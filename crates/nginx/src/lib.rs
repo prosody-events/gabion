@@ -24,6 +24,8 @@ use thiserror::Error;
 #[cfg(feature = "ngx-module")]
 mod module;
 mod request_queue;
+#[cfg(test)]
+mod tests;
 
 pub use request_queue::{
     RequestEvent, SharedRequestEventRecord, SharedRequestQueue, SharedRequestRingControl,
@@ -1441,6 +1443,3 @@ pub fn parse_rate(input: &str) -> Result<u64, NginxConfigError> {
         .parse::<u64>()
         .map_err(|_| NginxConfigError::InvalidRate)
 }
-
-#[cfg(test)]
-mod tests;

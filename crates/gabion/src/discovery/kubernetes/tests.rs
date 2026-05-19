@@ -1,4 +1,3 @@
-
 use super::*;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;

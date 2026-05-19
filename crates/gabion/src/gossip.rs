@@ -22,6 +22,9 @@ use sha2::Sha256;
 use thiserror::Error;
 use twox_hash::xxhash3_128::{DEFAULT_SECRET_LENGTH, RawHasher as XxHash3RawHasher, SecretBuffer};
 
+#[cfg(test)]
+mod tests;
+
 pub type CellId = usize;
 
 const MAGIC: u32 = 0x4742_4731;
@@ -987,6 +990,3 @@ fn hmac_sha256(key: HmacKey, payload: &[u8]) -> [u8; AUTH_TAG_LEN] {
     mac.update(payload);
     mac.finalize().into_bytes().into()
 }
-
-#[cfg(test)]
-mod tests;

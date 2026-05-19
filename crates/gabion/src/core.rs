@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use twox_hash::xxhash3_128::{DEFAULT_SECRET_LENGTH, RawHasher as XxHash3RawHasher, SecretBuffer};
 
+#[cfg(test)]
+mod tests;
+
 pub type RuleId = u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1547,6 +1550,3 @@ fn expire_old_buckets(entry: &mut KeyEntry, window: WindowSpec, now_millis: u64)
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

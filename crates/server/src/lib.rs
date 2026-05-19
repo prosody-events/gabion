@@ -16,6 +16,9 @@ use gabion::{
     CardinalityLimits, Decision, Descriptor, LimitRequest, NoOpCountUpdateHandler, Runtime,
 };
 
+#[cfg(test)]
+mod tests;
+
 pub type SharedLimiter = Runtime<NoOpCountUpdateHandler>;
 
 pub use envoy_types::pb::envoy::extensions::common::ratelimit::v3::{
@@ -163,6 +166,3 @@ pub fn now_millis() -> u64 {
         .try_into()
         .unwrap_or(u64::MAX)
 }
-
-#[cfg(test)]
-mod tests;

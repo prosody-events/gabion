@@ -2,6 +2,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gabion::{HashedLimitRequest, RuleId};
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RequestEvent {
     pub rule_id: RuleId,
@@ -146,6 +149,3 @@ impl<'a> SharedRequestQueue<'a> {
         self.control.dropped()
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::core::{DescriptorMatcher, LocalEngine, Rule, RuleTable, hash_domain, hash_key};
 use crate::{

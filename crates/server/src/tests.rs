@@ -1,4 +1,3 @@
-
 use super::*;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
