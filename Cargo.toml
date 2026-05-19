@@ -11,6 +11,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+ahash = "0.8"
 axum = "0.8"
 async-stream = "0.3"
 bon = "3"

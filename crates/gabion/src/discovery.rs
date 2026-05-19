@@ -23,7 +23,7 @@ pub trait PeerDiscovery {
     fn peer_events(self) -> impl Stream<Item = Result<PeerEvent, Self::Error>> + Send;
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Peer {
     pub addr: SocketAddr,
 }
