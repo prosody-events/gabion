@@ -30,6 +30,7 @@ OUTPUT_DIR = Path(
 
 SERVER_REPLICAS = env_int("GABION_BENCH_SERVER_REPLICAS", 3)
 NGINX_REPLICAS = env_int("GABION_BENCH_NGINX_REPLICAS", 8)
+INITIAL_NGINX_REPLICAS = env_int("GABION_BENCH_INITIAL_NGINX_REPLICAS", max(1, NGINX_REPLICAS // 2))
 REQUESTS = env_int("GABION_BENCH_REQUESTS", 2000)
 CONCURRENCY = env_int("GABION_BENCH_CONCURRENCY", 32)
 LINGER_MS = env_int("GABION_BENCH_LINGER_MS", 100)
@@ -254,7 +255,7 @@ kind: Deployment
 metadata:
   name: gabion-nginx
 spec:
-  replicas: {NGINX_REPLICAS}
+  replicas: {INITIAL_NGINX_REPLICAS}
   selector:
     matchLabels:
       app: gabion-nginx
@@ -619,6 +620,31 @@ def convergence_summary(rows, target):
     return result
 
 
+def benchmark_failures(load, convergence):
+    failures = []
+    if load["attempted"] != REQUESTS:
+        failures.append(f"load attempted {load['attempted']} requests, expected {REQUESTS}")
+    if load["failures"] != 0:
+        failures.append(f"load had {load['failures']} non-2xx/non-429 responses")
+    if load["limited"] != 0:
+        failures.append(f"load had {load['limited']} 429 responses with benchmark limit {RULE_LIMIT}")
+    if load["ok"] != REQUESTS:
+        failures.append(f"load completed {load['ok']} successful requests, expected {REQUESTS}")
+    for pod, pod_result in sorted(convergence.items()):
+        if pod_result["final_remote_total"] < load["ok"]:
+            failures.append(
+                f"{pod} converged to {pod_result['final_remote_total']} remote counts, expected {load['ok']}"
+            )
+        if pod_result["full_ms"] is None:
+            failures.append(f"{pod} never reached full convergence")
+        if pod_result["final_peers"] < SERVER_REPLICAS + NGINX_REPLICAS - 1:
+            failures.append(
+                f"{pod} discovered {pod_result['final_peers']} peers, expected at least "
+                f"{SERVER_REPLICAS + NGINX_REPLICAS - 1}"
+            )
+    return failures
+
+
 def main():
     context, server = guard_local_orbstack()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -640,8 +666,14 @@ def main():
         run(["kubectl", "-n", NAMESPACE, "apply", "-f", "-"], input_text=manifest())
         run(["kubectl", "-n", NAMESPACE, "rollout", "status", "deployment/gabiond", "--timeout=180s"])
         run(["kubectl", "-n", NAMESPACE, "rollout", "status", "deployment/gabion-nginx", "--timeout=180s"])
-        log("waiting for EndpointSlices")
+        log("waiting for initial EndpointSlices")
         wait_endpoint_count("gabiond", SERVER_REPLICAS)
+        wait_endpoint_count("gabion-nginx", INITIAL_NGINX_REPLICAS)
+        if INITIAL_NGINX_REPLICAS != NGINX_REPLICAS:
+            log(f"scaling NGINX from {INITIAL_NGINX_REPLICAS} to {NGINX_REPLICAS} replicas")
+            run(["kubectl", "-n", NAMESPACE, "scale", "deployment/gabion-nginx", f"--replicas={NGINX_REPLICAS}"])
+            run(["kubectl", "-n", NAMESPACE, "rollout", "status", "deployment/gabion-nginx", "--timeout=180s"])
+        log("waiting for final EndpointSlices")
         wait_endpoint_count("gabion-nginx", NGINX_REPLICAS)
 
         server_pods = pods_for_app("gabiond")
@@ -671,12 +703,15 @@ def main():
         if sampler is not None:
             sampler.join(timeout=5)
 
+        convergence = convergence_summary(rows, load["ok"])
+        failures = benchmark_failures(load, convergence)
         summary = {
             "context": context,
             "server": server,
             "namespace": NAMESPACE,
             "parameters": {
                 "server_replicas": SERVER_REPLICAS,
+                "initial_nginx_replicas": INITIAL_NGINX_REPLICAS,
                 "nginx_replicas": NGINX_REPLICAS,
                 "requests": REQUESTS,
                 "concurrency": CONCURRENCY,
@@ -685,12 +720,15 @@ def main():
                 "sample_ms": SAMPLE_MS,
             },
             "load": load,
-            "convergence": convergence_summary(rows, load["ok"]),
+            "convergence": convergence,
+            "failures": failures,
             "output_dir": str(OUTPUT_DIR),
         }
         write_report(OUTPUT_DIR, summary, rows)
         print(json.dumps(summary, indent=2, sort_keys=True))
         print(f"gabion gossip propagation benchmark wrote {OUTPUT_DIR}")
+        if failures:
+            raise SystemExit("gabion gossip propagation benchmark failed:\n" + "\n".join(failures))
     finally:
         stop_event.set()
         if sampler is not None:
