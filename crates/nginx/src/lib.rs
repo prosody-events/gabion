@@ -1411,27 +1411,11 @@ pub fn parse_size_bytes(input: &str) -> Result<usize, NginxConfigError> {
 }
 
 pub fn parse_duration_millis(input: &str) -> Result<u64, NginxConfigError> {
-    let input = input.trim();
-    let split = input
-        .find(|ch: char| !ch.is_ascii_digit())
-        .ok_or(NginxConfigError::InvalidDuration)?;
-    let (number, unit) = input.split_at(split);
-    let value = number
-        .parse::<u64>()
-        .map_err(|_| NginxConfigError::InvalidDuration)?;
-    match unit.trim() {
-        "ms" => Ok(value),
-        "s" => value
-            .checked_mul(1_000)
-            .ok_or(NginxConfigError::InvalidDuration),
-        "m" => value
-            .checked_mul(60_000)
-            .ok_or(NginxConfigError::InvalidDuration),
-        "h" => value
-            .checked_mul(3_600_000)
-            .ok_or(NginxConfigError::InvalidDuration),
-        _ => Err(NginxConfigError::InvalidDuration),
-    }
+    humantime::parse_duration(input.trim())
+        .map_err(|_| NginxConfigError::InvalidDuration)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| NginxConfigError::InvalidDuration)
 }
 
 pub fn parse_rate(input: &str) -> Result<u64, NginxConfigError> {

@@ -1,6 +1,7 @@
 use super::*;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 struct EnvoyRequestCase {
@@ -56,17 +57,16 @@ fn runtime(max_descriptor_bytes: usize) -> SharedLimiter {
                     value: "*".to_string(),
                 }],
                 limit: 10,
-                window: "1s".to_string(),
-                bucket: "100ms".to_string(),
+                window: Duration::from_secs(1),
+                bucket: Duration::from_millis(100),
                 local_fallback_limit: 3,
                 local_absolute_limit: 6,
-                stale_after: "500ms".to_string(),
+                stale_after: Duration::from_millis(500),
                 safety_margin: gabion::SafetyMarginConfig { hits: 0 },
                 overflow_policy: gabion::OverflowPolicy::UseOverflowKey,
                 mode: gabion::EnforcementMode::Enforce,
             }],
-            runtime: gabion::RuntimeConfig::default(),
-            server: gabion::ServerConfig::default(),
+            runtime: gabion::RuntimeTuningConfig::default(),
             discovery: gabion::DiscoveryConfig::default(),
             gossip: gabion::GossipConfig::default(),
         },

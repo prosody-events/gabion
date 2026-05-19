@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::Deserialize;
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -9,18 +11,13 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let config_path = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .ok_or_else(|| "usage: gabiond <config.yaml>".to_string())?;
-    let config_text = std::fs::read_to_string(config_path).map_err(|error| error.to_string())?;
-    let config = gabion::Config::from_yaml_str(&config_text).map_err(|error| error.to_string())?;
+    let config = load_config()?;
     let envoy_bind = config.server.envoy_rls.bind;
     let envoy_enabled = config.server.envoy_rls.enabled;
     let admin_bind = config.server.admin.bind;
     let admin_enabled = config.server.admin.enabled;
-    let cardinality_limits = config.cardinality_limits();
-    let runtime = gabion::Runtime::new(config).map_err(|error| error.to_string())?;
+    let cardinality_limits = config.runtime.cardinality_limits();
+    let runtime = gabion::Runtime::new(config.runtime).map_err(|error| error.to_string())?;
     let gossip_enabled = runtime.gossip_enabled();
 
     let runtime_task = tokio::spawn({
@@ -78,6 +75,54 @@ async fn run() -> Result<(), String> {
 
     runtime.shutdown();
     Ok(())
+}
+
+fn load_config() -> Result<AppConfig, String> {
+    let config_path = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .ok_or_else(|| "usage: gabiond <config.yaml>".to_string())?;
+    let text = std::fs::read_to_string(config_path).map_err(|error| error.to_string())?;
+    let config: FileConfig = serde_yaml::from_str(&text).map_err(|error| error.to_string())?;
+    config.into_app_config()
+}
+
+#[derive(Debug)]
+struct AppConfig {
+    runtime: gabion::Config,
+    server: FileServerConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileConfig {
+    #[serde(flatten)]
+    runtime: gabion::Config,
+    #[serde(default)]
+    server: FileServerConfig,
+}
+
+impl FileConfig {
+    fn into_app_config(self) -> Result<AppConfig, String> {
+        Ok(AppConfig {
+            runtime: self.runtime,
+            server: self.server,
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileServerConfig {
+    #[serde(default)]
+    envoy_rls: FileListenerConfig,
+    #[serde(default)]
+    admin: FileListenerConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileListenerConfig {
+    #[serde(default)]
+    enabled: bool,
+    bind: Option<std::net::SocketAddr>,
 }
 
 fn flatten_task<T, E: std::fmt::Display>(

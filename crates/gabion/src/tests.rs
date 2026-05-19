@@ -14,6 +14,7 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 struct RuntimeRecentPeerCase {
@@ -141,34 +142,42 @@ impl GossipTransport for MemoryTransport {
     }
 }
 
-fn test_config() -> LocalOnlyConfig {
-    LocalOnlyConfig::from_yaml_str(
-        r#"
-storage:
-  max_keys: 16
-  max_cells: 64
-  dirty_ring_entries: 64
-discovery:
-  kind: none
-gossip:
-  enabled: false
-limits:
-  - name: tenant_api_minute
-    domain: api
-    descriptors:
-      - key: tenant
-        value: "*"
-    limit: 1
-    window: 60s
-    bucket: 1s
-    local_fallback_limit: 100
-    local_absolute_limit: 100
-    stale_after: 2s
-    overflow_policy: aggregate
-    mode: enforce
-"#,
-    )
-    .expect("config parses")
+fn test_config() -> Config {
+    Config {
+        storage: StorageConfig {
+            max_keys: 16,
+            max_cells: Some(64),
+            dirty_ring_entries: Some(64),
+            ..Default::default()
+        },
+        limits: vec![tenant_rule(1, 100, 100)],
+        discovery: DiscoveryConfig {
+            kind: DiscoveryMode::None,
+            ..Default::default()
+        },
+        gossip: GossipConfig::default(),
+        runtime: RuntimeTuningConfig::default(),
+    }
+}
+
+fn tenant_rule(limit: u64, local_fallback_limit: u64, local_absolute_limit: u64) -> LimitRuleConfig {
+    LimitRuleConfig {
+        name: "tenant_api_minute".to_string(),
+        domain: "api".to_string(),
+        descriptors: vec![DescriptorConfig {
+            key: "tenant".to_string(),
+            value: "*".to_string(),
+        }],
+        limit,
+        window: Duration::from_secs(60),
+        bucket: Duration::from_secs(1),
+        local_fallback_limit,
+        local_absolute_limit,
+        stale_after: Duration::from_secs(2),
+        safety_margin: SafetyMarginConfig::default(),
+        overflow_policy: OverflowPolicy::UseOverflowKey,
+        mode: EnforcementMode::Enforce,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -276,8 +285,8 @@ fn runtime_config(node: u64) -> StandaloneGossipConfig {
         remote_dirty_capacity: 64,
         auth_key: None,
         max_peers: 16,
-        recent_peer_grace_millis: 30_000,
-        send_policy: GossipSendPolicy::with_linger_ms(1),
+        recent_peer_grace: Duration::from_millis(30_000),
+        send_policy: GossipSendPolicy::with_linger(Duration::from_millis(1)),
     }
 }
 
@@ -455,31 +464,18 @@ fn admin_storage_summary_reports_cells_and_dirty_ring() {
 
 #[test]
 fn parses_local_only_config_into_engine() {
-    let config = LocalOnlyConfig::from_yaml_str(
-        r#"
-storage:
-  max_keys: 16
-discovery:
-  kind: none
-gossip:
-  enabled: false
-limits:
-  - name: tenant_api_minute
-    domain: api
-    descriptors:
-      - key: tenant
-        value: "*"
-    limit: 10
-    window: 60s
-    bucket: 1s
-    local_fallback_limit: 3
-    local_absolute_limit: 6
-    stale_after: 2s
-    overflow_policy: aggregate
-    mode: enforce
-"#,
-    )
-    .expect("config parses");
+    let config = Config {
+        storage: StorageConfig {
+            max_keys: 16,
+            ..Default::default()
+        },
+        limits: vec![tenant_rule(10, 3, 6)],
+        discovery: DiscoveryConfig {
+            kind: DiscoveryMode::None,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     let engine = config.into_engine().expect("local-only engine builds");
 
@@ -489,34 +485,28 @@ limits:
 
 #[test]
 fn parses_static_peer_config_without_boxed_provider() {
-    let config = LocalOnlyConfig::from_yaml_str(
-        r#"
-storage:
-  max_keys: 16
-discovery:
-  kind: static
-  self_addr: 127.0.0.1:18080
-  peers:
-    - 127.0.0.1:18080
-    - 127.0.0.2:18080
-gossip:
-  enabled: true
-  bind: 127.0.0.1:18080
-limits:
-  - name: tenant_api_minute
-    domain: api
-    descriptors:
-      - key: tenant
-        value: "*"
-    limit: 10
-    window: 60s
-    bucket: 1s
-    local_fallback_limit: 3
-    local_absolute_limit: 6
-    stale_after: 2s
-"#,
-    )
-    .expect("config parses");
+    let config = Config {
+        storage: StorageConfig {
+            max_keys: 16,
+            ..Default::default()
+        },
+        limits: vec![tenant_rule(10, 3, 6)],
+        discovery: DiscoveryConfig {
+            kind: DiscoveryMode::Static,
+            self_addr: Some("127.0.0.1:18080".parse().expect("addr")),
+            peers: vec![
+                "127.0.0.1:18080".parse().expect("addr"),
+                "127.0.0.2:18080".parse().expect("addr"),
+            ],
+            ..Default::default()
+        },
+        gossip: GossipConfig {
+            enabled: true,
+            bind: Some("127.0.0.1:18080".parse().expect("addr")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let provider = peer_provider_from_config(&config.discovery).expect("provider");
 
     assert_eq!(provider.snapshot().peers().len(), 1);
@@ -524,62 +514,46 @@ limits:
 
 #[test]
 fn discovery_defaults_to_auto_and_sync_provider_is_local_only() {
-    let config = LocalOnlyConfig::from_yaml_str(
-        r#"
-storage:
-  max_keys: 16
-gossip:
-  enabled: true
-  bind: 0.0.0.0:18080
-limits:
-  - name: tenant_api_minute
-    domain: api
-    descriptors:
-      - key: tenant
-        value: "*"
-    limit: 10
-    window: 60s
-    bucket: 1s
-    local_fallback_limit: 3
-    local_absolute_limit: 6
-    stale_after: 2s
-"#,
-    )
-    .expect("config parses");
+    let config = Config {
+        storage: StorageConfig {
+            max_keys: 16,
+            ..Default::default()
+        },
+        limits: vec![tenant_rule(10, 3, 6)],
+        gossip: GossipConfig {
+            enabled: true,
+            bind: Some("0.0.0.0:18080".parse().expect("addr")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let provider = peer_provider_from_config(&config.discovery).expect("provider");
 
-    assert_eq!(config.discovery.kind, DiscoveryKind::Auto);
+    assert_eq!(config.discovery.kind, DiscoveryMode::Auto);
     assert!(provider.snapshot().local_only());
 }
 
 #[test]
 fn discovery_section_without_kind_defaults_to_auto() {
-    let config = LocalOnlyConfig::from_yaml_str(
-        r#"
-storage:
-  max_keys: 16
-discovery:
-  self_addr: 10.0.0.1:18080
-gossip:
-  enabled: true
-  bind: 0.0.0.0:18080
-limits:
-  - name: tenant_api_minute
-    domain: api
-    descriptors:
-      - key: tenant
-        value: "*"
-    limit: 10
-    window: 60s
-    bucket: 1s
-    local_fallback_limit: 3
-    local_absolute_limit: 6
-    stale_after: 2s
-"#,
-    )
-    .expect("config parses");
+    let config = Config {
+        storage: StorageConfig {
+            max_keys: 16,
+            ..Default::default()
+        },
+        limits: vec![tenant_rule(10, 3, 6)],
+        discovery: DiscoveryConfig {
+            self_addr: Some("10.0.0.1:18080".parse().expect("addr")),
+            ..Default::default()
+        },
+        gossip: GossipConfig {
+            enabled: true,
+            bind: Some("0.0.0.0:18080".parse().expect("addr")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
-    assert_eq!(config.discovery.kind, DiscoveryKind::Auto);
+    assert_eq!(config.discovery.kind, DiscoveryMode::Auto);
     assert_eq!(
         config.discovery.self_addr,
         Some("10.0.0.1:18080".parse().expect("addr"))
@@ -645,8 +619,8 @@ fn deterministic_gossip_uses_peer_and_transport_traits_without_udp() {
         remote_dirty_capacity: 64,
         auth_key: None,
         max_peers: 16,
-        recent_peer_grace_millis: 30_000,
-        send_policy: GossipSendPolicy::with_linger_ms(1),
+        recent_peer_grace: Duration::from_millis(30_000),
+        send_policy: GossipSendPolicy::with_linger(Duration::from_millis(1)),
     };
     let mut config_b = config_a;
     config_b.sender_node_id = 2_u128.into();
@@ -715,8 +689,8 @@ fn gossip_tick_keeps_last_good_file_peers_when_read_fails() {
         remote_dirty_capacity: 64,
         auth_key: None,
         max_peers: 16,
-        recent_peer_grace_millis: 30_000,
-        send_policy: GossipSendPolicy::with_linger_ms(1),
+        recent_peer_grace: Duration::from_millis(30_000),
+        send_policy: GossipSendPolicy::with_linger(Duration::from_millis(1)),
     };
     let mut runtime =
         StandaloneGossipRuntime::new(limiter, provider, MemoryTransport::default(), config);
@@ -730,34 +704,27 @@ fn gossip_tick_keeps_last_good_file_peers_when_read_fails() {
 
 #[test]
 fn kubernetes_endpoint_slice_config_uses_snapshot_provider() {
-    let config = LocalOnlyConfig::from_yaml_str(
-        r#"
-storage:
-  max_keys: 16
-discovery:
-  kind: kubernetes
-  namespace: default
-  service_name: gabion
-  port_name: gossip
-  self_addr: 10.0.0.1:18080
-gossip:
-  enabled: true
-  bind: 0.0.0.0:18080
-limits:
-  - name: tenant_api_minute
-    domain: api
-    descriptors:
-      - key: tenant
-        value: "*"
-    limit: 10
-    window: 60s
-    bucket: 1s
-    local_fallback_limit: 3
-    local_absolute_limit: 6
-    stale_after: 2s
-"#,
-    )
-    .expect("config parses");
+    let config = Config {
+        storage: StorageConfig {
+            max_keys: 16,
+            ..Default::default()
+        },
+        limits: vec![tenant_rule(10, 3, 6)],
+        discovery: DiscoveryConfig {
+            kind: DiscoveryMode::KubernetesEndpointSlice,
+            namespace: Some("default".to_string()),
+            service_name: Some("gabion".to_string()),
+            port_name: Some("gossip".to_string()),
+            self_addr: Some("10.0.0.1:18080".parse().expect("addr")),
+            ..Default::default()
+        },
+        gossip: GossipConfig {
+            enabled: true,
+            bind: Some("0.0.0.0:18080".parse().expect("addr")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let endpoint_config =
         endpoint_slice_config_from_discovery(&config.discovery).expect("endpoint config");
     let provider = peer_provider_from_config(&config.discovery).expect("provider");
@@ -817,38 +784,36 @@ fn quickcheck_endpoint_slice_config_preserves_selector_shape(
 
 #[test]
 fn kubernetes_endpoint_slice_config_accepts_multiple_selectors() {
-    let config = LocalOnlyConfig::from_yaml_str(
-        r#"
-storage:
-  max_keys: 16
-discovery:
-  kind: kubernetes
-  self_addr: 10.0.0.1:18080
-  endpoint_slices:
-    - namespace: default
-      service_name: gabion-grpc
-      port_name: gossip
-    - namespace: default
-      service_name: gabion-nginx
-      port_name: gossip
-gossip:
-  enabled: true
-  bind: 0.0.0.0:18080
-limits:
-  - name: tenant_api_minute
-    domain: api
-    descriptors:
-      - key: tenant
-        value: "*"
-    limit: 10
-    window: 60s
-    bucket: 1s
-    local_fallback_limit: 3
-    local_absolute_limit: 6
-    stale_after: 2s
-"#,
-    )
-    .expect("config parses");
+    let config = Config {
+        storage: StorageConfig {
+            max_keys: 16,
+            ..Default::default()
+        },
+        limits: vec![tenant_rule(10, 3, 6)],
+        discovery: DiscoveryConfig {
+            kind: DiscoveryMode::KubernetesEndpointSlice,
+            self_addr: Some("10.0.0.1:18080".parse().expect("addr")),
+            endpoint_slices: vec![
+                EndpointSliceSelectorConfig {
+                    namespace: "default".to_string(),
+                    service_name: "gabion-grpc".to_string(),
+                    port_name: Some("gossip".to_string()),
+                },
+                EndpointSliceSelectorConfig {
+                    namespace: "default".to_string(),
+                    service_name: "gabion-nginx".to_string(),
+                    port_name: Some("gossip".to_string()),
+                },
+            ],
+            ..Default::default()
+        },
+        gossip: GossipConfig {
+            enabled: true,
+            bind: Some("0.0.0.0:18080".parse().expect("addr")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     let configs =
         endpoint_slice_configs_from_discovery(&config.discovery).expect("endpoint configs");
@@ -864,32 +829,25 @@ limits:
 
 #[test]
 fn kubernetes_endpoint_slice_config_defaults_port_name_to_gossip() {
-    let config = LocalOnlyConfig::from_yaml_str(
-        r#"
-storage:
-  max_keys: 16
-discovery:
-  kind: kubernetes
-  namespace: default
-  service_name: gabion
-gossip:
-  enabled: true
-  bind: 0.0.0.0:18080
-limits:
-  - name: tenant_api_minute
-    domain: api
-    descriptors:
-      - key: tenant
-        value: "*"
-    limit: 10
-    window: 60s
-    bucket: 1s
-    local_fallback_limit: 3
-    local_absolute_limit: 6
-    stale_after: 2s
-"#,
-    )
-    .expect("config parses");
+    let config = Config {
+        storage: StorageConfig {
+            max_keys: 16,
+            ..Default::default()
+        },
+        limits: vec![tenant_rule(10, 3, 6)],
+        discovery: DiscoveryConfig {
+            kind: DiscoveryMode::KubernetesEndpointSlice,
+            namespace: Some("default".to_string()),
+            service_name: Some("gabion".to_string()),
+            ..Default::default()
+        },
+        gossip: GossipConfig {
+            enabled: true,
+            bind: Some("0.0.0.0:18080".parse().expect("addr")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let endpoint_config =
         endpoint_slice_config_from_discovery(&config.discovery).expect("endpoint config");
 
@@ -904,7 +862,7 @@ fn quickcheck_removed_peers_are_accepted_only_within_grace_window(
     let peers = SnapshotPeerHandler::with_capacity(4);
     peers.peer_added(Peer::new(addr_b));
     let mut config = runtime_config(1);
-    config.recent_peer_grace_millis = u64::from(case.grace_millis);
+    config.recent_peer_grace = Duration::from_millis(u64::from(case.grace_millis));
     let mut runtime = StandaloneGossipRuntime::new(
         shared_limiter(engine_with_node(1)),
         peers.clone(),
@@ -1083,33 +1041,28 @@ fn quickcheck_runtime_reuses_construction_buffers(case: RuntimeBufferReuseCase) 
 
 #[test]
 fn endpoint_slice_selector_defaults_port_name_to_gossip() {
-    let config = LocalOnlyConfig::from_yaml_str(
-        r#"
-storage:
-  max_keys: 16
-discovery:
-  kind: kubernetes
-  endpoint_slices:
-    - namespace: default
-      service_name: gabion
-gossip:
-  enabled: true
-  bind: 0.0.0.0:18080
-limits:
-  - name: tenant_api_minute
-    domain: api
-    descriptors:
-      - key: tenant
-        value: "*"
-    limit: 10
-    window: 60s
-    bucket: 1s
-    local_fallback_limit: 3
-    local_absolute_limit: 6
-    stale_after: 2s
-"#,
-    )
-    .expect("config parses");
+    let config = Config {
+        storage: StorageConfig {
+            max_keys: 16,
+            ..Default::default()
+        },
+        limits: vec![tenant_rule(10, 3, 6)],
+        discovery: DiscoveryConfig {
+            kind: DiscoveryMode::KubernetesEndpointSlice,
+            endpoint_slices: vec![EndpointSliceSelectorConfig {
+                namespace: "default".to_string(),
+                service_name: "gabion".to_string(),
+                port_name: Some(DEFAULT_GOSSIP_PORT_NAME.to_string()),
+            }],
+            ..Default::default()
+        },
+        gossip: GossipConfig {
+            enabled: true,
+            bind: Some("0.0.0.0:18080".parse().expect("addr")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let configs =
         endpoint_slice_configs_from_discovery(&config.discovery).expect("endpoint configs");
 
@@ -1166,8 +1119,8 @@ fn gossip_runtime_accepts_recently_known_peer_during_grace_window() {
         remote_dirty_capacity: 64,
         auth_key: None,
         max_peers: 16,
-        recent_peer_grace_millis: 10,
-        send_policy: GossipSendPolicy::with_linger_ms(1),
+        recent_peer_grace: Duration::from_millis(10),
+        send_policy: GossipSendPolicy::with_linger(Duration::from_millis(1)),
     };
     let mut receiver = StandaloneGossipRuntime::new(
         limiter,
@@ -1256,8 +1209,8 @@ fn authenticated_runtime_rejects_mismatched_hmac_frames() {
         remote_dirty_capacity: 64,
         auth_key: Some(crate::gossip::HmacKey::new([1; 32])),
         max_peers: 16,
-        recent_peer_grace_millis: 30_000,
-        send_policy: GossipSendPolicy::with_linger_ms(1),
+        recent_peer_grace: Duration::from_millis(30_000),
+        send_policy: GossipSendPolicy::with_linger(Duration::from_millis(1)),
     };
     let mut config_b = config_a;
     config_b.sender_node_id = 2_u128.into();
@@ -1338,8 +1291,8 @@ fn dirty_overflow_forces_bounded_resync_cells() {
             remote_dirty_capacity: 64,
             auth_key: None,
             max_peers: 16,
-            recent_peer_grace_millis: 30_000,
-            send_policy: GossipSendPolicy::with_linger_ms(1),
+            recent_peer_grace: Duration::from_millis(30_000),
+            send_policy: GossipSendPolicy::with_linger(Duration::from_millis(1)),
         },
     );
 
@@ -1381,8 +1334,8 @@ fn local_udp_gossip_converges_end_to_end() {
         remote_dirty_capacity: 64,
         auth_key: None,
         max_peers: 16,
-        recent_peer_grace_millis: 30_000,
-        send_policy: GossipSendPolicy::with_linger_ms(1),
+        recent_peer_grace: Duration::from_millis(30_000),
+        send_policy: GossipSendPolicy::with_linger(Duration::from_millis(1)),
     };
     let mut config_b = config_a;
     config_b.sender_node_id = 2_u128.into();
@@ -1580,8 +1533,8 @@ async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
             remote_dirty_capacity: 64,
             auth_key: None,
             max_peers: 16,
-            recent_peer_grace_millis: 30_000,
-            send_policy: GossipSendPolicy::with_linger_ms(1),
+            recent_peer_grace: Duration::from_millis(30_000),
+            send_policy: GossipSendPolicy::with_linger(Duration::from_millis(1)),
         };
         let mut config_b = config_a;
         config_b.sender_node_id = 2_u128.into();

@@ -29,8 +29,8 @@ use crate::{
 use gabion::{
     CountAggregate, DescriptorConfig, DiscoveryConfig, DiscoveryMode, EndpointSliceSelectorConfig,
     EnforcementMode, GossipConfig as WireConfig, HashedLimitRequest, LimitRuleConfig,
-    LocalOnlyConfig, OverflowPolicy, Runtime, RuntimeConfig, SafetyMarginConfig, ServerConfig,
-    StorageConfig, TimedHashedLimitRequest,
+    OverflowPolicy, Runtime, RuntimeConfig, RuntimeTuningConfig, SafetyMarginConfig, StorageConfig,
+    TimedHashedLimitRequest,
 };
 
 struct Module;
@@ -58,7 +58,7 @@ fn gabion_log_info(args: std::fmt::Arguments<'_>) {
 
 #[derive(Clone, Debug)]
 struct NginxRuntimeLaunch {
-    config: LocalOnlyConfig,
+    config: RuntimeConfig,
     ptr: usize,
     len: usize,
 }
@@ -933,7 +933,7 @@ fn rebuild_runtime(main: &MainConfig) -> Result<(), NginxConfigError> {
         .max_keys
         .checked_mul(DEFAULT_MAX_ACTIVE_BUCKETS)
         .ok_or(NginxConfigError::InvalidCapacity)?;
-    let config = LocalOnlyConfig {
+    let config = RuntimeConfig {
         storage: StorageConfig {
             max_keys: zone.max_keys,
             max_cells: Some(max_cells),
@@ -944,10 +944,9 @@ fn rebuild_runtime(main: &MainConfig) -> Result<(), NginxConfigError> {
             max_active_buckets: DEFAULT_MAX_ACTIVE_BUCKETS,
         },
         limits: nginx_limit_configs(main)?,
-        runtime: RuntimeConfig {
+        runtime: RuntimeTuningConfig {
             count_update_batch_size: RUNTIME_DRAIN_BATCH,
         },
-        server: ServerConfig::default(),
         discovery: nginx_discovery_config(&main.discovery),
         gossip: nginx_wire_config(&main.discovery),
     };
@@ -991,11 +990,11 @@ fn nginx_limit_configs(main: &MainConfig) -> Result<Vec<LimitRuleConfig>, NginxC
             domain: rule.domain.as_str().to_string(),
             descriptors,
             limit: rule.limit,
-            window: millis_config(rule.window_millis),
-            bucket: millis_config(rule.bucket_millis),
-            local_fallback_limit: rule.local_fallback_limit,
-            local_absolute_limit: rule.local_absolute_limit,
-            stale_after: millis_config(rule.stale_after_millis),
+                window: Duration::from_millis(rule.window_millis),
+                bucket: Duration::from_millis(rule.bucket_millis),
+                local_fallback_limit: rule.local_fallback_limit,
+                local_absolute_limit: rule.local_absolute_limit,
+                stale_after: Duration::from_millis(rule.stale_after_millis),
             safety_margin: SafetyMarginConfig::default(),
             overflow_policy: OverflowPolicy::UseOverflowKey,
             mode: rule.mode,
@@ -1033,7 +1032,7 @@ fn nginx_discovery_config(discovery: &NginxDiscoveryConfig) -> DiscoveryConfig {
         service_name: None,
         port_name: Some(crate::DEFAULT_GOSSIP_PORT_NAME.to_string()),
         max_peers: crate::MAX_NGINX_PEERS,
-        recent_peer_grace_millis: 30_000,
+        recent_peer_grace: Duration::from_millis(30_000),
     }
 }
 
@@ -1041,16 +1040,12 @@ fn nginx_wire_config(discovery: &NginxDiscoveryConfig) -> WireConfig {
     WireConfig {
         enabled: discovery.bind_addr.is_some() && discovery.kind != DiscoveryMode::None,
         bind: discovery.bind_addr,
-        linger_ms: discovery.linger_ms,
+        linger: Duration::from_millis(discovery.linger_ms),
         fanout: discovery.fanout,
         max_payload_bytes: discovery.max_payload_bytes,
         max_cells_per_frame: discovery.max_cells_per_frame,
         cluster_id_hash: discovery.cluster_id_hash,
     }
-}
-
-fn millis_config(millis: u64) -> String {
-    format!("{millis}ms")
 }
 
 fn run_nginx_runtime(launch: NginxRuntimeLaunch) {

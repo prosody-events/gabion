@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 envoy-types.workspace = true
 gabion.workspace = true
+humantime.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 

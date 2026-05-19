@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -11,19 +10,21 @@ pub use core::{
     HashedLimitRequestBuilder, KeyHash, LimitRequest, OverflowPolicy, RateLimitRecorder,
     RateLimitRuntime, RejectReason, RuleId, SafetyMargin, TimedHashedLimitRequest, WindowSpec,
 };
+pub use config::{
+    ConfigError, DescriptorConfig, DiscoveryConfig, EndpointSliceSelectorConfig, GossipConfig,
+    LimitRuleConfig, RuntimeConfig, RuntimeTuningConfig, SafetyMarginConfig, StorageConfig,
+    endpoint_slice_config_from_discovery, endpoint_slice_configs_from_discovery,
+    peer_provider_from_config,
+};
 pub use discovery::DiscoveryMode;
 
-use crate::core::{
-    DescriptorMatcher, LocalEngine, NodeId, NodeIdentity, Rule, RuleTable, hash_domain,
-};
+use crate::core::{LocalEngine, NodeId, NodeIdentity};
 use crate::discovery::{
-    DEFAULT_GOSSIP_PORT_NAME, DEFAULT_MAX_PEERS, DEFAULT_RECENT_PEER_GRACE_MILLIS, FilePeerHandler,
-    Peer, PeerHandler, PeerSnapshot, SnapshotPeerHandler, StaticPeerHandler,
+    FilePeerHandler, Peer, PeerHandler, PeerSnapshot, SnapshotPeerHandler, StaticPeerHandler,
 };
-use serde::Deserialize;
-use thiserror::Error;
 
 pub mod admin;
+pub mod config;
 pub(crate) mod core;
 pub(crate) mod discovery;
 pub(crate) mod gossip;
@@ -37,7 +38,7 @@ fn shared_limiter(engine: LocalEngine) -> SharedLimiter {
     Arc::new(Mutex::new(engine))
 }
 
-pub type Config = LocalOnlyConfig;
+pub type Config = RuntimeConfig;
 
 #[derive(Clone, Debug)]
 pub struct Runtime<H = NoOpCountUpdateHandler> {
@@ -48,7 +49,7 @@ pub struct Runtime<H = NoOpCountUpdateHandler> {
 struct RuntimeInner<H> {
     limiter: SharedLimiter,
     limits: CardinalityLimits,
-    runtime: RuntimeConfig,
+    runtime: RuntimeTuningConfig,
     discovery: DiscoveryConfig,
     gossip: GossipConfig,
     admin_snapshot: Option<crate::gossip_runtime::SharedGossipAdminSnapshot>,
@@ -94,24 +95,6 @@ impl CountUpdateHandler for NoOpCountUpdateHandler {
             dropped: 0,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-pub struct RuntimeConfig {
-    #[serde(default = "default_count_update_batch_size")]
-    pub count_update_batch_size: usize,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            count_update_batch_size: default_count_update_batch_size(),
-        }
-    }
-}
-
-fn default_count_update_batch_size() -> usize {
-    64
 }
 
 impl Runtime<NoOpCountUpdateHandler> {
@@ -360,8 +343,9 @@ impl<H: CountUpdateHandler> Runtime<H> {
             .lock()
             .map(|limiter| limiter.identity())
             .unwrap_or_default();
-        let mut runtime_config = crate::gossip_runtime::StandaloneGossipConfig::from_config(
+        let mut runtime_config = crate::gossip_runtime::StandaloneGossipConfig::from_runtime_config(
             &self.inner.gossip,
+            &self.inner.discovery,
             self.inner.remote_cell_capacity,
         );
         runtime_config.sender_node_id = crate::gossip::NodeId::from(u128::from(identity.node_id));
@@ -373,7 +357,10 @@ impl<H: CountUpdateHandler> Runtime<H> {
             runtime_config,
             self.inner.admin_snapshot.clone(),
         );
-        let wake_millis = self.inner.gossip.linger_ms.max(1).div_ceil(4).max(1);
+        let wake_millis = duration_millis(self.inner.gossip.linger)
+            .max(1)
+            .div_ceil(4)
+            .max(1);
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(wake_millis));
 
         while !self.inner.shutdown.load(Ordering::Acquire) {
@@ -394,7 +381,7 @@ impl<H: CountUpdateHandler> Runtime<H> {
         match peers {
             RuntimePeerHandler::File(handler) => {
                 let handler = handler.clone();
-                let poll_millis = self.inner.gossip.linger_ms.max(1);
+                let poll_millis = duration_millis(self.inner.gossip.linger).max(1);
                 Ok(Some(tokio::spawn(async move {
                     crate::discovery::run_file_peer_events(handler, poll_millis).await;
                 })))
@@ -460,6 +447,10 @@ fn current_time_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX).max(1)
 }
 
 async fn kubernetes_client() -> Result<kube::Client, kube::Error> {
@@ -546,340 +537,6 @@ impl<H: CountUpdateHandler> RateLimitRuntime<TimedHashedLimitRequest> for Runtim
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct LocalOnlyConfig {
-    pub storage: StorageConfig,
-    pub limits: Vec<LimitRuleConfig>,
-    #[serde(default)]
-    pub runtime: RuntimeConfig,
-    #[serde(default)]
-    pub server: ServerConfig,
-    #[serde(default)]
-    pub discovery: DiscoveryConfig,
-    #[serde(default)]
-    pub gossip: GossipConfig,
-}
-
-impl LocalOnlyConfig {
-    pub fn from_yaml_str(input: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(input)
-    }
-
-    pub fn into_engine(self) -> Result<LocalEngine, ConfigError> {
-        self.into_engine_with_identity(NodeIdentity::default())
-    }
-
-    pub fn into_engine_with_identity(
-        self,
-        identity: NodeIdentity,
-    ) -> Result<LocalEngine, ConfigError> {
-        let bucket_count = self
-            .limits
-            .iter()
-            .map(|limit| limit.bucket_count())
-            .max()
-            .unwrap_or(1);
-        if bucket_count > self.storage.max_active_buckets {
-            return Err(ConfigError::TooManyBuckets {
-                configured: bucket_count,
-                max: self.storage.max_active_buckets,
-            });
-        }
-        let rules = self
-            .limits
-            .iter()
-            .enumerate()
-            .map(|(index, limit)| limit.to_rule(index as RuleId + 1))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let max_cells = self.storage.max_cells.unwrap_or_else(|| {
-            self.storage
-                .max_keys
-                .saturating_mul(bucket_count.max(1))
-                .max(1)
-        });
-        let dirty_capacity = self.storage.dirty_ring_entries.unwrap_or(max_cells);
-
-        Ok(LocalEngine::with_identity(
-            RuleTable::new(rules),
-            self.storage.max_keys,
-            bucket_count,
-            max_cells,
-            dirty_capacity,
-            identity,
-        ))
-    }
-
-    pub fn cardinality_limits(&self) -> CardinalityLimits {
-        CardinalityLimits {
-            max_descriptor_count: self.storage.max_descriptor_count,
-            max_descriptor_bytes: self.storage.max_descriptor_bytes,
-            max_key_bytes: self.storage.max_key_bytes,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct StorageConfig {
-    pub max_keys: usize,
-    pub max_cells: Option<usize>,
-    pub dirty_ring_entries: Option<usize>,
-    #[serde(default = "default_max_descriptor_count")]
-    pub max_descriptor_count: usize,
-    #[serde(default = "default_max_descriptor_bytes")]
-    pub max_descriptor_bytes: usize,
-    #[serde(default = "default_max_key_bytes")]
-    pub max_key_bytes: usize,
-    #[serde(default = "default_max_active_buckets")]
-    pub max_active_buckets: usize,
-}
-
-fn default_max_descriptor_count() -> usize {
-    16
-}
-
-fn default_max_descriptor_bytes() -> usize {
-    512
-}
-
-fn default_max_key_bytes() -> usize {
-    128
-}
-
-fn default_max_active_buckets() -> usize {
-    64
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-pub struct ServerConfig {
-    #[serde(default)]
-    pub envoy_rls: ListenerConfig,
-    #[serde(default)]
-    pub admin: ListenerConfig,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-pub struct ListenerConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    pub bind: Option<SocketAddr>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct DiscoveryConfig {
-    #[serde(default)]
-    pub kind: DiscoveryMode,
-    #[serde(default)]
-    pub peers: Vec<SocketAddr>,
-    pub path: Option<std::path::PathBuf>,
-    pub self_addr: Option<SocketAddr>,
-    #[serde(default)]
-    pub endpoint_slices: Vec<EndpointSliceSelectorConfig>,
-    pub namespace: Option<String>,
-    pub service_name: Option<String>,
-    #[serde(default = "default_gossip_port_name")]
-    pub port_name: Option<String>,
-    #[serde(default = "default_max_peers")]
-    pub max_peers: usize,
-    #[serde(default = "default_recent_peer_grace_millis")]
-    pub recent_peer_grace_millis: u64,
-}
-
-impl Default for DiscoveryConfig {
-    fn default() -> Self {
-        Self {
-            kind: DiscoveryMode::default(),
-            peers: Vec::new(),
-            path: None,
-            self_addr: None,
-            endpoint_slices: Vec::new(),
-            namespace: None,
-            service_name: None,
-            port_name: default_gossip_port_name(),
-            max_peers: DEFAULT_MAX_PEERS,
-            recent_peer_grace_millis: DEFAULT_RECENT_PEER_GRACE_MILLIS,
-        }
-    }
-}
-
-fn default_max_peers() -> usize {
-    DEFAULT_MAX_PEERS
-}
-
-fn default_recent_peer_grace_millis() -> u64 {
-    DEFAULT_RECENT_PEER_GRACE_MILLIS
-}
-
-fn default_gossip_port_name() -> Option<String> {
-    Some(DEFAULT_GOSSIP_PORT_NAME.to_string())
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct EndpointSliceSelectorConfig {
-    pub namespace: String,
-    pub service_name: String,
-    #[serde(default = "default_gossip_port_name")]
-    pub port_name: Option<String>,
-}
-
-pub use crate::DiscoveryMode as DiscoveryKind;
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct GossipConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    pub bind: Option<SocketAddr>,
-    #[serde(default = "default_gossip_linger_ms")]
-    pub linger_ms: u64,
-    #[serde(default = "default_gossip_fanout")]
-    pub fanout: usize,
-    #[serde(default = "default_gossip_payload_bytes")]
-    pub max_payload_bytes: usize,
-    #[serde(default = "default_gossip_max_cells")]
-    pub max_cells_per_frame: usize,
-    #[serde(default = "default_gossip_cluster_id")]
-    pub cluster_id_hash: u128,
-}
-
-impl Default for GossipConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bind: None,
-            linger_ms: default_gossip_linger_ms(),
-            fanout: default_gossip_fanout(),
-            max_payload_bytes: default_gossip_payload_bytes(),
-            max_cells_per_frame: default_gossip_max_cells(),
-            cluster_id_hash: default_gossip_cluster_id(),
-        }
-    }
-}
-
-fn default_gossip_linger_ms() -> u64 {
-    gossip::DEFAULT_GOSSIP_LINGER_MS
-}
-
-fn default_gossip_fanout() -> usize {
-    3
-}
-
-fn default_gossip_payload_bytes() -> usize {
-    256 * 1024
-}
-
-fn default_gossip_max_cells() -> usize {
-    4096
-}
-
-fn default_gossip_cluster_id() -> u128 {
-    1
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct LimitRuleConfig {
-    pub name: String,
-    pub domain: String,
-    pub descriptors: Vec<DescriptorConfig>,
-    pub limit: u64,
-    pub window: String,
-    pub bucket: String,
-    pub local_fallback_limit: u64,
-    pub local_absolute_limit: u64,
-    pub stale_after: String,
-    #[serde(default)]
-    pub safety_margin: SafetyMarginConfig,
-    #[serde(default = "default_overflow_policy")]
-    pub overflow_policy: OverflowPolicy,
-    #[serde(default = "default_enforcement_mode")]
-    pub mode: EnforcementMode,
-}
-
-impl LimitRuleConfig {
-    fn bucket_count(&self) -> usize {
-        let window = parse_duration_millis(&self.window).unwrap_or(1);
-        let bucket = parse_duration_millis(&self.bucket).unwrap_or(1);
-        window.div_ceil(bucket).max(1) as usize
-    }
-
-    fn to_rule(&self, id: RuleId) -> Result<Rule, ConfigError> {
-        if self.descriptors.is_empty() {
-            return Err(ConfigError::EmptyDescriptorSet(self.name.clone()));
-        }
-        let window_millis = parse_duration_millis(&self.window)
-            .ok_or_else(|| ConfigError::InvalidDuration(self.window.clone()))?;
-        let bucket_millis = parse_duration_millis(&self.bucket)
-            .ok_or_else(|| ConfigError::InvalidDuration(self.bucket.clone()))?;
-        let stale_after_millis = parse_duration_millis(&self.stale_after)
-            .ok_or_else(|| ConfigError::InvalidDuration(self.stale_after.clone()))?;
-
-        Ok(Rule {
-            id,
-            domain_hash: hash_domain(&self.domain),
-            descriptor_matcher: DescriptorMatcher::exact(
-                self.descriptors
-                    .iter()
-                    .map(|descriptor| (descriptor.key.as_str(), descriptor.value.as_str())),
-            ),
-            limit: self.limit,
-            window: WindowSpec {
-                size_millis: window_millis,
-                bucket_count: window_millis.div_ceil(bucket_millis).max(1) as usize,
-            },
-            local_fallback_limit: self.local_fallback_limit,
-            local_absolute_limit: self.local_absolute_limit,
-            stale_after_millis,
-            safety_margin: SafetyMargin {
-                hits: self.safety_margin.hits,
-            },
-            overflow_policy: self.overflow_policy,
-            mode: self.mode,
-        })
-    }
-}
-
-fn default_overflow_policy() -> OverflowPolicy {
-    OverflowPolicy::UseOverflowKey
-}
-
-fn default_enforcement_mode() -> EnforcementMode {
-    EnforcementMode::Enforce
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct DescriptorConfig {
-    pub key: String,
-    #[serde(default)]
-    pub value: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-pub struct SafetyMarginConfig {
-    #[serde(default)]
-    pub hits: u64,
-}
-
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum ConfigError {
-    #[error("invalid duration: {0}")]
-    InvalidDuration(String),
-    #[error("gossip.enabled requires gossip.bind")]
-    MissingGossipBind,
-    #[error("discovery.kind static requires at least one peer")]
-    MissingStaticPeers,
-    #[error("discovery.kind file requires discovery.path")]
-    MissingPeerFile,
-    #[error("discovery.kind kubernetes requires discovery.namespace")]
-    MissingKubernetesNamespace,
-    #[error("discovery.kind kubernetes requires discovery.service_name")]
-    MissingKubernetesServiceName,
-    #[error("discovery.kind kubernetes requires at least one EndpointSlice selector")]
-    MissingKubernetesEndpointSliceSelector,
-    #[error("rule {0} has no descriptors")]
-    EmptyDescriptorSet(String),
-    #[error("configured bucket count {configured} exceeds max_active_buckets {max}")]
-    TooManyBuckets { configured: usize, max: usize },
-}
-
 #[derive(Clone, Debug)]
 pub enum RuntimePeerHandler {
     Static(StaticPeerHandler),
@@ -919,101 +576,5 @@ impl PeerHandler for RuntimePeerHandler {
             Self::File(provider) => provider.peer_removed(peer),
             Self::Snapshot(provider) => provider.peer_removed(peer),
         }
-    }
-}
-
-pub fn peer_provider_from_config(
-    discovery: &DiscoveryConfig,
-) -> Result<RuntimePeerHandler, ConfigError> {
-    match discovery.kind {
-        DiscoveryMode::Auto => Ok(RuntimePeerHandler::Static(StaticPeerHandler::new(
-            Vec::new(),
-            discovery.self_addr,
-        ))),
-        DiscoveryMode::None => Ok(RuntimePeerHandler::Static(StaticPeerHandler::new(
-            Vec::new(),
-            discovery.self_addr,
-        ))),
-        DiscoveryMode::Static => {
-            if discovery.peers.is_empty() {
-                return Err(ConfigError::MissingStaticPeers);
-            }
-            Ok(RuntimePeerHandler::Static(StaticPeerHandler::new(
-                discovery.peers.clone(),
-                discovery.self_addr,
-            )))
-        }
-        DiscoveryMode::File => {
-            let Some(path) = &discovery.path else {
-                return Err(ConfigError::MissingPeerFile);
-            };
-            Ok(RuntimePeerHandler::File(FilePeerHandler::with_capacity(
-                path,
-                discovery.self_addr,
-                discovery.peers.clone(),
-                discovery.max_peers,
-            )))
-        }
-        DiscoveryMode::KubernetesEndpointSlice => Ok(RuntimePeerHandler::Snapshot(
-            SnapshotPeerHandler::with_capacity(discovery.max_peers),
-        )),
-    }
-}
-
-pub fn endpoint_slice_config_from_discovery(
-    discovery: &DiscoveryConfig,
-) -> Result<crate::discovery::kubernetes::EndpointSliceDiscoveryConfig, ConfigError> {
-    endpoint_slice_configs_from_discovery(discovery)?
-        .into_iter()
-        .next()
-        .ok_or(ConfigError::MissingKubernetesEndpointSliceSelector)
-}
-
-pub fn endpoint_slice_configs_from_discovery(
-    discovery: &DiscoveryConfig,
-) -> Result<Vec<crate::discovery::kubernetes::EndpointSliceDiscoveryConfig>, ConfigError> {
-    if !discovery.endpoint_slices.is_empty() {
-        return Ok(discovery
-            .endpoint_slices
-            .iter()
-            .map(
-                |selector| crate::discovery::kubernetes::EndpointSliceDiscoveryConfig {
-                    namespace: selector.namespace.clone(),
-                    service_name: selector.service_name.clone(),
-                    port_name: selector.port_name.clone(),
-                    self_addr: discovery.self_addr,
-                },
-            )
-            .collect());
-    }
-
-    let Some(namespace) = &discovery.namespace else {
-        return Err(ConfigError::MissingKubernetesNamespace);
-    };
-    let Some(service_name) = &discovery.service_name else {
-        return Err(ConfigError::MissingKubernetesServiceName);
-    };
-
-    Ok(vec![
-        crate::discovery::kubernetes::EndpointSliceDiscoveryConfig {
-            namespace: namespace.clone(),
-            service_name: service_name.clone(),
-            port_name: discovery.port_name.clone(),
-            self_addr: discovery.self_addr,
-        },
-    ])
-}
-
-pub fn parse_duration_millis(input: &str) -> Option<u64> {
-    let input = input.trim();
-    let split_at = input.find(|ch: char| !ch.is_ascii_digit())?;
-    let (number, unit) = input.split_at(split_at);
-    let value = number.parse::<u64>().ok()?;
-    match unit.trim() {
-        "ms" => Some(value),
-        "s" => value.checked_mul(1_000),
-        "m" => value.checked_mul(60_000),
-        "h" => value.checked_mul(3_600_000),
-        _ => None,
     }
 }

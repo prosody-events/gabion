@@ -1,6 +1,7 @@
 use super::*;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 struct NginxPeerTableCase {
@@ -313,19 +314,18 @@ fn runtime_drain_records_request_ring_and_updates_shared_aggregates() {
                     value: "*".to_string(),
                 }],
                 limit: 2,
-                window: "100ms".to_string(),
-                bucket: "10ms".to_string(),
+                window: Duration::from_millis(100),
+                bucket: Duration::from_millis(10),
                 local_fallback_limit: 2,
                 local_absolute_limit: 2,
-                stale_after: "2000ms".to_string(),
+                stale_after: Duration::from_millis(2000),
                 safety_margin: gabion::SafetyMarginConfig::default(),
                 overflow_policy: gabion::OverflowPolicy::UseOverflowKey,
                 mode: EnforcementMode::Enforce,
             }],
-            runtime: gabion::RuntimeConfig {
+            runtime: gabion::RuntimeTuningConfig {
                 count_update_batch_size: 2,
             },
-            server: gabion::ServerConfig::default(),
             discovery: gabion::DiscoveryConfig::default(),
             gossip: gabion::GossipConfig::default(),
         },

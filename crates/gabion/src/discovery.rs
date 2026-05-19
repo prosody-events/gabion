@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub mod kubernetes;
@@ -31,7 +31,7 @@ pub const DEFAULT_MAX_PEERS: usize = 128;
 pub const DEFAULT_RECENT_PEER_GRACE_MILLIS: u64 = 30_000;
 pub const DEFAULT_GOSSIP_PORT_NAME: &str = "gossip";
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryMode {
     #[default]

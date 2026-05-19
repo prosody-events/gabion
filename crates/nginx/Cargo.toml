@@ -9,6 +9,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 gabion.workspace = true
+humantime.workspace = true
 kube.workspace = true
 nginx-sys = { workspace = true, optional = true }
 ngx = { workspace = true, optional = true }

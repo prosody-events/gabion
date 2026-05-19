@@ -374,21 +374,21 @@ pub enum GossipSendReason {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GossipSendPolicy {
-    pub linger_ms: u64,
+    pub linger: std::time::Duration,
 }
 
 impl Default for GossipSendPolicy {
     fn default() -> Self {
         Self {
-            linger_ms: DEFAULT_GOSSIP_LINGER_MS,
+            linger: std::time::Duration::from_millis(DEFAULT_GOSSIP_LINGER_MS),
         }
     }
 }
 
 impl GossipSendPolicy {
-    pub fn with_linger_ms(linger_ms: u64) -> Self {
+    pub fn with_linger(linger: std::time::Duration) -> Self {
         Self {
-            linger_ms,
+            linger,
             ..Self::default()
         }
     }
@@ -405,11 +405,15 @@ impl GossipSendPolicy {
         if usage.max_cells != 0 && usage.active_cells >= usage.max_cells {
             return Some(GossipSendReason::PacketFull);
         }
-        if now_millis.saturating_sub(last_send_millis) >= self.linger_ms.max(1) {
+        if now_millis.saturating_sub(last_send_millis) >= duration_millis(self.linger) {
             return Some(GossipSendReason::TimeElapsed);
         }
         None
     }
+}
+
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX).max(1)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -5,12 +5,13 @@ edition.workspace = true
 
 [dependencies]
 axum.workspace = true
+bon.workspace = true
 futures.workspace = true
 hmac.workspace = true
+humantime-serde.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 serde.workspace = true
-serde_yaml.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

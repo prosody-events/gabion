@@ -47,6 +47,12 @@ pub enum EnforcementMode {
     Disabled,
 }
 
+impl Default for EnforcementMode {
+    fn default() -> Self {
+        Self::Enforce
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverflowPolicy {
@@ -56,6 +62,12 @@ pub enum OverflowPolicy {
     AllowUntracked,
     Reject,
     Sample,
+}
+
+impl Default for OverflowPolicy {
+    fn default() -> Self {
+        Self::UseOverflowKey
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

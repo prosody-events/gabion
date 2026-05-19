@@ -15,7 +15,7 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::SharedLimiter;
 use crate::discovery::{Peer, PeerHandler, PeerSnapshot};
@@ -27,7 +27,7 @@ use crate::gossip::{
 };
 use thiserror::Error;
 
-use crate::{GossipConfig, RuntimePeerHandler};
+use crate::{DiscoveryConfig, GossipConfig, RuntimePeerHandler};
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct GossipAdminSnapshot {
@@ -107,7 +107,7 @@ pub struct StandaloneGossipConfig {
     pub remote_dirty_capacity: usize,
     pub auth_key: Option<HmacKey>,
     pub max_peers: usize,
-    pub recent_peer_grace_millis: u64,
+    pub recent_peer_grace: Duration,
     pub send_policy: GossipSendPolicy,
 }
 
@@ -126,9 +126,20 @@ impl StandaloneGossipConfig {
             remote_dirty_capacity: remote_cell_capacity,
             auth_key: None,
             max_peers: 128,
-            recent_peer_grace_millis: 30_000,
-            send_policy: GossipSendPolicy::with_linger_ms(config.linger_ms),
+            recent_peer_grace: Duration::from_millis(30_000),
+            send_policy: GossipSendPolicy::with_linger(config.linger),
         }
+    }
+
+    pub fn from_runtime_config(
+        config: &GossipConfig,
+        discovery: &DiscoveryConfig,
+        remote_cell_capacity: usize,
+    ) -> Self {
+        let mut runtime = Self::from_config(config, remote_cell_capacity);
+        runtime.max_peers = discovery.max_peers;
+        runtime.recent_peer_grace = discovery.recent_peer_grace;
+        runtime
     }
 }
 
@@ -271,7 +282,7 @@ impl<T: GossipTransport, P: PeerHandler> StandaloneGossipRuntime<T, P> {
             digest_buffer: Vec::with_capacity(1),
             peer_authorizer: PeerAuthorizer::with_capacity(
                 config.max_peers,
-                config.recent_peer_grace_millis,
+                duration_millis(config.recent_peer_grace),
             ),
             force_resync: false,
             last_send_millis: 0,
@@ -580,14 +591,18 @@ pub async fn run_udp_runtime_with_admin(
         runtime_config,
         admin_snapshot,
     );
-    run_runtime(runtime, config.linger_ms).await
+    run_runtime(runtime, config.linger).await
+}
+
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX).max(1)
 }
 
 pub async fn run_runtime<T: GossipTransport, P: PeerHandler>(
     mut runtime: StandaloneGossipRuntime<T, P>,
-    linger_ms: u64,
+    linger: Duration,
 ) -> Result<(), GossipRuntimeError> {
-    let wake_millis = linger_ms.max(1).div_ceil(4).max(1);
+    let wake_millis = duration_millis(linger).div_ceil(4).max(1);
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(wake_millis));
 
     loop {
