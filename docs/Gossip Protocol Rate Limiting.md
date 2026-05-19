@@ -393,7 +393,7 @@ Rules are loaded at configuration time.
 ```rust
 pub struct Rule {
     pub id: RuleId,
-    pub domain_hash: u64,
+    pub domain_hash: KeyHash,
     pub descriptor_matcher: DescriptorMatcher,
     pub limit: u64,
     pub window: WindowSpec,
@@ -494,8 +494,7 @@ Remote CRDT state lives in a separate global cell table.
 #[repr(C)]
 pub struct CellEntry {
     rule_id: RuleId,
-    key_hash_hi: u64,
-    key_hash_lo: u64,
+    key_hash: u128,
     bucket_start_millis: i64,
     origin_node: NodeIndex,
     origin_incarnation: u64,
@@ -787,11 +786,9 @@ A fixed-width `CounterCell` avoids allocation-heavy decoding:
 #[repr(C)]
 pub struct WireCounterCell {
     rule_id: u64,
-    key_hash_hi: u64,
-    key_hash_lo: u64,
+    key_hash: u128,
     bucket_start_millis: i64,
-    origin_node_id_hi: u64,
-    origin_node_id_lo: u64,
+    origin_node_id: u128,
     origin_incarnation: u64,
     count: u64,
 }
@@ -995,7 +992,7 @@ storage:
 
 ```yaml
 discovery:
-  kind: kubernetes_endpoint_slice
+  kind: kubernetes
   namespace: default
   service_name: rate-gossipd
   port_name: gossip
@@ -1328,13 +1325,13 @@ storage:
   gossip_buffer_bytes: 262144
 
 discovery:
-  kind: kubernetes_endpoint_slice
+  kind: kubernetes
   namespace: default
   service_name: rate-gossipd
   port_name: gossip
 
 gossip:
-  interval: 250ms
+  linger_ms: 250
   fanout: 3
   peer_timeout: 50ms
   max_payload_bytes: 262144

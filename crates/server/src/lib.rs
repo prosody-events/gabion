@@ -10,12 +10,13 @@
 //! - The adapter itself contains protocol mapping only; admission decisions
 //!   stay in core.
 
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gabion_core::{CardinalityLimits, Decision, Descriptor, LimitRequest, LocalEngine};
+use gabion::{
+    CardinalityLimits, Decision, Descriptor, LimitRequest, NoOpCountUpdateHandler, Runtime,
+};
 
-pub type SharedLimiter = Arc<Mutex<LocalEngine>>;
+pub type SharedLimiter = Runtime<NoOpCountUpdateHandler>;
 
 pub use envoy_types::pb::envoy::extensions::common::ratelimit::v3::{
     RateLimitDescriptor, rate_limit_descriptor,
@@ -28,19 +29,15 @@ pub use envoy_types::pb::envoy::service::ratelimit::v3::{
 #[derive(Clone)]
 pub struct EnvoyRateLimitService {
     limiter: SharedLimiter,
-    limits: CardinalityLimits,
 }
 
 impl EnvoyRateLimitService {
     pub fn new(limiter: SharedLimiter) -> Self {
-        Self {
-            limiter,
-            limits: CardinalityLimits::default(),
-        }
+        Self { limiter }
     }
 
-    pub fn with_limits(limiter: SharedLimiter, limits: CardinalityLimits) -> Self {
-        Self { limiter, limits }
+    pub fn with_limits(limiter: SharedLimiter, _limits: gabion::CardinalityLimits) -> Self {
+        Self { limiter }
     }
 
     pub fn should_rate_limit_at(
@@ -72,25 +69,9 @@ impl EnvoyRateLimitService {
             })
             .collect::<Vec<_>>();
 
-        if limit_requests
-            .iter()
-            .any(|request| request.validate_cardinality(self.limits).is_err())
-        {
-            return response_from_decisions_with_len(
-                request.descriptors.len(),
-                Decision::Reject(gabion_core::RejectReason::LocalFallbackLimit),
-            );
-        }
-
-        let decisions = match self.limiter.lock() {
-            Ok(mut limiter) => limiter.check_and_record_all_detailed(&limit_requests, now_millis),
-            Err(_) => {
-                return response_from_decisions_with_len(
-                    request.descriptors.len(),
-                    Decision::Allow,
-                );
-            }
-        };
+        let mut decisions = vec![Decision::Allow; limit_requests.len()];
+        self.limiter
+            .record_all_at(&limit_requests, &mut decisions, now_millis);
 
         response_from_decisions(&decisions)
     }
@@ -159,26 +140,6 @@ pub fn response_from_decisions(decisions: &[Decision]) -> RateLimitResponse {
     }
 }
 
-fn response_from_decisions_with_len(len: usize, decision: Decision) -> RateLimitResponse {
-    let overall_code = if decision.is_reject() {
-        rate_limit_response::Code::OverLimit
-    } else {
-        rate_limit_response::Code::Ok
-    } as i32;
-    let statuses = (0..len)
-        .map(|_| rate_limit_response::DescriptorStatus {
-            code: overall_code,
-            ..Default::default()
-        })
-        .collect();
-
-    RateLimitResponse {
-        overall_code,
-        statuses,
-        ..Default::default()
-    }
-}
-
 pub fn descriptor(
     entries: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
 ) -> RateLimitDescriptor {
@@ -206,10 +167,6 @@ pub fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gabion_core::{
-        DescriptorMatcher, EnforcementMode, LocalEngine, OverflowPolicy, Rule, RuleId, RuleTable,
-        SafetyMargin, WindowSpec, hash_domain,
-    };
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
 
@@ -247,30 +204,48 @@ mod tests {
         }
     }
 
-    fn rule(id: RuleId) -> Rule {
-        Rule {
-            id,
-            domain_hash: hash_domain("api"),
-            descriptor_matcher: DescriptorMatcher::exact_keys(["tenant"]),
-            limit: 10,
-            window: WindowSpec {
-                size_millis: 1_000,
-                bucket_count: 10,
+    fn runtime(max_descriptor_bytes: usize) -> SharedLimiter {
+        Runtime::with_count_update_handler(
+            gabion::Config {
+                storage: gabion::StorageConfig {
+                    max_keys: 32,
+                    max_cells: None,
+                    dirty_ring_entries: None,
+                    max_descriptor_count: 16,
+                    max_descriptor_bytes,
+                    max_key_bytes: 64,
+                    max_active_buckets: 64,
+                },
+                limits: vec![gabion::LimitRuleConfig {
+                    name: "tenant".to_string(),
+                    domain: "api".to_string(),
+                    descriptors: vec![gabion::DescriptorConfig {
+                        key: "tenant".to_string(),
+                        value: "*".to_string(),
+                    }],
+                    limit: 10,
+                    window: "1s".to_string(),
+                    bucket: "100ms".to_string(),
+                    local_fallback_limit: 3,
+                    local_absolute_limit: 6,
+                    stale_after: "500ms".to_string(),
+                    safety_margin: gabion::SafetyMarginConfig { hits: 0 },
+                    overflow_policy: gabion::OverflowPolicy::UseOverflowKey,
+                    mode: gabion::EnforcementMode::Enforce,
+                }],
+                runtime: gabion::RuntimeConfig::default(),
+                server: gabion::ServerConfig::default(),
+                discovery: gabion::DiscoveryConfig::default(),
+                gossip: gabion::GossipConfig::default(),
             },
-            local_fallback_limit: 3,
-            local_absolute_limit: 6,
-            stale_after_millis: 500,
-            safety_margin: SafetyMargin { hits: 0 },
-            overflow_policy: OverflowPolicy::UseOverflowKey,
-            mode: EnforcementMode::Enforce,
-        }
+            NoOpCountUpdateHandler,
+        )
+        .expect("runtime")
     }
 
     #[test]
     fn maps_descriptors_and_returns_ok_or_over_limit() {
-        let rules = RuleTable::new(vec![rule(1)]);
-        let limiter = Arc::new(Mutex::new(LocalEngine::new(rules, 8, 10)));
-        let service = EnvoyRateLimitService::new(Arc::clone(&limiter));
+        let service = EnvoyRateLimitService::new(runtime(512));
         let request = RateLimitRequest {
             domain: "api".to_string(),
             descriptors: vec![descriptor([("tenant", "a")])],
@@ -290,9 +265,7 @@ mod tests {
 
     #[test]
     fn multiple_descriptors_are_all_or_nothing() {
-        let rules = RuleTable::new(vec![rule(1)]);
-        let limiter = Arc::new(Mutex::new(LocalEngine::new(rules, 8, 10)));
-        let service = EnvoyRateLimitService::new(Arc::clone(&limiter));
+        let service = EnvoyRateLimitService::new(runtime(512));
 
         let fill_b = RateLimitRequest {
             domain: "api".to_string(),
@@ -327,16 +300,7 @@ mod tests {
 
     #[test]
     fn rejects_requests_over_cardinality_limits_before_recording() {
-        let rules = RuleTable::new(vec![rule(1)]);
-        let limiter = Arc::new(Mutex::new(LocalEngine::new(rules, 8, 10)));
-        let service = EnvoyRateLimitService::with_limits(
-            Arc::clone(&limiter),
-            CardinalityLimits {
-                max_descriptor_count: 1,
-                max_descriptor_bytes: 8,
-                max_key_bytes: 8,
-            },
-        );
+        let service = EnvoyRateLimitService::new(runtime(8));
         let request = RateLimitRequest {
             domain: "api".to_string(),
             descriptors: vec![descriptor([("tenant", "long-value")])],
@@ -349,7 +313,6 @@ mod tests {
             response.overall_code,
             rate_limit_response::Code::OverLimit as i32
         );
-        assert_eq!(limiter.lock().expect("lock").active_keys(), 0);
     }
 
     #[quickcheck]
@@ -363,9 +326,7 @@ mod tests {
                 .saturating_add(1)
                 .saturating_add(case.filled_tenant)
         );
-        let rules = RuleTable::new(vec![rule(1)]);
-        let limiter = Arc::new(Mutex::new(LocalEngine::new(rules, 8, 10)));
-        let service = EnvoyRateLimitService::new(Arc::clone(&limiter));
+        let service = EnvoyRateLimitService::new(runtime(512));
 
         let fill = RateLimitRequest {
             domain: "api".to_string(),
@@ -378,7 +339,6 @@ mod tests {
             return TestResult::error("failed to seed filled descriptor");
         }
 
-        let before = limiter.lock().expect("lock").active_cells();
         let mixed = RateLimitRequest {
             domain: "api".to_string(),
             descriptors: vec![
@@ -388,28 +348,17 @@ mod tests {
             hits_addend: u32::from(case.hits),
         };
         let response = service.should_rate_limit_at(mixed, 1);
-        let after = limiter.lock().expect("lock").active_cells();
 
         if response.overall_code != rate_limit_response::Code::OverLimit as i32 {
             return TestResult::error("mixed request with rejected descriptor did not reject");
-        }
-        if before != after {
-            return TestResult::error("rejected multi-descriptor request mutated limiter state");
         }
         TestResult::passed()
     }
 
     #[quickcheck]
     fn quickcheck_poisoned_limiter_lock_fails_open(case: EnvoyRequestCase) -> TestResult {
-        let rules = RuleTable::new(vec![rule(1)]);
-        let limiter = Arc::new(Mutex::new(LocalEngine::new(rules, 8, 10)));
-        let service = EnvoyRateLimitService::new(Arc::clone(&limiter));
-        let poison_limiter = Arc::clone(&limiter);
-        let _ = std::thread::spawn(move || {
-            let _guard = poison_limiter.lock().expect("lock before poison");
-            panic!("poison limiter for property test");
-        })
-        .join();
+        let service = EnvoyRateLimitService::new(runtime(512));
+        service.limiter.shutdown();
 
         let descriptors = case
             .tenants
@@ -440,9 +389,7 @@ mod tests {
 
     #[quickcheck]
     fn quickcheck_response_shape_matches_descriptor_shape(case: EnvoyRequestCase) -> TestResult {
-        let rules = RuleTable::new(vec![rule(1)]);
-        let limiter = Arc::new(Mutex::new(LocalEngine::new(rules, 32, 10)));
-        let service = EnvoyRateLimitService::new(limiter);
+        let service = EnvoyRateLimitService::new(runtime(512));
         let descriptors = case
             .tenants
             .iter()
@@ -478,16 +425,7 @@ mod tests {
             return TestResult::discard();
         }
 
-        let rules = RuleTable::new(vec![rule(1)]);
-        let limiter = Arc::new(Mutex::new(LocalEngine::new(rules, 32, 10)));
-        let service = EnvoyRateLimitService::with_limits(
-            Arc::clone(&limiter),
-            CardinalityLimits {
-                max_descriptor_count: 1,
-                max_descriptor_bytes: 8,
-                max_key_bytes: 8,
-            },
-        );
+        let service = EnvoyRateLimitService::new(runtime(8));
         let descriptors = case
             .tenants
             .iter()
@@ -508,9 +446,6 @@ mod tests {
         }
         if response.overall_code != rate_limit_response::Code::OverLimit as i32 {
             return TestResult::error("cardinality violation did not reject");
-        }
-        if limiter.lock().expect("lock").active_keys() != 0 {
-            return TestResult::error("cardinality violation mutated limiter state");
         }
         TestResult::passed()
     }

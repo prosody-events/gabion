@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 pub const DEFAULT_MAX_PEERS: usize = 128;
 pub const DEFAULT_RECENT_PEER_GRACE_MILLIS: u64 = 30_000;
@@ -34,6 +35,7 @@ pub enum DiscoveryMode {
     None,
     Static,
     File,
+    #[serde(rename = "kubernetes")]
     KubernetesEndpointSlice,
 }
 
@@ -112,6 +114,49 @@ pub trait PeerHandler {
     fn peer_added(&self, _peer: Peer) {}
 
     fn peer_removed(&self, _peer: Peer) {}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeerEvent {
+    Added(Peer),
+    Removed(Peer),
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelPeerHandler {
+    snapshot: SnapshotPeerHandler,
+    events: mpsc::Sender<PeerEvent>,
+}
+
+impl ChannelPeerHandler {
+    pub fn with_capacity(max_peers: usize, events: mpsc::Sender<PeerEvent>) -> Self {
+        Self {
+            snapshot: SnapshotPeerHandler::with_capacity(max_peers),
+            events,
+        }
+    }
+}
+
+impl PeerHandler for ChannelPeerHandler {
+    fn snapshot(&self) -> PeerSnapshot {
+        self.snapshot.snapshot()
+    }
+
+    fn peer_added(&self, peer: Peer) {
+        let before = self.snapshot.snapshot().generation();
+        self.snapshot.peer_added(peer);
+        if self.snapshot.snapshot().generation() != before {
+            let _ = self.events.try_send(PeerEvent::Added(peer));
+        }
+    }
+
+    fn peer_removed(&self, peer: Peer) {
+        let before = self.snapshot.snapshot().generation();
+        self.snapshot.peer_removed(peer);
+        if self.snapshot.snapshot().generation() != before {
+            let _ = self.events.try_send(PeerEvent::Removed(peer));
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -264,9 +309,8 @@ impl PeerHandler for FilePeerHandler {
     }
 }
 
-pub async fn run_file_peer_events(handler: FilePeerHandler, interval_millis: u64) {
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_millis(interval_millis.max(1)));
+pub async fn run_file_peer_events(handler: FilePeerHandler, poll_millis: u64) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(poll_millis.max(1)));
 
     loop {
         publish_file_peer_event(&handler, &mut interval).await;
@@ -597,7 +641,8 @@ pub mod kubernetes {
     use kube::runtime::watcher::{Config as WatcherConfig, Event, watcher};
     use kube::{Api, Client};
 
-    use crate::{DEFAULT_GOSSIP_PORT_NAME, Peer, SnapshotPeerHandler, publish_peer_snapshot};
+    use super::publish_peer_snapshot;
+    use crate::discovery::{DEFAULT_GOSSIP_PORT_NAME, Peer, PeerHandler};
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct EndpointSliceDiscoveryConfig {
@@ -618,6 +663,7 @@ pub mod kubernetes {
 
     pub fn incluster_client() -> Option<Client> {
         kube::Config::incluster_env()
+            .or_else(|_| kube::Config::incluster_dns())
             .ok()
             .and_then(|config| Client::try_from(config).ok())
     }
@@ -737,7 +783,7 @@ pub mod kubernetes {
     pub async fn run_endpoint_slice_watcher(
         client: Client,
         config: EndpointSliceDiscoveryConfig,
-        provider: SnapshotPeerHandler,
+        provider: impl PeerHandler,
     ) -> Result<(), kube::runtime::watcher::Error> {
         let api: Api<EndpointSlice> = Api::namespaced(client, &config.namespace);
         let labels = format!("kubernetes.io/service-name={}", config.service_name);
@@ -813,7 +859,7 @@ pub mod kubernetes {
     pub async fn run_endpoint_slice_watchers(
         client: Client,
         configs: Vec<EndpointSliceDiscoveryConfig>,
-        provider: SnapshotPeerHandler,
+        provider: impl PeerHandler + Clone + Send + Sync + 'static,
     ) {
         let state = Arc::new(Mutex::new(MergedEndpointSliceState::new(configs.len())));
 

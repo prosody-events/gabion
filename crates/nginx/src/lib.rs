@@ -1,4 +1,4 @@
-//! NGINX request-path adapter, bounded peer tables, and embedded gossip pieces.
+//! NGINX request-path adapter and bounded configuration tables.
 //!
 //! Invariants:
 //! - Request-path local limiting performs no network or Kubernetes I/O.
@@ -6,41 +6,43 @@
 //! - Peer tables are sorted, deduplicated, bounded, and exclude self.
 //! - Peer-file loading uses caller-provided scratch memory and rejects
 //!   oversized files.
-//! - Embedded gossip sends only from the elected owner and uses caller-owned
-//!   buffers.
-//! - Embedded gossip receive decodes through visitor callbacks and rejects
-//!   invalid frames before mutating cell state.
 //! - Kubernetes selector config is bounded and defaults the gossip port name
 //!   consistently.
 
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
-use gabion_core::{
-    Decision, Descriptor, DescriptorMatcher, EnforcementMode, LimitRequest, LocalEngine,
-    OverflowPolicy, Rule, RuleId, RuleTable, SafetyMargin, WindowSpec, hash_domain,
-};
-use gabion_discovery::{DEFAULT_GOSSIP_PORT_NAME, DiscoveryMode};
-use gabion_gossip::{
-    CellTable, CounterCell, DecodeError, GossipHeader, GossipLimits, GossipMessage, HmacKey,
-    NodeId, decode_authenticated_message_visit_checked, decode_message_visit_checked,
-    encode_authenticated_message, encode_message,
+use gabion::DiscoveryMode;
+use gabion::{
+    ApplyBatchOutcome, CountAggregate, CountUpdateHandler, Decision, EnforcementMode,
+    HashedLimitRequest, HashedLimitRequestBuilder, RuleId, Runtime, TimedHashedLimitRequest,
 };
 use thiserror::Error;
 
 #[cfg(feature = "ngx-module")]
 mod module;
+mod request_queue;
+
+pub use request_queue::{
+    RequestEvent, SharedRequestEventRecord, SharedRequestQueue, SharedRequestRingControl,
+};
 
 pub const MAX_NAME_BYTES: usize = 64;
 pub const MAX_KEY_COMPONENTS: usize = 8;
 pub const MAX_NGINX_PEERS: usize = 64;
 pub const MAX_ENDPOINT_SLICE_SELECTORS: usize = 16;
+pub const MAX_PEER_FILE_PATH_BYTES: usize = 256;
 pub const MAX_NGINX_SHM_RULES: usize = 16;
 pub const MAX_NGINX_SHM_BUCKETS: usize = DEFAULT_MAX_ACTIVE_BUCKETS;
 pub const DEFAULT_MAX_ACTIVE_BUCKETS: usize = 64;
 pub const DEFAULT_GOSSIP_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const DEFAULT_GOSSIP_MAX_CELLS: usize = 4096;
+pub const DEFAULT_GOSSIP_FANOUT: usize = 3;
+pub const DEFAULT_GOSSIP_CLUSTER_ID_HASH: u128 = 1;
+pub const DEFAULT_GOSSIP_LINGER_MS: u64 = 250;
+pub const DEFAULT_GOSSIP_PORT_NAME: &str = "gossip";
 const SHM_MAGIC: u32 = 0x4742_4e58;
 const SHM_VERSION: u16 = 1;
 const SHM_LOCK_FREE: u16 = 0;
@@ -59,13 +61,6 @@ impl NginxStatus {
             Decision::Reject(_) => Self::TooManyRequests,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GossipMode {
-    Off,
-    FilePeers,
-    Embedded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,20 +141,60 @@ impl Default for NginxEndpointSliceSelectors {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NginxDiscoveryConfig {
     pub kind: DiscoveryMode,
+    pub bind_addr: Option<SocketAddr>,
     pub self_addr: Option<SocketAddr>,
+    pub static_peers: NginxPeerTable,
+    pub peer_file_path: FixedName<MAX_PEER_FILE_PATH_BYTES>,
     pub endpoint_slices: NginxEndpointSliceSelectors,
+    pub linger_ms: u64,
+    pub fanout: usize,
+    pub max_payload_bytes: usize,
+    pub max_cells_per_frame: usize,
+    pub cluster_id_hash: u128,
 }
 
 impl NginxDiscoveryConfig {
     pub fn local_default() -> Self {
         Self {
             kind: DiscoveryMode::default(),
+            bind_addr: None,
             self_addr: None,
+            static_peers: NginxPeerTable::empty(),
+            peer_file_path: FixedName::empty(),
             endpoint_slices: NginxEndpointSliceSelectors::empty(),
+            linger_ms: DEFAULT_GOSSIP_LINGER_MS,
+            fanout: DEFAULT_GOSSIP_FANOUT,
+            max_payload_bytes: DEFAULT_GOSSIP_PAYLOAD_BYTES,
+            max_cells_per_frame: DEFAULT_GOSSIP_MAX_CELLS,
+            cluster_id_hash: DEFAULT_GOSSIP_CLUSTER_ID_HASH,
         }
+    }
+
+    pub fn set_kind(&mut self, kind: DiscoveryMode) {
+        self.kind = kind;
+    }
+
+    pub fn set_self_addr(&mut self, self_addr: SocketAddr) {
+        self.self_addr = Some(self_addr);
+    }
+
+    pub fn set_bind_addr(&mut self, bind_addr: SocketAddr) {
+        self.bind_addr = Some(bind_addr);
+    }
+
+    pub fn add_static_peer(&mut self, peer: SocketAddr) -> Result<(), NginxPeerConfigError> {
+        if Some(peer) == self.self_addr {
+            return Ok(());
+        }
+        self.static_peers.insert(NginxPeer::new(peer))
+    }
+
+    pub fn set_peer_file_path(&mut self, path: &str) -> Result<(), NginxConfigError> {
+        self.peer_file_path = FixedName::new(path)?;
+        Ok(())
     }
 
     pub fn add_endpoint_slice(
@@ -175,11 +210,24 @@ impl NginxDiscoveryConfig {
         )?)
     }
 
-    pub fn auto_incluster_client(&self) -> Option<kube::Client> {
-        if self.kind != DiscoveryMode::Auto {
-            return None;
-        }
-        gabion_discovery::kubernetes::incluster_client()
+    pub fn set_linger_ms(&mut self, millis: u64) {
+        self.linger_ms = millis.max(1);
+    }
+
+    pub fn set_fanout(&mut self, fanout: usize) {
+        self.fanout = fanout.max(1);
+    }
+
+    pub fn set_max_payload_bytes(&mut self, bytes: usize) {
+        self.max_payload_bytes = bytes.max(68);
+    }
+
+    pub fn set_max_cells_per_frame(&mut self, cells: usize) {
+        self.max_cells_per_frame = cells.max(1);
+    }
+
+    pub fn set_cluster_id_hash(&mut self, cluster_id_hash: u128) {
+        self.cluster_id_hash = cluster_id_hash;
     }
 }
 
@@ -187,56 +235,6 @@ impl Default for NginxDiscoveryConfig {
     fn default() -> Self {
         Self::local_default()
     }
-}
-
-pub async fn load_kubernetes_peer_table(
-    client: kube::Client,
-    discovery: &NginxDiscoveryConfig,
-) -> Result<NginxPeerTable, NginxGossipError> {
-    let configs = if let Some(configs) = endpoint_slice_configs_from_nginx_discovery(discovery) {
-        configs
-    } else {
-        gabion_discovery::kubernetes::running_service_endpoint_slice_configs(
-            client.clone(),
-            discovery.self_addr,
-        )
-        .await
-        .map_err(|_| NginxGossipError::KubernetesDiscovery)?
-    };
-    let peers = gabion_discovery::kubernetes::initial_endpoint_slice_snapshots(client, &configs)
-        .await
-        .map_err(|_| NginxGossipError::KubernetesDiscovery)?;
-    let mut table = NginxPeerTable::empty();
-
-    for peer in peers {
-        table.insert(NginxPeer::new(peer.addr))?;
-    }
-
-    Ok(table)
-}
-
-fn endpoint_slice_configs_from_nginx_discovery(
-    discovery: &NginxDiscoveryConfig,
-) -> Option<Vec<gabion_discovery::kubernetes::EndpointSliceDiscoveryConfig>> {
-    if discovery.endpoint_slices.is_empty() {
-        return None;
-    }
-
-    Some(
-        discovery
-            .endpoint_slices
-            .as_slice()
-            .iter()
-            .map(
-                |selector| gabion_discovery::kubernetes::EndpointSliceDiscoveryConfig {
-                    namespace: selector.namespace.as_str().to_string(),
-                    service_name: selector.service_name.as_str().to_string(),
-                    port_name: Some(selector.port_name.as_str().to_string()),
-                    self_addr: discovery.self_addr,
-                },
-            )
-            .collect(),
-    )
 }
 
 impl<const N: usize> FixedName<N> {
@@ -359,36 +357,6 @@ pub struct NginxRuleConfig {
     pub local_absolute_limit: u64,
     pub stale_after_millis: u64,
     pub mode: EnforcementMode,
-    pub gossip: GossipMode,
-}
-
-impl NginxRuleConfig {
-    pub fn to_core_rule(&self) -> Rule {
-        Rule {
-            id: self.id,
-            domain_hash: hash_domain(self.domain.as_str()),
-            descriptor_matcher: DescriptorMatcher::exact_keys(
-                self.key_components
-                    .as_slice()
-                    .iter()
-                    .map(|component| component.variable.as_str()),
-            ),
-            limit: self.limit,
-            window: WindowSpec {
-                size_millis: self.window_millis,
-                bucket_count: self
-                    .window_millis
-                    .div_ceil(self.bucket_millis.max(1))
-                    .max(1) as usize,
-            },
-            local_fallback_limit: self.local_fallback_limit,
-            local_absolute_limit: self.local_absolute_limit,
-            stale_after_millis: self.stale_after_millis,
-            safety_margin: SafetyMargin { hits: 0 },
-            overflow_policy: OverflowPolicy::UseOverflowKey,
-            mode: self.mode,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -434,7 +402,6 @@ impl NginxRuleBuilder<'_> {
             local_absolute_limit,
             stale_after_millis,
             mode: self.mode,
-            gossip: GossipMode::Off,
         })
     }
 }
@@ -452,64 +419,16 @@ pub struct NginxRequest<'a> {
     pub hits: u64,
 }
 
-impl NginxRequest<'_> {
-    fn variable(&self, name: &str) -> Option<&str> {
-        self.variables
-            .iter()
-            .find(|variable| variable.name == name)
-            .map(|variable| variable.value)
-    }
-}
-
-pub struct NginxLocalOnlyAdapter {
-    engine: LocalEngine,
-    rule: NginxRuleConfig,
-}
-
-impl NginxLocalOnlyAdapter {
-    pub fn new(zone: NginxZoneConfig, rule: NginxRuleConfig) -> Self {
-        let core_rule = rule.to_core_rule();
-        let bucket_count = core_rule.window.bucket_count;
-        Self {
-            engine: LocalEngine::new(RuleTable::new(vec![core_rule]), zone.max_keys, bucket_count),
-            rule,
-        }
-    }
-
-    pub fn access_phase(&mut self, request: NginxRequest<'_>, now_millis: u64) -> NginxStatus {
-        let mut descriptors = [Descriptor { key: "", value: "" }; MAX_KEY_COMPONENTS];
-        let mut count = 0;
-
-        for component in self.rule.key_components.as_slice() {
-            let key = component.variable.as_str();
-            let Some(value) = request.variable(key) else {
-                return NginxStatus::Declined;
-            };
-            descriptors[count] = Descriptor { key, value };
-            count += 1;
-        }
-
-        let limit_request = LimitRequest {
-            domain: request.domain,
-            descriptors: &descriptors[..count],
-            hits: request.hits,
-        };
-        NginxStatus::from_decision(self.engine.check_and_record(limit_request, now_millis))
-    }
-
-    pub fn active_keys(&self) -> usize {
-        self.engine.active_keys()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NginxShmLayout {
     pub max_rules: usize,
     pub max_keys: usize,
     pub bucket_count: usize,
     rules_offset: usize,
-    keys_offset: usize,
-    buckets_offset: usize,
+    request_ring_offset: usize,
+    request_events_offset: usize,
+    aggregates_offset: usize,
+    leader_offset: usize,
     stats_offset: usize,
     total_bytes: usize,
 }
@@ -521,12 +440,28 @@ impl NginxShmLayout {
         let bucket_count = bucket_count.clamp(1, MAX_NGINX_SHM_BUCKETS);
         let rules_offset = align_up(std::mem::size_of::<StoreHeader>(), align_of_shm())?;
         let rules_bytes = std::mem::size_of::<RuleRuntimeRecord>().checked_mul(max_rules)?;
-        let keys_offset = align_up(rules_offset.checked_add(rules_bytes)?, align_of_shm())?;
-        let keys_bytes = std::mem::size_of::<KeyRuntimeRecord>().checked_mul(max_keys)?;
-        let buckets_offset = align_up(keys_offset.checked_add(keys_bytes)?, align_of_shm())?;
         let bucket_slots = max_keys.checked_mul(bucket_count)?;
-        let buckets_bytes = std::mem::size_of::<BucketRuntimeRecord>().checked_mul(bucket_slots)?;
-        let stats_offset = align_up(buckets_offset.checked_add(buckets_bytes)?, align_of_shm())?;
+        let request_ring_offset = align_up(rules_offset.checked_add(rules_bytes)?, align_of_shm())?;
+        let request_events_offset = align_up(
+            request_ring_offset.checked_add(std::mem::size_of::<SharedRequestRingControl>())?,
+            align_of_shm(),
+        )?;
+        let event_bytes =
+            std::mem::size_of::<SharedRequestEventRecord>().checked_mul(bucket_slots)?;
+        let aggregates_offset = align_up(
+            request_events_offset.checked_add(event_bytes)?,
+            align_of_shm(),
+        )?;
+        let aggregates_bytes =
+            std::mem::size_of::<SharedCountAggregateRecord>().checked_mul(bucket_slots)?;
+        let leader_offset = align_up(
+            aggregates_offset.checked_add(aggregates_bytes)?,
+            align_of_shm(),
+        )?;
+        let stats_offset = align_up(
+            leader_offset.checked_add(std::mem::size_of::<SharedLeaderLease>())?,
+            align_of_shm(),
+        )?;
         let total_bytes = align_up(
             stats_offset.checked_add(std::mem::size_of::<SharedStatsCounters>())?,
             align_of_shm(),
@@ -537,8 +472,10 @@ impl NginxShmLayout {
             max_keys,
             bucket_count,
             rules_offset,
-            keys_offset,
-            buckets_offset,
+            request_ring_offset,
+            request_events_offset,
+            aggregates_offset,
+            leader_offset,
             stats_offset,
             total_bytes,
         })
@@ -547,13 +484,23 @@ impl NginxShmLayout {
     pub fn total_bytes(self) -> usize {
         self.total_bytes
     }
+
+    pub fn aggregate_capacity(self) -> usize {
+        self.max_keys * self.bucket_count
+    }
+
+    pub fn request_event_capacity(self) -> usize {
+        self.max_keys * self.bucket_count
+    }
 }
 
 fn align_of_shm() -> usize {
     std::mem::align_of::<StoreHeader>()
         .max(std::mem::align_of::<RuleRuntimeRecord>())
-        .max(std::mem::align_of::<KeyRuntimeRecord>())
-        .max(std::mem::align_of::<BucketRuntimeRecord>())
+        .max(std::mem::align_of::<SharedRequestRingControl>())
+        .max(std::mem::align_of::<SharedRequestEventRecord>())
+        .max(std::mem::align_of::<SharedCountAggregateRecord>())
+        .max(std::mem::align_of::<SharedLeaderLease>())
         .max(std::mem::align_of::<SharedStatsCounters>())
 }
 
@@ -608,41 +555,44 @@ impl RuleRuntimeRecord {
 }
 
 #[repr(C)]
-#[derive(Debug)]
-pub struct KeyRuntimeRecord {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SharedCountAggregateRecord {
     rule_id: u32,
-    hash: u64,
-    occupied: u8,
-    overflow: u8,
-    reserved: [u8; 6],
-    local_window_total: u64,
-}
-
-impl KeyRuntimeRecord {
-    fn empty() -> Self {
-        Self {
-            rule_id: 0,
-            hash: 0,
-            occupied: 0,
-            overflow: 0,
-            reserved: [0; 6],
-            local_window_total: 0,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct BucketRuntimeRecord {
-    start_millis: u64,
+    key_hash: u128,
+    bucket_start_millis: u64,
     count: u64,
 }
 
-impl BucketRuntimeRecord {
+impl SharedCountAggregateRecord {
     fn empty() -> Self {
+        Self::default()
+    }
+
+    fn is_empty(self) -> bool {
+        self.count == 0
+    }
+
+    fn matches(self, aggregate: CountAggregate) -> bool {
+        self.rule_id == aggregate.rule_id
+            && self.key_hash == u128::from(aggregate.key_hash)
+            && self.bucket_start_millis == aggregate.bucket_start_millis
+    }
+
+    fn from_aggregate(aggregate: CountAggregate) -> Self {
         Self {
-            start_millis: 0,
-            count: 0,
+            rule_id: aggregate.rule_id,
+            key_hash: u128::from(aggregate.key_hash),
+            bucket_start_millis: aggregate.bucket_start_millis,
+            count: aggregate.count,
+        }
+    }
+
+    pub fn as_aggregate(self) -> CountAggregate {
+        CountAggregate {
+            rule_id: self.rule_id,
+            key_hash: self.key_hash.into(),
+            bucket_start_millis: self.bucket_start_millis,
+            count: self.count,
         }
     }
 }
@@ -681,6 +631,44 @@ pub enum NgxShmAccessError {
 
 pub trait NginxVariableLookup {
     fn value<'a>(&'a self, name: &str) -> Option<&'a [u8]>;
+}
+
+pub trait NginxRequestEventSource {
+    fn try_acquire_runtime_leader(&self, worker_id: u32, now_millis: u64, ttl_millis: u64) -> bool;
+
+    fn drain_request_events(&mut self, out: &mut [RequestEvent]) -> usize;
+}
+
+pub fn drain_request_events_into_runtime<H: CountUpdateHandler>(
+    source: &mut impl NginxRequestEventSource,
+    runtime: &Runtime<H>,
+    events: &mut [RequestEvent],
+    requests: &mut [TimedHashedLimitRequest],
+    aggregates: &mut [CountAggregate],
+) -> usize {
+    let capacity = events.len().min(requests.len());
+    if capacity == 0 || aggregates.is_empty() {
+        return 0;
+    }
+
+    let events = &mut events[..capacity];
+    let mut recorded = 0_usize;
+    loop {
+        let drained = source.drain_request_events(events);
+        if drained == 0 {
+            break;
+        }
+        for index in 0..drained {
+            requests[index] =
+                TimedHashedLimitRequest::new(events[index].as_hashed(), events[index].now_millis);
+        }
+        recorded = recorded
+            .saturating_add(runtime.record_timed_hashed_batch(&requests[..drained], aggregates));
+        if drained < events.len() {
+            break;
+        }
+    }
+    recorded
 }
 
 #[derive(Debug)]
@@ -730,12 +718,22 @@ impl NgxShmStore {
             for index in 0..layout.max_rules {
                 std::ptr::write(store.rule_mut(index), RuleRuntimeRecord::empty());
             }
-            for index in 0..layout.max_keys {
-                std::ptr::write(store.key_mut(index), KeyRuntimeRecord::empty());
+            let request_ring = &mut *store.request_ring_mut();
+            let request_events = std::slice::from_raw_parts_mut(
+                store
+                    .ptr
+                    .add(layout.request_events_offset)
+                    .cast::<SharedRequestEventRecord>(),
+                layout.request_event_capacity(),
+            );
+            SharedRequestQueue::initialize(request_ring, request_events);
+            for index in 0..layout.aggregate_capacity() {
+                std::ptr::write(
+                    store.aggregate_mut(index),
+                    SharedCountAggregateRecord::empty(),
+                );
             }
-            for index in 0..layout.max_keys * layout.bucket_count {
-                std::ptr::write(store.bucket_mut(index), BucketRuntimeRecord::empty());
-            }
+            std::ptr::write(store.leader_mut(), SharedLeaderLease::default());
             std::ptr::write(
                 store.stats_mut(),
                 SharedStatsCounters {
@@ -801,131 +799,115 @@ impl NgxShmStore {
         if rule.id == 0 || rule.key_component_count == 0 {
             return Err(NgxShmAccessError::InvalidRule);
         }
-        let mut hash = ShmHasher::new();
-        for component in rule.key_components() {
-            let Some(value) = variables.value(component.as_str()) else {
-                return Err(NgxShmAccessError::MissingVariable);
-            };
-            hash.write(component.as_str().as_bytes());
-            hash.write(&[0]);
-            hash.write(value);
-            hash.write(&[0xff]);
-        }
-        let hash = hash.finish();
-        let key_index = self.find_or_insert_key(rule, hash)?;
-        let bucket_start = bucket_start(now_millis, rule.bucket_millis);
-        self.rotate_key_buckets(key_index, rule, now_millis);
-        let current = unsafe { (*self.key_mut(key_index)).local_window_total };
+        let request = hashed_request_from_variables(rule, variables)?;
+        let current = self.aggregate_window_total(rule, request, now_millis);
         self.stats().requests.fetch_add(1, Ordering::Relaxed);
         if current.saturating_add(1) > rule.limit {
             self.stats().rejected.fetch_add(1, Ordering::Relaxed);
             return Ok(NginxStatus::TooManyRequests);
         }
-        self.increment_bucket(key_index, bucket_start);
-        unsafe {
-            (*self.key_mut(key_index)).local_window_total = (*self.key_mut(key_index))
-                .local_window_total
-                .saturating_add(1);
-        }
+
+        let event = RequestEvent::from_hashed(request, now_millis);
+        self.request_queue()
+            .push(event)
+            .map_err(|_| NgxShmAccessError::StoreFull)?;
         self.stats().allowed.fetch_add(1, Ordering::Relaxed);
         Ok(NginxStatus::Declined)
+    }
+
+    pub fn drain_request_events(&mut self, out: &mut [RequestEvent]) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
+
+        let _guard = self.lock();
+        self.request_queue().drain(out)
     }
 
     pub fn stats_snapshot(&self) -> StatsCounters {
         self.stats().snapshot()
     }
 
+    pub fn apply_count_aggregates(&mut self, aggregates: &[CountAggregate]) -> ApplyBatchOutcome {
+        if aggregates.is_empty() {
+            return ApplyBatchOutcome::default();
+        }
+
+        let _guard = self.lock();
+        let mut outcome = ApplyBatchOutcome::default();
+        for aggregate in aggregates.iter().copied() {
+            if aggregate.count == 0 || aggregate.rule_id == 0 {
+                outcome.dropped = outcome.dropped.saturating_add(1);
+                continue;
+            }
+            if self.upsert_count_aggregate(aggregate) {
+                outcome.applied = outcome.applied.saturating_add(1);
+            } else {
+                outcome.dropped = outcome.dropped.saturating_add(1);
+            }
+        }
+        outcome
+    }
+
+    pub fn try_acquire_leader(&self, worker_id: u32, now_millis: u64, ttl_millis: u64) -> bool {
+        self.leader().try_acquire(worker_id, now_millis, ttl_millis)
+    }
+
     pub fn layout(&self) -> NginxShmLayout {
         self.layout
     }
 
-    fn find_or_insert_key(
-        &mut self,
-        rule: &RuleRuntimeRecord,
-        hash: u64,
-    ) -> Result<usize, NgxShmAccessError> {
+    fn upsert_count_aggregate(&mut self, aggregate: CountAggregate) -> bool {
         let mut vacant = None;
-        for index in 0..self.layout.max_keys {
-            let key = unsafe { &*self.key_ptr(index) };
-            if key.occupied != 0 && key.rule_id == rule.id && key.hash == hash {
-                return Ok(index);
+        for index in 0..self.layout.aggregate_capacity() {
+            let stored = unsafe { *self.aggregate_ptr(index) };
+            if !stored.is_empty() && stored.matches(aggregate) {
+                unsafe {
+                    (*self.aggregate_mut(index)).count = aggregate.count;
+                }
+                return true;
             }
-            if key.occupied == 0 && vacant.is_none() {
+            if stored.is_empty() && vacant.is_none() {
                 vacant = Some(index);
             }
         }
 
-        if let Some(index) = vacant {
-            unsafe {
-                std::ptr::write(
-                    self.key_mut(index),
-                    KeyRuntimeRecord {
-                        rule_id: rule.id,
-                        hash,
-                        occupied: 1,
-                        overflow: 0,
-                        reserved: [0; 6],
-                        local_window_total: 0,
-                    },
-                );
-                self.clear_buckets(index);
-            }
-            return Ok(index);
-        }
-
-        self.stats().overflow_keys.fetch_add(1, Ordering::Relaxed);
-        Ok((rule.id as usize - 1) % self.layout.max_keys)
-    }
-
-    fn rotate_key_buckets(&mut self, key_index: usize, rule: &RuleRuntimeRecord, now_millis: u64) {
-        let mut total = 0_u64;
-        for offset in 0..self.layout.bucket_count {
-            let bucket = unsafe { &mut *self.bucket_for_key_mut(key_index, offset) };
-            if bucket.count != 0
-                && bucket.start_millis.saturating_add(rule.window_millis) <= now_millis
-            {
-                *bucket = BucketRuntimeRecord::empty();
-            }
-            total = total.saturating_add(bucket.count);
-        }
+        let Some(index) = vacant else {
+            return false;
+        };
         unsafe {
-            (*self.key_mut(key_index)).local_window_total = total;
+            std::ptr::write(
+                self.aggregate_mut(index),
+                SharedCountAggregateRecord::from_aggregate(aggregate),
+            );
         }
+        true
     }
 
-    fn increment_bucket(&mut self, key_index: usize, bucket_start: u64) {
-        let mut target = 0;
-        for offset in 0..self.layout.bucket_count {
-            let bucket = unsafe { &mut *self.bucket_for_key_mut(key_index, offset) };
-            if bucket.count == 0 || bucket.start_millis == bucket_start {
-                target = offset;
-                break;
-            }
-            if bucket.start_millis
-                < unsafe { (*self.bucket_for_key_mut(key_index, target)).start_millis }
+    fn aggregate_window_total(
+        &self,
+        rule: &RuleRuntimeRecord,
+        request: HashedLimitRequest,
+        now_millis: u64,
+    ) -> u64 {
+        let mut total = 0_u64;
+        for index in 0..self.layout.aggregate_capacity() {
+            let aggregate = unsafe { *self.aggregate_ptr(index) };
+            if aggregate.count == 0
+                || aggregate.rule_id != rule.id
+                || aggregate.key_hash != request.key_hash().into()
             {
-                target = offset;
+                continue;
+            }
+            if aggregate
+                .bucket_start_millis
+                .saturating_add(rule.window_millis)
+                > now_millis
+            {
+                total = total.saturating_add(aggregate.count);
             }
         }
-        let bucket = unsafe { &mut *self.bucket_for_key_mut(key_index, target) };
-        if bucket.start_millis != bucket_start {
-            *bucket = BucketRuntimeRecord {
-                start_millis: bucket_start,
-                count: 0,
-            };
-        }
-        bucket.count = bucket.count.saturating_add(1);
-    }
-
-    unsafe fn clear_buckets(&mut self, key_index: usize) {
-        for offset in 0..self.layout.bucket_count {
-            unsafe {
-                std::ptr::write(
-                    self.bucket_for_key_mut(key_index, offset),
-                    BucketRuntimeRecord::empty(),
-                );
-            }
-        }
+        total
     }
 
     fn lock(&self) -> ShmLockGuard {
@@ -974,39 +956,63 @@ impl NgxShmStore {
         }
     }
 
-    fn key_ptr(&self, index: usize) -> *const KeyRuntimeRecord {
+    unsafe fn request_ring_mut(&mut self) -> *mut SharedRequestRingControl {
         unsafe {
             self.ptr
-                .add(self.layout.keys_offset)
-                .cast::<KeyRuntimeRecord>()
+                .add(self.layout.request_ring_offset)
+                .cast::<SharedRequestRingControl>()
+        }
+    }
+
+    fn request_queue(&mut self) -> SharedRequestQueue<'_> {
+        unsafe {
+            let control = &*self
+                .ptr
+                .add(self.layout.request_ring_offset)
+                .cast::<SharedRequestRingControl>();
+            let events = std::slice::from_raw_parts_mut(
+                self.ptr
+                    .add(self.layout.request_events_offset)
+                    .cast::<SharedRequestEventRecord>(),
+                self.layout.request_event_capacity(),
+            );
+            SharedRequestQueue::new(control, events)
+        }
+    }
+
+    fn aggregate_ptr(&self, index: usize) -> *const SharedCountAggregateRecord {
+        unsafe {
+            self.ptr
+                .add(self.layout.aggregates_offset)
+                .cast::<SharedCountAggregateRecord>()
                 .add(index)
         }
     }
 
-    unsafe fn key_mut(&mut self, index: usize) -> *mut KeyRuntimeRecord {
+    unsafe fn aggregate_mut(&mut self, index: usize) -> *mut SharedCountAggregateRecord {
         unsafe {
             self.ptr
-                .add(self.layout.keys_offset)
-                .cast::<KeyRuntimeRecord>()
+                .add(self.layout.aggregates_offset)
+                .cast::<SharedCountAggregateRecord>()
                 .add(index)
         }
     }
 
-    unsafe fn bucket_mut(&mut self, index: usize) -> *mut BucketRuntimeRecord {
+    fn leader(&self) -> &SharedLeaderLease {
         unsafe {
-            self.ptr
-                .add(self.layout.buckets_offset)
-                .cast::<BucketRuntimeRecord>()
-                .add(index)
+            &*self
+                .ptr
+                .add(self.layout.leader_offset)
+                .cast::<SharedLeaderLease>()
         }
     }
 
-    unsafe fn bucket_for_key_mut(
-        &mut self,
-        key_index: usize,
-        bucket_offset: usize,
-    ) -> *mut BucketRuntimeRecord {
-        unsafe { self.bucket_mut(key_index * self.layout.bucket_count + bucket_offset) }
+    unsafe fn leader_mut(&mut self) -> *mut SharedLeaderLease {
+        unsafe {
+            self.ptr
+                .add(self.layout.leader_offset)
+                .cast::<SharedLeaderLease>()
+        }
     }
 
     fn stats(&self) -> &SharedStatsCounters {
@@ -1027,6 +1033,61 @@ impl NgxShmStore {
     }
 }
 
+impl NginxRequestEventSource for NgxShmStore {
+    fn try_acquire_runtime_leader(&self, worker_id: u32, now_millis: u64, ttl_millis: u64) -> bool {
+        self.leader().try_acquire(worker_id, now_millis, ttl_millis)
+    }
+
+    fn drain_request_events(&mut self, out: &mut [RequestEvent]) -> usize {
+        NgxShmStore::drain_request_events(self, out)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NginxSharedCountHandler {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl NginxSharedCountHandler {
+    /// # Safety
+    ///
+    /// `ptr` must point to a live `NgxShmStore` mapping for the whole lifetime
+    /// of the runtime using this handler.
+    pub unsafe fn new(ptr: *mut u8, len: usize) -> Self {
+        Self { ptr, len }
+    }
+}
+
+unsafe impl Send for NginxSharedCountHandler {}
+unsafe impl Sync for NginxSharedCountHandler {}
+
+impl CountUpdateHandler for NginxSharedCountHandler {
+    fn apply_batch(&self, aggregates: &[CountAggregate]) -> ApplyBatchOutcome {
+        let Some(mut store) = (unsafe { NgxShmStore::from_initialized(self.ptr, self.len) }) else {
+            return ApplyBatchOutcome {
+                applied: 0,
+                dropped: aggregates.len(),
+            };
+        };
+        store.apply_count_aggregates(aggregates)
+    }
+}
+
+fn hashed_request_from_variables(
+    rule: &RuleRuntimeRecord,
+    variables: &impl NginxVariableLookup,
+) -> Result<HashedLimitRequest, NgxShmAccessError> {
+    let mut request = HashedLimitRequestBuilder::new(rule.id, 1);
+    for component in rule.key_components() {
+        let Some(value) = variables.value(component.as_str()) else {
+            return Err(NgxShmAccessError::MissingVariable);
+        };
+        request.push_component(component.as_str().as_bytes(), value);
+    }
+    Ok(request.finish())
+}
+
 struct ShmLockGuard {
     lock: *const AtomicU16,
 }
@@ -1035,34 +1096,6 @@ impl Drop for ShmLockGuard {
     fn drop(&mut self) {
         unsafe { &*self.lock }.store(SHM_LOCK_FREE, Ordering::Release);
     }
-}
-
-struct ShmHasher {
-    state: u64,
-}
-
-impl ShmHasher {
-    fn new() -> Self {
-        Self {
-            state: 0xcbf2_9ce4_8422_2325,
-        }
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.state
-    }
-}
-
-fn bucket_start(now_millis: u64, bucket_millis: u64) -> u64 {
-    let bucket_millis = bucket_millis.max(1);
-    now_millis / bucket_millis * bucket_millis
 }
 
 #[repr(C)]
@@ -1213,7 +1246,7 @@ impl NginxPeerTable {
     pub fn parse_lines(
         input: &str,
         self_addr: Option<SocketAddr>,
-    ) -> Result<Self, NginxGossipError> {
+    ) -> Result<Self, NginxPeerConfigError> {
         let mut table = Self::empty();
         for line in input.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
@@ -1221,7 +1254,7 @@ impl NginxPeerTable {
             }
             let addr = line
                 .parse::<SocketAddr>()
-                .map_err(|_| NginxGossipError::InvalidPeer)?;
+                .map_err(|_| NginxPeerConfigError::InvalidPeer)?;
             if Some(addr) != self_addr {
                 table.insert(NginxPeer::new(addr))?;
             }
@@ -1229,18 +1262,29 @@ impl NginxPeerTable {
         Ok(table)
     }
 
-    pub fn insert(&mut self, peer: NginxPeer) -> Result<(), NginxGossipError> {
+    pub fn insert(&mut self, peer: NginxPeer) -> Result<(), NginxPeerConfigError> {
         if self.as_slice().contains(&peer) {
             return Ok(());
         }
         if self.len as usize == MAX_NGINX_PEERS {
-            return Err(NginxGossipError::PeerTableFull);
+            return Err(NginxPeerConfigError::PeerTableFull);
         }
 
         self.peers[self.len as usize] = peer;
         self.len += 1;
         self.peers[..self.len as usize].sort();
         Ok(())
+    }
+
+    pub fn remove(&mut self, peer: NginxPeer) {
+        let Some(index) = self.as_slice().iter().position(|stored| *stored == peer) else {
+            return;
+        };
+        let len = self.len as usize;
+        for offset in index..len.saturating_sub(1) {
+            self.peers[offset] = self.peers[offset + 1];
+        }
+        self.len = self.len.saturating_sub(1);
     }
 
     pub fn as_slice(&self) -> &[NginxPeer] {
@@ -1266,313 +1310,36 @@ pub fn load_peer_file(
     path: impl AsRef<Path>,
     scratch: &mut [u8],
     self_addr: Option<SocketAddr>,
-) -> Result<NginxPeerTable, NginxGossipError> {
+) -> Result<NginxPeerTable, NginxPeerConfigError> {
     if scratch.is_empty() {
-        return Err(NginxGossipError::PeerFileTooLarge);
+        return Err(NginxPeerConfigError::PeerFileTooLarge);
     }
 
-    let mut file = std::fs::File::open(path).map_err(|_| NginxGossipError::PeerFileRead)?;
+    let mut file = std::fs::File::open(path).map_err(|_| NginxPeerConfigError::PeerFileRead)?;
     let mut len = 0;
     loop {
         if len == scratch.len() {
             let mut extra = [0_u8; 1];
             match file.read(&mut extra) {
                 Ok(0) => break,
-                Ok(_) => return Err(NginxGossipError::PeerFileTooLarge),
-                Err(_) => return Err(NginxGossipError::PeerFileRead),
+                Ok(_) => return Err(NginxPeerConfigError::PeerFileTooLarge),
+                Err(_) => return Err(NginxPeerConfigError::PeerFileRead),
             }
         }
 
         match file.read(&mut scratch[len..]) {
             Ok(0) => break,
             Ok(read) => len += read,
-            Err(_) => return Err(NginxGossipError::PeerFileRead),
+            Err(_) => return Err(NginxPeerConfigError::PeerFileRead),
         }
     }
 
-    let input =
-        std::str::from_utf8(&scratch[..len]).map_err(|_| NginxGossipError::InvalidPeerFileUtf8)?;
+    let input = std::str::from_utf8(&scratch[..len])
+        .map_err(|_| NginxPeerConfigError::InvalidPeerFileUtf8)?;
     NginxPeerTable::parse_lines(input, self_addr)
 }
-
-#[derive(Debug)]
-pub struct NginxGossipBuffers {
-    send: Vec<u8>,
-    recv: Vec<u8>,
-    max_payload_bytes: usize,
-}
-
-impl NginxGossipBuffers {
-    pub fn with_capacity(max_payload_bytes: usize) -> Result<Self, NginxGossipError> {
-        if max_payload_bytes == 0 {
-            return Err(NginxGossipError::InvalidPayloadCapacity);
-        }
-        Ok(Self {
-            send: Vec::with_capacity(max_payload_bytes),
-            recv: vec![0; max_payload_bytes],
-            max_payload_bytes,
-        })
-    }
-
-    pub fn send_buffer(&self) -> &[u8] {
-        &self.send
-    }
-
-    pub fn recv_buffer_mut(&mut self) -> &mut [u8] {
-        self.recv.as_mut_slice()
-    }
-
-    pub fn recv_capacity(&self) -> usize {
-        self.recv.len()
-    }
-}
-
-pub trait NginxGossipTransport {
-    fn send(&mut self, peer: NginxPeer, payload: &[u8]) -> bool;
-
-    fn recv(&mut self, _buffer: &mut [u8]) -> Option<(NginxPeer, usize)> {
-        None
-    }
-}
-
-#[derive(Debug)]
-pub struct NginxUdpTransport {
-    socket: UdpSocket,
-}
-
-impl NginxUdpTransport {
-    pub fn bind(addr: SocketAddr) -> Result<Self, NginxUdpError> {
-        let socket = UdpSocket::bind(addr).map_err(NginxUdpError::Bind)?;
-        socket
-            .set_nonblocking(true)
-            .map_err(NginxUdpError::Configure)?;
-        Ok(Self { socket })
-    }
-
-    pub fn local_addr(&self) -> Result<SocketAddr, NginxUdpError> {
-        self.socket.local_addr().map_err(NginxUdpError::LocalAddr)
-    }
-}
-
-impl NginxGossipTransport for NginxUdpTransport {
-    fn send(&mut self, peer: NginxPeer, payload: &[u8]) -> bool {
-        let Some(addr) = peer.socket_addr() else {
-            return false;
-        };
-        matches!(self.socket.send_to(payload, addr), Ok(sent) if sent == payload.len())
-    }
-
-    fn recv(&mut self, buffer: &mut [u8]) -> Option<(NginxPeer, usize)> {
-        match self.socket.recv_from(buffer) {
-            Ok((len, addr)) => Some((NginxPeer::new(addr), len)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-            Err(_) => None,
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum NginxUdpError {
-    #[error("failed to bind UDP socket: {0}")]
-    Bind(std::io::Error),
-    #[error("failed to configure UDP socket: {0}")]
-    Configure(std::io::Error),
-    #[error("failed to read local UDP address: {0}")]
-    LocalAddr(std::io::Error),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NginxEmbeddedGossip {
-    pub cluster_id_hash: u64,
-    pub node_id: NodeId,
-    pub incarnation: u64,
-    pub lease_ttl_millis: u64,
-    pub auth_key: Option<HmacKey>,
-}
-
-impl NginxEmbeddedGossip {
-    pub fn tick(
-        self,
-        worker_id: u32,
-        now_millis: u64,
-        peers: &NginxPeerTable,
-        lease: &SharedLeaderLease,
-        buffers: &mut NginxGossipBuffers,
-        transport: &mut impl NginxGossipTransport,
-    ) -> GossipTickOutcome {
-        if peers.is_empty() {
-            return GossipTickOutcome::LocalOnlyNoPeers;
-        }
-        if !lease.try_acquire(worker_id, now_millis, self.lease_ttl_millis) {
-            return GossipTickOutcome::LocalOnlyNoLeader;
-        }
-
-        let message = GossipMessage {
-            header: GossipHeader {
-                cluster_id_hash: self.cluster_id_hash,
-                sender_node_id: self.node_id,
-                sender_incarnation: self.incarnation,
-                min_bucket: 0,
-                max_bucket: 0,
-                flags: 0,
-            },
-            digests: Vec::new(),
-            cells: Vec::new(),
-            truncated: false,
-        };
-
-        let truncated = if let Some(key) = self.auth_key {
-            encode_authenticated_message(
-                &message,
-                key,
-                &mut buffers.send,
-                GossipLimits {
-                    max_payload_bytes: buffers.max_payload_bytes,
-                    max_digests: 64,
-                    max_cells: 0,
-                },
-            )
-        } else {
-            encode_message(&message, &mut buffers.send, buffers.max_payload_bytes)
-        };
-        let mut sent = 0_u16;
-        let mut failed = 0_u16;
-        for peer in peers.as_slice() {
-            if transport.send(*peer, buffers.send.as_slice()) {
-                sent = sent.saturating_add(1);
-            } else {
-                failed = failed.saturating_add(1);
-            }
-        }
-
-        GossipTickOutcome::Sent {
-            peers: sent,
-            failed,
-            bytes: buffers.send.len(),
-            truncated,
-        }
-    }
-
-    pub fn receive_one(
-        self,
-        now_millis: u64,
-        cell_table: &mut CellTable,
-        engine: Option<&mut LocalEngine>,
-        buffers: &mut NginxGossipBuffers,
-        transport: &mut impl NginxGossipTransport,
-    ) -> GossipReceiveOutcome {
-        let Some((_peer, len)) = transport.recv(buffers.recv_buffer_mut()) else {
-            return GossipReceiveOutcome::NoPacket;
-        };
-        if len > buffers.max_payload_bytes || len > buffers.recv.len() {
-            return GossipReceiveOutcome::DecodeError(DecodeError::PayloadTooLarge);
-        }
-
-        let mut merged = 0_u16;
-        let mut stale = 0_u16;
-        let mut full = false;
-        let mut engine = engine;
-        let mut header_outcome = HeaderOutcome::Accepted;
-        let limits = GossipLimits {
-            max_payload_bytes: buffers.max_payload_bytes,
-            max_digests: 64,
-            max_cells: cell_table.capacity(),
-        };
-        let accept_header = |header: GossipHeader| {
-            if header.cluster_id_hash != self.cluster_id_hash {
-                header_outcome = HeaderOutcome::WrongCluster;
-                return false;
-            }
-            if header.sender_node_id == self.node_id {
-                header_outcome = HeaderOutcome::SelfPacket;
-                return false;
-            }
-            true
-        };
-        let on_digest = |_| {};
-        let mut on_cell = |cell: CounterCell| {
-            if full {
-                return;
-            }
-            if cell.origin_node_id == self.node_id && cell.origin_incarnation == self.incarnation {
-                stale = stale.saturating_add(1);
-                return;
-            }
-            match cell_table.merge_remote(cell, engine.as_deref_mut(), now_millis) {
-                Ok(outcome) => {
-                    if outcome.changed {
-                        merged = merged.saturating_add(1);
-                    } else {
-                        stale = stale.saturating_add(1);
-                    }
-                }
-                Err(_) => full = true,
-            }
-        };
-        let result = if let Some(key) = self.auth_key {
-            decode_authenticated_message_visit_checked(
-                &buffers.recv[..len],
-                key,
-                limits,
-                accept_header,
-                on_digest,
-                &mut on_cell,
-            )
-        } else {
-            decode_message_visit_checked(
-                &buffers.recv[..len],
-                limits,
-                accept_header,
-                on_digest,
-                &mut on_cell,
-            )
-        };
-
-        match result {
-            Ok(_) if header_outcome == HeaderOutcome::WrongCluster => {
-                GossipReceiveOutcome::WrongCluster
-            }
-            Ok(_) if header_outcome == HeaderOutcome::SelfPacket => {
-                GossipReceiveOutcome::SelfPacket
-            }
-            Ok(_) if full => GossipReceiveOutcome::CellTableFull,
-            Ok(_) => GossipReceiveOutcome::Merged { merged, stale },
-            Err(error) => GossipReceiveOutcome::DecodeError(error),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HeaderOutcome {
-    Accepted,
-    WrongCluster,
-    SelfPacket,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GossipTickOutcome {
-    LocalOnlyNoPeers,
-    LocalOnlyNoLeader,
-    Sent {
-        peers: u16,
-        failed: u16,
-        bytes: usize,
-        truncated: bool,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GossipReceiveOutcome {
-    NoPacket,
-    WrongCluster,
-    SelfPacket,
-    CellTableFull,
-    DecodeError(DecodeError),
-    Merged { merged: u16, stale: u16 },
-}
-
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum NginxGossipError {
+pub enum NginxPeerConfigError {
     #[error("invalid peer")]
     InvalidPeer,
     #[error("peer table full")]
@@ -1583,7 +1350,7 @@ pub enum NginxGossipError {
     PeerFileTooLarge,
     #[error("invalid peer file utf-8")]
     InvalidPeerFileUtf8,
-    #[error("invalid gossip payload capacity")]
+    #[error("invalid payload capacity")]
     InvalidPayloadCapacity,
     #[error("missing EndpointSlice selector")]
     MissingEndpointSliceSelector,
@@ -1611,6 +1378,10 @@ pub enum NginxConfigError {
     TooManyEndpointSliceSelectors,
     #[error("too many rules")]
     TooManyRules,
+    #[error("no rules")]
+    NoRules,
+    #[error("invalid runtime config")]
+    RuntimeConfig,
 }
 
 pub fn parse_size_bytes(input: &str) -> Result<usize, NginxConfigError> {
@@ -1710,54 +1481,27 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct NginxEmbeddedSendCase {
-        peer_count: u8,
-        leader_worker: u32,
-        contender_worker: u32,
+    struct NginxAggregateAccessCase {
+        limit: u8,
+        published_count: u8,
+        key: u8,
+        other_key: u8,
+        expired: bool,
     }
 
-    impl Arbitrary for NginxEmbeddedSendCase {
+    impl Arbitrary for NginxAggregateAccessCase {
         fn arbitrary(g: &mut Gen) -> Self {
-            Self {
-                peer_count: u8::arbitrary(g) % 8,
-                leader_worker: (u32::arbitrary(g) % 16).saturating_add(1),
-                contender_worker: (u32::arbitrary(g) % 16).saturating_add(1),
+            let key = u8::arbitrary(g);
+            let mut other_key = u8::arbitrary(g);
+            if other_key == key {
+                other_key = other_key.wrapping_add(1);
             }
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct NginxPeerFileCase {
-        peers: Vec<u8>,
-        scratch_extra: u8,
-    }
-
-    impl Arbitrary for NginxPeerFileCase {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let mut peers = Vec::<u8>::arbitrary(g);
-            peers.truncate(12);
             Self {
-                peers,
-                scratch_extra: u8::arbitrary(g) % 8,
-            }
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct NginxReceiveRejectCase {
-        wrong_cluster: bool,
-        self_sender: bool,
-        tamper_auth: bool,
-        count: u8,
-    }
-
-    impl Arbitrary for NginxReceiveRejectCase {
-        fn arbitrary(g: &mut Gen) -> Self {
-            Self {
-                wrong_cluster: bool::arbitrary(g),
-                self_sender: bool::arbitrary(g),
-                tamper_auth: bool::arbitrary(g),
-                count: (u8::arbitrary(g) % 8).max(1),
+                limit: (u8::arbitrary(g) % 8).saturating_add(1),
+                published_count: u8::arbitrary(g) % 16,
+                key,
+                other_key,
+                expired: bool::arbitrary(g),
             }
         }
     }
@@ -1778,162 +1522,6 @@ mod tests {
         }
         .build()
         .expect("rule")
-    }
-
-    #[test]
-    fn parses_nginx_rule_config() {
-        let rule = rule();
-
-        assert_eq!(rule.name.as_str(), "tenant_api");
-        assert_eq!(rule.key_components.len(), 2);
-        assert_eq!(rule.limit, 10);
-        assert_eq!(rule.window_millis, 60_000);
-    }
-
-    #[test]
-    fn nginx_discovery_defaults_to_auto_and_stores_kubernetes_selectors_bounded() {
-        let mut discovery = NginxDiscoveryConfig {
-            kind: DiscoveryMode::KubernetesEndpointSlice,
-            ..Default::default()
-        };
-
-        discovery
-            .add_endpoint_slice("default", "gabion-grpc", "gossip")
-            .expect("grpc selector");
-        discovery
-            .add_endpoint_slice("default", "gabion-nginx", "gossip")
-            .expect("nginx selector");
-
-        assert_eq!(NginxDiscoveryConfig::default().kind, DiscoveryMode::Auto);
-        assert_eq!(discovery.endpoint_slices.len(), 2);
-        assert_eq!(
-            discovery.endpoint_slices.as_slice()[0]
-                .service_name
-                .as_str(),
-            "gabion-grpc"
-        );
-        assert_eq!(
-            discovery.endpoint_slices.as_slice()[1]
-                .service_name
-                .as_str(),
-            "gabion-nginx"
-        );
-    }
-
-    #[test]
-    fn nginx_endpoint_slice_selector_defaults_empty_port_name_to_gossip() {
-        let selector =
-            NginxEndpointSliceSelector::new("default", "gabion-grpc", "").expect("selector");
-
-        assert_eq!(selector.port_name.as_str(), "gossip");
-    }
-
-    #[test]
-    fn nginx_discovery_rejects_too_many_endpoint_slice_selectors() {
-        let mut selectors = NginxEndpointSliceSelectors::empty();
-        for index in 0..MAX_ENDPOINT_SLICE_SELECTORS {
-            selectors
-                .push(
-                    NginxEndpointSliceSelector::new(
-                        "default",
-                        "gabion-grpc",
-                        &format!("gossip-{index}"),
-                    )
-                    .expect("selector"),
-                )
-                .expect("push selector");
-        }
-
-        let error = selectors.push(
-            NginxEndpointSliceSelector::new("default", "gabion-nginx", "gossip").expect("selector"),
-        );
-
-        assert_eq!(error, Err(NginxConfigError::TooManyEndpointSliceSelectors));
-    }
-
-    #[test]
-    fn nginx_kubernetes_discovery_uses_shared_inference_when_selectors_are_empty() {
-        let empty = NginxDiscoveryConfig {
-            kind: DiscoveryMode::KubernetesEndpointSlice,
-            ..Default::default()
-        };
-        assert!(endpoint_slice_configs_from_nginx_discovery(&empty).is_none());
-
-        let mut explicit = empty;
-        explicit
-            .add_endpoint_slice("default", "gabion-nginx", "gossip")
-            .expect("selector");
-        let configs = endpoint_slice_configs_from_nginx_discovery(&explicit).expect("configs");
-
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].namespace, "default");
-        assert_eq!(configs[0].service_name, "gabion-nginx");
-        assert_eq!(configs[0].port_name.as_deref(), Some("gossip"));
-    }
-
-    #[test]
-    fn rejects_too_many_key_components() {
-        let keys = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
-
-        assert_eq!(
-            KeyComponentList::new(&keys),
-            Err(NginxConfigError::TooManyKeyComponents)
-        );
-    }
-
-    #[test]
-    fn local_only_access_phase_allows_then_rejects_without_request_allocation() {
-        let zone = NginxZoneConfig::new("api", 128 * 1024 * 1024, 16).expect("zone");
-        let mut adapter = NginxLocalOnlyAdapter::new(zone, rule());
-        let variables = [
-            NginxVariable {
-                name: "tenant",
-                value: "a",
-            },
-            NginxVariable {
-                name: "uri",
-                value: "/v1",
-            },
-        ];
-        let request = NginxRequest {
-            domain: "api",
-            variables: &variables,
-            hits: 1,
-        };
-
-        assert_eq!(adapter.access_phase(request, 0), NginxStatus::Declined);
-        assert_eq!(adapter.access_phase(request, 1), NginxStatus::Declined);
-        assert_eq!(adapter.access_phase(request, 2), NginxStatus::Declined);
-        assert_eq!(
-            adapter.access_phase(request, 3),
-            NginxStatus::TooManyRequests
-        );
-        assert_eq!(adapter.active_keys(), 1);
-    }
-
-    #[test]
-    fn missing_variable_declines_without_tracking() {
-        let zone = NginxZoneConfig::new("api", 128 * 1024 * 1024, 16).expect("zone");
-        let mut adapter = NginxLocalOnlyAdapter::new(zone, rule());
-        let variables = [NginxVariable {
-            name: "tenant",
-            value: "a",
-        }];
-        let request = NginxRequest {
-            domain: "api",
-            variables: &variables,
-            hits: 1,
-        };
-
-        assert_eq!(adapter.access_phase(request, 0), NginxStatus::Declined);
-        assert_eq!(adapter.active_keys(), 0);
-    }
-
-    #[test]
-    fn shared_memory_records_are_c_layout_copy_types() {
-        assert_eq!(std::mem::size_of::<StoreHeader>(), 24);
-        assert_eq!(std::mem::size_of::<StatsCounters>(), 32);
-        assert_eq!(std::mem::size_of::<LeaderLease>(), 24);
     }
 
     fn shm_rule(name: &str, limit: &str, keys: &[&str]) -> NginxRuleConfig {
@@ -1983,7 +1571,80 @@ mod tests {
     }
 
     #[test]
-    fn shm_store_limits_requests_without_allocating_runtime_records() {
+    fn parses_nginx_rule_config() {
+        let rule = rule();
+
+        assert_eq!(rule.name.as_str(), "tenant_api");
+        assert_eq!(rule.key_components.len(), 2);
+        assert_eq!(rule.limit, 10);
+        assert_eq!(rule.window_millis, 60_000);
+    }
+
+    #[test]
+    fn nginx_endpoint_slice_selector_defaults_empty_port_name_to_gossip() {
+        let selector =
+            NginxEndpointSliceSelector::new("default", "gabion-grpc", "").expect("selector");
+
+        assert_eq!(selector.port_name.as_str(), "gossip");
+    }
+
+    #[test]
+    fn nginx_discovery_rejects_too_many_endpoint_slice_selectors() {
+        let mut selectors = NginxEndpointSliceSelectors::empty();
+        for index in 0..MAX_ENDPOINT_SLICE_SELECTORS {
+            selectors
+                .push(
+                    NginxEndpointSliceSelector::new(
+                        "default",
+                        "gabion-grpc",
+                        &format!("gossip-{index}"),
+                    )
+                    .expect("selector"),
+                )
+                .expect("push selector");
+        }
+
+        let error = selectors.push(
+            NginxEndpointSliceSelector::new("default", "gabion-nginx", "gossip").expect("selector"),
+        );
+
+        assert_eq!(error, Err(NginxConfigError::TooManyEndpointSliceSelectors));
+    }
+
+    #[test]
+    fn nginx_discovery_stores_static_and_file_modes_without_heap_state() {
+        let self_addr = "127.0.0.1:9000".parse().expect("self addr");
+        let peer_addr = "127.0.0.2:9000".parse().expect("peer addr");
+        let mut discovery = NginxDiscoveryConfig::default();
+
+        discovery.set_kind(DiscoveryMode::Static);
+        discovery.set_self_addr(self_addr);
+        discovery.add_static_peer(self_addr).expect("ignore self");
+        discovery.add_static_peer(peer_addr).expect("static peer");
+        discovery
+            .set_peer_file_path("/etc/gabion/peers.txt")
+            .expect("peer file path");
+
+        assert_eq!(discovery.kind, DiscoveryMode::Static);
+        assert_eq!(discovery.self_addr, Some(self_addr));
+        assert_eq!(discovery.static_peers.len(), 1);
+        assert_eq!(
+            discovery.static_peers.as_slice()[0].socket_addr(),
+            Some(peer_addr)
+        );
+        assert_eq!(discovery.peer_file_path.as_str(), "/etc/gabion/peers.txt");
+    }
+
+    #[test]
+    fn shared_memory_records_are_c_layout_copy_types() {
+        assert_eq!(std::mem::size_of::<StoreHeader>(), 24);
+        assert_eq!(std::mem::size_of::<StatsCounters>(), 32);
+        assert_eq!(std::mem::size_of::<LeaderLease>(), 24);
+        assert_eq!(std::mem::size_of::<SharedCountAggregateRecord>(), 48);
+    }
+
+    #[test]
+    fn shm_store_enqueues_requests_and_rejects_from_runtime_counts() {
         let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 8, DEFAULT_MAX_ACTIVE_BUCKETS)
             .expect("required bytes");
         let mut memory = vec![0_u8; bytes];
@@ -1994,15 +1655,151 @@ mod tests {
 
         assert_eq!(store.access(0, &variables, 0), Ok(NginxStatus::Declined));
         assert_eq!(store.access(0, &variables, 1), Ok(NginxStatus::Declined));
+
+        let mut events = [RequestEvent::default(); 4];
+        assert_eq!(store.drain_request_events(&mut events), 2);
+        assert_eq!(events[0].rule_id, 1);
+        assert_eq!(events[1].rule_id, 1);
+        assert_eq!(events[0].key_hash, events[1].key_hash);
+
+        assert_eq!(
+            store.apply_count_aggregates(&[CountAggregate {
+                rule_id: events[0].rule_id,
+                key_hash: events[0].key_hash.into(),
+                bucket_start_millis: 0,
+                count: 2,
+            }]),
+            ApplyBatchOutcome {
+                applied: 1,
+                dropped: 0,
+            }
+        );
         assert_eq!(
             store.access(0, &variables, 2),
             Ok(NginxStatus::TooManyRequests)
         );
+    }
 
-        let stats = store.stats_snapshot();
-        assert_eq!(stats.requests, 3);
-        assert_eq!(stats.allowed, 2);
-        assert_eq!(stats.rejected, 1);
+    #[test]
+    fn nginx_shared_count_handler_applies_runtime_aggregates_to_shared_memory() {
+        let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 2, DEFAULT_MAX_ACTIVE_BUCKETS)
+            .expect("required bytes");
+        let mut memory = vec![0_u8; bytes];
+        let store = shm_store(&mut memory, shm_rule("tenant_api", "2r/m", &["$uri"]), 2);
+        let handler = unsafe { NginxSharedCountHandler::new(memory.as_mut_ptr(), memory.len()) };
+        let aggregates = [
+            CountAggregate {
+                rule_id: 1,
+                key_hash: 7_u128.into(),
+                bucket_start_millis: 100,
+                count: 3,
+            },
+            CountAggregate {
+                rule_id: 1,
+                key_hash: 10_u128.into(),
+                bucket_start_millis: 100,
+                count: 4,
+            },
+        ];
+
+        assert_eq!(
+            handler.apply_batch(&aggregates),
+            ApplyBatchOutcome {
+                applied: 2,
+                dropped: 0
+            }
+        );
+
+        let first = unsafe { *store.aggregate_ptr(0) }.as_aggregate();
+        let second = unsafe { *store.aggregate_ptr(1) }.as_aggregate();
+        assert_eq!(first, aggregates[0]);
+        assert_eq!(second, aggregates[1]);
+
+        assert_eq!(
+            handler.apply_batch(&[CountAggregate {
+                count: 8,
+                ..aggregates[0]
+            }]),
+            ApplyBatchOutcome {
+                applied: 1,
+                dropped: 0
+            }
+        );
+        assert_eq!(unsafe { *store.aggregate_ptr(0) }.count, 8);
+    }
+
+    #[test]
+    fn runtime_drain_records_request_ring_and_updates_shared_aggregates() {
+        let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 8, DEFAULT_MAX_ACTIVE_BUCKETS)
+            .expect("required bytes");
+        let mut memory = vec![0_u8; bytes];
+        let mut store = shm_store(&mut memory, shm_rule("tenant_api", "2r/m", &["$uri"]), 8);
+        let variables = TestVariables {
+            values: &[("uri", b"/api/a")],
+        };
+        assert_eq!(store.access(0, &variables, 0), Ok(NginxStatus::Declined));
+        assert_eq!(store.access(0, &variables, 1), Ok(NginxStatus::Declined));
+
+        let handler = unsafe { NginxSharedCountHandler::new(memory.as_mut_ptr(), memory.len()) };
+        let runtime = Runtime::with_count_update_handler(
+            gabion::Config {
+                storage: gabion::StorageConfig {
+                    max_keys: 8,
+                    max_cells: Some(8 * DEFAULT_MAX_ACTIVE_BUCKETS),
+                    dirty_ring_entries: Some(8 * DEFAULT_MAX_ACTIVE_BUCKETS),
+                    max_descriptor_count: MAX_KEY_COMPONENTS,
+                    max_descriptor_bytes: MAX_NAME_BYTES * MAX_KEY_COMPONENTS,
+                    max_key_bytes: MAX_NAME_BYTES,
+                    max_active_buckets: DEFAULT_MAX_ACTIVE_BUCKETS,
+                },
+                limits: vec![gabion::LimitRuleConfig {
+                    name: "tenant_api".to_string(),
+                    domain: "nginx".to_string(),
+                    descriptors: vec![gabion::DescriptorConfig {
+                        key: "$uri".to_string(),
+                        value: "*".to_string(),
+                    }],
+                    limit: 2,
+                    window: "100ms".to_string(),
+                    bucket: "10ms".to_string(),
+                    local_fallback_limit: 2,
+                    local_absolute_limit: 2,
+                    stale_after: "2000ms".to_string(),
+                    safety_margin: gabion::SafetyMarginConfig::default(),
+                    overflow_policy: gabion::OverflowPolicy::UseOverflowKey,
+                    mode: EnforcementMode::Enforce,
+                }],
+                runtime: gabion::RuntimeConfig {
+                    count_update_batch_size: 2,
+                },
+                server: gabion::ServerConfig::default(),
+                discovery: gabion::DiscoveryConfig::default(),
+                gossip: gabion::GossipConfig::default(),
+            },
+            handler,
+        )
+        .expect("runtime");
+
+        let mut events = [RequestEvent::default(); 1];
+        let empty_request = TimedHashedLimitRequest::new(HashedLimitRequest::new(0, 0_u128, 1), 0);
+        let mut requests = [empty_request; 1];
+        let mut aggregates = [CountAggregate::default(); 1];
+
+        assert_eq!(
+            drain_request_events_into_runtime(
+                &mut store,
+                &runtime,
+                &mut events,
+                &mut requests,
+                &mut aggregates,
+            ),
+            2
+        );
+        assert_eq!(store.drain_request_events(&mut events), 0);
+        assert_eq!(
+            store.access(0, &variables, 2),
+            Ok(NginxStatus::TooManyRequests)
+        );
     }
 
     #[test]
@@ -2019,33 +1816,22 @@ mod tests {
         };
 
         assert_eq!(first.access(0, &variables, 0), Ok(NginxStatus::Declined));
+        let mut events = [RequestEvent::default(); 1];
+        assert_eq!(first.drain_request_events(&mut events), 1);
+        assert_eq!(
+            first.apply_count_aggregates(&[CountAggregate {
+                rule_id: events[0].rule_id,
+                key_hash: events[0].key_hash.into(),
+                bucket_start_millis: 0,
+                count: 1,
+            }]),
+            ApplyBatchOutcome {
+                applied: 1,
+                dropped: 0,
+            }
+        );
         assert_eq!(
             second.access(0, &variables, 1),
-            Ok(NginxStatus::TooManyRequests)
-        );
-    }
-
-    #[test]
-    fn shm_store_uses_all_configured_key_components() {
-        let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 8, DEFAULT_MAX_ACTIVE_BUCKETS)
-            .expect("required bytes");
-        let mut memory = vec![0_u8; bytes];
-        let mut store = shm_store(
-            &mut memory,
-            shm_rule("tenant_api", "1r/m", &["$arg_tenant", "$uri"]),
-            8,
-        );
-        let tenant_a = TestVariables {
-            values: &[("arg_tenant", b"a"), ("uri", b"/api")],
-        };
-        let tenant_b = TestVariables {
-            values: &[("arg_tenant", b"b"), ("uri", b"/api")],
-        };
-
-        assert_eq!(store.access(0, &tenant_a, 0), Ok(NginxStatus::Declined));
-        assert_eq!(store.access(0, &tenant_b, 1), Ok(NginxStatus::Declined));
-        assert_eq!(
-            store.access(0, &tenant_a, 2),
             Ok(NginxStatus::TooManyRequests)
         );
     }
@@ -2069,29 +1855,25 @@ mod tests {
 
         assert_eq!(store.access(0, &first_ip, 0), Ok(NginxStatus::Declined));
         assert_eq!(store.access(0, &second_ip, 1), Ok(NginxStatus::Declined));
+        let mut events = [RequestEvent::default(); 2];
+        assert_eq!(store.drain_request_events(&mut events), 2);
+        assert_ne!(events[0].key_hash, events[1].key_hash);
+        assert_eq!(
+            store.apply_count_aggregates(&[CountAggregate {
+                rule_id: events[0].rule_id,
+                key_hash: events[0].key_hash.into(),
+                bucket_start_millis: 0,
+                count: 1,
+            }]),
+            ApplyBatchOutcome {
+                applied: 1,
+                dropped: 0,
+            }
+        );
         assert_eq!(
             store.access(0, &first_ip, 2),
             Ok(NginxStatus::TooManyRequests)
         );
-    }
-
-    #[test]
-    fn shm_store_expires_window_and_aggregates_overflow() {
-        let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 1, DEFAULT_MAX_ACTIVE_BUCKETS)
-            .expect("required bytes");
-        let mut memory = vec![0_u8; bytes];
-        let mut store = shm_store(&mut memory, shm_rule("tenant_api", "1r/m", &["$uri"]), 1);
-        let key_a = TestVariables {
-            values: &[("uri", b"/api/a")],
-        };
-        let key_b = TestVariables {
-            values: &[("uri", b"/api/b")],
-        };
-
-        assert_eq!(store.access(0, &key_a, 0), Ok(NginxStatus::Declined));
-        assert_eq!(store.access(0, &key_b, 1), Ok(NginxStatus::TooManyRequests));
-        assert_eq!(store.stats_snapshot().overflow_keys, 1);
-        assert_eq!(store.access(0, &key_a, 101), Ok(NginxStatus::Declined));
     }
 
     #[test]
@@ -2132,11 +1914,11 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
         assert_eq!(table.len(), 2);
-        assert_eq!(too_small, Err(NginxGossipError::PeerFileTooLarge));
+        assert_eq!(too_small, Err(NginxPeerConfigError::PeerFileTooLarge));
     }
 
     #[test]
-    fn leader_lease_allows_one_gossip_owner_and_expires() {
+    fn leader_lease_allows_one_runtime_owner_and_expires() {
         let lease = SharedLeaderLease::default();
 
         assert!(lease.try_acquire(1, 100, 50));
@@ -2150,553 +1932,153 @@ mod tests {
         assert_eq!(snapshot.epoch, 2);
     }
 
-    #[derive(Default)]
-    struct RecordingTransport {
-        sends: Vec<(NginxPeer, usize)>,
-    }
-
-    impl NginxGossipTransport for RecordingTransport {
-        fn send(&mut self, peer: NginxPeer, payload: &[u8]) -> bool {
-            self.sends.push((peer, payload.len()));
-            true
-        }
-    }
-
-    struct PacketTransport {
-        peer: NginxPeer,
-        packet: Vec<u8>,
-        delivered: bool,
-    }
-
-    impl PacketTransport {
-        fn new(peer: NginxPeer, packet: Vec<u8>) -> Self {
-            Self {
-                peer,
-                packet,
-                delivered: false,
-            }
-        }
-    }
-
-    impl NginxGossipTransport for PacketTransport {
-        fn send(&mut self, _peer: NginxPeer, _payload: &[u8]) -> bool {
-            true
-        }
-
-        fn recv(&mut self, buffer: &mut [u8]) -> Option<(NginxPeer, usize)> {
-            if self.delivered || self.packet.len() > buffer.len() {
-                return None;
-            }
-            buffer[..self.packet.len()].copy_from_slice(&self.packet);
-            self.delivered = true;
-            Some((self.peer, self.packet.len()))
-        }
-    }
-
-    #[test]
-    fn embedded_gossip_sends_only_from_elected_owner_with_reused_buffer() {
-        let peers =
-            NginxPeerTable::parse_lines("127.0.0.2:9000\n127.0.0.3:9000\n", None).expect("peers");
-        let lease = SharedLeaderLease::default();
-        let mut buffers =
-            NginxGossipBuffers::with_capacity(DEFAULT_GOSSIP_PAYLOAD_BYTES).expect("buffers");
-        let mut transport = RecordingTransport::default();
-        let gossip = NginxEmbeddedGossip {
-            cluster_id_hash: 7,
-            node_id: NodeId { hi: 1, lo: 2 },
-            incarnation: 9,
-            lease_ttl_millis: 1_000,
-            auth_key: None,
-        };
-
-        let first = gossip.tick(1, 0, &peers, &lease, &mut buffers, &mut transport);
-        let send_capacity = buffers.send.capacity();
-        let second = gossip.tick(2, 1, &peers, &lease, &mut buffers, &mut transport);
-
-        assert_eq!(
-            first,
-            GossipTickOutcome::Sent {
-                peers: 2,
-                failed: 0,
-                bytes: 68,
-                truncated: false,
-            }
-        );
-        assert_eq!(second, GossipTickOutcome::LocalOnlyNoLeader);
-        assert_eq!(transport.sends.len(), 2);
-        assert_eq!(buffers.send.capacity(), send_capacity);
-        assert_eq!(buffers.recv_capacity(), DEFAULT_GOSSIP_PAYLOAD_BYTES);
-    }
-
-    #[test]
-    fn embedded_gossip_receives_and_merges_packet_without_message_allocation() {
-        let peer = NginxPeer::new("127.0.0.2:9000".parse().expect("addr"));
-        let remote_node = NodeId { hi: 9, lo: 9 };
-        let mut packet = Vec::with_capacity(256);
-        let cell = gabion_gossip::CounterCell {
-            rule_id: 1,
-            key_hash_hi: 10,
-            key_hash_lo: 20,
-            bucket_start_millis: 0,
-            origin_node_id: remote_node,
-            origin_incarnation: 1,
-            count: 5,
-            last_update_millis: 100,
-            sequence: 0,
-        };
-        let message = GossipMessage {
-            header: GossipHeader {
-                cluster_id_hash: 7,
-                sender_node_id: remote_node,
-                sender_incarnation: 1,
-                min_bucket: 0,
-                max_bucket: 0,
-                flags: 0,
-            },
-            digests: Vec::new(),
-            cells: vec![cell],
-            truncated: false,
-        };
-        let gossip = NginxEmbeddedGossip {
-            cluster_id_hash: 7,
-            node_id: NodeId { hi: 1, lo: 2 },
-            incarnation: 9,
-            lease_ttl_millis: 1_000,
-            auth_key: None,
-        };
-        let mut buffers = NginxGossipBuffers::with_capacity(256).expect("buffers");
-        let mut table = CellTable::with_capacity(4, 4);
-        assert!(!encode_message(&message, &mut packet, 256));
-        let mut transport = PacketTransport::new(peer, packet);
-
-        let outcome = gossip.receive_one(123, &mut table, None, &mut buffers, &mut transport);
-
-        assert_eq!(
-            outcome,
-            GossipReceiveOutcome::Merged {
-                merged: 1,
-                stale: 0,
-            }
-        );
-        assert_eq!(table.active_cell_count(), 1);
-    }
-
-    #[test]
-    fn embedded_gossip_rejects_wrong_cluster_before_merge() {
-        let peer = NginxPeer::new("127.0.0.2:9000".parse().expect("addr"));
-        let mut packet = Vec::with_capacity(128);
-        let message = GossipMessage {
-            header: GossipHeader {
-                cluster_id_hash: 8,
-                sender_node_id: NodeId { hi: 9, lo: 9 },
-                sender_incarnation: 1,
-                min_bucket: 0,
-                max_bucket: 0,
-                flags: 0,
-            },
-            digests: Vec::new(),
-            cells: vec![gabion_gossip::CounterCell {
-                rule_id: 1,
-                key_hash_hi: 10,
-                key_hash_lo: 20,
-                bucket_start_millis: 0,
-                origin_node_id: NodeId { hi: 9, lo: 9 },
-                origin_incarnation: 1,
-                count: 5,
-                last_update_millis: 100,
-                sequence: 0,
-            }],
-            truncated: false,
-        };
-        let gossip = NginxEmbeddedGossip {
-            cluster_id_hash: 7,
-            node_id: NodeId { hi: 1, lo: 2 },
-            incarnation: 9,
-            lease_ttl_millis: 1_000,
-            auth_key: None,
-        };
-        let mut buffers = NginxGossipBuffers::with_capacity(256).expect("buffers");
-        let mut table = CellTable::with_capacity(4, 4);
-        assert!(!encode_message(&message, &mut packet, 256));
-        let mut transport = PacketTransport::new(peer, packet);
-
-        let outcome = gossip.receive_one(123, &mut table, None, &mut buffers, &mut transport);
-
-        assert_eq!(outcome, GossipReceiveOutcome::WrongCluster);
-        assert_eq!(table.active_cell_count(), 0);
-    }
-
-    #[test]
-    fn embedded_gossip_rejects_tampered_authenticated_packet() {
-        let key = HmacKey::new([7_u8; 32]);
-        let peer = NginxPeer::new("127.0.0.2:9000".parse().expect("addr"));
-        let remote_node = NodeId { hi: 9, lo: 9 };
-        let mut packet = Vec::with_capacity(256);
-        let message = GossipMessage {
-            header: GossipHeader {
-                cluster_id_hash: 7,
-                sender_node_id: remote_node,
-                sender_incarnation: 1,
-                min_bucket: 0,
-                max_bucket: 0,
-                flags: 0,
-            },
-            digests: Vec::new(),
-            cells: vec![gabion_gossip::CounterCell {
-                rule_id: 1,
-                key_hash_hi: 10,
-                key_hash_lo: 20,
-                bucket_start_millis: 0,
-                origin_node_id: remote_node,
-                origin_incarnation: 1,
-                count: 5,
-                last_update_millis: 100,
-                sequence: 0,
-            }],
-            truncated: false,
-        };
-        let gossip = NginxEmbeddedGossip {
-            cluster_id_hash: 7,
-            node_id: NodeId { hi: 1, lo: 2 },
-            incarnation: 9,
-            lease_ttl_millis: 1_000,
-            auth_key: Some(key),
-        };
-        let mut buffers = NginxGossipBuffers::with_capacity(256).expect("buffers");
-        let mut table = CellTable::with_capacity(4, 4);
-        assert!(!encode_authenticated_message(
-            &message,
-            key,
-            &mut packet,
-            GossipLimits {
-                max_payload_bytes: 256,
-                max_digests: 0,
-                max_cells: 1,
-            },
-        ));
-        let last = packet.len() - 1;
-        packet[last] ^= 1;
-        let mut transport = PacketTransport::new(peer, packet);
-
-        let outcome = gossip.receive_one(123, &mut table, None, &mut buffers, &mut transport);
-
-        assert_eq!(
-            outcome,
-            GossipReceiveOutcome::DecodeError(DecodeError::AuthenticationFailed)
-        );
-        assert_eq!(table.active_cell_count(), 0);
-    }
-
-    #[test]
-    fn udp_transport_sends_and_receives_without_packet_allocation() {
-        let Ok(mut first) = NginxUdpTransport::bind("127.0.0.1:0".parse().expect("addr")) else {
-            return;
-        };
-        let Ok(mut second) = NginxUdpTransport::bind("127.0.0.1:0".parse().expect("addr")) else {
-            return;
-        };
-        let second_addr = second.local_addr().expect("second addr");
-        let payload = [1_u8, 2, 3, 4];
-        let mut recv = [0_u8; 16];
-
-        assert!(first.send(NginxPeer::new(second_addr), &payload));
-
-        let mut received = None;
-        for _ in 0..1_000 {
-            received = second.recv(&mut recv);
-            if received.is_some() {
-                break;
-            }
-        }
-
-        let (_peer, len) = received.expect("packet");
-        assert_eq!(len, payload.len());
-        assert_eq!(&recv[..len], &payload);
-    }
-
     #[quickcheck]
-    fn quickcheck_peer_file_uses_scratch_and_rejects_oversized_inputs(
-        case: NginxPeerFileCase,
-    ) -> TestResult {
-        let mut input = String::new();
-        for octet in &case.peers {
-            input.push_str("127.0.0.");
-            input.push_str(&(octet % 64).saturating_add(1).to_string());
-            input.push_str(":9000\n");
-        }
-        let path = std::env::temp_dir().join(format!(
-            "gabion-nginx-peer-file-{}-{}-{}.txt",
-            std::process::id(),
-            input.len(),
-            case.scratch_extra
-        ));
-        if std::fs::write(&path, input.as_bytes()).is_err() {
-            return TestResult::error("failed to write generated peer file");
-        }
-
-        let mut exact_scratch = vec![
-            0_u8;
-            input
-                .len()
-                .saturating_add(usize::from(case.scratch_extra))
-                .max(1)
-        ];
-        let loaded = load_peer_file(&path, &mut exact_scratch, None);
-        let mut short_scratch = vec![0_u8; input.len().saturating_sub(1)];
-        let too_small = if input.is_empty() {
-            Err(NginxGossipError::PeerFileTooLarge)
-        } else {
-            load_peer_file(&path, &mut short_scratch, None)
-        };
-        let _ = std::fs::remove_file(path);
-
-        let Ok(table) = loaded else {
-            return TestResult::error("peer file did not load with sufficient scratch");
-        };
-        if table.len() > case.peers.len().min(MAX_NGINX_PEERS) {
-            return TestResult::error("peer file loaded more peers than generated");
-        }
-        if !input.is_empty() && too_small != Err(NginxGossipError::PeerFileTooLarge) {
-            return TestResult::error("peer file did not reject undersized scratch");
-        }
-        TestResult::passed()
-    }
-
-    #[quickcheck]
-    fn quickcheck_embedded_receive_rejects_invalid_frames_before_mutating_cells(
-        case: NginxReceiveRejectCase,
-    ) -> TestResult {
-        if !case.wrong_cluster && !case.self_sender && !case.tamper_auth {
-            return TestResult::discard();
-        }
-
-        let key = HmacKey::new([7_u8; 32]);
-        let peer = NginxPeer::new("127.0.0.2:9000".parse().expect("addr"));
-        let local_node = NodeId { hi: 1, lo: 2 };
-        let remote_node = if case.self_sender {
-            local_node
-        } else {
-            NodeId { hi: 9, lo: 9 }
-        };
-        let message = GossipMessage {
-            header: GossipHeader {
-                cluster_id_hash: if case.wrong_cluster { 8 } else { 7 },
-                sender_node_id: remote_node,
-                sender_incarnation: 1,
-                min_bucket: 0,
-                max_bucket: 0,
-                flags: 0,
-            },
-            digests: Vec::new(),
-            cells: vec![gabion_gossip::CounterCell {
-                rule_id: 1,
-                key_hash_hi: 10,
-                key_hash_lo: 20,
-                bucket_start_millis: 0,
-                origin_node_id: remote_node,
-                origin_incarnation: 1,
-                count: u64::from(case.count),
-                last_update_millis: 100,
-                sequence: 0,
-            }],
-            truncated: false,
-        };
-        let gossip = NginxEmbeddedGossip {
-            cluster_id_hash: 7,
-            node_id: local_node,
-            incarnation: 9,
-            lease_ttl_millis: 1_000,
-            auth_key: case.tamper_auth.then_some(key),
-        };
-        let mut packet = Vec::with_capacity(256);
-        let truncated = if case.tamper_auth {
-            encode_authenticated_message(
-                &message,
-                key,
-                &mut packet,
-                GossipLimits {
-                    max_payload_bytes: 256,
-                    max_digests: 0,
-                    max_cells: 1,
-                },
-            )
-        } else {
-            encode_message(&message, &mut packet, 256)
-        };
-        if truncated {
-            return TestResult::error("generated invalid receive frame truncated");
-        }
-        if case.tamper_auth {
-            let last = packet.len() - 1;
-            packet[last] ^= 1;
-        }
-        let mut buffers = match NginxGossipBuffers::with_capacity(256) {
-            Ok(buffers) => buffers,
-            Err(_) => return TestResult::error("valid receive buffer capacity was rejected"),
-        };
-        let mut table = CellTable::with_capacity(4, 4);
-        let mut transport = PacketTransport::new(peer, packet);
-
-        let outcome = gossip.receive_one(123, &mut table, None, &mut buffers, &mut transport);
-
-        if matches!(outcome, GossipReceiveOutcome::Merged { merged: 1, .. }) {
-            return TestResult::error("invalid receive frame merged a cell");
-        }
-        if table.active_cell_count() != 0 {
-            return TestResult::error("invalid receive frame mutated cell table");
-        }
-        TestResult::passed()
-    }
-
-    #[quickcheck]
-    fn quickcheck_peer_table_is_sorted_deduped_bounded_and_selfless(
+    fn peer_table_property_sorts_deduplicates_excludes_self(
         case: NginxPeerTableCase,
     ) -> TestResult {
-        let self_addr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, case.self_octet)), 9000);
+        let self_addr: SocketAddr = format!("127.0.0.{}:9000", case.self_octet)
+            .parse()
+            .expect("self addr");
         let mut input = String::new();
         for octet in case.peers {
-            input.push_str("127.0.0.");
-            input.push_str(&(octet % 64).saturating_add(1).to_string());
-            input.push_str(":9000\n");
+            let octet = (octet % 96).saturating_add(1);
+            input.push_str(&format!("127.0.0.{octet}:9000\n"));
         }
 
-        let Ok(table) = NginxPeerTable::parse_lines(&input, Some(self_addr)) else {
-            return TestResult::error("generated peer table failed to parse");
+        let table = match NginxPeerTable::parse_lines(&input, Some(self_addr)) {
+            Ok(table) => table,
+            Err(error) => return TestResult::error(format!("parse failed: {error:?}")),
         };
-        let peers = table.as_slice();
-        if peers.len() > MAX_NGINX_PEERS {
-            return TestResult::error("peer table exceeded configured capacity");
+
+        if table.len() > MAX_NGINX_PEERS {
+            return TestResult::error("peer table exceeded maximum capacity");
         }
-        if peers.windows(2).any(|window| window[0] >= window[1]) {
-            return TestResult::error("peer table is not strictly sorted and deduplicated");
-        }
-        if peers
+        if table
+            .as_slice()
             .iter()
             .any(|peer| peer.socket_addr() == Some(self_addr))
         {
             return TestResult::error("peer table retained self address");
         }
+        if !table.as_slice().windows(2).all(|pair| pair[0] < pair[1]) {
+            return TestResult::error("peer table is not sorted and deduplicated");
+        }
         TestResult::passed()
     }
 
     #[quickcheck]
-    fn quickcheck_access_phase_respects_missing_variables_and_fallback_cap(
+    fn shared_memory_access_property_respects_missing_variables_and_limit(
         case: NginxAccessCase,
     ) -> TestResult {
-        let zone = match NginxZoneConfig::new("api", 128 * 1024 * 1024, 16) {
-            Ok(zone) => zone,
-            Err(_) => return TestResult::error("valid generated zone was rejected"),
+        let bytes =
+            match NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 4, DEFAULT_MAX_ACTIVE_BUCKETS) {
+                Some(bytes) => bytes,
+                None => return TestResult::error("required bytes overflowed"),
+            };
+        let mut memory = vec![0_u8; bytes];
+        let mut store = shm_store(&mut memory, shm_rule("tenant_api", "4r/m", &["$uri"]), 4);
+        let present = TestVariables {
+            values: &[("uri", b"/api/a")],
         };
-        let mut adapter = NginxLocalOnlyAdapter::new(zone, rule());
-        let complete = [
-            NginxVariable {
-                name: "tenant",
-                value: "a",
-            },
-            NginxVariable {
-                name: "uri",
-                value: "/v1",
-            },
-        ];
-        let missing = [NginxVariable {
-            name: "tenant",
-            value: "a",
-        }];
-        let variables = if case.missing_variable {
-            missing.as_slice()
-        } else {
-            complete.as_slice()
-        };
-        let request = NginxRequest {
-            domain: "api",
-            variables,
-            hits: 1,
-        };
-        let mut allowed = 0_u8;
+        let missing = TestVariables { values: &[] };
 
-        for now_millis in 0..u64::from(case.attempts) {
-            match adapter.access_phase(request, now_millis) {
-                NginxStatus::Declined => allowed = allowed.saturating_add(1),
-                NginxStatus::TooManyRequests => break,
-            }
-        }
-
-        if case.missing_variable {
-            if adapter.active_keys() == 0 {
-                TestResult::passed()
+        for attempt in 0..case.attempts {
+            let result = if case.missing_variable {
+                store.access(0, &missing, u64::from(attempt))
             } else {
-                TestResult::error("missing variable path tracked a key")
+                store.access(0, &present, u64::from(attempt))
+            };
+            if case.missing_variable {
+                if result != Err(NgxShmAccessError::MissingVariable) {
+                    return TestResult::error(format!("missing variable result: {result:?}"));
+                }
+            } else if result != Ok(NginxStatus::Declined) {
+                return TestResult::error(format!("request was not enqueued: {result:?}"));
             }
-        } else if allowed <= rule().local_fallback_limit as u8 && adapter.active_keys() <= 1 {
-            TestResult::passed()
-        } else {
-            TestResult::error("access phase exceeded fallback cap or tracked too many keys")
         }
+        let mut events = [RequestEvent::default(); 16];
+        let drained = store.drain_request_events(&mut events);
+        let expected = if case.missing_variable {
+            0
+        } else {
+            usize::from(case.attempts)
+        };
+        if drained != expected {
+            return TestResult::error(format!("drained {drained} events, expected {expected}"));
+        }
+        TestResult::passed()
     }
 
     #[quickcheck]
-    fn quickcheck_embedded_gossip_sends_from_single_owner(
-        case: NginxEmbeddedSendCase,
+    fn shared_memory_access_property_uses_runtime_aggregates_and_isolates_keys(
+        case: NginxAggregateAccessCase,
     ) -> TestResult {
-        let mut peers = NginxPeerTable::empty();
-        for index in 0..case.peer_count {
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 1, index + 1)), 9000);
-            if peers.insert(NginxPeer::new(addr)).is_err() {
-                return TestResult::error("generated peer table unexpectedly filled");
+        let bytes =
+            match NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 8, DEFAULT_MAX_ACTIVE_BUCKETS) {
+                Some(bytes) => bytes,
+                None => return TestResult::error("required bytes overflowed"),
+            };
+        let mut memory = vec![0_u8; bytes];
+        let limit = format!("{}r/m", case.limit);
+        let mut store = shm_store(
+            &mut memory,
+            shm_rule("runtime_counts", &limit, &["$remote_addr"]),
+            8,
+        );
+        let key = [case.key];
+        let other_key = [case.other_key];
+        let variables = TestVariables {
+            values: &[("remote_addr", &key)],
+        };
+        let other_variables = TestVariables {
+            values: &[("remote_addr", &other_key)],
+        };
+
+        if store.access(0, &variables, 200) != Ok(NginxStatus::Declined) {
+            return TestResult::error("initial access did not enqueue request event");
+        }
+        let mut events = [RequestEvent::default(); 1];
+        if store.drain_request_events(&mut events) != 1 {
+            return TestResult::error("initial request event was not drainable");
+        }
+
+        let bucket_start_millis = if case.expired { 0 } else { 200 };
+        if case.published_count != 0 {
+            let outcome = store.apply_count_aggregates(&[CountAggregate {
+                rule_id: events[0].rule_id,
+                key_hash: events[0].key_hash.into(),
+                bucket_start_millis,
+                count: u64::from(case.published_count),
+            }]);
+            if outcome
+                != (ApplyBatchOutcome {
+                    applied: 1,
+                    dropped: 0,
+                })
+            {
+                return TestResult::error(format!("aggregate apply outcome: {outcome:?}"));
             }
         }
-        let lease = SharedLeaderLease::default();
-        let mut buffers = match NginxGossipBuffers::with_capacity(DEFAULT_GOSSIP_PAYLOAD_BYTES) {
-            Ok(buffers) => buffers,
-            Err(_) => return TestResult::error("valid gossip buffer capacity was rejected"),
-        };
-        let mut transport = RecordingTransport::default();
-        let gossip = NginxEmbeddedGossip {
-            cluster_id_hash: 7,
-            node_id: NodeId { hi: 1, lo: 2 },
-            incarnation: 9,
-            lease_ttl_millis: 1_000,
-            auth_key: None,
-        };
 
-        let first = gossip.tick(
-            case.leader_worker,
-            0,
-            &peers,
-            &lease,
-            &mut buffers,
-            &mut transport,
-        );
-        let second = gossip.tick(
-            case.contender_worker,
-            1,
-            &peers,
-            &lease,
-            &mut buffers,
-            &mut transport,
-        );
+        let observed = store.access(0, &variables, 201);
+        let expected_reject =
+            !case.expired && u64::from(case.published_count) >= u64::from(case.limit);
+        let expected = if expected_reject {
+            Ok(NginxStatus::TooManyRequests)
+        } else {
+            Ok(NginxStatus::Declined)
+        };
+        if observed != expected {
+            return TestResult::error(format!(
+                "aggregate-backed access returned {observed:?}, expected {expected:?}"
+            ));
+        }
 
-        if peers.is_empty() {
-            return if first == GossipTickOutcome::LocalOnlyNoPeers
-                && second == GossipTickOutcome::LocalOnlyNoPeers
-                && transport.sends.is_empty()
-            {
-                TestResult::passed()
-            } else {
-                TestResult::error("empty peer table sent gossip")
-            };
-        }
-        if !matches!(first, GossipTickOutcome::Sent { .. }) {
-            return TestResult::error("leader did not send to non-empty peer table");
-        }
-        if case.contender_worker != case.leader_worker
-            && second != GossipTickOutcome::LocalOnlyNoLeader
-        {
-            return TestResult::error("contender sent while lease owner was active");
-        }
-        if transport.sends.len() < peers.len() {
-            return TestResult::error("leader did not send to every generated peer");
+        let other_observed = store.access(0, &other_variables, 202);
+        if other_observed != Ok(NginxStatus::Declined) {
+            return TestResult::error(format!(
+                "aggregate for one key affected a different key: {other_observed:?}"
+            ));
         }
         TestResult::passed()
     }

@@ -21,7 +21,7 @@ esac
 kubectl get namespace -o name \
     | while IFS= read -r namespace; do
         case "$namespace" in
-            namespace/gabion-kube-e2e-*|namespace/gabion-local-smoke)
+            namespace/gabion-kube-e2e-*|namespace/gabion-local-smoke|namespace/gabion-nginx-scale-*|namespace/gabion-mixed-*|namespace/gabion-gossip-bench-*)
                 kubectl delete "$namespace" --ignore-not-found=true
                 ;;
         esac

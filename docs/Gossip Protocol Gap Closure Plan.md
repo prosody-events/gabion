@@ -316,7 +316,7 @@ Goal: EndpointSlice discovery is usable by standalone `gabiond` without becoming
          port_name: gossip
    ```
 
-   `auto` is the default. At startup, the runtime uses kube-rs in-cluster configuration inference. If kube-rs can build an in-cluster Kubernetes client, `auto` resolves to `kubernetes_endpoint_slice`; otherwise it resolves to `none` and remains local-only.
+   `auto` is the default. At startup, the runtime uses kube-rs in-cluster configuration inference. If kube-rs can build an in-cluster Kubernetes client, `auto` resolves to `kubernetes`; otherwise it resolves to `none` and remains local-only.
 
    Explicit modes still override auto:
 
@@ -324,7 +324,7 @@ Goal: EndpointSlice discovery is usable by standalone `gabiond` without becoming
    kind: none = always local-only
    kind: static = use configured static peers
    kind: file = use configured peer file
-   kind: kubernetes_endpoint_slice = require Kubernetes EndpointSlice config and keep retrying if the API cannot be reached
+   kind: kubernetes = require Kubernetes EndpointSlice config and keep retrying if the API cannot be reached
    kind: auto = Kubernetes EndpointSlice when kube-rs in-cluster config is available, local-only otherwise
    ```
 
@@ -346,7 +346,7 @@ Goal: EndpointSlice discovery is usable by standalone `gabiond` without becoming
    Use the same logical shape for standalone `gabiond` and the NGINX module. Phase 3 wires it into `gabiond` and adds the shared NGINX runtime/config primitives; Phase 7 wires the directives, background watcher, shared peer table, and embedded gossip into the actual NGINX module.
 
    ```nginx
-   gabion_gossip_discovery kubernetes_endpoint_slice;
+   gabion_gossip_discovery kubernetes;
    gabion_gossip_endpoint_slice default gabion-grpc gossip;
    gabion_gossip_endpoint_slice default gabion-nginx gossip;
    ```

@@ -1,11 +1,12 @@
 [package]
-name = "gabion-envoy"
+name = "gabion-server"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 envoy-types.workspace = true
-gabion-core.workspace = true
+gabion.workspace = true
+tokio.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]

@@ -1,11 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/core",
-    "crates/discovery",
-    "crates/envoy",
-    "crates/gossip",
-    "crates/bin",
+    "crates/gabion",
+    "crates/server",
     "crates/nginx",
 ]
 
@@ -17,10 +14,8 @@ edition = "2024"
 axum = "0.8"
 envoy-types = "0.7"
 futures = "0.3"
-gabion-core = { path = "crates/core" }
-gabion-discovery = { path = "crates/discovery" }
-gabion-envoy = { path = "crates/envoy" }
-gabion-gossip = { path = "crates/gossip" }
+gabion = { path = "crates/gabion" }
+gabion-server = { path = "crates/server" }
 hmac = "0.12"
 k8s-openapi = { version = "0.26", features = ["v1_34"] }
 kube = { version = "2", features = ["client", "runtime"] }
@@ -31,9 +26,12 @@ quickcheck_macros = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
+socket2 = "0.6"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "test-util"] }
 tonic = "0.14"
+tracing = "0.1"
+twox-hash = "2.1.2"
 
 [profile.release]
 lto = "fat"

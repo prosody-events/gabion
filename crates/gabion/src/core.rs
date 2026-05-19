@@ -12,11 +12,9 @@
 //!   capacity.
 //! - Descriptor matching is deterministic for exact keys and wildcard values.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use twox_hash::xxhash3_128::{DEFAULT_SECRET_LENGTH, RawHasher as XxHash3RawHasher, SecretBuffer};
 
 pub type RuleId = u32;
 
@@ -161,7 +159,7 @@ impl ValueMatcher {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Rule {
     pub id: RuleId,
-    pub domain_hash: u64,
+    pub domain_hash: KeyHash,
     pub descriptor_matcher: DescriptorMatcher,
     pub limit: u64,
     pub window: WindowSpec,
@@ -248,6 +246,115 @@ impl LimitRequest<'_> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HashedLimitRequest {
+    rule_id: RuleId,
+    key_hash: KeyHash,
+    hits: u64,
+}
+
+impl HashedLimitRequest {
+    pub fn new(rule_id: RuleId, key_hash: impl Into<KeyHash>, hits: u64) -> Self {
+        Self {
+            rule_id,
+            key_hash: key_hash.into(),
+            hits,
+        }
+    }
+
+    pub fn rule_id(self) -> RuleId {
+        self.rule_id
+    }
+
+    pub fn key_hash(self) -> KeyHash {
+        self.key_hash
+    }
+
+    pub fn hits(self) -> u64 {
+        self.hits.max(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimedHashedLimitRequest {
+    request: HashedLimitRequest,
+    now_millis: u64,
+}
+
+impl TimedHashedLimitRequest {
+    pub fn new(request: HashedLimitRequest, now_millis: u64) -> Self {
+        Self {
+            request,
+            now_millis,
+        }
+    }
+
+    pub fn request(self) -> HashedLimitRequest {
+        self.request
+    }
+
+    pub fn now_millis(self) -> u64 {
+        self.now_millis
+    }
+}
+
+#[derive(Clone)]
+pub struct HashedLimitRequestBuilder {
+    rule_id: RuleId,
+    hits: u64,
+    hash: StableKeyHasher,
+}
+
+impl HashedLimitRequestBuilder {
+    pub fn new(rule_id: RuleId, hits: u64) -> Self {
+        let mut hash = StableKeyHasher::new();
+        hash.write_number(u64::from(rule_id));
+        Self {
+            rule_id,
+            hits,
+            hash,
+        }
+    }
+
+    pub fn push_component(&mut self, key: &[u8], value: &[u8]) {
+        self.hash.write_bytes(key);
+        self.hash.write_bytes(&[0]);
+        self.hash.write_bytes(value);
+        self.hash.write_bytes(&[0xff]);
+    }
+
+    pub fn finish(self) -> HashedLimitRequest {
+        HashedLimitRequest::new(self.rule_id, self.hash.finish(), self.hits)
+    }
+}
+
+#[derive(Clone)]
+struct StableKeyHasher {
+    inner: XxHash3RawHasher<[u8; DEFAULT_SECRET_LENGTH]>,
+}
+
+impl StableKeyHasher {
+    fn new() -> Self {
+        let secret =
+            SecretBuffer::new(0, [0x9d; DEFAULT_SECRET_LENGTH]).expect("valid XXH3 secret length");
+        Self {
+            inner: XxHash3RawHasher::new(secret),
+        }
+    }
+
+    fn write_number(&mut self, value: u64) {
+        self.write_bytes(&value.to_le_bytes());
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.inner.write(bytes);
+    }
+
+    fn finish(&self) -> u128 {
+        self.inner.finish_128()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CardinalityLimits {
     pub max_descriptor_count: usize,
     pub max_descriptor_bytes: usize,
@@ -288,61 +395,56 @@ pub struct Metrics {
     pub overflow_sampled: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KeyHash {
-    hi: u64,
-    lo: u64,
-}
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct KeyHash(u128);
 
 impl KeyHash {
-    pub fn from_parts(hi: u64, lo: u64) -> Self {
-        Self { hi, lo }
+    pub fn value(self) -> u128 {
+        self.0
     }
 
-    pub fn hi(self) -> u64 {
-        self.hi
-    }
-
-    pub fn lo(self) -> u64 {
-        self.lo
-    }
-
-    fn index_hash(self) -> u64 {
-        self.hi ^ self.lo
+    fn index_bits(self) -> u64 {
+        (self.0 >> 64) as u64 ^ self.0 as u64
     }
 
     fn sampled(self) -> bool {
-        self.index_hash() & 1 == 0
+        self.index_bits() & 1 == 0
     }
 }
 
-pub fn hash_domain(domain: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    domain.hash(&mut hasher);
-    hasher.finish()
+impl From<u128> for KeyHash {
+    fn from(value: u128) -> Self {
+        Self(value)
+    }
+}
+
+impl From<KeyHash> for u128 {
+    fn from(value: KeyHash) -> Self {
+        value.0
+    }
+}
+
+pub fn hash_domain(domain: &str) -> KeyHash {
+    let mut hasher = StableKeyHasher::new();
+    hasher.write_bytes(domain.as_bytes());
+    KeyHash::from(hasher.finish())
 }
 
 pub fn hash_key(rule_id: RuleId, request: &LimitRequest<'_>) -> KeyHash {
-    let mut hi = DefaultHasher::new();
-    let mut lo = DefaultHasher::new();
+    let mut hash = StableKeyHasher::new();
 
-    rule_id.hash(&mut hi);
-    request.domain.hash(&mut hi);
-    0x9e37_79b9_7f4a_7c15_u64.hash(&mut lo);
-    rule_id.hash(&mut lo);
-    request.domain.hash(&mut lo);
+    hash.write_number(u64::from(rule_id));
+    hash.write_bytes(request.domain.as_bytes());
+    hash.write_bytes(&[0]);
 
     for descriptor in request.descriptors {
-        descriptor.key.hash(&mut hi);
-        descriptor.value.hash(&mut hi);
-        descriptor.value.hash(&mut lo);
-        descriptor.key.hash(&mut lo);
+        hash.write_bytes(descriptor.key.as_bytes());
+        hash.write_bytes(&[0]);
+        hash.write_bytes(descriptor.value.as_bytes());
+        hash.write_bytes(&[0xff]);
     }
 
-    KeyHash {
-        hi: hi.finish(),
-        lo: lo.finish(),
-    }
+    KeyHash::from(hash.finish())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -378,7 +480,7 @@ impl KeyEntry {
         Self {
             occupied: false,
             rule_id: 0,
-            key_hash: KeyHash { hi: 0, lo: 0 },
+            key_hash: KeyHash::default(),
             last_seen_millis: 0,
             local_window_total: 0,
             estimated_window_total: 0,
@@ -431,10 +533,7 @@ impl HeapStore {
             let mut entry = KeyEntry::empty(bucket_count);
             entry.reset(
                 rule.id,
-                KeyHash {
-                    hi: u64::MAX,
-                    lo: rule.id as u64,
-                },
+                KeyHash::from((u128::from(u64::MAX) << 64) | u128::from(rule.id)),
                 0,
             );
             overflow_entries.push(entry);
@@ -555,7 +654,7 @@ impl HeapStore {
             return SlotSearch::Full;
         }
 
-        let start = key_hash.index_hash() as usize % self.entries.len();
+        let start = key_hash.index_bits() as usize % self.entries.len();
         for probe in 0..self.entries.len() {
             let index = (start + probe) % self.entries.len();
             let entry = &self.entries[index];
@@ -678,9 +777,24 @@ enum SlotSearch {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize)]
-pub struct NodeId {
-    pub hi: u64,
-    pub lo: u64,
+pub struct NodeId(u128);
+
+impl NodeId {
+    pub fn value(self) -> u128 {
+        self.0
+    }
+}
+
+impl From<u128> for NodeId {
+    fn from(value: u128) -> Self {
+        Self(value)
+    }
+}
+
+impl From<NodeId> for u128 {
+    fn from(value: NodeId) -> Self {
+        value.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -692,7 +806,7 @@ pub struct NodeIdentity {
 impl Default for NodeIdentity {
     fn default() -> Self {
         Self {
-            node_id: NodeId { hi: 0, lo: 1 },
+            node_id: NodeId::from(1_u128),
             incarnation: 1,
         }
     }
@@ -701,14 +815,23 @@ impl Default for NodeIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize)]
 pub struct CounterCell {
     pub rule_id: RuleId,
-    pub key_hash_hi: u64,
-    pub key_hash_lo: u64,
+    pub key_hash: KeyHash,
     pub bucket_start_millis: u64,
     pub origin_node_id: NodeId,
     pub origin_incarnation: u64,
     pub count: u64,
     pub last_update_millis: u64,
     pub sequence: u64,
+}
+
+pub trait RateLimitRecorder<Request> {
+    type Decision;
+
+    fn record_at(&self, request: Request, now_millis: u64) -> Self::Decision;
+}
+
+pub trait RateLimitRuntime<Request>: RateLimitRecorder<Request> {
+    fn shutdown(&self);
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -735,8 +858,7 @@ impl CounterCell {
     ) -> Self {
         Self {
             rule_id,
-            key_hash_hi: key_hash.hi(),
-            key_hash_lo: key_hash.lo(),
+            key_hash,
             bucket_start_millis,
             origin_node_id: identity.node_id,
             origin_incarnation: identity.incarnation,
@@ -748,8 +870,7 @@ impl CounterCell {
 
     fn same_identity(self, other: Self) -> bool {
         self.rule_id == other.rule_id
-            && self.key_hash_hi == other.key_hash_hi
-            && self.key_hash_lo == other.key_hash_lo
+            && self.key_hash == other.key_hash
             && self.bucket_start_millis == other.bucket_start_millis
             && self.origin_node_id == other.origin_node_id
             && self.origin_incarnation == other.origin_incarnation
@@ -861,15 +982,15 @@ impl LocalCellTable {
             .filter_map(|dirty| self.cells.get(dirty.cell_index).and_then(|cell| *cell))
     }
 
-    fn upsert_local(&mut self, incoming: CounterCell) -> bool {
+    fn upsert_local(&mut self, incoming: CounterCell) -> Option<CounterCell> {
         if self.cells.is_empty() {
             self.dirty.overflowed = true;
-            return false;
+            return None;
         }
 
         if let Some(index) = self.find_cell(incoming) {
             let Some(stored) = self.cells.get_mut(index).and_then(Option::as_mut) else {
-                return false;
+                return None;
             };
             stored.count = stored.count.saturating_add(incoming.count);
             stored.last_update_millis = incoming.last_update_millis;
@@ -879,12 +1000,12 @@ impl LocalCellTable {
                 cell_index: index,
                 sequence: stored.sequence,
             });
-            return true;
+            return Some(*stored);
         }
 
         let Some(index) = self.cells.iter().position(Option::is_none) else {
             self.dirty.overflowed = true;
-            return false;
+            return None;
         };
 
         self.next_sequence = self.next_sequence.saturating_add(1);
@@ -896,7 +1017,7 @@ impl LocalCellTable {
             cell_index: index,
             sequence: cell.sequence,
         });
-        true
+        Some(cell)
     }
 
     fn find_cell(&self, incoming: CounterCell) -> Option<usize> {
@@ -1140,6 +1261,80 @@ impl LocalEngine {
         Decision::Allow
     }
 
+    pub fn check_and_record_hashed(
+        &mut self,
+        request: HashedLimitRequest,
+        now_millis: u64,
+    ) -> Decision {
+        self.check_and_record_hashed_with_cell(request, now_millis)
+            .0
+    }
+
+    pub(crate) fn check_and_record_hashed_with_cell(
+        &mut self,
+        request: HashedLimitRequest,
+        now_millis: u64,
+    ) -> (Decision, Option<CounterCell>) {
+        self.store.metrics.requests = self.store.metrics.requests.saturating_add(1);
+        let Some(rule) = self
+            .rules
+            .iter()
+            .find(|rule| rule.id == request.rule_id && rule.mode == EnforcementMode::Enforce)
+            .cloned()
+        else {
+            self.store.metrics.allowed = self.store.metrics.allowed.saturating_add(1);
+            return (Decision::Allow, None);
+        };
+        let hits = request.hits();
+        let key_hash = request.key_hash();
+        let key = match self.store.get_or_insert_key(&rule, key_hash, now_millis) {
+            KeyAdmission::Tracked(key) => key,
+            KeyAdmission::AllowUntracked => {
+                self.store.metrics.allowed = self.store.metrics.allowed.saturating_add(1);
+                return (Decision::Allow, None);
+            }
+            KeyAdmission::Reject => {
+                record_rejection(&mut self.store.metrics, RejectReason::LocalFallbackLimit);
+                return (Decision::Reject(RejectReason::LocalFallbackLimit), None);
+            }
+        };
+
+        self.store.rotate_if_needed(key, &rule, now_millis);
+
+        let local = self.store.local_window_total(key);
+        let estimated = self.store.estimated_window_total(key);
+        let fresh = self.freshness.is_fresh(&rule, now_millis);
+        let decision = decide(
+            &rule,
+            local,
+            estimated,
+            fresh,
+            rule.safety_margin.hits,
+            hits,
+        );
+
+        if let Decision::Reject(reason) = decision {
+            record_rejection(&mut self.store.metrics, reason);
+            return (Decision::Reject(reason), None);
+        }
+
+        let effective_key_hash = self.store.key_hash(key);
+        self.store.increment_local(key, &rule, now_millis, hits);
+        let bucket_start = rule.window.bucket_start(now_millis);
+        let cell = CounterCell::local(
+            rule.id,
+            effective_key_hash,
+            bucket_start,
+            self.identity,
+            hits,
+            now_millis,
+        );
+        let updated = self.cells.upsert_local(cell);
+
+        self.store.metrics.allowed = self.store.metrics.allowed.saturating_add(1);
+        (Decision::Allow, updated)
+    }
+
     pub fn check_and_record_all_detailed(
         &mut self,
         requests: &[LimitRequest<'_>],
@@ -1213,6 +1408,83 @@ impl LocalEngine {
 
         store.metrics.allowed = store.metrics.allowed.saturating_add(1);
         decisions
+    }
+
+    pub fn check_and_record_all_into(
+        &mut self,
+        requests: &[LimitRequest<'_>],
+        decisions: &mut [Decision],
+        now_millis: u64,
+    ) -> usize {
+        let count = requests.len().min(decisions.len());
+        self.store.metrics.requests = self.store.metrics.requests.saturating_add(1);
+        let rules = &self.rules;
+        let store = &mut self.store;
+        let freshness = &self.freshness;
+
+        for (request, decision) in requests[..count].iter().zip(&mut decisions[..count]) {
+            let hits = request.hits();
+            *decision = Decision::Allow;
+
+            for rule in rules.matching(request) {
+                let key_hash = hash_key(rule.id, request);
+                let key = match store.get_or_insert_key(rule, key_hash, now_millis) {
+                    KeyAdmission::Tracked(key) => key,
+                    KeyAdmission::AllowUntracked => continue,
+                    KeyAdmission::Reject => {
+                        *decision = Decision::Reject(RejectReason::LocalFallbackLimit);
+                        break;
+                    }
+                };
+
+                store.rotate_if_needed(key, rule, now_millis);
+
+                let local = store.local_window_total(key);
+                let estimated = store.estimated_window_total(key);
+                let fresh = freshness.is_fresh(rule, now_millis);
+                let next = decide(rule, local, estimated, fresh, rule.safety_margin.hits, hits);
+
+                if next.is_reject() {
+                    *decision = next;
+                    break;
+                }
+            }
+        }
+
+        if let Some(reason) = decisions[..count]
+            .iter()
+            .find_map(|decision| match decision {
+                Decision::Allow => None,
+                Decision::Reject(reason) => Some(*reason),
+            })
+        {
+            record_rejection(&mut store.metrics, reason);
+            return count;
+        }
+
+        for request in &requests[..count] {
+            let hits = request.hits();
+            for rule in rules.matching(request) {
+                let key_hash = hash_key(rule.id, request);
+                if let KeyAdmission::Tracked(key) = store.key_for_record(rule, key_hash) {
+                    let effective_key_hash = store.key_hash(key);
+                    store.increment_local(key, rule, now_millis, hits);
+                    let bucket_start = rule.window.bucket_start(now_millis);
+                    let cell = CounterCell::local(
+                        rule.id,
+                        effective_key_hash,
+                        bucket_start,
+                        self.identity,
+                        hits,
+                        now_millis,
+                    );
+                    self.cells.upsert_local(cell);
+                }
+            }
+        }
+
+        store.metrics.allowed = store.metrics.allowed.saturating_add(1);
+        count
     }
 }
 
@@ -1651,7 +1923,7 @@ mod tests {
     fn successful_local_increments_create_dirty_cells() {
         let rules = RuleTable::new(vec![rule(1)]);
         let identity = NodeIdentity {
-            node_id: NodeId { hi: 7, lo: 9 },
+            node_id: NodeId::from((7_u128 << 64) | 9),
             incarnation: 11,
         };
         let mut engine = LocalEngine::with_identity(rules, 8, 10, 8, 8, identity);

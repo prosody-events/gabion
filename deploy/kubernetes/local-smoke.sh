@@ -24,7 +24,7 @@ esac
 sh deploy/kubernetes/local-clean.sh
 trap 'sh deploy/kubernetes/local-clean.sh' EXIT
 
-env CARGO_BUILD_RUSTC_WRAPPER= cargo test -p gabion-discovery --no-default-features
-env CARGO_BUILD_RUSTC_WRAPPER= cargo test -p gabion-bin local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence --no-default-features -- --ignored
+env CARGO_BUILD_RUSTC_WRAPPER= cargo test -p gabion --no-default-features discovery::kubernetes::tests
+env CARGO_BUILD_RUSTC_WRAPPER= cargo test -p gabion local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence --no-default-features -- --ignored
 
 printf '%s\n' "local kubernetes EndpointSlice watcher and gossip convergence test passed on context '$context' ($server)"

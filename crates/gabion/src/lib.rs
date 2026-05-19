@@ -1,26 +1,553 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use gabion_core::{
-    CardinalityLimits, DescriptorMatcher, EnforcementMode, LocalEngine, NodeIdentity,
-    OverflowPolicy, Rule, RuleId, RuleTable, SafetyMargin, WindowSpec, hash_domain,
+extern crate self as gabion_core;
+extern crate self as gabion_discovery;
+extern crate self as gabion_gossip;
+
+pub(crate) mod core;
+pub(crate) mod discovery;
+pub(crate) mod gossip;
+
+pub use core::{
+    CardinalityError, CardinalityLimits, Decision, Descriptor, EnforcementMode, HashedLimitRequest,
+    HashedLimitRequestBuilder, KeyHash, LimitRequest, OverflowPolicy, RateLimitRecorder,
+    RateLimitRuntime, RejectReason, RuleId, SafetyMargin, TimedHashedLimitRequest, WindowSpec,
 };
-use gabion_discovery::{
-    DEFAULT_GOSSIP_PORT_NAME, DEFAULT_MAX_PEERS, DEFAULT_RECENT_PEER_GRACE_MILLIS, DiscoveryMode,
-    FilePeerHandler, Peer, PeerHandler, PeerSnapshot, SnapshotPeerHandler, StaticPeerHandler,
+pub use discovery::DiscoveryMode;
+
+use crate::core::{
+    DescriptorMatcher, LocalEngine, NodeId, NodeIdentity, Rule, RuleTable, hash_domain,
 };
-use gabion_envoy::SharedLimiter;
+use crate::discovery::{
+    DEFAULT_GOSSIP_PORT_NAME, DEFAULT_MAX_PEERS, DEFAULT_RECENT_PEER_GRACE_MILLIS, FilePeerHandler,
+    Peer, PeerHandler, PeerSnapshot, SnapshotPeerHandler, StaticPeerHandler,
+};
 use serde::Deserialize;
 use thiserror::Error;
 
-pub fn shared_limiter(engine: LocalEngine) -> SharedLimiter {
+type SharedLimiter = Arc<Mutex<LocalEngine>>;
+
+fn shared_limiter(engine: LocalEngine) -> SharedLimiter {
     Arc::new(Mutex::new(engine))
+}
+
+pub type Config = LocalOnlyConfig;
+
+#[derive(Clone, Debug)]
+pub struct Runtime<H = NoOpCountUpdateHandler> {
+    inner: Arc<RuntimeInner<H>>,
+}
+
+#[derive(Debug)]
+struct RuntimeInner<H> {
+    limiter: SharedLimiter,
+    limits: CardinalityLimits,
+    runtime: RuntimeConfig,
+    discovery: DiscoveryConfig,
+    gossip: GossipConfig,
+    admin_snapshot: Option<crate::gossip_runtime::SharedGossipAdminSnapshot>,
+    remote_cell_capacity: usize,
+    count_update_handler: H,
+    shutdown: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CountAggregate {
+    pub rule_id: RuleId,
+    pub key_hash: KeyHash,
+    pub bucket_start_millis: u64,
+    pub count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ApplyBatchOutcome {
+    pub applied: usize,
+    pub dropped: usize,
+}
+
+impl ApplyBatchOutcome {
+    pub fn all_applied(count: usize) -> Self {
+        Self {
+            applied: count,
+            dropped: 0,
+        }
+    }
+}
+
+pub trait CountUpdateHandler: Send + Sync + 'static {
+    fn apply_batch(&self, aggregates: &[CountAggregate]) -> ApplyBatchOutcome;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NoOpCountUpdateHandler;
+
+impl CountUpdateHandler for NoOpCountUpdateHandler {
+    fn apply_batch(&self, aggregates: &[CountAggregate]) -> ApplyBatchOutcome {
+        ApplyBatchOutcome {
+            applied: aggregates.len(),
+            dropped: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub struct RuntimeConfig {
+    #[serde(default = "default_count_update_batch_size")]
+    pub count_update_batch_size: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            count_update_batch_size: default_count_update_batch_size(),
+        }
+    }
+}
+
+fn default_count_update_batch_size() -> usize {
+    64
+}
+
+impl Runtime<NoOpCountUpdateHandler> {
+    pub fn new(config: Config) -> Result<Self, ConfigError> {
+        Self::with_count_update_handler(config, NoOpCountUpdateHandler)
+    }
+}
+
+impl<H: CountUpdateHandler> Runtime<H> {
+    pub fn with_count_update_handler(
+        config: Config,
+        count_update_handler: H,
+    ) -> Result<Self, ConfigError> {
+        let limits = config.cardinality_limits();
+        let runtime = config.runtime;
+        let discovery = config.discovery.clone();
+        let gossip = config.gossip.clone();
+        let bucket_count = config
+            .limits
+            .iter()
+            .map(|limit| limit.bucket_count())
+            .max()
+            .unwrap_or(1);
+        let remote_cell_capacity = config.storage.max_cells.unwrap_or_else(|| {
+            config
+                .storage
+                .max_keys
+                .saturating_mul(bucket_count.max(1))
+                .max(1)
+        });
+        let limiter = shared_limiter(config.into_engine_with_identity(runtime_node_identity())?);
+        Ok(Self {
+            inner: Arc::new(RuntimeInner {
+                limiter,
+                limits,
+                runtime,
+                discovery,
+                admin_snapshot: gossip.enabled.then(|| {
+                    Arc::new(Mutex::new(
+                        crate::gossip_runtime::GossipAdminSnapshot::default(),
+                    ))
+                }),
+                gossip,
+                remote_cell_capacity,
+                count_update_handler,
+                shutdown: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    pub fn record_at(&self, request: LimitRequest<'_>, now_millis: u64) -> Decision {
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Decision::Allow;
+        }
+        if request.validate_cardinality(self.inner.limits).is_err() {
+            return Decision::Reject(RejectReason::LocalFallbackLimit);
+        }
+        self.inner
+            .limiter
+            .lock()
+            .map(|mut limiter| limiter.check_and_record(request, now_millis))
+            .unwrap_or(Decision::Allow)
+    }
+
+    pub fn record_hashed_at(&self, request: HashedLimitRequest, now_millis: u64) -> Decision {
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Decision::Allow;
+        }
+        let Ok(mut limiter) = self.inner.limiter.lock() else {
+            return Decision::Allow;
+        };
+        let (decision, aggregate) = record_hashed_one(&mut limiter, request, now_millis);
+        drop(limiter);
+        if let Some(aggregate) = aggregate {
+            let _ = self
+                .inner
+                .count_update_handler
+                .apply_batch(std::slice::from_ref(&aggregate));
+        }
+        decision
+    }
+
+    pub fn record_hashed_batch_at(
+        &self,
+        requests: &[HashedLimitRequest],
+        aggregate_scratch: &mut [CountAggregate],
+        now_millis: u64,
+    ) -> usize {
+        if self.inner.shutdown.load(Ordering::Acquire)
+            || requests.is_empty()
+            || aggregate_scratch.is_empty()
+        {
+            return 0;
+        }
+
+        let batch_size = self
+            .inner
+            .runtime
+            .count_update_batch_size
+            .max(1)
+            .min(aggregate_scratch.len());
+        let mut recorded = 0_usize;
+        let mut buffered = 0_usize;
+        let Ok(mut limiter) = self.inner.limiter.lock() else {
+            return 0;
+        };
+
+        for request in requests {
+            let (decision, aggregate) = record_hashed_one(&mut limiter, *request, now_millis);
+            if decision == Decision::Allow {
+                recorded = recorded.saturating_add(1);
+            }
+            let Some(aggregate) = aggregate else {
+                continue;
+            };
+            aggregate_scratch[buffered] = aggregate;
+            buffered += 1;
+            if buffered == batch_size {
+                let batch = &aggregate_scratch[..buffered];
+                self.inner.count_update_handler.apply_batch(batch);
+                buffered = 0;
+            }
+        }
+        drop(limiter);
+        if buffered != 0 {
+            self.inner
+                .count_update_handler
+                .apply_batch(&aggregate_scratch[..buffered]);
+        }
+        recorded
+    }
+
+    pub fn record_timed_hashed_batch(
+        &self,
+        requests: &[TimedHashedLimitRequest],
+        aggregate_scratch: &mut [CountAggregate],
+    ) -> usize {
+        if self.inner.shutdown.load(Ordering::Acquire)
+            || requests.is_empty()
+            || aggregate_scratch.is_empty()
+        {
+            return 0;
+        }
+
+        let batch_size = self
+            .inner
+            .runtime
+            .count_update_batch_size
+            .max(1)
+            .min(aggregate_scratch.len());
+        let mut recorded = 0_usize;
+        let mut buffered = 0_usize;
+        let Ok(mut limiter) = self.inner.limiter.lock() else {
+            return 0;
+        };
+
+        for request in requests {
+            let (decision, aggregate) =
+                record_hashed_one(&mut limiter, request.request(), request.now_millis());
+            if decision == Decision::Allow {
+                recorded = recorded.saturating_add(1);
+            }
+            let Some(aggregate) = aggregate else {
+                continue;
+            };
+            aggregate_scratch[buffered] = aggregate;
+            buffered += 1;
+            if buffered == batch_size {
+                let batch = &aggregate_scratch[..buffered];
+                self.inner.count_update_handler.apply_batch(batch);
+                buffered = 0;
+            }
+        }
+        drop(limiter);
+        if buffered != 0 {
+            self.inner
+                .count_update_handler
+                .apply_batch(&aggregate_scratch[..buffered]);
+        }
+        recorded
+    }
+
+    pub fn record_all_at(
+        &self,
+        requests: &[LimitRequest<'_>],
+        decisions: &mut [Decision],
+        now_millis: u64,
+    ) -> usize {
+        let count = requests.len().min(decisions.len());
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            decisions[..count].fill(Decision::Allow);
+            return count;
+        }
+        if requests[..count]
+            .iter()
+            .any(|request| request.validate_cardinality(self.inner.limits).is_err())
+        {
+            decisions[..count].fill(Decision::Reject(RejectReason::LocalFallbackLimit));
+            return count;
+        }
+        let Ok(mut limiter) = self.inner.limiter.lock() else {
+            decisions[..count].fill(Decision::Allow);
+            return count;
+        };
+        limiter.check_and_record_all_into(&requests[..count], &mut decisions[..count], now_millis)
+    }
+
+    pub fn shutdown(&self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+    }
+
+    pub fn gossip_enabled(&self) -> bool {
+        self.inner.gossip.enabled
+    }
+
+    pub async fn run_until_shutdown(
+        &self,
+    ) -> Result<(), crate::gossip_runtime::GossipRuntimeError> {
+        if !self.inner.gossip.enabled {
+            while !self.inner.shutdown.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            return Ok(());
+        }
+
+        let peers = if self.inner.discovery.kind == DiscoveryMode::Auto
+            && kubernetes_client().await.is_ok()
+        {
+            RuntimePeerHandler::Snapshot(SnapshotPeerHandler::with_capacity(
+                self.inner.discovery.max_peers,
+            ))
+        } else {
+            peer_provider_from_config(&self.inner.discovery)
+                .map_err(crate::gossip_runtime::GossipRuntimeError::Config)?
+        };
+        let discovery_task = self.start_discovery_task(&peers).await?;
+        let bind = self
+            .inner
+            .gossip
+            .bind
+            .ok_or(crate::gossip_runtime::GossipRuntimeError::MissingBind)?;
+        let transport = crate::gossip_runtime::UdpGossipTransport::bind(bind)?;
+        let identity = self
+            .inner
+            .limiter
+            .lock()
+            .map(|limiter| limiter.identity())
+            .unwrap_or_default();
+        let mut runtime_config = crate::gossip_runtime::StandaloneGossipConfig::from_config(
+            &self.inner.gossip,
+            self.inner.remote_cell_capacity,
+        );
+        runtime_config.sender_node_id = crate::gossip::NodeId::from(u128::from(identity.node_id));
+        runtime_config.sender_incarnation = identity.incarnation;
+        let mut runtime = crate::gossip_runtime::StandaloneGossipRuntime::new_with_admin(
+            Arc::clone(&self.inner.limiter),
+            peers,
+            transport,
+            runtime_config,
+            self.inner.admin_snapshot.clone(),
+        );
+        let wake_millis = self.inner.gossip.linger_ms.max(1).div_ceil(4).max(1);
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(wake_millis));
+
+        while !self.inner.shutdown.load(Ordering::Acquire) {
+            interval.tick().await;
+            runtime.tick(current_time_millis());
+        }
+        if let Some(task) = discovery_task {
+            task.abort();
+        }
+        Ok(())
+    }
+
+    async fn start_discovery_task(
+        &self,
+        peers: &RuntimePeerHandler,
+    ) -> Result<Option<tokio::task::JoinHandle<()>>, crate::gossip_runtime::GossipRuntimeError>
+    {
+        match peers {
+            RuntimePeerHandler::File(handler) => {
+                let handler = handler.clone();
+                let poll_millis = self.inner.gossip.linger_ms.max(1);
+                Ok(Some(tokio::spawn(async move {
+                    crate::discovery::run_file_peer_events(handler, poll_millis).await;
+                })))
+            }
+            RuntimePeerHandler::Snapshot(handler)
+                if self.inner.discovery.kind == DiscoveryMode::KubernetesEndpointSlice
+                    || self.inner.discovery.kind == DiscoveryMode::Auto =>
+            {
+                let client = kubernetes_client().await.map_err(|error| {
+                    crate::gossip_runtime::GossipRuntimeError::Discovery(error.to_string())
+                })?;
+                let configs = if self.inner.discovery.endpoint_slices.is_empty()
+                    && self.inner.discovery.namespace.is_none()
+                    && self.inner.discovery.service_name.is_none()
+                {
+                    crate::discovery::kubernetes::running_service_endpoint_slice_configs(
+                        client.clone(),
+                        self.inner.discovery.self_addr,
+                    )
+                    .await
+                    .map_err(|error| {
+                        crate::gossip_runtime::GossipRuntimeError::Discovery(format!("{error:?}"))
+                    })?
+                } else {
+                    endpoint_slice_configs_from_discovery(&self.inner.discovery)
+                        .map_err(crate::gossip_runtime::GossipRuntimeError::Config)?
+                };
+                let handler = handler.clone();
+                Ok(Some(tokio::spawn(async move {
+                    crate::discovery::kubernetes::run_endpoint_slice_watchers(
+                        client, configs, handler,
+                    )
+                    .await;
+                })))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn record_hashed_one(
+    limiter: &mut LocalEngine,
+    request: HashedLimitRequest,
+    now_millis: u64,
+) -> (Decision, Option<CountAggregate>) {
+    let (decision, cell) = limiter.check_and_record_hashed_with_cell(request, now_millis);
+    (decision, cell.map(count_aggregate_from_cell))
+}
+
+fn count_aggregate_from_cell(cell: crate::core::CounterCell) -> CountAggregate {
+    CountAggregate {
+        rule_id: cell.rule_id,
+        key_hash: cell.key_hash,
+        bucket_start_millis: cell.bucket_start_millis,
+        count: cell.count,
+    }
+}
+
+fn current_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+async fn kubernetes_client() -> Result<kube::Client, kube::Error> {
+    match kube::Client::try_default().await {
+        Ok(client) => Ok(client),
+        Err(default_error) => match kube::Config::incluster_dns() {
+            Ok(config) => kube::Client::try_from(config).map_err(|_| default_error),
+            Err(_) => Err(default_error),
+        },
+    }
+}
+
+fn runtime_node_identity() -> NodeIdentity {
+    let seed = std::env::var("GABION_NODE_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("POD_NAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
+    let Some(seed) = seed else {
+        return NodeIdentity::default();
+    };
+
+    let secret = twox_hash::xxhash3_128::SecretBuffer::new(
+        0,
+        [0x9d; twox_hash::xxhash3_128::DEFAULT_SECRET_LENGTH],
+    )
+    .expect("valid XXH3 secret length");
+    let mut hasher = twox_hash::xxhash3_128::RawHasher::new(secret);
+    hasher.write(seed.as_bytes());
+    let node_id = hasher.finish_128().max(1);
+    NodeIdentity {
+        node_id: NodeId::from(node_id),
+        incarnation: 1,
+    }
+}
+
+impl<H: CountUpdateHandler> RateLimitRecorder<LimitRequest<'_>> for Runtime<H> {
+    type Decision = Decision;
+
+    fn record_at(&self, request: LimitRequest<'_>, now_millis: u64) -> Self::Decision {
+        Runtime::record_at(self, request, now_millis)
+    }
+}
+
+impl<H: CountUpdateHandler> RateLimitRecorder<HashedLimitRequest> for Runtime<H> {
+    type Decision = Decision;
+
+    fn record_at(&self, request: HashedLimitRequest, now_millis: u64) -> Self::Decision {
+        Runtime::record_hashed_at(self, request, now_millis)
+    }
+}
+
+impl<H: CountUpdateHandler> RateLimitRecorder<TimedHashedLimitRequest> for Runtime<H> {
+    type Decision = Decision;
+
+    fn record_at(&self, request: TimedHashedLimitRequest, _now_millis: u64) -> Self::Decision {
+        Runtime::record_hashed_at(self, request.request(), request.now_millis())
+    }
+}
+
+impl<H: CountUpdateHandler> RateLimitRuntime<LimitRequest<'_>> for Runtime<H> {
+    fn shutdown(&self) {
+        Runtime::shutdown(self);
+    }
+}
+
+impl<H: CountUpdateHandler> RateLimitRuntime<HashedLimitRequest> for Runtime<H> {
+    fn shutdown(&self) {
+        Runtime::shutdown(self);
+    }
+}
+
+impl<H: CountUpdateHandler> RateLimitRuntime<TimedHashedLimitRequest> for Runtime<H> {
+    fn shutdown(&self) {
+        Runtime::shutdown(self);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct LocalOnlyConfig {
     pub storage: StorageConfig,
     pub limits: Vec<LimitRuleConfig>,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -35,6 +562,13 @@ impl LocalOnlyConfig {
     }
 
     pub fn into_engine(self) -> Result<LocalEngine, ConfigError> {
+        self.into_engine_with_identity(NodeIdentity::default())
+    }
+
+    pub fn into_engine_with_identity(
+        self,
+        identity: NodeIdentity,
+    ) -> Result<LocalEngine, ConfigError> {
         let bucket_count = self
             .limits
             .iter()
@@ -68,7 +602,7 @@ impl LocalOnlyConfig {
             bucket_count,
             max_cells,
             dirty_capacity,
-            NodeIdentity::default(),
+            identity,
         ))
     }
 
@@ -184,15 +718,15 @@ pub struct EndpointSliceSelectorConfig {
     pub port_name: Option<String>,
 }
 
-pub use gabion_discovery::DiscoveryMode as DiscoveryKind;
+pub use crate::DiscoveryMode as DiscoveryKind;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct GossipConfig {
     #[serde(default)]
     pub enabled: bool,
     pub bind: Option<SocketAddr>,
-    #[serde(default = "default_gossip_interval_millis")]
-    pub interval_millis: u64,
+    #[serde(default = "default_gossip_linger_ms")]
+    pub linger_ms: u64,
     #[serde(default = "default_gossip_fanout")]
     pub fanout: usize,
     #[serde(default = "default_gossip_payload_bytes")]
@@ -200,7 +734,7 @@ pub struct GossipConfig {
     #[serde(default = "default_gossip_max_cells")]
     pub max_cells_per_frame: usize,
     #[serde(default = "default_gossip_cluster_id")]
-    pub cluster_id_hash: u64,
+    pub cluster_id_hash: u128,
 }
 
 impl Default for GossipConfig {
@@ -208,7 +742,7 @@ impl Default for GossipConfig {
         Self {
             enabled: false,
             bind: None,
-            interval_millis: default_gossip_interval_millis(),
+            linger_ms: default_gossip_linger_ms(),
             fanout: default_gossip_fanout(),
             max_payload_bytes: default_gossip_payload_bytes(),
             max_cells_per_frame: default_gossip_max_cells(),
@@ -217,8 +751,8 @@ impl Default for GossipConfig {
     }
 }
 
-fn default_gossip_interval_millis() -> u64 {
-    250
+fn default_gossip_linger_ms() -> u64 {
+    gossip::DEFAULT_GOSSIP_LINGER_MS
 }
 
 fn default_gossip_fanout() -> usize {
@@ -233,7 +767,7 @@ fn default_gossip_max_cells() -> usize {
     4096
 }
 
-fn default_gossip_cluster_id() -> u64 {
+fn default_gossip_cluster_id() -> u128 {
     1
 }
 
@@ -330,13 +864,11 @@ pub enum ConfigError {
     MissingStaticPeers,
     #[error("discovery.kind file requires discovery.path")]
     MissingPeerFile,
-    #[error("discovery.kind kubernetes_endpoint_slice requires discovery.namespace")]
+    #[error("discovery.kind kubernetes requires discovery.namespace")]
     MissingKubernetesNamespace,
-    #[error("discovery.kind kubernetes_endpoint_slice requires discovery.service_name")]
+    #[error("discovery.kind kubernetes requires discovery.service_name")]
     MissingKubernetesServiceName,
-    #[error(
-        "discovery.kind kubernetes_endpoint_slice requires at least one EndpointSlice selector"
-    )]
+    #[error("discovery.kind kubernetes requires at least one EndpointSlice selector")]
     MissingKubernetesEndpointSliceSelector,
     #[error("rule {0} has no descriptors")]
     EmptyDescriptorSet(String),
@@ -426,7 +958,7 @@ pub fn peer_provider_from_config(
 
 pub fn endpoint_slice_config_from_discovery(
     discovery: &DiscoveryConfig,
-) -> Result<gabion_discovery::kubernetes::EndpointSliceDiscoveryConfig, ConfigError> {
+) -> Result<crate::discovery::kubernetes::EndpointSliceDiscoveryConfig, ConfigError> {
     endpoint_slice_configs_from_discovery(discovery)?
         .into_iter()
         .next()
@@ -435,13 +967,13 @@ pub fn endpoint_slice_config_from_discovery(
 
 pub fn endpoint_slice_configs_from_discovery(
     discovery: &DiscoveryConfig,
-) -> Result<Vec<gabion_discovery::kubernetes::EndpointSliceDiscoveryConfig>, ConfigError> {
+) -> Result<Vec<crate::discovery::kubernetes::EndpointSliceDiscoveryConfig>, ConfigError> {
     if !discovery.endpoint_slices.is_empty() {
         return Ok(discovery
             .endpoint_slices
             .iter()
             .map(
-                |selector| gabion_discovery::kubernetes::EndpointSliceDiscoveryConfig {
+                |selector| crate::discovery::kubernetes::EndpointSliceDiscoveryConfig {
                     namespace: selector.namespace.clone(),
                     service_name: selector.service_name.clone(),
                     port_name: selector.port_name.clone(),
@@ -459,7 +991,7 @@ pub fn endpoint_slice_configs_from_discovery(
     };
 
     Ok(vec![
-        gabion_discovery::kubernetes::EndpointSliceDiscoveryConfig {
+        crate::discovery::kubernetes::EndpointSliceDiscoveryConfig {
             namespace: namespace.clone(),
             service_name: service_name.clone(),
             port_name: discovery.port_name.clone(),
@@ -502,13 +1034,13 @@ pub mod gossip_runtime {
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use gabion_core;
-    use gabion_discovery::{Peer, PeerHandler};
-    use gabion_envoy::SharedLimiter;
-    use gabion_gossip::{
-        CellTable, DecodeError, GossipHeader, GossipLimits, GossipMessage, GossipMetrics, HmacKey,
-        ShardDigest, decode_authenticated_message_visit_checked, decode_message_visit_checked,
-        encode_authenticated_message, encode_message,
+    use crate::SharedLimiter;
+    use crate::discovery::{Peer, PeerHandler, PeerSnapshot};
+    use crate::gossip::{
+        CellTable, DecodeError, GossipHeader, GossipLimits, GossipMetrics, GossipSendPolicy,
+        GossipSendReason, GossipSpaceUsage, HmacKey, ShardDigest,
+        decode_authenticated_message_visit_checked, decode_message_visit_checked,
+        encode_authenticated_message_parts, encode_message_parts,
     };
     use thiserror::Error;
 
@@ -516,8 +1048,8 @@ pub mod gossip_runtime {
 
     #[derive(Clone, Debug, Default, serde::Serialize)]
     pub struct GossipAdminSnapshot {
-        pub cluster_id_hash: u64,
-        pub sender_node_id: gabion_gossip::NodeId,
+        pub cluster_id_hash: u128,
+        pub sender_node_id: crate::gossip::NodeId,
         pub sender_incarnation: u64,
         pub active_peers: Vec<SocketAddr>,
         pub recent_peers: Vec<RecentPeerSnapshot>,
@@ -528,7 +1060,7 @@ pub mod gossip_runtime {
         pub remote_cell_capacity: usize,
         pub remote_dirty_ring_len: usize,
         pub remote_dirty_overflow: bool,
-        pub remote_cells_sample: Vec<gabion_gossip::CounterCell>,
+        pub remote_cells_sample: Vec<crate::gossip::CounterCell>,
         pub metrics: GossipMetrics,
     }
 
@@ -582,8 +1114,8 @@ pub mod gossip_runtime {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub struct StandaloneGossipConfig {
-        pub cluster_id_hash: u64,
-        pub sender_node_id: gabion_gossip::NodeId,
+        pub cluster_id_hash: u128,
+        pub sender_node_id: crate::gossip::NodeId,
         pub sender_incarnation: u64,
         pub fanout: usize,
         pub max_payload_bytes: usize,
@@ -593,22 +1125,26 @@ pub mod gossip_runtime {
         pub auth_key: Option<HmacKey>,
         pub max_peers: usize,
         pub recent_peer_grace_millis: u64,
+        pub send_policy: GossipSendPolicy,
     }
 
     impl StandaloneGossipConfig {
         pub fn from_config(config: &GossipConfig, remote_cell_capacity: usize) -> Self {
             Self {
                 cluster_id_hash: config.cluster_id_hash,
-                sender_node_id: gabion_gossip::NodeId { hi: 0, lo: 1 },
+                sender_node_id: crate::gossip::NodeId::from(1_u128),
                 sender_incarnation: 1,
                 fanout: config.fanout.max(1),
-                max_payload_bytes: config.max_payload_bytes.max(68),
+                max_payload_bytes: config
+                    .max_payload_bytes
+                    .max(crate::gossip::GOSSIP_HEADER_LEN),
                 max_cells_per_frame: config.max_cells_per_frame.max(1),
                 remote_cell_capacity,
                 remote_dirty_capacity: remote_cell_capacity,
                 auth_key: None,
                 max_peers: 128,
                 recent_peer_grace_millis: 30_000,
+                send_policy: GossipSendPolicy::with_linger_ms(config.linger_ms),
             }
         }
     }
@@ -624,6 +1160,7 @@ pub mod gossip_runtime {
         pub peer_rejected: usize,
         pub local_only: bool,
         pub discovery_stale: bool,
+        pub send_reason: Option<GossipSendReason>,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -710,10 +1247,11 @@ pub mod gossip_runtime {
         remote_cells: CellTable,
         send_buffer: Vec<u8>,
         recv_buffer: Vec<u8>,
-        cell_buffer: Vec<gabion_gossip::CounterCell>,
+        cell_buffer: Vec<crate::gossip::CounterCell>,
         digest_buffer: Vec<ShardDigest>,
         peer_authorizer: PeerAuthorizer,
         force_resync: bool,
+        last_send_millis: u64,
         metrics: GossipMetrics,
         admin_snapshot: Option<SharedGossipAdminSnapshot>,
     }
@@ -753,6 +1291,7 @@ pub mod gossip_runtime {
                     config.recent_peer_grace_millis,
                 ),
                 force_resync: false,
+                last_send_millis: 0,
                 metrics: GossipMetrics::default(),
                 admin_snapshot,
             }
@@ -768,54 +1307,75 @@ pub mod gossip_runtime {
                 ..GossipTickSummary::default()
             };
 
-            self.collect_dirty_cells();
-
             if !snapshot.local_only() {
-                let cells = std::mem::take(&mut self.cell_buffer);
-                let digests = std::mem::take(&mut self.digest_buffer);
-                let message = GossipMessage {
-                    header: GossipHeader {
+                let send_reason = if self.force_resync {
+                    Some(GossipSendReason::DirtyOverflow)
+                } else {
+                    self.local_usage().and_then(|usage| {
+                        self.config.send_policy.should_send(
+                            now_millis,
+                            self.last_send_millis,
+                            usage,
+                        )
+                    })
+                };
+                summary.send_reason = send_reason;
+
+                if send_reason.is_some() {
+                    self.collect_dirty_cells();
+                    let header = GossipHeader {
                         cluster_id_hash: self.config.cluster_id_hash,
                         sender_node_id: self.config.sender_node_id,
                         sender_incarnation: self.config.sender_incarnation,
                         min_bucket: 0,
                         max_bucket: 0,
                         flags: 0,
-                    },
-                    digests,
-                    cells,
-                    truncated: false,
-                };
-                let truncated = if let Some(key) = self.config.auth_key {
-                    encode_authenticated_message(
-                        &message,
-                        key,
-                        &mut self.send_buffer,
-                        GossipLimits {
-                            max_payload_bytes: self.config.max_payload_bytes,
-                            max_digests: 64,
-                            max_cells: self.config.max_cells_per_frame,
-                        },
-                    )
-                } else {
-                    encode_message(
-                        &message,
-                        &mut self.send_buffer,
-                        self.config.max_payload_bytes,
-                    )
-                };
-                self.metrics.record_send(self.send_buffer.len(), truncated);
-                summary.cells_sent = message.cells.len();
-
-                for peer in snapshot.peers().iter().take(self.config.fanout) {
-                    if self.transport.send_to(*peer, self.send_buffer.as_slice()) {
-                        summary.peers_sent = summary.peers_sent.saturating_add(1);
+                    };
+                    let truncated = if let Some(key) = self.config.auth_key {
+                        encode_authenticated_message_parts(
+                            header,
+                            self.digest_buffer.as_slice(),
+                            self.cell_buffer.as_slice(),
+                            false,
+                            key,
+                            &mut self.send_buffer,
+                            GossipLimits {
+                                max_payload_bytes: self.config.max_payload_bytes,
+                                max_digests: 64,
+                                max_cells: self.config.max_cells_per_frame,
+                            },
+                        )
                     } else {
-                        summary.send_failures = summary.send_failures.saturating_add(1);
+                        encode_message_parts(
+                            header,
+                            self.digest_buffer.as_slice(),
+                            self.cell_buffer.as_slice(),
+                            false,
+                            &mut self.send_buffer,
+                            self.config.max_payload_bytes,
+                        )
+                    };
+                    self.metrics.record_send(self.send_buffer.len(), truncated);
+                    summary.cells_sent = self.cell_buffer.len();
+
+                    for peer in snapshot.peers().iter().take(self.config.fanout) {
+                        if self.transport.send_to(*peer, self.send_buffer.as_slice()) {
+                            summary.peers_sent = summary.peers_sent.saturating_add(1);
+                        } else {
+                            summary.send_failures = summary.send_failures.saturating_add(1);
+                        }
                     }
+                    self.last_send_millis = now_millis;
+                    tracing::debug!(
+                        ?send_reason,
+                        cells = summary.cells_sent,
+                        peers = summary.peers_sent,
+                        failures = summary.send_failures,
+                        bytes = self.send_buffer.len(),
+                        truncated,
+                        "gossip frame sent"
+                    );
                 }
-                self.cell_buffer = message.cells;
-                self.digest_buffer = message.digests;
             }
 
             while let Some((peer, len)) = self.transport.recv_into(self.recv_buffer.as_mut_slice())
@@ -862,7 +1422,7 @@ pub mod gossip_runtime {
             }
         }
 
-        fn publish_admin_snapshot(&self, snapshot: &gabion_discovery::PeerSnapshot) {
+        fn publish_admin_snapshot(&self, snapshot: &PeerSnapshot) {
             let Some(shared) = &self.admin_snapshot else {
                 return;
             };
@@ -871,10 +1431,7 @@ pub mod gossip_runtime {
             }
         }
 
-        fn build_admin_snapshot(
-            &self,
-            snapshot: &gabion_discovery::PeerSnapshot,
-        ) -> GossipAdminSnapshot {
+        fn build_admin_snapshot(&self, snapshot: &PeerSnapshot) -> GossipAdminSnapshot {
             GossipAdminSnapshot {
                 cluster_id_hash: self.config.cluster_id_hash,
                 sender_node_id: self.config.sender_node_id,
@@ -898,6 +1455,20 @@ pub mod gossip_runtime {
             }
         }
 
+        fn local_usage(&self) -> Option<GossipSpaceUsage> {
+            let Ok(limiter) = self.limiter.lock() else {
+                return None;
+            };
+            let summary = limiter.storage_summary();
+            Some(GossipSpaceUsage {
+                active_cells: summary.active_cells,
+                max_cells: summary.max_cells,
+                dirty_cells: summary.dirty_ring_len,
+                dirty_capacity: summary.dirty_ring_capacity,
+                dirty_overflowed: summary.dirty_overflow,
+            })
+        }
+
         fn collect_dirty_cells(&mut self) {
             self.cell_buffer.clear();
             self.digest_buffer.clear();
@@ -905,7 +1476,7 @@ pub mod gossip_runtime {
                 return;
             };
 
-            self.digest_buffer.push(gabion_gossip::digest_cells(
+            self.digest_buffer.push(crate::gossip::digest_cells(
                 limiter.cells().map(convert_core_cell),
                 0,
                 1,
@@ -1029,15 +1600,15 @@ pub mod gossip_runtime {
             runtime_config,
             admin_snapshot,
         );
-        run_runtime(runtime, config.interval_millis).await
+        run_runtime(runtime, config.linger_ms).await
     }
 
     pub async fn run_runtime<T: GossipTransport, P: PeerHandler>(
         mut runtime: StandaloneGossipRuntime<T, P>,
-        interval_millis: u64,
+        linger_ms: u64,
     ) -> Result<(), GossipRuntimeError> {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_millis(interval_millis.max(1)));
+        let wake_millis = linger_ms.max(1).div_ceil(4).max(1);
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(wake_millis));
 
         loop {
             interval.tick().await;
@@ -1045,16 +1616,12 @@ pub mod gossip_runtime {
         }
     }
 
-    fn convert_core_cell(cell: gabion_core::CounterCell) -> gabion_gossip::CounterCell {
-        gabion_gossip::CounterCell {
+    fn convert_core_cell(cell: crate::core::CounterCell) -> crate::gossip::CounterCell {
+        crate::gossip::CounterCell {
             rule_id: cell.rule_id,
-            key_hash_hi: cell.key_hash_hi,
-            key_hash_lo: cell.key_hash_lo,
+            key_hash: cell.key_hash,
             bucket_start_millis: cell.bucket_start_millis.min(i64::MAX as u64) as i64,
-            origin_node_id: gabion_gossip::NodeId {
-                hi: cell.origin_node_id.hi,
-                lo: cell.origin_node_id.lo,
-            },
+            origin_node_id: u128::from(cell.origin_node_id).into(),
             origin_incarnation: cell.origin_incarnation,
             count: cell.count,
             last_update_millis: cell.last_update_millis,
@@ -1075,6 +1642,10 @@ pub mod gossip_runtime {
     pub enum GossipRuntimeError {
         #[error("gossip bind address is required")]
         MissingBind,
+        #[error("invalid gossip runtime config: {0}")]
+        Config(#[from] crate::ConfigError),
+        #[error("gossip discovery failed: {0}")]
+        Discovery(String),
         #[error("failed to bind gossip socket: {0}")]
         Bind(std::io::Error),
         #[error("failed to configure gossip socket: {0}")]
@@ -1085,13 +1656,14 @@ pub mod gossip_runtime {
 }
 
 pub mod admin {
+    use crate::RuleId;
+    use crate::SharedLimiter;
+    use crate::core::{CounterCell, Metrics, NodeIdentity, Rule, StorageSummary};
     use axum::extract::{Query, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::get;
     use axum::{Json, Router};
-    use gabion_core::{CounterCell, Metrics, NodeIdentity, Rule, RuleId, StorageSummary};
-    use gabion_envoy::SharedLimiter;
     use serde::{Deserialize, Serialize};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -1135,11 +1707,11 @@ pub mod admin {
     pub struct IntrospectionSnapshot {
         pub mode: &'static str,
         pub identity: NodeIdentity,
-        pub cluster_id_hash: u64,
+        pub cluster_id_hash: u128,
         pub active_rule_ids: Vec<RuleId>,
         pub storage: StorageSummary,
         pub local_cells: Vec<CounterCell>,
-        pub remote_cells: Vec<gabion_gossip::CounterCell>,
+        pub remote_cells: Vec<crate::gossip::CounterCell>,
         pub peers: PeersSnapshot,
         pub gossip: Option<GossipAdminSnapshotSummary>,
         pub metrics: Metrics,
@@ -1370,7 +1942,7 @@ pub mod admin {
                 gossip.active_peers.len(),
                 gossip.metrics,
             ),
-            None => (true, false, 0, gabion_gossip::GossipMetrics::default()),
+            None => (true, false, 0, crate::gossip::GossipMetrics::default()),
         };
         format!(
             concat!(
@@ -1425,6 +1997,13 @@ pub mod admin {
         router_with_gossip(limiter, None)
     }
 
+    pub fn router_for_runtime<H: crate::CountUpdateHandler>(runtime: crate::Runtime<H>) -> Router {
+        router_with_gossip(
+            Arc::clone(&runtime.inner.limiter),
+            runtime.inner.admin_snapshot.clone(),
+        )
+    }
+
     pub fn router_with_gossip(
         limiter: SharedLimiter,
         gossip: Option<SharedGossipAdminSnapshot>,
@@ -1445,6 +2024,14 @@ pub mod admin {
     pub async fn serve(bind: SocketAddr, limiter: SharedLimiter) -> std::io::Result<()> {
         let listener = tokio::net::TcpListener::bind(bind).await?;
         axum::serve(listener, router(limiter)).await
+    }
+
+    pub async fn serve_for_runtime<H: crate::CountUpdateHandler>(
+        bind: SocketAddr,
+        runtime: crate::Runtime<H>,
+    ) -> std::io::Result<()> {
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        axum::serve(listener, router_for_runtime(runtime)).await
     }
 
     pub async fn serve_with_gossip(
@@ -1508,14 +2095,17 @@ pub mod admin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{LocalEngine, NodeIdentity, Rule, RuleTable};
+    use crate::discovery::{
+        DEFAULT_GOSSIP_PORT_NAME, FilePeerHandler, Peer, PeerSnapshot, SnapshotPeerHandler,
+        StaticPeerHandler,
+    };
+    use crate::gossip::GossipSendPolicy;
     use crate::gossip_runtime::{
         GossipTickSummary, GossipTransport, StandaloneGossipConfig, StandaloneGossipRuntime,
         UdpGossipTransport,
     };
-    use gabion_core::{
-        Decision, Descriptor, LimitRequest, NodeId as CoreNodeId, NodeIdentity, RejectReason,
-    };
-    use gabion_discovery::{Peer, SnapshotPeerHandler};
+    use crate::{Decision, Descriptor, LimitRequest, RejectReason};
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
     use std::collections::VecDeque;
@@ -1677,6 +2267,66 @@ limits:
         .expect("config parses")
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct RecordingCountHandler {
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl CountUpdateHandler for RecordingCountHandler {
+        fn apply_batch(&self, aggregates: &[CountAggregate]) -> ApplyBatchOutcome {
+            self.batch_sizes
+                .lock()
+                .expect("batch sizes")
+                .push(aggregates.len());
+            ApplyBatchOutcome {
+                applied: aggregates.len(),
+                dropped: 0,
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_publishes_count_aggregates_in_configured_batches() {
+        let mut config = test_config();
+        config.runtime.count_update_batch_size = 2;
+        let handler = RecordingCountHandler::default();
+        let seen = Arc::clone(&handler.batch_sizes);
+        let runtime =
+            Runtime::with_count_update_handler(config, handler).expect("runtime with handler");
+        let requests = [
+            TimedHashedLimitRequest::new(HashedLimitRequest::new(1, 1_u128, 1), 0),
+            TimedHashedLimitRequest::new(HashedLimitRequest::new(1, 2_u128, 1), 0),
+            TimedHashedLimitRequest::new(HashedLimitRequest::new(1, 3_u128, 1), 0),
+        ];
+        let mut scratch = [CountAggregate::default(); 3];
+
+        let recorded = runtime.record_timed_hashed_batch(&requests, &mut scratch);
+
+        assert_eq!(recorded, 3);
+        assert_eq!(*seen.lock().expect("batch sizes"), vec![2, 1]);
+    }
+
+    #[test]
+    fn runtime_does_not_publish_count_aggregates_after_shutdown() {
+        let mut config = test_config();
+        config.runtime.count_update_batch_size = 1;
+        let handler = RecordingCountHandler::default();
+        let seen = Arc::clone(&handler.batch_sizes);
+        let runtime =
+            Runtime::with_count_update_handler(config, handler).expect("runtime with handler");
+        runtime.shutdown();
+        let requests = [TimedHashedLimitRequest::new(
+            HashedLimitRequest::new(1, 1_u128, 1),
+            0,
+        )];
+        let mut scratch = [CountAggregate::default(); 1];
+
+        let recorded = runtime.record_timed_hashed_batch(&requests, &mut scratch);
+
+        assert_eq!(recorded, 0);
+        assert!(seen.lock().expect("batch sizes").is_empty());
+    }
+
     fn engine_with_node(node: u64) -> LocalEngine {
         let config = test_config();
         let bucket_count = config
@@ -1700,7 +2350,7 @@ limits:
             64,
             64,
             NodeIdentity {
-                node_id: CoreNodeId { hi: 0, lo: node },
+                node_id: u128::from(node).into(),
                 incarnation: 1,
             },
         )
@@ -1713,7 +2363,7 @@ limits:
     fn runtime_config(node: u64) -> StandaloneGossipConfig {
         StandaloneGossipConfig {
             cluster_id_hash: 42,
-            sender_node_id: gabion_gossip::NodeId { hi: 0, lo: node },
+            sender_node_id: u128::from(node).into(),
             sender_incarnation: 1,
             fanout: 3,
             max_payload_bytes: 4096,
@@ -1723,14 +2373,15 @@ limits:
             auth_key: None,
             max_peers: 16,
             recent_peer_grace_millis: 30_000,
+            send_policy: GossipSendPolicy::with_linger_ms(1),
         }
     }
 
     fn empty_gossip_packet(sender: u64) -> Vec<u8> {
-        let message = gabion_gossip::GossipMessage {
-            header: gabion_gossip::GossipHeader {
+        let message = crate::gossip::GossipMessage {
+            header: crate::gossip::GossipHeader {
                 cluster_id_hash: 42,
-                sender_node_id: gabion_gossip::NodeId { hi: 0, lo: sender },
+                sender_node_id: u128::from(sender).into(),
                 sender_incarnation: 1,
                 min_bucket: 0,
                 max_bucket: 0,
@@ -1741,7 +2392,7 @@ limits:
             truncated: false,
         };
         let mut packet = Vec::with_capacity(128);
-        assert!(!gabion_gossip::encode_message(&message, &mut packet, 128));
+        assert!(!crate::gossip::encode_message(&message, &mut packet, 128));
         packet
     }
 
@@ -1785,7 +2436,7 @@ limits:
         let gossip =
             std::sync::Arc::new(std::sync::Mutex::new(gossip_runtime::GossipAdminSnapshot {
                 cluster_id_hash: 42,
-                sender_node_id: gabion_gossip::NodeId { hi: 0, lo: 1 },
+                sender_node_id: 1_u128.into(),
                 sender_incarnation: 1,
                 active_peers: vec![
                     "127.0.0.2:9000".parse().expect("addr"),
@@ -1803,30 +2454,28 @@ limits:
                 remote_dirty_ring_len: 1,
                 remote_dirty_overflow: false,
                 remote_cells_sample: vec![
-                    gabion_gossip::CounterCell {
+                    crate::gossip::CounterCell {
                         rule_id: 1,
-                        key_hash_hi: 1,
-                        key_hash_lo: 2,
+                        key_hash: 2_u128.into(),
                         bucket_start_millis: 0,
-                        origin_node_id: gabion_gossip::NodeId { hi: 0, lo: 2 },
+                        origin_node_id: 2_u128.into(),
                         origin_incarnation: 1,
                         count: 1,
                         last_update_millis: 1,
                         sequence: 1,
                     },
-                    gabion_gossip::CounterCell {
+                    crate::gossip::CounterCell {
                         rule_id: 1,
-                        key_hash_hi: 3,
-                        key_hash_lo: 4,
+                        key_hash: 4_u128.into(),
                         bucket_start_millis: 0,
-                        origin_node_id: gabion_gossip::NodeId { hi: 0, lo: 3 },
+                        origin_node_id: 3_u128.into(),
                         origin_incarnation: 1,
                         count: 1,
                         last_update_millis: 1,
                         sequence: 1,
                     },
                 ],
-                metrics: gabion_gossip::GossipMetrics {
+                metrics: crate::gossip::GossipMetrics {
                     send_bytes: 10,
                     recv_bytes: 20,
                     merge_cells: 2,
@@ -1867,7 +2516,7 @@ limits:
                 local_only: false,
                 discovery_stale: true,
                 active_peers: vec!["127.0.0.2:9000".parse().expect("addr")],
-                metrics: gabion_gossip::GossipMetrics {
+                metrics: crate::gossip::GossipMetrics {
                     send_bytes: 11,
                     recv_bytes: 22,
                     merge_cells: 3,
@@ -2085,7 +2734,7 @@ limits:
         peers_b.peer_added(Peer::new(addr_a));
         let config_a = StandaloneGossipConfig {
             cluster_id_hash: 42,
-            sender_node_id: gabion_gossip::NodeId { hi: 0, lo: 1 },
+            sender_node_id: 1_u128.into(),
             sender_incarnation: 1,
             fanout: 1,
             max_payload_bytes: 4096,
@@ -2095,9 +2744,10 @@ limits:
             auth_key: None,
             max_peers: 16,
             recent_peer_grace_millis: 30_000,
+            send_policy: GossipSendPolicy::with_linger_ms(1),
         };
         let mut config_b = config_a;
-        config_b.sender_node_id = gabion_gossip::NodeId { hi: 0, lo: 2 };
+        config_b.sender_node_id = 2_u128.into();
         let mut runtime_a = StandaloneGossipRuntime::new(
             shared_limiter(engine_with_node(1)),
             peers_a.clone(),
@@ -2155,7 +2805,7 @@ limits:
         let limiter = shared_limiter(engine_with_node(1));
         let config = StandaloneGossipConfig {
             cluster_id_hash: 42,
-            sender_node_id: gabion_gossip::NodeId { hi: 0, lo: 1 },
+            sender_node_id: 1_u128.into(),
             sender_incarnation: 1,
             fanout: 1,
             max_payload_bytes: 4096,
@@ -2165,6 +2815,7 @@ limits:
             auth_key: None,
             max_peers: 16,
             recent_peer_grace_millis: 30_000,
+            send_policy: GossipSendPolicy::with_linger_ms(1),
         };
         let mut runtime =
             StandaloneGossipRuntime::new(limiter, provider, MemoryTransport::default(), config);
@@ -2183,7 +2834,7 @@ limits:
 storage:
   max_keys: 16
 discovery:
-  kind: kubernetes_endpoint_slice
+  kind: kubernetes
   namespace: default
   service_name: gabion
   port_name: gossip
@@ -2270,7 +2921,7 @@ limits:
 storage:
   max_keys: 16
 discovery:
-  kind: kubernetes_endpoint_slice
+  kind: kubernetes
   self_addr: 10.0.0.1:18080
   endpoint_slices:
     - namespace: default
@@ -2317,7 +2968,7 @@ limits:
 storage:
   max_keys: 16
 discovery:
-  kind: kubernetes_endpoint_slice
+  kind: kubernetes
   namespace: default
   service_name: gabion
 gossip:
@@ -2424,7 +3075,7 @@ limits:
                 16,
                 1,
                 NodeIdentity {
-                    node_id: CoreNodeId { hi: 0, lo: 7 },
+                    node_id: 7_u128.into(),
                     incarnation: 1,
                 },
             )),
@@ -2538,7 +3189,7 @@ limits:
 storage:
   max_keys: 16
 discovery:
-  kind: kubernetes_endpoint_slice
+  kind: kubernetes
   endpoint_slices:
     - namespace: default
       service_name: gabion
@@ -2607,7 +3258,7 @@ limits:
         let limiter = shared_limiter(engine_with_node(2));
         let config = StandaloneGossipConfig {
             cluster_id_hash: 42,
-            sender_node_id: gabion_gossip::NodeId { hi: 0, lo: 2 },
+            sender_node_id: 2_u128.into(),
             sender_incarnation: 1,
             fanout: 1,
             max_payload_bytes: 4096,
@@ -2617,6 +3268,7 @@ limits:
             auth_key: None,
             max_peers: 16,
             recent_peer_grace_millis: 10,
+            send_policy: GossipSendPolicy::with_linger_ms(1),
         };
         let mut receiver = StandaloneGossipRuntime::new(
             limiter,
@@ -2696,20 +3348,21 @@ limits:
         let addr_b = "127.0.0.1:11002".parse().expect("addr");
         let config_a = StandaloneGossipConfig {
             cluster_id_hash: 42,
-            sender_node_id: gabion_gossip::NodeId { hi: 0, lo: 1 },
+            sender_node_id: 1_u128.into(),
             sender_incarnation: 1,
             fanout: 1,
             max_payload_bytes: 4096,
             max_cells_per_frame: 16,
             remote_cell_capacity: 64,
             remote_dirty_capacity: 64,
-            auth_key: Some(gabion_gossip::HmacKey::new([1; 32])),
+            auth_key: Some(crate::gossip::HmacKey::new([1; 32])),
             max_peers: 16,
             recent_peer_grace_millis: 30_000,
+            send_policy: GossipSendPolicy::with_linger_ms(1),
         };
         let mut config_b = config_a;
-        config_b.sender_node_id = gabion_gossip::NodeId { hi: 0, lo: 2 };
-        config_b.auth_key = Some(gabion_gossip::HmacKey::new([2; 32]));
+        config_b.sender_node_id = 2_u128.into();
+        config_b.auth_key = Some(crate::gossip::HmacKey::new([2; 32]));
         let mut runtime_a = StandaloneGossipRuntime::new(
             shared_limiter(engine_with_node(1)),
             RuntimePeerHandler::Static(StaticPeerHandler::new(vec![addr_b], None)),
@@ -2766,7 +3419,7 @@ limits:
                 8,
                 1,
                 NodeIdentity {
-                    node_id: CoreNodeId { hi: 0, lo: 7 },
+                    node_id: 7_u128.into(),
                     incarnation: 1,
                 },
             )),
@@ -2777,7 +3430,7 @@ limits:
             MemoryTransport::default(),
             StandaloneGossipConfig {
                 cluster_id_hash: 42,
-                sender_node_id: gabion_gossip::NodeId { hi: 0, lo: 7 },
+                sender_node_id: 7_u128.into(),
                 sender_incarnation: 1,
                 fanout: 1,
                 max_payload_bytes: 4096,
@@ -2787,6 +3440,7 @@ limits:
                 auth_key: None,
                 max_peers: 16,
                 recent_peer_grace_millis: 30_000,
+                send_policy: GossipSendPolicy::with_linger_ms(1),
             },
         );
 
@@ -2819,7 +3473,7 @@ limits:
         let addr_b = transport_b.local_addr().expect("addr b");
         let config_a = StandaloneGossipConfig {
             cluster_id_hash: 42,
-            sender_node_id: gabion_gossip::NodeId { hi: 0, lo: 1 },
+            sender_node_id: 1_u128.into(),
             sender_incarnation: 1,
             fanout: 1,
             max_payload_bytes: 4096,
@@ -2829,9 +3483,10 @@ limits:
             auth_key: None,
             max_peers: 16,
             recent_peer_grace_millis: 30_000,
+            send_policy: GossipSendPolicy::with_linger_ms(1),
         };
         let mut config_b = config_a;
-        config_b.sender_node_id = gabion_gossip::NodeId { hi: 0, lo: 2 };
+        config_b.sender_node_id = 2_u128.into();
         let mut runtime_a = StandaloneGossipRuntime::new(
             shared_limiter(engine_with_node(1)),
             RuntimePeerHandler::Static(StaticPeerHandler::new(vec![addr_b], None)),
@@ -2879,7 +3534,7 @@ limits:
     #[tokio::test]
     #[ignore = "requires local Kubernetes API"]
     async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
-        use gabion_discovery::kubernetes::{
+        use crate::discovery::kubernetes::{
             EndpointSliceDiscoveryConfig, run_endpoint_slice_watchers,
         };
         use k8s_openapi::api::core::v1::{Namespace, Service, ServicePort, ServiceSpec};
@@ -3019,7 +3674,7 @@ limits:
 
             let config_a = StandaloneGossipConfig {
                 cluster_id_hash: 42,
-                sender_node_id: gabion_gossip::NodeId { hi: 0, lo: 1 },
+                sender_node_id: 1_u128.into(),
                 sender_incarnation: 1,
                 fanout: 1,
                 max_payload_bytes: 4096,
@@ -3029,9 +3684,10 @@ limits:
                 auth_key: None,
                 max_peers: 16,
                 recent_peer_grace_millis: 30_000,
+                send_policy: GossipSendPolicy::with_linger_ms(1),
             };
             let mut config_b = config_a;
-            config_b.sender_node_id = gabion_gossip::NodeId { hi: 0, lo: 2 };
+            config_b.sender_node_id = 2_u128.into();
             let mut runtime_a = StandaloneGossipRuntime::new(
                 shared_limiter(engine_with_node(1)),
                 RuntimePeerHandler::Snapshot(provider.clone()),

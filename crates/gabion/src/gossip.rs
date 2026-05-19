@@ -15,34 +15,51 @@
 //! - Authenticated frames reject any payload or tag mutation before callbacks
 //!   run.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
-use gabion_core::{KeyHash, LocalEngine, RuleId};
+use crate::RuleId;
+use crate::core::{KeyHash, LocalEngine};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use thiserror::Error;
+use twox_hash::xxhash3_128::{DEFAULT_SECRET_LENGTH, RawHasher as XxHash3RawHasher, SecretBuffer};
 
 pub type CellId = usize;
 
 const MAGIC: u32 = 0x4742_4731;
 const VERSION: u16 = 1;
-const HEADER_LEN: usize = 68;
-const DIGEST_LEN: usize = 18;
-const CELL_LEN: usize = 72;
-const AUTH_TAG_LEN: usize = 32;
+pub const GOSSIP_HEADER_LEN: usize = 76;
+pub const GOSSIP_DIGEST_LEN: usize = 30;
+pub const GOSSIP_CELL_LEN: usize = 72;
+pub const GOSSIP_AUTH_TAG_LEN: usize = 32;
+const HEADER_LEN: usize = GOSSIP_HEADER_LEN;
+const DIGEST_LEN: usize = GOSSIP_DIGEST_LEN;
+const CELL_LEN: usize = GOSSIP_CELL_LEN;
+const AUTH_TAG_LEN: usize = GOSSIP_AUTH_TAG_LEN;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize)]
-pub struct NodeId {
-    pub hi: u64,
-    pub lo: u64,
+pub struct NodeId(u128);
+
+impl NodeId {
+    pub fn value(self) -> u128 {
+        self.0
+    }
+}
+
+impl From<u128> for NodeId {
+    fn from(value: u128) -> Self {
+        Self(value)
+    }
+}
+
+impl From<NodeId> for u128 {
+    fn from(value: NodeId) -> Self {
+        value.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize)]
 pub struct CounterCell {
     pub rule_id: RuleId,
-    pub key_hash_hi: u64,
-    pub key_hash_lo: u64,
+    pub key_hash: KeyHash,
     pub bucket_start_millis: i64,
     pub origin_node_id: NodeId,
     pub origin_incarnation: u64,
@@ -53,13 +70,12 @@ pub struct CounterCell {
 
 impl CounterCell {
     pub fn key_hash(self) -> KeyHash {
-        KeyHash::from_parts(self.key_hash_hi, self.key_hash_lo)
+        self.key_hash
     }
 
     fn same_identity(self, other: Self) -> bool {
         self.rule_id == other.rule_id
-            && self.key_hash_hi == other.key_hash_hi
-            && self.key_hash_lo == other.key_hash_lo
+            && self.key_hash == other.key_hash
             && self.bucket_start_millis == other.bucket_start_millis
             && self.origin_node_id == other.origin_node_id
             && self.origin_incarnation == other.origin_incarnation
@@ -110,6 +126,15 @@ impl DirtyRing {
         self.overflowed
     }
 
+    pub fn clear(&mut self) {
+        for entry in self.entries.iter_mut() {
+            *entry = None;
+        }
+        self.next = 0;
+        self.len = 0;
+        self.overflowed = false;
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = DirtyEntry> + '_ {
         let len = self.len;
         let start = if len == self.entries.len() {
@@ -122,6 +147,10 @@ impl DirtyRing {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -159,6 +188,10 @@ impl CellTable {
         self.dirty.len()
     }
 
+    pub fn dirty_capacity(&self) -> usize {
+        self.dirty.capacity()
+    }
+
     pub fn cells(&self) -> impl Iterator<Item = (CellId, CounterCell)> + '_ {
         self.cells
             .iter()
@@ -174,6 +207,15 @@ impl CellTable {
 
     pub fn capacity(&self) -> usize {
         self.cells.len()
+    }
+
+    pub fn clear(&mut self) {
+        for cell in self.cells.iter_mut() {
+            *cell = None;
+        }
+        self.active = 0;
+        self.next_sequence = 0;
+        self.dirty.clear();
     }
 
     pub fn upsert_local(&mut self, cell: CounterCell) -> Result<CellId, CellTableFull> {
@@ -286,6 +328,87 @@ impl CellTable {
     }
 }
 
+pub const DEFAULT_GOSSIP_LINGER_MS: u64 = 250;
+pub fn max_cells_for_payload(
+    max_payload_bytes: usize,
+    digest_count: usize,
+    authenticated: bool,
+) -> usize {
+    let auth_len = if authenticated {
+        GOSSIP_AUTH_TAG_LEN
+    } else {
+        0
+    };
+    let Some(payload_without_auth) = max_payload_bytes.checked_sub(auth_len) else {
+        return 0;
+    };
+    let Some(fixed_len) =
+        GOSSIP_HEADER_LEN.checked_add(digest_count.saturating_mul(GOSSIP_DIGEST_LEN))
+    else {
+        return 0;
+    };
+    let Some(cell_bytes) = payload_without_auth.checked_sub(fixed_len) else {
+        return 0;
+    };
+    cell_bytes / GOSSIP_CELL_LEN
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GossipSpaceUsage {
+    pub active_cells: usize,
+    pub max_cells: usize,
+    pub dirty_cells: usize,
+    pub dirty_capacity: usize,
+    pub dirty_overflowed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GossipSendReason {
+    DirtyOverflow,
+    PacketFull,
+    TimeElapsed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GossipSendPolicy {
+    pub linger_ms: u64,
+}
+
+impl Default for GossipSendPolicy {
+    fn default() -> Self {
+        Self {
+            linger_ms: DEFAULT_GOSSIP_LINGER_MS,
+        }
+    }
+}
+
+impl GossipSendPolicy {
+    pub fn with_linger_ms(linger_ms: u64) -> Self {
+        Self {
+            linger_ms,
+            ..Self::default()
+        }
+    }
+
+    pub fn should_send(
+        self,
+        now_millis: u64,
+        last_send_millis: u64,
+        usage: GossipSpaceUsage,
+    ) -> Option<GossipSendReason> {
+        if usage.dirty_overflowed {
+            return Some(GossipSendReason::DirtyOverflow);
+        }
+        if usage.max_cells != 0 && usage.active_cells >= usage.max_cells {
+            return Some(GossipSendReason::PacketFull);
+        }
+        if now_millis.saturating_sub(last_send_millis) >= self.linger_ms.max(1) {
+            return Some(GossipSendReason::TimeElapsed);
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MergeOutcome {
     pub cell_id: CellId,
@@ -301,12 +424,12 @@ pub struct ShardDigest {
     pub shard_id: u16,
     pub active_cell_count: u32,
     pub max_sequence: u64,
-    pub checksum: u64,
+    pub checksum: u128,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GossipHeader {
-    pub cluster_id_hash: u64,
+    pub cluster_id_hash: u128,
     pub sender_node_id: NodeId,
     pub sender_incarnation: u64,
     pub min_bucket: i64,
@@ -406,49 +529,64 @@ pub fn encode_message(
     buffer: &mut Vec<u8>,
     max_payload_bytes: usize,
 ) -> bool {
+    encode_message_parts(
+        message.header,
+        &message.digests,
+        &message.cells,
+        message.truncated,
+        buffer,
+        max_payload_bytes,
+    )
+}
+
+pub fn encode_message_parts(
+    header: GossipHeader,
+    digests: &[ShardDigest],
+    cells: &[CounterCell],
+    truncated: bool,
+    buffer: &mut Vec<u8>,
+    max_payload_bytes: usize,
+) -> bool {
     buffer.clear();
-    let digest_count = message.digests.len().min(u16::MAX as usize);
-    let max_cells_by_count = message.cells.len().min(u32::MAX as usize);
+    let digest_count = digests.len().min(u16::MAX as usize);
+    let max_cells_by_count = cells.len().min(u32::MAX as usize);
     let fixed_len = HEADER_LEN + digest_count * DIGEST_LEN;
     if fixed_len > max_payload_bytes {
         return true;
     }
     let max_cells_by_size = (max_payload_bytes - fixed_len) / CELL_LEN;
     let cell_count = max_cells_by_count.min(max_cells_by_size);
-    let truncated = message.truncated || cell_count < message.cells.len();
+    let truncated = truncated || cell_count < cells.len();
     let flags = if truncated {
-        message.header.flags | 1
+        header.flags | 1
     } else {
-        message.header.flags
+        header.flags
     };
 
     put_u32(buffer, MAGIC);
     put_u16(buffer, VERSION);
     put_u16(buffer, digest_count as u16);
     put_u32(buffer, cell_count as u32);
-    put_u64(buffer, message.header.cluster_id_hash);
-    put_u64(buffer, message.header.sender_node_id.hi);
-    put_u64(buffer, message.header.sender_node_id.lo);
-    put_u64(buffer, message.header.sender_incarnation);
-    put_i64(buffer, message.header.min_bucket);
-    put_i64(buffer, message.header.max_bucket);
+    put_u128(buffer, header.cluster_id_hash);
+    put_u128(buffer, header.sender_node_id.into());
+    put_u64(buffer, header.sender_incarnation);
+    put_i64(buffer, header.min_bucket);
+    put_i64(buffer, header.max_bucket);
     put_u32(buffer, flags);
     put_u32(buffer, 0);
 
-    for digest in message.digests.iter().take(digest_count) {
+    for digest in digests.iter().take(digest_count) {
         put_u16(buffer, digest.shard_id);
         put_u32(buffer, digest.active_cell_count);
         put_u64(buffer, digest.max_sequence);
-        put_u64(buffer, digest.checksum);
+        put_u128(buffer, digest.checksum);
     }
 
-    for cell in message.cells.iter().take(cell_count) {
+    for cell in cells.iter().take(cell_count) {
         put_u64(buffer, u64::from(cell.rule_id));
-        put_u64(buffer, cell.key_hash_hi);
-        put_u64(buffer, cell.key_hash_lo);
+        put_u128(buffer, cell.key_hash.into());
         put_i64(buffer, cell.bucket_start_millis);
-        put_u64(buffer, cell.origin_node_id.hi);
-        put_u64(buffer, cell.origin_node_id.lo);
+        put_u128(buffer, cell.origin_node_id.into());
         put_u64(buffer, cell.origin_incarnation);
         put_u64(buffer, cell.count);
         put_u64(buffer, cell.last_update_millis);
@@ -463,12 +601,39 @@ pub fn encode_authenticated_message(
     buffer: &mut Vec<u8>,
     limits: GossipLimits,
 ) -> bool {
+    encode_authenticated_message_parts(
+        message.header,
+        &message.digests,
+        &message.cells,
+        message.truncated,
+        key,
+        buffer,
+        limits,
+    )
+}
+
+pub fn encode_authenticated_message_parts(
+    header: GossipHeader,
+    digests: &[ShardDigest],
+    cells: &[CounterCell],
+    truncated: bool,
+    key: HmacKey,
+    buffer: &mut Vec<u8>,
+    limits: GossipLimits,
+) -> bool {
     if limits.max_payload_bytes < AUTH_TAG_LEN {
         buffer.clear();
         return true;
     }
 
-    let truncated = encode_message(message, buffer, limits.max_payload_bytes - AUTH_TAG_LEN);
+    let truncated = encode_message_parts(
+        header,
+        digests,
+        cells,
+        truncated,
+        buffer,
+        limits.max_payload_bytes - AUTH_TAG_LEN,
+    );
     let tag = hmac_sha256(key, buffer);
     buffer.extend_from_slice(&tag);
     truncated
@@ -516,11 +681,8 @@ pub fn decode_message_with_limits(
     }
 
     let header = GossipHeader {
-        cluster_id_hash: take_u64(bytes, &mut cursor)?,
-        sender_node_id: NodeId {
-            hi: take_u64(bytes, &mut cursor)?,
-            lo: take_u64(bytes, &mut cursor)?,
-        },
+        cluster_id_hash: take_u128(bytes, &mut cursor)?,
+        sender_node_id: take_u128(bytes, &mut cursor)?.into(),
         sender_incarnation: take_u64(bytes, &mut cursor)?,
         min_bucket: take_i64(bytes, &mut cursor)?,
         max_bucket: take_i64(bytes, &mut cursor)?,
@@ -534,7 +696,7 @@ pub fn decode_message_with_limits(
             shard_id: take_u16(bytes, &mut cursor)?,
             active_cell_count: take_u32(bytes, &mut cursor)?,
             max_sequence: take_u64(bytes, &mut cursor)?,
-            checksum: take_u64(bytes, &mut cursor)?,
+            checksum: take_u128(bytes, &mut cursor)?,
         });
     }
 
@@ -542,13 +704,9 @@ pub fn decode_message_with_limits(
     for _ in 0..cell_count {
         cells.push(CounterCell {
             rule_id: take_u64(bytes, &mut cursor)? as RuleId,
-            key_hash_hi: take_u64(bytes, &mut cursor)?,
-            key_hash_lo: take_u64(bytes, &mut cursor)?,
+            key_hash: take_u128(bytes, &mut cursor)?.into(),
             bucket_start_millis: take_i64(bytes, &mut cursor)?,
-            origin_node_id: NodeId {
-                hi: take_u64(bytes, &mut cursor)?,
-                lo: take_u64(bytes, &mut cursor)?,
-            },
+            origin_node_id: take_u128(bytes, &mut cursor)?.into(),
             origin_incarnation: take_u64(bytes, &mut cursor)?,
             count: take_u64(bytes, &mut cursor)?,
             last_update_millis: take_u64(bytes, &mut cursor)?,
@@ -607,11 +765,8 @@ pub fn decode_message_visit_checked(
     }
 
     let header = GossipHeader {
-        cluster_id_hash: take_u64(bytes, &mut cursor)?,
-        sender_node_id: NodeId {
-            hi: take_u64(bytes, &mut cursor)?,
-            lo: take_u64(bytes, &mut cursor)?,
-        },
+        cluster_id_hash: take_u128(bytes, &mut cursor)?,
+        sender_node_id: take_u128(bytes, &mut cursor)?.into(),
         sender_incarnation: take_u64(bytes, &mut cursor)?,
         min_bucket: take_i64(bytes, &mut cursor)?,
         max_bucket: take_i64(bytes, &mut cursor)?,
@@ -632,20 +787,16 @@ pub fn decode_message_visit_checked(
             shard_id: take_u16(bytes, &mut cursor)?,
             active_cell_count: take_u32(bytes, &mut cursor)?,
             max_sequence: take_u64(bytes, &mut cursor)?,
-            checksum: take_u64(bytes, &mut cursor)?,
+            checksum: take_u128(bytes, &mut cursor)?,
         });
     }
 
     for _ in 0..cell_count {
         on_cell(CounterCell {
             rule_id: take_u64(bytes, &mut cursor)? as RuleId,
-            key_hash_hi: take_u64(bytes, &mut cursor)?,
-            key_hash_lo: take_u64(bytes, &mut cursor)?,
+            key_hash: take_u128(bytes, &mut cursor)?.into(),
             bucket_start_millis: take_i64(bytes, &mut cursor)?,
-            origin_node_id: NodeId {
-                hi: take_u64(bytes, &mut cursor)?,
-                lo: take_u64(bytes, &mut cursor)?,
-            },
+            origin_node_id: take_u128(bytes, &mut cursor)?.into(),
             origin_incarnation: take_u64(bytes, &mut cursor)?,
             count: take_u64(bytes, &mut cursor)?,
             last_update_millis: take_u64(bytes, &mut cursor)?,
@@ -718,19 +869,20 @@ fn shard_for(cell: CounterCell, shard_count: u16) -> u16 {
     if shard_count == 0 {
         return 0;
     }
-    (cell.key_hash_hi ^ cell.key_hash_lo) as u16 % shard_count
+    cell.key_hash.value() as u16 % shard_count
 }
 
-fn cell_checksum(cell: CounterCell) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    cell.rule_id.hash(&mut hasher);
-    cell.key_hash_hi.hash(&mut hasher);
-    cell.key_hash_lo.hash(&mut hasher);
-    cell.bucket_start_millis.hash(&mut hasher);
-    cell.origin_node_id.hash(&mut hasher);
-    cell.origin_incarnation.hash(&mut hasher);
-    cell.count.hash(&mut hasher);
-    hasher.finish()
+fn cell_checksum(cell: CounterCell) -> u128 {
+    let secret =
+        SecretBuffer::new(0, [0x9d; DEFAULT_SECRET_LENGTH]).expect("valid XXH3 secret length");
+    let mut hasher = XxHash3RawHasher::new(secret);
+    hasher.write(&u64::from(cell.rule_id).to_le_bytes());
+    hasher.write(&cell.key_hash.value().to_le_bytes());
+    hasher.write(&cell.bucket_start_millis.to_le_bytes());
+    hasher.write(&cell.origin_node_id.value().to_le_bytes());
+    hasher.write(&cell.origin_incarnation.to_le_bytes());
+    hasher.write(&cell.count.to_le_bytes());
+    hasher.finish_128()
 }
 
 pub fn digest_cells(
@@ -738,7 +890,7 @@ pub fn digest_cells(
     shard_id: u16,
     shard_count: u16,
 ) -> ShardDigest {
-    let mut checksum = 0_u64;
+    let mut checksum = 0_u128;
     let mut active_cell_count = 0_u32;
     let mut max_sequence = 0_u64;
 
@@ -768,6 +920,10 @@ fn put_u32(buffer: &mut Vec<u8>, value: u32) {
 }
 
 fn put_u64(buffer: &mut Vec<u8>, value: u64) {
+    buffer.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u128(buffer: &mut Vec<u8>, value: u128) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -808,6 +964,17 @@ fn take_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, DecodeError> {
     Ok(u64::from_le_bytes(value))
 }
 
+fn take_u128(bytes: &[u8], cursor: &mut usize) -> Result<u128, DecodeError> {
+    let end = cursor.saturating_add(16);
+    let Some(slice) = bytes.get(*cursor..end) else {
+        return Err(DecodeError::Truncated);
+    };
+    *cursor = end;
+    let mut value = [0_u8; 16];
+    value.copy_from_slice(slice);
+    Ok(u128::from_le_bytes(value))
+}
+
 fn take_i64(bytes: &[u8], cursor: &mut usize) -> Result<i64, DecodeError> {
     Ok(take_u64(bytes, cursor)? as i64)
 }
@@ -824,9 +991,10 @@ fn hmac_sha256(key: HmacKey, payload: &[u8]) -> [u8; AUTH_TAG_LEN] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gabion_core::{
-        hash_domain, hash_key, Decision, Descriptor, DescriptorMatcher, EnforcementMode,
-        LimitRequest, LocalEngine, OverflowPolicy, Rule, RuleTable, SafetyMargin, WindowSpec,
+    use crate::core::{DescriptorMatcher, LocalEngine, Rule, RuleTable, hash_domain, hash_key};
+    use crate::{
+        Decision, Descriptor, EnforcementMode, LimitRequest, OverflowPolicy, SafetyMargin,
+        WindowSpec,
     };
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
@@ -865,11 +1033,9 @@ mod tests {
     #[derive(Clone, Debug)]
     struct GeneratedMergeCell {
         rule_id: u8,
-        key_hash_hi: u8,
-        key_hash_lo: u8,
+        key_hash: u8,
         bucket: u8,
-        origin_hi: u8,
-        origin_lo: u8,
+        origin: u8,
         incarnation: u8,
         count: u8,
     }
@@ -878,11 +1044,9 @@ mod tests {
         fn arbitrary(g: &mut Gen) -> Self {
             Self {
                 rule_id: u8::arbitrary(g) % 4,
-                key_hash_hi: u8::arbitrary(g) % 4,
-                key_hash_lo: u8::arbitrary(g) % 4,
+                key_hash: u8::arbitrary(g) % 16,
                 bucket: u8::arbitrary(g) % 4,
-                origin_hi: u8::arbitrary(g) % 4,
-                origin_lo: u8::arbitrary(g) % 8,
+                origin: u8::arbitrary(g) % 16,
                 incarnation: u8::arbitrary(g) % 3,
                 count: u8::arbitrary(g),
             }
@@ -893,13 +1057,9 @@ mod tests {
         fn into_cell(self) -> CounterCell {
             CounterCell {
                 rule_id: u32::from(self.rule_id) + 1,
-                key_hash_hi: u64::from(self.key_hash_hi) + 10,
-                key_hash_lo: u64::from(self.key_hash_lo) + 20,
+                key_hash: (u128::from(self.key_hash) + 10).into(),
                 bucket_start_millis: i64::from(self.bucket) * 1_000,
-                origin_node_id: NodeId {
-                    hi: u64::from(self.origin_hi),
-                    lo: u64::from(self.origin_lo) + 1,
-                },
+                origin_node_id: (u128::from(self.origin) + 1).into(),
                 origin_incarnation: u64::from(self.incarnation) + 1,
                 count: u64::from(self.count) + 1,
                 last_update_millis: u64::from(self.count) + 1,
@@ -936,13 +1096,112 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct CodecCapacityCase {
+        digest_count: u8,
+        cell_count: u8,
+        payload_selector: u16,
+        initially_truncated: bool,
+    }
+
+    impl Arbitrary for CodecCapacityCase {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                digest_count: u8::arbitrary(g) % 12,
+                cell_count: u8::arbitrary(g) % 48,
+                payload_selector: u16::arbitrary(g),
+                initially_truncated: bool::arbitrary(g),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DecodeLimitCase {
+        digest_count: u8,
+        cell_count: u8,
+        digest_limit_delta: u8,
+        cell_limit_delta: u8,
+        payload_limit_delta: u16,
+        payload_too_small: bool,
+    }
+
+    impl Arbitrary for DecodeLimitCase {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                digest_count: u8::arbitrary(g) % 12,
+                cell_count: u8::arbitrary(g) % 48,
+                digest_limit_delta: u8::arbitrary(g) % 4,
+                cell_limit_delta: u8::arbitrary(g) % 4,
+                payload_limit_delta: u16::arbitrary(g) % 128,
+                payload_too_small: bool::arbitrary(g),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DigestModelCell {
+        cell: GeneratedMergeCell,
+        sequence: u8,
+    }
+
+    impl Arbitrary for DigestModelCell {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                cell: GeneratedMergeCell::arbitrary(g),
+                sequence: u8::arbitrary(g),
+            }
+        }
+    }
+
+    impl DigestModelCell {
+        fn into_cell(self) -> CounterCell {
+            let mut cell = self.cell.into_cell();
+            cell.sequence = u64::from(self.sequence);
+            cell
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DigestModelCase {
+        cells: Vec<DigestModelCell>,
+        shard_count: u8,
+        shard_selector: u8,
+    }
+
+    impl Arbitrary for DigestModelCase {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let mut cells = Vec::<DigestModelCell>::arbitrary(g);
+            cells.truncate(64);
+            let shard_count = (u8::arbitrary(g) % 8).max(1);
+            Self {
+                cells,
+                shard_count,
+                shard_selector: u8::arbitrary(g),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CellTableCapacityCase {
+        capacity: u8,
+        incoming_count: u8,
+    }
+
+    impl Arbitrary for CellTableCapacityCase {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                capacity: u8::arbitrary(g) % 12,
+                incoming_count: u8::arbitrary(g) % 24,
+            }
+        }
+    }
+
     fn cell(count: u64, origin: u64) -> CounterCell {
         CounterCell {
             rule_id: 1,
-            key_hash_hi: 10,
-            key_hash_lo: 20,
+            key_hash: 20_u128.into(),
             bucket_start_millis: 0,
-            origin_node_id: NodeId { hi: 0, lo: origin },
+            origin_node_id: u128::from(origin).into(),
             origin_incarnation: 1,
             count,
             last_update_millis: count,
@@ -986,14 +1245,14 @@ mod tests {
 
     #[test]
     fn merge_remote_example_orders_preserve_counts() {
-        fn merged_counts(cells: &[CounterCell]) -> Vec<(u64, u64)> {
+        fn merged_counts(cells: &[CounterCell]) -> Vec<(u128, u64)> {
             let mut table = CellTable::with_capacity(8, 16);
             for cell in cells {
                 table.merge_remote(*cell, None, 0).expect("merge");
             }
             let mut counts = table
                 .cells()
-                .map(|(_id, cell)| (cell.origin_node_id.lo, cell.count))
+                .map(|(_id, cell)| (cell.origin_node_id.value(), cell.count))
                 .collect::<Vec<_>>();
             counts.sort();
             counts
@@ -1047,7 +1306,7 @@ mod tests {
         let message = GossipMessage {
             header: GossipHeader {
                 cluster_id_hash: 42,
-                sender_node_id: NodeId { hi: 1, lo: 2 },
+                sender_node_id: ((1_u128 << 64) | 2).into(),
                 sender_incarnation: 7,
                 min_bucket: 0,
                 max_bucket: 1000,
@@ -1083,7 +1342,7 @@ mod tests {
         let message = GossipMessage {
             header: GossipHeader {
                 cluster_id_hash: 42,
-                sender_node_id: NodeId { hi: 1, lo: 2 },
+                sender_node_id: ((1_u128 << 64) | 2).into(),
                 sender_incarnation: 7,
                 min_bucket: 0,
                 max_bucket: 1000,
@@ -1131,7 +1390,7 @@ mod tests {
         let message = GossipMessage {
             header: GossipHeader {
                 cluster_id_hash: 42,
-                sender_node_id: NodeId { hi: 1, lo: 2 },
+                sender_node_id: ((1_u128 << 64) | 2).into(),
                 sender_incarnation: 7,
                 min_bucket: 0,
                 max_bucket: 1000,
@@ -1156,7 +1415,7 @@ mod tests {
         let message = GossipMessage {
             header: GossipHeader {
                 cluster_id_hash: 42,
-                sender_node_id: NodeId { hi: 1, lo: 2 },
+                sender_node_id: ((1_u128 << 64) | 2).into(),
                 sender_incarnation: 7,
                 min_bucket: 0,
                 max_bucket: 1000,
@@ -1186,7 +1445,7 @@ mod tests {
         );
     }
 
-    type NormalizedCell = (u32, u64, u64, i64, u64, u64, u64, u64);
+    type NormalizedCell = (u32, u128, i64, u128, u64, u64);
 
     fn merge_case_cells(case: MergeLawCase) -> Vec<CounterCell> {
         case.cells
@@ -1195,14 +1454,12 @@ mod tests {
             .collect()
     }
 
-    fn identity_key(cell: CounterCell) -> (u32, u64, u64, i64, u64, u64, u64) {
+    fn identity_key(cell: CounterCell) -> (u32, u128, i64, u128, u64) {
         (
             cell.rule_id,
-            cell.key_hash_hi,
-            cell.key_hash_lo,
+            cell.key_hash.value(),
             cell.bucket_start_millis,
-            cell.origin_node_id.hi,
-            cell.origin_node_id.lo,
+            cell.origin_node_id.value(),
             cell.origin_incarnation,
         )
     }
@@ -1213,11 +1470,9 @@ mod tests {
             .map(|cell| {
                 (
                     cell.rule_id,
-                    cell.key_hash_hi,
-                    cell.key_hash_lo,
+                    cell.key_hash.value(),
                     cell.bucket_start_millis,
-                    cell.origin_node_id.hi,
-                    cell.origin_node_id.lo,
+                    cell.origin_node_id.value(),
                     cell.origin_incarnation,
                     cell.count,
                 )
@@ -1228,25 +1483,13 @@ mod tests {
     }
 
     fn expected_counts_from_map(
-        max_by_identity: &BTreeMap<(u32, u64, u64, i64, u64, u64, u64), u64>,
+        max_by_identity: &BTreeMap<(u32, u128, i64, u128, u64), u64>,
     ) -> Vec<NormalizedCell> {
         max_by_identity
             .iter()
             .map(
-                |(
-                    (rule_id, key_hash_hi, key_hash_lo, bucket, origin_hi, origin_lo, incarnation),
-                    count,
-                )| {
-                    (
-                        *rule_id,
-                        *key_hash_hi,
-                        *key_hash_lo,
-                        *bucket,
-                        *origin_hi,
-                        *origin_lo,
-                        *incarnation,
-                        *count,
-                    )
+                |((rule_id, key_hash, bucket, origin, incarnation), count)| {
+                    (*rule_id, *key_hash, *bucket, *origin, *incarnation, *count)
                 },
             )
             .collect()
@@ -1258,6 +1501,44 @@ mod tests {
             table.merge_remote(*cell, None, 0).expect("merge");
         }
         table.cells().map(|(_id, cell)| cell).collect()
+    }
+
+    fn generated_digest(index: usize) -> ShardDigest {
+        ShardDigest {
+            shard_id: index as u16,
+            active_cell_count: (index + 1) as u32,
+            max_sequence: index as u64 + 10,
+            checksum: u128::from(index as u64 + 20),
+        }
+    }
+
+    fn generated_wire_cell(index: usize) -> CounterCell {
+        CounterCell {
+            rule_id: (index as RuleId).saturating_add(1),
+            key_hash: (u128::from(index as u64) + 1).into(),
+            bucket_start_millis: (index as i64) * 1_000,
+            origin_node_id: (u128::from(index as u64) + 1).into(),
+            origin_incarnation: 1,
+            count: index as u64 + 1,
+            last_update_millis: index as u64 + 2,
+            sequence: 0,
+        }
+    }
+
+    fn generated_message(digest_count: usize, cell_count: usize, truncated: bool) -> GossipMessage {
+        GossipMessage {
+            header: GossipHeader {
+                cluster_id_hash: 42,
+                sender_node_id: ((1_u128 << 64) | 2).into(),
+                sender_incarnation: 7,
+                min_bucket: 0,
+                max_bucket: 8_000,
+                flags: 0,
+            },
+            digests: (0..digest_count).map(generated_digest).collect(),
+            cells: (0..cell_count).map(generated_wire_cell).collect(),
+            truncated,
+        }
     }
 
     #[quickcheck]
@@ -1404,6 +1685,193 @@ mod tests {
     }
 
     #[quickcheck]
+    fn quickcheck_dirty_ring_retains_latest_dirty_cells_in_order(
+        case: DirtyRingCase,
+    ) -> TestResult {
+        let dirty_capacity = usize::from(case.dirty_capacity);
+        let cell_count = usize::from(case.cell_count);
+        let mut table = CellTable::with_capacity(cell_count, dirty_capacity);
+        let mut expected = Vec::with_capacity(dirty_capacity.min(cell_count));
+
+        for origin in 0..cell_count {
+            let cell = cell(1, origin as u64 + 1);
+            if table.merge_remote(cell, None, 0).is_err() {
+                return TestResult::error("generated table filled before cell capacity");
+            }
+            expected.push(identity_key(cell));
+            if expected.len() > dirty_capacity {
+                expected.remove(0);
+            }
+        }
+
+        let actual = table.dirty_cells().map(identity_key).collect::<Vec<_>>();
+        if actual == expected {
+            TestResult::passed()
+        } else {
+            TestResult::error("dirty ring retained cells diverged from latest-N order model")
+        }
+    }
+
+    #[quickcheck]
+    fn quickcheck_cell_table_reports_full_without_growing(
+        case: CellTableCapacityCase,
+    ) -> TestResult {
+        let capacity = usize::from(case.capacity);
+        let incoming_count = usize::from(case.incoming_count);
+        let mut table = CellTable::with_capacity(capacity, incoming_count.max(1));
+        let mut accepted = 0_usize;
+
+        for origin in 0..incoming_count {
+            match table.merge_remote(cell(1, origin as u64 + 1), None, 0) {
+                Ok(_) if accepted < capacity => accepted += 1,
+                Ok(_) => {
+                    return TestResult::error("cell table accepted more identities than capacity");
+                }
+                Err(CellTableFull) if accepted == capacity => {}
+                Err(CellTableFull) => {
+                    return TestResult::error("cell table reported full before reaching capacity");
+                }
+            }
+            if table.active_cell_count() > capacity || table.capacity() != capacity {
+                return TestResult::error("cell table grew beyond its configured capacity");
+            }
+        }
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn quickcheck_encoder_respects_payload_capacity_and_truncates_by_model(
+        case: CodecCapacityCase,
+    ) -> TestResult {
+        let digest_count = usize::from(case.digest_count);
+        let cell_count = usize::from(case.cell_count);
+        let message = generated_message(digest_count, cell_count, case.initially_truncated);
+        let full_len = HEADER_LEN + digest_count * DIGEST_LEN + cell_count * CELL_LEN;
+        let max_payload_bytes = usize::from(case.payload_selector) % (full_len + CELL_LEN + 1);
+        let mut buffer = Vec::with_capacity(full_len + CELL_LEN);
+
+        let truncated = encode_message(&message, &mut buffer, max_payload_bytes);
+        if buffer.len() > max_payload_bytes {
+            return TestResult::error("encoder wrote past configured payload capacity");
+        }
+
+        let fixed_len = HEADER_LEN + digest_count * DIGEST_LEN;
+        if fixed_len > max_payload_bytes {
+            if truncated && buffer.is_empty() {
+                return TestResult::passed();
+            }
+            return TestResult::error("encoder wrote a frame without enough room for fixed fields");
+        }
+
+        let expected_cells = cell_count.min((max_payload_bytes - fixed_len) / CELL_LEN);
+        let expected_truncated = case.initially_truncated || expected_cells < cell_count;
+        if truncated != expected_truncated {
+            return TestResult::error("encoder truncation flag diverged from payload-size model");
+        }
+
+        let Ok(decoded) = decode_message(&buffer, digest_count, expected_cells) else {
+            return TestResult::error("decoder rejected generated capacity-respecting frame");
+        };
+        if decoded.digests.len() != digest_count || decoded.cells.len() != expected_cells {
+            return TestResult::error("encoded frame counts diverged from payload-size model");
+        }
+        if decoded.truncated != expected_truncated {
+            return TestResult::error("encoded frame header did not preserve truncation state");
+        }
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn quickcheck_decoder_enforces_payload_and_count_limits_before_allocation(
+        case: DecodeLimitCase,
+    ) -> TestResult {
+        let digest_count = usize::from(case.digest_count);
+        let cell_count = usize::from(case.cell_count);
+        let message = generated_message(digest_count, cell_count, false);
+        let payload_capacity = HEADER_LEN + digest_count * DIGEST_LEN + cell_count * CELL_LEN;
+        let mut buffer = Vec::with_capacity(payload_capacity);
+        if encode_message(&message, &mut buffer, payload_capacity) {
+            return TestResult::error("generated decode-limit message unexpectedly truncated");
+        }
+
+        let max_payload_bytes = if case.payload_too_small {
+            buffer
+                .len()
+                .saturating_sub(usize::from(case.payload_limit_delta).max(1))
+        } else {
+            buffer.len()
+        };
+        let max_digests = digest_count.saturating_sub(usize::from(case.digest_limit_delta));
+        let max_cells = cell_count.saturating_sub(usize::from(case.cell_limit_delta));
+        let result = decode_message_with_limits(
+            &buffer,
+            GossipLimits {
+                max_payload_bytes,
+                max_digests,
+                max_cells,
+            },
+        );
+        let expected = if buffer.len() > max_payload_bytes {
+            Err(DecodeError::PayloadTooLarge)
+        } else if digest_count > max_digests || cell_count > max_cells {
+            Err(DecodeError::CapacityExceeded)
+        } else {
+            Ok(())
+        };
+
+        match (result, expected) {
+            (Ok(decoded), Ok(()))
+                if decoded.digests.len() == digest_count && decoded.cells.len() == cell_count =>
+            {
+                TestResult::passed()
+            }
+            (Err(actual), Err(expected)) if actual == expected => TestResult::passed(),
+            (Ok(_), Err(_)) => TestResult::error("decoder accepted a frame that exceeded limits"),
+            (Err(_), Ok(())) => TestResult::error("decoder rejected a frame within limits"),
+            (Err(_), Err(_)) => TestResult::error("decoder limit error precedence diverged"),
+            (Ok(_), Ok(())) => {
+                TestResult::error("decoded frame counts diverged from encoded counts")
+            }
+        }
+    }
+
+    #[quickcheck]
+    fn quickcheck_digest_matches_shard_model(case: DigestModelCase) -> TestResult {
+        let shard_count = u16::from(case.shard_count);
+        let shard_id = u16::from(case.shard_selector) % shard_count;
+        let cells = case
+            .cells
+            .into_iter()
+            .map(DigestModelCell::into_cell)
+            .collect::<Vec<_>>();
+        let mut expected_count = 0_u32;
+        let mut expected_max_sequence = 0_u64;
+        let mut expected_checksum = 0_u128;
+
+        for cell in cells.iter().copied() {
+            if shard_for(cell, shard_count) != shard_id {
+                continue;
+            }
+            expected_count = expected_count.saturating_add(1);
+            expected_max_sequence = expected_max_sequence.max(cell.sequence);
+            expected_checksum ^= cell_checksum(cell);
+        }
+
+        let actual = digest_cells(cells.iter().copied(), shard_id, shard_count);
+        if actual.shard_id == shard_id
+            && actual.active_cell_count == expected_count
+            && actual.max_sequence == expected_max_sequence
+            && actual.checksum == expected_checksum
+        {
+            TestResult::passed()
+        } else {
+            TestResult::error("digest diverged from shard/count/sequence/checksum model")
+        }
+    }
+
+    #[quickcheck]
     fn quickcheck_codec_roundtrip_and_visitor_decode_match(case: CodecRoundTripCase) -> TestResult {
         let digest_count = usize::from(case.digest_count);
         let cell_count = usize::from(case.cell_count);
@@ -1413,20 +1881,16 @@ mod tests {
                 shard_id: index as u16,
                 active_cell_count: (index + 1) as u32,
                 max_sequence: index as u64 + 10,
-                checksum: index as u64 + 20,
+                checksum: u128::from(index as u64 + 20),
             });
         }
         let mut cells = Vec::with_capacity(cell_count);
         for index in 0..cell_count {
             cells.push(CounterCell {
                 rule_id: 1,
-                key_hash_hi: index as u64,
-                key_hash_lo: index as u64 + 1,
+                key_hash: u128::from(index as u64 + 1).into(),
                 bucket_start_millis: (index as i64) * 1_000,
-                origin_node_id: NodeId {
-                    hi: 0,
-                    lo: index as u64 + 1,
-                },
+                origin_node_id: u128::from(index as u64 + 1).into(),
                 origin_incarnation: 1,
                 count: index as u64 + 1,
                 last_update_millis: index as u64 + 2,
@@ -1436,7 +1900,7 @@ mod tests {
         let message = GossipMessage {
             header: GossipHeader {
                 cluster_id_hash: 42,
-                sender_node_id: NodeId { hi: 1, lo: 2 },
+                sender_node_id: ((1_u128 << 64) | 2).into(),
                 sender_incarnation: 7,
                 min_bucket: 0,
                 max_bucket: 8_000,
@@ -1493,7 +1957,7 @@ mod tests {
         let message = GossipMessage {
             header: GossipHeader {
                 cluster_id_hash: 42,
-                sender_node_id: NodeId { hi: 1, lo: 2 },
+                sender_node_id: ((1_u128 << 64) | 2).into(),
                 sender_incarnation: 7,
                 min_bucket: 0,
                 max_bucket: 1000,
@@ -1533,7 +1997,7 @@ mod tests {
         let message = GossipMessage {
             header: GossipHeader {
                 cluster_id_hash: 42,
-                sender_node_id: NodeId { hi: 1, lo: 2 },
+                sender_node_id: ((1_u128 << 64) | 2).into(),
                 sender_incarnation: 7,
                 min_bucket: 0,
                 max_bucket: 1000,
@@ -1573,7 +2037,7 @@ mod tests {
         let message = GossipMessage {
             header: GossipHeader {
                 cluster_id_hash: 42,
-                sender_node_id: NodeId { hi: 1, lo: 2 },
+                sender_node_id: ((1_u128 << 64) | 2).into(),
                 sender_incarnation: 7,
                 min_bucket: 0,
                 max_bucket: 1000,
@@ -1627,7 +2091,7 @@ mod tests {
         let message = GossipMessage {
             header: GossipHeader {
                 cluster_id_hash: 1,
-                sender_node_id: NodeId { hi: 1, lo: 2 },
+                sender_node_id: ((1_u128 << 64) | 2).into(),
                 sender_incarnation: 1,
                 min_bucket: 0,
                 max_bucket: 0,
@@ -1697,10 +2161,9 @@ mod tests {
         let key_hash = hash_key(1, &request);
         let remote = CounterCell {
             rule_id: 1,
-            key_hash_hi: key_hash.hi(),
-            key_hash_lo: key_hash.lo(),
+            key_hash,
             bucket_start_millis: 0,
-            origin_node_id: NodeId { hi: 0, lo: 2 },
+            origin_node_id: 2_u128.into(),
             origin_incarnation: 1,
             count: 10,
             last_update_millis: 0,
@@ -1715,7 +2178,7 @@ mod tests {
 
         assert_eq!(
             engine.check_and_record(request, 1),
-            Decision::Reject(gabion_core::RejectReason::GlobalLimit)
+            Decision::Reject(crate::RejectReason::GlobalLimit)
         );
     }
 }

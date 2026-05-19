@@ -15,6 +15,9 @@ help:
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
 	@printf '%s\n' '  make nginx-test      Build NGINX module and assert 200, 200, 429 responses'
 	@printf '%s\n' '  make kubernetes-test Run guarded local OrbStack EndpointSlice convergence tests'
+	@printf '%s\n' '  make kubernetes-nginx-test Run guarded local OrbStack NGINX scale rate-limit tests'
+	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local OrbStack NGINX plus Gabion server gossip test'
+	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local OrbStack gossip propagation benchmark'
 	@printf '%s\n' '  make kubernetes-clean Delete local Kubernetes test namespaces'
 	@printf '%s\n' '  make ci              Run test, bench-check, nginx-config, nginx-module, nginx-test'
 
@@ -65,6 +68,18 @@ nginx-test:
 .PHONY: kubernetes-test
 kubernetes-test:
 	sh deploy/kubernetes/local-smoke.sh
+
+.PHONY: kubernetes-nginx-test
+kubernetes-nginx-test:
+	sh deploy/kubernetes/nginx-scale-rate-limit.sh
+
+.PHONY: kubernetes-mixed-test
+kubernetes-mixed-test:
+	sh deploy/kubernetes/mixed-nginx-gabion-gossip.sh
+
+.PHONY: kubernetes-gossip-bench
+kubernetes-gossip-bench:
+	python3 deploy/kubernetes/gossip-propagation-bench.py
 
 .PHONY: kubernetes-clean
 kubernetes-clean:

@@ -8,12 +8,11 @@ build = "build.rs"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-gabion-core.workspace = true
-gabion-discovery.workspace = true
-gabion-gossip.workspace = true
+gabion.workspace = true
 kube.workspace = true
 nginx-sys = { workspace = true, optional = true }
 ngx = { workspace = true, optional = true }
+socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
