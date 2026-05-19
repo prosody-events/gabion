@@ -16,7 +16,7 @@
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use gabion_core::{
     Decision, Descriptor, DescriptorMatcher, EnforcementMode, LimitRequest, LocalEngine,
@@ -37,8 +37,14 @@ pub const MAX_NAME_BYTES: usize = 64;
 pub const MAX_KEY_COMPONENTS: usize = 8;
 pub const MAX_NGINX_PEERS: usize = 64;
 pub const MAX_ENDPOINT_SLICE_SELECTORS: usize = 16;
+pub const MAX_NGINX_SHM_RULES: usize = 16;
+pub const MAX_NGINX_SHM_BUCKETS: usize = DEFAULT_MAX_ACTIVE_BUCKETS;
 pub const DEFAULT_MAX_ACTIVE_BUCKETS: usize = 64;
 pub const DEFAULT_GOSSIP_PAYLOAD_BYTES: usize = 64 * 1024;
+const SHM_MAGIC: u32 = 0x4742_4e58;
+const SHM_VERSION: u16 = 1;
+const SHM_LOCK_FREE: u16 = 0;
+const SHM_LOCK_HELD: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NginxStatus {
@@ -494,6 +500,569 @@ impl NginxLocalOnlyAdapter {
     pub fn active_keys(&self) -> usize {
         self.engine.active_keys()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NginxShmLayout {
+    pub max_rules: usize,
+    pub max_keys: usize,
+    pub bucket_count: usize,
+    rules_offset: usize,
+    keys_offset: usize,
+    buckets_offset: usize,
+    stats_offset: usize,
+    total_bytes: usize,
+}
+
+impl NginxShmLayout {
+    pub fn for_capacity(max_rules: usize, max_keys: usize, bucket_count: usize) -> Option<Self> {
+        let max_rules = max_rules.clamp(1, MAX_NGINX_SHM_RULES);
+        let max_keys = max_keys.max(1);
+        let bucket_count = bucket_count.clamp(1, MAX_NGINX_SHM_BUCKETS);
+        let rules_offset = align_up(std::mem::size_of::<StoreHeader>(), align_of_shm())?;
+        let rules_bytes = std::mem::size_of::<RuleRuntimeRecord>().checked_mul(max_rules)?;
+        let keys_offset = align_up(rules_offset.checked_add(rules_bytes)?, align_of_shm())?;
+        let keys_bytes = std::mem::size_of::<KeyRuntimeRecord>().checked_mul(max_keys)?;
+        let buckets_offset = align_up(keys_offset.checked_add(keys_bytes)?, align_of_shm())?;
+        let bucket_slots = max_keys.checked_mul(bucket_count)?;
+        let buckets_bytes = std::mem::size_of::<BucketRuntimeRecord>().checked_mul(bucket_slots)?;
+        let stats_offset = align_up(buckets_offset.checked_add(buckets_bytes)?, align_of_shm())?;
+        let total_bytes = align_up(
+            stats_offset.checked_add(std::mem::size_of::<SharedStatsCounters>())?,
+            align_of_shm(),
+        )?;
+
+        Some(Self {
+            max_rules,
+            max_keys,
+            bucket_count,
+            rules_offset,
+            keys_offset,
+            buckets_offset,
+            stats_offset,
+            total_bytes,
+        })
+    }
+
+    pub fn total_bytes(self) -> usize {
+        self.total_bytes
+    }
+}
+
+fn align_of_shm() -> usize {
+    std::mem::align_of::<StoreHeader>()
+        .max(std::mem::align_of::<RuleRuntimeRecord>())
+        .max(std::mem::align_of::<KeyRuntimeRecord>())
+        .max(std::mem::align_of::<BucketRuntimeRecord>())
+        .max(std::mem::align_of::<SharedStatsCounters>())
+}
+
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    let mask = align.checked_sub(1)?;
+    value.checked_add(mask).map(|value| value & !mask)
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct RuleRuntimeRecord {
+    id: u32,
+    limit: u64,
+    window_millis: u64,
+    bucket_millis: u64,
+    key_component_count: u8,
+    overflow_policy: u8,
+    reserved: [u8; 6],
+    key_components: [FixedName<MAX_NAME_BYTES>; MAX_KEY_COMPONENTS],
+}
+
+impl RuleRuntimeRecord {
+    fn empty() -> Self {
+        Self {
+            id: 0,
+            limit: 0,
+            window_millis: 1,
+            bucket_millis: 1,
+            key_component_count: 0,
+            overflow_policy: OverflowPolicyCode::Aggregate as u8,
+            reserved: [0; 6],
+            key_components: [FixedName::empty(); MAX_KEY_COMPONENTS],
+        }
+    }
+
+    fn from_config(rule: NginxRuleConfig) -> Self {
+        let mut record = Self::empty();
+        record.id = rule.id;
+        record.limit = rule.limit.max(1);
+        record.window_millis = rule.window_millis.max(1);
+        record.bucket_millis = rule.bucket_millis.max(1);
+        record.key_component_count = rule.key_components.len() as u8;
+        for (index, component) in rule.key_components.as_slice().iter().enumerate() {
+            record.key_components[index] = component.variable;
+        }
+        record
+    }
+
+    fn key_components(&self) -> &[FixedName<MAX_NAME_BYTES>] {
+        &self.key_components[..self.key_component_count as usize]
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct KeyRuntimeRecord {
+    rule_id: u32,
+    hash: u64,
+    occupied: u8,
+    overflow: u8,
+    reserved: [u8; 6],
+    local_window_total: u64,
+}
+
+impl KeyRuntimeRecord {
+    fn empty() -> Self {
+        Self {
+            rule_id: 0,
+            hash: 0,
+            occupied: 0,
+            overflow: 0,
+            reserved: [0; 6],
+            local_window_total: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct BucketRuntimeRecord {
+    start_millis: u64,
+    count: u64,
+}
+
+impl BucketRuntimeRecord {
+    fn empty() -> Self {
+        Self {
+            start_millis: 0,
+            count: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct SharedStatsCounters {
+    requests: AtomicU64,
+    allowed: AtomicU64,
+    rejected: AtomicU64,
+    overflow_keys: AtomicU64,
+}
+
+impl SharedStatsCounters {
+    pub fn snapshot(&self) -> StatsCounters {
+        StatsCounters {
+            requests: self.requests.load(Ordering::Relaxed),
+            allowed: self.allowed.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            overflow_keys: self.overflow_keys.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverflowPolicyCode {
+    Aggregate = 0,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NgxShmAccessError {
+    MissingVariable,
+    InvalidRule,
+    StoreFull,
+}
+
+pub trait NginxVariableLookup {
+    fn value<'a>(&'a self, name: &str) -> Option<&'a [u8]>;
+}
+
+#[derive(Debug)]
+pub struct NgxShmStore {
+    ptr: *mut u8,
+    layout: NginxShmLayout,
+}
+
+impl NgxShmStore {
+    pub fn required_bytes(max_rules: usize, max_keys: usize, bucket_count: usize) -> Option<usize> {
+        NginxShmLayout::for_capacity(max_rules, max_keys, bucket_count)
+            .map(|layout| layout.total_bytes().max(std::mem::size_of::<StoreHeader>()))
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to writable shared memory of at least `len` bytes for
+    /// the whole lifetime of this handle. The memory must be shared between
+    /// NGINX workers if cross-worker counters are required.
+    pub unsafe fn initialize(
+        ptr: *mut u8,
+        len: usize,
+        max_rules: usize,
+        max_keys: usize,
+        bucket_count: usize,
+    ) -> Result<Self, NginxConfigError> {
+        let Some(layout) = NginxShmLayout::for_capacity(max_rules, max_keys, bucket_count) else {
+            return Err(NginxConfigError::InvalidCapacity);
+        };
+        if ptr.is_null() || len < layout.total_bytes() {
+            return Err(NginxConfigError::InvalidCapacity);
+        }
+        let mut store = Self { ptr, layout };
+        unsafe {
+            std::ptr::write_bytes(ptr, 0, layout.total_bytes());
+            std::ptr::write(
+                store.header_mut(),
+                StoreHeader {
+                    magic: SHM_MAGIC,
+                    version: SHM_VERSION,
+                    flags: SHM_LOCK_FREE as u16,
+                    zone_bytes: len as u64,
+                    max_keys: layout.max_keys as u32,
+                    max_rules: layout.max_rules as u32,
+                },
+            );
+            for index in 0..layout.max_rules {
+                std::ptr::write(store.rule_mut(index), RuleRuntimeRecord::empty());
+            }
+            for index in 0..layout.max_keys {
+                std::ptr::write(store.key_mut(index), KeyRuntimeRecord::empty());
+            }
+            for index in 0..layout.max_keys * layout.bucket_count {
+                std::ptr::write(store.bucket_mut(index), BucketRuntimeRecord::empty());
+            }
+            std::ptr::write(
+                store.stats_mut(),
+                SharedStatsCounters {
+                    requests: AtomicU64::new(0),
+                    allowed: AtomicU64::new(0),
+                    rejected: AtomicU64::new(0),
+                    overflow_keys: AtomicU64::new(0),
+                },
+            );
+        }
+        Ok(store)
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to a store previously initialized with
+    /// `NgxShmStore::initialize`.
+    pub unsafe fn from_initialized(ptr: *mut u8, len: usize) -> Option<Self> {
+        if ptr.is_null() || len < std::mem::size_of::<StoreHeader>() {
+            return None;
+        }
+        let header = unsafe { &*(ptr as *const StoreHeader) };
+        if header.magic != SHM_MAGIC || header.version != SHM_VERSION {
+            return None;
+        }
+        let layout = NginxShmLayout::for_capacity(
+            header.max_rules as usize,
+            header.max_keys as usize,
+            MAX_NGINX_SHM_BUCKETS,
+        )?;
+        if len < layout.total_bytes() {
+            return None;
+        }
+        Some(Self { ptr, layout })
+    }
+
+    pub fn add_rule(
+        &mut self,
+        index: usize,
+        rule: NginxRuleConfig,
+    ) -> Result<(), NginxConfigError> {
+        if index >= self.layout.max_rules {
+            return Err(NginxConfigError::TooManyRules);
+        }
+        unsafe {
+            std::ptr::write(self.rule_mut(index), RuleRuntimeRecord::from_config(rule));
+        }
+        Ok(())
+    }
+
+    pub fn access(
+        &mut self,
+        rule_index: usize,
+        variables: &impl NginxVariableLookup,
+        now_millis: u64,
+    ) -> Result<NginxStatus, NgxShmAccessError> {
+        if rule_index >= self.layout.max_rules {
+            return Err(NgxShmAccessError::InvalidRule);
+        }
+
+        let _guard = self.lock();
+        let rule = unsafe { &*self.rule_ptr(rule_index) };
+        if rule.id == 0 || rule.key_component_count == 0 {
+            return Err(NgxShmAccessError::InvalidRule);
+        }
+        let mut hash = ShmHasher::new();
+        for component in rule.key_components() {
+            let Some(value) = variables.value(component.as_str()) else {
+                return Err(NgxShmAccessError::MissingVariable);
+            };
+            hash.write(component.as_str().as_bytes());
+            hash.write(&[0]);
+            hash.write(value);
+            hash.write(&[0xff]);
+        }
+        let hash = hash.finish();
+        let key_index = self.find_or_insert_key(rule, hash)?;
+        let bucket_start = bucket_start(now_millis, rule.bucket_millis);
+        self.rotate_key_buckets(key_index, rule, now_millis);
+        let current = unsafe { (*self.key_mut(key_index)).local_window_total };
+        self.stats().requests.fetch_add(1, Ordering::Relaxed);
+        if current.saturating_add(1) > rule.limit {
+            self.stats().rejected.fetch_add(1, Ordering::Relaxed);
+            return Ok(NginxStatus::TooManyRequests);
+        }
+        self.increment_bucket(key_index, bucket_start);
+        unsafe {
+            (*self.key_mut(key_index)).local_window_total = (*self.key_mut(key_index))
+                .local_window_total
+                .saturating_add(1);
+        }
+        self.stats().allowed.fetch_add(1, Ordering::Relaxed);
+        Ok(NginxStatus::Declined)
+    }
+
+    pub fn stats_snapshot(&self) -> StatsCounters {
+        self.stats().snapshot()
+    }
+
+    pub fn layout(&self) -> NginxShmLayout {
+        self.layout
+    }
+
+    fn find_or_insert_key(
+        &mut self,
+        rule: &RuleRuntimeRecord,
+        hash: u64,
+    ) -> Result<usize, NgxShmAccessError> {
+        let mut vacant = None;
+        for index in 0..self.layout.max_keys {
+            let key = unsafe { &*self.key_ptr(index) };
+            if key.occupied != 0 && key.rule_id == rule.id && key.hash == hash {
+                return Ok(index);
+            }
+            if key.occupied == 0 && vacant.is_none() {
+                vacant = Some(index);
+            }
+        }
+
+        if let Some(index) = vacant {
+            unsafe {
+                std::ptr::write(
+                    self.key_mut(index),
+                    KeyRuntimeRecord {
+                        rule_id: rule.id,
+                        hash,
+                        occupied: 1,
+                        overflow: 0,
+                        reserved: [0; 6],
+                        local_window_total: 0,
+                    },
+                );
+                self.clear_buckets(index);
+            }
+            return Ok(index);
+        }
+
+        self.stats().overflow_keys.fetch_add(1, Ordering::Relaxed);
+        Ok((rule.id as usize - 1) % self.layout.max_keys)
+    }
+
+    fn rotate_key_buckets(&mut self, key_index: usize, rule: &RuleRuntimeRecord, now_millis: u64) {
+        let mut total = 0_u64;
+        for offset in 0..self.layout.bucket_count {
+            let bucket = unsafe { &mut *self.bucket_for_key_mut(key_index, offset) };
+            if bucket.count != 0
+                && bucket.start_millis.saturating_add(rule.window_millis) <= now_millis
+            {
+                *bucket = BucketRuntimeRecord::empty();
+            }
+            total = total.saturating_add(bucket.count);
+        }
+        unsafe {
+            (*self.key_mut(key_index)).local_window_total = total;
+        }
+    }
+
+    fn increment_bucket(&mut self, key_index: usize, bucket_start: u64) {
+        let mut target = 0;
+        for offset in 0..self.layout.bucket_count {
+            let bucket = unsafe { &mut *self.bucket_for_key_mut(key_index, offset) };
+            if bucket.count == 0 || bucket.start_millis == bucket_start {
+                target = offset;
+                break;
+            }
+            if bucket.start_millis
+                < unsafe { (*self.bucket_for_key_mut(key_index, target)).start_millis }
+            {
+                target = offset;
+            }
+        }
+        let bucket = unsafe { &mut *self.bucket_for_key_mut(key_index, target) };
+        if bucket.start_millis != bucket_start {
+            *bucket = BucketRuntimeRecord {
+                start_millis: bucket_start,
+                count: 0,
+            };
+        }
+        bucket.count = bucket.count.saturating_add(1);
+    }
+
+    unsafe fn clear_buckets(&mut self, key_index: usize) {
+        for offset in 0..self.layout.bucket_count {
+            unsafe {
+                std::ptr::write(
+                    self.bucket_for_key_mut(key_index, offset),
+                    BucketRuntimeRecord::empty(),
+                );
+            }
+        }
+    }
+
+    fn lock(&self) -> ShmLockGuard {
+        let lock = self.lock_word() as *const AtomicU16;
+        while unsafe { &*lock }
+            .compare_exchange(
+                SHM_LOCK_FREE,
+                SHM_LOCK_HELD,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        ShmLockGuard { lock }
+    }
+
+    fn lock_word(&self) -> &AtomicU16 {
+        unsafe { &*(std::ptr::addr_of!((*self.header()).flags).cast::<AtomicU16>()) }
+    }
+
+    fn header(&self) -> *const StoreHeader {
+        self.ptr as *const StoreHeader
+    }
+
+    unsafe fn header_mut(&mut self) -> *mut StoreHeader {
+        self.ptr as *mut StoreHeader
+    }
+
+    fn rule_ptr(&self, index: usize) -> *const RuleRuntimeRecord {
+        unsafe {
+            self.ptr
+                .add(self.layout.rules_offset)
+                .cast::<RuleRuntimeRecord>()
+                .add(index)
+        }
+    }
+
+    unsafe fn rule_mut(&mut self, index: usize) -> *mut RuleRuntimeRecord {
+        unsafe {
+            self.ptr
+                .add(self.layout.rules_offset)
+                .cast::<RuleRuntimeRecord>()
+                .add(index)
+        }
+    }
+
+    fn key_ptr(&self, index: usize) -> *const KeyRuntimeRecord {
+        unsafe {
+            self.ptr
+                .add(self.layout.keys_offset)
+                .cast::<KeyRuntimeRecord>()
+                .add(index)
+        }
+    }
+
+    unsafe fn key_mut(&mut self, index: usize) -> *mut KeyRuntimeRecord {
+        unsafe {
+            self.ptr
+                .add(self.layout.keys_offset)
+                .cast::<KeyRuntimeRecord>()
+                .add(index)
+        }
+    }
+
+    unsafe fn bucket_mut(&mut self, index: usize) -> *mut BucketRuntimeRecord {
+        unsafe {
+            self.ptr
+                .add(self.layout.buckets_offset)
+                .cast::<BucketRuntimeRecord>()
+                .add(index)
+        }
+    }
+
+    unsafe fn bucket_for_key_mut(
+        &mut self,
+        key_index: usize,
+        bucket_offset: usize,
+    ) -> *mut BucketRuntimeRecord {
+        unsafe { self.bucket_mut(key_index * self.layout.bucket_count + bucket_offset) }
+    }
+
+    fn stats(&self) -> &SharedStatsCounters {
+        unsafe {
+            &*self
+                .ptr
+                .add(self.layout.stats_offset)
+                .cast::<SharedStatsCounters>()
+        }
+    }
+
+    unsafe fn stats_mut(&mut self) -> *mut SharedStatsCounters {
+        unsafe {
+            self.ptr
+                .add(self.layout.stats_offset)
+                .cast::<SharedStatsCounters>()
+        }
+    }
+}
+
+struct ShmLockGuard {
+    lock: *const AtomicU16,
+}
+
+impl Drop for ShmLockGuard {
+    fn drop(&mut self) {
+        unsafe { &*self.lock }.store(SHM_LOCK_FREE, Ordering::Release);
+    }
+}
+
+struct ShmHasher {
+    state: u64,
+}
+
+impl ShmHasher {
+    fn new() -> Self {
+        Self {
+            state: 0xcbf2_9ce4_8422_2325,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state ^= u64::from(*byte);
+            self.state = self.state.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.state
+    }
+}
+
+fn bucket_start(now_millis: u64, bucket_millis: u64) -> u64 {
+    let bucket_millis = bucket_millis.max(1);
+    now_millis / bucket_millis * bucket_millis
 }
 
 #[repr(C)]
@@ -1040,6 +1609,8 @@ pub enum NginxConfigError {
     TooManyBuckets,
     #[error("too many EndpointSlice selectors")]
     TooManyEndpointSliceSelectors,
+    #[error("too many rules")]
+    TooManyRules,
 }
 
 pub fn parse_size_bytes(input: &str) -> Result<usize, NginxConfigError> {
@@ -1363,6 +1934,164 @@ mod tests {
         assert_eq!(std::mem::size_of::<StoreHeader>(), 24);
         assert_eq!(std::mem::size_of::<StatsCounters>(), 32);
         assert_eq!(std::mem::size_of::<LeaderLease>(), 24);
+    }
+
+    fn shm_rule(name: &str, limit: &str, keys: &[&str]) -> NginxRuleConfig {
+        NginxRuleBuilder {
+            id: 1,
+            name,
+            domain: "nginx",
+            key_components: keys,
+            limit,
+            window: "100ms",
+            bucket: "10ms",
+            local_fallback: limit,
+            local_absolute: limit,
+            stale_after: "2s",
+            mode: EnforcementMode::Enforce,
+        }
+        .build()
+        .expect("shared memory rule")
+    }
+
+    fn shm_store(bytes: &mut [u8], rule: NginxRuleConfig, max_keys: usize) -> NgxShmStore {
+        let mut store = unsafe {
+            NgxShmStore::initialize(
+                bytes.as_mut_ptr(),
+                bytes.len(),
+                MAX_NGINX_SHM_RULES,
+                max_keys,
+                DEFAULT_MAX_ACTIVE_BUCKETS,
+            )
+        }
+        .expect("initialize shared store");
+        store.add_rule(0, rule).expect("add rule");
+        store
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestVariables<'a> {
+        values: &'a [(&'a str, &'a [u8])],
+    }
+
+    impl NginxVariableLookup for TestVariables<'_> {
+        fn value<'a>(&'a self, name: &str) -> Option<&'a [u8]> {
+            self.values
+                .iter()
+                .find_map(|(key, value)| (*key == name).then_some(*value))
+        }
+    }
+
+    #[test]
+    fn shm_store_limits_requests_without_allocating_runtime_records() {
+        let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 8, DEFAULT_MAX_ACTIVE_BUCKETS)
+            .expect("required bytes");
+        let mut memory = vec![0_u8; bytes];
+        let mut store = shm_store(&mut memory, shm_rule("tenant_api", "2r/m", &["$uri"]), 8);
+        let variables = TestVariables {
+            values: &[("uri", b"/api/a")],
+        };
+
+        assert_eq!(store.access(0, &variables, 0), Ok(NginxStatus::Declined));
+        assert_eq!(store.access(0, &variables, 1), Ok(NginxStatus::Declined));
+        assert_eq!(
+            store.access(0, &variables, 2),
+            Ok(NginxStatus::TooManyRequests)
+        );
+
+        let stats = store.stats_snapshot();
+        assert_eq!(stats.requests, 3);
+        assert_eq!(stats.allowed, 2);
+        assert_eq!(stats.rejected, 1);
+    }
+
+    #[test]
+    fn shm_store_handles_share_counts_across_workers() {
+        let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 8, DEFAULT_MAX_ACTIVE_BUCKETS)
+            .expect("required bytes");
+        let mut memory = vec![0_u8; bytes];
+        let mut first = shm_store(&mut memory, shm_rule("tenant_api", "1r/m", &["$uri"]), 8);
+        let mut second =
+            unsafe { NgxShmStore::from_initialized(memory.as_mut_ptr(), memory.len()) }
+                .expect("second worker handle");
+        let variables = TestVariables {
+            values: &[("uri", b"/api/a")],
+        };
+
+        assert_eq!(first.access(0, &variables, 0), Ok(NginxStatus::Declined));
+        assert_eq!(
+            second.access(0, &variables, 1),
+            Ok(NginxStatus::TooManyRequests)
+        );
+    }
+
+    #[test]
+    fn shm_store_uses_all_configured_key_components() {
+        let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 8, DEFAULT_MAX_ACTIVE_BUCKETS)
+            .expect("required bytes");
+        let mut memory = vec![0_u8; bytes];
+        let mut store = shm_store(
+            &mut memory,
+            shm_rule("tenant_api", "1r/m", &["$arg_tenant", "$uri"]),
+            8,
+        );
+        let tenant_a = TestVariables {
+            values: &[("arg_tenant", b"a"), ("uri", b"/api")],
+        };
+        let tenant_b = TestVariables {
+            values: &[("arg_tenant", b"b"), ("uri", b"/api")],
+        };
+
+        assert_eq!(store.access(0, &tenant_a, 0), Ok(NginxStatus::Declined));
+        assert_eq!(store.access(0, &tenant_b, 1), Ok(NginxStatus::Declined));
+        assert_eq!(
+            store.access(0, &tenant_a, 2),
+            Ok(NginxStatus::TooManyRequests)
+        );
+    }
+
+    #[test]
+    fn shm_store_supports_ip_based_rate_limiting() {
+        let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 8, DEFAULT_MAX_ACTIVE_BUCKETS)
+            .expect("required bytes");
+        let mut memory = vec![0_u8; bytes];
+        let mut store = shm_store(
+            &mut memory,
+            shm_rule("ip_api", "1r/m", &["$remote_addr"]),
+            8,
+        );
+        let first_ip = TestVariables {
+            values: &[("remote_addr", b"192.0.2.1")],
+        };
+        let second_ip = TestVariables {
+            values: &[("remote_addr", b"192.0.2.2")],
+        };
+
+        assert_eq!(store.access(0, &first_ip, 0), Ok(NginxStatus::Declined));
+        assert_eq!(store.access(0, &second_ip, 1), Ok(NginxStatus::Declined));
+        assert_eq!(
+            store.access(0, &first_ip, 2),
+            Ok(NginxStatus::TooManyRequests)
+        );
+    }
+
+    #[test]
+    fn shm_store_expires_window_and_aggregates_overflow() {
+        let bytes = NgxShmStore::required_bytes(MAX_NGINX_SHM_RULES, 1, DEFAULT_MAX_ACTIVE_BUCKETS)
+            .expect("required bytes");
+        let mut memory = vec![0_u8; bytes];
+        let mut store = shm_store(&mut memory, shm_rule("tenant_api", "1r/m", &["$uri"]), 1);
+        let key_a = TestVariables {
+            values: &[("uri", b"/api/a")],
+        };
+        let key_b = TestVariables {
+            values: &[("uri", b"/api/b")],
+        };
+
+        assert_eq!(store.access(0, &key_a, 0), Ok(NginxStatus::Declined));
+        assert_eq!(store.access(0, &key_b, 1), Ok(NginxStatus::TooManyRequests));
+        assert_eq!(store.stats_snapshot().overflow_keys, 1);
+        assert_eq!(store.access(0, &key_a, 101), Ok(NginxStatus::Declined));
     }
 
     #[test]

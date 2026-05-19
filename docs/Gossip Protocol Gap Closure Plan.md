@@ -737,10 +737,10 @@ Goal: replace the current NGINX smoke-test counter with a real local-only module
    Support:
 
    ```nginx
-   gossip_limit_zone
-   gossip_limit_rule
-   gossip_limit
-   gossip off
+   gabion_limit_zone
+   gabion_limit_rule
+   gabion_limit
+   gabion off
    overflow aggregate
    ```
 

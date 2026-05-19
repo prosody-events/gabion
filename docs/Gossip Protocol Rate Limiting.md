@@ -1108,9 +1108,9 @@ Example config shape:
 
 ```nginx
 http {
-    gossip_limit_zone api 128m;
+    gabion_limit_zone api 128m;
 
-    gossip_limit_rule tenant_api {
+    gabion_limit_rule tenant_api {
         key $http_x_tenant_id $uri;
         limit 10000r/m;
         window 60s;
@@ -1122,7 +1122,7 @@ http {
 
     server {
         location /api/ {
-            gossip_limit tenant_api;
+            gabion_limit tenant_api;
             proxy_pass http://app;
         }
     }
@@ -1411,22 +1411,22 @@ limits:
 
 ```nginx
 http {
-    gossip_limit_zone api 128m;
+    gabion_limit_zone api 128m;
 
-    gossip_limit_rule tenant_api {
+    gabion_limit_rule tenant_api {
         key $http_x_tenant_id $uri;
         limit 1000r/m;
         window 60s;
         bucket 1s;
         local_fallback 1000r/m;
         local_absolute 1000r/m;
-        gossip off;
+        gabion off;
         overflow aggregate;
     }
 
     server {
         location /api/ {
-            gossip_limit tenant_api;
+            gabion_limit tenant_api;
             proxy_pass http://app;
         }
     }
@@ -1437,11 +1437,11 @@ http {
 
 ```nginx
 http {
-    gossip_limit_zone api 256m;
+    gabion_limit_zone api 256m;
 
-    gossip_limit_peer_file /etc/gossip-limiter/peers.json;
+    gabion_peer_file /etc/gabion/peers.json;
 
-    gossip_limit_rule tenant_api {
+    gabion_limit_rule tenant_api {
         key $http_x_tenant_id $uri;
         limit 10000r/m;
         window 60s;
@@ -1454,7 +1454,7 @@ http {
 
     server {
         location /api/ {
-            gossip_limit tenant_api;
+            gabion_limit tenant_api;
             proxy_pass http://app;
         }
     }
