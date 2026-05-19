@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-stream.workspace = true
 axum.workspace = true
 bon.workspace = true
+educe.workspace = true
+either.workspace = true
 futures.workspace = true
 hmac.workspace = true
 humantime-serde.workspace = true

@@ -6,7 +6,6 @@
 //! runtime.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use bon::Builder;
@@ -14,14 +13,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::{
-    CardinalityLimits, DescriptorMatcher, EnforcementMode, LocalEngine, NodeIdentity, OverflowPolicy,
-    Rule, RuleId, RuleTable, SafetyMargin, WindowSpec, hash_domain,
+    CardinalityLimits, DescriptorMatcher, EnforcementMode, LocalEngine, NodeIdentity,
+    OverflowPolicy, Rule, RuleId, RuleTable, SafetyMargin, WindowSpec, hash_domain,
 };
-use crate::discovery::{
-    DEFAULT_GOSSIP_PORT_NAME, DEFAULT_MAX_PEERS, DEFAULT_RECENT_PEER_GRACE_MILLIS, FilePeerHandler,
-    SnapshotPeerHandler, StaticPeerHandler,
-};
-use crate::{DiscoveryMode, RuntimePeerHandler};
+use crate::discovery::DiscoveryConfig;
 
 const DEFAULT_GOSSIP_FANOUT: usize = 3;
 const DEFAULT_GOSSIP_PAYLOAD_BYTES: usize = 256 * 1024;
@@ -159,62 +154,6 @@ impl Default for RuntimeTuningConfig {
             count_update_batch_size: 64,
         }
     }
-}
-
-/// Peer discovery settings used by gossip.
-#[derive(Clone, Debug, Builder, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
-pub struct DiscoveryConfig {
-    /// Discovery backend used to produce gossip peers.
-    pub kind: DiscoveryMode,
-    /// Static seed peers; also used as initial peers for file discovery.
-    pub peers: Vec<SocketAddr>,
-    /// Peer-file path for file discovery.
-    pub path: Option<PathBuf>,
-    /// Local gossip address to exclude from peer snapshots.
-    pub self_addr: Option<SocketAddr>,
-    /// Explicit Kubernetes EndpointSlice selectors.
-    pub endpoint_slices: Vec<EndpointSliceSelectorConfig>,
-    /// Shorthand Kubernetes namespace used when endpoint_slices is empty.
-    pub namespace: Option<String>,
-    /// Shorthand Kubernetes service name used when endpoint_slices is empty.
-    pub service_name: Option<String>,
-    /// Shorthand Kubernetes service port name; defaults to "gossip".
-    pub port_name: Option<String>,
-    /// Maximum peers retained by bounded discovery handlers.
-    pub max_peers: usize,
-    /// Duration removed peers remain authorized for in-flight gossip frames.
-    #[serde(with = "humantime_serde")]
-    pub recent_peer_grace: Duration,
-}
-
-impl Default for DiscoveryConfig {
-    fn default() -> Self {
-        Self {
-            kind: DiscoveryMode::default(),
-            peers: Vec::new(),
-            path: None,
-            self_addr: None,
-            endpoint_slices: Vec::new(),
-            namespace: None,
-            service_name: None,
-            port_name: Some(DEFAULT_GOSSIP_PORT_NAME.to_string()),
-            max_peers: DEFAULT_MAX_PEERS,
-            recent_peer_grace: Duration::from_millis(DEFAULT_RECENT_PEER_GRACE_MILLIS),
-        }
-    }
-}
-
-/// Kubernetes EndpointSlice selector used for gossip peer discovery.
-#[derive(Clone, Debug, Builder, Deserialize, Eq, PartialEq, Serialize)]
-pub struct EndpointSliceSelectorConfig {
-    /// Kubernetes namespace containing the service.
-    pub namespace: String,
-    /// Kubernetes service name whose EndpointSlices advertise peers.
-    pub service_name: String,
-    /// Service port name to read from each endpoint; defaults to "gossip" when absent.
-    #[serde(default)]
-    pub port_name: Option<String>,
 }
 
 /// Gossip transport and propagation settings.
@@ -362,88 +301,6 @@ pub enum ConfigError {
     EmptyDescriptorSet(String),
     #[error("configured bucket count {configured} exceeds max_active_buckets {max}")]
     TooManyBuckets { configured: usize, max: usize },
-}
-
-pub fn peer_provider_from_config(
-    discovery: &DiscoveryConfig,
-) -> Result<RuntimePeerHandler, ConfigError> {
-    match discovery.kind {
-        DiscoveryMode::Auto => Ok(RuntimePeerHandler::Static(StaticPeerHandler::new(
-            Vec::new(),
-            discovery.self_addr,
-        ))),
-        DiscoveryMode::None => Ok(RuntimePeerHandler::Static(StaticPeerHandler::new(
-            Vec::new(),
-            discovery.self_addr,
-        ))),
-        DiscoveryMode::Static => {
-            if discovery.peers.is_empty() {
-                return Err(ConfigError::MissingStaticPeers);
-            }
-            Ok(RuntimePeerHandler::Static(StaticPeerHandler::new(
-                discovery.peers.clone(),
-                discovery.self_addr,
-            )))
-        }
-        DiscoveryMode::File => {
-            let Some(path) = &discovery.path else {
-                return Err(ConfigError::MissingPeerFile);
-            };
-            Ok(RuntimePeerHandler::File(FilePeerHandler::with_capacity(
-                path,
-                discovery.self_addr,
-                discovery.peers.clone(),
-                discovery.max_peers,
-            )))
-        }
-        DiscoveryMode::KubernetesEndpointSlice => Ok(RuntimePeerHandler::Snapshot(
-            SnapshotPeerHandler::with_capacity(discovery.max_peers),
-        )),
-    }
-}
-
-pub fn endpoint_slice_config_from_discovery(
-    discovery: &DiscoveryConfig,
-) -> Result<crate::discovery::kubernetes::EndpointSliceDiscoveryConfig, ConfigError> {
-    endpoint_slice_configs_from_discovery(discovery)?
-        .into_iter()
-        .next()
-        .ok_or(ConfigError::MissingKubernetesEndpointSliceSelector)
-}
-
-pub fn endpoint_slice_configs_from_discovery(
-    discovery: &DiscoveryConfig,
-) -> Result<Vec<crate::discovery::kubernetes::EndpointSliceDiscoveryConfig>, ConfigError> {
-    if !discovery.endpoint_slices.is_empty() {
-        return Ok(discovery
-            .endpoint_slices
-            .iter()
-            .map(
-                |selector| crate::discovery::kubernetes::EndpointSliceDiscoveryConfig {
-                    namespace: selector.namespace.clone(),
-                    service_name: selector.service_name.clone(),
-                    port_name: selector.port_name.clone(),
-                    self_addr: discovery.self_addr,
-                },
-            )
-            .collect());
-    }
-
-    let Some(namespace) = &discovery.namespace else {
-        return Err(ConfigError::MissingKubernetesNamespace);
-    };
-    let Some(service_name) = &discovery.service_name else {
-        return Err(ConfigError::MissingKubernetesServiceName);
-    };
-
-    Ok(vec![
-        crate::discovery::kubernetes::EndpointSliceDiscoveryConfig {
-            namespace: namespace.clone(),
-            service_name: service_name.clone(),
-            port_name: discovery.port_name.clone(),
-            self_addr: discovery.self_addr,
-        },
-    ])
 }
 
 fn duration_millis(duration: Duration) -> u64 {

@@ -5,18 +5,20 @@ extern crate self as gabion_core;
 extern crate self as gabion_discovery;
 extern crate self as gabion_gossip;
 
+pub use config::{
+    ConfigError, DescriptorConfig, GossipConfig, LimitRuleConfig, RuntimeConfig,
+    RuntimeTuningConfig, SafetyMarginConfig, StorageConfig,
+};
 pub use core::{
     CardinalityError, CardinalityLimits, Decision, Descriptor, EnforcementMode, HashedLimitRequest,
     HashedLimitRequestBuilder, KeyHash, LimitRequest, OverflowPolicy, RateLimitRecorder,
     RateLimitRuntime, RejectReason, RuleId, SafetyMargin, TimedHashedLimitRequest, WindowSpec,
 };
-pub use config::{
-    ConfigError, DescriptorConfig, DiscoveryConfig, EndpointSliceSelectorConfig, GossipConfig,
-    LimitRuleConfig, RuntimeConfig, RuntimeTuningConfig, SafetyMarginConfig, StorageConfig,
+pub use discovery::{
+    DiscoveryConfig, DiscoveryMode, EndpointSliceSelectorConfig,
     endpoint_slice_config_from_discovery, endpoint_slice_configs_from_discovery,
     peer_provider_from_config,
 };
-pub use discovery::DiscoveryMode;
 
 use crate::core::{LocalEngine, NodeId, NodeIdentity};
 use crate::discovery::{

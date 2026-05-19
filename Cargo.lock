@@ -640,8 +640,11 @@ dependencies = [
 name = "gabion"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "axum",
  "bon",
+ "educe",
+ "either",
  "futures",
  "hmac",
  "humantime-serde",

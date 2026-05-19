@@ -12,7 +12,10 @@ edition = "2024"
 
 [workspace.dependencies]
 axum = "0.8"
+async-stream = "0.3"
 bon = "3"
+educe = "0.6"
+either = "1"
 envoy-types = "0.7"
 futures = "0.3"
 gabion = { path = "crates/gabion" }

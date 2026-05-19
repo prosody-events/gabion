@@ -160,7 +160,11 @@ fn test_config() -> Config {
     }
 }
 
-fn tenant_rule(limit: u64, local_fallback_limit: u64, local_absolute_limit: u64) -> LimitRuleConfig {
+fn tenant_rule(
+    limit: u64,
+    local_fallback_limit: u64,
+    local_absolute_limit: u64,
+) -> LimitRuleConfig {
     LimitRuleConfig {
         name: "tenant_api_minute".to_string(),
         domain: "api".to_string(),
