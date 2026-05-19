@@ -17,9 +17,12 @@ use crate::discovery::{DEFAULT_GABION_SERVICE_NAME, Peer, PeerDiscovery, PeerEve
 /// exposing a UDP `gabion` port, watches its EndpointSlices. New services are
 /// picked up live; deletions and disappearing ports emit `Removed` for every
 /// peer the Service had contributed before its watcher is shut down.
+///
+/// The kube `Client` is built lazily when `peer_events` is first polled. If
+/// the in-cluster/kubeconfig environment is missing, a warning is logged and
+/// the stream completes empty.
 #[derive(Clone)]
 pub struct EndpointSliceDiscovery {
-    client: Client,
     self_addr: Option<SocketAddr>,
     namespace_whitelist: Vec<String>,
     service_whitelist: Vec<String>,
@@ -27,13 +30,11 @@ pub struct EndpointSliceDiscovery {
 
 impl EndpointSliceDiscovery {
     pub fn new(
-        client: Client,
         self_addr: Option<SocketAddr>,
         namespace_whitelist: Vec<String>,
         service_whitelist: Vec<String>,
     ) -> Self {
         Self {
-            client,
             self_addr,
             namespace_whitelist,
             service_whitelist,
@@ -46,7 +47,17 @@ impl PeerDiscovery for EndpointSliceDiscovery {
 
     fn peer_events(self) -> impl Stream<Item = Result<PeerEvent, Self::Error>> + Send {
         stream! {
-            let mut services = watch_services(&self.client, &self.namespace_whitelist);
+            let client = match Client::try_default().await {
+                Ok(client) => client,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "kubernetes client unavailable; peer discovery disabled",
+                    );
+                    return;
+                }
+            };
+            let mut services = watch_services(&client, &self.namespace_whitelist);
             let mut endpoints = SelectAll::new();
             let mut watched: AHashMap<Target, oneshot::Sender<()>> = AHashMap::new();
 
@@ -59,7 +70,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                 if let Entry::Vacant(slot) = watched.entry(target) {
                                     let (cancel_tx, cancel_rx) = oneshot::channel();
                                     endpoints.push(Box::pin(watch_target(
-                                        self.client.clone(),
+                                        client.clone(),
                                         slot.key().clone(),
                                         self.self_addr,
                                         cancel_rx,
