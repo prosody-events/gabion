@@ -825,11 +825,12 @@ fn hmac_sha256(key: HmacKey, payload: &[u8]) -> [u8; AUTH_TAG_LEN] {
 mod tests {
     use super::*;
     use gabion_core::{
-        Decision, Descriptor, DescriptorMatcher, EnforcementMode, LimitRequest, LocalEngine,
-        OverflowPolicy, Rule, RuleTable, SafetyMargin, WindowSpec, hash_domain, hash_key,
+        hash_domain, hash_key, Decision, Descriptor, DescriptorMatcher, EnforcementMode,
+        LimitRequest, LocalEngine, OverflowPolicy, Rule, RuleTable, SafetyMargin, WindowSpec,
     };
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
+    use std::collections::BTreeMap;
 
     #[derive(Clone, Debug)]
     struct CodecRoundTripCase {
@@ -862,18 +863,61 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    struct GeneratedMergeCell {
+        rule_id: u8,
+        key_hash_hi: u8,
+        key_hash_lo: u8,
+        bucket: u8,
+        origin_hi: u8,
+        origin_lo: u8,
+        incarnation: u8,
+        count: u8,
+    }
+
+    impl Arbitrary for GeneratedMergeCell {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                rule_id: u8::arbitrary(g) % 4,
+                key_hash_hi: u8::arbitrary(g) % 4,
+                key_hash_lo: u8::arbitrary(g) % 4,
+                bucket: u8::arbitrary(g) % 4,
+                origin_hi: u8::arbitrary(g) % 4,
+                origin_lo: u8::arbitrary(g) % 8,
+                incarnation: u8::arbitrary(g) % 3,
+                count: u8::arbitrary(g),
+            }
+        }
+    }
+
+    impl GeneratedMergeCell {
+        fn into_cell(self) -> CounterCell {
+            CounterCell {
+                rule_id: u32::from(self.rule_id) + 1,
+                key_hash_hi: u64::from(self.key_hash_hi) + 10,
+                key_hash_lo: u64::from(self.key_hash_lo) + 20,
+                bucket_start_millis: i64::from(self.bucket) * 1_000,
+                origin_node_id: NodeId {
+                    hi: u64::from(self.origin_hi),
+                    lo: u64::from(self.origin_lo) + 1,
+                },
+                origin_incarnation: u64::from(self.incarnation) + 1,
+                count: u64::from(self.count) + 1,
+                last_update_millis: u64::from(self.count) + 1,
+                sequence: 0,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
     struct MergeLawCase {
-        counts: Vec<u8>,
-        origins: Vec<u8>,
+        cells: Vec<GeneratedMergeCell>,
     }
 
     impl Arbitrary for MergeLawCase {
         fn arbitrary(g: &mut Gen) -> Self {
-            let mut counts = Vec::<u8>::arbitrary(g);
-            let mut origins = Vec::<u8>::arbitrary(g);
-            counts.truncate(24);
-            origins.truncate(24);
-            Self { counts, origins }
+            let mut cells = Vec::<GeneratedMergeCell>::arbitrary(g);
+            cells.truncate(24);
+            Self { cells }
         }
     }
 
@@ -941,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_remote_is_idempotent_commutative_and_associative() {
+    fn merge_remote_example_orders_preserve_counts() {
         fn merged_counts(cells: &[CounterCell]) -> Vec<(u64, u64)> {
             let mut table = CellTable::with_capacity(8, 16);
             for cell in cells {
@@ -1142,68 +1186,195 @@ mod tests {
         );
     }
 
-    fn merged_counts(cells: &[CounterCell]) -> Vec<(u64, u64)> {
-        let mut table = CellTable::with_capacity(32, 32);
-        for cell in cells {
-            table.merge_remote(*cell, None, 0).expect("merge");
-        }
-        let mut counts = table
-            .cells()
-            .map(|(_id, cell)| (cell.origin_node_id.lo, cell.count))
+    type NormalizedCell = (u32, u64, u64, i64, u64, u64, u64, u64);
+
+    fn merge_case_cells(case: MergeLawCase) -> Vec<CounterCell> {
+        case.cells
+            .into_iter()
+            .map(GeneratedMergeCell::into_cell)
+            .collect()
+    }
+
+    fn identity_key(cell: CounterCell) -> (u32, u64, u64, i64, u64, u64, u64) {
+        (
+            cell.rule_id,
+            cell.key_hash_hi,
+            cell.key_hash_lo,
+            cell.bucket_start_millis,
+            cell.origin_node_id.hi,
+            cell.origin_node_id.lo,
+            cell.origin_incarnation,
+        )
+    }
+
+    fn normalized_counts(cells: impl IntoIterator<Item = CounterCell>) -> Vec<NormalizedCell> {
+        let mut counts = cells
+            .into_iter()
+            .map(|cell| {
+                (
+                    cell.rule_id,
+                    cell.key_hash_hi,
+                    cell.key_hash_lo,
+                    cell.bucket_start_millis,
+                    cell.origin_node_id.hi,
+                    cell.origin_node_id.lo,
+                    cell.origin_incarnation,
+                    cell.count,
+                )
+            })
             .collect::<Vec<_>>();
         counts.sort();
         counts
     }
 
+    fn expected_counts_from_map(
+        max_by_identity: &BTreeMap<(u32, u64, u64, i64, u64, u64, u64), u64>,
+    ) -> Vec<NormalizedCell> {
+        max_by_identity
+            .iter()
+            .map(
+                |(
+                    (rule_id, key_hash_hi, key_hash_lo, bucket, origin_hi, origin_lo, incarnation),
+                    count,
+                )| {
+                    (
+                        *rule_id,
+                        *key_hash_hi,
+                        *key_hash_lo,
+                        *bucket,
+                        *origin_hi,
+                        *origin_lo,
+                        *incarnation,
+                        *count,
+                    )
+                },
+            )
+            .collect()
+    }
+
+    fn merged_cells(cells: &[CounterCell]) -> Vec<CounterCell> {
+        let mut table = CellTable::with_capacity(64, 64);
+        for cell in cells {
+            table.merge_remote(*cell, None, 0).expect("merge");
+        }
+        table.cells().map(|(_id, cell)| cell).collect()
+    }
+
     #[quickcheck]
-    fn quickcheck_remote_merge_is_monotonic_idempotent_commutative_and_associative(
+    fn quickcheck_remote_merge_is_monotonic_per_full_cell_identity(
         case: MergeLawCase,
     ) -> TestResult {
-        let len = case.counts.len().min(case.origins.len()).min(24);
-        if len == 0 {
+        let cells = merge_case_cells(case);
+        if cells.is_empty() {
             return TestResult::discard();
         }
-        let mut cells = Vec::with_capacity(len);
-        for index in 0..len {
-            cells.push(cell(
-                u64::from(case.counts[index]) + 1,
-                u64::from(case.origins[index] % 8) + 1,
-            ));
-        }
-        let mut sorted_by_identity = cells.clone();
-        sorted_by_identity.sort_by_key(|cell| (cell.origin_node_id.lo, cell.count));
-        let mut reversed = cells.clone();
-        reversed.reverse();
-        let mut duplicated = cells.clone();
-        duplicated.extend(cells.iter().copied());
 
-        let merged = merged_counts(&cells);
-        if merged != merged_counts(&reversed)
-            || merged != merged_counts(&sorted_by_identity)
-            || merged != merged_counts(&duplicated)
-        {
-            return TestResult::error("merge result changed under reorder or duplicate delivery");
-        }
+        let mut table = CellTable::with_capacity(64, 64);
+        let mut max_by_identity = BTreeMap::<_, u64>::new();
+        for cell in cells {
+            let previous = max_by_identity.get(&identity_key(cell)).copied();
+            let expected_delta = previous
+                .map(|count| cell.count.saturating_sub(count))
+                .unwrap_or(cell.count);
+            let outcome = table.merge_remote(cell, None, 0).expect("merge");
 
-        for origin in 1..=8 {
-            let max_input = cells
-                .iter()
-                .filter(|cell| cell.origin_node_id.lo == origin)
-                .map(|cell| cell.count)
-                .max()
-                .unwrap_or(0);
-            let merged_count = merged
-                .iter()
-                .find_map(|(merged_origin, count)| (*merged_origin == origin).then_some(*count))
-                .unwrap_or(0);
-            if merged_count != max_input {
+            if outcome.delta != expected_delta || outcome.changed != (expected_delta > 0) {
+                return TestResult::error("remote merge outcome diverged from monotonic max model");
+            }
+
+            max_by_identity
+                .entry(identity_key(cell))
+                .and_modify(|count| *count = (*count).max(cell.count))
+                .or_insert(cell.count);
+
+            if normalized_counts(table.cells().map(|(_id, cell)| cell))
+                != expected_counts_from_map(&max_by_identity)
+            {
                 return TestResult::error(
-                    "merged count was not monotonic maximum per cell identity",
+                    "remote merge did not preserve the prefix maximum per full identity",
                 );
             }
         }
 
         TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn quickcheck_remote_merge_is_idempotent_for_duplicate_delivery(
+        case: MergeLawCase,
+    ) -> TestResult {
+        let cells = merge_case_cells(case);
+        if cells.is_empty() {
+            return TestResult::discard();
+        }
+
+        let mut duplicated = cells.clone();
+        duplicated.extend(cells.iter().copied());
+
+        let merged = normalized_counts(merged_cells(&cells));
+        if merged == normalized_counts(merged_cells(&duplicated)) {
+            TestResult::passed()
+        } else {
+            TestResult::error("remote merge result changed after duplicate delivery")
+        }
+    }
+
+    #[quickcheck]
+    fn quickcheck_remote_merge_is_commutative_for_delivery_order(case: MergeLawCase) -> TestResult {
+        let cells = merge_case_cells(case);
+        if cells.is_empty() {
+            return TestResult::discard();
+        }
+
+        let mut sorted_by_identity = cells.clone();
+        sorted_by_identity.sort_by_key(|cell| (identity_key(*cell), cell.count));
+        let mut reversed = cells.clone();
+        reversed.reverse();
+
+        let merged = normalized_counts(merged_cells(&cells));
+        if merged == normalized_counts(merged_cells(&reversed))
+            && merged == normalized_counts(merged_cells(&sorted_by_identity))
+        {
+            TestResult::passed()
+        } else {
+            TestResult::error("remote merge result changed under reordered delivery")
+        }
+    }
+
+    #[quickcheck]
+    fn quickcheck_remote_merge_is_associative_for_grouped_state_merges(
+        case: MergeLawCase,
+    ) -> TestResult {
+        let cells = merge_case_cells(case);
+        if cells.is_empty() {
+            return TestResult::discard();
+        }
+
+        let first_split = cells.len() / 3;
+        let second_split = (cells.len() * 2) / 3;
+        let a = &cells[..first_split];
+        let b = &cells[first_split..second_split];
+        let c = &cells[second_split..];
+
+        let mut ab_then_c = merged_cells(&merged_cells(a));
+        ab_then_c.extend(merged_cells(b));
+        ab_then_c = merged_cells(&ab_then_c);
+        ab_then_c.extend(merged_cells(c));
+
+        let mut a_then_bc = merged_cells(b);
+        a_then_bc.extend(merged_cells(c));
+        a_then_bc = merged_cells(&a_then_bc);
+        let mut grouped_right = merged_cells(a);
+        grouped_right.extend(a_then_bc);
+
+        let all_at_once = normalized_counts(merged_cells(&cells));
+        if all_at_once == normalized_counts(merged_cells(&ab_then_c))
+            && all_at_once == normalized_counts(merged_cells(&grouped_right))
+        {
+            TestResult::passed()
+        } else {
+            TestResult::error("remote merge result changed under grouped state merges")
+        }
     }
 
     #[quickcheck]
