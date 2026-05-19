@@ -715,7 +715,7 @@ fn kubernetes_endpoint_slice_config_uses_snapshot_provider() {
         },
         limits: vec![tenant_rule(10, 3, 6)],
         discovery: DiscoveryConfig {
-            kind: DiscoveryMode::KubernetesEndpointSlice,
+            kind: DiscoveryMode::Kubernetes,
             namespace: Some("default".to_string()),
             service_name: Some("gabion".to_string()),
             port_name: Some("gossip".to_string()),
@@ -744,7 +744,7 @@ fn quickcheck_endpoint_slice_config_preserves_selector_shape(
     case: EndpointConfigCase,
 ) -> TestResult {
     let mut discovery = DiscoveryConfig {
-        kind: DiscoveryMode::KubernetesEndpointSlice,
+        kind: DiscoveryMode::Kubernetes,
         self_addr: Some("10.0.0.1:18080".parse().expect("addr")),
         ..Default::default()
     };
@@ -795,7 +795,7 @@ fn kubernetes_endpoint_slice_config_accepts_multiple_selectors() {
         },
         limits: vec![tenant_rule(10, 3, 6)],
         discovery: DiscoveryConfig {
-            kind: DiscoveryMode::KubernetesEndpointSlice,
+            kind: DiscoveryMode::Kubernetes,
             self_addr: Some("10.0.0.1:18080".parse().expect("addr")),
             endpoint_slices: vec![
                 EndpointSliceSelectorConfig {
@@ -840,7 +840,7 @@ fn kubernetes_endpoint_slice_config_defaults_port_name_to_gossip() {
         },
         limits: vec![tenant_rule(10, 3, 6)],
         discovery: DiscoveryConfig {
-            kind: DiscoveryMode::KubernetesEndpointSlice,
+            kind: DiscoveryMode::Kubernetes,
             namespace: Some("default".to_string()),
             service_name: Some("gabion".to_string()),
             ..Default::default()
@@ -1052,7 +1052,7 @@ fn endpoint_slice_selector_defaults_port_name_to_gossip() {
         },
         limits: vec![tenant_rule(10, 3, 6)],
         discovery: DiscoveryConfig {
-            kind: DiscoveryMode::KubernetesEndpointSlice,
+            kind: DiscoveryMode::Kubernetes,
             endpoint_slices: vec![EndpointSliceSelectorConfig {
                 namespace: "default".to_string(),
                 service_name: "gabion".to_string(),

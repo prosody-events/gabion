@@ -822,7 +822,7 @@ fn parse_discovery_mode(value: &str) -> Option<DiscoveryMode> {
         "none" => Some(DiscoveryMode::None),
         "static" => Some(DiscoveryMode::Static),
         "file" => Some(DiscoveryMode::File),
-        "kubernetes" => Some(DiscoveryMode::KubernetesEndpointSlice),
+        "kubernetes" => Some(DiscoveryMode::Kubernetes),
         _ => None,
     }
 }

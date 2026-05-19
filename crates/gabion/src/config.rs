@@ -112,9 +112,11 @@ impl Default for RuntimeConfig {
 pub struct StorageConfig {
     /// Maximum distinct request keys tracked in the local admission table.
     pub max_keys: usize,
-    /// Maximum local CRDT cells retained for gossip; defaults to max_keys times bucket count.
+    /// Maximum local CRDT cells retained for gossip; defaults to max_keys times
+    /// bucket count.
     pub max_cells: Option<usize>,
-    /// Maximum dirty-cell ring entries retained between gossip sends; defaults to max_cells.
+    /// Maximum dirty-cell ring entries retained between gossip sends; defaults
+    /// to max_cells.
     pub dirty_ring_entries: Option<usize>,
     /// Maximum descriptor entries accepted per request.
     pub max_descriptor_count: usize,

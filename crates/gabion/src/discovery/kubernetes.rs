@@ -1,7 +1,4 @@
-use std::collections::hash_map::Entry;
-use std::fmt;
-use std::net::{IpAddr, SocketAddr};
-
+use crate::discovery::{Peer, PeerDiscovery, PeerEvent};
 use ahash::{AHashMap, AHashSet};
 use async_stream::stream;
 use futures::stream::{SelectAll, Stream, StreamExt, select_all};
@@ -9,9 +6,12 @@ use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::watcher::{Config as WatcherConfig, Error as WatcherError, Event, watcher};
 use kube::{Api, Client};
+use std::collections::hash_map::Entry;
+use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use tokio::sync::oneshot;
 
-use crate::discovery::{DEFAULT_GABION_SERVICE_NAME, Peer, PeerDiscovery, PeerEvent};
+const DEFAULT_GABION_SERVICE_NAME: &str = "gabion";
 
 /// Watches every Service in the configured namespaces and, for each Service
 /// exposing a UDP `gabion` port, watches its EndpointSlices. New services are
@@ -243,17 +243,19 @@ fn watch_target(
 }
 
 fn peers(slice: &EndpointSlice, self_addr: Option<SocketAddr>) -> impl Iterator<Item = Peer> + '_ {
-    select_gabion_udp_port(slice).into_iter().flat_map(move |port| {
-        slice
-            .endpoints
-            .iter()
-            .filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
-            .flat_map(|e| &e.addresses)
-            .filter_map(move |addr| {
-                let sock = SocketAddr::new(addr.parse::<IpAddr>().ok()?, port);
-                (Some(sock) != self_addr).then_some(Peer::new(sock))
-            })
-    })
+    select_gabion_udp_port(slice)
+        .into_iter()
+        .flat_map(move |port| {
+            slice
+                .endpoints
+                .iter()
+                .filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
+                .flat_map(|e| &e.addresses)
+                .filter_map(move |addr| {
+                    let sock = SocketAddr::new(addr.parse::<IpAddr>().ok()?, port);
+                    (Some(sock) != self_addr).then_some(Peer::new(sock))
+                })
+        })
 }
 
 fn select_gabion_udp_port(slice: &EndpointSlice) -> Option<u16> {

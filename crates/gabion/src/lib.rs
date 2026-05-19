@@ -389,7 +389,7 @@ impl<H: CountUpdateHandler> Runtime<H> {
                 })))
             }
             RuntimePeerHandler::Snapshot(handler)
-                if self.inner.discovery.kind == DiscoveryMode::KubernetesEndpointSlice
+                if self.inner.discovery.kind == DiscoveryMode::Kubernetes
                     || self.inner.discovery.kind == DiscoveryMode::Auto =>
             {
                 let client = kubernetes_client().await.map_err(|error| {
