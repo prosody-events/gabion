@@ -852,6 +852,16 @@ pub mod gossip_runtime {
             self.build_admin_snapshot(&snapshot)
         }
 
+        #[cfg(test)]
+        pub(crate) fn buffer_capacities(&self) -> RuntimeBufferCapacities {
+            RuntimeBufferCapacities {
+                send: self.send_buffer.capacity(),
+                recv: self.recv_buffer.capacity(),
+                cells: self.cell_buffer.capacity(),
+                digests: self.digest_buffer.capacity(),
+            }
+        }
+
         fn publish_admin_snapshot(&self, snapshot: &gabion_discovery::PeerSnapshot) {
             let Some(shared) = &self.admin_snapshot else {
                 return;
@@ -982,6 +992,15 @@ pub mod gossip_runtime {
             }
             merged
         }
+    }
+
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct RuntimeBufferCapacities {
+        pub send: usize,
+        pub recv: usize,
+        pub cells: usize,
+        pub digests: usize,
     }
 
     pub async fn run_udp_runtime(
@@ -1577,6 +1596,21 @@ mod tests {
                 peer_count: u8::arbitrary(g) % 8,
                 fanout: (u8::arbitrary(g) % 8).saturating_add(1),
                 now_millis: u16::arbitrary(g),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RuntimeBufferReuseCase {
+        peer_count: u8,
+        tick_count: u8,
+    }
+
+    impl Arbitrary for RuntimeBufferReuseCase {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                peer_count: (u8::arbitrary(g) % 8).saturating_add(1),
+                tick_count: (u8::arbitrary(g) % 16).saturating_add(1),
             }
         }
     }
@@ -2352,7 +2386,6 @@ limits:
         TestResult::error("recent peer grace window did not match acceptance behavior")
     }
 
-    // TODO(gap): keep unknown-sender rejection covered before decode and merge.
     #[quickcheck]
     fn quickcheck_unknown_senders_are_rejected_before_decode(
         case: RuntimeUnknownPeerCase,
@@ -2378,7 +2411,6 @@ limits:
         }
     }
 
-    // TODO(gap): keep dirty-overflow bounded resync behavior property-covered.
     #[quickcheck]
     fn quickcheck_dirty_overflow_forces_bounded_resync(case: RuntimeDirtyResyncCase) -> TestResult {
         let mut config = runtime_config(7);
@@ -2426,8 +2458,6 @@ limits:
         TestResult::passed()
     }
 
-    // TODO(gap): keep supplied-time tick determinism covered for trait-injected
-    // transports.
     #[quickcheck]
     fn quickcheck_ticks_are_deterministic_for_supplied_timestamp(
         case: RuntimeDeterministicTickCase,
@@ -2473,6 +2503,31 @@ limits:
         {
             return TestResult::error("same runtime state and timestamp produced different sends");
         }
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn quickcheck_runtime_reuses_construction_buffers(case: RuntimeBufferReuseCase) -> TestResult {
+        let mut peers = Vec::with_capacity(usize::from(case.peer_count));
+        for index in 0..case.peer_count {
+            peers.push(peer_addr(index.saturating_add(1)));
+        }
+        let mut runtime = StandaloneGossipRuntime::new(
+            shared_limiter(engine_with_node(1)),
+            RuntimePeerHandler::Static(StaticPeerHandler::new(peers, None)),
+            MemoryTransport::default(),
+            runtime_config(1),
+        );
+        let initial = runtime.buffer_capacities();
+
+        for tick in 0..case.tick_count {
+            let _ = runtime.tick(u64::from(tick));
+            if runtime.buffer_capacities() != initial {
+                return TestResult::error("runtime buffer capacity changed after a tick");
+            }
+            let _ = runtime.transport_mut().drain_outbox();
+        }
+
         TestResult::passed()
     }
 

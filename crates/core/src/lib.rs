@@ -1720,8 +1720,6 @@ mod tests {
         assert!(metrics.overflow_untracked > 0);
     }
 
-    // TODO(gap): keep descriptor matching covered by a generated request/rule
-    // matrix.
     #[quickcheck]
     fn quickcheck_descriptor_matching_is_deterministic_for_exact_values_and_wildcards(
         case: DescriptorMatchCase,
@@ -1767,7 +1765,6 @@ mod tests {
         }
     }
 
-    // TODO(gap): keep overflow policies covered across generated request sequences.
     #[quickcheck]
     fn quickcheck_overflow_policies_never_exceed_key_or_cell_capacity(
         case: OverflowPolicyCase,

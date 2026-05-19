@@ -1155,7 +1155,6 @@ mod tests {
         counts
     }
 
-    // TODO(gap): keep CRDT merge laws covered with generated cell sequences.
     #[quickcheck]
     fn quickcheck_remote_merge_is_monotonic_idempotent_commutative_and_associative(
         case: MergeLawCase,
@@ -1207,7 +1206,6 @@ mod tests {
         TestResult::passed()
     }
 
-    // TODO(gap): keep dirty-ring overflow bounded under generated write pressure.
     #[quickcheck]
     fn quickcheck_dirty_ring_is_bounded_and_reports_overflow(case: DirtyRingCase) -> TestResult {
         let dirty_capacity = usize::from(case.dirty_capacity);
@@ -1356,8 +1354,6 @@ mod tests {
         }
     }
 
-    // TODO(gap): keep authenticated visitor decoding covered before callbacks
-    // mutate state.
     #[quickcheck]
     fn quickcheck_authenticated_visitor_rejects_mutations_before_cell_callbacks(
         case: AuthMutationCase,

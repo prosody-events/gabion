@@ -1685,7 +1685,6 @@ mod tests {
         assert_eq!(&recv[..len], &payload);
     }
 
-    // TODO(gap): keep peer-file scratch-buffer behavior property-covered.
     #[quickcheck]
     fn quickcheck_peer_file_uses_scratch_and_rejects_oversized_inputs(
         case: NginxPeerFileCase,
@@ -1734,7 +1733,6 @@ mod tests {
         TestResult::passed()
     }
 
-    // TODO(gap): keep receive rejection before mutation property-covered.
     #[quickcheck]
     fn quickcheck_embedded_receive_rejects_invalid_frames_before_mutating_cells(
         case: NginxReceiveRejectCase,

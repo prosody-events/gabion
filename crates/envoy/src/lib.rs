@@ -352,8 +352,6 @@ mod tests {
         assert_eq!(limiter.lock().expect("lock").active_keys(), 0);
     }
 
-    // TODO(gap): keep Envoy multi-descriptor all-or-nothing recording
-    // property-covered.
     #[quickcheck]
     fn quickcheck_multi_descriptor_requests_are_all_or_nothing(
         case: EnvoyAllOrNothingCase,
@@ -401,7 +399,6 @@ mod tests {
         TestResult::passed()
     }
 
-    // TODO(gap): keep poisoned-lock fail-open behavior property-covered.
     #[quickcheck]
     fn quickcheck_poisoned_limiter_lock_fails_open(case: EnvoyRequestCase) -> TestResult {
         let rules = RuleTable::new(vec![rule(1)]);
