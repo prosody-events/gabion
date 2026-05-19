@@ -1,0 +1,26 @@
+[package]
+name = "gabion-bin"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "gabiond"
+path = "src/bin/gabiond.rs"
+
+[dependencies]
+axum.workspace = true
+gabion-core.workspace = true
+gabion-discovery.workspace = true
+gabion-envoy.workspace = true
+gabion-gossip.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+quickcheck.workspace = true
+quickcheck_macros.workspace = true

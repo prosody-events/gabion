@@ -1,0 +1,27 @@
+[package]
+name = "gabion-nginx"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+gabion-core.workspace = true
+gabion-discovery.workspace = true
+gabion-gossip.workspace = true
+kube.workspace = true
+nginx-sys = { workspace = true, optional = true }
+ngx = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+
+[features]
+default = []
+ngx-module = ["dep:nginx-sys", "dep:ngx", "export-modules"]
+export-modules = []
+
+[dev-dependencies]
+quickcheck.workspace = true
+quickcheck_macros.workspace = true

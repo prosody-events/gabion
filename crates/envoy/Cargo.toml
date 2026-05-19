@@ -1,0 +1,13 @@
+[package]
+name = "gabion-envoy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+envoy-types.workspace = true
+gabion-core.workspace = true
+tonic.workspace = true
+
+[dev-dependencies]
+quickcheck.workspace = true
+quickcheck_macros.workspace = true

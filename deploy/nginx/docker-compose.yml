@@ -1,0 +1,20 @@
+services:
+  nginx-config-smoke:
+    image: nginx:stable-alpine
+    volumes:
+      - ./nginx.base.conf:/etc/nginx/nginx.conf:ro
+    command: ["nginx", "-t"]
+
+  nginx-module-smoke:
+    build:
+      context: ../..
+      dockerfile: deploy/nginx/Dockerfile
+    profiles: ["module"]
+    command: ["nginx", "-t"]
+
+  nginx-module-request-smoke:
+    build:
+      context: ../..
+      dockerfile: deploy/nginx/Dockerfile
+    profiles: ["module"]
+    command: ["/usr/local/bin/gabion-nginx-request-smoke"]
