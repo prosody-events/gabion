@@ -23,5 +23,10 @@ tracing.workspace = true
 twox-hash.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
+
+[[bench]]
+name = "crdt"
+harness = false
