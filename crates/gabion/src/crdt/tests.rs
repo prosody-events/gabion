@@ -1,4 +1,5 @@
 use super::*;
+use super::hash::mix64;
 
 fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
