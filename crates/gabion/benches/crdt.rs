@@ -40,8 +40,8 @@ use std::hint::black_box;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use gabion::crdt::{
-    BucketEpoch, CellHandle, CellStore, CellStoreConfig, CompactCellKey, DeltaSink, Incarnation,
-    KeyHash, NodeId, NodeIdentity, NodeSlot, ObservationBatch, RuleDescriptor,
+    BucketEpoch, CellHandle, CellStore, CellStoreConfig, CompactCellKey, DeltaSink, ExpirationSink,
+    Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, ObservationBatch, RuleDescriptor,
 };
 use gabion::wire::{FrameLimits, Header, PacketBuf, Packets, WireScratch, decode_unauth};
 
@@ -68,7 +68,6 @@ impl Rng {
     fn range(&mut self, n: u32) -> u32 {
         (self.next_u64() % (n as u64)) as u32
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +300,13 @@ fn build_fixture() -> Fixture {
     // cold-insert tails and remote merges to grow the population.
     let mut local_seed: Vec<u128> = hot_keys.iter().copied().collect();
     local_seed.extend(warm_keys.iter().take(WARM_KEYS / 2).copied());
-    seed_local(&mut store, &rule_fps, &local_seed, local_seed.len(), 0xD0D0_C0DE);
+    seed_local(
+        &mut store,
+        &rule_fps,
+        &local_seed,
+        local_seed.len(),
+        0xD0D0_C0DE,
+    );
 
     // Seed remote cells under 8 peers using the other half of warm keys.
     let peers: Vec<(NodeId, Incarnation)> = (0..8).map(|i| (peer_node(i), 1)).collect();
@@ -491,13 +496,13 @@ fn bench_merge_remote(c: &mut Criterion) {
                         let (key, rule_idx, bucket, peer_idx, count) = if pick < 50 {
                             // No-op: peer behind us. Pick an existing cell
                             // and report a count less than ours (100).
-                            let row =
-                                fixture.remote_rows[rng.range(fixture.remote_rows.len() as u32) as usize];
+                            let row = fixture.remote_rows
+                                [rng.range(fixture.remote_rows.len() as u32) as usize];
                             (row.key, row.rule_idx, row.bucket, row.peer_idx, 1_u32)
                         } else if pick < 90 {
                             // Update: peer ahead of us.
-                            let row =
-                                fixture.remote_rows[rng.range(fixture.remote_rows.len() as u32) as usize];
+                            let row = fixture.remote_rows
+                                [rng.range(fixture.remote_rows.len() as u32) as usize];
                             (row.key, row.rule_idx, row.bucket, row.peer_idx, 10_000_u32)
                         } else {
                             // Insert: brand-new cell.
@@ -575,8 +580,7 @@ fn bench_merge_remote(c: &mut Criterion) {
             obs.clear();
             sink.clear();
             for _ in 0..128 {
-                let row =
-                    fixture.remote_rows[rng.range(fixture.remote_rows.len() as u32) as usize];
+                let row = fixture.remote_rows[rng.range(fixture.remote_rows.len() as u32) as usize];
                 let (origin, inc) = fixture.peers[row.peer_idx as usize];
                 obs.push(
                     fixture.rule_fps[row.rule_idx as usize],
@@ -645,10 +649,7 @@ fn bench_find(c: &mut Criterion) {
     // ─── miss ───────────────────────────────────────────────────────────
     // Pure miss path — Robin Hood early-exit baseline.
     group.bench_function("miss", |b| {
-        let rule_slot = fixture
-            .store
-            .find_rule(fixture.rule_fps[0])
-            .expect("rule");
+        let rule_slot = fixture.store.find_rule(fixture.rule_fps[0]).expect("rule");
         let mut rng = Rng::new(0xDEAD_BEEF);
         b.iter(|| {
             let h = fixture.store.find(black_box(CompactCellKey {
@@ -746,10 +747,16 @@ fn bench_expire(c: &mut Criterion) {
             current_epoch[i] = NUM_BUCKETS as u32; // 4
             live_buckets[i] = (NUM_BUCKETS as u32) - 1; // 3
         }
+        let mut sink = ExpirationSink::<u32>::with_capacity(fixture.store.capacity() as usize);
         b.iter_batched_ref(
             || fixture.store.clone(),
             |store| {
-                store.expire(black_box(&current_epoch), black_box(&live_buckets));
+                sink.clear();
+                store.expire(
+                    black_box(&current_epoch),
+                    black_box(&live_buckets),
+                    black_box(&mut sink),
+                );
             },
             BatchSize::SmallInput,
         );
@@ -764,10 +771,16 @@ fn bench_expire(c: &mut Criterion) {
             current_epoch[i] = 0;
             live_buckets[i] = 1000;
         }
+        let mut sink = ExpirationSink::<u32>::with_capacity(fixture.store.capacity() as usize);
         b.iter_batched_ref(
             || fixture.store.clone(),
             |store| {
-                store.expire(black_box(&current_epoch), black_box(&live_buckets));
+                sink.clear();
+                store.expire(
+                    black_box(&current_epoch),
+                    black_box(&live_buckets),
+                    black_box(&mut sink),
+                );
             },
             BatchSize::SmallInput,
         );

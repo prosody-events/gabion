@@ -11,6 +11,9 @@
 //! Every mutation that raises a stored count appends one row to a
 //! caller-owned [`DeltaSink`], whose SoA shape lets a higher-level
 //! rate-limit aggregator fold deltas without per-record dispatch.
+//! Expirations are surfaced symmetrically via [`ExpirationSink`] — one row
+//! per freed cell — so an external aggregate store can keep its summary
+//! consistent with the CRDT's active set.
 //!
 //! Two dirty rings track recent changes — `local_dirty` for cells whose
 //! origin is this node, `forwarded_dirty` for cells learned from peers. A
@@ -41,7 +44,7 @@ mod tests;
 pub use dictionary::{NodeDescriptor, NodeDictionary, RuleDescriptor, RuleDictionary};
 pub use dirty_ring::{DirtyEntry, DirtyRing};
 pub use index::CellIndex;
-pub use io::{DeltaSink, ObservationBatch};
+pub use io::{DeltaSink, ExpirationSink, ObservationBatch};
 pub use peer_frontier::PeerFrontierTable;
 
 use dictionary::pow2_index_capacity_for;
@@ -172,6 +175,16 @@ pub struct CellDelta<C: Count> {
     pub previous_count: C,
     pub current_count: C,
     pub delta: C,
+    pub applies_locally: bool,
+}
+
+/// One row appended to [`ExpirationSink`] when a cell ages out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CellExpiration<C: Count> {
+    pub handle: CellHandle,
+    pub key: CompactCellKey,
+    pub last_count: C,
+    pub last_update_millis: u64,
     pub applies_locally: bool,
 }
 
@@ -447,8 +460,7 @@ impl<C: Count> CellStore<C> {
     pub fn intern_rule(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
         let result = self.rule_dictionary.intern(descriptor);
         if result.is_none() {
-            self.rule_dictionary_full_rejects =
-                self.rule_dictionary_full_rejects.saturating_add(1);
+            self.rule_dictionary_full_rejects = self.rule_dictionary_full_rejects.saturating_add(1);
         }
         result
     }
@@ -456,8 +468,7 @@ impl<C: Count> CellStore<C> {
     pub fn intern_node(&mut self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
         let result = self.node_dictionary.intern(node_id, incarnation);
         if result.is_none() {
-            self.node_dictionary_full_rejects =
-                self.node_dictionary_full_rejects.saturating_add(1);
+            self.node_dictionary_full_rejects = self.node_dictionary_full_rejects.saturating_add(1);
         }
         result
     }
@@ -643,6 +654,33 @@ impl<C: Count> CellStore<C> {
         sink.push(handle, key, previous, current, delta, applies_locally);
     }
 
+    /// Append a row to the SoA expiration sink. Must run before
+    /// `free_cell_at`, since the latter decrements the rule descriptor's
+    /// refcount and may invalidate the `applies_locally` lookup.
+    fn emit_expiration(&self, sink: &mut ExpirationSink<C>, slot: u32) {
+        let rule_slot = self.rules[slot as usize];
+        let handle = self.handle_for(slot);
+        let applies_locally = self
+            .rule_dictionary
+            .descriptor(rule_slot)
+            .map(|d| d.applies_locally())
+            .unwrap_or(false);
+        let key = CompactCellKey {
+            rule: rule_slot,
+            key_hash: self.key_hashes[slot as usize],
+            bucket: self.buckets[slot as usize],
+            origin: self.origins[slot as usize],
+            incarnation: self.incarnations[slot as usize],
+        };
+        sink.push(
+            handle,
+            key,
+            self.counts[slot as usize],
+            self.last_update_millis[slot as usize],
+            applies_locally,
+        );
+    }
+
     /// Insert or update a row: returns the resulting handle and whether the
     /// stored count rose.
     fn upsert(
@@ -723,7 +761,8 @@ impl<C: Count> CellStore<C> {
         self.rule_dictionary.inc_ref(rule_slot);
         self.node_dictionary.inc_ref(origin_slot);
 
-        self.index.insert_unchecked(hash_compact_cell_key(&key), slot);
+        self.index
+            .insert_unchecked(hash_compact_cell_key(&key), slot);
 
         let handle = self.handle_for(slot);
         self.push_dirty(origin_slot, handle, seq);
@@ -851,8 +890,15 @@ impl<C: Count> CellStore<C> {
     /// Free cells whose bucket has aged out of the per-rule live window.
     ///
     /// For each rule slot `r`, the cell is kept iff
-    /// `buckets[slot] + live_buckets[r] >= current_epoch_by_rule[r]`.
-    pub fn expire(&mut self, current_epoch_by_rule: &[BucketEpoch], live_buckets: &[u32]) {
+    /// `buckets[slot] + live_buckets[r] >= current_epoch_by_rule[r]`. Each
+    /// freed cell is emitted into `sink` *before* its slot is released, so
+    /// external aggregators see one row per active-set departure.
+    pub fn expire(
+        &mut self,
+        current_epoch_by_rule: &[BucketEpoch],
+        live_buckets: &[u32],
+        sink: &mut ExpirationSink<C>,
+    ) {
         for slot in 0..self.capacity {
             if !self.is_active(slot) {
                 continue;
@@ -866,6 +912,7 @@ impl<C: Count> CellStore<C> {
             let bucket = self.buckets[slot as usize];
             let expired = (bucket as u64) + (live as u64) < (current as u64);
             if expired {
+                self.emit_expiration(sink, slot);
                 self.free_cell_at(slot);
             }
         }
@@ -1007,11 +1054,7 @@ impl<C: Count> CellStore<C> {
     /// Fill one outgoing gossip frame: local dirty first, then forwarded
     /// dirty, then a rotating repair slice. Returns the number of handles
     /// pushed. Uses `selection_marks` for O(1) intra-frame dedup.
-    pub fn fill_gossip_frame(
-        &mut self,
-        max_cells: usize,
-        out: &mut Vec<CellHandle>,
-    ) -> usize {
+    pub fn fill_gossip_frame(&mut self, max_cells: usize, out: &mut Vec<CellHandle>) -> usize {
         out.clear();
         if max_cells == 0 {
             return 0;
@@ -1077,4 +1120,3 @@ impl<C: Count> CellStore<C> {
         out.len()
     }
 }
-
