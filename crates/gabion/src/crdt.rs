@@ -35,6 +35,9 @@ mod index;
 mod io;
 mod peer_frontier;
 
+#[cfg(test)]
+mod tests;
+
 pub use dictionary::{NodeDescriptor, NodeDictionary, RuleDescriptor, RuleDictionary};
 pub use dirty_ring::{DirtyEntry, DirtyRing};
 pub use index::CellIndex;
@@ -1075,5 +1078,3 @@ impl<C: Count> CellStore<C> {
     }
 }
 
-#[cfg(test)]
-mod tests;

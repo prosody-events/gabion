@@ -43,6 +43,7 @@ use gabion::crdt::{
     BucketEpoch, CellHandle, CellStore, CellStoreConfig, CompactCellKey, DeltaSink, Incarnation,
     KeyHash, NodeId, NodeIdentity, NodeSlot, ObservationBatch, RuleDescriptor,
 };
+use gabion::wire::{FrameLimits, Header, PacketBuf, Packets, WireScratch, decode_unauth};
 
 // ---------------------------------------------------------------------------
 // SplitMix64 RNG. Deterministic so iteration order is reproducible.
@@ -775,6 +776,148 @@ fn bench_expire(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// wire — gossip frame encode / decode.
+// ---------------------------------------------------------------------------
+
+fn wire_header() -> Header {
+    Header {
+        cluster_id_hash: 0xC0FE_FACE_DEAD_BEEF_1234_5678_9ABC_DEF0,
+        sender_node_id: LOCAL_NODE.0,
+        sender_incarnation: LOCAL_INCARNATION,
+        count_width: 0,
+        cell_count: 0,
+        body_len: 0,
+        min_origin_sequence: 0,
+        max_origin_sequence: 0,
+        flags: 0,
+    }
+}
+
+fn bench_wire(c: &mut Criterion) {
+    let mut group = c.benchmark_group("crdt/wire");
+    group.throughput(Throughput::Elements(128));
+
+    let fixture = build_fixture();
+    let limits = FrameLimits::default();
+
+    // ─── encode_128 ────────────────────────────────────────────────────
+    // Compose a 128-cell frame from the fixture, then encode into a
+    // pre-allocated buffer. Resembles the runtime's per-tick send path.
+    let mut encode_store = fixture.store.clone();
+    let mut handles = Vec::<CellHandle>::with_capacity(128);
+    encode_store.fill_gossip_frame(128, &mut handles);
+    let handles = handles; // freeze for the closure
+    group.bench_function("encode_128", |b| {
+        let mut scratch = WireScratch::for_store(&encode_store);
+        let mut buf = PacketBuf::for_limits(limits);
+        b.iter(|| {
+            let mut packets = Packets::<u32>::unauth(
+                wire_header(),
+                black_box(&encode_store),
+                black_box(&handles),
+                &mut scratch,
+                limits,
+            )
+            .expect("ctor");
+            while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
+                black_box(pkt);
+                black_box(buf.as_bytes());
+            }
+        });
+    });
+
+    // ─── encode_multi_packet_4096 ─────────────────────────────────────
+    // 4096-cell fixture under a 64 KiB UDP-style budget. Measures the
+    // steady-state multi-packet emission rate — drains the full handle
+    // list across however many packets it takes (target ~9–10).
+    let mut multi_store = fixture.store.clone();
+    let mut multi_handles = Vec::<CellHandle>::with_capacity(4096);
+    multi_store.fill_gossip_frame(4096, &mut multi_handles);
+    let multi_handles = multi_handles;
+    let multi_limits = FrameLimits {
+        max_payload_bytes: 64 * 1024,
+        max_cells: 4096,
+    };
+    // Sanity-check the bench actually exercises the multi-packet path.
+    {
+        let mut scratch = WireScratch::for_store(&multi_store);
+        let mut buf = PacketBuf::for_limits(multi_limits);
+        let mut packets = Packets::<u32>::unauth(
+            wire_header(),
+            &multi_store,
+            &multi_handles,
+            &mut scratch,
+            multi_limits,
+        )
+        .expect("ctor");
+        let mut n_packets = 0;
+        while packets.next_into(&mut buf).expect("encode").is_some() {
+            n_packets += 1;
+        }
+        assert!(
+            n_packets > 1,
+            "encode_multi_packet_4096 emitted only {n_packets} packet(s); raise the cell count or lower max_payload_bytes",
+        );
+    }
+    group.throughput(Throughput::Elements(multi_handles.len() as u64));
+    group.bench_function("encode_multi_packet_4096", |b| {
+        let mut scratch = WireScratch::for_store(&multi_store);
+        let mut buf = PacketBuf::for_limits(multi_limits);
+        b.iter(|| {
+            let mut packets = Packets::<u32>::unauth(
+                wire_header(),
+                black_box(&multi_store),
+                black_box(&multi_handles),
+                &mut scratch,
+                multi_limits,
+            )
+            .expect("ctor");
+            while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
+                black_box(pkt);
+                black_box(buf.as_bytes());
+            }
+        });
+    });
+
+    // Restore throughput to 128 for the decode bench below.
+    group.throughput(Throughput::Elements(128));
+
+    // ─── decode_128 ────────────────────────────────────────────────────
+    // Pre-encode one 128-cell packet, then decode it into a recycled
+    // ObservationBatch on every iteration.
+    let mut preflight_scratch = WireScratch::for_store(&encode_store);
+    let mut preflight_buf = PacketBuf::for_limits(limits);
+    {
+        let mut packets = Packets::<u32>::unauth(
+            wire_header(),
+            &encode_store,
+            &handles,
+            &mut preflight_scratch,
+            limits,
+        )
+        .expect("preflight ctor");
+        packets
+            .next_into(&mut preflight_buf)
+            .expect("preflight encode")
+            .expect("at least one packet");
+        // 128 cells fits in the default 256 KiB budget, so it's one packet.
+        assert_eq!(packets.remaining(), 0);
+    }
+    let frame_buf: Vec<u8> = preflight_buf.as_bytes().to_vec();
+    group.bench_function("decode_128", |b| {
+        let mut obs = ObservationBatch::<u32>::with_capacity(128);
+        b.iter(|| {
+            obs.clear();
+            let summary =
+                decode_unauth::<u32>(black_box(&frame_buf), limits, &mut obs).expect("decode");
+            black_box(summary);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_ingest_local,
@@ -782,5 +925,6 @@ criterion_group!(
     bench_find,
     bench_fill_gossip_frame,
     bench_expire,
+    bench_wire,
 );
 criterion_main!(benches);
