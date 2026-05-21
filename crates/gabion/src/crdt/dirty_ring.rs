@@ -13,7 +13,8 @@ pub struct DirtyEntry {
 }
 
 /// Bounded ring of recent change records. Overflow bumps `overflow_seq` so
-/// observers can detect that the recent-change stream is no longer authoritative.
+/// observers can detect that the recent-change stream is no longer
+/// authoritative.
 #[derive(Clone, Debug)]
 pub struct DirtyRing {
     entries: Box<[DirtyEntry]>,
@@ -42,15 +43,19 @@ impl DirtyRing {
     pub fn capacity(&self) -> u32 {
         self.entries.len() as u32
     }
+
     pub fn len(&self) -> u32 {
         self.len
     }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
     pub fn overflow_seq(&self) -> u64 {
         self.overflow_seq
     }
+
     pub fn overflowed(&self) -> bool {
         self.overflow_seq > 0
     }

@@ -44,7 +44,7 @@ mod tests;
 pub use dictionary::{NodeDescriptor, NodeDictionary, RuleDescriptor, RuleDictionary};
 pub use dirty_ring::{DirtyEntry, DirtyRing};
 pub use index::CellIndex;
-pub use io::{DeltaSink, ExpirationSink, ObservationBatch};
+pub use io::{DeltaSink, ExpirationSink, Observation, ObservationBatch};
 pub use peer_frontier::PeerFrontierTable;
 
 use dictionary::pow2_index_capacity_for;
@@ -108,10 +108,12 @@ impl Count for u16 {
     fn saturating_from_u64(value: u64) -> Self {
         value.min(u16::MAX as u64) as u16
     }
+
     fn saturating_add_hits(self, hits: u64) -> Self {
         let sum = (self as u64).saturating_add(hits);
         sum.min(u16::MAX as u64) as u16
     }
+
     fn saturating_delta(new: Self, old: Self) -> Self {
         new.saturating_sub(old)
     }
@@ -123,10 +125,12 @@ impl Count for u32 {
     fn saturating_from_u64(value: u64) -> Self {
         value.min(u32::MAX as u64) as u32
     }
+
     fn saturating_add_hits(self, hits: u64) -> Self {
         let sum = (self as u64).saturating_add(hits);
         sum.min(u32::MAX as u64) as u32
     }
+
     fn saturating_delta(new: Self, old: Self) -> Self {
         new.saturating_sub(old)
     }
@@ -138,9 +142,11 @@ impl Count for u64 {
     fn saturating_from_u64(value: u64) -> Self {
         value
     }
+
     fn saturating_add_hits(self, hits: u64) -> Self {
         self.saturating_add(hits)
     }
+
     fn saturating_delta(new: Self, old: Self) -> Self {
         new.saturating_sub(old)
     }
@@ -306,6 +312,11 @@ pub struct CellStore<C: Count = u32> {
     // Per-origin sequence allocator (indexed by NodeSlot).
     next_sequence_by_origin: Box<[u64]>,
 
+    // Scratch arrays for `expire_at` — sized to rule_dictionary capacity.
+    // Reused across every call; never allocated past `new()`.
+    expire_current_epoch_scratch: Box<[BucketEpoch]>,
+    expire_live_buckets_scratch: Box<[u32]>,
+
     // Identity dictionaries.
     rule_dictionary: RuleDictionary,
     node_dictionary: NodeDictionary,
@@ -324,6 +335,27 @@ pub struct CellStore<C: Count = u32> {
 }
 
 const NO_FREE: u32 = u32::MAX;
+
+/// Internal arguments for [`CellStore::upsert`]. The mode discriminates the
+/// two valid update shapes; sharing a struct prevents callers from passing a
+/// remote `observed` count alongside a local `hits` delta or vice versa.
+struct UpsertSpec<C: Count> {
+    rule_slot: RuleSlot,
+    key_hash: KeyHash,
+    bucket: BucketEpoch,
+    origin_slot: NodeSlot,
+    incarnation: Incarnation,
+    now_millis: u64,
+    mode: UpsertMode<C>,
+}
+
+enum UpsertMode<C: Count> {
+    /// Local hit. The stored count rises by saturating-adding `hits`.
+    Accumulate { hits: u64 },
+    /// Remote observation. The stored count rises to `observed` if and only
+    /// if `observed` is strictly greater (CRDT max-merge).
+    MaxMerge { observed: C },
+}
 
 impl<C: Count> CellStore<C> {
     pub fn new(config: CellStoreConfig, local_identity: NodeIdentity) -> Self {
@@ -382,6 +414,11 @@ impl<C: Count> CellStore<C> {
             next_sequence_by_origin: vec![0_u64; config.node_dictionary_capacity as usize]
                 .into_boxed_slice(),
 
+            expire_current_epoch_scratch: vec![0_u32; config.rule_dictionary_capacity as usize]
+                .into_boxed_slice(),
+            expire_live_buckets_scratch: vec![0_u32; config.rule_dictionary_capacity as usize]
+                .into_boxed_slice(),
+
             rule_dictionary: RuleDictionary::with_capacity(config.rule_dictionary_capacity),
             node_dictionary,
 
@@ -404,39 +441,51 @@ impl<C: Count> CellStore<C> {
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
+
     pub fn active_len(&self) -> u32 {
         self.active_len
     }
+
     pub fn is_empty(&self) -> bool {
         self.active_len == 0
     }
+
     pub fn local_identity(&self) -> NodeIdentity {
         self.local_identity
     }
+
     pub fn local_node_slot(&self) -> NodeSlot {
         self.local_node_slot
     }
+
     pub fn rule_dictionary(&self) -> &RuleDictionary {
         &self.rule_dictionary
     }
+
     pub fn node_dictionary(&self) -> &NodeDictionary {
         &self.node_dictionary
     }
+
     pub fn peer_frontiers(&self) -> &PeerFrontierTable {
         &self.peer_frontiers
     }
+
     pub fn peer_frontiers_mut(&mut self) -> &mut PeerFrontierTable {
         &mut self.peer_frontiers
     }
+
     pub fn local_dirty(&self) -> &DirtyRing {
         &self.local_dirty
     }
+
     pub fn forwarded_dirty(&self) -> &DirtyRing {
         &self.forwarded_dirty
     }
+
     pub fn repair_cursor(&self) -> u32 {
         self.repair_cursor
     }
+
     pub fn index(&self) -> &CellIndex {
         &self.index
     }
@@ -685,17 +734,18 @@ impl<C: Count> CellStore<C> {
     /// stored count rose.
     fn upsert(
         &mut self,
-        rule_slot: RuleSlot,
-        key_hash: KeyHash,
-        bucket: BucketEpoch,
-        origin_slot: NodeSlot,
-        incarnation: Incarnation,
-        new_count: C,
-        accumulate: bool,
-        hits_for_local: u64,
-        now_millis: u64,
+        spec: UpsertSpec<C>,
         sink: &mut DeltaSink<C>,
     ) -> Result<UpdateOutcome<C>, InsertReject> {
+        let UpsertSpec {
+            rule_slot,
+            key_hash,
+            bucket,
+            origin_slot,
+            incarnation,
+            now_millis,
+            mode,
+        } = spec;
         let key = CompactCellKey {
             rule: rule_slot,
             key_hash,
@@ -705,12 +755,15 @@ impl<C: Count> CellStore<C> {
         };
         if let Some(slot) = self.lookup_index(key) {
             let previous = self.counts[slot as usize];
-            let next = if accumulate {
-                previous.saturating_add_hits(hits_for_local)
-            } else if new_count > previous {
-                new_count
-            } else {
-                previous
+            let next = match mode {
+                UpsertMode::Accumulate { hits } => previous.saturating_add_hits(hits),
+                UpsertMode::MaxMerge { observed } => {
+                    if observed > previous {
+                        observed
+                    } else {
+                        previous
+                    }
+                }
             };
             if next == previous {
                 return Ok(UpdateOutcome {
@@ -742,10 +795,9 @@ impl<C: Count> CellStore<C> {
                 return Err(InsertReject::CellStoreFull);
             }
         };
-        let initial = if accumulate {
-            C::default().saturating_add_hits(hits_for_local)
-        } else {
-            new_count
+        let initial = match mode {
+            UpsertMode::Accumulate { hits } => C::default().saturating_add_hits(hits),
+            UpsertMode::MaxMerge { observed } => observed,
         };
         self.rules[slot as usize] = rule_slot;
         self.key_hashes[slot as usize] = key_hash;
@@ -845,15 +897,15 @@ impl<C: Count> CellStore<C> {
             };
             let hits_u64: u64 = obs.counts[i].into();
             let _ = self.upsert(
-                rule_slot,
-                obs.key_hashes[i],
-                obs.buckets[i],
-                self.local_node_slot,
-                self.local_identity.incarnation,
-                C::default(),
-                true,
-                hits_u64,
-                obs.last_update_millis[i],
+                UpsertSpec {
+                    rule_slot,
+                    key_hash: obs.key_hashes[i],
+                    bucket: obs.buckets[i],
+                    origin_slot: self.local_node_slot,
+                    incarnation: self.local_identity.incarnation,
+                    now_millis: obs.last_update_millis[i],
+                    mode: UpsertMode::Accumulate { hits: hits_u64 },
+                },
                 sink,
             );
         }
@@ -873,15 +925,17 @@ impl<C: Count> CellStore<C> {
                 continue;
             };
             let _ = self.upsert(
-                rule_slot,
-                obs.key_hashes[i],
-                obs.buckets[i],
-                node_slot,
-                obs.incarnations[i],
-                obs.counts[i],
-                false,
-                0,
-                obs.last_update_millis[i],
+                UpsertSpec {
+                    rule_slot,
+                    key_hash: obs.key_hashes[i],
+                    bucket: obs.buckets[i],
+                    origin_slot: node_slot,
+                    incarnation: obs.incarnations[i],
+                    now_millis: obs.last_update_millis[i],
+                    mode: UpsertMode::MaxMerge {
+                        observed: obs.counts[i],
+                    },
+                },
                 sink,
             );
         }
@@ -1118,5 +1172,130 @@ impl<C: Count> CellStore<C> {
         }
         self.repair_cursor = next_cursor;
         out.len()
+    }
+
+    /// Convenience wrapper around [`Self::expire`] that derives the per-rule
+    /// epoch and live-bucket arrays from the current wall-clock time and each
+    /// rule's descriptor. Uses scratch storage allocated at construction time
+    /// so the call is allocation-free.
+    pub fn expire_at(&mut self, now_millis: u64, sink: &mut ExpirationSink<C>) {
+        let dict_cap = self.rule_dictionary.capacity() as usize;
+        debug_assert_eq!(self.expire_current_epoch_scratch.len(), dict_cap);
+        debug_assert_eq!(self.expire_live_buckets_scratch.len(), dict_cap);
+
+        for slot in 0..dict_cap {
+            let (current, live) = match self.rule_dictionary.descriptor(slot as RuleSlot) {
+                Some(d) if d.bucket_millis > 0 => {
+                    let current = (now_millis / d.bucket_millis as u64) as BucketEpoch;
+                    let live = (d.window_millis / d.bucket_millis).max(1);
+                    (current, live)
+                }
+                _ => (0, 0),
+            };
+            self.expire_current_epoch_scratch[slot] = current;
+            self.expire_live_buckets_scratch[slot] = live;
+        }
+
+        // Swap the scratch slices out so we can pass them as `&[T]` borrows
+        // to `self.expire(...)` (which needs `&mut self`). `Box::<[T]>::default`
+        // returns an empty boxed slice that does not allocate.
+        let current = std::mem::take(&mut self.expire_current_epoch_scratch);
+        let live = std::mem::take(&mut self.expire_live_buckets_scratch);
+        self.expire(&current, &live, sink);
+        self.expire_current_epoch_scratch = current;
+        self.expire_live_buckets_scratch = live;
+    }
+
+    /// Peer-aware sibling of [`Self::fill_gossip_frame`]. Walks the same
+    /// three lanes (local dirty → forwarded dirty → repair) in the same
+    /// order, dedup'd via `selection_marks`, but skips any cell whose
+    /// `origin_sequence` is already at or below the peer's recorded
+    /// `last_acked` for that origin slot.
+    pub fn fill_gossip_frame_for_peer(
+        &mut self,
+        max_cells: usize,
+        peer_slot: u16,
+        out: &mut Vec<CellHandle>,
+    ) -> usize {
+        out.clear();
+        if max_cells == 0 {
+            return 0;
+        }
+        self.bump_selection_epoch();
+
+        // Lane 1: local dirty.
+        let local_len = self.local_dirty.len();
+        for offset in 0..local_len {
+            if out.len() >= max_cells {
+                break;
+            }
+            let entry = ring_entry_at(&self.local_dirty, offset);
+            if !self.dirty_entry_current(entry) {
+                continue;
+            }
+            let i = entry.handle.index as usize;
+            if !self.peer_lacks(peer_slot, i) {
+                continue;
+            }
+            if !self.mark_selected(entry.handle.index) {
+                continue;
+            }
+            out.push(entry.handle);
+        }
+        if out.len() >= max_cells {
+            return out.len();
+        }
+
+        // Lane 2: forwarded dirty.
+        let forwarded_len = self.forwarded_dirty.len();
+        for offset in 0..forwarded_len {
+            if out.len() >= max_cells {
+                break;
+            }
+            let entry = ring_entry_at(&self.forwarded_dirty, offset);
+            if !self.dirty_entry_current(entry) {
+                continue;
+            }
+            let i = entry.handle.index as usize;
+            if !self.peer_lacks(peer_slot, i) {
+                continue;
+            }
+            if !self.mark_selected(entry.handle.index) {
+                continue;
+            }
+            out.push(entry.handle);
+        }
+        if out.len() >= max_cells {
+            return out.len();
+        }
+
+        // Lane 3: rotating repair slice.
+        let cap = self.capacity;
+        let mut visited = 0_u32;
+        let mut next_cursor = self.repair_cursor;
+        while visited < cap && out.len() < max_cells {
+            let slot = (self.repair_cursor + visited) % cap;
+            visited += 1;
+            next_cursor = (slot + 1) % cap;
+            if !self.is_active(slot) {
+                continue;
+            }
+            if !self.peer_lacks(peer_slot, slot as usize) {
+                continue;
+            }
+            if !self.mark_selected(slot) {
+                continue;
+            }
+            out.push(self.handle_for(slot));
+        }
+        self.repair_cursor = next_cursor;
+        out.len()
+    }
+
+    #[inline]
+    fn peer_lacks(&self, peer_slot: u16, cell_index: usize) -> bool {
+        let origin = self.origins[cell_index];
+        let last = self.peer_frontiers.last_acked(peer_slot, origin);
+        self.origin_sequences[cell_index] > last
     }
 }

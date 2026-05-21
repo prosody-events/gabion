@@ -161,14 +161,7 @@ pub(crate) fn encode_packet_body<C: Count>(
     scratch.reset();
 
     let count_size = std::mem::size_of::<C>();
-    let plan = plan_packet(
-        store,
-        handles,
-        start_at,
-        body_budget,
-        count_size,
-        scratch,
-    );
+    let plan = plan_packet(store, handles, start_at, body_budget, count_size, scratch);
 
     if plan.cells_emitted == 0 {
         return EncodedBody {
@@ -181,15 +174,7 @@ pub(crate) fn encode_packet_body<C: Count>(
         };
     }
 
-    write_body::<C>(
-        store,
-        handles,
-        start_at,
-        &plan,
-        count_size,
-        scratch,
-        out,
-    );
+    write_body::<C>(store, handles, start_at, &plan, count_size, scratch, out);
 
     EncodedBody {
         body_len: plan.body_len,
@@ -279,9 +264,7 @@ fn plan_packet<C: Count>(
     let body_len = if cells_emitted == 0 {
         0
     } else {
-        DICT_LEN_BYTES
-            + 16 * (r as usize + d as usize)
-            + cells_emitted as usize * per_cell_bytes
+        DICT_LEN_BYTES + 16 * (r as usize + d as usize) + cells_emitted as usize * per_cell_bytes
     };
 
     Plan {
@@ -348,7 +331,9 @@ fn write_body<C: Count>(
     while consumed < plan.consumed && i < n {
         let handle = handles[start_at + consumed];
         consumed += 1;
-        let Some(row) = store.get(handle) else { continue };
+        let Some(row) = store.get(handle) else {
+            continue;
+        };
         let Some(_rule_desc) = store.rule_dictionary().descriptor(row.key.rule) else {
             continue;
         };

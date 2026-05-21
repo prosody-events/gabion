@@ -5,7 +5,7 @@ use quickcheck_macros::quickcheck;
 
 use crate::crdt::{
     BucketEpoch, CellHandle, CellStore, CellStoreConfig, Count, DeltaSink, Incarnation, KeyHash,
-    NodeId, NodeIdentity, ObservationBatch,
+    NodeId, NodeIdentity, Observation, ObservationBatch,
 };
 
 use super::{
@@ -86,7 +86,10 @@ fn store_with_cap<C: Count>(cells: u32, dicts: u16) -> CellStore<C> {
 /// Build a store, ingest the rows as merge_remote observations (so each
 /// row's origin is its own peer), then return the store + ordered handle
 /// list.
-fn seed_store<C: Count>(rows: &[RawRow], to_count: impl Fn(u32) -> C) -> (CellStore<C>, Vec<CellHandle>) {
+fn seed_store<C: Count>(
+    rows: &[RawRow],
+    to_count: impl Fn(u32) -> C,
+) -> (CellStore<C>, Vec<CellHandle>) {
     // Size dictionaries to comfortably hold every distinct identity in the
     // fixture.
     let mut store = store_with_cap::<C>((rows.len() as u32).max(64), 256);
@@ -94,15 +97,15 @@ fn seed_store<C: Count>(rows: &[RawRow], to_count: impl Fn(u32) -> C) -> (CellSt
     let mut obs = ObservationBatch::<C>::with_capacity(rows.len());
     let mut sink = DeltaSink::<C>::with_capacity(rows.len());
     for r in rows {
-        obs.push(
-            r.rule_fingerprint,
-            KeyHash(r.key_hash),
-            r.bucket as BucketEpoch,
-            NodeId(r.origin_node_id),
-            r.origin_incarnation as Incarnation,
-            to_count(r.count),
-            r.last_update_millis,
-        );
+        obs.push(Observation {
+            rule_fingerprint: r.rule_fingerprint,
+            key_hash: KeyHash(r.key_hash),
+            bucket: r.bucket as BucketEpoch,
+            origin: NodeId(r.origin_node_id),
+            incarnation: r.origin_incarnation as Incarnation,
+            count: to_count(r.count),
+            last_update_millis: r.last_update_millis,
+        });
     }
     store.merge_remote(&obs, &mut sink);
 
@@ -199,9 +202,8 @@ fn run_unauth_roundtrip<C: Count>(
     let mut got: std::collections::HashSet<CellKey> = std::collections::HashSet::new();
     for (i, frame) in frames.iter().enumerate() {
         let mut visited: Vec<WireCell<C>> = Vec::new();
-        let summary =
-            decode_unauth_visit::<C>(frame, limits, |_| true, |c| visited.push(c))
-                .map_err(|e| format!("decode visit: {e:?}"))?;
+        let summary = decode_unauth_visit::<C>(frame, limits, |_| true, |c| visited.push(c))
+            .map_err(|e| format!("decode visit: {e:?}"))?;
         let last = i + 1 == frames.len();
         let more = summary.flags & FLAG_MORE != 0;
         if last && more {
@@ -267,9 +269,15 @@ fn roundtrip_auth_u32(rows: Rows, key_bytes: Vec<u8>) -> bool {
     let mut scratch = WireScratch::for_store(&store);
     let limits = FrameLimits::default();
     let mut buf = PacketBuf::for_limits(limits);
-    let packets =
-        Packets::<u32>::auth(sample_header(), &store, &handles, &key, &mut scratch, limits)
-            .expect("ctor");
+    let packets = Packets::<u32>::auth(
+        sample_header(),
+        &store,
+        &handles,
+        &key,
+        &mut scratch,
+        limits,
+    )
+    .expect("ctor");
     let frames = drain_packets(packets, &mut buf);
 
     let mut obs = ObservationBatch::<u32>::with_capacity(handles.len());
@@ -291,9 +299,15 @@ fn tampering_rejects(rows: Rows, byte_idx: usize) -> bool {
     let mut scratch = WireScratch::for_store(&store);
     let limits = FrameLimits::default();
     let mut buf = PacketBuf::for_limits(limits);
-    let packets =
-        Packets::<u32>::auth(sample_header(), &store, &handles, &key, &mut scratch, limits)
-            .expect("ctor");
+    let packets = Packets::<u32>::auth(
+        sample_header(),
+        &store,
+        &handles,
+        &key,
+        &mut scratch,
+        limits,
+    )
+    .expect("ctor");
     let mut frames = drain_packets(packets, &mut buf);
     if frames.is_empty() {
         return true;
@@ -331,15 +345,15 @@ fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
     let mut obs = ObservationBatch::<u32>::with_capacity(n as usize);
     let mut sink = DeltaSink::<u32>::with_capacity(n as usize);
     for i in 0..n {
-        obs.push(
-            0xAA_u128, // single shared rule fingerprint
-            KeyHash(0xBEEF + i as u128),
-            0,
-            NodeId(0x1_0000 + i as u128), // distinct origin per row
-            1,
-            1 + i,
-            1_000 + i as u64,
-        );
+        obs.push(Observation {
+            rule_fingerprint: 0xAA_u128, // single shared rule fingerprint
+            key_hash: KeyHash(0xBEEF + i as u128),
+            bucket: 0,
+            origin: NodeId(0x1_0000 + i as u128), // distinct origin per row
+            incarnation: 1,
+            count: 1 + i,
+            last_update_millis: 1_000 + i as u64,
+        });
     }
     store.merge_remote(&obs, &mut sink);
     let handles: Vec<CellHandle> = store.active_handles().collect();
@@ -358,17 +372,20 @@ fn packets_split_on_intern_cap() {
         max_cells: 4096,
     };
     let mut buf = PacketBuf::for_limits(limits);
-    let packets =
-        Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-            .expect("ctor");
+    let packets = Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+        .expect("ctor");
     let frames = drain_packets(packets, &mut buf);
-    assert!(frames.len() >= 2, "expected ≥2 packets, got {}", frames.len());
+    assert!(
+        frames.len() >= 2,
+        "expected ≥2 packets, got {}",
+        frames.len()
+    );
 
     let mut total_cells = 0_u32;
     for (i, frame) in frames.iter().enumerate() {
         let mut cells: Vec<WireCell<u32>> = Vec::new();
-        let summary = decode_unauth_visit::<u32>(frame, limits, |_| true, |c| cells.push(c))
-            .expect("decode");
+        let summary =
+            decode_unauth_visit::<u32>(frame, limits, |_| true, |c| cells.push(c)).expect("decode");
         // Each packet must declare a node_dict with <=255 slots; reading
         // the body re-validates this via slot-index bounds checks during
         // the visit above, which never panicked. As a stronger structural
@@ -406,18 +423,21 @@ fn packets_split_on_udp_budget() {
     };
     let mut scratch = WireScratch::for_store(&store);
     let mut buf = PacketBuf::for_limits(limits);
-    let packets =
-        Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-            .expect("ctor");
+    let packets = Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+        .expect("ctor");
     let frames = drain_packets(packets, &mut buf);
-    assert!(frames.len() >= 2, "expected ≥2 packets, got {}", frames.len());
+    assert!(
+        frames.len() >= 2,
+        "expected ≥2 packets, got {}",
+        frames.len()
+    );
 
     let mut total_cells = 0_u32;
     for (i, frame) in frames.iter().enumerate() {
         assert!(frame.len() <= limits.max_payload_bytes);
         let mut cells: Vec<WireCell<u32>> = Vec::new();
-        let summary = decode_unauth_visit::<u32>(frame, limits, |_| true, |c| cells.push(c))
-            .expect("decode");
+        let summary =
+            decode_unauth_visit::<u32>(frame, limits, |_| true, |c| cells.push(c)).expect("decode");
         total_cells += cells.len() as u32;
         let last = i + 1 == frames.len();
         let more = summary.flags & FLAG_MORE != 0;
@@ -462,9 +482,8 @@ fn mid_batch_packet_decodes_in_isolation() {
     let limits = FrameLimits::default();
     let mut scratch = WireScratch::for_store(&store);
     let mut buf = PacketBuf::for_limits(limits);
-    let packets =
-        Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-            .expect("ctor");
+    let packets = Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+        .expect("ctor");
     let frames = drain_packets(packets, &mut buf);
     assert!(frames.len() >= 2);
 
@@ -574,9 +593,8 @@ fn packets_drop_undrained_panics_in_debug() {
     let (store, handles) = seed_store::<u32>(&rows, |c| c);
     let limits = FrameLimits::default();
     let mut scratch = WireScratch::for_store(&store);
-    let _packets =
-        Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-            .expect("ctor");
+    let _packets = Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+        .expect("ctor");
     // Drop without calling next_into — Drop's debug-assert must fire.
 }
 
@@ -667,13 +685,9 @@ fn visitor_accept_header_short_circuit() {
         assert_eq!(packets.remaining(), 0);
     }
     let mut visited = 0_usize;
-    let _summary: DecodedSummary = decode_unauth_visit::<u32>(
-        buf.as_bytes(),
-        limits,
-        |_h| false,
-        |_c| visited += 1,
-    )
-    .expect("decode");
+    let _summary: DecodedSummary =
+        decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_h| false, |_c| visited += 1)
+            .expect("decode");
     assert_eq!(visited, 0);
 }
 
@@ -747,9 +761,15 @@ fn header_flags_track_auth() {
     let mut scratch = WireScratch::for_store(&store);
     let mut buf = PacketBuf::for_limits(limits);
     {
-        let mut packets =
-            Packets::<u32>::auth(sample_header(), &store, &handles, &key, &mut scratch, limits)
-                .expect("ctor");
+        let mut packets = Packets::<u32>::auth(
+            sample_header(),
+            &store,
+            &handles,
+            &key,
+            &mut scratch,
+            limits,
+        )
+        .expect("ctor");
         let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
         assert_eq!(pkt.flags & FLAG_AUTHENTICATED, FLAG_AUTHENTICATED);
         assert_eq!(pkt.flags & FLAG_MORE, 0);
@@ -758,7 +778,10 @@ fn header_flags_track_auth() {
 
     let mut obs = ObservationBatch::<u32>::with_capacity(2);
     let summary = decode_auth::<u32>(buf.as_bytes(), &key, limits, &mut obs).expect("decode");
-    assert_eq!(summary.header.flags & FLAG_AUTHENTICATED, FLAG_AUTHENTICATED);
+    assert_eq!(
+        summary.header.flags & FLAG_AUTHENTICATED,
+        FLAG_AUTHENTICATED
+    );
     assert_eq!(summary.flags & FLAG_MORE, 0);
 }
 
@@ -781,22 +804,23 @@ fn auth_visit_works() {
     let mut scratch = WireScratch::for_store(&store);
     let mut buf = PacketBuf::for_limits(limits);
     {
-        let mut packets =
-            Packets::<u32>::auth(sample_header(), &store, &handles, &key, &mut scratch, limits)
-                .expect("ctor");
+        let mut packets = Packets::<u32>::auth(
+            sample_header(),
+            &store,
+            &handles,
+            &key,
+            &mut scratch,
+            limits,
+        )
+        .expect("ctor");
         packets.next_into(&mut buf).expect("encode").expect("some");
         assert_eq!(packets.remaining(), 0);
     }
 
     let mut count = 0_usize;
-    let summary = decode_auth_visit::<u32>(
-        buf.as_bytes(),
-        &key,
-        limits,
-        |_h| true,
-        |_c| count += 1,
-    )
-    .expect("decode");
+    let summary =
+        decode_auth_visit::<u32>(buf.as_bytes(), &key, limits, |_h| true, |_c| count += 1)
+            .expect("decode");
     assert_eq!(count, summary.cell_count as usize);
     assert_eq!(count, rows.len());
 }

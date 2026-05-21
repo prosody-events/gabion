@@ -39,9 +39,11 @@ impl CellIndex {
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
+
     pub fn len(&self) -> u32 {
         self.len
     }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -165,7 +167,9 @@ impl CellIndex {
     }
 
     pub fn clear(&mut self) {
-        self.slot_indexes.iter_mut().for_each(|s| *s = EMPTY_INDEX_SLOT);
+        self.slot_indexes
+            .iter_mut()
+            .for_each(|s| *s = EMPTY_INDEX_SLOT);
         self.hashes.iter_mut().for_each(|h| *h = 0);
         self.len = 0;
     }

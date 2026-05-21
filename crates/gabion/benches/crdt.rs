@@ -3,36 +3,32 @@
 //! Each scenario models a state a production rate-limiter actually sits in,
 //! rather than abstract "warm vs cold" knobs:
 //!
-//! * `ingest_local/steady_state`  — 95% updates on existing cells + 5%
-//!                                  inserts; traffic Pareto-distributed
-//!                                  across 8 rules and 4 active buckets.
+//! * `ingest_local/steady_state`  — 95% updates on existing cells + 5% inserts;
+//!   traffic Pareto-distributed across 8 rules and 4 active buckets.
 //! * `ingest_local/traffic_burst` — 99% updates on a tight hot subset; a
-//!                                  Slashdot/spike pattern under one rule.
-//! * `ingest_local/cold_start`    — empty store filling under realistic
-//!                                  key distribution (per-window startup).
+//!   Slashdot/spike pattern under one rule.
+//! * `ingest_local/cold_start`    — empty store filling under realistic key
+//!   distribution (per-window startup).
 //!
 //! * `merge_remote/digest_repair` — what a digest-driven repair frame looks
-//!                                  like: 50% no-op (we are ahead) + 40%
-//!                                  real update + 10% insert, across 8
-//!                                  peers.
-//! * `merge_remote/bulk_fan_in`   — multiple peers gossiping overlapping
-//!                                  cells (max-merge collapses duplicates).
+//!   like: 50% no-op (we are ahead) + 40% real update + 10% insert, across 8
+//!   peers.
+//! * `merge_remote/bulk_fan_in`   — multiple peers gossiping overlapping cells
+//!   (max-merge collapses duplicates).
 //! * `merge_remote/all_noop`      — peer is behind us on every row.
 //!
 //! * `find/realistic_95_hit`      — what the rate-limit aggregator does on
-//!                                  every request: 95% of queries hit an
-//!                                  existing cell.
+//!   every request: 95% of queries hit an existing cell.
 //! * `find/miss`                  — pure miss path, for the Robin Hood
-//!                                  early-exit baseline.
+//!   early-exit baseline.
 //!
 //! * `fill_gossip_frame/steady_state` — moderately loaded node: some dirty
-//!                                      entries + repair lane filling the
-//!                                      rest of a 128-cell frame budget.
-//! * `fill_gossip_frame/repair_only`  — dirty rings empty (gossip went
-//!                                      idle); pure repair sweep.
+//!   entries + repair lane filling the rest of a 128-cell frame budget.
+//! * `fill_gossip_frame/repair_only`  — dirty rings empty (gossip went idle);
+//!   pure repair sweep.
 //!
-//! * `expire/window_turnover`     — one bucket out of four ages out per
-//!                                  call; the steady-state expiry pattern.
+//! * `expire/window_turnover`     — one bucket out of four ages out per call;
+//!   the steady-state expiry pattern.
 //! * `expire/no_expirations`      — scan-only cost, no frees.
 
 use std::hint::black_box;
@@ -41,8 +37,32 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 
 use gabion::crdt::{
     BucketEpoch, CellHandle, CellStore, CellStoreConfig, CompactCellKey, DeltaSink, ExpirationSink,
-    Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, ObservationBatch, RuleDescriptor,
+    Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
+    RuleDescriptor,
 };
+
+/// Build an `Observation` row with positional args. Used by the bench
+/// fixtures, where the field-named struct literal would be very verbose.
+#[inline]
+fn obs_row(
+    rule_fingerprint: u128,
+    key_hash: KeyHash,
+    bucket: BucketEpoch,
+    origin: NodeId,
+    incarnation: Incarnation,
+    count: u32,
+    last_update_millis: u64,
+) -> Observation<u32> {
+    Observation {
+        rule_fingerprint,
+        key_hash,
+        bucket,
+        origin,
+        incarnation,
+        count,
+        last_update_millis,
+    }
+}
 use gabion::wire::{FrameLimits, Header, PacketBuf, Packets, WireScratch, decode_unauth};
 
 // ---------------------------------------------------------------------------
@@ -190,7 +210,7 @@ fn seed_local(
         let key = keys[i % keys.len()];
         let rule_idx = pick_rule(&mut rng) as usize;
         let bucket = pick_bucket(&mut rng);
-        obs.push(
+        obs.push(obs_row(
             rule_fps[rule_idx],
             KeyHash(key),
             bucket,
@@ -198,7 +218,7 @@ fn seed_local(
             LOCAL_INCARNATION,
             1,
             0,
-        );
+        ));
     }
     store.ingest_local(&obs, &mut sink);
 }
@@ -220,7 +240,7 @@ fn seed_remote(
     let mut rows = Vec::with_capacity(count);
     for i in 0..count {
         let key = keys[i % keys.len()];
-        let rule_idx = pick_rule(&mut rng) as u32;
+        let rule_idx = pick_rule(&mut rng);
         let bucket = pick_bucket(&mut rng);
         let peer_idx = (i % peers.len()) as u32;
         let (origin, inc) = peers[peer_idx as usize];
@@ -230,7 +250,7 @@ fn seed_remote(
             bucket,
             peer_idx,
         });
-        obs.push(
+        obs.push(obs_row(
             rule_fps[rule_idx as usize],
             KeyHash(key),
             bucket,
@@ -238,7 +258,7 @@ fn seed_remote(
             inc,
             initial_count,
             0,
-        );
+        ));
     }
     store.merge_remote(&obs, &mut sink);
     rows
@@ -298,7 +318,7 @@ fn build_fixture() -> Fixture {
     // Seed half the capacity with local cells: all hot keys + half the
     // warm keys. ~4608 cells out of 16384 capacity, leaving room for
     // cold-insert tails and remote merges to grow the population.
-    let mut local_seed: Vec<u128> = hot_keys.iter().copied().collect();
+    let mut local_seed: Vec<u128> = hot_keys.to_vec();
     local_seed.extend(warm_keys.iter().take(WARM_KEYS / 2).copied());
     seed_local(
         &mut store,
@@ -368,7 +388,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                         };
                         let rule_idx = pick_rule(rng) as usize;
                         let bucket = pick_bucket(rng);
-                        obs.push(
+                        obs.push(obs_row(
                             fixture.rule_fps[rule_idx],
                             KeyHash(key),
                             bucket,
@@ -376,7 +396,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                             LOCAL_INCARNATION,
                             1,
                             0,
-                        );
+                        ));
                     }
                     store.ingest_local(black_box(obs), black_box(sink));
                 },
@@ -403,7 +423,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                 sink.clear();
                 for _ in 0..batch {
                     let key = burst_keys[rng.range(burst_keys.len() as u32) as usize];
-                    obs.push(
+                    obs.push(obs_row(
                         fixture.rule_fps[0],
                         KeyHash(key),
                         0,
@@ -411,7 +431,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                         LOCAL_INCARNATION,
                         1,
                         0,
-                    );
+                    ));
                 }
                 store.ingest_local(black_box(&obs), black_box(&mut sink));
             });
@@ -444,7 +464,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                 for _ in 0..32 {
                     let rule_idx = pick_rule(rng) as usize;
                     let bucket = pick_bucket(rng);
-                    obs.push(
+                    obs.push(obs_row(
                         empty.1[rule_idx],
                         KeyHash(fresh_key(rng)),
                         bucket,
@@ -452,7 +472,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                         LOCAL_INCARNATION,
                         1,
                         0,
-                    );
+                    ));
                 }
                 store.ingest_local(black_box(obs), black_box(sink));
             },
@@ -512,7 +532,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                             (fresh_key(rng), r, b, peer, 1_u32)
                         };
                         let (origin, inc) = fixture.peers[peer_idx as usize];
-                        obs.push(
+                        obs.push(obs_row(
                             fixture.rule_fps[rule_idx as usize],
                             KeyHash(key),
                             bucket,
@@ -520,7 +540,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                             inc,
                             count,
                             0,
-                        );
+                        ));
                     }
                     store.merge_remote(black_box(obs), black_box(sink));
                 },
@@ -551,7 +571,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                         fixture.remote_rows[rng.range(fixture.remote_rows.len() as u32) as usize];
                     let peer_idx = rng.range(fixture.peers.len() as u32);
                     let (origin, inc) = fixture.peers[peer_idx as usize];
-                    obs.push(
+                    obs.push(obs_row(
                         fixture.rule_fps[row.rule_idx as usize],
                         KeyHash(row.key),
                         row.bucket,
@@ -559,7 +579,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                         inc,
                         counter,
                         0,
-                    );
+                    ));
                 }
                 counter = counter.wrapping_add(1).max(200);
                 store.merge_remote(black_box(&obs), black_box(&mut sink));
@@ -582,7 +602,7 @@ fn bench_merge_remote(c: &mut Criterion) {
             for _ in 0..128 {
                 let row = fixture.remote_rows[rng.range(fixture.remote_rows.len() as u32) as usize];
                 let (origin, inc) = fixture.peers[row.peer_idx as usize];
-                obs.push(
+                obs.push(obs_row(
                     fixture.rule_fps[row.rule_idx as usize],
                     KeyHash(row.key),
                     row.bucket,
@@ -590,7 +610,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                     inc,
                     1, // ≪ stored 100 ⇒ no-op
                     0,
-                );
+                ));
             }
             store.merge_remote(black_box(&obs), black_box(&mut sink));
         });
@@ -688,7 +708,7 @@ fn bench_fill_gossip_frame(c: &mut Criterion) {
         for _ in 0..64 {
             let key = pareto_key(&mut rng, &fixture.hot_keys, &fixture.warm_keys);
             let rule_idx = pick_rule(&mut rng) as usize;
-            obs.push(
+            obs.push(obs_row(
                 fixture.rule_fps[rule_idx],
                 KeyHash(key),
                 0,
@@ -696,7 +716,7 @@ fn bench_fill_gossip_frame(c: &mut Criterion) {
                 LOCAL_INCARNATION,
                 1,
                 0,
-            );
+            ));
         }
         steady.ingest_local(&obs, &mut sink);
     }
@@ -870,7 +890,8 @@ fn bench_wire(c: &mut Criterion) {
         }
         assert!(
             n_packets > 1,
-            "encode_multi_packet_4096 emitted only {n_packets} packet(s); raise the cell count or lower max_payload_bytes",
+            "encode_multi_packet_4096 emitted only {n_packets} packet(s); raise the cell count or \
+             lower max_payload_bytes",
         );
     }
     group.throughput(Throughput::Elements(multi_handles.len() as u64));

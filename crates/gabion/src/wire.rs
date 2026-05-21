@@ -14,10 +14,10 @@
 //! - Decoders enforce `cell_count <= FrameLimits::max_cells` before any work.
 //! - Authenticated frames reject any header / body / tag mutation before
 //!   decoding the body.
-//! - `count_width` is strict: the decoder's `C: Count` must match the
-//!   sender's exactly.
-//! - Each packet is independently useful — losing packet `k` of a batch
-//!   does not invalidate packet `k+1` or any earlier packet.
+//! - `count_width` is strict: the decoder's `C: Count` must match the sender's
+//!   exactly.
+//! - Each packet is independently useful — losing packet `k` of a batch does
+//!   not invalidate packet `k+1` or any earlier packet.
 //!
 //! Socket I/O, peer selection, and tick scheduling live outside this module.
 
@@ -33,12 +33,10 @@ pub use body::{WireCell, WireScratch};
 pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
 
 use auth::AUTH_TAG_LEN;
-use body::{
-    DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body,
-};
+use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
 use header::{patch_header, read_header};
 
-use crate::crdt::{CellHandle, CellStore, Count, ObservationBatch};
+use crate::crdt::{CellHandle, CellStore, Count, Observation, ObservationBatch};
 
 use thiserror::Error;
 
@@ -258,10 +256,7 @@ impl<'a, C: Count> Packets<'a, C> {
     ///
     /// - `Ok(Some(p))` — one packet ready; send `buf.as_bytes()`.
     /// - `Ok(None)` — iterator exhausted.
-    pub fn next_into(
-        &mut self,
-        buf: &mut PacketBuf,
-    ) -> Result<Option<PacketWritten>, EncodeError> {
+    pub fn next_into(&mut self, buf: &mut PacketBuf) -> Result<Option<PacketWritten>, EncodeError> {
         buf.inner.clear();
         if self.cursor >= self.handles.len() {
             return Ok(None);
@@ -344,17 +339,13 @@ pub fn decode_unauth<C: Count>(
     limits: FrameLimits,
     obs: &mut ObservationBatch<C>,
 ) -> Result<DecodedSummary, DecodeError> {
-    decode_inner(bytes, None, limits, |_| true, |cell| {
-        obs.push(
-            cell.rule_fingerprint,
-            cell.key_hash,
-            cell.bucket,
-            cell.origin_node_id,
-            cell.origin_incarnation,
-            cell.count,
-            cell.last_update_millis,
-        );
-    })
+    decode_inner(
+        bytes,
+        None,
+        limits,
+        |_| true,
+        |cell| obs.push(observation_from_wire(cell)),
+    )
 }
 
 pub fn decode_auth<C: Count>(
@@ -363,17 +354,26 @@ pub fn decode_auth<C: Count>(
     limits: FrameLimits,
     obs: &mut ObservationBatch<C>,
 ) -> Result<DecodedSummary, DecodeError> {
-    decode_inner(bytes, Some(key), limits, |_| true, |cell| {
-        obs.push(
-            cell.rule_fingerprint,
-            cell.key_hash,
-            cell.bucket,
-            cell.origin_node_id,
-            cell.origin_incarnation,
-            cell.count,
-            cell.last_update_millis,
-        );
-    })
+    decode_inner(
+        bytes,
+        Some(key),
+        limits,
+        |_| true,
+        |cell| obs.push(observation_from_wire(cell)),
+    )
+}
+
+#[inline]
+fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
+    Observation {
+        rule_fingerprint: cell.rule_fingerprint,
+        key_hash: cell.key_hash,
+        bucket: cell.bucket,
+        origin: cell.origin_node_id,
+        incarnation: cell.origin_incarnation,
+        count: cell.count,
+        last_update_millis: cell.last_update_millis,
+    }
 }
 
 pub fn decode_unauth_visit<C: Count>(

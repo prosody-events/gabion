@@ -29,6 +29,7 @@ impl PeerFrontierTable {
     pub fn peer_capacity(&self) -> u16 {
         self.peer_capacity
     }
+
     pub fn node_capacity(&self) -> u16 {
         self.node_capacity
     }
@@ -72,15 +73,18 @@ impl PeerFrontierTable {
     pub fn last_acked(&self, peer_slot: u16, node_slot: NodeSlot) -> u64 {
         self.last_acked_seq[self.flat_index(peer_slot, node_slot)]
     }
+
     pub fn last_sent(&self, peer_slot: u16, node_slot: NodeSlot) -> u64 {
         self.last_sent_seq[self.flat_index(peer_slot, node_slot)]
     }
+
     pub fn record_sent(&mut self, peer_slot: u16, node_slot: NodeSlot, sequence: u64) {
         let i = self.flat_index(peer_slot, node_slot);
         if self.last_sent_seq[i] < sequence {
             self.last_sent_seq[i] = sequence;
         }
     }
+
     pub fn record_acked(&mut self, peer_slot: u16, node_slot: NodeSlot, sequence: u64) {
         let i = self.flat_index(peer_slot, node_slot);
         if self.last_acked_seq[i] < sequence {

@@ -36,7 +36,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 socket2 = "0.6"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "test-util"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tonic = "0.14"
 tracing = "0.1"
 twox-hash = "2.1.2"

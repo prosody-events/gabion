@@ -1,5 +1,5 @@
-use super::*;
 use super::hash::mix64;
+use super::*;
 
 fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
@@ -44,8 +44,10 @@ fn small_store(cell_cap: u32, dirty_cap: usize) -> CellStore<u32> {
     )
 }
 
-fn push_obs<C: Count>(
-    obs: &mut ObservationBatch<C>,
+/// Build an `Observation` row with positional args. Test convenience for the
+/// many fixture rows in this file — production code constructs `Observation`
+/// directly with field names.
+fn observation<C: Count>(
     rule_fp: u128,
     key: u128,
     bucket: BucketEpoch,
@@ -53,16 +55,16 @@ fn push_obs<C: Count>(
     inc: Incarnation,
     count: C,
     ts: u64,
-) {
-    obs.push(
-        rule_fp,
-        KeyHash(key),
+) -> Observation<C> {
+    Observation {
+        rule_fingerprint: rule_fp,
+        key_hash: KeyHash(key),
         bucket,
-        NodeId(origin),
-        inc,
+        origin: NodeId(origin),
+        incarnation: inc,
         count,
-        ts,
-    );
+        last_update_millis: ts,
+    }
 }
 
 fn remote_merge_one(
@@ -75,7 +77,7 @@ fn remote_merge_one(
 ) -> CellHandle {
     let mut obs = ObservationBatch::with_capacity(1);
     let mut sink = DeltaSink::with_capacity(1);
-    push_obs(&mut obs, rule_fp, 0xabc, 0, origin, inc, count, ts);
+    obs.push(observation(rule_fp, 0xabc, 0, origin, inc, count, ts));
     store.merge_remote(&obs, &mut sink);
     // A no-op merge (count <= stored) leaves the sink empty; recover the
     // handle via key lookup instead.
@@ -107,8 +109,7 @@ fn local_increment_one(
 ) -> CellHandle {
     let mut obs = ObservationBatch::with_capacity(1);
     let mut sink = DeltaSink::with_capacity(1);
-    push_obs(
-        &mut obs,
+    obs.push(observation(
         rule_fp,
         key,
         bucket,
@@ -116,7 +117,7 @@ fn local_increment_one(
         local().incarnation,
         hits,
         ts,
-    );
+    ));
     store.ingest_local(&obs, &mut sink);
     if let Some(handle) = sink.handles.first().copied() {
         return handle;
@@ -144,7 +145,7 @@ fn merge_remote_is_monotonic() {
     let mut sink = DeltaSink::with_capacity(4);
 
     let mut obs = ObservationBatch::with_capacity(1);
-    push_obs(&mut obs, 0x11, 0xabc, 0, 7, 1, 5, 100);
+    obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 100));
     store.merge_remote(&obs, &mut sink);
     assert_eq!(sink.len(), 1);
     let handle = sink.handles[0];
@@ -154,14 +155,14 @@ fn merge_remote_is_monotonic() {
     // Stale (3 < 5) — no delta.
     sink.clear();
     let mut obs2 = ObservationBatch::with_capacity(1);
-    push_obs(&mut obs2, 0x11, 0xabc, 0, 7, 1, 3, 200);
+    obs2.push(observation(0x11, 0xabc, 0, 7, 1, 3, 200));
     store.merge_remote(&obs2, &mut sink);
     assert_eq!(sink.len(), 0);
 
     // Higher (8 > 5) — delta of 3.
     sink.clear();
     let mut obs3 = ObservationBatch::with_capacity(1);
-    push_obs(&mut obs3, 0x11, 0xabc, 0, 7, 1, 8, 300);
+    obs3.push(observation(0x11, 0xabc, 0, 7, 1, 8, 300));
     store.merge_remote(&obs3, &mut sink);
     assert_eq!(sink.len(), 1);
     assert_eq!(sink.previous[0], 5);
@@ -224,10 +225,10 @@ fn capacity_is_enforced_without_growing() {
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(2);
     let mut a = ObservationBatch::with_capacity(1);
-    push_obs(&mut a, 0x11, 0xabc, 0, 1, 1, 1, 0);
+    a.push(observation(0x11, 0xabc, 0, 1, 1, 1, 0));
     store.merge_remote(&a, &mut sink);
     let mut b = ObservationBatch::with_capacity(1);
-    push_obs(&mut b, 0x11, 0xabc, 0, 2, 1, 1, 0);
+    b.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
     sink.clear();
     store.merge_remote(&b, &mut sink);
     assert_eq!(sink.len(), 0); // second insert was rejected
@@ -351,17 +352,33 @@ fn repair_slice_rotates_across_active_cells() {
 
     let mut out = Vec::with_capacity(1);
     store.fill_gossip_frame(1, &mut out);
-    let first =
-        store.node_dictionary().descriptor(store.get(out[0]).unwrap().key.origin).unwrap().node_id.0;
+    let first = store
+        .node_dictionary()
+        .descriptor(store.get(out[0]).unwrap().key.origin)
+        .unwrap()
+        .node_id
+        .0;
     store.fill_gossip_frame(1, &mut out);
-    let second =
-        store.node_dictionary().descriptor(store.get(out[0]).unwrap().key.origin).unwrap().node_id.0;
+    let second = store
+        .node_dictionary()
+        .descriptor(store.get(out[0]).unwrap().key.origin)
+        .unwrap()
+        .node_id
+        .0;
     store.fill_gossip_frame(1, &mut out);
-    let third =
-        store.node_dictionary().descriptor(store.get(out[0]).unwrap().key.origin).unwrap().node_id.0;
+    let third = store
+        .node_dictionary()
+        .descriptor(store.get(out[0]).unwrap().key.origin)
+        .unwrap()
+        .node_id
+        .0;
     store.fill_gossip_frame(1, &mut out);
-    let fourth =
-        store.node_dictionary().descriptor(store.get(out[0]).unwrap().key.origin).unwrap().node_id.0;
+    let fourth = store
+        .node_dictionary()
+        .descriptor(store.get(out[0]).unwrap().key.origin)
+        .unwrap()
+        .node_id
+        .0;
 
     let mut seen = vec![first, second, third];
     seen.sort();
@@ -378,16 +395,16 @@ fn delta_sink_records_exact_raises() {
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(4);
     let mut obs = ObservationBatch::with_capacity(2);
-    push_obs(&mut obs, 0x11, 0xabc, 0, 1, 1, 5, 0);
-    push_obs(&mut obs, 0x11, 0xabc, 0, 2, 1, 7, 0);
+    obs.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
+    obs.push(observation(0x11, 0xabc, 0, 2, 1, 7, 0));
     store.merge_remote(&obs, &mut sink);
     assert_eq!(sink.len(), 2);
 
     sink.clear();
     // No-op merges (count <= stored) produce nothing.
     let mut obs2 = ObservationBatch::with_capacity(2);
-    push_obs(&mut obs2, 0x11, 0xabc, 0, 1, 1, 5, 0);
-    push_obs(&mut obs2, 0x11, 0xabc, 0, 2, 1, 1, 0);
+    obs2.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
+    obs2.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
     store.merge_remote(&obs2, &mut sink);
     assert_eq!(sink.len(), 0);
 }
@@ -399,8 +416,8 @@ fn delta_applies_locally_reflects_rule_dictionary() {
     // 0x22 fingerprint unknown locally.
     let mut sink = DeltaSink::with_capacity(2);
     let mut obs = ObservationBatch::with_capacity(2);
-    push_obs(&mut obs, 0x11, 0xabc, 0, 9, 1, 1, 0);
-    push_obs(&mut obs, 0x22, 0xabc, 0, 9, 1, 1, 0);
+    obs.push(observation(0x11, 0xabc, 0, 9, 1, 1, 0));
+    obs.push(observation(0x22, 0xabc, 0, 9, 1, 1, 0));
     store.merge_remote(&obs, &mut sink);
     assert_eq!(sink.len(), 2);
     assert_eq!(sink.applies_locally[0], 1);
@@ -421,7 +438,7 @@ fn unknown_rule_cells_round_trip() {
 
     let mut sink = DeltaSink::with_capacity(1);
     let mut obs = ObservationBatch::with_capacity(1);
-    push_obs(&mut obs, 0x33, 0xabc, 0, 5, 1, 30, 2);
+    obs.push(observation(0x33, 0xabc, 0, 5, 1, 30, 2));
     store.merge_remote(&obs, &mut sink);
     assert_eq!(sink.applies_locally[0], 0);
 
@@ -430,7 +447,8 @@ fn unknown_rule_cells_round_trip() {
     let mut live = vec![0_u32; cur.len()];
     cur[row.key.rule as usize] = 5;
     live[row.key.rule as usize] = 0;
-    store.expire(&cur, &live);
+    let mut exp = ExpirationSink::<u32>::with_capacity(1);
+    store.expire(&cur, &live, &mut exp);
     assert_eq!(store.active_len(), 0);
 }
 
@@ -465,7 +483,8 @@ fn dictionary_refcount_frees_unreferenced_slots() {
     let mut live = vec![0_u32; cur.len()];
     cur[rule_slot as usize] = 5;
     live[rule_slot as usize] = 0;
-    store.expire(&cur, &live);
+    let mut exp = ExpirationSink::<u32>::with_capacity(1);
+    store.expire(&cur, &live, &mut exp);
     assert_eq!(store.active_len(), 0);
     // Refcounts return to 0 on both dictionaries; the corresponding slot
     // entries are freed and `descriptor()` reports None.
@@ -494,7 +513,7 @@ fn dictionary_full_rejects_with_counter() {
     assert!(store.get(h1).is_some());
     let mut sink = DeltaSink::with_capacity(1);
     let mut obs = ObservationBatch::with_capacity(1);
-    push_obs(&mut obs, 0x20, 0xabc, 0, 3, 1, 1, 0);
+    obs.push(observation(0x20, 0xabc, 0, 3, 1, 1, 0));
     store.merge_remote(&obs, &mut sink);
     assert_eq!(sink.len(), 0);
     assert!(store.stats().rule_dictionary_full_rejects >= 1);
@@ -657,26 +676,32 @@ fn node_slot_reuse_clears_frontier_rows() {
     store
         .peer_frontiers_mut()
         .record_acked(peer_slot, original_slot, 99);
-    store.peer_frontiers_mut().record_sent(peer_slot, original_slot, 88);
+    store
+        .peer_frontiers_mut()
+        .record_sent(peer_slot, original_slot, 88);
 
     // Expire the cell — node slot freed (rule was pre-interned, stays).
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
     let mut live = vec![0_u32; cur.len()];
     cur[row.key.rule as usize] = 5;
     live[row.key.rule as usize] = 0;
-    store.expire(&cur, &live);
+    let mut exp = ExpirationSink::<u32>::with_capacity(1);
+    store.expire(&cur, &live, &mut exp);
 
     // The slot is now free. Frontier rows must be zeroed.
-    assert_eq!(store.peer_frontiers().last_acked(peer_slot, original_slot), 0);
-    assert_eq!(store.peer_frontiers().last_sent(peer_slot, original_slot), 0);
+    assert_eq!(
+        store.peer_frontiers().last_acked(peer_slot, original_slot),
+        0
+    );
+    assert_eq!(
+        store.peer_frontiers().last_sent(peer_slot, original_slot),
+        0
+    );
 
     // Reassign to a different (node_id, incarnation). Since dict allocates
     // from freelist head, this should reuse the same slot.
     let _h2 = remote_merge_one(&mut store, 0x11, 99, 9, 1, 0);
-    let reused_slot = store
-        .node_dictionary()
-        .find(NodeId(99), 9)
-        .unwrap();
+    let reused_slot = store.node_dictionary().find(NodeId(99), 9).unwrap();
     assert_eq!(reused_slot, original_slot);
     // Frontier state must still be zero for the reused slot.
     assert_eq!(store.peer_frontiers().last_acked(peer_slot, reused_slot), 0);
@@ -709,12 +734,28 @@ fn count_widths_compile_and_saturate() {
     s16.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let mut obs = ObservationBatch::<u16>::with_capacity(1);
     let mut sink = DeltaSink::<u16>::with_capacity(1);
-    obs.push(0x11, KeyHash(1), 0, NodeId(1), 1, u16::MAX, 0);
+    obs.push(Observation {
+        rule_fingerprint: 0x11,
+        key_hash: KeyHash(1),
+        bucket: 0,
+        origin: NodeId(1),
+        incarnation: 1,
+        count: u16::MAX,
+        last_update_millis: 0,
+    });
     s16.ingest_local(&obs, &mut sink);
     // Add more hits — should saturate at u16::MAX, no overflow.
     let mut obs2 = ObservationBatch::<u16>::with_capacity(1);
     let mut sink2 = DeltaSink::<u16>::with_capacity(1);
-    obs2.push(0x11, KeyHash(1), 0, NodeId(1), 1, 1, 0);
+    obs2.push(Observation {
+        rule_fingerprint: 0x11,
+        key_hash: KeyHash(1),
+        bucket: 0,
+        origin: NodeId(1),
+        incarnation: 1,
+        count: 1,
+        last_update_millis: 0,
+    });
     s16.ingest_local(&obs2, &mut sink2);
     // No raise because already at MAX.
     assert_eq!(sink2.len(), 0);
@@ -734,7 +775,15 @@ fn count_widths_compile_and_saturate() {
     s64.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let mut obs64 = ObservationBatch::<u64>::with_capacity(1);
     let mut sink64 = DeltaSink::<u64>::with_capacity(1);
-    obs64.push(0x11, KeyHash(1), 0, NodeId(7), 1, 1_000_000_000_000, 0);
+    obs64.push(Observation {
+        rule_fingerprint: 0x11,
+        key_hash: KeyHash(1),
+        bucket: 0,
+        origin: NodeId(7),
+        incarnation: 1,
+        count: 1_000_000_000_000,
+        last_update_millis: 0,
+    });
     s64.merge_remote(&obs64, &mut sink64);
     assert_eq!(sink64.current[0], 1_000_000_000_000);
 }
@@ -752,20 +801,119 @@ fn incarnation_change_isolates() {
 }
 
 #[test]
+fn expire_emits_one_row_per_freed_cell() {
+    // Two rules — one with applies_locally=true (local_rule_id < u32::MAX),
+    // one whose descriptor `applies_locally()` returns false. Two origins.
+    // Drive the doomed cells onto a single rule slot so its refcount falls
+    // to zero — verifying emission happens *before* free_cell_at, since
+    // a post-free descriptor() lookup would otherwise return None for the
+    // doomed cells and applies_locally would silently degrade to false.
+    let mut store = small_store(8, 16);
+    let rule_local = store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let rule_doomed = store
+        .intern_rule(RuleDescriptor {
+            fingerprint: 0x22,
+            window_millis: 1000,
+            bucket_millis: 1000,
+            limit: 1000,
+            flags: 0,
+            local_rule_id: 1,
+        })
+        .unwrap();
+
+    // Surviving cell on rule_local — kept because rule_local's live window
+    // covers every bucket in the test.
+    let _h_keep = remote_merge_one(&mut store, 0x11, 5, 1, 4, 0);
+
+    // Doomed cells: rule_doomed, two origins, bucket 0.
+    let mut obs = ObservationBatch::with_capacity(2);
+    let mut sink = DeltaSink::with_capacity(2);
+    obs.push(observation(0x22, 0xabc, 0, 5, 1, 7, 100));
+    obs.push(observation(0x22, 0xdef, 0, 6, 1, 11, 200));
+    store.merge_remote(&obs, &mut sink);
+
+    let rule_local_slot = store.find_rule(0x11).unwrap();
+    let rule_doomed_slot = store.find_rule(0x22).unwrap();
+    assert_eq!(rule_local_slot, rule_local);
+    assert_eq!(rule_doomed_slot, rule_doomed);
+    let node5 = store.find_node(NodeId(5), 1).unwrap();
+    let node6 = store.find_node(NodeId(6), 1).unwrap();
+    let h_doomed_a = store
+        .find(CompactCellKey {
+            rule: rule_doomed,
+            key_hash: KeyHash(0xabc),
+            bucket: 0,
+            origin: node5,
+            incarnation: 1,
+        })
+        .unwrap();
+    let h_doomed_b = store
+        .find(CompactCellKey {
+            rule: rule_doomed,
+            key_hash: KeyHash(0xdef),
+            bucket: 0,
+            origin: node6,
+            incarnation: 1,
+        })
+        .unwrap();
+
+    let snap_a = store.get(h_doomed_a).unwrap();
+    let snap_b = store.get(h_doomed_b).unwrap();
+    assert_eq!(store.rule_dictionary().refcount(rule_doomed), 2);
+
+    // Build thresholds: doomed cells (bucket 0, live 0, current 5) expire;
+    // the keep cell on rule_local stays because its rule lives 1000 buckets.
+    let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
+    let mut live = vec![0_u32; cur.len()];
+    cur[rule_doomed as usize] = 5;
+    live[rule_doomed as usize] = 0;
+    cur[rule_local as usize] = 0;
+    live[rule_local as usize] = 1000;
+
+    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    store.expire(&cur, &live, &mut exp);
+
+    assert_eq!(store.active_len(), 1);
+    assert_eq!(exp.len(), 2);
+
+    // Rule descriptor for the doomed slot should now be gone (refcount hit 0)
+    // — proving emission ran *before* free_cell_at, since the rows captured
+    // applies_locally=true from the live descriptor.
+    assert_eq!(store.rule_dictionary().refcount(rule_doomed), 0);
+    assert!(store.rule_dictionary().descriptor(rule_doomed).is_none());
+
+    let mut rows: Vec<CellExpiration<u32>> = (0..exp.len()).map(|i| exp.row(i).unwrap()).collect();
+    rows.sort_by_key(|r| r.handle.index);
+    let mut expected = [snap_a, snap_b];
+    expected.sort_by_key(|r| r.handle.index);
+    for (got, snap) in rows.iter().zip(expected.iter()) {
+        assert_eq!(got.handle, snap.handle);
+        assert_eq!(got.key, snap.key);
+        assert_eq!(got.last_count, snap.count);
+        assert_eq!(got.last_update_millis, snap.last_update_millis);
+        assert!(got.applies_locally);
+    }
+}
+
+#[test]
 fn expire_frees_slots_and_dictionary_refs() {
     let mut store = small_store(4, 4);
     let rule_slot = store.intern_rule(rule_descriptor(0xCC, 1)).unwrap();
     let _h = remote_merge_one(&mut store, 0xCC, 100, 1, 5, 0);
     assert_eq!(store.active_len(), 1);
-    assert_eq!(store.node_dictionary().refcount(
-        store.node_dictionary().find(NodeId(100), 1).unwrap()
-    ), 1);
+    assert_eq!(
+        store
+            .node_dictionary()
+            .refcount(store.node_dictionary().find(NodeId(100), 1).unwrap()),
+        1
+    );
 
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
     let mut live = vec![0_u32; cur.len()];
     cur[rule_slot as usize] = 5;
     live[rule_slot as usize] = 0;
-    store.expire(&cur, &live);
+    let mut exp = ExpirationSink::<u32>::with_capacity(1);
+    store.expire(&cur, &live, &mut exp);
     assert_eq!(store.active_len(), 0);
     // Node dictionary no longer holds the (NodeId(100), 1) entry.
     assert!(store.node_dictionary().find(NodeId(100), 1).is_none());
@@ -804,4 +952,82 @@ fn selection_epoch_wraparound_resets_marks() {
     // mark_selected on a freshly-zeroed slot succeeds against epoch 1.
     assert!(store.mark_selected(0));
     assert_eq!(store.selection_marks[0], 1);
+}
+
+#[test]
+fn expire_at_and_expire_agree_for_same_now() {
+    let mk = || {
+        let mut s = small_store(8, 8);
+        s.intern_rule(RuleDescriptor {
+            fingerprint: 0x11,
+            window_millis: 100,
+            bucket_millis: 50,
+            limit: 10,
+            flags: 0,
+            local_rule_id: 1,
+        })
+        .unwrap();
+        // Seed two cells: one at bucket 0 (will expire), one at bucket 5
+        // (still inside the live window for now=300 -> current=6, live=2).
+        let mut obs = ObservationBatch::with_capacity(2);
+        let mut sink = DeltaSink::with_capacity(2);
+        obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
+        obs.push(observation(0x11, 0xdef, 5, 8, 1, 5, 250));
+        s.merge_remote(&obs, &mut sink);
+        s
+    };
+
+    let now_millis: u64 = 300;
+    // 300/50 = 6, window/bucket = 100/50 = 2 (live buckets)
+    let bucket_millis: u32 = 50;
+    let live = 2_u32;
+    let current = (now_millis / bucket_millis as u64) as u32;
+
+    let mut a = mk();
+    let mut sink_a = ExpirationSink::<u32>::with_capacity(8);
+    a.expire_at(now_millis, &mut sink_a);
+
+    let mut b = mk();
+    let dict_cap = b.rule_dictionary().capacity() as usize;
+    let mut cur = vec![0_u32; dict_cap];
+    let mut lv = vec![0_u32; dict_cap];
+    let rule_slot = b.find_rule(0x11).unwrap();
+    cur[rule_slot as usize] = current;
+    lv[rule_slot as usize] = live;
+    let mut sink_b = ExpirationSink::<u32>::with_capacity(8);
+    b.expire(&cur, &lv, &mut sink_b);
+
+    assert_eq!(sink_a.len(), sink_b.len());
+    assert_eq!(a.active_len(), b.active_len());
+}
+
+#[test]
+fn fill_gossip_frame_for_peer_skips_acked_cells() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+
+    // Seed three cells (three distinct origins).
+    let h1 = remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
+    let h2 = remote_merge_one(&mut store, 0x11, 2, 1, 5, 0);
+    let h3 = remote_merge_one(&mut store, 0x11, 3, 1, 5, 0);
+
+    let row1 = store.get(h1).unwrap();
+    let row2 = store.get(h2).unwrap();
+    let _ = h3; // used only via the frame composition
+
+    // Intern a peer and ack the first two origins through their current
+    // sequences. The third remains unacked.
+    let peer_slot = store.peer_frontiers_mut().intern_peer(NodeId(99)).unwrap();
+    store
+        .peer_frontiers_mut()
+        .record_acked(peer_slot, row1.key.origin, row1.origin_sequence);
+    store
+        .peer_frontiers_mut()
+        .record_acked(peer_slot, row2.key.origin, row2.origin_sequence);
+
+    let mut out = Vec::with_capacity(8);
+    store.fill_gossip_frame_for_peer(8, peer_slot, &mut out);
+    // Only the unacked cell survives the per-peer prune.
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].index, h3.index);
 }

@@ -16,8 +16,9 @@ pub struct RuleDescriptor {
     pub limit: u64,
     pub flags: u32,
     /// `u32::MAX` means the rule is known on the wire only — cells are stored,
-    /// dirty-tracked, and expired the same way, but [`super::CellDelta::applies_locally`]
-    /// is `false` so the local rate-limit aggregator ignores them.
+    /// dirty-tracked, and expired the same way, but
+    /// [`super::CellDelta::applies_locally`] is `false` so the local
+    /// rate-limit aggregator ignores them.
     pub local_rule_id: u32,
 }
 
@@ -82,12 +83,15 @@ impl RuleDictionary {
     pub fn capacity(&self) -> u16 {
         self.capacity
     }
+
     pub fn len(&self) -> u16 {
         self.len
     }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
     pub fn descriptor(&self, slot: RuleSlot) -> Option<&RuleDescriptor> {
         if (slot as u32) < self.capacity as u32 && self.refcounts[slot as usize] > 0 {
             Some(&self.descriptors[slot as usize])
@@ -95,6 +99,7 @@ impl RuleDictionary {
             None
         }
     }
+
     pub fn refcount(&self, slot: RuleSlot) -> u32 {
         self.refcounts.get(slot as usize).copied().unwrap_or(0)
     }
@@ -104,7 +109,9 @@ impl RuleDictionary {
         let h = hash_fingerprint(fingerprint);
         let descriptors = &self.descriptors;
         self.index
-            .find(h, |slot| descriptors[slot as usize].fingerprint == fingerprint)
+            .find(h, |slot| {
+                descriptors[slot as usize].fingerprint == fingerprint
+            })
             .map(|s| s as RuleSlot)
     }
 
@@ -141,7 +148,8 @@ impl RuleDictionary {
         *rc -= 1;
         if *rc == 0 {
             let fingerprint = self.descriptors[slot as usize].fingerprint;
-            self.index.remove(hash_fingerprint(fingerprint), slot as u32);
+            self.index
+                .remove(hash_fingerprint(fingerprint), slot as u32);
             self.descriptors[slot as usize] = RuleDescriptor::default();
             self.free_next[slot as usize] = self.free_head;
             self.free_head = slot;
@@ -200,12 +208,15 @@ impl NodeDictionary {
     pub fn capacity(&self) -> u16 {
         self.capacity
     }
+
     pub fn len(&self) -> u16 {
         self.len
     }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
     pub fn descriptor(&self, slot: NodeSlot) -> Option<&NodeDescriptor> {
         if (slot as u32) < self.capacity as u32 && self.refcounts[slot as usize] > 0 {
             Some(&self.descriptors[slot as usize])
@@ -213,9 +224,11 @@ impl NodeDictionary {
             None
         }
     }
+
     pub fn refcount(&self, slot: NodeSlot) -> u32 {
         self.refcounts.get(slot as usize).copied().unwrap_or(0)
     }
+
     pub fn find(&self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
         let h = hash_node_identity(node_id, incarnation);
         let descriptors = &self.descriptors;
