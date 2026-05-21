@@ -2,8 +2,8 @@
 //! [`ExpirationSink`].
 
 use super::{
-    BucketEpoch, CellDelta, CellExpiration, CellHandle, CompactCellKey, Count, Incarnation,
-    KeyHash, NodeId,
+    BucketEpoch, CellDelta, CellExpiration, CellHandle, CellIdentity, Count, Incarnation, KeyHash,
+    NodeId,
 };
 
 /// One row to push into an [`ObservationBatch`]. Bundled so callers can
@@ -93,7 +93,7 @@ impl<C: Count> ObservationBatch<C> {
 #[derive(Clone, Debug, Default)]
 pub struct DeltaSink<C: Count> {
     pub handles: Vec<CellHandle>,
-    pub keys: Vec<CompactCellKey>,
+    pub keys: Vec<CellIdentity>,
     pub previous: Vec<C>,
     pub current: Vec<C>,
     pub deltas: Vec<C>,
@@ -147,7 +147,7 @@ impl<C: Count> DeltaSink<C> {
     pub(super) fn push(
         &mut self,
         handle: CellHandle,
-        key: CompactCellKey,
+        key: CellIdentity,
         previous: C,
         current: C,
         delta: C,
@@ -168,7 +168,7 @@ impl<C: Count> DeltaSink<C> {
 #[derive(Clone, Debug, Default)]
 pub struct ExpirationSink<C: Count> {
     pub handles: Vec<CellHandle>,
-    pub keys: Vec<CompactCellKey>,
+    pub keys: Vec<CellIdentity>,
     pub last_counts: Vec<C>,
     pub last_update_millis: Vec<u64>,
     /// `0`/`1` flags — kept as a byte column rather than `Vec<bool>`.
@@ -218,7 +218,7 @@ impl<C: Count> ExpirationSink<C> {
     pub(super) fn push(
         &mut self,
         handle: CellHandle,
-        key: CompactCellKey,
+        key: CellIdentity,
         last_count: C,
         last_update_millis: u64,
         applies_locally: bool,

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub mod kubernetes;
 
 pub trait PeerDiscovery {
-    type Error;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn peer_events(self) -> impl Stream<Item = Result<PeerEvent, Self::Error>> + Send;
 }

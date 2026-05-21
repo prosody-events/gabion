@@ -17,9 +17,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::crdt::NodeIdentity;
+use crate::crdt::{CellStoreStats, NodeId, NodeIdentity};
 use crate::wire::{self, FrameLimits, HmacKey};
 
+mod admin;
 mod client;
 mod clock;
 mod runtime;
@@ -30,6 +31,7 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
+pub use admin::{AdminCommand, AdminSnapshot, PeerEntry};
 pub use client::GossipClient;
 pub use clock::{Clock, FixedClock, TokioClock};
 pub use runtime::GossipRuntime;

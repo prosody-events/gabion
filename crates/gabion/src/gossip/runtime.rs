@@ -23,6 +23,7 @@ use crate::crdt::{
 use crate::discovery::PeerEvent;
 use crate::wire::{self, PacketBuf, Packets, WireScratch};
 
+use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
 use super::clock::{Clock, TokioClock};
 use super::store::AggregateStore;
@@ -51,6 +52,11 @@ where
     transport: T,
     clock: K,
     requests_rx: mpsc::Receiver<Request>,
+    /// Optional admin command channel. `None` in embedded / test setups where
+    /// no observability surface is wired up — the matching `select!` arm is
+    /// guarded so the production hot path is byte-identical to the no-admin
+    /// case.
+    admin_rx: Option<mpsc::Receiver<AdminCommand>>,
 
     // Downstream count store (write-only).
     aggregates: S,
@@ -94,7 +100,33 @@ where
         aggregates: S,
     ) -> Result<(Self, GossipClient<C>), GossipError> {
         let transport = UdpTransport::bind(bind_addr).await?;
-        Ok(Self::from_parts(transport, TokioClock::new(), config, store, aggregates))
+        Ok(Self::from_parts(
+            transport,
+            TokioClock::new(),
+            config,
+            store,
+            aggregates,
+        ))
+    }
+
+    /// Like [`Self::bind`] but threads in an admin command channel. The
+    /// admin select arm is only polled when this constructor is used.
+    pub async fn bind_with_admin(
+        bind_addr: SocketAddr,
+        config: GossipConfig,
+        store: CellStore<C>,
+        aggregates: S,
+        admin_rx: mpsc::Receiver<AdminCommand>,
+    ) -> Result<(Self, GossipClient<C>), GossipError> {
+        let transport = UdpTransport::bind(bind_addr).await?;
+        Ok(Self::from_parts_with_admin(
+            transport,
+            TokioClock::new(),
+            config,
+            store,
+            aggregates,
+            Some(admin_rx),
+        ))
     }
 }
 
@@ -106,12 +138,27 @@ where
     K: Clock,
 {
     /// Generic entry point used by tests, simulators, and any non-UDP setup.
+    /// Equivalent to [`Self::from_parts_with_admin`] with `admin_rx = None`.
     pub fn from_parts(
         transport: T,
         clock: K,
         config: GossipConfig,
         store: CellStore<C>,
         aggregates: S,
+    ) -> (Self, GossipClient<C>) {
+        Self::from_parts_with_admin(transport, clock, config, store, aggregates, None)
+    }
+
+    /// Generic entry point with an optional admin command channel. The
+    /// runtime polls the admin arm only when `admin_rx.is_some()`, so the
+    /// no-admin case keeps the original five-arm `select!` shape.
+    pub fn from_parts_with_admin(
+        transport: T,
+        clock: K,
+        config: GossipConfig,
+        store: CellStore<C>,
+        aggregates: S,
+        admin_rx: Option<mpsc::Receiver<AdminCommand>>,
     ) -> (Self, GossipClient<C>) {
         let (req_tx, req_rx) = mpsc::channel(config.limit_queue_capacity);
 
@@ -147,6 +194,7 @@ where
             transport,
             clock,
             requests_rx: req_rx,
+            admin_rx,
             aggregates,
             recv_buf,
             scratch,
@@ -193,6 +241,7 @@ where
             // futures below.
             let have_send = !self.send_pending.is_empty();
             let watch_peers = !peer_events_done;
+            let watch_admin = self.admin_rx.is_some();
 
             let outcome = {
                 // Split-borrow scope: we hand the I/O futures non-overlapping
@@ -201,6 +250,7 @@ where
                     transport,
                     recv_buf,
                     requests_rx,
+                    admin_rx,
                     ..
                 } = &mut self;
 
@@ -211,6 +261,7 @@ where
                     recv = transport.recv_from(recv_buf) => ArmOutcome::Inbound(recv),
                     _ = transport.writable(), if have_send => ArmOutcome::Writable,
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
+                    cmd = recv_admin(admin_rx), if watch_admin => ArmOutcome::Admin(cmd),
                     _ = tick.tick() => ArmOutcome::Tick,
                 }
             };
@@ -225,6 +276,8 @@ where
                 ArmOutcome::Writable => self.drain_one_send()?,
                 ArmOutcome::PeerEvent(Some(evt)) => self.handle_peer_event(evt),
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
+                ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
+                ArmOutcome::Admin(None) => self.admin_rx = None,
                 ArmOutcome::Tick => self.handle_gossip_tick(),
             }
 
@@ -325,6 +378,30 @@ where
             }
         }
         Ok(())
+    }
+
+    fn handle_admin_command(&mut self, cmd: AdminCommand) {
+        match cmd {
+            AdminCommand::Snapshot { reply } => {
+                let snapshot = AdminSnapshot {
+                    local_identity: self.store.local_identity(),
+                    peers: self
+                        .peers
+                        .iter()
+                        .map(|p| PeerEntry {
+                            addr: p.addr,
+                            node_id: p.node_id,
+                        })
+                        .collect(),
+                    store_stats: self.store.stats(),
+                    local_dirty_len: self.store.local_dirty().len(),
+                    forwarded_dirty_len: self.store.forwarded_dirty().len(),
+                    send_pending_depth: self.send_pending.len(),
+                };
+                // Caller may have dropped the receiver; not an error.
+                let _ = reply.send(snapshot);
+            }
+        }
     }
 
     fn handle_peer_event(&mut self, evt: PeerEvent) {
@@ -466,7 +543,14 @@ enum ArmOutcome {
     Inbound(io::Result<(usize, SocketAddr)>),
     Writable,
     PeerEvent(Option<PeerEvent>),
+    Admin(Option<AdminCommand>),
     Tick,
+}
+
+/// Read one admin command. Only invoked when `admin_rx.is_some()` — the
+/// `select!` guard ensures the unwrap is safe.
+async fn recv_admin(rx: &mut Option<mpsc::Receiver<AdminCommand>>) -> Option<AdminCommand> {
+    rx.as_mut().expect("admin arm gated by admin_rx.is_some()").recv().await
 }
 
 fn make_tick(config: &GossipConfig) -> Interval {

@@ -153,7 +153,9 @@ impl Count for u64 {
 }
 
 /// Interned counter identity. All fields are dictionary slots or small ints;
-/// the struct never carries a raw `NodeId` or `RuleId`.
+/// the struct never carries a raw `NodeId` or `RuleId`. Internal to one
+/// process — see [`CellIdentity`] for the portable identity exported through
+/// [`DeltaSink`] / [`ExpirationSink`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CompactCellKey {
     pub rule: RuleSlot,
@@ -161,6 +163,19 @@ pub struct CompactCellKey {
     pub bucket: BucketEpoch,
     pub origin: NodeSlot,
     pub incarnation: Incarnation,
+}
+
+/// Portable cell identity used at the [`AggregateStore`](crate::gossip::AggregateStore)
+/// boundary. The `RuleSlot` interning index is node-local and not meaningful to
+/// downstream stores; `rule_fingerprint` is the same on every node by
+/// construction. Origin identity is intentionally omitted — the aggregate
+/// store keys on the cell's `(rule_fingerprint, key_hash, bucket)` tuple and
+/// has no business interpreting the originator.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct CellIdentity {
+    pub rule_fingerprint: u128,
+    pub key_hash: KeyHash,
+    pub bucket: BucketEpoch,
 }
 
 /// Generation-stamped slot identifier. The `generation` field's low bit
@@ -173,11 +188,14 @@ pub struct CellHandle {
     pub generation: u32,
 }
 
-/// One row appended to [`DeltaSink`] when a stored count rose.
+/// One row appended to [`DeltaSink`] when a stored count rose. The `key`
+/// carries the portable [`CellIdentity`] — downstream aggregate stores key on
+/// `(rule_fingerprint, key_hash, bucket)` without ever seeing a node-local
+/// slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CellDelta<C: Count> {
     pub handle: CellHandle,
-    pub key: CompactCellKey,
+    pub key: CellIdentity,
     pub previous_count: C,
     pub current_count: C,
     pub delta: C,
@@ -188,7 +206,7 @@ pub struct CellDelta<C: Count> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CellExpiration<C: Count> {
     pub handle: CellHandle,
-    pub key: CompactCellKey,
+    pub key: CellIdentity,
     pub last_count: C,
     pub last_update_millis: u64,
     pub applies_locally: bool,
@@ -688,19 +706,23 @@ impl<C: Count> CellStore<C> {
         rule_slot: RuleSlot,
     ) {
         let handle = self.handle_for(slot);
-        let applies_locally = self
+        let descriptor = self
             .rule_dictionary
             .descriptor(rule_slot)
-            .map(|d| d.applies_locally())
-            .unwrap_or(false);
-        let key = CompactCellKey {
-            rule: rule_slot,
+            .expect("rule slot live during emit_delta — pinned by cell refcount");
+        let key = CellIdentity {
+            rule_fingerprint: descriptor.fingerprint,
             key_hash: self.key_hashes[slot as usize],
             bucket: self.buckets[slot as usize],
-            origin: self.origins[slot as usize],
-            incarnation: self.incarnations[slot as usize],
         };
-        sink.push(handle, key, previous, current, delta, applies_locally);
+        sink.push(
+            handle,
+            key,
+            previous,
+            current,
+            delta,
+            descriptor.applies_locally(),
+        );
     }
 
     /// Append a row to the SoA expiration sink. Must run before
@@ -709,24 +731,21 @@ impl<C: Count> CellStore<C> {
     fn emit_expiration(&self, sink: &mut ExpirationSink<C>, slot: u32) {
         let rule_slot = self.rules[slot as usize];
         let handle = self.handle_for(slot);
-        let applies_locally = self
+        let descriptor = self
             .rule_dictionary
             .descriptor(rule_slot)
-            .map(|d| d.applies_locally())
-            .unwrap_or(false);
-        let key = CompactCellKey {
-            rule: rule_slot,
+            .expect("rule slot live during emit_expiration — pinned by cell refcount");
+        let key = CellIdentity {
+            rule_fingerprint: descriptor.fingerprint,
             key_hash: self.key_hashes[slot as usize],
             bucket: self.buckets[slot as usize],
-            origin: self.origins[slot as usize],
-            incarnation: self.incarnations[slot as usize],
         };
         sink.push(
             handle,
             key,
             self.counts[slot as usize],
             self.last_update_millis[slot as usize],
-            applies_locally,
+            descriptor.applies_locally(),
         );
     }
 

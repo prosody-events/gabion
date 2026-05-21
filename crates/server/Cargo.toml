@@ -4,13 +4,22 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = "1"
+axum.workspace = true
+dashmap.workspace = true
 envoy-types.workspace = true
+futures.workspace = true
 gabion.workspace = true
 humantime.workspace = true
+humantime-serde.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+tracing.workspace = true
+twox-hash.workspace = true
+whoami.workspace = true
 
 [dev-dependencies]
 quickcheck.workspace = true

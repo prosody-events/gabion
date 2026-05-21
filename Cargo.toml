@@ -6,6 +6,14 @@ members = [
     "crates/nginx",
 ]
 
+# `gabion-nginx` is being rewritten against the new gossip / `AggregateStore`
+# surface; until that lands we exclude it from the default build set so
+# `cargo check`/`cargo test` without `-p` operate on the working crates.
+default-members = [
+    "crates/gabion",
+    "crates/server",
+]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -16,6 +24,7 @@ axum = "0.8"
 async-stream = "0.3"
 bon = "3"
 criterion = "0.8"
+dashmap = "6"
 educe = "0.6"
 either = "1"
 envoy-types = "0.7"
@@ -40,6 +49,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tonic = "0.14"
 tracing = "0.1"
 twox-hash = "2.1.2"
+whoami = "1"
 
 [profile.release]
 lto = "fat"

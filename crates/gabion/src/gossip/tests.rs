@@ -17,7 +17,7 @@ use tokio::task::LocalSet;
 
 use crate::crdt::{
     BucketEpoch, CellStore, CellStoreConfig, Count, DeltaSink, ExpirationSink, KeyHash, NodeId,
-    NodeIdentity, RuleDescriptor, RuleSlot,
+    NodeIdentity, RuleDescriptor,
 };
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
 use crate::gossip::{
@@ -32,7 +32,7 @@ use crate::gossip::{
 /// read path.
 #[derive(Default)]
 pub(super) struct InMemoryAggregateStore<C: Count> {
-    inner: RefCell<HashMap<(RuleSlot, KeyHash, BucketEpoch), u64>>,
+    inner: RefCell<HashMap<(u128, KeyHash, BucketEpoch), u64>>,
     apply_calls: RefCell<Vec<(usize, usize)>>,
     _marker: std::marker::PhantomData<C>,
 }
@@ -61,15 +61,18 @@ impl<C: Count> AggregateStore<C> for InMemoryAggregateStore<C> {
         for i in 0..deltas.len() {
             let key = &deltas.keys[i];
             let v: u64 = deltas.deltas[i].into();
-            *map.entry((key.rule, key.key_hash, key.bucket)).or_insert(0) += v;
+            *map.entry((key.rule_fingerprint, key.key_hash, key.bucket))
+                .or_insert(0) += v;
         }
         for i in 0..expirations.len() {
             let key = &expirations.keys[i];
             let v: u64 = expirations.last_counts[i].into();
-            let entry = map.entry((key.rule, key.key_hash, key.bucket)).or_insert(0);
+            let entry = map
+                .entry((key.rule_fingerprint, key.key_hash, key.bucket))
+                .or_insert(0);
             *entry = entry.saturating_sub(v);
             if *entry == 0 {
-                map.remove(&(key.rule, key.key_hash, key.bucket));
+                map.remove(&(key.rule_fingerprint, key.key_hash, key.bucket));
             }
         }
     }
@@ -844,6 +847,62 @@ async fn udp_round_trip_smoke() {
             client_b.shutdown().await.unwrap();
             let _ = h_a.await;
             let _ = h_b.await;
+        })
+        .await;
+}
+
+// -- admin command channel --------------------------------------------------
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn admin_snapshot_reflects_runtime_state() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            use tokio::sync::{mpsc, oneshot};
+
+            use crate::gossip::{AdminCommand, AdminSnapshot};
+
+            let router = SimRouter::new();
+            let addr = sock(40_300);
+            let transport = router.bind(addr);
+
+            let identity = NodeIdentity::new(NodeId(0xCAFE), 7);
+            let store = store_for(identity);
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+
+            let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(4);
+
+            let (rt, client) = GossipRuntime::from_parts_with_admin(
+                transport,
+                TokioClock::from_millis(0),
+                sim_config(identity, vec![sock(40_301)], 1),
+                store,
+                agg.clone(),
+                Some(admin_rx),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+            // One record so the cell store is non-empty when we sample.
+            client.record(0xFEED, KeyHash(0x42), 0, 4, 100).await.unwrap();
+
+            let (reply_tx, reply_rx) = oneshot::channel::<AdminSnapshot>();
+            admin_tx
+                .send(AdminCommand::Snapshot { reply: reply_tx })
+                .await
+                .unwrap();
+            let snapshot = reply_rx.await.unwrap();
+
+            assert_eq!(snapshot.local_identity, identity);
+            // Bootstrap peer is present even though we never heard back from
+            // it — `node_id` stays `None` until first inbound packet.
+            assert_eq!(snapshot.peers.len(), 1);
+            assert_eq!(snapshot.peers[0].addr, sock(40_301));
+            assert!(snapshot.peers[0].node_id.is_none());
+            assert!(snapshot.store_stats.active_cells >= 1);
+            assert!(snapshot.local_dirty_len >= 1);
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
         })
         .await;
 }

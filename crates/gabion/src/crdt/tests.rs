@@ -888,7 +888,11 @@ fn expire_emits_one_row_per_freed_cell() {
     expected.sort_by_key(|r| r.handle.index);
     for (got, snap) in rows.iter().zip(expected.iter()) {
         assert_eq!(got.handle, snap.handle);
-        assert_eq!(got.key, snap.key);
+        // The exported identity carries the rule fingerprint, not the
+        // node-local rule slot — translate via the dictionary snapshot.
+        assert_eq!(got.key.rule_fingerprint, 0x22);
+        assert_eq!(got.key.key_hash, snap.key.key_hash);
+        assert_eq!(got.key.bucket, snap.key.bucket);
         assert_eq!(got.last_count, snap.count);
         assert_eq!(got.last_update_millis, snap.last_update_millis);
         assert!(got.applies_locally);
