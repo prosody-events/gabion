@@ -145,11 +145,51 @@ assert_pod_rate_limit() {
 
     first="$(curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/api/index.html")"
     second="$(curl -fsS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/api/index.html")"
-    third="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/api/index.html")"
+
+    # Capture headers + status on the rejected third request so we can
+    # validate the rate-limit headers the migrated adapter emits.
+    third_headers="$(mktemp)"
+    third="$(curl -sS -D "$third_headers" -o /dev/null \
+        -w '%{http_code}' "http://127.0.0.1:18080/api/index.html")"
 
     test "$first" = 200
     test "$second" = 200
     test "$third" = 429
+
+    printf '\n  pod=%s rate-limit headers on 429:\n' "$pod"
+    # The header order doesn't matter; print whichever the adapter set.
+    grep -iE '^(X-RateLimit-Limit|X-RateLimit-Remaining|X-RateLimit-Reset|Retry-After):' \
+        "$third_headers" | sed 's/^/    /' || true
+
+    limit_h="$(grep -i '^X-RateLimit-Limit:' "$third_headers" | head -n1 | awk '{print $2}' | tr -d '\r')"
+    remaining_h="$(grep -i '^X-RateLimit-Remaining:' "$third_headers" | head -n1 | awk '{print $2}' | tr -d '\r')"
+    reset_h="$(grep -i '^X-RateLimit-Reset:' "$third_headers" | head -n1 | awk '{print $2}' | tr -d '\r')"
+    retry_h="$(grep -i '^Retry-After:' "$third_headers" | head -n1 | awk '{print $2}' | tr -d '\r')"
+
+    rm -f "$third_headers"
+
+    if [ -z "$limit_h" ] || [ -z "$remaining_h" ] || [ -z "$reset_h" ] || [ -z "$retry_h" ]; then
+        printf '%s\n' "FAIL: missing rate-limit header on 429 from pod $pod" >&2
+        return 1
+    fi
+    # Per the rule in deploy/nginx/nginx.module.conf: uri_api 2r/m.
+    if [ "$limit_h" != "2" ]; then
+        printf '%s\n' "FAIL: X-RateLimit-Limit=$limit_h, expected 2" >&2
+        return 1
+    fi
+    if [ "$remaining_h" != "0" ]; then
+        printf '%s\n' "FAIL: X-RateLimit-Remaining=$remaining_h, expected 0" >&2
+        return 1
+    fi
+    # Reset / Retry-After are in seconds; should be > 0 and not absurdly large.
+    if [ "$reset_h" -le 0 ] 2>/dev/null; then
+        printf '%s\n' "FAIL: X-RateLimit-Reset=$reset_h is not a positive integer" >&2
+        return 1
+    fi
+    if [ "$retry_h" -le 0 ] 2>/dev/null; then
+        printf '%s\n' "FAIL: Retry-After=$retry_h is not a positive integer" >&2
+        return 1
+    fi
 }
 
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s

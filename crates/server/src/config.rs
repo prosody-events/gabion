@@ -4,19 +4,25 @@
 //!
 //! 1. Built-in defaults from the per-struct `Default` impls below.
 //! 2. An optional YAML file passed on the command line.
-//! 3. Environment variables prefixed `GABION_`.
+//! 3. Environment variables — see [`ENV_BINDINGS`] for the full list.
 //!
 //! ## Environment variables
 //!
-//! - Nested keys use a double-underscore separator. For example,
-//!   `GABION_STORAGE__MAX_CELLS=131072` maps to `storage.max_cells`.
-//! - Scalar lists (e.g. `Vec<String>`, `Vec<SocketAddr>`) are comma-
-//!   separated: `GABION_DISCOVERY__NAMESPACE_WHITELIST=ns-a,ns-b`.
-//! - Structured lists (notably `limits`, where each entry is itself a
-//!   struct with nested fields and durations) cannot be expressed through
-//!   env vars and must come from the YAML file.
-//! - Optional scalars accept their natural string form:
-//!   `GABION_ENVOY_BIND=0.0.0.0:8081`, `GABION_GOSSIP__TICK_INTERVAL=100ms`.
+//! Every overridable config field is mapped to a single env var. There is
+//! no automatic `STRUCT__FIELD` nesting — each binding is explicit so the
+//! variable names operators type are flat and unambiguous (no
+//! double-underscores).
+//!
+//! Examples:
+//!
+//! - `GABION_STORAGE_MAX_CELLS=131072`
+//! - `GABION_GOSSIP_BIND=0.0.0.0:9090`
+//! - `GABION_GOSSIP_TICK_INTERVAL=100ms`
+//! - `GABION_DISCOVERY_NAMESPACE_WHITELIST=ns-a,ns-b` (comma-separated)
+//!
+//! Structured lists (notably `limits`, where each entry is itself a
+//! struct with nested fields and durations) cannot be expressed through
+//! env vars and must come from the YAML file.
 //!
 //! The library itself knows nothing about YAML or env — every field below
 //! is server-only. Parsing produces typed primitives that the binary's
@@ -27,7 +33,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use config::{Config, Environment, File, FileFormat};
+use config::{Config, ConfigBuilder, File, FileFormat, Value, builder::DefaultState};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -51,26 +57,119 @@ pub struct AppConfig {
     pub gossip: GossipSettings,
 }
 
-/// Env-var prefix for every configurable field. Set e.g.
-/// `GABION_STORAGE__MAX_CELLS=131072` to override `storage.max_cells`.
-pub const ENV_PREFIX: &str = "GABION";
+/// Whether an env var value should be parsed as a scalar string or a
+/// comma-separated list. Comma-separated lists feed `Vec<String>` /
+/// `Vec<SocketAddr>` fields; lists of nested structs (like `limits`) are
+/// not env-configurable and must come from the YAML file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnvValueKind {
+    Scalar,
+    List,
+}
 
-/// Separator between nested field names in env var keys. Single underscores
-/// are kept for snake_case field names (`max_cells`); the double underscore
-/// signals a level of nesting.
-pub const ENV_SEPARATOR: &str = "__";
+/// How a single env var maps onto a config field.
+#[derive(Clone, Copy, Debug)]
+pub struct EnvBinding {
+    /// Exact env var name. Always upper-snake_case, single underscores.
+    pub env_name: &'static str,
+    /// Dotted path into the [`AppConfig`] tree, e.g. `storage.max_cells`.
+    pub config_path: &'static str,
+    /// How to interpret the raw env value.
+    pub kind: EnvValueKind,
+}
 
-/// Separator for `Vec<scalar>` env values. `Vec<String>`/`Vec<SocketAddr>`
-/// fields like `discovery.namespace_whitelist` accept a comma-separated
-/// list.
-pub const ENV_LIST_SEPARATOR: &str = ",";
+impl EnvBinding {
+    /// Bind an env var to a scalar field.
+    pub const fn scalar(env_name: &'static str, config_path: &'static str) -> Self {
+        Self {
+            env_name,
+            config_path,
+            kind: EnvValueKind::Scalar,
+        }
+    }
 
-/// Every `Vec<scalar>` field that `Environment` should split on the list
-/// separator. Struct lists (notably `limits`) are intentionally excluded
-/// because env vars cannot express nested struct entries.
-const LIST_PARSE_KEYS: &[&str] = &[
-    "discovery.namespace_whitelist",
-    "discovery.service_whitelist",
+    /// Bind an env var to a comma-separated list field.
+    pub const fn list(env_name: &'static str, config_path: &'static str) -> Self {
+        Self {
+            env_name,
+            config_path,
+            kind: EnvValueKind::List,
+        }
+    }
+}
+
+/// Every overridable config field, paired with the env var that overrides
+/// it. Names use single underscores throughout — there is no nesting
+/// separator, just an explicit table. To add a new env-overridable field:
+/// add an entry here and confirm `config_path` matches the field path in
+/// the YAML schema.
+pub const ENV_BINDINGS: &[EnvBinding] = &[
+    // Top-level binds.
+    EnvBinding::scalar("GABION_ENVOY_BIND", "envoy_bind"),
+    EnvBinding::scalar("GABION_ADMIN_BIND", "admin_bind"),
+    // storage.*
+    EnvBinding::scalar("GABION_STORAGE_MAX_CELLS", "storage.max_cells"),
+    EnvBinding::scalar(
+        "GABION_STORAGE_RULE_DICTIONARY_CAPACITY",
+        "storage.rule_dictionary_capacity",
+    ),
+    EnvBinding::scalar(
+        "GABION_STORAGE_NODE_DICTIONARY_CAPACITY",
+        "storage.node_dictionary_capacity",
+    ),
+    EnvBinding::scalar(
+        "GABION_STORAGE_LOCAL_DIRTY_CAPACITY",
+        "storage.local_dirty_capacity",
+    ),
+    EnvBinding::scalar(
+        "GABION_STORAGE_FORWARDED_DIRTY_CAPACITY",
+        "storage.forwarded_dirty_capacity",
+    ),
+    EnvBinding::scalar("GABION_STORAGE_PEER_CAPACITY", "storage.peer_capacity"),
+    EnvBinding::scalar(
+        "GABION_STORAGE_MAX_DESCRIPTOR_COUNT",
+        "storage.max_descriptor_count",
+    ),
+    EnvBinding::scalar(
+        "GABION_STORAGE_MAX_DESCRIPTOR_BYTES",
+        "storage.max_descriptor_bytes",
+    ),
+    EnvBinding::scalar("GABION_STORAGE_MAX_KEY_BYTES", "storage.max_key_bytes"),
+    // runtime.*
+    EnvBinding::scalar("GABION_RUNTIME_NODE_ID_SEED", "runtime.node_id_seed"),
+    EnvBinding::scalar("GABION_RUNTIME_RNG_SEED", "runtime.rng_seed"),
+    // gossip.*
+    EnvBinding::scalar("GABION_GOSSIP_BIND", "gossip.bind"),
+    EnvBinding::scalar("GABION_GOSSIP_TICK_INTERVAL", "gossip.tick_interval"),
+    EnvBinding::scalar("GABION_GOSSIP_FANOUT", "gossip.fanout"),
+    EnvBinding::scalar("GABION_GOSSIP_MAX_PAYLOAD_BYTES", "gossip.max_payload_bytes"),
+    EnvBinding::scalar(
+        "GABION_GOSSIP_MAX_CELLS_PER_FRAME",
+        "gossip.max_cells_per_frame",
+    ),
+    EnvBinding::scalar(
+        "GABION_GOSSIP_MAX_CELLS_PER_TICK",
+        "gossip.max_cells_per_tick",
+    ),
+    EnvBinding::scalar(
+        "GABION_GOSSIP_SEND_QUEUE_CAPACITY",
+        "gossip.send_queue_capacity",
+    ),
+    EnvBinding::scalar(
+        "GABION_GOSSIP_LIMIT_QUEUE_CAPACITY",
+        "gossip.limit_queue_capacity",
+    ),
+    EnvBinding::scalar("GABION_GOSSIP_CLUSTER_ID_HASH", "gossip.cluster_id_hash"),
+    // discovery.*
+    EnvBinding::scalar("GABION_DISCOVERY_SELF_ADDR", "discovery.self_addr"),
+    EnvBinding::list(
+        "GABION_DISCOVERY_NAMESPACE_WHITELIST",
+        "discovery.namespace_whitelist",
+    ),
+    EnvBinding::list(
+        "GABION_DISCOVERY_SERVICE_WHITELIST",
+        "discovery.service_whitelist",
+    ),
 ];
 
 impl AppConfig {
@@ -80,28 +179,24 @@ impl AppConfig {
     pub fn load(yaml_path: Option<&Path>) -> Result<Self, ConfigError> {
         let mut builder = Config::builder();
         if let Some(path) = yaml_path {
-            let path_str = path.to_string_lossy().into_owned();
-            builder = builder.add_source(File::new(&path_str, FileFormat::Yaml));
+            builder =
+                builder.add_source(File::new(&path.to_string_lossy(), FileFormat::Yaml));
         }
-
-        let mut env = Environment::with_prefix(ENV_PREFIX)
-            .separator(ENV_SEPARATOR)
-            .list_separator(ENV_LIST_SEPARATOR)
-            .try_parsing(true)
-            .prefix_separator("_");
-        for key in LIST_PARSE_KEYS {
-            env = env.with_list_parse_key(key);
-        }
-        builder = builder.add_source(env);
-
-        let raw = builder.build().map_err(ConfigError::Config)?;
-        raw.try_deserialize().map_err(ConfigError::Config)
+        finalize(builder)
     }
 
     /// Parse YAML text directly, ignoring any env layering. Retained for
     /// tests; production paths should use [`Self::load`].
     pub fn parse_yaml(text: &str) -> Result<Self, ConfigError> {
         serde_yaml::from_str(text).map_err(ConfigError::Yaml)
+    }
+
+    /// Test-only loader that takes inline YAML instead of a file path.
+    /// Same env-layering semantics as [`Self::load`].
+    #[cfg(test)]
+    fn load_with_yaml_str(yaml: &str) -> Result<Self, ConfigError> {
+        let builder = Config::builder().add_source(File::from_str(yaml, FileFormat::Yaml));
+        finalize(builder)
     }
 
     pub fn cardinality_limits(&self) -> CardinalityLimits {
@@ -135,6 +230,48 @@ impl AppConfig {
             peer_capacity: self.storage.peer_capacity,
         }
     }
+}
+
+/// Apply env overrides from [`ENV_BINDINGS`] on top of a builder already
+/// seeded with defaults and (optionally) a YAML file, then deserialize.
+fn finalize(mut builder: ConfigBuilder<DefaultState>) -> Result<AppConfig, ConfigError> {
+    for binding in ENV_BINDINGS {
+        let Some(raw) = read_env(binding.env_name)? else {
+            continue;
+        };
+        let value = match binding.kind {
+            EnvValueKind::Scalar => Value::from(raw),
+            EnvValueKind::List => Value::from(parse_csv(&raw)),
+        };
+        builder = builder
+            .set_override(binding.config_path, value)
+            .map_err(ConfigError::Config)?;
+    }
+    builder
+        .build()
+        .map_err(ConfigError::Config)?
+        .try_deserialize()
+        .map_err(ConfigError::Config)
+}
+
+/// Read an env var, distinguishing unset (`Ok(None)`) from non-UTF-8 (error).
+fn read_env(name: &'static str) -> Result<Option<String>, ConfigError> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::NonUtf8EnvVar(name)),
+    }
+}
+
+/// Split a comma-separated env value, trimming whitespace and skipping empty
+/// segments so a trailing comma or double comma never produces a phantom
+/// element.
+fn parse_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -321,6 +458,8 @@ pub enum ConfigError {
     EmptyDescriptorSet(String),
     #[error("gossip.bind is required")]
     MissingGossipBind,
+    #[error("environment variable {0} is not valid UTF-8")]
+    NonUtf8EnvVar(&'static str),
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -329,85 +468,61 @@ fn duration_millis(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    //! Env-var tests serialize through a single mutex because `std::env`
-    //! is process-global. Cargo runs tests within a binary in parallel by
-    //! default; without the lock, two tests can read each other's env vars
-    //! and produce nonsense failures.
+    //! Env-var tests serialize through a single mutex because `std::env` is
+    //! process-global; running tests in parallel without the lock can let
+    //! one test see another's env state and fail in non-obvious ways.
 
     use super::*;
     use std::sync::Mutex;
 
-    // Hand-rolled tempfile to avoid pulling a new dev-dep just for two tests.
-    mod tempfile_workaround {
-        use std::io::Write;
-        use std::path::PathBuf;
-
-        pub struct YamlTempFile {
-            path: PathBuf,
-        }
-
-        impl YamlTempFile {
-            pub fn new(contents: &str) -> Self {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static COUNTER: AtomicU32 = AtomicU32::new(0);
-                let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-                let path = std::env::temp_dir().join(format!(
-                    "gabion-config-test-{}-{}.yaml",
-                    std::process::id(),
-                    n
-                ));
-                let mut f = std::fs::File::create(&path).expect("create temp yaml");
-                f.write_all(contents.as_bytes()).expect("write temp yaml");
-                Self { path }
-            }
-
-            pub fn path(&self) -> &std::path::Path {
-                &self.path
-            }
-        }
-
-        impl Drop for YamlTempFile {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
-    }
-    use tempfile_workaround::YamlTempFile;
-
+    /// Held for the duration of any test that mutates the env. Guarantees
+    /// `set_env` / `clear_all` see a consistent view of the process env.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Env vars under our prefix that any test in this module might touch.
-    /// Cleared at the start and end of each test so leftovers from a prior
-    /// run can't leak across cases.
-    const TEST_ENV_KEYS: &[&str] = &[
-        "GABION_ENVOY_BIND",
-        "GABION_ADMIN_BIND",
-        "GABION_STORAGE__MAX_CELLS",
-        "GABION_STORAGE__RULE_DICTIONARY_CAPACITY",
-        "GABION_GOSSIP__BIND",
-        "GABION_GOSSIP__FANOUT",
-        "GABION_GOSSIP__TICK_INTERVAL",
-        "GABION_DISCOVERY__NAMESPACE_WHITELIST",
-        "GABION_DISCOVERY__SERVICE_WHITELIST",
-        "GABION_RUNTIME__RNG_SEED",
-    ];
-
-    fn clear_env() {
-        for key in TEST_ENV_KEYS {
-            // SAFETY: serialized via `ENV_LOCK`; no concurrent reader/writer.
-            unsafe { std::env::remove_var(key) };
+    /// Remove every env var declared in [`ENV_BINDINGS`]. Run at the start
+    /// of each test so leftovers from a prior test (in the same binary
+    /// run) can't leak across cases.
+    fn clear_all_env() {
+        for binding in ENV_BINDINGS {
+            // SAFETY: serialized through `ENV_LOCK`; no concurrent access.
+            unsafe { std::env::remove_var(binding.env_name) };
         }
     }
 
+    /// Set an env var. Asserts the key is a known binding so a typo in the
+    /// test surfaces immediately instead of silently doing nothing.
     fn set_env(key: &str, value: &str) {
-        // SAFETY: serialized via `ENV_LOCK`; no concurrent reader/writer.
+        assert!(
+            ENV_BINDINGS.iter().any(|b| b.env_name == key),
+            "test set unknown env var: {key} (add it to ENV_BINDINGS)",
+        );
+        // SAFETY: serialized through `ENV_LOCK`; no concurrent access.
         unsafe { std::env::set_var(key, value) };
+    }
+
+    /// RAII wrapper that clears every gabion env var on drop, so a panicking
+    /// test still cleans up after itself.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn lock() -> Self {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            clear_all_env();
+            Self { _lock }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            clear_all_env();
+        }
     }
 
     #[test]
     fn defaults_apply_when_neither_yaml_nor_env_set_a_value() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        clear_env();
+        let _env = EnvGuard::lock();
 
         let cfg = AppConfig::load(None).expect("load with neither yaml nor env");
 
@@ -415,119 +530,129 @@ mod tests {
         assert_eq!(cfg.storage.rule_dictionary_capacity, 64);
         assert_eq!(cfg.gossip.fanout, 6);
         assert!(cfg.discovery.namespace_whitelist.is_empty());
-
-        clear_env();
     }
 
     #[test]
     fn yaml_values_load_when_no_env_overrides() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        clear_env();
+        let _env = EnvGuard::lock();
 
-        let yaml = YamlTempFile::new(
+        let cfg = AppConfig::load_with_yaml_str(
             "envoy_bind: \"127.0.0.1:8000\"\n\
              storage:\n  \
                max_cells: 256\n  \
                rule_dictionary_capacity: 8\n\
              gossip:\n  bind: \"127.0.0.1:9000\"\n  fanout: 3\n",
-        );
+        )
+        .expect("load yaml");
 
-        let cfg = AppConfig::load(Some(yaml.path())).expect("load yaml");
         assert_eq!(cfg.envoy_bind, Some("127.0.0.1:8000".parse().unwrap()));
         assert_eq!(cfg.storage.max_cells, Some(256));
         assert_eq!(cfg.storage.rule_dictionary_capacity, 8);
         assert_eq!(cfg.gossip.fanout, 3);
-
-        clear_env();
     }
 
     #[test]
     fn env_overrides_yaml_for_scalars() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        clear_env();
+        let _env = EnvGuard::lock();
+        set_env("GABION_STORAGE_MAX_CELLS", "9999");
+        set_env("GABION_GOSSIP_FANOUT", "12");
 
-        let yaml = YamlTempFile::new(
+        let cfg = AppConfig::load_with_yaml_str(
             "storage:\n  max_cells: 256\n  rule_dictionary_capacity: 8\n\
              gossip:\n  fanout: 3\n",
-        );
-        set_env("GABION_STORAGE__MAX_CELLS", "9999");
-        set_env("GABION_GOSSIP__FANOUT", "12");
+        )
+        .expect("load yaml + env");
 
-        let cfg = AppConfig::load(Some(yaml.path())).expect("load yaml + env");
         assert_eq!(cfg.storage.max_cells, Some(9999));
         assert_eq!(cfg.gossip.fanout, 12);
         // Untouched YAML value stays.
         assert_eq!(cfg.storage.rule_dictionary_capacity, 8);
-
-        clear_env();
     }
 
     #[test]
     fn env_only_with_no_yaml_file() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        clear_env();
-
-        set_env("GABION_STORAGE__MAX_CELLS", "5555");
+        let _env = EnvGuard::lock();
+        set_env("GABION_STORAGE_MAX_CELLS", "5555");
         set_env("GABION_ENVOY_BIND", "0.0.0.0:8081");
-        set_env("GABION_RUNTIME__RNG_SEED", "42");
+        set_env("GABION_RUNTIME_RNG_SEED", "42");
 
         let cfg = AppConfig::load(None).expect("load env-only");
+
         assert_eq!(cfg.storage.max_cells, Some(5555));
         assert_eq!(cfg.envoy_bind, Some("0.0.0.0:8081".parse().unwrap()));
         assert_eq!(cfg.runtime.rng_seed, 42);
-
-        clear_env();
     }
 
     #[test]
     fn comma_separated_lists_split_into_vec() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        clear_env();
-
-        set_env(
-            "GABION_DISCOVERY__NAMESPACE_WHITELIST",
-            "ns-a,ns-b,ns-c",
-        );
-        set_env("GABION_DISCOVERY__SERVICE_WHITELIST", "svc-1,svc-2");
+        let _env = EnvGuard::lock();
+        set_env("GABION_DISCOVERY_NAMESPACE_WHITELIST", "ns-a,ns-b,ns-c");
+        set_env("GABION_DISCOVERY_SERVICE_WHITELIST", "svc-1,svc-2");
 
         let cfg = AppConfig::load(None).expect("load env-only with lists");
+
         assert_eq!(
             cfg.discovery.namespace_whitelist,
-            vec!["ns-a".to_string(), "ns-b".to_string(), "ns-c".to_string()],
+            ["ns-a", "ns-b", "ns-c"].map(String::from),
         );
         assert_eq!(
             cfg.discovery.service_whitelist,
-            vec!["svc-1".to_string(), "svc-2".to_string()],
+            ["svc-1", "svc-2"].map(String::from),
+        );
+    }
+
+    #[test]
+    fn list_parsing_trims_whitespace_and_skips_empties() {
+        let _env = EnvGuard::lock();
+        set_env(
+            "GABION_DISCOVERY_NAMESPACE_WHITELIST",
+            " ns-a , ns-b ,, ns-c , ",
         );
 
-        clear_env();
+        let cfg = AppConfig::load(None).expect("load env list");
+
+        assert_eq!(
+            cfg.discovery.namespace_whitelist,
+            ["ns-a", "ns-b", "ns-c"].map(String::from),
+        );
     }
 
     #[test]
     fn duration_env_uses_humantime_syntax() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        clear_env();
+        let _env = EnvGuard::lock();
+        set_env("GABION_GOSSIP_TICK_INTERVAL", "250ms");
 
-        set_env("GABION_GOSSIP__TICK_INTERVAL", "250ms");
         let cfg = AppConfig::load(None).expect("load tick_interval from env");
-        assert_eq!(cfg.gossip.tick_interval, Duration::from_millis(250));
 
-        clear_env();
+        assert_eq!(cfg.gossip.tick_interval, Duration::from_millis(250));
     }
 
     #[test]
     fn bad_scalar_env_value_returns_error_not_panic() {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        clear_env();
+        let _env = EnvGuard::lock();
+        set_env("GABION_STORAGE_MAX_CELLS", "not_a_number");
 
-        set_env("GABION_STORAGE__MAX_CELLS", "not_a_number");
         let err = AppConfig::load(None).expect_err("non-integer max_cells should error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("max_cells"),
-            "error should name the offending key, got: {msg}",
-        );
 
-        clear_env();
+        assert!(
+            err.to_string().contains("max_cells"),
+            "error should name the offending key, got: {err}",
+        );
+    }
+
+    #[test]
+    fn env_binding_names_use_single_underscores_only() {
+        for binding in ENV_BINDINGS {
+            assert!(
+                binding.env_name.starts_with("GABION_"),
+                "{} should be GABION_-prefixed",
+                binding.env_name,
+            );
+            assert!(
+                !binding.env_name.contains("__"),
+                "{} contains a double underscore",
+                binding.env_name,
+            );
+        }
     }
 }
