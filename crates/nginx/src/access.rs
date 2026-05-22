@@ -10,6 +10,8 @@ use arrayvec::ArrayVec;
 use gabion::defaults;
 use gabion::rules::{Descriptor, EnforcementMode, hash_key};
 
+use gabion::rules::RuleId;
+
 use crate::rules::{BindingLookup, CompiledRules, MAX_DESCRIPTORS, RuleSpec};
 use crate::shm::aggregate::AggregateTable;
 use crate::shm::queue::{QueueEvent, RequestQueue};
@@ -100,8 +102,9 @@ enum RuleOutcome {
     /// 400 just like the single-rule path.
     Cardinality,
     /// Predicate `except_if=` resolved truthy; rule is skipped for this
-    /// request.
-    Exempt,
+    /// request. Carries the rule id so the orchestrator can attribute the
+    /// per-rule exempt counter to the right slot.
+    Exempt(RuleId),
 }
 
 /// Evaluate one request against the rule indicated by `rule_index`.
@@ -162,9 +165,9 @@ pub fn decide_all(
                 any_cardinality = true;
                 ctx.stats.record_cardinality_reject();
             }
-            RuleOutcome::Exempt => {
+            RuleOutcome::Exempt(rule_id) => {
                 any_exempt = true;
-                ctx.stats.record_exempt();
+                ctx.stats.record_exempt(rule_id);
             }
         }
     }
@@ -218,7 +221,7 @@ fn decide_one(
         && let Some(value) = vars.lookup(predicate)
         && is_truthy(value)
     {
-        return RuleOutcome::Exempt;
+        return RuleOutcome::Exempt(compiled.rule.id);
     }
 
     // Build descriptors on the stack in one pass over `bindings`. Variable
@@ -245,7 +248,7 @@ fn decide_one(
             }
         };
         descriptors.push(Descriptor {
-            key: binding.key.as_str(),
+            key: &binding.key,
             value: value_str,
         });
     }

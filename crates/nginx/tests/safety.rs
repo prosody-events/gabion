@@ -94,11 +94,11 @@ fn build_zone(queue_cap: usize, agg_cap: usize) -> (TestZone, ShmRegion) {
 
 fn build_rules() -> CompiledRules {
     CompiledRules::compile(&[RuleConfig {
-        name: "per_tenant".to_string(),
-        domain: DEFAULT_DOMAIN.to_string(),
+        name: "per_tenant".into(),
+        domain: DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
-            key: "tenant".to_string(),
-            source: "$http_x_tenant".to_string(),
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
         }],
         limit: 2,
         window: std::time::Duration::from_secs(1),
@@ -214,8 +214,8 @@ fn leader_stamps_incarnation_and_applies_deltas() {
         1,
         DEFAULT_DOMAIN.to_string(),
         vec![DescriptorPattern {
-            key: "tenant".to_string(),
-            value: "*".to_string(),
+            key: "tenant".into(),
+            value: "*".into(),
         }],
         2,
         1_000,
@@ -246,8 +246,8 @@ fn expiration_subtracts_then_tombstones_when_zero() {
         1,
         DEFAULT_DOMAIN.to_string(),
         vec![DescriptorPattern {
-            key: "k".to_string(),
-            value: "*".to_string(),
+            key: "k".into(),
+            value: "*".into(),
         }],
         100,
         1_000,
@@ -362,8 +362,8 @@ fn concurrent_leader_writer_and_worker_readers() {
         1,
         DEFAULT_DOMAIN.to_string(),
         vec![DescriptorPattern {
-            key: "k".to_string(),
-            value: "*".to_string(),
+            key: "k".into(),
+            value: "*".into(),
         }],
         WRITES * 2,
         1_000,
@@ -512,8 +512,8 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
         1,
         DEFAULT_DOMAIN.to_string(),
         vec![DescriptorPattern {
-            key: "tenant".to_string(),
-            value: "*".to_string(),
+            key: "tenant".into(),
+            value: "*".into(),
         }],
         TOTAL * 2,
         1_000,
@@ -712,6 +712,123 @@ fn decide_and_leader_apply_concurrent() {
     let spec = rules.rules()[0].rule.spec();
     let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
     let _ = view.get(spec.fingerprint, key_hash.0, 0);
+}
+
+// -- 8b. Multi-rule decide_all + leader apply running concurrently --------
+
+/// Same shape as `decide_and_leader_apply_concurrent`, but with two stacked
+/// rules so the multi-rule queue-flush path is exercised under the
+/// writer/reader race. Catches regressions in the queue-batching logic
+/// that single-rule tests can't surface.
+#[test]
+fn decide_all_multi_rule_concurrent() {
+    #[cfg(not(miri))]
+    const ITERATIONS: usize = 64;
+    #[cfg(miri)]
+    const ITERATIONS: usize = 8;
+
+    let layout = Layout::new(32, 32).expect("layout");
+    let words = layout.total_bytes.div_ceil(8);
+    let zone = Arc::new(TestZone::allocate(words));
+    // SAFETY: zone is fresh, 8-byte aligned, exclusive during init.
+    let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
+
+    let rule_configs = vec![
+        RuleConfig {
+            name: "rule_a".into(),
+            domain: DEFAULT_DOMAIN.into(),
+            bindings: vec![DescriptorBinding {
+                key: "tenant_a".into(),
+                source: "$http_x_tenant".into(),
+            }],
+            limit: u64::MAX / 2,
+            window: std::time::Duration::from_secs(1),
+            bucket: std::time::Duration::from_millis(250),
+            mode: EnforcementMode::Enforce,
+            except_if: None,
+        },
+        RuleConfig {
+            name: "rule_b".into(),
+            domain: DEFAULT_DOMAIN.into(),
+            bindings: vec![DescriptorBinding {
+                key: "tenant_b".into(),
+                source: "$http_x_tenant".into(),
+            }],
+            limit: u64::MAX / 2,
+            window: std::time::Duration::from_secs(1),
+            bucket: std::time::Duration::from_millis(250),
+            mode: EnforcementMode::Enforce,
+            except_if: None,
+        },
+    ];
+    let rules = Arc::new(CompiledRules::compile(&rule_configs).expect("compile two rules"));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let worker_zone = zone.clone();
+    let worker_rules = rules.clone();
+    let worker_stop = stop.clone();
+    let worker = thread::spawn(move || {
+        // SAFETY: zone outlives the worker; access path only touches
+        // atomics + stack ArrayVec.
+        let r = unsafe { ShmRegion::from_initialized(worker_zone.as_ptr(), layout) };
+        let vars = MockVars {
+            tenant: b"alice".to_vec(),
+        };
+        for _ in 0..ITERATIONS {
+            let ctx = AccessCtx {
+                rules: &worker_rules,
+                aggregate: r.aggregate(),
+                queue: r.queue(),
+                stats: r.stats(),
+                domain: DEFAULT_DOMAIN,
+                cardinality: CardinalitySettings::default(),
+            };
+            let _ = gabion_nginx::access::decide_all(ctx, &[0, 1], &vars, 0);
+        }
+        worker_stop.store(true, Ordering::Release);
+    });
+
+    let leader_zone = zone.clone();
+    let leader_stop = stop.clone();
+    let leader_rules = rules.clone();
+    let leader = thread::spawn(move || {
+        // SAFETY: zone outlives the leader; sole writer for the store.
+        let r = unsafe { ShmRegion::from_initialized(leader_zone.as_ptr(), layout) };
+        let store =
+            unsafe { ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity) };
+        let mut applied = 0_u32;
+        while !leader_stop.load(Ordering::Acquire) {
+            for compiled in leader_rules.rules() {
+                let rule = &compiled.rule;
+                let descriptors = [gabion::rules::Descriptor {
+                    key: &compiled.bindings[0].key,
+                    value: "alice",
+                }];
+                let key_hash = hash_key(rule.id, DEFAULT_DOMAIN, &descriptors);
+                let (d, e) = deltas_and_expirations(rule, &[(key_hash, 0, 1)], &[]);
+                store.apply(&d, &e);
+            }
+            applied += 1;
+            if applied > 1_000 {
+                break;
+            }
+        }
+        applied
+    });
+
+    worker.join().expect("worker joined");
+    let _ = leader.join().expect("leader joined");
+
+    let view = region.aggregate();
+    for compiled in rules.rules() {
+        let rule = &compiled.rule;
+        let descriptors = [gabion::rules::Descriptor {
+            key: &compiled.bindings[0].key,
+            value: "alice",
+        }];
+        let key_hash = hash_key(rule.id, DEFAULT_DOMAIN, &descriptors);
+        let _ = view.get(rule.fingerprint, key_hash.0, 0);
+    }
 }
 
 // -- 9. Concurrent lease contention: only one winner among many threads ---

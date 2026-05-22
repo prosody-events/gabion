@@ -45,13 +45,13 @@ pub struct Descriptor<'a> {
 /// One descriptor pattern in a rule. `value == "*"` matches any value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DescriptorPattern {
-    pub key: String,
-    pub value: String,
+    pub key: Box<str>,
+    pub value: Box<str>,
 }
 
 impl DescriptorPattern {
     fn matches(&self, descriptor: Descriptor<'_>) -> bool {
-        self.key == descriptor.key && (self.value == "*" || self.value == descriptor.value)
+        &*self.key == descriptor.key && (&*self.value == "*" || &*self.value == descriptor.value)
     }
 }
 
@@ -63,9 +63,9 @@ pub struct Rule {
     pub id: RuleId,
     /// Stable, cross-node identity. Hashed from `(domain, descriptors)`.
     pub fingerprint: u128,
-    pub domain: String,
+    pub domain: Box<str>,
     pub domain_hash: KeyHash,
-    pub descriptors: Vec<DescriptorPattern>,
+    pub descriptors: Box<[DescriptorPattern]>,
     pub limit: u64,
     pub window_millis: u64,
     pub bucket_millis: u64,
@@ -75,7 +75,10 @@ pub struct Rule {
 
 impl Rule {
     /// Construct a rule, deriving `fingerprint` and `domain_hash` from
-    /// `domain` + `descriptors`.
+    /// `domain` + `descriptors`. `domain` accepts anything `Into<String>`
+    /// for operator-friendly construction; the field is stored as the
+    /// owned-immutable `Box<str>` per the no-capacity-after-construction
+    /// rule in CLAUDE.md.
     pub fn new(
         id: RuleId,
         domain: impl Into<String>,
@@ -85,7 +88,8 @@ impl Rule {
         bucket_millis: u64,
         mode: EnforcementMode,
     ) -> Self {
-        let domain = domain.into();
+        let domain: Box<str> = domain.into().into_boxed_str();
+        let descriptors: Box<[DescriptorPattern]> = descriptors.into_boxed_slice();
         let fingerprint = rule_fingerprint(&domain, &descriptors);
         let domain_hash = hash_domain(&domain);
         let window_millis = window_millis.max(1);
@@ -133,12 +137,14 @@ pub struct RuleSpec {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuleTable {
-    rules: Vec<Rule>,
+    rules: Box<[Rule]>,
 }
 
 impl RuleTable {
     pub fn new(rules: Vec<Rule>) -> Self {
-        Self { rules }
+        Self {
+            rules: rules.into_boxed_slice(),
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Rule> {
@@ -162,6 +168,10 @@ impl RuleTable {
     /// [`EnforcementMode::DryRun`] are returned so adapters can still hash
     /// the bucket and gossip the hit; adapters must check `rule.mode`
     /// before mapping a verdict to a rejection.
+    ///
+    /// The server adapter uses this for pattern-based filtering of Envoy
+    /// descriptors; the nginx adapter dispatches by `rule_index` (per
+    /// configured `gabion_limit`) and does not walk `matching` per request.
     pub fn matching<'a>(
         &'a self,
         domain: &'a str,
@@ -212,9 +222,7 @@ pub fn rule_fingerprint(domain: &str, descriptors: &[DescriptorPattern]) -> u128
     hasher.write(&[0]);
     write_descriptors(
         &mut hasher,
-        descriptors
-            .iter()
-            .map(|p| (p.key.as_str(), p.value.as_str())),
+        descriptors.iter().map(|p| (&*p.key, &*p.value)),
     );
     hasher.finish_128()
 }

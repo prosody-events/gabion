@@ -70,11 +70,11 @@ fn build_zone(queue_cap: usize, agg_cap: usize) -> (TestZone, ShmRegion) {
 
 fn build_rules() -> CompiledRules {
     CompiledRules::compile(&[RuleConfig {
-        name: "per_tenant".to_string(),
-        domain: crate::rules::DEFAULT_DOMAIN.to_string(),
+        name: "per_tenant".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
-            key: "tenant".to_string(),
-            source: "$http_x_tenant".to_string(),
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
         }],
         limit: 2,
         window: Duration::from_secs(1),
@@ -286,11 +286,11 @@ fn is_truthy_matches_documented_falsy_set() {
 
 fn rule_with_predicate(predicate: Option<&str>) -> CompiledRules {
     CompiledRules::compile(&[RuleConfig {
-        name: "per_tenant".to_string(),
-        domain: crate::rules::DEFAULT_DOMAIN.to_string(),
+        name: "per_tenant".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
-            key: "tenant".to_string(),
-            source: "$http_x_tenant".to_string(),
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
         }],
         limit: 2,
         window: Duration::from_secs(1),
@@ -405,11 +405,11 @@ fn build_two_rules(
     second_window_secs: u64,
 ) -> CompiledRules {
     let mk = |name: &str, limit: u64, window_secs: u64| RuleConfig {
-        name: name.to_string(),
-        domain: crate::rules::DEFAULT_DOMAIN.to_string(),
+        name: name.into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
-            key: "tenant".to_string(),
-            source: "$http_x_tenant".to_string(),
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
         }],
         limit,
         window: Duration::from_secs(window_secs),
@@ -519,11 +519,11 @@ fn decide_all_one_declines_one_allows() {
     // First rule keyed on a missing variable so it declines; second
     // rule has the variable set so it allows.
     let rule_a = RuleConfig {
-        name: "missing".to_string(),
-        domain: crate::rules::DEFAULT_DOMAIN.to_string(),
+        name: "missing".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
-            key: "nonexistent".to_string(),
-            source: "$does_not_exist".to_string(),
+            key: "nonexistent".into(),
+            source: "$does_not_exist".into(),
         }],
         limit: 10,
         window: Duration::from_secs(1),
@@ -532,11 +532,11 @@ fn decide_all_one_declines_one_allows() {
         except_if: None,
     };
     let rule_b = RuleConfig {
-        name: "tenant".to_string(),
-        domain: crate::rules::DEFAULT_DOMAIN.to_string(),
+        name: "tenant".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
-            key: "tenant".to_string(),
-            source: "$http_x_tenant".to_string(),
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
         }],
         limit: 10,
         window: Duration::from_secs(1),
@@ -565,11 +565,11 @@ fn decide_all_one_declines_one_allows() {
 fn dry_run_records_but_never_rejects() {
     let (_buf, region) = build_zone(8, 16);
     let cfg = RuleConfig {
-        name: "shadow".to_string(),
-        domain: crate::rules::DEFAULT_DOMAIN.to_string(),
+        name: "shadow".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
-            key: "tenant".to_string(),
-            source: "$http_x_tenant".to_string(),
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
         }],
         limit: 1,
         window: Duration::from_secs(1),
@@ -615,6 +615,328 @@ fn dry_run_records_but_never_rejects() {
     let snap = region.stats().snapshot();
     assert_eq!(snap.rejected, 0);
     assert_eq!(snap.allowed, 1);
+}
+
+/// Build two rules with different descriptor keys so the per-request
+/// cardinality budget can trip one without affecting the other.
+fn build_two_rules_varied(name_a: &str, key_a: &str, name_b: &str, key_b: &str) -> CompiledRules {
+    let mk = |name: &str, key: &str| RuleConfig {
+        name: name.into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: key.into(),
+            source: "$http_x_tenant".into(),
+        }],
+        limit: 10,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_millis(250),
+        mode: EnforcementMode::Enforce,
+        except_if: None,
+    };
+    CompiledRules::compile(&[mk(name_a, key_a), mk(name_b, key_b)]).expect("compile two rules")
+}
+
+#[test]
+fn decide_all_one_rule_cardinality_others_still_evaluate() {
+    let (_buf, region) = build_zone(8, 16);
+    let rules = build_two_rules_varied("a", "long_descriptor_key_name", "b", "k");
+    let domain = crate::rules::DEFAULT_DOMAIN;
+    let budget = domain.len() + 1 + "alice".len();
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain,
+        cardinality: CardinalitySettings {
+            max_descriptor_bytes: budget,
+            ..CardinalitySettings::default()
+        },
+    };
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    assert!(matches!(outcome, AccessOutcome::Allow));
+    let snap = region.stats().snapshot();
+    assert_eq!(snap.allowed, 1);
+    assert_eq!(snap.rejected_cardinality, 1, "one rule tripped cardinality");
+    let mut out = [QueueEvent::default(); 4];
+    assert_eq!(region.queue().drain(&mut out), 1);
+}
+
+#[test]
+fn decide_all_all_rules_cardinality_returns_cardinality() {
+    let (_buf, region) = build_zone(8, 16);
+    let rules = build_two_rules_varied(
+        "a",
+        "long_descriptor_key_name_a",
+        "b",
+        "long_descriptor_key_name_b",
+    );
+    let domain = crate::rules::DEFAULT_DOMAIN;
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain,
+        cardinality: CardinalitySettings {
+            max_descriptor_bytes: domain.len() + 1,
+            ..CardinalitySettings::default()
+        },
+    };
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    assert!(matches!(outcome, AccessOutcome::Cardinality));
+    let snap = region.stats().snapshot();
+    assert_eq!(snap.rejected_cardinality, 2);
+    assert_eq!(snap.allowed, 0);
+}
+
+#[test]
+fn decide_all_mixed_decline_and_cardinality_returns_cardinality() {
+    let (_buf, region) = build_zone(8, 16);
+    let cfg_a = RuleConfig {
+        name: "a".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: "k".into(),
+            source: "$does_not_exist".into(),
+        }],
+        limit: 10,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_millis(250),
+        mode: EnforcementMode::Enforce,
+        except_if: None,
+    };
+    let cfg_b = RuleConfig {
+        name: "b".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: "long_descriptor_key".into(),
+            source: "$http_x_tenant".into(),
+        }],
+        limit: 10,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_millis(250),
+        mode: EnforcementMode::Enforce,
+        except_if: None,
+    };
+    let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
+    let domain = crate::rules::DEFAULT_DOMAIN;
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain,
+        cardinality: CardinalitySettings {
+            max_descriptor_bytes: domain.len() + 1,
+            ..CardinalitySettings::default()
+        },
+    };
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    assert!(matches!(outcome, AccessOutcome::Cardinality));
+}
+
+#[test]
+fn decide_all_one_rule_exempt_one_rejects() {
+    let (_buf, region) = build_zone(8, 16);
+    let cfg_a = RuleConfig {
+        name: "a".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
+        }],
+        limit: 10,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_millis(250),
+        mode: EnforcementMode::Enforce,
+        except_if: Some("trusted".into()),
+    };
+    let cfg_b = RuleConfig {
+        name: "b".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: "k".into(),
+            source: "$http_x_tenant".into(),
+        }],
+        limit: 1,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_millis(250),
+        mode: EnforcementMode::Enforce,
+        except_if: None,
+    };
+    let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
+    let domain = crate::rules::DEFAULT_DOMAIN;
+
+    // SAFETY: see notes on the other ShmAggregateStore::new uses in this
+    // module — same single-writer test pattern.
+    let store = unsafe {
+        crate::shm::aggregate::ShmAggregateStore::new(
+            region.aggregate_slots_ptr(),
+            region.layout.aggregate_capacity,
+        )
+    };
+    let spec_b = rules.rules()[1].rule.spec();
+    let descriptors_b = [Descriptor {
+        key: "k",
+        value: "alice",
+    }];
+    let key_hash_b = hash_key(spec_b.id, domain, &descriptors_b);
+    store.write_delta(spec_b.fingerprint, key_hash_b.0, 0, 5, 0);
+
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain,
+        cardinality: CardinalitySettings::default(),
+    };
+    let vars = MockVars::new()
+        .set("http_x_tenant", "alice")
+        .set("trusted", "1");
+    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    match outcome {
+        AccessOutcome::Reject(info) => assert_eq!(info.spec.id, spec_b.id),
+        other => panic!("expected Reject, got {other:?}"),
+    }
+    let snap = region.stats().snapshot();
+    assert_eq!(snap.exempted, 1, "rule a still recorded its exemption");
+    assert_eq!(snap.rejected, 1);
+}
+
+#[test]
+fn cardinality_skip_does_not_push_queue_event() {
+    let (_buf, region) = build_zone(8, 16);
+    let rules = build_rules();
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain: crate::rules::DEFAULT_DOMAIN,
+        cardinality: CardinalitySettings {
+            max_descriptor_bytes: crate::rules::DEFAULT_DOMAIN.len() + 1,
+            ..CardinalitySettings::default()
+        },
+    };
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    let outcome = decide(ctx, 0, &vars, 0);
+    assert!(matches!(outcome, AccessOutcome::Cardinality));
+    let mut out = [QueueEvent::default(); 4];
+    assert_eq!(region.queue().drain(&mut out), 0);
+}
+
+#[test]
+fn except_does_not_count_cardinality() {
+    let (_buf, region) = build_zone(8, 16);
+    // Predicate truthy — request is exempted before the byte-budget check.
+    let rules = rule_with_predicate(Some("trusted"));
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain: crate::rules::DEFAULT_DOMAIN,
+        cardinality: CardinalitySettings {
+            max_descriptor_bytes: 1,
+            ..CardinalitySettings::default()
+        },
+    };
+    let vars = MockVars::new()
+        .set("http_x_tenant", "alice")
+        .set("trusted", "1");
+    let outcome = decide(ctx, 0, &vars, 0);
+    assert!(matches!(outcome, AccessOutcome::Allow));
+    let snap = region.stats().snapshot();
+    assert_eq!(
+        snap.rejected_cardinality, 0,
+        "exempt path skips budget check"
+    );
+    assert_eq!(snap.exempted, 1);
+}
+
+#[test]
+fn per_rule_exempt_counter_bumps_only_target_rule() {
+    let (_buf, region) = build_zone(8, 16);
+    let cfg_a = RuleConfig {
+        name: "a".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: "tenant_a".into(),
+            source: "$http_x_tenant".into(),
+        }],
+        limit: 10,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_millis(250),
+        mode: EnforcementMode::Enforce,
+        except_if: Some("trusted_a".into()),
+    };
+    let cfg_b = RuleConfig {
+        name: "b".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: "tenant_b".into(),
+            source: "$http_x_tenant".into(),
+        }],
+        limit: 10,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_millis(250),
+        mode: EnforcementMode::Enforce,
+        except_if: Some("trusted_b".into()),
+    };
+    let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain: crate::rules::DEFAULT_DOMAIN,
+        cardinality: CardinalitySettings::default(),
+    };
+    // Rule a exempts (truthy); rule b applies (falsy predicate).
+    let vars = MockVars::new()
+        .set("http_x_tenant", "alice")
+        .set("trusted_a", "1")
+        .set("trusted_b", "0");
+    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    assert!(matches!(outcome, AccessOutcome::Allow));
+    let snap = region.stats().snapshot();
+    // Rule ids are assigned 1, 2 in declaration order; per-rule slot is
+    // indexed by `rule_id - 1`.
+    assert_eq!(snap.exempted_per_rule[0], 1, "rule a exempted");
+    assert_eq!(snap.exempted_per_rule[1], 0, "rule b not exempted");
+    assert_eq!(snap.exempted, 1);
+}
+
+#[test]
+fn unknown_predicate_variable_fails_at_compile() {
+    use crate::rules::RuleConfigError;
+    // The NopBindingCompiler rejects anything that isn't a single
+    // `$identifier` or one of the inline fast-path arms. A hyphen in the
+    // identifier trips the legal-ident check, so the source `$bad-ident`
+    // forwarded through `except_if=` fails compilation.
+    let cfg = RuleConfig {
+        name: "bad".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
+        }],
+        limit: 10,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_millis(250),
+        mode: EnforcementMode::Enforce,
+        except_if: Some("bad-ident".into()),
+    };
+    let err = CompiledRules::compile(&[cfg]).expect_err("predicate compile rejected");
+    assert!(
+        matches!(err, RuleConfigError::CompileBinding { .. }),
+        "expected CompileBinding, got {err:?}"
+    );
 }
 
 #[test]

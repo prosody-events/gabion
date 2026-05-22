@@ -315,7 +315,7 @@ impl Default for StorageConfig {
 pub struct RuntimeTuningConfig {
     /// Optional seed for the node id. Falls back to
     /// `whoami::fallible::hostname()` then a fixed constant.
-    pub node_id_seed: Option<String>,
+    pub node_id_seed: Option<Box<str>>,
     /// Optional deterministic peer-sampling seed. When unset, startup draws
     /// fresh OS entropy.
     pub rng_seed: Option<u64>,
@@ -378,9 +378,9 @@ impl GossipSettings {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct LimitRuleConfig {
-    pub name: String,
-    pub domain: String,
-    pub descriptors: Vec<DescriptorConfig>,
+    pub name: Box<str>,
+    pub domain: Box<str>,
+    pub descriptors: Box<[DescriptorConfig]>,
     pub limit: u64,
     #[serde(with = "humantime_serde")]
     pub window: Duration,
@@ -393,7 +393,7 @@ pub struct LimitRuleConfig {
 impl LimitRuleConfig {
     pub fn to_rule(&self, id: RuleId) -> Result<Rule, ConfigError> {
         if self.descriptors.is_empty() {
-            return Err(ConfigError::EmptyDescriptorSet(self.name.clone()));
+            return Err(ConfigError::EmptyDescriptorSet(self.name.to_string()));
         }
         let descriptors = self
             .descriptors
@@ -405,7 +405,7 @@ impl LimitRuleConfig {
             .collect();
         Ok(Rule::new(
             id,
-            self.domain.clone(),
+            self.domain.to_string(),
             descriptors,
             self.limit,
             duration_millis(self.window),
@@ -417,13 +417,13 @@ impl LimitRuleConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DescriptorConfig {
-    pub key: String,
+    pub key: Box<str>,
     #[serde(default = "any_value")]
-    pub value: String,
+    pub value: Box<str>,
 }
 
-fn any_value() -> String {
-    "*".to_string()
+fn any_value() -> Box<str> {
+    Box::from("*")
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]

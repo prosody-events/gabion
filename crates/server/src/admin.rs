@@ -104,8 +104,8 @@ impl From<CellStoreStats> for CellStoreStatsSnapshot {
 pub struct RuleSnapshot {
     pub id: RuleId,
     pub fingerprint: String,
-    pub domain: String,
-    pub descriptors: Vec<DescriptorPatternSnapshot>,
+    pub domain: Box<str>,
+    pub descriptors: Box<[DescriptorPatternSnapshot]>,
     pub limit: u64,
     pub window_millis: u64,
     pub bucket_millis: u64,
@@ -115,8 +115,8 @@ pub struct RuleSnapshot {
 
 #[derive(Debug, Serialize)]
 pub struct DescriptorPatternSnapshot {
-    pub key: String,
-    pub value: String,
+    pub key: Box<str>,
+    pub value: Box<str>,
 }
 
 impl From<&DescriptorPattern> for DescriptorPatternSnapshot {

@@ -13,6 +13,8 @@ printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule tenant_api tenant:$arg_te
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule per_ip_stacked     ip:$remote_addr    rate=2r/m window=60s bucket=1s except_if=$trusted_ip;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule per_bot_stacked    class:$bot_class   rate=5r/m window=60s bucket=1s;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule shadow_canary      $uri               rate=1r/s window=1s bucket=1s dry_run;'
+printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule baseline_rule      $uri               rate=3r/m window=60s bucket=1s;'
+printf '%s\n' "$rendered" | grep -F 'gabion_limit baseline_rule;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_bind 0.0.0.0:9000;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_cluster 1;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_fanout 8;'
@@ -100,5 +102,31 @@ done
 sleep "$SETTLE_SLEEP"
 googlebot_429="$(curl -sS -A 'Googlebot/2.1' -o /dev/null -w '%{http_code}' "$googlebot_url")"
 test "$googlebot_429" = 429
+
+# /inherits/ — no `gabion_limit` declared at this location, so the
+# http-level `gabion_limit baseline_rule` (3r/m on $uri) is inherited.
+# First three requests pass, fourth gets 429.
+inherits_url="http://127.0.0.1:8080/inherits/index.html"
+for i in 1 2 3; do
+    inh_status="$(curl -fsS -o /dev/null -w '%{http_code}' "$inherits_url")"
+    test "$inh_status" = 200 || { echo "inherits request $i expected 200, got $inh_status"; exit 1; }
+done
+sleep "$SETTLE_SLEEP"
+inherits_429="$(curl -sS -o /dev/null -w '%{http_code}' "$inherits_url")"
+test "$inherits_429" = 429
+
+# /overrides/ — `gabion_limit uri_api;` REPLACES the inherited baseline;
+# uri_api is 2r/m. Only uri_api gates this location; baseline_rule
+# does not apply, so /overrides/ has its own independent budget keyed on
+# this distinct $uri. (uri_api was already exhausted earlier in this
+# script via /api/, so this URI's bucket is fresh — first two pass.)
+overrides_url="http://127.0.0.1:8080/overrides/index.html"
+o_first="$(curl -fsS -o /dev/null -w '%{http_code}' "$overrides_url")"
+o_second="$(curl -fsS -o /dev/null -w '%{http_code}' "$overrides_url")"
+sleep "$SETTLE_SLEEP"
+o_third="$(curl -sS -o /dev/null -w '%{http_code}' "$overrides_url")"
+test "$o_first" = 200
+test "$o_second" = 200
+test "$o_third" = 429
 
 nginx -s quit

@@ -249,6 +249,24 @@ gabion: `gabion_limit_rule` argument `key=$uri` is invalid: expected `$variable`
 gabion: `gabion_limit` references rule `tenant_api`, which is not declared via `gabion_limit_rule`
 ```
 
+## Unknown variable detection
+
+A typo in a `gabion_limit_rule` binding source — `except_if=$tursted_ip`
+when the operator meant `$trusted_ip` — fails `nginx -t` *before* the
+worker accepts a single request. The detection happens inside nginx core:
+`ngx_http_get_variable_index` declares a dependency on the variable name
+at config phase; nginx then runs `ngx_http_variables_init_vars` after
+every module's `postconfiguration` callback, walks each declared
+dependency, and emits a "unknown 'tursted_ip' variable" error and a
+non-zero exit when no module provides a getter.
+
+Gabion deliberately does **not** layer a second validator on top — the
+core check is exhaustive and the error message is already operator-clear.
+Make sure the module that provides the variable (e.g.
+`ngx_http_geoip2_module`, the `map` directive that defines `$bot_class`,
+the `geo` directive that defines `$trusted_ip`) is loaded before the
+`gabion_limit_rule` directive that references it.
+
 ## Fail-open invariant
 
 The only path that can return `429` is a successful, decisive determination
@@ -270,6 +288,37 @@ rules cap, rule-table lookup miss, …) decline rather than reject.
 the only sanctioned formatter. `make test` runs fmt-check, clippy, the
 workspace nextest suite, the safety integration tests, and hygiene. `make
 ci` adds Miri (Stacked Borrows) and the nginx smoke tests.
+
+### Miri coverage of the SHM unsafe surface
+
+Every `unsafe` block that touches the shared-memory zone, raw pointers into
+Rust-managed memory, or atomic operations on shared state is exercised by
+`crates/nginx/tests/safety.rs`, which runs under both Stacked Borrows
+(`make miri-safety`) and Tree Borrows (`make miri-safety-tb`). The table
+below maps each unsafe site to the test(s) that cover it.
+
+| Unsafe site                                       | Test(s) in `safety.rs`                                                                                                            |
+|---------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| `ShmRegion::initialize` (`shm.rs`)                | `master_stamps_node_id_and_initializes_region`, `concurrent_leader_writer_and_worker_readers`, `end_to_end_workers_push_leader_drains_workers_read`, `decide_and_leader_apply_concurrent`, `decide_all_multi_rule_concurrent` |
+| `ShmRegion::from_initialized`                     | `worker_view_via_from_initialized_sees_master_writes`, all concurrent tests                                                       |
+| `ShmAggregateStore::new` + `apply`                | `leader_stamps_incarnation_and_applies_deltas`, `concurrent_leader_writer_and_worker_readers`, `end_to_end_workers_push_leader_drains_workers_read`, `decide_all_multi_rule_concurrent` |
+| `AggregateTable::get` / seqlock read              | `access_path_allows_then_rejects_via_aggregate_seqlock`, all concurrent tests                                                     |
+| `RequestQueue::push` / `pop` (MPSC)               | `end_to_end_workers_push_leader_drains_workers_read` (3 producers + 1 consumer)                                                   |
+| `LeaderLease::try_acquire` / `release`            | `lease_takeover_under_contention`, `lease_concurrent_acquire_distinct_winners`                                                    |
+| `unsafe impl Send + Sync for BindingLookup`       | Documented contract; not Miri-testable (FFI-pointer-typed; soundness rests on nginx cycle-pool semantics)                         |
+| `unsafe impl Send + Sync for TestZone`            | Test-only; sound by construction (single owner, Box-backed)                                                                       |
+
+**FFI unsafe is necessarily uncovered by Miri.** Three FFI calls live in
+`NgxBindingCompiler::compile` (`ngx_http_get_variable_index`, `ngx_palloc`,
+`ngx_http_compile_complex_value`); five more in `RequestVariables::lookup`
+(`ngx_http_get_indexed_variable`, the complex-value accessor). The
+remaining FFI sites are nginx directive handlers and lifecycle hooks. None
+can run under Miri because Miri cannot execute nginx C code. They are
+entirely gated behind the `ngx-module` Cargo feature, which the Miri test
+build does not enable; soundness rests on the documented nginx contract
+(single-threaded config phase, pool-owned token storage, request lifetime
+tied to the access-phase handler), and every site carries a SAFETY block
+spelling out the relevant precondition.
 
 ## Migration from the previous DSL
 

@@ -2,15 +2,15 @@ use super::*;
 
 fn binding(key: &str, var: &str) -> DescriptorBinding {
     DescriptorBinding {
-        key: key.to_string(),
-        source: format!("${var}"),
+        key: key.into(),
+        source: format!("${var}").into_boxed_str(),
     }
 }
 
 fn cfg(name: &str, bindings: Vec<DescriptorBinding>) -> RuleConfig {
     RuleConfig {
-        name: name.to_string(),
-        domain: DEFAULT_DOMAIN.to_string(),
+        name: name.into(),
+        domain: DEFAULT_DOMAIN.into(),
         bindings,
         limit: 10,
         window: Duration::from_secs(60),

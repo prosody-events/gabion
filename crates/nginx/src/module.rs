@@ -41,6 +41,7 @@ use crate::leader::{self, GossipSettings, LeaderConfig};
 use crate::log;
 use crate::rules::{
     BindingCompiler, BindingLookup, CompiledRules, DEFAULT_DOMAIN, DescriptorBinding, RuleConfig,
+    is_single_ident,
 };
 use crate::shm::{Layout, ShmRegion};
 
@@ -68,7 +69,7 @@ struct WorkerGlobals {
     storage: StorageSettings,
     cardinality: CardinalitySettings,
     gossip_bind: Option<SocketAddr>,
-    identity_seed: Option<String>,
+    identity_seed: Option<Box<str>>,
     rng_seed: Option<u64>,
 }
 
@@ -190,14 +191,14 @@ impl http::HttpModule for Module {
 
 #[derive(Debug, Default)]
 struct MainConfig {
-    zone_name: Option<String>,
+    zone_name: Option<Box<str>>,
     rules: Vec<RuleConfig>,
     discovery: DiscoveryConfig,
     gossip: GossipSettings,
     storage: StorageSettings,
     cardinality: CardinalitySettings,
     gossip_bind: Option<SocketAddr>,
-    identity_seed: Option<String>,
+    identity_seed: Option<Box<str>>,
     rng_seed: Option<u64>,
     queue_capacity: usize,
     aggregate_capacity: usize,
@@ -778,7 +779,7 @@ extern "C" fn set_zone(
         SHM_LEN.store(total, Ordering::Release);
         SHM_QUEUE_CAPACITY.store(queue_capacity, Ordering::Release);
         SHM_AGGREGATE_CAPACITY.store(aggregate_capacity, Ordering::Release);
-        main.zone_name = Some(name.to_string());
+        main.zone_name = Some(name.into());
         tracing::info!(
             zone = name,
             bytes = total,
@@ -913,8 +914,8 @@ extern "C" fn set_rule(
         }
 
         main.rules.push(RuleConfig {
-            name: name.to_string(),
-            domain,
+            name: name.into(),
+            domain: domain.into(),
             bindings,
             limit,
             window,
@@ -977,7 +978,7 @@ fn parse_rule_arg(value: &str) -> RuleArg {
     }
     if let Some(rest) = value.strip_prefix("except_if=") {
         let var = rest.strip_prefix('$').unwrap_or(rest);
-        if var.is_empty() || !is_legal_ident(var) {
+        if var.is_empty() || !is_single_ident(var) {
             return RuleArg::Invalid("`except_if=` expects `$variable_name`");
         }
         return RuleArg::ExceptIf(var.to_string());
@@ -989,12 +990,6 @@ fn parse_rule_arg(value: &str) -> RuleArg {
              `mode=`, `dry_run`, `except_if=`, `domain=`",
         ),
     }
-}
-
-fn is_legal_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
-        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// nginx directive handler for `gabion_limit`. Valid at the http, server,
@@ -1422,7 +1417,7 @@ extern "C" fn set_identity_seed(
         let Some(value) = single_arg(cf) else {
             return core::NGX_CONF_ERROR;
         };
-        main.identity_seed = Some(value.to_string());
+        main.identity_seed = Some(value.into());
         core::NGX_CONF_OK
     }
 }
@@ -1571,11 +1566,14 @@ fn set_u64(
 ///
 /// `cf` must be a non-null pointer to a fully-initialised `ngx_conf_t` whose
 /// `args` array is populated with `ngx_str_t` elements that remain valid for
-/// the duration of the call. The returned `&'static str` actually borrows
-/// from nginx's config-file token storage, which (per nginx's contract)
-/// lives at least as long as the surrounding directive callback — callers
-/// must not retain the slice beyond the callback's lifetime even though the
-/// type is `'static`.
+/// the duration of the call. The returned `&'static str` is *technically*
+/// `'static` only to keep the type signature ergonomic — in practice the
+/// slice borrows from nginx's config-file token storage, which is owned by
+/// the cycle pool and lives at least as long as the surrounding directive
+/// callback. **Callers must not store the returned slice past the end of the
+/// directive callback** (e.g. into a `'static` map or a worker-globals
+/// field) without first copying into an owned `String`/`Box<str>`. Every
+/// current caller copies via `.into()` or `.to_string()` before storing.
 unsafe fn single_arg(cf: *mut ngx_conf_t) -> Option<&'static str> {
     // SAFETY: Per this function's documented contract, `cf` is non-null and
     // points to a valid `ngx_conf_t`; `(*cf).args` is a valid `ngx_array_t`;
@@ -1831,10 +1829,10 @@ fn parse_size_bytes(input: &str) -> Result<usize, ()> {
 fn parse_binding(rest: &str) -> Option<DescriptorBinding> {
     if rest.starts_with('$') {
         let stripped = &rest[1..];
-        if is_legal_ident(stripped) {
+        if is_single_ident(stripped) {
             return Some(DescriptorBinding {
-                key: stripped.to_string(),
-                source: rest.to_string(),
+                key: stripped.into(),
+                source: rest.into(),
             });
         }
         // Starts with `$` but is a template — requires an explicit key.
@@ -1845,8 +1843,8 @@ fn parse_binding(rest: &str) -> Option<DescriptorBinding> {
         return None;
     }
     Some(DescriptorBinding {
-        key: key.to_string(),
-        source: source.to_string(),
+        key: key.into(),
+        source: source.into(),
     })
 }
 

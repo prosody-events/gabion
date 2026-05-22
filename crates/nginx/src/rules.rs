@@ -47,13 +47,13 @@ impl Default for CardinalitySettings {
 /// with the nginx variable specification to evaluate at request time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DescriptorBinding {
-    pub key: String,
+    pub key: Box<str>,
     /// The variable specification as it appears in config after the `key`
     /// prefix is stripped: a single `$identifier` for the indexed-variable
     /// fast path or a template (anything that includes literal text or
     /// multiple `$identifier` substitutions) compiled via
     /// `ngx_http_compile_complex_value` at config phase.
-    pub source: String,
+    pub source: Box<str>,
 }
 
 /// Runtime-ready binding produced by compiling a [`DescriptorBinding`].
@@ -115,15 +115,15 @@ unsafe impl Sync for BindingLookup {}
 /// descriptor key with its [`BindingLookup`].
 #[derive(Debug)]
 pub struct CompiledBinding {
-    pub key: String,
+    pub key: Box<str>,
     pub lookup: BindingLookup,
 }
 
 /// Operator-facing rule configuration. Parsed from `gabion_limit_rule`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuleConfig {
-    pub name: String,
-    pub domain: String,
+    pub name: Box<str>,
+    pub domain: Box<str>,
     pub bindings: Vec<DescriptorBinding>,
     pub limit: u64,
     pub window: Duration,
@@ -145,22 +145,22 @@ pub struct RuleConfig {
 /// `RuleSpec` is reachable via `rule.spec()`.
 #[derive(Debug)]
 pub struct CompiledRule {
-    pub name: String,
+    pub name: Box<str>,
     pub rule: Rule,
-    pub bindings: Vec<CompiledBinding>,
+    pub bindings: Box<[CompiledBinding]>,
     /// Optional compiled predicate. When `Some` and the variable resolves
     /// to a truthy value at request time, the access path skips this rule
     /// — see `access::decide_one`.
     pub except_if: Option<BindingLookup>,
 }
 
-/// Composite of `RuleTable` + per-rule `Vec<DescriptorBinding>`. Shared (via
+/// Composite of `RuleTable` + per-rule [`CompiledBinding`]s. Shared (via
 /// `Arc`) between every worker's location config and the leader's drain
 /// task.
 #[derive(Debug)]
 pub struct CompiledRules {
     table: Arc<RuleTable>,
-    rules: Vec<CompiledRule>,
+    rules: Box<[CompiledRule]>,
 }
 
 /// Resolves binding sources into runtime-ready [`BindingLookup`] values.
@@ -275,31 +275,31 @@ impl CompiledRules {
         let mut rules = Vec::with_capacity(configs.len());
         for (idx, cfg) in configs.iter().enumerate() {
             if cfg.bindings.is_empty() {
-                return Err(RuleConfigError::EmptyBindings(cfg.name.clone()));
+                return Err(RuleConfigError::EmptyBindings(cfg.name.to_string()));
             }
             if cfg.bindings.len() > cardinality.max_descriptor_count {
-                return Err(RuleConfigError::TooManyBindings(cfg.name.clone()));
+                return Err(RuleConfigError::TooManyBindings(cfg.name.to_string()));
             }
             for binding in &cfg.bindings {
                 if binding.key.len() > cardinality.max_key_bytes {
                     return Err(RuleConfigError::KeyTooLong {
-                        rule: cfg.name.clone(),
-                        key: binding.key.clone(),
+                        rule: cfg.name.to_string(),
+                        key: binding.key.to_string(),
                     });
                 }
             }
             let id: RuleId = (idx + 1) as RuleId;
-            let descriptors = cfg
+            let descriptors: Vec<DescriptorPattern> = cfg
                 .bindings
                 .iter()
                 .map(|b| DescriptorPattern {
                     key: b.key.clone(),
-                    value: "*".to_string(),
+                    value: Box::from("*"),
                 })
                 .collect();
             let rule = Rule::new(
                 id,
-                cfg.domain.clone(),
+                cfg.domain.to_string(),
                 descriptors,
                 cfg.limit.max(1),
                 duration_millis(cfg.window),
@@ -311,8 +311,8 @@ impl CompiledRules {
             for binding in &cfg.bindings {
                 let lookup = compiler.compile(&binding.source).map_err(|err| {
                     RuleConfigError::CompileBinding {
-                        rule: cfg.name.clone(),
-                        spec: binding.source.clone(),
+                        rule: cfg.name.to_string(),
+                        spec: binding.source.to_string(),
                         message: err.to_string(),
                     }
                 })?;
@@ -326,7 +326,7 @@ impl CompiledRules {
                     let source = format!("${var}");
                     let lookup = compiler.compile(&source).map_err(|err| {
                         RuleConfigError::CompileBinding {
-                            rule: cfg.name.clone(),
+                            rule: cfg.name.to_string(),
                             spec: source,
                             message: err.to_string(),
                         }
@@ -338,13 +338,13 @@ impl CompiledRules {
             compiled.push(CompiledRule {
                 name: cfg.name.clone(),
                 rule,
-                bindings,
+                bindings: bindings.into_boxed_slice(),
                 except_if,
             });
         }
         Ok(Self {
             table: Arc::new(RuleTable::new(rules)),
-            rules: compiled,
+            rules: compiled.into_boxed_slice(),
         })
     }
 
@@ -357,11 +357,11 @@ impl CompiledRules {
     }
 
     pub fn by_name(&self, name: &str) -> Option<&CompiledRule> {
-        self.rules.iter().find(|r| r.name == name)
+        self.rules.iter().find(|r| &*r.name == name)
     }
 
     pub fn index_by_name(&self, name: &str) -> Option<usize> {
-        self.rules.iter().position(|r| r.name == name)
+        self.rules.iter().position(|r| &*r.name == name)
     }
 
     pub fn get(&self, index: usize) -> Option<&CompiledRule> {
