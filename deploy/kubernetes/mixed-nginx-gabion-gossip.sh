@@ -93,8 +93,8 @@ data:
     runtime:
       rng_seed: 12345
     discovery:
-      namespace_whitelist: ["$namespace"]
-      service_whitelist: ["gabiond", "gabion-nginx"]
+      namespace_allow: ["$namespace"]
+      service_allow: ["gabiond", "gabion-nginx"]
     gossip:
       bind: 0.0.0.0:9000
       tick_interval: 100ms

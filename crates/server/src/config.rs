@@ -167,12 +167,12 @@ pub const ENV_BINDINGS: &[EnvBinding] = &[
     // discovery.*
     EnvBinding::scalar("GABION_DISCOVERY_SELF_ADDR", "discovery.self_addr"),
     EnvBinding::list(
-        "GABION_DISCOVERY_NAMESPACE_WHITELIST",
-        "discovery.namespace_whitelist",
+        "GABION_DISCOVERY_NAMESPACE_ALLOW",
+        "discovery.namespace_allow",
     ),
     EnvBinding::list(
-        "GABION_DISCOVERY_SERVICE_WHITELIST",
-        "discovery.service_whitelist",
+        "GABION_DISCOVERY_SERVICE_ALLOW",
+        "discovery.service_allow",
     ),
 ];
 
@@ -443,6 +443,7 @@ fn any_value() -> String {
 pub enum EnforcementModeConfig {
     #[default]
     Enforce,
+    DryRun,
     Disabled,
 }
 
@@ -450,6 +451,7 @@ impl From<EnforcementModeConfig> for EnforcementMode {
     fn from(value: EnforcementModeConfig) -> Self {
         match value {
             EnforcementModeConfig::Enforce => EnforcementMode::Enforce,
+            EnforcementModeConfig::DryRun => EnforcementMode::DryRun,
             EnforcementModeConfig::Disabled => EnforcementMode::Disabled,
         }
     }
@@ -539,7 +541,7 @@ mod tests {
             defaults::STORAGE_RULE_DICTIONARY_CAPACITY
         );
         assert_eq!(cfg.gossip.fanout, defaults::GOSSIP_FANOUT);
-        assert!(cfg.discovery.namespace_whitelist.is_empty());
+        assert!(cfg.discovery.namespace_allow.is_empty());
         assert_eq!(cfg.runtime.rng_seed, None);
         assert_eq!(
             cfg.cardinality_limits().max_descriptor_bytes,
@@ -601,17 +603,17 @@ mod tests {
     #[test]
     fn comma_separated_lists_split_into_vec() {
         let _env = EnvGuard::lock();
-        set_env("GABION_DISCOVERY_NAMESPACE_WHITELIST", "ns-a,ns-b,ns-c");
-        set_env("GABION_DISCOVERY_SERVICE_WHITELIST", "svc-1,svc-2");
+        set_env("GABION_DISCOVERY_NAMESPACE_ALLOW", "ns-a,ns-b,ns-c");
+        set_env("GABION_DISCOVERY_SERVICE_ALLOW", "svc-1,svc-2");
 
         let cfg = AppConfig::load(None).expect("load env-only with lists");
 
         assert_eq!(
-            cfg.discovery.namespace_whitelist,
+            cfg.discovery.namespace_allow,
             ["ns-a", "ns-b", "ns-c"].map(String::from),
         );
         assert_eq!(
-            cfg.discovery.service_whitelist,
+            cfg.discovery.service_allow,
             ["svc-1", "svc-2"].map(String::from),
         );
     }
@@ -620,14 +622,14 @@ mod tests {
     fn list_parsing_trims_whitespace_and_skips_empties() {
         let _env = EnvGuard::lock();
         set_env(
-            "GABION_DISCOVERY_NAMESPACE_WHITELIST",
+            "GABION_DISCOVERY_NAMESPACE_ALLOW",
             " ns-a , ns-b ,, ns-c , ",
         );
 
         let cfg = AppConfig::load(None).expect("load env list");
 
         assert_eq!(
-            cfg.discovery.namespace_whitelist,
+            cfg.discovery.namespace_allow,
             ["ns-a", "ns-b", "ns-c"].map(String::from),
         );
     }

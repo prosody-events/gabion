@@ -25,7 +25,7 @@ use arrayvec::ArrayVec;
 use gabion::crdt::{Count, KeyHash};
 use gabion::defaults;
 use gabion::gossip::GossipClient;
-use gabion::rules::{Descriptor, RuleSpec, RuleTable, hash_key};
+use gabion::rules::{Descriptor, EnforcementMode, RuleSpec, RuleTable, hash_key};
 use thiserror::Error;
 
 use crate::admission::{CardinalityLimits, Decision, LimitRequest, RejectReason};
@@ -158,7 +158,9 @@ impl<C: Count> SharedLimiter<C> {
         // Pass 1: decide allow/reject and buffer (spec, key_hash, bucket)
         // for replay on the gossip-record path. One walk over `matching`,
         // one `hash_key` per matched rule, O(1) `Rule::spec()`. Early-exit
-        // on the first reject — no events have been queued yet.
+        // on the first enforcing reject — no events have been queued yet.
+        // Rules in `DryRun` mode are evaluated and recorded but never
+        // produce a reject verdict.
         let mut planned: ArrayVec<(RuleSpec, KeyHash, u32), MAX_MATCHED_RULES> = ArrayVec::new();
         for rule in self
             .rule_table
@@ -173,7 +175,9 @@ impl<C: Count> SharedLimiter<C> {
                 spec.bucket_millis,
                 spec.live_buckets,
             );
-            if total.saturating_add(request.hits) > spec.limit {
+            if total.saturating_add(request.hits) > spec.limit
+                && rule.mode == EnforcementMode::Enforce
+            {
                 return Decision::Reject(RejectReason::GlobalLimit);
             }
             let bucket = (now_millis / spec.bucket_millis) as u32;

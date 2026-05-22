@@ -136,6 +136,15 @@ in the request path to satisfy a lifetime — fix the lifetime.
 Identity is hashed once and threaded as `u128` / `KeyHash` from there. A
 second hash of the same bytes is a bug, not an optimisation.
 
+For owned string data that won't be mutated after construction (config
+entries, rule names, descriptor keys held in long-lived tables), prefer
+`Box<str>` over `String`. `String` carries a capacity field for amortised
+growth that owned-immutable data never uses — `Box<str>` is one word
+narrower per field, signals intent ("this is frozen"), and rules out
+accidental in-place mutation. Same logic for `Box<[T]>` over `Vec<T>`
+when the length is fixed at construction. Reach for `String`/`Vec<T>`
+only when you actually need `push`, `extend`, or capacity reuse.
+
 ## Strive for performance; benchmark the hot code
 
 Hot paths get realistic benchmarks (see `crates/gabion/benches/crdt.rs`)
@@ -175,9 +184,23 @@ enum tailored to the call site (`ServeError`, `ConfigError`,
 stringified original. Internal infallible code returns plain values —
 don't wrap success-only paths in `Result` for symmetry.
 
-`panic!`/`expect`/`unwrap` are reserved for genuine invariants (e.g.
-`stable_hasher`'s constant secret length). Anything that depends on
-inputs, config, or I/O must surface a typed error.
+Panicking is never allowed in production code when idiomatic error
+handling is possible. If a failure can be expressed as a `Result`,
+express it that way and let the caller decide. `panic!`/`expect`/`unwrap`
+are not a shortcut for "I don't want to plumb an error type."
+
+`debug_assert!` (and friends) are the right tool for enforcing
+invariants the type system can't capture: they document the
+precondition, catch violations in tests and debug builds, and compile
+out of release binaries so they cannot take down a production node.
+Reach for them instead of a runtime `panic!` whenever the condition is
+a programmer-error invariant rather than a recoverable failure.
+
+Runtime `panic!`/`expect`/`unwrap` survive in release builds and are
+reserved for genuine invariants that cannot be expressed any other way
+(e.g. `stable_hasher`'s constant secret length, where the input is a
+compile-time constant). Anything that depends on inputs, config, or
+I/O must surface a typed error.
 
 ## Simplicity, beauty, elegance
 
@@ -287,6 +310,16 @@ Other rules:
 The exemplars in tree are `note_cardinality_reject` and
 `note_gossip_record_failure` in `crates/server/src/lib.rs`. Copy their
 shape.
+
+## Documentation lives in README.md
+
+Project-level documentation belongs in `README.md` (or the appropriate
+`README.md` under a crate or `docs/` subdirectory). Don't scatter
+explanatory prose into new top-level `*.md` files, into long comment
+blocks at the top of source files, or into `CLAUDE.md` itself —
+`CLAUDE.md` is for contributor rules, not narrative docs. When you
+need to write something a human will read outside the code, put it in
+README.
 
 ## Workflow conventions
 

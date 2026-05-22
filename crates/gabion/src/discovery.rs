@@ -43,17 +43,17 @@ pub struct DiscoveryConfig {
     pub self_addr: Option<SocketAddr>,
     /// Kubernetes namespaces allowed for Service discovery; empty allows all
     /// namespaces.
-    pub namespace_whitelist: Vec<String>,
+    pub namespace_allow: Vec<String>,
     /// Kubernetes Service names allowed for discovery; empty allows all
     /// Services.
-    pub service_whitelist: Vec<String>,
+    pub service_allow: Vec<String>,
 }
 
 /// Build the configured peer discovery.
 pub fn from_config(config: DiscoveryConfig) -> impl PeerDiscovery {
     kubernetes::EndpointSliceDiscovery::new(
         config.self_addr,
-        config.namespace_whitelist,
-        config.service_whitelist,
+        config.namespace_allow,
+        config.service_allow,
     )
 }

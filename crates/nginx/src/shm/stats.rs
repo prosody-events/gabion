@@ -13,6 +13,7 @@ pub struct Stats {
     pub rejected_cardinality: AtomicU64,
     pub declines_invalid_descriptor: AtomicU64,
     pub matched_rule_overflows: AtomicU64,
+    pub exempted: AtomicU64,
     pub queue_pushed: AtomicU64,
     pub queue_drained: AtomicU64,
     pub queue_dropped: AtomicU64,
@@ -26,6 +27,7 @@ pub struct StatsSnapshot {
     pub rejected_cardinality: u64,
     pub declines_invalid_descriptor: u64,
     pub matched_rule_overflows: u64,
+    pub exempted: u64,
     pub queue_pushed: u64,
     pub queue_drained: u64,
     pub queue_dropped: u64,
@@ -40,6 +42,7 @@ impl Stats {
             rejected_cardinality: self.rejected_cardinality.load(Ordering::Relaxed),
             declines_invalid_descriptor: self.declines_invalid_descriptor.load(Ordering::Relaxed),
             matched_rule_overflows: self.matched_rule_overflows.load(Ordering::Relaxed),
+            exempted: self.exempted.load(Ordering::Relaxed),
             queue_pushed: self.queue_pushed.load(Ordering::Relaxed),
             queue_drained: self.queue_drained.load(Ordering::Relaxed),
             queue_dropped: self.queue_dropped.load(Ordering::Relaxed),
@@ -76,6 +79,13 @@ impl Stats {
     /// recorded), but operators want visibility into the bypass.
     pub fn record_matched_rule_overflow(&self) {
         self.matched_rule_overflows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A rule's `except_if=` predicate resolved truthy, so the rule was
+    /// skipped for this request. Operators watch this counter to detect a
+    /// misconfigured predicate that always-exempts.
+    pub fn record_exempt(&self) {
+        self.exempted.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_queue_push(&self) {

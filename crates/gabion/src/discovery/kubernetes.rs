@@ -25,20 +25,20 @@ const DEFAULT_GABION_SERVICE_NAME: &str = "gabion";
 #[derive(Clone)]
 pub struct EndpointSliceDiscovery {
     self_addr: Option<SocketAddr>,
-    namespace_whitelist: Vec<String>,
-    service_whitelist: Vec<String>,
+    namespace_allow: Vec<String>,
+    service_allow: Vec<String>,
 }
 
 impl EndpointSliceDiscovery {
     pub fn new(
         self_addr: Option<SocketAddr>,
-        namespace_whitelist: Vec<String>,
-        service_whitelist: Vec<String>,
+        namespace_allow: Vec<String>,
+        service_allow: Vec<String>,
     ) -> Self {
         Self {
             self_addr,
-            namespace_whitelist,
-            service_whitelist,
+            namespace_allow,
+            service_allow,
         }
     }
 }
@@ -65,7 +65,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                     return;
                 }
             };
-            let mut services = watch_services(&client, &self.namespace_whitelist);
+            let mut services = watch_services(&client, &self.namespace_allow);
             let mut endpoints = SelectAll::new();
             let mut watched: AHashMap<Target, oneshot::Sender<()>> = AHashMap::new();
 
@@ -95,7 +95,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                 return;
                             }
                         }
-                        Ok(event) => match service_change(event, &self.service_whitelist) {
+                        Ok(event) => match service_change(event, &self.service_allow) {
                             ServiceChange::Track(target) => {
                                 if let Entry::Vacant(slot) = watched.entry(target) {
                                     tracing::info!(
@@ -217,7 +217,7 @@ enum ServiceChange {
     Ignore,
 }
 
-fn service_change(event: Event<Service>, whitelist: &[String]) -> ServiceChange {
+fn service_change(event: Event<Service>, allow: &[String]) -> ServiceChange {
     let (svc, present) = match event {
         Event::Apply(svc) | Event::InitApply(svc) => {
             let present = has_gabion_udp_port(&svc);
@@ -229,7 +229,7 @@ fn service_change(event: Event<Service>, whitelist: &[String]) -> ServiceChange 
     let Some(target) = Target::take_from(svc) else {
         return ServiceChange::Ignore;
     };
-    if !matches_whitelist(&target.service_name, whitelist) {
+    if !matches_allow(&target.service_name, allow) {
         return ServiceChange::Ignore;
     }
     if present {
@@ -249,9 +249,9 @@ fn has_gabion_udp_port(service: &Service) -> bool {
 
 fn watch_services(
     client: &Client,
-    namespace_whitelist: &[String],
+    namespace_allow: &[String],
 ) -> impl Stream<Item = Result<Event<Service>, WatcherError>> + Send + Unpin {
-    let mut apis: Vec<Api<Service>> = namespace_whitelist
+    let mut apis: Vec<Api<Service>> = namespace_allow
         .iter()
         .filter(|s| !s.is_empty())
         .map(|ns| Api::namespaced(client.clone(), ns))
@@ -265,7 +265,7 @@ fn watch_services(
         // common single-namespace deployment. Cross-namespace discovery
         // (e.g. one HTTP namespace, separate gossip namespace) still works
         // by listing namespaces explicitly via the
-        // `gabion_gossip_discovery_namespace` directive.
+        // `gabion_discovery_namespace_allow` directive.
         let ns = client.default_namespace().to_owned();
         apis.push(Api::namespaced(client.clone(), &ns));
     }
@@ -301,10 +301,10 @@ fn is_fatal_status_code(code: u16) -> bool {
     matches!(code, 401 | 403 | 404)
 }
 
-/// True if `name` matches any non-empty entry in `whitelist`. A whitelist with
-/// no non-empty entries matches everything.
-fn matches_whitelist(name: &str, whitelist: &[String]) -> bool {
-    let mut entries = whitelist.iter().filter(|s| !s.is_empty()).peekable();
+/// True if `name` matches any non-empty entry in `allow`. An allow list
+/// with no non-empty entries matches everything.
+fn matches_allow(name: &str, allow: &[String]) -> bool {
+    let mut entries = allow.iter().filter(|s| !s.is_empty()).peekable();
     entries.peek().is_none() || entries.any(|s| s == name)
 }
 

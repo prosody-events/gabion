@@ -16,10 +16,23 @@ pub use crate::crdt::KeyHash;
 /// [`Rule::fingerprint`] for cross-node identity instead.
 pub type RuleId = u32;
 
+/// Operator-facing enforcement mode for a rule.
+///
+/// * `Enforce` — evaluate and reject on overflow.
+/// * `DryRun` — evaluate, record the hit (so metrics and gossip work), but
+///   never reject. Closes the observability gap between `Enforce` and
+///   `Disabled`. Excluded from no-op skipping in [`RuleTable::matching`];
+///   adapters must check the mode before mapping a verdict to a rejection.
+/// * `Disabled` — skip the rule entirely.
+///
+/// `Rule::fingerprint` deliberately does not hash `mode`: two nodes with the
+/// same rule shape but different enforcement settings must still share a
+/// cluster-wide counter identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum EnforcementMode {
     #[default]
     Enforce,
+    DryRun,
     Disabled,
 }
 
@@ -145,7 +158,10 @@ impl RuleTable {
     }
 
     /// Rules whose `(domain, descriptor pattern)` matches the request shape,
-    /// excluding any rule in [`EnforcementMode::Disabled`].
+    /// excluding any rule in [`EnforcementMode::Disabled`]. Rules in
+    /// [`EnforcementMode::DryRun`] are returned so adapters can still hash
+    /// the bucket and gossip the hit; adapters must check `rule.mode`
+    /// before mapping a verdict to a rejection.
     pub fn matching<'a>(
         &'a self,
         domain: &'a str,
@@ -153,7 +169,7 @@ impl RuleTable {
     ) -> impl Iterator<Item = &'a Rule> + 'a {
         let domain_hash = hash_domain(domain);
         self.rules.iter().filter(move |rule| {
-            rule.mode == EnforcementMode::Enforce
+            rule.mode != EnforcementMode::Disabled
                 && rule.domain_hash == domain_hash
                 && rule.descriptors.len() == descriptors.len()
                 && rule

@@ -30,7 +30,7 @@ use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, hash_key};
 use gabion::crdt::{NodeId, NodeIdentity};
 
 use gabion_nginx::access::{AccessCtx, AccessOutcome, CardinalitySettings, VariableLookup, decide};
-use gabion_nginx::rules::{CompiledRules, DescriptorBinding, RuleConfig};
+use gabion_nginx::rules::{BindingLookup, CompiledRules, DescriptorBinding, RuleConfig};
 use gabion_nginx::shm::aggregate::ShmAggregateStore;
 use gabion_nginx::shm::queue::QueueEvent;
 use gabion_nginx::shm::{Layout, ShmRegion};
@@ -98,12 +98,13 @@ fn build_rules() -> CompiledRules {
         domain: DEFAULT_DOMAIN.to_string(),
         bindings: vec![DescriptorBinding {
             key: "tenant".to_string(),
-            variable: "http_x_tenant".to_string(),
+            source: "$http_x_tenant".to_string(),
         }],
         limit: 2,
         window: std::time::Duration::from_secs(1),
         bucket: std::time::Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
+        except_if: None,
     }])
     .expect("compile rules")
 }
@@ -113,11 +114,12 @@ struct MockVars {
 }
 
 impl VariableLookup for MockVars {
-    fn value(&self, name: &str) -> Option<&[u8]> {
-        if name == "http_x_tenant" {
-            Some(&self.tenant)
-        } else {
-            None
+    fn lookup(&self, binding: &BindingLookup) -> Option<&[u8]> {
+        match binding {
+            BindingLookup::IndexedVariable { name, .. } if name.as_ref() == "http_x_tenant" => {
+                Some(&self.tenant)
+            }
+            _ => None,
         }
     }
 }

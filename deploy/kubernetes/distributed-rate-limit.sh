@@ -100,7 +100,7 @@ gossip:
   bind: 0.0.0.0:9000
   tick_interval: ${GOSSIP_TICK_INTERVAL}
 discovery:
-  namespace_whitelist: ["$namespace"]
+  namespace_allow: ["$namespace"]
 limits:
   - name: tenant_dist
     domain: nginx

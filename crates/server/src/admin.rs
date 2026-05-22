@@ -109,7 +109,8 @@ pub struct RuleSnapshot {
     pub limit: u64,
     pub window_millis: u64,
     pub bucket_millis: u64,
-    pub enforce: bool,
+    /// One of `"enforce"`, `"dry_run"`, `"disabled"`.
+    pub mode: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,7 +138,11 @@ impl From<&Rule> for RuleSnapshot {
             limit: rule.limit,
             window_millis: rule.window_millis,
             bucket_millis: rule.bucket_millis,
-            enforce: matches!(rule.mode, EnforcementMode::Enforce),
+            mode: match rule.mode {
+                EnforcementMode::Enforce => "enforce",
+                EnforcementMode::DryRun => "dry_run",
+                EnforcementMode::Disabled => "disabled",
+            },
         }
     }
 }
