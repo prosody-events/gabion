@@ -29,6 +29,7 @@ pub struct QueueSlot {
     pub bucket: std::sync::atomic::AtomicU32,
     pub _pad: std::sync::atomic::AtomicU32,
     pub hits: AtomicU64,
+    pub rule_limit: AtomicU64,
     pub now_millis: AtomicU64,
 }
 
@@ -43,6 +44,7 @@ impl QueueSlot {
             bucket: std::sync::atomic::AtomicU32::new(0),
             _pad: std::sync::atomic::AtomicU32::new(0),
             hits: AtomicU64::new(0),
+            rule_limit: AtomicU64::new(0),
             now_millis: AtomicU64::new(0),
         }
     }
@@ -55,6 +57,7 @@ pub struct QueueEvent {
     pub key_hash: u128,
     pub bucket: u32,
     pub hits: u64,
+    pub rule_limit: u64,
     pub now_millis: u64,
 }
 
@@ -189,6 +192,7 @@ fn write_slot(slot: &QueueSlot, event: QueueEvent) {
     slot.key_hash_hi.store((kh >> 64) as u64, Ordering::Relaxed);
     slot.bucket.store(event.bucket, Ordering::Relaxed);
     slot.hits.store(event.hits, Ordering::Relaxed);
+    slot.rule_limit.store(event.rule_limit, Ordering::Relaxed);
     slot.now_millis.store(event.now_millis, Ordering::Relaxed);
 }
 
@@ -200,6 +204,7 @@ fn read_slot(slot: &QueueSlot) -> QueueEvent {
             | slot.key_hash_lo.load(Ordering::Relaxed) as u128,
         bucket: slot.bucket.load(Ordering::Relaxed),
         hits: slot.hits.load(Ordering::Relaxed),
+        rule_limit: slot.rule_limit.load(Ordering::Relaxed),
         now_millis: slot.now_millis.load(Ordering::Relaxed),
     }
 }

@@ -384,6 +384,7 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
                 0,
                 record.hits as u64,
                 0,
+                0,
             )
             .await
             .is_err()
@@ -483,6 +484,7 @@ fn quickcheck_sim_partition_heals_without_overcount(mut case: PartitionCase) -> 
                     0,
                     record.hits as u64,
                     0,
+                    0,
                 )
                 .await
                 .unwrap();
@@ -554,11 +556,11 @@ fn quickcheck_sim_authentication_admits_only_matching_keys(case: AuthCase) -> Te
         let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
         client_a
-            .record(0xD00D, KeyHash(1), 0, case.a_hits as u64, 0)
+            .record(0xD00D, KeyHash(1), 0, case.a_hits as u64, 0, 0)
             .await
             .unwrap();
         client_b
-            .record(0xD00D, KeyHash(1), 0, case.b_hits as u64, 0)
+            .record(0xD00D, KeyHash(1), 0, case.b_hits as u64, 0, 0)
             .await
             .unwrap();
         sim_advance_ticks(Duration::from_millis(100), 20).await;
@@ -625,6 +627,7 @@ fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) 
                     0,
                     record.hits as u64,
                     0,
+                    0,
                 )
                 .await
                 .unwrap();
@@ -682,7 +685,7 @@ fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> Tes
 
         tokio::task::yield_now().await;
         client_a
-            .record(0xFACE, KeyHash(1), 0, case.hits as u64, 0)
+            .record(0xFACE, KeyHash(1), 0, case.hits as u64, 0, 0)
             .await
             .unwrap();
         sim_advance_ticks(Duration::from_millis(100), 20).await;
@@ -729,7 +732,7 @@ async fn record_acks_after_apply() {
 
             let rule_fp: u128 = 0xDEAD_BEEF;
             let key = KeyHash(0x1234);
-            client.record(rule_fp, key, 0, 5, 1_000).await.unwrap();
+            client.record(rule_fp, key, 0, 5, 0, 1_000).await.unwrap();
 
             // Read the count back from the store handle the test holds —
             // requires looking up the rule_slot.
@@ -740,7 +743,7 @@ async fn record_acks_after_apply() {
             let totals: u64 = agg.inner.borrow().values().copied().sum();
             assert_eq!(totals, 5);
 
-            client.record(rule_fp, key, 0, 3, 1_000).await.unwrap();
+            client.record(rule_fp, key, 0, 3, 0, 1_000).await.unwrap();
             let totals: u64 = agg.inner.borrow().values().copied().sum();
             assert_eq!(totals, 8);
 
@@ -788,8 +791,8 @@ async fn two_runtimes_converge_on_cluster_aggregate() {
             let rule_fp: u128 = 0xC0FE;
             let key = KeyHash(0xABCD);
 
-            client_a.record(rule_fp, key, 0, 3, 1_000).await.unwrap();
-            client_b.record(rule_fp, key, 0, 5, 1_000).await.unwrap();
+            client_a.record(rule_fp, key, 0, 3, 0, 1_000).await.unwrap();
+            client_b.record(rule_fp, key, 0, 5, 0, 1_000).await.unwrap();
 
             // Drive enough virtual ticks for both directions to drain.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
@@ -832,7 +835,7 @@ async fn apply_called_once_per_crdt_iteration() {
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
             // One record => one apply with deltas.len()==1.
-            client.record(0x11, KeyHash(1), 0, 4, 100).await.unwrap();
+            client.record(0x11, KeyHash(1), 0, 4, 0, 100).await.unwrap();
             let calls = agg.apply_call_lens();
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].0, 1);
@@ -881,7 +884,7 @@ async fn gossip_tick_drives_expiration() {
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
             // Hit at virtual time 0 — bucket 0.
-            client.record(0xFEED, KeyHash(7), 0, 2, 0).await.unwrap();
+            client.record(0xFEED, KeyHash(7), 0, 2, 0, 0).await.unwrap();
             assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 2);
 
             // Advance past one tick + past the live window.
@@ -956,7 +959,7 @@ async fn record_returns_after_apply_completes() {
             );
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
-            client.record(0xABC, KeyHash(1), 0, 3, 0).await.unwrap();
+            client.record(0xABC, KeyHash(1), 0, 3, 0, 0).await.unwrap();
             // After the ack returns, apply must have completed at least once.
             let totals: u64 = agg.inner.inner.borrow().values().copied().sum();
             assert_eq!(totals, 3);
@@ -1004,7 +1007,10 @@ async fn per_peer_frame_prunes_acked_cells() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            client_a.record(0xDEAD, KeyHash(1), 0, 4, 0).await.unwrap();
+            client_a
+                .record(0xDEAD, KeyHash(1), 0, 4, 0, 0)
+                .await
+                .unwrap();
             // Drive enough ticks for the eager-push lane to converge.
             sim_advance_ticks(Duration::from_millis(100), 5).await;
 
@@ -1060,7 +1066,10 @@ async fn dropped_packet_is_repaired() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            client_a.record(0xDEAD, KeyHash(1), 0, 7, 0).await.unwrap();
+            client_a
+                .record(0xDEAD, KeyHash(1), 0, 7, 0, 0)
+                .await
+                .unwrap();
             // Many ticks to allow the repair lane to retry.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
 
@@ -1128,9 +1137,18 @@ async fn partition_then_heal() {
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
             let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
 
-            client_a.record(0xDEAD, KeyHash(1), 0, 1, 0).await.unwrap();
-            client_b.record(0xDEAD, KeyHash(1), 0, 2, 0).await.unwrap();
-            client_c.record(0xDEAD, KeyHash(1), 0, 4, 0).await.unwrap();
+            client_a
+                .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
+                .await
+                .unwrap();
+            client_b
+                .record(0xDEAD, KeyHash(1), 0, 2, 0, 0)
+                .await
+                .unwrap();
+            client_c
+                .record(0xDEAD, KeyHash(1), 0, 4, 0, 0)
+                .await
+                .unwrap();
 
             // Drive ticks under partition.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
@@ -1209,7 +1227,10 @@ async fn simulates_minute_in_milliseconds() {
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
             let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
 
-            client_a.record(0xCAFE, KeyHash(99), 0, 1, 0).await.unwrap();
+            client_a
+                .record(0xCAFE, KeyHash(99), 0, 1, 0, 0)
+                .await
+                .unwrap();
 
             let start = Instant::now();
             // 60s of virtual time at 100ms cadence.
@@ -1305,7 +1326,10 @@ async fn gossip_tick_picks_peers_without_replacement() {
             let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
             let h_d = tokio::task::spawn_local(rt_d.run(futures::stream::empty()));
 
-            client_a.record(0xDEAD, KeyHash(1), 0, 1, 0).await.unwrap();
+            client_a
+                .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
+                .await
+                .unwrap();
             // With fanout = peer_count, every peer must receive the cell on
             // the first tick that fires after the record. Without-replacement
             // sampling is the invariant under test; with-replacement would
@@ -1391,11 +1415,11 @@ async fn udp_round_trip_smoke() {
                 .as_millis() as u64;
             let bucket = (now_millis / 1_000) as BucketEpoch;
             client_a
-                .record(0xC0FE, KeyHash(0xABCD), bucket, 3, now_millis)
+                .record(0xC0FE, KeyHash(0xABCD), bucket, 3, 0, now_millis)
                 .await
                 .unwrap();
             client_b
-                .record(0xC0FE, KeyHash(0xABCD), bucket, 5, now_millis)
+                .record(0xC0FE, KeyHash(0xABCD), bucket, 5, 0, now_millis)
                 .await
                 .unwrap();
 
@@ -1454,7 +1478,7 @@ async fn admin_snapshot_reflects_runtime_state() {
 
             // One record so the cell store is non-empty when we sample.
             client
-                .record(0xFEED, KeyHash(0x42), 0, 4, 100)
+                .record(0xFEED, KeyHash(0x42), 0, 4, 0, 100)
                 .await
                 .unwrap();
 
@@ -1596,7 +1620,9 @@ fn quickcheck_peer_slot_pairing_holds_across_lifecycle(case: PairingCase) -> Tes
                     let _ = peer_tx.send(PeerEvent::Removed(Peer::new(target)));
                 }
                 PairingOp::Record(key) => {
-                    let _ = client_local.record(0xAAAA, key_hash(*key), 0, 1, 0).await;
+                    let _ = client_local
+                        .record(0xAAAA, key_hash(*key), 0, 1, 0, 0)
+                        .await;
                 }
             }
             sim_advance_ticks(Duration::from_millis(100), 3).await;
@@ -1693,7 +1719,7 @@ fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
 
         // One record so the sender has dirty data to gossip every tick.
         client_sender
-            .record(0xB055, KeyHash(1), 0, 1, 0)
+            .record(0xB055, KeyHash(1), 0, 1, 0, 0)
             .await
             .unwrap();
 
@@ -1777,7 +1803,10 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             // One record on A. Each tick re-encodes A's dirty cell into a
             // packet for its only peer (B). B rejects each packet because
             // the auth keys don't match.
-            client_a.record(0xDEAD, KeyHash(1), 0, 1, 0).await.unwrap();
+            client_a
+                .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
+                .await
+                .unwrap();
 
             const TICKS: u32 = 8;
             sim_advance_ticks(Duration::from_millis(100), TICKS).await;
@@ -1852,7 +1881,10 @@ async fn send_queue_drains_after_recipient_backpressure() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
 
             for i in 0..6_u128 {
-                client_a.record(0xBA5, KeyHash(i), 0, 1, 0).await.unwrap();
+                client_a
+                    .record(0xBA5, KeyHash(i), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
             }
             sim_advance_ticks(Duration::from_millis(100), 12).await;
 
@@ -1970,6 +2002,7 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
                     0,
                     record.hits as u64,
                     0,
+                    0,
                 )
                 .await
                 .unwrap();
@@ -2077,6 +2110,315 @@ async fn peer_event_lifecycle_is_idempotent_and_tolerant() {
 
             client.shutdown().await.unwrap();
             let _ = handle.await;
+        })
+        .await;
+}
+
+// -- Threshold-triggered anti-entropy ---------------------------------------
+
+/// Threshold-trigger fires the moment a per-rule pending crosses ε, well
+/// before the proactive heartbeat would have run. Without the trigger,
+/// nothing would arrive at the peer until the heartbeat at `tick_interval`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn threshold_trigger_fires_before_heartbeat() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr_a = sock(54_000);
+            let addr_b = sock(54_001);
+            let id_a = NodeIdentity::new(NodeId(0xA1), 1);
+            let id_b = NodeIdentity::new(NodeId(0xB1), 1);
+
+            // Heartbeat is far in the future; only the threshold trigger
+            // could possibly deliver in the short window we sample.
+            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+            cfg_a.tick_interval = Duration::from_secs(1);
+            cfg_a.target_err_bps = 100;
+            cfg_a.min_emit_interval = Duration::from_millis(5);
+            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+            cfg_b.tick_interval = Duration::from_secs(1);
+
+            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+
+            let (rt_a, client_a) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                cfg_a,
+                store_for(id_a),
+                agg_a.clone(),
+            );
+            let (rt_b, _client_b) = GossipRuntime::from_parts(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                cfg_b,
+                store_for(id_b),
+                agg_b.clone(),
+            );
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+
+            // rule_limit=100, N=2 peers, target=100 bps =>
+            // ε = max(1, 100*100/(10000*2)) = 1. First hit puts pending=1
+            // (not yet > 1). Subsequent hits cross the budget.
+            //
+            // The rule has to be interned first or the threshold path is
+            // skipped on the very first hit; the local ingest interns it.
+            let rule_fp: u128 = 0xC0DE;
+            let key = KeyHash(0x99);
+            client_a.record(rule_fp, key, 0, 1, 100, 0).await.unwrap();
+            client_a.record(rule_fp, key, 0, 1, 100, 0).await.unwrap();
+            client_a.record(rule_fp, key, 0, 1, 100, 0).await.unwrap();
+
+            // Advance well under the heartbeat. The threshold trigger
+            // should have already pumped the gossip frame through.
+            sim_advance_ticks(Duration::from_millis(10), 5).await;
+
+            let sum_b: u64 = agg_b.inner.borrow().values().copied().sum();
+            assert!(
+                sum_b >= 1,
+                "expected threshold-fire to reach B before the 1s heartbeat, got sum_b={sum_b}",
+            );
+
+            client_a.shutdown().await.unwrap();
+            let _ = h_a.await;
+            h_b.abort();
+            let _ = h_b.await;
+        })
+        .await;
+}
+
+/// When ε saturates to 1 and the request stream pins it crossed every
+/// hit, the `min_emit_interval` floor caps the per-second emission rate.
+/// Drives 1000 hits across ~10 ms of virtual time; with a 5 ms floor the
+/// number of distinct emit-triggered ticks (= packets the recipient
+/// observed) must stay well below 1000.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn min_emit_interval_clamps_adversarial_rate() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::with_channel_capacity(256);
+            let addr_a = sock(54_010);
+            let addr_b = sock(54_011);
+            let id_a = NodeIdentity::new(NodeId(0xA2), 1);
+            let id_b = NodeIdentity::new(NodeId(0xB2), 1);
+
+            // ε saturates to 1 (limit=1). Heartbeat is far in the future
+            // so the only emissions are threshold-triggered.
+            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+            cfg_a.tick_interval = Duration::from_secs(10);
+            cfg_a.target_err_bps = 100;
+            cfg_a.min_emit_interval = Duration::from_millis(5);
+            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+            cfg_b.tick_interval = Duration::from_secs(10);
+
+            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+
+            let (rt_a, client_a) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                cfg_a,
+                store_for(id_a),
+                agg_a.clone(),
+            );
+            let (rt_b, _client_b) = GossipRuntime::from_parts(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                cfg_b,
+                store_for(id_b),
+                agg_b.clone(),
+            );
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+
+            let rule_fp: u128 = 0xCAB1E;
+            let key = KeyHash(0x11);
+
+            // Prime the rule so the threshold path takes effect on the
+            // first burst-loop iteration.
+            client_a.record(rule_fp, key, 0, 1, 1, 0).await.unwrap();
+
+            // 1000 hits across ~10 ms of virtual time; now_millis
+            // advances by 1 ms per 100 hits. The clamp applies through
+            // `req.now_millis - rule_last_emit_ms`.
+            for i in 0..1000_u64 {
+                let now_ms = i / 100;
+                client_a
+                    .record(rule_fp, key, 0, 1, 1, now_ms)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(1), 20).await;
+
+            // Each successful threshold-fire enqueues a single frame to B.
+            // SimRouter counts received frames. With 1000 hits and a 5 ms
+            // floor over ~10 ms, the count must stay well below the hit
+            // count by a large margin.
+            let received = router.received_count(addr_b);
+            assert!(
+                received < 200,
+                "min_emit_interval should clamp emit rate; got {received} frames for 1000 hits",
+            );
+
+            client_a.shutdown().await.unwrap();
+            let _ = h_a.await;
+            h_b.abort();
+            let _ = h_b.await;
+        })
+        .await;
+}
+
+/// Cold rules (with pending below ε) still get drained by the heartbeat.
+/// Without the heartbeat, a rule that never accumulates enough hits to
+/// fire the threshold would never replicate at all — eventual consistency
+/// would fail.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn heartbeat_still_drains_cold_rules() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr_a = sock(54_020);
+            let addr_b = sock(54_021);
+            let id_a = NodeIdentity::new(NodeId(0xA3), 1);
+            let id_b = NodeIdentity::new(NodeId(0xB3), 1);
+
+            // High budget so the single hit cannot cross ε.
+            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+            cfg_a.tick_interval = Duration::from_millis(100);
+            cfg_a.target_err_bps = 100;
+            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+            cfg_b.tick_interval = Duration::from_millis(100);
+
+            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+
+            let (rt_a, client_a) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                cfg_a,
+                store_for(id_a),
+                agg_a.clone(),
+            );
+            let (rt_b, _client_b) = GossipRuntime::from_parts(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                cfg_b,
+                store_for(id_b),
+                agg_b.clone(),
+            );
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+
+            // rule_limit=1_000_000, N=2, bps=100 =>
+            //   ε = 1_000_000*100/(10000*2) = 5000.
+            // One hit is far below ε, so the threshold never fires.
+            let rule_fp: u128 = 0xC01D;
+            client_a
+                .record(rule_fp, KeyHash(1), 0, 1, 1_000_000, 0)
+                .await
+                .unwrap();
+
+            // Advance past two heartbeats — the cold cell must propagate.
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+
+            let sum_b: u64 = agg_b.inner.borrow().values().copied().sum();
+            assert_eq!(sum_b, 1, "heartbeat should drain cold rules");
+
+            client_a.shutdown().await.unwrap();
+            let _ = h_a.await;
+            h_b.abort();
+            let _ = h_b.await;
+        })
+        .await;
+}
+
+/// Under sustained load, the cluster-wide unreplicated error per rule
+/// stays bounded by `target_err_bps / 10_000 × limit` plus slack for
+/// in-flight frames. Asserts a soft bound (≤ 2 × N × ε + tick slack)
+/// across many record batches.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn error_bound_holds_under_load() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            const NODES: usize = 4;
+            const LIMIT: u64 = 1_000;
+            const TARGET_BPS: u32 = 100; // 1 %
+
+            let router = SimRouter::with_channel_capacity(512);
+            let addrs: Vec<SocketAddr> = (0..NODES).map(|i| sock(54_100 + i as u16)).collect();
+
+            let mut clients = Vec::with_capacity(NODES);
+            let mut handles = Vec::with_capacity(NODES);
+            let mut aggregates = Vec::with_capacity(NODES);
+            for i in 0..NODES {
+                let identity = NodeIdentity::new(NodeId(0xC000 + i as u128), 1);
+                let peers: Vec<_> = addrs.iter().copied().filter(|a| *a != addrs[i]).collect();
+                let mut cfg = sim_config(identity, peers, 0xBEEF + i as u64);
+                cfg.fanout = NODES - 1;
+                cfg.target_err_bps = TARGET_BPS;
+                cfg.min_emit_interval = Duration::from_millis(1);
+                cfg.tick_interval = Duration::from_millis(100);
+                cfg.max_cells_per_tick = 64;
+                let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+                let (rt, client) = GossipRuntime::from_parts(
+                    router.bind(addrs[i]),
+                    TokioClock::from_millis(0),
+                    cfg,
+                    store_for(identity),
+                    agg.clone(),
+                );
+                handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+                clients.push(client);
+                aggregates.push(agg);
+            }
+
+            let rule_fp: u128 = 0xC0FE;
+            let key = KeyHash(0x44);
+            let batches = 50_u32;
+            let per_batch = 8_u64;
+            let mut real_total = 0_u64;
+            let mut max_lag = 0_u64;
+            for batch in 0..batches {
+                for client in clients.iter().take(NODES) {
+                    client
+                        .record(rule_fp, key, 0, per_batch, LIMIT, batch as u64)
+                        .await
+                        .unwrap();
+                    real_total += per_batch;
+                }
+                sim_advance_ticks(Duration::from_millis(2), 1).await;
+                let min_seen = aggregates
+                    .iter()
+                    .map(|a| a.snapshot().values().copied().sum::<u64>())
+                    .min()
+                    .unwrap_or(0);
+                let lag = real_total.saturating_sub(min_seen);
+                if lag > max_lag {
+                    max_lag = lag;
+                }
+            }
+
+            // ε per peer ≈ TARGET_BPS / 10_000 × LIMIT; the cluster-wide
+            // bound is N × ε. Allow slack for in-flight frames between
+            // trip and apply across all peers (one tick of writes).
+            let bound = ((LIMIT * TARGET_BPS as u64) / 10_000) * NODES as u64;
+            let tick_slack = NODES as u64 * per_batch * 2;
+            assert!(
+                max_lag <= bound.saturating_add(tick_slack).saturating_mul(2),
+                "error lag {max_lag} exceeded soft bound {bound} (+ slack {tick_slack})",
+            );
+
+            for client in clients {
+                let _ = client.shutdown().await;
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
         })
         .await;
 }

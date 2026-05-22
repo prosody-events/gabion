@@ -45,6 +45,8 @@ esac
 : "${RATE_LIMIT_BUCKET:=1s}"
 : "${WINDOW_MS:=1000}"
 : "${GOSSIP_TICK_INTERVAL:=100ms}"
+: "${GOSSIP_TARGET_ERR_BPS:=100}"
+: "${GOSSIP_MIN_EMIT_INTERVAL:=5ms}"
 : "${KEEP_NAMESPACE:=0}"
 
 namespace="gabion-${BACKEND}-dist-$$"
@@ -79,7 +81,9 @@ create_configmaps() {
             -v budget="$BUDGET_PER_TENANT" \
             -v window="$RATE_LIMIT_WINDOW" \
             -v bucket="$RATE_LIMIT_BUCKET" \
-            -v tick="$GOSSIP_TICK_INTERVAL" '
+            -v tick="$GOSSIP_TICK_INTERVAL" \
+            -v target_err_bps="$GOSSIP_TARGET_ERR_BPS" \
+            -v min_emit="$GOSSIP_MIN_EMIT_INTERVAL" '
                 /gabion_limit_rule tenant_dist / {
                     sub(/tenant_dist [0-9]+r\/s/, "tenant_dist " budget "r/s")
                     sub(/window=[^ ]+/, "window=" window)
@@ -88,6 +92,8 @@ create_configmaps() {
                 { print }
                 /gabion_gossip_fanout 8;/ {
                     print "    gabion_gossip_tick_interval " tick ";"
+                    print "    gabion_gossip_target_err_bps " target_err_bps ";"
+                    print "    gabion_gossip_min_emit_interval " min_emit ";"
                 }
             ' deploy/nginx/nginx.distributed.conf \
             | kubectl -n "$namespace" create configmap nginx-conf --from-file=nginx.conf=/dev/stdin
@@ -99,6 +105,8 @@ admin_bind: 0.0.0.0:9090
 gossip:
   bind: 0.0.0.0:9000
   tick_interval: ${GOSSIP_TICK_INTERVAL}
+  target_err_bps: ${GOSSIP_TARGET_ERR_BPS}
+  min_emit_interval: ${GOSSIP_MIN_EMIT_INTERVAL}
 discovery:
   namespace_allow: ["$namespace"]
 limits:

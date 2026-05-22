@@ -289,6 +289,7 @@ fn decide_one(
         key_hash: key_hash.0,
         bucket,
         hits: 1,
+        rule_limit: spec.limit,
         now_millis,
     });
     RuleOutcome::Allow(planned)

@@ -43,12 +43,19 @@ impl<C: Count> GossipClient<C> {
     /// runtime has consumed the request, applied the delta to the CRDT,
     /// and flushed the resulting rows through [`super::AggregateStore::apply`]
     /// — at that point the caller's own store handle reflects the increment.
+    ///
+    /// `rule_limit` is the matched rule's cluster-wide budget; the runtime
+    /// uses it to size the per-rule threshold-trigger error budget. Carried
+    /// per-request (rather than registered separately) so the library stays
+    /// oblivious to rule-reload protocols — the freshest limit always rides
+    /// with the hit.
     pub async fn record(
         &self,
         rule_fingerprint: u128,
         key_hash: KeyHash,
         bucket: BucketEpoch,
         hits: u64,
+        rule_limit: u64,
         now_millis: u64,
     ) -> Result<(), GossipError> {
         let (tx, rx) = oneshot::channel();
@@ -58,6 +65,7 @@ impl<C: Count> GossipClient<C> {
                 key_hash,
                 bucket,
                 hits,
+                rule_limit,
                 now_millis,
                 reply: tx,
             }))
@@ -94,6 +102,7 @@ pub(super) struct LimitRequest {
     pub key_hash: KeyHash,
     pub bucket: BucketEpoch,
     pub hits: u64,
+    pub rule_limit: u64,
     pub now_millis: u64,
     pub reply: oneshot::Sender<()>,
 }

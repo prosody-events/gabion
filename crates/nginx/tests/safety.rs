@@ -545,6 +545,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
                         key_hash: key_hash.0,
                         bucket,
                         hits: 1,
+                        rule_limit: 1_000,
                         now_millis: 0,
                     }) {
                         Ok(()) => break,

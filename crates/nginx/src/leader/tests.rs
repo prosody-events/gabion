@@ -26,6 +26,11 @@ fn defaults_match_shared_production_defaults() {
         defaults::GOSSIP_LIMIT_QUEUE_CAPACITY
     );
     assert_eq!(gossip.cluster_id_hash, defaults::GOSSIP_CLUSTER_ID_HASH);
+    assert_eq!(gossip.target_err_bps, defaults::GOSSIP_TARGET_ERR_BPS);
+    assert_eq!(
+        gossip.min_emit_interval,
+        Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS)
+    );
 
     let cell_store = production_cell_store_config();
     assert_eq!(cell_store.cell_capacity, defaults::STORAGE_MAX_CELLS as u32);

@@ -10,6 +10,7 @@ fn event(value: u8) -> QueueEvent {
         key_hash: u128::from(value) << 1,
         bucket: u32::from(value),
         hits: 1,
+        rule_limit: 1_000,
         now_millis: u64::from(value),
     }
 }
@@ -125,6 +126,7 @@ fn mpsc_concurrent_producers() {
                     key_hash: i as u128,
                     bucket: i as u32,
                     hits: 1,
+                    rule_limit: 1_000,
                     now_millis: i as u64,
                 };
                 loop {

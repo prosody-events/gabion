@@ -255,7 +255,25 @@ impl http::Merge for LocationConfig {
     }
 }
 
-static mut NGX_HTTP_GABION_COMMANDS: [ngx_command_t; 28] = [
+/// Build the static `[ngx_command_t; N + 1]` table nginx expects, sized
+/// automatically from the entry list and terminated with
+/// `ngx_command_t::empty()`. Avoids the previous footgun where adding or
+/// removing a directive required hand-bumping a hardcoded length and
+/// remembering to keep the sentinel at the end.
+macro_rules! ngx_command_table {
+    (static mut $name:ident = [ $($cmd:expr),* $(,)? ];) => {
+        static mut $name: [ngx_command_t;
+            <[()]>::len(&[$(ngx_command_table!(@unit $cmd)),*]) + 1]
+        = [
+            $($cmd,)*
+            ngx_command_t::empty(),
+        ];
+    };
+    (@unit $_e:expr) => { () };
+}
+
+ngx_command_table! {
+static mut NGX_HTTP_GABION_COMMANDS = [
     ngx_command_t {
         name: ngx_string!("gabion_limit_zone"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
@@ -358,6 +376,22 @@ static mut NGX_HTTP_GABION_COMMANDS: [ngx_command_t; 28] = [
         name: ngx_string!("gabion_gossip_limit_queue_capacity"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(set_gossip_limit_queue_capacity),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_gossip_target_err_bps"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_gossip_target_err_bps),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_gossip_min_emit_interval"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_gossip_min_emit_interval),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
         post: ptr::null_mut(),
@@ -474,8 +508,8 @@ static mut NGX_HTTP_GABION_COMMANDS: [ngx_command_t; 28] = [
         offset: 0,
         post: ptr::null_mut(),
     },
-    ngx_command_t::empty(),
 ];
+}
 
 static NGX_HTTP_GABION_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
     preconfiguration: Some(Module::preconfiguration),
@@ -1085,7 +1119,7 @@ extern "C" fn set_limit(
                 );
                 return core::NGX_CONF_ERROR;
             }
-            let Some(index) = main.rules.iter().position(|r| r.name == rule_name) else {
+            let Some(index) = main.rules.iter().position(|r| r.name.as_ref() == rule_name) else {
                 ngx::ngx_conf_log_error!(
                     NGX_LOG_EMERG,
                     cf,
@@ -1228,17 +1262,9 @@ extern "C" fn set_gossip_tick_interval(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(duration) = humantime::parse_duration(value) else {
-            return core::NGX_CONF_ERROR;
-        };
-        main.gossip.tick_interval = duration;
-        core::NGX_CONF_OK
-    }
+    set_duration(cf, conf, |main, value| {
+        main.gossip.tick_interval = value;
+    })
 }
 
 extern "C" fn set_gossip_max_payload_bytes(
@@ -1288,6 +1314,26 @@ extern "C" fn set_gossip_limit_queue_capacity(
 ) -> *mut c_char {
     set_usize(cf, conf, |main, value| {
         main.gossip.limit_queue_capacity = value.max(1);
+    })
+}
+
+extern "C" fn set_gossip_target_err_bps(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_u32(cf, conf, |main, value| {
+        main.gossip.target_err_bps = value;
+    })
+}
+
+extern "C" fn set_gossip_min_emit_interval(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_duration(cf, conf, |main, value| {
+        main.gossip.min_emit_interval = value;
     })
 }
 
@@ -1550,6 +1596,24 @@ fn set_u64(
             return core::NGX_CONF_ERROR;
         };
         let Ok(parsed) = value.parse::<u64>() else {
+            return core::NGX_CONF_ERROR;
+        };
+        apply(main, parsed);
+        core::NGX_CONF_OK
+    }
+}
+
+fn set_duration(
+    cf: *mut ngx_conf_t,
+    conf: *mut c_void,
+    apply: impl FnOnce(&mut MainConfig, Duration),
+) -> *mut c_char {
+    unsafe {
+        let main = &mut *(conf as *mut MainConfig);
+        let Some(value) = single_arg(cf) else {
+            return core::NGX_CONF_ERROR;
+        };
+        let Ok(parsed) = humantime::parse_duration(value) else {
             return core::NGX_CONF_ERROR;
         };
         apply(main, parsed);

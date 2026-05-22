@@ -62,6 +62,11 @@ fn defaults_apply_when_neither_yaml_nor_env_set_a_value() {
         defaults::STORAGE_RULE_DICTIONARY_CAPACITY
     );
     assert_eq!(cfg.gossip.fanout, defaults::GOSSIP_FANOUT);
+    assert_eq!(cfg.gossip.target_err_bps, defaults::GOSSIP_TARGET_ERR_BPS);
+    assert_eq!(
+        cfg.gossip.min_emit_interval,
+        Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS)
+    );
     assert!(cfg.discovery.namespace_allow.is_empty());
     assert_eq!(cfg.runtime.rng_seed, None);
     assert_eq!(
@@ -80,7 +85,8 @@ fn yaml_values_load_when_no_env_overrides() {
 
     let cfg = AppConfig::load_with_yaml_str(
         "envoy_bind: \"127.0.0.1:8000\"\nstorage:\n  max_cells: 256\n  rule_dictionary_capacity: \
-         8\ngossip:\n  bind: \"127.0.0.1:9000\"\n  fanout: 3\n",
+         8\ngossip:\n  bind: \"127.0.0.1:9000\"\n  fanout: 3\n  target_err_bps: 250\n  \
+         min_emit_interval: 7ms\n",
     )
     .expect("load yaml");
 
@@ -88,6 +94,8 @@ fn yaml_values_load_when_no_env_overrides() {
     assert_eq!(cfg.storage.max_cells, Some(256));
     assert_eq!(cfg.storage.rule_dictionary_capacity, 8);
     assert_eq!(cfg.gossip.fanout, 3);
+    assert_eq!(cfg.gossip.target_err_bps, 250);
+    assert_eq!(cfg.gossip.min_emit_interval, Duration::from_millis(7));
 }
 
 #[test]
@@ -95,14 +103,17 @@ fn env_overrides_yaml_for_scalars() {
     let _env = EnvGuard::lock();
     set_env("GABION_STORAGE_MAX_CELLS", "9999");
     set_env("GABION_GOSSIP_FANOUT", "12");
+    set_env("GABION_GOSSIP_TARGET_ERR_BPS", "250");
 
     let cfg = AppConfig::load_with_yaml_str(
-        "storage:\n  max_cells: 256\n  rule_dictionary_capacity: 8\ngossip:\n  fanout: 3\n",
+        "storage:\n  max_cells: 256\n  rule_dictionary_capacity: 8\ngossip:\n  fanout: 3\n  \
+         target_err_bps: 100\n",
     )
     .expect("load yaml + env");
 
     assert_eq!(cfg.storage.max_cells, Some(9999));
     assert_eq!(cfg.gossip.fanout, 12);
+    assert_eq!(cfg.gossip.target_err_bps, 250);
     // Untouched YAML value stays.
     assert_eq!(cfg.storage.rule_dictionary_capacity, 8);
 }
@@ -159,10 +170,12 @@ fn list_parsing_trims_whitespace_and_skips_empties() {
 fn duration_env_uses_humantime_syntax() {
     let _env = EnvGuard::lock();
     set_env("GABION_GOSSIP_TICK_INTERVAL", "250ms");
+    set_env("GABION_GOSSIP_MIN_EMIT_INTERVAL", "10ms");
 
     let cfg = AppConfig::load(None).expect("load tick_interval from env");
 
     assert_eq!(cfg.gossip.tick_interval, Duration::from_millis(250));
+    assert_eq!(cfg.gossip.min_emit_interval, Duration::from_millis(10));
 }
 
 #[test]

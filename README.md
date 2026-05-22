@@ -229,12 +229,14 @@ reject verdict. Useful for sizing a new rule before flipping it to
 
 The full list lives in `module.rs`; the common ones:
 
-| Directive                              | Description                                              |
-|----------------------------------------|----------------------------------------------------------|
-| `gabion_gossip_bind ADDR:PORT`         | UDP bind for the gossip channel.                         |
-| `gabion_gossip_cluster ID`             | Cluster identifier (u128 hash); peers must share.        |
-| `gabion_gossip_fanout N`               | How many peers each tick selects (defaults to 6).        |
-| `gabion_gossip_tick_interval DURATION` | Gossip cycle period (default 100ms).                     |
+| Directive                                   | Description                                                                        |
+|---------------------------------------------|------------------------------------------------------------------------------------|
+| `gabion_gossip_bind ADDR:PORT`              | UDP bind for the gossip channel.                                                   |
+| `gabion_gossip_cluster ID`                  | Cluster identifier (u128 hash); peers must share.                                  |
+| `gabion_gossip_fanout N`                    | How many peers each tick selects (defaults to 6).                                  |
+| `gabion_gossip_tick_interval DURATION`      | Gossip cycle period (default 100ms).                                               |
+| `gabion_gossip_target_err_bps N`            | Per-rule unreplicated-error budget in bps of the rule's limit (default 100 = 1 %). |
+| `gabion_gossip_min_emit_interval DURATION`  | Floor between threshold-fire emissions (default 5ms).                              |
 
 ## Configuration error messages
 

@@ -29,6 +29,23 @@ pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 128;
 pub const GOSSIP_LIMIT_QUEUE_CAPACITY: usize = 8192;
 pub const GOSSIP_CLUSTER_ID_HASH: u128 = 1;
 
+/// Per-rule error budget for threshold-triggered anti-entropy, expressed in
+/// basis points of the rule's own limit. A node emits the moment its locally
+/// unreplicated delta for some rule R would cross `target_err_bps / 10_000 ×
+/// L_R / N` (per-site safe zone of Sharfman, Schuster, Keren, SIGMOD 2006,
+/// calibrated by the Olston/Jiang/Widom SIGMOD 2003 error budget). The
+/// cluster-wide unreplicated error per rule is then bounded by
+/// `target_err_bps / 10_000 × L_R`, independent of request rate; default
+/// 100 bps = 1 % of the rule's limit.
+pub const GOSSIP_TARGET_ERR_BPS: u32 = 100;
+
+/// Floor on the gap between two threshold-fire emissions, in milliseconds.
+/// When the budget saturates to 1 hit under adversarial high-RPS traffic,
+/// this clamps worst-case bandwidth so a bad client cannot pin the gossip
+/// plane. Independent of the steady-state heartbeat (which still fires at
+/// `GOSSIP_TICK_INTERVAL_MILLIS`).
+pub const GOSSIP_MIN_EMIT_INTERVAL_MS: u64 = 5;
+
 pub fn random_rng_seed() -> Result<u64, getrandom::Error> {
     let mut bytes = [0_u8; 8];
     getrandom::fill(&mut bytes)?;

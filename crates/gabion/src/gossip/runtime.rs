@@ -130,6 +130,25 @@ where
     // path verify the queue actually grew under saturation.
     max_send_pending_depth: usize,
 
+    // Threshold-triggered anti-entropy state. One column per interned rule
+    // slot; sized to `STORAGE_RULE_DICTIONARY_CAPACITY` at construction and
+    // reused for the runtime's lifetime. Total cost ~1 KiB regardless of
+    // rule churn. Indexed by `RuleSlot` to keep the hot path's single
+    // dictionary lookup (`RuleDictionary::find`) the only identity work.
+    //
+    // - `rule_pending[slot]`     — local hits accumulated against rule `slot` since the last
+    //   gossip emit. Zeroed by the post-emit sweep in `handle_gossip_tick`.
+    // - `rule_last_emit_ms[slot]` — wall-clock stamp of the last emit that included this rule
+    //   (also stamped post-emit).
+    rule_pending: Box<[u32]>,
+    rule_last_emit_ms: Box<[u64]>,
+
+    // Set by `handle_limit_request` when the rule's per-site error budget
+    // would be exceeded by the new hit and the `min_emit_interval` floor
+    // has elapsed. Read at the top of the run loop, which then skips the
+    // `tokio::select!` wait and dispatches a synthetic `Tick` outcome.
+    want_immediate_flush: bool,
+
     _not_send: PhantomData<*const ()>,
 }
 
@@ -236,6 +255,10 @@ where
             .collect();
         let rng = SplitMix64::new(config.rng_seed);
 
+        let rule_capacity = store.rule_dictionary().capacity() as usize;
+        let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
+        let rule_last_emit_ms = vec![0_u64; rule_capacity].into_boxed_slice();
+
         let runtime = Self {
             config,
             store,
@@ -259,6 +282,9 @@ where
             pending_reply: None,
             decode_reject_count: 0,
             max_send_pending_depth: 0,
+            rule_pending,
+            rule_last_emit_ms,
+            want_immediate_flush: false,
             _not_send: PhantomData,
         };
         let client = GossipClient::new(req_tx);
@@ -294,7 +320,15 @@ where
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
 
-            let outcome = {
+            let outcome = if self.want_immediate_flush {
+                // A previous limit request crossed the per-rule error
+                // budget; skip the wait and dispatch a synthetic tick to
+                // emit the dirty rows immediately. `tick.tick()` is not
+                // consumed, so the heartbeat cadence naturally drifts
+                // forward (`MissedTickBehavior::Delay`).
+                self.want_immediate_flush = false;
+                ArmOutcome::Tick
+            } else {
                 // Split-borrow scope: we hand the I/O futures non-overlapping
                 // pieces of `self` so they compose inside `select!`.
                 let Self {
@@ -357,6 +391,48 @@ where
     // -- per-arm handlers ---------------------------------------------------
 
     fn handle_limit_request(&mut self, req: LimitRequest) {
+        // Threshold-triggered anti-entropy: track local hits per rule slot
+        // and fire an immediate flush once the per-site safe zone (Sharfman,
+        // Schuster, Keren — SIGMOD 2006) would be crossed, calibrated by
+        // the Olston/Jiang/Widom (SIGMOD 2003) error budget. Per-site
+        // budget: ε_R = max(1, L × target_err_bps / (10_000 × N)). Total
+        // cluster-wide unreplicated error per rule is bounded by N × ε_R.
+        // `saturating_add` keeps the column monotone across the gap between
+        // crossing and reset; the post-emit sweep in `handle_gossip_tick`
+        // zeroes the slot once a frame is queued.
+        //
+        // Falls through silently when the rule isn't interned yet (first
+        // hit for that fingerprint) — the next heartbeat picks it up.
+        if let Some(slot) = self.store.rule_dictionary().find(req.rule_fingerprint) {
+            let idx = slot as usize;
+            let pending =
+                self.rule_pending[idx].saturating_add(req.hits.min(u32::MAX as u64) as u32);
+            self.rule_pending[idx] = pending;
+            let peers = self.peers.len().max(1) as u64;
+            let limit = req.rule_limit.max(1);
+            let bps = self.config.target_err_bps.max(1) as u64;
+            let epsilon = ((limit.saturating_mul(bps)) / (10_000 * peers)).max(1);
+            if (pending as u64) > epsilon {
+                // The runtime's clock is the canonical floor reference, not
+                // `req.now_millis`. Adapter-supplied wall clock and
+                // `self.clock.now_millis()` may live on different epochs
+                // (wall vs paused-virtual time in tests), and only the
+                // runtime-local clock is monotone with the post-emit
+                // stamp written by `handle_gossip_tick`. Subtraction is
+                // still well-defined in monotonic-rate terms — both fire
+                // and reset use the same clock — so the floor is correct.
+                // `last == 0` is the "never emitted" sentinel so the very
+                // first crossing always fires; the post-emit sweep stamps
+                // `max(1)` so the sentinel is not re-introduced.
+                let now = self.clock.now_millis();
+                let last = self.rule_last_emit_ms[idx];
+                let floor = self.config.min_emit_interval.as_millis() as u64;
+                if last == 0 || now.saturating_sub(last) >= floor {
+                    self.want_immediate_flush = true;
+                }
+            }
+        }
+
         self.obs_buf.clear();
         self.sink_buf.clear();
         self.obs_buf.push(Observation {
@@ -561,8 +637,18 @@ where
         // same peer twice in one tick burns a send-pool slot encoding the
         // same frame for the same peer. `self.peers` has no ordering
         // contract elsewhere (lookups are by `addr`), so shuffling is free.
+        //
+        // Adaptive fanout (Verma & Ooi, ICDCS 2005): grow the per-tick
+        // fanout with the dirty-set bit length so a sudden burst converges
+        // in O(log N) rounds rather than O(N / fanout). `bit_length` for
+        // a u64 is `64 - leading_zeros`; for n ≥ 1 this is
+        // `floor(log2(n)) + 1`, which is what we want — a single dirty
+        // cell already deserves fanout ≥ 1. Capped at the peer count;
+        // falls back to `config.fanout` when dirty is small.
+        let dirty = self.store.local_dirty().len() + self.store.forwarded_dirty().len();
+        let log_dirty = (64 - (dirty as u64).leading_zeros()) as usize;
         let n = self.peers.len();
-        let pick_count = self.config.fanout.min(n);
+        let pick_count = self.config.fanout.max(log_dirty).min(n);
         for i in 0..pick_count {
             let j = i + (self.rng.next_u64() as usize) % (n - i);
             self.peers.swap(i, j);
@@ -599,6 +685,24 @@ where
                 continue;
             }
             self.encode_packets_for(peer_addr);
+        }
+
+        // Reset per-rule pending. The sweep treats every rule with
+        // non-zero pending as "touched in expectation by the tick" — the
+        // dirty-ring drain in `fill_gossip_frame*` doesn't tell us which
+        // rule slots actually made it onto the wire, but mass conservation
+        // (Kempe, Dobra, Gehrke — FOCS 2003) says every pending hit either
+        // rode out in this frame or sits in the dirty ring awaiting the
+        // next one. Under UDP loss the residual is repaired by the next
+        // round; the N × ε_R bound holds in expectation. A strict bound
+        // would require ack-aware reset against `peer_frontiers`,
+        // deferred until measurements show drift.
+        let stamp = now_millis.max(1);
+        for slot in 0..self.rule_pending.len() {
+            if self.rule_pending[slot] != 0 {
+                self.rule_pending[slot] = 0;
+                self.rule_last_emit_ms[slot] = stamp;
+            }
         }
     }
 

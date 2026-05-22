@@ -202,6 +202,7 @@ impl<C: Count> SharedLimiter<C> {
                     *key_hash,
                     *bucket,
                     request.hits,
+                    spec.limit,
                     now_millis,
                 )
                 .await

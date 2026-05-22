@@ -56,7 +56,7 @@ pub struct LeaderConfig {
     pub drain_tick: Duration,
     pub lease_tick: Duration,
     pub lease_ttl: Duration,
-    pub identity_seed: Option<String>,
+    pub identity_seed: Option<Box<str>>,
 }
 
 impl Default for LeaderConfig {
@@ -89,6 +89,13 @@ pub struct GossipSettings {
     pub send_queue_capacity: usize,
     pub limit_queue_capacity: usize,
     pub cluster_id_hash: u128,
+    /// Per-rule error budget for threshold-triggered anti-entropy, in
+    /// basis points of the rule's own limit. See
+    /// [`gabion::defaults::GOSSIP_TARGET_ERR_BPS`] for the derivation.
+    pub target_err_bps: u32,
+    /// Floor between two threshold-fire emissions. See
+    /// [`gabion::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
+    pub min_emit_interval: Duration,
 }
 
 impl Default for GossipSettings {
@@ -105,6 +112,8 @@ impl Default for GossipSettings {
             send_queue_capacity: defaults::GOSSIP_SEND_QUEUE_CAPACITY,
             limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
             cluster_id_hash: defaults::GOSSIP_CLUSTER_ID_HASH,
+            target_err_bps: defaults::GOSSIP_TARGET_ERR_BPS,
+            min_emit_interval: Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
         }
     }
 }
@@ -140,6 +149,8 @@ impl GossipSettings {
             tick_interval: self.tick_interval,
             auth_key: None,
             rng_seed,
+            target_err_bps: self.target_err_bps,
+            min_emit_interval: self.min_emit_interval,
         }
     }
 }
@@ -351,6 +362,7 @@ fn record_one(
                 KeyHash(ev.key_hash),
                 ev.bucket,
                 ev.hits,
+                ev.rule_limit,
                 ev.now_millis,
             )
             .await

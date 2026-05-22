@@ -26,6 +26,7 @@ use crate::transport::{CountingHandle, CountingTransport};
 const RULE_FINGERPRINT: u128 = 0xC0FE_DEAD_BEEF_BABE_F00D;
 const KEY: u128 = 0x0123_4567_89AB_CDEF;
 const BUCKET: BucketEpoch = 1;
+const RULE_LIMIT: u64 = 1_000_000;
 
 /// Run one scenario to completion and return its `ScenarioResult`.
 ///
@@ -129,6 +130,8 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
             tick_interval: scenario.tick_interval,
             auth_key: None,
             rng_seed: scenario.seed.wrapping_add(i as u64),
+            target_err_bps: gabion::defaults::GOSSIP_TARGET_ERR_BPS,
+            min_emit_interval: Duration::from_millis(gabion::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
         };
 
         let aggregate = Rc::new(BenchAggregateStore::<u32>::default());
@@ -306,6 +309,7 @@ async fn apply_workload(
                         KeyHash(KEY),
                         BUCKET,
                         *hits,
+                        RULE_LIMIT,
                         at.as_millis() as u64,
                     )
                     .await?;
@@ -326,6 +330,7 @@ async fn apply_workload(
                         KeyHash(KEY),
                         BUCKET,
                         *per_tick,
+                        RULE_LIMIT,
                         window_end.as_millis() as u64,
                     )
                     .await?;
@@ -350,6 +355,7 @@ async fn apply_workload(
                         KeyHash(KEY),
                         BUCKET,
                         *per_burst,
+                        RULE_LIMIT,
                         t.as_millis() as u64,
                     )
                     .await?;

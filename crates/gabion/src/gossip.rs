@@ -50,7 +50,10 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Number of peers contacted per gossip tick.
+    /// Minimum number of peers contacted per gossip tick. Under burst the
+    /// runtime grows this adaptively to keep up with the dirty set (Verma
+    /// & Ooi, ICDCS 2005); see `handle_gossip_tick` in `runtime.rs`. Idle
+    /// heartbeat ticks always pick exactly this many peers.
     pub fanout: usize,
     /// Frame composition: how many cells `fill_gossip_frame*` may emit per
     /// tick. The wire codec splits this into multiple packets if needed.
@@ -69,6 +72,13 @@ pub struct GossipConfig {
     pub auth_key: Option<HmacKey>,
     /// Deterministic RNG seed for peer sampling.
     pub rng_seed: u64,
+    /// Per-rule error budget in basis points of the rule's own limit, used
+    /// for threshold-triggered anti-entropy. See
+    /// [`crate::defaults::GOSSIP_TARGET_ERR_BPS`].
+    pub target_err_bps: u32,
+    /// Minimum gap between two threshold-fire emissions, in milliseconds.
+    /// See [`crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
+    pub min_emit_interval: Duration,
 }
 
 impl Default for GossipConfig {
@@ -85,6 +95,8 @@ impl Default for GossipConfig {
             tick_interval: Duration::from_millis(100),
             auth_key: None,
             rng_seed: crate::defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
+            target_err_bps: crate::defaults::GOSSIP_TARGET_ERR_BPS,
+            min_emit_interval: Duration::from_millis(crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
         }
     }
 }

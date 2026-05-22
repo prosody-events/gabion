@@ -105,6 +105,8 @@ data:
       send_queue_capacity: 32
       limit_queue_capacity: 1024
       cluster_id_hash: 1
+      target_err_bps: 100
+      min_emit_interval: 5ms
     limits:
       - name: nginx_uri
         domain: nginx

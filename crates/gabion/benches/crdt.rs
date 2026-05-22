@@ -438,6 +438,111 @@ fn bench_ingest_local(c: &mut Criterion) {
         });
     }
 
+    // ─── threshold_trigger_steady_state ────────────────────────────────
+    // Models the runtime's additional per-request work (`handle_limit_request`
+    // in `crates/gabion/src/gossip/runtime.rs`): one `rule_dictionary.find`
+    // lookup, one saturating-add into a per-rule pending column, one
+    // mul/div for ε, one compare. Target: < 1% regression vs `steady_state`
+    // with `batch == 128`.
+    for &batch in &[1usize, 32, 128] {
+        group.throughput(Throughput::Elements(batch as u64));
+        group.bench_function(
+            BenchmarkId::new("threshold_trigger_steady_state", batch),
+            |b| {
+                b.iter_batched_ref(
+                    || {
+                        (
+                            fixture.store.clone(),
+                            ObservationBatch::<u32>::with_capacity(batch),
+                            DeltaSink::<u32>::with_capacity(batch),
+                            Rng::new(0x7E57_7E57),
+                            vec![0_u32; 64].into_boxed_slice(),
+                        )
+                    },
+                    |(store, obs, sink, rng, pending)| {
+                        obs.clear();
+                        sink.clear();
+                        for _ in 0..batch {
+                            let pick = rng.range(100);
+                            let key = if pick < 95 {
+                                pareto_key(rng, &fixture.hot_keys, &fixture.warm_keys)
+                            } else {
+                                fresh_key(rng)
+                            };
+                            let rule_idx = pick_rule(rng) as usize;
+                            let bucket = pick_bucket(rng);
+                            let fp = fixture.rule_fps[rule_idx];
+                            // Mirror the runtime's threshold-trigger arithmetic:
+                            // lookup the rule slot, bump per-rule pending,
+                            // compute ε, compare. We don't store the flag; the
+                            // compare's side effects are observed via `black_box`.
+                            if let Some(slot) = store.rule_dictionary().find(fp) {
+                                let idx = slot as usize;
+                                let p = pending[idx].saturating_add(1);
+                                pending[idx] = p;
+                                let epsilon = (1_000_000_u64 * 100) / (10_000 * 8);
+                                black_box((p as u64) > epsilon);
+                            }
+                            obs.push(obs_row(
+                                fp,
+                                KeyHash(key),
+                                bucket,
+                                LOCAL_NODE,
+                                LOCAL_INCARNATION,
+                                1,
+                                0,
+                            ));
+                        }
+                        store.ingest_local(black_box(obs), black_box(sink));
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    // ─── threshold_trigger_burst ───────────────────────────────────────
+    // Burst of 50k hits to a previously-quiet single rule: measures
+    // crossing-detection + repeated immediate-tick cost on the
+    // adversarial path. ε saturates to 1, so every iteration past the
+    // first crosses. We don't measure the runtime's tick dispatch here
+    // — only the per-request lookup/add/compare — but the bench is
+    // sized so a future regression in those primitives is visible.
+    let burst_keys: Vec<u128> = fixture.hot_keys.iter().take(64).copied().collect();
+    group.throughput(Throughput::Elements(128));
+    group.bench_function("threshold_trigger_burst", |b| {
+        let mut store = fixture.store.clone();
+        let mut obs = ObservationBatch::<u32>::with_capacity(128);
+        let mut sink = DeltaSink::<u32>::with_capacity(128);
+        let mut rng = Rng::new(0xB0_B0_B0);
+        let mut pending = vec![0_u32; 64].into_boxed_slice();
+        b.iter(|| {
+            obs.clear();
+            sink.clear();
+            for _ in 0..128 {
+                let key = burst_keys[rng.range(burst_keys.len() as u32) as usize];
+                let fp = fixture.rule_fps[0];
+                if let Some(slot) = store.rule_dictionary().find(fp) {
+                    let idx = slot as usize;
+                    let p = pending[idx].saturating_add(1);
+                    pending[idx] = p;
+                    let epsilon = 1_u64; // saturated case
+                    black_box((p as u64) > epsilon);
+                }
+                obs.push(obs_row(
+                    fp,
+                    KeyHash(key),
+                    0,
+                    LOCAL_NODE,
+                    LOCAL_INCARNATION,
+                    1,
+                    0,
+                ));
+            }
+            store.ingest_local(black_box(&obs), black_box(&mut sink));
+        });
+    });
+
     // ─── cold_start ─────────────────────────────────────────────────────
     // Empty store at process start: each ingest pushes 32 fresh keys per
     // realistic Pareto distribution. Pure insert path. Use the smaller
