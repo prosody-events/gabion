@@ -17,8 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Interval;
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation,
-    ObservationBatch,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
 };
 use crate::discovery::PeerEvent;
 use crate::wire::{self, PacketBuf, Packets, WireScratch};
@@ -508,10 +507,8 @@ where
                     // Bootstrap fallback: we haven't heard from this peer
                     // yet, so we don't know what to prune. Send an unpruned
                     // frame; the next inbound from them caches the slot.
-                    self.store.fill_gossip_frame(
-                        self.config.max_cells_per_tick,
-                        &mut self.frame_handles,
-                    );
+                    self.store
+                        .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
                 }
             }
             if self.frame_handles.is_empty() {
@@ -586,7 +583,10 @@ enum ArmOutcome {
 /// Read one admin command. Only invoked when `admin_rx.is_some()` — the
 /// `select!` guard ensures the unwrap is safe.
 async fn recv_admin(rx: &mut Option<mpsc::Receiver<AdminCommand>>) -> Option<AdminCommand> {
-    rx.as_mut().expect("admin arm gated by admin_rx.is_some()").recv().await
+    rx.as_mut()
+        .expect("admin arm gated by admin_rx.is_some()")
+        .recv()
+        .await
 }
 
 fn make_tick(config: &GossipConfig) -> Interval {

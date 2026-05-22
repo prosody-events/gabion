@@ -81,12 +81,9 @@ impl LeaderLease {
     /// is still zero (default), so repeated initializations don't clobber
     /// a live anchor.
     pub fn set_init_millis(&self, now_millis: u64) {
-        let _ = self.init_millis.compare_exchange(
-            0,
-            now_millis,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ =
+            self.init_millis
+                .compare_exchange(0, now_millis, Ordering::AcqRel, Ordering::Acquire);
     }
 
     pub fn init_millis(&self) -> u64 {
@@ -140,12 +137,10 @@ impl LeaderLease {
             // Take over an idle/expired lease. Single CAS on the packed
             // state guarantees owner and expires update atomically.
             let new_state = pack(owner_id, new_expires_rel);
-            match self.state.compare_exchange(
-                state,
-                new_state,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .state
+                .compare_exchange(state, new_state, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
                     self.epoch.fetch_add(1, Ordering::AcqRel);
                     return true;

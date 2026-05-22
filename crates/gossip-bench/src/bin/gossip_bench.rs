@@ -61,8 +61,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
         Cmd::Run { scenario } => {
             let raw = read_path_or_stdin(&scenario)?;
-            let scenario: Scenario =
-                serde_json::from_str(&raw).context("parse scenario JSON")?;
+            let scenario: Scenario = serde_json::from_str(&raw).context("parse scenario JSON")?;
             let result = scenarios::run_scenario(scenario).await?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
@@ -93,8 +92,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Example { kind } => {
-            let json = example_scenario(&kind)
-                .with_context(|| format!("unknown example kind: {kind}"))?;
+            let json =
+                example_scenario(&kind).with_context(|| format!("unknown example kind: {kind}"))?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
             out.write_all(json.as_bytes())?;
@@ -121,8 +120,8 @@ fn example_scenario(kind: &str) -> Option<String> {
     use std::time::Duration;
 
     use gossip_bench::scenario::{
-        LinkAction, LinkModel, NetworkModel, Scenario, ScenarioKind,
-        ScheduledNetworkChange, Workload,
+        LinkAction, LinkModel, NetworkModel, Scenario, ScenarioKind, ScheduledNetworkChange,
+        Workload,
     };
 
     let mut base = Scenario {

@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
 
-ARG NGINX_BASE_IMAGE=nginx:stable-alpine
+ARG OPENRESTY_BASE_IMAGE=openresty/openresty:alpine
 
-FROM ${NGINX_BASE_IMAGE} AS module-builder
+FROM ${OPENRESTY_BASE_IMAGE} AS module-builder
 
-ARG NGINX_BASE_IMAGE=nginx:stable-alpine
+ARG OPENRESTY_BASE_IMAGE=openresty/openresty:alpine
 
 SHELL ["/bin/sh", "-euxc"]
 
@@ -19,7 +19,9 @@ RUN if command -v apk >/dev/null 2>&1; then \
             linux-headers \
             llvm-dev \
             openssl-dev \
+            pcre-dev \
             pcre2-dev \
+            perl \
             rust \
             zlib-dev; \
     elif command -v apt-get >/dev/null 2>&1; then \
@@ -31,37 +33,45 @@ RUN if command -v apk >/dev/null 2>&1; then \
             clang \
             curl \
             libclang-dev \
+            libpcre3-dev \
             libpcre2-dev \
             libssl-dev \
             llvm-dev \
+            perl \
             rustc \
             zlib1g-dev; \
         rm -rf /var/lib/apt/lists/*; \
     else \
-        echo "Unsupported nginx base image package manager: ${NGINX_BASE_IMAGE}" >&2; \
+        echo "Unsupported OpenResty base image package manager: ${OPENRESTY_BASE_IMAGE}" >&2; \
         exit 1; \
     fi
 
 WORKDIR /workspace
 
-RUN nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
-    && curl -fsSLO "https://nginx.org/download/nginx-${nginx_version}.tar.gz" \
-    && tar -xzf "nginx-${nginx_version}.tar.gz" \
-    && cd "nginx-${nginx_version}" \
-    && ./configure --with-compat
+RUN openresty_version="$(nginx -v 2>&1 | sed 's#nginx version: openresty/##')" \
+    && curl -fsSLO "https://openresty.org/download/openresty-${openresty_version}.tar.gz" \
+    && tar -xzf "openresty-${openresty_version}.tar.gz" \
+    && cd "openresty-${openresty_version}" \
+    && ./configure --with-compat \
+    && nginx_build_dir="$(find "$PWD/build" -maxdepth 2 -type d -name objs | head -n 1)" \
+    && nginx_source_dir="$(dirname "${nginx_build_dir}")" \
+    && test -n "${nginx_source_dir}" \
+    && test -n "${nginx_build_dir}" \
+    && printf 'NGINX_SOURCE_DIR=%s\nNGINX_BUILD_DIR=%s\n' \
+        "${nginx_source_dir}" "${nginx_build_dir}" > /workspace/openresty-nginx-build.env
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
+RUN . /workspace/openresty-nginx-build.env \
     && CARGO_BUILD_RUSTC_WRAPPER= \
-       NGINX_SOURCE_DIR="/workspace/nginx-${nginx_version}" \
-       NGINX_BUILD_DIR="/workspace/nginx-${nginx_version}/objs" \
+       NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR}" \
+       NGINX_BUILD_DIR="${NGINX_BUILD_DIR}" \
        cargo build -p gabion-nginx --release --features ngx-module \
     && mkdir -p /out \
     && cp target/release/libgabion_nginx.so /out/ngx_http_gabion_module.so
 
-FROM ${NGINX_BASE_IMAGE}
+FROM ${OPENRESTY_BASE_IMAGE}
 
 SHELL ["/bin/sh", "-euxc"]
 
@@ -77,4 +87,7 @@ COPY --from=module-builder /out/ngx_http_gabion_module.so /etc/nginx/modules/ngx
 COPY deploy/nginx/nginx.module.conf /etc/nginx/nginx.conf
 COPY deploy/nginx/module-request-smoke.sh /usr/local/bin/gabion-nginx-request-smoke
 
-RUN chmod +x /usr/local/bin/gabion-nginx-request-smoke
+RUN mkdir -p /usr/local/openresty/nginx/modules \
+    && cp /etc/nginx/modules/ngx_http_gabion_module.so /usr/local/openresty/nginx/modules/ngx_http_gabion_module.so \
+    && cp /etc/nginx/nginx.conf /usr/local/openresty/nginx/conf/nginx.conf \
+    && chmod +x /usr/local/bin/gabion-nginx-request-smoke

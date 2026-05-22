@@ -105,11 +105,11 @@ fn maps_descriptors_and_returns_ok_or_over_limit() {
             hits_addend: 2,
         };
 
-        let first = harness.limiter.should_rate_limit_at(request.clone(), 0).await;
-        let second = harness
+        let first = harness
             .limiter
-            .should_rate_limit_at(request, 1)
+            .should_rate_limit_at(request.clone(), 0)
             .await;
+        let second = harness.limiter.should_rate_limit_at(request, 1).await;
 
         assert_eq!(first.overall_code, rate_limit_response::Code::Ok as i32);
         // The second request pushes the bucket from 2 to 4 — still under the
@@ -159,7 +159,11 @@ fn record_then_read_credits_rejected_requests() {
             hits_addend: 3,
         };
         assert_eq!(
-            harness.limiter.should_rate_limit_at(fill_b, 0).await.overall_code,
+            harness
+                .limiter
+                .should_rate_limit_at(fill_b, 0)
+                .await
+                .overall_code,
             rate_limit_response::Code::Ok as i32
         );
 

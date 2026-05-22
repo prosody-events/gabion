@@ -211,26 +211,26 @@ impl ShmAggregateStore {
     ///   `capacity` `AggregateSlot` values that have been fully initialized
     ///   (e.g. via `AggregateSlot::empty()` performed by the nginx master
     ///   before fork).
-    /// * `capacity` is a power of two, at least 2, and the total size
-    ///   `capacity * size_of::<AggregateSlot>()` does not exceed `isize::MAX`
-    ///   (this is naturally satisfied by any realistic SHM region size).
-    /// * The backing memory remains live and mapped for as long as this store
-    ///   — and any `AggregateTable<'_>` derived from it via `view()` — is in
-    ///   use. In practice that means the `MAP_SHARED | MAP_ANONYMOUS` region
-    ///   established by the nginx master must not be unmapped while a worker
-    ///   or the leader still references it; the mapping is effectively
-    ///   `'static` from the leader's perspective.
+    /// * `capacity` is a power of two, at least 2, and the total size `capacity
+    ///   * size_of::<AggregateSlot>()` does not exceed `isize::MAX` (this is
+    ///   naturally satisfied by any realistic SHM region size).
+    /// * The backing memory remains live and mapped for as long as this store —
+    ///   and any `AggregateTable<'_>` derived from it via `view()` — is in use.
+    ///   In practice that means the `MAP_SHARED | MAP_ANONYMOUS` region
+    ///   established by the nginx master must not be unmapped while a worker or
+    ///   the leader still references it; the mapping is effectively `'static`
+    ///   from the leader's perspective.
     /// * The caller upholds the single-writer invariant: at most one
     ///   `ShmAggregateStore` may issue mutating calls (`write_delta` /
-    ///   `write_expiration` / `apply`) against this backing region at a
-    ///   time. The store is `!Send + !Sync` (because of `*mut _` and `Cell`),
-    ///   so this is enforced at the thread level by the type system; the
-    ///   cross-process exclusion is upheld by the gossip leader election.
+    ///   `write_expiration` / `apply`) against this backing region at a time.
+    ///   The store is `!Send + !Sync` (because of `*mut _` and `Cell`), so this
+    ///   is enforced at the thread level by the type system; the cross-process
+    ///   exclusion is upheld by the gossip leader election.
     /// * Concurrent readers (other processes/threads holding an
     ///   `AggregateTable<'_>` over the same region) are permitted: every
     ///   per-slot field is an `AtomicU64`, and all writes go through the
-    ///   seqlock protocol (`seq` odd ⇒ mid-write, even ⇒ stable), so there
-    ///   is no data race in the Rust memory model.
+    ///   seqlock protocol (`seq` odd ⇒ mid-write, even ⇒ stable), so there is
+    ///   no data race in the Rust memory model.
     pub unsafe fn new(slots_ptr: *mut AggregateSlot, capacity: usize) -> Self {
         debug_assert!(capacity.is_power_of_two() && capacity >= 2);
         Self {
@@ -391,8 +391,7 @@ mod tests {
     impl SlotBuffer {
         fn allocate(capacity: usize) -> Self {
             assert!(capacity.is_power_of_two() && capacity >= 2);
-            let layout =
-                std::alloc::Layout::array::<AggregateSlot>(capacity).expect("layout");
+            let layout = std::alloc::Layout::array::<AggregateSlot>(capacity).expect("layout");
             // SAFETY: `Layout` is a valid non-zero array layout for T;
             // we initialize every slot below before the buffer is observed.
             let ptr = unsafe { std::alloc::alloc(layout) as *mut AggregateSlot };
@@ -442,8 +441,8 @@ mod tests {
                 for i in 0..self.capacity {
                     std::ptr::drop_in_place(self.ptr.add(i));
                 }
-                let layout = std::alloc::Layout::array::<AggregateSlot>(self.capacity)
-                    .expect("layout");
+                let layout =
+                    std::alloc::Layout::array::<AggregateSlot>(self.capacity).expect("layout");
                 std::alloc::dealloc(self.ptr as *mut u8, layout);
             }
         }
@@ -574,4 +573,3 @@ mod tests {
         assert_eq!(cell.count, WRITES);
     }
 }
-

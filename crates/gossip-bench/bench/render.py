@@ -192,14 +192,24 @@ def fig_fanout_sweep(results: list[dict]):
         ax2.plot(df["fanout"], df["bytes_per_s"], marker="s", color=PALETTE[2])
 
         last = df.iloc[-1]
-        direct_label(ax, last["fanout"], last["rounds"], "rounds", color=PALETTE[0])
+        # Bigger right-edge offset so the labels clear the tick
+        # numbers; pull them slightly off the data line vertically too.
+        direct_label(
+            ax,
+            last["fanout"],
+            last["rounds"],
+            "rounds (left axis)",
+            color=PALETTE[0],
+            xytext=(10, 8),
+        )
         direct_label(
             ax2,
             last["fanout"],
             last["bytes_per_s"],
-            "bytes/s",
+            "bytes / s (right axis)",
             color=PALETTE[2],
             fontsize=8,
+            xytext=(10, -8),
         )
 
         ax.set_xlabel("fanout f")
@@ -207,7 +217,8 @@ def fig_fanout_sweep(results: list[dict]):
         ax2.set_ylabel("bytes per node, per second")
         title_only(ax, "convergence vs network cost at N = 32")
         offset_spines(ax)
-        tight_x(ax, df["fanout"])
+        # A little extra x-room on the right so the labels render.
+        tight_x(ax, list(df["fanout"]) + [df["fanout"].max() + 1.5])
         tight_y(ax, df["rounds"])
         ax2.set_ylim(0, max(df["bytes_per_s"]) * 1.05)
         fig.tight_layout()
@@ -264,10 +275,13 @@ def fig_scale_n(results: list[dict]):
         right.set_xscale("log", base=2)
         right.set_xlabel("cluster size N")
         right.set_ylabel("bytes per node, per second")
-        title_only(right, "per-node bandwidth")
+        title_only(right, "per-node bandwidth (the SWIM constant-load claim)")
         offset_spines(right)
         tight_x(right, ns)
-        tight_y(right, df["bytes_per_s"])
+        # The SWIM headline is "load is FLAT in N". A non-zero y-axis
+        # would visually amplify a ~30% range into a steep curve, which
+        # would lie about the claim. Anchor at 0.
+        right.set_ylim(0, max(df["bytes_per_s"]) * 1.1)
 
         fig.tight_layout()
         return fig
@@ -315,20 +329,23 @@ def fig_loss(results: list[dict]):
         ax.set_xlabel("per-link drop probability (i.i.d.)")
         ax.set_ylabel("rounds to converge")
         title_only(ax, "convergence under loss · N = 16, f = 3, 3 trials each")
-        # Light annotation pointing at the median bar.
-        # Use the last loss level so we don't overlap data.
+        # Annotate the FIRST loss level so the arrow doesn't pile on
+        # top of the rightmost data point. The label sits well above
+        # the data; arrow head touches the median bar from outside.
+        first_med = statistics.median(df[df["loss"] == losses[0]]["rounds"].dropna())
         ax.annotate(
-            "median",
-            xy=(len(losses) - 1, statistics.median(df[df["loss"] == losses[-1]]["rounds"].dropna())),
-            xytext=(8, 12),
+            "median over 3 trials",
+            xy=(0.18, first_med),
+            xytext=(28, 16),
             textcoords="offset points",
             fontsize=8,
             color=PALETTE[2],
-            arrowprops=dict(arrowstyle="-", color=PALETTE[2], lw=0.6),
+            arrowprops=dict(arrowstyle="->", color=PALETTE[2], lw=0.5),
+            va="center",
         )
         offset_spines(ax)
         ax.set_xlim(-0.4, len(losses) - 0.6)
-        tight_y(ax, df["rounds"])
+        tight_y(ax, list(df["rounds"]) + [max(df["rounds"]) + 1])
         fig.tight_layout()
         return fig
 
@@ -366,32 +383,52 @@ def fig_partition(results: list[dict]):
         gt = [s["ground_truth_total"] for s in samples]
         ax.plot(t, gt, color=INK, lw=1.6, linestyle="--")
 
-        # Heal marker.
+        # Heal marker, with a short arrow tying the label to the line
+        # so the reader isn't left guessing which event it describes.
         for change in r["scenario"]["network"]["schedule"]:
             heal_at = _hms_to_seconds(change["at"])
             ax.axvline(heal_at, color=PALETTE[2], linestyle=":", lw=0.8)
             ax.annotate(
                 f"heal at t = {heal_at:.0f} s",
-                xy=(heal_at, max(gt)),
-                xytext=(6, -8),
+                xy=(heal_at, max(gt) * 0.55),
+                xytext=(10, 0),
                 textcoords="offset points",
                 fontsize=8,
                 color=PALETTE[2],
+                arrowprops=dict(arrowstyle="-", color=PALETTE[2], lw=0.5),
+                va="center",
             )
 
+        # Stagger the right-edge labels vertically so they don't pile
+        # onto the same y-coordinate. "ground truth" rides slightly
+        # above the line; "nodes 0..3" sits slightly below; "nodes
+        # 4..7" goes above its baseline.
         ax.annotate(
-            "ground truth", (t[-1], gt[-1]), xytext=(4, 0),
-            textcoords="offset points", fontsize=8, color=INK, va="center",
+            "ground truth",
+            (t[-1], gt[-1]),
+            xytext=(6, 6),
+            textcoords="offset points",
+            fontsize=8,
+            color=INK,
+            va="bottom",
         )
         ax.annotate(
-            "nodes 0..3 (write side)", (t[-1], r["samples"][-1]["per_node_total"][0]),
-            xytext=(4, -10), textcoords="offset points", fontsize=8, color=left_side,
-            va="center",
+            "nodes 0..3 (write side)",
+            (t[-1], r["samples"][-1]["per_node_total"][0]),
+            xytext=(6, -10),
+            textcoords="offset points",
+            fontsize=8,
+            color=left_side,
+            va="top",
         )
         ax.annotate(
-            "nodes 4..7 (cut side)", (t[len(t)//2], 0),
-            xytext=(4, 6), textcoords="offset points", fontsize=8, color=right_side,
-            va="center",
+            "nodes 4..7 (cut side, pre-heal)",
+            (t[len(t) // 4], 0),
+            xytext=(0, 10),
+            textcoords="offset points",
+            fontsize=8,
+            color=right_side,
+            va="bottom",
         )
 
         ax.set_xlabel("virtual time (s)")
@@ -435,13 +472,33 @@ def fig_staleness(results: list[dict]):
         ax.plot(df["sources"], df["p50"], marker="o", color=INK)
         ax.plot(df["sources"], df["p95"], marker="s", color=PALETTE[2])
         last = df.iloc[-1]
-        direct_label(ax, last["sources"], last["p50"], "p50", color=INK)
-        direct_label(ax, last["sources"], last["p95"], "p95", color=PALETTE[2])
+        # At k = 8 the two lines often coincide (both 100 ms in our
+        # current data), so labels at identical offsets would stack
+        # into one illegible glyph. Place p95 ABOVE the marker (red,
+        # higher percentile) and p50 BELOW it.
+        direct_label(
+            ax,
+            last["sources"],
+            last["p50"],
+            "p50",
+            color=INK,
+            xytext=(14, -12),
+        )
+        direct_label(
+            ax,
+            last["sources"],
+            last["p95"],
+            "p95",
+            color=PALETTE[2],
+            xytext=(14, 12),
+        )
         ax.set_xlabel("concurrent write sources")
         ax.set_ylabel("per-hit lag (ms)")
         title_only(ax, "per-hit delivery delay under sustained writes")
         offset_spines(ax)
-        tight_x(ax, df["sources"])
+        # Stretch x just enough that the labels at the right edge have
+        # room to render without being clipped by the figure border.
+        tight_x(ax, list(df["sources"]) + [df["sources"].max() + 0.5])
         tight_y(ax, list(df["p50"]) + list(df["p95"]))
         fig.tight_layout()
         return fig
@@ -537,6 +594,44 @@ def emit_typst_data(summary: dict[str, list[dict]]) -> str:
         )
     else:
         lines.append("#let partition_reconv_ms = none")
+
+    # Scale_n table: N, rounds, wall-clock ms, bytes/node/s.
+    scale_rows: list[list[str]] = []
+    for r in sorted(
+        summary.get("scale_n", []), key=lambda r: r["scenario"]["nodes"]
+    ):
+        s, h = r["scenario"], r["headline"]
+        scale_rows.append(
+            [
+                str(s["nodes"]),
+                f"{h['convergence_rounds']:.0f}" if h["convergence_rounds"] is not None else "—",
+                f"{h['convergence_millis']}" if h["convergence_millis"] is not None else "—",
+                f"{h['bytes_per_node_per_second']:.0f}",
+            ]
+        )
+    lines.append(f"#let scale_rows = ({_typst_array_of_arrays(scale_rows)})")
+
+    # Headline numbers at N = 1024 (referenced inline in the report).
+    big = next(
+        (r for r in summary.get("scale_n", []) if r["scenario"]["nodes"] == 1024),
+        None,
+    )
+    if big is not None:
+        h = big["headline"]
+        rounds = h["convergence_rounds"]
+        ms = h["convergence_millis"]
+        bw = h["bytes_per_node_per_second"]
+        lines.append(
+            f'#let n1024_rounds = "{rounds:.0f}"' if rounds is not None else '#let n1024_rounds = "—"'
+        )
+        lines.append(
+            f'#let n1024_ms = "{ms}"' if ms is not None else '#let n1024_ms = "—"'
+        )
+        lines.append(f'#let n1024_bytes_per_s = "{bw:.0f}"')
+    else:
+        lines.append('#let n1024_rounds = "—"')
+        lines.append('#let n1024_ms = "—"')
+        lines.append('#let n1024_bytes_per_s = "—"')
 
     return "\n".join(lines) + "\n"
 

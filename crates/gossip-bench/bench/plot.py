@@ -230,12 +230,16 @@ def suite_scale_n() -> list[dict]:
     Stretched all the way to N=1024 to demonstrate the protocol holds
     its log-N shape and its constant per-node bandwidth at scale.
     Duration grows with N so the runner captures the convergence point
-    even when fanout=3 needs ~log_2(N) rounds at 100ms ticks."""
+    even when convergence takes a few × log_2(N) ticks (~100ms each)."""
     out = []
     for n in [4, 8, 16, 32, 64, 128, 256, 512, 1024]:
-        # 4 * log2(N) tick periods = 0.4 * log2(N) seconds of headroom.
-        # Floor at 8 s for the small clusters.
-        duration_s = max(8, 4 * (n.bit_length() - 1) // 10 + 1) * 4
+        # Pure-push convergence is bounded by ~log_2(N) / log_2(1+f)
+        # rounds = log_2(N) / 2 at fanout=3, but with a constant up to
+        # ~3× from peer-sampling overlap. Allocate plenty of headroom:
+        # 100 ms tick × 5 × log_2(N) gives at least 5× the theoretical
+        # bound, floored at 10 s.
+        log2_n = (n.bit_length() - 1)
+        duration_s = max(10, log2_n * 5)
         out.append(
             _base(
                 f"scale_n{n}",

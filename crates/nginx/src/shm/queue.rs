@@ -182,8 +182,7 @@ fn write_slot(slot: &QueueSlot, event: QueueEvent) {
     // `(pos & mask)` is enforced by the seq protocol (see push()).
     let fp = event.rule_fingerprint;
     let kh = event.key_hash;
-    slot.rule_fingerprint_lo
-        .store(fp as u64, Ordering::Relaxed);
+    slot.rule_fingerprint_lo.store(fp as u64, Ordering::Relaxed);
     slot.rule_fingerprint_hi
         .store((fp >> 64) as u64, Ordering::Relaxed);
     slot.key_hash_lo.store(kh as u64, Ordering::Relaxed);

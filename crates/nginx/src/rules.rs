@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use gabion::defaults;
 use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId, RuleTable};
 use thiserror::Error;
 
@@ -20,7 +21,7 @@ pub const DEFAULT_DOMAIN: &str = "nginx";
 /// Hard cap on descriptors per rule. Mirrors the server's cardinality
 /// envelope so cross-node fingerprints can never grow past what one side can
 /// admit.
-pub const MAX_DESCRIPTORS: usize = 16;
+pub const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
 
 /// One descriptor binding declared in nginx config — a descriptor `key` paired
 /// with the nginx variable name to read at request time.
@@ -91,6 +92,13 @@ pub struct CompiledRules {
 impl CompiledRules {
     /// Compile a list of `RuleConfig`s into a `RuleTable` + per-rule specs.
     pub fn compile(configs: &[RuleConfig]) -> Result<Self, RuleConfigError> {
+        Self::compile_with_max_descriptors(configs, MAX_DESCRIPTORS)
+    }
+
+    pub fn compile_with_max_descriptors(
+        configs: &[RuleConfig],
+        max_descriptors: usize,
+    ) -> Result<Self, RuleConfigError> {
         if configs.is_empty() {
             return Err(RuleConfigError::Empty);
         }
@@ -100,7 +108,7 @@ impl CompiledRules {
             if cfg.bindings.is_empty() {
                 return Err(RuleConfigError::EmptyBindings(cfg.name.clone()));
             }
-            if cfg.bindings.len() > MAX_DESCRIPTORS {
+            if cfg.bindings.len() > max_descriptors {
                 return Err(RuleConfigError::TooManyBindings(cfg.name.clone()));
             }
             let id: RuleId = (idx + 1) as RuleId;

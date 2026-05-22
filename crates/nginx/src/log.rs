@@ -8,10 +8,10 @@
 //! surrounding `error_log` directive points at, at the level it configures.
 //!
 //! The subscriber is installed once per process by [`install`]:
-//! - The master calls it from `preconfiguration` so config-phase events
-//!   (zone allocation, rule compile failures, …) route correctly.
-//! - Workers inherit the global dispatch via `fork`; the OnceLock guard
-//!   makes a redundant call from `init_process` a no-op.
+//! - The master calls it from `preconfiguration` so config-phase events (zone
+//!   allocation, rule compile failures, …) route correctly.
+//! - Workers inherit the global dispatch via `fork`; the OnceLock guard makes a
+//!   redundant call from `init_process` a no-op.
 //!
 //! # Example output
 //!
@@ -89,6 +89,7 @@ impl Subscriber for NginxSubscriber {
     }
 
     fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
 
     fn event(&self, event: &Event<'_>) {
@@ -108,6 +109,7 @@ impl Subscriber for NginxSubscriber {
     }
 
     fn enter(&self, _span: &Id) {}
+
     fn exit(&self, _span: &Id) {}
 }
 

@@ -4,8 +4,8 @@
 //! - [`admission`] — admission-time types (Decision, RejectReason, ...).
 //! - [`store`] — `DashMapStore<C>`: the gossip aggregate target + the read
 //!   surface used to evaluate window totals.
-//! - [`config`] — YAML config (server-only; the library knows nothing
-//!   about YAML).
+//! - [`config`] — YAML config (server-only; the library knows nothing about
+//!   YAML).
 //! - [`identity`] — `NodeIdentity` derivation at startup.
 //! - [`admin`] — a single admin HTTP endpoint backed by the gossip
 //!   `AdminCommand` channel.
@@ -28,8 +28,8 @@ use gabion::rules::{Descriptor, Rule, RuleId, RuleTable, hash_key};
 use crate::admission::{CardinalityLimits, Decision, LimitRequest, RejectReason};
 use crate::store::DashMapStore;
 
-pub mod admission;
 pub mod admin;
+pub mod admission;
 pub mod config;
 pub mod identity;
 pub mod store;
@@ -77,11 +77,8 @@ impl<C: Count> SharedLimiter<C> {
         counts: Arc<DashMapStore<C>>,
         cardinality_limits: CardinalityLimits,
     ) -> Self {
-        let rule_specs: Arc<[RuleSpec]> = rule_table
-            .iter()
-            .map(rule_spec)
-            .collect::<Vec<_>>()
-            .into();
+        let rule_specs: Arc<[RuleSpec]> =
+            rule_table.iter().map(rule_spec).collect::<Vec<_>>().into();
         Self {
             rule_table,
             rule_specs,
@@ -198,11 +195,10 @@ fn note_cardinality_reject(domain: &str, descriptor_count: usize) {
             descriptor_count,
             rejected_total = n,
             config_key = "cardinality_limits",
-            "Rejecting requests that attach too many rate-limit \
-             descriptors. This is usually a misbehaving client or an \
-             attack trying to exhaust gabion's tracking memory. If the \
-             traffic is legitimate, raise the relevant key under \
-             `cardinality_limits` in your gabion config.",
+            "Rejecting requests that attach too many rate-limit descriptors. This is usually a \
+             misbehaving client or an attack trying to exhaust gabion's tracking memory. If the \
+             traffic is legitimate, raise the relevant key under `cardinality_limits` in your \
+             gabion config.",
         );
     }
 }
@@ -248,8 +244,7 @@ impl<C: Count> EnvoyRateLimitService<C> {
 /// gRPC service name reported via the standard `grpc.health.v1.Health`
 /// protocol. Liveness/readiness probes (kube-proxy, gRPC load balancers,
 /// `grpc_health_probe`) should query for this exact name.
-pub const RATE_LIMIT_SERVICE_NAME: &str =
-    "envoy.service.ratelimit.v3.RateLimitService";
+pub const RATE_LIMIT_SERVICE_NAME: &str = "envoy.service.ratelimit.v3.RateLimitService";
 
 /// Run the gRPC server until `shutdown` resolves. Mounts:
 ///

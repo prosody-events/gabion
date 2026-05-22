@@ -2,14 +2,14 @@
 //!
 //! The production flow is:
 //!
-//! 1. nginx master `set_zone` → `mmap` + `ShmRegion::initialize`.
-//!    Identity (`node_id`) is stamped here before fork.
+//! 1. nginx master `set_zone` → `mmap` + `ShmRegion::initialize`. Identity
+//!    (`node_id`) is stamped here before fork.
 //! 2. nginx workers fork. Each one runs the access phase, which reads the
-//!    aggregate via `AggregateTable::window_total` and pushes hits onto the
-//!    SHM queue. The first worker to win the lease (`LeaderLease::try_acquire`)
-//!    spawns the leader thread; that thread stamps the incarnation, drains
-//!    the queue, drives the gossip runtime, and writes back into the
-//!    aggregate via `ShmAggregateStore::apply` (which invokes
+//!    aggregate via `AggregateTable::window_total` and pushes hits onto the SHM
+//!    queue. The first worker to win the lease (`LeaderLease::try_acquire`)
+//!    spawns the leader thread; that thread stamps the incarnation, drains the
+//!    queue, drives the gossip runtime, and writes back into the aggregate via
+//!    `ShmAggregateStore::apply` (which invokes
 //!    `write_delta`/`write_expiration` per row of the `DeltaSink`/
 //!    `ExpirationSink`).
 //!
@@ -29,7 +29,7 @@ use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, hash_key};
 
 use gabion::crdt::{NodeId, NodeIdentity};
 
-use gabion_nginx::access::{AccessCtx, AccessOutcome, VariableLookup, decide};
+use gabion_nginx::access::{AccessCtx, AccessOutcome, CardinalitySettings, VariableLookup, decide};
 use gabion_nginx::rules::{CompiledRules, DescriptorBinding, RuleConfig};
 use gabion_nginx::shm::aggregate::ShmAggregateStore;
 use gabion_nginx::shm::queue::QueueEvent;
@@ -221,8 +221,7 @@ fn leader_stamps_incarnation_and_applies_deltas() {
         EnforcementMode::Enforce,
     );
     let key_hash = KeyHash(0xABCD);
-    let (deltas, expirations) =
-        deltas_and_expirations(&rule, &[(key_hash, 3, 5)], &[]);
+    let (deltas, expirations) = deltas_and_expirations(&rule, &[(key_hash, 3, 5)], &[]);
     store.apply(&deltas, &expirations);
 
     // Workers should read the new value through the seqlock-protected view.
@@ -257,12 +256,26 @@ fn expiration_subtracts_then_tombstones_when_zero() {
 
     let (d1, e_empty) = deltas_and_expirations(&rule, &[(kh, 1, 7)], &[]);
     store.apply(&d1, &e_empty);
-    assert_eq!(region.aggregate().get(rule.fingerprint, kh.0, 1).unwrap().count, 7);
+    assert_eq!(
+        region
+            .aggregate()
+            .get(rule.fingerprint, kh.0, 1)
+            .unwrap()
+            .count,
+        7
+    );
 
     // Subtract part of the count.
     let (d_empty, e_partial) = deltas_and_expirations(&rule, &[], &[(kh, 1, 3)]);
     store.apply(&d_empty, &e_partial);
-    assert_eq!(region.aggregate().get(rule.fingerprint, kh.0, 1).unwrap().count, 4);
+    assert_eq!(
+        region
+            .aggregate()
+            .get(rule.fingerprint, kh.0, 1)
+            .unwrap()
+            .count,
+        4
+    );
 
     // Subtract the rest — should tombstone.
     let (d_empty, e_full) = deltas_and_expirations(&rule, &[], &[(kh, 1, 4)]);
@@ -282,6 +295,7 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
         queue: region.queue(),
         stats: region.stats(),
         domain: DEFAULT_DOMAIN,
+        cardinality: CardinalitySettings::default(),
     };
     let vars = MockVars {
         tenant: b"alice".to_vec(),
@@ -305,11 +319,8 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
     let spec = rules.rules()[0].spec;
     let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
     let bucket = 0_u32;
-    let (deltas, expirations) = deltas_and_expirations(
-        &rules.rules()[0].rule,
-        &[(key_hash, bucket, 3)],
-        &[],
-    );
+    let (deltas, expirations) =
+        deltas_and_expirations(&rules.rules()[0].rule, &[(key_hash, bucket, 3)], &[]);
     store.apply(&deltas, &expirations);
 
     // Third request must now be rejected — total (3) + 1 > limit (2).
@@ -367,8 +378,7 @@ fn concurrent_leader_writer_and_worker_readers() {
     let writer_zone = zone.clone();
     let writer = thread::spawn(move || {
         // SAFETY: see leader_stamps_incarnation_and_applies_deltas.
-        let writer_region =
-            unsafe { ShmRegion::from_initialized(writer_zone.as_ptr(), layout) };
+        let writer_region = unsafe { ShmRegion::from_initialized(writer_zone.as_ptr(), layout) };
         let store = unsafe {
             ShmAggregateStore::new(
                 writer_region.aggregate_slots_ptr(),
@@ -466,7 +476,8 @@ fn worker_view_via_from_initialized_sees_master_writes() {
     assert_eq!(worker_region.queue().capacity(), 8);
 }
 
-// -- 7. End-to-end nginx flow: workers push, leader drains+applies, workers reread
+// -- 7. End-to-end nginx flow: workers push, leader drains+applies, workers
+// reread
 
 /// Simulated end-to-end nginx flow: multiple worker threads push hits onto
 /// the SHM queue while a separate "leader" thread drains them, applies the
@@ -549,9 +560,8 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
         // SAFETY: zone outlives the leader; the leader is the sole writer
         // for ShmAggregateStore in this test.
         let r = unsafe { ShmRegion::from_initialized(leader_zone.as_ptr(), layout) };
-        let store = unsafe {
-            ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity)
-        };
+        let store =
+            unsafe { ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity) };
         let queue = r.queue();
         let mut total = 0_u64;
         while total < TOTAL || !leader_stop.load(Ordering::Acquire) {
@@ -653,6 +663,7 @@ fn decide_and_leader_apply_concurrent() {
                 queue: r.queue(),
                 stats: r.stats(),
                 domain: DEFAULT_DOMAIN,
+                cardinality: CardinalitySettings::default(),
             };
             let _ = decide(ctx, 0, &vars, 0);
         }
@@ -666,9 +677,8 @@ fn decide_and_leader_apply_concurrent() {
     let leader = thread::spawn(move || {
         // SAFETY: zone outlives the leader; sole writer for the store.
         let r = unsafe { ShmRegion::from_initialized(leader_zone.as_ptr(), layout) };
-        let store = unsafe {
-            ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity)
-        };
+        let store =
+            unsafe { ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity) };
         let descriptors = [gabion::rules::Descriptor {
             key: "tenant",
             value: "alice",
@@ -677,11 +687,8 @@ fn decide_and_leader_apply_concurrent() {
         let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
         let mut applied = 0_u32;
         while !leader_stop.load(Ordering::Acquire) {
-            let (d, e) = deltas_and_expirations(
-                &leader_rules.rules()[0].rule,
-                &[(key_hash, 0, 1)],
-                &[],
-            );
+            let (d, e) =
+                deltas_and_expirations(&leader_rules.rules()[0].rule, &[(key_hash, 0, 1)], &[]);
             store.apply(&d, &e);
             applied += 1;
             if applied > 1_000 {

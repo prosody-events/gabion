@@ -110,17 +110,17 @@ unsafe impl Sync for ShmRegion {}
 impl ShmRegion {
     /// # Safety
     /// The caller must guarantee all of the following:
-    /// * `base` is non-null and points at a fresh, writable mapping of at
-    ///   least `layout.total_bytes` bytes. In practice this is the
-    ///   `MAP_SHARED | MAP_ANONYMOUS` region the nginx master mmaps before any
-    ///   worker is forked.
+    /// * `base` is non-null and points at a fresh, writable mapping of at least
+    ///   `layout.total_bytes` bytes. In practice this is the `MAP_SHARED |
+    ///   MAP_ANONYMOUS` region the nginx master mmaps before any worker is
+    ///   forked.
     /// * `base` is aligned at least to `CACHELINE` (64). `mmap` returns
     ///   page-aligned memory, which satisfies the alignment requirements of
     ///   every `#[repr(C)]` sub-structure stored in the region.
     /// * `layout` is the value computed by `Layout::new` and is the same
-    ///   `Layout` that will later be passed to every `from_initialized` call
-    ///   in the fork-children. The offsets/sizes inside `layout` must
-    ///   therefore describe the actual mapping.
+    ///   `Layout` that will later be passed to every `from_initialized` call in
+    ///   the fork-children. The offsets/sizes inside `layout` must therefore
+    ///   describe the actual mapping.
     /// * The caller has *exclusive* access to the mapping for the duration of
     ///   this call (i.e. no worker is reading or writing it yet), so the
     ///   subsequent `write_bytes` and `ptr::write`s cannot race.
@@ -129,23 +129,23 @@ impl ShmRegion {
     pub unsafe fn initialize(base: *mut u8, layout: Layout) -> Self {
         // SAFETY: The caller of this `unsafe fn` upholds the preconditions
         // above. Specifically:
-        // * `write_bytes(base, 0, total_bytes)` is valid because `base` is
-        //   non-null, writable, exclusive (no other reader), and the mapping
-        //   covers `total_bytes` (caller precondition). Zero is a valid bit
-        //   pattern for every field in the region (all stored types are
-        //   `#[repr(C)]` composites of atomics / integers / arrays of bytes).
-        // * Each `ptr::write(p, value)` overwrites a `#[repr(C)]` POD at the
-        //   offset computed by `Layout::new`; `Layout::new` rounds every
-        //   offset up to `CACHELINE`, which exceeds the alignment of every
-        //   stored type, so the destination pointer is properly aligned.
-        //   `Layout::new` also guarantees `offset + size_of::<T>() <=
-        //   total_bytes`, so each write stays in-bounds of the one mapping
-        //   (Nomicon: "Working with raw pointers" / `pointer::add` rules).
-        // * The queue/aggregate loops only index `0..capacity`, matching the
-        //   per-slot bounds checked by the private `*_slot_ptr` helpers.
-        // * No `&mut T` to any region byte escapes this function, so the
-        //   shared-`&T` accessors that run afterwards are sound (Nomicon:
-        //   "References and Aliasing").
+        // * `write_bytes(base, 0, total_bytes)` is valid because `base` is non-null,
+        //   writable, exclusive (no other reader), and the mapping covers `total_bytes`
+        //   (caller precondition). Zero is a valid bit pattern for every field in the
+        //   region (all stored types are `#[repr(C)]` composites of atomics / integers
+        //   / arrays of bytes).
+        // * Each `ptr::write(p, value)` overwrites a `#[repr(C)]` POD at the offset
+        //   computed by `Layout::new`; `Layout::new` rounds every offset up to
+        //   `CACHELINE`, which exceeds the alignment of every stored type, so the
+        //   destination pointer is properly aligned. `Layout::new` also guarantees
+        //   `offset + size_of::<T>() <= total_bytes`, so each write stays in-bounds of
+        //   the one mapping (Nomicon: "Working with raw pointers" / `pointer::add`
+        //   rules).
+        // * The queue/aggregate loops only index `0..capacity`, matching the per-slot
+        //   bounds checked by the private `*_slot_ptr` helpers.
+        // * No `&mut T` to any region byte escapes this function, so the shared-`&T`
+        //   accessors that run afterwards are sound (Nomicon: "References and
+        //   Aliasing").
         unsafe {
             std::ptr::write_bytes(base, 0, layout.total_bytes);
             let region = Self { base, layout };
@@ -181,17 +181,17 @@ impl ShmRegion {
     /// # Safety
     /// The caller must guarantee all of the following:
     /// * `base` points at the same mapping that was previously handed to
-    ///   `initialize` with this exact `layout` value (typically the mapping
-    ///   the nginx master mmaps before forking workers — every fork-child
-    ///   inherits the identical `base` value).
+    ///   `initialize` with this exact `layout` value (typically the mapping the
+    ///   nginx master mmaps before forking workers — every fork-child inherits
+    ///   the identical `base` value).
     /// * `base` is at least cacheline-aligned (mmap returns page-aligned
     ///   memory, which is sufficient for every `#[repr(C)]` sub-structure).
     /// * The mapping must remain valid (not unmapped) for as long as any
     ///   `ShmRegion` derived from it is in use. Since the master holds the
     ///   mapping for its entire lifetime, this is automatic for workers.
-    /// * No other code is concurrently producing a `&mut T` to any region
-    ///   byte. All cross-process writers in this crate already go through
-    ///   atomic / seqlock APIs, so this is upheld by construction.
+    /// * No other code is concurrently producing a `&mut T` to any region byte.
+    ///   All cross-process writers in this crate already go through atomic /
+    ///   seqlock APIs, so this is upheld by construction.
     pub unsafe fn from_initialized(base: *mut u8, layout: Layout) -> Self {
         Self { base, layout }
     }
@@ -217,16 +217,15 @@ impl ShmRegion {
 
     pub fn queue(&self) -> RequestQueue<'_> {
         // SAFETY:
-        // * `queue_control_ptr()` is aligned and in-bounds; `QueueControl`
-        //   was initialized by `initialize` and contains only atomics, so
-        //   the shared reference is sound (see `header()` reasoning).
-        // * `slice::from_raw_parts`: `queue_slot_ptr(0)` is the start of a
-        //   contiguous `queue_capacity * size_of::<QueueSlot>()` byte range
-        //   that `Layout::new` reserves inside `total_bytes` (so the slice
-        //   fits in one allocation), every slot was initialized in
-        //   `initialize`, and `QueueSlot` is `#[repr(C)]` with atomic-only
-        //   interior mutability. `queue_capacity` fits in `isize` because the
-        //   master successfully mmaps `total_bytes`. See Nomicon:
+        // * `queue_control_ptr()` is aligned and in-bounds; `QueueControl` was
+        //   initialized by `initialize` and contains only atomics, so the shared
+        //   reference is sound (see `header()` reasoning).
+        // * `slice::from_raw_parts`: `queue_slot_ptr(0)` is the start of a contiguous
+        //   `queue_capacity * size_of::<QueueSlot>()` byte range that `Layout::new`
+        //   reserves inside `total_bytes` (so the slice fits in one allocation), every
+        //   slot was initialized in `initialize`, and `QueueSlot` is `#[repr(C)]` with
+        //   atomic-only interior mutability. `queue_capacity` fits in `isize` because
+        //   the master successfully mmaps `total_bytes`. See Nomicon:
         //   "`std::slice::from_raw_parts`" requirements.
         unsafe {
             let control = &*(self.queue_control_ptr() as *const QueueControl);
@@ -369,8 +368,7 @@ mod tests {
             // this `Zone` is dropped first because it is created later in
             // the test).
             unsafe {
-                let slice =
-                    std::ptr::slice_from_raw_parts_mut(self.ptr as *mut u64, self.words);
+                let slice = std::ptr::slice_from_raw_parts_mut(self.ptr as *mut u64, self.words);
                 let _ = Box::from_raw(slice);
             }
         }

@@ -26,10 +26,14 @@ use ngx::http::{
 };
 use ngx::{http_request_handler, ngx_string};
 
+use gabion::crdt::CellStoreConfig;
+use gabion::defaults;
 use gabion::discovery::DiscoveryConfig;
 use gabion::rules::EnforcementMode;
 
-use crate::access::{self, AccessCtx, AccessOutcome, RejectInfo, VariableLookup};
+use crate::access::{
+    self, AccessCtx, AccessOutcome, CardinalitySettings, RejectInfo, VariableLookup,
+};
 use crate::headers::RejectHeaders;
 use crate::identity::derive_identity;
 use crate::leader::{self, GossipSettings, LeaderConfig};
@@ -58,9 +62,47 @@ struct WorkerGlobals {
     rules: Arc<CompiledRules>,
     discovery: DiscoveryConfig,
     gossip: GossipSettings,
+    storage: StorageSettings,
+    cardinality: CardinalitySettings,
     gossip_bind: Option<SocketAddr>,
     identity_seed: Option<String>,
-    rng_seed: u64,
+    rng_seed: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StorageSettings {
+    max_cells: usize,
+    rule_dictionary_capacity: u16,
+    node_dictionary_capacity: u16,
+    local_dirty_capacity: usize,
+    forwarded_dirty_capacity: usize,
+    peer_capacity: u16,
+}
+
+impl Default for StorageSettings {
+    fn default() -> Self {
+        Self {
+            max_cells: defaults::STORAGE_MAX_CELLS,
+            rule_dictionary_capacity: defaults::STORAGE_RULE_DICTIONARY_CAPACITY,
+            node_dictionary_capacity: defaults::STORAGE_NODE_DICTIONARY_CAPACITY,
+            local_dirty_capacity: defaults::STORAGE_LOCAL_DIRTY_CAPACITY,
+            forwarded_dirty_capacity: defaults::STORAGE_FORWARDED_DIRTY_CAPACITY,
+            peer_capacity: defaults::STORAGE_PEER_CAPACITY,
+        }
+    }
+}
+
+impl StorageSettings {
+    fn cell_store_config(self) -> CellStoreConfig {
+        CellStoreConfig {
+            cell_capacity: self.max_cells.max(1) as u32,
+            rule_dictionary_capacity: self.rule_dictionary_capacity,
+            node_dictionary_capacity: self.node_dictionary_capacity,
+            local_dirty_capacity: self.local_dirty_capacity,
+            forwarded_dirty_capacity: self.forwarded_dirty_capacity,
+            peer_capacity: self.peer_capacity,
+        }
+    }
 }
 
 struct Module;
@@ -141,9 +183,11 @@ struct MainConfig {
     rules: Vec<RuleConfig>,
     discovery: DiscoveryConfig,
     gossip: GossipSettings,
+    storage: StorageSettings,
+    cardinality: CardinalitySettings,
     gossip_bind: Option<SocketAddr>,
     identity_seed: Option<String>,
-    rng_seed: u64,
+    rng_seed: Option<u64>,
     queue_capacity: usize,
     aggregate_capacity: usize,
 }
@@ -189,7 +233,7 @@ impl http::Merge for LocationConfig {
     }
 }
 
-static mut NGX_HTTP_GABION_COMMANDS: [ngx_command_t; 10] = [
+static mut NGX_HTTP_GABION_COMMANDS: [ngx_command_t; 29] = [
     ngx_command_t {
         name: ngx_string!("gabion_limit_zone"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE2) as ngx_uint_t,
@@ -247,6 +291,134 @@ static mut NGX_HTTP_GABION_COMMANDS: [ngx_command_t; 10] = [
         post: ptr::null_mut(),
     },
     ngx_command_t {
+        name: ngx_string!("gabion_gossip_tick_interval"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_gossip_tick_interval),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_gossip_max_payload_bytes"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_gossip_max_payload_bytes),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_gossip_max_cells_per_frame"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_gossip_max_cells_per_frame),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_gossip_max_cells_per_tick"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_gossip_max_cells_per_tick),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_gossip_send_queue_capacity"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_gossip_send_queue_capacity),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_gossip_limit_queue_capacity"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_gossip_limit_queue_capacity),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_storage_max_cells"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_storage_max_cells),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_storage_rule_dictionary_capacity"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_storage_rule_dictionary_capacity),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_storage_node_dictionary_capacity"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_storage_node_dictionary_capacity),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_storage_local_dirty_capacity"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_storage_local_dirty_capacity),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_storage_forwarded_dirty_capacity"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_storage_forwarded_dirty_capacity),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_storage_peer_capacity"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_storage_peer_capacity),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_storage_max_descriptor_count"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_storage_max_descriptor_count),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_storage_max_descriptor_bytes"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_storage_max_descriptor_bytes),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_storage_max_key_bytes"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_storage_max_key_bytes),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_runtime_rng_seed"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_runtime_rng_seed),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
         name: ngx_string!("gabion_node_id_seed"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(set_identity_seed),
@@ -258,6 +430,30 @@ static mut NGX_HTTP_GABION_COMMANDS: [ngx_command_t; 10] = [
         name: ngx_string!("gabion_gossip_discovery_namespace"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(set_discovery_namespace),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_discovery_namespace_whitelist"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_discovery_namespace),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_discovery_service_whitelist"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_discovery_service),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: ptr::null_mut(),
+    },
+    ngx_command_t {
+        name: ngx_string!("gabion_discovery_self_addr"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(set_discovery_self_addr),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
         post: ptr::null_mut(),
@@ -317,6 +513,7 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
         queue: globals.region.queue(),
         stats: globals.region.stats(),
         domain: DEFAULT_DOMAIN,
+        cardinality: globals.cardinality,
     };
     let vars = RequestVariables { request };
     let now = wall_millis();
@@ -702,6 +899,185 @@ extern "C" fn set_gossip_cluster(
     }
 }
 
+extern "C" fn set_gossip_tick_interval(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    unsafe {
+        let main = &mut *(conf as *mut MainConfig);
+        let Some(value) = single_arg(cf) else {
+            return core::NGX_CONF_ERROR;
+        };
+        let Ok(duration) = humantime::parse_duration(value) else {
+            return core::NGX_CONF_ERROR;
+        };
+        main.gossip.tick_interval = duration;
+        core::NGX_CONF_OK
+    }
+}
+
+extern "C" fn set_gossip_max_payload_bytes(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_usize(cf, conf, |main, value| {
+        main.gossip.max_payload_bytes = value.max(1);
+    })
+}
+
+extern "C" fn set_gossip_max_cells_per_frame(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_u32(cf, conf, |main, value| {
+        main.gossip.max_cells_per_frame = value.max(1);
+    })
+}
+
+extern "C" fn set_gossip_max_cells_per_tick(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_usize(cf, conf, |main, value| {
+        main.gossip.max_cells_per_tick = value.max(1);
+    })
+}
+
+extern "C" fn set_gossip_send_queue_capacity(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_usize(cf, conf, |main, value| {
+        main.gossip.send_queue_capacity = value.max(1);
+    })
+}
+
+extern "C" fn set_gossip_limit_queue_capacity(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_usize(cf, conf, |main, value| {
+        main.gossip.limit_queue_capacity = value.max(1);
+    })
+}
+
+extern "C" fn set_storage_max_cells(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_usize(cf, conf, |main, value| {
+        main.storage.max_cells = value.max(1);
+    })
+}
+
+extern "C" fn set_storage_rule_dictionary_capacity(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_u16(cf, conf, |main, value| {
+        main.storage.rule_dictionary_capacity = value.max(1);
+    })
+}
+
+extern "C" fn set_storage_node_dictionary_capacity(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_u16(cf, conf, |main, value| {
+        main.storage.node_dictionary_capacity = value.max(1);
+    })
+}
+
+extern "C" fn set_storage_local_dirty_capacity(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_usize(cf, conf, |main, value| {
+        main.storage.local_dirty_capacity = value.max(1);
+    })
+}
+
+extern "C" fn set_storage_forwarded_dirty_capacity(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_usize(cf, conf, |main, value| {
+        main.storage.forwarded_dirty_capacity = value.max(1);
+    })
+}
+
+extern "C" fn set_storage_peer_capacity(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_u16(cf, conf, |main, value| {
+        main.storage.peer_capacity = value.max(1);
+    })
+}
+
+extern "C" fn set_storage_max_descriptor_count(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    unsafe {
+        let main = &mut *(conf as *mut MainConfig);
+        let Some(value) = single_arg(cf) else {
+            return core::NGX_CONF_ERROR;
+        };
+        let Ok(count) = value.parse::<usize>() else {
+            return core::NGX_CONF_ERROR;
+        };
+        if count == 0 || count > crate::rules::MAX_DESCRIPTORS {
+            return core::NGX_CONF_ERROR;
+        }
+        main.cardinality.max_descriptor_count = count;
+        core::NGX_CONF_OK
+    }
+}
+
+extern "C" fn set_storage_max_descriptor_bytes(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_usize(cf, conf, |main, value| {
+        main.cardinality.max_descriptor_bytes = value.max(1);
+    })
+}
+
+extern "C" fn set_storage_max_key_bytes(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_usize(cf, conf, |main, value| {
+        main.cardinality.max_key_bytes = value.max(1);
+    })
+}
+
+extern "C" fn set_runtime_rng_seed(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    set_u64(cf, conf, |main, value| {
+        main.rng_seed = Some(value);
+    })
+}
+
 /// nginx directive handler for `gabion_node_id_seed`. Standard nginx callback
 /// contract (see `set_gossip_bind`).
 extern "C" fn set_identity_seed(
@@ -738,6 +1114,111 @@ extern "C" fn set_discovery_namespace(
             return core::NGX_CONF_ERROR;
         };
         main.discovery.namespace_whitelist.push(value.to_string());
+        core::NGX_CONF_OK
+    }
+}
+
+extern "C" fn set_discovery_service(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    unsafe {
+        let main = &mut *(conf as *mut MainConfig);
+        let Some(value) = single_arg(cf) else {
+            return core::NGX_CONF_ERROR;
+        };
+        main.discovery.service_whitelist.push(value.to_string());
+        core::NGX_CONF_OK
+    }
+}
+
+extern "C" fn set_discovery_self_addr(
+    cf: *mut ngx_conf_t,
+    _command: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    unsafe {
+        let main = &mut *(conf as *mut MainConfig);
+        let Some(value) = single_arg(cf) else {
+            return core::NGX_CONF_ERROR;
+        };
+        let Ok(addr) = value.parse::<SocketAddr>() else {
+            return core::NGX_CONF_ERROR;
+        };
+        main.discovery.self_addr = Some(addr);
+        core::NGX_CONF_OK
+    }
+}
+
+fn set_usize(
+    cf: *mut ngx_conf_t,
+    conf: *mut c_void,
+    apply: impl FnOnce(&mut MainConfig, usize),
+) -> *mut c_char {
+    unsafe {
+        let main = &mut *(conf as *mut MainConfig);
+        let Some(value) = single_arg(cf) else {
+            return core::NGX_CONF_ERROR;
+        };
+        let Ok(parsed) = value.parse::<usize>() else {
+            return core::NGX_CONF_ERROR;
+        };
+        apply(main, parsed);
+        core::NGX_CONF_OK
+    }
+}
+
+fn set_u16(
+    cf: *mut ngx_conf_t,
+    conf: *mut c_void,
+    apply: impl FnOnce(&mut MainConfig, u16),
+) -> *mut c_char {
+    unsafe {
+        let main = &mut *(conf as *mut MainConfig);
+        let Some(value) = single_arg(cf) else {
+            return core::NGX_CONF_ERROR;
+        };
+        let Ok(parsed) = value.parse::<u16>() else {
+            return core::NGX_CONF_ERROR;
+        };
+        apply(main, parsed);
+        core::NGX_CONF_OK
+    }
+}
+
+fn set_u32(
+    cf: *mut ngx_conf_t,
+    conf: *mut c_void,
+    apply: impl FnOnce(&mut MainConfig, u32),
+) -> *mut c_char {
+    unsafe {
+        let main = &mut *(conf as *mut MainConfig);
+        let Some(value) = single_arg(cf) else {
+            return core::NGX_CONF_ERROR;
+        };
+        let Ok(parsed) = value.parse::<u32>() else {
+            return core::NGX_CONF_ERROR;
+        };
+        apply(main, parsed);
+        core::NGX_CONF_OK
+    }
+}
+
+fn set_u64(
+    cf: *mut ngx_conf_t,
+    conf: *mut c_void,
+    apply: impl FnOnce(&mut MainConfig, u64),
+) -> *mut c_char {
+    unsafe {
+        let main = &mut *(conf as *mut MainConfig);
+        let Some(value) = single_arg(cf) else {
+            return core::NGX_CONF_ERROR;
+        };
+        let Ok(parsed) = value.parse::<u64>() else {
+            return core::NGX_CONF_ERROR;
+        };
+        apply(main, parsed);
         core::NGX_CONF_OK
     }
 }
@@ -791,7 +1272,10 @@ fn install_worker_globals(main: &MainConfig) {
     // one originally used. These together are the contract documented on
     // `ShmRegion::from_initialized`.
     let region = unsafe { ShmRegion::from_initialized(ptr, layout) };
-    let rules = match CompiledRules::compile(&main.rules) {
+    let rules = match CompiledRules::compile_with_max_descriptors(
+        &main.rules,
+        main.cardinality.max_descriptor_count,
+    ) {
         Ok(r) => Arc::new(r),
         Err(error) => {
             tracing::error!(%error, "gabion: rule compile failed");
@@ -803,13 +1287,11 @@ fn install_worker_globals(main: &MainConfig) {
         rules,
         discovery: main.discovery.clone(),
         gossip: main.gossip.clone(),
+        storage: main.storage,
+        cardinality: main.cardinality,
         gossip_bind: main.gossip_bind,
         identity_seed: main.identity_seed.clone(),
-        rng_seed: if main.rng_seed == 0 {
-            0x9E37_79B9_7F4A_7C15
-        } else {
-            main.rng_seed
-        },
+        rng_seed: main.rng_seed,
     });
 }
 
@@ -841,13 +1323,24 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
         return core::Status::NGX_OK.into();
     }
 
+    let rng_seed = match globals.rng_seed {
+        Some(seed) => seed,
+        None => match defaults::random_rng_seed() {
+            Ok(seed) => seed,
+            Err(error) => {
+                tracing::error!(%error, "gabion: failed to draw gossip RNG seed");
+                return core::Status::NGX_ERROR.into();
+            }
+        },
+    };
+
     let cfg = LeaderConfig {
         worker_id,
         gossip_bind,
         gossip: globals.gossip.clone(),
         discovery: globals.discovery.clone(),
-        cell_store: gabion::crdt::CellStoreConfig::default(),
-        rng_seed: globals.rng_seed,
+        cell_store: globals.storage.cell_store_config(),
+        rng_seed,
         admin_bind: None,
         max_inflight: leader::DEFAULT_MAX_INFLIGHT,
         drain_tick: leader::DEFAULT_DRAIN_TICK,
@@ -964,14 +1457,14 @@ fn mmap_shared(size: usize) -> *mut u8 {
 
     // SAFETY: This is a well-formed POSIX `mmap` call:
     //   - `addr` is null, asking the kernel to choose the location;
-    //   - `MAP_ANONYMOUS` is set, so `fd = -1` and `offset = 0` are the
-    //     mandated sentinel values (no file is being mapped);
-    //   - `MAP_SHARED` produces pages that survive `fork()` and are visible
-    //     to every child — exactly what the worker pool needs;
-    //   - the returned pages are kernel-owned and live until either the
-    //     process exits or we `munmap` them. v1 never `munmap`s, so the
-    //     pointer is valid for the full lifetime of the nginx master
-    //     process (and inherited workers).
+    //   - `MAP_ANONYMOUS` is set, so `fd = -1` and `offset = 0` are the mandated
+    //     sentinel values (no file is being mapped);
+    //   - `MAP_SHARED` produces pages that survive `fork()` and are visible to
+    //     every child — exactly what the worker pool needs;
+    //   - the returned pages are kernel-owned and live until either the process
+    //     exits or we `munmap` them. v1 never `munmap`s, so the pointer is valid
+    //     for the full lifetime of the nginx master process (and inherited
+    //     workers).
     // On failure mmap returns `MAP_FAILED`, which we convert to a null
     // pointer for the caller.
     let mapped = unsafe {

@@ -9,6 +9,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/nginx/Dockerfile
+      args:
+        NGINX_BASE_IMAGE: ${NGINX_BASE_IMAGE:-nginx:stable-alpine}
     profiles: ["module"]
     command: ["nginx", "-t"]
 
@@ -16,5 +18,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/nginx/Dockerfile
+      args:
+        NGINX_BASE_IMAGE: ${NGINX_BASE_IMAGE:-nginx:stable-alpine}
     profiles: ["module"]
     command: ["/usr/local/bin/gabion-nginx-request-smoke"]

@@ -38,9 +38,9 @@ pub struct CardinalityLimits {
 impl Default for CardinalityLimits {
     fn default() -> Self {
         Self {
-            max_descriptor_count: 16,
-            max_descriptor_bytes: 512,
-            max_key_bytes: 128,
+            max_descriptor_count: gabion::defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
+            max_descriptor_bytes: gabion::defaults::STORAGE_MAX_DESCRIPTOR_BYTES,
+            max_key_bytes: gabion::defaults::STORAGE_MAX_KEY_BYTES,
         }
     }
 }

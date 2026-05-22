@@ -38,6 +38,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use gabion::crdt::{CellStoreConfig, NodeIdentity};
+use gabion::defaults;
 use gabion::discovery::DiscoveryConfig;
 use gabion::gossip::GossipConfig;
 use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId, RuleTable};
@@ -142,7 +143,10 @@ pub const ENV_BINDINGS: &[EnvBinding] = &[
     EnvBinding::scalar("GABION_GOSSIP_BIND", "gossip.bind"),
     EnvBinding::scalar("GABION_GOSSIP_TICK_INTERVAL", "gossip.tick_interval"),
     EnvBinding::scalar("GABION_GOSSIP_FANOUT", "gossip.fanout"),
-    EnvBinding::scalar("GABION_GOSSIP_MAX_PAYLOAD_BYTES", "gossip.max_payload_bytes"),
+    EnvBinding::scalar(
+        "GABION_GOSSIP_MAX_PAYLOAD_BYTES",
+        "gossip.max_payload_bytes",
+    ),
     EnvBinding::scalar(
         "GABION_GOSSIP_MAX_CELLS_PER_FRAME",
         "gossip.max_cells_per_frame",
@@ -179,8 +183,7 @@ impl AppConfig {
     pub fn load(yaml_path: Option<&Path>) -> Result<Self, ConfigError> {
         let mut builder = Config::builder();
         if let Some(path) = yaml_path {
-            builder =
-                builder.add_source(File::new(&path.to_string_lossy(), FileFormat::Yaml));
+            builder = builder.add_source(File::new(&path.to_string_lossy(), FileFormat::Yaml));
         }
         finalize(builder)
     }
@@ -220,7 +223,10 @@ impl AppConfig {
     }
 
     pub fn cell_store_config(&self) -> CellStoreConfig {
-        let max_cells = self.storage.max_cells.unwrap_or(131_072);
+        let max_cells = self
+            .storage
+            .max_cells
+            .unwrap_or(defaults::STORAGE_MAX_CELLS);
         CellStoreConfig {
             cell_capacity: max_cells.max(1) as u32,
             rule_dictionary_capacity: self.storage.rule_dictionary_capacity,
@@ -295,14 +301,14 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             max_cells: None,
-            rule_dictionary_capacity: 64,
-            node_dictionary_capacity: 1024,
-            local_dirty_capacity: 8192,
-            forwarded_dirty_capacity: 65536,
-            peer_capacity: 256,
-            max_descriptor_count: 16,
-            max_descriptor_bytes: 512,
-            max_key_bytes: 128,
+            rule_dictionary_capacity: defaults::STORAGE_RULE_DICTIONARY_CAPACITY,
+            node_dictionary_capacity: defaults::STORAGE_NODE_DICTIONARY_CAPACITY,
+            local_dirty_capacity: defaults::STORAGE_LOCAL_DIRTY_CAPACITY,
+            forwarded_dirty_capacity: defaults::STORAGE_FORWARDED_DIRTY_CAPACITY,
+            peer_capacity: defaults::STORAGE_PEER_CAPACITY,
+            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
+            max_descriptor_bytes: defaults::STORAGE_MAX_DESCRIPTOR_BYTES,
+            max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
         }
     }
 }
@@ -310,18 +316,19 @@ impl Default for StorageConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct RuntimeTuningConfig {
-    /// Optional seed for the node id. Falls back to `whoami::fallible::hostname()`
-    /// then a fixed constant.
+    /// Optional seed for the node id. Falls back to
+    /// `whoami::fallible::hostname()` then a fixed constant.
     pub node_id_seed: Option<String>,
-    /// Deterministic peer-sampling seed.
-    pub rng_seed: u64,
+    /// Optional deterministic peer-sampling seed. When unset, startup draws
+    /// fresh OS entropy.
+    pub rng_seed: Option<u64>,
 }
 
 impl Default for RuntimeTuningConfig {
     fn default() -> Self {
         Self {
             node_id_seed: None,
-            rng_seed: 0x9E37_79B9_7F4A_7C15,
+            rng_seed: None,
         }
     }
 }
@@ -345,14 +352,14 @@ impl Default for GossipSettings {
     fn default() -> Self {
         Self {
             bind: None,
-            tick_interval: Duration::from_millis(100),
-            fanout: 6,
-            max_payload_bytes: 1400,
-            max_cells_per_frame: 4096,
-            max_cells_per_tick: 4096,
-            send_queue_capacity: 128,
-            limit_queue_capacity: 8192,
-            cluster_id_hash: 1,
+            tick_interval: Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS),
+            fanout: defaults::GOSSIP_FANOUT,
+            max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
+            max_cells_per_frame: defaults::GOSSIP_MAX_CELLS_PER_FRAME,
+            max_cells_per_tick: defaults::GOSSIP_MAX_CELLS_PER_TICK,
+            send_queue_capacity: defaults::GOSSIP_SEND_QUEUE_CAPACITY,
+            limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
+            cluster_id_hash: defaults::GOSSIP_CLUSTER_ID_HASH,
         }
     }
 }
@@ -527,9 +534,21 @@ mod tests {
         let cfg = AppConfig::load(None).expect("load with neither yaml nor env");
 
         assert_eq!(cfg.envoy_bind, None);
-        assert_eq!(cfg.storage.rule_dictionary_capacity, 64);
-        assert_eq!(cfg.gossip.fanout, 6);
+        assert_eq!(
+            cfg.storage.rule_dictionary_capacity,
+            defaults::STORAGE_RULE_DICTIONARY_CAPACITY
+        );
+        assert_eq!(cfg.gossip.fanout, defaults::GOSSIP_FANOUT);
         assert!(cfg.discovery.namespace_whitelist.is_empty());
+        assert_eq!(cfg.runtime.rng_seed, None);
+        assert_eq!(
+            cfg.cardinality_limits().max_descriptor_bytes,
+            defaults::STORAGE_MAX_DESCRIPTOR_BYTES
+        );
+        assert_eq!(
+            cfg.cell_store_config().cell_capacity,
+            defaults::STORAGE_MAX_CELLS as u32
+        );
     }
 
     #[test]
@@ -537,11 +556,8 @@ mod tests {
         let _env = EnvGuard::lock();
 
         let cfg = AppConfig::load_with_yaml_str(
-            "envoy_bind: \"127.0.0.1:8000\"\n\
-             storage:\n  \
-               max_cells: 256\n  \
-               rule_dictionary_capacity: 8\n\
-             gossip:\n  bind: \"127.0.0.1:9000\"\n  fanout: 3\n",
+            "envoy_bind: \"127.0.0.1:8000\"\nstorage:\n  max_cells: 256\n  \
+             rule_dictionary_capacity: 8\ngossip:\n  bind: \"127.0.0.1:9000\"\n  fanout: 3\n",
         )
         .expect("load yaml");
 
@@ -558,8 +574,7 @@ mod tests {
         set_env("GABION_GOSSIP_FANOUT", "12");
 
         let cfg = AppConfig::load_with_yaml_str(
-            "storage:\n  max_cells: 256\n  rule_dictionary_capacity: 8\n\
-             gossip:\n  fanout: 3\n",
+            "storage:\n  max_cells: 256\n  rule_dictionary_capacity: 8\ngossip:\n  fanout: 3\n",
         )
         .expect("load yaml + env");
 
@@ -580,7 +595,7 @@ mod tests {
 
         assert_eq!(cfg.storage.max_cells, Some(5555));
         assert_eq!(cfg.envoy_bind, Some("0.0.0.0:8081".parse().unwrap()));
-        assert_eq!(cfg.runtime.rng_seed, 42);
+        assert_eq!(cfg.runtime.rng_seed, Some(42));
     }
 
     #[test]

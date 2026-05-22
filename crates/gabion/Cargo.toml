@@ -11,6 +11,7 @@ bon.workspace = true
 educe.workspace = true
 either.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 hmac.workspace = true
 humantime-serde.workspace = true
 k8s-openapi.workspace = true

@@ -27,6 +27,7 @@ envoy-types = "0.7"
 futures = "0.3"
 gabion = { path = "crates/gabion" }
 gabion-server = { path = "crates/server" }
+getrandom = "0.3"
 hmac = "0.12"
 humantime = "2"
 humantime-serde = "1"

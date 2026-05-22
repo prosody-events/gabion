@@ -246,4 +246,3 @@ pub async fn sim_advance_ticks(period: Duration, n: u32) {
         sim_advance(period).await;
     }
 }
-

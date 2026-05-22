@@ -59,10 +59,8 @@ async fn run() -> anyhow::Result<()> {
     // arriving during config loading, gossip-runtime binding, or task
     // spawning gets caught and translated into a clean shutdown instead of
     // killing the process with the default disposition.
-    let mut sigterm = signal(SignalKind::terminate())
-        .context("install SIGTERM handler")?;
-    let mut sigint = signal(SignalKind::interrupt())
-        .context("install SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
 
     let config = load_config()?;
     tracing::info!(
@@ -95,10 +93,14 @@ async fn run() -> anyhow::Result<()> {
         .bind
         .ok_or(ConfigError::MissingGossipBind)
         .context("gossip.bind missing")?;
+    let rng_seed = match config.runtime.rng_seed {
+        Some(seed) => seed,
+        None => gabion::defaults::random_rng_seed().context("draw gossip RNG seed")?,
+    };
     let gossip_runtime_config = config
         .gossip
         .clone()
-        .into_runtime_config(identity, config.runtime.rng_seed);
+        .into_runtime_config(identity, rng_seed);
 
     let (admin_tx, admin_rx) = admin::admin_channel();
 
@@ -141,7 +143,10 @@ async fn run() -> anyhow::Result<()> {
     // removed from upstreams **before** tonic starts refusing connections.
     let (health_reporter, health_server) = tonic_health::server::health_reporter();
     health_reporter
-        .set_service_status(RATE_LIMIT_SERVICE_NAME, tonic_health::ServingStatus::Serving)
+        .set_service_status(
+            RATE_LIMIT_SERVICE_NAME,
+            tonic_health::ServingStatus::Serving,
+        )
         .await;
 
     let envoy_task = config.envoy_bind.map(|bind| {
@@ -212,11 +217,14 @@ async fn run() -> anyhow::Result<()> {
     // balancers will stop sending new requests; in-flight requests continue
     // to be served by `serve_with_shutdown` until they complete.
     health_reporter
-        .set_service_status(RATE_LIMIT_SERVICE_NAME, tonic_health::ServingStatus::NotServing)
+        .set_service_status(
+            RATE_LIMIT_SERVICE_NAME,
+            tonic_health::ServingStatus::NotServing,
+        )
         .await;
     tracing::info!(
-        "Marked the rate-limit service as NOT_SERVING in the health \
-         protocol. Load balancers should now route traffic elsewhere.",
+        "Marked the rate-limit service as NOT_SERVING in the health protocol. Load balancers \
+         should now route traffic elsewhere.",
     );
 
     // Trigger graceful shutdown of the gRPC and admin servers. Each task
@@ -273,22 +281,24 @@ async fn run() -> anyhow::Result<()> {
 fn discovery_stream(
     cfg: gabion::discovery::DiscoveryConfig,
 ) -> impl futures::Stream<Item = PeerEvent> {
-    discovery::from_config(cfg).peer_events().filter_map(|res| async move {
-        match res {
-            Ok(event) => Some(event),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "Peer discovery hit an error and skipped an update; \
-                     gabion will keep retrying. If this keeps happening, \
-                     check API access (e.g. Kubernetes RBAC for Services \
-                     and EndpointSlices) and the values under `discovery` \
-                     in your gabion config.",
-                );
-                None
+    discovery::from_config(cfg)
+        .peer_events()
+        .filter_map(|res| async move {
+            match res {
+                Ok(event) => Some(event),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Peer discovery hit an error and skipped an update; \
+                         gabion will keep retrying. If this keeps happening, \
+                         check API access (e.g. Kubernetes RBAC for Services \
+                         and EndpointSlices) and the values under `discovery` \
+                         in your gabion config.",
+                    );
+                    None
+                }
             }
-        }
-    })
+        })
 }
 
 fn load_config() -> anyhow::Result<AppConfig> {
@@ -302,8 +312,7 @@ fn load_config() -> anyhow::Result<AppConfig> {
         && !p.exists()
     {
         return Err(anyhow::anyhow!(
-            "Config file not found: {}\n\
-             Either pass a real path or omit the argument entirely \
+            "Config file not found: {}\nEither pass a real path or omit the argument entirely \
              (env vars and defaults will be used).",
             p.display(),
         ));

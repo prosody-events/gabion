@@ -58,20 +58,21 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
         apply_link(&router, &addrs, link);
     }
 
-    // Size every capacity from N so 512- and 1024-node runs don't trip
-    // the CellStore's "full" rejects or run out of peer / node-dict
-    // slots. Headroom factor is conservative: at N=1024, cell_capacity
-    // = max(256, 4*N) = 4096 even for a single-rule workload (one cell
-    // per origin per active bucket).
+    // Match (or exceed) the server's production `StorageConfig`
+    // defaults — see `crates/server/src/config.rs::StorageConfig::default`
+    // for the floors. The server ships with cell_capacity=4096,
+    // node_dict=1024, local_dirty=8192, forwarded_dirty=65536,
+    // peer=256. Bench runs scale all of those up further when N
+    // demands it: cell_capacity ≥ 4·N (4096 floor) so per-origin cells
+    // fit; node_dict ≥ N+16 (1024 floor); peer ≥ N+16 (256 floor).
     let cell_capacity = scenario
         .cell_capacity
-        .max(((scenario.nodes as u32).saturating_mul(4)).max(256));
-    let node_dict_capacity = ((scenario.nodes as u32) * 2)
-        .max(64)
-        .min(u16::MAX as u32) as u16;
-    let peer_capacity =
-        ((scenario.nodes as u32) + 16).max(32).min(u16::MAX as u32) as u16;
-    let dirty_capacity = (cell_capacity as usize).max(256);
+        .max(((scenario.nodes as u32).saturating_mul(4)).max(4_096));
+    let node_dict_capacity =
+        (((scenario.nodes as u32) + 16).max(1_024)).min(u16::MAX as u32) as u16;
+    let peer_capacity = (((scenario.nodes as u32) + 16).max(256)).min(u16::MAX as u32) as u16;
+    let local_dirty_capacity = (cell_capacity as usize).max(8_192);
+    let forwarded_dirty_capacity = ((cell_capacity as usize) * 16).max(65_536);
 
     let mut nodes: Vec<NodeHandle> = Vec::with_capacity(scenario.nodes);
     for (i, addr) in addrs.iter().enumerate() {
@@ -81,8 +82,8 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
                 cell_capacity,
                 rule_dictionary_capacity: 64,
                 node_dictionary_capacity: node_dict_capacity,
-                local_dirty_capacity: dirty_capacity,
-                forwarded_dirty_capacity: dirty_capacity,
+                local_dirty_capacity,
+                forwarded_dirty_capacity,
                 peer_capacity,
             },
             identity,
@@ -98,13 +99,16 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
             .map(|(_, a)| a)
             .collect();
 
-        // Frame size scales with N too: a "fill the frame" tick needs
-        // room for at least one cell per known origin, otherwise the
-        // gossip exchange is starved at large N. 4*N matches the
-        // CellStore's headroom factor.
+        // Match (or exceed) the server's production `GossipSettings`
+        // defaults: max_cells_per_frame=4096, max_cells_per_tick=4096,
+        // send_queue=128, limit_queue=8192, max_payload_bytes=1400.
+        // Bench scales the cell-count caps to 4·N when N is large
+        // (one cell per known origin per tick); leaves the queue and
+        // payload sizes at the production floors.
         let max_cells_per_tick = scenario
             .max_cells_per_tick
-            .max((scenario.nodes * 4).max(256));
+            .max((scenario.nodes * 4).max(4_096));
+        let max_cells_per_frame = (max_cells_per_tick as u32).max(4_096);
 
         let gossip_cfg = GossipConfig {
             local_identity: identity,
@@ -113,14 +117,15 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
             fanout: scenario.fanout,
             max_cells_per_tick,
             wire_limits: FrameLimits {
-                // Big enough to fit ~max_cells_per_tick cells. The
-                // production wire codec splits across multiple packets
-                // anyway; this just sets the per-frame ceiling.
-                max_payload_bytes: 64 * 1024,
-                max_cells: max_cells_per_tick as u32,
+                // Production caps the UDP datagram at 1400 bytes (the
+                // safe IPv4-MSS floor that avoids fragmentation). The
+                // codec emits multiple packets per frame when the cell
+                // list is bigger than the budget.
+                max_payload_bytes: 1_400,
+                max_cells: max_cells_per_frame,
             },
-            send_queue_capacity: 64,
-            limit_queue_capacity: 4096,
+            send_queue_capacity: 128,
+            limit_queue_capacity: 8_192,
             tick_interval: scenario.tick_interval,
             auth_key: None,
             rng_seed: scenario.seed.wrapping_add(i as u64),
@@ -187,12 +192,18 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
         ground_truth = ground_truth.saturating_add(issued);
 
         // Advance virtual time in tick-sized chunks so the runtimes get
-        // their per-tick gossip exchange. `sim_advance` yields after
-        // each step so the runtime task is dispatched.
+        // their per-tick gossip exchange. `sim_advance` itself yields
+        // exactly once — that's enough at small N but starves the
+        // remaining runtimes when N is large (single-thread tokio
+        // current-thread). After each advance we additionally yield
+        // until the scheduler has nothing else queued, so every
+        // runtime's tick arm has a chance to fire before the next
+        // virtual step.
         let mut remaining = step_end - elapsed;
         while remaining > Duration::ZERO {
             let step = remaining.min(tick);
             sim_advance(step).await;
+            drain_pending_tasks(scenario.nodes).await;
             remaining -= step;
         }
         elapsed = step_end;
@@ -208,10 +219,7 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
         // The join future was spawned on the LocalSet; awaiting it
         // signals the runtime completed. We don't surface its
         // error since shutdown is best-effort.
-        let join = std::mem::replace(
-            &mut node.join,
-            tokio::task::spawn_local(async { Ok(()) }),
-        );
+        let join = std::mem::replace(&mut node.join, tokio::task::spawn_local(async { Ok(()) }));
         let _ = join.await;
     }
 
@@ -262,11 +270,7 @@ fn apply_links(
             if src == dst {
                 continue;
             }
-            router.set_link_policy(
-                *src,
-                *dst,
-                LinkPolicy::DropProb { p: uniform_loss },
-            );
+            router.set_link_policy(*src, *dst, LinkPolicy::DropProb { p: uniform_loss });
         }
     }
 }
@@ -367,6 +371,37 @@ fn ceil_to_multiple(value: Duration, modulus: Duration) -> Duration {
     Duration::from_nanos(rounded as u64)
 }
 
+/// Yield to the scheduler enough times that every spawned runtime
+/// task has had a chance to be polled and either complete its current
+/// iteration or block on its next `select!` arm. Single-thread tokio
+/// runs one task per yield; without this drain step the simulation
+/// under-polls large clusters and underestimates per-tick gossip
+/// progress.
+///
+/// **This is a simulation-only artifact.** Production deployments run
+/// one `GossipRuntime` per process (one per nginx pod, one per gabiond
+/// pod). Each pod has its own kernel thread plus its own tokio
+/// runtime, so the OS scheduler — not this loop — gives every runtime
+/// a fair chance to fire its tick. The artifact here is that the
+/// in-process simulator co-locates N runtimes onto one single-threaded
+/// tokio scheduler. When virtual time advances by `tick_interval`, all
+/// N runtime tasks become ready simultaneously, but `yield_now()` only
+/// runs ONE before resuming the test driver. Without an explicit drain
+/// the simulator under-polls at large N and reports artificially slow
+/// convergence (we observed ~55 rounds at N=1024 before adding this
+/// drain, vs ~7 rounds with it).
+async fn drain_pending_tasks(node_count: usize) {
+    // The runtime needs at most one yield per task per tick to complete
+    // its iteration. 4× headroom covers iterations that re-await on a
+    // socket, plus the time-driven repair-frame composition. The yield
+    // loop terminates by the budget — there's no quiescence signal we
+    // can poll cheaply on `current_thread`.
+    let budget = node_count.saturating_mul(4).max(16);
+    for _ in 0..budget {
+        tokio::task::yield_now().await;
+    }
+}
+
 fn snapshot(t_millis: u64, nodes: &[NodeHandle], ground_truth: u64) -> TickSnapshot {
     let per_node_total: Vec<u64> = nodes.iter().map(|n| n.aggregate.total()).collect();
     let bytes_total: u64 = nodes.iter().map(|n| n.counters.bytes_sent()).sum();
@@ -387,9 +422,7 @@ fn compute_headline(
     duration: Duration,
 ) -> Headline {
     let convergence_millis = samples.iter().find_map(|s| {
-        if s.ground_truth_total > 0
-            && s.per_node_total.iter().all(|t| *t == s.ground_truth_total)
-        {
+        if s.ground_truth_total > 0 && s.per_node_total.iter().all(|t| *t == s.ground_truth_total) {
             Some(s.t_millis)
         } else {
             None

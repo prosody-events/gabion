@@ -84,7 +84,7 @@ impl Default for GossipConfig {
             limit_queue_capacity: 1024,
             tick_interval: Duration::from_millis(100),
             auth_key: None,
-            rng_seed: 0x9E37_79B9_7F4A_7C15,
+            rng_seed: crate::defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
         }
     }
 }

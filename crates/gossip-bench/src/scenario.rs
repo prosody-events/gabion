@@ -108,9 +108,13 @@ pub enum LinkAction {
     Pass,
     Block,
     /// Drop the first `count` packets, then pass.
-    DropFirst { count: u32 },
+    DropFirst {
+        count: u32,
+    },
     /// i.i.d. Bernoulli drop with probability `p`.
-    DropProb { p: f64 },
+    DropProb {
+        p: f64,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -135,10 +139,7 @@ pub enum Workload {
     },
     /// `per_tick` writes per source node per tick — the steady-state
     /// workload used by Astrolabe-style staleness measurements.
-    Sustained {
-        sources: Vec<usize>,
-        per_tick: u64,
-    },
+    Sustained { sources: Vec<usize>, per_tick: u64 },
     /// Burst at one node every `interval`. Used to stress the gossip
     /// pipeline.
     Burst {

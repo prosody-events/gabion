@@ -36,6 +36,8 @@ help:
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
 	@printf '%s\n' '  make nginx-test      Build NGINX module and assert 200, 200, 429 responses'
+	@printf '%s\n' '  make nginx-matrix    Build Gabion NGINX images for common official NGINX tags'
+	@printf '%s\n' '  make openresty-matrix Build Gabion OpenResty images for common OpenResty tags'
 	@printf '%s\n' '  make kubernetes-test Run guarded local OrbStack EndpointSlice convergence tests'
 	@printf '%s\n' '  make kubernetes-nginx-test Run guarded local OrbStack NGINX scale rate-limit tests'
 	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local OrbStack NGINX plus Gabion server gossip test'
@@ -115,6 +117,14 @@ nginx-module:
 .PHONY: nginx-test
 nginx-test:
 	$(COMPOSE) run --build --rm nginx-module-request-smoke
+
+.PHONY: nginx-matrix
+nginx-matrix:
+	sh deploy/nginx/build-matrix.sh
+
+.PHONY: openresty-matrix
+openresty-matrix:
+	sh deploy/nginx/build-openresty-matrix.sh
 
 .PHONY: kubernetes-test
 kubernetes-test:

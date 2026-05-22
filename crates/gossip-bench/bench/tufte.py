@@ -47,19 +47,15 @@ def tufte_rc():
         "font.family": "serif",
         "font.serif": SERIF,
         "font.size": 10,
-        "axes.titlesize": 11,
+        "axes.titlesize": 10.5,
         "axes.titleweight": "regular",
         "axes.labelsize": 9.5,
         "axes.labelcolor": INK,
         "axes.edgecolor": INK,
-        "axes.linewidth": 0.6,
+        "axes.linewidth": 0.5,
         "axes.spines.top": False,
         "axes.spines.right": False,
-        "axes.grid": True,
-        "grid.color": SUBTLE,
-        "grid.linestyle": ":",
-        "grid.linewidth": 0.4,
-        "grid.alpha": 0.5,
+        "axes.grid": False,        # data-ink rule: gridlines off by default.
         "xtick.direction": "out",
         "ytick.direction": "out",
         "xtick.color": INK,
@@ -68,21 +64,34 @@ def tufte_rc():
         "ytick.labelsize": 8.5,
         "xtick.major.size": 3,
         "ytick.major.size": 3,
-        "xtick.major.width": 0.6,
-        "ytick.major.width": 0.6,
+        "xtick.major.width": 0.5,
+        "ytick.major.width": 0.5,
         "legend.frameon": False,
         "legend.fontsize": 8.5,
         "legend.handlelength": 1.6,
         "figure.facecolor": "white",
         "axes.facecolor": "white",
         "axes.prop_cycle": mpl.cycler(color=PALETTE),
-        "lines.linewidth": 1.2,
-        "lines.markersize": 4,
+        "lines.linewidth": 1.1,
+        "lines.markersize": 3.5,
         "savefig.facecolor": "white",
         "svg.fonttype": "none",
     }
     with mpl.rc_context(rc):
         yield
+
+
+def range_frame(ax, x_values, y_values) -> None:
+    """Tufte's range-frame: replace the spines with line segments that
+    span only the data's actual range, not the full axis. After this
+    runs, the axes look like two small scale bars at the left and
+    bottom of the plot rather than a complete frame."""
+    xs = [v for v in x_values if v is not None]
+    ys = [v for v in y_values if v is not None]
+    if not xs or not ys:
+        return
+    ax.spines["bottom"].set_bounds(min(xs), max(xs))
+    ax.spines["left"].set_bounds(min(ys), max(ys))
 
 
 def offset_spines(ax, offset: float = 6.0) -> None:

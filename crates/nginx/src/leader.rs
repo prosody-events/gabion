@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
 use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeIdentity};
+use gabion::defaults;
 use gabion::discovery::{self, DiscoveryConfig, PeerDiscovery, PeerEvent};
 use gabion::gossip::{AdminCommand, GossipClient, GossipConfig, GossipError, GossipRuntime};
 use gabion::wire::FrameLimits;
@@ -65,8 +66,8 @@ impl Default for LeaderConfig {
             gossip_bind: "0.0.0.0:0".parse().expect("ipv4"),
             gossip: GossipSettings::default(),
             discovery: DiscoveryConfig::default(),
-            cell_store: CellStoreConfig::default(),
-            rng_seed: 0x9E37_79B9_7F4A_7C15,
+            cell_store: production_cell_store_config(),
+            rng_seed: defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
             admin_bind: None,
             max_inflight: DEFAULT_MAX_INFLIGHT,
             drain_tick: DEFAULT_DRAIN_TICK,
@@ -91,17 +92,90 @@ pub struct GossipSettings {
 }
 
 impl Default for GossipSettings {
+    /// Matches `gabion_server::config::GossipSettings::default()` so an
+    /// out-of-the-box nginx + gabiond cluster gossips with identical
+    /// frame/queue tuning.
     fn default() -> Self {
         Self {
-            tick_interval: Duration::from_millis(100),
-            fanout: 3,
-            max_payload_bytes: 256 * 1024,
-            max_cells_per_frame: 4096,
-            max_cells_per_tick: 1024,
-            send_queue_capacity: 32,
-            limit_queue_capacity: 1024,
-            cluster_id_hash: 1,
+            tick_interval: Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS),
+            fanout: defaults::GOSSIP_FANOUT,
+            max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
+            max_cells_per_frame: defaults::GOSSIP_MAX_CELLS_PER_FRAME,
+            max_cells_per_tick: defaults::GOSSIP_MAX_CELLS_PER_TICK,
+            send_queue_capacity: defaults::GOSSIP_SEND_QUEUE_CAPACITY,
+            limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
+            cluster_id_hash: defaults::GOSSIP_CLUSTER_ID_HASH,
         }
+    }
+}
+
+pub fn production_cell_store_config() -> CellStoreConfig {
+    CellStoreConfig {
+        cell_capacity: defaults::STORAGE_MAX_CELLS as u32,
+        rule_dictionary_capacity: defaults::STORAGE_RULE_DICTIONARY_CAPACITY,
+        node_dictionary_capacity: defaults::STORAGE_NODE_DICTIONARY_CAPACITY,
+        local_dirty_capacity: defaults::STORAGE_LOCAL_DIRTY_CAPACITY,
+        forwarded_dirty_capacity: defaults::STORAGE_FORWARDED_DIRTY_CAPACITY,
+        peer_capacity: defaults::STORAGE_PEER_CAPACITY,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_shared_production_defaults() {
+        let gossip = GossipSettings::default();
+        assert_eq!(
+            gossip.tick_interval,
+            Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS)
+        );
+        assert_eq!(gossip.fanout, defaults::GOSSIP_FANOUT);
+        assert_eq!(gossip.max_payload_bytes, defaults::GOSSIP_MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            gossip.max_cells_per_frame,
+            defaults::GOSSIP_MAX_CELLS_PER_FRAME
+        );
+        assert_eq!(
+            gossip.max_cells_per_tick,
+            defaults::GOSSIP_MAX_CELLS_PER_TICK
+        );
+        assert_eq!(
+            gossip.send_queue_capacity,
+            defaults::GOSSIP_SEND_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            gossip.limit_queue_capacity,
+            defaults::GOSSIP_LIMIT_QUEUE_CAPACITY
+        );
+        assert_eq!(gossip.cluster_id_hash, defaults::GOSSIP_CLUSTER_ID_HASH);
+
+        let cell_store = production_cell_store_config();
+        assert_eq!(cell_store.cell_capacity, defaults::STORAGE_MAX_CELLS as u32);
+        assert_eq!(
+            cell_store.rule_dictionary_capacity,
+            defaults::STORAGE_RULE_DICTIONARY_CAPACITY
+        );
+        assert_eq!(
+            cell_store.node_dictionary_capacity,
+            defaults::STORAGE_NODE_DICTIONARY_CAPACITY
+        );
+        assert_eq!(
+            cell_store.local_dirty_capacity,
+            defaults::STORAGE_LOCAL_DIRTY_CAPACITY
+        );
+        assert_eq!(
+            cell_store.forwarded_dirty_capacity,
+            defaults::STORAGE_FORWARDED_DIRTY_CAPACITY
+        );
+        assert_eq!(cell_store.peer_capacity, defaults::STORAGE_PEER_CAPACITY);
+
+        let leader = LeaderConfig::default();
+        assert_eq!(
+            leader.cell_store.cell_capacity,
+            defaults::STORAGE_MAX_CELLS as u32
+        );
     }
 }
 
@@ -171,29 +245,27 @@ async fn leader_main(
     let cell_store = CellStore::<u32>::new(config.cell_store, identity);
     // SAFETY: `ShmAggregateStore::new`'s preconditions (see its `# Safety`
     // doc) are upheld:
-    // * `shm.aggregate_slots_ptr()` returns the address of slot 0 of the
-    //   aggregate region. The nginx master called `ShmRegion::initialize`
-    //   in `set_zone` before forking workers, which `ptr::write`s an
-    //   `AggregateSlot::empty()` into each of `layout.aggregate_capacity`
-    //   slots, so the pointer is non-null, cacheline-aligned (and hence
-    //   aligned for `AggregateSlot`), and points at a fully initialized
-    //   contiguous array of exactly that many slots.
-    // * The `capacity` argument is `shm.layout.aggregate_capacity` — the
-    //   same `Layout` value the master used at `initialize` time, so the
-    //   slot count agrees with the mapping. `Layout::new` enforces it is
-    //   a power of two with `>= 2`, and the total byte length fits in the
-    //   mapping (well under `isize::MAX`).
-    // * The `MAP_SHARED | MAP_ANONYMOUS` region is held by the nginx
-    //   master for the lifetime of the worker process, and this leader
-    //   thread is joined before the worker exits, so the mapping outlives
-    //   `store` (and any `AggregateTable<'_>` derived from it).
-    // * Single-writer: the SHM `LeaderLease` elects at most one leader
-    //   thread per worker process at a time; `ShmAggregateStore` is
-    //   `!Send + !Sync` (it holds `*mut _` + `Cell`), so the type system
-    //   prevents this store from being shared with another thread.
-    //   Concurrent worker readers go through the seqlock/atomic accessors
-    //   on `AggregateSlot`, which is the data-race-free protocol the
-    //   nomicon's "Send and Sync" / atomics rules require.
+    // * `shm.aggregate_slots_ptr()` returns the address of slot 0 of the aggregate
+    //   region. The nginx master called `ShmRegion::initialize` in `set_zone`
+    //   before forking workers, which `ptr::write`s an `AggregateSlot::empty()`
+    //   into each of `layout.aggregate_capacity` slots, so the pointer is non-null,
+    //   cacheline-aligned (and hence aligned for `AggregateSlot`), and points at a
+    //   fully initialized contiguous array of exactly that many slots.
+    // * The `capacity` argument is `shm.layout.aggregate_capacity` — the same
+    //   `Layout` value the master used at `initialize` time, so the slot count
+    //   agrees with the mapping. `Layout::new` enforces it is a power of two with
+    //   `>= 2`, and the total byte length fits in the mapping (well under
+    //   `isize::MAX`).
+    // * The `MAP_SHARED | MAP_ANONYMOUS` region is held by the nginx master for the
+    //   lifetime of the worker process, and this leader thread is joined before the
+    //   worker exits, so the mapping outlives `store` (and any `AggregateTable<'_>`
+    //   derived from it).
+    // * Single-writer: the SHM `LeaderLease` elects at most one leader thread per
+    //   worker process at a time; `ShmAggregateStore` is `!Send + !Sync` (it holds
+    //   `*mut _` + `Cell`), so the type system prevents this store from being
+    //   shared with another thread. Concurrent worker readers go through the
+    //   seqlock/atomic accessors on `AggregateSlot`, which is the data-race-free
+    //   protocol the nomicon's "Send and Sync" / atomics rules require.
     let store = Rc::new(unsafe {
         ShmAggregateStore::new(shm.aggregate_slots_ptr(), shm.layout.aggregate_capacity)
     });

@@ -20,9 +20,7 @@ use crate::crdt::{
     NodeIdentity, RuleDescriptor,
 };
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
-use crate::gossip::{
-    AggregateStore, GossipConfig, GossipRuntime, TokioClock, UdpTransport,
-};
+use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, UdpTransport};
 
 // -- in-memory aggregate store ----------------------------------------------
 
@@ -186,14 +184,8 @@ async fn two_runtimes_converge_on_cluster_aggregate() {
             let rule_fp: u128 = 0xC0FE;
             let key = KeyHash(0xABCD);
 
-            client_a
-                .record(rule_fp, key, 0, 3, 1_000)
-                .await
-                .unwrap();
-            client_b
-                .record(rule_fp, key, 0, 5, 1_000)
-                .await
-                .unwrap();
+            client_a.record(rule_fp, key, 0, 3, 1_000).await.unwrap();
+            client_b.record(rule_fp, key, 0, 5, 1_000).await.unwrap();
 
             // Drive enough virtual ticks for both directions to drain.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
@@ -285,10 +277,7 @@ async fn gossip_tick_drives_expiration() {
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
             // Hit at virtual time 0 — bucket 0.
-            client
-                .record(0xFEED, KeyHash(7), 0, 2, 0)
-                .await
-                .unwrap();
+            client.record(0xFEED, KeyHash(7), 0, 2, 0).await.unwrap();
             assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 2);
 
             // Advance past one tick + past the live window.
@@ -363,10 +352,7 @@ async fn record_returns_after_apply_completes() {
             );
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
-            client
-                .record(0xABC, KeyHash(1), 0, 3, 0)
-                .await
-                .unwrap();
+            client.record(0xABC, KeyHash(1), 0, 3, 0).await.unwrap();
             // After the ack returns, apply must have completed at least once.
             let totals: u64 = agg.inner.inner.borrow().values().copied().sum();
             assert_eq!(totals, 3);
@@ -414,10 +400,7 @@ async fn per_peer_frame_prunes_acked_cells() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            client_a
-                .record(0xDEAD, KeyHash(1), 0, 4, 0)
-                .await
-                .unwrap();
+            client_a.record(0xDEAD, KeyHash(1), 0, 4, 0).await.unwrap();
             // Drive enough ticks for the eager-push lane to converge.
             sim_advance_ticks(Duration::from_millis(100), 5).await;
 
@@ -473,10 +456,7 @@ async fn dropped_packet_is_repaired() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            client_a
-                .record(0xDEAD, KeyHash(1), 0, 7, 0)
-                .await
-                .unwrap();
+            client_a.record(0xDEAD, KeyHash(1), 0, 7, 0).await.unwrap();
             // Many ticks to allow the repair lane to retry.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
 
@@ -544,18 +524,9 @@ async fn partition_then_heal() {
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
             let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
 
-            client_a
-                .record(0xDEAD, KeyHash(1), 0, 1, 0)
-                .await
-                .unwrap();
-            client_b
-                .record(0xDEAD, KeyHash(1), 0, 2, 0)
-                .await
-                .unwrap();
-            client_c
-                .record(0xDEAD, KeyHash(1), 0, 4, 0)
-                .await
-                .unwrap();
+            client_a.record(0xDEAD, KeyHash(1), 0, 1, 0).await.unwrap();
+            client_b.record(0xDEAD, KeyHash(1), 0, 2, 0).await.unwrap();
+            client_c.record(0xDEAD, KeyHash(1), 0, 4, 0).await.unwrap();
 
             // Drive ticks under partition.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
@@ -634,10 +605,7 @@ async fn simulates_minute_in_milliseconds() {
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
             let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
 
-            client_a
-                .record(0xCAFE, KeyHash(99), 0, 1, 0)
-                .await
-                .unwrap();
+            client_a.record(0xCAFE, KeyHash(99), 0, 1, 0).await.unwrap();
 
             let start = Instant::now();
             // 60s of virtual time at 100ms cadence.
@@ -733,10 +701,7 @@ async fn gossip_tick_picks_peers_without_replacement() {
             let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
             let h_d = tokio::task::spawn_local(rt_d.run(futures::stream::empty()));
 
-            client_a
-                .record(0xDEAD, KeyHash(1), 0, 1, 0)
-                .await
-                .unwrap();
+            client_a.record(0xDEAD, KeyHash(1), 0, 1, 0).await.unwrap();
             // With fanout = peer_count, every peer must receive the cell on
             // the first tick that fires after the record. Without-replacement
             // sampling is the invariant under test; with-replacement would
@@ -771,12 +736,8 @@ async fn udp_round_trip_smoke() {
             let id_b = NodeIdentity::new(NodeId(0xBB00), 1);
 
             // Bind sockets up front so we can read their addrs.
-            let sock_a = tokio::net::UdpSocket::bind("127.0.0.1:0")
-                .await
-                .unwrap();
-            let sock_b = tokio::net::UdpSocket::bind("127.0.0.1:0")
-                .await
-                .unwrap();
+            let sock_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sock_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let addr_a = sock_a.local_addr().unwrap();
             let addr_b = sock_b.local_addr().unwrap();
 
@@ -883,7 +844,10 @@ async fn admin_snapshot_reflects_runtime_state() {
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
             // One record so the cell store is non-empty when we sample.
-            client.record(0xFEED, KeyHash(0x42), 0, 4, 100).await.unwrap();
+            client
+                .record(0xFEED, KeyHash(0x42), 0, 4, 100)
+                .await
+                .unwrap();
 
             let (reply_tx, reply_rx) = oneshot::channel::<AdminSnapshot>();
             admin_tx

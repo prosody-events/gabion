@@ -7,6 +7,7 @@
 //! does only atomic loads.
 
 use arrayvec::ArrayVec;
+use gabion::defaults;
 use gabion::rules::{Descriptor, RuleTable, hash_key};
 
 use crate::rules::{CompiledRules, MAX_DESCRIPTORS, RuleSpec};
@@ -17,10 +18,27 @@ use crate::shm::stats::Stats;
 /// Maximum descriptor bytes per request (key + value, summed across all
 /// descriptors plus the domain). Matches the server's default cardinality
 /// envelope.
-pub const MAX_DESCRIPTOR_BYTES: usize = 512;
+pub const MAX_DESCRIPTOR_BYTES: usize = defaults::STORAGE_MAX_DESCRIPTOR_BYTES;
 
 /// Maximum per-descriptor key length in bytes.
-pub const MAX_KEY_BYTES: usize = 128;
+pub const MAX_KEY_BYTES: usize = defaults::STORAGE_MAX_KEY_BYTES;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CardinalitySettings {
+    pub max_descriptor_count: usize,
+    pub max_descriptor_bytes: usize,
+    pub max_key_bytes: usize,
+}
+
+impl Default for CardinalitySettings {
+    fn default() -> Self {
+        Self {
+            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
+            max_descriptor_bytes: defaults::STORAGE_MAX_DESCRIPTOR_BYTES,
+            max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
+        }
+    }
+}
 
 /// Look up an nginx variable's value. The access path borrows directly from
 /// nginx-owned buffers; the `&[u8]` returned must live for the duration of
@@ -61,6 +79,7 @@ pub struct AccessCtx<'a> {
     /// Default domain assigned to requests when the location config doesn't
     /// override it.
     pub domain: &'a str,
+    pub cardinality: CardinalitySettings,
 }
 
 /// Evaluate one request against the rule indicated by `rule_index`.
@@ -81,6 +100,10 @@ pub fn decide(
     let Some(compiled) = ctx.rules.get(rule_index) else {
         return AccessOutcome::Decline;
     };
+    if compiled.bindings.len() > ctx.cardinality.max_descriptor_count {
+        ctx.stats.record_cardinality_reject();
+        return AccessOutcome::Cardinality;
+    }
 
     // Build descriptors on the stack — no heap allocation.
     let mut value_storage: ArrayVec<&[u8], MAX_DESCRIPTORS> = ArrayVec::new();
@@ -99,14 +122,14 @@ pub fn decide(
     // gated at compile time; only per-request byte length is dynamic.
     let mut bytes = ctx.domain.len();
     for (binding, value) in compiled.bindings.iter().zip(value_storage.iter()) {
-        if binding.key.len() > MAX_KEY_BYTES {
+        if binding.key.len() > ctx.cardinality.max_key_bytes {
             ctx.stats.record_cardinality_reject();
             return AccessOutcome::Cardinality;
         }
         bytes = bytes
             .saturating_add(binding.key.len())
             .saturating_add(value.len());
-        if bytes > MAX_DESCRIPTOR_BYTES {
+        if bytes > ctx.cardinality.max_descriptor_bytes {
             ctx.stats.record_cardinality_reject();
             return AccessOutcome::Cardinality;
         }
@@ -271,6 +294,7 @@ mod mock {
             queue: region.queue(),
             stats: region.stats(),
             domain: crate::rules::DEFAULT_DOMAIN,
+            cardinality: CardinalitySettings::default(),
         }
     }
 }
@@ -336,13 +360,13 @@ mod tests {
         let zone = TestZone::allocate(words);
         // SAFETY: `ShmRegion::initialize`'s preconditions (see its
         // `# Safety` doc) are upheld:
-        // * `zone.as_ptr()` is non-null, writable, and 8-byte aligned (the
-        //   underlying allocation was a `Box<[u64]>`). `words * 8 >=
-        //   layout.total_bytes`, so the mapping size is covered.
+        // * `zone.as_ptr()` is non-null, writable, and 8-byte aligned (the underlying
+        //   allocation was a `Box<[u64]>`). `words * 8 >= layout.total_bytes`, so the
+        //   mapping size is covered.
         // * `Layout::new` produced `layout` above; offsets are consistent.
         // * `zone` is a fresh allocation; `initialize` is its first user.
-        // * The returned `TestZone` is paired with the `ShmRegion` and
-        //   dropped after every use of the region in each `#[test]`.
+        // * The returned `TestZone` is paired with the `ShmRegion` and dropped after
+        //   every use of the region in each `#[test]`.
         let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
         (zone, region)
     }
@@ -373,6 +397,7 @@ mod tests {
             queue: region.queue(),
             stats: region.stats(),
             domain: crate::rules::DEFAULT_DOMAIN,
+            cardinality: CardinalitySettings::default(),
         };
         let vars = MockVars::new().set("http_x_tenant", "alice");
         let outcome = decide(ctx, 0, &vars, 1_000);
@@ -399,24 +424,20 @@ mod tests {
         // `# Safety` doc) are upheld:
         // * `region` was produced by `build_zone`, which called
         //   `ShmRegion::initialize`. `initialize` `ptr::write`s an
-        //   `AggregateSlot::empty()` into each of the
-        //   `layout.aggregate_capacity` slots, so
-        //   `region.aggregate_slots_ptr()` is non-null, aligned for
-        //   `AggregateSlot`, and points at exactly that many fully
-        //   initialized slots.
-        // * The `capacity` argument is the same `aggregate_capacity` the
-        //   region was built with (`Layout::new` guarantees it is a power
-        //   of two `>= 2`, and the total byte length fits in the buffer
-        //   and thus in `isize::MAX`).
-        // * The backing `Vec<u8>` (`_buf` in the caller) lives until the
-        //   end of the `#[test]`, which outlives both this `store` and any
-        //   `AggregateTable<'_>` derived from it via `region.aggregate()`.
-        // * Single-writer: this test is single-threaded and `store` is the
-        //   sole `ShmAggregateStore` constructed against `region`'s
-        //   aggregate slots; reads from `region.aggregate()` use the same
-        //   seqlock/atomic protocol the production code does, so they
-        //   cannot race with `write_delta` (Nomicon: atomic accesses are
-        //   not data races even with concurrent reads).
+        //   `AggregateSlot::empty()` into each of the `layout.aggregate_capacity`
+        //   slots, so `region.aggregate_slots_ptr()` is non-null, aligned for
+        //   `AggregateSlot`, and points at exactly that many fully initialized slots.
+        // * The `capacity` argument is the same `aggregate_capacity` the region was
+        //   built with (`Layout::new` guarantees it is a power of two `>= 2`, and the
+        //   total byte length fits in the buffer and thus in `isize::MAX`).
+        // * The backing `Vec<u8>` (`_buf` in the caller) lives until the end of the
+        //   `#[test]`, which outlives both this `store` and any `AggregateTable<'_>`
+        //   derived from it via `region.aggregate()`.
+        // * Single-writer: this test is single-threaded and `store` is the sole
+        //   `ShmAggregateStore` constructed against `region`'s aggregate slots; reads
+        //   from `region.aggregate()` use the same seqlock/atomic protocol the
+        //   production code does, so they cannot race with `write_delta` (Nomicon:
+        //   atomic accesses are not data races even with concurrent reads).
         let store = unsafe {
             crate::shm::aggregate::ShmAggregateStore::new(
                 region.aggregate_slots_ptr(),
@@ -431,6 +452,7 @@ mod tests {
             queue: region.queue(),
             stats: region.stats(),
             domain,
+            cardinality: CardinalitySettings::default(),
         };
         let vars = MockVars::new().set("http_x_tenant", "alice");
         let outcome = decide(ctx, 0, &vars, 1_000);
@@ -453,10 +475,50 @@ mod tests {
             queue: region.queue(),
             stats: region.stats(),
             domain: crate::rules::DEFAULT_DOMAIN,
+            cardinality: CardinalitySettings::default(),
         };
         let vars = MockVars::new(); // no http_x_tenant set
         let outcome = decide(ctx, 0, &vars, 1_000);
         assert!(matches!(outcome, AccessOutcome::Decline));
+    }
+
+    #[test]
+    fn cardinality_settings_reject_oversized_descriptors() {
+        let (_buf, region) = build_zone(8, 16);
+        let rules = build_rules();
+        let ctx = AccessCtx {
+            rules: &rules,
+            aggregate: region.aggregate(),
+            queue: region.queue(),
+            stats: region.stats(),
+            domain: crate::rules::DEFAULT_DOMAIN,
+            cardinality: CardinalitySettings {
+                max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
+                max_descriptor_bytes: crate::rules::DEFAULT_DOMAIN.len() + "tenant".len(),
+                max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
+            },
+        };
+        let vars = MockVars::new().set("http_x_tenant", "alice");
+
+        let outcome = decide(ctx, 0, &vars, 1_000);
+
+        assert!(matches!(outcome, AccessOutcome::Cardinality));
+    }
+
+    #[test]
+    fn default_cardinality_settings_match_shared_defaults() {
+        let settings = CardinalitySettings::default();
+        assert_eq!(
+            settings.max_descriptor_count,
+            defaults::STORAGE_MAX_DESCRIPTOR_COUNT
+        );
+        assert_eq!(
+            settings.max_descriptor_bytes,
+            defaults::STORAGE_MAX_DESCRIPTOR_BYTES
+        );
+        assert_eq!(settings.max_key_bytes, defaults::STORAGE_MAX_KEY_BYTES);
+        assert_eq!(MAX_DESCRIPTOR_BYTES, defaults::STORAGE_MAX_DESCRIPTOR_BYTES);
+        assert_eq!(MAX_KEY_BYTES, defaults::STORAGE_MAX_KEY_BYTES);
     }
 
     #[test]

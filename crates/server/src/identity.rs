@@ -14,12 +14,12 @@ use twox_hash::xxhash3_128;
 /// Seed sources tried in order:
 /// 1. Explicit `seed_override` (from config).
 /// 2. OS hostname via [`whoami::fallible::hostname`].
-/// 3. The local interface IP the kernel would use to reach the public
-///    internet (no packet is actually sent — UDP `connect` is just an
-///    address association).
+/// 3. The local interface IP the kernel would use to reach the public internet
+///    (no packet is actually sent — UDP `connect` is just an address
+///    association).
 /// 4. A last-resort random-ish seed from `SystemTime` × `process_id`; not
-///    stable across restarts, but better than collapsing every restart into
-///    a single bucketed identity.
+///    stable across restarts, but better than collapsing every restart into a
+///    single bucketed identity.
 ///
 /// `incarnation` is unix epoch seconds clamped to `u32`, with a minimum of 1.
 /// Sub-second restarts reuse the same incarnation — peers catch up via the

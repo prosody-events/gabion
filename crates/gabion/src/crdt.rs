@@ -165,12 +165,13 @@ pub struct CompactCellKey {
     pub incarnation: Incarnation,
 }
 
-/// Portable cell identity used at the [`AggregateStore`](crate::gossip::AggregateStore)
-/// boundary. The `RuleSlot` interning index is node-local and not meaningful to
-/// downstream stores; `rule_fingerprint` is the same on every node by
-/// construction. Origin identity is intentionally omitted — the aggregate
-/// store keys on the cell's `(rule_fingerprint, key_hash, bucket)` tuple and
-/// has no business interpreting the originator.
+/// Portable cell identity used at the
+/// [`AggregateStore`](crate::gossip::AggregateStore) boundary. The `RuleSlot`
+/// interning index is node-local and not meaningful to downstream stores;
+/// `rule_fingerprint` is the same on every node by construction. Origin
+/// identity is intentionally omitted — the aggregate store keys on the cell's
+/// `(rule_fingerprint, key_hash, bucket)` tuple and has no business
+/// interpreting the originator.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct CellIdentity {
     pub rule_fingerprint: u128,
@@ -556,19 +557,16 @@ impl<C: Count> CellStore<C> {
                 capacity = self.capacity,
                 in_use = self.active_len,
                 config_key = "storage.max_cells",
-                "Too many distinct rate-limit keys are being tracked at \
-                 once. New keys are not being limited and will not \
-                 contribute to global counts until older time buckets \
-                 expire. To fix, raise `storage.max_cells` in your gabion \
-                 config (currently {}).",
+                "Too many distinct rate-limit keys are being tracked at once. New keys are not \
+                 being limited and will not contribute to global counts until older time buckets \
+                 expire. To fix, raise `storage.max_cells` in your gabion config (currently {}).",
                 self.capacity,
             );
         }
     }
 
     fn note_rule_dictionary_full(&mut self, rule_fingerprint: u128) {
-        self.rule_dictionary_full_rejects =
-            self.rule_dictionary_full_rejects.saturating_add(1);
+        self.rule_dictionary_full_rejects = self.rule_dictionary_full_rejects.saturating_add(1);
         if self.rule_dictionary_full_rejects.is_power_of_two() {
             tracing::warn!(
                 rejected_total = self.rule_dictionary_full_rejects,
@@ -587,8 +585,7 @@ impl<C: Count> CellStore<C> {
     }
 
     fn note_node_dictionary_full(&mut self, node_id: NodeId, incarnation: Incarnation) {
-        self.node_dictionary_full_rejects =
-            self.node_dictionary_full_rejects.saturating_add(1);
+        self.node_dictionary_full_rejects = self.node_dictionary_full_rejects.saturating_add(1);
         if self.node_dictionary_full_rejects.is_power_of_two() {
             tracing::warn!(
                 rejected_total = self.node_dictionary_full_rejects,

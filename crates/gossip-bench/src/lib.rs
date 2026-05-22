@@ -15,10 +15,10 @@
 //!   absorbed a write (Demers, Karp). Reported per fanout / cluster size.
 //! * **Network cost** (Bimodal Multicast): bytes-per-node-per-second and
 //!   packets-per-node-per-second at the steady state.
-//! * **Loss tolerance** (Bimodal, Astrolabe): convergence under
-//!   per-link drop probability.
-//! * **Partition + heal** (SWIM): elapsed virtual time to re-converge
-//!   after a network split is repaired.
+//! * **Loss tolerance** (Bimodal, Astrolabe): convergence under per-link drop
+//!   probability.
+//! * **Partition + heal** (SWIM): elapsed virtual time to re-converge after a
+//!   network split is repaired.
 //! * **Steady-state staleness** (Astrolabe): median observed lag for a
 //!   sustained write workload.
 //!
@@ -26,8 +26,8 @@
 //! harness can ingest them without re-implementing parsing.
 
 pub mod metrics;
-pub mod scenarios;
 pub mod scenario;
+pub mod scenarios;
 pub mod transport;
 
 pub use metrics::{NodeMetrics, ScenarioResult, TickSnapshot};
