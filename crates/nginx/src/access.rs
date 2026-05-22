@@ -203,17 +203,30 @@ fn collect_matching_specs(
     out
 }
 
-/// Compute the seconds until the oldest live bucket rolls off. Used for
-/// both `X-RateLimit-Reset` and `Retry-After` (the latter capped at the
-/// rule window per RFC 7231).
-pub fn reset_seconds(info: RejectInfo) -> u64 {
-    let bm = info.spec.bucket_millis.max(1);
-    let current_bucket_start = (info.now_millis / bm) * bm;
-    let next_boundary = current_bucket_start.saturating_add(bm);
-    let until_next = next_boundary.saturating_sub(info.now_millis);
-    let window_seconds = info.spec.window_millis.div_ceil(1_000);
-    let seconds = until_next.div_ceil(1_000);
-    seconds.min(window_seconds.max(1))
+/// Delta-seconds the client should wait before retrying. Emitted as
+/// `Retry-After` (RFC 7231 §7.1.3).
+///
+/// Under a sliding window, a hit recorded "now" stays in the window
+/// until `now + window_millis`. The safest answer — and the one least
+/// likely to send the client into another 429 — is the full window in
+/// seconds. We deliberately don't emit "seconds until the next bucket
+/// boundary" (often ~1s): under sliding windows that number is
+/// misleading because the rejected client's earlier hits are still
+/// counted at the next boundary.
+pub fn retry_after_seconds(info: RejectInfo) -> u64 {
+    info.spec.window_millis.div_ceil(1_000).max(1)
+}
+
+/// Unix-timestamp seconds at which `X-RateLimit-Reset` says the rate
+/// limit will reset. Matches the Envoy ratelimit filter / GitHub /
+/// Twitter conventions: emit an absolute time, not a delta.
+///
+/// Falls back to "now + window_seconds" if the caller's `now_millis`
+/// looks like a relative clock (less than the unix epoch lower bound).
+pub fn reset_unix_seconds(info: RejectInfo) -> u64 {
+    let window_seconds = info.spec.window_millis.div_ceil(1_000).max(1);
+    let now_seconds = info.now_millis / 1_000;
+    now_seconds.saturating_add(window_seconds)
 }
 
 #[cfg(test)]
@@ -447,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_seconds_caps_at_window() {
+    fn retry_after_seconds_matches_window() {
         let info = RejectInfo {
             spec: RuleSpec {
                 id: 1,
@@ -460,7 +473,23 @@ mod tests {
             total: 1,
             now_millis: 0,
         };
-        let s = reset_seconds(info);
-        assert!(s <= 60);
+        assert_eq!(retry_after_seconds(info), 60);
+    }
+
+    #[test]
+    fn reset_unix_seconds_is_now_plus_window() {
+        let info = RejectInfo {
+            spec: RuleSpec {
+                id: 1,
+                fingerprint: 0,
+                limit: 1,
+                bucket_millis: 1_000,
+                window_millis: 60_000,
+                live_buckets: 60,
+            },
+            total: 1,
+            now_millis: 1_770_000_000_000,
+        };
+        assert_eq!(reset_unix_seconds(info), 1_770_000_000 + 60);
     }
 }

@@ -172,7 +172,12 @@ assert_pod_rate_limit() {
         printf '%s\n' "FAIL: missing rate-limit header on 429 from pod $pod" >&2
         return 1
     fi
-    # Per the rule in deploy/nginx/nginx.module.conf: uri_api 2r/m.
+    # Per the rule in deploy/nginx/nginx.module.conf: uri_api 2r/m,
+    # window=60s. Standard conventions (Envoy / GitHub-compatible):
+    #   X-RateLimit-Limit:     budget
+    #   X-RateLimit-Remaining: 0 on reject
+    #   X-RateLimit-Reset:     unix-timestamp seconds when the window resets
+    #   Retry-After:           delta-seconds = window (RFC 7231)
     if [ "$limit_h" != "2" ]; then
         printf '%s\n' "FAIL: X-RateLimit-Limit=$limit_h, expected 2" >&2
         return 1
@@ -181,13 +186,20 @@ assert_pod_rate_limit() {
         printf '%s\n' "FAIL: X-RateLimit-Remaining=$remaining_h, expected 0" >&2
         return 1
     fi
-    # Reset / Retry-After are in seconds; should be > 0 and not absurdly large.
-    if [ "$reset_h" -le 0 ] 2>/dev/null; then
-        printf '%s\n' "FAIL: X-RateLimit-Reset=$reset_h is not a positive integer" >&2
+    # Retry-After should equal the rule window in seconds (60).
+    if [ "$retry_h" != "60" ]; then
+        printf '%s\n' "FAIL: Retry-After=$retry_h, expected 60 (rule window)" >&2
         return 1
     fi
-    if [ "$retry_h" -le 0 ] 2>/dev/null; then
-        printf '%s\n' "FAIL: Retry-After=$retry_h is not a positive integer" >&2
+    # Reset is a unix timestamp; sanity-check it is "now-ish" (within
+    # ±5 minutes of the local clock) so we catch a stale or absurd value.
+    now_unix="$(date +%s)"
+    delta=$((reset_h - now_unix))
+    if [ "$delta" -lt 0 ]; then
+        delta=$((-delta))
+    fi
+    if [ "$delta" -gt 300 ]; then
+        printf '%s\n' "FAIL: X-RateLimit-Reset=$reset_h is too far from now=$now_unix (delta=$delta s)" >&2
         return 1
     fi
 }
