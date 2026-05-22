@@ -11,7 +11,7 @@ path = "src/bin/gossip_bench.rs"
 
 [dependencies]
 anyhow.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 futures.workspace = true
 gabion.workspace = true
 humantime.workspace = true

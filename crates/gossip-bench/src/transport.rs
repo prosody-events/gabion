@@ -96,16 +96,11 @@ impl GossipTransport for CountingTransport {
         result
     }
 
-    fn recv_from<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a {
-        async move {
-            let result = self.inner.recv_from(buf).await;
-            if result.is_ok() {
-                self.counters.record_recv();
-            }
-            result
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let result = self.inner.recv_from(buf).await;
+        if result.is_ok() {
+            self.counters.record_recv();
         }
+        result
     }
 }

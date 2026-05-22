@@ -2240,11 +2240,11 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
     let mut cur = vec![0_u32; dict_cap];
     let mut live = vec![0_u32; dict_cap];
     for slot in 0..dict_cap {
-        if let Some(d) = store_b.rule_dictionary().descriptor(slot as RuleSlot) {
-            if d.bucket_millis > 0 {
-                cur[slot] = (now_millis / d.bucket_millis as u64) as BucketEpoch;
-                live[slot] = (d.window_millis / d.bucket_millis).max(1);
-            }
+        if let Some(d) = store_b.rule_dictionary().descriptor(slot as RuleSlot)
+            && d.bucket_millis > 0
+        {
+            cur[slot] = (now_millis / d.bucket_millis as u64) as BucketEpoch;
+            live[slot] = (d.window_millis / d.bucket_millis).max(1);
         }
     }
     let mut sink_b = ExpirationSink::<u32>::with_capacity(base.capacity() as usize);

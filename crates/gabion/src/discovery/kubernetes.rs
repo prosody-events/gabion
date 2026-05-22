@@ -8,7 +8,6 @@ use kube::config::Config;
 use kube::runtime::watcher::{Config as WatcherConfig, Error as WatcherError, Event, watcher};
 use kube::{Api, Client};
 use std::collections::hash_map::Entry;
-use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use tokio::sync::oneshot;
 
@@ -175,26 +174,9 @@ enum InClusterClientError {
     Client(#[from] kube::Error),
 }
 
-#[derive(Debug)]
-pub struct DiscoveryError(WatcherError);
-
-impl fmt::Display for DiscoveryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "kubernetes watch failed: {}", self.0)
-    }
-}
-
-impl std::error::Error for DiscoveryError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
-
-impl From<WatcherError> for DiscoveryError {
-    fn from(err: WatcherError) -> Self {
-        Self(err)
-    }
-}
+#[derive(Debug, thiserror::Error)]
+#[error("kubernetes watch failed: {0}")]
+pub struct DiscoveryError(#[from] WatcherError);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Target {

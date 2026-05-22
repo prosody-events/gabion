@@ -601,7 +601,7 @@ fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) 
                 .filter(|addr| *addr != addrs[i])
                 .collect();
             let mut cfg = sim_config(identity, peers, 0xEED0 + i as u64);
-            cfg.fanout = nodes.saturating_sub(1).min(8).max(1);
+            cfg.fanout = nodes.saturating_sub(1).clamp(1, 8);
             cfg.max_cells_per_tick = 32;
             let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
             let (rt, client) = GossipRuntime::from_parts(
@@ -1946,7 +1946,7 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
                 .filter(|addr| *addr != addrs[i])
                 .collect();
             let mut cfg = sim_config(identity, peers, 0xD0D0 + i as u64);
-            cfg.fanout = nodes.saturating_sub(1).min(4).max(1);
+            cfg.fanout = nodes.saturating_sub(1).clamp(1, 4);
             cfg.max_cells_per_tick = 32;
             let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
             let (rt, client) = GossipRuntime::from_parts(

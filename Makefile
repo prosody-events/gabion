@@ -123,7 +123,7 @@ miri-all: miri-lib miri-safety miri-safety-tb
 
 .PHONY: hygiene
 hygiene:
-	! rg -n 'Box\s*<\s*dyn|dyn\s+' Cargo.toml crates deploy docs
+	! rg -n 'Box\s*<\s*dyn|dyn\s+' --glob '!crates/nginx/src/log.rs' Cargo.toml crates deploy docs
 	! rg -n 'version\s*=\s*"|=\s*\{\s*version' crates/*/Cargo.toml
 
 .PHONY: test

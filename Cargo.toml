@@ -19,6 +19,7 @@ arrayvec = "0.7"
 axum = "0.8"
 async-stream = "0.3"
 bon = "3"
+clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", default-features = false, features = ["yaml"] }
 criterion = "0.8"
 dashmap = "6"

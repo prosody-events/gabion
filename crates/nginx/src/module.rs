@@ -579,9 +579,7 @@ impl VariableLookup for RequestVariables<'_> {
                 // aliasing or lifetime extension occurs.
                 unsafe { raw.connection.as_ref() }.map(|conn| conn.addr_text.as_bytes())
             }
-            BindingLookup::Arg(name) => {
-                find_query_arg(raw.args.as_bytes(), name.as_bytes())
-            }
+            BindingLookup::Arg(name) => find_query_arg(raw.args.as_bytes(), name.as_bytes()),
             BindingLookup::IndexedVariable { index, .. } => {
                 // SAFETY: nginx guarantees the request pointer (`self.request`
                 // → underlying `ngx_http_request_t`) is valid for the
@@ -680,7 +678,8 @@ extern "C" fn set_zone(
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
-                "gabion: `gabion_limit_zone` declared twice; only one zone is supported per http {{}} block"
+                "gabion: `gabion_limit_zone` declared twice; only one zone is supported per http \
+                 {{}} block"
             );
             return core::NGX_CONF_ERROR;
         }
@@ -688,7 +687,8 @@ extern "C" fn set_zone(
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
-                "gabion: `gabion_limit_zone` requires one argument of the form `zone=NAME:SIZE` (e.g. `zone=api:128m`)"
+                "gabion: `gabion_limit_zone` requires one argument of the form `zone=NAME:SIZE` \
+                 (e.g. `zone=api:128m`)"
             );
             return core::NGX_CONF_ERROR;
         };
@@ -696,7 +696,8 @@ extern "C" fn set_zone(
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
-                "gabion: `gabion_limit_zone` argument must start with `zone=` (e.g. `zone=api:128m`)"
+                "gabion: `gabion_limit_zone` argument must start with `zone=` (e.g. \
+                 `zone=api:128m`)"
             );
             return core::NGX_CONF_ERROR;
         };
@@ -721,7 +722,8 @@ extern "C" fn set_zone(
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
-                "gabion: `gabion_limit_zone` size `{}` is not a valid byte count (use suffix k/m/g)",
+                "gabion: `gabion_limit_zone` size `{}` is not a valid byte count (use suffix \
+                 k/m/g)",
                 size
             );
             return core::NGX_CONF_ERROR;
@@ -866,7 +868,8 @@ extern "C" fn set_rule(
                         ngx::ngx_conf_log_error!(
                             NGX_LOG_EMERG,
                             cf,
-                            "gabion: `gabion_limit_rule` `dry_run` flag conflicts with explicit `mode=`"
+                            "gabion: `gabion_limit_rule` `dry_run` flag conflicts with explicit \
+                             `mode=`"
                         );
                         return core::NGX_CONF_ERROR;
                     }
@@ -892,7 +895,8 @@ extern "C" fn set_rule(
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
-                "gabion: `gabion_limit_rule` rule `{}` is missing the required `rate=Nr/s` argument",
+                "gabion: `gabion_limit_rule` rule `{}` is missing the required `rate=Nr/s` \
+                 argument",
                 name
             );
             return core::NGX_CONF_ERROR;
@@ -901,7 +905,8 @@ extern "C" fn set_rule(
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
-                "gabion: `gabion_limit_rule` rule `{}` declares no descriptor bindings; add at least one `$variable` (e.g. `$remote_addr`)",
+                "gabion: `gabion_limit_rule` rule `{}` declares no descriptor bindings; add at \
+                 least one `$variable` (e.g. `$remote_addr`)",
                 name
             );
             return core::NGX_CONF_ERROR;
@@ -980,9 +985,8 @@ fn parse_rule_arg(value: &str) -> RuleArg {
     match parse_binding(value) {
         Some(b) => RuleArg::Binding(b),
         None => RuleArg::Invalid(
-            "expected `$variable`, `name:$variable`, or one of \
-             `rate=`, `window=`, `bucket=`, `mode=`, `dry_run`, \
-             `except_if=`, `domain=`",
+            "expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, \
+             `mode=`, `dry_run`, `except_if=`, `domain=`",
         ),
     }
 }
@@ -1090,7 +1094,8 @@ extern "C" fn set_limit(
                 ngx::ngx_conf_log_error!(
                     NGX_LOG_EMERG,
                     cf,
-                    "gabion: `gabion_limit` references rule `{}`, which is not declared via `gabion_limit_rule`",
+                    "gabion: `gabion_limit` references rule `{}`, which is not declared via \
+                     `gabion_limit_rule`",
                     rule_name
                 );
                 return core::NGX_CONF_ERROR;
@@ -1610,12 +1615,7 @@ fn install_worker_globals(cf: *mut ngx_conf_t, main: &MainConfig) -> bool {
     let rules = match CompiledRules::compile_with(&main.rules, main.cardinality, &mut compiler) {
         Ok(r) => Arc::new(r),
         Err(error) => {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: rule compile failed: {}",
-                error
-            );
+            ngx::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "gabion: rule compile failed: {}", error);
             return false;
         }
     };
@@ -1645,7 +1645,9 @@ struct NgxBindingCompiler {
 
 #[derive(Debug, thiserror::Error)]
 enum NgxBindingError {
-    #[error("could not resolve variable `${0}`; load the providing module before `gabion_limit_rule`")]
+    #[error(
+        "could not resolve variable `${0}`; load the providing module before `gabion_limit_rule`"
+    )]
     UnknownVariable(String),
     #[error("could not compile template `{0}` as a complex value")]
     ComplexCompile(String),
@@ -1661,9 +1663,9 @@ impl BindingCompiler for NgxBindingCompiler {
         if let Some(b) = crate::rules::compile_inline(source) {
             return Ok(b);
         }
-        // 2. Single $identifier: resolve through nginx's indexed-variable
-        //    table. Hashing happens inside the call once at config phase;
-        //    per-request lookups are O(1).
+        // 2. Single $identifier: resolve through nginx's indexed-variable table.
+        //    Hashing happens inside the call once at config phase; per-request lookups
+        //    are O(1).
         if let Some(stripped) = source.strip_prefix('$') {
             if crate::rules::is_single_ident(stripped) {
                 let mut name_str = ngx_str_t {
@@ -1685,15 +1687,14 @@ impl BindingCompiler for NgxBindingCompiler {
                 });
             }
         }
-        // 3. Template: compile to an ngx_http_complex_value_t in the
-        //    cycle pool. Allocates two structs (the input ccv and the
-        //    output complex_value) against `cf->pool`.
+        // 3. Template: compile to an ngx_http_complex_value_t in the cycle pool.
+        //    Allocates two structs (the input ccv and the output complex_value) against
+        //    `cf->pool`.
         // SAFETY: cf is valid; `pool` is the cycle pool; sizeof return
         // values are POD.
         let cv_size = std::mem::size_of::<ngx::ffi::ngx_http_complex_value_t>();
-        let cv_ptr: *mut ngx::ffi::ngx_http_complex_value_t = unsafe {
-            ngx::ffi::ngx_palloc((*self.cf).pool, cv_size).cast()
-        };
+        let cv_ptr: *mut ngx::ffi::ngx_http_complex_value_t =
+            unsafe { ngx::ffi::ngx_palloc((*self.cf).pool, cv_size).cast() };
         if cv_ptr.is_null() {
             return Err(NgxBindingError::PoolAlloc(cv_size));
         }
@@ -1701,9 +1702,7 @@ impl BindingCompiler for NgxBindingCompiler {
             len: source.len(),
             data: source.as_ptr() as *mut _,
         };
-        let mut ccv: ngx::ffi::ngx_http_compile_complex_value_t = unsafe {
-            std::mem::zeroed()
-        };
+        let mut ccv: ngx::ffi::ngx_http_compile_complex_value_t = unsafe { std::mem::zeroed() };
         ccv.cf = self.cf;
         ccv.value = &mut value_str;
         ccv.complex_value = cv_ptr;
@@ -1820,12 +1819,11 @@ fn parse_size_bytes(input: &str) -> Result<usize, ()> {
 }
 
 /// Parse a positional descriptor binding argument. Accepts:
-/// - `$uri` → key="uri", source="$uri" (auto-keyed; only when the source
-///   is a single legal `$identifier`)
+/// - `$uri` → key="uri", source="$uri" (auto-keyed; only when the source is a
+///   single legal `$identifier`)
 /// - `tenant:$http_x_tenant` → key="tenant", source="$http_x_tenant"
-/// - `combo:prefix-$asn-$ua` → key="combo", source="prefix-$asn-$ua"
-///   (template; compiled via `ngx_http_compile_complex_value` at config
-///   phase)
+/// - `combo:prefix-$asn-$ua` → key="combo", source="prefix-$asn-$ua" (template;
+///   compiled via `ngx_http_compile_complex_value` at config phase)
 ///
 /// Templates (anything with literal text or multiple `$` substitutions)
 /// require the explicit `key:source` form — there's no useful auto-name

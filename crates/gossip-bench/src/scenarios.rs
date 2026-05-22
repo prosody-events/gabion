@@ -23,7 +23,7 @@ use crate::metrics::{Headline, NodeMetrics, ScenarioResult, TickSnapshot};
 use crate::scenario::{LinkAction, Scenario, ScenarioKind, Workload};
 use crate::transport::{CountingHandle, CountingTransport};
 
-const RULE_FINGERPRINT: u128 = 0xC0FE_DEADBEEF_BABE_F00D;
+const RULE_FINGERPRINT: u128 = 0xC0FE_DEAD_BEEF_BABE_F00D;
 const KEY: u128 = 0x0123_4567_89AB_CDEF;
 const BUCKET: BucketEpoch = 1;
 

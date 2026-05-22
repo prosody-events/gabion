@@ -340,15 +340,15 @@ README.
   `nextest`, the safety integration test, and `hygiene`. Run it before
   declaring a change done. `make ci` adds Miri (Stacked Borrows),
   `bench-check`, and the nginx smoke tests.
-- Tests live in their own file in their own module: each tested
-  module `foo.rs` gets a `tests.rs` file inside the module's own
-  subdirectory (`foo/tests.rs`), declared from `foo.rs` as
-  `#[cfg(test)] mod tests;`. Don't bury a
-  `#[cfg(test)] mod tests { ... }` block at the bottom of the
-  production file, and don't drop a sibling `foo_tests.rs` next to
-  `foo.rs`. Cross-process integration lives in
-  `crates/nginx/tests/safety.rs`. Run individual tests with
-  `cargo nextest run -p <crate> <filter>`.
+- Tests live in their own file, not inline at the bottom of the
+  production file. For a tested module `foo.rs`, declare
+  `#[cfg(test)] mod tests;` in the parent and put the body at
+  `foo/tests.rs` — write tests at the top level of that file; the
+  parent's `mod tests;` does the wrapping. Test-only helpers (mocks,
+  fixtures) get their own sibling under the same module — e.g.
+  `foo/mock.rs` declared as `#[cfg(test)] mod mock;`. Cross-process
+  integration lives in `crates/nginx/tests/safety.rs`. Run individual
+  tests with `cargo nextest run -p <crate> <filter>`.
 - Shared production tunables live in `gabion::defaults`. Both adapters
   consume them; introduce new tunables there, not as duplicated `const`s
   in each adapter.
