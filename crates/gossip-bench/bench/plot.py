@@ -102,9 +102,16 @@ def _base(name: str, **overrides) -> dict:
 
 
 def suite_convergence() -> list[dict]:
-    """Demers/Karp: single-write convergence vs cluster size and fanout."""
+    """Demers/Karp: single-write convergence vs cluster size and fanout.
+    N sweeps up to 256 here (the scale_n suite goes further). Bigger
+    clusters take more virtual ticks to converge, so the duration grows
+    with N to make sure we capture the convergence point even at
+    fanout=1."""
     out = []
-    for n in [4, 8, 16, 32, 64]:
+    for n in [4, 8, 16, 32, 64, 128, 256]:
+        # ceil(2 * log2(n)) seconds is enough virtual time for fanout=1
+        # to finish; smaller fanouts converge faster.
+        duration_s = max(8, 2 * (n.bit_length() - 1))
         for f in [1, 2, 3, 5, 8]:
             if f >= n:
                 continue
@@ -113,7 +120,7 @@ def suite_convergence() -> list[dict]:
                     f"converge_n{n}_f{f}",
                     nodes=n,
                     fanout=f,
-                    duration="6s",
+                    duration=f"{duration_s}s",
                     kind="convergence",
                 )
             )
@@ -219,17 +226,26 @@ def suite_staleness() -> list[dict]:
 
 
 def suite_scale_n() -> list[dict]:
-    """Convergence as cluster size scales — the classic log-N curve."""
-    return [
-        _base(
-            f"scale_n{n}",
-            nodes=n,
-            fanout=3,
-            duration="8s",
-            kind="scale_n",
+    """Convergence as cluster size scales — the classic log-N curve.
+    Stretched all the way to N=1024 to demonstrate the protocol holds
+    its log-N shape and its constant per-node bandwidth at scale.
+    Duration grows with N so the runner captures the convergence point
+    even when fanout=3 needs ~log_2(N) rounds at 100ms ticks."""
+    out = []
+    for n in [4, 8, 16, 32, 64, 128, 256, 512, 1024]:
+        # 4 * log2(N) tick periods = 0.4 * log2(N) seconds of headroom.
+        # Floor at 8 s for the small clusters.
+        duration_s = max(8, 4 * (n.bit_length() - 1) // 10 + 1) * 4
+        out.append(
+            _base(
+                f"scale_n{n}",
+                nodes=n,
+                fanout=3,
+                duration=f"{duration_s}s",
+                kind="scale_n",
+            )
         )
-        for n in [4, 8, 16, 32, 64, 128]
-    ]
+    return out
 
 
 SUITES = {

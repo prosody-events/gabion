@@ -58,13 +58,32 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
         apply_link(&router, &addrs, link);
     }
 
+    // Size every capacity from N so 512- and 1024-node runs don't trip
+    // the CellStore's "full" rejects or run out of peer / node-dict
+    // slots. Headroom factor is conservative: at N=1024, cell_capacity
+    // = max(256, 4*N) = 4096 even for a single-rule workload (one cell
+    // per origin per active bucket).
+    let cell_capacity = scenario
+        .cell_capacity
+        .max(((scenario.nodes as u32).saturating_mul(4)).max(256));
+    let node_dict_capacity = ((scenario.nodes as u32) * 2)
+        .max(64)
+        .min(u16::MAX as u32) as u16;
+    let peer_capacity =
+        ((scenario.nodes as u32) + 16).max(32).min(u16::MAX as u32) as u16;
+    let dirty_capacity = (cell_capacity as usize).max(256);
+
     let mut nodes: Vec<NodeHandle> = Vec::with_capacity(scenario.nodes);
     for (i, addr) in addrs.iter().enumerate() {
         let identity = NodeIdentity::new(NodeId((i as u128) * 0x100 + 1), 1);
         let store = CellStore::<u32>::new(
             CellStoreConfig {
-                cell_capacity: scenario.cell_capacity,
-                ..CellStoreConfig::default()
+                cell_capacity,
+                rule_dictionary_capacity: 64,
+                node_dictionary_capacity: node_dict_capacity,
+                local_dirty_capacity: dirty_capacity,
+                forwarded_dirty_capacity: dirty_capacity,
+                peer_capacity,
             },
             identity,
         );
@@ -79,18 +98,29 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
             .map(|(_, a)| a)
             .collect();
 
+        // Frame size scales with N too: a "fill the frame" tick needs
+        // room for at least one cell per known origin, otherwise the
+        // gossip exchange is starved at large N. 4*N matches the
+        // CellStore's headroom factor.
+        let max_cells_per_tick = scenario
+            .max_cells_per_tick
+            .max((scenario.nodes * 4).max(256));
+
         let gossip_cfg = GossipConfig {
             local_identity: identity,
             cluster_id_hash: 0xC1,
             bootstrap_peers: bootstrap,
             fanout: scenario.fanout,
-            max_cells_per_tick: scenario.max_cells_per_tick,
+            max_cells_per_tick,
             wire_limits: FrameLimits {
-                max_payload_bytes: 1400,
-                max_cells: scenario.max_cells_per_tick as u32,
+                // Big enough to fit ~max_cells_per_tick cells. The
+                // production wire codec splits across multiple packets
+                // anyway; this just sets the per-frame ceiling.
+                max_payload_bytes: 64 * 1024,
+                max_cells: max_cells_per_tick as u32,
             },
-            send_queue_capacity: 32,
-            limit_queue_capacity: 1024,
+            send_queue_capacity: 64,
+            limit_queue_capacity: 4096,
             tick_interval: scenario.tick_interval,
             auth_key: None,
             rng_seed: scenario.seed.wrapping_add(i as u64),
