@@ -55,11 +55,12 @@ impl<C: Count> DashMapStore<C> {
         bucket_millis: u64,
         live_buckets: u32,
     ) -> u64 {
-        let bm = bucket_millis.max(1);
-        let current = (now_millis / bm) as BucketEpoch;
-        let live = live_buckets.max(1);
+        // `Rule::new` clamps `bucket_millis` and `live_buckets` to ≥ 1, so
+        // every caller routed through `Rule::spec()` is safe. Defensive
+        // clamps here would only hide caller bugs.
+        let current = (now_millis / bucket_millis) as BucketEpoch;
         let mut total: u64 = 0;
-        for offset in 0..live {
+        for offset in 0..live_buckets {
             let Some(bucket) = current.checked_sub(offset) else {
                 break;
             };

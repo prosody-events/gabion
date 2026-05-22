@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow = "1"
+arrayvec.workspace = true
 axum.workspace = true
 config.workspace = true
 dashmap.workspace = true

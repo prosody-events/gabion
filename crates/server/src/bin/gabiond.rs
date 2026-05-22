@@ -241,8 +241,8 @@ async fn run() -> anyhow::Result<()> {
     // `serve_with_shutdown` drains in-flight requests before returning.
     if shutdown_tx.send(true).is_err() {
         tracing::warn!(
-            "Shutdown signal had no remaining subscribers; gRPC/admin tasks \
-             may have already exited.",
+            "Shutdown signal had no remaining subscribers; gRPC/admin tasks may have already \
+             exited.",
         );
     }
 

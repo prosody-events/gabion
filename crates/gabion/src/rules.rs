@@ -56,6 +56,7 @@ pub struct Rule {
     pub limit: u64,
     pub window_millis: u64,
     pub bucket_millis: u64,
+    pub live_buckets: u32,
     pub mode: EnforcementMode,
 }
 
@@ -74,6 +75,9 @@ impl Rule {
         let domain = domain.into();
         let fingerprint = rule_fingerprint(&domain, &descriptors);
         let domain_hash = hash_domain(&domain);
+        let window_millis = window_millis.max(1);
+        let bucket_millis = bucket_millis.max(1);
+        let live_buckets = window_millis.div_ceil(bucket_millis).max(1) as u32;
         Self {
             id,
             fingerprint,
@@ -81,18 +85,37 @@ impl Rule {
             domain_hash,
             descriptors,
             limit,
-            window_millis: window_millis.max(1),
-            bucket_millis: bucket_millis.max(1),
+            window_millis,
+            bucket_millis,
+            live_buckets,
             mode,
         }
     }
 
-    /// Number of buckets covering this rule's window.
-    pub fn live_buckets(&self) -> u32 {
-        let bm = self.bucket_millis.max(1);
-        let span = self.window_millis.max(1);
-        span.div_ceil(bm).max(1) as u32
+    /// Hot-path-ready summary. O(1) field copies.
+    pub fn spec(&self) -> RuleSpec {
+        RuleSpec {
+            id: self.id,
+            fingerprint: self.fingerprint,
+            limit: self.limit,
+            bucket_millis: self.bucket_millis,
+            window_millis: self.window_millis,
+            live_buckets: self.live_buckets,
+        }
     }
+}
+
+/// Hot-path-ready summary of one rule. The per-request decision path holds
+/// this by value (Copy) so neither adapter needs an O(N) lookup back into
+/// the rule table by id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuleSpec {
+    pub id: RuleId,
+    pub fingerprint: u128,
+    pub limit: u64,
+    pub bucket_millis: u64,
+    pub window_millis: u64,
+    pub live_buckets: u32,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

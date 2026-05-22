@@ -21,16 +21,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gabion::crdt::Count;
+use arrayvec::ArrayVec;
+use gabion::crdt::{Count, KeyHash};
 use gabion::defaults;
 use gabion::gossip::GossipClient;
-use gabion::rules::{Descriptor, Rule, RuleId, RuleTable, hash_key};
+use gabion::rules::{Descriptor, RuleSpec, RuleTable, hash_key};
 use thiserror::Error;
 
 use crate::admission::{CardinalityLimits, Decision, LimitRequest, RejectReason};
 use crate::store::DashMapStore;
 
 const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
+const MAX_MATCHED_RULES: usize = defaults::STORAGE_MAX_MATCHED_RULES;
 
 pub mod admin;
 pub mod admission;
@@ -57,24 +59,6 @@ pub enum ServeError {
     Transport(#[from] tonic::transport::Error),
 }
 
-#[derive(Debug, Error)]
-pub enum EvaluationError {
-    #[error("rule spec missing for rule id {0}")]
-    MissingRuleSpec(RuleId),
-}
-
-/// Precomputed hot-path data for one rule. Built once at startup so the
-/// per-request path doesn't re-derive bucket arithmetic or look up the
-/// fingerprint.
-#[derive(Clone, Copy, Debug)]
-struct RuleSpec {
-    id: RuleId,
-    fingerprint: u128,
-    limit: u64,
-    bucket_millis: u64,
-    live_buckets: u32,
-}
-
 /// Adapter state shared between the gRPC service and admin endpoints.
 ///
 /// Cheap to clone (`Arc` + `Clone` handles). The gossip runtime that backs
@@ -82,7 +66,6 @@ struct RuleSpec {
 #[derive(Clone)]
 pub struct SharedLimiter<C: Count = u32> {
     rule_table: Arc<RuleTable>,
-    rule_specs: Arc<[RuleSpec]>,
     gossip_client: GossipClient<C>,
     counts: Arc<DashMapStore<C>>,
     cardinality_limits: CardinalityLimits,
@@ -95,11 +78,8 @@ impl<C: Count> SharedLimiter<C> {
         counts: Arc<DashMapStore<C>>,
         cardinality_limits: CardinalityLimits,
     ) -> Self {
-        let rule_specs: Arc<[RuleSpec]> =
-            rule_table.iter().map(rule_spec).collect::<Vec<_>>().into();
         Self {
             rule_table,
-            rule_specs,
             gossip_client,
             counts,
             cardinality_limits,
@@ -114,13 +94,6 @@ impl<C: Count> SharedLimiter<C> {
         &self.counts
     }
 
-    fn spec_for(&self, id: RuleId) -> Result<&RuleSpec, EvaluationError> {
-        self.rule_specs
-            .iter()
-            .find(|s| s.id == id)
-            .ok_or(EvaluationError::MissingRuleSpec(id))
-    }
-
     /// Evaluate one Envoy rate-limit request at the given wall-clock time.
     /// Each descriptor is admitted independently — rejected descriptors do
     /// not gate the others.
@@ -128,7 +101,7 @@ impl<C: Count> SharedLimiter<C> {
         &self,
         request: RateLimitRequest,
         now_millis: u64,
-    ) -> Result<RateLimitResponse, EvaluationError> {
+    ) -> RateLimitResponse {
         let hits = u64::from(request.hits_addend.max(1));
         let mut statuses = Vec::with_capacity(request.descriptors.len());
         let max_entries = request
@@ -152,7 +125,7 @@ impl<C: Count> SharedLimiter<C> {
                             descriptors: mapped.as_slice(),
                             hits,
                         };
-                        self.evaluate(core_request, now_millis).await?
+                        self.evaluate(core_request, now_millis).await
                     }
                     Err(reason) => Decision::Reject(reason),
                 }
@@ -165,7 +138,7 @@ impl<C: Count> SharedLimiter<C> {
             });
         }
 
-        Ok(RateLimitResponse {
+        RateLimitResponse {
             overall_code: if over_limit {
                 rate_limit_response::Code::OverLimit
             } else {
@@ -173,27 +146,26 @@ impl<C: Count> SharedLimiter<C> {
             } as i32,
             statuses,
             ..Default::default()
-        })
+        }
     }
 
-    async fn evaluate(
-        &self,
-        request: LimitRequest<'_>,
-        now_millis: u64,
-    ) -> Result<Decision, EvaluationError> {
+    async fn evaluate(&self, request: LimitRequest<'_>, now_millis: u64) -> Decision {
         if request.violates_cardinality(self.cardinality_limits) {
             note_cardinality_reject(request.domain, request.descriptors.len());
-            return Ok(Decision::Reject(RejectReason::Cardinality));
+            return Decision::Reject(RejectReason::Cardinality);
         }
 
-        let mut decision = Decision::Allow;
+        // Pass 1: decide allow/reject and buffer (spec, key_hash, bucket)
+        // for replay on the gossip-record path. One walk over `matching`,
+        // one `hash_key` per matched rule, O(1) `Rule::spec()`. Early-exit
+        // on the first reject — no events have been queued yet.
+        let mut planned: ArrayVec<(RuleSpec, KeyHash, u32), MAX_MATCHED_RULES> = ArrayVec::new();
         for rule in self
             .rule_table
             .matching(request.domain, request.descriptors)
         {
-            let spec = self.spec_for(rule.id)?;
+            let spec = rule.spec();
             let key_hash = hash_key(rule.id, request.domain, request.descriptors);
-
             let total = self.counts.window_total(
                 spec.fingerprint,
                 key_hash,
@@ -202,30 +174,38 @@ impl<C: Count> SharedLimiter<C> {
                 spec.live_buckets,
             );
             if total.saturating_add(request.hits) > spec.limit {
-                decision = Decision::Reject(RejectReason::GlobalLimit);
-                // Continue iterating so every matching rule participates in
-                // the decision, but do not charge a rejected descriptor.
+                return Decision::Reject(RejectReason::GlobalLimit);
+            }
+            let bucket = (now_millis / spec.bucket_millis) as u32;
+            if planned.try_push((spec, key_hash, bucket)).is_err() {
+                // Per the allow-by-default principle (see CLAUDE.md), a
+                // matched-rules overflow is a gabion-internal limit, not a
+                // client cardinality violation: let the request through
+                // with the events we managed to buffer rather than
+                // rejecting because our cap is undersized.
+                note_matched_overflow(request.domain, MAX_MATCHED_RULES);
+                break;
             }
         }
 
-        if !decision.is_reject() {
-            for rule in self
-                .rule_table
-                .matching(request.domain, request.descriptors)
+        // Pass 2: gossip-record. Only allowed requests reach here, so a
+        // single drain of the buffer fans out the deltas.
+        for (spec, key_hash, bucket) in &planned {
+            if let Err(err) = self
+                .gossip_client
+                .record(
+                    spec.fingerprint,
+                    *key_hash,
+                    *bucket,
+                    request.hits,
+                    now_millis,
+                )
+                .await
             {
-                let spec = self.spec_for(rule.id)?;
-                let key_hash = hash_key(rule.id, request.domain, request.descriptors);
-                let bucket = (now_millis / spec.bucket_millis) as u32;
-                if let Err(err) = self
-                    .gossip_client
-                    .record(spec.fingerprint, key_hash, bucket, request.hits, now_millis)
-                    .await
-                {
-                    note_gossip_record_failure(&err);
-                }
+                note_gossip_record_failure(&err);
             }
         }
-        Ok(decision)
+        Decision::Allow
     }
 }
 
@@ -255,6 +235,7 @@ fn map_envoy_descriptor<'a>(
 
 static CARDINALITY_REJECTS: AtomicU64 = AtomicU64::new(0);
 static GOSSIP_RECORD_FAILURES: AtomicU64 = AtomicU64::new(0);
+static MATCHED_RULE_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 
 fn note_cardinality_reject(domain: &str, descriptor_count: usize) {
     let n = CARDINALITY_REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -288,13 +269,17 @@ fn note_gossip_record_failure(err: &gabion::gossip::GossipError) {
     }
 }
 
-fn rule_spec(rule: &Rule) -> RuleSpec {
-    RuleSpec {
-        id: rule.id,
-        fingerprint: rule.fingerprint,
-        limit: rule.limit,
-        bucket_millis: rule.bucket_millis,
-        live_buckets: rule.live_buckets(),
+fn note_matched_overflow(domain: &str, cap: usize) {
+    let n = MATCHED_RULE_OVERFLOWS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            domain,
+            cap,
+            overflowed_total = n,
+            "A single request matched more rules than gabion's per-request cap allows; the \
+             request was rejected conservatively rather than truncated. Reduce overlapping rule \
+             patterns or raise STORAGE_MAX_MATCHED_RULES."
+        );
     }
 }
 
@@ -365,8 +350,7 @@ where
         let response = self
             .limiter
             .should_rate_limit_at(request.into_inner(), now_millis())
-            .await
-            .map_err(|err| tonic::Status::internal(err.to_string()))?;
+            .await;
         Ok(tonic::Response::new(response))
     }
 }

@@ -1,10 +1,9 @@
 //! Bridge from operator-provided nginx configuration (`gabion_limit_rule`)
 //! to `gabion::rules::Rule` + a precomputed `RuleSpec` table.
 //!
-//! Mirrors the server's `RuleSpec` pattern (`crates/server/src/lib.rs:51-57`).
-//! Each `RuleSpec` carries the values the access hot path needs without
-//! re-deriving them per request: the cross-node `fingerprint`, the limit,
-//! the bucket size, and the live-bucket count.
+//! `RuleSpec` itself lives in `gabion::rules` so both adapters share the
+//! same hot-path-ready summary; this module re-exports it for source
+//! compatibility.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +11,8 @@ use std::time::Duration;
 use gabion::defaults;
 use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId, RuleTable};
 use thiserror::Error;
+
+pub use gabion::rules::RuleSpec;
 
 /// Default domain assigned to rules that don't name one explicitly. nginx
 /// requests carry no inherent "domain" the way Envoy descriptors do, so we
@@ -22,6 +23,25 @@ pub const DEFAULT_DOMAIN: &str = "nginx";
 /// envelope so cross-node fingerprints can never grow past what one side can
 /// admit.
 pub const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
+
+/// Operator-visible cardinality envelope, enforced both at config-compile
+/// time (descriptor count, key length) and per-request (byte budget).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CardinalitySettings {
+    pub max_descriptor_count: usize,
+    pub max_descriptor_bytes: usize,
+    pub max_key_bytes: usize,
+}
+
+impl Default for CardinalitySettings {
+    fn default() -> Self {
+        Self {
+            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
+            max_descriptor_bytes: defaults::STORAGE_MAX_DESCRIPTOR_BYTES,
+            max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
+        }
+    }
+}
 
 /// One descriptor binding declared in nginx config — a descriptor `key` paired
 /// with the nginx variable name to read at request time.
@@ -46,43 +66,19 @@ pub struct RuleConfig {
 }
 
 /// Compiled rule data ready for the runtime. Holds the gossip `Rule`, the
-/// operator-facing name (so locations can be wired up by string), the
-/// per-request descriptor bindings, and the hot-path `RuleSpec`.
+/// operator-facing name (so locations can be wired up by string), and the
+/// per-request descriptor bindings. The hot-path `RuleSpec` is reachable
+/// via `rule.spec()`.
 #[derive(Debug)]
 pub struct CompiledRule {
     pub name: String,
     pub rule: Rule,
     pub bindings: Vec<DescriptorBinding>,
-    pub spec: RuleSpec,
 }
 
-/// Hot-path-ready summary of one rule. Copied around freely.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RuleSpec {
-    pub id: RuleId,
-    pub fingerprint: u128,
-    pub limit: u64,
-    pub bucket_millis: u64,
-    pub window_millis: u64,
-    pub live_buckets: u32,
-}
-
-impl RuleSpec {
-    pub fn from_rule(rule: &Rule) -> Self {
-        Self {
-            id: rule.id,
-            fingerprint: rule.fingerprint,
-            limit: rule.limit,
-            bucket_millis: rule.bucket_millis,
-            window_millis: rule.window_millis,
-            live_buckets: rule.live_buckets(),
-        }
-    }
-}
-
-/// Composite of `RuleTable` + per-rule `Vec<DescriptorBinding>` + per-rule
-/// `RuleSpec`. Shared (via `Arc`) between every worker's location config and
-/// the leader's drain task.
+/// Composite of `RuleTable` + per-rule `Vec<DescriptorBinding>`. Shared (via
+/// `Arc`) between every worker's location config and the leader's drain
+/// task.
 #[derive(Debug)]
 pub struct CompiledRules {
     table: Arc<RuleTable>,
@@ -91,13 +87,14 @@ pub struct CompiledRules {
 
 impl CompiledRules {
     /// Compile a list of `RuleConfig`s into a `RuleTable` + per-rule specs.
+    /// Uses the default cardinality envelope (16 descriptors / 128B keys).
     pub fn compile(configs: &[RuleConfig]) -> Result<Self, RuleConfigError> {
-        Self::compile_with_max_descriptors(configs, MAX_DESCRIPTORS)
+        Self::compile_with_cardinality(configs, CardinalitySettings::default())
     }
 
-    pub fn compile_with_max_descriptors(
+    pub fn compile_with_cardinality(
         configs: &[RuleConfig],
-        max_descriptors: usize,
+        cardinality: CardinalitySettings,
     ) -> Result<Self, RuleConfigError> {
         if configs.is_empty() {
             return Err(RuleConfigError::Empty);
@@ -108,8 +105,16 @@ impl CompiledRules {
             if cfg.bindings.is_empty() {
                 return Err(RuleConfigError::EmptyBindings(cfg.name.clone()));
             }
-            if cfg.bindings.len() > max_descriptors {
+            if cfg.bindings.len() > cardinality.max_descriptor_count {
                 return Err(RuleConfigError::TooManyBindings(cfg.name.clone()));
+            }
+            for binding in &cfg.bindings {
+                if binding.key.len() > cardinality.max_key_bytes {
+                    return Err(RuleConfigError::KeyTooLong {
+                        rule: cfg.name.clone(),
+                        key: binding.key.clone(),
+                    });
+                }
             }
             let id: RuleId = (idx + 1) as RuleId;
             let descriptors = cfg
@@ -129,13 +134,11 @@ impl CompiledRules {
                 duration_millis(cfg.bucket),
                 cfg.mode,
             );
-            let spec = RuleSpec::from_rule(&rule);
             rules.push(rule.clone());
             compiled.push(CompiledRule {
                 name: cfg.name.clone(),
                 rule,
                 bindings: cfg.bindings.clone(),
-                spec,
             });
         }
         Ok(Self {
@@ -181,6 +184,8 @@ pub enum RuleConfigError {
     EmptyBindings(String),
     #[error("rule {0} declares too many bindings")]
     TooManyBindings(String),
+    #[error("rule {rule} binding key '{key}' exceeds max_key_bytes")]
+    KeyTooLong { rule: String, key: String },
 }
 
 fn duration_millis(d: Duration) -> u64 {
@@ -218,8 +223,8 @@ mod tests {
         ])
         .expect("compile");
         assert_eq!(rules.len(), 2);
-        assert_eq!(rules.rules()[0].spec.limit, 10);
-        assert_eq!(rules.rules()[0].spec.live_buckets, 60);
+        assert_eq!(rules.rules()[0].rule.spec().limit, 10);
+        assert_eq!(rules.rules()[0].rule.spec().live_buckets, 60);
         let table = rules.table();
         assert_eq!(table.len(), 2);
     }
@@ -234,5 +239,26 @@ mod tests {
     fn empty_set_rejects() {
         let err = CompiledRules::compile(&[]).unwrap_err();
         assert_eq!(err, RuleConfigError::Empty);
+    }
+
+    #[test]
+    fn key_too_long_at_compile() {
+        let long_key = "k".repeat(200);
+        let cardinality = CardinalitySettings::default();
+        let err = CompiledRules::compile_with_cardinality(
+            &[cfg("long", vec![binding(&long_key, "http_x")])],
+            cardinality,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuleConfigError::KeyTooLong { .. }));
+    }
+
+    #[test]
+    fn too_many_bindings_at_compile() {
+        let bindings = (0..MAX_DESCRIPTORS + 1)
+            .map(|i| binding(&format!("k{i}"), &format!("v{i}")))
+            .collect();
+        let err = CompiledRules::compile(&[cfg("wide", bindings)]).unwrap_err();
+        assert!(matches!(err, RuleConfigError::TooManyBindings(_)));
     }
 }

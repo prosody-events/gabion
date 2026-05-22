@@ -8,12 +8,16 @@
 
 use arrayvec::ArrayVec;
 use gabion::defaults;
-use gabion::rules::{Descriptor, RuleTable, hash_key};
+use gabion::rules::{Descriptor, hash_key};
 
 use crate::rules::{CompiledRules, MAX_DESCRIPTORS, RuleSpec};
 use crate::shm::aggregate::AggregateTable;
 use crate::shm::queue::{QueueEvent, RequestQueue};
 use crate::shm::stats::Stats;
+
+/// Cap on rules that may match a single request. Mirrors the server limit
+/// (`gabion::defaults::STORAGE_MAX_MATCHED_RULES`).
+const MAX_MATCHED_RULES: usize = defaults::STORAGE_MAX_MATCHED_RULES;
 
 /// Maximum descriptor bytes per request (key + value, summed across all
 /// descriptors plus the domain). Matches the server's default cardinality
@@ -23,22 +27,7 @@ pub const MAX_DESCRIPTOR_BYTES: usize = defaults::STORAGE_MAX_DESCRIPTOR_BYTES;
 /// Maximum per-descriptor key length in bytes.
 pub const MAX_KEY_BYTES: usize = defaults::STORAGE_MAX_KEY_BYTES;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CardinalitySettings {
-    pub max_descriptor_count: usize,
-    pub max_descriptor_bytes: usize,
-    pub max_key_bytes: usize,
-}
-
-impl Default for CardinalitySettings {
-    fn default() -> Self {
-        Self {
-            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
-            max_descriptor_bytes: defaults::STORAGE_MAX_DESCRIPTOR_BYTES,
-            max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
-        }
-    }
-}
+pub use crate::rules::CardinalitySettings;
 
 /// Look up an nginx variable's value. The access path borrows directly from
 /// nginx-owned buffers; the `&[u8]` returned must live for the duration of
@@ -100,32 +89,17 @@ pub fn decide(
     let Some(compiled) = ctx.rules.get(rule_index) else {
         return AccessOutcome::Decline;
     };
-    if compiled.bindings.len() > ctx.cardinality.max_descriptor_count {
-        ctx.stats.record_cardinality_reject();
-        return AccessOutcome::Cardinality;
-    }
 
-    // Build descriptors on the stack — no heap allocation.
-    let mut value_storage: ArrayVec<&[u8], MAX_DESCRIPTORS> = ArrayVec::new();
-    for binding in &compiled.bindings {
-        match vars.value(&binding.variable) {
-            Some(value) => {
-                if value_storage.try_push(value).is_err() {
-                    return AccessOutcome::Decline;
-                }
-            }
-            None => return AccessOutcome::Decline,
-        }
-    }
-
-    // Validate cardinality before any rule work. `bindings.len()` is
-    // gated at compile time; only per-request byte length is dynamic.
+    // Build descriptors on the stack in one pass over `bindings`. Variable
+    // misses decline; UTF-8 failures decline (and bump a stat so the bypass
+    // is observable); the dynamic byte budget is the only per-request
+    // cardinality check — count and key length are gated at compile time.
+    let mut descriptors: ArrayVec<Descriptor<'_>, MAX_DESCRIPTORS> = ArrayVec::new();
     let mut bytes = ctx.domain.len();
-    for (binding, value) in compiled.bindings.iter().zip(value_storage.iter()) {
-        if binding.key.len() > ctx.cardinality.max_key_bytes {
-            ctx.stats.record_cardinality_reject();
-            return AccessOutcome::Cardinality;
-        }
+    for binding in &compiled.bindings {
+        let Some(value) = vars.value(&binding.variable) else {
+            return AccessOutcome::Decline;
+        };
         bytes = bytes
             .saturating_add(binding.key.len())
             .saturating_add(value.len());
@@ -133,19 +107,12 @@ pub fn decide(
             ctx.stats.record_cardinality_reject();
             return AccessOutcome::Cardinality;
         }
-    }
-
-    // Build the `Descriptor<'_>` slice borrowed from the value storage.
-    let mut descriptors: ArrayVec<Descriptor<'_>, MAX_DESCRIPTORS> = ArrayVec::new();
-    for (binding, value) in compiled.bindings.iter().zip(value_storage.iter()) {
-        // SAFETY: values come from nginx variables; they may be non-utf8 in
-        // theory but the rate-limit hashing treats them as bytes via
-        // `Descriptor`'s `&str` field. Defer the utf8 check to the borrow
-        // site — `from_utf8` lossy is too expensive; we use `from_utf8` and
-        // decline on error.
         let value_str = match std::str::from_utf8(value) {
             Ok(s) => s,
-            Err(_) => return AccessOutcome::Decline,
+            Err(_) => {
+                ctx.stats.record_decline_invalid_descriptor();
+                return AccessOutcome::Decline;
+            }
         };
         descriptors.push(Descriptor {
             key: binding.key.as_str(),
@@ -155,16 +122,17 @@ pub fn decide(
 
     // Walk matching rules — typically a single rule (the one named by the
     // location), but we honor the rule table's semantics so multiple rules
-    // could match a single request.
+    // could match. Buffer events for replay so a reject mid-iteration skips
+    // the queue work cleanly.
     let descriptors_slice: &[Descriptor<'_>] = descriptors.as_slice();
+    let mut planned: ArrayVec<QueueEvent, MAX_MATCHED_RULES> = ArrayVec::new();
     let mut worst: Option<RejectInfo> = None;
-    let matched: ArrayVec<RuleSpec, MAX_DESCRIPTORS> =
-        collect_matching_specs(ctx.rules.table(), ctx.domain, descriptors_slice, ctx.rules);
+    let mut matched_any = false;
 
-    let mut records: ArrayVec<QueueEvent, MAX_DESCRIPTORS> = ArrayVec::new();
-    for spec in &matched {
+    for rule in ctx.rules.table().matching(ctx.domain, descriptors_slice) {
+        matched_any = true;
+        let spec = rule.spec();
         let key_hash = hash_key(spec.id, ctx.domain, descriptors_slice);
-        let bucket = (now_millis / spec.bucket_millis.max(1)) as u32;
         let total = ctx.aggregate.window_total(
             spec.fingerprint,
             key_hash.0,
@@ -172,60 +140,50 @@ pub fn decide(
             spec.bucket_millis,
             spec.live_buckets,
         );
-        if total.saturating_add(1) > spec.limit && worst.is_none() {
+        if total.saturating_add(1) > spec.limit {
             worst = Some(RejectInfo {
-                spec: *spec,
+                spec,
                 total,
                 now_millis,
             });
+            break;
         }
-        records.push(QueueEvent {
-            rule_fingerprint: spec.fingerprint,
-            key_hash: key_hash.0,
-            bucket,
-            hits: 1,
-            now_millis,
-        });
-    }
-
-    match worst {
-        Some(info) => {
-            ctx.stats.record_reject();
-            AccessOutcome::Reject(info)
-        }
-        None => {
-            if matched.is_empty() {
-                AccessOutcome::Decline
-            } else {
-                for event in records {
-                    match ctx.queue.push(event) {
-                        Ok(()) => ctx.stats.record_queue_push(),
-                        Err(_) => ctx.stats.record_queue_drop(),
-                    }
-                }
-                ctx.stats.record_allow();
-                AccessOutcome::Allow
-            }
-        }
-    }
-}
-
-fn collect_matching_specs(
-    table: &RuleTable,
-    domain: &str,
-    descriptors: &[Descriptor<'_>],
-    rules: &CompiledRules,
-) -> ArrayVec<RuleSpec, MAX_DESCRIPTORS> {
-    let mut out: ArrayVec<RuleSpec, MAX_DESCRIPTORS> = ArrayVec::new();
-    for rule in table.matching(domain, descriptors) {
-        let Some(compiled) = rules.rules().iter().find(|r| r.rule.id == rule.id) else {
-            continue;
-        };
-        if out.try_push(compiled.spec).is_err() {
+        let bucket = (now_millis / spec.bucket_millis) as u32;
+        if planned
+            .try_push(QueueEvent {
+                rule_fingerprint: spec.fingerprint,
+                key_hash: key_hash.0,
+                bucket,
+                hits: 1,
+                now_millis,
+            })
+            .is_err()
+        {
+            // Hit the per-request matched-rules cap. Per the
+            // allow-by-default principle (see CLAUDE.md), we keep going
+            // with the events we managed to buffer: under-counting on the
+            // remaining rules is preferable to rejecting traffic because
+            // gabion's internal cap is undersized.
+            ctx.stats.record_matched_rule_overflow();
             break;
         }
     }
-    out
+
+    if let Some(info) = worst {
+        ctx.stats.record_reject();
+        return AccessOutcome::Reject(info);
+    }
+    if !matched_any {
+        return AccessOutcome::Decline;
+    }
+    for event in planned {
+        match ctx.queue.push(event) {
+            Ok(()) => ctx.stats.record_queue_push(),
+            Err(_) => ctx.stats.record_queue_drop(),
+        }
+    }
+    ctx.stats.record_allow();
+    AccessOutcome::Allow
 }
 
 /// Delta-seconds the client should wait before retrying. Emitted as
@@ -275,6 +233,11 @@ mod mock {
         pub fn set(mut self, name: &str, value: &str) -> Self {
             self.vars
                 .insert(name.to_string(), value.as_bytes().to_vec());
+            self
+        }
+
+        pub fn set_bytes(mut self, name: &str, value: &[u8]) -> Self {
+            self.vars.insert(name.to_string(), value.to_vec());
             self
         }
     }
@@ -413,13 +376,13 @@ mod tests {
         let (_buf, region) = build_zone(8, 16);
         let rules = build_rules();
         let domain = crate::rules::DEFAULT_DOMAIN;
-        let spec = rules.rules()[0].spec;
+        let spec = rules.rules()[0].rule.spec();
         let descriptors = [Descriptor {
             key: "tenant",
             value: "alice",
         }];
         let key_hash = hash_key(spec.id, domain, &descriptors);
-        let bucket = (1_000_u64 / spec.bucket_millis.max(1)) as u32;
+        let bucket = (1_000_u64 / spec.bucket_millis) as u32;
         // Pre-populate aggregate so total >= limit (limit is 2).
         // SAFETY: `ShmAggregateStore::new`'s preconditions (see its
         // `# Safety` doc) are upheld:
@@ -522,6 +485,30 @@ mod tests {
         assert_eq!(settings.max_key_bytes, defaults::STORAGE_MAX_KEY_BYTES);
         assert_eq!(MAX_DESCRIPTOR_BYTES, defaults::STORAGE_MAX_DESCRIPTOR_BYTES);
         assert_eq!(MAX_KEY_BYTES, defaults::STORAGE_MAX_KEY_BYTES);
+    }
+
+    #[test]
+    fn invalid_utf8_descriptor_declines_and_bumps_counter() {
+        let (_buf, region) = build_zone(8, 16);
+        let rules = build_rules();
+        let ctx = AccessCtx {
+            rules: &rules,
+            aggregate: region.aggregate(),
+            queue: region.queue(),
+            stats: region.stats(),
+            domain: crate::rules::DEFAULT_DOMAIN,
+            cardinality: CardinalitySettings::default(),
+        };
+        // `0xFF` is never a valid UTF-8 lead byte — guaranteed decline.
+        let vars = MockVars::new().set_bytes("http_x_tenant", &[0xFFu8, 0xFE, 0xFD]);
+        let outcome = decide(ctx, 0, &vars, 1_000);
+        assert!(matches!(outcome, AccessOutcome::Decline));
+        let snap = region.stats().snapshot();
+        assert_eq!(snap.declines_invalid_descriptor, 1);
+        // Allow-by-default: a UTF-8 decline does NOT increment the
+        // user-facing reject counter.
+        assert_eq!(snap.rejected, 0);
+        assert_eq!(snap.rejected_cardinality, 0);
     }
 
     #[test]

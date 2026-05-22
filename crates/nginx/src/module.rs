@@ -1272,10 +1272,7 @@ fn install_worker_globals(main: &MainConfig) {
     // one originally used. These together are the contract documented on
     // `ShmRegion::from_initialized`.
     let region = unsafe { ShmRegion::from_initialized(ptr, layout) };
-    let rules = match CompiledRules::compile_with_max_descriptors(
-        &main.rules,
-        main.cardinality.max_descriptor_count,
-    ) {
+    let rules = match CompiledRules::compile_with_cardinality(&main.rules, main.cardinality) {
         Ok(r) => Arc::new(r),
         Err(error) => {
             tracing::error!(%error, "gabion: rule compile failed");

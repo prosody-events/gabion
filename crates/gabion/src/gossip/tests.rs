@@ -431,274 +431,274 @@ fn quickcheck_sim_connected_clusters_converge_after_finite_loss(
 #[quickcheck]
 fn quickcheck_sim_partition_heals_without_overcount(mut case: PartitionCase) -> TestResult {
     run_paused(async move {
-            const NODES: usize = 8;
-            if case.records.is_empty() {
-                return TestResult::discard();
-            }
-            for record in &mut case.records {
-                record.node %= NODES as u16;
-            }
+        const NODES: usize = 8;
+        if case.records.is_empty() {
+            return TestResult::discard();
+        }
+        for record in &mut case.records {
+            record.node %= NODES as u16;
+        }
 
-            let router = SimRouter::with_channel_capacity(128);
-            let addrs: Vec<_> = (0..NODES).map(|i| sock(42_000 + i as u16)).collect();
-            for left in 0..4 {
-                for right in 4..8 {
-                    router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Block);
-                    router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Block);
-                }
+        let router = SimRouter::with_channel_capacity(128);
+        let addrs: Vec<_> = (0..NODES).map(|i| sock(42_000 + i as u16)).collect();
+        for left in 0..4 {
+            for right in 4..8 {
+                router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Block);
+                router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Block);
             }
+        }
 
-            let mut clients = Vec::with_capacity(NODES);
-            let mut handles = Vec::with_capacity(NODES);
-            let mut aggregates = Vec::with_capacity(NODES);
-            for i in 0..NODES {
-                let identity = NodeIdentity::new(NodeId(0xB000 + i as u128), 1);
-                let peers: Vec<_> = addrs
-                    .iter()
-                    .copied()
-                    .filter(|addr| *addr != addrs[i])
-                    .collect();
-                let mut cfg = sim_config(identity, peers, 0xC0FF_EE00 + i as u64);
-                cfg.fanout = 4;
-                cfg.max_cells_per_tick = 32;
-                let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
-                let (rt, client) = GossipRuntime::from_parts(
-                    router.bind(addrs[i]),
-                    TokioClock::from_millis(0),
-                    cfg,
-                    store_for(identity),
-                    agg.clone(),
-                );
-                handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-                clients.push(client);
-                aggregates.push(agg);
-            }
+        let mut clients = Vec::with_capacity(NODES);
+        let mut handles = Vec::with_capacity(NODES);
+        let mut aggregates = Vec::with_capacity(NODES);
+        for i in 0..NODES {
+            let identity = NodeIdentity::new(NodeId(0xB000 + i as u128), 1);
+            let peers: Vec<_> = addrs
+                .iter()
+                .copied()
+                .filter(|addr| *addr != addrs[i])
+                .collect();
+            let mut cfg = sim_config(identity, peers, 0xC0FF_EE00 + i as u64);
+            cfg.fanout = 4;
+            cfg.max_cells_per_tick = 32;
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(addrs[i]),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(identity),
+                agg.clone(),
+            );
+            handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+            clients.push(client);
+            aggregates.push(agg);
+        }
 
-            for record in &case.records {
-                let node = record.node as usize % NODES;
-                clients[node]
-                    .record(
-                        rule_fp(record.rule),
-                        key_hash(record.key),
-                        0,
-                        record.hits as u64,
-                        0,
-                    )
-                    .await
-                    .unwrap();
-            }
+        for record in &case.records {
+            let node = record.node as usize % NODES;
+            clients[node]
+                .record(
+                    rule_fp(record.rule),
+                    key_hash(record.key),
+                    0,
+                    record.hits as u64,
+                    0,
+                )
+                .await
+                .unwrap();
+        }
 
-            sim_advance_ticks(Duration::from_millis(100), case.heal_after_ticks as u32).await;
-            let global = expected_model(&case.records, NODES);
-            let no_overcount = aggregates.iter().all(|agg| {
-                agg.snapshot()
-                    .iter()
-                    .all(|(key, count)| *count <= *global.get(key).unwrap_or(&0))
-            });
+        sim_advance_ticks(Duration::from_millis(100), case.heal_after_ticks as u32).await;
+        let global = expected_model(&case.records, NODES);
+        let no_overcount = aggregates.iter().all(|agg| {
+            agg.snapshot()
+                .iter()
+                .all(|(key, count)| *count <= *global.get(key).unwrap_or(&0))
+        });
 
-            for left in 0..4 {
-                for right in 4..8 {
-                    router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Pass);
-                    router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Pass);
-                }
+        for left in 0..4 {
+            for right in 4..8 {
+                router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Pass);
+                router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Pass);
             }
-            sim_advance_ticks(Duration::from_millis(100), 120).await;
-            let converged = aggregates.iter().all(|agg| agg.snapshot() == global);
+        }
+        sim_advance_ticks(Duration::from_millis(100), 120).await;
+        let converged = aggregates.iter().all(|agg| agg.snapshot() == global);
 
-            for client in clients {
-                let _ = client.shutdown().await;
-            }
-            for handle in handles {
-                let _ = handle.await;
-            }
-            TestResult::from_bool(no_overcount && converged)
+        for client in clients {
+            let _ = client.shutdown().await;
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        TestResult::from_bool(no_overcount && converged)
     })
 }
 
 #[quickcheck]
 fn quickcheck_sim_authentication_admits_only_matching_keys(case: AuthCase) -> TestResult {
     run_paused(async move {
-            let router = SimRouter::new();
-            let addr_a = sock(43_000);
-            let addr_b = sock(43_001);
-            let id_a = NodeIdentity::new(NodeId(0xCA), 1);
-            let id_b = NodeIdentity::new(NodeId(0xCB), 1);
-            let key_a = HmacKey([7; 32]);
-            let key_b = if case.matching_keys {
-                HmacKey([7; 32])
-            } else {
-                HmacKey([8; 32])
-            };
+        let router = SimRouter::new();
+        let addr_a = sock(43_000);
+        let addr_b = sock(43_001);
+        let id_a = NodeIdentity::new(NodeId(0xCA), 1);
+        let id_b = NodeIdentity::new(NodeId(0xCB), 1);
+        let key_a = HmacKey([7; 32]);
+        let key_b = if case.matching_keys {
+            HmacKey([7; 32])
+        } else {
+            HmacKey([8; 32])
+        };
 
-            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
-            cfg_a.auth_key = Some(key_a);
-            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
-            cfg_b.auth_key = Some(key_b);
-            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                router.bind(addr_a),
-                TokioClock::from_millis(0),
-                cfg_a,
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            let (rt_b, client_b) = GossipRuntime::from_parts(
-                router.bind(addr_b),
-                TokioClock::from_millis(0),
-                cfg_b,
-                store_for(id_b),
-                agg_b.clone(),
-            );
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+        let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+        cfg_a.auth_key = Some(key_a);
+        let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+        cfg_b.auth_key = Some(key_b);
+        let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let (rt_a, client_a) = GossipRuntime::from_parts(
+            router.bind(addr_a),
+            TokioClock::from_millis(0),
+            cfg_a,
+            store_for(id_a),
+            agg_a.clone(),
+        );
+        let (rt_b, client_b) = GossipRuntime::from_parts(
+            router.bind(addr_b),
+            TokioClock::from_millis(0),
+            cfg_b,
+            store_for(id_b),
+            agg_b.clone(),
+        );
+        let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+        let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            client_a
-                .record(0xD00D, KeyHash(1), 0, case.a_hits as u64, 0)
-                .await
-                .unwrap();
-            client_b
-                .record(0xD00D, KeyHash(1), 0, case.b_hits as u64, 0)
-                .await
-                .unwrap();
-            sim_advance_ticks(Duration::from_millis(100), 20).await;
+        client_a
+            .record(0xD00D, KeyHash(1), 0, case.a_hits as u64, 0)
+            .await
+            .unwrap();
+        client_b
+            .record(0xD00D, KeyHash(1), 0, case.b_hits as u64, 0)
+            .await
+            .unwrap();
+        sim_advance_ticks(Duration::from_millis(100), 20).await;
 
-            let sum_a = agg_a.inner.borrow().values().copied().sum::<u64>();
-            let sum_b = agg_b.inner.borrow().values().copied().sum::<u64>();
-            let expected = if case.matching_keys {
-                (
-                    case.a_hits as u64 + case.b_hits as u64,
-                    case.a_hits as u64 + case.b_hits as u64,
-                )
-            } else {
-                (case.a_hits as u64, case.b_hits as u64)
-            };
+        let sum_a = agg_a.inner.borrow().values().copied().sum::<u64>();
+        let sum_b = agg_b.inner.borrow().values().copied().sum::<u64>();
+        let expected = if case.matching_keys {
+            (
+                case.a_hits as u64 + case.b_hits as u64,
+                case.a_hits as u64 + case.b_hits as u64,
+            )
+        } else {
+            (case.a_hits as u64, case.b_hits as u64)
+        };
 
-            client_a.shutdown().await.unwrap();
-            client_b.shutdown().await.unwrap();
-            let _ = h_a.await;
-            let _ = h_b.await;
+        client_a.shutdown().await.unwrap();
+        client_b.shutdown().await.unwrap();
+        let _ = h_a.await;
+        let _ = h_b.await;
 
-            TestResult::from_bool((sum_a, sum_b) == expected)
+        TestResult::from_bool((sum_a, sum_b) == expected)
     })
 }
 
 #[quickcheck]
 fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) -> TestResult {
     run_paused(async move {
-            let nodes = case.nodes as usize;
-            let router = SimRouter::with_channel_capacity(128);
-            let addrs: Vec<_> = (0..nodes).map(|i| sock(44_000 + i as u16)).collect();
-            let mut clients = Vec::with_capacity(nodes);
-            let mut handles = Vec::with_capacity(nodes);
-            let mut aggregates = Vec::with_capacity(nodes);
+        let nodes = case.nodes as usize;
+        let router = SimRouter::with_channel_capacity(128);
+        let addrs: Vec<_> = (0..nodes).map(|i| sock(44_000 + i as u16)).collect();
+        let mut clients = Vec::with_capacity(nodes);
+        let mut handles = Vec::with_capacity(nodes);
+        let mut aggregates = Vec::with_capacity(nodes);
 
-            for i in 0..nodes {
-                let identity = NodeIdentity::new(NodeId(0xE000 + i as u128), 1);
-                let peers: Vec<_> = addrs
-                    .iter()
-                    .copied()
-                    .filter(|addr| *addr != addrs[i])
-                    .collect();
-                let mut cfg = sim_config(identity, peers, 0xEED0 + i as u64);
-                cfg.fanout = nodes.saturating_sub(1).min(8).max(1);
-                cfg.max_cells_per_tick = 32;
-                let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
-                let (rt, client) = GossipRuntime::from_parts(
-                    router.bind(addrs[i]),
-                    TokioClock::from_millis(0),
-                    cfg,
-                    store_for_expiring_rule(identity),
-                    agg.clone(),
-                );
-                handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-                clients.push(client);
-                aggregates.push(agg);
-            }
+        for i in 0..nodes {
+            let identity = NodeIdentity::new(NodeId(0xE000 + i as u128), 1);
+            let peers: Vec<_> = addrs
+                .iter()
+                .copied()
+                .filter(|addr| *addr != addrs[i])
+                .collect();
+            let mut cfg = sim_config(identity, peers, 0xEED0 + i as u64);
+            cfg.fanout = nodes.saturating_sub(1).min(8).max(1);
+            cfg.max_cells_per_tick = 32;
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(addrs[i]),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for_expiring_rule(identity),
+                agg.clone(),
+            );
+            handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+            clients.push(client);
+            aggregates.push(agg);
+        }
 
-            for record in &case.records {
-                let node = record.node as usize % nodes;
-                clients[node]
-                    .record(
-                        rule_fp(record.rule),
-                        key_hash(record.key),
-                        0,
-                        record.hits as u64,
-                        0,
-                    )
-                    .await
-                    .unwrap();
-            }
+        for record in &case.records {
+            let node = record.node as usize % nodes;
+            clients[node]
+                .record(
+                    rule_fp(record.rule),
+                    key_hash(record.key),
+                    0,
+                    record.hits as u64,
+                    0,
+                )
+                .await
+                .unwrap();
+        }
 
-            sim_advance_ticks(Duration::from_millis(100), 8).await;
-            let expired_everywhere = aggregates.iter().all(|agg| agg.snapshot().is_empty());
+        sim_advance_ticks(Duration::from_millis(100), 8).await;
+        let expired_everywhere = aggregates.iter().all(|agg| agg.snapshot().is_empty());
 
-            for client in clients {
-                let _ = client.shutdown().await;
-            }
-            for handle in handles {
-                let _ = handle.await;
-            }
-            TestResult::from_bool(expired_everywhere)
+        for client in clients {
+            let _ = client.shutdown().await;
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        TestResult::from_bool(expired_everywhere)
     })
 }
 
 #[quickcheck]
 fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> TestResult {
     run_paused(async move {
-            let router = SimRouter::new();
-            let addr_a = sock(45_000);
-            let addr_b = sock(45_001);
-            let id_a = NodeIdentity::new(NodeId(0xFA), 1);
-            let id_b = NodeIdentity::new(NodeId(0xFB), 1);
+        let router = SimRouter::new();
+        let addr_a = sock(45_000);
+        let addr_b = sock(45_001);
+        let id_a = NodeIdentity::new(NodeId(0xFA), 1);
+        let id_b = NodeIdentity::new(NodeId(0xFB), 1);
 
-            let events = if case.remove_after_add {
-                vec![
-                    PeerEvent::Added(Peer::new(addr_b)),
-                    PeerEvent::Removed(Peer::new(addr_b)),
-                ]
-            } else {
-                vec![PeerEvent::Added(Peer::new(addr_b))]
-            };
+        let events = if case.remove_after_add {
+            vec![
+                PeerEvent::Added(Peer::new(addr_b)),
+                PeerEvent::Removed(Peer::new(addr_b)),
+            ]
+        } else {
+            vec![PeerEvent::Added(Peer::new(addr_b))]
+        };
 
-            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                router.bind(addr_a),
-                TokioClock::from_millis(0),
-                sim_config(id_a, Vec::new(), 1),
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            let (rt_b, client_b) = GossipRuntime::from_parts(
-                router.bind(addr_b),
-                TokioClock::from_millis(0),
-                sim_config(id_b, Vec::new(), 2),
-                store_for(id_b),
-                agg_b.clone(),
-            );
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::iter(events)));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+        let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let (rt_a, client_a) = GossipRuntime::from_parts(
+            router.bind(addr_a),
+            TokioClock::from_millis(0),
+            sim_config(id_a, Vec::new(), 1),
+            store_for(id_a),
+            agg_a.clone(),
+        );
+        let (rt_b, client_b) = GossipRuntime::from_parts(
+            router.bind(addr_b),
+            TokioClock::from_millis(0),
+            sim_config(id_b, Vec::new(), 2),
+            store_for(id_b),
+            agg_b.clone(),
+        );
+        let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::iter(events)));
+        let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            tokio::task::yield_now().await;
-            client_a
-                .record(0xFACE, KeyHash(1), 0, case.hits as u64, 0)
-                .await
-                .unwrap();
-            sim_advance_ticks(Duration::from_millis(100), 20).await;
+        tokio::task::yield_now().await;
+        client_a
+            .record(0xFACE, KeyHash(1), 0, case.hits as u64, 0)
+            .await
+            .unwrap();
+        sim_advance_ticks(Duration::from_millis(100), 20).await;
 
-            let got_b = agg_b.inner.borrow().values().copied().sum::<u64>();
-            let expected_b = if case.remove_after_add {
-                0
-            } else {
-                case.hits as u64
-            };
+        let got_b = agg_b.inner.borrow().values().copied().sum::<u64>();
+        let expected_b = if case.remove_after_add {
+            0
+        } else {
+            case.hits as u64
+        };
 
-            client_a.shutdown().await.unwrap();
-            client_b.shutdown().await.unwrap();
-            let _ = h_a.await;
-            let _ = h_b.await;
-            TestResult::from_bool(got_b == expected_b)
+        client_a.shutdown().await.unwrap();
+        client_b.shutdown().await.unwrap();
+        let _ = h_a.await;
+        let _ = h_b.await;
+        TestResult::from_bool(got_b == expected_b)
     })
 }
 
@@ -1541,87 +1541,82 @@ fn quickcheck_peer_slot_pairing_holds_across_lifecycle(case: PairingCase) -> Tes
     use tokio::sync::mpsc;
 
     run_paused(async move {
-            const NODE_COUNT: usize = 3;
-            let router = SimRouter::new();
-            let addrs: Vec<SocketAddr> =
-                (0..NODE_COUNT).map(|i| sock(48_000 + i as u16)).collect();
+        const NODE_COUNT: usize = 3;
+        let router = SimRouter::new();
+        let addrs: Vec<SocketAddr> = (0..NODE_COUNT).map(|i| sock(48_000 + i as u16)).collect();
 
-            let id_local = NodeIdentity::new(NodeId(0xA0A0), 1);
-            let mut cfg = sim_config(id_local, Vec::new(), 1);
-            cfg.fanout = NODE_COUNT.saturating_sub(1);
+        let id_local = NodeIdentity::new(NodeId(0xA0A0), 1);
+        let mut cfg = sim_config(id_local, Vec::new(), 1);
+        cfg.fanout = NODE_COUNT.saturating_sub(1);
 
-            let (admin_tx, admin_rx) = mpsc::channel(8);
-            let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
-            let peer_stream = futures::stream::unfold(peer_rx, |mut rx| async move {
-                rx.recv().await.map(|evt| (evt, rx))
-            });
+        let (admin_tx, admin_rx) = mpsc::channel(8);
+        let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
+        let peer_stream = futures::stream::unfold(peer_rx, |mut rx| async move {
+            rx.recv().await.map(|evt| (evt, rx))
+        });
 
-            let local_addr = addrs[0];
-            let (rt_local, client_local) = GossipRuntime::from_parts_with_admin(
-                router.bind(local_addr),
+        let local_addr = addrs[0];
+        let (rt_local, client_local) = GossipRuntime::from_parts_with_admin(
+            router.bind(local_addr),
+            TokioClock::from_millis(0),
+            cfg,
+            store_for(id_local),
+            Rc::new(InMemoryAggregateStore::<u32>::new()),
+            Some(admin_rx),
+        );
+        let h_local = tokio::task::spawn_local(rt_local.run(peer_stream));
+
+        let mut remote_clients = Vec::new();
+        let mut remote_handles = Vec::new();
+        for (i, addr) in addrs.iter().enumerate().skip(1) {
+            let id = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
+            let mut cfg = sim_config(id, vec![local_addr], 100 + i as u64);
+            cfg.fanout = 1;
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(*addr),
                 TokioClock::from_millis(0),
                 cfg,
-                store_for(id_local),
+                store_for(id),
                 Rc::new(InMemoryAggregateStore::<u32>::new()),
-                Some(admin_rx),
             );
-            let h_local = tokio::task::spawn_local(rt_local.run(peer_stream));
+            remote_handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+            remote_clients.push(client);
+        }
 
-            let mut remote_clients = Vec::new();
-            let mut remote_handles = Vec::new();
-            for (i, addr) in addrs.iter().enumerate().skip(1) {
-                let id = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
-                let mut cfg = sim_config(id, vec![local_addr], 100 + i as u64);
-                cfg.fanout = 1;
-                let (rt, client) = GossipRuntime::from_parts(
-                    router.bind(*addr),
-                    TokioClock::from_millis(0),
-                    cfg,
-                    store_for(id),
-                    Rc::new(InMemoryAggregateStore::<u32>::new()),
-                );
-                remote_handles.push(tokio::task::spawn_local(
-                    rt.run(futures::stream::empty()),
-                ));
-                remote_clients.push(client);
-            }
-
-            let mut invariant_holds = true;
-            let mut snapshots = 0usize;
-            for op in &case.ops {
-                match op {
-                    PairingOp::AddPeer(idx) => {
-                        let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
-                        let _ = peer_tx.send(PeerEvent::Added(Peer::new(target)));
-                    }
-                    PairingOp::RemovePeer(idx) => {
-                        let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
-                        let _ = peer_tx.send(PeerEvent::Removed(Peer::new(target)));
-                    }
-                    PairingOp::Record(key) => {
-                        let _ = client_local
-                            .record(0xAAAA, key_hash(*key), 0, 1, 0)
-                            .await;
-                    }
+        let mut invariant_holds = true;
+        let mut snapshots = 0usize;
+        for op in &case.ops {
+            match op {
+                PairingOp::AddPeer(idx) => {
+                    let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
+                    let _ = peer_tx.send(PeerEvent::Added(Peer::new(target)));
                 }
-                sim_advance_ticks(Duration::from_millis(100), 3).await;
-                let snap = admin_snapshot(&admin_tx).await;
-                snapshots += 1;
-                for peer in &snap.peers {
-                    if peer.node_id.is_some() != peer.peer_slot.is_some() {
-                        invariant_holds = false;
-                    }
+                PairingOp::RemovePeer(idx) => {
+                    let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
+                    let _ = peer_tx.send(PeerEvent::Removed(Peer::new(target)));
+                }
+                PairingOp::Record(key) => {
+                    let _ = client_local.record(0xAAAA, key_hash(*key), 0, 1, 0).await;
                 }
             }
+            sim_advance_ticks(Duration::from_millis(100), 3).await;
+            let snap = admin_snapshot(&admin_tx).await;
+            snapshots += 1;
+            for peer in &snap.peers {
+                if peer.node_id.is_some() != peer.peer_slot.is_some() {
+                    invariant_holds = false;
+                }
+            }
+        }
 
-            client_local.shutdown().await.unwrap();
-            for client in remote_clients {
-                let _ = client.shutdown().await;
-            }
-            let _ = h_local.await;
-            for handle in remote_handles {
-                let _ = handle.await;
-            }
+        client_local.shutdown().await.unwrap();
+        for client in remote_clients {
+            let _ = client.shutdown().await;
+        }
+        let _ = h_local.await;
+        for handle in remote_handles {
+            let _ = handle.await;
+        }
 
         if snapshots == 0 {
             TestResult::discard()
@@ -1662,8 +1657,7 @@ fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
         const TICKS: u32 = 100;
         let router = SimRouter::with_channel_capacity(128);
         let sender_addr = sock(49_000);
-        let peer_addrs: Vec<SocketAddr> =
-            (0..PEERS).map(|i| sock(49_001 + i as u16)).collect();
+        let peer_addrs: Vec<SocketAddr> = (0..PEERS).map(|i| sock(49_001 + i as u16)).collect();
 
         let id_sender = NodeIdentity::new(NodeId(0xB000), 1);
         let mut cfg_sender = sim_config(id_sender, peer_addrs.clone(), case.seed);
@@ -1716,8 +1710,8 @@ fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
         let uniform = counts.iter().all(|&c| c >= lower && c <= upper);
         if !uniform {
             eprintln!(
-                "non-uniform sampling distribution: seed={}, counts={:?}, \
-                 total={}, expected_per_peer={}, bound=[{},{}]",
+                "non-uniform sampling distribution: seed={}, counts={:?}, total={}, \
+                 expected_per_peer={}, bound=[{},{}]",
                 case.seed, counts, total, expected, lower, upper
             );
         }
@@ -1865,8 +1859,8 @@ async fn send_queue_drains_after_recipient_backpressure() {
             let snap_saturated = admin_snapshot(&admin_tx).await;
             assert!(
                 snap_saturated.max_send_pending_depth >= 2,
-                "expected backpressure re-queue to grow send_pending past 1, \
-                 got max={} (snapshot={:?})",
+                "expected backpressure re-queue to grow send_pending past 1, got max={} \
+                 (snapshot={:?})",
                 snap_saturated.max_send_pending_depth,
                 snap_saturated,
             );
@@ -1992,8 +1986,7 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
         }
         if !converged {
             eprintln!(
-                "iid loss test did not converge under p={}, nodes={}, \
-                 records={}, last_states={:?}",
+                "iid loss test did not converge under p={}, nodes={}, records={}, last_states={:?}",
                 p,
                 nodes,
                 case.records.len(),
@@ -2059,7 +2052,11 @@ async fn peer_event_lifecycle_is_idempotent_and_tolerant() {
                 (PeerEvent::Added(Peer::new(addr_other)), 1, "first add"),
                 (PeerEvent::Added(Peer::new(addr_other)), 1, "duplicate add"),
                 (PeerEvent::Removed(Peer::new(addr_other)), 0, "first remove"),
-                (PeerEvent::Removed(Peer::new(addr_other)), 0, "remove without add"),
+                (
+                    PeerEvent::Removed(Peer::new(addr_other)),
+                    0,
+                    "remove without add",
+                ),
                 (PeerEvent::Added(Peer::new(addr_other)), 1, "re-add"),
             ];
 

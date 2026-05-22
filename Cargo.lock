@@ -954,6 +954,7 @@ name = "gabion-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrayvec",
  "axum",
  "config",
  "dashmap",

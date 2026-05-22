@@ -11,28 +11,56 @@ NIGHTLY_BIN := $(HOME)/.rustup/toolchains/nightly-aarch64-apple-darwin/bin
 STABLE_CARGO := PATH="$(STABLE_BIN):$$PATH" $(STABLE_BIN)/cargo
 NIGHTLY_CARGO := PATH="$(NIGHTLY_BIN):$$PATH" $(NIGHTLY_BIN)/cargo
 
-# nextest is the standard test runner for this repo. It's faster than
-# `cargo test`, surfaces failures earlier, and supports per-test timeouts.
+# `cargo nextest` is the *only* sanctioned test runner for this repo.
+# Faster than `cargo test`, surfaces failures earlier, supports per-test
+# timeouts, and is what CI runs.
 # Install with `cargo install cargo-nextest --locked`.
 NEXTEST := $(STABLE_CARGO) nextest run
+
+# `cargo +nightly fmt` is the *only* sanctioned formatter. Stable
+# rustfmt does not understand all the unstable knobs the codebase
+# relies on; running it will produce a diff CI rejects.
+FMT := $(NIGHTLY_CARGO) fmt
 
 # Miri lives on nightly. Install with `rustup component add miri --toolchain nightly`.
 MIRI := $(NIGHTLY_CARGO) miri nextest run --no-fail-fast
 
+# Friendly install-check. Run before any test target so a missing tool
+# surfaces a one-line fix instead of a cryptic cargo error.
+.PHONY: require-nextest
+require-nextest:
+	@$(STABLE_CARGO) nextest --version >/dev/null 2>&1 || { \
+		printf '%s\n' \
+			'cargo-nextest is not installed.' \
+			'Gabion uses nextest as its only test runner; cargo test is unsupported.' \
+			'Install with: cargo install cargo-nextest --locked' >&2; \
+		exit 1; \
+	}
+
+.PHONY: require-nightly-fmt
+require-nightly-fmt:
+	@$(NIGHTLY_CARGO) fmt --version >/dev/null 2>&1 || { \
+		printf '%s\n' \
+			'cargo +nightly fmt is not available.' \
+			'Gabion formats with nightly rustfmt; stable rustfmt is unsupported.' \
+			'Install with: rustup toolchain install nightly --component rustfmt' >&2; \
+		exit 1; \
+	}
+
 .PHONY: help
 help:
 	@printf '%s\n' 'Gabion test targets:'
-	@printf '%s\n' '  make format          Run cargo +nightly fmt'
-	@printf '%s\n' '  make fmt             Run cargo +nightly fmt --check'
+	@printf '%s\n' '  make format          Format with cargo +nightly fmt (the only sanctioned formatter)'
+	@printf '%s\n' '  make fmt             Check formatting with cargo +nightly fmt --check'
 	@printf '%s\n' '  make clippy          Run cargo clippy for all workspace targets'
 	@printf '%s\n' '  make test            Run formatting, clippy, workspace tests, hygiene, and safety tests'
-	@printf '%s\n' '  make unit            Run cargo nextest across the workspace'
+	@printf '%s\n' '  make unit            Run cargo nextest across the workspace (the only sanctioned test runner)'
 	@printf '%s\n' '  make safety          Run gabion-nginx safety integration tests (cargo nextest)'
 	@printf '%s\n' '  make miri-safety     Run safety tests under miri (Stacked Borrows)'
 	@printf '%s\n' '  make miri-safety-tb  Run safety tests under miri (Tree Borrows)'
 	@printf '%s\n' '  make miri-lib        Run all gabion-nginx lib tests under miri'
 	@printf '%s\n' '  make miri-all        Run miri (Stacked + Tree Borrows) on every gabion-nginx test'
-	@printf '%s\n' '  make bench-check     Compile core and gossip benchmarks'
+	@printf '%s\n' '  make bench-check     Compile gabion::crdt benchmarks'
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
 	@printf '%s\n' '  make nginx-test      Build NGINX module and assert 200, 200, 429 responses'
@@ -49,19 +77,19 @@ help:
 fmt: fmt-check
 
 .PHONY: fmt-check
-fmt-check:
-	$(NIGHTLY_CARGO) fmt --check
+fmt-check: require-nightly-fmt
+	$(FMT) --check
 
 .PHONY: format
-format:
-	$(NIGHTLY_CARGO) fmt
+format: require-nightly-fmt
+	$(FMT)
 
 .PHONY: clippy
 clippy:
 	$(CARGO_ENV) $(STABLE_CARGO) clippy --workspace --all-targets --tests -- -D warnings
 
 .PHONY: unit
-unit:
+unit: require-nextest
 	$(CARGO_ENV) $(NEXTEST) --workspace
 
 # Safety integration tests live in crates/nginx/tests/safety.rs. They
@@ -69,7 +97,7 @@ unit:
 # queue, single-writer / multi-reader aggregate, leader-lease takeover,
 # end-to-end access → leader-apply → reread).
 .PHONY: safety
-safety:
+safety: require-nextest
 	$(CARGO_ENV) $(NEXTEST) -p gabion-nginx --test safety
 
 .PHONY: miri-safety
@@ -103,8 +131,7 @@ test: fmt clippy unit safety hygiene
 
 .PHONY: bench-check
 bench-check:
-	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-core --bench core_engine --no-run
-	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-gossip --bench gossip_codec --no-run
+	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion --bench crdt --no-run
 
 .PHONY: nginx-config
 nginx-config:

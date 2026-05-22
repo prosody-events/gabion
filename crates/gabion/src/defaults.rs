@@ -14,6 +14,12 @@ pub const STORAGE_MAX_DESCRIPTOR_COUNT: usize = 16;
 pub const STORAGE_MAX_DESCRIPTOR_BYTES: usize = 512;
 pub const STORAGE_MAX_KEY_BYTES: usize = 128;
 
+/// Maximum number of rules that can match a single request. Bounds the
+/// per-request decision/record loop in both adapters; deployments with
+/// fewer rules cost less, deployments above this cap reject the request
+/// (rather than silently truncate).
+pub const STORAGE_MAX_MATCHED_RULES: usize = 16;
+
 pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 100;
 pub const GOSSIP_FANOUT: usize = 6;
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;

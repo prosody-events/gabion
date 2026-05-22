@@ -316,7 +316,7 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
         key: "tenant",
         value: "alice",
     }];
-    let spec = rules.rules()[0].spec;
+    let spec = rules.rules()[0].rule.spec();
     let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
     let bucket = 0_u32;
     let (deltas, expirations) =
@@ -683,7 +683,7 @@ fn decide_and_leader_apply_concurrent() {
             key: "tenant",
             value: "alice",
         }];
-        let spec = leader_rules.rules()[0].spec;
+        let spec = leader_rules.rules()[0].rule.spec();
         let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
         let mut applied = 0_u32;
         while !leader_stop.load(Ordering::Acquire) {
@@ -707,7 +707,7 @@ fn decide_and_leader_apply_concurrent() {
         key: "tenant",
         value: "alice",
     }];
-    let spec = rules.rules()[0].spec;
+    let spec = rules.rules()[0].rule.spec();
     let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
     let _ = view.get(spec.fingerprint, key_hash.0, 0);
 }

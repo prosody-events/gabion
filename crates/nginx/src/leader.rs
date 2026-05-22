@@ -340,7 +340,7 @@ fn discovery_stream(cfg: DiscoveryConfig) -> impl futures::Stream<Item = PeerEve
 
 fn register_rules(cell_store: &mut CellStore<u32>, rules: &CompiledRules) {
     for compiled in rules.rules() {
-        let spec = compiled.spec;
+        let spec = compiled.rule.spec();
         let _ = cell_store.intern_rule(RuleDescriptor {
             fingerprint: spec.fingerprint,
             window_millis: spec.window_millis.min(u32::MAX as u64) as u32,
