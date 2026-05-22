@@ -27,7 +27,7 @@ fn next_test_addr() -> SocketAddr {
 
 struct Harness {
     limiter: SharedLimiter<u32>,
-    _gossip_handle: tokio::task::JoinHandle<Result<(), gabion::gossip::GossipError>>,
+    gossip_handle: tokio::task::JoinHandle<Result<(), gabion::gossip::GossipError>>,
     client: gabion::gossip::GossipClient<u32>,
 }
 
@@ -88,7 +88,7 @@ async fn harness(max_descriptor_bytes: usize, limit: u64) -> Harness {
 
     Harness {
         limiter,
-        _gossip_handle: gossip_handle,
+        gossip_handle,
         client,
     }
 }
@@ -362,4 +362,224 @@ fn quickcheck_response_shape_matches_descriptor_shape(case: EnvoyRequestCase) ->
         }
         TestResult::passed()
     })
+}
+
+/// The gossip runtime can die out from under the request path (network
+/// failure, transport panic recovered, etc.). Per allow-by-default the
+/// decision must stay `Allow` even though the deltas can no longer be
+/// recorded. Forcing the failure is straightforward: shut the runtime
+/// down, await its exit, then issue another request — `record()` returns
+/// `RuntimeShutDown` and `note_gossip_record_failure` swallows it.
+#[test]
+fn gossip_record_failure_does_not_reject_request() {
+    run_local(async {
+        let harness = harness(512, 100).await;
+
+        // Bring the runtime down and wait for it to actually exit so the
+        // next `record()` is guaranteed to hit the closed channel.
+        harness.client.shutdown().await.expect("shutdown sent");
+        harness
+            .gossip_handle
+            .await
+            .expect("gossip task joined")
+            .expect("gossip exited cleanly");
+
+        let request = RateLimitRequest {
+            domain: "api".into(),
+            descriptors: vec![descriptor([("tenant", "a")])],
+            hits_addend: 1,
+        };
+        let response = harness.limiter.should_rate_limit_at(request, 0).await;
+        assert_eq!(
+            response.overall_code,
+            rate_limit_response::Code::Ok as i32,
+            "a dead gossip runtime must not reject — see CLAUDE.md (allow-by-default)",
+        );
+    });
+}
+
+/// Boundary check for `MAX_DESCRIPTORS` on the request-shape cardinality
+/// guard. Exactly the cap is accepted; cap + 1 is rejected. Catches an
+/// off-by-one slip from `==` to `>`/`>=`.
+#[test]
+fn cardinality_accepts_max_descriptors() {
+    run_local(async {
+        let harness = harness(512, u64::from(u32::MAX)).await;
+
+        let descriptors = (0..MAX_DESCRIPTORS)
+            .map(|i| descriptor([("tenant", format!("t-{i}"))]))
+            .collect::<Vec<_>>();
+        assert_eq!(descriptors.len(), MAX_DESCRIPTORS);
+        let request = RateLimitRequest {
+            domain: "api".into(),
+            descriptors,
+            hits_addend: 1,
+        };
+
+        let response = harness.limiter.should_rate_limit_at(request, 0).await;
+        assert_eq!(
+            response.overall_code,
+            rate_limit_response::Code::Ok as i32,
+            "exactly MAX_DESCRIPTORS must be accepted",
+        );
+        assert_eq!(response.statuses.len(), MAX_DESCRIPTORS);
+
+        let _ = harness.client.shutdown().await;
+    });
+}
+
+#[test]
+fn cardinality_rejects_max_plus_one_descriptors() {
+    run_local(async {
+        let harness = harness(512, u64::from(u32::MAX)).await;
+
+        let descriptors = (0..=MAX_DESCRIPTORS)
+            .map(|i| descriptor([("tenant", format!("t-{i}"))]))
+            .collect::<Vec<_>>();
+        assert_eq!(descriptors.len(), MAX_DESCRIPTORS + 1);
+        let request = RateLimitRequest {
+            domain: "api".into(),
+            descriptors,
+            hits_addend: 1,
+        };
+
+        let response = harness.limiter.should_rate_limit_at(request, 0).await;
+        assert_eq!(
+            response.overall_code,
+            rate_limit_response::Code::OverLimit as i32,
+            "MAX_DESCRIPTORS + 1 must trip the cardinality reject",
+        );
+        // Only the overflow descriptor (index == MAX_DESCRIPTORS) is rejected.
+        let overflow_status = response
+            .statuses
+            .last()
+            .expect("at least one status returned");
+        assert_eq!(
+            overflow_status.code,
+            rate_limit_response::Code::OverLimit as i32,
+        );
+
+        let _ = harness.client.shutdown().await;
+    });
+}
+
+/// End-to-end gRPC round-trip against the actual tonic Server. Catches
+/// proto field add/remove regressions and runtime mounting errors that
+/// the in-process harness skips by calling `should_rate_limit_at`
+/// directly.
+#[test]
+fn grpc_transport_round_trip() {
+    use envoy_types::pb::envoy::service::ratelimit::v3::rate_limit_service_client::RateLimitServiceClient;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .expect("multi-thread runtime");
+    let local = LocalSet::new();
+    local.block_on(&rt, async {
+        let harness = harness(512, 2).await;
+        let limiter = harness.limiter.clone();
+
+        // Reserve an ephemeral port via a probe bind, drop it, then hand
+        // the address to tonic. The kernel will reuse the port for a
+        // brief window; the client retry loop covers the race.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+        let bound = probe.local_addr().expect("local_addr");
+        drop(probe);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(RateLimitServiceServer::new(EnvoyRateLimitService::new(
+                    limiter,
+                )))
+                .serve_with_shutdown(bound, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let mut client = None;
+        for attempt in 0..50 {
+            match RateLimitServiceClient::connect(format!("http://{bound}")).await {
+                Ok(c) => {
+                    client = Some(c);
+                    break;
+                }
+                Err(err) if attempt < 49 => {
+                    tracing::debug!(?err, "waiting for tonic server");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(err) => panic!("client could not connect: {err:?}"),
+            }
+        }
+        let mut client = client.expect("client connected");
+
+        // First call: under limit, expect OK with a single descriptor status.
+        let response = client
+            .should_rate_limit(RateLimitRequest {
+                domain: "api".into(),
+                descriptors: vec![descriptor([("tenant", "t-grpc")])],
+                hits_addend: 1,
+            })
+            .await
+            .expect("rpc OK")
+            .into_inner();
+        assert_eq!(response.overall_code, rate_limit_response::Code::Ok as i32,);
+        assert_eq!(response.statuses.len(), 1);
+        assert_eq!(
+            response.statuses[0].code,
+            rate_limit_response::Code::Ok as i32,
+        );
+
+        // Drive the same key over the configured limit (2) so the next
+        // request must come back OverLimit through the full stack.
+        for _ in 0..3 {
+            let _ = client
+                .should_rate_limit(RateLimitRequest {
+                    domain: "api".into(),
+                    descriptors: vec![descriptor([("tenant", "t-grpc")])],
+                    hits_addend: 1,
+                })
+                .await
+                .expect("rpc OK");
+        }
+        let over = client
+            .should_rate_limit(RateLimitRequest {
+                domain: "api".into(),
+                descriptors: vec![descriptor([("tenant", "t-grpc")])],
+                hits_addend: 1,
+            })
+            .await
+            .expect("rpc OK")
+            .into_inner();
+        assert_eq!(
+            over.overall_code,
+            rate_limit_response::Code::OverLimit as i32,
+        );
+
+        // Empty descriptor list still round-trips successfully with no
+        // statuses — guards against an accidental proto reshape that
+        // forces the server to error on edge inputs.
+        let empty = client
+            .should_rate_limit(RateLimitRequest {
+                domain: "api".into(),
+                descriptors: vec![],
+                hits_addend: 1,
+            })
+            .await
+            .expect("rpc OK")
+            .into_inner();
+        assert_eq!(empty.overall_code, rate_limit_response::Code::Ok as i32,);
+        assert!(empty.statuses.is_empty());
+
+        drop(client);
+        let _ = shutdown_tx.send(());
+        server_handle
+            .await
+            .expect("join")
+            .expect("server clean exit");
+        let _ = harness.client.shutdown().await;
+    });
 }

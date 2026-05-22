@@ -73,3 +73,6 @@ impl Header {
             && self.version.load(Ordering::Acquire) == SHM_VERSION
     }
 }
+
+#[cfg(test)]
+mod tests;

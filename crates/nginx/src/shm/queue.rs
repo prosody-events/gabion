@@ -299,9 +299,12 @@ mod tests {
         let queue = RequestQueue::from_parts(&control, &slots);
         assert!(queue.push(event(1)).is_ok());
         assert!(queue.push(event(2)).is_ok());
-        // Third push must overflow.
+        assert_eq!(queue.dropped(), 0, "no drops before the ring fills");
+        // Each push beyond capacity bumps `dropped` by exactly one.
         assert!(queue.push(event(3)).is_err());
-        assert!(queue.dropped() >= 1);
+        assert_eq!(queue.dropped(), 1);
+        assert!(queue.push(event(4)).is_err());
+        assert_eq!(queue.dropped(), 2);
     }
 
     #[test]

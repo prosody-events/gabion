@@ -11,6 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gabion::crdt::{NodeId, NodeIdentity};
 use twox_hash::xxhash3_128;
 
+#[cfg(test)]
+mod tests;
+
 /// Derive a [`NodeIdentity`]. `seed_override` is used when the operator has
 /// configured a stable identifier; otherwise we fall back to hostname → local
 /// IP → random.
@@ -44,7 +47,7 @@ fn local_ip_seed() -> Option<String> {
     socket.local_addr().ok().map(|sa| sa.ip().to_string())
 }
 
-fn random_seed() -> String {
+pub(crate) fn random_seed() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())

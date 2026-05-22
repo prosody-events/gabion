@@ -237,3 +237,6 @@ pub const DEFAULT_ADMIN_CHANNEL_SIZE: usize = 8;
 pub fn admin_channel() -> (mpsc::Sender<AdminCommand>, mpsc::Receiver<AdminCommand>) {
     mpsc::channel(DEFAULT_ADMIN_CHANNEL_SIZE)
 }
+
+#[cfg(test)]
+mod tests;

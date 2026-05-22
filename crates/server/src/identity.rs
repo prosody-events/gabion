@@ -11,6 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gabion::crdt::{NodeId, NodeIdentity};
 use twox_hash::xxhash3_128;
 
+#[cfg(test)]
+mod tests;
+
 /// Seed sources tried in order:
 /// 1. Explicit `seed_override` (from config).
 /// 2. OS hostname via [`whoami::fallible::hostname`].
@@ -53,7 +56,7 @@ fn local_ip_seed() -> Option<String> {
     socket.local_addr().ok().map(|sa| sa.ip().to_string())
 }
 
-fn random_seed() -> String {
+pub(crate) fn random_seed() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
