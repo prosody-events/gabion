@@ -25,8 +25,16 @@ pub enum LinkPolicy {
     Pass,
     /// Drop every packet on this link.
     Block,
-    /// Drop the first `count` packets, then deliver normally.
+    /// Drop the first `count` packets, then deliver normally. Useful for
+    /// "warm-up" scenarios where a link is unreachable for a known
+    /// number of attempts before recovering.
     DropFirst { count: u32 },
+    /// i.i.d. Bernoulli drop: each packet is dropped independently with
+    /// probability `p` (clamped to `[0.0, 1.0]`). Uses a deterministic
+    /// per-link PRNG seeded from the link's `(src, dst)` so repeated
+    /// runs of the same scenario hit the same drop pattern. Matches the
+    /// loss model used by Birman et al. (Bimodal Multicast, TOCS 1999).
+    DropProb { p: f64 },
 }
 
 /// One packet in flight on the sim network. The byte buffer is owned (one
@@ -96,7 +104,7 @@ impl SimRouter {
     }
 
     /// Look up the policy for `(src, dst)`. Mutates the counter for
-    /// `DropFirst`; returns the effective decision: `true` ⇒ drop.
+    /// `DropFirst`/`DropProb`; returns the effective decision: `true` ⇒ drop.
     fn should_drop(&self, src: SocketAddr, dst: SocketAddr) -> bool {
         let policies = self.inner.policies.borrow();
         let Some(policy) = policies.get(&(src, dst)).copied() else {
@@ -116,12 +124,45 @@ impl SimRouter {
                     false
                 }
             }
+            LinkPolicy::DropProb { p } => {
+                // Deterministic per-link splitmix64 — same seed → same
+                // drop pattern across re-runs. We reuse `drop_counters`
+                // as the per-link splitmix state since we only need a
+                // single u64 of state per link.
+                let p = p.clamp(0.0, 1.0);
+                if p <= 0.0 {
+                    return false;
+                }
+                if p >= 1.0 {
+                    return true;
+                }
+                let key = link_seed(src, dst);
+                let mut counters = self.inner.drop_counters.borrow_mut();
+                let state = counters.entry((src, dst)).or_insert_with(|| key as u32);
+                // 32-bit splitmix. Drop iff next sample < p * u32::MAX.
+                let mut z = (*state as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                *state = (*state).wrapping_add(1);
+                let threshold = (p * (u32::MAX as f64)) as u32;
+                (z as u32) < threshold
+            }
         }
     }
 
     fn sender_for(&self, addr: SocketAddr) -> Option<mpsc::Sender<SimPacket>> {
         self.inner.senders.borrow().get(&addr).cloned()
     }
+}
+
+fn link_seed(src: SocketAddr, dst: SocketAddr) -> u64 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for octet in src.to_string().bytes().chain(dst.to_string().bytes()) {
+        h ^= octet as u64;
+        h = h.wrapping_mul(0x1000_0000_01B3);
+    }
+    h
 }
 
 /// In-memory bidirectional transport. Single-threaded — the inbound receiver
