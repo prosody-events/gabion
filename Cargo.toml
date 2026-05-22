@@ -30,7 +30,13 @@ gabion-server = { path = "crates/server" }
 hmac = "0.12"
 humantime = "2"
 humantime-serde = "1"
-k8s-openapi = { version = "0.26", features = ["v1_34"] }
+# Pin to v1_30 (the floor supported by kube 2.0.1 / k8s-openapi 0.26).
+# The Kubernetes upstream contract allows a 2-minor-version skew between
+# client and server, so this binding talks to servers v1.28–v1.32+ without
+# changes — wider than the maintenance window of any single cloud
+# provider. The Service / EndpointSlice surface we consume has been GA
+# since v1.21 and unchanged for our purposes.
+k8s-openapi = { version = "0.26", features = ["v1_30"] }
 kube = { version = "2", features = ["client", "runtime"] }
 nginx-sys = { version = "0.5", default-features = false }
 ngx = { version = "0.5", default-features = false, features = ["std"] }

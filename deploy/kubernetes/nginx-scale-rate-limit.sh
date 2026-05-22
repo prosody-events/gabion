@@ -37,6 +37,40 @@ docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-m
 kubectl create namespace "$namespace"
 
 kubectl -n "$namespace" apply -f - <<'YAML'
+# Bind watch permissions to the namespace's `default` ServiceAccount.
+# kubelet always mounts the default SA's token into pods that don't set
+# `serviceAccountName`, so no custom SA is needed — but the API server
+# still authenticates each request as `system:serviceaccount:<ns>:default`,
+# and that identity has zero permissions out of the box. The Role +
+# RoleBinding below grants exactly the verbs `EndpointSliceDiscovery`
+# uses (`crates/gabion/src/discovery/kubernetes.rs::watch_services` and
+# `watch_target`). Discovery itself falls through env→DNS bootstrap so
+# no `serviceAccountName` line, no `env` directive in nginx.module.conf,
+# and no kubeconfig is needed inside the pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gabion-endpointslice-reader
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gabion-endpointslice-reader
+subjects:
+  - kind: ServiceAccount
+    name: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gabion-endpointslice-reader
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,9 +92,14 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-            - name: gossip
+              protocol: TCP
+            - name: gabion
               containerPort: 9000
+              protocol: UDP
 ---
+# nginx HTTP frontend. ClusterIP load-balances inbound requests across the
+# replica set. UDP isn't exposed here — gossip lives on its own headless
+# Service below so peer discovery sees pod IPs, not the virtual ClusterIP.
 apiVersion: v1
 kind: Service
 metadata:
@@ -72,9 +111,28 @@ spec:
     - name: http
       port: 8080
       targetPort: http
-    - name: gossip
+      protocol: TCP
+---
+# Gabion peer-discovery Service. The discovery code (see
+# `crates/gabion/src/discovery/kubernetes.rs::is_gabion_udp`) tracks only
+# Services exposing a port literally named "gabion" with protocol UDP — so
+# the port name and protocol below are load-bearing, not cosmetic.
+# clusterIP: None makes this headless: the EndpointSlice the discovery
+# watches lists each replica's pod IP directly, which is what gossip needs
+# in order to address peers individually.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gabion
+spec:
+  clusterIP: None
+  selector:
+    app: gabion-nginx
+  ports:
+    - name: gabion
       port: 9000
-      targetPort: gossip
+      targetPort: gabion
+      protocol: UDP
 YAML
 
 wait_for_endpoint_count() {
