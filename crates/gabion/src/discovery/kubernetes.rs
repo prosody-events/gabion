@@ -52,7 +52,12 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        "kubernetes client unavailable; peer discovery disabled",
+                        "Could not connect to the Kubernetes API; \
+                         gabion cannot auto-discover peers. This node \
+                         will only talk to peers listed in \
+                         `gossip.bootstrap_peers`. Check that the pod has \
+                         a service account with permission to watch \
+                         Services and EndpointSlices.",
                     );
                     return;
                 }
@@ -68,6 +73,12 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                         Ok(event) => match service_change(event, &self.service_whitelist) {
                             ServiceChange::Track(target) => {
                                 if let Entry::Vacant(slot) = watched.entry(target) {
+                                    tracing::info!(
+                                        namespace = %slot.key().namespace,
+                                        service = %slot.key().service_name,
+                                        "Found a gabion service in the cluster; \
+                                         watching it for new peers.",
+                                    );
                                     let (cancel_tx, cancel_rx) = oneshot::channel();
                                     endpoints.push(Box::pin(watch_target(
                                         client.clone(),
@@ -78,7 +89,17 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                     slot.insert(cancel_tx);
                                 }
                             }
-                            ServiceChange::Untrack(target) => { watched.remove(&target); }
+                            ServiceChange::Untrack(target) => {
+                                if watched.remove(&target).is_some() {
+                                    tracing::info!(
+                                        namespace = %target.namespace,
+                                        service = %target.service_name,
+                                        "Gabion service is no longer reachable \
+                                         (deleted or missing its UDP port); \
+                                         stopping peer discovery for it.",
+                                    );
+                                }
+                            }
                             ServiceChange::Ignore => {}
                         },
                     },

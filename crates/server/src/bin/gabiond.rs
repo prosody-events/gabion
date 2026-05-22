@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use futures::StreamExt;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 use tokio::task::LocalSet;
+use tracing_subscriber::{EnvFilter, fmt};
 
 use gabion::crdt::CellStore;
 use gabion::discovery::{self, PeerDiscovery, PeerEvent};
@@ -17,21 +20,70 @@ use gabion_server::admin::{self, AdminState};
 use gabion_server::config::{AppConfig, ConfigError};
 use gabion_server::identity::derive_identity;
 use gabion_server::store::DashMapStore;
-use gabion_server::{SharedLimiter, serve};
+use gabion_server::{RATE_LIMIT_SERVICE_NAME, SharedLimiter, serve};
 
 fn main() -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime")?;
-    let local = LocalSet::new();
-    local.block_on(&runtime, run())
+    init_tracing();
+    let result = (|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("build tokio runtime")?;
+        let local = LocalSet::new();
+        local.block_on(&runtime, run())
+    })();
+    if let Err(ref err) = result {
+        tracing::error!(
+            error = ?err,
+            "Gabion stopped because of an unrecoverable error. Details \
+             above (with the chain of causes) explain what went wrong.",
+        );
+    }
+    result
+}
+
+/// Install a stdout `tracing` subscriber. Verbosity follows `RUST_LOG`
+/// (defaults to `info` for gabion crates, `warn` elsewhere).
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,gabion=info,gabion_server=info"));
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stdout)
+        .with_target(true)
+        .init();
 }
 
 async fn run() -> anyhow::Result<()> {
+    // Install signal handlers **before** any other work so a SIGTERM
+    // arriving during config loading, gossip-runtime binding, or task
+    // spawning gets caught and translated into a clean shutdown instead of
+    // killing the process with the default disposition.
+    let mut sigterm = signal(SignalKind::terminate())
+        .context("install SIGTERM handler")?;
+    let mut sigint = signal(SignalKind::interrupt())
+        .context("install SIGINT handler")?;
+
     let config = load_config()?;
+    tracing::info!(
+        gossip_bind = ?config.gossip.bind,
+        envoy_bind = ?config.envoy_bind,
+        admin_bind = ?config.admin_bind,
+        rules_loaded = config.limits.len(),
+        max_keys = config.cell_store_config().cell_capacity,
+        max_rules = config.cell_store_config().rule_dictionary_capacity,
+        max_peer_instances = config.cell_store_config().node_dictionary_capacity,
+        "Starting gabion.",
+    );
 
     let identity = derive_identity(config.runtime.node_id_seed.as_deref());
+    tracing::info!(
+        node_id = %format!("{:032x}", identity.node_id.0),
+        incarnation = identity.incarnation,
+        "Generated this node's identity. The incarnation number changes on \
+         every restart so peers can tell restarts apart from new nodes.",
+    );
+
     let rule_table = Arc::new(config.rule_table()?);
     let cell_store = CellStore::<u32>::new(config.cell_store_config(), identity);
     let counts = Arc::new(DashMapStore::<u32>::with_capacity(
@@ -59,6 +111,10 @@ async fn run() -> anyhow::Result<()> {
     )
     .await
     .context("bind gossip runtime")?;
+    tracing::info!(
+        listen_addr = %gossip_bind,
+        "Listening for gossip from other gabion nodes.",
+    );
 
     let limiter = SharedLimiter::<u32>::new(
         rule_table.clone(),
@@ -71,34 +127,147 @@ async fn run() -> anyhow::Result<()> {
 
     let gossip_task = tokio::task::spawn_local(async move { gossip_rt.run(peer_events).await });
 
+    // Shutdown broadcasts to every long-running task. `false` = keep serving,
+    // `true` = drain. `watch` is the right primitive here because every
+    // subscriber sees the latest value regardless of when it joins, and
+    // `wait_for` lets each subscriber suspend until the value flips to
+    // `true`.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Health protocol: report SERVING for the rate-limit service so external
+    // readiness probes (kube-proxy gRPC checks, `grpc_health_probe`,
+    // grpc-go load balancers) treat this pod as ready. We flip the status to
+    // NOT_SERVING the moment a shutdown signal arrives so endpoints get
+    // removed from upstreams **before** tonic starts refusing connections.
+    let (health_reporter, health_server) = tonic_health::server::health_reporter();
+    health_reporter
+        .set_service_status(RATE_LIMIT_SERVICE_NAME, tonic_health::ServingStatus::Serving)
+        .await;
+
     let envoy_task = config.envoy_bind.map(|bind| {
+        tracing::info!(
+            listen_addr = %bind,
+            health_service = "grpc.health.v1.Health",
+            reflection_service = "grpc.reflection.v1.ServerReflection",
+            rate_limit_service = RATE_LIMIT_SERVICE_NAME,
+            "Accepting rate-limit decisions from Envoy. Health, reflection, \
+             and the rate-limit service are mounted on this address.",
+        );
         let limiter = limiter.clone();
-        tokio::task::spawn_local(async move { serve(bind, limiter).await })
+        let health_server = health_server.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::task::spawn_local(async move {
+            let shutdown = async move {
+                let _ = shutdown_rx.wait_for(|drain| *drain).await;
+            };
+            serve(bind, limiter, health_server, shutdown).await
+        })
     });
 
     let admin_task = config.admin_bind.map(|bind| {
+        tracing::info!(
+            listen_addr = %bind,
+            "Admin HTTP endpoint is up. Hit /snapshot for a live view of \
+             this node's rate-limit state.",
+        );
         let state = AdminState::new(rule_table.clone(), counts.clone(), admin_tx.clone());
-        tokio::task::spawn_local(async move { admin::serve(bind, state).await })
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::task::spawn_local(async move {
+            let shutdown = async move {
+                let _ = shutdown_rx.wait_for(|drain| *drain).await;
+            };
+            admin::serve_with_shutdown(bind, state, shutdown).await
+        })
     });
 
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
-
-    let outcome = tokio::select! {
-        result = gossip_task => result
-            .context("gossip task panicked")?
-            .context("gossip runtime exited with error"),
-        result = task_or_pending(envoy_task) => result
-            .context("envoy task panicked")?
-            .context("envoy server exited with error"),
-        result = task_or_pending(admin_task) => result
-            .context("admin task panicked")?
-            .context("admin server exited with error"),
-        _ = &mut shutdown => Ok(()),
+    // Wait for whichever happens first: a SIGTERM/SIGINT (clean shutdown)
+    // or the gossip runtime exiting unexpectedly (already a failure; we
+    // still want to drain the gRPC/admin servers before exiting).
+    let early_exit: Result<(), anyhow::Error> = tokio::select! {
+        result = gossip_task => Err(result
+            .context("gossip task panicked")
+            .and_then(|inner| inner.context("gossip runtime exited with error"))
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("gossip runtime exited unexpectedly"))),
+        _ = sigterm.recv() => {
+            tracing::info!(
+                signal = "SIGTERM",
+                "Received shutdown signal; draining in-flight requests and \
+                 stopping cleanly.",
+            );
+            Ok(())
+        }
+        _ = sigint.recv() => {
+            tracing::info!(
+                signal = "SIGINT",
+                "Received shutdown signal (Ctrl-C); draining in-flight \
+                 requests and stopping cleanly.",
+            );
+            Ok(())
+        }
     };
 
+    // Flip health to NOT_SERVING first so readiness probes (which run
+    // independently of in-flight traffic) immediately fail. External load
+    // balancers will stop sending new requests; in-flight requests continue
+    // to be served by `serve_with_shutdown` until they complete.
+    health_reporter
+        .set_service_status(RATE_LIMIT_SERVICE_NAME, tonic_health::ServingStatus::NotServing)
+        .await;
+    tracing::info!(
+        "Marked the rate-limit service as NOT_SERVING in the health \
+         protocol. Load balancers should now route traffic elsewhere.",
+    );
+
+    // Trigger graceful shutdown of the gRPC and admin servers. Each task
+    // observes the flip via `wait_for(|drain| *drain)` and tonic's
+    // `serve_with_shutdown` drains in-flight requests before returning.
+    let _ = shutdown_tx.send(true);
+
+    // Drain the gRPC server. tonic finishes any in-flight `should_rate_limit`
+    // calls before this future resolves.
+    if let Some(task) = envoy_task {
+        match task.await {
+            Ok(Ok(())) => {
+                tracing::info!("Rate-limit gRPC server drained and stopped.");
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "Rate-limit gRPC server stopped with an error during drain.",
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "Rate-limit gRPC task panicked during shutdown.",
+                );
+            }
+        }
+    }
+
+    if let Some(task) = admin_task {
+        match task.await {
+            Ok(Ok(())) => tracing::info!("Admin HTTP server stopped."),
+            Ok(Err(err)) => tracing::warn!(
+                error = %err,
+                "Admin HTTP server stopped with an error.",
+            ),
+            Err(err) => tracing::error!(
+                error = %err,
+                "Admin HTTP task panicked during shutdown.",
+            ),
+        }
+    }
+
+    // Drop the gossip client so the gossip runtime's request channel closes
+    // and `gossip_rt.run()` returns. The gossip task was already consumed by
+    // the select above (if it fired the gossip arm); if the signal arm
+    // fired, gossip is still running and this drop ends it.
     drop(gossip_client);
-    outcome
+    tracing::info!("Gabion shut down cleanly.");
+
+    early_exit
 }
 
 fn discovery_stream(
@@ -108,31 +277,36 @@ fn discovery_stream(
         match res {
             Ok(event) => Some(event),
             Err(error) => {
-                tracing::warn!(error = %error, "peer discovery error");
+                tracing::warn!(
+                    error = %error,
+                    "Peer discovery hit an error and skipped an update; \
+                     gabion will keep retrying. If this keeps happening, \
+                     check API access (e.g. Kubernetes RBAC for Services \
+                     and EndpointSlices) and the values under `discovery` \
+                     in your gabion config.",
+                );
                 None
             }
         }
     })
 }
 
-/// Resolve to the task's result if it exists, otherwise hang. Lets
-/// `tokio::select!` arms be conditionally present without leaking that into
-/// the match shape.
-async fn task_or_pending<T>(
-    task: Option<tokio::task::JoinHandle<T>>,
-) -> Result<T, tokio::task::JoinError> {
-    match task {
-        Some(handle) => handle.await,
-        None => std::future::pending().await,
-    }
-}
-
 fn load_config() -> anyhow::Result<AppConfig> {
-    let path = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .context("usage: gabiond <config.yaml>")?;
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read config {}", path.display()))?;
-    Ok(AppConfig::parse_yaml(&text)?)
+    // Layer order: built-in defaults → YAML file (if provided) → `GABION_*`
+    // env vars. Operators can run with no config file at all and configure
+    // the server entirely through env vars; the file path argument is
+    // optional. Passing `--help` (or any single flag-looking argument) is
+    // not supported — config-rs handles structural errors directly.
+    let path = std::env::args_os().nth(1).map(PathBuf::from);
+    if let Some(ref p) = path
+        && !p.exists()
+    {
+        return Err(anyhow::anyhow!(
+            "Config file not found: {}\n\
+             Either pass a real path or omit the argument entirely \
+             (env vars and defaults will be used).",
+            p.display(),
+        ));
+    }
+    Ok(AppConfig::load(path.as_deref())?)
 }

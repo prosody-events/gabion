@@ -83,6 +83,11 @@ where
     // iteration is processed.
     pending_reply: Option<oneshot::Sender<()>>,
 
+    // Cumulative count of dropped inbound frames. Used to rate-limit the
+    // decode-failure `warn!` to power-of-two transitions so a peer stuck on
+    // the wrong version / cluster secret can't flood the log.
+    decode_reject_count: u64,
+
     _not_send: PhantomData<*const ()>,
 }
 
@@ -208,6 +213,7 @@ where
             peers,
             rng,
             pending_reply: None,
+            decode_reject_count: 0,
             _not_send: PhantomData,
         };
         let client = GossipClient::new(req_tx);
@@ -333,7 +339,27 @@ where
         };
         let summary = match decoded {
             Ok(s) => s,
-            Err(_) => return,
+            Err(err) => {
+                self.decode_reject_count = self.decode_reject_count.saturating_add(1);
+                if self.decode_reject_count.is_power_of_two() {
+                    tracing::warn!(
+                        peer = %src,
+                        error = %err,
+                        rejected_total = self.decode_reject_count,
+                        "Could not understand a gossip message from this \
+                         peer; dropping it. Common causes: the peer is \
+                         running a different gabion version, the peers are \
+                         configured with different counter sizes \
+                         (`storage.count_width`), the cluster authentication \
+                         key (`gossip.auth_key`) does not match between \
+                         peers, or the peer is sending messages larger than \
+                         this node's `gossip.max_payload_bytes`. Check the \
+                         peer's version and gabion config to find the \
+                         mismatch.",
+                    );
+                }
+                return;
+            }
         };
 
         self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
@@ -413,6 +439,11 @@ where
                         node_id: None,
                         peer_slot: None,
                     });
+                    tracing::info!(
+                        peer = %p.addr,
+                        cluster_size = self.peers.len(),
+                        "Peer joined the cluster.",
+                    );
                 }
             }
             PeerEvent::Removed(p) => {
@@ -421,6 +452,11 @@ where
                     if let Some(node_id) = removed.node_id {
                         self.store.peer_frontiers_mut().remove_peer(node_id);
                     }
+                    tracing::info!(
+                        peer = %p.addr,
+                        cluster_size = self.peers.len(),
+                        "Peer left the cluster.",
+                    );
                 }
             }
         }

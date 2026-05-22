@@ -527,7 +527,7 @@ impl<C: Count> CellStore<C> {
     pub fn intern_rule(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
         let result = self.rule_dictionary.intern(descriptor);
         if result.is_none() {
-            self.rule_dictionary_full_rejects = self.rule_dictionary_full_rejects.saturating_add(1);
+            self.note_rule_dictionary_full(descriptor.fingerprint);
         }
         result
     }
@@ -535,9 +535,79 @@ impl<C: Count> CellStore<C> {
     pub fn intern_node(&mut self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
         let result = self.node_dictionary.intern(node_id, incarnation);
         if result.is_none() {
-            self.node_dictionary_full_rejects = self.node_dictionary_full_rejects.saturating_add(1);
+            self.note_node_dictionary_full(node_id, incarnation);
         }
         result
+    }
+
+    // -- Capacity-pressure warnings -----------------------------------------
+    //
+    // Each helper bumps the relevant rejection counter and emits a
+    // `tracing::warn!` only on power-of-two thresholds (1, 2, 4, 8, ...) so
+    // log volume stays bounded at ~log2(N) lines regardless of how many rows
+    // are being dropped per second. The message names the `CellStoreConfig`
+    // field the operator should raise.
+
+    fn note_cell_store_full(&mut self) {
+        self.cell_store_full_rejects = self.cell_store_full_rejects.saturating_add(1);
+        if self.cell_store_full_rejects.is_power_of_two() {
+            tracing::warn!(
+                rejected_total = self.cell_store_full_rejects,
+                capacity = self.capacity,
+                in_use = self.active_len,
+                config_key = "storage.max_cells",
+                "Too many distinct rate-limit keys are being tracked at \
+                 once. New keys are not being limited and will not \
+                 contribute to global counts until older time buckets \
+                 expire. To fix, raise `storage.max_cells` in your gabion \
+                 config (currently {}).",
+                self.capacity,
+            );
+        }
+    }
+
+    fn note_rule_dictionary_full(&mut self, rule_fingerprint: u128) {
+        self.rule_dictionary_full_rejects =
+            self.rule_dictionary_full_rejects.saturating_add(1);
+        if self.rule_dictionary_full_rejects.is_power_of_two() {
+            tracing::warn!(
+                rejected_total = self.rule_dictionary_full_rejects,
+                capacity = self.rule_dictionary.capacity(),
+                in_use = self.rule_dictionary.len(),
+                rule_fingerprint = %format!("{:032x}", rule_fingerprint),
+                config_key = "storage.rule_dictionary_capacity",
+                "Too many distinct rate-limit rules are in flight. New \
+                 rules cannot be registered on this node and will not \
+                 enforce limits here. To fix, raise \
+                 `storage.rule_dictionary_capacity` in your gabion config \
+                 (currently {}).",
+                self.rule_dictionary.capacity(),
+            );
+        }
+    }
+
+    fn note_node_dictionary_full(&mut self, node_id: NodeId, incarnation: Incarnation) {
+        self.node_dictionary_full_rejects =
+            self.node_dictionary_full_rejects.saturating_add(1);
+        if self.node_dictionary_full_rejects.is_power_of_two() {
+            tracing::warn!(
+                rejected_total = self.node_dictionary_full_rejects,
+                capacity = self.node_dictionary.capacity(),
+                in_use = self.node_dictionary.len(),
+                peer_node_id = %format!("{:032x}", node_id.0),
+                peer_incarnation = incarnation,
+                config_key = "storage.node_dictionary_capacity",
+                "Too many gabion peer instances are being tracked (every \
+                 peer restart counts as a new instance until its data \
+                 ages out). Counts from some peers are now being dropped, \
+                 so cluster-wide rate limits will under-count requests \
+                 handled by those peers. To fix, raise \
+                 `storage.node_dictionary_capacity` in your gabion config \
+                 (currently {}); size it comfortably above 2× the \
+                 cluster's peer count to absorb rolling restarts.",
+                self.node_dictionary.capacity(),
+            );
+        }
     }
 
     pub fn find_rule(&self, fingerprint: u128) -> Option<RuleSlot> {
@@ -810,7 +880,7 @@ impl<C: Count> CellStore<C> {
         let slot = match self.alloc_slot() {
             Some(s) => s,
             None => {
-                self.cell_store_full_rejects = self.cell_store_full_rejects.saturating_add(1);
+                self.note_cell_store_full();
                 return Err(InsertReject::CellStoreFull);
             }
         };
@@ -868,8 +938,7 @@ impl<C: Count> CellStore<C> {
                 match self.rule_dictionary.intern(descriptor) {
                     Some(slot) => slot,
                     None => {
-                        self.rule_dictionary_full_rejects =
-                            self.rule_dictionary_full_rejects.saturating_add(1);
+                        self.note_rule_dictionary_full(rule_fingerprint);
                         return None;
                     }
                 }
@@ -880,8 +949,7 @@ impl<C: Count> CellStore<C> {
             None => match self.node_dictionary.intern(node_id, incarnation) {
                 Some(slot) => slot,
                 None => {
-                    self.node_dictionary_full_rejects =
-                        self.node_dictionary_full_rejects.saturating_add(1);
+                    self.note_node_dictionary_full(node_id, incarnation);
                     return None;
                 }
             },
@@ -907,8 +975,7 @@ impl<C: Count> CellStore<C> {
                     match self.rule_dictionary.intern(descriptor) {
                         Some(slot) => slot,
                         None => {
-                            self.rule_dictionary_full_rejects =
-                                self.rule_dictionary_full_rejects.saturating_add(1);
+                            self.note_rule_dictionary_full(rule_fingerprint);
                             continue;
                         }
                     }

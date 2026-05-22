@@ -8,14 +8,19 @@ build = "build.rs"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+anyhow.workspace = true
+arrayvec.workspace = true
+futures.workspace = true
 gabion.workspace = true
 humantime.workspace = true
-kube.workspace = true
+humantime-serde.workspace = true
 nginx-sys = { workspace = true, optional = true }
 ngx = { workspace = true, optional = true }
-socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+twox-hash.workspace = true
+whoami.workspace = true
 
 [features]
 default = []

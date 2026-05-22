@@ -12,6 +12,7 @@ pub struct PeerFrontierTable {
     last_sent_seq: Box<[u64]>,
     peer_capacity: u16,
     node_capacity: u16,
+    full_rejects: u64,
 }
 
 impl PeerFrontierTable {
@@ -23,6 +24,7 @@ impl PeerFrontierTable {
             last_sent_seq: vec![0_u64; flat].into_boxed_slice(),
             peer_capacity,
             node_capacity,
+            full_rejects: 0,
         }
     }
 
@@ -50,6 +52,21 @@ impl PeerFrontierTable {
                 *slot = Some(peer);
                 return Some(i as u16);
             }
+        }
+        self.full_rejects = self.full_rejects.saturating_add(1);
+        if self.full_rejects.is_power_of_two() {
+            tracing::warn!(
+                rejected_total = self.full_rejects,
+                capacity = self.peer_capacity,
+                peer_node_id = %format!("{:032x}", peer.0),
+                config_key = "storage.peer_capacity",
+                "Too many gabion peers to optimize gossip with. The cluster \
+                 will still converge correctly, but gossip with this peer \
+                 will use more network bandwidth than necessary. To fix, \
+                 raise `storage.peer_capacity` in your gabion config \
+                 (currently {}).",
+                self.peer_capacity,
+            );
         }
         None
     }

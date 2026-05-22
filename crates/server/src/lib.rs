@@ -18,6 +18,7 @@
 //! descriptor requests are no longer all-or-nothing for admission.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gabion::crdt::Count;
@@ -138,6 +139,7 @@ impl<C: Count> SharedLimiter<C> {
 
     async fn evaluate(&self, request: LimitRequest<'_>, now_millis: u64) -> Decision {
         if request.violates_cardinality(self.cardinality_limits) {
+            note_cardinality_reject(request.domain, request.descriptors.len());
             return Decision::Reject(RejectReason::Cardinality);
         }
 
@@ -153,10 +155,13 @@ impl<C: Count> SharedLimiter<C> {
             // Record-then-read. If the gossip runtime has gone away the
             // record fails open — we still consult whatever the local
             // DashMap holds.
-            let _ = self
+            if let Err(err) = self
                 .gossip_client
                 .record(spec.fingerprint, key_hash, bucket, request.hits, now_millis)
-                .await;
+                .await
+            {
+                note_gossip_record_failure(&err);
+            }
 
             let total = self.counts.window_total(
                 spec.fingerprint,
@@ -172,6 +177,49 @@ impl<C: Count> SharedLimiter<C> {
             }
         }
         decision
+    }
+}
+
+// -- Rate-limited operator warnings -----------------------------------------
+//
+// These two failure modes can both fire at full request rate when something
+// is wrong (mass-cardinality attack; gossip runtime dead). Each emits a
+// `tracing::warn!` only on power-of-two transitions of its counter, so the
+// log volume is bounded at ~log2(N) regardless of request rate.
+
+static CARDINALITY_REJECTS: AtomicU64 = AtomicU64::new(0);
+static GOSSIP_RECORD_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+fn note_cardinality_reject(domain: &str, descriptor_count: usize) {
+    let n = CARDINALITY_REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            domain,
+            descriptor_count,
+            rejected_total = n,
+            config_key = "cardinality_limits",
+            "Rejecting requests that attach too many rate-limit \
+             descriptors. This is usually a misbehaving client or an \
+             attack trying to exhaust gabion's tracking memory. If the \
+             traffic is legitimate, raise the relevant key under \
+             `cardinality_limits` in your gabion config.",
+        );
+    }
+}
+
+fn note_gossip_record_failure(err: &gabion::gossip::GossipError) {
+    let n = GOSSIP_RECORD_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            error = %err,
+            failed_total = n,
+            "This node can no longer share rate-limit counts with the \
+             rest of the cluster. Rate limits are now using only this \
+             node's local traffic, so they will under-count requests \
+             handled by other nodes. The gossip background task has \
+             stopped — look for an earlier error log entry to find out \
+             why.",
+        );
     }
 }
 
@@ -197,18 +245,45 @@ impl<C: Count> EnvoyRateLimitService<C> {
     }
 }
 
-pub async fn serve<C>(
+/// gRPC service name reported via the standard `grpc.health.v1.Health`
+/// protocol. Liveness/readiness probes (kube-proxy, gRPC load balancers,
+/// `grpc_health_probe`) should query for this exact name.
+pub const RATE_LIMIT_SERVICE_NAME: &str =
+    "envoy.service.ratelimit.v3.RateLimitService";
+
+/// Run the gRPC server until `shutdown` resolves. Mounts:
+///
+/// 1. The Envoy rate-limit service itself.
+/// 2. `grpc.health.v1.Health` — flip statuses via `health_reporter`. Set to
+///    `NOT_SERVING` before triggering `shutdown` so external readiness probes
+///    see the failure and route traffic away before in-flight requests start
+///    being refused.
+/// 3. `grpc.reflection.v1.ServerReflection` — lets `grpcurl list` and similar
+///    tools enumerate services without ahead-of-time `.proto` files.
+pub async fn serve<C, F, H>(
     bind: std::net::SocketAddr,
     limiter: SharedLimiter<C>,
+    health_server: tonic_health::pb::health_server::HealthServer<H>,
+    shutdown: F,
 ) -> Result<(), tonic::transport::Error>
 where
     C: Count + Send + Sync + 'static,
+    F: std::future::Future<Output = ()>,
+    H: tonic_health::pb::health_server::Health,
 {
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+        .with_service_name(RATE_LIMIT_SERVICE_NAME)
+        .build_v1()
+        .expect("build reflection service");
+
     tonic::transport::Server::builder()
+        .add_service(health_server)
+        .add_service(reflection)
         .add_service(RateLimitServiceServer::new(EnvoyRateLimitService::new(
             limiter,
         )))
-        .serve(bind)
+        .serve_with_shutdown(bind, shutdown)
         .await
 }
 

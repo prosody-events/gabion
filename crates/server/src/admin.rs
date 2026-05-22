@@ -160,8 +160,24 @@ pub async fn serve<C: Count + 'static>(
     bind: SocketAddr,
     state: AdminState<C>,
 ) -> std::io::Result<()> {
+    serve_with_shutdown(bind, state, std::future::pending()).await
+}
+
+/// Like [`serve`] but stops accepting new connections and drains in-flight
+/// admin requests when `shutdown` resolves.
+pub async fn serve_with_shutdown<C, F>(
+    bind: SocketAddr,
+    state: AdminState<C>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    C: Count + 'static,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, router(state)).await
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
 }
 
 async fn snapshot_handler<C: Count + 'static>(
