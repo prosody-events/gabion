@@ -135,12 +135,12 @@ data:
     }
 
     http {
-        gabion_limit_zone api 128m;
-        gabion_limit_rule uri_api 2r/m key=\$uri window=60s bucket=1s;
+        gabion_limit_zone zone=api:128m;
+        gabion_limit_rule uri_api \$uri rate=2r/m bucket=1s;
         gabion_gossip_bind 0.0.0.0:9000;
         gabion_gossip_cluster 1;
         gabion_gossip_fanout 6;
-        gabion_gossip_discovery_namespace $namespace;
+        gabion_discovery_namespace_allow $namespace;
 
         server {
             listen 8080;

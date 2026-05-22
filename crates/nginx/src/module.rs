@@ -41,14 +41,12 @@ use crate::leader::{self, GossipSettings, LeaderConfig};
 use crate::log;
 use crate::rules::{
     BindingCompiler, BindingLookup, CompiledRules, DEFAULT_DOMAIN, DescriptorBinding, RuleConfig,
-    is_single_ident,
+    is_descriptor_key, is_dns_label, is_single_ident, is_zone_name, parse_binding, parse_rate,
 };
 use crate::shm::{Layout, ShmRegion};
 
 const DEFAULT_QUEUE_CAPACITY: usize = 2048;
 const DEFAULT_AGGREGATE_CAPACITY: usize = 4096;
-const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
-const DEFAULT_BUCKET: Duration = Duration::from_secs(1);
 
 static SHM_PTR: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
 static SHM_LEN: AtomicUsize = AtomicUsize::new(0);
@@ -745,11 +743,13 @@ extern "C" fn set_zone(
             );
             return core::NGX_CONF_ERROR;
         };
-        if name.is_empty() {
+        if !is_zone_name(name) {
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
-                "gabion: `gabion_limit_zone` zone name is empty"
+                "gabion: `gabion_limit_zone` zone name `{}` must match `[A-Za-z0-9_]+` (matches \
+                 nginx core's `limit_req_zone` grammar)",
+                name
             );
             return core::NGX_CONF_ERROR;
         }
@@ -829,8 +829,8 @@ extern "C" fn set_zone(
 ///
 /// ```text
 /// gabion_limit_rule <name> <$var | name:$var> [...]
-///                          rate=Nr/{s,m,h}
-///                          [window=W] [bucket=B]
+///                          rate=Nr/<s|m|h|d|DURATION>
+///                          [bucket=B]
 ///                          [mode=enforce|dry_run|disabled] [dry_run]
 ///                          [except_if=$var] [domain=NAME];
 /// ```
@@ -838,7 +838,9 @@ extern "C" fn set_zone(
 /// Positional arguments after the rule name are descriptor bindings — `$var`
 /// auto-keyed by the variable name, or `name:$var` with an explicit key.
 /// Named arguments are recognised by their `keyword=` prefix; the bare
-/// `dry_run` flag is an alias for `mode=dry_run`.
+/// `dry_run` flag is an alias for `mode=dry_run`. The `rate=` argument's
+/// unit-letter (`s|m|h|d`) defines the window; for non-round periods use a
+/// duration (`rate=100r/30s`, `rate=10r/5m`).
 extern "C" fn set_rule(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
@@ -871,13 +873,12 @@ extern "C" fn set_rule(
             return core::NGX_CONF_ERROR;
         };
 
-        let mut window = DEFAULT_WINDOW;
-        let mut bucket = DEFAULT_BUCKET;
+        let mut bucket: Option<Duration> = None;
         let mut domain = DEFAULT_DOMAIN.to_string();
         let mut bindings: Vec<DescriptorBinding> = Vec::new();
         let mut mode = EnforcementMode::Enforce;
         let mut mode_explicit = false;
-        let mut limit: Option<u64> = None;
+        let mut rate: Option<(u64, Duration)> = None;
         let mut except_if: Option<Box<str>> = None;
 
         for index in 2..nelts {
@@ -890,9 +891,8 @@ extern "C" fn set_rule(
                 return core::NGX_CONF_ERROR;
             };
             match parse_rule_arg(value) {
-                RuleArg::Rate(r) => limit = Some(r),
-                RuleArg::Window(d) => window = d,
-                RuleArg::Bucket(d) => bucket = d,
+                RuleArg::Rate(count, period) => rate = Some((count, period)),
+                RuleArg::Bucket(d) => bucket = Some(d),
                 RuleArg::Domain(d) => domain = d,
                 RuleArg::Mode(m) => {
                     mode = m;
@@ -926,7 +926,7 @@ extern "C" fn set_rule(
             }
         }
 
-        let Some(limit) = limit else {
+        let Some((limit, window)) = rate else {
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
@@ -946,7 +946,22 @@ extern "C" fn set_rule(
             );
             return core::NGX_CONF_ERROR;
         }
+        if main.rules.iter().any(|r| r.name.as_ref() == name) {
+            ngx::ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                cf,
+                "gabion: `gabion_limit_rule` rule `{}` is declared more than once; rule names \
+                 must be unique within an http {{}} block",
+                name
+            );
+            return core::NGX_CONF_ERROR;
+        }
 
+        // `bucket=` defaults to the rate's window so the natural shape of
+        // a rule is a single fixed-window bucket per period (e.g.
+        // `rate=10r/m` → one 60s bucket). Operators who want finer
+        // sliding-window enforcement set `bucket=` explicitly.
+        let bucket = bucket.unwrap_or(window);
         main.rules.push(RuleConfig {
             name: name.into(),
             domain: domain.into(),
@@ -963,8 +978,9 @@ extern "C" fn set_rule(
 
 /// Parsed shape of one `gabion_limit_rule` argument.
 enum RuleArg {
-    Rate(u64),
-    Window(Duration),
+    /// `rate=Nr/<period>` — `(count, period)`. Period comes from the unit
+    /// letter (`s|m|h|d`) or a humantime-parsed duration (`30s`, `5m`).
+    Rate(u64, Duration),
     Bucket(Duration),
     Domain(String),
     Mode(EnforcementMode),
@@ -980,25 +996,22 @@ fn parse_rule_arg(value: &str) -> RuleArg {
     }
     if let Some(rest) = value.strip_prefix("rate=") {
         return match parse_rate(rest) {
-            Ok(r) => RuleArg::Rate(r),
-            Err(()) => RuleArg::Invalid("expected `rate=Nr/s`, `Nr/m`, or `Nr/h`"),
-        };
-    }
-    if let Some(rest) = value.strip_prefix("window=") {
-        return match humantime::parse_duration(rest) {
-            Ok(d) => RuleArg::Window(d),
-            Err(_) => RuleArg::Invalid("expected `window=DURATION` (e.g. `window=60s`)"),
+            Ok((count, period)) => RuleArg::Rate(count, period),
+            Err(reason) => RuleArg::Invalid(reason),
         };
     }
     if let Some(rest) = value.strip_prefix("bucket=") {
         return match humantime::parse_duration(rest) {
-            Ok(d) => RuleArg::Bucket(d),
+            Ok(d) if !d.is_zero() => RuleArg::Bucket(d),
+            Ok(_) => RuleArg::Invalid("`bucket=` must be greater than zero"),
             Err(_) => RuleArg::Invalid("expected `bucket=DURATION` (e.g. `bucket=1s`)"),
         };
     }
     if let Some(rest) = value.strip_prefix("domain=") {
-        if rest.is_empty() {
-            return RuleArg::Invalid("`domain=` requires a non-empty value");
+        if !is_descriptor_key(rest) {
+            return RuleArg::Invalid(
+                "`domain=` must match `[A-Za-z_][A-Za-z0-9_.-]*` (e.g. `domain=api`)",
+            );
         }
         return RuleArg::Domain(rest.to_string());
     }
@@ -1018,11 +1031,8 @@ fn parse_rule_arg(value: &str) -> RuleArg {
         return RuleArg::ExceptIf(var.to_string());
     }
     match parse_binding(value) {
-        Some(b) => RuleArg::Binding(b),
-        None => RuleArg::Invalid(
-            "expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, \
-             `mode=`, `dry_run`, `except_if=`, `domain=`",
-        ),
+        Ok(b) => RuleArg::Binding(b),
+        Err(reason) => RuleArg::Invalid(reason),
     }
 }
 
@@ -1194,21 +1204,13 @@ extern "C" fn set_gossip_bind(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    // SAFETY: `conf` is the uniquely-owned `MainConfig` slot per the
-    // HttpModuleMainConf contract; `cf` is a valid `ngx_conf_t` passed
-    // to `single_arg` which honours the same contract. Single-threaded
-    // config phase, so the `&mut` borrow is unique.
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(addr) = value.parse::<SocketAddr>() else {
-            return core::NGX_CONF_ERROR;
-        };
-        main.gossip_bind = Some(addr);
-        core::NGX_CONF_OK
-    }
+    set_scalar(
+        cf,
+        conf,
+        "expected a host:port socket address (e.g. `0.0.0.0:9000`, `[::]:9000`)",
+        |v| v.parse::<SocketAddr>().ok(),
+        |main, addr| main.gossip_bind = Some(addr),
+    )
 }
 
 /// nginx directive handler for `gabion_gossip_fanout`. Standard nginx
@@ -1218,20 +1220,14 @@ extern "C" fn set_gossip_fanout(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    // SAFETY: Same as `set_gossip_bind` — `conf` is the uniquely-owned
-    // `MainConfig` slot in the single-threaded config phase, and `cf` is
-    // a valid `ngx_conf_t`.
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(fanout) = value.parse::<usize>() else {
-            return core::NGX_CONF_ERROR;
-        };
-        main.gossip.fanout = fanout.max(1);
-        core::NGX_CONF_OK
-    }
+    set_usize(
+        cf,
+        conf,
+        "expected a positive integer (peers per tick, e.g. `6`)",
+        |main, value| {
+            main.gossip.fanout = value.max(1);
+        },
+    )
 }
 
 /// nginx directive handler for `gabion_gossip_cluster`. Standard nginx
@@ -1241,20 +1237,17 @@ extern "C" fn set_gossip_cluster(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    // SAFETY: Same as `set_gossip_bind` — `conf` is the uniquely-owned
-    // `MainConfig` slot in the single-threaded config phase, and `cf` is
-    // a valid `ngx_conf_t`.
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(cluster) = value.parse::<u128>() else {
-            return core::NGX_CONF_ERROR;
-        };
-        main.gossip.cluster_id_hash = cluster;
-        core::NGX_CONF_OK
-    }
+    set_scalar(
+        cf,
+        conf,
+        "expected a non-zero 128-bit cluster identifier shared by every peer (e.g. `1`, any u128 \
+         literal)",
+        |v| match v.parse::<u128>() {
+            Ok(0) | Err(_) => None,
+            Ok(cluster) => Some(cluster),
+        },
+        |main, cluster| main.gossip.cluster_id_hash = cluster,
+    )
 }
 
 extern "C" fn set_gossip_tick_interval(
@@ -1262,9 +1255,14 @@ extern "C" fn set_gossip_tick_interval(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_duration(cf, conf, |main, value| {
-        main.gossip.tick_interval = value;
-    })
+    set_duration(
+        cf,
+        conf,
+        "expected a duration like `100ms` or `1s`",
+        |main, value| {
+            main.gossip.tick_interval = value;
+        },
+    )
 }
 
 extern "C" fn set_gossip_max_payload_bytes(
@@ -1272,9 +1270,14 @@ extern "C" fn set_gossip_max_payload_bytes(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_usize(cf, conf, |main, value| {
-        main.gossip.max_payload_bytes = value.max(1);
-    })
+    set_usize(
+        cf,
+        conf,
+        "expected a positive byte count (e.g. `65536`)",
+        |main, value| {
+            main.gossip.max_payload_bytes = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_gossip_max_cells_per_frame(
@@ -1282,9 +1285,14 @@ extern "C" fn set_gossip_max_cells_per_frame(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_u32(cf, conf, |main, value| {
-        main.gossip.max_cells_per_frame = value.max(1);
-    })
+    set_u32(
+        cf,
+        conf,
+        "expected a positive integer (cells/frame, e.g. `4096`)",
+        |main, value| {
+            main.gossip.max_cells_per_frame = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_gossip_max_cells_per_tick(
@@ -1292,9 +1300,14 @@ extern "C" fn set_gossip_max_cells_per_tick(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_usize(cf, conf, |main, value| {
-        main.gossip.max_cells_per_tick = value.max(1);
-    })
+    set_usize(
+        cf,
+        conf,
+        "expected a positive integer (cells/tick)",
+        |main, value| {
+            main.gossip.max_cells_per_tick = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_gossip_send_queue_capacity(
@@ -1302,9 +1315,14 @@ extern "C" fn set_gossip_send_queue_capacity(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_usize(cf, conf, |main, value| {
-        main.gossip.send_queue_capacity = value.max(1);
-    })
+    set_usize(
+        cf,
+        conf,
+        "expected a positive integer (send-queue slots)",
+        |main, value| {
+            main.gossip.send_queue_capacity = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_gossip_limit_queue_capacity(
@@ -1312,9 +1330,14 @@ extern "C" fn set_gossip_limit_queue_capacity(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_usize(cf, conf, |main, value| {
-        main.gossip.limit_queue_capacity = value.max(1);
-    })
+    set_usize(
+        cf,
+        conf,
+        "expected a positive integer (limit-queue slots)",
+        |main, value| {
+            main.gossip.limit_queue_capacity = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_gossip_target_err_bps(
@@ -1322,9 +1345,14 @@ extern "C" fn set_gossip_target_err_bps(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_u32(cf, conf, |main, value| {
-        main.gossip.target_err_bps = value;
-    })
+    set_u32(
+        cf,
+        conf,
+        "expected basis points of the rule's limit (e.g. `100` = 1%)",
+        |main, value| {
+            main.gossip.target_err_bps = value;
+        },
+    )
 }
 
 extern "C" fn set_gossip_min_emit_interval(
@@ -1332,9 +1360,14 @@ extern "C" fn set_gossip_min_emit_interval(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_duration(cf, conf, |main, value| {
-        main.gossip.min_emit_interval = value;
-    })
+    set_duration(
+        cf,
+        conf,
+        "expected a duration like `5ms` or `100ms`",
+        |main, value| {
+            main.gossip.min_emit_interval = value;
+        },
+    )
 }
 
 extern "C" fn set_storage_max_cells(
@@ -1342,9 +1375,14 @@ extern "C" fn set_storage_max_cells(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_usize(cf, conf, |main, value| {
-        main.storage.max_cells = value.max(1);
-    })
+    set_usize(
+        cf,
+        conf,
+        "expected a positive integer (CRDT cell capacity, e.g. `131072`)",
+        |main, value| {
+            main.storage.max_cells = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_storage_rule_dictionary_capacity(
@@ -1352,9 +1390,14 @@ extern "C" fn set_storage_rule_dictionary_capacity(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_u16(cf, conf, |main, value| {
-        main.storage.rule_dictionary_capacity = value.max(1);
-    })
+    set_u16(
+        cf,
+        conf,
+        "expected a positive integer that fits u16 (e.g. `1024`)",
+        |main, value| {
+            main.storage.rule_dictionary_capacity = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_storage_node_dictionary_capacity(
@@ -1362,9 +1405,14 @@ extern "C" fn set_storage_node_dictionary_capacity(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_u16(cf, conf, |main, value| {
-        main.storage.node_dictionary_capacity = value.max(1);
-    })
+    set_u16(
+        cf,
+        conf,
+        "expected a positive integer that fits u16 (e.g. `1024`)",
+        |main, value| {
+            main.storage.node_dictionary_capacity = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_storage_local_dirty_capacity(
@@ -1372,9 +1420,14 @@ extern "C" fn set_storage_local_dirty_capacity(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_usize(cf, conf, |main, value| {
-        main.storage.local_dirty_capacity = value.max(1);
-    })
+    set_usize(
+        cf,
+        conf,
+        "expected a positive integer (local dirty-ring slots)",
+        |main, value| {
+            main.storage.local_dirty_capacity = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_storage_forwarded_dirty_capacity(
@@ -1382,9 +1435,14 @@ extern "C" fn set_storage_forwarded_dirty_capacity(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_usize(cf, conf, |main, value| {
-        main.storage.forwarded_dirty_capacity = value.max(1);
-    })
+    set_usize(
+        cf,
+        conf,
+        "expected a positive integer (forwarded dirty-ring slots)",
+        |main, value| {
+            main.storage.forwarded_dirty_capacity = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_storage_peer_capacity(
@@ -1392,9 +1450,14 @@ extern "C" fn set_storage_peer_capacity(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_u16(cf, conf, |main, value| {
-        main.storage.peer_capacity = value.max(1);
-    })
+    set_u16(
+        cf,
+        conf,
+        "expected a positive integer that fits u16 (e.g. `256`)",
+        |main, value| {
+            main.storage.peer_capacity = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_storage_max_descriptor_count(
@@ -1402,20 +1465,20 @@ extern "C" fn set_storage_max_descriptor_count(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(count) = value.parse::<usize>() else {
-            return core::NGX_CONF_ERROR;
-        };
-        if count == 0 || count > crate::rules::MAX_DESCRIPTORS {
-            return core::NGX_CONF_ERROR;
-        }
-        main.cardinality.max_descriptor_count = count;
-        core::NGX_CONF_OK
-    }
+    set_scalar(
+        cf,
+        conf,
+        "expected a positive integer no greater than the compiled-in cap (see \
+         `gabion::defaults::STORAGE_MAX_DESCRIPTOR_COUNT`)",
+        |v| {
+            let count = v.parse::<usize>().ok()?;
+            if count == 0 || count > crate::rules::MAX_DESCRIPTORS {
+                return None;
+            }
+            Some(count)
+        },
+        |main, value| main.cardinality.max_descriptor_count = value,
+    )
 }
 
 extern "C" fn set_storage_max_descriptor_bytes(
@@ -1423,9 +1486,14 @@ extern "C" fn set_storage_max_descriptor_bytes(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_usize(cf, conf, |main, value| {
-        main.cardinality.max_descriptor_bytes = value.max(1);
-    })
+    set_usize(
+        cf,
+        conf,
+        "expected a positive byte budget per request (e.g. `512`)",
+        |main, value| {
+            main.cardinality.max_descriptor_bytes = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_storage_max_key_bytes(
@@ -1433,9 +1501,14 @@ extern "C" fn set_storage_max_key_bytes(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_usize(cf, conf, |main, value| {
-        main.cardinality.max_key_bytes = value.max(1);
-    })
+    set_usize(
+        cf,
+        conf,
+        "expected a positive byte budget per descriptor key (e.g. `64`)",
+        |main, value| {
+            main.cardinality.max_key_bytes = value.max(1);
+        },
+    )
 }
 
 extern "C" fn set_runtime_rng_seed(
@@ -1443,9 +1516,14 @@ extern "C" fn set_runtime_rng_seed(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    set_u64(cf, conf, |main, value| {
-        main.rng_seed = Some(value);
-    })
+    set_u64(
+        cf,
+        conf,
+        "expected a u64 seed for deterministic peer sampling (e.g. `42`)",
+        |main, value| {
+            main.rng_seed = Some(value);
+        },
+    )
 }
 
 /// nginx directive handler for `gabion_node_id_seed`. Standard nginx callback
@@ -1455,17 +1533,13 @@ extern "C" fn set_identity_seed(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    // SAFETY: Same as `set_gossip_bind` — `conf` is the uniquely-owned
-    // `MainConfig` slot in the single-threaded config phase, and `cf` is
-    // a valid `ngx_conf_t`.
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        main.identity_seed = Some(value.into());
-        core::NGX_CONF_OK
-    }
+    set_scalar(
+        cf,
+        conf,
+        "expected a non-empty seed string (e.g. a pod name)",
+        |v| (!v.is_empty()).then(|| v.to_string()),
+        |main, value| main.identity_seed = Some(value.into()),
+    )
 }
 
 /// nginx directive handler for `gabion_discovery_namespace_allow`. Standard
@@ -1475,22 +1549,14 @@ extern "C" fn set_discovery_namespace(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    // SAFETY: Same as `set_gossip_bind` — `conf` is the uniquely-owned
-    // `MainConfig` slot in the single-threaded config phase, and `cf` is
-    // a valid `ngx_conf_t`.
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_discovery_namespace_allow` requires one namespace argument"
-            );
-            return core::NGX_CONF_ERROR;
-        };
-        main.discovery.namespace_allow.push(value.to_string());
-        core::NGX_CONF_OK
-    }
+    set_scalar(
+        cf,
+        conf,
+        "expected a Kubernetes DNS label `[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?` (lower-case, ≤63 \
+         chars)",
+        |v| is_dns_label(v).then(|| v.to_string()),
+        |main, value| main.discovery.namespace_allow.push(value),
+    )
 }
 
 extern "C" fn set_discovery_service(
@@ -1498,19 +1564,14 @@ extern "C" fn set_discovery_service(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_discovery_service_allow` requires one service-name argument"
-            );
-            return core::NGX_CONF_ERROR;
-        };
-        main.discovery.service_allow.push(value.to_string());
-        core::NGX_CONF_OK
-    }
+    set_scalar(
+        cf,
+        conf,
+        "expected a Kubernetes DNS label `[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?` (lower-case, ≤63 \
+         chars)",
+        |v| is_dns_label(v).then(|| v.to_string()),
+        |main, value| main.discovery.service_allow.push(value),
+    )
 }
 
 extern "C" fn set_discovery_self_addr(
@@ -1518,106 +1579,139 @@ extern "C" fn set_discovery_self_addr(
     _command: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    set_scalar(
+        cf,
+        conf,
+        "expected a host:port socket address to exclude from discovered peers",
+        |v| v.parse::<SocketAddr>().ok(),
+        |main, addr| main.discovery.self_addr = Some(addr),
+    )
+}
+
+/// Resolve a single string-typed argument and parse it through `parse`,
+/// applying the result via `apply`. On parse failure logs an EMERG line of
+/// the operator-grade shape:
+///
+/// ```text
+/// gabion: `<directive>` rejected value `<offending>`: <expected>
+/// ```
+///
+/// where `<directive>` is read from `(*cf).args[0]` (always populated by
+/// nginx) and `<expected>` is the per-directive format hint. The hint
+/// should be a short, complete sentence that names the expected shape and
+/// gives an example (e.g. `"expected a positive integer (e.g. 4096)"`).
+fn set_scalar<T>(
+    cf: *mut ngx_conf_t,
+    conf: *mut c_void,
+    expected: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+    apply: impl FnOnce(&mut MainConfig, T),
+) -> *mut c_char {
+    // SAFETY: `conf` is the `MainConfig` slot nginx allocated for this
+    // module (HttpModuleMainConf contract), uniquely owned for the
+    // duration of this single-threaded config-phase callback; `cf` is a
+    // valid `ngx_conf_t`.
     unsafe {
         let main = &mut *(conf as *mut MainConfig);
+        let directive = directive_name(cf);
         let Some(value) = single_arg(cf) else {
+            ngx::ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                cf,
+                "gabion: `{}` requires exactly one argument; {}",
+                directive,
+                expected
+            );
             return core::NGX_CONF_ERROR;
         };
-        let Ok(addr) = value.parse::<SocketAddr>() else {
-            return core::NGX_CONF_ERROR;
-        };
-        main.discovery.self_addr = Some(addr);
-        core::NGX_CONF_OK
+        match parse(value) {
+            Some(parsed) => {
+                apply(main, parsed);
+                core::NGX_CONF_OK
+            }
+            None => {
+                ngx::ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    cf,
+                    "gabion: `{}` rejected value `{}`: {}",
+                    directive,
+                    value,
+                    expected
+                );
+                core::NGX_CONF_ERROR
+            }
+        }
     }
 }
 
 fn set_usize(
     cf: *mut ngx_conf_t,
     conf: *mut c_void,
+    expected: &str,
     apply: impl FnOnce(&mut MainConfig, usize),
 ) -> *mut c_char {
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(parsed) = value.parse::<usize>() else {
-            return core::NGX_CONF_ERROR;
-        };
-        apply(main, parsed);
-        core::NGX_CONF_OK
-    }
+    set_scalar(cf, conf, expected, |v| v.parse::<usize>().ok(), apply)
 }
 
 fn set_u16(
     cf: *mut ngx_conf_t,
     conf: *mut c_void,
+    expected: &str,
     apply: impl FnOnce(&mut MainConfig, u16),
 ) -> *mut c_char {
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(parsed) = value.parse::<u16>() else {
-            return core::NGX_CONF_ERROR;
-        };
-        apply(main, parsed);
-        core::NGX_CONF_OK
-    }
+    set_scalar(cf, conf, expected, |v| v.parse::<u16>().ok(), apply)
 }
 
 fn set_u32(
     cf: *mut ngx_conf_t,
     conf: *mut c_void,
+    expected: &str,
     apply: impl FnOnce(&mut MainConfig, u32),
 ) -> *mut c_char {
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(parsed) = value.parse::<u32>() else {
-            return core::NGX_CONF_ERROR;
-        };
-        apply(main, parsed);
-        core::NGX_CONF_OK
-    }
+    set_scalar(cf, conf, expected, |v| v.parse::<u32>().ok(), apply)
 }
 
 fn set_u64(
     cf: *mut ngx_conf_t,
     conf: *mut c_void,
+    expected: &str,
     apply: impl FnOnce(&mut MainConfig, u64),
 ) -> *mut c_char {
-    unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(parsed) = value.parse::<u64>() else {
-            return core::NGX_CONF_ERROR;
-        };
-        apply(main, parsed);
-        core::NGX_CONF_OK
-    }
+    set_scalar(cf, conf, expected, |v| v.parse::<u64>().ok(), apply)
 }
 
 fn set_duration(
     cf: *mut ngx_conf_t,
     conf: *mut c_void,
+    expected: &str,
     apply: impl FnOnce(&mut MainConfig, Duration),
 ) -> *mut c_char {
+    set_scalar(
+        cf,
+        conf,
+        expected,
+        |v| humantime::parse_duration(v).ok(),
+        apply,
+    )
+}
+
+/// Read the directive name from `(*cf).args[0]`. nginx always populates
+/// this with the keyword that triggered the callback, so it never panics
+/// in practice; the fallback covers a hypothetical malformed `ngx_conf_t`
+/// without taking down the master process.
+fn directive_name(cf: *mut ngx_conf_t) -> &'static str {
+    // SAFETY: Same contract as `single_arg`: `cf` is a valid `ngx_conf_t`
+    // owned for the duration of this single-threaded callback;
+    // `(*cf).args` is an `ngx_array_t` of `ngx_str_t` with at least one
+    // element (the directive name itself). The `&'static str` lifetime is
+    // a convenience cast; the byte view borrows from cycle-pool memory
+    // valid for the call.
     unsafe {
-        let main = &mut *(conf as *mut MainConfig);
-        let Some(value) = single_arg(cf) else {
-            return core::NGX_CONF_ERROR;
-        };
-        let Ok(parsed) = humantime::parse_duration(value) else {
-            return core::NGX_CONF_ERROR;
-        };
-        apply(main, parsed);
-        core::NGX_CONF_OK
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        if args.is_null() || (*(*cf).args).nelts == 0 {
+            return "<gabion-directive>";
+        }
+        (*args).to_str().unwrap_or("<gabion-directive>")
     }
 }
 
@@ -1878,46 +1972,6 @@ fn parse_size_bytes(input: &str) -> Result<usize, ()> {
         "g" | "gb" => value.checked_mul(1024 * 1024 * 1024).ok_or(()),
         _ => Err(()),
     }
-}
-
-/// Parse a positional descriptor binding argument. Accepts:
-/// - `$uri` → key="uri", source="$uri" (auto-keyed; only when the source is a
-///   single legal `$identifier`)
-/// - `tenant:$http_x_tenant` → key="tenant", source="$http_x_tenant"
-/// - `combo:prefix-$asn-$ua` → key="combo", source="prefix-$asn-$ua" (template;
-///   compiled via `ngx_http_compile_complex_value` at config phase)
-///
-/// Templates (anything with literal text or multiple `$` substitutions)
-/// require the explicit `key:source` form — there's no useful auto-name
-/// to derive.
-fn parse_binding(rest: &str) -> Option<DescriptorBinding> {
-    if rest.starts_with('$') {
-        let stripped = &rest[1..];
-        if is_single_ident(stripped) {
-            return Some(DescriptorBinding {
-                key: stripped.into(),
-                source: rest.into(),
-            });
-        }
-        // Starts with `$` but is a template — requires an explicit key.
-        return None;
-    }
-    let (key, source) = rest.split_once(':')?;
-    if key.is_empty() || source.is_empty() {
-        return None;
-    }
-    Some(DescriptorBinding {
-        key: key.into(),
-        source: source.into(),
-    })
-}
-
-fn parse_rate(input: &str) -> Result<u64, ()> {
-    let input = input.trim();
-    let Some((number, _unit)) = input.split_once("r/") else {
-        return Err(());
-    };
-    number.parse::<u64>().map_err(|_| ())
 }
 
 fn wall_millis() -> u64 {

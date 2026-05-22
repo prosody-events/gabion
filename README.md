@@ -1,17 +1,195 @@
 # Gabion
 
-Distributed rate limiter. Cluster members maintain per-origin counters in a
-CRDT, exchange them over an anti-entropy UDP gossip protocol, and admit or
-reject incoming requests against the cluster-wide aggregate. Two adapters
-consume the same core: `gabiond`, an Envoy-compatible gRPC service, and an
-in-process NGINX module.
+## What gabion does
 
-Cluster-wide counts are eventually consistent. Admission is local and
-allocation-free; under heavy load operators pay for one atomic read of SHM
-(nginx) or one `DashMap` lookup (server), no syscalls.
+Gabion enforces rate limits *across a cluster of nginx workers and
+replicas* (or a fleet of Envoy sidecars) without lying about shared state.
+Each member maintains per-origin counters in a CRDT, exchanges them over
+an anti-entropy UDP gossip protocol, and admits or rejects each incoming
+request against the cluster-wide aggregate. Counts are eventually
+consistent; admission is local and allocation-free — operators pay for
+one atomic read of SHM (nginx) or one `DashMap` lookup (gabiond), no
+syscalls.
 
-This README covers the NGINX module's directive surface. For the broader
-architecture see `CLAUDE.md`; for CRDT internals see `docs/CRDT Module.md`.
+If you run a single nginx box and don't need cluster-wide enforcement,
+nginx core's `limit_req` is simpler and you should use it. Gabion earns
+its keep when two or more nginx workers (let alone replicas) must
+enforce one shared limit. Two adapters consume the same core:
+`gabiond`, an Envoy-compatible gRPC service (see
+[`crates/server/README.md`](crates/server/README.md)); and an
+in-process NGINX module (this README). For the broader architecture see
+`CLAUDE.md`; for CRDT internals see `docs/CRDT Module.md`.
+
+## Your first rule
+
+A minimal single-node nginx config that exercises gabion end-to-end:
+
+```nginx
+# Load the compiled module shared object. Required once, before `events`.
+load_module /etc/nginx/modules/ngx_http_gabion_module.so;
+
+worker_processes 2;
+events {}
+
+http {
+    # Allocate the shared-memory zone all rules live in. One per `http {}`.
+    gabion_limit_zone zone=api:64m;
+
+    # Declare a rule: at most 100 requests per second per client IP.
+    gabion_limit_rule per_ip $remote_addr rate=100r/s;
+
+    server {
+        listen 8080;
+        location / {
+            # Apply the rule at this location.
+            gabion_limit per_ip;
+            return 200 "ok\n";
+        }
+    }
+}
+```
+
+What you'll see:
+
+- `curl -i http://127.0.0.1:8080/` under budget → `HTTP/1.1 200 OK`.
+- Hammer it past 100 requests in one second from the same IP →
+  `HTTP/1.1 429 Too Many Requests` with `X-RateLimit-Limit`,
+  `X-RateLimit-Remaining: 0`, `X-RateLimit-Reset`, and a `Retry-After`
+  header pinned to the rule's window.
+
+Before flipping a freshly-added rule to enforcing mode, run it in
+**dry-run** first. Append `dry_run` to the directive; the rule
+evaluates and records hits (so your metrics show the load) but never
+rejects:
+
+```nginx
+gabion_limit_rule per_ip $remote_addr rate=100r/s dry_run;
+```
+
+Watch the rule's allow/reject counts in your logs or metrics for a
+release window, then drop `dry_run` to start enforcing.
+
+To scale beyond one node, add `gabion_gossip_bind` plus a cluster
+identifier and (under Kubernetes) the namespace allowlist — see
+[Running across a cluster](#running-across-a-cluster) below.
+
+## Glossary
+
+Gabion-specific vocabulary used throughout this README:
+
+| Term            | Definition                                                                                                                                |
+|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| **rule**        | One rate-limit policy (e.g. `per_ip`, `per_tenant`). Declared with `gabion_limit_rule`, applied with `gabion_limit`.                      |
+| **zone**        | The shared-memory area where counters live. Allocated by `gabion_limit_zone`.                                                             |
+| **descriptor**  | A `key=value` pair like `tenant=acme` that names what the rule is counting.                                                               |
+| **binding**     | The recipe for building a descriptor from request data — e.g. `tenant:$arg_tenant` (read the `?tenant=` query arg as the descriptor key). |
+| **predicate**   | An `except_if=$var` condition that exempts a request from a rule when the variable is truthy.                                             |
+| **window**      | The time horizon the limit applies over, derived from `rate=Nr/<unit>`. `rate=10r/m` → 1-minute window.                                   |
+| **bucket**      | The granularity inside a window. Defaults to the window (one fixed-window bucket); set `bucket=` for sliding-window-style enforcement.    |
+| **cardinality** | How many distinct counters a rule can hold; bounded to prevent memory blow-ups when descriptor keys are unbounded user input.             |
+| **fail-open**   | Gabion never rejects on its own internal errors; only on a measured limit overflow. See [Fail-open invariant](#fail-open-invariant).      |
+| **gossip**      | The UDP background exchange that keeps counters in sync across nodes.                                                                     |
+| **cluster**     | The set of gabion processes (nginx workers and/or `gabiond` instances) that share counters via gossip.                                    |
+
+## Common patterns
+
+### Limit per IP, exempt internal network
+
+```nginx
+geo $trusted_ip {
+    default 0;
+    10.0.0.0/8 1;     # internal range bypasses this rule
+    127.0.0.1/32 1;
+}
+gabion_limit_rule per_ip $remote_addr rate=100r/s except_if=$trusted_ip;
+
+server {
+    location /api/ { gabion_limit per_ip; }
+}
+```
+
+The `geo` block defines a variable that's `1` for internal addresses and
+`0` elsewhere. `except_if=$trusted_ip` skips the rule whenever the
+variable resolves truthy. Internal traffic is uncounted; external
+traffic is gated. See [Predicates](#predicates-except_ifvariable) for
+the precise truthy/falsy rules.
+
+### Limit per tenant header
+
+```nginx
+gabion_limit_rule per_tenant tenant:$arg_tenant rate=1000r/m;
+
+server {
+    location /api/ { gabion_limit per_tenant; }
+}
+```
+
+`$arg_tenant` reads the `?tenant=` query arg. `tenant:` is the
+descriptor key — each distinct tenant gets its own counter. A request
+without `?tenant=` produces an empty value; with allow-by-default the
+rule simply doesn't apply (no counter is bumped).
+
+### Roll out a new limit safely
+
+```nginx
+# Step 1: ship the rule in dry_run; observe metrics for a release window.
+gabion_limit_rule new_route tenant:$arg_tenant path:$uri rate=50r/m dry_run;
+gabion_limit new_route;
+
+# Step 2: once the allow/reject ratio looks right, drop `dry_run`.
+gabion_limit_rule new_route tenant:$arg_tenant path:$uri rate=50r/m;
+```
+
+Dry-run rules evaluate and record hits but never reject. The aggregate
+in SHM and gossip both see real traffic, so capacity planning is
+truthful before you flip the switch.
+
+### Stack per-IP + per-tenant
+
+```nginx
+gabion_limit_rule per_ip     $remote_addr        rate=100r/s;
+gabion_limit_rule per_tenant tenant:$arg_tenant  rate=1000r/m;
+
+location /api/ {
+    gabion_limit per_ip per_tenant;     # both must allow the request
+}
+```
+
+Each rule is an independent gate. A reject from either rejects the
+request; the `X-RateLimit-*` headers pin to the rule with the longest
+window so the client doesn't immediately get re-rejected by the wider
+rule. See [Composition: layering rules](#composition-layering-rules)
+for the inheritance shape.
+
+### Exclude `/healthz` from rate limiting
+
+```nginx
+location /healthz {
+    gabion off;       # skip the access handler entirely; zero per-request cost
+    return 200;
+}
+```
+
+`gabion off` skips the access handler altogether (no rule lookup, no
+SHM read). Compare with `gabion_limit off`, which keeps the handler
+running but evaluates no rules — useful when you want a scoped opt-out
+without disabling future gabion machinery for the location. See
+[`gabion_limit off` vs `gabion off`](#gabion_limit-off-vs-gabion-off).
+
+### Scale beyond one node
+
+Add the cluster-side directives at the `http {}` level:
+
+```nginx
+gabion_gossip_bind 0.0.0.0:9000;
+gabion_gossip_cluster 0xc0ffee;                       # any non-zero u128 shared across peers
+gabion_discovery_namespace_allow my-app-namespace;    # Kubernetes EndpointSlice discovery
+```
+
+Every gabion process that shares `gabion_gossip_cluster` and can reach
+each other's `gabion_gossip_bind` socket will exchange counters. See
+[Running across a cluster](#running-across-a-cluster) for the full
+checklist.
 
 ## NGINX directive reference
 
@@ -25,20 +203,24 @@ zone=name:size`.
 gabion_limit_zone zone=api:128m;
 ```
 
-### `gabion_limit_rule NAME [$bindings...] rate=Nr/{s,m,h} [...]` (http)
+### `gabion_limit_rule NAME [$bindings...] rate=Nr/<unit> [...]` (http)
 
 Declares a rate-limit rule. Positional arguments after the name are
 descriptor bindings; everything else is a `keyword=value` named argument or
 a bare flag.
 
 ```nginx
-gabion_limit_rule per_ip    $remote_addr                  rate=100r/s window=1s;
-gabion_limit_rule per_uri   $uri                          rate=10r/s  window=1s;
-gabion_limit_rule per_route tenant:$arg_tenant path:$uri  rate=5r/s   window=1s;
+gabion_limit_rule per_ip    $remote_addr                  rate=100r/s;
+gabion_limit_rule per_uri   $uri                          rate=10r/s;
+gabion_limit_rule per_route tenant:$arg_tenant path:$uri  rate=5r/s;
 
-gabion_limit_rule by_asn    $geoip2_asn_number   rate=50r/s window=1s except_if=$trusted_ip;
-gabion_limit_rule by_bot    class:$bot_class     rate=10r/s window=1s;
-gabion_limit_rule shadow    $uri                 rate=1r/s  window=1s dry_run;
+gabion_limit_rule by_asn    $geoip2_asn_number   rate=50r/s except_if=$trusted_ip;
+gabion_limit_rule by_bot    class:$bot_class     rate=10r/s;
+gabion_limit_rule shadow    $uri                 rate=1r/s  dry_run;
+
+# Non-round periods: any humantime-parsable duration after `r/`.
+gabion_limit_rule slow_path $uri                 rate=5r/30s;
+gabion_limit_rule daily_cap tenant:$arg_tenant   rate=10000r/d;
 ```
 
 #### Descriptor bindings
@@ -62,17 +244,16 @@ operator-meaningful compositions but pay for what they use.
 
 #### Named arguments
 
-| Argument                | Meaning                                                                                 |
-|-------------------------|-----------------------------------------------------------------------------------------|
-| `rate=Nr/{s,m,h}`       | **Required.** Rate; the unit-letter is informational, the actual window is `window=`.   |
-| `window=DURATION`       | Sliding-window length (default `60s`).                                                  |
-| `bucket=DURATION`       | Bucket granularity inside the window (default `1s`). Sub-second buckets are fine.       |
-| `mode=enforce`          | Default. Evaluate and reject on overflow.                                               |
-| `mode=dry_run`          | Evaluate, record the hit, never reject. Lets operators observe before enforcing.        |
-| `mode=disabled`         | Skip the rule entirely.                                                                 |
-| `dry_run`               | Bare flag; alias for `mode=dry_run`.                                                    |
-| `except_if=$variable`   | Skip this rule for requests where `$variable` resolves truthy. See "Predicates" below.  |
-| `domain=NAME`           | Domain bucket for the rule (defaults to `nginx`).                                       |
+| Argument                | Meaning                                                                                                                                    |
+|-------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
+| `rate=Nr/<unit>`        | **Required.** `N` requests per the period named by `<unit>`. `<unit>` is `s\|m\|h\|d` (1 second / 1 minute / 1 hour / 1 day) or any humantime duration like `30s`, `5m`, `2h30m`. Must be a positive integer. |
+| `bucket=DURATION`       | Bucket granularity inside the window (default `1s`; **does not** track the rate's period). Smaller buckets enforce more smoothly; larger buckets cost less memory and gossip traffic. For a rule like `rate=1r/h`, leaving the default keeps 3600 1-second buckets — raise `bucket=` to coarsen. |
+| `mode=enforce`          | Default. Evaluate and reject on overflow.                                                                                                  |
+| `mode=dry_run`          | Evaluate, record the hit, never reject. Lets operators observe before enforcing.                                                           |
+| `mode=disabled`         | Skip the rule entirely.                                                                                                                    |
+| `dry_run`               | Bare flag; alias for `mode=dry_run`.                                                                                                       |
+| `except_if=$variable`   | Skip this rule for requests where `$variable` resolves truthy. See "Predicates" below.                                                     |
+| `domain=NAME`           | Domain bucket for the rule (defaults to `nginx`). Must match `[A-Za-z_][A-Za-z0-9_.-]*`.                                                   |
 
 ### `gabion_limit NAME [NAME ...]` (http, server, location)
 
@@ -97,19 +278,37 @@ parent had it off.
 `gabion off` is the foolproof way to fully bypass a parent's rule stack
 in a sub-location.
 
+#### `gabion_limit off` vs `gabion off`
+
+The two `off` modes are deliberately distinct:
+
+- **`gabion_limit off`** keeps the access handler running and produces a
+  clean access-phase decision, but evaluates no rules at this scope.
+  Use this when you want a scoped opt-out from inherited rules while
+  preserving any future gabion machinery (metrics, headers) for the
+  location.
+- **`gabion off`** skips the access handler entirely — no rule lookup,
+  no SHM read. Use this when you want zero per-request cost (e.g.
+  `/static/`, `/healthz`).
+
+Both shapes are nginx-idiomatic (`limit_req off`, `auth_basic off`); see
+the layering example below for them side by side.
+
 ## Composition: layering rules
 
 Each rule is an independent gate. A request is allowed only if **every**
-rule allows it. Rejection from any enforcing rule rejects the request, with
+rule allows it. Rules evaluate in declaration order; the first enforcing
+reject wins. Rejection from any enforcing rule rejects the request, with
 `Retry-After` and the `X-RateLimit-*` triplet pinned to the rule with the
 longest window so the client doesn't immediately get re-rejected by a
-wider rule.
+wider rule. See [Fail-open invariant](#fail-open-invariant) for what
+happens when something else goes wrong.
 
 ```nginx
 http {
     gabion_limit_zone zone=api:128m;
-    gabion_limit_rule per_ip     $remote_addr           rate=100r/s window=1s;
-    gabion_limit_rule per_tenant tenant:$arg_tenant     rate=10r/s  window=1s;
+    gabion_limit_rule per_ip     $remote_addr           rate=100r/s;
+    gabion_limit_rule per_tenant tenant:$arg_tenant     rate=10r/s;
 
     server {
         gabion_limit per_ip per_tenant;     # baseline at server level
@@ -144,9 +343,9 @@ http {
         ~*facebook   fb;
     }
 
-    gabion_limit_rule per_ip  ip:$remote_addr     rate=50r/s window=1s except_if=$trusted_ip;
-    gabion_limit_rule per_bot class:$bot_class    rate=10r/s window=1s;
-    gabion_limit_rule per_uri $uri                rate=10r/s window=1s;
+    gabion_limit_rule per_ip  ip:$remote_addr     rate=50r/s except_if=$trusted_ip;
+    gabion_limit_rule per_bot class:$bot_class    rate=10r/s;
+    gabion_limit_rule per_uri $uri                rate=10r/s;
 
     server {
         listen 8080;
@@ -187,7 +386,7 @@ geo $trusted_ip {
     default 0;
     10.0.0.0/8 1;   # internal network bypasses this rule
 }
-gabion_limit_rule public_traffic $remote_addr rate=100r/s window=1s except_if=$trusted_ip;
+gabion_limit_rule public_traffic $remote_addr rate=100r/s except_if=$trusted_ip;
 ```
 
 Semantics worth knowing:
@@ -208,7 +407,7 @@ Semantics worth knowing:
 ## Dry-run mode
 
 ```nginx
-gabion_limit_rule canary $uri rate=10r/s window=1s dry_run;
+gabion_limit_rule canary $uri rate=10r/s dry_run;
 gabion_limit per_ip canary;     # canary stacks with per_ip but never rejects
 ```
 
@@ -238,6 +437,84 @@ The full list lives in `module.rs`; the common ones:
 | `gabion_gossip_target_err_bps N`            | Per-rule unreplicated-error budget in bps of the rule's limit (default 100 = 1 %). |
 | `gabion_gossip_min_emit_interval DURATION`  | Floor between threshold-fire emissions (default 5ms).                              |
 
+## Running across a cluster
+
+Beyond a single nginx box, gabion's value is shared counters. Three
+pieces of plumbing make a cluster:
+
+1. **Bind a gossip socket** so peers can talk to each other.
+   `gabion_gossip_bind ADDR:PORT` opens a UDP socket. UDP is intentional
+   — gabion's wire codec is self-describing and loss-tolerant; one
+   dropped frame just means counters re-converge on the next tick.
+
+2. **Pick a cluster identifier.** Every gabion process that should share
+   counters declares the same `gabion_gossip_cluster ID` (any non-zero
+   u128). Frames from peers with a mismatched cluster ID are dropped on
+   the floor — this is the cheap firewall against accidental
+   cross-cluster contamination.
+
+3. **Tell peers how to find each other.** The simplest production path
+   is Kubernetes EndpointSlice discovery: declare which namespaces and
+   service names to watch, and gabion picks up peer pods as they come
+   and go. No static peer list to maintain.
+
+   ```nginx
+   gabion_discovery_namespace_allow my-app-namespace;
+   gabion_discovery_service_allow   gabion-nginx;
+   gabion_discovery_service_allow   gabiond;          # if running mixed
+   ```
+
+   Each directive takes one name; repeat to allow multiple. Without any
+   `..._allow` directive, gabion falls back to the pod's own namespace.
+
+A complete cluster-side `http {}` block looks like:
+
+```nginx
+http {
+    gabion_limit_zone zone=api:128m;
+
+    gabion_limit_rule per_ip $remote_addr rate=100r/s;
+
+    gabion_gossip_bind 0.0.0.0:9000;
+    gabion_gossip_cluster 0xc0ffee;
+    gabion_gossip_fanout 6;                      # peers per tick; default 6
+
+    gabion_discovery_namespace_allow my-app;
+    gabion_discovery_service_allow   gabion-nginx;
+
+    server { listen 8080; location / { gabion_limit per_ip; } }
+}
+```
+
+Tuning the gossip cadence is rarely necessary — the defaults converge
+in well under a second at production scale. The settings that matter:
+
+| Directive                                   | When to touch it                                                                                                |
+|---------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| `gabion_gossip_fanout N`                    | How many peers each tick selects. Increase only if convergence is too slow at high cluster sizes (>50 peers).   |
+| `gabion_gossip_tick_interval DURATION`      | Cycle period (default `100ms`). Shorter = faster convergence, more UDP traffic. Lengthen at large fleet sizes.  |
+| `gabion_gossip_target_err_bps N`            | Threshold-fire budget in basis points of the rule's limit (default `100` = 1%). Lower = tighter accuracy, more emissions. |
+| `gabion_gossip_min_emit_interval DURATION`  | Floor between threshold-fires (default `5ms`). Raise when the gossip channel itself becomes the bottleneck.     |
+
+See `docs/Gossip Propagation Benchmarks.md` for measured convergence
+curves at different fanouts and cluster sizes.
+
+### Verifying the cluster has converged
+
+After deploy, check three things:
+
+1. **Process logs.** Each process logs the gossip bind, its derived
+   node identity, and the count of discovered peers. If a process logs
+   `discovered 0 peers`, the discovery filter is wrong (namespace or
+   service mismatch).
+2. **Counter delta under load.** Send traffic to one replica only;
+   counters on every other replica should rise within a tick or two.
+   If they don't, the gossip channel is partitioned (UDP firewall,
+   cluster-ID mismatch, or wrong `gabion_gossip_bind` reachability).
+3. **`gabiond` `/snapshot`** (server adapter only) returns the full
+   peer/cell view; a similar HTTP endpoint is on roadmap for the
+   nginx module.
+
 ## Configuration error messages
 
 Every `gabion_*` directive emits an operator-readable error at `nginx -t`
@@ -247,9 +524,35 @@ fix named. Examples:
 ```
 gabion: `gabion_limit_zone` argument must start with `zone=` (e.g. `zone=api:128m`)
 gabion: `gabion_limit_rule` rule `per_ip` is missing the required `rate=Nr/s` argument
-gabion: `gabion_limit_rule` argument `key=$uri` is invalid: expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, `mode=`, `dry_run`, `except_if=`, `domain=`
+gabion: `gabion_limit_rule` argument `key=$uri` is invalid: expected `$variable`, `name:$variable`, or one of `rate=`, `bucket=`, `mode=`, `dry_run`, `except_if=`, `domain=`
+gabion: `gabion_limit_rule` argument `rate=100r/fortnight` is invalid: rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`
+gabion: `gabion_limit_rule` rule `per_ip` is declared more than once; rule names must be unique within an http {} block
 gabion: `gabion_limit` references rule `tenant_api`, which is not declared via `gabion_limit_rule`
+gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a duration like `100ms` or `1s`
 ```
+
+## Troubleshooting
+
+One-line "you'll see this when / what to do" for the messages
+operators most commonly hit.
+
+| Symptom                                                                                                   | What it means                                                                                                                              | Fix                                                                                                                              |
+|-----------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| `nginx -t` says `unknown 'foo' variable`                                                                  | A `gabion_limit_rule` references a variable no loaded module defines.                                                                      | Load the providing module (`geoip2`, `map`, `geo`) before the gabion directive that references it.                               |
+| `gabion_limit references rule X, which is not declared`                                                   | A `gabion_limit X;` names a rule that has no `gabion_limit_rule X ...` declaration in the same `http {}` block.                            | Add the missing declaration or fix the name.                                                                                     |
+| `gabion_limit_rule rule X is declared more than once`                                                     | Two `gabion_limit_rule X ...` directives with the same name.                                                                               | Pick distinct names. The grammar is unambiguous; this is almost always a copy-paste bug.                                         |
+| `gabion_limit_rule argument 'rate=0r/s' is invalid`                                                       | Zero rate; would deny all traffic.                                                                                                         | Pick a non-zero positive integer. To temporarily disable a rule, use `mode=disabled` instead.                                    |
+| `gabion_gossip_cluster requires a non-zero cluster identifier`                                            | The cluster ID parses to `0`, which is almost certainly unintended.                                                                        | Pick any non-zero 128-bit value shared by every peer (`1`, `0xc0ffee`, a u128 literal).                                          |
+| `gabion: gabion_gossip_tick_interval rejected value 'notaduration': expected a duration like '100ms'`     | A tuning directive received a value it couldn't parse.                                                                                     | The error message names the directive and the expected format; supply a humantime duration (`100ms`, `5s`).                      |
+| Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`                                  | The client crossed a rule's limit.                                                                                                         | Expected behaviour. `Retry-After` says how long to back off.                                                                     |
+| `400 Bad Request` from gabion                                                                             | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits.                            | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
+| `gabion: ... matched rules cap exceeded` in nginx error log                                               | The location stacked more rules than `STORAGE_MAX_MATCHED_RULES` permits. **The request was allowed** (allow-by-default).                  | Reduce the number of rules applied at this location or split the location.                                                       |
+| `gabion: ... gossip background task has stopped` in error log                                             | The leader thread exited. Cluster-wide convergence stops; admission still runs locally.                                                    | Check earlier log lines for the underlying error. Restart the worker (or the pod) to re-elect a leader.                          |
+
+Operator-facing log lines all follow the three-question shape from
+`CLAUDE.md`: *what happened*, *why it's likely happening*, *what to do
+next*. Open an issue if you see one that doesn't end with a concrete
+next step.
 
 ## Unknown variable detection
 
@@ -330,7 +633,10 @@ configs.
 | Before                                                   | After                                                       |
 |----------------------------------------------------------|-------------------------------------------------------------|
 | `gabion_limit_zone NAME SIZE`                            | `gabion_limit_zone zone=NAME:SIZE`                          |
-| `gabion_limit_rule NAME 2r/m key=$uri window=60s`        | `gabion_limit_rule NAME $uri rate=2r/m window=60s`          |
+| `gabion_limit_rule NAME 2r/m key=$uri window=60s`        | `gabion_limit_rule NAME $uri rate=2r/m`                     |
+| `gabion_limit_rule NAME $uri rate=10r/s window=1s`       | `gabion_limit_rule NAME $uri rate=10r/s` (unit defines period) |
+| `gabion_limit_rule NAME $uri rate=10r/m window=30s`      | `gabion_limit_rule NAME $uri rate=10r/30s` (duration after `r/`) |
+| `bucket=` default of `1s`                                | `bucket=` defaults to the rate's window (single fixed-window bucket); set explicitly for sub-window granularity |
 | `key=tenant:$arg_tenant`                                 | `tenant:$arg_tenant` (positional)                           |
 | `gabion_limit foo` only                                  | `gabion_limit foo bar baz` / `gabion_limit off`             |
 | `gabion_gossip_discovery_namespace NS`                   | `gabion_discovery_namespace_allow NS`                       |

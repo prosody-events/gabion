@@ -12,7 +12,7 @@ anyhow.workspace = true
 arrayvec.workspace = true
 futures.workspace = true
 gabion.workspace = true
-humantime = { workspace = true, optional = true }
+humantime.workspace = true
 nginx-sys = { workspace = true, optional = true }
 ngx = { workspace = true, optional = true }
 thiserror.workspace = true
@@ -23,7 +23,7 @@ whoami.workspace = true
 
 [features]
 default = []
-ngx-module = ["dep:humantime", "dep:nginx-sys", "dep:ngx", "export-modules"]
+ngx-module = ["dep:nginx-sys", "dep:ngx", "export-modules"]
 export-modules = []
 
 [dev-dependencies]

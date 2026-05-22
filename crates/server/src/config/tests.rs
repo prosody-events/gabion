@@ -206,3 +206,79 @@ fn env_binding_names_use_single_underscores_only() {
         );
     }
 }
+
+#[test]
+fn duplicate_rule_names_are_rejected() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    limit: \
+         10\n    window: 1s\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip \
+         }]\n    limit: 5\n    window: 1s\n",
+    )
+    .expect("yaml parses");
+    let err = cfg.rule_table().expect_err("duplicate rules must error");
+    assert!(
+        matches!(err, ConfigError::DuplicateRule { ref name } if name == "per_ip"),
+        "expected DuplicateRule, got {err:?}",
+    );
+}
+
+#[test]
+fn zero_limit_is_rejected_in_yaml() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: doomed\n    domain: nginx\n    descriptors: [{ key: ip }]\n    limit: \
+         0\n    window: 1s\n",
+    )
+    .expect("yaml parses");
+    let err = cfg.rule_table().expect_err("zero limit must error");
+    assert!(
+        matches!(err, ConfigError::ZeroLimit { ref name } if name == "doomed"),
+        "expected ZeroLimit, got {err:?}",
+    );
+}
+
+#[test]
+fn invalid_descriptor_key_rejected_in_yaml() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: bad_key\n    domain: nginx\n    descriptors: [{ key: \"with space\" \
+         }]\n    limit: 10\n    window: 1s\n",
+    )
+    .expect("yaml parses");
+    let err = cfg
+        .rule_table()
+        .expect_err("invalid descriptor key must error");
+    assert!(
+        matches!(err, ConfigError::InvalidDescriptorKey { ref rule, .. } if rule == "bad_key"),
+        "expected InvalidDescriptorKey, got {err:?}",
+    );
+}
+
+#[test]
+fn bucket_defaults_to_window_when_omitted() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    limit: \
+         10\n    window: 60s\n",
+    )
+    .expect("yaml parses");
+    let table = cfg.rule_table().expect("rule table");
+    let spec = table.iter().next().expect("one rule").spec();
+    assert_eq!(spec.bucket_millis, 60_000);
+    assert_eq!(spec.live_buckets, 1);
+}
+
+#[test]
+fn explicit_bucket_overrides_window() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    limit: \
+         10\n    window: 60s\n    bucket: 1s\n",
+    )
+    .expect("yaml parses");
+    let table = cfg.rule_table().expect("rule table");
+    let spec = table.iter().next().expect("one rule").spec();
+    assert_eq!(spec.bucket_millis, 1_000);
+    assert_eq!(spec.live_buckets, 60);
+}

@@ -215,12 +215,18 @@ impl AppConfig {
     /// Construct the runtime [`RuleTable`]. Rule ids are assigned in
     /// declaration order starting at 1.
     pub fn rule_table(&self) -> Result<RuleTable, ConfigError> {
-        let rules = self
-            .limits
-            .iter()
-            .enumerate()
-            .map(|(i, limit)| limit.to_rule(i as RuleId + 1))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut rules = Vec::with_capacity(self.limits.len());
+        for (i, limit) in self.limits.iter().enumerate() {
+            if self.limits[..i]
+                .iter()
+                .any(|earlier| earlier.name == limit.name)
+            {
+                return Err(ConfigError::DuplicateRule {
+                    name: limit.name.to_string(),
+                });
+            }
+            rules.push(limit.to_rule(i as RuleId + 1)?);
+        }
         Ok(RuleTable::new(rules))
     }
 
@@ -401,8 +407,11 @@ pub struct LimitRuleConfig {
     pub limit: u64,
     #[serde(with = "humantime_serde")]
     pub window: Duration,
-    #[serde(with = "humantime_serde")]
-    pub bucket: Duration,
+    /// `bucket:` defaults to `window:` when omitted — one fixed-window
+    /// bucket per rule. Set explicitly for finer sliding-window
+    /// enforcement (e.g. `bucket: 1s` inside a `window: 60s` rule).
+    #[serde(default, with = "humantime_serde::option")]
+    pub bucket: Option<Duration>,
     #[serde(default)]
     pub mode: EnforcementModeConfig,
 }
@@ -412,6 +421,19 @@ impl LimitRuleConfig {
         if self.descriptors.is_empty() {
             return Err(ConfigError::EmptyDescriptorSet(self.name.to_string()));
         }
+        if self.limit == 0 {
+            return Err(ConfigError::ZeroLimit {
+                name: self.name.to_string(),
+            });
+        }
+        for descriptor in self.descriptors.iter() {
+            if !is_descriptor_key(&descriptor.key) {
+                return Err(ConfigError::InvalidDescriptorKey {
+                    rule: self.name.to_string(),
+                    key: descriptor.key.to_string(),
+                });
+            }
+        }
         let descriptors = self
             .descriptors
             .iter()
@@ -420,16 +442,26 @@ impl LimitRuleConfig {
                 value: d.value.clone(),
             })
             .collect();
+        let bucket = self.bucket.unwrap_or(self.window);
         Ok(Rule::new(
             id,
             self.domain.to_string(),
             descriptors,
             self.limit,
             duration_millis(self.window),
-            duration_millis(self.bucket),
+            duration_millis(bucket),
             self.mode.into(),
         ))
     }
+}
+
+/// Match a descriptor key against `[A-Za-z_][A-Za-z0-9_.-]*`. Mirrors the
+/// nginx adapter's `is_descriptor_key` so two nodes with the same logical
+/// rule produce identical descriptor identifiers.
+fn is_descriptor_key(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c == '.' || c == '-' || c.is_ascii_alphanumeric())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -470,6 +502,12 @@ pub enum ConfigError {
     Yaml(#[source] serde_yaml::Error),
     #[error("rule {0} has no descriptors")]
     EmptyDescriptorSet(String),
+    #[error("rule `{name}` is declared more than once; rule names must be unique")]
+    DuplicateRule { name: String },
+    #[error("rule `{name}` has `limit: 0`, which would deny all traffic")]
+    ZeroLimit { name: String },
+    #[error("rule `{rule}` descriptor key `{key}` must match `[A-Za-z_][A-Za-z0-9_.-]*`")]
+    InvalidDescriptorKey { rule: String, key: String },
     #[error("gossip.bind is required")]
     MissingGossipBind,
     #[error("environment variable {0} is not valid UTF-8")]

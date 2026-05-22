@@ -239,6 +239,140 @@ pub fn is_single_ident(s: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+/// Match a descriptor key against `[A-Za-z_][A-Za-z0-9_.-]*`. Identifier-
+/// like with `.` and `-` so operator-readable names (`tenant-id`,
+/// `app.tenant`) round-trip through the directive parser and the YAML
+/// adapter unchanged.
+pub fn is_descriptor_key(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c == '.' || c == '-' || c.is_ascii_alphanumeric())
+}
+
+/// Match an nginx-style zone name against `[A-Za-z0-9_]+`, the same shape
+/// nginx core's `limit_req_zone` imposes on its own zone names.
+pub fn is_zone_name(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// Match a Kubernetes DNS label per RFC 1123:
+/// `[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?`. Lower-case, 1–63 chars, must
+/// start and end with `[a-z0-9]`. Used for namespace / service allowlist
+/// arguments so a typo doesn't silently match nothing.
+pub fn is_dns_label(s: &str) -> bool {
+    let len = s.len();
+    if !(1..=63).contains(&len) {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let head_ok = bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit();
+    let tail_ok = bytes[len - 1].is_ascii_lowercase() || bytes[len - 1].is_ascii_digit();
+    if !head_ok || !tail_ok {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// Parse a `rate=` value into `(count, period)`.
+///
+/// The suffix after `r/` is either a single-letter unit (`s`, `m`, `h`,
+/// `d`) or a [humantime] duration (`30s`, `5m`, `2h30m`). Zero counts and
+/// zero periods are rejected at parse time so `cfg.limit.max(1)` is never
+/// load-bearing in downstream code.
+///
+/// [humantime]: https://docs.rs/humantime
+pub fn parse_rate(input: &str) -> Result<(u64, Duration), &'static str> {
+    let input = input.trim();
+    let Some((number, period)) = input.split_once("r/") else {
+        return Err(
+            "expected `rate=Nr/<unit>` where unit is `s|m|h|d` or a duration (e.g. `rate=100r/s`, \
+             `rate=10r/5m`)",
+        );
+    };
+    let count: u64 = number
+        .parse()
+        .map_err(|_| "rate count must be a non-negative integer (e.g. `rate=100r/s`)")?;
+    if count == 0 {
+        return Err("`rate=` must be a positive integer; zero would deny all traffic");
+    }
+    let duration = match period {
+        "s" => Duration::from_secs(1),
+        "m" => Duration::from_secs(60),
+        "h" => Duration::from_secs(60 * 60),
+        "d" => Duration::from_secs(60 * 60 * 24),
+        other => humantime::parse_duration(other).map_err(|_| {
+            "rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`"
+        })?,
+    };
+    if duration.is_zero() {
+        return Err("rate period must be greater than zero");
+    }
+    Ok((count, duration))
+}
+
+/// Parse a positional descriptor binding argument. Accepts:
+/// - `$uri` → key="uri", source="$uri" (auto-keyed; only when the source is a
+///   single legal `$identifier`)
+/// - `tenant:$http_x_tenant` → key="tenant", source="$http_x_tenant"
+/// - `combo:prefix-$asn-$ua` → key="combo", source="prefix-$asn-$ua" (template;
+///   compiled via `ngx_http_compile_complex_value` at config phase)
+///
+/// Templates (anything with literal text or multiple `$` substitutions)
+/// require the explicit `key:source` form — there's no useful auto-name
+/// to derive. Keys are validated against [`is_descriptor_key`] so spaces,
+/// punctuation, or anything else not matching `[A-Za-z_][A-Za-z0-9_.-]*`
+/// is rejected at parse time. Keys longer than the default
+/// `gabion_storage_max_key_bytes` are also rejected here so the error
+/// names the directive line (a second, authoritative check runs at
+/// compile time once any per-zone override takes effect).
+pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
+    if let Some(stripped) = rest.strip_prefix('$') {
+        if is_single_ident(stripped) {
+            if stripped.len() > defaults::STORAGE_MAX_KEY_BYTES {
+                return Err(
+                    "binding key exceeds the default `gabion_storage_max_key_bytes` budget; \
+                     tighten the key or raise the directive",
+                );
+            }
+            return Ok(DescriptorBinding {
+                key: stripped.into(),
+                source: rest.into(),
+            });
+        }
+        return Err(
+            "expected `$variable`, `name:$variable`, or one of `rate=`, `bucket=`, `mode=`, \
+             `dry_run`, `except_if=`, `domain=`",
+        );
+    }
+    let Some((key, source)) = rest.split_once(':') else {
+        return Err(
+            "expected `$variable`, `name:$variable`, or one of `rate=`, `bucket=`, `mode=`, \
+             `dry_run`, `except_if=`, `domain=`",
+        );
+    };
+    if !is_descriptor_key(key) {
+        return Err(
+            "binding key must match `[A-Za-z_][A-Za-z0-9_.-]*` (e.g. `tenant`, `app.tenant`, \
+             `tenant-id`)",
+        );
+    }
+    if source.is_empty() {
+        return Err("binding source after `:` is empty; supply a `$variable` or template");
+    }
+    if key.len() > defaults::STORAGE_MAX_KEY_BYTES {
+        return Err(
+            "binding key exceeds the default `gabion_storage_max_key_bytes` budget; tighten the \
+             key or raise the directive",
+        );
+    }
+    Ok(DescriptorBinding {
+        key: key.into(),
+        source: source.into(),
+    })
+}
+
 impl CompiledRules {
     /// Compile a list of `RuleConfig`s into a `RuleTable` + per-rule specs.
     /// Uses the default cardinality envelope and [`NopBindingCompiler`];
@@ -297,11 +431,14 @@ impl CompiledRules {
                     value: Box::from("*"),
                 })
                 .collect();
+            if cfg.limit == 0 {
+                return Err(RuleConfigError::ZeroLimit(cfg.name.to_string()));
+            }
             let rule = Rule::new(
                 id,
                 cfg.domain.to_string(),
                 descriptors,
-                cfg.limit.max(1),
+                cfg.limit,
                 duration_millis(cfg.window),
                 duration_millis(cfg.bucket),
                 cfg.mode,
@@ -385,6 +522,8 @@ pub enum RuleConfigError {
     EmptyBindings(String),
     #[error("rule {0} declares too many bindings")]
     TooManyBindings(String),
+    #[error("rule {0} has `rate=0`, which would deny all traffic")]
+    ZeroLimit(String),
     #[error("rule {rule} binding key '{key}' exceeds max_key_bytes")]
     KeyTooLong { rule: String, key: String },
     #[error(

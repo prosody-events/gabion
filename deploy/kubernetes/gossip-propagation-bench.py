@@ -174,17 +174,17 @@ data:
     }}
 
     http {{
-        gabion_limit_zone api 256m;
-        gabion_limit_rule uri_api {RULE_LIMIT}r/m key=$request_uri window=60s bucket=1s overflow=aggregate;
-        gabion_gossip_discovery kubernetes;
+        gabion_limit_zone zone=api:256m;
+        gabion_limit_rule uri_api $request_uri rate={RULE_LIMIT}r/m bucket=1s;
         gabion_gossip_bind 0.0.0.0:9000;
         gabion_gossip_cluster 1;
         gabion_gossip_fanout {FANOUT};
-        gabion_gossip_payload 64k;
-        gabion_gossip_max_cells 4096;
-        gabion_gossip_linger {LINGER_MS}ms;
-        gabion_gossip_endpoint_slice {NAMESPACE} gabiond gossip;
-        gabion_gossip_endpoint_slice {NAMESPACE} gabion-nginx gossip;
+        gabion_gossip_max_payload_bytes 65536;
+        gabion_gossip_max_cells_per_frame 4096;
+        gabion_gossip_tick_interval {LINGER_MS}ms;
+        gabion_discovery_namespace_allow {NAMESPACE};
+        gabion_discovery_service_allow gabiond;
+        gabion_discovery_service_allow gabion-nginx;
 
         server {{
             listen 8080;

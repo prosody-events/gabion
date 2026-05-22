@@ -87,8 +87,7 @@ create_configmaps() {
             -v target_err_bps="$GOSSIP_TARGET_ERR_BPS" \
             -v min_emit="$GOSSIP_MIN_EMIT_INTERVAL" '
                 /gabion_limit_rule tenant_dist / {
-                    sub(/tenant_dist [0-9]+r\/s/, "tenant_dist " budget "r/s")
-                    sub(/window=[^ ]+/, "window=" window)
+                    sub(/rate=[0-9]+r\/[^ ;]+/, "rate=" budget "r/" window)
                     sub(/bucket=[^ ;]+/, "bucket=" bucket)
                 }
                 /gabion_gossip_fanout [0-9]+;/ {
