@@ -12,7 +12,7 @@ use tokio::sync::watch;
 use tokio::task::LocalSet;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use gabion::crdt::CellStore;
+use gabion::crdt::{CellStore, RuleDescriptor};
 use gabion::discovery::{self, PeerDiscovery, PeerEvent};
 use gabion::gossip::GossipRuntime;
 
@@ -83,7 +83,8 @@ async fn run() -> anyhow::Result<()> {
     );
 
     let rule_table = Arc::new(config.rule_table()?);
-    let cell_store = CellStore::<u32>::new(config.cell_store_config(), identity);
+    let mut cell_store = CellStore::<u32>::new(config.cell_store_config(), identity);
+    register_rules(&mut cell_store, &rule_table);
     let counts = Arc::new(DashMapStore::<u32>::with_capacity(
         config.storage.max_cells.unwrap_or(4096),
     ));
@@ -276,6 +277,19 @@ async fn run() -> anyhow::Result<()> {
     tracing::info!("Gabion shut down cleanly.");
 
     early_exit
+}
+
+fn register_rules(cell_store: &mut CellStore<u32>, rule_table: &gabion::rules::RuleTable) {
+    for rule in rule_table.iter() {
+        let _ = cell_store.intern_rule(RuleDescriptor {
+            fingerprint: rule.fingerprint,
+            window_millis: rule.window_millis.min(u32::MAX as u64) as u32,
+            bucket_millis: rule.bucket_millis.min(u32::MAX as u64) as u32,
+            limit: rule.limit,
+            flags: 0,
+            local_rule_id: rule.id,
+        });
+    }
 }
 
 fn discovery_stream(

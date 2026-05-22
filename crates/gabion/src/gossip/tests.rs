@@ -6,7 +6,7 @@
 //! ensure the production transport doesn't bit-rot.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,8 +19,11 @@ use crate::crdt::{
     BucketEpoch, CellStore, CellStoreConfig, Count, DeltaSink, ExpirationSink, KeyHash, NodeId,
     NodeIdentity, RuleDescriptor,
 };
+use crate::discovery::{Peer, PeerEvent};
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
 use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, UdpTransport};
+use crate::wire::HmacKey;
+use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
 
 // -- in-memory aggregate store ----------------------------------------------
 
@@ -46,6 +49,14 @@ impl<C: Count> InMemoryAggregateStore<C> {
 
     pub fn apply_call_lens(&self) -> Vec<(usize, usize)> {
         self.apply_calls.borrow().clone()
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<(u128, u128, BucketEpoch), u64> {
+        self.inner
+            .borrow()
+            .iter()
+            .map(|((rule, key, bucket), count)| ((*rule, key.0, *bucket), *count))
+            .collect()
     }
 }
 
@@ -96,6 +107,633 @@ fn sim_config(identity: NodeIdentity, peers: Vec<SocketAddr>, seed: u64) -> Goss
         rng_seed: seed,
         ..GossipConfig::default()
     }
+}
+
+fn quickcheck_tests() -> u64 {
+    std::env::var("QUICKCHECK_TESTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100)
+}
+
+fn quickcheck_max_nodes() -> u16 {
+    std::env::var("GOSSIP_QUICKCHECK_MAX_NODES")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .map(|n| n.clamp(1, 1024))
+        .unwrap_or(32)
+}
+
+fn run_paused<F, R>(f: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = LocalSet::new();
+    rt.block_on(local.run_until(f))
+}
+
+#[derive(Clone, Debug)]
+struct SimRecord {
+    node: u16,
+    rule: u8,
+    key: u8,
+    hits: u8,
+}
+
+impl Arbitrary for SimRecord {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            node: u16::arbitrary(g),
+            rule: u8::arbitrary(g) % 3,
+            key: u8::arbitrary(g) % 8,
+            hits: (u8::arbitrary(g) % 20) + 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConnectedClusterCase {
+    nodes: u16,
+    fanout: u16,
+    peer_degree: u16,
+    records: Vec<SimRecord>,
+    drop_first: u8,
+}
+
+impl Arbitrary for ConnectedClusterCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let max_nodes = quickcheck_max_nodes();
+        let nodes = (u16::arbitrary(g) % max_nodes) + 1;
+        let max_records = 32;
+        let len = usize::arbitrary(g) % max_records;
+        Self {
+            nodes,
+            fanout: if nodes == 1 {
+                0
+            } else {
+                (u16::arbitrary(g) % (nodes - 1)) + 1
+            },
+            peer_degree: (u16::arbitrary(g) % 7) + 4,
+            records: (0..len).map(|_| SimRecord::arbitrary(g)).collect(),
+            drop_first: u8::arbitrary(g) % 4,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PartitionCase {
+    records: Vec<SimRecord>,
+    heal_after_ticks: u8,
+}
+
+impl Arbitrary for PartitionCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = usize::arbitrary(g) % 32;
+        Self {
+            records: (0..len).map(|_| SimRecord::arbitrary(g)).collect(),
+            heal_after_ticks: (u8::arbitrary(g) % 8) + 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AuthCase {
+    matching_keys: bool,
+    a_hits: u8,
+    b_hits: u8,
+}
+
+impl Arbitrary for AuthCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            matching_keys: bool::arbitrary(g),
+            a_hits: (u8::arbitrary(g) % 20) + 1,
+            b_hits: (u8::arbitrary(g) % 20) + 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExpirationCase {
+    nodes: u16,
+    records: Vec<SimRecord>,
+}
+
+impl Arbitrary for ExpirationCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let nodes = (u16::arbitrary(g) % 15) + 2;
+        let len = (usize::arbitrary(g) % 32) + 1;
+        Self {
+            nodes,
+            records: (0..len).map(|_| SimRecord::arbitrary(g)).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MembershipCase {
+    remove_after_add: bool,
+    hits: u8,
+}
+
+impl Arbitrary for MembershipCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            remove_after_add: bool::arbitrary(g),
+            hits: (u8::arbitrary(g) % 20) + 1,
+        }
+    }
+}
+
+fn rule_fp(rule: u8) -> u128 {
+    0xABC0 + rule as u128
+}
+
+fn key_hash(key: u8) -> KeyHash {
+    KeyHash(0x1000 + key as u128)
+}
+
+fn expected_model(records: &[SimRecord], nodes: usize) -> BTreeMap<(u128, u128, BucketEpoch), u64> {
+    let mut model = BTreeMap::new();
+    for record in records {
+        let node = record.node as usize % nodes;
+        let _origin = node;
+        let key = (rule_fp(record.rule), key_hash(record.key).0, 0);
+        *model.entry(key).or_insert(0) += record.hits as u64;
+    }
+    model
+}
+
+fn store_for_expiring_rule(identity: NodeIdentity) -> CellStore<u32> {
+    let mut store = store_for(identity);
+    for rule in 0..3 {
+        store
+            .intern_rule(RuleDescriptor {
+                fingerprint: rule_fp(rule),
+                window_millis: 100,
+                bucket_millis: 100,
+                limit: 1_000,
+                flags: 0,
+                local_rule_id: rule as u32,
+            })
+            .unwrap();
+    }
+    store
+}
+
+fn store_for_property_rules(identity: NodeIdentity, node_capacity: u16) -> CellStore<u32> {
+    let mut store = CellStore::<u32>::new(
+        CellStoreConfig {
+            cell_capacity: 512,
+            rule_dictionary_capacity: 8,
+            node_dictionary_capacity: node_capacity.max(8),
+            local_dirty_capacity: 512,
+            forwarded_dirty_capacity: 512,
+            peer_capacity: 32,
+        },
+        identity,
+    );
+    for rule in 0..3 {
+        store
+            .intern_rule(RuleDescriptor {
+                fingerprint: rule_fp(rule),
+                window_millis: 3_600_000,
+                bucket_millis: 100,
+                limit: 1_000_000,
+                flags: 0,
+                local_rule_id: rule as u32,
+            })
+            .unwrap();
+    }
+    store
+}
+
+fn overlay_peers(addrs: &[SocketAddr], index: usize, degree: usize) -> Vec<SocketAddr> {
+    let nodes = addrs.len();
+    if nodes <= 1 {
+        return Vec::new();
+    }
+    let degree = degree.min((nodes - 1).ilog2() as usize + 1).max(1);
+    let mut peers = Vec::with_capacity(degree * 2);
+    let mut offset = 1_usize;
+    for _ in 0..degree {
+        peers.push(addrs[(index + offset) % nodes]);
+        peers.push(addrs[(index + nodes - (offset % nodes)) % nodes]);
+        offset = (offset * 2).min(nodes - 1);
+    }
+    peers.sort_unstable();
+    peers.dedup();
+    peers
+}
+
+async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
+    let nodes = case.nodes as usize;
+    if case.records.is_empty() {
+        return TestResult::discard();
+    }
+
+    let router = SimRouter::with_channel_capacity(256);
+    let addrs: Vec<SocketAddr> = (0..nodes).map(|i| sock(41_000 + i as u16)).collect();
+    if nodes > 1 {
+        for i in 0..nodes {
+            if case.drop_first == 0 {
+                continue;
+            }
+            let dst = (i + 1) % nodes;
+            router.set_link_policy(
+                addrs[i],
+                addrs[dst],
+                LinkPolicy::DropFirst {
+                    count: case.drop_first as u32,
+                },
+            );
+        }
+    }
+
+    let mut clients = Vec::with_capacity(nodes);
+    let mut handles = Vec::with_capacity(nodes);
+    let mut aggregates = Vec::with_capacity(nodes);
+    let peer_degree = case.peer_degree as usize;
+    let node_capacity =
+        ((case.records.len() + 1).next_power_of_two().max(8)).min(u16::MAX as usize) as u16;
+    for i in 0..nodes {
+        let identity = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
+        let peers = overlay_peers(&addrs, i, peer_degree);
+        let mut cfg = sim_config(identity, peers, 0xBAD5_EED0 + i as u64);
+        cfg.fanout = (case.fanout as usize).min(nodes.saturating_sub(1));
+        cfg.max_cells_per_tick = 128;
+        cfg.send_queue_capacity = 128;
+        let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let (rt, client) = GossipRuntime::from_parts(
+            router.bind(addrs[i]),
+            TokioClock::from_millis(0),
+            cfg,
+            store_for_property_rules(identity, node_capacity),
+            agg.clone(),
+        );
+        handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+        clients.push(client);
+        aggregates.push(agg);
+    }
+
+    for record in &case.records {
+        let node = record.node as usize % nodes;
+        if clients[node]
+            .record(
+                rule_fp(record.rule),
+                key_hash(record.key),
+                0,
+                record.hits as u64,
+                0,
+            )
+            .await
+            .is_err()
+        {
+            return TestResult::failed();
+        }
+    }
+
+    let ticks = if nodes == 1 { 1 } else { 160 };
+    sim_advance_ticks(Duration::from_millis(100), ticks).await;
+
+    let expected = expected_model(&case.records, nodes);
+    let passed = aggregates.iter().all(|agg| agg.snapshot() == expected);
+    if !passed {
+        let mismatches = aggregates
+            .iter()
+            .enumerate()
+            .filter(|(_, agg)| agg.snapshot() != expected)
+            .take(5)
+            .map(|(i, agg)| (i, agg.snapshot()))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "connected gossip case failed: case={case:?}, expected={expected:?}, \
+             mismatches={mismatches:?}"
+        );
+    }
+
+    for client in clients {
+        let _ = client.shutdown().await;
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    TestResult::from_bool(passed)
+}
+
+#[test]
+fn quickcheck_sim_connected_clusters_converge_after_finite_loss() {
+    fn property(case: ConnectedClusterCase) -> TestResult {
+        run_paused(run_connected_case(case))
+    }
+
+    QuickCheck::new()
+        .tests(quickcheck_tests())
+        .quickcheck(property as fn(ConnectedClusterCase) -> TestResult);
+}
+
+#[test]
+fn quickcheck_sim_partition_heals_without_overcount() {
+    fn property(mut case: PartitionCase) -> TestResult {
+        run_paused(async move {
+            const NODES: usize = 8;
+            if case.records.is_empty() {
+                return TestResult::discard();
+            }
+            for record in &mut case.records {
+                record.node %= NODES as u16;
+            }
+
+            let router = SimRouter::with_channel_capacity(128);
+            let addrs: Vec<_> = (0..NODES).map(|i| sock(42_000 + i as u16)).collect();
+            for left in 0..4 {
+                for right in 4..8 {
+                    router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Block);
+                    router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Block);
+                }
+            }
+
+            let mut clients = Vec::with_capacity(NODES);
+            let mut handles = Vec::with_capacity(NODES);
+            let mut aggregates = Vec::with_capacity(NODES);
+            for i in 0..NODES {
+                let identity = NodeIdentity::new(NodeId(0xB000 + i as u128), 1);
+                let peers: Vec<_> = addrs
+                    .iter()
+                    .copied()
+                    .filter(|addr| *addr != addrs[i])
+                    .collect();
+                let mut cfg = sim_config(identity, peers, 0xC0FF_EE00 + i as u64);
+                cfg.fanout = 4;
+                cfg.max_cells_per_tick = 32;
+                let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+                let (rt, client) = GossipRuntime::from_parts(
+                    router.bind(addrs[i]),
+                    TokioClock::from_millis(0),
+                    cfg,
+                    store_for(identity),
+                    agg.clone(),
+                );
+                handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+                clients.push(client);
+                aggregates.push(agg);
+            }
+
+            for record in &case.records {
+                let node = record.node as usize % NODES;
+                clients[node]
+                    .record(
+                        rule_fp(record.rule),
+                        key_hash(record.key),
+                        0,
+                        record.hits as u64,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            sim_advance_ticks(Duration::from_millis(100), case.heal_after_ticks as u32).await;
+            let global = expected_model(&case.records, NODES);
+            let no_overcount = aggregates.iter().all(|agg| {
+                agg.snapshot()
+                    .iter()
+                    .all(|(key, count)| *count <= *global.get(key).unwrap_or(&0))
+            });
+
+            for left in 0..4 {
+                for right in 4..8 {
+                    router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Pass);
+                    router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Pass);
+                }
+            }
+            sim_advance_ticks(Duration::from_millis(100), 120).await;
+            let converged = aggregates.iter().all(|agg| agg.snapshot() == global);
+
+            for client in clients {
+                let _ = client.shutdown().await;
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+            TestResult::from_bool(no_overcount && converged)
+        })
+    }
+
+    QuickCheck::new()
+        .tests(quickcheck_tests())
+        .quickcheck(property as fn(PartitionCase) -> TestResult);
+}
+
+#[test]
+fn quickcheck_sim_authentication_admits_only_matching_keys() {
+    fn property(case: AuthCase) -> TestResult {
+        run_paused(async move {
+            let router = SimRouter::new();
+            let addr_a = sock(43_000);
+            let addr_b = sock(43_001);
+            let id_a = NodeIdentity::new(NodeId(0xCA), 1);
+            let id_b = NodeIdentity::new(NodeId(0xCB), 1);
+            let key_a = HmacKey([7; 32]);
+            let key_b = if case.matching_keys {
+                HmacKey([7; 32])
+            } else {
+                HmacKey([8; 32])
+            };
+
+            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+            cfg_a.auth_key = Some(key_a);
+            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+            cfg_b.auth_key = Some(key_b);
+            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt_a, client_a) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                cfg_a,
+                store_for(id_a),
+                agg_a.clone(),
+            );
+            let (rt_b, client_b) = GossipRuntime::from_parts(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                cfg_b,
+                store_for(id_b),
+                agg_b.clone(),
+            );
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+
+            client_a
+                .record(0xD00D, KeyHash(1), 0, case.a_hits as u64, 0)
+                .await
+                .unwrap();
+            client_b
+                .record(0xD00D, KeyHash(1), 0, case.b_hits as u64, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 20).await;
+
+            let sum_a = agg_a.inner.borrow().values().copied().sum::<u64>();
+            let sum_b = agg_b.inner.borrow().values().copied().sum::<u64>();
+            let expected = if case.matching_keys {
+                (
+                    case.a_hits as u64 + case.b_hits as u64,
+                    case.a_hits as u64 + case.b_hits as u64,
+                )
+            } else {
+                (case.a_hits as u64, case.b_hits as u64)
+            };
+
+            client_a.shutdown().await.unwrap();
+            client_b.shutdown().await.unwrap();
+            let _ = h_a.await;
+            let _ = h_b.await;
+
+            TestResult::from_bool((sum_a, sum_b) == expected)
+        })
+    }
+
+    QuickCheck::new()
+        .tests(quickcheck_tests())
+        .quickcheck(property as fn(AuthCase) -> TestResult);
+}
+
+#[test]
+fn quickcheck_sim_tick_expiration_removes_converged_cells() {
+    fn property(case: ExpirationCase) -> TestResult {
+        run_paused(async move {
+            let nodes = case.nodes as usize;
+            let router = SimRouter::with_channel_capacity(128);
+            let addrs: Vec<_> = (0..nodes).map(|i| sock(44_000 + i as u16)).collect();
+            let mut clients = Vec::with_capacity(nodes);
+            let mut handles = Vec::with_capacity(nodes);
+            let mut aggregates = Vec::with_capacity(nodes);
+
+            for i in 0..nodes {
+                let identity = NodeIdentity::new(NodeId(0xE000 + i as u128), 1);
+                let peers: Vec<_> = addrs
+                    .iter()
+                    .copied()
+                    .filter(|addr| *addr != addrs[i])
+                    .collect();
+                let mut cfg = sim_config(identity, peers, 0xEED0 + i as u64);
+                cfg.fanout = nodes.saturating_sub(1).min(8).max(1);
+                cfg.max_cells_per_tick = 32;
+                let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+                let (rt, client) = GossipRuntime::from_parts(
+                    router.bind(addrs[i]),
+                    TokioClock::from_millis(0),
+                    cfg,
+                    store_for_expiring_rule(identity),
+                    agg.clone(),
+                );
+                handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+                clients.push(client);
+                aggregates.push(agg);
+            }
+
+            for record in &case.records {
+                let node = record.node as usize % nodes;
+                clients[node]
+                    .record(
+                        rule_fp(record.rule),
+                        key_hash(record.key),
+                        0,
+                        record.hits as u64,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            sim_advance_ticks(Duration::from_millis(100), 8).await;
+            let expired_everywhere = aggregates.iter().all(|agg| agg.snapshot().is_empty());
+
+            for client in clients {
+                let _ = client.shutdown().await;
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+            TestResult::from_bool(expired_everywhere)
+        })
+    }
+
+    QuickCheck::new()
+        .tests(quickcheck_tests())
+        .quickcheck(property as fn(ExpirationCase) -> TestResult);
+}
+
+#[test]
+fn quickcheck_sim_peer_membership_controls_delivery() {
+    fn property(case: MembershipCase) -> TestResult {
+        run_paused(async move {
+            let router = SimRouter::new();
+            let addr_a = sock(45_000);
+            let addr_b = sock(45_001);
+            let id_a = NodeIdentity::new(NodeId(0xFA), 1);
+            let id_b = NodeIdentity::new(NodeId(0xFB), 1);
+
+            let events = if case.remove_after_add {
+                vec![
+                    PeerEvent::Added(Peer::new(addr_b)),
+                    PeerEvent::Removed(Peer::new(addr_b)),
+                ]
+            } else {
+                vec![PeerEvent::Added(Peer::new(addr_b))]
+            };
+
+            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt_a, client_a) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                sim_config(id_a, Vec::new(), 1),
+                store_for(id_a),
+                agg_a.clone(),
+            );
+            let (rt_b, client_b) = GossipRuntime::from_parts(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                sim_config(id_b, Vec::new(), 2),
+                store_for(id_b),
+                agg_b.clone(),
+            );
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::iter(events)));
+            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+
+            tokio::task::yield_now().await;
+            client_a
+                .record(0xFACE, KeyHash(1), 0, case.hits as u64, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 20).await;
+
+            let got_b = agg_b.inner.borrow().values().copied().sum::<u64>();
+            let expected_b = if case.remove_after_add {
+                0
+            } else {
+                case.hits as u64
+            };
+
+            client_a.shutdown().await.unwrap();
+            client_b.shutdown().await.unwrap();
+            let _ = h_a.await;
+            let _ = h_b.await;
+            TestResult::from_bool(got_b == expected_b)
+        })
+    }
+
+    QuickCheck::new()
+        .tests(quickcheck_tests())
+        .quickcheck(property as fn(MembershipCase) -> TestResult);
 }
 
 // -- migrated tests ---------------------------------------------------------
@@ -781,12 +1419,17 @@ async fn udp_round_trip_smoke() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
+            let now_millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let bucket = (now_millis / 1_000) as BucketEpoch;
             client_a
-                .record(0xC0FE, KeyHash(0xABCD), 0, 3, 1_000)
+                .record(0xC0FE, KeyHash(0xABCD), bucket, 3, now_millis)
                 .await
                 .unwrap();
             client_b
-                .record(0xC0FE, KeyHash(0xABCD), 0, 5, 1_000)
+                .record(0xC0FE, KeyHash(0xABCD), bucket, 5, now_millis)
                 .await
                 .unwrap();
 

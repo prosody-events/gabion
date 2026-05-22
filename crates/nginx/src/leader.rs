@@ -16,7 +16,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
-use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeIdentity};
+use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeIdentity, RuleDescriptor};
 use gabion::defaults;
 use gabion::discovery::{self, DiscoveryConfig, PeerDiscovery, PeerEvent};
 use gabion::gossip::{AdminCommand, GossipClient, GossipConfig, GossipError, GossipRuntime};
@@ -242,7 +242,8 @@ async fn leader_main(
     let node_id = shm.header().identity.load_node_id();
     let identity = NodeIdentity::new(gabion::crdt::NodeId(node_id), new_incarnation);
 
-    let cell_store = CellStore::<u32>::new(config.cell_store, identity);
+    let mut cell_store = CellStore::<u32>::new(config.cell_store, identity);
+    register_rules(&mut cell_store, &rules);
     // SAFETY: `ShmAggregateStore::new`'s preconditions (see its `# Safety`
     // doc) are upheld:
     // * `shm.aggregate_slots_ptr()` returns the address of slot 0 of the aggregate
@@ -335,6 +336,20 @@ fn discovery_stream(cfg: DiscoveryConfig) -> impl futures::Stream<Item = PeerEve
                 }
             }
         })
+}
+
+fn register_rules(cell_store: &mut CellStore<u32>, rules: &CompiledRules) {
+    for compiled in rules.rules() {
+        let spec = compiled.spec;
+        let _ = cell_store.intern_rule(RuleDescriptor {
+            fingerprint: spec.fingerprint,
+            window_millis: spec.window_millis.min(u32::MAX as u64) as u32,
+            bucket_millis: spec.bucket_millis.min(u32::MAX as u64) as u32,
+            limit: spec.limit,
+            flags: 0,
+            local_rule_id: spec.id,
+        });
+    }
 }
 
 async fn drain_loop(

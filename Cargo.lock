@@ -899,7 +899,6 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "async-stream",
- "axum",
  "bon",
  "criterion",
  "educe",
@@ -907,7 +906,6 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "hmac",
- "humantime-serde",
  "k8s-openapi",
  "kube",
  "quickcheck",
@@ -921,6 +919,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gabion-loader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "envoy-types",
+ "futures",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "gabion-nginx"
 version = "0.1.0"
 dependencies = [
@@ -929,7 +938,6 @@ dependencies = [
  "futures",
  "gabion",
  "humantime",
- "humantime-serde",
  "nginx-sys",
  "ngx",
  "quickcheck",

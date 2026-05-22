@@ -229,13 +229,12 @@ fn collect_matching_specs(
 /// Delta-seconds the client should wait before retrying. Emitted as
 /// `Retry-After` (RFC 7231 §7.1.3).
 ///
-/// Under a sliding window, a hit recorded "now" stays in the window
-/// until `now + window_millis`. The safest answer — and the one least
+/// Under the fixed-window configuration, a rejected hit may still be visible
+/// until the next full window boundary. The safest answer — and the one least
 /// likely to send the client into another 429 — is the full window in
-/// seconds. We deliberately don't emit "seconds until the next bucket
-/// boundary" (often ~1s): under sliding windows that number is
-/// misleading because the rejected client's earlier hits are still
-/// counted at the next boundary.
+/// seconds. We deliberately don't emit "seconds until the next small bucket
+/// boundary": if bucket granularity is configured below the user-facing
+/// window, that number is misleading for clients.
 pub fn retry_after_seconds(info: RejectInfo) -> u64 {
     info.spec.window_millis.div_ceil(1_000).max(1)
 }

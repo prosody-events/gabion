@@ -9,7 +9,7 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use tokio::task::LocalSet;
 
-use gabion::crdt::{CellStore, CellStoreConfig, NodeId, NodeIdentity};
+use gabion::crdt::{CellStore, CellStoreConfig, NodeId, NodeIdentity, RuleDescriptor};
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{GossipConfig, GossipRuntime, TokioClock};
 use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleTable};
@@ -51,7 +51,16 @@ async fn harness(max_descriptor_bytes: usize, limit: u64) -> Harness {
     let addr = next_test_addr();
     let transport = router.bind(addr);
     let identity = NodeIdentity::new(NodeId(0xAA00), 1);
-    let store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
+    let rule = rule_tenant(limit);
+    let mut store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
+    store.intern_rule(RuleDescriptor {
+        fingerprint: rule.fingerprint,
+        window_millis: rule.window_millis as u32,
+        bucket_millis: rule.bucket_millis as u32,
+        limit: rule.limit,
+        flags: 0,
+        local_rule_id: rule.id,
+    });
     let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
 
     let gossip_config = GossipConfig {
@@ -69,7 +78,7 @@ async fn harness(max_descriptor_bytes: usize, limit: u64) -> Harness {
     );
     let gossip_handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
-    let rule_table = Arc::new(RuleTable::new(vec![rule_tenant(limit)]));
+    let rule_table = Arc::new(RuleTable::new(vec![rule]));
     let cardinality_limits = CardinalityLimits {
         max_descriptor_count: 16,
         max_descriptor_bytes,

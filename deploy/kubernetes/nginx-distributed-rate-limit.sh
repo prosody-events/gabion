@@ -14,6 +14,8 @@
 #   DURATION_S          sustained measurement seconds (default 60)
 #   WARMUP_S            unmeasured warm-up seconds (default 5)
 #   KEEP_NAMESPACE=1    leave the ephemeral namespace behind for debug
+#   BACKEND=nginx       run nginx/curl path (default)
+#   BACKEND=gabiond     run gabiond/gRPC path
 #
 # The script refuses to run outside the local orbstack context so it
 # never touches a shared cluster.
@@ -22,6 +24,15 @@ set -eu
 
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$repo_root"
+
+: "${BACKEND:=nginx}"
+if [ "$BACKEND" = "gabiond" ]; then
+    exec sh ./deploy/kubernetes/gabiond-distributed-rate-limit.sh
+fi
+if [ "$BACKEND" != "nginx" ]; then
+    printf '%s\n' "unknown BACKEND='$BACKEND' (expected nginx or gabiond)" >&2
+    exit 1
+fi
 
 context="$(kubectl config current-context)"
 server="$(kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}')"
@@ -67,15 +78,14 @@ trap cleanup EXIT
 #   nginx pods themselves drop cells locally.
 docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
 docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
+docker build -f deploy/kubernetes/loader.Dockerfile -t gabion-loader:local .
 
 kubectl create namespace "$namespace"
 
-# nginx conf override + loader source + gabiond config go in via
+# nginx conf override + gabiond config go in via
 # ConfigMaps so we don't need to rebuild images to vary test parameters.
 kubectl -n "$namespace" create configmap nginx-conf \
     --from-file=nginx.conf=deploy/nginx/nginx.distributed.conf
-kubectl -n "$namespace" create configmap loader \
-    --from-file=loader.py=deploy/kubernetes/distributed-rate-limit-loader.py
 
 # gabiond config. Storage + gossip settings deliberately omitted so the
 # server uses its built-in defaults (see crates/server/src/config.rs) —
@@ -88,6 +98,16 @@ gossip:
   bind: 0.0.0.0:9000
 discovery:
   namespace_whitelist: ["$namespace"]
+limits:
+  - name: tenant_dist
+    domain: nginx
+    descriptors:
+      - key: tenant
+        value: "*"
+    limit: ${BUDGET_PER_TENANT}
+    window: 1s
+    bucket: 1s
+    mode: enforce
 YAML
 
 # RBAC + Deployment + Services. Same shape as nginx-scale-rate-limit.sh:
@@ -180,7 +200,7 @@ spec:
   # Headless: the EndpointSlice the discovery watches lists each replica's
   # pod IP directly, which is what gossip needs in order to address peers
   # individually. The port name + protocol below are load-bearing — the
-  # discovery filter is `name == "gabion" && protocol == "UDP"`
+  # discovery filter is 'name == "gabion" && protocol == "UDP"'
   # (crates/gabion/src/discovery/kubernetes.rs:311-313).
   clusterIP: None
   selector:
@@ -241,11 +261,11 @@ spec:
             name: gabiond-config
 ---
 # gabiond Service. Two pieces:
-#   - the `gabion` UDP port satisfies the same discovery filter as the
+#   - the 'gabion' UDP port satisfies the same discovery filter as the
 #     headless nginx service above, so the EndpointSlice for this
 #     Service contributes the gabiond pod's IP into the gossip mesh
 #     alongside the nginx pods.
-#   - the `admin` TCP port exposes /snapshot for diagnostics; the test
+#   - the 'admin' TCP port exposes /snapshot for diagnostics; the test
 #     port-forwards to it to read CellStoreStats after the load run.
 apiVersion: v1
 kind: Service
@@ -307,8 +327,7 @@ wait_for_endpoint_count "$POD_COUNT"
 printf '\nletting gossip converge for 15s…\n'
 sleep 15
 
-# In-cluster Job loader. Mounts the loader script from a ConfigMap and
-# uses a minimal python:3.11-alpine image (small, stdlib-only deps).
+# In-cluster Job loader.
 printf '\nlaunching in-cluster loader (target %s tenants × %s r/s for %ss after %ss warm-up)…\n' \
     "$TENANTS" "$RPS_PER_TENANT" "$DURATION_S" "$WARMUP_S"
 
@@ -326,11 +345,13 @@ spec:
       restartPolicy: Never
       containers:
         - name: loader
-          image: python:3.11-alpine
-          command: ["python3", "/loader/loader.py"]
+          image: gabion-loader:local
+          imagePullPolicy: Never
           env:
+            - name: BACKEND
+              value: "http"
             - name: TARGET_URL
-              value: "http://gabion-nginx:8080/tenant/index.html"
+              value: "http://gabion-nginx:8080/tenant/index.html?tenant={tenant}"
             - name: TENANTS
               value: "${TENANTS}"
             - name: RPS_PER_TENANT
@@ -341,9 +362,10 @@ spec:
               value: "${DURATION_S}"
             - name: WARMUP_S
               value: "${WARMUP_S}"
-          volumeMounts:
-            - name: loader
-              mountPath: /loader
+            - name: WINDOW_MS
+              value: "1000"
+            - name: ALIGN_WINDOW
+              value: "1"
           resources:
             requests:
               cpu: "500m"
@@ -351,10 +373,6 @@ spec:
             limits:
               cpu: "2000m"
               memory: "512Mi"
-      volumes:
-        - name: loader
-          configMap:
-            name: loader
 YAML
 
 # Wait for the loader to complete. Timeout is generous: warmup +
@@ -410,7 +428,7 @@ trap 'kill "$admin_pf_pid" 2>/dev/null || true; cleanup' EXIT
 # Wait for the port-forward to come up so the first curl doesn't race it.
 attempts=0
 while [ "$attempts" -lt 30 ]; do
-    if curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot"; then
+    if curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot" 2>/dev/null; then
         break
     fi
     attempts=$((attempts + 1))
@@ -441,6 +459,7 @@ else
     cat "$admin_pf_log" >&2 || true
 fi
 kill "$admin_pf_pid" 2>/dev/null || true
+wait "$admin_pf_pid" 2>/dev/null || true
 admin_pf_pid=""
 
 # Cluster overview at the end. Skim a few pod logs for gabion lines.

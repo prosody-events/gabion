@@ -74,6 +74,9 @@ impl<C: Count> DashMapStore<C> {
 impl<C: Count> AggregateStore<C> for DashMapStore<C> {
     fn apply(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>) {
         for i in 0..deltas.len() {
+            if deltas.applies_locally[i] == 0 {
+                continue;
+            }
             let key = &deltas.keys[i];
             let v: u64 = deltas.deltas[i].into();
             if v == 0 {
@@ -86,6 +89,9 @@ impl<C: Count> AggregateStore<C> for DashMapStore<C> {
             *entry = entry.saturating_add(v);
         }
         for i in 0..expirations.len() {
+            if expirations.applies_locally[i] == 0 {
+                continue;
+            }
             let key = &expirations.keys[i];
             let v: u64 = expirations.last_counts[i].into();
             let composite = (key.rule_fingerprint, key.key_hash, key.bucket);

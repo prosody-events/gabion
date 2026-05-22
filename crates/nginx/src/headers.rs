@@ -101,12 +101,12 @@ impl RejectHeaders {
     ///
     /// * `X-RateLimit-Limit` — request budget per window (GitHub/Envoy style).
     /// * `X-RateLimit-Remaining` — `0` once we're past the budget.
-    /// * `X-RateLimit-Reset` — unix-timestamp seconds at which the sliding
+    /// * `X-RateLimit-Reset` — unix-timestamp seconds at which the fixed
     ///   window's quota resets. Matches the Envoy ratelimit filter and
     ///   GitHub/Twitter.
     /// * `Retry-After` — delta-seconds per RFC 7231 §7.1.3. Always the safe
-    ///   upper bound (`window_seconds`) because a client retrying sooner under
-    ///   a sliding window would just see their earlier hits and 429 again.
+    ///   upper bound (`window_seconds`) because a client retrying sooner may
+    ///   still see their earlier hits and 429 again.
     pub fn build(info: RejectInfo) -> Self {
         let retry_after_s = retry_after_seconds(info);
         let reset_unix_s = reset_unix_seconds(info);

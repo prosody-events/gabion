@@ -17,7 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Interval;
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Incarnation, NodeId, Observation,
+    ObservationBatch,
 };
 use crate::discovery::PeerEvent;
 use crate::wire::{self, PacketBuf, Packets, WireScratch};
@@ -36,6 +37,41 @@ struct Peer {
     addr: SocketAddr,
     node_id: Option<NodeId>,
     peer_slot: Option<u16>,
+}
+
+/// Data-oriented scratch for per-row frontier acks decoded from one inbound
+/// packet. The columns are allocated once at runtime construction and reused
+/// for every inbound arm.
+struct AckColumns {
+    origin_node_ids: Vec<NodeId>,
+    incarnations: Vec<Incarnation>,
+    origin_sequences: Vec<u64>,
+}
+
+impl AckColumns {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            origin_node_ids: Vec::with_capacity(capacity),
+            incarnations: Vec::with_capacity(capacity),
+            origin_sequences: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.origin_node_ids.clear();
+        self.incarnations.clear();
+        self.origin_sequences.clear();
+    }
+
+    fn push(&mut self, origin_node_id: NodeId, incarnation: Incarnation, origin_sequence: u64) {
+        self.origin_node_ids.push(origin_node_id);
+        self.incarnations.push(incarnation);
+        self.origin_sequences.push(origin_sequence);
+    }
+
+    fn len(&self) -> usize {
+        self.origin_node_ids.len()
+    }
 }
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
@@ -64,6 +100,7 @@ where
     recv_buf: Box<[u8]>,
     scratch: WireScratch,
     obs_buf: ObservationBatch<C>,
+    ack_buf: AckColumns,
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
@@ -169,6 +206,7 @@ where
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
         let obs_buf = ObservationBatch::<C>::with_capacity(config.max_cells_per_tick);
+        let ack_buf = AckColumns::with_capacity(config.wire_limits.max_cells as usize);
         let sink_buf = DeltaSink::<C>::with_capacity(config.max_cells_per_tick);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
@@ -203,6 +241,7 @@ where
             recv_buf,
             scratch,
             obs_buf,
+            ack_buf,
             sink_buf,
             expiration_buf,
             frame_handles,
@@ -328,13 +367,43 @@ where
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
         self.obs_buf.clear();
+        self.ack_buf.clear();
         self.sink_buf.clear();
         let bytes = &self.recv_buf[..n];
-        let decoded = match self.config.auth_key.as_ref() {
-            Some(key) => {
-                wire::decode_auth::<C>(bytes, key, self.config.wire_limits, &mut self.obs_buf)
+        let decoded = {
+            let obs_buf = &mut self.obs_buf;
+            let ack_buf = &mut self.ack_buf;
+            let mut on_cell = |cell: wire::WireCell<C>| {
+                ack_buf.push(
+                    cell.origin_node_id,
+                    cell.origin_incarnation,
+                    cell.origin_sequence,
+                );
+                obs_buf.push(Observation {
+                    rule_fingerprint: cell.rule_fingerprint,
+                    key_hash: cell.key_hash,
+                    bucket: cell.bucket,
+                    origin: cell.origin_node_id,
+                    incarnation: cell.origin_incarnation,
+                    count: cell.count,
+                    last_update_millis: cell.last_update_millis,
+                });
+            };
+            match self.config.auth_key.as_ref() {
+                Some(key) => wire::decode_auth_visit::<C>(
+                    bytes,
+                    key,
+                    self.config.wire_limits,
+                    |_| true,
+                    &mut on_cell,
+                ),
+                None => wire::decode_unauth_visit::<C>(
+                    bytes,
+                    self.config.wire_limits,
+                    |_| true,
+                    &mut on_cell,
+                ),
             }
-            None => wire::decode_unauth::<C>(bytes, self.config.wire_limits, &mut self.obs_buf),
         };
         let summary = match decoded {
             Ok(s) => s,
@@ -366,15 +435,16 @@ where
         // Frontier update — latency optimization. Best-effort: missing slot
         // or missing node entry just means we don't get the skip.
         let sender_id = NodeId(summary.header.sender_node_id);
-        let sender_inc = summary.header.sender_incarnation;
-        let max_origin_sequence = summary.header.max_origin_sequence;
         if let Some(peer_slot) = self.store.peer_frontiers_mut().intern_peer(sender_id) {
-            if let Some(node_slot) = self.store.node_dictionary().find(sender_id, sender_inc) {
-                self.store.peer_frontiers_mut().record_acked(
-                    peer_slot,
-                    node_slot,
-                    max_origin_sequence,
-                );
+            for i in 0..self.ack_buf.len() {
+                let origin_id = self.ack_buf.origin_node_ids[i];
+                let incarnation = self.ack_buf.incarnations[i];
+                let sequence = self.ack_buf.origin_sequences[i];
+                if let Some(node_slot) = self.store.node_dictionary().find(origin_id, incarnation) {
+                    self.store
+                        .peer_frontiers_mut()
+                        .record_acked(peer_slot, node_slot, sequence);
+                }
             }
             // Cache the peer_slot on the matching peer entry so future ticks
             // can prune without re-interning. `node_id` and `peer_slot` are

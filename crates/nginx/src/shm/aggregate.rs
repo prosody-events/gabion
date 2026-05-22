@@ -348,6 +348,9 @@ impl ShmAggregateStore {
 impl AggregateStore<u32> for ShmAggregateStore {
     fn apply(&self, deltas: &DeltaSink<u32>, expirations: &ExpirationSink<u32>) {
         for i in 0..deltas.len() {
+            if deltas.applies_locally[i] == 0 {
+                continue;
+            }
             let key = &deltas.keys[i];
             let d: u64 = deltas.deltas[i].into();
             if d == 0 {
@@ -356,6 +359,9 @@ impl AggregateStore<u32> for ShmAggregateStore {
             self.write_delta(key.rule_fingerprint, key.key_hash.0, key.bucket, d, 0);
         }
         for i in 0..expirations.len() {
+            if expirations.applies_locally[i] == 0 {
+                continue;
+            }
             let key = &expirations.keys[i];
             let last: u64 = expirations.last_counts[i].into();
             self.write_expiration(key.rule_fingerprint, key.key_hash.0, key.bucket, last);

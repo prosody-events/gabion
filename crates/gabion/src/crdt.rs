@@ -756,9 +756,33 @@ impl<C: Count> CellStore<C> {
             origin_sequence: sequence,
         };
         if origin == self.local_node_slot {
+            let before = self.local_dirty.overflow_seq();
             self.local_dirty.push(entry);
+            let after = self.local_dirty.overflow_seq();
+            if after != before && after.is_power_of_two() {
+                tracing::warn!(
+                    overflow_total = after,
+                    capacity = self.local_dirty.capacity(),
+                    "Local gossip dirty ring overflowed. Recent local changes are being \
+                     overwritten before gossip can send them; peers may lag until the repair lane \
+                     catches up. Raise `storage.local_dirty_capacity` or reduce write/cardinality \
+                     pressure.",
+                );
+            }
         } else {
+            let before = self.forwarded_dirty.overflow_seq();
             self.forwarded_dirty.push(entry);
+            let after = self.forwarded_dirty.overflow_seq();
+            if after != before && after.is_power_of_two() {
+                tracing::warn!(
+                    overflow_total = after,
+                    capacity = self.forwarded_dirty.capacity(),
+                    "Forwarded gossip dirty ring overflowed. Recently received peer changes are \
+                     being overwritten before they can be forwarded; convergence will depend on \
+                     repair scans. Raise `storage.forwarded_dirty_capacity` or reduce \
+                     write/cardinality pressure.",
+                );
+            }
         }
     }
 

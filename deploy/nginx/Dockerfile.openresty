@@ -1,8 +1,8 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.7
 
 ARG OPENRESTY_BASE_IMAGE=openresty/openresty:alpine
 
-FROM ${OPENRESTY_BASE_IMAGE} AS module-builder
+FROM ${OPENRESTY_BASE_IMAGE} AS chef
 
 ARG OPENRESTY_BASE_IMAGE=openresty/openresty:alpine
 
@@ -23,6 +23,8 @@ RUN if command -v apk >/dev/null 2>&1; then \
             pcre2-dev \
             perl \
             rust \
+            cargo-chef \
+            sccache \
             zlib-dev; \
     elif command -v apt-get >/dev/null 2>&1; then \
         apt-get update; \
@@ -39,6 +41,7 @@ RUN if command -v apk >/dev/null 2>&1; then \
             llvm-dev \
             perl \
             rustc \
+            sccache \
             zlib1g-dev; \
         rm -rf /var/lib/apt/lists/*; \
     else \
@@ -47,6 +50,12 @@ RUN if command -v apk >/dev/null 2>&1; then \
     fi
 
 WORKDIR /workspace
+
+RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
+    --mount=type=cache,id=gabion-cargo-git,target=/root/.cargo/git \
+    if ! command -v cargo-chef >/dev/null 2>&1; then \
+        cargo install cargo-chef --locked; \
+    fi
 
 RUN openresty_version="$(nginx -v 2>&1 | sed 's#nginx version: openresty/##')" \
     && curl -fsSLO "https://openresty.org/download/openresty-${openresty_version}.tar.gz" \
@@ -60,11 +69,38 @@ RUN openresty_version="$(nginx -v 2>&1 | sed 's#nginx version: openresty/##')" \
     && printf 'NGINX_SOURCE_DIR=%s\nNGINX_BUILD_DIR=%s\n' \
         "${nginx_source_dir}" "${nginx_build_dir}" > /workspace/openresty-nginx-build.env
 
+FROM chef AS planner
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN . /workspace/openresty-nginx-build.env \
-    && CARGO_BUILD_RUSTC_WRAPPER= \
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS module-builder
+
+COPY --from=planner /workspace/recipe.json recipe.json
+
+RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
+    --mount=type=cache,id=gabion-cargo-git,target=/root/.cargo/git \
+    --mount=type=cache,id=gabion-openresty-target,target=/workspace/target \
+    --mount=type=cache,id=gabion-openresty-sccache,target=/workspace/.cache/sccache \
+    . /workspace/openresty-nginx-build.env \
+    && SCCACHE_DIR=/workspace/.cache/sccache \
+       CARGO_BUILD_RUSTC_WRAPPER=sccache \
+       NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR}" \
+       NGINX_BUILD_DIR="${NGINX_BUILD_DIR}" \
+       cargo chef cook --release --package gabion-nginx --features ngx-module --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
+    --mount=type=cache,id=gabion-cargo-git,target=/root/.cargo/git \
+    --mount=type=cache,id=gabion-openresty-target,target=/workspace/target \
+    --mount=type=cache,id=gabion-openresty-sccache,target=/workspace/.cache/sccache \
+    . /workspace/openresty-nginx-build.env \
+    && SCCACHE_DIR=/workspace/.cache/sccache \
+       CARGO_BUILD_RUSTC_WRAPPER=sccache \
        NGINX_SOURCE_DIR="${NGINX_SOURCE_DIR}" \
        NGINX_BUILD_DIR="${NGINX_BUILD_DIR}" \
        cargo build -p gabion-nginx --release --features ngx-module \

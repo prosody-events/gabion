@@ -1,5 +1,8 @@
 use super::hash::mix64;
 use super::*;
+use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck_macros::quickcheck;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
@@ -136,6 +139,464 @@ fn local_increment_one(
             incarnation: local().incarnation,
         })
         .expect("cell present after ingest")
+}
+
+fn quickcheck_store() -> CellStore<u32> {
+    CellStore::new(
+        CellStoreConfig {
+            cell_capacity: 256,
+            rule_dictionary_capacity: 16,
+            node_dictionary_capacity: 16,
+            local_dirty_capacity: 512,
+            forwarded_dirty_capacity: 512,
+            peer_capacity: 8,
+        },
+        local(),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct RemoteRow {
+    rule: u8,
+    key: u8,
+    bucket: u8,
+    origin: u8,
+    incarnation: u8,
+    count: u32,
+    ts: u16,
+}
+
+impl Arbitrary for RemoteRow {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            rule: u8::arbitrary(g) % 4,
+            key: u8::arbitrary(g) % 4,
+            bucket: u8::arbitrary(g) % 4,
+            origin: (u8::arbitrary(g) % 4) + 2,
+            incarnation: (u8::arbitrary(g) % 2) + 1,
+            count: u32::arbitrary(g) % 10_000,
+            ts: u16::arbitrary(g),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RemoteRows(Vec<RemoteRow>);
+
+impl Arbitrary for RemoteRows {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = usize::arbitrary(g) % 64;
+        Self((0..len).map(|_| RemoteRow::arbitrary(g)).collect())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LocalRow {
+    rule: u8,
+    key: u8,
+    bucket: u8,
+    ignored_origin: u8,
+    ignored_incarnation: u8,
+    hits: u32,
+    ts: u16,
+}
+
+impl Arbitrary for LocalRow {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            rule: u8::arbitrary(g) % 4,
+            key: u8::arbitrary(g) % 4,
+            bucket: u8::arbitrary(g) % 4,
+            ignored_origin: u8::arbitrary(g),
+            ignored_incarnation: u8::arbitrary(g),
+            hits: u32::arbitrary(g) % 10_000,
+            ts: u16::arbitrary(g),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LocalRows(Vec<LocalRow>);
+
+impl Arbitrary for LocalRows {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = usize::arbitrary(g) % 64;
+        Self((0..len).map(|_| LocalRow::arbitrary(g)).collect())
+    }
+}
+
+fn remote_observation(row: &RemoteRow) -> Observation<u32> {
+    observation(
+        0x100 + row.rule as u128,
+        0x200 + row.key as u128,
+        row.bucket as BucketEpoch,
+        row.origin as u128,
+        row.incarnation as Incarnation,
+        row.count,
+        row.ts as u64,
+    )
+}
+
+fn apply_remote_rows(store: &mut CellStore<u32>, rows: &[RemoteRow]) -> DeltaSink<u32> {
+    let mut sink = DeltaSink::with_capacity(rows.len());
+    for row in rows {
+        let mut obs = ObservationBatch::with_capacity(1);
+        obs.push(remote_observation(row));
+        store.merge_remote(&obs, &mut sink);
+    }
+    sink
+}
+
+fn apply_local_rows(store: &mut CellStore<u32>, rows: &[LocalRow]) -> DeltaSink<u32> {
+    let mut sink = DeltaSink::with_capacity(rows.len());
+    for row in rows {
+        let mut obs = ObservationBatch::with_capacity(1);
+        obs.push(observation(
+            0x100 + row.rule as u128,
+            0x200 + row.key as u128,
+            row.bucket as BucketEpoch,
+            row.ignored_origin as u128,
+            row.ignored_incarnation as Incarnation,
+            row.hits,
+            row.ts as u64,
+        ));
+        store.ingest_local(&obs, &mut sink);
+    }
+    sink
+}
+
+type PortableKey = (u128, u128, BucketEpoch, u128, Incarnation);
+
+fn remote_model(rows: &[RemoteRow]) -> BTreeMap<PortableKey, u32> {
+    let mut model = BTreeMap::new();
+    for row in rows {
+        let key = (
+            0x100 + row.rule as u128,
+            0x200 + row.key as u128,
+            row.bucket as BucketEpoch,
+            row.origin as u128,
+            row.incarnation as Incarnation,
+        );
+        model
+            .entry(key)
+            .and_modify(|stored: &mut u32| *stored = (*stored).max(row.count))
+            .or_insert(row.count);
+    }
+    model
+}
+
+fn local_model(rows: &[LocalRow]) -> BTreeMap<PortableKey, u32> {
+    let mut model = BTreeMap::new();
+    for row in rows {
+        let key = (
+            0x100 + row.rule as u128,
+            0x200 + row.key as u128,
+            row.bucket as BucketEpoch,
+            local().node_id.0,
+            local().incarnation,
+        );
+        model
+            .entry(key)
+            .and_modify(|stored: &mut u32| *stored = stored.saturating_add(row.hits))
+            .or_insert(row.hits);
+    }
+    model
+}
+
+fn portable_snapshot(store: &CellStore<u32>) -> BTreeMap<PortableKey, u32> {
+    let mut rows = BTreeMap::new();
+    for handle in store.active_handles() {
+        let row = store.get(handle).unwrap();
+        let rule = store.rule_dictionary().descriptor(row.key.rule).unwrap();
+        let origin = store.node_dictionary().descriptor(row.key.origin).unwrap();
+        rows.insert(
+            (
+                rule.fingerprint,
+                row.key.key_hash.0,
+                row.key.bucket,
+                origin.node_id.0,
+                origin.incarnation,
+            ),
+            row.count,
+        );
+    }
+    rows
+}
+
+fn assert_structural_invariants(store: &CellStore<u32>) -> bool {
+    let mut active = 0_u32;
+    let mut rules = BTreeMap::<RuleSlot, u32>::new();
+    let mut nodes = BTreeMap::<NodeSlot, u32>::new();
+    let mut identities = BTreeSet::<(RuleSlot, u128, BucketEpoch, NodeSlot, Incarnation)>::new();
+
+    for handle in store.active_handles() {
+        active += 1;
+        let Some(row) = store.get(handle) else {
+            return false;
+        };
+        if store.resolve(handle) != Some(handle.index) {
+            return false;
+        }
+        if store.find(row.key) != Some(handle) {
+            return false;
+        }
+        if !identities.insert((
+            row.key.rule,
+            row.key.key_hash.0,
+            row.key.bucket,
+            row.key.origin,
+            row.key.incarnation,
+        )) {
+            return false;
+        }
+        *rules.entry(row.key.rule).or_default() += 1;
+        *nodes.entry(row.key.origin).or_default() += 1;
+    }
+
+    *nodes.entry(store.local_node_slot()).or_default() += 1;
+
+    if active != store.active_len() || store.index().len() != active {
+        return false;
+    }
+    for slot in 0..store.rule_dictionary().capacity() {
+        let expected = rules.get(&slot).copied().unwrap_or(0);
+        if store.rule_dictionary().refcount(slot) != expected {
+            return false;
+        }
+        if (store.rule_dictionary().descriptor(slot).is_some()) != (expected > 0) {
+            return false;
+        }
+    }
+    for slot in 0..store.node_dictionary().capacity() {
+        let expected = nodes.get(&slot).copied().unwrap_or(0);
+        if store.node_dictionary().refcount(slot) != expected {
+            return false;
+        }
+        if (store.node_dictionary().descriptor(slot).is_some()) != (expected > 0) {
+            return false;
+        }
+    }
+    true
+}
+
+#[quickcheck]
+fn quickcheck_remote_merge_is_gcounter_crdt(rows: RemoteRows) -> bool {
+    let mut forward = quickcheck_store();
+    apply_remote_rows(&mut forward, &rows.0);
+
+    let mut reverse = quickcheck_store();
+    let mut reversed = rows.0.clone();
+    reversed.reverse();
+    apply_remote_rows(&mut reverse, &reversed);
+
+    let mut duplicated = quickcheck_store();
+    let mut dup_rows = rows.0.clone();
+    dup_rows.extend(rows.0.iter().cloned());
+    apply_remote_rows(&mut duplicated, &dup_rows);
+
+    let model = remote_model(&rows.0);
+    portable_snapshot(&forward) == model
+        && portable_snapshot(&reverse) == model
+        && portable_snapshot(&duplicated) == model
+        && assert_structural_invariants(&forward)
+        && assert_structural_invariants(&reverse)
+        && assert_structural_invariants(&duplicated)
+}
+
+#[quickcheck]
+fn quickcheck_local_ingest_accumulates_saturating_and_ignores_batch_origin(
+    rows: LocalRows,
+) -> bool {
+    let mut store = quickcheck_store();
+    let sink = apply_local_rows(&mut store, &rows.0);
+    let model = local_model(&rows.0);
+
+    let deltas_are_exact = (0..sink.len()).all(|i| {
+        sink.current[i] >= sink.previous[i]
+            && sink.deltas[i] == sink.current[i].saturating_sub(sink.previous[i])
+            && sink.applies_locally[i] == 0
+    });
+
+    portable_snapshot(&store) == model
+        && deltas_are_exact
+        && assert_structural_invariants(&store)
+        && store.active_handles().all(|h| {
+            let row = store.get(h).unwrap();
+            row.key.origin == store.local_node_slot()
+                && row.key.incarnation == store.local_identity().incarnation
+        })
+}
+
+#[quickcheck]
+fn quickcheck_delta_sink_rows_are_exact_remote_raises(rows: RemoteRows) -> bool {
+    let mut store = quickcheck_store();
+    let mut model = BTreeMap::<PortableKey, u32>::new();
+    let mut sink = DeltaSink::with_capacity(rows.0.len());
+
+    for row in &rows.0 {
+        let key = (
+            0x100 + row.rule as u128,
+            0x200 + row.key as u128,
+            row.bucket as BucketEpoch,
+            row.origin as u128,
+            row.incarnation as Incarnation,
+        );
+        let previous = model.get(&key).copied().unwrap_or(0);
+        let mut obs = ObservationBatch::with_capacity(1);
+        obs.push(remote_observation(row));
+        let before = sink.len();
+        store.merge_remote(&obs, &mut sink);
+        if row.count > previous || !model.contains_key(&key) {
+            let after = sink.len();
+            if after != before + 1 {
+                return false;
+            }
+            let i = after - 1;
+            if sink.previous[i] != previous
+                || sink.current[i] != row.count
+                || sink.deltas[i] != row.count.saturating_sub(previous)
+                || sink.keys[i].rule_fingerprint != key.0
+                || sink.keys[i].key_hash.0 != key.1
+                || sink.keys[i].bucket != key.2
+            {
+                return false;
+            }
+            model.insert(key, row.count);
+        } else if sink.len() != before {
+            return false;
+        }
+    }
+
+    portable_snapshot(&store) == model && assert_structural_invariants(&store)
+}
+
+#[quickcheck]
+fn quickcheck_expire_frees_exactly_aged_out_cells(rows: RemoteRows, current_seed: u8) -> bool {
+    let mut store = quickcheck_store();
+    apply_remote_rows(&mut store, &rows.0);
+    let before: Vec<CellRow<u32>> = store
+        .active_handles()
+        .map(|h| store.get(h).unwrap())
+        .collect();
+
+    let dict_cap = store.rule_dictionary().capacity() as usize;
+    let mut current = vec![0_u32; dict_cap];
+    let mut live = vec![0_u32; dict_cap];
+    for slot in 0..dict_cap {
+        current[slot] = (current_seed as u32 % 4) + 2;
+        live[slot] = current_seed as u32 % 2;
+    }
+
+    let expected_expired: BTreeSet<u32> = before
+        .iter()
+        .filter(|row| {
+            (row.key.bucket as u64) + (live[row.key.rule as usize] as u64)
+                < current[row.key.rule as usize] as u64
+        })
+        .map(|row| row.handle.index)
+        .collect();
+
+    let mut exp = ExpirationSink::<u32>::with_capacity(before.len());
+    store.expire(&current, &live, &mut exp);
+    let expired: BTreeSet<u32> = exp.handles.iter().map(|h| h.index).collect();
+    if expired != expected_expired || exp.len() != expected_expired.len() {
+        return false;
+    }
+    for handle in &exp.handles {
+        if store.get(*handle).is_some() {
+            return false;
+        }
+    }
+    for row in before {
+        let should_survive = !expected_expired.contains(&row.handle.index);
+        if store.get(row.handle).is_some() != should_survive {
+            return false;
+        }
+    }
+    assert_structural_invariants(&store)
+}
+
+#[quickcheck]
+fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
+    rows: RemoteRows,
+    max_seed: u8,
+) -> TestResult {
+    let mut store = quickcheck_store();
+    apply_remote_rows(&mut store, &rows.0);
+    if store.is_empty() {
+        return TestResult::discard();
+    }
+
+    let max_cells = (max_seed as usize % 32) + 1;
+    let mut out = Vec::with_capacity(max_cells);
+    let emitted = store.fill_gossip_frame(max_cells, &mut out);
+    if emitted != out.len() || out.len() > max_cells {
+        return TestResult::failed();
+    }
+    let mut unique = BTreeSet::new();
+    for handle in &out {
+        if store.get(*handle).is_none() || !unique.insert(handle.index) {
+            return TestResult::failed();
+        }
+    }
+
+    store.clear_dirty();
+    let expected: BTreeSet<u32> = store.active_handles().map(|h| h.index).collect();
+    let mut seen = BTreeSet::new();
+    let mut one = Vec::with_capacity(1);
+    for _ in 0..(store.capacity() * 2) {
+        store.fill_gossip_frame(1, &mut one);
+        if let Some(handle) = one.first() {
+            if store.get(*handle).is_none() {
+                return TestResult::failed();
+            }
+            seen.insert(handle.index);
+        }
+        if seen == expected {
+            return TestResult::passed();
+        }
+    }
+    TestResult::from_bool(seen == expected)
+}
+
+#[quickcheck]
+fn quickcheck_peer_frontier_prunes_exactly_acked_origins(rows: RemoteRows, ack_seed: u8) -> bool {
+    let mut store = quickcheck_store();
+    apply_remote_rows(&mut store, &rows.0);
+    store.clear_dirty();
+    let peer_slot = store
+        .peer_frontiers_mut()
+        .intern_peer(NodeId(0x999))
+        .unwrap();
+
+    let active: Vec<CellRow<u32>> = store
+        .active_handles()
+        .map(|h| store.get(h).unwrap())
+        .collect();
+    for row in &active {
+        if ((row.key.origin as u8).wrapping_add(ack_seed) & 1) == 0 {
+            store
+                .peer_frontiers_mut()
+                .record_acked(peer_slot, row.key.origin, row.origin_sequence);
+        }
+    }
+
+    let expected: BTreeSet<u32> = active
+        .iter()
+        .filter(|row| {
+            row.origin_sequence > store.peer_frontiers().last_acked(peer_slot, row.key.origin)
+        })
+        .map(|row| row.handle.index)
+        .collect();
+
+    let mut out = Vec::with_capacity(store.capacity() as usize);
+    store.fill_gossip_frame_for_peer(store.capacity() as usize, peer_slot, &mut out);
+    let got: BTreeSet<u32> = out.iter().map(|h| h.index).collect();
+
+    got == expected
+        && out.len() == got.len()
+        && out.iter().all(|h| store.get(*h).is_some())
+        && assert_structural_invariants(&store)
 }
 
 #[test]
@@ -450,6 +911,20 @@ fn unknown_rule_cells_round_trip() {
     let mut exp = ExpirationSink::<u32>::with_capacity(1);
     store.expire(&cur, &live, &mut exp);
     assert_eq!(store.active_len(), 0);
+}
+
+#[test]
+fn unknown_rule_cells_expire_at_default_window() {
+    let mut store = small_store(4, 8);
+    let handle = remote_merge_one(&mut store, 0x44, 5, 1, 10, 0);
+    assert!(store.get(handle).is_some());
+
+    let mut exp = ExpirationSink::<u32>::with_capacity(1);
+    store.expire_at(61_000, &mut exp);
+
+    assert!(store.get(handle).is_none());
+    assert_eq!(exp.len(), 1);
+    assert_eq!(exp.applies_locally[0], 0);
 }
 
 #[test]
@@ -1034,4 +1509,722 @@ fn fill_gossip_frame_for_peer_skips_acked_cells() {
     // Only the unacked cell survives the per-peer prune.
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].index, h3.index);
+}
+
+// --- Coverage extensions (Gaps 1-6) -----------------------------------
+
+/// Like `quickcheck_store()` but pre-interns rules for fingerprints `0x100`
+/// and `0x101` with `local_rule_id != u32::MAX`, then `inc_ref`s each so the
+/// pin survives across expirations. Fingerprints `0x102` and `0x103` remain
+/// auto-interned on first use with `applies_locally = false`.
+fn quickcheck_store_with_pinned_rules() -> CellStore<u32> {
+    let mut store = quickcheck_store();
+    let slot_a = store
+        .intern_rule(RuleDescriptor {
+            fingerprint: 0x100,
+            window_millis: 1000,
+            bucket_millis: 1000,
+            limit: 1000,
+            flags: 0,
+            local_rule_id: 1,
+        })
+        .unwrap();
+    let slot_b = store
+        .intern_rule(RuleDescriptor {
+            fingerprint: 0x101,
+            window_millis: 1000,
+            bucket_millis: 1000,
+            limit: 1000,
+            flags: 0,
+            local_rule_id: 1,
+        })
+        .unwrap();
+    // Pin so the descriptor (and thus `applies_locally`) survives even when
+    // every cell on that rule expires.
+    store.rule_dictionary.inc_ref(slot_a);
+    store.rule_dictionary.inc_ref(slot_b);
+    store
+}
+
+/// Variant of `assert_structural_invariants` that allows one extra refcount
+/// on each slot in `pinned_rule_slots` — those are pinned via direct
+/// `inc_ref`, mirroring how the local node slot is pinned.
+fn assert_invariants_with_pinned_rules(
+    store: &CellStore<u32>,
+    pinned_rule_slots: &[RuleSlot],
+) -> bool {
+    let mut active = 0_u32;
+    let mut rules = BTreeMap::<RuleSlot, u32>::new();
+    let mut nodes = BTreeMap::<NodeSlot, u32>::new();
+    let mut identities = BTreeSet::<(RuleSlot, u128, BucketEpoch, NodeSlot, Incarnation)>::new();
+
+    for handle in store.active_handles() {
+        active += 1;
+        let Some(row) = store.get(handle) else {
+            return false;
+        };
+        if store.resolve(handle) != Some(handle.index) {
+            return false;
+        }
+        if store.find(row.key) != Some(handle) {
+            return false;
+        }
+        if !identities.insert((
+            row.key.rule,
+            row.key.key_hash.0,
+            row.key.bucket,
+            row.key.origin,
+            row.key.incarnation,
+        )) {
+            return false;
+        }
+        *rules.entry(row.key.rule).or_default() += 1;
+        *nodes.entry(row.key.origin).or_default() += 1;
+    }
+    for slot in pinned_rule_slots {
+        *rules.entry(*slot).or_default() += 1;
+    }
+    *nodes.entry(store.local_node_slot()).or_default() += 1;
+
+    if active != store.active_len() || store.index().len() != active {
+        return false;
+    }
+    for slot in 0..store.rule_dictionary().capacity() {
+        let expected = rules.get(&slot).copied().unwrap_or(0);
+        if store.rule_dictionary().refcount(slot) != expected {
+            return false;
+        }
+        if (store.rule_dictionary().descriptor(slot).is_some()) != (expected > 0) {
+            return false;
+        }
+    }
+    for slot in 0..store.node_dictionary().capacity() {
+        let expected = nodes.get(&slot).copied().unwrap_or(0);
+        if store.node_dictionary().refcount(slot) != expected {
+            return false;
+        }
+        if (store.node_dictionary().descriptor(slot).is_some()) != (expected > 0) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Predict the exact ordered handle sequence `fill_gossip_frame` will emit
+/// for the current store state, mirroring the lane priority (local dirty →
+/// forwarded dirty → repair) and the dedup / staleness filters.
+fn predict_gossip_order(store: &CellStore<u32>, max_cells: usize) -> Vec<CellHandle> {
+    let mut out: Vec<CellHandle> = Vec::with_capacity(max_cells);
+    if max_cells == 0 {
+        return out;
+    }
+    let cap = store.capacity();
+    let mut marks: BTreeSet<u32> = BTreeSet::new();
+
+    let entry_current = |entry: DirtyEntry| -> bool {
+        let i = entry.handle.index as usize;
+        if (entry.handle.index) >= cap {
+            return false;
+        }
+        if store.generations[i] != entry.handle.generation {
+            return false;
+        }
+        if store.origin_sequences[i] != entry.origin_sequence {
+            return false;
+        }
+        true
+    };
+
+    // Lane 1: local dirty.
+    for entry in store.local_dirty().iter() {
+        if out.len() >= max_cells {
+            break;
+        }
+        if !entry_current(entry) {
+            continue;
+        }
+        if !marks.insert(entry.handle.index) {
+            continue;
+        }
+        out.push(entry.handle);
+    }
+    if out.len() >= max_cells {
+        return out;
+    }
+
+    // Lane 2: forwarded dirty.
+    for entry in store.forwarded_dirty().iter() {
+        if out.len() >= max_cells {
+            break;
+        }
+        if !entry_current(entry) {
+            continue;
+        }
+        if !marks.insert(entry.handle.index) {
+            continue;
+        }
+        out.push(entry.handle);
+    }
+    if out.len() >= max_cells {
+        return out;
+    }
+
+    // Lane 3: rotating repair slice.
+    let mut visited = 0_u32;
+    while visited < cap && out.len() < max_cells {
+        let slot = (store.repair_cursor() + visited) % cap;
+        visited += 1;
+        if (store.generations[slot as usize] & 1) != 1 {
+            continue;
+        }
+        if !marks.insert(slot) {
+            continue;
+        }
+        out.push(CellHandle {
+            index: slot,
+            generation: store.generations[slot as usize],
+        });
+    }
+    out
+}
+
+// --- Shared scaffolding for mixed-ops properties (Gaps 1, 2, 5) ----------
+
+#[derive(Clone, Debug)]
+struct ExpireTick {
+    current_by_fp: [u8; 4],
+    live_by_fp: [u8; 4],
+}
+
+impl Arbitrary for ExpireTick {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let mut current = [0_u8; 4];
+        let mut live = [0_u8; 4];
+        for i in 0..4 {
+            current[i] = u8::arbitrary(g) % 8;
+            live[i] = u8::arbitrary(g) % 8;
+        }
+        Self {
+            current_by_fp: current,
+            live_by_fp: live,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum MixedOp {
+    Remote(RemoteRow),
+    Local(LocalRow),
+    Expire(ExpireTick),
+}
+
+impl Arbitrary for MixedOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        // ~40% Remote, ~40% Local, ~20% Expire.
+        let pick = u8::arbitrary(g) % 10;
+        if pick < 4 {
+            MixedOp::Remote(RemoteRow::arbitrary(g))
+        } else if pick < 8 {
+            MixedOp::Local(LocalRow::arbitrary(g))
+        } else {
+            MixedOp::Expire(ExpireTick::arbitrary(g))
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MixedOps(Vec<MixedOp>);
+
+impl Arbitrary for MixedOps {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = usize::arbitrary(g) % 32;
+        Self((0..len).map(|_| MixedOp::arbitrary(g)).collect())
+    }
+}
+
+fn apply_mixed_op_with_sinks(
+    store: &mut CellStore<u32>,
+    op: &MixedOp,
+    sink: &mut DeltaSink<u32>,
+    exp_sink: &mut ExpirationSink<u32>,
+) {
+    match op {
+        MixedOp::Remote(row) => {
+            let mut obs = ObservationBatch::with_capacity(1);
+            obs.push(remote_observation(row));
+            store.merge_remote(&obs, sink);
+        }
+        MixedOp::Local(row) => {
+            let mut obs = ObservationBatch::with_capacity(1);
+            obs.push(observation(
+                0x100 + row.rule as u128,
+                0x200 + row.key as u128,
+                row.bucket as BucketEpoch,
+                row.ignored_origin as u128,
+                row.ignored_incarnation as Incarnation,
+                row.hits,
+                row.ts as u64,
+            ));
+            store.ingest_local(&obs, sink);
+        }
+        MixedOp::Expire(tick) => {
+            // Build slot-indexed arrays from the fingerprint-indexed model.
+            let dict_cap = store.rule_dictionary().capacity() as usize;
+            let mut cur = vec![0_u32; dict_cap];
+            let mut live = vec![0_u32; dict_cap];
+            for fp_idx in 0..4 {
+                let fp = 0x100 + fp_idx as u128;
+                if let Some(slot) = store.find_rule(fp) {
+                    cur[slot as usize] = tick.current_by_fp[fp_idx] as u32;
+                    live[slot as usize] = tick.live_by_fp[fp_idx] as u32;
+                }
+            }
+            store.expire(&cur, &live, exp_sink);
+        }
+    }
+}
+
+fn apply_mixed_op_to_model(model: &mut BTreeMap<PortableKey, u32>, op: &MixedOp) {
+    match op {
+        MixedOp::Remote(row) => {
+            let key = (
+                0x100 + row.rule as u128,
+                0x200 + row.key as u128,
+                row.bucket as BucketEpoch,
+                row.origin as u128,
+                row.incarnation as Incarnation,
+            );
+            model
+                .entry(key)
+                .and_modify(|stored: &mut u32| *stored = (*stored).max(row.count))
+                .or_insert(row.count);
+        }
+        MixedOp::Local(row) => {
+            let key = (
+                0x100 + row.rule as u128,
+                0x200 + row.key as u128,
+                row.bucket as BucketEpoch,
+                local().node_id.0,
+                local().incarnation,
+            );
+            model
+                .entry(key)
+                .and_modify(|stored: &mut u32| *stored = stored.saturating_add(row.hits))
+                .or_insert(row.hits);
+        }
+        MixedOp::Expire(tick) => {
+            model.retain(|key, _| {
+                let fp_idx = (key.0 - 0x100) as usize;
+                if fp_idx >= 4 {
+                    return true;
+                }
+                let bucket = key.2 as u64;
+                let live = tick.live_by_fp[fp_idx] as u64;
+                let current = tick.current_by_fp[fp_idx] as u64;
+                bucket + live >= current
+            });
+        }
+    }
+}
+
+// Gap 1 + Gap 2: mixed local+remote+expire ops, with `applies_locally`
+// driven by the pinned-fingerprint set so the flag is no longer uniformly
+// false across the QC suite.
+#[quickcheck]
+fn quickcheck_mixed_ops_match_model(ops: MixedOps) -> bool {
+    let mut store = quickcheck_store_with_pinned_rules();
+    let pinned_rule_slots = [
+        store.find_rule(0x100).unwrap(),
+        store.find_rule(0x101).unwrap(),
+    ];
+    let pinned_fps: BTreeSet<u128> = [0x100_u128, 0x101_u128].into_iter().collect();
+    let mut model: BTreeMap<PortableKey, u32> = BTreeMap::new();
+
+    for op in &ops.0 {
+        let mut sink = DeltaSink::with_capacity(1);
+        let mut exp_sink = ExpirationSink::<u32>::with_capacity(8);
+        apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
+        apply_mixed_op_to_model(&mut model, op);
+
+        for i in 0..sink.len() {
+            let expected = pinned_fps.contains(&sink.keys[i].rule_fingerprint);
+            if (sink.applies_locally[i] != 0) != expected {
+                return false;
+            }
+        }
+        for i in 0..exp_sink.len() {
+            let expected = pinned_fps.contains(&exp_sink.keys[i].rule_fingerprint);
+            if (exp_sink.applies_locally[i] != 0) != expected {
+                return false;
+            }
+        }
+
+        if portable_snapshot(&store) != model {
+            return false;
+        }
+        if !assert_invariants_with_pinned_rules(&store, &pinned_rule_slots) {
+            return false;
+        }
+    }
+    true
+}
+
+// --- Gap 3: saturation and dictionary-full paths -------------------------
+
+#[derive(Clone, Debug)]
+struct TightRemoteRow {
+    rule: u8,
+    key: u8,
+    bucket: u8,
+    origin: u8,
+    incarnation: u8,
+    count: u32,
+    ts: u16,
+}
+
+impl Arbitrary for TightRemoteRow {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            rule: u8::arbitrary(g) % 4,
+            key: u8::arbitrary(g) % 4,
+            bucket: u8::arbitrary(g) % 4,
+            origin: u8::arbitrary(g) % 6,
+            incarnation: (u8::arbitrary(g) % 2) + 1,
+            count: u32::arbitrary(g) % 10_000,
+            ts: u16::arbitrary(g),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TightRemoteRows(Vec<TightRemoteRow>);
+
+impl Arbitrary for TightRemoteRows {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = usize::arbitrary(g) % 64;
+        Self((0..len).map(|_| TightRemoteRow::arbitrary(g)).collect())
+    }
+}
+
+fn quickcheck_store_tight() -> CellStore<u32> {
+    CellStore::new(
+        CellStoreConfig {
+            cell_capacity: 4,
+            rule_dictionary_capacity: 2,
+            node_dictionary_capacity: 3,
+            local_dirty_capacity: 16,
+            forwarded_dirty_capacity: 16,
+            peer_capacity: 4,
+        },
+        local(),
+    )
+}
+
+#[quickcheck]
+fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
+    rows: TightRemoteRows,
+) -> TestResult {
+    let mut store = quickcheck_store_tight();
+    // Model mirrors translate_identity → upsert: rule intern first, then
+    // node intern, then cell alloc. A failing intern is permanent for the
+    // row (skip) but the slot it already took stays consumed.
+    let mut interned_rules: BTreeSet<u128> = BTreeSet::new();
+    let mut interned_nodes: BTreeSet<(u128, Incarnation)> = BTreeSet::new();
+    interned_nodes.insert((local().node_id.0, local().incarnation));
+    let mut cells: BTreeMap<PortableKey, u32> = BTreeMap::new();
+    let mut model_rule_full = 0_u64;
+    let mut model_node_full = 0_u64;
+    let mut model_cell_full = 0_u64;
+
+    for row in &rows.0 {
+        let fp = 0x100 + row.rule as u128;
+        let origin = row.origin as u128;
+        let inc = row.incarnation as Incarnation;
+        let mut obs = ObservationBatch::with_capacity(1);
+        obs.push(observation(
+            fp,
+            0x200 + row.key as u128,
+            row.bucket as BucketEpoch,
+            origin,
+            inc,
+            row.count,
+            row.ts as u64,
+        ));
+        let mut sink = DeltaSink::with_capacity(1);
+        store.merge_remote(&obs, &mut sink);
+
+        if !interned_rules.contains(&fp) {
+            if interned_rules.len() >= 2 {
+                model_rule_full += 1;
+                continue;
+            }
+            interned_rules.insert(fp);
+        }
+        if !interned_nodes.contains(&(origin, inc)) {
+            if interned_nodes.len() >= 3 {
+                model_node_full += 1;
+                continue;
+            }
+            interned_nodes.insert((origin, inc));
+        }
+        let key = (
+            fp,
+            0x200 + row.key as u128,
+            row.bucket as BucketEpoch,
+            origin,
+            inc,
+        );
+        if let Some(stored) = cells.get_mut(&key) {
+            *stored = (*stored).max(row.count);
+        } else if cells.len() >= 4 {
+            model_cell_full += 1;
+        } else {
+            cells.insert(key, row.count);
+        }
+    }
+
+    let stats = store.stats();
+    let any_rejected = stats.rule_dictionary_full_rejects > 0
+        || stats.node_dictionary_full_rejects > 0
+        || stats.cell_store_full_rejects > 0;
+    if !any_rejected {
+        return TestResult::discard();
+    }
+
+    if stats.rule_dictionary_full_rejects != model_rule_full
+        || stats.node_dictionary_full_rejects != model_node_full
+        || stats.cell_store_full_rejects != model_cell_full
+    {
+        return TestResult::failed();
+    }
+    if portable_snapshot(&store) != cells {
+        return TestResult::failed();
+    }
+    if !assert_structural_invariants(&store) {
+        return TestResult::failed();
+    }
+    TestResult::passed()
+}
+
+#[derive(Clone, Debug)]
+struct U16HitRow {
+    hits: u16,
+}
+
+impl Arbitrary for U16HitRow {
+    fn arbitrary(g: &mut Gen) -> Self {
+        // Draw near u16::MAX so a small number of accumulations saturate.
+        let base = (u16::MAX - 16) as u32;
+        let jitter = u32::arbitrary(g) % 32;
+        let hits = (base + jitter).min(u16::MAX as u32) as u16;
+        Self { hits }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct U16HitRows(Vec<U16HitRow>);
+
+impl Arbitrary for U16HitRows {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = (usize::arbitrary(g) % 16) + 1;
+        Self((0..len).map(|_| U16HitRow::arbitrary(g)).collect())
+    }
+}
+
+#[quickcheck]
+fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
+    let mut store = CellStore::<u16>::new(
+        CellStoreConfig {
+            cell_capacity: 4,
+            rule_dictionary_capacity: 4,
+            node_dictionary_capacity: 4,
+            local_dirty_capacity: 32,
+            forwarded_dirty_capacity: 32,
+            peer_capacity: 4,
+        },
+        local(),
+    );
+    let mut model_sum: u64 = 0;
+    for row in &rows.0 {
+        let mut obs = ObservationBatch::<u16>::with_capacity(1);
+        obs.push(Observation {
+            rule_fingerprint: 0x100,
+            key_hash: KeyHash(0xabc),
+            bucket: 0,
+            origin: NodeId(1),
+            incarnation: 1,
+            count: row.hits,
+            last_update_millis: 0,
+        });
+        let mut sink = DeltaSink::<u16>::with_capacity(1);
+        store.ingest_local(&obs, &mut sink);
+        model_sum = model_sum.saturating_add(row.hits as u64);
+    }
+    let stored = store
+        .active_handles()
+        .next()
+        .and_then(|h| store.get(h).map(|r| r.count))
+        .unwrap_or(0);
+    let expected = model_sum.min(u16::MAX as u64) as u16;
+    stored == expected
+}
+
+// --- Gap 4: peer-aware frame across all three lanes ----------------------
+
+#[quickcheck]
+fn quickcheck_gossip_frame_for_peer_across_all_lanes(rows: RemoteRows, ack_seed: u8) -> bool {
+    let mut store = quickcheck_store();
+    apply_remote_rows(&mut store, &rows.0);
+    // No `clear_dirty` here — exercise the union across local, forwarded,
+    // and repair lanes simultaneously.
+    let peer_slot = store
+        .peer_frontiers_mut()
+        .intern_peer(NodeId(0x999))
+        .unwrap();
+
+    let active: Vec<CellRow<u32>> = store
+        .active_handles()
+        .map(|h| store.get(h).unwrap())
+        .collect();
+    for row in &active {
+        if ((row.key.origin as u8).wrapping_add(ack_seed) & 1) == 0 {
+            store
+                .peer_frontiers_mut()
+                .record_acked(peer_slot, row.key.origin, row.origin_sequence);
+        }
+    }
+
+    let expected: BTreeSet<u32> = active
+        .iter()
+        .filter(|row| {
+            row.origin_sequence > store.peer_frontiers().last_acked(peer_slot, row.key.origin)
+        })
+        .map(|row| row.handle.index)
+        .collect();
+
+    let mut out = Vec::with_capacity(store.capacity() as usize);
+    store.fill_gossip_frame_for_peer(store.capacity() as usize, peer_slot, &mut out);
+    let got: BTreeSet<u32> = out.iter().map(|h| h.index).collect();
+
+    got == expected
+        && out.len() == got.len()
+        && out.iter().all(|h| store.get(*h).is_some())
+        && assert_structural_invariants(&store)
+}
+
+// --- Gap 5: lane priority as ordered prediction --------------------------
+
+#[quickcheck]
+fn quickcheck_gossip_frame_order_matches_lane_model(ops: MixedOps, max_seed: u8) -> TestResult {
+    let mut store = quickcheck_store_with_pinned_rules();
+    for op in &ops.0 {
+        let mut sink = DeltaSink::with_capacity(1);
+        let mut exp_sink = ExpirationSink::<u32>::with_capacity(8);
+        apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
+    }
+    if store.is_empty() {
+        return TestResult::discard();
+    }
+    let max_cells = (max_seed as usize % 32) + 1;
+    let predicted = predict_gossip_order(&store, max_cells);
+    let mut got = Vec::with_capacity(max_cells);
+    store.fill_gossip_frame(max_cells, &mut got);
+    TestResult::from_bool(predicted == got)
+}
+
+// --- Gap 6: expire_at vs expire for varied rule windows ------------------
+
+#[derive(Clone, Debug)]
+struct RuleParams {
+    window: u32,
+    bucket: u32,
+}
+
+impl Arbitrary for RuleParams {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let window = match u8::arbitrary(g) % 3 {
+            0 => 50_u32,
+            1 => 100_u32,
+            _ => 200_u32,
+        };
+        let bucket = match u8::arbitrary(g) % 3 {
+            0 => 25_u32,
+            1 => 50_u32,
+            _ => 100_u32,
+        };
+        Self { window, bucket }
+    }
+}
+
+#[quickcheck]
+fn quickcheck_expire_at_matches_expire_for_varied_rules(
+    rule_a: RuleParams,
+    rule_b: RuleParams,
+    rows: RemoteRows,
+    now_seed: u32,
+) -> bool {
+    let mut base = quickcheck_store();
+    base.intern_rule(RuleDescriptor {
+        fingerprint: 0x100,
+        window_millis: rule_a.window,
+        bucket_millis: rule_a.bucket,
+        limit: 1000,
+        flags: 0,
+        local_rule_id: 1,
+    })
+    .unwrap();
+    base.intern_rule(RuleDescriptor {
+        fingerprint: 0x101,
+        window_millis: rule_b.window,
+        bucket_millis: rule_b.bucket,
+        limit: 1000,
+        flags: 0,
+        local_rule_id: 1,
+    })
+    .unwrap();
+
+    // Restrict to the two pre-interned rules; widen bucket spread so cells
+    // land across multiple live windows.
+    let varied: Vec<RemoteRow> = rows
+        .0
+        .iter()
+        .map(|r| RemoteRow {
+            rule: r.rule % 2,
+            key: r.key,
+            bucket: r.bucket % 8,
+            origin: r.origin,
+            incarnation: r.incarnation,
+            count: r.count,
+            ts: r.ts,
+        })
+        .collect();
+    apply_remote_rows(&mut base, &varied);
+
+    let now_millis: u64 = (now_seed as u64) % 4000;
+
+    let mut store_a = base.clone();
+    let mut sink_a = ExpirationSink::<u32>::with_capacity(base.capacity() as usize);
+    store_a.expire_at(now_millis, &mut sink_a);
+
+    let mut store_b = base.clone();
+    let dict_cap = store_b.rule_dictionary().capacity() as usize;
+    let mut cur = vec![0_u32; dict_cap];
+    let mut live = vec![0_u32; dict_cap];
+    for slot in 0..dict_cap {
+        if let Some(d) = store_b.rule_dictionary().descriptor(slot as RuleSlot) {
+            if d.bucket_millis > 0 {
+                cur[slot] = (now_millis / d.bucket_millis as u64) as BucketEpoch;
+                live[slot] = (d.window_millis / d.bucket_millis).max(1);
+            }
+        }
+    }
+    let mut sink_b = ExpirationSink::<u32>::with_capacity(base.capacity() as usize);
+    store_b.expire(&cur, &live, &mut sink_b);
+
+    let handles_a: BTreeSet<u32> = sink_a.handles.iter().map(|h| h.index).collect();
+    let handles_b: BTreeSet<u32> = sink_b.handles.iter().map(|h| h.index).collect();
+
+    handles_a == handles_b
+        && store_a.active_len() == store_b.active_len()
+        && portable_snapshot(&store_a) == portable_snapshot(&store_b)
 }

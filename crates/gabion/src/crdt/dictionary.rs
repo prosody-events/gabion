@@ -26,8 +26,12 @@ impl Default for RuleDescriptor {
     fn default() -> Self {
         Self {
             fingerprint: 0,
-            window_millis: 0,
-            bucket_millis: 0,
+            // Unknown wire-only rules still need a bounded lifetime. A zero
+            // bucket/window disables expiration in CellStore::expire_at, which
+            // lets stale peer cells accumulate forever when a node has not
+            // registered the rule locally.
+            window_millis: 60_000,
+            bucket_millis: 1_000,
             limit: 0,
             flags: 0,
             local_rule_id: u32::MAX,

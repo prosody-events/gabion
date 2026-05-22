@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/gabion",
     "crates/gossip-bench",
+    "crates/loader",
     "crates/server",
     "crates/nginx",
 ]

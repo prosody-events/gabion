@@ -58,6 +58,24 @@ def _ensure_plot_libs():
 # ----- figure builders ------------------------------------------------------
 
 
+def _log2_axis(ax, values, axis: str = "x") -> None:
+    """Render a log-base-2 axis with plain integer tick labels at the
+    sampled points. Avoids mathtext (which forces a DejaVu fallback
+    and breaks font consistency with the body) and Unicode superscript
+    glyphs (which most installed serifs do not carry). Plain integers
+    are equally readable on a log axis because the geometric spacing
+    of the ticks already signals the doubling."""
+    vals = sorted(set(int(v) for v in values))
+    labels = [str(v) for v in vals]
+    set_scale, set_ticks, set_labels = {
+        "x": (ax.set_xscale, ax.set_xticks, ax.set_xticklabels),
+        "y": (ax.set_yscale, ax.set_yticks, ax.set_yticklabels),
+    }[axis]
+    set_scale("log", base=2)
+    set_ticks(vals)
+    set_labels(labels)
+
+
 def fig_convergence(results: list[dict]) -> "matplotlib.figure.Figure":
     import matplotlib.pyplot as plt
     import pandas as pd
@@ -67,6 +85,7 @@ def fig_convergence(results: list[dict]) -> "matplotlib.figure.Figure":
         PALETTE,
         direct_label,
         offset_spines,
+        range_frame,
         tight_x,
         tight_y,
         title_only,
@@ -124,13 +143,14 @@ def fig_convergence(results: list[dict]) -> "matplotlib.figure.Figure":
             style="italic",
         )
 
-        left.set_xscale("log", base=2)
+        _log2_axis(left, ns, axis="x")
         left.set_xlabel("cluster size N")
         left.set_ylabel("rounds to converge")
         title_only(left, "convergence")
         offset_spines(left)
         tight_x(left, df["nodes"])
         tight_y(left, list(df["rounds"]) + [math.log2(n) for n in ns])
+        range_frame(left, df["nodes"], list(df["rounds"]) + [math.log2(n) for n in ns])
 
         # --- Bandwidth vs N ---
         for i, f in enumerate(fanouts):
@@ -142,13 +162,14 @@ def fig_convergence(results: list[dict]) -> "matplotlib.figure.Figure":
                 right, last["nodes"], last["bytes_per_s"], f"f={f}", color=color
             )
 
-        right.set_xscale("log", base=2)
+        _log2_axis(right, ns, axis="x")
         right.set_xlabel("cluster size N")
         right.set_ylabel("bytes per node, per second")
         title_only(right, "per-node bandwidth")
         offset_spines(right)
         tight_x(right, df["nodes"])
         tight_y(right, df["bytes_per_s"])
+        range_frame(right, df["nodes"], df["bytes_per_s"])
 
         fig.tight_layout()
         return fig
@@ -163,6 +184,7 @@ def fig_fanout_sweep(results: list[dict]):
         PALETTE,
         direct_label,
         offset_spines,
+        range_frame,
         tight_x,
         tight_y,
         title_only,
@@ -221,6 +243,7 @@ def fig_fanout_sweep(results: list[dict]):
         tight_x(ax, list(df["fanout"]) + [df["fanout"].max() + 1.5])
         tight_y(ax, df["rounds"])
         ax2.set_ylim(0, max(df["bytes_per_s"]) * 1.05)
+        range_frame(ax, df["fanout"], df["rounds"])
         fig.tight_layout()
         return fig
 
@@ -233,6 +256,7 @@ def fig_scale_n(results: list[dict]):
         INK,
         direct_label,
         offset_spines,
+        range_frame,
         tight_x,
         tight_y,
         title_only,
@@ -262,17 +286,18 @@ def fig_scale_n(results: list[dict]):
             color=INK,
             linewidth=0.8,
         )
-        direct_label(left, ns[-1], math.log2(ns[-1]), "log₂ N", style="italic", fontsize=8)
-        left.set_xscale("log", base=2)
+        direct_label(left, ns[-1], math.log2(ns[-1]), "log2 N", style="italic", fontsize=8)
+        _log2_axis(left, ns, axis="x")
         left.set_xlabel("cluster size N")
         left.set_ylabel("rounds to converge")
         title_only(left, "scaling: rounds-to-converge (f = 3)")
         offset_spines(left)
         tight_x(left, ns)
         tight_y(left, list(df["rounds"]) + [math.log2(n) for n in ns])
+        range_frame(left, ns, list(df["rounds"]) + [math.log2(n) for n in ns])
 
         right.plot(df["nodes"], df["bytes_per_s"], marker="o", color=INK)
-        right.set_xscale("log", base=2)
+        _log2_axis(right, ns, axis="x")
         right.set_xlabel("cluster size N")
         right.set_ylabel("bytes per node, per second")
         title_only(right, "per-node bandwidth (the SWIM constant-load claim)")
@@ -282,6 +307,7 @@ def fig_scale_n(results: list[dict]):
         # would visually amplify a ~30% range into a steep curve, which
         # would lie about the claim. Anchor at 0.
         right.set_ylim(0, max(df["bytes_per_s"]) * 1.1)
+        range_frame(right, ns, [0, max(df["bytes_per_s"])])
 
         fig.tight_layout()
         return fig
@@ -295,6 +321,7 @@ def fig_loss(results: list[dict]):
         INK,
         PALETTE,
         offset_spines,
+        range_frame,
         tight_y,
         title_only,
         tufte_rc,
@@ -346,6 +373,7 @@ def fig_loss(results: list[dict]):
         offset_spines(ax)
         ax.set_xlim(-0.4, len(losses) - 0.6)
         tight_y(ax, list(df["rounds"]) + [max(df["rounds"]) + 1])
+        range_frame(ax, [0, len(losses) - 1], df["rounds"])
         fig.tight_layout()
         return fig
 
@@ -357,6 +385,7 @@ def fig_partition(results: list[dict]):
         INK,
         PALETTE,
         offset_spines,
+        range_frame,
         tight_x,
         tight_y,
         title_only,
@@ -437,6 +466,7 @@ def fig_partition(results: list[dict]):
         offset_spines(ax)
         tight_x(ax, t)
         ax.set_ylim(-0.5, max(gt) + 0.6)
+        range_frame(ax, t, [0, max(gt)])
         fig.tight_layout()
         return fig
 
@@ -450,6 +480,7 @@ def fig_staleness(results: list[dict]):
         PALETTE,
         direct_label,
         offset_spines,
+        range_frame,
         tight_x,
         tight_y,
         title_only,
@@ -500,6 +531,7 @@ def fig_staleness(results: list[dict]):
         # room to render without being clipped by the figure border.
         tight_x(ax, list(df["sources"]) + [df["sources"].max() + 0.5])
         tight_y(ax, list(df["p50"]) + list(df["p95"]))
+        range_frame(ax, df["sources"], list(df["p50"]) + list(df["p95"]))
         fig.tight_layout()
         return fig
 
