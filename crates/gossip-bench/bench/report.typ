@@ -31,26 +31,25 @@
 
 #set document(title: "gabion gossip evaluation", author: "gossip-bench")
 
-// Page geometry: a generous outer margin keeps the measure within
-// Bringhurst's 45–75 cpl band even at 10 pt. Page numbers go on the
-// OUTSIDE corner of the running head (rule 3.3): right on rectos
-// (odd page numbers), left on versos.
+// Page geometry tuned for on-screen PDF readers rather than a bound
+// book: symmetric left/right margins, single-page reading order, no
+// recto/verso distinction. The wide side margins keep the measure
+// within Bringhurst's 45–75 cpl band even at 10 pt. Title sits left,
+// page number right — same layout on every page, since the reader
+// flips pages forward in a viewer, never opens to a two-page spread.
 #set page(
   paper: "us-letter",
-  margin: (top: 1.0in, bottom: 1.0in, inside: 1.3in, outside: 2.05in),
+  margin: (top: 1.0in, bottom: 1.0in, x: 1.7in),
   header: context {
     let p = here().page()
     if p > 1 {
-      let n = str(p)
-      let title = sc[gabion gossip evaluation]
       set text(size: 8.5pt, fill: sub-color)
-      if calc.odd(p) {
-        // Recto: title left, page number right (outside).
-        grid(columns: (1fr, auto), align: (left, right), title, n)
-      } else {
-        // Verso: page number left (outside), title right.
-        grid(columns: (auto, 1fr), align: (left, right), n, title)
-      }
+      grid(
+        columns: (1fr, auto),
+        align: (left, right),
+        sc[gabion gossip evaluation],
+        str(p),
+      )
     }
   },
   footer: none,

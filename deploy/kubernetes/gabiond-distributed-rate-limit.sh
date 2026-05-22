@@ -26,6 +26,10 @@ esac
 : "${RPS_PER_TENANT:=100}"
 : "${DURATION_S:=20}"
 : "${WARMUP_S:=2}"
+: "${RATE_LIMIT_WINDOW:=1s}"
+: "${RATE_LIMIT_BUCKET:=1s}"
+: "${WINDOW_MS:=1000}"
+: "${GOSSIP_TICK_INTERVAL:=100ms}"
 : "${KEEP_NAMESPACE:=0}"
 
 namespace="gabiond-dist-$$"
@@ -49,6 +53,7 @@ envoy_bind: 0.0.0.0:8081
 admin_bind: 0.0.0.0:9090
 gossip:
   bind: 0.0.0.0:9000
+  tick_interval: ${GOSSIP_TICK_INTERVAL}
 discovery:
   namespace_whitelist: ["$namespace"]
 limits:
@@ -58,8 +63,8 @@ limits:
       - key: tenant
         value: "*"
     limit: ${BUDGET_PER_TENANT}
-    window: 1s
-    bucket: 1s
+    window: ${RATE_LIMIT_WINDOW}
+    bucket: ${RATE_LIMIT_BUCKET}
     mode: enforce
 YAML
 
@@ -217,7 +222,7 @@ spec:
             - name: WARMUP_S
               value: "${WARMUP_S}"
             - name: WINDOW_MS
-              value: "1000"
+              value: "${WINDOW_MS}"
             - name: ALIGN_WINDOW
               value: "1"
 YAML

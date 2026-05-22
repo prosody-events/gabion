@@ -13,6 +13,10 @@
 #   RPS_PER_TENANT      per-tenant requests/sec attempted (default 100)
 #   DURATION_S          sustained measurement seconds (default 60)
 #   WARMUP_S            unmeasured warm-up seconds (default 5)
+#   RATE_LIMIT_WINDOW   configured rule window (default 1s)
+#   RATE_LIMIT_BUCKET   configured rule bucket (default 1s)
+#   WINDOW_MS           loader reporting window in ms (default 1000)
+#   GOSSIP_TICK_INTERVAL gossip runtime tick interval (default 100ms)
 #   KEEP_NAMESPACE=1    leave the ephemeral namespace behind for debug
 #   BACKEND=nginx       run nginx/curl path (default)
 #   BACKEND=gabiond     run gabiond/gRPC path
@@ -57,6 +61,10 @@ esac
 : "${RPS_PER_TENANT:=100}"
 : "${DURATION_S:=60}"
 : "${WARMUP_S:=5}"
+: "${RATE_LIMIT_WINDOW:=1s}"
+: "${RATE_LIMIT_BUCKET:=1s}"
+: "${WINDOW_MS:=1000}"
+: "${GOSSIP_TICK_INTERVAL:=100ms}"
 : "${KEEP_NAMESPACE:=0}"
 
 namespace="gabion-nginx-dist-$$"
@@ -82,20 +90,32 @@ docker build -f deploy/kubernetes/loader.Dockerfile -t gabion-loader:local .
 
 kubectl create namespace "$namespace"
 
-# nginx conf override + gabiond config go in via
-# ConfigMaps so we don't need to rebuild images to vary test parameters.
-kubectl -n "$namespace" create configmap nginx-conf \
-    --from-file=nginx.conf=deploy/nginx/nginx.distributed.conf
+# nginx conf override + gabiond config go in via ConfigMaps so we don't need to
+# rebuild images to vary test parameters.
+awk \
+    -v budget="$BUDGET_PER_TENANT" \
+    -v window="$RATE_LIMIT_WINDOW" \
+    -v bucket="$RATE_LIMIT_BUCKET" \
+    -v tick="$GOSSIP_TICK_INTERVAL" '
+        /gabion_limit_rule tenant_dist / {
+            sub(/tenant_dist [0-9]+r\/s/, "tenant_dist " budget "r/s")
+            sub(/window=[^ ]+/, "window=" window)
+            sub(/bucket=[^ ;]+/, "bucket=" bucket)
+        }
+        { print }
+        /gabion_gossip_fanout 8;/ {
+            print "    gabion_gossip_tick_interval " tick ";"
+        }
+    ' deploy/nginx/nginx.distributed.conf \
+    | kubectl -n "$namespace" create configmap nginx-conf --from-file=nginx.conf=/dev/stdin
 
-# gabiond config. Storage + gossip settings deliberately omitted so the
-# server uses its built-in defaults (see crates/server/src/config.rs) —
-# the nginx module's defaults now mirror these one-for-one, so the two
-# sides gossip with identical tuning out of the box.
+# gabiond config. Keep gossip tuning aligned with the nginx module config.
 kubectl -n "$namespace" create configmap gabiond-config --from-file=config.yaml=/dev/stdin <<YAML
 envoy_bind: 0.0.0.0:8081
 admin_bind: 0.0.0.0:9090
 gossip:
   bind: 0.0.0.0:9000
+  tick_interval: ${GOSSIP_TICK_INTERVAL}
 discovery:
   namespace_whitelist: ["$namespace"]
 limits:
@@ -105,8 +125,8 @@ limits:
       - key: tenant
         value: "*"
     limit: ${BUDGET_PER_TENANT}
-    window: 1s
-    bucket: 1s
+    window: ${RATE_LIMIT_WINDOW}
+    bucket: ${RATE_LIMIT_BUCKET}
     mode: enforce
 YAML
 
@@ -363,7 +383,7 @@ spec:
             - name: WARMUP_S
               value: "${WARMUP_S}"
             - name: WINDOW_MS
-              value: "1000"
+              value: "${WINDOW_MS}"
             - name: ALIGN_WINDOW
               value: "1"
           resources:
