@@ -52,6 +52,10 @@ struct SimRouterInner {
     policies: RefCell<HashMap<(SocketAddr, SocketAddr), LinkPolicy>>,
     /// Per-direction counters used by `DropFirst`.
     drop_counters: RefCell<HashMap<(SocketAddr, SocketAddr), u32>>,
+    /// Per-recipient packet counters incremented after policy evaluation
+    /// decides the packet is delivered. Used by property tests that check
+    /// peer-sampling distribution.
+    received_counts: RefCell<HashMap<SocketAddr, u64>>,
     /// Per-receiver send-channel capacity. Bounded queue applies backpressure.
     channel_capacity: usize,
 }
@@ -80,9 +84,22 @@ impl SimRouter {
                 senders: RefCell::new(HashMap::new()),
                 policies: RefCell::new(HashMap::new()),
                 drop_counters: RefCell::new(HashMap::new()),
+                received_counts: RefCell::new(HashMap::new()),
                 channel_capacity,
             }),
         }
+    }
+
+    /// Number of packets that were *delivered* to `addr` (i.e. the policy did
+    /// not drop them and the destination had a receiver registered). Used by
+    /// property tests that need per-recipient stats.
+    pub fn received_count(&self, addr: SocketAddr) -> u64 {
+        self.inner
+            .received_counts
+            .borrow()
+            .get(&addr)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Register a transport at `addr` and return its handle. The transport
@@ -154,6 +171,15 @@ impl SimRouter {
     fn sender_for(&self, addr: SocketAddr) -> Option<mpsc::Sender<SimPacket>> {
         self.inner.senders.borrow().get(&addr).cloned()
     }
+
+    fn record_delivery(&self, dst: SocketAddr) {
+        *self
+            .inner
+            .received_counts
+            .borrow_mut()
+            .entry(dst)
+            .or_insert(0) += 1;
+    }
 }
 
 fn link_seed(src: SocketAddr, dst: SocketAddr) -> u64 {
@@ -208,7 +234,10 @@ impl GossipTransport for SimTransport {
             bytes: buf.to_vec(),
         };
         match sender.try_send(packet) {
-            Ok(()) => Ok(buf.len()),
+            Ok(()) => {
+                self.router.record_delivery(dst);
+                Ok(buf.len())
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }

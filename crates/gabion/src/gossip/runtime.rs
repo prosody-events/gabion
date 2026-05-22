@@ -486,12 +486,14 @@ where
                         .map(|p| PeerEntry {
                             addr: p.addr,
                             node_id: p.node_id,
+                            peer_slot: p.peer_slot,
                         })
                         .collect(),
                     store_stats: self.store.stats(),
                     local_dirty_len: self.store.local_dirty().len(),
                     forwarded_dirty_len: self.store.forwarded_dirty().len(),
                     send_pending_depth: self.send_pending.len(),
+                    decode_reject_count: self.decode_reject_count,
                 };
                 // Caller may have dropped the receiver; not an error.
                 let _ = reply.send(snapshot);
