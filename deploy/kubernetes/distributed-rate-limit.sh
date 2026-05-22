@@ -45,6 +45,7 @@ esac
 : "${RATE_LIMIT_BUCKET:=1s}"
 : "${WINDOW_MS:=1000}"
 : "${GOSSIP_TICK_INTERVAL:=100ms}"
+: "${GOSSIP_FANOUT:=6}"
 : "${GOSSIP_TARGET_ERR_BPS:=100}"
 : "${GOSSIP_MIN_EMIT_INTERVAL:=5ms}"
 : "${KEEP_NAMESPACE:=0}"
@@ -81,6 +82,7 @@ create_configmaps() {
             -v budget="$BUDGET_PER_TENANT" \
             -v window="$RATE_LIMIT_WINDOW" \
             -v bucket="$RATE_LIMIT_BUCKET" \
+            -v fanout="$GOSSIP_FANOUT" \
             -v tick="$GOSSIP_TICK_INTERVAL" \
             -v target_err_bps="$GOSSIP_TARGET_ERR_BPS" \
             -v min_emit="$GOSSIP_MIN_EMIT_INTERVAL" '
@@ -89,12 +91,15 @@ create_configmaps() {
                     sub(/window=[^ ]+/, "window=" window)
                     sub(/bucket=[^ ;]+/, "bucket=" bucket)
                 }
-                { print }
-                /gabion_gossip_fanout 8;/ {
+                /gabion_gossip_fanout [0-9]+;/ {
+                    sub(/gabion_gossip_fanout [0-9]+;/, "gabion_gossip_fanout " fanout ";")
+                    print
                     print "    gabion_gossip_tick_interval " tick ";"
                     print "    gabion_gossip_target_err_bps " target_err_bps ";"
                     print "    gabion_gossip_min_emit_interval " min_emit ";"
+                    next
                 }
+                { print }
             ' deploy/nginx/nginx.distributed.conf \
             | kubectl -n "$namespace" create configmap nginx-conf --from-file=nginx.conf=/dev/stdin
     fi
@@ -104,6 +109,7 @@ envoy_bind: 0.0.0.0:8081
 admin_bind: 0.0.0.0:9090
 gossip:
   bind: 0.0.0.0:9000
+  fanout: ${GOSSIP_FANOUT}
   tick_interval: ${GOSSIP_TICK_INTERVAL}
   target_err_bps: ${GOSSIP_TARGET_ERR_BPS}
   min_emit_interval: ${GOSSIP_MIN_EMIT_INTERVAL}
@@ -387,6 +393,8 @@ ${backend_env}
               value: "${WARMUP_S}"
             - name: WINDOW_MS
               value: "${WINDOW_MS}"
+            - name: HTTP_CONNECTIONS
+              value: "${POD_COUNT}"
             - name: ALIGN_WINDOW
               value: "1"
           resources:

@@ -13,7 +13,11 @@ use envoy_types::pb::envoy::service::ratelimit::v3::{
 use futures::future::join_all;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Backend {
@@ -36,6 +40,7 @@ struct Config {
     align_window: bool,
     descriptor_key: String,
     request_timeout_ms: u64,
+    http_connections: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -81,11 +86,25 @@ impl Counters {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Outcome {
     Ok,
     Over,
     Fail,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScheduledRequest {
+    tenant: usize,
+    window: usize,
+    scheduled_at: Instant,
+}
+
+#[derive(Debug)]
+struct ExpectedLoad {
+    attempts: u64,
+    allowed: u64,
+    allowed_per_window: Vec<u64>,
 }
 
 #[tokio::main]
@@ -110,14 +129,95 @@ async fn main() -> Result<()> {
     let counters: Arc<Vec<Counters>> = Arc::new((0..windows).map(|_| Counters::new()).collect());
     let cfg = Arc::new(cfg);
 
+    let task_failures = match cfg.backend {
+        Backend::Http => {
+            run_http_load(Arc::clone(&cfg), started, finished, Arc::clone(&counters)).await
+        }
+        Backend::Grpc => {
+            run_grpc_load(Arc::clone(&cfg), started, finished, Arc::clone(&counters)).await
+        }
+    };
+
+    let expected = expected_load(&cfg, windows);
+    print_summary(
+        &cfg,
+        started_wall_ms,
+        windows,
+        &expected,
+        &counters,
+        task_failures,
+    );
+    Ok(())
+}
+
+async fn run_http_load(
+    cfg: Arc<Config>,
+    started: Instant,
+    finished: Instant,
+    counters: Arc<Vec<Counters>>,
+) -> u64 {
+    let target = match parse_http_target(&cfg.target_url) {
+        Ok(target) => Arc::new(target),
+        Err(error) => {
+            eprintln!("could not parse TARGET_URL: {error:#}");
+            return cfg.tenants as u64;
+        }
+    };
+    let pool_size = cfg.http_connections.min(cfg.tenants).max(1);
+    let mut senders = Vec::with_capacity(pool_size);
+    let mut workers = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let (tx, rx) = mpsc::channel::<ScheduledRequest>(cfg.tenants.max(1024));
+        senders.push(tx);
+        workers.push(tokio::spawn(run_http_worker(
+            Arc::clone(&cfg),
+            Arc::clone(&target),
+            Arc::clone(&counters),
+            rx,
+        )));
+    }
+
+    let tasks = (0..cfg.tenants)
+        .map(|tenant| {
+            let cfg = Arc::clone(&cfg);
+            let sender = senders[tenant % pool_size].clone();
+            tokio::spawn(
+                async move { schedule_tenant(cfg, tenant, started, finished, sender).await },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut task_failures = join_task_results(tasks).await;
+    drop(senders);
+    for worker in workers {
+        if let Err(error) = worker.await {
+            task_failures += 1;
+            eprintln!("http worker panicked: {error:#}");
+        }
+    }
+    task_failures
+}
+
+async fn run_grpc_load(
+    cfg: Arc<Config>,
+    started: Instant,
+    finished: Instant,
+    counters: Arc<Vec<Counters>>,
+) -> u64 {
     let tasks = (0..cfg.tenants)
         .map(|tenant| {
             let cfg = Arc::clone(&cfg);
             let counters = Arc::clone(&counters);
-            tokio::spawn(async move { run_tenant(cfg, tenant, started, finished, counters).await })
+            tokio::spawn(
+                async move { run_grpc_tenant(cfg, tenant, started, finished, counters).await },
+            )
         })
         .collect::<Vec<_>>();
 
+    join_task_results(tasks).await
+}
+
+async fn join_task_results(tasks: Vec<tokio::task::JoinHandle<Result<()>>>) -> u64 {
     let mut task_failures = 0_u64;
     for result in join_all(tasks).await {
         match result {
@@ -132,88 +232,308 @@ async fn main() -> Result<()> {
             }
         }
     }
+    task_failures
+}
 
-    print_summary(&cfg, started_wall_ms, windows, &counters, task_failures);
+async fn schedule_tenant(
+    cfg: Arc<Config>,
+    tenant: usize,
+    started: Instant,
+    finished: Instant,
+    sender: mpsc::Sender<ScheduledRequest>,
+) -> Result<()> {
+    let schedule = TenantSchedule::new(&cfg, tenant, started, finished);
+    for request in schedule {
+        sleep_until(request.scheduled_at).await;
+        if sender.send(request).await.is_err() {
+            break;
+        }
+    }
     Ok(())
 }
 
-async fn run_tenant(
+async fn run_grpc_tenant(
     cfg: Arc<Config>,
     tenant: usize,
     started: Instant,
     finished: Instant,
     counters: Arc<Vec<Counters>>,
 ) -> Result<()> {
-    let interval = Duration::from_nanos(1_000_000_000_u64 / cfg.rps_per_tenant.max(1));
-    let mut next = started;
-    let mut grpc = if cfg.backend == Backend::Grpc {
-        Some(RateLimitServiceClient::connect(format!("http://{}", cfg.grpc_addr)).await?)
-    } else {
-        None
-    };
-    let http = if cfg.backend == Backend::Http {
-        Some(parse_http_target(&cfg.target_url)?)
-    } else {
-        None
-    };
-
-    while next < finished {
-        sleep_until(next).await;
-        let elapsed = next.saturating_duration_since(started);
-        let window = (elapsed.as_millis() / u128::from(cfg.window_ms)) as usize;
-        if let Some(counter) = counters.get(window) {
-            let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
-            let outcome = match cfg.backend {
-                Backend::Http => {
-                    timeout(request_timeout, call_http(http.as_ref().unwrap(), tenant))
-                        .await
-                        .unwrap_or(Outcome::Fail)
-                }
-                Backend::Grpc => timeout(
-                    request_timeout,
-                    call_grpc(
-                        grpc.as_mut().unwrap(),
-                        &cfg.domain,
-                        &cfg.descriptor_key,
-                        tenant,
-                    ),
-                )
-                .await
-                .unwrap_or(Outcome::Fail),
-            };
+    let mut grpc = RateLimitServiceClient::connect(format!("http://{}", cfg.grpc_addr)).await?;
+    let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
+    let schedule = TenantSchedule::new(&cfg, tenant, started, finished);
+    for request in schedule {
+        sleep_until(request.scheduled_at).await;
+        if let Some(counter) = counters.get(request.window) {
+            let outcome = timeout(
+                request_timeout,
+                call_grpc(&mut grpc, &cfg.domain, &cfg.descriptor_key, tenant),
+            )
+            .await
+            .unwrap_or(Outcome::Fail);
             counter.add(outcome);
         }
-        next += interval;
     }
     Ok(())
 }
 
-async fn call_http(target: &HttpTarget, tenant: usize) -> Outcome {
-    call_http_inner(target, tenant)
+async fn run_http_worker(
+    cfg: Arc<Config>,
+    target: Arc<HttpTarget>,
+    counters: Arc<Vec<Counters>>,
+    mut rx: mpsc::Receiver<ScheduledRequest>,
+) {
+    let mut stream = None;
+    let mut read_buf = Vec::with_capacity(4096);
+    while let Some(request) = rx.recv().await {
+        let Some(counter) = counters.get(request.window) else {
+            continue;
+        };
+        let deadline = request.scheduled_at + Duration::from_millis(cfg.request_timeout_ms);
+        let now = Instant::now();
+        if now >= deadline {
+            counter.add(Outcome::Fail);
+            continue;
+        }
+        let outcome = timeout(
+            deadline.saturating_duration_since(now),
+            call_http(&target, request.tenant, &mut stream, &mut read_buf),
+        )
         .await
-        .unwrap_or(Outcome::Fail)
+        .unwrap_or_else(|_| {
+            stream = None;
+            Outcome::Fail
+        });
+        counter.add(outcome);
+    }
 }
 
-async fn call_http_inner(target: &HttpTarget, tenant: usize) -> Result<Outcome> {
+async fn call_http(
+    target: &HttpTarget,
+    tenant: usize,
+    stream: &mut Option<TcpStream>,
+    read_buf: &mut Vec<u8>,
+) -> Outcome {
+    let had_stream = stream.is_some();
+    match call_http_inner(target, tenant, stream, read_buf).await {
+        Ok(outcome) => outcome,
+        Err(_) if had_stream => {
+            *stream = None;
+            call_http_inner(target, tenant, stream, read_buf)
+                .await
+                .unwrap_or(Outcome::Fail)
+        }
+        Err(_) => {
+            *stream = None;
+            Outcome::Fail
+        }
+    }
+}
+
+async fn call_http_inner(
+    target: &HttpTarget,
+    tenant: usize,
+    stream: &mut Option<TcpStream>,
+    read_buf: &mut Vec<u8>,
+) -> Result<Outcome> {
+    if stream.is_none() {
+        *stream = Some(TcpStream::connect((target.host.as_str(), target.port)).await?);
+    }
     let path = format!("{}{}{}", target.path_prefix, tenant, target.path_suffix);
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\n\r\n",
         target.authority
     );
-    let mut stream = TcpStream::connect((target.host.as_str(), target.port)).await?;
-    stream.write_all(request.as_bytes()).await?;
-    let mut buf = [0_u8; 128];
-    let n = stream.read(&mut buf).await?;
-    let status = std::str::from_utf8(&buf[..n]).unwrap_or_default();
-    Ok(
-        if status.starts_with("HTTP/1.1 429") || status.starts_with("HTTP/1.0 429") {
+    let conn = stream.as_mut().expect("stream just connected");
+    conn.write_all(request.as_bytes()).await?;
+    let response = read_http_response(conn, read_buf).await?;
+    if !response.reusable {
+        *stream = None;
+    }
+    Ok(response.outcome)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HttpResponse {
+    outcome: Outcome,
+    reusable: bool,
+}
+
+async fn read_http_response(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<HttpResponse> {
+    buf.clear();
+    let header_end = loop {
+        if let Some(end) = find_header_end(buf) {
+            break end;
+        }
+        let mut chunk = [0_u8; 1024];
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            bail!("connection closed before HTTP response headers");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > 16 * 1024 {
+            bail!("HTTP response headers exceeded 16KiB");
+        }
+    };
+    let headers = std::str::from_utf8(&buf[..header_end]).unwrap_or_default();
+    let first_line = headers.lines().next().unwrap_or_default();
+    let outcome =
+        if first_line.starts_with("HTTP/1.1 429") || first_line.starts_with("HTTP/1.0 429") {
             Outcome::Over
-        } else if status.starts_with("HTTP/1.1 2") || status.starts_with("HTTP/1.0 2") {
+        } else if first_line.starts_with("HTTP/1.1 2") || first_line.starts_with("HTTP/1.0 2") {
             Outcome::Ok
         } else {
             Outcome::Fail
-        },
-    )
+        };
+
+    let Some(content_len) = content_length(headers) else {
+        return Ok(HttpResponse {
+            outcome,
+            reusable: false,
+        });
+    };
+    let already = buf.len().saturating_sub(header_end);
+    let mut remaining = content_len.saturating_sub(already);
+    while remaining > 0 {
+        let mut chunk = [0_u8; 1024];
+        let n = stream.read(&mut chunk[..remaining.min(1024)]).await?;
+        if n == 0 {
+            bail!("connection closed before HTTP response body completed");
+        }
+        remaining -= n;
+    }
+    Ok(HttpResponse {
+        outcome,
+        reusable: true,
+    })
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+fn content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+struct TenantSchedule {
+    tenant: usize,
+    tenants: usize,
+    rps_per_tenant: u64,
+    window_ms: u64,
+    started: Instant,
+    duration_ns: u128,
+    seq: u128,
+}
+
+impl TenantSchedule {
+    fn new(cfg: &Config, tenant: usize, started: Instant, finished: Instant) -> Self {
+        Self {
+            tenant,
+            tenants: cfg.tenants,
+            rps_per_tenant: cfg.rps_per_tenant,
+            window_ms: cfg.window_ms,
+            started,
+            duration_ns: finished.saturating_duration_since(started).as_nanos(),
+            seq: 0,
+        }
+    }
+
+    fn offset_ns(&self) -> u128 {
+        tenant_phase_ns(self.tenant, self.tenants, self.rps_per_tenant)
+            + self.seq * 1_000_000_000_u128 / u128::from(self.rps_per_tenant)
+    }
+}
+
+impl Iterator for TenantSchedule {
+    type Item = ScheduledRequest;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let offset_ns = self.offset_ns();
+        if offset_ns >= self.duration_ns {
+            return None;
+        }
+        self.seq += 1;
+        let window = (offset_ns / (u128::from(self.window_ms) * 1_000_000)) as usize;
+        let scheduled_at = self.started + duration_from_nanos(offset_ns);
+        Some(ScheduledRequest {
+            tenant: self.tenant,
+            window,
+            scheduled_at,
+        })
+    }
+}
+
+fn tenant_phase_ns(tenant: usize, tenants: usize, rps_per_tenant: u64) -> u128 {
+    (tenant as u128 * 1_000_000_000_u128)
+        / (tenants.max(1) as u128 * u128::from(rps_per_tenant.max(1)))
+}
+
+fn duration_from_nanos(ns: u128) -> Duration {
+    let ns = ns.min(u128::from(u64::MAX)) as u64;
+    Duration::from_nanos(ns)
+}
+
+fn expected_allowed_per_window(cfg: &Config, windows: u64) -> Vec<u64> {
+    let mut expected = vec![0_u64; windows as usize];
+    let started = Instant::now();
+    let finished = started + Duration::from_millis(windows.saturating_mul(cfg.window_ms));
+    for tenant in 0..cfg.tenants {
+        let mut current_window = 0_usize;
+        let mut offered = 0_u64;
+        for request in TenantSchedule::new(cfg, tenant, started, finished) {
+            if request.window != current_window {
+                if let Some(slot) = expected.get_mut(current_window) {
+                    *slot = slot.saturating_add(offered.min(cfg.budget_per_tenant));
+                }
+                current_window = request.window;
+                offered = 0;
+            }
+            offered = offered.saturating_add(1);
+        }
+        if let Some(slot) = expected.get_mut(current_window) {
+            *slot = slot.saturating_add(offered.min(cfg.budget_per_tenant));
+        }
+    }
+    expected
+}
+
+fn expected_attempts_total(cfg: &Config, windows: u64) -> u64 {
+    let mut total = 0_u64;
+    let started = Instant::now();
+    let finished = started + Duration::from_millis(windows.saturating_mul(cfg.window_ms));
+    for tenant in 0..cfg.tenants {
+        total = total
+            .saturating_add(TenantSchedule::new(cfg, tenant, started, finished).count() as u64);
+    }
+    total
+}
+
+fn expected_allowed_total(cfg: &Config, windows: u64) -> u64 {
+    let mut total = 0_u64;
+    let started = Instant::now();
+    let finished = started + Duration::from_millis(windows.saturating_mul(cfg.window_ms));
+    let tenant_budget = cfg.budget_per_tenant.saturating_mul(windows);
+    for tenant in 0..cfg.tenants {
+        let offered = TenantSchedule::new(cfg, tenant, started, finished).count() as u64;
+        total = total.saturating_add(offered.min(tenant_budget));
+    }
+    total
+}
+
+fn expected_load(cfg: &Config, windows: u64) -> ExpectedLoad {
+    ExpectedLoad {
+        attempts: expected_attempts_total(cfg, windows),
+        allowed: expected_allowed_total(cfg, windows),
+        allowed_per_window: expected_allowed_per_window(cfg, windows),
+    }
 }
 
 async fn call_grpc(
@@ -291,6 +611,7 @@ fn print_summary(
     cfg: &Config,
     started_wall_ms: u64,
     windows: u64,
+    expected: &ExpectedLoad,
     counters: &[Counters],
     task_failures: u64,
 ) {
@@ -303,6 +624,9 @@ fn print_summary(
     println!("  tenants                    {}", cfg.tenants);
     println!("  budget per tenant/window   {}", cfg.budget_per_tenant);
     println!("  rps per tenant             {}", cfg.rps_per_tenant);
+    if cfg.backend == Backend::Http {
+        println!("  http connections           {}", cfg.http_connections);
+    }
     println!("  window ms                  {}", cfg.window_ms);
     println!("  windows                    {}", windows);
     println!("  started wall ms            {}", started_wall_ms);
@@ -310,26 +634,62 @@ fn print_summary(
     println!("  per-window:");
     for (idx, counter) in counters.iter().enumerate() {
         let (ok, over, fail) = counter.snapshot();
+        let expected_ok = expected
+            .allowed_per_window
+            .get(idx)
+            .copied()
+            .unwrap_or_default();
         total_ok += ok;
         total_over += over;
         total_fail += fail;
-        println!(
-            "    window={idx} ok={ok} over={over} fail={fail} expected_ok={}",
-            cfg.tenants as u64 * cfg.budget_per_tenant
-        );
+        println!("    window={idx} ok={ok} over={over} fail={fail} expected_ok={expected_ok}",);
     }
     println!();
+    println!("  expected attempts          {}", expected.attempts);
     println!(
         "  actual attempts            {}",
         total_ok + total_over + total_fail
     );
-    println!(
-        "  expected allowed           {}",
-        cfg.tenants as u64 * cfg.budget_per_tenant * windows
-    );
+    println!("  expected allowed           {}", expected.allowed);
     println!("  actual allowed             {total_ok}");
     println!("  actual rejected            {total_over}");
     println!("  failed calls               {total_fail}");
+    let elapsed_s = (windows.saturating_mul(cfg.window_ms)) as f64 / 1_000.0;
+    let actual_attempts = total_ok
+        .saturating_add(total_over)
+        .saturating_add(total_fail);
+    if elapsed_s > 0.0 {
+        println!(
+            "  transmit rate              {:.1} r/s",
+            actual_attempts as f64 / elapsed_s
+        );
+        println!(
+            "  allowed rate               {:.1} r/s",
+            total_ok as f64 / elapsed_s
+        );
+        println!(
+            "  limited rate               {:.1} r/s",
+            total_over as f64 / elapsed_s
+        );
+        println!(
+            "  failure rate               {:.1} r/s",
+            total_fail as f64 / elapsed_s
+        );
+    }
+    if actual_attempts > 0 {
+        println!(
+            "  allowed percent            {:.2}",
+            100.0 * total_ok as f64 / actual_attempts as f64
+        );
+        println!(
+            "  limited percent            {:.2}",
+            100.0 * total_over as f64 / actual_attempts as f64
+        );
+        println!(
+            "  failure percent            {:.2}",
+            100.0 * total_fail as f64 / actual_attempts as f64
+        );
+    }
     println!("---LOADER-SUMMARY-END---");
 }
 
@@ -354,6 +714,7 @@ impl Config {
             align_window: parse_bool_env("ALIGN_WINDOW", true)?,
             descriptor_key: env_value("DESCRIPTOR_KEY", "tenant"),
             request_timeout_ms: parse_env("REQUEST_TIMEOUT_MS", 2_000)?,
+            http_connections: parse_env("HTTP_CONNECTIONS", 20)?,
         })
         .and_then(|cfg| {
             if cfg.tenants == 0 {
@@ -364,6 +725,15 @@ impl Config {
             }
             if cfg.window_ms == 0 {
                 bail!("WINDOW_MS must be greater than zero");
+            }
+            if cfg.duration_s == 0 {
+                bail!("DURATION_S must be greater than zero");
+            }
+            if cfg.request_timeout_ms == 0 {
+                bail!("REQUEST_TIMEOUT_MS must be greater than zero");
+            }
+            if cfg.http_connections == 0 {
+                bail!("HTTP_CONNECTIONS must be greater than zero");
             }
             Ok(cfg)
         })
