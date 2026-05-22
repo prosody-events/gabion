@@ -291,3 +291,20 @@ against pathological client input.
 This mirrors the nginx adapter's behaviour; see the
 [Fail-open invariant](../../README.md#fail-open-invariant) section of
 the main README for the full statement.
+
+## Migration from the previous YAML
+
+Pre-1.0: there's no deprecation cycle, just one-shot updates to operator
+configs. The old `limit:` + `window:` pair becomes a single mandatory
+`rate:` string plus optional `window:` / `bucket:` durations:
+
+| Before                                          | After                                                                                                                                  |
+|-------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| `limit: 100, window: 60s`                       | `rate: 100r/m`                                                                                                                         |
+| `limit: 10, window: 1s`                         | `rate: 10r/s`                                                                                                                          |
+| `limit: 180000, window: 5h`                     | `rate: 10r/s, window: 5h` (same resolved limit, original intent preserved)                                                             |
+| sub-period limits (`limit: 100, window: 500ms`) | move the period into the rate: `rate: 100r/500ms`. `window: 500ms` paired with `rate: 200r/s` is rejected (would resolve to `limit=0`). |
+
+Read [Rate, window, and bucket](#rate-window-and-bucket) before you
+reach for `window:` — long windows with the default `bucket:` produce
+a *burstable* budget, not a paced one.

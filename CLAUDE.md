@@ -53,8 +53,8 @@ The workspace lives under `crates/`:
 
 - **`gossip-bench`** — gossip propagation simulator. Runs scenario JSON
   specs through `gossip::sim::SimTransport` and emits result JSON;
-  `bench/plot.py` produces the convergence plots referenced from
-  `docs/Gossip Propagation Benchmarks.md`.
+  `bench/plot.py` produces the convergence plots. See
+  `crates/gossip-bench/README.md`.
 
 Deployment manifests, NGINX docker-compose, Kubernetes smoke harnesses,
 and the cross-version NGINX/OpenResty build matrices live under
