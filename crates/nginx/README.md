@@ -415,10 +415,10 @@ http {
         gabion_limit per_ip per_tenant;     # baseline at server level
         location /api/      { /* inherits per_ip + per_tenant */ }
         location /api/upload {
-            # Replaces the baseline. per_ip and per_tenant are restated
-            # so they keep applying alongside upload_throttle. Drop them
-            # from this list to scope them out of /api/upload.
-            gabion_limit per_ip per_tenant upload_throttle;
+            # Replaces the baseline: only upload_throttle applies here.
+            # per_ip and per_tenant are NOT in effect — restate them
+            # explicitly if you want them to keep applying.
+            gabion_limit upload_throttle;
         }
         location /api/healthz { gabion_limit off; }   # local opt-out
         location /static/     { gabion off; }         # skip access handler entirely
