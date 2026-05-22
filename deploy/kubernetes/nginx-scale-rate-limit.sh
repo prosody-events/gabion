@@ -192,11 +192,46 @@ assert_pod_rate_limit() {
     fi
 }
 
+summarize_pod() {
+    pod="$1"
+    printf '\n=== pod %s ===\n' "$pod"
+
+    printf '\n-- nginx error log (gabion tracing + leader status) --\n'
+    kubectl -n "$namespace" logs --tail=120 "$pod" 2>&1 \
+        | grep -iE 'gabion|leader|gossip|warn|error|notice' \
+        | sed 's/^/  /' \
+        | head -n 40 || true
+
+    printf '\n-- pod info --\n'
+    kubectl -n "$namespace" get pod "$pod" \
+        -o 'jsonpath={.status.podIP}{"\t"}{.spec.nodeName}{"\n"}' \
+        | sed 's/^/  ip=node=/'
+
+    # Issue a burst so we can quote total / rejected counts back at the user.
+    printf '\n-- burst sample (10 requests against /api) --\n'
+    allowed=0
+    rejected=0
+    cardinality=0
+    other=0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/api/index.html")"
+        case "$code" in
+            200) allowed=$((allowed + 1)) ;;
+            429) rejected=$((rejected + 1)) ;;
+            400) cardinality=$((cardinality + 1)) ;;
+            *)   other=$((other + 1)) ;;
+        esac
+    done
+    printf '  allowed=%d  rejected=%d  cardinality=%d  other=%d\n' \
+        "$allowed" "$rejected" "$cardinality" "$other"
+}
+
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
 wait_for_endpoint_count 1
 pods="$(wait_for_pods 1)"
 for pod in $pods; do
     assert_pod_rate_limit "$pod"
+    summarize_pod "$pod"
 done
 
 kubectl -n "$namespace" scale deployment/gabion-nginx --replicas=0
@@ -209,10 +244,23 @@ wait_for_endpoint_count 3
 pods="$(wait_for_pods 3)"
 for pod in $pods; do
     assert_pod_rate_limit "$pod"
+    summarize_pod "$pod"
 done
+
+# Cluster-wide overview at the end so the operator can confirm everything
+# settled into the expected state.
+printf '\n=== cluster overview ===\n'
+printf '\n-- pods --\n'
+kubectl -n "$namespace" get pods -o wide 2>&1 | sed 's/^/  /'
+printf '\n-- service & endpoints --\n'
+kubectl -n "$namespace" get svc,endpointslice -o wide 2>&1 | sed 's/^/  /'
+printf '\n-- recent events --\n'
+kubectl -n "$namespace" get events --sort-by=.lastTimestamp 2>&1 \
+    | tail -n 12 | sed 's/^/  /' || true
 
 kubectl -n "$namespace" scale deployment/gabion-nginx --replicas=1
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
 wait_for_endpoint_count 1
 
-printf '%s\n' "local kubernetes NGINX EndpointSlice scale and per-pod rate-limit test passed on context '$context' ($server)"
+printf '\nlocal kubernetes NGINX EndpointSlice scale and per-pod rate-limit test passed on context %s (%s)\n' \
+    "$context" "$server"

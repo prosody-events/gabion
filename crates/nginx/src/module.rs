@@ -445,6 +445,12 @@ extern "C" fn set_zone(
         let identity = derive_identity(main.identity_seed.as_deref());
         region.header().identity.store_node_id(identity.node_id.0);
 
+        // Anchor the lease's clock at this moment. Without it, the
+        // try_acquire pack-and-compare path can't distinguish "active"
+        // from "expired" because unix epoch millis exceed the u40 expiry
+        // bit budget. See shm::lease module docs.
+        region.lease().set_init_millis(wall_millis());
+
         SHM_PTR.store(mapped, Ordering::Release);
         SHM_LEN.store(total, Ordering::Release);
         SHM_QUEUE_CAPACITY.store(queue_capacity, Ordering::Release);
