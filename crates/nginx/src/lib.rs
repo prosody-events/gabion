@@ -23,4 +23,6 @@ pub mod rules;
 pub mod shm;
 
 #[cfg(feature = "ngx-module")]
+mod log;
+#[cfg(feature = "ngx-module")]
 mod module;

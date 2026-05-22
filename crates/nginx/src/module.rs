@@ -24,7 +24,7 @@ use ngx::http::{
     self, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, MergeConfigError,
     NgxHttpCoreModule,
 };
-use ngx::{http_request_handler, ngx_log_error, ngx_string};
+use ngx::{http_request_handler, ngx_string};
 
 use gabion::discovery::DiscoveryConfig;
 use gabion::rules::EnforcementMode;
@@ -33,6 +33,7 @@ use crate::access::{self, AccessCtx, AccessOutcome, RejectInfo, VariableLookup};
 use crate::headers::RejectHeaders;
 use crate::identity::derive_identity;
 use crate::leader::{self, GossipSettings, LeaderConfig};
+use crate::log;
 use crate::rules::{CompiledRules, DEFAULT_DOMAIN, DescriptorBinding, RuleConfig};
 use crate::shm::{Layout, ShmRegion};
 
@@ -79,6 +80,14 @@ impl http::HttpModule for Module {
         unsafe {
             &ngx_http_gabion_module
         }
+    }
+
+    /// nginx invokes this once per cycle in the master process before any
+    /// `gabion_*` directive callback runs. We use it to install the
+    /// tracing→nginx subscriber so config-phase log lines route correctly.
+    unsafe extern "C" fn preconfiguration(_cf: *mut ngx_conf_t) -> ngx_int_t {
+        log::install();
+        core::Status::NGX_OK.into()
     }
 
     /// nginx invokes this exactly once per cycle, from the master process,
@@ -428,9 +437,11 @@ extern "C" fn set_zone(
         };
 
         let Some(layout) = Layout::new(queue_capacity, aggregate_capacity) else {
-            log_info(format_args!(
-                "gabion: invalid SHM layout queue={queue_capacity} aggregate={aggregate_capacity}"
-            ));
+            tracing::error!(
+                queue_capacity,
+                aggregate_capacity,
+                "gabion: invalid SHM layout",
+            );
             return core::NGX_CONF_ERROR;
         };
         let total = bytes.max(layout.total_bytes);
@@ -456,10 +467,13 @@ extern "C" fn set_zone(
         SHM_QUEUE_CAPACITY.store(queue_capacity, Ordering::Release);
         SHM_AGGREGATE_CAPACITY.store(aggregate_capacity, Ordering::Release);
         main.zone_name = Some(name.to_string());
-        log_info(format_args!(
-            "gabion: zone allocated name={name} bytes={total} queue={queue_capacity} \
-             aggregate={aggregate_capacity}"
-        ));
+        tracing::info!(
+            zone = name,
+            bytes = total,
+            queue = queue_capacity,
+            aggregate = aggregate_capacity,
+            "gabion: zone allocated",
+        );
         core::NGX_CONF_OK
     }
 }
@@ -780,7 +794,7 @@ fn install_worker_globals(main: &MainConfig) {
     let rules = match CompiledRules::compile(&main.rules) {
         Ok(r) => Arc::new(r),
         Err(error) => {
-            log_info(format_args!("gabion: rule compile failed: {error}"));
+            tracing::error!(%error, "gabion: rule compile failed");
             return;
         }
     };
@@ -804,6 +818,10 @@ fn install_worker_globals(main: &MainConfig) {
 /// `cycle` argument points to a valid `ngx_cycle_t` for the duration of the
 /// call; we do not dereference it here.
 unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
+    // Workers inherit the global tracing dispatch via fork; re-install is
+    // idempotent and covers any path that bypassed `preconfiguration`.
+    log::install();
+
     let Some(globals) = WORKER_GLOBALS.get() else {
         return core::Status::NGX_OK.into();
     };
@@ -819,9 +837,7 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
         leader::DEFAULT_LEASE_TTL.as_millis() as u64,
     ) {
         // Another worker holds the lease — be a follower for this turn.
-        log_info(format_args!(
-            "gabion: worker {worker_id} did not win leader lease"
-        ));
+        tracing::info!(worker_id, "gabion: worker did not win leader lease");
         return core::Status::NGX_OK.into();
     }
 
@@ -844,9 +860,7 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
     if let Ok(mut slot) = LEADER_THREAD.lock() {
         *slot = Some(handle);
     }
-    log_info(format_args!(
-        "gabion: leader thread spawned worker={worker_id}"
-    ));
+    tracing::info!(worker_id, "gabion: leader thread spawned");
     core::Status::NGX_OK.into()
 }
 
@@ -863,7 +877,7 @@ unsafe extern "C" fn gabion_exit_process(_cycle: *mut ngx_cycle_t) {
     if let Some(handle) = handle
         && let Err(error) = handle.join()
     {
-        log_info(format_args!("gabion: leader thread panicked: {error:?}"));
+        tracing::error!(?error, "gabion: leader thread panicked");
     }
 }
 
@@ -916,11 +930,6 @@ fn parse_rate(input: &str) -> Result<u64, ()> {
         return Err(());
     };
     number.parse::<u64>().map_err(|_| ())
-}
-
-fn log_info(args: std::fmt::Arguments<'_>) {
-    let log = ngx::log::ngx_cycle_log().as_ptr();
-    ngx_log_error!(ngx::ffi::NGX_LOG_INFO, log, "{}", args);
 }
 
 fn wall_millis() -> u64 {
