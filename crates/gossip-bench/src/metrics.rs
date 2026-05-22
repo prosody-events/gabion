@@ -28,7 +28,9 @@ pub struct TickSnapshot {
     /// Virtual-time millis since the scenario started.
     pub t_millis: u64,
     /// Per-node total observed via the local `AggregateStore`. Indexed
-    /// by node position in `Scenario.nodes`.
+    /// by node position in `Scenario.nodes`. For the two-rule mixed
+    /// workload, this collapses across rules; per-rule totals live in
+    /// `per_node_hot_total` / `per_node_cold_total` when set.
     pub per_node_total: Vec<u64>,
     /// Ground-truth total — every hit ever issued by every workload at
     /// or before `t_millis`. The Demers/Astrolabe convergence metric is
@@ -39,6 +41,32 @@ pub struct TickSnapshot {
     pub bytes_sent_total: u64,
     /// Cumulative packets sent across all nodes up to this sample.
     pub packets_sent_total: u64,
+    /// Cumulative threshold-fire emit count summed across all nodes.
+    /// `0` when the runtime never crossed the per-rule error budget
+    /// between the previous tick and this one.
+    #[serde(default)]
+    pub threshold_fires_total: u64,
+    /// Cumulative tick count summed across all nodes (heartbeat + threshold
+    /// fires combined). Combined with `threshold_fires_total`, the bench can
+    /// derive `heartbeat_fires_total = ticks_total - threshold_fires_total`.
+    #[serde(default)]
+    pub ticks_total: u64,
+    /// Cumulative count of ticks (summed across nodes) that found at least
+    /// one dirty cell. Used to compute the *effective* fanout —
+    /// `packets_sent_total / dirty_ticks_total` across a sample window.
+    #[serde(default)]
+    pub dirty_ticks_total: u64,
+    /// Per-rule per-node totals for the two-rule mix workload. Empty for
+    /// every other workload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_node_hot_total: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_node_cold_total: Vec<u64>,
+    /// Ground-truth split for the two-rule mix.
+    #[serde(default)]
+    pub ground_truth_hot_total: u64,
+    #[serde(default)]
+    pub ground_truth_cold_total: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -76,6 +104,27 @@ pub struct Headline {
     /// workload is sustained.
     pub p50_staleness_millis: Option<u64>,
     pub p95_staleness_millis: Option<u64>,
+    /// Average threshold-fire emits per node across the run. Zero when
+    /// the workload never crosses the per-rule error budget — for those
+    /// scenarios every emit was a heartbeat tick.
+    #[serde(default)]
+    pub threshold_fires_per_node: f64,
+    /// Effective per-tick fanout — the median (p50) and 95th percentile
+    /// of `packets_emitted / nodes_with_dirty_cells` across all sample
+    /// windows in which at least one node was dirty. With static
+    /// `fanout=f`, both numbers sit at `f` in steady state; under burst
+    /// the runtime's adaptive widening pushes them up toward `log₂
+    /// dirty`. `None` when no sample window contained dirty work.
+    #[serde(default)]
+    pub effective_fanout_p50: Option<f64>,
+    #[serde(default)]
+    pub effective_fanout_p95: Option<f64>,
+    /// Peak `ground_truth_total - min(per_node_total)` over the run.
+    /// For the `error_budget` suite this is the empirical worst-case
+    /// staleness operators would see if every node converged to its
+    /// laggiest peer.
+    #[serde(default)]
+    pub max_lag: u64,
     /// Optional extra fields scenarios use to surface their headline
     /// number (e.g. partition `reconvergence_millis`).
     #[serde(default)]

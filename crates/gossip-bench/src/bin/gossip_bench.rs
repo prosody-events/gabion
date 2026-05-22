@@ -141,6 +141,8 @@ fn example_scenario(kind: &str) -> Option<String> {
         seed: 0xDEAD_BEEF,
         cell_capacity: 256,
         max_cells_per_tick: 256,
+        target_err_bps: None,
+        min_emit_interval: None,
     };
 
     match kind {
@@ -202,6 +204,7 @@ fn example_scenario(kind: &str) -> Option<String> {
             base.workload = Workload::Sustained {
                 sources: vec![0, 1, 2, 3],
                 per_tick: 1,
+                rule_limit: None,
             };
             base.duration = Duration::from_secs(10);
         }
@@ -214,6 +217,61 @@ fn example_scenario(kind: &str) -> Option<String> {
         "fanout_sweep" => {
             base.name = "fanout_5".to_string();
             base.fanout = 5;
+        }
+        "adaptive_fanout" => {
+            base.name = "adaptive_fanout_burst".to_string();
+            base.kind = ScenarioKind::AdaptiveFanout;
+            base.nodes = 32;
+            base.fanout = 1;
+            base.duration = Duration::from_secs(5);
+            // 256 distinct keys at once → 256 dirty cells; adaptive
+            // fanout should widen by ~log₂(256) = 8 even though
+            // static is 1.
+            base.workload = Workload::DistinctKeyBurst {
+                node: 0,
+                cells: 256,
+                at: Duration::from_millis(100),
+            };
+        }
+        "error_budget" => {
+            base.name = "error_budget_100bps".to_string();
+            base.kind = ScenarioKind::ErrorBudget;
+            base.nodes = 16;
+            base.duration = Duration::from_secs(5);
+            base.target_err_bps = Some(100);
+            base.workload = Workload::Sustained {
+                sources: (0..16).collect(),
+                per_tick: 10,
+                rule_limit: Some(1600),
+            };
+        }
+        "min_emit_clamp" => {
+            base.name = "min_emit_clamp_5ms".to_string();
+            base.kind = ScenarioKind::MinEmitClamp;
+            base.nodes = 8;
+            base.duration = Duration::from_secs(1);
+            base.min_emit_interval = Some(Duration::from_millis(5));
+            base.workload = Workload::BurstCompressed {
+                node: 0,
+                hits: 10_000,
+                at: Duration::from_millis(0),
+                burst_span: Duration::from_millis(50),
+            };
+        }
+        "heartbeat_threshold_mix" => {
+            base.name = "heartbeat_threshold_mix".to_string();
+            base.kind = ScenarioKind::HeartbeatThresholdMix;
+            base.nodes = 8;
+            base.duration = Duration::from_secs(5);
+            base.workload = Workload::TwoRule {
+                hot_node: 0,
+                hot_per_tick: 200,
+                hot_limit: 1_000,
+                cold_node: 1,
+                cold_per_interval: 1,
+                cold_interval: Duration::from_secs(1),
+                cold_limit: 1_000_000,
+            };
         }
         _ => return None,
     }

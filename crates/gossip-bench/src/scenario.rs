@@ -45,6 +45,19 @@ pub struct Scenario {
     /// Per-tick gossip frame ceiling — also stored on `GossipConfig`.
     #[serde(default = "default_max_cells_per_tick")]
     pub max_cells_per_tick: usize,
+    /// Per-rule error budget in basis points of the rule limit, used for
+    /// threshold-triggered anti-entropy. `None` means: use
+    /// `gabion::defaults::GOSSIP_TARGET_ERR_BPS` (100 bps = 1 %). Lower
+    /// values fire emits sooner and burn more bandwidth; higher values
+    /// let local error accumulate before replicating.
+    #[serde(default)]
+    pub target_err_bps: Option<u32>,
+    /// Minimum gap between two threshold-fire emissions. `None` means:
+    /// use `gabion::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS` (5 ms). Caps
+    /// worst-case bandwidth when the error budget saturates under
+    /// adversarial request rates.
+    #[serde(default, with = "humantime_serde::option")]
+    pub min_emit_interval: Option<Duration>,
 }
 
 fn default_seed() -> u64 {
@@ -76,6 +89,22 @@ pub enum ScenarioKind {
     Staleness,
     /// Karp / Bimodal: convergence as a function of cluster size.
     ScaleN,
+    /// Verma & Ooi-style: rounds-to-converge stays O(log N) as the
+    /// dirty-set cardinality grows because the runtime widens fanout
+    /// with `log₂(dirty)`.
+    AdaptiveFanout,
+    /// Olston / Sharfman-style: bandwidth and max lag as the per-rule
+    /// `target_err_bps` budget changes. Confirms the cluster-wide error
+    /// bound `N × ε_R` and shows the bandwidth/accuracy trade.
+    ErrorBudget,
+    /// Adversarial saturating write rate: confirms `min_emit_interval`
+    /// caps worst-case emit rate while the cluster still converges
+    /// after the burst.
+    MinEmitClamp,
+    /// One cold rule (well under ε) + one hot rule (saturating ε)
+    /// running concurrently: both must converge — hot via threshold
+    /// fires, cold via the proactive heartbeat.
+    HeartbeatThresholdMix,
 }
 
 /// Per-link network conditions. Pairs are referenced by node *index*
@@ -124,8 +153,11 @@ pub struct ScheduledNetworkChange {
     pub apply: Vec<LinkModel>,
 }
 
-/// Workload driving the cluster. All workloads share the same rule
-/// fingerprint and key so the convergence metric is well-defined.
+/// Workload driving the cluster. Single-rule workloads share the same
+/// rule fingerprint and key so the convergence metric is well-defined;
+/// `TwoRule` exposes a hot/cold pair with distinct fingerprints so the
+/// `heartbeat_threshold_mix` scenario can measure both code paths in one
+/// run.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "shape", rename_all = "snake_case")]
 pub enum Workload {
@@ -139,7 +171,15 @@ pub enum Workload {
     },
     /// `per_tick` writes per source node per tick — the steady-state
     /// workload used by Astrolabe-style staleness measurements.
-    Sustained { sources: Vec<usize>, per_tick: u64 },
+    /// `rule_limit` overrides the bench's default for scenarios that
+    /// need to exercise the per-rule error budget at a different
+    /// `pending > ε` crossing point.
+    Sustained {
+        sources: Vec<usize>,
+        per_tick: u64,
+        #[serde(default)]
+        rule_limit: Option<u64>,
+    },
     /// Burst at one node every `interval`. Used to stress the gossip
     /// pipeline.
     Burst {
@@ -147,5 +187,44 @@ pub enum Workload {
         per_burst: u64,
         #[serde(with = "humantime_serde")]
         interval: Duration,
+    },
+    /// Burst at one node, but compressed into a tight window of size
+    /// `burst_span` starting at `at`. The bench issues `hits` writes
+    /// distributed across `burst_span` so virtual time has a chance to
+    /// advance between them — used by `min_emit_clamp` to drive the
+    /// runtime under an adversarial sustained rate.
+    BurstCompressed {
+        node: usize,
+        hits: u64,
+        #[serde(with = "humantime_serde")]
+        at: Duration,
+        #[serde(with = "humantime_serde")]
+        burst_span: Duration,
+    },
+    /// Issue `cells` distinct-key writes at one node in a single
+    /// instant. Each write lands in its own CRDT cell — that's what
+    /// makes the local dirty ring's cardinality jump to `cells` in one
+    /// step, which is what the `adaptive_fanout` suite needs to see
+    /// the runtime widen its per-tick fanout.
+    DistinctKeyBurst {
+        node: usize,
+        cells: u32,
+        #[serde(with = "humantime_serde")]
+        at: Duration,
+    },
+    /// Two-rule workload for `heartbeat_threshold_mix`. The `hot` rule
+    /// receives a saturating burst that should fire the threshold path;
+    /// the `cold` rule receives a slow trickle that should ride the
+    /// proactive heartbeat. Both rules use the same node so we can
+    /// observe both gossip paths in one run.
+    TwoRule {
+        hot_node: usize,
+        hot_per_tick: u64,
+        hot_limit: u64,
+        cold_node: usize,
+        cold_per_interval: u64,
+        #[serde(with = "humantime_serde")]
+        cold_interval: Duration,
+        cold_limit: u64,
     },
 }

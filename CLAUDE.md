@@ -58,8 +58,9 @@ The workspace lives under `crates/`:
 
 Deployment manifests, NGINX docker-compose, Kubernetes smoke harnesses,
 and the cross-version NGINX/OpenResty build matrices live under
-`deploy/`. Background documents — CRDT design, gossip gap analysis,
-distributed rate-limit semantics — live under `docs/`.
+`deploy/`. The gossip protocol explainer, operator-knob reference, and
+benchmark results live in `crates/gabion/README.md`; the CRDT design
+deep-dive lives in `crates/gabion/CRDT.md`.
 
 ## How a request flows
 
@@ -313,13 +314,15 @@ shape.
 
 ## Documentation lives in README.md
 
-Project-level documentation belongs in `README.md` (or the appropriate
-`README.md` under a crate or `docs/` subdirectory). Don't scatter
+Project-level documentation belongs in `README.md`, either at the
+repo root or next to the crate it documents (e.g.
+`crates/gabion/README.md`). Long-form deep-dives sit beside the README
+that links them (e.g. `crates/gabion/CRDT.md`). Don't scatter
 explanatory prose into new top-level `*.md` files, into long comment
 blocks at the top of source files, or into `CLAUDE.md` itself —
 `CLAUDE.md` is for contributor rules, not narrative docs. When you
 need to write something a human will read outside the code, put it in
-README.
+the relevant README and link it from the surrounding context.
 
 ## Workflow conventions
 

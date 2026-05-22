@@ -149,6 +149,16 @@ where
     // `tokio::select!` wait and dispatches a synthetic `Tick` outcome.
     want_immediate_flush: bool,
 
+    // Observability counters surfaced through `AdminSnapshot`. None of
+    // them feed back into the hot path — they exist purely so the
+    // benchmark harness can split heartbeat-driven emits from
+    // threshold-driven ones and compute the *effective* fanout (packets
+    // emitted ÷ dirty ticks). Single-threaded `!Send` runtime, so plain
+    // `u64`s are cheaper and clearer than atomics.
+    ticks_total: u64,
+    threshold_fires: u64,
+    dirty_ticks: u64,
+
     _not_send: PhantomData<*const ()>,
 }
 
@@ -285,6 +295,9 @@ where
             rule_pending,
             rule_last_emit_ms,
             want_immediate_flush: false,
+            ticks_total: 0,
+            threshold_fires: 0,
+            dirty_ticks: 0,
             _not_send: PhantomData,
         };
         let client = GossipClient::new(req_tx);
@@ -326,7 +339,15 @@ where
                 // emit the dirty rows immediately. `tick.tick()` is not
                 // consumed, so the heartbeat cadence naturally drifts
                 // forward (`MissedTickBehavior::Delay`).
+                //
+                // Count one threshold-fire per dispatched synthetic
+                // tick. Multiple requests in the same `select!`
+                // iteration can all set `want_immediate_flush=true`,
+                // but only one synthetic tick consumes the flag, so
+                // bumping here gives the bench an accurate split
+                // between threshold fires and heartbeat fires.
                 self.want_immediate_flush = false;
+                self.threshold_fires = self.threshold_fires.saturating_add(1);
                 ArmOutcome::Tick
             } else {
                 // Split-borrow scope: we hand the I/O futures non-overlapping
@@ -582,6 +603,9 @@ where
                     send_pending_depth: self.send_pending.len(),
                     decode_reject_count: self.decode_reject_count,
                     max_send_pending_depth: self.max_send_pending_depth,
+                    ticks_total: self.ticks_total,
+                    threshold_fires: self.threshold_fires,
+                    dirty_ticks: self.dirty_ticks,
                 };
                 // Caller may have dropped the receiver; not an error.
                 let _ = reply.send(snapshot);
@@ -622,6 +646,11 @@ where
     }
 
     fn handle_gossip_tick(&mut self) {
+        // Step 0: bump the total-ticks counter. Tracked unconditionally
+        // (even for empty / no-peer ticks) so the bench can split the
+        // run's wall time into heartbeat ticks vs threshold fires.
+        self.ticks_total = self.ticks_total.saturating_add(1);
+
         // Step 1: expire aged-out cells so we don't gossip them.
         let now_millis = self.clock.now_millis();
         self.expiration_buf.clear();
@@ -630,6 +659,13 @@ where
         if self.store.is_empty() || self.peers.is_empty() || self.send_free.is_empty() {
             return;
         }
+
+        // The store was non-empty when this tick fired — bench harness
+        // counts this as a "dirty tick" so effective-fanout reports
+        // `packets / dirty_ticks` rather than `packets / wall_ticks`.
+        // Bumped before the peer-pick math runs so synthetic threshold
+        // ticks (which by construction have local_dirty>0) always count.
+        self.dirty_ticks = self.dirty_ticks.saturating_add(1);
 
         // Step 2: pick `fanout` distinct peers via a partial Fisher-Yates
         // shuffle of `self.peers` in place. With-replacement sampling would

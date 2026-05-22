@@ -1,6 +1,9 @@
-# The `crdt` Module
+# The `crdt` module
 
-A guide to `crates/gabion/src/crdt/*` for somebody who has never opened this code before.
+A guide to `crates/gabion/src/crdt/*` for somebody who has never opened
+this code before. This is the deep-dive companion to
+[`README.md`](README.md), which describes how the gossip runtime sits
+on top of the structures documented here.
 
 This document explains the per-origin counter CRDT that powers Gabion's distributed rate limiting. It is organised so you can read it end-to-end and build up a complete mental model: it starts with the problem, sketches the module map, walks through each piece bottom-up, traces how writes and reads flow through the structures, and ends with a single end-to-end example, an invariants reference, and a glossary.
 

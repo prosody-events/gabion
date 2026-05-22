@@ -10,8 +10,9 @@ a single cluster and share counters. If you're not running Envoy or you
 want enforcement inside nginx itself, see the [main nginx README](../../README.md)
 instead.
 
-For the broader architecture see `CLAUDE.md`; for CRDT internals see
-`docs/CRDT Module.md`.
+For the broader architecture see [`CLAUDE.md`](../../CLAUDE.md); for
+the gossip protocol see [`crates/gabion/README.md`](../gabion/README.md);
+for CRDT internals see [`crates/gabion/CRDT.md`](../gabion/CRDT.md).
 
 ## Your first YAML
 

@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 
 use gabion::crdt::{
@@ -16,7 +17,10 @@ use gabion::crdt::{
     NodeIdentity,
 };
 use gabion::gossip::sim::{LinkPolicy, SimRouter, sim_advance};
-use gabion::gossip::{AggregateStore, GossipClient, GossipConfig, GossipRuntime, TokioClock};
+use gabion::gossip::{
+    AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipConfig, GossipRuntime,
+    TokioClock,
+};
 use gabion::wire::FrameLimits;
 
 use crate::metrics::{Headline, NodeMetrics, ScenarioResult, TickSnapshot};
@@ -27,6 +31,12 @@ const RULE_FINGERPRINT: u128 = 0xC0FE_DEAD_BEEF_BABE_F00D;
 const KEY: u128 = 0x0123_4567_89AB_CDEF;
 const BUCKET: BucketEpoch = 1;
 const RULE_LIMIT: u64 = 1_000_000;
+
+// Two-rule mix uses these in addition to the single-rule constants above.
+const HOT_RULE_FINGERPRINT: u128 = 0xA110_7B07_7B07_7B07;
+const COLD_RULE_FINGERPRINT: u128 = 0xC01D_CAFE_CAFE_CAFE;
+const HOT_KEY: u128 = 0x1111_1111_1111_1111;
+const COLD_KEY: u128 = 0x2222_2222_2222_2222;
 
 /// Run one scenario to completion and return its `ScenarioResult`.
 ///
@@ -130,18 +140,29 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
             tick_interval: scenario.tick_interval,
             auth_key: None,
             rng_seed: scenario.seed.wrapping_add(i as u64),
-            target_err_bps: gabion::defaults::GOSSIP_TARGET_ERR_BPS,
-            min_emit_interval: Duration::from_millis(gabion::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
+            target_err_bps: scenario
+                .target_err_bps
+                .unwrap_or(gabion::defaults::GOSSIP_TARGET_ERR_BPS),
+            min_emit_interval: scenario.min_emit_interval.unwrap_or_else(|| {
+                Duration::from_millis(gabion::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS)
+            }),
         };
 
         let aggregate = Rc::new(BenchAggregateStore::<u32>::default());
 
-        let (runtime, client) = GossipRuntime::from_parts(
+        // Each node gets its own admin command channel so the bench can
+        // pull threshold-fire / tick / dirty-tick counters out of the
+        // runtime on every sample. Capacity of one is enough: the bench
+        // is single-threaded and awaits each request before issuing the
+        // next.
+        let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
+        let (runtime, client) = GossipRuntime::from_parts_with_admin(
             transport,
             TokioClock::from_millis(0),
             gossip_cfg,
             store,
             aggregate.clone(),
+            Some(admin_rx),
         );
         let join = tokio::task::spawn_local(runtime.run(futures::stream::empty()));
 
@@ -149,6 +170,7 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
             client,
             counters,
             aggregate,
+            admin_tx,
             join,
         });
     }
@@ -164,10 +186,13 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
     let mut samples: Vec<TickSnapshot> = Vec::new();
     let mut elapsed = Duration::ZERO;
     let mut ground_truth: u64 = 0;
+    let mut ground_truth_hot: u64 = 0;
+    let mut ground_truth_cold: u64 = 0;
     let mut next_schedule_idx = 0;
+    let is_two_rule = matches!(scenario.workload, Workload::TwoRule { .. });
 
     // Initial sample at t=0.
-    samples.push(snapshot(0, &nodes, ground_truth));
+    samples.push(snapshot(0, &nodes, ground_truth, 0, 0, is_two_rule).await);
 
     while elapsed < duration {
         // Compute the workload hits issued in (elapsed, elapsed+sample].
@@ -192,7 +217,9 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
         // sample_interval (granularity is fine for the metrics we
         // collect).
         let issued = apply_workload(&scenario.workload, &nodes, elapsed, step_end).await?;
-        ground_truth = ground_truth.saturating_add(issued);
+        ground_truth = ground_truth.saturating_add(issued.total);
+        ground_truth_hot = ground_truth_hot.saturating_add(issued.hot);
+        ground_truth_cold = ground_truth_cold.saturating_add(issued.cold);
 
         // Advance virtual time in tick-sized chunks so the runtimes get
         // their per-tick gossip exchange. `sim_advance` itself yields
@@ -210,7 +237,17 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
             remaining -= step;
         }
         elapsed = step_end;
-        samples.push(snapshot(elapsed.as_millis() as u64, &nodes, ground_truth));
+        samples.push(
+            snapshot(
+                elapsed.as_millis() as u64,
+                &nodes,
+                ground_truth,
+                ground_truth_hot,
+                ground_truth_cold,
+                is_two_rule,
+            )
+            .await,
+        );
     }
 
     // Shut down every runtime; ignore individual errors — the metric
@@ -252,6 +289,11 @@ struct NodeHandle {
     client: GossipClient<u32>,
     counters: CountingHandle,
     aggregate: Rc<BenchAggregateStore<u32>>,
+    /// Admin command sender used by the bench to snapshot threshold-fire,
+    /// total-tick, and dirty-tick counters from the runtime on every
+    /// sample. Sent off the hot path (one snapshot every
+    /// `sample_interval`), never on the per-request path.
+    admin_tx: mpsc::Sender<AdminCommand>,
     join: tokio::task::JoinHandle<Result<(), gabion::gossip::GossipError>>,
 }
 
@@ -290,13 +332,23 @@ fn apply_link(router: &SimRouter, addrs: &[SocketAddr], link: &crate::scenario::
     router.set_link_policy(from, to, policy);
 }
 
+/// Hits issued during one workload window, split across the rules the
+/// scenario tracks. `hot` + `cold` ≤ `total`; for single-rule workloads
+/// the entire count lands in `total` and the two splits stay zero.
+#[derive(Clone, Copy, Debug, Default)]
+struct IssuedHits {
+    total: u64,
+    hot: u64,
+    cold: u64,
+}
+
 async fn apply_workload(
     workload: &Workload,
     nodes: &[NodeHandle],
     window_start: Duration,
     window_end: Duration,
-) -> Result<u64> {
-    let mut issued = 0_u64;
+) -> Result<IssuedHits> {
+    let mut issued = IssuedHits::default();
     match workload {
         Workload::SingleWrite { node, hits, at } => {
             if *at >= window_start && *at < window_end {
@@ -313,13 +365,18 @@ async fn apply_workload(
                         at.as_millis() as u64,
                     )
                     .await?;
-                issued = issued.saturating_add(*hits);
+                issued.total = issued.total.saturating_add(*hits);
             }
         }
-        Workload::Sustained { sources, per_tick } => {
+        Workload::Sustained {
+            sources,
+            per_tick,
+            rule_limit,
+        } => {
             // Treat "per_tick" as "per sample window" for simplicity.
             // Sustained scenarios sample every tick so this matches the
             // intended cadence.
+            let limit = rule_limit.unwrap_or(RULE_LIMIT);
             for source in sources {
                 let n = nodes
                     .get(*source)
@@ -330,11 +387,11 @@ async fn apply_workload(
                         KeyHash(KEY),
                         BUCKET,
                         *per_tick,
-                        RULE_LIMIT,
+                        limit,
                         window_end.as_millis() as u64,
                     )
                     .await?;
-                issued = issued.saturating_add(*per_tick);
+                issued.total = issued.total.saturating_add(*per_tick);
             }
         }
         Workload::Burst {
@@ -359,8 +416,145 @@ async fn apply_workload(
                         t.as_millis() as u64,
                     )
                     .await?;
-                issued = issued.saturating_add(*per_burst);
+                issued.total = issued.total.saturating_add(*per_burst);
                 t = t.checked_add(*interval).unwrap_or(window_end);
+            }
+        }
+        Workload::BurstCompressed {
+            node,
+            hits,
+            at,
+            burst_span,
+        } => {
+            let burst_end = at.checked_add(*burst_span).unwrap_or(window_end);
+            if *at < window_end && burst_end > window_start {
+                // Distribute `hits` evenly across `burst_span` so virtual
+                // time can advance between sub-bursts. Each sub-burst
+                // bumps `now_millis` by 1 ms — that's what makes
+                // `min_emit_interval` enforceable; if every hit shared a
+                // timestamp the floor check would saturate to zero.
+                let overlap_start = (*at).max(window_start);
+                let overlap_end = burst_end.min(window_end);
+                let total_span_ms = burst_span.as_millis().max(1) as u64;
+                let overlap_span_ms =
+                    overlap_end.saturating_sub(overlap_start).as_millis().max(1) as u64;
+                // Hits attributable to this window are a proportional
+                // slice of the configured total.
+                let in_window = (((*hits) as u128) * (overlap_span_ms as u128)
+                    / (total_span_ms as u128)) as u64;
+                if in_window > 0 {
+                    let n = nodes
+                        .get(*node)
+                        .with_context(|| format!("burst_compressed node {node} out of range"))?;
+                    // Step in 1 ms-spaced sub-bursts so the floor check
+                    // sees forward progress. `step_count` caps at the
+                    // window span so we don't pile thousands of micro-
+                    // writes into one millisecond.
+                    let step_count = overlap_span_ms.max(1);
+                    let base_now_ms = overlap_start.as_millis() as u64;
+                    let per_step = in_window / step_count;
+                    let remainder = in_window - per_step * step_count;
+                    for step in 0..step_count {
+                        let count = per_step + if step < remainder { 1 } else { 0 };
+                        if count > 0 {
+                            // limit=1 forces ε to saturate at 1 — every
+                            // hit crosses the budget. That's the
+                            // adversarial shape `min_emit_clamp` is
+                            // meant to exercise.
+                            n.client
+                                .record(
+                                    RULE_FINGERPRINT,
+                                    KeyHash(KEY),
+                                    BUCKET,
+                                    count,
+                                    1,
+                                    base_now_ms + step,
+                                )
+                                .await?;
+                        }
+                        // Advance virtual time one millisecond between
+                        // every sub-step so the runtime's own clock
+                        // tracks `req.now_millis` — that's what makes
+                        // `min_emit_interval` enforceable. Without this,
+                        // `self.clock.now_millis()` would stay pinned
+                        // and the floor check would saturate to zero.
+                        gabion::gossip::sim::sim_advance(Duration::from_millis(1)).await;
+                    }
+                    issued.total = issued.total.saturating_add(in_window);
+                }
+            }
+        }
+        Workload::DistinctKeyBurst { node, cells, at } => {
+            if *at >= window_start && *at < window_end {
+                let n = nodes
+                    .get(*node)
+                    .with_context(|| format!("distinct_key_burst node {node} out of range"))?;
+                // One hit per distinct key — the cardinality of dirty
+                // cells produced is `cells`, which is the lever
+                // `adaptive_fanout` uses to drive `log₂(dirty)`.
+                for i in 0..*cells {
+                    n.client
+                        .record(
+                            RULE_FINGERPRINT,
+                            // Mix the index into the high bits so each
+                            // call hits a different `KeyHash` slot in
+                            // the CellStore.
+                            KeyHash(KEY ^ ((i as u128) << 64)),
+                            BUCKET,
+                            1,
+                            RULE_LIMIT,
+                            at.as_millis() as u64,
+                        )
+                        .await?;
+                }
+                issued.total = issued.total.saturating_add(*cells as u64);
+            }
+        }
+        Workload::TwoRule {
+            hot_node,
+            hot_per_tick,
+            hot_limit,
+            cold_node,
+            cold_per_interval,
+            cold_interval,
+            cold_limit,
+        } => {
+            let hot = nodes
+                .get(*hot_node)
+                .with_context(|| format!("two_rule hot_node {hot_node} out of range"))?;
+            hot.client
+                .record(
+                    HOT_RULE_FINGERPRINT,
+                    KeyHash(HOT_KEY),
+                    BUCKET,
+                    *hot_per_tick,
+                    *hot_limit,
+                    window_end.as_millis() as u64,
+                )
+                .await?;
+            issued.hot = issued.hot.saturating_add(*hot_per_tick);
+            issued.total = issued.total.saturating_add(*hot_per_tick);
+
+            // Cold trickle: issue exactly once at each `cold_interval`
+            // boundary that falls inside this window.
+            let cold = nodes
+                .get(*cold_node)
+                .with_context(|| format!("two_rule cold_node {cold_node} out of range"))?;
+            let mut t = ceil_to_multiple(window_start, *cold_interval);
+            while t < window_end {
+                cold.client
+                    .record(
+                        COLD_RULE_FINGERPRINT,
+                        KeyHash(COLD_KEY),
+                        BUCKET,
+                        *cold_per_interval,
+                        *cold_limit,
+                        t.as_millis() as u64,
+                    )
+                    .await?;
+                issued.cold = issued.cold.saturating_add(*cold_per_interval);
+                issued.total = issued.total.saturating_add(*cold_per_interval);
+                t = t.checked_add(*cold_interval).unwrap_or(window_end);
             }
         }
     }
@@ -408,17 +602,73 @@ async fn drain_pending_tasks(node_count: usize) {
     }
 }
 
-fn snapshot(t_millis: u64, nodes: &[NodeHandle], ground_truth: u64) -> TickSnapshot {
+async fn snapshot(
+    t_millis: u64,
+    nodes: &[NodeHandle],
+    ground_truth: u64,
+    ground_truth_hot: u64,
+    ground_truth_cold: u64,
+    is_two_rule: bool,
+) -> TickSnapshot {
     let per_node_total: Vec<u64> = nodes.iter().map(|n| n.aggregate.total()).collect();
     let bytes_total: u64 = nodes.iter().map(|n| n.counters.bytes_sent()).sum();
     let packets_total: u64 = nodes.iter().map(|n| n.counters.packets_sent()).sum();
+
+    // Pull threshold/heartbeat/dirty counters out of every runtime via
+    // its admin channel. Each request is one `oneshot` round-trip — done
+    // sequentially because the runner is single-threaded.
+    let mut threshold_fires_total = 0_u64;
+    let mut ticks_total = 0_u64;
+    let mut dirty_ticks_total = 0_u64;
+    for n in nodes {
+        if let Some(snap) = admin_snapshot(&n.admin_tx).await {
+            threshold_fires_total = threshold_fires_total.saturating_add(snap.threshold_fires);
+            ticks_total = ticks_total.saturating_add(snap.ticks_total);
+            dirty_ticks_total = dirty_ticks_total.saturating_add(snap.dirty_ticks);
+        }
+    }
+
+    let (per_node_hot_total, per_node_cold_total) = if is_two_rule {
+        (
+            nodes
+                .iter()
+                .map(|n| n.aggregate.total_for_rule(HOT_RULE_FINGERPRINT))
+                .collect(),
+            nodes
+                .iter()
+                .map(|n| n.aggregate.total_for_rule(COLD_RULE_FINGERPRINT))
+                .collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     TickSnapshot {
         t_millis,
         per_node_total,
         ground_truth_total: ground_truth,
         bytes_sent_total: bytes_total,
         packets_sent_total: packets_total,
+        threshold_fires_total,
+        ticks_total,
+        dirty_ticks_total,
+        per_node_hot_total,
+        per_node_cold_total,
+        ground_truth_hot_total: ground_truth_hot,
+        ground_truth_cold_total: ground_truth_cold,
     }
+}
+
+/// Pull one `AdminSnapshot` out of a runtime. Returns `None` if the
+/// runtime has already shut down or the channel was dropped — the
+/// caller treats that as "no new counters to merge", which keeps the
+/// final snapshot well-defined even after the shutdown path runs.
+async fn admin_snapshot(tx: &mpsc::Sender<AdminCommand>) -> Option<AdminSnapshot> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(AdminCommand::Snapshot { reply: reply_tx })
+        .await
+        .ok()?;
+    reply_rx.await.ok()
 }
 
 fn compute_headline(
@@ -459,6 +709,31 @@ fn compute_headline(
     // ground_truth changes over time (Sustained / Burst workloads).
     let (p50_staleness_millis, p95_staleness_millis) = staleness_quantiles(samples);
 
+    // Threshold fires: average per node across the run. Pulled from the
+    // last snapshot which carries the cumulative count.
+    let threshold_fires_per_node = samples
+        .last()
+        .map(|s| s.threshold_fires_total as f64 / n_nodes)
+        .unwrap_or(0.0);
+
+    // Effective fanout: across each sample window, how many distinct
+    // peer-bound packets did the cluster emit per dirty tick? Quantiles
+    // are taken over the per-window ratios so a steady-state run reports
+    // the same number for p50 and p95.
+    let (effective_fanout_p50, effective_fanout_p95) = effective_fanout_quantiles(samples);
+
+    // Max lag: peak `ground_truth - min(per_node_total)` across the run.
+    // For the `error_budget` suite this is the empirical bound to
+    // compare against `N × ε_R`.
+    let max_lag = samples
+        .iter()
+        .map(|s| {
+            let min = s.per_node_total.iter().copied().min().unwrap_or(0);
+            s.ground_truth_total.saturating_sub(min)
+        })
+        .max()
+        .unwrap_or(0);
+
     let mut extras = HashMap::new();
     if scenario.kind == ScenarioKind::Partition {
         // If the run scheduled a heal, record time-to-reconverge from
@@ -486,6 +761,77 @@ fn compute_headline(
         }
     }
 
+    if scenario.kind == ScenarioKind::HeartbeatThresholdMix {
+        // Surface per-rule convergence so the bench can confirm both
+        // paths drained: hot via threshold fires, cold via heartbeat.
+        if let Some(hot) = samples.iter().find_map(|s| {
+            if s.ground_truth_hot_total > 0
+                && s.per_node_hot_total
+                    .iter()
+                    .all(|t| *t >= s.ground_truth_hot_total)
+            {
+                Some(s.t_millis)
+            } else {
+                None
+            }
+        }) {
+            extras.insert(
+                "hot_convergence_millis".to_string(),
+                serde_json::Value::from(hot),
+            );
+        }
+        if let Some(cold) = samples.iter().find_map(|s| {
+            if s.ground_truth_cold_total > 0
+                && s.per_node_cold_total
+                    .iter()
+                    .all(|t| *t >= s.ground_truth_cold_total)
+            {
+                Some(s.t_millis)
+            } else {
+                None
+            }
+        }) {
+            extras.insert(
+                "cold_convergence_millis".to_string(),
+                serde_json::Value::from(cold),
+            );
+        }
+    }
+
+    if scenario.kind == ScenarioKind::ErrorBudget {
+        // Quote the theoretical bound alongside the empirical one. ε_R
+        // = max(1, L_R × bps / 10_000 / N); cluster-wide bound is N × ε_R
+        // = max(N, L_R × bps / 10_000). Use the workload's actual
+        // rule_limit (Sustained may override the bench default).
+        let bps = scenario
+            .target_err_bps
+            .unwrap_or(gabion::defaults::GOSSIP_TARGET_ERR_BPS) as u64;
+        let n = scenario.nodes as u64;
+        let l = match &scenario.workload {
+            Workload::Sustained {
+                rule_limit: Some(l),
+                ..
+            } => *l,
+            _ => RULE_LIMIT,
+        };
+        let cluster_bound = (l * bps / 10_000).max(n);
+        extras.insert(
+            "theoretical_max_lag".to_string(),
+            serde_json::Value::from(cluster_bound),
+        );
+        extras.insert("target_err_bps".to_string(), serde_json::Value::from(bps));
+        extras.insert("rule_limit".to_string(), serde_json::Value::from(l));
+    }
+
+    if scenario.kind == ScenarioKind::MinEmitClamp
+        && let Some(floor) = scenario.min_emit_interval
+    {
+        extras.insert(
+            "min_emit_interval_ms".to_string(),
+            serde_json::Value::from(floor.as_millis() as u64),
+        );
+    }
+
     Headline {
         convergence_millis,
         convergence_rounds,
@@ -494,8 +840,45 @@ fn compute_headline(
         packets_per_node_per_second,
         p50_staleness_millis,
         p95_staleness_millis,
+        threshold_fires_per_node,
+        effective_fanout_p50,
+        effective_fanout_p95,
+        max_lag,
         extras,
     }
+}
+
+/// Effective fanout = packets emitted between two consecutive sample
+/// windows divided by the number of dirty ticks in the same window. We
+/// compute one ratio per window in which the cluster did any dirty work
+/// at all and then take quantiles. Returns `None` for both quantiles
+/// when no window had dirty activity.
+fn effective_fanout_quantiles(samples: &[TickSnapshot]) -> (Option<f64>, Option<f64>) {
+    if samples.len() < 2 {
+        return (None, None);
+    }
+    let mut ratios: Vec<f64> = Vec::new();
+    for window in samples.windows(2) {
+        let dirty = window[1]
+            .dirty_ticks_total
+            .saturating_sub(window[0].dirty_ticks_total);
+        if dirty == 0 {
+            continue;
+        }
+        let packets = window[1]
+            .packets_sent_total
+            .saturating_sub(window[0].packets_sent_total);
+        ratios.push(packets as f64 / dirty as f64);
+    }
+    if ratios.is_empty() {
+        return (None, None);
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pick = |q: f64| -> f64 {
+        let idx = ((ratios.len() as f64) * q).clamp(0.0, (ratios.len() - 1) as f64);
+        ratios[idx as usize]
+    };
+    (Some(pick(0.5)), Some(pick(0.95)))
 }
 
 fn staleness_quantiles(samples: &[TickSnapshot]) -> (Option<u64>, Option<u64>) {
@@ -577,6 +960,19 @@ pub(crate) struct BenchAggregateStore<C: Count> {
 impl<C: Count> BenchAggregateStore<C> {
     pub fn total(&self) -> u64 {
         self.inner.borrow().values().copied().sum()
+    }
+
+    /// Sum of stored counts whose rule fingerprint matches `rule`. Used
+    /// by the two-rule mix workload to split hot vs cold totals at
+    /// snapshot time without needing to teach the aggregate store about
+    /// rule names.
+    pub fn total_for_rule(&self, rule: u128) -> u64 {
+        self.inner
+            .borrow()
+            .iter()
+            .filter(|((r, ..), _)| *r == rule)
+            .map(|(_, c)| *c)
+            .sum()
     }
 
     pub fn apply_calls(&self) -> u64 {

@@ -6,18 +6,16 @@ protocol, and admit or reject each request against the cluster-wide
 aggregate. Counts are eventually consistent; admission is local and
 allocation-free.
 
-```
-                ┌─────────────┐     ┌─────────────┐
-   request ───▶ │   nginx     │     │   gabiond   │ ◀─── Envoy
-                │ + gabion.so │ ◀──▶│  (gRPC svc) │
-                └─────────────┘ UDP └─────────────┘
-                      gossip ▲             ▲
-                             │             │
-                             └─ same CRDT, same wire codec, same rules
+```mermaid
+flowchart LR
+    client["request"] --> nginx["nginx<br/>+ gabion.so"]
+    envoy["Envoy"] --> gabiond["gabiond<br/>(gRPC service)"]
+    nginx <-->|UDP gossip| gabiond
 ```
 
-Two adapters consume one core, so an nginx pod and an Envoy sidecar
-can share counters inside the same cluster.
+Both stacks load the same library — same CRDT, same wire codec, same
+rules. An nginx pod and an Envoy sidecar can share counters inside one
+cluster as long as they agree on the gossip cluster identifier.
 
 ## Contents
 
@@ -66,8 +64,22 @@ a dropped UDP frame just means counters re-converge on the next tick.
 
 The library knows nothing about YAML, gRPC, or nginx. Adapters bridge
 their own config to library types and own their own transport. See
-[`docs/CRDT Module.md`](docs/CRDT%20Module.md) for the data structures
-and [`CLAUDE.md`](CLAUDE.md) for the deeper architecture.
+[`crates/gabion/CRDT.md`](crates/gabion/CRDT.md) for the data
+structures and [`CLAUDE.md`](CLAUDE.md) for the deeper architecture.
+
+### Gossip in one paragraph
+
+Each node runs an anti-entropy loop that exchanges dirty CRDT rows with
+peers on a heartbeat (`tick_interval`, default 100 ms). Under a burst,
+fanout adapts: a single tick can contact up to `log₂(dirty)` peers
+where `dirty` is the count of locally-dirty cells, so convergence stays
+O(log N) regardless of burst size. Between heartbeats, a per-rule error
+budget (`target_err_bps`, default 1 % of the rule's limit) lets hot
+rules fire a *synthetic* gossip tick before the next heartbeat would
+have run, bounding the cluster-wide unreplicated error per rule to
+`N × ε_R`; cold rules ride the proactive heartbeat. See
+[`crates/gabion/README.md`](crates/gabion/README.md) for the full
+gossip explainer, the operator-knob reference, and benchmark results.
 
 ## Choose your adapter
 
@@ -127,9 +139,10 @@ for adapter-specific syntax.
 
 Tuning the gossip cadence is rarely necessary — defaults converge in
 well under a second at production scale. See
-[`crates/gossip-bench/README.md`](crates/gossip-bench/README.md) for
-the simulator that produces measured convergence curves at different
-fanouts and cluster sizes.
+[`crates/gabion/README.md`](crates/gabion/README.md) for the operator
+knobs and measured convergence curves;
+[`crates/gossip-bench/README.md`](crates/gossip-bench/README.md)
+documents how to re-run the benchmark suite locally.
 
 ## Fail-open invariant
 
@@ -171,10 +184,11 @@ under [`deploy/`](deploy).
 
 ## Further reading
 
+- [`crates/gabion/README.md`](crates/gabion/README.md) — the gossip explainer, operator-knob reference, and benchmark results.
+- [`crates/gabion/CRDT.md`](crates/gabion/CRDT.md) — design of the counter store, end-to-end.
 - [`crates/nginx/README.md`](crates/nginx/README.md) — operator guide for the nginx module.
 - [`crates/server/README.md`](crates/server/README.md) — operator guide for `gabiond`.
-- [`docs/CRDT Module.md`](docs/CRDT%20Module.md) — design of the counter store.
-- [`crates/gossip-bench/README.md`](crates/gossip-bench/README.md) — gossip propagation simulator and convergence plots.
+- [`crates/gossip-bench/README.md`](crates/gossip-bench/README.md) — how to re-run the benchmark suite locally.
 - [`deploy/nginx/README.md`](deploy/nginx/README.md) — building the module against different nginx / OpenResty base images.
 
 ## Contributing

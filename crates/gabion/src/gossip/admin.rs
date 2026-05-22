@@ -37,6 +37,23 @@ pub struct AdminSnapshot {
     /// exercised under saturation — without re-queue, the depth never
     /// rises above 1.
     pub max_send_pending_depth: usize,
+    /// Cumulative ticks the runtime has processed. Includes both
+    /// heartbeat ticks (the proactive timer) and synthetic ticks
+    /// triggered by `handle_limit_request` crossing a per-rule error
+    /// budget. Combined with `threshold_fires`, lets observers split
+    /// the two.
+    pub ticks_total: u64,
+    /// Subset of `ticks_total` that were threshold-triggered — i.e. a
+    /// `LimitRequest` crossed `target_err_bps × limit / (10_000 × N)`
+    /// and `min_emit_interval` had elapsed, so the run loop dispatched
+    /// a synthetic tick without waiting for the heartbeat.
+    pub threshold_fires: u64,
+    /// Cumulative ticks (heartbeat + threshold) during which at least
+    /// one cell was dirty when `handle_gossip_tick` entered the peer
+    /// pick. Used by the bench to compute *effective fanout*
+    /// (`packets_emitted / dirty_ticks`) — see
+    /// `crates/gossip-bench/README.md`.
+    pub dirty_ticks: u64,
 }
 
 /// One peer known to the runtime. `node_id` is `None` until the runtime has
