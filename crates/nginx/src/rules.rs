@@ -12,7 +12,7 @@ use gabion::defaults;
 use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId, RuleTable};
 use thiserror::Error;
 
-pub use gabion::rules::RuleSpec;
+pub use gabion::rules::{RateResolveError, ResolvedRate, RuleSpec, parse_rate, resolve_rate};
 
 /// Default domain assigned to rules that don't name one explicitly. nginx
 /// requests carry no inherent "domain" the way Envoy descriptors do, so we
@@ -275,43 +275,6 @@ pub fn is_dns_label(s: &str) -> bool {
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
-/// Parse a `rate=` value into `(count, period)`.
-///
-/// The suffix after `r/` is either a single-letter unit (`s`, `m`, `h`,
-/// `d`) or a [humantime] duration (`30s`, `5m`, `2h30m`). Zero counts and
-/// zero periods are rejected at parse time so `cfg.limit.max(1)` is never
-/// load-bearing in downstream code.
-///
-/// [humantime]: https://docs.rs/humantime
-pub fn parse_rate(input: &str) -> Result<(u64, Duration), &'static str> {
-    let input = input.trim();
-    let Some((number, period)) = input.split_once("r/") else {
-        return Err(
-            "expected `rate=Nr/<unit>` where unit is `s|m|h|d` or a duration (e.g. `rate=100r/s`, \
-             `rate=10r/5m`)",
-        );
-    };
-    let count: u64 = number
-        .parse()
-        .map_err(|_| "rate count must be a non-negative integer (e.g. `rate=100r/s`)")?;
-    if count == 0 {
-        return Err("`rate=` must be a positive integer; zero would deny all traffic");
-    }
-    let duration = match period {
-        "s" => Duration::from_secs(1),
-        "m" => Duration::from_secs(60),
-        "h" => Duration::from_secs(60 * 60),
-        "d" => Duration::from_secs(60 * 60 * 24),
-        other => humantime::parse_duration(other).map_err(|_| {
-            "rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`"
-        })?,
-    };
-    if duration.is_zero() {
-        return Err("rate period must be greater than zero");
-    }
-    Ok((count, duration))
-}
-
 /// Parse a positional descriptor binding argument. Accepts:
 /// - `$uri` → key="uri", source="$uri" (auto-keyed; only when the source is a
 ///   single legal `$identifier`)
@@ -342,14 +305,14 @@ pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
             });
         }
         return Err(
-            "expected `$variable`, `name:$variable`, or one of `rate=`, `bucket=`, `mode=`, \
-             `dry_run`, `except_if=`, `domain=`",
+            "expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, \
+             `mode=`, `dry_run`, `except_if=`, `domain=`",
         );
     }
     let Some((key, source)) = rest.split_once(':') else {
         return Err(
-            "expected `$variable`, `name:$variable`, or one of `rate=`, `bucket=`, `mode=`, \
-             `dry_run`, `except_if=`, `domain=`",
+            "expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, \
+             `mode=`, `dry_run`, `except_if=`, `domain=`",
         );
     };
     if !is_descriptor_key(key) {

@@ -211,9 +211,9 @@ fn env_binding_names_use_single_underscores_only() {
 fn duplicate_rule_names_are_rejected() {
     let _env = EnvGuard::lock();
     let cfg = AppConfig::load_with_yaml_str(
-        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    limit: \
-         10\n    window: 1s\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip \
-         }]\n    limit: 5\n    window: 1s\n",
+        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
+         10r/s\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
+         5r/s\n",
     )
     .expect("yaml parses");
     let err = cfg.rule_table().expect_err("duplicate rules must error");
@@ -224,17 +224,17 @@ fn duplicate_rule_names_are_rejected() {
 }
 
 #[test]
-fn zero_limit_is_rejected_in_yaml() {
+fn zero_rate_is_rejected_in_yaml() {
     let _env = EnvGuard::lock();
     let cfg = AppConfig::load_with_yaml_str(
-        "limits:\n  - name: doomed\n    domain: nginx\n    descriptors: [{ key: ip }]\n    limit: \
-         0\n    window: 1s\n",
+        "limits:\n  - name: doomed\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
+         0r/s\n",
     )
     .expect("yaml parses");
-    let err = cfg.rule_table().expect_err("zero limit must error");
+    let err = cfg.rule_table().expect_err("zero rate must error");
     assert!(
-        matches!(err, ConfigError::ZeroLimit { ref name } if name == "doomed"),
-        "expected ZeroLimit, got {err:?}",
+        matches!(err, ConfigError::InvalidRate { ref name, .. } if name == "doomed"),
+        "expected InvalidRate, got {err:?}",
     );
 }
 
@@ -243,7 +243,7 @@ fn invalid_descriptor_key_rejected_in_yaml() {
     let _env = EnvGuard::lock();
     let cfg = AppConfig::load_with_yaml_str(
         "limits:\n  - name: bad_key\n    domain: nginx\n    descriptors: [{ key: \"with space\" \
-         }]\n    limit: 10\n    window: 1s\n",
+         }]\n    rate: 10r/s\n",
     )
     .expect("yaml parses");
     let err = cfg
@@ -256,11 +256,59 @@ fn invalid_descriptor_key_rejected_in_yaml() {
 }
 
 #[test]
+fn rate_only_yaml_infers_window_and_bucket() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
+         10r/m\n",
+    )
+    .expect("yaml parses");
+    let table = cfg.rule_table().expect("rule table");
+    let spec = table.iter().next().expect("one rule").spec();
+    assert_eq!(spec.limit, 10);
+    assert_eq!(spec.window_millis, 60_000);
+    assert_eq!(spec.bucket_millis, 60_000);
+    assert_eq!(spec.live_buckets, 1);
+}
+
+#[test]
+fn explicit_window_scales_limit_up() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
+         10r/s\n    window: 5h\n",
+    )
+    .expect("yaml parses");
+    let table = cfg.rule_table().expect("rule table");
+    let spec = table.iter().next().expect("one rule").spec();
+    assert_eq!(spec.limit, 10 * 5 * 3600);
+    assert_eq!(spec.window_millis, 5 * 3600 * 1_000);
+    // bucket defaults to the resolved window: one fixed-window bucket.
+    assert_eq!(spec.bucket_millis, 5 * 3600 * 1_000);
+    assert_eq!(spec.live_buckets, 1);
+}
+
+#[test]
+fn explicit_window_and_bucket_set_live_buckets() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
+         10r/s\n    window: 5h\n    bucket: 1h\n",
+    )
+    .expect("yaml parses");
+    let table = cfg.rule_table().expect("rule table");
+    let spec = table.iter().next().expect("one rule").spec();
+    assert_eq!(spec.limit, 10 * 5 * 3600);
+    assert_eq!(spec.bucket_millis, 3600 * 1_000);
+    assert_eq!(spec.live_buckets, 5);
+}
+
+#[test]
 fn bucket_defaults_to_window_when_omitted() {
     let _env = EnvGuard::lock();
     let cfg = AppConfig::load_with_yaml_str(
-        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    limit: \
-         10\n    window: 60s\n",
+        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
+         10r/m\n",
     )
     .expect("yaml parses");
     let table = cfg.rule_table().expect("rule table");
@@ -273,12 +321,48 @@ fn bucket_defaults_to_window_when_omitted() {
 fn explicit_bucket_overrides_window() {
     let _env = EnvGuard::lock();
     let cfg = AppConfig::load_with_yaml_str(
-        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    limit: \
-         10\n    window: 60s\n    bucket: 1s\n",
+        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
+         10r/m\n    bucket: 1s\n",
     )
     .expect("yaml parses");
     let table = cfg.rule_table().expect("rule table");
     let spec = table.iter().next().expect("one rule").spec();
     assert_eq!(spec.bucket_millis, 1_000);
     assert_eq!(spec.live_buckets, 60);
+}
+
+#[test]
+fn bad_rate_string_is_rejected() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: bad\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
+         100r/fortnight\n",
+    )
+    .expect("yaml parses");
+    let err = cfg.rule_table().expect_err("bad rate must error");
+    assert!(
+        matches!(err, ConfigError::InvalidRate { ref name, .. } if name == "bad"),
+        "expected InvalidRate, got {err:?}",
+    );
+}
+
+#[test]
+fn window_shorter_than_period_is_rejected() {
+    let _env = EnvGuard::lock();
+    let cfg = AppConfig::load_with_yaml_str(
+        "limits:\n  - name: inverted\n    domain: nginx\n    descriptors: [{ key: ip }]\n    \
+         rate: 10r/m\n    window: 500ms\n",
+    )
+    .expect("yaml parses");
+    let err = cfg.rule_table().expect_err("sub-period window must error");
+    assert!(
+        matches!(
+            err,
+            ConfigError::ResolveRate {
+                ref name,
+                source: gabion::rules::RateResolveError::WindowShorterThanPeriod,
+            } if name == "inverted"
+        ),
+        "expected ResolveRate(WindowShorterThanPeriod), got {err:?}",
+    );
 }

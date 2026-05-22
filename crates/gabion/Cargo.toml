@@ -12,6 +12,7 @@ either.workspace = true
 futures.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
+humantime.workspace = true
 k8s-openapi.workspace = true
 kube.workspace = true
 serde.workspace = true

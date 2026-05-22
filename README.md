@@ -84,8 +84,9 @@ Gabion-specific vocabulary used throughout this README:
 | **descriptor**  | A `key=value` pair like `tenant=acme` that names what the rule is counting.                                                               |
 | **binding**     | The recipe for building a descriptor from request data — e.g. `tenant:$arg_tenant` (read the `?tenant=` query arg as the descriptor key). |
 | **predicate**   | An `except_if=$var` condition that exempts a request from a rule when the variable is truthy.                                             |
-| **window**      | The time horizon the limit applies over, derived from `rate=Nr/<unit>`. `rate=10r/m` → 1-minute window.                                   |
-| **bucket**      | The granularity inside a window. Defaults to the window (one fixed-window bucket); set `bucket=` for sliding-window-style enforcement.    |
+| **rate**        | Sustained allowance, written `Nr/<unit>` (e.g. `100r/s`, `10r/5m`). The rate's period IS the default window unless overridden by `window=`. |
+| **window**      | The time horizon the rate is enforced over. Defaults to the rate's period; set `window=` to widen it (the resolved limit scales up).      |
+| **bucket**      | The granularity inside the window. Defaults to the window (one fixed-window bucket); set `bucket=` for sliding-window-style enforcement.  |
 | **cardinality** | How many distinct counters a rule can hold; bounded to prevent memory blow-ups when descriptor keys are unbounded user input.             |
 | **fail-open**   | Gabion never rejects on its own internal errors; only on a measured limit overflow. See [Fail-open invariant](#fail-open-invariant).      |
 | **gossip**      | The UDP background exchange that keeps counters in sync across nodes.                                                                     |
@@ -221,6 +222,11 @@ gabion_limit_rule shadow    $uri                 rate=1r/s  dry_run;
 # Non-round periods: any humantime-parsable duration after `r/`.
 gabion_limit_rule slow_path $uri                 rate=5r/30s;
 gabion_limit_rule daily_cap tenant:$arg_tenant   rate=10000r/d;
+
+# Explicit window= widens the time horizon; the resolved limit scales
+# from the rate up to fit. `rate=10r/s window=5h bucket=1h` enforces
+# a 180k-over-5h budget across five 1h buckets.
+gabion_limit_rule sustained tenant:$arg_tenant   rate=10r/s window=5h bucket=1h;
 ```
 
 #### Descriptor bindings
@@ -247,13 +253,66 @@ operator-meaningful compositions but pay for what they use.
 | Argument                | Meaning                                                                                                                                    |
 |-------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
 | `rate=Nr/<unit>`        | **Required.** `N` requests per the period named by `<unit>`. `<unit>` is `s\|m\|h\|d` (1 second / 1 minute / 1 hour / 1 day) or any humantime duration like `30s`, `5m`, `2h30m`. Must be a positive integer. |
-| `bucket=DURATION`       | Bucket granularity inside the window (default `1s`; **does not** track the rate's period). Smaller buckets enforce more smoothly; larger buckets cost less memory and gossip traffic. For a rule like `rate=1r/h`, leaving the default keeps 3600 1-second buckets — raise `bucket=` to coarsen. |
+| `window=DURATION`       | Time horizon the rate is enforced over (default: the rate's period). When set, the resolved limit scales up to `floor(rate_count * window / period)`. See "Rate, window, and bucket" below — and watch out for the burstable-budget gotcha. |
+| `bucket=DURATION`       | Bucket granularity inside the window (default: the resolved window — one fixed-window bucket). Smaller buckets enforce more smoothly; larger buckets cost less memory and gossip traffic. |
 | `mode=enforce`          | Default. Evaluate and reject on overflow.                                                                                                  |
 | `mode=dry_run`          | Evaluate, record the hit, never reject. Lets operators observe before enforcing.                                                           |
 | `mode=disabled`         | Skip the rule entirely.                                                                                                                    |
 | `dry_run`               | Bare flag; alias for `mode=dry_run`.                                                                                                       |
 | `except_if=$variable`   | Skip this rule for requests where `$variable` resolves truthy. See "Predicates" below.                                                     |
 | `domain=NAME`           | Domain bucket for the rule (defaults to `nginx`). Must match `[A-Za-z_][A-Za-z0-9_.-]*`.                                                   |
+
+#### Rate, window, and bucket
+
+A rule resolves to three internal numbers — a `limit`, a `window`, and a
+`bucket`. The directive surface gives you three knobs, evaluated in
+this order:
+
+* `rate=Nr/<unit>` (mandatory) — sustained allowance and its natural
+  period.
+* `window=DURATION` (optional) — widens the time horizon. The resolved
+  internal limit is scaled up to fit:
+  `limit = floor(rate_count * window_millis / period_millis)`.
+  Omitted, the window equals the rate's period.
+* `bucket=DURATION` (optional) — granularity inside the window. Omitted,
+  the bucket equals the resolved window (one fixed-window bucket).
+
+Worked example:
+
+```nginx
+gabion_limit_rule per_tenant tenant:$arg_tenant rate=10r/s window=5h bucket=1h;
+```
+
+resolves to `limit = 10 * 5 * 3600 = 180000`, `window = 5h`,
+`bucket = 1h` (five live buckets). The same triple can be written as
+`rate=180000r/5h bucket=1h` — the operator-facing knob is identical,
+but `rate=10r/s window=5h bucket=1h` preserves the "10 r/s applied
+over 5 hours" intent in the config text.
+
+> **Rule of thumb.** If you set `window=` larger than the rate's period
+> and don't also set `bucket=`, you get a *burstable* budget — clients
+> can fire the whole window's allowance instantly, then sit empty for
+> the rest of the window. For sustained-rate enforcement, set `bucket=`
+> close to the rate's period. Example: `rate=10r/s window=5h bucket=1s`
+> keeps the 180k 5-hour budget but smooths it to roughly 10 r/s.
+
+Other things worth knowing:
+
+* **`X-RateLimit-Limit` reports the *resolved* number.** A rule written
+  as `rate=10r/s window=1h` returns `X-RateLimit-Limit: 36000`. If you
+  surface that header to end users (dashboards, customer-facing error
+  pages), be aware they will see 36000, not 10.
+* **`Retry-After` scales with the resolved window.** With `window=5h`
+  a rejected client may be told to wait up to 5 hours; without an
+  explicit window, the worst case is the rate's period.
+* **Floor silently under-budgets non-multiples.** `rate=10r/m
+  window=85s` resolves to `limit=14` (the leftover 0.16 period
+  vanishes). Pick `window=` values that are integer multiples of the
+  rate's period when you care about every last request.
+* **`window=` shorter than the rate's period is rejected.** To enforce
+  "100 in 500ms" write `rate=100r/500ms`, not
+  `rate=200r/s window=500ms` — the latter would resolve to `limit=0`
+  and is refused at `nginx -t` time.
 
 ### `gabion_limit NAME [NAME ...]` (http, server, location)
 
@@ -526,6 +585,8 @@ gabion: `gabion_limit_zone` argument must start with `zone=` (e.g. `zone=api:128
 gabion: `gabion_limit_rule` rule `per_ip` is missing the required `rate=Nr/s` argument
 gabion: `gabion_limit_rule` argument `key=$uri` is invalid: expected `$variable`, `name:$variable`, or one of `rate=`, `bucket=`, `mode=`, `dry_run`, `except_if=`, `domain=`
 gabion: `gabion_limit_rule` argument `rate=100r/fortnight` is invalid: rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`
+gabion: `gabion_limit_rule` rule `zero_window`: `window=` must be greater than zero
+gabion: `gabion_limit_rule` rule `inverted`: `window=` must be at least as long as the rate's period; a sub-period window would resolve to a zero limit. To enforce N requests in a shorter span, write the period into the rate itself (e.g. `rate=100r/500ms`).
 gabion: `gabion_limit_rule` rule `per_ip` is declared more than once; rule names must be unique within an http {} block
 gabion: `gabion_limit` references rule `tenant_api`, which is not declared via `gabion_limit_rule`
 gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a duration like `100ms` or `1s`
@@ -542,6 +603,7 @@ operators most commonly hit.
 | `gabion_limit references rule X, which is not declared`                                                   | A `gabion_limit X;` names a rule that has no `gabion_limit_rule X ...` declaration in the same `http {}` block.                            | Add the missing declaration or fix the name.                                                                                     |
 | `gabion_limit_rule rule X is declared more than once`                                                     | Two `gabion_limit_rule X ...` directives with the same name.                                                                               | Pick distinct names. The grammar is unambiguous; this is almost always a copy-paste bug.                                         |
 | `gabion_limit_rule argument 'rate=0r/s' is invalid`                                                       | Zero rate; would deny all traffic.                                                                                                         | Pick a non-zero positive integer. To temporarily disable a rule, use `mode=disabled` instead.                                    |
+| `gabion_limit_rule rule X: window= must be at least as long as the rate's period`                         | `window=` was paired with a rate whose period is longer (e.g. `rate=200r/s window=500ms`); the resolved limit would be zero.               | Move the period into the rate itself (e.g. `rate=100r/500ms`) instead of pairing a short window with a longer-period rate.       |
 | `gabion_gossip_cluster requires a non-zero cluster identifier`                                            | The cluster ID parses to `0`, which is almost certainly unintended.                                                                        | Pick any non-zero 128-bit value shared by every peer (`1`, `0xc0ffee`, a u128 literal).                                          |
 | `gabion: gabion_gossip_tick_interval rejected value 'notaduration': expected a duration like '100ms'`     | A tuning directive received a value it couldn't parse.                                                                                     | The error message names the directive and the expected format; supply a humantime duration (`100ms`, `5s`).                      |
 | Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`                                  | The client crossed a rule's limit.                                                                                                         | Expected behaviour. `Retry-After` says how long to back off.                                                                     |
@@ -634,11 +696,31 @@ configs.
 |----------------------------------------------------------|-------------------------------------------------------------|
 | `gabion_limit_zone NAME SIZE`                            | `gabion_limit_zone zone=NAME:SIZE`                          |
 | `gabion_limit_rule NAME 2r/m key=$uri window=60s`        | `gabion_limit_rule NAME $uri rate=2r/m`                     |
-| `gabion_limit_rule NAME $uri rate=10r/s window=1s`       | `gabion_limit_rule NAME $uri rate=10r/s` (unit defines period) |
-| `gabion_limit_rule NAME $uri rate=10r/m window=30s`      | `gabion_limit_rule NAME $uri rate=10r/30s` (duration after `r/`) |
+| `gabion_limit_rule NAME $uri rate=10r/s window=1s`       | `gabion_limit_rule NAME $uri rate=10r/s` (rate's period is the default window) |
+| `gabion_limit_rule NAME $uri rate=10r/m window=30s`      | `gabion_limit_rule NAME $uri rate=10r/30s` (duration after `r/`) — or `rate=10r/m window=30s` if you want to keep "10/min" in the text (resolves to limit=5 over 30s) |
 | `bucket=` default of `1s`                                | `bucket=` defaults to the rate's window (single fixed-window bucket); set explicitly for sub-window granularity |
 | `key=tenant:$arg_tenant`                                 | `tenant:$arg_tenant` (positional)                           |
 | `gabion_limit foo` only                                  | `gabion_limit foo bar baz` / `gabion_limit off`             |
 | `gabion_gossip_discovery_namespace NS`                   | `gabion_discovery_namespace_allow NS`                       |
 | `gabion_discovery_namespace_whitelist NS`                | `gabion_discovery_namespace_allow NS`                       |
 | `gabion_discovery_service_whitelist SVC`                 | `gabion_discovery_service_allow SVC`                        |
+
+The directive surface also gained an explicit `window=` for operators
+whose mental model is "N requests per second, applied over an H-hour
+window". `rate=10r/s window=5h` resolves to a 180,000-over-5-hour
+budget — equivalent to `rate=180000r/5h`, but the original "10 r/s"
+intent survives in the config text. Read the new
+[Rate, window, and bucket](#rate-window-and-bucket) section before
+you reach for `window=` — long windows with the default `bucket=`
+produce a *burstable* budget, not a paced one.
+
+For the server YAML adapter, the same change replaces `limit:` +
+`window:` with a single mandatory `rate:` string plus optional
+`window:` / `bucket:` durations:
+
+| Server YAML before               | Server YAML after                |
+|----------------------------------|----------------------------------|
+| `limit: 100, window: 60s`        | `rate: 100r/m`                   |
+| `limit: 10, window: 1s`          | `rate: 10r/s`                    |
+| `limit: 180000, window: 5h`      | `rate: 10r/s, window: 5h` (same resolved limit, original intent preserved) |
+| sub-period limits (`limit: 100, window: 500ms`) | move the period into the rate: `rate: 100r/500ms`. `window: 500ms` paired with `rate: 200r/s` is rejected (would resolve to `limit=0`). |

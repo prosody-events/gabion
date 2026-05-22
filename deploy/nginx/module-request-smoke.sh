@@ -15,6 +15,7 @@ printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule per_bot_stacked    class:
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule shadow_canary      $uri               rate=1r/s bucket=1s dry_run;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule baseline_rule      $uri               rate=3r/m bucket=1s;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit baseline_rule;'
+printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule window_demo       demo:$arg_demo     rate=2r/m window=2m bucket=30s;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_bind 0.0.0.0:9000;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_cluster 1;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_fanout 8;'

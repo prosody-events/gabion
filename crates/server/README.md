@@ -31,10 +31,11 @@ limits:
     domain: envoy
     descriptors:
       - key: remote_address       # the Envoy descriptor key to match on
-    limit: 100
-    window: 1s
-    # `bucket:` defaults to `window:` (single fixed-window bucket). Set
-    # explicitly for finer sliding-window enforcement.
+    rate: 100r/s                  # the rate's period IS the default window
+    # `window:` (optional) widens the time horizon; the resolved limit
+    # scales up to `floor(rate_count * window / period)`.
+    # `bucket:` (optional) defaults to the resolved window — one fixed-
+    # window bucket. Set explicitly for sliding-window-style enforcement.
 
 # Gossip channel — required even for a single node so future peers
 # can join without a restart.
@@ -99,8 +100,7 @@ limits:
     domain: envoy
     descriptors:
       - key: remote_address
-    limit: 100
-    window: 1s
+    rate: 100r/s
 ```
 
 Envoy's `remote_address` action emits a descriptor of the form
@@ -115,8 +115,7 @@ limits:
     domain: envoy
     descriptors:
       - key: tenant
-    limit: 1000
-    window: 1m
+    rate: 1000r/m
 ```
 
 Configure Envoy's filter to extract a header into a descriptor:
@@ -140,8 +139,7 @@ limits:
     domain: envoy
     descriptors:
       - key: route
-    limit: 50
-    window: 1m
+    rate: 50r/m
     mode: dry_run        # evaluate + record, never reject
 ```
 
@@ -159,14 +157,60 @@ limits:
   - name: per_ip
     domain: envoy
     descriptors: [{ key: remote_address }]
-    limit: 100
-    window: 1s
+    rate: 100r/s
   - name: per_tenant
     domain: envoy
     descriptors: [{ key: tenant }]
-    limit: 1000
-    window: 1m
+    rate: 1000r/m
 ```
+
+### Rate, window, and bucket
+
+A rule resolves to three internal numbers — a `limit`, a `window`, and a
+`bucket`. The YAML shape mirrors the nginx adapter:
+
+* `rate:` (mandatory) — `N` requests per period, e.g. `10r/s`, `100r/5m`,
+  `1000r/h`. Same syntax as the nginx `rate=` argument.
+* `window:` (optional) — the time horizon the rate is enforced over.
+  Defaults to the rate's period. When set, the resolved limit scales up
+  to `floor(rate_count * window / period)`.
+* `bucket:` (optional) — granularity inside the window. Defaults to the
+  resolved window (one fixed-window bucket). Set smaller for
+  sliding-window-style enforcement.
+
+Worked example:
+
+```yaml
+limits:
+  - name: per_tenant
+    domain: envoy
+    descriptors: [{ key: tenant }]
+    rate: 10r/s
+    window: 5h
+    bucket: 1h
+```
+
+resolves to `limit = 10 * 5 * 3600 = 180000`, `window = 5h`, `bucket = 1h`
+(five live buckets). The same triple can be written as
+`rate: 180000r/5h\nbucket: 1h` — the operator-facing knob is identical.
+
+> **Rule of thumb.** If you set `window:` larger than the rate's period
+> and don't also set `bucket:`, you get a *burstable* budget — clients
+> can fire the whole window's allowance instantly, then sit empty for
+> the rest of the window. For sustained-rate enforcement, set `bucket:`
+> close to the rate's period. `rate: 10r/s, window: 5h, bucket: 1s`
+> keeps the 180k 5-hour budget but smooths it to roughly 10 r/s.
+
+Other things worth knowing:
+
+* **`OVER_LIMIT` reports the resolved budget.** A rule written as
+  `rate: 10r/s window: 1h` returns the 36000-request budget, not 10.
+* **Floor silently under-budgets non-multiples.** `rate: 10r/m window:
+  85s` resolves to `limit = 14` (the leftover 0.16 period vanishes).
+* **`window:` shorter than the rate's period is rejected.** To enforce
+  "100 in 500ms" write `rate: 100r/500ms`, not `rate: 200r/s window:
+  500ms` — the latter would resolve to `limit = 0` and is refused at
+  config-load time.
 
 The corresponding Envoy filter emits two descriptors per request, one
 for each action.
@@ -220,13 +264,14 @@ section for the knobs and their tradeoffs.
 
 | Symptom                                                                          | What it means                                                                                                  | Fix                                                                                                                          |
 |----------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
-| `config error: ... missing field 'name' at limits[0]`                            | A YAML `limits:` entry is missing the required field.                                                          | Supply `name`, `domain`, `descriptors`, `limit`, and `window`. `bucket` is optional (defaults to `window`).                  |
+| `config error: ... missing field 'name' at limits[0]`                            | A YAML `limits:` entry is missing the required field.                                                          | Supply `name`, `domain`, `descriptors`, and `rate`. `window` / `bucket` are optional.                                        |
 | `rule X is declared more than once`                                              | Two entries in `limits:` share a `name:`.                                                                      | Pick distinct names.                                                                                                         |
-| `rule X has 'limit: 0', which would deny all traffic`                            | Zero limit.                                                                                                    | Use a positive integer. For temporary disabling, use `mode: disabled`.                                                       |
+| `rule X has an invalid 'rate:' value: ...`                                       | The `rate:` string didn't parse, or its count is zero.                                                         | Use e.g. `rate: 100r/s`, `rate: 10r/5m`. Zero counts are refused — a zero rate would deny all traffic.                       |
+| `rule X: 'window=' must be at least as long as the rate's period`                | An explicit `window:` was shorter than the rate's period; the resolved limit would be zero.                    | Move the period into the rate (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.                |
 | `rule X descriptor key 'with space' must match '[A-Za-z_][A-Za-z0-9_.-]*'`       | A descriptor key uses unsupported characters.                                                                  | Stick to identifier-like names (underscore + dot + dash OK).                                                                 |
 | `gossip.bind is required`                                                        | No bind address was supplied.                                                                                  | Set `gossip.bind` in YAML or `GABION_GOSSIP_BIND` in env.                                                                    |
 | `environment variable GABION_X is not valid UTF-8`                               | A non-UTF-8 byte in an env var.                                                                                | Re-export the env var with a valid value.                                                                                    |
-| `OVER_LIMIT` responses for all descriptors                                       | The configured `limit:` is below sustained load.                                                               | Raise the limit, or extend the window, or split the rule. Run with `mode: dry_run` while you measure.                        |
+| `OVER_LIMIT` responses for all descriptors                                       | The configured `rate:` is below sustained load.                                                                | Raise the rate, or extend the window, or split the rule. Run with `mode: dry_run` while you measure.                         |
 | `gabiond` warns about gossip record failures                                     | The gossip queue is full; gabiond is **allowing** the request and **under-counting**.                          | Either tune `gossip.limit_queue_capacity` upward or reduce upstream traffic. Errors are rate-limited via a power-of-two pattern. |
 | `gabiond` warns about matched-rule overflow                                      | A request matched more than `STORAGE_MAX_MATCHED_RULES` rules; the request was **allowed** (allow-by-default). | Reduce the number of rules matching a single descriptor, or split your rule space across multiple domains.                   |
 

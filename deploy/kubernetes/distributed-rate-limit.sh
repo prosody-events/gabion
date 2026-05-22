@@ -35,15 +35,55 @@ case "$server" in
         ;;
 esac
 
+duration_millis() {
+    duration="$1"
+    case "$duration" in
+        *ms)
+            count="${duration%ms}"
+            multiplier=1
+            ;;
+        *s)
+            count="${duration%s}"
+            multiplier=1000
+            ;;
+        *m)
+            count="${duration%m}"
+            multiplier=60000
+            ;;
+        *h)
+            count="${duration%h}"
+            multiplier=3600000
+            ;;
+        *)
+            printf '%s\n' \
+                "unsupported duration '$duration' (expected an integer with ms, s, m, or h)" >&2
+            return 1
+            ;;
+    esac
+
+    case "$count" in
+        ''|*[!0-9]*)
+            printf '%s\n' \
+                "unsupported duration '$duration' (expected an integer with ms, s, m, or h)" >&2
+            return 1
+            ;;
+    esac
+
+    printf '%s\n' "$((count * multiplier))"
+}
+
 : "${POD_COUNT:=$([ "$BACKEND" = "gabiond" ] && printf 3 || printf 20)}"
 : "${TENANTS:=$([ "$BACKEND" = "gabiond" ] && printf 20 || printf 100)}"
 : "${BUDGET_PER_TENANT:=20}"
 : "${RPS_PER_TENANT:=100}"
 : "${DURATION_S:=$([ "$BACKEND" = "gabiond" ] && printf 20 || printf 60)}"
 : "${WARMUP_S:=$([ "$BACKEND" = "gabiond" ] && printf 2 || printf 5)}"
-: "${RATE_LIMIT_WINDOW:=1s}"
-: "${RATE_LIMIT_BUCKET:=1s}"
-: "${WINDOW_MS:=1000}"
+# Match gabion::rules::resolve_rate: window defaults to the rate period,
+# bucket defaults to the resolved window.
+: "${RATE_LIMIT_PERIOD:=1s}"
+: "${RATE_LIMIT_WINDOW:=$RATE_LIMIT_PERIOD}"
+: "${RATE_LIMIT_BUCKET:=$RATE_LIMIT_WINDOW}"
+: "${WINDOW_MS:=$(duration_millis "$RATE_LIMIT_PERIOD")}"
 : "${GOSSIP_TICK_INTERVAL:=100ms}"
 : "${GOSSIP_FANOUT:=6}"
 : "${GOSSIP_TARGET_ERR_BPS:=100}"
@@ -80,6 +120,7 @@ create_configmaps() {
     if [ "$BACKEND" = "nginx" ]; then
         awk \
             -v budget="$BUDGET_PER_TENANT" \
+            -v period="$RATE_LIMIT_PERIOD" \
             -v window="$RATE_LIMIT_WINDOW" \
             -v bucket="$RATE_LIMIT_BUCKET" \
             -v fanout="$GOSSIP_FANOUT" \
@@ -87,8 +128,8 @@ create_configmaps() {
             -v target_err_bps="$GOSSIP_TARGET_ERR_BPS" \
             -v min_emit="$GOSSIP_MIN_EMIT_INTERVAL" '
                 /gabion_limit_rule tenant_dist / {
-                    sub(/rate=[0-9]+r\/[^ ;]+/, "rate=" budget "r/" window)
-                    sub(/bucket=[^ ;]+/, "bucket=" bucket)
+                    print "    gabion_limit_rule tenant_dist tenant:$arg_tenant rate=" budget "r/" period " window=" window " bucket=" bucket ";"
+                    next
                 }
                 /gabion_gossip_fanout [0-9]+;/ {
                     sub(/gabion_gossip_fanout [0-9]+;/, "gabion_gossip_fanout " fanout ";")
@@ -120,7 +161,7 @@ limits:
     descriptors:
       - key: tenant
         value: "*"
-    limit: ${BUDGET_PER_TENANT}
+    rate: ${BUDGET_PER_TENANT}r/${RATE_LIMIT_PERIOD}
     window: ${RATE_LIMIT_WINDOW}
     bucket: ${RATE_LIMIT_BUCKET}
     mode: enforce
@@ -505,6 +546,8 @@ fi
 printf '\nletting gossip converge for 15s...\n'
 sleep 15
 
+printf '\nconfigured tenant rule: rate=%sr/%s window=%s bucket=%s\n' \
+    "$BUDGET_PER_TENANT" "$RATE_LIMIT_PERIOD" "$RATE_LIMIT_WINDOW" "$RATE_LIMIT_BUCKET"
 printf '\nlaunching %s loader (%s tenants x %s r/s for %ss after %ss warm-up)...\n' \
     "$BACKEND" "$TENANTS" "$RPS_PER_TENANT" "$DURATION_S" "$WARMUP_S"
 apply_loader

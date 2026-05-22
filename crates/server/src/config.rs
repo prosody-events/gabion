@@ -41,7 +41,10 @@ use gabion::crdt::{CellStoreConfig, NodeIdentity};
 use gabion::defaults;
 use gabion::discovery::DiscoveryConfig;
 use gabion::gossip::GossipConfig;
-use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId, RuleTable};
+use gabion::rules::{
+    DescriptorPattern, EnforcementMode, RateResolveError, Rule, RuleId, RuleTable, parse_rate,
+    resolve_rate,
+};
 use gabion::wire::FrameLimits;
 
 use crate::admission::CardinalityLimits;
@@ -404,9 +407,15 @@ pub struct LimitRuleConfig {
     pub name: Box<str>,
     pub domain: Box<str>,
     pub descriptors: Box<[DescriptorConfig]>,
-    pub limit: u64,
-    #[serde(with = "humantime_serde")]
-    pub window: Duration,
+    /// Operator-facing rate: `N` requests per period, e.g. `10r/s`,
+    /// `100r/5m`, `1000r/h`. Mandatory. See `gabion::rules::parse_rate`.
+    pub rate: Box<str>,
+    /// Optional window the rate is enforced over. Defaults to the rate's
+    /// period when omitted. When set, the resolved internal limit scales
+    /// up to `floor(rate_count * window_millis / period_millis)` — see
+    /// the README's "Rate, window, and bucket" section.
+    #[serde(default, with = "humantime_serde::option")]
+    pub window: Option<Duration>,
     /// `bucket:` defaults to `window:` when omitted — one fixed-window
     /// bucket per rule. Set explicitly for finer sliding-window
     /// enforcement (e.g. `bucket: 1s` inside a `window: 60s` rule).
@@ -421,11 +430,6 @@ impl LimitRuleConfig {
         if self.descriptors.is_empty() {
             return Err(ConfigError::EmptyDescriptorSet(self.name.to_string()));
         }
-        if self.limit == 0 {
-            return Err(ConfigError::ZeroLimit {
-                name: self.name.to_string(),
-            });
-        }
         for descriptor in self.descriptors.iter() {
             if !is_descriptor_key(&descriptor.key) {
                 return Err(ConfigError::InvalidDescriptorKey {
@@ -434,6 +438,18 @@ impl LimitRuleConfig {
                 });
             }
         }
+        let (rate_count, period) =
+            parse_rate(&self.rate).map_err(|reason| ConfigError::InvalidRate {
+                name: self.name.to_string(),
+                reason,
+            })?;
+        let resolved =
+            resolve_rate(rate_count, period, self.window, self.bucket).map_err(|err| {
+                ConfigError::ResolveRate {
+                    name: self.name.to_string(),
+                    source: err,
+                }
+            })?;
         let descriptors = self
             .descriptors
             .iter()
@@ -442,14 +458,13 @@ impl LimitRuleConfig {
                 value: d.value.clone(),
             })
             .collect();
-        let bucket = self.bucket.unwrap_or(self.window);
         Ok(Rule::new(
             id,
             self.domain.to_string(),
             descriptors,
-            self.limit,
-            duration_millis(self.window),
-            duration_millis(bucket),
+            resolved.limit,
+            resolved.window_millis,
+            resolved.bucket_millis,
             self.mode.into(),
         ))
     }
@@ -504,18 +519,23 @@ pub enum ConfigError {
     EmptyDescriptorSet(String),
     #[error("rule `{name}` is declared more than once; rule names must be unique")]
     DuplicateRule { name: String },
-    #[error("rule `{name}` has `limit: 0`, which would deny all traffic")]
-    ZeroLimit { name: String },
+    #[error(
+        "rule `{name}` has an invalid `rate:` value: {reason}. Use e.g. `rate: 100r/s` or `rate: \
+         10r/5m`."
+    )]
+    InvalidRate { name: String, reason: &'static str },
+    #[error("rule `{name}`: {source}")]
+    ResolveRate {
+        name: String,
+        #[source]
+        source: RateResolveError,
+    },
     #[error("rule `{rule}` descriptor key `{key}` must match `[A-Za-z_][A-Za-z0-9_.-]*`")]
     InvalidDescriptorKey { rule: String, key: String },
     #[error("gossip.bind is required")]
     MissingGossipBind,
     #[error("environment variable {0} is not valid UTF-8")]
     NonUtf8EnvVar(&'static str),
-}
-
-fn duration_millis(duration: Duration) -> u64 {
-    duration.as_millis().try_into().unwrap_or(u64::MAX).max(1)
 }
 
 #[cfg(test)]

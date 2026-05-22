@@ -42,6 +42,7 @@ use crate::log;
 use crate::rules::{
     BindingCompiler, BindingLookup, CompiledRules, DEFAULT_DOMAIN, DescriptorBinding, RuleConfig,
     is_descriptor_key, is_dns_label, is_single_ident, is_zone_name, parse_binding, parse_rate,
+    resolve_rate,
 };
 use crate::shm::{Layout, ShmRegion};
 
@@ -830,7 +831,7 @@ extern "C" fn set_zone(
 /// ```text
 /// gabion_limit_rule <name> <$var | name:$var> [...]
 ///                          rate=Nr/<s|m|h|d|DURATION>
-///                          [bucket=B]
+///                          [window=W] [bucket=B]
 ///                          [mode=enforce|dry_run|disabled] [dry_run]
 ///                          [except_if=$var] [domain=NAME];
 /// ```
@@ -838,9 +839,14 @@ extern "C" fn set_zone(
 /// Positional arguments after the rule name are descriptor bindings — `$var`
 /// auto-keyed by the variable name, or `name:$var` with an explicit key.
 /// Named arguments are recognised by their `keyword=` prefix; the bare
-/// `dry_run` flag is an alias for `mode=dry_run`. The `rate=` argument's
-/// unit-letter (`s|m|h|d`) defines the window; for non-round periods use a
-/// duration (`rate=100r/30s`, `rate=10r/5m`).
+/// `dry_run` flag is an alias for `mode=dry_run`.
+///
+/// `rate=` carries the sustained allowance, `window=` widens the time
+/// horizon (defaults to the rate's period), and `bucket=` controls the
+/// granularity inside the window (defaults to the resolved window, i.e.
+/// one fixed-window bucket). When `window=` is set, the resolved internal
+/// limit scales up to `floor(rate_count * window_millis / period_millis)`
+/// — see the README's "Rate, window, and bucket" section.
 extern "C" fn set_rule(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
@@ -874,6 +880,7 @@ extern "C" fn set_rule(
         };
 
         let mut bucket: Option<Duration> = None;
+        let mut window: Option<Duration> = None;
         let mut domain = DEFAULT_DOMAIN.to_string();
         let mut bindings: Vec<DescriptorBinding> = Vec::new();
         let mut mode = EnforcementMode::Enforce;
@@ -892,6 +899,7 @@ extern "C" fn set_rule(
             };
             match parse_rule_arg(value) {
                 RuleArg::Rate(count, period) => rate = Some((count, period)),
+                RuleArg::Window(d) => window = Some(d),
                 RuleArg::Bucket(d) => bucket = Some(d),
                 RuleArg::Domain(d) => domain = d,
                 RuleArg::Mode(m) => {
@@ -926,7 +934,7 @@ extern "C" fn set_rule(
             }
         }
 
-        let Some((limit, window)) = rate else {
+        let Some((rate_count, period)) = rate else {
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
@@ -957,18 +965,34 @@ extern "C" fn set_rule(
             return core::NGX_CONF_ERROR;
         }
 
-        // `bucket=` defaults to the rate's window so the natural shape of
-        // a rule is a single fixed-window bucket per period (e.g.
-        // `rate=10r/m` → one 60s bucket). Operators who want finer
-        // sliding-window enforcement set `bucket=` explicitly.
-        let bucket = bucket.unwrap_or(window);
+        // `window=` defaults to the rate's period (today's behavior);
+        // `bucket=` defaults to the resolved window (one fixed-window
+        // bucket per rule). With an explicit `window=` the rate is
+        // scaled up to a window-sized budget — see the README's
+        // "Rate, window, and bucket" section for the burstable-vs-paced
+        // gotcha when bucket is left at its default. Each
+        // `RateResolveError` already carries the operator-facing
+        // three-question message via `Display`; we forward it verbatim.
+        let resolved = match resolve_rate(rate_count, period, window, bucket) {
+            Ok(r) => r,
+            Err(err) => {
+                ngx::ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    cf,
+                    "gabion: `gabion_limit_rule` rule `{}`: {}",
+                    name,
+                    err
+                );
+                return core::NGX_CONF_ERROR;
+            }
+        };
         main.rules.push(RuleConfig {
             name: name.into(),
             domain: domain.into(),
             bindings,
-            limit,
-            window,
-            bucket,
+            limit: resolved.limit,
+            window: Duration::from_millis(resolved.window_millis),
+            bucket: Duration::from_millis(resolved.bucket_millis),
             mode,
             except_if,
         });
@@ -981,6 +1005,11 @@ enum RuleArg {
     /// `rate=Nr/<period>` — `(count, period)`. Period comes from the unit
     /// letter (`s|m|h|d`) or a humantime-parsed duration (`30s`, `5m`).
     Rate(u64, Duration),
+    /// `window=DURATION` — the time horizon the rate is enforced over.
+    /// When set, the resolved `limit` scales from the rate's count up to
+    /// the window-sized budget. Defaults to the rate's period when
+    /// omitted (preserving today's behavior).
+    Window(Duration),
     Bucket(Duration),
     Domain(String),
     Mode(EnforcementMode),
@@ -1000,12 +1029,18 @@ fn parse_rule_arg(value: &str) -> RuleArg {
             Err(reason) => RuleArg::Invalid(reason),
         };
     }
+    // `window=` and `bucket=` share the same shape — a humantime duration
+    // string that must parse and be non-zero. Zero is rejected in
+    // `resolve_rate` (so the operator sees the same wording whether it
+    // arrived as `window=0s` or as a window-vs-period mismatch); here we
+    // only reject unparseable values.
+    if let Some(rest) = value.strip_prefix("window=") {
+        return parse_duration_arg(rest, "expected `window=DURATION` (e.g. `window=5h`)")
+            .map_or_else(RuleArg::Invalid, RuleArg::Window);
+    }
     if let Some(rest) = value.strip_prefix("bucket=") {
-        return match humantime::parse_duration(rest) {
-            Ok(d) if !d.is_zero() => RuleArg::Bucket(d),
-            Ok(_) => RuleArg::Invalid("`bucket=` must be greater than zero"),
-            Err(_) => RuleArg::Invalid("expected `bucket=DURATION` (e.g. `bucket=1s`)"),
-        };
+        return parse_duration_arg(rest, "expected `bucket=DURATION` (e.g. `bucket=1s`)")
+            .map_or_else(RuleArg::Invalid, RuleArg::Bucket);
     }
     if let Some(rest) = value.strip_prefix("domain=") {
         if !is_descriptor_key(rest) {
@@ -1034,6 +1069,13 @@ fn parse_rule_arg(value: &str) -> RuleArg {
         Ok(b) => RuleArg::Binding(b),
         Err(reason) => RuleArg::Invalid(reason),
     }
+}
+
+/// Parse a humantime duration argument and return the original
+/// operator-facing example on a parse error. Zero durations are accepted
+/// here and rejected with a domain-specific message by `resolve_rate`.
+fn parse_duration_arg(rest: &str, unparseable_msg: &'static str) -> Result<Duration, &'static str> {
+    humantime::parse_duration(rest).map_err(|_| unparseable_msg)
 }
 
 /// nginx directive handler for `gabion_limit`. Valid at the http, server,

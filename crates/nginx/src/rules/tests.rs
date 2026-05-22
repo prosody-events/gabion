@@ -76,48 +76,6 @@ fn zero_limit_is_rejected_at_compile() {
 }
 
 #[test]
-fn parse_rate_unit_letters() {
-    assert_eq!(parse_rate("100r/s").unwrap(), (100, Duration::from_secs(1)));
-    assert_eq!(
-        parse_rate("100r/m").unwrap(),
-        (100, Duration::from_secs(60))
-    );
-    assert_eq!(parse_rate("1r/h").unwrap(), (1, Duration::from_secs(3600)));
-    assert_eq!(parse_rate("1r/d").unwrap(), (1, Duration::from_secs(86400)));
-}
-
-#[test]
-fn parse_rate_humantime_periods() {
-    assert_eq!(parse_rate("5r/30s").unwrap(), (5, Duration::from_secs(30)));
-    assert_eq!(
-        parse_rate("100r/5m").unwrap(),
-        (100, Duration::from_secs(300))
-    );
-    assert_eq!(
-        parse_rate("100r/2h30m").unwrap(),
-        (100, Duration::from_secs(2 * 3600 + 30 * 60))
-    );
-}
-
-#[test]
-fn parse_rate_rejects_unknown_unit() {
-    assert!(parse_rate("100r/fortnight").is_err());
-    assert!(parse_rate("100r/").is_err());
-    assert!(parse_rate("100").is_err());
-    assert!(parse_rate("100/s").is_err());
-}
-
-#[test]
-fn parse_rate_rejects_zero_count() {
-    assert!(parse_rate("0r/s").is_err());
-}
-
-#[test]
-fn parse_rate_rejects_zero_period() {
-    assert!(parse_rate("10r/0s").is_err());
-}
-
-#[test]
 fn parse_binding_auto_keyed_single_variable() {
     let b = parse_binding("$remote_addr").unwrap();
     assert_eq!(b.key.as_ref(), "remote_addr");

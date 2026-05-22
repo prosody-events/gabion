@@ -8,6 +8,9 @@
 //! cardinality enforcement, request mapping) is the adapter's job — kept out
 //! of this module on purpose.
 
+use std::time::Duration;
+
+use thiserror::Error;
 use twox_hash::xxhash3_128::{DEFAULT_SECRET_LENGTH, RawHasher, SecretBuffer};
 
 pub use crate::crdt::KeyHash;
@@ -244,3 +247,130 @@ fn stable_hasher() -> RawHasher<[u8; DEFAULT_SECRET_LENGTH]> {
         SecretBuffer::new(0, [0x9d; DEFAULT_SECRET_LENGTH]).expect("valid XXH3 secret length");
     RawHasher::new(secret)
 }
+
+// -- rate parsing & window/bucket resolution --------------------------------
+
+/// Parse a `rate=` value into `(count, period)`.
+///
+/// The suffix after `r/` is either a single-letter unit (`s`, `m`, `h`,
+/// `d`) or a [humantime] duration (`30s`, `5m`, `2h30m`). Zero counts and
+/// zero periods are rejected at parse time so `cfg.limit.max(1)` is never
+/// load-bearing in downstream code.
+///
+/// Shared by both adapters so two nodes with identical rule text agree on
+/// what `rate=10r/s` means.
+///
+/// [humantime]: https://docs.rs/humantime
+pub fn parse_rate(input: &str) -> Result<(u64, Duration), &'static str> {
+    let input = input.trim();
+    let Some((number, period)) = input.split_once("r/") else {
+        return Err(
+            "expected `rate=Nr/<unit>` where unit is `s|m|h|d` or a duration (e.g. `rate=100r/s`, \
+             `rate=10r/5m`)",
+        );
+    };
+    let count: u64 = number
+        .parse()
+        .map_err(|_| "rate count must be a non-negative integer (e.g. `rate=100r/s`)")?;
+    if count == 0 {
+        return Err("`rate=` must be a positive integer; zero would deny all traffic");
+    }
+    let duration = match period {
+        "s" => Duration::from_secs(1),
+        "m" => Duration::from_secs(60),
+        "h" => Duration::from_secs(60 * 60),
+        "d" => Duration::from_secs(60 * 60 * 24),
+        other => humantime::parse_duration(other).map_err(|_| {
+            "rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`"
+        })?,
+    };
+    if duration.is_zero() {
+        return Err("rate period must be greater than zero");
+    }
+    Ok((count, duration))
+}
+
+/// Resolved triple consumed by [`Rule::new`]. The limit has already been
+/// scaled from the rate to fit the window so the CRDT representation
+/// matches the operator's mental model exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedRate {
+    pub limit: u64,
+    pub window_millis: u64,
+    pub bucket_millis: u64,
+}
+
+/// Reasons [`resolve_rate`] can refuse a (rate, window, bucket) tuple. Each
+/// variant carries enough context for the adapter to print an
+/// operator-quality error per CLAUDE.md (what / why / what to do).
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum RateResolveError {
+    #[error(
+        "`window=` must be at least as long as the rate's period; a sub-period window would \
+         resolve to a zero limit. To enforce N requests in a shorter span, write the period into \
+         the rate itself (e.g. `rate=100r/500ms`)."
+    )]
+    WindowShorterThanPeriod,
+    #[error("`window=` must be greater than zero")]
+    ZeroWindow,
+    #[error("`bucket=` must be greater than zero")]
+    ZeroBucket,
+    #[error(
+        "rate × window would overflow a 64-bit limit; pick a smaller `rate=` count or a shorter \
+         `window=`"
+    )]
+    LimitOverflow,
+}
+
+/// Scale a `(rate_count, period)` rate up to a window-sized budget, applying
+/// the operator-supplied `window` and `bucket` defaults documented in the
+/// README.
+///
+/// * `window` defaults to `period` (preserves the historical "rate's period IS
+///   the window" shape).
+/// * `bucket` defaults to `window` (one fixed-window bucket — same shape as
+///   before this surface existed).
+/// * `limit = floor(rate_count * window_millis / period_millis)`, computed with
+///   checked multiplication so an operator who writes `rate=1r/ms window=10y`
+///   gets a clean `LimitOverflow` instead of wrap-around.
+///
+/// `window < period` is rejected because the integer-floor would resolve
+/// to `limit = 0`, which `parse_rate` already refuses to express
+/// directly — surfacing it here as an error keeps the two paths aligned.
+pub fn resolve_rate(
+    rate_count: u64,
+    period: Duration,
+    window: Option<Duration>,
+    bucket: Option<Duration>,
+) -> Result<ResolvedRate, RateResolveError> {
+    let window = window.unwrap_or(period);
+    if window.is_zero() {
+        return Err(RateResolveError::ZeroWindow);
+    }
+    if window < period {
+        return Err(RateResolveError::WindowShorterThanPeriod);
+    }
+    let bucket = bucket.unwrap_or(window);
+    if bucket.is_zero() {
+        return Err(RateResolveError::ZeroBucket);
+    }
+    let window_millis = duration_to_millis(window);
+    let period_millis = duration_to_millis(period).max(1);
+    let bucket_millis = duration_to_millis(bucket);
+    let limit = rate_count
+        .checked_mul(window_millis)
+        .ok_or(RateResolveError::LimitOverflow)?
+        / period_millis;
+    Ok(ResolvedRate {
+        limit,
+        window_millis,
+        bucket_millis,
+    })
+}
+
+fn duration_to_millis(d: Duration) -> u64 {
+    d.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests;

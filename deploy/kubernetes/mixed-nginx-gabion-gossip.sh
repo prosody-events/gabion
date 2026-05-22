@@ -113,8 +113,7 @@ data:
         descriptors:
           - key: uri
             value: "*"
-        limit: 2
-        window: 60s
+        rate: 2r/m
         bucket: 1s
         mode: enforce
 ---

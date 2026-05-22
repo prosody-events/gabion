@@ -149,8 +149,7 @@ data:
         descriptors:
           - key: uri
             value: "*"
-        limit: {RULE_LIMIT}
-        window: 60s
+        rate: {RULE_LIMIT}r/m
         bucket: 1s
         local_fallback_limit: {RULE_LIMIT}
         local_absolute_limit: {RULE_LIMIT}
