@@ -23,7 +23,8 @@ use crate::discovery::{Peer, PeerEvent};
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
 use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, UdpTransport};
 use crate::wire::HmacKey;
-use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use quickcheck::{Arbitrary, Gen, TestResult};
+use quickcheck_macros::quickcheck;
 
 // -- in-memory aggregate store ----------------------------------------------
 
@@ -107,13 +108,6 @@ fn sim_config(identity: NodeIdentity, peers: Vec<SocketAddr>, seed: u64) -> Goss
         rng_seed: seed,
         ..GossipConfig::default()
     }
-}
-
-fn quickcheck_tests() -> u64 {
-    std::env::var("QUICKCHECK_TESTS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
 }
 
 fn quickcheck_max_nodes() -> u16 {
@@ -427,21 +421,16 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
     TestResult::from_bool(passed)
 }
 
-#[test]
-fn quickcheck_sim_connected_clusters_converge_after_finite_loss() {
-    fn property(case: ConnectedClusterCase) -> TestResult {
-        run_paused(run_connected_case(case))
-    }
-
-    QuickCheck::new()
-        .tests(quickcheck_tests())
-        .quickcheck(property as fn(ConnectedClusterCase) -> TestResult);
+#[quickcheck]
+fn quickcheck_sim_connected_clusters_converge_after_finite_loss(
+    case: ConnectedClusterCase,
+) -> TestResult {
+    run_paused(run_connected_case(case))
 }
 
-#[test]
-fn quickcheck_sim_partition_heals_without_overcount() {
-    fn property(mut case: PartitionCase) -> TestResult {
-        run_paused(async move {
+#[quickcheck]
+fn quickcheck_sim_partition_heals_without_overcount(mut case: PartitionCase) -> TestResult {
+    run_paused(async move {
             const NODES: usize = 8;
             if case.records.is_empty() {
                 return TestResult::discard();
@@ -523,18 +512,12 @@ fn quickcheck_sim_partition_heals_without_overcount() {
                 let _ = handle.await;
             }
             TestResult::from_bool(no_overcount && converged)
-        })
-    }
-
-    QuickCheck::new()
-        .tests(quickcheck_tests())
-        .quickcheck(property as fn(PartitionCase) -> TestResult);
+    })
 }
 
-#[test]
-fn quickcheck_sim_authentication_admits_only_matching_keys() {
-    fn property(case: AuthCase) -> TestResult {
-        run_paused(async move {
+#[quickcheck]
+fn quickcheck_sim_authentication_admits_only_matching_keys(case: AuthCase) -> TestResult {
+    run_paused(async move {
             let router = SimRouter::new();
             let addr_a = sock(43_000);
             let addr_b = sock(43_001);
@@ -597,18 +580,12 @@ fn quickcheck_sim_authentication_admits_only_matching_keys() {
             let _ = h_b.await;
 
             TestResult::from_bool((sum_a, sum_b) == expected)
-        })
-    }
-
-    QuickCheck::new()
-        .tests(quickcheck_tests())
-        .quickcheck(property as fn(AuthCase) -> TestResult);
+    })
 }
 
-#[test]
-fn quickcheck_sim_tick_expiration_removes_converged_cells() {
-    fn property(case: ExpirationCase) -> TestResult {
-        run_paused(async move {
+#[quickcheck]
+fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) -> TestResult {
+    run_paused(async move {
             let nodes = case.nodes as usize;
             let router = SimRouter::with_channel_capacity(128);
             let addrs: Vec<_> = (0..nodes).map(|i| sock(44_000 + i as u16)).collect();
@@ -663,18 +640,12 @@ fn quickcheck_sim_tick_expiration_removes_converged_cells() {
                 let _ = handle.await;
             }
             TestResult::from_bool(expired_everywhere)
-        })
-    }
-
-    QuickCheck::new()
-        .tests(quickcheck_tests())
-        .quickcheck(property as fn(ExpirationCase) -> TestResult);
+    })
 }
 
-#[test]
-fn quickcheck_sim_peer_membership_controls_delivery() {
-    fn property(case: MembershipCase) -> TestResult {
-        run_paused(async move {
+#[quickcheck]
+fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> TestResult {
+    run_paused(async move {
             let router = SimRouter::new();
             let addr_a = sock(45_000);
             let addr_b = sock(45_001);
@@ -728,12 +699,7 @@ fn quickcheck_sim_peer_membership_controls_delivery() {
             let _ = h_a.await;
             let _ = h_b.await;
             TestResult::from_bool(got_b == expected_b)
-        })
-    }
-
-    QuickCheck::new()
-        .tests(quickcheck_tests())
-        .quickcheck(property as fn(MembershipCase) -> TestResult);
+    })
 }
 
 // -- migrated tests ---------------------------------------------------------
@@ -1507,6 +1473,610 @@ async fn admin_snapshot_reflects_runtime_state() {
             assert!(snapshot.peers[0].node_id.is_none());
             assert!(snapshot.store_stats.active_cells >= 1);
             assert!(snapshot.local_dirty_len >= 1);
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
+        })
+        .await;
+}
+
+// -- shared helpers for coverage-gap tests ----------------------------------
+
+async fn admin_snapshot(
+    admin_tx: &tokio::sync::mpsc::Sender<crate::gossip::AdminCommand>,
+) -> crate::gossip::AdminSnapshot {
+    use crate::gossip::AdminCommand;
+    use tokio::sync::oneshot;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    admin_tx
+        .send(AdminCommand::Snapshot { reply: reply_tx })
+        .await
+        .expect("admin command channel open");
+    reply_rx.await.expect("runtime replied to snapshot")
+}
+
+// -- Gap 1: peer-cache pairing invariant ------------------------------------
+
+#[derive(Clone, Debug)]
+enum PairingOp {
+    AddPeer(u8),
+    RemovePeer(u8),
+    Record(u8),
+}
+
+impl Arbitrary for PairingOp {
+    fn arbitrary(g: &mut Gen) -> Self {
+        match u8::arbitrary(g) % 4 {
+            0 => PairingOp::AddPeer(u8::arbitrary(g)),
+            1 => PairingOp::RemovePeer(u8::arbitrary(g)),
+            _ => PairingOp::Record(u8::arbitrary(g)),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PairingCase {
+    ops: Vec<PairingOp>,
+}
+
+impl Arbitrary for PairingCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = (usize::arbitrary(g) % 12) + 2;
+        Self {
+            ops: (0..len).map(|_| PairingOp::arbitrary(g)).collect(),
+        }
+    }
+}
+
+/// Invariant: in every peer entry observed via admin snapshot,
+/// `node_id.is_some()` iff `peer_slot.is_some()`. The runtime sets the two
+/// together (runtime.rs `handle_inbound`); a future refactor that breaks
+/// the pairing would not break convergence — gossip would just silently
+/// re-send unpruned frames — so the bug would slip past every existing
+/// property test. This case stresses `PeerEvent::Added/Removed` interleaved
+/// with `record()` and snapshots after each step.
+#[quickcheck]
+fn quickcheck_peer_slot_pairing_holds_across_lifecycle(case: PairingCase) -> TestResult {
+    use crate::discovery::{Peer, PeerEvent};
+    use tokio::sync::mpsc;
+
+    run_paused(async move {
+            const NODE_COUNT: usize = 3;
+            let router = SimRouter::new();
+            let addrs: Vec<SocketAddr> =
+                (0..NODE_COUNT).map(|i| sock(48_000 + i as u16)).collect();
+
+            let id_local = NodeIdentity::new(NodeId(0xA0A0), 1);
+            let mut cfg = sim_config(id_local, Vec::new(), 1);
+            cfg.fanout = NODE_COUNT.saturating_sub(1);
+
+            let (admin_tx, admin_rx) = mpsc::channel(8);
+            let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
+            let peer_stream = futures::stream::unfold(peer_rx, |mut rx| async move {
+                rx.recv().await.map(|evt| (evt, rx))
+            });
+
+            let local_addr = addrs[0];
+            let (rt_local, client_local) = GossipRuntime::from_parts_with_admin(
+                router.bind(local_addr),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(id_local),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx),
+            );
+            let h_local = tokio::task::spawn_local(rt_local.run(peer_stream));
+
+            let mut remote_clients = Vec::new();
+            let mut remote_handles = Vec::new();
+            for (i, addr) in addrs.iter().enumerate().skip(1) {
+                let id = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
+                let mut cfg = sim_config(id, vec![local_addr], 100 + i as u64);
+                cfg.fanout = 1;
+                let (rt, client) = GossipRuntime::from_parts(
+                    router.bind(*addr),
+                    TokioClock::from_millis(0),
+                    cfg,
+                    store_for(id),
+                    Rc::new(InMemoryAggregateStore::<u32>::new()),
+                );
+                remote_handles.push(tokio::task::spawn_local(
+                    rt.run(futures::stream::empty()),
+                ));
+                remote_clients.push(client);
+            }
+
+            let mut invariant_holds = true;
+            let mut snapshots = 0usize;
+            for op in &case.ops {
+                match op {
+                    PairingOp::AddPeer(idx) => {
+                        let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
+                        let _ = peer_tx.send(PeerEvent::Added(Peer::new(target)));
+                    }
+                    PairingOp::RemovePeer(idx) => {
+                        let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
+                        let _ = peer_tx.send(PeerEvent::Removed(Peer::new(target)));
+                    }
+                    PairingOp::Record(key) => {
+                        let _ = client_local
+                            .record(0xAAAA, key_hash(*key), 0, 1, 0)
+                            .await;
+                    }
+                }
+                sim_advance_ticks(Duration::from_millis(100), 3).await;
+                let snap = admin_snapshot(&admin_tx).await;
+                snapshots += 1;
+                for peer in &snap.peers {
+                    if peer.node_id.is_some() != peer.peer_slot.is_some() {
+                        invariant_holds = false;
+                    }
+                }
+            }
+
+            client_local.shutdown().await.unwrap();
+            for client in remote_clients {
+                let _ = client.shutdown().await;
+            }
+            let _ = h_local.await;
+            for handle in remote_handles {
+                let _ = handle.await;
+            }
+
+        if snapshots == 0 {
+            TestResult::discard()
+        } else {
+            TestResult::from_bool(invariant_holds)
+        }
+    })
+}
+
+// -- Gap 2: without-replacement sampling distribution -----------------------
+
+#[derive(Clone, Debug)]
+struct SamplingCase {
+    seed: u64,
+}
+
+impl Arbitrary for SamplingCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        Self {
+            seed: u64::arbitrary(g),
+        }
+    }
+}
+
+/// Per-peer delivery counts under strict-fanout sampling should be roughly
+/// uniform. The existing `gossip_tick_picks_peers_without_replacement` uses
+/// `fanout == peer_count` so even a degenerate sampler (always picks peer 0)
+/// passes — every peer ends up picked at least once per tick anyway. This
+/// case sets `fanout < peer_count` so a broken sampler concentrates all
+/// deliveries on a few peers and starves the rest.
+#[quickcheck]
+fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
+    case: SamplingCase,
+) -> TestResult {
+    run_paused(async move {
+        const PEERS: usize = 8;
+        const FANOUT: usize = 4;
+        const TICKS: u32 = 100;
+        let router = SimRouter::with_channel_capacity(128);
+        let sender_addr = sock(49_000);
+        let peer_addrs: Vec<SocketAddr> =
+            (0..PEERS).map(|i| sock(49_001 + i as u16)).collect();
+
+        let id_sender = NodeIdentity::new(NodeId(0xB000), 1);
+        let mut cfg_sender = sim_config(id_sender, peer_addrs.clone(), case.seed);
+        cfg_sender.fanout = FANOUT;
+        let agg_sender = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let (rt_sender, client_sender) = GossipRuntime::from_parts(
+            router.bind(sender_addr),
+            TokioClock::from_millis(0),
+            cfg_sender,
+            store_for(id_sender),
+            agg_sender,
+        );
+        let h_sender = tokio::task::spawn_local(rt_sender.run(futures::stream::empty()));
+
+        // Silent recipients — they receive but don't emit gossip themselves
+        // (their stores are empty, so `handle_gossip_tick` early-returns).
+        // We hold the clients to keep their request channels alive.
+        let mut peer_clients = Vec::with_capacity(PEERS);
+        let mut peer_handles = Vec::with_capacity(PEERS);
+        for (i, addr) in peer_addrs.iter().enumerate() {
+            let id = NodeIdentity::new(NodeId(0xB100 + i as u128), 1);
+            let cfg = sim_config(id, Vec::new(), 1000 + i as u64);
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(*addr),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(id),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            peer_handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+            peer_clients.push(client);
+        }
+
+        // One record so the sender has dirty data to gossip every tick.
+        client_sender
+            .record(0xB055, KeyHash(1), 0, 1, 0)
+            .await
+            .unwrap();
+
+        sim_advance_ticks(Duration::from_millis(100), TICKS).await;
+
+        let counts: Vec<u64> = peer_addrs
+            .iter()
+            .map(|addr| router.received_count(*addr))
+            .collect();
+        let total: u64 = counts.iter().sum();
+        let expected = (TICKS as u64) * (FANOUT as u64) / (PEERS as u64);
+        let lower = expected / 2;
+        let upper = expected * 2;
+        let uniform = counts.iter().all(|&c| c >= lower && c <= upper);
+        if !uniform {
+            eprintln!(
+                "non-uniform sampling distribution: seed={}, counts={:?}, \
+                 total={}, expected_per_peer={}, bound=[{},{}]",
+                case.seed, counts, total, expected, lower, upper
+            );
+        }
+
+        client_sender.shutdown().await.unwrap();
+        for client in peer_clients {
+            let _ = client.shutdown().await;
+        }
+        let _ = h_sender.await;
+        for handle in peer_handles {
+            let _ = handle.await;
+        }
+        TestResult::from_bool(uniform)
+    })
+}
+
+// -- Gap 3: decode rejection counter ----------------------------------------
+
+/// Mismatched auth keys cause every inbound frame to fail decode. The
+/// runtime increments `decode_reject_count` per drop and rate-limits a
+/// `warn!` to power-of-two transitions. The existing authentication
+/// quickcheck verifies *convergence* under mismatched keys but never reads
+/// the counter — a regression that breaks the increment (e.g. dropping the
+/// `saturating_add`) wouldn't fail any current test.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
+    use tokio::sync::mpsc;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr_a = sock(50_000);
+            let addr_b = sock(50_001);
+            let id_a = NodeIdentity::new(NodeId(0xDA), 1);
+            let id_b = NodeIdentity::new(NodeId(0xDB), 1);
+
+            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+            cfg_a.auth_key = Some(HmacKey([7; 32]));
+            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+            cfg_b.auth_key = Some(HmacKey([8; 32]));
+
+            let (admin_tx_b, admin_rx_b) = mpsc::channel(4);
+
+            let (rt_a, client_a) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                cfg_a,
+                store_for(id_a),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            let (rt_b, client_b) = GossipRuntime::from_parts_with_admin(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                cfg_b,
+                store_for(id_b),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx_b),
+            );
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+
+            // One record on A. Each tick re-encodes A's dirty cell into a
+            // packet for its only peer (B). B rejects each packet because
+            // the auth keys don't match.
+            client_a.record(0xDEAD, KeyHash(1), 0, 1, 0).await.unwrap();
+
+            const TICKS: u32 = 8;
+            sim_advance_ticks(Duration::from_millis(100), TICKS).await;
+
+            let snap = admin_snapshot(&admin_tx_b).await;
+            // Allow a one-tick slop for first-tick scheduling under
+            // start_paused (the first interval fires at t=0 in some
+            // configurations).
+            assert!(
+                snap.decode_reject_count >= (TICKS as u64) - 1,
+                "decode_reject_count too low: {} (after {} ticks)",
+                snap.decode_reject_count,
+                TICKS
+            );
+            assert!(
+                snap.decode_reject_count <= (TICKS as u64) + 1,
+                "decode_reject_count too high: {} (after {} ticks)",
+                snap.decode_reject_count,
+                TICKS
+            );
+
+            client_a.shutdown().await.unwrap();
+            client_b.shutdown().await.unwrap();
+            let _ = h_a.await;
+            let _ = h_b.await;
+        })
+        .await;
+}
+
+// -- Gap 4: send queue backpressure (WouldBlock re-queue) -------------------
+
+/// When the recipient's inbound channel is saturated, `try_send_to` returns
+/// `WouldBlock` and the runtime re-queues the slot at the front of
+/// `send_pending` (runtime.rs `drain_one_send`). Without re-queue, the slot
+/// would either be lost or shuffled to the back, breaking the high-water
+/// mark this test reads via `max_send_pending_depth`. Working case: queue
+/// fills toward `send_queue_capacity`. Broken case: max stays at 1.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn send_queue_drains_after_recipient_backpressure() {
+    use tokio::sync::mpsc;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            // Channel cap 1 — recipient mpsc holds at most one buffered
+            // packet, so the second outbound from the sender hits WouldBlock
+            // until the recipient drains.
+            let router = SimRouter::with_channel_capacity(1);
+            let addr_a = sock(51_000);
+            let addr_b = sock(51_001);
+            let id_a = NodeIdentity::new(NodeId(0xBA), 1);
+
+            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+            cfg_a.fanout = 1;
+            cfg_a.send_queue_capacity = 8;
+
+            let (admin_tx, admin_rx) = mpsc::channel(4);
+
+            let (rt_a, client_a) = GossipRuntime::from_parts_with_admin(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                cfg_a,
+                store_for(id_a),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx),
+            );
+            // Bind the recipient address but do NOT spawn its runtime. The
+            // mpsc receiver lives on `transport_b` so the channel stays
+            // open with cap 1 and the sender's outbound `try_send_to`
+            // returns `WouldBlock` after the first buffered packet.
+            let transport_b = router.bind(addr_b);
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+
+            for i in 0..6_u128 {
+                client_a.record(0xBA5, KeyHash(i), 0, 1, 0).await.unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 12).await;
+
+            let snap_saturated = admin_snapshot(&admin_tx).await;
+            assert!(
+                snap_saturated.max_send_pending_depth >= 2,
+                "expected backpressure re-queue to grow send_pending past 1, \
+                 got max={} (snapshot={:?})",
+                snap_saturated.max_send_pending_depth,
+                snap_saturated,
+            );
+
+            // Drain the recipient by dropping its transport. The mpsc
+            // receiver is freed and subsequent `try_send` returns `Closed`
+            // (which the sim treats as "delivered to the floor"), letting
+            // the sender's pending queue empty.
+            drop(transport_b);
+            sim_advance_ticks(Duration::from_millis(100), 6).await;
+
+            let snap_drained = admin_snapshot(&admin_tx).await;
+            assert_eq!(
+                snap_drained.send_pending_depth, 0,
+                "send_pending should drain after recipient released: {:?}",
+                snap_drained,
+            );
+
+            client_a.shutdown().await.unwrap();
+            let _ = h_a.await;
+        })
+        .await;
+}
+
+// -- Gap 5: DropProb i.i.d. packet loss -------------------------------------
+
+#[derive(Clone, Debug)]
+struct DropProbCase {
+    p_choice: u8,
+    records: Vec<SimRecord>,
+    nodes: u8,
+}
+
+impl Arbitrary for DropProbCase {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let len = (usize::arbitrary(g) % 16) + 1;
+        Self {
+            p_choice: u8::arbitrary(g) % 3,
+            records: (0..len).map(|_| SimRecord::arbitrary(g)).collect(),
+            nodes: (u8::arbitrary(g) % 4) + 4,
+        }
+    }
+}
+
+/// The `LinkPolicy::DropProb` simulator path implements i.i.d. Bernoulli
+/// packet loss but no existing test exercises it. Demers et al. showed
+/// anti-entropy converges under bounded i.i.d. loss; we sanity-check that
+/// the gossip runtime hits that bound for p ∈ {0.1, 0.3, 0.5} on small
+/// clusters.
+#[quickcheck]
+fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestResult {
+    if case.records.is_empty() {
+        return TestResult::discard();
+    }
+
+    run_paused(async move {
+        let p = match case.p_choice {
+            0 => 0.1,
+            1 => 0.3,
+            _ => 0.5,
+        };
+        let nodes = case.nodes as usize;
+        let router = SimRouter::with_channel_capacity(128);
+        let addrs: Vec<SocketAddr> = (0..nodes).map(|i| sock(52_000 + i as u16)).collect();
+
+        // Apply DropProb on every directed link.
+        for &src in &addrs {
+            for &dst in &addrs {
+                if src != dst {
+                    router.set_link_policy(src, dst, LinkPolicy::DropProb { p });
+                }
+            }
+        }
+
+        let mut clients = Vec::with_capacity(nodes);
+        let mut handles = Vec::with_capacity(nodes);
+        let mut aggregates = Vec::with_capacity(nodes);
+        for i in 0..nodes {
+            let identity = NodeIdentity::new(NodeId(0xC000 + i as u128), 1);
+            let peers: Vec<_> = addrs
+                .iter()
+                .copied()
+                .filter(|addr| *addr != addrs[i])
+                .collect();
+            let mut cfg = sim_config(identity, peers, 0xD0D0 + i as u64);
+            cfg.fanout = nodes.saturating_sub(1).min(4).max(1);
+            cfg.max_cells_per_tick = 32;
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(addrs[i]),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(identity),
+                agg.clone(),
+            );
+            handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+            clients.push(client);
+            aggregates.push(agg);
+        }
+
+        for record in &case.records {
+            let node = record.node as usize % nodes;
+            clients[node]
+                .record(
+                    rule_fp(record.rule),
+                    key_hash(record.key),
+                    0,
+                    record.hits as u64,
+                    0,
+                )
+                .await
+                .unwrap();
+        }
+
+        let expected = expected_model(&case.records, nodes);
+        let mut converged = false;
+        for _ in 0..40 {
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            if aggregates.iter().all(|agg| agg.snapshot() == expected) {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            eprintln!(
+                "iid loss test did not converge under p={}, nodes={}, \
+                 records={}, last_states={:?}",
+                p,
+                nodes,
+                case.records.len(),
+                aggregates
+                    .iter()
+                    .map(|agg| agg.snapshot())
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        for client in clients {
+            let _ = client.shutdown().await;
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        TestResult::from_bool(converged)
+    })
+}
+
+// -- Gap 6: peer event lifecycle idempotence --------------------------------
+
+/// `handle_peer_event` guards `Added` against duplicates (`peers.iter()
+/// .any(...)`) and tolerates `Removed` of a peer that was never added
+/// (`peers.iter().position(...).map(...)`). Neither edge is exercised by
+/// existing tests. This case walks the sequence
+/// `Added → Added → Removed → Removed → Added` and asserts the peer-list
+/// length transitions are `1 → 1 → 0 → 0 → 1`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn peer_event_lifecycle_is_idempotent_and_tolerant() {
+    use crate::discovery::{Peer, PeerEvent};
+    use tokio::sync::mpsc;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr_local = sock(53_000);
+            let addr_other = sock(53_001);
+            let id_local = NodeIdentity::new(NodeId(0xE0E0), 1);
+
+            let (admin_tx, admin_rx) = mpsc::channel(8);
+            let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
+            let peer_stream = futures::stream::unfold(peer_rx, |mut rx| async move {
+                rx.recv().await.map(|evt| (evt, rx))
+            });
+
+            let (rt, client) = GossipRuntime::from_parts_with_admin(
+                router.bind(addr_local),
+                TokioClock::from_millis(0),
+                sim_config(id_local, Vec::new(), 1),
+                store_for(id_local),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx),
+            );
+            let handle = tokio::task::spawn_local(rt.run(peer_stream));
+
+            // Initial snapshot: no peers.
+            let snap0 = admin_snapshot(&admin_tx).await;
+            assert_eq!(snap0.peers.len(), 0, "initial state should have no peers");
+
+            let events: Vec<(PeerEvent, usize, &'static str)> = vec![
+                (PeerEvent::Added(Peer::new(addr_other)), 1, "first add"),
+                (PeerEvent::Added(Peer::new(addr_other)), 1, "duplicate add"),
+                (PeerEvent::Removed(Peer::new(addr_other)), 0, "first remove"),
+                (PeerEvent::Removed(Peer::new(addr_other)), 0, "remove without add"),
+                (PeerEvent::Added(Peer::new(addr_other)), 1, "re-add"),
+            ];
+
+            for (evt, expected_len, label) in events {
+                peer_tx.send(evt).expect("peer stream open");
+                // Yield enough that the runtime processes the peer event
+                // before we snapshot. Peer events are CRDT-free, so no
+                // time advance is strictly required, but a yield ensures
+                // ordering between the send and the snapshot.
+                tokio::task::yield_now().await;
+                let snap = admin_snapshot(&admin_tx).await;
+                assert_eq!(
+                    snap.peers.len(),
+                    expected_len,
+                    "after {label}: snapshot={snap:?}"
+                );
+            }
 
             client.shutdown().await.unwrap();
             let _ = handle.await;

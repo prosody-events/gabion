@@ -111,6 +111,7 @@ impl SimRouter {
             addr,
             router: self.clone(),
             inbound_rx: Mutex::new(rx),
+            blocked: RefCell::new(false),
         }
     }
 
@@ -200,6 +201,12 @@ pub struct SimTransport {
     addr: SocketAddr,
     router: SimRouter,
     inbound_rx: Mutex<mpsc::Receiver<SimPacket>>,
+    /// Set whenever `try_send_to` returns `WouldBlock`; cleared on the next
+    /// successful send. Used by `writable` to insert a yield only while the
+    /// loop would otherwise hot-spin retrying a blocked send, so other
+    /// `select!` arms (notably `tick`) get a chance to run. Models the
+    /// realtime UDP behavior where `writable` waits on socket state.
+    blocked: RefCell<bool>,
 }
 
 impl SimTransport {
@@ -214,8 +221,14 @@ impl GossipTransport for SimTransport {
     }
 
     async fn writable(&self) -> io::Result<()> {
-        // Sim has no kernel backpressure that we need to drain; capacity is
-        // governed by `try_send` returning `WouldBlock`. Resolve immediately.
+        // Only yield when the last `try_send_to` returned `WouldBlock`. The
+        // normal case (no backpressure) resolves immediately — preserves the
+        // timing characteristics existing sim tests were written against.
+        // The yield only matters under saturation, where without it the
+        // writable arm hot-spins and starves `tick`.
+        if *self.blocked.borrow() {
+            tokio::task::yield_now().await;
+        }
         Ok(())
     }
 
@@ -236,12 +249,17 @@ impl GossipTransport for SimTransport {
         match sender.try_send(packet) {
             Ok(()) => {
                 self.router.record_delivery(dst);
+                *self.blocked.borrow_mut() = false;
                 Ok(buf.len())
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                *self.blocked.borrow_mut() = true;
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Ok(buf.len()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                *self.blocked.borrow_mut() = false;
+                Ok(buf.len())
+            }
         }
     }
 

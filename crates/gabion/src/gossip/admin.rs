@@ -32,6 +32,11 @@ pub struct AdminSnapshot {
     pub forwarded_dirty_len: u32,
     pub send_pending_depth: usize,
     pub decode_reject_count: u64,
+    /// High-water mark of `send_pending_depth` since startup. Useful for
+    /// verifying that the `try_send` `WouldBlock` re-queue path was
+    /// exercised under saturation — without re-queue, the depth never
+    /// rises above 1.
+    pub max_send_pending_depth: usize,
 }
 
 /// One peer known to the runtime. `node_id` is `None` until the runtime has

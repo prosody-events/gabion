@@ -124,6 +124,12 @@ where
     // the wrong version / cluster secret can't flood the log.
     decode_reject_count: u64,
 
+    // High-water mark of `send_pending.len()`. Strictly observability — the
+    // `WouldBlock` re-queue path in `drain_one_send` is otherwise invisible
+    // to external testers, so this field lets the property test for that
+    // path verify the queue actually grew under saturation.
+    max_send_pending_depth: usize,
+
     _not_send: PhantomData<*const ()>,
 }
 
@@ -252,6 +258,7 @@ where
             rng,
             pending_reply: None,
             decode_reject_count: 0,
+            max_send_pending_depth: 0,
             _not_send: PhantomData,
         };
         let client = GossipClient::new(req_tx);
@@ -332,6 +339,10 @@ where
                 self.aggregates.apply(&self.sink_buf, &self.expiration_buf);
                 self.sink_buf.clear();
                 self.expiration_buf.clear();
+            }
+
+            if self.send_pending.len() > self.max_send_pending_depth {
+                self.max_send_pending_depth = self.send_pending.len();
             }
 
             // Ack any pending limit-request AFTER the apply ran — callers
@@ -494,6 +505,7 @@ where
                     forwarded_dirty_len: self.store.forwarded_dirty().len(),
                     send_pending_depth: self.send_pending.len(),
                     decode_reject_count: self.decode_reject_count,
+                    max_send_pending_depth: self.max_send_pending_depth,
                 };
                 // Caller may have dropped the receiver; not an error.
                 let _ = reply.send(snapshot);
