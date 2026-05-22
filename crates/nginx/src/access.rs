@@ -161,6 +161,7 @@ pub fn decide(
     let matched: ArrayVec<RuleSpec, MAX_DESCRIPTORS> =
         collect_matching_specs(ctx.rules.table(), ctx.domain, descriptors_slice, ctx.rules);
 
+    let mut records: ArrayVec<QueueEvent, MAX_DESCRIPTORS> = ArrayVec::new();
     for spec in &matched {
         let key_hash = hash_key(spec.id, ctx.domain, descriptors_slice);
         let bucket = (now_millis / spec.bucket_millis.max(1)) as u32;
@@ -178,18 +179,13 @@ pub fn decide(
                 now_millis,
             });
         }
-        // Record-then-read penalty rate: enqueue regardless of allow/reject.
-        let push_result = ctx.queue.push(QueueEvent {
+        records.push(QueueEvent {
             rule_fingerprint: spec.fingerprint,
             key_hash: key_hash.0,
             bucket,
             hits: 1,
             now_millis,
         });
-        match push_result {
-            Ok(()) => ctx.stats.record_queue_push(),
-            Err(_) => ctx.stats.record_queue_drop(),
-        }
     }
 
     match worst {
@@ -201,6 +197,12 @@ pub fn decide(
             if matched.is_empty() {
                 AccessOutcome::Decline
             } else {
+                for event in records {
+                    match ctx.queue.push(event) {
+                        Ok(()) => ctx.stats.record_queue_push(),
+                        Err(_) => ctx.stats.record_queue_drop(),
+                    }
+                }
                 ctx.stats.record_allow();
                 AccessOutcome::Allow
             }
@@ -462,6 +464,8 @@ mod tests {
             }
             other => panic!("expected Reject, got {other:?}"),
         }
+        let mut out = [QueueEvent::default(); 1];
+        assert_eq!(region.queue().drain(&mut out), 0);
     }
 
     #[test]

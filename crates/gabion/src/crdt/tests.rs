@@ -1481,6 +1481,35 @@ fn expire_at_and_expire_agree_for_same_now() {
 }
 
 #[test]
+fn expire_at_uses_ceil_for_partial_bucket_windows() {
+    let mut store = small_store(8, 8);
+    store
+        .intern_rule(RuleDescriptor {
+            fingerprint: 0x11,
+            window_millis: 101,
+            bucket_millis: 50,
+            limit: 10,
+            flags: 0,
+            local_rule_id: 1,
+        })
+        .unwrap();
+
+    let mut obs = ObservationBatch::with_capacity(1);
+    let mut deltas = DeltaSink::with_capacity(1);
+    obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
+    store.merge_remote(&obs, &mut deltas);
+
+    let mut expirations = ExpirationSink::<u32>::with_capacity(1);
+    store.expire_at(150, &mut expirations);
+
+    // now=150ms -> current bucket 3. A 101ms window spans ceil(101/50)=3
+    // buckets, so bucket 0 is still live. Floor division would use 2 live
+    // buckets and expire this cell.
+    assert_eq!(expirations.len(), 0);
+    assert_eq!(store.active_len(), 1);
+}
+
+#[test]
 fn fill_gossip_frame_for_peer_skips_acked_cells() {
     let mut store = small_store(8, 8);
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();

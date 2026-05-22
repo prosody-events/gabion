@@ -12,21 +12,25 @@
 //! - This module — `SharedLimiter`, the gRPC service trait impl, and Envoy
 //!   descriptor mapping.
 //!
-//! Hit semantics are **record-then-read**: every matching `(rule, key)` pair
-//! records its hits into the gossip runtime before the limit is evaluated,
-//! so rejected requests still credit the bucket ("penalty rate"). Multi-
-//! descriptor requests are no longer all-or-nothing for admission.
+//! Hit semantics are **read-then-record**: each descriptor is evaluated against
+//! the current aggregate window, and only allowed descriptors record hits into
+//! the gossip runtime. Multi-descriptor requests are not all-or-nothing for
+//! admission.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gabion::crdt::Count;
+use gabion::defaults;
 use gabion::gossip::GossipClient;
 use gabion::rules::{Descriptor, Rule, RuleId, RuleTable, hash_key};
+use thiserror::Error;
 
 use crate::admission::{CardinalityLimits, Decision, LimitRequest, RejectReason};
 use crate::store::DashMapStore;
+
+const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
 
 pub mod admin;
 pub mod admission;
@@ -44,6 +48,20 @@ pub use envoy_types::pb::envoy::service::ratelimit::v3::{
     RateLimitRequest, RateLimitResponse, rate_limit_response,
     rate_limit_service_server::RateLimitServiceServer,
 };
+
+#[derive(Debug, Error)]
+pub enum ServeError {
+    #[error("build gRPC reflection service: {0}")]
+    Reflection(#[from] tonic_reflection::server::Error),
+    #[error("serve gRPC transport: {0}")]
+    Transport(#[from] tonic::transport::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum EvaluationError {
+    #[error("rule spec missing for rule id {0}")]
+    MissingRuleSpec(RuleId),
+}
 
 /// Precomputed hot-path data for one rule. Built once at startup so the
 /// per-request path doesn't re-derive bucket arithmetic or look up the
@@ -96,11 +114,11 @@ impl<C: Count> SharedLimiter<C> {
         &self.counts
     }
 
-    fn spec_for(&self, id: RuleId) -> &RuleSpec {
+    fn spec_for(&self, id: RuleId) -> Result<&RuleSpec, EvaluationError> {
         self.rule_specs
             .iter()
             .find(|s| s.id == id)
-            .expect("rule spec missing for an id that came from rule_table")
+            .ok_or(EvaluationError::MissingRuleSpec(id))
     }
 
     /// Evaluate one Envoy rate-limit request at the given wall-clock time.
@@ -110,34 +128,62 @@ impl<C: Count> SharedLimiter<C> {
         &self,
         request: RateLimitRequest,
         now_millis: u64,
-    ) -> RateLimitResponse {
+    ) -> Result<RateLimitResponse, EvaluationError> {
         let hits = u64::from(request.hits_addend.max(1));
-        let mut decisions = Vec::with_capacity(request.descriptors.len());
+        let mut statuses = Vec::with_capacity(request.descriptors.len());
+        let max_entries = request
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.entries.len())
+            .max()
+            .unwrap_or(0)
+            .min(MAX_DESCRIPTORS);
+        let mut mapped = Vec::with_capacity(max_entries);
+        let mut over_limit = false;
 
-        for envoy_descriptor in &request.descriptors {
-            let mapped: Vec<Descriptor<'_>> = envoy_descriptor
-                .entries
-                .iter()
-                .map(|entry| Descriptor {
-                    key: entry.key.as_str(),
-                    value: entry.value.as_str(),
-                })
-                .collect();
-            let core_request = LimitRequest {
-                domain: request.domain.as_str(),
-                descriptors: &mapped,
-                hits,
+        for (idx, envoy_descriptor) in request.descriptors.iter().enumerate() {
+            let decision = if idx >= MAX_DESCRIPTORS {
+                Decision::Reject(RejectReason::Cardinality)
+            } else {
+                match map_envoy_descriptor(envoy_descriptor, &mut mapped) {
+                    Ok(()) => {
+                        let core_request = LimitRequest {
+                            domain: request.domain.as_str(),
+                            descriptors: mapped.as_slice(),
+                            hits,
+                        };
+                        self.evaluate(core_request, now_millis).await?
+                    }
+                    Err(reason) => Decision::Reject(reason),
+                }
             };
-            decisions.push(self.evaluate(core_request, now_millis).await);
+
+            over_limit |= decision.is_reject();
+            statuses.push(rate_limit_response::DescriptorStatus {
+                code: code_for_decision(decision),
+                ..Default::default()
+            });
         }
 
-        response_from_decisions(&decisions)
+        Ok(RateLimitResponse {
+            overall_code: if over_limit {
+                rate_limit_response::Code::OverLimit
+            } else {
+                rate_limit_response::Code::Ok
+            } as i32,
+            statuses,
+            ..Default::default()
+        })
     }
 
-    async fn evaluate(&self, request: LimitRequest<'_>, now_millis: u64) -> Decision {
+    async fn evaluate(
+        &self,
+        request: LimitRequest<'_>,
+        now_millis: u64,
+    ) -> Result<Decision, EvaluationError> {
         if request.violates_cardinality(self.cardinality_limits) {
             note_cardinality_reject(request.domain, request.descriptors.len());
-            return Decision::Reject(RejectReason::Cardinality);
+            return Ok(Decision::Reject(RejectReason::Cardinality));
         }
 
         let mut decision = Decision::Allow;
@@ -145,20 +191,8 @@ impl<C: Count> SharedLimiter<C> {
             .rule_table
             .matching(request.domain, request.descriptors)
         {
-            let spec = self.spec_for(rule.id);
+            let spec = self.spec_for(rule.id)?;
             let key_hash = hash_key(rule.id, request.domain, request.descriptors);
-            let bucket = (now_millis / spec.bucket_millis) as u32;
-
-            // Record-then-read. If the gossip runtime has gone away the
-            // record fails open — we still consult whatever the local
-            // DashMap holds.
-            if let Err(err) = self
-                .gossip_client
-                .record(spec.fingerprint, key_hash, bucket, request.hits, now_millis)
-                .await
-            {
-                note_gossip_record_failure(&err);
-            }
 
             let total = self.counts.window_total(
                 spec.fingerprint,
@@ -167,14 +201,49 @@ impl<C: Count> SharedLimiter<C> {
                 spec.bucket_millis,
                 spec.live_buckets,
             );
-            if total > spec.limit {
+            if total.saturating_add(request.hits) > spec.limit {
                 decision = Decision::Reject(RejectReason::GlobalLimit);
-                // Continue iterating so every matching rule's bucket is
-                // credited under record-then-read.
+                // Continue iterating so every matching rule participates in
+                // the decision, but do not charge a rejected descriptor.
             }
         }
-        decision
+
+        if !decision.is_reject() {
+            for rule in self
+                .rule_table
+                .matching(request.domain, request.descriptors)
+            {
+                let spec = self.spec_for(rule.id)?;
+                let key_hash = hash_key(rule.id, request.domain, request.descriptors);
+                let bucket = (now_millis / spec.bucket_millis) as u32;
+                if let Err(err) = self
+                    .gossip_client
+                    .record(spec.fingerprint, key_hash, bucket, request.hits, now_millis)
+                    .await
+                {
+                    note_gossip_record_failure(&err);
+                }
+            }
+        }
+        Ok(decision)
     }
+}
+
+fn map_envoy_descriptor<'a>(
+    envoy_descriptor: &'a RateLimitDescriptor,
+    mapped: &mut Vec<Descriptor<'a>>,
+) -> Result<(), RejectReason> {
+    mapped.clear();
+    for entry in &envoy_descriptor.entries {
+        if mapped.len() == MAX_DESCRIPTORS {
+            return Err(RejectReason::Cardinality);
+        }
+        mapped.push(Descriptor {
+            key: entry.key.as_str(),
+            value: entry.value.as_str(),
+        });
+    }
+    Ok(())
 }
 
 // -- Rate-limited operator warnings -----------------------------------------
@@ -260,7 +329,7 @@ pub async fn serve<C, F, H>(
     limiter: SharedLimiter<C>,
     health_server: tonic_health::pb::health_server::HealthServer<H>,
     shutdown: F,
-) -> Result<(), tonic::transport::Error>
+) -> Result<(), ServeError>
 where
     C: Count + Send + Sync + 'static,
     F: std::future::Future<Output = ()>,
@@ -269,8 +338,7 @@ where
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .with_service_name(RATE_LIMIT_SERVICE_NAME)
-        .build_v1()
-        .expect("build reflection service");
+        .build_v1()?;
 
     tonic::transport::Server::builder()
         .add_service(health_server)
@@ -279,7 +347,9 @@ where
             limiter,
         )))
         .serve_with_shutdown(bind, shutdown)
-        .await
+        .await?;
+
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -295,7 +365,8 @@ where
         let response = self
             .limiter
             .should_rate_limit_at(request.into_inner(), now_millis())
-            .await;
+            .await
+            .map_err(|err| tonic::Status::internal(err.to_string()))?;
         Ok(tonic::Response::new(response))
     }
 }
@@ -309,16 +380,9 @@ pub fn response_from_decisions(decisions: &[Decision]) -> RateLimitResponse {
     } as i32;
     let statuses = decisions
         .iter()
-        .map(|decision| {
-            let code = if decision.is_reject() {
-                rate_limit_response::Code::OverLimit
-            } else {
-                rate_limit_response::Code::Ok
-            } as i32;
-            rate_limit_response::DescriptorStatus {
-                code,
-                ..Default::default()
-            }
+        .map(|decision| rate_limit_response::DescriptorStatus {
+            code: code_for_decision(*decision),
+            ..Default::default()
         })
         .collect();
 
@@ -327,6 +391,14 @@ pub fn response_from_decisions(decisions: &[Decision]) -> RateLimitResponse {
         statuses,
         ..Default::default()
     }
+}
+
+fn code_for_decision(decision: Decision) -> i32 {
+    (if decision.is_reject() {
+        rate_limit_response::Code::OverLimit
+    } else {
+        rate_limit_response::Code::Ok
+    }) as i32
 }
 
 pub fn descriptor(

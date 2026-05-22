@@ -84,7 +84,7 @@ async fn run() -> anyhow::Result<()> {
 
     let rule_table = Arc::new(config.rule_table()?);
     let mut cell_store = CellStore::<u32>::new(config.cell_store_config(), identity);
-    register_rules(&mut cell_store, &rule_table);
+    register_rules(&mut cell_store, &rule_table).context("register configured rules")?;
     let counts = Arc::new(DashMapStore::<u32>::with_capacity(
         config.storage.max_cells.unwrap_or(4096),
     ));
@@ -164,7 +164,11 @@ async fn run() -> anyhow::Result<()> {
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::task::spawn_local(async move {
             let shutdown = async move {
-                let _ = shutdown_rx.wait_for(|drain| *drain).await;
+                if shutdown_rx.wait_for(|drain| *drain).await.is_err() {
+                    tracing::debug!(
+                        "Shutdown channel closed before the gRPC server observed a drain signal.",
+                    );
+                }
             };
             serve(bind, limiter, health_server, shutdown).await
         })
@@ -180,7 +184,11 @@ async fn run() -> anyhow::Result<()> {
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::task::spawn_local(async move {
             let shutdown = async move {
-                let _ = shutdown_rx.wait_for(|drain| *drain).await;
+                if shutdown_rx.wait_for(|drain| *drain).await.is_err() {
+                    tracing::debug!(
+                        "Shutdown channel closed before the admin server observed a drain signal.",
+                    );
+                }
             };
             admin::serve_with_shutdown(bind, state, shutdown).await
         })
@@ -231,7 +239,12 @@ async fn run() -> anyhow::Result<()> {
     // Trigger graceful shutdown of the gRPC and admin servers. Each task
     // observes the flip via `wait_for(|drain| *drain)` and tonic's
     // `serve_with_shutdown` drains in-flight requests before returning.
-    let _ = shutdown_tx.send(true);
+    if shutdown_tx.send(true).is_err() {
+        tracing::warn!(
+            "Shutdown signal had no remaining subscribers; gRPC/admin tasks \
+             may have already exited.",
+        );
+    }
 
     // Drain the gRPC server. tonic finishes any in-flight `should_rate_limit`
     // calls before this future resolves.
@@ -279,17 +292,28 @@ async fn run() -> anyhow::Result<()> {
     early_exit
 }
 
-fn register_rules(cell_store: &mut CellStore<u32>, rule_table: &gabion::rules::RuleTable) {
+fn register_rules(
+    cell_store: &mut CellStore<u32>,
+    rule_table: &gabion::rules::RuleTable,
+) -> anyhow::Result<()> {
     for rule in rule_table.iter() {
-        let _ = cell_store.intern_rule(RuleDescriptor {
+        let descriptor = RuleDescriptor {
             fingerprint: rule.fingerprint,
             window_millis: rule.window_millis.min(u32::MAX as u64) as u32,
             bucket_millis: rule.bucket_millis.min(u32::MAX as u64) as u32,
             limit: rule.limit,
             flags: 0,
             local_rule_id: rule.id,
-        });
+        };
+        if cell_store.intern_rule(descriptor).is_none() {
+            anyhow::bail!(
+                "rule dictionary is full while registering rule id {} fingerprint {:032x}",
+                rule.id,
+                rule.fingerprint,
+            );
+        }
     }
+    Ok(())
 }
 
 fn discovery_stream(

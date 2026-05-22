@@ -1294,7 +1294,7 @@ impl<C: Count> CellStore<C> {
             let (current, live) = match self.rule_dictionary.descriptor(slot as RuleSlot) {
                 Some(d) if d.bucket_millis > 0 => {
                     let current = (now_millis / d.bucket_millis as u64) as BucketEpoch;
-                    let live = (d.window_millis / d.bucket_millis).max(1);
+                    let live = d.window_millis.div_ceil(d.bucket_millis).max(1);
                     (current, live)
                 }
                 _ => (0, 0),
