@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/gabion.png" alt="Gabion" width="100%">
+</p>
+
 # Gabion
 
 **A distributed rate limiter for nginx and Envoy.** Cluster members
