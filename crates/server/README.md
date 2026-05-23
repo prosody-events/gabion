@@ -1,95 +1,100 @@
 # gabiond — gabion's gRPC adapter
 
-## What gabiond is
-
 `gabiond` is gabion's standalone rate-limit service: an Envoy-compatible
 gRPC server that any sidecar or proxy speaking
-`envoy.service.ratelimit.v3` can call. Internally it uses the same
-CRDT and gossip plumbing as the nginx module, so the two can coexist in
-a single cluster and share counters. If you're not running Envoy or you
-want enforcement inside nginx itself, see the [main nginx README](../../README.md)
-instead.
-
-For the broader architecture see [`CLAUDE.md`](../../CLAUDE.md); for
-the gossip protocol see [`crates/gabion/README.md`](../gabion/README.md);
-for CRDT internals see [`crates/gabion/CRDT.md`](../gabion/CRDT.md).
+`envoy.service.ratelimit.v3` can call. It shares the CRDT and gossip
+machinery with the nginx module, so the two adapters can coexist in a
+single cluster and count against the same totals. If you're not running
+Envoy — or you want enforcement inside nginx itself — see
+[`../nginx/README.md`](../nginx/README.md). For the gossip protocol
+explainer and tuning knobs, see
+[`../gabion/README.md#how-gossip-works`](../gabion/README.md#how-gossip-works)
+and
+[`../gabion/README.md#operator-knobs`](../gabion/README.md#operator-knobs).
 
 ## Your first YAML
 
-A minimal `config.yaml` that runs `gabiond` on a single node:
+A single-node `gabiond` needs four things: where Envoy reaches it, an
+admin port, one rule, and a gossip socket. The gossip socket is
+mandatory even with no peers so a future peer can join without a
+restart.
 
 ```yaml
 # Where Envoy (or any v3 ratelimit client) reaches gabiond.
 envoy_bind: 0.0.0.0:8081
 
-# Optional: HTTP endpoint for /snapshot and other admin reads.
+# HTTP endpoint for /snapshot (peer + cell view).
 admin_bind: 0.0.0.0:9090
 
-# One rule: 100 requests/second per IP, keyed by an Envoy descriptor
-# entry whose key is `remote_address`.
+# One rule: 100 requests/second per IP. Envoy emits a descriptor
+# whose key is `remote_address`; gabion keys the counter on the value.
 limits:
   - name: per_ip
     domain: envoy
     descriptors:
-      - key: remote_address       # the Envoy descriptor key to match on
-    rate: 100r/s                  # the rate's period IS the default window
-    # `window:` (optional) widens the time horizon; the resolved limit
-    # scales up to `floor(rate_count * window / period)`.
-    # `bucket:` (optional) defaults to the resolved window — one fixed-
-    # window bucket. Set explicitly for sliding-window-style enforcement.
+      - key: remote_address
+    rate: 100r/s
 
-# Gossip channel — required even for a single node so future peers
-# can join without a restart.
+# Gossip channel — required even on a single node.
 gossip:
   bind: 0.0.0.0:9000
-  cluster_id_hash: 0xc0ffee       # any non-zero u128 shared across peers
+  cluster_id_hash: 0xc0ffee   # any non-zero u128 shared across peers
 ```
 
-Run with:
+Run it:
 
 ```bash
 gabiond /etc/gabion/config.yaml
 ```
 
-Configure Envoy to point its rate-limit filter at
-`gabiond.<namespace>.svc:8081` (or wherever you bound `envoy_bind`).
-Each request Envoy emits one `RateLimit` RPC; gabiond evaluates the
-matching rules against the current cluster-wide aggregate, records
-allowed hits, and returns `OK` or `OVER_LIMIT`.
+Point Envoy's rate-limit filter at `gabiond.<namespace>.svc:8081` (or
+wherever you bound `envoy_bind`). Envoy emits one RPC per request;
+gabiond evaluates every descriptor in that RPC against the rules its
+`(domain, key)` matches, records the allowed ones into the gossip
+ring, and replies. `overall_code` is `OVER_LIMIT` if any descriptor
+was rejected; per-descriptor codes ride in `statuses[]` so a partial
+reject doesn't fail the whole batch.
 
 ## How configuration layers
 
-Configuration is built up in three stages, each overriding the
-previous:
+Most operators ship one ConfigMap to every replica and poke a couple
+of values — the gossip bind, the pod IP — through per-pod env vars.
+That's the shape gabiond is built for.
 
-1. **Built-in defaults** from `gabion::defaults` and the per-struct
-   `Default` impls.
-2. **YAML file** passed on the command line.
-3. **Environment variables** — every overridable field has one
-   `GABION_*` env var bound explicitly. Useful for container deploys
-   where most of the config is shared via ConfigMap but a few values
-   (binds, seeds) come from per-pod env.
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Environment variables (last word)                           │
+│   GABION_GOSSIP_BIND, GABION_DISCOVERY_SELF_ADDR, …         │
+│   Scalars and comma-separated lists. Cannot express         │
+│   `limits[]` or anything with nested duration fields.       │
+├─────────────────────────────────────────────────────────────┤
+│ YAML file (the shape)                                       │
+│   /etc/gabion/config.yaml. Full schema including rules.     │
+├─────────────────────────────────────────────────────────────┤
+│ Built-in defaults                                           │
+│   `gabion::defaults` + per-struct `Default` impls.          │
+└─────────────────────────────────────────────────────────────┘
+```
 
-See `crates/server/src/config.rs::ENV_BINDINGS` for the full list of
-env-var names. Comma-separated values feed list fields:
-`GABION_DISCOVERY_NAMESPACE_ALLOW=ns-a,ns-b`.
-
-Structured lists (notably `limits:`, where each entry has nested
-fields and durations) come from the YAML file — they cannot be expressed
-through flat env vars.
+Every overridable field has exactly one `GABION_*` env var; see
+`ENV_BINDINGS` in `crates/server/src/config.rs` for the full table.
+Comma-separated values feed list fields:
+`GABION_DISCOVERY_NAMESPACE_ALLOW=ns-a,ns-b`. Structured lists (the
+`limits:` block, anything with nested durations) live in YAML only —
+flat env vars cannot express them.
 
 ## Glossary
 
-The gabion vocabulary is shared between adapters; see the [main
-README's glossary](../../README.md#glossary) for the full set.
-Server-specific terms:
+The core vocabulary — rule, descriptor, rate, window, bucket,
+cardinality, fail-open — is defined once in the
+[root glossary](../../README.md#glossary). Server-specific terms:
 
-| Term            | Definition                                                                                                                                  |
-|-----------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| **Envoy domain**| The `domain:` field in a YAML rule, matched against the `domain` field of the inbound `RateLimitRequest`. Envoy filters set this per-route. |
-| **Descriptor**  | An Envoy term: a list of `(key, value)` pairs sent with each request. Gabion's rule descriptors match against these.                        |
-| **Read-then-record** | Each descriptor is evaluated against the current aggregate; only allowed descriptors are recorded into gossip. Multi-descriptor requests are not all-or-nothing — over-limit descriptors return `OVER_LIMIT` for that descriptor alone. |
-| **`/snapshot`** | Admin HTTP endpoint that returns the full peer + cell view. The fastest way to verify a cluster has converged.                              |
+| Term                 | Definition                                                                                                                  |
+|----------------------|-----------------------------------------------------------------------------------------------------------------------------|
+| **Envoy domain**     | The `domain:` field on a rule. Matched against the `domain` field on the inbound `RateLimitRequest`; Envoy filters set this per-route. |
+| **Descriptor**       | Envoy's term for the `(key, value)` pairs each request carries. Gabion's `descriptors:` patterns match against them.        |
+| **Read-then-record** | Each descriptor is evaluated against the cluster aggregate first; only allowed descriptors record into gossip.              |
+| **`/snapshot`**      | Admin HTTP endpoint returning the full peer + cell view. The fastest way to verify a cluster has converged.                 |
 
 ## Common patterns
 
@@ -104,9 +109,8 @@ limits:
     rate: 100r/s
 ```
 
-Envoy's `remote_address` action emits a descriptor of the form
-`("remote_address", "1.2.3.4")` per request. Gabion keys the counter
-on the descriptor's value.
+Envoy's `remote_address` action emits `("remote_address", "1.2.3.4")`
+per request; gabion keys the counter on the descriptor's value.
 
 ### Limit per tenant header
 
@@ -119,7 +123,7 @@ limits:
     rate: 1000r/m
 ```
 
-Configure Envoy's filter to extract a header into a descriptor:
+Configure Envoy to extract the header into a descriptor:
 
 ```yaml
 # Envoy route_config snippet
@@ -130,7 +134,7 @@ rate_limits:
           descriptor_key: tenant
 ```
 
-Each tenant sees an independent 1000/m budget.
+Each tenant gets an independent 1000-per-minute budget.
 
 ### Roll out a new limit safely
 
@@ -144,14 +148,19 @@ limits:
     mode: dry_run        # evaluate + record, never reject
 ```
 
-Watch `gabiond`'s metrics (`gabion_admission_allowed`,
-`gabion_admission_rejected`) for the new rule. Once the ratio looks
-right, drop `mode: dry_run` to start enforcing.
+`dry_run` evaluates the rule and records hits into gossip but never
+rejects. To see what would have happened, look at the per-descriptor
+`code` field in the gRPC `statuses[]` array (Envoy's access logs can
+surface this), and check `/snapshot` to confirm the rule is
+accumulating counts. Once the numbers look right, drop the `mode:`
+line to start enforcing.
 
-### Stack per-IP + per-tenant
+### Stack per-IP and per-tenant
 
-Each YAML rule is an independent gate; the gRPC service evaluates every
-descriptor in the request and returns `OVER_LIMIT` if any rule rejects.
+Each YAML rule is an independent gate. A request is evaluated against
+every rule its descriptors match; if any rule rejects, that
+descriptor's status is `OVER_LIMIT` and `overall_code` is
+`OVER_LIMIT`.
 
 ```yaml
 limits:
@@ -165,18 +174,20 @@ limits:
     rate: 1000r/m
 ```
 
+The Envoy filter emits two descriptors per request, one per action.
+
 ### Rate, window, and bucket
 
-A rule resolves to three internal numbers — a `limit`, a `window`, and a
-`bucket`. The YAML shape mirrors the nginx adapter:
+The concept is defined in the
+[root glossary](../../README.md#glossary). The YAML surface:
 
-* `rate:` (mandatory) — `N` requests per period, e.g. `10r/s`, `100r/5m`,
-  `1000r/h`. Same syntax as the nginx `rate=` argument.
-* `window:` (optional) — the time horizon the rate is enforced over.
-  Defaults to the rate's period. When set, the resolved limit scales up
-  to `floor(rate_count * window / period)`.
-* `bucket:` (optional) — granularity inside the window. Defaults to the
-  resolved window (one fixed-window bucket). Set smaller for
+* `rate:` (mandatory) — `Nr/<unit>`, e.g. `10r/s`, `100r/5m`,
+  `1000r/h`.
+* `window:` (optional) — the time horizon. Defaults to the rate's
+  period. Set it longer to scale the limit up to
+  `floor(rate_count * window / period)`.
+* `bucket:` (optional) — granularity inside the window. Defaults to
+  the resolved window (one fixed-window bucket). Set smaller for
   sliding-window-style enforcement.
 
 Worked example:
@@ -191,121 +202,107 @@ limits:
     bucket: 1h
 ```
 
-resolves to `limit = 10 * 5 * 3600 = 180000`, `window = 5h`, `bucket = 1h`
-(five live buckets). The same triple can be written as
-`rate: 180000r/5h\nbucket: 1h` — the operator-facing knob is identical.
+resolves to `limit = 10 * 5 * 3600 = 180_000`, `window = 5h`,
+`bucket = 1h` (five live buckets). The same triple is equivalent to
+`rate: 180000r/5h` with `bucket: 1h`.
 
-> **Rule of thumb.** If you set `window:` larger than the rate's period
-> and don't also set `bucket:`, you get a *burstable* budget — clients
-> can fire the whole window's allowance instantly, then sit empty for
-> the rest of the window. For sustained-rate enforcement, set `bucket:`
-> close to the rate's period. `rate: 10r/s, window: 5h, bucket: 1s`
-> keeps the 180k 5-hour budget but smooths it to roughly 10 r/s.
+> **Rule of thumb.** A `window:` longer than the rate's period with
+> the default `bucket:` is a *burstable* budget — clients can fire the
+> whole window's allowance instantly, then sit empty until the window
+> rolls. For sustained-rate enforcement, set `bucket:` close to the
+> rate's period. `rate: 10r/s, window: 5h, bucket: 1s` keeps the
+> 180k-request 5-hour budget but smooths it to roughly 10 r/s.
 
-Other things worth knowing:
-
-* **`OVER_LIMIT` reports the resolved budget.** A rule written as
-  `rate: 10r/s window: 1h` returns the 36000-request budget, not 10.
-* **Floor silently under-budgets non-multiples.** `rate: 10r/m window:
-  85s` resolves to `limit = 14` (the leftover 0.16 period vanishes).
-* **`window:` shorter than the rate's period is rejected.** To enforce
-  "100 in 500ms" write `rate: 100r/500ms`, not `rate: 200r/s window:
-  500ms` — the latter would resolve to `limit = 0` and is refused at
-  config-load time.
-
-The corresponding Envoy filter emits two descriptors per request, one
-for each action.
-
-### Scale beyond one node
-
-Add discovery so peers can find each other under Kubernetes:
-
-```yaml
-gossip:
-  bind: 0.0.0.0:9000
-  cluster_id_hash: 0xc0ffee
-
-discovery:
-  namespace_allow: [my-app]
-  service_allow: [gabiond]
-  self_addr: ${POD_IP}:9000    # exclude this pod from discovered peers
-```
-
-`namespace_allow` and `service_allow` filter Kubernetes EndpointSlice
-watches. `self_addr` is read from the pod's own IP (set via the
-downward API) so each replica doesn't try to gossip to itself. Bind a
-ServiceAccount with `endpointslices` `get`/`list`/`watch` to the
-deployment; without it, discovery logs `403` and falls back to the
-empty peer set.
+A `window:` shorter than the rate's period is refused at config-load
+time (it would resolve to `limit = 0`). To enforce "100 in 500ms",
+write `rate: 100r/500ms`.
 
 ## Running across a cluster
 
-The three pieces of plumbing are identical to the nginx side:
-
-1. **Gossip bind** (`gossip.bind`) — UDP socket every peer reaches.
-2. **Cluster identifier** (`gossip.cluster_id_hash`) — non-zero u128
-   shared by every peer; mismatches drop frames on the floor.
-3. **Discovery** (`discovery.namespace_allow` / `discovery.service_allow`)
-   — Kubernetes EndpointSlice filter that picks up peer pods as they
-   come and go.
-
-Verify convergence with `/snapshot`:
-
-```bash
-curl -s "$ADMIN_HOST:9090/snapshot" | jq '.peers | length'   # peer count
-curl -s "$ADMIN_HOST:9090/snapshot" | jq '.cells | length'   # local cells
-```
+The three plumbing steps — bind a gossip socket, pick a cluster id,
+tell peers how to find each other — are cross-cutting and live in the
+root README's
+[Running across a cluster](../../README.md#running-across-a-cluster).
+The `gabiond` YAML keys are `gossip.bind` (UDP `host:port`),
+`gossip.cluster_id_hash` (non-zero u128 shared across peers),
+`discovery.namespace_allow` / `discovery.service_allow` (Kubernetes
+EndpointSlice filters), and `discovery.self_addr` (this pod's own
+`host:port` from `POD_IP`, excluded from the peer set). Bind a
+ServiceAccount with `endpointslices` `get`/`list`/`watch` on the
+deployment; without it, discovery logs `403` and the peer set stays
+empty.
 
 Tuning the gossip cadence is rarely necessary — defaults converge in
-well under a second at production scale. See the main
-[Running across a cluster](../../README.md#running-across-a-cluster)
-section for the knobs and their tradeoffs.
+well under a second at production scale. When you do tune, the two
+adaptive aspects of the protocol have their own knobs: **adaptive
+fanout** (per-tick peer count scaling with the dirty set) is
+`gossip.fanout`; the **adaptive emit rate** (threshold-triggered
+emissions between heartbeats) is `gossip.target_err_bps` (per-rule
+error budget in basis points of the limit) and
+`gossip.min_emit_interval` (the floor between threshold-fire
+emissions). The math and tradeoffs live in
+[`../gabion/README.md#how-gossip-works`](../gabion/README.md#how-gossip-works).
+
+### Verify convergence
+
+`/snapshot` returns peer list, rule list, and CRDT stats:
+
+```bash
+curl -s "$ADMIN_HOST:9090/snapshot" | jq '.peers | length'
+curl -s "$ADMIN_HOST:9090/snapshot" | jq '.store.cell_store.active_cells'
+```
+
+A cluster has converged when every node's `peers | length` reflects
+the expected topology and `active_cells` is the same order of
+magnitude on each.
 
 ## Troubleshooting
 
-| Symptom                                                                          | What it means                                                                                                  | Fix                                                                                                                          |
-|----------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
-| `config error: ... missing field 'name' at limits[0]`                            | A YAML `limits:` entry is missing the required field.                                                          | Supply `name`, `domain`, `descriptors`, and `rate`. `window` / `bucket` are optional.                                        |
-| `rule X is declared more than once`                                              | Two entries in `limits:` share a `name:`.                                                                      | Pick distinct names.                                                                                                         |
-| `rule X has an invalid 'rate:' value: ...`                                       | The `rate:` string didn't parse, or its count is zero.                                                         | Use e.g. `rate: 100r/s`, `rate: 10r/5m`. Zero counts are refused — a zero rate would deny all traffic.                       |
-| `rule X: 'window=' must be at least as long as the rate's period`                | An explicit `window:` was shorter than the rate's period; the resolved limit would be zero.                    | Move the period into the rate (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.                |
-| `rule X descriptor key 'with space' must match '[A-Za-z_][A-Za-z0-9_.-]*'`       | A descriptor key uses unsupported characters.                                                                  | Stick to identifier-like names (underscore + dot + dash OK).                                                                 |
-| `gossip.bind is required`                                                        | No bind address was supplied.                                                                                  | Set `gossip.bind` in YAML or `GABION_GOSSIP_BIND` in env.                                                                    |
-| `environment variable GABION_X is not valid UTF-8`                               | A non-UTF-8 byte in an env var.                                                                                | Re-export the env var with a valid value.                                                                                    |
-| `OVER_LIMIT` responses for all descriptors                                       | The configured `rate:` is below sustained load.                                                                | Raise the rate, or extend the window, or split the rule. Run with `mode: dry_run` while you measure.                         |
-| `gabiond` warns about gossip record failures                                     | The gossip queue is full; gabiond is **allowing** the request and **under-counting**.                          | Either tune `gossip.limit_queue_capacity` upward or reduce upstream traffic. Errors are rate-limited via a power-of-two pattern. |
-| `gabiond` warns about matched-rule overflow                                      | A request matched more than `STORAGE_MAX_MATCHED_RULES` rules; the request was **allowed** (allow-by-default). | Reduce the number of rules matching a single descriptor, or split your rule space across multiple domains.                   |
+Every operator-facing warning answers three questions in one breath:
+what happened, why it's likely happening, and the next thing to try.
+Warnings that can fire at request rate are throttled, so a misbehaving
+client at high rate produces a handful of log lines, not a flood.
 
-Operator-facing log lines follow the three-question shape from
-`CLAUDE.md`: *what happened*, *why it's likely happening*, *what to do
-next*.
+| Symptom (verbatim from the error string)                                                                                       | What it means                                                                                          | Fix                                                                                                                          |
+|--------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
+| `` config error: … missing field `name` ``                                                                                     | A `limits:` entry is missing a required field.                                                         | Supply `name`, `domain`, `descriptors`, and `rate`. `window` and `bucket` are optional.                                       |
+| `` rule `X` is declared more than once; rule names must be unique ``                                                           | Two `limits:` entries share a `name:`.                                                                 | Pick distinct names.                                                                                                          |
+| `` rule `X` has an invalid `rate:` value: …. Use e.g. `rate: 100r/s` or `rate: 10r/5m`. ``                                     | The `rate:` string didn't parse, or its count is zero.                                                 | Write a non-zero count and a unit (`s`, `ms`, `m`, `h`). A zero rate is refused because it would deny all traffic.            |
+| `` rule `X`: `window=` must be at least as long as the rate's period; … e.g. `rate=100r/500ms` ``                              | An explicit `window:` was shorter than the rate's period; the resolved limit would be zero.            | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
+| `` rule `X` descriptor key `Y` must match `[A-Za-z_][A-Za-z0-9_.-]*` ``                                                        | A descriptor key uses an unsupported character.                                                        | Use identifier-like names. Underscore, dot, and dash are allowed inside; the first character must be a letter or underscore.  |
+| `gossip.bind is required`                                                                                                      | No bind address was supplied.                                                                          | Set `gossip.bind` in YAML or `GABION_GOSSIP_BIND` in env.                                                                     |
+| `environment variable GABION_X is not valid UTF-8`                                                                             | A non-UTF-8 byte appeared in `GABION_X`.                                                               | Re-export the env var with a valid UTF-8 value.                                                                               |
+| `OVER_LIMIT` for every descriptor                                                                                              | The configured `rate:` is below sustained load.                                                        | Raise the rate, widen the window, or split the rule. Re-run with `mode: dry_run` while you measure.                           |
+| *"Rejecting requests that attach too many rate-limit descriptors."*                                                            | A client sent more descriptors, larger descriptors, or larger keys than the configured envelope.       | Raise `storage.max_descriptor_count`, `storage.max_descriptor_bytes`, or `storage.max_key_bytes` in YAML; restart.            |
+| *"This node can no longer share rate-limit counts with the rest of the cluster."*                                              | The gossip background task has stopped. Counters keep working off local traffic only.                  | Look for an earlier error log entry — gossip exits after surfacing a typed error. Fix that and restart.                       |
+| *"A single request matched more rules than gabion's per-request cap allows"*                                                   | A request matched more than `STORAGE_MAX_MATCHED_RULES` (= 16) rules. Gabion **allowed** the request.  | Reduce overlapping rule patterns or split the rule space across multiple `domain:` values. The cap is a compile-time const.   |
 
 ## Fail-open invariant
 
 `gabiond` returns `OVER_LIMIT` only on a measured limit overflow.
-Every other condition — gossip record failure, internal queue
-saturation, rule-table miss — results in `OK`. The deliberate
-exception is `OVER_LIMIT` from the cardinality envelope
-(`max_descriptor_bytes`), which exists to bound memory consumption
+Every other condition — gossip queue saturation, a rule-table
+inconsistency, a transient internal failure — results in `OK`. The
+deliberate exception is `OVER_LIMIT` from the cardinality envelope
+(`storage.max_descriptor_count`, `storage.max_descriptor_bytes`,
+`storage.max_key_bytes`), which exists to bound memory consumption
 against pathological client input.
 
-This mirrors the nginx adapter's behaviour; see the
-[Fail-open invariant](../../README.md#fail-open-invariant) section of
-the main README for the full statement.
+See the [Fail-open invariant](../../README.md#fail-open-invariant)
+section of the root README for the policy statement.
 
-## Migration from the previous YAML
+## Migration from the pre-1.0 YAML
 
-Pre-1.0: there's no deprecation cycle, just one-shot updates to operator
-configs. The old `limit:` + `window:` pair becomes a single mandatory
-`rate:` string plus optional `window:` / `bucket:` durations:
+No deprecation cycle: the old `limit:` + `window:` pair became a
+mandatory `rate:` string plus optional `window:` / `bucket:`
+durations.
 
-| Before                                          | After                                                                                                                                  |
-|-------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
-| `limit: 100, window: 60s`                       | `rate: 100r/m`                                                                                                                         |
-| `limit: 10, window: 1s`                         | `rate: 10r/s`                                                                                                                          |
-| `limit: 180000, window: 5h`                     | `rate: 10r/s, window: 5h` (same resolved limit, original intent preserved)                                                             |
-| sub-period limits (`limit: 100, window: 500ms`) | move the period into the rate: `rate: 100r/500ms`. `window: 500ms` paired with `rate: 200r/s` is rejected (would resolve to `limit=0`). |
+| Before                                       | After                                                                                                            |
+|----------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| `limit: 100, window: 60s`                    | `rate: 100r/m`                                                                                                   |
+| `limit: 10, window: 1s`                      | `rate: 10r/s`                                                                                                    |
+| `limit: 180000, window: 5h`                  | `rate: 10r/s, window: 5h` (same resolved limit, original intent preserved)                                       |
+| `limit: 100, window: 500ms` (sub-period)     | `rate: 100r/500ms`. A `window:` shorter than the rate's period is refused (would resolve to `limit = 0`).        |
 
-Read [Rate, window, and bucket](#rate-window-and-bucket) before you
-reach for `window:` — long windows with the default `bucket:` produce
-a *burstable* budget, not a paced one.
+Read [Rate, window, and bucket](#rate-window-and-bucket) before
+reaching for `window:` — long windows with the default `bucket:`
+give you a burstable budget, not a paced one.

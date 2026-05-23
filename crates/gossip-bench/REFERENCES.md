@@ -1,13 +1,13 @@
 # Gossip & Anti-Entropy Literature: Reference Metrics for Gabion
 
-Reference notes used to ground the evaluation framework for the gabion gossip layer. The gabion protocol under test is:
+Reference notes that ground gabion's gossip evaluation. The protocol under test is:
 
 - Anti-entropy with **per-origin counter CRDTs** (counters merge by max; messages dedup by `(origin, seq)`).
-- **Push gossip with peer-frontier dedup**: every peer remembers the highest sequence number per origin it has acked, so the sender prunes already-known cells before transmission.
-- **Fanout-based peer sampling** drawn from the Kubernetes EndpointSlice — gabion does **not** implement membership or failure detection itself.
-- A **repair lane** that rotates linearly over the entire active peer set so anti-entropy converges even when per-peer dirty rings overflow.
+- **Push gossip with peer-frontier dedup**: the sender remembers the highest sequence number per origin each peer has acked and prunes already-known cells before transmission.
+- **Fanout-based peer sampling** drawn from the Kubernetes EndpointSlice — gabion does **not** implement membership or failure detection itself. Per-tick peer selection is a partial Fisher-Yates shuffle over the active peer set.
+- A **repair lane** that rotates a cursor linearly over the local cell store's slots, so anti-entropy converges even when per-peer dirty rings overflow.
 
-Each entry below captures (1) what the paper measures, (2) headline numerical results, (3) which metrics map onto gabion's design, and (4) methodology worth replicating in `gossip-bench`. The synthesis table at the end is the operational deliverable: the right-hand column is what gabion-bench should report.
+Each entry below records (1) what the paper measures, (2) headline numbers, (3) which metrics map onto gabion, and (4) methodology worth replicating. The synthesis table at the end is the operational deliverable — the right-hand column is what gabion-bench should report.
 
 ---
 
@@ -67,7 +67,7 @@ Sources: [SWIM (Cornell)](https://www.cs.cornell.edu/projects/Quicksilver/public
 
 **Headline numbers.** Experiments at N = 10,000 nodes, sweeping simultaneous failure rates from 10% to 95%. HyParView preserves ~100% delivery reliability under failure rates up to **80%**, and maintains ~90% delivery even at **95% simultaneous failures**, while comparable protocols (Scamp, Cyclon) collapse to <50% reliability at the same failure rates. Fanout is small — around log(N), i.e., ~10 for N = 10k — which keeps per-node bandwidth low.
 
-**Maps onto gabion.** Gabion does not implement HyParView, but EndpointSlice plays the role of the "passive view": when an active peer disappears, the next EndpointSlice update supplies the replacement. The relevant question for gabion is the **resilience under simultaneous pod loss** — when 50% / 80% / 95% of pods are evicted at once, how fast does the system reconverge once new pods register? The fanout = log(N) sizing is also directly relevant for the gabion fanout knob.
+**Maps onto gabion.** Gabion does not implement HyParView, but EndpointSlice plays the role of the "passive view": when an active peer disappears, the next EndpointSlice update supplies the replacement. The relevant question for gabion is the **resilience under simultaneous pod loss** — when 50% / 80% / 95% of pods are evicted at once, how fast does the system reconverge once new pods register? The fanout = log(N) sizing applies to gabion's fanout knob.
 
 **Methodology to replicate.** The massive-failure injection sweep is the headline experiment. Gabion-bench should kill 10%, 50%, 80% of pods simultaneously and measure (a) the fraction of in-flight updates that still converge, and (b) the time-to-reconvergence after the EndpointSlice settles.
 
@@ -173,19 +173,16 @@ Sources: [Dynamo SOSP 2007](https://www.allthingsdistributed.com/files/amazon-dy
 | Workload methodology | Xerox trace | 16–56 real nodes + sim | 10k-node simulation | 10k-node simulation | sim + small deployment | SP2 cluster ≤160 nodes | up to 100k sim | **k8s deploy 50–200 pods + sim up to 10k peers** |
 | Failure injection | replica crash | random crash | massive simultaneous failure 10–95% | massive failure 10–95% | n/a | CPU-perturbation + packet loss | churn rate | **simultaneous pod loss sweep + CPU throttle of subset** |
 
-## What gabion-bench should ship
+## Roadmap: what gabion-bench should ship
 
-The literature converges on five headline numbers that every gossip system reports in some form. Gabion-bench should produce one figure per row, parameterized by `(N, fanout, write_rate, churn_rate)`:
+Five headline numbers from the literature plus two gabion-specific ones. Status reflects what `Headline` in `src/metrics.rs` and the `SUITES` in `bench/plot.py` emit today — the shipped item is the one to defend; the rest are open work.
 
-1. **t_avg and t_last per origin**, in wall-clock seconds. (Demers; production-systems units.)
-2. **Per-pod sustained bytes/sec** at idle and under load, plotted against N at fixed fanout. (SWIM constant-load methodology.)
-3. **RMR** ≡ bytes shipped / bytes of novel CRDT delta. The single most important measure of how well peer-frontier dedup is actually working. (Plumtree.)
-4. **Delivery completeness and reconvergence time** under simultaneous pod loss at 10%, 50%, 80%, 95%. (HyParView / Plumtree massive-failure sweep.)
-5. **In-degree CDF** across the peer set at steady state — verifies the EndpointSlice + uniform-sampling assumption. (Jelasity 2007.)
+1. ☐ **t_avg and t_last per origin** in wall-clock seconds (Demers). Today the bench reports cluster-wide `convergence_millis` and `final_divergence`, not per-origin.
+2. ☑ **Per-pod sustained bytes/sec** at idle and under load vs N at fixed fanout (SWIM). Shipped as `bytes_per_node_per_second` in `Headline`; surfaced in `plot_scale_n` and `plot_convergence`.
+3. ☐ **RMR** ≡ bytes shipped / bytes of novel CRDT delta (Plumtree). The bench has `bytes_sent_total` but no novel-delta denominator. Gabion's most direct test of peer-frontier dedup, and still missing.
+4. ☐ **Delivery completeness and reconvergence** under simultaneous pod loss at 10/50/80/95 % (HyParView/Plumtree). `LinkAction::Block` can isolate a node, but no suite sweeps the failure axis.
+5. ☐ **In-degree CDF** across the peer set at steady state (Jelasity 2007). `CountingTransport` counts bytes per node but doesn't log who sent to whom.
+6. ☐ **Repair-lane catch-up time** after a forced dirty-ring overflow — gabion's analogue of SWIM's worst-case detection time. No suite forces overflow; `min_emit_clamp` stresses the emit-rate floor but stays below the ring.
+7. ☐ **CRDT-update throughput under 25 % throttled pods** (Bimodal CPU perturbation). No CPU-throttle or per-pod-rate-limit primitive in the bench yet.
 
-Two gabion-specific metrics with no direct precedent in the literature:
-
-6. **Repair-lane catch-up time** after a forced dirty-ring overflow. This is the gabion analogue of SWIM's worst-case detection time: the bound the repair lane provides on staleness.
-7. **CRDT-update throughput under 25% throttled pods** (CPU-perturbation methodology from Bimodal). Tests that slow pods do not drag down the cluster.
-
-Out of scope: anything from SWIM about failure detection — Kubernetes EndpointSlice owns membership. Gabion-bench should explicitly note this so reviewers don't expect time-to-detect-a-failed-pod numbers.
+Out of scope: anything from SWIM about failure detection — Kubernetes EndpointSlice owns membership, so reviewers should not expect time-to-detect-a-failed-pod numbers.

@@ -7,8 +7,8 @@ under virtual time and emits a JSON result; a Python harness
 produces SVG plots.
 
 Read [`crates/gabion/README.md`](../gabion/README.md) for the gossip
-explainer and the headline benchmark numbers. This README only covers
-"how to run the suite."
+explainer and the headline numbers. This README only covers how to run
+the suite.
 
 ## Running
 
@@ -18,8 +18,8 @@ explainer and the headline benchmark numbers. This README only covers
 python3 crates/gossip-bench/bench/plot.py all
 
 # Same, but also copy SVGs into crates/gabion/figures/ so the
-# explainer's embedded figures reflect this run. Run --publish only
-# after a clean bench; otherwise the README will commit stale plots.
+# explainer's embedded figures reflect this run. Only --publish after
+# a clean bench; otherwise the figures the README embeds will be stale.
 python3 crates/gossip-bench/bench/plot.py all --publish
 
 # Just one suite.
@@ -41,7 +41,8 @@ cargo run -p gossip-bench --release -- example --kind partition > scn.json
 $EDITOR scn.json
 cargo run -p gossip-bench --release -- run --scenario scn.json | jq .
 
-# Or stream JSONL.
+# Or stream JSONL. Result records echo the scenario name back, so
+# unique names are for your own readability.
 for f in 1 2 3 5; do
     cargo run -p gossip-bench --release -- example --kind convergence \
         | jq -c ".fanout = $f | .name = \"f$f\""
@@ -54,6 +55,12 @@ Built-in example kinds: `convergence`, `loss`, `partition`,
 
 ## What each suite measures
 
+Two suites are the empirical evidence for gabion's *adaptive emit rate*:
+`min_emit_clamp` and `error_budget`. One suite is the evidence for
+*adaptive fanout*: `adaptive_fanout`. The rest are classical
+anti-entropy measurements borrowed from the literature surveyed in
+[`REFERENCES.md`](REFERENCES.md).
+
 | Suite | Paper | What it measures |
 | --- | --- | --- |
 | `convergence` | Demers 1987, Karp 2000 | Rounds to converge vs `(N, fanout)` for a single write. |
@@ -62,13 +69,12 @@ Built-in example kinds: `convergence`, `loss`, `partition`,
 | `partition` | SWIM '02 | Time to re-converge after a network partition is healed. |
 | `staleness` | Astrolabe '03 | Per-hit p50/p95 lag under sustained writes from k sources. |
 | `scale_n` | Karp 2000, Astrolabe '03 | log-N curve: rounds-to-converge as cluster size grows. |
-| `adaptive_fanout` | Verma & Ooi '05 | Rounds and effective fanout as the dirty set grows; at static `fanout=1`, with the adaptive bump in place, rounds stay nearly flat. |
-| `error_budget` | Sharfman/Schuster/Keren '06, Olston/Jiang/Widom '03 | Bandwidth and max-lag as a function of `target_err_bps`; verifies the `N × ε_R` cluster-wide bound. |
-| `min_emit_clamp` | gabion-specific | Adversarial saturating write rate; sweeps `min_emit_interval`. Confirms the floor caps worst-case emit rate while the cluster still converges. |
+| `adaptive_fanout` | Verma & Ooi '05 | Evidence for **adaptive fanout**: at static `fanout=1`, rounds stay nearly flat as the dirty set grows because the runtime widens the per-tick fanout by `log₂(dirty_count)`. |
+| `error_budget` | Sharfman/Schuster/Keren '06, Olston/Jiang/Widom '03 | Evidence for **adaptive emit rate**: bandwidth and max-lag as a function of `target_err_bps`; verifies the `N × ε_R` cluster-wide bound. |
+| `min_emit_clamp` | gabion-specific | Evidence for **adaptive emit rate** (the floor): adversarial saturating write rate; sweeps `min_emit_interval`. Confirms the floor caps worst-case emit rate while the cluster still converges. |
 | `heartbeat_threshold_mix` | gabion-specific | A hot rule (saturating ε every tick) and a cold rule (slow trickle) replicate concurrently; both must converge. |
 
-Each suite's headline numbers, methodology, and full figure are
-documented in
+Each suite's headline numbers, methodology, and full figure live in
 [`crates/gabion/README.md#what-we-measured`](../gabion/README.md#what-we-measured).
 [`REFERENCES.md`](REFERENCES.md) is the paper-by-paper survey behind
 the methodology choices.
@@ -84,7 +90,7 @@ the methodology choices.
 - `src/transport.rs` — `CountingTransport` wrapper that counts
   bytes/packets per `try_send_to` / `recv_from`.
 - `src/bin/gossip_bench.rs` — the CLI (`run`, `batch`, `example`).
-- `bench/plot.py` — Python harness: matrix generator + matplotlib /
+- `bench/plot.py` — Python harness: matrix generator, matplotlib /
   seaborn plotting, SVG output.
 - `REFERENCES.md` — paper-by-paper survey of the methodologies we
   borrowed.

@@ -9,9 +9,10 @@ paths.
 
 This README is the canonical guide to the library. If you want to
 understand how the cluster stays consistent, how a packet is shaped, or
-which knob to turn when an operator asks, read this end-to-end. Code
-references throughout point at `crates/gabion/src/` and exact line numbers
-where helpful.
+which knob to turn when an operator asks, read it end-to-end. For the
+CRDT data structures behind the gossip protocol, see [`CRDT.md`](CRDT.md).
+For cross-adapter vocabulary (rule, descriptor, bucket, fail-open), see
+the [repo root README](../../README.md#glossary).
 
 ## Contents
 
@@ -20,7 +21,7 @@ where helpful.
   - [The wire frame](#the-wire-frame)
   - [The anti-entropy loop](#the-anti-entropy-loop)
   - [Adaptive fanout](#adaptive-fanout)
-  - [Threshold-triggered emissions](#threshold-triggered-emissions)
+  - [Adaptive emit rate](#adaptive-emit-rate)
   - [Dirty rings and the peer frontier](#dirty-rings-and-the-peer-frontier)
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
@@ -32,269 +33,347 @@ Six modules. Every type that crosses an adapter boundary lives in
 exactly one of them, and the dependency graph is a DAG (no module
 imports from a module that imports it).
 
-```mermaid
-graph TD
-    crdt["crdt — CellStore, dirty rings, peer frontier<br/>(see CRDT.md for the deep dive)"]
-    rules["rules — Rule / RuleTable / Descriptor / fingerprints"]
-    gossip["gossip — runtime, transport, clock, sim, admin"]
-    wire["wire — header, body, HMAC auth, FrameLimits"]
-    discovery["discovery — PeerDiscovery trait + Kubernetes impl"]
-    defaults["defaults — production tunables shared by adapters"]
-
-    gossip --> crdt
-    gossip --> wire
-    gossip --> discovery
-    wire --> crdt
-    rules --> defaults
-    gossip --> defaults
-```
-
 | Module       | Path                          | What it owns                                                                                                                              |
 |--------------|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
-| `crdt`       | `src/crdt/*`                  | The per-origin counter store. Robin Hood hash table, structure-of-arrays columns, bounded dirty rings, per-peer frontier. Allocates only at construction. See [`CRDT.md`](CRDT.md). |
+| `crdt`       | `src/crdt/*`                  | The per-origin counter store. Robin Hood hash index, structure-of-arrays columns, bounded dirty rings, per-peer frontier. Allocates only at construction. See [`CRDT.md`](CRDT.md). |
 | `rules`      | `src/rules/*`                 | `Rule`, `RuleTable`, `Descriptor`, fingerprint hashing. Two nodes with the same rules produce identical `rule_fingerprint` values, which is what makes the CRDT addressable across the cluster. |
 | `gossip`     | `src/gossip/*`                | `GossipRuntime`, `GossipClient`, `GossipTransport`, `Clock`, the `sim::SimTransport` used in tests, and the `AdminCommand` / `AdminSnapshot` observability surface. |
 | `wire`       | `src/wire/*`                  | The on-the-wire codec. One UDP packet = header + rule dictionary + node dictionary + cell rows + optional HMAC tag. Each packet decodes independently. |
 | `discovery`  | `src/discovery/*`             | `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation. Adapters consume `PeerEvent` streams; the gossip runtime treats peer add/remove as a normal `select!` arm. |
 | `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, fanout floor, payload caps, the per-rule error budget, and the min-emit floor. |
 
+`gossip` depends on every other module. `wire` and `crdt` are independent
+of each other. `defaults` is a leaf — `rules` and `gossip` import it; it
+imports nothing in this crate. Adapters consume the public surface of
+`gossip`, `rules`, and `discovery`, plus the constants in `defaults`.
+
 ## How gossip works
 
 Gossip is the protocol that turns N independent counter stores into one
 *eventually consistent* counter store. Every node admits requests
 against its local view of the cluster aggregate; gossip is what keeps
-that view fresh.
+that view fresh. From the adapter's side it shows up as a single call:
+admission writes a row through `GossipClient::record`, and the runtime
+tick later turns those rows into outbound frames.
 
-Three things make gabion's flavour different from a textbook anti-entropy
-loop:
+The protocol has two adaptive aspects, and they are the reason gabion
+holds up under load that a textbook anti-entropy loop would not:
 
-1. The gossip runtime never allocates after construction. Every buffer
-   is pre-sized; the `tokio::select!` body is branch-free.
-2. Fanout *adapts* to the dirty set under burst — a single tick can
-   pick up to `log₂(dirty)` peers instead of a fixed constant.
-3. The cluster decouples convergence latency from heartbeat cadence
-   with an operator-tunable per-rule error budget. The moment local
-   unreplicated error would exceed the budget, the node fires a
-   sub-heartbeat emit.
+1. **Adaptive fanout** — the per-tick peer count grows with the size of
+   the dirty set. Quiet ticks pick the static `fanout` floor; bursty
+   ticks pick up to `log₂(dirty)` peers, capped at the peer-set size.
+   Convergence stays O(log N) regardless of burst size, without paying
+   wide-fanout bandwidth on quiet ticks.
+2. **Adaptive emit rate** — the gossip cadence adapts to per-rule
+   pressure. Heartbeats fire every `tick_interval` unconditionally, but
+   the runtime also fires a synthetic *threshold* tick between
+   heartbeats whenever a hot rule's locally unreplicated hits would
+   exceed its per-site error budget. The budget bounds cluster-wide
+   unreplicated error per rule by 1 % of the rule's limit (default), no
+   matter the request rate. A floor `min_emit_interval` caps the worst
+   case so an adversarial workload cannot pin the gossip socket.
 
-The rest of this section walks through each of those, then closes with
-the data structures that make pruning cheap.
+The rest of this section walks through each in turn, then closes with
+the dirty rings and peer frontier — the data structures that decide
+which cells go to which peer.
 
 ### The wire frame
 
 Every gossip frame is one self-describing UDP packet. There is no
 session state on either side: each frame decodes independently, even if
-its predecessor was dropped.
+its predecessor was dropped. Loss of a packet costs you a few cells
+until the next tick refills them.
 
-```mermaid
-graph LR
-    header["Header (28 bytes)<br/>cluster_id, sender, count_width,<br/>cell_count, body_len, sequence range, flags"]
-    rule_dict["Rule dictionary<br/>(only fingerprints referenced<br/>by this frame's cells)"]
-    node_dict["Node dictionary<br/>(only node identities referenced<br/>by this frame's cells)"]
-    cells["Cell rows<br/>each row references rule and node slots<br/>via small u8/u16 indices"]
-    auth["HMAC tag (optional, 16 bytes)<br/>over header + dictionaries + cells"]
+The header is fixed at 72 bytes. Every multi-byte field is encoded
+little-endian; the first four bytes on the wire are `0x32 0x47 0x42
+0x47` so a packet capture reads `2GBG`. (The numeric `MAGIC` literal
+`0x4742_4732` spells "GBG2" when written most-significant byte first;
+the LE encoding then writes those bytes in reverse.)
 
-    header --> rule_dict --> node_dict --> cells --> auth
+```
+byte  field                  width
+----  ---------------------  -----
+0     MAGIC                  4   (0x4742_4732)
+4     VERSION                2   (= 1)
+6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED)
+8     cluster_id_hash       16
+24    sender_node_id        16
+40    sender_incarnation     4
+44    count_width            4   (2, 4, or 8 — width of the count column;
+                                  matches u16/u32/u64 `impl Count`)
+48    cell_count             4
+52    body_len               4
+56    min_origin_sequence    8
+64    max_origin_sequence    8
+----                       ----
+                            72
 ```
 
-The rule and node dictionaries are *per-frame* — they only carry the
-identities the cell rows actually reference. That keeps small frames
-small (one rule, one origin → header + 1 dict entry + 1 cell row), while
-still supporting frames that span the full address space.
+The body follows immediately. When `cell_count > 0` it carries a
+*per-frame* rule dictionary, a per-frame node dictionary, and the cell
+rows. Each cell row references rule and node slots by `u8` index into
+those dictionaries (so the same fingerprint isn't repeated 4096 times),
+plus its `key_hash`, `bucket`, origin incarnation, `last_update_millis`,
+`origin_sequence`, and `count`:
 
-The codec lives in `src/wire/{header,body,auth}.rs`. `FrameLimits` (in
-`src/wire.rs`) caps per-packet payload size at 1400 bytes — the safe
-IPv4 MSS floor that avoids fragmentation across most network paths.
-Frames bigger than the cap split into multiple packets at the sending
-side; each packet is independently decodable, so loss of any one packet
-just delays a few cells.
+```
+[rule_dict_len    : u8     ]    R rules in this frame (1–255)
+[rule_dict        : u128×R ]    rule fingerprints
+[node_dict_len    : u8     ]    D origins in this frame (1–255)
+[node_dict        : u128×D ]    origin node ids
+[rule_slot        : u8 ×N  ]    each < R
+[key_hash         : u128×N ]
+[bucket           : u32 ×N ]
+[node_slot        : u8 ×N  ]    each < D
+[origin_incarn.   : u32 ×N ]
+[last_update_ms   : u64 ×N ]
+[origin_sequence  : u64 ×N ]
+[count            : C  ×N  ]    count_width × N bytes
+```
 
-The HMAC authentication path is optional: when `gossip.auth_key` is set,
-the codec adds a 16-byte tag derived from the cluster's pre-shared key
-over the entire decoded body. Inbound packets that fail the tag check
-are dropped on the floor. The whole cluster must agree on the key.
+When the frame carries no cells (a frontier ack, say), the body is
+empty.
+
+If the cluster is configured with a shared HMAC key, an additional
+**32-byte HMAC-SHA256 tag** is appended over the header and body, and
+`FLAG_AUTHENTICATED` is set. Inbound packets whose tag fails verify are
+dropped on the floor. The whole cluster must agree on the key.
+
+The codec lives in `src/wire/{header,body,auth}.rs`. The library's own
+`FrameLimits::default()` is 256 KB — useful for tests and the simulator
+— but production adapters plumb `gabion::defaults::GOSSIP_MAX_PAYLOAD_BYTES`
+(1400 bytes, the safe IPv4 MSS floor) into `FrameLimits` so frames stay
+well below the path MTU and avoid IP fragmentation. Frames larger than
+the cap split into multiple packets at the sender; each packet is
+independently decodable.
 
 ### The anti-entropy loop
 
-The runtime ([`gossip::GossipRuntime`](src/gossip/runtime.rs)) is a
-single-threaded event loop driven by one `tokio::select!` with six arms:
-limit requests from the adapter, inbound packets, outbound writability,
-peer membership churn, admin commands, and the heartbeat tick. After
-each iteration it calls `aggregates.apply(...)` exactly once with the
-deltas and expirations the arm produced — that's the contract with the
-downstream rate-limit decision path.
+The runtime (`GossipRuntime`, in `src/gossip/runtime.rs`) is a
+single-threaded event loop driven by one `tokio::select!` with six
+arms: limit requests from the adapter, inbound packets, outbound
+writability, peer membership churn, admin commands, and the heartbeat
+tick. After every iteration that produced delta or expiration rows, the
+runtime calls `aggregates.apply(...)` exactly once — that's the
+contract with the downstream rate-limit decision path. Empty iterations
+(an idle tick, a peer event with no CRDT effect) short-circuit the
+apply.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Adapter as Adapter (nginx/gabiond)
+    participant Adapter as Adapter (nginx / gabiond)
     participant Runtime as GossipRuntime
-    participant CellStore as CellStore
-    participant Transport as UDP transport
+    participant Store as CellStore
+    participant Tx as UDP transport
     participant Peer as Remote peer
 
-    Adapter->>Runtime: record(rule, key, hits, ...)
-    Runtime->>CellStore: ingest_local(...)
-    CellStore-->>Runtime: Δ rows + dirty marks
-    Note over Runtime: emit synthetic tick if<br/>error budget crossed
+    Adapter->>Runtime: record(rule, key, hits, limit, now)
+    Runtime->>Runtime: handle_limit_request
+    Runtime->>Store: ingest_local(observation)
+    Store-->>Runtime: delta row + dirty mark
+    Note over Runtime: set want_immediate_flush<br/>if pending > ε_R
+    Runtime->>Adapter: aggregates.apply(deltas, expirations)
 
-    loop every tick_interval
+    loop every tick (heartbeat OR synthetic threshold)
         Runtime->>Runtime: handle_gossip_tick
-        Runtime->>CellStore: expire_at(now)
-        Runtime->>CellStore: fill_gossip_frame_for_peer
-        CellStore-->>Runtime: candidate cells
-        Runtime->>Transport: encode + try_send_to(peer)
-        Transport->>Peer: UDP frame
+        Runtime->>Store: expire_at(now)
+        Runtime->>Store: fill_gossip_frame_for_peer
+        Store-->>Runtime: pruned cell list
+        Runtime->>Tx: encode + try_send_to(peer)
+        Tx->>Peer: UDP frame
+        Runtime->>Adapter: aggregates.apply(expirations)
     end
 
-    Peer->>Transport: UDP frame
-    Transport->>Runtime: recv_from
-    Runtime->>CellStore: merge_remote(observations)
-    CellStore-->>Runtime: Δ rows + frontier acks
-    Runtime->>Adapter: aggregate.apply(deltas, expirations)
+    Peer->>Tx: UDP frame
+    Tx->>Runtime: recv_from
+    Runtime->>Store: merge_remote(observations)
+    Store-->>Runtime: delta rows + frontier acks
+    Runtime->>Adapter: aggregates.apply(deltas, expirations)
 ```
 
-The cell store's `merge_remote` does the CRDT join: max-merge per
+`CellStore::merge_remote` performs the CRDT join: max-merge per
 `(origin, key, bucket)`, sum across origins. Every dirty row also goes
 into a peer-frontier ring so the next outbound frame can prune anything
-that peer has already acked.
+that peer has already acknowledged.
 
 ### Adaptive fanout
 
-A pure-push gossip protocol with a fixed fanout `f` converges in
-`O(log_(1+f) N)` rounds with high probability — that's the Karp et al.
-2000 bound. The catch is the constant: when the dirty set is small the
-fixed `f` is fine, but when a burst lands and the dirty set jumps, the
-same fixed `f` extends time-to-convergence linearly with burst size.
+A burst lands. The dirty set jumps from one cell to a thousand. With
+fixed fanout `f`, propagation now takes O(dirty / f) rounds — for a
+1024-cell burst at f=1, that's a thousand rounds before everyone
+converges. Karp et al. (2000) prove an O(log_{1+f} N) lower bound for
+pure-push protocols, but a fixed `f` chosen for the quiet case cannot
+get near it when the dirty set explodes.
 
-Gabion's runtime grows the per-tick fanout with the dirty-set bit length
-([`runtime.rs:648`](src/gossip/runtime.rs#L648)):
+Gabion grows the per-tick peer count with the size of the dirty set.
+The pick lives in `GossipRuntime::handle_gossip_tick`:
 
-```mermaid
-graph LR
-    dirty["dirty = local_dirty.len() +<br/>forwarded_dirty.len()"]
-    log_dirty["log_dirty = bit_length(dirty)<br/>≈ floor(log₂ dirty) + 1"]
-    pick["pick_count = max(config.fanout, log_dirty)<br/>.min(peer_count)"]
-    sample["partial Fisher-Yates over self.peers<br/>(distinct peers, no replacement)"]
-
-    dirty --> log_dirty --> pick --> sample
+```rust
+let dirty = local_dirty.len() + forwarded_dirty.len();
+let log_dirty = bit_length(dirty);          // ≈ floor(log₂ dirty) + 1
+let pick_count = max(config.fanout, log_dirty).min(peer_count);
 ```
 
-The intuition: when one cell is dirty, fanout = `config.fanout`
-(typically 3 or 6). When the burst arrives and 1024 cells are dirty,
-`log_dirty` jumps to 11, so the runtime picks min(11, peer_count) peers
-this single tick. The dirty set then drops back toward zero and fanout
-narrows again on the next tick. The cluster pays the wide-fanout cost
-only for the ticks it needs.
+Then a partial Fisher-Yates shuffle picks `pick_count` distinct peers
+from `self.peers` — distinct, not with-replacement, because sampling
+the same peer twice in one tick burns a send-pool slot to encode the
+same frame twice. Some example pick counts at `fanout = 6` (the
+default):
 
-Verma & Ooi (ICDCS 2005) showed this scheme gives O(log N) burst
-convergence at the cost of one extra tick of latency in the worst case.
-The `adaptive_fanout` benchmark suite (see [What we measured](#what-we-measured))
-confirms the rounds-to-converge stays flat as the burst size grows.
+| `dirty`  | `log_dirty` | `pick_count`               |
+|----------|-------------|----------------------------|
+| 0        | 0           | 6 (capped at peer count)   |
+| 1        | 1           | 6                          |
+| 32       | 6           | 6                          |
+| 64       | 7           | 7                          |
+| 256      | 9           | 9                          |
+| 1024     | 11          | 11                         |
+| 1 048 576 | 21         | 21 (capped at peer count)  |
 
-### Threshold-triggered emissions
+Quiet ticks pay nothing — the floor stays at `fanout`. The wide-fanout
+cost only lands on the ticks that need it, and falls off again as the
+dirty ring drains. Verma & Ooi (ICDCS 2005) prove that adaptive widening
+gives O(log N) burst convergence at the cost of one extra tick of
+latency in the worst case; the `adaptive_fanout` bench
+[below](#what-we-measured) shows that empirically.
 
-The proactive heartbeat is bounded below by `tick_interval` (default
-100 ms). That's fine for cold rules but pessimistic for hot rules under
-load — a single saturating burst between two heartbeats could leak many
-admissions past the limit before the next tick fires.
+### Adaptive emit rate
 
-Gabion crosses this trade with an operator-tunable error budget. Each
-matched rule R has a per-site safe zone ε_R = `max(1, L_R × bps /
-(10_000 × N))`, where L_R is the rule's limit and N is the peer count
-([`runtime.rs:393–453`](src/gossip/runtime.rs#L393)). When a request's
-local unreplicated hits would push past ε_R, the runtime sets
-`want_immediate_flush = true`; the top of the run loop reads that flag
-on the next iteration and dispatches a *synthetic* gossip tick without
-waiting for the heartbeat. A floor (`min_emit_interval`, default 5 ms)
-prevents the emit rate from saturating even when ε saturates to 1 under
-adversarial load.
+The heartbeat tick is bounded below by `tick_interval` (default
+100 ms). That works for cold rules but is pessimistic for hot ones — a
+saturating burst between two heartbeats could leak many admissions past
+the limit before the next tick. Lowering `tick_interval` for everyone
+costs bandwidth on every quiet rule in the cluster.
+
+The runtime crosses this trade with a per-rule error budget.
+`GossipRuntime::handle_limit_request` keeps a small `rule_pending`
+column indexed by rule slot; each admission adds its hits. The runtime
+also computes a per-site safe zone:
+
+```
+ε_R = max(1, L_R · target_err_bps / (10_000 · N))
+```
+
+where `L_R` is the rule's limit and `N` is the peer count. When
+`rule_pending` for that rule crosses `ε_R`, the runtime sets
+`want_immediate_flush = true`. On the next loop iteration the top of
+the run loop reads that flag (instead of waiting on `tick.tick()`) and
+dispatches a synthetic gossip tick straight away. The post-emit sweep
+inside `handle_gossip_tick` zeroes the rule's pending column and stamps
+its `last_emit_ms`.
+
+The constant `target_err_bps` is in basis points of each rule's own
+limit, default 100 = 1 %. The cluster-wide unreplicated error per rule
+is then bounded by `N · ε_R` (Sharfman, Schuster & Keren, SIGMOD 2006)
+— roughly 1 % of the rule's limit, regardless of the request rate.
+
+A floor `min_emit_interval` (default 5 ms) sits in front of the flush:
+the runtime won't set `want_immediate_flush` if the gap since the last
+emit is below the floor. Under adversarial traffic ε saturates to 1 and
+every hit would otherwise emit; the floor caps the worst-case emit rate
+so a bad client cannot pin the gossip socket.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Accumulating: limit request<br/>increments rule_pending
+    Idle --> Accumulating: limit request<br/>adds hits to rule_pending
     Accumulating --> Accumulating: pending ≤ ε_R
     Accumulating --> ReadyToFire: pending > ε_R
-    ReadyToFire --> Idle: since_last_emit < min_emit_interval<br/>(skip — bandwidth floor)
-    ReadyToFire --> Emit: since_last_emit ≥ min_emit_interval
+    ReadyToFire --> Idle: now − last_emit < min_emit_interval<br/>(floor blocks the emit)
+    ReadyToFire --> Emit: now − last_emit ≥ min_emit_interval
     Emit --> Idle: synthetic tick dispatched,<br/>rule_pending reset,<br/>last_emit_ms stamped
-    Idle --> Emit: heartbeat tick<br/>(unconditional, drains cold rules)
+    Idle --> Emit: heartbeat tick<br/>(unconditional; drains cold rules)
 ```
 
-What this buys the operator:
+Three operational properties drop out:
 
-- **Bounded cluster-wide error.** Sharfman/Schuster/Keren (SIGMOD 2006)
-  bound the global unreplicated error per rule by `N × ε_R`. With
-  default `target_err_bps = 100` (1 % of the rule's limit), the global
-  error is bounded by 1 % of the limit *regardless of request rate*.
-- **Cold rules still propagate.** The proactive heartbeat is
-  independent of the threshold path. A rule whose pending count never
-  reaches ε_R still replicates every `tick_interval`.
-- **A floor on bandwidth.** Under an adversarial rate ε saturates to 1
-  and every hit would otherwise emit. `min_emit_interval` caps the
-  worst-case emit rate, so a bad client can't pin the gossip plane.
+- **Bounded cluster-wide error.** Default `target_err_bps = 100` means
+  the global unreplicated error per rule never exceeds 1 % of the
+  rule's limit, regardless of how fast requests come in.
+- **Cold rules still propagate.** The heartbeat is independent of the
+  threshold path. A rule whose pending count never reaches ε_R still
+  replicates every `tick_interval`.
+- **A bandwidth floor.** Under an adversarial rate where ε saturates,
+  `min_emit_interval` caps the worst-case emit rate. Convergence still
+  happens; the cluster just absorbs the burst at a different bandwidth
+  budget.
 
-The `error_budget` and `min_emit_clamp` benchmark suites measure both
+The `error_budget` and `min_emit_clamp` bench suites measure both
 sides of this trade.
 
 ### Dirty rings and the peer frontier
 
-Anti-entropy boils down to: which cells should this tick send to which
-peer? Three data structures decide:
+Three data structures decide which cells the current tick sends to
+which peer:
 
 1. **`local_dirty`** — every locally-observed hit pushes onto this
-   bounded ring. Drained by the heartbeat tick.
+   bounded ring. Drained by every tick (heartbeat and threshold).
 2. **`forwarded_dirty`** — every cell merged from a peer pushes onto a
-   separate ring, so we can decide to *forward* a remote delta even if
-   our local origin column is quiet. Larger than `local_dirty` because
+   separate ring, so the runtime can forward a remote delta even if
+   its local origin column is quiet. Larger than `local_dirty` because
    forwarded cells fan out N-to-many.
 3. **`peer_frontier`** — for each peer × each origin slot, the highest
-   sequence number that peer has acked. The sender uses this to skip
-   cells the recipient already has.
+   sequence number that peer has already acked. The sender uses this
+   to skip cells the recipient already has.
 
 Together they keep `fill_gossip_frame_for_peer` allocation-free and
-strictly bounded: the runtime walks at most `max_cells_per_tick` cells,
-prunes against the peer's frontier, and stops when the dirty ring is
-drained.
+strictly bounded: the runtime walks at most `max_cells_per_tick` cells
+through the three lanes (local dirty → forwarded dirty → repair),
+prunes each candidate against the peer's frontier, and stops when the
+budget is exhausted. The rings are pre-sized at construction; pushes
+that hit the cap bump an overflow counter and silently drop, and the
+next repair-lane sweep picks the dropped cell back up.
 
-`CRDT.md` documents the data structures end-to-end with traces, slot
+`CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
 debug the CRDT.
 
 ## Operator knobs
 
-Most production deployments leave the defaults alone — they're chosen to
-keep convergence well under a second at typical cluster sizes (≤ 256).
-The table below is for the days you do need to tune.
+Most deployments leave the defaults alone — they're chosen to keep
+convergence well under a second at typical cluster sizes (≤ 256). The
+table is for the days you need to tune; it splits into the two adaptive
+halves.
 
-| Knob                  | Default      | What it controls                                                                                                  | When to tune                                                                                                  |
-|-----------------------|--------------|-------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
-| `tick_interval`       | 100 ms       | Heartbeat cadence — period between proactive gossip ticks.                                                        | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.   |
-| `fanout`              | 6            | Static fanout floor. The runtime widens above this under burst.                                                   | Lower for very small clusters (1–4) to cut bandwidth; rarely raise — adaptive fanout already handles bursts. |
-| `target_err_bps`      | 100 (= 1 %)  | Per-rule error budget in basis points of the rule's limit. Tighter = more emits, looser = more local lag.         | Lower if your hot rule needs tighter convergence; higher if bandwidth is the bottleneck.                     |
-| `min_emit_interval`   | 5 ms         | Floor between two threshold-fire emissions. Caps worst-case emit rate when ε saturates under adversarial load.    | Raise if a bad client is pinning the gossip plane; lower to chase microsecond convergence on tiny clusters.  |
-| `max_cells_per_tick`  | 4096         | Frame composition cap — the maximum cells `fill_gossip_frame_for_peer` will emit per tick.                        | Raise when you have many rules and the dirty ring backlogs; the wire codec splits frames at the 1400-byte UDP cap. |
-| `max_payload_bytes`   | 1400         | UDP datagram budget. The codec emits multiple packets per frame when the cell list overflows.                     | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
+### Heartbeat cadence and fanout (adaptive fanout)
 
-`gabion::defaults` is the single source of truth for those constants.
-Both adapters (`gabion-server`, `gabion-nginx`) read from it; if you
-change a default, both adapters move together.
+| Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
+|----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| `tick_interval`      | 100 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
+| `fanout`             | 6           | Static fanout floor. The runtime widens to `max(fanout, log₂ dirty)` automatically.                                                    | Lower for very small clusters (1–4) to cut bandwidth; rarely raise — adaptive widening already handles bursts. |
+| `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame_for_peer` will emit in one tick. Cells over the cap roll forward to the next tick via the repair lane. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
+| `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
+
+### Per-rule error budget (adaptive emit rate)
+
+| Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
+|----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| `target_err_bps`     | 100 (= 1 %) | Per-rule error budget in basis points of the rule's limit. Tighter = more threshold fires, looser = more local lag.                    | Lower if a hot rule needs tighter convergence than 1 %; higher if bandwidth is the bottleneck.                |
+| `min_emit_interval`  | 5 ms        | Floor between two threshold-fire emissions. Caps worst-case emit rate when ε saturates under adversarial load.                         | Raise if a bad client is pinning the gossip socket; lower to chase microsecond convergence on tiny clusters.  |
+
+The `gabion::defaults` module is the single source of truth for these
+constants. Both adapters read from it; if you change a default, both
+adapters move together. Per-adapter configuration translates each knob
+to its surface name — see [`crates/server/README.md`](../server/README.md)
+for the YAML keys and [`crates/nginx/README.md`](../nginx/README.md) for
+the directives.
 
 ## What we measured
 
-Every figure below is regenerated from current code by running
-`python3 crates/gossip-bench/bench/plot.py all --publish`. The bench
-itself lives in [`crates/gossip-bench/`](../gossip-bench/README.md) and
-is documented from a "how to run it" perspective; this section is the
-*results* perspective — the things we want every operator and reviewer
-to come away knowing.
+Every figure below is regenerated from current code by running the
+gossip simulator across the suites; see
+[`../gossip-bench/README.md`](../gossip-bench/README.md) for the
+"how to re-run it" perspective. The figures here are committed to
+`figures/` so this README renders correctly on GitHub without first
+running the bench.
 
 The suites split into four bundles. Steady-state convergence and scale
 prove the protocol meets its asymptotic bounds. Resilience proves it
 survives the failure modes operators see in practice. The adaptive
-machinery suites prove the burst- and load-driven knobs work as
-designed.
+machinery suites — `adaptive_fanout`, `error_budget`,
+`min_emit_clamp`, and `heartbeat_threshold_mix` — are the empirical
+evidence for the two adaptive aspects of the protocol.
 
 ### Steady-state convergence
 
@@ -306,29 +385,29 @@ bytes sent across the run divided by `N · duration`.
 
 **Takeaway.** Gabion sits at or below the Karp `log₂ N` lower bound at
 every fanout above 1, because peer-frontier dedup lets the sender skip
-cells the recipient already has. The empirical curve flattens at f=3 —
-the production default — at well under one extra round compared to f=8.
+cells the recipient already has. The empirical curve at f = 3 — well
+under the f = 6 production default — is within one extra round of f = 8.
 
 ![fanout_sweep](figures/fanout_sweep.svg)
 
-**Method.** Fix N=32, sweep static `fanout` from 1 to 12, measure both
+**Method.** Fix N = 32, sweep static `fanout` from 1 to 12, measure both
 convergence rounds and bytes-per-node-per-second.
 
-**Takeaway.** Convergence rounds drop sharply between f=1 and f=3, then
-flatten. Bandwidth scales roughly linearly with `fanout`. The
-"sweet spot" near f=3–4 is where bandwidth stays modest while
-convergence is within a round of the asymptote.
+**Takeaway.** Rounds drop sharply between f = 1 and f = 3, then flatten.
+Bandwidth scales roughly linearly with `fanout`. The sweet spot near
+f = 3–6 is where bandwidth stays modest while convergence sits within
+a round of the asymptote.
 
 ### Scale
 
 ![scale_n](figures/scale_n.svg)
 
-**Method.** Sweep N from 4 to 1024 at fixed `fanout=3`. Time-to-converge
-should track `log₂ N`; bytes-per-node-per-second should stay roughly
-constant (SWIM "constant load per node" property).
+**Method.** Sweep N from 4 to 1024 at fixed `fanout = 3`. Time-to-
+converge should track `log₂ N`; bytes-per-node-per-second should stay
+roughly constant (SWIM's "constant load per node" property).
 
 **Takeaway.** Rounds-to-converge sits at or below `log₂ N` all the way
-through N=1024. Per-node bandwidth is flat in N — the curve is within
+through N = 1024. Per-node bandwidth is flat in N — the curve is within
 noise of a horizontal line.
 
 ### Resilience
@@ -336,13 +415,13 @@ noise of a horizontal line.
 ![loss](figures/loss.svg)
 
 **Method.** Three trials at each per-link drop probability from 0 % to
-50 %. N=16, f=3, 20 s of virtual time.
+50 %. N = 16, f = 3, 20 s of virtual time.
 
 **Takeaway.** Convergence rounds climb only a small constant as loss
 rises; gabion converges in every trial including the 50 % loss row.
-Bimodal Multicast (Birman et al. 1999) reports stable delivery to ~25 –
-30 %; gabion's empirical tolerance is roughly twice that because of the
-peer-frontier dedup plus the rotating repair lane.
+Bimodal Multicast (Birman et al. 1999) reports stable delivery to
+~25–30 %; gabion's empirical tolerance is roughly twice that, thanks
+to peer-frontier dedup plus the rotating repair lane.
 
 ![partition](figures/partition.svg)
 
@@ -357,36 +436,46 @@ partition; reconvergence is bounded above by one `tick_interval`.
 **Method.** Sustained writes from k sources concurrently; measure
 per-hit p50 / p95 lag (Astrolabe-style staleness).
 
-**Takeaway.** P50 and p95 lag both stay flat at a single tick interval
+**Takeaway.** P50 and p95 lag both stay flat at a single `tick_interval`
 regardless of the number of concurrent writers — the dirty ring drains
 in one round under steady state.
 
 ### Adaptive machinery
 
+These four suites are the empirical evidence for the two adaptive
+aspects of the protocol. `adaptive_fanout` exercises adaptive fanout;
+`error_budget` and `min_emit_clamp` exercise adaptive emit rate;
+`heartbeat_threshold_mix` confirms the cold-rule heartbeat is
+independent of the threshold path.
+
 ![adaptive_fanout](figures/adaptive_fanout.svg)
 
 **Method.** Issue a `DistinctKeyBurst` of size `dirty ∈ {1, 4, 16, 64,
-256, 1024}` at one node — every write lands in its own CellStore slot,
+256, 1024}` at one node — every write lands in its own cell store slot,
 so `local_dirty.len()` jumps to `dirty` in one step. Static
-`fanout=1`; N ∈ {32, 128}. Each scenario reports rounds-to-converge
+`fanout = 1`; N ∈ {32, 128}. Each scenario reports rounds-to-converge
 and the observed effective fanout (packets emitted ÷ dirty-tick count).
 
-**Takeaway.** With static fanout 1 and no adaptive widening, a 1024-cell
-burst would take `~ dirty / 1 = 1024` rounds. In practice it converges
-in 3–4. The right panel shows why: observed effective fanout climbs
-from ~1 at `dirty=1` to ~126 at `dirty=1024` — the runtime is picking
-the entire peer set every tick during the burst, then narrows back to
-the static floor once the dirty set drains. The single-cell case (left
-edge) is the only point where rounds tail upward, because there's
-nothing for `log₂(dirty)` to widen.
+**Takeaway.** With static `fanout = 1` and no adaptive widening, a
+1024-cell burst would take roughly `dirty / 1 = 1024` rounds. In
+practice it converges in 3–4. The right panel shows why: each node's
+per-tick `pick_count` widens from `1` at `dirty = 1` to roughly
+`log₂(1024) ≈ 11` at `dirty = 1024`, and the aggregate
+*packets-per-dirty-tick* climbs to ~126 — about an order of magnitude
+greater than the cluster's nominal floor — because every node is doing
+the same widening simultaneously. Once the burst drains, both numbers
+fall back to the static fanout. The single-cell case (left edge) is
+the only point where rounds tail upward, because there is nothing for
+`log₂(dirty)` to widen.
 
 ![error_budget](figures/error_budget.svg)
 
-**Method.** Sustained workload at N=16, rule_limit = 10 000, per_tick
-= 5 hits / source / sample. Sweep `target_err_bps` across nearly three
-decades. Each scenario reports bandwidth, threshold-fires/node, and
-empirical `max_lag = max(ground_truth − min(per_node_total))` and quotes
-the theoretical N × ε_R bound.
+**Method.** Sustained workload at N = 16, `rule_limit = 10 000`,
+`per_tick = 5` hits / source / sample. Sweep `target_err_bps` across
+nearly three decades. Each scenario reports bandwidth,
+threshold-fires/node, and the empirical
+`max_lag = max(ground_truth − min(per_node_total))`, alongside the
+theoretical `N · ε_R` bound.
 
 **Takeaway.** Two regimes show up cleanly. While ε_R is small enough
 that per-sample accumulated hits cross the budget (left of bps ≈ 100
@@ -395,22 +484,24 @@ here), the runtime fires nearly every sample and bandwidth climbs to
 per-sample hit count and the proactive heartbeat carries the work
 alone — bandwidth drops to ~73 kB/node/s and threshold fires go to
 zero. Empirical max lag plateaus at ~65 hits across the entire sweep
-because the heartbeat by itself keeps lag bounded by one
-`tick_interval` × per-sample hit count — the budget only matters when
-it would force gossip *faster* than that. Empirical max lag may briefly
-exceed `N × ε_R` at the tight end of the sweep — that's hits in flight
+because the heartbeat alone keeps lag bounded by one `tick_interval`
+× per-sample hit count — the budget only matters when it would force
+gossip *faster* than that. Empirical max lag may briefly exceed
+`N · ε_R` at the tight end of the sweep — those are hits in flight
 between the bench's sample point and the next gossip apply, bounded by
 one workload batch and absorbed by the following sample.
 
 ![min_emit_clamp](figures/min_emit_clamp.svg)
 
-**Method.** Adversarial: drive 10 000 hits into 50 ms of virtual time
-with `rule_limit = 1` (forces ε to saturate at 1, so every hit would
-otherwise emit). Sweep `min_emit_interval ∈ {0, 1, 5, 10, 50} ms`.
+**Method.** Adversarial workload: drive 10 000 hits into 50 ms of
+virtual time. The `BurstCompressed` workload calls `record(...)` with
+`rule_limit = 1`, which forces `ε_R = max(1, 1 · bps / 80_000) = 1` at
+every bps — so every hit crosses the budget. Sweep
+`min_emit_interval ∈ {0, 1, 5, 10, 50}` ms.
 
 **Takeaway.** Bandwidth scales inversely with the floor; the floor
-caps worst-case emit rate. Threshold-fires-per-node drops by 50× across
-the sweep (6.1 at floor=0/1 ms down to 0.1 at floor=50 ms). Final
+caps worst-case emit rate. Threshold-fires-per-node drops by ~50× across
+the sweep (6.1 at floor = 0 / 1 ms down to 0.1 at floor = 50 ms). Final
 divergence stays at zero in every configuration — the cluster still
 converges after the burst, just at a different bandwidth budget.
 
@@ -420,24 +511,27 @@ converges after the burst, just at a different bandwidth budget.
 burst every tick (threshold path); the cold rule receives one hit per
 second (heartbeat path). Both must converge.
 
-**Takeaway.** The left panel shows the hot rule converging sub-heartbeat
-through threshold fires. The right panel shows the cold rule riding the
-proactive heartbeat. Cold-rule replication does not depend on the
-threshold ever firing.
+**Takeaway.** The left panel shows the hot rule converging
+sub-heartbeat through threshold fires. The right panel shows the cold
+rule riding the proactive heartbeat. Cold-rule replication does not
+depend on the threshold ever firing — heartbeat and threshold are
+independent code paths.
 
 ## References
 
 In-tree primary sources:
 
-- [`src/gossip/runtime.rs`](src/gossip/runtime.rs) — the event loop, the
-  adaptive-fanout pick, and the threshold-fire / heartbeat split.
-- [`src/wire.rs`](src/wire.rs) and [`src/wire/`](src/wire/) — packet
-  shape, encoders, HMAC.
-- [`src/crdt.rs`](src/crdt.rs) and [`src/crdt/`](src/crdt/) — the
-  counter store, dirty rings, peer frontier, expiry.
-- [`CRDT.md`](CRDT.md) — the data-structure deep dive.
+- `src/gossip/runtime.rs` — the event loop. `GossipRuntime::run` is the
+  outer `select!`; `handle_gossip_tick` carries the adaptive-fanout
+  pick; `handle_limit_request` carries the per-site safe zone and the
+  threshold-fire flag.
+- `src/wire.rs` and `src/wire/` — packet shape, encoders, HMAC
+  authentication.
+- `src/crdt.rs` and `src/crdt/` — counter store, dirty rings, peer
+  frontier, expiry. The structures here are documented in depth in
+  [`CRDT.md`](CRDT.md).
 - [`../gossip-bench/REFERENCES.md`](../gossip-bench/REFERENCES.md) — the
-  literature survey behind the benchmark methodology (Demers 1987, Karp
-  2000, SWIM 2002, HyParView / Plumtree 2007, Astrolabe 2003, Bimodal
-  Multicast 1999, plus Sharfman/Schuster/Keren and Olston/Jiang/Widom
-  for the error-budget machinery).
+  literature survey behind the benchmark methodology (Demers 1987,
+  Karp 2000, SWIM 2002, HyParView / Plumtree 2007, Astrolabe 2003,
+  Bimodal Multicast 1999, plus Sharfman/Schuster/Keren and
+  Olston/Jiang/Widom for the error-budget machinery).
