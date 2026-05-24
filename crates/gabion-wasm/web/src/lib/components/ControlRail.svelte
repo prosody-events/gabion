@@ -51,25 +51,28 @@
   const showNetwork = $derived(activePreset?.usesNetwork ?? false);
   const nodeCount = $derived(nodeIds.length);
 
-  // Send and remove both pick a live id. A bare `$state` would not follow the
-  // live set as nodes leave, so derive a *valid* selection that snaps to the
-  // first live id whenever the raw pick is no longer a member — the picker
-  // never points at a departed node.
+  // Send and remove each pick a live id. A bare `$state` can't follow the live
+  // set: before the cluster loads it is null, and a picked node can leave under
+  // churn. A reconciling effect snaps each pick to the first live id whenever it
+  // names no live node — which also *seeds* it once the cluster arrives, so the
+  // `<select>` shows a real target (node 0) instead of a blank until first touch.
+  // It converges in one pass (the snapped value is itself live), so it does not
+  // loop.
   let sendPick = $state<number | null>(null);
   let removePick = $state<number | null>(null);
-  const sendTarget = $derived(
-    sendPick !== null && nodeIds.includes(sendPick) ? sendPick : (nodeIds[0] ?? null),
-  );
-  const removeTarget = $derived(
-    removePick !== null && nodeIds.includes(removePick) ? removePick : (nodeIds[0] ?? null),
-  );
+  $effect(() => {
+    if (sendPick === null || !nodeIds.includes(sendPick)) sendPick = nodeIds[0] ?? null;
+  });
+  $effect(() => {
+    if (removePick === null || !nodeIds.includes(removePick)) removePick = nodeIds[0] ?? null;
+  });
 
   function send(): void {
-    if (sendTarget !== null) onSend(sendTarget);
+    if (sendPick !== null) onSend(sendPick);
   }
 
   function remove(): void {
-    if (removeTarget !== null) onRemoveNode(removeTarget);
+    if (removePick !== null) onRemoveNode(removePick);
   }
 </script>
 
@@ -142,19 +145,39 @@
 
   <section class="group">
     <h2>Cluster</h2>
-    <p class="hint">Nodes join and leave live — no rebuild. Ids are stable.</p>
-    <button class="secondary" onclick={onAddNode} disabled={!canAdd}>+ Add node</button>
-    {#if nodeCount > 1}
-      <div class="field">
-        <label for="remove-node">Remove</label>
-        <select id="remove-node" class="numeric" bind:value={removePick}>
-          {#each nodeIds as id (id)}
-            <option value={id}>node {id}</option>
-          {/each}
-        </select>
-      </div>
-      <button class="secondary" onclick={remove}>Remove node</button>
-    {/if}
+    <p class="hint">Add or remove members live — ids stay stable.</p>
+    <!-- The current size, so the +/− pair reads against a live value (system
+         status) without counting discs on the stage. -->
+    <div class="members">
+      <span class="members-label">Members</span>
+      <span class="members-value numeric">{nodeCount}</span>
+    </div>
+    <!-- Which node "Remove" takes — the AT/keyboard equivalent of the stage "×".
+         Disabled (not hidden) at one node, so the section never changes height. -->
+    <div class="field">
+      <label for="remove-node">Remove</label>
+      <select id="remove-node" class="numeric" bind:value={removePick} disabled={nodeCount <= 1}>
+        {#each nodeIds as id (id)}
+          <option value={id}>node {id}</option>
+        {/each}
+      </select>
+    </div>
+    <!-- Add and Remove as a balanced pair, so they read as the inverse of one
+         another. The glyphs are the signifier; the aria-labels carry the action
+         for assistive tech (and keep the stage "×" buttons unambiguous). -->
+    <div class="cluster-actions">
+      <button class="cluster-btn" aria-label="Add node" onclick={onAddNode} disabled={!canAdd}>
+        <span class="sign" aria-hidden="true">+</span>Add
+      </button>
+      <button
+        class="cluster-btn"
+        aria-label="Remove node"
+        onclick={remove}
+        disabled={nodeCount <= 1}
+      >
+        <span class="sign" aria-hidden="true">−</span>Remove
+      </button>
+    </div>
   </section>
 
   <section class="group">
@@ -266,6 +289,76 @@
     font-family: inherit;
     font-size: var(--text-sm);
     color: var(--ink);
+  }
+
+  select.numeric:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* The live member count: a quiet readout the +/− pair acts on. The number
+     dominates its label (visual hierarchy) and is tabular, so it never jitters
+     as nodes join and leave. */
+  .members {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--chrome-border);
+    border-radius: var(--radius);
+    background: var(--chrome-bg);
+  }
+
+  .members-label {
+    font-size: var(--text-sm);
+    color: var(--ink-soft);
+  }
+
+  .members-value {
+    font-size: var(--text-lg);
+    font-weight: 600;
+    line-height: 1;
+    color: var(--ink);
+  }
+
+  /* Add and Remove on one 8-pt row, equal halves — the inverse-pair reading. */
+  .cluster-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-2);
+  }
+
+  .cluster-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4em;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--chrome-border);
+    border-radius: var(--radius);
+    background: var(--chrome-bg);
+    font-size: var(--text-sm);
+    transition:
+      background 120ms ease,
+      border-color 120ms ease;
+  }
+
+  .cluster-btn:hover:not(:disabled) {
+    background: var(--chrome-panel);
+    border-color: var(--ink-faint);
+  }
+
+  .cluster-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  /* The +/− signifier rides a touch larger than the verb and in the soft ink,
+     so it reads as an icon paired with the label, not part of the word. */
+  .cluster-btn .sign {
+    font-size: 1.15em;
+    line-height: 1;
+    color: var(--ink-soft);
   }
 
   /* Rebuild knobs — collapsed by default so the rail stays compact (Hick's law:

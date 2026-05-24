@@ -158,7 +158,7 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   await dashboard.screenshot({ path: 'screenshots/dash-before-add.png' });
 
   // Add a fresh node: it takes id 12 and joins cold (its view starts at zero).
-  await page.getByRole('button', { name: '+ Add node' }).click();
+  await page.getByRole('button', { name: 'Add node' }).click();
   const newcomer = page.locator('.node-label[data-id="12"]');
   await expect(newcomer.locator('.node-count')).toHaveText('0');
   await expect(page.locator(COUNTS)).toHaveCount(NODES + 1);
