@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Sim } from './lib/sim/sim';
-  import type { ClusterState, SimConfig } from './lib/sim/types';
+  import type { ClusterState, SimConfig, SimEvent } from './lib/sim/types';
   import Stage from './lib/components/Stage.svelte';
   import TransportBar from './lib/components/TransportBar.svelte';
 
@@ -25,6 +25,10 @@
   // Not named `state`: `$state(...)` would then parse as store-subscription
   // syntax (`$` + a variable called `state`) and confuse the compiler.
   let cluster: ClusterState | null = $state(null);
+  // The latest step's gossip events, handed to the stage to animate as
+  // light-beam packets. Only ever reassigned to a non-empty batch, so a
+  // sub-tick step that produced nothing doesn't re-trigger the stage.
+  let events: SimEvent[] = $state([]);
   let playing = $state(false);
   let speed = $state(1);
   let tick = $state(0);
@@ -43,6 +47,7 @@
     pause();
     loading = true;
     error = null;
+    events = [];
     try {
       // Tear the previous engine down first; otherwise its spawned task,
       // runtimes, and tick channels leak for the life of the page (Reset would
@@ -90,6 +95,7 @@
       const batch = await sim.step(deltaMs);
       tick = batch.tick;
       virtualMs = batch.virtual_ms;
+      if (batch.events.length > 0) events = batch.events;
       cluster = await sim.snapshot();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -163,7 +169,7 @@
     {:else if loading}
       <div class="overlay" aria-live="polite">Loading the gossip engine…</div>
     {:else}
-      <Stage state={cluster} />
+      <Stage {cluster} {events} />
     {/if}
   </main>
 

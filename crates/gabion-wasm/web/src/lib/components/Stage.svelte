@@ -1,84 +1,133 @@
 <script lang="ts">
-  import type { ClusterState } from '../sim/types';
+  import { onMount } from 'svelte';
+  import type { ClusterState, SimEvent } from '../sim/types';
+  import { StageRenderer } from '../stage/renderer';
+  import {
+    DOT_THRESHOLD,
+    fitTransform,
+    nodePosition,
+    nodeRadius,
+    toScreen,
+    type StageTransform,
+  } from '../stage/layout';
 
-  let { state }: { state: ClusterState | null } = $props();
+  // The PixiJS stage. The WebGL canvas (managed imperatively by `StageRenderer`)
+  // draws the discs, cell arcs, light-beam packets, and convergence pulse;
+  // `cluster` feeds steady per-node state and `events` feeds the transient
+  // gossip packets from each step. A DOM overlay sits on top of the canvas with
+  // the per-node index and total — the canvas is opaque to assistive tech and
+  // to test tooling, so the real numbers live in queryable, tabular-figure text.
+  let { cluster, events }: { cluster: ClusterState | null; events: SimEvent[] } = $props();
 
-  // A fixed, deterministically-ordered ring: node `i` always sits at the same
-  // screen address so the eye learns it (and so a shared URL renders identically
-  // — no re-solving force layout). Light-beam packets and per-node cell glyphs
-  // layer onto this in Phase 4; for now each node shows the cluster-aggregate
-  // total it currently believes.
-  const VIEW = 1000;
-  const CENTER = VIEW / 2;
-  const RING_RADIUS = 370;
+  let container: HTMLDivElement;
+  let renderer: StageRenderer | null = null;
+  let ready = $state(false);
+  let transform: StageTransform = $state(fitTransform(0, 0));
 
-  const nodes = $derived(state?.nodes ?? []);
+  const nodes = $derived(cluster?.nodes ?? []);
   const count = $derived(nodes.length);
-  const nodeRadius = $derived(Math.max(9, Math.min(38, 1100 / Math.max(count, 1))));
-  const labelSize = $derived(Math.max(9, nodeRadius * 0.7));
+  // Labels track the canvas: their size scales with the disc, and they vanish
+  // once the ring is too dense to label (matching the renderer's dot mode).
+  const labelFont = $derived(nodeRadius(count) * transform.scale * 0.62);
+  // Hold the overlay until the stage has a real fitted size (scale > 0),
+  // otherwise the first frame stacks every label at the origin.
+  const showLabels = $derived(count > 0 && count <= DOT_THRESHOLD && transform.scale > 0);
+  const summary = $derived(
+    cluster === null
+      ? 'Gossip cluster: loading.'
+      : `Gossip cluster of ${count} nodes. True total ${cluster.oracle_total}. ` +
+        `Per-node totals: ${nodes.map((n) => n.aggregate_total).join(', ')}.`,
+  );
 
-  function position(i: number, n: number): { x: number; y: number } {
-    // Start at 12 o'clock, go clockwise.
-    const angle = (2 * Math.PI * i) / n - Math.PI / 2;
-    return {
-      x: CENTER + RING_RADIUS * Math.cos(angle),
-      y: CENTER + RING_RADIUS * Math.sin(angle),
+  $effect(() => {
+    if (ready && renderer !== null) renderer.setCluster(cluster);
+  });
+
+  $effect(() => {
+    if (ready && renderer !== null && events.length > 0) renderer.applyEvents(events);
+  });
+
+  onMount(() => {
+    let disposed = false;
+    let observer: ResizeObserver | null = null;
+
+    void (async () => {
+      const r = await StageRenderer.create(container);
+      if (disposed) {
+        r.destroy();
+        return;
+      }
+      renderer = r;
+      const apply = (): void => {
+        const rect = container.getBoundingClientRect();
+        transform = r.resize(rect.width, rect.height);
+      };
+      apply();
+      observer = new ResizeObserver(apply);
+      observer.observe(container);
+      if (cluster !== null) r.setCluster(cluster);
+      ready = true;
+    })();
+
+    return () => {
+      disposed = true;
+      observer?.disconnect();
+      renderer?.destroy();
+      renderer = null;
+      ready = false;
     };
-  }
+  });
 </script>
 
-<svg
-  class="stage"
-  viewBox="0 0 {VIEW} {VIEW}"
-  preserveAspectRatio="xMidYMid meet"
-  role="img"
-  aria-label="Gossip cluster of {count} nodes arranged in a ring"
->
-  <!-- Faint guide ring the nodes sit on. -->
-  <circle cx={CENTER} cy={CENTER} r={RING_RADIUS} class="guide" />
-
-  {#each nodes as node (node.index)}
-    {@const p = position(node.index, count)}
-    <g class="node" transform="translate({p.x} {p.y})">
-      <circle r={nodeRadius} class="node-disc" />
-      <text class="node-index numeric" y={-nodeRadius - 6} font-size={labelSize}>
-        {node.index}
-      </text>
-      <text class="node-count numeric" dy="0.34em" font-size={labelSize}>
-        {node.aggregate_total}
-      </text>
-    </g>
-  {/each}
-</svg>
+<div class="stage" bind:this={container} role="img" aria-label={summary}>
+  {#if showLabels}
+    <div class="stage-labels" aria-hidden="true">
+      {#each nodes as node (node.index)}
+        {@const s = toScreen(nodePosition(node.index, count), transform)}
+        <span class="node-label" style="left: {s.x}px; top: {s.y}px; font-size: {labelFont}px;">
+          <span class="node-index numeric">{node.index}</span>
+          <span class="node-count numeric">{node.aggregate_total}</span>
+        </span>
+      {/each}
+    </div>
+  {/if}
+</div>
 
 <style>
   .stage {
+    position: relative;
     width: 100%;
     height: 100%;
-    display: block;
+    overflow: hidden;
     background: var(--stage-bg);
   }
 
-  .guide {
-    fill: none;
-    stroke: var(--stage-grid);
-    stroke-width: 1.5;
+  /* The overlay must never intercept pointer events — Phase 6 hit-tests the
+     canvas underneath for click-a-node. */
+  .stage-labels {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
   }
 
-  .node-disc {
-    fill: var(--node-fill);
-    stroke: var(--node-stroke);
-    stroke-width: 2;
+  .node-label {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    line-height: 1;
   }
 
   .node-index {
-    fill: var(--on-stage-soft);
-    text-anchor: middle;
+    color: var(--on-stage-soft);
+    font-size: 0.7em;
+    margin-bottom: 0.15em;
   }
 
+  /* Dark ink reads against the light disc fill the node is drawn with. */
   .node-count {
-    fill: var(--stage-bg);
-    text-anchor: middle;
-    font-weight: 600;
+    color: var(--stage-bg);
+    font-weight: 650;
   }
 </style>
