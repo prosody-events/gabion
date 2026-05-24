@@ -1,38 +1,31 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Sim } from './lib/sim/sim';
-  import type { ClusterState, EventBatch, SimConfig, SimEvent } from './lib/sim/types';
+  import type { ClusterState, EventBatch, SimEvent } from './lib/sim/types';
   import { ChartHistory } from './lib/charts/history';
+  import { DEFAULT_PRESET, PRESETS, WATCHED_KEY, type Preset } from './lib/presets';
   import Stage from './lib/components/Stage.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
   import ControlRail from './lib/components/ControlRail.svelte';
   import TransportBar from './lib/components/TransportBar.svelte';
 
-  // A 12-node cluster with one burst of hits seeded on node 0 at t=0. Pressing
-  // play advances virtual time so the burst gossips outward, hop by hop, until
-  // every node's aggregate reaches the true total — the end-to-end proof the
-  // real gabion core runs in a browser. The default rule limit is left high
-  // (far above the seeded burst) so the burst stays well under gabion's
-  // threshold anti-entropy and spreads by lazy heartbeat over several rounds —
-  // the multi-hop propagation this view exists to show. A burst large enough to
-  // approach the limit would trip the eager threshold flush and converge in one
-  // round; that overload regime, and the Aggregate-vs-Limit chart it powers,
-  // land as a Phase 6 preset. Clicking a node (or the control rail) already
-  // injects a burst (see `sendBurst`); scenario presets and the scrubber are
-  // still to come.
-  const CONFIG: Partial<SimConfig> = { nodes: 12, rng_seed: 1 };
-  const SEED_NODE = 0;
-  const SEED_KEY = 1;
-  const SEED_HITS = 50;
+  // The session runs one scenario preset at a time (see `lib/presets.ts`): a
+  // config plus an opening seed against a fresh cluster. Pressing play advances
+  // virtual time so the seeded traffic gossips outward, hop by hop, until every
+  // node's aggregate reaches the true total — the end-to-end proof the real
+  // gabion core runs in a browser. Reset re-runs the active preset; selecting
+  // another rebuilds. Clicking a node (or the rail's Send) injects more traffic
+  // for the watched key on top.
+  let activePreset = $state<Preset>(DEFAULT_PRESET);
   // Hits per burst, shared by a stage click and the control rail's Send so the
   // two always agree. Each burst targets the same watched key, growing the same
-  // counter the seed did. The default sits well under the threshold-AE budget
-  // (ε ≈ limit·bps/(10⁴·N), ~900 at the default limit), so a burst spreads only
-  // by lazy heartbeat — raising it far enough trips an eager flush, which is
-  // itself worth seeing.
+  // counter the preset seeded. The default sits well under the threshold-AE
+  // budget (ε ≈ limit·bps/(10⁴·N), ~900 at the default limit), so a burst
+  // spreads only by lazy heartbeat — raising it far enough trips an eager
+  // flush, which is itself worth seeing.
   let burstHits = $state(25);
   // One gossip tick at the production default (`GOSSIP_TICK_INTERVAL_MILLIS`),
-  // which `CONFIG` leaves unset.
+  // which the presets leave unset.
   const TICK_MS = 100;
   // Cap one advance so a backgrounded tab resuming rAF can't leap seconds of
   // virtual time in a single frame.
@@ -66,25 +59,29 @@
   // than the engine drains them.
   let stepping = false;
 
-  async function bootstrap(): Promise<void> {
+  /** Build the cluster for `preset`, run its opening seed, and adopt it as the
+   *  active scenario. Reset re-runs the current preset; the rail's scenario
+   *  buttons pass a new one. */
+  async function bootstrap(preset: Preset = activePreset): Promise<void> {
+    activePreset = preset;
     pause();
     loading = true;
     error = null;
     events = [];
-    // Clear the rolling history so a Reset starts the charts from a blank slate
-    // (the first sample re-shapes it for the cluster's node count).
+    // Clear the rolling history so a rebuild starts the charts from a blank
+    // slate (the first sample re-shapes it for the cluster's node count).
     history.reset(0);
     chartVersion += 1;
     try {
       // Tear the previous engine down first; otherwise its spawned task,
-      // runtimes, and tick channels leak for the life of the page (Reset would
-      // pile up an engine per click).
+      // runtimes, and tick channels leak for the life of the page (each
+      // rebuild would pile up an engine).
       if (sim !== null) {
         await sim.shutdown();
         sim = null;
       }
-      const fresh = await Sim.create(CONFIG);
-      await fresh.submitRequest(SEED_NODE, SEED_KEY, SEED_HITS);
+      const fresh = await Sim.create(preset.config);
+      await preset.seed(fresh);
       sim = fresh;
       await refresh();
     } catch (e) {
@@ -149,8 +146,21 @@
   async function sendBurst(node: number): Promise<void> {
     if (sim === null) return;
     try {
-      showEvents(await sim.submitRequest(node, SEED_KEY, burstHits));
+      showEvents(await sim.submitRequest(node, WATCHED_KEY, burstHits));
       if (!playing) applySnapshot(await sim.snapshot());
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      pause();
+    }
+  }
+
+  /** Restore every link to lossless `Pass` — undo the active preset's partition
+   *  or isolation. Pure, like a burst: it opens the links but moves no counts
+   *  until the next tick gossips, so the user plays/steps to watch reconcile. */
+  async function heal(): Promise<void> {
+    if (sim === null) return;
+    try {
+      await sim.heal();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -209,8 +219,8 @@
     <h1>Gabion · <span class="subtitle">Gossip Visualizer</span></h1>
     <p class="lede">
       A cluster of nodes spreading per-origin rate-limit counters by anti-entropy
-      gossip. Press play to watch one node's burst of {SEED_HITS} hits propagate until
-      every node agrees — or click any node (or use the controls) to send a fresh burst.
+      gossip. Pick a scenario and press play to watch every node converge on the
+      cluster-wide total — or click any node (or use the controls) to inject more.
     </p>
   </header>
 
@@ -225,9 +235,13 @@
     {:else}
       <div class="workspace">
         <ControlRail
+          presets={PRESETS}
+          activeId={activePreset.id}
           nodeCount={cluster?.nodes.length ?? 0}
           bind:burstHits
+          onSelectPreset={(preset) => void bootstrap(preset)}
           onSend={(node) => void sendBurst(node)}
+          onHeal={() => void heal()}
         />
         <div class="stage-pane">
           <Stage {cluster} {events} onSendBurst={(node) => void sendBurst(node)} />

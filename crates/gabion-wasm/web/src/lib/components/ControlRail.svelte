@@ -1,18 +1,34 @@
 <script lang="ts">
-  // The left control rail (the chassis's controls region). In this slice it
-  // carries the keyboard/AT-accessible equivalent of click-a-node: pick a node
-  // and a burst size, press Send. The same `burstHits` drives a stage click, so
-  // the pointer gesture and this control always agree on the burst size.
-  // Scenario presets and the rebuild-knob sliders land here in later slices.
+  import type { Preset } from '../presets';
+
+  // The left control rail (the chassis's controls region): scenario presets, the
+  // keyboard/AT-accessible "send a burst" control (the equivalent of clicking a
+  // disc — the same `burstHits` drives both), and the network Heal action that
+  // completes the partition / isolation stories. Rebuild-knob sliders land here
+  // in a later slice.
   let {
+    presets,
+    activeId,
     nodeCount,
     burstHits = $bindable(),
+    onSelectPreset,
     onSend,
+    onHeal,
   }: {
+    presets: readonly Preset[];
+    activeId: string;
     nodeCount: number;
     burstHits: number;
+    onSelectPreset: (preset: Preset) => void;
     onSend: (node: number) => void;
+    onHeal: () => void;
   } = $props();
+
+  const activePreset = $derived(presets.find((p) => p.id === activeId));
+  const activeBlurb = $derived(activePreset?.blurb ?? '');
+  // Heal only does something after a partition or isolation, so the rail shows
+  // it only for those scenarios (progressive disclosure — fewer idle controls).
+  const showNetwork = $derived(activePreset?.usesNetwork ?? false);
 
   let targetNode = $state(0);
   const maxNode = $derived(Math.max(nodeCount - 1, 0));
@@ -30,6 +46,31 @@
 </script>
 
 <aside class="rail" aria-label="Controls">
+  <section class="group">
+    <h2>Scenario</h2>
+    <div class="presets" role="group" aria-label="Scenario preset">
+      {#each presets as preset (preset.id)}
+        <button
+          class="preset"
+          class:active={preset.id === activeId}
+          aria-current={preset.id === activeId ? 'true' : undefined}
+          onclick={() => onSelectPreset(preset)}
+        >
+          {preset.label}
+        </button>
+      {/each}
+    </div>
+    <p class="blurb">{activeBlurb}</p>
+  </section>
+
+  {#if showNetwork}
+    <section class="group">
+      <h2>Network</h2>
+      <p class="hint">Restore every link, then play to reconcile.</p>
+      <button class="secondary" onclick={onHeal} disabled={nodeCount === 0}>Heal network</button>
+    </section>
+  {/if}
+
   <section class="group">
     <h2>Send a burst</h2>
     <p class="hint">Pick a node, or click any disc on the stage.</p>
@@ -57,7 +98,7 @@
   .rail {
     display: flex;
     flex-direction: column;
-    gap: var(--space-4);
+    gap: var(--space-3);
     min-height: 0;
     overflow-y: auto;
     padding: var(--space-3);
@@ -84,6 +125,44 @@
     margin: 0 0 var(--space-1);
     font-size: var(--text-sm);
     color: var(--ink-faint);
+  }
+
+  .presets {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+
+  .preset {
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--chrome-border);
+    border-radius: var(--radius);
+    background: var(--chrome-bg);
+    font-size: var(--text-sm);
+    text-align: left;
+    transition:
+      background 120ms ease,
+      border-color 120ms ease;
+  }
+
+  .preset:hover {
+    background: var(--chrome-panel);
+    border-color: var(--ink-faint);
+  }
+
+  /* Active scenario marked by fill + weight, not color alone. */
+  .preset.active {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: var(--chrome-panel);
+    font-weight: 600;
+  }
+
+  .blurb {
+    margin: var(--space-1) 0 0;
+    font-size: var(--text-sm);
+    line-height: 1.45;
+    color: var(--ink-soft);
   }
 
   .field {
@@ -122,6 +201,26 @@
   }
 
   .send:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .secondary {
+    align-self: flex-start;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--chrome-border);
+    border-radius: var(--radius);
+    background: var(--chrome-bg);
+    font-size: var(--text-sm);
+    transition: background 120ms ease;
+  }
+
+  .secondary:hover:not(:disabled) {
+    background: var(--chrome-panel);
+    border-color: var(--ink-faint);
+  }
+
+  .secondary:disabled {
     opacity: 0.45;
     cursor: not-allowed;
   }

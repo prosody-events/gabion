@@ -122,3 +122,52 @@ test('the control rail sends a burst to the chosen node', async ({ page }) => {
 
   await expect(target.locator('.node-count')).toHaveText(CLICK_HITS);
 });
+
+// Scenario presets rebuild the cluster from a fresh config + opening seed.
+// Switching from the default Traffic burst to Steady state should tear down and
+// rebuild with the steady seed (a light burst scattered across four nodes).
+test('selecting a scenario preset rebuilds the cluster with its seed', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  // Default scenario: node 0 carries the 50-hit burst, the rest start at zero.
+  await expect(page.locator('.node-label[data-index="0"] .node-count')).toHaveText(SEED_TOTAL);
+
+  await page.getByRole('button', { name: 'Steady state' }).click();
+
+  // Steady state seeds 10 on nodes 0, 3, 6, 9 and nothing elsewhere; at t=0
+  // (paused) each carries only its own seed, so the cluster maximally disagrees
+  // before any gossip. node 0's old 50 is gone — this is a fresh cluster.
+  await expect(page.locator('.node-label[data-index="3"] .node-count')).toHaveText('10');
+  await expect(page.locator('.node-label[data-index="0"] .node-count')).toHaveText('10');
+  await expect(page.locator('.node-label[data-index="1"] .node-count')).toHaveText('0');
+});
+
+// The network-partition scenario severs the cluster in two, bursts one half, and
+// the halves disagree until the user heals the link — the eventual-consistency
+// story end to end. Also confirms Heal is disclosed only for network scenarios.
+test('network partition splits the cluster until healed', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  await page.getByRole('button', { name: 'Network partition' }).click();
+  const heal = page.getByRole('button', { name: 'Heal network' });
+  await expect(heal).toBeVisible();
+
+  // Group A (nodes 0–5) holds the burst; group B (6–11) is cut off from it.
+  const groupA = page.locator('.node-label[data-index="1"] .node-count');
+  const groupB = page.locator('.node-label[data-index="6"] .node-count');
+
+  await page.getByRole('button', { name: 'Play' }).click();
+  // Group A converges on the burst among itself; the severed half never hears it.
+  await expect(groupA).toHaveText(SEED_TOTAL);
+  await expect(groupB).toHaveText('0');
+  await page.screenshot({ path: 'screenshots/ring-partition.png' });
+
+  // Heal the link (still playing): the cut-off half catches up by gossip — it
+  // kept its CRDT state, so this is reconciliation, not a cold restart.
+  await heal.click();
+  await expect(groupB).toHaveText(SEED_TOTAL, { timeout: 15_000 });
+  await page.getByRole('button', { name: 'Pause' }).click();
+  await page.screenshot({ path: 'screenshots/ring-healed.png' });
+});
