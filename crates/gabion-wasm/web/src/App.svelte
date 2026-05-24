@@ -5,6 +5,7 @@
   import { ChartHistory } from './lib/charts/history';
   import Stage from './lib/components/Stage.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
+  import ControlRail from './lib/components/ControlRail.svelte';
   import TransportBar from './lib/components/TransportBar.svelte';
 
   // A 12-node cluster with one burst of hits seeded on node 0 at t=0. Pressing
@@ -16,17 +17,20 @@
   // the multi-hop propagation this view exists to show. A burst large enough to
   // approach the limit would trip the eager threshold flush and converge in one
   // round; that overload regime, and the Aggregate-vs-Limit chart it powers,
-  // land as a Phase 6 preset. Clicking a node already injects a burst (see
-  // `sendBurst`); the control rail, presets, and scrubber are still to come.
+  // land as a Phase 6 preset. Clicking a node (or the control rail) already
+  // injects a burst (see `sendBurst`); scenario presets and the scrubber are
+  // still to come.
   const CONFIG: Partial<SimConfig> = { nodes: 12, rng_seed: 1 };
   const SEED_NODE = 0;
   const SEED_KEY = 1;
   const SEED_HITS = 50;
-  // Clicking a node injects this many hits for the same watched key, so the
-  // click grows the *same* counter the seed did and the burst spreads on the
-  // next ticks. Sized well under the threshold-AE budget (ε ≈ limit·bps/(10⁴·N),
-  // ~900 at the default limit) so a click never trips an eager flush by itself.
-  const CLICK_HITS = 25;
+  // Hits per burst, shared by a stage click and the control rail's Send so the
+  // two always agree. Each burst targets the same watched key, growing the same
+  // counter the seed did. The default sits well under the threshold-AE budget
+  // (ε ≈ limit·bps/(10⁴·N), ~900 at the default limit), so a burst spreads only
+  // by lazy heartbeat — raising it far enough trips an eager flush, which is
+  // itself worth seeing.
+  let burstHits = $state(25);
   // One gossip tick at the production default (`GOSSIP_TICK_INTERVAL_MILLIS`),
   // which `CONFIG` leaves unset.
   const TICK_MS = 100;
@@ -145,7 +149,7 @@
   async function sendBurst(node: number): Promise<void> {
     if (sim === null) return;
     try {
-      showEvents(await sim.submitRequest(node, SEED_KEY, CLICK_HITS));
+      showEvents(await sim.submitRequest(node, SEED_KEY, burstHits));
       if (!playing) applySnapshot(await sim.snapshot());
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -206,7 +210,7 @@
     <p class="lede">
       A cluster of nodes spreading per-origin rate-limit counters by anti-entropy
       gossip. Press play to watch one node's burst of {SEED_HITS} hits propagate until
-      every node agrees — or click any node to send it a fresh burst of {CLICK_HITS}.
+      every node agrees — or click any node (or use the controls) to send a fresh burst.
     </p>
   </header>
 
@@ -220,6 +224,11 @@
       <div class="overlay" aria-live="polite">Loading the gossip engine…</div>
     {:else}
       <div class="workspace">
+        <ControlRail
+          nodeCount={cluster?.nodes.length ?? 0}
+          bind:burstHits
+          onSend={(node) => void sendBurst(node)}
+        />
         <div class="stage-pane">
           <Stage {cluster} {events} onSendBurst={(node) => void sendBurst(node)} />
         </div>
@@ -279,11 +288,13 @@
     background: var(--stage-bg);
   }
 
-  /* Stage dominant on the left (the single focal point), the quieter charts
-     dashboard on the right rail. Stacks vertically on a narrow viewport. */
+  /* The three-pane chassis: quiet controls rail, the dominant stage (the single
+     focal point — kept ≥ 55% so the rails never out-weigh it), and the charts
+     dashboard rail. The rail widths sum to ~44% at typical desktop widths and
+     cap on wide screens, so the stage only grows. Stacks vertically when narrow. */
   .workspace {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) clamp(320px, 32%, 440px);
+    grid-template-columns: clamp(200px, 16%, 260px) minmax(0, 1fr) clamp(300px, 28%, 380px);
     height: 100%;
     min-height: 0;
   }
@@ -297,7 +308,7 @@
   @media (max-width: 880px) {
     .workspace {
       grid-template-columns: 1fr;
-      grid-template-rows: minmax(0, 1.2fr) minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1.2fr) minmax(0, 1fr);
     }
   }
 

@@ -106,3 +106,19 @@ test('clicking a node injects a burst at the current virtual time', async ({ pag
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
+
+// The control rail is the keyboard/AT-accessible equivalent of click-a-node:
+// type a node index, press Send, and the same burst lands — no pointer geometry
+// involved. Drives the labelled inputs and the button by their accessible names.
+test('the control rail sends a burst to the chosen node', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  const target = page.locator('.node-label[data-index="7"]');
+  await expect(target.locator('.node-count')).toHaveText('0');
+
+  await page.getByLabel('Node', { exact: true }).fill('7');
+  await page.getByRole('button', { name: 'Send burst' }).click();
+
+  await expect(target.locator('.node-count')).toHaveText(CLICK_HITS);
+});
