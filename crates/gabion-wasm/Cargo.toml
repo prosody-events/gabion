@@ -35,3 +35,15 @@ getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# wasm-pack's release build runs wasm-opt `-Oz` (aggressive size) over the whole
+# emitted module — gabion's gossip + CRDT code included — after wasm-bindgen. The
+# `--enable-*` flags match the WebAssembly features recent rustc emits by default
+# (bulk-memory et al.); without them, the binaryen wasm-pack bundles refuses to
+# validate the input. The cargo half of the size tuning (`opt-level=z`,
+# `panic=immediate-abort`, and `-Z build-std` to recompile std without its panic
+# machinery) lives in `web/package.json`'s `build:wasm` script, scoped to the
+# release build so the stable `--dev` path stays fast. wasm-pack skips wasm-opt
+# for `--dev` too.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-Oz', '--enable-bulk-memory', '--enable-sign-ext', '--enable-mutable-globals', '--enable-nontrapping-float-to-int', '--enable-multivalue', '--enable-reference-types']

@@ -86,6 +86,22 @@ require-pnpm:
 		exit 1; \
 	}
 
+# The *release* wasm build (web/package.json `build:wasm`) is size-optimized with
+# nightly's `-Z build-std` + `panic=immediate-abort`, which recompiles the
+# standard library from source — shaving ~15% off the gzipped download. That
+# needs nightly's `rust-src` component. (`--dev` builds stay on stable and need
+# none of this; only the size-optimized release path pins nightly.)
+.PHONY: require-wasm-nightly
+require-wasm-nightly:
+	@rustup component list --toolchain nightly 2>/dev/null | grep -q 'rust-src (installed)' || { \
+		printf '%s\n' \
+			'The nightly rust-src component is not installed.' \
+			'The size-optimized release wasm build recompiles std with -Z build-std.' \
+			'Install with: rustup toolchain install nightly --component rust-src' \
+			'         and: rustup target add $(WASM_TARGET) --toolchain nightly' >&2; \
+		exit 1; \
+	}
+
 .PHONY: help
 help:
 	@printf '%s\n' 'Gabion test targets:'
@@ -182,7 +198,7 @@ bench-check:
 # (`pnpm run screenshot`) downloads a browser, so it stays a documented
 # on-demand run rather than part of this gate — same treatment as smoke.cjs.
 .PHONY: wasm-check
-wasm-check: require-nextest require-wasm-target require-wasm-pack require-pnpm
+wasm-check: require-nextest require-wasm-target require-wasm-pack require-pnpm require-wasm-nightly
 	$(CARGO_ENV) $(STABLE_CARGO) check --target $(WASM_TARGET) -p gabion-wasm
 	$(CARGO_ENV) $(NEXTEST) -p gabion-wasm
 	cd $(WEB_DIR) && pnpm install --frozen-lockfile && pnpm run build

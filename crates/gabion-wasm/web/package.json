@@ -5,7 +5,7 @@
   "type": "module",
   "description": "In-browser explorable explanation of gabion's gossip-based distributed rate limiter, driven by the real gossip + CRDT core compiled to WebAssembly.",
   "scripts": {
-    "build:wasm": "wasm-pack build .. --target web --out-dir web/src/wasm --out-name gabion_wasm",
+    "build:wasm": "RUSTUP_TOOLCHAIN=nightly RUSTFLAGS='-Copt-level=z -Zunstable-options -Cpanic=immediate-abort' wasm-pack build .. --release --target web --out-dir web/src/wasm --out-name gabion_wasm -- -Zbuild-std=std,panic_abort,core,alloc",
     "build:wasm:dev": "wasm-pack build .. --dev --target web --out-dir web/src/wasm --out-name gabion_wasm",
     "dev": "pnpm run build:wasm:dev && vite",
     "build": "pnpm run build:wasm && pnpm run check && vite build",
