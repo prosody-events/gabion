@@ -39,6 +39,33 @@ export const WATCHED_KEY = 1;
  *  adaptive fanout still saturates it in a couple of rounds. */
 const NODES = 12;
 
+/** The rebuild knobs the control rail exposes, and the positions they take when
+ *  a preset doesn't pin the field. These mirror `gabion::defaults` /
+ *  `SimConfig::default` — the values the Rust side applies to an omitted field —
+ *  so a slider at its default produces the same cluster as no slider at all. (A
+ *  hand-mirror, like `sim/types.ts`; if the Rust defaults move, move these.) */
+export const KNOB_DEFAULTS = {
+  nodes: NODES,
+  fanout: 6,
+  target_err_bps: 100,
+  uniform_loss: 0,
+} as const;
+
+/** The subset of `SimConfig` the rebuild sliders own. */
+export type Knobs = { [K in keyof typeof KNOB_DEFAULTS]: number };
+
+/** Seat the sliders from a preset: its pinned fields win, the rest fall to the
+ *  defaults above. Called on every preset switch so the knobs mirror the active
+ *  scenario (e.g. Packet loss seats the loss slider at 0.3). */
+export function knobsFromPreset(preset: Preset): Knobs {
+  return {
+    nodes: preset.config.nodes ?? KNOB_DEFAULTS.nodes,
+    fanout: preset.config.fanout ?? KNOB_DEFAULTS.fanout,
+    target_err_bps: preset.config.target_err_bps ?? KNOB_DEFAULTS.target_err_bps,
+    uniform_loss: preset.config.uniform_loss ?? KNOB_DEFAULTS.uniform_loss,
+  };
+}
+
 /** A steady traffic feed the play loop drives while a preset is active —
  *  the engine of the overload story. The hits are spread round-robin across the
  *  cluster (by global hit index, so the spread is chunk-independent), targeting

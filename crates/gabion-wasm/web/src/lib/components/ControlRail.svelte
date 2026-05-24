@@ -1,17 +1,19 @@
 <script lang="ts">
-  import type { Preset } from '../presets';
+  import type { Knobs, Preset } from '../presets';
 
   // The left control rail (the chassis's controls region): scenario presets, the
+  // rebuild knobs (a collapsed disclosure, so the rail stays compact), the
   // keyboard/AT-accessible "send a burst" control (the equivalent of clicking a
   // disc — the same `burstHits` drives both), and the network Heal action that
-  // completes the partition / isolation stories. Rebuild-knob sliders land here
-  // in a later slice.
+  // completes the partition / isolation stories.
   let {
     presets,
     activeId,
     nodeCount,
     burstHits = $bindable(),
+    knobs,
     onSelectPreset,
+    onApplyKnobs,
     onSend,
     onHeal,
   }: {
@@ -19,13 +21,22 @@
     activeId: string;
     nodeCount: number;
     burstHits: number;
+    // A live `$state` proxy owned by App: the sliders mutate its fields in place
+    // (no reassignment, so it need not be `$bindable`), and `onApplyKnobs`
+    // rebuilds the cluster with the new values once a slider is released.
+    knobs: Knobs;
     onSelectPreset: (preset: Preset) => void;
+    onApplyKnobs: () => void;
     onSend: (node: number) => void;
     onHeal: () => void;
   } = $props();
 
   const activePreset = $derived(presets.find((p) => p.id === activeId));
   const activeBlurb = $derived(activePreset?.blurb ?? '');
+  // Packet loss reads as a percentage; the engine wants the fraction. Fanout
+  // can't exceed the peer count of the cluster the knobs will build.
+  const lossPct = $derived(Math.round(knobs.uniform_loss * 100));
+  const maxFanout = $derived(Math.max(knobs.nodes - 1, 1));
   // Heal only does something after a partition or isolation, so the rail shows
   // it only for those scenarios (progressive disclosure — fewer idle controls).
   const showNetwork = $derived(activePreset?.usesNetwork ?? false);
@@ -62,6 +73,47 @@
     </div>
     <p class="blurb">{activeBlurb}</p>
   </section>
+
+  <details class="tune">
+    <summary>Tune the cluster</summary>
+    <p class="hint">Sliders rebuild the cluster on release.</p>
+    <div class="knob">
+      <label for="knob-fanout">Fanout<span class="val numeric">{knobs.fanout}</span></label>
+      <input
+        id="knob-fanout"
+        type="range"
+        min="1"
+        max={maxFanout}
+        step="1"
+        bind:value={knobs.fanout}
+        onchange={onApplyKnobs}
+      />
+    </div>
+    <div class="knob">
+      <label for="knob-bps">Error budget<span class="val numeric">{knobs.target_err_bps} bps</span></label>
+      <input
+        id="knob-bps"
+        type="range"
+        min="0"
+        max="2000"
+        step="50"
+        bind:value={knobs.target_err_bps}
+        onchange={onApplyKnobs}
+      />
+    </div>
+    <div class="knob">
+      <label for="knob-loss">Packet loss<span class="val numeric">{lossPct}%</span></label>
+      <input
+        id="knob-loss"
+        type="range"
+        min="0"
+        max="0.9"
+        step="0.05"
+        bind:value={knobs.uniform_loss}
+        onchange={onApplyKnobs}
+      />
+    </div>
+  </details>
 
   {#if showNetwork}
     <section class="group">
@@ -174,7 +226,7 @@
     color: var(--ink-soft);
   }
 
-  input {
+  input.numeric {
     width: 100%;
     padding: var(--space-1) var(--space-2);
     border: 1px solid var(--chrome-border);
@@ -183,6 +235,52 @@
     font-family: inherit;
     font-size: var(--text-sm);
     color: var(--ink);
+  }
+
+  /* Rebuild knobs — collapsed by default so the rail stays compact (Hick's law:
+     fewer simultaneous choices), and so the network/burst controls stay near the
+     top. */
+  .tune {
+    border-top: 1px solid var(--chrome-border);
+    padding-top: var(--space-2);
+  }
+
+  .tune summary {
+    cursor: pointer;
+    font-size: var(--text-xs);
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+  }
+
+  .tune .hint {
+    margin: var(--space-2) 0 0;
+  }
+
+  .knob {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-top: var(--space-2);
+  }
+
+  .knob label {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-size: var(--text-sm);
+    color: var(--ink-soft);
+  }
+
+  .knob .val {
+    color: var(--ink);
+  }
+
+  input[type='range'] {
+    width: 100%;
+    accent-color: var(--ink);
+    cursor: pointer;
   }
 
   .send {

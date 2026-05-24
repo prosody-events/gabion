@@ -143,6 +143,32 @@ test('selecting a scenario preset rebuilds the cluster with its seed', async ({ 
   await expect(page.locator('.node-label[data-index="1"] .node-count')).toHaveText('0');
 });
 
+// The rebuild knobs live behind a collapsed disclosure (Hick's law). Opening it
+// and moving the packet-loss slider updates its readout and rebuilds the cluster
+// with the new value — the cluster still boots (no errors) and stays at N nodes.
+test('a rebuild knob updates its readout and rebuilds the cluster', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+
+  await page.getByText('Tune the cluster').click();
+  // A range input can't be `fill`ed: set the value, fire `input` so Svelte's
+  // bind reads it, then `change` to commit (which rebuilds with the new config).
+  await page.getByLabel('Packet loss').evaluate((el: HTMLInputElement) => {
+    el.value = '0.5';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+
+  await expect(page.locator('label[for="knob-loss"] .val')).toHaveText('50%');
+  // The rebuild left a healthy cluster of the same size.
+  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
 // The sustained-overload scenario feeds the cluster at a steady rate against a
 // low limit (400). Played, the aggregate every node converges on climbs past the
 // limit into the REJECTING band — the "why gabion exists" story, and the one

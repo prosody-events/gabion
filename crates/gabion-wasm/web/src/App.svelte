@@ -1,9 +1,16 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Sim } from './lib/sim/sim';
-  import type { ClusterState, EventBatch, SimEvent } from './lib/sim/types';
+  import type { ClusterState, EventBatch, SimConfig, SimEvent } from './lib/sim/types';
   import { ChartHistory } from './lib/charts/history';
-  import { DEFAULT_PRESET, PRESETS, WATCHED_KEY, type Preset } from './lib/presets';
+  import {
+    DEFAULT_PRESET,
+    PRESETS,
+    WATCHED_KEY,
+    knobsFromPreset,
+    type Knobs,
+    type Preset,
+  } from './lib/presets';
   import Stage from './lib/components/Stage.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
   import ControlRail from './lib/components/ControlRail.svelte';
@@ -17,6 +24,12 @@
   // another rebuilds. Clicking a node (or the rail's Send) injects more traffic
   // for the watched key on top.
   let activePreset = $state<Preset>(DEFAULT_PRESET);
+  // The rebuild knobs (cluster size, fanout, error budget, packet loss). Seated
+  // from the active preset and merged over its config on each (re)build, so a
+  // slider tweak followed by a rebuild explores the parameter space without
+  // leaving the scenario. They take effect only on rebuild — a live engine can't
+  // change its node count — so the rail's sliders rebuild on release.
+  let knobs = $state<Knobs>(knobsFromPreset(DEFAULT_PRESET));
   // Hits per burst, shared by a stage click and the control rail's Send so the
   // two always agree. Each burst targets the same watched key, growing the same
   // counter the preset seeded. The default sits well under the threshold-AE
@@ -68,9 +81,26 @@
   // than the engine drains them.
   let stepping = false;
 
+  /** The preset's config with the live knob values layered on top. The preset's
+   *  other pinned fields (e.g. the overload limit, the rng seed) survive; fanout
+   *  is clamped to the peer count so a small cluster can't ask for more peers
+   *  than it has. */
+  function effectiveConfig(preset: Preset): Partial<SimConfig> {
+    const nodes = knobs.nodes;
+    const fanout = Math.min(Math.max(knobs.fanout, 1), Math.max(nodes - 1, 1));
+    return {
+      ...preset.config,
+      nodes,
+      fanout,
+      target_err_bps: knobs.target_err_bps,
+      uniform_loss: knobs.uniform_loss,
+    };
+  }
+
   /** Build the cluster for `preset`, run its opening seed, and adopt it as the
-   *  active scenario. Reset re-runs the current preset; the rail's scenario
-   *  buttons pass a new one. */
+   *  active scenario. Reset and a knob change re-run the current preset with the
+   *  current knobs; the rail's scenario buttons pass a new one (via
+   *  `selectPreset`, which re-seats the knobs first). */
   async function bootstrap(preset: Preset = activePreset): Promise<void> {
     activePreset = preset;
     pause();
@@ -93,7 +123,7 @@
         await sim.shutdown();
         sim = null;
       }
-      const fresh = await Sim.create(preset.config);
+      const fresh = await Sim.create(effectiveConfig(preset));
       await preset.seed(fresh);
       sim = fresh;
       await refresh();
@@ -102,6 +132,14 @@
     } finally {
       loading = false;
     }
+  }
+
+  /** Adopt a scenario: re-seat the knobs from its config (so the sliders mirror
+   *  it), then build it. The rail's scenario buttons route here; Reset and knob
+   *  changes call `bootstrap()` directly, keeping the current knobs. */
+  function selectPreset(preset: Preset): void {
+    knobs = knobsFromPreset(preset);
+    void bootstrap(preset);
   }
 
   async function refresh(): Promise<void> {
@@ -281,7 +319,9 @@
           activeId={activePreset.id}
           nodeCount={cluster?.nodes.length ?? 0}
           bind:burstHits
-          onSelectPreset={(preset) => void bootstrap(preset)}
+          {knobs}
+          onSelectPreset={selectPreset}
+          onApplyKnobs={() => void bootstrap()}
           onSend={(node) => void sendBurst(node)}
           onHeal={() => void heal()}
         />

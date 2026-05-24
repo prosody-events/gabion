@@ -64,10 +64,11 @@ the steps — deterministic, without the scrubber's timed-event driver.
   imperative uPlot wrapper.
 - `src/lib/components/` — `Stage.svelte` (the thin Svelte wrapper around the
   renderer plus the DOM label overlay), `Dashboard.svelte` (the headline metric
-  + charts), `ControlRail.svelte` (the left rail: scenario presets, the
-  keyboard-accessible "send a burst to node N" control, and a Heal action shown
-  only for the partition / isolation scenarios; rebuild sliders land here next),
-  and `TransportBar.svelte`.
+  + charts), `ControlRail.svelte` (the left rail: scenario presets, a
+  collapsible "Tune the cluster" disclosure with rebuild sliders for fanout /
+  error budget / packet loss, the keyboard-accessible "send a burst to node N"
+  control, and a Heal action shown only for the partition / isolation
+  scenarios), and `TransportBar.svelte`.
 - `src/lib/presets.ts` — the scenario presets. A preset is a config plus an
   `async seed(sim)` that fires its opening commands (partitions, seed bursts)
   against a fresh cluster, and optionally a `traffic` rate the play loop feeds
