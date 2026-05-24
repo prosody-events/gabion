@@ -1,0 +1,125 @@
+// uPlot option builders for the dashboard's charts. Pure functions — given the
+// node count (for the fan's per-node series), each returns a complete
+// `uPlot.Options`. The thin `Chart.svelte` wrapper owns the lifecycle; the
+// pedagogy lives here.
+//
+// (The Aggregate-vs-Limit panel is deferred to a Phase 6 overload preset: a
+// burst large enough to approach the limit necessarily trips gabion's threshold
+// anti-entropy, which collapses the multi-hop spread this default scenario is
+// built to show. The two regimes are distinct scenarios, not one chart.)
+//
+// Conventions enforced across the charts (the design rubric is explicit):
+//   • one shared cursor-sync key, so a hover crosshair tracks the same x on
+//     every panel at once;
+//   • the detached legend is OFF — series are direct-labelled in `draw` hooks
+//     (Tufte: label the line, don't make the eye round-trip to a key);
+//   • the oracle / true-total line dominates (dark, heavy, dashed); per-node
+//     lines recede (translucent slate), so the macro reading is the oracle and
+//     the micro reading is the spread around it.
+
+import uPlot from 'uplot';
+
+// CSS color strings mirroring the `app.css` design tokens. (The Pixi renderer
+// keeps the same two signal hues as hex *numbers*; uPlot wants strings.)
+const INK = '#1b1d22';
+const INK_SOFT = '#5c626b';
+const GRID = '#ececdf';
+const NODE_LINE = 'rgba(92, 98, 107, 0.32)'; // recessive per-node fan line
+const DIRTY = '#d98a2b'; // limit / not-yet-agreed
+const DIRTY_FILL = 'rgba(217, 138, 43, 0.15)';
+
+const FONT = "12px ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
+
+// One sync group ties every chart's cursor to the same virtual-time x.
+const SYNC_KEY = 'gabion-dashboard';
+
+/** Device-pixel ratio uPlot drew at: hook coordinates and fonts are in canvas
+ *  (device) pixels, so static sizes must scale by it to stay crisp. */
+function pxr(u: uPlot): number {
+  return (u as { pxRatio?: number }).pxRatio ?? (window.devicePixelRatio || 1);
+}
+
+/** Shared axis styling: a faint grid, soft ink labels, minimal tick ink —
+ *  maximizing the data-ink ratio. */
+function axes(xLabel?: string): uPlot.Axis[] {
+  const common = {
+    stroke: INK_SOFT,
+    font: FONT,
+    grid: { stroke: GRID, width: 1 },
+    ticks: { stroke: GRID, width: 1, size: 4 },
+  };
+  return [
+    { ...common, label: xLabel, labelFont: FONT, labelGap: 4, size: xLabel ? 38 : 28 },
+    { ...common, size: 44 },
+  ];
+}
+
+function baseCursor(): uPlot.Cursor {
+  return { sync: { key: SYNC_KEY }, points: { size: 6 }, focus: { prox: 12 } };
+}
+
+/** Direct-label series `seriesIdx` at the plot's right margin, riding at the
+ *  line's current height — the label that replaces a detached legend entry.
+ *  Pinned to the right edge (not the last data point) so a single sample at
+ *  x = 0 can't push the right-anchored text off the left edge. */
+function labelSeriesEnd(seriesIdx: number, text: string, color: string) {
+  return (u: uPlot): void => {
+    const ys = u.data[seriesIdx];
+    let i = ys.length - 1;
+    while (i >= 0 && ys[i] == null) i--;
+    if (i < 0) return;
+    const dpr = pxr(u);
+    const x = u.bbox.left + u.bbox.width - 4 * dpr;
+    const y = u.valToPos(ys[i] as number, 'y', true);
+    const ctx = u.ctx;
+    ctx.save();
+    ctx.font = `${dpr * 11}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.fillStyle = color;
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(text, x, y - 4 * dpr);
+    ctx.restore();
+  };
+}
+
+/** A1 — the Convergence Fan. N recessive per-node lines racing a dominant,
+ *  heavy dashed ground-truth oracle. The hero panel; never hidden. */
+export function fanOptions(nodeCount: number): uPlot.Options {
+  const nodeSeries: uPlot.Series[] = [];
+  for (let i = 0; i < nodeCount; i++) {
+    nodeSeries.push({ stroke: NODE_LINE, width: 1, points: { show: false } });
+  }
+  const oracleIdx = nodeCount + 1;
+  return {
+    width: 1,
+    height: 1,
+    cursor: baseCursor(),
+    legend: { show: false },
+    scales: { x: { time: false } },
+    axes: axes(),
+    series: [
+      {},
+      ...nodeSeries,
+      // The oracle: dark, heavy, dashed — the line the fan chases.
+      { stroke: INK, width: 2.5, dash: [7, 4], points: { show: false } },
+    ],
+    hooks: { draw: [labelSeriesEnd(oracleIdx, 'true total', INK)] },
+  };
+}
+
+/** A2 — Disagreement → 0. The per-node spread (max − min) as a filled area
+ *  decaying to zero after the burst: the textbook anti-entropy curve. */
+export function disagreementOptions(): uPlot.Options {
+  return {
+    width: 1,
+    height: 1,
+    cursor: baseCursor(),
+    legend: { show: false },
+    scales: { x: { time: false }, y: { range: (_u, _min, max) => [0, Math.max(max, 1)] } },
+    axes: axes('virtual ms'),
+    series: [
+      {},
+      { stroke: DIRTY, fill: DIRTY_FILL, width: 1.5, points: { show: false } },
+    ],
+  };
+}

@@ -2,14 +2,21 @@
   import { onMount } from 'svelte';
   import { Sim } from './lib/sim/sim';
   import type { ClusterState, SimConfig, SimEvent } from './lib/sim/types';
+  import { ChartHistory } from './lib/charts/history';
   import Stage from './lib/components/Stage.svelte';
+  import Dashboard from './lib/components/Dashboard.svelte';
   import TransportBar from './lib/components/TransportBar.svelte';
 
-  // Phase-3 skeleton scenario: a 12-node cluster with one burst of hits seeded
-  // on node 0 at t=0. Pressing play advances virtual time so the burst gossips
-  // outward and every node's aggregate climbs toward the true total — the first
-  // end-to-end proof the real gabion core runs in a browser. Interactions
-  // (click-to-send, presets, partitions) arrive in Phase 6.
+  // A 12-node cluster with one burst of hits seeded on node 0 at t=0. Pressing
+  // play advances virtual time so the burst gossips outward, hop by hop, until
+  // every node's aggregate reaches the true total — the end-to-end proof the
+  // real gabion core runs in a browser. The default rule limit is left high
+  // (far above the seeded burst) so the burst stays well under gabion's
+  // threshold anti-entropy and spreads by lazy heartbeat over several rounds —
+  // the multi-hop propagation this view exists to show. A burst large enough to
+  // approach the limit would trip the eager threshold flush and converge in one
+  // round; that overload regime, and the Aggregate-vs-Limit chart it powers,
+  // land as a Phase 6 preset. Interactions arrive in Phase 6.
   const CONFIG: Partial<SimConfig> = { nodes: 12, rng_seed: 1 };
   const SEED_NODE = 0;
   const SEED_KEY = 1;
@@ -36,6 +43,12 @@
   let error: string | null = $state(null);
   let loading = $state(true);
 
+  // The rolling chart history is a plain (non-reactive) structure — 600 samples
+  // under a deep `$state` proxy would cost on every frame. `chartVersion` is the
+  // single reactive signal the dashboard redraws on; it ticks on each new sample.
+  const history = new ChartHistory();
+  let chartVersion = $state(0);
+
   let rafId = 0;
   let lastWall = 0;
   // Exactly one advance is ever in flight: the play loop will not issue the
@@ -48,6 +61,10 @@
     loading = true;
     error = null;
     events = [];
+    // Clear the rolling history so a Reset starts the charts from a blank slate
+    // (the first sample re-shapes it for the cluster's node count).
+    history.reset(0);
+    chartVersion += 1;
     try {
       // Tear the previous engine down first; otherwise its spawned task,
       // runtimes, and tick channels leak for the life of the page (Reset would
@@ -69,10 +86,18 @@
 
   async function refresh(): Promise<void> {
     if (sim === null) return;
-    const snap = await sim.snapshot();
+    applySnapshot(await sim.snapshot());
+  }
+
+  /** Adopt a fresh snapshot as the current state and append it to the chart
+   *  history — the one place per-frame state and the rolling series stay in
+   *  step. */
+  function applySnapshot(snap: ClusterState): void {
     cluster = snap;
     tick = snap.tick;
     virtualMs = snap.virtual_ms;
+    history.push(snap);
+    chartVersion += 1;
   }
 
   function frame(now: number): void {
@@ -93,10 +118,8 @@
     if (sim === null) return;
     try {
       const batch = await sim.step(deltaMs);
-      tick = batch.tick;
-      virtualMs = batch.virtual_ms;
       if (batch.events.length > 0) events = batch.events;
-      cluster = await sim.snapshot();
+      applySnapshot(await sim.snapshot());
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -169,7 +192,12 @@
     {:else if loading}
       <div class="overlay" aria-live="polite">Loading the gossip engine…</div>
     {:else}
-      <Stage {cluster} {events} />
+      <div class="workspace">
+        <div class="stage-pane">
+          <Stage {cluster} {events} />
+        </div>
+        <Dashboard {cluster} {history} version={chartVersion} />
+      </div>
     {/if}
   </main>
 
@@ -222,6 +250,28 @@
     position: relative;
     min-height: 0;
     background: var(--stage-bg);
+  }
+
+  /* Stage dominant on the left (the single focal point), the quieter charts
+     dashboard on the right rail. Stacks vertically on a narrow viewport. */
+  .workspace {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(320px, 32%, 440px);
+    height: 100%;
+    min-height: 0;
+  }
+
+  .stage-pane {
+    position: relative;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  @media (max-width: 880px) {
+    .workspace {
+      grid-template-columns: 1fr;
+      grid-template-rows: minmax(0, 1.2fr) minmax(0, 1fr);
+    }
   }
 
   .overlay {

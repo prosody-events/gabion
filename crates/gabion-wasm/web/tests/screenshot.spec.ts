@@ -18,9 +18,13 @@ test('boots, renders the ring, and gossips to convergence in-browser', async ({ 
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
   await page.screenshot({ path: 'screenshots/ring-initial.png' });
 
-  // Before any gossip, only the seeded node carries the burst total.
+  // Before any gossip, only the seeded node carries the burst total, so the
+  // cluster maximally disagrees: one node at 50, the rest at 0. (The default
+  // limit is high enough that the burst stays below gabion's threshold flush,
+  // so it spreads only when played — no eager pre-spread.)
   const initial = await page.locator(COUNTS).allTextContents();
   expect(initial.filter((t) => t.trim() === SEED_TOTAL)).toHaveLength(1);
+  await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
 
   // Play; the burst propagates as beams until every node agrees on the total.
   await page.getByRole('button', { name: 'Play' }).click();
@@ -44,6 +48,11 @@ test('boots, renders the ring, and gossips to convergence in-browser', async ({ 
   // be expanding.
   await page.screenshot({ path: 'screenshots/ring-converged.png' });
 
+  // The pinned headline reaches zero and latches the round count — the dashboard
+  // tells the same convergence story the stage just animated.
+  await expect(page.locator('.headline.converged .headline-value')).toHaveText('0');
+  await expect(page.locator('.badge')).toHaveText(/converged in \d+ rounds?/);
+
   await page.getByRole('button', { name: 'Pause' }).click();
 
   // Reset tears the engine down and rebuilds: back to a single seeded node.
@@ -59,6 +68,10 @@ test('boots, renders the ring, and gossips to convergence in-browser', async ({ 
       { timeout: 10_000, message: 'Reset did not rebuild a freshly-seeded cluster' },
     )
     .toBe(1);
+  // The dashboard resets with the engine: headline back to the full burst
+  // spread, the converged badge cleared.
+  await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
+  await expect(page.locator('.headline.converged')).toHaveCount(0);
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
