@@ -213,7 +213,8 @@
   /* The per-node "×": a pointer-only affordance that removes this node live.
      `pointer-events: auto` lifts it out of the pass-through overlay so it can
      be clicked, while the rest of the label stays click-through for the burst
-     hit-test. Subtle until hovered, so twelve of them don't clutter the stage. */
+     hit-test. A small white chip with a hairline border so it reads on the
+     light stage; subtle until hovered, so twelve of them don't clutter it. */
   .node-delete {
     pointer-events: auto;
     position: absolute;
@@ -225,36 +226,36 @@
     width: 1.15em;
     height: 1.15em;
     padding: 0;
-    border: none;
+    border: 1px solid var(--chrome-border);
     border-radius: 50%;
-    background: color-mix(in srgb, var(--stage-bg) 65%, transparent);
-    color: var(--on-stage-soft);
+    background: var(--chrome-panel);
+    color: var(--ink-faint);
     font-size: 0.8em;
     line-height: 1;
     cursor: pointer;
-    opacity: 0.5;
+    opacity: 0.55;
     transition:
       opacity 120ms ease,
       color 120ms ease,
-      background 120ms ease;
+      border-color 120ms ease;
   }
 
   .node-delete:hover,
   .node-delete:focus-visible {
     opacity: 1;
-    color: #f4b4a4;
-    background: color-mix(in srgb, var(--stage-bg) 88%, transparent);
+    color: var(--signal-reject);
+    border-color: var(--signal-reject);
   }
 
   .node-id {
-    color: var(--on-stage-soft);
+    color: var(--on-disc-soft);
     font-size: 0.7em;
     margin-bottom: 0.15em;
   }
 
-  /* Dark ink reads against the light disc fill the node is drawn with. */
+  /* Light text reads against the dark slate disc the node is drawn with. */
   .node-count {
-    color: var(--stage-bg);
+    color: var(--on-disc);
     font-weight: 650;
   }
 </style>

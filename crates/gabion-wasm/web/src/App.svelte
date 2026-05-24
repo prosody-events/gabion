@@ -477,17 +477,17 @@
     align-items: center;
     justify-content: center;
     gap: var(--space-2);
-    color: var(--on-stage-soft);
+    color: var(--ink-soft);
     font-size: var(--text-sm);
   }
 
   .overlay.error {
-    color: #f4b4a4;
+    color: var(--signal-reject);
     padding: var(--space-4);
     text-align: center;
   }
 
   .overlay.error strong {
-    color: var(--on-stage);
+    color: var(--ink);
   }
 </style>

@@ -1,25 +1,37 @@
-/* Design tokens for the visualizer chassis. Editorial-clean light chrome
- * wrapping a deep-neutral stage (per the locked "Atelier Stage" design).
- * Phase 3 establishes only the chassis, type, and color tokens; the stage's
- * PixiJS layers, charts, and inspector arrive in later phases. */
+/* Design tokens for the visualizer chassis. A unified light theme: a cool,
+ * paper-bright stage that is the brightest, most active surface, framed by
+ * quieter grey chrome. Dark slate node discs read as solid figures on the
+ * light canvas; the two signal hues carry the gossip story. Every text pair
+ * here clears WCAG AA 4.5:1, every graphical mark (beam, arc, disc) 3:1 —
+ * verified against the surfaces they sit on, not eyeballed. */
 
 :root {
-  /* Color — light chrome around a deep stage. */
-  --chrome-bg: #f4f4f1;
+  /* Surfaces, lightest-to-quietest. The stage (`--stage-bg`) is a touch cooler
+   * than the white panels so it reads as its own lit canvas, not contiguous
+   * chrome; the frame (`--chrome-bg`) recedes a step further. */
+  --chrome-bg: #e7eaee;
   --chrome-panel: #ffffff;
-  --chrome-border: #e2e2db;
-  --stage-bg: #0e1218;
-  --stage-grid: #1b222c;
-  --ink: #1b1d22;
-  --ink-soft: #5c626b;
-  --ink-faint: #9aa0a8;
-  --on-stage: #e8ecf1;
-  --on-stage-soft: #8b95a3;
-  /* Two signal hues, colorblind-safe; never the sole encoding. */
-  --signal-converged: #2a9d6f; /* settled / agreed */
-  --signal-dirty: #d98a2b; /* in-flight / news */
-  --node-fill: #aeb8c4;
-  --node-stroke: #38414d;
+  --chrome-border: #d6dbe1;
+  --stage-bg: #e8edf2;
+  --stage-grid: #d2d9e1;
+  /* Ink, darkest-to-faintest. `--ink-faint` is dark enough to clear 4.5:1 even
+   * on the grey chrome it sometimes borders. `--ink-hover` is the dark-button
+   * hover tint. */
+  --ink: #1b2330;
+  --ink-soft: #555e6d;
+  --ink-faint: #5f6874;
+  --ink-hover: #2c2f36;
+  /* Light text carried on the dark node discs. */
+  --on-disc: #f5f7f9;
+  --on-disc-soft: rgba(245, 247, 249, 0.66);
+  /* Two signal hues, colorblind-safe; never the sole encoding (always paired
+   * with arc length, motion, or a label). Deepened for legibility on the light
+   * stage and as small text in the dashboard. */
+  --signal-converged: #137a52; /* settled / agreed */
+  --signal-dirty: #b3720d; /* in-flight / news */
+  --signal-reject: #b3261e; /* error / remove */
+  --node-fill: #39424f;
+  --node-stroke: #2b333d;
 
   /* Type — humanist sans for UI; tabular figures so numerals never jitter.
    * Serif (narration) and mono (pseudocode) join in later phases. */

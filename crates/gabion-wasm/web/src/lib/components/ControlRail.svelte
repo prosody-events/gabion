@@ -419,7 +419,7 @@
   }
 
   .send:hover:not(:disabled) {
-    background: #2c2f36;
+    background: var(--ink-hover);
   }
 
   .send:disabled {

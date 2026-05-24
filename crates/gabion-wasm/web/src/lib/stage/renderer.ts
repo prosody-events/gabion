@@ -30,15 +30,16 @@ import {
 } from './layout';
 
 // Palette mirrors the CSS design tokens in `app.css` (Pixi wants numbers, not
-// hex strings). Two signal hues only — amber for "in flight / not yet agreed",
+// hex strings). A paper-bright stage with dark slate discs as the solid
+// figures; two signal hues only — amber for "in flight / not yet agreed",
 // green for "converged" — each always paired with a shape cue (arc length,
-// motion, the pulse), never color alone.
-const COLOR_STAGE_BG = 0x0e1218;
-const COLOR_GRID = 0x1b222c;
-const COLOR_NODE_FILL = 0xaeb8c4;
-const COLOR_NODE_STROKE = 0x38414d;
-const COLOR_DIRTY = 0xd98a2b; // in flight / still climbing
-const COLOR_CONVERGED = 0x2a9d6f; // settled / agreed
+// motion, the pulse), never color alone. Every mark clears 3:1 on the stage.
+const COLOR_STAGE_BG = 0xe8edf2;
+const COLOR_GRID = 0xd2d9e1;
+const COLOR_NODE_FILL = 0x39424f;
+const COLOR_NODE_STROKE = 0x2b333d;
+const COLOR_DIRTY = 0xb3720d; // in flight / still climbing
+const COLOR_CONVERGED = 0x137a52; // settled / agreed
 
 // A node counts as caught up when its view is within this fraction of the
 // cluster's true total — the threshold that flips its arc from amber to green.
@@ -363,13 +364,26 @@ export class StageRenderer {
     node.arc.clear();
 
     if (n > DOT_THRESHOLD) {
-      // Intensity dot: tint the disc from neutral toward the signal hue by how
-      // caught up the node is. Position on the ring still encodes identity.
-      node.disc.tint = f === 0 ? 0xffffff : color;
-      node.disc.alpha = 0.45 + 0.55 * f;
+      // Intensity dot: there is no room for an arc, so the disc *fill* itself
+      // carries how caught up the node is — lerped from the cold slate base
+      // toward the signal hue. (Pixi `tint` multiplies, so tinting the dark
+      // base would only ever darken it; we redraw the fill instead.) Position
+      // on the ring still encodes identity.
+      node.disc.tint = 0xffffff;
+      node.disc.alpha = 1;
+      const fill = f <= 0 ? COLOR_NODE_FILL : lerpColor(COLOR_NODE_FILL, color, 0.35 + 0.65 * f);
+      node.disc
+        .clear()
+        .circle(0, 0, node.radius)
+        .fill(fill)
+        .stroke({ width: 1.5, color: COLOR_NODE_STROKE });
       return;
     }
 
+    // Arc mode: the disc keeps its slate base fill (crossing the dot threshold
+    // changes the node count, hence the radius, so the glide loop's radius-change
+    // redraw already restored it from any dot-mode recolour). The arc carries
+    // the fraction.
     node.disc.tint = 0xffffff;
     node.disc.alpha = 1;
     if (f <= 0) return;
@@ -396,7 +410,7 @@ export class StageRenderer {
       gfx
         .moveTo(a.x, a.y)
         .lineTo(b.x, b.y)
-        .stroke({ width, color: COLOR_DIRTY, alpha: dropped ? 0.25 : 0.6, cap: 'round' });
+        .stroke({ width, color: COLOR_DIRTY, alpha: dropped ? 0.3 : 0.9, cap: 'round' });
       const beam: Beam = {
         gfx,
         src,
@@ -419,8 +433,8 @@ export class StageRenderer {
       const from = lerp(a, b, tail);
       const to = lerp(a, b, tip);
       // A dropped beam dims as it dies; a delivered one stays bright to the
-      // target.
-      const alpha = dropped ? 0.7 * (1 - tip / end) : 0.85;
+      // target (near-opaque so the amber clears 3:1 on the light stage).
+      const alpha = dropped ? 0.7 * (1 - tip / end) : 0.95;
       gfx
         .clear()
         .moveTo(from.x, from.y)
@@ -515,4 +529,17 @@ export class StageRenderer {
 
 function lerp(a: Point, b: Point, t: number): Point {
   return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+/** Blend two packed `0xRRGGBB` colours channel-wise — the dot-mode disc fill
+ *  ramps from the slate base toward a signal hue as a node catches up. */
+function lerpColor(a: number, b: number, t: number): number {
+  const k = Math.max(0, Math.min(1, t));
+  const ar = (a >> 16) & 0xff;
+  const ag = (a >> 8) & 0xff;
+  const ab = a & 0xff;
+  const r = Math.round(ar + ((b >> 16 & 0xff) - ar) * k);
+  const g = Math.round(ag + ((b >> 8 & 0xff) - ag) * k);
+  const bl = Math.round(ab + ((b & 0xff) - ab) * k);
+  return (r << 16) | (g << 8) | bl;
 }

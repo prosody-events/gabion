@@ -22,13 +22,13 @@ import uPlot from 'uplot';
 
 // CSS color strings mirroring the `app.css` design tokens. (The Pixi renderer
 // keeps the same two signal hues as hex *numbers*; uPlot wants strings.)
-const INK = '#1b1d22';
-const INK_SOFT = '#5c626b';
-const GRID = '#ececdf';
-const NODE_LINE = 'rgba(92, 98, 107, 0.32)'; // recessive per-node fan line
-const DIRTY = '#d98a2b'; // limit / not-yet-agreed
-const DIRTY_FILL = 'rgba(217, 138, 43, 0.15)';
-const INK_FILL = 'rgba(27, 29, 34, 0.08)'; // aggregate area under its line
+const INK = '#1b2330';
+const INK_SOFT = '#555e6d';
+const GRID = '#e4e8ed'; // cool, faint — matches the light theme's grid token
+const NODE_LINE = 'rgba(85, 94, 109, 0.34)'; // recessive per-node fan line
+const DIRTY = '#b3720d'; // limit / not-yet-agreed (deepened to clear 3:1 on white)
+const DIRTY_FILL = 'rgba(179, 114, 13, 0.15)';
+const INK_FILL = 'rgba(27, 35, 48, 0.08)'; // aggregate area under its line
 
 const FONT = "12px ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
 
