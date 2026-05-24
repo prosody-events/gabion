@@ -41,9 +41,6 @@ use crate::engine::{Command, LinkPolicyKind, run_engine};
 #[wasm_bindgen]
 pub struct Sim {
     cmd_tx: mpsc::Sender<Command>,
-    /// Cluster size, cached so [`Sim::heal`] can sweep every directed link
-    /// without another round-trip.
-    nodes: usize,
 }
 
 #[wasm_bindgen]
@@ -58,7 +55,6 @@ impl Sim {
         config
             .validate()
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
-        let nodes = config.nodes;
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         // The engine drives virtual time itself through `ManualClock` (see the
         // module-level R2 note), so it needs no tokio time driver — `spawn_local`
@@ -68,7 +64,7 @@ impl Sim {
         wasm_bindgen_futures::spawn_local(async move {
             let _ = run_engine(config, cmd_rx).await;
         });
-        Ok(Sim { cmd_tx, nodes })
+        Ok(Sim { cmd_tx })
     }
 
     /// Inject `hits` requests for `key_id` at `node`, at the current virtual
@@ -123,17 +119,38 @@ impl Sim {
     }
 
     /// Restore every directed link to lossless `Pass` — undo any partition or
-    /// per-link drop policy across the whole cluster.
+    /// per-link drop policy across the whole cluster. Engine-driven: it sweeps
+    /// the *live* link set in one round-trip, so it stays correct after nodes
+    /// have joined or left (the caller no longer tracks the node count).
     pub async fn heal(&self) -> Result<(), JsValue> {
-        let n = self.nodes as u32;
-        for src in 0..n {
-            for dst in 0..n {
-                if src != dst {
-                    self.apply_link(src, dst, LinkPolicyKind::Pass).await?;
-                }
-            }
-        }
-        Ok(())
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::Heal { reply }).await?;
+        rx.await.map_err(|_| engine_gone())
+    }
+
+    /// Add a fresh cold-start node to the live cluster. It joins by gossip and
+    /// catches up by anti-entropy — no rebuild. Resolves to the
+    /// [`crate::event::EventBatch`] the join produced; the new node's stable id
+    /// appears in the next [`Sim::snapshot`].
+    pub async fn add_node(&self) -> Result<JsValue, JsValue> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::AddNode { reply }).await?;
+        let batch = rx.await.map_err(|_| engine_gone())?;
+        to_js(&batch)
+    }
+
+    /// Remove the live node with stable `id`. Survivors keep their own ids and
+    /// re-converge; the removed id leaves a gap and is never reused. Resolves
+    /// to the [`crate::event::EventBatch`] the removal produced, or throws
+    /// [`crate::engine::EngineError::UnknownNode`] if no live node has that id.
+    pub async fn remove_node(&self, id: u32) -> Result<JsValue, JsValue> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Command::RemoveNode { id, reply }).await?;
+        let batch = rx
+            .await
+            .map_err(|_| engine_gone())?
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
+        to_js(&batch)
     }
 
     /// Advance virtual time by `delta_ms`, resolving to the events produced.

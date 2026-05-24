@@ -91,6 +91,22 @@ export class Sim {
     await this.#inner.heal();
   }
 
+  /** Add a fresh cold-start node to the live cluster (no rebuild). Resolves to
+   *  the events the join produced; the new node's id appears in the next
+   *  snapshot. */
+  async addNode(): Promise<EventBatch> {
+    const batch = (await this.#inner.add_node()) as EventBatch;
+    assertBoundary(batch);
+    return batch;
+  }
+
+  /** Remove the live node with stable `id`. Throws if no live node has it. */
+  async removeNode(id: number): Promise<EventBatch> {
+    const batch = (await this.#inner.remove_node(id)) as EventBatch;
+    assertBoundary(batch);
+    return batch;
+  }
+
   /** End the session and tear every runtime down. */
   async shutdown(): Promise<void> {
     await this.#inner.shutdown();
