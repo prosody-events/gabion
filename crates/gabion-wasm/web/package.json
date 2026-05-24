@@ -1,0 +1,27 @@
+{
+  "name": "gabion-gossip-visualizer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "In-browser explorable explanation of gabion's gossip-based distributed rate limiter, driven by the real gossip + CRDT core compiled to WebAssembly.",
+  "scripts": {
+    "build:wasm": "wasm-pack build .. --target web --out-dir web/src/wasm --out-name gabion_wasm",
+    "build:wasm:dev": "wasm-pack build .. --dev --target web --out-dir web/src/wasm --out-name gabion_wasm",
+    "dev": "pnpm run build:wasm:dev && vite",
+    "build": "pnpm run build:wasm && pnpm run check && vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "screenshot": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@tsconfig/svelte": "^5.0.4",
+    "@types/node": "^22.13.0",
+    "svelte": "^5.19.0",
+    "svelte-check": "^4.1.4",
+    "tslib": "^2.8.1",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.11"
+  }
+}

@@ -10,6 +10,7 @@ use bon::Builder;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "discovery-kubernetes")]
 pub mod kubernetes;
 
 pub trait PeerDiscovery {
@@ -50,6 +51,7 @@ pub struct DiscoveryConfig {
 }
 
 /// Build the configured peer discovery.
+#[cfg(feature = "discovery-kubernetes")]
 pub fn from_config(config: DiscoveryConfig) -> impl PeerDiscovery {
     kubernetes::EndpointSliceDiscovery::new(
         config.self_addr,

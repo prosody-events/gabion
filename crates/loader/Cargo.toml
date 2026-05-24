@@ -8,5 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 envoy-types.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+# `#[tokio::main]` + TCP sockets + spawned workers: host-only drivers the
+# workspace base no longer carries.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread"] }
 tonic.workspace = true

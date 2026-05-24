@@ -328,7 +328,7 @@ impl Default for StorageConfig {
 #[serde(default)]
 pub struct RuntimeTuningConfig {
     /// Optional seed for the node id. Falls back to
-    /// `whoami::fallible::hostname()` then a fixed constant.
+    /// `whoami::hostname()` then a fixed constant.
     pub node_id_seed: Option<Box<str>>,
     /// Optional deterministic peer-sampling seed. When unset, startup draws
     /// fresh OS entropy.

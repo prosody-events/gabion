@@ -32,11 +32,15 @@ mod transport;
 mod tests;
 
 pub use admin::{AdminCommand, AdminSnapshot, PeerEntry};
+#[cfg(feature = "cell-dump")]
+pub use admin::{CellDumpEntry, CellDumpSnapshot};
 pub use client::GossipClient;
-pub use clock::{Clock, FixedClock, TokioClock};
+pub use clock::{Clock, FixedClock, Ticker, TokioClock};
 pub use runtime::GossipRuntime;
 pub use store::AggregateStore;
-pub use transport::{GossipTransport, UdpTransport};
+pub use transport::GossipTransport;
+#[cfg(feature = "transport-udp")]
+pub use transport::UdpTransport;
 
 /// Configuration for [`GossipRuntime`]. Non-generic — holds scalar tuning
 /// knobs only. [`Clock`] and [`GossipTransport`] are constructor parameters

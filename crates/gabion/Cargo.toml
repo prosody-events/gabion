@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ahash.workspace = true
+# Only the Kubernetes discovery module uses ahash, so it is optional and pulled
+# by `discovery-kubernetes`. This keeps it (and its `getrandom` backend) out of
+# the wasm build entirely.
+ahash = { workspace = true, optional = true }
 async-stream.workspace = true
 bon.workspace = true
 educe.workspace = true
@@ -14,14 +17,37 @@ futures.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
 humantime.workspace = true
-k8s-openapi.workspace = true
-kube.workspace = true
+k8s-openapi = { workspace = true, optional = true }
+kube = { workspace = true, optional = true }
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 twox-hash.workspace = true
+
+# On wasm32 the `getrandom` backend is the browser's, selected by the
+# `wasm_js` feature (getrandom 0.4 needs no RUSTFLAGS cfg for this). Scoped to
+# the wasm target so native builds keep the OS (`sys_rng`) backend.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[features]
+# Default features keep the production adapters (gabiond, nginx) building
+# exactly as before. The visualizer's wasm build turns them off
+# (`--no-default-features`) to drop the host-only Kubernetes client and the
+# UDP transport, neither of which compiles for wasm32.
+default = ["discovery-kubernetes", "transport-udp"]
+# Kubernetes EndpointSlice peer discovery. Pulls `kube` + `k8s-openapi`,
+# which transitively need `hyper`/`rustls`/`tower-http` — host-only.
+discovery-kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:ahash"]
+# The production UDP datagram transport (`UdpTransport`) and the
+# socket-binding runtime constructors. Needs `tokio/net`.
+transport-udp = ["tokio/net"]
+# Per-cell admin dump (`AdminCommand::CellDump`). Built inside the gossip
+# task and used by the visualizer to render every node's CRDT cells. Off by
+# default so the production runtime never compiles the cell-iteration path.
+cell-dump = []
 
 [dev-dependencies]
 criterion.workspace = true

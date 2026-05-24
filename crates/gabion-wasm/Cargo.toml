@@ -1,0 +1,37 @@
+[package]
+name = "gabion-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# `cdylib` for the wasm artifact wasm-pack emits; `rlib` so the native test
+# harness can link the engine and shims directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The real gossip + CRDT core. A direct path dep (not the workspace one)
+# because this is the only crate that turns gabion's default features OFF —
+# Cargo forbids overriding `default-features` through workspace inheritance,
+# and flipping it at the workspace level would break the production adapters.
+# No version key, so the `workspace deps only` hygiene rule still holds. The
+# visualizer drops the Kubernetes client and UDP transport (neither builds for
+# wasm32) and adds the per-cell admin dump it renders from.
+gabion = { path = "../gabion", default-features = false, features = ["cell-dump"] }
+futures.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+tokio.workspace = true
+
+# The `#[wasm_bindgen]` surface and its serde glue only exist for the wasm
+# target; native builds (and `cargo nextest`) never compile them, keeping the
+# engine and shims testable without any wasm toolchain. `getrandom` selects its
+# browser backend from the `wasm_js` feature (no RUSTFLAGS cfg needed in 0.4).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+serde-wasm-bindgen.workspace = true
+getrandom = { workspace = true, features = ["wasm_js"] }
+
+[dev-dependencies]
+serde_json.workspace = true

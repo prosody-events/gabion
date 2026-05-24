@@ -47,6 +47,45 @@ require-nightly-fmt:
 		exit 1; \
 	}
 
+# The gabion-wasm crate (the visualizer's gossip core) cross-compiles to
+# WebAssembly. getrandom 0.4 selects its browser backend from the `wasm_js`
+# feature alone (gabion's wasm32 manifest enables it), so no RUSTFLAGS cfg is
+# needed any more.
+WASM_TARGET := wasm32-unknown-unknown
+
+.PHONY: require-wasm-target
+require-wasm-target:
+	@rustup target list --installed 2>/dev/null | grep -qx '$(WASM_TARGET)' || { \
+		printf '%s\n' \
+			'The $(WASM_TARGET) target is not installed.' \
+			'gabion-wasm compiles the gossip + CRDT core to WebAssembly for the visualizer.' \
+			'Install with: rustup target add $(WASM_TARGET)' >&2; \
+		exit 1; \
+	}
+
+# The visualizer frontend (crates/gabion-wasm/web) builds with wasm-pack + pnpm.
+WEB_DIR := crates/gabion-wasm/web
+
+.PHONY: require-wasm-pack
+require-wasm-pack:
+	@wasm-pack --version >/dev/null 2>&1 || { \
+		printf '%s\n' \
+			'wasm-pack is not installed.' \
+			'It builds the gabion-wasm crate into the package the frontend imports.' \
+			'Install with: cargo install wasm-pack --locked' >&2; \
+		exit 1; \
+	}
+
+.PHONY: require-pnpm
+require-pnpm:
+	@pnpm --version >/dev/null 2>&1 || { \
+		printf '%s\n' \
+			'pnpm is not installed.' \
+			'The visualizer frontend ($(WEB_DIR)) uses pnpm for its JS toolchain.' \
+			'Install with: corepack enable pnpm   (or: npm install -g pnpm)' >&2; \
+		exit 1; \
+	}
+
 .PHONY: help
 help:
 	@printf '%s\n' 'Gabion test targets:'
@@ -61,6 +100,7 @@ help:
 	@printf '%s\n' '  make miri-lib        Run all gabion-nginx lib tests under miri'
 	@printf '%s\n' '  make miri-all        Run miri (Stacked + Tree Borrows) on every gabion-nginx test'
 	@printf '%s\n' '  make bench-check     Compile gabion::crdt benchmarks'
+	@printf '%s\n' '  make wasm-check      Cross-compile gabion-wasm, run its native tests, and build the web frontend'
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
 	@printf '%s\n' '  make nginx-test      Build NGINX module and assert 200, 200, 429 responses'
@@ -71,7 +111,7 @@ help:
 	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local OrbStack NGINX plus Gabion server gossip test'
 	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local OrbStack gossip propagation benchmark'
 	@printf '%s\n' '  make kubernetes-clean Delete local Kubernetes test namespaces'
-	@printf '%s\n' '  make ci              Run test, miri-safety, bench-check, nginx-config, nginx-module, nginx-test'
+	@printf '%s\n' '  make ci              Run test, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
 
 .PHONY: fmt
 fmt: fmt-check
@@ -133,6 +173,20 @@ test: fmt clippy unit safety hygiene
 bench-check:
 	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion --bench crdt --no-run
 
+# Gate the visualizer's wasm bridge and frontend: (1) type-check gabion-wasm
+# for wasm32 with the browser getrandom backend (the make-or-break
+# cross-compile), (2) run its native engine + shim tests (no wasm toolchain
+# needed), and (3) build the frontend — `pnpm run build` rebuilds the wasm
+# package with wasm-pack, type-checks the Svelte/TS with svelte-check, and runs
+# the production Vite build. The Playwright screenshot/in-browser smoke
+# (`pnpm run screenshot`) downloads a browser, so it stays a documented
+# on-demand run rather than part of this gate — same treatment as smoke.cjs.
+.PHONY: wasm-check
+wasm-check: require-nextest require-wasm-target require-wasm-pack require-pnpm
+	$(CARGO_ENV) $(STABLE_CARGO) check --target $(WASM_TARGET) -p gabion-wasm
+	$(CARGO_ENV) $(NEXTEST) -p gabion-wasm
+	cd $(WEB_DIR) && pnpm install --frozen-lockfile && pnpm run build
+
 .PHONY: nginx-config
 nginx-config:
 	docker compose -f deploy/nginx/docker-compose.yml run --rm nginx-config-smoke
@@ -174,4 +228,4 @@ kubernetes-clean:
 	sh deploy/kubernetes/local-clean.sh
 
 .PHONY: ci
-ci: test miri-safety bench-check nginx-config nginx-module nginx-test
+ci: test miri-safety bench-check wasm-check nginx-config nginx-module nginx-test

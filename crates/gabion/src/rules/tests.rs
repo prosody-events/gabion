@@ -173,3 +173,24 @@ fn resolve_rate_rejects_overflow() {
     .unwrap_err();
     assert_eq!(err, RateResolveError::LimitOverflow);
 }
+
+/// The stable hasher is the cross-node identity backbone — two *separate*
+/// builds with the same rule must emit the same fingerprint. The same-build
+/// determinism the gossip tests rely on would not catch a uniform shift (e.g.
+/// a `twox-hash` feature change altering XXH3 output), so the values are pinned
+/// to known constants here.
+#[test]
+fn stable_hash_values_are_pinned() {
+    let descriptors = vec![DescriptorPattern {
+        key: "tenant".into(),
+        value: "acme".into(),
+    }];
+    assert_eq!(
+        rule_fingerprint("api.requests", &descriptors),
+        0xf0db_dfc4_2215_eb87_23c1_caf4_5793_04b4,
+    );
+    assert_eq!(
+        hash_domain("api.requests").0,
+        0xec42_b938_8905_54a6_8a84_ad23_b6e1_13ba,
+    );
+}

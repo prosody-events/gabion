@@ -16,7 +16,7 @@ mod tests;
 
 /// Seed sources tried in order:
 /// 1. Explicit `seed_override` (from config).
-/// 2. OS hostname via [`whoami::fallible::hostname`].
+/// 2. OS hostname via [`whoami::hostname`].
 /// 3. The local interface IP the kernel would use to reach the public internet
 ///    (no packet is actually sent — UDP `connect` is just an address
 ///    association).
@@ -30,7 +30,7 @@ mod tests;
 pub fn derive_identity(seed_override: Option<&str>) -> NodeIdentity {
     let seed = seed_override
         .map(str::to_owned)
-        .or_else(|| whoami::fallible::hostname().ok())
+        .or_else(|| whoami::hostname().ok())
         .or_else(local_ip_seed)
         .unwrap_or_else(random_seed);
     let node_id = NodeId(xxhash3_128::Hasher::oneshot(seed.as_bytes()));

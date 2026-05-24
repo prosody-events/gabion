@@ -163,7 +163,7 @@ fn deltas_and_expirations(
 }
 
 /// Deterministic identity for miri-compatible tests. The production
-/// `derive_identity` calls `whoami::fallible::hostname()` and
+/// `derive_identity` calls `whoami::hostname()` and
 /// `UdpSocket::bind` (network I/O), which miri rejects without
 /// `-Zmiri-disable-isolation`.
 fn test_identity(node_id_lo: u64, incarnation: u32) -> NodeIdentity {

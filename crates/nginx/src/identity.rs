@@ -20,7 +20,7 @@ mod tests;
 pub fn derive_identity(seed_override: Option<&str>) -> NodeIdentity {
     let seed = seed_override
         .map(str::to_owned)
-        .or_else(|| whoami::fallible::hostname().ok())
+        .or_else(|| whoami::hostname().ok())
         .or_else(local_ip_seed)
         .unwrap_or_else(random_seed);
     let node_id = NodeId(xxhash3_128::Hasher::oneshot(seed.as_bytes()));

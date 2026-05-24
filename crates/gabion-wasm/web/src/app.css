@@ -1,0 +1,87 @@
+/* Design tokens for the visualizer chassis. Editorial-clean light chrome
+ * wrapping a deep-neutral stage (per the locked "Atelier Stage" design).
+ * Phase 3 establishes only the chassis, type, and color tokens; the stage's
+ * PixiJS layers, charts, and inspector arrive in later phases. */
+
+:root {
+  /* Color — light chrome around a deep stage. */
+  --chrome-bg: #f4f4f1;
+  --chrome-panel: #ffffff;
+  --chrome-border: #e2e2db;
+  --stage-bg: #0e1218;
+  --stage-grid: #1b222c;
+  --ink: #1b1d22;
+  --ink-soft: #5c626b;
+  --ink-faint: #9aa0a8;
+  --on-stage: #e8ecf1;
+  --on-stage-soft: #8b95a3;
+  /* Two signal hues, colorblind-safe; never the sole encoding. */
+  --signal-converged: #2a9d6f; /* settled / agreed */
+  --signal-dirty: #d98a2b; /* in-flight / news */
+  --node-fill: #aeb8c4;
+  --node-stroke: #38414d;
+
+  /* Type — humanist sans for UI; tabular figures so numerals never jitter.
+   * Serif (narration) and mono (pseudocode) join in later phases. */
+  --font-ui:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-numeric:
+    ui-sans-serif, system-ui, sans-serif;
+
+  /* Modular type scale (1.25 / major third) off a 16px base. */
+  --text-xs: 0.64rem;
+  --text-sm: 0.8rem;
+  --text-base: 1rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.563rem;
+
+  /* 8-pt spacing grid. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 16px;
+  --space-4: 24px;
+  --space-5: 32px;
+
+  --radius: 8px;
+
+  color-scheme: light;
+  font-family: var(--font-ui);
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--chrome-bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+#app {
+  height: 100vh;
+}
+
+/* Tabular lining figures wherever a changing number is shown. */
+.numeric {
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: 'tnum' 1, 'lnum' 1;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--signal-dirty);
+  outline-offset: 2px;
+}

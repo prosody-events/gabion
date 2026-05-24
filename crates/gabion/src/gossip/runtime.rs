@@ -14,7 +14,6 @@ use std::net::SocketAddr;
 
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::Interval;
 
 use crate::crdt::{
     CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Incarnation, NodeId, Observation,
@@ -25,9 +24,13 @@ use crate::wire::{self, PacketBuf, Packets, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
-use super::clock::{Clock, TokioClock};
+#[cfg(feature = "transport-udp")]
+use super::clock::TokioClock;
+use super::clock::{Clock, Ticker};
 use super::store::AggregateStore;
-use super::transport::{GossipTransport, UdpTransport};
+use super::transport::GossipTransport;
+#[cfg(feature = "transport-udp")]
+use super::transport::UdpTransport;
 use super::{GossipConfig, GossipError};
 
 /// One peer the runtime gossips with. `node_id` is `None` until we receive
@@ -162,6 +165,7 @@ where
     _not_send: PhantomData<*const ()>,
 }
 
+#[cfg(feature = "transport-udp")]
 impl<C, S> GossipRuntime<C, S, UdpTransport, TokioClock>
 where
     C: Count,
@@ -318,7 +322,7 @@ where
         St: Stream<Item = PeerEvent>,
     {
         let mut peer_events = std::pin::pin!(peer_events);
-        let mut tick = make_tick(&self.config);
+        let mut tick = self.clock.ticker(self.config.tick_interval);
         // Once the peer-event stream returns `None` (e.g. `stream::empty()`),
         // never poll it again — otherwise it returns `Ready(None)` on every
         // iteration and the loop spins.
@@ -610,6 +614,50 @@ where
                 // Caller may have dropped the receiver; not an error.
                 let _ = reply.send(snapshot);
             }
+            #[cfg(feature = "cell-dump")]
+            AdminCommand::CellDump { reply } => {
+                let _ = reply.send(self.build_cell_dump());
+            }
+        }
+    }
+
+    /// Build a full per-cell snapshot of the store. Walks every active cell,
+    /// resolving its rule and origin descriptors into owned scalars so the
+    /// reply crosses the admin channel without aliasing `self.store`. Off the
+    /// hot path — feature-gated and only reachable via the admin arm.
+    #[cfg(feature = "cell-dump")]
+    fn build_cell_dump(&self) -> super::admin::CellDumpSnapshot {
+        use super::admin::{CellDumpEntry, CellDumpSnapshot};
+
+        let store = &self.store;
+        let rules = store.rule_dictionary();
+        let node_dict = store.node_dictionary();
+        let mut cells = Vec::with_capacity(store.stats().active_cells as usize);
+        for handle in store.active_handles() {
+            let Some(row) = store.get(handle) else {
+                continue;
+            };
+            let rule = rules.descriptor(row.key.rule);
+            let origin = node_dict.descriptor(row.key.origin);
+            let count: u64 = row.count.into();
+            cells.push(CellDumpEntry {
+                rule_fingerprint: rule.map_or(0, |r| r.fingerprint),
+                key_hash: row.key.key_hash.0,
+                bucket: row.key.bucket,
+                count,
+                last_update_millis: row.last_update_millis,
+                origin_sequence: row.origin_sequence,
+                origin_node_id: origin.map(|n| n.node_id.0),
+                origin_incarnation: origin.map(|n| n.incarnation),
+                rule_window_millis: rule.map_or(0, |r| r.window_millis),
+                rule_bucket_millis: rule.map_or(0, |r| r.bucket_millis),
+                rule_limit: rule.map_or(0, |r| r.limit),
+                applies_locally: rule.is_some_and(|r| r.applies_locally()),
+            });
+        }
+        CellDumpSnapshot {
+            local_identity: store.local_identity(),
+            cells,
         }
     }
 
@@ -811,12 +859,6 @@ async fn recv_admin(rx: &mut Option<mpsc::Receiver<AdminCommand>>) -> Option<Adm
         .expect("admin arm gated by admin_rx.is_some()")
         .recv()
         .await
-}
-
-fn make_tick(config: &GossipConfig) -> Interval {
-    let mut tick = tokio::time::interval(config.tick_interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tick
 }
 
 /// SplitMix64 — small, fast, deterministic. Used only for peer sampling so

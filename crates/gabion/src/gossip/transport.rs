@@ -9,6 +9,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 
+#[cfg(feature = "transport-udp")]
 use tokio::net::UdpSocket;
 
 /// Bidirectional datagram transport. The runtime borrows `&self.transport`
@@ -43,9 +44,11 @@ pub trait GossipTransport {
 
 /// Thin newtype over [`UdpSocket`]. Every method delegates to the inner
 /// socket — zero overhead in production.
+#[cfg(feature = "transport-udp")]
 #[derive(Debug)]
 pub struct UdpTransport(pub UdpSocket);
 
+#[cfg(feature = "transport-udp")]
 impl UdpTransport {
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
         Ok(Self(UdpSocket::bind(addr).await?))
@@ -56,6 +59,7 @@ impl UdpTransport {
     }
 }
 
+#[cfg(feature = "transport-udp")]
 impl GossipTransport for UdpTransport {
     #[inline]
     fn local_addr(&self) -> io::Result<SocketAddr> {

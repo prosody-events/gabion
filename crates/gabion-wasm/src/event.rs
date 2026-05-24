@@ -1,0 +1,139 @@
+//! The typed event log and snapshot shapes the frontend renders.
+//!
+//! Node identifiers are dense indices `0..N` (never `SocketAddr`). Every
+//! [`Event`] carries the `tick` and `virtual_ms` at which the engine observed
+//! it, so the frontend can place it on a shared timeline and scrub. `u128`
+//! identifiers serialize as hex strings (see [`crate::hex`]).
+
+use serde::{Deserialize, Serialize};
+
+use crate::hex::{option_u128_hex, u128_hex};
+
+/// One thing that happened in the simulation, stamped with when. `kind` is a
+/// `{ "type": … }`-tagged payload so the frontend can switch on it directly.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Event {
+    /// Gossip-tick index (`virtual_ms / tick_interval_ms`) the event fell in.
+    pub tick: u64,
+    /// Virtual time, in milliseconds since the session began.
+    pub virtual_ms: u64,
+    pub kind: EventKind,
+}
+
+/// The event payloads. Cell events mirror the CRDT `DeltaSink` /
+/// `ExpirationSink` rows; packet events come from the logging transport;
+/// tick / threshold events come from diffing the admin snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub enum EventKind {
+    /// A gossip tick fired on `node` (heartbeat or threshold).
+    Tick { node: u32 },
+    /// A threshold-triggered (not heartbeat) tick fired on `node`.
+    ThresholdFire { node: u32 },
+    /// `src` enqueued a packet bound for `dst`; it will be delivered.
+    PacketSent { src: u32, dst: u32, bytes: u32 },
+    /// `dst` consumed a packet from `src`.
+    PacketDelivered { src: u32, dst: u32, bytes: u32 },
+    /// `src`'s packet to `dst` was lost on the link (or `dst` had no
+    /// receiver). Distinct from [`EventKind::PacketSent`]: a dropped packet
+    /// never produces a matching delivery.
+    PacketDropped { src: u32, dst: u32, bytes: u32 },
+    /// A cell appeared on `node` (previous stored count was zero).
+    CellCreated {
+        node: u32,
+        #[serde(with = "u128_hex")]
+        rule: u128,
+        #[serde(with = "u128_hex")]
+        key: u128,
+        bucket: u32,
+        count: u64,
+    },
+    /// An existing cell's count rose on `node`.
+    CellUpdated {
+        node: u32,
+        #[serde(with = "u128_hex")]
+        rule: u128,
+        #[serde(with = "u128_hex")]
+        key: u128,
+        bucket: u32,
+        count: u64,
+    },
+    /// A cell aged out of the window on `node`.
+    CellExpired {
+        node: u32,
+        #[serde(with = "u128_hex")]
+        rule: u128,
+        #[serde(with = "u128_hex")]
+        key: u128,
+        bucket: u32,
+    },
+}
+
+/// The events produced by one `step` / `submit_request` / `step_to` call,
+/// plus the virtual time the engine reached.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EventBatch {
+    pub events: Vec<Event>,
+    /// Virtual time after this batch, in milliseconds.
+    pub virtual_ms: u64,
+    /// Gossip-tick index after this batch.
+    pub tick: u64,
+}
+
+/// Full per-node cluster state, pulled on seek / re-render. Bounded by
+/// `nodes × cell_capacity`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ClusterState {
+    pub virtual_ms: u64,
+    pub tick: u64,
+    pub nodes: Vec<NodeState>,
+    /// The ground-truth cluster total for the watched key — the
+    /// simulator-only oracle the convergence fan races toward. Summed across
+    /// every node's locally-originated hits, so it is independent of how far
+    /// gossip has propagated.
+    pub oracle_total: u64,
+}
+
+/// One node's view at snapshot time.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NodeState {
+    pub index: u32,
+    #[serde(with = "u128_hex")]
+    pub node_id: u128,
+    pub incarnation: u32,
+    /// This node's cluster-aggregate total across all cells (what its local
+    /// admission decision reads).
+    pub aggregate_total: u64,
+    pub ticks_total: u64,
+    pub threshold_fires: u64,
+    pub cells: Vec<CellView>,
+    pub peers: Vec<PeerView>,
+}
+
+/// One CRDT cell as this node currently holds it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CellView {
+    #[serde(with = "u128_hex")]
+    pub rule: u128,
+    #[serde(with = "u128_hex")]
+    pub key: u128,
+    pub bucket: u32,
+    pub count: u64,
+    /// How long since this cell was last updated, in milliseconds.
+    pub age_ms: u64,
+    /// The node index that originated this cell, if its origin identity is
+    /// still interned and known to the engine.
+    pub origin: Option<u32>,
+    /// Whether this node is itself the origin of the cell.
+    pub is_local: bool,
+}
+
+/// One peer entry from a node's gossip peer table.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PeerView {
+    /// The peer's dense node index, if the engine can resolve its address.
+    pub index: Option<u32>,
+    /// The peer's node id once an inbound packet has revealed it.
+    #[serde(with = "option_u128_hex")]
+    pub node_id: Option<u128>,
+}

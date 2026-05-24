@@ -18,7 +18,9 @@ humantime-serde.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# Host-only drivers the workspace base no longer carries: TCP/UDP sockets,
+# the multi-threaded runtime (tests), and Unix signal handling for gabiond.
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tonic.workspace = true
 tonic-health.workspace = true
 tonic-reflection.workspace = true

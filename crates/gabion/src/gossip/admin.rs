@@ -10,13 +10,24 @@ use std::net::SocketAddr;
 use tokio::sync::oneshot;
 
 use super::{CellStoreStats, NodeId, NodeIdentity};
+#[cfg(feature = "cell-dump")]
+use crate::crdt::{BucketEpoch, Incarnation};
 
-/// Request sent into the gossip runtime over the admin channel. Today the
-/// only variant is a snapshot request; new shapes (e.g. forced repair) can
-/// be added without changing the `select!` arm.
+/// Request sent into the gossip runtime over the admin channel. New shapes
+/// (e.g. forced repair) can be added without changing the `select!` arm.
 pub enum AdminCommand {
     Snapshot {
         reply: oneshot::Sender<AdminSnapshot>,
+    },
+    /// Full per-cell dump of the runtime's `CellStore`. Built inside the
+    /// gossip task — the store is owned there and cannot be aliased from the
+    /// driver, so the reply carries owned scalars (the same owned-data-out
+    /// contract as [`AdminCommand::Snapshot`]). Feature-gated behind
+    /// `cell-dump` so the production runtime never compiles the
+    /// cell-iteration path.
+    #[cfg(feature = "cell-dump")]
+    CellDump {
+        reply: oneshot::Sender<CellDumpSnapshot>,
     },
 }
 
@@ -66,4 +77,45 @@ pub struct PeerEntry {
     pub addr: SocketAddr,
     pub node_id: Option<NodeId>,
     pub peer_slot: Option<u16>,
+}
+
+/// Full per-cell view of one runtime's `CellStore`, built inside the gossip
+/// task in response to [`AdminCommand::CellDump`]. Every field is an owned
+/// scalar resolved through the rule and node dictionaries so the consumer can
+/// render counts, ages, and per-origin attribution without a second channel
+/// round-trip or any borrow of runtime internals.
+#[cfg(feature = "cell-dump")]
+#[derive(Clone, Debug)]
+pub struct CellDumpSnapshot {
+    pub local_identity: NodeIdentity,
+    pub cells: Vec<CellDumpEntry>,
+}
+
+/// One active CRDT cell. Identity fields are the resolved descriptor values,
+/// not the compact dictionary slots: `rule_fingerprint` is the rule's stable
+/// fingerprint and `origin_node_id` is the originating node's id (both `u128`,
+/// rendered as hex across the wasm boundary).
+#[cfg(feature = "cell-dump")]
+#[derive(Clone, Copy, Debug)]
+pub struct CellDumpEntry {
+    pub rule_fingerprint: u128,
+    pub key_hash: u128,
+    pub bucket: BucketEpoch,
+    pub count: u64,
+    pub last_update_millis: u64,
+    pub origin_sequence: u64,
+    /// Originating node identity, resolved through the node dictionary.
+    /// `None` if the origin slot is no longer interned (not expected for an
+    /// active cell, but the lookup is fallible by contract).
+    pub origin_node_id: Option<u128>,
+    pub origin_incarnation: Option<Incarnation>,
+    /// Rule parameters from the rule dictionary, so the consumer can do
+    /// window/bucket and limit math directly. Zeroed if the rule slot is no
+    /// longer interned.
+    pub rule_window_millis: u32,
+    pub rule_bucket_millis: u32,
+    pub rule_limit: u64,
+    /// Whether this cell's rule contributes to the local rate-limit
+    /// aggregate (`false` for wire-only rules this node hasn't registered).
+    pub applies_locally: bool,
 }
