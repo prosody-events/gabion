@@ -20,17 +20,23 @@
   // to test tooling, so the real numbers live in queryable, tabular-figure text.
   //
   // `onSendBurst` is the click-a-node affordance: clicking a disc injects a
-  // burst at that node. This is a pointer-only power gesture (the canvas is one
-  // opaque image to assistive tech); the keyboard/AT-accessible equivalent is
-  // the explicit "send to node N" control that lands with the control rail.
+  // burst at that node. `onDeleteNode` is the per-node "×" on its label, which
+  // removes that node live. Both are pointer-only power gestures (the canvas is
+  // one opaque image to assistive tech); the keyboard/AT-accessible equivalents
+  // are the explicit "send to node N" and "remove node N" controls in the rail.
+  // The "×" lives inside the aria-hidden label overlay and is `tabindex=-1`, so
+  // it is not a focusable element hidden from assistive tech — the rail owns
+  // that path.
   let {
     cluster,
     events,
     onSendBurst,
+    onDeleteNode,
   }: {
     cluster: ClusterState | null;
     events: SimEvent[];
     onSendBurst?: (node: number) => void;
+    onDeleteNode?: (id: number) => void;
   } = $props();
 
   let container: HTMLDivElement;
@@ -138,6 +144,20 @@
         >
           <span class="node-id numeric">{node.id}</span>
           <span class="node-count numeric">{node.aggregate_total}</span>
+          {#if onDeleteNode}
+            <button
+              class="node-delete"
+              type="button"
+              tabindex="-1"
+              aria-hidden="true"
+              title={`Remove node ${node.id}`}
+              onpointerdown={(event) => event.stopPropagation()}
+              onclick={(event) => {
+                event.stopPropagation();
+                onDeleteNode?.(node.id);
+              }}>×</button
+            >
+          {/if}
         </span>
       {/each}
     </div>
@@ -174,6 +194,56 @@
     flex-direction: column;
     align-items: center;
     line-height: 1;
+  }
+
+  /* When membership changes the ring re-spaces: glide each label's screen
+     address (and its size) in step with the canvas disc's GSAP glide, so the
+     number rides along with its node rather than snapping ahead of it. Only
+     fires when left/top/font-size actually change — steady play leaves them
+     untouched — and is dropped entirely under reduced motion. */
+  @media (prefers-reduced-motion: no-preference) {
+    .node-label {
+      transition:
+        left 520ms ease-in-out,
+        top 520ms ease-in-out,
+        font-size 520ms ease-in-out;
+    }
+  }
+
+  /* The per-node "×": a pointer-only affordance that removes this node live.
+     `pointer-events: auto` lifts it out of the pass-through overlay so it can
+     be clicked, while the rest of the label stays click-through for the burst
+     hit-test. Subtle until hovered, so twelve of them don't clutter the stage. */
+  .node-delete {
+    pointer-events: auto;
+    position: absolute;
+    top: -0.85em;
+    right: -1em;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.15em;
+    height: 1.15em;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--stage-bg) 65%, transparent);
+    color: var(--on-stage-soft);
+    font-size: 0.8em;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.5;
+    transition:
+      opacity 120ms ease,
+      color 120ms ease,
+      background 120ms ease;
+  }
+
+  .node-delete:hover,
+  .node-delete:focus-visible {
+    opacity: 1;
+    color: #f4b4a4;
+    background: color-mix(in srgb, var(--stage-bg) 88%, transparent);
   }
 
   .node-id {

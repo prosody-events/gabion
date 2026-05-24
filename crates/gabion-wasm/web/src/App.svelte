@@ -59,6 +59,19 @@
   let error: string | null = $state(null);
   let loading = $state(true);
 
+  // The live stable ids, in rank order — what the rail's remove/send controls
+  // pick from and the count the Cluster controls gate on. Ids have gaps under
+  // churn, so this is the authoritative live set, not a `0..count` range.
+  // `$derived.by` (a closure) rather than a bare `$derived(cluster?…)`: `cluster`
+  // is `$state` reassigned only inside async callbacks, so at this top-level
+  // position TS control-flow narrows it to its `null` initializer. Reading it
+  // through a closure keeps its declared `ClusterState | null` type (the closure
+  // may run after a reassignment) — and is what Svelte's reactivity wants too.
+  const nodeIds = $derived.by(() => (cluster?.nodes ?? []).map((n) => n.id));
+  // The visualizer's upper bound on live nodes (the design's 6–100 range); the
+  // rail disables Add here so a held key can't spawn runtimes without limit.
+  const MAX_LIVE_NODES = 100;
+
   // The rolling chart history is a plain (non-reactive) structure — 600 samples
   // under a deep `$state` proxy would cost on every frame. `chartVersion` is the
   // single reactive signal the dashboard redraws on; it ticks on each new sample.
@@ -250,6 +263,35 @@
     }
   }
 
+  /** Spawn a fresh cold-start node into the live cluster — no rebuild. It joins
+   *  by gossip and catches up by anti-entropy; the re-snapshot drives the stage
+   *  to fade it in at its ring slot and re-space the survivors. Play (or it is
+   *  already playing) to watch it converge. */
+  async function addNode(): Promise<void> {
+    if (sim === null) return;
+    try {
+      await sim.addNode();
+      applySnapshot(await sim.snapshot());
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      pause();
+    }
+  }
+
+  /** Remove the live node with stable `id`. Survivors keep their ids and
+   *  re-converge; the re-snapshot drives the stage to scale it out and glide
+   *  the survivors into the gap it leaves. */
+  async function removeNode(id: number): Promise<void> {
+    if (sim === null) return;
+    try {
+      await sim.removeNode(id);
+      applySnapshot(await sim.snapshot());
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      pause();
+    }
+  }
+
   function play(): void {
     if (playing || sim === null) return;
     playing = true;
@@ -320,16 +362,24 @@
         <ControlRail
           presets={PRESETS}
           activeId={activePreset.id}
-          nodeCount={cluster?.nodes.length ?? 0}
+          {nodeIds}
+          canAdd={nodeIds.length < MAX_LIVE_NODES}
           bind:burstHits
           {knobs}
           onSelectPreset={selectPreset}
           onApplyKnobs={() => void bootstrap()}
           onSend={(node) => void sendBurst(node)}
           onHeal={() => void heal()}
+          onAddNode={() => void addNode()}
+          onRemoveNode={(id) => void removeNode(id)}
         />
         <div class="stage-pane">
-          <Stage {cluster} {events} onSendBurst={(node) => void sendBurst(node)} />
+          <Stage
+            {cluster}
+            {events}
+            onSendBurst={(node) => void sendBurst(node)}
+            onDeleteNode={(id) => void removeNode(id)}
+          />
         </div>
         <Dashboard
           {cluster}

@@ -9,17 +9,24 @@
   let {
     presets,
     activeId,
-    nodeCount,
+    nodeIds,
+    canAdd,
     burstHits = $bindable(),
     knobs,
     onSelectPreset,
     onApplyKnobs,
     onSend,
     onHeal,
+    onAddNode,
+    onRemoveNode,
   }: {
     presets: readonly Preset[];
     activeId: string;
-    nodeCount: number;
+    // The live stable ids in rank order (with gaps after churn) — what the
+    // send and remove pickers choose from. Authoritative live set, not 0..N.
+    nodeIds: number[];
+    // Whether the cluster is below the live-node cap (gates the Add button).
+    canAdd: boolean;
     burstHits: number;
     // A live `$state` proxy owned by App: the sliders mutate its fields in place
     // (no reassignment, so it need not be `$bindable`), and `onApplyKnobs`
@@ -29,6 +36,8 @@
     onApplyKnobs: () => void;
     onSend: (node: number) => void;
     onHeal: () => void;
+    onAddNode: () => void;
+    onRemoveNode: (id: number) => void;
   } = $props();
 
   const activePreset = $derived(presets.find((p) => p.id === activeId));
@@ -40,19 +49,27 @@
   // Heal only does something after a partition or isolation, so the rail shows
   // it only for those scenarios (progressive disclosure — fewer idle controls).
   const showNetwork = $derived(activePreset?.usesNetwork ?? false);
+  const nodeCount = $derived(nodeIds.length);
 
-  let targetNode = $state(0);
-  const maxNode = $derived(Math.max(nodeCount - 1, 0));
-
-  /** Keep the node index inside the cluster — a stale value (e.g. after the
-   *  cluster shrinks) would otherwise reject at the engine boundary. */
-  function clampNode(): void {
-    targetNode = Math.min(Math.max(Math.trunc(targetNode), 0), maxNode);
-  }
+  // Send and remove both pick a live id. A bare `$state` would not follow the
+  // live set as nodes leave, so derive a *valid* selection that snaps to the
+  // first live id whenever the raw pick is no longer a member — the picker
+  // never points at a departed node.
+  let sendPick = $state<number | null>(null);
+  let removePick = $state<number | null>(null);
+  const sendTarget = $derived(
+    sendPick !== null && nodeIds.includes(sendPick) ? sendPick : (nodeIds[0] ?? null),
+  );
+  const removeTarget = $derived(
+    removePick !== null && nodeIds.includes(removePick) ? removePick : (nodeIds[0] ?? null),
+  );
 
   function send(): void {
-    clampNode();
-    onSend(targetNode);
+    if (sendTarget !== null) onSend(sendTarget);
+  }
+
+  function remove(): void {
+    if (removeTarget !== null) onRemoveNode(removeTarget);
   }
 </script>
 
@@ -124,19 +141,32 @@
   {/if}
 
   <section class="group">
+    <h2>Cluster</h2>
+    <p class="hint">Nodes join and leave live — no rebuild. Ids are stable.</p>
+    <button class="secondary" onclick={onAddNode} disabled={!canAdd}>+ Add node</button>
+    {#if nodeCount > 1}
+      <div class="field">
+        <label for="remove-node">Remove</label>
+        <select id="remove-node" class="numeric" bind:value={removePick}>
+          {#each nodeIds as id (id)}
+            <option value={id}>node {id}</option>
+          {/each}
+        </select>
+      </div>
+      <button class="secondary" onclick={remove}>Remove node</button>
+    {/if}
+  </section>
+
+  <section class="group">
     <h2>Send a burst</h2>
     <p class="hint">Pick a node, or click any disc on the stage.</p>
     <div class="field">
       <label for="burst-node">Node</label>
-      <input
-        id="burst-node"
-        class="numeric"
-        type="number"
-        min="0"
-        max={maxNode}
-        bind:value={targetNode}
-        onchange={clampNode}
-      />
+      <select id="burst-node" class="numeric" bind:value={sendPick} disabled={nodeCount === 0}>
+        {#each nodeIds as id (id)}
+          <option value={id}>node {id}</option>
+        {/each}
+      </select>
     </div>
     <div class="field">
       <label for="burst-hits">Hits</label>
@@ -226,7 +256,8 @@
     color: var(--ink-soft);
   }
 
-  input.numeric {
+  input.numeric,
+  select.numeric {
     width: 100%;
     padding: var(--space-1) var(--space-2);
     border: 1px solid var(--chrome-border);

@@ -108,8 +108,10 @@ test('clicking a node injects a burst at the current virtual time', async ({ pag
 });
 
 // The control rail is the keyboard/AT-accessible equivalent of click-a-node:
-// type a node index, press Send, and the same burst lands — no pointer geometry
-// involved. Drives the labelled inputs and the button by their accessible names.
+// pick a live node id, press Send, and the same burst lands — no pointer
+// geometry involved. The picker is a select of live stable ids (ids gap under
+// churn, so a free-typed number could miss a live node). Drives the labelled
+// control and the button by their accessible names.
 test('the control rail sends a burst to the chosen node', async ({ page }) => {
   await page.goto('/');
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
@@ -117,10 +119,96 @@ test('the control rail sends a burst to the chosen node', async ({ page }) => {
   const target = page.locator('.node-label[data-id="7"]');
   await expect(target.locator('.node-count')).toHaveText('0');
 
-  await page.getByLabel('Node', { exact: true }).fill('7');
+  await page.getByLabel('Node', { exact: true }).selectOption('7');
   await page.getByRole('button', { name: 'Send burst' }).click();
 
   await expect(target.locator('.node-count')).toHaveText(CLICK_HITS);
+});
+
+// Live join: "+ Add node" spawns a fresh cold-start member into a converged
+// cluster — no rebuild. It takes the next stable id (12, never reused) and joins
+// by gossip, then catches up to the settled total by anti-entropy. The
+// screenshots are the proof the join *reads* right: the newcomer fades/scales in
+// at its ring slot while the survivors glide to re-space around it.
+test('adding a node joins it live and it catches up by gossip', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  // Converge the seeded burst across all 12 nodes first, so the newcomer joins a
+  // settled cluster — the clearest "catch up by gossip" story.
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect
+    .poll(
+      async () => {
+        const counts = await page.locator(COUNTS).allTextContents();
+        return counts.filter((t) => t.trim() === SEED_TOTAL).length;
+      },
+      { timeout: 15_000, message: 'cluster did not converge before the add' },
+    )
+    .toBe(NODES);
+  await page.getByRole('button', { name: 'Pause' }).click();
+
+  // Add a fresh node: it takes id 12 and joins cold (its view starts at zero).
+  await page.getByRole('button', { name: '+ Add node' }).click();
+  const newcomer = page.locator('.node-label[data-id="12"]');
+  await expect(newcomer.locator('.node-count')).toHaveText('0');
+  await expect(page.locator(COUNTS)).toHaveCount(NODES + 1);
+  await page.screenshot({ path: 'screenshots/ring-node-added.png' });
+
+  // Play on: the newcomer catches up to the settled total by anti-entropy — the
+  // survivors push it their cells until its view matches the cluster.
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect(newcomer.locator('.node-count')).toHaveText(SEED_TOTAL, { timeout: 15_000 });
+  await page.getByRole('button', { name: 'Pause' }).click();
+  await page.screenshot({ path: 'screenshots/ring-node-added-caughtup.png' });
+
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
+// Live leave via the stage "×": removing a mid-ring node drops exactly that one.
+// Its stable id leaves a *gap* — neighbours 4 and 6 keep their ids, no renumber —
+// and the survivors re-space to close the ring. The "×" is a pointer-only
+// affordance whose `stopPropagation` keeps the click off the burst hit-test.
+test('removing a node via its stage × leaves a stable-id gap and re-spaces', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+
+  await page.locator('.node-label[data-id="5"] .node-delete').click();
+
+  // Node 5 is gone, 12 → 11 nodes; 4 and 6 remain (a gap at 5, not a renumber).
+  await expect(page.locator('.node-label[data-id="5"]')).toHaveCount(0);
+  await expect(page.locator('.node-label[data-id="4"]')).toHaveCount(1);
+  await expect(page.locator('.node-label[data-id="6"]')).toHaveCount(1);
+  await expect(page.locator(COUNTS)).toHaveCount(NODES - 1);
+  // Node 5 was empty (only node 0 seeded), so removing it loses no count — node 0
+  // still holds the burst.
+  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText(SEED_TOTAL);
+  await page.screenshot({ path: 'screenshots/ring-node-removed.png' });
+
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
+// The rail's Cluster control is the keyboard/AT-accessible equivalent of the
+// stage "×": pick a live id, press Remove, and that node leaves.
+test('the rail Cluster control removes the chosen node', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+
+  await page.getByLabel('Remove', { exact: true }).selectOption('8');
+  // `exact` so this rail button isn't ambiguous with the stage "×" buttons,
+  // whose accessible name is "Remove node 5", "Remove node 6", …
+  await page.getByRole('button', { name: 'Remove node', exact: true }).click();
+
+  await expect(page.locator('.node-label[data-id="8"]')).toHaveCount(0);
+  await expect(page.locator(COUNTS)).toHaveCount(NODES - 1);
 });
 
 // Scenario presets rebuild the cluster from a fresh config + opening seed.
