@@ -23,10 +23,12 @@ use crate::event::EventKind;
 /// because everything runs on one `LocalSet` (wasm is single-threaded).
 pub type EventLog = Rc<RefCell<Vec<EventKind>>>;
 
-/// Maps each node's gossip address to its dense `0..N` index. Built once by
-/// the engine and shared with every transport so packet events carry indices,
-/// not `SocketAddr`s.
-pub type AddressBook = Rc<HashMap<SocketAddr, u32>>;
+/// Maps each node's gossip address to its stable id. Shared with every
+/// transport so packet events carry ids, not `SocketAddr`s. Mutable
+/// (`RefCell`) because nodes join and leave at runtime: the engine inserts a
+/// newcomer's address on add and removes a departed one on delete, and the
+/// already-running transports resolve against the live map.
+pub type AddressBook = Rc<RefCell<HashMap<SocketAddr, u32>>>;
 
 /// Downstream aggregate store that doubles as the cluster-aggregate read
 /// surface (like the production `DashMapStore`) and the cell-event source.
@@ -166,20 +168,20 @@ impl GossipTransport for LoggingSimTransport {
         // Only a successful (non-`WouldBlock`) send is a network event; the
         // re-queued `WouldBlock` path is backpressure, not a packet.
         if let Ok(n) = result
-            && let Some(&dst_index) = self.addresses.get(&dst)
+            && let Some(&dst_id) = self.addresses.borrow().get(&dst)
         {
             let delivered = self.router.received_count(dst) > before;
             let bytes = n as u32;
             let event = if delivered {
                 EventKind::PacketSent {
                     src: self.src,
-                    dst: dst_index,
+                    dst: dst_id,
                     bytes,
                 }
             } else {
                 EventKind::PacketDropped {
                     src: self.src,
-                    dst: dst_index,
+                    dst: dst_id,
                     bytes,
                 }
             };
@@ -191,10 +193,10 @@ impl GossipTransport for LoggingSimTransport {
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let result = self.inner.recv_from(buf).await;
         if let Ok((n, src_addr)) = result
-            && let Some(&src_index) = self.addresses.get(&src_addr)
+            && let Some(&src_id) = self.addresses.borrow().get(&src_addr)
         {
             self.log.borrow_mut().push(EventKind::PacketDelivered {
-                src: src_index,
+                src: src_id,
                 dst: self.src,
                 bytes: n as u32,
             });

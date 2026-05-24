@@ -1,9 +1,13 @@
 //! The typed event log and snapshot shapes the frontend renders.
 //!
-//! Node identifiers are dense indices `0..N` (never `SocketAddr`). Every
-//! [`Event`] carries the `tick` and `virtual_ms` at which the engine observed
-//! it, so the frontend can place it on a shared timeline and scrub. `u128`
-//! identifiers serialize as hex strings (see [`crate::hex`]).
+//! Nodes are identified by a **stable id** (never `SocketAddr`, never a dense
+//! array position): the id is assigned once when the node joins and never
+//! reused, so it survives other nodes joining and leaving without renumbering.
+//! Ids therefore have gaps once a node has been removed — a gap *is* the honest
+//! record that a member left. Every [`Event`] carries the `tick` and
+//! `virtual_ms` at which the engine observed it, so the frontend can place it
+//! on a shared timeline and scrub. `u128` identifiers serialize as hex strings
+//! (see [`crate::hex`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -97,10 +101,9 @@ pub struct ClusterState {
 /// One node's view at snapshot time.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NodeState {
-    pub index: u32,
-    #[serde(with = "u128_hex")]
-    pub node_id: u128,
-    pub incarnation: u32,
+    /// The node's stable id (see the module note). The gossip `NodeId` is a
+    /// pure function of this (`id·256 + 1`), so it is not duplicated here.
+    pub id: u32,
     /// This node's cluster-aggregate total across all cells (what its local
     /// admission decision reads).
     pub aggregate_total: u64,
@@ -121,8 +124,8 @@ pub struct CellView {
     pub count: u64,
     /// How long since this cell was last updated, in milliseconds.
     pub age_ms: u64,
-    /// The node index that originated this cell, if its origin identity is
-    /// still interned and known to the engine.
+    /// The stable id of the node that originated this cell, if its origin
+    /// identity is still interned and known to the engine.
     pub origin: Option<u32>,
     /// Whether this node is itself the origin of the cell.
     pub is_local: bool,
@@ -131,9 +134,11 @@ pub struct CellView {
 /// One peer entry from a node's gossip peer table.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PeerView {
-    /// The peer's dense node index, if the engine can resolve its address.
-    pub index: Option<u32>,
-    /// The peer's node id once an inbound packet has revealed it.
+    /// The peer's stable id, if the engine can resolve its address.
+    pub id: Option<u32>,
+    /// The peer's gossip node id once an inbound packet has revealed it
+    /// (distinct from `id`: this is the on-the-wire identity the peer
+    /// announced, unknown until the first packet from it arrives).
     #[serde(with = "option_u128_hex")]
     pub node_id: Option<u128>,
 }

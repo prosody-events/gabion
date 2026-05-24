@@ -94,6 +94,22 @@ async fn set_link(tx: &mpsc::Sender<Command>, src: u32, dst: u32, policy: LinkPo
     rx.await.unwrap().expect("set_link_policy succeeded");
 }
 
+async fn add_node(tx: &mpsc::Sender<Command>) -> EventBatch {
+    let (reply, rx) = oneshot::channel();
+    tx.send(Command::AddNode { reply }).await.unwrap();
+    rx.await.unwrap()
+}
+
+async fn remove_node(tx: &mpsc::Sender<Command>, id: u32) -> EventBatch {
+    let (reply, rx) = oneshot::channel();
+    tx.send(Command::RemoveNode { id, reply }).await.unwrap();
+    rx.await.unwrap().expect("remove_node succeeded")
+}
+
+fn node_ids(state: &ClusterState) -> Vec<u32> {
+    state.nodes.iter().map(|n| n.id).collect()
+}
+
 /// Phase 0.5: a spawned engine survives many `step` commands, with the gossip
 /// tick index and per-node `ticks_total` accumulating monotonically.
 #[test]
@@ -293,6 +309,143 @@ fn many_nodes_receive_every_tick_deterministically() {
         "every node must consume all 10 ticks (no coalescing); got {first:?}"
     );
     assert_eq!(run(), first, "tick delivery must be deterministic at N=32");
+}
+
+/// A node added after the cluster has converged catches up to the cluster
+/// total by anti-entropy — survivors push their settled cells to the cold
+/// newcomer — and it appears in snapshots under a fresh stable id (`N`, the
+/// next never-reused id) without renumbering any survivor.
+#[test]
+fn added_node_catches_up_by_gossip() {
+    with_engine(test_config(3), |tx| async move {
+        // Seed and converge a 3-node cluster on a single burst.
+        submit(&tx, 0, WATCHED_KEY, 50).await;
+        for _ in 0..10 {
+            step(&tx, 100).await;
+        }
+        let before = snapshot(&tx).await;
+        assert_eq!(node_ids(&before), vec![0, 1, 2]);
+        assert!(
+            before.nodes.iter().all(|n| n.aggregate_total == 50),
+            "cluster converged before the add"
+        );
+
+        // Add a fresh member. It takes id 3 (next_id); survivors keep 0..2.
+        add_node(&tx).await;
+        let joined = snapshot(&tx).await;
+        assert_eq!(
+            node_ids(&joined),
+            vec![0, 1, 2, 3],
+            "ids are stable; the newcomer is 3, not a renumber"
+        );
+        let newcomer = joined.nodes.iter().find(|n| n.id == 3).unwrap();
+        assert_eq!(newcomer.aggregate_total, 0, "the newcomer starts cold");
+
+        // Drive gossip; the newcomer catches up to the settled total.
+        for _ in 0..15 {
+            step(&tx, 100).await;
+        }
+        let after = snapshot(&tx).await;
+        assert!(
+            after.nodes.iter().all(|n| n.aggregate_total == 50),
+            "every node, the newcomer included, converges on 50: {:?}",
+            after
+                .nodes
+                .iter()
+                .map(|n| (n.id, n.aggregate_total))
+                .collect::<Vec<_>>(),
+        );
+    });
+}
+
+/// Removing a node drops it from snapshots — its stable id leaves a gap rather
+/// than renumbering survivors — and the survivors keep gossiping correctly: a
+/// burst after the removal still converges across exactly the remaining nodes.
+#[test]
+fn removed_node_leaves_and_survivors_keep_converging() {
+    with_engine(test_config(3), |tx| async move {
+        submit(&tx, 0, WATCHED_KEY, 50).await;
+        for _ in 0..10 {
+            step(&tx, 100).await;
+        }
+
+        // Remove the middle node by its stable id.
+        remove_node(&tx, 1).await;
+        let removed = snapshot(&tx).await;
+        assert_eq!(
+            node_ids(&removed),
+            vec![0, 2],
+            "node 1 left; 0 and 2 keep their ids (a gap, not a renumber)"
+        );
+        assert!(
+            removed.nodes.iter().all(|n| n.aggregate_total == 50),
+            "survivors still hold the converged total"
+        );
+
+        // The survivors keep gossiping: a new burst on a survivor converges
+        // across exactly the two that remain.
+        submit(&tx, 2, WATCHED_KEY, 10).await;
+        for _ in 0..15 {
+            step(&tx, 100).await;
+        }
+        let after = snapshot(&tx).await;
+        assert_eq!(after.oracle_total, 60);
+        assert_eq!(node_ids(&after), vec![0, 2]);
+        assert!(
+            after.nodes.iter().all(|n| n.aggregate_total == 60),
+            "the two survivors converge on 60: {:?}",
+            after
+                .nodes
+                .iter()
+                .map(|n| (n.id, n.aggregate_total))
+                .collect::<Vec<_>>(),
+        );
+    });
+}
+
+/// Determinism across churn: the same command script — including a join and a
+/// leave — yields an identical event log *and* identical stable ids on every
+/// run. This is the invariant the shareable-URL replay relies on once churn is
+/// part of the command stream.
+#[test]
+fn churn_script_is_deterministic() {
+    fn run() -> (Vec<EventBatch>, Vec<u32>) {
+        let mut batches = Vec::new();
+        let mut ids = Vec::new();
+        with_engine(test_config(4), |tx| {
+            let batches = &mut batches;
+            let ids = &mut ids;
+            async move {
+                batches.push(submit(&tx, 0, WATCHED_KEY, 7).await);
+                batches.push(add_node(&tx).await);
+                for _ in 0..4 {
+                    batches.push(step(&tx, 100).await);
+                }
+                batches.push(remove_node(&tx, 1).await);
+                for _ in 0..4 {
+                    batches.push(step(&tx, 100).await);
+                }
+                *ids = node_ids(&snapshot(&tx).await);
+            }
+        });
+        (batches, ids)
+    }
+
+    let (first_batches, first_ids) = run();
+    let (second_batches, second_ids) = run();
+    assert_eq!(
+        first_batches, second_batches,
+        "identical churn script must yield identical event batches"
+    );
+    assert_eq!(
+        first_ids, second_ids,
+        "identical churn script must yield identical stable ids"
+    );
+    assert_eq!(
+        first_ids,
+        vec![0, 2, 3, 4],
+        "built 0..3, joined id 4, removed id 1 ⇒ a {{0,2,3,4}} cluster"
+    );
 }
 
 /// The wire form renders 128-bit identifiers as hex strings (JS-safe) while

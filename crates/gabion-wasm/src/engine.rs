@@ -17,14 +17,17 @@
 //! `Builder::new_current_thread().enable_all().start_paused(true)`); virtual
 //! time only moves when a `Step` / `StepTo` handler calls `sim_advance`.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
+use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gabion::crdt::{
     BucketEpoch, CellStore, CellStoreConfig, KeyHash, NodeId, NodeIdentity, RuleDescriptor,
 };
+use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::sim::{LinkPolicy, SimRouter};
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipConfig, GossipError,
@@ -81,10 +84,12 @@ pub enum EngineError {
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(
-        "node index {got} is out of range: this cluster has {nodes} nodes \
-         (valid indices 0..{nodes})."
+        "node {id} is not a member of this cluster — it never joined, or it has \
+         already left. Node ids are stable and are never reused, so a removed \
+         node's id stays gone. Pick an id from the current cluster (the live \
+         ids appear on the stage and in the Cluster control)."
     )]
-    NodeOutOfRange { got: u32, nodes: usize },
+    UnknownNode { id: u32 },
     #[error(
         "the gossip runtime for node {node} has stopped, so the request could \
          not be recorded. The simulation has ended; reload to start over."
@@ -113,6 +118,21 @@ pub enum Command {
         dst: u32,
         policy: LinkPolicyKind,
         reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    /// Restore every directed link between live nodes to lossless `Pass` —
+    /// undo any partition or per-link drop. Engine-driven (it owns the live
+    /// membership) so it stays correct as nodes join and leave.
+    Heal { reply: oneshot::Sender<()> },
+    /// Spawn a fresh cold-start member that bootstraps knowing every current
+    /// node. The newcomer takes the next never-reused id; survivors are told it
+    /// joined so they gossip to it. Replies with the events the join produced.
+    AddNode { reply: oneshot::Sender<EventBatch> },
+    /// Remove the node with stable id `id`: tell every survivor it left, stop
+    /// its runtime, and unbind its transport. Replies with the events the
+    /// removal produced, or [`EngineError::UnknownNode`] if no such live node.
+    RemoveNode {
+        id: u32,
+        reply: oneshot::Sender<Result<EventBatch, EngineError>>,
     },
     /// Advance virtual time by `delta_ms`, collecting the events produced.
     Step {
@@ -167,6 +187,16 @@ async fn engine_loop(
             } => {
                 let _ = reply.send(state.set_link_policy(src, dst, policy));
             }
+            Command::Heal { reply } => {
+                state.heal();
+                let _ = reply.send(());
+            }
+            Command::AddNode { reply } => {
+                let _ = reply.send(state.add_node().await);
+            }
+            Command::RemoveNode { id, reply } => {
+                let _ = reply.send(state.remove_node(id).await);
+            }
             Command::Step { delta_ms, reply } => {
                 let _ = reply.send(state.step(delta_ms).await);
             }
@@ -184,14 +214,28 @@ async fn engine_loop(
     Ok(())
 }
 
-/// One node's handles, owned by the engine for the session.
+/// One node's handles, owned by the engine for the session. The `Vec` of these
+/// stays insertion-ordered (append on add, `remove` on delete), so a handle's
+/// position in the `Vec` is the node's **rank** — what the frontend turns into
+/// a ring slot — while `id` is its stable identity. The two are equal only
+/// until the first removal opens a gap.
 struct NodeHandle {
+    /// Stable id (see [`crate::event`]). Assigned once, never reused.
+    id: u32,
+    /// This node's gossip address, `127.0.0.1:(BASE_PORT + id)`. Cached so a
+    /// removal can unbind it without recomputing.
+    addr: SocketAddr,
     client: GossipClient<Count>,
     aggregate: Rc<EventEmittingAggregateStore<Count>>,
     admin_tx: mpsc::Sender<AdminCommand>,
     /// Fires one gossip tick on this node (its `ManualClock`'s ticker drains
     /// the matching receiver).
     tick_tx: mpsc::Sender<()>,
+    /// The discovery stream this node's runtime watches. The engine pushes
+    /// `PeerEvent::Added`/`Removed` here as other nodes join and leave, so
+    /// membership is dynamic rather than the static `stream::empty()` the bench
+    /// uses. An `UnboundedReceiver` *is* a `Stream`, which is what `run` wants.
+    peer_tx: UnboundedSender<PeerEvent>,
     join: JoinHandle<Result<(), GossipError>>,
     identity: NodeIdentity,
 }
@@ -203,9 +247,14 @@ struct EngineState {
     router: SimRouter,
     nodes: Vec<NodeHandle>,
     addresses: AddressBook,
-    /// Reverse map: node id → dense index, for resolving cell origins and
-    /// peer identities back to indices.
+    /// Reverse map: gossip `NodeId` (the `u128` on the wire) → stable id, for
+    /// resolving a cell's origin identity back to the node that owns it. An
+    /// entry is removed when its node leaves.
     node_id_index: HashMap<u128, u32>,
+    /// The next stable id to hand out. Monotonic and never reset, so ids are
+    /// never reused across joins and leaves — a departed node's id stays gone,
+    /// and addresses / gossip `NodeId`s derived from it never collide.
+    next_id: u32,
     log: EventLog,
     /// Shared virtual time every node reads. The engine moves it and fires
     /// gossip ticks per node, so the runtimes never touch `tokio::time` (which
@@ -220,162 +269,182 @@ struct EngineState {
 
 impl EngineState {
     fn build(config: SimConfig) -> Self {
-        let router = SimRouter::with_channel_capacity(256);
-        let addrs: Vec<SocketAddr> = (0..config.nodes)
-            .map(|i| SocketAddr::from(([127, 0, 0, 1], BASE_PORT + i as u16)))
-            .collect();
-
-        let mut address_map = HashMap::with_capacity(addrs.len());
-        for (i, addr) in addrs.iter().enumerate() {
-            address_map.insert(*addr, i as u32);
-        }
-        let addresses: AddressBook = Rc::new(address_map);
-        let log: EventLog = Rc::new(std::cell::RefCell::new(Vec::new()));
-
-        // Storage sizing mirrors the bench: scale per-origin capacities with N
-        // but never below the server's production floors.
-        let cell_capacity = config
-            .cell_capacity
-            .max(((config.nodes as u32).saturating_mul(4)).max(4_096));
-        let node_dict_capacity =
-            (((config.nodes as u32) + 16).max(1_024)).min(u16::MAX as u32) as u16;
-        let peer_capacity = (((config.nodes as u32) + 16).max(256)).min(u16::MAX as u32) as u16;
-        let local_dirty_capacity = (cell_capacity as usize).max(8_192);
-        let forwarded_dirty_capacity = ((cell_capacity as usize) * 16).max(65_536);
-        let max_cells_per_tick = (config.nodes * 4).max(4_096);
-        let max_cells_per_frame = (max_cells_per_tick as u32).max(4_096);
-        let tick_interval = Duration::from_millis(config.tick_interval_ms);
-
+        let log: EventLog = Rc::new(RefCell::new(Vec::new()));
+        let addresses: AddressBook = Rc::new(RefCell::new(HashMap::new()));
         // One shared time base for the whole cluster; each node gets its own
         // tick channel so a fired tick queues rather than coalescing.
-        let now: SharedNow = Rc::new(std::cell::Cell::new(0));
+        let now: SharedNow = Rc::new(Cell::new(0));
 
-        let mut nodes = Vec::with_capacity(config.nodes);
-        let mut node_id_index = HashMap::with_capacity(config.nodes);
-        for (i, addr) in addrs.iter().enumerate() {
-            let identity = NodeIdentity::new(NodeId((i as u128) * 0x100 + 1), 1);
-            node_id_index.insert(identity.node_id.0, i as u32);
+        let initial_nodes = config.nodes;
+        let mut state = Self {
+            config,
+            router: SimRouter::with_channel_capacity(256),
+            nodes: Vec::with_capacity(initial_nodes),
+            addresses,
+            node_id_index: HashMap::with_capacity(initial_nodes),
+            next_id: 0,
+            log,
+            now,
+            virtual_ms: 0,
+            oracle_total: 0,
+        };
 
-            let mut store = CellStore::<Count>::new(
-                CellStoreConfig {
-                    cell_capacity,
-                    rule_dictionary_capacity: 64,
-                    node_dictionary_capacity: node_dict_capacity,
-                    local_dirty_capacity,
-                    forwarded_dirty_capacity,
-                    peer_capacity,
-                },
-                identity,
-            );
-            // Footgun guard: intern the watched rule with the configured
-            // window/bucket *before* any request. Unknown rules otherwise
-            // intern with `RuleDescriptor::default()` (60 s / 1 s), making
-            // bucket and expiry math silently wrong.
-            store.intern_rule(RuleDescriptor {
-                fingerprint: config.rule_fingerprint,
-                window_millis: config.rule_window_ms,
-                bucket_millis: config.rule_bucket_ms,
-                limit: config.rule_limit,
-                flags: 0,
-                local_rule_id: LOCAL_RULE_ID,
-            });
-
-            let bootstrap = addrs
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, a)| a)
-                .collect();
-
-            let transport = LoggingSimTransport::new(
-                router.bind(*addr),
-                router.clone(),
-                i as u32,
-                addresses.clone(),
-                log.clone(),
-            );
-
-            let gossip_cfg = GossipConfig {
-                local_identity: identity,
-                cluster_id_hash: CLUSTER_ID_HASH,
-                bootstrap_peers: bootstrap,
-                fanout: config.fanout,
-                max_cells_per_tick,
-                wire_limits: FrameLimits {
-                    max_payload_bytes: 1_400,
-                    max_cells: max_cells_per_frame,
-                },
-                send_queue_capacity: 128,
-                limit_queue_capacity: 8_192,
-                tick_interval,
-                auth_key: None,
-                rng_seed: config.rng_seed.wrapping_add(i as u64),
-                target_err_bps: config.target_err_bps,
-                min_emit_interval: Duration::from_millis(config.min_emit_interval_ms),
-            };
-
-            let aggregate = Rc::new(EventEmittingAggregateStore::<Count>::new(
-                i as u32,
-                log.clone(),
-            ));
-            let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
-            let (clock, tick_tx) = ManualClock::new(now.clone());
-            let (runtime, client) = GossipRuntime::from_parts_with_admin(
-                transport,
-                clock,
-                gossip_cfg,
-                store,
-                aggregate.clone(),
-                Some(admin_rx),
-            );
-            let join = tokio::task::spawn_local(runtime.run(futures::stream::empty()));
-            nodes.push(NodeHandle {
-                client,
-                aggregate,
-                admin_tx,
-                tick_tx,
-                join,
-                identity,
-            });
+        // The initial members are ids 0..N, so the address of id `i` is
+        // `BASE_PORT + i` — the same set every member bootstraps against, and
+        // the set a later newcomer will be handed too.
+        let addrs: Vec<SocketAddr> = (0..initial_nodes).map(|i| addr_of_id(i as u32)).collect();
+        for _ in 0..initial_nodes {
+            let id = state.next_id;
+            state.next_id += 1;
+            state.spawn_node(id, &addrs);
         }
 
         // Apply the uniform i.i.d. loss model to every directed link.
-        if config.uniform_loss > 0.0 {
+        if state.config.uniform_loss > 0.0 {
+            let p = state.config.uniform_loss;
             for src in &addrs {
                 for dst in &addrs {
                     if src != dst {
-                        router.set_link_policy(
-                            *src,
-                            *dst,
-                            LinkPolicy::DropProb {
-                                p: config.uniform_loss,
-                            },
-                        );
+                        state
+                            .router
+                            .set_link_policy(*src, *dst, LinkPolicy::DropProb { p });
                     }
                 }
             }
         }
 
-        Self {
-            config,
-            router,
-            nodes,
-            addresses,
-            node_id_index,
-            log,
-            now,
-            virtual_ms: 0,
-            oracle_total: 0,
-        }
+        state
     }
 
-    fn addr_of(&self, index: u32) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], BASE_PORT + index as u16))
+    /// Build, spawn, and register one node with stable id `id`, bootstrapped
+    /// against `bootstrap` (its own address is filtered out if present). The
+    /// single node-construction path: both [`EngineState::build`] and
+    /// [`EngineState::add_node`] route through here, so the rule-intern footgun
+    /// guard below is honored identically on every path.
+    ///
+    /// Per-node storage is sized from the *initial* `config.nodes`, but every
+    /// capacity floors at a value that holds the whole `MAX_NODES`-bounded
+    /// cluster (node dictionary ≥ 1024, peer table ≥ 256, cells ≥ 4096). So a
+    /// node added to a cluster that started small still has room for every
+    /// peer it will ever learn about — no resize on join.
+    fn spawn_node(&mut self, id: u32, bootstrap: &[SocketAddr]) {
+        let addr = addr_of_id(id);
+        let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
+
+        let n = self.config.nodes as u32;
+        let cell_capacity = self
+            .config
+            .cell_capacity
+            .max((n.saturating_mul(4)).max(4_096));
+        let node_dict_capacity = ((n + 16).max(1_024)).min(u16::MAX as u32) as u16;
+        let peer_capacity = ((n + 16).max(256)).min(u16::MAX as u32) as u16;
+        let local_dirty_capacity = (cell_capacity as usize).max(8_192);
+        let forwarded_dirty_capacity = ((cell_capacity as usize) * 16).max(65_536);
+        let max_cells_per_tick = (self.config.nodes * 4).max(4_096);
+        let max_cells_per_frame = (max_cells_per_tick as u32).max(4_096);
+        let tick_interval = Duration::from_millis(self.config.tick_interval_ms);
+
+        let mut store = CellStore::<Count>::new(
+            CellStoreConfig {
+                cell_capacity,
+                rule_dictionary_capacity: 64,
+                node_dictionary_capacity: node_dict_capacity,
+                local_dirty_capacity,
+                forwarded_dirty_capacity,
+                peer_capacity,
+            },
+            identity,
+        );
+        // Footgun guard: intern the watched rule with the configured
+        // window/bucket *before* any request. Unknown rules otherwise intern
+        // with `RuleDescriptor::default()` (60 s / 1 s), making bucket and
+        // expiry math silently wrong.
+        store.intern_rule(RuleDescriptor {
+            fingerprint: self.config.rule_fingerprint,
+            window_millis: self.config.rule_window_ms,
+            bucket_millis: self.config.rule_bucket_ms,
+            limit: self.config.rule_limit,
+            flags: 0,
+            local_rule_id: LOCAL_RULE_ID,
+        });
+
+        let bootstrap_peers: Vec<SocketAddr> =
+            bootstrap.iter().copied().filter(|a| *a != addr).collect();
+
+        let transport = LoggingSimTransport::new(
+            self.router.bind(addr),
+            self.router.clone(),
+            id,
+            self.addresses.clone(),
+            self.log.clone(),
+        );
+
+        let gossip_cfg = GossipConfig {
+            local_identity: identity,
+            cluster_id_hash: CLUSTER_ID_HASH,
+            bootstrap_peers,
+            fanout: self.config.fanout,
+            max_cells_per_tick,
+            wire_limits: FrameLimits {
+                max_payload_bytes: 1_400,
+                max_cells: max_cells_per_frame,
+            },
+            send_queue_capacity: 128,
+            limit_queue_capacity: 8_192,
+            tick_interval,
+            auth_key: None,
+            rng_seed: self.config.rng_seed.wrapping_add(id as u64),
+            target_err_bps: self.config.target_err_bps,
+            min_emit_interval: Duration::from_millis(self.config.min_emit_interval_ms),
+        };
+
+        let aggregate = Rc::new(EventEmittingAggregateStore::<Count>::new(
+            id,
+            self.log.clone(),
+        ));
+        let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
+        let (clock, tick_tx) = ManualClock::new(self.now.clone());
+        let (runtime, client) = GossipRuntime::from_parts_with_admin(
+            transport,
+            clock,
+            gossip_cfg,
+            store,
+            aggregate.clone(),
+            Some(admin_rx),
+        );
+        // The discovery stream: an `UnboundedReceiver` is already a
+        // `Stream<Item = PeerEvent>`, so it drops straight into `run` where the
+        // bench passes `stream::empty()`. The engine keeps `peer_tx` to feed
+        // this node membership changes as others join and leave.
+        let (peer_tx, peer_rx) = unbounded::<PeerEvent>();
+        let join = tokio::task::spawn_local(runtime.run(peer_rx));
+
+        self.node_id_index.insert(identity.node_id.0, id);
+        self.addresses.borrow_mut().insert(addr, id);
+        self.nodes.push(NodeHandle {
+            id,
+            addr,
+            client,
+            aggregate,
+            admin_tx,
+            tick_tx,
+            peer_tx,
+            join,
+            identity,
+        });
     }
 
     fn current_tick(&self) -> u64 {
         self.virtual_ms / self.config.tick_interval_ms.max(1)
+    }
+
+    /// Position in the `nodes` `Vec` of the live node with stable id `id`,
+    /// or `None` if no live node has it. The `Vec` is small (≤ `MAX_NODES`)
+    /// and rarely scanned (only on a targeted command), so a linear search is
+    /// simpler than maintaining a second id→position map that would have to
+    /// stay in sync across every add and remove.
+    fn position_of(&self, id: u32) -> Option<usize> {
+        self.nodes.iter().position(|h| h.id == id)
     }
 
     async fn submit_request(
@@ -385,12 +454,9 @@ impl EngineState {
         hits: u64,
     ) -> Result<EventBatch, EngineError> {
         let handle = self
-            .nodes
-            .get(node as usize)
-            .ok_or(EngineError::NodeOutOfRange {
-                got: node,
-                nodes: self.config.nodes,
-            })?;
+            .position_of(node)
+            .map(|pos| &self.nodes[pos])
+            .ok_or(EngineError::UnknownNode { id: node })?;
         let bucket = (self.virtual_ms / self.config.rule_bucket_ms.max(1) as u64) as BucketEpoch;
         handle
             .client
@@ -424,15 +490,105 @@ impl EngineState {
         dst: u32,
         policy: LinkPolicyKind,
     ) -> Result<(), EngineError> {
-        let nodes = self.config.nodes;
-        for index in [src, dst] {
-            if index as usize >= nodes {
-                return Err(EngineError::NodeOutOfRange { got: index, nodes });
+        for id in [src, dst] {
+            if self.position_of(id).is_none() {
+                return Err(EngineError::UnknownNode { id });
             }
         }
         self.router
-            .set_link_policy(self.addr_of(src), self.addr_of(dst), policy.into());
+            .set_link_policy(addr_of_id(src), addr_of_id(dst), policy.into());
         Ok(())
+    }
+
+    /// Restore every directed link between live nodes to lossless `Pass`.
+    /// Sweeps the live address set (not a stale `0..N`), so it stays correct
+    /// after churn; `set_link_policy(Pass)` also clears any drop counter.
+    fn heal(&mut self) {
+        let addrs: Vec<SocketAddr> = self.nodes.iter().map(|h| h.addr).collect();
+        for &src in &addrs {
+            for &dst in &addrs {
+                if src != dst {
+                    self.router.set_link_policy(src, dst, LinkPolicy::Pass);
+                }
+            }
+        }
+    }
+
+    /// Spawn a fresh cold-start member. It takes the next never-reused id and
+    /// bootstraps knowing every current node; each survivor is told it joined
+    /// (via that survivor's discovery stream) so gossip flows both ways. The
+    /// newcomer starts with an empty store and catches up by anti-entropy.
+    async fn add_node(&mut self) -> EventBatch {
+        let id = self.next_id;
+        self.next_id += 1;
+        let newcomer_addr = addr_of_id(id);
+        // The newcomer bootstraps against everyone currently live.
+        let live_addrs: Vec<SocketAddr> = self.nodes.iter().map(|h| h.addr).collect();
+        self.spawn_node(id, &live_addrs);
+
+        // Tell every survivor (everyone but the just-pushed newcomer) the
+        // newcomer joined, so they add it to their peer table and gossip to it.
+        let joined = PeerEvent::Added(Peer::new(newcomer_addr));
+        for handle in &self.nodes {
+            if handle.id != id {
+                let _ = handle.peer_tx.unbounded_send(joined);
+            }
+        }
+
+        // Let the newcomer bind and the survivors register the join before we
+        // return, so the immediate snapshot already reflects the new member.
+        self.drain_pending().await;
+        let mut events = Vec::new();
+        self.drain_log(&mut events);
+        EventBatch {
+            events,
+            virtual_ms: self.virtual_ms,
+            tick: self.current_tick(),
+        }
+    }
+
+    /// Remove the live node with stable id `id`. Symmetric with
+    /// [`EngineState::add_node`]: tell every survivor it left, stop its
+    /// runtime, unbind its transport, and drop every trace of it. Its id is
+    /// never reused, so survivors keep their own ids and addresses unchanged.
+    async fn remove_node(&mut self, id: u32) -> Result<EventBatch, EngineError> {
+        let pos = self
+            .position_of(id)
+            .ok_or(EngineError::UnknownNode { id })?;
+        let addr = self.nodes[pos].addr;
+        let node_id = self.nodes[pos].identity.node_id.0;
+
+        // Tell every *other* node it left first, so they drop it from their
+        // peer tables and stop gossiping to it.
+        let left = PeerEvent::Removed(Peer::new(addr));
+        for (i, handle) in self.nodes.iter().enumerate() {
+            if i != pos {
+                let _ = handle.peer_tx.unbounded_send(left);
+            }
+        }
+
+        // Stop its runtime: aborting drops the task's transport, which drops
+        // its router receiver, so survivors' in-flight sends to it now hit the
+        // UDP floor. Then unbind so no dead sender lingers in the router.
+        self.nodes[pos].join.abort();
+        self.router.unbind(addr);
+
+        // Drop every trace: the handle (closing its client / admin / tick /
+        // peer channels), the address-book entry, and the id reverse-map entry.
+        let handle = self.nodes.remove(pos);
+        drop(handle);
+        self.addresses.borrow_mut().remove(&addr);
+        self.node_id_index.remove(&node_id);
+
+        // Let survivors process the departure and the aborted task fully drop.
+        self.drain_pending().await;
+        let mut events = Vec::new();
+        self.drain_log(&mut events);
+        Ok(EventBatch {
+            events,
+            virtual_ms: self.virtual_ms,
+            tick: self.current_tick(),
+        })
     }
 
     async fn step(&mut self, delta_ms: u64) -> EventBatch {
@@ -504,7 +660,9 @@ impl EngineState {
     /// single-thread tokio polls one task per yield, so a large cluster needs
     /// an explicit drain or it under-polls.
     async fn drain_pending(&self) {
-        let budget = self.config.nodes.saturating_mul(4).max(16);
+        // Scale with the *live* node count, not the initial config, so a
+        // cluster grown by joins is still fully polled.
+        let budget = self.nodes.len().saturating_mul(4).max(16);
         for _ in 0..budget {
             tokio::task::yield_now().await;
         }
@@ -529,8 +687,11 @@ impl EngineState {
     fn push_tick_events(&self, prev: &[(u64, u64)], now: &[(u64, u64)], events: &mut Vec<Event>) {
         let tick = self.current_tick();
         let virtual_ms = self.virtual_ms;
+        // `prev`/`now` are aligned to `self.nodes` order (both built by
+        // iterating it), so position `index` is `self.nodes[index]` — map it to
+        // that node's stable id for the emitted event.
         for (index, (before, after)) in prev.iter().zip(now.iter()).enumerate() {
-            let node = index as u32;
+            let node = self.nodes[index].id;
             let total_delta = after.0.saturating_sub(before.0);
             let threshold_delta = after.1.saturating_sub(before.1);
             let heartbeat_delta = total_delta.saturating_sub(threshold_delta);
@@ -553,7 +714,9 @@ impl EngineState {
 
     async fn snapshot(&self) -> ClusterState {
         let mut nodes = Vec::with_capacity(self.nodes.len());
-        for (index, handle) in self.nodes.iter().enumerate() {
+        // Insertion order, so a node's position in `nodes` is its rank — the
+        // frontend turns that into a ring slot, while `id` stays its identity.
+        for handle in &self.nodes {
             let cells = match cell_dump(&handle.admin_tx).await {
                 Some(dump) => self.cells_from_dump(handle.identity, &dump),
                 None => Vec::new(),
@@ -568,9 +731,7 @@ impl EngineState {
                 None => (0, 0, Vec::new()),
             };
             nodes.push(NodeState {
-                index: index as u32,
-                node_id: handle.identity.node_id.0,
-                incarnation: handle.identity.incarnation,
+                id: handle.id,
                 aggregate_total: handle.aggregate.total(),
                 ticks_total,
                 threshold_fires,
@@ -604,10 +765,11 @@ impl EngineState {
     }
 
     fn peers_from_snapshot(&self, snap: &AdminSnapshot) -> Vec<PeerView> {
+        let addresses = self.addresses.borrow();
         snap.peers
             .iter()
             .map(|peer| PeerView {
-                index: self.addresses.get(&peer.addr).copied(),
+                id: addresses.get(&peer.addr).copied(),
                 node_id: peer.node_id.map(|id| id.0),
             })
             .collect()
@@ -623,6 +785,14 @@ impl EngineState {
             let _ = join.await;
         }
     }
+}
+
+/// The gossip address of the node with stable id `id`. A pure function of the
+/// id — and since ids are never reused, addresses never collide across churn.
+/// It is therefore also the address a newcomer bootstraps against and the one a
+/// removal unbinds, with no lookup needed.
+fn addr_of_id(id: u32) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], BASE_PORT + id as u16))
 }
 
 /// One `Snapshot` admin round-trip. `None` if the runtime has already stopped.

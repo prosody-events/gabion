@@ -115,6 +115,16 @@ impl SimRouter {
         }
     }
 
+    /// Drop the sender registered at `addr`, the symmetric inverse of
+    /// [`SimRouter::bind`]; returns whether one was bound. Sim/test-only — it
+    /// lets a simulation remove a node at runtime without leaving a dead sender
+    /// in the routing table (otherwise the map would accumulate one stale entry
+    /// per removal). After unbinding, sends to `addr` see no receiver and land
+    /// on the floor, exactly as production UDP to a departed peer does.
+    pub fn unbind(&self, addr: SocketAddr) -> bool {
+        self.inner.senders.borrow_mut().remove(&addr).is_some()
+    }
+
     /// Install a per-(src, dst) link policy. Default is [`LinkPolicy::Pass`].
     pub fn set_link_policy(&self, src: SocketAddr, dst: SocketAddr, policy: LinkPolicy) {
         self.inner.policies.borrow_mut().insert((src, dst), policy);
