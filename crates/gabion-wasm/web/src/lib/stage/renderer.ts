@@ -7,6 +7,13 @@
 // Three layers, back to front: the guide ring, light-beam packets, then the
 // node discs with their cell arcs on top (so beams emanate from beneath the
 // nodes they connect).
+//
+// Nodes are keyed by **stable id**, never by array position. `setCluster`
+// reconciles the live id set against what is on stage: a newcomer fades and
+// scales in at its ring slot, a departed node scales out and is destroyed
+// (its beams cancelled), and every survivor glides to the slot its new rank
+// gives it. So a join or leave re-spaces the ring without any node jumping or
+// renumbering — the membership change *is* the animation.
 
 import { gsap } from 'gsap';
 import { Application, Container, Graphics } from 'pixi.js';
@@ -49,19 +56,37 @@ const DROP_FRACTION = 0.5;
 // list; excess sends are simply not drawn (the cell arcs still tell the story).
 const MAX_BEAMS = 320;
 
-/** One node's persistent display objects. */
+// Membership-change motion (join / leave / re-space). Purposeful only: a join
+// grows in, a leave shrinks out, survivors glide. Reduced motion skips all of
+// it and snaps to the final layout.
+const ENTER_MS = 420;
+const EXIT_MS = 340;
+const GLIDE_MS = 520;
+const ENTER_SCALE = 0.25;
+
+/** One node's persistent display objects, keyed by stable id. */
 interface NodeGfx {
   root: Container;
   disc: Graphics;
   arc: Graphics;
+  /** The ring slot this node is gliding to (logical coords). */
   center: Point;
+  /** Radius the disc geometry was last drawn at; redrawn only when a join or
+   *  leave re-spaces the ring and changes it. */
+  radius: number;
+  /** Live tweens (enter / exit / glide), killed on destroy so a stale tween
+   *  can never touch a freed display object. */
+  tweens: Set<gsap.core.Tween>;
 }
 
 /** One packet in flight: its graphics plus the tween animating it, tracked so
- *  a reset can kill both deterministically. */
+ *  a reset — or the departure of an endpoint node — can kill both
+ *  deterministically. `src` / `dst` are stable ids. */
 interface Beam {
   gfx: Graphics;
   tween: gsap.core.Tween;
+  src: number;
+  dst: number;
 }
 
 export class StageRenderer {
@@ -72,7 +97,7 @@ export class StageRenderer {
   readonly #nodeLayer: Container;
   readonly #reduceMotion: boolean;
 
-  #nodes: NodeGfx[] = [];
+  #nodes = new Map<number, NodeGfx>();
   #beams = new Set<Beam>();
   #lastTick = -1;
   #lastDisagreement = 0;
@@ -131,7 +156,8 @@ export class StageRenderer {
     return t;
   }
 
-  /** Apply steady per-node state: rebuild the ring if the node count changed,
+  /** Apply steady per-node state: reconcile the live id set against the stage
+   *  (enter newcomers, exit departed, glide survivors to their new ranks),
    *  then update each node's cell arc and detect cluster-wide convergence. */
   setCluster(state: ClusterState | null): void {
     if (state === null) return;
@@ -139,7 +165,7 @@ export class StageRenderer {
     // A tick that runs backward means the session was reset (a fresh sim starts
     // at tick 0). Tear down transient state — killing in-flight beams *before*
     // touching node graphics — so a stale tween can't animate a disc we're
-    // about to rebuild.
+    // about to reconcile.
     if (state.tick < this.#lastTick) {
       this.#clearBeams();
       this.#lastDisagreement = 0;
@@ -147,8 +173,37 @@ export class StageRenderer {
     this.#lastTick = state.tick;
 
     const n = state.nodes.length;
-    if (n !== this.#nodes.length) this.#rebuildNodes(n);
+    const radius = nodeRadius(n);
+    const liveIds = new Set<number>();
 
+    // Enter + glide: ensure a gfx for every live id, sitting at the ring slot
+    // its rank (position in the live list) gives it.
+    state.nodes.forEach((node, rank) => {
+      liveIds.add(node.id);
+      const target = nodePosition(rank, n);
+      let gfx = this.#nodes.get(node.id);
+      if (gfx === undefined) {
+        gfx = this.#createNode(node.id, target, radius);
+      } else {
+        this.#glide(gfx, target);
+        if (gfx.radius !== radius) {
+          this.#drawDisc(gfx.disc, radius);
+          gfx.radius = radius;
+        }
+      }
+    });
+
+    // Exit: any node whose id is no longer live scales out and is destroyed,
+    // its in-flight beams cancelled first (explicit cleanup, mirroring the
+    // tick-regress beam sweep).
+    for (const [id, gfx] of this.#nodes) {
+      if (!liveIds.has(id)) {
+        this.#cancelBeamsFor(id);
+        this.#removeNode(id, gfx);
+      }
+    }
+
+    // Arcs + convergence, over the live nodes only.
     const oracle = Math.max(state.oracle_total, 1);
     let max = 0;
     let min = Number.POSITIVE_INFINITY;
@@ -156,7 +211,8 @@ export class StageRenderer {
       const total = node.aggregate_total;
       if (total > max) max = total;
       if (total < min) min = total;
-      this.#drawArc(this.#nodes[node.index], total / oracle, n);
+      const gfx = this.#nodes.get(node.id);
+      if (gfx !== undefined) this.#drawArc(gfx, total / oracle, n);
     }
     if (n === 0) min = 0;
 
@@ -184,31 +240,116 @@ export class StageRenderer {
     }
   }
 
-  /** Tear the renderer down: kill tweens, free every GPU resource, drop the
-   *  canvas. Safe to call once; the owner must not reuse the instance after. */
+  /** Tear the renderer down: kill every tween (node and beam), free every GPU
+   *  resource, drop the canvas. Safe to call once; the owner must not reuse the
+   *  instance after. */
   destroy(): void {
     this.#clearBeams();
+    for (const gfx of this.#nodes.values()) {
+      for (const tween of gfx.tweens) tween.kill();
+      gfx.tweens.clear();
+    }
+    this.#nodes.clear();
     this.#app.canvas.remove();
     this.#app.destroy(true, { children: true, texture: true, textureSource: true });
   }
 
-  #rebuildNodes(n: number): void {
-    this.#nodeLayer.removeChildren().forEach((c) => c.destroy({ children: true }));
-    this.#nodes = [];
-    const radius = nodeRadius(n);
-    for (let i = 0; i < n; i++) {
-      const center = nodePosition(i, n);
-      const root = new Container();
-      root.position.set(center.x, center.y);
-      const disc = new Graphics()
-        .circle(0, 0, radius)
-        .fill(COLOR_NODE_FILL)
-        .stroke({ width: 2, color: COLOR_NODE_STROKE });
-      const arc = new Graphics();
-      root.addChild(disc, arc);
-      this.#nodeLayer.addChild(root);
-      this.#nodes[i] = { root, disc, arc, center };
+  /** Create one node's display objects at `center` and animate its join. */
+  #createNode(id: number, center: Point, radius: number): NodeGfx {
+    const root = new Container();
+    root.position.set(center.x, center.y);
+    const disc = new Graphics();
+    const arc = new Graphics();
+    root.addChild(disc, arc);
+    this.#drawDisc(disc, radius);
+    this.#nodeLayer.addChild(root);
+    const gfx: NodeGfx = { root, disc, arc, center, radius, tweens: new Set() };
+    this.#nodes.set(id, gfx);
+
+    if (this.#reduceMotion) {
+      root.alpha = 1;
+      root.scale.set(1);
+      return gfx;
     }
+    // Join: fade in and scale up from a small disc — growth reads as "a member
+    // arrived here", distinct from a packet landing.
+    root.alpha = 0;
+    root.scale.set(ENTER_SCALE);
+    const s = { v: ENTER_SCALE };
+    this.#track(gfx, gsap.to(root, { alpha: 1, duration: ENTER_MS / 1000, ease: 'power2.out' }));
+    this.#track(
+      gfx,
+      gsap.to(s, {
+        v: 1,
+        duration: ENTER_MS / 1000,
+        ease: 'back.out(1.6)',
+        onUpdate: () => root.scale.set(s.v),
+      }),
+    );
+    return gfx;
+  }
+
+  /** Glide a survivor's disc to the ring slot its new rank gives it. */
+  #glide(gfx: NodeGfx, target: Point): void {
+    if (gfx.center.x === target.x && gfx.center.y === target.y) return;
+    gfx.center = target;
+    if (this.#reduceMotion) {
+      gfx.root.position.set(target.x, target.y);
+      return;
+    }
+    this.#track(
+      gfx,
+      gsap.to(gfx.root.position, {
+        x: target.x,
+        y: target.y,
+        duration: GLIDE_MS / 1000,
+        ease: 'power2.inOut',
+        overwrite: 'auto',
+      }),
+    );
+  }
+
+  /** Animate a departed node's leave, then destroy it. */
+  #removeNode(id: number, gfx: NodeGfx): void {
+    this.#nodes.delete(id);
+    const finish = (): void => {
+      for (const tween of gfx.tweens) tween.kill();
+      gfx.tweens.clear();
+      gfx.root.destroy({ children: true });
+    };
+    if (this.#reduceMotion) {
+      finish();
+      return;
+    }
+    const s = { v: gfx.root.scale.x };
+    this.#track(gfx, gsap.to(gfx.root, { alpha: 0, duration: EXIT_MS / 1000, ease: 'power2.in' }));
+    this.#track(
+      gfx,
+      gsap.to(s, {
+        v: 0,
+        duration: EXIT_MS / 1000,
+        ease: 'power2.in',
+        onUpdate: () => gfx.root.scale.set(s.v),
+        onComplete: finish,
+      }),
+    );
+  }
+
+  /** Track a node tween so it is killed on destroy, and drop it from the set
+   *  once it finishes so a long session doesn't accumulate inert tweens. */
+  #track(gfx: NodeGfx, tween: gsap.core.Tween): gsap.core.Tween {
+    gfx.tweens.add(tween);
+    void tween.then(() => gfx.tweens.delete(tween)).catch(() => {});
+    return tween;
+  }
+
+  /** Draw a node's disc at `radius` (clearing any prior geometry). */
+  #drawDisc(disc: Graphics, radius: number): void {
+    disc
+      .clear()
+      .circle(0, 0, radius)
+      .fill(COLOR_NODE_FILL)
+      .stroke({ width: 2, color: COLOR_NODE_STROKE });
   }
 
   /** Draw a node's cell arc: an annulus around the disc whose sweep is the
@@ -232,7 +373,7 @@ export class StageRenderer {
     node.disc.tint = 0xffffff;
     node.disc.alpha = 1;
     if (f <= 0) return;
-    const radius = nodeRadius(n) + 4;
+    const radius = node.radius + 4;
     const start = -Math.PI / 2;
     node.arc
       .arc(0, 0, radius, start, start + f * 2 * Math.PI)
@@ -241,9 +382,9 @@ export class StageRenderer {
 
   #beam(src: number, dst: number, bytes: number, dropped: boolean): void {
     if (this.#beams.size >= MAX_BEAMS) return;
-    const a = this.#nodes[src]?.center;
-    const b = this.#nodes[dst]?.center;
-    if (a === undefined || b === undefined) return;
+    const a = this.#liveCenter(src);
+    const b = this.#liveCenter(dst);
+    if (a === null || b === null) return;
 
     const width = 1.5 + Math.min(bytes, 400) / 100;
     const gfx = new Graphics();
@@ -258,6 +399,8 @@ export class StageRenderer {
         .stroke({ width, color: COLOR_DIRTY, alpha: dropped ? 0.25 : 0.6, cap: 'round' });
       const beam: Beam = {
         gfx,
+        src,
+        dst,
         tween: gsap.to(gfx, {
           alpha: 0,
           duration: 0.4,
@@ -270,7 +413,7 @@ export class StageRenderer {
 
     const head = { t: 0 };
     const end = dropped ? DROP_FRACTION : 1;
-    const draw = () => {
+    const draw = (): void => {
       const tip = head.t;
       const tail = Math.max(0, tip - BEAM_TRAIL);
       const from = lerp(a, b, tail);
@@ -286,6 +429,8 @@ export class StageRenderer {
     };
     const beam: Beam = {
       gfx,
+      src,
+      dst,
       tween: gsap.to(head, {
         t: end,
         duration: BEAM_FLIGHT_MS / 1000,
@@ -300,10 +445,18 @@ export class StageRenderer {
     this.#beams.add(beam);
   }
 
+  /** The live position of node `id`'s disc (mid-glide if it is moving), or
+   *  `null` if no such node is on stage. */
+  #liveCenter(id: number): Point | null {
+    const gfx = this.#nodes.get(id);
+    if (gfx === undefined) return null;
+    return { x: gfx.root.position.x, y: gfx.root.position.y };
+  }
+
   /** A delivered beam briefly brightens its target — the visible "news landed
    *  here" beat that distinguishes delivery from a drop. */
   #flash(dst: number): void {
-    const disc = this.#nodes[dst]?.disc;
+    const disc = this.#nodes.get(dst)?.disc;
     if (disc === undefined) return;
     gsap.fromTo(disc, { alpha: 1 }, { alpha: 0.4, duration: 0.12, yoyo: true, repeat: 1 });
   }
@@ -313,12 +466,13 @@ export class StageRenderer {
    *  already snapped green. */
   #pulse(): void {
     if (this.#reduceMotion) return;
-    for (const node of this.#nodes) {
+    const baseRadius = nodeRadius(this.#nodes.size);
+    for (const node of this.#nodes.values()) {
       const ring = new Graphics();
       node.root.addChild(ring);
-      const state = { r: nodeRadius(this.#nodes.length), alpha: 0.7 };
+      const state = { r: baseRadius, alpha: 0.7 };
       gsap.to(state, {
-        r: nodeRadius(this.#nodes.length) * 3,
+        r: baseRadius * 3,
         alpha: 0,
         duration: 0.6,
         ease: 'power2.out',
@@ -336,6 +490,17 @@ export class StageRenderer {
   #removeBeam(beam: Beam): void {
     if (!this.#beams.delete(beam)) return;
     beam.gfx.destroy();
+  }
+
+  /** Cancel every in-flight beam touching node `id` — called when that node
+   *  leaves, so no beam animates to or from a disc that is being destroyed. */
+  #cancelBeamsFor(id: number): void {
+    for (const beam of [...this.#beams]) {
+      if (beam.src === id || beam.dst === id) {
+        beam.tween.kill();
+        this.#removeBeam(beam);
+      }
+    }
   }
 
   #clearBeams(): void {

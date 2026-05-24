@@ -16,7 +16,7 @@
   // draws the discs, cell arcs, light-beam packets, and convergence pulse;
   // `cluster` feeds steady per-node state and `events` feeds the transient
   // gossip packets from each step. A DOM overlay sits on top of the canvas with
-  // the per-node index and total — the canvas is opaque to assistive tech and
+  // each node's stable id and total — the canvas is opaque to assistive tech and
   // to test tooling, so the real numbers live in queryable, tabular-figure text.
   //
   // `onSendBurst` is the click-a-node affordance: clicking a disc injects a
@@ -69,7 +69,7 @@
    *  over a disc reaches this handler whether it is over the canvas or a label. */
   function nodeUnder(event: PointerEvent): number | null {
     const rect = container.getBoundingClientRect();
-    return nodeAt({ x: event.clientX - rect.left, y: event.clientY - rect.top }, count, transform);
+    return nodeAt({ x: event.clientX - rect.left, y: event.clientY - rect.top }, nodes, transform);
   }
 
   function onPointerMove(event: PointerEvent): void {
@@ -129,14 +129,14 @@
 >
   {#if showLabels}
     <div class="stage-labels" aria-hidden="true">
-      {#each nodes as node (node.index)}
-        {@const s = toScreen(nodePosition(node.index, count), transform)}
+      {#each nodes as node, rank (node.id)}
+        {@const s = toScreen(nodePosition(rank, count), transform)}
         <span
           class="node-label"
-          data-index={node.index}
+          data-id={node.id}
           style="left: {s.x}px; top: {s.y}px; font-size: {labelFont}px;"
         >
-          <span class="node-index numeric">{node.index}</span>
+          <span class="node-id numeric">{node.id}</span>
           <span class="node-count numeric">{node.aggregate_total}</span>
         </span>
       {/each}
@@ -176,7 +176,7 @@
     line-height: 1;
   }
 
-  .node-index {
+  .node-id {
     color: var(--on-stage-soft);
     font-size: 0.7em;
     margin-bottom: 0.15em;

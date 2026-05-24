@@ -195,15 +195,18 @@
     hits = Math.min(hits, traffic.cap - trafficInjected);
     if (hits <= 0) return;
     // Spread by global hit index so the per-node split is chunk-independent;
-    // group into one submit per node touched this advance.
+    // the round-robin runs over *ranks* (positions in the live node list) and
+    // resolves each to that node's stable id, since the engine addresses nodes
+    // by id. Group into one submit per node touched this advance.
+    const liveNodes = cluster.nodes;
     const perNode = new Map<number, number>();
     for (let i = 0; i < hits; i++) {
-      const node = (trafficInjected + i) % count;
-      perNode.set(node, (perNode.get(node) ?? 0) + 1);
+      const id = liveNodes[(trafficInjected + i) % count].id;
+      perNode.set(id, (perNode.get(id) ?? 0) + 1);
     }
     trafficInjected += hits;
-    for (const [node, n] of perNode) {
-      await sim.submitRequest(node, WATCHED_KEY, n);
+    for (const [id, n] of perNode) {
+      await sim.submitRequest(id, WATCHED_KEY, n);
     }
   }
 

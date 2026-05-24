@@ -23,7 +23,11 @@ export class ChartHistory {
   readonly oracle: number[] = [];
   /** max − min of the per-node views: the disagreement that decays to zero. */
   readonly disagreement: number[] = [];
-  /** One column per node: `nodes[i]` is node i's view over time (the fan). */
+  /** One column per node: `nodes[rank]` is the view over time (the fan) of the
+   *  node at that rank in the snapshot's live, insertion-ordered node list — a
+   *  positional series, not keyed by stable id. The count is reshaped (and the
+   *  window cleared) whenever membership changes, so a join or leave restarts
+   *  the fan rather than threading a per-id line through the gap. */
   readonly nodes: number[][] = [];
 
   get length(): number {
@@ -53,12 +57,14 @@ export class ChartHistory {
 
     let max = 0;
     let min = snap.nodes.length === 0 ? 0 : Number.POSITIVE_INFINITY;
-    for (const node of snap.nodes) {
+    // Index by rank (position in the live node list), not by stable id: after
+    // a removal ids have gaps, but the reshaped `nodes` array is dense 0..N.
+    snap.nodes.forEach((node, rank) => {
       const total = node.aggregate_total;
       if (total > max) max = total;
       if (total < min) min = total;
-      this.nodes[node.index].push(total);
-    }
+      this.nodes[rank].push(total);
+    });
 
     this.times.push(snap.virtual_ms);
     this.ticks.push(snap.tick);

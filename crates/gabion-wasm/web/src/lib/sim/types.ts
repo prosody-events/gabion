@@ -88,15 +88,17 @@ export interface CellView {
 
 /** Mirror of `crate::event::PeerView`. */
 export interface PeerView {
-  index: number | null;
+  /** The peer's stable id, if the engine can resolve its address. */
+  id: number | null;
+  /** The peer's gossip node id once an inbound packet has revealed it. */
   node_id: Hex | null;
 }
 
-/** Mirror of `crate::event::NodeState`. */
+/** Mirror of `crate::event::NodeState`. `id` is the node's stable identity (see
+ *  the Rust module note): assigned once, never reused, so it survives other
+ *  nodes joining and leaving and has gaps once a member has been removed. */
 export interface NodeState {
-  index: number;
-  node_id: Hex;
-  incarnation: number;
+  id: number;
   aggregate_total: number;
   ticks_total: number;
   threshold_fires: number;

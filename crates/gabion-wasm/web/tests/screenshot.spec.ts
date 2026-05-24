@@ -90,7 +90,7 @@ test('clicking a node injects a burst at the current virtual time', async ({ pag
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
 
   // The page boots paused, with only node 0 seeded. Pick an empty node to poke.
-  const target = page.locator('.node-label[data-index="3"]');
+  const target = page.locator('.node-label[data-id="3"]');
   await expect(target.locator('.node-count')).toHaveText('0');
 
   const box = await target.boundingBox();
@@ -101,8 +101,8 @@ test('clicking a node injects a burst at the current virtual time', async ({ pag
   // not advance time, and the burst is far below the threshold-AE budget, so it
   // does not spread: node 0 keeps its seed and the rest stay at zero.
   await expect(target.locator('.node-count')).toHaveText(CLICK_HITS);
-  await expect(page.locator('.node-label[data-index="0"] .node-count')).toHaveText(SEED_TOTAL);
-  await expect(page.locator('.node-label[data-index="5"] .node-count')).toHaveText('0');
+  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText(SEED_TOTAL);
+  await expect(page.locator('.node-label[data-id="5"] .node-count')).toHaveText('0');
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
@@ -114,7 +114,7 @@ test('the control rail sends a burst to the chosen node', async ({ page }) => {
   await page.goto('/');
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
 
-  const target = page.locator('.node-label[data-index="7"]');
+  const target = page.locator('.node-label[data-id="7"]');
   await expect(target.locator('.node-count')).toHaveText('0');
 
   await page.getByLabel('Node', { exact: true }).fill('7');
@@ -131,16 +131,16 @@ test('selecting a scenario preset rebuilds the cluster with its seed', async ({ 
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
 
   // Default scenario: node 0 carries the 50-hit burst, the rest start at zero.
-  await expect(page.locator('.node-label[data-index="0"] .node-count')).toHaveText(SEED_TOTAL);
+  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText(SEED_TOTAL);
 
   await page.getByRole('button', { name: 'Steady state' }).click();
 
   // Steady state seeds 10 on nodes 0, 3, 6, 9 and nothing elsewhere; at t=0
   // (paused) each carries only its own seed, so the cluster maximally disagrees
   // before any gossip. node 0's old 50 is gone — this is a fresh cluster.
-  await expect(page.locator('.node-label[data-index="3"] .node-count')).toHaveText('10');
-  await expect(page.locator('.node-label[data-index="0"] .node-count')).toHaveText('10');
-  await expect(page.locator('.node-label[data-index="1"] .node-count')).toHaveText('0');
+  await expect(page.locator('.node-label[data-id="3"] .node-count')).toHaveText('10');
+  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText('10');
+  await expect(page.locator('.node-label[data-id="1"] .node-count')).toHaveText('0');
 });
 
 // The rebuild knobs live behind a collapsed disclosure (Hick's law). Opening it
@@ -183,7 +183,7 @@ test('sustained overload climbs the aggregate past the limit', async ({ page }) 
   await page.getByRole('button', { name: 'Sustained overload' }).click();
   // The overload preset has no opening burst — the feed is the story — so every
   // node starts at zero until played.
-  await expect(page.locator('.node-label[data-index="0"] .node-count')).toHaveText('0');
+  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText('0');
 
   await page.getByRole('button', { name: 'Play' }).click();
   // The watched node's view (the aggregate it converges on) climbs past the
@@ -191,7 +191,7 @@ test('sustained overload climbs the aggregate past the limit', async ({ page }) 
   await expect
     .poll(
       async () => {
-        const text = await page.locator('.node-label[data-index="0"] .node-count').textContent();
+        const text = await page.locator('.node-label[data-id="0"] .node-count').textContent();
         return Number(text ?? '0');
       },
       { timeout: 15_000, message: 'aggregate did not climb past the limit under sustained load' },
@@ -215,8 +215,8 @@ test('network partition splits the cluster until healed', async ({ page }) => {
   await expect(heal).toBeVisible();
 
   // Group A (nodes 0–5) holds the burst; group B (6–11) is cut off from it.
-  const groupA = page.locator('.node-label[data-index="1"] .node-count');
-  const groupB = page.locator('.node-label[data-index="6"] .node-count');
+  const groupA = page.locator('.node-label[data-id="1"] .node-count');
+  const groupB = page.locator('.node-label[data-id="6"] .node-count');
 
   await page.getByRole('button', { name: 'Play' }).click();
   // Group A converges on the burst among itself; the severed half never hears it.

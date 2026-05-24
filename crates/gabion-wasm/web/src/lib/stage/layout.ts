@@ -28,10 +28,14 @@ export interface StageTransform {
   offsetY: number;
 }
 
-/** Deterministic ring address for node `i` of `n`: starts at 12 o'clock and
- *  goes clockwise, so a shared URL renders an identical layout. */
-export function nodePosition(i: number, n: number): Point {
-  const angle = (2 * Math.PI * i) / Math.max(n, 1) - Math.PI / 2;
+/** Deterministic ring address for the node at `rank` (its position in the live,
+ *  insertion-ordered node list) out of `count` live nodes: starts at 12 o'clock
+ *  and goes clockwise. Position is a function of *rank*, not identity — so when
+ *  a node leaves, the survivors' ranks shift and the ring re-spaces, while each
+ *  node keeps its stable id. A shared URL still renders an identical layout
+ *  because the command order fixes the ranks. */
+export function nodePosition(rank: number, count: number): Point {
+  const angle = (2 * Math.PI * rank) / Math.max(count, 1) - Math.PI / 2;
   return {
     x: CENTER + RING_RADIUS * Math.cos(angle),
     y: CENTER + RING_RADIUS * Math.sin(angle),
@@ -69,23 +73,30 @@ export function toLogical(p: Point, t: StageTransform): Point {
   return { x: (p.x - t.offsetX) / t.scale, y: (p.y - t.offsetY) / t.scale };
 }
 
-/** The node a screen-space pointer is over, or `null` if it is over none.
- *  Nearest disc by Euclidean distance, accepted only *inside* the node's
- *  radius — discs never overlap, so a hit is unambiguous and a click on the
- *  bare stage misses cleanly (the design wants precise, intentional clicks,
- *  not a generous catch-all). */
-export function nodeAt(screen: Point, count: number, t: StageTransform): number | null {
+/** The **stable id** of the node a screen-space pointer is over, or `null` if
+ *  it is over none. Takes the live, insertion-ordered node list so each
+ *  candidate's ring position comes from its rank (its index in that list);
+ *  the match is the nearest disc by Euclidean distance, accepted only *inside*
+ *  the node's radius — discs never overlap, so a hit is unambiguous and a click
+ *  on the bare stage misses cleanly (the design wants precise, intentional
+ *  clicks, not a generous catch-all). */
+export function nodeAt(
+  screen: Point,
+  nodes: readonly { id: number }[],
+  t: StageTransform,
+): number | null {
+  const count = nodes.length;
   if (count === 0 || t.scale <= 0) return null;
   const p = toLogical(screen, t);
   const radius = nodeRadius(count);
   let best: number | null = null;
   let bestDist = radius;
-  for (let i = 0; i < count; i++) {
-    const c = nodePosition(i, count);
+  for (let rank = 0; rank < count; rank++) {
+    const c = nodePosition(rank, count);
     const dist = Math.hypot(p.x - c.x, p.y - c.y);
     if (dist <= bestDist) {
       bestDist = dist;
-      best = i;
+      best = nodes[rank].id;
     }
   }
   return best;
