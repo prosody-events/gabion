@@ -3,10 +3,11 @@
 // `uPlot.Options`. The thin `Chart.svelte` wrapper owns the lifecycle; the
 // pedagogy lives here.
 //
-// (The Aggregate-vs-Limit panel is deferred to a Phase 6 overload preset: a
-// burst large enough to approach the limit necessarily trips gabion's threshold
-// anti-entropy, which collapses the multi-hop spread this default scenario is
-// built to show. The two regimes are distinct scenarios, not one chart.)
+// The Aggregate-vs-Limit panel (`aggregateLimitOptions`) is shown only under the
+// overload preset, whose sustained feed climbs the aggregate across a low limit
+// — the one regime where it is legible. A single burst can't tell that story:
+// approaching the limit trips the eager threshold flush, collapsing the spread
+// the other scenarios exist to show. See `lib/presets.ts`.
 //
 // Conventions enforced across the charts (the design rubric is explicit):
 //   • one shared cursor-sync key, so a hover crosshair tracks the same x on
@@ -27,6 +28,7 @@ const GRID = '#ececdf';
 const NODE_LINE = 'rgba(92, 98, 107, 0.32)'; // recessive per-node fan line
 const DIRTY = '#d98a2b'; // limit / not-yet-agreed
 const DIRTY_FILL = 'rgba(217, 138, 43, 0.15)';
+const INK_FILL = 'rgba(27, 29, 34, 0.08)'; // aggregate area under its line
 
 const FONT = "12px ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
 
@@ -104,6 +106,77 @@ export function fanOptions(nodeCount: number): uPlot.Options {
       { stroke: INK, width: 2.5, dash: [7, 4], points: { show: false } },
     ],
     hooks: { draw: [labelSeriesEnd(oracleIdx, 'true total', INK)] },
+  };
+}
+
+/** Paint the REJECTING band (limit → top of plot) and the dashed limit line,
+ *  behind the series. Device-pixel coordinates, like `labelSeriesEnd`. */
+function drawRejectBand(limit: number) {
+  return (u: uPlot): void => {
+    const dpr = pxr(u);
+    const ctx = u.ctx;
+    const x = u.bbox.left;
+    const w = u.bbox.width;
+    const yTop = u.bbox.top;
+    const yLimit = u.valToPos(limit, 'y', true);
+    if (yLimit <= yTop) return;
+    ctx.save();
+    ctx.fillStyle = DIRTY_FILL;
+    ctx.fillRect(x, yTop, w, yLimit - yTop);
+    ctx.strokeStyle = DIRTY;
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.setLineDash([6 * dpr, 4 * dpr]);
+    ctx.beginPath();
+    ctx.moveTo(x, yLimit);
+    ctx.lineTo(x + w, yLimit);
+    ctx.stroke();
+    ctx.restore();
+  };
+}
+
+/** Label the band "REJECTING" (top-left, inside the band) and the threshold
+ *  "limit" (left, just under the dashed line), over the series. Kept on the left
+ *  so neither collides with the "aggregate" end-label riding the line's right. */
+function drawRejectLabels(limit: number) {
+  return (u: uPlot): void => {
+    const dpr = pxr(u);
+    const ctx = u.ctx;
+    const x = u.bbox.left;
+    const yTop = u.bbox.top;
+    const yLimit = u.valToPos(limit, 'y', true);
+    ctx.save();
+    ctx.font = `${dpr * 11}px ui-sans-serif, system-ui, sans-serif`;
+    ctx.fillStyle = DIRTY;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText('REJECTING', x + 6 * dpr, yTop + 4 * dpr);
+    ctx.fillText('limit', x + 6 * dpr, yLimit + 3 * dpr);
+    ctx.restore();
+  };
+}
+
+/** B1 — Aggregate vs Limit. The cluster's true total (the aggregate every node
+ *  converges on) climbing across a dashed limit line, the regime above it shaded
+ *  as the REJECTING band — *why gabion exists*. Shown only for the overload
+ *  preset, whose sustained feed actually drives the aggregate across the limit. */
+export function aggregateLimitOptions(limit: number): uPlot.Options {
+  // Fixed range so the limit line keeps its height as the aggregate ramps (no
+  // auto-fit crawl). `2×limit` seats the limit at mid-height — a tall enough
+  // REJECTING band to label — and leaves headroom above the feed's 1.6×limit
+  // plateau so the line settles inside the band, not against the ceiling.
+  const top = Math.max(limit * 2, 1);
+  return {
+    width: 1,
+    height: 1,
+    cursor: baseCursor(),
+    legend: { show: false },
+    scales: { x: { time: false }, y: { range: () => [0, top] } },
+    axes: axes(),
+    series: [{}, { stroke: INK, fill: INK_FILL, width: 2, points: { show: false } }],
+    hooks: {
+      drawClear: [drawRejectBand(limit)],
+      draw: [drawRejectLabels(limit), labelSeriesEnd(1, 'aggregate', INK)],
+    },
   };
 }
 

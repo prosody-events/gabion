@@ -8,13 +8,24 @@
 // scripted timeline. A timed-event driver only becomes load-bearing for the
 // scrubber's replay-from-zero, so it waits for that phase.
 //
-// Every preset leaves the rule limit at the production default — far above the
+// Most presets leave the rule limit at the production default — far above the
 // seeded volumes — on purpose. A burst stays well under gabion's threshold
 // anti-entropy budget (ε ≈ limit·bps/(10⁴·N), ~900 at the default limit), so it
 // spreads by lazy heartbeat over several rounds: the multi-hop propagation
-// these views exist to show. A burst large enough to approach the limit trips
-// the eager threshold flush and converges in one round; that overload regime,
-// and the Aggregate-vs-Limit chart it powers, get their own preset later.
+// these views exist to show.
+//
+// The exception is the `overload` preset, which tells the opposite — and the
+// reason gabion exists — story. A single burst that approaches the limit can't:
+// to keep each node's local delta under ε while twelve nodes' sum exceeds the
+// limit you'd need L/N < ε = L·bps/(10⁴·N), i.e. bps > 10⁴, an absurd error
+// budget. So overload *feeds* the cluster at a steady rate (see `traffic`),
+// dropping the limit low enough that the cluster aggregate climbs across it
+// within seconds. There, eager threshold flushing is the healthy behavior on
+// display — every node's view tracks the climbing aggregate tightly — and the
+// Aggregate-vs-Limit chart's REJECTING band fills. The sustained feed is folded
+// into the play loop as a carry-save rate (App.svelte), not a timed script: the
+// total injected by virtual time T is exactly ⌊rate·T⌋ regardless of how play
+// chunked the steps, so it stays deterministic without the scrubber's driver.
 
 import type { Sim } from './sim/sim';
 import type { SimConfig } from './sim/types';
@@ -28,6 +39,18 @@ export const WATCHED_KEY = 1;
  *  adaptive fanout still saturates it in a couple of rounds. */
 const NODES = 12;
 
+/** A steady traffic feed the play loop drives while a preset is active —
+ *  the engine of the overload story. The hits are spread round-robin across the
+ *  cluster (by global hit index, so the spread is chunk-independent), targeting
+ *  the watched key, until `cap` total have been injected; then the aggregate
+ *  plateaus. App.svelte folds `rate_per_sec` into each advance as a carry-save
+ *  accumulator, so ⌊rate·T⌋ hits have landed by virtual time T regardless of
+ *  step chunking — deterministic, and it composes with scrub-from-zero. */
+export interface SustainedTraffic {
+  readonly rate_per_sec: number;
+  readonly cap: number;
+}
+
 export interface Preset {
   readonly id: string;
   readonly label: string;
@@ -36,6 +59,10 @@ export interface Preset {
   /** Whether the scenario severs links (a partition or isolation) — the rail
    *  surfaces its Heal control only for these, where it does something. */
   readonly usesNetwork?: boolean;
+  /** A steady feed the play loop drives (the overload scenario). Its presence
+   *  also surfaces the Aggregate-vs-Limit chart, which is only legible when the
+   *  aggregate actually approaches the (low) limit this preset sets. */
+  readonly traffic?: SustainedTraffic;
   /** Fire the preset's opening commands at the current (t = 0) virtual time. */
   seed(sim: Sim): Promise<void>;
 }
@@ -66,6 +93,20 @@ export const PRESETS: readonly Preset[] = [
       for (const node of [0, 3, 6, 9]) {
         await sim.submitRequest(node, WATCHED_KEY, 10);
       }
+    },
+  },
+  {
+    id: 'overload',
+    label: 'Sustained overload',
+    blurb:
+      'Steady traffic floods the cluster against a low limit. Play to watch the aggregate climb past it into the rejecting band.',
+    // A low limit so the aggregate crosses it within seconds; the default
+    // budget then keeps ε = 1, so eager flushing tracks the climb tightly. The
+    // feed caps at 1.6× the limit, so the aggregate plateaus inside the band.
+    config: { nodes: NODES, rng_seed: 1, rule_limit: 400 },
+    traffic: { rate_per_sec: 150, cap: 640 },
+    async seed() {
+      // No opening burst: the sustained feed (driven during play) is the story.
     },
   },
   {

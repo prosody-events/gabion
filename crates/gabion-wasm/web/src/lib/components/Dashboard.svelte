@@ -3,23 +3,34 @@
   import type { ClusterState } from '../sim/types';
   import type { ChartHistory } from '../charts/history';
   import Chart from '../charts/Chart.svelte';
-  import { disagreementOptions, fanOptions } from '../charts/options';
+  import { aggregateLimitOptions, disagreementOptions, fanOptions } from '../charts/options';
 
   // The abstract rung: the convergence story as charts. Fed the live `cluster`
   // (for the pinned headline) plus the rolling `history` and a `version` counter
   // that ticks on every new sample — the single signal the charts redraw on.
+  // `showLimit` adds the Aggregate-vs-Limit panel: it is only legible when the
+  // active scenario drives the aggregate toward `limit` (the overload preset).
   let {
     cluster,
     history,
     version,
-  }: { cluster: ClusterState | null; history: ChartHistory; version: number } = $props();
+    limit,
+    showLimit,
+  }: {
+    cluster: ClusterState | null;
+    history: ChartHistory;
+    version: number;
+    limit: number;
+    showLimit: boolean;
+  } = $props();
 
   const nodeCount = $derived(cluster?.nodes.length ?? 0);
 
   // Option shapes rebuild only when their structural input changes (the fan's
-  // series count) — not per sample.
+  // series count, the limit line's height) — not per sample.
   const fanOpts = $derived(fanOptions(nodeCount));
   const disagreementOpts = disagreementOptions();
+  const aggregateOpts = $derived(showLimit ? aggregateLimitOptions(limit) : null);
 
   // Column-major data, re-wrapped each sample. The inner arrays are the same
   // references `ChartHistory` mutates; `version` is what makes the charts read.
@@ -30,6 +41,12 @@
   const disagreementData = $derived.by((): uPlot.AlignedData => {
     void version;
     return [history.times, history.disagreement];
+  });
+  // The aggregate the cluster converges on is the ground-truth oracle — the same
+  // total the fan chases, reframed here against the rule limit.
+  const aggregateData = $derived.by((): uPlot.AlignedData => {
+    void version;
+    return [history.times, history.oracle];
   });
 
   // The always-pinned headline: the live spread between the most- and
@@ -52,7 +69,7 @@
   });
 </script>
 
-<aside class="dashboard" aria-label="Convergence dashboard">
+<aside class="dashboard" class:with-limit={showLimit} aria-label="Convergence dashboard">
   <div class="headline" class:converged>
     <span class="headline-label">Disagreement → 0</span>
     <span class="headline-value numeric">{disagreement}</span>
@@ -68,6 +85,11 @@
   <div class="panel hero">
     <Chart label="Convergence — each node's view vs. true total" opts={fanOpts} data={fanData} {version} />
   </div>
+  {#if showLimit && aggregateOpts !== null}
+    <div class="panel">
+      <Chart label="Aggregate vs. limit" opts={aggregateOpts} data={aggregateData} {version} />
+    </div>
+  {/if}
   <div class="panel">
     <Chart label="Disagreement decay" opts={disagreementOpts} data={disagreementData} {version} />
   </div>
@@ -84,6 +106,13 @@
     background: var(--chrome-panel);
     border-left: 1px solid var(--chrome-border);
     overflow: hidden;
+  }
+
+  /* The overload scenario adds the Aggregate-vs-Limit panel between the hero
+     fan and the disagreement strip; trim the hero so three plots fit. (Only
+     reshapes on a preset switch, which fully remounts the dashboard.) */
+  .dashboard.with-limit {
+    grid-template-rows: auto 1.6fr 1fr 1fr;
   }
 
   .headline {

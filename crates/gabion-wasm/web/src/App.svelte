@@ -52,6 +52,15 @@
   const history = new ChartHistory();
   let chartVersion = $state(0);
 
+  // The active preset's sustained feed (the overload scenario), folded into the
+  // play loop. Carry-save accumulation makes the total injected by virtual time
+  // T exactly ⌊rate·T⌋ regardless of how play chunked the steps — deterministic
+  // and replayable from zero. `trafficInjected` is the running global hit count:
+  // it caps the feed and indexes the round-robin node spread, so both stay
+  // chunk-independent too. Plain `let` (not `$state`) — nothing renders them.
+  let trafficCarry = 0;
+  let trafficInjected = 0;
+
   let rafId = 0;
   let lastWall = 0;
   // Exactly one advance is ever in flight: the play loop will not issue the
@@ -68,6 +77,10 @@
     loading = true;
     error = null;
     events = [];
+    // Restart the sustained feed from a clean slate so a Reset mid-ramp doesn't
+    // inherit stale carry or a stale node cursor.
+    trafficCarry = 0;
+    trafficInjected = 0;
     // Clear the rolling history so a rebuild starts the charts from a blank
     // slate (the first sample re-shapes it for the cluster's node count).
     history.reset(0);
@@ -128,9 +141,38 @@
     if (batch.events.length > 0) events = batch.events;
   }
 
+  /** Drive the active preset's sustained feed for a `deltaMs` advance (a no-op
+   *  for presets without one). The hits land at the current virtual time,
+   *  *before* the step that gossips them, so a hit and its propagation animate
+   *  in the same frame. Submit batches are dropped — they carry no packets; the
+   *  following step's batch carries the beams the feed's eager flush triggers. */
+  async function injectTraffic(deltaMs: number): Promise<void> {
+    const traffic = activePreset.traffic;
+    if (traffic === undefined || sim === null || cluster === null) return;
+    const count = cluster.nodes.length;
+    if (count === 0) return;
+    trafficCarry += (traffic.rate_per_sec * deltaMs) / 1000;
+    let hits = Math.floor(trafficCarry);
+    trafficCarry -= hits;
+    hits = Math.min(hits, traffic.cap - trafficInjected);
+    if (hits <= 0) return;
+    // Spread by global hit index so the per-node split is chunk-independent;
+    // group into one submit per node touched this advance.
+    const perNode = new Map<number, number>();
+    for (let i = 0; i < hits; i++) {
+      const node = (trafficInjected + i) % count;
+      perNode.set(node, (perNode.get(node) ?? 0) + 1);
+    }
+    trafficInjected += hits;
+    for (const [node, n] of perNode) {
+      await sim.submitRequest(node, WATCHED_KEY, n);
+    }
+  }
+
   async function advance(deltaMs: number): Promise<void> {
     if (sim === null) return;
     try {
+      await injectTraffic(deltaMs);
       showEvents(await sim.step(deltaMs));
       applySnapshot(await sim.snapshot());
     } catch (e) {
@@ -246,7 +288,13 @@
         <div class="stage-pane">
           <Stage {cluster} {events} onSendBurst={(node) => void sendBurst(node)} />
         </div>
-        <Dashboard {cluster} {history} version={chartVersion} />
+        <Dashboard
+          {cluster}
+          {history}
+          version={chartVersion}
+          limit={activePreset.config.rule_limit ?? 0}
+          showLimit={activePreset.traffic !== undefined}
+        />
       </div>
     {/if}
   </main>

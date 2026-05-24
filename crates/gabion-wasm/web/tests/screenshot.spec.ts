@@ -143,6 +143,40 @@ test('selecting a scenario preset rebuilds the cluster with its seed', async ({ 
   await expect(page.locator('.node-label[data-index="1"] .node-count')).toHaveText('0');
 });
 
+// The sustained-overload scenario feeds the cluster at a steady rate against a
+// low limit (400). Played, the aggregate every node converges on climbs past the
+// limit into the REJECTING band — the "why gabion exists" story, and the one
+// scenario that surfaces the Aggregate-vs-Limit chart.
+test('sustained overload climbs the aggregate past the limit', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  await page.getByRole('button', { name: 'Sustained overload' }).click();
+  // The overload preset has no opening burst — the feed is the story — so every
+  // node starts at zero until played.
+  await expect(page.locator('.node-label[data-index="0"] .node-count')).toHaveText('0');
+
+  await page.getByRole('button', { name: 'Play' }).click();
+  // The watched node's view (the aggregate it converges on) climbs past the
+  // limit of 400 as the steady feed accumulates cluster-wide.
+  await expect
+    .poll(
+      async () => {
+        const text = await page.locator('.node-label[data-index="0"] .node-count').textContent();
+        return Number(text ?? '0');
+      },
+      { timeout: 15_000, message: 'aggregate did not climb past the limit under sustained load' },
+    )
+    .toBeGreaterThan(400);
+  await page.getByRole('button', { name: 'Pause' }).click();
+  await page.screenshot({ path: 'screenshots/ring-overload.png' });
+
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
 // The network-partition scenario severs the cluster in two, bursts one half, and
 // the halves disagree until the user heals the link — the eventual-consistency
 // story end to end. Also confirms Heal is disclosed only for network scenarios.
