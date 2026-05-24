@@ -298,6 +298,10 @@ test('sustained overload climbs the aggregate past the limit', async ({ page }) 
     .toBeGreaterThan(400);
   await page.getByRole('button', { name: 'Pause' }).click();
   await page.screenshot({ path: 'screenshots/ring-overload.png' });
+  // A dashboard-only frame, large enough to eyeball that the REJECTING band
+  // (the shaded regime above the dashed limit line) actually reads against the
+  // white panel — the full-page shot is too small to judge a pale fill.
+  await page.locator('.dashboard').screenshot({ path: 'screenshots/dash-overload.png' });
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });

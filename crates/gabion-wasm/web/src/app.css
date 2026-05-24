@@ -31,7 +31,6 @@
   --signal-dirty: #b3720d; /* in-flight / news */
   --signal-reject: #b3261e; /* error / remove */
   --node-fill: #39424f;
-  --node-stroke: #2b333d;
 
   /* Type — humanist sans for UI; tabular figures so numerals never jitter.
    * Serif (narration) and mono (pseudocode) join in later phases. */

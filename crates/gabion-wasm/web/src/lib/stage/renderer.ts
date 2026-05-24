@@ -37,7 +37,6 @@ import {
 const COLOR_STAGE_BG = 0xe8edf2;
 const COLOR_GRID = 0xd2d9e1;
 const COLOR_NODE_FILL = 0x39424f;
-const COLOR_NODE_STROKE = 0x2b333d;
 const COLOR_DIRTY = 0xb3720d; // in flight / still climbing
 const COLOR_CONVERGED = 0x137a52; // settled / agreed
 
@@ -344,13 +343,11 @@ export class StageRenderer {
     return tween;
   }
 
-  /** Draw a node's disc at `radius` (clearing any prior geometry). */
+  /** Draw a node's disc at `radius` (clearing any prior geometry). A flat slate
+   *  fill — on the light stage the disc edge is defined by fill-vs-canvas
+   *  contrast, so a stroke would only add invisible ink. */
   #drawDisc(disc: Graphics, radius: number): void {
-    disc
-      .clear()
-      .circle(0, 0, radius)
-      .fill(COLOR_NODE_FILL)
-      .stroke({ width: 2, color: COLOR_NODE_STROKE });
+    disc.clear().circle(0, 0, radius).fill(COLOR_NODE_FILL);
   }
 
   /** Draw a node's cell arc: an annulus around the disc whose sweep is the
@@ -372,11 +369,7 @@ export class StageRenderer {
       node.disc.tint = 0xffffff;
       node.disc.alpha = 1;
       const fill = f <= 0 ? COLOR_NODE_FILL : lerpColor(COLOR_NODE_FILL, color, 0.35 + 0.65 * f);
-      node.disc
-        .clear()
-        .circle(0, 0, node.radius)
-        .fill(fill)
-        .stroke({ width: 1.5, color: COLOR_NODE_STROKE });
+      node.disc.clear().circle(0, 0, node.radius).fill(fill);
       return;
     }
 
@@ -484,7 +477,10 @@ export class StageRenderer {
     for (const node of this.#nodes.values()) {
       const ring = new Graphics();
       node.root.addChild(ring);
-      const state = { r: baseRadius, alpha: 0.7 };
+      // The deep converged green carries strong contrast on the light stage, so
+      // a bold ring (3px, near-opaque at the outset) reads as a deliberate
+      // "agrees now" beat rather than an ambient halo as it expands and fades.
+      const state = { r: baseRadius, alpha: 0.85 };
       gsap.to(state, {
         r: baseRadius * 3,
         alpha: 0,
@@ -494,7 +490,7 @@ export class StageRenderer {
           ring
             .clear()
             .circle(0, 0, state.r)
-            .stroke({ width: 2, color: COLOR_CONVERGED, alpha: state.alpha });
+            .stroke({ width: 3, color: COLOR_CONVERGED, alpha: state.alpha });
         },
         onComplete: () => ring.destroy(),
       });

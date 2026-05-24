@@ -27,7 +27,7 @@ const INK_SOFT = '#555e6d';
 const GRID = '#e4e8ed'; // cool, faint — matches the light theme's grid token
 const NODE_LINE = 'rgba(85, 94, 109, 0.34)'; // recessive per-node fan line
 const DIRTY = '#b3720d'; // limit / not-yet-agreed (deepened to clear 3:1 on white)
-const DIRTY_FILL = 'rgba(179, 114, 13, 0.15)';
+const DIRTY_FILL = 'rgba(179, 114, 13, 0.2)';
 const INK_FILL = 'rgba(27, 35, 48, 0.08)'; // aggregate area under its line
 
 const FONT = "12px ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
