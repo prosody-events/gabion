@@ -14,6 +14,17 @@ import type { ClusterState } from '../sim/types';
  *  visualizer's tick rate, 600 samples is comfortably past convergence. */
 export const HISTORY_CAP = 600;
 
+/** One node's fan line, keyed by its *stable id* (not rank): its view of the
+ *  total at each retained sample, aligned to `times`. `null` before the node
+ *  joined and after it left — uPlot draws those as a gap, so a newcomer's line
+ *  begins mid-chart and a departed node's line ends there rather than the whole
+ *  window restarting. `samples` counts the non-null entries so a column can be
+ *  dropped once its last real value scrolls out of the window, with no scan. */
+interface NodeColumn {
+  values: (number | null)[];
+  samples: number;
+}
+
 export class ChartHistory {
   /** x-axis: virtual milliseconds since the session began. */
   readonly times: number[] = [];
@@ -23,48 +34,71 @@ export class ChartHistory {
   readonly oracle: number[] = [];
   /** max − min of the per-node views: the disagreement that decays to zero. */
   readonly disagreement: number[] = [];
-  /** One column per node: `nodes[rank]` is the view over time (the fan) of the
-   *  node at that rank in the snapshot's live, insertion-ordered node list — a
-   *  positional series, not keyed by stable id. The count is reshaped (and the
-   *  window cleared) whenever membership changes, so a join or leave restarts
-   *  the fan rather than threading a per-id line through the gap. */
-  readonly nodes: number[][] = [];
+  /** Per-node fan columns keyed by stable id, insertion-ordered. Keying by id
+   *  (not rank) is what lets a join or leave thread through the existing window
+   *  instead of restarting it: a join appends a back-filled column, a leave
+   *  stops feeding one (its line gaps), and the shared time axis never resets. */
+  readonly #columns = new Map<number, NodeColumn>();
 
   get length(): number {
     return this.times.length;
   }
 
+  /** The fan's per-node series count: live nodes plus any departed ones whose
+   *  history is still inside the window. The dashboard sizes the fan chart from
+   *  this (not the live node count), so the series and the columns always agree. */
   get nodeCount(): number {
-    return this.nodes.length;
+    return this.#columns.size;
   }
 
-  /** Discard every sample and re-shape for a cluster of `nodeCount` nodes.
-   *  Called on reset and whenever the node count changes under us. */
-  reset(nodeCount: number): void {
+  /** The fan columns in insertion order — the per-node `y` series uPlot wants,
+   *  with `null` gaps where a node had not yet joined or had already left. */
+  get nodes(): (number | null)[][] {
+    const out: (number | null)[][] = [];
+    for (const col of this.#columns.values()) out.push(col.values);
+    return out;
+  }
+
+  /** Discard every sample and column. Called on a full rebuild (a new preset or
+   *  Reset). A *membership* change does not reset — `push` reshapes in place,
+   *  which is the whole point: the time axis survives a join or leave. */
+  reset(): void {
     this.times.length = 0;
     this.ticks.length = 0;
     this.oracle.length = 0;
     this.disagreement.length = 0;
-    this.nodes.length = 0;
-    for (let i = 0; i < nodeCount; i++) this.nodes.push([]);
+    this.#columns.clear();
   }
 
   /** Append one sample from a fresh snapshot, deriving the disagreement. Drops
    *  the oldest sample once the window is full so memory and redraw cost stay
-   *  bounded. */
+   *  bounded. Reshapes the fan columns for the snapshot's live membership
+   *  without touching the time-series backbone. */
   push(snap: ClusterState): void {
-    if (snap.nodes.length !== this.nodes.length) this.reset(snap.nodes.length);
+    const sampleIdx = this.times.length;
 
     let max = 0;
     let min = snap.nodes.length === 0 ? 0 : Number.POSITIVE_INFINITY;
-    // Index by rank (position in the live node list), not by stable id: after
-    // a removal ids have gaps, but the reshaped `nodes` array is dense 0..N.
-    snap.nodes.forEach((node, rank) => {
+    for (const node of snap.nodes) {
       const total = node.aggregate_total;
       if (total > max) max = total;
       if (total < min) min = total;
-      this.nodes[rank].push(total);
-    });
+      let col = this.#columns.get(node.id);
+      if (col === undefined) {
+        // A newcomer: back-fill the samples before it joined with null, so its
+        // line starts at this x rather than the window's left edge.
+        col = { values: new Array<number | null>(sampleIdx).fill(null), samples: 0 };
+        this.#columns.set(node.id, col);
+      }
+      col.values.push(total);
+      col.samples += 1;
+    }
+    // Every column still at the old length is a departed (or not-yet-rejoined)
+    // node — extend it with a null so its line gaps rather than mis-aligning
+    // with a later node's samples. (A live node grew above, so it is skipped.)
+    for (const col of this.#columns.values()) {
+      if (col.values.length === sampleIdx) col.values.push(null);
+    }
 
     this.times.push(snap.virtual_ms);
     this.ticks.push(snap.tick);
@@ -89,6 +123,12 @@ export class ChartHistory {
     this.ticks.shift();
     this.oracle.shift();
     this.disagreement.shift();
-    for (const column of this.nodes) column.shift();
+    for (const [id, col] of this.#columns) {
+      if (col.values.shift() !== null) col.samples -= 1;
+      // A departed node whose last real sample has now scrolled out leaves an
+      // all-null column. Drop it so the fan's series count returns to the live
+      // set instead of carrying dead lines for the rest of the session.
+      if (col.samples === 0) this.#columns.delete(id);
+    }
   }
 }

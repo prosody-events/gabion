@@ -125,8 +125,10 @@
     trafficCarry = 0;
     trafficInjected = 0;
     // Clear the rolling history so a rebuild starts the charts from a blank
-    // slate (the first sample re-shapes it for the cluster's node count).
-    history.reset(0);
+    // slate (the first sample reshapes the fan for the new cluster). Only a
+    // rebuild clears it — adding or removing a node reshapes in place, so the
+    // shared time axis keeps running across a join or leave.
+    history.reset();
     chartVersion += 1;
     try {
       // Tear the previous engine down first; otherwise its spawned task,

@@ -150,6 +150,12 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
     )
     .toBe(NODES);
   await page.getByRole('button', { name: 'Pause' }).click();
+  // The dashboard before the join: a settled fan and a disagreement curve that
+  // has decayed to zero across the elapsed window. Pair with `dash-after-add`
+  // to eyeball that the join threads through this same window — the time axis
+  // keeps running, the curves don't restart at x = 0.
+  const dashboard = page.locator('.dashboard');
+  await dashboard.screenshot({ path: 'screenshots/dash-before-add.png' });
 
   // Add a fresh node: it takes id 12 and joins cold (its view starts at zero).
   await page.getByRole('button', { name: '+ Add node' }).click();
@@ -157,6 +163,11 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   await expect(newcomer.locator('.node-count')).toHaveText('0');
   await expect(page.locator(COUNTS)).toHaveCount(NODES + 1);
   await page.screenshot({ path: 'screenshots/ring-node-added.png' });
+  // The same dashboard right after the join: the newcomer adds a fan line that
+  // starts *here* (a gap before it, since it did not exist earlier in the
+  // window), the disagreement curve steps back up — and crucially the x-axis is
+  // unbroken from `dash-before-add`, proving the join did not reset the charts.
+  await dashboard.screenshot({ path: 'screenshots/dash-after-add.png' });
 
   // Play on: the newcomer catches up to the settled total by anti-entropy — the
   // survivors push it their cells until its view matches the cluster.

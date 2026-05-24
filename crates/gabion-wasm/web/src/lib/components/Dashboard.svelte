@@ -24,11 +24,20 @@
     showLimit: boolean;
   } = $props();
 
-  const nodeCount = $derived(cluster?.nodes.length ?? 0);
+  // The fan has one line per retained column — live nodes plus any departed one
+  // whose history is still in the window — which is `history.nodeCount`, not the
+  // live count. Reading `version` makes it reactive; its *value* changes only on
+  // a join or leave, so the fan options (and the chart rebuild they drive via
+  // `Chart.svelte`) fire only then, not every sample. The continuous time axis
+  // means that rebuild redraws the same window, it doesn't reset it.
+  const fanSeriesCount = $derived.by(() => {
+    void version;
+    return history.nodeCount;
+  });
 
   // Option shapes rebuild only when their structural input changes (the fan's
   // series count, the limit line's height) — not per sample.
-  const fanOpts = $derived(fanOptions(nodeCount));
+  const fanOpts = $derived(fanOptions(fanSeriesCount));
   const disagreementOpts = disagreementOptions();
   const aggregateOpts = $derived(showLimit ? aggregateLimitOptions(limit) : null);
 
