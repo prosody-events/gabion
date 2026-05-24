@@ -3,9 +3,10 @@
 `gabion-nginx` is gabion's in-process NGINX module: a dynamic `.so` that
 loads into every worker, enforces rate limits at the access phase, and
 (on the elected leader worker) drives the gossip runtime that keeps
-counters in sync across replicas. The module decides admission against
-a cluster-wide aggregate without leaving the worker process — no
-out-of-process call, no syscall, no allocation per request.
+counters in sync across replicas. Admission is decided against a
+cluster-wide aggregate without ever leaving the worker process, so
+each request costs neither an out-of-process call, a syscall, nor a
+heap allocation.
 
 If you're running Envoy sidecars instead of nginx, see
 [`../server/README.md`](../server/README.md) for the gRPC adapter
@@ -54,17 +55,18 @@ http {
 }
 ```
 
-A request under budget gets `200 OK`. Hammering the same IP past
-100 in one second gets `429 Too Many Requests` with
+A request under budget gets `200 OK`; hammering the same IP past 100
+in one second gets `429 Too Many Requests` together with
 `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`, `X-RateLimit-Reset`,
-and `Retry-After` — the four headers pin to the rule with the
-longest window so a client that just tripped a narrow rule isn't
-immediately re-rejected by a wider one.
+and `Retry-After`. Those four headers are pinned to the rule with
+the longest window, so a client that just tripped a narrow rule is
+not immediately re-rejected by a wider one.
 
-Before flipping a new rule to enforcing, run it in dry-run first
-(append the `dry_run` flag); the rule evaluates and records hits —
-metrics and gossip see real traffic — but never rejects. Once the
-allow/reject ratio looks right, drop `dry_run`.
+Before flipping a new rule to enforcing, it is worth running it in
+dry-run first by appending the `dry_run` flag. The rule evaluates
+and records hits — metrics and gossip see real traffic — but never
+rejects, which lets you watch the allow/reject ratio against
+production load before you drop the flag.
 
 To scale beyond one node, add `gabion_gossip_bind`, a non-zero
 `gabion_gossip_cluster` id, and (under Kubernetes) the namespace
@@ -80,9 +82,9 @@ allowlist. See [Running across a cluster](#running-across-a-cluster).
 
 ## Common patterns
 
-Each subsection asks an operator's question first, then names the
-recipe. Stack as many as you need at one location; rules compose
-left-to-right and the first enforcing reject wins.
+Each subsection asks an operator's question first and then names the
+recipe. You can stack as many as you need at one location; rules
+compose left-to-right, and the first enforcing reject wins.
 
 ### How do you exempt internal traffic without measuring it?
 
@@ -100,8 +102,8 @@ server {
 ```
 
 `except_if=$trusted_ip` skips the rule when the variable resolves
-truthy. Exempted requests don't bump the counter, don't hit the
-aggregate, and don't emit a gossip cell. See
+truthy. An exempted request neither bumps the counter nor reaches
+the aggregate, and it produces no gossip cell. See
 [Predicates](#predicates-except_ifvariable) for the truthy/falsy set.
 
 ### How do you key off a tenant header instead of an IP?
@@ -114,10 +116,11 @@ server {
 }
 ```
 
-`$arg_tenant` reads the `?tenant=` query argument. `tenant:` is the
-descriptor key — each distinct tenant gets its own counter. A request
-without `?tenant=` produces an empty value; the rule declines (no
-counter is bumped), and the request flows through.
+`$arg_tenant` reads the `?tenant=` query argument and `tenant:` is
+the descriptor key, so each distinct tenant gets its own counter.
+A request without `?tenant=` produces an empty value, at which point
+the rule declines without bumping a counter and the request flows
+through.
 
 ### How do you roll out a new limit safely?
 
@@ -130,9 +133,10 @@ gabion_limit new_route;
 gabion_limit_rule new_route tenant:$arg_tenant path:$uri rate=50r/m;
 ```
 
-A dry-run rule records hits into the SHM aggregate and gossips them
-to peers, so capacity planning is truthful before you flip the switch.
-You're sizing against real load, not a synthetic projection.
+A dry-run rule still records hits into the SHM aggregate and
+gossips them to peers, so capacity planning is truthful before you
+flip the switch — you are sizing against real load rather than a
+synthetic projection.
 
 ### How do you stack per-IP and per-tenant limits?
 
@@ -143,10 +147,10 @@ gabion_limit_rule per_tenant tenant:$arg_tenant  rate=1000r/m;
 location /api/ { gabion_limit per_ip per_tenant; }
 ```
 
-Each rule is an independent gate; a reject from either rejects the
-request. Headers pin to the rule with the longer window so a 1s
-per-IP reject doesn't tell the client to retry after 1s when the
-1-minute per-tenant budget would also reject them.
+Each rule is an independent gate, and a reject from either rejects
+the request. Headers pin to the rule with the longer window so that
+a 1s per-IP reject does not tell the client to retry after 1s when
+the 1-minute per-tenant budget would also reject them.
 
 ### How do you exclude `/healthz` from rate limiting?
 
@@ -157,9 +161,10 @@ location /healthz {
 }
 ```
 
-`gabion off` skips the access handler entirely — zero per-request
-cost. Use it for liveness probes and static asset paths where you'd
-rather not pay even a SHM atomic load.
+`gabion off` skips the access handler entirely, so the request pays
+zero per-request cost. It is the right choice for liveness probes
+and static asset paths where you would rather not pay even a SHM
+atomic load.
 
 ### How do you scale beyond one node?
 
@@ -169,8 +174,8 @@ gabion_gossip_cluster 0xc0ffee;
 gabion_discovery_namespace_allow my-app-namespace;
 ```
 
-Every gabion process that shares the cluster identifier and can reach
-each other's gossip socket exchanges counters. The
+Every gabion process that shares the cluster identifier and can
+reach the others' gossip sockets exchanges counters with them. The
 [Running across a cluster](#running-across-a-cluster) section names
 the directives by role.
 
@@ -226,20 +231,22 @@ flowchart TD
     style SHM fill:#fafafa,stroke:#666,stroke-dasharray: 4 4
 ```
 
-Three things to read off the picture: `gabion off` and an empty
-`gabion_limit` set both decline early without touching SHM; the
-byte-budget check is the only request-time cardinality gate
-(descriptor count and key length are bounded at config phase); and
-dry-run rules still push to the SHM queue — counters and gossip see
-real traffic, only the reject verdict is suppressed.
+A few things are worth reading off the picture. Both `gabion off`
+and an empty `gabion_limit` set decline early without ever touching
+SHM, which is why those branches are essentially free. The byte-budget
+check is the only cardinality gate evaluated at request time; the
+descriptor count and key length are bounded earlier, at config phase.
+Finally, a dry-run rule still pushes its event onto the SHM queue, so
+counters and gossip continue to see real traffic — only the reject
+verdict itself is suppressed.
 
 ## Directive reference
 
 The full directive surface is below. Every directive starts with
 `gabion_` and is registered as an http-block directive unless noted.
 Errors at `nginx -t` time use the shape *what happened, why it
-likely happened, what to do next* — if you see one that doesn't end
-with a concrete next step, open an issue.
+likely happened, what to do next*; if you see one that doesn't end
+with a concrete next step, please open an issue.
 
 ### Core
 
@@ -283,12 +290,13 @@ variable expression evaluated at request time:
 | `name:"prefix-$foo-$bar"`         | Explicit key; template — compiled to a complex value.          |
 
 Single-variable bindings dispatch through nginx's indexed-variable
-subsystem — O(1) array lookup, no allocation per request. The inline
-fast path (`$uri`, `$request_uri`, `$args`, `$remote_addr`, `$arg_*`)
-skips even the FFI hop. Template bindings compile via
-`ngx_http_compile_complex_value` once at config phase and allocate a
-few tens of bytes per evaluation against the request pool — fine for
-operator-meaningful compositions, but they pay for what they use.
+subsystem, which is an O(1) array lookup with no allocation per
+request. The inline fast path for `$uri`, `$request_uri`, `$args`,
+`$remote_addr`, and `$arg_*` skips even the FFI hop. Template
+bindings compile via `ngx_http_compile_complex_value` once at config
+phase and allocate a few tens of bytes per evaluation against the
+request pool, which is fine for operator-meaningful compositions
+since they only pay for what they use.
 
 **Named arguments.**
 
@@ -304,9 +312,9 @@ operator-meaningful compositions, but they pay for what they use.
 | `except_if=$variable`   | Skip the rule when `$variable` resolves truthy. See [Predicates](#predicates-except_ifvariable).                                           |
 | `domain=NAME`           | Domain bucket for the rule (defaults to `nginx`). Must match `[A-Za-z_][A-Za-z0-9_.-]*`.                                                   |
 
-**Rate, window, and bucket.** A rule resolves to three internal
-numbers — a `limit`, a `window`, and a `bucket`. The directive surface
-gives you three knobs, evaluated in order:
+**Rate, window, and bucket.** A rule resolves internally to three
+numbers — a `limit`, a `window`, and a `bucket` — controlled by
+three directive-level knobs that are evaluated in order:
 
 * `rate=Nr/<unit>` (mandatory) — sustained allowance and its natural
   period.
@@ -314,8 +322,8 @@ gives you three knobs, evaluated in order:
   limit is `floor(rate_count * window_millis / period_millis)`.
   Omitted, the window equals the rate's period.
 * `bucket=DURATION` (optional) — granularity inside the window.
-  Omitted, the bucket equals the resolved window (one fixed-window
-  bucket).
+  Omitted, the bucket equals the resolved window, which gives a
+  single fixed-window bucket.
 
 Worked example:
 
@@ -323,36 +331,35 @@ Worked example:
 gabion_limit_rule per_tenant tenant:$arg_tenant rate=10r/s window=5h bucket=1h;
 ```
 
-resolves to `limit = 10 * 5 * 3600 = 180000`, `window = 5h`,
-`bucket = 1h` (five live buckets). The same triple can be written as
-`rate=180000r/5h bucket=1h` — the resolved enforcement is identical,
-but `rate=10r/s window=5h bucket=1h` preserves the "10 r/s applied
-over 5 hours" intent in the config text.
+resolves to `limit = 10 * 5 * 3600 = 180000`, `window = 5h`, and
+`bucket = 1h`, leaving five live buckets. The same triple can be
+written as `rate=180000r/5h bucket=1h` and the resolved enforcement
+will be identical, but the original phrasing preserves the "10 r/s
+applied over 5 hours" intent in the config text.
 
 > **Rule of thumb.** If you set `window=` larger than the rate's
-> period and don't also set `bucket=`, you get a *burstable* budget —
-> clients can fire the whole window's allowance instantly, then sit
-> empty for the rest of the window. For sustained-rate enforcement,
-> set `bucket=` close to the rate's period. Example:
-> `rate=10r/s window=5h bucket=1s` keeps the 180k 5-hour budget but
-> smooths it to roughly 10 r/s.
+> period and don't also set `bucket=`, you get a *burstable* budget:
+> clients can fire the whole window's allowance instantly and then
+> sit empty for the rest of the window. For sustained-rate
+> enforcement, set `bucket=` close to the rate's period — for
+> example, `rate=10r/s window=5h bucket=1s` keeps the 180k 5-hour
+> budget but smooths it to roughly 10 r/s.
 
-Other things worth knowing:
-
-* **`X-RateLimit-Limit` reports the resolved number.** A rule written
-  as `rate=10r/s window=1h` returns `X-RateLimit-Limit: 36000`. If
-  you surface that header to end users, they will see 36000, not 10.
-* **`Retry-After` scales with the resolved window.** With `window=5h`
-  a rejected client may be told to wait up to 5 hours; without an
-  explicit window, the worst case is the rate's period.
-* **Floor silently under-budgets non-multiples.** `rate=10r/m
-  window=85s` resolves to `limit=14` (the leftover 0.16 period
-  vanishes). Pick `window=` values that are integer multiples of the
-  rate's period when you care about every last request.
-* **`window=` shorter than the rate's period is rejected.** To
-  enforce "100 in 500ms" write `rate=100r/500ms`, not
-  `rate=200r/s window=500ms` — the latter would resolve to `limit=0`
-  and is refused at `nginx -t` time.
+A few related subtleties are worth knowing. `X-RateLimit-Limit`
+reports the resolved number, so a rule written as
+`rate=10r/s window=1h` returns `X-RateLimit-Limit: 36000`; clients
+that see the header will read 36000, not 10. `Retry-After` scales
+with the resolved window in the same way, which means that under
+`window=5h` a rejected client may be told to wait up to five hours,
+whereas without an explicit window the worst case is just the
+rate's period. The floor in the limit calculation silently
+under-budgets non-multiples — `rate=10r/m window=85s` resolves to
+`limit=14` because the leftover 0.16 of a period vanishes — so if
+you care about every last request, pick `window=` values that are
+integer multiples of the rate's period. Finally, a `window=` shorter
+than the rate's period is refused at `nginx -t` time, because the
+resolved limit would be zero; to enforce "100 in 500ms", write
+`rate=100r/500ms` rather than `rate=200r/s window=500ms`.
 
 #### `gabion_limit NAME [NAME ...]` *(http, server, location)*
 
@@ -369,9 +376,10 @@ without disabling the module entirely.
 
 #### `gabion on | off` *(http, server, location)*
 
-`gabion off` disables the access handler for this scope — no rule
-lookup, no SHM read, zero per-request cost. `gabion on` re-enables
-where a parent had it off.
+`gabion off` disables the access handler for this scope so that
+the request never incurs a rule lookup or an SHM read, leaving its
+per-request cost at zero. `gabion on` re-enables the handler where
+a parent had it off.
 
 The two `off` modes are deliberately distinct. Both reach the same
 access-phase outcome (allow); the difference is which directive an
@@ -382,9 +390,10 @@ is in scope for gabion but has no active rules at this level".
 ### Discovery
 
 Without discovery, every node has to be told the address of every
-peer at startup, and rolling deploys break the list. EndpointSlice
-watch makes the membership self-healing — gabion picks up peer pods
-as they come and go, no static list to maintain.
+peer at startup, and a rolling deploy breaks the list. The
+EndpointSlice watch makes membership self-healing: gabion picks up
+peer pods as they come and go, and there is no static list to
+maintain.
 
 | Directive                                     | Description                                                                                  |
 |-----------------------------------------------|----------------------------------------------------------------------------------------------|
@@ -443,10 +452,10 @@ they bound resource use.
 
 The CRDT cell store, dictionaries, dirty rings, and peer frontier
 table allocate exactly once, at leader startup. These knobs size
-that allocation; if you raise one you also raise the worker's RSS by
+that allocation, so raising one also raises the worker's RSS by
 roughly the named slot count times the per-slot byte cost. The
-defaults are sized for production clusters; you should only need to
-touch them if your workload runs into the cap.
+defaults are sized for production clusters and you should only need
+to touch them if your workload runs into the cap.
 
 | Directive                                       | Default     | Effect                                                                                |
 |-------------------------------------------------|-------------|---------------------------------------------------------------------------------------|
@@ -469,17 +478,19 @@ touch them if your workload runs into the cap.
 
 ## Composition: rule layering
 
-Each `gabion_limit` is an independent gate. A request is allowed only
-if **every** rule allows it; the first enforcing reject wins. Reject
-headers pin to the rule with the longest window so a client doesn't
-see a short retry that puts it right back into 429 against a wider
-rule. Internal errors (overflow, decode failures) allow through —
-see the [fail-open invariant](../../README.md#fail-open-invariant).
+Each `gabion_limit` is an independent gate, so a request is allowed
+only if **every** rule allows it and the first enforcing reject
+wins. Reject headers pin to the rule with the longest window, which
+prevents a client from seeing a short retry that puts it right back
+into a 429 against a wider rule. Internal errors such as
+matched-rule overflow or descriptor decode failures fall through to
+allow, as described under the
+[fail-open invariant](../../README.md#fail-open-invariant).
 
 The inheritance shape mirrors nginx core's `limit_req`: **redeclaring
 `gabion_limit` at a child level replaces the parent's set entirely**.
-There is no append form. If a child wants the parent's set plus one
-more rule, it restates the parent's set explicitly.
+There is no append form, so a child that wants the parent's set plus
+one more rule has to restate the parent's set explicitly.
 
 A location's effective config is two independent axes — whether the
 access handler runs at all (`gabion on|off`) and which rule set it
@@ -506,10 +517,10 @@ flowchart LR
 ```
 
 Both axes resolve independently. `gabion off` skips the access handler
-regardless of any `gabion_limit` at the same level. `gabion_limit off`
-empties the rule set but does not stop the handler — useful when a
-later directive (e.g. a future header writer) needs the handler in the
-chain.
+regardless of any `gabion_limit` at the same level, and conversely
+`gabion_limit off` empties the rule set without stopping the handler,
+which is useful when a later directive (for example, a future header
+writer) needs the handler to remain in the chain.
 
 The picture in code:
 
@@ -526,14 +537,16 @@ server {
 }
 ```
 
-Replace-rather-than-append is deliberate. Silent inheritance plus
-override would let a remote `gabion_limit` in a parent quietly
-change behaviour in an apparently-scoped sub-location.
+Replace-rather-than-append is deliberate: if silent inheritance were
+combined with override semantics, a remote `gabion_limit` in some
+parent block could quietly change behaviour inside an apparently
+self-contained sub-location, which is exactly the kind of action at a
+distance the directive shape is designed to rule out.
 
 ### First-class ASN / UA / IP-range limits and bypasses
 
-Variable lookup + `except_if=` + multi-rule stacking lets you treat
-trusted crawlers specially in a single location:
+Variable lookup, `except_if=`, and multi-rule stacking together let
+you treat trusted crawlers specially in a single location:
 
 ```nginx
 geo $trusted_ip { default 0; 127.0.0.1/32 1; }
@@ -551,18 +564,20 @@ gabion_limit_rule per_uri $uri                rate=10r/s;
 server { location /api/ { gabion_limit per_ip per_bot per_uri; } }
 ```
 
-Trusted IPs bypass `per_ip` but still gate against `per_bot` and
-`per_uri`. A misbehaving Googlebot still trips the 10 r/s `per_bot`
-cap. The `per_uri` floor catches anything else hammering a single
-endpoint.
+Trusted IPs bypass `per_ip` but are still gated against `per_bot`
+and `per_uri`, so a misbehaving Googlebot will trip the 10 r/s
+`per_bot` cap, and anything else that hammers a single endpoint will
+hit the `per_uri` floor.
 
-**Cardinality safety.** Don't key directly on `$http_user_agent` —
-every unique UA string becomes a distinct counter and the descriptor
-space explodes. Map UAs through a small `map` block first (the
-`$bot_class` recipe above) so the cardinality is bounded by the
-number of classes you care about. `$geoip2_asn_number` is safe
-(already bucketed to ASN numbers); the human-readable `$geoip2_asn`
-organisation name is not — bound it before binding.
+**Cardinality safety.** Don't key directly on `$http_user_agent`,
+because every unique UA string becomes a distinct counter and the
+descriptor space explodes. Map UAs through a small `map` block first
+(the `$bot_class` recipe above is the pattern) so that the
+cardinality is bounded by the number of classes you care about.
+`$geoip2_asn_number` is safe to bind directly because it is already
+bucketed to ASN numbers; the human-readable `$geoip2_asn`
+organisation name is not, and should be bound through a map before
+it reaches a rule.
 
 ## Predicates: `except_if=$variable`
 
@@ -581,22 +596,20 @@ geo $trusted_ip {
 gabion_limit_rule public_traffic $remote_addr rate=100r/s except_if=$trusted_ip;
 ```
 
-Semantics worth knowing:
-
-- **One `except_if=` per rule.** If a rule repeats the argument, the
-  last one wins silently. To compose multiple bypass conditions,
-  pre-combine them in a `map` or `geo` block.
-- **Predicates never bill the cardinality budget.** A truthy
-  predicate exempts the request before the byte-budget check.
-- **A missing predicate variable falls through.** The rule applies
-  as if the predicate didn't exist — same fail-open shape as a
-  missing descriptor variable. Operator-typo protection runs at
-  startup: `nginx -t` rejects a predicate that names a variable no
-  loaded module provides.
-- **Exempted requests bump a separate counter.** The SHM stats
-  snapshot exposes `exempted` (global) and `exempted_per_rule[]`
-  (per rule, indexed by `rule_id - 1`), so a misconfigured
-  always-true predicate is visible against the global allow counter.
+A few semantics are worth knowing. Only one `except_if=` is permitted
+per rule, and a rule that repeats the argument quietly keeps the
+last one — to compose multiple bypass conditions, pre-combine them
+in a `map` or `geo` block. Predicates never bill the cardinality
+budget, because a truthy predicate exempts the request before the
+byte-budget check ever runs. A missing predicate variable falls
+through, so the rule applies as if the predicate were not there,
+which is the same fail-open shape as a missing descriptor variable;
+operator-typo protection runs at startup, because `nginx -t` rejects
+a predicate that names a variable no loaded module provides.
+Finally, exempted requests bump a separate counter: the SHM stats
+snapshot exposes `exempted` globally and `exempted_per_rule[]`
+indexed by `rule_id - 1`, so a misconfigured always-true predicate
+is visible against the global allow counter.
 
 ### Combining multiple bypass conditions
 
@@ -623,8 +636,8 @@ gabion_limit_rule sensitive_route $uri rate=10r/s except_if=$exempt;
 
 The pattern generalises: build whatever boolean expression you need
 in `map` or `geo`, then pass the final variable to `except_if=`.
-Doing the composition in nginx core keeps gabion's per-request work
-to a single variable lookup.
+Pushing the composition into nginx core keeps gabion's per-request
+work to a single variable lookup.
 
 ## Dry-run mode
 
@@ -634,16 +647,16 @@ gabion_limit per_ip canary;     # canary stacks with per_ip but never rejects
 ```
 
 A dry-run rule evaluates the descriptor, reads the aggregate, and
-records the hit — but never produces a reject verdict. Counters
-and gossip see real traffic, so capacity planning is truthful before
-you flip `enforce`.
+records the hit, but it never produces a reject verdict. Because
+counters and gossip continue to see real traffic, capacity planning
+remains truthful before you flip the rule to `enforce`.
 
 ## Running across a cluster
 
-Beyond a single nginx box, gabion's value is shared counters. The
-three pieces of cluster plumbing are the same across both adapters —
-see the
-[root README](../../README.md#running-across-a-cluster) for the
+Once you move past a single nginx box, gabion's whole value is the
+shared counters, and the three pieces of cluster plumbing involved
+are the same across both adapters — the
+[root README](../../README.md#running-across-a-cluster) carries the
 narrative. The nginx directives that bind each piece are:
 
 | Piece                  | Directive                                                    |
@@ -669,25 +682,28 @@ http {
 }
 ```
 
-Tuning the gossip cadence is rarely necessary; the defaults converge
-in under a second at production scale. When you need to tune,
+Tuning the gossip cadence is rarely necessary, because the defaults
+converge in under a second at production scale. When you do need to
+tune,
 [`crates/gabion/README.md#operator-knobs`](../gabion/README.md#operator-knobs)
-has the canonical knob discussion and a table of effects. The
+has the canonical knob discussion and a table of effects, and the
 matching nginx directives are listed under
 [Gossip — the two adaptive aspects](#gossip--the-two-adaptive-aspects).
 
 ### Verifying convergence
 
-Two things to check after deploy. First, process logs: each worker
-logs the gossip bind, its node identity, and the discovered-peer
-count. `gabion: worker did not win leader lease` means you're
-looking at a follower (only one worker drives gossip per node); no
-peer-discovery logs at all means the discovery filter doesn't match
-anything. Second, the counter delta under load: send traffic to one
-replica and watch counters on every other replica rise within a tick
-or two. If they don't, the gossip channel is partitioned — UDP
-firewall, cluster-id mismatch, or `gabion_gossip_bind`
-unreachability between pods.
+There are two things worth checking after a deploy. The first is the
+process logs: each worker logs the gossip bind, its node identity,
+and the discovered-peer count. A line that reads
+`gabion: worker did not win leader lease` means you are looking at a
+follower, which is expected because only one worker drives gossip
+per node; the absence of any peer-discovery logs at all means the
+discovery filter doesn't match anything. The second check is the
+counter delta under load: send traffic to one replica and watch the
+counters on every other replica rise within a tick or two. If they
+don't, the gossip channel is partitioned — typical causes are a UDP
+firewall, a cluster-id mismatch, or `gabion_gossip_bind` being
+unreachable between pods.
 
 The nginx adapter does not currently expose an admin HTTP endpoint.
 The SHM `Stats` snapshot (`requests`, `allowed`, `rejected`,
@@ -741,9 +757,10 @@ gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a 
 | `peer discovery error` (warn) in the error log                                | The Kubernetes discovery stream returned an error this tick. Membership is stale until the next successful tick.                                    | Usually transient (apiserver flap, transient watch reset). If persistent, check pod RBAC / network reachability to the API.      |
 | `gabion: failed to draw gossip RNG seed` (error) in the error log             | `getrandom` failed at leader startup. The leader did not start; this worker is a follower until something restarts it.                              | Inspect the wrapped `error` field. Usually a sandboxed environment denying `/dev/urandom`; either lift the restriction or supply `gabion_runtime_rng_seed N` to bypass the entropy draw. |
 
-Operator-facing errors say *what happened*, *why it likely
-happened*, and *what to do next*. If you see one that doesn't end
-with a concrete next step, open an issue.
+Operator-facing errors are written to answer three questions: *what
+happened*, *why it likely happened*, and *what to do next*. If you
+see one that doesn't end with a concrete next step, please open an
+issue.
 
 ## Unknown variable detection
 
@@ -756,18 +773,18 @@ every module's `postconfiguration` callback, nginx walks the
 declared dependencies and rejects the config if any variable has no
 provider.
 
-Gabion deliberately does not layer a second validator on top — the
-core check is exhaustive and the error message
-(`unknown 'tursted_ip' variable`) is already operator-clear. Make
-sure the module that provides the variable (`ngx_http_geoip2_module`,
-the `map` directive defining `$bot_class`, the `geo` directive
-defining `$trusted_ip`) is loaded before the `gabion_limit_rule`
-that references it.
+Gabion deliberately does not layer a second validator on top, because
+the core check is already exhaustive and the resulting error message
+(`unknown 'tursted_ip' variable`) is operator-clear on its own. Make
+sure the module that provides the variable — `ngx_http_geoip2_module`,
+or the `map` directive that defines `$bot_class`, or the `geo`
+directive that defines `$trusted_ip` — is loaded before the
+`gabion_limit_rule` that references it.
 
 ## Migration from the pre-1.0 DSL
 
-Pre-1.0: no deprecation cycle, just one-shot updates to operator
-configs.
+There was no deprecation cycle pre-1.0, so the migration is a
+one-shot update to operator configs.
 
 | Before                                                   | After                                                                       |
 |----------------------------------------------------------|-----------------------------------------------------------------------------|
@@ -784,9 +801,9 @@ configs.
 
 The directive surface also gained an explicit `window=` for the
 "N requests per second, applied over an H-hour window" mental model.
-`rate=10r/s window=5h` resolves to a 180,000-over-5h budget —
-equivalent to `rate=180000r/5h`, but the original "10 r/s" intent
-survives in the config text. Read the Rate, window, and bucket
-discussion under `gabion_limit_rule` before reaching for `window=`:
-long windows with the default `bucket=` produce a burstable budget,
-not a paced one.
+`rate=10r/s window=5h` resolves to a 180,000-over-5h budget, which
+is equivalent to `rate=180000r/5h` but preserves the original
+"10 r/s" intent in the config text. Read the rate, window, and
+bucket discussion under `gabion_limit_rule` before reaching for
+`window=`, because long windows combined with the default `bucket=`
+produce a burstable budget rather than a paced one.

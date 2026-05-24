@@ -1,14 +1,14 @@
 # gossip-bench
 
 The simulator-driven evaluation harness for the gabion gossip protocol.
-The Rust binary runs scenarios against `gabion::gossip::sim::SimRouter`
-under virtual time and emits a JSON result; a Python harness
+A Rust binary runs scenarios against `gabion::gossip::sim::SimRouter`
+under virtual time and emits a JSON result, while a Python harness
 (`bench/plot.py`) generates scenario matrices, drives the binary, and
-produces SVG plots.
+turns the resulting records into SVG plots.
 
-Read [`crates/gabion/README.md`](../gabion/README.md) for the gossip
-explainer and the headline numbers. This README only covers how to run
-the suite.
+For the gossip explainer itself and the headline numbers we publish,
+see [`crates/gabion/README.md`](../gabion/README.md); the present
+document is concerned only with the mechanics of running the suite.
 
 ## Running
 
@@ -30,8 +30,9 @@ Suite names: `convergence`, `fanout_sweep`, `loss`, `partition`,
 `staleness`, `scale_n`, `adaptive_fanout`, `error_budget`,
 `min_emit_clamp`, `heartbeat_threshold_mix`.
 
-The first run builds `target/release/gossip-bench` once and reuses it
-for every subsequent scenario.
+On the first invocation the harness builds `target/release/gossip-bench`
+once and then reuses the same binary across every subsequent scenario,
+so repeated runs pay only the cost of the simulator itself.
 
 ## Ad-hoc scenarios
 
@@ -49,17 +50,21 @@ for f in 1 2 3 5; do
 done | cargo run -p gossip-bench --release -- batch > matrix.jsonl
 ```
 
-Built-in example kinds: `convergence`, `loss`, `partition`,
-`sustained`, `scale_n`, `fanout_sweep`, `adaptive_fanout`,
-`error_budget`, `min_emit_clamp`, `heartbeat_threshold_mix`.
+The built-in example kinds available through `--kind` are `convergence`,
+`loss`, `partition`, `sustained`, `scale_n`, `fanout_sweep`,
+`adaptive_fanout`, `error_budget`, `min_emit_clamp`, and
+`heartbeat_threshold_mix`.
 
 ## What each suite measures
 
-Two suites are the empirical evidence for gabion's *adaptive emit rate*:
-`min_emit_clamp` and `error_budget`. One suite is the evidence for
-*adaptive fanout*: `adaptive_fanout`. The rest are classical
-anti-entropy measurements borrowed from the literature surveyed in
-[`REFERENCES.md`](REFERENCES.md).
+The suites fall into two groups. Three of them are the empirical
+evidence for gabion's two adaptive mechanisms: `adaptive_fanout`
+exercises the runtime's *adaptive fanout*, while `error_budget` and
+`min_emit_clamp` together exercise its *adaptive emit rate*. The
+remaining suites are classical anti-entropy measurements borrowed from
+the literature surveyed in [`REFERENCES.md`](REFERENCES.md), and serve
+mainly to establish that gabion behaves as the published theory
+predicts before we layer the adaptive machinery on top.
 
 | Suite | Paper | What it measures |
 | --- | --- | --- |
@@ -74,10 +79,11 @@ anti-entropy measurements borrowed from the literature surveyed in
 | `min_emit_clamp` | gabion-specific | Evidence for **adaptive emit rate** (the floor): adversarial saturating write rate; sweeps `min_emit_interval`. Confirms the floor caps worst-case emit rate while the cluster still converges. |
 | `heartbeat_threshold_mix` | gabion-specific | A hot rule (saturating ε every tick) and a cold rule (slow trickle) replicate concurrently; both must converge. |
 
-Each suite's headline numbers, methodology, and full figure live in
-[`crates/gabion/README.md#what-we-measured`](../gabion/README.md#what-we-measured).
-[`REFERENCES.md`](REFERENCES.md) is the paper-by-paper survey behind
-the methodology choices.
+The headline number from each suite, the methodology behind it, and the
+full-resolution figure all live in
+[`crates/gabion/README.md#what-we-measured`](../gabion/README.md#what-we-measured),
+and [`REFERENCES.md`](REFERENCES.md) provides the paper-by-paper survey
+that justifies the methodology choices made here.
 
 ## Files
 

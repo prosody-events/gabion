@@ -2,10 +2,10 @@
 
 The pure-Rust library at the heart of every gabion deployment. It owns
 the CRDT, the gossip runtime, the wire codec, the rule machinery, and the
-discovery interface — but knows nothing about YAML, gRPC, or nginx. Both
-adapters in the workspace (`gabion-server` and `gabion-nginx`) build their
-configuration on top of the same library types and call the same hot
-paths.
+discovery interface, while knowing nothing about YAML, gRPC, or nginx.
+Both adapters in the workspace (`gabion-server` and `gabion-nginx`) build
+their configuration on top of the same library types and call the same
+hot paths.
 
 This README is the canonical guide to the library. If you want to
 understand how the cluster stays consistent, how a packet is shaped, or
@@ -29,9 +29,9 @@ the [repo root README](../../README.md#glossary).
 
 ## Module map
 
-Six modules. Every type that crosses an adapter boundary lives in
-exactly one of them, and the dependency graph is a DAG (no module
-imports from a module that imports it).
+The library is divided into six modules, and every type that crosses an
+adapter boundary lives in exactly one of them. The dependency graph is
+a DAG, so no module imports from a module that imports it.
 
 | Module       | Path                          | What it owns                                                                                                                              |
 |--------------|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
@@ -42,19 +42,21 @@ imports from a module that imports it).
 | `discovery`  | `src/discovery/*`             | `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation. Adapters consume `PeerEvent` streams; the gossip runtime treats peer add/remove as a normal `select!` arm. |
 | `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, fanout floor, payload caps, the per-rule error budget, and the min-emit floor. |
 
-`gossip` depends on every other module. `wire` and `crdt` are independent
-of each other. `defaults` is a leaf — `rules` and `gossip` import it; it
-imports nothing in this crate. Adapters consume the public surface of
-`gossip`, `rules`, and `discovery`, plus the constants in `defaults`.
+`gossip` sits at the top of that graph and depends on every other
+module, whereas `wire` and `crdt` are independent of each other.
+`defaults` is a leaf: `rules` and `gossip` import it, and it imports
+nothing else in this crate. Adapters consume the public surface of
+`gossip`, `rules`, and `discovery`, together with the constants in
+`defaults`.
 
 ## How gossip works
 
 Gossip is the protocol that turns N independent counter stores into one
 *eventually consistent* counter store. Every node admits requests
-against its local view of the cluster aggregate; gossip is what keeps
-that view fresh. From the adapter's side it shows up as a single call:
-admission writes a row through `GossipClient::record`, and the runtime
-tick later turns those rows into outbound frames.
+against its local view of the cluster aggregate, and gossip is what
+keeps that view fresh. From the adapter's side it shows up as a single
+call: admission writes a row through `GossipClient::record`, and a
+later runtime tick turns those rows into outbound frames.
 
 The protocol has two adaptive aspects, and they are the reason gabion
 holds up under load that a textbook anti-entropy loop would not:
@@ -79,10 +81,10 @@ which cells go to which peer.
 
 ### The wire frame
 
-Every gossip frame is one self-describing UDP packet. There is no
-session state on either side: each frame decodes independently, even if
-its predecessor was dropped. Loss of a packet costs you a few cells
-until the next tick refills them.
+Every gossip frame is one self-describing UDP packet, with no session
+state on either side: each frame decodes independently, even if its
+predecessor was dropped. Loss of a packet costs you a few cells until
+the next tick refills them.
 
 The header is fixed at 72 bytes. Every multi-byte field is encoded
 little-endian; the first four bytes on the wire are `0x32 0x47 0x42
@@ -137,14 +139,14 @@ empty.
 If the cluster is configured with a shared HMAC key, an additional
 **32-byte HMAC-SHA256 tag** is appended over the header and body, and
 `FLAG_AUTHENTICATED` is set. Inbound packets whose tag fails verify are
-dropped on the floor. The whole cluster must agree on the key.
+dropped on the floor, and the whole cluster must agree on the key.
 
 The codec lives in `src/wire/{header,body,auth}.rs`. The library's own
 `FrameLimits::default()` is 256 KB — useful for tests and the simulator
 — but production adapters plumb `gabion::defaults::GOSSIP_MAX_PAYLOAD_BYTES`
 (1400 bytes, the safe IPv4 MSS floor) into `FrameLimits` so frames stay
 well below the path MTU and avoid IP fragmentation. Frames larger than
-the cap split into multiple packets at the sender; each packet is
+the cap split into multiple packets at the sender, and each packet is
 independently decodable.
 
 ### The anti-entropy loop
@@ -154,10 +156,11 @@ single-threaded event loop driven by one `tokio::select!` with six
 arms: limit requests from the adapter, inbound packets, outbound
 writability, peer membership churn, admin commands, and the heartbeat
 tick. After every iteration that produced delta or expiration rows, the
-runtime calls `aggregates.apply(...)` exactly once — that's the
+runtime calls `aggregates.apply(...)` exactly once — that is the
 contract with the downstream rate-limit decision path. Empty iterations
 (an idle tick, a peer event with no CRDT effect) short-circuit the
-apply.
+apply so the read side of the aggregate is never disturbed for no
+reason.
 
 ```mermaid
 sequenceDiagram
@@ -199,12 +202,13 @@ that peer has already acknowledged.
 
 ### Adaptive fanout
 
-A burst lands. The dirty set jumps from one cell to a thousand. With
-fixed fanout `f`, propagation now takes O(dirty / f) rounds — for a
-1024-cell burst at f=1, that's a thousand rounds before everyone
-converges. Karp et al. (2000) prove an O(log_{1+f} N) lower bound for
-pure-push protocols, but a fixed `f` chosen for the quiet case cannot
-get near it when the dirty set explodes.
+Suppose a burst lands and the dirty set jumps from one cell to a
+thousand. With fixed fanout `f`, propagation now takes O(dirty / f)
+rounds, which for a 1024-cell burst at f=1 means a thousand rounds
+before everyone converges. Karp et al. (2000) prove an
+O(log_{1+f} N) lower bound for pure-push protocols, but a fixed `f`
+chosen for the quiet case cannot get near that bound when the dirty set
+explodes.
 
 Gabion grows the per-tick peer count with the size of the dirty set.
 The pick lives in `GossipRuntime::handle_gossip_tick`:
@@ -215,11 +219,11 @@ let log_dirty = bit_length(dirty);          // ≈ floor(log₂ dirty) + 1
 let pick_count = max(config.fanout, log_dirty).min(peer_count);
 ```
 
-Then a partial Fisher-Yates shuffle picks `pick_count` distinct peers
-from `self.peers` — distinct, not with-replacement, because sampling
-the same peer twice in one tick burns a send-pool slot to encode the
-same frame twice. Some example pick counts at `fanout = 6` (the
-default):
+A partial Fisher-Yates shuffle then picks `pick_count` distinct peers
+from `self.peers`. The peers must be distinct rather than sampled with
+replacement, because sampling the same peer twice in one tick would
+burn a send-pool slot encoding the same frame twice. Some example pick
+counts at `fanout = 6` (the default):
 
 | `dirty`  | `log_dirty` | `pick_count`               |
 |----------|-------------|----------------------------|
@@ -231,20 +235,21 @@ default):
 | 1024     | 11          | 11                         |
 | 1 048 576 | 21         | 21 (capped at peer count)  |
 
-Quiet ticks pay nothing — the floor stays at `fanout`. The wide-fanout
-cost only lands on the ticks that need it, and falls off again as the
-dirty ring drains. Verma & Ooi (ICDCS 2005) prove that adaptive widening
-gives O(log N) burst convergence at the cost of one extra tick of
-latency in the worst case; the `adaptive_fanout` bench
-[below](#what-we-measured) shows that empirically.
+Quiet ticks pay nothing because the floor stays at `fanout`, while the
+wide-fanout cost only lands on the ticks that need it and falls off
+again as the dirty ring drains. Verma & Ooi (ICDCS 2005) prove that
+adaptive widening gives O(log N) burst convergence at the cost of one
+extra tick of latency in the worst case, and the `adaptive_fanout`
+bench [below](#what-we-measured) shows that empirically.
 
 ### Adaptive emit rate
 
 The heartbeat tick is bounded below by `tick_interval` (default
-100 ms). That works for cold rules but is pessimistic for hot ones — a
-saturating burst between two heartbeats could leak many admissions past
-the limit before the next tick. Lowering `tick_interval` for everyone
-costs bandwidth on every quiet rule in the cluster.
+100 ms). That cadence works for cold rules but is pessimistic for hot
+ones, because a saturating burst between two heartbeats could leak many
+admissions past the limit before the next tick. Lowering
+`tick_interval` for everyone is not an answer either: it costs
+bandwidth on every quiet rule in the cluster.
 
 The runtime crosses this trade with a per-rule error budget.
 `GossipRuntime::handle_limit_request` keeps a small `rule_pending`
@@ -286,18 +291,16 @@ stateDiagram-v2
     Idle --> Emit: heartbeat tick<br/>(unconditional; drains cold rules)
 ```
 
-Three operational properties drop out:
-
-- **Bounded cluster-wide error.** Default `target_err_bps = 100` means
-  the global unreplicated error per rule never exceeds 1 % of the
-  rule's limit, regardless of how fast requests come in.
-- **Cold rules still propagate.** The heartbeat is independent of the
-  threshold path. A rule whose pending count never reaches ε_R still
-  replicates every `tick_interval`.
-- **A bandwidth floor.** Under an adversarial rate where ε saturates,
-  `min_emit_interval` caps the worst-case emit rate. Convergence still
-  happens; the cluster just absorbs the burst at a different bandwidth
-  budget.
+Three operational properties fall out of this design. The cluster-wide
+unreplicated error per rule is bounded: at the default
+`target_err_bps = 100`, the global error never exceeds 1 % of the
+rule's limit no matter how fast requests come in. Cold rules still
+propagate, because the heartbeat is independent of the threshold path
+and any rule whose pending count never reaches ε_R still replicates
+every `tick_interval`. Finally, under an adversarial workload where ε
+saturates and every hit would otherwise emit, `min_emit_interval` caps
+the worst-case emit rate; convergence still happens, but the cluster
+absorbs the burst at a different bandwidth budget.
 
 The `error_budget` and `min_emit_clamp` bench suites measure both
 sides of this trade.
@@ -331,10 +334,10 @@ debug the CRDT.
 
 ## Operator knobs
 
-Most deployments leave the defaults alone — they're chosen to keep
-convergence well under a second at typical cluster sizes (≤ 256). The
-table is for the days you need to tune; it splits into the two adaptive
-halves.
+Most deployments leave the defaults alone, because they are chosen to
+keep convergence well under a second at typical cluster sizes
+(≤ 256). The table below is for the days when you do need to tune, and
+it splits into the two adaptive halves of the protocol.
 
 ### Heartbeat cadence and fanout (adaptive fanout)
 
@@ -353,9 +356,9 @@ halves.
 | `min_emit_interval`  | 5 ms        | Floor between two threshold-fire emissions. Caps worst-case emit rate when ε saturates under adversarial load.                         | Raise if a bad client is pinning the gossip socket; lower to chase microsecond convergence on tiny clusters.  |
 
 The `gabion::defaults` module is the single source of truth for these
-constants. Both adapters read from it; if you change a default, both
-adapters move together. Per-adapter configuration translates each knob
-to its surface name — see [`crates/server/README.md`](../server/README.md)
+constants. Both adapters read from it, so if you change a default the
+two adapters move together. Per-adapter configuration translates each
+knob to its surface name — see [`crates/server/README.md`](../server/README.md)
 for the YAML keys and [`crates/nginx/README.md`](../nginx/README.md) for
 the directives.
 
@@ -369,11 +372,11 @@ gossip simulator across the suites; see
 running the bench.
 
 The suites split into four bundles. Steady-state convergence and scale
-prove the protocol meets its asymptotic bounds. Resilience proves it
-survives the failure modes operators see in practice. The adaptive
-machinery suites — `adaptive_fanout`, `error_budget`,
-`min_emit_clamp`, and `heartbeat_threshold_mix` — are the empirical
-evidence for the two adaptive aspects of the protocol.
+together show that the protocol meets its asymptotic bounds, while the
+resilience suite shows that it survives the failure modes operators
+see in practice. The adaptive machinery suites — `adaptive_fanout`,
+`error_budget`, `min_emit_clamp`, and `heartbeat_threshold_mix` — are
+the empirical evidence for the two adaptive aspects of the protocol.
 
 ### Steady-state convergence
 
@@ -393,10 +396,10 @@ under the f = 6 production default — is within one extra round of f = 8.
 **Method.** Fix N = 32, sweep static `fanout` from 1 to 12, measure both
 convergence rounds and bytes-per-node-per-second.
 
-**Takeaway.** Rounds drop sharply between f = 1 and f = 3, then flatten.
-Bandwidth scales roughly linearly with `fanout`. The sweet spot near
-f = 3–6 is where bandwidth stays modest while convergence sits within
-a round of the asymptote.
+**Takeaway.** Rounds drop sharply between f = 1 and f = 3 and then
+flatten, while bandwidth scales roughly linearly with `fanout`. The
+sweet spot near f = 3–6 is where bandwidth stays modest while
+convergence sits within a round of the asymptote.
 
 ### Scale
 
@@ -407,7 +410,7 @@ converge should track `log₂ N`; bytes-per-node-per-second should stay
 roughly constant (SWIM's "constant load per node" property).
 
 **Takeaway.** Rounds-to-converge sits at or below `log₂ N` all the way
-through N = 1024. Per-node bandwidth is flat in N — the curve is within
+through N = 1024, and per-node bandwidth is flat in N to within the
 noise of a horizontal line.
 
 ### Resilience
@@ -418,7 +421,7 @@ noise of a horizontal line.
 50 %. N = 16, f = 3, 20 s of virtual time.
 
 **Takeaway.** Convergence rounds climb only a small constant as loss
-rises; gabion converges in every trial including the 50 % loss row.
+rises, and gabion converges in every trial including the 50 % loss row.
 Bimodal Multicast (Birman et al. 1999) reports stable delivery to
 ~25–30 %; gabion's empirical tolerance is roughly twice that, thanks
 to peer-frontier dedup plus the rotating repair lane.
@@ -429,7 +432,7 @@ to peer-frontier dedup plus the rotating repair lane.
 heal at t = 10 s. Time-to-reconverge measured from the heal.
 
 **Takeaway.** Once the links open, the next tick after heal drains the
-partition; reconvergence is bounded above by one `tick_interval`.
+partition, so reconvergence is bounded above by one `tick_interval`.
 
 ![staleness](figures/staleness.svg)
 
@@ -437,14 +440,14 @@ partition; reconvergence is bounded above by one `tick_interval`.
 per-hit p50 / p95 lag (Astrolabe-style staleness).
 
 **Takeaway.** P50 and p95 lag both stay flat at a single `tick_interval`
-regardless of the number of concurrent writers — the dirty ring drains
-in one round under steady state.
+regardless of the number of concurrent writers, because the dirty ring
+drains in one round under steady state.
 
 ### Adaptive machinery
 
 These four suites are the empirical evidence for the two adaptive
 aspects of the protocol. `adaptive_fanout` exercises adaptive fanout;
-`error_budget` and `min_emit_clamp` exercise adaptive emit rate;
+`error_budget` and `min_emit_clamp` exercise adaptive emit rate; and
 `heartbeat_threshold_mix` confirms the cold-rule heartbeat is
 independent of the threshold path.
 
@@ -499,11 +502,11 @@ virtual time. The `BurstCompressed` workload calls `record(...)` with
 every bps — so every hit crosses the budget. Sweep
 `min_emit_interval ∈ {0, 1, 5, 10, 50}` ms.
 
-**Takeaway.** Bandwidth scales inversely with the floor; the floor
-caps worst-case emit rate. Threshold-fires-per-node drops by ~50× across
-the sweep (6.1 at floor = 0 / 1 ms down to 0.1 at floor = 50 ms). Final
-divergence stays at zero in every configuration — the cluster still
-converges after the burst, just at a different bandwidth budget.
+**Takeaway.** Bandwidth scales inversely with the floor, which is what
+caps worst-case emit rate. Threshold-fires-per-node drops by ~50×
+across the sweep (6.1 at floor = 0 / 1 ms down to 0.1 at floor = 50 ms),
+and final divergence stays at zero in every configuration — the cluster
+still converges after the burst, just at a different bandwidth budget.
 
 ![heartbeat_threshold_mix](figures/heartbeat_threshold_mix.svg)
 
@@ -512,10 +515,10 @@ burst every tick (threshold path); the cold rule receives one hit per
 second (heartbeat path). Both must converge.
 
 **Takeaway.** The left panel shows the hot rule converging
-sub-heartbeat through threshold fires. The right panel shows the cold
-rule riding the proactive heartbeat. Cold-rule replication does not
-depend on the threshold ever firing — heartbeat and threshold are
-independent code paths.
+sub-heartbeat through threshold fires, while the right panel shows the
+cold rule riding the proactive heartbeat. Cold-rule replication does
+not depend on the threshold ever firing, because heartbeat and
+threshold are independent code paths.
 
 ## References
 
