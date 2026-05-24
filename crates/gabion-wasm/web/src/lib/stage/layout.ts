@@ -62,3 +62,31 @@ export function fitTransform(width: number, height: number): StageTransform {
 export function toScreen(p: Point, t: StageTransform): Point {
   return { x: t.offsetX + p.x * t.scale, y: t.offsetY + p.y * t.scale };
 }
+
+/** Inverse of {@link toScreen}: container/screen pixels back to logical stage
+ *  coordinates. Used to hit-test a pointer against the ring. */
+export function toLogical(p: Point, t: StageTransform): Point {
+  return { x: (p.x - t.offsetX) / t.scale, y: (p.y - t.offsetY) / t.scale };
+}
+
+/** The node a screen-space pointer is over, or `null` if it is over none.
+ *  Nearest disc by Euclidean distance, accepted only *inside* the node's
+ *  radius — discs never overlap, so a hit is unambiguous and a click on the
+ *  bare stage misses cleanly (the design wants precise, intentional clicks,
+ *  not a generous catch-all). */
+export function nodeAt(screen: Point, count: number, t: StageTransform): number | null {
+  if (count === 0 || t.scale <= 0) return null;
+  const p = toLogical(screen, t);
+  const radius = nodeRadius(count);
+  let best: number | null = null;
+  let bestDist = radius;
+  for (let i = 0; i < count; i++) {
+    const c = nodePosition(i, count);
+    const dist = Math.hypot(p.x - c.x, p.y - c.y);
+    if (dist <= bestDist) {
+      bestDist = dist;
+      best = i;
+    }
+  }
+  return best;
+}

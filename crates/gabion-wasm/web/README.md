@@ -12,7 +12,9 @@ fly between nodes as eased light-beams (thickness ∝ bytes, dropped packets fad
 mid-flight); the cluster pulses once, in sync, the instant every node agrees. A
 transport bar steps the engine; a burst of hits seeded on one node at `t = 0`
 gossips outward until the ring converges — the end-to-end proof the gabion core
-runs in a browser.
+runs in a browser. Clicking any node injects a fresh burst there (a pure inject
+at the current virtual time), so you can poke the cluster and watch it
+re-converge — the first of the Phase 6 interactions.
 
 The right rail is the **convergence dashboard**: a pinned headline metric
 ("disagreement → 0", the live spread between the best- and worst-informed node,
@@ -42,9 +44,10 @@ bounded, column-major rolling history that the engine appends to on each step.
   wrapper that converts JS numbers to the `bigint`s wasm-bindgen wants for u64
   arguments and asserts the numeric boundary contract at runtime.
 - `src/lib/stage/` — the renderer. `layout.ts` is the shared coordinate system
-  (ring positions, fit transform) consumed by both the canvas and the DOM
-  labels; `renderer.ts` is the framework-agnostic `StageRenderer` that owns the
-  PixiJS canvas, draws the layers, and animates beams + the pulse with GSAP.
+  (ring positions, fit transform, and the inverse `nodeAt` hit-test) consumed by
+  the canvas, the DOM labels, and the click-a-node handler alike; `renderer.ts`
+  is the framework-agnostic `StageRenderer` that owns the PixiJS canvas, draws
+  the layers, and animates beams + the pulse with GSAP.
 - `src/lib/charts/` — the dashboard. `history.ts` is the bounded, column-major
   rolling time-series (a plain class, not reactive — the owner bumps a single
   counter to drive redraws); `options.ts` builds each uPlot chart's options
@@ -65,7 +68,10 @@ canvas, sharing `layout.ts`'s coordinates so a label always sits on its disc.
 That overlay is the canvas's text alternative, the sighted-reader's numerals,
 *and* what the Playwright assertions query — which keeps the functional test
 independent of whether headless WebGL produced exact pixels. The overlay is
-`pointer-events: none` so it never intercepts the canvas hit-tests Phase 6 needs.
+`pointer-events: none` so it never intercepts the click-a-node hit-test, which
+maps a pointer back through the fit transform to the nearest disc (`nodeAt` in
+`layout.ts`). Clicking a disc is a pointer-only power gesture; the
+keyboard/AT-accessible "send to node N" equivalent lands with the control rail.
 
 ## Develop
 

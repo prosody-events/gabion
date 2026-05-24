@@ -3,6 +3,8 @@ import { expect, test } from '@playwright/test';
 const COUNTS = '.stage-labels .node-count';
 const SEED_TOTAL = '50';
 const NODES = 12;
+// Mirrors `CLICK_HITS` in `App.svelte`: the burst a single node click injects.
+const CLICK_HITS = '25';
 
 // One end-to-end check that doubles as the visual-quality screenshot source:
 // the page boots the real gabion core in the browser, the PixiJS stage renders
@@ -72,6 +74,35 @@ test('boots, renders the ring, and gossips to convergence in-browser', async ({ 
   // spread, the converged badge cleared.
   await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
   await expect(page.locator('.headline.converged')).toHaveCount(0);
+
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
+// Click-a-node: a pointer click on a disc injects a burst at that node, at the
+// current (paused) virtual time. The label overlay is `pointer-events: none`, so
+// clicking its center falls through to the stage's hit-test; we read the geometry
+// off the same overlay the canvas hides behind.
+test('clicking a node injects a burst at the current virtual time', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  // The page boots paused, with only node 0 seeded. Pick an empty node to poke.
+  const target = page.locator('.node-label[data-index="3"]');
+  await expect(target.locator('.node-count')).toHaveText('0');
+
+  const box = await target.boundingBox();
+  if (box === null) throw new Error('node 3 label has no bounding box to click');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+
+  // The clicked node now carries the burst. The click is a pure inject — it does
+  // not advance time, and the burst is far below the threshold-AE budget, so it
+  // does not spread: node 0 keeps its seed and the rest stay at zero.
+  await expect(target.locator('.node-count')).toHaveText(CLICK_HITS);
+  await expect(page.locator('.node-label[data-index="0"] .node-count')).toHaveText(SEED_TOTAL);
+  await expect(page.locator('.node-label[data-index="5"] .node-count')).toHaveText('0');
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });

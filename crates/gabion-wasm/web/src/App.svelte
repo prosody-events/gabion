@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Sim } from './lib/sim/sim';
-  import type { ClusterState, SimConfig, SimEvent } from './lib/sim/types';
+  import type { ClusterState, EventBatch, SimConfig, SimEvent } from './lib/sim/types';
   import { ChartHistory } from './lib/charts/history';
   import Stage from './lib/components/Stage.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
@@ -16,11 +16,17 @@
   // the multi-hop propagation this view exists to show. A burst large enough to
   // approach the limit would trip the eager threshold flush and converge in one
   // round; that overload regime, and the Aggregate-vs-Limit chart it powers,
-  // land as a Phase 6 preset. Interactions arrive in Phase 6.
+  // land as a Phase 6 preset. Clicking a node already injects a burst (see
+  // `sendBurst`); the control rail, presets, and scrubber are still to come.
   const CONFIG: Partial<SimConfig> = { nodes: 12, rng_seed: 1 };
   const SEED_NODE = 0;
   const SEED_KEY = 1;
   const SEED_HITS = 50;
+  // Clicking a node injects this many hits for the same watched key, so the
+  // click grows the *same* counter the seed did and the burst spreads on the
+  // next ticks. Sized well under the threshold-AE budget (ε ≈ limit·bps/(10⁴·N),
+  // ~900 at the default limit) so a click never trips an eager flush by itself.
+  const CLICK_HITS = 25;
   // One gossip tick at the production default (`GOSSIP_TICK_INTERVAL_MILLIS`),
   // which `CONFIG` leaves unset.
   const TICK_MS = 100;
@@ -114,12 +120,33 @@
     });
   }
 
+  /** Show a batch's gossip events as stage beams — but only when it produced
+   *  some, so a no-op sub-tick step doesn't clear beams still in flight. The one
+   *  place this invariant lives; both the play loop and a click route through it. */
+  function showEvents(batch: EventBatch): void {
+    if (batch.events.length > 0) events = batch.events;
+  }
+
   async function advance(deltaMs: number): Promise<void> {
     if (sim === null) return;
     try {
-      const batch = await sim.step(deltaMs);
-      if (batch.events.length > 0) events = batch.events;
+      showEvents(await sim.step(deltaMs));
       applySnapshot(await sim.snapshot());
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      pause();
+    }
+  }
+
+  /** Inject a burst at `node` for the watched key, at the current virtual time —
+   *  a pure inject: it never advances time, so the stage/charts only move on the
+   *  next step or play. While playing the loop snapshots every frame, so a click
+   *  just shows its beams; while paused nothing else will, so it snapshots once. */
+  async function sendBurst(node: number): Promise<void> {
+    if (sim === null) return;
+    try {
+      showEvents(await sim.submitRequest(node, SEED_KEY, CLICK_HITS));
+      if (!playing) applySnapshot(await sim.snapshot());
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -179,7 +206,7 @@
     <p class="lede">
       A cluster of nodes spreading per-origin rate-limit counters by anti-entropy
       gossip. Press play to watch one node's burst of {SEED_HITS} hits propagate until
-      every node agrees.
+      every node agrees — or click any node to send it a fresh burst of {CLICK_HITS}.
     </p>
   </header>
 
@@ -194,7 +221,7 @@
     {:else}
       <div class="workspace">
         <div class="stage-pane">
-          <Stage {cluster} {events} />
+          <Stage {cluster} {events} onSendBurst={(node) => void sendBurst(node)} />
         </div>
         <Dashboard {cluster} {history} version={chartVersion} />
       </div>

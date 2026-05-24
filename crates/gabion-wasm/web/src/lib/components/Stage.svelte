@@ -5,6 +5,7 @@
   import {
     DOT_THRESHOLD,
     fitTransform,
+    nodeAt,
     nodePosition,
     nodeRadius,
     toScreen,
@@ -17,12 +18,28 @@
   // gossip packets from each step. A DOM overlay sits on top of the canvas with
   // the per-node index and total — the canvas is opaque to assistive tech and
   // to test tooling, so the real numbers live in queryable, tabular-figure text.
-  let { cluster, events }: { cluster: ClusterState | null; events: SimEvent[] } = $props();
+  //
+  // `onSendBurst` is the click-a-node affordance: clicking a disc injects a
+  // burst at that node. This is a pointer-only power gesture (the canvas is one
+  // opaque image to assistive tech); the keyboard/AT-accessible equivalent is
+  // the explicit "send to node N" control that lands with the control rail.
+  let {
+    cluster,
+    events,
+    onSendBurst,
+  }: {
+    cluster: ClusterState | null;
+    events: SimEvent[];
+    onSendBurst?: (node: number) => void;
+  } = $props();
 
   let container: HTMLDivElement;
   let renderer: StageRenderer | null = null;
   let ready = $state(false);
   let transform: StageTransform = $state(fitTransform(0, 0));
+  // The node the pointer is currently over, or null — drives the cursor
+  // affordance so the ring reads as clickable only where a click would land.
+  let hoverNode: number | null = $state(null);
 
   const nodes = $derived(cluster?.nodes ?? []);
   const count = $derived(nodes.length);
@@ -46,6 +63,27 @@
   $effect(() => {
     if (ready && renderer !== null && events.length > 0) renderer.applyEvents(events);
   });
+
+  /** Resolve a pointer event to the node under it (or null), in the container's
+   *  own pixel space. The label overlay is `pointer-events: none`, so a pointer
+   *  over a disc reaches this handler whether it is over the canvas or a label. */
+  function nodeUnder(event: PointerEvent): number | null {
+    const rect = container.getBoundingClientRect();
+    return nodeAt({ x: event.clientX - rect.left, y: event.clientY - rect.top }, count, transform);
+  }
+
+  function onPointerMove(event: PointerEvent): void {
+    hoverNode = nodeUnder(event);
+  }
+
+  function onPointerLeave(): void {
+    hoverNode = null;
+  }
+
+  function onPointerDown(event: PointerEvent): void {
+    const node = nodeUnder(event);
+    if (node !== null) onSendBurst?.(node);
+  }
 
   onMount(() => {
     let disposed = false;
@@ -79,12 +117,25 @@
   });
 </script>
 
-<div class="stage" bind:this={container} role="img" aria-label={summary}>
+<div
+  class="stage"
+  class:actionable={hoverNode !== null}
+  bind:this={container}
+  role="img"
+  aria-label={summary}
+  onpointerdown={onPointerDown}
+  onpointermove={onPointerMove}
+  onpointerleave={onPointerLeave}
+>
   {#if showLabels}
     <div class="stage-labels" aria-hidden="true">
       {#each nodes as node (node.index)}
         {@const s = toScreen(nodePosition(node.index, count), transform)}
-        <span class="node-label" style="left: {s.x}px; top: {s.y}px; font-size: {labelFont}px;">
+        <span
+          class="node-label"
+          data-index={node.index}
+          style="left: {s.x}px; top: {s.y}px; font-size: {labelFont}px;"
+        >
           <span class="node-index numeric">{node.index}</span>
           <span class="node-count numeric">{node.aggregate_total}</span>
         </span>
@@ -100,6 +151,12 @@
     height: 100%;
     overflow: hidden;
     background: var(--stage-bg);
+  }
+
+  /* The ring reads as interactive only over a disc — the cursor is the
+     signifier that a click here will land on a node. */
+  .stage.actionable {
+    cursor: pointer;
   }
 
   /* The overlay must never intercept pointer events — Phase 6 hit-tests the
