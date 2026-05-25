@@ -569,3 +569,136 @@ test('network partition splits the cluster until healed', async ({ page }) => {
   await page.getByRole('button', { name: 'Pause' }).click();
   await page.screenshot({ path: 'screenshots/ring-healed.png' });
 });
+
+// The redesigned node-detail panel surfaces the full AdminSnapshot in grouped,
+// labeled sections. This asserts each section renders with live values: the
+// §2 convergence headline (honestly "This node's view", not "Cluster total"),
+// §4 cadence, §5 I/O & queues, §6 storage gauges, §7 peer table, §8 identity.
+test('the node inspector renders every detail section', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  // Spread some traffic so cadence/peers/storage carry non-trivial values.
+  await setSpeed(page, 3);
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect.poll(async () => nonZeroCount(page), { timeout: 15_000 }).toBe(NODES);
+  await page.getByRole('button', { name: 'Pause' }).click();
+
+  const target = page.locator('.node-label[data-id="0"]');
+  const box = await target.boundingBox();
+  if (box === null) throw new Error('node 0 label has no bounding box to click');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+
+  const inspector = page.locator('.inspector');
+  await expect(inspector).toBeVisible();
+
+  // §2 — the headline is this node's view, with its two references inline.
+  await expect(inspector).toContainText("This node's view");
+  await expect(inspector.locator('.hl-refs')).toContainText('true');
+  await expect(inspector.locator('.hl-refs')).toContainText('limit');
+  // A convergence badge is always present (one of the three states).
+  await expect(inspector.locator('.badge[role="status"]').first()).toBeVisible();
+
+  // §4–§7 section headings.
+  await expect(inspector.locator('.section-head', { hasText: 'Gossip cadence' })).toBeVisible();
+  await expect(inspector.locator('.section-head', { hasText: 'Gossip I/O' })).toBeVisible();
+  await expect(inspector.locator('.section-head', { hasText: 'Storage' })).toBeVisible();
+  await expect(inspector.locator('.section-head', { hasText: 'Peers' })).toBeVisible();
+
+  // §4 — the cadence status word and live tick sparkline.
+  await expect(inspector.locator('.cadence .status-word')).toBeVisible();
+  await expect(inspector.locator('.cadence .spark')).toBeVisible();
+
+  // §6 — three occupancy gauges plus the send-queue meter = four meters; the
+  // calm "holding" badge at zero rejects.
+  await expect(inspector.locator('[role="meter"]')).toHaveCount(4);
+  await expect(inspector.locator('.holding')).toContainText('All capacities holding');
+
+  // §7 — the peer table summary and a resolved peer row.
+  await expect(inspector.locator('.peer-summary')).toContainText('tracked');
+  await expect(inspector.locator('table.peers tbody tr').first()).toContainText('known');
+
+  // §8 — the collapsed identity footer with its hex preview.
+  await expect(inspector.locator('details.identity summary')).toContainText('Identity');
+
+  // Honesty invariant (guards the §2/§3 rewrite): the headline "this node's
+  // view" equals the Strata Σ for the single watched key — the strip shows
+  // exactly the cells the node's aggregate counts. (Strip commas from the
+  // localized hero before comparing.)
+  const hero = Number(
+    (await inspector.locator('.hl-value').textContent())?.replace(/,/g, '') ?? '0',
+  );
+  const sigma = Number(
+    (await inspector.locator('.strata .sigma-value').first().textContent()) ?? '0',
+  );
+  expect(sigma, "Strata Σ should equal this node's aggregate view").toBe(hero);
+
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
+// Two orthogonal states on independent channels. Convergence: a fresh node lags
+// the origin, then catches up (deterministic on Sandbox — no background feed).
+// Admission: on the low-limit overload preset the aggregate climbs past the
+// limit, recoloring the headline and showing the honest "over limit" pill
+// (the visualizer counts past the cap; it never claims to have rejected).
+test('the inspector shows convergence lag and the over-limit state', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  // --- Convergence channel, on Sandbox ---
+  await page.getByRole('button', { name: 'Sandbox' }).click();
+  // Inject at node 0 (the origin): its view equals the oracle → caught up.
+  const origin = page.locator('.node-label[data-id="0"]');
+  let box = await origin.boundingBox();
+  if (box === null) throw new Error('node 0 has no bounding box');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.locator('.inspector').getByRole('button', { name: 'Send burst' }).click();
+  await expect(page.locator('.inspector .badge')).toContainText('caught up');
+
+  // Switch to an empty node: it has none of the origin's burst yet → lagging.
+  const other = page.locator('.node-label[data-id="6"]');
+  box = await other.boundingBox();
+  if (box === null) throw new Error('node 6 has no bounding box');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(page.locator('.inspector .badge')).toContainText('lagging');
+  // Step until it catches up by gossip.
+  for (let i = 0; i < 12; i++) {
+    await page.getByRole('button', { name: 'Step forward one tick' }).click();
+  }
+  await expect(page.locator('.inspector .badge')).toContainText('caught up');
+
+  // --- Admission channel, on the overload preset ---
+  await page.getByRole('button', { name: 'Sustained overload' }).click();
+  await setSpeed(page, 4);
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect
+    .poll(
+      async () => Number((await page.locator('.node-label[data-id="0"] .node-count').textContent()) ?? '0'),
+      { timeout: 15_000 },
+    )
+    .toBeGreaterThan(400);
+  await page.getByRole('button', { name: 'Pause' }).click();
+  box = await page.locator('.node-label[data-id="0"]').boundingBox();
+  if (box === null) throw new Error('node 0 has no bounding box');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  // The headline recolors (the `.over` class) and the over-limit pill appears.
+  await expect(page.locator('.inspector .hl-value.over')).toBeVisible();
+  await expect(page.locator('.inspector .pill')).toContainText('over limit');
+
+  // The pill sits at the panel's right edge; its tooltip must grow inward, not
+  // clip against the inspector's overflow box (it is right-aligned for exactly
+  // this reason).
+  await page.locator('.inspector .pill .term').hover();
+  await page.waitForTimeout(200);
+  const bubble = page.locator('.inspector .pill .bubble');
+  await expect(bubble).toBeVisible();
+  const bb = await bubble.boundingBox();
+  const ib = await page.locator('.inspector').boundingBox();
+  if (bb === null || ib === null) throw new Error('missing tooltip/inspector box');
+  expect(bb.x + bb.width, 'the tooltip clipped past the inspector right edge').toBeLessThanOrEqual(
+    ib.x + ib.width + 1,
+  );
+});
