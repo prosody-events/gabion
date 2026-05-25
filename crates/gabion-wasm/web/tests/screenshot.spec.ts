@@ -426,10 +426,12 @@ test('selecting a scenario preset rebuilds the cluster with its seed', async ({ 
   await expect(page.locator('.node-label[data-id="1"] .node-count')).toHaveText('0');
 });
 
-// The rebuild knobs live behind a collapsed disclosure (Hick's law). Opening it
-// and moving the packet-loss slider updates its readout and rebuilds the cluster
-// with the new value — the cluster still boots (no errors) and stays at N nodes.
-test('a rebuild knob updates its readout and rebuilds the cluster', async ({ page }) => {
+// The rebuild knobs live behind a collapsed disclosure (Hick's law). They are
+// build-time settings, so editing one only *stages* it: the readout updates and
+// a "staged" cue appears, but nothing rebuilds and the section stays open until
+// the explicit Rebuild. This guards the regression where a knob change flashed
+// "Loading…", reset the running sim, and collapsed the disclosure.
+test('a rebuild knob stages, keeps the section open, and applies on Rebuild', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
@@ -437,27 +439,45 @@ test('a rebuild knob updates its readout and rebuilds the cluster', async ({ pag
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
 
+  const details = page.locator('details.tune');
   await page.getByText('Tune the cluster').click();
-  // A range input can't be `fill`ed: set the value, fire `input` so Svelte's
-  // bind reads it, then `change` to commit (which rebuilds with the new config).
+  await expect(details).toHaveAttribute('open', '');
+  // Nothing staged yet → Rebuild is disabled.
+  const rebuild = page.getByRole('button', { name: 'Rebuild cluster' });
+  await expect(rebuild).toBeDisabled();
+
+  // A range input can't be `fill`ed: set the value and fire `input` so Svelte's
+  // bind reads it. With the new model there is no `change`-to-rebuild.
   await page.getByLabel('Packet loss').evaluate((el: HTMLInputElement) => {
     el.value = '0.5';
     el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
   });
 
+  // The readout updated and the knob is marked staged; the section stayed open
+  // and no rebuild fired (no loading overlay, Rebuild now enabled).
   await expect(page.locator('label[for="knob-loss"] .val')).toHaveText('50%');
-  // The rebuild left a healthy cluster of the same size.
+  await expect(page.locator('.knob.changed label[for="knob-loss"]')).toBeVisible();
+  await expect(page.locator('.tune-status')).toContainText('staged');
+  await expect(page.locator('.overlay', { hasText: 'Loading the gossip engine' })).toHaveCount(0);
+  await expect(details).toHaveAttribute('open', '');
+  await expect(rebuild).toBeEnabled();
+
+  // Rebuild applies the staged set: the cluster rebuilds (same size, no errors),
+  // the section is still open, and nothing is staged any more.
+  await rebuild.click();
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  await expect(details).toHaveAttribute('open', '');
+  await expect(page.locator('.tune-status')).toContainText('match');
+  await expect(rebuild).toBeDisabled();
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // The rule knobs (Slice 2) live in the same disclosure: a gossip-interval and
 // window range plus a limit number input. Moving the window updates its derived
-// bucket-count readout (the same `buckets.ts` math the Strata draws bars from)
-// and rebuilds the cluster — proof the readout and the rebuild are wired and the
-// engine still accepts the new window/bucket pairing (window stays a whole
-// number of 1 s buckets, so `SimConfig::validate` passes).
+// bucket-count readout (the same `buckets.ts` math the Strata draws bars from);
+// the explicit Rebuild then applies it — proof the readout and the rebuild are
+// wired and the engine still accepts the new window/bucket pairing (window stays
+// a whole number of 1 s buckets, so `SimConfig::validate` passes).
 test('the window knob updates its bucket-count readout and rebuilds', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
@@ -471,17 +491,16 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
   // the engine retains; see `buckets.ts`).
   await expect(page.locator('label[for="knob-window"] .val')).toHaveText('10 s · 11 buckets');
 
-  // Move the window to 5 s → 6 buckets, and commit the rebuild. The label's
-  // accessible name carries the readout ("Window 5 s · …"), so match by
-  // substring like the Packet-loss control above.
+  // Move the window to 5 s → 6 buckets. The readout updates immediately (the
+  // staged value), before any rebuild.
   await page.getByLabel('Window').evaluate((el: HTMLInputElement) => {
     el.value = '5000';
     el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
   });
-
   await expect(page.locator('label[for="knob-window"] .val')).toHaveText('5 s · 6 buckets');
-  // The rebuild left a healthy cluster of the same size, no errors.
+
+  // Apply it. The rebuild left a healthy cluster of the same size, no errors.
+  await page.getByRole('button', { name: 'Rebuild cluster' }).click();
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });

@@ -14,6 +14,9 @@
     canAdd,
     burstHits = $bindable(),
     knobs,
+    appliedKnobs,
+    tuneOpen,
+    onToggleTune,
     onSelectPreset,
     onApplyKnobs,
     onSend,
@@ -30,9 +33,16 @@
     canAdd: boolean;
     burstHits: number;
     // A live `$state` proxy owned by App: the sliders mutate its fields in place
-    // (no reassignment, so it need not be `$bindable`), and `onApplyKnobs`
-    // rebuilds the cluster with the new values once a slider is released.
+    // (no reassignment, so it need not be `$bindable`). Editing a knob only
+    // *stages* it — nothing rebuilds until `onApplyKnobs`.
     knobs: Knobs;
+    // The knobs the current engine was built from. A field that differs from
+    // `knobs` is staged-but-not-applied; `onApplyKnobs` (Rebuild) applies them.
+    appliedKnobs: Knobs;
+    // The disclosure's open state, owned by App so it survives a rebuild's
+    // loading flash (the rail unmounts then; native `<details>` state would not).
+    tuneOpen: boolean;
+    onToggleTune: (open: boolean) => void;
     onSelectPreset: (preset: Preset) => void;
     onApplyKnobs: () => void;
     onSend: (node: number) => void;
@@ -40,6 +50,19 @@
     onAddNode: () => void;
     onRemoveNode: (id: number) => void;
   } = $props();
+
+  // Which rebuild knobs have been moved since the last build — staged, awaiting
+  // a Rebuild. The set drives the per-row "changed" cue and gates the button.
+  const KNOB_FIELDS = [
+    'fanout',
+    'target_err_bps',
+    'uniform_loss',
+    'rule_limit',
+    'rule_window_ms',
+    'tick_interval_ms',
+  ] as const;
+  const changed = $derived(new Set(KNOB_FIELDS.filter((k) => knobs[k] !== appliedKnobs[k])));
+  const dirty = $derived(changed.size > 0);
 
   const activePreset = $derived(presets.find((p) => p.id === activeId));
   const activeBlurb = $derived(activePreset?.blurb ?? '');
@@ -100,85 +123,50 @@
     <p class="blurb">{activeBlurb}</p>
   </section>
 
-  <details class="tune">
+  <details class="tune" open={tuneOpen} ontoggle={(e) => onToggleTune(e.currentTarget.open)}>
     <summary>Tune the cluster</summary>
-    <p class="hint">Sliders rebuild the cluster on release.</p>
-    <div class="knob">
+    <p class="hint">Edit freely — changes stage until you rebuild.</p>
+    <div class="knob" class:changed={changed.has('fanout')}>
       <label for="knob-fanout">Fanout<span class="val numeric">{knobs.fanout}</span></label>
-      <input
-        id="knob-fanout"
-        type="range"
-        min="1"
-        max={maxFanout}
-        step="1"
-        bind:value={knobs.fanout}
-        onchange={onApplyKnobs}
-      />
+      <input id="knob-fanout" type="range" min="1" max={maxFanout} step="1" bind:value={knobs.fanout} />
     </div>
-    <div class="knob">
+    <div class="knob" class:changed={changed.has('target_err_bps')}>
       <label for="knob-bps">Error budget<span class="val numeric">{knobs.target_err_bps} bps</span></label>
-      <input
-        id="knob-bps"
-        type="range"
-        min="0"
-        max="2000"
-        step="50"
-        bind:value={knobs.target_err_bps}
-        onchange={onApplyKnobs}
-      />
+      <input id="knob-bps" type="range" min="0" max="2000" step="50" bind:value={knobs.target_err_bps} />
     </div>
-    <div class="knob">
+    <div class="knob" class:changed={changed.has('uniform_loss')}>
       <label for="knob-loss">Packet loss<span class="val numeric">{lossPct}%</span></label>
-      <input
-        id="knob-loss"
-        type="range"
-        min="0"
-        max="0.9"
-        step="0.05"
-        bind:value={knobs.uniform_loss}
-        onchange={onApplyKnobs}
-      />
+      <input id="knob-loss" type="range" min="0" max="0.9" step="0.05" bind:value={knobs.uniform_loss} />
     </div>
     <!-- The rule + gossip knobs. Longer gossip interval = slower propagation;
          the window readout shows its derived bucket count (the bars the Strata
          draws); the limit reaches 1 000 000 so a narrative preset's pinned limit
          is editable, not clamped away. -->
-    <div class="knob">
+    <div class="knob" class:changed={changed.has('tick_interval_ms')}>
       <label for="knob-gossip">Gossip interval<span class="val numeric">{knobs.tick_interval_ms} ms</span></label>
-      <input
-        id="knob-gossip"
-        type="range"
-        min="50"
-        max="1000"
-        step="50"
-        bind:value={knobs.tick_interval_ms}
-        onchange={onApplyKnobs}
-      />
+      <input id="knob-gossip" type="range" min="50" max="1000" step="50" bind:value={knobs.tick_interval_ms} />
     </div>
-    <div class="knob">
+    <div class="knob" class:changed={changed.has('rule_window_ms')}>
       <label for="knob-window">Window<span class="val numeric">{windowSec} s · {windowBuckets} buckets</span></label>
-      <input
-        id="knob-window"
-        type="range"
-        min="3000"
-        max="30000"
-        step="1000"
-        bind:value={knobs.rule_window_ms}
-        onchange={onApplyKnobs}
-      />
+      <input id="knob-window" type="range" min="3000" max="30000" step="1000" bind:value={knobs.rule_window_ms} />
     </div>
-    <div class="knob">
+    <div class="knob" class:changed={changed.has('rule_limit')}>
       <label for="knob-limit">Rule limit</label>
-      <input
-        id="knob-limit"
-        class="numeric"
-        type="number"
-        min="1"
-        max="1000000"
-        step="100"
-        bind:value={knobs.rule_limit}
-        onchange={onApplyKnobs}
-      />
+      <input id="knob-limit" class="numeric" type="number" min="1" max="1000000" step="100" bind:value={knobs.rule_limit} />
+    </div>
+    <!-- Build-time settings apply only on an explicit rebuild — so editing never
+         nukes the running sim or collapses this section. The button is live only
+         while there is a staged change. -->
+    <div class="tune-apply">
+      <p class="tune-status" aria-live="polite">
+        {#if dirty}
+          <span class="staged-dot" aria-hidden="true"></span>
+          <span class="numeric">{changed.size}</span> staged — rebuild to apply
+        {:else}
+          Settings match the running cluster.
+        {/if}
+      </p>
+      <button class="rebuild" onclick={onApplyKnobs} disabled={!dirty}>Rebuild cluster</button>
     </div>
   </details>
 
@@ -448,10 +436,74 @@
     color: var(--ink);
   }
 
+  /* A staged (changed-but-not-applied) knob: its readout turns dirty-hued and a
+     marker rides the label, so the pending state reads in text + colour + a
+     glyph, never colour alone. */
+  .knob.changed .val {
+    color: var(--signal-dirty);
+    font-weight: 600;
+  }
+
+  .knob.changed label::before {
+    content: '•';
+    margin-right: 0.3em;
+    color: var(--signal-dirty);
+  }
+
+  .knob.changed input[type='number'] {
+    border-color: var(--signal-dirty);
+  }
+
   input[type='range'] {
     width: 100%;
     accent-color: var(--ink);
     cursor: pointer;
+  }
+
+  /* The explicit apply control: a status line (staged count or "matches") and
+     the Rebuild button, live only while a change is staged. */
+  .tune-apply {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+  }
+
+  .tune-status {
+    display: flex;
+    align-items: center;
+    gap: 0.4em;
+    margin: 0;
+    font-size: var(--text-sm);
+    color: var(--ink-faint);
+  }
+
+  .staged-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--signal-dirty);
+    flex: none;
+  }
+
+  .rebuild {
+    align-self: flex-start;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--ink);
+    border-radius: var(--radius);
+    background: var(--ink);
+    color: var(--chrome-panel);
+    font-size: var(--text-sm);
+    transition: background 120ms ease;
+  }
+
+  .rebuild:hover:not(:disabled) {
+    background: var(--ink-hover);
+  }
+
+  .rebuild:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
 
   .send {

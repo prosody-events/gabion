@@ -33,8 +33,18 @@
   // from the active preset and merged over its config on each (re)build, so a
   // slider tweak followed by a rebuild explores the parameter space without
   // leaving the scenario. They take effect only on rebuild — a live engine can't
-  // change its node count — so the rail's sliders rebuild on release.
+  // change its node count — so editing a knob just *stages* it; the rail's
+  // explicit "Rebuild" applies the staged set in one build.
   let knobs = $state<Knobs>(knobsFromPreset(DEFAULT_PRESET));
+  // The knob values the *current* engine was built from. `bootstrap` snapshots
+  // `knobs` into this on every (re)build, so the rail can show which sliders have
+  // been moved since — staged but not yet applied — and enable Rebuild only when
+  // there is something to apply.
+  let appliedKnobs = $state<Knobs>(knobsFromPreset(DEFAULT_PRESET));
+  // The "Tune the cluster" disclosure's open state, lifted here so it survives
+  // the workspace unmount during a rebuild's loading flash — a knob edit (which
+  // no longer rebuilds) keeps it open, and an explicit Rebuild reopens it.
+  let tuneOpen = $state(false);
   // Hits per burst, shared by a stage click and the control rail's Send so the
   // two always agree. Each burst targets the same watched key, growing the same
   // counter the preset seeded. The default sits well under the threshold-AE
@@ -166,6 +176,9 @@
       const fresh = await Sim.create(effectiveConfig(preset));
       await preset.seed(fresh);
       sim = fresh;
+      // The engine now reflects the current knobs — mark them applied so the
+      // rail's "staged" cue and Rebuild button reset to clean.
+      appliedKnobs = { ...knobs };
       await refresh();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -392,6 +405,9 @@
           canAdd={nodeIds.length < MAX_LIVE_NODES}
           bind:burstHits
           {knobs}
+          {appliedKnobs}
+          {tuneOpen}
+          onToggleTune={(open) => (tuneOpen = open)}
           onSelectPreset={selectPreset}
           onApplyKnobs={() => void bootstrap()}
           onSend={(node) => void sendBurst(node)}
