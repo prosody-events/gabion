@@ -95,12 +95,13 @@
   const history = new ChartHistory();
   let chartVersion = $state(0);
 
-  // The active preset's sustained feed (the overload scenario), folded into the
-  // play loop. Carry-save accumulation makes the total injected by virtual time
-  // T exactly ⌊rate·T⌋ regardless of how play chunked the steps — deterministic
-  // and replayable from zero. `trafficInjected` is the running global hit count:
-  // it caps the feed and indexes the round-robin node spread, so both stay
-  // chunk-independent too. Plain `let` (not `$state`) — nothing renders them.
+  // The active preset's background feed (every narrative preset and overload;
+  // not sandbox), folded into the play loop. Carry-save accumulation makes the
+  // total injected by virtual time T exactly ⌊rate·T⌋ regardless of how play
+  // chunked the steps — deterministic and replayable from zero. The feed is
+  // uncapped (the windowed oracle decays on its own); `trafficInjected` is the
+  // running global hit count, kept only to index the round-robin node spread so
+  // it stays chunk-independent. Plain `let` (not `$state`) — nothing renders them.
   let trafficCarry = 0;
   let trafficInjected = 0;
 
@@ -228,9 +229,8 @@
     const count = cluster.nodes.length;
     if (count === 0) return;
     trafficCarry += (traffic.rate_per_sec * deltaMs) / 1000;
-    let hits = Math.floor(trafficCarry);
+    const hits = Math.floor(trafficCarry);
     trafficCarry -= hits;
-    hits = Math.min(hits, traffic.cap - trafficInjected);
     if (hits <= 0) return;
     // Spread by global hit index so the per-node split is chunk-independent;
     // the round-robin runs over *ranks* (positions in the live node list) and
@@ -430,7 +430,7 @@
                 {history}
                 version={chartVersion}
                 limit={knobs.rule_limit}
-                showLimit={activePreset.traffic !== undefined}
+                showLimit={activePreset.showsLimitChart === true}
               />
             {/if}
           </div>

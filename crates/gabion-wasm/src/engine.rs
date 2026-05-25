@@ -260,9 +260,6 @@ struct EngineState {
     now: SharedNow,
     /// Virtual time elapsed since the session began, in milliseconds.
     virtual_ms: u64,
-    /// Ground-truth total hits submitted for the watched rule — the
-    /// simulator-only oracle the convergence fan races toward.
-    oracle_total: u64,
 }
 
 impl EngineState {
@@ -284,7 +281,6 @@ impl EngineState {
             log,
             now,
             virtual_ms: 0,
-            oracle_total: 0,
         };
 
         // The initial members are ids 0..N, so the address of id `i` is
@@ -476,7 +472,6 @@ impl EngineState {
             )
             .await
             .map_err(|source| EngineError::Gossip { node, source })?;
-        self.oracle_total = self.oracle_total.saturating_add(hits);
 
         // `record` returns only after the aggregate `apply` ran, so the cell
         // events are already buffered. Drain and stamp them at the current
@@ -745,12 +740,27 @@ impl EngineState {
                 peers,
             });
         }
+        // The ground-truth windowed total, derived from the live CRDT cells
+        // rather than a monotonic accumulator: sum every node's
+        // locally-originated cells for the watched rule. Each hit is recorded
+        // once at its origin (`merge_remote` preserves the wire origin, so a
+        // forwarded replica is never `is_local` on a non-origin holder), so the
+        // sum counts each hit exactly once — and it decays with the window as
+        // cells age out, which a monotonic counter never did. This is the
+        // honest target the convergence fan races toward.
+        let fingerprint = self.config.rule_fingerprint;
+        let oracle_total: u64 = nodes
+            .iter()
+            .flat_map(|node| &node.cells)
+            .filter(|cell| cell.is_local && cell.rule == fingerprint)
+            .map(|cell| cell.count)
+            .sum();
         let rd = self.rule_descriptor();
         ClusterState {
             virtual_ms: self.virtual_ms,
             tick: self.current_tick(),
             nodes,
-            oracle_total: self.oracle_total,
+            oracle_total,
             // The CRDT's own window layout at this instant — the Strata renders
             // these directly instead of recomputing the boundary in TypeScript.
             bucket_epoch_now: rd.current_epoch(self.virtual_ms),

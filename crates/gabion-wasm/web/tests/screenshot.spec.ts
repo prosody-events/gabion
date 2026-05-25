@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
 const COUNTS = '.stage-labels .node-count';
 const SEED_TOTAL = '50';
@@ -7,13 +7,38 @@ const NODES = 12;
 // the rail's Send injects (a stage click now *selects*, it does not burst).
 const BURST_HITS = '25';
 
+/** Set the playback speed slider (a range input can't be `fill`ed). */
+async function setSpeed(page: Page, value: number): Promise<void> {
+  await page.getByLabel('Playback speed').evaluate((el: HTMLInputElement, v: number) => {
+    el.value = String(v);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  }, value);
+}
+
+/** Read the transport bar's virtual-time readout, in seconds. */
+async function virtualSeconds(page: Page): Promise<number> {
+  const text = await page
+    .locator('.readout-item', { hasText: 'virtual time' })
+    .locator('.readout-value')
+    .textContent();
+  return Number.parseFloat((text ?? '0').replace('s', ''));
+}
+
+/** How many of the on-stage node counts are currently non-zero. */
+async function nonZeroCount(page: Page): Promise<number> {
+  const counts = await page.locator(COUNTS).allTextContents();
+  return counts.filter((t) => Number(t.trim()) > 0).length;
+}
+
 // One end-to-end check that doubles as the visual-quality screenshot source:
 // the page boots the real gabion core in the browser, the PixiJS stage renders
 // the ring from a snapshot, and — when played — gossips the seeded burst out to
-// every node as light-beam packets. The hard assertions read the DOM label
-// overlay (robust regardless of WebGL pixels); the screenshots are for eyeballing
-// the canvas itself (discs, beams, convergence pulse).
-test('boots, renders the ring, and gossips to convergence in-browser', async ({ page }) => {
+// every node as light-beam packets. The narrative presets now carry a faint
+// uncapped background feed, so the cluster never settles on a single clean total
+// and never falls silent — the burst spreads on top of a living hum, and gossip
+// continues indefinitely. The hard assertions read the DOM label overlay (robust
+// regardless of WebGL pixels); the screenshots are for eyeballing the canvas.
+test('boots, gossips the burst out, and keeps gossiping past the window', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
@@ -21,40 +46,38 @@ test('boots, renders the ring, and gossips to convergence in-browser', async ({ 
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
   await page.screenshot({ path: 'screenshots/ring-initial.png' });
 
-  // Before any gossip, only the seeded node carries the burst total, so the
-  // cluster maximally disagrees: one node at 50, the rest at 0. (The default
-  // limit is high enough that the burst stays below gabion's threshold flush,
-  // so it spreads only when played — no eager pre-spread.)
+  // Before any gossip (paused, so the background feed has not yet run): only the
+  // seeded node carries the burst total — one node at 50, the rest at 0, maximal
+  // disagreement. The narrative limit keeps the burst below the threshold flush,
+  // so it spreads only when played.
   const initial = await page.locator(COUNTS).allTextContents();
   expect(initial.filter((t) => t.trim() === SEED_TOTAL)).toHaveLength(1);
   await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
 
-  // Play; the burst propagates as beams until every node agrees on the total.
+  // Play at speed so the burst gossips out and virtual time crosses the window.
+  await setSpeed(page, 4);
   await page.getByRole('button', { name: 'Play' }).click();
 
   // Catch the stage mid-gossip: beams in flight, arcs partly filled. Best-effort
-  // — a snapshot for eyeballing, not an assertion (timing the burst exactly is
-  // racy at 12 nodes).
+  // — a snapshot for eyeballing, not an assertion.
   await page.waitForTimeout(250);
   await page.screenshot({ path: 'screenshots/ring-gossip.png' });
 
+  // The burst (and the background hum) reach every node — no node sits at zero.
   await expect
-    .poll(
-      async () => {
-        const counts = await page.locator(COUNTS).allTextContents();
-        return counts.filter((t) => t.trim() === SEED_TOTAL).length;
-      },
-      { timeout: 15_000, message: 'cluster did not converge on the seeded total' },
-    )
+    .poll(async () => nonZeroCount(page), {
+      timeout: 15_000,
+      message: 'the burst did not gossip out to every node',
+    })
     .toBe(NODES);
-  // Grab the converged frame immediately, while the convergence pulse may still
-  // be expanding.
   await page.screenshot({ path: 'screenshots/ring-converged.png' });
 
-  // The pinned headline reaches zero and latches the round count — the dashboard
-  // tells the same convergence story the stage just animated.
-  await expect(page.locator('.headline.converged .headline-value')).toHaveText('0');
-  await expect(page.locator('.badge')).toHaveText(/converged in \d+ rounds?/);
+  // Perpetual gossip — the regression this guards. Well past the old ~11 s
+  // silence point (where every store emptied and beams stopped), the windowed
+  // background feed keeps live cells on every node, so the cluster never falls
+  // quiet. Drive virtual time past 13 s and confirm it is still carrying traffic.
+  await expect.poll(async () => virtualSeconds(page), { timeout: 15_000 }).toBeGreaterThan(13);
+  expect(await nonZeroCount(page), 'the cluster fell silent past the window').toBe(NODES);
 
   await page.getByRole('button', { name: 'Pause' }).click();
 
@@ -71,10 +94,8 @@ test('boots, renders the ring, and gossips to convergence in-browser', async ({ 
       { timeout: 10_000, message: 'Reset did not rebuild a freshly-seeded cluster' },
     )
     .toBe(1);
-  // The dashboard resets with the engine: headline back to the full burst
-  // spread, the converged badge cleared.
+  // The dashboard resets with the engine: headline back to the full burst spread.
   await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
-  await expect(page.locator('.headline.converged')).toHaveCount(0);
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
@@ -174,40 +195,59 @@ test('the pinned headline stays visible in both rail modes', async ({ page }) =>
   await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
 });
 
-// The inspector's Strata: per-bucket bars for the selected node's window, summed
-// straight from its cells. The Σ readout must equal the node's aggregate (the
-// honesty invariant — the strip shows exactly the cells the node holds), a bar
-// must carry the right count, and playing past the 10 s window must age the
-// bucket out (the buckets scrolled off), emptying the strip.
-test('the strata shows bucket counts, matches the node total, and ages out', async ({ page }) => {
+// The Sandbox preset is the user-driven complement to the continuous-feed
+// presets: a blank cluster with no background traffic. It is the one scenario
+// that shows the full state-driven lifecycle honestly — inject a cell by hand,
+// Step it out round by round to convergence, then watch it age back to quiet
+// once the window slides past it (nothing replenishes it). It also carries the
+// Strata honesty invariant (Σ over the rendered slots equals the node's
+// aggregate) in a deterministic, feed-free setting.
+test('Sandbox: inject, Step it out to convergence, then age out to quiet', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await page.goto('/');
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
 
-  // Select node 0 — the seeded burst node, so its window holds one bucket of 50.
+  await page.getByRole('button', { name: 'Sandbox' }).click();
+  // Starts quiet — no seed, no background feed, every node at zero.
+  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText('0');
+  await expect(page.locator('.node-label[data-id="6"] .node-count')).toHaveText('0');
+
+  // Select node 0 and inject a burst (paused — a pure inject, no spread yet).
   const target = page.locator('.node-label[data-id="0"]');
   const box = await target.boundingBox();
   if (box === null) throw new Error('node 0 label has no bounding box to click');
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.locator('.inspector').getByRole('button', { name: 'Send burst' }).click();
+  await expect(target.locator('.node-count')).toHaveText(BURST_HITS);
 
+  // Honesty invariant: the Strata Σ equals this node's aggregate (the strip
+  // shows exactly the cells the node holds).
   const strata = page.locator('.strata');
   await expect(strata).toBeVisible();
-  // Honesty invariant: Σ over the rendered slots equals this node's aggregate
-  // (the same number the stage overlay shows).
-  await expect(strata.locator('.sigma-value')).toHaveText(SEED_TOTAL);
-  await expect(target.locator('.node-count')).toHaveText(SEED_TOTAL);
-  // The single live bucket carries the burst count.
-  await expect(strata.locator('.bar-count')).toHaveText(SEED_TOTAL);
+  await expect(strata.locator('.sigma-value')).toHaveText(BURST_HITS);
+  // It has not spread yet — a different node is still empty.
+  await expect(page.locator('.node-label[data-id="6"] .node-count')).toHaveText('0');
 
-  // Play at speed to advance virtual time past the 10 s window: the epoch-0
-  // bucket ages out on every node, so node 0's window empties (and its overlay
-  // count drops to 0 in lockstep — the buckets scrolled off and expired).
-  await page.getByLabel('Playback speed').evaluate((el: HTMLInputElement) => {
-    el.value = '4';
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-  });
+  // Step gossips the cell out round by round; within a handful of ticks every
+  // node agrees on the injected total.
+  for (let i = 0; i < 12; i++) {
+    await page.getByRole('button', { name: 'Step forward one tick' }).click();
+  }
+  await expect
+    .poll(
+      async () => {
+        const counts = await page.locator(COUNTS).allTextContents();
+        return counts.filter((t) => t.trim() === BURST_HITS).length;
+      },
+      { timeout: 10_000, message: 'the cell did not gossip out to every node under Step' },
+    )
+    .toBe(NODES);
+
+  // Advance past the 10 s window: with no feed to replenish it, the bucket ages
+  // out everywhere, the Σ strip empties, and the cluster falls quiet.
+  await setSpeed(page, 4);
   await page.getByRole('button', { name: 'Play' }).click();
   await expect(strata.locator('.no-traffic')).toBeVisible({ timeout: 20_000 });
   await page.getByRole('button', { name: 'Pause' }).click();
@@ -246,23 +286,20 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   await page.goto('/');
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
 
-  // Converge the seeded burst across all 12 nodes first, so the newcomer joins a
-  // settled cluster — the clearest "catch up by gossip" story.
+  // Spread the burst across the living cluster first, so the newcomer joins an
+  // actively-gossiping cluster — the clearest "catch up by gossip" story.
+  await setSpeed(page, 4);
   await page.getByRole('button', { name: 'Play' }).click();
   await expect
-    .poll(
-      async () => {
-        const counts = await page.locator(COUNTS).allTextContents();
-        return counts.filter((t) => t.trim() === SEED_TOTAL).length;
-      },
-      { timeout: 15_000, message: 'cluster did not converge before the add' },
-    )
+    .poll(async () => nonZeroCount(page), {
+      timeout: 15_000,
+      message: 'the cluster was not carrying traffic before the add',
+    })
     .toBe(NODES);
   await page.getByRole('button', { name: 'Pause' }).click();
-  // The dashboard before the join: a settled fan and a disagreement curve that
-  // has decayed to zero across the elapsed window. Pair with `dash-after-add`
-  // to eyeball that the join threads through this same window — the time axis
-  // keeps running, the curves don't restart at x = 0.
+  // The dashboard before the join: the fan and disagreement curves over the
+  // elapsed window. Pair with `dash-after-add` to eyeball that the join threads
+  // through this same window — the time axis keeps running, no restart at x = 0.
   const dashboard = page.locator('.dashboard');
   await dashboard.screenshot({ path: 'screenshots/dash-before-add.png' });
 
@@ -274,14 +311,19 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   await page.screenshot({ path: 'screenshots/ring-node-added.png' });
   // The same dashboard right after the join: the newcomer adds a fan line that
   // starts *here* (a gap before it, since it did not exist earlier in the
-  // window), the disagreement curve steps back up — and crucially the x-axis is
-  // unbroken from `dash-before-add`, proving the join did not reset the charts.
+  // window) — and crucially the x-axis is unbroken from `dash-before-add`,
+  // proving the join did not reset the charts.
   await dashboard.screenshot({ path: 'screenshots/dash-after-add.png' });
 
-  // Play on: the newcomer catches up to the settled total by anti-entropy — the
-  // survivors push it their cells until its view matches the cluster.
+  // Play on: the newcomer catches up from zero by anti-entropy — the survivors
+  // push it their cells until its view climbs to match the living cluster.
   await page.getByRole('button', { name: 'Play' }).click();
-  await expect(newcomer.locator('.node-count')).toHaveText(SEED_TOTAL, { timeout: 15_000 });
+  await expect
+    .poll(async () => Number((await newcomer.locator('.node-count').textContent()) ?? '0'), {
+      timeout: 15_000,
+      message: 'the newcomer did not catch up by gossip',
+    })
+    .toBeGreaterThan(0);
   await page.getByRole('button', { name: 'Pause' }).click();
   await page.screenshot({ path: 'screenshots/ring-node-added-caughtup.png' });
 
@@ -460,20 +502,37 @@ test('network partition splits the cluster until healed', async ({ page }) => {
   const heal = page.getByRole('button', { name: 'Heal network' });
   await expect(heal).toBeVisible();
 
-  // Group A (nodes 0–5) holds the burst; group B (6–11) is cut off from it.
-  const groupA = page.locator('.node-label[data-id="1"] .node-count');
-  const groupB = page.locator('.node-label[data-id="6"] .node-count');
+  // Group A (nodes 0–5) holds the 50-hit burst; group B (6–11) is severed from
+  // it. Both halves carry their share of the faint background hum, but only A
+  // ever sees the burst — so A sits well above B while the link is cut.
+  const groupACount = page.locator('.node-label[data-id="1"] .node-count');
+  const groupBCount = page.locator('.node-label[data-id="6"] .node-count');
 
   await page.getByRole('button', { name: 'Play' }).click();
-  // Group A converges on the burst among itself; the severed half never hears it.
-  await expect(groupA).toHaveText(SEED_TOTAL);
-  await expect(groupB).toHaveText('0');
+  // Group A picks up the burst (≥ 50); the severed half never hears it, so it
+  // stays well below — only its sliver of background traffic.
+  await expect
+    .poll(async () => Number((await groupACount.textContent()) ?? '0'), {
+      timeout: 15_000,
+      message: 'group A did not pick up the burst',
+    })
+    .toBeGreaterThanOrEqual(50);
+  expect(
+    Number((await groupBCount.textContent()) ?? '0'),
+    'the severed half should not have the burst',
+  ).toBeLessThan(50);
   await page.screenshot({ path: 'screenshots/ring-partition.png' });
 
   // Heal the link (still playing): the cut-off half catches up by gossip — it
-  // kept its CRDT state, so this is reconciliation, not a cold restart.
+  // kept its CRDT state, so this reconciles rather than cold-restarts. It now
+  // holds the burst too, climbing past where it sat while severed.
   await heal.click();
-  await expect(groupB).toHaveText(SEED_TOTAL, { timeout: 15_000 });
+  await expect
+    .poll(async () => Number((await groupBCount.textContent()) ?? '0'), {
+      timeout: 15_000,
+      message: 'the healed half did not reconcile',
+    })
+    .toBeGreaterThanOrEqual(50);
   await page.getByRole('button', { name: 'Pause' }).click();
   await page.screenshot({ path: 'screenshots/ring-healed.png' });
 });

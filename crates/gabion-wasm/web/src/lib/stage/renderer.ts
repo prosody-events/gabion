@@ -479,6 +479,11 @@ export class StageRenderer {
     const head = { t: 0 };
     const end = dropped ? DROP_FRACTION : 1;
     const draw = (): void => {
+      // A tween tick can land after the beam's graphics were destroyed (a sweep
+      // on reset / node-exit, or the completion tick racing the next frame under
+      // fast play). Drawing into a destroyed `Graphics` reads its null context
+      // and throws — bail before touching it.
+      if (gfx.destroyed) return;
       const tip = head.t;
       const tail = Math.max(0, tip - BEAM_TRAIL);
       const from = lerp(a, b, tail);
@@ -583,12 +588,17 @@ export class StageRenderer {
         duration: 0.6,
         ease: 'power2.out',
         onUpdate: () => {
+          // Same guard as the beam draw: the ring can be destroyed (its node
+          // left, or a reset tore the stage down) while this tween still ticks.
+          if (ring.destroyed) return;
           ring
             .clear()
             .circle(0, 0, state.r)
             .stroke({ width: 3, color: COLOR_CONVERGED, alpha: state.alpha });
         },
-        onComplete: () => ring.destroy(),
+        onComplete: () => {
+          if (!ring.destroyed) ring.destroy();
+        },
       });
     }
   }

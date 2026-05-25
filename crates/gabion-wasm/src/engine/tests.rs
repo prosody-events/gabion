@@ -201,6 +201,56 @@ fn submit_creates_and_gossips_a_cell() {
     });
 }
 
+/// The windowed oracle is the sum of every node's locally-originated *live*
+/// cells: a gossiped replica never inflates it (one origin → counted once), and
+/// it decays to zero as the window slides past the only bucket — the behaviour
+/// a monotonic accumulator could not show.
+#[test]
+fn oracle_total_is_windowed_and_counts_each_origin_once() {
+    let config = SimConfig {
+        rule_window_ms: 2_000,
+        rule_bucket_ms: 1_000,
+        ..test_config(2)
+    };
+    with_engine(config, |tx| async move {
+        submit(&tx, 0, WATCHED_KEY, 9).await;
+        assert_eq!(
+            snapshot(&tx).await.oracle_total,
+            9,
+            "the windowed oracle counts the fresh burst at its origin"
+        );
+
+        // Spread it so node 1 holds a remote replica of node 0's cell.
+        for _ in 0..5 {
+            step(&tx, 100).await;
+        }
+        let converged = snapshot(&tx).await;
+        assert!(
+            converged.nodes.iter().all(|n| n.aggregate_total == 9),
+            "both nodes hold the cell"
+        );
+        assert_eq!(
+            converged.oracle_total, 9,
+            "the replica on node 1 is not local, so the oracle still counts the \
+             hit once at its single origin"
+        );
+
+        // Step well past the 2 s window so the only bucket ages out everywhere.
+        for _ in 0..40 {
+            step(&tx, 100).await;
+        }
+        let aged = snapshot(&tx).await;
+        assert_eq!(
+            aged.oracle_total, 0,
+            "the windowed oracle decays to zero as the bucket expires"
+        );
+        assert!(
+            aged.nodes.iter().all(|n| n.aggregate_total == 0),
+            "node views age out in lockstep with the oracle"
+        );
+    });
+}
+
 /// Phase 1: a blocked link stops propagation (the logging transport records
 /// drops), and healing the link lets the cluster converge.
 #[test]

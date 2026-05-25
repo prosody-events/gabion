@@ -93,8 +93,9 @@ pub struct ClusterState {
     pub nodes: Vec<NodeState>,
     /// The ground-truth cluster total for the watched key — the
     /// simulator-only oracle the convergence fan races toward. Summed across
-    /// every node's locally-originated hits, so it is independent of how far
-    /// gossip has propagated.
+    /// every node's locally-originated *live* cells, so it is independent of how
+    /// far gossip has propagated and decays with the window as buckets age out
+    /// (it is not a monotonic accumulator).
     pub oracle_total: u64,
     /// The bucket epoch the watched rule sits in at `virtual_ms`, straight from
     /// `RuleDescriptor::current_epoch` — so the Strata renders the CRDT's window
