@@ -8,11 +8,15 @@
 // scripted timeline. A timed-event driver only becomes load-bearing for the
 // scrubber's replay-from-zero, so it waits for that phase.
 //
-// Most presets leave the rule limit at the production default — far above the
-// seeded volumes — on purpose. A burst stays well under gabion's threshold
-// anti-entropy budget (ε ≈ limit·bps/(10⁴·N), ~900 at the default limit), so it
-// spreads by lazy heartbeat over several rounds: the multi-hop propagation
-// these views exist to show.
+// Most presets pin the rule limit high (`NARRATIVE_LIMIT`, 1 000 000) on
+// purpose — well above the seeded volumes. A burst then stays well under
+// gabion's threshold anti-entropy budget (ε ≈ limit·bps/(10⁴·N), ~833 at this
+// limit with N=12), so it spreads by lazy heartbeat over several rounds: the
+// multi-hop propagation these views exist to show. The viz-friendly default
+// limit (1 000, see `SimConfig::default` in `config.rs`) gives ε ≈ 0.83, so
+// every hit would eager-flush and a burst would flood at t=0 — which is why the
+// narrative presets override it back up. The default limit's limit-crossing
+// story is told instead by the no-preset "Tune the cluster" path.
 //
 // The exception is the `overload` preset, which tells the opposite — and the
 // reason gabion exists — story. A single burst that approaches the limit can't:
@@ -38,6 +42,13 @@ export const WATCHED_KEY = 1;
 /** The cluster size the presets build. A ring of 12 reads cleanly and gabion's
  *  adaptive fanout still saturates it in a couple of rounds. */
 const NODES = 12;
+
+/** The rule limit the narrative presets pin (burst, steady, partition, loss,
+ *  isolation). Far above their seeded volumes, so ε stays large and a burst
+ *  spreads lazily by heartbeat — the convergence story. Overrides the much
+ *  lower viz-friendly default (`SimConfig::default`), which exists for the
+ *  limit-crossing story the `overload` preset and the no-preset path tell. */
+const NARRATIVE_LIMIT = 1_000_000;
 
 /** The rebuild knobs the control rail exposes, and the positions they take when
  *  a preset doesn't pin the field. These mirror `gabion::defaults` /
@@ -106,7 +117,7 @@ export const PRESETS: readonly Preset[] = [
     id: 'burst',
     label: 'Traffic burst',
     blurb: 'One node takes a 50-hit burst. Play to watch it gossip out until every node agrees.',
-    config: { nodes: NODES, rng_seed: 1 },
+    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
     async seed(sim) {
       await sim.submitRequest(0, WATCHED_KEY, 50);
     },
@@ -115,7 +126,7 @@ export const PRESETS: readonly Preset[] = [
     id: 'steady',
     label: 'Steady state',
     blurb: 'Light traffic, scattered across the cluster. It converges at once — the calm baseline.',
-    config: { nodes: NODES, rng_seed: 1 },
+    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
     async seed(sim) {
       for (const node of [0, 3, 6, 9]) {
         await sim.submitRequest(node, WATCHED_KEY, 10);
@@ -141,7 +152,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Network partition',
     blurb:
       'The cluster splits in two; one half bursts. Heal the network to watch the halves reconcile.',
-    config: { nodes: NODES, rng_seed: 1 },
+    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
     usesNetwork: true,
     async seed(sim) {
       const [a, b] = halves();
@@ -153,7 +164,7 @@ export const PRESETS: readonly Preset[] = [
     id: 'loss',
     label: 'Packet loss',
     blurb: 'Every link drops 30% of packets. Convergence still arrives — just over more rounds.',
-    config: { nodes: NODES, rng_seed: 1, uniform_loss: 0.3 },
+    config: { nodes: NODES, rng_seed: 1, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
     async seed(sim) {
       await sim.submitRequest(0, WATCHED_KEY, 50);
     },
@@ -163,7 +174,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Node isolation & heal',
     blurb:
       'One node is cut off while a burst spreads. Heal it and it re-syncs by gossip catch-up — it kept its state, so no counts are lost.',
-    config: { nodes: NODES, rng_seed: 1 },
+    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
     usesNetwork: true,
     async seed(sim) {
       const isolated = NODES - 1;

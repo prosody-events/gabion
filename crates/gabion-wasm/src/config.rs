@@ -61,8 +61,14 @@ impl Default for SimConfig {
             min_emit_interval_ms: defaults::GOSSIP_MIN_EMIT_INTERVAL_MS,
             // A memorable but arbitrary default fingerprint; the UI overrides it.
             rule_fingerprint: 0xC0FE_DEAD_BEEF_BABE_F00D,
-            rule_limit: 1_000_000,
-            rule_window_ms: 60_000,
+            // Viz-friendly defaults: a 10 s window of 1 s buckets reads as a
+            // legible row of bucket bars (the production 60 s / 1 s default is
+            // 60 thin bands), and a limit of 1 000 is low enough that the
+            // no-preset "Tune the cluster" path can cross it within a window.
+            // The narrative presets override the limit back to 1 000 000 so a
+            // burst still spreads lazily by heartbeat (see `web/.../presets.ts`).
+            rule_limit: 1_000,
+            rule_window_ms: 10_000,
             rule_bucket_ms: 1_000,
             rng_seed: 0,
             uniform_loss: 0.0,
