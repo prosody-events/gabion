@@ -94,14 +94,48 @@ export interface PeerView {
   node_id: Hex | null;
 }
 
+/** Mirror of `crate::event::StoreStats` — the CRDT store's occupancy and
+ *  saturation counters (itself a mirror of `gabion::crdt::CellStoreStats`). */
+export interface StoreStats {
+  active_cells: number;
+  cell_capacity: number;
+  rule_slots_used: number;
+  rule_slots_capacity: number;
+  node_slots_used: number;
+  node_slots_capacity: number;
+  cell_store_full_rejects: number;
+  rule_dictionary_full_rejects: number;
+  node_dictionary_full_rejects: number;
+}
+
 /** Mirror of `crate::event::NodeState`. `id` is the node's stable identity (see
  *  the Rust module note): assigned once, never reused, so it survives other
- *  nodes joining and leaving and has gaps once a member has been removed. */
+ *  nodes joining and leaving and has gaps once a member has been removed. The
+ *  scalar fields mirror the runtime's `AdminSnapshot`. */
 export interface NodeState {
   id: number;
+  /** The on-the-wire gossip identity (`NodeIdentity.node_id`), distinct from the
+   *  display `id`. */
+  node_id: Hex;
+  /** Incarnation — bumped on restart; always 1 in the sim. */
+  incarnation: number;
   aggregate_total: number;
   ticks_total: number;
   threshold_fires: number;
+  /** Subset of `ticks_total` that actually carried gossip work (a cell was
+   *  dirty at the peer pick). */
+  dirty_ticks: number;
+  /** Rows in the local-origin dirty ring awaiting gossip out. */
+  local_dirty_len: number;
+  /** Rows in the forwarded (received-then-re-gossiped) dirty ring. */
+  forwarded_dirty_len: number;
+  /** Outbound packets queued behind the transport right now. */
+  send_pending_depth: number;
+  /** High-water mark of `send_pending_depth` since startup. */
+  max_send_pending_depth: number;
+  /** Inbound packets the wire decoder rejected. */
+  decode_reject_count: number;
+  store_stats: StoreStats;
   cells: CellView[];
   peers: PeerView[];
 }

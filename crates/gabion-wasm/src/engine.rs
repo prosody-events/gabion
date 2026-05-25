@@ -722,20 +722,33 @@ impl EngineState {
                 Some(dump) => self.cells_from_dump(handle.identity, &dump),
                 None => Vec::new(),
             };
-            let (ticks_total, threshold_fires, peers) = match admin_snapshot(&handle.admin_tx).await
-            {
-                Some(snap) => (
-                    snap.ticks_total,
-                    snap.threshold_fires,
-                    self.peers_from_snapshot(&snap),
-                ),
-                None => (0, 0, Vec::new()),
-            };
+            // `node_id` / `incarnation` come from the engine's own record of the
+            // node, so they survive even if the runtime has already stopped and
+            // the admin round-trip returns `None` (defaults for the rest).
+            let snap = admin_snapshot(&handle.admin_tx).await;
+            let peers = snap
+                .as_ref()
+                .map(|s| self.peers_from_snapshot(s))
+                .unwrap_or_default();
             nodes.push(NodeState {
                 id: handle.id,
+                node_id: handle.identity.node_id.0,
+                incarnation: handle.identity.incarnation,
                 aggregate_total: handle.aggregate.total(),
-                ticks_total,
-                threshold_fires,
+                ticks_total: snap.as_ref().map_or(0, |s| s.ticks_total),
+                threshold_fires: snap.as_ref().map_or(0, |s| s.threshold_fires),
+                dirty_ticks: snap.as_ref().map_or(0, |s| s.dirty_ticks),
+                local_dirty_len: snap.as_ref().map_or(0, |s| s.local_dirty_len),
+                forwarded_dirty_len: snap.as_ref().map_or(0, |s| s.forwarded_dirty_len),
+                send_pending_depth: snap.as_ref().map_or(0, |s| s.send_pending_depth as u64),
+                max_send_pending_depth: snap
+                    .as_ref()
+                    .map_or(0, |s| s.max_send_pending_depth as u64),
+                decode_reject_count: snap.as_ref().map_or(0, |s| s.decode_reject_count),
+                store_stats: snap
+                    .as_ref()
+                    .map(|s| s.store_stats.into())
+                    .unwrap_or_default(),
                 cells,
                 peers,
             });

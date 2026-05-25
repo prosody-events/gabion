@@ -104,19 +104,82 @@ pub struct ClusterState {
     pub bucket_epoch_now: u32,
 }
 
-/// One node's view at snapshot time.
+/// One node's view at snapshot time. The scalar fields mirror the runtime's
+/// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); `store_stats` mirrors its
+/// [`CellStoreStats`](gabion::crdt::CellStoreStats). The node inspector renders
+/// them directly — see the panel sections in `web/src/lib/components`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NodeState {
-    /// The node's stable id (see the module note). The gossip `NodeId` is a
-    /// pure function of this (`id·256 + 1`), so it is not duplicated here.
+    /// The node's stable id (see the module note). Distinct from `node_id`
+    /// below: this is the frontend's display/identity handle; `node_id` is the
+    /// on-the-wire gossip identity (a pure function of it, `id·256 + 1`).
     pub id: u32,
+    /// The on-the-wire gossip identity this node announces (`NodeIdentity`).
+    #[serde(with = "u128_hex")]
+    pub node_id: u128,
+    /// The node's incarnation — bumped on restart so peers can supersede a
+    /// stale alias. Always 1 in the sim (no restart path), shown to teach the
+    /// concept.
+    pub incarnation: u32,
     /// This node's cluster-aggregate total across all cells (what its local
     /// admission decision reads).
     pub aggregate_total: u64,
+    /// Cumulative gossip ticks (heartbeat + threshold-triggered) this runtime
+    /// has processed.
     pub ticks_total: u64,
+    /// Subset of `ticks_total` that were threshold-triggered (an eager flush
+    /// crossing the per-rule error budget, not the heartbeat timer).
     pub threshold_fires: u64,
+    /// Subset of `ticks_total` during which at least one cell was dirty when the
+    /// peer pick ran — the ticks that actually carried gossip work.
+    pub dirty_ticks: u64,
+    /// Rows in the local-origin dirty ring awaiting gossip out.
+    pub local_dirty_len: u32,
+    /// Rows in the forwarded (received-then-re-gossiped) dirty ring.
+    pub forwarded_dirty_len: u32,
+    /// Outbound packets queued behind the transport right now.
+    pub send_pending_depth: u64,
+    /// High-water mark of `send_pending_depth` since startup — the only honest
+    /// denominator for the send-queue meter (no static capacity exists).
+    pub max_send_pending_depth: u64,
+    /// Inbound packets rejected by the wire decoder (bad HMAC, truncated, or
+    /// otherwise undecodable).
+    pub decode_reject_count: u64,
+    /// CRDT store occupancy and saturation counters.
+    pub store_stats: StoreStats,
     pub cells: Vec<CellView>,
     pub peers: Vec<PeerView>,
+}
+
+/// Mirror of [`gabion::crdt::CellStoreStats`] — the CRDT store's occupancy and
+/// saturation counters, surfaced for the inspector's storage section.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub struct StoreStats {
+    pub active_cells: u32,
+    pub cell_capacity: u32,
+    pub rule_slots_used: u16,
+    pub rule_slots_capacity: u16,
+    pub node_slots_used: u16,
+    pub node_slots_capacity: u16,
+    pub cell_store_full_rejects: u64,
+    pub rule_dictionary_full_rejects: u64,
+    pub node_dictionary_full_rejects: u64,
+}
+
+impl From<gabion::crdt::CellStoreStats> for StoreStats {
+    fn from(s: gabion::crdt::CellStoreStats) -> Self {
+        Self {
+            active_cells: s.active_cells,
+            cell_capacity: s.cell_capacity,
+            rule_slots_used: s.rule_slots_used,
+            rule_slots_capacity: s.rule_slots_capacity,
+            node_slots_used: s.node_slots_used,
+            node_slots_capacity: s.node_slots_capacity,
+            cell_store_full_rejects: s.cell_store_full_rejects,
+            rule_dictionary_full_rejects: s.rule_dictionary_full_rejects,
+            node_dictionary_full_rejects: s.node_dictionary_full_rejects,
+        }
+    }
 }
 
 /// One CRDT cell as this node currently holds it.
