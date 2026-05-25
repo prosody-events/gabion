@@ -174,6 +174,48 @@ test('the pinned headline stays visible in both rail modes', async ({ page }) =>
   await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
 });
 
+// The inspector's Strata: per-bucket bars for the selected node's window, summed
+// straight from its cells. The Σ readout must equal the node's aggregate (the
+// honesty invariant — the strip shows exactly the cells the node holds), a bar
+// must carry the right count, and playing past the 10 s window must age the
+// bucket out (the buckets scrolled off), emptying the strip.
+test('the strata shows bucket counts, matches the node total, and ages out', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  // Select node 0 — the seeded burst node, so its window holds one bucket of 50.
+  const target = page.locator('.node-label[data-id="0"]');
+  const box = await target.boundingBox();
+  if (box === null) throw new Error('node 0 label has no bounding box to click');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+
+  const strata = page.locator('.strata');
+  await expect(strata).toBeVisible();
+  // Honesty invariant: Σ over the rendered slots equals this node's aggregate
+  // (the same number the stage overlay shows).
+  await expect(strata.locator('.sigma-value')).toHaveText(SEED_TOTAL);
+  await expect(target.locator('.node-count')).toHaveText(SEED_TOTAL);
+  // The single live bucket carries the burst count.
+  await expect(strata.locator('.bar-count')).toHaveText(SEED_TOTAL);
+
+  // Play at speed to advance virtual time past the 10 s window: the epoch-0
+  // bucket ages out on every node, so node 0's window empties (and its overlay
+  // count drops to 0 in lockstep — the buckets scrolled off and expired).
+  await page.getByLabel('Playback speed').evaluate((el: HTMLInputElement) => {
+    el.value = '4';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect(strata.locator('.no-traffic')).toBeVisible({ timeout: 20_000 });
+  await page.getByRole('button', { name: 'Pause' }).click();
+  await expect(target.locator('.node-count')).toHaveText('0');
+
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
 // The control rail is the keyboard/AT-accessible equivalent of click-a-node:
 // pick a live node id, press Send, and the same burst lands — no pointer
 // geometry involved. The picker is a select of live stable ids (ids gap under

@@ -16,6 +16,7 @@
   import Dashboard from './lib/components/Dashboard.svelte';
   import HeadlineMetric from './lib/components/HeadlineMetric.svelte';
   import NodeInspector from './lib/components/NodeInspector.svelte';
+  import BucketStrata from './lib/components/BucketStrata.svelte';
   import ControlRail from './lib/components/ControlRail.svelte';
   import TransportBar from './lib/components/TransportBar.svelte';
 
@@ -416,7 +417,15 @@
                 {burstHits}
                 onSend={(id) => void sendBurst(id)}
                 onClose={() => (selectedId = null)}
-              />
+              >
+                <BucketStrata
+                  cells={selectedNode.cells}
+                  windowMs={knobs.rule_window_ms}
+                  bucketMs={RULE_BUCKET_MS}
+                  limit={knobs.rule_limit}
+                  {virtualMs}
+                />
+              </NodeInspector>
             {:else}
               <Dashboard
                 {history}
