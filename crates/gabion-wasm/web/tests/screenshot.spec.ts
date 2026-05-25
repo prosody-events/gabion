@@ -702,3 +702,52 @@ test('the inspector shows convergence lag and the over-limit state', async ({ pa
     ib.x + ib.width + 1,
   );
 });
+
+// Regression for two linked bugs: in isolation/heal mode a cut-off node tracks
+// peers it has never heard from, whose gossip id is None — and Option::None
+// crosses the wasm boundary as `undefined`, not `null`. A strict `!== null`
+// guard let `undefined` through to `shortHex`, throwing during the inspector's
+// render. That surfaced as "clicking a node does nothing" (the inspector never
+// mounted), and — because an uncaught render error wedges Svelte's scheduler —
+// a subsequent Reset then hung forever on "Loading the gossip engine…". The fix
+// is the loose `!= null` peer guards; this guards the whole path.
+test('isolation/heal: nodes stay clickable and Reset still rebuilds', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await page.getByRole('button', { name: 'Node isolation & heal' }).click();
+  await setSpeed(page, 4);
+  await page.getByRole('button', { name: 'Play' }).click();
+  await page.waitForTimeout(1000);
+  await page.getByRole('button', { name: 'Pause' }).click();
+
+  // The isolated node (highest id) has only pending peers — the exact case that
+  // used to crash. Clicking it must open the inspector, not silently fail.
+  const isolated = page.locator(`.node-label[data-id="${NODES - 1}"]`);
+  let box = await isolated.boundingBox();
+  if (box === null) throw new Error('isolated node has no bounding box');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(page.locator('.inspector')).toContainText(`Node ${NODES - 1}`);
+  // It really is the unresolved-peer case (pending rows present).
+  await expect(page.locator('.inspector .state.pending').first()).toBeVisible();
+
+  // Heal, then the same node is still clickable.
+  await page.getByRole('button', { name: 'Heal network' }).click();
+  await page.waitForTimeout(300);
+  box = await isolated.boundingBox();
+  if (box === null) throw new Error('isolated node has no bounding box after heal');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(page.locator('.inspector')).toContainText(`Node ${NODES - 1}`);
+
+  // With a node selected, Reset must clear the loading overlay and rebuild the
+  // cluster — not wedge on "Loading the gossip engine…".
+  await page.getByRole('button', { name: 'Reset' }).click();
+  await expect(page.locator('.overlay', { hasText: 'Loading the gossip engine' })).toHaveCount(0, {
+    timeout: 10_000,
+  });
+  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
