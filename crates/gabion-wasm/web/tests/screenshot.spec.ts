@@ -256,6 +256,39 @@ test('Sandbox: inject, Step it out to convergence, then age out to quiet', async
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
+// The Strata is a fixed-width conveyor belt: the time channel is the track's
+// leftward scroll, the data channel is bar height — kept separate so a window
+// slide reads as motion, never as bars "growing in place". Its column count is
+// fixed for the whole session and never grows, shrinks, or stretches as virtual
+// time advances — the regression behind the old "bars stretch / overlap / scroll
+// off screen" report (a variable slot count re-distributing `flex:1` widths).
+// Default window is 10 s → liveBuckets 10 → 12 columns (the 11-bucket window plus
+// the emerging bucket scrolling in under "now"). Select the seeded node, then
+// drive time forward and confirm the column count is pinned throughout.
+test('the Strata keeps a fixed column count as the window scrolls', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  const target = page.locator('.node-label[data-id="0"]');
+  const box = await target.boundingBox();
+  if (box === null) throw new Error('node 0 label has no bounding box to click');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+
+  // One key (the watched key) → one strip; its track holds liveBuckets + 2 = 12
+  // fixed-width columns from the first render.
+  const cells = page.locator('.strata .strip .track .bar-cell');
+  await expect(cells).toHaveCount(12);
+
+  // Drive virtual time well past several bucket boundaries (the window scrolls,
+  // the background feed keeps the strip populated). The column count must not
+  // move — no insert, no re-distribution.
+  await setSpeed(page, 4);
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect.poll(async () => virtualSeconds(page), { timeout: 15_000 }).toBeGreaterThan(6);
+  await page.getByRole('button', { name: 'Pause' }).click();
+  await expect(cells).toHaveCount(12);
+});
+
 // The control rail is the keyboard/AT-accessible equivalent of click-a-node:
 // pick a live node id, press Send, and the same burst lands — no pointer
 // geometry involved. The picker is a select of live stable ids (ids gap under

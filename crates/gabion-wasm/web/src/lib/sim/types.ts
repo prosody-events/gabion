@@ -114,9 +114,7 @@ export interface ClusterState {
   nodes: NodeState[];
   oracle_total: number;
   /** The bucket epoch the watched rule sits in at `virtual_ms`, from the CRDT's
-   *  `RuleDescriptor::current_epoch`. The Strata renders the window from this
-   *  (and `oldest_live_epoch`) rather than recomputing the boundary in TS. */
+   *  `RuleDescriptor::current_epoch`. The Strata right-anchors its fixed-width
+   *  grid on this epoch rather than recomputing the boundary in TS. */
   bucket_epoch_now: number;
-  /** The oldest epoch the rule still retains, from `RuleDescriptor::oldest_live_epoch`. */
-  oldest_live_epoch: number;
 }

@@ -1,36 +1,74 @@
 <script lang="ts">
-  import { flip } from 'svelte/animate';
-  import { fade, scale } from 'svelte/transition';
   import type { CellView } from '../sim/types';
 
-  // The sliding window made literal: one strip per active key, each a row of
-  // per-bucket bars oldest → newest, with a windowed Σ against the rule limit.
-  // This is the one device that shows the windowed-rate-limit mechanic — the
-  // individual bucket counts, and buckets being created / aging out.
+  // The sliding window made literal: one strip per active key, a conveyor belt of
+  // per-bucket bars that scrolls left as virtual time advances. This is the one
+  // device that shows the windowed-rate-limit mechanic — per-bucket counts, new
+  // buckets forming under "now", old buckets aging off the trailing edge — and Σ
+  // against the rule limit.
   //
-  // Source of truth is the CRDT: `cells` are the selected node's live cells, and
-  // the window's edges (`currentEpoch`, `oldestEpoch`) are reported straight off
-  // the snapshot by gabion's `RuleDescriptor` helpers — no window math is redone
-  // here. The slide is driven by `oldestEpoch` advancing as virtual time crosses
-  // bucket boundaries; keying each bar by its absolute epoch makes the
-  // new-bucket enter, the oldest-bucket age-out, and the surviving bars' leftward
-  // slide fall out of Svelte transitions for free.
+  // Two channels, kept strictly separate so neither lies about the other:
+  //   • TIME is the horizontal scroll. The whole track drifts left by the
+  //     fraction of the current bucket already elapsed (`epochFraction`), so the
+  //     window visibly slides; bars keep their identity (keyed by epoch) and
+  //     translate, they do not rebind in place.
+  //   • DATA is the bar height. A bar only grows/shrinks when its bucket's count
+  //     changes — so a growing bar honestly means "this bucket is accumulating",
+  //     never "the window moved".
+  //
+  // The columns are a FIXED pixel width (`viewportWidth / visibleCols`), so they
+  // never re-distribute or stretch. The track is one column wider than the
+  // viewport and `overflow:hidden` clips the emerging/expiring edges. Because the
+  // epoch window and the fractional offset are both re-derived every frame, the
+  // translate is always within `[-colW, 0]` — a high-speed multi-bucket leap just
+  // re-anchors, it can never scroll off screen. There is no CSS transition on the
+  // transform: the per-frame snapshot loop is the animation.
   let {
     cells,
     currentEpoch,
-    oldestEpoch,
+    epochFraction,
+    liveBuckets,
+    windowMs,
     limit,
   }: {
     cells: CellView[];
+    /** The bucket epoch "now" sits in (`RuleDescriptor::current_epoch`). */
     currentEpoch: number;
-    oldestEpoch: number;
+    /** Fraction of the current bucket already elapsed, `[0, 1)` — the sub-bucket
+     *  scroll offset. `(virtual_ms mod bucket_ms) / bucket_ms`, computed by the
+     *  caller so this component needn't know the bucket size. */
+    epochFraction: number;
+    /** `RuleDescriptor::live_buckets()` (nominal `ceil(window / bucket)`). The
+     *  window holds `liveBuckets + 1` buckets; one more emerging bucket is
+     *  rendered so a fresh empty bucket can scroll in under "now". */
+    liveBuckets: number;
+    /** The rule window in ms — labels the trailing edge of the axis ("Ns ago"). */
+    windowMs: number;
     limit: number;
   } = $props();
 
-  // Purposeful motion only: under reduced motion every transition snaps (0 ms).
+  // The trailing edge of the visible window, in whole seconds, for the axis
+  // caption. The window knob steps in seconds, so this is exact.
+  const windowSeconds = $derived(Math.round(windowMs / 1000));
+
+  // Purposeful motion only: reduced motion snaps to whole buckets (no sub-bucket
+  // drift) and the height transition is dropped (gated in CSS below).
   const reduceMotion =
     typeof window !== 'undefined' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const motionMs = reduceMotion ? 0 : 260;
+
+  // Measured once layout settles; 0 on the first frame, where colW falls to 0 and
+  // the track sits un-translated until the real width arrives.
+  let viewportWidth = $state(0);
+
+  // The window shows `liveBuckets + 1` buckets [oldest, currentEpoch]; the track
+  // carries one more (`currentEpoch + 1`, the bucket forming just off the right
+  // edge) so it has something to scroll in.
+  const visibleCols = $derived(Math.max(liveBuckets + 1, 1));
+  const colCount = $derived(visibleCols + 1);
+  const colW = $derived(viewportWidth > 0 ? viewportWidth / visibleCols : 0);
+  const oldest = $derived(currentEpoch - (visibleCols - 1));
+  const fraction = $derived(reduceMotion ? 0 : Math.min(Math.max(epochFraction, 0), 1));
+  const translateX = $derived(-fraction * colW);
 
   interface Slot {
     epoch: number;
@@ -40,39 +78,37 @@
     key: string;
     slots: Slot[];
     sigma: number;
-    /** Tallest bar — the per-strip auto-scale denominator. */
+    /** Tallest in-window bar — the per-strip auto-scale denominator. */
     max: number;
   }
 
-  // Group the live cells by key and bin them into the window's bucket slots,
-  // summing counts that share a slot (different origins, or — defensively — any
-  // epoch the engine kept just outside the nominal range). Σ is the sum of the
-  // live slots, so it equals this node's aggregate total for the key.
+  // Bin the live cells by key into the rendered epoch range [oldest, oldest +
+  // colCount). Cells outside the range are dropped (not clipped to the edge), so
+  // Σ — summed over the in-window buckets [oldest, currentEpoch] — equals this
+  // node's windowed aggregate for the key. The emerging `currentEpoch + 1` column
+  // is excluded from Σ (it is always empty in any case — no cell is dated to the
+  // future).
   const strips = $derived.by((): Strip[] => {
-    // Bars span the CRDT-reported live window [oldestEpoch, currentEpoch]; a
-    // cell in epoch `e` bins to slot `e - oldestEpoch`. (`Math.max(…, 1)` guards
-    // the degenerate equal-epoch case so we always draw at least one slot.)
-    const slotCount = Math.max(currentEpoch - oldestEpoch + 1, 1);
     const byKey = new Map<string, number[]>();
     for (const cell of cells) {
+      const off = cell.bucket - oldest;
+      if (off < 0 || off >= colCount) continue;
       let counts = byKey.get(cell.key);
       if (counts === undefined) {
-        counts = new Array<number>(slotCount).fill(0);
+        counts = new Array<number>(colCount).fill(0);
         byKey.set(cell.key, counts);
       }
-      let slot = cell.bucket - oldestEpoch;
-      if (slot < 0) slot = 0;
-      else if (slot >= slotCount) slot = slotCount - 1;
-      counts[slot] += cell.count;
+      counts[off] += cell.count;
     }
     const result: Strip[] = [];
     for (const [key, counts] of byKey) {
       let sigma = 0;
       let max = 0;
       const slots = counts.map((count, i) => {
-        sigma += count;
+        const epoch = oldest + i;
+        if (epoch <= currentEpoch) sigma += count;
         if (count > max) max = count;
-        return { epoch: oldestEpoch + i, count };
+        return { epoch, count };
       });
       result.push({ key, slots, sigma, max });
     }
@@ -99,15 +135,17 @@
     return key.length > 12 ? `${key.slice(0, 6)}…${key.slice(-4)}` : key;
   }
 
-  /** A concise screen-reader summary of one strip's non-empty buckets. */
+  /** A concise screen-reader summary of one strip's in-window non-empty buckets. */
   function stripSummary(strip: Strip): string {
-    const active = strip.slots.filter((s) => s.count > 0).map((s) => s.count);
+    const active = strip.slots
+      .filter((s) => s.epoch <= currentEpoch && s.count > 0)
+      .map((s) => s.count);
     const tally = active.length === 0 ? 'no buckets' : `buckets ${active.join(', ')}`;
     return `Sliding window, key ${shortKey(strip.key)}: total ${strip.sigma} of ${limit}; ${tally}`;
   }
 </script>
 
-<div class="strata">
+<div class="strata" bind:clientWidth={viewportWidth}>
   {#if strips.length === 0}
     <p class="no-traffic">No traffic in this node's window yet.</p>
   {:else}
@@ -121,32 +159,34 @@
             <span class="numeric">{limit.toLocaleString()}</span>
           </span>
         </div>
-        <div class="bars" aria-hidden="true">
+        <div class="viewport" aria-hidden="true">
           {#if limitWithinRange(strip.max)}
-            <div
-              class="limit-line"
-              style="bottom: {(limit / strip.max) * 100}%"
-              title="limit {limit}"
-            ></div>
+            <div class="limit-line" style="bottom: {(limit / strip.max) * 100}%"></div>
           {/if}
-          {#each strip.slots as slot (slot.epoch)}
-            <div class="bar-cell" animate:flip={{ duration: motionMs }}>
-              <div
-                class="bar"
-                class:empty={slot.count === 0}
-                style="height: {heightPct(slot.count, strip.max)}%"
-                in:scale={{ duration: motionMs, start: 0.6 }}
-                out:fade={{ duration: motionMs }}
-              >
-                {#if slot.count > 0}
-                  <span class="bar-count numeric">{slot.count}</span>
-                {/if}
+          <div
+            class="track"
+            style="width: {colCount * colW}px; transform: translateX({translateX}px)"
+          >
+            {#each strip.slots as slot (slot.epoch)}
+              <div class="bar-cell" style="width: {colW}px" title="bucket {slot.epoch}: {slot.count}">
+                <div
+                  class="bar"
+                  class:empty={slot.count === 0}
+                  style="height: {heightPct(slot.count, strip.max)}%"
+                ></div>
               </div>
-            </div>
-          {/each}
+            {/each}
+          </div>
         </div>
       </section>
     {/each}
+    <!-- One shared time axis under all strips: the window flows left, the newest
+         buckets enter under "now" on the right and age out toward the trailing
+         edge on the left. -->
+    <div class="axis" aria-hidden="true">
+      <span class="numeric">{windowSeconds}s ago</span>
+      <span>now</span>
+    </div>
   {/if}
 </div>
 
@@ -202,20 +242,32 @@
     color: var(--signal-reject);
   }
 
-  /* The bar area: a baseline the bars rise from, with headroom on top for the
-     count labels that ride each bar's crown. */
-  .bars {
+  /* The scroll window: a fixed-height viewport that clips the track's emerging
+     (right) and expiring (left) edges. The bottom border is the baseline the bars
+     rise from. */
+  .viewport {
     position: relative;
-    display: flex;
-    align-items: flex-end;
-    gap: 2px;
     height: 96px;
-    padding-top: 16px;
+    overflow: hidden;
     border-bottom: 1.5px solid var(--chrome-border);
   }
 
+  /* The conveyor belt: a row of fixed-width columns, one wider than the viewport,
+     translated horizontally by the caller's sub-bucket fraction. No transition —
+     the per-frame snapshot loop drives the scroll, and a CSS transition would
+     fight it and jitter. */
+  .track {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    height: 100%;
+    display: flex;
+    align-items: flex-end;
+    will-change: transform;
+  }
+
   .bar-cell {
-    flex: 1;
+    flex: none;
     height: 100%;
     display: flex;
     align-items: flex-end;
@@ -226,44 +278,46 @@
      graphical mark. Height encodes count; the auto-scale keeps them legible at
      any limit. */
   .bar {
-    position: relative;
-    width: 72%;
+    width: 70%;
     min-height: 0;
     background: var(--node-fill);
     border-radius: 3px 3px 0 0;
   }
 
-  /* Smooth growth when a bucket fills; gated so reduced motion snaps. */
+  /* The one purposeful height motion: a bar easing as its bucket's count changes
+     (the data channel). Gated so reduced motion snaps. */
   @media (prefers-reduced-motion: no-preference) {
     .bar {
-      transition: height 260ms ease;
+      transition: height 220ms ease;
     }
   }
 
-  /* An empty slot keeps its column (so the window's width reads) but shows no
-     ink beyond the shared baseline. */
+  /* An empty slot keeps its column (so the window's width reads) but shows no ink
+     beyond the shared baseline. */
   .bar.empty {
     background: transparent;
   }
 
-  .bar-count {
-    position: absolute;
-    bottom: 100%;
-    left: 50%;
-    transform: translateX(-50%);
-    margin-bottom: 2px;
+  /* The shared time axis: quiet end-labels orienting the scroll. "now" on the
+     right (where buckets enter), the window's trailing edge on the left (where
+     they age out). Letterspaced small-caps, the panel's faintest ink. */
+  .axis {
+    display: flex;
+    justify-content: space-between;
+    margin-top: calc(-1 * var(--space-2));
     font-size: var(--text-xs);
-    color: var(--ink-soft);
-    white-space: nowrap;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
   }
 
-  /* The rule limit as a dashed threshold across the strip — drawn only when it
-     sits within the auto-scaled range. */
+  /* The rule limit as a dashed threshold across the viewport — fixed (it does not
+     scroll with the track), drawn only when it sits within the auto-scaled range. */
   .limit-line {
     position: absolute;
     left: 0;
     right: 0;
     border-top: 1.5px dashed var(--signal-reject);
     pointer-events: none;
+    z-index: 1;
   }
 </style>

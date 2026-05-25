@@ -6,9 +6,9 @@
 // plus the partially-overlapping oldest bucket the engine retains until it
 // falls fully out of the sliding window.
 //
-// Live CRDT state is *not* rendered from this file: the Strata reads the
-// CRDT-reported `bucket_epoch_now` / `oldest_live_epoch` off the snapshot, so it
-// can never drift from production expiry.
+// Live CRDT state is *not* rendered from this file: the Strata right-anchors its
+// fixed-width grid on the CRDT-reported `bucket_epoch_now` off the snapshot, so
+// it can never drift from production expiry.
 
 /** The CRDT's `live_buckets` for a window: `div_ceil(window, bucket)`. */
 export function nominalBuckets(windowMs: number, bucketMs: number): number {

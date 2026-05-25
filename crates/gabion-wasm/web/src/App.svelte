@@ -12,6 +12,7 @@
     type Knobs,
     type Preset,
   } from './lib/presets';
+  import { nominalBuckets } from './lib/buckets';
   import Stage from './lib/components/Stage.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
   import HeadlineMetric from './lib/components/HeadlineMetric.svelte';
@@ -421,7 +422,9 @@
                 <BucketStrata
                   cells={selectedNode.cells}
                   currentEpoch={cluster?.bucket_epoch_now ?? 0}
-                  oldestEpoch={cluster?.oldest_live_epoch ?? 0}
+                  epochFraction={((cluster?.virtual_ms ?? 0) % RULE_BUCKET_MS) / RULE_BUCKET_MS}
+                  liveBuckets={nominalBuckets(knobs.rule_window_ms, RULE_BUCKET_MS)}
+                  windowMs={knobs.rule_window_ms}
                   limit={knobs.rule_limit}
                 />
               </NodeInspector>

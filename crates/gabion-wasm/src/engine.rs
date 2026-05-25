@@ -761,10 +761,10 @@ impl EngineState {
             tick: self.current_tick(),
             nodes,
             oracle_total,
-            // The CRDT's own window layout at this instant — the Strata renders
-            // these directly instead of recomputing the boundary in TypeScript.
+            // The CRDT's own window position at this instant — the Strata
+            // right-anchors its fixed-width grid on this epoch instead of
+            // recomputing the boundary in TypeScript.
             bucket_epoch_now: rd.current_epoch(self.virtual_ms),
-            oldest_live_epoch: rd.oldest_live_epoch(self.virtual_ms),
         }
     }
 
