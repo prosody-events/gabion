@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { Knobs, Preset } from '../presets';
+  import { RULE_BUCKET_MS, type Knobs, type Preset } from '../presets';
+  import { visibleBuckets } from '../buckets';
 
   // The left control rail (the chassis's controls region): scenario presets, the
   // rebuild knobs (a collapsed disclosure, so the rail stays compact), the
@@ -50,6 +51,11 @@
   // it only for those scenarios (progressive disclosure — fewer idle controls).
   const showNetwork = $derived(activePreset?.usesNetwork ?? false);
   const nodeCount = $derived(nodeIds.length);
+  // The window reads in whole seconds; its bar count is the bucket math the
+  // Strata uses (one source of truth — `buckets.ts`), so the readout can't
+  // disagree with the strip the inspector draws.
+  const windowSec = $derived(Math.round(knobs.rule_window_ms / 1000));
+  const windowBuckets = $derived(visibleBuckets(knobs.rule_window_ms, RULE_BUCKET_MS));
 
   // Send and remove each pick a live id. A bare `$state` can't follow the live
   // set: before the cluster loads it is null, and a picked node can leave under
@@ -130,6 +136,47 @@
         max="0.9"
         step="0.05"
         bind:value={knobs.uniform_loss}
+        onchange={onApplyKnobs}
+      />
+    </div>
+    <!-- The rule + gossip knobs. Longer gossip interval = slower propagation;
+         the window readout shows its derived bucket count (the bars the Strata
+         draws); the limit reaches 1 000 000 so a narrative preset's pinned limit
+         is editable, not clamped away. -->
+    <div class="knob">
+      <label for="knob-gossip">Gossip interval<span class="val numeric">{knobs.tick_interval_ms} ms</span></label>
+      <input
+        id="knob-gossip"
+        type="range"
+        min="50"
+        max="1000"
+        step="50"
+        bind:value={knobs.tick_interval_ms}
+        onchange={onApplyKnobs}
+      />
+    </div>
+    <div class="knob">
+      <label for="knob-window">Window<span class="val numeric">{windowSec} s · {windowBuckets} buckets</span></label>
+      <input
+        id="knob-window"
+        type="range"
+        min="3000"
+        max="30000"
+        step="1000"
+        bind:value={knobs.rule_window_ms}
+        onchange={onApplyKnobs}
+      />
+    </div>
+    <div class="knob">
+      <label for="knob-limit">Rule limit</label>
+      <input
+        id="knob-limit"
+        class="numeric"
+        type="number"
+        min="1"
+        max="1000000"
+        step="100"
+        bind:value={knobs.rule_limit}
         onchange={onApplyKnobs}
       />
     </div>

@@ -268,6 +268,40 @@ test('a rebuild knob updates its readout and rebuilds the cluster', async ({ pag
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
+// The rule knobs (Slice 2) live in the same disclosure: a gossip-interval and
+// window range plus a limit number input. Moving the window updates its derived
+// bucket-count readout (the same `buckets.ts` math the Strata draws bars from)
+// and rebuilds the cluster — proof the readout and the rebuild are wired and the
+// engine still accepts the new window/bucket pairing (window stays a whole
+// number of 1 s buckets, so `SimConfig::validate` passes).
+test('the window knob updates its bucket-count readout and rebuilds', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+
+  await page.getByText('Tune the cluster').click();
+  // Default window is 10 s → 11 buckets (10 nominal + the partial oldest bucket
+  // the engine retains; see `buckets.ts`).
+  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('10 s · 11 buckets');
+
+  // Move the window to 5 s → 6 buckets, and commit the rebuild. The label's
+  // accessible name carries the readout ("Window 5 s · …"), so match by
+  // substring like the Packet-loss control above.
+  await page.getByLabel('Window').evaluate((el: HTMLInputElement) => {
+    el.value = '5000';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+
+  await expect(page.locator('label[for="knob-window"] .val')).toHaveText('5 s · 6 buckets');
+  // The rebuild left a healthy cluster of the same size, no errors.
+  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
 // The sustained-overload scenario feeds the cluster at a steady rate against a
 // low limit (400). Played, the aggregate every node converges on climbs past the
 // limit into the REJECTING band — the "why gabion exists" story, and the one

@@ -6,6 +6,7 @@
   import {
     DEFAULT_PRESET,
     PRESETS,
+    RULE_BUCKET_MS,
     WATCHED_KEY,
     knobsFromPreset,
     type Knobs,
@@ -33,9 +34,9 @@
   // Hits per burst, shared by a stage click and the control rail's Send so the
   // two always agree. Each burst targets the same watched key, growing the same
   // counter the preset seeded. The default sits well under the threshold-AE
-  // budget (ε ≈ limit·bps/(10⁴·N), ~900 at the default limit), so a burst
-  // spreads only by lazy heartbeat — raising it far enough trips an eager
-  // flush, which is itself worth seeing.
+  // budget (ε ≈ limit·bps/(10⁴·N), ~833 at the narrative presets' pinned
+  // 1 000 000 limit), so a burst spreads only by lazy heartbeat — raising it (or
+  // dropping the rule limit) far enough trips an eager flush, itself worth seeing.
   let burstHits = $state(25);
   // One gossip tick at the production default (`GOSSIP_TICK_INTERVAL_MILLIS`),
   // which the presets leave unset.
@@ -95,9 +96,11 @@
   let stepping = false;
 
   /** The preset's config with the live knob values layered on top. The preset's
-   *  other pinned fields (e.g. the overload limit, the rng seed) survive; fanout
-   *  is clamped to the peer count so a small cluster can't ask for more peers
-   *  than it has. */
+   *  other pinned fields (e.g. the rng seed) survive; the rule + gossip knobs
+   *  seated from the preset (its limit, the shared window/tick defaults) win on
+   *  drag, exactly like fanout/loss. Fanout is clamped to the peer count so a
+   *  small cluster can't ask for more peers than it has; the bucket width is
+   *  fixed so every window the slider picks stays a whole number of buckets. */
   function effectiveConfig(preset: Preset): Partial<SimConfig> {
     const nodes = knobs.nodes;
     const fanout = Math.min(Math.max(knobs.fanout, 1), Math.max(nodes - 1, 1));
@@ -107,6 +110,10 @@
       fanout,
       target_err_bps: knobs.target_err_bps,
       uniform_loss: knobs.uniform_loss,
+      rule_limit: knobs.rule_limit,
+      rule_window_ms: knobs.rule_window_ms,
+      rule_bucket_ms: RULE_BUCKET_MS,
+      tick_interval_ms: knobs.tick_interval_ms,
     };
   }
 
@@ -387,7 +394,7 @@
           {cluster}
           {history}
           version={chartVersion}
-          limit={activePreset.config.rule_limit ?? 0}
+          limit={knobs.rule_limit}
           showLimit={activePreset.traffic !== undefined}
         />
       </div>
