@@ -50,6 +50,12 @@ const CONVERGED_EPSILON = 0.001;
 // then effect.
 const BEAM_FLIGHT_MS = 520;
 const BEAM_TRAIL = 0.28;
+// Soft beam edges: a beam ramps in over the first slice of its flight and (when
+// delivered) back out over the last slice as it reaches the target, so it
+// neither snaps on at the source nor vanishes abruptly on arrival — the
+// target's pulse takes over the "news landed" beat. Fractions of the flight.
+const BEAM_FADE_IN = 0.1;
+const BEAM_FADE_OUT = 0.12;
 // A dropped packet dies partway across instead of landing.
 const DROP_FRACTION = 0.5;
 // Cap concurrent beams so a burst at high node counts can't unbound the draw
@@ -101,6 +107,12 @@ export class StageRenderer {
   #beams = new Set<Beam>();
   #lastTick = -1;
   #lastDisagreement = 0;
+  // Delivered beams that landed since the last frame, coalesced so each disc
+  // pulses at most once per frame: without this, several arrivals in one frame
+  // each fire their own tween on the same `disc.alpha` and strobe it. Drained
+  // by a single rAF (`#flashRaf`, 0 when idle).
+  #pendingFlash = new Set<number>();
+  #flashRaf = 0;
 
   private constructor(app: Application) {
     this.#app = app;
@@ -312,6 +324,9 @@ export class StageRenderer {
   /** Animate a departed node's leave, then destroy it. */
   #removeNode(id: number, gfx: NodeGfx): void {
     this.#nodes.delete(id);
+    // Drop any queued delivery pulse for this node — the flush re-resolves and
+    // would skip it anyway, but a leaving node shouldn't linger in the queue.
+    this.#pendingFlash.delete(id);
     const finish = (): void => {
       for (const tween of gfx.tweens) tween.kill();
       gfx.tweens.clear();
@@ -425,9 +440,15 @@ export class StageRenderer {
       const tail = Math.max(0, tip - BEAM_TRAIL);
       const from = lerp(a, b, tail);
       const to = lerp(a, b, tip);
-      // A dropped beam dims as it dies; a delivered one stays bright to the
-      // target (near-opaque so the amber clears 3:1 on the light stage).
-      const alpha = dropped ? 0.7 * (1 - tip / end) : 0.95;
+      // Soft edges multiply the base alpha: ramp in over the first slice of the
+      // flight, and — delivered only — back out over the last slice into the
+      // target. A dropped beam keeps its own mid-flight dim (and still fades in)
+      // so it reads as fading *out* mid-flight, distinct from a delivery.
+      const fadeIn = clamp01(tip / (end * BEAM_FADE_IN));
+      const base = dropped
+        ? 0.7 * (1 - tip / end)
+        : 0.95 * clamp01((end - tip) / (end * BEAM_FADE_OUT));
+      const alpha = base * fadeIn;
       gfx
         .clear()
         .moveTo(from.x, from.y)
@@ -444,7 +465,7 @@ export class StageRenderer {
         ease: 'power2.inOut',
         onUpdate: draw,
         onComplete: () => {
-          if (!dropped) this.#flash(dst);
+          if (!dropped) this.#queueFlash(dst);
           this.#removeBeam(beam);
         },
       }),
@@ -460,12 +481,44 @@ export class StageRenderer {
     return { x: gfx.root.position.x, y: gfx.root.position.y };
   }
 
-  /** A delivered beam briefly brightens its target — the visible "news landed
-   *  here" beat that distinguishes delivery from a drop. */
-  #flash(dst: number): void {
-    const disc = this.#nodes.get(dst)?.disc;
-    if (disc === undefined) return;
-    gsap.fromTo(disc, { alpha: 1 }, { alpha: 0.4, duration: 0.12, yoyo: true, repeat: 1 });
+  /** Queue node `dst` for a coalesced delivery pulse on the next frame, instead
+   *  of pulsing it now — so several beams landing in one frame brighten the disc
+   *  once, not N times. A no-op under reduced motion: the pulse is motion the
+   *  user opted out of, and the arc/count already updated. */
+  #queueFlash(dst: number): void {
+    if (this.#reduceMotion) return;
+    this.#pendingFlash.add(dst);
+    if (this.#flashRaf === 0) {
+      this.#flashRaf = requestAnimationFrame(() => this.#flushFlashes());
+    }
+  }
+
+  /** Fire one delivery pulse per disc that received a beam this frame. Resolves
+   *  the disc fresh (a node may have left between queue and flush) and brightens
+   *  to a gentle dim floor (0.7) over a soft duration — `overwrite: 'auto'` so a
+   *  delivery on the next frame can't strand `disc.alpha` below 1. */
+  #flushFlashes(): void {
+    this.#flashRaf = 0;
+    for (const dst of this.#pendingFlash) {
+      const disc = this.#nodes.get(dst)?.disc;
+      if (disc === undefined) continue;
+      gsap.fromTo(
+        disc,
+        { alpha: 1 },
+        { alpha: 0.7, duration: 0.16, yoyo: true, repeat: 1, overwrite: 'auto' },
+      );
+    }
+    this.#pendingFlash.clear();
+  }
+
+  /** Cancel a queued flush and drop every pending target — a teardown or beam
+   *  sweep must not pulse a disc that is being freed. */
+  #cancelFlashes(): void {
+    if (this.#flashRaf !== 0) {
+      cancelAnimationFrame(this.#flashRaf);
+      this.#flashRaf = 0;
+    }
+    this.#pendingFlash.clear();
   }
 
   /** The synchronized convergence pulse: one expanding ring from each node,
@@ -514,6 +567,7 @@ export class StageRenderer {
   }
 
   #clearBeams(): void {
+    this.#cancelFlashes();
     for (const beam of this.#beams) {
       beam.tween.kill();
       beam.gfx.destroy();
@@ -525,6 +579,11 @@ export class StageRenderer {
 
 function lerp(a: Point, b: Point, t: number): Point {
   return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+/** Clamp `t` to `[0, 1]` — the beam fade ramps run a raw ratio through this. */
+function clamp01(t: number): number {
+  return t < 0 ? 0 : t > 1 ? 1 : t;
 }
 
 /** Blend two packed `0xRRGGBB` colours channel-wise — the dot-mode disc fill
