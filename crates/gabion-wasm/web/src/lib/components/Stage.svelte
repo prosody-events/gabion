@@ -19,23 +19,28 @@
   // each node's stable id and total — the canvas is opaque to assistive tech and
   // to test tooling, so the real numbers live in queryable, tabular-figure text.
   //
-  // `onSendBurst` is the click-a-node affordance: clicking a disc injects a
-  // burst at that node. `onDeleteNode` is the per-node "×" on its label, which
-  // removes that node live. Both are pointer-only power gestures (the canvas is
-  // one opaque image to assistive tech); the keyboard/AT-accessible equivalents
-  // are the explicit "send to node N" and "remove node N" controls in the rail.
-  // The "×" lives inside the aria-hidden label overlay and is `tabindex=-1`, so
-  // it is not a focusable element hidden from assistive tech — the rail owns
-  // that path.
+  // Clicking a disc *selects* that node (opening the inspector); clicking the
+  // bare stage deselects. `selectedId` is fed back in so the renderer draws a
+  // static ring on the selected disc. `onDeleteNode` is the per-node "×" on its
+  // label, which removes that node live. Both clicks are pointer-only power
+  // gestures (the canvas is one opaque image to assistive tech); the
+  // keyboard/AT-accessible equivalents — pick a node to send to or remove — are
+  // explicit controls in the rail. The "×" lives inside the aria-hidden label
+  // overlay and is `tabindex=-1`, so it is not a focusable element hidden from
+  // assistive tech — the rail owns that path.
   let {
     cluster,
     events,
-    onSendBurst,
+    selectedId,
+    onSelect,
+    onDeselect,
     onDeleteNode,
   }: {
     cluster: ClusterState | null;
     events: SimEvent[];
-    onSendBurst?: (node: number) => void;
+    selectedId: number | null;
+    onSelect?: (node: number) => void;
+    onDeselect?: () => void;
     onDeleteNode?: (id: number) => void;
   } = $props();
 
@@ -70,6 +75,10 @@
     if (ready && renderer !== null && events.length > 0) renderer.applyEvents(events);
   });
 
+  $effect(() => {
+    if (ready && renderer !== null) renderer.setSelected(selectedId);
+  });
+
   /** Resolve a pointer event to the node under it (or null), in the container's
    *  own pixel space. The label overlay is `pointer-events: none`, so a pointer
    *  over a disc reaches this handler whether it is over the canvas or a label. */
@@ -88,7 +97,8 @@
 
   function onPointerDown(event: PointerEvent): void {
     const node = nodeUnder(event);
-    if (node !== null) onSendBurst?.(node);
+    if (node !== null) onSelect?.(node);
+    else onDeselect?.();
   }
 
   onMount(() => {

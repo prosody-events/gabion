@@ -3,8 +3,9 @@ import { expect, test } from '@playwright/test';
 const COUNTS = '.stage-labels .node-count';
 const SEED_TOTAL = '50';
 const NODES = 12;
-// Mirrors `CLICK_HITS` in `App.svelte`: the burst a single node click injects.
-const CLICK_HITS = '25';
+// Mirrors `burstHits` in `App.svelte`: the size of a burst the inspector's or
+// the rail's Send injects (a stage click now *selects*, it does not burst).
+const BURST_HITS = '25';
 
 // One end-to-end check that doubles as the visual-quality screenshot source:
 // the page boots the real gabion core in the browser, the PixiJS stage renders
@@ -78,18 +79,19 @@ test('boots, renders the ring, and gossips to convergence in-browser', async ({ 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
-// Click-a-node: a pointer click on a disc injects a burst at that node, at the
-// current (paused) virtual time. The label overlay is `pointer-events: none`, so
-// clicking its center falls through to the stage's hit-test; we read the geometry
+// Click-a-node now *selects* it and opens the inspector (the burst gesture moved
+// into the inspector and the rail). The label overlay is `pointer-events: none`,
+// so clicking its center falls through to the stage's hit-test; we read geometry
 // off the same overlay the canvas hides behind.
-test('clicking a node injects a burst at the current virtual time', async ({ page }) => {
+test('clicking a node selects it; the inspector sends a burst', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
   await page.goto('/');
   await page.waitForSelector('.stage canvas', { timeout: 30_000 });
 
-  // The page boots paused, with only node 0 seeded. Pick an empty node to poke.
+  // The page boots paused, with only node 0 seeded and the charts in the right
+  // rail. Pick an empty node to inspect.
   const target = page.locator('.node-label[data-id="3"]');
   await expect(target.locator('.node-count')).toHaveText('0');
 
@@ -97,14 +99,79 @@ test('clicking a node injects a burst at the current virtual time', async ({ pag
   if (box === null) throw new Error('node 3 label has no bounding box to click');
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 
-  // The clicked node now carries the burst. The click is a pure inject — it does
-  // not advance time, and the burst is far below the threshold-AE budget, so it
-  // does not spread: node 0 keeps its seed and the rest stay at zero.
-  await expect(target.locator('.node-count')).toHaveText(CLICK_HITS);
+  // The click selects node 3: the inspector replaces the charts and names it.
+  const inspector = page.locator('.inspector');
+  await expect(inspector).toBeVisible();
+  await expect(inspector).toContainText('Node 3');
+
+  // The inspector's Send burst injects at the selected node, at the current
+  // (paused) virtual time — a pure inject below the threshold-AE budget, so it
+  // does not spread: node 3 carries the burst, node 0 keeps its seed, others 0.
+  await inspector.getByRole('button', { name: 'Send burst' }).click();
+  await expect(target.locator('.node-count')).toHaveText(BURST_HITS);
   await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText(SEED_TOTAL);
   await expect(page.locator('.node-label[data-id="5"] .node-count')).toHaveText('0');
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
+// Clicking the bare stage (the ring's empty hub) deselects: the inspector closes
+// and the charts dashboard returns.
+test('clicking the bare stage deselects and restores the charts', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  const target = page.locator('.node-label[data-id="3"]');
+  const box = await target.boundingBox();
+  if (box === null) throw new Error('node 3 label has no bounding box to click');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(page.locator('.inspector')).toBeVisible();
+
+  // The stage's centre sits inside the ring, off every disc — a click there
+  // misses all nodes and deselects.
+  const stage = page.locator('.stage');
+  const sb = await stage.boundingBox();
+  if (sb === null) throw new Error('stage has no bounding box');
+  await page.mouse.click(sb.x + sb.width / 2, sb.y + sb.height / 2);
+  await expect(page.locator('.inspector')).toHaveCount(0);
+  await expect(page.locator('.dashboard')).toBeVisible();
+});
+
+// Removing the selected node closes its inspector — the App clears the selection
+// the moment its id is no longer live, so the inspector can't show a gone node.
+test('removing the selected node closes its inspector', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  const target = page.locator('.node-label[data-id="5"]');
+  const box = await target.boundingBox();
+  if (box === null) throw new Error('node 5 label has no bounding box to click');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(page.locator('.inspector')).toContainText('Node 5');
+
+  await page.locator('.node-label[data-id="5"] .node-delete').click();
+  await expect(page.locator('.inspector')).toHaveCount(0);
+  await expect(page.locator('.dashboard')).toBeVisible();
+});
+
+// The pinned headline metric stays above whichever the right rail shows — the
+// charts dashboard or the node inspector.
+test('the pinned headline stays visible in both rail modes', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+
+  // Charts mode: node 0 seeded at 50, rest 0, so the headline (max − min) is 50.
+  await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
+  await expect(page.locator('.dashboard')).toBeVisible();
+
+  const target = page.locator('.node-label[data-id="3"]');
+  const box = await target.boundingBox();
+  if (box === null) throw new Error('node 3 label has no bounding box to click');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+
+  // Inspector mode: the headline is still pinned above it.
+  await expect(page.locator('.inspector')).toBeVisible();
+  await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
 });
 
 // The control rail is the keyboard/AT-accessible equivalent of click-a-node:
@@ -122,7 +189,7 @@ test('the control rail sends a burst to the chosen node', async ({ page }) => {
   await page.getByLabel('Node', { exact: true }).selectOption('7');
   await page.getByRole('button', { name: 'Send burst' }).click();
 
-  await expect(target.locator('.node-count')).toHaveText(CLICK_HITS);
+  await expect(target.locator('.node-count')).toHaveText(BURST_HITS);
 });
 
 // Live join: "+ Add node" spawns a fresh cold-start member into a converged

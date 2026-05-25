@@ -39,6 +39,11 @@ const COLOR_GRID = 0xd2d9e1;
 const COLOR_NODE_FILL = 0x39424f;
 const COLOR_DIRTY = 0xb3720d; // in flight / still climbing
 const COLOR_CONVERGED = 0x137a52; // settled / agreed
+// The selection ring (the inspected node). Drawn in the dark ink — chrome, not
+// a signal — so it never reads as amber/green convergence state, and it is
+// paired with the inspector opening, so selection is signified by more than the
+// ring alone.
+const COLOR_SELECT = 0x1b2330;
 
 // A node counts as caught up when its view is within this fraction of the
 // cluster's true total — the threshold that flips its arc from amber to green.
@@ -75,6 +80,10 @@ interface NodeGfx {
   root: Container;
   disc: Graphics;
   arc: Graphics;
+  /** A persistent ring drawn around this node while it is the selected one,
+   *  cleared otherwise. A child of `root`, so it glides with the node on a
+   *  re-space and is destroyed with it on leave. */
+  selectRing: Graphics;
   /** The ring slot this node is gliding to (logical coords). */
   center: Point;
   /** Radius the disc geometry was last drawn at; redrawn only when a join or
@@ -107,6 +116,9 @@ export class StageRenderer {
   #beams = new Set<Beam>();
   #lastTick = -1;
   #lastDisagreement = 0;
+  // The stable id of the selected node, or null. A static ring marks it; updated
+  // by `setSelected` and re-applied each `setCluster` so a re-space keeps it.
+  #selectedId: number | null = null;
   // Delivered beams that landed since the last frame, coalesced so each disc
   // pulses at most once per frame: without this, several arrivals in one frame
   // each fire their own tween on the same `disc.alpha` and strobe it. Drained
@@ -224,7 +236,12 @@ export class StageRenderer {
       if (total > max) max = total;
       if (total < min) min = total;
       const gfx = this.#nodes.get(node.id);
-      if (gfx !== undefined) this.#drawArc(gfx, total / oracle, n);
+      if (gfx !== undefined) {
+        this.#drawArc(gfx, total / oracle, n);
+        // Re-apply selection after the arc/radius update so a re-space keeps the
+        // ring on the right disc at the freshly-drawn radius.
+        this.#drawSelection(gfx, node.id === this.#selectedId);
+      }
     }
     if (n === 0) min = 0;
 
@@ -252,6 +269,17 @@ export class StageRenderer {
     }
   }
 
+  /** Mark node `id` as selected (or clear with `null`), drawing a static ring
+   *  around it. Takes effect immediately — including while paused — by redrawing
+   *  every node's selection state, and is re-applied by `setCluster` so a
+   *  re-space keeps the ring on the right disc at the right radius. */
+  setSelected(id: number | null): void {
+    this.#selectedId = id;
+    for (const [nodeId, gfx] of this.#nodes) {
+      this.#drawSelection(gfx, nodeId === id);
+    }
+  }
+
   /** Tear the renderer down: kill every tween (node and beam), free every GPU
    *  resource, drop the canvas. Safe to call once; the owner must not reuse the
    *  instance after. */
@@ -272,11 +300,15 @@ export class StageRenderer {
     root.position.set(center.x, center.y);
     const disc = new Graphics();
     const arc = new Graphics();
-    root.addChild(disc, arc);
+    // Selection ring on top: it sits outside the disc and arc, so it is never
+    // occluded by them and reads as a frame around the whole node glyph.
+    const selectRing = new Graphics();
+    root.addChild(disc, arc, selectRing);
     this.#drawDisc(disc, radius);
     this.#nodeLayer.addChild(root);
-    const gfx: NodeGfx = { root, disc, arc, center, radius, tweens: new Set() };
+    const gfx: NodeGfx = { root, disc, arc, selectRing, center, radius, tweens: new Set() };
     this.#nodes.set(id, gfx);
+    if (id === this.#selectedId) this.#drawSelection(gfx, true);
 
     if (this.#reduceMotion) {
       root.alpha = 1;
@@ -400,6 +432,17 @@ export class StageRenderer {
     node.arc
       .arc(0, 0, radius, start, start + f * 2 * Math.PI)
       .stroke({ width: 3, color, cap: 'round' });
+  }
+
+  /** Draw or clear the selection ring around a node — a static dark ring just
+   *  outside the cell arc, distinct from the expanding convergence pulse and the
+   *  amber/green arc. */
+  #drawSelection(node: NodeGfx, selected: boolean): void {
+    node.selectRing.clear();
+    if (!selected) return;
+    node.selectRing
+      .circle(0, 0, node.radius + 9)
+      .stroke({ width: 2.5, color: COLOR_SELECT, alpha: 0.9 });
   }
 
   #beam(src: number, dst: number, bytes: number, dropped: boolean): void {

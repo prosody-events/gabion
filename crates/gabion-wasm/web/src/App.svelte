@@ -14,6 +14,8 @@
   } from './lib/presets';
   import Stage from './lib/components/Stage.svelte';
   import Dashboard from './lib/components/Dashboard.svelte';
+  import HeadlineMetric from './lib/components/HeadlineMetric.svelte';
+  import NodeInspector from './lib/components/NodeInspector.svelte';
   import ControlRail from './lib/components/ControlRail.svelte';
   import TransportBar from './lib/components/TransportBar.svelte';
 
@@ -72,6 +74,19 @@
   // The visualizer's upper bound on live nodes (the design's 6–100 range); the
   // rail disables Add here so a held key can't spawn runtimes without limit.
   const MAX_LIVE_NODES = 100;
+
+  // The selected node (clicking a disc selects it and opens the inspector in the
+  // right rail). `selectedNode` resolves the id against the live snapshot; an
+  // effect clears the selection the moment its node is no longer live — a remove
+  // or a rebuild — so the inspector can never show a stale or vanished node.
+  let selectedId = $state<number | null>(null);
+  const selectedNode = $derived.by(() => {
+    if (selectedId === null || cluster === null) return null;
+    return cluster.nodes.find((n) => n.id === selectedId) ?? null;
+  });
+  $effect(() => {
+    if (selectedId !== null && !nodeIds.includes(selectedId)) selectedId = null;
+  });
 
   // The rolling chart history is a plain (non-reactive) structure — 600 samples
   // under a deep `$state` proxy would cost on every frame. `chartVersion` is the
@@ -386,17 +401,32 @@
           <Stage
             {cluster}
             {events}
-            onSendBurst={(node) => void sendBurst(node)}
+            {selectedId}
+            onSelect={(node) => (selectedId = node)}
+            onDeselect={() => (selectedId = null)}
             onDeleteNode={(id) => void removeNode(id)}
           />
         </div>
-        <Dashboard
-          {cluster}
-          {history}
-          version={chartVersion}
-          limit={knobs.rule_limit}
-          showLimit={activePreset.traffic !== undefined}
-        />
+        <div class="detail-rail">
+          <HeadlineMetric {cluster} {history} version={chartVersion} />
+          <div class="rail-body">
+            {#if selectedNode !== null}
+              <NodeInspector
+                node={selectedNode}
+                {burstHits}
+                onSend={(id) => void sendBurst(id)}
+                onClose={() => (selectedId = null)}
+              />
+            {:else}
+              <Dashboard
+                {history}
+                version={chartVersion}
+                limit={knobs.rule_limit}
+                showLimit={activePreset.traffic !== undefined}
+              />
+            {/if}
+          </div>
+        </div>
       </div>
     {/if}
   </main>
@@ -466,6 +496,27 @@
   .stage-pane {
     position: relative;
     min-width: 0;
+    min-height: 0;
+  }
+
+  /* The right rail: the pinned headline metric above a swappable body — the
+     charts dashboard by default, the node inspector when a node is selected.
+     Owns the panel chrome (the Dashboard/Inspector inside are borderless). */
+  .detail-rail {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    padding: var(--space-3);
+    background: var(--chrome-panel);
+    border-left: 1px solid var(--chrome-border);
+    overflow: hidden;
+  }
+
+  .rail-body {
+    flex: 1;
     min-height: 0;
   }
 
