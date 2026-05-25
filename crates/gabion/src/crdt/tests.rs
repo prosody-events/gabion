@@ -1435,17 +1435,17 @@ fn selection_epoch_wraparound_resets_marks() {
 
 #[test]
 fn expire_at_and_expire_agree_for_same_now() {
+    let rule = RuleDescriptor {
+        fingerprint: 0x11,
+        window_millis: 100,
+        bucket_millis: 50,
+        limit: 10,
+        flags: 0,
+        local_rule_id: 1,
+    };
     let mk = || {
         let mut s = small_store(8, 8);
-        s.intern_rule(RuleDescriptor {
-            fingerprint: 0x11,
-            window_millis: 100,
-            bucket_millis: 50,
-            limit: 10,
-            flags: 0,
-            local_rule_id: 1,
-        })
-        .unwrap();
+        s.intern_rule(rule).unwrap();
         // Seed two cells: one at bucket 0 (will expire), one at bucket 5
         // (still inside the live window for now=300 -> current=6, live=2).
         let mut obs = ObservationBatch::with_capacity(2);
@@ -1457,10 +1457,10 @@ fn expire_at_and_expire_agree_for_same_now() {
     };
 
     let now_millis: u64 = 300;
-    // 300/50 = 6, window/bucket = 100/50 = 2 (live buckets)
-    let bucket_millis: u32 = 50;
-    let live = 2_u32;
-    let current = (now_millis / bucket_millis as u64) as u32;
+    // 300/50 = 6 (current epoch), 100/50 = 2 (live buckets) — computed through
+    // the production helpers so this test breaks if their semantics drift.
+    let current = rule.current_epoch(now_millis);
+    let live = rule.live_buckets();
 
     let mut a = mk();
     let mut sink_a = ExpirationSink::<u32>::with_capacity(8);
@@ -1478,6 +1478,33 @@ fn expire_at_and_expire_agree_for_same_now() {
 
     assert_eq!(sink_a.len(), sink_b.len());
     assert_eq!(a.active_len(), b.active_len());
+}
+
+#[test]
+fn rule_descriptor_epoch_helpers_pin_window_math() {
+    let rd = RuleDescriptor {
+        fingerprint: 0x1,
+        window_millis: 10_000,
+        bucket_millis: 1_000,
+        limit: 100,
+        flags: 0,
+        local_rule_id: 1,
+    };
+    assert_eq!(rd.current_epoch(12_345), 12);
+    assert_eq!(rd.live_buckets(), 10);
+    assert_eq!(rd.oldest_live_epoch(12_345), 2);
+
+    // Wire-only rule (bucket_millis == 0): the never-expire sentinel. Both
+    // current and live collapse to 0, so the oldest live epoch stays 0 and every
+    // stored bucket is retained.
+    let wire_only = RuleDescriptor {
+        window_millis: 0,
+        bucket_millis: 0,
+        ..rd
+    };
+    assert_eq!(wire_only.current_epoch(12_345), 0);
+    assert_eq!(wire_only.live_buckets(), 0);
+    assert_eq!(wire_only.oldest_live_epoch(12_345), 0);
 }
 
 #[test]

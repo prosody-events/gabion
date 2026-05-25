@@ -1292,12 +1292,8 @@ impl<C: Count> CellStore<C> {
 
         for slot in 0..dict_cap {
             let (current, live) = match self.rule_dictionary.descriptor(slot as RuleSlot) {
-                Some(d) if d.bucket_millis > 0 => {
-                    let current = (now_millis / d.bucket_millis as u64) as BucketEpoch;
-                    let live = d.window_millis.div_ceil(d.bucket_millis).max(1);
-                    (current, live)
-                }
-                _ => (0, 0),
+                Some(d) => (d.current_epoch(now_millis), d.live_buckets()),
+                None => (0, 0),
             };
             self.expire_current_epoch_scratch[slot] = current;
             self.expire_live_buckets_scratch[slot] = live;

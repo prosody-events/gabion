@@ -2,7 +2,7 @@
 
 use super::hash::{hash_fingerprint, hash_node_identity};
 use super::index::CellIndex;
-use super::{Incarnation, NodeId, NodeSlot, RuleSlot};
+use super::{BucketEpoch, Incarnation, NodeId, NodeSlot, RuleSlot};
 
 const EMPTY_DICT_SLOT: u16 = u16::MAX;
 
@@ -42,6 +42,40 @@ impl Default for RuleDescriptor {
 impl RuleDescriptor {
     pub fn applies_locally(&self) -> bool {
         self.local_rule_id != u32::MAX
+    }
+
+    /// The bucket epoch `now_millis` falls in: `now_millis / bucket_millis`.
+    /// The single source of truth for this floor used by both [`super::CellStore::expire_at`]
+    /// and the visualizer. Returns `0` for a wire-only rule (`bucket_millis == 0`),
+    /// matching the "never expire" path in `expire_at`.
+    pub fn current_epoch(&self, now_millis: u64) -> BucketEpoch {
+        if self.bucket_millis == 0 {
+            0
+        } else {
+            (now_millis / (self.bucket_millis as u64)) as BucketEpoch
+        }
+    }
+
+    /// Number of live buckets in the window: `ceil(window_millis / bucket_millis)`,
+    /// at least 1. Returns `0` for a wire-only rule (`bucket_millis == 0`); paired
+    /// with [`Self::current_epoch`]'s `0`, `expire_at` then reads `bucket + 0 >= 0`
+    /// as "never expire" — so here `0` means *unbounded*, not *none*.
+    pub fn live_buckets(&self) -> u32 {
+        if self.bucket_millis == 0 {
+            0
+        } else {
+            self.window_millis.div_ceil(self.bucket_millis).max(1)
+        }
+    }
+
+    /// Oldest epoch still retained at `now_millis`:
+    /// `current_epoch(now) - live_buckets()`. A cell is kept while
+    /// `bucket >= oldest_live_epoch`, matching `expire_at`'s keep set. The
+    /// `saturating_sub(0)` for a wire-only rule yields `current`, i.e. retains
+    /// everything from epoch `current` downward — the unbounded behavior.
+    pub fn oldest_live_epoch(&self, now_millis: u64) -> BucketEpoch {
+        self.current_epoch(now_millis)
+            .saturating_sub(self.live_buckets())
     }
 }
 
