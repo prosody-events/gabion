@@ -2,31 +2,29 @@
   import { flip } from 'svelte/animate';
   import { fade, scale } from 'svelte/transition';
   import type { CellView } from '../sim/types';
-  import { bucketSlots } from '../buckets';
 
   // The sliding window made literal: one strip per active key, each a row of
   // per-bucket bars oldest → newest, with a windowed Σ against the rule limit.
   // This is the one device that shows the windowed-rate-limit mechanic — the
   // individual bucket counts, and buckets being created / aging out.
   //
-  // Source of truth is `cells` (the selected node's live CRDT cells), never the
-  // event stream: bar heights are summed straight from the cells, and the slide
-  // is driven by `virtualMs` advancing through bucket boundaries (`buckets.ts`),
-  // so a bucket scrolls left every slot with no event needed. Keying each bar by
-  // its absolute epoch makes the new-bucket enter, the oldest-bucket age-out, and
-  // the surviving bars' leftward slide fall out of Svelte transitions for free.
+  // Source of truth is the CRDT: `cells` are the selected node's live cells, and
+  // the window's edges (`currentEpoch`, `oldestEpoch`) are reported straight off
+  // the snapshot by gabion's `RuleDescriptor` helpers — no window math is redone
+  // here. The slide is driven by `oldestEpoch` advancing as virtual time crosses
+  // bucket boundaries; keying each bar by its absolute epoch makes the
+  // new-bucket enter, the oldest-bucket age-out, and the surviving bars' leftward
+  // slide fall out of Svelte transitions for free.
   let {
     cells,
-    windowMs,
-    bucketMs,
+    currentEpoch,
+    oldestEpoch,
     limit,
-    virtualMs,
   }: {
     cells: CellView[];
-    windowMs: number;
-    bucketMs: number;
+    currentEpoch: number;
+    oldestEpoch: number;
     limit: number;
-    virtualMs: number;
   } = $props();
 
   // Purposeful motion only: under reduced motion every transition snaps (0 ms).
@@ -51,7 +49,10 @@
   // epoch the engine kept just outside the nominal range). Σ is the sum of the
   // live slots, so it equals this node's aggregate total for the key.
   const strips = $derived.by((): Strip[] => {
-    const { oldestEpoch, slotCount } = bucketSlots(windowMs, bucketMs, virtualMs);
+    // Bars span the CRDT-reported live window [oldestEpoch, currentEpoch]; a
+    // cell in epoch `e` bins to slot `e - oldestEpoch`. (`Math.max(…, 1)` guards
+    // the degenerate equal-epoch case so we always draw at least one slot.)
+    const slotCount = Math.max(currentEpoch - oldestEpoch + 1, 1);
     const byKey = new Map<string, number[]>();
     for (const cell of cells) {
       let counts = byKey.get(cell.key);

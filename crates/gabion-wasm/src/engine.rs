@@ -24,9 +24,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use gabion::crdt::{
-    BucketEpoch, CellStore, CellStoreConfig, KeyHash, NodeId, NodeIdentity, RuleDescriptor,
-};
+use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeId, NodeIdentity, RuleDescriptor};
 use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::sim::{LinkPolicy, SimRouter};
 use gabion::gossip::{
@@ -316,6 +314,21 @@ impl EngineState {
         state
     }
 
+    /// The watched rule as a [`RuleDescriptor`], built from `self.config`. The
+    /// one construction site, so the rule the nodes intern, the bucket epoch the
+    /// submission path stamps, and the window the snapshot reports can never
+    /// drift from one another (or from gabion's own window/epoch helpers).
+    fn rule_descriptor(&self) -> RuleDescriptor {
+        RuleDescriptor {
+            fingerprint: self.config.rule_fingerprint,
+            window_millis: self.config.rule_window_ms,
+            bucket_millis: self.config.rule_bucket_ms,
+            limit: self.config.rule_limit,
+            flags: 0,
+            local_rule_id: LOCAL_RULE_ID,
+        }
+    }
+
     /// Build, spawn, and register one node with stable id `id`, bootstrapped
     /// against `bootstrap` (its own address is filtered out if present). The
     /// single node-construction path: both [`EngineState::build`] and
@@ -359,14 +372,7 @@ impl EngineState {
         // window/bucket *before* any request. Unknown rules otherwise intern
         // with `RuleDescriptor::default()` (60 s / 1 s), making bucket and
         // expiry math silently wrong.
-        store.intern_rule(RuleDescriptor {
-            fingerprint: self.config.rule_fingerprint,
-            window_millis: self.config.rule_window_ms,
-            bucket_millis: self.config.rule_bucket_ms,
-            limit: self.config.rule_limit,
-            flags: 0,
-            local_rule_id: LOCAL_RULE_ID,
-        });
+        store.intern_rule(self.rule_descriptor());
 
         let bootstrap_peers: Vec<SocketAddr> =
             bootstrap.iter().copied().filter(|a| *a != addr).collect();
@@ -457,7 +463,7 @@ impl EngineState {
             .position_of(node)
             .map(|pos| &self.nodes[pos])
             .ok_or(EngineError::UnknownNode { id: node })?;
-        let bucket = (self.virtual_ms / self.config.rule_bucket_ms.max(1) as u64) as BucketEpoch;
+        let bucket = self.rule_descriptor().current_epoch(self.virtual_ms);
         handle
             .client
             .record(
@@ -739,11 +745,16 @@ impl EngineState {
                 peers,
             });
         }
+        let rd = self.rule_descriptor();
         ClusterState {
             virtual_ms: self.virtual_ms,
             tick: self.current_tick(),
             nodes,
             oracle_total: self.oracle_total,
+            // The CRDT's own window layout at this instant — the Strata renders
+            // these directly instead of recomputing the boundary in TypeScript.
+            bucket_epoch_now: rd.current_epoch(self.virtual_ms),
+            oldest_live_epoch: rd.oldest_live_epoch(self.virtual_ms),
         }
     }
 

@@ -420,10 +420,9 @@
               >
                 <BucketStrata
                   cells={selectedNode.cells}
-                  windowMs={knobs.rule_window_ms}
-                  bucketMs={RULE_BUCKET_MS}
+                  currentEpoch={cluster?.bucket_epoch_now ?? 0}
+                  oldestEpoch={cluster?.oldest_live_epoch ?? 0}
                   limit={knobs.rule_limit}
-                  {virtualMs}
                 />
               </NodeInspector>
             {:else}

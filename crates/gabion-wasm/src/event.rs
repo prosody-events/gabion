@@ -96,6 +96,14 @@ pub struct ClusterState {
     /// every node's locally-originated hits, so it is independent of how far
     /// gossip has propagated.
     pub oracle_total: u64,
+    /// The bucket epoch the watched rule sits in at `virtual_ms`, straight from
+    /// `RuleDescriptor::current_epoch` — so the Strata renders the CRDT's window
+    /// layout rather than recomputing it. Rule-global in v1 (one watched rule);
+    /// moves per-rule in the v1.1 multi-rule shape.
+    pub bucket_epoch_now: u32,
+    /// The oldest epoch the rule still retains at `virtual_ms`, from
+    /// `RuleDescriptor::oldest_live_epoch` — the trailing edge of the slide.
+    pub oldest_live_epoch: u32,
 }
 
 /// One node's view at snapshot time.
