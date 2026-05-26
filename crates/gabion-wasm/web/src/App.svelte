@@ -433,6 +433,7 @@
                 node={selectedNode}
                 oracleTotal={cluster?.oracle_total ?? 0}
                 ruleLimit={knobs.rule_limit}
+                baseFanout={appliedKnobs.fanout}
                 {burstHits}
                 version={chartVersion}
                 onSend={(id) => void sendBurst(id)}

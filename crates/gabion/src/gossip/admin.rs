@@ -65,6 +65,22 @@ pub struct AdminSnapshot {
     /// (`packets_emitted / dirty_ticks`) — see
     /// `crates/gossip-bench/README.md`.
     pub dirty_ticks: u64,
+    /// The adaptive fanout the most recent dirty tick chose:
+    /// `config.fanout.max(⌊log₂(dirty)⌋ + 1).min(peers)`. Grows above the
+    /// configured base when the dirty set is large (a burst), so a burst
+    /// that fans out wider is directly observable. `0` before the first
+    /// dirty tick.
+    pub last_effective_fanout: usize,
+    /// High-water mark of `last_effective_fanout` since startup — the widest
+    /// the node has ever fanned out, so a transient burst's peak survives
+    /// even after the dirty set drains and fanout relaxes to the base.
+    pub peak_effective_fanout: usize,
+    /// The per-rule error budget ε the most recent `handle_limit_request`
+    /// computed: `limit × target_err_bps / (10_000 × peers)` (floored at 1).
+    /// A rule's accumulated `pending` crossing ε is what triggers an eager
+    /// (threshold) flush — so this is the threshold behind `threshold_fires`.
+    /// `0` before the first request is seen.
+    pub last_error_budget: u64,
 }
 
 /// One peer known to the runtime. `node_id` is `None` until the runtime has

@@ -627,13 +627,17 @@ test('the node inspector renders every detail section', async ({ page }) => {
   await expect(inspector.locator('.section-head', { hasText: 'Storage' })).toBeVisible();
   await expect(inspector.locator('.section-head', { hasText: 'Peers' })).toBeVisible();
 
-  // §4 — the cadence status word and live tick sparkline.
+  // §4 — the cadence status word, live tick sparkline, the adaptive-fanout meter
+  // (base → effective → peak), and the surfaced error budget.
   await expect(inspector.locator('.cadence .status-word')).toBeVisible();
   await expect(inspector.locator('.cadence .spark')).toBeVisible();
+  await expect(inspector.locator('.cadence .fanout-now')).toContainText('peers');
+  await expect(inspector.locator('.cadence .fanout-foot')).toContainText('base');
+  await expect(inspector.locator('.cadence .budget')).toContainText('error budget');
 
-  // §6 — three occupancy gauges plus the send-queue meter = four meters; the
-  // calm "holding" badge at zero rejects.
-  await expect(inspector.locator('[role="meter"]')).toHaveCount(4);
+  // §6 — three occupancy gauges + the §5 send-queue meter + the §4 fanout meter
+  // = five meters; the calm "holding" badge at zero rejects.
+  await expect(inspector.locator('[role="meter"]')).toHaveCount(5);
   await expect(inspector.locator('.holding')).toContainText('All capacities holding');
 
   // §7 — the peer table summary and a resolved peer row.
@@ -720,6 +724,72 @@ test('the inspector shows convergence lag and the over-limit state', async ({ pa
   expect(bb.x + bb.width, 'the tooltip clipped past the inspector right edge').toBeLessThanOrEqual(
     ib.x + ib.width + 1,
   );
+});
+
+// The adaptive-decision metrics must be *visible and responsive* — the whole
+// point of §4. Adaptive fanout (`config.fanout.max(⌊log₂(dirty)⌋+1).min(peers)`)
+// was never measured before this work; the eager-flush share was a frozen
+// lifetime ratio. Under overload a node's dirty set is large, so its fanout
+// widens above the base; and a concentrated burst crosses the (now tiny) error
+// budget, raising the windowed threshold share off zero.
+test('the node inspector shows adaptive fanout widening and a responsive eager-flush share', async ({
+  page,
+}) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await page.getByRole('button', { name: 'Sustained overload' }).click();
+  await setSpeed(page, 4);
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect
+    .poll(
+      async () =>
+        Number((await page.locator('.node-label[data-id="0"] .node-count').textContent()) ?? '0'),
+      { timeout: 15_000 },
+    )
+    .toBeGreaterThan(400);
+
+  const box = await page.locator('.node-label[data-id="0"]').boundingBox();
+  if (box === null) throw new Error('node 0 has no bounding box');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  const inspector = page.locator('.inspector');
+  await expect(inspector).toBeVisible();
+
+  // Adaptive fanout has widened above the base: the widen segment carries width,
+  // and the foot says so. (Overload's large dirty set guarantees this.)
+  await expect
+    .poll(
+      async () =>
+        Number(
+          ((await inspector.locator('.cadence .seg.fan-widen').getAttribute('style')) ?? '')
+            .replace(/[^0-9.]/g, '') || '0',
+        ),
+      { timeout: 10_000 },
+    )
+    .toBeGreaterThan(0);
+  await expect(inspector.locator('.cadence .widen-note')).toContainText('widened by load');
+
+  // The eager-flush (threshold) share is windowed, so a concentrated burst on
+  // this node — many hits at once across the ε=1 budget — moves it off zero.
+  const send = inspector.getByRole('button', { name: /send/i }).first();
+  for (let i = 0; i < 10; i++) {
+    await send.click();
+    await page.waitForTimeout(80);
+  }
+  await expect
+    .poll(
+      async () =>
+        Number(
+          ((await inspector.locator('.bar-row .bar .seg.threshold').getAttribute('style')) ?? '')
+            .replace(/[^0-9.]/g, '') || '0',
+        ),
+      { timeout: 10_000 },
+    )
+    .toBeGreaterThan(0);
+
+  expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // Regression for two linked bugs: in isolation/heal mode a cut-off node tracks

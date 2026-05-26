@@ -201,6 +201,51 @@ fn submit_creates_and_gossips_a_cell() {
     });
 }
 
+/// The adaptive-decision outputs reach the snapshot: a multi-key burst grows the
+/// dirty set, so the runtime fans out *wider than the configured base*, and the
+/// effective/peak fanout and the error budget all surface on the node — the
+/// metrics whose absence made the adaptation invisible in the inspector.
+#[test]
+fn adaptive_fanout_and_budget_surface_in_snapshot() {
+    let config = SimConfig {
+        fanout: 2,
+        rule_limit: 1_000,
+        target_err_bps: 100,
+        ..test_config(12)
+    };
+    with_engine(config, |tx| async move {
+        // 16 distinct keys on one node → a dirty set of ~16 cells →
+        // ⌊log₂(16)⌋+1 = 5, well above the base fanout of 2.
+        for key in 0..16u128 {
+            submit(&tx, 0, key, 7).await;
+        }
+        for _ in 0..3 {
+            step(&tx, 100).await;
+        }
+        let origin = snapshot(&tx)
+            .await
+            .nodes
+            .into_iter()
+            .find(|n| n.id == 0)
+            .expect("node 0 present");
+        assert!(
+            origin.effective_fanout > 2,
+            "a 16-cell dirty set must fan out above the base of 2; got {}",
+            origin.effective_fanout,
+        );
+        assert!(
+            origin.peak_fanout >= origin.effective_fanout,
+            "peak fanout must be a high-water mark; peak {} < last {}",
+            origin.peak_fanout,
+            origin.effective_fanout,
+        );
+        assert!(
+            origin.error_budget > 0,
+            "the error budget must be recorded once a request is seen",
+        );
+    });
+}
+
 /// The windowed oracle is the sum of every node's locally-originated *live*
 /// cells: a gossiped replica never inflates it (one origin → counted once), and
 /// it decays to zero as the window slides past the only bucket — the behaviour

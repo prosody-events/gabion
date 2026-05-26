@@ -133,6 +133,15 @@ pub struct NodeState {
     /// Subset of `ticks_total` during which at least one cell was dirty when the
     /// peer pick ran — the ticks that actually carried gossip work.
     pub dirty_ticks: u64,
+    /// Adaptive fanout the most recent dirty tick chose (grows above the base
+    /// `config.fanout` with the dirty-set size). `0` before the first emit.
+    pub effective_fanout: u32,
+    /// High-water mark of `effective_fanout` — the widest this node has fanned
+    /// out, so a burst's peak survives after fanout relaxes to the base.
+    pub peak_fanout: u32,
+    /// The per-rule error budget ε at the most recent request: a rule's pending
+    /// hits crossing it triggers an eager (threshold) flush. `0` until seen.
+    pub error_budget: u64,
     /// Rows in the local-origin dirty ring awaiting gossip out.
     pub local_dirty_len: u32,
     /// Rows in the forwarded (received-then-re-gossiped) dirty ring.

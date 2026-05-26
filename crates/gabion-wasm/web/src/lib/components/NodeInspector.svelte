@@ -15,6 +15,7 @@
     node,
     oracleTotal,
     ruleLimit,
+    baseFanout,
     burstHits,
     version,
     onSend,
@@ -26,6 +27,9 @@
      *  is racing toward. */
     oracleTotal: number;
     ruleLimit: number;
+    /** The configured base fanout knob — the floor the adaptive fanout grows
+     *  above under load. */
+    baseFanout: number;
     burstHits: number;
     /** The per-snapshot counter (drives GossipCadence's tick ring buffer). */
     version: number;
@@ -129,10 +133,10 @@
     </section>
   {/if}
 
-  <!-- §4 Gossip cadence. -->
+  <!-- §4 Gossip cadence & adaptive fanout. -->
   <section class="section">
-    <h3 class="section-head">Gossip cadence</h3>
-    <GossipCadence {node} {version} />
+    <h3 class="section-head">Gossip cadence &amp; fanout</h3>
+    <GossipCadence {node} {version} {baseFanout} />
   </section>
 
   <!-- §5 Gossip I/O & queues. -->

@@ -125,6 +125,14 @@ export interface NodeState {
   /** Subset of `ticks_total` that actually carried gossip work (a cell was
    *  dirty at the peer pick). */
   dirty_ticks: number;
+  /** Adaptive fanout the most recent dirty tick chose — grows above the base
+   *  `fanout` knob with the dirty-set size. 0 before the first emit. */
+  effective_fanout: number;
+  /** High-water mark of `effective_fanout` since startup. */
+  peak_fanout: number;
+  /** Per-rule error budget ε at the most recent request; pending crossing it
+   *  triggers an eager (threshold) flush. 0 until a request is seen. */
+  error_budget: number;
   /** Rows in the local-origin dirty ring awaiting gossip out. */
   local_dirty_len: number;
   /** Rows in the forwarded (received-then-re-gossiped) dirty ring. */

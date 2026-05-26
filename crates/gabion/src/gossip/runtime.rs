@@ -161,6 +161,18 @@ where
     ticks_total: u64,
     threshold_fires: u64,
     dirty_ticks: u64,
+    // The adaptive-decision outputs, so observers can *see* the runtime
+    // react rather than infer it. `last_effective_fanout` is the
+    // `pick_count` the most recent dirty tick chose (adaptive fanout grows
+    // with the dirty-set bit length); `peak_effective_fanout` is its
+    // high-water mark since startup. `last_error_budget` is the per-rule
+    // error budget ε the most recent `handle_limit_request` computed — the
+    // threshold a burst's accumulated `rule_pending` must cross to trigger
+    // an eager (threshold) flush. All three are decision *outputs* that are
+    // otherwise lost when their enclosing scope ends.
+    last_effective_fanout: usize,
+    peak_effective_fanout: usize,
+    last_error_budget: u64,
 
     _not_send: PhantomData<*const ()>,
 }
@@ -302,6 +314,9 @@ where
             ticks_total: 0,
             threshold_fires: 0,
             dirty_ticks: 0,
+            last_effective_fanout: 0,
+            peak_effective_fanout: 0,
+            last_error_budget: 0,
             _not_send: PhantomData,
         };
         let client = GossipClient::new(req_tx);
@@ -437,6 +452,9 @@ where
             let limit = req.rule_limit.max(1);
             let bps = self.config.target_err_bps.max(1) as u64;
             let epsilon = ((limit.saturating_mul(bps)) / (10_000 * peers)).max(1);
+            // Surface the budget so observers can see the threshold a burst's
+            // accumulated `pending` must cross to trigger an eager flush.
+            self.last_error_budget = epsilon;
             if (pending as u64) > epsilon {
                 // The runtime's clock is the canonical floor reference, not
                 // `req.now_millis`. Adapter-supplied wall clock and
@@ -610,6 +628,9 @@ where
                     ticks_total: self.ticks_total,
                     threshold_fires: self.threshold_fires,
                     dirty_ticks: self.dirty_ticks,
+                    last_effective_fanout: self.last_effective_fanout,
+                    peak_effective_fanout: self.peak_effective_fanout,
+                    last_error_budget: self.last_error_budget,
                 };
                 // Caller may have dropped the receiver; not an error.
                 let _ = reply.send(snapshot);
@@ -733,6 +754,13 @@ where
         let log_dirty = (64 - (dirty as u64).leading_zeros()) as usize;
         let n = self.peers.len();
         let pick_count = self.config.fanout.max(log_dirty).min(n);
+        // Record the adaptive-fanout decision so observers can see it widen
+        // under a burst (base `config.fanout` → `pick_count`) rather than
+        // having to reconstruct the formula. Only dirty ticks reach here, so
+        // `last_effective_fanout` is the fanout of the most recent tick that
+        // actually gossiped.
+        self.last_effective_fanout = pick_count;
+        self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
         for i in 0..pick_count {
             let j = i + (self.rng.next_u64() as usize) % (n - i);
             self.peers.swap(i, j);
