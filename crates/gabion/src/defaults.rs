@@ -20,8 +20,8 @@ pub const STORAGE_MAX_KEY_BYTES: usize = 128;
 /// (rather than silently truncate).
 pub const STORAGE_MAX_MATCHED_RULES: usize = 16;
 
-pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 100;
-pub const GOSSIP_FANOUT: usize = 6;
+pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
+pub const GOSSIP_FANOUT: usize = 3;
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;

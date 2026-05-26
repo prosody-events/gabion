@@ -430,7 +430,7 @@ adapters; the canonical knob table lives in
 
 | Directive                                   | Default | Adapts                                                       |
 |---------------------------------------------|---------|--------------------------------------------------------------|
-| `gabion_gossip_fanout N`                    | `6`     | **Adaptive fanout** — floor on peers selected per tick.      |
+| `gabion_gossip_fanout N`                    | `3`     | **Adaptive fanout** — floor on peers selected per tick.      |
 | `gabion_gossip_target_err_bps N`            | `100`   | **Adaptive emit rate** — per-rule unreplicated-error budget in basis points of the rule's limit (`100` = 1%). Lower = tighter accuracy, more emissions. |
 | `gabion_gossip_min_emit_interval DURATION`  | `5ms`   | **Adaptive emit rate** — floor between threshold-fire emissions. Raise when the gossip channel itself is the bottleneck. |
 
@@ -441,7 +441,7 @@ they bound resource use.
 |-------------------------------------------------|---------|---------------------------------------------------------------------------------------|
 | `gabion_gossip_bind ADDR:PORT`                  | *(none)* | UDP bind for the gossip channel. Required for clustering.                            |
 | `gabion_gossip_cluster ID`                      | *(none)* | Cluster identifier (any non-zero u128). Frames from peers with a mismatched id are dropped. |
-| `gabion_gossip_tick_interval DURATION`          | `100ms` | Heartbeat period. Shorter = faster convergence, more UDP traffic.                     |
+| `gabion_gossip_tick_interval DURATION`          | `500ms` | Heartbeat period. Shorter = faster convergence, more UDP traffic.                     |
 | `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet. Below ~64 the encoder refuses to fit even one cell. |
 | `gabion_gossip_max_cells_per_frame N`           | `4096`  | Maximum cells encoded into one packet.                                                |
 | `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells emitted across all packets in one tick.                                 |

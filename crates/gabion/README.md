@@ -223,17 +223,17 @@ A partial Fisher-Yates shuffle then picks `pick_count` distinct peers
 from `self.peers`. The peers must be distinct rather than sampled with
 replacement, because sampling the same peer twice in one tick would
 burn a send-pool slot encoding the same frame twice. Some example pick
-counts at `fanout = 6` (the default):
+counts at `fanout = 3` (the default):
 
-| `dirty`  | `log_dirty` | `pick_count`               |
-|----------|-------------|----------------------------|
-| 0        | 0           | 6 (capped at peer count)   |
-| 1        | 1           | 6                          |
-| 32       | 6           | 6                          |
-| 64       | 7           | 7                          |
-| 256      | 9           | 9                          |
-| 1024     | 11          | 11                         |
-| 1 048 576 | 21         | 21 (capped at peer count)  |
+| `dirty`   | `log_dirty` | `pick_count`               |
+|-----------|-------------|----------------------------|
+| 0         | 0           | 3 (floor; capped at peers) |
+| 1         | 1           | 3 (floor)                  |
+| 32        | 6           | 6                          |
+| 64        | 7           | 7                          |
+| 256       | 9           | 9                          |
+| 1024      | 11          | 11                         |
+| 1 048 576 | 21          | 21 (capped at peers)       |
 
 Quiet ticks pay nothing because the floor stays at `fanout`, while the
 wide-fanout cost only lands on the ticks that need it and falls off
@@ -245,7 +245,7 @@ bench [below](#what-we-measured) shows that empirically.
 ### Adaptive emit rate
 
 The heartbeat tick is bounded below by `tick_interval` (default
-100 ms). That cadence works for cold rules but is pessimistic for hot
+500 ms). That cadence works for cold rules but is pessimistic for hot
 ones, because a saturating burst between two heartbeats could leak many
 admissions past the limit before the next tick. Lowering
 `tick_interval` for everyone is not an answer either: it costs
@@ -343,8 +343,8 @@ it splits into the two adaptive halves of the protocol.
 
 | Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
-| `tick_interval`      | 100 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
-| `fanout`             | 6           | Static fanout floor. The runtime widens to `max(fanout, log₂ dirty)` automatically.                                                    | Lower for very small clusters (1–4) to cut bandwidth; rarely raise — adaptive widening already handles bursts. |
+| `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
+| `fanout`             | 3           | Static fanout floor. The runtime widens to `max(fanout, log₂ dirty)` automatically.                                                    | Lower for very small clusters (1–4) to cut bandwidth; rarely raise — adaptive widening already handles bursts. |
 | `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame_for_peer` will emit in one tick. Cells over the cap roll forward to the next tick via the repair lane. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
 | `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 

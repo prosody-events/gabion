@@ -91,7 +91,7 @@ recorded into a local queue.
 
 Everything else happens asynchronously, driven by those recorded hits.
 A background gossip task on each member folds them into a CRDT,
-exchanges dirty rows with peers over UDP roughly every 100 ms, applies
+exchanges dirty rows with peers over UDP roughly every 500 ms, applies
 inbound deltas back into the local aggregate, and expires bucket rows
 as time advances. The wire codec is self-describing and tolerant of
 loss, so a dropped UDP frame costs the cluster one tick of staleness
