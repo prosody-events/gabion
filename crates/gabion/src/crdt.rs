@@ -525,12 +525,38 @@ impl<C: Count> CellStore<C> {
 
     // -- Dictionary access (test-public; runtime-public for orchestration) --
 
+    /// Register a configured rule and **pin** it: the first registration holds
+    /// one persistent reference so the slot survives cell churn. Without the
+    /// pin, a configured rule's descriptor was released the moment its last
+    /// cell aged out (cell refs were the only refs), and the next hit
+    /// re-interned the [`RuleDescriptor::default()`] fallback — a 60 s window
+    /// with `applies_locally = false` — so the rule silently stopped expiring
+    /// on its real window and stopped counting locally. Cells interned via
+    /// gossip/local fallback (an *unconfigured*, wire-only rule) are not pinned
+    /// and still free when their cells expire, so stale peer rules can't
+    /// accumulate. Re-registering an already-known rule refreshes its
+    /// descriptor without adding a second pin.
+    ///
+    /// Edge case: if a rule were first learned wire-only (via gossip) and only
+    /// later registered here, the `already_known` guard would skip the pin and
+    /// leave it freeable. That ordering doesn't occur in practice — every
+    /// adapter calls `intern_rule` for its configured rules at startup, before
+    /// the gossip runtime spawns — so the pin always lands on a fresh slot.
     pub fn intern_rule(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
+        let already_known = self.rule_dictionary.find(descriptor.fingerprint).is_some();
         let result = self.rule_dictionary.intern(descriptor);
-        if result.is_none() {
-            self.note_rule_dictionary_full(descriptor.fingerprint);
+        match result {
+            Some(slot) => {
+                if !already_known {
+                    self.rule_dictionary.inc_ref(slot);
+                }
+                Some(slot)
+            }
+            None => {
+                self.note_rule_dictionary_full(descriptor.fingerprint);
+                None
+            }
         }
-        result
     }
 
     pub fn intern_node(&mut self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {

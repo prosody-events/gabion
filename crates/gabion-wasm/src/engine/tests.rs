@@ -748,3 +748,66 @@ fn grown_cluster_holds_every_origin_without_overflow() {
         }
     });
 }
+
+/// A burst whose cell fully expires must not poison expiry for the *next*
+/// burst. Regression for the rule-dictionary release bug: the engine
+/// pre-interns the watched rule, but interning held no reference, so once the
+/// first burst's cell aged out the rule slot was freed — and the next burst
+/// re-interned the *default* descriptor (60 s window, `applies_locally =
+/// false`), so it never expired in the 10 s window and never counted locally.
+/// Drives whole ticks (deterministic; this is a local-store bug, no gossip
+/// race needed): burst, age out, burst again, and confirm the second ages out
+/// on the same 10 s schedule as the first.
+#[test]
+fn second_burst_after_expiry_still_ages_out() {
+    let config = SimConfig {
+        nodes: 3,
+        rule_window_ms: 10_000,
+        rule_bucket_ms: 1_000,
+        rule_limit: 1_000_000,
+        ..test_config(3)
+    };
+    with_engine(config, |tx| async move {
+        // First burst, spread and aged out across the whole cluster.
+        submit(&tx, 0, WATCHED_KEY, 25).await;
+        for _ in 0..130 {
+            step(&tx, 100).await; // 13 s ≫ the 10 s window
+        }
+        let after_first = snapshot(&tx).await;
+        assert!(
+            after_first.nodes.iter().all(|n| n.aggregate_total == 0),
+            "first burst must age out everywhere: {:?}",
+            after_first
+                .nodes
+                .iter()
+                .map(|n| n.aggregate_total)
+                .collect::<Vec<_>>(),
+        );
+
+        // Second burst, same key, same node — the rule slot was just released.
+        submit(&tx, 0, WATCHED_KEY, 25).await;
+        let after_second_submit = snapshot(&tx).await;
+        assert!(
+            after_second_submit
+                .nodes
+                .iter()
+                .any(|n| n.aggregate_total == 25),
+            "second burst must register on its origin"
+        );
+
+        // It must age out on the *same* 10 s schedule, not the 60 s default.
+        for _ in 0..130 {
+            step(&tx, 100).await;
+        }
+        let aged = snapshot(&tx).await;
+        assert!(
+            aged.nodes.iter().all(|n| n.aggregate_total == 0),
+            "second burst must age out in the 10 s window like the first — a non-zero \
+             total here means it was stored under the default 60 s descriptor: {:?}",
+            aged.nodes
+                .iter()
+                .map(|n| n.aggregate_total)
+                .collect::<Vec<_>>(),
+        );
+    });
+}

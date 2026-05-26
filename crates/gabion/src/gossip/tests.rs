@@ -901,6 +901,78 @@ async fn gossip_tick_drives_expiration() {
         .await;
 }
 
+/// A configured rule that goes idle long enough for every cell to expire must
+/// still age out on its *configured* window when traffic resumes — not silently
+/// fall back to the 60 s default. Exercises the `GossipRuntime` both adapters
+/// spawn: record → expire (releasing all cells) → record again → expire again.
+/// Before configured rules were pinned, the first expiry released the rule
+/// slot, so the second wave re-interned `RuleDescriptor::default()` (60 s
+/// window, `applies_locally = false`) and never aged out here.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn configured_rule_reexpires_after_idle_window() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr = sock(40_031);
+            let transport = router.bind(addr);
+
+            let identity = NodeIdentity::new(NodeId(0xAA), 1);
+            let mut store = store_for(identity);
+            // Configured rule: 100 ms bucket, 100 ms window -> 1 live bucket.
+            store
+                .intern_rule(RuleDescriptor {
+                    fingerprint: 0xFEED,
+                    window_millis: 100,
+                    bucket_millis: 100,
+                    limit: 10,
+                    flags: 0,
+                    local_rule_id: 1,
+                })
+                .unwrap();
+
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+
+            let (rt, client) = GossipRuntime::from_parts(
+                transport,
+                TokioClock::from_millis(0),
+                sim_config(identity, Vec::new(), 1),
+                store,
+                agg.clone(),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+            // First burst at bucket 0, then advance past the live window so the
+            // cell ages out and (pre-fix) the rule slot is released.
+            client
+                .record(0xFEED, KeyHash(7), 0, 2, 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 2);
+            sim_advance_ticks(Duration::from_millis(100), 3).await;
+            assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 0);
+
+            // Second burst at the now-current bucket. It must register and then
+            // age out on the same 100 ms window. Under the released-then-default
+            // bug it lands on a 60 s descriptor and stays here forever.
+            client
+                .record(0xFEED, KeyHash(7), 3, 2, 10, 300)
+                .await
+                .unwrap();
+            assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 2);
+            sim_advance_ticks(Duration::from_millis(100), 3).await;
+            assert_eq!(
+                agg.inner.borrow().values().copied().sum::<u64>(),
+                0,
+                "second burst must age out on the configured 100 ms window, not the 60 s default",
+            );
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
+        })
+        .await;
+}
+
 // -- ack ordering against apply ---------------------------------------------
 
 struct BlockingApplyStore<C: Count> {

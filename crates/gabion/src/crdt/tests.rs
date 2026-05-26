@@ -951,7 +951,8 @@ fn dictionary_refcount_frees_unreferenced_slots() {
     let node_slot = row.key.origin;
     let rule_slot = row.key.rule;
     assert_eq!(store.node_dictionary().refcount(node_slot), 1);
-    assert_eq!(store.rule_dictionary().refcount(rule_slot), 1);
+    // A configured rule carries its registration pin (1) plus the cell's ref.
+    assert_eq!(store.rule_dictionary().refcount(rule_slot), 2);
 
     // Expire the cell.
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
@@ -961,12 +962,113 @@ fn dictionary_refcount_frees_unreferenced_slots() {
     let mut exp = ExpirationSink::<u32>::with_capacity(1);
     store.expire(&cur, &live, &mut exp);
     assert_eq!(store.active_len(), 0);
-    // Refcounts return to 0 on both dictionaries; the corresponding slot
-    // entries are freed and `descriptor()` reports None.
+    // The unpinned remote-origin node slot frees: refcount 0, descriptor None.
     assert_eq!(store.node_dictionary().refcount(node_slot), 0);
     assert!(store.node_dictionary().descriptor(node_slot).is_none());
-    assert_eq!(store.rule_dictionary().refcount(rule_slot), 0);
-    assert!(store.rule_dictionary().descriptor(rule_slot).is_none());
+    // The configured rule slot keeps its registration pin, so it survives the
+    // cell's expiry and stays interned — this is what stops the next hit from
+    // re-interning the 60 s `RuleDescriptor::default()` fallback.
+    assert_eq!(store.rule_dictionary().refcount(rule_slot), 1);
+    assert!(store.rule_dictionary().descriptor(rule_slot).is_some());
+}
+
+/// A configured rule (applies_locally = true) must keep its descriptor across a
+/// full cell-expiry cycle. `intern_rule` holds a registration pin so the slot
+/// is never released to the default fallback; the next hit re-uses the
+/// configured descriptor — its real window, applies_locally true — instead of
+/// re-interning the 60 s `RuleDescriptor::default()`. Direct regression for the
+/// rule-dictionary release bug.
+#[test]
+fn configured_rule_pinned_survives_cell_expiry() {
+    let mut store = small_store(4, 8);
+    let configured = RuleDescriptor {
+        fingerprint: 0xCAFE,
+        window_millis: 10_000,
+        bucket_millis: 1_000,
+        limit: 5,
+        flags: 0,
+        local_rule_id: 7,
+    };
+    let slot = store.intern_rule(configured).unwrap();
+    // The registration pin alone holds the slot — no cells yet.
+    assert_eq!(store.rule_dictionary().refcount(slot), 1);
+    assert_eq!(store.rule_dictionary().descriptor(slot), Some(&configured));
+
+    // One cell on the rule: pin (1) + cell ref (1).
+    let h = remote_merge_one(&mut store, 0xCAFE, 100, 1, 3, 0);
+    assert_eq!(store.rule_dictionary().refcount(slot), 2);
+
+    // Force the cell to expire (bucket 0, current 20, live 0).
+    let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
+    let mut live = vec![0_u32; cur.len()];
+    cur[slot as usize] = 20;
+    live[slot as usize] = 0;
+    let mut exp = ExpirationSink::<u32>::with_capacity(1);
+    store.expire(&cur, &live, &mut exp);
+    assert!(store.get(h).is_none());
+    assert_eq!(store.active_len(), 0);
+
+    // The pin survives: refcount back to 1, descriptor unchanged (the real 10 s
+    // window and local_rule_id 7 — NOT the 60 s default).
+    assert_eq!(store.rule_dictionary().refcount(slot), 1);
+    assert_eq!(store.rule_dictionary().descriptor(slot), Some(&configured));
+
+    // A fresh hit re-uses the configured slot and records applies_locally =
+    // true. Under the released-then-default-reinterned bug this would land on a
+    // new wire-only slot with applies_locally = false, so the local aggregator
+    // would ignore it.
+    let mut obs = ObservationBatch::with_capacity(1);
+    let mut sink = DeltaSink::with_capacity(1);
+    obs.push(observation(
+        0xCAFE,
+        0xabc,
+        21,
+        local().node_id.0,
+        local().incarnation,
+        2,
+        21_000,
+    ));
+    store.ingest_local(&obs, &mut sink);
+    assert_eq!(store.find_rule(0xCAFE), Some(slot));
+    assert_eq!(sink.len(), 1);
+    assert_ne!(
+        sink.applies_locally[0], 0,
+        "re-recorded cell must apply locally (configured descriptor preserved)"
+    );
+    assert_eq!(store.rule_dictionary().descriptor(slot), Some(&configured));
+}
+
+/// A wire-only rule — learned from a peer via `merge_remote`, never registered
+/// locally — carries no registration pin, so its slot must free when its last
+/// cell expires. Guards that pinning configured rules didn't make stale peer
+/// rules immortal.
+#[test]
+fn wire_only_rule_frees_when_cells_expire() {
+    let mut store = small_store(4, 8);
+    let h = remote_merge_one(&mut store, 0xBEEF, 100, 1, 3, 0);
+    let slot = store.get(h).unwrap().key.rule;
+    // No pin: the cell is the only reference.
+    assert_eq!(store.rule_dictionary().refcount(slot), 1);
+    assert!(
+        !store
+            .rule_dictionary()
+            .descriptor(slot)
+            .unwrap()
+            .applies_locally(),
+        "an unregistered rule is wire-only"
+    );
+
+    let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
+    let mut live = vec![0_u32; cur.len()];
+    cur[slot as usize] = 20;
+    live[slot as usize] = 0;
+    let mut exp = ExpirationSink::<u32>::with_capacity(1);
+    store.expire(&cur, &live, &mut exp);
+    assert_eq!(store.active_len(), 0);
+
+    // Slot freed: no lingering descriptor for a rule nobody configured.
+    assert_eq!(store.rule_dictionary().refcount(slot), 0);
+    assert!(store.rule_dictionary().descriptor(slot).is_none());
 }
 
 #[test]
@@ -1277,12 +1379,14 @@ fn incarnation_change_isolates() {
 
 #[test]
 fn expire_emits_one_row_per_freed_cell() {
-    // Two rules — one with applies_locally=true (local_rule_id < u32::MAX),
-    // one whose descriptor `applies_locally()` returns false. Two origins.
-    // Drive the doomed cells onto a single rule slot so its refcount falls
-    // to zero — verifying emission happens *before* free_cell_at, since
-    // a post-free descriptor() lookup would otherwise return None for the
-    // doomed cells and applies_locally would silently degrade to false.
+    // Two configured rules (applies_locally = true), two origins. Both cells on
+    // `rule_doomed` age out together; the rule's registration pin keeps its
+    // descriptor live, so each freed cell still emits exactly one expiration
+    // row carrying applies_locally = true read from that live descriptor.
+    // (Before configured rules were pinned, the last cell's free_cell_at
+    // released the slot mid-expiry and a post-free descriptor() lookup would
+    // have degraded applies_locally to false. The pin removes that hazard;
+    // emission still runs before free_cell_at for the cell rows.)
     let mut store = small_store(8, 16);
     let rule_local = store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let rule_doomed = store
@@ -1334,7 +1438,8 @@ fn expire_emits_one_row_per_freed_cell() {
 
     let snap_a = store.get(h_doomed_a).unwrap();
     let snap_b = store.get(h_doomed_b).unwrap();
-    assert_eq!(store.rule_dictionary().refcount(rule_doomed), 2);
+    // Registration pin (1) + two cell refs.
+    assert_eq!(store.rule_dictionary().refcount(rule_doomed), 3);
 
     // Build thresholds: doomed cells (bucket 0, live 0, current 5) expire;
     // the keep cell on rule_local stays because its rule lives 1000 buckets.
@@ -1351,11 +1456,12 @@ fn expire_emits_one_row_per_freed_cell() {
     assert_eq!(store.active_len(), 1);
     assert_eq!(exp.len(), 2);
 
-    // Rule descriptor for the doomed slot should now be gone (refcount hit 0)
-    // — proving emission ran *before* free_cell_at, since the rows captured
-    // applies_locally=true from the live descriptor.
-    assert_eq!(store.rule_dictionary().refcount(rule_doomed), 0);
-    assert!(store.rule_dictionary().descriptor(rule_doomed).is_none());
+    // Both cell refs drop, but the registration pin keeps the doomed rule
+    // interned (refcount 1, descriptor still present). The expired rows still
+    // carry applies_locally=true (asserted below), read from the descriptor the
+    // pin keeps live.
+    assert_eq!(store.rule_dictionary().refcount(rule_doomed), 1);
+    assert!(store.rule_dictionary().descriptor(rule_doomed).is_some());
 
     let mut rows: Vec<CellExpiration<u32>> = (0..exp.len()).map(|i| exp.row(i).unwrap()).collect();
     rows.sort_by_key(|r| r.handle.index);
@@ -1569,13 +1675,15 @@ fn fill_gossip_frame_for_peer_skips_acked_cells() {
 
 // --- Coverage extensions (Gaps 1-6) -----------------------------------
 
-/// Like `quickcheck_store()` but pre-interns rules for fingerprints `0x100`
-/// and `0x101` with `local_rule_id != u32::MAX`, then `inc_ref`s each so the
-/// pin survives across expirations. Fingerprints `0x102` and `0x103` remain
-/// auto-interned on first use with `applies_locally = false`.
+/// Like `quickcheck_store()` but pre-registers configured rules for
+/// fingerprints `0x100` and `0x101` (`local_rule_id != u32::MAX`).
+/// `intern_rule` pins each on registration, so their descriptors (and thus
+/// `applies_locally`) survive even when every cell on the rule expires.
+/// Fingerprints `0x102` and `0x103` remain auto-interned wire-only on first
+/// use with `applies_locally = false`.
 fn quickcheck_store_with_pinned_rules() -> CellStore<u32> {
     let mut store = quickcheck_store();
-    let slot_a = store
+    store
         .intern_rule(RuleDescriptor {
             fingerprint: 0x100,
             window_millis: 1000,
@@ -1585,7 +1693,7 @@ fn quickcheck_store_with_pinned_rules() -> CellStore<u32> {
             local_rule_id: 1,
         })
         .unwrap();
-    let slot_b = store
+    store
         .intern_rule(RuleDescriptor {
             fingerprint: 0x101,
             window_millis: 1000,
@@ -1595,16 +1703,12 @@ fn quickcheck_store_with_pinned_rules() -> CellStore<u32> {
             local_rule_id: 1,
         })
         .unwrap();
-    // Pin so the descriptor (and thus `applies_locally`) survives even when
-    // every cell on that rule expires.
-    store.rule_dictionary.inc_ref(slot_a);
-    store.rule_dictionary.inc_ref(slot_b);
     store
 }
 
 /// Variant of `assert_structural_invariants` that allows one extra refcount
-/// on each slot in `pinned_rule_slots` — those are pinned via direct
-/// `inc_ref`, mirroring how the local node slot is pinned.
+/// on each slot in `pinned_rule_slots` — those carry the registration pin
+/// `intern_rule` holds for a configured rule, on top of their cell refs.
 fn assert_invariants_with_pinned_rules(
     store: &CellStore<u32>,
     pinned_rule_slots: &[RuleSlot],
