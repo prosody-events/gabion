@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/gabion.png" alt="Gabion" width="100%">
-</p>
-
 # Gabion
 
 Gabion is a distributed rate limiter for nginx and Envoy. Every member
