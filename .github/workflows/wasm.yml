@@ -65,7 +65,10 @@ jobs:
           version: 'latest'
       - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          # `crates/gabion-wasm/web/pnpm-workspace.yaml` uses pnpm 11's
+          # `allowBuilds:` build-allowlist key — pnpm 9 doesn't recognise
+          # it and errors out with "packages field missing or empty".
+          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: 22

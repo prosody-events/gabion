@@ -82,19 +82,19 @@ impl Default for SimConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "cluster size {got} is out of range: the visualizer simulates 1 to \
-         {MAX_NODES} nodes. Lower `nodes` in the controls or shared URL."
+        "cluster size {got} is out of range: the visualizer simulates 1 to {MAX_NODES} nodes. \
+         Lower `nodes` in the controls or shared URL."
     )]
     NodeCountOutOfRange { got: usize },
     #[error(
-        "rule window ({window_ms} ms) and bucket ({bucket_ms} ms) must both \
-         be non-zero and the window must be a whole number of buckets. Adjust \
-         `rule_window_ms` / `rule_bucket_ms` in the controls."
+        "rule window ({window_ms} ms) and bucket ({bucket_ms} ms) must both be non-zero and the \
+         window must be a whole number of buckets. Adjust `rule_window_ms` / `rule_bucket_ms` in \
+         the controls."
     )]
     WindowBucketMismatch { window_ms: u32, bucket_ms: u32 },
     #[error(
-        "packet-loss probability {got} is outside 0.0–1.0. Set `uniform_loss` \
-         to a fraction (e.g. 0.1 for 10% loss)."
+        "packet-loss probability {got} is outside 0.0–1.0. Set `uniform_loss` to a fraction (e.g. \
+         0.1 for 10% loss)."
     )]
     LossOutOfRange { got: f64 },
 }
@@ -127,28 +127,28 @@ impl SimConfig {
 
     /// Per-node CRDT capacities for the browser sim, derived from the watched
     /// rule's live-bucket count and the cluster's *growth ceiling*. The single
-    /// sizing site: every node ([`crate::engine`]'s initial build and `add_node`
-    /// both route through `spawn_node`, which calls this).
+    /// sizing site: every node ([`crate::engine`]'s initial build and
+    /// `add_node` both route through `spawn_node`, which calls this).
     ///
     /// The node-count term is [`MAX_NODES`], **not** `self.nodes`. A
     /// [`gabion::crdt::CellStore`] allocates once and never resizes, and the
-    /// visualizer grows the live cluster by live joins up to `MAX_NODES` with no
-    /// rebuild (the `live-node-membership-requirement`). Sizing from `self.nodes`
-    /// would overflow the node dictionary, peer table, and cell store the moment
-    /// a user joined past `config.nodes`, so every cluster is sized for the
-    /// ceiling it can grow to — the same guarantee the old per-`spawn_node`
-    /// floors gave, now in one expression.
+    /// visualizer grows the live cluster by live joins up to `MAX_NODES` with
+    /// no rebuild (the `live-node-membership-requirement`). Sizing from
+    /// `self.nodes` would overflow the node dictionary, peer table, and
+    /// cell store the moment a user joined past `config.nodes`, so every
+    /// cluster is sized for the ceiling it can grow to — the same guarantee
+    /// the old per-`spawn_node` floors gave, now in one expression.
     ///
     /// Unlike the adapters' production configs
     /// ([`gabion::defaults::STORAGE_*`] via `server::config::cell_store_config`
     /// and `nginx::leader::production_cell_store_config`), these carry **no
     /// production floors**: the visualizer watches one rule for a handful of
-    /// keys, so even at the ceiling the working set is the cross-node replica set
-    /// — `MAX_NODES × live_buckets` cells — a few thousand entries, not the
-    /// hundreds of thousands a real deployment sizes for. A small constant
-    /// `SLACK` keeps the largest cluster clear of eviction; if a probe ever
-    /// overflows a ring, raise `SLACK` here — the one place — not a scattered
-    /// floor.
+    /// keys, so even at the ceiling the working set is the cross-node replica
+    /// set — `MAX_NODES × live_buckets` cells — a few thousand entries, not
+    /// the hundreds of thousands a real deployment sizes for. A small
+    /// constant `SLACK` keeps the largest cluster clear of eviction; if a
+    /// probe ever overflows a ring, raise `SLACK` here — the one place —
+    /// not a scattered floor.
     pub fn cell_store_config(&self, live_buckets: u32) -> CellStoreConfig {
         // Headroom over the exact working set, absorbing churn and the bucket
         // just emerging under "now". One knob for the whole sizing.

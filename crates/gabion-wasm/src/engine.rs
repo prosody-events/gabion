@@ -132,15 +132,14 @@ pub enum EngineError {
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(
-        "node {id} is not a member of this cluster — it never joined, or it has \
-         already left. Node ids are stable and are never reused, so a removed \
-         node's id stays gone. Pick an id from the current cluster (the live \
-         ids appear on the stage and in the Cluster control)."
+        "node {id} is not a member of this cluster — it never joined, or it has already left. \
+         Node ids are stable and are never reused, so a removed node's id stays gone. Pick an id \
+         from the current cluster (the live ids appear on the stage and in the Cluster control)."
     )]
     UnknownNode { id: u32 },
     #[error(
-        "the gossip runtime for node {node} has stopped, so the request could \
-         not be recorded. The simulation has ended; reload to start over."
+        "the gossip runtime for node {node} has stopped, so the request could not be recorded. \
+         The simulation has ended; reload to start over."
     )]
     Gossip {
         node: u32,
@@ -366,9 +365,10 @@ impl EngineState {
     }
 
     /// The watched rule as a [`RuleDescriptor`], built from `self.config`. The
-    /// one construction site, so the rule the nodes intern, the bucket epoch the
-    /// submission path stamps, and the window the snapshot reports can never
-    /// drift from one another (or from gabion's own window/epoch helpers).
+    /// one construction site, so the rule the nodes intern, the bucket epoch
+    /// the submission path stamps, and the window the snapshot reports can
+    /// never drift from one another (or from gabion's own window/epoch
+    /// helpers).
     fn rule_descriptor(&self) -> RuleDescriptor {
         RuleDescriptor {
             fingerprint: self.config.rule_fingerprint,
@@ -391,7 +391,8 @@ impl EngineState {
     /// with no production floors (the browser working set is a few hundred
     /// cells, not the hundreds of thousands a deployment sizes for). The caps
     /// scale with `config.nodes`, so a newcomer is sized for the same
-    /// `MAX_NODES`-bounded cluster the initial members were — no resize on join.
+    /// `MAX_NODES`-bounded cluster the initial members were — no resize on
+    /// join.
     fn spawn_node(&mut self, id: u32, bootstrap: &[SocketAddr]) {
         let addr = addr_of_id(id);
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);

@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use crate::discovery::{Peer, PeerDiscovery, PeerEvent};
 use ahash::{AHashMap, AHashSet};
 use async_stream::stream;
@@ -26,6 +29,12 @@ pub struct EndpointSliceDiscovery {
     self_addr: Option<SocketAddr>,
     namespace_allow: Vec<String>,
     service_allow: Vec<String>,
+    /// Pre-built client; when `Some` we skip the in-cluster client
+    /// construction entirely and use it as-is. Only the
+    /// kubeconfig-aware test constructor populates this — production
+    /// constructors leave it `None` so the in-cluster credential
+    /// loading path on the production hot start path is byte-identical.
+    preconnected: Option<Client>,
 }
 
 impl EndpointSliceDiscovery {
@@ -38,6 +47,28 @@ impl EndpointSliceDiscovery {
             self_addr,
             namespace_allow,
             service_allow,
+            preconnected: None,
+        }
+    }
+
+    /// Build an `EndpointSliceDiscovery` from an already-constructed
+    /// `kube::Client`. Used by the live-cluster integration test, which
+    /// resolves credentials via `Config::infer()` (kubeconfig + env
+    /// vars) so it can run against a kind cluster from the workstation.
+    /// Production code paths never reach this — they construct the
+    /// client lazily via [`build_incluster_client`].
+    #[doc(hidden)]
+    pub fn with_client(
+        client: Client,
+        self_addr: Option<SocketAddr>,
+        namespace_allow: Vec<String>,
+        service_allow: Vec<String>,
+    ) -> Self {
+        Self {
+            self_addr,
+            namespace_allow,
+            service_allow,
+            preconnected: Some(client),
         }
     }
 }
@@ -47,22 +78,25 @@ impl PeerDiscovery for EndpointSliceDiscovery {
 
     fn peer_events(self) -> impl Stream<Item = Result<PeerEvent, Self::Error>> + Send {
         stream! {
-            let client = match build_incluster_client() {
-                Ok(client) => client,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "Could not connect to the Kubernetes API; gabion \
-                         cannot auto-discover peers. This node will only \
-                         talk to peers listed in `gossip.bootstrap_peers`. \
-                         Check that the pod has the auto-mounted \
-                         ServiceAccount secrets at \
-                         /var/run/secrets/kubernetes.io/serviceaccount/ \
-                         and an RBAC binding granting watch on Services \
-                         and EndpointSlices.",
-                    );
-                    return;
-                }
+            let client = match self.preconnected.clone() {
+                Some(c) => c,
+                None => match build_incluster_client() {
+                    Ok(client) => client,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "Could not connect to the Kubernetes API; gabion \
+                             cannot auto-discover peers. This node will only \
+                             talk to peers listed in `gossip.bootstrap_peers`. \
+                             Check that the pod has the auto-mounted \
+                             ServiceAccount secrets at \
+                             /var/run/secrets/kubernetes.io/serviceaccount/ \
+                             and an RBAC binding granting watch on Services \
+                             and EndpointSlices.",
+                        );
+                        return;
+                    }
+                },
             };
             let mut services = watch_services(&client, &self.namespace_allow);
             let mut endpoints = SelectAll::new();
@@ -305,13 +339,13 @@ fn watch_target(
         let labels = format!("kubernetes.io/service-name={}", target.service_name);
         let events = watcher(api, WatcherConfig::default().labels(&labels));
         futures::pin_mut!(events);
-        let mut by_slice: AHashMap<String, AHashSet<Peer>> = AHashMap::new();
+        let mut peer_set = EndpointSlicePeerSet::default();
 
         loop {
             tokio::select! {
                 biased;
                 _ = &mut cancel => {
-                    for peer in by_slice.into_values().flatten() {
+                    for peer in peer_set.drain_peers() {
                         yield Ok(PeerEvent::Removed(peer));
                     }
                     return;
@@ -337,23 +371,17 @@ fn watch_target(
                     }
                     Some(Ok(Event::Init | Event::InitDone)) => {}
                     Some(Ok(Event::Apply(slice) | Event::InitApply(slice))) => {
-                        let new: AHashSet<Peer> = peers(&slice, self_addr).collect();
-                        let Some(name) = slice.metadata.name else { continue };
-                        let old = by_slice.remove(&name).unwrap_or_default();
-                        for &peer in old.difference(&new) {
+                        let diff = peer_set.apply(&slice, self_addr);
+                        for peer in diff.removed {
                             yield Ok(PeerEvent::Removed(peer));
                         }
-                        for &peer in new.difference(&old) {
+                        for peer in diff.added {
                             yield Ok(PeerEvent::Added(peer));
                         }
-                        by_slice.insert(name, new);
                     }
                     Some(Ok(Event::Delete(slice))) => {
-                        let Some(name) = slice.metadata.name.as_deref() else { continue };
-                        if let Some(old) = by_slice.remove(name) {
-                            for peer in old {
-                                yield Ok(PeerEvent::Removed(peer));
-                            }
+                        for peer in peer_set.delete(&slice) {
+                            yield Ok(PeerEvent::Removed(peer));
                         }
                     }
                 },
@@ -362,20 +390,113 @@ fn watch_target(
     }
 }
 
-fn peers(slice: &EndpointSlice, self_addr: Option<SocketAddr>) -> impl Iterator<Item = Peer> + '_ {
-    select_gabion_udp_port(slice)
-        .into_iter()
-        .flat_map(move |port| {
-            slice
-                .endpoints
-                .iter()
-                .filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
-                .flat_map(|e| &e.addresses)
-                .filter_map(move |addr| {
-                    let sock = SocketAddr::new(addr.parse::<IpAddr>().ok()?, port);
-                    (Some(sock) != self_addr).then_some(Peer::new(sock))
-                })
+/// Per-slice peer accounting for one `Service` target. `watch_target`
+/// drives one of these for the lifetime of its EndpointSlice watch; the
+/// inner map is keyed by EndpointSlice `metadata.name` so that
+/// successive `Apply` events for the same slice replace the old peer
+/// set in place. Lifted out of `watch_target` as its own type so the
+/// snapshot/diff semantics are unit-testable without spinning up a kube
+/// client.
+#[derive(Default)]
+pub(super) struct EndpointSlicePeerSet {
+    by_slice: AHashMap<String, AHashSet<Peer>>,
+}
+
+/// What `apply` changed relative to the previous snapshot for that
+/// slice — separated so the caller can emit `Removed` before `Added`
+/// (matching how the kube-rs watcher reports an Apply that both adds
+/// and removes addresses within one slice).
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct PeerSetDiff {
+    pub(super) added: Vec<Peer>,
+    pub(super) removed: Vec<Peer>,
+}
+
+impl EndpointSlicePeerSet {
+    /// Replace the cached peer set for `slice.metadata.name` with the
+    /// parsed peers of `slice`. Returns the symmetric difference. A
+    /// slice with no name is silently dropped (matches the in-tree
+    /// `continue` in `watch_target`).
+    pub(super) fn apply(
+        &mut self,
+        slice: &EndpointSlice,
+        self_addr: Option<SocketAddr>,
+    ) -> PeerSetDiff {
+        let Some(name) = slice.metadata.name.as_deref() else {
+            return PeerSetDiff::default();
+        };
+        let new: AHashSet<Peer> = peers_from_endpoint_slice(slice, self_addr);
+        let old = self.by_slice.remove(name).unwrap_or_default();
+        let mut diff = PeerSetDiff::default();
+        for &peer in old.difference(&new) {
+            diff.removed.push(peer);
+        }
+        for &peer in new.difference(&old) {
+            diff.added.push(peer);
+        }
+        self.by_slice.insert(name.to_owned(), new);
+        diff
+    }
+
+    /// Forget the cached peer set for `slice`; returns the peers the
+    /// caller now needs to emit `Removed` for. Unknown slice names are
+    /// a no-op.
+    pub(super) fn delete(&mut self, slice: &EndpointSlice) -> Vec<Peer> {
+        let Some(name) = slice.metadata.name.as_deref() else {
+            return Vec::new();
+        };
+        self.by_slice
+            .remove(name)
+            .map(|set| set.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Replace the entire peer map with `other`'s. Used on
+    /// relist/re-init to drop slices the watcher no longer reports.
+    /// Returns nothing — callers handle the diff by comparing their
+    /// own snapshots before and after.
+    #[cfg(test)]
+    pub(super) fn replace(&mut self, other: EndpointSlicePeerSet) {
+        self.by_slice = other.by_slice;
+    }
+
+    /// Empty the map and yield every peer it contained — used at
+    /// watcher shutdown to emit `Removed` for everything still live.
+    pub(super) fn drain_peers(&mut self) -> impl Iterator<Item = Peer> + '_ {
+        std::mem::take(&mut self.by_slice).into_values().flatten()
+    }
+
+    /// Sorted, deduplicated union of every cached slice's peer set.
+    /// Used by tests to assert against a model snapshot.
+    #[cfg(test)]
+    pub(super) fn snapshot_peers(&self) -> Vec<Peer> {
+        let mut peers: Vec<Peer> = self.by_slice.values().flatten().copied().collect();
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+}
+
+/// Parse an EndpointSlice into the (deduplicated, self-filtered, ready-
+/// only) peer set. Exposed to `tests` rather than kept private to the
+/// runtime so the parser invariants are pinned by unit tests.
+pub(super) fn peers_from_endpoint_slice(
+    slice: &EndpointSlice,
+    self_addr: Option<SocketAddr>,
+) -> AHashSet<Peer> {
+    let Some(port) = select_gabion_udp_port(slice) else {
+        return AHashSet::new();
+    };
+    slice
+        .endpoints
+        .iter()
+        .filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
+        .flat_map(|e| &e.addresses)
+        .filter_map(|addr| {
+            let sock = SocketAddr::new(addr.parse::<IpAddr>().ok()?, port);
+            (Some(sock) != self_addr).then_some(Peer::new(sock))
         })
+        .collect()
 }
 
 fn select_gabion_udp_port(slice: &EndpointSlice) -> Option<u16> {

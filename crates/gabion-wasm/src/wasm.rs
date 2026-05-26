@@ -213,8 +213,8 @@ impl Sim {
 /// The production-aligned [`SimConfig`] defaults as a plain JS object. The
 /// single source the frontend reads, so its control sliders open at exactly the
 /// values an omitted field would take — no hand-maintained TypeScript mirror to
-/// drift from `gabion::defaults`. `u128` fields cross as hex strings, like every
-/// other boundary payload.
+/// drift from `gabion::defaults`. `u128` fields cross as hex strings, like
+/// every other boundary payload.
 #[wasm_bindgen]
 pub fn default_config() -> Result<JsValue, JsValue> {
     to_js(&SimConfig::default())
@@ -228,7 +228,7 @@ fn to_js<T: serde::Serialize>(value: &T) -> Result<JsValue, JsValue> {
 /// The error every method returns once the engine task is gone.
 fn engine_gone() -> JsValue {
     JsValue::from_str(
-        "the simulation engine has stopped, so this command could not run. \
-         Reload the page to start a new session.",
+        "the simulation engine has stopped, so this command could not run. Reload the page to \
+         start a new session.",
     )
 }

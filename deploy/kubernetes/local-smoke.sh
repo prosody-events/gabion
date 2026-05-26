@@ -34,7 +34,20 @@ if ! cargo nextest --version >/dev/null 2>&1; then
     exit 1
 fi
 
-env CARGO_BUILD_RUSTC_WRAPPER= cargo nextest run -p gabion --no-default-features discovery::kubernetes::tests
-env CARGO_BUILD_RUSTC_WRAPPER= cargo nextest run -p gabion --no-default-features --run-ignored ignored-only local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence
+# Use the default feature set: `discovery-kubernetes` is what enables the
+# `discovery::kubernetes::tests` module in the first place, and
+# `transport-udp` is needed for the test crate to compile (it pulls
+# `UdpTransport` and `tokio::net::UdpSocket` via the gossip tests file).
+# The previous `--no-default-features` form gated out kubernetes entirely,
+# so the filter matched zero tests.
+env CARGO_BUILD_RUSTC_WRAPPER= cargo nextest run -p gabion discovery::kubernetes::tests
+
+# Live-cluster integration: `EndpointSliceDiscovery` against the running
+# kind cluster, end-to-end through `GossipRuntime` convergence. Marked
+# `#[ignore]` so it doesn't fire on `make test`, and only run here under
+# `local-smoke.sh` where we've already asserted kind is up.
+env CARGO_BUILD_RUSTC_WRAPPER= cargo nextest run -p gabion \
+    --run-ignored ignored-only \
+    discovery::kubernetes::tests::local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence
 
 printf '%s\n' "local kubernetes EndpointSlice watcher and gossip convergence test passed on context '$context' ($server)"

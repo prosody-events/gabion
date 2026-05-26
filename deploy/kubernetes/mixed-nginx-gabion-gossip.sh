@@ -27,6 +27,20 @@ admin_forward_pid=""
 nginx_forward_pid=""
 
 cleanup() {
+    # If the script is failing, dump pod state BEFORE namespace deletion —
+    # otherwise `kubectl delete namespace` wipes pod logs, events, and
+    # describe output before we can read them, leaving CI with nothing
+    # but a generic "rollout timed out" message.
+    if [ "${cleanup_dump:-1}" = "1" ] && [ -n "${namespace:-}" ]; then
+        printf '\n--- cleanup diagnostic dump (namespace=%s) ---\n' "$namespace" >&2
+        kubectl -n "$namespace" get pods,events --sort-by=.lastTimestamp -o wide >&2 || true
+        kubectl -n "$namespace" describe pods -l app=gabiond >&2 || true
+        kubectl -n "$namespace" describe pods -l app=gabion-nginx >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=200 -l app=gabiond >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=200 --previous -l app=gabiond >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=200 -l app=gabion-nginx >&2 || true
+        printf -- '--- end cleanup diagnostic dump ---\n\n' >&2
+    fi
     if [ -n "$admin_forward_pid" ]; then
         kill "$admin_forward_pid" 2>/dev/null || true
     fi
@@ -223,6 +237,9 @@ spec:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
           imagePullPolicy: Never
+          # See nginx-scale-rate-limit.sh: the image's baked CMD is the
+          # one-shot request smoke, which exits immediately under k8s.
+          command: ["nginx", "-g", "daemon off;"]
           ports:
             - { name: http,   containerPort: 8080 }
             - { name: gossip, containerPort: 9000, protocol: UDP }

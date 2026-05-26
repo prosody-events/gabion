@@ -280,9 +280,9 @@ pub fn parse_rate(input: &str) -> Result<(u64, Duration), &'static str> {
         "m" => Duration::from_secs(60),
         "h" => Duration::from_secs(60 * 60),
         "d" => Duration::from_secs(60 * 60 * 24),
-        other => humantime::parse_duration(other).map_err(
-            |_| "rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`",
-        )?,
+        other => humantime::parse_duration(other).map_err(|_| {
+            "rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`"
+        })?,
     };
     if duration.is_zero() {
         return Err("rate period must be greater than zero");

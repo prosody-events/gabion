@@ -62,10 +62,17 @@ RUN openresty_version="$(nginx -v 2>&1 | sed 's#nginx version: openresty/##')" \
     && tar -xzf "openresty-${openresty_version}.tar.gz" \
     && cd "openresty-${openresty_version}" \
     && ./configure --with-compat \
-    && nginx_build_dir="$(find "$PWD/build" -maxdepth 2 -type d -name objs | head -n 1)" \
-    && nginx_source_dir="$(dirname "${nginx_build_dir}")" \
-    && test -n "${nginx_source_dir}" \
-    && test -n "${nginx_build_dir}" \
+    # `./configure --with-compat` materializes `objs/` not just under
+    # `nginx-X.Y.Z/` but also under each bundled module that openresty
+    # ships (ngx_devel_kit/, echo-nginx-module/, lua-nginx-module/, …).
+    # An unfiltered `find -name objs | head -n 1` therefore hands
+    # nginx-sys's build.rs a module subdir like `ngx_devel_kit-0.3.4/`
+    # and the build panics with "Invalid nginx source directory". Pin
+    # to the `nginx-*` source root explicitly.
+    && nginx_source_dir="$(printf '%s\n' "$PWD"/build/nginx-*/ | sort -V | tail -n 1 | sed 's:/$::')" \
+    && nginx_build_dir="${nginx_source_dir}/objs" \
+    && test -d "${nginx_source_dir}/src/core" \
+    && test -d "${nginx_build_dir}" \
     && printf 'NGINX_SOURCE_DIR=%s\nNGINX_BUILD_DIR=%s\n' \
         "${nginx_source_dir}" "${nginx_build_dir}" > /workspace/openresty-nginx-build.env
 

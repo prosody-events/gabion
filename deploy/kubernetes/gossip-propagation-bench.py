@@ -117,33 +117,29 @@ metadata:
   name: gabiond-config
 data:
   config.yaml: |
+    envoy_bind: 0.0.0.0:8081
+    admin_bind: 0.0.0.0:9090
     storage:
-      max_keys: {MAX_CELLS}
       max_cells: {MAX_CELLS}
-      dirty_ring_entries: {MAX_CELLS}
-    server:
-      envoy_rls:
-        enabled: true
-        bind: 0.0.0.0:8081
-      admin:
-        enabled: true
-        bind: 0.0.0.0:9090
+      rule_dictionary_capacity: 64
+      node_dictionary_capacity: 256
+      local_dirty_capacity: 2048
+      forwarded_dirty_capacity: 8192
+      peer_capacity: 64
+    runtime:
+      rng_seed: 12345
     discovery:
-      kind: kubernetes
-      endpoint_slices:
-        - namespace: {NAMESPACE}
-          service_name: gabiond
-          port_name: gossip
-        - namespace: {NAMESPACE}
-          service_name: gabion-nginx
-          port_name: gossip
+      namespace_allow: ["{NAMESPACE}"]
+      service_allow: ["gabiond", "gabion-nginx"]
     gossip:
-      enabled: true
       bind: 0.0.0.0:9000
-      linger_ms: {LINGER_MS}
+      tick_interval: {LINGER_MS}ms
       fanout: {FANOUT}
-      max_payload_bytes: 65536
-      max_cells_per_frame: 4096
+      max_payload_bytes: 1400
+      max_cells_per_frame: 1024
+      max_cells_per_tick: 1024
+      send_queue_capacity: 32
+      limit_queue_capacity: 1024
       cluster_id_hash: 1
     limits:
       - name: nginx_uri
@@ -153,10 +149,6 @@ data:
             value: "*"
         rate: {RULE_LIMIT}r/m
         bucket: 1s
-        local_fallback_limit: {RULE_LIMIT}
-        local_absolute_limit: {RULE_LIMIT}
-        stale_after: 2s
-        overflow_policy: aggregate
         mode: enforce
 ---
 apiVersion: v1
@@ -270,6 +262,9 @@ spec:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
           imagePullPolicy: Never
+          # See nginx-scale-rate-limit.sh: the image's baked CMD is the
+          # one-shot request smoke, which exits immediately under k8s.
+          command: ["nginx", "-g", "daemon off;"]
           ports:
             - name: http
               containerPort: 8080
@@ -735,6 +730,19 @@ def main():
         if sampler is not None:
             sampler.join(timeout=5)
         stop_processes(forwards)
+        # Dump pod state BEFORE deleting the namespace — otherwise CI
+        # logs lose every signal about why pods crashed.
+        log(f"\n--- cleanup diagnostic dump (namespace={NAMESPACE}) ---")
+        for cmd in (
+            ["kubectl", "-n", NAMESPACE, "get", "pods,events", "--sort-by=.lastTimestamp", "-o", "wide"],
+            ["kubectl", "-n", NAMESPACE, "describe", "pods", "-l", "app=gabiond"],
+            ["kubectl", "-n", NAMESPACE, "describe", "pods", "-l", "app=gabion-nginx"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=200", "-l", "app=gabiond"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=200", "--previous", "-l", "app=gabiond"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=200", "-l", "app=gabion-nginx"],
+        ):
+            run(cmd, check=False)
+        log("--- end cleanup diagnostic dump ---\n")
         if KEEP_NAMESPACE:
             print(f"kept namespace {NAMESPACE}", file=sys.stderr)
         else:

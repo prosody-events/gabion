@@ -27,6 +27,17 @@ namespace="gabion-nginx-scale-$$"
 port_forward_pid=""
 
 cleanup() {
+    # Dump pod state BEFORE namespace deletion so CI failures surface
+    # the real cause instead of a generic timeout. See mixed script for
+    # the rationale.
+    if [ -n "${namespace:-}" ]; then
+        printf '\n--- cleanup diagnostic dump (namespace=%s) ---\n' "$namespace" >&2
+        kubectl -n "$namespace" get pods,events --sort-by=.lastTimestamp -o wide >&2 || true
+        kubectl -n "$namespace" describe pods -l app=gabion-nginx >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=200 -l app=gabion-nginx >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=200 --previous -l app=gabion-nginx >&2 || true
+        printf -- '--- end cleanup diagnostic dump ---\n\n' >&2
+    fi
     if [ -n "$port_forward_pid" ]; then
         kill "$port_forward_pid" 2>/dev/null || true
     fi
@@ -91,6 +102,12 @@ spec:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
           imagePullPolicy: Never
+          # The image's baked CMD (from `deploy/nginx/docker-compose.yml`)
+          # is `/usr/local/bin/gabion-nginx-request-smoke`, a one-shot
+          # script that runs nginx, hits a few URLs, then exits. In a
+          # long-lived pod that's CrashLoopBackoff. Run nginx as a daemon
+          # instead — same image, real server.
+          command: ["nginx", "-g", "daemon off;"]
           ports:
             - name: http
               containerPort: 8080
