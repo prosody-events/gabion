@@ -450,7 +450,7 @@
               <NodeInspector
                 node={selectedNode}
                 oracleTotal={cluster?.oracle_total ?? 0}
-                ruleLimit={knobs.rule_limit}
+                ruleLimit={appliedKnobs.rule_limit}
                 baseFanout={appliedKnobs.fanout}
                 {burstHits}
                 version={chartVersion}
@@ -462,16 +462,16 @@
                   currentEpoch={cluster?.bucket_epoch_now ?? 0}
                   epochFraction={((cluster?.virtual_ms ?? 0) % defaults.rule_bucket_ms) /
                     defaults.rule_bucket_ms}
-                  liveBuckets={nominalBuckets(knobs.rule_window_ms, defaults.rule_bucket_ms)}
-                  windowMs={knobs.rule_window_ms}
-                  limit={knobs.rule_limit}
+                  liveBuckets={nominalBuckets(appliedKnobs.rule_window_ms, defaults.rule_bucket_ms)}
+                  windowMs={appliedKnobs.rule_window_ms}
+                  limit={appliedKnobs.rule_limit}
                 />
               </NodeInspector>
             {:else}
               <Dashboard
                 {history}
                 version={chartVersion}
-                limit={knobs.rule_limit}
+                limit={appliedKnobs.rule_limit}
                 showLimit={activePreset.showsLimitChart === true}
               />
             {/if}

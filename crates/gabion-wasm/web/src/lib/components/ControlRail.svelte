@@ -78,9 +78,12 @@
   // it only for those scenarios (progressive disclosure — fewer idle controls).
   const showNetwork = $derived(activePreset?.usesNetwork ?? false);
   const nodeCount = $derived(nodeIds.length);
-  // The window reads in whole seconds; its bar count is the bucket math the
-  // Strata uses (one source of truth — `buckets.ts`), so the readout can't
-  // disagree with the strip the inspector draws.
+  // The window reads in whole seconds; its bar count uses the same bucket math
+  // the Strata uses (one source of truth — `buckets.ts`). This readout tracks
+  // the *staged* slider value (what you're dragging), while the inspector strip
+  // reflects the *applied* engine. They diverge only while a window edit is
+  // staged-but-not-rebuilt — the knob's "changed" cue flags exactly that gap —
+  // and match again on Rebuild.
   const windowSec = $derived(Math.round(knobs.rule_window_ms / 1000));
   const windowBuckets = $derived(visibleBuckets(knobs.rule_window_ms, bucketMs));
 
