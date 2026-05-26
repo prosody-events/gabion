@@ -24,7 +24,7 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      kube-smoke: ${{ steps.rail.outputs.custom_kube_smoke }}
+      kube-smoke: ${{ steps.surfaces.outputs.kube_smoke }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -33,11 +33,18 @@ jobs:
         id: rail
         with:
           mode: minimal
-      - name: debug rail outputs
+      # cargo-rail-action v4.1.3 emits the built-in surface outputs
+      # (`build`, `test`, …) but doesn't actually expose `custom_<name>`
+      # outputs even though its README claims it does — they're never
+      # declared in `outputs:` so GitHub Actions filters them out. Read
+      # them out of `scope-json` ourselves with jq.
+      - id: surfaces
         env:
-          RAIL_OUTPUTS: ${{ toJSON(steps.rail.outputs) }}
+          SCOPE_JSON: ${{ steps.rail.outputs.scope-json }}
         run: |
-          printf 'rail outputs:\n%s\n' "$RAIL_OUTPUTS"
+          set -eu
+          val=$(printf '%s' "$SCOPE_JSON" | jq -r '.surfaces["custom:kube_smoke"] // false')
+          echo "kube_smoke=$val" >> "$GITHUB_OUTPUT"
 
   # Each k8s job spins its own kind cluster. They cannot share one — the
   # smoke scripts create / delete namespaces named after the parent
