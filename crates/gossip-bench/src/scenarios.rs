@@ -490,8 +490,9 @@ async fn apply_workload(
                     .get(*node)
                     .with_context(|| format!("distinct_key_burst node {node} out of range"))?;
                 // One hit per distinct key — the cardinality of dirty
-                // cells produced is `cells`, which is the lever
-                // `adaptive_fanout` uses to drive `log₂(dirty)`.
+                // cells produced is `cells`, the volume lever the
+                // `coverage_fanout` suite sweeps to show the per-tick
+                // fanout does *not* move with it.
                 for i in 0..*cells {
                     n.client
                         .record(
@@ -620,11 +621,13 @@ async fn snapshot(
     let mut threshold_fires_total = 0_u64;
     let mut ticks_total = 0_u64;
     let mut dirty_ticks_total = 0_u64;
+    let mut peak_effective_fanout = 0_usize;
     for n in nodes {
         if let Some(snap) = admin_snapshot(&n.admin_tx).await {
             threshold_fires_total = threshold_fires_total.saturating_add(snap.threshold_fires);
             ticks_total = ticks_total.saturating_add(snap.ticks_total);
             dirty_ticks_total = dirty_ticks_total.saturating_add(snap.dirty_ticks);
+            peak_effective_fanout = peak_effective_fanout.max(snap.peak_effective_fanout);
         }
     }
 
@@ -652,6 +655,7 @@ async fn snapshot(
         threshold_fires_total,
         ticks_total,
         dirty_ticks_total,
+        peak_effective_fanout,
         per_node_hot_total,
         per_node_cold_total,
         ground_truth_hot_total: ground_truth_hot,
@@ -721,6 +725,16 @@ fn compute_headline(
     // are taken over the per-window ratios so a steady-state run reports
     // the same number for p50 and p95.
     let (effective_fanout_p50, effective_fanout_p95) = effective_fanout_quantiles(samples);
+
+    // Peak coverage fanout reached anywhere in the cluster across the run.
+    // The headline number for the `coverage_fanout` suite: it should equal
+    // the predicted `⌈ln(peers)+c⌉` for the cluster size and stay flat as
+    // the burst volume changes.
+    let peak_effective_fanout = samples
+        .iter()
+        .map(|s| s.peak_effective_fanout)
+        .max()
+        .unwrap_or(0);
 
     // Max lag: peak `ground_truth - min(per_node_total)` across the run.
     // For the `error_budget` suite this is the empirical bound to
@@ -843,6 +857,7 @@ fn compute_headline(
         threshold_fires_per_node,
         effective_fanout_p50,
         effective_fanout_p95,
+        peak_effective_fanout,
         max_lag,
         extras,
     }

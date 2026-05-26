@@ -89,10 +89,10 @@ pub enum ScenarioKind {
     Staleness,
     /// Karp / Bimodal: convergence as a function of cluster size.
     ScaleN,
-    /// Verma & Ooi-style: rounds-to-converge stays O(log N) as the
-    /// dirty-set cardinality grows because the runtime widens fanout
-    /// with `log₂(dirty)`.
-    AdaptiveFanout,
+    /// Kermarrec/Massoulié/Ganesh-style: the per-tick fanout the runtime
+    /// picks is the coverage threshold `⌈ln(n)+c⌉`, a function of cluster
+    /// size — flat as the dirty-set cardinality changes, scaling with `n`.
+    CoverageFanout,
     /// Olston / Sharfman-style: bandwidth and max lag as the per-rule
     /// `target_err_bps` budget changes. Confirms the cluster-wide error
     /// bound `N × ε_R` and shows the bandwidth/accuracy trade.
@@ -204,8 +204,8 @@ pub enum Workload {
     /// Issue `cells` distinct-key writes at one node in a single
     /// instant. Each write lands in its own CRDT cell — that's what
     /// makes the local dirty ring's cardinality jump to `cells` in one
-    /// step, which is what the `adaptive_fanout` suite needs to see
-    /// the runtime widen its per-tick fanout.
+    /// step. The `coverage_fanout` suite varies `cells` to confirm the
+    /// per-tick fanout is *independent* of dirty-set volume.
     DistinctKeyBurst {
         node: usize,
         cells: u32,

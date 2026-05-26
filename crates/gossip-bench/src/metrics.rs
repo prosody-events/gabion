@@ -56,6 +56,12 @@ pub struct TickSnapshot {
     /// `packets_sent_total / dirty_ticks_total` across a sample window.
     #[serde(default)]
     pub dirty_ticks_total: u64,
+    /// Largest `peak_effective_fanout` any node has reached as of this
+    /// sample — the widest per-tick coverage pick (`⌈ln(peers)+c⌉` clamped)
+    /// observed cluster-wide. Stable for a given cluster size; the
+    /// `coverage_fanout` suite reads it to confirm the pick tracks `n`.
+    #[serde(default)]
+    pub peak_effective_fanout: usize,
     /// Per-rule per-node totals for the two-rule mix workload. Empty for
     /// every other workload.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -111,14 +117,22 @@ pub struct Headline {
     pub threshold_fires_per_node: f64,
     /// Effective per-tick fanout — the median (p50) and 95th percentile
     /// of `packets_emitted / nodes_with_dirty_cells` across all sample
-    /// windows in which at least one node was dirty. With static
-    /// `fanout=f`, both numbers sit at `f` in steady state; under burst
-    /// the runtime's adaptive widening pushes them up toward `log₂
-    /// dirty`. `None` when no sample window contained dirty work.
+    /// windows in which at least one node was dirty. The runtime sizes the
+    /// per-tick pick by the coverage threshold `⌈ln(peers)+c⌉` (a function
+    /// of cluster size, not the dirty set), so both numbers sit at that
+    /// threshold regardless of burst volume. `None` when no sample window
+    /// contained dirty work.
     #[serde(default)]
     pub effective_fanout_p50: Option<f64>,
     #[serde(default)]
     pub effective_fanout_p95: Option<f64>,
+    /// Peak per-tick coverage fanout reached during the run:
+    /// `⌈ln(peers)+c⌉` clamped to `[fanout, peers]`. The headline number
+    /// for the `coverage_fanout` suite — it should equal the predicted
+    /// threshold for the cluster size and stay flat as the burst volume
+    /// changes.
+    #[serde(default)]
+    pub peak_effective_fanout: usize,
     /// Peak `ground_truth_total - min(per_node_total)` over the run.
     /// For the `error_budget` suite this is the empirical worst-case
     /// staleness operators would see if every node converged to its

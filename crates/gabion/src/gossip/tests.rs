@@ -1425,6 +1425,79 @@ async fn gossip_tick_picks_peers_without_replacement() {
         .await;
 }
 
+// -- coverage fanout: ⌈ln(n)+c⌉, scaled by cluster size --------------------
+
+/// Drive a single node against a sweep of bootstrap-peer counts and read
+/// the chosen per-tick fanout back through the admin snapshot. The pick is
+/// the coverage threshold `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`
+/// (Kermarrec, Massoulié & Ganesh, TPDS 2003, Thm 1) — a function of the
+/// peer count, *not* the dirty set. Covers the `n=1` floor-clip edge
+/// (`⌈0+c⌉` clamped to 1) and a 255-peer large cluster.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn coverage_fanout_tracks_ln_n_plus_c() {
+    use crate::defaults::{GOSSIP_COVERAGE_MARGIN, GOSSIP_FANOUT};
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            for peers in [1usize, 8, 31, 99, 255] {
+                let coverage = ((peers as f64).ln() + GOSSIP_COVERAGE_MARGIN).ceil() as usize;
+                let expected = GOSSIP_FANOUT.max(coverage).min(peers);
+                let observed = observe_coverage_fanout(peers, GOSSIP_FANOUT).await;
+                assert_eq!(
+                    observed, expected,
+                    "coverage fanout for {peers} peers: expected \
+                     max({GOSSIP_FANOUT}, ⌈ln({peers})+{GOSSIP_COVERAGE_MARGIN}⌉={coverage})\
+                     .min({peers}) = {expected}, got {observed}",
+                );
+            }
+        })
+        .await;
+}
+
+/// Build one node with `peers` unbound bootstrap addresses, give it a cell
+/// to gossip, and return the `last_effective_fanout` it records on the next
+/// dirty tick. The peers need not run: the sim transport treats a send to an
+/// unbound address as delivered on the floor (UDP semantics), and the runtime
+/// records `last_effective_fanout` from the computed pick *before* any send,
+/// so the addresses serve only to set `self.peers.len()`.
+async fn observe_coverage_fanout(peers: usize, base: usize) -> usize {
+    use tokio::sync::mpsc;
+
+    use crate::gossip::AdminCommand;
+
+    let router = SimRouter::new();
+    let local_addr = sock(41_000);
+    let transport = router.bind(local_addr);
+
+    let bootstrap: Vec<SocketAddr> = (0..peers).map(|i| sock(41_001 + i as u16)).collect();
+    let identity = NodeIdentity::new(NodeId(0x5EED), 1);
+    let mut cfg = sim_config(identity, bootstrap, 1);
+    cfg.fanout = base;
+
+    let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(4);
+    let (rt, client) = GossipRuntime::from_parts_with_admin(
+        transport,
+        TokioClock::from_millis(0),
+        cfg,
+        store_for(identity),
+        Rc::new(InMemoryAggregateStore::<u32>::new()),
+        Some(admin_rx),
+    );
+    let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+    client
+        .record(0xC0FFEE, KeyHash(1), 0, 1, 0, 0)
+        .await
+        .unwrap();
+    sim_advance_ticks(Duration::from_millis(100), 3).await;
+
+    let snap = admin_snapshot(&admin_tx).await;
+    client.shutdown().await.unwrap();
+    let _ = handle.await;
+    snap.last_effective_fanout
+}
+
 // -- UDP smoke --------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
@@ -1743,8 +1816,10 @@ impl Arbitrary for SamplingCase {
 /// uniform. The existing `gossip_tick_picks_peers_without_replacement` uses
 /// `fanout == peer_count` so even a degenerate sampler (always picks peer 0)
 /// passes — every peer ends up picked at least once per tick anyway. This
-/// case sets `fanout < peer_count` so a broken sampler concentrates all
-/// deliveries on a few peers and starves the rest.
+/// case keeps the effective pick strictly below the peer count so a broken
+/// sampler concentrates all deliveries on a few peers and starves the rest.
+/// The effective pick is the coverage fanout `⌈ln(8) + c⌉ = 7` (which
+/// overrides the lower configured floor), still 7 of 8 peers per tick.
 #[quickcheck]
 fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
     case: SamplingCase,
@@ -1802,7 +1877,15 @@ fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
             .map(|addr| router.received_count(*addr))
             .collect();
         let total: u64 = counts.iter().sum();
-        let expected = (TICKS as u64) * (FANOUT as u64) / (PEERS as u64);
+        // The runtime scales the per-tick pick to the coverage fanout
+        // `⌈ln(PEERS) + c⌉`, which exceeds the configured `FANOUT` floor —
+        // so the expected per-peer mean is driven by the effective pick, not
+        // by `FANOUT`. Still strictly below `PEERS`, so a broken sampler
+        // starves the unpicked peers.
+        let coverage =
+            ((PEERS as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
+        let effective = FANOUT.max(coverage).min(PEERS);
+        let expected = (TICKS as u64) * (effective as u64) / (PEERS as u64);
         let lower = expected / 2;
         let upper = expected * 2;
         let uniform = counts.iter().all(|&c| c >= lower && c <= upper);

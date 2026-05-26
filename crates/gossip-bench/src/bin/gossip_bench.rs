@@ -218,15 +218,20 @@ fn example_scenario(kind: &str) -> Option<String> {
             base.name = "fanout_5".to_string();
             base.fanout = 5;
         }
-        "adaptive_fanout" => {
-            base.name = "adaptive_fanout_burst".to_string();
-            base.kind = ScenarioKind::AdaptiveFanout;
+        "coverage_fanout" => {
+            base.name = "coverage_fanout_n32".to_string();
+            base.kind = ScenarioKind::CoverageFanout;
             base.nodes = 32;
+            // `fanout` is the floor; the runtime scales the actual pick to
+            // the coverage threshold `⌈ln(31)+4⌉ = 8` (31 peers at n=32),
+            // well above this floor of 1.
             base.fanout = 1;
             base.duration = Duration::from_secs(5);
-            // 256 distinct keys at once → 256 dirty cells; adaptive
-            // fanout should widen by ~log₂(256) = 8 even though
-            // static is 1.
+            // 256 distinct keys at once → 256 dirty cells. The burst rides
+            // one fat frame; the headline `peak_effective_fanout` should sit
+            // at the coverage threshold regardless of this volume. The plot
+            // harness sweeps `nodes` (16/64/256) to show the pick tracking
+            // `⌈ln(n)+c⌉`, and sweeps `cells` to show volume-independence.
             base.workload = Workload::DistinctKeyBurst {
                 node: 0,
                 cells: 256,

@@ -239,37 +239,51 @@ def suite_scale_n() -> list[dict]:
     return out
 
 
-def suite_adaptive_fanout() -> list[dict]:
-    """Verma & Ooi: adaptive fanout widens with `log₂(dirty_set)` so a
-    burst converges in O(log N) rounds even when the static floor is 1.
+# gabion::defaults::GOSSIP_COVERAGE_MARGIN — keep in sync with the Rust const.
+COVERAGE_MARGIN = 4.0
 
-    We sweep the cardinality of a single dirty *cell set* (distinct
-    keys, written all at once into one node) and watch
-    rounds-to-converge. With static `fanout=1` only, rounds would grow
-    O(burst_size); with the adaptive bump in place they stay flat at
-    roughly `log₂(dirty) + log₂(N)`.
 
-    `DistinctKeyBurst` ensures each write lands in its own CellStore
-    slot so `local_dirty.len()` actually jumps to `cells`, which is
-    what the bump reads when picking peers.
+def _coverage_pick(n_nodes: int, floor: int = 1) -> int:
+    """Predicted per-tick fanout `⌈ln(peers) + c⌉`, clamped to
+    `[floor, peers]`. `peers = n_nodes - 1` because the runtime sizes the
+    pick off `self.peers.len()`."""
+    peers = max(n_nodes - 1, 1)
+    coverage = math.ceil(math.log(peers) + COVERAGE_MARGIN)
+    return min(max(floor, coverage), peers)
+
+
+def suite_coverage_fanout() -> list[dict]:
+    """Kermarrec, Massoulié & Ganesh (TPDS 2003, Thm 1): the per-round
+    fanout that reaches every node is `⌈ln(n) + c⌉` — a function of cluster
+    size, not data volume. Two sweeps in one grid:
+
+      * cluster size `n` (16/64/256) shows the observed
+        `peak_effective_fanout` tracking `⌈ln(n-1) + c⌉`;
+      * dirty-set cardinality (distinct keys written at once) at fixed `n`
+        shows the per-tick fanout is *flat* in volume — the burst rides one
+        fat frame and does not widen the peer pick.
+
+    `DistinctKeyBurst` makes each write land in its own CellStore slot so
+    `local_dirty.len()` actually jumps to `cells`; the fanout staying put
+    is the direct refutation of an `O(N/fanout)` volume premise.
     """
     out = []
-    for n_nodes in [32, 128]:
-        for dirty in [1, 4, 16, 64, 256, 1024]:
+    for n_nodes in [16, 64, 256]:
+        for dirty in [16, 256, 1024]:
             out.append(
                 _base(
-                    f"adaptive_n{n_nodes}_d{dirty}",
+                    f"coverage_n{n_nodes}_d{dirty}",
                     nodes=n_nodes,
                     fanout=1,
                     duration="5s",
-                    kind="adaptive_fanout",
+                    kind="coverage_fanout",
                     workload={
                         "shape": "distinct_key_burst",
                         "node": 0,
                         "cells": dirty,
                         "at": "50ms",
                     },
-                    seed=0xADAF + dirty,
+                    seed=0xC0F0 + dirty,
                     cell_capacity=4096,
                     max_cells_per_tick=4096,
                 )
@@ -381,7 +395,7 @@ SUITES = {
     "partition": suite_partition,
     "staleness": suite_staleness,
     "scale_n": suite_scale_n,
-    "adaptive_fanout": suite_adaptive_fanout,
+    "coverage_fanout": suite_coverage_fanout,
     "error_budget": suite_error_budget,
     "min_emit_clamp": suite_min_emit_clamp,
     "heartbeat_threshold_mix": suite_heartbeat_threshold_mix,
@@ -688,11 +702,11 @@ def plot_scale_n(results: list[dict], out_dir: Path) -> list[PlotResult]:
         return [PlotResult(name="scale_n", path=_save(fig, FIGURES_DIR / "scale_n.svg"))]
 
 
-def plot_adaptive_fanout(results: list[dict], out_dir: Path) -> list[PlotResult]:
-    """Rounds-to-converge against dirty-set cardinality, one line per N.
-
-    Adaptive fanout should keep convergence flat; without it, rounds
-    would grow linearly with dirty size at static fanout=1.
+def plot_coverage_fanout(results: list[dict], out_dir: Path) -> list[PlotResult]:
+    """Two claims, two panels: (left) the per-tick fanout tracks the
+    coverage threshold `⌈ln(n)+c⌉` as the cluster grows; (right) it is flat
+    in burst volume, because the dirty set rides one fat frame rather than
+    widening the peer pick.
     """
     _ensure_plot_libs()
     import pandas as pd
@@ -703,45 +717,44 @@ def plot_adaptive_fanout(results: list[dict], out_dir: Path) -> list[PlotResult]
             {
                 "nodes": r["scenario"]["nodes"],
                 "dirty": r["scenario"]["workload"]["cells"],
-                "rounds": r["headline"]["convergence_rounds"],
+                "peak_fanout": r["headline"].get("peak_effective_fanout"),
                 "effective_fanout_p50": r["headline"]["effective_fanout_p50"],
-                "effective_fanout_p95": r["headline"]["effective_fanout_p95"],
             }
         )
     df = pd.DataFrame(rows).sort_values(["nodes", "dirty"])
     with style():
         fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
 
+        # Left: peak per-tick fanout vs N, with the predicted ⌈ln(n)+c⌉
+        # reference. Peak is invariant over the dirty sweep, so collapse to
+        # the max per N.
         ax = axes[0]
-        for n, group in df.groupby("nodes"):
-            ax.plot(group["dirty"], group["rounds"], marker="o", label=f"N={n}")
-        # Reference: pure linear growth at f=1 would be `dirty / 1` ticks.
-        # Cap at the highest measured rounds value so the reference doesn't
-        # blow up the y-range. Pure log₂(dirty) is the protocol's target shape.
-        d_grid = sorted(df["dirty"].unique())
-        ax.plot(d_grid, [math.log2(max(d, 1)) for d in d_grid], linestyle="--", color="#888",
-                label="log₂ dirty (adaptive target)")
+        by_n = df.groupby("nodes")["peak_fanout"].max().reset_index()
+        ax.plot(by_n["nodes"], by_n["peak_fanout"], marker="o",
+                label="observed peak fanout")
+        n_grid = sorted(df["nodes"].unique())
+        ax.plot(n_grid, [_coverage_pick(n) for n in n_grid], linestyle="--", color="#888",
+                label="⌈ln(n)+c⌉ (coverage threshold)")
         ax.set_xscale("log", base=2)
-        ax.set_xlabel("burst-write cardinality (hits in single write)")
-        ax.set_ylabel("convergence (gossip rounds)")
-        ax.set_title("Adaptive fanout — rounds stay flat as burst grows")
+        ax.set_xlabel("cluster size N")
+        ax.set_ylabel("peak per-tick fanout")
+        ax.set_title("Coverage fanout tracks ln(N)+c")
         ax.legend(fontsize=8)
 
+        # Right: effective fanout vs dirty-set size, one line per N. Flat
+        # lines are the point — volume does not widen the pick.
         ax = axes[1]
         for n, group in df.groupby("nodes"):
-            ax.plot(group["dirty"], group["effective_fanout_p95"], marker="s",
-                    label=f"N={n} (p95)")
-            ax.plot(group["dirty"], group["effective_fanout_p50"], marker="o", linestyle=":",
-                    label=f"N={n} (p50)", alpha=0.7)
+            ax.plot(group["dirty"], group["effective_fanout_p50"], marker="o", label=f"N={n}")
         ax.set_xscale("log", base=2)
-        ax.set_xlabel("burst cardinality")
+        ax.set_xlabel("burst-write cardinality (dirty cells)")
         ax.set_ylabel("effective per-tick fanout (packets / dirty-tick)")
-        ax.set_title("Observed fanout widens with burst size")
+        ax.set_title("Fanout is flat in burst volume")
         ax.legend(fontsize=8)
 
         fig.tight_layout()
-        return [PlotResult(name="adaptive_fanout",
-                           path=_save(fig, FIGURES_DIR / "adaptive_fanout.svg"))]
+        return [PlotResult(name="coverage_fanout",
+                           path=_save(fig, FIGURES_DIR / "coverage_fanout.svg"))]
 
 
 def plot_error_budget(results: list[dict], out_dir: Path) -> list[PlotResult]:
@@ -908,7 +921,7 @@ PLOTTERS = {
     "partition": plot_partition,
     "staleness": plot_staleness,
     "scale_n": plot_scale_n,
-    "adaptive_fanout": plot_adaptive_fanout,
+    "coverage_fanout": plot_coverage_fanout,
     "error_budget": plot_error_budget,
     "min_emit_clamp": plot_min_emit_clamp,
     "heartbeat_threshold_mix": plot_heartbeat_threshold_mix,

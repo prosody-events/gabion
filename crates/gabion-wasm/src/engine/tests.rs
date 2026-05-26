@@ -201,21 +201,26 @@ fn submit_creates_and_gossips_a_cell() {
     });
 }
 
-/// The adaptive-decision outputs reach the snapshot: a multi-key burst grows the
-/// dirty set, so the runtime fans out *wider than the configured base*, and the
-/// effective/peak fanout and the error budget all surface on the node — the
-/// metrics whose absence made the adaptation invisible in the inspector.
+/// The adaptive-decision outputs reach the snapshot. The runtime sizes its
+/// per-tick fanout by the coverage threshold `⌈ln(peers) + c⌉` — driven by
+/// cluster size, not the dirty set — so a node in a 12-member cluster (11
+/// peers) fans out above the configured floor of 2, and the effective/peak
+/// fanout and the error budget all surface on the node: the metrics whose
+/// absence made the adaptation invisible in the inspector.
 #[test]
-fn adaptive_fanout_and_budget_surface_in_snapshot() {
+fn coverage_fanout_and_budget_surface_in_snapshot() {
     let config = SimConfig {
         fanout: 2,
         rule_limit: 1_000,
         target_err_bps: 100,
         ..test_config(12)
     };
+    // 12 members → 11 peers per node → coverage `⌈ln(11) + c⌉`, well above
+    // the configured floor of 2. The dirty set does not move it.
+    let expected = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
     with_engine(config, |tx| async move {
-        // 16 distinct keys on one node → a dirty set of ~16 cells →
-        // ⌊log₂(16)⌋+1 = 5, well above the base fanout of 2.
+        // A 16-key burst grows the dirty set; the coverage fanout ignores it
+        // — the burst rides one fat frame rather than widening the peer pick.
         for key in 0..16u128 {
             submit(&tx, 0, key, 7).await;
         }
@@ -228,9 +233,10 @@ fn adaptive_fanout_and_budget_surface_in_snapshot() {
             .into_iter()
             .find(|n| n.id == 0)
             .expect("node 0 present");
-        assert!(
-            origin.effective_fanout > 2,
-            "a 16-cell dirty set must fan out above the base of 2; got {}",
+        assert_eq!(
+            origin.effective_fanout, expected,
+            "a 12-member cluster fans out to the coverage threshold \
+             ⌈ln(11)+c⌉={expected}, independent of the dirty set; got {}",
             origin.effective_fanout,
         );
         assert!(

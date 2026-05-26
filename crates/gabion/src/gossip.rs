@@ -54,10 +54,12 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Minimum number of peers contacted per gossip tick. Under burst the
-    /// runtime grows this adaptively to keep up with the dirty set (Verma
-    /// & Ooi, ICDCS 2005); see `handle_gossip_tick` in `runtime.rs`. Idle
-    /// heartbeat ticks always pick exactly this many peers.
+    /// Floor on the number of peers contacted per gossip tick. The runtime
+    /// scales the actual per-tick fanout to the coverage threshold
+    /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =
+    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
+    /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
+    /// hard minimum when that threshold falls below it.
     pub fanout: usize,
     /// Frame composition: how many cells `fill_gossip_frame*` may emit per
     /// tick. The wire codec splits this into multiple packets if needed.

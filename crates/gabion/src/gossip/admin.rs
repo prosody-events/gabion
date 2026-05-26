@@ -65,15 +65,15 @@ pub struct AdminSnapshot {
     /// (`packets_emitted / dirty_ticks`) — see
     /// `crates/gossip-bench/README.md`.
     pub dirty_ticks: u64,
-    /// The adaptive fanout the most recent dirty tick chose:
-    /// `config.fanout.max(⌊log₂(dirty)⌋ + 1).min(peers)`. Grows above the
-    /// configured base when the dirty set is large (a burst), so a burst
-    /// that fans out wider is directly observable. `0` before the first
-    /// dirty tick.
+    /// The coverage fanout the most recent dirty tick chose:
+    /// `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`, where `c` is
+    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]. Scales with cluster size,
+    /// not the dirty set, so it is stable for a given peer count rather than
+    /// pulsing with bursts. `0` before the first dirty tick.
     pub last_effective_fanout: usize,
     /// High-water mark of `last_effective_fanout` since startup — the widest
-    /// the node has ever fanned out, so a transient burst's peak survives
-    /// even after the dirty set drains and fanout relaxes to the base.
+    /// the node has ever fanned out. Tracks the coverage fanout's peak, which
+    /// rises only when the peer count grows.
     pub peak_effective_fanout: usize,
     /// The per-rule error budget ε the most recent `handle_limit_request`
     /// computed: `limit × target_err_bps / (10_000 × peers)` (floored at 1).

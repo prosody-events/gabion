@@ -163,9 +163,10 @@ where
     dirty_ticks: u64,
     // The adaptive-decision outputs, so observers can *see* the runtime
     // react rather than infer it. `last_effective_fanout` is the
-    // `pick_count` the most recent dirty tick chose (adaptive fanout grows
-    // with the dirty-set bit length); `peak_effective_fanout` is its
-    // high-water mark since startup. `last_error_budget` is the per-rule
+    // `pick_count` the most recent dirty tick chose (the coverage fanout
+    // `⌈ln(n)+c⌉`, scaled by cluster size n, not the dirty set);
+    // `peak_effective_fanout` is its high-water mark since startup.
+    // `last_error_budget` is the per-rule
     // error budget ε the most recent `handle_limit_request` computed — the
     // threshold a burst's accumulated `rule_pending` must cross to trigger
     // an eager (threshold) flush. All three are decision *outputs* that are
@@ -743,22 +744,28 @@ where
         // same frame for the same peer. `self.peers` has no ordering
         // contract elsewhere (lookups are by `addr`), so shuffling is free.
         //
-        // Adaptive fanout (Verma & Ooi, ICDCS 2005): grow the per-tick
-        // fanout with the dirty-set bit length so a sudden burst converges
-        // in O(log N) rounds rather than O(N / fanout). `bit_length` for
-        // a u64 is `64 - leading_zeros`; for n ≥ 1 this is
-        // `floor(log2(n)) + 1`, which is what we want — a single dirty
-        // cell already deserves fanout ≥ 1. Capped at the peer count;
-        // falls back to `config.fanout` when dirty is small.
-        let dirty = self.store.local_dirty().len() + self.store.forwarded_dirty().len();
-        let log_dirty = (64 - (dirty as u64).leading_zeros()) as usize;
+        // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
+        // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`
+        // reaches *every* node with probability → e^(−e^(−c)) — "there is a
+        // sharp threshold in the required fanout at log n." Fanout is
+        // governed by cluster size `n`, not data volume: KMG note the
+        // fanout need only grow by 1 each time `n` rises by a factor of e,
+        // and that a round "can easily be modified … to send several
+        // notifications per gossip message." Gabion already packs the whole
+        // dirty set into one fat frame (`max_cells_per_tick` + packet
+        // splitting), so a burst rides along without widening fanout — the
+        // dirty-set size drives frame fill, not the peer pick. `config.fanout`
+        // is the floor; `.min(n)` makes small clusters full-mesh (at small n
+        // coverage demands it and the bandwidth is trivial). The early return
+        // above guarantees n ≥ 1, so `ln` is never called on 0 and `.min(n)`
+        // never clamps below 1.
         let n = self.peers.len();
-        let pick_count = self.config.fanout.max(log_dirty).min(n);
-        // Record the adaptive-fanout decision so observers can see it widen
-        // under a burst (base `config.fanout` → `pick_count`) rather than
-        // having to reconstruct the formula. Only dirty ticks reach here, so
-        // `last_effective_fanout` is the fanout of the most recent tick that
-        // actually gossiped.
+        let coverage = ((n as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
+        let pick_count = self.config.fanout.max(coverage).min(n);
+        // Record the coverage-fanout decision so observers can read the pick
+        // directly instead of reconstructing the formula. Only dirty ticks
+        // reach here, so `last_effective_fanout` is the fanout of the most
+        // recent tick that actually gossiped.
         self.last_effective_fanout = pick_count;
         self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
         for i in 0..pick_count {
