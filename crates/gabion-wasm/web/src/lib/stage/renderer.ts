@@ -512,7 +512,7 @@ export class StageRenderer {
       a,
       b,
       startMs: performance.now(),
-      width: 1.5 + Math.min(bytes, 400) / 100,
+      width: 1.0 + Math.min(bytes, 400) / 130,
       dropped,
     });
     this.#beamsActive = true;
@@ -562,7 +562,7 @@ export class StageRenderer {
         // No flight: a static edge fading over its lifetime — a diff, not travel.
         // Delivered stays steel-blue; dropped reads as the terminal grey.
         const color = beam.dropped ? COLOR_BEAM_LOST : COLOR_BEAM;
-        const alpha = (beam.dropped ? 0.3 : 0.9) * (1 - age / duration);
+        const alpha = (beam.dropped ? 0.3 : 0.8) * (1 - age / duration);
         g.moveTo(beam.a.x, beam.a.y)
           .lineTo(beam.b.x, beam.b.y)
           .stroke({ width: beam.width, color, alpha, cap: 'round' });
@@ -583,7 +583,7 @@ export class StageRenderer {
       const fadeIn = clamp01(tip / (end * BEAM_FADE_IN));
       const base = beam.dropped
         ? 0.7 * (1 - tip / end)
-        : 0.95 * clamp01((end - tip) / (end * BEAM_FADE_OUT));
+        : 0.8 * clamp01((end - tip) / (end * BEAM_FADE_OUT));
       const alpha = base * fadeIn;
       // Delivered: the steel-blue accent. Dropped: drain chroma toward grey as it
       // dies, so loss reads as color leaving rather than an alarm hue.
