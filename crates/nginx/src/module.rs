@@ -822,6 +822,7 @@ extern "C" fn set_zone(
             aggregate = aggregate_capacity,
             "gabion: zone allocated",
         );
+        tracing::info!("gabion: set_zone returning NGX_CONF_OK");
         core::NGX_CONF_OK
     }
 }
@@ -859,6 +860,7 @@ extern "C" fn set_rule(
     // the duration of the call, and pointer arithmetic into it is bounded
     // by `nelts`.
     unsafe {
+        tracing::info!("gabion: set_rule entered");
         let main = &mut *(conf as *mut MainConfig);
         let args = (*(*cf).args).elts as *mut ngx_str_t;
         let nelts = (*(*cf).args).nelts;
