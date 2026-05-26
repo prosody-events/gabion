@@ -464,6 +464,7 @@
                     defaults.rule_bucket_ms}
                   liveBuckets={nominalBuckets(appliedKnobs.rule_window_ms, defaults.rule_bucket_ms)}
                   windowMs={appliedKnobs.rule_window_ms}
+                  bucketMs={defaults.rule_bucket_ms}
                   limit={appliedKnobs.rule_limit}
                 />
               </NodeInspector>

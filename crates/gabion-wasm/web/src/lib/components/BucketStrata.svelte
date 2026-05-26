@@ -29,6 +29,7 @@
     epochFraction,
     liveBuckets,
     windowMs,
+    bucketMs,
     limit,
   }: {
     cells: CellView[];
@@ -44,6 +45,10 @@
     liveBuckets: number;
     /** The rule window in ms — labels the trailing edge of the axis ("Ns ago"). */
     windowMs: number;
+    /** The rule's bucket width in ms (`defaults.rule_bucket_ms`). Used with the
+     *  unclamped `epochFraction` to count down the oldest live bucket's
+     *  time-to-expiry — a number that honestly ticks toward 0 each step. */
+    bucketMs: number;
     limit: number;
   } = $props();
 
@@ -80,6 +85,10 @@
     sigma: number;
     /** Tallest in-window bar — the per-strip auto-scale denominator. */
     max: number;
+    /** Oldest in-window bucket that still carries hits — the next to age off the
+     *  trailing edge. `null` when the window holds no counts. Anchors the
+     *  time-to-expiry caption and the `.expiring` bar highlight. */
+    oldestActiveEpoch: number | null;
   }
 
   // Bin the live cells by key into the rendered epoch range [oldest, oldest +
@@ -110,7 +119,16 @@
         if (count > max) max = count;
         return { epoch, count };
       });
-      result.push({ key, slots, sigma, max });
+      // Slots run oldest→newest, so the first in-window non-empty one is the
+      // oldest — the bucket nearest the trailing edge, next to age out.
+      const oldestActive = slots.find((s) => s.epoch <= currentEpoch && s.count > 0);
+      result.push({
+        key,
+        slots,
+        sigma,
+        max,
+        oldestActiveEpoch: oldestActive?.epoch ?? null,
+      });
     }
     // Stable order so strips don't reshuffle as keys come and go.
     result.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
@@ -121,6 +139,17 @@
   function heightPct(count: number, max: number): number {
     if (max <= 0 || count <= 0) return 0;
     return (count / max) * 100;
+  }
+
+  /** Seconds until `epoch` ages off the trailing edge. The engine keeps a bucket
+   *  while `bucket + liveBuckets >= currentEpoch`, so it leaves the window the
+   *  instant the continuous current (`currentEpoch + epochFraction`) reaches
+   *  `epoch + liveBuckets + 1`. Uses the raw, unclamped `epochFraction` (not the
+   *  reduced-motion `fraction`) so the readout is an honest sub-second countdown
+   *  rather than a per-bucket snap. */
+  function tteSeconds(epoch: number): number {
+    const epochsLeft = epoch + liveBuckets + 1 - currentEpoch - epochFraction;
+    return Math.max(0, (epochsLeft * bucketMs) / 1000);
   }
 
   /** Whether the limit threshold falls within a strip's auto-scaled range —
@@ -141,7 +170,11 @@
       .filter((s) => s.epoch <= currentEpoch && s.count > 0)
       .map((s) => s.count);
     const tally = active.length === 0 ? 'no buckets' : `buckets ${active.join(', ')}`;
-    return `Sliding window, key ${shortKey(strip.key)}: total ${strip.sigma} of ${limit}; ${tally}`;
+    const aging =
+      strip.oldestActiveEpoch === null
+        ? ''
+        : `; oldest bucket ages out in ${tteSeconds(strip.oldestActiveEpoch).toFixed(1)} seconds`;
+    return `Sliding window, key ${shortKey(strip.key)}: total ${strip.sigma} of ${limit}; ${tally}${aging}`;
   }
 </script>
 
@@ -152,7 +185,12 @@
     {#each strips as strip (strip.key)}
       <section class="strip" role="group" aria-label={stripSummary(strip)}>
         <div class="strip-head">
-          <span class="key numeric">key {shortKey(strip.key)}</span>
+          <span class="head-left">
+            <span class="key numeric">key {shortKey(strip.key)}</span>
+            {#if strip.oldestActiveEpoch !== null}
+              <span class="tte numeric">ages out in {tteSeconds(strip.oldestActiveEpoch).toFixed(1)}s</span>
+            {/if}
+          </span>
           <span class="sigma" class:over={strip.sigma >= limit}>
             Σ <span class="sigma-value numeric">{strip.sigma}</span>
             <span class="sigma-sep">/</span>
@@ -172,6 +210,8 @@
                 <div
                   class="bar"
                   class:empty={slot.count === 0}
+                  class:expiring={strip.oldestActiveEpoch !== null &&
+                    slot.epoch === strip.oldestActiveEpoch}
                   style="height: {heightPct(slot.count, strip.max)}%"
                 ></div>
               </div>
@@ -217,8 +257,23 @@
     font-size: var(--text-sm);
   }
 
+  .head-left {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+
   .key {
     color: var(--ink-faint);
+  }
+
+  /* The time-to-expiry countdown for the oldest live bucket: amber (the
+     "transient / on the clock" hue, matching the `.expiring` bar it points at),
+     tabular figures so the ticking number doesn't jitter its width. */
+  .tte {
+    color: var(--signal-dirty);
+    font-variant-numeric: tabular-nums;
   }
 
   .sigma {
@@ -296,6 +351,14 @@
      beyond the shared baseline. */
   .bar.empty {
     background: transparent;
+  }
+
+  /* The oldest live bucket — the next to scroll off the trailing edge. Amber
+     marks the one bar the countdown is timing, so the otherwise-uniform fence
+     of equal-height bars has a clear anchor for "this is what ages out in
+     N.Ns". */
+  .bar.expiring {
+    background: var(--signal-dirty);
   }
 
   /* The shared time axis: quiet end-labels orienting the scroll. "now" on the
