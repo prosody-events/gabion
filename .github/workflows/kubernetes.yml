@@ -1,0 +1,130 @@
+name: kubernetes
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly kind-cluster smoke on main. The k8s code paths
+    # (`crates/gabion/src/discovery/kubernetes.rs`, the NGINX scale and
+    # mixed gossip scripts) only exercise here — main must not silently
+    # regress.
+    - cron: '0 8 * * 1'
+
+concurrency:
+  group: kubernetes-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      kube-smoke: ${{ steps.rail.outputs.custom_kube_smoke }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: loadingalias/cargo-rail-action@v4
+        id: rail
+        with:
+          mode: minimal
+
+  # Each k8s job spins its own kind cluster. They cannot share one — the
+  # smoke scripts create / delete namespaces named after the parent
+  # process pid and assume exclusive access.
+  kubernetes-test:
+    needs: plan
+    if: needs.plan.outputs.kube-smoke == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: gabion
+          wait: 120s
+      - run: make kubernetes-test
+
+  kubernetes-nginx-test:
+    needs: plan
+    if: needs.plan.outputs.kube-smoke == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: gabion
+          wait: 120s
+      # Pre-build the NGINX module image so `kind load docker-image` can
+      # ship it into the cluster's containerd. The script itself rebuilds
+      # the same compose target — that becomes a cache no-op.
+      - name: build NGINX module image
+        env:
+          DOCKER_BUILDKIT: '1'
+          COMPOSE_DOCKER_CLI_BUILD: '1'
+        run: docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
+      - name: load image into kind
+        run: kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
+      - run: make kubernetes-nginx-test
+
+  kubernetes-mixed-test:
+    needs: plan
+    if: needs.plan.outputs.kube-smoke == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: gabion
+          wait: 120s
+      - name: build images
+        env:
+          DOCKER_BUILDKIT: '1'
+          COMPOSE_DOCKER_CLI_BUILD: '1'
+        run: |
+          docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
+          docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
+      - name: load images into kind
+        run: |
+          kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
+          kind load docker-image gabiond:local --name gabion
+      - run: make kubernetes-mixed-test
+
+  kubernetes-gossip-bench:
+    needs: plan
+    if: needs.plan.outputs.kube-smoke == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: gabion
+          wait: 120s
+      - name: build images
+        env:
+          DOCKER_BUILDKIT: '1'
+          COMPOSE_DOCKER_CLI_BUILD: '1'
+        run: |
+          docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
+          docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
+      - name: load images into kind
+        run: |
+          kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
+          kind load docker-image gabiond:local --name gabion
+      - run: make kubernetes-gossip-bench

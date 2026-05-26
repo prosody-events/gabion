@@ -1,0 +1,93 @@
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel in-flight runs of this workflow on the same ref (PR head, branch).
+# Push to main is never cancelled — main coverage is load-bearing.
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      build:       ${{ steps.rail.outputs.build }}
+      test:        ${{ steps.rail.outputs.test }}
+      bench:       ${{ steps.rail.outputs.bench }}
+      docs:        ${{ steps.rail.outputs.docs }}
+      infra:       ${{ steps.rail.outputs.infra }}
+      scope-json:  ${{ steps.rail.outputs.scope-json }}
+      base-ref:    ${{ steps.rail.outputs.base-ref }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: loadingalias/cargo-rail-action@v4
+        id: rail
+        with:
+          mode: minimal
+
+  fmt:
+    needs: plan
+    if: needs.plan.outputs.build == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: make fmt
+
+  clippy:
+    needs: plan
+    if: needs.plan.outputs.build == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: make clippy
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
+      # `make unit` covers the full workspace; the `gabion-nginx` `safety`
+      # integration test runs as part of that.
+      - run: make unit
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: make hygiene
+
+  bench-check:
+    needs: plan
+    if: needs.plan.outputs.bench == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make bench-check

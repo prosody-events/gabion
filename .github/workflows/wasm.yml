@@ -1,0 +1,131 @@
+name: wasm
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Sequence pages deploys (cancel-in-progress: false) so a deploy already in
+# flight always finishes before the next one begins — Pages refuses
+# overlapping deploys.
+concurrency:
+  group: wasm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      wasm-viz: ${{ steps.rail.outputs.custom_wasm_viz }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: loadingalias/cargo-rail-action@v4
+        id: rail
+        with:
+          mode: minimal
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.wasm-viz == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # The release wasm build (web/package.json `build:wasm`) recompiles
+      # std with `-Zbuild-std` for size — that needs nightly's `rust-src`.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: 'latest'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: crates/gabion-wasm/web/pnpm-lock.yaml
+
+      - name: cross-compile gabion-wasm
+        run: rustup run stable cargo check --target wasm32-unknown-unknown -p gabion-wasm
+      - name: native gabion-wasm tests
+        run: rustup run stable cargo nextest run -p gabion-wasm
+
+      - name: install web deps
+        working-directory: crates/gabion-wasm/web
+        run: pnpm install --frozen-lockfile
+      # The Playwright smoke runs `vite preview` at root, so the smoke
+      # build must use base `/`. Don't set VITE_BASE here — vite.config.ts
+      # defaults to `/`.
+      - name: build visualizer for smoke
+        working-directory: crates/gabion-wasm/web
+        run: pnpm run build
+
+      - name: install Playwright chromium
+        working-directory: crates/gabion-wasm/web
+        run: pnpm exec playwright install --with-deps chromium
+      - name: in-browser screenshot smoke
+        working-directory: crates/gabion-wasm/web
+        run: pnpm run screenshot
+
+      # Rebuild with VITE_BASE=/gabion/ so the deployed `index.html` and
+      # the wasm bundle's asset URLs resolve under the project-pages
+      # subpath. Cheap: the wasm-pack output and the Svelte bundle are
+      # already in cache from the smoke build.
+      - name: build visualizer for Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          VITE_BASE: /gabion/
+        working-directory: crates/gabion-wasm/web
+        run: pnpm run build
+
+      # Hand the built site to the deploy-pages job on main pushes.
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        with:
+          name: pages
+          path: crates/gabion-wasm/web/dist
+          if-no-files-found: error
+
+  deploy-pages:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pages
+          path: dist
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+      - id: deploy
+        uses: actions/deploy-pages@v4

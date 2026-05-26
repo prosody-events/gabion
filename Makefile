@@ -2,14 +2,13 @@ SHELL := /bin/sh
 
 COMPOSE := docker compose --profile module -f deploy/nginx/docker-compose.yml
 CARGO_ENV := CARGO_BUILD_RUSTC_WRAPPER=
-# Resolve toolchain-pinned cargo binaries explicitly so the Makefile works
-# under stripped-down environments (e.g. CI), where PATH probing may fall
-# through to a broken `cargo` shim. Each cargo invocation needs `rustc`
-# from the same toolchain on PATH.
-STABLE_BIN := $(HOME)/.rustup/toolchains/stable-aarch64-apple-darwin/bin
-NIGHTLY_BIN := $(HOME)/.rustup/toolchains/nightly-aarch64-apple-darwin/bin
-STABLE_CARGO := PATH="$(STABLE_BIN):$$PATH" $(STABLE_BIN)/cargo
-NIGHTLY_CARGO := PATH="$(NIGHTLY_BIN):$$PATH" $(NIGHTLY_BIN)/cargo
+# `rustup run` resolves the correct toolchain for the host triple and puts
+# the matching `rustc` on PATH for the duration of the call — works the
+# same on macOS arm64 contributor laptops and the `x86_64-unknown-linux-gnu`
+# GitHub Actions runners we ship CI on. The `require-*` targets below
+# verify the toolchains are installed before any cargo invocation.
+STABLE_CARGO := rustup run stable cargo
+NIGHTLY_CARGO := rustup run nightly cargo
 
 # `cargo nextest` is the *only* sanctioned test runner for this repo.
 # Faster than `cargo test`, surfaces failures earlier, supports per-test
@@ -122,12 +121,13 @@ help:
 	@printf '%s\n' '  make nginx-test      Build NGINX module and assert 200, 200, 429 responses'
 	@printf '%s\n' '  make nginx-matrix    Build Gabion NGINX images for common official NGINX tags'
 	@printf '%s\n' '  make openresty-matrix Build Gabion OpenResty images for common OpenResty tags'
-	@printf '%s\n' '  make kubernetes-test Run guarded local OrbStack EndpointSlice convergence tests'
-	@printf '%s\n' '  make kubernetes-nginx-test Run guarded local OrbStack NGINX scale rate-limit tests'
-	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local OrbStack NGINX plus Gabion server gossip test'
-	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local OrbStack gossip propagation benchmark'
+	@printf '%s\n' '  make kubernetes-test Run guarded local kind EndpointSlice convergence tests'
+	@printf '%s\n' '  make kubernetes-nginx-test Run guarded local kind NGINX scale rate-limit tests'
+	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local kind NGINX plus Gabion server gossip test'
+	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local kind gossip propagation benchmark'
 	@printf '%s\n' '  make kubernetes-clean Delete local Kubernetes test namespaces'
-	@printf '%s\n' '  make ci              Run test, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
+	@printf '%s\n' '  make ci              Fast contributor pre-merge: test, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
+	@printf '%s\n' '  make ci-full         Mirror GitHub Actions end-to-end: ci + miri-all + every kubernetes-* target'
 
 .PHONY: fmt
 fmt: fmt-check
@@ -243,5 +243,14 @@ kubernetes-gossip-bench:
 kubernetes-clean:
 	sh deploy/kubernetes/local-clean.sh
 
+# `ci` is the fast subset a contributor runs before opening a PR: it pairs
+# the local test gate with the slower miri / nginx / wasm smokes that
+# `make test` alone skips. It deliberately does *not* run miri-all or any
+# kubernetes-* target (kind boot + image builds are too slow for the
+# pre-merge loop) — `make ci-full` does, and matches what GitHub Actions
+# runs end-to-end.
 .PHONY: ci
 ci: test miri-safety bench-check wasm-check nginx-config nginx-module nginx-test
+
+.PHONY: ci-full
+ci-full: ci miri-all kubernetes-test kubernetes-nginx-test kubernetes-mixed-test kubernetes-gossip-bench

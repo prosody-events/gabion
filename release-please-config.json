@@ -1,0 +1,24 @@
+{
+  "release-type": "rust",
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "package-name": "gabion",
+      "include-component-in-tag": false,
+      "extra-files": []
+    }
+  },
+  "pull-request-title-pattern": "chore: release v${version}",
+  "include-v-in-tag": true,
+  "changelog-sections": [
+    { "type": "feat",     "section": "Features" },
+    { "type": "fix",      "section": "Bug fixes" },
+    { "type": "perf",     "section": "Performance" },
+    { "type": "refactor", "section": "Refactoring" },
+    { "type": "test",     "section": "Tests" },
+    { "type": "build",    "section": "Build / CI", "hidden": false },
+    { "type": "ci",       "section": "Build / CI", "hidden": false },
+    { "type": "docs",     "section": "Documentation", "hidden": false },
+    { "type": "chore",    "hidden": true }
+  ]
+}

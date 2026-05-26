@@ -62,14 +62,16 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def guard_local_orbstack():
+def guard_local_kind():
     context = run(["kubectl", "config", "current-context"], capture=True).stdout.strip()
     server = run(
         ["kubectl", "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}"],
         capture=True,
     ).stdout.strip()
-    if context != "orbstack":
-        raise SystemExit(f"refusing to run: current kubernetes context is {context!r}, expected 'orbstack'")
+    if not context.startswith("kind-"):
+        raise SystemExit(
+            f"refusing to run: current kubernetes context is {context!r}, expected 'kind-*'"
+        )
     if not (server.startswith("https://127.0.0.1:") or server.startswith("https://localhost:")):
         raise SystemExit(f"refusing to run: kubernetes API server is {server!r}, expected localhost")
     return context, server
@@ -645,7 +647,7 @@ def benchmark_failures(load, convergence):
 
 
 def main():
-    context, server = guard_local_orbstack()
+    context, server = guard_local_kind()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     forwards = []

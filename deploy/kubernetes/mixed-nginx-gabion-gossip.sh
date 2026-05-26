@@ -7,10 +7,12 @@ cd "$repo_root"
 context="$(kubectl config current-context)"
 server="$(kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}')"
 
-if [ "$context" != "orbstack" ]; then
-    printf '%s\n' "refusing to run: current kubernetes context is '$context', expected 'orbstack'" >&2
-    exit 1
-fi
+case "$context" in
+    kind-*) ;;
+    *)
+        printf '%s\n' "refusing to run: current kubernetes context is '$context', expected 'kind-*'" >&2
+        exit 1 ;;
+esac
 
 case "$server" in
     https://127.0.0.1:*|https://localhost:*) ;;

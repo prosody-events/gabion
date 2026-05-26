@@ -326,6 +326,16 @@ the relevant README and link it from the surrounding context.
 
 ## Workflow conventions
 
+- **Changes ship via pull request — never push directly to `main`.**
+  Open a branch, push it, open a PR, and let the workflows under
+  `.github/workflows/` gate the merge. CI runs the full surface: fmt,
+  clippy, nextest, hygiene, bench-check, Miri (Stacked + Tree Borrows,
+  lib + safety), nginx docker-compose smokes, kind-based kubernetes
+  smokes, the WASM + Playwright build, and a per-PR docker image
+  build that publishes `pr-<N>` and `pr-<N>-<short-sha>` tags to GHCR
+  for reviewer testing. `release-please` only runs on `main`; merging
+  is what triggers the release PR loop. Direct pushes to `main` skip
+  review and bypass every gate above.
 - **`cargo nextest` is the only sanctioned test runner.** Do not
   invoke `cargo test`. Nextest is faster, supports per-test timeouts,
   surfaces failures earlier, and is what CI runs. If you write a new
