@@ -33,6 +33,11 @@ jobs:
         id: rail
         with:
           mode: minimal
+      - name: debug rail outputs
+        env:
+          RAIL_OUTPUTS: ${{ toJSON(steps.rail.outputs) }}
+        run: |
+          printf 'rail outputs:\n%s\n' "$RAIL_OUTPUTS"
 
   # Each k8s job spins its own kind cluster. They cannot share one — the
   # smoke scripts create / delete namespaces named after the parent

@@ -168,14 +168,19 @@ miri-safety-tb:
 
 .PHONY: miri-lib
 miri-lib:
-	$(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
+	# `identity::tests` reads `SystemTime::now()` via `clock_gettime(REALTIME)`,
+	# which miri refuses under default isolation. Disabling isolation is
+	# the official recommendation from miri's own error message and is
+	# scoped per-target by the make variable so the rest of the gate
+	# (safety integration tests, etc.) still runs under default isolation.
+	MIRIFLAGS="-Zmiri-disable-isolation" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
 
 # Full miri coverage: both lib tests and safety integration tests, under
 # both Stacked Borrows and Tree Borrows. Ramps up CI time significantly
 # (a few minutes); not part of `make test` by default — run before merge.
 .PHONY: miri-all
 miri-all: miri-lib miri-safety miri-safety-tb
-	MIRIFLAGS="-Zmiri-tree-borrows" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
+	MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-disable-isolation" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
 
 .PHONY: hygiene
 hygiene:

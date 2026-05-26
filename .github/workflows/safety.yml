@@ -98,7 +98,10 @@ jobs:
     if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     env:
-      MIRIFLAGS: -Zmiri-tree-borrows
+      # `-Zmiri-disable-isolation` matches what `make miri-lib` sets —
+      # the identity tests need a real-time clock, which miri refuses
+      # under default isolation. Tree Borrows is independent of that.
+      MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly

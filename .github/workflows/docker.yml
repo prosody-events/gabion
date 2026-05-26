@@ -98,10 +98,10 @@ jobs:
             dockerfile: deploy/nginx/Dockerfile
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable-alpine
-          - image: openresty
-            dockerfile: deploy/nginx/Dockerfile.openresty
-            base-arg: OPENRESTY_BASE_IMAGE
-            base-image: openresty/openresty:alpine
+          # `openresty` is intentionally excluded from PR builds: its
+          # `cargo chef cook` step segfaults (exit 139, OOM-killer) on
+          # the 7GB ubuntu-latest runner under fat LTO + 1 codegen unit.
+          # Full multi-flavor builds still run on main/tags/cron.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -170,7 +170,6 @@ jobs:
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gabiond:pr-${{ github.event.pull_request.number }}
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/loader:pr-${{ github.event.pull_request.number }}
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/nginx:pr-${{ github.event.pull_request.number }}
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/openresty:pr-${{ github.event.pull_request.number }}
             ```
 
             Or pin to this exact commit (`${{ github.event.pull_request.head.sha }}`):
@@ -179,7 +178,7 @@ jobs:
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gabiond:pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
             ```
 
-            `linux/amd64` only on PRs; multi-arch and non-default flavors build on `main`. Tags are auto-pruned when this PR closes (or after 30 days, whichever comes first).
+            `linux/amd64` only on PRs; openresty + multi-arch + non-default flavors build on `main`. Tags are auto-pruned when this PR closes (or after 30 days, whichever comes first).
 
   # Stage 1: one job per (image × flavor × arch). Each job builds a
   # single-platform image, pushes it to GHCR by digest, and uploads the
