@@ -75,46 +75,34 @@ const BACKGROUND_RATE_PER_SEC = 3;
  *  — twice the 400 limit, well inside the REJECTING band, and perpetually so. */
 const OVERLOAD_RATE_PER_SEC = 80;
 
-/** The rebuild knobs the control rail exposes, and the positions they take when
- *  a preset doesn't pin the field. These mirror `gabion::defaults` /
- *  `SimConfig::default` — the values the Rust side applies to an omitted field —
- *  so a slider at its default produces the same cluster as no slider at all. (A
- *  hand-mirror, like `sim/types.ts`; if the Rust defaults move, move these.) */
-export const KNOB_DEFAULTS = {
-  nodes: NODES,
-  fanout: 6,
-  target_err_bps: 100,
-  uniform_loss: 0,
-  // The rule + gossip knobs mirror `SimConfig::default` (`config.rs`): a
-  // viz-friendly 1 000 limit / 10 s window, and the production 100 ms gossip
-  // tick. A narrative preset seats `rule_limit` at `NARRATIVE_LIMIT` instead
-  // (via `knobsFromPreset`); none pins window or tick, so those stay here.
-  rule_limit: 1_000,
-  rule_window_ms: 10_000,
-  tick_interval_ms: 100,
-} as const;
-
-/** The bucket width within the window, fixed (not a knob) so the
- *  window-is-a-whole-number-of-buckets invariant `SimConfig::validate` enforces
- *  holds by construction for every window the slider can pick. Mirrors
- *  `SimConfig::default`'s `rule_bucket_ms`. */
-export const RULE_BUCKET_MS = 1_000;
-
 /** The subset of `SimConfig` the rebuild sliders own. */
-export type Knobs = { [K in keyof typeof KNOB_DEFAULTS]: number };
+export interface Knobs {
+  nodes: number;
+  fanout: number;
+  target_err_bps: number;
+  uniform_loss: number;
+  rule_limit: number;
+  rule_window_ms: number;
+  tick_interval_ms: number;
+}
 
-/** Seat the sliders from a preset: its pinned fields win, the rest fall to the
- *  defaults above. Called on every preset switch so the knobs mirror the active
- *  scenario (e.g. Packet loss seats the loss slider at 0.3). */
-export function knobsFromPreset(preset: Preset): Knobs {
+/** Seat the sliders from a preset: its pinned fields win, and every field it
+ *  leaves open falls to the Rust-reported `defaults` (`Sim.defaultConfig()`), so
+ *  a slider at rest builds the same cluster as an omitted field and the rest
+ *  positions follow `gabion::defaults` with no hand-typed mirror. Only `nodes`
+ *  falls to a local constant (`NODES`, the presets' ring size — a viz choice, not
+ *  a Rust tunable). The bucket width is not a knob; it tracks `defaults.rule_bucket_ms`
+ *  directly in `App.svelte` so the window-is-whole-buckets invariant holds.
+ *  Called on every preset switch (e.g. Packet loss seats the loss slider at 0.3). */
+export function knobsFromPreset(preset: Preset, defaults: SimConfig): Knobs {
   return {
-    nodes: preset.config.nodes ?? KNOB_DEFAULTS.nodes,
-    fanout: preset.config.fanout ?? KNOB_DEFAULTS.fanout,
-    target_err_bps: preset.config.target_err_bps ?? KNOB_DEFAULTS.target_err_bps,
-    uniform_loss: preset.config.uniform_loss ?? KNOB_DEFAULTS.uniform_loss,
-    rule_limit: preset.config.rule_limit ?? KNOB_DEFAULTS.rule_limit,
-    rule_window_ms: preset.config.rule_window_ms ?? KNOB_DEFAULTS.rule_window_ms,
-    tick_interval_ms: preset.config.tick_interval_ms ?? KNOB_DEFAULTS.tick_interval_ms,
+    nodes: preset.config.nodes ?? NODES,
+    fanout: preset.config.fanout ?? defaults.fanout,
+    target_err_bps: preset.config.target_err_bps ?? defaults.target_err_bps,
+    uniform_loss: preset.config.uniform_loss ?? defaults.uniform_loss,
+    rule_limit: preset.config.rule_limit ?? defaults.rule_limit,
+    rule_window_ms: preset.config.rule_window_ms ?? defaults.rule_window_ms,
+    tick_interval_ms: preset.config.tick_interval_ms ?? defaults.tick_interval_ms,
   };
 }
 

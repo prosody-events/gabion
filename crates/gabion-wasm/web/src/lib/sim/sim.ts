@@ -3,7 +3,7 @@
 // `bigint`s wasm-bindgen expects for u64 parameters, and stamps the untyped
 // boundary results with the contracts declared in `types.ts`.
 
-import init, { Sim as WasmSim } from '../../wasm/gabion_wasm.js';
+import init, { Sim as WasmSim, default_config } from '../../wasm/gabion_wasm.js';
 import type { ClusterState, EventBatch, LinkPolicyKind, SimConfig } from './types';
 
 let initPromise: Promise<unknown> | null = null;
@@ -48,6 +48,15 @@ export class Sim {
   static async create(config: Partial<SimConfig> = {}): Promise<Sim> {
     await ensureInit();
     return new Sim(new WasmSim(config));
+  }
+
+  /** The Rust-side production-aligned `SimConfig` defaults — the single source
+   *  the control sliders open from (no hand-maintained TS mirror, so changing
+   *  `gabion::defaults` is the only edit). u128 fields arrive as hex strings,
+   *  matching the `SimConfig` contract in `types.ts`. */
+  static async defaultConfig(): Promise<SimConfig> {
+    await ensureInit();
+    return default_config() as SimConfig;
   }
 
   /** Inject `hits` requests for `key` at `node`, at the current virtual time. */

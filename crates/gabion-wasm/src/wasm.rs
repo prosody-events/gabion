@@ -210,6 +210,16 @@ impl Sim {
     }
 }
 
+/// The production-aligned [`SimConfig`] defaults as a plain JS object. The
+/// single source the frontend reads, so its control sliders open at exactly the
+/// values an omitted field would take — no hand-maintained TypeScript mirror to
+/// drift from `gabion::defaults`. `u128` fields cross as hex strings, like every
+/// other boundary payload.
+#[wasm_bindgen]
+pub fn default_config() -> Result<JsValue, JsValue> {
+    to_js(&SimConfig::default())
+}
+
 /// Serialize an owned reply into a plain JS object.
 fn to_js<T: serde::Serialize>(value: &T) -> Result<JsValue, JsValue> {
     serde_wasm_bindgen::to_value(value).map_err(Into::into)

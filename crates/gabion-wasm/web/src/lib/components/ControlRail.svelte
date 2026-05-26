@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { RULE_BUCKET_MS, type Knobs, type Preset } from '../presets';
+  import { type Knobs, type Preset } from '../presets';
   import { visibleBuckets } from '../buckets';
 
   // The left control rail (the chassis's controls region): scenario presets, the
@@ -15,6 +15,7 @@
     burstHits = $bindable(),
     knobs,
     appliedKnobs,
+    bucketMs,
     tuneOpen,
     onToggleTune,
     onSelectPreset,
@@ -39,6 +40,9 @@
     // The knobs the current engine was built from. A field that differs from
     // `knobs` is staged-but-not-applied; `onApplyKnobs` (Rebuild) applies them.
     appliedKnobs: Knobs;
+    // The rule's bucket width (`defaults.rule_bucket_ms`, sourced from Rust), so
+    // the window readout's bucket count matches the Strata the inspector draws.
+    bucketMs: number;
     // The disclosure's open state, owned by App so it survives a rebuild's
     // loading flash (the rail unmounts then; native `<details>` state would not).
     tuneOpen: boolean;
@@ -78,7 +82,7 @@
   // Strata uses (one source of truth — `buckets.ts`), so the readout can't
   // disagree with the strip the inspector draws.
   const windowSec = $derived(Math.round(knobs.rule_window_ms / 1000));
-  const windowBuckets = $derived(visibleBuckets(knobs.rule_window_ms, RULE_BUCKET_MS));
+  const windowBuckets = $derived(visibleBuckets(knobs.rule_window_ms, bucketMs));
 
   // Send and remove each pick a live id. A bare `$state` can't follow the live
   // set: before the cluster loads it is null, and a picked node can leave under

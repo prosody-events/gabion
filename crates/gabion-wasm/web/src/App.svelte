@@ -6,7 +6,6 @@
   import {
     DEFAULT_PRESET,
     PRESETS,
-    RULE_BUCKET_MS,
     WATCHED_KEY,
     knobsFromPreset,
     type Knobs,
@@ -29,18 +28,25 @@
   // another rebuilds. Clicking a node (or the rail's Send) injects more traffic
   // for the watched key on top.
   let activePreset = $state<Preset>(DEFAULT_PRESET);
+  // The Rust-side production defaults (`Sim.defaultConfig()`), the single source
+  // the sliders open from — no hand-typed TS mirror. Fetched once during the
+  // first load (the workspace is unmounted while `loading`, so the `null` window
+  // is never rendered), then every knob default and the bucket width read from
+  // it. Changing `gabion::defaults` is the only edit; the sliders follow.
+  let defaults = $state<SimConfig | null>(null);
   // The rebuild knobs (cluster size, fanout, error budget, packet loss). Seated
   // from the active preset and merged over its config on each (re)build, so a
   // slider tweak followed by a rebuild explores the parameter space without
   // leaving the scenario. They take effect only on rebuild — a live engine can't
   // change its node count — so editing a knob just *stages* it; the rail's
-  // explicit "Rebuild" applies the staged set in one build.
-  let knobs = $state<Knobs>(knobsFromPreset(DEFAULT_PRESET));
+  // explicit "Rebuild" applies the staged set in one build. `null` until the
+  // first load seeds them from `defaults` (see `bootstrap`).
+  let knobs = $state<Knobs | null>(null);
   // The knob values the *current* engine was built from. `bootstrap` snapshots
   // `knobs` into this on every (re)build, so the rail can show which sliders have
   // been moved since — staged but not yet applied — and enable Rebuild only when
   // there is something to apply.
-  let appliedKnobs = $state<Knobs>(knobsFromPreset(DEFAULT_PRESET));
+  let appliedKnobs = $state<Knobs | null>(null);
   // The "Tune the cluster" disclosure's open state, lifted here so it survives
   // the workspace unmount during a rebuild's loading flash — a knob edit (which
   // no longer rebuilds) keeps it open, and an explicit Rebuild reopens it.
@@ -52,9 +58,11 @@
   // 1 000 000 limit), so a burst spreads only by lazy heartbeat — raising it (or
   // dropping the rule limit) far enough trips an eager flush, itself worth seeing.
   let burstHits = $state(25);
-  // One gossip tick at the production default (`GOSSIP_TICK_INTERVAL_MILLIS`),
-  // which the presets leave unset.
-  const TICK_MS = 100;
+  // One gossip tick = the active cluster's gossip interval, so a Sandbox Step
+  // advances exactly one heartbeat round and the invariant holds at any tick
+  // setting (not just the old hard-coded 100 ms). `0` only before the first
+  // build seeds `appliedKnobs`, when nothing steps. See `appliedKnobs`.
+  const tickMs = $derived(appliedKnobs?.tick_interval_ms ?? 0);
   // Cap one advance so a backgrounded tab resuming rAF can't leap seconds of
   // virtual time in a single frame.
   const MAX_STEP_MS = 500;
@@ -129,19 +137,19 @@
    *  drag, exactly like fanout/loss. Fanout is clamped to the peer count so a
    *  small cluster can't ask for more peers than it has; the bucket width is
    *  fixed so every window the slider picks stays a whole number of buckets. */
-  function effectiveConfig(preset: Preset): Partial<SimConfig> {
-    const nodes = knobs.nodes;
-    const fanout = Math.min(Math.max(knobs.fanout, 1), Math.max(nodes - 1, 1));
+  function effectiveConfig(preset: Preset, k: Knobs, d: SimConfig): Partial<SimConfig> {
+    const nodes = k.nodes;
+    const fanout = Math.min(Math.max(k.fanout, 1), Math.max(nodes - 1, 1));
     return {
       ...preset.config,
       nodes,
       fanout,
-      target_err_bps: knobs.target_err_bps,
-      uniform_loss: knobs.uniform_loss,
-      rule_limit: knobs.rule_limit,
-      rule_window_ms: knobs.rule_window_ms,
-      rule_bucket_ms: RULE_BUCKET_MS,
-      tick_interval_ms: knobs.tick_interval_ms,
+      target_err_bps: k.target_err_bps,
+      uniform_loss: k.uniform_loss,
+      rule_limit: k.rule_limit,
+      rule_window_ms: k.rule_window_ms,
+      rule_bucket_ms: d.rule_bucket_ms,
+      tick_interval_ms: k.tick_interval_ms,
     };
   }
 
@@ -166,6 +174,13 @@
     history.reset();
     chartVersion += 1;
     try {
+      // Source the Rust defaults once, then seed the knobs from the active
+      // preset before the (still-unmounted) control rail mounts. After this
+      // first pass both are non-null for the life of the page; Reset and knob
+      // edits keep the current `knobs`, a preset switch re-seats them in
+      // `selectPreset` before calling here.
+      const d = defaults ?? (defaults = await Sim.defaultConfig());
+      const k = knobs ?? (knobs = knobsFromPreset(preset, d));
       // Tear the previous engine down first; otherwise its spawned task,
       // runtimes, and tick channels leak for the life of the page (each
       // rebuild would pile up an engine).
@@ -173,12 +188,12 @@
         await sim.shutdown();
         sim = null;
       }
-      const fresh = await Sim.create(effectiveConfig(preset));
+      const fresh = await Sim.create(effectiveConfig(preset, k, d));
       await preset.seed(fresh);
       sim = fresh;
       // The engine now reflects the current knobs — mark them applied so the
       // rail's "staged" cue and Rebuild button reset to clean.
-      appliedKnobs = { ...knobs };
+      appliedKnobs = { ...k };
       await refresh();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -191,7 +206,9 @@
    *  it), then build it. The rail's scenario buttons route here; Reset and knob
    *  changes call `bootstrap()` directly, keeping the current knobs. */
   function selectPreset(preset: Preset): void {
-    knobs = knobsFromPreset(preset);
+    // The rail (which routes here) only mounts after the first load seeds
+    // `defaults`, so it is non-null; re-seat the knobs from the chosen scenario.
+    if (defaults !== null) knobs = knobsFromPreset(preset, defaults);
     void bootstrap(preset);
   }
 
@@ -215,7 +232,7 @@
     if (!playing || sim === null) return;
     rafId = requestAnimationFrame(frame);
     if (stepping) return;
-    const wallDelta = lastWall === 0 ? TICK_MS / 6 : now - lastWall;
+    const wallDelta = lastWall === 0 ? tickMs / 6 : now - lastWall;
     lastWall = now;
     const deltaMs = Math.min(Math.round(wallDelta * speed), MAX_STEP_MS);
     if (deltaMs <= 0) return;
@@ -356,7 +373,7 @@
 
   async function stepOnce(): Promise<void> {
     if (playing) return;
-    await advance(TICK_MS);
+    await advance(tickMs);
   }
 
   function onKeydown(event: KeyboardEvent): void {
@@ -394,7 +411,7 @@
         <strong>The simulation could not start.</strong>
         <span>{error}</span>
       </div>
-    {:else if loading}
+    {:else if loading || knobs === null || appliedKnobs === null || defaults === null}
       <div class="overlay" aria-live="polite">Loading the gossip engine…</div>
     {:else}
       <div class="workspace">
@@ -406,6 +423,7 @@
           bind:burstHits
           {knobs}
           {appliedKnobs}
+          bucketMs={defaults.rule_bucket_ms}
           {tuneOpen}
           onToggleTune={(open) => (tuneOpen = open)}
           onSelectPreset={selectPreset}
@@ -442,8 +460,9 @@
                 <BucketStrata
                   cells={selectedNode.cells}
                   currentEpoch={cluster?.bucket_epoch_now ?? 0}
-                  epochFraction={((cluster?.virtual_ms ?? 0) % RULE_BUCKET_MS) / RULE_BUCKET_MS}
-                  liveBuckets={nominalBuckets(knobs.rule_window_ms, RULE_BUCKET_MS)}
+                  epochFraction={((cluster?.virtual_ms ?? 0) % defaults.rule_bucket_ms) /
+                    defaults.rule_bucket_ms}
+                  liveBuckets={nominalBuckets(knobs.rule_window_ms, defaults.rule_bucket_ms)}
                   windowMs={knobs.rule_window_ms}
                   limit={knobs.rule_limit}
                 />
