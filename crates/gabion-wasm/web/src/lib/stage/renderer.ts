@@ -31,14 +31,24 @@ import {
 
 // Palette mirrors the CSS design tokens in `app.css` (Pixi wants numbers, not
 // hex strings). A paper-bright stage with dark slate discs as the solid
-// figures; two signal hues only — amber for "in flight / not yet agreed",
-// green for "converged" — each always paired with a shape cue (arc length,
-// motion, the pulse), never color alone. Every mark clears 3:1 on the stage.
+// figures. Two distinct color families, never mixed:
+//   - Three **state** signal hues — amber for "in flight / not yet agreed",
+//     green for "converged", red for a rejected request — each always paired
+//     with a shape cue (arc length, the pulse), never color alone.
+//   - One **ambient traffic** accent — a muted steel-blue for the gossip beams.
+//     Gossip is structural, not a state signal, so it gets its own cool hue
+//     (analogous to the cool paper bg) and never borrows amber/green/red. A
+//     *dropped* beam desaturates toward a neutral cool grey as it dies mid-flight
+//     (loss = chroma drained, paired with its visible death + fade), so it reads
+//     as "lost" without the alarm of red.
+// Every mark clears 3:1 on the stage.
 const COLOR_STAGE_BG = 0xe8edf2;
 const COLOR_GRID = 0xd2d9e1;
 const COLOR_NODE_FILL = 0x39424f;
 const COLOR_DIRTY = 0xb3720d; // in flight / still climbing
 const COLOR_CONVERGED = 0x137a52; // settled / agreed
+const COLOR_BEAM = 0x3f6090; // gossip traffic — ambient steel-blue accent
+const COLOR_BEAM_LOST = 0x8b94a1; // dropped beam's terminal color — cool grey
 // The selection ring (the inspected node). Drawn in the dark ink — chrome, not
 // a signal — so it never reads as amber/green convergence state, and it is
 // paired with the inspector opening, so selection is signified by more than the
@@ -49,12 +59,23 @@ const COLOR_SELECT = 0x1b2330;
 // cluster's true total — the threshold that flips its arc from amber to green.
 const CONVERGED_EPSILON = 0.001;
 
-// Wall-clock flight time of a gossip packet beam, and how long its bright head
-// trails behind it (as a fraction of the edge). Eased so the beam accelerates
+// Wall-clock flight time of a gossip packet beam. Eased so the beam accelerates
 // off the source and decelerates into the target — motion that reads as cause
 // then effect.
 const BEAM_FLIGHT_MS = 520;
-const BEAM_TRAIL = 0.28;
+// Reduced motion: a beam is a static edge that fades over this span instead of
+// flying — the same lifetime bound, no travel.
+const REDUCE_FADE_MS = 400;
+// The comet: a bright crisp head leads, a soft wake fades behind it, so a beam
+// reads unmistakably as a particle traveling its edge. `BEAM_WAKE` is the wake's
+// length as a fraction of the edge; the head is a filled dot of radius
+// `width · BEAM_HEAD_R`, set in a faint glow of radius `width · BEAM_GLOW_R` at
+// `BEAM_GLOW_ALPHA` of the beam's alpha (plain layered alpha, not additive —
+// additive washes toward white on the paper-bright stage).
+const BEAM_WAKE = 0.26;
+const BEAM_HEAD_R = 1.4;
+const BEAM_GLOW_R = 3.0;
+const BEAM_GLOW_ALPHA = 0.2;
 // Soft beam edges: a beam ramps in over the first slice of its flight and (when
 // delivered) back out over the last slice as it reaches the target, so it
 // neither snaps on at the source nor vanishes abruptly on arrival — the
@@ -63,9 +84,19 @@ const BEAM_FADE_IN = 0.1;
 const BEAM_FADE_OUT = 0.12;
 // A dropped packet dies partway across instead of landing.
 const DROP_FRACTION = 0.5;
-// Cap concurrent beams so a burst at high node counts can't unbound the draw
-// list; excess sends are simply not drawn (the cell arcs still tell the story).
-const MAX_BEAMS = 320;
+// A last-resort sanity ceiling against a pathological event-batch dump — *not* a
+// render-cost cap. Every beam is a few primitives redrawn by a single ticker
+// pass into one persistent Graphics, and beams self-expire after one flight, so
+// the live set is bounded by sends-in-the-last-flight-window. Measured: a
+// 100-node sustained overload (the UI's worst case) peaks in the low tens of
+// thousands, so this leaves an order of magnitude of headroom and is not
+// reached in normal operation.
+const MAX_BEAMS = 32768;
+// Above this many concurrent beams each comet drops its head glow and filled
+// head dot for an all-stroke "lean comet" (wake + a short bright head streak),
+// so dense gossip stays fast; below it every beam is the full comet (glow under
+// a soft wake under a crisp filled head).
+const BEAM_DETAIL_CAP = 400;
 
 // Membership-change motion (join / leave / re-space). Purposeful only: a join
 // grows in, a leave shrinks out, survivors glide. Reduced motion skips all of
@@ -94,14 +125,19 @@ interface NodeGfx {
   tweens: Set<gsap.core.Tween>;
 }
 
-/** One packet in flight: its graphics plus the tween animating it, tracked so
- *  a reset — or the departure of an endpoint node — can kill both
- *  deterministically. `src` / `dst` are stable ids. */
+/** One packet in flight, as plain wall-time data. A single ticker pass
+ *  (`#stepBeams`) redraws every live beam into one shared Graphics each frame
+ *  and deletes it when its flight ends — no per-beam display object or tween.
+ *  `src` / `dst` are stable ids; `a` / `b` are the endpoint centers captured at
+ *  creation (a node leaving mid-flight is swept by `#cancelBeamsFor`). */
 interface Beam {
-  gfx: Graphics;
-  tween: gsap.core.Tween;
   src: number;
   dst: number;
+  a: Point;
+  b: Point;
+  startMs: number;
+  width: number;
+  dropped: boolean;
 }
 
 export class StageRenderer {
@@ -111,9 +147,16 @@ export class StageRenderer {
   readonly #packetLayer: Container;
   readonly #nodeLayer: Container;
   readonly #reduceMotion: boolean;
+  // One persistent Graphics holding every live beam's strokes, redrawn each
+  // frame by `#stepBeams` on the app ticker (N beams, one draw call).
+  readonly #packetGfx: Graphics;
 
   #nodes = new Map<number, NodeGfx>();
   #beams = new Set<Beam>();
+  // Whether `#packetGfx` currently holds strokes — so the always-on ticker
+  // issues exactly one final `.clear()` when the beam set drains, then does zero
+  // work each idle tick after.
+  #beamsActive = false;
   #lastTick = -1;
   #lastDisagreement = 0;
   // The stable id of the selected node, or null. A static ring marks it; updated
@@ -143,6 +186,12 @@ export class StageRenderer {
       .circle(stageCenter.x, stageCenter.y, guideRadius)
       .stroke({ width: 1.5, color: COLOR_GRID });
     this.#guideLayer.addChild(guide);
+
+    // Parent the shared beam Graphics before registering the ticker, so the
+    // first tick never fires against an orphaned object.
+    this.#packetGfx = new Graphics();
+    this.#packetLayer.addChild(this.#packetGfx);
+    this.#app.ticker.add(this.#stepBeams, this);
   }
 
   /** Build the renderer and attach its canvas to `container`. Async because
@@ -290,6 +339,7 @@ export class StageRenderer {
       gfx.tweens.clear();
     }
     this.#nodes.clear();
+    this.#app.ticker.remove(this.#stepBeams, this);
     this.#app.canvas.remove();
     this.#app.destroy(true, { children: true, texture: true, textureSource: true });
   }
@@ -445,80 +495,124 @@ export class StageRenderer {
       .stroke({ width: 2.5, color: COLOR_SELECT, alpha: 0.9 });
   }
 
+  /** Record one gossip packet as a beam. No Graphics, no tween — just a data
+   *  record the ticker draws and ages out; endpoints are captured here so the
+   *  beam keeps flying along its original path even as the nodes glide. */
   #beam(src: number, dst: number, bytes: number, dropped: boolean): void {
+    // Sanity ceiling only — beams self-expire, so the live set is bounded by the
+    // last flight window (see MAX_BEAMS); drop excess rather than unbound the set
+    // if an event batch ever dumps pathologically many at once.
     if (this.#beams.size >= MAX_BEAMS) return;
     const a = this.#liveCenter(src);
     const b = this.#liveCenter(dst);
     if (a === null || b === null) return;
+    this.#beams.add({
+      src,
+      dst,
+      a,
+      b,
+      startMs: performance.now(),
+      width: 1.5 + Math.min(bytes, 400) / 100,
+      dropped,
+    });
+    this.#beamsActive = true;
+  }
 
-    const width = 1.5 + Math.min(bytes, 400) / 100;
-    const gfx = new Graphics();
-    this.#packetLayer.addChild(gfx);
-
-    if (this.#reduceMotion) {
-      // Reduced motion: no flight. Mark the edge briefly, then fade — a static
-      // diff rather than animated travel.
-      gfx
-        .moveTo(a.x, a.y)
-        .lineTo(b.x, b.y)
-        .stroke({ width, color: COLOR_DIRTY, alpha: dropped ? 0.3 : 0.9, cap: 'round' });
-      const beam: Beam = {
-        gfx,
-        src,
-        dst,
-        tween: gsap.to(gfx, {
-          alpha: 0,
-          duration: 0.4,
-          onComplete: () => this.#removeBeam(beam),
-        }),
-      };
-      this.#beams.add(beam);
+  /** The per-frame beam render: one ticker pass that redraws every live beam
+   *  into the shared `#packetGfx` by wall-clock age and deletes it when its
+   *  flight ends. Idle pays nothing — when the set drains it issues one final
+   *  `.clear()` (via `#beamsActive`) and then returns immediately each tick.
+   *
+   *  A beam is a comet: a bright crisp head leads, a soft wake fades behind it,
+   *  along the eased flight, so it reads as a particle traveling its edge. Below
+   *  `BEAM_DETAIL_CAP` live beams the head sits in a faint glow and is a filled
+   *  dot (the full comet); above it the comet goes all-stroke (wake + a short
+   *  head streak) so dense gossip stays fast. A delivered beam is the steel-blue
+   *  gossip accent, reaches the target, and hands the "news landed" beat to its
+   *  pulse; a dropped beam dies at `DROP_FRACTION`, draining to grey as it goes —
+   *  the partition / packet-loss cue. */
+  #stepBeams(): void {
+    if (this.#packetGfx.destroyed) return;
+    if (this.#beams.size === 0) {
+      if (this.#beamsActive) {
+        this.#packetGfx.clear();
+        this.#beamsActive = false;
+      }
       return;
     }
 
-    const head = { t: 0 };
-    const end = dropped ? DROP_FRACTION : 1;
-    const draw = (): void => {
-      // A tween tick can land after the beam's graphics were destroyed (a sweep
-      // on reset / node-exit, or the completion tick racing the next frame under
-      // fast play). Drawing into a destroyed `Graphics` reads its null context
-      // and throws — bail before touching it.
-      if (gfx.destroyed) return;
-      const tip = head.t;
-      const tail = Math.max(0, tip - BEAM_TRAIL);
-      const from = lerp(a, b, tail);
-      const to = lerp(a, b, tip);
-      // Soft edges multiply the base alpha: ramp in over the first slice of the
-      // flight, and — delivered only — back out over the last slice into the
-      // target. A dropped beam keeps its own mid-flight dim (and still fades in)
-      // so it reads as fading *out* mid-flight, distinct from a delivery.
+    const g = this.#packetGfx.clear();
+    const now = performance.now();
+    const duration = this.#reduceMotion ? REDUCE_FADE_MS : BEAM_FLIGHT_MS;
+    const detail = this.#beams.size <= BEAM_DETAIL_CAP;
+
+    // Deleting from a Set during its own for…of is well-defined: the deleted
+    // entry simply won't be revisited.
+    for (const beam of this.#beams) {
+      const age = now - beam.startMs;
+      if (age >= duration) {
+        // Flight done. A delivered (non-reduced) beam hands off to the target's
+        // pulse; deleting this same frame means that pulse fires exactly once.
+        if (!beam.dropped && !this.#reduceMotion) this.#queueFlash(beam.dst);
+        this.#beams.delete(beam);
+        continue;
+      }
+
+      if (this.#reduceMotion) {
+        // No flight: a static edge fading over its lifetime — a diff, not travel.
+        // Delivered stays steel-blue; dropped reads as the terminal grey.
+        const color = beam.dropped ? COLOR_BEAM_LOST : COLOR_BEAM;
+        const alpha = (beam.dropped ? 0.3 : 0.9) * (1 - age / duration);
+        g.moveTo(beam.a.x, beam.a.y)
+          .lineTo(beam.b.x, beam.b.y)
+          .stroke({ width: beam.width, color, alpha, cap: 'round' });
+        continue;
+      }
+
+      // Eased flight. A dropped beam only crosses to `DROP_FRACTION`; a delivered
+      // one reaches the target. The head leads at `tip`; the wake trails it.
+      const end = beam.dropped ? DROP_FRACTION : 1;
+      const tip = easeInOutQuad(age / duration) * end;
+      const wakeStart = Math.max(0, tip - BEAM_WAKE);
+      const headPt = lerp(beam.a, beam.b, tip);
+      const wakePt = lerp(beam.a, beam.b, wakeStart);
+      // Soft edges multiply the base alpha: ramp in over the first slice; a
+      // delivered beam ramps back out over the last slice into the target, while
+      // a dropped one carries its own mid-flight dim so it reads as fading *out*
+      // partway across, distinct from a delivery.
       const fadeIn = clamp01(tip / (end * BEAM_FADE_IN));
-      const base = dropped
+      const base = beam.dropped
         ? 0.7 * (1 - tip / end)
         : 0.95 * clamp01((end - tip) / (end * BEAM_FADE_OUT));
       const alpha = base * fadeIn;
-      gfx
-        .clear()
-        .moveTo(from.x, from.y)
-        .lineTo(to.x, to.y)
-        .stroke({ width, color: COLOR_DIRTY, alpha, cap: 'round' });
-    };
-    const beam: Beam = {
-      gfx,
-      src,
-      dst,
-      tween: gsap.to(head, {
-        t: end,
-        duration: BEAM_FLIGHT_MS / 1000,
-        ease: 'power2.inOut',
-        onUpdate: draw,
-        onComplete: () => {
-          if (!dropped) this.#queueFlash(dst);
-          this.#removeBeam(beam);
-        },
-      }),
-    };
-    this.#beams.add(beam);
+      // Delivered: the steel-blue accent. Dropped: drain chroma toward grey as it
+      // dies, so loss reads as color leaving rather than an alarm hue.
+      const color = beam.dropped
+        ? lerpColor(COLOR_BEAM, COLOR_BEAM_LOST, tip / end)
+        : COLOR_BEAM;
+
+      if (detail) {
+        // Full comet, back to front: glow, then soft wake, then the crisp head.
+        g.circle(headPt.x, headPt.y, beam.width * BEAM_GLOW_R).fill({
+          color,
+          alpha: alpha * BEAM_GLOW_ALPHA,
+        });
+        g.moveTo(wakePt.x, wakePt.y)
+          .lineTo(headPt.x, headPt.y)
+          .stroke({ width: beam.width, color, alpha: alpha * 0.4, cap: 'round' });
+        g.circle(headPt.x, headPt.y, beam.width * BEAM_HEAD_R).fill({ color, alpha });
+      } else {
+        // Lean comet (all-stroke): the soft wake, then a short bright head streak
+        // for the leading edge — no fills, so overload stays fast.
+        const streakPt = lerp(beam.a, beam.b, Math.max(0, tip - BEAM_WAKE / 4));
+        g.moveTo(wakePt.x, wakePt.y)
+          .lineTo(headPt.x, headPt.y)
+          .stroke({ width: beam.width, color, alpha: alpha * 0.45, cap: 'round' });
+        g.moveTo(streakPt.x, streakPt.y)
+          .lineTo(headPt.x, headPt.y)
+          .stroke({ width: beam.width, color, alpha, cap: 'round' });
+      }
+    }
   }
 
   /** The live position of node `id`'s disc (mid-glide if it is moving), or
@@ -603,35 +697,31 @@ export class StageRenderer {
     }
   }
 
-  #removeBeam(beam: Beam): void {
-    if (!this.#beams.delete(beam)) return;
-    beam.gfx.destroy();
-  }
-
-  /** Cancel every in-flight beam touching node `id` — called when that node
-   *  leaves, so no beam animates to or from a disc that is being destroyed. */
+  /** Drop every in-flight beam touching node `id` — called when that node
+   *  leaves, so no beam draws to or from a disc that is being destroyed. The
+   *  next ticker pass redraws the survivors (or issues the drain clear). */
   #cancelBeamsFor(id: number): void {
     for (const beam of [...this.#beams]) {
-      if (beam.src === id || beam.dst === id) {
-        beam.tween.kill();
-        this.#removeBeam(beam);
-      }
+      if (beam.src === id || beam.dst === id) this.#beams.delete(beam);
     }
   }
 
   #clearBeams(): void {
     this.#cancelFlashes();
-    for (const beam of this.#beams) {
-      beam.tween.kill();
-      beam.gfx.destroy();
-    }
     this.#beams.clear();
-    this.#packetLayer.removeChildren().forEach((c) => c.destroy());
+    this.#packetGfx.clear();
+    this.#beamsActive = false;
   }
 }
 
 function lerp(a: Point, b: Point, t: number): Point {
   return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+/** GSAP `power2.inOut` reproduced locally: the beam ticker (not a tween) now
+ *  drives flight progress, so it eases the raw age ratio itself. */
+function easeInOutQuad(t: number): number {
+  return t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t);
 }
 
 /** Clamp `t` to `[0, 1]` — the beam fade ramps run a raw ratio through this. */
