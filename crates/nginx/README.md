@@ -29,7 +29,6 @@ fail-open invariant, see the [top-level README](../../README.md).
 - [Configuration error messages](#configuration-error-messages)
 - [Troubleshooting](#troubleshooting)
 - [Unknown variable detection](#unknown-variable-detection)
-- [Migration from the pre-1.0 DSL](#migration-from-the-pre-10-dsl)
 
 ## Your first rule
 
@@ -780,30 +779,3 @@ sure the module that provides the variable — `ngx_http_geoip2_module`,
 or the `map` directive that defines `$bot_class`, or the `geo`
 directive that defines `$trusted_ip` — is loaded before the
 `gabion_limit_rule` that references it.
-
-## Migration from the pre-1.0 DSL
-
-There was no deprecation cycle pre-1.0, so the migration is a
-one-shot update to operator configs.
-
-| Before                                                   | After                                                                       |
-|----------------------------------------------------------|-----------------------------------------------------------------------------|
-| `gabion_limit_zone NAME SIZE`                            | `gabion_limit_zone zone=NAME:SIZE`                                          |
-| `gabion_limit_rule NAME 2r/m key=$uri window=60s`        | `gabion_limit_rule NAME $uri rate=2r/m`                                     |
-| `gabion_limit_rule NAME $uri rate=10r/s window=1s`       | `gabion_limit_rule NAME $uri rate=10r/s` (rate's period is the default window) |
-| `gabion_limit_rule NAME $uri rate=10r/m window=30s`      | `gabion_limit_rule NAME $uri rate=10r/30s` — or `rate=10r/m window=30s` if you want "10/min" to survive in the text (resolves to limit=5 over 30s) |
-| `bucket=` default of `1s`                                | `bucket=` defaults to the resolved window (single fixed-window bucket); set explicitly for sub-window granularity |
-| `key=tenant:$arg_tenant`                                 | `tenant:$arg_tenant` (positional)                                           |
-| `gabion_limit foo` only                                  | `gabion_limit foo bar baz` / `gabion_limit off`                             |
-| `gabion_gossip_discovery_namespace NS`                   | `gabion_discovery_namespace_allow NS`                                       |
-| `gabion_discovery_namespace_whitelist NS`                | `gabion_discovery_namespace_allow NS`                                       |
-| `gabion_discovery_service_whitelist SVC`                 | `gabion_discovery_service_allow SVC`                                        |
-
-The directive surface also gained an explicit `window=` for the
-"N requests per second, applied over an H-hour window" mental model.
-`rate=10r/s window=5h` resolves to a 180,000-over-5h budget, which
-is equivalent to `rate=180000r/5h` but preserves the original
-"10 r/s" intent in the config text. Read the rate, window, and
-bucket discussion under `gabion_limit_rule` before reaching for
-`window=`, because long windows combined with the default `bucket=`
-produce a burstable budget rather than a paced one.
