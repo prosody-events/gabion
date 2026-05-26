@@ -240,7 +240,7 @@ def suite_scale_n() -> list[dict]:
 
 
 # gabion::defaults::GOSSIP_COVERAGE_MARGIN — keep in sync with the Rust const.
-COVERAGE_MARGIN = 4.0
+COVERAGE_MARGIN = 3.0
 
 
 def _coverage_pick(n_nodes: int, floor: int = 1) -> int:

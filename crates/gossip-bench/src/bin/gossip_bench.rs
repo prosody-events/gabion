@@ -223,7 +223,7 @@ fn example_scenario(kind: &str) -> Option<String> {
             base.kind = ScenarioKind::CoverageFanout;
             base.nodes = 32;
             // `fanout` is the floor; the runtime scales the actual pick to
-            // the coverage threshold `⌈ln(31)+4⌉ = 8` (31 peers at n=32),
+            // the coverage threshold `⌈ln(31)+3⌉ = 7` (31 peers at n=32),
             // well above this floor of 1.
             base.fanout = 1;
             base.duration = Duration::from_secs(5);

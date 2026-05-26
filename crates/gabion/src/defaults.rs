@@ -37,20 +37,27 @@ pub const GOSSIP_FANOUT: usize = 3;
 /// gossip round with mean fanout `ln(n) + c` reaches every node with
 /// probability → `e^(−e^(−c))`:
 ///
-/// | `c` | per-round coverage `e^(−e^(−c))` |
-/// |-----|----------------------------------|
-/// | 3   | 95.1 %                           |
-/// | 4   | 98.2 %                           |
-/// | 5   | 99.3 %                           |
+/// | `c`   | per-round coverage `e^(−e^(−c))` |
+/// |-------|----------------------------------|
+/// | **3** | **95.1 %**                       |
+/// | 4     | 98.2 %                           |
+/// | 5     | 99.3 %                           |
 ///
-/// These are *single-round* figures. Gabion runs continuous anti-entropy, so
-/// any node missed in one round is reached by a later one and reliability
-/// compounds far past the per-round number. `c = 4` also matches KMG's
-/// validated simulations, where the threshold fanout sits at 13 for 10 000
-/// nodes and 15 for 50 000 (both ⇒ `c ≈ 4`). Kept a `const` for now; promote
-/// to a `GossipConfig` field if an operator ever needs to trade bandwidth for
-/// coverage at runtime.
-pub const GOSSIP_COVERAGE_MARGIN: f64 = 4.0;
+/// **These are single-round figures, and the single round is the wrong unit
+/// for gabion.** KMG's theorem bounds one *one-shot* dissemination; gabion
+/// instead runs continuous anti-entropy — it re-gossips every dirty cell each
+/// tick until the peer frontier shows it acked, with the repair lane behind
+/// that. So a node missed in one round is overwhelmingly likely to be reached
+/// by the next, and the per-round coverage *compounds*: at `c = 3` the 4.9 %
+/// per-round miss falls to ≈ 0.24 % after two rounds and ≈ 0.012 % after three.
+/// We therefore size to the leaner `c = 3` threshold and let anti-entropy close
+/// the gap, rather than paying KMG's one-shot `c ≈ 4` (their validated sims —
+/// fanout 13 @ 10 000 nodes, 15 @ 50 000 — measure single-shot reach, which a
+/// re-gossiping system does not need to match). `c = 3` costs ≈ 1 fewer peer
+/// per tick at every cluster size (≈ 10 % less gossip bandwidth). Kept a
+/// `const`; promote to a `GossipConfig` field if an operator ever needs to
+/// trade bandwidth for coverage at runtime.
+pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
