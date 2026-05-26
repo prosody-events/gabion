@@ -78,6 +78,17 @@ jobs:
         with:
           cluster_name: gabion
           wait: 120s
+      # Cores from pods inside kind land in their own mount namespace at
+      # /tmp/cores. The cleanup hook in `nginx-scale-rate-limit.sh`
+      # best-effort-copies them out via `kubectl cp` into the runner's
+      # /tmp/cores; the upload-artifact step picks them up on failure.
+      # Setting `kernel.core_pattern` here matches the smoke containers
+      # built with `--ulimit core=-1` so cores actually get written.
+      - name: enable host core dumps
+        run: |
+          sudo mkdir -p /tmp/cores
+          sudo chmod 1777 /tmp/cores
+          sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
       # Pre-build the NGINX module image so `kind load docker-image` can
       # ship it into the cluster's containerd. The script itself rebuilds
       # the same compose target — that becomes a cache no-op.
@@ -89,6 +100,13 @@ jobs:
       - name: load image into kind
         run: kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
       - run: make kubernetes-nginx-test
+      - name: upload cores on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cores-${{ github.job }}-${{ github.run_attempt }}
+          path: /tmp/cores
+          if-no-files-found: ignore
 
   kubernetes-mixed-test:
     needs: plan
@@ -101,6 +119,11 @@ jobs:
         with:
           cluster_name: gabion
           wait: 120s
+      - name: enable host core dumps
+        run: |
+          sudo mkdir -p /tmp/cores
+          sudo chmod 1777 /tmp/cores
+          sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
       - name: build images
         env:
           DOCKER_BUILDKIT: '1'
@@ -113,6 +136,13 @@ jobs:
           kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
           kind load docker-image gabiond:local --name gabion
       - run: make kubernetes-mixed-test
+      - name: upload cores on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cores-${{ github.job }}-${{ github.run_attempt }}
+          path: /tmp/cores
+          if-no-files-found: ignore
 
   kubernetes-gossip-bench:
     needs: plan
@@ -128,6 +158,11 @@ jobs:
         with:
           cluster_name: gabion
           wait: 120s
+      - name: enable host core dumps
+        run: |
+          sudo mkdir -p /tmp/cores
+          sudo chmod 1777 /tmp/cores
+          sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
       - name: build images
         env:
           DOCKER_BUILDKIT: '1'
@@ -140,3 +175,10 @@ jobs:
           kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
           kind load docker-image gabiond:local --name gabion
       - run: make kubernetes-gossip-bench
+      - name: upload cores on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cores-${{ github.job }}-${{ github.run_attempt }}
+          path: /tmp/cores
+          if-no-files-found: ignore

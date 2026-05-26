@@ -5,6 +5,17 @@ services:
       - ./nginx.base.conf:/etc/nginx/nginx.conf:ro
     command: ["nginx", "-t"]
 
+  # Both module smokes share the same diagnostic setup:
+  # - `ulimits.core: -1` raises the soft+hard core-dump rlimit so a SEGV
+  #   actually writes a core. Without this, `set_zone`-time crashes
+  #   surface only as exit 139 + an empty log.
+  # - `cap_add: [SYS_PTRACE]` is what `gdb -batch` needs to attach to
+  #   the core for `thread apply all bt full`. Without ptrace gdb can
+  #   still load the core but can't fully inspect threads on some
+  #   kernels.
+  # - The `/tmp/cores` bind mount is where the kernel's `core_pattern`
+  #   points on the GHA runner host. Host and container see the same
+  #   files, so workflow-side `actions/upload-artifact` can grab them.
   nginx-module-smoke:
     build:
       context: ../..
@@ -12,7 +23,13 @@ services:
       args:
         NGINX_BASE_IMAGE: ${NGINX_BASE_IMAGE:-nginx:stable-alpine}
     profiles: ["module"]
-    command: ["nginx", "-t"]
+    ulimits:
+      core: -1
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - /tmp/cores:/tmp/cores
+    command: ["/usr/local/bin/gabion-smoke-with-bt", "nginx", "-t"]
 
   nginx-module-request-smoke:
     build:
@@ -21,4 +38,10 @@ services:
       args:
         NGINX_BASE_IMAGE: ${NGINX_BASE_IMAGE:-nginx:stable-alpine}
     profiles: ["module"]
-    command: ["/usr/local/bin/gabion-nginx-request-smoke"]
+    ulimits:
+      core: -1
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - /tmp/cores:/tmp/cores
+    command: ["/usr/local/bin/gabion-smoke-with-bt", "/usr/local/bin/gabion-nginx-request-smoke"]

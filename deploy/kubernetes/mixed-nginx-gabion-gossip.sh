@@ -36,9 +36,23 @@ cleanup() {
         kubectl -n "$namespace" get pods,events --sort-by=.lastTimestamp -o wide >&2 || true
         kubectl -n "$namespace" describe pods -l app=gabiond >&2 || true
         kubectl -n "$namespace" describe pods -l app=gabion-nginx >&2 || true
-        kubectl -n "$namespace" logs --all-containers --tail=200 -l app=gabiond >&2 || true
-        kubectl -n "$namespace" logs --all-containers --tail=200 --previous -l app=gabiond >&2 || true
-        kubectl -n "$namespace" logs --all-containers --tail=200 -l app=gabion-nginx >&2 || true
+        # --tail=1000 because the smoke-with-bt wrapper prints a full
+        # `gdb thread apply all bt full` on crash, which easily blows
+        # past 200 lines and is the *only* signal for a native SIGSEGV
+        # in the module's config-phase callbacks.
+        kubectl -n "$namespace" logs --all-containers --tail=1000 -l app=gabiond >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=1000 --previous -l app=gabiond >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=1000 -l app=gabion-nginx >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=1000 --previous -l app=gabion-nginx >&2 || true
+        # Best-effort: copy /tmp/cores out of any pod that's still
+        # Running (kubectl cp uses `kubectl exec` under the hood, so a
+        # crashed pod's cores are unreachable). The smoke wrapper
+        # already prints a gdb backtrace into stdout above; this just
+        # preserves the raw cores for offline post-mortem.
+        mkdir -p /tmp/cores
+        for pod in $(kubectl -n "$namespace" get pods -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}'); do
+            kubectl -n "$namespace" cp "$pod:/tmp/cores" "/tmp/cores/${namespace}-${pod}" 2>/dev/null || true
+        done
         printf -- '--- end cleanup diagnostic dump ---\n\n' >&2
     fi
     if [ -n "$admin_forward_pid" ]; then

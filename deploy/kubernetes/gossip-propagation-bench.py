@@ -733,15 +733,37 @@ def main():
         # Dump pod state BEFORE deleting the namespace — otherwise CI
         # logs lose every signal about why pods crashed.
         log(f"\n--- cleanup diagnostic dump (namespace={NAMESPACE}) ---")
+        # --tail=1000 captures the smoke-with-bt wrapper's gdb output
+        # on a native SIGSEGV; 200 was enough for plain "rollout timed
+        # out" but truncates a full thread bt.
         for cmd in (
             ["kubectl", "-n", NAMESPACE, "get", "pods,events", "--sort-by=.lastTimestamp", "-o", "wide"],
             ["kubectl", "-n", NAMESPACE, "describe", "pods", "-l", "app=gabiond"],
             ["kubectl", "-n", NAMESPACE, "describe", "pods", "-l", "app=gabion-nginx"],
-            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=200", "-l", "app=gabiond"],
-            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=200", "--previous", "-l", "app=gabiond"],
-            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=200", "-l", "app=gabion-nginx"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=1000", "-l", "app=gabiond"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=1000", "--previous", "-l", "app=gabiond"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=1000", "-l", "app=gabion-nginx"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=1000", "--previous", "-l", "app=gabion-nginx"],
         ):
             run(cmd, check=False)
+        # Best-effort: copy /tmp/cores out of any pod that's still
+        # Running. Crashed pods are unreachable via `kubectl cp` (it
+        # uses `kubectl exec` under the hood); the in-pod gdb dump in
+        # the logs above is the primary signal.
+        os.makedirs("/tmp/cores", exist_ok=True)
+        running = run(
+            [
+                "kubectl", "-n", NAMESPACE, "get", "pods",
+                "-o", 'jsonpath={.items[?(@.status.phase=="Running")].metadata.name}',
+            ],
+            capture=True,
+            check=False,
+        )
+        for pod in (running.stdout or "").split():
+            run(
+                ["kubectl", "-n", NAMESPACE, "cp", f"{pod}:/tmp/cores", f"/tmp/cores/{NAMESPACE}-{pod}"],
+                check=False,
+            )
         log("--- end cleanup diagnostic dump ---\n")
         if KEEP_NAMESPACE:
             print(f"kept namespace {NAMESPACE}", file=sys.stderr)

@@ -34,8 +34,22 @@ cleanup() {
         printf '\n--- cleanup diagnostic dump (namespace=%s) ---\n' "$namespace" >&2
         kubectl -n "$namespace" get pods,events --sort-by=.lastTimestamp -o wide >&2 || true
         kubectl -n "$namespace" describe pods -l app=gabion-nginx >&2 || true
-        kubectl -n "$namespace" logs --all-containers --tail=200 -l app=gabion-nginx >&2 || true
-        kubectl -n "$namespace" logs --all-containers --tail=200 --previous -l app=gabion-nginx >&2 || true
+        # --tail=1000 because the smoke-with-bt wrapper emits a full gdb
+        # backtrace on a native SIGSEGV that easily exceeds the prior
+        # 200-line tail — and that backtrace is the only signal we have
+        # for a config-phase crash inside the module's static
+        # callbacks.
+        kubectl -n "$namespace" logs --all-containers --tail=1000 -l app=gabion-nginx >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=1000 --previous -l app=gabion-nginx >&2 || true
+        # Best-effort: copy /tmp/cores out of any pod that's still
+        # Running. kubectl cp uses `kubectl exec`, so it can't reach a
+        # pod that has already exited — the in-pod gdb dump in the
+        # logs above is the primary signal; this is for offline
+        # post-mortem when a pod survives long enough.
+        mkdir -p /tmp/cores
+        for pod in $(kubectl -n "$namespace" get pods -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}'); do
+            kubectl -n "$namespace" cp "$pod:/tmp/cores" "/tmp/cores/${namespace}-${pod}" 2>/dev/null || true
+        done
         printf -- '--- end cleanup diagnostic dump ---\n\n' >&2
     fi
     if [ -n "$port_forward_pid" ]; then
