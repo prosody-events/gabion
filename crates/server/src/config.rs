@@ -335,6 +335,75 @@ pub struct RuntimeTuningConfig {
     pub rng_seed: Option<u64>,
 }
 
+/// Deserialize a `u128` from whatever shape the layered config sources
+/// hand us. The `config` crate normalises YAML/env values into its own
+/// `Value` type before serde sees them, and that pipeline never invokes
+/// `Visitor::visit_u128` — YAML integer literals arrive as `i64`/`u64`,
+/// env vars arrive as `String`. The default serde derive only accepts
+/// `visit_u128`, so a bare `cluster_id_hash: 1` in YAML panics at boot
+/// with "u128 is not supported for key 'gossip.cluster_id_hash'".
+///
+/// This visitor accepts:
+///   - YAML integers (`cluster_id_hash: 12345`)
+///   - decimal strings (`cluster_id_hash: "12345"`)
+///   - `0x`-prefixed hex strings (`cluster_id_hash: "0xdeadbeef"`)
+///   - `visit_u128` directly, for completeness.
+///
+/// Used only by [`GossipSettings::cluster_id_hash`].
+mod u128_any {
+    use std::fmt;
+
+    use serde::de::{self, Deserializer, Visitor};
+
+    pub fn deserialize<'de, D>(d: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct U128Any;
+
+        impl<'de> Visitor<'de> for U128Any {
+            type Value = u128;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a non-negative integer, a decimal string, or a `0x`-prefixed hex string",
+                )
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<u128, E> {
+                Ok(u128::from(v))
+            }
+
+            fn visit_u128<E: de::Error>(self, v: u128) -> Result<u128, E> {
+                Ok(v)
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<u128, E> {
+                u128::try_from(v).map_err(|_| {
+                    de::Error::invalid_value(de::Unexpected::Signed(v), &"a non-negative integer")
+                })
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<u128, E> {
+                let trimmed = v.trim();
+                if let Some(hex) = trimmed
+                    .strip_prefix("0x")
+                    .or_else(|| trimmed.strip_prefix("0X"))
+                {
+                    return u128::from_str_radix(hex, 16).map_err(de::Error::custom);
+                }
+                trimmed.parse::<u128>().map_err(de::Error::custom)
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<u128, E> {
+                self.visit_str(&v)
+            }
+        }
+
+        d.deserialize_any(U128Any)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct GossipSettings {
@@ -347,6 +416,7 @@ pub struct GossipSettings {
     pub max_cells_per_tick: usize,
     pub send_queue_capacity: usize,
     pub limit_queue_capacity: usize,
+    #[serde(deserialize_with = "u128_any::deserialize")]
     pub cluster_id_hash: u128,
     /// Per-rule error budget for threshold-triggered anti-entropy, in
     /// basis points of the rule's own limit. See

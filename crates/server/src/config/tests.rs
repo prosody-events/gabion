@@ -332,6 +332,50 @@ fn explicit_bucket_overrides_window() {
 }
 
 #[test]
+fn cluster_id_hash_accepts_integer_decimal_and_hex_strings() {
+    // Regression: serde's default `u128` deserializer only invokes
+    // `visit_u128`, which the `config` crate's pipeline never emits
+    // (YAML integers come in as i64/u64; env vars come in as String).
+    // The `u128_any` deserializer must accept all three shapes so a
+    // YAML `cluster_id_hash: 1` doesn't panic gabiond at boot.
+    let _env = EnvGuard::lock();
+
+    let integer_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: 1\n")
+        .expect("integer cluster_id_hash should deserialize");
+    assert_eq!(integer_cfg.gossip.cluster_id_hash, 1);
+
+    let decimal_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: \"42\"\n")
+        .expect("decimal-string cluster_id_hash should deserialize");
+    assert_eq!(decimal_cfg.gossip.cluster_id_hash, 42);
+
+    let hex_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: \"0xff\"\n")
+        .expect("hex-string cluster_id_hash should deserialize");
+    assert_eq!(hex_cfg.gossip.cluster_id_hash, 0xff);
+
+    // Above-u64 values must round-trip when expressed as a hex string —
+    // YAML's integer scalar can't hold a u128 max anyway, but the env-
+    // and string-shaped paths can.
+    let big_cfg = AppConfig::load_with_yaml_str(
+        "gossip:\n  cluster_id_hash: \"0xffffffffffffffffffffffffffffffff\"\n",
+    )
+    .expect("u128 max hex string should deserialize");
+    assert_eq!(big_cfg.gossip.cluster_id_hash, u128::MAX);
+}
+
+#[test]
+fn cluster_id_hash_from_env_var() {
+    // The env layer always presents the value as a String. The
+    // u128_any deserializer's visit_str branch is what the env path
+    // ultimately exercises; this test pins that behaviour so a
+    // future refactor of the env→Value pipeline can't regress it.
+    let _env = EnvGuard::lock();
+    set_env("GABION_GOSSIP_CLUSTER_ID_HASH", "0xdeadbeef");
+
+    let cfg = AppConfig::load(None).expect("env-only cluster_id_hash should deserialize");
+    assert_eq!(cfg.gossip.cluster_id_hash, 0xdeadbeef);
+}
+
+#[test]
 fn bad_rate_string_is_rejected() {
     let _env = EnvGuard::lock();
     let cfg = AppConfig::load_with_yaml_str(
