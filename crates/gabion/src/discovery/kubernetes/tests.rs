@@ -332,8 +332,14 @@ async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
         .expect("create service");
 
     // EndpointSlice. Manually authored (no Pod selector) because we want
-    // to advertise the two UDP sockets on the host loopback, not the
-    // cluster's pod network.
+    // the watcher's input to be deterministic. The apiserver REJECTS
+    // loopback addresses (`127.0.0.0/8`, `::1/128`) in
+    // `endpoints[].addresses` — that's a built-in EndpointSlice
+    // validation rule, not RBAC. So advertise non-loopback IPs even
+    // though the two gossip sockets are bound on `127.0.0.1`. The
+    // advertised IPs are never dialed: gossip reaches its peers via
+    // `bootstrap_peers` (lines below), and this test only asserts that
+    // the discovery stream emits a `PeerEvent::Added`.
     let slices: kube::Api<ApiEndpointSlice> = kube::Api::namespaced(client.clone(), &namespace);
     let slice = ApiEndpointSlice {
         metadata: ObjectMeta {
@@ -347,7 +353,7 @@ async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
         address_type: "IPv4".to_string(),
         endpoints: vec![
             Endpoint {
-                addresses: vec![addr_a.ip().to_string()],
+                addresses: vec!["10.0.0.1".to_string()],
                 conditions: Some(EndpointConditions {
                     ready: Some(true),
                     ..Default::default()
@@ -355,7 +361,7 @@ async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
                 ..Default::default()
             },
             Endpoint {
-                addresses: vec![addr_b.ip().to_string()],
+                addresses: vec!["10.0.0.2".to_string()],
                 conditions: Some(EndpointConditions {
                     ready: Some(true),
                     ..Default::default()

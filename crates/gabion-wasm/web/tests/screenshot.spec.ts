@@ -628,11 +628,11 @@ test('the node inspector renders every detail section', async ({ page }) => {
   await expect(inspector.locator('.section-head', { hasText: 'Peers' })).toBeVisible();
 
   // §4 — the cadence status word, live tick sparkline, the adaptive-fanout meter
-  // (base → effective → peak), and the surfaced error budget.
+  // (floor → peak with a coverage badge), and the surfaced error budget.
   await expect(inspector.locator('.cadence .status-word')).toBeVisible();
   await expect(inspector.locator('.cadence .spark')).toBeVisible();
   await expect(inspector.locator('.cadence .fanout-now')).toContainText('peers');
-  await expect(inspector.locator('.cadence .fanout-foot')).toContainText('base');
+  await expect(inspector.locator('.cadence .fanout-foot')).toContainText('floor');
   await expect(inspector.locator('.cadence .budget')).toContainText('error budget');
 
   // §6 — three occupancy gauges + the §5 send-queue meter + the §4 fanout meter
