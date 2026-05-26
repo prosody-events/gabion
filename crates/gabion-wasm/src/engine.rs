@@ -24,7 +24,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeId, NodeIdentity, RuleDescriptor};
+use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor};
+use gabion::defaults;
 use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::sim::{LinkPolicy, SimRouter};
 use gabion::gossip::{
@@ -331,39 +332,26 @@ impl EngineState {
     /// [`EngineState::add_node`] route through here, so the rule-intern footgun
     /// guard below is honored identically on every path.
     ///
-    /// Per-node storage is sized from the *initial* `config.nodes`, but every
-    /// capacity floors at a value that holds the whole `MAX_NODES`-bounded
-    /// cluster (node dictionary ≥ 1024, peer table ≥ 256, cells ≥ 4096). So a
-    /// node added to a cluster that started small still has room for every
-    /// peer it will ever learn about — no resize on join.
+    /// Per-node storage is sized by [`SimConfig::cell_store_config`] from the
+    /// cluster size and the watched rule's live buckets — the one sizing site,
+    /// with no production floors (the browser working set is a few hundred
+    /// cells, not the hundreds of thousands a deployment sizes for). The caps
+    /// scale with `config.nodes`, so a newcomer is sized for the same
+    /// `MAX_NODES`-bounded cluster the initial members were — no resize on join.
     fn spawn_node(&mut self, id: u32, bootstrap: &[SocketAddr]) {
         let addr = addr_of_id(id);
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
 
-        let n = self.config.nodes as u32;
-        let cell_capacity = self
+        let store_config = self
             .config
-            .cell_capacity
-            .max((n.saturating_mul(4)).max(4_096));
-        let node_dict_capacity = ((n + 16).max(1_024)).min(u16::MAX as u32) as u16;
-        let peer_capacity = ((n + 16).max(256)).min(u16::MAX as u32) as u16;
-        let local_dirty_capacity = (cell_capacity as usize).max(8_192);
-        let forwarded_dirty_capacity = ((cell_capacity as usize) * 16).max(65_536);
-        let max_cells_per_tick = (self.config.nodes * 4).max(4_096);
-        let max_cells_per_frame = (max_cells_per_tick as u32).max(4_096);
+            .cell_store_config(self.rule_descriptor().live_buckets());
+        // One tick may flush the whole per-node working set, so a burst drains
+        // in a round rather than trickling out over the repair lane.
+        let max_cells_per_tick = store_config.cell_capacity as usize;
+        let max_cells_per_frame = store_config.cell_capacity;
         let tick_interval = Duration::from_millis(self.config.tick_interval_ms);
 
-        let mut store = CellStore::<Count>::new(
-            CellStoreConfig {
-                cell_capacity,
-                rule_dictionary_capacity: 64,
-                node_dictionary_capacity: node_dict_capacity,
-                local_dirty_capacity,
-                forwarded_dirty_capacity,
-                peer_capacity,
-            },
-            identity,
-        );
+        let mut store = CellStore::<Count>::new(store_config, identity);
         // Footgun guard: intern the watched rule with the configured
         // window/bucket *before* any request. Unknown rules otherwise intern
         // with `RuleDescriptor::default()` (60 s / 1 s), making bucket and
@@ -388,11 +376,11 @@ impl EngineState {
             fanout: self.config.fanout,
             max_cells_per_tick,
             wire_limits: FrameLimits {
-                max_payload_bytes: 1_400,
+                max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
                 max_cells: max_cells_per_frame,
             },
-            send_queue_capacity: 128,
-            limit_queue_capacity: 8_192,
+            send_queue_capacity: defaults::GOSSIP_SEND_QUEUE_CAPACITY,
+            limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
             tick_interval,
             auth_key: None,
             rng_seed: self.config.rng_seed.wrapping_add(id as u64),

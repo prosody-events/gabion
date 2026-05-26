@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 
 use super::{Command, LinkPolicyKind, run_engine};
-use crate::config::SimConfig;
+use crate::config::{MAX_NODES, SimConfig};
 use crate::event::{ClusterState, EventBatch, EventKind};
 
 const WATCHED_KEY: u128 = 0x1;
@@ -565,4 +565,186 @@ fn events_serialize_with_hex_identifiers() {
     // Round-trips back to the same u128.
     let back: crate::event::Event = serde_json::from_value(json).unwrap();
     assert_eq!(back, event);
+}
+
+/// The derived per-node sizing (`SimConfig::cell_store_config`) is anchored on
+/// the `MAX_NODES` *growth ceiling*, not the initial cluster size — so every
+/// node, however small the cluster starts, holds the full cross-node replica
+/// working set it could ever grow into (the `CellStore` never resizes, and
+/// `add_node` grows the live set with no rebuild). It must cover that ceiling
+/// without overflow while staying far below the production floors it replaces.
+/// This is a pure check of the sizing math; the runtime path is exercised by
+/// [`moderate_cluster_runtime_honors_the_shrunk_sizing`] and the growth path by
+/// [`grown_cluster_holds_every_origin_without_overflow`]. (A `MAX_NODES`
+/// *functional* run is intentionally not attempted — 256 nodes gossiping at once
+/// saturates the deterministic `SimRouter`'s inbound queues and trips a
+/// debug-only wire backpressure assert unrelated to cell-store sizing.)
+#[test]
+fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
+    // The viz-default window: a 10 s / 1 s rule has 10 live buckets.
+    const LIVE_BUCKETS: u32 = 10;
+
+    // Ceiling-anchored: a 12-node cluster and a `MAX_NODES` cluster get byte-for-
+    // byte identical caps. This is the property that makes live growth safe —
+    // size is a function of the ceiling and the rule, never of `config.nodes`.
+    let small = SimConfig::default().cell_store_config(LIVE_BUCKETS);
+    let full = SimConfig {
+        nodes: MAX_NODES,
+        ..SimConfig::default()
+    }
+    .cell_store_config(LIVE_BUCKETS);
+    assert_eq!(small.cell_capacity, full.cell_capacity);
+    assert_eq!(
+        small.forwarded_dirty_capacity,
+        full.forwarded_dirty_capacity
+    );
+    assert_eq!(
+        small.node_dictionary_capacity,
+        full.node_dictionary_capacity
+    );
+    assert_eq!(small.peer_capacity, full.peer_capacity);
+
+    let caps = full;
+    // Each origin holds its live buckets plus the one emerging, and every node
+    // holds a replica of every origin's set — so the cell store must cover
+    // `MAX_NODES × (live_buckets + 1)`.
+    assert!(
+        caps.cell_capacity as usize >= MAX_NODES * (LIVE_BUCKETS as usize + 1),
+        "cell_capacity {} under the cross-node working set",
+        caps.cell_capacity,
+    );
+    // The forwarded-dirty ring carries replicas of every *other* origin's live
+    // buckets — the cap the design analysis pins.
+    assert!(
+        caps.forwarded_dirty_capacity >= (MAX_NODES - 1) * LIVE_BUCKETS as usize,
+        "forwarded_dirty_capacity {} under the replica working set",
+        caps.forwarded_dirty_capacity,
+    );
+    // The node dictionary must intern every origin (this is the tightest cap —
+    // the slack is only a couple of slots) without truncating to a u16 below it.
+    assert!(
+        usize::from(caps.node_dictionary_capacity) >= MAX_NODES,
+        "node_dictionary_capacity {} cannot hold {MAX_NODES} origins",
+        caps.node_dictionary_capacity,
+    );
+    assert!(usize::from(caps.peer_capacity) >= MAX_NODES);
+
+    // …and the shrink is real: even at the ceiling every cap is a few thousand
+    // entries, well under the production floors (`gabion::defaults::STORAGE_*`)
+    // it replaces — `STORAGE_FORWARDED_DIRTY_CAPACITY` alone is 524 288.
+    assert!(
+        caps.forwarded_dirty_capacity < gabion::defaults::STORAGE_FORWARDED_DIRTY_CAPACITY / 50
+    );
+    assert!((caps.cell_capacity as usize) < gabion::defaults::STORAGE_MAX_CELLS / 20);
+    assert!(caps.local_dirty_capacity < gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY / 1_000);
+}
+
+/// The live runtime honors the shrunk, derived sizing: a cluster the size of the
+/// heaviest existing test (N=32) takes the watched key spread across nodes and
+/// buckets, gossips to convergence, and reports the *derived* (small) store
+/// capacity with not a single eviction on any node.
+#[test]
+fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
+    const NODES: usize = 32;
+    let config = SimConfig {
+        tick_interval_ms: 500,
+        rule_window_ms: 10_000,
+        rule_bucket_ms: 1_000,
+        ..test_config(NODES)
+    };
+    let caps = config.cell_store_config(10);
+
+    with_engine(config, |tx| async move {
+        // Eight origins across two buckets: enough cross-node replication to
+        // populate every node's store, while light enough not to saturate the
+        // sim transport.
+        for node in [0u32, 8, 16, 24] {
+            submit(&tx, node, WATCHED_KEY, 5).await;
+        }
+        step(&tx, 1_000).await;
+        for node in [4u32, 12, 20, 28] {
+            submit(&tx, node, WATCHED_KEY, 5).await;
+        }
+        // 16 rounds — ample for an 8-origin set to converge across 32 nodes —
+        // while staying inside the 10 s window so the first batch (epoch 0) does
+        // not age out (1 000 + 16 × 500 = 9 000 ms, the window holds epoch 0).
+        for _ in 0..16 {
+            step(&tx, 500).await;
+        }
+
+        let state = snapshot(&tx).await;
+        assert_eq!(state.nodes.len(), NODES);
+        for node in &state.nodes {
+            let s = &node.store_stats;
+            assert_eq!(
+                s.cell_store_full_rejects, 0,
+                "node {} evicted cells (cell_capacity {})",
+                node.id, s.cell_capacity,
+            );
+            assert_eq!(s.rule_dictionary_full_rejects, 0, "node {}", node.id);
+            assert_eq!(s.node_dictionary_full_rejects, 0, "node {}", node.id);
+            // The runtime was built with the derived (small) capacity, not a
+            // production floor — proof the shrink is in effect end-to-end.
+            assert_eq!(s.cell_capacity, caps.cell_capacity);
+        }
+        // The 40 hits (8 origins × 5) propagate to every node within the window.
+        assert_eq!(state.oracle_total, 40);
+        assert!(
+            state.nodes.iter().all(|n| n.aggregate_total == 40),
+            "every node converges on 40: {:?}",
+            state
+                .nodes
+                .iter()
+                .map(|n| (n.id, n.aggregate_total))
+                .collect::<Vec<_>>(),
+        );
+    });
+}
+
+/// Live growth must not overflow the derived caps: a cluster built small and
+/// then grown by `add_node` (the visualizer's join, with no rebuild — see the
+/// `live-node-membership-requirement`) interns *every* origin into a node
+/// dictionary and cell store sized for the `MAX_NODES` ceiling, not the initial
+/// `config.nodes`. Sizing from `config.nodes` regressed exactly here — growing
+/// 12 → 24 overflowed the 14-slot dictionary; this locks the ceiling sizing.
+#[test]
+fn grown_cluster_holds_every_origin_without_overflow() {
+    let config = SimConfig {
+        tick_interval_ms: 500,
+        rule_window_ms: 10_000,
+        rule_bucket_ms: 1_000,
+        ..test_config(12)
+    };
+    with_engine(config, |tx| async move {
+        // Grow 12 → 24 by live joins (well past `config.nodes + slack`, the point
+        // the old per-cluster sizing overflowed).
+        for _ in 0..12 {
+            add_node(&tx).await;
+        }
+        let grown = snapshot(&tx).await;
+        assert_eq!(grown.nodes.len(), 24, "twelve joins grow the cluster to 24");
+
+        // Every node originates, so all 24 origins must intern on every peer.
+        for id in grown.nodes.iter().map(|n| n.id).collect::<Vec<_>>() {
+            submit(&tx, id, WATCHED_KEY, 1).await;
+        }
+        for _ in 0..16 {
+            step(&tx, 500).await;
+        }
+
+        let state = snapshot(&tx).await;
+        for node in &state.nodes {
+            let s = &node.store_stats;
+            assert_eq!(
+                s.node_dictionary_full_rejects, 0,
+                "node {} overflowed its node dictionary after growth ({} of {} origins)",
+                node.id, s.node_slots_used, s.node_slots_capacity,
+            );
+            assert_eq!(
+                s.cell_store_full_rejects, 0,
+                "node {} evicted cells after growth (cell_capacity {})",
+                node.id, s.cell_capacity,
+            );
+        }
+    });
 }

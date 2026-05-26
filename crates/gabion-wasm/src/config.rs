@@ -4,6 +4,7 @@
 //! bucket)` rule the user drives with requests for arbitrary keys. A
 //! multi-rule mix is a future extension (it becomes a `Vec` here).
 
+use gabion::crdt::CellStoreConfig;
 use gabion::defaults;
 use serde::{Deserialize, Serialize};
 
@@ -47,8 +48,6 @@ pub struct SimConfig {
     /// i.i.d. per-link packet drop probability applied to every directed
     /// link at startup. `0.0` is a lossless network.
     pub uniform_loss: f64,
-    /// Per-node CRDT cell capacity. Floored to fit one cell per origin.
-    pub cell_capacity: u32,
 }
 
 impl Default for SimConfig {
@@ -72,7 +71,6 @@ impl Default for SimConfig {
             rule_bucket_ms: 1_000,
             rng_seed: 0,
             uniform_loss: 0.0,
-            cell_capacity: 4_096,
         }
     }
 }
@@ -124,5 +122,57 @@ impl SimConfig {
             });
         }
         Ok(())
+    }
+
+    /// Per-node CRDT capacities for the browser sim, derived from the watched
+    /// rule's live-bucket count and the cluster's *growth ceiling*. The single
+    /// sizing site: every node ([`crate::engine`]'s initial build and `add_node`
+    /// both route through `spawn_node`, which calls this).
+    ///
+    /// The node-count term is [`MAX_NODES`], **not** `self.nodes`. A
+    /// [`gabion::crdt::CellStore`] allocates once and never resizes, and the
+    /// visualizer grows the live cluster by live joins up to `MAX_NODES` with no
+    /// rebuild (the `live-node-membership-requirement`). Sizing from `self.nodes`
+    /// would overflow the node dictionary, peer table, and cell store the moment
+    /// a user joined past `config.nodes`, so every cluster is sized for the
+    /// ceiling it can grow to — the same guarantee the old per-`spawn_node`
+    /// floors gave, now in one expression.
+    ///
+    /// Unlike the adapters' production configs
+    /// ([`gabion::defaults::STORAGE_*`] via `server::config::cell_store_config`
+    /// and `nginx::leader::production_cell_store_config`), these carry **no
+    /// production floors**: the visualizer watches one rule for a handful of
+    /// keys, so even at the ceiling the working set is the cross-node replica set
+    /// — `MAX_NODES × live_buckets` cells — a few thousand entries, not the
+    /// hundreds of thousands a real deployment sizes for. A small constant
+    /// `SLACK` keeps the largest cluster clear of eviction; if a probe ever
+    /// overflows a ring, raise `SLACK` here — the one place — not a scattered
+    /// floor.
+    pub fn cell_store_config(&self, live_buckets: u32) -> CellStoreConfig {
+        // Headroom over the exact working set, absorbing churn and the bucket
+        // just emerging under "now". One knob for the whole sizing.
+        const SLACK: u32 = 2;
+        // The ceiling the cluster can grow to (see the doc note) — not
+        // `self.nodes`, which is only the *initial* member count.
+        let ceiling = MAX_NODES as u32;
+        // Each origin contributes its `live_buckets` cells plus the one
+        // emerging. A node holds a replica of every origin's set, so the cell
+        // store and forwarded-dirty ring both scale with `ceiling × per_origin`.
+        let per_origin = live_buckets + 1;
+        let cross_node = ceiling
+            .saturating_mul(per_origin)
+            .saturating_mul(SLACK)
+            .max(SLACK);
+        CellStoreConfig {
+            cell_capacity: cross_node,
+            // One watched rule; headroom for an interned default / wire-only rule.
+            rule_dictionary_capacity: 4,
+            node_dictionary_capacity: (ceiling + SLACK).min(u16::MAX as u32) as u16,
+            // Local-origin dirty cells are this node's *own* live buckets —
+            // independent of cluster size, so this stays small at any ceiling.
+            local_dirty_capacity: (per_origin * SLACK) as usize,
+            forwarded_dirty_capacity: cross_node as usize,
+            peer_capacity: (ceiling + SLACK).min(u16::MAX as u32) as u16,
+        }
     }
 }

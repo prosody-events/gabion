@@ -36,7 +36,6 @@ export interface SimConfig {
   rule_bucket_ms: number;
   rng_seed: number;
   uniform_loss: number;
-  cell_capacity: number;
 }
 
 /** Mirror of `crate::engine::LinkPolicyKind` (serde-tagged by `kind`). */
