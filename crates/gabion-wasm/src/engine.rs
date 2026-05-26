@@ -51,6 +51,51 @@ const CLUSTER_ID_HASH: u128 = 0xC1;
 /// the aggregate (see `RuleDescriptor::applies_locally`).
 const LOCAL_RULE_ID: u32 = 0;
 
+/// The visualizer's per-node gossip buffer sizing. **Not** the library
+/// production defaults (`GOSSIP_SEND_QUEUE_CAPACITY` = 128, tuned for a
+/// deployment whose per-tick output is small): the visualizer drives a far
+/// denser regime — up to `MAX_NODES` runtimes on one thread under a 100-node
+/// sustained-overload peak — so it sizes its own pool to that regime.
+///
+/// The invariant that fixes the high-node gossip freeze: **the send pool must
+/// hold one tick's worst-case packet output, with headroom for any cross-tick
+/// backlog.** Send-pool slots recycle only on the runtime's separate `Writable`
+/// select arm, never within `handle_gossip_tick`, so all `pick_count` peers'
+/// frames for one tick must fit in the free slots at once. If a frame can't
+/// finish, [`gabion::wire::Packets::next_into`] runs out of slots mid-frame and
+/// the iterator's drain contract trips its `debug_assert` (an `unreachable`
+/// freeze in dev wasm; a silent re-send next tick in release, since the dirty
+/// rings are persistent — no data loss, just slower flush).
+///
+/// **The pool ceiling is 255, not a free choice.** The runtime addresses
+/// send-pool slots with a `u8` (`send_pending: VecDeque<(SocketAddr, u8)>`) and
+/// builds the free list as `(0..send_pool_size as u8)`, so any capacity ≥ 256
+/// wraps to an *empty* free list and silently kills all gossip. So the pool is
+/// pinned at the largest addressable value, and the per-tick frame is capped so
+/// one tick stays well inside it:
+///
+/// One tick emits at most `pick_count × packets_per_frame` packets, where
+/// `pick_count ≤ log2(forwarded_dirty_capacity) + 1 ≈ 13` (adaptive fanout is
+/// capped at the dirty-set bit length, itself bounded by the cell store) and
+/// `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK / cells_per_packet)`, with
+/// `cells_per_packet ≈ 21` at a 1400-byte payload in the worst case (every cell
+/// a distinct origin, so the node dictionary costs 16 B/cell on top of the 46 B
+/// row) — so `ceil(160 / 21) = 8`. The worst case is therefore ≈ `13 × 8 = 104`
+/// packets/tick, which the 255-slot pool clears ~2.4×, leaving the rest of the
+/// pool for packets still draining from the previous tick. A native 100-node
+/// Sustained-overload run (40 s of virtual time, debug build with the drain
+/// `debug_assert` live) measured an actual `max_send_pending_depth` peak of
+/// **94** — no trap, ~2.7× under the pool.
+///
+/// Capping the per-tick frame is what keeps one tick inside the fixed pool. The
+/// cap is inert at the default 12-node scenarios — their cross-node working set
+/// (≈ 132 cells) never reaches 160 — so it changes nothing user-visible there;
+/// a large cluster's burst simply flushes over a few ticks instead of one (the
+/// dirty rings are persistent, so the residual rides the next tick rather than
+/// dropping). Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
+const VIZ_MAX_CELLS_PER_TICK: usize = 160;
+const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
+
 /// The count width every node uses. `u32` matches the bench and is plenty for
 /// the visualizer's hit volumes.
 type Count = u32;
@@ -274,7 +319,12 @@ impl EngineState {
         let initial_nodes = config.nodes;
         let mut state = Self {
             config,
-            router: SimRouter::with_channel_capacity(256),
+            // The inbound channel is kept in lockstep with the send pool: if a
+            // receiver's queue fills, `try_send_to` returns `WouldBlock`, the
+            // sender re-queues the packet, and the slot never frees between
+            // ticks — a second backpressure source that would re-create the
+            // freeze. Sized ≥ the send pool so it is never the bottleneck.
+            router: SimRouter::with_channel_capacity(VIZ_SEND_QUEUE_CAPACITY),
             nodes: Vec::with_capacity(initial_nodes),
             addresses,
             node_id_index: HashMap::with_capacity(initial_nodes),
@@ -345,9 +395,12 @@ impl EngineState {
         let store_config = self
             .config
             .cell_store_config(self.rule_descriptor().live_buckets());
-        // One tick may flush the whole per-node working set, so a burst drains
-        // in a round rather than trickling out over the repair lane.
-        let max_cells_per_tick = store_config.cell_capacity as usize;
+        // The per-tick frame is capped (see `VIZ_MAX_CELLS_PER_TICK`) so one
+        // tick's packet output stays inside the send pool. A small cluster's
+        // working set is below the cap, so it still flushes in a single round;
+        // a large cluster's burst flushes over a few ticks (the dirty rings are
+        // persistent, so the residual rides the next tick rather than dropping).
+        let max_cells_per_tick = VIZ_MAX_CELLS_PER_TICK.min(store_config.cell_capacity as usize);
         let max_cells_per_frame = store_config.cell_capacity;
         let tick_interval = Duration::from_millis(self.config.tick_interval_ms);
 
@@ -379,7 +432,7 @@ impl EngineState {
                 max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
                 max_cells: max_cells_per_frame,
             },
-            send_queue_capacity: defaults::GOSSIP_SEND_QUEUE_CAPACITY,
+            send_queue_capacity: VIZ_SEND_QUEUE_CAPACITY,
             limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
             tick_interval,
             auth_key: None,
