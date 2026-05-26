@@ -97,9 +97,10 @@ Two adaptive aspects of the gossip protocol are worth naming together,
 because operators who only learn one half tend to misjudge how the
 cluster behaves under load:
 
-- **Adaptive fanout** — the per-tick peer count grows with the size
-  of the dirty set, so that a burst converges in O(log N) rounds
-  without paying a wide-fanout cost on quiet ticks.
+- **Coverage fanout** — the per-tick peer count is sized to the
+  coverage threshold `⌈ln(n)+c⌉` (`n` = peer count), the fanout that
+  reliably reaches every node. It scales with cluster size, not the
+  dirty set; a burst rides one fat frame instead of widening the pick.
 - **Adaptive emit rate** — the gossip cadence itself adapts to
   per-rule pressure. A hot rule can fire a synthetic tick between
   heartbeats so that each rule's contribution to cluster-wide

@@ -409,10 +409,10 @@ Gabion's gossip protocol has **two adaptive aspects** that distinguish
 it from a textbook anti-entropy loop. Both are operator-tunable; the
 defaults are sized for production loads.
 
-- **Adaptive fanout** — per-tick peer count grows with the size of
-  the dirty set. Quiet ticks pick `gabion_gossip_fanout` peers;
-  bursty ticks pick up to `log₂(dirty_count)`, capped at the
-  peer-set size. The directive sets the **floor**.
+- **Coverage fanout** — per-tick peer count is sized to the coverage
+  threshold `⌈ln(peers)+c⌉`, the fanout that reliably reaches every
+  node, capped at the peer-set size. It scales with cluster size, not
+  the dirty set. `gabion_gossip_fanout` sets the **floor**.
 - **Adaptive emit rate** — the gossip cadence adapts to per-rule
   pressure. Heartbeats fire every `gabion_gossip_tick_interval`;
   between heartbeats, the runtime fires a synthetic "threshold" tick
@@ -430,7 +430,7 @@ adapters; the canonical knob table lives in
 
 | Directive                                   | Default | Adapts                                                       |
 |---------------------------------------------|---------|--------------------------------------------------------------|
-| `gabion_gossip_fanout N`                    | `3`     | **Adaptive fanout** — floor on peers selected per tick.      |
+| `gabion_gossip_fanout N`                    | `3`     | **Coverage fanout** — floor on peers selected per tick; the runtime scales the pick to `⌈ln(peers)+c⌉`. |
 | `gabion_gossip_target_err_bps N`            | `100`   | **Adaptive emit rate** — per-rule unreplicated-error budget in basis points of the rule's limit (`100` = 1%). Lower = tighter accuracy, more emissions. |
 | `gabion_gossip_min_emit_interval DURATION`  | `5ms`   | **Adaptive emit rate** — floor between threshold-fire emissions. Raise when the gossip channel itself is the bottleneck. |
 

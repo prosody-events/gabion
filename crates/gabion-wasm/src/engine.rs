@@ -75,17 +75,21 @@ const LOCAL_RULE_ID: u32 = 0;
 /// one tick stays well inside it:
 ///
 /// One tick emits at most `pick_count × packets_per_frame` packets, where
-/// `pick_count ≤ log2(forwarded_dirty_capacity) + 1 ≈ 13` (adaptive fanout is
-/// capped at the dirty-set bit length, itself bounded by the cell store) and
-/// `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK / cells_per_packet)`, with
-/// `cells_per_packet ≈ 21` at a 1400-byte payload in the worst case (every cell
-/// a distinct origin, so the node dictionary costs 16 B/cell on top of the 46 B
-/// row) — so `ceil(160 / 21) = 8`. The worst case is therefore ≈ `13 × 8 = 104`
-/// packets/tick, which the 255-slot pool clears ~2.4×, leaving the rest of the
-/// pool for packets still draining from the previous tick. A native 100-node
-/// Sustained-overload run (40 s of virtual time, debug build with the drain
-/// `debug_assert` live) measured an actual `max_send_pending_depth` peak of
-/// **94** — no trap, ~2.7× under the pool.
+/// `pick_count = ⌈ln(peers)+c⌉` (the coverage fanout, `c` =
+/// `GOSSIP_COVERAGE_MARGIN` = 4), capped at the peer count. The widest cluster
+/// the visualizer builds is `MAX_NODES` = 256, so `peers ≤ 255` and
+/// `pick_count ≤ ⌈ln(255)+4⌉ = 10`; at the 100-node overload point it is
+/// `⌈ln(99)+4⌉ = 9`. `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK /
+/// cells_per_packet)`, with `cells_per_packet ≈ 21` at a 1400-byte payload in
+/// the worst case (every cell a distinct origin, so the node dictionary costs
+/// 16 B/cell on top of the 46 B row) — so `ceil(160 / 21) = 8`. The worst case
+/// at 100 nodes is therefore ≈ `9 × 8 = 72` packets/tick, which the 255-slot
+/// pool clears ~3.5×, leaving the rest of the pool for packets still draining
+/// from the previous tick. A native 100-node Sustained-overload run (40 s of
+/// virtual time, debug build with the drain `debug_assert` live) measured an
+/// actual `max_send_pending_depth` peak of **72** — no trap, ~3.5× under the
+/// pool. (The coverage fanout is stable for a cluster size, so this peak does
+/// not climb with burst volume the way the old dirty-set widening did.)
 ///
 /// Capping the per-tick frame is what keeps one tick inside the fixed pool. The
 /// cap is inert at the default 12-node scenarios — their cross-node working set

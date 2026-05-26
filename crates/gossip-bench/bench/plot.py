@@ -265,7 +265,7 @@ def suite_coverage_fanout() -> list[dict]:
 
     `DistinctKeyBurst` makes each write land in its own CellStore slot so
     `local_dirty.len()` actually jumps to `cells`; the fanout staying put
-    is the direct refutation of an `O(N/fanout)` volume premise.
+    shows the per-tick pick does not grow with burst volume.
     """
     out = []
     for n_nodes in [16, 64, 256]:

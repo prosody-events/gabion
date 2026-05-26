@@ -27,8 +27,8 @@
      *  is racing toward. */
     oracleTotal: number;
     ruleLimit: number;
-    /** The configured base fanout knob — the floor the adaptive fanout grows
-     *  above under load. */
+    /** The configured base fanout knob — the floor the coverage fanout
+     *  (`⌈ln(peers)+c⌉`) sits above. */
     baseFanout: number;
     burstHits: number;
     /** The per-snapshot counter (drives GossipCadence's tick ring buffer). */
@@ -133,7 +133,7 @@
     </section>
   {/if}
 
-  <!-- §4 Gossip cadence & adaptive fanout. -->
+  <!-- §4 Gossip cadence & coverage fanout. -->
   <section class="section">
     <h3 class="section-head">Gossip cadence &amp; fanout</h3>
     <GossipCadence {node} {version} {baseFanout} />

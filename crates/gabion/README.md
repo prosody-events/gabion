@@ -20,7 +20,7 @@ the [repo root README](../../README.md#glossary).
 - [How gossip works](#how-gossip-works)
   - [The wire frame](#the-wire-frame)
   - [The anti-entropy loop](#the-anti-entropy-loop)
-  - [Adaptive fanout](#adaptive-fanout)
+  - [Coverage fanout](#coverage-fanout)
   - [Adaptive emit rate](#adaptive-emit-rate)
   - [Dirty rings and the peer frontier](#dirty-rings-and-the-peer-frontier)
 - [Operator knobs](#operator-knobs)
@@ -61,11 +61,11 @@ later runtime tick turns those rows into outbound frames.
 The protocol has two adaptive aspects, and they are the reason gabion
 holds up under load that a textbook anti-entropy loop would not:
 
-1. **Adaptive fanout** — the per-tick peer count grows with the size of
-   the dirty set. Quiet ticks pick the static `fanout` floor; bursty
-   ticks pick up to `log₂(dirty)` peers, capped at the peer-set size.
-   Convergence stays O(log N) regardless of burst size, without paying
-   wide-fanout bandwidth on quiet ticks.
+1. **Coverage fanout** — the per-tick peer count is sized to the
+   *coverage threshold* `⌈ln(n)+c⌉` (`n` = peer count), the fanout that
+   provably reaches every node. It scales with cluster size, not the
+   dirty set: a burst rides one fat frame instead of widening the pick.
+   `fanout` is the floor; small clusters go full-mesh.
 2. **Adaptive emit rate** — the gossip cadence adapts to per-rule
    pressure. Heartbeats fire every `tick_interval` unconditionally, but
    the runtime also fires a synthetic *threshold* tick between
@@ -200,47 +200,68 @@ sequenceDiagram
 into a peer-frontier ring so the next outbound frame can prune anything
 that peer has already acknowledged.
 
-### Adaptive fanout
+### Coverage fanout
 
-Suppose a burst lands and the dirty set jumps from one cell to a
-thousand. With fixed fanout `f`, propagation now takes O(dirty / f)
-rounds, which for a 1024-cell burst at f=1 means a thousand rounds
-before everyone converges. Karp et al. (2000) prove an
-O(log_{1+f} N) lower bound for pure-push protocols, but a fixed `f`
-chosen for the quiet case cannot get near that bound when the dirty set
-explodes.
+Three separate concerns pull on the gossip plane, and it is tempting to
+fold them all into the fanout knob. They are governed by three different
+variables, and gabion keeps them apart:
 
-Gabion grows the per-tick peer count with the size of the dirty set.
+| Concern | Governed by | Mechanism |
+|---|---|---|
+| **Coverage** — reach every node reliably | cluster size `n` | **fanout** = `⌈ln(n)+c⌉` |
+| **Volume** — a big burst of dirty cells | dirty-set size | frame fill: `max_cells_per_tick` + packet-splitting |
+| **Urgency** — a fresh delta matters *now* | per-rule error budget | threshold-fire emissions (`target_err_bps`) |
+
+Only the first is a fanout question. Kermarrec, Massoulié & Ganesh (IEEE
+TPDS 2003, *Probabilistic Reliable Dissemination in Large-Scale
+Systems*, Theorem 1) prove that a directed gossip round with mean fanout
+`ln(n)+c` reaches **every** node with probability → `e^(−e^(−c))`:
+*"there is a sharp threshold in the required fanout at log n."* The
+fanout needs to grow by only 1 each time `n` rises by a factor of e, and
+a single round *"can easily be modified … to send several notifications
+per gossip message"* — which is exactly what gabion does: the whole
+dirty set rides one fat frame, so burst **volume** never widens the peer
+pick — many cells share one packet, so a burst does not translate into
+proportionally more rounds.
+
 The pick lives in `GossipRuntime::handle_gossip_tick`:
 
 ```rust
-let dirty = local_dirty.len() + forwarded_dirty.len();
-let log_dirty = bit_length(dirty);          // ≈ floor(log₂ dirty) + 1
-let pick_count = max(config.fanout, log_dirty).min(peer_count);
+let n = peers.len();
+let coverage = (n as f64).ln() + GOSSIP_COVERAGE_MARGIN;   // c = 4.0
+let pick_count = config.fanout.max(coverage.ceil() as usize).min(n);
 ```
 
 A partial Fisher-Yates shuffle then picks `pick_count` distinct peers
 from `self.peers`. The peers must be distinct rather than sampled with
-replacement, because sampling the same peer twice in one tick would
-burn a send-pool slot encoding the same frame twice. Some example pick
-counts at `fanout = 3` (the default):
+replacement, because sampling the same peer twice in one tick would burn
+a send-pool slot encoding the same frame twice. `config.fanout` is a
+hard floor; `.min(n)` makes small clusters full-mesh (coverage demands
+it there and the bandwidth is trivial). Some example pick counts at
+`fanout = 3`, `c = 4`:
 
-| `dirty`   | `log_dirty` | `pick_count`               |
+| peers `n` | `⌈ln(n)+c⌉` | `pick_count`               |
 |-----------|-------------|----------------------------|
-| 0         | 0           | 3 (floor; capped at peers) |
-| 1         | 1           | 3 (floor)                  |
-| 32        | 6           | 6                          |
-| 64        | 7           | 7                          |
-| 256       | 9           | 9                          |
-| 1024      | 11          | 11                         |
-| 1 048 576 | 21          | 21 (capped at peers)       |
+| 1         | 4           | 1 (capped at peers)        |
+| 4         | 6           | 4 (capped at peers)        |
+| 15        | 7           | 7                          |
+| 31        | 8           | 8                          |
+| 63        | 9           | 9                          |
+| 255       | 10          | 10                         |
+| 9 999     | 14          | 14                         |
 
-Quiet ticks pay nothing because the floor stays at `fanout`, while the
-wide-fanout cost only lands on the ticks that need it and falls off
-again as the dirty ring drains. Verma & Ooi (ICDCS 2005) prove that
-adaptive widening gives O(log N) burst convergence at the cost of one
-extra tick of latency in the worst case, and the `adaptive_fanout`
-bench [below](#what-we-measured) shows that empirically.
+Fanout trades **bandwidth** (linear in the pick: the cluster ships
+`n·pick·frame` per tick) against **coverage-failure probability**
+(`≈ e^(−e^(−c))` per round) and **latency** (`≈ log_{1+pick} n` rounds,
+with diminishing return above the threshold). `⌈ln(n)+c⌉` is the
+provably-minimal fanout for reliable coverage, so that is the operating
+point; `c = 4` is a per-round 98.2%, and because anti-entropy runs
+continuously, any node missed in one round is caught by the next and
+end-to-end reliability compounds far past that. The bandwidth floor on
+quiet ticks is unchanged from a fixed fanout — the pick is stable for a
+given cluster size, not pulsing with load. The `coverage_fanout` bench
+[below](#what-we-measured) shows the pick tracking `⌈ln(n)+c⌉` and
+staying flat as burst volume changes.
 
 ### Adaptive emit rate
 
@@ -339,12 +360,12 @@ keep convergence well under a second at typical cluster sizes
 (≤ 256). The table below is for the days when you do need to tune, and
 it splits into the two adaptive halves of the protocol.
 
-### Heartbeat cadence and fanout (adaptive fanout)
+### Heartbeat cadence and fanout (coverage fanout)
 
 | Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
-| `fanout`             | 3           | Static fanout floor. The runtime widens to `max(fanout, log₂ dirty)` automatically.                                                    | Lower for very small clusters (1–4) to cut bandwidth; rarely raise — adaptive widening already handles bursts. |
+| `fanout`             | 3           | Fanout floor. The runtime scales the actual pick to the coverage threshold `⌈ln(n)+c⌉` (`c` = `GOSSIP_COVERAGE_MARGIN`, 4), capped at the peer count. | Rarely tune — the floor binds only if you lower `GOSSIP_COVERAGE_MARGIN`. To trade bandwidth for coverage, change the margin, not this floor. |
 | `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame_for_peer` will emit in one tick. Cells over the cap roll forward to the next tick via the repair lane. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
 | `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 
@@ -374,7 +395,7 @@ running the bench.
 The suites split into four bundles. Steady-state convergence and scale
 together show that the protocol meets its asymptotic bounds, while the
 resilience suite shows that it survives the failure modes operators
-see in practice. The adaptive machinery suites — `adaptive_fanout`,
+see in practice. The adaptive machinery suites — `coverage_fanout`,
 `error_budget`, `min_emit_clamp`, and `heartbeat_threshold_mix` — are
 the empirical evidence for the two adaptive aspects of the protocol.
 
@@ -446,30 +467,29 @@ drains in one round under steady state.
 ### Adaptive machinery
 
 These four suites are the empirical evidence for the two adaptive
-aspects of the protocol. `adaptive_fanout` exercises adaptive fanout;
+aspects of the protocol. `coverage_fanout` exercises coverage fanout;
 `error_budget` and `min_emit_clamp` exercise adaptive emit rate; and
 `heartbeat_threshold_mix` confirms the cold-rule heartbeat is
 independent of the threshold path.
 
-![adaptive_fanout](figures/adaptive_fanout.svg)
+![coverage_fanout](figures/coverage_fanout.svg)
 
-**Method.** Issue a `DistinctKeyBurst` of size `dirty ∈ {1, 4, 16, 64,
-256, 1024}` at one node — every write lands in its own cell store slot,
-so `local_dirty.len()` jumps to `dirty` in one step. Static
-`fanout = 1`; N ∈ {32, 128}. Each scenario reports rounds-to-converge
-and the observed effective fanout (packets emitted ÷ dirty-tick count).
+**Method.** Sweep two axes against a `DistinctKeyBurst` (each write
+lands in its own cell store slot, so `local_dirty.len()` jumps to the
+burst size in one step). Across cluster size `n ∈ {16, 64, 256}` at a
+fixed burst, read the per-tick `peak_effective_fanout`. Across burst
+size `cells ∈ {16, 256, 1024}` at a fixed `n`, read the effective fanout
+(packets ÷ dirty-tick count). Static `fanout = 1` (the floor, which the
+coverage threshold overrides).
 
-**Takeaway.** With static `fanout = 1` and no adaptive widening, a
-1024-cell burst would take roughly `dirty / 1 = 1024` rounds. In
-practice it converges in 3–4. The right panel shows why: each node's
-per-tick `pick_count` widens from `1` at `dirty = 1` to roughly
-`log₂(1024) ≈ 11` at `dirty = 1024`, and the aggregate
-*packets-per-dirty-tick* climbs to ~126 — about an order of magnitude
-greater than the cluster's nominal floor — because every node is doing
-the same widening simultaneously. Once the burst drains, both numbers
-fall back to the static fanout. The single-cell case (left edge) is
-the only point where rounds tail upward, because there is nothing for
-`log₂(dirty)` to widen.
+**Takeaway.** The left panel: the observed peak fanout tracks
+`⌈ln(n−1)+c⌉` — 7 at `n=16`, 9 at `n=64`, 10 at `n=256` — sitting right
+on the predicted threshold and rising by ~1 per factor-of-e of cluster
+growth, exactly the KMG law. The right panel: at fixed `n` the per-tick
+fanout is **flat** across a 64× change in burst volume, because the
+burst rides one fat frame rather than widening the peer pick — volume is
+a frame-fill concern, not a fanout one. (Volume that overflows the dirty
+ring is repaired by the rotating repair lane, not by fanning out wider.)
 
 ![error_budget](figures/error_budget.svg)
 
@@ -525,7 +545,7 @@ threshold are independent code paths.
 In-tree primary sources:
 
 - `src/gossip/runtime.rs` — the event loop. `GossipRuntime::run` is the
-  outer `select!`; `handle_gossip_tick` carries the adaptive-fanout
+  outer `select!`; `handle_gossip_tick` carries the coverage-fanout
   pick; `handle_limit_request` carries the per-site safe zone and the
   threshold-fire flag.
 - `src/wire.rs` and `src/wire/` — packet shape, encoders, HMAC

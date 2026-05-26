@@ -23,11 +23,11 @@ python3 crates/gossip-bench/bench/plot.py all
 python3 crates/gossip-bench/bench/plot.py all --publish
 
 # Just one suite.
-python3 crates/gossip-bench/bench/plot.py adaptive_fanout
+python3 crates/gossip-bench/bench/plot.py coverage_fanout
 ```
 
 Suite names: `convergence`, `fanout_sweep`, `loss`, `partition`,
-`staleness`, `scale_n`, `adaptive_fanout`, `error_budget`,
+`staleness`, `scale_n`, `coverage_fanout`, `error_budget`,
 `min_emit_clamp`, `heartbeat_threshold_mix`.
 
 On the first invocation the harness builds `target/release/gossip-bench`
@@ -52,14 +52,14 @@ done | cargo run -p gossip-bench --release -- batch > matrix.jsonl
 
 The built-in example kinds available through `--kind` are `convergence`,
 `loss`, `partition`, `sustained`, `scale_n`, `fanout_sweep`,
-`adaptive_fanout`, `error_budget`, `min_emit_clamp`, and
+`coverage_fanout`, `error_budget`, `min_emit_clamp`, and
 `heartbeat_threshold_mix`.
 
 ## What each suite measures
 
 The suites fall into two groups. Three of them are the empirical
-evidence for gabion's two adaptive mechanisms: `adaptive_fanout`
-exercises the runtime's *adaptive fanout*, while `error_budget` and
+evidence for gabion's two adaptive mechanisms: `coverage_fanout`
+exercises the runtime's *coverage fanout*, while `error_budget` and
 `min_emit_clamp` together exercise its *adaptive emit rate*. The
 remaining suites are classical anti-entropy measurements borrowed from
 the literature surveyed in [`REFERENCES.md`](REFERENCES.md), and serve
@@ -74,7 +74,7 @@ predicts before we layer the adaptive machinery on top.
 | `partition` | SWIM '02 | Time to re-converge after a network partition is healed. |
 | `staleness` | Astrolabe '03 | Per-hit p50/p95 lag under sustained writes from k sources. |
 | `scale_n` | Karp 2000, Astrolabe '03 | log-N curve: rounds-to-converge as cluster size grows. |
-| `adaptive_fanout` | Verma & Ooi '05 | Evidence for **adaptive fanout**: at static `fanout=1`, rounds stay nearly flat as the dirty set grows because the runtime widens the per-tick fanout by `log₂(dirty_count)`. |
+| `coverage_fanout` | Kermarrec/Massoulié/Ganesh '03 | Evidence for **coverage fanout**: the per-tick `peak_effective_fanout` tracks the threshold `⌈ln(n)+c⌉` as the cluster grows, and stays flat as the dirty set grows (the burst rides one fat frame, so volume does not widen the pick). |
 | `error_budget` | Sharfman/Schuster/Keren '06, Olston/Jiang/Widom '03 | Evidence for **adaptive emit rate**: bandwidth and max-lag as a function of `target_err_bps`; verifies the `N × ε_R` cluster-wide bound. |
 | `min_emit_clamp` | gabion-specific | Evidence for **adaptive emit rate** (the floor): adversarial saturating write rate; sweeps `min_emit_interval`. Confirms the floor caps worst-case emit rate while the cluster still converges. |
 | `heartbeat_threshold_mix` | gabion-specific | A hot rule (saturating ε every tick) and a cold rule (slow trickle) replicate concurrently; both must converge. |

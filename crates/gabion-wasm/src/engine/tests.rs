@@ -219,8 +219,8 @@ fn coverage_fanout_and_budget_surface_in_snapshot() {
     // the configured floor of 2. The dirty set does not move it.
     let expected = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
     with_engine(config, |tx| async move {
-        // A 16-key burst grows the dirty set; the coverage fanout ignores it
-        // — the burst rides one fat frame rather than widening the peer pick.
+        // A 16-key burst makes the dirty set large; the coverage fanout
+        // ignores it — the burst rides one fat frame, not a wider peer pick.
         for key in 0..16u128 {
             submit(&tx, 0, key, 7).await;
         }

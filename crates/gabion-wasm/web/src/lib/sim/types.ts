@@ -124,8 +124,9 @@ export interface NodeState {
   /** Subset of `ticks_total` that actually carried gossip work (a cell was
    *  dirty at the peer pick). */
   dirty_ticks: number;
-  /** Adaptive fanout the most recent dirty tick chose — grows above the base
-   *  `fanout` knob with the dirty-set size. 0 before the first emit. */
+  /** The coverage fanout the most recent dirty tick chose — `⌈ln(peers)+c⌉`,
+   *  ≥ the base `fanout` floor, scaled by cluster size not the dirty set.
+   *  0 before the first emit. */
   effective_fanout: number;
   /** High-water mark of `effective_fanout` since startup. */
   peak_fanout: number;

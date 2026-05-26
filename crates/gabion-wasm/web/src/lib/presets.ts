@@ -54,7 +54,8 @@ import type { SimConfig } from './sim/types';
 export const WATCHED_KEY = 1;
 
 /** The cluster size the presets build. A ring of 12 reads cleanly and gabion's
- *  adaptive fanout still saturates it in a couple of rounds. */
+ *  gossip still saturates it in a couple of rounds (coverage fanout ⌈ln(11)+c⌉
+ *  reaches most peers each tick). */
 const NODES = 12;
 
 /** The rule limit the narrative presets pin (burst, steady, partition, loss,

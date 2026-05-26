@@ -727,12 +727,13 @@ test('the inspector shows convergence lag and the over-limit state', async ({ pa
 });
 
 // The adaptive-decision metrics must be *visible and responsive* — the whole
-// point of §4. Adaptive fanout (`config.fanout.max(⌊log₂(dirty)⌋+1).min(peers)`)
-// was never measured before this work; the eager-flush share was a frozen
-// lifetime ratio. Under overload a node's dirty set is large, so its fanout
-// widens above the base; and a concentrated burst crosses the (now tiny) error
-// budget, raising the windowed threshold share off zero.
-test('the node inspector shows adaptive fanout widening and a responsive eager-flush share', async ({
+// point of §4. The coverage fanout (`config.fanout.max(⌈ln(peers)+c⌉).min(peers)`)
+// sits above the configured floor and is stable for the cluster size; the
+// eager-flush share was a frozen lifetime ratio. So §4 shows two things: the
+// fanout meter fills past its floor for coverage, and a concentrated burst
+// crosses the (now tiny) error budget, raising the windowed threshold share —
+// the genuinely burst-driven knob — off zero.
+test('the node inspector shows the coverage fanout and a responsive eager-flush share', async ({
   page,
 }) => {
   const pageErrors: string[] = [];
@@ -757,19 +758,20 @@ test('the node inspector shows adaptive fanout widening and a responsive eager-f
   const inspector = page.locator('.inspector');
   await expect(inspector).toBeVisible();
 
-  // Adaptive fanout has widened above the base: the widen segment carries width,
-  // and the foot says so. (Overload's large dirty set guarantees this.)
+  // The coverage fanout sits above the configured floor: the coverage segment
+  // carries width, and the foot says so. (`⌈ln(peers)+c⌉` exceeds the floor at
+  // this cluster size, independent of load.)
   await expect
     .poll(
       async () =>
         Number(
-          ((await inspector.locator('.cadence .seg.fan-widen').getAttribute('style')) ?? '')
+          ((await inspector.locator('.cadence .seg.fan-coverage').getAttribute('style')) ?? '')
             .replace(/[^0-9.]/g, '') || '0',
         ),
       { timeout: 10_000 },
     )
     .toBeGreaterThan(0);
-  await expect(inspector.locator('.cadence .widen-note')).toContainText('widened by load');
+  await expect(inspector.locator('.cadence .coverage-note')).toContainText('sized for coverage');
 
   // The eager-flush (threshold) share is windowed, so a concentrated burst on
   // this node — many hits at once across the ε=1 budget — moves it off zero.

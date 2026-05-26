@@ -1,6 +1,7 @@
 <script lang="ts">
   import { type Knobs, type Preset } from '../presets';
   import { visibleBuckets } from '../buckets';
+  import InfoTip from './InfoTip.svelte';
 
   // The left control rail (the chassis's controls region): scenario presets, the
   // rebuild knobs (a collapsed disclosure, so the rail stays compact), the
@@ -134,7 +135,7 @@
     <summary>Tune the cluster</summary>
     <p class="hint">Edit freely — changes stage until you rebuild.</p>
     <div class="knob" class:changed={changed.has('fanout')}>
-      <label for="knob-fanout">Fanout<span class="val numeric">{knobs.fanout}</span></label>
+      <label for="knob-fanout"><InfoTip text="The fanout floor — the minimum peers contacted per gossip tick. The runtime scales the actual fanout up to the coverage threshold ⌈ln(peers)+c⌉, the fanout that reliably reaches every node, so this floor binds only at small clusters.">Fanout</InfoTip><span class="val numeric">{knobs.fanout}</span></label>
       <input id="knob-fanout" type="range" min="1" max={maxFanout} step="1" bind:value={knobs.fanout} />
     </div>
     <div class="knob" class:changed={changed.has('target_err_bps')}>

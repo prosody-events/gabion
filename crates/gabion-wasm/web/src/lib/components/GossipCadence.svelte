@@ -3,13 +3,16 @@
   import InfoTip from './InfoTip.svelte';
 
   // §4 of the node inspector: how this node gossips — how *alive* it is, how
-  // *often* it flushes, and how *wide* it fans out. The runtime adapts the last
-  // two under load; this section exists to make those adaptations visible:
+  // *often* it flushes, and how *wide* it fans out. The flush *rate* adapts to
+  // load; the fanout is sized for cluster-wide coverage. This section makes both
+  // visible:
   //
   //   (a) a tick sparkline + status word — the heartbeat keeps firing even when
   //       the cluster is quiet (the "still ticking, not dead" story);
-  //   (b) adaptive fanout — the effective peer count the most recent emit chose,
-  //       which grows above the configured base as the dirty set grows (a burst);
+  //   (b) coverage fanout — the effective peer count the most recent emit chose.
+  //       The runtime sizes it to the coverage threshold ⌈ln(peers)+c⌉, scaled by
+  //       cluster size (not the dirty set), so it is stable for a given cluster
+  //       rather than pulsing with load; it sits above the configured floor.
   //   (c) heartbeat vs threshold — what share of *recent* ticks were eager
   //       flushes (a burst crossing the error budget ε) rather than the timer;
   //   (d) working vs idle — what share of *recent* ticks actually carried gossip
@@ -107,19 +110,20 @@
   const thresholdPct = $derived(hasRecent ? (recentThreshold / recentTicks) * 100 : 0);
   const workedPct = $derived(hasRecent ? (recentDirty / recentTicks) * 100 : 0);
 
-  // Adaptive fanout. The runtime caps the per-tick fanout at the peer count and
-  // floors it at the configured base, growing it with the dirty-set size in
-  // between (`config.fanout.max(⌊log₂(dirty)⌋+1).min(peers)`). The meter scale is
-  // 0…peers; the base is the floor it never drops below, and any fill past the
-  // base is the adaptive widening a burst caused.
+  // Coverage fanout. The runtime sizes the per-tick fanout to the coverage
+  // threshold ⌈ln(peers)+c⌉, floored at the configured base and capped at the
+  // peer count (`config.fanout.max(⌈ln(peers)+c⌉).min(peers)`). It scales with
+  // cluster size, not the dirty set, so it holds steady for a given cluster.
+  // The meter scale is 0…peers; the base segment is the floor, and the fill
+  // past it is the coverage margin the threshold adds over that floor.
   const peerCap = $derived(node.peers.length);
   const base = $derived(Math.min(baseFanout, peerCap));
   const effective = $derived(Math.min(node.effective_fanout, peerCap));
   const peak = $derived(Math.min(node.peak_fanout, peerCap));
   const hasPeers = $derived(peerCap > 0);
-  const widened = $derived(effective > base);
+  const aboveFloor = $derived(effective > base);
   const basePct = $derived(hasPeers ? (Math.min(base, effective) / peerCap) * 100 : 0);
-  const widenPct = $derived(hasPeers ? (Math.max(effective - base, 0) / peerCap) * 100 : 0);
+  const coveragePct = $derived(hasPeers ? (Math.max(effective - base, 0) / peerCap) * 100 : 0);
   const peakPct = $derived(hasPeers ? (peak / peerCap) * 100 : 0);
 
   // The direct status word. Dirty rows queued now → there is news to push;
@@ -148,15 +152,15 @@
     {/if}
   </svg>
 
-  <!-- Adaptive fanout: base → effective → peak, on a 0…peers scale. -->
+  <!-- Coverage fanout: floor → effective coverage → peak, on a 0…peers scale. -->
   <div class="fanout">
     <div class="fanout-head">
       <span class="bar-label">
-        <InfoTip text="How many peers this node gossiped to on its most recent emit. The runtime floors fanout at the configured base and grows it with the dirty-set size (⌊log₂(dirty)⌋+1), capped at the peer count — so a burst makes it fan out wider to converge faster, then it relaxes back to the base.">
-          adaptive fanout
+        <InfoTip text="How many peers this node gossiped to on its most recent emit. The runtime sizes fanout to the coverage threshold ⌈ln(peers)+c⌉ — the fanout that reliably reaches every node — floored at the configured base and capped at the peer count. It scales with cluster size, not the dirty set, so it holds steady for a given cluster instead of pulsing with bursts.">
+          coverage fanout
         </InfoTip>
       </span>
-      <span class="fanout-now numeric" class:widened>
+      <span class="fanout-now numeric" class:above-floor={aboveFloor}>
         {effective}<span class="sep"> / </span>{peerCap}
         <span class="unit">peers</span>
       </span>
@@ -168,16 +172,16 @@
         aria-valuemin="0"
         aria-valuemax={peerCap}
         aria-valuenow={effective}
-        aria-valuetext="{effective} of {peerCap} peers; base {base}, peak {peak}"
+        aria-valuetext="{effective} of {peerCap} peers reached for coverage; floor {base}, peak {peak}"
       >
         <div class="seg fan-base" style="width: {basePct}%"></div>
-        <div class="seg fan-widen" style="width: {widenPct}%"></div>
+        <div class="seg fan-coverage" style="width: {coveragePct}%"></div>
         <span class="peak-tick" style="left: {peakPct}%" aria-hidden="true"></span>
       </div>
       <div class="fanout-foot">
-        <span>base {base}</span>
+        <span>floor {base}</span>
         <span>peak {peak}</span>
-        <span class="widen-note" class:on={widened}>{widened ? 'widened by load' : 'at base'}</span>
+        <span class="coverage-note" class:on={aboveFloor}>{aboveFloor ? 'sized for coverage' : 'at floor'}</span>
       </div>
     {:else}
       <span class="bar-empty">no peers — nothing to fan out to</span>
@@ -186,7 +190,7 @@
 
   <div class="bar-row">
     <span class="bar-label">
-      <InfoTip text="Of recent gossip ticks (a rolling window of the last several seconds), the share triggered eagerly by a burst whose accumulated hits crossed the per-rule error budget ε, rather than by the proactive heartbeat timer. The same burst that widens the fanout fires this eager flush — so a busy node shows a higher threshold share.">
+      <InfoTip text="Of recent gossip ticks (a rolling window of the last several seconds), the share triggered eagerly by a burst whose accumulated hits crossed the per-rule error budget ε, rather than by the proactive heartbeat timer. This is the burst-driven knob — a busy node shows a higher threshold share. (The fanout above does not respond to bursts; it is sized for coverage.)">
         heartbeat vs threshold
       </InfoTip>
     </span>
@@ -301,7 +305,7 @@
     vector-effect: non-scaling-stroke;
   }
 
-  /* Adaptive fanout block. */
+  /* Coverage fanout block. */
   .fanout {
     display: flex;
     flex-direction: column;
@@ -319,8 +323,8 @@
     color: var(--ink-soft);
   }
 
-  .fanout-now.widened {
-    color: var(--signal-dirty);
+  .fanout-now.above-floor {
+    color: var(--signal-converged);
     font-weight: 600;
   }
 
@@ -345,8 +349,8 @@
     color: var(--ink-faint);
   }
 
-  .widen-note.on {
-    color: var(--signal-dirty);
+  .coverage-note.on {
+    color: var(--signal-converged);
   }
 
   /* The peak high-water mark: a 2px tick standing above the fill. */
@@ -396,9 +400,14 @@
     background: var(--node-fill);
   }
 
-  .seg.threshold,
-  .seg.fan-widen {
+  .seg.threshold {
     background: var(--signal-dirty);
+  }
+
+  /* Coverage margin reads as "reach", not burst — a converged-green tone,
+     distinct from the amber threshold/eager-flush share below. */
+  .seg.fan-coverage {
+    background: var(--signal-converged);
   }
 
   .seg.idle {
