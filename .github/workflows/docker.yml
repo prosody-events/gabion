@@ -127,7 +127,7 @@ jobs:
             printf 'short-sha=%s\n' "$short_sha"
           } >> "$GITHUB_OUTPUT"
         shell: bash
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -418,7 +418,7 @@ jobs:
         shell: bash
 
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
