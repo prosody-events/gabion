@@ -1383,7 +1383,7 @@ The only call to a `peer_frontier` mutator from inside `crdt.rs` is `clear_node_
 
 ### 7.5 `fill_gossip_frame_for_peer` and `peer_lacks`
 
-The peer-aware sibling of `fill_gossip_frame` is `fill_gossip_frame_for_peer(max_cells, peer_slot, out)`. It walks the same three lanes in the same order, with the same `selection_marks` dedup, and adds one filter per cell: skip it if the peer already has it.
+The peer-aware sibling of `fill_gossip_frame` is `fill_gossip_frame_for_peer(max_cells, peer_slot, out)`. It walks the same three lanes in the same order, with the same `selection_marks` dedup. The two **dirty** lanes add one filter per cell — skip it if the peer already has it — but the **repair** lane (lane 3) does *not*: it sweeps the rotating active-set slice unconditionally. That asymmetry is load-bearing for correctness, not just bandwidth (see below).
 
 That filter is a tiny inlined helper:
 
@@ -1398,9 +1398,11 @@ fn peer_lacks(&self, peer_slot: u16, cell_index: usize) -> bool {
 
 `peer_lacks` is the hot per-frame consumer of the frontier table. Per candidate cell, it reads two contiguous slices — `origins[cell_index]` and `origin_sequences[cell_index]` — and one `u64` out of the peer-major `last_acked_seq` array, with no allocation and no branch other than the comparison itself.
 
-`fill_gossip_frame_for_peer` chains four checks per candidate cell in the order they fail fastest. First it runs `dirty_entry_current` (for the dirty lanes) or `is_active` (for the repair lane); then `peer_lacks(peer_slot, cell_index)` skips cells the peer is already current on; then `mark_selected(slot)` deduplicates across lanes within this frame; otherwise the handle is pushed.
+`fill_gossip_frame_for_peer` chains its checks per candidate cell in the order they fail fastest. The dirty lanes run `dirty_entry_current`, then `peer_lacks(peer_slot, cell_index)` to skip cells the peer is already current on, then `mark_selected(slot)` to deduplicate across lanes within this frame; otherwise the handle is pushed. The repair lane runs only `is_active` and `mark_selected` — it deliberately omits `peer_lacks`.
 
-The gossip runtime calls `fill_gossip_frame_for_peer` once per peer-target per tick, so the per-tick UDP fanout is peer-shaped: each peer gets exactly the cells they have not yet acknowledged, capped at the frame budget. Two peers receiving from the same compositor therefore see overlapping but not identical content, which is exactly what per-peer frontier tracking exists to enable.
+The gossip runtime calls `fill_gossip_frame_for_peer` once per peer-target per tick, so the per-tick UDP fanout is peer-shaped: the dirty lanes hand each peer the fresh cells it has not yet acknowledged, capped at the frame budget, while the repair lane rotates the rest of the active set past it over successive ticks. Two peers receiving from the same compositor therefore see overlapping but not identical content.
+
+The repair lane omits `peer_lacks` for **correctness**, not bandwidth. `last_acked` is a per-`(peer, origin)` high-watermark, and `merge_remote` re-stamps a remote cell with the *merging* node's local origin counter rather than carrying the origin's sequence on the wire — so a replica's stored `origin_sequence` and a peer's `last_acked` live in different per-node sequence spaces, and a single watermark cannot represent a gap (a peer holding sequence 5 but not 4). If every lane pruned on it, a cell the watermark wrongly believes the peer holds would be suppressed on *every* holder forever and the cluster would never converge. Gating only the dirty lanes keeps `peer_lacks` as the latency optimization it is; the repair lane's unconditional sweep — re-merged idempotently via the max-merge in `merge_remote` — is the convergence guarantee the `PeerFrontierTable` doc comment delegates to it. (This was a real bug: a rare partition-heal counterexample stranded one cell on one node forever until the repair lane was ungated.)
 
 When a peer has not been interned because the table was full, the runtime falls back to plain `fill_gossip_frame`; the wasted bandwidth shows up as redundant retransmission, and the `full_rejects` log line points the operator at the relevant config key.
 
@@ -1589,7 +1591,7 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `visit_local_dirty`, `visit_forwarded_dirty` | Stream dirty lanes (no dedup). |
 | `visit_repair_slice(max, visit)` | Rotate a slice of active cells. |
 | `fill_gossip_frame(max, out)` | Compose a frame: local dirty + forwarded dirty + repair slice, deduped. |
-| `fill_gossip_frame_for_peer(max, peer_slot, out)` | Peer-aware variant; adds `peer_lacks` filter on top of the same three lanes. |
+| `fill_gossip_frame_for_peer(max, peer_slot, out)` | Peer-aware variant; the two dirty lanes add a `peer_lacks` filter, the repair lane sweeps unconditionally (convergence backstop). |
 | `peer_frontiers()`, `peer_frontiers_mut()` | Per-peer send/ack frontier access. |
 | `repair_cursor()` | Read the current cursor position. |
 

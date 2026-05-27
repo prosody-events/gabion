@@ -430,91 +430,179 @@ fn quickcheck_sim_connected_clusters_converge_after_finite_loss(
 }
 
 #[quickcheck]
-fn quickcheck_sim_partition_heals_without_overcount(mut case: PartitionCase) -> TestResult {
-    run_paused(async move {
-        const NODES: usize = 8;
-        if case.records.is_empty() {
-            return TestResult::discard();
-        }
-        for record in &mut case.records {
-            record.node %= NODES as u16;
-        }
+fn quickcheck_sim_partition_heals_without_overcount(case: PartitionCase) -> TestResult {
+    if case.records.is_empty() {
+        return TestResult::discard();
+    }
+    // Surface the failing invariant *and the generating case* rather than a
+    // bare `false`: `PartitionCase` has no `shrink`, so `from_bool(false)`
+    // prints only quickcheck's "No Arguments Provided" — useless for a rare
+    // flake. `TestResult::error` carries the message to the log.
+    match run_paused(partition_heal_violation(case.clone(), 120)) {
+        Some(reason) => TestResult::error(format!("{reason}; case={case:?}")),
+        None => TestResult::passed(),
+    }
+}
 
-        let router = SimRouter::with_channel_capacity(128);
-        let addrs: Vec<_> = (0..NODES).map(|i| sock(42_000 + i as u16)).collect();
-        for left in 0..4 {
-            for right in 4..8 {
-                router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Block);
-                router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Block);
+/// Drive the eight-node partition→heal scenario for `case` and return a
+/// human-readable description of the first invariant it violates, or `None`
+/// if the cluster behaved correctly: while the partition holds no node may
+/// over-count any key (over-admission is the dangerous direction for a
+/// limiter), and `heal_ticks` ticks after the links are restored every node
+/// must converge to the exact cluster-wide model. Shared by the property test
+/// above and the deterministic regression below.
+async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> Option<String> {
+    const NODES: usize = 8;
+    if case.records.is_empty() {
+        return None;
+    }
+    for record in &mut case.records {
+        record.node %= NODES as u16;
+    }
+
+    let router = SimRouter::with_channel_capacity(128);
+    let addrs: Vec<_> = (0..NODES).map(|i| sock(42_000 + i as u16)).collect();
+    for left in 0..4 {
+        for right in 4..8 {
+            router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Block);
+            router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Block);
+        }
+    }
+
+    let mut clients = Vec::with_capacity(NODES);
+    let mut handles = Vec::with_capacity(NODES);
+    let mut aggregates = Vec::with_capacity(NODES);
+    for i in 0..NODES {
+        let identity = NodeIdentity::new(NodeId(0xB000 + i as u128), 1);
+        let peers: Vec<_> = addrs
+            .iter()
+            .copied()
+            .filter(|addr| *addr != addrs[i])
+            .collect();
+        let mut cfg = sim_config(identity, peers, 0xC0FF_EE00 + i as u64);
+        cfg.fanout = 4;
+        cfg.max_cells_per_tick = 32;
+        let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let (rt, client) = GossipRuntime::from_parts(
+            router.bind(addrs[i]),
+            TokioClock::from_millis(0),
+            cfg,
+            store_for(identity),
+            agg.clone(),
+        );
+        handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+        clients.push(client);
+        aggregates.push(agg);
+    }
+
+    for record in &case.records {
+        let node = record.node as usize % NODES;
+        clients[node]
+            .record(
+                rule_fp(record.rule),
+                key_hash(record.key),
+                0,
+                record.hits as u64,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+    }
+
+    sim_advance_ticks(Duration::from_millis(100), case.heal_after_ticks as u32).await;
+    let global = expected_model(&case.records, NODES);
+    let mut overcount = None;
+    for (node, agg) in aggregates.iter().enumerate() {
+        for (key, count) in agg.snapshot() {
+            let cap = *global.get(&key).unwrap_or(&0);
+            if count > cap {
+                overcount = Some(format!(
+                    "node {node} over-counted {key:?}: {count} > cluster total {cap} \
+                     during the partition"
+                ));
             }
         }
+    }
 
-        let mut clients = Vec::with_capacity(NODES);
-        let mut handles = Vec::with_capacity(NODES);
-        let mut aggregates = Vec::with_capacity(NODES);
-        for i in 0..NODES {
-            let identity = NodeIdentity::new(NodeId(0xB000 + i as u128), 1);
-            let peers: Vec<_> = addrs
-                .iter()
-                .copied()
-                .filter(|addr| *addr != addrs[i])
-                .collect();
-            let mut cfg = sim_config(identity, peers, 0xC0FF_EE00 + i as u64);
-            cfg.fanout = 4;
-            cfg.max_cells_per_tick = 32;
-            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let (rt, client) = GossipRuntime::from_parts(
-                router.bind(addrs[i]),
-                TokioClock::from_millis(0),
-                cfg,
-                store_for(identity),
-                agg.clone(),
-            );
-            handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-            clients.push(client);
-            aggregates.push(agg);
+    for left in 0..4 {
+        for right in 4..8 {
+            router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Pass);
+            router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Pass);
         }
+    }
+    sim_advance_ticks(Duration::from_millis(100), heal_ticks).await;
+    let mut divergence = None;
+    for (node, agg) in aggregates.iter().enumerate() {
+        let snap = agg.snapshot();
+        if snap != global {
+            divergence = Some(format!(
+                "node {node} did not converge {heal_ticks} ticks after heal: has {} keys, \
+                 cluster model has {}; snapshot={snap:?} model={global:?}",
+                snap.len(),
+                global.len(),
+            ));
+        }
+    }
 
-        for record in &case.records {
-            let node = record.node as usize % NODES;
-            clients[node]
-                .record(
-                    rule_fp(record.rule),
-                    key_hash(record.key),
-                    0,
-                    record.hits as u64,
-                    0,
-                    0,
-                )
-                .await
-                .unwrap();
-        }
+    for client in clients {
+        let _ = client.shutdown().await;
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
 
-        sim_advance_ticks(Duration::from_millis(100), case.heal_after_ticks as u32).await;
-        let global = expected_model(&case.records, NODES);
-        let no_overcount = aggregates.iter().all(|agg| {
-            agg.snapshot()
-                .iter()
-                .all(|(key, count)| *count <= *global.get(key).unwrap_or(&0))
-        });
+    overcount.or(divergence)
+}
 
-        for left in 0..4 {
-            for right in 4..8 {
-                router.set_link_policy(addrs[left], addrs[right], LinkPolicy::Pass);
-                router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Pass);
-            }
-        }
-        sim_advance_ticks(Duration::from_millis(100), 120).await;
-        let converged = aggregates.iter().all(|agg| agg.snapshot() == global);
-
-        for client in clients {
-            let _ = client.shutdown().await;
-        }
-        for handle in handles {
-            let _ = handle.await;
-        }
-        TestResult::from_bool(no_overcount && converged)
+/// Deterministic regression for the partition-heal stuck-cell flake. These
+/// records are a captured `PartitionCase` counterexample: node 3's
+/// `(rule 0, key 0)` cell never reached node 1 because the peer-frontier
+/// high-watermark sat at that cell's (locally re-stamped) sequence, so every
+/// send lane — including repair — pruned it via `peer_lacks`. With the repair
+/// lane ungated (see `CellStore::fill_gossip_frame_for_peer`) the cluster
+/// converges. Pinned as a fast `#[test]` so the fix cannot regress behind the
+/// ~1-in-100k random trigger.
+#[test]
+fn sim_partition_heal_converges_on_captured_stuck_cell() {
+    let records: Vec<SimRecord> = [
+        (1419u16, 0u8, 6u8, 8u8),
+        (36630, 1, 1, 10),
+        (6923, 0, 6, 3),
+        (54319, 0, 4, 14),
+        (29105, 1, 2, 2),
+        (41658, 2, 4, 13),
+        (33226, 2, 4, 11),
+        (11907, 2, 0, 7),
+        (18610, 2, 6, 15),
+        (49507, 0, 0, 16),
+        (57336, 0, 6, 10),
+        (22238, 0, 1, 12),
+        (44550, 0, 4, 8),
+        (41284, 2, 2, 17),
+        (1, 2, 7, 5),
+        (37755, 0, 3, 16),
+        (52572, 1, 1, 8),
+        (50717, 1, 6, 11),
+        (25066, 0, 1, 13),
+    ]
+    .into_iter()
+    .map(|(node, rule, key, hits)| SimRecord {
+        node,
+        rule,
+        key,
+        hits,
     })
+    .collect();
+    let case = PartitionCase {
+        records,
+        heal_after_ticks: 8,
+    };
+    assert_eq!(
+        run_paused(partition_heal_violation(case, 120)),
+        None,
+        "captured partition counterexample must converge after the repair-lane fix",
+    );
 }
 
 #[quickcheck]

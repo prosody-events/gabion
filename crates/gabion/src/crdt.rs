@@ -1337,9 +1337,19 @@ impl<C: Count> CellStore<C> {
 
     /// Peer-aware sibling of [`Self::fill_gossip_frame`]. Walks the same
     /// three lanes (local dirty → forwarded dirty → repair) in the same
-    /// order, dedup'd via `selection_marks`, but skips any cell whose
-    /// `origin_sequence` is already at or below the peer's recorded
-    /// `last_acked` for that origin slot.
+    /// order, dedup'd via `selection_marks`.
+    ///
+    /// The two dirty lanes prune by the peer frontier — a cell whose
+    /// `origin_sequence` is at or below the peer's recorded `last_acked` for
+    /// that origin is skipped. That is a **latency optimization only**: the
+    /// frontier is a per-(peer, origin) high-watermark, and because remote
+    /// cells are re-stamped with the merging node's local origin counter (see
+    /// [`Self::merge_remote`]), the watermark can sit above a sequence the peer
+    /// never actually received — a gap it cannot represent. So the repair lane
+    /// (lane 3) sweeps the rotating active-set slice **unconditionally**,
+    /// without consulting the frontier. That is what makes anti-entropy
+    /// converge under reordering, loss, or a stale watermark — the guarantee
+    /// the [`PeerFrontierTable`] doc comment delegates to the repair lane.
     pub fn fill_gossip_frame_for_peer(
         &mut self,
         max_cells: usize,
@@ -1398,7 +1408,13 @@ impl<C: Count> CellStore<C> {
             return out.len();
         }
 
-        // Lane 3: rotating repair slice.
+        // Lane 3: rotating repair slice. Unlike the dirty lanes above, this
+        // does *not* consult `peer_lacks` — the frontier is a gap-blind
+        // high-watermark and cannot be trusted for correctness (see the
+        // method doc). Sweeping every active cell in cursor order, regardless
+        // of the watermark, is what guarantees a cell the frontier wrongly
+        // believes the peer holds still gets re-sent and merged (idempotent
+        // max-merge) until the cluster converges.
         let cap = self.capacity;
         let mut visited = 0_u32;
         let mut next_cursor = self.repair_cursor;
@@ -1407,9 +1423,6 @@ impl<C: Count> CellStore<C> {
             visited += 1;
             next_cursor = (slot + 1) % cap;
             if !self.is_active(slot) {
-                continue;
-            }
-            if !self.peer_lacks(peer_slot, slot as usize) {
                 continue;
             }
             if !self.mark_selected(slot) {

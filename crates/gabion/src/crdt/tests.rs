@@ -560,9 +560,13 @@ fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
 }
 
 #[quickcheck]
-fn quickcheck_peer_frontier_prunes_exactly_acked_origins(rows: RemoteRows, ack_seed: u8) -> bool {
+fn quickcheck_repair_lane_sweeps_active_despite_acked_frontier(
+    rows: RemoteRows,
+    ack_seed: u8,
+) -> bool {
     let mut store = quickcheck_store();
     apply_remote_rows(&mut store, &rows.0);
+    // Drop the dirty rings so the frame is composed purely by the repair lane.
     store.clear_dirty();
     let peer_slot = store
         .peer_frontiers_mut()
@@ -573,6 +577,7 @@ fn quickcheck_peer_frontier_prunes_exactly_acked_origins(rows: RemoteRows, ack_s
         .active_handles()
         .map(|h| store.get(h).unwrap())
         .collect();
+    // Ack roughly half the origins through their current sequence.
     for row in &active {
         if ((row.key.origin as u8).wrapping_add(ack_seed) & 1) == 0 {
             store
@@ -581,13 +586,11 @@ fn quickcheck_peer_frontier_prunes_exactly_acked_origins(rows: RemoteRows, ack_s
         }
     }
 
-    let expected: BTreeSet<u32> = active
-        .iter()
-        .filter(|row| {
-            row.origin_sequence > store.peer_frontiers().last_acked(peer_slot, row.key.origin)
-        })
-        .map(|row| row.handle.index)
-        .collect();
+    // The repair lane is the convergence backstop: it ignores the frontier, so
+    // a full-capacity sweep re-sends *every* active cell, acked or not. Pruning
+    // it by `last_acked` is exactly what stranded a cell forever in the
+    // partition-heal flake.
+    let expected: BTreeSet<u32> = active.iter().map(|row| row.handle.index).collect();
 
     let mut out = Vec::with_capacity(store.capacity() as usize);
     store.fill_gossip_frame_for_peer(store.capacity() as usize, peer_slot, &mut out);
@@ -1643,7 +1646,7 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
 }
 
 #[test]
-fn fill_gossip_frame_for_peer_skips_acked_cells() {
+fn fill_gossip_frame_for_peer_prunes_dirty_but_repairs_acked() {
     let mut store = small_store(8, 8);
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
 
@@ -1654,7 +1657,6 @@ fn fill_gossip_frame_for_peer_skips_acked_cells() {
 
     let row1 = store.get(h1).unwrap();
     let row2 = store.get(h2).unwrap();
-    let _ = h3; // used only via the frame composition
 
     // Intern a peer and ack the first two origins through their current
     // sequences. The third remains unacked.
@@ -1666,11 +1668,29 @@ fn fill_gossip_frame_for_peer_skips_acked_cells() {
         .peer_frontiers_mut()
         .record_acked(peer_slot, row2.key.origin, row2.origin_sequence);
 
-    let mut out = Vec::with_capacity(8);
-    store.fill_gossip_frame_for_peer(8, peer_slot, &mut out);
-    // Only the unacked cell survives the per-peer prune.
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].index, h3.index);
+    // A single-cell budget never reaches the repair lane, so the frame is
+    // composed purely from the dirty lanes — which prune the two acked cells,
+    // leaving only the unacked one. This is the latency optimization.
+    let mut dirty_only = Vec::with_capacity(8);
+    store.fill_gossip_frame_for_peer(1, peer_slot, &mut dirty_only);
+    assert_eq!(dirty_only.len(), 1);
+    assert_eq!(dirty_only[0].index, h3.index);
+
+    // With budget to spare, the repair lane sweeps the whole active set
+    // regardless of the frontier and backfills the acked cells too — the
+    // convergence backstop the frontier doc comment delegates to it. All three
+    // cells ride out. (Pre-fix, the repair lane also pruned by `last_acked`,
+    // so the acked cells were suppressed forever — the partition-heal flake.)
+    let mut full = Vec::with_capacity(8);
+    store.fill_gossip_frame_for_peer(8, peer_slot, &mut full);
+    let mut got: Vec<u32> = full.iter().map(|h| h.index).collect();
+    got.sort_unstable();
+    let mut want = [h1.index, h2.index, h3.index];
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "repair lane must backfill cells the frontier marks acked"
+    );
 }
 
 // --- Coverage extensions (Gaps 1-6) -----------------------------------
@@ -2254,13 +2274,10 @@ fn quickcheck_gossip_frame_for_peer_across_all_lanes(rows: RemoteRows, ack_seed:
         }
     }
 
-    let expected: BTreeSet<u32> = active
-        .iter()
-        .filter(|row| {
-            row.origin_sequence > store.peer_frontiers().last_acked(peer_slot, row.key.origin)
-        })
-        .map(|row| row.handle.index)
-        .collect();
+    // Dirty lanes prune by the frontier, but the repair lane backfills
+    // unconditionally, so a full-capacity sweep across all three lanes is every
+    // active cell regardless of which origins were acked.
+    let expected: BTreeSet<u32> = active.iter().map(|row| row.handle.index).collect();
 
     let mut out = Vec::with_capacity(store.capacity() as usize);
     store.fill_gossip_frame_for_peer(store.capacity() as usize, peer_slot, &mut out);
