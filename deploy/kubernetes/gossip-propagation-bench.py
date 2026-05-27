@@ -214,8 +214,13 @@ spec:
               containerPort: 8081
             - name: admin
               containerPort: 9090
-            - name: gossip
+            # EndpointSliceDiscovery filters by literal name "gabion" and
+            # protocol "UDP" (crates/gabion/src/discovery/kubernetes.rs).
+            # Both fields are load-bearing — renaming or dropping the
+            # protocol disables peer discovery silently.
+            - name: gabion
               containerPort: 9000
+              protocol: UDP
           volumeMounts:
             - name: config
               mountPath: /etc/gabion
@@ -239,9 +244,10 @@ spec:
     - name: admin
       port: 9090
       targetPort: admin
-    - name: gossip
+    - name: gabion
       port: 9000
-      targetPort: gossip
+      targetPort: gabion
+      protocol: UDP
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -268,8 +274,9 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-            - name: gossip
+            - name: gabion
               containerPort: 9000
+              protocol: UDP
           volumeMounts:
             - name: config
               mountPath: /etc/nginx/nginx.conf
@@ -291,9 +298,10 @@ spec:
     - name: http
       port: 8080
       targetPort: http
-    - name: gossip
+    - name: gabion
       port: 9000
-      targetPort: gossip
+      targetPort: gabion
+      protocol: UDP
 """
 
 

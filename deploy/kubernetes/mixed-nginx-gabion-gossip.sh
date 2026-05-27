@@ -210,7 +210,10 @@ spec:
           ports:
             - { name: envoy,  containerPort: 8081 }
             - { name: admin,  containerPort: 9090 }
-            - { name: gossip, containerPort: 9000, protocol: UDP }
+            # EndpointSliceDiscovery filters by the literal port name
+            # "gabion" (see crates/gabion/src/discovery/kubernetes.rs).
+            # Renaming this port disables auto-discovery silently.
+            - { name: gabion, containerPort: 9000, protocol: UDP }
           volumeMounts:
             - name: config
               mountPath: /etc/gabion
@@ -230,7 +233,7 @@ spec:
   ports:
     - { name: envoy,  port: 8081, targetPort: envoy }
     - { name: admin,  port: 9090, targetPort: admin }
-    - { name: gossip, port: 9000, targetPort: gossip, protocol: UDP }
+    - { name: gabion, port: 9000, targetPort: gabion, protocol: UDP }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -256,7 +259,7 @@ spec:
           command: ["nginx", "-g", "daemon off;"]
           ports:
             - { name: http,   containerPort: 8080 }
-            - { name: gossip, containerPort: 9000, protocol: UDP }
+            - { name: gabion, containerPort: 9000, protocol: UDP }
           volumeMounts:
             - name: config
               mountPath: /etc/nginx/nginx.conf
@@ -276,7 +279,7 @@ spec:
     app: gabion-nginx
   ports:
     - { name: http,   port: 8080, targetPort: http }
-    - { name: gossip, port: 9000, targetPort: gossip, protocol: UDP }
+    - { name: gabion, port: 9000, targetPort: gabion, protocol: UDP }
 YAML
 
 wait_for_endpoint_count() {
