@@ -29,17 +29,31 @@ RUN if command -v apk >/dev/null 2>&1; then \
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential \
             ca-certificates \
-            cargo \
             clang \
             curl \
             libclang-dev \
             libpcre2-dev \
             libssl-dev \
             llvm-dev \
-            rustc \
-            sccache \
             zlib1g-dev; \
         rm -rf /var/lib/apt/lists/*; \
+        # Distro `rustc`/`cargo` on Debian 12 / Ubuntu 22.04 are too old for \
+        # cargo-chef's MSRV (1.86+) and can't read Cargo.lock v4. Install a \
+        # current stable toolchain via rustup, and grab a prebuilt `sccache` \
+        # (Ubuntu 22.04 lacks an apt package; building from source is slow). \
+        # The Alpine path above already ships new-enough rust/cargo/sccache. \
+        curl -fsSL https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path; \
+        ln -s /root/.cargo/bin/cargo /root/.cargo/bin/rustc /usr/local/bin/; \
+        case "$(uname -m)" in \
+            x86_64)  sccache_arch=x86_64-unknown-linux-musl ;; \
+            aarch64) sccache_arch=aarch64-unknown-linux-musl ;; \
+            *) echo "Unsupported architecture for sccache: $(uname -m)" >&2; exit 1 ;; \
+        esac; \
+        sccache_version=v0.15.0; \
+        curl -fsSL "https://github.com/mozilla/sccache/releases/download/${sccache_version}/sccache-${sccache_version}-${sccache_arch}.tar.gz" \
+            | tar -xz --strip-components=1 -C /usr/local/bin "sccache-${sccache_version}-${sccache_arch}/sccache"; \
+        chmod +x /usr/local/bin/sccache; \
     else \
         echo "Unsupported nginx base image package manager: ${NGINX_BASE_IMAGE}" >&2; \
         exit 1; \
