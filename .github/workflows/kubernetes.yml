@@ -100,6 +100,12 @@ jobs:
       - name: load image into kind
         run: kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
       - run: make kubernetes-nginx-test
+      # Cores copied out by `kubectl cp` (or written by root-owned
+      # smokes via the host's core_pattern) may be read-locked against
+      # the runner user. Relax perms so upload-artifact can zip them.
+      - name: relax core perms for upload
+        if: failure()
+        run: sudo chmod -R a+r /tmp/cores 2>/dev/null || true
       - name: upload cores on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -136,6 +142,12 @@ jobs:
           kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
           kind load docker-image gabiond:local --name gabion
       - run: make kubernetes-mixed-test
+      # Cores copied out by `kubectl cp` (or written by root-owned
+      # smokes via the host's core_pattern) may be read-locked against
+      # the runner user. Relax perms so upload-artifact can zip them.
+      - name: relax core perms for upload
+        if: failure()
+        run: sudo chmod -R a+r /tmp/cores 2>/dev/null || true
       - name: upload cores on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -175,6 +187,12 @@ jobs:
           kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
           kind load docker-image gabiond:local --name gabion
       - run: make kubernetes-gossip-bench
+      # Cores copied out by `kubectl cp` (or written by root-owned
+      # smokes via the host's core_pattern) may be read-locked against
+      # the runner user. Relax perms so upload-artifact can zip them.
+      - name: relax core perms for upload
+        if: failure()
+        run: sudo chmod -R a+r /tmp/cores 2>/dev/null || true
       - name: upload cores on failure
         if: failure()
         uses: actions/upload-artifact@v4

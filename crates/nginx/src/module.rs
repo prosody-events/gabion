@@ -18,8 +18,8 @@ use ngx::ffi::{
     NGX_CONF_1MORE, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET,
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF,
     NGX_LOG_EMERG, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_http_handler_pt,
-    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t, ngx_module_t, ngx_str_t,
-    ngx_uint_t,
+    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t, ngx_module_t,
+    ngx_pool_cleanup_add, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
     self, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, MergeConfigError,
@@ -135,6 +135,54 @@ impl http::HttpModule for Module {
         core::Status::NGX_OK.into()
     }
 
+    /// Override ngx-rs's default `create_main_conf` to heap-allocate
+    /// [`MainConfig`].
+    ///
+    /// ngx-rs's default routes through `Pool::allocate::<T>(value)`, which
+    /// calls `ngx_palloc(size_of::<T>())` and ignores `align_of::<T>()`.
+    /// nginx's pool only guarantees `NGX_ALIGNMENT` (= `sizeof(unsigned
+    /// long)` = 8 on amd64). `MainConfig` contains
+    /// [`leader::GossipSettings::cluster_id_hash: u128`], so
+    /// `align_of::<MainConfig>() == 16`; writing a 16-aligned value into an
+    /// 8-aligned pool slot is UB. Native linux/amd64 traps when LLVM
+    /// lowers a u128 access to aligned SSE (`movdqa`); macOS arm64 uses
+    /// paired 64-bit loads and tolerates the misalignment; QEMU's TCG
+    /// doesn't enforce alignment either — which is why this only crashed
+    /// on the GHA native amd64 runner.
+    ///
+    /// Box the value instead: the global allocator honors `align_of`. A
+    /// pool cleanup reclaims the box when nginx tears down the cycle's
+    /// pool (config reload or shutdown), so we don't leak per-reload.
+    unsafe extern "C" fn create_main_conf(cf: *mut ngx_conf_t) -> *mut c_void {
+        let boxed = Box::new(MainConfig::default());
+        let ptr = Box::into_raw(boxed);
+
+        // SAFETY: nginx hands us a non-null `cf` per the FFI contract, and
+        // `(*cf).pool` is the cycle pool, alive for the duration of this
+        // cycle. `ngx_pool_cleanup_add(pool, 0)` returns either a valid
+        // pointer to a fresh `ngx_pool_cleanup_t` slot or null on
+        // allocation failure.
+        let cleanup = unsafe { ngx_pool_cleanup_add((*cf).pool, 0) };
+        if cleanup.is_null() {
+            // SAFETY: we still own `ptr` (no consumer has taken it yet);
+            // reconstructing the `Box` from the raw pointer we just leaked
+            // is the canonical way to drop it on the failure path.
+            unsafe { drop(Box::from_raw(ptr)) };
+            return ptr::null_mut();
+        }
+
+        // SAFETY: `cleanup` is non-null (checked above) and points to a
+        // freshly-allocated, exclusively-owned cleanup slot. Setting
+        // `handler` + `data` is the documented contract for installing a
+        // pool cleanup callback (`src/core/ngx_palloc.c`).
+        unsafe {
+            (*cleanup).handler = Some(drop_main_config);
+            (*cleanup).data = ptr.cast();
+        }
+
+        ptr.cast()
+    }
+
     /// nginx invokes this exactly once per cycle, from the master process,
     /// after all configuration directives have been parsed but before any
     /// worker fork. The pointer is a fully-initialised `ngx_conf_t` owned by
@@ -213,6 +261,26 @@ struct LocationConfig {
     /// inner bool is true when `gabion off` and false on `gabion on`.
     /// `None` means "inherit."
     off: Option<bool>,
+}
+
+/// Pool-cleanup handler installed by [`Module::create_main_conf`].
+///
+/// nginx invokes this once when the cycle's pool is destroyed, with `data`
+/// pointing back at the `*mut MainConfig` we registered in
+/// `cleanup.data`. Reconstructing the `Box` and dropping it returns the
+/// MainConfig's allocation to the global allocator.
+///
+/// # Safety
+/// `data` must be a pointer produced by `Box::into_raw(Box<MainConfig>)`
+/// and must not have been freed already. Both invariants are upheld by
+/// nginx's contract: it stores exactly the pointer we handed to it and
+/// invokes the handler exactly once.
+unsafe extern "C" fn drop_main_config(data: *mut c_void) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: precondition documented above.
+    unsafe { drop(Box::from_raw(data.cast::<MainConfig>())) };
 }
 
 // SAFETY: `HttpModuleMainConf` is an `unsafe trait` in ngx-rs because nginx's
@@ -822,7 +890,6 @@ extern "C" fn set_zone(
             aggregate = aggregate_capacity,
             "gabion: zone allocated",
         );
-        tracing::info!("gabion: set_zone returning NGX_CONF_OK");
         core::NGX_CONF_OK
     }
 }
@@ -860,7 +927,6 @@ extern "C" fn set_rule(
     // the duration of the call, and pointer arithmetic into it is bounded
     // by `nelts`.
     unsafe {
-        tracing::info!("gabion: set_rule entered");
         let main = &mut *(conf as *mut MainConfig);
         let args = (*(*cf).args).elts as *mut ngx_str_t;
         let nelts = (*(*cf).args).nelts;
