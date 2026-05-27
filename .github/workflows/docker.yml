@@ -442,7 +442,7 @@ jobs:
       # Signed SLSA-style provenance attached to the per-arch image
       # digest. The Sigstore signature is keyless — issued against the
       # workflow run's OIDC identity. No secret to rotate.
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
