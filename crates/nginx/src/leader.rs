@@ -158,15 +158,24 @@ impl GossipSettings {
 /// Spawn a leader thread. The thread owns its own `current_thread` tokio
 /// runtime + `LocalSet`. Returns the join handle so callers can await
 /// termination (e.g. on nginx worker shutdown).
+///
+/// Returns an `io::Error` if the OS refuses the thread spawn (out of
+/// memory, `RLIMIT_NPROC`, `EAGAIN` under fork pressure). The previous
+/// implementation called `.expect(...)` on the spawn, which would
+/// panic — but this function is reached from `gabion_init_process`,
+/// an `extern "C"` callback invoked by nginx's worker setup, and a
+/// panic across an FFI boundary is UB. Surface the error instead so
+/// the caller can log it and degrade gracefully (worker stays up
+/// without a leader thread, consistent with gabion's allow-by-default
+/// posture when internal machinery falters — see CLAUDE.md).
 pub fn spawn(
     shm: ShmRegion,
     rules: Arc<CompiledRules>,
     config: LeaderConfig,
-) -> std::thread::JoinHandle<anyhow::Result<()>> {
+) -> std::io::Result<std::thread::JoinHandle<anyhow::Result<()>>> {
     std::thread::Builder::new()
         .name("gabion-leader".to_string())
         .spawn(move || run_leader(shm, rules, config))
-        .expect("spawn gabion-leader thread")
 }
 
 fn run_leader(

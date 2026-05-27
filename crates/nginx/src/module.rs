@@ -2085,7 +2085,35 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
         identity_seed: globals.identity_seed.clone(),
     };
 
-    let handle = leader::spawn(globals.region, globals.rules.clone(), cfg);
+    let handle = match leader::spawn(globals.region, globals.rules.clone(), cfg) {
+        Ok(h) => h,
+        Err(error) => {
+            // OS refused the spawn (OOM, RLIMIT_NPROC, EAGAIN under fork
+            // pressure). A panic here would unwind into nginx's
+            // `init_process` C frame and is UB. Log and degrade
+            // gracefully — the worker stays up handling requests
+            // against whatever SHM aggregate the previous leader left
+            // behind. The next worker that wins the lease will retry
+            // the spawn; if every spawn is failing, the operator needs
+            // to raise their thread budget (`ulimit -u`) or investigate
+            // the host's memory.
+            tracing::error!(
+                worker_id,
+                %error,
+                "gabion: failed to spawn the leader thread. Usually the host \
+                 hit RLIMIT_NPROC, ran out of memory, or returned EAGAIN \
+                 under fork pressure. This worker is staying up without a \
+                 leader thread — requests still admit against the existing \
+                 SHM aggregate but no gossip will be emitted from this \
+                 process. Raise the process / thread limit for the nginx \
+                 user, or check `dmesg` for OOM signals.",
+            );
+            // Release the lease we acquired above so the next worker
+            // gets a fair shot at becoming leader.
+            globals.region.lease().release(worker_id);
+            return core::Status::NGX_OK.into();
+        }
+    };
     if let Ok(mut slot) = LEADER_THREAD.lock() {
         *slot = Some(handle);
     }

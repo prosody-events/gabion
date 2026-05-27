@@ -38,7 +38,19 @@ impl HeaderBuffer {
     }
 
     pub fn as_str(&self) -> &str {
-        std::str::from_utf8(self.as_bytes()).expect("formatted via Display")
+        // SAFETY: the buffer is only written via `write_u64`, which
+        // routes a `u64`'s `Display` output through `StackWriter`. The
+        // `Display` impl for `u64` emits only ASCII digit bytes
+        // (`'0'..='9'`), all of which are valid UTF-8 by themselves
+        // and form a valid UTF-8 string when concatenated. No other
+        // writer touches `bytes`, so every byte in `as_bytes()` is a
+        // valid ASCII digit. Replacing the previous `.expect("...")`
+        // because this is on the reject hot path (every 429 builds
+        // four of these headers) and the panic surface across nginx's
+        // C handler is UB if it ever fires — keeping the contract
+        // local to this module pins the invariant where it's
+        // upheld.
+        unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
     }
 
     fn write_u64(&mut self, value: u64) {
