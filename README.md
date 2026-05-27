@@ -84,8 +84,9 @@ ships a drop-in `envoy.service.ratelimit.v3` server, `gabiond`, that
 shares state through gossip rather than through a central Redis (or
 equivalent) backend, so that the failure of any one replica costs the
 cluster a little freshness rather than its ability to enforce at all.
-This Envoy adapter is younger than the nginx module and has had much
-less production exposure; we still treat it as experimental.
+We still treat this Envoy adapter as experimental: its surface is
+moving as we learn what operators actually need from it, and it has
+seen less use than the nginx module — which is itself young.
 
 ## How it works
 
@@ -141,12 +142,7 @@ The CRDT data structures themselves are described in
 Each adapter's README is a self-contained operator guide covering its
 directives or YAML schema, its runbook entries, and the shape of its
 logging. The sections below only cover the vocabulary and behaviour
-that apply to both. The nginx module is the more mature of the two
-paths, so an operator coming to gabion for the first time will have a
-smoother time starting there; `gabiond` is worth picking up if you are
-already invested in Envoy and want a gossiping replacement for a
-central Redis backend, on the understanding that the surface is still
-moving.
+that apply to both.
 
 ## Glossary
 
