@@ -45,9 +45,10 @@ impl RuleDescriptor {
     }
 
     /// The bucket epoch `now_millis` falls in: `now_millis / bucket_millis`.
-    /// The single source of truth for this floor used by both [`super::CellStore::expire_at`]
-    /// and the visualizer. Returns `0` for a wire-only rule (`bucket_millis == 0`),
-    /// matching the "never expire" path in `expire_at`.
+    /// The single source of truth for this floor used by both
+    /// [`super::CellStore::expire_at`] and the visualizer. Returns `0` for
+    /// a wire-only rule (`bucket_millis == 0`), matching the "never expire"
+    /// path in `expire_at`.
     pub fn current_epoch(&self, now_millis: u64) -> BucketEpoch {
         if self.bucket_millis == 0 {
             0
@@ -56,10 +57,11 @@ impl RuleDescriptor {
         }
     }
 
-    /// Number of live buckets in the window: `ceil(window_millis / bucket_millis)`,
-    /// at least 1. Returns `0` for a wire-only rule (`bucket_millis == 0`); paired
-    /// with [`Self::current_epoch`]'s `0`, `expire_at` then reads `bucket + 0 >= 0`
-    /// as "never expire" — so here `0` means *unbounded*, not *none*.
+    /// Number of live buckets in the window: `ceil(window_millis /
+    /// bucket_millis)`, at least 1. Returns `0` for a wire-only rule
+    /// (`bucket_millis == 0`); paired with [`Self::current_epoch`]'s `0`,
+    /// `expire_at` then reads `bucket + 0 >= 0` as "never expire" — so here
+    /// `0` means *unbounded*, not *none*.
     pub fn live_buckets(&self) -> u32 {
         if self.bucket_millis == 0 {
             0

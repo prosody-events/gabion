@@ -22,6 +22,11 @@ fn override_seeds_differ_when_seeds_differ() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "whoami::hostname() calls libc::gethostname; miri has no shim for that foreign \
+              function"
+)]
 fn falls_back_to_hostname_consistently() {
     // No explicit override — the chain falls through hostname (or IP,
     // or random). The exact value is machine-dependent, but two

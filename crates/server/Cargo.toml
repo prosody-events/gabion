@@ -12,7 +12,10 @@ config.workspace = true
 dashmap.workspace = true
 envoy-types.workspace = true
 futures.workspace = true
-gabion.workspace = true
+# `cell-dump` lets `/debug/introspection` walk the `CellStore` to surface
+# per-cell counts and origins — feature-gated inside `gabion` so callers
+# that don't need it never compile the cell-iteration path.
+gabion = { workspace = true, features = ["cell-dump"] }
 humantime.workspace = true
 humantime-serde.workspace = true
 serde.workspace = true

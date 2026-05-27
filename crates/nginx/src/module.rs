@@ -18,8 +18,8 @@ use ngx::ffi::{
     NGX_CONF_1MORE, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET,
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF,
     NGX_LOG_EMERG, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_http_handler_pt,
-    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t, ngx_module_t, ngx_str_t,
-    ngx_uint_t,
+    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t, ngx_module_t,
+    ngx_pool_cleanup_add, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
     self, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, MergeConfigError,
@@ -135,6 +135,54 @@ impl http::HttpModule for Module {
         core::Status::NGX_OK.into()
     }
 
+    /// Override ngx-rs's default `create_main_conf` to heap-allocate
+    /// [`MainConfig`].
+    ///
+    /// ngx-rs's default routes through `Pool::allocate::<T>(value)`, which
+    /// calls `ngx_palloc(size_of::<T>())` and ignores `align_of::<T>()`.
+    /// nginx's pool only guarantees `NGX_ALIGNMENT` (= `sizeof(unsigned
+    /// long)` = 8 on amd64). `MainConfig` contains
+    /// [`leader::GossipSettings::cluster_id_hash: u128`], so
+    /// `align_of::<MainConfig>() == 16`; writing a 16-aligned value into an
+    /// 8-aligned pool slot is UB. Native linux/amd64 traps when LLVM
+    /// lowers a u128 access to aligned SSE (`movdqa`); macOS arm64 uses
+    /// paired 64-bit loads and tolerates the misalignment; QEMU's TCG
+    /// doesn't enforce alignment either — which is why this only crashed
+    /// on the GHA native amd64 runner.
+    ///
+    /// Box the value instead: the global allocator honors `align_of`. A
+    /// pool cleanup reclaims the box when nginx tears down the cycle's
+    /// pool (config reload or shutdown), so we don't leak per-reload.
+    unsafe extern "C" fn create_main_conf(cf: *mut ngx_conf_t) -> *mut c_void {
+        let boxed = Box::new(MainConfig::default());
+        let ptr = Box::into_raw(boxed);
+
+        // SAFETY: nginx hands us a non-null `cf` per the FFI contract, and
+        // `(*cf).pool` is the cycle pool, alive for the duration of this
+        // cycle. `ngx_pool_cleanup_add(pool, 0)` returns either a valid
+        // pointer to a fresh `ngx_pool_cleanup_t` slot or null on
+        // allocation failure.
+        let cleanup = unsafe { ngx_pool_cleanup_add((*cf).pool, 0) };
+        if cleanup.is_null() {
+            // SAFETY: we still own `ptr` (no consumer has taken it yet);
+            // reconstructing the `Box` from the raw pointer we just leaked
+            // is the canonical way to drop it on the failure path.
+            unsafe { drop(Box::from_raw(ptr)) };
+            return ptr::null_mut();
+        }
+
+        // SAFETY: `cleanup` is non-null (checked above) and points to a
+        // freshly-allocated, exclusively-owned cleanup slot. Setting
+        // `handler` + `data` is the documented contract for installing a
+        // pool cleanup callback (`src/core/ngx_palloc.c`).
+        unsafe {
+            (*cleanup).handler = Some(drop_main_config);
+            (*cleanup).data = ptr.cast();
+        }
+
+        ptr.cast()
+    }
+
     /// nginx invokes this exactly once per cycle, from the master process,
     /// after all configuration directives have been parsed but before any
     /// worker fork. The pointer is a fully-initialised `ngx_conf_t` owned by
@@ -215,6 +263,26 @@ struct LocationConfig {
     off: Option<bool>,
 }
 
+/// Pool-cleanup handler installed by [`Module::create_main_conf`].
+///
+/// nginx invokes this once when the cycle's pool is destroyed, with `data`
+/// pointing back at the `*mut MainConfig` we registered in
+/// `cleanup.data`. Reconstructing the `Box` and dropping it returns the
+/// MainConfig's allocation to the global allocator.
+///
+/// # Safety
+/// `data` must be a pointer produced by `Box::into_raw(Box<MainConfig>)`
+/// and must not have been freed already. Both invariants are upheld by
+/// nginx's contract: it stores exactly the pointer we handed to it and
+/// invokes the handler exactly once.
+unsafe extern "C" fn drop_main_config(data: *mut c_void) {
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: precondition documented above.
+    unsafe { drop(Box::from_raw(data.cast::<MainConfig>())) };
+}
+
 // SAFETY: `HttpModuleMainConf` is an `unsafe trait` in ngx-rs because nginx's
 // configuration slot machinery is implemented in C: nginx allocates a block of
 // memory of size `size_of::<MainConf>()` in `create_main_conf`, treats it as
@@ -230,6 +298,22 @@ unsafe impl HttpModuleMainConf for Module {
     type MainConf = MainConfig;
 }
 
+// No `align_of::<MainConfig>() <= NGX_ALIGNMENT` assert here. `MainConfig`
+// transitively contains `GossipSettings::cluster_id_hash: u128`, so its
+// alignment is 16 — greater than `NGX_ALIGNMENT` (= 8 on amd64). What
+// keeps that sound is `Module::create_main_conf` above: instead of letting
+// ngx-rs `Pool::allocate::<MainConfig>` the value into the pool, we
+// heap-allocate via `Box::new` and store only the resulting
+// `*mut MainConfig` in the pool slot. The pool slot then holds an
+// 8-aligned pointer, which palloc handles correctly. An assert on
+// `align_of::<MainConfig>()` would fire even though the runtime layout is
+// fine, so it can't be expressed at this level.
+//
+// If you change `create_main_conf` back to ngx-rs's default — or add a
+// new over-aligned field to `MainConfig` without keeping the override —
+// the CI native-amd64 nginx smokes crash inside the config phase. Keep
+// the override; the heap path is the only thing making this safe.
+
 // SAFETY: Same justification as `HttpModuleMainConf` above — `LocationConfig`
 // is a POD type with a safe `Default` impl, fitting the ngx-rs contract for
 // nginx's C-managed per-location config slot. See the nomicon chapter on
@@ -237,6 +321,38 @@ unsafe impl HttpModuleMainConf for Module {
 unsafe impl HttpModuleLocationConf for Module {
     type LocationConf = LocationConfig;
 }
+
+// Compile-time alignment guard for the default `create_loc_conf` path.
+// ngx-rs's default routes through `Pool::allocate::<LocationConfig>(value)`,
+// which calls `ngx_palloc(size_of::<T>())` and ignores `align_of::<T>()`.
+// The pool only guarantees `NGX_ALIGNMENT` (= `sizeof(unsigned long)` = 8
+// on amd64), so a type whose alignment exceeds that placed directly into
+// a pool slot is UB — which is exactly the bug that shipped for
+// `MainConfig` until commit 2a1a2e8. This assert catches the same
+// hazard for `LocationConfig` at `cargo check` time, before nginx tries
+// the misaligned write.
+//
+// Scope: this guards types that go through `Pool::allocate::<T>`. Types
+// with a custom `create_*_conf` override (see `Module::create_main_conf`
+// for the pattern) sidestep palloc's alignment limit by heap-allocating
+// and storing only a pointer in the pool, and the assert can't be
+// expressed at that point — so they get a comment instead, next to their
+// unsafe-impl.
+//
+// If you hit this assert: override `create_loc_conf` to heap-allocate
+// via Box::new the same way `Module::create_main_conf` does, or split
+// the over-aligned field (e.g. `u128` → two paired `u64`s, the
+// convention used at the SHM boundary in `crates/nginx/src/shm/`).
+// `::core::mem` — not bare `core::mem` — because this file imports
+// `use ngx::core;` at the top, which shadows the standard `core` crate
+// inside this module. The `::core` prefix bypasses the shadow without
+// dragging the rest of the file off `ngx::core::Status` etc.
+const _: () = assert!(
+    ::core::mem::align_of::<LocationConfig>() <= nginx_sys::NGX_ALIGNMENT,
+    "LocationConfig alignment exceeds NGX_ALIGNMENT; ngx_palloc cannot host it. Override \
+     `create_loc_conf` to heap-allocate via Box::new (see `Module::create_main_conf` for the \
+     cleanup-callback pattern), or split over-aligned fields into paired u64s.",
+);
 
 impl http::Merge for LocationConfig {
     /// Mirrors nginx's `limit_req` inheritance: a child that names any
@@ -1973,7 +2089,35 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
         identity_seed: globals.identity_seed.clone(),
     };
 
-    let handle = leader::spawn(globals.region, globals.rules.clone(), cfg);
+    let handle = match leader::spawn(globals.region, globals.rules.clone(), cfg) {
+        Ok(h) => h,
+        Err(error) => {
+            // OS refused the spawn (OOM, RLIMIT_NPROC, EAGAIN under fork
+            // pressure). A panic here would unwind into nginx's
+            // `init_process` C frame and is UB. Log and degrade
+            // gracefully — the worker stays up handling requests
+            // against whatever SHM aggregate the previous leader left
+            // behind. The next worker that wins the lease will retry
+            // the spawn; if every spawn is failing, the operator needs
+            // to raise their thread budget (`ulimit -u`) or investigate
+            // the host's memory.
+            tracing::error!(
+                worker_id,
+                %error,
+                "gabion: failed to spawn the leader thread. Usually the host \
+                 hit RLIMIT_NPROC, ran out of memory, or returned EAGAIN \
+                 under fork pressure. This worker is staying up without a \
+                 leader thread — requests still admit against the existing \
+                 SHM aggregate but no gossip will be emitted from this \
+                 process. Raise the process / thread limit for the nginx \
+                 user, or check `dmesg` for OOM signals.",
+            );
+            // Release the lease we acquired above so the next worker
+            // gets a fair shot at becoming leader.
+            globals.region.lease().release(worker_id);
+            return core::Status::NGX_OK.into();
+        }
+    };
     if let Ok(mut slot) = LEADER_THREAD.lock() {
         *slot = Some(handle);
     }

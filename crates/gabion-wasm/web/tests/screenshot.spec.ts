@@ -628,11 +628,11 @@ test('the node inspector renders every detail section', async ({ page }) => {
   await expect(inspector.locator('.section-head', { hasText: 'Peers' })).toBeVisible();
 
   // §4 — the cadence status word, live tick sparkline, the adaptive-fanout meter
-  // (base → effective → peak), and the surfaced error budget.
+  // (floor → peak with a coverage badge), and the surfaced error budget.
   await expect(inspector.locator('.cadence .status-word')).toBeVisible();
   await expect(inspector.locator('.cadence .spark')).toBeVisible();
   await expect(inspector.locator('.cadence .fanout-now')).toContainText('peers');
-  await expect(inspector.locator('.cadence .fanout-foot')).toContainText('base');
+  await expect(inspector.locator('.cadence .fanout-foot')).toContainText('floor');
   await expect(inspector.locator('.cadence .budget')).toContainText('error budget');
 
   // §6 — three occupancy gauges + the §5 send-queue meter + the §4 fanout meter
@@ -679,19 +679,19 @@ test('the inspector shows convergence lag and the over-limit state', async ({ pa
   if (box === null) throw new Error('node 0 has no bounding box');
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
   await page.locator('.inspector').getByRole('button', { name: 'Send burst' }).click();
-  await expect(page.locator('.inspector .badge')).toContainText('caught up');
+  await expect(page.locator('.inspector .convergence .badge')).toContainText('caught up');
 
   // Switch to an empty node: it has none of the origin's burst yet → lagging.
   const other = page.locator('.node-label[data-id="6"]');
   box = await other.boundingBox();
   if (box === null) throw new Error('node 6 has no bounding box');
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-  await expect(page.locator('.inspector .badge')).toContainText('lagging');
+  await expect(page.locator('.inspector .convergence .badge')).toContainText('lagging');
   // Step until it catches up by gossip.
   for (let i = 0; i < 12; i++) {
     await page.getByRole('button', { name: 'Step forward one tick' }).click();
   }
-  await expect(page.locator('.inspector .badge')).toContainText('caught up');
+  await expect(page.locator('.inspector .convergence .badge')).toContainText('caught up');
 
   // --- Admission channel, on the overload preset ---
   await page.getByRole('button', { name: 'Sustained overload' }).click();

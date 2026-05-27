@@ -7,10 +7,12 @@ cd "$repo_root"
 context="$(kubectl config current-context)"
 server="$(kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}')"
 
-if [ "$context" != "orbstack" ]; then
-    printf '%s\n' "refusing to run: current kubernetes context is '$context', expected 'orbstack'" >&2
-    exit 1
-fi
+case "$context" in
+    kind-*) ;;
+    *)
+        printf '%s\n' "refusing to run: current kubernetes context is '$context', expected 'kind-*'" >&2
+        exit 1 ;;
+esac
 
 case "$server" in
     https://127.0.0.1:*|https://localhost:*) ;;
@@ -25,6 +27,34 @@ admin_forward_pid=""
 nginx_forward_pid=""
 
 cleanup() {
+    # If the script is failing, dump pod state BEFORE namespace deletion —
+    # otherwise `kubectl delete namespace` wipes pod logs, events, and
+    # describe output before we can read them, leaving CI with nothing
+    # but a generic "rollout timed out" message.
+    if [ "${cleanup_dump:-1}" = "1" ] && [ -n "${namespace:-}" ]; then
+        printf '\n--- cleanup diagnostic dump (namespace=%s) ---\n' "$namespace" >&2
+        kubectl -n "$namespace" get pods,events --sort-by=.lastTimestamp -o wide >&2 || true
+        kubectl -n "$namespace" describe pods -l app=gabiond >&2 || true
+        kubectl -n "$namespace" describe pods -l app=gabion-nginx >&2 || true
+        # --tail=1000 because the smoke-with-bt wrapper prints a full
+        # `gdb thread apply all bt full` on crash, which easily blows
+        # past 200 lines and is the *only* signal for a native SIGSEGV
+        # in the module's config-phase callbacks.
+        kubectl -n "$namespace" logs --all-containers --tail=1000 -l app=gabiond >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=1000 --previous -l app=gabiond >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=1000 -l app=gabion-nginx >&2 || true
+        kubectl -n "$namespace" logs --all-containers --tail=1000 --previous -l app=gabion-nginx >&2 || true
+        # Best-effort: copy /tmp/cores out of any pod that's still
+        # Running (kubectl cp uses `kubectl exec` under the hood, so a
+        # crashed pod's cores are unreachable). The smoke wrapper
+        # already prints a gdb backtrace into stdout above; this just
+        # preserves the raw cores for offline post-mortem.
+        mkdir -p /tmp/cores
+        for pod in $(kubectl -n "$namespace" get pods -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}'); do
+            kubectl -n "$namespace" cp "$pod:/tmp/cores" "/tmp/cores/${namespace}-${pod}" 2>/dev/null || true
+        done
+        printf -- '--- end cleanup diagnostic dump ---\n\n' >&2
+    fi
     if [ -n "$admin_forward_pid" ]; then
         kill "$admin_forward_pid" 2>/dev/null || true
     fi
@@ -180,7 +210,10 @@ spec:
           ports:
             - { name: envoy,  containerPort: 8081 }
             - { name: admin,  containerPort: 9090 }
-            - { name: gossip, containerPort: 9000, protocol: UDP }
+            # EndpointSliceDiscovery filters by the literal port name
+            # "gabion" (see crates/gabion/src/discovery/kubernetes.rs).
+            # Renaming this port disables auto-discovery silently.
+            - { name: gabion, containerPort: 9000, protocol: UDP }
           volumeMounts:
             - name: config
               mountPath: /etc/gabion
@@ -200,7 +233,7 @@ spec:
   ports:
     - { name: envoy,  port: 8081, targetPort: envoy }
     - { name: admin,  port: 9090, targetPort: admin }
-    - { name: gossip, port: 9000, targetPort: gossip, protocol: UDP }
+    - { name: gabion, port: 9000, targetPort: gabion, protocol: UDP }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -221,9 +254,12 @@ spec:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
           imagePullPolicy: Never
+          # See nginx-scale-rate-limit.sh: the image's baked CMD is the
+          # one-shot request smoke, which exits immediately under k8s.
+          command: ["nginx", "-g", "daemon off;"]
           ports:
             - { name: http,   containerPort: 8080 }
-            - { name: gossip, containerPort: 9000, protocol: UDP }
+            - { name: gabion, containerPort: 9000, protocol: UDP }
           volumeMounts:
             - name: config
               mountPath: /etc/nginx/nginx.conf
@@ -243,7 +279,7 @@ spec:
     app: gabion-nginx
   ports:
     - { name: http,   port: 8080, targetPort: http }
-    - { name: gossip, port: 9000, targetPort: gossip, protocol: UDP }
+    - { name: gabion, port: 9000, targetPort: gabion, protocol: UDP }
 YAML
 
 wait_for_endpoint_count() {

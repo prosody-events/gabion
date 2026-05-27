@@ -1,0 +1,50 @@
+# cargo-rail change-impact configuration.
+#
+# Built-in surfaces (build, test, bench, docs, infra) are computed
+# automatically from the touched files in the diff. The custom surfaces
+# below feed the workflow gating in `.github/workflows/*.yml` — each one
+# is exposed by `cargo-rail-action` as `steps.rail.outputs.custom_<name>`.
+#
+# Downstream jobs gate on a surface flag OR a non-pull_request event
+# (release tag, push to main, schedule, manual dispatch), so gating only
+# ever shrinks PR feedback — never the release path.
+
+[change-detection]
+infrastructure = [
+    ".github/**",
+    "Makefile",
+    "rail.toml",
+    "release-please-config.json",
+    ".release-please-manifest.json",
+    "Cargo.lock",
+]
+
+[change-detection.custom]
+nginx_smoke = [
+    "deploy/nginx/**",
+    "crates/nginx/**",
+    "crates/gabion/src/wire/**",
+]
+
+kube_smoke = [
+    "deploy/kubernetes/**",
+    "deploy/nginx/**",
+    "deploy/gabiond/**",
+    "crates/gabion/src/discovery/**",
+    "crates/server/**",
+    "crates/nginx/**",
+    "Cargo.toml",
+    "Cargo.lock",
+]
+
+wasm_viz = [
+    "crates/gabion-wasm/**",
+    "crates/gabion/src/**",
+]
+
+images = [
+    "deploy/**",
+    "crates/**",
+    "Cargo.toml",
+    "Cargo.lock",
+]

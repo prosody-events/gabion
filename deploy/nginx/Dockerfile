@@ -102,15 +102,16 @@ FROM ${NGINX_BASE_IMAGE}
 SHELL ["/bin/sh", "-euxc"]
 
 RUN if command -v apk >/dev/null 2>&1; then \
-        apk add --no-cache curl; \
+        apk add --no-cache curl gdb binutils; \
     elif command -v apt-get >/dev/null 2>&1; then \
         apt-get update; \
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl; \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl gdb binutils; \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
 COPY --from=module-builder /out/ngx_http_gabion_module.so /etc/nginx/modules/ngx_http_gabion_module.so
 COPY deploy/nginx/nginx.module.conf /etc/nginx/nginx.conf
 COPY deploy/nginx/module-request-smoke.sh /usr/local/bin/gabion-nginx-request-smoke
+COPY deploy/nginx/smoke-with-bt.sh /usr/local/bin/gabion-smoke-with-bt
 
-RUN chmod +x /usr/local/bin/gabion-nginx-request-smoke
+RUN chmod +x /usr/local/bin/gabion-nginx-request-smoke /usr/local/bin/gabion-smoke-with-bt

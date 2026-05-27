@@ -39,7 +39,12 @@ SAMPLE_MS = env_int("GABION_BENCH_SAMPLE_MS", 100)
 TIMEOUT_SECONDS = env_int("GABION_BENCH_TIMEOUT_SECONDS", 90)
 KEEP_NAMESPACE = os.environ.get("GABION_BENCH_KEEP_NAMESPACE") == "1"
 
-ADMIN_BASE_PORT = 19100
+# Derived from the pid so parallel bench runs against the same kind
+# cluster (CI's "bench matrix" + a local dev run) can't collide on the
+# host-side port-forward ports. NAMESPACE already varies by pid so the
+# k8s side is namespace-isolated; the only remaining shared resource is
+# the host TCP port range.
+ADMIN_BASE_PORT = 19100 + (os.getpid() % 100)
 RULE_LIMIT = max(REQUESTS * 2, 10_000)
 MAX_CELLS = max(8192, NGINX_REPLICAS * REQUESTS * 2)
 
@@ -62,14 +67,16 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def guard_local_orbstack():
+def guard_local_kind():
     context = run(["kubectl", "config", "current-context"], capture=True).stdout.strip()
     server = run(
         ["kubectl", "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}"],
         capture=True,
     ).stdout.strip()
-    if context != "orbstack":
-        raise SystemExit(f"refusing to run: current kubernetes context is {context!r}, expected 'orbstack'")
+    if not context.startswith("kind-"):
+        raise SystemExit(
+            f"refusing to run: current kubernetes context is {context!r}, expected 'kind-*'"
+        )
     if not (server.startswith("https://127.0.0.1:") or server.startswith("https://localhost:")):
         raise SystemExit(f"refusing to run: kubernetes API server is {server!r}, expected localhost")
     return context, server
@@ -115,46 +122,35 @@ metadata:
   name: gabiond-config
 data:
   config.yaml: |
+    envoy_bind: 0.0.0.0:8081
+    admin_bind: 0.0.0.0:9090
     storage:
-      max_keys: {MAX_CELLS}
       max_cells: {MAX_CELLS}
-      dirty_ring_entries: {MAX_CELLS}
-    server:
-      envoy_rls:
-        enabled: true
-        bind: 0.0.0.0:8081
-      admin:
-        enabled: true
-        bind: 0.0.0.0:9090
+      rule_dictionary_capacity: 64
+      node_dictionary_capacity: 256
+      local_dirty_capacity: 2048
+      forwarded_dirty_capacity: 8192
+      peer_capacity: 64
+    runtime:
+      rng_seed: 12345
     discovery:
-      kind: kubernetes
-      endpoint_slices:
-        - namespace: {NAMESPACE}
-          service_name: gabiond
-          port_name: gossip
-        - namespace: {NAMESPACE}
-          service_name: gabion-nginx
-          port_name: gossip
+      namespace_allow: ["{NAMESPACE}"]
+      service_allow: ["gabiond", "gabion-nginx"]
     gossip:
-      enabled: true
       bind: 0.0.0.0:9000
-      linger_ms: {LINGER_MS}
+      tick_interval: {LINGER_MS}ms
       fanout: {FANOUT}
-      max_payload_bytes: 65536
-      max_cells_per_frame: 4096
+      send_queue_capacity: 32
+      limit_queue_capacity: 1024
       cluster_id_hash: 1
     limits:
       - name: nginx_uri
         domain: nginx
         descriptors:
-          - key: uri
+          - key: request_uri
             value: "*"
         rate: {RULE_LIMIT}r/m
         bucket: 1s
-        local_fallback_limit: {RULE_LIMIT}
-        local_absolute_limit: {RULE_LIMIT}
-        stale_after: 2s
-        overflow_policy: aggregate
         mode: enforce
 ---
 apiVersion: v1
@@ -178,8 +174,6 @@ data:
         gabion_gossip_bind 0.0.0.0:9000;
         gabion_gossip_cluster 1;
         gabion_gossip_fanout {FANOUT};
-        gabion_gossip_max_payload_bytes 65536;
-        gabion_gossip_max_cells_per_frame 4096;
         gabion_gossip_tick_interval {LINGER_MS}ms;
         gabion_discovery_namespace_allow {NAMESPACE};
         gabion_discovery_service_allow gabiond;
@@ -220,8 +214,13 @@ spec:
               containerPort: 8081
             - name: admin
               containerPort: 9090
-            - name: gossip
+            # EndpointSliceDiscovery filters by literal name "gabion" and
+            # protocol "UDP" (crates/gabion/src/discovery/kubernetes.rs).
+            # Both fields are load-bearing — renaming or dropping the
+            # protocol disables peer discovery silently.
+            - name: gabion
               containerPort: 9000
+              protocol: UDP
           volumeMounts:
             - name: config
               mountPath: /etc/gabion
@@ -245,9 +244,10 @@ spec:
     - name: admin
       port: 9090
       targetPort: admin
-    - name: gossip
+    - name: gabion
       port: 9000
-      targetPort: gossip
+      targetPort: gabion
+      protocol: UDP
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -268,11 +268,15 @@ spec:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
           imagePullPolicy: Never
+          # See nginx-scale-rate-limit.sh: the image's baked CMD is the
+          # one-shot request smoke, which exits immediately under k8s.
+          command: ["nginx", "-g", "daemon off;"]
           ports:
             - name: http
               containerPort: 8080
-            - name: gossip
+            - name: gabion
               containerPort: 9000
+              protocol: UDP
           volumeMounts:
             - name: config
               mountPath: /etc/nginx/nginx.conf
@@ -294,9 +298,10 @@ spec:
     - name: http
       port: 8080
       targetPort: http
-    - name: gossip
+    - name: gabion
       port: 9000
-      targetPort: gossip
+      targetPort: gabion
+      protocol: UDP
 """
 
 
@@ -389,12 +394,40 @@ def pods_for_app(app):
 
 
 def wait_http(url, timeout=30):
+    """Poll an HTTP endpoint until it returns a non-5xx. Fails fast on
+    4xx other than 408/429 because those are operator bugs (missing
+    route, bad query) that won't heal by retrying — the previous
+    blanket "swallow URLError" path turned a 404 into a 30s timeout,
+    which is what masked the missing `/readyz` / `/debug/introspection`
+    routes for the bench. 408 (Request Timeout) and 429 (Too Many
+    Requests) are intentionally retried — they're transient by
+    definition. Anything 5xx is also retried since the server may
+    still be coming up.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen(url, timeout=1) as response:
-                if response.status < 500:
+                if response.status < 400:
                     return
+                # 5xx is transient; 4xx (except 408/429) is fatal.
+                if response.status >= 500 or response.status in (408, 429):
+                    pass
+                else:
+                    raise RuntimeError(
+                        f"{url} returned {response.status} — usually means the "
+                        f"endpoint is missing or the URL is wrong. The bench "
+                        f"won't retry 4xx other than 408/429."
+                    )
+        except urllib.error.HTTPError as err:
+            if err.code >= 500 or err.code in (408, 429):
+                pass
+            else:
+                raise RuntimeError(
+                    f"{url} returned HTTP {err.code} — usually means the "
+                    f"endpoint is missing or the URL is wrong. The bench "
+                    f"won't retry 4xx other than 408/429."
+                ) from err
         except (urllib.error.URLError, TimeoutError):
             pass
         time.sleep(0.25)
@@ -456,6 +489,13 @@ def stop_processes(processes):
 
 
 def sample_loop(forwards, rows, stop_event, started_at):
+    # Log the first failure observed for each pod, then swallow the
+    # rest. The previous implementation silently appended a row of
+    # zeros on every failure, which made a missing `/debug/introspection`
+    # endpoint look like "convergence never happened" rather than
+    # "endpoint missing" — which is exactly the bug the bench tripped
+    # over before /debug/introspection existed.
+    logged_failures: set[str] = set()
     while not stop_event.is_set():
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
         for pod, port, _ in forwards:
@@ -481,7 +521,14 @@ def sample_loop(forwards, rows, stop_event, started_at):
                         "peers": len(peers.get("active_peers", [])),
                     }
                 )
-            except Exception:
+            except Exception as err:
+                if pod not in logged_failures:
+                    log(
+                        f"sampler error for pod/{pod} on 127.0.0.1:{port}: "
+                        f"{type(err).__name__}: {err} — subsequent failures "
+                        f"for this pod will be silently zeroed."
+                    )
+                    logged_failures.add(pod)
                 rows.append(
                     {
                         "elapsed_ms": elapsed_ms,
@@ -645,7 +692,7 @@ def benchmark_failures(load, convergence):
 
 
 def main():
-    context, server = guard_local_orbstack()
+    context, server = guard_local_kind()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     forwards = []
@@ -733,6 +780,41 @@ def main():
         if sampler is not None:
             sampler.join(timeout=5)
         stop_processes(forwards)
+        # Dump pod state BEFORE deleting the namespace — otherwise CI
+        # logs lose every signal about why pods crashed.
+        log(f"\n--- cleanup diagnostic dump (namespace={NAMESPACE}) ---")
+        # --tail=1000 captures the smoke-with-bt wrapper's gdb output
+        # on a native SIGSEGV; 200 was enough for plain "rollout timed
+        # out" but truncates a full thread bt.
+        for cmd in (
+            ["kubectl", "-n", NAMESPACE, "get", "pods,events", "--sort-by=.lastTimestamp", "-o", "wide"],
+            ["kubectl", "-n", NAMESPACE, "describe", "pods", "-l", "app=gabiond"],
+            ["kubectl", "-n", NAMESPACE, "describe", "pods", "-l", "app=gabion-nginx"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=1000", "-l", "app=gabiond"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=1000", "--previous", "-l", "app=gabiond"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=1000", "-l", "app=gabion-nginx"],
+            ["kubectl", "-n", NAMESPACE, "logs", "--all-containers", "--tail=1000", "--previous", "-l", "app=gabion-nginx"],
+        ):
+            run(cmd, check=False)
+        # Best-effort: copy /tmp/cores out of any pod that's still
+        # Running. Crashed pods are unreachable via `kubectl cp` (it
+        # uses `kubectl exec` under the hood); the in-pod gdb dump in
+        # the logs above is the primary signal.
+        os.makedirs("/tmp/cores", exist_ok=True)
+        running = run(
+            [
+                "kubectl", "-n", NAMESPACE, "get", "pods",
+                "-o", 'jsonpath={.items[?(@.status.phase=="Running")].metadata.name}',
+            ],
+            capture=True,
+            check=False,
+        )
+        for pod in (running.stdout or "").split():
+            run(
+                ["kubectl", "-n", NAMESPACE, "cp", f"{pod}:/tmp/cores", f"/tmp/cores/{NAMESPACE}-{pod}"],
+                check=False,
+            )
+        log("--- end cleanup diagnostic dump ---\n")
         if KEEP_NAMESPACE:
             print(f"kept namespace {NAMESPACE}", file=sys.stderr)
         else:

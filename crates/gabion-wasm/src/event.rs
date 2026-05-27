@@ -93,14 +93,14 @@ pub struct ClusterState {
     pub nodes: Vec<NodeState>,
     /// The ground-truth cluster total for the watched key — the
     /// simulator-only oracle the convergence fan races toward. Summed across
-    /// every node's locally-originated *live* cells, so it is independent of how
-    /// far gossip has propagated and decays with the window as buckets age out
-    /// (it is not a monotonic accumulator).
+    /// every node's locally-originated *live* cells, so it is independent of
+    /// how far gossip has propagated and decays with the window as buckets
+    /// age out (it is not a monotonic accumulator).
     pub oracle_total: u64,
     /// The bucket epoch the watched rule sits in at `virtual_ms`, straight from
-    /// `RuleDescriptor::current_epoch` — so the Strata renders the CRDT's window
-    /// layout rather than recomputing it. Rule-global in v1 (one watched rule);
-    /// moves per-rule in the v1.1 multi-rule shape.
+    /// `RuleDescriptor::current_epoch` — so the Strata renders the CRDT's
+    /// window layout rather than recomputing it. Rule-global in v1 (one
+    /// watched rule); moves per-rule in the v1.1 multi-rule shape.
     pub bucket_epoch_now: u32,
 }
 
@@ -130,8 +130,8 @@ pub struct NodeState {
     /// Subset of `ticks_total` that were threshold-triggered (an eager flush
     /// crossing the per-rule error budget, not the heartbeat timer).
     pub threshold_fires: u64,
-    /// Subset of `ticks_total` during which at least one cell was dirty when the
-    /// peer pick ran — the ticks that actually carried gossip work.
+    /// Subset of `ticks_total` during which at least one cell was dirty when
+    /// the peer pick ran — the ticks that actually carried gossip work.
     pub dirty_ticks: u64,
     /// Coverage fanout the most recent dirty tick chose: `⌈ln(peers)+c⌉`,
     /// ≥ the base `config.fanout` floor and scaled by cluster size, not the

@@ -1,0 +1,615 @@
+name: docker
+
+on:
+  pull_request:
+    # PRs that don't touch any image input skip the workflow — docs-only
+    # / test-only PRs don't need to burn registry quota. The `pr-build`
+    # job below pushes per-PR images for reviewer testing; the full
+    # build matrix + combine stage are gated to non-PR runs.
+    paths:
+      - 'crates/**'
+      - 'deploy/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/docker.yml'
+  push:
+    branches: [main]
+    tags: ['v*']
+  schedule:
+    # Weekly Monday 06:00 UTC. The cron is what picks up upstream nginx /
+    # openresty patch releases: every flavor's base tag (`stable-alpine`,
+    # `mainline-alpine`, …) floats; rebuilding refreshes the resolved
+    # `nginx<X.Y.Z>` tag so consumers can pin to a specific upstream
+    # patch without anyone bumping anything by hand.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  # Per-PR concurrency: a second push to the same PR cancels the
+  # in-flight build (its tags would be stomped anyway). Main / tag /
+  # cron stay un-cancelled — every release tag deserves a full run.
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  # The docker workflow never triggers on PRs (only `push:main`, tag,
+  # schedule, dispatch) so it has no need for cargo-rail's PR-skip gate.
+  # The plan job here exists solely to resolve the gabion version once
+  # and hand it to every build / combine job below — release tag wins,
+  # otherwise we read `.release-please-manifest.json`.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      ref-tag: ${{ steps.version.outputs.ref-tag }}
+      is-release: ${{ steps.version.outputs.is-release }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: version
+        run: |
+          set -eu
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "ref-tag=v$version" >> "$GITHUB_OUTPUT"
+            echo "is-release=true" >> "$GITHUB_OUTPUT"
+          else
+            version="$(jq -r '."."' .release-please-manifest.json)"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "ref-tag=main" >> "$GITHUB_OUTPUT"
+            echo "is-release=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+  # PR builds: amd64-only, default flavors only. Pushed with two tags:
+  #   - `pr-<N>-<short-sha>` — immutable, one per commit
+  #   - `pr-<N>`             — moving, points at the PR's latest head
+  # Both are prefixed `pr-` so the cleanup workflow can find and prune
+  # them on PR close or by age. Fork PRs skip — GITHUB_TOKEN doesn't
+  # carry `packages:write` for forks; a fork would 401 at login.
+  pr-build:
+    if: |
+      github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: gabiond
+            dockerfile: deploy/gabiond/Dockerfile
+            base-arg: ''
+            base-image: ''
+          - image: loader
+            dockerfile: deploy/kubernetes/loader.Dockerfile
+            base-arg: ''
+            base-image: ''
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:stable-alpine
+          # `openresty` is intentionally excluded from PR builds: its
+          # `cargo chef cook` step segfaults (exit 139, OOM-killer) on
+          # the 7GB ubuntu-latest runner under fat LTO + 1 codegen unit.
+          # Full multi-flavor builds still run on main/tags/cron.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        env:
+          IMAGE_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          short_sha="${HEAD_SHA:0:7}"
+          {
+            printf 'tags<<EOF\n'
+            printf '%s:pr-%s\n' "$IMAGE_REPO" "$PR"
+            printf '%s:pr-%s-%s\n' "$IMAGE_REPO" "$PR" "$short_sha"
+            printf 'EOF\n'
+            printf 'short-sha=%s\n' "$short_sha"
+          } >> "$GITHUB_OUTPUT"
+        shell: bash
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            ${{ matrix.base-arg != '' && format('{0}={1}', matrix.base-arg, matrix.base-image) || '' }}
+          # GHA-only cache; scope per (image,arch). PR scope is separate
+          # from release scope so a stale PR layer never poisons a
+          # release rebuild.
+          cache-from: type=gha,scope=pr-${{ matrix.image }}-amd64
+          cache-to: type=gha,mode=max,scope=pr-${{ matrix.image }}-amd64
+          # Skip provenance + sbom on PRs — they're for releases, and
+          # they bloat per-PR registry churn the cleanup has to sweep.
+          provenance: false
+          sbom: false
+
+  # One sticky comment per PR with the resolved `docker pull` lines.
+  # Re-runs on every commit overwrite the comment in place rather than
+  # piling up — the header field makes it idempotent.
+  pr-comment:
+    if: |
+      github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
+    needs: pr-build
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: docker-pr-images
+          message: |
+            ### Docker images for this PR
+
+            Pull a moving tag (latest commit on this PR):
+
+            ```sh
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gabiond:pr-${{ github.event.pull_request.number }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/loader:pr-${{ github.event.pull_request.number }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/nginx:pr-${{ github.event.pull_request.number }}
+            ```
+
+            Or pin to this exact commit (`${{ github.event.pull_request.head.sha }}`):
+
+            ```sh
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gabiond:pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+            ```
+
+            `linux/amd64` only on PRs; openresty + multi-arch + non-default flavors build on `main`. Tags are auto-pruned when this PR closes (or after 30 days, whichever comes first).
+
+  # Stage 1: one job per (image × flavor × arch). Each job builds a
+  # single-platform image, pushes it to GHCR by digest, and uploads the
+  # digest as an artifact for the manifest-combine job.
+  build:
+    if: github.event_name != 'pull_request'
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # gabiond — single flavor.
+          - image: gabiond
+            dockerfile: deploy/gabiond/Dockerfile
+            flavor: default
+            flavor-suffix: ''
+            base-arg: ''
+            base-image: ''
+            arch: amd64
+            runner: ubuntu-latest
+          - image: gabiond
+            dockerfile: deploy/gabiond/Dockerfile
+            flavor: default
+            flavor-suffix: ''
+            base-arg: ''
+            base-image: ''
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          # loader — single flavor.
+          - image: loader
+            dockerfile: deploy/kubernetes/loader.Dockerfile
+            flavor: default
+            flavor-suffix: ''
+            base-arg: ''
+            base-image: ''
+            arch: amd64
+            runner: ubuntu-latest
+          - image: loader
+            dockerfile: deploy/kubernetes/loader.Dockerfile
+            flavor: default
+            flavor-suffix: ''
+            base-arg: ''
+            base-image: ''
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          # nginx — six flavors. Default (no suffix) is stable-alpine.
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: stable-alpine
+            flavor-suffix: ''
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:stable-alpine
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: stable-alpine
+            flavor-suffix: ''
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:stable-alpine
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: mainline-alpine
+            flavor-suffix: mainline-alpine
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:mainline-alpine
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: mainline-alpine
+            flavor-suffix: mainline-alpine
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:mainline-alpine
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: alpine
+            flavor-suffix: alpine
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:alpine
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: alpine
+            flavor-suffix: alpine
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:alpine
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: stable
+            flavor-suffix: stable
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:stable
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: stable
+            flavor-suffix: stable
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:stable
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: mainline
+            flavor-suffix: mainline
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:mainline
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: mainline
+            flavor-suffix: mainline
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:mainline
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: latest
+            flavor-suffix: debian
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:latest
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: latest
+            flavor-suffix: debian
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:latest
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          # openresty — three flavors. Default (no suffix) is alpine.
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: alpine
+            flavor-suffix: ''
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:alpine
+            arch: amd64
+            runner: ubuntu-latest
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: alpine
+            flavor-suffix: ''
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:alpine
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: jammy
+            flavor-suffix: jammy
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:jammy
+            arch: amd64
+            runner: ubuntu-latest
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: jammy
+            flavor-suffix: jammy
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:jammy
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: bookworm
+            flavor-suffix: bookworm
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:bookworm
+            arch: amd64
+            runner: ubuntu-latest
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: bookworm
+            flavor-suffix: bookworm
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:bookworm
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolve the upstream nginx/openresty version baked into the
+      # chosen base image. nginx exposes NGINX_VERSION as a runtime env
+      # var; openresty doesn't expose RESTY_VERSION, so parse
+      # `nginx -v`'s output instead.
+      - id: resolve
+        if: matrix.base-image != ''
+        env:
+          BASE_IMAGE: ${{ matrix.base-image }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          docker pull --platform="linux/${ARCH}" "$BASE_IMAGE"
+          if [[ "${{ matrix.image }}" == "nginx" ]]; then
+            ver=$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$BASE_IMAGE" \
+              | sed -n 's/^NGINX_VERSION=//p' \
+              | head -n1)
+            echo "upstream-tag=nginx${ver}" >> "$GITHUB_OUTPUT"
+            echo "upstream-version=${ver}" >> "$GITHUB_OUTPUT"
+          else
+            ver=$(docker run --rm --platform="linux/${ARCH}" --entrypoint sh "$BASE_IMAGE" \
+              -c '/usr/local/openresty/nginx/sbin/nginx -v 2>&1' \
+              | sed -n 's|^nginx version: openresty/\([0-9.]*\).*|\1|p')
+            echo "upstream-tag=openresty${ver}" >> "$GITHUB_OUTPUT"
+            echo "upstream-version=${ver}" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            ${{ matrix.base-arg != '' && format('{0}={1}', matrix.base-arg, matrix.base-image) || '' }}
+          # `mode=max` exports every layer (not just the final), which is
+          # what makes cargo-chef shine — the recipe-frozen build layer is
+          # what we want to skip on re-runs. Scope per (image,flavor,arch)
+          # so an amd64 layer never tries to satisfy an arm64 build.
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          # `mode=max` provenance records the full build graph in the
+          # image's OCI index. The signed attestation goes through
+          # actions/attest-build-provenance below.
+          provenance: mode=max
+          sbom: true
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+
+      # Signed SLSA-style provenance attached to the per-arch image
+      # digest. The Sigstore signature is keyless — issued against the
+      # workflow run's OIDC identity. No secret to rotate.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: capture digest
+        run: |
+          set -eu
+          mkdir -p /tmp/digests
+          # `name | flavor | upstream-tag` carry to the combine stage.
+          # The arch is encoded in the artifact name itself.
+          name='${{ matrix.image }}'
+          flavor='${{ matrix.flavor }}'
+          digest='${{ steps.build.outputs.digest }}'
+          upstream='${{ steps.resolve.outputs.upstream-tag || '' }}'
+          printf '%s\n' "$digest" > "/tmp/digests/digest"
+          printf '%s\n' "$upstream" > "/tmp/digests/upstream"
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stage 2: one job per (image × flavor). Pull both arch digests,
+  # `docker buildx imagetools create` a multi-arch manifest under every
+  # tag the scheme says we should publish.
+  combine:
+    if: github.event_name != 'pull_request'
+    needs: [plan, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: gabiond
+            flavor: default
+            flavor-suffix: ''
+            kind: app
+          - image: loader
+            flavor: default
+            flavor-suffix: ''
+            kind: app
+          - image: nginx
+            flavor: stable-alpine
+            flavor-suffix: ''
+            kind: nginx
+          - image: nginx
+            flavor: mainline-alpine
+            flavor-suffix: mainline-alpine
+            kind: nginx
+          - image: nginx
+            flavor: alpine
+            flavor-suffix: alpine
+            kind: nginx
+          - image: nginx
+            flavor: stable
+            flavor-suffix: stable
+            kind: nginx
+          - image: nginx
+            flavor: mainline
+            flavor-suffix: mainline
+            kind: nginx
+          - image: nginx
+            flavor: latest
+            flavor-suffix: debian
+            kind: nginx
+          - image: openresty
+            flavor: alpine
+            flavor-suffix: ''
+            kind: nginx
+          - image: openresty
+            flavor: jammy
+            flavor-suffix: jammy
+            kind: nginx
+          - image: openresty
+            flavor: bookworm
+            flavor-suffix: bookworm
+            kind: nginx
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.flavor }}-amd64
+          path: /tmp/digests/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: digest-${{ matrix.image }}-${{ matrix.flavor }}-arm64
+          path: /tmp/digests/arm64
+
+      - id: assemble
+        env:
+          IMAGE_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          REF_TAG: ${{ needs.plan.outputs.ref-tag }}
+          IS_RELEASE: ${{ needs.plan.outputs.is-release }}
+          FLAVOR_SUFFIX: ${{ matrix.flavor-suffix }}
+          KIND: ${{ matrix.kind }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          amd64_digest="$(cat /tmp/digests/amd64/digest)"
+          arm64_digest="$(cat /tmp/digests/arm64/digest)"
+          upstream="$(cat /tmp/digests/amd64/upstream)"
+
+          tags=()
+          short_sha="${SHA:0:7}"
+          # `app` images (gabiond, loader) only ever carry version and
+          # ref-tag — no flavor and no upstream-version axis.
+          # `nginx`-shaped images (nginx, openresty) layer the resolved
+          # upstream version onto the same set.
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            base_versioned="$REF_TAG"
+            base_latest="latest"
+          else
+            base_versioned="main-$short_sha"
+            base_latest="main"
+          fi
+
+          if [[ "$KIND" == "app" ]]; then
+            tags+=("${IMAGE_REPO}:${base_versioned}")
+            if [[ "$IS_RELEASE" == "true" ]]; then
+              tags+=("${IMAGE_REPO}:${base_latest}")
+            else
+              # On main pushes, also publish a moving `:main` pointer.
+              tags+=("${IMAGE_REPO}:main")
+            fi
+          else
+            if [[ -z "$FLAVOR_SUFFIX" ]]; then
+              # Default flavor — no suffix in the tag.
+              tags+=("${IMAGE_REPO}:${base_versioned}")
+              if [[ "$IS_RELEASE" == "true" ]]; then
+                tags+=("${IMAGE_REPO}:${base_versioned}-${upstream}")
+                tags+=("${IMAGE_REPO}:${base_latest}")
+                tags+=("${IMAGE_REPO}:${upstream}")
+              else
+                tags+=("${IMAGE_REPO}:main")
+                tags+=("${IMAGE_REPO}:${upstream}-main")
+              fi
+            else
+              tags+=("${IMAGE_REPO}:${base_versioned}-${FLAVOR_SUFFIX}")
+              if [[ "$IS_RELEASE" == "true" ]]; then
+                tags+=("${IMAGE_REPO}:${base_versioned}-${upstream}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${base_latest}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${upstream}-${FLAVOR_SUFFIX}")
+              else
+                tags+=("${IMAGE_REPO}:main-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${upstream}-main-${FLAVOR_SUFFIX}")
+              fi
+            fi
+          fi
+
+          # Emit one `--tag` per resolved tag plus the two source digests.
+          args=()
+          for t in "${tags[@]}"; do
+            args+=("--tag" "$t")
+          done
+          args+=("${IMAGE_REPO}@${amd64_digest}" "${IMAGE_REPO}@${arm64_digest}")
+          printf '%s\n' "${tags[@]}"
+          docker buildx imagetools create "${args[@]}"
+        shell: bash

@@ -18,6 +18,14 @@ pub struct QueueOverflow;
 ///
 /// Layout-wise, `AtomicU64` is identical to `u64`/`AtomicU32` to `u32`, so
 /// the SHM byte image is unchanged.
+///
+/// `rule_fingerprint` and `key_hash` are logically `u128`s, split into
+/// paired `(lo, hi)` `AtomicU64`s on the same alignment-workaround
+/// principle that drives `shm/header.rs::NodeIdentityFields` and
+/// `Module::create_main_conf`'s `Box::new`: the SHM mapping only
+/// guarantees 8-byte alignment, and a 16-aligned `u128` placed
+/// directly here would be UB on amd64 (LLVM lowers u128 access to
+/// aligned SSE on that target). Don't "simplify" these back to `u128`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct QueueSlot {

@@ -1,0 +1,93 @@
+name: ghcr-cleanup
+
+on:
+  # On PR close (merged or rejected) — sweep that PR's tags
+  # immediately. The `pr-build` job in docker.yml only ever publishes
+  # `pr-<N>` and `pr-<N>-<short-sha>` tags, so the deletion set is
+  # bounded and predictable.
+  pull_request:
+    types: [closed]
+  # Weekly safety net: anything `pr-*` older than 30 days gets pruned,
+  # in case the close-event handler missed a tag (network blip, fork
+  # PR closed before merge, etc.).
+  schedule:
+    - cron: '0 5 * * 6'
+  workflow_dispatch:
+    inputs:
+      max-age-days:
+        description: 'Delete pr-* tags older than this many days (manual sweeps)'
+        type: number
+        default: 30
+
+permissions:
+  packages: write
+  pull-requests: read
+  contents: read
+
+jobs:
+  cleanup-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: delete pr-${{ github.event.pull_request.number }} images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          # GHCR packages are owner-scoped under either /orgs/{org} or
+          # /users/{user}. Probe once.
+          if gh api "/orgs/${OWNER}" >/dev/null 2>&1; then
+            base="orgs/${OWNER}"
+          else
+            base="users/${OWNER}"
+          fi
+          for image in gabiond loader nginx openresty; do
+            pkg=$(printf '%s/%s' "$REPO" "$image" | jq -sRr @uri)
+            # Match the moving `pr-N` tag and any `pr-N-<sha>` pins.
+            ids=$(gh api --paginate "/${base}/packages/container/${pkg}/versions" \
+                    --jq ".[] | select(.metadata.container.tags | map(. == \"pr-${PR}\" or startswith(\"pr-${PR}-\")) | any) | .id" \
+                    || true)
+            for id in $ids; do
+              printf 'deleting %s version %s\n' "$image" "$id"
+              gh api -X DELETE "/${base}/packages/container/${pkg}/versions/${id}"
+            done
+          done
+
+  cleanup-orphans:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: delete pr-* images older than ${{ inputs.max-age-days || 30 }} days
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          MAX_AGE_DAYS: ${{ inputs.max-age-days || 30 }}
+        run: |
+          set -eu
+          if gh api "/orgs/${OWNER}" >/dev/null 2>&1; then
+            base="orgs/${OWNER}"
+          else
+            base="users/${OWNER}"
+          fi
+          cutoff=$(python3 -c "import time; print(int(time.time()) - ${MAX_AGE_DAYS}*86400)")
+          for image in gabiond loader nginx openresty; do
+            pkg=$(printf '%s/%s' "$REPO" "$image" | jq -sRr @uri)
+            # Pull every version, keep only ones whose tags all start
+            # with `pr-` (so we never sweep a moving release tag) and
+            # whose updated_at predates the cutoff.
+            ids=$(gh api --paginate "/${base}/packages/container/${pkg}/versions" \
+                    --jq ".[]
+                          | select((.metadata.container.tags | length) > 0)
+                          | select(.metadata.container.tags | map(startswith(\"pr-\")) | all)
+                          | select((.updated_at | fromdateiso8601) < ${cutoff})
+                          | .id" \
+                    || true)
+            for id in $ids; do
+              printf 'deleting orphan %s version %s\n' "$image" "$id"
+              gh api -X DELETE "/${base}/packages/container/${pkg}/versions/${id}"
+            done
+          done

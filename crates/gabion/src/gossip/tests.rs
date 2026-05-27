@@ -20,8 +20,10 @@ use crate::crdt::{
     NodeIdentity, RuleDescriptor,
 };
 use crate::discovery::{Peer, PeerEvent};
+#[cfg(feature = "transport-udp")]
+use crate::gossip::UdpTransport;
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
-use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, UdpTransport};
+use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock};
 use crate::wire::HmacKey;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
@@ -1534,9 +1536,9 @@ async fn coverage_fanout_tracks_ln_n_plus_c() {
                 let observed = observe_coverage_fanout(peers, GOSSIP_FANOUT).await;
                 assert_eq!(
                     observed, expected,
-                    "coverage fanout for {peers} peers: expected \
-                     max({GOSSIP_FANOUT}, ⌈ln({peers})+{GOSSIP_COVERAGE_MARGIN}⌉={coverage})\
-                     .min({peers}) = {expected}, got {observed}",
+                    "coverage fanout for {peers} peers: expected max({GOSSIP_FANOUT}, \
+                     ⌈ln({peers})+{GOSSIP_COVERAGE_MARGIN}⌉={coverage}).min({peers}) = \
+                     {expected}, got {observed}",
                 );
             }
         })
@@ -1588,6 +1590,11 @@ async fn observe_coverage_fanout(peers: usize, base: usize) -> usize {
 
 // -- UDP smoke --------------------------------------------------------------
 
+// `UdpTransport` and the `tokio::net::UdpSocket` it wraps live behind the
+// `transport-udp` feature (see `crates/gabion/src/gossip.rs:42-43`). Without
+// the gate, `cargo nextest run -p gabion --no-default-features` — the form
+// the kubernetes smokes use — fails to compile this whole test crate.
+#[cfg(feature = "transport-udp")]
 #[tokio::test(flavor = "current_thread")]
 async fn udp_round_trip_smoke() {
     let local = LocalSet::new();

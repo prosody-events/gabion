@@ -1,0 +1,117 @@
+name: safety
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly Miri pass on `main` — guards against nightly toolchain
+    # regressions in Miri itself, not just our own code.
+    - cron: '0 7 * * 1'
+
+concurrency:
+  group: safety-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      build:      ${{ steps.rail.outputs.build }}
+      test:       ${{ steps.rail.outputs.test }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: loadingalias/cargo-rail-action@v4
+        id: rail
+        with:
+          mode: minimal
+
+  # Each Miri job is one make target. Together they cover everything
+  # `make miri-all` runs locally — split for parallelism and so a failure
+  # points at the exact mode that broke.
+  miri-safety:
+    needs: plan
+    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-safety
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
+      - run: make miri-safety
+
+  miri-safety-tb:
+    needs: plan
+    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-safety-tb
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
+      - run: make miri-safety-tb
+
+  miri-lib:
+    needs: plan
+    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-lib
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
+      - run: make miri-lib
+
+  # The Tree-Borrows half of `make miri-all` beyond the three Stacked-Borrows
+  # passes above. The Makefile doesn't expose this as a standalone target, so
+  # invoke the same command directly.
+  miri-lib-tb:
+    needs: plan
+    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      # `-Zmiri-disable-isolation` matches what `make miri-lib` sets —
+      # the identity tests need a real-time clock, which miri refuses
+      # under default isolation. Tree Borrows is independent of that.
+      MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-disable-isolation
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-lib-tb
+      - uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
+      - run: rustup run nightly cargo miri nextest run --no-fail-fast -p gabion-nginx --lib

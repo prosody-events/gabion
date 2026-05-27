@@ -1,0 +1,126 @@
+name: nginx
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: nginx-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      nginx-smoke: ${{ steps.surfaces.outputs.nginx_smoke }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: loadingalias/cargo-rail-action@v4
+        id: rail
+        with:
+          mode: minimal
+      # cargo-rail-action v4.1.3 doesn't expose `custom_<name>` outputs;
+      # parse them out of `scope-json` directly.
+      - id: surfaces
+        env:
+          SCOPE_JSON: ${{ steps.rail.outputs.scope-json }}
+        run: |
+          set -eu
+          val=$(printf '%s' "$SCOPE_JSON" | jq -r '.surfaces["custom:nginx_smoke"] // false')
+          echo "nginx_smoke=$val" >> "$GITHUB_OUTPUT"
+
+  nginx-config:
+    needs: plan
+    if: needs.plan.outputs.nginx-smoke == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:latest
+      - name: nginx-config smoke
+        env:
+          DOCKER_BUILDKIT: '1'
+          COMPOSE_DOCKER_CLI_BUILD: '1'
+        run: make nginx-config
+
+  nginx-module:
+    needs: plan
+    if: needs.plan.outputs.nginx-smoke == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:latest
+      # Route the host kernel's core dumps into /tmp/cores so the
+      # smoke container (bind-mounted at /tmp/cores:/tmp/cores) and the
+      # workflow's artifact upload below can pick them up. GHA's
+      # ubuntu-latest defaults `kernel.core_pattern` to apport, which
+      # stashes cores in an unreadable path. The container path
+      # resolves against the dumping process's filesystem root, so the
+      # bind mount makes host and container see the same file.
+      - name: enable host core dumps
+        run: |
+          sudo mkdir -p /tmp/cores
+          sudo chmod 1777 /tmp/cores
+          sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
+      - name: nginx-module smoke
+        env:
+          DOCKER_BUILDKIT: '1'
+          COMPOSE_DOCKER_CLI_BUILD: '1'
+        run: make nginx-module
+      # Cores are written by root inside the container so the runner
+      # user can't open them for read. `sudo chmod` fixes the perms
+      # before upload-artifact zips the directory.
+      - name: relax core perms for upload
+        if: failure()
+        run: sudo chmod -R a+r /tmp/cores 2>/dev/null || true
+      - name: upload cores on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cores-${{ github.job }}-${{ github.run_attempt }}
+          path: /tmp/cores
+          if-no-files-found: ignore
+
+  nginx-test:
+    needs: plan
+    if: needs.plan.outputs.nginx-smoke == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:latest
+      - name: enable host core dumps
+        run: |
+          sudo mkdir -p /tmp/cores
+          sudo chmod 1777 /tmp/cores
+          sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
+      - name: nginx-test smoke
+        env:
+          DOCKER_BUILDKIT: '1'
+          COMPOSE_DOCKER_CLI_BUILD: '1'
+        run: make nginx-test
+      # Cores are written by root inside the container so the runner
+      # user can't open them for read. `sudo chmod` fixes the perms
+      # before upload-artifact zips the directory.
+      - name: relax core perms for upload
+        if: failure()
+        run: sudo chmod -R a+r /tmp/cores 2>/dev/null || true
+      - name: upload cores on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cores-${{ github.job }}-${{ github.run_attempt }}
+          path: /tmp/cores
+          if-no-files-found: ignore

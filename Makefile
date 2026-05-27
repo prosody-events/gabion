@@ -2,14 +2,13 @@ SHELL := /bin/sh
 
 COMPOSE := docker compose --profile module -f deploy/nginx/docker-compose.yml
 CARGO_ENV := CARGO_BUILD_RUSTC_WRAPPER=
-# Resolve toolchain-pinned cargo binaries explicitly so the Makefile works
-# under stripped-down environments (e.g. CI), where PATH probing may fall
-# through to a broken `cargo` shim. Each cargo invocation needs `rustc`
-# from the same toolchain on PATH.
-STABLE_BIN := $(HOME)/.rustup/toolchains/stable-aarch64-apple-darwin/bin
-NIGHTLY_BIN := $(HOME)/.rustup/toolchains/nightly-aarch64-apple-darwin/bin
-STABLE_CARGO := PATH="$(STABLE_BIN):$$PATH" $(STABLE_BIN)/cargo
-NIGHTLY_CARGO := PATH="$(NIGHTLY_BIN):$$PATH" $(NIGHTLY_BIN)/cargo
+# `rustup run` resolves the correct toolchain for the host triple and puts
+# the matching `rustc` on PATH for the duration of the call — works the
+# same on macOS arm64 contributor laptops and the `x86_64-unknown-linux-gnu`
+# GitHub Actions runners we ship CI on. The `require-*` targets below
+# verify the toolchains are installed before any cargo invocation.
+STABLE_CARGO := rustup run stable cargo
+NIGHTLY_CARGO := rustup run nightly cargo
 
 # `cargo nextest` is the *only* sanctioned test runner for this repo.
 # Faster than `cargo test`, surfaces failures earlier, supports per-test
@@ -113,6 +112,8 @@ help:
 	@printf '%s\n' '  make safety          Run gabion-nginx safety integration tests (cargo nextest)'
 	@printf '%s\n' '  make miri-safety     Run safety tests under miri (Stacked Borrows)'
 	@printf '%s\n' '  make miri-safety-tb  Run safety tests under miri (Tree Borrows)'
+	@printf '%s\n' '  make miri-ffi-alignment    Run FFI alignment tests under miri (Stacked Borrows)'
+	@printf '%s\n' '  make miri-ffi-alignment-tb Run FFI alignment tests under miri (Tree Borrows)'
 	@printf '%s\n' '  make miri-lib        Run all gabion-nginx lib tests under miri'
 	@printf '%s\n' '  make miri-all        Run miri (Stacked + Tree Borrows) on every gabion-nginx test'
 	@printf '%s\n' '  make bench-check     Compile gabion::crdt benchmarks'
@@ -122,12 +123,13 @@ help:
 	@printf '%s\n' '  make nginx-test      Build NGINX module and assert 200, 200, 429 responses'
 	@printf '%s\n' '  make nginx-matrix    Build Gabion NGINX images for common official NGINX tags'
 	@printf '%s\n' '  make openresty-matrix Build Gabion OpenResty images for common OpenResty tags'
-	@printf '%s\n' '  make kubernetes-test Run guarded local OrbStack EndpointSlice convergence tests'
-	@printf '%s\n' '  make kubernetes-nginx-test Run guarded local OrbStack NGINX scale rate-limit tests'
-	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local OrbStack NGINX plus Gabion server gossip test'
-	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local OrbStack gossip propagation benchmark'
+	@printf '%s\n' '  make kubernetes-test Run guarded local kind EndpointSlice convergence tests'
+	@printf '%s\n' '  make kubernetes-nginx-test Run guarded local kind NGINX scale rate-limit tests'
+	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local kind NGINX plus Gabion server gossip test'
+	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local kind gossip propagation benchmark'
 	@printf '%s\n' '  make kubernetes-clean Delete local Kubernetes test namespaces'
-	@printf '%s\n' '  make ci              Run test, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
+	@printf '%s\n' '  make ci              Fast contributor pre-merge: test, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
+	@printf '%s\n' '  make ci-full         Mirror GitHub Actions end-to-end: ci + miri-all + every kubernetes-* target'
 
 .PHONY: fmt
 fmt: fmt-check
@@ -166,16 +168,34 @@ miri-safety:
 miri-safety-tb:
 	MIRIFLAGS="-Zmiri-tree-borrows" $(CARGO_ENV) $(MIRI) -p gabion-nginx --test safety
 
+# FFI alignment regression test: pins the misaligned-write UB that
+# crashed the native amd64 nginx smoke before commit 2a1a2e8. Lives in
+# its own integration test so it can run under Miri without dragging
+# in the rest of `safety.rs`. No nginx-sys / ngx headers, so it runs
+# without the `ngx-module` feature.
+.PHONY: miri-ffi-alignment
+miri-ffi-alignment:
+	$(CARGO_ENV) $(MIRI) -p gabion-nginx --test ffi_alignment
+
+.PHONY: miri-ffi-alignment-tb
+miri-ffi-alignment-tb:
+	MIRIFLAGS="-Zmiri-tree-borrows" $(CARGO_ENV) $(MIRI) -p gabion-nginx --test ffi_alignment
+
 .PHONY: miri-lib
 miri-lib:
-	$(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
+	# `identity::tests` reads `SystemTime::now()` via `clock_gettime(REALTIME)`,
+	# which miri refuses under default isolation. Disabling isolation is
+	# the official recommendation from miri's own error message and is
+	# scoped per-target by the make variable so the rest of the gate
+	# (safety integration tests, etc.) still runs under default isolation.
+	MIRIFLAGS="-Zmiri-disable-isolation" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
 
 # Full miri coverage: both lib tests and safety integration tests, under
 # both Stacked Borrows and Tree Borrows. Ramps up CI time significantly
 # (a few minutes); not part of `make test` by default — run before merge.
 .PHONY: miri-all
-miri-all: miri-lib miri-safety miri-safety-tb
-	MIRIFLAGS="-Zmiri-tree-borrows" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
+miri-all: miri-lib miri-safety miri-safety-tb miri-ffi-alignment miri-ffi-alignment-tb
+	MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-disable-isolation" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
 
 .PHONY: hygiene
 hygiene:
@@ -243,5 +263,14 @@ kubernetes-gossip-bench:
 kubernetes-clean:
 	sh deploy/kubernetes/local-clean.sh
 
+# `ci` is the fast subset a contributor runs before opening a PR: it pairs
+# the local test gate with the slower miri / nginx / wasm smokes that
+# `make test` alone skips. It deliberately does *not* run miri-all or any
+# kubernetes-* target (kind boot + image builds are too slow for the
+# pre-merge loop) — `make ci-full` does, and matches what GitHub Actions
+# runs end-to-end.
 .PHONY: ci
 ci: test miri-safety bench-check wasm-check nginx-config nginx-module nginx-test
+
+.PHONY: ci-full
+ci-full: ci miri-all kubernetes-test kubernetes-nginx-test kubernetes-mixed-test kubernetes-gossip-bench

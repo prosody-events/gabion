@@ -235,8 +235,8 @@ fn coverage_fanout_and_budget_surface_in_snapshot() {
             .expect("node 0 present");
         assert_eq!(
             origin.effective_fanout, expected,
-            "a 12-member cluster fans out to the coverage threshold \
-             ⌈ln(11)+c⌉={expected}, independent of the dirty set; got {}",
+            "a 12-member cluster fans out to the coverage threshold ⌈ln(11)+c⌉={expected}, \
+             independent of the dirty set; got {}",
             origin.effective_fanout,
         );
         assert!(
@@ -282,8 +282,8 @@ fn oracle_total_is_windowed_and_counts_each_origin_once() {
         );
         assert_eq!(
             converged.oracle_total, 9,
-            "the replica on node 1 is not local, so the oracle still counts the \
-             hit once at its single origin"
+            "the replica on node 1 is not local, so the oracle still counts the hit once at its \
+             single origin"
         );
 
         // Step well past the 2 s window so the only bucket ages out everywhere.
@@ -582,8 +582,8 @@ fn events_serialize_with_hex_identifiers() {
 /// This is a pure check of the sizing math; the runtime path is exercised by
 /// [`moderate_cluster_runtime_honors_the_shrunk_sizing`] and the growth path by
 /// [`grown_cluster_holds_every_origin_without_overflow`]. (A `MAX_NODES`
-/// *functional* run is intentionally not attempted — 256 nodes gossiping at once
-/// saturates the deterministic `SimRouter`'s inbound queues and trips a
+/// *functional* run is intentionally not attempted — 256 nodes gossiping at
+/// once saturates the deterministic `SimRouter`'s inbound queues and trips a
 /// debug-only wire backpressure assert unrelated to cell-store sizing.)
 #[test]
 fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
@@ -645,9 +645,9 @@ fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
     assert!(caps.local_dirty_capacity < gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY / 1_000);
 }
 
-/// The live runtime honors the shrunk, derived sizing: a cluster the size of the
-/// heaviest existing test (N=32) takes the watched key spread across nodes and
-/// buckets, gossips to convergence, and reports the *derived* (small) store
+/// The live runtime honors the shrunk, derived sizing: a cluster the size of
+/// the heaviest existing test (N=32) takes the watched key spread across nodes
+/// and buckets, gossips to convergence, and reports the *derived* (small) store
 /// capacity with not a single eviction on any node.
 #[test]
 fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
@@ -808,8 +808,8 @@ fn second_burst_after_expiry_still_ages_out() {
         let aged = snapshot(&tx).await;
         assert!(
             aged.nodes.iter().all(|n| n.aggregate_total == 0),
-            "second burst must age out in the 10 s window like the first — a non-zero \
-             total here means it was stored under the default 60 s descriptor: {:?}",
+            "second burst must age out in the 10 s window like the first — a non-zero total here \
+             means it was stored under the default 60 s descriptor: {:?}",
             aged.nodes
                 .iter()
                 .map(|n| n.aggregate_total)

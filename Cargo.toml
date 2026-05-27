@@ -81,3 +81,10 @@ whoami = "2"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+# Keep address → file:line mapping in release binaries so a SIGSEGV at
+# 2am (or in CI, where `gdb` is the only signal) produces a backtrace
+# pointing at Rust source instead of bare addresses. `line-tables-only`
+# is the smallest debuginfo bump: no variable info, no codegen change,
+# no LTO impact — only the line tables. Adds ~3–5 MB to the nginx .so
+# and to `gabiond`.
+debug = "line-tables-only"
