@@ -37,6 +37,22 @@ library sits underneath both adapters, so an nginx worker and a
 `gabiond` replica are interchangeable peers as long as they share a
 cluster id.
 
+## Try the simulator in your browser
+
+It is often easier to follow a gossip protocol by watching it run than
+by reading about it, so the gabion gossip and CRDT core has been
+compiled to WebAssembly and is hosted at
+<https://prosody-events.github.io/gabion/>. The runtime there is the
+same code that drives production. The only substitution is the clock,
+which is hand-driven so that you can advance virtual time at your own
+pace. Clicking on a node injects a fresh burst of hits at the current
+instant; the visualization then shows each node's view of the cluster
+total racing the ground-truth oracle the simulator maintains. A control
+on the left can cut links between particular peers, which is how you
+watch the protocol heal around lost packets. The dashboard on the
+right plots the cluster-wide disagreement decaying to zero as
+anti-entropy catches each node up.
+
 ## Contents
 
 - [When to use gabion](#when-to-use-gabion)
@@ -63,13 +79,13 @@ more than one admission point.
 
 If you run a single nginx box and only need that box's own view of the
 world, nginx core's `limit_req` is simpler and you should use it
-instead. If you run Envoy with the rate-limit filter, gabion offers a
-drop-in `envoy.service.ratelimit.v3` server that shares state through
-gossip rather than through a central Redis (or equivalent) backend, so
-that the failure of any one replica costs the cluster a little
-freshness rather than its ability to enforce at all. If you run nginx
-and Envoy in front of the same upstream, gabion is the only component
-we are aware of that lets both stacks share a single counter store.
+instead. If you run Envoy with the rate-limit filter, gabion also
+ships a drop-in `envoy.service.ratelimit.v3` server, `gabiond`, that
+shares state through gossip rather than through a central Redis (or
+equivalent) backend, so that the failure of any one replica costs the
+cluster a little freshness rather than its ability to enforce at all.
+This Envoy adapter is younger than the nginx module and has had much
+less production exposure; we still treat it as experimental.
 
 ## How it works
 
@@ -116,16 +132,21 @@ The CRDT data structures themselves are described in
 
 ## Choose your adapter
 
-| You're running…                       | Component                                           | Configuration surface                                       |
-|---------------------------------------|-----------------------------------------------------|-------------------------------------------------------------|
-| nginx (in-process, dynamic module)    | [**gabion-nginx**](crates/nginx/README.md)          | `load_module ngx_http_gabion_module.so` + `gabion_*` directives in `nginx.conf` |
-| Envoy (out-of-process, gRPC sidecar)  | [**gabiond**](crates/server/README.md)              | `envoy.service.ratelimit.v3` server, YAML config            |
-| Both, with shared counters            | Run both adapters side by side                      | Point them at the same cluster id (see [Running across a cluster](#running-across-a-cluster)) |
+| You're running…                       | Component                                                       | Configuration surface                                       |
+|---------------------------------------|-----------------------------------------------------------------|-------------------------------------------------------------|
+| nginx (in-process, dynamic module)    | [**gabion-nginx**](crates/nginx/README.md)                      | `load_module ngx_http_gabion_module.so` + `gabion_*` directives in `nginx.conf` |
+| Envoy (out-of-process, gRPC sidecar)  | [**gabiond**](crates/server/README.md) *(experimental)*         | `envoy.service.ratelimit.v3` server, YAML config            |
+| Both, with shared counters            | Run both adapters side by side                                  | Point them at the same cluster id (see [Running across a cluster](#running-across-a-cluster)) |
 
 Each adapter's README is a self-contained operator guide covering its
 directives or YAML schema, its runbook entries, and the shape of its
 logging. The sections below only cover the vocabulary and behaviour
-that apply to both.
+that apply to both. The nginx module is the more mature of the two
+paths, so an operator coming to gabion for the first time will have a
+smoother time starting there; `gabiond` is worth picking up if you are
+already invested in Envoy and want a gossiping replacement for a
+central Redis backend, on the understanding that the surface is still
+moving.
 
 ## Glossary
 
@@ -179,11 +200,18 @@ regardless of which adapter they are running:
    most obviously, the case where staging traffic bleeds into a
    production counter store.
 
-3. **Tell peers how to find each other.** The simplest production
-   path is Kubernetes EndpointSlice discovery: declare which
-   namespaces and service names to watch, and gabion picks up peer
-   pods as they come and go without any static peer list to maintain
-   or any restart to perform when the topology changes.
+3. **Run on Kubernetes.** Peer discovery is built around Kubernetes
+   EndpointSlices, and at present this is the only implementation the
+   library ships. A member is configured with the namespaces and
+   Service names it should watch, and from then on it picks peer pods
+   up and lets them go as the corresponding EndpointSlice changes.
+   There is no static peer list anywhere in the configuration, and no
+   restart is needed when the topology shifts. The other side of that
+   coin is that no alternative peer source is plugged in. The
+   `PeerDiscovery` trait is a single-method extension point that
+   someone could implement against another control plane, but nobody
+   has yet done so in tree, so in practice gabion expects to run as a
+   Kubernetes workload.
 
 The directive names differ between adapters (`gabion_gossip_*` for
 nginx, the `gossip:` and `discovery:` blocks in `gabiond` YAML), but
@@ -242,7 +270,8 @@ The workspace lives under `crates/`:
 | [`gabion-server`](crates/server/README.md)         | The `gabiond` binary. Tonic gRPC service speaking `envoy.service.ratelimit.v3`, plus a small admin HTTP endpoint. |
 | [`gabion-nginx`](crates/nginx/README.md)           | The nginx dynamic module. Builds with `cargo build -p gabion-nginx --features ngx-module --release`. |
 | `gabion-loader`                                    | Load generator. Drives the gRPC service (or an HTTP endpoint sitting in front of nginx) with a configurable tenant / hit-rate mix. |
-| [`gossip-bench`](crates/gossip-bench/README.md)    | Gossip propagation simulator. Runs scenario JSON specs through the deterministic sim transport and emits result JSON; a Python harness produces the convergence plots. |
+| [`gabion-wasm`](crates/gabion-wasm/README.md)      | The visualizer's WebAssembly bridge. Stands up N gossip runtimes against the deterministic sim transport and exposes them to the Svelte frontend that ships to <https://prosody-events.github.io/gabion/>. |
+| [`gossip-bench`](crates/gossip-bench/README.md)    | Headless gossip propagation harness. Runs scenario JSON specs through the same deterministic sim transport and emits result JSON; a Python script turns the JSON into convergence plots. |
 
 Deployment manifests, the nginx docker-compose harness, Kubernetes
 smoke tests, and the cross-version nginx / OpenResty build matrices
@@ -250,10 +279,12 @@ live under [`deploy/`](deploy).
 
 ## Further reading
 
+- <https://prosody-events.github.io/gabion/> — the interactive gossip simulator, the real core running in your browser.
 - [`crates/gabion/README.md`](crates/gabion/README.md) — the gossip protocol explainer, operator-knob reference, and benchmark results.
 - [`crates/gabion/CRDT.md`](crates/gabion/CRDT.md) — design of the counter store, end to end.
 - [`crates/nginx/README.md`](crates/nginx/README.md) — operator guide for the nginx module.
-- [`crates/server/README.md`](crates/server/README.md) — operator guide for `gabiond`.
+- [`crates/server/README.md`](crates/server/README.md) — operator guide for `gabiond` (experimental).
+- [`crates/gabion-wasm/README.md`](crates/gabion-wasm/README.md) — how the visualizer is wired to the gossip core.
 - [`crates/gossip-bench/README.md`](crates/gossip-bench/README.md) — how to re-run the benchmark suite locally.
 - [`deploy/nginx/README.md`](deploy/nginx/README.md) — building the module against different nginx / OpenResty base images.
 
