@@ -112,6 +112,8 @@ help:
 	@printf '%s\n' '  make safety          Run gabion-nginx safety integration tests (cargo nextest)'
 	@printf '%s\n' '  make miri-safety     Run safety tests under miri (Stacked Borrows)'
 	@printf '%s\n' '  make miri-safety-tb  Run safety tests under miri (Tree Borrows)'
+	@printf '%s\n' '  make miri-ffi-alignment    Run FFI alignment tests under miri (Stacked Borrows)'
+	@printf '%s\n' '  make miri-ffi-alignment-tb Run FFI alignment tests under miri (Tree Borrows)'
 	@printf '%s\n' '  make miri-lib        Run all gabion-nginx lib tests under miri'
 	@printf '%s\n' '  make miri-all        Run miri (Stacked + Tree Borrows) on every gabion-nginx test'
 	@printf '%s\n' '  make bench-check     Compile gabion::crdt benchmarks'
@@ -166,6 +168,19 @@ miri-safety:
 miri-safety-tb:
 	MIRIFLAGS="-Zmiri-tree-borrows" $(CARGO_ENV) $(MIRI) -p gabion-nginx --test safety
 
+# FFI alignment regression test: pins the misaligned-write UB that
+# crashed the native amd64 nginx smoke before commit 2a1a2e8. Lives in
+# its own integration test so it can run under Miri without dragging
+# in the rest of `safety.rs`. No nginx-sys / ngx headers, so it runs
+# without the `ngx-module` feature.
+.PHONY: miri-ffi-alignment
+miri-ffi-alignment:
+	$(CARGO_ENV) $(MIRI) -p gabion-nginx --test ffi_alignment
+
+.PHONY: miri-ffi-alignment-tb
+miri-ffi-alignment-tb:
+	MIRIFLAGS="-Zmiri-tree-borrows" $(CARGO_ENV) $(MIRI) -p gabion-nginx --test ffi_alignment
+
 .PHONY: miri-lib
 miri-lib:
 	# `identity::tests` reads `SystemTime::now()` via `clock_gettime(REALTIME)`,
@@ -179,7 +194,7 @@ miri-lib:
 # both Stacked Borrows and Tree Borrows. Ramps up CI time significantly
 # (a few minutes); not part of `make test` by default — run before merge.
 .PHONY: miri-all
-miri-all: miri-lib miri-safety miri-safety-tb
+miri-all: miri-lib miri-safety miri-safety-tb miri-ffi-alignment miri-ffi-alignment-tb
 	MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-disable-isolation" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
 
 .PHONY: hygiene
