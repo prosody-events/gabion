@@ -151,6 +151,117 @@ fn snapshot_returns_full_state_via_axum_route() {
 }
 
 #[test]
+fn readyz_returns_200_with_static_body() {
+    run_local(async {
+        // `/readyz` is intentionally independent of the gossip runtime —
+        // the bench needs it to confirm the port-forward attached
+        // before it starts sampling, and the runtime might still be
+        // converging on peers at that point.
+        let (admin_tx, admin_rx) = admin_channel();
+        drop(admin_rx);
+
+        let app = build_router(admin_tx);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router responded");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024).await.expect("body");
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(text.contains("ready"), "unexpected body: {text:?}");
+    });
+}
+
+#[test]
+fn introspection_returns_remote_cells_and_active_peers() {
+    run_local(async {
+        let sim = SimRouter::new();
+        let bind_addr = next_addr();
+        let transport = sim.bind(bind_addr);
+        let identity = NodeIdentity::new(NodeId(0xBEEF_CAFE), 11);
+        let store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
+        let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
+
+        let bootstrap = next_addr();
+        let gossip_config = GossipConfig {
+            local_identity: identity,
+            bootstrap_peers: vec![bootstrap],
+            rng_seed: 7,
+            ..GossipConfig::default()
+        };
+
+        let (admin_tx, admin_rx) = admin_channel();
+        let (rt, client) = GossipRuntime::from_parts_with_admin(
+            transport,
+            TokioClock::from_millis(0),
+            gossip_config,
+            store,
+            counts.clone(),
+            Some(admin_rx),
+        );
+        let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+        let rule_table = Arc::new(RuleTable::new(vec![sample_rule()]));
+        let state = AdminState::new(rule_table, counts, admin_tx);
+        let app = router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/debug/introspection?max_cells=128&max_peers=8")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router responded");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+
+        // The bench reads `peers.active_peers` (nested), not a top-level
+        // `peers` list — regression target if anyone "flattens" the
+        // shape.
+        let active_peers = body["peers"]["active_peers"]
+            .as_array()
+            .expect("peers.active_peers");
+        assert_eq!(active_peers.len(), 1);
+        assert_eq!(active_peers[0]["addr"], bootstrap.to_string());
+
+        // `remote_cells` is the list the bench sums over for
+        // `final_remote_total`. A fresh runtime with no inbound traffic
+        // has nothing, but the field must exist as an array.
+        assert!(body["remote_cells"].is_array(), "remote_cells missing");
+        // Gossip chart-only fields must serialize even when the runtime
+        // doesn't track them yet — the bench reader does
+        // `gossip.get("merge_cells", 0)` and similar.
+        for field in [
+            "remote_active_cells",
+            "decode_errors",
+            "merge_cells",
+            "send_bytes",
+            "recv_bytes",
+            "digest_mismatch",
+        ] {
+            assert!(
+                body["gossip"].get(field).is_some(),
+                "missing gossip.{field}",
+            );
+        }
+
+        client.shutdown().await.unwrap();
+        let _ = handle.await;
+    });
+}
+
+#[test]
 fn snapshot_returns_service_unavailable_when_gossip_is_down() {
     run_local(async {
         // No runtime ever started — drop the receiver so the admin
