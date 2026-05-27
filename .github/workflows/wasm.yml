@@ -68,7 +68,7 @@ jobs:
           # in `crates/gabion-wasm/Cargo.toml`. v0.12.0+ understands the
           # `[workspace.package]` indirection.
           version: 'v0.15.0'
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           # `crates/gabion-wasm/web/pnpm-workspace.yaml` uses pnpm 11's
           # `allowBuilds:` build-allowlist key — pnpm 9 doesn't recognise
