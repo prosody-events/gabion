@@ -206,6 +206,113 @@ fn quickcheck_endpoint_slice_events_match_live_slice_model(
     TestResult::passed()
 }
 
+// -- service_change ---------------------------------------------------------
+
+/// Build a synthetic Service exposing one named UDP port and one TCP
+/// port. The `gabion_named` and `udp_protocol` knobs let one helper
+/// drive both the happy path and every flavour of misconfiguration the
+/// discovery filter rejects.
+fn service(namespace: &str, name: &str, gabion_named: bool, udp_protocol: bool) -> Service {
+    use k8s_openapi::api::core::v1::{ServicePort, ServiceSpec};
+
+    let port_name = if gabion_named { "gabion" } else { "gossip" };
+    let protocol = if udp_protocol { "UDP" } else { "TCP" };
+    Service {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            ports: Some(vec![ServicePort {
+                name: Some(port_name.to_string()),
+                port: 9000,
+                protocol: Some(protocol.to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn service_change_returns_track_for_gabion_udp_apply() {
+    let svc = service("default", "gabion", true, true);
+    let change = service_change(Event::Apply(svc), &[]);
+    match change {
+        ServiceChange::Track(target) => {
+            assert_eq!(target.namespace, "default");
+            assert_eq!(target.service_name, "gabion");
+        }
+        other => panic!("expected Track, got {other:?}"),
+    }
+}
+
+#[test]
+fn service_change_returns_untrack_when_gabion_port_disappears() {
+    // Apply event with no gabion-named UDP port — service was renamed
+    // or had its protocol switched to TCP. Discovery untracks it so
+    // the EndpointSlice watcher can be torn down.
+    let svc = service("default", "gabion", false, true);
+    let change = service_change(Event::Apply(svc), &[]);
+    assert!(
+        matches!(change, ServiceChange::Untrack(_)),
+        "Apply without gabion-named UDP port should Untrack",
+    );
+
+    let svc = service("default", "gabion", true, false);
+    let change = service_change(Event::Apply(svc), &[]);
+    assert!(
+        matches!(change, ServiceChange::Untrack(_)),
+        "Apply with gabion name but TCP protocol should Untrack",
+    );
+}
+
+#[test]
+fn service_change_returns_init_done_at_end_of_initial_sync() {
+    // The variant the zero-match warning hooks: at end-of-init-sync
+    // the caller can detect "no tracks emitted" and warn once.
+    let change = service_change(Event::<Service>::InitDone, &[]);
+    assert!(
+        matches!(change, ServiceChange::InitDone),
+        "Event::InitDone must map to ServiceChange::InitDone",
+    );
+}
+
+#[test]
+fn service_change_ignores_init_marker() {
+    let change = service_change(Event::<Service>::Init, &[]);
+    assert!(
+        matches!(change, ServiceChange::Ignore),
+        "Event::Init is a no-op",
+    );
+}
+
+#[test]
+fn service_change_filters_by_allow_list() {
+    let svc = service("default", "other", true, true);
+    let change = service_change(Event::Apply(svc), &["gabion".to_string()]);
+    assert!(
+        matches!(change, ServiceChange::Ignore),
+        "Service not in allow list should Ignore",
+    );
+}
+
+// Manual Debug impl so the test panic messages above are useful — the
+// production code never displays it, so an inline impl is cheaper than
+// deriving Debug across the enum's full surface.
+impl core::fmt::Debug for ServiceChange {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ServiceChange::Track(t) => write!(f, "Track({t:?})"),
+            ServiceChange::Untrack(t) => write!(f, "Untrack({t:?})"),
+            ServiceChange::InitDone => write!(f, "InitDone"),
+            ServiceChange::Ignore => write!(f, "Ignore"),
+        }
+    }
+}
+
 // -- live cluster integration ---------------------------------------------
 
 /// End-to-end: stand up two `GossipRuntime`s against a real kind-based

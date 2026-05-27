@@ -101,6 +101,15 @@ impl PeerDiscovery for EndpointSliceDiscovery {
             let mut services = watch_services(&client, &self.namespace_allow);
             let mut endpoints = SelectAll::new();
             let mut watched: AHashMap<Target, oneshot::Sender<()>> = AHashMap::new();
+            // True once *any* namespace has finished its initial Service list
+            // without producing a single Track. The first time that happens
+            // we emit a one-shot operator warning (see CLAUDE.md's
+            // operator-facing-errors rules). Tracks observed after the
+            // warning fires don't unset it — the operator already has the
+            // information they need, and re-firing on every relist would
+            // be noisy.
+            let mut zero_match_warned = false;
+            let watched_namespaces = self.namespace_allow.clone();
 
             loop {
                 tokio::select! {
@@ -156,6 +165,34 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                          (deleted or missing its UDP port); \
                                          stopping peer discovery for it.",
                                     );
+                                }
+                            }
+                            ServiceChange::InitDone => {
+                                if !zero_match_warned && watched.is_empty() {
+                                    let ns_display = if watched_namespaces.is_empty() {
+                                        "<pod's own namespace>".to_string()
+                                    } else {
+                                        watched_namespaces.join(",")
+                                    };
+                                    tracing::warn!(
+                                        watched_namespaces = %ns_display,
+                                        gabion_port_name = DEFAULT_GABION_SERVICE_NAME,
+                                        "Kubernetes auto-discovery is up but no \
+                                         Service in the watched namespaces \
+                                         exposes a UDP port named `gabion`. \
+                                         Usually the manifest named the port \
+                                         differently (`gossip`, `udp`, etc.) \
+                                         or left the protocol as the default \
+                                         TCP — discovery filters on both the \
+                                         literal name `gabion` and \
+                                         protocol `UDP`. Rename the port to \
+                                         `name: gabion` with `protocol: UDP` \
+                                         (see \
+                                         `deploy/kubernetes/nginx-scale-rate-limit.sh` \
+                                         for a working example), then re-apply \
+                                         the manifest.",
+                                    );
+                                    zero_match_warned = true;
                                 }
                             }
                             ServiceChange::Ignore => {}
@@ -230,6 +267,14 @@ impl Target {
 enum ServiceChange {
     Track(Target),
     Untrack(Target),
+    /// One namespace's initial Service list has finished syncing. The
+    /// caller uses this boundary to detect a zero-match
+    /// misconfiguration (no Service in any watched namespace exposes a
+    /// `gabion`-named UDP port) and surface a one-shot operator
+    /// warning. Distinct from `Ignore` so the warning path can fire
+    /// exactly once at the first end-of-init-sync that still has no
+    /// tracks.
+    InitDone,
     Ignore,
 }
 
@@ -240,7 +285,8 @@ fn service_change(event: Event<Service>, allow: &[String]) -> ServiceChange {
             (svc, present)
         }
         Event::Delete(svc) => (svc, false),
-        Event::Init | Event::InitDone => return ServiceChange::Ignore,
+        Event::Init => return ServiceChange::Ignore,
+        Event::InitDone => return ServiceChange::InitDone,
     };
     let Some(target) = Target::take_from(svc) else {
         return ServiceChange::Ignore;
