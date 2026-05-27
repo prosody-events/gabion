@@ -343,8 +343,12 @@ unsafe impl HttpModuleLocationConf for Module {
 // via Box::new the same way `Module::create_main_conf` does, or split
 // the over-aligned field (e.g. `u128` → two paired `u64`s, the
 // convention used at the SHM boundary in `crates/nginx/src/shm/`).
+// `::core::mem` — not bare `core::mem` — because this file imports
+// `use ngx::core;` at the top, which shadows the standard `core` crate
+// inside this module. The `::core` prefix bypasses the shadow without
+// dragging the rest of the file off `ngx::core::Status` etc.
 const _: () = assert!(
-    core::mem::align_of::<LocationConfig>() <= nginx_sys::NGX_ALIGNMENT,
+    ::core::mem::align_of::<LocationConfig>() <= nginx_sys::NGX_ALIGNMENT,
     "LocationConfig alignment exceeds NGX_ALIGNMENT; ngx_palloc cannot host it. Override \
      `create_loc_conf` to heap-allocate via Box::new (see `Module::create_main_conf` for the \
      cleanup-callback pattern), or split over-aligned fields into paired u64s.",
