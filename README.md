@@ -41,8 +41,8 @@ cluster id.
 
 A gossip protocol tends to be easier to follow when you can watch it
 run, so the gabion gossip runtime and CRDT have been compiled to
-WebAssembly and [hosted as a small Svelte
-app](https://prosody-events.github.io/gabion/). The code that runs
+WebAssembly and [hosted as an interactive
+demo](https://prosody-events.github.io/gabion/). The code that runs
 there is the same code that runs in a `gabiond` replica or an nginx
 worker, adapted for the browser environment. UDP gives way to an
 in-process router that connects the runtimes by direct call. The
@@ -272,7 +272,7 @@ The workspace lives under `crates/`:
 | [`gabion-server`](crates/server/README.md)         | The `gabiond` binary. Tonic gRPC service speaking `envoy.service.ratelimit.v3`, plus a small admin HTTP endpoint. |
 | [`gabion-nginx`](crates/nginx/README.md)           | The nginx dynamic module. Builds with `cargo build -p gabion-nginx --features ngx-module --release`. |
 | `gabion-loader`                                    | Load generator. Drives the gRPC service (or an HTTP endpoint sitting in front of nginx) with a configurable tenant / hit-rate mix. |
-| [`gabion-wasm`](crates/gabion-wasm/README.md)      | The visualizer's WebAssembly bridge. Stands up N gossip runtimes on the deterministic in-process router and exposes them over a command channel to the Svelte frontend that ships to the hosted simulator. |
+| [`gabion-wasm`](crates/gabion-wasm/README.md)      | The visualizer's WebAssembly bridge. Stands up N gossip runtimes on the deterministic in-process router and exposes them over a command channel to the browser frontend that ships to the hosted simulator. |
 | [`gossip-bench`](crates/gossip-bench/README.md)    | Headless gossip propagation harness. Runs scenario JSON specs through the same deterministic sim transport and emits result JSON; a Python script turns the JSON into convergence plots. |
 
 Deployment manifests, the nginx docker-compose harness, Kubernetes
