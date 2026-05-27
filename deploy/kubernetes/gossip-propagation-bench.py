@@ -140,9 +140,6 @@ data:
       bind: 0.0.0.0:9000
       tick_interval: {LINGER_MS}ms
       fanout: {FANOUT}
-      max_payload_bytes: 1400
-      max_cells_per_frame: 1024
-      max_cells_per_tick: 1024
       send_queue_capacity: 32
       limit_queue_capacity: 1024
       cluster_id_hash: 1
@@ -150,7 +147,7 @@ data:
       - name: nginx_uri
         domain: nginx
         descriptors:
-          - key: uri
+          - key: request_uri
             value: "*"
         rate: {RULE_LIMIT}r/m
         bucket: 1s
@@ -177,8 +174,6 @@ data:
         gabion_gossip_bind 0.0.0.0:9000;
         gabion_gossip_cluster 1;
         gabion_gossip_fanout {FANOUT};
-        gabion_gossip_max_payload_bytes 65536;
-        gabion_gossip_max_cells_per_frame 4096;
         gabion_gossip_tick_interval {LINGER_MS}ms;
         gabion_discovery_namespace_allow {NAMESPACE};
         gabion_discovery_service_allow gabiond;
