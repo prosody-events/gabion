@@ -9,6 +9,15 @@ pub const SHM_VERSION: u32 = 2;
 /// the master process before fork; `incarnation` is updated atomically by
 /// each leader takeover so peers see fresh `(node_id, incarnation)` pairs
 /// after a flip.
+///
+/// `node_id` is logically a `u128` but stored as a paired
+/// `(AtomicU64, AtomicU64)` for the same reason `MainConfig` in
+/// `module.rs` is `Box::new`'d: the SHM mapping only guarantees
+/// `align_of::<u64>` = 8, and a 16-aligned `u128` placed directly here
+/// would be UB on amd64 (LLVM lowers u128 access to aligned SSE). See
+/// `Module::create_main_conf`'s doc comment for the same hazard in the
+/// nginx pool. `shm/queue.rs` and `shm/aggregate.rs` use the same
+/// paired-u64 convention for their own logical-u128 fields.
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct NodeIdentityFields {
