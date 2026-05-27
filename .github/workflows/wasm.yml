@@ -62,7 +62,12 @@ jobs:
           locked: true
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: 'latest'
+          # Pin the wasm-pack version: the action's `latest` resolver is
+          # broken and pulls the 2019-era v0.9.1, which predates Cargo
+          # workspace inheritance and chokes on `license.workspace = true`
+          # in `crates/gabion-wasm/Cargo.toml`. v0.12.0+ understands the
+          # `[workspace.package]` indirection.
+          version: 'v0.15.0'
       - uses: pnpm/action-setup@v4
         with:
           # `crates/gabion-wasm/web/pnpm-workspace.yaml` uses pnpm 11's
