@@ -90,10 +90,6 @@ jobs:
             dockerfile: deploy/gabiond/Dockerfile
             base-arg: ''
             base-image: ''
-          - image: loader
-            dockerfile: deploy/kubernetes/loader.Dockerfile
-            base-arg: ''
-            base-image: ''
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             base-arg: NGINX_BASE_IMAGE
@@ -168,7 +164,6 @@ jobs:
 
             ```sh
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gabiond:pr-${{ github.event.pull_request.number }}
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/loader:pr-${{ github.event.pull_request.number }}
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/nginx:pr-${{ github.event.pull_request.number }}
             ```
 
@@ -201,24 +196,6 @@ jobs:
             runner: ubuntu-latest
           - image: gabiond
             dockerfile: deploy/gabiond/Dockerfile
-            flavor: default
-            flavor-suffix: ''
-            base-arg: ''
-            base-image: ''
-            arch: arm64
-            runner: ubuntu-24.04-arm
-
-          # loader — single flavor.
-          - image: loader
-            dockerfile: deploy/kubernetes/loader.Dockerfile
-            flavor: default
-            flavor-suffix: ''
-            base-arg: ''
-            base-image: ''
-            arch: amd64
-            runner: ubuntu-latest
-          - image: loader
-            dockerfile: deploy/kubernetes/loader.Dockerfile
             flavor: default
             flavor-suffix: ''
             base-arg: ''
@@ -483,10 +460,6 @@ jobs:
             flavor: default
             flavor-suffix: ''
             kind: app
-          - image: loader
-            flavor: default
-            flavor-suffix: ''
-            kind: app
           - image: nginx
             flavor: stable-alpine
             flavor-suffix: ''
@@ -559,8 +532,8 @@ jobs:
 
           tags=()
           short_sha="${SHA:0:7}"
-          # `app` images (gabiond, loader) only ever carry version and
-          # ref-tag — no flavor and no upstream-version axis.
+          # `app` images (gabiond) only ever carry version and ref-tag
+          # — no flavor and no upstream-version axis.
           # `nginx`-shaped images (nginx, openresty) layer the resolved
           # upstream version onto the same set.
           if [[ "$IS_RELEASE" == "true" ]]; then
