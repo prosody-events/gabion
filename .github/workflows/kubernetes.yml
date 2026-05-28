@@ -15,6 +15,14 @@ concurrency:
   group: kubernetes-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# `packages: read` lets the image-building jobs pull the private GHCR
+# buildcache as a read-only `cache-from` source. Fork PRs can't read
+# packages — their import misses and the build cold-compiles (today's
+# behavior).
+permissions:
+  contents: read
+  packages: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -74,6 +82,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v3
+      # Best-effort GHCR login so the buildx cache-from steps can read the
+      # private buildcache; forks miss and cold-compile (continue-on-error).
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: helm/kind-action@v1
         with:
           cluster_name: gabion
@@ -90,13 +106,21 @@ jobs:
           sudo chmod 1777 /tmp/cores
           sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
       # Pre-build the NGINX module image so `kind load docker-image` can
-      # ship it into the cluster's containerd. The script itself rebuilds
-      # the same compose target — that becomes a cache no-op.
+      # ship it into the cluster's containerd. `--cache-from` warms the
+      # cargo-chef cook layer from docker.yml's canonical `build` cache
+      # (read-only; a miss degrades to today's cold build). Tagged as the
+      # compose `<project>-<service>` name so `kind load` and the smoke
+      # script's no-op rebuild both find it.
       - name: build NGINX module image
-        env:
-          DOCKER_BUILDKIT: '1'
-          COMPOSE_DOCKER_CLI_BUILD: '1'
-        run: docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
+        run: |
+          docker buildx build \
+            --load \
+            --target smoke \
+            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
+            -f deploy/nginx/Dockerfile \
+            -t nginx-nginx-module-request-smoke:latest \
+            .
       - name: load image into kind
         run: kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
       - run: make kubernetes-nginx-test
@@ -121,6 +145,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v3
+      # Best-effort GHCR login so the buildx cache-from steps can read the
+      # private buildcache; forks miss and cold-compile (continue-on-error).
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: helm/kind-action@v1
         with:
           cluster_name: gabion
@@ -130,13 +162,26 @@ jobs:
           sudo mkdir -p /tmp/cores
           sudo chmod 1777 /tmp/cores
           sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
+      # Warm both smoke images from their canonical `build` caches
+      # (read-only; a miss degrades to today's cold build). `docker build`
+      # can't consume a registry cache, so use `docker buildx build
+      # --load`. Tagged as the names `kind load` + the smoke scripts expect.
       - name: build images
-        env:
-          DOCKER_BUILDKIT: '1'
-          COMPOSE_DOCKER_CLI_BUILD: '1'
         run: |
-          docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
-          docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
+          docker buildx build \
+            --load \
+            --target smoke \
+            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
+            -f deploy/nginx/Dockerfile \
+            -t nginx-nginx-module-request-smoke:latest \
+            .
+          docker buildx build \
+            --load \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/gabiond:buildcache-gabiond-default-amd64 \
+            -f deploy/gabiond/Dockerfile \
+            -t gabiond:local \
+            .
       - name: load images into kind
         run: |
           kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
@@ -163,6 +208,14 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: docker/setup-buildx-action@v3
+      # Best-effort GHCR login so the buildx cache-from steps can read the
+      # private buildcache; forks miss and cold-compile (continue-on-error).
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -175,13 +228,26 @@ jobs:
           sudo mkdir -p /tmp/cores
           sudo chmod 1777 /tmp/cores
           sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
+      # Warm both smoke images from their canonical `build` caches
+      # (read-only; a miss degrades to today's cold build). `docker build`
+      # can't consume a registry cache, so use `docker buildx build
+      # --load`. Tagged as the names `kind load` + the smoke scripts expect.
       - name: build images
-        env:
-          DOCKER_BUILDKIT: '1'
-          COMPOSE_DOCKER_CLI_BUILD: '1'
         run: |
-          docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
-          docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
+          docker buildx build \
+            --load \
+            --target smoke \
+            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
+            -f deploy/nginx/Dockerfile \
+            -t nginx-nginx-module-request-smoke:latest \
+            .
+          docker buildx build \
+            --load \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/gabiond:buildcache-gabiond-default-amd64 \
+            -f deploy/gabiond/Dockerfile \
+            -t gabiond:local \
+            .
       - name: load images into kind
         run: |
           kind load docker-image nginx-nginx-module-request-smoke:latest --name gabion
