@@ -6,7 +6,7 @@
 //! a known base, property tests can drive many runtimes in one process,
 //! deliver packets through memory, and advance virtual time deterministically.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -58,6 +58,17 @@ struct SimRouterInner {
     received_counts: RefCell<HashMap<SocketAddr, u64>>,
     /// Per-receiver send-channel capacity. Bounded queue applies backpressure.
     channel_capacity: usize,
+    /// When set, `try_send_to` buffers outbound packets in `held` instead of
+    /// delivering them to the destination's inbound channel immediately. The
+    /// step driver arms this so one simulated step is one gossip round: every
+    /// node makes its gossip decision against this round's state before any
+    /// packet lands, then `release_deferred` delivers them all. Default `false`
+    /// — core gossip tests and gossip-bench never arm it, so their behavior is
+    /// unchanged.
+    deferring: Cell<bool>,
+    /// Packets buffered while `deferring` is set, in push (send) order. Drained
+    /// deterministically by `release_deferred`.
+    held: RefCell<Vec<(SocketAddr, SimPacket)>>,
 }
 
 /// In-memory packet router shared by all sim runtimes in one process.
@@ -86,6 +97,8 @@ impl SimRouter {
                 drop_counters: RefCell::new(HashMap::new()),
                 received_counts: RefCell::new(HashMap::new()),
                 channel_capacity,
+                deferring: Cell::new(false),
+                held: RefCell::new(Vec::new()),
             }),
         }
     }
@@ -191,6 +204,45 @@ impl SimRouter {
             .entry(dst)
             .or_insert(0) += 1;
     }
+
+    /// Begin deferring delivery: subsequent `try_send_to` calls buffer their
+    /// packets instead of delivering them, so every node decides its gossip
+    /// against this round's state before any packet lands. Pair with
+    /// [`SimRouter::release_deferred`]. Opt-in — only the wasm step driver arms
+    /// it, to give one step one gossip round of fidelity.
+    pub fn begin_deferred(&self) {
+        self.inner.deferring.set(true);
+    }
+
+    /// Deliver every packet buffered since [`SimRouter::begin_deferred`], in
+    /// push (send) order, then stop deferring. Each held packet was already
+    /// counted delivered (via `record_delivery`) at buffer time, so the
+    /// `received_count` diff the wasm logging shim reads is unaffected.
+    pub fn release_deferred(&self) {
+        self.inner.deferring.set(false);
+        let held = std::mem::take(&mut *self.inner.held.borrow_mut());
+        for (dst, packet) in held {
+            if let Some(sender) = self.sender_for(dst) {
+                // The packet was counted delivered at buffer time. A full
+                // channel here would drop a packet already counted as
+                // delivered — impossible at the one-rule, small-round sizes
+                // the step driver uses (a single round buffers far fewer
+                // packets than the channel's capacity), but noted rather than
+                // silent.
+                let _ = sender.try_send(packet);
+            }
+            // No receiver bound (a departed peer) ⇒ the packet hits the UDP
+            // floor, exactly as the immediate path treats a missing sender.
+        }
+    }
+
+    fn is_deferring(&self) -> bool {
+        self.inner.deferring.get()
+    }
+
+    fn push_held(&self, dst: SocketAddr, packet: SimPacket) {
+        self.inner.held.borrow_mut().push((dst, packet));
+    }
 }
 
 fn link_seed(src: SocketAddr, dst: SocketAddr) -> u64 {
@@ -256,6 +308,18 @@ impl GossipTransport for SimTransport {
             src: self.addr,
             bytes: buf.to_vec(),
         };
+        if self.router.is_deferring() {
+            // Hold this round's packet until every node has made its gossip
+            // decision; `release_deferred` delivers it. `should_drop` was
+            // already evaluated above (so Block / DropFirst / partition still
+            // increment their counters at send time), and we count the
+            // delivery now so the wasm logging shim's `received_count` diff
+            // still sees the send land at buffer time.
+            self.router.push_held(dst, packet);
+            self.router.record_delivery(dst);
+            *self.blocked.borrow_mut() = false;
+            return Ok(buf.len());
+        }
         match sender.try_send(packet) {
             Ok(()) => {
                 self.router.record_delivery(dst);
