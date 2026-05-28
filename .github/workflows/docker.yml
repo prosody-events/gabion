@@ -86,18 +86,32 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `flavor` mirrors the default flavor each image builds under in
+          # the `build` matrix, so `cache-from` can read that job's
+          # canonical cook layer (see the build-push step below).
           - image: gabiond
             dockerfile: deploy/gabiond/Dockerfile
             base-arg: ''
             base-image: ''
+            flavor: default
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable-alpine
-          # `openresty` is intentionally excluded from PR builds: its
-          # `cargo chef cook` step segfaults (exit 139, OOM-killer) on
-          # the 7GB ubuntu-latest runner under fat LTO + 1 codegen unit.
-          # Full multi-flavor builds still run on main/tags/cron.
+            flavor: stable-alpine
+          # openresty's default (alpine) flavor. It was previously
+          # excluded over a `cargo chef cook` OOM (exit 139) blamed on a
+          # "7 GB" ubuntu-latest runner under fat LTO + 1 codegen unit —
+          # but hosted runners have been 16 GB since 2024, and openresty
+          # amd64 already builds in the main `build` matrix on this same
+          # runner, so the exclusion is being re-tested here. Non-default
+          # openresty flavors + multi-arch still build only on
+          # main/tags/cron.
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:alpine
+            flavor: alpine
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -135,12 +149,21 @@ jobs:
           # Registry-backed cache on GHCR — not the Actions cache, whose
           # hard 10 GiB per-repo cap these `mode=max` blobs were blowing
           # past, so entries were LRU-evicted before they could be reused.
-          # Registry cache counts against package storage instead. PR
-          # scope stays separate from release scope so a stale PR layer
-          # never poisons a release rebuild. `image-manifest=true,
-          # oci-mediatypes=true` is mandatory: without it GHCR rejects the
-          # cache manifest mediatype and the export silently no-ops.
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-pr-${{ matrix.image }}-amd64
+          # Registry cache counts against package storage instead.
+          # `image-manifest=true,oci-mediatypes=true` is mandatory: without
+          # it GHCR rejects the cache manifest mediatype and the export
+          # silently no-ops.
+          #
+          # `cache-from` reads two scopes: the PR's own scope first, then
+          # the canonical `build`-job scope read-only. Content-addressed
+          # layers can't poison — a layer is served only on exact
+          # input-hash match — so the second source just lets a fresh PR
+          # warm its cook layer from main's last build instead of
+          # compiling dependencies cold. `cache-to` writes only the PR
+          # scope, so a PR build never mutates the release scope.
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-pr-${{ matrix.image }}-amd64
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-amd64
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-pr-${{ matrix.image }}-amd64,mode=max,image-manifest=true,oci-mediatypes=true
           # Skip provenance + sbom on PRs — they're for releases, and
           # they bloat per-PR registry churn the cleanup has to sweep.
@@ -170,6 +193,7 @@ jobs:
             ```sh
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gabiond:pr-${{ github.event.pull_request.number }}
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/nginx:pr-${{ github.event.pull_request.number }}
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/openresty:pr-${{ github.event.pull_request.number }}
             ```
 
             Or pin to this exact commit (`${{ github.event.pull_request.head.sha }}`):
@@ -178,7 +202,7 @@ jobs:
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/gabiond:pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
             ```
 
-            `linux/amd64` only on PRs; openresty + multi-arch + non-default flavors build on `main`. Tags are auto-pruned when this PR closes (or after 30 days, whichever comes first).
+            `linux/amd64` + default flavors only on PRs; multi-arch + non-default flavors build on `main`. Tags are auto-pruned when this PR closes (or after 30 days, whichever comes first).
 
   # Stage 1: one job per (image × flavor × arch). Each job builds a
   # single-platform image, pushes it to GHCR by digest, and uploads the
