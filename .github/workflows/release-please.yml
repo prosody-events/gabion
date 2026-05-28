@@ -13,7 +13,48 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v5
+        id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-please's `simple` release-type bumps
+      # `workspace.package.version` in Cargo.toml via the TOML jsonpath
+      # extra-file, but knows nothing about Cargo.lock. Without this
+      # step, the merged release commit ships a stale lockfile (every
+      # workspace crate's `[[package]] version = "..."` entry still
+      # carries the prior version) and the first local `cargo build`
+      # after release produces a spurious N-crate version diff.
+      #
+      # Check out the release PR branch, run `cargo update --workspace`
+      # to refresh only workspace-member entries in Cargo.lock (without
+      # touching external deps), and push the result back to the PR
+      # branch as a follow-up commit. release-please rewrites its PR
+      # branch on subsequent runs; that's fine — this step runs again
+      # and re-adds the Cargo.lock commit before the PR is merged.
+      - uses: actions/checkout@v6
+        if: ${{ steps.release.outputs.pr }}
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync Cargo.lock in the release PR
+        if: ${{ steps.release.outputs.pr }}
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # `--workspace` updates only workspace-member entries to match
+          # Cargo.toml; external deps are touched only if they're not
+          # already in the lockfile. The runner ships a stable toolchain
+          # so no rustup setup is needed.
+          cargo update --workspace
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already in sync." >&2
+            exit 0
+          fi
+          git add Cargo.lock
+          git commit -m "chore: sync Cargo.lock to workspace.package.version"
+          git push
+        shell: bash
