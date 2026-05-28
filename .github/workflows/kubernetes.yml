@@ -57,10 +57,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: baptiste0928/cargo-install@v3
+      # Prebuilt nextest — cargo-install compiles it from source on a
+      # cache miss; install-action fetches the release binary.
+      - uses: taiki-e/install-action@v2
         with:
-          crate: cargo-nextest
-          locked: true
+          tool: nextest
       - uses: helm/kind-action@v1
         with:
           cluster_name: gabion

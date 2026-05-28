@@ -56,10 +56,6 @@ jobs:
           components: rust-src
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: baptiste0928/cargo-install@v3
-        with:
-          crate: cargo-nextest
-          locked: true
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
           # Pin the wasm-pack version: the action's `latest` resolver is
@@ -82,8 +78,10 @@ jobs:
 
       - name: cross-compile gabion-wasm
         run: rustup run stable cargo check --target wasm32-unknown-unknown -p gabion-wasm
-      - name: native gabion-wasm tests
-        run: rustup run stable cargo nextest run -p gabion-wasm
+      # Native `gabion-wasm` engine + shim tests are covered by
+      # `check.yml`'s `make unit` (`cargo nextest run --workspace`), so we
+      # don't re-run them here — this job keeps only the wasm-unique work
+      # (the wasm32 cross-compile above and the browser smoke below).
 
       - name: install web deps
         working-directory: crates/gabion-wasm/web
@@ -95,9 +93,24 @@ jobs:
         working-directory: crates/gabion-wasm/web
         run: pnpm run build
 
+      # Cache the chromium browser binary (~/.cache/ms-playwright), keyed
+      # on the pnpm lockfile so it re-downloads only when the pinned
+      # @playwright/test version moves. The OS-level deps installed by
+      # `install-deps` below land in root-owned system paths and aren't
+      # cacheable, so that step always runs.
+      - name: cache Playwright browser
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/gabion-wasm/web/pnpm-lock.yaml') }}
       - name: install Playwright chromium
         working-directory: crates/gabion-wasm/web
-        run: pnpm exec playwright install --with-deps chromium
+        run: |
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
+            pnpm exec playwright install chromium
+          fi
+          pnpm exec playwright install-deps chromium
       - name: in-browser screenshot smoke
         working-directory: crates/gabion-wasm/web
         run: pnpm run screenshot

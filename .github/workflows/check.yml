@@ -45,7 +45,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache here: `make fmt` only runs rustfmt, which compiles
+      # nothing — a cache restore/save would be pure overhead.
       - run: make fmt
 
   clippy:
@@ -68,10 +69,11 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: baptiste0928/cargo-install@v3
+      # Prebuilt nextest binary — `cargo-install` compiles it from source
+      # on a cache miss (minutes); `install-action` fetches the release.
+      - uses: taiki-e/install-action@v2
         with:
-          crate: cargo-nextest
-          locked: true
+          tool: nextest
       # `make unit` covers the full workspace; the `gabion-nginx` `safety`
       # integration test runs as part of that.
       - run: make unit

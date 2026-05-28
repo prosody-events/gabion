@@ -48,10 +48,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri-safety
-      - uses: baptiste0928/cargo-install@v3
+          # miri builds its sysroot into ~/.cache/miri (MIRI_SYSROOT is
+          # unset), outside the paths rust-cache captures by default —
+          # without this it rebuilds the sysroot cold every run.
+          cache-directories: ~/.cache/miri
+      # Prebuilt nextest — cargo-install compiles it from source on a
+      # cache miss; install-action fetches the release binary.
+      - uses: taiki-e/install-action@v2
         with:
-          crate: cargo-nextest
-          locked: true
+          tool: nextest
       - run: make miri-safety
 
   miri-safety-tb:
@@ -66,10 +71,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri-safety-tb
-      - uses: baptiste0928/cargo-install@v3
+          # See miri-safety: the sysroot in ~/.cache/miri isn't captured
+          # by default and rebuilds cold without this.
+          cache-directories: ~/.cache/miri
+      - uses: taiki-e/install-action@v2
         with:
-          crate: cargo-nextest
-          locked: true
+          tool: nextest
       - run: make miri-safety-tb
 
   miri-lib:
@@ -84,10 +91,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri-lib
-      - uses: baptiste0928/cargo-install@v3
+          # See miri-safety: the sysroot in ~/.cache/miri isn't captured
+          # by default and rebuilds cold without this.
+          cache-directories: ~/.cache/miri
+      - uses: taiki-e/install-action@v2
         with:
-          crate: cargo-nextest
-          locked: true
+          tool: nextest
       - run: make miri-lib
 
   # The Tree-Borrows half of `make miri-all` beyond the three Stacked-Borrows
@@ -110,8 +119,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri-lib-tb
-      - uses: baptiste0928/cargo-install@v3
+          # See miri-safety: the sysroot in ~/.cache/miri isn't captured
+          # by default and rebuilds cold without this.
+          cache-directories: ~/.cache/miri
+      - uses: taiki-e/install-action@v2
         with:
-          crate: cargo-nextest
-          locked: true
+          tool: nextest
       - run: rustup run nightly cargo miri nextest run --no-fail-fast -p gabion-nginx --lib
