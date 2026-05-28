@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0](https://github.com/prosody-events/gabion/compare/v0.2.0...v0.3.0) (2026-05-28)
+
+
+### Features
+
+* accurate Retry-After / X-RateLimit-Reset / X-RateLimit-Remaining ([#19](https://github.com/prosody-events/gabion/issues/19)) ([60f3ca3](https://github.com/prosody-events/gabion/commit/60f3ca3aed8b2029c6ecfc18ca026d3418cc2e20))
+* emit X-RateLimit-* headers on allowed responses ([#22](https://github.com/prosody-events/gabion/issues/22)) ([101af34](https://github.com/prosody-events/gabion/commit/101af34e3d826701a4516932e8e943ae2f14e97a))
+
+
+### Bug fixes
+
+* **sim:** one visualizer step is one gossip round ([#27](https://github.com/prosody-events/gabion/issues/27)) ([4587e10](https://github.com/prosody-events/gabion/commit/4587e106bded354aa702e427c56ee5f8b2bc074d))
+
+
+### Build / CI
+
+* **docker:** back buildx cache with GHCR registry, not the Actions cache ([#23](https://github.com/prosody-events/gabion/issues/23)) ([518244a](https://github.com/prosody-events/gabion/commit/518244a66d8c1644e6fd9da166fe68f141d65b85))
+* **docker:** re-test openresty PR build; share the canonical cook cache ([#25](https://github.com/prosody-events/gabion/issues/25)) ([a915cd8](https://github.com/prosody-events/gabion/commit/a915cd8495b173ba81ce20944b42b965ee724606))
+* prebuilt nextest, miri sysroot cache, wasm dedup, Playwright cache, release-gated attestation ([#24](https://github.com/prosody-events/gabion/issues/24)) ([551607e](https://github.com/prosody-events/gabion/commit/551607e585932871309a2065583e8703c5bb2d0b))
+* share docker's warm cook cache with the nginx + k8s smokes ([#26](https://github.com/prosody-events/gabion/issues/26)) ([0dedddc](https://github.com/prosody-events/gabion/commit/0dedddc2a8d0ed302e155d8be8011707ea74e995))
+
 ## [0.2.0](https://github.com/prosody-events/gabion/compare/v0.1.0...v0.2.0) (2026-05-27)
 
 
