@@ -5,6 +5,15 @@ services:
       - ./nginx.base.conf:/etc/nginx/nginx.conf:ro
     command: ["nginx", "-t"]
 
+  # CI note: the nginx + kubernetes workflows pre-build these `target:
+  # smoke` services with `docker buildx build --load --cache-from
+  # type=registry,…` (warming the cargo-chef cook layer from the canonical
+  # `build` cache) and tag the result `<project>-<service>` —
+  # `nginx-nginx-module-smoke` / `nginx-nginx-module-request-smoke` — so a
+  # subsequent `compose run` without `--build` (and `kind load`) consume
+  # the pre-built image. Renaming a service or the compose project would
+  # break that name match; keep them in sync with the workflows.
+  #
   # Both module smokes share the same diagnostic setup:
   # - `ulimits.core: -1` raises the soft+hard core-dump rlimit so a SEGV
   #   actually writes a core. Without this, `set_zone`-time crashes

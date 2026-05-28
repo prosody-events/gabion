@@ -9,6 +9,14 @@ concurrency:
   group: nginx-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# `packages: read` lets the smoke jobs pull the private GHCR buildcache as
+# a read-only `cache-from` source. Fork PRs' GITHUB_TOKEN can't read
+# packages — their cache-from import misses and the build falls back to a
+# cold compile (today's behavior).
+permissions:
+  contents: read
+  packages: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -43,13 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: image=moby/buildkit:latest
+      # No buildx here: `make nginx-config` only runs `nginx -t` against
+      # the stock `nginx:stable-alpine` image — it builds nothing.
       - name: nginx-config smoke
-        env:
-          DOCKER_BUILDKIT: '1'
-          COMPOSE_DOCKER_CLI_BUILD: '1'
         run: make nginx-config
 
   nginx-module:
@@ -61,6 +65,16 @@ jobs:
       - uses: docker/setup-buildx-action@v3
         with:
           driver-opts: image=moby/buildkit:latest
+      # Best-effort login so the buildx `cache-from` below can read the
+      # private GHCR buildcache. Fork PRs lack packages access — the login
+      # fails, the import misses, and the build cold-compiles (today's
+      # behavior). `continue-on-error` keeps that path green.
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       # Route the host kernel's core dumps into /tmp/cores so the
       # smoke container (bind-mounted at /tmp/cores:/tmp/cores) and the
       # workflow's artifact upload below can pick them up. GHA's
@@ -73,10 +87,27 @@ jobs:
           sudo mkdir -p /tmp/cores
           sudo chmod 1777 /tmp/cores
           sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
+      # Pre-build the `target: smoke` image with the canonical `build`-job
+      # cook layer as a read-only registry cache, then `--load` it into the
+      # docker image store under the `<project>-<service>` name compose
+      # expects. The smoke run below (NGINX_SMOKE_BUILD empty → no
+      # `--build`) consumes it instead of cold-compiling gabion-nginx.
+      # cache-from is read-only — a miss degrades to today's cold build.
+      - name: warm smoke image from registry cache
+        run: |
+          docker buildx build \
+            --load \
+            --target smoke \
+            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
+            -f deploy/nginx/Dockerfile \
+            -t nginx-nginx-module-smoke:latest \
+            .
       - name: nginx-module smoke
         env:
           DOCKER_BUILDKIT: '1'
           COMPOSE_DOCKER_CLI_BUILD: '1'
+          NGINX_SMOKE_BUILD: ''
         run: make nginx-module
       # Cores are written by root inside the container so the runner
       # user can't open them for read. `sudo chmod` fixes the perms
@@ -101,15 +132,36 @@ jobs:
       - uses: docker/setup-buildx-action@v3
         with:
           driver-opts: image=moby/buildkit:latest
+      # Best-effort login — see nginx-module. Forks miss and cold-compile.
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: enable host core dumps
         run: |
           sudo mkdir -p /tmp/cores
           sudo chmod 1777 /tmp/cores
           sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
+      # Warm the `target: smoke` image from the canonical build cache, then
+      # run without `--build` (see nginx-module). Same image, different
+      # command — the request smoke asserts 200, 200, 429.
+      - name: warm smoke image from registry cache
+        run: |
+          docker buildx build \
+            --load \
+            --target smoke \
+            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
+            -f deploy/nginx/Dockerfile \
+            -t nginx-nginx-module-request-smoke:latest \
+            .
       - name: nginx-test smoke
         env:
           DOCKER_BUILDKIT: '1'
           COMPOSE_DOCKER_CLI_BUILD: '1'
+          NGINX_SMOKE_BUILD: ''
         run: make nginx-test
       # Cores are written by root inside the container so the runner
       # user can't open them for read. `sudo chmod` fixes the perms

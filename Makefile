@@ -1,6 +1,12 @@
 SHELL := /bin/sh
 
 COMPOSE := docker compose --profile module -f deploy/nginx/docker-compose.yml
+# Locally the nginx smokes build their own image (`--build`). CI pre-builds
+# the `target: smoke` image with a warm registry cache via
+# `docker buildx build --load` (so the `cargo chef cook` layer is a hit,
+# not a cold recompile) and overrides this to empty, so the compose run
+# consumes that pre-built image instead of rebuilding it cold.
+NGINX_SMOKE_BUILD ?= --build
 CARGO_ENV := CARGO_BUILD_RUSTC_WRAPPER=
 # `rustup run` resolves the correct toolchain for the host triple and puts
 # the matching `rustc` on PATH for the duration of the call — works the
@@ -229,11 +235,11 @@ nginx-config:
 
 .PHONY: nginx-module
 nginx-module:
-	$(COMPOSE) run --build --rm nginx-module-smoke
+	$(COMPOSE) run $(NGINX_SMOKE_BUILD) --rm nginx-module-smoke
 
 .PHONY: nginx-test
 nginx-test:
-	$(COMPOSE) run --build --rm nginx-module-request-smoke
+	$(COMPOSE) run $(NGINX_SMOKE_BUILD) --rm nginx-module-request-smoke
 
 .PHONY: nginx-matrix
 nginx-matrix:
