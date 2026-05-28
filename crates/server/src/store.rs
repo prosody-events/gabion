@@ -12,6 +12,7 @@ use dashmap::DashMap;
 
 use gabion::crdt::{BucketEpoch, Count, DeltaSink, ExpirationSink, KeyHash};
 use gabion::gossip::AggregateStore;
+use gabion::rules::RuleSpec;
 
 /// Lock-sharded per-bucket counter table. `&self` everywhere — clone an
 /// `Arc<DashMapStore<C>>` between the gossip writer and the read path.
@@ -69,6 +70,32 @@ impl<C: Count> DashMapStore<C> {
             }
         }
         total
+    }
+
+    /// Wall-clock ms until a request of weight `hits` for `(spec, key_hash)`
+    /// would be admitted under the sliding-window model. One DashMap lookup
+    /// per walked bucket; typical case is one lookup.
+    pub fn time_until_admit_millis(
+        &self,
+        spec: RuleSpec,
+        key_hash: KeyHash,
+        now_millis: u64,
+        total: u64,
+        hits: u64,
+    ) -> u64 {
+        gabion::window::time_until_admit_millis(
+            now_millis,
+            spec.bucket_millis,
+            spec.live_buckets,
+            spec.limit,
+            total,
+            hits,
+            |bucket| {
+                self.cells
+                    .get(&(spec.fingerprint, key_hash, bucket))
+                    .map_or(0, |v| *v.value())
+            },
+        )
     }
 }
 

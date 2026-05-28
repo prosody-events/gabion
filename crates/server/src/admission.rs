@@ -8,13 +8,30 @@ use gabion::rules::Descriptor;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Decision {
     Allow,
-    Reject(RejectReason),
+    /// Carries the reason plus, when the reject was scoped to a specific
+    /// rule, the precomputed header inputs Envoy renders into the response.
+    /// Pre-admission rejects (no rule) leave the context `None` — the
+    /// adapter still emits an `OverLimit` status, just without invented
+    /// remaining/reset numbers it cannot compute.
+    Reject(RejectReason, Option<RejectContext>),
 }
 
 impl Decision {
     pub fn is_reject(self) -> bool {
-        matches!(self, Self::Reject(_))
+        matches!(self, Self::Reject(..))
     }
+}
+
+/// Header-shaped reject payload populated alongside [`RejectReason::GlobalLimit`].
+/// Mirrors what Envoy expects on a per-descriptor `DescriptorStatus`:
+/// `limit_remaining` is the floor (0 on reject), and
+/// `duration_until_reset_millis` is the sliding-window-precise time until a
+/// same-weight request would be admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RejectContext {
+    pub limit: u64,
+    pub remaining: u64,
+    pub duration_until_reset_millis: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

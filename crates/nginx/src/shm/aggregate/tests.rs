@@ -148,6 +148,60 @@ fn multiple_keys_in_full_table_dont_lose_data() {
     }
 }
 
+fn test_spec(fp: u128, limit: u64, bucket_millis: u64, live_buckets: u32) -> RuleSpec {
+    RuleSpec {
+        id: 1,
+        fingerprint: fp,
+        limit,
+        bucket_millis,
+        window_millis: bucket_millis * live_buckets as u64,
+        live_buckets,
+    }
+}
+
+#[test]
+fn time_until_admit_millis_uses_oldest_non_empty_bucket() {
+    // Window = [6..10], bm=1000. Bucket 6 holds 15 hits — total=15,
+    // limit=10, hits=1 → need=6. Bucket 6 alone covers it; delta =
+    // (6+5)*1000 - 10000 = 1000ms.
+    let buf = SlotBuffer::allocate(16);
+    let store = buf.store();
+    store.write_delta(0xaa, 0xbb, 6, 15, 0);
+    let spec = test_spec(0xaa, 10, 1_000, 5);
+    let delta = buf
+        .view()
+        .time_until_admit_millis(spec, 0xbb, 10_000, 15, 1);
+    assert_eq!(delta, 1_000);
+}
+
+#[test]
+fn time_until_admit_millis_walks_through_empty_then_tombstoned_buckets() {
+    // Tombstone the oldest bucket (write then expire) to verify the
+    // walker steps over a TOMBSTONE slot exactly like an Empty one.
+    // Window = [6..10]. Bucket 6 expired → reads as None. Bucket 7
+    // alone covers need = 15+1-10 = 6.
+    let buf = SlotBuffer::allocate(16);
+    let store = buf.store();
+    store.write_delta(0xcc, 0xdd, 6, 4, 0);
+    store.write_expiration(0xcc, 0xdd, 6, 4); // tombstone bucket 6
+    store.write_delta(0xcc, 0xdd, 7, 15, 0);
+    let spec = test_spec(0xcc, 10, 1_000, 5);
+    let delta = buf
+        .view()
+        .time_until_admit_millis(spec, 0xdd, 10_000, 15, 1);
+    assert_eq!(delta, 2_000);
+}
+
+#[test]
+fn time_until_admit_millis_already_admittable_returns_zero() {
+    let buf = SlotBuffer::allocate(8);
+    let store = buf.store();
+    store.write_delta(0xee, 0xff, 10, 5, 0);
+    let spec = test_spec(0xee, 10, 1_000, 5);
+    let delta = buf.view().time_until_admit_millis(spec, 0xff, 10_000, 5, 3);
+    assert_eq!(delta, 0);
+}
+
 #[test]
 fn concurrent_readers_see_consistent_counts() {
     use std::sync::Arc;

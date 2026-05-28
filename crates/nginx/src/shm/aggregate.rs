@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gabion::crdt::{DeltaSink, ExpirationSink};
 use gabion::gossip::AggregateStore;
+use gabion::rules::RuleSpec;
 
 use super::AggregateCell;
 
@@ -150,6 +151,32 @@ impl<'a> AggregateTable<'a> {
             }
         }
         total
+    }
+
+    /// Wall-clock ms until a request of weight `hits` for `(spec, kh)`
+    /// would be admitted under the sliding-window model. Walks the live
+    /// buckets oldest → newest via [`gabion::window::time_until_admit_millis`],
+    /// so typical-case cost is one seqlocked SHM read.
+    pub fn time_until_admit_millis(
+        &self,
+        spec: RuleSpec,
+        kh: u128,
+        now_millis: u64,
+        total: u64,
+        hits: u64,
+    ) -> u64 {
+        gabion::window::time_until_admit_millis(
+            now_millis,
+            spec.bucket_millis,
+            spec.live_buckets,
+            spec.limit,
+            total,
+            hits,
+            |bucket| {
+                self.get(spec.fingerprint, kh, bucket)
+                    .map_or(0, |cell| cell.count)
+            },
+        )
     }
 
     fn read_slot(&self, index: usize) -> ProbeResult {

@@ -463,6 +463,96 @@ fn cardinality_rejects_max_plus_one_descriptors() {
     });
 }
 
+/// Once a descriptor goes over its limit, the per-descriptor status must
+/// carry both `limit_remaining` (0 on reject) and a non-empty
+/// `duration_until_reset`. Today's response leaves both at proto defaults
+/// — this test pins the populated shape so future refactors don't silently
+/// regress to empty fields.
+#[test]
+fn over_limit_populates_descriptor_status_fields() {
+    run_local(async {
+        // limit=2, rule window=1s, bucket=100ms (live=10).
+        let harness = harness(512, 2).await;
+        let make_request = || RateLimitRequest {
+            domain: "api".into(),
+            descriptors: vec![descriptor([("tenant", "a")])],
+            hits_addend: 1,
+        };
+
+        // Fill to the limit at now=0.
+        for tick in 0..2_u64 {
+            let r = harness
+                .limiter
+                .should_rate_limit_at(make_request(), tick)
+                .await;
+            assert_eq!(r.overall_code, rate_limit_response::Code::Ok as i32);
+        }
+
+        // 3rd request at now=0 trips the reject. With both prior hits
+        // in bucket 0 (oldest visible), need=1 is satisfied as soon as
+        // bucket 0 falls off — fall_off = (0+10)*100 = 1000ms, delta
+        // from now=0 is 1000ms.
+        let over = harness
+            .limiter
+            .should_rate_limit_at(make_request(), 0)
+            .await;
+        assert_eq!(
+            over.overall_code,
+            rate_limit_response::Code::OverLimit as i32,
+        );
+        let status = over.statuses.first().expect("one status");
+        assert_eq!(status.code, rate_limit_response::Code::OverLimit as i32);
+        assert_eq!(status.limit_remaining, 0, "remaining must be 0 on reject");
+        let duration = status
+            .duration_until_reset
+            .as_ref()
+            .expect("duration_until_reset must be populated");
+        let millis = (duration.seconds as u64) * 1_000 + (duration.nanos as u64) / 1_000_000;
+        assert_eq!(
+            millis, 1_000,
+            "delta should be the oldest bucket's fall-off"
+        );
+
+        let _ = harness.client.shutdown().await;
+    });
+}
+
+/// Pre-admission rejects (cardinality, MAX_DESCRIPTORS overflow) carry no
+/// rule scope, so the adapter cannot compute a real reset moment. Verify
+/// the response leaves `duration_until_reset` unset rather than inventing
+/// a value.
+#[test]
+fn cardinality_reject_leaves_duration_unset() {
+    run_local(async {
+        // max_descriptor_bytes = 8 forces the cardinality envelope to
+        // trip on any descriptor with a non-trivial value.
+        let harness = harness(8, 10).await;
+        let response = harness
+            .limiter
+            .should_rate_limit_at(
+                RateLimitRequest {
+                    domain: "api".into(),
+                    descriptors: vec![descriptor([("tenant", "long-value-here")])],
+                    hits_addend: 1,
+                },
+                0,
+            )
+            .await;
+        assert_eq!(
+            response.overall_code,
+            rate_limit_response::Code::OverLimit as i32,
+        );
+        let status = response.statuses.first().expect("one status");
+        assert_eq!(status.code, rate_limit_response::Code::OverLimit as i32);
+        assert_eq!(status.limit_remaining, 0);
+        assert!(
+            status.duration_until_reset.is_none(),
+            "pre-admission reject must not invent a reset moment"
+        );
+        let _ = harness.client.shutdown().await;
+    });
+}
+
 /// End-to-end gRPC round-trip against the actual tonic Server. Catches
 /// proto field add/remove regressions and runtime mounting errors that
 /// the in-process harness skips by calling `should_rate_limit_at`
