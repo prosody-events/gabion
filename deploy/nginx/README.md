@@ -1,3 +1,57 @@
+# NGINX images and smoke harness
+
+This directory ships two things:
+
+1. The **published NGINX and OpenResty Docker images** that we build and
+   push to GHCR (`ghcr.io/<repo>/nginx:*`, `ghcr.io/<repo>/openresty:*`).
+2. The **smoke harness** that exercises those images in CI and locally.
+
+## What the published image is
+
+Each published image is a **drop-in replacement** for its upstream base
+(`nginx:stable-alpine`, `openresty/openresty:alpine`, etc.). It
+inherits the upstream `ENTRYPOINT`, `EXPOSE`, `STOPSIGNAL`, `WORKDIR`,
+env vars, the `/docker-entrypoint.d/` script chain (on nginx), and the
+unmodified upstream `/etc/nginx/nginx.conf`. The only delta is:
+
+- `ngx_http_gabion_module.so` lives at `modules/ngx_http_gabion_module.so`
+  under each binary's `--modules-path`.
+- A one-line shim, `gabion-load-module.conf`, sits next to the upstream
+  nginx.conf. It contains exactly:
+  ```nginx
+  load_module modules/ngx_http_gabion_module.so;
+  include <upstream nginx.conf path>;
+  ```
+- The image's `CMD` is overridden to invoke nginx with `-c <shim>`, so
+  the shim is what gets parsed; the shim then includes the upstream (or
+  user-supplied) nginx.conf.
+
+The contract this gives the user: **`gabion_*` directives are available
+in their config without writing `load_module ...;` themselves**.
+Concretely:
+
+- `docker run ghcr.io/<repo>/nginx:stable-alpine` → identical to
+  `docker run nginx:stable-alpine`, with the gabion module loaded.
+  Serves the upstream "Welcome to nginx" page on `:80`.
+- `docker run -v ./my-nginx.conf:/etc/nginx/nginx.conf
+  ghcr.io/<repo>/nginx:stable-alpine` → the user's nginx.conf is
+  parsed; `gabion_limit_zone`, `gabion_limit_rule`, `gabion_limit`,
+  etc. work directly. No `load_module` needed.
+- `FROM ghcr.io/<repo>/nginx:stable-alpine` in a downstream Dockerfile
+  works the same way — `COPY my-nginx.conf /etc/nginx/nginx.conf` and
+  you're done.
+
+Users writing their own nginx.conf must **not** declare
+`load_module ngx_http_gabion_module.so;` themselves — the shim already
+does, and nginx errors on a double-load.
+
+The published Dockerfiles define a single multi-stage build. The
+default build target (the trailing `FROM published` alias) is the
+published image; passing `--target smoke` selects a separate stage
+that adds diagnostic tooling (`curl`, `gdb`, `binutils`) and the smoke
+harness scripts and config. The smoke target is opt-in and is only
+used by the smoke services in `docker-compose.yml`.
+
 # NGINX smoke harness
 
 The smoke harness builds the Gabion NGINX module against an upstream

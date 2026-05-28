@@ -1,11 +1,26 @@
 #!/bin/sh
 set -eu
 
-nginx -t
-rendered="$(nginx -T 2>&1)"
+# The published image's contract is "run nginx -c <shim>"; the shim does
+# `load_module modules/ngx_http_gabion_module.so;` and includes the
+# user's nginx.conf. The smoke harness exercises that exact path —
+# nginx.smoke.conf is mounted as /etc/nginx/nginx.conf and carries no
+# `load_module` of its own. Detect openresty vs nginx so the same script
+# works against both published images.
+if command -v openresty >/dev/null 2>&1; then
+    SHIM_CONF="/usr/local/openresty/nginx/conf/gabion-load-module.conf"
+else
+    SHIM_CONF="/etc/nginx/gabion-load-module.conf"
+fi
+
+nginx -t -c "$SHIM_CONF"
+rendered="$(nginx -T -c "$SHIM_CONF" 2>&1)"
 
 # Module loads and core directives are present at the expected level.
-printf '%s\n' "$rendered" | grep -F 'load_module /etc/nginx/modules/ngx_http_gabion_module.so;'
+# `load_module` lives in the shim in its relative form
+# (`modules/ngx_http_gabion_module.so`), resolved against each binary's
+# configured `--modules-path`.
+printf '%s\n' "$rendered" | grep -F 'load_module modules/ngx_http_gabion_module.so;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_zone zone=api:128m;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule uri_api    $uri                            rate=2r/m bucket=1s;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule ip_api     $remote_addr                    rate=2r/m bucket=1s;'
@@ -21,7 +36,7 @@ printf '%s\n' "$rendered" | grep -F 'gabion_gossip_cluster 1;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_fanout 8;'
 printf '%s\n' "$rendered" | grep -F 'gabion off;'
 
-nginx
+nginx -c "$SHIM_CONF"
 
 api_url="http://127.0.0.1:8080/api/index.html"
 ip_url="http://127.0.0.1:8080/ip/index.html"
@@ -130,4 +145,4 @@ test "$o_first" = 200
 test "$o_second" = 200
 test "$o_third" = 429
 
-nginx -s quit
+nginx -c "$SHIM_CONF" -s quit

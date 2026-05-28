@@ -12,8 +12,55 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v5
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-please's `simple` release-type bumps
+      # `workspace.package.version` in Cargo.toml via the TOML jsonpath
+      # extra-file, but knows nothing about Cargo.lock. Without this
+      # step, the merged release commit ships a stale lockfile (every
+      # workspace crate's `[[package]] version = "..."` entry still
+      # carries the prior version) and the first local `cargo build`
+      # after release produces a spurious N-crate version diff.
+      #
+      # Check out the release PR branch, run `cargo update --workspace`
+      # to refresh only workspace-member entries in Cargo.lock (without
+      # touching external deps), and push the result back to the PR
+      # branch as a follow-up commit. release-please rewrites its PR
+      # branch on subsequent runs; that's fine — this step runs again
+      # and re-adds the Cargo.lock commit before the PR is merged.
+      # Checkout main (the trusted, just-pushed SHA) — no `ref:` derived
+      # from `steps.release.outputs.pr` so CodeQL's "untrusted-checkout"
+      # heuristic stays satisfied. The next step fetches and checks out
+      # the release-please branch from the same trusted remote.
+      - uses: actions/checkout@v6
+        if: ${{ steps.release.outputs.pr }}
+
+      - name: Sync Cargo.lock in the release PR
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          PR: ${{ steps.release.outputs.pr }}
+        run: |
+          set -eu
+          branch=$(printf '%s' "$PR" | jq -r .headBranchName)
+          if [ -z "$branch" ] || [ "$branch" = "null" ]; then
+            echo "No release PR branch resolved; nothing to sync." >&2
+            exit 0
+          fi
+          git fetch origin "$branch":"$branch"
+          git checkout "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cargo update --workspace
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already in sync." >&2
+            exit 0
+          fi
+          git add Cargo.lock
+          git commit -m "chore: sync Cargo.lock to workspace.package.version"
+          git push origin "$branch"
+        shell: bash

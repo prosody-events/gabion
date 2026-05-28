@@ -101,8 +101,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -123,7 +123,7 @@ jobs:
             printf 'short-sha=%s\n' "$short_sha"
           } >> "$GITHUB_OUTPUT"
         shell: bash
-      - uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -360,8 +360,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -395,7 +395,7 @@ jobs:
         shell: bash
 
       - id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -498,8 +498,8 @@ jobs:
             kind: nginx
     runs-on: ubuntu-latest
     steps:
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -524,6 +524,7 @@ jobs:
           KIND: ${{ matrix.kind }}
           EVENT: ${{ github.event_name }}
           SHA: ${{ github.sha }}
+          EMIT_IMMUTABLE: 'true'
         run: |
           set -eu
           amd64_digest="$(cat /tmp/digests/amd64/digest)"
@@ -532,52 +533,524 @@ jobs:
 
           tags=()
           short_sha="${SHA:0:7}"
-          # `app` images (gabiond) only ever carry version and ref-tag
-          # — no flavor and no upstream-version axis.
-          # `nginx`-shaped images (nginx, openresty) layer the resolved
-          # upstream version onto the same set.
+
+          # On release, also publish floating `:MAJOR` and `:MAJOR.MINOR`
+          # tags so users can pin to a release line and get patches
+          # automatically. These intentionally drop the `v` prefix — only
+          # the immutable `:vX.Y.Z` keeps it.
+          major=""
+          major_minor=""
           if [[ "$IS_RELEASE" == "true" ]]; then
-            base_versioned="$REF_TAG"
-            base_latest="latest"
-          else
-            base_versioned="main-$short_sha"
-            base_latest="main"
+            major="${VERSION%%.*}"      # 0.2.0 -> 0
+            major_minor="${VERSION%.*}" # 0.2.0 -> 0.2
           fi
 
+          # `app` images (gabiond) only ever carry version and ref-tag —
+          # no flavor and no upstream-version axis. `nginx`-shaped images
+          # (nginx, openresty) layer the resolved upstream version onto
+          # the same set.
+          #
+          # Non-release (main pushes / cron) is split for the two kinds:
+          # `app` keeps `:main-<sha>` as its immutable per-commit pin
+          # (no upstream axis to track). `nginx`-shaped images drop the
+          # unqualified `:main-<sha>` — that tag's immutability is
+          # broken on every weekly cron rebuild when an upstream patch
+          # shifts under the same SHA — and pin instead to the
+          # upstream-qualified `:main-<sha>-<upstream>` form, which
+          # genuinely is one-image-per-(commit, upstream-patch).
           if [[ "$KIND" == "app" ]]; then
-            tags+=("${IMAGE_REPO}:${base_versioned}")
             if [[ "$IS_RELEASE" == "true" ]]; then
-              tags+=("${IMAGE_REPO}:${base_latest}")
+              [[ "$EMIT_IMMUTABLE" == "true" ]] && tags+=("${IMAGE_REPO}:${REF_TAG}")
+              tags+=("${IMAGE_REPO}:latest")
+              tags+=("${IMAGE_REPO}:${major}")
+              tags+=("${IMAGE_REPO}:${major_minor}")
             else
-              # On main pushes, also publish a moving `:main` pointer.
+              tags+=("${IMAGE_REPO}:main-${short_sha}")
               tags+=("${IMAGE_REPO}:main")
             fi
           else
             if [[ -z "$FLAVOR_SUFFIX" ]]; then
-              # Default flavor — no suffix in the tag.
-              tags+=("${IMAGE_REPO}:${base_versioned}")
               if [[ "$IS_RELEASE" == "true" ]]; then
-                tags+=("${IMAGE_REPO}:${base_versioned}-${upstream}")
-                tags+=("${IMAGE_REPO}:${base_latest}")
+                if [[ "$EMIT_IMMUTABLE" == "true" ]]; then
+                  tags+=("${IMAGE_REPO}:${REF_TAG}")
+                  tags+=("${IMAGE_REPO}:${REF_TAG}-${upstream}")
+                fi
+                tags+=("${IMAGE_REPO}:latest")
                 tags+=("${IMAGE_REPO}:${upstream}")
+                tags+=("${IMAGE_REPO}:${major}")
+                tags+=("${IMAGE_REPO}:${major}-${upstream}")
+                tags+=("${IMAGE_REPO}:${major_minor}")
+                tags+=("${IMAGE_REPO}:${major_minor}-${upstream}")
               else
                 tags+=("${IMAGE_REPO}:main")
                 tags+=("${IMAGE_REPO}:${upstream}-main")
+                tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}")
               fi
             else
-              tags+=("${IMAGE_REPO}:${base_versioned}-${FLAVOR_SUFFIX}")
               if [[ "$IS_RELEASE" == "true" ]]; then
-                tags+=("${IMAGE_REPO}:${base_versioned}-${upstream}-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${base_latest}-${FLAVOR_SUFFIX}")
+                if [[ "$EMIT_IMMUTABLE" == "true" ]]; then
+                  tags+=("${IMAGE_REPO}:${REF_TAG}-${FLAVOR_SUFFIX}")
+                  tags+=("${IMAGE_REPO}:${REF_TAG}-${upstream}-${FLAVOR_SUFFIX}")
+                fi
+                tags+=("${IMAGE_REPO}:latest-${FLAVOR_SUFFIX}")
                 tags+=("${IMAGE_REPO}:${upstream}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${major}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${major}-${upstream}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${major_minor}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${major_minor}-${upstream}-${FLAVOR_SUFFIX}")
               else
                 tags+=("${IMAGE_REPO}:main-${FLAVOR_SUFFIX}")
                 tags+=("${IMAGE_REPO}:${upstream}-main-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}-${FLAVOR_SUFFIX}")
               fi
             fi
           fi
 
           # Emit one `--tag` per resolved tag plus the two source digests.
+          args=()
+          for t in "${tags[@]}"; do
+            args+=("--tag" "$t")
+          done
+          args+=("${IMAGE_REPO}@${amd64_digest}" "${IMAGE_REPO}@${arm64_digest}")
+          printf '%s\n' "${tags[@]}"
+          docker buildx imagetools create "${args[@]}"
+        shell: bash
+
+  # ── Floating-release-tag refresh ────────────────────────────────────
+  #
+  # The `build` + `combine` pair above is wired to refresh the main-
+  # tagged image set on cron (`:main`, `:<upstream>-main`,
+  # `:main-<sha>-<upstream>`). The floating *release* tags
+  # (`:latest`, `:<upstream>`, `:X`, `:X.Y` and their flavored variants)
+  # need a separate pipeline because they have to be built **from the
+  # latest `v*` tag**, not from `main`. Without this, `:latest` etc.
+  # stop tracking upstream patches the moment a release ships, until
+  # the next gabion release.
+  #
+  # Refresh runs only on the schedule event and emits the floating
+  # subset of the release tag set — never the immutable `:vX.Y.Z` or
+  # `:vX.Y.Z-<upstream>(-<sfx>)?` pins. Those keep their original
+  # release digest.
+  refresh-plan:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      ref: ${{ steps.tag.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: tag
+        run: |
+          set -eu
+          tag="$(git tag --sort=-v:refname --list 'v*' | head -n1)"
+          if [[ -z "$tag" ]]; then
+            echo "No v* tags found; nothing to refresh." >&2
+            exit 0
+          fi
+          echo "ref=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+  refresh-build:
+    if: github.event_name == 'schedule' && needs.refresh-plan.outputs.ref != ''
+    needs: refresh-plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # gabiond — single flavor.
+          - image: gabiond
+            dockerfile: deploy/gabiond/Dockerfile
+            flavor: default
+            flavor-suffix: ''
+            base-arg: ''
+            base-image: ''
+            arch: amd64
+            runner: ubuntu-latest
+          - image: gabiond
+            dockerfile: deploy/gabiond/Dockerfile
+            flavor: default
+            flavor-suffix: ''
+            base-arg: ''
+            base-image: ''
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          # nginx — six flavors.
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: stable-alpine
+            flavor-suffix: ''
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:stable-alpine
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: stable-alpine
+            flavor-suffix: ''
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:stable-alpine
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: mainline-alpine
+            flavor-suffix: mainline-alpine
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:mainline-alpine
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: mainline-alpine
+            flavor-suffix: mainline-alpine
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:mainline-alpine
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: alpine
+            flavor-suffix: alpine
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:alpine
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: alpine
+            flavor-suffix: alpine
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:alpine
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: stable
+            flavor-suffix: stable
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:stable
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: stable
+            flavor-suffix: stable
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:stable
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: mainline
+            flavor-suffix: mainline
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:mainline
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: mainline
+            flavor-suffix: mainline
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:mainline
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: latest
+            flavor-suffix: debian
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:latest
+            arch: amd64
+            runner: ubuntu-latest
+          - image: nginx
+            dockerfile: deploy/nginx/Dockerfile
+            flavor: latest
+            flavor-suffix: debian
+            base-arg: NGINX_BASE_IMAGE
+            base-image: nginx:latest
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+          # openresty — three flavors.
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: alpine
+            flavor-suffix: ''
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:alpine
+            arch: amd64
+            runner: ubuntu-latest
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: alpine
+            flavor-suffix: ''
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:alpine
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: jammy
+            flavor-suffix: jammy
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:jammy
+            arch: amd64
+            runner: ubuntu-latest
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: jammy
+            flavor-suffix: jammy
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:jammy
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: bookworm
+            flavor-suffix: bookworm
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:bookworm
+            arch: amd64
+            runner: ubuntu-latest
+          - image: openresty
+            dockerfile: deploy/nginx/Dockerfile.openresty
+            flavor: bookworm
+            flavor-suffix: bookworm
+            base-arg: OPENRESTY_BASE_IMAGE
+            base-image: openresty/openresty:bookworm
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      # Build from the v* tag, not main — that's the contract refresh
+      # exists to satisfy. Anything else and `:latest`-shaped tags
+      # would drift to whatever's on main between releases.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.refresh-plan.outputs.ref }}
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: resolve
+        if: matrix.base-image != ''
+        env:
+          BASE_IMAGE: ${{ matrix.base-image }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          docker pull --platform="linux/${ARCH}" "$BASE_IMAGE"
+          if [[ "${{ matrix.image }}" == "nginx" ]]; then
+            ver=$(docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$BASE_IMAGE" \
+              | sed -n 's/^NGINX_VERSION=//p' \
+              | head -n1)
+            echo "upstream-tag=nginx${ver}" >> "$GITHUB_OUTPUT"
+            echo "upstream-version=${ver}" >> "$GITHUB_OUTPUT"
+          else
+            ver=$(docker run --rm --platform="linux/${ARCH}" --entrypoint sh "$BASE_IMAGE" \
+              -c '/usr/local/openresty/nginx/sbin/nginx -v 2>&1' \
+              | sed -n 's|^nginx version: openresty/\([0-9.]*\).*|\1|p')
+            echo "upstream-tag=openresty${ver}" >> "$GITHUB_OUTPUT"
+            echo "upstream-version=${ver}" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            ${{ matrix.base-arg != '' && format('{0}={1}', matrix.base-arg, matrix.base-image) || '' }}
+          # Refresh uses a distinct cache scope so an inflight `main`
+          # build can't poison the release-tag rebuild (and vice versa).
+          cache-from: type=gha,scope=refresh-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=refresh-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          provenance: mode=max
+          sbom: true
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: capture digest
+        run: |
+          set -eu
+          mkdir -p /tmp/digests
+          name='${{ matrix.image }}'
+          flavor='${{ matrix.flavor }}'
+          digest='${{ steps.build.outputs.digest }}'
+          upstream='${{ steps.resolve.outputs.upstream-tag || '' }}'
+          printf '%s\n' "$digest" > "/tmp/digests/digest"
+          printf '%s\n' "$upstream" > "/tmp/digests/upstream"
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: refresh-digest-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  refresh-combine:
+    if: github.event_name == 'schedule' && needs.refresh-plan.outputs.ref != ''
+    needs: [refresh-plan, refresh-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: gabiond
+            flavor: default
+            flavor-suffix: ''
+            kind: app
+          - image: nginx
+            flavor: stable-alpine
+            flavor-suffix: ''
+            kind: nginx
+          - image: nginx
+            flavor: mainline-alpine
+            flavor-suffix: mainline-alpine
+            kind: nginx
+          - image: nginx
+            flavor: alpine
+            flavor-suffix: alpine
+            kind: nginx
+          - image: nginx
+            flavor: stable
+            flavor-suffix: stable
+            kind: nginx
+          - image: nginx
+            flavor: mainline
+            flavor-suffix: mainline
+            kind: nginx
+          - image: nginx
+            flavor: latest
+            flavor-suffix: debian
+            kind: nginx
+          - image: openresty
+            flavor: alpine
+            flavor-suffix: ''
+            kind: nginx
+          - image: openresty
+            flavor: jammy
+            flavor-suffix: jammy
+            kind: nginx
+          - image: openresty
+            flavor: bookworm
+            flavor-suffix: bookworm
+            kind: nginx
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: refresh-digest-${{ matrix.image }}-${{ matrix.flavor }}-amd64
+          path: /tmp/digests/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: refresh-digest-${{ matrix.image }}-${{ matrix.flavor }}-arm64
+          path: /tmp/digests/arm64
+
+      - id: assemble
+        env:
+          IMAGE_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          VERSION: ${{ needs.refresh-plan.outputs.version }}
+          REF_TAG: ${{ needs.refresh-plan.outputs.ref }}
+          # Refresh always operates as if `IS_RELEASE` is true (we're
+          # building from the v* tag), but with `EMIT_IMMUTABLE` false
+          # — the immutable `:vX.Y.Z` (and `:vX.Y.Z-<upstream>(-<sfx>)?`)
+          # pins keep their original release-time digest. We only
+          # republish the floating subset under the same release line.
+          IS_RELEASE: 'true'
+          EMIT_IMMUTABLE: 'false'
+          FLAVOR_SUFFIX: ${{ matrix.flavor-suffix }}
+          KIND: ${{ matrix.kind }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          amd64_digest="$(cat /tmp/digests/amd64/digest)"
+          arm64_digest="$(cat /tmp/digests/arm64/digest)"
+          upstream="$(cat /tmp/digests/amd64/upstream)"
+
+          tags=()
+          short_sha="${SHA:0:7}"
+
+          major=""
+          major_minor=""
+          if [[ "$IS_RELEASE" == "true" ]]; then
+            major="${VERSION%%.*}"
+            major_minor="${VERSION%.*}"
+          fi
+
+          if [[ "$KIND" == "app" ]]; then
+            if [[ "$IS_RELEASE" == "true" ]]; then
+              [[ "$EMIT_IMMUTABLE" == "true" ]] && tags+=("${IMAGE_REPO}:${REF_TAG}")
+              tags+=("${IMAGE_REPO}:latest")
+              tags+=("${IMAGE_REPO}:${major}")
+              tags+=("${IMAGE_REPO}:${major_minor}")
+            else
+              tags+=("${IMAGE_REPO}:main-${short_sha}")
+              tags+=("${IMAGE_REPO}:main")
+            fi
+          else
+            if [[ -z "$FLAVOR_SUFFIX" ]]; then
+              if [[ "$IS_RELEASE" == "true" ]]; then
+                if [[ "$EMIT_IMMUTABLE" == "true" ]]; then
+                  tags+=("${IMAGE_REPO}:${REF_TAG}")
+                  tags+=("${IMAGE_REPO}:${REF_TAG}-${upstream}")
+                fi
+                tags+=("${IMAGE_REPO}:latest")
+                tags+=("${IMAGE_REPO}:${upstream}")
+                tags+=("${IMAGE_REPO}:${major}")
+                tags+=("${IMAGE_REPO}:${major}-${upstream}")
+                tags+=("${IMAGE_REPO}:${major_minor}")
+                tags+=("${IMAGE_REPO}:${major_minor}-${upstream}")
+              else
+                tags+=("${IMAGE_REPO}:main")
+                tags+=("${IMAGE_REPO}:${upstream}-main")
+                tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}")
+              fi
+            else
+              if [[ "$IS_RELEASE" == "true" ]]; then
+                if [[ "$EMIT_IMMUTABLE" == "true" ]]; then
+                  tags+=("${IMAGE_REPO}:${REF_TAG}-${FLAVOR_SUFFIX}")
+                  tags+=("${IMAGE_REPO}:${REF_TAG}-${upstream}-${FLAVOR_SUFFIX}")
+                fi
+                tags+=("${IMAGE_REPO}:latest-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${upstream}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${major}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${major}-${upstream}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${major_minor}-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${major_minor}-${upstream}-${FLAVOR_SUFFIX}")
+              else
+                tags+=("${IMAGE_REPO}:main-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:${upstream}-main-${FLAVOR_SUFFIX}")
+                tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}-${FLAVOR_SUFFIX}")
+              fi
+            fi
+          fi
+
           args=()
           for t in "${tags[@]}"; do
             args+=("--tag" "$t")

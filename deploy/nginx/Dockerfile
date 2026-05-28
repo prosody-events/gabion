@@ -111,7 +111,14 @@ RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
     && mkdir -p /out \
     && cp target/release/libgabion_nginx.so /out/ngx_http_gabion_module.so
 
-FROM ${NGINX_BASE_IMAGE}
+FROM ${NGINX_BASE_IMAGE} AS published
+
+COPY --from=module-builder /out/ngx_http_gabion_module.so /etc/nginx/modules/ngx_http_gabion_module.so
+COPY deploy/nginx/gabion-load-module.conf /etc/nginx/gabion-load-module.conf
+
+CMD ["nginx", "-c", "/etc/nginx/gabion-load-module.conf", "-g", "daemon off;"]
+
+FROM published AS smoke
 
 SHELL ["/bin/sh", "-euxc"]
 
@@ -123,9 +130,13 @@ RUN if command -v apk >/dev/null 2>&1; then \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
-COPY --from=module-builder /out/ngx_http_gabion_module.so /etc/nginx/modules/ngx_http_gabion_module.so
-COPY deploy/nginx/nginx.module.conf /etc/nginx/nginx.conf
+COPY deploy/nginx/nginx.smoke.conf /etc/nginx/nginx.conf
 COPY deploy/nginx/module-request-smoke.sh /usr/local/bin/gabion-nginx-request-smoke
 COPY deploy/nginx/smoke-with-bt.sh /usr/local/bin/gabion-smoke-with-bt
 
 RUN chmod +x /usr/local/bin/gabion-nginx-request-smoke /usr/local/bin/gabion-smoke-with-bt
+
+# Default build target = `published`. The trailing unnamed stage makes
+# `docker build -f Dockerfile .` produce the registry-shaped image
+# without --target; smoke is opt-in via --target smoke.
+FROM published
