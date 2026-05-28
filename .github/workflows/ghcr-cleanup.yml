@@ -7,15 +7,17 @@ on:
   # bounded and predictable.
   pull_request:
     types: [closed]
-  # Weekly safety net: anything `pr-*` older than 30 days gets pruned,
-  # in case the close-event handler missed a tag (network blip, fork
-  # PR closed before merge, etc.).
+  # Weekly safety net: anything `pr-*` or `buildcache-*` older than 30
+  # days gets pruned, in case the close-event handler missed a `pr-` tag
+  # (network blip, fork PR closed before merge, etc.) or a `buildcache-`
+  # scope was retired (a dropped flavor / image) and stopped being
+  # rewritten.
   schedule:
     - cron: '0 5 * * 6'
   workflow_dispatch:
     inputs:
       max-age-days:
-        description: 'Delete pr-* tags older than this many days (manual sweeps)'
+        description: 'Delete pr-* / buildcache-* tags older than this many days (manual sweeps)'
         type: number
         default: 30
 
@@ -60,7 +62,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - name: delete pr-* images older than ${{ inputs.max-age-days || 30 }} days
+      - name: delete pr-* / buildcache-* images older than ${{ inputs.max-age-days || 30 }} days
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OWNER: ${{ github.repository_owner }}
@@ -76,18 +78,34 @@ jobs:
           cutoff=$(python3 -c "import time; print(int(time.time()) - ${MAX_AGE_DAYS}*86400)")
           for image in gabiond nginx openresty; do
             pkg=$(printf '%s/%s' "$REPO" "$image" | jq -sRr @uri)
-            # Pull every version, keep only ones whose tags all start
-            # with `pr-` (so we never sweep a moving release tag) and
-            # whose updated_at predates the cutoff.
-            ids=$(gh api --paginate "/${base}/packages/container/${pkg}/versions" \
-                    --jq ".[]
-                          | select((.metadata.container.tags | length) > 0)
-                          | select(.metadata.container.tags | map(startswith(\"pr-\")) | all)
-                          | select((.updated_at | fromdateiso8601) < ${cutoff})
-                          | .id" \
-                    || true)
-            for id in $ids; do
-              printf 'deleting orphan %s version %s\n' "$image" "$id"
-              gh api -X DELETE "/${base}/packages/container/${pkg}/versions/${id}"
+            # Two prune classes, same shape: keep only versions whose tags
+            # *all* start with the prefix, and whose updated_at predates
+            # the cutoff. The `length > 0` guard is load-bearing — it
+            # excludes the untagged per-arch release digests that
+            # `push-by-digest` leaves behind, so we never sweep a real
+            # published layer. A version carrying any non-prefixed tag
+            # (a release tag, `:main`, …) also fails `| all` and is kept.
+            #   - `pr-`         per-PR reviewer images. The PR-close event
+            #                   handler is the primary sweep; this is the
+            #                   30-day safety net.
+            #   - `buildcache-` registry-backed buildx cache tags written
+            #                   by docker.yml. An active scope is rewritten
+            #                   every run, so updated_at stays fresh; only
+            #                   a retired scope (a dropped flavor / image)
+            #                   ages past the cutoff. Pruning one just
+            #                   forces a single cold build next run — never
+            #                   wrong output.
+            for prefix in pr- buildcache-; do
+              ids=$(gh api --paginate "/${base}/packages/container/${pkg}/versions" \
+                      --jq ".[]
+                            | select((.metadata.container.tags | length) > 0)
+                            | select(.metadata.container.tags | map(startswith(\"${prefix}\")) | all)
+                            | select((.updated_at | fromdateiso8601) < ${cutoff})
+                            | .id" \
+                      || true)
+              for id in $ids; do
+                printf 'deleting orphan %s version %s (prefix %s)\n' "$image" "$id" "$prefix"
+                gh api -X DELETE "/${base}/packages/container/${pkg}/versions/${id}"
+              done
             done
           done

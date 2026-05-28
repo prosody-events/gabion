@@ -132,11 +132,16 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
             ${{ matrix.base-arg != '' && format('{0}={1}', matrix.base-arg, matrix.base-image) || '' }}
-          # GHA-only cache; scope per (image,arch). PR scope is separate
-          # from release scope so a stale PR layer never poisons a
-          # release rebuild.
-          cache-from: type=gha,scope=pr-${{ matrix.image }}-amd64
-          cache-to: type=gha,mode=max,scope=pr-${{ matrix.image }}-amd64
+          # Registry-backed cache on GHCR — not the Actions cache, whose
+          # hard 10 GiB per-repo cap these `mode=max` blobs were blowing
+          # past, so entries were LRU-evicted before they could be reused.
+          # Registry cache counts against package storage instead. PR
+          # scope stays separate from release scope so a stale PR layer
+          # never poisons a release rebuild. `image-manifest=true,
+          # oci-mediatypes=true` is mandatory: without it GHCR rejects the
+          # cache manifest mediatype and the export silently no-ops.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-pr-${{ matrix.image }}-amd64
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-pr-${{ matrix.image }}-amd64,mode=max,image-manifest=true,oci-mediatypes=true
           # Skip provenance + sbom on PRs — they're for releases, and
           # they bloat per-PR registry churn the cleanup has to sweep.
           provenance: false
@@ -406,8 +411,16 @@ jobs:
           # what makes cargo-chef shine — the recipe-frozen build layer is
           # what we want to skip on re-runs. Scope per (image,flavor,arch)
           # so an amd64 layer never tries to satisfy an arm64 build.
-          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          #
+          # Registry-backed on GHCR, not the Actions cache: at `mode=max`
+          # these blobs ran ~10 GiB and were continuously LRU-evicted
+          # under GitHub's 10 GiB per-repo Actions cap before reuse.
+          # Registry cache counts against package storage instead.
+          # `image-manifest=true,oci-mediatypes=true` is mandatory —
+          # without it GHCR rejects the cache manifest mediatype and the
+          # export silently no-ops.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
           # `mode=max` provenance records the full build graph in the
           # image's OCI index. The signed attestation goes through
           # actions/attest-build-provenance below.
@@ -874,8 +887,12 @@ jobs:
             ${{ matrix.base-arg != '' && format('{0}={1}', matrix.base-arg, matrix.base-image) || '' }}
           # Refresh uses a distinct cache scope so an inflight `main`
           # build can't poison the release-tag rebuild (and vice versa).
-          cache-from: type=gha,scope=refresh-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=refresh-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          # Registry-backed on GHCR for the same cap reason as `build` —
+          # and refresh's weekly cadence made GHA eviction especially
+          # likely to drop the entry before the next run could reuse it.
+          # `image-manifest=true,oci-mediatypes=true` is mandatory.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-refresh-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-refresh-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
           provenance: mode=max
           sbom: true
           outputs: |
