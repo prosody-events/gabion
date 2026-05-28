@@ -3,4 +3,5 @@ pub mod defaults;
 pub mod discovery;
 pub mod gossip;
 pub mod rules;
+pub mod window;
 pub mod wire;

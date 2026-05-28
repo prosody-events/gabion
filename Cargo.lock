@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "gabion"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "async-stream",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "gabion-loader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "envoy-types",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "gabion-nginx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "gabion-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "gabion-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures",
  "gabion",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "gossip-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

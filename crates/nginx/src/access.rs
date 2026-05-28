@@ -59,6 +59,11 @@ pub struct RejectInfo {
     pub spec: RuleSpec,
     pub total: u64,
     pub now_millis: u64,
+    /// Wall-clock ms from `now_millis` until a request of the same weight
+    /// would be admitted under the sliding-window model. Computed once at
+    /// reject time so `Retry-After` / `X-RateLimit-Reset` are a pure
+    /// format step.
+    pub delta_until_admit_millis: u64,
 }
 
 /// Borrowed view of the rule set + SHM region passed into the access path.
@@ -275,11 +280,16 @@ fn decide_one(
     );
     // DryRun rules count and gossip but never reject — they let operators
     // observe what enforcement would do before flipping the switch.
-    if total.saturating_add(1) > spec.limit && rule.mode == EnforcementMode::Enforce {
+    let hits = 1u64;
+    if total.saturating_add(hits) > spec.limit && rule.mode == EnforcementMode::Enforce {
+        let delta_until_admit_millis = ctx
+            .aggregate
+            .time_until_admit_millis(spec, key_hash.0, now_millis, total, hits);
         return RuleOutcome::Reject(RejectInfo {
             spec,
             total,
             now_millis,
+            delta_until_admit_millis,
         });
     }
     let bucket = (now_millis / spec.bucket_millis) as u32;
@@ -321,31 +331,6 @@ pub fn is_truthy(value: &[u8]) -> bool {
         value,
         b"0" | b"false" | b"False" | b"FALSE" | b"off" | b"Off" | b"OFF" | b"no" | b"No" | b"NO"
     )
-}
-
-/// Delta-seconds the client should wait before retrying. Emitted as
-/// `Retry-After` (RFC 7231 §7.1.3).
-///
-/// Under the fixed-window configuration, a rejected hit may still be visible
-/// until the next full window boundary. The safest answer — and the one least
-/// likely to send the client into another 429 — is the full window in
-/// seconds. We deliberately don't emit "seconds until the next small bucket
-/// boundary": if bucket granularity is configured below the user-facing
-/// window, that number is misleading for clients.
-pub fn retry_after_seconds(info: RejectInfo) -> u64 {
-    info.spec.window_millis.div_ceil(1_000).max(1)
-}
-
-/// Unix-timestamp seconds at which `X-RateLimit-Reset` says the rate
-/// limit will reset. Matches the Envoy ratelimit filter / GitHub /
-/// Twitter conventions: emit an absolute time, not a delta.
-///
-/// Falls back to "now + window_seconds" if the caller's `now_millis`
-/// looks like a relative clock (less than the unix epoch lower bound).
-pub fn reset_unix_seconds(info: RejectInfo) -> u64 {
-    let window_seconds = info.spec.window_millis.div_ceil(1_000).max(1);
-    let now_seconds = info.now_millis / 1_000;
-    now_seconds.saturating_add(window_seconds)
 }
 
 #[cfg(test)]

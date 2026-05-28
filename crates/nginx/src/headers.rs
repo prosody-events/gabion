@@ -5,7 +5,7 @@
 
 use std::fmt::Write;
 
-use crate::access::{RejectInfo, reset_unix_seconds, retry_after_seconds};
+use crate::access::RejectInfo;
 
 /// Header values formatted for one rejected request. The buffers are sized
 /// to fit any `u64`/`u32` value plus padding.
@@ -113,15 +113,23 @@ impl RejectHeaders {
     ///
     /// * `X-RateLimit-Limit` — request budget per window (GitHub/Envoy style).
     /// * `X-RateLimit-Remaining` — `0` once we're past the budget.
-    /// * `X-RateLimit-Reset` — unix-timestamp seconds at which the fixed
-    ///   window's quota resets. Matches the Envoy ratelimit filter and
+    /// * `X-RateLimit-Reset` — unix-timestamp seconds at which the rate
+    ///   limit resets. Matches the Envoy ratelimit filter and
     ///   GitHub/Twitter.
-    /// * `Retry-After` — delta-seconds per RFC 7231 §7.1.3. Always the safe
-    ///   upper bound (`window_seconds`) because a client retrying sooner may
-    ///   still see their earlier hits and 429 again.
+    /// * `Retry-After` — delta-seconds per RFC 7231 §7.1.3.
+    ///
+    /// Both `Retry-After` and `Reset` come from `info.delta_until_admit_millis`
+    /// — the sliding-window-precise "time until a same-weight request
+    /// would be admitted" computed at reject time
+    /// (`gabion::window::time_until_admit_millis`). The value is bucket-
+    /// distribution-aware: two clients rejected on the same key one second
+    /// apart see `Retry-After` values that differ by exactly 1, and a
+    /// rejection with stale hits in older buckets reports a shorter wait
+    /// than the full window.
     pub fn build(info: RejectInfo) -> Self {
-        let retry_after_s = retry_after_seconds(info);
-        let reset_unix_s = reset_unix_seconds(info);
+        let retry_after_s = gabion::window::retry_after_seconds(info.delta_until_admit_millis);
+        let reset_unix_s =
+            gabion::window::reset_unix_seconds(info.now_millis, info.delta_until_admit_millis);
         let mut limit = HeaderBuffer::new();
         limit.write_u64(info.spec.limit);
         let mut remaining = HeaderBuffer::new();

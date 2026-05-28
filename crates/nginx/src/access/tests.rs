@@ -158,11 +158,63 @@ fn reject_when_window_total_exceeds_limit() {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.spec.id, spec.id);
             assert_eq!(info.total, 5);
+            // Rule: limit=2, window=1s, bucket=250ms (live=4). All 5 hits
+            // sit in bucket 4 (now=1000ms). need = 5+1-2 = 4. Walking
+            // buckets 1..4 oldest-first: 0,0,0,5 — bucket 4 alone covers
+            // need. Its fall-off is (4+4)*250 = 2000ms, so delta from
+            // now=1000 is 1000ms.
+            assert_eq!(info.delta_until_admit_millis, 1_000);
         }
         other => panic!("expected Reject, got {other:?}"),
     }
     let mut out = [QueueEvent::default(); 1];
     assert_eq!(region.queue().drain(&mut out), 0);
+}
+
+#[test]
+fn reject_delta_reflects_oldest_non_empty_bucket() {
+    // Build a rule with limit=2, window=1s, bucket=250ms (live=4). At
+    // now=1_000ms the live window is buckets [1..4]. Spread the 5
+    // existing hits across buckets so the *oldest non-empty* bucket
+    // governs the delta: bucket 2 has 5 hits, the rest are empty. need
+    // = 5+1-2 = 4, satisfied at bucket 2; fall_off = (2+4)*250 = 1500ms;
+    // delta from now=1_000 is 500ms.
+    let (_buf, region) = build_zone(8, 16);
+    let rules = build_rules();
+    let domain = crate::rules::DEFAULT_DOMAIN;
+    let spec = rules.rules()[0].rule.spec();
+    let descriptors = [Descriptor {
+        key: "tenant",
+        value: "alice",
+    }];
+    let key_hash = hash_key(spec.id, domain, &descriptors);
+    // SAFETY: same single-writer pattern documented on the other
+    // ShmAggregateStore::new uses in this file.
+    let store = unsafe {
+        crate::shm::aggregate::ShmAggregateStore::new(
+            region.aggregate_slots_ptr(),
+            region.layout.aggregate_capacity,
+        )
+    };
+    store.write_delta(spec.fingerprint, key_hash.0, 2, 5, 0);
+
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain,
+        cardinality: CardinalitySettings::default(),
+    };
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    let outcome = decide(ctx, 0, &vars, 1_000);
+    match outcome {
+        AccessOutcome::Reject(info) => {
+            assert_eq!(info.total, 5);
+            assert_eq!(info.delta_until_admit_millis, 500);
+        }
+        other => panic!("expected Reject, got {other:?}"),
+    }
 }
 
 #[test]
@@ -243,23 +295,6 @@ fn invalid_utf8_descriptor_declines_and_bumps_counter() {
     // user-facing reject counter.
     assert_eq!(snap.rejected, 0);
     assert_eq!(snap.rejected_cardinality, 0);
-}
-
-#[test]
-fn retry_after_seconds_matches_window() {
-    let info = RejectInfo {
-        spec: RuleSpec {
-            id: 1,
-            fingerprint: 0,
-            limit: 1,
-            bucket_millis: 1_000,
-            window_millis: 60_000,
-            live_buckets: 60,
-        },
-        total: 1,
-        now_millis: 0,
-    };
-    assert_eq!(retry_after_seconds(info), 60);
 }
 
 #[test]
@@ -937,21 +972,4 @@ fn unknown_predicate_variable_fails_at_compile() {
         matches!(err, RuleConfigError::CompileBinding { .. }),
         "expected CompileBinding, got {err:?}"
     );
-}
-
-#[test]
-fn reset_unix_seconds_is_now_plus_window() {
-    let info = RejectInfo {
-        spec: RuleSpec {
-            id: 1,
-            fingerprint: 0,
-            limit: 1,
-            bucket_millis: 1_000,
-            window_millis: 60_000,
-            live_buckets: 60,
-        },
-        total: 1,
-        now_millis: 1_770_000_000_000,
-    };
-    assert_eq!(reset_unix_seconds(info), 1_770_000_000 + 60);
 }

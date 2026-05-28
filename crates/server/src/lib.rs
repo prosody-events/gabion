@@ -28,7 +28,7 @@ use gabion::gossip::GossipClient;
 use gabion::rules::{Descriptor, EnforcementMode, RuleSpec, RuleTable, hash_key};
 use thiserror::Error;
 
-use crate::admission::{CardinalityLimits, Decision, LimitRequest, RejectReason};
+use crate::admission::{CardinalityLimits, Decision, LimitRequest, RejectContext, RejectReason};
 use crate::store::DashMapStore;
 
 const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
@@ -116,7 +116,7 @@ impl<C: Count> SharedLimiter<C> {
 
         for (idx, envoy_descriptor) in request.descriptors.iter().enumerate() {
             let decision = if idx >= MAX_DESCRIPTORS {
-                Decision::Reject(RejectReason::Cardinality)
+                Decision::Reject(RejectReason::Cardinality, None)
             } else {
                 match map_envoy_descriptor(envoy_descriptor, &mut mapped) {
                     Ok(()) => {
@@ -127,15 +127,12 @@ impl<C: Count> SharedLimiter<C> {
                         };
                         self.evaluate(core_request, now_millis).await
                     }
-                    Err(reason) => Decision::Reject(reason),
+                    Err(reason) => Decision::Reject(reason, None),
                 }
             };
 
             over_limit |= decision.is_reject();
-            statuses.push(rate_limit_response::DescriptorStatus {
-                code: code_for_decision(decision),
-                ..Default::default()
-            });
+            statuses.push(descriptor_status_for(decision));
         }
 
         RateLimitResponse {
@@ -152,7 +149,7 @@ impl<C: Count> SharedLimiter<C> {
     async fn evaluate(&self, request: LimitRequest<'_>, now_millis: u64) -> Decision {
         if request.violates_cardinality(self.cardinality_limits) {
             note_cardinality_reject(request.domain, request.descriptors.len());
-            return Decision::Reject(RejectReason::Cardinality);
+            return Decision::Reject(RejectReason::Cardinality, None);
         }
 
         // Pass 1: decide allow/reject and buffer (spec, key_hash, bucket)
@@ -178,7 +175,21 @@ impl<C: Count> SharedLimiter<C> {
             if total.saturating_add(request.hits) > spec.limit
                 && rule.mode == EnforcementMode::Enforce
             {
-                return Decision::Reject(RejectReason::GlobalLimit);
+                let duration_until_reset_millis = self.counts.time_until_admit_millis(
+                    spec,
+                    key_hash,
+                    now_millis,
+                    total,
+                    request.hits,
+                );
+                return Decision::Reject(
+                    RejectReason::GlobalLimit,
+                    Some(RejectContext {
+                        limit: spec.limit,
+                        remaining: gabion::window::limit_remaining(spec.limit, total),
+                        duration_until_reset_millis,
+                    }),
+                );
             }
             let bucket = (now_millis / spec.bucket_millis) as u32;
             if planned.try_push((spec, key_hash, bucket)).is_err() {
@@ -369,10 +380,7 @@ pub fn response_from_decisions(decisions: &[Decision]) -> RateLimitResponse {
     } as i32;
     let statuses = decisions
         .iter()
-        .map(|decision| rate_limit_response::DescriptorStatus {
-            code: code_for_decision(*decision),
-            ..Default::default()
-        })
+        .map(|decision| descriptor_status_for(*decision))
         .collect();
 
     RateLimitResponse {
@@ -388,6 +396,35 @@ fn code_for_decision(decision: Decision) -> i32 {
     } else {
         rate_limit_response::Code::Ok
     }) as i32
+}
+
+/// Build the `DescriptorStatus` Envoy renders into the response. Allows
+/// and pre-admission rejects (no rule scope, no [`RejectContext`]) leave
+/// `limit_remaining` and `duration_until_reset` at their proto defaults;
+/// scoped rejects populate both from the [`RejectContext`] computed at
+/// reject time.
+///
+/// `current_limit` (the `RateLimit { requests_per_unit, unit }`
+/// sub-message) stays `None`: there is no lossless mapping from arbitrary
+/// `(limit, window_millis)` pairs to the discrete `Second/Minute/Hour/Day`
+/// enum, and reporting a wrong unit is worse than reporting none.
+fn descriptor_status_for(decision: Decision) -> rate_limit_response::DescriptorStatus {
+    let code = code_for_decision(decision);
+    match decision {
+        Decision::Reject(_, Some(ctx)) => rate_limit_response::DescriptorStatus {
+            code,
+            limit_remaining: u32::try_from(ctx.remaining).unwrap_or(u32::MAX),
+            duration_until_reset: Some(envoy_types::pb::google::protobuf::Duration {
+                seconds: (ctx.duration_until_reset_millis / 1_000) as i64,
+                nanos: ((ctx.duration_until_reset_millis % 1_000) * 1_000_000) as i32,
+            }),
+            ..Default::default()
+        },
+        _ => rate_limit_response::DescriptorStatus {
+            code,
+            ..Default::default()
+        },
+    }
 }
 
 pub fn descriptor(
