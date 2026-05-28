@@ -649,6 +649,18 @@ impl EngineState {
         // analogue of a single `tokio::time::advance` firing every node's
         // interval — then drains so the tick and any gossip it triggers fully
         // propagate before the next.
+        //
+        // Delivery is deferred across the round: a sim send buffers its packet
+        // (the source flushes its outbound queue within its own poll, so no
+        // engine-side drain order can otherwise separate "every node has
+        // gossiped" from "packets delivered"). The first drain lets every node
+        // consume its tick and buffer its sends with nothing yet delivered;
+        // `release_deferred` then delivers this round's packets; the second
+        // drain lets receivers merge them. Their ticks are already consumed, so
+        // a freshly-merged count cannot re-gossip in the same step — one step
+        // is one epidemic round, capped at `fanout` new peers. This is the
+        // physically correct model and keeps `submit`/churn paths (which never
+        // arm deferral) unchanged.
         loop {
             let next_tick = (self.virtual_ms / tick_ms + 1).saturating_mul(tick_ms);
             if next_tick > target {
@@ -656,7 +668,10 @@ impl EngineState {
             }
             self.virtual_ms = next_tick;
             self.now.set(next_tick);
+            self.router.begin_deferred();
             self.fire_tick().await;
+            self.drain_pending().await;
+            self.router.release_deferred();
             self.drain_pending().await;
             self.drain_log(&mut events);
             let now = self.admin_counters().await;

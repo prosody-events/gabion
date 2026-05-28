@@ -549,6 +549,78 @@ fn churn_script_is_deterministic() {
     );
 }
 
+/// A single `step` is a single gossip round: a brand-new count must not reach
+/// more than `fanout` other nodes in one step. Before the delivery-barrier fix
+/// the step driver interleaved tick-consumption with packet delivery, so a peer
+/// that received the burst could re-gossip it within the *same* step — a
+/// hop-by-hop cascade that lit up far more than `fanout + 1` nodes per click.
+///
+/// `nodes = 12`, `fanout = 6`: 11 peers ⇒ coverage `⌈ln(11) + c⌉ = 6`, so the
+/// effective fanout is 6 and at most `6 + 1 = 7` nodes may know after one step.
+/// `hits` stays well under the eager-flush budget
+/// (`epsilon = rule_limit × bps / (10_000 × peers) = 1_000_000 / 1_100 ≈ 909`)
+/// so the submit itself does not gossip — the baseline below proves it.
+#[test]
+fn one_step_propagates_a_new_count_to_at_most_fanout_peers() {
+    let config = SimConfig {
+        fanout: 6,
+        rule_limit: 1_000_000,
+        ..test_config(12)
+    };
+    let effective_fanout = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
+    assert_eq!(effective_fanout, 6, "11 peers ⇒ coverage ⌈ln(11)+3⌉ = 6");
+
+    // A node "knows" the count if it holds the cell (a nonzero aggregate, since
+    // the single key is the only traffic).
+    fn known(state: &ClusterState) -> usize {
+        state.nodes.iter().filter(|n| n.aggregate_total > 0).count()
+    }
+
+    with_engine(config, |tx| async move {
+        submit(&tx, 0, WATCHED_KEY, 5).await;
+        let baseline = snapshot(&tx).await;
+        assert_eq!(
+            known(&baseline),
+            1,
+            "submit alone must not gossip; only the origin knows (if this is 7 the eager-flush \
+             threshold assumption broke — tune hits/rule_limit)"
+        );
+
+        // One gossip round (one tick at the configured 100 ms interval). The
+        // origin fans out to `effective_fanout` peers and nobody re-forwards
+        // within the same step.
+        step(&tx, 100).await;
+        let after_one = snapshot(&tx).await;
+        assert!(
+            known(&after_one) <= effective_fanout as usize + 1,
+            "one step is one round: at most fanout+1 = {} nodes may know, got {}",
+            effective_fanout + 1,
+            known(&after_one),
+        );
+        assert!(
+            known(&after_one) > 1,
+            "one step must still propagate to at least one peer"
+        );
+
+        // Further steps must eventually inform every node — the fix one-hops
+        // propagation, it does not freeze it.
+        for _ in 0..20 {
+            step(&tx, 100).await;
+        }
+        let converged = snapshot(&tx).await;
+        assert_eq!(
+            known(&converged),
+            12,
+            "enough rounds inform all 12 nodes: {:?}",
+            converged
+                .nodes
+                .iter()
+                .map(|n| (n.id, n.aggregate_total))
+                .collect::<Vec<_>>(),
+        );
+    });
+}
+
 /// The wire form renders 128-bit identifiers as hex strings (JS-safe) while
 /// the Rust types keep `u128`.
 #[test]
