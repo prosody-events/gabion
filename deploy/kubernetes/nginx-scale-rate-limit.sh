@@ -72,7 +72,7 @@ kubectl -n "$namespace" apply -f - <<'YAML'
 # RoleBinding below grants exactly the verbs `EndpointSliceDiscovery`
 # uses (`crates/gabion/src/discovery/kubernetes.rs::watch_services` and
 # `watch_target`). Discovery itself falls through env→DNS bootstrap so
-# no `serviceAccountName` line, no `env` directive in nginx.module.conf,
+# no `serviceAccountName` line, no `env` directive in nginx.smoke.conf,
 # and no kubeconfig is needed inside the pod.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -116,12 +116,6 @@ spec:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
           imagePullPolicy: Never
-          # The image's baked CMD (from `deploy/nginx/docker-compose.yml`)
-          # is `/usr/local/bin/gabion-nginx-request-smoke`, a one-shot
-          # script that runs nginx, hits a few URLs, then exits. In a
-          # long-lived pod that's CrashLoopBackoff. Run nginx as a daemon
-          # instead — same image, real server.
-          command: ["nginx", "-g", "daemon off;"]
           ports:
             - name: http
               containerPort: 8080
@@ -283,12 +277,9 @@ assert_pod_rate_limit() {
         printf '%s\n' "FAIL: missing rate-limit header on 429 from pod $pod" >&2
         return 1
     fi
-    # Per the rule in deploy/nginx/nginx.module.conf: uri_api 2r/m,
-    # window=60s. Standard conventions (Envoy / GitHub-compatible):
-    #   X-RateLimit-Limit:     budget
-    #   X-RateLimit-Remaining: 0 on reject
-    #   X-RateLimit-Reset:     unix-timestamp seconds when the window resets
-    #   Retry-After:           delta-seconds = window (RFC 7231)
+    # Rule (deploy/nginx/nginx.smoke.conf): uri_api 2r/m, window=60s.
+    # Retry-After is the sliding-window delta until the oldest live hit
+    # ages out, so it falls in [1, window].
     if [ "$limit_h" != "2" ]; then
         printf '%s\n' "FAIL: X-RateLimit-Limit=$limit_h, expected 2" >&2
         return 1
@@ -297,9 +288,8 @@ assert_pod_rate_limit() {
         printf '%s\n' "FAIL: X-RateLimit-Remaining=$remaining_h, expected 0" >&2
         return 1
     fi
-    # Retry-After should equal the rule window in seconds (60).
-    if [ "$retry_h" != "60" ]; then
-        printf '%s\n' "FAIL: Retry-After=$retry_h, expected 60 (rule window)" >&2
+    if ! [ "$retry_h" -ge 1 ] || ! [ "$retry_h" -le 60 ]; then
+        printf '%s\n' "FAIL: Retry-After=$retry_h, expected 1..60 (rule window)" >&2
         return 1
     fi
     # Reset is a unix timestamp; sanity-check it is "now-ish" (within
@@ -393,8 +383,8 @@ assert_cluster_rate_limit() {
         printf '%s\n' "FAIL: X-RateLimit-Remaining=$remaining_h, expected 0" >&2
         return 1
     fi
-    if [ "$retry_h" != "60" ]; then
-        printf '%s\n' "FAIL: Retry-After=$retry_h, expected 60 (rule window)" >&2
+    if ! [ "$retry_h" -ge 1 ] || ! [ "$retry_h" -le 60 ]; then
+        printf '%s\n' "FAIL: Retry-After=$retry_h, expected 1..60 (rule window)" >&2
         return 1
     fi
     now_unix="$(date +%s)"

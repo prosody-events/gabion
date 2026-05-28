@@ -16,7 +16,7 @@
 //! # Example output
 //!
 //! With `error_log /dev/stderr info;` in `nginx.conf` (the v1 deployment
-//! default — see `deploy/nginx/nginx.module.conf`), a worker handling a
+//! default — see `deploy/nginx/nginx.smoke.conf`), a worker handling a
 //! request that exercises the gabion module logs lines such as:
 //!
 //! ```text
@@ -99,7 +99,7 @@ impl Subscriber for NginxSubscriber {
         // race on nginx's cached log timestamp — worst case a line is
         // stamped a second stale. The file write itself is atomic for
         // line-sized payloads on the targets we ship with (the v1 deploy
-        // uses `/dev/stderr`, see `deploy/nginx/nginx.module.conf`).
+        // uses `/dev/stderr`, see `deploy/nginx/nginx.smoke.conf`).
         let meta = event.metadata();
         let mut visitor = MsgVisitor::default();
         event.record(&mut visitor);

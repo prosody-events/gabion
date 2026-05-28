@@ -111,12 +111,6 @@ RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
     && mkdir -p /out \
     && cp target/release/libgabion_nginx.so /out/ngx_http_gabion_module.so
 
-# The published image: identical to its upstream base image (entrypoint
-# chain, /etc/nginx/nginx.conf, default server, env, EXPOSE, STOPSIGNAL
-# all inherited) except that the gabion module is auto-loaded via a
-# one-line shim invoked with `-c`. A user mounting their own nginx.conf
-# at /etc/nginx/nginx.conf gets `gabion_*` directives without needing
-# `load_module ...;` of their own.
 FROM ${NGINX_BASE_IMAGE} AS published
 
 COPY --from=module-builder /out/ngx_http_gabion_module.so /etc/nginx/modules/ngx_http_gabion_module.so
@@ -124,11 +118,6 @@ COPY deploy/nginx/gabion-load-module.conf /etc/nginx/gabion-load-module.conf
 
 CMD ["nginx", "-c", "/etc/nginx/gabion-load-module.conf", "-g", "daemon off;"]
 
-# Smoke variant: published image + diagnostic tooling (curl, gdb,
-# binutils) + the smoke harness scripts and config. Opt-in via
-# `--target smoke`; deploy/nginx/docker-compose.yml selects it for the
-# `make nginx-module`/`nginx-test` services so the smoke rig tests the
-# same published image the registry ships.
 FROM published AS smoke
 
 SHELL ["/bin/sh", "-euxc"]
@@ -147,8 +136,7 @@ COPY deploy/nginx/smoke-with-bt.sh /usr/local/bin/gabion-smoke-with-bt
 
 RUN chmod +x /usr/local/bin/gabion-nginx-request-smoke /usr/local/bin/gabion-smoke-with-bt
 
-# Default build target = the published image. The unnamed final stage is
-# an alias for `published` so `docker build -f Dockerfile .` (and every
-# CI build that doesn't pass --target) produces the registry-shaped
-# image. The `smoke` stage above is opt-in via --target smoke.
+# Default build target = `published`. The trailing unnamed stage makes
+# `docker build -f Dockerfile .` produce the registry-shaped image
+# without --target; smoke is opt-in via --target smoke.
 FROM published

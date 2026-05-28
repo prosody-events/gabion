@@ -159,8 +159,6 @@ metadata:
   name: gabion-nginx-config
 data:
   nginx.conf: |
-    load_module /etc/nginx/modules/ngx_http_gabion_module.so;
-
     worker_processes 2;
     error_log /dev/stderr info;
 
@@ -268,9 +266,6 @@ spec:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
           imagePullPolicy: Never
-          # See nginx-scale-rate-limit.sh: the image's baked CMD is the
-          # one-shot request smoke, which exits immediately under k8s.
-          command: ["nginx", "-g", "daemon off;"]
           ports:
             - name: http
               containerPort: 8080
