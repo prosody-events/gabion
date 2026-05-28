@@ -28,7 +28,9 @@ use gabion::gossip::GossipClient;
 use gabion::rules::{Descriptor, EnforcementMode, RuleSpec, RuleTable, hash_key};
 use thiserror::Error;
 
-use crate::admission::{CardinalityLimits, Decision, LimitRequest, RejectContext, RejectReason};
+use crate::admission::{
+    CardinalityLimits, Decision, LimitRequest, QuotaContext, RejectContext, RejectReason,
+};
 use crate::store::DashMapStore;
 
 const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
@@ -159,6 +161,7 @@ impl<C: Count> SharedLimiter<C> {
         // Rules in `DryRun` mode are evaluated and recorded but never
         // produce a reject verdict.
         let mut planned: ArrayVec<(RuleSpec, KeyHash, u32), MAX_MATCHED_RULES> = ArrayVec::new();
+        let mut tightest: Option<QuotaContext> = None;
         for rule in self
             .rule_table
             .matching(request.domain, request.descriptors)
@@ -191,6 +194,24 @@ impl<C: Count> SharedLimiter<C> {
                     }),
                 );
             }
+            // Saturating: DryRun rule past its limit (which the gate
+            // above lets through) reports `remaining = 0` rather than
+            // underflowing.
+            let remaining = spec
+                .limit
+                .saturating_sub(total)
+                .saturating_sub(request.hits);
+            let duration_until_reset_millis =
+                gabion::window::time_until_next_bucket_boundary_millis(
+                    now_millis,
+                    spec.bucket_millis,
+                );
+            let candidate = QuotaContext {
+                limit: spec.limit,
+                remaining,
+                duration_until_reset_millis,
+            };
+            tightest = Some(pick_min_remaining_ctx(tightest, candidate));
             let bucket = (now_millis / spec.bucket_millis) as u32;
             if planned.try_push((spec, key_hash, bucket)).is_err() {
                 // Per the allow-by-default principle (see CLAUDE.md), a
@@ -221,7 +242,17 @@ impl<C: Count> SharedLimiter<C> {
                 note_gossip_record_failure(&err);
             }
         }
-        Decision::Allow
+        Decision::Allow(tightest)
+    }
+}
+
+/// Pick the rule the client is closest to tripping (smallest
+/// `remaining`). Ties keep the existing pick — first match wins,
+/// preserving the rule-declaration order surfaced by `RuleTable::matching`.
+fn pick_min_remaining_ctx(current: Option<QuotaContext>, candidate: QuotaContext) -> QuotaContext {
+    match current {
+        Some(c) if c.remaining <= candidate.remaining => c,
+        _ => candidate,
     }
 }
 
@@ -398,11 +429,14 @@ fn code_for_decision(decision: Decision) -> i32 {
     }) as i32
 }
 
-/// Build the `DescriptorStatus` Envoy renders into the response. Allows
-/// and pre-admission rejects (no rule scope, no [`RejectContext`]) leave
-/// `limit_remaining` and `duration_until_reset` at their proto defaults;
-/// scoped rejects populate both from the [`RejectContext`] computed at
-/// reject time.
+/// Build the `DescriptorStatus` Envoy renders into the response. Both
+/// allow paths (with a [`QuotaContext`]) and scoped rejects (with a
+/// [`RejectContext`]) populate `limit_remaining` and
+/// `duration_until_reset`; the Envoy filter with
+/// `enable_x_ratelimit_headers: DRAFT_VERSION_03` turns those into
+/// `X-RateLimit-*` response headers on the upstream response.
+/// Pre-admission rejects (no rule scope) leave both fields at their proto
+/// defaults — there is no rule to compute a real reset moment against.
 ///
 /// `current_limit` (the `RateLimit { requests_per_unit, unit }`
 /// sub-message) stays `None`: there is no lossless mapping from arbitrary
@@ -414,16 +448,26 @@ fn descriptor_status_for(decision: Decision) -> rate_limit_response::DescriptorS
         Decision::Reject(_, Some(ctx)) => rate_limit_response::DescriptorStatus {
             code,
             limit_remaining: u32::try_from(ctx.remaining).unwrap_or(u32::MAX),
-            duration_until_reset: Some(envoy_types::pb::google::protobuf::Duration {
-                seconds: (ctx.duration_until_reset_millis / 1_000) as i64,
-                nanos: ((ctx.duration_until_reset_millis % 1_000) * 1_000_000) as i32,
-            }),
+            duration_until_reset: Some(duration_from_millis(ctx.duration_until_reset_millis)),
+            ..Default::default()
+        },
+        Decision::Allow(Some(ctx)) => rate_limit_response::DescriptorStatus {
+            code,
+            limit_remaining: u32::try_from(ctx.remaining).unwrap_or(u32::MAX),
+            duration_until_reset: Some(duration_from_millis(ctx.duration_until_reset_millis)),
             ..Default::default()
         },
         _ => rate_limit_response::DescriptorStatus {
             code,
             ..Default::default()
         },
+    }
+}
+
+fn duration_from_millis(millis: u64) -> envoy_types::pb::google::protobuf::Duration {
+    envoy_types::pb::google::protobuf::Duration {
+        seconds: (millis / 1_000) as i64,
+        nanos: ((millis % 1_000) * 1_000_000) as i32,
     }
 }
 

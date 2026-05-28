@@ -44,6 +44,50 @@ tenant_a_url="http://127.0.0.1:8080/tenant/index.html?tenant=a"
 tenant_b_url="http://127.0.0.1:8080/tenant/index.html?tenant=b"
 tenant_missing_url="http://127.0.0.1:8080/tenant/index.html"
 off_url="http://127.0.0.1:8080/off/index.html"
+dryrun_url="http://127.0.0.1:8080/dryrun/index.html"
+
+# `curl_headers <url>` runs a GET and emits only the response headers on
+# stdout (status line + headers, body discarded), so assertions can grep
+# both the HTTP code and the `X-RateLimit-*` triplet from a single call.
+curl_headers() {
+    curl -sS -D - -o /dev/null "$1"
+}
+
+# `assert_header_present <headers-blob> <name>` exits non-zero with a
+# diagnostic when the named header is missing. Case-insensitive on the
+# name because nginx may normalise the casing.
+assert_header_present() {
+    if ! printf '%s\n' "$1" | grep -i -q "^$2:"; then
+        echo "expected header '$2' missing from response:"
+        printf '%s\n' "$1"
+        exit 1
+    fi
+}
+
+# `assert_header_absent <headers-blob> <name>` is the dual — used to
+# verify allowed responses don't carry `Retry-After`.
+assert_header_absent() {
+    if printf '%s\n' "$1" | grep -i -q "^$2:"; then
+        echo "unexpected header '$2' present on response:"
+        printf '%s\n' "$1"
+        exit 1
+    fi
+}
+
+# `assert_header_equals <headers-blob> <name> <expected>` exits non-zero
+# unless the named header's value equals `<expected>` exactly. Uses
+# `tr -d` to strip carriage returns rather than bash-only `$'...'`
+# escapes, since this script targets `#!/bin/sh` (dash on the nginx
+# image).
+assert_header_equals() {
+    actual="$(printf '%s\n' "$1" | grep -i "^$2:" | head -n1 \
+        | sed -e 's/^[^:]*:[[:space:]]*//' -e 's/[[:space:]]*$//' | tr -d '\r')"
+    if [ "$actual" != "$3" ]; then
+        echo "header '$2': expected '$3', got '$actual'"
+        printf '%s\n' "$1"
+        exit 1
+    fi
+}
 
 # Gossip-pipeline settle time. Each request flows
 # worker→SHM queue→leader→GossipRuntime→AggregateStore before the next
@@ -52,15 +96,33 @@ off_url="http://127.0.0.1:8080/off/index.html"
 # over-budget probe keeps the assertions deterministic.
 SETTLE_SLEEP="${GABION_SMOKE_SETTLE_SLEEP:-0.25}"
 
-# /api/ — uri_api at 2r/m: first two pass, third gets 429.
-first="$(curl -fsS -o /dev/null -w '%{http_code}' "$api_url")"
-second="$(curl -fsS -o /dev/null -w '%{http_code}' "$api_url")"
-sleep "$SETTLE_SLEEP"
-third="$(curl -sS -o /dev/null -w '%{http_code}' "$api_url")"
-
+# /api/ — uri_api at 2r/m: first two pass, third gets 429. Each response
+# must carry `X-RateLimit-{Limit,Remaining,Reset}`; the 429 also gets
+# `Retry-After`.
+first_h="$(curl_headers "$api_url")"
+first="$(printf '%s\n' "$first_h" | head -n1 | awk '{print $2}')"
 test "$first" = 200
+assert_header_present "$first_h" 'X-RateLimit-Limit'
+assert_header_present "$first_h" 'X-RateLimit-Remaining'
+assert_header_present "$first_h" 'X-RateLimit-Reset'
+assert_header_absent  "$first_h" 'Retry-After'
+
+second_h="$(curl_headers "$api_url")"
+second="$(printf '%s\n' "$second_h" | head -n1 | awk '{print $2}')"
 test "$second" = 200
+assert_header_present "$second_h" 'X-RateLimit-Limit'
+assert_header_present "$second_h" 'X-RateLimit-Remaining'
+assert_header_present "$second_h" 'X-RateLimit-Reset'
+assert_header_absent  "$second_h" 'Retry-After'
+
+sleep "$SETTLE_SLEEP"
+third_h="$(curl_headers "$api_url")"
+third="$(printf '%s\n' "$third_h" | head -n1 | awk '{print $2}')"
 test "$third" = 429
+assert_header_present "$third_h" 'X-RateLimit-Limit'
+assert_header_equals  "$third_h" 'X-RateLimit-Remaining' '0'
+assert_header_present "$third_h" 'X-RateLimit-Reset'
+assert_header_present "$third_h" 'Retry-After'
 
 # /ip/ — ip_api keyed on $remote_addr at 2r/m: same shape as /api/.
 ip_first="$(curl -fsS -o /dev/null -w '%{http_code}' "$ip_url")"
@@ -144,5 +206,17 @@ o_third="$(curl -sS -o /dev/null -w '%{http_code}' "$overrides_url")"
 test "$o_first" = 200
 test "$o_second" = 200
 test "$o_third" = 429
+
+# /dryrun/ — shadow_canary at 1r/s in DryRun mode. Every request is
+# allowed (DryRun never rejects), but `X-RateLimit-Remaining: 0` rides
+# the response so operators can graph "share that would have been
+# 429'd". No `Retry-After` because no admission decision was negative.
+dryrun_h="$(curl_headers "$dryrun_url")"
+dryrun_status="$(printf '%s\n' "$dryrun_h" | head -n1 | awk '{print $2}')"
+test "$dryrun_status" = 200
+assert_header_present "$dryrun_h" 'X-RateLimit-Limit'
+assert_header_equals  "$dryrun_h" 'X-RateLimit-Remaining' '0'
+assert_header_present "$dryrun_h" 'X-RateLimit-Reset'
+assert_header_absent  "$dryrun_h" 'Retry-After'
 
 nginx -c "$SHIM_CONF" -s quit

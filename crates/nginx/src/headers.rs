@@ -1,20 +1,23 @@
-//! Format the response headers emitted on a rate-limit rejection.
+//! Format the response headers emitted by gabion on every admission decision.
 //!
-//! `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` and
-//! `Retry-After`. All formatting goes into stack buffers; nothing allocates.
+//! `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`
+//! ride on both allowed and rejected responses; `Retry-After` is added on
+//! rejections only. All formatting goes into stack buffers; nothing
+//! allocates.
 
 use std::fmt::Write;
 
-use crate::access::RejectInfo;
+use crate::access::{AllowInfo, RejectInfo};
 
-/// Header values formatted for one rejected request. The buffers are sized
-/// to fit any `u64`/`u32` value plus padding.
-pub struct RejectHeaders {
+/// Header values formatted for one admission decision. The buffers are
+/// sized to fit any `u64`/`u32` value plus padding. `retry_after` is
+/// `Some(_)` only on the reject path — allowed responses get the
+/// `X-RateLimit-*` triplet without a `Retry-After`.
+pub struct AdmissionHeaders {
     pub limit: HeaderBuffer,
     pub remaining: HeaderBuffer,
     pub reset: HeaderBuffer,
-    pub retry_after: HeaderBuffer,
-    pub body: BodyBuffer,
+    pub retry_after: Option<HeaderBuffer>,
 }
 
 /// Header value formatted into a fixed-cap byte buffer. Holds at most 32
@@ -44,12 +47,11 @@ impl HeaderBuffer {
         // (`'0'..='9'`), all of which are valid UTF-8 by themselves
         // and form a valid UTF-8 string when concatenated. No other
         // writer touches `bytes`, so every byte in `as_bytes()` is a
-        // valid ASCII digit. Replacing the previous `.expect("...")`
-        // because this is on the reject hot path (every 429 builds
+        // valid ASCII digit. Avoiding `.expect("...")` because this is
+        // on the admission hot path (every response builds three or
         // four of these headers) and the panic surface across nginx's
         // C handler is UB if it ever fires — keeping the contract
-        // local to this module pins the invariant where it's
-        // upheld.
+        // local to this module pins the invariant where it's upheld.
         unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
     }
 
@@ -59,6 +61,12 @@ impl HeaderBuffer {
         let _ = write!(&mut tmp, "{value}");
         self.len = tmp.len as u8;
     }
+
+    fn from_u64(value: u64) -> Self {
+        let mut buf = Self::new();
+        buf.write_u64(value);
+        buf
+    }
 }
 
 impl Default for HeaderBuffer {
@@ -67,14 +75,15 @@ impl Default for HeaderBuffer {
     }
 }
 
-/// Response body buffer for the rejection text. Bounded at compile time.
+/// Response body buffer for the 429 rejection text. Bounded at compile time
+/// and only constructed on the reject path.
 #[derive(Clone, Copy)]
-pub struct BodyBuffer {
+pub struct RejectBody {
     bytes: [u8; 128],
     len: u8,
 }
 
-impl BodyBuffer {
+impl RejectBody {
     pub fn new() -> Self {
         Self {
             bytes: [0; 128],
@@ -90,32 +99,59 @@ impl BodyBuffer {
         std::str::from_utf8(self.as_bytes()).unwrap_or("rate limit exceeded\n")
     }
 
-    fn write_body(&mut self, info: RejectInfo) {
-        let mut tmp = StackWriter::new(&mut self.bytes);
+    pub fn build(info: RejectInfo) -> Self {
+        let mut body = Self::new();
+        let mut tmp = StackWriter::new(&mut body.bytes);
         let over = info.total.saturating_add(1).saturating_sub(info.spec.limit);
         let _ = writeln!(
             &mut tmp,
             "rate limit exceeded: rule={} limit={} over_by={}",
             info.spec.id, info.spec.limit, over
         );
-        self.len = tmp.len.min(self.bytes.len()) as u8;
+        body.len = tmp.len.min(body.bytes.len()) as u8;
+        body
     }
 }
 
-impl Default for BodyBuffer {
+impl Default for RejectBody {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RejectHeaders {
-    /// Build the header set + body for one rejection. Conventions:
+impl AdmissionHeaders {
+    /// Build the `X-RateLimit-*` triplet for an allowed response.
+    ///
+    /// * `X-RateLimit-Limit` — the rule's request budget (matching the reject
+    ///   path).
+    /// * `X-RateLimit-Remaining` — budget left *after* this request.
+    /// * `X-RateLimit-Reset` — unix-timestamp seconds at which the oldest live
+    ///   bucket ages off, i.e. the next moment the client's budget might grow.
+    ///   In gabion's uniform sliding window this is identical to "time until
+    ///   the next bucket boundary" (no SHM walk needed — see
+    ///   `gabion::window::time_until_next_bucket_boundary_millis`).
+    ///
+    /// No `Retry-After`: the request was admitted.
+    pub fn build_for_allow(info: AllowInfo) -> Self {
+        let delta = gabion::window::time_until_next_bucket_boundary_millis(
+            info.now_millis,
+            info.spec.bucket_millis,
+        );
+        let reset_unix_s = gabion::window::reset_unix_seconds(info.now_millis, delta);
+        Self {
+            limit: HeaderBuffer::from_u64(info.spec.limit),
+            remaining: HeaderBuffer::from_u64(info.remaining),
+            reset: HeaderBuffer::from_u64(reset_unix_s),
+            retry_after: None,
+        }
+    }
+
+    /// Build the four-header set for one rejection. Conventions:
     ///
     /// * `X-RateLimit-Limit` — request budget per window (GitHub/Envoy style).
     /// * `X-RateLimit-Remaining` — `0` once we're past the budget.
-    /// * `X-RateLimit-Reset` — unix-timestamp seconds at which the rate
-    ///   limit resets. Matches the Envoy ratelimit filter and
-    ///   GitHub/Twitter.
+    /// * `X-RateLimit-Reset` — unix-timestamp seconds at which the rate limit
+    ///   resets. Matches the Envoy ratelimit filter and GitHub/Twitter.
     /// * `Retry-After` — delta-seconds per RFC 7231 §7.1.3.
     ///
     /// Both `Retry-After` and `Reset` come from `info.delta_until_admit_millis`
@@ -126,26 +162,15 @@ impl RejectHeaders {
     /// apart see `Retry-After` values that differ by exactly 1, and a
     /// rejection with stale hits in older buckets reports a shorter wait
     /// than the full window.
-    pub fn build(info: RejectInfo) -> Self {
+    pub fn build_for_reject(info: RejectInfo) -> Self {
         let retry_after_s = gabion::window::retry_after_seconds(info.delta_until_admit_millis);
         let reset_unix_s =
             gabion::window::reset_unix_seconds(info.now_millis, info.delta_until_admit_millis);
-        let mut limit = HeaderBuffer::new();
-        limit.write_u64(info.spec.limit);
-        let mut remaining = HeaderBuffer::new();
-        remaining.write_u64(0);
-        let mut reset_h = HeaderBuffer::new();
-        reset_h.write_u64(reset_unix_s);
-        let mut retry_after = HeaderBuffer::new();
-        retry_after.write_u64(retry_after_s);
-        let mut body = BodyBuffer::new();
-        body.write_body(info);
         Self {
-            limit,
-            remaining,
-            reset: reset_h,
-            retry_after,
-            body,
+            limit: HeaderBuffer::from_u64(info.spec.limit),
+            remaining: HeaderBuffer::from_u64(0),
+            reset: HeaderBuffer::from_u64(reset_unix_s),
+            retry_after: Some(HeaderBuffer::from_u64(retry_after_s)),
         }
     }
 }

@@ -43,7 +43,12 @@ pub trait VariableLookup {
 /// Result of the access decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccessOutcome {
-    Allow,
+    /// Request was admitted. Carries optional quota context for the
+    /// rule the client is closest to tripping — the headers builder
+    /// renders `X-RateLimit-*` from it. `None` means no rule with a
+    /// meaningful quota matched (e.g. every rule declined or was
+    /// exempt), so no headers should be emitted.
+    Allow(Option<AllowInfo>),
     /// Rate limit exceeded. Carries the rule-specific info the headers
     /// builder needs.
     Reject(RejectInfo),
@@ -64,6 +69,17 @@ pub struct RejectInfo {
     /// reject time so `Retry-After` / `X-RateLimit-Reset` are a pure
     /// format step.
     pub delta_until_admit_millis: u64,
+}
+
+/// Per-request quota snapshot for the rule with the smallest budget
+/// remaining. Drives the `X-RateLimit-*` triplet on allowed responses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllowInfo {
+    pub spec: RuleSpec,
+    /// Budget left under this rule after admitting the current request.
+    /// Saturating: a `DryRun` rule already over its limit reports `0`.
+    pub remaining: u64,
+    pub now_millis: u64,
 }
 
 /// Borrowed view of the rule set + SHM region passed into the access path.
@@ -90,10 +106,12 @@ pub struct AccessCtx<'a> {
               in CLAUDE.md."
 )]
 enum RuleOutcome {
-    /// Rule evaluated cleanly and would allow the request. Buffered queue
-    /// events ride along so a sibling-rule reject can drop them without
-    /// committing partial work.
-    Allow(ArrayVec<QueueEvent, MAX_MATCHED_RULES>),
+    /// Rule evaluated cleanly and would allow the request. The buffered
+    /// queue events ride along so a sibling-rule reject can drop them
+    /// without committing partial work, and the rule's quota snapshot
+    /// feeds the most-constrained-rule selection that drives the
+    /// `X-RateLimit-*` headers on the allowed response.
+    Allow(QuotaSnapshot, ArrayVec<QueueEvent, MAX_MATCHED_RULES>),
     /// Rule evaluated and crossed its configured limit while in
     /// `Enforce` mode.
     Reject(RejectInfo),
@@ -110,6 +128,17 @@ enum RuleOutcome {
     /// request. Carries the rule id so the orchestrator can attribute the
     /// per-rule exempt counter to the right slot.
     Exempt(RuleId),
+}
+
+/// Per-rule quota view captured at the same instant the admission
+/// decision is made. Trivially `Copy` so [`decide_all`] can stash it
+/// while folding sibling outcomes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QuotaSnapshot {
+    spec: RuleSpec,
+    /// Budget remaining after this request. Saturating: a `DryRun` rule
+    /// already past `spec.limit` reports `0`.
+    remaining: u64,
 }
 
 /// Evaluate one request against the rule indicated by `rule_index`.
@@ -138,6 +167,7 @@ pub fn decide_all(
     ctx.stats.record_request();
 
     let mut worst_reject: Option<RejectInfo> = None;
+    let mut tightest_allow: Option<QuotaSnapshot> = None;
     let mut all_events: ArrayVec<QueueEvent, MAX_MATCHED_RULES> = ArrayVec::new();
     let mut had_non_exempt_outcome = false;
     let mut any_exempt = false;
@@ -145,8 +175,9 @@ pub fn decide_all(
 
     for &index in rule_indices {
         match decide_one(ctx, index, vars, now_millis) {
-            RuleOutcome::Allow(events) => {
+            RuleOutcome::Allow(snapshot, events) => {
                 had_non_exempt_outcome = true;
+                tightest_allow = Some(pick_min_remaining(tightest_allow, snapshot));
                 for ev in events {
                     if all_events.try_push(ev).is_err() {
                         // The combined buffer can hold up to one event per
@@ -189,13 +220,19 @@ pub fn decide_all(
             }
         }
         ctx.stats.record_allow();
-        return AccessOutcome::Allow;
+        return AccessOutcome::Allow(tightest_allow.map(|snap| AllowInfo {
+            spec: snap.spec,
+            remaining: snap.remaining,
+            now_millis,
+        }));
     }
     if any_exempt {
         // Exempt-only outcome: every rule's `except_if=` predicate fired,
         // so the request is allowed through without crediting either the
-        // generic `allowed` counter or the gossip aggregate.
-        return AccessOutcome::Allow;
+        // generic `allowed` counter or the gossip aggregate. No headers —
+        // the operator's intent for `except_if=` is "pretend the rule
+        // wasn't there for this request".
+        return AccessOutcome::Allow(None);
     }
     if any_cardinality {
         return AccessOutcome::Cardinality;
@@ -302,7 +339,11 @@ fn decide_one(
         rule_limit: spec.limit,
         now_millis,
     });
-    RuleOutcome::Allow(planned)
+    // Saturating remaining: under-limit Enforce/DryRun reports the real
+    // budget; over-limit DryRun (which the gate above lets through)
+    // reports 0 rather than underflowing.
+    let remaining = spec.limit.saturating_sub(total).saturating_sub(hits);
+    RuleOutcome::Allow(QuotaSnapshot { spec, remaining }, planned)
 }
 
 /// Pick the rule with the longer window among a candidate and a current
@@ -312,6 +353,24 @@ fn decide_one(
 fn pick_longest_window(current: Option<RejectInfo>, candidate: RejectInfo) -> RejectInfo {
     match current {
         Some(c) if c.spec.window_millis >= candidate.spec.window_millis => c,
+        _ => candidate,
+    }
+}
+
+/// Pick the rule the client is closest to tripping (smallest `remaining`)
+/// among a candidate and the current best choice. On ties, prefer the
+/// rule with the *longer* window — mirroring [`pick_longest_window`]'s
+/// rationale: the client should see the most-constraining context, not
+/// the one that resets soonest.
+fn pick_min_remaining(current: Option<QuotaSnapshot>, candidate: QuotaSnapshot) -> QuotaSnapshot {
+    match current {
+        Some(c) if c.remaining < candidate.remaining => c,
+        Some(c)
+            if c.remaining == candidate.remaining
+                && c.spec.window_millis >= candidate.spec.window_millis =>
+        {
+            c
+        }
         _ => candidate,
     }
 }

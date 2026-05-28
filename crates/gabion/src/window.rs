@@ -88,5 +88,23 @@ pub fn limit_remaining(limit: u64, total: u64) -> u64 {
     limit.saturating_sub(total)
 }
 
+/// Wall-clock ms until the next bucket boundary — equivalently, until the
+/// oldest live bucket ages off in gabion's uniform sliding window.
+///
+/// Used as `X-RateLimit-Reset` on the **allow** path. By construction the
+/// oldest live bucket has epoch `current - live + 1` and ages off at
+/// `(current + 1) * bucket_millis`, so "time until the next bucket
+/// boundary" and "time until the oldest live bucket ages off" are the
+/// same value — and that value is the next moment quota *might* be
+/// reclaimed. No SHM walk required; this is pure arithmetic. The
+/// expensive [`time_until_admit_millis`] is reserved for the reject path,
+/// where it answers a different question ("when can *this* client retry
+/// without being rejected again") that depends on the actual per-bucket
+/// distribution.
+pub fn time_until_next_bucket_boundary_millis(now_millis: u64, bucket_millis: u64) -> u64 {
+    let bm = bucket_millis.max(1);
+    bm - (now_millis % bm)
+}
+
 #[cfg(test)]
 mod tests;

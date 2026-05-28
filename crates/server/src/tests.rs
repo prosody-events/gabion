@@ -517,6 +517,153 @@ fn over_limit_populates_descriptor_status_fields() {
     });
 }
 
+/// An allowed descriptor whose rule matched cleanly must carry both
+/// `limit_remaining` and `duration_until_reset` so the Envoy filter can
+/// render `X-RateLimit-*` on the OK response — the same shape an Envoy
+/// fleet with `enable_x_ratelimit_headers: DRAFT_VERSION_03` reads.
+#[test]
+fn under_limit_populates_descriptor_status_fields() {
+    run_local(async {
+        // limit=5, rule window=1s, bucket=100ms (live=10).
+        let harness = harness(512, 5).await;
+        let response = harness
+            .limiter
+            .should_rate_limit_at(
+                RateLimitRequest {
+                    domain: "api".into(),
+                    descriptors: vec![descriptor([("tenant", "a")])],
+                    hits_addend: 1,
+                },
+                0,
+            )
+            .await;
+        assert_eq!(response.overall_code, rate_limit_response::Code::Ok as i32);
+        let status = response.statuses.first().expect("one status");
+        assert_eq!(status.code, rate_limit_response::Code::Ok as i32);
+        assert_eq!(
+            status.limit_remaining, 4,
+            "limit=5, hits=1, total=0 -> remaining=4"
+        );
+        let duration = status
+            .duration_until_reset
+            .as_ref()
+            .expect("duration_until_reset must be populated on allow");
+        let millis = (duration.seconds as u64) * 1_000 + (duration.nanos as u64) / 1_000_000;
+        // bucket=100ms, now=0 sits exactly on a boundary -> next
+        // boundary is a full bucket away.
+        assert_eq!(
+            millis, 100,
+            "allow-path reset = ms until the next bucket boundary"
+        );
+        let _ = harness.client.shutdown().await;
+    });
+}
+
+/// DryRun rule already past its limit must still emit an OK status with
+/// `limit_remaining = 0`, mirroring the nginx adapter's behaviour so the
+/// proxy fleet can graph "share that would have been 429'd".
+#[test]
+fn dry_run_over_limit_populates_descriptor_status_fields() {
+    run_local(async {
+        let router = SimRouter::new();
+        let addr = next_test_addr();
+        let transport = router.bind(addr);
+        let identity = NodeIdentity::new(NodeId(0xAA02), 1);
+        let rule = Rule::new(
+            1,
+            "api",
+            vec![DescriptorPattern {
+                key: "tenant".into(),
+                value: "*".into(),
+            }],
+            2,
+            1_000,
+            100,
+            EnforcementMode::DryRun,
+        );
+        let mut store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
+        store.intern_rule(RuleDescriptor {
+            fingerprint: rule.fingerprint,
+            window_millis: rule.window_millis as u32,
+            bucket_millis: rule.bucket_millis as u32,
+            limit: rule.limit,
+            flags: 0,
+            local_rule_id: rule.id,
+        });
+        let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
+        let gossip_config = GossipConfig {
+            local_identity: identity,
+            rng_seed: 1,
+            ..GossipConfig::default()
+        };
+        let (rt, client) = GossipRuntime::from_parts(
+            transport,
+            TokioClock::from_millis(0),
+            gossip_config,
+            store,
+            counts.clone(),
+        );
+        let _handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+        let rule_table = Arc::new(RuleTable::new(vec![rule]));
+        let cardinality_limits = CardinalityLimits {
+            max_descriptor_count: 16,
+            max_descriptor_bytes: 512,
+            max_key_bytes: 64,
+        };
+        let limiter = SharedLimiter::new(rule_table, client.clone(), counts, cardinality_limits);
+
+        // Drive enough hits to push past the DryRun budget. Each
+        // request is allowed because the rule never rejects.
+        for tick in 0..5_u64 {
+            let r = limiter
+                .should_rate_limit_at(
+                    RateLimitRequest {
+                        domain: "api".into(),
+                        descriptors: vec![descriptor([("tenant", "a")])],
+                        hits_addend: 1,
+                    },
+                    tick,
+                )
+                .await;
+            assert_eq!(
+                r.overall_code,
+                rate_limit_response::Code::Ok as i32,
+                "DryRun must never overall-reject",
+            );
+        }
+
+        // Next request: still allowed, but the descriptor status must
+        // report `Remaining = 0` so observers see the bypass.
+        let over = limiter
+            .should_rate_limit_at(
+                RateLimitRequest {
+                    domain: "api".into(),
+                    descriptors: vec![descriptor([("tenant", "a")])],
+                    hits_addend: 1,
+                },
+                5,
+            )
+            .await;
+        assert_eq!(
+            over.overall_code,
+            rate_limit_response::Code::Ok as i32,
+            "DryRun over-limit must still allow at the request level",
+        );
+        let status = over.statuses.first().expect("one status");
+        assert_eq!(status.code, rate_limit_response::Code::Ok as i32);
+        assert_eq!(
+            status.limit_remaining, 0,
+            "saturating: DryRun past limit -> Remaining = 0"
+        );
+        assert!(
+            status.duration_until_reset.is_some(),
+            "duration_until_reset must still be populated"
+        );
+        let _ = client.shutdown().await;
+    });
+}
+
 /// Pre-admission rejects (cardinality, MAX_DESCRIPTORS overflow) carry no
 /// rule scope, so the adapter cannot compute a real reset moment. Verify
 /// the response leaves `duration_until_reset` unset rather than inventing
