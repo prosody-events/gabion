@@ -20,6 +20,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/nginx/Dockerfile
+      target: smoke
       args:
         NGINX_BASE_IMAGE: ${NGINX_BASE_IMAGE:-nginx:stable-alpine}
     profiles: ["module"]
@@ -29,12 +30,18 @@ services:
       - SYS_PTRACE
     volumes:
       - /tmp/cores:/tmp/cores
-    command: ["/usr/local/bin/gabion-smoke-with-bt", "nginx", "-t"]
+    command:
+      - "/usr/local/bin/gabion-smoke-with-bt"
+      - "nginx"
+      - "-t"
+      - "-c"
+      - "/etc/nginx/gabion-load-module.conf"
 
   nginx-module-request-smoke:
     build:
       context: ../..
       dockerfile: deploy/nginx/Dockerfile
+      target: smoke
       args:
         NGINX_BASE_IMAGE: ${NGINX_BASE_IMAGE:-nginx:stable-alpine}
     profiles: ["module"]

@@ -128,7 +128,21 @@ RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
     && mkdir -p /out \
     && cp target/release/libgabion_nginx.so /out/ngx_http_gabion_module.so
 
-FROM ${OPENRESTY_BASE_IMAGE}
+# The published image: identical to its upstream openresty base image
+# except that the gabion module is auto-loaded via a one-line shim
+# invoked with `-c`. A user mounting their own nginx.conf at
+# /usr/local/openresty/nginx/conf/nginx.conf gets `gabion_*` directives
+# without needing `load_module ...;` of their own.
+FROM ${OPENRESTY_BASE_IMAGE} AS published
+
+COPY --from=module-builder /out/ngx_http_gabion_module.so /usr/local/openresty/nginx/modules/ngx_http_gabion_module.so
+COPY deploy/nginx/gabion-load-module.openresty.conf /usr/local/openresty/nginx/conf/gabion-load-module.conf
+
+CMD ["/usr/local/openresty/bin/openresty", "-c", "/usr/local/openresty/nginx/conf/gabion-load-module.conf", "-g", "daemon off;"]
+
+# Smoke variant: published image + diagnostic tooling + the smoke
+# harness scripts and config. Opt-in via `--target smoke`.
+FROM published AS smoke
 
 SHELL ["/bin/sh", "-euxc"]
 
@@ -140,12 +154,12 @@ RUN if command -v apk >/dev/null 2>&1; then \
         rm -rf /var/lib/apt/lists/*; \
     fi
 
-COPY --from=module-builder /out/ngx_http_gabion_module.so /etc/nginx/modules/ngx_http_gabion_module.so
-COPY deploy/nginx/nginx.module.conf /etc/nginx/nginx.conf
+COPY deploy/nginx/nginx.smoke.conf /usr/local/openresty/nginx/conf/nginx.conf
 COPY deploy/nginx/module-request-smoke.sh /usr/local/bin/gabion-nginx-request-smoke
 COPY deploy/nginx/smoke-with-bt.sh /usr/local/bin/gabion-smoke-with-bt
 
-RUN mkdir -p /usr/local/openresty/nginx/modules \
-    && cp /etc/nginx/modules/ngx_http_gabion_module.so /usr/local/openresty/nginx/modules/ngx_http_gabion_module.so \
-    && cp /etc/nginx/nginx.conf /usr/local/openresty/nginx/conf/nginx.conf \
-    && chmod +x /usr/local/bin/gabion-nginx-request-smoke /usr/local/bin/gabion-smoke-with-bt
+RUN chmod +x /usr/local/bin/gabion-nginx-request-smoke /usr/local/bin/gabion-smoke-with-bt
+
+# Default build target = the published image. See the matching note in
+# deploy/nginx/Dockerfile for why this trailing alias exists.
+FROM published
