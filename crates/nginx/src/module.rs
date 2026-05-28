@@ -33,9 +33,10 @@ use gabion::discovery::DiscoveryConfig;
 use gabion::rules::EnforcementMode;
 
 use crate::access::{
-    AccessCtx, AccessOutcome, CardinalitySettings, RejectInfo, VariableLookup, decide_all,
+    AccessCtx, AccessOutcome, AllowInfo, CardinalitySettings, RejectInfo, VariableLookup,
+    decide_all,
 };
-use crate::headers::RejectHeaders;
+use crate::headers::AdmissionHeaders;
 use crate::identity::derive_identity;
 use crate::leader::{self, GossipSettings, LeaderConfig};
 use crate::log;
@@ -692,7 +693,11 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
     let now = wall_millis();
     let outcome = decide_all(ctx, rule_indices, &vars, now);
     match outcome {
-        AccessOutcome::Allow | AccessOutcome::Decline => core::Status::NGX_DECLINED,
+        AccessOutcome::Allow(Some(info)) => {
+            apply_admit_headers(request, info);
+            core::Status::NGX_DECLINED
+        }
+        AccessOutcome::Allow(None) | AccessOutcome::Decline => core::Status::NGX_DECLINED,
         AccessOutcome::Reject(info) => {
             apply_reject_headers(request, info);
             http::HTTPStatus::TOO_MANY_REQUESTS.into()
@@ -701,12 +706,21 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
     }
 });
 
-fn apply_reject_headers(request: &mut http::Request, info: RejectInfo) {
-    let headers = RejectHeaders::build(info);
+fn apply_admit_headers(request: &mut http::Request, info: AllowInfo) {
+    let headers = AdmissionHeaders::build_for_allow(info);
     let _ = request.add_header_out("X-RateLimit-Limit", headers.limit.as_str());
     let _ = request.add_header_out("X-RateLimit-Remaining", headers.remaining.as_str());
     let _ = request.add_header_out("X-RateLimit-Reset", headers.reset.as_str());
-    let _ = request.add_header_out("Retry-After", headers.retry_after.as_str());
+}
+
+fn apply_reject_headers(request: &mut http::Request, info: RejectInfo) {
+    let headers = AdmissionHeaders::build_for_reject(info);
+    let _ = request.add_header_out("X-RateLimit-Limit", headers.limit.as_str());
+    let _ = request.add_header_out("X-RateLimit-Remaining", headers.remaining.as_str());
+    let _ = request.add_header_out("X-RateLimit-Reset", headers.reset.as_str());
+    if let Some(retry_after) = headers.retry_after.as_ref() {
+        let _ = request.add_header_out("Retry-After", retry_after.as_str());
+    }
 }
 
 struct RequestVariables<'a> {

@@ -157,3 +157,24 @@ fn limit_remaining_saturates_at_zero() {
     assert_eq!(limit_remaining(10, 10), 0);
     assert_eq!(limit_remaining(10, 25), 0);
 }
+
+#[test]
+fn next_bucket_boundary_is_full_bucket_at_boundary() {
+    // now exactly on the boundary -> a full bucket until the next one.
+    assert_eq!(time_until_next_bucket_boundary_millis(0, 1_000), 1_000);
+    assert_eq!(time_until_next_bucket_boundary_millis(10_000, 1_000), 1_000);
+}
+
+#[test]
+fn next_bucket_boundary_off_boundary_subtracts_remainder() {
+    // 500ms into a 1000ms bucket leaves 500ms.
+    assert_eq!(time_until_next_bucket_boundary_millis(500, 1_000), 500);
+    // 1_234ms into a 250ms bucket: 234 % 250 = 234 -> 16ms left.
+    assert_eq!(time_until_next_bucket_boundary_millis(1_234, 250), 16);
+}
+
+#[test]
+fn next_bucket_boundary_handles_zero_bucket() {
+    // Defensive: treat 0 as 1ms (same convention as time_until_admit_millis).
+    assert_eq!(time_until_next_bucket_boundary_millis(10, 0), 1);
+}

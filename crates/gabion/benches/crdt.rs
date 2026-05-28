@@ -792,6 +792,141 @@ fn bench_find(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// admission_headers — overhead of populating `X-RateLimit-*` on the allow
+// path. We do *not* keep a separate "cheap allow" code path; this bench is
+// the audit trail confirming the header math is genuinely free enough not
+// to need one.
+// ---------------------------------------------------------------------------
+
+fn bench_admission_headers(c: &mut Criterion) {
+    use std::fmt::Write;
+    let mut group = c.benchmark_group("crdt/admission_headers");
+    group.throughput(Throughput::Elements(1));
+
+    let fixture = build_fixture();
+    let present_keys: Vec<u128> = {
+        let mut v = fixture.hot_keys.clone();
+        v.extend(fixture.warm_keys.iter().take(WARM_KEYS / 2).copied());
+        v
+    };
+
+    // Pick a representative bucket_millis matching the production
+    // 60s / 15s shape the rest of this file's fixture uses.
+    const BUCKET_MILLIS: u64 = 15_000;
+    const RULE_LIMIT: u64 = 1_000;
+
+    // ─── baseline (A) ───────────────────────────────────────────────────
+    // Today's allow path — just the `find` lookup. Used as the reference
+    // the headers variant is compared against.
+    group.bench_function("baseline", |b| {
+        let mut rng = Rng::new(0x9595_9595);
+        let mut now: u64 = 0;
+        b.iter(|| {
+            let pick = rng.range(100);
+            let (key, rule_idx, bucket) = if pick < 95 {
+                let key = present_keys[rng.range(present_keys.len() as u32) as usize];
+                let rule_idx = pick_rule(&mut rng) as usize;
+                let bucket = pick_bucket(&mut rng);
+                (key, rule_idx, bucket)
+            } else {
+                (fresh_key(&mut rng), 0, 0)
+            };
+            let rule_slot = fixture
+                .store
+                .find_rule(fixture.rule_fps[rule_idx])
+                .expect("rule");
+            let h = fixture.store.find(black_box(CompactCellKey {
+                rule: rule_slot,
+                key_hash: KeyHash(key),
+                bucket,
+                origin: fixture.local_node_slot,
+                incarnation: LOCAL_INCARNATION,
+            }));
+            black_box(h);
+            now = now.wrapping_add(1);
+        });
+    });
+
+    // ─── with_headers (B) ───────────────────────────────────────────────
+    // Same allow path plus the arithmetic that `AdmissionHeaders` emits on
+    // a 200 response: bucket-boundary modulo + saturating remaining +
+    // `reset_unix_seconds` + three u64 format passes into a stack buffer.
+    group.bench_function("with_headers", |b| {
+        let mut rng = Rng::new(0x9595_9595);
+        let mut now: u64 = 0;
+        let mut scratch = [0_u8; 96];
+        b.iter(|| {
+            let pick = rng.range(100);
+            let (key, rule_idx, bucket) = if pick < 95 {
+                let key = present_keys[rng.range(present_keys.len() as u32) as usize];
+                let rule_idx = pick_rule(&mut rng) as usize;
+                let bucket = pick_bucket(&mut rng);
+                (key, rule_idx, bucket)
+            } else {
+                (fresh_key(&mut rng), 0, 0)
+            };
+            let rule_slot = fixture
+                .store
+                .find_rule(fixture.rule_fps[rule_idx])
+                .expect("rule");
+            let handle = fixture.store.find(black_box(CompactCellKey {
+                rule: rule_slot,
+                key_hash: KeyHash(key),
+                bucket,
+                origin: fixture.local_node_slot,
+                incarnation: LOCAL_INCARNATION,
+            }));
+            // Treat the existing count as the window total. Realistic
+            // enough for the cost we want to measure — the bench is
+            // about the header math, not about an exact admission walk.
+            let total: u64 = handle
+                .and_then(|h| fixture.store.count_of(h))
+                .map(u64::from)
+                .unwrap_or(0);
+            let hits: u64 = 1;
+            let remaining = RULE_LIMIT.saturating_sub(total).saturating_sub(hits);
+            let delta = gabion::window::time_until_next_bucket_boundary_millis(now, BUCKET_MILLIS);
+            let reset = gabion::window::reset_unix_seconds(now, delta);
+            // Format the three header values into a scratch buffer so the
+            // bench measures the same Display passes the production
+            // builder runs.
+            let mut writer = SliceWriter::new(&mut scratch);
+            let _ = write!(&mut writer, "{}", RULE_LIMIT);
+            let _ = write!(&mut writer, "{}", remaining);
+            let _ = write!(&mut writer, "{}", reset);
+            black_box(writer.len);
+            now = now.wrapping_add(BUCKET_MILLIS / 4);
+        });
+    });
+
+    group.finish();
+}
+
+/// Allocation-free `core::fmt::Write` backed by a stack slice. Truncates
+/// silently on overflow; the bench buffer is sized to hold three `u64`
+/// decimal strings.
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> SliceWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
+}
+
+impl std::fmt::Write for SliceWriter<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let room = self.buf.len().saturating_sub(self.len);
+        let to_copy = s.len().min(room);
+        self.buf[self.len..self.len + to_copy].copy_from_slice(&s.as_bytes()[..to_copy]);
+        self.len += to_copy;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // fill_gossip_frame — outbound gossip composition.
 // ---------------------------------------------------------------------------
 
@@ -1062,6 +1197,7 @@ criterion_group!(
     bench_ingest_local,
     bench_merge_remote,
     bench_find,
+    bench_admission_headers,
     bench_fill_gossip_frame,
     bench_expire,
     bench_wire,

@@ -520,8 +520,8 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
             let cap = *global.get(&key).unwrap_or(&0);
             if count > cap {
                 overcount = Some(format!(
-                    "node {node} over-counted {key:?}: {count} > cluster total {cap} \
-                     during the partition"
+                    "node {node} over-counted {key:?}: {count} > cluster total {cap} during the \
+                     partition"
                 ));
             }
         }
@@ -539,8 +539,8 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
         let snap = agg.snapshot();
         if snap != global {
             divergence = Some(format!(
-                "node {node} did not converge {heal_ticks} ticks after heal: has {} keys, \
-                 cluster model has {}; snapshot={snap:?} model={global:?}",
+                "node {node} did not converge {heal_ticks} ticks after heal: has {} keys, cluster \
+                 model has {}; snapshot={snap:?} model={global:?}",
                 snap.len(),
                 global.len(),
             ));

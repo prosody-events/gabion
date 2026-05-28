@@ -304,7 +304,7 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
     };
 
     // First two requests — limit is 2 — should be allowed.
-    assert!(matches!(decide(ctx, 0, &vars, 0), AccessOutcome::Allow));
+    assert!(matches!(decide(ctx, 0, &vars, 0), AccessOutcome::Allow(_)));
 
     // Simulate leader applying the recorded hits before the third arrives.
     // SAFETY: see leader_stamps_incarnation_and_applies_deltas.

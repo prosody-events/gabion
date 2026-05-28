@@ -99,7 +99,15 @@ fn allow_on_empty_aggregate() {
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide(ctx, 0, &vars, 1_000);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    // Single matched rule, aggregate empty: limit=2, hits=1 -> remaining=1.
+    match outcome {
+        AccessOutcome::Allow(Some(info)) => {
+            assert_eq!(info.spec.limit, 2);
+            assert_eq!(info.remaining, 1);
+            assert_eq!(info.now_millis, 1_000);
+        }
+        other => panic!("expected Allow(Some), got {other:?}"),
+    }
     // One queue event pushed.
     let mut out = [QueueEvent::default(); 1];
     assert_eq!(region.queue().drain(&mut out), 1);
@@ -352,7 +360,9 @@ fn except_truthy_skips_rule() {
         .set("http_x_tenant", "alice")
         .set("trusted", "1");
     let outcome = decide(ctx, 0, &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    // Exempt-only outcome: no rule produced a quota view, so no
+    // `X-RateLimit-*` headers should be emitted on the response.
+    assert!(matches!(outcome, AccessOutcome::Allow(None)));
     let snap = region.stats().snapshot();
     assert_eq!(snap.exempted, 1, "exempt counter should fire");
     assert_eq!(snap.allowed, 0, "exempt is not a normal allow");
@@ -378,7 +388,7 @@ fn except_falsy_applies_rule() {
         .set("http_x_tenant", "alice")
         .set("trusted", "off");
     let outcome = decide(ctx, 0, &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    assert!(matches!(outcome, AccessOutcome::Allow(_)));
     let snap = region.stats().snapshot();
     assert_eq!(snap.exempted, 0);
     assert_eq!(snap.allowed, 1);
@@ -402,7 +412,7 @@ fn except_missing_applies_rule() {
     // exemption, not opt-in enforcement).
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide(ctx, 0, &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    assert!(matches!(outcome, AccessOutcome::Allow(_)));
     let snap = region.stats().snapshot();
     assert_eq!(snap.exempted, 0);
     assert_eq!(snap.allowed, 1);
@@ -424,7 +434,7 @@ fn except_empty_applies_rule() {
         .set("http_x_tenant", "alice")
         .set("trusted", "");
     let outcome = decide(ctx, 0, &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    assert!(matches!(outcome, AccessOutcome::Allow(_)));
     let snap = region.stats().snapshot();
     assert_eq!(snap.exempted, 0);
     assert_eq!(snap.allowed, 1);
@@ -473,7 +483,7 @@ fn decide_all_allow_when_all_pass() {
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    assert!(matches!(outcome, AccessOutcome::Allow(_)));
     // Both rules push a QueueEvent because both matched.
     let mut out = [QueueEvent::default(); 4];
     assert_eq!(region.queue().drain(&mut out), 2);
@@ -590,7 +600,7 @@ fn decide_all_one_declines_one_allows() {
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    assert!(matches!(outcome, AccessOutcome::Allow(_)));
     // Only one rule (the second) produced an event.
     let mut out = [QueueEvent::default(); 4];
     assert_eq!(region.queue().drain(&mut out), 1);
@@ -643,7 +653,19 @@ fn dry_run_records_but_never_rejects() {
     let vars = MockVars::new().set("http_x_tenant", "alice");
     // DryRun: over the limit but never rejects.
     let outcome = decide_all(ctx, &[0], &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    match outcome {
+        // Over-limit DryRun: saturating subtraction collapses remaining
+        // to 0 so the response still gets `Remaining: 0` headers,
+        // letting operators graph "share that would have been 429'd".
+        AccessOutcome::Allow(Some(info)) => {
+            assert_eq!(info.spec.limit, 1);
+            assert_eq!(
+                info.remaining, 0,
+                "DryRun over its budget reports remaining=0"
+            );
+        }
+        other => panic!("expected Allow(Some), got {other:?}"),
+    }
     // Still records the hit for the gossip aggregate.
     let mut out = [QueueEvent::default(); 4];
     assert_eq!(region.queue().drain(&mut out), 1);
@@ -690,7 +712,7 @@ fn decide_all_one_rule_cardinality_others_still_evaluate() {
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    assert!(matches!(outcome, AccessOutcome::Allow(_)));
     let snap = region.stats().snapshot();
     assert_eq!(snap.allowed, 1);
     assert_eq!(snap.rejected_cardinality, 1, "one rule tripped cardinality");
@@ -885,7 +907,8 @@ fn except_does_not_count_cardinality() {
         .set("http_x_tenant", "alice")
         .set("trusted", "1");
     let outcome = decide(ctx, 0, &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    // Exempt-only outcome — no rule produced a quota view.
+    assert!(matches!(outcome, AccessOutcome::Allow(None)));
     let snap = region.stats().snapshot();
     assert_eq!(
         snap.rejected_cardinality, 0,
@@ -938,7 +961,7 @@ fn per_rule_exempt_counter_bumps_only_target_rule() {
         .set("trusted_a", "1")
         .set("trusted_b", "0");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow));
+    assert!(matches!(outcome, AccessOutcome::Allow(_)));
     let snap = region.stats().snapshot();
     // Rule ids are assigned 1, 2 in declaration order; per-rule slot is
     // indexed by `rule_id - 1`.
@@ -972,4 +995,103 @@ fn unknown_predicate_variable_fails_at_compile() {
         matches!(err, RuleConfigError::CompileBinding { .. }),
         "expected CompileBinding, got {err:?}"
     );
+}
+
+#[test]
+fn allow_info_picks_min_remaining_across_rules() {
+    // Two rules. Rule 0 has the lower budget left — its quota should
+    // drive the `X-RateLimit-*` headers on the allowed response so the
+    // client sees the most-constraining rule.
+    let (_buf, region) = build_zone(8, 16);
+    // Rule 0: limit=2, window=1s. Rule 1: limit=10, window=60s.
+    let rules = build_two_rules(2, 1, 10, 60);
+    let domain = crate::rules::DEFAULT_DOMAIN;
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain,
+        cardinality: CardinalitySettings::default(),
+    };
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    match outcome {
+        AccessOutcome::Allow(Some(info)) => {
+            // Rule 0 reports the smaller remaining (limit=2, hits=1) -> 1.
+            assert_eq!(info.spec.limit, 2);
+            assert_eq!(info.remaining, 1);
+            assert_eq!(info.spec.window_millis, 1_000);
+        }
+        other => panic!("expected Allow(Some), got {other:?}"),
+    }
+}
+
+#[test]
+fn allow_info_tie_break_prefers_longer_window() {
+    // Both rules have the same remaining (limit=5, hits=1 -> 4). The
+    // tie-break picks the longer window, mirroring the reject path's
+    // most-constraining-context rationale.
+    let (_buf, region) = build_zone(8, 16);
+    let rules = build_two_rules(5, 1, 5, 60);
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain: crate::rules::DEFAULT_DOMAIN,
+        cardinality: CardinalitySettings::default(),
+    };
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    let outcome = decide_all(ctx, &[0, 1], &vars, 0);
+    match outcome {
+        AccessOutcome::Allow(Some(info)) => {
+            assert_eq!(info.remaining, 4);
+            assert_eq!(
+                info.spec.window_millis, 60_000,
+                "ties go to the longer window"
+            );
+        }
+        other => panic!("expected Allow(Some), got {other:?}"),
+    }
+}
+
+#[test]
+fn allow_info_under_limit_dry_run_emits_positive_remaining() {
+    // DryRun rule under its limit should produce an AllowInfo with the
+    // real remaining budget — same as Enforce. Mirrors the
+    // over-limit case below, which is exercised by
+    // `dry_run_records_but_never_rejects`.
+    let (_buf, region) = build_zone(8, 16);
+    let cfg = RuleConfig {
+        name: "shadow".into(),
+        domain: crate::rules::DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
+        }],
+        limit: 5,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_millis(250),
+        mode: EnforcementMode::DryRun,
+        except_if: None,
+    };
+    let rules = CompiledRules::compile(&[cfg]).expect("compile");
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain: crate::rules::DEFAULT_DOMAIN,
+        cardinality: CardinalitySettings::default(),
+    };
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    let outcome = decide_all(ctx, &[0], &vars, 0);
+    match outcome {
+        AccessOutcome::Allow(Some(info)) => {
+            assert_eq!(info.spec.limit, 5);
+            assert_eq!(info.remaining, 4, "limit=5, hits=1 -> remaining=4");
+        }
+        other => panic!("expected Allow(Some), got {other:?}"),
+    }
 }

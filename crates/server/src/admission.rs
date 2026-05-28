@@ -7,7 +7,14 @@ use gabion::rules::Descriptor;
 /// Result of evaluating one descriptor's rules.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Decision {
-    Allow,
+    /// Request was admitted. When at least one matching rule produced a
+    /// quota view, [`QuotaContext`] carries the rule the client is
+    /// closest to tripping so the adapter can populate
+    /// `limit_remaining` / `duration_until_reset` on the OK status —
+    /// the Envoy filter then emits `X-RateLimit-*` on the allowed
+    /// response. `None` means no rule matched (exempt or no rules at
+    /// all), so no header info is exposed.
+    Allow(Option<QuotaContext>),
     /// Carries the reason plus, when the reject was scoped to a specific
     /// rule, the precomputed header inputs Envoy renders into the response.
     /// Pre-admission rejects (no rule) leave the context `None` — the
@@ -22,13 +29,27 @@ impl Decision {
     }
 }
 
-/// Header-shaped reject payload populated alongside [`RejectReason::GlobalLimit`].
-/// Mirrors what Envoy expects on a per-descriptor `DescriptorStatus`:
-/// `limit_remaining` is the floor (0 on reject), and
-/// `duration_until_reset_millis` is the sliding-window-precise time until a
-/// same-weight request would be admitted.
+/// Header-shaped reject payload populated alongside
+/// [`RejectReason::GlobalLimit`]. Mirrors what Envoy expects on a
+/// per-descriptor `DescriptorStatus`: `limit_remaining` is the floor (0 on
+/// reject), and `duration_until_reset_millis` is the sliding-window-precise
+/// time until a same-weight request would be admitted.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RejectContext {
+    pub limit: u64,
+    pub remaining: u64,
+    pub duration_until_reset_millis: u64,
+}
+
+/// Per-allowed-descriptor quota view. Shape mirrors [`RejectContext`] so
+/// the adapter can render `DescriptorStatus` with the same field
+/// population, but on the allow path `remaining > 0` (or `0` for a
+/// `DryRun` rule already past its limit) and `duration_until_reset_millis`
+/// is the cheap bucket-boundary modulo from
+/// [`gabion::window::time_until_next_bucket_boundary_millis`] — not the
+/// sliding-window walk used on reject.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuotaContext {
     pub limit: u64,
     pub remaining: u64,
     pub duration_until_reset_millis: u64,
