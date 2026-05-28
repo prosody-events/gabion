@@ -422,17 +422,24 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
           # `mode=max` provenance records the full build graph in the
-          # image's OCI index. The signed attestation goes through
-          # actions/attest-build-provenance below.
-          provenance: mode=max
-          sbom: true
+          # image's OCI index; the signed attestation goes through
+          # actions/attest-build-provenance below. Both, plus the SBOM,
+          # are gated to release builds (`is-release`) — `:main-<sha>` dev
+          # images skip them (they bloat per-commit registry churn and
+          # aren't pinned by users). `refresh-build` keeps them because it
+          # republishes the release-line tags. Anything users pin to keeps
+          # its attestation.
+          provenance: ${{ needs.plan.outputs.is-release == 'true' && 'mode=max' || 'false' }}
+          sbom: ${{ needs.plan.outputs.is-release == 'true' }}
           outputs: |
             type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
 
       # Signed SLSA-style provenance attached to the per-arch image
       # digest. The Sigstore signature is keyless — issued against the
-      # workflow run's OIDC identity. No secret to rotate.
+      # workflow run's OIDC identity. No secret to rotate. Release-only,
+      # matching the in-image provenance/sbom gating above.
       - uses: actions/attest-build-provenance@v4
+        if: needs.plan.outputs.is-release == 'true'
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
