@@ -549,11 +549,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: digest-${{ matrix.image }}-${{ matrix.flavor }}-amd64
           path: /tmp/digests/amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: digest-${{ matrix.image }}-${{ matrix.flavor }}-arm64
           path: /tmp/digests/arm64
@@ -1010,11 +1010,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: refresh-digest-${{ matrix.image }}-${{ matrix.flavor }}-amd64
           path: /tmp/digests/amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: refresh-digest-${{ matrix.image }}-${{ matrix.flavor }}-arm64
           path: /tmp/digests/arm64
