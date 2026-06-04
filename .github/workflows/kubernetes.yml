@@ -133,7 +133,7 @@ jobs:
         run: sudo chmod -R a+r /tmp/cores 2>/dev/null || true
       - name: upload cores on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cores-${{ github.job }}-${{ github.run_attempt }}
           path: /tmp/cores
@@ -196,7 +196,7 @@ jobs:
         run: sudo chmod -R a+r /tmp/cores 2>/dev/null || true
       - name: upload cores on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cores-${{ github.job }}-${{ github.run_attempt }}
           path: /tmp/cores
@@ -262,7 +262,7 @@ jobs:
         run: sudo chmod -R a+r /tmp/cores 2>/dev/null || true
       - name: upload cores on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cores-${{ github.job }}-${{ github.run_attempt }}
           path: /tmp/cores
