@@ -12,8 +12,8 @@ importers:
         specifier: ^3.15.0
         version: 3.15.0
       pixi.js:
-        specifier: ^8.18.1
-        version: 8.18.1
+        specifier: ^8.19.0
+        version: 8.19.0
       uplot:
         specifier: ^1.6.32
         version: 1.6.32
@@ -500,8 +500,8 @@ packages:
   obug@2.1.1:
     resolution: {integrity: sha512-uTqF9MuPraAQ+IsnPf366RG4cP9RtUi7MLO1N3KEc+wb0a6yKpeL0lmk2IB1jY5KHPAlTc6T/JRdC/YqxHNwkQ==}
 
-  parse-svg-path@0.1.2:
-    resolution: {integrity: sha512-JyPSBnkTJ0AI8GGJLfMXvKq42cj5c006fnLz6fXy6zfoVjJizi8BNTpu8on8ziI1cKy9d9DGNuY17Ce7wuejpQ==}
+  parse-svg-path@0.2.0:
+    resolution: {integrity: sha512-Tf7FFIrguPKQwzD4pWnYkR2VOv3raoHeKED80Bm+BYHI3KxC8KsgsGC5+fSMzAGDA6UEk4bHvmi+RsjmL3khpg==}
 
   picocolors@1.1.1:
     resolution: {integrity: sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==}
@@ -510,8 +510,8 @@ packages:
     resolution: {integrity: sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==}
     engines: {node: '>=12'}
 
-  pixi.js@8.18.1:
-    resolution: {integrity: sha512-6LUPWYgulZhp/w4kam2XHXB0QedISZIqrJbRdHLLQ3csn5a38uzKxAp6B5j6s89QFYaIJbg95kvgTRcbgpO1ow==}
+  pixi.js@8.19.0:
+    resolution: {integrity: sha512-pq1O6emA/GFjjeF+8d3Pb5t7knD8FsnfWGqQcRjYjsqFZ7QdzG1XgjLDUu0DFJRbafjV5+g8iNLFBx0b9649lg==}
 
   playwright-core@1.60.0:
     resolution: {integrity: sha512-9bW6zvX/m0lEbgTKJ6YppOKx8H3VOPBMOCFh2irXFOT4BbHgrx5hPjwJYLT40Lu+4qtD36qKc/Hn56StUW57IA==}
@@ -939,13 +939,13 @@ snapshots:
 
   obug@2.1.1: {}
 
-  parse-svg-path@0.1.2: {}
+  parse-svg-path@0.2.0: {}
 
   picocolors@1.1.1: {}
 
   picomatch@4.0.4: {}
 
-  pixi.js@8.18.1:
+  pixi.js@8.19.0:
     dependencies:
       '@pixi/colord': 2.9.6
       '@types/earcut': 3.0.0
@@ -955,7 +955,7 @@ snapshots:
       eventemitter3: 5.0.4
       gifuct-js: 2.1.2
       ismobilejs: 1.1.1
-      parse-svg-path: 0.1.2
+      parse-svg-path: 0.2.0
       tiny-lru: 11.4.7
 
   playwright-core@1.60.0: {}
