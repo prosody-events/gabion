@@ -100,7 +100,7 @@ jobs:
       # cacheable, so that step always runs.
       - name: cache Playwright browser
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('crates/gabion-wasm/web/pnpm-lock.yaml') }}
