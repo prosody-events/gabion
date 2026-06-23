@@ -25,7 +25,7 @@ jobs:
       build:      ${{ steps.rail.outputs.build }}
       test:       ${{ steps.rail.outputs.test }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: loadingalias/cargo-rail-action@v4
@@ -41,7 +41,7 @@ jobs:
     if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri,rust-src
@@ -64,7 +64,7 @@ jobs:
     if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri,rust-src
@@ -84,7 +84,7 @@ jobs:
     if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri,rust-src
@@ -112,7 +112,7 @@ jobs:
       # under default isolation. Tree Borrows is independent of that.
       MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-disable-isolation
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri,rust-src

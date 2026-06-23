@@ -23,7 +23,7 @@ jobs:
     outputs:
       wasm-viz: ${{ steps.surfaces.outputs.wasm_viz }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: loadingalias/cargo-rail-action@v4
@@ -45,7 +45,7 @@ jobs:
     if: needs.plan.outputs.wasm-viz == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown

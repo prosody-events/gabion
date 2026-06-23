@@ -28,7 +28,7 @@ jobs:
       scope-json:  ${{ steps.rail.outputs.scope-json }}
       base-ref:    ${{ steps.rail.outputs.base-ref }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: loadingalias/cargo-rail-action@v4
@@ -41,7 +41,7 @@ jobs:
     if: needs.plan.outputs.build == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
@@ -54,7 +54,7 @@ jobs:
     if: needs.plan.outputs.build == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -66,7 +66,7 @@ jobs:
     if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Prebuilt nextest binary — `cargo-install` compiles it from source
@@ -81,7 +81,7 @@ jobs:
   hygiene:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: make hygiene
 
   bench-check:
@@ -89,7 +89,7 @@ jobs:
     if: needs.plan.outputs.bench == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: make bench-check
