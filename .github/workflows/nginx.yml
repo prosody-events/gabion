@@ -69,7 +69,7 @@ jobs:
       # private GHCR buildcache. Fork PRs lack packages access — the login
       # fails, the import misses, and the build cold-compiles (today's
       # behavior). `continue-on-error` keeps that path green.
-      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         continue-on-error: true
         with:
           registry: ghcr.io
@@ -133,7 +133,7 @@ jobs:
         with:
           driver-opts: image=moby/buildkit:latest
       # Best-effort login — see nginx-module. Forks miss and cold-compile.
-      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+      - uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         continue-on-error: true
         with:
           registry: ghcr.io
