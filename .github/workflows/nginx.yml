@@ -29,7 +29,7 @@ jobs:
       required-work: ${{ steps.rail.outputs.required-work }}
     steps:
       - uses: actions/checkout@v7
-      - uses: loadingalias/cargo-rail-action@v12
+      - uses: loadingalias/cargo-rail-action@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         id: rail
         with:
           all: true
@@ -55,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=moby/buildkit:latest
       # Best-effort login so the buildx `cache-from` below can read the
@@ -124,7 +124,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=moby/buildkit:latest
       # Best-effort login — see nginx-module. Forks miss and cold-compile.
