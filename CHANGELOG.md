@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.1](https://github.com/prosody-events/gabion/compare/v0.3.0...v0.3.1) (2026-10-20)
+
+
+### Bug fixes
+
+* **nginx:** apply gabion config changes on reload ([#88](https://github.com/prosody-events/gabion/issues/88)) ([2ffb276](https://github.com/prosody-events/gabion/commit/2ffb2762a0ff1684b4ef05da2a6cf177d54cd414))
+* **nginx:** stop the leader thread before worker exit ([#86](https://github.com/prosody-events/gabion/issues/86)) ([1ca8c44](https://github.com/prosody-events/gabion/commit/1ca8c44338f7d7eda66887dcb894357ab1f910ac))
+
+
+### Build / CI
+
+* **deps:** update all dependencies to latest ([#89](https://github.com/prosody-events/gabion/issues/89)) ([b8a7824](https://github.com/prosody-events/gabion/commit/b8a782410b470de02b25ccd245462e1b60c325ed))
+* **deps:** update GitHub Actions, migrate cargo-rail-action to v12 ([#91](https://github.com/prosody-events/gabion/issues/91)) ([c7eaa38](https://github.com/prosody-events/gabion/commit/c7eaa38f3b346eca4e3014129e8e83cb297c6277))
+* make the Docker and Actions caches actually hit ([#90](https://github.com/prosody-events/gabion/issues/90)) ([ecfec86](https://github.com/prosody-events/gabion/commit/ecfec86330af514180ef55eeb5897aa5628a7061))
+* pin third-party actions to commit SHAs ([#92](https://github.com/prosody-events/gabion/issues/92)) ([1226f32](https://github.com/prosody-events/gabion/commit/1226f32dcd30296957976cb908049ab60c036979))
+* **release:** dispatch the release image build from release-please ([#93](https://github.com/prosody-events/gabion/issues/93)) ([3fa3144](https://github.com/prosody-events/gabion/commit/3fa31443068ee1ae6ae9d2ec56db67cdd29a93a6))
+
 ## [0.3.0](https://github.com/prosody-events/gabion/compare/v0.2.0...v0.3.0) (2026-05-28)
 
 
