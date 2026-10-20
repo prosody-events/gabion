@@ -22,7 +22,6 @@ RUN if command -v apk >/dev/null 2>&1; then \
             pcre2-dev \
             rust \
             cargo-chef \
-            sccache \
             zlib-dev; \
     elif command -v apt-get >/dev/null 2>&1; then \
         apt-get update; \
@@ -39,21 +38,11 @@ RUN if command -v apk >/dev/null 2>&1; then \
         rm -rf /var/lib/apt/lists/*; \
         # Distro `rustc`/`cargo` on Debian 12 / Ubuntu 22.04 are too old for \
         # cargo-chef's MSRV (1.86+) and can't read Cargo.lock v4. Install a \
-        # current stable toolchain via rustup, and grab a prebuilt `sccache` \
-        # (Ubuntu 22.04 lacks an apt package; building from source is slow). \
-        # The Alpine path above already ships new-enough rust/cargo/sccache. \
+        # current stable toolchain via rustup. The Alpine path above already \
+        # ships new-enough rust/cargo. \
         curl -fsSL https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path; \
         ln -s /root/.cargo/bin/cargo /root/.cargo/bin/rustc /usr/local/bin/; \
-        case "$(uname -m)" in \
-            x86_64)  sccache_arch=x86_64-unknown-linux-musl ;; \
-            aarch64) sccache_arch=aarch64-unknown-linux-musl ;; \
-            *) echo "Unsupported architecture for sccache: $(uname -m)" >&2; exit 1 ;; \
-        esac; \
-        sccache_version=v0.15.0; \
-        curl -fsSL "https://github.com/mozilla/sccache/releases/download/${sccache_version}/sccache-${sccache_version}-${sccache_arch}.tar.gz" \
-            | tar -xz --strip-components=1 -C /usr/local/bin "sccache-${sccache_version}-${sccache_arch}/sccache"; \
-        chmod +x /usr/local/bin/sccache; \
     else \
         echo "Unsupported nginx base image package manager: ${NGINX_BASE_IMAGE}" >&2; \
         exit 1; \
@@ -84,28 +73,18 @@ FROM chef AS module-builder
 
 COPY --from=planner /workspace/recipe.json recipe.json
 
-RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
-    --mount=type=cache,id=gabion-cargo-git,target=/root/.cargo/git \
-    --mount=type=cache,id=gabion-nginx-target,target=/workspace/target \
-    --mount=type=cache,id=gabion-nginx-sccache,target=/workspace/.cache/sccache \
-    nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
-    && SCCACHE_DIR=/workspace/.cache/sccache \
-       CARGO_BUILD_RUSTC_WRAPPER=sccache \
-       NGINX_SOURCE_DIR="/workspace/nginx-${nginx_version}" \
+# No cache mounts: the cooked deps must land in this layer to be reusable
+# (see deploy/gabiond/Dockerfile).
+RUN nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
+    && NGINX_SOURCE_DIR="/workspace/nginx-${nginx_version}" \
        NGINX_BUILD_DIR="/workspace/nginx-${nginx_version}/objs" \
        cargo chef cook --release --package gabion-nginx --features ngx-module --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
-    --mount=type=cache,id=gabion-cargo-git,target=/root/.cargo/git \
-    --mount=type=cache,id=gabion-nginx-target,target=/workspace/target \
-    --mount=type=cache,id=gabion-nginx-sccache,target=/workspace/.cache/sccache \
-    nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
-    && SCCACHE_DIR=/workspace/.cache/sccache \
-       CARGO_BUILD_RUSTC_WRAPPER=sccache \
-       NGINX_SOURCE_DIR="/workspace/nginx-${nginx_version}" \
+RUN nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
+    && NGINX_SOURCE_DIR="/workspace/nginx-${nginx_version}" \
        NGINX_BUILD_DIR="/workspace/nginx-${nginx_version}/objs" \
        cargo build -p gabion-nginx --release --features ngx-module \
     && mkdir -p /out \

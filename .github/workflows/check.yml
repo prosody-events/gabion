@@ -58,7 +58,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Only `main` saves. PRs restore main's entry (a PR ref can read its
+      # base branch's caches) — per-PR saves only churned the repo's 10 GiB
+      # Actions cache and LRU-evicted main's entries. With
+      # CARGO_INCREMENTAL=0 and rust-cache pruning workspace crates, a PR's
+      # own entry only ever helped PRs that change dependencies.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: make clippy
 
   test:
@@ -68,7 +75,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      # `shared-key: test` lets kubernetes.yml's `kubernetes-test` (a subset
+      # of this build, same profile and env) restore this entry too.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Prebuilt nextest binary — `cargo-install` compiles it from source
       # on a cache miss (minutes); `install-action` fetches the release.
       - uses: taiki-e/install-action@v2
@@ -92,4 +104,6 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: make bench-check
