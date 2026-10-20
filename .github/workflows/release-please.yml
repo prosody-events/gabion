@@ -11,6 +11,9 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release-created: ${{ steps.release.outputs.release_created }}
+      tag-name: ${{ steps.release.outputs.tag_name }}
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
@@ -64,3 +67,26 @@ jobs:
           git commit -m "chore: sync Cargo.lock to workspace.package.version"
           git push origin "$branch"
         shell: bash
+
+  # The release tag is pushed with GITHUB_TOKEN, and GitHub starts no
+  # workflows for events that token causes, so docker.yml's `push: tags`
+  # trigger never fires for a release. `workflow_dispatch` is the
+  # documented exception: dispatch docker.yml on the new tag, where its
+  # plan job sees `refs/tags/v*` and publishes the release images,
+  # provenance, SBOM, and attestations.
+  #
+  # A job of its own so only it holds `actions: write`, a failed
+  # Cargo.lock sync can't skip it, and "Re-run failed jobs" retries a
+  # failed dispatch with the same tag (release-please reports a release
+  # as created only on the run that creates it).
+  release-images:
+    needs: release-please
+    if: ${{ !cancelled() && needs.release-please.outputs.release-created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag-name }}
+        run: gh workflow run docker.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG"
