@@ -14,6 +14,9 @@ on:
       - '.github/workflows/docker.yml'
   push:
     branches: [main]
+    # Manually pushed tags only: release-please's tags are pushed with
+    # GITHUB_TOKEN, which starts no workflows, so release-please.yml
+    # dispatches this workflow on the tag instead.
     tags: ['v*']
   schedule:
     # Weekly Monday 06:00 UTC. The cron is what picks up upstream nginx /
@@ -42,8 +45,8 @@ permissions:
   attestations: write
 
 jobs:
-  # The docker workflow never triggers on PRs (only `push:main`, tag,
-  # schedule, dispatch) so it has no need for cargo-rail's PR-skip gate.
+  # PRs reach this workflow only through the `paths:` filter above, so it
+  # has no need for cargo-rail's PR-skip gate.
   # The plan job here exists solely to resolve the gabion version once
   # and hand it to every build / combine job below — release tag wins,
   # otherwise we read `.release-please-manifest.json`.
