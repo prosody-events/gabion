@@ -551,6 +551,7 @@ async fn call_grpc(
             }],
             limit: None,
             hits_addend: None,
+            is_negative_hits: false,
         }],
         hits_addend: 1,
     };
