@@ -1,6 +1,6 @@
 //! NGINX FFI glue: directives, the access-phase handler, and the
-//! `init_process` hook that spawns the leader thread when a worker wins the
-//! SHM lease. All cross-process state lives in the SHM zone allocated by
+//! `init_process` / `exit_process` hooks that start and stop each worker's
+//! leader thread. All cross-process state lives in the SHM zone allocated by
 //! [`set_zone`] during the master process's config phase.
 
 use std::ffi::{c_char, c_void};
@@ -9,10 +9,8 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::Result;
 use ngx::core;
 use ngx::ffi::{
     NGX_CONF_1MORE, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET,
@@ -38,7 +36,7 @@ use crate::access::{
 };
 use crate::headers::AdmissionHeaders;
 use crate::identity::derive_identity;
-use crate::leader::{self, GossipSettings, LeaderConfig};
+use crate::leader::{self, GossipSettings, LeaderConfig, LeaderHandle};
 use crate::log;
 use crate::rules::{
     BindingCompiler, BindingLookup, CompiledRules, DEFAULT_DOMAIN, DescriptorBinding, RuleConfig,
@@ -58,8 +56,7 @@ static SHM_AGGREGATE_CAPACITY: AtomicUsize = AtomicUsize::new(0);
 /// Per-worker shared state. Set during config phase by the master process so
 /// every fork sees the same pointers in this static.
 static WORKER_GLOBALS: OnceLock<WorkerGlobals> = OnceLock::new();
-static LEADER_THREAD: std::sync::Mutex<Option<JoinHandle<Result<()>>>> =
-    std::sync::Mutex::new(None);
+static LEADER_THREAD: std::sync::Mutex<Option<LeaderHandle>> = std::sync::Mutex::new(None);
 
 struct WorkerGlobals {
     region: ShmRegion,
@@ -2065,18 +2062,10 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
         return core::Status::NGX_OK.into();
     };
 
+    // Every worker runs a leader thread; the SHM lease decides which one
+    // drives gossip, and the others stand by to take over (for example
+    // from an old-generation worker exiting after a reload).
     let worker_id = std::process::id();
-    let now = wall_millis();
-    if !globals.region.lease().try_acquire(
-        worker_id,
-        now,
-        leader::DEFAULT_LEASE_TTL.as_millis() as u64,
-    ) {
-        // Another worker holds the lease — be a follower for this turn.
-        tracing::info!(worker_id, "gabion: worker did not win leader lease");
-        return core::Status::NGX_OK.into();
-    }
-
     let rng_seed = match globals.rng_seed {
         Some(seed) => seed,
         None => match defaults::random_rng_seed() {
@@ -2110,11 +2099,10 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
             // pressure). A panic here would unwind into nginx's
             // `init_process` C frame and is UB. Log and degrade
             // gracefully — the worker stays up handling requests
-            // against whatever SHM aggregate the previous leader left
-            // behind. The next worker that wins the lease will retry
-            // the spawn; if every spawn is failing, the operator needs
-            // to raise their thread budget (`ulimit -u`) or investigate
-            // the host's memory.
+            // against the shared SHM aggregate, and any other worker
+            // can still lead. If every spawn is failing, the operator
+            // needs to raise their thread budget (`ulimit -u`) or
+            // investigate the host's memory.
             tracing::error!(
                 worker_id,
                 %error,
@@ -2122,13 +2110,10 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
                  hit RLIMIT_NPROC, ran out of memory, or returned EAGAIN \
                  under fork pressure. This worker is staying up without a \
                  leader thread — requests still admit against the existing \
-                 SHM aggregate but no gossip will be emitted from this \
-                 process. Raise the process / thread limit for the nginx \
-                 user, or check `dmesg` for OOM signals.",
+                 SHM aggregate but this worker can never drive gossip. Raise \
+                 the process / thread limit for the nginx user, or check \
+                 `dmesg` for OOM signals.",
             );
-            // Release the lease we acquired above so the next worker
-            // gets a fair shot at becoming leader.
-            globals.region.lease().release(worker_id);
             return core::Status::NGX_OK.into();
         }
     };
@@ -2146,14 +2131,18 @@ unsafe extern "C" fn gabion_exit_process(_cycle: *mut ngx_cycle_t) {
     let Some(globals) = WORKER_GLOBALS.get() else {
         return;
     };
-    let worker_id = std::process::id();
-    globals.region.lease().release(worker_id);
+    // Stop the leader thread before anything else: it renews the lease and
+    // holds the gossip socket until told to stop, so joining it without the
+    // stop signal blocks this worker's exit forever.
     let handle = LEADER_THREAD.lock().ok().and_then(|mut slot| slot.take());
     if let Some(handle) = handle
-        && let Err(error) = handle.join()
+        && let Err(error) = handle.stop()
     {
         tracing::error!(?error, "gabion: leader thread panicked");
     }
+    // The thread releases the lease on its way out; this covers a thread
+    // that panicked while holding it.
+    globals.region.lease().release(std::process::id());
 }
 
 // -- helpers ----------------------------------------------------------------

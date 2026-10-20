@@ -6,9 +6,9 @@
 //!    (`node_id`) is stamped here before fork.
 //! 2. nginx workers fork. Each one runs the access phase, which reads the
 //!    aggregate via `AggregateTable::window_total` and pushes hits onto the SHM
-//!    queue. The first worker to win the lease (`LeaderLease::try_acquire`)
-//!    spawns the leader thread; that thread stamps the incarnation, drains the
-//!    queue, drives the gossip runtime, and writes back into the aggregate via
+//!    queue. Every worker spawns a leader thread; the one holding the lease
+//!    (`LeaderLease::try_acquire`) stamps the incarnation, drains the queue,
+//!    drives the gossip runtime, and writes back into the aggregate via
 //!    `ShmAggregateStore::apply` (which invokes
 //!    `write_delta`/`write_expiration` per row of the `DeltaSink`/
 //!    `ExpirationSink`).

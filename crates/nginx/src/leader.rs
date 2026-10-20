@@ -2,6 +2,10 @@
 //! wires the `GossipRuntime` to the SHM aggregate writer, and drains the SHM
 //! queue into per-record `GossipClient::record` calls.
 //!
+//! Every nginx worker runs one of these threads. The SHM lease decides
+//! which one leads; the others campaign each lease tick so they can take
+//! over when the leader's worker exits.
+//!
 //! `GossipRuntime` is `!Send`, so its select loop runs on a `LocalSet`
 //! `spawn_local` task. The drain task lives next to it on the same
 //! `LocalSet` so the two communicate via plain `Rc<...>` shares.
@@ -13,8 +17,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::mpsc;
-use tokio::task::LocalSet;
+use tokio::sync::{mpsc, watch};
+use tokio::task::{JoinSet, LocalSet};
 
 use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeIdentity, RuleDescriptor};
 use gabion::defaults;
@@ -41,6 +45,10 @@ pub const DEFAULT_LEASE_TICK: Duration = Duration::from_millis(300);
 /// Default lease TTL — three lease ticks so a renew can miss once without
 /// flipping the leadership.
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(1);
+
+/// Ceiling on the back-off between leadership attempts after a leader
+/// fails. The back-off starts at the lease TTL and doubles per failure.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Configuration the leader thread needs to bring up its tokio runtime.
 #[derive(Clone, Debug)]
@@ -155,9 +163,28 @@ impl GossipSettings {
     }
 }
 
-/// Spawn a leader thread. The thread owns its own `current_thread` tokio
-/// runtime + `LocalSet`. Returns the join handle so callers can await
-/// termination (e.g. on nginx worker shutdown).
+/// A worker's leader thread, and the means to stop it.
+pub struct LeaderHandle {
+    stop: watch::Sender<bool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl LeaderHandle {
+    /// Ask the thread to stop, then wait for it. A leading thread shuts
+    /// its gossip tasks down and releases the lease before it returns, so
+    /// another worker can take over as soon as this call does. `Err`
+    /// means the thread panicked.
+    pub fn stop(self) -> std::thread::Result<()> {
+        self.stop.send_replace(true);
+        self.thread.join()
+    }
+}
+
+/// Spawn a worker's leader thread. The thread owns its own
+/// `current_thread` tokio runtime + `LocalSet` and campaigns for the SHM
+/// lease every `lease_tick`: whichever worker holds it drives gossip, and
+/// the rest stand by to take over when that worker exits or its leader
+/// fails. Call [`LeaderHandle::stop`] before the worker exits.
 ///
 /// Returns an `io::Error` if the OS refuses the thread spawn (out of
 /// memory, `RLIMIT_NPROC`, `EAGAIN` under fork pressure). The previous
@@ -172,32 +199,115 @@ pub fn spawn(
     shm: ShmRegion,
     rules: Arc<CompiledRules>,
     config: LeaderConfig,
-) -> std::io::Result<std::thread::JoinHandle<anyhow::Result<()>>> {
-    std::thread::Builder::new()
+) -> std::io::Result<LeaderHandle> {
+    let (stop, stopped) = watch::channel(false);
+    let thread = std::thread::Builder::new()
         .name("gabion-leader".to_string())
-        .spawn(move || run_leader(shm, rules, config))
+        .spawn(move || run_leader(shm, rules, config, stopped))?;
+    Ok(LeaderHandle { stop, thread })
 }
 
 fn run_leader(
     shm: ShmRegion,
     rules: Arc<CompiledRules>,
     config: LeaderConfig,
-) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    stopped: watch::Receiver<bool>,
+) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("build leader tokio runtime")?;
-    let local = LocalSet::new();
-    local.block_on(
-        &runtime,
-        async move { leader_main(shm, rules, config).await },
-    )
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(
+                worker_id = config.worker_id,
+                %error,
+                "gabion: could not start the leader thread's async runtime, so \
+                 this worker will never drive gossip. Requests are still \
+                 admitted against the shared SHM aggregate, and another worker \
+                 can still lead. Usually the worker hit its file-descriptor or \
+                 memory limit; check `worker_rlimit_nofile` and `dmesg`, then \
+                 restart nginx.",
+            );
+            return;
+        }
+    };
+    LocalSet::new().block_on(&runtime, campaign(shm, rules, config, stopped));
 }
 
-async fn leader_main(
+/// Hold or wait for the SHM lease until told to stop. A worker that wins
+/// the lease runs [`leader_main`] until it is stopped, loses the lease,
+/// or fails, then releases the lease. After a failure it backs off
+/// before campaigning again, so a leader that cannot start does not spin.
+async fn campaign(
     shm: ShmRegion,
     rules: Arc<CompiledRules>,
     config: LeaderConfig,
+    mut stopped: watch::Receiver<bool>,
+) {
+    let lease = shm.lease();
+    let ttl_millis = config.lease_ttl.as_millis() as u64;
+    let mut retry_delay = config.lease_ttl;
+    let mut announced_follower = false;
+    let mut tick = tokio::time::interval(config.lease_tick);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = stopped.wait_for(|stop| *stop) => return,
+            _ = tick.tick() => {}
+        }
+        if !lease.try_acquire(config.worker_id, wall_millis(), ttl_millis) {
+            if !announced_follower {
+                tracing::info!(
+                    worker_id = config.worker_id,
+                    "gabion: worker did not win leader lease; standing by to take over gossip if \
+                     the leader exits",
+                );
+                announced_follower = true;
+            }
+            continue;
+        }
+
+        tracing::info!(
+            worker_id = config.worker_id,
+            "gabion: worker won leader lease"
+        );
+        let outcome = leader_main(shm, &rules, &config, &mut stopped).await;
+        lease.release(config.worker_id);
+        let Err(error) = outcome else {
+            return;
+        };
+        tracing::error!(
+            worker_id = config.worker_id,
+            error = format!("{error:#}"),
+            retry_in = ?retry_delay,
+            "gabion: this worker stopped leading gossip and released the \
+             leader lease; it will campaign again after `retry_in`. Requests \
+             are still admitted against the shared SHM aggregate, but counts \
+             are not gossiped to or from peers until some worker leads. \
+             Usually the `gabion_gossip_bind` address is already in use, or \
+             the worker was starved long enough to miss its lease renewals. \
+             The `error` field names the step that failed.",
+        );
+        tokio::select! {
+            _ = stopped.wait_for(|stop| *stop) => return,
+            _ = tokio::time::sleep(retry_delay) => {}
+        }
+        retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
+        announced_follower = false;
+    }
+}
+
+/// Lead gossip until `stopped` fires (`Ok`) or one of the leader's tasks
+/// ends on its own (`Err`). Every task is shut down before this returns,
+/// so the gossip socket is closed and nothing renews the lease once the
+/// caller releases it.
+async fn leader_main(
+    shm: ShmRegion,
+    rules: &Arc<CompiledRules>,
+    config: &LeaderConfig,
+    stopped: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // Stamp a fresh incarnation into the SHM header so peers see a new
     // `(node_id, incarnation)` for this takeover.
@@ -207,7 +317,7 @@ async fn leader_main(
     let identity = NodeIdentity::new(gabion::crdt::NodeId(node_id), new_incarnation);
 
     let mut cell_store = CellStore::<u32>::new(config.cell_store, identity);
-    register_rules(&mut cell_store, &rules);
+    register_rules(&mut cell_store, rules);
     // SAFETY: `ShmAggregateStore::new`'s preconditions (see its `# Safety`
     // doc) are upheld:
     // * `shm.aggregate_slots_ptr()` returns the address of slot 0 of the
@@ -227,10 +337,12 @@ async fn leader_main(
     //   before the worker exits, so the mapping outlives `store` (and any
     //   `AggregateTable<'_>` derived from it).
     // * Single-writer: the SHM `LeaderLease` elects at most one leader thread
-    //   per worker process at a time; `ShmAggregateStore` is `!Send + !Sync`
-    //   (it holds `*mut _` + `Cell`), so the type system prevents this store
-    //   from being shared with another thread. Concurrent worker readers go
-    //   through the seqlock/atomic accessors on `AggregateSlot`, which is the
+    //   per worker process at a time, and this function drops `store` and every
+    //   task holding a clone of it before `campaign` releases the lease to the
+    //   next leader; `ShmAggregateStore` is `!Send + !Sync` (it holds `*mut _`
+    //   + `Cell`), so the type system prevents this store from being shared
+    //   with another thread. Concurrent worker readers go through the
+    //   seqlock/atomic accessors on `AggregateSlot`, which is the
     //   data-race-free protocol the nomicon's "Send and Sync" / atomics rules
     //   require.
     let store = Rc::new(unsafe {
@@ -254,39 +366,39 @@ async fn leader_main(
 
     let peer_events = discovery_stream(config.discovery.clone());
 
-    let gossip_task = tokio::task::spawn_local(async move { gossip_rt.run(peer_events).await });
-
-    let drain_task = tokio::task::spawn_local(drain_loop(
-        gossip_client.clone(),
+    let mut tasks = JoinSet::new();
+    tasks.spawn_local(async move {
+        gossip_rt
+            .run(peer_events)
+            .await
+            .context("gossip runtime exited")
+    });
+    let drain = drain_loop(
+        gossip_client,
         shm,
         rules.clone(),
         config.max_inflight,
         config.drain_tick,
-    ));
-
-    let lease_task = tokio::task::spawn_local(lease_renewer(
+    );
+    tasks.spawn_local(async move { drain.await.context("drain loop exited") });
+    tasks.spawn_local(lease_renewer(
         shm,
         config.worker_id,
         config.lease_tick,
         config.lease_ttl,
     ));
-
-    let admin_task = tokio::task::spawn_local(admin_listener(admin_tx, config.admin_bind));
+    tasks.spawn_local(admin_listener(admin_tx, config.admin_bind));
 
     let outcome = tokio::select! {
-        result = gossip_task => result
-            .context("gossip task panicked")?
-            .context("gossip runtime exited"),
-        result = drain_task => result
-            .context("drain task panicked")?
-            .context("drain loop exited"),
-        result = lease_task => result
-            .context("lease task panicked")?,
-        result = admin_task => result.context("admin task panicked")?,
+        _ = stopped.wait_for(|stop| *stop) => Ok(()),
+        Some(joined) = tasks.join_next() => Err(match joined {
+            Ok(Ok(())) => anyhow::anyhow!("a leader task exited without being asked to"),
+            Ok(Err(error)) => error,
+            Err(error) => anyhow::Error::new(error).context("a leader task panicked"),
+        }),
     };
 
-    // Best-effort: tell the gossip runtime to shut down.
-    let _ = gossip_client.shutdown().await;
+    tasks.shutdown().await;
     outcome
 }
 

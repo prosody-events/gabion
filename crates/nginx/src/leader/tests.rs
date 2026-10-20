@@ -58,3 +58,117 @@ fn defaults_match_shared_production_defaults() {
         defaults::STORAGE_MAX_CELLS as u32
     );
 }
+
+use std::sync::mpsc as std_mpsc;
+use std::time::Instant;
+
+use gabion::rules::EnforcementMode;
+
+use crate::rules::{DEFAULT_DOMAIN, DescriptorBinding, RuleConfig};
+use crate::shm::Layout;
+
+const LEASE_TICK: Duration = Duration::from_millis(10);
+const DEADLINE: Duration = Duration::from_secs(5);
+
+/// A region over a leaked allocation, so a leader thread that outlives a
+/// failed assertion never reads freed memory.
+fn leaked_region() -> ShmRegion {
+    let layout = Layout::new(64, 64).expect("layout");
+    let words: &'static mut [u64] =
+        Box::leak(vec![0_u64; layout.total_bytes.div_ceil(8)].into_boxed_slice());
+    // SAFETY: `ShmRegion::initialize`'s preconditions hold: `words` is a
+    // fresh, writable, 8-byte-aligned allocation of at least
+    // `layout.total_bytes`, `initialize` is its first user, and the leak
+    // keeps it alive for every thread that reads the region.
+    let region = unsafe { ShmRegion::initialize(words.as_mut_ptr().cast(), layout) };
+    region.lease().set_init_millis(wall_millis());
+    region
+}
+
+fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
+    let rules = CompiledRules::compile(&[RuleConfig {
+        name: "per_tenant".into(),
+        domain: DEFAULT_DOMAIN.into(),
+        bindings: vec![DescriptorBinding {
+            key: "tenant".into(),
+            source: "$http_x_tenant".into(),
+        }],
+        limit: 2,
+        window: Duration::from_secs(1),
+        bucket: Duration::from_secs(1),
+        mode: EnforcementMode::Enforce,
+        except_if: None,
+    }])
+    .expect("rules");
+    let config = LeaderConfig {
+        worker_id,
+        gossip_bind: "127.0.0.1:0".parse().expect("addr"),
+        lease_tick: LEASE_TICK,
+        ..LeaderConfig::default()
+    };
+    spawn(region, Arc::new(rules), config).expect("spawn leader thread")
+}
+
+fn wait_for_owner(region: ShmRegion, worker_id: u32) {
+    let deadline = Instant::now() + DEADLINE;
+    while region.lease().snapshot().owner_worker != worker_id {
+        assert!(
+            Instant::now() < deadline,
+            "worker {worker_id} never took the lease: {:?}",
+            region.lease().snapshot(),
+        );
+        std::thread::sleep(LEASE_TICK);
+    }
+}
+
+/// Stop `handle`, failing instead of hanging if the thread never exits.
+fn stop_within_deadline(handle: LeaderHandle) {
+    let (done_tx, done_rx) = std_mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done_tx.send(handle.stop().is_ok());
+    });
+    let stopped = done_rx
+        .recv_timeout(DEADLINE)
+        .expect("leader thread did not stop");
+    assert!(stopped, "leader thread panicked");
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "binds a UDP socket")]
+fn stopping_the_leader_ends_its_thread_and_releases_the_lease() {
+    let region = leaked_region();
+    let leader = spawn_worker(region, 1);
+    wait_for_owner(region, 1);
+
+    stop_within_deadline(leader);
+    assert_eq!(region.lease().snapshot().owner_worker, 0);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "binds a UDP socket")]
+fn stopping_a_follower_leaves_the_leader_in_place() {
+    let region = leaked_region();
+    let leader = spawn_worker(region, 1);
+    wait_for_owner(region, 1);
+    let follower = spawn_worker(region, 2);
+    std::thread::sleep(LEASE_TICK * 10);
+
+    stop_within_deadline(follower);
+    assert_eq!(region.lease().snapshot().owner_worker, 1);
+    stop_within_deadline(leader);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "binds a UDP socket")]
+fn a_follower_takes_over_when_the_leader_stops() {
+    let region = leaked_region();
+    let leader = spawn_worker(region, 1);
+    wait_for_owner(region, 1);
+    let follower = spawn_worker(region, 2);
+    std::thread::sleep(LEASE_TICK * 10);
+    assert_eq!(region.lease().snapshot().owner_worker, 1);
+
+    stop_within_deadline(leader);
+    wait_for_owner(region, 2);
+    stop_within_deadline(follower);
+}
