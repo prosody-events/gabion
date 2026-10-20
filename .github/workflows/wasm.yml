@@ -21,31 +21,24 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      wasm-viz: ${{ steps.surfaces.outputs.wasm_viz }}
+      required-work: ${{ steps.rail.outputs.required-work }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: loadingalias/cargo-rail-action@v4
+      - uses: loadingalias/cargo-rail-action@v12
         id: rail
         with:
-          mode: minimal
-      # cargo-rail-action v4.1.3 doesn't expose `custom_<name>` outputs;
-      # parse them out of `scope-json` directly.
-      - id: surfaces
-        env:
-          SCOPE_JSON: ${{ steps.rail.outputs.scope-json }}
-        run: |
-          set -eu
-          val=$(printf '%s' "$SCOPE_JSON" | jq -r '.surfaces["custom:wasm_viz"] // false')
-          echo "wasm_viz=$val" >> "$GITHUB_OUTPUT"
+          all: true
 
   build:
     needs: plan
-    if: needs.plan.outputs.wasm-viz == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'wasm-viz') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -70,9 +63,9 @@ jobs:
           # `allowBuilds:` build-allowlist key — pnpm 9 doesn't recognise
           # it and errors out with "packages field missing or empty".
           version: 11
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           cache-dependency-path: crates/gabion-wasm/web/pnpm-lock.yaml
 
@@ -100,7 +93,7 @@ jobs:
       # cacheable, so that step always runs.
       - name: cache Playwright browser
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('crates/gabion-wasm/web/pnpm-lock.yaml') }}
@@ -127,7 +120,7 @@ jobs:
         run: pnpm run build
 
       # Hand the built site to the deploy-pages job on main pushes.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         with:
           name: pages
@@ -149,7 +142,7 @@ jobs:
       group: pages
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pages
           path: dist

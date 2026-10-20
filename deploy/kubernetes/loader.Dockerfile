@@ -31,7 +31,7 @@ RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
     && mkdir -p /out \
     && cp target/release/gabion-loader /out/gabion-loader
 
-FROM alpine:3.22
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /out/gabion-loader /usr/local/bin/gabion-loader
 ENTRYPOINT ["/usr/local/bin/gabion-loader"]

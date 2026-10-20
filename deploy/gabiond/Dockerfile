@@ -38,7 +38,7 @@ RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
     && mkdir -p /out \
     && cp target/release/gabiond /out/gabiond
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates
 

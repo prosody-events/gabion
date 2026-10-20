@@ -20,28 +20,24 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      build:       ${{ steps.rail.outputs.build }}
-      test:        ${{ steps.rail.outputs.test }}
-      bench:       ${{ steps.rail.outputs.bench }}
-      docs:        ${{ steps.rail.outputs.docs }}
-      infra:       ${{ steps.rail.outputs.infra }}
-      scope-json:  ${{ steps.rail.outputs.scope-json }}
-      base-ref:    ${{ steps.rail.outputs.base-ref }}
+      required-work: ${{ steps.rail.outputs.required-work }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: loadingalias/cargo-rail-action@v4
+      - uses: loadingalias/cargo-rail-action@v12
         id: rail
         with:
-          mode: minimal
+          all: true
 
   fmt:
     needs: plan
-    if: needs.plan.outputs.build == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.fmt') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
@@ -51,10 +47,12 @@ jobs:
 
   clippy:
     needs: plan
-    if: needs.plan.outputs.build == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.clippy') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -63,10 +61,12 @@ jobs:
 
   test:
     needs: plan
-    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Prebuilt nextest binary — `cargo-install` compiles it from source
@@ -81,15 +81,17 @@ jobs:
   hygiene:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: make hygiene
 
   bench-check:
     needs: plan
-    if: needs.plan.outputs.bench == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.build') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: make bench-check
