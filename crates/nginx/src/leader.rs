@@ -65,7 +65,6 @@ pub struct LeaderConfig {
     pub drain_tick: Duration,
     pub lease_tick: Duration,
     pub lease_ttl: Duration,
-    pub identity_seed: Option<Box<str>>,
 }
 
 impl Default for LeaderConfig {
@@ -81,7 +80,6 @@ impl Default for LeaderConfig {
             drain_tick: DEFAULT_DRAIN_TICK,
             lease_tick: DEFAULT_LEASE_TICK,
             lease_ttl: DEFAULT_LEASE_TTL,
-            identity_seed: None,
         }
     }
 }
@@ -344,10 +342,9 @@ async fn leader_main(
     //   agrees with the mapping. `Layout::new` enforces it is a power of two
     //   with `>= 2`, and the total byte length fits in the mapping (well under
     //   `isize::MAX`).
-    // * A worker never unmaps its `MAP_SHARED | MAP_ANONYMOUS` region (only the
-    //   master does, in `Zone::drop`), and this leader thread is joined before
-    //   the worker exits, so the mapping outlives `store` (and any
-    //   `AggregateTable<'_>` derived from it).
+    // * A worker's shared-zone mapping lives until the worker exits, and this
+    //   leader thread is joined before then, so the mapping outlives `store`
+    //   (and any `AggregateTable<'_>` derived from it).
     // * Single-writer: the SHM `LeaderLease` elects at most one leader thread
     //   per worker process at a time, and this function drops `store` and the
     //   gossip runtime holding its clone before `campaign` releases the lease
@@ -433,8 +430,8 @@ async fn drain_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        // The queue allows one consumer, so renew the lease before popping:
-        // a leader that stalled past the TTL and lost it stops here.
+        // Renew the lease before popping: a leader that stalled past the TTL
+        // and lost it stops here instead of draining beside its successor.
         if !lease.try_acquire(worker_id, now_millis(), ttl_millis) {
             return anyhow::anyhow!("worker {worker_id} lost the leader lease to another worker");
         }

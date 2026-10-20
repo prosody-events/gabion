@@ -2,8 +2,8 @@
 //!
 //! The production flow is:
 //!
-//! 1. nginx master `set_zone` → `mmap` + `ShmRegion::initialize`. Identity
-//!    (`node_id`) is stamped here before fork.
+//! 1. nginx master maps the shared zone; its `init_zone` callback runs
+//!    `ShmRegion::initialize` and stamps the identity (`node_id`) before fork.
 //! 2. nginx workers fork. Each one runs the access phase, which reads the
 //!    aggregate via `AggregateTable::window_total` and pushes hits onto the SHM
 //!    queue. Every worker spawns a leader thread; the one holding the lease
@@ -19,9 +19,10 @@
 //! `ExpirationSink<u32>` rows directly and feed them through
 //! `AggregateStore::apply`.
 //!
-//! Exempt: `module.rs`'s `watch_for_shutdown` reads nginx's `ngx_exiting`
-//! global, which Miri can't model. The read is by value, on the worker's
-//! event thread, which is the only thread that writes it.
+//! Exempt: `module.rs`'s nginx FFI, which needs nginx itself and so can't run
+//! under Miri. That includes `watch_for_shutdown`'s by-value read of
+//! `ngx_exiting` on the worker's event thread (the only thread that writes
+//! it), and `init_zone`, which carves the region out of a zone nginx maps.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -381,10 +382,8 @@ fn concurrent_leader_writer_and_worker_readers() {
     let stop = Arc::new(AtomicBool::new(false));
 
     // Leader thread writes deltas one at a time.
-    let writer_zone = zone.clone();
     let writer = thread::spawn(move || {
-        // SAFETY: see leader_stamps_incarnation_and_applies_deltas.
-        let writer_region = unsafe { ShmRegion::from_initialized(writer_zone.as_ptr(), layout) };
+        let writer_region = region;
         let store = unsafe {
             ShmAggregateStore::new(
                 writer_region.aggregate_slots_ptr(),
@@ -400,13 +399,9 @@ fn concurrent_leader_writer_and_worker_readers() {
     // Two reader threads — what every nginx worker does on the access path.
     let mut readers = Vec::new();
     for _ in 0..2 {
-        let reader_zone = zone.clone();
         let reader_stop = stop.clone();
         readers.push(thread::spawn(move || {
-            // SAFETY: zone outlives this thread thanks to Arc; layout/region
-            // are reused from the master's initialization.
-            let reader_region =
-                unsafe { ShmRegion::from_initialized(reader_zone.as_ptr(), layout) };
+            let reader_region = region;
             while !reader_stop.load(Ordering::Acquire) {
                 let view = reader_region.aggregate();
                 // No panic = no torn read.
@@ -459,30 +454,7 @@ struct LeaseFacade {
 unsafe impl Send for LeaseFacade {}
 unsafe impl Sync for LeaseFacade {}
 
-// -- 6. Fork-style: master initializes, "worker" reconstructs view -----
-
-#[test]
-fn worker_view_via_from_initialized_sees_master_writes() {
-    // This is the moral equivalent of master `set_zone` → fork → worker
-    // reads through `from_initialized`. Both `region` constructions point
-    // at the same backing `TestZone`.
-    let layout = Layout::new(8, 16).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = TestZone::allocate(words);
-    // SAFETY: as in build_zone — fresh allocation, 8-byte aligned,
-    // exclusive during init.
-    let master_region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
-    master_region.header().identity.store_node_id(0xfeed_face);
-
-    // SAFETY: pointer is the same one master_region was initialized with,
-    // and the TestZone outlives both regions. Pre-init writes via
-    // master_region are visible because all access uses atomics.
-    let worker_region = unsafe { ShmRegion::from_initialized(zone.as_ptr(), layout) };
-    assert_eq!(worker_region.header().identity.load_node_id(), 0xfeed_face);
-    assert_eq!(worker_region.queue().capacity(), 8);
-}
-
-// -- 7. End-to-end nginx flow: workers push, leader drains+applies, workers
+// -- 6. End-to-end nginx flow: workers push, leader drains+applies, workers
 // reread
 
 /// Simulated end-to-end nginx flow: multiple worker threads push hits onto
@@ -490,9 +462,8 @@ fn worker_view_via_from_initialized_sees_master_writes() {
 /// resulting deltas through `ShmAggregateStore::apply`, and the workers
 /// re-read the aggregate to confirm increments are visible. This exercises:
 ///
-/// * `ShmRegion::initialize` (master) and `from_initialized` (per worker).
-/// * `RequestQueue::push` (MPSC producer) and `RequestQueue::pop` (single
-///   consumer).
+/// * `ShmRegion::initialize` (master), whose region every worker copies.
+/// * `RequestQueue::push` (MPSC producer) and `RequestQueue::pop`.
 /// * `ShmAggregateStore::new` (leader) and `apply()` (per drained batch).
 /// * `AggregateTable::get` and `window_total` (worker readers).
 /// * All `// SAFETY:` blocks inside these methods.
@@ -537,10 +508,8 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
     // Worker producers: each replays the access path's queue.push.
     let mut producers = Vec::new();
     for _ in 0..WORKER_COUNT {
-        let zone_clone = zone.clone();
         producers.push(thread::spawn(move || {
-            // SAFETY: zone outlives this thread; layout/init are master's.
-            let r = unsafe { ShmRegion::from_initialized(zone_clone.as_ptr(), layout) };
+            let r = region;
             let queue = r.queue();
             for _ in 0..PER_WORKER {
                 loop {
@@ -561,12 +530,9 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
     }
 
     // Leader drainer: pops from the queue, batches into one apply().
-    let leader_zone = zone.clone();
     let leader_stop = stop.clone();
     let leader = thread::spawn(move || {
-        // SAFETY: zone outlives the leader; the leader is the sole writer
-        // for ShmAggregateStore in this test.
-        let r = unsafe { ShmRegion::from_initialized(leader_zone.as_ptr(), layout) };
+        let r = region;
         let store =
             unsafe { ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity) };
         let queue = r.queue();
@@ -600,12 +566,9 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
     // Reader threads (mimic workers reading window_total during access).
     let mut readers = Vec::new();
     for _ in 0..2 {
-        let reader_zone = zone.clone();
         let reader_stop = stop.clone();
         readers.push(thread::spawn(move || {
-            // SAFETY: zone outlives the reader; aggregate view uses
-            // seqlock-protected atomic reads only.
-            let r = unsafe { ShmRegion::from_initialized(reader_zone.as_ptr(), layout) };
+            let r = region;
             let view = r.aggregate();
             while !reader_stop.load(Ordering::Acquire) {
                 let _ = view.get(fingerprint, key_hash.0, bucket);
@@ -631,7 +594,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
     assert_eq!(cell.count, TOTAL);
 }
 
-// -- 8. Decide() + leader apply running concurrently -----------------------
+// -- 7. Decide() + leader apply running concurrently -----------------------
 
 #[test]
 fn decide_and_leader_apply_concurrent() {
@@ -653,13 +616,10 @@ fn decide_and_leader_apply_concurrent() {
     // Worker thread runs the access path (decide()) repeatedly. This
     // exercises every read-side unsafe accessor as well as queue push and
     // aggregate seqlock retries when the writer races us.
-    let worker_zone = zone.clone();
     let worker_rules = rules.clone();
     let worker_stop = stop.clone();
     let worker = thread::spawn(move || {
-        // SAFETY: zone outlives the worker; access path only touches
-        // atomics + stack ArrayVec.
-        let r = unsafe { ShmRegion::from_initialized(worker_zone.as_ptr(), layout) };
+        let r = region;
         let vars = MockVars {
             tenant: b"alice".to_vec(),
         };
@@ -678,12 +638,10 @@ fn decide_and_leader_apply_concurrent() {
     });
 
     // Leader thread continuously applies deltas until the worker stops.
-    let leader_zone = zone.clone();
     let leader_stop = stop.clone();
     let leader_rules = rules.clone();
     let leader = thread::spawn(move || {
-        // SAFETY: zone outlives the leader; sole writer for the store.
-        let r = unsafe { ShmRegion::from_initialized(leader_zone.as_ptr(), layout) };
+        let r = region;
         let store =
             unsafe { ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity) };
         let descriptors = [gabion::rules::Descriptor {
@@ -768,14 +726,10 @@ fn decide_all_multi_rule_concurrent() {
     ];
     let rules = Arc::new(CompiledRules::compile(&rule_configs).expect("compile two rules"));
     let stop = Arc::new(AtomicBool::new(false));
-
-    let worker_zone = zone.clone();
     let worker_rules = rules.clone();
     let worker_stop = stop.clone();
     let worker = thread::spawn(move || {
-        // SAFETY: zone outlives the worker; access path only touches
-        // atomics + stack ArrayVec.
-        let r = unsafe { ShmRegion::from_initialized(worker_zone.as_ptr(), layout) };
+        let r = region;
         let vars = MockVars {
             tenant: b"alice".to_vec(),
         };
@@ -792,13 +746,10 @@ fn decide_all_multi_rule_concurrent() {
         }
         worker_stop.store(true, Ordering::Release);
     });
-
-    let leader_zone = zone.clone();
     let leader_stop = stop.clone();
     let leader_rules = rules.clone();
     let leader = thread::spawn(move || {
-        // SAFETY: zone outlives the leader; sole writer for the store.
-        let r = unsafe { ShmRegion::from_initialized(leader_zone.as_ptr(), layout) };
+        let r = region;
         let store =
             unsafe { ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity) };
         let mut applied = 0_u32;
@@ -836,7 +787,7 @@ fn decide_all_multi_rule_concurrent() {
     }
 }
 
-// -- 9. Concurrent lease contention: only one winner among many threads ---
+// -- 8. Concurrent lease contention: only one winner among many threads ---
 
 #[test]
 fn lease_concurrent_acquire_distinct_winners() {

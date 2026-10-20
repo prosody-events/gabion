@@ -20,7 +20,7 @@
 //! request that exercises the gabion module logs lines such as:
 //!
 //! ```text
-//! 2026/05/21 12:34:56 [info]  1#1: gabion_nginx::module: gabion: zone ready zone=requests bytes=1048576 queue=2048 aggregate=4096 reused=false
+//! 2026/05/21 12:34:56 [info]  1#1: gabion_nginx::module: gabion: zone ready zone=requests bytes=1048576 reused=false
 //! 2026/05/21 12:34:57 [info] 12#0: gabion_nginx::module: gabion: leader thread spawned worker_id=12
 //! 2026/05/21 12:34:58 [warn] 12#0: gabion_nginx::leader: peer discovery error error=connection refused
 //! 2026/05/21 12:35:00 [info] 13#0: gabion::gossip::runtime: peer accepted addr=10.0.0.5:7234

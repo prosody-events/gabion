@@ -90,10 +90,11 @@ pub struct ShmRegion {
 }
 
 // SAFETY: `ShmRegion` is two POD fields (`*mut u8` + `Copy` `Layout`). The
-// pointer addresses an `MAP_SHARED | MAP_ANONYMOUS` mapping that lives for the
-// lifetime of the nginx master and is therefore effectively `'static`. The
-// mapping is identical in every fork-child, so the raw pointer is meaningful
-// across processes/threads. Crucially, every byte inside the region is only
+// pointer addresses an nginx shared zone that the master maps before forking,
+// so it is identical in every fork-child and meaningful across
+// processes/threads. A worker's mapping lives until the worker exits; the
+// master frees a zone only after a reload drops it, which leaves workers'
+// mappings in place. Crucially, every byte inside the region is only
 // accessed through atomics or seqlock-protected slots defined on the contained
 // `#[repr(C)]` types (see `shm/header.rs`, `shm/lease.rs`, `shm/queue.rs`,
 // `shm/aggregate.rs`, `shm/stats.rs`). No code ever materialises a `&mut T`
@@ -111,21 +112,17 @@ impl ShmRegion {
     /// # Safety
     /// The caller must guarantee all of the following:
     /// * `base` is non-null and points at a fresh, writable mapping of at least
-    ///   `layout.total_bytes` bytes. In practice this is the `MAP_SHARED |
-    ///   MAP_ANONYMOUS` region the nginx master mmaps before any worker is
-    ///   forked.
-    /// * `base` is aligned at least to `CACHELINE` (64). `mmap` returns
-    ///   page-aligned memory, which satisfies the alignment requirements of
-    ///   every `#[repr(C)]` sub-structure stored in the region.
-    /// * `layout` is the value computed by `Layout::new` and is the same
-    ///   `Layout` that will later be passed to every `from_initialized` call in
-    ///   the fork-children. The offsets/sizes inside `layout` must therefore
+    ///   `layout.total_bytes` bytes. In practice this is a block of the nginx
+    ///   shared zone the master maps before any worker is forked.
+    /// * `base` is aligned at least to `CACHELINE` (64). The zone's slab
+    ///   allocator returns page-aligned blocks, which satisfies the alignment
+    ///   requirements of every `#[repr(C)]` sub-structure stored in the region.
+    /// * `layout` is the value computed by `Layout::new`, and its offsets/sizes
     ///   describe the actual mapping.
     /// * The caller has *exclusive* access to the mapping for the duration of
     ///   this call (i.e. no worker is reading or writing it yet), so the
     ///   subsequent `write_bytes` and `ptr::write`s cannot race.
-    /// * The mapping must outlive every worker that later reconstructs a
-    ///   `ShmRegion` from `base`.
+    /// * The mapping must outlive every copy of the returned `ShmRegion`.
     pub unsafe fn initialize(base: *mut u8, layout: Layout) -> Self {
         // SAFETY: The caller of this `unsafe fn` upholds the preconditions
         // above. Specifically:
@@ -170,24 +167,6 @@ impl ShmRegion {
             std::ptr::write(region.stats_ptr() as *mut Stats, Stats::default());
             region
         }
-    }
-
-    /// # Safety
-    /// The caller must guarantee all of the following:
-    /// * `base` points at the same mapping that was previously handed to
-    ///   `initialize` with this exact `layout` value (typically the mapping the
-    ///   nginx master mmaps before forking workers — every fork-child inherits
-    ///   the identical `base` value).
-    /// * `base` is at least cacheline-aligned (mmap returns page-aligned
-    ///   memory, which is sufficient for every `#[repr(C)]` sub-structure).
-    /// * The mapping must remain valid (not unmapped) for as long as any
-    ///   `ShmRegion` derived from it is in use. Since the master holds the
-    ///   mapping for its entire lifetime, this is automatic for workers.
-    /// * No other code is concurrently producing a `&mut T` to any region byte.
-    ///   All cross-process writers in this crate already go through atomic /
-    ///   seqlock APIs, so this is upheld by construction.
-    pub unsafe fn from_initialized(base: *mut u8, layout: Layout) -> Self {
-        Self { base, layout }
     }
 
     pub fn header(&self) -> &Header {
