@@ -28,8 +28,8 @@ pub fn derive_identity(seed_override: Option<&str>) -> NodeIdentity {
 }
 
 /// Stamp a new wall-clock-seconds incarnation. Called on leader takeover so
-/// peers see fresh `(node_id, incarnation)` for the new leader. Sub-second
-/// takeovers reuse the same incarnation — same caveat as the server.
+/// peers see fresh `(node_id, incarnation)` for the new leader; the caller
+/// steps past the previous incarnation for sub-second takeovers.
 pub fn fresh_incarnation() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -15,10 +15,9 @@ use ngx::core;
 use ngx::ffi::{
     NGX_CONF_1MORE, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET,
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF,
-    NGX_LOG_EMERG, ngx_add_timer, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t,
-    ngx_event_t, ngx_exiting, ngx_http_handler_pt, ngx_http_module_t,
-    ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t, ngx_module_t, ngx_msec_t, ngx_pcalloc,
-    ngx_pool_cleanup_add, ngx_str_t, ngx_uint_t,
+    NGX_LOG_EMERG, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_exiting,
+    ngx_http_handler_pt, ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t,
+    ngx_module_t, ngx_pool_cleanup_add, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
     self, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, MergeConfigError,
@@ -933,11 +932,8 @@ extern "C" fn set_zone(
         let identity = derive_identity(main.identity_seed.as_deref());
         region.header().identity.store_node_id(identity.node_id.0);
 
-        // Anchor the lease's clock at this moment. Without it, the
-        // try_acquire pack-and-compare path can't distinguish "active"
-        // from "expired" because raw clock millis can exceed the u40
-        // expiry bit budget. See shm::lease module docs.
-        region.lease().set_init_millis(now_millis());
+        // Anchor the lease clock before fork so every worker inherits it.
+        now_millis();
 
         SHM_PTR.store(mapped, Ordering::Release);
         SHM_LEN.store(total, Ordering::Release);
@@ -2050,9 +2046,9 @@ impl BindingCompiler for NgxBindingCompiler {
 
 /// nginx `init_process` hook. Invoked once per worker process immediately
 /// after fork, before the worker enters its event loop. nginx guarantees the
-/// `cycle` argument points to a valid `ngx_cycle_t` whose pool and log live
-/// until the worker exits.
-unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
+/// `cycle` argument points to a valid `ngx_cycle_t` for the duration of the
+/// call; we do not dereference it here.
+unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
     // Workers inherit the global tracing dispatch via fork; re-install is
     // idempotent and covers any path that bypassed `preconfiguration`.
     log::install();
@@ -2064,9 +2060,6 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         return core::Status::NGX_OK.into();
     };
 
-    // Every worker runs a leader thread; the SHM lease decides which one
-    // drives gossip, and the others stand by to take over (for example
-    // from an old-generation worker exiting after a reload).
     let worker_id = std::process::id();
     let rng_seed = match globals.rng_seed {
         Some(seed) => seed,
@@ -2097,7 +2090,6 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         discovery: globals.discovery.clone(),
         cell_store: globals.storage.cell_store_config(),
         rng_seed,
-        admin_bind: None,
         max_inflight: leader::DEFAULT_MAX_INFLIGHT,
         drain_tick: leader::DEFAULT_DRAIN_TICK,
         lease_tick: leader::DEFAULT_LEASE_TICK,
@@ -2108,14 +2100,8 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     let handle = match leader::spawn(globals.region, globals.rules.clone(), cfg) {
         Ok(h) => h,
         Err(error) => {
-            // OS refused the spawn (OOM, RLIMIT_NPROC, EAGAIN under fork
-            // pressure). A panic here would unwind into nginx's
-            // `init_process` C frame and is UB. Log and degrade
-            // gracefully — the worker stays up handling requests
-            // against the shared SHM aggregate, and any other worker
-            // can still lead. If every spawn is failing, the operator
-            // needs to raise their thread budget (`ulimit -u`) or
-            // investigate the host's memory.
+            // Panicking here would unwind into nginx's C frame, so log and
+            // leave the worker up without a leader thread.
             tracing::error!(
                 worker_id,
                 %error,
@@ -2133,69 +2119,38 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     if let Ok(mut slot) = LEADER_THREAD.lock() {
         *slot = Some(handle);
     }
-    // SAFETY: `cycle` is the live cycle nginx passed to `init_process`, and
-    // this hook runs on the worker's event thread before its event loop.
-    unsafe { watch_for_shutdown(cycle) };
+    watch_for_shutdown();
     tracing::info!(worker_id, "gabion: leader thread spawned");
     core::Status::NGX_OK.into()
 }
 
 /// How often a worker checks whether nginx has begun shutting it down.
-const SHUTDOWN_POLL: ngx_msec_t = leader::DEFAULT_LEASE_TICK.as_millis() as ngx_msec_t;
+const SHUTDOWN_POLL: Duration = leader::DEFAULT_LEASE_TICK;
 
-/// Arm a timer that tells this worker's leader thread to stop as soon as a
-/// graceful shutdown begins (`nginx -s quit`, or the old generation on
-/// reload). Without it the thread keeps leading, or keeps campaigning and
-/// can win the lease ahead of a worker that's staying up, until the worker
-/// exits, which can take until `worker_shutdown_timeout` while connections
-/// drain.
+/// Tell this worker's leader thread to stop as soon as a graceful shutdown
+/// begins (`nginx -s quit`, or the old generation on reload). Without it
+/// the thread keeps leading, or keeps campaigning and can win the lease
+/// ahead of a worker that's staying up, until the worker exits, which can
+/// take until `worker_shutdown_timeout` while connections drain.
 ///
-/// # Safety
-///
-/// `cycle` must be the live cycle nginx passed to `init_process`, and the
-/// caller must be on the worker's event thread.
-unsafe fn watch_for_shutdown(cycle: *mut ngx_cycle_t) {
-    // SAFETY: the caller guarantees `cycle` is live; its pool outlives the
-    // worker's event loop, so the event stays valid while it's armed.
-    let ev = unsafe { ngx_pcalloc((*cycle).pool, size_of::<ngx_event_t>()) }.cast::<ngx_event_t>();
-    if ev.is_null() {
-        tracing::warn!(
-            "gabion: couldn't allocate the shutdown timer, so on a graceful shutdown this worker \
-             keeps campaigning for the leader lease until it exits. Gossip still runs, but after \
-             a reload it may hand off once more before reaching a new worker. The worker's memory \
-             pool is exhausted; check the host's memory.",
-        );
-        return;
-    }
-    // SAFETY: `ev` is a zeroed, pool-owned `ngx_event_t` that nothing else
-    // references, and the caller is on the event thread that owns the timer
-    // tree. `data` mirrors nginx's own shutdown timer, which also points it
-    // at the cycle.
-    unsafe {
-        (*ev).handler = Some(gabion_shutdown_poll);
-        (*ev).data = cycle.cast();
-        (*ev).log = (*cycle).log;
-        // A cancelable timer doesn't hold up an exiting worker.
-        (*ev).set_cancelable(1);
-        ngx_add_timer(ev, SHUTDOWN_POLL);
-    }
-}
-
-/// Timer handler armed by [`watch_for_shutdown`].
-unsafe extern "C" fn gabion_shutdown_poll(ev: *mut ngx_event_t) {
-    // SAFETY: nginx calls timer handlers on the worker's event thread, the
-    // only thread that writes `ngx_exiting`, with the `ev` it was armed with.
-    unsafe {
-        if ngx_exiting == 0 {
-            ngx_add_timer(ev, SHUTDOWN_POLL);
-            return;
+/// Must be called on the worker's event thread (`init_process`). nginx has
+/// no shutdown hook, so this polls `ngx_exiting` on a cancelable timer,
+/// which never holds up an exiting worker.
+fn watch_for_shutdown() {
+    ngx::async_::spawn(async {
+        // SAFETY: the task only runs on the worker's event thread, the only
+        // thread that writes `ngx_exiting`; this is a plain by-value read.
+        while unsafe { ngx_exiting } == 0 {
+            ngx::async_::sleep(SHUTDOWN_POLL).await;
         }
-    }
-    if let Ok(slot) = LEADER_THREAD.lock()
-        && let Some(handle) = slot.as_ref()
-    {
-        handle.request_stop();
-    }
+        if let Ok(slot) = LEADER_THREAD.lock()
+            && let Some(handle) = slot.as_ref()
+        {
+            tracing::info!("gabion: worker is shutting down; stopping its leader thread");
+            handle.request_stop();
+        }
+    })
+    .detach();
 }
 
 /// nginx `exit_process` hook. Invoked once per worker process when nginx is

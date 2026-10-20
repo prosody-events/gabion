@@ -18,6 +18,10 @@
 //! and tokio are not invoked — we manufacture `DeltaSink<u32>` /
 //! `ExpirationSink<u32>` rows directly and feed them through
 //! `AggregateStore::apply`.
+//!
+//! Exempt: `module.rs`'s `watch_for_shutdown` reads nginx's `ngx_exiting`
+//! global, which Miri can't model. The read is by value, on the worker's
+//! event thread, which is the only thread that writes it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -858,12 +862,4 @@ fn lease_concurrent_acquire_distinct_winners() {
     }
     let winners = winners.lock().unwrap();
     assert_eq!(winners.len(), 1, "expected exactly one lease winner");
-}
-
-// -- Lease clock -----------------------------------------------------------
-
-#[test]
-fn lease_clock_reads_monotonic_time() {
-    let first = gabion_nginx::shm::lease::now_millis();
-    assert!(gabion_nginx::shm::lease::now_millis() >= first);
 }

@@ -80,9 +80,7 @@ fn leaked_region() -> ShmRegion {
     // fresh, writable, 8-byte-aligned allocation of at least
     // `layout.total_bytes`, `initialize` is its first user, and the leak
     // keeps it alive for every thread that reads the region.
-    let region = unsafe { ShmRegion::initialize(words.as_mut_ptr().cast(), layout) };
-    region.lease().set_init_millis(now_millis());
-    region
+    unsafe { ShmRegion::initialize(words.as_mut_ptr().cast(), layout) }
 }
 
 fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
@@ -135,17 +133,6 @@ fn stop_within_deadline(handle: LeaderHandle) {
 
 #[test]
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
-fn stopping_the_leader_ends_its_thread_and_releases_the_lease() {
-    let region = leaked_region();
-    let leader = spawn_worker(region, 1);
-    wait_for_owner(region, 1);
-
-    stop_within_deadline(leader);
-    assert_eq!(region.lease().snapshot().owner_worker, 0);
-}
-
-#[test]
-#[cfg_attr(miri, ignore = "binds a UDP socket")]
 fn stopping_a_follower_leaves_the_leader_in_place() {
     let region = leaked_region();
     let leader = spawn_worker(region, 1);
@@ -160,16 +147,19 @@ fn stopping_a_follower_leaves_the_leader_in_place() {
 
 #[test]
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
-fn a_follower_takes_over_when_the_leader_stops() {
+fn stopping_the_leader_releases_the_lease_to_a_follower() {
     let region = leaked_region();
     let leader = spawn_worker(region, 1);
     wait_for_owner(region, 1);
     let follower = spawn_worker(region, 2);
     std::thread::sleep(LEASE_TICK * 10);
     assert_eq!(region.lease().snapshot().owner_worker, 1);
-
-    stop_within_deadline(leader);
     let leader_incarnation = region.header().identity.load_incarnation();
+
+    // The leader releases the lease on its way out, so the follower takes
+    // over within a tick rather than after the TTL.
+    stop_within_deadline(leader);
+    assert_ne!(region.lease().snapshot().owner_worker, 1);
     wait_for_owner(region, 2);
     stop_within_deadline(follower);
     // The takeover lands within the same second, so a seconds-based

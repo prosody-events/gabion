@@ -692,19 +692,19 @@ matching nginx directives are listed under
 ### Verifying convergence
 
 There are two things worth checking after a deploy. The first is the
-process logs: each worker logs the gossip bind, its node identity,
-and the discovered-peer count. A line that reads
+process logs: each worker logs the gossip bind, its node identity, and
+the discovered-peer count. A line that reads
 `gabion: worker did not win leader lease` means you are looking at a
-follower, which is expected because only one worker drives gossip
-per node; the worker that does logs `gabion: worker won leader
-lease`. Followers keep campaigning for the lease. A worker stops
-leading and campaigning as soon as nginx starts shutting it down
-gracefully (`nginx -s quit`, or the old generation on a reload), even
-while it drains connections, so a worker that's staying up takes over
-gossip within about a lease tick (300ms). After a crash, takeover
-waits for the lease TTL (1s) to run out. The absence of any
-peer-discovery logs at all means the discovery filter doesn't match
-anything. The second check is the counter delta under load: send traffic to one replica and watch the
+follower, which is expected because only one worker drives gossip per
+node; the worker that does logs `gabion: worker won leader lease`.
+Followers keep campaigning for the lease. A worker stops leading and
+campaigning as soon as nginx starts shutting it down gracefully
+(`nginx -s quit`, or the old generation on a reload), even while it
+drains connections, so a worker that's staying up takes over gossip
+within about 600ms. After a crash, takeover waits for the lease TTL
+(1s) to run out. The absence of any peer-discovery logs at all means
+the discovery filter doesn't match anything. The second check is the
+counter delta under load: send traffic to one replica and watch the
 counters on every other replica rise within a tick or two. If they
 don't, the gossip channel is partitioned — typical causes are a UDP
 firewall, a cluster-id mismatch, or `gabion_gossip_bind` being
@@ -758,8 +758,8 @@ gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a 
 | Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`      | A client crossed a rule's limit.                                                                                                                    | Expected. `Retry-After` says how long to back off; the rule with the longest window owns the header.                             |
 | `400 Bad Request` from gabion                                                 | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits (`512` by default).                  | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
 | SHM `matched_rule_overflows` counter rising                                   | A location stacked more rules than `STORAGE_MAX_MATCHED_RULES` permits (`16`). **The request was allowed** (allow-by-default); the count under-counts. *No log line — observed only via the SHM stats snapshot.* | Reduce the number of rules applied at this location, or split the location.                                                      |
-| `gabion: this worker stopped leading gossip` (error) in the error log         | The leader's gossip / drain / lease / admin task failed or panicked. The worker released the lease and campaigns again after `retry_in` (doubling, up to 30s); another worker may take over first. Admission keeps running against the shared aggregate. | Read the `error` field. A bind error means `gabion_gossip_bind` is already in use; a lost lease means the worker was starved long enough to miss its renewals. |
-| `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside the gossip tasks, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
+| `gabion: this worker stopped leading gossip` (error) in the error log         | The leader's gossip runtime or queue drain failed or panicked, or it lost the lease. The worker released the lease and campaigns again after `retry_in` (doubling, up to 30s); another worker may take over first. Admission keeps running against the shared aggregate. | Read the `error` field. A bind error means `gabion_gossip_bind` is already in use; a lost lease means the worker was starved long enough to miss its renewals. |
+| `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside a leadership term, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
 | `peer discovery error` (warn) in the error log                                | The Kubernetes discovery stream returned an error this tick. Membership is stale until the next successful tick.                                    | Usually transient (apiserver flap, transient watch reset). If persistent, check pod RBAC / network reachability to the API.      |
 | `gabion: failed to draw gossip RNG seed` (error) in the error log             | `getrandom` failed at worker startup. This worker keeps serving requests but never drives gossip; another worker can still lead.                              | Inspect the wrapped `error` field. Usually a sandboxed environment denying `/dev/urandom`; either lift the restriction or supply `gabion_runtime_rng_seed N` to bypass the entropy draw. |
 
