@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::num::NonZeroU128;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2676,25 +2677,19 @@ async fn error_bound_holds_under_load() {
 
 #[test]
 fn parse_cluster_id_accepts_decimal_and_prefixed_hex() {
-    assert_eq!(
-        parse_cluster_id("32201612552594806"),
-        Ok(32_201_612_552_594_806)
-    );
-    assert_eq!(parse_cluster_id("0xc0ffee"), Ok(0x00c0_ffee));
-    assert_eq!(parse_cluster_id("0XC0FFEE"), Ok(0x00c0_ffee));
-    assert_eq!(parse_cluster_id(" 1 "), Ok(1));
-    assert_eq!(
-        parse_cluster_id("0xffffffffffffffffffffffffffffffff"),
-        Ok(u128::MAX)
-    );
+    let parse = |value| parse_cluster_id(value).map(NonZeroU128::get);
+    assert_eq!(parse("32201612552594806"), Some(32_201_612_552_594_806));
+    assert_eq!(parse("0xc0ffee"), Some(0x00c0_ffee));
+    assert_eq!(parse("0XC0FFEE"), Some(0x00c0_ffee));
+    assert_eq!(parse(" 1 "), Some(1));
+    assert_eq!(parse("0xffffffffffffffffffffffffffffffff"), Some(u128::MAX));
 }
 
 #[test]
-fn parse_cluster_id_rejects_unprefixed_hex_and_garbage() {
-    for value in ["c0ffee", "0x", "", "-1", "0xg1", "1e3"] {
-        assert!(
-            parse_cluster_id(value).is_err(),
-            "{value:?} should not parse"
-        );
+fn parse_cluster_id_rejects_zero_signs_unprefixed_hex_and_garbage() {
+    for value in [
+        "0", "0x0", "+1", "0x+1", "-1", "c0ffee", "0x", "", "0xg1", "1e3",
+    ] {
+        assert_eq!(parse_cluster_id(value), None, "{value:?} should not parse");
     }
 }

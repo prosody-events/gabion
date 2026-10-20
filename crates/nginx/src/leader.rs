@@ -10,7 +10,7 @@
 //! task on a `LocalSet` that polls the gossip runtime and the queue drain
 //! in one `select!`, sharing plain `Rc<...>` handles.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,11 +52,16 @@ pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(1);
 /// starts over once a leader has run at least this long.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
+/// Where a lone node's gossip runtime binds when `gabion_gossip_bind` is unset.
+const LONE_NODE_BIND: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+
 /// Configuration the leader thread needs to bring up its tokio runtime.
 #[derive(Clone, Debug)]
 pub struct LeaderConfig {
     pub worker_id: u32,
-    pub gossip_bind: SocketAddr,
+    /// `None` runs this node alone: the leader still folds its hits into
+    /// the shared counts, but nothing can reach it to gossip.
+    pub gossip_bind: Option<SocketAddr>,
     pub gossip: GossipSettings,
     pub discovery: DiscoveryConfig,
     pub cell_store: CellStoreConfig,
@@ -71,7 +76,7 @@ impl Default for LeaderConfig {
     fn default() -> Self {
         Self {
             worker_id: 0,
-            gossip_bind: "0.0.0.0:0".parse().expect("ipv4"),
+            gossip_bind: None,
             gossip: GossipSettings::default(),
             discovery: DiscoveryConfig::default(),
             cell_store: production_cell_store_config(),
@@ -363,8 +368,15 @@ async fn leader_main(
         .clone()
         .into_runtime_config(identity, config.rng_seed);
 
+    // A lone node still needs a socket for the runtime; an ephemeral
+    // loopback port can't collide with another nginx on the same host, and
+    // there is no one to discover.
+    let (bind, peers) = match config.gossip_bind {
+        Some(bind) => (bind, discovery_stream(config.discovery).left_stream()),
+        None => (LONE_NODE_BIND, futures::stream::empty().right_stream()),
+    };
     let (gossip_rt, gossip_client) =
-        GossipRuntime::bind(config.gossip_bind, gossip_cfg, cell_store, store.clone())
+        GossipRuntime::bind(bind, gossip_cfg, cell_store, store.clone())
             .await
             .context("bind gossip runtime")?;
     let drain = drain_loop(
@@ -378,7 +390,7 @@ async fn leader_main(
 
     tokio::select! {
         _ = stopped.wait_for(|stop| *stop) => Ok(()),
-        result = gossip_rt.run(discovery_stream(config.discovery)) => Err(match result {
+        result = gossip_rt.run(peers) => Err(match result {
             Ok(()) => anyhow::anyhow!("the gossip runtime exited without being asked to"),
             Err(error) => anyhow::Error::new(error).context("the gossip runtime failed"),
         }),

@@ -199,22 +199,15 @@ impl http::HttpModule for Module {
         // pool, so each config keeps its own compiled rules: workers forked
         // from it read them, and a reload compiles fresh ones.
         if let Some(main) = Module::main_conf_mut(&*cf)
-            && main.layout.is_some()
             && !main.rules.is_empty()
         {
-            // Workers only queue their hits; the gossip leader folds them
-            // into the shared counts, and `gabion_init_process` starts it
-            // only with a gossip socket. Without one, every rule would
-            // silently admit everything.
-            if main.gossip_bind.is_none() {
+            if main.layout.is_none() {
                 ngx::ngx_conf_log_error!(
                     NGX_LOG_EMERG,
                     cf,
-                    "gabion: rules are declared but `gabion_gossip_bind` is not set, so no \
-                     request would ever be counted or limited. Workers hand their hits to the \
-                     gossip leader, which runs only with a gossip socket, even on a single node. \
-                     Add `gabion_gossip_bind 127.0.0.1:9000;` to the http {{}} block for one \
-                     node, or `0.0.0.0:9000` to share counts across replicas."
+                    "gabion: rules are declared but `gabion_limit_zone` is not set, so no request \
+                     would ever be counted or limited: the zone is the shared memory that holds \
+                     the counts. Add `gabion_limit_zone zone=gabion:64m;` to the http {{}} block."
                 );
                 return core::Status::NGX_ERROR.into();
             }
@@ -1458,11 +1451,8 @@ extern "C" fn set_gossip_cluster(
         conf,
         "expected a non-zero 128-bit cluster identifier shared by every peer, in decimal or \
          `0x`-prefixed hex (e.g. `1`, `0xc0ffee`)",
-        |v| match gabion::gossip::parse_cluster_id(v) {
-            Ok(0) | Err(_) => None,
-            Ok(cluster) => Some(cluster),
-        },
-        |main, cluster| main.gossip.cluster_id_hash = cluster,
+        gabion::gossip::parse_cluster_id,
+        |main, cluster| main.gossip.cluster_id_hash = cluster.get(),
     )
 }
 
@@ -2064,7 +2054,7 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     let Some(main) = Module::main_conf(unsafe { &*cycle }) else {
         return core::Status::NGX_OK.into();
     };
-    let (Some((region, rules)), Some(gossip_bind)) = (main.active(), main.gossip_bind) else {
+    let Some((region, rules)) = main.active() else {
         return core::Status::NGX_OK.into();
     };
 
@@ -2093,7 +2083,7 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
 
     let cfg = LeaderConfig {
         worker_id,
-        gossip_bind,
+        gossip_bind: main.gossip_bind,
         gossip: main.gossip.clone(),
         discovery: main.discovery.clone(),
         cell_store: main.storage.cell_store_config(),

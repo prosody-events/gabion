@@ -15,6 +15,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU128;
 use std::time::Duration;
 
 use crate::crdt::{CellStoreStats, NodeId, NodeIdentity};
@@ -109,16 +110,23 @@ impl Default for GossipConfig {
 
 /// Parse a cluster identifier as both adapters' configs spell it: decimal
 /// (`12345`) or `0x`-prefixed hex (`0xc0ffee`), ignoring surrounding
-/// whitespace.
-pub fn parse_cluster_id(value: &str) -> Result<u128, std::num::ParseIntError> {
+/// whitespace. `None` for anything else, including `0`.
+pub fn parse_cluster_id(value: &str) -> Option<NonZeroU128> {
     let value = value.trim();
-    match value
+    let (digits, radix) = match value
         .strip_prefix("0x")
         .or_else(|| value.strip_prefix("0X"))
     {
-        Some(hex) => u128::from_str_radix(hex, 16),
-        None => value.parse(),
+        Some(hex) => (hex, 16),
+        None => (value, 10),
+    };
+    // `from_str_radix` also takes a leading `+`; an id is digits only.
+    if !digits.starts_with(|c: char| c.is_digit(radix)) {
+        return None;
     }
+    u128::from_str_radix(digits, radix)
+        .ok()
+        .and_then(NonZeroU128::new)
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -363,6 +363,22 @@ fn cluster_id_hash_accepts_integer_decimal_and_hex_strings() {
 }
 
 #[test]
+fn cluster_id_hash_rejects_zero() {
+    // nginx's `gabion_gossip_cluster` refuses `0`, so gabiond must too or
+    // the two adapters could never be configured into one cluster.
+    let _env = EnvGuard::lock();
+    for yaml in [
+        "gossip:\n  cluster_id_hash: 0\n",
+        "gossip:\n  cluster_id_hash: \"0x0\"\n",
+    ] {
+        assert!(
+            AppConfig::load_with_yaml_str(yaml).is_err(),
+            "{yaml:?} should be rejected"
+        );
+    }
+}
+
+#[test]
 fn cluster_id_hash_from_env_var() {
     // The env layer always presents the value as a String. The
     // u128_any deserializer's visit_str branch is what the env path
