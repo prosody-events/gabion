@@ -343,7 +343,7 @@ pub struct RuntimeTuningConfig {
 /// `visit_u128`, so a bare `cluster_id_hash: 1` in YAML panics at boot
 /// with "u128 is not supported for key 'gossip.cluster_id_hash'".
 ///
-/// This visitor accepts:
+/// This visitor accepts any non-zero id, matching `gabion_gossip_cluster`:
 ///   - YAML integers (`cluster_id_hash: 12345`)
 ///   - decimal strings (`cluster_id_hash: "12345"`)
 ///   - `0x`-prefixed hex strings (`cluster_id_hash: "0xdeadbeef"`)
@@ -352,6 +352,7 @@ pub struct RuntimeTuningConfig {
 /// Used only by [`GossipSettings::cluster_id_hash`].
 mod u128_any {
     use std::fmt;
+    use std::num::NonZeroU128;
 
     use serde::de::{self, Deserializer, Visitor};
 
@@ -365,34 +366,31 @@ mod u128_any {
             type Value = u128;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(
-                    "a non-negative integer, a decimal string, or a `0x`-prefixed hex string",
-                )
+                f.write_str("a non-zero integer, a decimal string, or a `0x`-prefixed hex string")
             }
 
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<u128, E> {
-                Ok(u128::from(v))
+                self.visit_u128(u128::from(v))
             }
 
             fn visit_u128<E: de::Error>(self, v: u128) -> Result<u128, E> {
+                if v == 0 {
+                    return Err(de::Error::invalid_value(de::Unexpected::Unsigned(0), &self));
+                }
                 Ok(v)
             }
 
             fn visit_i64<E: de::Error>(self, v: i64) -> Result<u128, E> {
-                u128::try_from(v).map_err(|_| {
-                    de::Error::invalid_value(de::Unexpected::Signed(v), &"a non-negative integer")
-                })
+                match u128::try_from(v) {
+                    Ok(v) => self.visit_u128(v),
+                    Err(_) => Err(de::Error::invalid_value(de::Unexpected::Signed(v), &self)),
+                }
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<u128, E> {
-                let trimmed = v.trim();
-                if let Some(hex) = trimmed
-                    .strip_prefix("0x")
-                    .or_else(|| trimmed.strip_prefix("0X"))
-                {
-                    return u128::from_str_radix(hex, 16).map_err(de::Error::custom);
-                }
-                trimmed.parse::<u128>().map_err(de::Error::custom)
+                gabion::gossip::parse_cluster_id(v)
+                    .map(NonZeroU128::get)
+                    .ok_or_else(|| de::Error::invalid_value(de::Unexpected::Str(v), &self))
             }
 
             fn visit_string<E: de::Error>(self, v: String) -> Result<u128, E> {

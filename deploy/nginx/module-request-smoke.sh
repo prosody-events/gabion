@@ -14,6 +14,28 @@ else
 fi
 
 nginx -t -c "$SHIM_CONF"
+
+# `scratch_conf <http-body>` writes a config that loads the module and
+# wraps `<http-body>` in an http {} block, and prints its path.
+scratch_conf() {
+    conf="$(mktemp)"
+    {
+        grep '^load_module' "$SHIM_CONF"
+        printf 'pid %s.pid;\nerror_log /dev/stderr info;\nevents {}\nhttp {\n%s\n}\n' "$conf" "$1"
+    } >"$conf"
+    printf '%s\n' "$conf"
+}
+
+# Rules without a zone have nowhere to count, so `nginx -t` must refuse
+# them rather than start a limiter that admits everything.
+nozone_conf="$(scratch_conf 'gabion_limit_rule per_ip $remote_addr rate=1r/m;')"
+if nozone_out="$(nginx -t -c "$nozone_conf" 2>&1)"; then
+    echo "nginx -t accepted rules without gabion_limit_zone:"
+    printf '%s\n' "$nozone_out"
+    exit 1
+fi
+printf '%s\n' "$nozone_out" | grep -F 'rules are declared but `gabion_limit_zone` is not set'
+
 rendered="$(nginx -T -c "$SHIM_CONF" 2>&1)"
 
 # Module loads and core directives are present at the expected level.
@@ -32,7 +54,7 @@ printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule baseline_rule      $uri  
 printf '%s\n' "$rendered" | grep -F 'gabion_limit baseline_rule;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule window_demo       demo:$arg_demo     rate=2r/m window=2m bucket=30s;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_bind 0.0.0.0:9000;'
-printf '%s\n' "$rendered" | grep -F 'gabion_gossip_cluster 1;'
+printf '%s\n' "$rendered" | grep -F 'gabion_gossip_cluster 0xc0ffee;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_fanout 8;'
 printf '%s\n' "$rendered" | grep -F 'gabion off;'
 
@@ -220,3 +242,27 @@ assert_header_present "$dryrun_h" 'X-RateLimit-Reset'
 assert_header_absent  "$dryrun_h" 'Retry-After'
 
 nginx -c "$SHIM_CONF" -s quit
+
+# A lone node with no `gabion_gossip_bind` still counts: its leader binds
+# an ephemeral loopback port and folds hits into the shared counts. At
+# 1r/m the second counted request is rejected once the leader has drained
+# the first.
+lone_conf="$(scratch_conf '
+    gabion_limit_zone zone=lone:8m;
+    gabion_limit_rule lone $remote_addr rate=1r/m;
+    server {
+        listen 8081;
+        location / {
+            gabion_limit lone;
+            alias /usr/share/nginx/html/;
+        }
+    }')"
+nginx -c "$lone_conf"
+lone_status=
+for _ in $(seq 1 20); do
+    lone_status="$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/index.html)"
+    test "$lone_status" = 429 && break
+    sleep 0.5
+done
+test "$lone_status" = 429 || { echo "lone node never limited: last status $lone_status"; exit 1; }
+nginx -c "$lone_conf" -s quit

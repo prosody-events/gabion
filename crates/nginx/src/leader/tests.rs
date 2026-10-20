@@ -100,7 +100,7 @@ fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
     .expect("rules");
     let config = LeaderConfig {
         worker_id,
-        gossip_bind: "127.0.0.1:0".parse().expect("addr"),
+        gossip_bind: Some("127.0.0.1:0".parse().expect("addr")),
         lease_tick: LEASE_TICK,
         ..LeaderConfig::default()
     };

@@ -199,9 +199,18 @@ impl http::HttpModule for Module {
         // pool, so each config keeps its own compiled rules: workers forked
         // from it read them, and a reload compiles fresh ones.
         if let Some(main) = Module::main_conf_mut(&*cf)
-            && main.layout.is_some()
             && !main.rules.is_empty()
         {
+            if main.layout.is_none() {
+                ngx::ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    cf,
+                    "gabion: rules are declared but `gabion_limit_zone` is not set, so no request \
+                     would ever be counted or limited: the zone is the shared memory that holds \
+                     the counts. Add `gabion_limit_zone zone=gabion:64m;` to the http {{}} block."
+                );
+                return core::Status::NGX_ERROR.into();
+            }
             let mut compiler = NgxBindingCompiler { cf };
             match CompiledRules::compile_with(&main.rules, main.cardinality, &mut compiler) {
                 Ok(rules) => main.compiled = Some(Arc::new(rules)),
@@ -1440,13 +1449,10 @@ extern "C" fn set_gossip_cluster(
     set_scalar(
         cf,
         conf,
-        "expected a non-zero 128-bit cluster identifier shared by every peer (e.g. `1`, any u128 \
-         literal)",
-        |v| match v.parse::<u128>() {
-            Ok(0) | Err(_) => None,
-            Ok(cluster) => Some(cluster),
-        },
-        |main, cluster| main.gossip.cluster_id_hash = cluster,
+        "expected a non-zero 128-bit cluster identifier shared by every peer, in decimal or \
+         `0x`-prefixed hex (e.g. `1`, `0xc0ffee`)",
+        gabion::gossip::parse_cluster_id,
+        |main, cluster| main.gossip.cluster_id_hash = cluster.get(),
     )
 }
 
@@ -2048,7 +2054,7 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     let Some(main) = Module::main_conf(unsafe { &*cycle }) else {
         return core::Status::NGX_OK.into();
     };
-    let (Some((region, rules)), Some(gossip_bind)) = (main.active(), main.gossip_bind) else {
+    let Some((region, rules)) = main.active() else {
         return core::Status::NGX_OK.into();
     };
 
@@ -2077,7 +2083,7 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
 
     let cfg = LeaderConfig {
         worker_id,
-        gossip_bind,
+        gossip_bind: main.gossip_bind,
         gossip: main.gossip.clone(),
         discovery: main.discovery.clone(),
         cell_store: main.storage.cell_store_config(),
