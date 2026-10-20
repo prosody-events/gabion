@@ -167,3 +167,55 @@ fn mpsc_concurrent_producers() {
     assert_eq!(total_pushed, (PRODUCERS * PER_PRODUCER) as u64);
     assert_eq!(seen, total_pushed);
 }
+
+#[test]
+fn overlapping_consumers_each_take_distinct_events() {
+    #[cfg(not(miri))]
+    const TOTAL: usize = 4096;
+    #[cfg(miri)]
+    const TOTAL: usize = 64;
+    const CAPACITY: usize = 16;
+    // Consumers that collide wedge the ring, so fail rather than hang.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let wedged = move || assert!(std::time::Instant::now() < deadline, "queue wedged");
+
+    let (control, slots) = build(CAPACITY);
+    let popped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let consumers: Vec<_> = (0..2)
+        .map(|_| {
+            let (control, slots, popped) = (control.clone(), slots.clone(), popped.clone());
+            thread::spawn(move || {
+                let queue = RequestQueue::from_parts(&control, &slots);
+                let mut keys = Vec::new();
+                while popped.load(Ordering::Relaxed) < TOTAL {
+                    match queue.pop() {
+                        Some(ev) => {
+                            keys.push(ev.key_hash);
+                            popped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        None => wedged(),
+                    }
+                }
+                keys
+            })
+        })
+        .collect();
+
+    let queue = RequestQueue::from_parts(&control, &slots);
+    for i in 0..TOTAL {
+        let ev = QueueEvent {
+            key_hash: i as u128,
+            ..event(0)
+        };
+        while queue.push(ev).is_err() {
+            wedged();
+        }
+    }
+
+    let mut keys: Vec<u128> = consumers
+        .into_iter()
+        .flat_map(|consumer| consumer.join().unwrap())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, (0..TOTAL as u128).collect::<Vec<_>>());
+}

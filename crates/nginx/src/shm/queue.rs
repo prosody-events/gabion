@@ -1,10 +1,11 @@
-//! Multi-producer single-consumer ring buffer laid out in shared memory.
+//! Multi-producer ring buffer laid out in shared memory.
 //!
-//! Workers push request events concurrently; the leader's drain task is the
-//! sole consumer. Implementation follows the classic Vyukov bounded MPMC
-//! design — each slot carries a sequence counter that doubles as occupancy
-//! and ordering. Capacity is a power of two so the modulo collapses to a
-//! mask.
+//! Workers push request events concurrently; the leader's drain task
+//! normally consumes alone, but a stalled leader can briefly overlap its
+//! successor, so both ends claim slots by CAS. Implementation follows the
+//! classic Vyukov bounded MPMC design — each slot carries a sequence counter
+//! that doubles as occupancy and ordering. Capacity is a power of two so the
+//! modulo collapses to a mask.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -142,25 +143,32 @@ impl<'a> RequestQueue<'a> {
         }
     }
 
-    /// Consumer entry point. Single-consumer: no CAS on `dequeue_pos`
-    /// because no other thread mutates it.
+    /// Consumer entry point. Each event goes to exactly one caller, even
+    /// when two leaders briefly overlap.
     pub fn pop(&self) -> Option<QueueEvent> {
         let mask = self.control.capacity_mask.load(Ordering::Relaxed);
         let capacity = self.slots.len() as u64;
-        let pos = self.control.dequeue_pos.load(Ordering::Relaxed);
-        let slot = &self.slots[(pos & mask) as usize];
-        let seq = slot.seq.load(Ordering::Acquire);
-        let diff = (seq as i64).wrapping_sub((pos + 1) as i64);
-        if diff < 0 {
-            return None;
+        loop {
+            let pos = self.control.dequeue_pos.load(Ordering::Relaxed);
+            let slot = &self.slots[(pos & mask) as usize];
+            let seq = slot.seq.load(Ordering::Acquire);
+            let diff = (seq as i64).wrapping_sub((pos + 1) as i64);
+            if diff == 0 {
+                if self
+                    .control
+                    .dequeue_pos
+                    .compare_exchange_weak(pos, pos + 1, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let event = read_slot(slot);
+                    slot.seq.store(pos + capacity, Ordering::Release);
+                    return Some(event);
+                }
+            } else if diff < 0 {
+                return None;
+            }
+            std::hint::spin_loop();
         }
-        // diff > 0 would mean the producer skipped ahead, which can't
-        // happen for a single-consumer ring — treat it like data being
-        // available at this pos (read the slot we own).
-        let event = read_slot(slot);
-        slot.seq.store(pos + capacity, Ordering::Release);
-        self.control.dequeue_pos.store(pos + 1, Ordering::Release);
-        Some(event)
     }
 
     /// Pop up to `out.len()` events into `out`. Returns count drained.
