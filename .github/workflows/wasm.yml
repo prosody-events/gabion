@@ -24,8 +24,6 @@ jobs:
       required-work: ${{ steps.rail.outputs.required-work }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: loadingalias/cargo-rail-action@v12
         id: rail
         with:

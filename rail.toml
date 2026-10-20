@@ -5,11 +5,15 @@
 # The repository work below feeds the job gating in
 # `.github/workflows/*.yml`: `cargo-rail-action` lists every required
 # work ID in its `required-work` output, and each job checks for its own
-# work ID or `ci`.
+# work ID or `ci`. Repository work does not inherit the built-in Cargo
+# routing, so an item whose job compiles Rust lists `Cargo.toml` and
+# `Cargo.lock` itself; otherwise a dependency bump skips that job.
 #
-# Plan jobs pass `all` on every non-pull_request event (push to main,
-# schedule, manual dispatch), so gating only ever shrinks PR feedback —
-# never the main or release path.
+# Plan jobs pass `all: true`, so every job runs on every event: main
+# still carries the pre-0.32 config, which this cargo-rail cannot read as
+# a comparison base. Once it doesn't, plan jobs pass `all` only on
+# non-pull_request events (push to main, schedule, manual dispatch), so
+# gating only ever shrinks PR feedback — never the main or release path.
 
 [plan.work.ci]
 scope = "repository"
@@ -27,6 +31,8 @@ paths = [
     "deploy/nginx/**",
     "crates/nginx/**",
     "crates/gabion/src/wire/**",
+    "Cargo.toml",
+    "Cargo.lock",
 ]
 
 [plan.work.kube-smoke]
@@ -38,6 +44,7 @@ paths = [
     "crates/gabion/src/discovery/**",
     "crates/server/**",
     "crates/nginx/**",
+    "crates/loader/**",
     "Cargo.toml",
     "Cargo.lock",
 ]
@@ -47,4 +54,7 @@ scope = "repository"
 paths = [
     "crates/gabion-wasm/**",
     "crates/gabion/src/**",
+    "crates/gabion/Cargo.toml",
+    "Cargo.toml",
+    "Cargo.lock",
 ]

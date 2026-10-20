@@ -23,8 +23,6 @@ jobs:
       required-work: ${{ steps.rail.outputs.required-work }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: loadingalias/cargo-rail-action@v12
         id: rail
         with:
@@ -84,10 +82,12 @@ jobs:
       - uses: actions/checkout@v7
       - run: make hygiene
 
+  # Gate on `cargo.test`, not `cargo.build`: cargo-rail attributes bench
+  # targets to the test work, so a bench-only change skips `cargo.build`.
   bench-check:
     needs: plan
     if: >-
-      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.build') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
       contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
