@@ -48,11 +48,15 @@ http {
         listen 8080;
         location / {
             gabion_limit per_ip;
-            return 200 "ok\n";
+            root html;
         }
     }
 }
 ```
+
+gabion runs in nginx's access phase, so it never sees a request that a
+`return` directive answers first: `return` runs in the earlier rewrite
+phase.
 
 A request under budget gets `200 OK`; hammering the same IP past 100
 in one second gets `429 Too Many Requests` together with
