@@ -344,9 +344,9 @@ async fn leader_main(
     //   agrees with the mapping. `Layout::new` enforces it is a power of two
     //   with `>= 2`, and the total byte length fits in the mapping (well under
     //   `isize::MAX`).
-    // * The `MAP_SHARED | MAP_ANONYMOUS` region is held by the nginx master for
-    //   the lifetime of the worker process, and this leader thread is joined
-    //   before the worker exits, so the mapping outlives `store` (and any
+    // * A worker never unmaps its `MAP_SHARED | MAP_ANONYMOUS` region (only the
+    //   master does, in `Zone::drop`), and this leader thread is joined before
+    //   the worker exits, so the mapping outlives `store` (and any
     //   `AggregateTable<'_>` derived from it).
     // * Single-writer: the SHM `LeaderLease` elects at most one leader thread
     //   per worker process at a time, and this function drops `store` and the
