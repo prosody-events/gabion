@@ -81,7 +81,7 @@ fn leaked_region() -> ShmRegion {
     // `layout.total_bytes`, `initialize` is its first user, and the leak
     // keeps it alive for every thread that reads the region.
     let region = unsafe { ShmRegion::initialize(words.as_mut_ptr().cast(), layout) };
-    region.lease().set_init_millis(wall_millis());
+    region.lease().set_init_millis(now_millis());
     region
 }
 
@@ -169,6 +169,10 @@ fn a_follower_takes_over_when_the_leader_stops() {
     assert_eq!(region.lease().snapshot().owner_worker, 1);
 
     stop_within_deadline(leader);
+    let leader_incarnation = region.header().identity.load_incarnation();
     wait_for_owner(region, 2);
     stop_within_deadline(follower);
+    // The takeover lands within the same second, so a seconds-based
+    // incarnation alone would hand the follower the leader's identity.
+    assert!(region.header().identity.load_incarnation() > leader_incarnation);
 }

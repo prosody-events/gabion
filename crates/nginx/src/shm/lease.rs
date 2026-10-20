@@ -13,9 +13,15 @@
 //! in the low 40 bits. u24 holds 16M worker ids (well above any plausible
 //! nginx PID); u40 holds ~34 years of milliseconds.
 //!
+//! Clock: production callers pass [`now_millis`], which reads
+//! `CLOCK_MONOTONIC`. Every process on the host shares that clock, and NTP
+//! steps don't move it, so a wall-clock jump can't expire a live leader's
+//! lease and let a campaigning follower take over while the leader still
+//! runs.
+//!
 //! Time anchoring: the stored `expires_millis_rel` is *relative to zone
-//! init time*, not unix epoch. Unix epoch milliseconds in 2026 already
-//! exceed 2^40 (~1.77e12 vs 1.10e12), so a naive `now.min(EXPIRES_MASK)`
+//! init time*. A raw clock reading can exceed 2^40 (unix epoch milliseconds
+//! in 2026 are ~1.77e12 vs 1.10e12), so a naive `now.min(EXPIRES_MASK)`
 //! clamp would make every fresh call observe `now == EXPIRES_MASK ==
 //! expires`, breaking the "active lease" check and letting every worker
 //! steal the lease at startup. Subtracting `init_millis` keeps the
@@ -27,6 +33,20 @@ const OWNER_SHIFT: u32 = 40;
 const OWNER_MAX: u32 = (1 << 24) - 1;
 const EXPIRES_MASK: u64 = (1 << OWNER_SHIFT) - 1;
 
+/// Milliseconds on `CLOCK_MONOTONIC`, the clock all lease arithmetic uses.
+pub fn now_millis() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` only writes a `timespec` through its pointer,
+    // and `now` is a live, writable, aligned `timespec`. `CLOCK_MONOTONIC` is
+    // supported on every platform nginx runs on, so the call can't fail.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    debug_assert_eq!(rc, 0, "clock_gettime(CLOCK_MONOTONIC) failed");
+    now.tv_sec as u64 * 1_000 + now.tv_nsec as u64 / 1_000_000
+}
+
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct LeaderLease {
@@ -34,7 +54,7 @@ pub struct LeaderLease {
     /// expires_millis_rel is measured from `init_millis` below.
     state: AtomicU64,
     pub epoch: AtomicU64,
-    /// Wall-clock millis at which the SHM zone was initialized. Stamped
+    /// [`now_millis`] at which the SHM zone was initialized. Stamped
     /// once by `ShmRegion::initialize`. All subsequent lease arithmetic
     /// happens in `now - init` space so the relative value stays inside
     /// u40 regardless of the absolute clock value.
@@ -44,7 +64,7 @@ pub struct LeaderLease {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LeaseSnapshot {
     pub owner_worker: u32,
-    /// Absolute wall-clock millis at which the lease expires.
+    /// [`now_millis`] at which the lease expires.
     pub expires_millis: u64,
     pub epoch: u64,
 }
@@ -76,7 +96,7 @@ fn truncate_owner(worker_id: u32) -> u32 {
 }
 
 impl LeaderLease {
-    /// Stamp the wall-clock anchor used by all subsequent lease arithmetic.
+    /// Stamp the clock anchor used by all subsequent lease arithmetic.
     /// Idempotent on the first call: stores `now_millis` only if the field
     /// is still zero (default), so repeated initializations don't clobber
     /// a live anchor.
@@ -148,6 +168,12 @@ impl LeaderLease {
                 Err(_) => continue,
             }
         }
+    }
+
+    /// Whether `worker_id` owns the lease, expired or not. A leader whose
+    /// lease expired still owns it until another worker takes it over.
+    pub fn is_held_by(&self, worker_id: u32) -> bool {
+        unpack(self.state.load(Ordering::Acquire)).0 == truncate_owner(worker_id)
     }
 
     pub fn release(&self, worker_id: u32) -> bool {

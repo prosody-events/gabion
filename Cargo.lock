@@ -988,6 +988,7 @@ dependencies = [
  "futures",
  "gabion",
  "humantime",
+ "libc",
  "nginx-sys",
  "ngx",
  "quickcheck",

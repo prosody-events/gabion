@@ -156,11 +156,11 @@ impl ShmRegion {
                 LeaderLease::default(),
             );
             // Callers (production: nginx module's `set_zone`) MUST call
-            // `region.lease().set_init_millis(now_wall_clock_millis)` once
-            // they've established a wall-clock anchor. Without it, the
+            // `region.lease().set_init_millis(lease::now_millis())` once
+            // they've established a clock anchor. Without it, the
             // lease treats `now_millis` as already-relative. See
             // `shm::lease` module docs for why this matters for
-            // production unix-epoch clocks.
+            // production clocks.
             std::ptr::write(
                 region.queue_control_ptr() as *mut QueueControl,
                 QueueControl::new(layout.queue_capacity),

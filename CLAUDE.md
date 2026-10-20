@@ -41,11 +41,12 @@ The workspace lives under `crates/`:
 
 - **`nginx`** (`gabion-nginx`) — the NGINX module. Two execution
   contexts share one `mmap`'d SHM zone: every worker runs the access
-  phase (read aggregate, decide, push to SHM queue), and one elected
-  worker spawns a thread that drains the queue, drives `GossipRuntime`,
-  and writes deltas back into the SHM aggregate. The library half
-  (`access`, `headers`, `identity`, `leader`, `rules`, `shm`) builds and
-  tests without the `ngx-module` feature; FFI glue is gated behind it.
+  phase (read aggregate, decide, push to SHM queue), and every worker
+  runs a leader thread that campaigns for the SHM lease; the holder
+  drains the queue, drives `GossipRuntime`, and writes deltas back into
+  the SHM aggregate. The library half (`access`, `headers`, `identity`,
+  `leader`, `rules`, `shm`) builds and tests without the `ngx-module`
+  feature; FFI glue is gated behind it.
 
 - **`loader`** — a load generator. Drives the gRPC service (or an HTTP
   endpoint sitting in front of nginx) with a configurable tenant /

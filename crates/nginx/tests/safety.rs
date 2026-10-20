@@ -859,3 +859,11 @@ fn lease_concurrent_acquire_distinct_winners() {
     let winners = winners.lock().unwrap();
     assert_eq!(winners.len(), 1, "expected exactly one lease winner");
 }
+
+// -- Lease clock -----------------------------------------------------------
+
+#[test]
+fn lease_clock_reads_monotonic_time() {
+    let first = gabion_nginx::shm::lease::now_millis();
+    assert!(gabion_nginx::shm::lease::now_millis() >= first);
+}

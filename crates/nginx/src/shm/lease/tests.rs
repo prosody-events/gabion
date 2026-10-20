@@ -35,6 +35,19 @@ fn expired_lease_can_be_taken_over() {
 }
 
 #[test]
+fn is_held_by_tracks_the_owner_until_takeover() {
+    let lease = lease();
+    assert!(!lease.is_held_by(11));
+    assert!(lease.try_acquire(11, 1_000, 500));
+    assert!(lease.is_held_by(11));
+    assert!(!lease.is_held_by(22));
+    // Expiry alone doesn't change hands; a takeover does.
+    assert!(lease.try_acquire(22, 1_600, 500));
+    assert!(!lease.is_held_by(11));
+    assert!(lease.is_held_by(22));
+}
+
+#[test]
 fn release_resets_owner() {
     let lease = lease();
     assert!(lease.try_acquire(11, 1_000, 500));

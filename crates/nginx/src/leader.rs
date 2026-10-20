@@ -4,7 +4,7 @@
 //!
 //! Every nginx worker runs one of these threads. The SHM lease decides
 //! which one leads; the others campaign each lease tick so they can take
-//! over when the leader's worker exits.
+//! over when the leader's worker begins a graceful shutdown or exits.
 //!
 //! `GossipRuntime` is `!Send`, so its select loop runs on a `LocalSet`
 //! `spawn_local` task. The drain task lives next to it on the same
@@ -30,6 +30,7 @@ use crate::identity::fresh_incarnation;
 use crate::rules::CompiledRules;
 use crate::shm::ShmRegion;
 use crate::shm::aggregate::ShmAggregateStore;
+use crate::shm::lease::now_millis;
 use crate::shm::queue::QueueEvent;
 
 /// Drain batch size: how many records the leader keeps in flight against the
@@ -176,8 +177,13 @@ impl LeaderHandle {
     /// another worker can take over as soon as this call does. `Err`
     /// means the thread panicked.
     pub fn stop(self) -> std::thread::Result<()> {
-        self.stop.send_replace(true);
+        self.request_stop();
         self.thread.join()
+    }
+
+    /// Ask the thread to stop without waiting for it.
+    pub fn request_stop(&self) {
+        self.stop.send_replace(true);
     }
 }
 
@@ -234,6 +240,9 @@ fn run_leader(
         }
     };
     LocalSet::new().block_on(&runtime, campaign(shm, rules, config, stopped));
+    // Dropping the runtime would wait on any `spawn_blocking` DNS lookup the
+    // Kubernetes client left behind, holding up the worker's exit.
+    runtime.shutdown_background();
 }
 
 /// Hold or wait for the SHM lease until told to stop. A worker that wins
@@ -258,7 +267,7 @@ async fn campaign(
             _ = stopped.wait_for(|stop| *stop) => return,
             _ = tick.tick() => {}
         }
-        if !lease.try_acquire(config.worker_id, wall_millis(), ttl_millis) {
+        if !lease.try_acquire(config.worker_id, now_millis(), ttl_millis) {
             if !announced_follower {
                 tracing::info!(
                     worker_id = config.worker_id,
@@ -311,13 +320,17 @@ async fn campaign(
 /// caller releases it.
 async fn leader_main(
     shm: ShmRegion,
-    rules: &Arc<CompiledRules>,
+    rules: &CompiledRules,
     config: &LeaderConfig,
     stopped: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // Stamp a fresh incarnation into the SHM header so peers see a new
-    // `(node_id, incarnation)` for this takeover.
-    let new_incarnation = fresh_incarnation();
+    // `(node_id, incarnation)` for this takeover. `fresh_incarnation` has
+    // one-second resolution, so step past the previous leader's in case it
+    // led within the same second; reusing its identity with an empty
+    // `CellStore` would have peers max-merge away this leader's counts.
+    let new_incarnation =
+        fresh_incarnation().max(shm.header().identity.load_incarnation().saturating_add(1));
     shm.header().identity.store_incarnation(new_incarnation);
     let node_id = shm.header().identity.load_node_id();
     let identity = NodeIdentity::new(gabion::crdt::NodeId(node_id), new_incarnation);
@@ -372,35 +385,47 @@ async fn leader_main(
 
     let peer_events = discovery_stream(config.discovery.clone());
 
-    let mut tasks = JoinSet::new();
-    tasks.spawn_local(async move {
+    let gossip = async move {
         gossip_rt
             .run(peer_events)
             .await
-            .context("gossip runtime exited")
-    });
+            .map_err(anyhow::Error::from)
+    };
     let drain = drain_loop(
         gossip_client,
         shm,
-        rules.clone(),
+        config.worker_id,
         config.max_inflight,
         config.drain_tick,
     );
-    tasks.spawn_local(async move { drain.await.context("drain loop exited") });
-    tasks.spawn_local(lease_renewer(
-        shm,
-        config.worker_id,
-        config.lease_tick,
-        config.lease_ttl,
-    ));
-    tasks.spawn_local(admin_listener(admin_tx, config.admin_bind));
+    let renewer = lease_renewer(shm, config.worker_id, config.lease_tick, config.lease_ttl);
+    let admin = admin_listener(admin_tx, config.admin_bind);
+
+    let mut tasks = JoinSet::new();
+    let names = [
+        (tasks.spawn_local(gossip).id(), "gossip runtime"),
+        (tasks.spawn_local(drain).id(), "drain loop"),
+        (tasks.spawn_local(renewer).id(), "lease renewer"),
+        (tasks.spawn_local(admin).id(), "admin listener"),
+    ];
+    let name_of = |id| {
+        names
+            .iter()
+            .find_map(|&(task, name)| (task == id).then_some(name))
+            .unwrap_or("leader task")
+    };
 
     let outcome = tokio::select! {
         _ = stopped.wait_for(|stop| *stop) => Ok(()),
-        Some(joined) = tasks.join_next() => Err(match joined {
-            Ok(Ok(())) => anyhow::anyhow!("a leader task exited without being asked to"),
-            Ok(Err(error)) => error,
-            Err(error) => anyhow::Error::new(error).context("a leader task panicked"),
+        Some(joined) = tasks.join_next_with_id() => Err(match joined {
+            Ok((id, Ok(()))) => {
+                anyhow::anyhow!("the {} exited without being asked to", name_of(id))
+            }
+            Ok((id, Err(error))) => error.context(format!("the {} failed", name_of(id))),
+            Err(error) => {
+                let name = name_of(error.id());
+                anyhow::Error::new(error).context(format!("the {name} panicked"))
+            }
         }),
     };
 
@@ -439,10 +464,11 @@ fn register_rules(cell_store: &mut CellStore<u32>, rules: &CompiledRules) {
 async fn drain_loop(
     client: GossipClient<u32>,
     shm: ShmRegion,
-    _rules: Arc<CompiledRules>,
+    worker_id: u32,
     max_inflight: usize,
     tick: Duration,
 ) -> anyhow::Result<()> {
+    let lease = shm.lease();
     let queue = shm.queue();
     let stats = shm.stats();
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
@@ -450,6 +476,15 @@ async fn drain_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        // The queue allows one consumer. If this thread stalled past the
+        // lease TTL and another worker took the lease over, stop before
+        // popping rather than waiting for `lease_renewer` to notice.
+        if !lease.is_held_by(worker_id) {
+            return Err(anyhow::anyhow!(
+                "worker {worker_id} lost the leader lease to another worker"
+            ));
+        }
+
         // Refill in_flight from the SHM queue.
         while in_flight.len() < max_inflight {
             let Some(ev) = queue.pop() else { break };
@@ -509,8 +544,7 @@ async fn lease_renewer(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        let now = wall_millis();
-        if !lease.try_acquire(worker_id, now, ttl.as_millis() as u64) {
+        if !lease.try_acquire(worker_id, now_millis(), ttl.as_millis() as u64) {
             return Err(anyhow::anyhow!("leader lease lost by worker {worker_id}"));
         }
     }
@@ -525,13 +559,6 @@ async fn admin_listener(
     // owning task. Wait indefinitely.
     std::future::pending::<()>().await;
     unreachable!()
-}
-
-fn wall_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 // Type-level sanity: confirm the Rc impl works for our store at compile time.
