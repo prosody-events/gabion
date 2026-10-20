@@ -51,6 +51,10 @@ jobs:
           targets: wasm32-unknown-unknown
       # The release wasm build (web/package.json `build:wasm`) recompiles
       # std with `-Zbuild-std` for size — that needs nightly's `rust-src`.
+      # Installed last, nightly is the default toolchain rust-cache keys
+      # on, which is right: `build:wasm` is the expensive, nightly-compiled
+      # half of this cache. It saves on PRs too, for the same reason as
+      # safety.yml's Miri jobs — the key moves whenever nightly does.
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -95,22 +99,31 @@ jobs:
 
       # Cache the chromium browser binary (~/.cache/ms-playwright), keyed
       # on the pnpm lockfile so it re-downloads only when the pinned
-      # @playwright/test version moves. The OS-level deps installed by
-      # `install-deps` below land in root-owned system paths and aren't
-      # cacheable, so that step always runs.
-      - name: cache Playwright browser
+      # @playwright/test version moves. Restore and save are split so only
+      # `main` writes the ~280 MB entry; PRs restore main's. The OS-level
+      # deps installed by `install-deps` below land in root-owned system
+      # paths and aren't cacheable, so that step always runs.
+      - name: restore Playwright browser
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('crates/gabion-wasm/web/pnpm-lock.yaml') }}
       - name: install Playwright chromium
         working-directory: crates/gabion-wasm/web
+        env:
+          CACHE_HIT: ${{ steps.playwright-cache.outputs.cache-hit }}
         run: |
-          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
+          if [ "$CACHE_HIT" != "true" ]; then
             pnpm exec playwright install chromium
           fi
           pnpm exec playwright install-deps chromium
+      - name: save Playwright browser
+        if: github.ref == 'refs/heads/main' && steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ steps.playwright-cache.outputs.cache-primary-key }}
       - name: in-browser screenshot smoke
         working-directory: crates/gabion-wasm/web
         run: pnpm run screenshot

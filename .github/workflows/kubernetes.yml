@@ -64,7 +64,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      # Its own entry, not check.yml's `test`: `-p gabion` unifies
+      # dependency features differently from `--workspace`, so most of that
+      # entry would rebuild anyway. Only `main` saves (see check.yml).
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Prebuilt nextest — cargo-install compiles it from source on a
       # cache miss; install-action fetches the release binary.
       - uses: taiki-e/install-action@v2
