@@ -449,8 +449,8 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-${{ matrix.arch }},mode=max,image-manifest=true,oci-mediatypes=true
           # `mode=max` provenance records the full build graph in the
-          # image's OCI index; the signed attestation goes through
-          # actions/attest-build-provenance below. Both, plus the SBOM,
+          # image's OCI index; the signed attestation is issued in
+          # `combine`, against the published index. Both, plus the SBOM,
           # are gated to release builds (`is-release`) — `:main-<sha>` dev
           # images skip them (they bloat per-commit registry churn and
           # aren't pinned by users). `refresh-build` keeps them because it
@@ -460,17 +460,6 @@ jobs:
           sbom: ${{ needs.plan.outputs.is-release == 'true' }}
           outputs: |
             type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
-
-      # Signed SLSA-style provenance attached to the per-arch image
-      # digest. The Sigstore signature is keyless — issued against the
-      # workflow run's OIDC identity. No secret to rotate. Release-only,
-      # matching the in-image provenance/sbom gating above.
-      - uses: actions/attest-build-provenance@v4
-        if: needs.plan.outputs.is-release == 'true'
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
 
       - name: capture digest
         run: |
@@ -661,7 +650,22 @@ jobs:
           args+=("${IMAGE_REPO}@${amd64_digest}" "${IMAGE_REPO}@${arm64_digest}")
           printf '%s\n' "${tags[@]}"
           docker buildx imagetools create "${args[@]}"
+          # Every tag above resolves to this one multi-arch index, so it is
+          # the digest `gh attestation verify oci://<image>:<tag>` looks up.
+          digest="$(docker buildx imagetools inspect "${tags[0]}" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
         shell: bash
+
+      # Signed SLSA-style provenance for the published index. The Sigstore
+      # signature is keyless — issued against the workflow run's OIDC
+      # identity. No secret to rotate.
+      - uses: actions/attest-build-provenance@v4
+        # Release-only, matching the in-image provenance/sbom gating.
+        if: needs.plan.outputs.is-release == 'true'
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          subject-digest: ${{ steps.assemble.outputs.digest }}
+          push-to-registry: true
 
   # ── Floating-release-tag refresh ────────────────────────────────────
   #
@@ -932,12 +936,6 @@ jobs:
           outputs: |
             type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
 
-      - uses: actions/attest-build-provenance@v4
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
-
       - name: capture digest
         run: |
           set -eu
@@ -1109,4 +1107,17 @@ jobs:
           args+=("${IMAGE_REPO}@${amd64_digest}" "${IMAGE_REPO}@${arm64_digest}")
           printf '%s\n' "${tags[@]}"
           docker buildx imagetools create "${args[@]}"
+          # Every tag above resolves to this one multi-arch index, so it is
+          # the digest `gh attestation verify oci://<image>:<tag>` looks up.
+          digest="$(docker buildx imagetools inspect "${tags[0]}" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
         shell: bash
+
+      # Signed SLSA-style provenance for the published index. The Sigstore
+      # signature is keyless — issued against the workflow run's OIDC
+      # identity. No secret to rotate.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
+          subject-digest: ${{ steps.assemble.outputs.digest }}
+          push-to-registry: true
