@@ -42,8 +42,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: nightly
           components: miri,rust-src
       # All four Miri jobs compile the same crate graph and sysroot —
       # MIRIFLAGS only steers the interpreter, not rustc — so they share
@@ -53,7 +54,7 @@ jobs:
       # on PRs too: the key embeds the nightly rustc hash, so main's entry
       # goes stale whenever nightly moves, and a PR's own entry is what
       # keeps its follow-up pushes warm.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: miri
           # miri builds its sysroot into ~/.cache/miri (MIRI_SYSROOT is
@@ -62,7 +63,7 @@ jobs:
           cache-directories: ~/.cache/miri
       # Prebuilt nextest — cargo-install compiles it from source on a
       # cache miss; install-action fetches the release binary.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: nextest
       - run: make miri-safety miri-ffi-alignment
@@ -75,16 +76,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: nightly
           components: miri,rust-src
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: miri
           # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
           # isn't captured by default.
           cache-directories: ~/.cache/miri
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: nextest
       - run: make miri-safety-tb miri-ffi-alignment-tb
@@ -97,16 +99,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: nightly
           components: miri,rust-src
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: miri
           # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
           # isn't captured by default.
           cache-directories: ~/.cache/miri
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: nextest
       - run: make miri-lib
@@ -127,16 +130,17 @@ jobs:
       MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: nightly
           components: miri,rust-src
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: miri
           # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
           # isn't captured by default.
           cache-directories: ~/.cache/miri
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: nextest
       - run: rustup run nightly cargo miri nextest run --no-fail-fast -p gabion-nginx --lib

@@ -37,8 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
       # The release wasm build (web/package.json `build:wasm`) recompiles
       # std with `-Zbuild-std` for size — that needs nightly's `rust-src`.
@@ -46,12 +47,13 @@ jobs:
       # on, which is right: `build:wasm` is the expensive, nightly-compiled
       # half of this cache. It saves on PRs too, for the same reason as
       # safety.yml's Miri jobs — the key moves whenever nightly does.
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: nightly
           components: rust-src
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: jetli/wasm-pack-action@v0.4.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
         with:
           # Pin the wasm-pack version: the action's `latest` resolver is
           # broken and pulls the 2019-era v0.9.1, which predates Cargo
@@ -59,7 +61,7 @@ jobs:
           # in `crates/gabion-wasm/Cargo.toml`. v0.12.0+ understands the
           # `[workspace.package]` indirection.
           version: 'v0.15.0'
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           # `crates/gabion-wasm/web/pnpm-workspace.yaml` uses pnpm 11's
           # `allowBuilds:` build-allowlist key — pnpm 9 doesn't recognise
