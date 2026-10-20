@@ -1,50 +1,60 @@
 # cargo-rail change-impact configuration.
 #
-# Built-in surfaces (build, test, bench, docs, infra) are computed
-# automatically from the touched files in the diff. The custom surfaces
-# below feed the workflow gating in `.github/workflows/*.yml` — each one
-# is exposed by `cargo-rail-action` as `steps.rail.outputs.custom_<name>`.
+# Built-in Cargo work (`cargo.fmt`, `cargo.clippy`, `cargo.test`, …) is
+# computed automatically from the Cargo graph and the touched files.
+# The repository work below feeds the job gating in
+# `.github/workflows/*.yml`: `cargo-rail-action` lists every required
+# work ID in its `required-work` output, and each job checks for its own
+# work ID or `ci`. Repository work does not inherit the built-in Cargo
+# routing, so an item whose job compiles Rust lists `Cargo.toml` and
+# `Cargo.lock` itself; otherwise a dependency bump skips that job.
 #
-# Downstream jobs gate on a surface flag OR a non-pull_request event
-# (release tag, push to main, schedule, manual dispatch), so gating only
-# ever shrinks PR feedback — never the release path.
+# Plan jobs pass `all: true`, so every job runs on every event: main
+# still carries the pre-0.32 config, which this cargo-rail cannot read as
+# a comparison base. Once it doesn't, plan jobs pass `all` only on
+# non-pull_request events (push to main, schedule, manual dispatch), so
+# gating only ever shrinks PR feedback — never the main or release path.
 
-[change-detection]
-infrastructure = [
+[plan.work.ci]
+scope = "repository"
+paths = [
     ".github/**",
     "Makefile",
     "rail.toml",
     "release-please-config.json",
     ".release-please-manifest.json",
-    "Cargo.lock",
 ]
 
-[change-detection.custom]
-nginx_smoke = [
+[plan.work.nginx-smoke]
+scope = "repository"
+paths = [
     "deploy/nginx/**",
     "crates/nginx/**",
     "crates/gabion/src/wire/**",
+    "Cargo.toml",
+    "Cargo.lock",
 ]
 
-kube_smoke = [
+[plan.work.kube-smoke]
+scope = "repository"
+paths = [
     "deploy/kubernetes/**",
     "deploy/nginx/**",
     "deploy/gabiond/**",
     "crates/gabion/src/discovery/**",
     "crates/server/**",
     "crates/nginx/**",
+    "crates/loader/**",
     "Cargo.toml",
     "Cargo.lock",
 ]
 
-wasm_viz = [
+[plan.work.wasm-viz]
+scope = "repository"
+paths = [
     "crates/gabion-wasm/**",
     "crates/gabion/src/**",
-]
-
-images = [
-    "deploy/**",
-    "crates/**",
+    "crates/gabion/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",
 ]

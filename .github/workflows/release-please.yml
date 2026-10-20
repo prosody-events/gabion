@@ -37,7 +37,7 @@ jobs:
       # from `steps.release.outputs.pr` so CodeQL's "untrusted-checkout"
       # heuristic stays satisfied. The next step fetches and checks out
       # the release-please branch from the same trusted remote.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: ${{ steps.release.outputs.pr }}
 
       - name: Sync Cargo.lock in the release PR

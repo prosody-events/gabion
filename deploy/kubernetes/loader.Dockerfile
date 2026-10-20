@@ -22,7 +22,7 @@ RUN cargo build -p gabion-loader --release \
     && cp target/release/gabion-loader /out/gabion-loader \
     && rm -rf target
 
-FROM alpine:3.22
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /out/gabion-loader /usr/local/bin/gabion-loader
 ENTRYPOINT ["/usr/local/bin/gabion-loader"]

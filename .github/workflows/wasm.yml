@@ -21,31 +21,22 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      wasm-viz: ${{ steps.surfaces.outputs.wasm_viz }}
+      required-work: ${{ steps.rail.outputs.required-work }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - uses: loadingalias/cargo-rail-action@95875a43ad5583b4d6a1dc65630afb0c2ecb6b30 # v4.1.3
+      - uses: actions/checkout@v7
+      - uses: loadingalias/cargo-rail-action@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         id: rail
         with:
-          mode: minimal
-      # cargo-rail-action v4.1.3 doesn't expose `custom_<name>` outputs;
-      # parse them out of `scope-json` directly.
-      - id: surfaces
-        env:
-          SCOPE_JSON: ${{ steps.rail.outputs.scope-json }}
-        run: |
-          set -eu
-          val=$(printf '%s' "$SCOPE_JSON" | jq -r '.surfaces["custom:wasm_viz"] // false')
-          echo "wasm_viz=$val" >> "$GITHUB_OUTPUT"
+          all: true
 
   build:
     needs: plan
-    if: needs.plan.outputs.wasm-viz == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'wasm-viz') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -70,15 +61,15 @@ jobs:
           # in `crates/gabion-wasm/Cargo.toml`. v0.12.0+ understands the
           # `[workspace.package]` indirection.
           version: 'v0.15.0'
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           # `crates/gabion-wasm/web/pnpm-workspace.yaml` uses pnpm 11's
           # `allowBuilds:` build-allowlist key — pnpm 9 doesn't recognise
           # it and errors out with "packages field missing or empty".
           version: 11
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           cache-dependency-path: crates/gabion-wasm/web/pnpm-lock.yaml
 
@@ -142,7 +133,7 @@ jobs:
         run: pnpm run build
 
       # Hand the built site to the deploy-pages job on main pushes.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         with:
           name: pages
@@ -164,7 +155,7 @@ jobs:
       group: pages
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pages
           path: dist

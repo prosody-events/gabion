@@ -22,16 +22,13 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      build:      ${{ steps.rail.outputs.build }}
-      test:       ${{ steps.rail.outputs.test }}
+      required-work: ${{ steps.rail.outputs.required-work }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - uses: loadingalias/cargo-rail-action@95875a43ad5583b4d6a1dc65630afb0c2ecb6b30 # v4.1.3
+      - uses: actions/checkout@v7
+      - uses: loadingalias/cargo-rail-action@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         id: rail
         with:
-          mode: minimal
+          all: true
 
   # Together these jobs cover everything `make miri-all` runs locally —
   # split by suite and borrow model for parallelism, so a failure points at
@@ -39,10 +36,12 @@ jobs:
   # ride along with the matching safety job instead of paying for a runner.
   miri-safety:
     needs: plan
-    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly
@@ -71,10 +70,12 @@ jobs:
 
   miri-safety-tb:
     needs: plan
-    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly
@@ -92,10 +93,12 @@ jobs:
 
   miri-lib:
     needs: plan
-    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly
@@ -116,7 +119,9 @@ jobs:
   # invoke the same command directly.
   miri-lib-tb:
     needs: plan
-    if: needs.plan.outputs.test == 'true' || github.event_name != 'pull_request'
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
     runs-on: ubuntu-latest
     env:
       # `-Zmiri-disable-isolation` matches what `make miri-lib` sets —
@@ -124,7 +129,7 @@ jobs:
       # under default isolation. Tree Borrows is independent of that.
       MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-disable-isolation
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly

@@ -35,7 +35,7 @@ RUN cargo build -p gabion-server --release --bin gabiond --no-default-features \
     && cp target/release/gabiond /out/gabiond \
     && rm -rf target
 
-FROM alpine:3.22
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates
 
