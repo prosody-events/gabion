@@ -30,9 +30,10 @@ jobs:
         with:
           all: true
 
-  # Each Miri job is one make target. Together they cover everything
-  # `make miri-all` runs locally — split for parallelism and so a failure
-  # points at the exact mode that broke.
+  # Together these jobs cover everything `make miri-all` runs locally —
+  # split by suite and borrow model for parallelism, so a failure points at
+  # the mode that broke. The FFI alignment suites take seconds, so they
+  # ride along with the matching safety job instead of paying for a runner.
   miri-safety:
     needs: plan
     if: >-
@@ -44,9 +45,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri,rust-src
+      # All four Miri jobs compile the same crate graph and sysroot —
+      # MIRIFLAGS only steers the interpreter, not rustc — so they share
+      # one cache entry instead of keeping four copies per ref. Every job
+      # may save it: the first to succeed writes the entry, so one failing
+      # suite can't leave the rest cold. Unlike the stable jobs these save
+      # on PRs too: the key embeds the nightly rustc hash, so main's entry
+      # goes stale whenever nightly moves, and a PR's own entry is what
+      # keeps its follow-up pushes warm.
       - uses: Swatinem/rust-cache@v2
         with:
-          key: miri-safety
+          shared-key: miri
           # miri builds its sysroot into ~/.cache/miri (MIRI_SYSROOT is
           # unset), outside the paths rust-cache captures by default —
           # without this it rebuilds the sysroot cold every run.
@@ -56,7 +65,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: make miri-safety
+      - run: make miri-safety miri-ffi-alignment
 
   miri-safety-tb:
     needs: plan
@@ -71,14 +80,14 @@ jobs:
           components: miri,rust-src
       - uses: Swatinem/rust-cache@v2
         with:
-          key: miri-safety-tb
-          # See miri-safety: the sysroot in ~/.cache/miri isn't captured
-          # by default and rebuilds cold without this.
+          shared-key: miri
+          # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
+          # isn't captured by default.
           cache-directories: ~/.cache/miri
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: make miri-safety-tb
+      - run: make miri-safety-tb miri-ffi-alignment-tb
 
   miri-lib:
     needs: plan
@@ -93,9 +102,9 @@ jobs:
           components: miri,rust-src
       - uses: Swatinem/rust-cache@v2
         with:
-          key: miri-lib
-          # See miri-safety: the sysroot in ~/.cache/miri isn't captured
-          # by default and rebuilds cold without this.
+          shared-key: miri
+          # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
+          # isn't captured by default.
           cache-directories: ~/.cache/miri
       - uses: taiki-e/install-action@v2
         with:
@@ -123,9 +132,9 @@ jobs:
           components: miri,rust-src
       - uses: Swatinem/rust-cache@v2
         with:
-          key: miri-lib-tb
-          # See miri-safety: the sysroot in ~/.cache/miri isn't captured
-          # by default and rebuilds cold without this.
+          shared-key: miri
+          # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
+          # isn't captured by default.
           cache-directories: ~/.cache/miri
       - uses: taiki-e/install-action@v2
         with:
