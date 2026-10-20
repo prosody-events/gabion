@@ -129,23 +129,23 @@ impl ShmRegion {
     pub unsafe fn initialize(base: *mut u8, layout: Layout) -> Self {
         // SAFETY: The caller of this `unsafe fn` upholds the preconditions
         // above. Specifically:
-        // * `write_bytes(base, 0, total_bytes)` is valid because `base` is non-null,
-        //   writable, exclusive (no other reader), and the mapping covers `total_bytes`
-        //   (caller precondition). Zero is a valid bit pattern for every field in the
-        //   region (all stored types are `#[repr(C)]` composites of atomics / integers
-        //   / arrays of bytes).
-        // * Each `ptr::write(p, value)` overwrites a `#[repr(C)]` POD at the offset
-        //   computed by `Layout::new`; `Layout::new` rounds every offset up to
-        //   `CACHELINE`, which exceeds the alignment of every stored type, so the
-        //   destination pointer is properly aligned. `Layout::new` also guarantees
-        //   `offset + size_of::<T>() <= total_bytes`, so each write stays in-bounds of
-        //   the one mapping (Nomicon: "Working with raw pointers" / `pointer::add`
-        //   rules).
-        // * The queue/aggregate loops only index `0..capacity`, matching the per-slot
-        //   bounds checked by the private `*_slot_ptr` helpers.
-        // * No `&mut T` to any region byte escapes this function, so the shared-`&T`
-        //   accessors that run afterwards are sound (Nomicon: "References and
-        //   Aliasing").
+        // * `write_bytes(base, 0, total_bytes)` is valid because `base` is
+        //   non-null, writable, exclusive (no other reader), and the mapping
+        //   covers `total_bytes` (caller precondition). Zero is a valid bit
+        //   pattern for every field in the region (all stored types are
+        //   `#[repr(C)]` composites of atomics / integers / arrays of bytes).
+        // * Each `ptr::write(p, value)` overwrites a `#[repr(C)]` POD at the
+        //   offset computed by `Layout::new`; `Layout::new` rounds every offset
+        //   up to `CACHELINE`, which exceeds the alignment of every stored
+        //   type, so the destination pointer is properly aligned. `Layout::new`
+        //   also guarantees `offset + size_of::<T>() <= total_bytes`, so each
+        //   write stays in-bounds of the one mapping (Nomicon: "Working with
+        //   raw pointers" / `pointer::add` rules).
+        // * The queue/aggregate loops only index `0..capacity`, matching the
+        //   per-slot bounds checked by the private `*_slot_ptr` helpers.
+        // * No `&mut T` to any region byte escapes this function, so the
+        //   shared-`&T` accessors that run afterwards are sound (Nomicon:
+        //   "References and Aliasing").
         unsafe {
             std::ptr::write_bytes(base, 0, layout.total_bytes);
             let region = Self { base, layout };
@@ -155,12 +155,6 @@ impl ShmRegion {
                 region.lease_ptr() as *mut LeaderLease,
                 LeaderLease::default(),
             );
-            // Callers (production: nginx module's `set_zone`) MUST call
-            // `region.lease().set_init_millis(now_wall_clock_millis)` once
-            // they've established a wall-clock anchor. Without it, the
-            // lease treats `now_millis` as already-relative. See
-            // `shm::lease` module docs for why this matters for
-            // production unix-epoch clocks.
             std::ptr::write(
                 region.queue_control_ptr() as *mut QueueControl,
                 QueueControl::new(layout.queue_capacity),
@@ -218,15 +212,16 @@ impl ShmRegion {
     pub fn queue(&self) -> RequestQueue<'_> {
         // SAFETY:
         // * `queue_control_ptr()` is aligned and in-bounds; `QueueControl` was
-        //   initialized by `initialize` and contains only atomics, so the shared
-        //   reference is sound (see `header()` reasoning).
-        // * `slice::from_raw_parts`: `queue_slot_ptr(0)` is the start of a contiguous
-        //   `queue_capacity * size_of::<QueueSlot>()` byte range that `Layout::new`
-        //   reserves inside `total_bytes` (so the slice fits in one allocation), every
-        //   slot was initialized in `initialize`, and `QueueSlot` is `#[repr(C)]` with
-        //   atomic-only interior mutability. `queue_capacity` fits in `isize` because
-        //   the master successfully mmaps `total_bytes`. See Nomicon:
-        //   "`std::slice::from_raw_parts`" requirements.
+        //   initialized by `initialize` and contains only atomics, so the
+        //   shared reference is sound (see `header()` reasoning).
+        // * `slice::from_raw_parts`: `queue_slot_ptr(0)` is the start of a
+        //   contiguous `queue_capacity * size_of::<QueueSlot>()` byte range
+        //   that `Layout::new` reserves inside `total_bytes` (so the slice fits
+        //   in one allocation), every slot was initialized in `initialize`, and
+        //   `QueueSlot` is `#[repr(C)]` with atomic-only interior mutability.
+        //   `queue_capacity` fits in `isize` because the master successfully
+        //   mmaps `total_bytes`. See Nomicon: "`std::slice::from_raw_parts`"
+        //   requirements.
         unsafe {
             let control = &*(self.queue_control_ptr() as *const QueueControl);
             let slots = std::slice::from_raw_parts(
@@ -279,9 +274,9 @@ impl ShmRegion {
     }
 
     fn lease_ptr(&self) -> *mut u8 {
-        // SAFETY: As for `header_ptr()` — `lease_offset + size_of::<LeaderLease>()
-        // <= total_bytes` by `Layout::new`, so the `pointer::add` lands inside
-        // the single allocation.
+        // SAFETY: As for `header_ptr()` — `lease_offset +
+        // size_of::<LeaderLease>() <= total_bytes` by `Layout::new`, so
+        // the `pointer::add` lands inside the single allocation.
         unsafe { self.base.add(self.layout.lease_offset) }
     }
 

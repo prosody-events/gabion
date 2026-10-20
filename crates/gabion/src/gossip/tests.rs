@@ -1043,8 +1043,9 @@ async fn configured_rule_reexpires_after_idle_window() {
             assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 0);
 
             // Second burst at the now-current bucket. It must register and then
-            // age out on the same 100 ms window. Under the released-then-default
-            // bug it lands on a 60 s descriptor and stays here forever.
+            // age out on the same 100 ms window. Under the
+            // released-then-default bug it lands on a 60 s
+            // descriptor and stays here forever.
             client
                 .record(0xFEED, KeyHash(7), 3, 2, 10, 300)
                 .await

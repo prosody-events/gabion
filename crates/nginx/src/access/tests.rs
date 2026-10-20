@@ -57,13 +57,13 @@ fn build_zone(queue_cap: usize, agg_cap: usize) -> (TestZone, ShmRegion) {
     let zone = TestZone::allocate(words);
     // SAFETY: `ShmRegion::initialize`'s preconditions (see its
     // `# Safety` doc) are upheld:
-    // * `zone.as_ptr()` is non-null, writable, and 8-byte aligned (the underlying
-    //   allocation was a `Box<[u64]>`). `words * 8 >= layout.total_bytes`, so the
-    //   mapping size is covered.
+    // * `zone.as_ptr()` is non-null, writable, and 8-byte aligned (the
+    //   underlying allocation was a `Box<[u64]>`). `words * 8 >=
+    //   layout.total_bytes`, so the mapping size is covered.
     // * `Layout::new` produced `layout` above; offsets are consistent.
     // * `zone` is a fresh allocation; `initialize` is its first user.
-    // * The returned `TestZone` is paired with the `ShmRegion` and dropped after
-    //   every use of the region in each `#[test]`.
+    // * The returned `TestZone` is paired with the `ShmRegion` and dropped
+    //   after every use of the region in each `#[test]`.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
     (zone, region)
 }
@@ -132,18 +132,20 @@ fn reject_when_window_total_exceeds_limit() {
     //   `ShmRegion::initialize`. `initialize` `ptr::write`s an
     //   `AggregateSlot::empty()` into each of the `layout.aggregate_capacity`
     //   slots, so `region.aggregate_slots_ptr()` is non-null, aligned for
-    //   `AggregateSlot`, and points at exactly that many fully initialized slots.
+    //   `AggregateSlot`, and points at exactly that many fully initialized
+    //   slots.
     // * The `capacity` argument is the same `aggregate_capacity` the region was
-    //   built with (`Layout::new` guarantees it is a power of two `>= 2`, and the
-    //   total byte length fits in the buffer and thus in `isize::MAX`).
+    //   built with (`Layout::new` guarantees it is a power of two `>= 2`, and
+    //   the total byte length fits in the buffer and thus in `isize::MAX`).
     // * The backing `Vec<u8>` (`_buf` in the caller) lives until the end of the
-    //   `#[test]`, which outlives both this `store` and any `AggregateTable<'_>`
-    //   derived from it via `region.aggregate()`.
+    //   `#[test]`, which outlives both this `store` and any
+    //   `AggregateTable<'_>` derived from it via `region.aggregate()`.
     // * Single-writer: this test is single-threaded and `store` is the sole
-    //   `ShmAggregateStore` constructed against `region`'s aggregate slots; reads
-    //   from `region.aggregate()` use the same seqlock/atomic protocol the
-    //   production code does, so they cannot race with `write_delta` (Nomicon:
-    //   atomic accesses are not data races even with concurrent reads).
+    //   `ShmAggregateStore` constructed against `region`'s aggregate slots;
+    //   reads from `region.aggregate()` use the same seqlock/atomic protocol
+    //   the production code does, so they cannot race with `write_delta`
+    //   (Nomicon: atomic accesses are not data races even with concurrent
+    //   reads).
     let store = unsafe {
         crate::shm::aggregate::ShmAggregateStore::new(
             region.aggregate_slots_ptr(),

@@ -404,7 +404,8 @@ impl EngineState {
         // tick's packet output stays inside the send pool. A small cluster's
         // working set is below the cap, so it still flushes in a single round;
         // a large cluster's burst flushes over a few ticks (the dirty rings are
-        // persistent, so the residual rides the next tick rather than dropping).
+        // persistent, so the residual rides the next tick rather than
+        // dropping).
         let max_cells_per_tick = VIZ_MAX_CELLS_PER_TICK.min(store_config.cell_capacity as usize);
         let max_cells_per_frame = store_config.cell_capacity;
         let tick_interval = Duration::from_millis(self.config.tick_interval_ms);
@@ -783,9 +784,10 @@ impl EngineState {
                 Some(dump) => self.cells_from_dump(handle.identity, &dump),
                 None => Vec::new(),
             };
-            // `node_id` / `incarnation` come from the engine's own record of the
-            // node, so they survive even if the runtime has already stopped and
-            // the admin round-trip returns `None` (defaults for the rest).
+            // `node_id` / `incarnation` come from the engine's own record of
+            // the node, so they survive even if the runtime has
+            // already stopped and the admin round-trip returns
+            // `None` (defaults for the rest).
             let snap = admin_snapshot(&handle.admin_tx).await;
             let peers = snap
                 .as_ref()

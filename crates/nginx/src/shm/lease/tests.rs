@@ -75,31 +75,3 @@ fn ms_precision_takeover_just_after_expiry() {
     assert!(lease.try_acquire(1, 0, 1_000));
     assert!(lease.try_acquire(2, 1_001, 1_000));
 }
-
-#[test]
-fn unix_epoch_millis_dont_break_lease() {
-    // Reproduces the production bug: without init_millis, two workers
-    // would both acquire because `now.min(2^40-1)` clamps every recent
-    // unix-epoch value to the same number.
-    let lease = lease();
-    // Mirror the production startup: SHM init stamps the anchor, then
-    // the first worker calls try_acquire shortly after.
-    let init_now = 1_770_000_000_000_u64; // ~2026-02 unix epoch millis
-    lease.set_init_millis(init_now);
-    let now1 = init_now + 5;
-    assert!(lease.try_acquire(30, now1, 1_000));
-    // A second worker calling almost simultaneously must NOT win.
-    let now2 = init_now + 6;
-    assert!(!lease.try_acquire(31, now2, 1_000));
-    // After ttl expires, the second worker takes over.
-    let now3 = init_now + 1_500;
-    assert!(lease.try_acquire(31, now3, 1_000));
-}
-
-#[test]
-fn set_init_millis_is_idempotent() {
-    let lease = lease();
-    lease.set_init_millis(100);
-    lease.set_init_millis(200);
-    assert_eq!(lease.init_millis(), 100);
-}

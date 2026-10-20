@@ -320,7 +320,8 @@ fn watch_services(
         .collect();
     if apis.is_empty() {
         // Default to the pod's own namespace. `Client::default_namespace()`
-        // is populated from `/var/run/secrets/kubernetes.io/serviceaccount/namespace`
+        // is populated from
+        // `/var/run/secrets/kubernetes.io/serviceaccount/namespace`
         // by both `Config::incluster_env` and `Config::incluster_dns`, so it
         // tracks wherever the pod was actually scheduled — no kubeconfig
         // magic, no operator-supplied namespace directive needed for the

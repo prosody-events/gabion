@@ -662,9 +662,10 @@ fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
     // The viz-default window: a 10 s / 1 s rule has 10 live buckets.
     const LIVE_BUCKETS: u32 = 10;
 
-    // Ceiling-anchored: a 12-node cluster and a `MAX_NODES` cluster get byte-for-
-    // byte identical caps. This is the property that makes live growth safe —
-    // size is a function of the ceiling and the rule, never of `config.nodes`.
+    // Ceiling-anchored: a 12-node cluster and a `MAX_NODES` cluster get
+    // byte-for- byte identical caps. This is the property that makes live
+    // growth safe — size is a function of the ceiling and the rule, never
+    // of `config.nodes`.
     let small = SimConfig::default().cell_store_config(LIVE_BUCKETS);
     let full = SimConfig {
         nodes: MAX_NODES,
@@ -699,7 +700,8 @@ fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
         caps.forwarded_dirty_capacity,
     );
     // The node dictionary must intern every origin (this is the tightest cap —
-    // the slack is only a couple of slots) without truncating to a u16 below it.
+    // the slack is only a couple of slots) without truncating to a u16 below
+    // it.
     assert!(
         usize::from(caps.node_dictionary_capacity) >= MAX_NODES,
         "node_dictionary_capacity {} cannot hold {MAX_NODES} origins",
@@ -744,8 +746,9 @@ fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
             submit(&tx, node, WATCHED_KEY, 5).await;
         }
         // 16 rounds — ample for an 8-origin set to converge across 32 nodes —
-        // while staying inside the 10 s window so the first batch (epoch 0) does
-        // not age out (1 000 + 16 × 500 = 9 000 ms, the window holds epoch 0).
+        // while staying inside the 10 s window so the first batch (epoch 0)
+        // does not age out (1 000 + 16 × 500 = 9 000 ms, the window
+        // holds epoch 0).
         for _ in 0..16 {
             step(&tx, 500).await;
         }
@@ -765,7 +768,8 @@ fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
             // production floor — proof the shrink is in effect end-to-end.
             assert_eq!(s.cell_capacity, caps.cell_capacity);
         }
-        // The 40 hits (8 origins × 5) propagate to every node within the window.
+        // The 40 hits (8 origins × 5) propagate to every node within the
+        // window.
         assert_eq!(state.oracle_total, 40);
         assert!(
             state.nodes.iter().all(|n| n.aggregate_total == 40),
@@ -794,8 +798,8 @@ fn grown_cluster_holds_every_origin_without_overflow() {
         ..test_config(12)
     };
     with_engine(config, |tx| async move {
-        // Grow 12 → 24 by live joins (well past `config.nodes + slack`, the point
-        // the old per-cluster sizing overflowed).
+        // Grow 12 → 24 by live joins (well past `config.nodes + slack`, the
+        // point the old per-cluster sizing overflowed).
         for _ in 0..12 {
             add_node(&tx).await;
         }

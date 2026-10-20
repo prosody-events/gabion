@@ -1,6 +1,6 @@
 //! NGINX FFI glue: directives, the access-phase handler, and the
-//! `init_process` hook that spawns the leader thread when a worker wins the
-//! SHM lease. All cross-process state lives in the SHM zone allocated by
+//! `init_process` / `exit_process` hooks that start and stop each worker's
+//! leader thread. All cross-process state lives in the SHM zone allocated by
 //! [`set_zone`] during the master process's config phase.
 
 use std::ffi::{c_char, c_void};
@@ -9,17 +9,15 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::Result;
 use ngx::core;
 use ngx::ffi::{
     NGX_CONF_1MORE, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET,
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF,
-    NGX_LOG_EMERG, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_http_handler_pt,
-    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t, ngx_module_t,
-    ngx_pool_cleanup_add, ngx_str_t, ngx_uint_t,
+    NGX_LOG_EMERG, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_exiting,
+    ngx_http_handler_pt, ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t,
+    ngx_module_t, ngx_pool_cleanup_add, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
     self, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, MergeConfigError,
@@ -38,13 +36,14 @@ use crate::access::{
 };
 use crate::headers::AdmissionHeaders;
 use crate::identity::derive_identity;
-use crate::leader::{self, GossipSettings, LeaderConfig};
+use crate::leader::{self, GossipSettings, LeaderConfig, LeaderHandle};
 use crate::log;
 use crate::rules::{
     BindingCompiler, BindingLookup, CompiledRules, DEFAULT_DOMAIN, DescriptorBinding, RuleConfig,
     is_descriptor_key, is_dns_label, is_single_ident, is_zone_name, parse_binding, parse_rate,
     resolve_rate,
 };
+use crate::shm::lease::now_millis;
 use crate::shm::{Layout, ShmRegion};
 
 const DEFAULT_QUEUE_CAPACITY: usize = 2048;
@@ -58,8 +57,7 @@ static SHM_AGGREGATE_CAPACITY: AtomicUsize = AtomicUsize::new(0);
 /// Per-worker shared state. Set during config phase by the master process so
 /// every fork sees the same pointers in this static.
 static WORKER_GLOBALS: OnceLock<WorkerGlobals> = OnceLock::new();
-static LEADER_THREAD: std::sync::Mutex<Option<JoinHandle<Result<()>>>> =
-    std::sync::Mutex::new(None);
+static LEADER_THREAD: std::sync::Mutex<Option<LeaderHandle>> = std::sync::Mutex::new(None);
 
 struct WorkerGlobals {
     region: ShmRegion,
@@ -934,11 +932,8 @@ extern "C" fn set_zone(
         let identity = derive_identity(main.identity_seed.as_deref());
         region.header().identity.store_node_id(identity.node_id.0);
 
-        // Anchor the lease's clock at this moment. Without it, the
-        // try_acquire pack-and-compare path can't distinguish "active"
-        // from "expired" because unix epoch millis exceed the u40 expiry
-        // bit budget. See shm::lease module docs.
-        region.lease().set_init_millis(wall_millis());
+        // Anchor the lease clock before fork so every worker inherits it.
+        now_millis();
 
         SHM_PTR.store(mapped, Ordering::Release);
         SHM_LEN.store(total, Ordering::Release);
@@ -1991,9 +1986,9 @@ impl BindingCompiler for NgxBindingCompiler {
         if let Some(b) = crate::rules::compile_inline(source) {
             return Ok(b);
         }
-        // 2. Single $identifier: resolve through nginx's indexed-variable table.
-        //    Hashing happens inside the call once at config phase; per-request lookups
-        //    are O(1).
+        // 2. Single $identifier: resolve through nginx's indexed-variable
+        //    table. Hashing happens inside the call once at config phase;
+        //    per-request lookups are O(1).
         if let Some(stripped) = source.strip_prefix('$') {
             if crate::rules::is_single_ident(stripped) {
                 let mut name_str = ngx_str_t {
@@ -2015,9 +2010,9 @@ impl BindingCompiler for NgxBindingCompiler {
                 });
             }
         }
-        // 3. Template: compile to an ngx_http_complex_value_t in the cycle pool.
-        //    Allocates two structs (the input ccv and the output complex_value) against
-        //    `cf->pool`.
+        // 3. Template: compile to an ngx_http_complex_value_t in the cycle
+        //    pool. Allocates two structs (the input ccv and the output
+        //    complex_value) against `cf->pool`.
         // SAFETY: cf is valid; `pool` is the cycle pool; sizeof return
         // values are POD.
         let cv_size = std::mem::size_of::<ngx::ffi::ngx_http_complex_value_t>();
@@ -2066,24 +2061,24 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
     };
 
     let worker_id = std::process::id();
-    let now = wall_millis();
-    if !globals.region.lease().try_acquire(
-        worker_id,
-        now,
-        leader::DEFAULT_LEASE_TTL.as_millis() as u64,
-    ) {
-        // Another worker holds the lease — be a follower for this turn.
-        tracing::info!(worker_id, "gabion: worker did not win leader lease");
-        return core::Status::NGX_OK.into();
-    }
-
     let rng_seed = match globals.rng_seed {
         Some(seed) => seed,
         None => match defaults::random_rng_seed() {
             Ok(seed) => seed,
             Err(error) => {
-                tracing::error!(%error, "gabion: failed to draw gossip RNG seed");
-                return core::Status::NGX_ERROR.into();
+                // Not NGX_ERROR: nginx never respawns a worker whose
+                // `init_process` fails, and every worker runs this, so
+                // failing here would take down the whole server.
+                tracing::error!(
+                    worker_id,
+                    %error,
+                    "gabion: failed to draw gossip RNG seed, so this worker \
+                     will never drive gossip. It is still serving requests \
+                     against the shared SHM aggregate. Usually a sandbox is \
+                     denying `/dev/urandom`; lift the restriction or set \
+                     `gabion_runtime_rng_seed N`, then restart nginx.",
+                );
+                return core::Status::NGX_OK.into();
             }
         },
     };
@@ -2095,7 +2090,6 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
         discovery: globals.discovery.clone(),
         cell_store: globals.storage.cell_store_config(),
         rng_seed,
-        admin_bind: None,
         max_inflight: leader::DEFAULT_MAX_INFLIGHT,
         drain_tick: leader::DEFAULT_DRAIN_TICK,
         lease_tick: leader::DEFAULT_LEASE_TICK,
@@ -2106,15 +2100,8 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
     let handle = match leader::spawn(globals.region, globals.rules.clone(), cfg) {
         Ok(h) => h,
         Err(error) => {
-            // OS refused the spawn (OOM, RLIMIT_NPROC, EAGAIN under fork
-            // pressure). A panic here would unwind into nginx's
-            // `init_process` C frame and is UB. Log and degrade
-            // gracefully — the worker stays up handling requests
-            // against whatever SHM aggregate the previous leader left
-            // behind. The next worker that wins the lease will retry
-            // the spawn; if every spawn is failing, the operator needs
-            // to raise their thread budget (`ulimit -u`) or investigate
-            // the host's memory.
+            // Panicking here would unwind into nginx's C frame, so log and
+            // leave the worker up without a leader thread.
             tracing::error!(
                 worker_id,
                 %error,
@@ -2122,21 +2109,48 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
                  hit RLIMIT_NPROC, ran out of memory, or returned EAGAIN \
                  under fork pressure. This worker is staying up without a \
                  leader thread — requests still admit against the existing \
-                 SHM aggregate but no gossip will be emitted from this \
-                 process. Raise the process / thread limit for the nginx \
-                 user, or check `dmesg` for OOM signals.",
+                 SHM aggregate but this worker can never drive gossip. Raise \
+                 the process / thread limit for the nginx user, or check \
+                 `dmesg` for OOM signals.",
             );
-            // Release the lease we acquired above so the next worker
-            // gets a fair shot at becoming leader.
-            globals.region.lease().release(worker_id);
             return core::Status::NGX_OK.into();
         }
     };
     if let Ok(mut slot) = LEADER_THREAD.lock() {
         *slot = Some(handle);
     }
+    watch_for_shutdown();
     tracing::info!(worker_id, "gabion: leader thread spawned");
     core::Status::NGX_OK.into()
+}
+
+/// How often a worker checks whether nginx has begun shutting it down.
+const SHUTDOWN_POLL: Duration = leader::DEFAULT_LEASE_TICK;
+
+/// Tell this worker's leader thread to stop as soon as a graceful shutdown
+/// begins (`nginx -s quit`, or the old generation on reload). Without it
+/// the thread keeps leading, or keeps campaigning and can win the lease
+/// ahead of a worker that's staying up, until the worker exits, which can
+/// take until `worker_shutdown_timeout` while connections drain.
+///
+/// Must be called on the worker's event thread (`init_process`). nginx has
+/// no shutdown hook, so this polls `ngx_exiting` on a cancelable timer,
+/// which never holds up an exiting worker.
+fn watch_for_shutdown() {
+    ngx::async_::spawn(async {
+        // SAFETY: the task only runs on the worker's event thread, the only
+        // thread that writes `ngx_exiting`; this is a plain by-value read.
+        while unsafe { ngx_exiting } == 0 {
+            ngx::async_::sleep(SHUTDOWN_POLL).await;
+        }
+        if let Ok(slot) = LEADER_THREAD.lock()
+            && let Some(handle) = slot.as_ref()
+        {
+            tracing::info!("gabion: worker is shutting down; stopping its leader thread");
+            handle.request_stop();
+        }
+    })
+    .detach();
 }
 
 /// nginx `exit_process` hook. Invoked once per worker process when nginx is
@@ -2146,14 +2160,30 @@ unsafe extern "C" fn gabion_exit_process(_cycle: *mut ngx_cycle_t) {
     let Some(globals) = WORKER_GLOBALS.get() else {
         return;
     };
-    let worker_id = std::process::id();
-    globals.region.lease().release(worker_id);
+    // Stop the leader thread before anything else: it renews the lease and
+    // holds the gossip socket until told to stop, so joining it without the
+    // stop signal blocks this worker's exit forever.
     let handle = LEADER_THREAD.lock().ok().and_then(|mut slot| slot.take());
     if let Some(handle) = handle
-        && let Err(error) = handle.join()
+        && let Err(payload) = handle.stop()
     {
-        tracing::error!(?error, "gabion: leader thread panicked");
+        // `Debug` on a panic payload prints only `Any { .. }`.
+        let panic = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("panic payload is not a string");
+        tracing::error!(
+            panic,
+            "gabion: leader thread panicked, so this worker had stopped campaigning for the \
+             leader lease before it exited. Other workers still campaign and take over gossip. \
+             This is a gabion bug: report it with the `panic` field and the panic location from \
+             earlier error log lines.",
+        );
     }
+    // The thread releases the lease on its way out; this covers a thread
+    // that panicked while holding it.
+    globals.region.lease().release(std::process::id());
 }
 
 // -- helpers ----------------------------------------------------------------
@@ -2206,14 +2236,14 @@ fn mmap_shared(size: usize) -> *mut u8 {
 
     // SAFETY: This is a well-formed POSIX `mmap` call:
     //   - `addr` is null, asking the kernel to choose the location;
-    //   - `MAP_ANONYMOUS` is set, so `fd = -1` and `offset = 0` are the mandated
-    //     sentinel values (no file is being mapped);
+    //   - `MAP_ANONYMOUS` is set, so `fd = -1` and `offset = 0` are the
+    //     mandated sentinel values (no file is being mapped);
     //   - `MAP_SHARED` produces pages that survive `fork()` and are visible to
     //     every child — exactly what the worker pool needs;
     //   - the returned pages are kernel-owned and live until either the process
-    //     exits or we `munmap` them. v1 never `munmap`s, so the pointer is valid
-    //     for the full lifetime of the nginx master process (and inherited
-    //     workers).
+    //     exits or we `munmap` them. v1 never `munmap`s, so the pointer is
+    //     valid for the full lifetime of the nginx master process (and
+    //     inherited workers).
     // On failure mmap returns `MAP_FAILED`, which we convert to a null
     // pointer for the caller.
     let mapped = unsafe {

@@ -1326,8 +1326,9 @@ impl<C: Count> CellStore<C> {
         }
 
         // Swap the scratch slices out so we can pass them as `&[T]` borrows
-        // to `self.expire(...)` (which needs `&mut self`). `Box::<[T]>::default`
-        // returns an empty boxed slice that does not allocate.
+        // to `self.expire(...)` (which needs `&mut self`).
+        // `Box::<[T]>::default` returns an empty boxed slice that does
+        // not allocate.
         let current = std::mem::take(&mut self.expire_current_epoch_scratch);
         let live = std::mem::take(&mut self.expire_live_buckets_scratch);
         self.expire(&current, &live, sink);

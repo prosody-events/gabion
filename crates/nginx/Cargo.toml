@@ -24,7 +24,7 @@ whoami.workspace = true
 
 [features]
 default = []
-ngx-module = ["dep:nginx-sys", "dep:ngx", "export-modules"]
+ngx-module = ["dep:nginx-sys", "dep:ngx", "ngx/async", "export-modules"]
 export-modules = []
 
 [dev-dependencies]
