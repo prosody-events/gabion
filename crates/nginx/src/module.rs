@@ -202,6 +202,22 @@ impl http::HttpModule for Module {
             && main.layout.is_some()
             && !main.rules.is_empty()
         {
+            // Workers only queue their hits; the gossip leader folds them
+            // into the shared counts, and `gabion_init_process` starts it
+            // only with a gossip socket. Without one, every rule would
+            // silently admit everything.
+            if main.gossip_bind.is_none() {
+                ngx::ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    cf,
+                    "gabion: rules are declared but `gabion_gossip_bind` is not set, so no \
+                     request would ever be counted or limited. Workers hand their hits to the \
+                     gossip leader, which runs only with a gossip socket, even on a single node. \
+                     Add `gabion_gossip_bind 127.0.0.1:9000;` to the http {{}} block for one \
+                     node, or `0.0.0.0:9000` to share counts across replicas."
+                );
+                return core::Status::NGX_ERROR.into();
+            }
             let mut compiler = NgxBindingCompiler { cf };
             match CompiledRules::compile_with(&main.rules, main.cardinality, &mut compiler) {
                 Ok(rules) => main.compiled = Some(Arc::new(rules)),
@@ -1440,9 +1456,9 @@ extern "C" fn set_gossip_cluster(
     set_scalar(
         cf,
         conf,
-        "expected a non-zero 128-bit cluster identifier shared by every peer (e.g. `1`, any u128 \
-         literal)",
-        |v| match v.parse::<u128>() {
+        "expected a non-zero 128-bit cluster identifier shared by every peer, in decimal or \
+         `0x`-prefixed hex (e.g. `1`, `0xc0ffee`)",
+        |v| match gabion::gossip::parse_cluster_id(v) {
             Ok(0) | Err(_) => None,
             Ok(cluster) => Some(cluster),
         },

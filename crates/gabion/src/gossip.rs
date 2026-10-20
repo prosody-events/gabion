@@ -107,6 +107,20 @@ impl Default for GossipConfig {
     }
 }
 
+/// Parse a cluster identifier as both adapters' configs spell it: decimal
+/// (`12345`) or `0x`-prefixed hex (`0xc0ffee`), ignoring surrounding
+/// whitespace.
+pub fn parse_cluster_id(value: &str) -> Result<u128, std::num::ParseIntError> {
+    let value = value.trim();
+    match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        Some(hex) => u128::from_str_radix(hex, 16),
+        None => value.parse(),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GossipError {
     #[error("gossip runtime is no longer running")]

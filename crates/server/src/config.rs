@@ -385,14 +385,7 @@ mod u128_any {
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<u128, E> {
-                let trimmed = v.trim();
-                if let Some(hex) = trimmed
-                    .strip_prefix("0x")
-                    .or_else(|| trimmed.strip_prefix("0X"))
-                {
-                    return u128::from_str_radix(hex, 16).map_err(de::Error::custom);
-                }
-                trimmed.parse::<u128>().map_err(de::Error::custom)
+                gabion::gossip::parse_cluster_id(v).map_err(de::Error::custom)
             }
 
             fn visit_string<E: de::Error>(self, v: String) -> Result<u128, E> {

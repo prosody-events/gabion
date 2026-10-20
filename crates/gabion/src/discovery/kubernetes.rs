@@ -85,10 +85,11 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
-                            "Could not connect to the Kubernetes API; gabion \
-                             cannot auto-discover peers. This node will only \
-                             talk to peers listed in `gossip.bootstrap_peers`. \
-                             Check that the pod has the auto-mounted \
+                            "Could not connect to the Kubernetes API, so gabion \
+                             cannot discover peers and this node's counts stay \
+                             local to it. That is expected for a single node \
+                             outside Kubernetes. In a pod, check that it has the \
+                             auto-mounted \
                              ServiceAccount secrets at \
                              /var/run/secrets/kubernetes.io/serviceaccount/ \
                              and an RBAC binding granting watch on Services \

@@ -43,6 +43,7 @@ events {}
 http {
     gabion_limit_zone zone=api:64m;
     gabion_limit_rule per_ip $remote_addr rate=100r/s;
+    gabion_gossip_bind 127.0.0.1:9000;
 
     server {
         listen 8080;
@@ -53,6 +54,11 @@ http {
     }
 }
 ```
+
+`gabion_gossip_bind` is required even on one node. Workers hand their
+hits to the gossip leader, which folds them into the shared counts, and
+the leader runs only with a gossip socket. `nginx -t` refuses a config
+that declares rules without one.
 
 gabion runs in nginx's access phase, so it never sees a request that a
 `return` directive answers first: `return` runs in the earlier rewrite
@@ -71,9 +77,9 @@ and records hits — metrics and gossip see real traffic — but never
 rejects, which lets you watch the allow/reject ratio against
 production load before you drop the flag.
 
-To scale beyond one node, add `gabion_gossip_bind`, a non-zero
-`gabion_gossip_cluster` id, and (under Kubernetes) the namespace
-allowlist. See [Running across a cluster](#running-across-a-cluster).
+To scale beyond one node, bind the gossip socket on an address peers
+can reach (`0.0.0.0:9000`), set a `gabion_gossip_cluster` id shared by
+every peer, and (under Kubernetes) the namespace allowlist. See [Running across a cluster](#running-across-a-cluster).
 
 <a id="fail-open-invariant"></a>
 
@@ -448,8 +454,8 @@ they bound resource use.
 
 | Directive                                       | Default | Effect                                                                                |
 |-------------------------------------------------|---------|---------------------------------------------------------------------------------------|
-| `gabion_gossip_bind ADDR:PORT`                  | *(none)* | UDP bind for the gossip channel. Required for clustering.                            |
-| `gabion_gossip_cluster ID`                      | *(none)* | Cluster identifier (any non-zero u128). Frames from peers with a mismatched id are dropped. |
+| `gabion_gossip_bind ADDR:PORT`                  | *(none)* | UDP bind for the gossip channel. Required whenever rules are declared, even on one node: the leader that folds hits into the shared counts runs only with this socket. |
+| `gabion_gossip_cluster ID`                      | `1`     | Cluster identifier: any non-zero u128, in decimal or `0x`-prefixed hex. Frames from peers with a mismatched id are dropped. |
 | `gabion_gossip_tick_interval DURATION`          | `500ms` | Heartbeat period. Shorter = faster convergence, more UDP traffic.                     |
 | `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet. Below ~64 the encoder refuses to fit even one cell. |
 | `gabion_gossip_max_cells_per_frame N`           | `4096`  | Maximum cells encoded into one packet.                                                |
@@ -671,7 +677,7 @@ narrative. The nginx directives that bind each piece are:
 | Piece                  | Directive                                                    |
 |------------------------|--------------------------------------------------------------|
 | Gossip socket          | `gabion_gossip_bind ADDR:PORT`                               |
-| Cluster identifier     | `gabion_gossip_cluster ID` (any non-zero u128)               |
+| Cluster identifier     | `gabion_gossip_cluster ID` (non-zero u128, decimal or `0x` hex) |
 | Discovery filter       | `gabion_discovery_namespace_allow`, `gabion_discovery_service_allow`, `gabion_discovery_self_addr` |
 
 A complete cluster-side `http {}` block:
@@ -750,7 +756,8 @@ gabion: `gabion_limit_rule` argument `rate=100r/fortnight` is invalid: rate peri
 gabion: `gabion_limit_rule` rule `inverted`: `window=` must be at least as long as the rate's period; a sub-period window would resolve to a zero limit. To enforce N requests in a shorter span, write the period into the rate itself (e.g. `rate=100r/500ms`).
 gabion: `gabion_limit_rule` rule `per_ip` is declared more than once; rule names must be unique within an http {} block
 gabion: `gabion_limit` references rule `tenant_api`, which is not declared via `gabion_limit_rule`
-gabion: `gabion_gossip_cluster` rejected value `0`: expected a non-zero 128-bit cluster identifier shared by every peer (e.g. `1`, any u128 literal)
+gabion: `gabion_gossip_cluster` rejected value `0`: expected a non-zero 128-bit cluster identifier shared by every peer, in decimal or `0x`-prefixed hex (e.g. `1`, `0xc0ffee`)
+gabion: rules are declared but `gabion_gossip_bind` is not set, so no request would ever be counted or limited. Workers hand their hits to the gossip leader, which runs only with a gossip socket, even on a single node. Add `gabion_gossip_bind 127.0.0.1:9000;` to the http {} block for one node, or `0.0.0.0:9000` to share counts across replicas.
 gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a duration like `100ms` or `1s`
 ```
 
@@ -763,7 +770,8 @@ gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a 
 | `gabion_limit_rule rule X is declared more than once`                         | Two `gabion_limit_rule X ...` directives with the same name. The grammar is unambiguous; almost always a copy-paste bug.                            | Pick distinct names.                                                                                                             |
 | `gabion_limit_rule argument 'rate=0r/s' is invalid`                           | Zero rate; would deny all traffic.                                                                                                                  | Pick a non-zero positive integer. To temporarily disable a rule, use `mode=disabled`.                                            |
 | `gabion_limit_rule rule X: window= must be at least as long as the rate's period` | `window=` was paired with a rate whose period is longer (e.g. `rate=200r/s window=500ms`); the resolved limit would be zero.                    | Move the period into the rate itself (e.g. `rate=100r/500ms`) instead of pairing a short window with a longer-period rate.       |
-| `gabion_gossip_cluster rejected value 0`                                      | The cluster ID parsed to `0`, which is almost certainly unintended.                                                                                 | Pick any non-zero u128 value shared by every peer (`1`, `0xc0ffee`).                                                             |
+| `gabion_gossip_cluster rejected value 0`                                      | The cluster ID parsed to `0`, which is almost certainly unintended.                                                                                 | Pick any non-zero u128 value shared by every peer, in decimal or `0x`-prefixed hex (`1`, `0xc0ffee`).                            |
+| `rules are declared but gabion_gossip_bind is not set`                        | The config declares rules but no gossip socket, so the leader that counts hits would never start and every request would be admitted uncounted.     | Add `gabion_gossip_bind 127.0.0.1:9000;` on one node, or `0.0.0.0:9000` to share counts across replicas.                         |
 | `gabion: <directive> rejected value 'X': expected a duration like '100ms'`    | A tuning directive received a value it couldn't parse.                                                                                              | The error names the directive and the expected format; supply a humantime duration (`100ms`, `5s`).                              |
 | Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`      | A client crossed a rule's limit.                                                                                                                    | Expected. `Retry-After` says how long to back off; the rule with the longest window owns the header.                             |
 | `400 Bad Request` from gabion                                                 | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits (`512` by default).                  | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
