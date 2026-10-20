@@ -6,9 +6,7 @@
 use std::ffi::{c_char, c_void};
 use std::net::SocketAddr;
 use std::ptr;
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ngx::core;
@@ -17,7 +15,8 @@ use ngx::ffi::{
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF,
     NGX_LOG_EMERG, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_exiting,
     ngx_http_handler_pt, ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t,
-    ngx_module_t, ngx_pool_cleanup_add, ngx_str_t, ngx_uint_t,
+    ngx_module_t, ngx_pool_cleanup_add, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_alloc,
+    ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
     self, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, MergeConfigError,
@@ -49,27 +48,7 @@ use crate::shm::{Layout, ShmRegion};
 const DEFAULT_QUEUE_CAPACITY: usize = 2048;
 const DEFAULT_AGGREGATE_CAPACITY: usize = 4096;
 
-static SHM_PTR: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
-static SHM_LEN: AtomicUsize = AtomicUsize::new(0);
-static SHM_QUEUE_CAPACITY: AtomicUsize = AtomicUsize::new(0);
-static SHM_AGGREGATE_CAPACITY: AtomicUsize = AtomicUsize::new(0);
-
-/// Per-worker shared state. Set during config phase by the master process so
-/// every fork sees the same pointers in this static.
-static WORKER_GLOBALS: OnceLock<WorkerGlobals> = OnceLock::new();
-static LEADER_THREAD: std::sync::Mutex<Option<LeaderHandle>> = std::sync::Mutex::new(None);
-
-struct WorkerGlobals {
-    region: ShmRegion,
-    rules: Arc<CompiledRules>,
-    discovery: DiscoveryConfig,
-    gossip: GossipSettings,
-    storage: StorageSettings,
-    cardinality: CardinalitySettings,
-    gossip_bind: Option<SocketAddr>,
-    identity_seed: Option<Box<str>>,
-    rng_seed: Option<u64>,
-}
+static LEADER_THREAD: Mutex<Option<LeaderHandle>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StorageSettings {
@@ -215,20 +194,26 @@ impl http::HttpModule for Module {
             *handler = Some(gabion_access_handler);
         }
 
-        // Install WORKER_GLOBALS now that all `gabion_limit_*` directives
-        // have been processed. From here on out workers fork and inherit
-        // the mapping + the OnceLock-populated static.
-        //
-        // The FFI-backed `BindingCompiler` resolves every rule's binding
-        // sources against the cycle's variable index before fork, so
-        // workers never call the config-phase FFI APIs.
-        // SAFETY: `cf` is a non-null, fully-initialised pointer received
-        // from nginx and exclusively owned for the duration of this
-        // callback. The shared reborrow below is bounded by the immediate
-        // call.
-        if let Some(main) = Module::main_conf(&*cf) {
-            if !install_worker_globals(cf, main) {
-                return core::Status::NGX_ERROR.into();
+        // Compile the rules now that every `gabion_limit_*` directive has
+        // been read. Bindings resolve against this cycle's variables and
+        // pool, so each config keeps its own compiled rules: workers forked
+        // from it read them, and a reload compiles fresh ones.
+        if let Some(main) = Module::main_conf_mut(&*cf)
+            && main.layout.is_some()
+            && !main.rules.is_empty()
+        {
+            let mut compiler = NgxBindingCompiler { cf };
+            match CompiledRules::compile_with(&main.rules, main.cardinality, &mut compiler) {
+                Ok(rules) => main.compiled = Some(Arc::new(rules)),
+                Err(error) => {
+                    ngx::ngx_conf_log_error!(
+                        NGX_LOG_EMERG,
+                        cf,
+                        "gabion: rule compile failed: {}",
+                        error
+                    );
+                    return core::Status::NGX_ERROR.into();
+                }
             }
         }
         core::Status::NGX_OK.into()
@@ -237,8 +222,13 @@ impl http::HttpModule for Module {
 
 #[derive(Debug, Default)]
 struct MainConfig {
-    zone_name: Option<Box<str>>,
+    /// Set by `gabion_limit_zone`.
+    layout: Option<Layout>,
+    /// Set by `init_zone` once nginx has mapped the zone.
+    region: Option<ShmRegion>,
     rules: Vec<RuleConfig>,
+    /// `rules` compiled against this config, set in `postconfiguration`.
+    compiled: Option<Arc<CompiledRules>>,
     discovery: DiscoveryConfig,
     gossip: GossipSettings,
     storage: StorageSettings,
@@ -246,8 +236,14 @@ struct MainConfig {
     gossip_bind: Option<SocketAddr>,
     identity_seed: Option<Box<str>>,
     rng_seed: Option<u64>,
-    queue_capacity: usize,
-    aggregate_capacity: usize,
+}
+
+impl MainConfig {
+    /// The shared region and compiled rules, once a zone and a rule are
+    /// configured.
+    fn active(&self) -> Option<(ShmRegion, &Arc<CompiledRules>)> {
+        Some((self.region?, self.compiled.as_ref()?))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -675,17 +671,20 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
         // disabling the module itself (which `gabion off` does).
         return core::Status::NGX_DECLINED;
     }
-    let Some(globals) = WORKER_GLOBALS.get() else {
+    let Some(main) = Module::main_conf(request) else {
+        return core::Status::NGX_DECLINED;
+    };
+    let Some((region, rules)) = main.active() else {
         return core::Status::NGX_DECLINED;
     };
 
     let ctx = AccessCtx {
-        rules: &globals.rules,
-        aggregate: globals.region.aggregate(),
-        queue: globals.region.queue(),
-        stats: globals.region.stats(),
+        rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
         domain: DEFAULT_DOMAIN,
-        cardinality: globals.cardinality,
+        cardinality: main.cardinality,
     };
     let vars = RequestVariables { request };
     let now = wall_millis();
@@ -836,7 +835,7 @@ extern "C" fn set_zone(
     // this call. See the nomicon chapters on FFI and raw pointers.
     unsafe {
         let main = &mut *(conf as *mut MainConfig);
-        if main.zone_name.is_some() {
+        if main.layout.is_some() {
             ngx::ngx_conf_log_error!(
                 NGX_LOG_EMERG,
                 cf,
@@ -892,63 +891,97 @@ extern "C" fn set_zone(
             );
             return core::NGX_CONF_ERROR;
         };
-        let queue_capacity = if main.queue_capacity == 0 {
-            DEFAULT_QUEUE_CAPACITY
-        } else {
-            main.queue_capacity
-        };
-        let aggregate_capacity = if main.aggregate_capacity == 0 {
-            DEFAULT_AGGREGATE_CAPACITY
-        } else {
-            main.aggregate_capacity
-        };
-
-        let Some(layout) = Layout::new(queue_capacity, aggregate_capacity) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: invalid SHM layout (queue_capacity={}, aggregate_capacity={})",
-                queue_capacity,
-                aggregate_capacity
-            );
+        let Some(layout) = Layout::new(DEFAULT_QUEUE_CAPACITY, DEFAULT_AGGREGATE_CAPACITY) else {
+            ngx::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "gabion: invalid SHM layout");
             return core::NGX_CONF_ERROR;
         };
-        let total = bytes.max(layout.total_bytes);
-
-        let mapped = mmap_shared(total);
-        if mapped.is_null() {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: failed to mmap {} bytes of shared memory for zone `{}`",
-                total,
-                name
-            );
+        let mut zone_name = ngx_str_t {
+            len: name.len(),
+            data: name.as_ptr().cast_mut(),
+        };
+        // nginx's slab allocator keeps its bookkeeping at the start of the
+        // zone, so leave it room beside the region.
+        let shm_zone = ngx_shared_memory_add(
+            cf,
+            &mut zone_name,
+            bytes.max(2 * layout.total_bytes),
+            ptr::addr_of_mut!(ngx_http_gabion_module).cast(),
+        );
+        if shm_zone.is_null() {
             return core::NGX_CONF_ERROR;
         }
-        let region = ShmRegion::initialize(mapped, layout);
-
-        // Stamp the node identity into the SHM header — once, before fork.
-        let identity = derive_identity(main.identity_seed.as_deref());
-        region.header().identity.store_node_id(identity.node_id.0);
-
-        // Anchor the lease clock before fork so every worker inherits it.
-        now_millis();
-
-        SHM_PTR.store(mapped, Ordering::Release);
-        SHM_LEN.store(total, Ordering::Release);
-        SHM_QUEUE_CAPACITY.store(queue_capacity, Ordering::Release);
-        SHM_AGGREGATE_CAPACITY.store(aggregate_capacity, Ordering::Release);
-        main.zone_name = Some(name.into());
-        tracing::info!(
-            zone = name,
-            bytes = total,
-            queue = queue_capacity,
-            aggregate = aggregate_capacity,
-            "gabion: zone allocated",
-        );
+        (*shm_zone).init = Some(init_zone);
+        (*shm_zone).data = ptr::from_mut(main).cast();
+        main.layout = Some(layout);
         core::NGX_CONF_OK
     }
+}
+
+/// nginx zone `init` callback for `gabion_limit_zone`. nginx runs it in the
+/// master after the whole config is parsed. On a reload that keeps the
+/// zone's name and size, nginx reuses the mapping and passes the previous
+/// config as `data`, so counts, the leader lease and the queue carry over;
+/// otherwise the zone is new and the region is carved out of it.
+unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void) -> ngx_int_t {
+    // SAFETY: `set_zone` pointed this zone's `data` at its config's boxed
+    // `MainConfig`, which lives until that config's pool is destroyed. nginx
+    // passes the previous config's `data` when it reuses the zone, and keeps
+    // that config alive until the new one is initialised.
+    let (zone, main, previous) = unsafe {
+        (
+            &*shm_zone,
+            &mut *(*shm_zone).data.cast::<MainConfig>(),
+            data.cast::<MainConfig>().as_ref(),
+        )
+    };
+    let Some(layout) = main.layout else {
+        return core::Status::NGX_ERROR.into();
+    };
+    let region = match previous.and_then(|previous| previous.region) {
+        Some(region) => region,
+        None => {
+            if LEADER_THREAD.lock().is_ok_and(|slot| slot.is_some()) {
+                tracing::error!(
+                    "gabion: this reload changes `gabion_limit_zone`, but with `master_process \
+                     off` the running leader thread still uses the old zone, which nginx is about \
+                     to free. nginx keeps the previous configuration. Restart nginx to change the \
+                     zone.",
+                );
+                return core::Status::NGX_ERROR.into();
+            }
+            // SAFETY: nginx initialised a slab pool at the start of every new
+            // zone it maps. Allocations above half a page come back
+            // page-aligned, which is the alignment `ShmRegion` needs, and the
+            // block is ours alone.
+            let base = unsafe { ngx_slab_alloc(zone.shm.addr.cast(), layout.total_bytes) };
+            if base.is_null() {
+                tracing::error!(
+                    "gabion: `gabion_limit_zone` is too small for gabion's {} bytes of state. \
+                     Raise its size.",
+                    layout.total_bytes,
+                );
+                return core::Status::NGX_ERROR.into();
+            }
+            // SAFETY: `base` is a fresh, exclusively owned, page-aligned block
+            // of `layout.total_bytes`, which nginx keeps mapped in every
+            // worker forked from this config.
+            unsafe { ShmRegion::initialize(base.cast(), layout) }
+        }
+    };
+    // Stamp the identity on every config load so a changed
+    // `gabion_node_id_seed` takes effect, and anchor the lease clock, both
+    // before fork.
+    let identity = derive_identity(main.identity_seed.as_deref());
+    region.header().identity.store_node_id(identity.node_id.0);
+    now_millis();
+    main.region = Some(region);
+    tracing::info!(
+        zone = %String::from_utf8_lossy(zone.shm.name.as_bytes()),
+        bytes = zone.shm.size,
+        reused = previous.is_some(),
+        "gabion: zone ready",
+    );
+    core::Status::NGX_OK.into()
 }
 
 /// nginx directive handler for `gabion_limit_rule`. Shape:
@@ -1915,47 +1948,6 @@ unsafe fn single_arg(cf: *mut ngx_conf_t) -> Option<&'static str> {
 
 // -- worker globals + lifecycle --------------------------------------------
 
-fn install_worker_globals(cf: *mut ngx_conf_t, main: &MainConfig) -> bool {
-    let ptr = SHM_PTR.load(Ordering::Acquire);
-    let len = SHM_LEN.load(Ordering::Acquire);
-    let queue_capacity = SHM_QUEUE_CAPACITY.load(Ordering::Acquire);
-    let aggregate_capacity = SHM_AGGREGATE_CAPACITY.load(Ordering::Acquire);
-    if ptr.is_null() || len == 0 || main.rules.is_empty() {
-        return true;
-    }
-    let Some(layout) = Layout::new(queue_capacity, aggregate_capacity) else {
-        return false;
-    };
-    // SAFETY: `ptr` was set by `set_zone` (running earlier in this same
-    // master process during config parsing) to the base of the freshly
-    // `mmap`'d shared region, sized to at least `layout.total_bytes`, and
-    // already initialised by `ShmRegion::initialize`. The mapping outlives
-    // every reader (it is never `munmap`'d), and the `Layout` matches the
-    // one originally used. These together are the contract documented on
-    // `ShmRegion::from_initialized`.
-    let region = unsafe { ShmRegion::from_initialized(ptr, layout) };
-    let mut compiler = NgxBindingCompiler { cf };
-    let rules = match CompiledRules::compile_with(&main.rules, main.cardinality, &mut compiler) {
-        Ok(r) => Arc::new(r),
-        Err(error) => {
-            ngx::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "gabion: rule compile failed: {}", error);
-            return false;
-        }
-    };
-    let _ = WORKER_GLOBALS.set(WorkerGlobals {
-        region,
-        rules,
-        discovery: main.discovery.clone(),
-        gossip: main.gossip.clone(),
-        storage: main.storage,
-        cardinality: main.cardinality,
-        gossip_bind: main.gossip_bind,
-        identity_seed: main.identity_seed.clone(),
-        rng_seed: main.rng_seed,
-    });
-    true
-}
-
 /// FFI-backed implementation of [`crate::rules::BindingCompiler`].
 ///
 /// At config phase, resolves single-variable bindings to a stable
@@ -1989,26 +1981,25 @@ impl BindingCompiler for NgxBindingCompiler {
         // 2. Single $identifier: resolve through nginx's indexed-variable
         //    table. Hashing happens inside the call once at config phase;
         //    per-request lookups are O(1).
-        if let Some(stripped) = source.strip_prefix('$') {
-            if crate::rules::is_single_ident(stripped) {
-                let mut name_str = ngx_str_t {
-                    len: stripped.len(),
-                    data: stripped.as_ptr() as *mut _,
-                };
-                // SAFETY: `self.cf` is valid for the duration of
-                // `postconfiguration`. `name_str` borrows from `source`
-                // which lives at least as long as this call. nginx hashes
-                // and copies the name internally.
-                let index =
-                    unsafe { ngx::ffi::ngx_http_get_variable_index(self.cf, &mut name_str) };
-                if index == ngx::core::Status::NGX_ERROR.0 {
-                    return Err(NgxBindingError::UnknownVariable(stripped.to_string()));
-                }
-                return Ok(BindingLookup::IndexedVariable {
-                    name: stripped.into(),
-                    index: index as i64,
-                });
+        if let Some(stripped) = source.strip_prefix('$')
+            && crate::rules::is_single_ident(stripped)
+        {
+            let mut name_str = ngx_str_t {
+                len: stripped.len(),
+                data: stripped.as_ptr() as *mut _,
+            };
+            // SAFETY: `self.cf` is valid for the duration of
+            // `postconfiguration`. `name_str` borrows from `source`
+            // which lives at least as long as this call. nginx hashes
+            // and copies the name internally.
+            let index = unsafe { ngx::ffi::ngx_http_get_variable_index(self.cf, &mut name_str) };
+            if index == ngx::core::Status::NGX_ERROR.0 {
+                return Err(NgxBindingError::UnknownVariable(stripped.to_string()));
             }
+            return Ok(BindingLookup::IndexedVariable {
+                name: stripped.into(),
+                index: index as i64,
+            });
         }
         // 3. Template: compile to an ngx_http_complex_value_t in the cycle
         //    pool. Allocates two structs (the input ccv and the output
@@ -2047,21 +2038,22 @@ impl BindingCompiler for NgxBindingCompiler {
 /// nginx `init_process` hook. Invoked once per worker process immediately
 /// after fork, before the worker enters its event loop. nginx guarantees the
 /// `cycle` argument points to a valid `ngx_cycle_t` for the duration of the
-/// call; we do not dereference it here.
-unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
+/// call.
+unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     // Workers inherit the global tracing dispatch via fork; re-install is
     // idempotent and covers any path that bypassed `preconfiguration`.
     log::install();
 
-    let Some(globals) = WORKER_GLOBALS.get() else {
+    // SAFETY: nginx passes a valid cycle, per the doc above.
+    let Some(main) = Module::main_conf(unsafe { &*cycle }) else {
         return core::Status::NGX_OK.into();
     };
-    let Some(gossip_bind) = globals.gossip_bind else {
+    let (Some((region, rules)), Some(gossip_bind)) = (main.active(), main.gossip_bind) else {
         return core::Status::NGX_OK.into();
     };
 
     let worker_id = std::process::id();
-    let rng_seed = match globals.rng_seed {
+    let rng_seed = match main.rng_seed {
         Some(seed) => seed,
         None => match defaults::random_rng_seed() {
             Ok(seed) => seed,
@@ -2086,18 +2078,17 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
     let cfg = LeaderConfig {
         worker_id,
         gossip_bind,
-        gossip: globals.gossip.clone(),
-        discovery: globals.discovery.clone(),
-        cell_store: globals.storage.cell_store_config(),
+        gossip: main.gossip.clone(),
+        discovery: main.discovery.clone(),
+        cell_store: main.storage.cell_store_config(),
         rng_seed,
         max_inflight: leader::DEFAULT_MAX_INFLIGHT,
         drain_tick: leader::DEFAULT_DRAIN_TICK,
         lease_tick: leader::DEFAULT_LEASE_TICK,
         lease_ttl: leader::DEFAULT_LEASE_TTL,
-        identity_seed: globals.identity_seed.clone(),
     };
 
-    let handle = match leader::spawn(globals.region, globals.rules.clone(), cfg) {
+    let handle = match leader::spawn(region, rules.clone(), cfg) {
         Ok(h) => h,
         Err(error) => {
             // Panicking here would unwind into nginx's C frame, so log and
@@ -2155,9 +2146,11 @@ fn watch_for_shutdown() {
 
 /// nginx `exit_process` hook. Invoked once per worker process when nginx is
 /// shutting that worker down. `cycle` follows the same contract as in
-/// `gabion_init_process`; we do not dereference it.
-unsafe extern "C" fn gabion_exit_process(_cycle: *mut ngx_cycle_t) {
-    let Some(globals) = WORKER_GLOBALS.get() else {
+/// `gabion_init_process`.
+unsafe extern "C" fn gabion_exit_process(cycle: *mut ngx_cycle_t) {
+    // SAFETY: nginx passes a valid cycle, per `gabion_init_process`.
+    let Some((region, _)) = Module::main_conf(unsafe { &*cycle }).and_then(MainConfig::active)
+    else {
         return;
     };
     // Stop the leader thread before anything else: it renews the lease and
@@ -2183,7 +2176,7 @@ unsafe extern "C" fn gabion_exit_process(_cycle: *mut ngx_cycle_t) {
     }
     // The thread releases the lease on its way out; this covers a thread
     // that panicked while holding it.
-    globals.region.lease().release(std::process::id());
+    region.lease().release(std::process::id());
 }
 
 // -- helpers ----------------------------------------------------------------
@@ -2209,55 +2202,4 @@ fn wall_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn mmap_shared(size: usize) -> *mut u8 {
-    // SAFETY: This is a plain libc `mmap` declaration. We match the standard
-    // POSIX prototype exactly, so calling the libc symbol with these
-    // argument types is well-defined. See the nomicon chapter on FFI.
-    unsafe extern "C" {
-        fn mmap(
-            addr: *mut c_void,
-            len: usize,
-            prot: i32,
-            flags: i32,
-            fd: i32,
-            offset: isize,
-        ) -> *mut c_void;
-    }
-    const PROT_READ: i32 = 0x1;
-    const PROT_WRITE: i32 = 0x2;
-    const MAP_SHARED: i32 = 0x01;
-    #[cfg(target_os = "linux")]
-    const MAP_ANONYMOUS: i32 = 0x20;
-    #[cfg(target_os = "macos")]
-    const MAP_ANONYMOUS: i32 = 0x1000;
-    const MAP_FAILED: *mut c_void = !0_usize as *mut c_void;
-
-    // SAFETY: This is a well-formed POSIX `mmap` call:
-    //   - `addr` is null, asking the kernel to choose the location;
-    //   - `MAP_ANONYMOUS` is set, so `fd = -1` and `offset = 0` are the
-    //     mandated sentinel values (no file is being mapped);
-    //   - `MAP_SHARED` produces pages that survive `fork()` and are visible to
-    //     every child — exactly what the worker pool needs;
-    //   - the returned pages are kernel-owned and live until either the process
-    //     exits or we `munmap` them. v1 never `munmap`s, so the pointer is
-    //     valid for the full lifetime of the nginx master process (and
-    //     inherited workers).
-    // On failure mmap returns `MAP_FAILED`, which we convert to a null
-    // pointer for the caller.
-    let mapped = unsafe {
-        mmap(
-            ptr::null_mut(),
-            size,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if mapped == MAP_FAILED {
-        return ptr::null_mut();
-    }
-    mapped.cast()
 }

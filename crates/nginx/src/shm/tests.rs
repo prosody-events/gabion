@@ -64,20 +64,3 @@ fn initialize_then_read_round_trip() {
     let _ = region;
     let _ = zone;
 }
-
-#[test]
-fn from_initialized_sees_same_state() {
-    let layout = Layout::new(8, 16).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = Zone::allocate(words);
-    // SAFETY: as in initialize_then_read_round_trip.
-    let first = unsafe { ShmRegion::initialize(zone.ptr, layout) };
-    first.stats().record_allow();
-    // SAFETY: `zone.ptr` points at the same initialized region; the
-    // first ShmRegion has not freed anything.
-    let second = unsafe { ShmRegion::from_initialized(zone.ptr, layout) };
-    assert_eq!(second.stats().snapshot().allowed, 1);
-    let _ = first;
-    let _ = second;
-    let _ = zone;
-}

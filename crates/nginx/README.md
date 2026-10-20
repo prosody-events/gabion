@@ -48,11 +48,15 @@ http {
         listen 8080;
         location / {
             gabion_limit per_ip;
-            return 200 "ok\n";
+            root html;
         }
     }
 }
 ```
+
+gabion runs in nginx's access phase, so it never sees a request that a
+`return` directive answers first: `return` runs in the earlier rewrite
+phase.
 
 A request under budget gets `200 OK`; hammering the same IP past 100
 in one second gets `429 Too Many Requests` together with
@@ -255,6 +259,12 @@ Allocates the shared-memory zone that holds the local-aggregate
 counters, the SHM queue, and the per-zone `Stats`. Required exactly
 once per `http {}` block. Mirrors nginx core's `limit_req_zone
 zone=name:size`.
+
+Like nginx's own zones, a zone survives `nginx -s reload` when its
+name and size are unchanged: counts, the node identity and the gossip
+leader carry over, and the log line `gabion: zone ready` says
+`reused=true`. Changing the name or size starts an empty zone, and the
+master releases the old one once no configuration uses it.
 
 ```nginx
 gabion_limit_zone zone=api:128m;
