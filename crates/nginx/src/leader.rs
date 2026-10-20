@@ -47,8 +47,9 @@ pub const DEFAULT_LEASE_TICK: Duration = Duration::from_millis(300);
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(1);
 
 /// Ceiling on the back-off between leadership attempts after a leader
-/// fails. The back-off starts at the lease TTL and doubles per failure.
-pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// fails. The back-off starts at the lease TTL, doubles per failure, and
+/// starts over once a leader has run at least this long.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Configuration the leader thread needs to bring up its tokio runtime.
 #[derive(Clone, Debug)]
@@ -273,11 +274,16 @@ async fn campaign(
             worker_id = config.worker_id,
             "gabion: worker won leader lease"
         );
+        let led_since = tokio::time::Instant::now();
         let outcome = leader_main(shm, &rules, &config, &mut stopped).await;
         lease.release(config.worker_id);
         let Err(error) = outcome else {
             return;
         };
+        // A leader that ran for a while was healthy; back off from scratch.
+        if led_since.elapsed() >= MAX_RETRY_DELAY {
+            retry_delay = config.lease_ttl;
+        }
         tracing::error!(
             worker_id = config.worker_id,
             error = format!("{error:#}"),

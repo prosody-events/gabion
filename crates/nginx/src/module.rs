@@ -2071,8 +2071,19 @@ unsafe extern "C" fn gabion_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t 
         None => match defaults::random_rng_seed() {
             Ok(seed) => seed,
             Err(error) => {
-                tracing::error!(%error, "gabion: failed to draw gossip RNG seed");
-                return core::Status::NGX_ERROR.into();
+                // Not NGX_ERROR: nginx never respawns a worker whose
+                // `init_process` fails, and every worker runs this, so
+                // failing here would take down the whole server.
+                tracing::error!(
+                    worker_id,
+                    %error,
+                    "gabion: failed to draw gossip RNG seed, so this worker \
+                     will never drive gossip. It is still serving requests \
+                     against the shared SHM aggregate. Usually a sandbox is \
+                     denying `/dev/urandom`; lift the restriction or set \
+                     `gabion_runtime_rng_seed N`, then restart nginx.",
+                );
+                return core::Status::NGX_OK.into();
             }
         },
     };
