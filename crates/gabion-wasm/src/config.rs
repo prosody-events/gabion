@@ -158,7 +158,8 @@ impl SimConfig {
         let ceiling = MAX_NODES as u32;
         // Each origin contributes its `live_buckets` cells plus the one
         // emerging. A node holds a replica of every origin's set, so the cell
-        // store and forwarded-dirty ring both scale with `ceiling × per_origin`.
+        // store and forwarded-dirty ring both scale with `ceiling ×
+        // per_origin`.
         let per_origin = live_buckets + 1;
         let cross_node = ceiling
             .saturating_mul(per_origin)

@@ -1604,8 +1604,8 @@ fn rule_descriptor_epoch_helpers_pin_window_math() {
     assert_eq!(rd.oldest_live_epoch(12_345), 2);
 
     // Wire-only rule (bucket_millis == 0): the never-expire sentinel. Both
-    // current and live collapse to 0, so the oldest live epoch stays 0 and every
-    // stored bucket is retained.
+    // current and live collapse to 0, so the oldest live epoch stays 0 and
+    // every stored bucket is retained.
     let wire_only = RuleDescriptor {
         window_millis: 0,
         bucket_millis: 0,

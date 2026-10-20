@@ -198,7 +198,8 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
         // Compute the workload hits issued in (elapsed, elapsed+sample].
         let step_end = (elapsed + sample).min(duration);
 
-        // Apply any scheduled network change whose `at` is in (elapsed, step_end].
+        // Apply any scheduled network change whose `at` is in (elapsed,
+        // step_end].
         while next_schedule_idx < scenario.network.schedule.len() {
             let change = &scenario.network.schedule[next_schedule_idx];
             if change.at <= step_end {

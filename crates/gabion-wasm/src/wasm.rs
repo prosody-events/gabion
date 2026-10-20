@@ -57,10 +57,10 @@ impl Sim {
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         // The engine drives virtual time itself through `ManualClock` (see the
-        // module-level R2 note), so it needs no tokio time driver — `spawn_local`
-        // is all the executor it requires. The node smoke test confirms the
-        // spawned task runs the full submit → gossip → snapshot loop on the wasm
-        // microtask queue.
+        // module-level R2 note), so it needs no tokio time driver —
+        // `spawn_local` is all the executor it requires. The node smoke
+        // test confirms the spawned task runs the full submit → gossip
+        // → snapshot loop on the wasm microtask queue.
         wasm_bindgen_futures::spawn_local(async move {
             let _ = run_engine(config, cmd_rx).await;
         });

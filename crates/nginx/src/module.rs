@@ -1991,9 +1991,9 @@ impl BindingCompiler for NgxBindingCompiler {
         if let Some(b) = crate::rules::compile_inline(source) {
             return Ok(b);
         }
-        // 2. Single $identifier: resolve through nginx's indexed-variable table.
-        //    Hashing happens inside the call once at config phase; per-request lookups
-        //    are O(1).
+        // 2. Single $identifier: resolve through nginx's indexed-variable
+        //    table. Hashing happens inside the call once at config phase;
+        //    per-request lookups are O(1).
         if let Some(stripped) = source.strip_prefix('$') {
             if crate::rules::is_single_ident(stripped) {
                 let mut name_str = ngx_str_t {
@@ -2015,9 +2015,9 @@ impl BindingCompiler for NgxBindingCompiler {
                 });
             }
         }
-        // 3. Template: compile to an ngx_http_complex_value_t in the cycle pool.
-        //    Allocates two structs (the input ccv and the output complex_value) against
-        //    `cf->pool`.
+        // 3. Template: compile to an ngx_http_complex_value_t in the cycle
+        //    pool. Allocates two structs (the input ccv and the output
+        //    complex_value) against `cf->pool`.
         // SAFETY: cf is valid; `pool` is the cycle pool; sizeof return
         // values are POD.
         let cv_size = std::mem::size_of::<ngx::ffi::ngx_http_complex_value_t>();
@@ -2206,14 +2206,14 @@ fn mmap_shared(size: usize) -> *mut u8 {
 
     // SAFETY: This is a well-formed POSIX `mmap` call:
     //   - `addr` is null, asking the kernel to choose the location;
-    //   - `MAP_ANONYMOUS` is set, so `fd = -1` and `offset = 0` are the mandated
-    //     sentinel values (no file is being mapped);
+    //   - `MAP_ANONYMOUS` is set, so `fd = -1` and `offset = 0` are the
+    //     mandated sentinel values (no file is being mapped);
     //   - `MAP_SHARED` produces pages that survive `fork()` and are visible to
     //     every child — exactly what the worker pool needs;
     //   - the returned pages are kernel-owned and live until either the process
-    //     exits or we `munmap` them. v1 never `munmap`s, so the pointer is valid
-    //     for the full lifetime of the nginx master process (and inherited
-    //     workers).
+    //     exits or we `munmap` them. v1 never `munmap`s, so the pointer is
+    //     valid for the full lifetime of the nginx master process (and
+    //     inherited workers).
     // On failure mmap returns `MAP_FAILED`, which we convert to a null
     // pointer for the caller.
     let mapped = unsafe {

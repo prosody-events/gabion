@@ -472,10 +472,12 @@ fn bench_ingest_local(c: &mut Criterion) {
                             let rule_idx = pick_rule(rng) as usize;
                             let bucket = pick_bucket(rng);
                             let fp = fixture.rule_fps[rule_idx];
-                            // Mirror the runtime's threshold-trigger arithmetic:
+                            // Mirror the runtime's threshold-trigger
+                            // arithmetic:
                             // lookup the rule slot, bump per-rule pending,
                             // compute ε, compare. We don't store the flag; the
-                            // compare's side effects are observed via `black_box`.
+                            // compare's side effects are observed via
+                            // `black_box`.
                             if let Some(slot) = store.rule_dictionary().find(fp) {
                                 let idx = slot as usize;
                                 let p = pending[idx].saturating_add(1);

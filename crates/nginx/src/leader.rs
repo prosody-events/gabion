@@ -210,27 +210,29 @@ async fn leader_main(
     register_rules(&mut cell_store, &rules);
     // SAFETY: `ShmAggregateStore::new`'s preconditions (see its `# Safety`
     // doc) are upheld:
-    // * `shm.aggregate_slots_ptr()` returns the address of slot 0 of the aggregate
-    //   region. The nginx master called `ShmRegion::initialize` in `set_zone`
-    //   before forking workers, which `ptr::write`s an `AggregateSlot::empty()`
-    //   into each of `layout.aggregate_capacity` slots, so the pointer is non-null,
-    //   cacheline-aligned (and hence aligned for `AggregateSlot`), and points at a
-    //   fully initialized contiguous array of exactly that many slots.
+    // * `shm.aggregate_slots_ptr()` returns the address of slot 0 of the
+    //   aggregate region. The nginx master called `ShmRegion::initialize` in
+    //   `set_zone` before forking workers, which `ptr::write`s an
+    //   `AggregateSlot::empty()` into each of `layout.aggregate_capacity`
+    //   slots, so the pointer is non-null, cacheline-aligned (and hence aligned
+    //   for `AggregateSlot`), and points at a fully initialized contiguous
+    //   array of exactly that many slots.
     // * The `capacity` argument is `shm.layout.aggregate_capacity` — the same
     //   `Layout` value the master used at `initialize` time, so the slot count
-    //   agrees with the mapping. `Layout::new` enforces it is a power of two with
-    //   `>= 2`, and the total byte length fits in the mapping (well under
+    //   agrees with the mapping. `Layout::new` enforces it is a power of two
+    //   with `>= 2`, and the total byte length fits in the mapping (well under
     //   `isize::MAX`).
-    // * The `MAP_SHARED | MAP_ANONYMOUS` region is held by the nginx master for the
-    //   lifetime of the worker process, and this leader thread is joined before the
-    //   worker exits, so the mapping outlives `store` (and any `AggregateTable<'_>`
-    //   derived from it).
-    // * Single-writer: the SHM `LeaderLease` elects at most one leader thread per
-    //   worker process at a time; `ShmAggregateStore` is `!Send + !Sync` (it holds
-    //   `*mut _` + `Cell`), so the type system prevents this store from being
-    //   shared with another thread. Concurrent worker readers go through the
-    //   seqlock/atomic accessors on `AggregateSlot`, which is the data-race-free
-    //   protocol the nomicon's "Send and Sync" / atomics rules require.
+    // * The `MAP_SHARED | MAP_ANONYMOUS` region is held by the nginx master for
+    //   the lifetime of the worker process, and this leader thread is joined
+    //   before the worker exits, so the mapping outlives `store` (and any
+    //   `AggregateTable<'_>` derived from it).
+    // * Single-writer: the SHM `LeaderLease` elects at most one leader thread
+    //   per worker process at a time; `ShmAggregateStore` is `!Send + !Sync`
+    //   (it holds `*mut _` + `Cell`), so the type system prevents this store
+    //   from being shared with another thread. Concurrent worker readers go
+    //   through the seqlock/atomic accessors on `AggregateSlot`, which is the
+    //   data-race-free protocol the nomicon's "Send and Sync" / atomics rules
+    //   require.
     let store = Rc::new(unsafe {
         ShmAggregateStore::new(shm.aggregate_slots_ptr(), shm.layout.aggregate_capacity)
     });

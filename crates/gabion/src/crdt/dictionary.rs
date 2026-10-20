@@ -159,7 +159,8 @@ impl RuleDictionary {
     /// through [`super::CellStore`].
     pub(super) fn intern(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
         if let Some(slot) = self.find(descriptor.fingerprint) {
-            // Replace descriptor metadata (e.g. local_rule_id may have changed).
+            // Replace descriptor metadata (e.g. local_rule_id may have
+            // changed).
             self.descriptors[slot as usize] = descriptor;
             return Some(slot);
         }

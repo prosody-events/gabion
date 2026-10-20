@@ -346,9 +346,9 @@ where
 
         loop {
             // Decide outside the `select!` whether the send arm has work to do.
-            // Reading `self.send_pending.is_empty()` inside the `if` guard would
-            // re-borrow `self` after we've already split-borrowed for the I/O
-            // futures below.
+            // Reading `self.send_pending.is_empty()` inside the `if` guard
+            // would re-borrow `self` after we've already
+            // split-borrowed for the I/O futures below.
             let have_send = !self.send_pending.is_empty();
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
