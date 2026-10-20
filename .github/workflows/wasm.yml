@@ -46,23 +46,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       # The release wasm build (web/package.json `build:wasm`) recompiles
       # std with `-Zbuild-std` for size — that needs nightly's `rust-src`.
-      # It pins `RUSTUP_TOOLCHAIN=nightly` itself, so install nightly
-      # first and leave stable as the default: rust-cache keys on the
-      # default toolchain, and a nightly default rolled the key (and
-      # threw the cache away) every time nightly moved.
+      # Installed last, nightly is the default toolchain rust-cache keys
+      # on, which is right: `build:wasm` is the expensive, nightly-compiled
+      # half of this cache. It saves on PRs too, for the same reason as
+      # safety.yml's Miri jobs — the key moves whenever nightly does.
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
           targets: wasm32-unknown-unknown
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      # Only `main` saves; PRs restore main's entry (see check.yml).
       - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
           # Pin the wasm-pack version: the action's `latest` resolver is

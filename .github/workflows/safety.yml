@@ -48,15 +48,15 @@ jobs:
           components: miri,rust-src
       # All four Miri jobs compile the same crate graph and sysroot —
       # MIRIFLAGS only steers the interpreter, not rustc — so they share
-      # one cache entry, saved by `miri-lib` alone (each job used to keep
-      # its own copy, four per ref). Unlike the stable jobs, `miri-lib`
-      # saves on PRs too: the key embeds the nightly rustc hash, so main's
-      # entry goes stale whenever nightly moves, and a PR's own entry is
-      # what keeps its follow-up pushes warm.
+      # one cache entry instead of keeping four copies per ref. Every job
+      # may save it: the first to succeed writes the entry, so one failing
+      # suite can't leave the rest cold. Unlike the stable jobs these save
+      # on PRs too: the key embeds the nightly rustc hash, so main's entry
+      # goes stale whenever nightly moves, and a PR's own entry is what
+      # keeps its follow-up pushes warm.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: miri
-          save-if: false
           # miri builds its sysroot into ~/.cache/miri (MIRI_SYSROOT is
           # unset), outside the paths rust-cache captures by default —
           # without this it rebuilds the sysroot cold every run.
@@ -80,7 +80,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: miri
-          save-if: false
           # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
           # isn't captured by default.
           cache-directories: ~/.cache/miri
@@ -129,7 +128,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: miri
-          save-if: false
           # See miri-safety: shared entry, and the sysroot in ~/.cache/miri
           # isn't captured by default.
           cache-directories: ~/.cache/miri

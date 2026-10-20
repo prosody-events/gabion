@@ -75,11 +75,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      # `shared-key: test` lets kubernetes.yml's `kubernetes-test` (a subset
-      # of this build, same profile and env) restore this entry too.
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Prebuilt nextest binary — `cargo-install` compiles it from source
       # on a cache miss (minutes); `install-action` fetches the release.

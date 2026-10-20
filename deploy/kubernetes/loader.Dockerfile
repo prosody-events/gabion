@@ -19,7 +19,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build -p gabion-loader --release \
     && mkdir -p /out \
-    && cp target/release/gabion-loader /out/gabion-loader
+    && cp target/release/gabion-loader /out/gabion-loader \
+    && rm -rf target
 
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates

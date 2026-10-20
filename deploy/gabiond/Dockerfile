@@ -22,6 +22,9 @@ COPY --from=planner /workspace/recipe.json recipe.json
 # to the next runner. A cache mount lives outside the layer and starts
 # empty on every ephemeral CI runner, which left this step a cached no-op
 # and pushed the full dependency compile into the build step below.
+# The build step drops target/ once the binary is copied out: that layer
+# depends on `COPY crates`, so it can never be reused, and leaving the
+# workspace artifacts in it only bloats every `mode=max` cache export.
 RUN cargo chef cook --release --package gabion-server --no-default-features --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
@@ -29,7 +32,8 @@ COPY crates ./crates
 
 RUN cargo build -p gabion-server --release --bin gabiond --no-default-features \
     && mkdir -p /out \
-    && cp target/release/gabiond /out/gabiond
+    && cp target/release/gabiond /out/gabiond \
+    && rm -rf target
 
 FROM alpine:3.22
 

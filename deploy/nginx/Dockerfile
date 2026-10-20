@@ -50,9 +50,7 @@ RUN if command -v apk >/dev/null 2>&1; then \
 
 WORKDIR /workspace
 
-RUN --mount=type=cache,id=gabion-cargo-registry,target=/root/.cargo/registry \
-    --mount=type=cache,id=gabion-cargo-git,target=/root/.cargo/git \
-    if ! command -v cargo-chef >/dev/null 2>&1; then \
+RUN if ! command -v cargo-chef >/dev/null 2>&1; then \
         cargo install cargo-chef --locked; \
     fi
 
@@ -88,7 +86,8 @@ RUN nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
        NGINX_BUILD_DIR="/workspace/nginx-${nginx_version}/objs" \
        cargo build -p gabion-nginx --release --features ngx-module \
     && mkdir -p /out \
-    && cp target/release/libgabion_nginx.so /out/ngx_http_gabion_module.so
+    && cp target/release/libgabion_nginx.so /out/ngx_http_gabion_module.so \
+    && rm -rf target
 
 FROM ${NGINX_BASE_IMAGE} AS published
 
