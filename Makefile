@@ -116,6 +116,7 @@ help:
 	@printf '%s\n' '  make test            Run formatting, clippy, workspace tests, hygiene, and safety tests'
 	@printf '%s\n' '  make unit            Run cargo nextest across the workspace (the only sanctioned test runner)'
 	@printf '%s\n' '  make safety          Run gabion-nginx safety integration tests (cargo nextest)'
+	@printf '%s\n' '  make loom            Model-check the SHM queue, leader lease and aggregate seqlock with loom (cargo nextest)'
 	@printf '%s\n' '  make miri-safety     Run safety tests under miri (Stacked Borrows)'
 	@printf '%s\n' '  make miri-safety-tb  Run safety tests under miri (Tree Borrows)'
 	@printf '%s\n' '  make miri-ffi-alignment    Run FFI alignment tests under miri (Stacked Borrows)'
@@ -134,7 +135,7 @@ help:
 	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local kind NGINX plus Gabion server gossip test'
 	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local kind gossip propagation benchmark'
 	@printf '%s\n' '  make kubernetes-clean Delete local Kubernetes test namespaces'
-	@printf '%s\n' '  make ci              Fast contributor pre-merge: test, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
+	@printf '%s\n' '  make ci              Fast contributor pre-merge: test, loom, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
 	@printf '%s\n' '  make ci-full         Mirror GitHub Actions end-to-end: ci + miri-all + every kubernetes-* target'
 
 .PHONY: fmt
@@ -163,6 +164,13 @@ unit: require-nextest
 .PHONY: safety
 safety: require-nextest
 	$(CARGO_ENV) $(NEXTEST) -p gabion-nginx --test safety
+
+# Loom model checks for the SHM queue, leader lease and aggregate seqlock, in
+# crates/nginx/tests/loom.rs. `--cfg gabion_loom` recompiles every crate, so it
+# builds into its own target dir rather than evicting the normal build.
+.PHONY: loom
+loom: require-nextest
+	RUSTFLAGS="--cfg gabion_loom" CARGO_TARGET_DIR=target/loom $(CARGO_ENV) $(NEXTEST) -p gabion-nginx --test loom
 
 .PHONY: miri-safety
 miri-safety:
@@ -277,7 +285,7 @@ kubernetes-clean:
 # pre-merge loop) — `make ci-full` does, and matches what GitHub Actions
 # runs end-to-end.
 .PHONY: ci
-ci: test miri-safety bench-check wasm-check nginx-config nginx-module nginx-test
+ci: test loom miri-safety bench-check wasm-check nginx-config nginx-module nginx-test
 
 .PHONY: ci-full
 ci-full: ci miri-all kubernetes-test kubernetes-nginx-test kubernetes-mixed-test kubernetes-gossip-bench

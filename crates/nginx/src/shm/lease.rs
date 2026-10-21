@@ -19,8 +19,9 @@
 //! leader still runs.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+use super::atomic::{AtomicU64, Ordering};
 
 const OWNER_SHIFT: u32 = 40;
 const OWNER_MAX: u32 = (1 << 24) - 1;

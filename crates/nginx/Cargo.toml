@@ -22,6 +22,10 @@ tracing.workspace = true
 twox-hash.workspace = true
 whoami.workspace = true
 
+# The SHM atomics resolve to loom's under `--cfg gabion_loom`; see `make loom`.
+[target.'cfg(gabion_loom)'.dependencies]
+loom.workspace = true
+
 [features]
 default = []
 ngx-module = ["dep:nginx-sys", "dep:ngx", "ngx/async", "export-modules"]
@@ -35,3 +39,6 @@ quickcheck_macros.workspace = true
 [[bench]]
 name = "aggregate"
 harness = false
+
+[lints]
+workspace = true

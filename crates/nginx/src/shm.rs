@@ -19,6 +19,14 @@ pub use lease::LeaderLease;
 pub use queue::{QueueControl, QueueOverflow, QueueSlot, RequestQueue};
 pub use stats::Stats;
 
+/// Atomics for the queue, lease and aggregate table. `make loom` builds with
+/// `--cfg gabion_loom`, which swaps in loom's model-checked atomics
+/// (`tests/loom.rs`).
+#[cfg(gabion_loom)]
+use loom::sync::atomic;
+#[cfg(not(gabion_loom))]
+use std::sync::atomic;
+
 /// Bytes of padding between regions; rounded up to the cacheline boundary.
 pub const CACHELINE: usize = 64;
 

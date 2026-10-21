@@ -293,6 +293,10 @@ live under [`deploy/`](deploy).
 ## Contributing
 
 Pull requests are welcome; please run `make test` before sending one.
+`make loom` model-checks the nginx module's shared-memory queue, leader lease
+and aggregate seqlock with [loom](https://github.com/tokio-rs/loom), across
+every thread interleaving with up to two preemptions; run it after touching
+any of them.
 
 ## License
 

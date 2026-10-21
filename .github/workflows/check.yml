@@ -88,6 +88,8 @@ jobs:
       # `make unit` covers the full workspace; the `gabion-nginx` `safety`
       # integration test runs as part of that.
       - run: make unit
+      # Builds into its own target dir, which rust-cache saves alongside.
+      - run: make loom
 
   hygiene:
     runs-on: ubuntu-latest
