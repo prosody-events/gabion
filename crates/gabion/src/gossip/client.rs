@@ -58,20 +58,32 @@ impl<C: Count> GossipClient<C> {
         rule_limit: u64,
         now_millis: u64,
     ) -> Result<(), GossipError> {
-        let (tx, rx) = oneshot::channel();
-        self.requests
-            .send(Request::Limit(LimitRequest {
-                rule_fingerprint,
-                key_hash,
-                bucket,
-                hits,
-                rule_limit,
-                now_millis,
-                reply: tx,
-            }))
+        let (reply, applied) = oneshot::channel();
+        let mut permit = self.reserve().await?;
+        permit.reply = Some(reply);
+        permit.record(
+            rule_fingerprint,
+            key_hash,
+            bucket,
+            hits,
+            rule_limit,
+            now_millis,
+        );
+        applied.await.map_err(|_| GossipError::RuntimeShutDown)
+    }
+
+    /// Wait for room in the runtime's request queue, so a caller can leave
+    /// its hit queued until the runtime can take it.
+    pub async fn reserve(&self) -> Result<RecordPermit<'_>, GossipError> {
+        let permit = self
+            .requests
+            .reserve()
             .await
             .map_err(|_| GossipError::RuntimeShutDown)?;
-        rx.await.map_err(|_| GossipError::RuntimeShutDown)
+        Ok(RecordPermit {
+            permit,
+            reply: None,
+        })
     }
 
     /// Ask the runtime to stop after draining whatever is already queued.
@@ -80,6 +92,36 @@ impl<C: Count> GossipClient<C> {
             .send(Request::Shutdown)
             .await
             .map_err(|_| GossipError::RuntimeShutDown)
+    }
+}
+
+/// A slot in the runtime's request queue, from [`GossipClient::reserve`].
+pub struct RecordPermit<'a> {
+    permit: mpsc::Permit<'a, Request>,
+    reply: Option<oneshot::Sender<()>>,
+}
+
+impl RecordPermit<'_> {
+    /// Hand one hit to the runtime without waiting for it to be applied.
+    /// Neither this nor [`GossipClient::reserve`] allocates.
+    pub fn record(
+        self,
+        rule_fingerprint: u128,
+        key_hash: KeyHash,
+        bucket: BucketEpoch,
+        hits: u64,
+        rule_limit: u64,
+        now_millis: u64,
+    ) {
+        self.permit.send(Request::Limit(LimitRequest {
+            rule_fingerprint,
+            key_hash,
+            bucket,
+            hits,
+            rule_limit,
+            now_millis,
+            reply: self.reply,
+        }));
     }
 }
 
@@ -104,5 +146,5 @@ pub(super) struct LimitRequest {
     pub hits: u64,
     pub rule_limit: u64,
     pub now_millis: u64,
-    pub reply: oneshot::Sender<()>,
+    pub reply: Option<oneshot::Sender<()>>,
 }

@@ -59,13 +59,18 @@ fn defaults_match_shared_production_defaults() {
     );
 }
 
+use std::cell::Cell;
 use std::sync::mpsc as std_mpsc;
 use std::time::Instant;
 
+use gabion::crdt::{DeltaSink, ExpirationSink};
+use gabion::gossip::AggregateStore;
 use gabion::rules::EnforcementMode;
+use tokio::time::timeout;
 
 use crate::rules::{DEFAULT_DOMAIN, DescriptorBinding, RuleConfig};
 use crate::shm::Layout;
+use crate::shm::queue::QueueEvent;
 
 const LEASE_TICK: Duration = Duration::from_millis(10);
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -165,4 +170,52 @@ fn stopping_the_leader_releases_the_lease_to_a_follower() {
     // The takeover lands within the same second, so a seconds-based
     // incarnation alone would hand the follower the leader's identity.
     assert!(region.header().identity.load_incarnation() > leader_incarnation);
+}
+
+/// Counts the hits the gossip runtime applies, one delta row each.
+#[derive(Default)]
+struct AppliedHits(Cell<usize>);
+
+impl AggregateStore<u32> for AppliedHits {
+    fn apply(&self, deltas: &DeltaSink<u32>, _: &ExpirationSink<u32>) {
+        self.0.set(self.0.get() + deltas.len());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+#[cfg_attr(miri, ignore = "binds a UDP socket")]
+async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
+    const EVENTS: usize = 8;
+    const ROOM: usize = 3;
+    let region = leaked_region();
+    let event = QueueEvent {
+        hits: 1,
+        ..QueueEvent::default()
+    };
+    (0..EVENTS)
+        .try_for_each(|_| region.queue().push(event))
+        .expect("queue has room");
+    let identity = NodeIdentity::new(gabion::crdt::NodeId(1), 1);
+    let gossip = GossipSettings {
+        limit_queue_capacity: ROOM,
+        ..GossipSettings::default()
+    };
+    let applied = Rc::new(AppliedHits::default());
+    let (runtime, client) = GossipRuntime::bind(
+        LONE_NODE_BIND,
+        gossip.into_runtime_config(identity, 0),
+        CellStore::new(production_cell_store_config(), identity),
+        applied.clone(),
+    )
+    .await
+    .expect("bind gossip runtime");
+    let drained = || region.stats().snapshot().queue_drained as usize;
+    let mut drain = std::pin::pin!(drain_loop(client, region, 1));
+    assert!(timeout(DEADLINE, drain.as_mut()).await.is_err());
+    assert_eq!(drained(), ROOM);
+    let both = async { tokio::join!(drain.as_mut(), runtime.run(futures::stream::empty())) };
+    assert!(timeout(DEADLINE, both).await.is_err());
+    assert_eq!((applied.0.get(), drained()), (EVENTS, EVENTS));
+    // `both` dropped the runtime, closing its queue.
+    assert_eq!(drain.await.to_string(), "gossip runtime shut down");
 }

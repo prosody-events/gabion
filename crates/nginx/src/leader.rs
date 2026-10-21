@@ -1,6 +1,6 @@
 //! Leader-thread main: spins up a single-threaded tokio runtime + `LocalSet`,
 //! wires the `GossipRuntime` to the SHM aggregate writer, and drains the SHM
-//! queue into per-record `GossipClient::record` calls.
+//! queue into the runtime's request queue.
 //!
 //! Every nginx worker runs one of these threads. The SHM lease decides
 //! which one leads; the others campaign each lease tick so they can take
@@ -16,16 +16,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::task::LocalSet;
 
 use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeIdentity, RuleDescriptor};
 use gabion::defaults;
 use gabion::discovery::{self, DiscoveryConfig, PeerDiscovery, PeerEvent};
-use gabion::gossip::{
-    GossipClient, GossipConfig, GossipError, GossipRuntime, TokioClock, UdpTransport,
-};
+use gabion::gossip::{GossipClient, GossipConfig, GossipRuntime, TokioClock, UdpTransport};
 use gabion::wire::FrameLimits;
 
 use crate::identity::fresh_incarnation;
@@ -33,21 +31,21 @@ use crate::rules::CompiledRules;
 use crate::shm::ShmRegion;
 use crate::shm::aggregate::ShmAggregateStore;
 use crate::shm::lease::now_millis;
-use crate::shm::queue::QueueEvent;
 
-/// Drain batch size: how many records the leader keeps in flight against the
-/// gossip runtime simultaneously.
-pub const DEFAULT_MAX_INFLIGHT: usize = 32;
+/// Events the drain hands the runtime between yields. Yielding keeps tokio's
+/// mpsc shallow enough to recycle its 32-slot blocks; deeper, it allocates.
+const DRAIN_BATCH: usize = 32;
 
-/// Polling interval for the queue drain when in-flight slots are empty.
-pub const DEFAULT_DRAIN_TICK: Duration = Duration::from_millis(5);
+/// How often the drain polls an empty SHM queue.
+const DRAIN_TICK: Duration = Duration::from_millis(5);
 
 /// How often a worker that doesn't hold the SHM lease tries to take it.
 pub const DEFAULT_LEASE_TICK: Duration = Duration::from_millis(300);
 
-/// Default lease TTL. The leader renews before every drain pass, so only a
+/// Lease TTL. The leader renews before every drain pass, so only a
 /// leader thread stalled this long loses the lease.
-pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(1);
+const LEASE_TTL: Duration = Duration::from_secs(1);
+const LEASE_TTL_MILLIS: u64 = LEASE_TTL.as_millis() as u64;
 
 /// Ceiling on the back-off between leadership attempts after a leader
 /// fails. The back-off starts at the lease TTL, doubles per failure, and
@@ -68,10 +66,7 @@ pub struct LeaderConfig {
     pub discovery: DiscoveryConfig,
     pub cell_store: CellStoreConfig,
     pub rng_seed: u64,
-    pub max_inflight: usize,
-    pub drain_tick: Duration,
     pub lease_tick: Duration,
-    pub lease_ttl: Duration,
 }
 
 impl Default for LeaderConfig {
@@ -83,10 +78,7 @@ impl Default for LeaderConfig {
             discovery: DiscoveryConfig::default(),
             cell_store: production_cell_store_config(),
             rng_seed: defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
-            max_inflight: DEFAULT_MAX_INFLIGHT,
-            drain_tick: DEFAULT_DRAIN_TICK,
             lease_tick: DEFAULT_LEASE_TICK,
-            lease_ttl: DEFAULT_LEASE_TTL,
         }
     }
 }
@@ -253,8 +245,7 @@ async fn campaign(
     mut stopped: watch::Receiver<bool>,
 ) {
     let lease = shm.lease();
-    let ttl_millis = config.lease_ttl.as_millis() as u64;
-    let mut retry_delay = config.lease_ttl;
+    let mut retry_delay = LEASE_TTL;
     let mut announced_follower = false;
     let mut tick = tokio::time::interval(config.lease_tick);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -264,7 +255,7 @@ async fn campaign(
             _ = stopped.wait_for(|stop| *stop) => return,
             _ = tick.tick() => {}
         }
-        if !lease.try_acquire(config.worker_id, now_millis(), ttl_millis) {
+        if !lease.try_acquire(config.worker_id, now_millis(), LEASE_TTL_MILLIS) {
             if !announced_follower {
                 tracing::info!(
                     worker_id = config.worker_id,
@@ -292,7 +283,7 @@ async fn campaign(
         };
         // A leader that ran for a while was healthy; back off from scratch.
         if led_since.elapsed() >= MAX_RETRY_DELAY {
-            retry_delay = config.lease_ttl;
+            retry_delay = LEASE_TTL;
         }
         tracing::error!(
             worker_id = config.worker_id,
@@ -359,14 +350,7 @@ async fn leader_main(
         cell_store,
         Rc::new(ShmAggregateStore::new(shm)),
     );
-    let drain = drain_loop(
-        gossip_client,
-        shm,
-        config.worker_id,
-        config.lease_ttl.as_millis() as u64,
-        config.max_inflight,
-        config.drain_tick,
-    );
+    let drain = drain_loop(gossip_client, shm, config.worker_id);
 
     tokio::select! {
         _ = stopped.wait_for(|stop| *stop) => Ok(()),
@@ -406,78 +390,35 @@ fn register_rules(cell_store: &mut CellStore<u32>, rules: &CompiledRules) {
     }
 }
 
-async fn drain_loop(
-    client: GossipClient<u32>,
-    shm: ShmRegion,
-    worker_id: u32,
-    ttl_millis: u64,
-    max_inflight: usize,
-    tick: Duration,
-) -> anyhow::Error {
+async fn drain_loop(client: GossipClient<u32>, shm: ShmRegion, worker_id: u32) -> anyhow::Error {
     let lease = shm.lease();
     let queue = shm.queue();
     let stats = shm.stats();
-    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-    let mut interval = tokio::time::interval(tick);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
+    'drain: loop {
         // Renew the lease before popping: a leader that stalled past the TTL
         // and lost it stops here instead of draining beside its successor.
-        if !lease.try_acquire(worker_id, now_millis(), ttl_millis) {
+        if !lease.try_acquire(worker_id, now_millis(), LEASE_TTL_MILLIS) {
             return anyhow::anyhow!("worker {worker_id} lost the leader lease to another worker");
         }
-
-        // Refill in_flight from the SHM queue.
-        while in_flight.len() < max_inflight {
-            let Some(ev) = queue.pop() else { break };
+        for _ in 0..DRAIN_BATCH {
+            // Reserve before popping: a busy runtime leaves events in SHM.
+            let Ok(permit) = client.reserve().await else {
+                return anyhow::anyhow!("gossip runtime shut down");
+            };
+            let Some(ev) = queue.pop() else {
+                tokio::time::sleep(DRAIN_TICK).await;
+                continue 'drain;
+            };
             stats.record_queue_drain(1);
-            in_flight.push(record_one(&client, ev));
-        }
-
-        if in_flight.is_empty() {
-            interval.tick().await;
-            continue;
-        }
-
-        tokio::select! {
-            _ = interval.tick() => {}
-            Some(result) = in_flight.next() => {
-                if let Err(GossipError::RuntimeShutDown) = result {
-                    return anyhow::anyhow!("gossip runtime shut down");
-                }
-                // Transient errors (IO, Encode) are logged at trace and
-                // otherwise ignored — they do not indicate the leader has
-                // lost its grip.
-                if let Err(error) = result {
-                    tracing::trace!(error = ?error, "drain record error");
-                }
-            }
-        }
-    }
-}
-
-fn record_one(
-    client: &GossipClient<u32>,
-    ev: QueueEvent,
-) -> impl std::future::Future<Output = Result<(), GossipError>> + use<> {
-    let client = client.clone();
-    async move {
-        client
-            .record(
+            permit.record(
                 ev.rule_fingerprint,
                 KeyHash(ev.key_hash),
                 ev.bucket,
                 ev.hits,
                 ev.rule_limit,
                 ev.now_millis,
-            )
-            .await
+            );
+        }
+        tokio::task::yield_now().await;
     }
 }
-
-// Type-level sanity: confirm the Rc impl works for our store at compile time.
-const _: fn() = || {
-    fn assert_aggregate_store<S: gabion::gossip::AggregateStore<u32>>() {}
-    assert_aggregate_store::<Rc<ShmAggregateStore>>();
-};

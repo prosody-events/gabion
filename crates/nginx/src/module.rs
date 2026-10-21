@@ -2099,10 +2099,7 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         discovery: main.discovery.clone(),
         cell_store: main.storage.cell_store_config(),
         rng_seed,
-        max_inflight: leader::DEFAULT_MAX_INFLIGHT,
-        drain_tick: leader::DEFAULT_DRAIN_TICK,
         lease_tick: leader::DEFAULT_LEASE_TICK,
-        lease_ttl: leader::DEFAULT_LEASE_TTL,
     };
 
     let handle = match leader::spawn(region, rules.clone(), cfg) {
