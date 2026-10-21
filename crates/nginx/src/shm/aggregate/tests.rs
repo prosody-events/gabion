@@ -136,35 +136,55 @@ fn lead(store: &ShmAggregateStore, incarnation: u32) -> CellStore<u32> {
     cells
 }
 
+fn expire(store: &ShmAggregateStore, cells: &mut CellStore<u32>) {
+    let mut expired = ExpirationSink::default();
+    cells.expire_at(100_000, &mut expired);
+    store.apply(&DeltaSink::default(), &expired);
+}
+
 /// A leader taking over a zone its predecessor filled relearns the same
-/// counts from peers. It counts each once, and expiring them frees every
-/// slot.
+/// counts from peers. It counts each once, ignores the predecessor if it
+/// keeps applying gossip, and expiring the counts frees every slot.
 #[test]
 fn a_new_leader_counts_regossiped_cells_once() {
     let (_zone, region, previous) = table(16);
     lead(&previous, 1);
-    let view = region.aggregate();
-    let last_seq = || {
-        view.slots
-            .iter()
-            .map(|slot| slot.seq.load(Ordering::Relaxed))
-            .max()
-    };
-    let previous_seq = last_seq();
+    assert!(region.lease().try_acquire(2, 0, 1_000));
 
     let store = ShmAggregateStore::new(region);
     let mut cells = lead(&store, 2);
+    lead(&previous, 1);
+    let view = region.aggregate();
     assert_eq!(view.get(0x42, 0x99, 7).expect("found").count, 5);
-    assert!(last_seq() > previous_seq, "a cleared sequence was reused");
 
-    let mut expired = ExpirationSink::default();
-    cells.expire_at(100_000, &mut expired);
-    store.apply(&DeltaSink::default(), &expired);
+    expire(&store, &mut cells);
     assert!(
         view.slots
             .iter()
             .all(|slot| matches!(slot.read(), Read::Empty))
     );
+}
+
+/// A new leader's writes continue past every sequence an earlier leader
+/// issued, even to cells it has since freed, so a reader still holding one
+/// cannot accept it over a different cell.
+#[test]
+fn a_new_leader_never_reuses_a_sequence() {
+    let (_zone, region, previous) = table(16);
+    let last_seq = || {
+        region
+            .aggregate()
+            .slots
+            .iter()
+            .map(|slot| slot.seq.load(Ordering::Relaxed))
+            .max()
+    };
+    let mut cells = lead(&previous, 1);
+    let issued = last_seq();
+    expire(&previous, &mut cells);
+
+    lead(&ShmAggregateStore::new(region), 2);
+    assert!(last_seq() > issued);
 }
 
 #[test]

@@ -1,9 +1,10 @@
-//! SHM zone header: magic, version, identity, geometry summary, rule digest.
+//! SHM zone header: magic, version, identity, geometry summary, rule digest,
+//! aggregate write sequence.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const SHM_MAGIC: u32 = 0x4742_4e58; // "GBNX"
-pub const SHM_VERSION: u32 = 2;
+pub const SHM_VERSION: u32 = 3;
 
 /// Node identity fields stored cross-process. `node_id` is stamped once by
 /// the master process before fork; `incarnation` is updated atomically by
@@ -60,6 +61,10 @@ pub struct Header {
     pub queue_capacity: AtomicU64,
     pub aggregate_capacity: AtomicU64,
     pub rule_table_digest: AtomicU64,
+    /// The next sequence the aggregate writer stamps on a slot. Every leader
+    /// continues it, so a reader holding a sequence from a slot that has
+    /// since been freed or cleared cannot accept it again over another cell.
+    pub aggregate_write_seq: AtomicU64,
 }
 
 impl Default for Header {
@@ -72,6 +77,7 @@ impl Default for Header {
             queue_capacity: AtomicU64::new(0),
             aggregate_capacity: AtomicU64::new(0),
             rule_table_digest: AtomicU64::new(0),
+            aggregate_write_seq: AtomicU64::new(2),
         }
     }
 }

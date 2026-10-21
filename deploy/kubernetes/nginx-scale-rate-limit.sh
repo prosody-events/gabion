@@ -344,6 +344,10 @@ await_counted_once() {
         remaining="$(kubectl -n "$namespace" exec "$1" -- \
             curl -sS -D - -o /dev/null http://127.0.0.1:8080/takeover/index.html \
             | grep -i '^X-RateLimit-Remaining:' | awk '{print $2}' | tr -d '\r')"
+        case "$remaining" in '' | *[!0-9]*)
+            printf '%s\n' "FAIL: pod $1 answered without a numeric X-RateLimit-Remaining header" >&2
+            return 1 ;;
+        esac
         sent=$((sent + 1))
         if [ "$remaining" = "$expected" ]; then
             return 0

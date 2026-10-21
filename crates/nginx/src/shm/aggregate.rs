@@ -18,7 +18,6 @@
 //! touching or moving at that instant and under-count it for one request,
 //! which the allow-by-default rule accepts.
 
-use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use gabion::crdt::{DeltaSink, ExpirationSink};
@@ -226,14 +225,15 @@ impl<'a> AggregateTable<'a> {
 
 /// `AggregateStore<u32>` implementation backed by SHM. Only the gossip
 /// leader's thread owns one of these; readers use `AggregateTable`
-/// directly. `Cell` keeps it `!Sync`.
+/// directly.
 ///
 /// Every slot is an atomic, so a second writer could not cause undefined
 /// behaviour, only wrong counts; the gossip leader lease keeps the writer
 /// single across processes.
 pub struct ShmAggregateStore {
     region: ShmRegion,
-    next_write_seq: Cell<u64>,
+    /// The lease epoch this leader won; a later one means it lost the lease.
+    epoch: u64,
 }
 
 impl ShmAggregateStore {
@@ -241,26 +241,40 @@ impl ShmAggregateStore {
     /// builds its counts afresh, from its own hits and peers' gossip, so
     /// counts an earlier leader left behind would be added a second time and
     /// never expire. Readers under-count until gossip refills the table.
-    /// Writes resume past every sequence cleared, so a reader still holding
-    /// one cannot see it again over a different cell.
     pub fn new(region: ShmRegion) -> Self {
-        let slots = region.aggregate().slots;
-        let (cleared, last_seq) = slots.iter().fold((0, 0), |(n, last), slot| {
-            let seq = slot.seq.swap(0, Ordering::Release);
-            (n + usize::from(seq != 0), last.max(seq))
-        });
-        tracing::debug!(cleared, "gabion: new gossip leader emptied the count table");
+        let mut cleared = 0_usize;
+        for slot in region.aggregate().slots {
+            // Most slots are usually empty; leaving those untouched spares
+            // every worker's cached copy of them.
+            if slot.seq.load(Ordering::Relaxed) != 0 {
+                slot.seq.store(0, Ordering::Release);
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            tracing::info!(
+                cleared,
+                "gabion: this worker took over gossip and emptied the previous leader's counts, \
+                 so that peers' gossip refills them without counting them twice. Until then, \
+                 usually a gossip tick or two, this node under-counts and may admit requests over \
+                 their limits. Nothing to do unless that persists; see `gabion_limit_zone` in the \
+                 gabion-nginx README.",
+            );
+        }
         Self {
             region,
-            next_write_seq: Cell::new((last_seq | 1).wrapping_add(1)),
+            epoch: region.lease().epoch.load(Ordering::Acquire),
         }
     }
 
     fn write(&self, slot: &AggregateSlot, cell: AggregateCell) {
         // Even sequences only; `AggregateSlot::write` publishes `seq - 1`
         // (odd) while the fields change.
-        let seq = self.next_write_seq.get();
-        self.next_write_seq.set(seq.wrapping_add(2));
+        let seq = self
+            .region
+            .header()
+            .aggregate_write_seq
+            .fetch_add(2, Ordering::Relaxed);
         slot.write(seq, cell);
     }
 
@@ -345,6 +359,11 @@ impl ShmAggregateStore {
 
 impl AggregateStore<u32> for ShmAggregateStore {
     fn apply(&self, deltas: &DeltaSink<u32>, expirations: &ExpirationSink<u32>) {
+        // A leader that stalled past its lease may still be applying gossip
+        // after its successor emptied the table, which would count it twice.
+        if self.region.lease().epoch.load(Ordering::Acquire) != self.epoch {
+            return;
+        }
         for i in 0..deltas.len() {
             if deltas.applies_locally[i] == 0 {
                 continue;

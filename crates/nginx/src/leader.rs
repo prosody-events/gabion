@@ -23,7 +23,9 @@ use tokio::task::LocalSet;
 use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeIdentity, RuleDescriptor};
 use gabion::defaults;
 use gabion::discovery::{self, DiscoveryConfig, PeerDiscovery, PeerEvent};
-use gabion::gossip::{GossipClient, GossipConfig, GossipError, GossipRuntime};
+use gabion::gossip::{
+    GossipClient, GossipConfig, GossipError, GossipRuntime, TokioClock, UdpTransport,
+};
 use gabion::wire::FrameLimits;
 
 use crate::identity::fresh_incarnation;
@@ -333,7 +335,6 @@ async fn leader_main(
 
     let mut cell_store = CellStore::<u32>::new(config.cell_store, identity);
     register_rules(&mut cell_store, &rules);
-    let store = Rc::new(ShmAggregateStore::new(shm));
     let gossip_cfg = config
         .gossip
         .clone()
@@ -346,10 +347,18 @@ async fn leader_main(
         Some(bind) => (bind, discovery_stream(config.discovery).left_stream()),
         None => (LONE_NODE_BIND, futures::stream::empty().right_stream()),
     };
-    let (gossip_rt, gossip_client) =
-        GossipRuntime::bind(bind, gossip_cfg, cell_store, store.clone())
-            .await
-            .context("bind gossip runtime")?;
+    // Bind before the store empties the count table: a term that cannot
+    // start leaves the last counts in force, with no leader to refill them.
+    let transport = UdpTransport::bind(bind)
+        .await
+        .context("bind the gossip socket")?;
+    let (gossip_rt, gossip_client) = GossipRuntime::from_parts(
+        transport,
+        TokioClock::new(),
+        gossip_cfg,
+        cell_store,
+        Rc::new(ShmAggregateStore::new(shm)),
+    );
     let drain = drain_loop(
         gossip_client,
         shm,
