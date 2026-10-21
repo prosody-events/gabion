@@ -13,10 +13,11 @@ use ngx::core;
 use ngx::ffi::{
     NGX_CONF_1MORE, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET,
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF,
-    NGX_LOG_EMERG, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_exiting,
-    ngx_http_handler_pt, ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t,
-    ngx_module_t, ngx_pagesize, ngx_pool_cleanup_add, ngx_shared_memory_add, ngx_shm_zone_t,
-    ngx_slab_alloc, ngx_str_t, ngx_uint_t,
+    NGX_HTTP_VAR_NOHASH, NGX_LOG_EMERG, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t,
+    ngx_exiting, ngx_http_add_variable, ngx_http_get_variable_index, ngx_http_handler_pt,
+    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_request_t,
+    ngx_http_variable_value_t, ngx_int_t, ngx_module_t, ngx_pagesize, ngx_pool_cleanup_add,
+    ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_alloc, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
     self, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, MergeConfigError,
@@ -104,9 +105,29 @@ impl http::HttpModule for Module {
 
     /// nginx invokes this once per cycle in the master process before any
     /// `gabion_*` directive callback runs. We use it to install the
-    /// tracing→nginx subscriber so config-phase log lines route correctly.
-    unsafe extern "C" fn preconfiguration(_cf: *mut ngx_conf_t) -> ngx_int_t {
+    /// tracing→nginx subscriber so config-phase log lines route correctly,
+    /// and to register `$gabion_decided`, whose slot marks a decided request.
+    unsafe extern "C" fn preconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
         log::install();
+        let mut name = ngx_string!("gabion_decided");
+        // SAFETY: nginx passes a valid `cf`, and the core module has already
+        // set up the variable tables. Both calls copy `name`; the first
+        // returns null or a variable in the cycle pool. NOHASH hides the
+        // variable from lookups by name at runtime (SSI, Lua, Perl), and
+        // without CHANGEABLE a `set` or regex capture of the name fails
+        // `nginx -t`, so only the access handler writes the slot's `data`.
+        let variable =
+            unsafe { ngx_http_add_variable(cf, &mut name, NGX_HTTP_VAR_NOHASH as _).as_mut() };
+        // SAFETY: as above.
+        let index = unsafe { ngx_http_get_variable_index(cf, &mut name) };
+        // SAFETY: as above.
+        let main = Module::main_conf_mut(unsafe { &*cf });
+        let (Some(variable), Ok(index), Some(main)) = (variable, usize::try_from(index), main)
+        else {
+            return core::Status::NGX_ERROR.into();
+        };
+        variable.get_handler = Some(decided_not_found);
+        main.decided = Some(index);
         core::Status::NGX_OK.into()
     }
 
@@ -240,6 +261,8 @@ struct MainConfig {
     storage: StorageSettings,
     cardinality: CardinalitySettings,
     gossip_bind: Option<SocketAddr>,
+    /// `$gabion_decided`'s `r->variables` index, set in `preconfiguration`.
+    decided: Option<usize>,
     identity_seed: Option<Box<str>>,
     rng_seed: Option<u64>,
 }
@@ -672,9 +695,24 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
     let Some(main) = Module::main_conf(request) else {
         return core::Status::NGX_DECLINED;
     };
-    let Some((region, rules)) = main.active() else {
+    let (Some((region, rules)), Some(index)) = (main.active(), main.decided) else {
         return core::Status::NGX_DECLINED;
     };
+    // Internal redirects rerun this handler but keep `r->variables`, so the
+    // slot's `data` marks a request already counted or refused, as
+    // `limit_req` marks `r->main`. Subrequests skip the access phase.
+    //
+    // SAFETY: `index` came from `ngx_http_get_variable_index` for this
+    // request's cycle, and nginx zero-allocates `r->variables` with a slot
+    // per indexed variable of that cycle, so the slot is in bounds and
+    // initialised for the whole request. Only this worker's event thread
+    // touches it, and no reference to it is held.
+    let decided = unsafe { request.as_ref().variables.add(index) };
+    let marker = ptr::addr_of!(DECIDED).cast_mut();
+    // SAFETY: `decided` is in bounds and initialised (above).
+    if unsafe { (*decided).data } == marker {
+        return core::Status::NGX_DECLINED;
+    }
 
     let ctx = AccessCtx {
         rules,
@@ -687,6 +725,11 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
     let vars = RequestVariables { request };
     let now = wall_millis();
     let outcome = decide_all(ctx, rule_indices, &vars, now);
+    // A pass that counted nothing leaves the next limited location to decide.
+    if !matches!(outcome, AccessOutcome::Allow(None) | AccessOutcome::Decline) {
+        // SAFETY: `decided` is in bounds and initialised (above).
+        unsafe { (*decided).data = marker };
+    }
     match outcome {
         AccessOutcome::Allow(Some(info)) => {
             apply_admit_headers(request, info);
@@ -700,6 +743,22 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
         AccessOutcome::Cardinality => http::HTTPStatus::BAD_REQUEST.into(),
     }
 });
+
+/// Only its address matters: `$gabion_decided`'s `data` points here.
+static DECIDED: u8 = 0;
+
+/// `$gabion_decided` never has a value, and leaving the slot's `data`
+/// alone keeps nginx's own evaluation (`log_format`, `if`) off the marker.
+extern "C" fn decided_not_found(
+    _: *mut ngx_http_request_t,
+    v: *mut ngx_http_variable_value_t,
+    _: usize,
+) -> ngx_int_t {
+    // SAFETY: nginx calls get handlers with `v` pointing at the request's
+    // slot for this variable, valid for writes.
+    unsafe { (*v).set_not_found(1) };
+    core::Status::NGX_OK.into()
+}
 
 fn apply_admit_headers(request: &mut http::Request, info: AllowInfo) {
     let headers = AdmissionHeaders::build_for_allow(info);
