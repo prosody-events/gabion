@@ -163,19 +163,16 @@ spec:
       protocol: UDP
 YAML
 
-running_pods() {
-    kubectl -n "$namespace" get pods -l app=gabion-nginx \
-        -o 'jsonpath={range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' \
-        | sed '/^$/d'
-}
-
+# Sets `pods` to the Running pod names, so `wait_for_pods` prints the
+# same set it counted.
 running_pod_count_is() {
-    [ "$(running_pods | wc -l | tr -d ' ')" = "$1" ]
+    pods="$(kubectl -n "$namespace" get pods -l app=gabion-nginx \
+        -o 'jsonpath={range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}')"
+    [ "$(printf '%s' "$pods" | grep -c .)" = "$1" ]
 }
 
 wait_for_pods() {
-    retry 60 running_pod_count_is "$1" && running_pods && return 0
-    printf '%s\n' "timed out waiting for $1 running pods; saw $(running_pods | wc -l | tr -d ' ')" >&2
+    retry 60 running_pod_count_is "$1" && printf '%s\n' "$pods" && return 0
     kubectl -n "$namespace" get pods -o wide >&2
     return 1
 }
@@ -257,12 +254,10 @@ assert_pod_rate_limit() {
 }
 
 assert_cluster_rate_limit() {
-    # The replicas=3 path: the rule's 2r/min budget on $uri is shared
-    # across every pod via gossip, so the assertion is about the
-    # cluster-wide aggregate, not any one pod. Route through the
-    # ClusterIP Service and confirm that the first 2 of 5 requests succeed
-    # and the rest are rejected — same arithmetic as the single-pod case at
-    # N=1, just observed through the Service.
+    # The replicas=3 path: confirm that the first 2 of 5 requests through
+    # the Service succeed and the rest are rejected. `kubectl port-forward
+    # svc/...` pins one pod, so this checks enforcement after the scale-out,
+    # not gossip, and needs no wait for the pods to converge.
     start_port_forward svc/gabion-nginx
 
     headers_4="$(mktemp)"
@@ -292,11 +287,8 @@ assert_cluster_rate_limit() {
         return 1
     fi
 
-    # The 4th and 5th request must both be 429 (the rule limit is 2),
-    # so either response is a valid carrier of the rate-limit headers.
-    # Pick whichever one was a 429 — under N=3 gossip can race the very
-    # first second so we tolerate the budget being burned slightly
-    # later than position 3 in the burst.
+    # Read the rate-limit headers from whichever of the 4th and 5th
+    # requests was rejected.
     if [ "$c4" = "429" ]; then
         rej_headers="$headers_4"
     else

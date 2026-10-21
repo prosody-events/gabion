@@ -332,6 +332,7 @@ impl core::fmt::Debug for ServiceChange {
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a live kubernetes cluster (kind)"]
 async fn local_kubernetes_endpoint_slice_watcher_emits_added_peer() {
+    use std::net::Ipv4Addr;
     use std::time::Duration;
 
     use futures::TryStreamExt;
@@ -343,10 +344,11 @@ async fn local_kubernetes_endpoint_slice_watcher_emits_added_peer() {
     use crate::discovery::PeerDiscovery;
 
     const PORT: u16 = 9000;
-    const ADDRESSES: [&str; 2] = ["10.0.0.1", "10.0.0.2"];
+    const ADDRESSES: [Ipv4Addr; 2] = [Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)];
 
     // Use a fresh per-process namespace so concurrent runs (and aborted
-    // past runs) don't collide.
+    // past runs) don't collide. `local-clean.sh` sweeps up any that an aborted
+    // run leaves behind.
     let suffix = std::process::id();
     let namespace = format!("gabion-disc-{suffix}");
 
@@ -371,32 +373,6 @@ async fn local_kubernetes_endpoint_slice_watcher_emits_added_peer() {
         .create(&PostParams::default(), &ns)
         .await
         .expect("create namespace");
-
-    // Cleanup guard: drop runs `kubectl delete namespace --ignore-not-found`
-    // equivalent so an interrupted test doesn't leak the namespace.
-    struct NamespaceGuard {
-        api: kube::Api<k8s_openapi::api::core::v1::Namespace>,
-        name: String,
-    }
-    impl Drop for NamespaceGuard {
-        fn drop(&mut self) {
-            let api = self.api.clone();
-            let name = self.name.clone();
-            // Best-effort, fire-and-forget delete. We're inside Drop so
-            // we can't await; spawn the cascade delete onto whatever
-            // runtime exists at drop time and let kubernetes' garbage
-            // collector finish the job.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = api.delete(&name, &DeleteParams::default()).await;
-                });
-            }
-        }
-    }
-    let _ns_guard = NamespaceGuard {
-        api: namespaces.clone(),
-        name: namespace.clone(),
-    };
 
     // Service. The discovery code keys off a UDP port named "gabion";
     // EndpointSlice's port spec must match.
@@ -480,13 +456,20 @@ async fn local_kubernetes_endpoint_slice_watcher_emits_added_peer() {
         }
         panic!("discovery stream ended without emitting PeerEvent::Added");
     };
-    let peer = tokio::time::timeout(Duration::from_secs(60), first_added)
+    let peer = tokio::time::timeout(Duration::from_secs(60), first_added).await;
+
+    // Delete before asserting. A `Drop` guard can't await, and a task it
+    // spawns never runs once the test's runtime shuts down.
+    namespaces
+        .delete(&namespace, &DeleteParams::default())
         .await
-        .expect("EndpointSliceDiscovery did not emit a PeerEvent::Added within 60s");
+        .expect("delete namespace");
+
+    let peer = peer.expect("EndpointSliceDiscovery did not emit a PeerEvent::Added within 60s");
     assert!(
         ADDRESSES
-            .iter()
-            .any(|address| peer.addr == SocketAddr::new(address.parse().unwrap(), PORT)),
+            .map(|ip| SocketAddr::from((ip, PORT)))
+            .contains(&peer.addr),
         "unexpected peer {peer:?}",
     );
 }

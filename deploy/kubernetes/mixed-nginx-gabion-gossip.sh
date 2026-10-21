@@ -292,39 +292,6 @@ dump_snapshot() {
         || curl -fsS "http://127.0.0.1:19090/snapshot" | sed 's/^/  /'
 }
 
-assert_snapshot_has_peers() {
-    state="$(curl -fsS "http://127.0.0.1:19090/snapshot")"
-    if printf '%s' "$state" | python3 -c '
-import json, sys
-s = json.load(sys.stdin)
-peers = s.get("peers", [])
-if not peers:
-    sys.exit(1)
-print(f"peers={len(peers)}")
-' >/tmp/peers.txt 2>/dev/null; then
-        sed 's/^/  /' /tmp/peers.txt
-        return 0
-    fi
-    printf '%s\n' "FAIL: gabiond /snapshot has no peers — gossip discovery is not working" >&2
-    printf '%s\n' "$state" | sed 's/^/  /' >&2
-    return 1
-}
-
-assert_snapshot_has_aggregate_rows() {
-    state="$(curl -fsS "http://127.0.0.1:19090/snapshot")"
-    rows="$(printf '%s' "$state" | python3 -c '
-import json, sys
-print(json.load(sys.stdin)["store"]["aggregate_rows"])
-' 2>/dev/null || echo 0)"
-    if [ "$rows" -gt 0 ] 2>/dev/null; then
-        printf '  store.aggregate_rows=%s\n' "$rows"
-        return 0
-    fi
-    printf '%s\n' "FAIL: gabiond /snapshot store.aggregate_rows=$rows" >&2
-    printf '%s\n' "$state" | sed 's/^/  /' >&2
-    return 1
-}
-
 drive_nginx_traffic() {
     # Burst against /api so the local nginx leader records hits and gossips
     # them to the gabiond peers.
@@ -338,18 +305,17 @@ port_forwards_ready() {
         && curl -fsS -o /dev/null "http://127.0.0.1:18080/off/index.html"
 }
 
-# Push traffic through nginx, then check that gabiond knows its peers
-# (discovered via EndpointSlice) and holds rows for the nginx rule.
+# gossip_settled <min-peers>: push traffic through nginx, then check that
+# gabiond knows at least <min-peers> peers (discovered via EndpointSlice)
+# and holds rows for the nginx rule.
 gossip_settled() {
     drive_nginx_traffic
     curl -fsS "http://127.0.0.1:19090/snapshot" \
         | python3 -c '
 import json, sys
 s = json.load(sys.stdin)
-if s.get("peers") and s["store"]["aggregate_rows"] > 0:
-    sys.exit(0)
-sys.exit(1)
-' 2>/dev/null
+sys.exit(len(s["peers"]) < int(sys.argv[1]) or s["store"]["aggregate_rows"] == 0)
+' "$1" 2>/dev/null
 }
 
 kubectl -n "$namespace" rollout status deployment/gabiond --timeout=180s
@@ -369,7 +335,7 @@ retry 60 port_forwards_ready
 # Initial state — peers may not have discovered each other yet.
 dump_snapshot "before traffic"
 
-retry 60 gossip_settled
+retry 60 gossip_settled 1
 
 # Now scale both deployments and confirm discovery + gossip still convergent.
 kubectl -n "$namespace" scale deployment/gabiond --replicas=3
@@ -379,14 +345,10 @@ kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=180s
 wait_for_endpoint_count gabiond 3
 wait_for_endpoint_count gabion-nginx 3
 
-# Send more traffic so the new pods participate.
-retry 60 gossip_settled
+# gabiond peers with every other pod: 3 before the scale-out, 5 after.
+retry 60 gossip_settled 5
 
 dump_snapshot "after traffic + scale-out"
-
-printf '\n=== assertions ===\n'
-assert_snapshot_has_peers
-assert_snapshot_has_aggregate_rows
 
 # Dump pod logs so the operator can see what each side reported.
 printf '\n=== gabiond logs (most recent gabion / gossip / warn lines) ===\n'
