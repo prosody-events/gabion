@@ -127,7 +127,7 @@ help:
 	@printf '%s\n' '  make wasm-check      Cross-compile gabion-wasm, run its native tests, and build the web frontend'
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
-	@printf '%s\n' '  make nginx-test      Build NGINX module and assert 200, 200, 429 responses'
+	@printf '%s\n' '  make nginx-test      Build the module for NGINX and OpenResty and assert 200, 200, 429 responses'
 	@printf '%s\n' '  make nginx-matrix    Build Gabion NGINX images for common official NGINX tags'
 	@printf '%s\n' '  make openresty-matrix Build Gabion OpenResty images for common OpenResty tags'
 	@printf '%s\n' '  make kubernetes-test Run guarded local kind EndpointSlice convergence tests'
@@ -249,6 +249,7 @@ nginx-module:
 .PHONY: nginx-test
 nginx-test:
 	$(COMPOSE) run $(NGINX_SMOKE_BUILD) --rm nginx-module-request-smoke
+	$(COMPOSE) run $(NGINX_SMOKE_BUILD) --rm openresty-module-request-smoke
 
 .PHONY: nginx-matrix
 nginx-matrix:
