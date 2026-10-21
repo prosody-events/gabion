@@ -117,6 +117,77 @@ COPY deploy/nginx/smoke-with-bt.sh /usr/local/bin/gabion-smoke-with-bt
 
 RUN chmod +x /usr/local/bin/gabion-nginx-request-smoke /usr/local/bin/gabion-smoke-with-bt
 
+# AddressSanitizer build of nginx and the module (`make nginx-asan`). Needs
+# the Debian base (`NGINX_BASE_IMAGE=nginx:stable`): ASan doesn't support
+# musl, and nightly comes from the rustup install only that path has.
+FROM chef AS asan-builder
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libclang-rt-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && /root/.cargo/bin/rustup toolchain install nightly --profile minimal
+
+# Rebuild the base image's nginx from its own configure arguments with
+# clang's ASan. Under `NGX_DEBUG_PALLOC` every pool allocation is its own
+# malloc, so ASan bounds it instead of seeing one opaque pool block.
+RUN ln -s "nginx-$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" nginx \
+    && cd nginx \
+    && eval "./configure $(nginx -V 2>&1 | sed -n 's/^configure arguments: //p') \
+        --with-cc=clang \
+        --with-cc-opt='-g -O1 -fno-omit-frame-pointer -fsanitize=address -DNGX_DEBUG_PALLOC=1' \
+        --with-ld-opt=-fsanitize=address" \
+    && make -j"$(nproc)"
+
+# rustc links no sanitizer runtime into a cdylib, so the module's
+# `__asan_*` calls bind to the one clang linked into nginx. std stays
+# uninstrumented (no `-Zbuild-std`): ASan has no false positives from
+# uninstrumented code, and the generic std code gabion uses is
+# instrumented where gabion monomorphizes it. `--target` keeps RUSTFLAGS
+# off build scripts and proc macros, which run inside uninstrumented
+# cargo/rustc. `-z nodelete` keeps the module mapped after nginx's
+# exit-time dlclose, so LeakSanitizer still scans its statics and
+# symbolizes its frames. The dev profile adds debug assertions.
+ENV NGINX_SOURCE_DIR=/workspace/nginx \
+    NGINX_BUILD_DIR=/workspace/nginx/objs \
+    CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+    RUSTFLAGS="-Zsanitizer=address -Clink-arg=-Wl,-z,nodelete"
+
+COPY --from=planner /workspace/recipe.json recipe.json
+
+RUN cargo +nightly chef cook --target "$(uname -m)-unknown-linux-gnu" --package gabion-nginx --features ngx-module --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo +nightly build --target "$(uname -m)-unknown-linux-gnu" -p gabion-nginx --features ngx-module \
+    && mkdir -p /out \
+    && cp nginx/objs/nginx /out/nginx \
+    && cp target/*/debug/libgabion_nginx.so /out/ngx_http_gabion_module.so \
+    && rm -rf target
+
+FROM ${NGINX_BASE_IMAGE} AS asan
+
+SHELL ["/bin/sh", "-euxc"]
+
+# `llvm` provides the llvm-symbolizer ASan uses to resolve report frames.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends llvm \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=asan-builder /out/nginx /usr/sbin/nginx
+COPY --from=asan-builder /out/ngx_http_gabion_module.so /etc/nginx/modules/ngx_http_gabion_module.so
+COPY deploy/nginx/gabion-load-module.conf /etc/nginx/gabion-load-module.conf
+COPY deploy/nginx/nginx.smoke.conf /etc/nginx/nginx.conf
+COPY deploy/nginx/lsan.supp /etc/nginx/lsan.supp
+COPY --chmod=755 deploy/nginx/module-request-smoke.sh /usr/local/bin/gabion-nginx-request-smoke
+COPY --chmod=755 deploy/nginx/reload-smoke.sh /usr/local/bin/gabion-nginx-reload-smoke
+COPY --chmod=755 deploy/nginx/smoke-with-bt.sh /usr/local/bin/gabion-smoke-with-bt
+
+# Reports go to files, not stderr: nginx respawns a worker ASan aborted, so
+# only `gabion-smoke-with-bt` checking /tmp/asan.* can fail the run.
+ENV ASAN_OPTIONS=abort_on_error=1:halt_on_error=1:detect_leaks=1:log_path=/tmp/asan \
+    LSAN_OPTIONS=suppressions=/etc/nginx/lsan.supp:print_suppressions=0
+
 # Default build target = `published`. The trailing unnamed stage makes
 # `docker build -f Dockerfile .` produce the registry-shaped image
 # without --target; smoke is opt-in via --target smoke.

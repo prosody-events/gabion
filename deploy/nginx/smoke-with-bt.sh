@@ -21,6 +21,23 @@ mkdir -p /tmp/cores
 # — `set -e` would mask SIGSEGV.
 "$@"
 rc=$?
+
+# The ASan image logs reports to /tmp/asan.<pid> (see `ASAN_OPTIONS` in
+# the Dockerfile): nginx respawns a worker ASan aborts, so the smoke
+# itself can pass. LeakSanitizer reports as each process exits, so wait
+# for nginx to finish shutting down before collecting.
+if [ -n "${ASAN_OPTIONS:-}" ]; then
+    for _ in $(seq 50); do
+        grep -qsx nginx /proc/[0-9]*/comm || break
+        sleep 0.1
+    done
+    for report in /tmp/asan.*; do
+        [ -e "$report" ] || continue
+        printf '\n=== AddressSanitizer report %s ===\n' "$report" >&2
+        cat "$report" >&2
+        rc=1
+    done
+fi
 [ "$rc" -eq 0 ] && exit 0
 
 printf '\n=== gabion smoke exited rc=%s ===\n' "$rc" >&2

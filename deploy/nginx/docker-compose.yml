@@ -60,3 +60,20 @@ services:
       target: smoke
       args:
         OPENRESTY_BASE_IMAGE: ${OPENRESTY_BASE_IMAGE:-openresty/openresty:alpine}
+
+  # AddressSanitizer build of nginx and the module (`make nginx-asan`).
+  # Pinned to the Debian base because ASan doesn't support musl. The
+  # wrapper fails the run on any ASan or LeakSanitizer report.
+  nginx-module-asan-smoke:
+    build:
+      context: ../..
+      dockerfile: deploy/nginx/Dockerfile
+      target: asan
+      args:
+        NGINX_BASE_IMAGE: nginx:stable
+    profiles: ["module"]
+    command:
+      - "/usr/local/bin/gabion-smoke-with-bt"
+      - "sh"
+      - "-c"
+      - "gabion-nginx-request-smoke && gabion-nginx-reload-smoke"
