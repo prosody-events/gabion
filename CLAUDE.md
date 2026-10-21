@@ -352,7 +352,7 @@ the relevant README and link it from the surrounding context.
   if it's missing.
 - `make test` runs `fmt-check`, `clippy -D warnings`, workspace
   `nextest`, the safety integration test, and `hygiene`. Run it before
-  declaring a change done. `make ci` adds Miri (Stacked Borrows),
+  declaring a change done. `make ci` adds loom, Miri (Stacked Borrows),
   `bench-check`, and the nginx smoke tests.
 - Tests live in their own file, not inline at the bottom of the
   production file. For a tested module `foo.rs`, declare

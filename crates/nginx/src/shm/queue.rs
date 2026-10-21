@@ -8,6 +8,7 @@
 //! modulo collapses to a mask.
 
 use super::atomic::{AtomicU32, AtomicU64, Ordering};
+use super::hint::spin_loop;
 
 /// Drop reason returned by `push` when the ring is at capacity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,7 +140,7 @@ impl<'a> RequestQueue<'a> {
                 self.control.dropped.fetch_add(1, Ordering::Relaxed);
                 return Err(QueueOverflow);
             }
-            std::hint::spin_loop();
+            spin_loop();
         }
     }
 
@@ -167,7 +168,7 @@ impl<'a> RequestQueue<'a> {
             } else if diff < 0 {
                 return None;
             }
-            std::hint::spin_loop();
+            spin_loop();
         }
     }
 

@@ -152,6 +152,7 @@ format: require-nightly-fmt
 .PHONY: clippy
 clippy:
 	$(CARGO_ENV) $(STABLE_CARGO) clippy --workspace --all-targets --tests -- -D warnings
+	$(CARGO_ENV) $(STABLE_CARGO) clippy -p gabion-nginx --features loom --tests -- -D warnings
 
 .PHONY: unit
 unit: require-nextest
@@ -166,11 +167,10 @@ safety: require-nextest
 	$(CARGO_ENV) $(NEXTEST) -p gabion-nginx --test safety
 
 # Loom model checks for the SHM queue, leader lease and aggregate seqlock, in
-# crates/nginx/tests/loom.rs. `--cfg gabion_loom` recompiles every crate, so it
-# builds into its own target dir rather than evicting the normal build.
+# crates/nginx/tests/loom.rs. The `loom` feature rebuilds only gabion-nginx.
 .PHONY: loom
 loom: require-nextest
-	RUSTFLAGS="--cfg gabion_loom" CARGO_TARGET_DIR=target/loom $(CARGO_ENV) $(NEXTEST) -p gabion-nginx --test loom
+	$(CARGO_ENV) $(NEXTEST) -p gabion-nginx --features loom --test loom
 
 .PHONY: miri-safety
 miri-safety:

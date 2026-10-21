@@ -14,6 +14,8 @@ arrayvec.workspace = true
 futures.workspace = true
 gabion.workspace = true
 humantime.workspace = true
+# The `loom` feature swaps the SHM atomics for loom's; `make loom` only.
+loom = { workspace = true, optional = true }
 nginx-sys = { workspace = true, optional = true }
 ngx = { workspace = true, optional = true }
 thiserror.workspace = true
@@ -21,10 +23,6 @@ tokio.workspace = true
 tracing.workspace = true
 twox-hash.workspace = true
 whoami.workspace = true
-
-# The SHM atomics resolve to loom's under `--cfg gabion_loom`; see `make loom`.
-[target.'cfg(gabion_loom)'.dependencies]
-loom.workspace = true
 
 [features]
 default = []
@@ -39,6 +37,3 @@ quickcheck_macros.workspace = true
 [[bench]]
 name = "aggregate"
 harness = false
-
-[lints]
-workspace = true

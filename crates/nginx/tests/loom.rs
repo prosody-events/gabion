@@ -1,11 +1,9 @@
 //! Loom model checks for the SHM request queue, leader lease and aggregate
-//! slot seqlock. Where a
-//! Miri run sees the one schedule it happens to hit, loom runs each model
-//! under every interleaving (up to a preemption bound), and every value a
-//! relaxed load may return.
-//! Run with `make loom`, which builds with `--cfg gabion_loom` so the SHM
-//! atomics are loom's.
-#![cfg(gabion_loom)]
+//! slot seqlock. Where a Miri run sees the one schedule it happens to hit,
+//! loom runs each model under every interleaving (up to a preemption bound),
+//! including the stale values a relaxed load may return. Run with
+//! `make loom`, whose `loom` feature makes the SHM atomics loom's.
+#![cfg(feature = "loom")]
 
 use std::ops::Range;
 
