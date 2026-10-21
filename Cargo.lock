@@ -1025,6 +1025,7 @@ version = "0.3.1"
 dependencies = [
  "anyhow",
  "arrayvec",
+ "criterion",
  "futures",
  "gabion",
  "humantime",

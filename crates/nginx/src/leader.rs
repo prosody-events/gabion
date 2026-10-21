@@ -333,36 +333,7 @@ async fn leader_main(
 
     let mut cell_store = CellStore::<u32>::new(config.cell_store, identity);
     register_rules(&mut cell_store, &rules);
-    // SAFETY: `ShmAggregateStore::new`'s preconditions (see its `# Safety`
-    // doc) are upheld:
-    // * `shm.aggregate_slots_ptr()` returns the address of slot 0 of the
-    //   aggregate region. The nginx master called `ShmRegion::initialize` in
-    //   `set_zone` before forking workers, which `ptr::write`s an
-    //   `AggregateSlot::empty()` into each of `layout.aggregate_capacity`
-    //   slots, so the pointer is non-null, cacheline-aligned (and hence aligned
-    //   for `AggregateSlot`), and points at a fully initialized contiguous
-    //   array of exactly that many slots.
-    // * The `capacity` argument is `shm.layout.aggregate_capacity` — the same
-    //   `Layout` value the master used at `initialize` time, so the slot count
-    //   agrees with the mapping. `Layout::new` enforces it is a power of two
-    //   with `>= 2`, and the total byte length fits in the mapping (well under
-    //   `isize::MAX`).
-    // * A worker's shared-zone mapping lives until the worker exits, and this
-    //   leader thread is joined before then, so the mapping outlives `store`
-    //   (and any `AggregateTable<'_>` derived from it).
-    // * Single-writer: the SHM `LeaderLease` elects at most one leader thread
-    //   per worker process at a time, and this function drops `store` and the
-    //   gossip runtime holding its clone before `campaign` releases the lease
-    //   to the next leader; `ShmAggregateStore` is `!Send + !Sync` (it holds
-    //   `*mut _`
-    //   + `Cell`), so the type system prevents this store from being shared
-    //   with another thread. Concurrent worker readers go through the
-    //   seqlock/atomic accessors on `AggregateSlot`, which is the
-    //   data-race-free protocol the nomicon's "Send and Sync" / atomics rules
-    //   require.
-    let store = Rc::new(unsafe {
-        ShmAggregateStore::new(shm.aggregate_slots_ptr(), shm.layout.aggregate_capacity)
-    });
+    let store = Rc::new(ShmAggregateStore::new(shm));
     let gossip_cfg = config
         .gossip
         .clone()

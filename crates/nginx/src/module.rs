@@ -15,8 +15,8 @@ use ngx::ffi::{
     NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF,
     NGX_LOG_EMERG, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_exiting,
     ngx_http_handler_pt, ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t,
-    ngx_module_t, ngx_pool_cleanup_add, ngx_shared_memory_add, ngx_shm_zone_t, ngx_slab_alloc,
-    ngx_str_t, ngx_uint_t,
+    ngx_module_t, ngx_pagesize, ngx_pool_cleanup_add, ngx_shared_memory_add, ngx_shm_zone_t,
+    ngx_slab_alloc, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
     self, HttpModule, HttpModuleLocationConf, HttpModuleMainConf, MergeConfigError,
@@ -43,10 +43,7 @@ use crate::rules::{
     resolve_rate,
 };
 use crate::shm::lease::now_millis;
-use crate::shm::{Layout, ShmRegion};
-
-const DEFAULT_QUEUE_CAPACITY: usize = 2048;
-const DEFAULT_AGGREGATE_CAPACITY: usize = 4096;
+use crate::shm::{Layout, MIN_AGGREGATE_CAPACITY, ShmRegion};
 
 static LEADER_THREAD: Mutex<Option<LeaderHandle>> = Mutex::new(None);
 
@@ -841,7 +838,9 @@ extern "C" fn set_zone(
     // `ngx_str_t` populated by nginx's tokenizer; the pointer arithmetic
     // below is bounded by the `nelts` check, and each `ngx_str_t` is a
     // valid borrowed view of the config file's token storage which outlives
-    // this call. See the nomicon chapters on FFI and raw pointers.
+    // this call. `ngx_pagesize` is read by value; nginx set it at startup,
+    // before parsing any config, and never writes it again. See the nomicon
+    // chapters on FFI and raw pointers.
     unsafe {
         let main = &mut *(conf as *mut MainConfig);
         if main.layout.is_some() {
@@ -900,20 +899,26 @@ extern "C" fn set_zone(
             );
             return core::NGX_CONF_ERROR;
         };
-        let Some(layout) = Layout::new(DEFAULT_QUEUE_CAPACITY, DEFAULT_AGGREGATE_CAPACITY) else {
-            ngx::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "gabion: invalid SHM layout");
+        let Some(layout) = Layout::for_zone(bytes, ngx_pagesize) else {
+            ngx::ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                cf,
+                "gabion: `gabion_limit_zone` size `{}` is too small to hold gabion's request \
+                 queue and at least {} counter slots. Use at least `1m`; see the zone sizing \
+                 notes in the gabion nginx README to size it for your traffic.",
+                size,
+                MIN_AGGREGATE_CAPACITY
+            );
             return core::NGX_CONF_ERROR;
         };
         let mut zone_name = ngx_str_t {
             len: name.len(),
             data: name.as_ptr().cast_mut(),
         };
-        // nginx's slab allocator keeps its bookkeeping at the start of the
-        // zone, so leave it room beside the region.
         let shm_zone = ngx_shared_memory_add(
             cf,
             &mut zone_name,
-            bytes.max(2 * layout.total_bytes),
+            bytes,
             ptr::addr_of_mut!(ngx_http_gabion_module).cast(),
         );
         if shm_zone.is_null() {
@@ -987,6 +992,7 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
     tracing::info!(
         zone = %String::from_utf8_lossy(zone.shm.name.as_bytes()),
         bytes = zone.shm.size,
+        slots = region.layout.aggregate_capacity,
         reused = previous.is_some(),
         "gabion: zone ready",
     );

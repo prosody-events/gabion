@@ -28,5 +28,10 @@ ngx-module = ["dep:nginx-sys", "dep:ngx", "ngx/async", "export-modules"]
 export-modules = []
 
 [dev-dependencies]
+criterion.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
+
+[[bench]]
+name = "aggregate"
+harness = false

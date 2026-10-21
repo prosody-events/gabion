@@ -122,7 +122,7 @@ help:
 	@printf '%s\n' '  make miri-ffi-alignment-tb Run FFI alignment tests under miri (Tree Borrows)'
 	@printf '%s\n' '  make miri-lib        Run all gabion-nginx lib tests under miri'
 	@printf '%s\n' '  make miri-all        Run miri (Stacked + Tree Borrows) on every gabion-nginx test'
-	@printf '%s\n' '  make bench-check     Compile gabion::crdt benchmarks'
+	@printf '%s\n' '  make bench-check     Compile the crdt and SHM aggregate benchmarks'
 	@printf '%s\n' '  make wasm-check      Cross-compile gabion-wasm, run its native tests, and build the web frontend'
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
@@ -214,6 +214,7 @@ test: fmt clippy unit safety hygiene
 .PHONY: bench-check
 bench-check:
 	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion --bench crdt --no-run
+	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-nginx --bench aggregate --no-run
 
 # Gate the visualizer's wasm bridge and frontend: (1) type-check gabion-wasm
 # for wasm32 with the browser getrandom backend (the make-or-break
