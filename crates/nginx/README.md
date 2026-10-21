@@ -246,7 +246,10 @@ counters and gossip continue to see real traffic — only the reject
 verdict itself is suppressed. A request is decided once: internal
 redirects (`index`, `try_files`, `error_page`, named locations) don't
 count it again, though a pass that counted nothing leaves the next
-limited location to decide, as with `limit_req`. Subrequests never count.
+limited location to decide, as with `limit_req`. So an inherited
+http-level `gabion_limit` that counts a request keeps a stricter rule in
+a location it is redirected to from applying. Subrequests never count,
+and gabion reserves the `$gabion_decided` variable name for this mark.
 
 ## Directive reference
 

@@ -124,6 +124,13 @@ impl http::HttpModule for Module {
         let main = Module::main_conf_mut(unsafe { &*cf });
         let (Some(variable), Ok(index), Some(main)) = (variable, usize::try_from(index), main)
         else {
+            ngx::ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                cf,
+                "gabion: could not register `$gabion_decided`, the variable gabion uses to count \
+                 each request once across internal redirects. Look for an earlier error naming \
+                 it: another module may define `$gabion_decided` too."
+            );
             return core::Status::NGX_ERROR.into();
         };
         variable.get_handler = Some(decided_not_found);
@@ -698,8 +705,8 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
     let (Some((region, rules)), Some(index)) = (main.active(), main.decided) else {
         return core::Status::NGX_DECLINED;
     };
-    // Internal redirects rerun this handler but keep `r->variables`, so the
-    // slot's `data` marks a request already counted or refused, as
+    // Internal redirects rerun this handler but keep `r->variables`, so a
+    // non-null slot `data` marks a request already counted or refused, as
     // `limit_req` marks `r->main`. Subrequests skip the access phase.
     //
     // SAFETY: `index` came from `ngx_http_get_variable_index` for this
@@ -708,9 +715,8 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
     // initialised for the whole request. Only this worker's event thread
     // touches it, and no reference to it is held.
     let decided = unsafe { request.as_ref().variables.add(index) };
-    let marker = ptr::addr_of!(DECIDED).cast_mut();
     // SAFETY: `decided` is in bounds and initialised (above).
-    if unsafe { (*decided).data } == marker {
+    if !unsafe { (*decided).data }.is_null() {
         return core::Status::NGX_DECLINED;
     }
 
@@ -724,38 +730,38 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
     };
     let vars = RequestVariables { request };
     let now = wall_millis();
-    let outcome = decide_all(ctx, rule_indices, &vars, now);
     // A pass that counted nothing leaves the next limited location to decide.
-    if !matches!(outcome, AccessOutcome::Allow(None) | AccessOutcome::Decline) {
-        // SAFETY: `decided` is in bounds and initialised (above).
-        unsafe { (*decided).data = marker };
-    }
-    match outcome {
+    let (status, counted) = match decide_all(ctx, rule_indices, &vars, now) {
         AccessOutcome::Allow(Some(info)) => {
             apply_admit_headers(request, info);
-            core::Status::NGX_DECLINED
+            (core::Status::NGX_DECLINED, true)
         }
-        AccessOutcome::Allow(None) | AccessOutcome::Decline => core::Status::NGX_DECLINED,
+        AccessOutcome::Allow(None) | AccessOutcome::Decline => (core::Status::NGX_DECLINED, false),
         AccessOutcome::Reject(info) => {
             apply_reject_headers(request, info);
-            http::HTTPStatus::TOO_MANY_REQUESTS.into()
+            (http::HTTPStatus::TOO_MANY_REQUESTS.into(), true)
         }
-        AccessOutcome::Cardinality => http::HTTPStatus::BAD_REQUEST.into(),
+        AccessOutcome::Cardinality => (http::HTTPStatus::BAD_REQUEST.into(), true),
+    };
+    if counted {
+        // SAFETY: `decided` is in bounds and initialised (above).
+        unsafe { (*decided).data = ptr::NonNull::dangling().as_ptr() };
     }
+    status
 });
-
-/// Only its address matters: `$gabion_decided`'s `data` points here.
-static DECIDED: u8 = 0;
 
 /// `$gabion_decided` never has a value, and leaving the slot's `data`
 /// alone keeps nginx's own evaluation (`log_format`, `if`) off the marker.
-extern "C" fn decided_not_found(
+///
+/// # Safety
+/// `v` must point at a request's slot for this variable, valid for writes.
+unsafe extern "C" fn decided_not_found(
     _: *mut ngx_http_request_t,
     v: *mut ngx_http_variable_value_t,
     _: usize,
 ) -> ngx_int_t {
     // SAFETY: nginx calls get handlers with `v` pointing at the request's
-    // slot for this variable, valid for writes.
+    // slot for this variable, per the doc above.
     unsafe { (*v).set_not_found(1) };
     core::Status::NGX_OK.into()
 }

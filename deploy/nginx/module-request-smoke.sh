@@ -62,6 +62,8 @@ nginx -c "$SHIM_CONF"
 
 api_url="http://127.0.0.1:8080/api/index.html"
 ip_url="http://127.0.0.1:8080/ip/index.html"
+redirect_url="http://127.0.0.1:8080/redirect/"
+named_url="http://127.0.0.1:8080/named/"
 tenant_a_url="http://127.0.0.1:8080/tenant/index.html?tenant=a"
 tenant_b_url="http://127.0.0.1:8080/tenant/index.html?tenant=b"
 tenant_missing_url="http://127.0.0.1:8080/tenant/index.html"
@@ -123,8 +125,9 @@ SETTLE_SLEEP="${GABION_SMOKE_SETTLE_SLEEP:-0.25}"
 # one `Retry-After`. `/redirect/` passes through `index` (and its 429
 # through `error_page`) back into its own limited location, and `/named/`
 # is first limited after `try_files`: each is still counted once.
-for url in "$api_url" "$ip_url" http://127.0.0.1:8080/redirect/ http://127.0.0.1:8080/named/; do
+for url in "$api_url" "$ip_url" "$redirect_url" "$named_url"; do
     for status in 200 200 429; do
+        [ "$status" = 429 ] && sleep "$SETTLE_SLEEP"
         h="$(curl_headers "$url")"
         test "$(printf '%s\n' "$h" | head -n1 | awk '{print $2}')" = "$status"
         for name in X-RateLimit-Limit X-RateLimit-Remaining X-RateLimit-Reset Retry-After; do
@@ -133,7 +136,6 @@ for url in "$api_url" "$ip_url" http://127.0.0.1:8080/redirect/ http://127.0.0.1
             test "$(printf '%s\n' "$h" | grep -ci "^$name:")" = "$want" \
                 || { echo "$url: expected $want $name"; printf '%s\n' "$h"; exit 1; }
         done
-        sleep "$SETTLE_SLEEP"
     done
     assert_header_equals "$h" 'X-RateLimit-Remaining' '0'
 done
