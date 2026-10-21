@@ -237,10 +237,22 @@ pub struct ShmAggregateStore {
 }
 
 impl ShmAggregateStore {
+    /// The writer for `region`'s table, which it empties first. Each leader
+    /// builds its counts afresh, from its own hits and peers' gossip, so
+    /// counts an earlier leader left behind would be added a second time and
+    /// never expire. Readers under-count until gossip refills the table.
+    /// Writes resume past every sequence cleared, so a reader still holding
+    /// one cannot see it again over a different cell.
     pub fn new(region: ShmRegion) -> Self {
+        let slots = region.aggregate().slots;
+        let (cleared, last_seq) = slots.iter().fold((0, 0), |(n, last), slot| {
+            let seq = slot.seq.swap(0, Ordering::Release);
+            (n + usize::from(seq != 0), last.max(seq))
+        });
+        tracing::debug!(cleared, "gabion: new gossip leader emptied the count table");
         Self {
             region,
-            next_write_seq: Cell::new(2),
+            next_write_seq: Cell::new((last_seq | 1).wrapping_add(1)),
         }
     }
 
@@ -304,8 +316,8 @@ impl ShmAggregateStore {
                         gap = 0;
                     }
                 }
-                // Only a slot a crashed leader left mid-write reads busy to
-                // the writer; it stays put.
+                // Only a former leader still writing after it lost the lease
+                // leaves a slot busy for the writer; it stays put.
                 Read::Busy => {}
             }
         }

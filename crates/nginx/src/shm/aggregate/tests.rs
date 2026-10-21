@@ -1,5 +1,10 @@
 use std::collections::HashMap;
 
+use gabion::crdt::{
+    CellStore, CellStoreConfig, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch,
+    RuleDescriptor,
+};
+
 use super::*;
 use crate::shm::mock::TestZone;
 
@@ -97,6 +102,64 @@ fn churn_keeps_cells_findable_and_frees_every_slot() {
             store.write_expiration(1, 2, key, count);
         }
     }
+    assert!(
+        view.slots
+            .iter()
+            .all(|slot| matches!(slot.read(), Read::Empty))
+    );
+}
+
+/// One leader term on node 1: a fresh `CellStore` learns a peer's count
+/// from gossip and `store` applies the resulting delta.
+fn lead(store: &ShmAggregateStore, incarnation: u32) -> CellStore<u32> {
+    let identity = NodeIdentity::new(NodeId(1), incarnation);
+    let mut cells = CellStore::new(CellStoreConfig::default(), identity);
+    let rule = RuleDescriptor {
+        fingerprint: 0x42,
+        local_rule_id: 0,
+        ..RuleDescriptor::default()
+    };
+    cells.intern_rule(rule).expect("rule slot");
+    let mut gossip = ObservationBatch::default();
+    gossip.push(Observation {
+        rule_fingerprint: 0x42,
+        key_hash: KeyHash(0x99),
+        bucket: 7,
+        origin: NodeId(2),
+        incarnation: 1,
+        count: 5,
+        last_update_millis: 7_000,
+    });
+    let mut deltas = DeltaSink::default();
+    cells.merge_remote(&gossip, &mut deltas);
+    store.apply(&deltas, &ExpirationSink::default());
+    cells
+}
+
+/// A leader taking over a zone its predecessor filled relearns the same
+/// counts from peers. It counts each once, and expiring them frees every
+/// slot.
+#[test]
+fn a_new_leader_counts_regossiped_cells_once() {
+    let (_zone, region, previous) = table(16);
+    lead(&previous, 1);
+    let view = region.aggregate();
+    let last_seq = || {
+        view.slots
+            .iter()
+            .map(|slot| slot.seq.load(Ordering::Relaxed))
+            .max()
+    };
+    let previous_seq = last_seq();
+
+    let store = ShmAggregateStore::new(region);
+    let mut cells = lead(&store, 2);
+    assert_eq!(view.get(0x42, 0x99, 7).expect("found").count, 5);
+    assert!(last_seq() > previous_seq, "a cleared sequence was reused");
+
+    let mut expired = ExpirationSink::default();
+    cells.expire_at(100_000, &mut expired);
+    store.apply(&DeltaSink::default(), &expired);
     assert!(
         view.slots
             .iter()

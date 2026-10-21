@@ -333,6 +333,66 @@ assert_cluster_rate_limit() {
     fi
 }
 
+# `await_counted_once <pod>` probes the pod's takeover_check location
+# (1000 requests an hour) until it has counted every earlier request
+# exactly once. Each probe counts too. Fewer is gossip still catching up;
+# more is a double count and fails at once.
+await_counted_once() {
+    attempts=0
+    while [ "$attempts" -lt 120 ]; do
+        expected=$((1000 - sent - 1))
+        remaining="$(kubectl -n "$namespace" exec "$1" -- \
+            curl -sS -D - -o /dev/null http://127.0.0.1:8080/takeover/index.html \
+            | grep -i '^X-RateLimit-Remaining:' | awk '{print $2}' | tr -d '\r')"
+        sent=$((sent + 1))
+        if [ "$remaining" = "$expected" ]; then
+            return 0
+        fi
+        if [ "$remaining" -lt "$expected" ]; then
+            printf '%s\n' "FAIL: pod $1 reports Remaining=$remaining, expected $expected: it counted a request twice" >&2
+            return 1
+        fi
+        attempts=$((attempts + 1))
+        sleep 0.5
+    done
+    printf '%s\n' "FAIL: pod $1 never counted all $sent requests; last Remaining=$remaining" >&2
+    return 1
+}
+
+# `leader_terms <pod>` prints how many times a worker on the pod has won
+# the gossip leader lease.
+leader_terms() {
+    kubectl -n "$namespace" logs "$1" | grep -c 'worker won leader lease'
+}
+
+assert_reload_counts_once() {
+    # A reloaded pod's new leader empties its count table and relearns the
+    # counts from its peers; it must count each request once, not add them
+    # on top of the counts it already had. Before the reload, B must hold
+    # A's request and A must hold B's probes, so B's next leader can relearn
+    # them. After it takes over, a fresh request on A reaches B only as A's
+    # whole count, which a leftover table would add twice.
+    set -- $pods
+    sent=0
+    await_counted_once "$1"
+    await_counted_once "$2"
+    await_counted_once "$1"
+    terms="$(leader_terms "$2")"
+    kubectl -n "$namespace" exec "$2" -- nginx -c /etc/nginx/gabion-load-module.conf -s reload
+    attempts=0
+    until [ "$(leader_terms "$2")" -gt "$terms" ]; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 120 ]; then
+            printf '%s\n' "FAIL: no worker on pod $2 took over gossip after the reload" >&2
+            return 1
+        fi
+        sleep 0.5
+    done
+    await_counted_once "$1"
+    await_counted_once "$2"
+    printf '\n  pod %s counted all %s requests once after its reload\n' "$2" "$sent"
+}
+
 summarize_pod() {
     pod="$1"
     printf '\n=== pod %s ===\n' "$pod"
@@ -389,6 +449,7 @@ pods="$(wait_for_pods 3)"
 # assertion only holds at N=1; for N=3 we assert the cluster-wide
 # aggregate via the ClusterIP Service.
 assert_cluster_rate_limit
+assert_reload_counts_once
 
 # Still pull per-pod diagnostics so an operator can see who participated.
 for pod in $pods; do

@@ -934,8 +934,9 @@ extern "C" fn set_zone(
 /// nginx zone `init` callback for `gabion_limit_zone`. nginx runs it in the
 /// master after the whole config is parsed. On a reload that keeps the
 /// zone's name and size, nginx reuses the mapping and passes the previous
-/// config as `data`, so counts, the leader lease and the queue carry over;
-/// otherwise the zone is new and the region is carved out of it.
+/// config as `data`, so the identity, the leader lease and the queue carry
+/// over (the next leader empties the counts and peers' gossip refills
+/// them); otherwise the zone is new and the region is carved out of it.
 unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void) -> ngx_int_t {
     // SAFETY: `set_zone` pointed this zone's `data` at its config's boxed
     // `MainConfig`, which lives until that config's pool is destroyed. nginx

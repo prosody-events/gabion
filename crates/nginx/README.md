@@ -263,10 +263,17 @@ once per `http {}` block that declares rules; `nginx -t` refuses rules
 without one. Mirrors nginx core's `limit_req_zone zone=name:size`.
 
 Like nginx's own zones, a zone survives `nginx -s reload` when its
-name and size are unchanged: counts, the node identity and the gossip
-leader carry over, and the log line `gabion: zone ready` says
-`reused=true`. Changing the name or size starts an empty zone, and the
-master releases the old one once no configuration uses it.
+name and size are unchanged: the node identity and any queued hits
+carry over, and the log line `gabion: zone ready` says `reused=true`.
+The counts do not: whenever a worker takes over gossip (after a reload,
+a crash, or a lost lease), it empties the count table and peers gossip
+the counts back, usually within a gossip tick or two, longer when the
+cluster tracks many thousands of keys. Until then this node under-counts
+and may admit requests over the limit. A node with no peers has nothing
+to rebuild from, so a reload or leader change resets its limits as if
+every window had just started. Changing the name or size starts an
+empty zone, and the master releases the old one once no configuration
+uses it.
 
 ```nginx
 gabion_limit_zone zone=api:128m;
