@@ -21,10 +21,6 @@ fn defaults_match_shared_production_defaults() {
         gossip.send_queue_capacity,
         defaults::GOSSIP_SEND_QUEUE_CAPACITY
     );
-    assert_eq!(
-        gossip.limit_queue_capacity,
-        defaults::GOSSIP_LIMIT_QUEUE_CAPACITY
-    );
     assert_eq!(gossip.cluster_id_hash, defaults::GOSSIP_CLUSTER_ID_HASH);
     assert_eq!(gossip.target_err_bps, defaults::GOSSIP_TARGET_ERR_BPS);
     assert_eq!(
@@ -185,8 +181,7 @@ impl AggregateStore<u32> for AppliedHits {
 #[tokio::test(start_paused = true)]
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
 async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
-    const EVENTS: usize = 8;
-    const ROOM: usize = 3;
+    const EVENTS: usize = DRAIN_BATCH + 8;
     let region = leaked_region();
     let event = QueueEvent {
         hits: 1,
@@ -196,14 +191,10 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
         .try_for_each(|_| region.queue().push(event))
         .expect("queue has room");
     let identity = NodeIdentity::new(gabion::crdt::NodeId(1), 1);
-    let gossip = GossipSettings {
-        limit_queue_capacity: ROOM,
-        ..GossipSettings::default()
-    };
     let applied = Rc::new(AppliedHits::default());
     let (runtime, client) = GossipRuntime::bind(
         LONE_NODE_BIND,
-        gossip.into_runtime_config(identity, 0),
+        GossipSettings::default().into_runtime_config(identity, 0),
         CellStore::new(production_cell_store_config(), identity),
         applied.clone(),
     )
@@ -212,7 +203,7 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
     let drained = || region.stats().snapshot().queue_drained as usize;
     let mut drain = std::pin::pin!(drain_loop(client, region, 1));
     assert!(timeout(DEADLINE, drain.as_mut()).await.is_err());
-    assert_eq!(drained(), ROOM);
+    assert_eq!(drained(), DRAIN_BATCH);
     let both = async { tokio::join!(drain.as_mut(), runtime.run(futures::stream::empty())) };
     assert!(timeout(DEADLINE, both).await.is_err());
     assert_eq!((applied.0.get(), drained()), (EVENTS, EVENTS));

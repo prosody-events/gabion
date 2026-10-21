@@ -58,10 +58,17 @@ impl<C: Count> GossipClient<C> {
         rule_limit: u64,
         now_millis: u64,
     ) -> Result<(), GossipError> {
+        let permit = self
+            .requests
+            .reserve()
+            .await
+            .map_err(|_| GossipError::RuntimeShutDown)?;
         let (reply, applied) = oneshot::channel();
-        let mut permit = self.reserve().await?;
-        permit.reply = Some(reply);
-        permit.record(
+        RecordPermit {
+            permit,
+            reply: Some(reply),
+        }
+        .record(
             rule_fingerprint,
             key_hash,
             bucket,
@@ -72,18 +79,23 @@ impl<C: Count> GossipClient<C> {
         applied.await.map_err(|_| GossipError::RuntimeShutDown)
     }
 
-    /// Wait for room in the runtime's request queue, so a caller can leave
-    /// its hit queued until the runtime can take it.
-    pub async fn reserve(&self) -> Result<RecordPermit<'_>, GossipError> {
-        let permit = self
+    /// Wait until the runtime's request queue has room for `n` hits, so a
+    /// caller can leave its hits where they are until the runtime can take
+    /// them. `n` must not exceed [`super::GossipConfig::limit_queue_capacity`].
+    pub async fn reserve(
+        &self,
+        n: usize,
+    ) -> Result<impl Iterator<Item = RecordPermit<'_>>, GossipError> {
+        debug_assert!(n <= self.requests.max_capacity());
+        let permits = self
             .requests
-            .reserve()
+            .reserve_many(n)
             .await
             .map_err(|_| GossipError::RuntimeShutDown)?;
-        Ok(RecordPermit {
+        Ok(permits.map(|permit| RecordPermit {
             permit,
             reply: None,
-        })
+        }))
     }
 
     /// Ask the runtime to stop after draining whatever is already queued.
@@ -96,14 +108,15 @@ impl<C: Count> GossipClient<C> {
 }
 
 /// A slot in the runtime's request queue, from [`GossipClient::reserve`].
+#[must_use = "dropping a permit releases its slot without recording a hit"]
 pub struct RecordPermit<'a> {
     permit: mpsc::Permit<'a, Request>,
     reply: Option<oneshot::Sender<()>>,
 }
 
 impl RecordPermit<'_> {
-    /// Hand one hit to the runtime without waiting for it to be applied.
-    /// Neither this nor [`GossipClient::reserve`] allocates.
+    /// Hand one hit to the runtime without waiting for it to be applied, and
+    /// without the reply channel [`GossipClient::record`] allocates.
     pub fn record(
         self,
         rule_fingerprint: u128,

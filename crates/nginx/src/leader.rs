@@ -32,8 +32,10 @@ use crate::shm::ShmRegion;
 use crate::shm::aggregate::ShmAggregateStore;
 use crate::shm::lease::now_millis;
 
-/// Events the drain hands the runtime between yields. Yielding keeps tokio's
-/// mpsc shallow enough to recycle its 32-slot blocks; deeper, it allocates.
+/// Events the drain hands the runtime per pass, and the depth of the runtime's
+/// request queue. The drain waits for the runtime to take one batch before
+/// popping the next, so a backlog waits in SHM, and a queue this shallow
+/// recycles tokio's storage instead of allocating.
 const DRAIN_BATCH: usize = 32;
 
 /// How often the drain polls an empty SHM queue.
@@ -92,7 +94,6 @@ pub struct GossipSettings {
     pub max_cells_per_frame: u32,
     pub max_cells_per_tick: usize,
     pub send_queue_capacity: usize,
-    pub limit_queue_capacity: usize,
     pub cluster_id_hash: u128,
     /// Per-rule error budget for threshold-triggered anti-entropy, in
     /// basis points of the rule's own limit. See
@@ -115,7 +116,6 @@ impl Default for GossipSettings {
             max_cells_per_frame: defaults::GOSSIP_MAX_CELLS_PER_FRAME,
             max_cells_per_tick: defaults::GOSSIP_MAX_CELLS_PER_TICK,
             send_queue_capacity: defaults::GOSSIP_SEND_QUEUE_CAPACITY,
-            limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
             cluster_id_hash: defaults::GOSSIP_CLUSTER_ID_HASH,
             target_err_bps: defaults::GOSSIP_TARGET_ERR_BPS,
             min_emit_interval: Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
@@ -150,7 +150,7 @@ impl GossipSettings {
                 max_cells: self.max_cells_per_frame,
             },
             send_queue_capacity: self.send_queue_capacity,
-            limit_queue_capacity: self.limit_queue_capacity,
+            limit_queue_capacity: DRAIN_BATCH,
             tick_interval: self.tick_interval,
             auth_key: None,
             rng_seed,
@@ -394,22 +394,19 @@ async fn drain_loop(client: GossipClient<u32>, shm: ShmRegion, worker_id: u32) -
     let lease = shm.lease();
     let queue = shm.queue();
     let stats = shm.stats();
-    'drain: loop {
+    loop {
         // Renew the lease before popping: a leader that stalled past the TTL
         // and lost it stops here instead of draining beside its successor.
         if !lease.try_acquire(worker_id, now_millis(), LEASE_TTL_MILLIS) {
             return anyhow::anyhow!("worker {worker_id} lost the leader lease to another worker");
         }
-        for _ in 0..DRAIN_BATCH {
-            // Reserve before popping: a busy runtime leaves events in SHM.
-            let Ok(permit) = client.reserve().await else {
-                return anyhow::anyhow!("gossip runtime shut down");
-            };
-            let Some(ev) = queue.pop() else {
-                tokio::time::sleep(DRAIN_TICK).await;
-                continue 'drain;
-            };
-            stats.record_queue_drain(1);
+        let Ok(permits) = client.reserve(DRAIN_BATCH).await else {
+            return anyhow::anyhow!("gossip runtime shut down");
+        };
+        // `zip` takes a permit before each pop, so no event leaves SHM
+        // without a slot to land in.
+        let mut drained = 0;
+        for (permit, ev) in permits.zip(std::iter::from_fn(|| queue.pop())) {
             permit.record(
                 ev.rule_fingerprint,
                 KeyHash(ev.key_hash),
@@ -418,7 +415,11 @@ async fn drain_loop(client: GossipClient<u32>, shm: ShmRegion, worker_id: u32) -
                 ev.rule_limit,
                 ev.now_millis,
             );
+            drained += 1;
         }
-        tokio::task::yield_now().await;
+        stats.record_queue_drain(drained);
+        if drained == 0 {
+            tokio::time::sleep(DRAIN_TICK).await;
+        }
     }
 }
