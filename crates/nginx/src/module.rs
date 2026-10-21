@@ -970,9 +970,13 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
             let base = unsafe { ngx_slab_alloc(zone.shm.addr.cast(), layout.total_bytes) };
             if base.is_null() {
                 tracing::error!(
-                    "gabion: `gabion_limit_zone` is too small for gabion's {} bytes of state. \
-                     Raise its size.",
-                    layout.total_bytes,
+                    zone_bytes = zone.shm.size,
+                    needed_bytes = layout.total_bytes,
+                    "gabion: the `gabion_limit_zone` zone had no room for gabion's state, so \
+                     nginx rejected this configuration. gabion sizes its state to fit the zone, \
+                     so nginx's slab bookkeeping used more of it than gabion allowed for. Raise \
+                     SIZE in `gabion_limit_zone zone=NAME:SIZE`, and report your nginx version as \
+                     a gabion bug.",
                 );
                 return core::Status::NGX_ERROR.into();
             }
@@ -992,7 +996,7 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
     tracing::info!(
         zone = %String::from_utf8_lossy(zone.shm.name.as_bytes()),
         bytes = zone.shm.size,
-        slots = region.layout.aggregate_capacity,
+        slots = region.layout().aggregate_capacity,
         reused = previous.is_some(),
         "gabion: zone ready",
     );

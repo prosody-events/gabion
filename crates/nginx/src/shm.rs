@@ -114,8 +114,8 @@ impl Layout {
 /// stored in atomics or seqlock-protected slots.
 #[derive(Clone, Copy, Debug)]
 pub struct ShmRegion {
-    pub base: *mut u8,
-    pub layout: Layout,
+    base: *mut u8,
+    layout: Layout,
 }
 
 // SAFETY: `ShmRegion` is two POD fields (`*mut u8` + `Copy` `Layout`). The
@@ -196,6 +196,10 @@ impl ShmRegion {
             std::ptr::write(region.stats_ptr() as *mut Stats, Stats::default());
             region
         }
+    }
+
+    pub fn layout(&self) -> Layout {
+        self.layout
     }
 
     pub fn header(&self) -> &Header {

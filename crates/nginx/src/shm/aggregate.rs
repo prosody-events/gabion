@@ -28,9 +28,8 @@ use gabion::rules::RuleSpec;
 use super::{AggregateCell, ShmRegion};
 
 /// The furthest a cell may sit from its home slot, and so the most slots a
-/// lookup reads. Below half load, linear probing almost never needs more
-/// than a few dozen.
-pub const MAX_PROBE: usize = 64;
+/// lookup reads. At half load, under one insert in 10^10 needs more.
+pub const MAX_PROBE: usize = 128;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -155,7 +154,7 @@ impl<'a> AggregateTable<'a> {
     /// Walk at most `MAX_PROBE` slots from the cell's home, stopping at the
     /// cell or at the first empty slot.
     fn probe(&self, fp: u128, kh: u128, bucket: u32) -> Probe {
-        let home = mix_index(fp, kh, bucket);
+        let home = mix_index(fp, kh, bucket) & self.mask();
         for distance in 0..MAX_PROBE {
             let index = (home + distance) & self.mask();
             match self.slots[index].read() {
@@ -258,7 +257,7 @@ impl ShmAggregateStore {
         let (index, count) = match table.probe(fp, kh, bucket) {
             Probe::Found(index, cell) => (index, cell.count.saturating_add(delta)),
             Probe::Vacant(index) => (index, delta),
-            Probe::Full => return self.note_dropped_write(table.capacity()),
+            Probe::Full => return self.note_dropped_write(),
         };
         let cell = AggregateCell {
             rule_fingerprint: fp,
@@ -315,11 +314,11 @@ impl ShmAggregateStore {
 
     /// The table had no free slot near this cell's home, so its count was
     /// not recorded.
-    fn note_dropped_write(&self, capacity: usize) {
+    fn note_dropped_write(&self) {
         let n = self.region.stats().record_aggregate_drop();
         if n.is_power_of_two() {
             tracing::warn!(
-                capacity,
+                capacity = self.region.layout().aggregate_capacity,
                 dropped_total = n,
                 "gabion: the shared-memory count table had no free slot for a rate-limit key, so \
                  that key's hits were not counted: its requests were allowed and it is now \
