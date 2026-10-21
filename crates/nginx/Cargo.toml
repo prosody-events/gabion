@@ -27,6 +27,10 @@ default = []
 ngx-module = ["dep:nginx-sys", "dep:ngx", "ngx/async", "export-modules"]
 export-modules = []
 
+[[bin]]
+name = "nginx_layout"
+required-features = ["ngx-module"]
+
 [dev-dependencies]
 quickcheck.workspace = true
 quickcheck_macros.workspace = true

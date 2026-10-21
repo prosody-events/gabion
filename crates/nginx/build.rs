@@ -39,9 +39,13 @@ fn main() {
         }
     }
 
-    println!("cargo::rerun-if-env-changed=DEP_NGINX_BUILD_DIR");
-    if let Ok(build_dir) = std::env::var("DEP_NGINX_BUILD_DIR") {
-        println!("cargo::rustc-env=DEP_NGINX_BUILD_DIR={build_dir}");
+    // `src/bin/nginx_layout.rs` compiles its C probe against the same
+    // include path nginx-sys ran bindgen with.
+    for var in ["DEP_NGINX_BUILD_DIR", "DEP_NGINX_INCLUDE"] {
+        println!("cargo::rerun-if-env-changed={var}");
+        if let Ok(value) = std::env::var(var) {
+            println!("cargo::rustc-env={var}={value}");
+        }
     }
 
     if cfg!(target_os = "macos") {

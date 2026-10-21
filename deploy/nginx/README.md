@@ -123,6 +123,23 @@ docker build -f deploy/nginx/Dockerfile.openresty \
   -t gabion-openresty:alpine .
 ```
 
+## Binding layout check
+
+Every module build, and so every NGINX and OpenResty version in the
+matrices, runs `crates/nginx/src/bin/nginx_layout.rs` right after
+compiling the module. For each struct field and bitfield that gabion
+and the `ngx` crate touch, it checks the bindings' `size_of`,
+`offset_of!`, and the bits each bitfield accessor reads against a C
+probe compiled with the same configured NGINX headers. A mismatch
+fails the build, naming the field, the NGINX version, and both
+values. When gabion starts using another NGINX field, add it to the
+lists in that file. To run it against a local tree:
+
+```sh
+NGINX_SOURCE_DIR=/path/to/nginx NGINX_BUILD_DIR=/path/to/nginx/objs \
+  cargo run -p gabion-nginx --features ngx-module --bin nginx_layout
+```
+
 ## What the smoke image does
 
 The module smoke image installs build dependencies into the selected
