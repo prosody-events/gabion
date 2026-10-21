@@ -23,6 +23,7 @@ case "$server" in
 esac
 
 namespace="gabion-mixed-$$"
+. deploy/kubernetes/lib.sh
 admin_forward_pid=""
 nginx_forward_pid=""
 
@@ -277,30 +278,6 @@ spec:
     - { name: gabion, port: 9000, targetPort: gabion, protocol: UDP }
 YAML
 
-wait_for_endpoint_count() {
-    service="$1"
-    expected="$2"
-    attempts=0
-    while [ "$attempts" -lt 90 ]; do
-        count="$(
-            kubectl -n "$namespace" get endpointslice \
-                -l "kubernetes.io/service-name=$service" \
-                -o 'jsonpath={range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}' \
-                | sed '/^$/d' \
-                | wc -l \
-                | tr -d ' '
-        )"
-        if [ "$count" = "$expected" ]; then
-            return 0
-        fi
-        attempts=$((attempts + 1))
-        sleep 1
-    done
-    printf '%s\n' "timed out waiting for $expected EndpointSlice addresses for $service; saw $count" >&2
-    kubectl -n "$namespace" get endpointslice -o wide >&2
-    return 1
-}
-
 dump_snapshot() {
     label="$1"
     printf '\n=== gabiond /snapshot (%s) ===\n' "$label"
@@ -356,6 +333,25 @@ drive_nginx_traffic() {
     done
 }
 
+port_forwards_ready() {
+    curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot" \
+        && curl -fsS -o /dev/null "http://127.0.0.1:18080/off/index.html"
+}
+
+# Push traffic through nginx, then check that gabiond knows its peers
+# (discovered via EndpointSlice) and holds rows for the nginx rule.
+gossip_settled() {
+    drive_nginx_traffic
+    curl -fsS "http://127.0.0.1:19090/snapshot" \
+        | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+if s.get("peers") and s["store"]["aggregate_rows"] > 0:
+    sys.exit(0)
+sys.exit(1)
+' 2>/dev/null
+}
+
 kubectl -n "$namespace" rollout status deployment/gabiond --timeout=180s
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=180s
 wait_for_endpoint_count gabiond 2
@@ -368,42 +364,12 @@ kubectl -n "$namespace" port-forward service/gabion-nginx 18080:8080 \
     >/tmp/gabion-nginx-service-port-forward.log 2>&1 &
 nginx_forward_pid="$!"
 
-attempts=0
-while [ "$attempts" -lt 60 ]; do
-    if curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot" \
-        && curl -fsS -o /dev/null "http://127.0.0.1:18080/off/index.html"; then
-        break
-    fi
-    attempts=$((attempts + 1))
-    sleep 1
-done
+retry 60 port_forwards_ready
 
 # Initial state — peers may not have discovered each other yet.
 dump_snapshot "before traffic"
 
-# Push some traffic through nginx, then give gossip a beat to propagate.
-drive_nginx_traffic
-sleep 3
-
-# After some gossip ticks the gabiond peers should know about each other
-# (they discover via EndpointSlice) and the store should have rows for the
-# nginx rule's fingerprint.
-attempts=0
-while [ "$attempts" -lt 30 ]; do
-    if curl -fsS "http://127.0.0.1:19090/snapshot" \
-        | python3 -c '
-import json, sys
-s = json.load(sys.stdin)
-if s.get("peers") and s["store"]["aggregate_rows"] > 0:
-    sys.exit(0)
-sys.exit(1)
-' 2>/dev/null; then
-        break
-    fi
-    attempts=$((attempts + 1))
-    drive_nginx_traffic
-    sleep 1
-done
+retry 60 gossip_settled
 
 # Now scale both deployments and confirm discovery + gossip still convergent.
 kubectl -n "$namespace" scale deployment/gabiond --replicas=3
@@ -413,11 +379,8 @@ kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=180s
 wait_for_endpoint_count gabiond 3
 wait_for_endpoint_count gabion-nginx 3
 
-# Send a bit more traffic so the new pods participate.
-drive_nginx_traffic
-sleep 3
-drive_nginx_traffic
-sleep 2
+# Send more traffic so the new pods participate.
+retry 60 gossip_settled
 
 dump_snapshot "after traffic + scale-out"
 

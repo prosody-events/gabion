@@ -315,10 +315,10 @@ impl core::fmt::Debug for ServiceChange {
 
 // -- live cluster integration ---------------------------------------------
 
-/// End-to-end: stand up two `GossipRuntime`s against a real kind-based
-/// kube cluster, expose them via a tiny Service+EndpointSlice pair so
-/// `EndpointSliceDiscovery` sees one peer for each runtime, and assert
-/// they converge on a non-trivial CRDT counter.
+/// End-to-end: author a Service + EndpointSlice pair in a real kind-based
+/// kube cluster and assert `EndpointSliceDiscovery`'s watcher emits a
+/// `PeerEvent::Added` for one of its endpoints. Gossip over real UDP is
+/// covered by `gossip::tests::udp_round_trip_smoke`.
 ///
 /// `#[ignore]` because it needs `kubectl` credentials wired up. Driven
 /// by `deploy/kubernetes/local-smoke.sh` after `kind` is provisioned.
@@ -329,23 +329,21 @@ impl core::fmt::Debug for ServiceChange {
 /// from an injected client — `Config::infer()` falls through to the
 /// kubeconfig branch when the in-cluster env vars are missing, which is
 /// exactly the path `kubectl`-on-a-laptop takes.
-#[cfg(feature = "transport-udp")]
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires a live kubernetes cluster (kind)"]
-async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
-    use std::rc::Rc;
-    use std::time::{Duration, Instant};
+async fn local_kubernetes_endpoint_slice_watcher_emits_added_peer() {
+    use std::time::Duration;
 
     use futures::TryStreamExt;
     use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
     use k8s_openapi::api::discovery::v1::EndpointSlice as ApiEndpointSlice;
     use kube::api::{DeleteParams, PostParams};
     use kube::core::ObjectMeta;
-    use tokio::task::LocalSet;
 
-    use crate::crdt::{BucketEpoch, CellStore, CellStoreConfig, KeyHash, NodeId, NodeIdentity};
     use crate::discovery::PeerDiscovery;
-    use crate::gossip::{GossipConfig, GossipRuntime, TokioClock, UdpTransport};
+
+    const PORT: u16 = 9000;
+    const ADDRESSES: [&str; 2] = ["10.0.0.1", "10.0.0.2"];
 
     // Use a fresh per-process namespace so concurrent runs (and aborted
     // past runs) don't collide.
@@ -400,20 +398,6 @@ async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
         name: namespace.clone(),
     };
 
-    // Bind two UDP sockets on the host. Their addresses become the
-    // EndpointSlice addresses; kube-rs's watcher returns them, the
-    // discovery stream emits them as Peer events, and the two
-    // GossipRuntimes converge by talking to each other over those
-    // sockets.
-    let sock_a = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind a");
-    let sock_b = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind b");
-    let addr_a = sock_a.local_addr().expect("local addr a");
-    let addr_b = sock_b.local_addr().expect("local addr b");
-
     // Service. The discovery code keys off a UDP port named "gabion";
     // EndpointSlice's port spec must match.
     let svc: kube::Api<Service> = kube::Api::namespaced(client.clone(), &namespace);
@@ -427,7 +411,7 @@ async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
             ports: Some(vec![ServicePort {
                 name: Some("gabion".to_string()),
                 protocol: Some("UDP".to_string()),
-                port: addr_a.port() as i32,
+                port: PORT.into(),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -442,11 +426,8 @@ async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
     // the watcher's input to be deterministic. The apiserver REJECTS
     // loopback addresses (`127.0.0.0/8`, `::1/128`) in
     // `endpoints[].addresses` — that's a built-in EndpointSlice
-    // validation rule, not RBAC. So advertise non-loopback IPs even
-    // though the two gossip sockets are bound on `127.0.0.1`. The
-    // advertised IPs are never dialed: gossip reaches its peers via
-    // `bootstrap_peers` (lines below), and this test only asserts that
-    // the discovery stream emits a `PeerEvent::Added`.
+    // validation rule, not RBAC — so advertise non-loopback IPs. They are
+    // never dialed: this test only asserts what the discovery stream emits.
     let slices: kube::Api<ApiEndpointSlice> = kube::Api::namespaced(client.clone(), &namespace);
     let slice = ApiEndpointSlice {
         metadata: ObjectMeta {
@@ -458,35 +439,20 @@ async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
             ..Default::default()
         },
         address_type: "IPv4".to_string(),
-        endpoints: vec![
-            Endpoint {
-                addresses: vec!["10.0.0.1".to_string()],
+        endpoints: ADDRESSES
+            .map(|address| Endpoint {
+                addresses: vec![address.to_string()],
                 conditions: Some(EndpointConditions {
                     ready: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()
-            },
-            Endpoint {
-                addresses: vec!["10.0.0.2".to_string()],
-                conditions: Some(EndpointConditions {
-                    ready: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        ],
+            })
+            .into(),
         ports: Some(vec![EndpointPort {
             name: Some("gabion".to_string()),
             protocol: Some("UDP".to_string()),
-            // Discovery emits one peer per address, sharing this port.
-            // Both gossip runtimes can't sit on the same port though, so
-            // we accept that the EndpointSlice's "port" can only point
-            // to one of the two and rely on bootstrap_peers below as a
-            // belt-and-suspenders. The test still exercises the
-            // discovery happy path (one peer event arrives) which is
-            // the integration we care about.
-            port: Some(addr_b.port() as i32),
+            port: Some(PORT.into()),
             ..Default::default()
         }]),
     };
@@ -495,167 +461,32 @@ async fn local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence() {
         .await
         .expect("create endpointslice");
 
-    // ---- gossip wiring --------------------------------------------------
-    let local = LocalSet::new();
-    let outcome = local
-        .run_until(async move {
-            let id_a = NodeIdentity::new(NodeId(0x1A_00), 1);
-            let id_b = NodeIdentity::new(NodeId(0x1B_00), 1);
-            let agg_a = Rc::new(InMemoryAgg::default());
-            let agg_b = Rc::new(InMemoryAgg::default());
-
-            let config_a = GossipConfig {
-                local_identity: id_a,
-                cluster_id_hash: 0xC1,
-                bootstrap_peers: vec![addr_b],
-                fanout: 1,
-                tick_interval: Duration::from_millis(20),
-                rng_seed: 1,
-                ..GossipConfig::default()
-            };
-            let config_b = GossipConfig {
-                local_identity: id_b,
-                cluster_id_hash: 0xC1,
-                bootstrap_peers: vec![addr_a],
-                fanout: 1,
-                tick_interval: Duration::from_millis(20),
-                rng_seed: 2,
-                ..GossipConfig::default()
-            };
-
-            let store_a = CellStore::<u32>::new(CellStoreConfig::default(), id_a);
-            let store_b = CellStore::<u32>::new(CellStoreConfig::default(), id_b);
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                UdpTransport::from_socket(sock_a),
-                TokioClock::new(),
-                config_a,
-                store_a,
-                agg_a.clone(),
-            );
-            let (rt_b, client_b) = GossipRuntime::from_parts(
-                UdpTransport::from_socket(sock_b),
-                TokioClock::new(),
-                config_b,
-                store_b,
-                agg_b.clone(),
-            );
-
-            // Drive discovery against the live cluster. We don't feed
-            // the resulting peer stream into either runtime — we already
-            // bootstrap-peered them above — but we MUST drain it, which
-            // is what proves the watcher saw our EndpointSlice and
-            // emitted at least one Added.
-            let discovery = EndpointSliceDiscovery::with_client(
-                client.clone(),
-                None,
-                vec![namespace.clone()],
-                vec!["gabion".to_string()],
-            );
-            let saw_peer = Rc::new(std::cell::Cell::new(false));
-            let saw_peer_clone = saw_peer.clone();
-            let _discovery_task = tokio::task::spawn_local(async move {
-                let stream = discovery.peer_events();
-                futures::pin_mut!(stream);
-                while let Ok(Some(event)) = stream.try_next().await {
-                    if matches!(event, PeerEvent::Added(_)) {
-                        saw_peer_clone.set(true);
-                    }
-                }
-            });
-
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
-
-            let now_millis = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            let bucket = (now_millis / 1_000) as BucketEpoch;
-            client_a
-                .record(0xC0FE, KeyHash(0xABCD), bucket, 3, 0, now_millis)
-                .await
-                .unwrap();
-            client_b
-                .record(0xC0FE, KeyHash(0xABCD), bucket, 5, 0, now_millis)
-                .await
-                .unwrap();
-
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let converged = loop {
-                let sa: u64 = agg_a.sum();
-                let sb: u64 = agg_b.sum();
-                if sa == 8 && sb == 8 {
-                    break true;
-                }
-                if Instant::now() >= deadline {
-                    break false;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            };
-
-            client_a.shutdown().await.unwrap();
-            client_b.shutdown().await.unwrap();
-            let _ = h_a.await;
-            let _ = h_b.await;
-
-            (converged, saw_peer.get())
-        })
-        .await;
-
-    let (converged, saw_peer) = outcome;
-    assert!(
-        converged,
-        "gossip did not converge against live kube discovery"
+    // ---- discovery --------------------------------------------------------
+    // The watcher's stream is the signal: the test proceeds the moment the
+    // first `Added` arrives. The timeout only bounds a broken watcher.
+    let discovery = EndpointSliceDiscovery::with_client(
+        client,
+        None,
+        vec![namespace.clone()],
+        vec!["gabion".to_string()],
     );
-    assert!(
-        saw_peer,
-        "EndpointSliceDiscovery did not emit a PeerEvent::Added"
-    );
-}
-
-// Tiny aggregate store used only by the live-cluster test. Kept inline
-// rather than reusing `gossip::tests::InMemoryAggregateStore` because
-// that module is `#[cfg(test)] mod tests` in `gossip.rs` and not
-// reachable from a sibling module's test file.
-#[cfg(feature = "transport-udp")]
-#[derive(Default)]
-struct InMemoryAgg {
-    inner: std::cell::RefCell<
-        std::collections::HashMap<(u128, crate::crdt::KeyHash, crate::crdt::BucketEpoch), u64>,
-    >,
-}
-
-#[cfg(feature = "transport-udp")]
-impl InMemoryAgg {
-    fn sum(&self) -> u64 {
-        self.inner.borrow().values().copied().sum()
-    }
-}
-
-#[cfg(feature = "transport-udp")]
-impl crate::gossip::AggregateStore<u32> for InMemoryAgg {
-    fn apply(
-        &self,
-        deltas: &crate::crdt::DeltaSink<u32>,
-        expirations: &crate::crdt::ExpirationSink<u32>,
-    ) {
-        let mut map = self.inner.borrow_mut();
-        for i in 0..deltas.len() {
-            let key = &deltas.keys[i];
-            let v: u64 = deltas.deltas[i].into();
-            *map.entry((key.rule_fingerprint, key.key_hash, key.bucket))
-                .or_insert(0) += v;
-        }
-        for i in 0..expirations.len() {
-            let key = &expirations.keys[i];
-            let v: u64 = expirations.last_counts[i].into();
-            let entry = map
-                .entry((key.rule_fingerprint, key.key_hash, key.bucket))
-                .or_insert(0);
-            *entry = entry.saturating_sub(v);
-            if *entry == 0 {
-                map.remove(&(key.rule_fingerprint, key.key_hash, key.bucket));
+    let first_added = async {
+        let stream = discovery.peer_events();
+        futures::pin_mut!(stream);
+        while let Some(event) = stream.try_next().await.expect("discovery stream failed") {
+            if let PeerEvent::Added(peer) = event {
+                return peer;
             }
         }
-    }
+        panic!("discovery stream ended without emitting PeerEvent::Added");
+    };
+    let peer = tokio::time::timeout(Duration::from_secs(60), first_added)
+        .await
+        .expect("EndpointSliceDiscovery did not emit a PeerEvent::Added within 60s");
+    assert!(
+        ADDRESSES
+            .iter()
+            .any(|address| peer.addr == SocketAddr::new(address.parse().unwrap(), PORT)),
+        "unexpected peer {peer:?}",
+    );
 }

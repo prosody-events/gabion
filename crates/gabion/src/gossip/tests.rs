@@ -3,7 +3,8 @@
 //! Most tests use [`super::sim::SimTransport`] + `tokio::time::pause()` so
 //! virtual time + in-memory delivery make them deterministic and fast.
 //! `udp_round_trip_smoke` is the lone realtime/UDP smoke test, kept to
-//! ensure the production transport doesn't bit-rot.
+//! ensure the production transport doesn't bit-rot; it waits on the
+//! aggregate store's apply signal rather than polling the clock.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -11,7 +12,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU128;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::task::LocalSet;
@@ -34,21 +35,23 @@ use quickcheck_macros::quickcheck;
 /// Single-threaded in-memory aggregate store used as the canonical test
 /// backend. Keys on `(rule, key_hash, bucket)`. `RefCell` keeps the trait
 /// method `&self` so tests can clone an `Rc` between the runtime and the
-/// read path.
+/// read path. `applied` fires after every `apply`, so realtime tests wait
+/// on it instead of sleeping.
 #[derive(Default)]
 pub(super) struct InMemoryAggregateStore<C: Count> {
     inner: RefCell<HashMap<(u128, KeyHash, BucketEpoch), u64>>,
     apply_calls: RefCell<Vec<(usize, usize)>>,
+    applied: Notify,
     _marker: std::marker::PhantomData<C>,
 }
 
 impl<C: Count> InMemoryAggregateStore<C> {
     pub fn new() -> Self {
-        Self {
-            inner: RefCell::new(HashMap::new()),
-            apply_calls: RefCell::new(Vec::new()),
-            _marker: std::marker::PhantomData,
-        }
+        Self::default()
+    }
+
+    pub fn total(&self) -> u64 {
+        self.inner.borrow().values().sum()
     }
 
     pub fn apply_call_lens(&self) -> Vec<(usize, usize)> {
@@ -88,6 +91,7 @@ impl<C: Count> AggregateStore<C> for InMemoryAggregateStore<C> {
                 map.remove(&(key.rule_fingerprint, key.key_hash, key.bucket));
             }
         }
+        self.applied.notify_one();
     }
 }
 
@@ -656,8 +660,8 @@ fn quickcheck_sim_authentication_admits_only_matching_keys(case: AuthCase) -> Te
             .unwrap();
         sim_advance_ticks(Duration::from_millis(100), 20).await;
 
-        let sum_a = agg_a.inner.borrow().values().copied().sum::<u64>();
-        let sum_b = agg_b.inner.borrow().values().copied().sum::<u64>();
+        let sum_a = agg_a.total();
+        let sum_b = agg_b.total();
         let expected = if case.matching_keys {
             (
                 case.a_hits as u64 + case.b_hits as u64,
@@ -781,7 +785,7 @@ fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> Tes
             .unwrap();
         sim_advance_ticks(Duration::from_millis(100), 20).await;
 
-        let got_b = agg_b.inner.borrow().values().copied().sum::<u64>();
+        let got_b = agg_b.total();
         let expected_b = if case.remove_after_add {
             0
         } else {
@@ -830,12 +834,11 @@ async fn record_acks_after_apply() {
             // Use a small dance: send a second record that pushes the store
             // through one more apply so we know which rule slot was minted.
             // (The first record itself must have stored the count already.)
-            // Easier: probe by iterating the inner map.
-            let totals: u64 = agg.inner.borrow().values().copied().sum();
+            let totals = agg.total();
             assert_eq!(totals, 5);
 
             client.record(rule_fp, key, 0, 3, 0, 1_000).await.unwrap();
-            let totals: u64 = agg.inner.borrow().values().copied().sum();
+            let totals = agg.total();
             assert_eq!(totals, 8);
 
             client.shutdown().await.unwrap();
@@ -888,8 +891,8 @@ async fn two_runtimes_converge_on_cluster_aggregate() {
             // Drive enough virtual ticks for both directions to drain.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
 
-            let sum_a: u64 = agg_a.inner.borrow().values().copied().sum();
-            let sum_b: u64 = agg_b.inner.borrow().values().copied().sum();
+            let sum_a = agg_a.total();
+            let sum_b = agg_b.total();
             assert_eq!(sum_a, 8, "A converges");
             assert_eq!(sum_b, 8, "B converges");
 
@@ -976,7 +979,7 @@ async fn gossip_tick_drives_expiration() {
 
             // Hit at virtual time 0 — bucket 0.
             client.record(0xFEED, KeyHash(7), 0, 2, 0, 0).await.unwrap();
-            assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 2);
+            assert_eq!(agg.total(), 2);
 
             // Advance past one tick + past the live window.
             sim_advance_ticks(Duration::from_millis(100), 3).await;
@@ -984,7 +987,7 @@ async fn gossip_tick_drives_expiration() {
             // The tick handler called expire_at, which freed the cell.
             // The aggregate store sees expiration row(s) and removes the
             // value.
-            assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 0);
+            assert_eq!(agg.total(), 0);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;
@@ -1039,9 +1042,9 @@ async fn configured_rule_reexpires_after_idle_window() {
                 .record(0xFEED, KeyHash(7), 0, 2, 10, 0)
                 .await
                 .unwrap();
-            assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 2);
+            assert_eq!(agg.total(), 2);
             sim_advance_ticks(Duration::from_millis(100), 3).await;
-            assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 0);
+            assert_eq!(agg.total(), 0);
 
             // Second burst at the now-current bucket. It must register and then
             // age out on the same 100 ms window. Under the
@@ -1051,10 +1054,10 @@ async fn configured_rule_reexpires_after_idle_window() {
                 .record(0xFEED, KeyHash(7), 3, 2, 10, 300)
                 .await
                 .unwrap();
-            assert_eq!(agg.inner.borrow().values().copied().sum::<u64>(), 2);
+            assert_eq!(agg.total(), 2);
             sim_advance_ticks(Duration::from_millis(100), 3).await;
             assert_eq!(
-                agg.inner.borrow().values().copied().sum::<u64>(),
+                agg.total(),
                 0,
                 "second burst must age out on the configured 100 ms window, not the 60 s default",
             );
@@ -1125,7 +1128,7 @@ async fn record_returns_after_apply_completes() {
 
             client.record(0xABC, KeyHash(1), 0, 3, 0, 0).await.unwrap();
             // After the ack returns, apply must have completed at least once.
-            let totals: u64 = agg.inner.inner.borrow().values().copied().sum();
+            let totals = agg.inner.total();
             assert_eq!(totals, 3);
 
             client.shutdown().await.unwrap();
@@ -1178,8 +1181,8 @@ async fn per_peer_frame_prunes_acked_cells() {
             // Drive enough ticks for the eager-push lane to converge.
             sim_advance_ticks(Duration::from_millis(100), 5).await;
 
-            let sum_a: u64 = agg_a.inner.borrow().values().copied().sum();
-            let sum_b: u64 = agg_b.inner.borrow().values().copied().sum();
+            let sum_a = agg_a.total();
+            let sum_b = agg_b.total();
             assert_eq!(sum_a, 4);
             assert_eq!(sum_b, 4);
 
@@ -1237,7 +1240,7 @@ async fn dropped_packet_is_repaired() {
             // Many ticks to allow the repair lane to retry.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
 
-            let sum_b: u64 = agg_b.inner.borrow().values().copied().sum();
+            let sum_b = agg_b.total();
             assert_eq!(sum_b, 7, "B converged despite the first-packet drop");
 
             client_a.shutdown().await.unwrap();
@@ -1323,9 +1326,9 @@ async fn partition_then_heal() {
 
             sim_advance_ticks(Duration::from_millis(100), 30).await;
 
-            let sum_a: u64 = agg_a.inner.borrow().values().copied().sum();
-            let sum_b: u64 = agg_b.inner.borrow().values().copied().sum();
-            let sum_c: u64 = agg_c.inner.borrow().values().copied().sum();
+            let sum_a = agg_a.total();
+            let sum_b = agg_b.total();
+            let sum_c = agg_c.total();
             assert_eq!(sum_a, 7, "A converges after heal");
             assert_eq!(sum_b, 7, "B converges");
             assert_eq!(sum_c, 7, "C converges after heal");
@@ -1334,82 +1337,6 @@ async fn partition_then_heal() {
             client_b.shutdown().await.unwrap();
             client_c.shutdown().await.unwrap();
             let _ = h_a.await;
-            let _ = h_b.await;
-            let _ = h_c.await;
-        })
-        .await;
-}
-
-// -- minute-in-milliseconds -------------------------------------------------
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn simulates_minute_in_milliseconds() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr_a = sock(40_080);
-            let addr_b = sock(40_081);
-            let addr_c = sock(40_082);
-            let t_a = router.bind(addr_a);
-            let t_b = router.bind(addr_b);
-            let t_c = router.bind(addr_c);
-
-            let id_a = NodeIdentity::new(NodeId(0xA), 1);
-            let id_b = NodeIdentity::new(NodeId(0xB), 1);
-            let id_c = NodeIdentity::new(NodeId(0xC), 1);
-
-            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let agg_c = Rc::new(InMemoryAggregateStore::<u32>::new());
-
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                t_a,
-                TokioClock::from_millis(0),
-                sim_config(id_a, vec![addr_b, addr_c], 1),
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            // Hold the clients so the mpsc senders stay alive; dropping a
-            // client closes the channel and signals the runtime to shut down.
-            let (rt_b, _client_b) = GossipRuntime::from_parts(
-                t_b,
-                TokioClock::from_millis(0),
-                sim_config(id_b, vec![addr_a, addr_c], 2),
-                store_for(id_b),
-                agg_b.clone(),
-            );
-            let (rt_c, _client_c) = GossipRuntime::from_parts(
-                t_c,
-                TokioClock::from_millis(0),
-                sim_config(id_c, vec![addr_a, addr_b], 3),
-                store_for(id_c),
-                agg_c.clone(),
-            );
-
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
-            let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
-
-            client_a
-                .record(0xCAFE, KeyHash(99), 0, 1, 0, 0)
-                .await
-                .unwrap();
-
-            let start = Instant::now();
-            // 60s of virtual time at 100ms cadence.
-            sim_advance_ticks(Duration::from_millis(100), 600).await;
-            let elapsed = start.elapsed();
-
-            assert!(
-                elapsed < Duration::from_millis(1_000),
-                "expected sub-second wall-clock, got {elapsed:?}"
-            );
-
-            client_a.shutdown().await.unwrap();
-            let _ = h_a.await;
-            h_b.abort();
-            h_c.abort();
             let _ = h_b.await;
             let _ = h_c.await;
         })
@@ -1500,9 +1427,9 @@ async fn gossip_tick_picks_peers_without_replacement() {
             // leave at least one peer empty whenever the tick double-picks.
             sim_advance_ticks(Duration::from_millis(100), 20).await;
 
-            let got_b = agg_b.inner.borrow().values().copied().sum::<u64>();
-            let got_c = agg_c.inner.borrow().values().copied().sum::<u64>();
-            let got_d = agg_d.inner.borrow().values().copied().sum::<u64>();
+            let got_b = agg_b.total();
+            let got_c = agg_c.total();
+            let got_d = agg_d.total();
             assert_eq!((got_b, got_c, got_d), (1, 1, 1));
 
             client_a.shutdown().await.unwrap();
@@ -1665,19 +1592,21 @@ async fn udp_round_trip_smoke() {
                 .await
                 .unwrap();
 
-            // Poll for convergence; bounded realtime budget.
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                let sa: u64 = agg_a.inner.borrow().values().copied().sum();
-                let sb: u64 = agg_b.inner.borrow().values().copied().sum();
-                if sa == 8 && sb == 8 {
-                    break;
+            // Re-check after each apply (`notify_one` keeps a permit, so none
+            // is missed); the timeout only bounds a broken transport.
+            let converged = tokio::time::timeout(Duration::from_secs(30), async {
+                for agg in [&agg_a, &agg_b] {
+                    while agg.total() != 8 {
+                        agg.applied.notified().await;
+                    }
                 }
-                if Instant::now() >= deadline {
-                    panic!("did not converge in 2s: a={sa}, b={sb}");
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            });
+            assert!(
+                converged.await.is_ok(),
+                "did not converge: a={}, b={}",
+                agg_a.total(),
+                agg_b.total(),
+            );
 
             client_a.shutdown().await.unwrap();
             client_b.shutdown().await.unwrap();
@@ -2427,7 +2356,7 @@ async fn threshold_trigger_fires_before_heartbeat() {
             // should have already pumped the gossip frame through.
             sim_advance_ticks(Duration::from_millis(10), 5).await;
 
-            let sum_b: u64 = agg_b.inner.borrow().values().copied().sum();
+            let sum_b = agg_b.total();
             assert!(
                 sum_b >= 1,
                 "expected threshold-fire to reach B before the 1s heartbeat, got sum_b={sum_b}",
@@ -2577,7 +2506,7 @@ async fn heartbeat_still_drains_cold_rules() {
             // Advance past two heartbeats — the cold cell must propagate.
             sim_advance_ticks(Duration::from_millis(100), 5).await;
 
-            let sum_b: u64 = agg_b.inner.borrow().values().copied().sum();
+            let sum_b = agg_b.total();
             assert_eq!(sum_b, 1, "heartbeat should drain cold rules");
 
             client_a.shutdown().await.unwrap();

@@ -24,6 +24,7 @@ case "$server" in
 esac
 
 namespace="gabion-nginx-scale-$$"
+. deploy/kubernetes/lib.sh
 port_forward_pid=""
 
 cleanup() {
@@ -162,84 +163,34 @@ spec:
       protocol: UDP
 YAML
 
-wait_for_endpoint_count() {
-    expected="$1"
-    attempts=0
-    while [ "$attempts" -lt 60 ]; do
-        count="$(
-            kubectl -n "$namespace" get endpointslice \
-                -l kubernetes.io/service-name=gabion-nginx \
-                -o 'jsonpath={range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}' \
-                | sed '/^$/d' \
-                | wc -l \
-                | tr -d ' '
-        )"
-        if [ "$count" = "$expected" ]; then
-            return 0
-        fi
-        attempts=$((attempts + 1))
-        sleep 1
-    done
-    printf '%s\n' "timed out waiting for $expected EndpointSlice addresses; saw $count" >&2
-    kubectl -n "$namespace" get endpointslice -o wide >&2
-    return 1
+running_pods() {
+    kubectl -n "$namespace" get pods -l app=gabion-nginx \
+        -o 'jsonpath={range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' \
+        | sed '/^$/d'
+}
+
+running_pod_count_is() {
+    [ "$(running_pods | wc -l | tr -d ' ')" = "$1" ]
 }
 
 wait_for_pods() {
-    expected="$1"
-    attempts=0
-    while [ "$attempts" -lt 60 ]; do
-        pods="$(kubectl -n "$namespace" get pods -l app=gabion-nginx -o 'jsonpath={range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}')"
-        count="$(printf '%s\n' "$pods" | sed '/^$/d' | wc -l | tr -d ' ')"
-        if [ "$count" = "$expected" ]; then
-            printf '%s\n' "$pods" | sed '/^$/d'
-            return 0
-        fi
-        attempts=$((attempts + 1))
-        sleep 1
-    done
-    printf '%s\n' "timed out waiting for $expected running pods; saw $count" >&2
+    retry 60 running_pod_count_is "$1" && running_pods && return 0
+    printf '%s\n' "timed out waiting for $1 running pods; saw $(running_pods | wc -l | tr -d ' ')" >&2
     kubectl -n "$namespace" get pods -o wide >&2
     return 1
 }
 
+# start_port_forward <pod-name|svc/NAME>: forward 18080 to the target and
+# wait until nginx answers through it.
 start_port_forward() {
-    pod="$1"
     if [ -n "$port_forward_pid" ]; then
         kill "$port_forward_pid" 2>/dev/null || true
         port_forward_pid=""
     fi
-    kubectl -n "$namespace" port-forward "pod/$pod" 18080:8080 >/tmp/gabion-nginx-port-forward.log 2>&1 &
+    kubectl -n "$namespace" port-forward "$1" 18080:8080 >/tmp/gabion-nginx-port-forward.log 2>&1 &
     port_forward_pid="$!"
 
-    attempts=0
-    while [ "$attempts" -lt 30 ]; do
-        if curl -fsS -o /dev/null "http://127.0.0.1:18080/off/index.html"; then
-            return 0
-        fi
-        attempts=$((attempts + 1))
-        sleep 1
-    done
-    cat /tmp/gabion-nginx-port-forward.log >&2 || true
-    return 1
-}
-
-start_service_port_forward() {
-    if [ -n "$port_forward_pid" ]; then
-        kill "$port_forward_pid" 2>/dev/null || true
-        port_forward_pid=""
-    fi
-    kubectl -n "$namespace" port-forward "svc/gabion-nginx" 18080:8080 >/tmp/gabion-nginx-port-forward.log 2>&1 &
-    port_forward_pid="$!"
-
-    attempts=0
-    while [ "$attempts" -lt 30 ]; do
-        if curl -fsS -o /dev/null "http://127.0.0.1:18080/off/index.html"; then
-            return 0
-        fi
-        attempts=$((attempts + 1))
-        sleep 1
-    done
+    retry 30 curl -fsS -o /dev/null "http://127.0.0.1:18080/off/index.html" && return 0
     cat /tmp/gabion-nginx-port-forward.log >&2 || true
     return 1
 }
@@ -309,18 +260,10 @@ assert_cluster_rate_limit() {
     # The replicas=3 path: the rule's 2r/min budget on $uri is shared
     # across every pod via gossip, so the assertion is about the
     # cluster-wide aggregate, not any one pod. Route through the
-    # ClusterIP Service so curl gets round-robined across the replica
-    # set, sleep enough for gossip to propagate the running budget, and
-    # confirm that the first 2 of 5 requests succeed and the rest are
-    # rejected — same arithmetic as the single-pod case at N=1, just
-    # observed through the load balancer.
-    start_service_port_forward
-
-    # Give the just-started pods one or two gossip ticks to discover each
-    # other and converge on a shared aggregate. tick_interval default is
-    # 100 ms; bench manifests use 100 ms too — a couple of seconds is
-    # ample.
-    sleep 2
+    # ClusterIP Service and confirm that the first 2 of 5 requests succeed
+    # and the rest are rejected — same arithmetic as the single-pod case at
+    # N=1, just observed through the Service.
+    start_port_forward svc/gabion-nginx
 
     headers_4="$(mktemp)"
     headers_5="$(mktemp)"
@@ -433,7 +376,7 @@ summarize_pod() {
 }
 
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
-wait_for_endpoint_count 1
+wait_for_endpoint_count gabion-nginx 1
 pods="$(wait_for_pods 1)"
 for pod in $pods; do
     assert_pod_rate_limit "$pod"
@@ -442,11 +385,11 @@ done
 
 kubectl -n "$namespace" scale deployment/gabion-nginx --replicas=0
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
-wait_for_endpoint_count 0
+wait_for_endpoint_count gabion-nginx 0
 
 kubectl -n "$namespace" scale deployment/gabion-nginx --replicas=3
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
-wait_for_endpoint_count 3
+wait_for_endpoint_count gabion-nginx 3
 pods="$(wait_for_pods 3)"
 
 # At N>1 the rule's 2r/min budget on $uri is shared across all pods via
@@ -474,7 +417,7 @@ kubectl -n "$namespace" get events --sort-by=.lastTimestamp 2>&1 \
 
 kubectl -n "$namespace" scale deployment/gabion-nginx --replicas=1
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
-wait_for_endpoint_count 1
+wait_for_endpoint_count gabion-nginx 1
 
 printf '\nlocal kubernetes NGINX EndpointSlice scale and per-pod rate-limit test passed on context %s (%s)\n' \
     "$context" "$server"
