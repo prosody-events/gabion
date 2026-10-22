@@ -27,8 +27,13 @@ rc=$?
 # itself can pass. LeakSanitizer reports as each process exits, so wait
 # for nginx to finish shutting down before collecting.
 if [ -n "${ASAN_OPTIONS:-}" ]; then
-    for _ in $(seq 50); do
-        grep -qsx nginx /proc/[0-9]*/comm || break
+    tries=50
+    while grep -qsx nginx /proc/[0-9]*/comm; do
+        [ "$((tries -= 1))" -gt 0 ] || {
+            echo 'nginx is still running 5s after the smoke ended, so LeakSanitizer never checked it; look above for a hung worker or leader thread' >&2
+            rc=1
+            break
+        }
         sleep 0.1
     done
     for report in /tmp/asan.*; do

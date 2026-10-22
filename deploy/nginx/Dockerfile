@@ -185,7 +185,8 @@ COPY --chmod=755 deploy/nginx/smoke-with-bt.sh /usr/local/bin/gabion-smoke-with-
 
 # Reports go to files, not stderr: nginx respawns a worker ASan aborted, so
 # only `gabion-smoke-with-bt` checking /tmp/asan.* can fail the run.
-ENV ASAN_OPTIONS=abort_on_error=1:halt_on_error=1:detect_leaks=1:log_path=/tmp/asan \
+# `handle_abort` reports a Rust panic's abort (a failed debug assertion) too.
+ENV ASAN_OPTIONS=abort_on_error=1:handle_abort=1:detect_leaks=1:log_path=/tmp/asan \
     LSAN_OPTIONS=suppressions=/etc/nginx/lsan.supp:print_suppressions=0
 
 # Default build target = `published`. The trailing unnamed stage makes
