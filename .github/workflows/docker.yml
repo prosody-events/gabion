@@ -25,20 +25,13 @@ on:
     # `nginx<X.Y.Z>` tag so consumers can pin to a specific upstream
     # patch without anyone bumping anything by hand.
     - cron: '0 6 * * 1'
-    # Every other schedule (see `plan`'s `mode`) only refreshes the
-    # canonical amd64 cache scopes PRs read, when main hasn't built in the
-    # last day, so a floating base-image bump doesn't leave PRs cooking
-    # dependencies cold. No image is pushed.
-    - cron: '0 6 * * 0,2-6'
   workflow_dispatch:
 
 concurrency:
   # Per-PR concurrency: a second push to the same PR cancels the
   # in-flight build (its tags would be stomped anyway). Main / tag /
-  # cron stay un-cancelled — every release tag deserves a full run. The
-  # cache cron gets its own group: a newly queued run cancels the group's
-  # pending one, and it must never displace a pending main build.
-  group: docker-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'schedule' && github.event.schedule != '0 6 * * 1' && '-cache' || '' }}
+  # cron stay un-cancelled — every release tag deserves a full run.
+  group: docker-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -54,18 +47,12 @@ permissions:
 jobs:
   # PRs reach this workflow only through the `paths:` filter above, so it
   # has no need for cargo-rail's PR-skip gate.
-  # The plan job resolves the gabion version once for every build /
-  # combine job (release tag wins, else `.release-please-manifest.json`),
-  # and its `mode` picks which jobs run: `pr`, `full` (main, tags,
-  # dispatch), `weekly` (full plus refresh), `cache`, or `none` (fork PRs,
-  # and a cache cron main's own build covered, so they never race on a ref).
+  # The plan job here exists solely to resolve the gabion version once
+  # and hand it to every build / combine job below — release tag wins,
+  # otherwise we read `.release-please-manifest.json`.
   plan:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read
     outputs:
-      mode: ${{ steps.mode.outputs.mode }}
       version: ${{ steps.version.outputs.version }}
       ref-tag: ${{ steps.version.outputs.ref-tag }}
       is-release: ${{ steps.version.outputs.is-release }}
@@ -86,32 +73,6 @@ jobs:
             echo "is-release=false" >> "$GITHUB_OUTPUT"
           fi
         shell: bash
-      - id: mode
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          SCHEDULE: ${{ github.event.schedule }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-        run: |
-          set -eu
-          case "$EVENT" in
-            pull_request)
-              # Quoted: `pr` is also a command name (SC2209).
-              if [[ "$HEAD_REPO" == "$GITHUB_REPOSITORY" ]]; then mode='pr'; else mode=none; fi
-              ;;
-            schedule)
-              if [[ "$SCHEDULE" == '0 6 * * 1' ]]; then
-                mode=weekly
-              else
-                last="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/docker.yml/runs?branch=main&event=push&per_page=1" \
-                  --jq '.workflow_runs[0].created_at // "1970-01-01T00:00:00Z" | fromdateiso8601')"
-                if (( last > $(date +%s) - 86400 )); then mode=none; else mode=cache; fi
-              fi
-              ;;
-            *) mode=full ;;
-          esac
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
-        shell: bash
 
   # PR builds: amd64-only, default flavors only. Pushed with two tags:
   #   - `pr-<N>-<short-sha>` — immutable, one per commit
@@ -119,14 +80,11 @@ jobs:
   # Both are prefixed `pr-` so the cleanup workflow can find and prune
   # them on PR close or by age. Fork PRs skip — GITHUB_TOKEN doesn't
   # carry `packages:write` for forks; a fork would 401 at login.
-  #
-  # The cache cron runs the same matrix with no push, writing the
-  # canonical `build` scopes PRs read instead of the PR scope.
   pr-build:
-    if: needs.plan.outputs.mode == 'pr' || needs.plan.outputs.mode == 'cache'
+    if: |
+      github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
     needs: plan
-    env:
-      CACHE_SCOPE: ${{ needs.plan.outputs.mode == 'pr' && format('pr-{0}', matrix.image) || format('{0}-{1}', matrix.image, matrix.flavor) }}
     strategy:
       fail-fast: false
       matrix:
@@ -167,7 +125,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        if: needs.plan.outputs.mode == 'pr'
         env:
           IMAGE_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
           PR: ${{ github.event.pull_request.number }}
@@ -188,7 +145,7 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: ${{ needs.plan.outputs.mode == 'pr' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
             ${{ matrix.base-arg != '' && format('{0}={1}', matrix.base-arg, matrix.base-image) || '' }}
@@ -200,16 +157,17 @@ jobs:
           # it GHCR rejects the cache manifest mediatype and the export
           # silently no-ops.
           #
-          # `cache-from` reads the job's own `CACHE_SCOPE`, then the
-          # canonical `build`-job scope read-only. Content-addressed layers
-          # can't poison — a layer is served only on exact input-hash match
-          # — so a fresh PR warms its cook layer from main's last build. A
-          # PR writes only its own scope, never the release scope; the cache
-          # cron, building main, reads and writes only the canonical one.
+          # `cache-from` reads two scopes: the PR's own scope first, then
+          # the canonical `build`-job scope read-only. Content-addressed
+          # layers can't poison — a layer is served only on exact
+          # input-hash match — so the second source just lets a fresh PR
+          # warm its cook layer from main's last build instead of
+          # compiling dependencies cold. `cache-to` writes only the PR
+          # scope, so a PR build never mutates the release scope.
           cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.CACHE_SCOPE }}-amd64
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-pr-${{ matrix.image }}-amd64
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-amd64
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.CACHE_SCOPE }}-amd64,mode=max,image-manifest=true,oci-mediatypes=true
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-pr-${{ matrix.image }}-amd64,mode=max,image-manifest=true,oci-mediatypes=true
           # Skip provenance + sbom on PRs — they're for releases, and
           # they bloat per-PR registry churn the cleanup has to sweep.
           provenance: false
@@ -219,7 +177,9 @@ jobs:
   # Re-runs on every commit overwrite the comment in place rather than
   # piling up — the header field makes it idempotent.
   pr-comment:
-    if: github.event_name == 'pull_request'
+    if: |
+      github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
     needs: pr-build
     runs-on: ubuntu-latest
     permissions:
@@ -251,7 +211,7 @@ jobs:
   # single-platform image, pushes it to GHCR by digest, and uploads the
   # digest as an artifact for the manifest-combine job.
   build:
-    if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'weekly'
+    if: github.event_name != 'pull_request'
     needs: plan
     strategy:
       fail-fast: false
@@ -479,6 +439,7 @@ jobs:
   # `docker buildx imagetools create` a multi-arch manifest under every
   # tag the scheme says we should publish.
   combine:
+    if: github.event_name != 'pull_request'
     needs: [plan, build]
     strategy:
       fail-fast: false
@@ -656,7 +617,7 @@ jobs:
   # ── Floating-release-tag refresh ────────────────────────────────────
   #
   # The `build` + `combine` pair above is wired to refresh the main-
-  # tagged image set on the weekly cron (`:main`, `:<upstream>-main`,
+  # tagged image set on cron (`:main`, `:<upstream>-main`,
   # `:main-<sha>-<upstream>`). The floating *release* tags
   # (`:latest`, `:<upstream>`, `:X`, `:X.Y` and their flavored variants)
   # need a separate pipeline because they have to be built **from the
@@ -664,13 +625,12 @@ jobs:
   # stop tracking upstream patches the moment a release ships, until
   # the next gabion release.
   #
-  # Refresh runs only on the weekly cron and emits the floating
+  # Refresh runs only on the schedule event and emits the floating
   # subset of the release tag set — never the immutable `:vX.Y.Z` or
   # `:vX.Y.Z-<upstream>(-<sfx>)?` pins. Those keep their original
   # release digest.
   refresh-plan:
-    if: needs.plan.outputs.mode == 'weekly'
-    needs: plan
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.tag.outputs.version }}
@@ -693,7 +653,7 @@ jobs:
         shell: bash
 
   refresh-build:
-    if: needs.refresh-plan.outputs.ref != ''
+    if: github.event_name == 'schedule' && needs.refresh-plan.outputs.ref != ''
     needs: refresh-plan
     strategy:
       fail-fast: false
@@ -895,7 +855,7 @@ jobs:
           retention-days: 1
 
   refresh-combine:
-    if: needs.refresh-plan.outputs.ref != ''
+    if: github.event_name == 'schedule' && needs.refresh-plan.outputs.ref != ''
     needs: [refresh-plan, refresh-build]
     strategy:
       fail-fast: false
