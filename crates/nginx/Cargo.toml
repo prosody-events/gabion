@@ -14,6 +14,8 @@ arrayvec.workspace = true
 futures.workspace = true
 gabion.workspace = true
 humantime.workspace = true
+# The `loom` feature swaps the SHM atomics for loom's; `make loom` only.
+loom = { workspace = true, optional = true }
 nginx-sys = { workspace = true, optional = true }
 ngx = { workspace = true, optional = true }
 thiserror.workspace = true

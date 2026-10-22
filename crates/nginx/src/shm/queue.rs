@@ -7,7 +7,8 @@
 //! that doubles as occupancy and ordering. Capacity is a power of two so the
 //! modulo collapses to a mask.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use super::atomic::{AtomicU32, AtomicU64, Ordering};
+use super::hint::spin_loop;
 
 /// Drop reason returned by `push` when the ring is at capacity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,8 +36,8 @@ pub struct QueueSlot {
     pub rule_fingerprint_hi: AtomicU64,
     pub key_hash_lo: AtomicU64,
     pub key_hash_hi: AtomicU64,
-    pub bucket: std::sync::atomic::AtomicU32,
-    pub _pad: std::sync::atomic::AtomicU32,
+    pub bucket: AtomicU32,
+    pub _pad: AtomicU32,
     pub hits: AtomicU64,
     pub rule_limit: AtomicU64,
     pub now_millis: AtomicU64,
@@ -50,8 +51,8 @@ impl QueueSlot {
             rule_fingerprint_hi: AtomicU64::new(0),
             key_hash_lo: AtomicU64::new(0),
             key_hash_hi: AtomicU64::new(0),
-            bucket: std::sync::atomic::AtomicU32::new(0),
-            _pad: std::sync::atomic::AtomicU32::new(0),
+            bucket: AtomicU32::new(0),
+            _pad: AtomicU32::new(0),
             hits: AtomicU64::new(0),
             rule_limit: AtomicU64::new(0),
             now_millis: AtomicU64::new(0),
@@ -139,7 +140,7 @@ impl<'a> RequestQueue<'a> {
                 self.control.dropped.fetch_add(1, Ordering::Relaxed);
                 return Err(QueueOverflow);
             }
-            std::hint::spin_loop();
+            spin_loop();
         }
     }
 
@@ -167,7 +168,7 @@ impl<'a> RequestQueue<'a> {
             } else if diff < 0 {
                 return None;
             }
-            std::hint::spin_loop();
+            spin_loop();
         }
     }
 

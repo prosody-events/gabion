@@ -18,12 +18,11 @@
 //! touching or moving at that instant and under-count it for one request,
 //! which the allow-by-default rule accepts.
 
-use std::sync::atomic::{AtomicU64, Ordering, fence};
-
 use gabion::crdt::{DeltaSink, ExpirationSink};
 use gabion::gossip::AggregateStore;
 use gabion::rules::RuleSpec;
 
+use super::atomic::{AtomicU64, Ordering, fence};
 use super::{AggregateCell, ShmRegion};
 
 /// The furthest a cell may sit from its home slot, and so the most slots a
@@ -44,7 +43,7 @@ pub struct AggregateSlot {
 }
 
 impl AggregateSlot {
-    pub const fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             seq: AtomicU64::new(0),
             rule_fingerprint_lo: AtomicU64::new(0),
@@ -81,8 +80,9 @@ impl AggregateSlot {
         }
     }
 
-    /// Publish `cell` under the even sequence `seq`.
-    fn write(&self, seq: u64, cell: AggregateCell) {
+    /// Publish `cell` under the even sequence `seq`. Only the table's single
+    /// writer calls this, with a fresh `seq` each time.
+    pub fn write(&self, seq: u64, cell: AggregateCell) {
         debug_assert!(seq & 1 == 0 && seq != 0);
         self.seq.store(seq.wrapping_sub(1), Ordering::Relaxed);
         // Order the odd `seq` before the field stores.

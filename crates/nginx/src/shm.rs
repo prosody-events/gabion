@@ -19,6 +19,14 @@ pub use lease::LeaderLease;
 pub use queue::{QueueControl, QueueOverflow, QueueSlot, RequestQueue};
 pub use stats::Stats;
 
+/// Atomics and spin hints for the queue, lease and aggregate table. The
+/// `loom` feature (`make loom`) swaps in loom's model-checked ones for
+/// `tests/loom.rs`.
+#[cfg(feature = "loom")]
+use loom::{hint, sync::atomic};
+#[cfg(not(feature = "loom"))]
+use std::{hint, sync::atomic};
+
 /// Bytes of padding between regions; rounded up to the cacheline boundary.
 pub const CACHELINE: usize = 64;
 
