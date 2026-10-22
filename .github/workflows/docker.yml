@@ -25,13 +25,20 @@ on:
     # `nginx<X.Y.Z>` tag so consumers can pin to a specific upstream
     # patch without anyone bumping anything by hand.
     - cron: '0 6 * * 1'
+    # Daily except Monday (the weekly run covers it): `pr-build` rebuilds
+    # only the canonical amd64 cache scopes PRs read, pushing no image, so
+    # a floating base-image bump between main builds doesn't leave PRs
+    # cooking dependencies cold.
+    - cron: '0 6 * * 0,2-6'
   workflow_dispatch:
 
 concurrency:
   # Per-PR concurrency: a second push to the same PR cancels the
   # in-flight build (its tags would be stomped anyway). Main / tag /
-  # cron stay un-cancelled — every release tag deserves a full run.
-  group: docker-${{ github.workflow }}-${{ github.ref }}
+  # cron stay un-cancelled — every release tag deserves a full run. The
+  # daily cache cron gets its own group: a newly queued run cancels the
+  # group's pending one, and it must never displace a pending main build.
+  group: docker-${{ github.workflow }}-${{ github.ref }}${{ github.event.schedule == '0 6 * * 0,2-6' && '-cache' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -80,10 +87,14 @@ jobs:
   # Both are prefixed `pr-` so the cleanup workflow can find and prune
   # them on PR close or by age. Fork PRs skip — GITHUB_TOKEN doesn't
   # carry `packages:write` for forks; a fork would 401 at login.
+  #
+  # The daily cron runs the same matrix with no push, writing the
+  # canonical `build` scopes PRs read instead of the PR scope.
   pr-build:
     if: |
-      github.event_name == 'pull_request'
-        && github.event.pull_request.head.repo.full_name == github.repository
+      (github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository)
+        || github.event.schedule == '0 6 * * 0,2-6'
     needs: plan
     strategy:
       fail-fast: false
@@ -125,6 +136,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
+        if: github.event_name == 'pull_request'
         env:
           IMAGE_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
           PR: ${{ github.event.pull_request.number }}
@@ -145,7 +157,7 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
             ${{ matrix.base-arg != '' && format('{0}={1}', matrix.base-arg, matrix.base-image) || '' }}
@@ -162,12 +174,13 @@ jobs:
           # layers can't poison — a layer is served only on exact
           # input-hash match — so the second source just lets a fresh PR
           # warm its cook layer from main's last build instead of
-          # compiling dependencies cold. `cache-to` writes only the PR
-          # scope, so a PR build never mutates the release scope.
+          # compiling dependencies cold. On PRs `cache-to` writes only the
+          # PR scope, so a PR build never mutates the release scope; the
+          # daily cron, building main, writes the canonical scope.
           cache-from: |
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-pr-${{ matrix.image }}-amd64
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-amd64
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-pr-${{ matrix.image }}-amd64,mode=max,image-manifest=true,oci-mediatypes=true
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ github.event_name == 'pull_request' && format('pr-{0}', matrix.image) || format('{0}-{1}', matrix.image, matrix.flavor) }}-amd64,mode=max,image-manifest=true,oci-mediatypes=true
           # Skip provenance + sbom on PRs — they're for releases, and
           # they bloat per-PR registry churn the cleanup has to sweep.
           provenance: false
@@ -211,7 +224,7 @@ jobs:
   # single-platform image, pushes it to GHCR by digest, and uploads the
   # digest as an artifact for the manifest-combine job.
   build:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event.schedule != '0 6 * * 0,2-6'
     needs: plan
     strategy:
       fail-fast: false
@@ -235,7 +248,10 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
 
-          # nginx — six flavors. Default (no suffix) is stable-alpine.
+          # nginx — six flavors from four builds. Default (no suffix) is
+          # stable-alpine. Docker's `alpine` / `latest` tags always alias
+          # `mainline-alpine` / `mainline`, so those builds also publish
+          # the `-alpine` / `-debian` tags: `flavor-suffix` is a list.
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable-alpine
@@ -256,7 +272,7 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine
+            flavor-suffix: mainline-alpine alpine
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline-alpine
             arch: amd64
@@ -264,26 +280,9 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine
+            flavor-suffix: mainline-alpine alpine
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline-alpine
-            arch: arm64
-            runner: ubuntu-24.04-arm
-
-          - image: nginx
-            dockerfile: deploy/nginx/Dockerfile
-            flavor: alpine
-            flavor-suffix: alpine
-            base-arg: NGINX_BASE_IMAGE
-            base-image: nginx:alpine
-            arch: amd64
-            runner: ubuntu-latest
-          - image: nginx
-            dockerfile: deploy/nginx/Dockerfile
-            flavor: alpine
-            flavor-suffix: alpine
-            base-arg: NGINX_BASE_IMAGE
-            base-image: nginx:alpine
             arch: arm64
             runner: ubuntu-24.04-arm
 
@@ -307,7 +306,7 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline
-            flavor-suffix: mainline
+            flavor-suffix: mainline debian
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline
             arch: amd64
@@ -315,26 +314,9 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline
-            flavor-suffix: mainline
+            flavor-suffix: mainline debian
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline
-            arch: arm64
-            runner: ubuntu-24.04-arm
-
-          - image: nginx
-            dockerfile: deploy/nginx/Dockerfile
-            flavor: latest
-            flavor-suffix: debian
-            base-arg: NGINX_BASE_IMAGE
-            base-image: nginx:latest
-            arch: amd64
-            runner: ubuntu-latest
-          - image: nginx
-            dockerfile: deploy/nginx/Dockerfile
-            flavor: latest
-            flavor-suffix: debian
-            base-arg: NGINX_BASE_IMAGE
-            base-image: nginx:latest
             arch: arm64
             runner: ubuntu-24.04-arm
 
@@ -486,7 +468,7 @@ jobs:
   # `docker buildx imagetools create` a multi-arch manifest under every
   # tag the scheme says we should publish.
   combine:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event.schedule != '0 6 * * 0,2-6'
     needs: [plan, build]
     strategy:
       fail-fast: false
@@ -502,11 +484,7 @@ jobs:
             kind: nginx
           - image: nginx
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine
-            kind: nginx
-          - image: nginx
-            flavor: alpine
-            flavor-suffix: alpine
+            flavor-suffix: mainline-alpine alpine
             kind: nginx
           - image: nginx
             flavor: stable
@@ -514,11 +492,7 @@ jobs:
             kind: nginx
           - image: nginx
             flavor: mainline
-            flavor-suffix: mainline
-            kind: nginx
-          - image: nginx
-            flavor: latest
-            flavor-suffix: debian
+            flavor-suffix: mainline debian
             kind: nginx
           - image: openresty
             flavor: alpine
@@ -623,22 +597,24 @@ jobs:
                 tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}")
               fi
             else
-              if [[ "$IS_RELEASE" == "true" ]]; then
-                if [[ "$EMIT_IMMUTABLE" == "true" ]]; then
-                  tags+=("${IMAGE_REPO}:${REF_TAG}-${FLAVOR_SUFFIX}")
-                  tags+=("${IMAGE_REPO}:${REF_TAG}-${upstream}-${FLAVOR_SUFFIX}")
+              for sfx in $FLAVOR_SUFFIX; do
+                if [[ "$IS_RELEASE" == "true" ]]; then
+                  if [[ "$EMIT_IMMUTABLE" == "true" ]]; then
+                    tags+=("${IMAGE_REPO}:${REF_TAG}-${sfx}")
+                    tags+=("${IMAGE_REPO}:${REF_TAG}-${upstream}-${sfx}")
+                  fi
+                  tags+=("${IMAGE_REPO}:latest-${sfx}")
+                  tags+=("${IMAGE_REPO}:${upstream}-${sfx}")
+                  tags+=("${IMAGE_REPO}:${major}-${sfx}")
+                  tags+=("${IMAGE_REPO}:${major}-${upstream}-${sfx}")
+                  tags+=("${IMAGE_REPO}:${major_minor}-${sfx}")
+                  tags+=("${IMAGE_REPO}:${major_minor}-${upstream}-${sfx}")
+                else
+                  tags+=("${IMAGE_REPO}:main-${sfx}")
+                  tags+=("${IMAGE_REPO}:${upstream}-main-${sfx}")
+                  tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}-${sfx}")
                 fi
-                tags+=("${IMAGE_REPO}:latest-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${upstream}-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${major}-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${major}-${upstream}-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${major_minor}-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${major_minor}-${upstream}-${FLAVOR_SUFFIX}")
-              else
-                tags+=("${IMAGE_REPO}:main-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${upstream}-main-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}-${FLAVOR_SUFFIX}")
-              fi
+              done
             fi
           fi
 
@@ -670,7 +646,7 @@ jobs:
   # ── Floating-release-tag refresh ────────────────────────────────────
   #
   # The `build` + `combine` pair above is wired to refresh the main-
-  # tagged image set on cron (`:main`, `:<upstream>-main`,
+  # tagged image set on the weekly cron (`:main`, `:<upstream>-main`,
   # `:main-<sha>-<upstream>`). The floating *release* tags
   # (`:latest`, `:<upstream>`, `:X`, `:X.Y` and their flavored variants)
   # need a separate pipeline because they have to be built **from the
@@ -678,12 +654,12 @@ jobs:
   # stop tracking upstream patches the moment a release ships, until
   # the next gabion release.
   #
-  # Refresh runs only on the schedule event and emits the floating
+  # Refresh runs only on the weekly cron and emits the floating
   # subset of the release tag set — never the immutable `:vX.Y.Z` or
   # `:vX.Y.Z-<upstream>(-<sfx>)?` pins. Those keep their original
   # release digest.
   refresh-plan:
-    if: github.event_name == 'schedule'
+    if: github.event.schedule == '0 6 * * 1'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.tag.outputs.version }}
@@ -706,7 +682,7 @@ jobs:
         shell: bash
 
   refresh-build:
-    if: github.event_name == 'schedule' && needs.refresh-plan.outputs.ref != ''
+    if: github.event.schedule == '0 6 * * 1' && needs.refresh-plan.outputs.ref != ''
     needs: refresh-plan
     strategy:
       fail-fast: false
@@ -730,7 +706,7 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
 
-          # nginx — six flavors.
+          # nginx — six flavors from four builds (see `build`).
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable-alpine
@@ -750,7 +726,7 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine
+            flavor-suffix: mainline-alpine alpine
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline-alpine
             arch: amd64
@@ -758,25 +734,9 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine
+            flavor-suffix: mainline-alpine alpine
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline-alpine
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          - image: nginx
-            dockerfile: deploy/nginx/Dockerfile
-            flavor: alpine
-            flavor-suffix: alpine
-            base-arg: NGINX_BASE_IMAGE
-            base-image: nginx:alpine
-            arch: amd64
-            runner: ubuntu-latest
-          - image: nginx
-            dockerfile: deploy/nginx/Dockerfile
-            flavor: alpine
-            flavor-suffix: alpine
-            base-arg: NGINX_BASE_IMAGE
-            base-image: nginx:alpine
             arch: arm64
             runner: ubuntu-24.04-arm
           - image: nginx
@@ -798,7 +758,7 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline
-            flavor-suffix: mainline
+            flavor-suffix: mainline debian
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline
             arch: amd64
@@ -806,25 +766,9 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline
-            flavor-suffix: mainline
+            flavor-suffix: mainline debian
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          - image: nginx
-            dockerfile: deploy/nginx/Dockerfile
-            flavor: latest
-            flavor-suffix: debian
-            base-arg: NGINX_BASE_IMAGE
-            base-image: nginx:latest
-            arch: amd64
-            runner: ubuntu-latest
-          - image: nginx
-            dockerfile: deploy/nginx/Dockerfile
-            flavor: latest
-            flavor-suffix: debian
-            base-arg: NGINX_BASE_IMAGE
-            base-image: nginx:latest
             arch: arm64
             runner: ubuntu-24.04-arm
 
@@ -956,7 +900,7 @@ jobs:
           retention-days: 1
 
   refresh-combine:
-    if: github.event_name == 'schedule' && needs.refresh-plan.outputs.ref != ''
+    if: github.event.schedule == '0 6 * * 1' && needs.refresh-plan.outputs.ref != ''
     needs: [refresh-plan, refresh-build]
     strategy:
       fail-fast: false
@@ -972,11 +916,7 @@ jobs:
             kind: nginx
           - image: nginx
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine
-            kind: nginx
-          - image: nginx
-            flavor: alpine
-            flavor-suffix: alpine
+            flavor-suffix: mainline-alpine alpine
             kind: nginx
           - image: nginx
             flavor: stable
@@ -984,11 +924,7 @@ jobs:
             kind: nginx
           - image: nginx
             flavor: mainline
-            flavor-suffix: mainline
-            kind: nginx
-          - image: nginx
-            flavor: latest
-            flavor-suffix: debian
+            flavor-suffix: mainline debian
             kind: nginx
           - image: openresty
             flavor: alpine
@@ -1081,22 +1017,24 @@ jobs:
                 tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}")
               fi
             else
-              if [[ "$IS_RELEASE" == "true" ]]; then
-                if [[ "$EMIT_IMMUTABLE" == "true" ]]; then
-                  tags+=("${IMAGE_REPO}:${REF_TAG}-${FLAVOR_SUFFIX}")
-                  tags+=("${IMAGE_REPO}:${REF_TAG}-${upstream}-${FLAVOR_SUFFIX}")
+              for sfx in $FLAVOR_SUFFIX; do
+                if [[ "$IS_RELEASE" == "true" ]]; then
+                  if [[ "$EMIT_IMMUTABLE" == "true" ]]; then
+                    tags+=("${IMAGE_REPO}:${REF_TAG}-${sfx}")
+                    tags+=("${IMAGE_REPO}:${REF_TAG}-${upstream}-${sfx}")
+                  fi
+                  tags+=("${IMAGE_REPO}:latest-${sfx}")
+                  tags+=("${IMAGE_REPO}:${upstream}-${sfx}")
+                  tags+=("${IMAGE_REPO}:${major}-${sfx}")
+                  tags+=("${IMAGE_REPO}:${major}-${upstream}-${sfx}")
+                  tags+=("${IMAGE_REPO}:${major_minor}-${sfx}")
+                  tags+=("${IMAGE_REPO}:${major_minor}-${upstream}-${sfx}")
+                else
+                  tags+=("${IMAGE_REPO}:main-${sfx}")
+                  tags+=("${IMAGE_REPO}:${upstream}-main-${sfx}")
+                  tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}-${sfx}")
                 fi
-                tags+=("${IMAGE_REPO}:latest-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${upstream}-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${major}-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${major}-${upstream}-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${major_minor}-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${major_minor}-${upstream}-${FLAVOR_SUFFIX}")
-              else
-                tags+=("${IMAGE_REPO}:main-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:${upstream}-main-${FLAVOR_SUFFIX}")
-                tags+=("${IMAGE_REPO}:main-${short_sha}-${upstream}-${FLAVOR_SUFFIX}")
-              fi
+              done
             fi
           fi
 
