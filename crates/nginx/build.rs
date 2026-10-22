@@ -39,9 +39,9 @@ fn main() {
         }
     }
 
-    // `src/bin/nginx_layout.rs` compiles its C probe against the same
-    // include path nginx-sys ran bindgen with.
-    for var in ["DEP_NGINX_BUILD_DIR", "DEP_NGINX_INCLUDE"] {
+    // `src/bin/nginx_layout.rs` compiles its C probe with the same include
+    // path and defines nginx-sys ran bindgen with.
+    for var in ["DEP_NGINX_INCLUDE", "DEP_NGINX_METADATA"] {
         println!("cargo::rerun-if-env-changed={var}");
         if let Ok(value) = std::env::var(var) {
             println!("cargo::rustc-env={var}={value}");

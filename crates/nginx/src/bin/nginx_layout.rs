@@ -95,7 +95,8 @@ macro_rules! checks {
             c += &format!(
                 "    FIELD({}, {}, {}, {});\n",
                 stringify!($t),
-                c_name(stringify!($f)),
+                // bindgen appends `_` to fields named after Rust keywords (`type_`).
+                stringify!($f).trim_end_matches('_'),
                 offset_of!($t, $f),
                 field_size(|s: &$t| &s.$f),
             );
@@ -167,8 +168,12 @@ fn main() -> io::Result<ExitCode> {
     let dir = Path::new(env!("OUT_DIR"));
     let (c_file, probe) = (dir.join("nginx_layout.c"), dir.join("nginx_layout"));
     fs::write(&c_file, source)?;
+    // nginx-sys 0.5 prints its defines as `cargo:metadata=cflags=...`, which
+    // Cargo passes on under the key `metadata`.
+    let defines = env!("DEP_NGINX_METADATA").trim_start_matches("cflags=");
     let compiled = Command::new(env::var_os("CC").unwrap_or_else(|| "cc".into()))
         .args(env::split_paths(env!("DEP_NGINX_INCLUDE")).map(|dir| format!("-I{}", dir.display())))
+        .args(defines.split_whitespace())
         .arg(&c_file)
         .arg("-o")
         .arg(&probe)
@@ -177,7 +182,7 @@ fn main() -> io::Result<ExitCode> {
         eprintln!(
             "gabion: could not compile the nginx layout probe {}, so the nginx-sys bindings went \
              unchecked. The compiler errors above say why; the probe builds with `cc` (or `$CC`) \
-             against the include path nginx-sys generated its bindings from.",
+             with the include path and defines nginx-sys generated its bindings from.",
             c_file.display(),
         );
         return Ok(ExitCode::FAILURE);
@@ -187,11 +192,6 @@ fn main() -> io::Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
-}
-
-/// bindgen appends `_` to fields named after Rust keywords (`type_`).
-fn c_name(field: &str) -> &str {
-    field.strip_suffix('_').unwrap_or(field)
 }
 
 /// The size of the field `field` projects out of a `T`.
