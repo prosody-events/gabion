@@ -139,10 +139,9 @@ jobs:
           sudo mkdir -p /tmp/cores
           sudo chmod 1777 /tmp/cores
           sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
-      # Warm the nginx and OpenResty `target: smoke` images from their
-      # canonical build caches, then run without `--build` (see
-      # nginx-module). OpenResty alpine is the flavor production runs. Same
-      # images, different command — the request smoke asserts 200, 200, 429.
+      # Warm the nginx and OpenResty alpine (the flavor production runs)
+      # `target: smoke` images from their canonical build caches, then run
+      # the request smoke without `--build` (see nginx-module).
       - name: warm smoke images from registry cache
         run: |
           warm() { # <image> <flavor> <base-arg> <dockerfile>

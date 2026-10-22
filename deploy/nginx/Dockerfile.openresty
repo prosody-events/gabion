@@ -130,11 +130,11 @@ COPY deploy/nginx/nginx.smoke.conf /usr/local/openresty/nginx/conf/nginx.conf
 COPY deploy/nginx/module-request-smoke.sh /usr/local/bin/gabion-nginx-request-smoke
 COPY deploy/nginx/smoke-with-bt.sh /usr/local/bin/gabion-smoke-with-bt
 
-RUN chmod +x /usr/local/bin/gabion-nginx-request-smoke /usr/local/bin/gabion-smoke-with-bt
-
 # The smoke config serves the stock nginx docroot; link it to OpenResty's
 # so the same config runs on both images.
-RUN mkdir -p /usr/share/nginx && ln -s /usr/local/openresty/nginx/html /usr/share/nginx/html
+RUN chmod +x /usr/local/bin/gabion-nginx-request-smoke /usr/local/bin/gabion-smoke-with-bt \
+    && mkdir -p /usr/share/nginx \
+    && ln -s /usr/local/openresty/nginx/html /usr/share/nginx/html
 
 # Default build target = `published`. See deploy/nginx/Dockerfile.
 FROM published
