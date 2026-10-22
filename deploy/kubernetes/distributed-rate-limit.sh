@@ -93,6 +93,7 @@ duration_millis() {
 : "${KEEP_NAMESPACE:=0}"
 
 namespace="gabion-${BACKEND}-dist-$$"
+. deploy/kubernetes/lib.sh
 admin_pf_pid=""
 snapshot_path="/tmp/gabion-${BACKEND}-dist-snapshot.json"
 admin_pf_log="/tmp/gabion-${BACKEND}-dist-admin-port-forward.log"
@@ -353,35 +354,6 @@ spec:
 YAML
 }
 
-endpoint_count() {
-    service="$1"
-    kubectl -n "$namespace" get endpointslice \
-        -l "kubernetes.io/service-name=$service" \
-        -o 'jsonpath={range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}' \
-        | sed '/^$/d' \
-        | wc -l \
-        | tr -d ' '
-}
-
-wait_for_endpoint_count() {
-    service="$1"
-    expected="$2"
-    timeout="${3:-180}"
-    attempts=0
-    count=0
-    while [ "$attempts" -lt "$timeout" ]; do
-        count="$(endpoint_count "$service")"
-        if [ "$count" = "$expected" ]; then
-            return 0
-        fi
-        attempts=$((attempts + 1))
-        sleep 1
-    done
-    printf '%s\n' "timed out waiting for $expected EndpointSlice addresses on $service; saw $count" >&2
-    kubectl -n "$namespace" get endpointslice -o wide >&2
-    return 1
-}
-
 loader_env() {
     if [ "$BACKEND" = "nginx" ]; then
         cat <<YAML
@@ -465,14 +437,7 @@ show_snapshot() {
     kubectl -n "$namespace" port-forward "pod/$gabiond_pod" 19090:9090 >"$admin_pf_log" 2>&1 &
     admin_pf_pid=$!
 
-    attempts=0
-    while [ "$attempts" -lt 30 ]; do
-        if curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot" 2>/dev/null; then
-            break
-        fi
-        attempts=$((attempts + 1))
-        sleep 1
-    done
+    retry 30 curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot" 2>/dev/null || true
 
     if curl -fsS "http://127.0.0.1:19090/snapshot" >"$snapshot_path" 2>/dev/null; then
         python3 - "$snapshot_path" <<'PY'

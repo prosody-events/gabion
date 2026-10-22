@@ -707,6 +707,7 @@ fn cardinality_reject_leaves_duration_unset() {
 #[test]
 fn grpc_transport_round_trip() {
     use envoy_types::pb::envoy::service::ratelimit::v3::rate_limit_service_client::RateLimitServiceClient;
+    use tonic::transport::server::TcpIncoming;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -718,40 +719,24 @@ fn grpc_transport_round_trip() {
         let harness = harness(512, 2).await;
         let limiter = harness.limiter.clone();
 
-        // Reserve an ephemeral port via a probe bind, drop it, then hand
-        // the address to tonic. The kernel will reuse the port for a
-        // brief window; the client retry loop covers the race.
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-        let bound = probe.local_addr().expect("local_addr");
-        drop(probe);
-
+        // Bind before serving so the client connects on the first try: the
+        // listener is already accepting, with no port to race for.
+        let incoming =
+            TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).expect("bind gRPC listener");
+        let bound = incoming.local_addr().expect("local_addr");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let server_handle = tokio::spawn(async move {
+        let server_handle = tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(RateLimitServiceServer::new(EnvoyRateLimitService::new(
                     limiter,
                 )))
-                .serve_with_shutdown(bound, async {
+                .serve_with_incoming_shutdown(incoming, async {
                     let _ = shutdown_rx.await;
-                })
-                .await
-        });
-
-        let mut client = None;
-        for attempt in 0..50 {
-            match RateLimitServiceClient::connect(format!("http://{bound}")).await {
-                Ok(c) => {
-                    client = Some(c);
-                    break;
-                }
-                Err(err) if attempt < 49 => {
-                    tracing::debug!(?err, "waiting for tonic server");
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-                Err(err) => panic!("client could not connect: {err:?}"),
-            }
-        }
-        let mut client = client.expect("client connected");
+                }),
+        );
+        let mut client = RateLimitServiceClient::connect(format!("http://{bound}"))
+            .await
+            .expect("client connected");
 
         // First call: under limit, expect OK with a single descriptor status.
         let response = client
@@ -770,23 +755,14 @@ fn grpc_transport_round_trip() {
             rate_limit_response::Code::Ok as i32,
         );
 
-        // Drive the same key over the configured limit (2) so the next
-        // request must come back OverLimit through the full stack.
-        for _ in 0..3 {
-            let _ = client
-                .should_rate_limit(RateLimitRequest {
-                    domain: "api".into(),
-                    descriptors: vec![descriptor([("tenant", "t-grpc")])],
-                    hits_addend: 1,
-                })
-                .await
-                .expect("rpc OK");
-        }
+        // The service stamps requests with the wall clock, so make the
+        // OverLimit case independent of it: hits above the limit (2) are
+        // rejected whatever the window already holds.
         let over = client
             .should_rate_limit(RateLimitRequest {
                 domain: "api".into(),
                 descriptors: vec![descriptor([("tenant", "t-grpc")])],
-                hits_addend: 1,
+                hits_addend: 3,
             })
             .await
             .expect("rpc OK")
