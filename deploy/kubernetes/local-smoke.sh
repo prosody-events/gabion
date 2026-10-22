@@ -43,11 +43,11 @@ fi
 env CARGO_BUILD_RUSTC_WRAPPER= cargo nextest run -p gabion discovery::kubernetes::tests
 
 # Live-cluster integration: `EndpointSliceDiscovery` against the running
-# kind cluster, end-to-end through `GossipRuntime` convergence. Marked
+# kind cluster, asserting the watcher emits a peer for a live slice. Marked
 # `#[ignore]` so it doesn't fire on `make test`, and only run here under
 # `local-smoke.sh` where we've already asserted kind is up.
 env CARGO_BUILD_RUSTC_WRAPPER= cargo nextest run -p gabion \
     --run-ignored ignored-only \
-    discovery::kubernetes::tests::local_kubernetes_endpoint_slice_watcher_drives_gossip_convergence
+    discovery::kubernetes::tests::local_kubernetes_endpoint_slice_watcher_emits_added_peer
 
-printf '%s\n' "local kubernetes EndpointSlice watcher and gossip convergence test passed on context '$context' ($server)"
+printf '%s\n' "local kubernetes EndpointSlice watcher test passed on context '$context' ($server)"

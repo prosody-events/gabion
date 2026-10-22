@@ -88,3 +88,9 @@ codegen-units = 1
 # no LTO impact — only the line tables. Adds ~3–5 MB to the nginx .so
 # and to `gabiond`.
 debug = "line-tables-only"
+
+# The gossip property tests simulate thousands of node-ticks per case, and
+# unoptimised they are the suite's long pole. Optimising the library cuts
+# them ~8x; debug assertions and overflow checks stay on.
+[profile.test.package.gabion]
+opt-level = 2
