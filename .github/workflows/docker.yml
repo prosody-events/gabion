@@ -25,10 +25,10 @@ on:
     # `nginx<X.Y.Z>` tag so consumers can pin to a specific upstream
     # patch without anyone bumping anything by hand.
     - cron: '0 6 * * 1'
-    # Daily except Monday (the weekly run covers it): `pr-build` rebuilds
-    # only the canonical amd64 cache scopes PRs read, pushing no image, so
-    # a floating base-image bump between main builds doesn't leave PRs
-    # cooking dependencies cold.
+    # Every other schedule (see `plan`'s `mode`) only refreshes the
+    # canonical amd64 cache scopes PRs read, when main hasn't built in the
+    # last day, so a floating base-image bump doesn't leave PRs cooking
+    # dependencies cold. No image is pushed.
     - cron: '0 6 * * 0,2-6'
   workflow_dispatch:
 
@@ -36,9 +36,9 @@ concurrency:
   # Per-PR concurrency: a second push to the same PR cancels the
   # in-flight build (its tags would be stomped anyway). Main / tag /
   # cron stay un-cancelled — every release tag deserves a full run. The
-  # daily cache cron gets its own group: a newly queued run cancels the
-  # group's pending one, and it must never displace a pending main build.
-  group: docker-${{ github.workflow }}-${{ github.ref }}${{ github.event.schedule == '0 6 * * 0,2-6' && '-cache' || '' }}
+  # cache cron gets its own group: a newly queued run cancels the group's
+  # pending one, and it must never displace a pending main build.
+  group: docker-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'schedule' && github.event.schedule != '0 6 * * 1' && '-cache' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -54,12 +54,18 @@ permissions:
 jobs:
   # PRs reach this workflow only through the `paths:` filter above, so it
   # has no need for cargo-rail's PR-skip gate.
-  # The plan job here exists solely to resolve the gabion version once
-  # and hand it to every build / combine job below — release tag wins,
-  # otherwise we read `.release-please-manifest.json`.
+  # The plan job resolves the gabion version once for every build /
+  # combine job (release tag wins, else `.release-please-manifest.json`),
+  # and its `mode` picks which jobs run: `pr`, `full` (main, tags,
+  # dispatch), `weekly` (full plus refresh), `cache`, or `none` (fork PRs,
+  # and a cache cron main's own build covered, so they never race on a ref).
   plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     outputs:
+      mode: ${{ steps.mode.outputs.mode }}
       version: ${{ steps.version.outputs.version }}
       ref-tag: ${{ steps.version.outputs.ref-tag }}
       is-release: ${{ steps.version.outputs.is-release }}
@@ -80,6 +86,32 @@ jobs:
             echo "is-release=false" >> "$GITHUB_OUTPUT"
           fi
         shell: bash
+      - id: mode
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          set -eu
+          case "$EVENT" in
+            pull_request)
+              # Quoted: `pr` is also a command name (SC2209).
+              if [[ "$HEAD_REPO" == "$GITHUB_REPOSITORY" ]]; then mode='pr'; else mode=none; fi
+              ;;
+            schedule)
+              if [[ "$SCHEDULE" == '0 6 * * 1' ]]; then
+                mode=weekly
+              else
+                last="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/docker.yml/runs?branch=main&event=push&per_page=1" \
+                  --jq '.workflow_runs[0].created_at // "1970-01-01T00:00:00Z" | fromdateiso8601')"
+                if (( last > $(date +%s) - 86400 )); then mode=none; else mode=cache; fi
+              fi
+              ;;
+            *) mode=full ;;
+          esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        shell: bash
 
   # PR builds: amd64-only, default flavors only. Pushed with two tags:
   #   - `pr-<N>-<short-sha>` — immutable, one per commit
@@ -88,14 +120,13 @@ jobs:
   # them on PR close or by age. Fork PRs skip — GITHUB_TOKEN doesn't
   # carry `packages:write` for forks; a fork would 401 at login.
   #
-  # The daily cron runs the same matrix with no push, writing the
+  # The cache cron runs the same matrix with no push, writing the
   # canonical `build` scopes PRs read instead of the PR scope.
   pr-build:
-    if: |
-      (github.event_name == 'pull_request'
-        && github.event.pull_request.head.repo.full_name == github.repository)
-        || github.event.schedule == '0 6 * * 0,2-6'
+    if: needs.plan.outputs.mode == 'pr' || needs.plan.outputs.mode == 'cache'
     needs: plan
+    env:
+      CACHE_SCOPE: ${{ needs.plan.outputs.mode == 'pr' && format('pr-{0}', matrix.image) || format('{0}-{1}', matrix.image, matrix.flavor) }}
     strategy:
       fail-fast: false
       matrix:
@@ -136,7 +167,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        if: github.event_name == 'pull_request'
+        if: needs.plan.outputs.mode == 'pr'
         env:
           IMAGE_REPO: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}
           PR: ${{ github.event.pull_request.number }}
@@ -157,7 +188,7 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: ${{ github.event_name == 'pull_request' }}
+          push: ${{ needs.plan.outputs.mode == 'pr' }}
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
             ${{ matrix.base-arg != '' && format('{0}={1}', matrix.base-arg, matrix.base-image) || '' }}
@@ -169,19 +200,16 @@ jobs:
           # it GHCR rejects the cache manifest mediatype and the export
           # silently no-ops.
           #
-          # `cache-from` reads two scopes: the PR's own scope first, then
-          # the canonical `build`-job scope read-only. Content-addressed
-          # layers can't poison — a layer is served only on exact
-          # input-hash match — so the second source just lets a fresh PR
-          # warm its cook layer from main's last build instead of
-          # compiling dependencies cold. On PRs `cache-to` writes only the
-          # PR scope, so a PR build never mutates the release scope; the
-          # daily cron, building main, reads and writes only the canonical
-          # scope, so no PR-built layer reaches it.
+          # `cache-from` reads the job's own `CACHE_SCOPE`, then the
+          # canonical `build`-job scope read-only. Content-addressed layers
+          # can't poison — a layer is served only on exact input-hash match
+          # — so a fresh PR warms its cook layer from main's last build. A
+          # PR writes only its own scope, never the release scope; the cache
+          # cron, building main, reads and writes only the canonical one.
           cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ github.event_name == 'pull_request' && format('pr-{0}', matrix.image) || format('{0}-{1}', matrix.image, matrix.flavor) }}-amd64
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.CACHE_SCOPE }}-amd64
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ matrix.image }}-${{ matrix.flavor }}-amd64
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ github.event_name == 'pull_request' && format('pr-{0}', matrix.image) || format('{0}-{1}', matrix.image, matrix.flavor) }}-amd64,mode=max,image-manifest=true,oci-mediatypes=true
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.CACHE_SCOPE }}-amd64,mode=max,image-manifest=true,oci-mediatypes=true
           # Skip provenance + sbom on PRs — they're for releases, and
           # they bloat per-PR registry churn the cleanup has to sweep.
           provenance: false
@@ -191,9 +219,7 @@ jobs:
   # Re-runs on every commit overwrite the comment in place rather than
   # piling up — the header field makes it idempotent.
   pr-comment:
-    if: |
-      github.event_name == 'pull_request'
-        && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'pull_request'
     needs: pr-build
     runs-on: ubuntu-latest
     permissions:
@@ -225,7 +251,7 @@ jobs:
   # single-platform image, pushes it to GHCR by digest, and uploads the
   # digest as an artifact for the manifest-combine job.
   build:
-    if: github.event_name != 'pull_request' && github.event.schedule != '0 6 * * 0,2-6'
+    if: needs.plan.outputs.mode == 'full' || needs.plan.outputs.mode == 'weekly'
     needs: plan
     strategy:
       fail-fast: false
@@ -235,7 +261,6 @@ jobs:
           - image: gabiond
             dockerfile: deploy/gabiond/Dockerfile
             flavor: default
-            flavor-suffix: ''
             base-arg: ''
             base-image: ''
             arch: amd64
@@ -243,20 +268,18 @@ jobs:
           - image: gabiond
             dockerfile: deploy/gabiond/Dockerfile
             flavor: default
-            flavor-suffix: ''
             base-arg: ''
             base-image: ''
             arch: arm64
             runner: ubuntu-24.04-arm
 
-          # nginx — six flavors from four builds. Default (no suffix) is
-          # stable-alpine. Docker's `alpine` / `latest` tags always alias
-          # `mainline-alpine` / `mainline`, so those builds also publish
-          # the `-alpine` / `-debian` tags: `flavor-suffix` is a list.
+          # nginx — six flavors from four builds. Docker's `alpine` /
+          # `latest` tags always alias `mainline-alpine` / `mainline`, so
+          # `combine` publishes the `-alpine` / `-debian` tags from those
+          # builds: its `flavor-suffix` is a list.
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable-alpine
-            flavor-suffix: ''
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable-alpine
             arch: amd64
@@ -264,7 +287,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable-alpine
-            flavor-suffix: ''
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable-alpine
             arch: arm64
@@ -273,7 +295,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine alpine
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline-alpine
             arch: amd64
@@ -281,7 +302,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine alpine
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline-alpine
             arch: arm64
@@ -290,7 +310,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable
-            flavor-suffix: stable
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable
             arch: amd64
@@ -298,7 +317,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable
-            flavor-suffix: stable
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable
             arch: arm64
@@ -307,7 +325,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline
-            flavor-suffix: mainline debian
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline
             arch: amd64
@@ -315,7 +332,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline
-            flavor-suffix: mainline debian
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline
             arch: arm64
@@ -325,7 +341,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: alpine
-            flavor-suffix: ''
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:alpine
             arch: amd64
@@ -333,7 +348,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: alpine
-            flavor-suffix: ''
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:alpine
             arch: arm64
@@ -342,7 +356,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: jammy
-            flavor-suffix: jammy
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:jammy
             arch: amd64
@@ -350,7 +363,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: jammy
-            flavor-suffix: jammy
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:jammy
             arch: arm64
@@ -359,7 +371,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: bookworm
-            flavor-suffix: bookworm
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:bookworm
             arch: amd64
@@ -367,7 +378,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: bookworm
-            flavor-suffix: bookworm
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:bookworm
             arch: arm64
@@ -469,7 +479,6 @@ jobs:
   # `docker buildx imagetools create` a multi-arch manifest under every
   # tag the scheme says we should publish.
   combine:
-    if: github.event_name != 'pull_request' && github.event.schedule != '0 6 * * 0,2-6'
     needs: [plan, build]
     strategy:
       fail-fast: false
@@ -660,7 +669,8 @@ jobs:
   # `:vX.Y.Z-<upstream>(-<sfx>)?` pins. Those keep their original
   # release digest.
   refresh-plan:
-    if: github.event.schedule == '0 6 * * 1'
+    if: needs.plan.outputs.mode == 'weekly'
+    needs: plan
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.tag.outputs.version }}
@@ -683,7 +693,7 @@ jobs:
         shell: bash
 
   refresh-build:
-    if: github.event.schedule == '0 6 * * 1' && needs.refresh-plan.outputs.ref != ''
+    if: needs.refresh-plan.outputs.ref != ''
     needs: refresh-plan
     strategy:
       fail-fast: false
@@ -693,7 +703,6 @@ jobs:
           - image: gabiond
             dockerfile: deploy/gabiond/Dockerfile
             flavor: default
-            flavor-suffix: ''
             base-arg: ''
             base-image: ''
             arch: amd64
@@ -701,7 +710,6 @@ jobs:
           - image: gabiond
             dockerfile: deploy/gabiond/Dockerfile
             flavor: default
-            flavor-suffix: ''
             base-arg: ''
             base-image: ''
             arch: arm64
@@ -711,7 +719,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable-alpine
-            flavor-suffix: ''
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable-alpine
             arch: amd64
@@ -719,7 +726,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable-alpine
-            flavor-suffix: ''
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable-alpine
             arch: arm64
@@ -727,7 +733,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine alpine
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline-alpine
             arch: amd64
@@ -735,7 +740,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline-alpine
-            flavor-suffix: mainline-alpine alpine
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline-alpine
             arch: arm64
@@ -743,7 +747,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable
-            flavor-suffix: stable
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable
             arch: amd64
@@ -751,7 +754,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: stable
-            flavor-suffix: stable
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:stable
             arch: arm64
@@ -759,7 +761,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline
-            flavor-suffix: mainline debian
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline
             arch: amd64
@@ -767,7 +768,6 @@ jobs:
           - image: nginx
             dockerfile: deploy/nginx/Dockerfile
             flavor: mainline
-            flavor-suffix: mainline debian
             base-arg: NGINX_BASE_IMAGE
             base-image: nginx:mainline
             arch: arm64
@@ -777,7 +777,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: alpine
-            flavor-suffix: ''
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:alpine
             arch: amd64
@@ -785,7 +784,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: alpine
-            flavor-suffix: ''
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:alpine
             arch: arm64
@@ -793,7 +791,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: jammy
-            flavor-suffix: jammy
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:jammy
             arch: amd64
@@ -801,7 +798,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: jammy
-            flavor-suffix: jammy
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:jammy
             arch: arm64
@@ -809,7 +805,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: bookworm
-            flavor-suffix: bookworm
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:bookworm
             arch: amd64
@@ -817,7 +812,6 @@ jobs:
           - image: openresty
             dockerfile: deploy/nginx/Dockerfile.openresty
             flavor: bookworm
-            flavor-suffix: bookworm
             base-arg: OPENRESTY_BASE_IMAGE
             base-image: openresty/openresty:bookworm
             arch: arm64
@@ -901,7 +895,7 @@ jobs:
           retention-days: 1
 
   refresh-combine:
-    if: github.event.schedule == '0 6 * * 1' && needs.refresh-plan.outputs.ref != ''
+    if: needs.refresh-plan.outputs.ref != ''
     needs: [refresh-plan, refresh-build]
     strategy:
       fail-fast: false

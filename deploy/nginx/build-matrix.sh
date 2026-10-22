@@ -8,7 +8,7 @@ context="${GABION_NGINX_CONTEXT:-.}"
 if [ "$#" -gt 0 ]; then
     bases="$*"
 else
-    bases="${GABION_NGINX_BASE_IMAGES:-nginx:stable-alpine nginx:mainline-alpine nginx:alpine nginx:stable nginx:mainline nginx:latest}"
+    bases="${GABION_NGINX_BASE_IMAGES:-nginx:stable-alpine nginx:mainline-alpine nginx:stable nginx:mainline}"
 fi
 
 for base in $bases; do
