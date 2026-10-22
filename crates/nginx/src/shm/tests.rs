@@ -1,37 +1,5 @@
 use super::*;
-
-/// Aligned heap allocation used to back a `ShmRegion` in tests so the
-/// pointer stays at a stable address (no Stacked-Borrows reborrow on
-/// move).
-struct Zone {
-    ptr: *mut u8,
-    words: usize,
-}
-
-impl Zone {
-    fn allocate(words: usize) -> Self {
-        let buf: Box<[u64]> = vec![0_u64; words].into_boxed_slice();
-        let raw = Box::into_raw(buf);
-        Self {
-            ptr: raw as *mut u8,
-            words,
-        }
-    }
-}
-
-impl Drop for Zone {
-    fn drop(&mut self) {
-        // SAFETY: `self.ptr` was minted by `Box::into_raw` of a
-        // `Box<[u64]>` of length `self.words`. No live references into
-        // the region exist at drop time (the `ShmRegion` paired with
-        // this `Zone` is dropped first because it is created later in
-        // the test).
-        unsafe {
-            let slice = std::ptr::slice_from_raw_parts_mut(self.ptr as *mut u64, self.words);
-            let _ = Box::from_raw(slice);
-        }
-    }
-}
+use crate::shm::mock::TestZone;
 
 #[test]
 fn layout_minimum_capacities() {
@@ -45,22 +13,40 @@ fn layout_minimum_capacities() {
 }
 
 #[test]
+fn zone_size_sets_aggregate_capacity() {
+    const MIB: usize = 1024 * 1024;
+    for page in [4096, 16384, 65536] {
+        assert!(Layout::for_zone(128 * 1024, page).is_none());
+        assert!(Layout::for_zone(MIB, page).is_some());
+        for mib in [1, 2, 3, 64, 1024] {
+            let zone = mib * MIB;
+            let layout = Layout::for_zone(zone, page).expect("layout");
+            assert_eq!(layout.queue_capacity, QUEUE_CAPACITY);
+            assert!(layout.aggregate_capacity.is_power_of_two());
+            // It fits beside nginx's slab overhead, and twice as many slots
+            // would not.
+            assert!(layout.total_bytes + zone / 128 + 4 * page <= zone);
+            let doubled = Layout::new(QUEUE_CAPACITY, 2 * layout.aggregate_capacity).unwrap();
+            assert!(doubled.total_bytes + zone / 128 + 4 * page > zone);
+        }
+    }
+    assert_eq!(
+        Layout::for_zone(2 * MIB, 4096).unwrap().aggregate_capacity,
+        16384
+    );
+    assert_eq!(
+        Layout::for_zone(64 * MIB, 4096).unwrap().aggregate_capacity,
+        524288
+    );
+}
+
+#[test]
 fn initialize_then_read_round_trip() {
-    let layout = Layout::new(8, 16).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = Zone::allocate(words);
-    // SAFETY: see access::tests::TestZone for the same justification.
-    // `zone.ptr` is 8-byte aligned, freshly allocated, lives until the
-    // `Zone` drop at the end of this test, and `layout` matches the
-    // allocation size.
-    let region = unsafe { ShmRegion::initialize(zone.ptr, layout) };
+    let (_zone, region) = TestZone::new(8, 16);
     assert!(region.header().is_initialized());
     assert_eq!(region.queue().capacity(), 8);
     assert_eq!(region.aggregate().capacity(), 16);
     // Stats fields default to zero.
     let stats = region.stats().snapshot();
     assert_eq!(stats.requests, 0);
-    // Keep `region` and `zone` alive through the end of the test.
-    let _ = region;
-    let _ = zone;
 }

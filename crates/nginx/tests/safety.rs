@@ -205,15 +205,7 @@ fn leader_stamps_incarnation_and_applies_deltas() {
     assert_eq!(region.header().identity.load_incarnation(), incarnation);
 
     // Build the store and feed it a synthetic delta batch.
-    // SAFETY: `region.aggregate_slots_ptr()` points at `agg_cap` initialized
-    // AggregateSlots inside the live SHM mapping. The TestZone outlives both
-    // the store and any worker view. This is the sole writer.
-    let store = unsafe {
-        ShmAggregateStore::new(
-            region.aggregate_slots_ptr(),
-            region.layout.aggregate_capacity,
-        )
-    };
+    let store = ShmAggregateStore::new(region);
 
     let rule = Rule::new(
         1,
@@ -238,15 +230,9 @@ fn leader_stamps_incarnation_and_applies_deltas() {
 }
 
 #[test]
-fn expiration_subtracts_then_tombstones_when_zero() {
+fn expiration_subtracts_then_empties_when_zero() {
     let (_zone, region) = build_zone(8, 16);
-    // SAFETY: see leader_stamps_incarnation_and_applies_deltas.
-    let store = unsafe {
-        ShmAggregateStore::new(
-            region.aggregate_slots_ptr(),
-            region.layout.aggregate_capacity,
-        )
-    };
+    let store = ShmAggregateStore::new(region);
     let rule = Rule::new(
         1,
         DEFAULT_DOMAIN.to_string(),
@@ -284,7 +270,7 @@ fn expiration_subtracts_then_tombstones_when_zero() {
         4
     );
 
-    // Subtract the rest — should tombstone.
+    // Subtract the rest — should empty the slot.
     let (d_empty, e_full) = deltas_and_expirations(&rule, &[], &[(kh, 1, 4)]);
     store.apply(&d_empty, &e_full);
     assert!(region.aggregate().get(rule.fingerprint, kh.0, 1).is_none());
@@ -312,13 +298,7 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
     assert!(matches!(decide(ctx, 0, &vars, 0), AccessOutcome::Allow(_)));
 
     // Simulate leader applying the recorded hits before the third arrives.
-    // SAFETY: see leader_stamps_incarnation_and_applies_deltas.
-    let store = unsafe {
-        ShmAggregateStore::new(
-            region.aggregate_slots_ptr(),
-            region.layout.aggregate_capacity,
-        )
-    };
+    let store = ShmAggregateStore::new(region);
     let descriptors = [gabion::rules::Descriptor {
         key: "tenant",
         value: "alice",
@@ -348,21 +328,19 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
 
 // -- 4. Concurrent leader writer + worker readers --------------------------
 
+/// The leader inserts and expires cells around a steady one in a small,
+/// crowded table, so expiry keeps shifting cells back over freed slots
+/// while workers read. A reader may miss a cell mid-move, but whatever it
+/// does read must be exact: never torn, never another cell's count.
 #[test]
-fn concurrent_leader_writer_and_worker_readers() {
-    // Smaller iteration counts under miri so the test stays tractable.
+fn readers_see_exact_counts_while_the_leader_moves_cells() {
     #[cfg(not(miri))]
-    const WRITES: u64 = 256;
+    const ROUNDS: u32 = 2_000;
     #[cfg(miri)]
-    const WRITES: u64 = 32;
+    const ROUNDS: u32 = 20;
+    const STEADY: u32 = 1_000_000;
 
-    let layout = Layout::new(8, 32).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = Arc::new(TestZone::allocate(words));
-    // SAFETY: zone.as_ptr() outlives every thread that uses it (Arc keeps it
-    // alive). layout matches the allocation size.
-    let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
-
+    let (_zone, region) = build_zone(8, 16);
     let rule = Rule::new(
         1,
         DEFAULT_DOMAIN.to_string(),
@@ -370,57 +348,55 @@ fn concurrent_leader_writer_and_worker_readers() {
             key: "k".into(),
             value: "*".into(),
         }],
-        WRITES * 2,
+        u64::MAX,
         1_000,
         250,
         EnforcementMode::Enforce,
     );
     let fp = rule.fingerprint;
-    let kh = KeyHash(0x777);
-    let bucket = 1_u32;
+    let steady = KeyHash(0x777);
+    let store = ShmAggregateStore::new(region);
+    let (d, e) = deltas_and_expirations(&rule, &[(steady, 0, STEADY)], &[]);
+    store.apply(&d, &e);
 
     let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let view = region.aggregate();
+                    if let Some(cell) = view.get(fp, steady.0, 0) {
+                        assert_eq!(cell.count, u64::from(STEADY));
+                    }
+                    for bucket in 1..=8 {
+                        if let Some(cell) = view.get(fp, steady.0, bucket) {
+                            assert_eq!(cell.count, u64::from(bucket));
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
 
-    // Leader thread writes deltas one at a time.
-    let writer = thread::spawn(move || {
-        let writer_region = region;
-        let store = unsafe {
-            ShmAggregateStore::new(
-                writer_region.aggregate_slots_ptr(),
-                writer_region.layout.aggregate_capacity,
-            )
-        };
-        for _ in 0..WRITES {
-            let (d, e) = deltas_and_expirations(&rule, &[(kh, bucket, 1)], &[]);
-            store.apply(&d, &e);
-        }
-    });
-
-    // Two reader threads — what every nginx worker does on the access path.
-    let mut readers = Vec::new();
-    for _ in 0..2 {
-        let reader_stop = stop.clone();
-        readers.push(thread::spawn(move || {
-            let reader_region = region;
-            while !reader_stop.load(Ordering::Acquire) {
-                let view = reader_region.aggregate();
-                // No panic = no torn read.
-                let _ = view.get(fp, kh.0, bucket);
-            }
-        }));
+    for _ in 0..ROUNDS {
+        let cells: Vec<_> = (1..=8).map(|bucket| (steady, bucket, bucket)).collect();
+        let (d, e) = deltas_and_expirations(&rule, &cells, &[]);
+        store.apply(&d, &e);
+        let (d, e) = deltas_and_expirations(&rule, &[], &cells);
+        store.apply(&d, &e);
     }
-
-    writer.join().expect("writer joined");
     stop.store(true, Ordering::Release);
-    for r in readers {
-        r.join().expect("reader joined");
+    for reader in readers {
+        reader.join().expect("reader joined");
     }
 
-    let final_view = region.aggregate();
-    let cell = final_view
-        .get(fp, kh.0, bucket)
-        .expect("final value present");
-    assert_eq!(cell.count, WRITES);
+    let view = region.aggregate();
+    assert_eq!(
+        view.get(fp, steady.0, 0).expect("steady").count,
+        u64::from(STEADY)
+    );
+    assert!((1..=8).all(|bucket| view.get(fp, steady.0, bucket).is_none()));
 }
 
 // -- 5. Lease takeover under contention ------------------------------------
@@ -533,8 +509,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
     let leader_stop = stop.clone();
     let leader = thread::spawn(move || {
         let r = region;
-        let store =
-            unsafe { ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity) };
+        let store = ShmAggregateStore::new(r);
         let queue = r.queue();
         let mut total = 0_u64;
         while total < TOTAL || !leader_stop.load(Ordering::Acquire) {
@@ -642,8 +617,7 @@ fn decide_and_leader_apply_concurrent() {
     let leader_rules = rules.clone();
     let leader = thread::spawn(move || {
         let r = region;
-        let store =
-            unsafe { ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity) };
+        let store = ShmAggregateStore::new(r);
         let descriptors = [gabion::rules::Descriptor {
             key: "tenant",
             value: "alice",
@@ -750,8 +724,7 @@ fn decide_all_multi_rule_concurrent() {
     let leader_rules = rules.clone();
     let leader = thread::spawn(move || {
         let r = region;
-        let store =
-            unsafe { ShmAggregateStore::new(r.aggregate_slots_ptr(), r.layout.aggregate_capacity) };
+        let store = ShmAggregateStore::new(r);
         let mut applied = 0_u32;
         while !leader_stop.load(Ordering::Acquire) {
             for compiled in leader_rules.rules() {

@@ -272,6 +272,18 @@ master releases the old one once no configuration uses it.
 gabion_limit_zone zone=api:128m;
 ```
 
+SIZE sets how many `(rule, key, bucket)` counters the zone holds: after
+the ~150 KiB request queue and nginx's slab bookkeeping (under 1%), the
+rest becomes a power-of-two table of 64-byte slots, so each doubling of
+SIZE doubles the slots (`2m` holds 16,384, `64m` holds 524,288; the
+`gabion: zone ready` log line reports `slots`). A rule needs about
+*active keys × (window / bucket + 1)* slots, and lookups stay short
+while the table is under half full. For example, 650 keys a second under
+`rate=20r/s window=10s bucket=1s` keep about 650 × 11 ≈ 7,200 cells
+live, so choose 16,384 slots: `zone=api:2m`. Sizes under `1m` may be
+refused. When the table runs out of room, gabion allows the request,
+under-counts that key, increments `aggregate_dropped` and logs a warning.
+
 #### `gabion_limit_rule NAME [$bindings...] rate=Nr/<unit> [...]` *(http)*
 
 Declares a rate-limit rule. Positional arguments after the name are
@@ -726,7 +738,7 @@ The nginx adapter does not currently expose an admin HTTP endpoint.
 The SHM `Stats` snapshot (`requests`, `allowed`, `rejected`,
 `rejected_cardinality`, `declines_invalid_descriptor`,
 `matched_rule_overflows`, `exempted`, `exempted_per_rule[]`,
-`queue_pushed`, `queue_drained`, `queue_dropped`) is the operator's
+`queue_pushed`, `queue_drained`, `queue_dropped`, `aggregate_dropped`) is the operator's
 local readout; the server adapter exposes the same data via
 `/snapshot` (see [`../server/README.md`](../server/README.md)).
 
@@ -772,6 +784,7 @@ gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a 
 | Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`      | A client crossed a rule's limit.                                                                                                                    | Expected. `Retry-After` says how long to back off; the rule with the longest window owns the header.                             |
 | `400 Bad Request` from gabion                                                 | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits (`512` by default).                  | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
 | SHM `matched_rule_overflows` counter rising                                   | A location stacked more rules than `STORAGE_MAX_MATCHED_RULES` permits (`16`). **The request was allowed** (allow-by-default); the count under-counts. *No log line — observed only via the SHM stats snapshot.* | Reduce the number of rules applied at this location, or split the location.                                                      |
+| `gabion: the shared-memory count table had no free slot` (warn)               | The zone holds too few slots for the live `(rule, key, bucket)` cells. **The request was allowed** and that key under-counted. Logged at powers of two of `aggregate_dropped`. | Raise SIZE in `gabion_limit_zone` (see its sizing notes); each doubling doubles the slots.                                         |
 | `gabion: this worker stopped leading gossip` (error) in the error log         | The leader's gossip runtime or queue drain failed or panicked, or it lost the lease. The worker released the lease and campaigns again after `retry_in` (doubling, up to 30s); another worker may take over first. Admission keeps running against the shared aggregate. | Read the `error` field. A bind error means `gabion_gossip_bind` is already in use; a lost lease means the worker was starved long enough to miss its renewals. |
 | `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside a leadership term, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
 | `peer discovery error` (warn) in the error log                                | The Kubernetes discovery stream returned an error this tick. Membership is stale until the next successful tick.                                    | Usually transient (apiserver flap, transient watch reset). If persistent, check pod RBAC / network reachability to the API.      |

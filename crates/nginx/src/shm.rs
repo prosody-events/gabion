@@ -8,6 +8,8 @@
 pub mod aggregate;
 pub mod header;
 pub mod lease;
+#[cfg(test)]
+pub(crate) mod mock;
 pub mod queue;
 pub mod stats;
 
@@ -25,8 +27,15 @@ pub fn align_up(value: usize, align: usize) -> usize {
     (value + mask) & !mask
 }
 
-/// Lays out the SHM zone given capacity targets. Sizes are computed once at
-/// `init_module` and the resulting `Layout` is stamped into the SHM header.
+/// Depth of the queue workers push hits onto for the leader to drain.
+const QUEUE_CAPACITY: usize = 2048;
+
+/// The fewest aggregate slots a zone may hold.
+pub const MIN_AGGREGATE_CAPACITY: usize = 1024;
+
+/// Lays out the SHM zone given capacity targets. Computed once per config
+/// load, from the zone's size; nginx reuses a zone across reload only when
+/// its size is unchanged, so a reused region keeps a matching layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Layout {
     pub queue_capacity: usize,
@@ -77,6 +86,26 @@ impl Layout {
             total_bytes,
         })
     }
+
+    /// Lay out a zone of `zone_bytes` on `page_bytes` pages: the fixed
+    /// queue plus the largest power-of-two aggregate table that fits, or
+    /// `None` below `MIN_AGGREGATE_CAPACITY` slots. nginx's slab pool keeps
+    /// a 24-byte descriptor per page (under 1/128 of the zone for pages of
+    /// 4 KiB or more) and loses up to a page each to its header, to
+    /// aligning its first page, and to rounding its page count down; our
+    /// block is rounded up to whole pages, which can cost one more.
+    pub fn for_zone(zone_bytes: usize, page_bytes: usize) -> Option<Self> {
+        let usable = zone_bytes.checked_sub(zone_bytes / 128 + 4 * page_bytes)?;
+        let mut capacity = 1 << (usable / size_of::<AggregateSlot>()).checked_ilog2()?;
+        while capacity >= MIN_AGGREGATE_CAPACITY {
+            let layout = Self::new(QUEUE_CAPACITY, capacity)?;
+            if layout.total_bytes <= usable {
+                return Some(layout);
+            }
+            capacity /= 2;
+        }
+        None
+    }
 }
 
 /// Live view of an initialized SHM zone. Workers reconstruct one from the
@@ -85,8 +114,8 @@ impl Layout {
 /// stored in atomics or seqlock-protected slots.
 #[derive(Clone, Copy, Debug)]
 pub struct ShmRegion {
-    pub base: *mut u8,
-    pub layout: Layout,
+    base: *mut u8,
+    layout: Layout,
 }
 
 // SAFETY: `ShmRegion` is two POD fields (`*mut u8` + `Copy` `Layout`). The
@@ -169,6 +198,10 @@ impl ShmRegion {
         }
     }
 
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+
     pub fn header(&self) -> &Header {
         // SAFETY: The `ShmRegion` invariants (see `initialize` / `Send`+`Sync`
         // docs) guarantee that `header_ptr()` is non-null, cacheline-aligned
@@ -226,12 +259,6 @@ impl ShmRegion {
             );
             AggregateTable::from_slots(slots)
         }
-    }
-
-    /// Pointer to the first aggregate slot. Used by `ShmAggregateStore` (the
-    /// leader-only writer).
-    pub fn aggregate_slots_ptr(&self) -> *mut AggregateSlot {
-        self.aggregate_slot_ptr(0) as *mut AggregateSlot
     }
 
     pub fn stats(&self) -> &Stats {

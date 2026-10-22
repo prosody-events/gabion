@@ -31,6 +31,7 @@ pub struct Stats {
     pub queue_pushed: AtomicU64,
     pub queue_drained: AtomicU64,
     pub queue_dropped: AtomicU64,
+    pub aggregate_dropped: AtomicU64,
 }
 
 impl Default for Stats {
@@ -47,6 +48,7 @@ impl Default for Stats {
             queue_pushed: AtomicU64::new(0),
             queue_drained: AtomicU64::new(0),
             queue_dropped: AtomicU64::new(0),
+            aggregate_dropped: AtomicU64::new(0),
         }
     }
 }
@@ -64,6 +66,7 @@ pub struct StatsSnapshot {
     pub queue_pushed: u64,
     pub queue_drained: u64,
     pub queue_dropped: u64,
+    pub aggregate_dropped: u64,
 }
 
 impl Default for StatsSnapshot {
@@ -80,6 +83,7 @@ impl Default for StatsSnapshot {
             queue_pushed: 0,
             queue_drained: 0,
             queue_dropped: 0,
+            aggregate_dropped: 0,
         }
     }
 }
@@ -105,6 +109,7 @@ impl Stats {
             queue_pushed: self.queue_pushed.load(Ordering::Relaxed),
             queue_drained: self.queue_drained.load(Ordering::Relaxed),
             queue_dropped: self.queue_dropped.load(Ordering::Relaxed),
+            aggregate_dropped: self.aggregate_dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -159,6 +164,12 @@ impl Stats {
 
     pub fn record_queue_drop(&self) {
         self.queue_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The aggregate table had no free slot for a cell, so its count was
+    /// dropped (allowed and under-counted). Returns the new total.
+    pub fn record_aggregate_drop(&self) -> u64 {
+        self.aggregate_dropped.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn record_queue_drain(&self, n: u64) {

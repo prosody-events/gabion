@@ -1,72 +1,9 @@
 use super::*;
 use crate::rules::{DescriptorBinding, RuleConfig};
-use crate::shm::{Layout, ShmRegion};
+use crate::shm::ShmAggregateStore;
+use crate::shm::mock::TestZone;
 use gabion::rules::EnforcementMode;
 use std::time::Duration;
-
-/// RAII guard wrapping a leaked SHM-backing buffer. Reclaims memory in
-/// `Drop` so each test allocation is freed; in the meantime the
-/// underlying pointer lives at a stable address, sidestepping the
-/// Stacked-/Tree-Borrows reborrow-on-move semantics that bite when a
-/// `Box<[u8]>` is moved alongside the `ShmRegion` carrying its pointer.
-pub(crate) struct TestZone {
-    ptr: *mut u8,
-    words: usize,
-}
-
-impl TestZone {
-    fn allocate(words: usize) -> Self {
-        let buf: Box<[u64]> = vec![0_u64; words].into_boxed_slice();
-        let raw = Box::into_raw(buf);
-        // SAFETY: `Box::into_raw` returns a non-null pointer to a slice
-        // of `words` `u64`s. Reading the slice length back out is
-        // straightforward from `(*raw).len()`. We keep the raw pointer
-        // and the length, and Drop reconstructs the Box.
-        Self {
-            ptr: raw as *mut u8,
-            words,
-        }
-    }
-
-    fn as_ptr(&self) -> *mut u8 {
-        self.ptr
-    }
-}
-
-impl Drop for TestZone {
-    fn drop(&mut self) {
-        // SAFETY: `self.ptr` came from `Box::into_raw` of
-        // `Box<[u64]>` with `self.words` slice length. Reconstructing
-        // the box here is the only thing that touches this allocation
-        // (no aliasing borrows are live because the `ShmRegion` paired
-        // with this zone is dropped before `self`).
-        unsafe {
-            let slice = std::ptr::slice_from_raw_parts_mut(self.ptr as *mut u64, self.words);
-            let _ = Box::from_raw(slice);
-        }
-    }
-}
-
-fn build_zone(queue_cap: usize, agg_cap: usize) -> (TestZone, ShmRegion) {
-    let layout = Layout::new(queue_cap, agg_cap).expect("layout");
-    // Production allocates via `mmap`. In tests we back the zone with
-    // a heap allocation rounded up to `u64` words so the buffer is
-    // 8-byte aligned — matching the strictest alignment any field in
-    // the region requires (`AtomicU64`).
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = TestZone::allocate(words);
-    // SAFETY: `ShmRegion::initialize`'s preconditions (see its
-    // `# Safety` doc) are upheld:
-    // * `zone.as_ptr()` is non-null, writable, and 8-byte aligned (the
-    //   underlying allocation was a `Box<[u64]>`). `words * 8 >=
-    //   layout.total_bytes`, so the mapping size is covered.
-    // * `Layout::new` produced `layout` above; offsets are consistent.
-    // * `zone` is a fresh allocation; `initialize` is its first user.
-    // * The returned `TestZone` is paired with the `ShmRegion` and dropped
-    //   after every use of the region in each `#[test]`.
-    let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
-    (zone, region)
-}
 
 fn build_rules() -> CompiledRules {
     CompiledRules::compile(&[RuleConfig {
@@ -87,7 +24,7 @@ fn build_rules() -> CompiledRules {
 
 #[test]
 fn allow_on_empty_aggregate() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_rules();
     let ctx = AccessCtx {
         rules: &rules,
@@ -115,7 +52,7 @@ fn allow_on_empty_aggregate() {
 
 #[test]
 fn reject_when_window_total_exceeds_limit() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_rules();
     let domain = crate::rules::DEFAULT_DOMAIN;
     let spec = rules.rules()[0].rule.spec();
@@ -126,32 +63,7 @@ fn reject_when_window_total_exceeds_limit() {
     let key_hash = hash_key(spec.id, domain, &descriptors);
     let bucket = (1_000_u64 / spec.bucket_millis) as u32;
     // Pre-populate aggregate so total >= limit (limit is 2).
-    // SAFETY: `ShmAggregateStore::new`'s preconditions (see its
-    // `# Safety` doc) are upheld:
-    // * `region` was produced by `build_zone`, which called
-    //   `ShmRegion::initialize`. `initialize` `ptr::write`s an
-    //   `AggregateSlot::empty()` into each of the `layout.aggregate_capacity`
-    //   slots, so `region.aggregate_slots_ptr()` is non-null, aligned for
-    //   `AggregateSlot`, and points at exactly that many fully initialized
-    //   slots.
-    // * The `capacity` argument is the same `aggregate_capacity` the region was
-    //   built with (`Layout::new` guarantees it is a power of two `>= 2`, and
-    //   the total byte length fits in the buffer and thus in `isize::MAX`).
-    // * The backing `Vec<u8>` (`_buf` in the caller) lives until the end of the
-    //   `#[test]`, which outlives both this `store` and any
-    //   `AggregateTable<'_>` derived from it via `region.aggregate()`.
-    // * Single-writer: this test is single-threaded and `store` is the sole
-    //   `ShmAggregateStore` constructed against `region`'s aggregate slots;
-    //   reads from `region.aggregate()` use the same seqlock/atomic protocol
-    //   the production code does, so they cannot race with `write_delta`
-    //   (Nomicon: atomic accesses are not data races even with concurrent
-    //   reads).
-    let store = unsafe {
-        crate::shm::aggregate::ShmAggregateStore::new(
-            region.aggregate_slots_ptr(),
-            region.layout.aggregate_capacity,
-        )
-    };
+    let store = ShmAggregateStore::new(region);
     store.write_delta(spec.fingerprint, key_hash.0, bucket, 5, 1_000);
 
     let ctx = AccessCtx {
@@ -189,7 +101,7 @@ fn reject_delta_reflects_oldest_non_empty_bucket() {
     // governs the delta: bucket 2 has 5 hits, the rest are empty. need
     // = 5+1-2 = 4, satisfied at bucket 2; fall_off = (2+4)*250 = 1500ms;
     // delta from now=1_000 is 500ms.
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_rules();
     let domain = crate::rules::DEFAULT_DOMAIN;
     let spec = rules.rules()[0].rule.spec();
@@ -198,14 +110,7 @@ fn reject_delta_reflects_oldest_non_empty_bucket() {
         value: "alice",
     }];
     let key_hash = hash_key(spec.id, domain, &descriptors);
-    // SAFETY: same single-writer pattern documented on the other
-    // ShmAggregateStore::new uses in this file.
-    let store = unsafe {
-        crate::shm::aggregate::ShmAggregateStore::new(
-            region.aggregate_slots_ptr(),
-            region.layout.aggregate_capacity,
-        )
-    };
+    let store = ShmAggregateStore::new(region);
     store.write_delta(spec.fingerprint, key_hash.0, 2, 5, 0);
 
     let ctx = AccessCtx {
@@ -229,7 +134,7 @@ fn reject_delta_reflects_oldest_non_empty_bucket() {
 
 #[test]
 fn decline_when_variable_missing() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_rules();
     let ctx = AccessCtx {
         rules: &rules,
@@ -246,7 +151,7 @@ fn decline_when_variable_missing() {
 
 #[test]
 fn cardinality_settings_reject_oversized_descriptors() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_rules();
     let ctx = AccessCtx {
         rules: &rules,
@@ -285,7 +190,7 @@ fn default_cardinality_settings_match_shared_defaults() {
 
 #[test]
 fn invalid_utf8_descriptor_declines_and_bumps_counter() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_rules();
     let ctx = AccessCtx {
         rules: &rules,
@@ -348,7 +253,7 @@ fn rule_with_predicate(predicate: Option<&str>) -> CompiledRules {
 
 #[test]
 fn except_truthy_skips_rule() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = rule_with_predicate(Some("trusted"));
     let ctx = AccessCtx {
         rules: &rules,
@@ -376,7 +281,7 @@ fn except_truthy_skips_rule() {
 
 #[test]
 fn except_falsy_applies_rule() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = rule_with_predicate(Some("trusted"));
     let ctx = AccessCtx {
         rules: &rules,
@@ -398,7 +303,7 @@ fn except_falsy_applies_rule() {
 
 #[test]
 fn except_missing_applies_rule() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = rule_with_predicate(Some("trusted"));
     let ctx = AccessCtx {
         rules: &rules,
@@ -422,7 +327,7 @@ fn except_missing_applies_rule() {
 
 #[test]
 fn except_empty_applies_rule() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = rule_with_predicate(Some("trusted"));
     let ctx = AccessCtx {
         rules: &rules,
@@ -473,7 +378,7 @@ fn build_two_rules(
 
 #[test]
 fn decide_all_allow_when_all_pass() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_two_rules(10, 1, 10, 60);
     let ctx = AccessCtx {
         rules: &rules,
@@ -496,7 +401,7 @@ fn decide_all_allow_when_all_pass() {
 
 #[test]
 fn decide_all_decline_when_all_decline() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_two_rules(10, 1, 10, 60);
     let ctx = AccessCtx {
         rules: &rules,
@@ -517,7 +422,7 @@ fn decide_all_decline_when_all_decline() {
 
 #[test]
 fn decide_all_picks_longest_window() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     // First rule: 1s window, limit 1; second: 60s window, limit 1.
     let rules = build_two_rules(1, 1, 1, 60);
     let domain = crate::rules::DEFAULT_DOMAIN;
@@ -526,14 +431,7 @@ fn decide_all_picks_longest_window() {
         value: "alice",
     }];
     // Pre-populate aggregate so BOTH rules are over their budget.
-    // SAFETY: same as the other tests in this file (build_zone owns
-    // the backing allocation; the store is the sole writer here).
-    let store = unsafe {
-        crate::shm::aggregate::ShmAggregateStore::new(
-            region.aggregate_slots_ptr(),
-            region.layout.aggregate_capacity,
-        )
-    };
+    let store = ShmAggregateStore::new(region);
     for rule in rules.rules() {
         let spec = rule.rule.spec();
         let key_hash = hash_key(spec.id, domain, &descriptors);
@@ -562,7 +460,7 @@ fn decide_all_picks_longest_window() {
 
 #[test]
 fn decide_all_one_declines_one_allows() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     // First rule keyed on a missing variable so it declines; second
     // rule has the variable set so it allows.
     let rule_a = RuleConfig {
@@ -610,7 +508,7 @@ fn decide_all_one_declines_one_allows() {
 
 #[test]
 fn dry_run_records_but_never_rejects() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let cfg = RuleConfig {
         name: "shadow".into(),
         domain: crate::rules::DEFAULT_DOMAIN.into(),
@@ -628,14 +526,7 @@ fn dry_run_records_but_never_rejects() {
     let domain = crate::rules::DEFAULT_DOMAIN;
 
     // Pre-populate so the aggregate is way over the limit.
-    // SAFETY: see notes on the other ShmAggregateStore::new uses in
-    // this module — same single-writer test pattern.
-    let store = unsafe {
-        crate::shm::aggregate::ShmAggregateStore::new(
-            region.aggregate_slots_ptr(),
-            region.layout.aggregate_capacity,
-        )
-    };
+    let store = ShmAggregateStore::new(region);
     let spec = rules.rules()[0].rule.spec();
     let descriptors = [Descriptor {
         key: "tenant",
@@ -697,7 +588,7 @@ fn build_two_rules_varied(name_a: &str, key_a: &str, name_b: &str, key_b: &str) 
 
 #[test]
 fn decide_all_one_rule_cardinality_others_still_evaluate() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_two_rules_varied("a", "long_descriptor_key_name", "b", "k");
     let domain = crate::rules::DEFAULT_DOMAIN;
     let budget = domain.len() + 1 + "alice".len();
@@ -724,7 +615,7 @@ fn decide_all_one_rule_cardinality_others_still_evaluate() {
 
 #[test]
 fn decide_all_all_rules_cardinality_returns_cardinality() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_two_rules_varied(
         "a",
         "long_descriptor_key_name_a",
@@ -753,7 +644,7 @@ fn decide_all_all_rules_cardinality_returns_cardinality() {
 
 #[test]
 fn decide_all_mixed_decline_and_cardinality_returns_cardinality() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let cfg_a = RuleConfig {
         name: "a".into(),
         domain: crate::rules::DEFAULT_DOMAIN.into(),
@@ -800,7 +691,7 @@ fn decide_all_mixed_decline_and_cardinality_returns_cardinality() {
 
 #[test]
 fn decide_all_one_rule_exempt_one_rejects() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let cfg_a = RuleConfig {
         name: "a".into(),
         domain: crate::rules::DEFAULT_DOMAIN.into(),
@@ -830,14 +721,7 @@ fn decide_all_one_rule_exempt_one_rejects() {
     let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
     let domain = crate::rules::DEFAULT_DOMAIN;
 
-    // SAFETY: see notes on the other ShmAggregateStore::new uses in this
-    // module — same single-writer test pattern.
-    let store = unsafe {
-        crate::shm::aggregate::ShmAggregateStore::new(
-            region.aggregate_slots_ptr(),
-            region.layout.aggregate_capacity,
-        )
-    };
+    let store = ShmAggregateStore::new(region);
     let spec_b = rules.rules()[1].rule.spec();
     let descriptors_b = [Descriptor {
         key: "k",
@@ -869,7 +753,7 @@ fn decide_all_one_rule_exempt_one_rejects() {
 
 #[test]
 fn cardinality_skip_does_not_push_queue_event() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_rules();
     let ctx = AccessCtx {
         rules: &rules,
@@ -891,7 +775,7 @@ fn cardinality_skip_does_not_push_queue_event() {
 
 #[test]
 fn except_does_not_count_cardinality() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     // Predicate truthy — request is exempted before the byte-budget check.
     let rules = rule_with_predicate(Some("trusted"));
     let ctx = AccessCtx {
@@ -921,7 +805,7 @@ fn except_does_not_count_cardinality() {
 
 #[test]
 fn per_rule_exempt_counter_bumps_only_target_rule() {
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let cfg_a = RuleConfig {
         name: "a".into(),
         domain: crate::rules::DEFAULT_DOMAIN.into(),
@@ -1004,7 +888,7 @@ fn allow_info_picks_min_remaining_across_rules() {
     // Two rules. Rule 0 has the lower budget left — its quota should
     // drive the `X-RateLimit-*` headers on the allowed response so the
     // client sees the most-constraining rule.
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     // Rule 0: limit=2, window=1s. Rule 1: limit=10, window=60s.
     let rules = build_two_rules(2, 1, 10, 60);
     let domain = crate::rules::DEFAULT_DOMAIN;
@@ -1034,7 +918,7 @@ fn allow_info_tie_break_prefers_longer_window() {
     // Both rules have the same remaining (limit=5, hits=1 -> 4). The
     // tie-break picks the longer window, mirroring the reject path's
     // most-constraining-context rationale.
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let rules = build_two_rules(5, 1, 5, 60);
     let ctx = AccessCtx {
         rules: &rules,
@@ -1064,7 +948,7 @@ fn allow_info_under_limit_dry_run_emits_positive_remaining() {
     // real remaining budget — same as Enforce. Mirrors the
     // over-limit case below, which is exercised by
     // `dry_run_records_but_never_rejects`.
-    let (_buf, region) = build_zone(8, 16);
+    let (_buf, region) = TestZone::new(8, 16);
     let cfg = RuleConfig {
         name: "shadow".into(),
         domain: crate::rules::DEFAULT_DOMAIN.into(),

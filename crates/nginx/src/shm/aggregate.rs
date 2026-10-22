@@ -5,26 +5,31 @@
 //! The gossip leader is the only writer (via `AggregateStore::apply`); every
 //! worker process reads from this table on the request hot path.
 //!
-//! Each slot uses a seqlock-style sequence counter:
-//! - `0` ⇒ empty
-//! - `u64::MAX` ⇒ tombstone
-//! - even ⇒ stable
-//! - odd ⇒ mid-write
+//! The table is linear-probed, and every cell sits within [`MAX_PROBE`]
+//! slots of its home slot: a write that finds no free slot that close is
+//! dropped (and counted) rather than placed further away, so no lookup ever
+//! walks more than `MAX_PROBE` slots. Removal shifts the cells behind the
+//! freed slot back toward their homes (Knuth's Algorithm R), so expiry
+//! returns slots to empty and lookups for absent keys stay short.
 //!
-//! Readers load `seq`, abort on `0`, skip on tombstone, retry on `odd`, then
-//! re-verify `seq` after the read. Writers bump `seq` to odd, mutate, then
-//! bump back to even (`seq + 1`).
+//! Each slot is a seqlock: `seq == 0` ⇒ empty, odd ⇒ mid-write, even ⇒
+//! stable. Readers never wait: a slot that is mid-write, or changes under
+//! the read, is skipped. A reader can therefore miss a cell the writer is
+//! touching or moving at that instant and under-count it for one request,
+//! which the allow-by-default rule accepts.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use gabion::crdt::{DeltaSink, ExpirationSink};
 use gabion::gossip::AggregateStore;
 use gabion::rules::RuleSpec;
 
-use super::AggregateCell;
+use super::{AggregateCell, ShmRegion};
 
-pub const TOMBSTONE: u64 = u64::MAX;
+/// The furthest a cell may sit from its home slot, and so the most slots a
+/// lookup reads. At half load, under one insert in 10^10 needs more.
+pub const MAX_PROBE: usize = 128;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -53,22 +58,64 @@ impl AggregateSlot {
         }
     }
 
-    fn matches(&self, fp: u128, kh: u128, bucket: u32) -> bool {
-        self.rule_fingerprint_lo.load(Ordering::Relaxed) == fp as u64
-            && self.rule_fingerprint_hi.load(Ordering::Relaxed) == (fp >> 64) as u64
-            && self.key_hash_lo.load(Ordering::Relaxed) == kh as u64
-            && self.key_hash_hi.load(Ordering::Relaxed) == (kh >> 64) as u64
-            && self.bucket.load(Ordering::Relaxed) == bucket as u64
+    fn read(&self) -> Read {
+        let seq = match self.seq.load(Ordering::Acquire) {
+            0 => return Read::Empty,
+            seq if seq & 1 == 1 => return Read::Busy,
+            seq => seq,
+        };
+        let cell = AggregateCell {
+            rule_fingerprint: ((self.rule_fingerprint_hi.load(Ordering::Relaxed) as u128) << 64)
+                | self.rule_fingerprint_lo.load(Ordering::Relaxed) as u128,
+            key_hash: ((self.key_hash_hi.load(Ordering::Relaxed) as u128) << 64)
+                | self.key_hash_lo.load(Ordering::Relaxed) as u128,
+            bucket: self.bucket.load(Ordering::Relaxed) as u32,
+            count: self.count.load(Ordering::Relaxed),
+            last_update_millis: self.last_update_millis.load(Ordering::Relaxed),
+        };
+        // Order the field loads before the re-check of `seq`.
+        fence(Ordering::Acquire);
+        if self.seq.load(Ordering::Relaxed) == seq {
+            Read::Live(cell)
+        } else {
+            Read::Busy
+        }
     }
 
-    fn write_identity(&self, fp: u128, kh: u128, bucket: u32) {
+    /// Publish `cell` under the even sequence `seq`.
+    fn write(&self, seq: u64, cell: AggregateCell) {
+        debug_assert!(seq & 1 == 0 && seq != 0);
+        self.seq.store(seq.wrapping_sub(1), Ordering::Relaxed);
+        // Order the odd `seq` before the field stores.
+        fence(Ordering::Release);
+        let (fp, kh) = (cell.rule_fingerprint, cell.key_hash);
         self.rule_fingerprint_lo.store(fp as u64, Ordering::Relaxed);
         self.rule_fingerprint_hi
             .store((fp >> 64) as u64, Ordering::Relaxed);
         self.key_hash_lo.store(kh as u64, Ordering::Relaxed);
         self.key_hash_hi.store((kh >> 64) as u64, Ordering::Relaxed);
-        self.bucket.store(bucket as u64, Ordering::Relaxed);
+        self.bucket.store(cell.bucket as u64, Ordering::Relaxed);
+        self.count.store(cell.count, Ordering::Relaxed);
+        self.last_update_millis
+            .store(cell.last_update_millis, Ordering::Relaxed);
+        self.seq.store(seq, Ordering::Release);
     }
+}
+
+enum Read {
+    Empty,
+    /// Mid-write, or changed while being read.
+    Busy,
+    Live(AggregateCell),
+}
+
+/// Where a lookup for one cell ended.
+enum Probe {
+    Found(usize, AggregateCell),
+    /// Absent; this empty slot is where it would go.
+    Vacant(usize),
+    /// Absent, with no empty slot within `MAX_PROBE` of its home.
+    Full,
 }
 
 /// Read-side view of the SHM-resident hash table. Carries a borrowed slot
@@ -95,37 +142,34 @@ impl<'a> AggregateTable<'a> {
         self.slots.len() - 1
     }
 
-    /// Reader: probe forward, return the stored count for
-    /// `(rule_fingerprint, key_hash, bucket)`. Returns `None` when the slot is
-    /// empty (the key has never been written) or when probing terminates
-    /// without a hit.
+    /// The stored count for `(rule_fingerprint, key_hash, bucket)`, or
+    /// `None` when it is absent (or being written or moved right now).
     pub fn get(&self, fp: u128, kh: u128, bucket: u32) -> Option<AggregateCell> {
-        let mut probe = mix_index(fp, kh, bucket) & self.mask();
-        let capacity = self.slots.len();
-        let mut walked = 0;
-        while walked < capacity {
-            let cell = self.read_slot(probe);
-            match cell {
-                ProbeResult::Empty => return None,
-                ProbeResult::Tombstone => {
-                    probe = (probe + 1) & self.mask();
-                    walked += 1;
-                    continue;
+        match self.probe(fp, kh, bucket) {
+            Probe::Found(_, cell) => Some(cell),
+            Probe::Vacant(_) | Probe::Full => None,
+        }
+    }
+
+    /// Walk at most `MAX_PROBE` slots from the cell's home, stopping at the
+    /// cell or at the first empty slot.
+    fn probe(&self, fp: u128, kh: u128, bucket: u32) -> Probe {
+        let home = mix_index(fp, kh, bucket) & self.mask();
+        for distance in 0..MAX_PROBE {
+            let index = (home + distance) & self.mask();
+            match self.slots[index].read() {
+                Read::Empty => return Probe::Vacant(index),
+                Read::Live(cell)
+                    if cell.rule_fingerprint == fp
+                        && cell.key_hash == kh
+                        && cell.bucket == bucket =>
+                {
+                    return Probe::Found(index, cell);
                 }
-                ProbeResult::Filled(cell) => {
-                    if cell.rule_fingerprint == fp && cell.key_hash == kh && cell.bucket == bucket {
-                        return Some(cell);
-                    }
-                    probe = (probe + 1) & self.mask();
-                    walked += 1;
-                }
-                ProbeResult::Retry => {
-                    // Mid-write; spin and re-read the same slot.
-                    std::hint::spin_loop();
-                }
+                Read::Live(_) | Read::Busy => {}
             }
         }
-        None
+        Probe::Full
     }
 
     /// Sum the counts for the live `[bucket - live_buckets + 1 .. bucket]`
@@ -178,197 +222,112 @@ impl<'a> AggregateTable<'a> {
             },
         )
     }
-
-    fn read_slot(&self, index: usize) -> ProbeResult {
-        let slot = &self.slots[index];
-        let s1 = slot.seq.load(Ordering::Acquire);
-        if s1 == 0 {
-            return ProbeResult::Empty;
-        }
-        if s1 == TOMBSTONE {
-            return ProbeResult::Tombstone;
-        }
-        if s1 & 1 == 1 {
-            return ProbeResult::Retry;
-        }
-        let fp = ((slot.rule_fingerprint_hi.load(Ordering::Relaxed) as u128) << 64)
-            | slot.rule_fingerprint_lo.load(Ordering::Relaxed) as u128;
-        let kh = ((slot.key_hash_hi.load(Ordering::Relaxed) as u128) << 64)
-            | slot.key_hash_lo.load(Ordering::Relaxed) as u128;
-        let bucket = slot.bucket.load(Ordering::Relaxed) as u32;
-        let count = slot.count.load(Ordering::Relaxed);
-        let last_update_millis = slot.last_update_millis.load(Ordering::Relaxed);
-        let s2 = slot.seq.load(Ordering::Acquire);
-        if s1 != s2 {
-            return ProbeResult::Retry;
-        }
-        ProbeResult::Filled(AggregateCell {
-            rule_fingerprint: fp,
-            key_hash: kh,
-            bucket,
-            count,
-            last_update_millis,
-        })
-    }
-}
-
-enum ProbeResult {
-    Empty,
-    Tombstone,
-    Retry,
-    Filled(AggregateCell),
 }
 
 /// `AggregateStore<u32>` implementation backed by SHM. Only the gossip
 /// leader's thread owns one of these; readers use `AggregateTable`
-/// directly. Holds a raw pointer so the type is naturally `!Send + !Sync`.
+/// directly. `Cell` keeps it `!Sync`.
+///
+/// Every slot is an atomic, so a second writer could not cause undefined
+/// behaviour, only wrong counts; the gossip leader lease keeps the writer
+/// single across processes.
 pub struct ShmAggregateStore {
-    slots_ptr: *mut AggregateSlot,
-    capacity: usize,
+    region: ShmRegion,
     next_write_seq: Cell<u64>,
 }
 
 impl ShmAggregateStore {
-    /// # Safety
-    /// All of the following must hold for the lifetime of the returned
-    /// `ShmAggregateStore`:
-    ///
-    /// * `slots_ptr` is non-null, properly aligned for `AggregateSlot`, and
-    ///   points to the first element of a contiguous region of exactly
-    ///   `capacity` `AggregateSlot` values that have been fully initialized
-    ///   (e.g. via `AggregateSlot::empty()` performed by the nginx master
-    ///   before fork).
-    /// * `capacity` is a power of two, at least 2, and the total size `capacity
-    ///   * size_of::<AggregateSlot>()` does not exceed `isize::MAX` (this is
-    ///     naturally satisfied by any realistic SHM region size).
-    /// * The backing memory remains live and mapped for as long as this store —
-    ///   and any `AggregateTable<'_>` derived from it via `view()` — is in use.
-    ///   In practice that means the `MAP_SHARED | MAP_ANONYMOUS` region
-    ///   established by the nginx master must not be unmapped while a worker or
-    ///   the leader still references it; the mapping is effectively `'static`
-    ///   from the leader's perspective.
-    /// * The caller upholds the single-writer invariant: at most one
-    ///   `ShmAggregateStore` may issue mutating calls (`write_delta` /
-    ///   `write_expiration` / `apply`) against this backing region at a time.
-    ///   The store is `!Send + !Sync` (because of `*mut _` and `Cell`), so this
-    ///   is enforced at the thread level by the type system; the cross-process
-    ///   exclusion is upheld by the gossip leader election.
-    /// * Concurrent readers (other processes/threads holding an
-    ///   `AggregateTable<'_>` over the same region) are permitted: every
-    ///   per-slot field is an `AtomicU64`, and all writes go through the
-    ///   seqlock protocol (`seq` odd ⇒ mid-write, even ⇒ stable), so there is
-    ///   no data race in the Rust memory model.
-    pub unsafe fn new(slots_ptr: *mut AggregateSlot, capacity: usize) -> Self {
-        debug_assert!(capacity.is_power_of_two() && capacity >= 2);
+    pub fn new(region: ShmRegion) -> Self {
         Self {
-            slots_ptr,
-            capacity,
+            region,
             next_write_seq: Cell::new(2),
         }
     }
 
-    fn slots(&self) -> &[AggregateSlot] {
-        // SAFETY: By the contract of `ShmAggregateStore::new`, `slots_ptr`
-        // points to `capacity` fully-initialized, properly-aligned
-        // `AggregateSlot`s in a region that stays mapped for the lifetime of
-        // `self`. All fields are `AtomicU64`, so concurrent readers holding
-        // `&[AggregateSlot]` over the same region and our own atomic stores
-        // through `slots_ptr` do not violate Rust's aliasing rules: shared
-        // `&` references to atomic types permit interior mutation, and we
-        // never hand out a `&mut AggregateSlot`. The returned slice borrows
-        // from `&self`, so its lifetime cannot outlive the store, and the
-        // total byte length `capacity * size_of::<AggregateSlot>()` fits in
-        // `isize` per the same `new` contract.
-        unsafe { std::slice::from_raw_parts(self.slots_ptr, self.capacity) }
-    }
-
-    fn mask(&self) -> usize {
-        self.capacity - 1
-    }
-
-    /// Locate the slot for `(fp, kh, bucket)`, returning `(index,
-    /// was_present)`. On a miss returns the first empty/tombstone slot
-    /// encountered. Returns `None` only when the entire table is full of
-    /// live keys (rare; treated as a drop).
-    fn probe_for_write(&self, fp: u128, kh: u128, bucket: u32) -> Option<(usize, bool)> {
-        let slots = self.slots();
-        let mut probe = mix_index(fp, kh, bucket) & self.mask();
-        let mut first_vacancy: Option<usize> = None;
-        for _ in 0..self.capacity {
-            let slot = &slots[probe];
-            let seq = slot.seq.load(Ordering::Acquire);
-            if seq == 0 {
-                return Some((first_vacancy.unwrap_or(probe), false));
-            }
-            if seq == TOMBSTONE {
-                if first_vacancy.is_none() {
-                    first_vacancy = Some(probe);
-                }
-                probe = (probe + 1) & self.mask();
-                continue;
-            }
-            if slot.matches(fp, kh, bucket) {
-                return Some((probe, true));
-            }
-            probe = (probe + 1) & self.mask();
-        }
-        first_vacancy.map(|i| (i, false))
-    }
-
-    fn next_seq(&self) -> u64 {
-        // Even sequences only (odd = mid-write); the writer bumps by 1 inside
-        // each apply and the visible "stable" value is even.
-        let s = self.next_write_seq.get();
-        self.next_write_seq.set(s.wrapping_add(2));
-        s
+    fn write(&self, slot: &AggregateSlot, cell: AggregateCell) {
+        // Even sequences only; `AggregateSlot::write` publishes `seq - 1`
+        // (odd) while the fields change.
+        let seq = self.next_write_seq.get();
+        self.next_write_seq.set(seq.wrapping_add(2));
+        slot.write(seq, cell);
     }
 
     pub(crate) fn write_delta(&self, fp: u128, kh: u128, bucket: u32, delta: u64, now_millis: u64) {
-        let Some((index, present)) = self.probe_for_write(fp, kh, bucket) else {
-            return;
+        let table = self.region.aggregate();
+        let (index, count) = match table.probe(fp, kh, bucket) {
+            Probe::Found(index, cell) => (index, cell.count.saturating_add(delta)),
+            Probe::Vacant(index) => (index, delta),
+            Probe::Full => return self.note_dropped_write(),
         };
-        let slot = &self.slots()[index];
-        let new_seq = self.next_seq();
-        slot.seq.store(new_seq.wrapping_sub(1), Ordering::Release); // odd
-        if !present {
-            slot.write_identity(fp, kh, bucket);
-            slot.count.store(delta, Ordering::Relaxed);
-        } else {
-            let cur = slot.count.load(Ordering::Relaxed);
-            slot.count
-                .store(cur.saturating_add(delta), Ordering::Relaxed);
-        }
-        slot.last_update_millis.store(now_millis, Ordering::Relaxed);
-        slot.seq.store(new_seq, Ordering::Release); // even
+        let cell = AggregateCell {
+            rule_fingerprint: fp,
+            key_hash: kh,
+            bucket,
+            count,
+            last_update_millis: now_millis,
+        };
+        self.write(&table.slots[index], cell);
     }
 
     fn write_expiration(&self, fp: u128, kh: u128, bucket: u32, last_count: u64) {
-        let Some((index, present)) = self.probe_for_write(fp, kh, bucket) else {
+        let table = self.region.aggregate();
+        let Probe::Found(index, mut cell) = table.probe(fp, kh, bucket) else {
             return;
         };
-        if !present {
-            return;
-        }
-        let slot = &self.slots()[index];
-        let new_seq = self.next_seq();
-        slot.seq.store(new_seq.wrapping_sub(1), Ordering::Release);
-        let cur = slot.count.load(Ordering::Relaxed);
-        let next = cur.saturating_sub(last_count);
-        slot.count.store(next, Ordering::Relaxed);
-        if next == 0 {
-            // Convert to tombstone so subsequent reads see the cell as gone.
-            slot.seq.store(TOMBSTONE, Ordering::Release);
+        cell.count = cell.count.saturating_sub(last_count);
+        if cell.count == 0 {
+            self.remove(table, index);
         } else {
-            slot.seq.store(new_seq, Ordering::Release);
+            self.write(&table.slots[index], cell);
         }
     }
 
-    pub fn view(&self) -> AggregateTable<'_> {
-        AggregateTable::from_slots(self.slots())
+    /// Free slot `hole`, then pull each later cell of its run that may sit
+    /// there (its home is at or before the hole) back into it, until an
+    /// empty slot or `MAX_PROBE` slots without such a cell. No cell further
+    /// on can have its home at or before the hole, so the last hole becomes
+    /// empty. A moved cell is copied before its old slot is reused, so a
+    /// reader finds it in one place or the other unless the reader passed
+    /// the new slot before the copy landed.
+    fn remove(&self, table: AggregateTable<'_>, mut hole: usize) {
+        let mut gap = 0;
+        while gap < MAX_PROBE {
+            gap += 1;
+            let index = (hole + gap) & table.mask();
+            match table.slots[index].read() {
+                Read::Empty => break,
+                Read::Live(cell) => {
+                    let home = mix_index(cell.rule_fingerprint, cell.key_hash, cell.bucket);
+                    if index.wrapping_sub(home) & table.mask() >= gap {
+                        self.write(&table.slots[hole], cell);
+                        hole = index;
+                        gap = 0;
+                    }
+                }
+                // Only a slot a crashed leader left mid-write reads busy to
+                // the writer; it stays put.
+                Read::Busy => {}
+            }
+        }
+        table.slots[hole].seq.store(0, Ordering::Release);
     }
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
+    /// The table had no free slot near this cell's home, so its count was
+    /// not recorded.
+    fn note_dropped_write(&self) {
+        let n = self.region.stats().record_aggregate_drop();
+        if n.is_power_of_two() {
+            tracing::warn!(
+                capacity = self.region.layout().aggregate_capacity,
+                dropped_total = n,
+                "gabion: the shared-memory count table had no free slot for a rate-limit key, so \
+                 that key's hits were not counted: its requests were allowed and it is now \
+                 under-counted. The table needs a slot per rule × active key × live bucket \
+                 (window / bucket + 1), and this zone is too small for the current traffic. Raise \
+                 SIZE in `gabion_limit_zone zone=NAME:SIZE`: each doubling of SIZE doubles the \
+                 slots (64m holds 524288), and the table works best under half full.",
+            );
+        }
     }
 }
 
