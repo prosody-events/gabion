@@ -83,10 +83,12 @@ the resulting `.so`:
 make nginx-module
 ```
 
-Override the base image:
+Override the base image with another digest-pinned flavor
+(`stable-alpine`, `mainline-alpine`, `stable`, `mainline`) or any image
+reference:
 
 ```sh
-NGINX_BASE_IMAGE=nginx:mainline-alpine make nginx-module
+NGINX_BASE=mainline-alpine make nginx-module
 ```
 
 ## Run the request-level assertions
@@ -112,14 +114,14 @@ make openresty-matrix
 ```
 
 Both targets wrap a shell script, so you can override the matrix by
-passing bases explicitly to either one, or drive the OpenResty
-Dockerfile directly for a one-off build:
+passing bases (flavors or image references) explicitly to either one,
+or drive the OpenResty Dockerfile directly for a one-off build:
 
 ```sh
 sh deploy/nginx/build-matrix.sh nginx:1.27-alpine nginx:1.27
 sh deploy/nginx/build-openresty-matrix.sh openresty/openresty:alpine
 docker build -f deploy/nginx/Dockerfile.openresty \
-  --build-arg OPENRESTY_BASE_IMAGE=openresty/openresty:alpine \
+  --build-arg OPENRESTY_BASE=alpine \
   -t gabion-openresty:alpine .
 ```
 

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:alpine AS chef
+FROM rust:alpine@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87 AS chef
 
 RUN apk add --no-cache cargo-chef musl-dev
 
@@ -35,7 +35,7 @@ RUN cargo build -p gabion-server --release --bin gabiond --no-default-features \
     && cp target/release/gabiond /out/gabiond \
     && rm -rf target
 
-FROM alpine:3.24
+FROM alpine:3.24@sha256:71e9b7bae160ba167fa17414401b94cbcdaf3c32feeab9298bd794a2a0614c35
 
 RUN apk add --no-cache ca-certificates
 

@@ -91,7 +91,7 @@ jobs:
           docker buildx build \
             --load \
             --target smoke \
-            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --build-arg NGINX_BASE=stable-alpine \
             --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
             -f deploy/nginx/Dockerfile \
             -t nginx-nginx-module-smoke:latest \
@@ -147,7 +147,7 @@ jobs:
           docker buildx build \
             --load \
             --target smoke \
-            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --build-arg NGINX_BASE=stable-alpine \
             --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
             -f deploy/nginx/Dockerfile \
             -t nginx-nginx-module-request-smoke:latest \

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:alpine AS chef
+FROM rust:alpine@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87 AS chef
 RUN apk add --no-cache cargo-chef musl-dev
 WORKDIR /workspace
 
@@ -22,7 +22,7 @@ RUN cargo build -p gabion-loader --release \
     && cp target/release/gabion-loader /out/gabion-loader \
     && rm -rf target
 
-FROM alpine:3.24
+FROM alpine:3.24@sha256:71e9b7bae160ba167fa17414401b94cbcdaf3c32feeab9298bd794a2a0614c35
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /out/gabion-loader /usr/local/bin/gabion-loader
 ENTRYPOINT ["/usr/local/bin/gabion-loader"]

@@ -31,7 +31,7 @@ services:
       dockerfile: deploy/nginx/Dockerfile
       target: smoke
       args:
-        NGINX_BASE_IMAGE: ${NGINX_BASE_IMAGE:-nginx:stable-alpine}
+        NGINX_BASE: ${NGINX_BASE:-stable-alpine}
     profiles: ["module"]
     ulimits:
       core: -1
@@ -52,7 +52,7 @@ services:
       dockerfile: deploy/nginx/Dockerfile
       target: smoke
       args:
-        NGINX_BASE_IMAGE: ${NGINX_BASE_IMAGE:-nginx:stable-alpine}
+        NGINX_BASE: ${NGINX_BASE:-stable-alpine}
     profiles: ["module"]
     ulimits:
       core: -1

@@ -1,10 +1,16 @@
 # syntax=docker/dockerfile:1.7
 
-ARG OPENRESTY_BASE_IMAGE=openresty/openresty:alpine
+# `OPENRESTY_BASE` names a digest-pinned flavor stage or any other image.
+# See deploy/nginx/Dockerfile.
+ARG OPENRESTY_BASE=alpine
 
-FROM ${OPENRESTY_BASE_IMAGE} AS chef
+FROM openresty/openresty:alpine@sha256:2f09322c11964de09cbc53c9dbda84ed299a9f777a5824a67a46c85260bcda92 AS alpine
+FROM openresty/openresty:jammy@sha256:a6affc809243f6f911345a69e6ab55295ba9df78038c3c96fa38f7cd5ab2d090 AS jammy
+FROM openresty/openresty:bookworm@sha256:93c2dd73fa3573fbe648b51496d271614b108d806eb0a9294dab4cfe65b93f6b AS bookworm
 
-ARG OPENRESTY_BASE_IMAGE=openresty/openresty:alpine
+FROM ${OPENRESTY_BASE} AS chef
+
+ARG OPENRESTY_BASE
 
 SHELL ["/bin/sh", "-euxc"]
 
@@ -48,7 +54,7 @@ RUN if command -v apk >/dev/null 2>&1; then \
             | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path; \
         ln -s /root/.cargo/bin/cargo /root/.cargo/bin/rustc /usr/local/bin/; \
     else \
-        echo "Unsupported OpenResty base image package manager: ${OPENRESTY_BASE_IMAGE}" >&2; \
+        echo "Unsupported OpenResty base image package manager: ${OPENRESTY_BASE}" >&2; \
         exit 1; \
     fi
 
@@ -106,7 +112,7 @@ RUN . /workspace/openresty-nginx-build.env \
     && cp target/release/libgabion_nginx.so /out/ngx_http_gabion_module.so \
     && rm -rf target
 
-FROM ${OPENRESTY_BASE_IMAGE} AS published
+FROM ${OPENRESTY_BASE} AS published
 
 COPY --from=module-builder /out/ngx_http_gabion_module.so /usr/local/openresty/nginx/modules/ngx_http_gabion_module.so
 COPY deploy/nginx/gabion-load-module.openresty.conf /usr/local/openresty/nginx/conf/gabion-load-module.conf

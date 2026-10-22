@@ -1,10 +1,19 @@
 # syntax=docker/dockerfile:1.7
 
-ARG NGINX_BASE_IMAGE=nginx:stable-alpine
+# `NGINX_BASE` names one of the digest-pinned flavor stages below, which
+# Dependabot keeps current, or any other image for a one-off local build
+# (`--build-arg NGINX_BASE=nginx:1.27-alpine`). Only the selected stage
+# is pulled.
+ARG NGINX_BASE=stable-alpine
 
-FROM ${NGINX_BASE_IMAGE} AS chef
+FROM nginx:stable-alpine@sha256:47928bf67eb62a1863cb08d9ecb52d3e704304ba614eaee17884204677702951 AS stable-alpine
+FROM nginx:mainline-alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417 AS mainline-alpine
+FROM nginx:stable@sha256:a7675fcee220f59b4a99f7098c06a0d5d999c2c0ee37c0211efb780536e5cb20 AS stable
+FROM nginx:mainline@sha256:4c41e2d0a3a55b325ed572cd0200bdb72af1433c3daa2bca6ef8eea68ce504a2 AS mainline
 
-ARG NGINX_BASE_IMAGE=nginx:stable-alpine
+FROM ${NGINX_BASE} AS chef
+
+ARG NGINX_BASE
 
 SHELL ["/bin/sh", "-euxc"]
 
@@ -44,7 +53,7 @@ RUN if command -v apk >/dev/null 2>&1; then \
             | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path; \
         ln -s /root/.cargo/bin/cargo /root/.cargo/bin/rustc /usr/local/bin/; \
     else \
-        echo "Unsupported nginx base image package manager: ${NGINX_BASE_IMAGE}" >&2; \
+        echo "Unsupported nginx base image package manager: ${NGINX_BASE}" >&2; \
         exit 1; \
     fi
 
@@ -89,7 +98,7 @@ RUN nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
     && cp target/release/libgabion_nginx.so /out/ngx_http_gabion_module.so \
     && rm -rf target
 
-FROM ${NGINX_BASE_IMAGE} AS published
+FROM ${NGINX_BASE} AS published
 
 COPY --from=module-builder /out/ngx_http_gabion_module.so /etc/nginx/modules/ngx_http_gabion_module.so
 COPY deploy/nginx/gabion-load-module.conf /etc/nginx/gabion-load-module.conf

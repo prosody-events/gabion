@@ -8,14 +8,14 @@ context="${GABION_OPENRESTY_CONTEXT:-.}"
 if [ "$#" -gt 0 ]; then
     bases="$*"
 else
-    bases="${GABION_OPENRESTY_BASE_IMAGES:-openresty/openresty:alpine openresty/openresty:bookworm openresty/openresty:bullseye openresty/openresty:jammy openresty/openresty:focal}"
+    bases="${GABION_OPENRESTY_BASES:-alpine bookworm openresty/openresty:bullseye jammy openresty/openresty:focal}"
 fi
 
 for base in $bases; do
     tag="$(printf '%s' "$base" | tr '/:' '--')"
     docker build \
         -f "$dockerfile" \
-        --build-arg "OPENRESTY_BASE_IMAGE=$base" \
+        --build-arg "OPENRESTY_BASE=$base" \
         -t "$repo:$tag" \
         "$context"
 done

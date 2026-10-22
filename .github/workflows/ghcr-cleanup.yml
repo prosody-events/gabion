@@ -7,13 +7,16 @@ on:
   # bounded and predictable.
   pull_request:
     types: [closed]
-  # Weekly safety net: anything `pr-*` or `buildcache-*` older than 30
-  # days gets pruned, in case the close-event handler missed a `pr-` tag
-  # (network blip, fork PR closed before merge, etc.) or a `buildcache-`
-  # scope was retired (a dropped flavor / image) and stopped being
-  # rewritten.
-  schedule:
-    - cron: '0 5 * * 6'
+  # Safety net after every docker build of main: anything `pr-*` or
+  # `buildcache-*` older than 30 days gets pruned, in case the close-event
+  # handler missed a `pr-` tag (network blip, fork PR closed before merge,
+  # etc.) or a `buildcache-` scope was retired (a dropped flavor / image)
+  # and stopped being rewritten. Running after the build means every
+  # active scope was just rewritten, and an idle repo runs no sweep.
+  workflow_run:
+    workflows: [docker]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       max-age-days:
@@ -59,7 +62,10 @@ jobs:
           done
 
   cleanup-orphans:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request'
+    # Back-to-back main builds queue their sweeps instead of racing to
+    # delete the same versions.
+    concurrency: ghcr-cleanup-orphans
     runs-on: ubuntu-latest
     steps:
       - name: delete pr-* / buildcache-* images older than ${{ inputs.max-age-days || 30 }} days

@@ -4,12 +4,6 @@ on:
   pull_request:
   push:
     branches: [main]
-  schedule:
-    # Weekly kind-cluster smoke on main. The k8s code paths
-    # (`crates/gabion/src/discovery/kubernetes.rs`, the NGINX scale and
-    # mixed gossip scripts) only exercise here — main must not silently
-    # regress.
-    - cron: '0 8 * * 1'
 
 concurrency:
   group: kubernetes-${{ github.workflow }}-${{ github.ref }}
@@ -114,7 +108,7 @@ jobs:
           docker buildx build \
             --load \
             --target smoke \
-            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --build-arg NGINX_BASE=stable-alpine \
             --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
             -f deploy/nginx/Dockerfile \
             -t nginx-nginx-module-request-smoke:latest \
@@ -171,7 +165,7 @@ jobs:
           docker buildx build \
             --load \
             --target smoke \
-            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --build-arg NGINX_BASE=stable-alpine \
             --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
             -f deploy/nginx/Dockerfile \
             -t nginx-nginx-module-request-smoke:latest \
@@ -239,7 +233,7 @@ jobs:
           docker buildx build \
             --load \
             --target smoke \
-            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
+            --build-arg NGINX_BASE=stable-alpine \
             --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
             -f deploy/nginx/Dockerfile \
             -t nginx-nginx-module-request-smoke:latest \

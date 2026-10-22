@@ -8,14 +8,14 @@ context="${GABION_NGINX_CONTEXT:-.}"
 if [ "$#" -gt 0 ]; then
     bases="$*"
 else
-    bases="${GABION_NGINX_BASE_IMAGES:-nginx:stable-alpine nginx:mainline-alpine nginx:stable nginx:mainline}"
+    bases="${GABION_NGINX_BASES:-stable-alpine mainline-alpine stable mainline}"
 fi
 
 for base in $bases; do
     tag="$(printf '%s' "$base" | tr '/:' '--')"
     docker build \
         -f "$dockerfile" \
-        --build-arg "NGINX_BASE_IMAGE=$base" \
+        --build-arg "NGINX_BASE=$base" \
         -t "$repo:$tag" \
         "$context"
 done

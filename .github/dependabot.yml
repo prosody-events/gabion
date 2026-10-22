@@ -18,10 +18,18 @@ updates:
       interval: weekly
     open-pull-requests-limit: 10
 
+  # Every base image is pinned `tag@sha256:digest`; for a non-version tag
+  # (`stable-alpine`, `jammy`, …) Dependabot keeps the tag and bumps the
+  # digest. One grouped PR per week keeps an upstream rebuild to one CI
+  # run.
   - package-ecosystem: docker
     directories:
       - /deploy/gabiond
       - /deploy/kubernetes
+      - /deploy/nginx
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    groups:
+      base-images:
+        patterns: ['*']

@@ -12,7 +12,7 @@
 # Plan jobs pass `all: true`, so every job runs on every event: main
 # still carries the pre-0.32 config, which this cargo-rail cannot read as
 # a comparison base. Once it doesn't, plan jobs pass `all` only on
-# non-pull_request events (push to main, schedule, manual dispatch), so
+# non-pull_request events (push to main, manual dispatch), so
 # gating only ever shrinks PR feedback — never the main or release path.
 
 [plan.work.ci]
