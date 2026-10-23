@@ -234,9 +234,10 @@ deployment; without it, discovery logs `403` and the peer set stays
 empty.
 
 Tuning the gossip cadence is rarely necessary, since the defaults
-converge in well under a second at production scale. When you do tune,
-the two adaptive aspects of the protocol have their own knobs:
-**coverage fanout** (per-tick peer count sized to `⌈ln(n)+c⌉`, scaled by
+converge in under a second in our simulations of clusters up to
+1 024 nodes. When you do tune, the two adaptive aspects of the protocol
+have their own knobs:
+**coverage fanout** (per-round peer count sized to `⌈ln(n)+c⌉`, scaled by
 cluster size) has its floor at `gossip.fanout`; the **adaptive emit rate** (threshold-triggered
 emissions between heartbeats) is governed by `gossip.target_err_bps`
 (per-rule error budget in basis points of the limit) and

@@ -2,14 +2,16 @@
 
 use super::{NodeId, NodeSlot};
 
-/// Per-peer × per-origin frontier: what we last sent to / heard acked from a
-/// given peer for each origin. **Latency optimization only** — convergence
-/// is guaranteed by the repair lane, not by this table.
+/// Per-peer × per-origin frontier: for each peer and origin, the highest
+/// origin sequence among the cells that peer has sent us. The "acked" names
+/// read it as "the peer holds that origin up to here", but the sequence is in
+/// the peer's own numbering (each node re-stamps the cells it merges), so it
+/// is a hint, not an acknowledgement. **Latency optimization only** —
+/// convergence is guaranteed by the repair lane, not by this table.
 #[derive(Clone, Debug)]
 pub struct PeerFrontierTable {
     peer_ids: Box<[Option<NodeId>]>,
     last_acked_seq: Box<[u64]>,
-    last_sent_seq: Box<[u64]>,
     peer_capacity: u16,
     node_capacity: u16,
     full_rejects: u64,
@@ -21,7 +23,6 @@ impl PeerFrontierTable {
         Self {
             peer_ids: vec![None; peer_capacity as usize].into_boxed_slice(),
             last_acked_seq: vec![0_u64; flat].into_boxed_slice(),
-            last_sent_seq: vec![0_u64; flat].into_boxed_slice(),
             peer_capacity,
             node_capacity,
             full_rejects: 0,
@@ -79,7 +80,6 @@ impl PeerFrontierTable {
         let base = (peer_slot as usize) * (self.node_capacity as usize);
         let end = base + self.node_capacity as usize;
         self.last_acked_seq[base..end].fill(0);
-        self.last_sent_seq[base..end].fill(0);
     }
 
     #[inline]
@@ -89,17 +89,6 @@ impl PeerFrontierTable {
 
     pub fn last_acked(&self, peer_slot: u16, node_slot: NodeSlot) -> u64 {
         self.last_acked_seq[self.flat_index(peer_slot, node_slot)]
-    }
-
-    pub fn last_sent(&self, peer_slot: u16, node_slot: NodeSlot) -> u64 {
-        self.last_sent_seq[self.flat_index(peer_slot, node_slot)]
-    }
-
-    pub fn record_sent(&mut self, peer_slot: u16, node_slot: NodeSlot, sequence: u64) {
-        let i = self.flat_index(peer_slot, node_slot);
-        if self.last_sent_seq[i] < sequence {
-            self.last_sent_seq[i] = sequence;
-        }
     }
 
     pub fn record_acked(&mut self, peer_slot: u16, node_slot: NodeSlot, sequence: u64) {
@@ -116,27 +105,6 @@ impl PeerFrontierTable {
         for peer_slot in 0..self.peer_capacity {
             let i = self.flat_index(peer_slot, node_slot);
             self.last_acked_seq[i] = 0;
-            self.last_sent_seq[i] = 0;
-        }
-    }
-
-    /// Brute-force "what does this peer lack" scan against the supplied
-    /// origin-sequence column. Used by tests and by digest-mismatch repair.
-    pub fn lacks_indices(
-        &self,
-        peer_slot: u16,
-        active_origins: &[NodeSlot],
-        origin_sequences: &[u64],
-        active_indices: &[u32],
-        out: &mut Vec<u32>,
-    ) {
-        out.clear();
-        for &idx in active_indices {
-            let origin = active_origins[idx as usize];
-            let last = self.last_acked(peer_slot, origin);
-            if origin_sequences[idx as usize] > last {
-                out.push(idx);
-            }
         }
     }
 }

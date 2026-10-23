@@ -1500,7 +1500,7 @@ extern "C" fn set_gossip_fanout(
     set_usize(
         cf,
         conf,
-        "expected a positive integer (peers per tick, e.g. `6`)",
+        "expected a positive integer (floor on peers per round, e.g. `3`)",
         |main, value| {
             main.gossip.fanout = value.max(1);
         },
@@ -1577,7 +1577,7 @@ extern "C" fn set_gossip_max_cells_per_tick(
     set_usize(
         cf,
         conf,
-        "expected a positive integer (cells/tick)",
+        "expected a positive integer (cells per frame, per peer, per round)",
         |main, value| {
             main.gossip.max_cells_per_tick = value.max(1);
         },

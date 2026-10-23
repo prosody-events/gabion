@@ -24,7 +24,7 @@ use crate::crdt::{
 use crate::discovery::{Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
-use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
+use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance, sim_advance_ticks};
 use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, parse_cluster_id};
 use crate::wire::HmacKey;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -567,7 +567,7 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
 /// `(rule 0, key 0)` cell never reached node 1 because the peer-frontier
 /// high-watermark sat at that cell's (locally re-stamped) sequence, so every
 /// send lane — including repair — pruned it via `peer_lacks`. With the repair
-/// lane ungated (see `CellStore::fill_gossip_frame_for_peer`) the cluster
+/// lane ungated (see `CellStore::fill_gossip_frame`) the cluster
 /// converges. Pinned as a fast `#[test]` so the fix cannot regress behind the
 /// ~1-in-100k random trigger.
 #[test]
@@ -1374,7 +1374,8 @@ async fn gossip_tick_picks_peers_without_replacement() {
             let agg_c = Rc::new(InMemoryAggregateStore::<u32>::new());
             let agg_d = Rc::new(InMemoryAggregateStore::<u32>::new());
 
-            // A talks to B, C, D with fanout=3 — every tick must hit each.
+            // A talks to B, C, D with fanout=3 — a round with changes hits
+            // each.
             let mut cfg_a = sim_config(id_a, vec![addr_b, addr_c, addr_d], 0xBAD_5EED);
             cfg_a.fanout = 3;
             let (rt_a, client_a) = GossipRuntime::from_parts(
@@ -1667,7 +1668,9 @@ async fn admin_snapshot_reflects_runtime_state() {
             assert_eq!(snapshot.peers[0].addr, sock(40_301));
             assert!(snapshot.peers[0].node_id.is_none());
             assert!(snapshot.store_stats.active_cells >= 1);
-            assert!(snapshot.local_dirty_len >= 1);
+            // The record crossed its error budget, so the threshold round
+            // that runs before the admin arm sent it and cleared the ring.
+            assert_eq!(snapshot.local_dirty_len, 0);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;
@@ -1890,13 +1893,16 @@ fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
             peer_clients.push(client);
         }
 
-        // One record so the sender has dirty data to gossip every tick.
-        client_sender
-            .record(0xB055, KeyHash(1), 0, 1, 0, 0)
-            .await
-            .unwrap();
-
-        sim_advance_ticks(Duration::from_millis(100), TICKS).await;
+        // A record before every tick, so every round has a fresh change for
+        // each pick; a round sends each change once. The high limit keeps
+        // the error budget from adding threshold rounds.
+        for _ in 0..TICKS {
+            client_sender
+                .record(0xB055, KeyHash(1), 0, 1, 1_000_000, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 1).await;
+        }
 
         let counts: Vec<u64> = peer_addrs
             .iter()
@@ -2094,6 +2100,97 @@ async fn send_queue_drains_after_recipient_backpressure() {
 
             client_a.shutdown().await.unwrap();
             let _ = h_a.await;
+        })
+        .await;
+}
+
+/// A round sends each change once, to every pick. Later heartbeats with no
+/// new changes carry only the repair slice, to a single pick.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn round_sends_each_change_once_then_repairs_one_pick() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            const PEERS: u16 = 8;
+            let router = SimRouter::new();
+            let peers: Vec<SocketAddr> = (1..=PEERS).map(|i| sock(52_000 + i)).collect();
+            // Bound but never run, so the peers only count what arrives.
+            let _inboxes: Vec<_> = peers.iter().map(|addr| router.bind(*addr)).collect();
+            let id = NodeIdentity::new(NodeId(0xC0), 1);
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(sock(52_000)),
+                TokioClock::from_millis(0),
+                sim_config(id, peers.clone(), 7),
+                store_for(id),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+            let received = || -> u64 { peers.iter().map(|a| router.received_count(*a)).sum() };
+
+            // The high limit keeps the error budget from adding threshold
+            // rounds; the first heartbeat fires at t = 0.
+            client
+                .record(0xC05, KeyHash(1), 0, 1, 1_000_000, 0)
+                .await
+                .unwrap();
+            sim_advance(Duration::from_millis(50)).await;
+            let picks = ((f64::from(PEERS)).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN)
+                .ceil()
+                .min(f64::from(PEERS)) as u64;
+            assert_eq!(received(), picks);
+
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert_eq!(received(), picks + 5);
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
+        })
+        .await;
+}
+
+/// More than 255 send slots are all usable: slot indices used to be `u8`,
+/// so a capacity of 300 silently shrank to 44.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn send_queue_uses_every_slot_past_255() {
+    use tokio::sync::mpsc;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            const CELLS: u128 = 300;
+            let router = SimRouter::with_channel_capacity(1);
+            let addr_b = sock(53_001);
+            // Bound but never run, so every packet past the first queues.
+            let _inbox = router.bind(addr_b);
+            let id = NodeIdentity::new(NodeId(0xD0), 1);
+            let mut cfg = sim_config(id, vec![addr_b], 1);
+            cfg.send_queue_capacity = CELLS as usize;
+            // One cell per packet, so the round needs a slot per cell.
+            cfg.wire_limits.max_payload_bytes = 160;
+            let (admin_tx, admin_rx) = mpsc::channel(4);
+            let (rt, client) = GossipRuntime::from_parts_with_admin(
+                router.bind(sock(53_000)),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(id),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+            for key in 0..CELLS {
+                client
+                    .record(0xD05, KeyHash(key), 0, 1, 1_000_000, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 2).await;
+
+            let depth = admin_snapshot(&admin_tx).await.max_send_pending_depth;
+            assert!(depth > 255, "send queue peaked at {depth} slots");
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
         })
         .await;
 }

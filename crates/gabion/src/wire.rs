@@ -169,7 +169,8 @@ fn min_payload_bytes(count_size: usize, auth_overhead: usize) -> usize {
 ///
 /// `#[must_use]` so undrained iterators warn at compile time. The `Drop`
 /// impl additionally debug-asserts that the iterator was drained, so silent
-/// data-loss bugs trip a panic in tests and debug builds.
+/// data-loss bugs trip a panic in tests and debug builds. To send only part
+/// of a frame on purpose, call [`Packets::abandon`].
 #[must_use = "drain Packets to send every cell — undrained handles are lost"]
 pub struct Packets<'a, C: Count> {
     header: Header,
@@ -250,6 +251,15 @@ impl<'a, C: Count> Packets<'a, C> {
     /// Handles still to be encoded into a packet.
     pub fn remaining(&self) -> usize {
         self.handles.len() - self.cursor
+    }
+
+    /// Stop early: give up the handles not yet encoded and return how many
+    /// there were. The explicit way to send part of a frame; dropping an
+    /// undrained iterator is a bug.
+    pub fn abandon(mut self) -> usize {
+        let unsent = self.remaining();
+        self.cursor = self.handles.len();
+        unsent
     }
 
     /// Encode the next packet into `buf`. The encoder clears `buf` first.

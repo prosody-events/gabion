@@ -15,10 +15,11 @@
 //! per freed cell — so an external aggregate store can keep its summary
 //! consistent with the CRDT's active set.
 //!
-//! Two dirty rings track recent changes — `local_dirty` for cells whose
-//! origin is this node, `forwarded_dirty` for cells learned from peers. A
-//! third lane, the repair cursor, rotates over the entire active set so
-//! anti-entropy still converges when the dirty rings overflow.
+//! Two dirty rings track the changes since the last gossip round —
+//! `local_dirty` for cells whose origin is this node, `forwarded_dirty` for
+//! cells learned from peers. A third lane, the repair cursor, rotates over the
+//! entire active set so anti-entropy still converges when a ring overflows or
+//! a round's one-shot send is lost, cut, or pruned.
 //!
 //! Slot lifecycle uses an intrusive freelist (`free_next` linking inactive
 //! slots) and a generation counter per slot (low bit = active flag, high
@@ -789,10 +790,12 @@ impl<C: Count> CellStore<C> {
                 tracing::warn!(
                     overflow_total = after,
                     capacity = self.local_dirty.capacity(),
-                    "Local gossip dirty ring overflowed. Recent local changes are being \
-                     overwritten before gossip can send them; peers may lag until the repair lane \
-                     catches up. Raise `storage.local_dirty_capacity` or reduce write/cardinality \
-                     pressure.",
+                    "Local gossip dirty ring overflowed: more local changes arrived between two \
+                     gossip rounds than it holds, so the oldest were overwritten before gossip \
+                     sent them. Usually a burst of new keys, or a gossip loop starved of CPU. \
+                     Peers see those changes late, from the repair lane or the cell's next \
+                     change. Raise `storage.local_dirty_capacity` (nginx: \
+                     `gabion_storage_local_dirty_capacity`).",
                 );
             }
         } else {
@@ -803,10 +806,12 @@ impl<C: Count> CellStore<C> {
                 tracing::warn!(
                     overflow_total = after,
                     capacity = self.forwarded_dirty.capacity(),
-                    "Forwarded gossip dirty ring overflowed. Recently received peer changes are \
-                     being overwritten before they can be forwarded; convergence will depend on \
-                     repair scans. Raise `storage.forwarded_dirty_capacity` or reduce \
-                     write/cardinality pressure.",
+                    "Forwarded gossip dirty ring overflowed: more peer changes were merged \
+                     between two gossip rounds than it holds, so the oldest were overwritten \
+                     before this node forwarded them. Usually a burst of new keys across the \
+                     cluster, or a gossip loop starved of CPU. Other forwarders and the repair \
+                     lane still deliver them. Raise `storage.forwarded_dirty_capacity` (nginx: \
+                     `gabion_storage_forwarded_dirty_capacity`).",
                 );
             }
         }
@@ -1105,7 +1110,9 @@ impl<C: Count> CellStore<C> {
         }
     }
 
-    /// Drop dirty records. Stored cells are untouched.
+    /// Drop dirty records. Stored cells are untouched. The gossip runtime
+    /// calls this after each round, so the dirty lanes only ever hold the
+    /// changes since the last one.
     pub fn clear_dirty(&mut self) {
         self.local_dirty.clear();
         self.forwarded_dirty.clear();
@@ -1155,41 +1162,6 @@ impl<C: Count> CellStore<C> {
         true
     }
 
-    /// Visit dirty cells originating on the local node, newest cell state only.
-    /// `visit` returning `false` halts the scan.
-    ///
-    /// Streams every current entry in the ring through `visit` with no
-    /// intra-call dedup — in contrast to `fill_gossip_frame`, which dedups
-    /// via `selection_marks`. Callers composing multi-lane frames must
-    /// dedup themselves.
-    pub fn visit_local_dirty(&self, mut visit: impl FnMut(CellHandle, &CellStore<C>) -> bool) {
-        for entry in self.local_dirty.iter() {
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !visit(entry.handle, self) {
-                return;
-            }
-        }
-    }
-
-    /// Visit dirty cells originating on other peers.
-    ///
-    /// Streams every current entry in the ring through `visit` with no
-    /// intra-call dedup — in contrast to `fill_gossip_frame`, which dedups
-    /// via `selection_marks`. Callers composing multi-lane frames must
-    /// dedup themselves.
-    pub fn visit_forwarded_dirty(&self, mut visit: impl FnMut(CellHandle, &CellStore<C>) -> bool) {
-        for entry in self.forwarded_dirty.iter() {
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !visit(entry.handle, self) {
-                return;
-            }
-        }
-    }
-
     fn dirty_entry_current(&self, entry: DirtyEntry) -> bool {
         let i = entry.handle.index as usize;
         if i >= self.capacity as usize {
@@ -1204,107 +1176,87 @@ impl<C: Count> CellStore<C> {
         true
     }
 
-    /// Visit a fair rotating slice of active cells. Anti-entropy lane.
-    pub fn visit_repair_slice(
+    /// Fill one outgoing gossip frame with at most `max_cells` handles: the
+    /// local dirty lane, then the forwarded one, each newest first, then up
+    /// to `repair_cells` of the rotating repair slice. Returns how many of
+    /// the handles are changes from the dirty lanes; the rest of `out` is
+    /// repair. `selection_marks` dedups across lanes in O(1).
+    ///
+    /// Newest first because a frame over `max_cells`, or over its pick's share
+    /// of the send queue, loses its tail: keeping the newest changes keeps the
+    /// freshest counts, and a dropped change still reaches the peer through
+    /// other forwarders, the cell's next change, or the repair lane.
+    ///
+    /// With `peer`, the dirty lanes skip a cell whose `origin_sequence` is at
+    /// or below that peer's `last_acked` for the cell's origin. That is a
+    /// **latency optimization only**: the frontier is a per-(peer, origin)
+    /// high-watermark, and because remote cells are re-stamped with the
+    /// merging node's local origin counter (see [`Self::merge_remote`]), the
+    /// watermark can sit above a sequence the peer never actually received —
+    /// a gap it cannot represent. So the repair lane sweeps
+    /// **unconditionally**, without consulting the frontier. That is what
+    /// makes anti-entropy converge under reordering, loss, or a stale
+    /// watermark — the guarantee the [`PeerFrontierTable`] doc comment
+    /// delegates to the repair lane. Pass `None` for a peer with no
+    /// frontier slot yet.
+    pub fn fill_gossip_frame(
         &mut self,
         max_cells: usize,
-        mut visit: impl FnMut(CellHandle) -> bool,
+        repair_cells: usize,
+        peer: Option<u16>,
+        out: &mut Vec<CellHandle>,
     ) -> usize {
-        if self.capacity == 0 || max_cells == 0 || self.active_len == 0 {
-            return 0;
-        }
-        self.bump_selection_epoch();
-        let cap = self.capacity;
-        let mut visited = 0_u32;
-        let mut emitted = 0_usize;
-        let mut next_cursor = self.repair_cursor;
-        while visited < cap && emitted < max_cells {
-            let slot = (self.repair_cursor + visited) % cap;
-            visited += 1;
-            next_cursor = (slot + 1) % cap;
-            if !self.is_active(slot) {
-                continue;
-            }
-            if !self.mark_selected(slot) {
-                continue;
-            }
-            let handle = self.handle_for(slot);
-            emitted += 1;
-            if !visit(handle) {
-                break;
-            }
-        }
-        self.repair_cursor = next_cursor;
-        emitted
-    }
-
-    /// Fill one outgoing gossip frame: local dirty first, then forwarded
-    /// dirty, then a rotating repair slice. Returns the number of handles
-    /// pushed. Uses `selection_marks` for O(1) intra-frame dedup.
-    pub fn fill_gossip_frame(&mut self, max_cells: usize, out: &mut Vec<CellHandle>) -> usize {
         out.clear();
         if max_cells == 0 {
             return 0;
         }
         self.bump_selection_epoch();
+        self.fill_dirty_lane(|store| &store.local_dirty, peer, max_cells, out);
+        self.fill_dirty_lane(|store| &store.forwarded_dirty, peer, max_cells, out);
+        let changes = out.len();
+        self.fill_repair_slice(changes.saturating_add(repair_cells).min(max_cells), out);
+        changes
+    }
 
-        // Lane 1: local dirty.
-        let local_len = self.local_dirty.len();
-        for offset in 0..local_len {
+    /// Push one dirty lane's current entries, newest first, until `out`
+    /// holds `max_cells`.
+    fn fill_dirty_lane(
+        &mut self,
+        ring: impl Fn(&Self) -> &DirtyRing,
+        peer: Option<u16>,
+        max_cells: usize,
+        out: &mut Vec<CellHandle>,
+    ) {
+        for offset in (0..ring(self).len()).rev() {
             if out.len() >= max_cells {
-                break;
+                return;
             }
-            let entry = ring_entry_at(&self.local_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
+            let entry = ring_entry_at(ring(self), offset);
+            if self.dirty_entry_current(entry)
+                && peer.is_none_or(|slot| self.peer_lacks(slot, entry.handle.index as usize))
+                && self.mark_selected(entry.handle.index)
+            {
+                out.push(entry.handle);
             }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
         }
-        if out.len() >= max_cells {
-            return out.len();
-        }
+    }
 
-        // Lane 2: forwarded dirty.
-        let forwarded_len = self.forwarded_dirty.len();
-        for offset in 0..forwarded_len {
-            if out.len() >= max_cells {
-                break;
-            }
-            let entry = ring_entry_at(&self.forwarded_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
-        }
-        if out.len() >= max_cells {
-            return out.len();
-        }
-
-        // Lane 3: rotating repair slice. selection_marks has already been
-        // set for dirty cells in lanes 1+2, so repair cannot re-emit them.
+    /// Advance the repair cursor over active cells not already in this
+    /// frame until `out` holds `end` handles or the cursor has gone round
+    /// once.
+    fn fill_repair_slice(&mut self, end: usize, out: &mut Vec<CellHandle>) {
         let cap = self.capacity;
         let mut visited = 0_u32;
         let mut next_cursor = self.repair_cursor;
-        while visited < cap && out.len() < max_cells {
+        while visited < cap && out.len() < end {
             let slot = (self.repair_cursor + visited) % cap;
             visited += 1;
             next_cursor = (slot + 1) % cap;
-            if !self.is_active(slot) {
-                continue;
+            if self.is_active(slot) && self.mark_selected(slot) {
+                out.push(self.handle_for(slot));
             }
-            if !self.mark_selected(slot) {
-                continue;
-            }
-            out.push(self.handle_for(slot));
         }
         self.repair_cursor = next_cursor;
-        out.len()
     }
 
     /// Convenience wrapper around [`Self::expire`] that derives the per-rule
@@ -1334,105 +1286,6 @@ impl<C: Count> CellStore<C> {
         self.expire(&current, &live, sink);
         self.expire_current_epoch_scratch = current;
         self.expire_live_buckets_scratch = live;
-    }
-
-    /// Peer-aware sibling of [`Self::fill_gossip_frame`]. Walks the same
-    /// three lanes (local dirty → forwarded dirty → repair) in the same
-    /// order, dedup'd via `selection_marks`.
-    ///
-    /// The two dirty lanes prune by the peer frontier — a cell whose
-    /// `origin_sequence` is at or below the peer's recorded `last_acked` for
-    /// that origin is skipped. That is a **latency optimization only**: the
-    /// frontier is a per-(peer, origin) high-watermark, and because remote
-    /// cells are re-stamped with the merging node's local origin counter (see
-    /// [`Self::merge_remote`]), the watermark can sit above a sequence the peer
-    /// never actually received — a gap it cannot represent. So the repair lane
-    /// (lane 3) sweeps the rotating active-set slice **unconditionally**,
-    /// without consulting the frontier. That is what makes anti-entropy
-    /// converge under reordering, loss, or a stale watermark — the guarantee
-    /// the [`PeerFrontierTable`] doc comment delegates to the repair lane.
-    pub fn fill_gossip_frame_for_peer(
-        &mut self,
-        max_cells: usize,
-        peer_slot: u16,
-        out: &mut Vec<CellHandle>,
-    ) -> usize {
-        out.clear();
-        if max_cells == 0 {
-            return 0;
-        }
-        self.bump_selection_epoch();
-
-        // Lane 1: local dirty.
-        let local_len = self.local_dirty.len();
-        for offset in 0..local_len {
-            if out.len() >= max_cells {
-                break;
-            }
-            let entry = ring_entry_at(&self.local_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            let i = entry.handle.index as usize;
-            if !self.peer_lacks(peer_slot, i) {
-                continue;
-            }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
-        }
-        if out.len() >= max_cells {
-            return out.len();
-        }
-
-        // Lane 2: forwarded dirty.
-        let forwarded_len = self.forwarded_dirty.len();
-        for offset in 0..forwarded_len {
-            if out.len() >= max_cells {
-                break;
-            }
-            let entry = ring_entry_at(&self.forwarded_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            let i = entry.handle.index as usize;
-            if !self.peer_lacks(peer_slot, i) {
-                continue;
-            }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
-        }
-        if out.len() >= max_cells {
-            return out.len();
-        }
-
-        // Lane 3: rotating repair slice. Unlike the dirty lanes above, this
-        // does *not* consult `peer_lacks` — the frontier is a gap-blind
-        // high-watermark and cannot be trusted for correctness (see the
-        // method doc). Sweeping every active cell in cursor order, regardless
-        // of the watermark, is what guarantees a cell the frontier wrongly
-        // believes the peer holds still gets re-sent and merged (idempotent
-        // max-merge) until the cluster converges.
-        let cap = self.capacity;
-        let mut visited = 0_u32;
-        let mut next_cursor = self.repair_cursor;
-        while visited < cap && out.len() < max_cells {
-            let slot = (self.repair_cursor + visited) % cap;
-            visited += 1;
-            next_cursor = (slot + 1) % cap;
-            if !self.is_active(slot) {
-                continue;
-            }
-            if !self.mark_selected(slot) {
-                continue;
-            }
-            out.push(self.handle_for(slot));
-        }
-        self.repair_cursor = next_cursor;
-        out.len()
     }
 
     #[inline]

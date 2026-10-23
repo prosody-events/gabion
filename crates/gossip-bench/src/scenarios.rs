@@ -69,13 +69,11 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
         apply_link(&router, &addrs, link);
     }
 
-    // Match (or exceed) the server's production `StorageConfig`
-    // defaults — see `crates/server/src/config.rs::StorageConfig::default`
-    // for the floors. The server ships with cell_capacity=4096,
-    // node_dict=1024, local_dirty=8192, forwarded_dirty=65536,
-    // peer=256. Bench runs scale all of those up further when N
-    // demands it: cell_capacity ≥ 4·N (4096 floor) so per-origin cells
-    // fit; node_dict ≥ N+16 (1024 floor); peer ≥ N+16 (256 floor).
+    // Size the stores to the scenario rather than the production
+    // `gabion::defaults::STORAGE_*` (which hold far more cells than any
+    // scenario writes): cell_capacity ≥ 4·N (4096 floor) so per-origin
+    // cells fit; node_dict ≥ N+16 (1024 floor); peer ≥ N+16 (256 floor);
+    // the dirty rings scale with cell_capacity.
     let cell_capacity = scenario
         .cell_capacity
         .max(((scenario.nodes as u32).saturating_mul(4)).max(4_096));
@@ -112,7 +110,7 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
 
         // Match (or exceed) the server's production `GossipSettings`
         // defaults: max_cells_per_frame=4096, max_cells_per_tick=4096,
-        // send_queue=128, limit_queue=8192, max_payload_bytes=1400.
+        // send_queue=512, limit_queue=8192, max_payload_bytes=1400.
         // Bench scales the cell-count caps to 4·N when N is large
         // (one cell per known origin per tick); leaves the queue and
         // payload sizes at the production floors.
@@ -135,7 +133,7 @@ async fn run_inner(scenario: Scenario) -> Result<ScenarioResult> {
                 max_payload_bytes: 1_400,
                 max_cells: max_cells_per_frame,
             },
-            send_queue_capacity: 128,
+            send_queue_capacity: gabion::defaults::GOSSIP_SEND_QUEUE_CAPACITY,
             limit_queue_capacity: 8_192,
             tick_interval: scenario.tick_interval,
             auth_key: None,
