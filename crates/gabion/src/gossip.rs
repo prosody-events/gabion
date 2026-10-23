@@ -55,20 +55,19 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Floor on the number of peers contacted per gossip tick. The runtime
-    /// scales the actual per-tick fanout to the coverage threshold
-    /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
-    /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
-    /// hard minimum when that threshold falls below it.
+    /// Unused by the Plumtree overlay, whose active view is sized by the
+    /// cluster alone (`⌈ln(n) + c⌉` peers, `c` =
+    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]). Kept so adapter configs
+    /// compile unchanged.
     pub fanout: usize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
-    /// tick. The wire codec splits this into multiple packets if needed.
+    /// Cap on the changes one round pushes to one peer, and on the queues of
+    /// changes waiting for a round. The wire codec splits a frame into
+    /// multiple packets if needed.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,
     /// Outbound send queue capacity. Each slot owns a pre-allocated
-    /// [`wire::PacketBuf`].
+    /// [`wire::PacketBuf`]. A frame that finds the queue full loses its tail.
     pub send_queue_capacity: usize,
     /// Capacity of the incoming limit-request mpsc channel.
     pub limit_queue_capacity: usize,
@@ -127,6 +126,42 @@ pub fn parse_cluster_id(value: &str) -> Option<NonZeroU128> {
     u128::from_str_radix(digits, radix)
         .ok()
         .and_then(NonZeroU128::new)
+}
+
+/// Parameters of the Plumtree overlay. The defaults are
+/// [`crate::defaults`]'s `PLUMTREE_*` constants; a runtime takes other values
+/// through [`GossipRuntime::with_plumtree`].
+#[derive(Clone, Copy, Debug)]
+pub struct PlumtreeConfig {
+    /// See [`crate::defaults::PLUMTREE_MISSING_TIMEOUT_MS`].
+    pub missing_timeout: Duration,
+    /// See [`crate::defaults::PLUMTREE_LAZY_TARGETS`].
+    pub lazy_targets: usize,
+    /// See [`crate::defaults::PLUMTREE_FULL_IHAVE_EVERY`].
+    pub full_ihave_every: u32,
+    /// See [`crate::defaults::PLUMTREE_RELAY_FLOOR_MS`].
+    pub relay_floor: Duration,
+    /// See [`crate::defaults::PLUMTREE_NACK_RETRY_MS`].
+    pub nack_retry: Duration,
+    /// See [`crate::defaults::PLUMTREE_EXTRA_RANDOM`].
+    pub extra_random: usize,
+    /// See [`crate::defaults::PLUMTREE_FIRST_CONTACT_PULL`].
+    pub first_contact_pull: bool,
+}
+
+impl Default for PlumtreeConfig {
+    fn default() -> Self {
+        use crate::defaults as d;
+        Self {
+            missing_timeout: Duration::from_millis(d::PLUMTREE_MISSING_TIMEOUT_MS),
+            lazy_targets: d::PLUMTREE_LAZY_TARGETS,
+            full_ihave_every: d::PLUMTREE_FULL_IHAVE_EVERY,
+            relay_floor: Duration::from_millis(d::PLUMTREE_RELAY_FLOOR_MS),
+            nack_retry: Duration::from_millis(d::PLUMTREE_NACK_RETRY_MS),
+            extra_random: d::PLUMTREE_EXTRA_RANDOM,
+            first_contact_pull: d::PLUMTREE_FIRST_CONTACT_PULL,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

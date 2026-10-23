@@ -10,6 +10,59 @@ pub const VERSION: u16 = 1;
 /// receivers that want to defer downstream work until the batch settles.
 pub const FLAG_MORE: u16 = 0x01;
 pub const FLAG_AUTHENTICATED: u16 = 0x02;
+const FRAME_KIND_SHIFT: u16 = 2;
+const FRAME_KIND_MASK: u16 = 0b111 << FRAME_KIND_SHIFT;
+
+/// What a frame is for, carried in three flag bits so a receiver knows how to
+/// treat it before it reads a cell. Cells from every kind merge the same way;
+/// the kind decides what the receiver does *about* them (see
+/// `gossip::runtime::plumtree`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameKind {
+    /// Repair slices and pull replies: merge, never forward.
+    Plain = 0,
+    /// Eager push along a root's tree, numbered per edge (the number rides in
+    /// `min_origin_sequence`). A duplicate here is the PRUNE signal.
+    Eager = 1,
+    /// A lost eager packet sent again under its original edge number: merge
+    /// and forward, but a duplicate says nothing about the tree.
+    Resent = 2,
+    /// The answer to a GRAFT: merge and forward, duplicates expected.
+    Grafted = 3,
+    /// Hybrid random push: merge, forward only once a tree edge delivers the
+    /// same change.
+    Random = 4,
+    /// IHAVE, GRAFT, PRUNE, NACK or PULL: no cells, see [`super::ControlKind`].
+    Control = 5,
+}
+
+impl FrameKind {
+    /// The header flag bits that name this kind.
+    pub const fn flags(self) -> u16 {
+        (self as u16) << FRAME_KIND_SHIFT
+    }
+
+    fn from_flags(flags: u16) -> Option<Self> {
+        match (flags & FRAME_KIND_MASK) >> FRAME_KIND_SHIFT {
+            0 => Some(Self::Plain),
+            1 => Some(Self::Eager),
+            2 => Some(Self::Resent),
+            3 => Some(Self::Grafted),
+            4 => Some(Self::Random),
+            5 => Some(Self::Control),
+            _ => None,
+        }
+    }
+}
+
+/// The kind a packet claims, read without validating or authenticating the
+/// rest of it. Only routes the packet to the right decoder; that decoder
+/// still checks everything. `None` for a packet too short to carry flags or
+/// naming an unknown kind.
+pub fn frame_kind(bytes: &[u8]) -> Option<FrameKind> {
+    let flags = u16::from_le_bytes(bytes.get(6..8)?.try_into().ok()?);
+    FrameKind::from_flags(flags)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {

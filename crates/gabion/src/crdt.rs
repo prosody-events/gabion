@@ -372,8 +372,9 @@ enum UpsertMode<C: Count> {
     /// Local hit. The stored count rises by saturating-adding `hits`.
     Accumulate { hits: u64 },
     /// Remote observation. The stored count rises to `observed` if and only
-    /// if `observed` is strictly greater (CRDT max-merge).
-    MaxMerge { observed: C },
+    /// if `observed` is strictly greater (CRDT max-merge). The cell keeps the
+    /// origin's own `sequence` for that version.
+    MaxMerge { observed: C, sequence: u64 },
 }
 
 impl<C: Count> CellStore<C> {
@@ -776,6 +777,28 @@ impl<C: Count> CellStore<C> {
         *seq
     }
 
+    /// The sequence a cell takes when its count rises. A local hit draws the
+    /// next number from the local counter. A merged version keeps the
+    /// origin's number, and the counter follows it up, so
+    /// [`Self::origin_watermark`] is the highest sequence of that origin held
+    /// here.
+    fn stamp_sequence(&mut self, origin: NodeSlot, mode: &UpsertMode<C>) -> u64 {
+        match *mode {
+            UpsertMode::Accumulate { .. } => self.next_origin_sequence(origin),
+            UpsertMode::MaxMerge { sequence, .. } => {
+                let watermark = &mut self.next_sequence_by_origin[origin as usize];
+                *watermark = (*watermark).max(sequence);
+                sequence
+            }
+        }
+    }
+
+    /// Highest origin sequence held for the origin in `slot`; `0` when no
+    /// cell of that origin is live.
+    pub fn origin_watermark(&self, slot: NodeSlot) -> u64 {
+        self.next_sequence_by_origin[slot as usize]
+    }
+
     fn push_dirty(&mut self, origin: NodeSlot, handle: CellHandle, sequence: u64) {
         let entry = DirtyEntry {
             handle,
@@ -893,7 +916,7 @@ impl<C: Count> CellStore<C> {
             let previous = self.counts[slot as usize];
             let next = match mode {
                 UpsertMode::Accumulate { hits } => previous.saturating_add_hits(hits),
-                UpsertMode::MaxMerge { observed } => {
+                UpsertMode::MaxMerge { observed, .. } => {
                     if observed > previous {
                         observed
                     } else {
@@ -910,7 +933,7 @@ impl<C: Count> CellStore<C> {
             }
             self.counts[slot as usize] = next;
             self.last_update_millis[slot as usize] = now_millis;
-            let seq = self.next_origin_sequence(origin_slot);
+            let seq = self.stamp_sequence(origin_slot, &mode);
             self.origin_sequences[slot as usize] = seq;
             let handle = self.handle_for(slot);
             self.push_dirty(origin_slot, handle, seq);
@@ -933,7 +956,7 @@ impl<C: Count> CellStore<C> {
         };
         let initial = match mode {
             UpsertMode::Accumulate { hits } => C::default().saturating_add_hits(hits),
-            UpsertMode::MaxMerge { observed } => observed,
+            UpsertMode::MaxMerge { observed, .. } => observed,
         };
         self.rules[slot as usize] = rule_slot;
         self.key_hashes[slot as usize] = key_hash;
@@ -942,7 +965,7 @@ impl<C: Count> CellStore<C> {
         self.incarnations[slot as usize] = incarnation;
         self.counts[slot as usize] = initial;
         self.last_update_millis[slot as usize] = now_millis;
-        let seq = self.next_origin_sequence(origin_slot);
+        let seq = self.stamp_sequence(origin_slot, &mode);
         self.origin_sequences[slot as usize] = seq;
 
         // Hold dictionary references on behalf of this cell.
@@ -1050,28 +1073,40 @@ impl<C: Count> CellStore<C> {
     pub fn merge_remote(&mut self, obs: &ObservationBatch<C>, sink: &mut DeltaSink<C>) {
         obs.assert_consistent();
         for i in 0..obs.len() {
-            let Some((rule_slot, node_slot)) = self.translate_identity(
-                obs.rule_fingerprints[i],
-                obs.origin_node_ids[i],
-                obs.incarnations[i],
-            ) else {
-                continue;
-            };
-            let _ = self.upsert(
-                UpsertSpec {
-                    rule_slot,
-                    key_hash: obs.key_hashes[i],
-                    bucket: obs.buckets[i],
-                    origin_slot: node_slot,
-                    incarnation: obs.incarnations[i],
-                    now_millis: obs.last_update_millis[i],
-                    mode: UpsertMode::MaxMerge {
-                        observed: obs.counts[i],
-                    },
-                },
-                sink,
-            );
+            let _ = self.merge_remote_row(obs, i, sink);
         }
+    }
+
+    /// Max-merge row `i` of `obs`. `None` when a full dictionary or cell store
+    /// rejected the row; otherwise the outcome says whether the stored count
+    /// rose. A cell that rises keeps the origin's sequence from the row.
+    pub fn merge_remote_row(
+        &mut self,
+        obs: &ObservationBatch<C>,
+        i: usize,
+        sink: &mut DeltaSink<C>,
+    ) -> Option<UpdateOutcome<C>> {
+        let (rule_slot, node_slot) = self.translate_identity(
+            obs.rule_fingerprints[i],
+            obs.origin_node_ids[i],
+            obs.incarnations[i],
+        )?;
+        self.upsert(
+            UpsertSpec {
+                rule_slot,
+                key_hash: obs.key_hashes[i],
+                bucket: obs.buckets[i],
+                origin_slot: node_slot,
+                incarnation: obs.incarnations[i],
+                now_millis: obs.last_update_millis[i],
+                mode: UpsertMode::MaxMerge {
+                    observed: obs.counts[i],
+                    sequence: obs.origin_sequences[i],
+                },
+            },
+            sink,
+        )
+        .ok()
     }
 
     /// Free cells whose bucket has aged out of the per-rule live window.

@@ -83,6 +83,50 @@ pub const GOSSIP_TARGET_ERR_BPS: u32 = 100;
 /// `GOSSIP_TICK_INTERVAL_MILLIS`).
 pub const GOSSIP_MIN_EMIT_INTERVAL_MS: u64 = 5;
 
+// -- Plumtree dissemination ---------------------------------------------------
+//
+// Parameters of the Plumtree overlay (`gossip::runtime::plumtree`). The first
+// seven are the fields of `gossip::PlumtreeConfig`; the last two size
+// bounded buffers. See "Design notes" in `crates/gabion/README.md`.
+
+/// How long a lazily announced change may stay undelivered before the
+/// announcer is sent a GRAFT, in milliseconds (Leitao et al., SRDS 2007).
+pub const PLUMTREE_MISSING_TIMEOUT_MS: u64 = 500;
+
+/// Lazy peers sent an IHAVE digest per heartbeat. The paper announces to every
+/// lazy peer; capping it bounds the announcement bytes at large views.
+pub const PLUMTREE_LAZY_TARGETS: usize = 2;
+
+/// Every this many heartbeats an IHAVE digest lists every origin the peer is
+/// lazy for, not only those that advanced since the last digest, so a lost
+/// IHAVE costs at most this many heartbeats. `0` never sends the full digest.
+pub const PLUMTREE_FULL_IHAVE_EVERY: u32 = 8;
+
+/// Delay between a change arriving and the relay round that forwards it,
+/// in milliseconds. Batches the changes of one burst into one frame per edge.
+pub const PLUMTREE_RELAY_FLOOR_MS: u64 = 5;
+
+/// How long a NACKed edge packet may stay missing before it is requested
+/// again, in milliseconds.
+pub const PLUMTREE_NACK_RETRY_MS: u64 = 100;
+
+/// Random peers outside the tree that also receive each round's changes (the
+/// "hybrid" variant). `0` is plain Plumtree.
+pub const PLUMTREE_EXTRA_RANDOM: usize = 0;
+
+/// Ask the first peer to show us an origin for that origin's live cells, so a
+/// node that joins or restarts catches up without waiting for the repair
+/// slice to sweep every cell.
+pub const PLUMTREE_FIRST_CONTACT_PULL: bool = true;
+
+/// Cells of the rotating repair slice one random peer receives per heartbeat.
+pub const PLUMTREE_REPAIR_CELLS_PER_HEARTBEAT: usize = 256;
+
+/// Eager packets remembered per node so a NACK can be answered, and the most
+/// cells one remembered packet keeps (a fuller packet cannot be resent).
+pub const PLUMTREE_RESEND_PACKETS: usize = 512;
+pub const PLUMTREE_RESEND_CELLS_PER_PACKET: usize = 48;
+
 pub fn random_rng_seed() -> Result<u64, getrandom::Error> {
     let mut bytes = [0_u8; 8];
     getrandom::fill(&mut bytes)?;

@@ -67,6 +67,7 @@ fn observation<C: Count>(
         incarnation: inc,
         count,
         last_update_millis: ts,
+        origin_sequence: count.into(),
     }
 }
 
@@ -600,6 +601,75 @@ fn quickcheck_repair_lane_sweeps_active_despite_acked_frontier(
         && out.len() == got.len()
         && out.iter().all(|h| store.get(*h).is_some())
         && assert_structural_invariants(&store)
+}
+
+#[test]
+fn merged_cells_keep_the_origins_sequence_and_the_watermark_follows_it() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut sink = DeltaSink::with_capacity(4);
+
+    let mut batch = ObservationBatch::with_capacity(2);
+    let mut first = observation(0x11, 0xabc, 0, 7, 1, 5, 100);
+    first.origin_sequence = 40;
+    let mut second = observation(0x11, 0xdef, 0, 7, 1, 2, 100);
+    second.origin_sequence = 42;
+    batch.push(first);
+    batch.push(second);
+    store.merge_remote(&batch, &mut sink);
+
+    let origin = store.find_node(NodeId(7), 1).unwrap();
+    let sequences: Vec<u64> = store
+        .active_handles()
+        .map(|h| store.get(h).unwrap().origin_sequence)
+        .collect();
+    assert_eq!(sequences, vec![40, 42]);
+    assert_eq!(store.origin_watermark(origin), 42);
+
+    // A later version of the first cell takes the origin's later number; a
+    // stale one changes nothing, and the watermark never moves back.
+    let mut later = observation(0x11, 0xabc, 0, 7, 1, 6, 200);
+    later.origin_sequence = 45;
+    let mut stale = observation(0x11, 0xabc, 0, 7, 1, 3, 200);
+    stale.origin_sequence = 44;
+    batch.clear();
+    batch.push(stale);
+    batch.push(later);
+    sink.clear();
+    store.merge_remote(&batch, &mut sink);
+    assert_eq!(sink.len(), 1);
+    assert_eq!(store.origin_watermark(origin), 45);
+    let kept = store
+        .find_node(NodeId(7), 1)
+        .and_then(|_| store.active_handles().next());
+    assert_eq!(store.get(kept.unwrap()).unwrap().origin_sequence, 45);
+
+    // The local origin still numbers its own hits.
+    let local_slot = store.local_node_slot();
+    let mut obs = ObservationBatch::with_capacity(1);
+    obs.push(observation(0x11, 0x1, 0, 1, 1, 1, 300));
+    store.ingest_local(&obs, &mut sink);
+    assert_eq!(store.origin_watermark(local_slot), 1);
+}
+
+#[test]
+fn merge_remote_row_reports_each_rows_outcome() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut sink = DeltaSink::with_capacity(4);
+    let mut batch = ObservationBatch::with_capacity(3);
+    batch.push(observation(0x11, 0xabc, 0, 7, 1, 5, 100));
+    batch.push(observation(0x11, 0xabc, 0, 7, 1, 5, 100));
+    batch.push(observation(0x11, 0xabc, 0, 7, 1, 4, 100));
+
+    let first = store.merge_remote_row(&batch, 0, &mut sink).unwrap();
+    assert!(first.changed);
+    let again = store.merge_remote_row(&batch, 1, &mut sink).unwrap();
+    assert!(!again.changed);
+    assert_eq!(again.handle, first.handle);
+    let stale = store.merge_remote_row(&batch, 2, &mut sink).unwrap();
+    assert!(!stale.changed);
+    assert_eq!(sink.len(), 1);
 }
 
 #[test]
@@ -1322,6 +1392,7 @@ fn count_widths_compile_and_saturate() {
         incarnation: 1,
         count: u16::MAX,
         last_update_millis: 0,
+        origin_sequence: 0,
     });
     s16.ingest_local(&obs, &mut sink);
     // Add more hits — should saturate at u16::MAX, no overflow.
@@ -1335,6 +1406,7 @@ fn count_widths_compile_and_saturate() {
         incarnation: 1,
         count: 1,
         last_update_millis: 0,
+        origin_sequence: 0,
     });
     s16.ingest_local(&obs2, &mut sink2);
     // No raise because already at MAX.
@@ -1363,6 +1435,7 @@ fn count_widths_compile_and_saturate() {
         incarnation: 1,
         count: 1_000_000_000_000,
         last_update_millis: 0,
+        origin_sequence: 1,
     });
     s64.merge_remote(&obs64, &mut sink64);
     assert_eq!(sink64.current[0], 1_000_000_000_000);
@@ -2235,6 +2308,7 @@ fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
             incarnation: 1,
             count: row.hits,
             last_update_millis: 0,
+            origin_sequence: 0,
         });
         let mut sink = DeltaSink::<u16>::with_capacity(1);
         store.ingest_local(&obs, &mut sink);

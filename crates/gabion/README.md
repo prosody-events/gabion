@@ -17,6 +17,7 @@ the [repo root README](../../README.md#glossary).
 ## Contents
 
 - [Module map](#module-map)
+- [Design notes: Plumtree dissemination](#design-notes-plumtree-dissemination)
 - [How gossip works](#how-gossip-works)
   - [The wire frame](#the-wire-frame)
   - [The anti-entropy loop](#the-anti-entropy-loop)
@@ -48,6 +49,152 @@ module, whereas `wire` and `crdt` are independent of each other.
 nothing else in this crate. Adapters consume the public surface of
 `gossip`, `rules`, and `discovery`, together with the constants in
 `defaults`.
+
+## Design notes: Plumtree dissemination
+
+This branch replaces main's flat dissemination (a fresh random fanout every
+round, forward-once) with **Plumtree**, so that the rest of this README, which
+describes the flat design ("How gossip works", "Coverage fanout", "Dirty rings
+and the peer frontier", the measurements), describes `main` and not this
+branch. What is unchanged is *when* a node originates changes: the 500 ms
+heartbeat and the error-budget threshold rounds with their 5 ms floor, and
+the per-rule `rule_pending` accounting, are main's, including its known
+per-rule threshold shortcomings. What changed is *to whom* a change goes.
+
+Sources: Leitao, Pereira and Rodrigues, *Epidemic Broadcast Trees*, SRDS 2007
+(Plumtree); Leitao, Pereira and Rodrigues, *HyParView*, DSN 2007 (active
+views); and `riak_core_broadcast`, which keeps the eager and lazy sets per
+root rather than for one shared tree. A single shared tree is not used: with
+every node originating concurrently, the wavefronts of different origins meet
+at different edges and keep pruning each other's tree.
+
+### Mechanism
+
+- **Messages.** A message is one change of one origin, named cluster-wide by
+  `(origin, incarnation, origin sequence)`. A merged cell keeps the origin's
+  sequence instead of taking a number from the merging node's counter, so every
+  node names a change the same way, and `CellStore::origin_watermark` is the
+  highest sequence of an origin held here.
+- **Active view.** Each node keeps `⌈ln n + c⌉` random peers (`c` =
+  `GOSSIP_COVERAGE_MARGIN`, 3), a stand-in for HyParView because membership is
+  full. It is a uniform random sample kept by reservoir sampling over discovery
+  events; a departing member is replaced by a random peer from outside. Views
+  are directed, not symmetric: there is no NEIGHBOR handshake, because every node
+  already knows every peer from discovery.
+- **Eager and lazy sets, per root.** For each origin, the view splits into an
+  eager set and a lazy set. A new neighbour, and a root first seen, start
+  eager.
+- **Eager push.** A node pushes the cells of a round to the peers that are eager
+  for their origin, never back to the peer a change came from. Local changes go
+  out in heartbeat and threshold rounds (main's scheduler). A change that
+  arrived from a peer goes out in a relay round `relay_floor` after it arrives,
+  which batches one burst into one frame per edge.
+- **PRUNE.** A duplicate delivery on an *eager* frame (the merge did not raise
+  the cell) makes the receiver send PRUNE for that origin; the sender moves the
+  receiver to its lazy set for that root. One PRUNE per origin per frame.
+- **IHAVE.** Once per heartbeat, `lazy_targets` random lazy peers get an IHAVE
+  digest: for each origin they are lazy for, the highest sequence held. Between
+  full digests (every `full_ihave_every` heartbeats) only origins that advanced
+  past what the peer announced or was told are listed (the peer frontier is the
+  hint).
+- **GRAFT.** An IHAVE naming a sequence above the receiver's watermark starts a
+  `missing_timeout` timer. If the watermark has not caught up when it expires,
+  the receiver sends GRAFT to the announcer, naming the sequence it held when
+  the announcement arrived. The announcer
+  makes the receiver eager for that root again and replies with the origin's
+  live cells above the sequence; the receiver forwards them like any delivery.
+  After three unanswered GRAFTs for an origin the announcement is dropped.
+- **Wire.** Eager frames use the shared cell codec. IHAVE, GRAFT, PRUNE, NACK
+  and PULL are cell-less control frames (`wire::control`): the 72-byte header,
+  28-byte `(origin, incarnation, sequence)` entries, and the HMAC tag when
+  authenticated. The frame kind rides in three flag bits (`wire::FrameKind`);
+  every control byte is counted by the harness like any datagram.
+
+### Parameters
+
+| Parameter | Default | `gabion::defaults` |
+| --- | --- | --- |
+| Active view | `⌈ln n + 3⌉` | `GOSSIP_COVERAGE_MARGIN` |
+| `missing_timeout` | 500 ms | `PLUMTREE_MISSING_TIMEOUT_MS` |
+| `lazy_targets` | 2 | `PLUMTREE_LAZY_TARGETS` |
+| `full_ihave_every` | 8 heartbeats | `PLUMTREE_FULL_IHAVE_EVERY` |
+| `relay_floor` | 5 ms | `PLUMTREE_RELAY_FLOOR_MS` |
+| `nack_retry` | 100 ms | `PLUMTREE_NACK_RETRY_MS` |
+| `extra_random` | 0 | `PLUMTREE_EXTRA_RANDOM` |
+| `first_contact_pull` | on | `PLUMTREE_FIRST_CONTACT_PULL` |
+
+They are the fields of `gossip::PlumtreeConfig`, whose `Default` reads these
+constants. `GossipRuntime::with_plumtree` replaces them; `GossipConfig` is
+unchanged, because adapters and the harness build it field by field.
+`extra_random = 1` is the **hybrid** variant: each round also gives its changes
+to one random peer off the tree of their roots, on frames of kind `Random`.
+Those bytes are data traffic, and a receiver keeps the cells without
+forwarding them.
+
+### Adaptations to gabion
+
+Each is the smallest change that lets the paper's algorithm run here.
+
+1. **Cells are state, not messages.** A cell updated again before it is pushed
+   only ever travels in its newest state, so a round pushes one entry per cell
+   and a skipped sequence number is normal. A "duplicate" is a delivery that did
+   not raise the stored count.
+2. **IHAVE is a per-origin watermark, not a message id.** Because of (1), a
+   receiver cannot tell a lost sequence from a superseded one, so IHAVE
+   announces how far a peer holds an origin. A hole below the watermark is not
+   visible to IHAVE; NACK (3) and the repair slice (8) close it.
+3. **UDP instead of reliable links.** The paper assumes reliable FIFO links.
+   Each eager packet carries a per-edge number in `min_origin_sequence`. A
+   receiver remembers which of the last 64 numbers arrived. A number that
+   skips starts a NACK after one `relay_floor` (datagrams of one burst reorder);
+   the NACK names the window (first number and a bit mask of the missing ones)
+   and repeats every `nack_retry`, at most ten times or until the packet leaves
+   the window. The sender keeps its last 512 eager packets
+   (`PLUMTREE_RESEND_PACKETS`) and resends the cells of a requested one, in
+   their newest state, under its original number (frame kind `Resent`). A packet
+   over 48 cells is not kept.
+4. **Off-tree arrivals.** A version that arrives by repair slice, by pull, or by
+   random push is kept but not forwarded. When the tree later delivers it, that
+   is a first delivery: it is forwarded, and the sender is **not** pruned.
+   Without this a repair slice that wins the race against the tree makes the
+   receiver prune its own parent and drop its subtree.
+5. **Catch-up.** Plumtree has no state transfer, and a node that joins or
+   restarts holds no cells. The first time a node sees an origin it has no
+   cells of (in a frame or an IHAVE), it sends the announcer **PULL**, which is
+   answered with the origin's live cells and does not touch the tree. PULL is
+   separate from GRAFT so that GRAFT is sent only after an announcement timed
+   out.
+6. **Repair slice.** Main's anti-entropy backstop stays, narrowed to 256 cells
+   of the rotating store slice to one random peer per heartbeat
+   (`PLUMTREE_REPAIR_CELLS_PER_HEARTBEAT`). It is not part of Plumtree. It is
+   what keeps the store convergent when a hole is below the watermark, a NACK
+   arrives after its packet left the resend ring, or the resend or
+   announcement bounds above are exhausted.
+7. **Relay round.** The paper forwards on receipt; a relay round waits
+   `relay_floor` to batch. The clock offers only periodic tickers, so the runtime
+   arms one extra ticker per deadline (`arm_wake`).
+8. **`lazy_targets`.** The paper announces to every lazy peer; the spec caps it
+   at 2 per heartbeat. A lost IHAVE is repaired by the full digest.
+
+### Faithfulness checks
+
+| Invariant | Where |
+| --- | --- |
+| PRUNE only on a duplicate *eager* delivery | `handle_data`: only `FrameKind::Eager` rows that did not raise a cell whose version was last seen on the tree |
+| GRAFT only after an IHAVE whose timer expired | `check_timers`; `Missing` records are created only by `on_ihave` |
+| Eager and lazy partition the view, per root | `Plumtree::roots[slot].lazy` is a mask over view positions; eager is `occupied & !lazy` |
+| Relayed cells keep the origin's sequence | `CellStore::merge_remote_row` |
+| Hybrid is data traffic and a parameter | `extra_random`, frame kind `Random` |
+| No shared single tree | per-root masks; there is no root-less state |
+
+### What stays dead on this branch
+
+`GossipConfig::fanout` is a no-op. The store's dirty rings
+(`local_dirty_capacity`, `forwarded_dirty_capacity` are part of the solution
+contract) are cleared after every event and no longer read by the runtime;
+`AdminSnapshot::{local,forwarded}_dirty_len` report the changes queued for
+the next heartbeat/threshold and relay round instead. `CellStore::fill_gossip_frame*`
+and the `visit_*_dirty` functions are no longer called by the runtime.
 
 ## How gossip works
 
