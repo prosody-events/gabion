@@ -32,10 +32,40 @@ pub const GOSSIP_FANOUT: usize = 3;
 /// Multicast", ACM TOCS 1999: one repair round per gossip period, fanout 1).
 pub const GOSSIP_REPAIR_PERIOD_MILLIS: u64 = 1000;
 
+/// Linux's `net.core.rmem_default`: the UDP receive buffer a gossip socket
+/// gets unless the operator enlarges it. Datagrams that arrive while it is
+/// full are dropped silently.
+pub const GOSSIP_RECEIVE_BUFFER_BYTES: usize = 212_992;
+
+/// The repair phase may fill at most `1 / GOSSIP_REPAIR_BUFFER_SHARE` of one
+/// receive buffer per repair period; the rest is left for first-phase
+/// packets and digests that arrive in the same period.
+pub const GOSSIP_REPAIR_BUFFER_SHARE: usize = 2;
+
+/// Worst-case wire bytes one cell costs a repair packet: the fixed per-cell
+/// columns (42), an 8-byte count, and its own rule and node dictionary
+/// entries (2 x 16) in a packet that shares nothing with other cells.
+pub const GOSSIP_REPAIR_CELL_WIRE_BYTES: usize = 82;
+
 /// Cells a node will send in answer to digests during one repair period: the
-/// paper's per-round retransmission limit. About 18 full packets, below what
-/// one receive buffer holds, so a joiner's catch-up cannot overflow a peer.
-pub const GOSSIP_REPAIR_MAX_CELLS: usize = 512;
+/// paper's per-round retransmission limit, which it states as "a limit" with
+/// no value. Derived from the receive buffer rather than tuned: half of
+/// `rmem_default` (106,496 bytes) at the worst-case 82 bytes per cell is
+/// 1,298 cells (about 76 full packets). Repair and churn results are bound by
+/// this budget; it is a swept design parameter alongside
+/// [`GOSSIP_REPAIR_PERIOD_MILLIS`].
+pub const GOSSIP_REPAIR_MAX_CELLS: usize =
+    GOSSIP_RECEIVE_BUFFER_BYTES / GOSSIP_REPAIR_BUFFER_SHARE / GOSSIP_REPAIR_CELL_WIRE_BYTES;
+
+/// Words of the per-origin held-sequence bitmap in a digest entry. The
+/// bitmap covers `64 * words` sequences below the origin's maximum (256 by
+/// default); a gap further back than that is assumed held and never
+/// repaired. Each word adds 8 bytes to every digest entry. 256 covers the
+/// live window of an origin that stamps up to about 2 sequences a second
+/// over a two-minute window; an origin that changes more cells per window than
+/// that, such as a long-window rule at a high per-origin hit rate, can have
+/// older losses that repair cannot see.
+pub const GOSSIP_DIGEST_WINDOW_WORDS: usize = 4;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;

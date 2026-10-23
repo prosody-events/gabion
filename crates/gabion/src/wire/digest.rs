@@ -21,6 +21,7 @@
 //! ```
 
 use crate::crdt::{Incarnation, NodeId};
+use crate::defaults::GOSSIP_DIGEST_WINDOW_WORDS;
 
 use super::auth::{self, AUTH_TAG_LEN};
 use super::header::{FLAG_AUTHENTICATED, FLAG_DIGEST, FLAG_MORE, FLAG_REPLY, patch_header};
@@ -29,7 +30,7 @@ use super::{
     open_frame,
 };
 
-const DIGEST_WORDS: usize = 4;
+const DIGEST_WORDS: usize = GOSSIP_DIGEST_WINDOW_WORDS;
 
 /// How many sequences below an origin's maximum a digest entry tracks.
 pub const DIGEST_WINDOW: u64 = 64 * DIGEST_WORDS as u64;

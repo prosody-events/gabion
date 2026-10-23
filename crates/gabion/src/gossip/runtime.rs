@@ -751,6 +751,16 @@ where
             PeerEvent::Removed(p) => {
                 if let Some(pos) = self.peers.iter().position(|x| x.addr == p.addr) {
                     self.peers.remove(pos);
+                    // A broadcast in flight walks the peer list by index:
+                    // step it back over the removed entry so the peer that
+                    // slid into its place is not skipped.
+                    for outgoing in &mut self.send_pending {
+                        if let Outgoing::All { next, .. } = outgoing
+                            && pos < *next
+                        {
+                            *next -= 1;
+                        }
+                    }
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
