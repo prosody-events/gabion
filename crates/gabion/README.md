@@ -78,8 +78,10 @@ gabion:
 - *Rebroadcast reaches below the first hop.* The root resends only to children
   that did not answer. An interior node that receives a broadcast it already
   holds either re-acknowledges (if it had completed) or pushes the cells again
-  to its own silent children. Without this a rebroadcast could not repair
-  anything below the root's children. No node resends on its own timer.
+  to its own silent children, but only if the repeat came from its parent (views
+  that disagree can name an ancestor as a child, and following that edge would
+  circulate the packet). Without this a rebroadcast could not repair anything
+  below the root's children. No node resends on its own timer.
 - *Expected tree round trip is measured.* A node cannot know the network, so
   the timeout is twice a smoothed (gain 1/8) measurement of the root's
   broadcasts that completed without a rebroadcast, seeded with

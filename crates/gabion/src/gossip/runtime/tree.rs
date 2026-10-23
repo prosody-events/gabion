@@ -227,10 +227,16 @@ where
             .and_then(|i| self.relays.get_mut(i))
         {
             // The root rebroadcast. Acknowledge again if this node already
-            // did; otherwise push the cells to the children still silent.
+            // did. Otherwise push the cells to the children still silent, but
+            // only when the rebroadcast came down from the parent: views that
+            // disagree can name an ancestor as a child, and following that
+            // edge would circulate the packet forever.
             let relay = *relay;
             if relay.done {
                 self.send_ack(src, root, seq);
+                return;
+            }
+            if src != relay.parent {
                 return;
             }
             self.ring
