@@ -14,6 +14,12 @@ CRDT data structures behind the gossip protocol, see [`CRDT.md`](CRDT.md).
 For cross-adapter vocabulary (rule, descriptor, bucket, fail-open), see
 the [repo root README](../../README.md#glossary).
 
+> **This branch replaces the dissemination layer with Scuttlebutt.** The
+> sections below ("How gossip works" onward) still describe the baseline
+> (coverage fanout, dirty rings, the peer frontier, the repair lane); those
+> mechanisms no longer exist here. [Design notes](#design-notes-scuttlebutt)
+> describes what runs instead and every place it departs from the paper.
+
 ## Contents
 
 - [Module map](#module-map)
@@ -23,6 +29,7 @@ the [repo root README](../../README.md#glossary).
   - [Coverage fanout](#coverage-fanout)
   - [Adaptive emit rate](#adaptive-emit-rate)
   - [Dirty rings and the peer frontier](#dirty-rings-and-the-peer-frontier)
+- [Design notes: Scuttlebutt](#design-notes-scuttlebutt)
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
 - [References](#references)
@@ -358,6 +365,103 @@ next repair-lane sweep picks the dropped cell back up.
 `CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
 debug the CRDT.
+
+## Design notes: Scuttlebutt
+
+Replication is push-pull anti-entropy by per-origin version digest:
+Van Renesse, Dumitriu, Gupta and Bhagwat, "Efficient Reconciliation and Flow
+Control for Anti-Entropy Protocols" (LADIS 2008,
+<https://doi.org/10.1145/1529974.1529983>), with the three-way
+SYN / reply / reply-to-reply shape of Cassandra's gossip
+(<https://cassandra.apache.org/doc/latest/cassandra/architecture/gossip.html>)
+and the anti-entropy framing of Demers et al. (PODC 1987,
+<https://doi.org/10.1145/41840.41841>).
+
+**The exchange.** A gossip round (the shared scheduler is unchanged: the
+500 ms heartbeat plus error-budget threshold rounds with the 5 ms floor) opens
+`f` exchanges, each with a distinct uniformly random peer
+(`defaults::GOSSIP_FANOUT`, 1). Each exchange is:
+
+1. **SYN.** The initiator sends its digest: for every origin it knows, the
+   origin's *watermark*, the version below which it holds every cell that
+   still exists.
+2. **Reply.** The peer answers with the cells whose origin version is above
+   the digest's, oldest version first per origin, and with its own digest.
+3. **Reply to the reply.** The initiator answers the peer's digest the same
+   way, sending the cells the peer lacks.
+
+Cells move only in response to a digest; there is no unsolicited push, no
+dirty ring, no forwarding lane, no repair sweep and no per-peer frontier. A
+digest is sent every round, even when nothing differs, so the bytes it costs
+are part of the design's baseline cost.
+
+**Versions.** Each cell carries the version its origin assigned when the cell
+last changed (the wire's `origin_sequence`). The baseline renumbered remote
+cells with the receiver's own counter; here a receiver keeps the origin's
+version, which is what makes a digest comparable across nodes. A cell that
+changes again takes a new, higher version and leaves its old one as a hole
+(Scuttlebutt's superseded key). Cells of one origin are threaded onto a
+version-ordered list in the `CellStore` (`log_prev`, `log_next`, `log_tail`),
+so answering a digest walks only the cells owed.
+
+**Reply budget and ordering.** The paper bounds a reply to one MTU and orders
+deltas "scuttle-depth" when it binds. A reply here is bounded by
+`max_cells_per_tick` cells (4,096, the same per-tick budget the baseline uses),
+split into 1,400 B datagrams by the shared codec, and further bounded by the
+send pool. When the budget binds, origins are served in descending order of
+backlog (newest held version minus the digest's version, the order Cassandra
+uses), each origin from its oldest owed version up, so what an origin delivers
+is a prefix of what it owes.
+
+### Adaptations to UDP
+
+The paper assumes a reliable, ordered channel, so a digest that reports the
+highest version received is exact. Datagrams are lost, duplicated and
+reordered, so three minimal changes keep the paper's invariant that a digest
+never claims a version its sender lacks:
+
+- **Claims instead of a highest version.** Each cell on the wire carries a
+  `claim_gap` (4 B): the sender certifies that no version between
+  `origin_sequence - claim_gap` and `origin_sequence` exists. The receiver
+  advances the origin's watermark to the cell's version only if the claim
+  reaches back to the watermark it already has, so a lost datagram leaves a
+  hole the watermark cannot cross. The cells above the hole are still merged
+  (the join is idempotent); the next exchange resends from the watermark. The
+  sender sets the claim to the gap back to the previous cell on its own log
+  when the cell is at or below its own watermark for that origin, and to `1`
+  (vacuous) above it, so it never certifies a stretch it does not itself
+  hold. The watermark never advances for a cell the store rejected. `claim_gap`
+  saturates at `u32::MAX`; a wider stretch is certified only up to that width.
+- **Digests tile the node-id space.** One digest does not fit one datagram at
+  80 or 300 origins (28 B per entry). A digest is cut into frames each of which
+  names the node-id range `[lo, hi]` it covers; an origin inside the range
+  that the frame does not list is one the sender holds nothing for and is
+  answered from version `0`. Every frame is therefore answerable on its own,
+  and a lost frame costs only its range. The reply digest echoes the ranges of
+  the SYN frames it answers.
+- **Cells already out of window are acknowledged, not stored.** An origin's
+  watermark resets when its last cell expires, and a peer that has not yet
+  expired the same cells would hand them straight back. `merge_remote` takes
+  `now_millis` and, for a rule it knows, drops a cell whose bucket has left the
+  live window while still advancing the watermark.
+
+The wire format is version 2: header flags `FLAG_DIGEST` and `FLAG_SYN`, the
+digest frame in `wire/digest.rs`, and the `claim_gap` column in cell frames.
+
+### What is deliberately not here
+
+- The paper's AIMD flow control is off, as specified for this study.
+- `local_dirty_capacity`, `forwarded_dirty_capacity` and `peer_capacity` remain
+  in `CellStoreConfig` and the adapters' configuration so existing
+  configuration and the study harness keep compiling, but nothing reads them.
+- `GOSSIP_COVERAGE_MARGIN` is gone, and `GOSSIP_FANOUT` now means Scuttlebutt's
+  `f`. The admin snapshot lost `local_dirty_len`, `forwarded_dirty_len` and the
+  peers' `node_id` / `peer_slot`; `last_effective_fanout` and
+  `peak_effective_fanout` report the exchanges a tick opened.
+- A hole at the *top* of an origin's version range (its newest cell expired
+  while older ones live) is not certified, so a digest can sit below the
+  sender's true watermark until those cells expire. That costs a few resent
+  cells, never correctness.
 
 ## Operator knobs
 

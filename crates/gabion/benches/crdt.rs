@@ -22,10 +22,11 @@
 //! * `find/miss`                  — pure miss path, for the Robin Hood
 //!   early-exit baseline.
 //!
-//! * `fill_gossip_frame/steady_state` — moderately loaded node: some dirty
-//!   entries + repair lane filling the rest of a 128-cell frame budget.
-//! * `fill_gossip_frame/repair_only`  — dirty rings empty (gossip went idle);
-//!   pure repair sweep.
+//! * `collect_newer/steady_state` — answering a digest from a peer that is a
+//!   few versions behind on every origin: the per-origin log walk plus a
+//!   handful of owed cells each.
+//! * `collect_newer/catch_up`     — answering a digest from a joiner that holds
+//!   nothing: a 128-cell reply budget filled from version zero.
 //!
 //! * `expire/window_turnover`     — one bucket out of four ages out per call;
 //!   the steady-state expiry pattern.
@@ -61,6 +62,21 @@ fn obs_row(
         incarnation,
         count,
         last_update_millis,
+        origin_sequence: 0,
+        claim_gap: 0,
+    }
+}
+
+/// Stamp the most recently pushed row with the version its origin assigned,
+/// as a peer's frame would carry it.
+const FRESH_VERSION: u64 = 1_000_000;
+
+fn stamp_version(obs: &mut ObservationBatch<u32>, version: u64) {
+    if let Some(v) = obs.origin_sequences.last_mut() {
+        *v = version;
+    }
+    if let Some(g) = obs.claim_gaps.last_mut() {
+        *g = 1;
     }
 }
 use gabion::wire::{FrameLimits, Header, PacketBuf, Packets, WireScratch, decode_unauth};
@@ -259,8 +275,9 @@ fn seed_remote(
             initial_count,
             0,
         ));
+        stamp_version(&mut obs, 1 + (i / peers.len()) as u64);
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, 0, &mut sink);
     rows
 }
 
@@ -618,7 +635,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                 |(store, obs, sink, rng)| {
                     obs.clear();
                     sink.clear();
-                    for _ in 0..batch {
+                    for k in 0..batch {
                         let pick = rng.range(100);
                         let (key, rule_idx, bucket, peer_idx, count) = if pick < 50 {
                             // No-op: peer behind us. Pick an existing cell
@@ -648,8 +665,9 @@ fn bench_merge_remote(c: &mut Criterion) {
                             count,
                             0,
                         ));
+                        stamp_version(obs, FRESH_VERSION + k as u64);
                     }
-                    store.merge_remote(black_box(obs), black_box(sink));
+                    store.merge_remote(black_box(obs), 0, black_box(sink));
                 },
                 BatchSize::SmallInput,
             );
@@ -671,7 +689,7 @@ fn bench_merge_remote(c: &mut Criterion) {
             b.iter(|| {
                 obs.clear();
                 sink.clear();
-                for _ in 0..batch {
+                for k in 0..batch {
                     // Pick a remote row, then rotate the reporting peer
                     // so the same key shows up under different origins.
                     let row =
@@ -687,9 +705,10 @@ fn bench_merge_remote(c: &mut Criterion) {
                         counter,
                         0,
                     ));
+                    stamp_version(&mut obs, FRESH_VERSION + (counter as u64) * 1024 + k as u64);
                 }
                 counter = counter.wrapping_add(1).max(200);
-                store.merge_remote(black_box(&obs), black_box(&mut sink));
+                store.merge_remote(black_box(&obs), 0, black_box(&mut sink));
             });
         });
     }
@@ -719,7 +738,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                     0,
                 ));
             }
-            store.merge_remote(black_box(&obs), black_box(&mut sink));
+            store.merge_remote(black_box(&obs), 0, black_box(&mut sink));
         });
     });
 
@@ -929,59 +948,40 @@ impl std::fmt::Write for SliceWriter<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// fill_gossip_frame — outbound gossip composition.
+// collect_newer — answering a digest.
 // ---------------------------------------------------------------------------
 
-fn bench_fill_gossip_frame(c: &mut Criterion) {
-    let mut group = c.benchmark_group("crdt/fill_gossip_frame");
+/// Fill `out` with up to `limit` cells owed to a peer whose digest sits
+/// `lag` versions below this store's watermark for every origin.
+fn owed_handles(store: &CellStore<u32>, lag: u64, limit: usize, out: &mut Vec<CellHandle>) {
+    out.clear();
+    let nodes = store.node_dictionary();
+    for slot in 0..nodes.capacity() {
+        if nodes.descriptor(slot).is_some() {
+            store.collect_newer(slot, store.watermark(slot).saturating_sub(lag), limit, out);
+        }
+    }
+}
+
+fn bench_collect_newer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("crdt/collect_newer");
     group.throughput(Throughput::Elements(128));
 
     let fixture = build_fixture();
 
     // ─── steady_state ───────────────────────────────────────────────────
-    // Moderately loaded node: dirty rings contain ~64 recent updates;
-    // repair lane fills the remaining 64 slots of a 128-handle frame.
-    let mut steady = fixture.store.clone();
-    {
-        // Generate ~64 recent local updates so local_dirty has entries.
-        let mut rng = Rng::new(0xD1_D1_D1);
-        let mut obs = ObservationBatch::<u32>::with_capacity(64);
-        let mut sink = DeltaSink::<u32>::with_capacity(64);
-        for _ in 0..64 {
-            let key = pareto_key(&mut rng, &fixture.hot_keys, &fixture.warm_keys);
-            let rule_idx = pick_rule(&mut rng) as usize;
-            obs.push(obs_row(
-                fixture.rule_fps[rule_idx],
-                KeyHash(key),
-                0,
-                LOCAL_NODE,
-                LOCAL_INCARNATION,
-                1,
-                0,
-            ));
-        }
-        steady.ingest_local(&obs, &mut sink);
-    }
+    // The common exchange: every origin owes the peer its last few versions.
     group.bench_function("steady_state", |b| {
-        // fill_gossip_frame only mutates selection_marks (per-frame
-        // ephemeral) and repair_cursor (advances round-robin); over many
-        // iterations the repair cursor wraps but no identity changes ⇒
-        // iter without cloning.
-        let mut out = Vec::<CellHandle>::with_capacity(128);
-        b.iter(|| {
-            steady.fill_gossip_frame(black_box(128), black_box(&mut out));
-        });
+        let mut out = Vec::<CellHandle>::with_capacity(4096);
+        b.iter(|| owed_handles(black_box(&fixture.store), 2, 4096, &mut out));
     });
 
-    // ─── repair_only ────────────────────────────────────────────────────
-    // Dirty rings drained; frame composition is entirely the repair scan.
-    let mut repair = fixture.store.clone();
-    repair.clear_dirty();
-    group.bench_function("repair_only", |b| {
+    // ─── catch_up ───────────────────────────────────────────────────────
+    // A joiner's digest is empty: the log walk starts at the head of every
+    // origin and the budget cuts the reply off.
+    group.bench_function("catch_up", |b| {
         let mut out = Vec::<CellHandle>::with_capacity(128);
-        b.iter(|| {
-            repair.fill_gossip_frame(black_box(128), black_box(&mut out));
-        });
+        b.iter(|| owed_handles(black_box(&fixture.store), u64::MAX, 128, &mut out));
     });
 
     group.finish();
@@ -1079,9 +1079,9 @@ fn bench_wire(c: &mut Criterion) {
     // ─── encode_128 ────────────────────────────────────────────────────
     // Compose a 128-cell frame from the fixture, then encode into a
     // pre-allocated buffer. Resembles the runtime's per-tick send path.
-    let mut encode_store = fixture.store.clone();
+    let encode_store = fixture.store.clone();
     let mut handles = Vec::<CellHandle>::with_capacity(128);
-    encode_store.fill_gossip_frame(128, &mut handles);
+    owed_handles(&encode_store, u64::MAX, 128, &mut handles);
     let handles = handles; // freeze for the closure
     group.bench_function("encode_128", |b| {
         let mut scratch = WireScratch::for_store(&encode_store);
@@ -1106,9 +1106,9 @@ fn bench_wire(c: &mut Criterion) {
     // 4096-cell fixture under a 64 KiB UDP-style budget. Measures the
     // steady-state multi-packet emission rate — drains the full handle
     // list across however many packets it takes (target ~9–10).
-    let mut multi_store = fixture.store.clone();
+    let multi_store = fixture.store.clone();
     let mut multi_handles = Vec::<CellHandle>::with_capacity(4096);
-    multi_store.fill_gossip_frame(4096, &mut multi_handles);
+    owed_handles(&multi_store, u64::MAX, 4096, &mut multi_handles);
     let multi_handles = multi_handles;
     let multi_limits = FrameLimits {
         max_payload_bytes: 64 * 1024,
@@ -1200,7 +1200,7 @@ criterion_group!(
     bench_merge_remote,
     bench_find,
     bench_admission_headers,
-    bench_fill_gossip_frame,
+    bench_collect_newer,
     bench_expire,
     bench_wire,
 );

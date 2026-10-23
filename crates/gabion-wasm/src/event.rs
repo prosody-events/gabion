@@ -143,10 +143,6 @@ pub struct NodeState {
     /// The per-rule error budget ε at the most recent request: a rule's pending
     /// hits crossing it triggers an eager (threshold) flush. `0` until seen.
     pub error_budget: u64,
-    /// Rows in the local-origin dirty ring awaiting gossip out.
-    pub local_dirty_len: u32,
-    /// Rows in the forwarded (received-then-re-gossiped) dirty ring.
-    pub forwarded_dirty_len: u32,
     /// Outbound packets queued behind the transport right now.
     pub send_pending_depth: u64,
     /// High-water mark of `send_pending_depth` since startup — the only honest

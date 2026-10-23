@@ -4,12 +4,17 @@ use super::DecodeError;
 
 pub const HEADER_LEN: usize = 72;
 pub const MAGIC: u32 = 0x4742_4732;
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 /// Set on every packet but the last in a multi-packet batch. Each packet is
 /// independently decodable — `FLAG_MORE` is only an advisory hint for
 /// receivers that want to defer downstream work until the batch settles.
 pub const FLAG_MORE: u16 = 0x01;
 pub const FLAG_AUTHENTICATED: u16 = 0x02;
+/// The body is a Scuttlebutt digest rather than cells; see [`super::digest`].
+pub const FLAG_DIGEST: u16 = 0x04;
+/// On a digest frame: the sender initiated this exchange and expects the
+/// receiver to answer with its own digest as well as the cells owed.
+pub const FLAG_SYN: u16 = 0x08;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {

@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU128;
 use std::time::Duration;
 
-use crate::crdt::{CellStoreStats, NodeId, NodeIdentity};
+use crate::crdt::{CellStoreStats, NodeIdentity};
 use crate::wire::{self, FrameLimits, HmacKey};
 
 mod admin;
@@ -55,15 +55,12 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Floor on the number of peers contacted per gossip tick. The runtime
-    /// scales the actual per-tick fanout to the coverage threshold
-    /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
-    /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
-    /// hard minimum when that threshold falls below it.
+    /// Scuttlebutt `f`: how many distinct random peers a gossip tick opens an
+    /// exchange with (capped at the peer count). See
+    /// [`crate::defaults::GOSSIP_FANOUT`].
     pub fanout: usize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
-    /// tick. The wire codec splits this into multiple packets if needed.
+    /// Reply budget: the most cells one answer to a digest may carry. The
+    /// wire codec splits them into as many packets as the MTU requires.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,
