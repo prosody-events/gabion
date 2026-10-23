@@ -11,7 +11,7 @@ use crate::crdt::{
 use super::{
     DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_MORE, FrameLimits,
     HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch, decode_auth,
-    decode_auth_visit, decode_unauth, decode_unauth_visit,
+    decode_auth_visit, decode_unauth, decode_unauth_visit, encode_header_only,
 };
 
 const MAX_ROWS: usize = 32;
@@ -63,8 +63,10 @@ fn sample_header() -> Header {
         count_width: 0,
         cell_count: 0,
         body_len: 0,
-        min_origin_sequence: 0,
-        max_origin_sequence: 0,
+        ack_own: 0,
+        ack_relay: 0,
+        stream_lower: 0,
+        stream_upper: 0,
         flags: 0,
     }
 }
@@ -867,4 +869,103 @@ fn visitor_matches_allocating_for_curated_rows() {
         assert_eq!(cell.count, obs.counts[i]);
         assert_eq!(cell.last_update_millis, obs.last_update_millis[i]);
     }
+}
+
+// -- Stream ranges and header-only acks --------------------------------------
+
+fn distinct_rows(n: u32) -> Vec<RawRow> {
+    (0..n)
+        .map(|i| RawRow {
+            rule_fingerprint: 0xAA,
+            key_hash: i as u128,
+            bucket: 0,
+            origin_node_id: 0xBB,
+            origin_incarnation: 1,
+            count: 1,
+            last_update_millis: 0,
+        })
+        .collect()
+}
+
+#[test]
+fn stamped_packets_chain_their_stream_ranges() {
+    let (store, handles) = seed_store::<u32>(&distinct_rows(40), |c| c);
+    let stamps: Vec<u64> = (0..handles.len() as u64).map(|i| 100 + 3 * i).collect();
+    let mut scratch = WireScratch::for_store(&store);
+    // Small payloads force several packets.
+    let limits = FrameLimits {
+        max_payload_bytes: HEADER_LEN + 2 + 32 + 40 * 3,
+        max_cells: 4096,
+    };
+    let mut buf = PacketBuf::for_limits(limits);
+    let header = Header {
+        stream_lower: 97,
+        ack_own: 11,
+        ack_relay: 12,
+        ..sample_header()
+    };
+    let packets = Packets::<u32>::unauth(header, &store, &handles, &mut scratch, limits)
+        .expect("ctor")
+        .with_stamps(&stamps);
+    let frames = drain_packets(packets, &mut buf);
+    assert!(frames.len() > 2, "the cells span several packets");
+
+    let mut lower = 97;
+    let mut consumed = 0;
+    for frame in &frames {
+        let mut obs = ObservationBatch::<u32>::with_capacity(64);
+        let summary = decode_unauth::<u32>(frame, limits, &mut obs).expect("decode");
+        let h = summary.header;
+        assert_eq!((h.ack_own, h.ack_relay), (11, 12));
+        assert_eq!(
+            h.stream_lower, lower,
+            "each packet starts where the last ended"
+        );
+        consumed += summary.cell_count as usize;
+        assert_eq!(h.stream_upper, stamps[consumed - 1]);
+        lower = h.stream_upper;
+    }
+    assert_eq!(consumed, handles.len());
+}
+
+#[test]
+fn abandon_lets_an_undrained_iterator_drop() {
+    let (store, handles) = seed_store::<u32>(&distinct_rows(8), |c| c);
+    let mut scratch = WireScratch::for_store(&store);
+    let limits = FrameLimits::default();
+    let mut packets =
+        Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+            .expect("ctor");
+    assert_eq!(packets.remaining(), handles.len());
+    packets.abandon();
+    assert_eq!(packets.remaining(), 0);
+}
+
+#[test]
+fn header_only_packet_roundtrips_and_authenticates() {
+    let limits = FrameLimits::default();
+    let header = Header {
+        ack_own: 5,
+        ack_relay: 9,
+        flags: FLAG_MORE,
+        ..sample_header()
+    };
+    let mut obs = ObservationBatch::<u32>::with_capacity(1);
+
+    let mut buf = PacketBuf::for_limits(limits);
+    encode_header_only::<u32>(header, None, &mut buf);
+    assert_eq!(buf.as_bytes().len(), HEADER_LEN);
+    let summary = decode_unauth::<u32>(buf.as_bytes(), limits, &mut obs).expect("decode");
+    assert_eq!(summary.cell_count, 0);
+    assert_eq!((summary.header.ack_own, summary.header.ack_relay), (5, 9));
+    assert_eq!(summary.header.flags & FLAG_MORE, 0);
+
+    let key = HmacKey([3; 32]);
+    encode_header_only::<u32>(header, Some(&key), &mut buf);
+    let summary = decode_auth::<u32>(buf.as_bytes(), &key, limits, &mut obs).expect("decode");
+    assert_eq!(
+        summary.header.flags & FLAG_AUTHENTICATED,
+        FLAG_AUTHENTICATED
+    );
+    assert!(obs.is_empty());
 }

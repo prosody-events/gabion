@@ -1063,8 +1063,10 @@ fn wire_header() -> Header {
         count_width: 0,
         cell_count: 0,
         body_len: 0,
-        min_origin_sequence: 0,
-        max_origin_sequence: 0,
+        ack_own: 0,
+        ack_relay: 0,
+        stream_lower: 0,
+        stream_upper: 0,
         flags: 0,
     }
 }

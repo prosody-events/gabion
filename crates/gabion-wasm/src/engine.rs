@@ -445,6 +445,9 @@ impl EngineState {
             rng_seed: self.config.rng_seed.wrapping_add(id as u64),
             target_err_bps: self.config.target_err_bps,
             min_emit_interval: Duration::from_millis(self.config.min_emit_interval_ms),
+            zone_prefix_len: defaults::GOSSIP_ZONE_PREFIX_LEN,
+            rto_floor: Duration::from_millis(defaults::GOSSIP_RTO_FLOOR_MS),
+            relay_floor: Duration::from_millis(defaults::GOSSIP_RELAY_FLOOR_MS),
         };
 
         let aggregate = Rc::new(EventEmittingAggregateStore::<Count>::new(

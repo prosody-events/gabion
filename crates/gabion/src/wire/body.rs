@@ -115,10 +115,6 @@ pub(crate) struct EncodedBody {
     /// row (stale generation, missing dict descriptor). They never advance
     /// to the next packet.
     pub cells_dropped: u32,
-    /// Lowest `origin_sequence` among emitted cells, or `0` when empty.
-    pub min_origin_sequence: u64,
-    /// Highest `origin_sequence` among emitted cells.
-    pub max_origin_sequence: u64,
     /// Number of handles consumed from `handles[start..]`, i.e.
     /// `cells_emitted + cells_dropped`.
     pub handles_consumed: usize,
@@ -137,8 +133,6 @@ struct Plan {
     /// `D` — distinct origin node ids required by the emitted cells.
     node_count: u8,
     body_len: usize,
-    min_seq: u64,
-    max_seq: u64,
 }
 
 /// Encode the next packet's body into `out` starting at `out.len()`. Returns
@@ -168,8 +162,6 @@ pub(crate) fn encode_packet_body<C: Count>(
             body_len: 0,
             cells_emitted: 0,
             cells_dropped: plan.cells_dropped,
-            min_origin_sequence: 0,
-            max_origin_sequence: 0,
             handles_consumed: plan.consumed,
         };
     }
@@ -180,8 +172,6 @@ pub(crate) fn encode_packet_body<C: Count>(
         body_len: plan.body_len,
         cells_emitted: plan.cells_emitted,
         cells_dropped: plan.cells_dropped,
-        min_origin_sequence: plan.min_seq,
-        max_origin_sequence: plan.max_seq,
         handles_consumed: plan.consumed,
     }
 }
@@ -200,8 +190,6 @@ fn plan_packet<C: Count>(
     let mut cells_dropped: u32 = 0;
     let mut r: u8 = 0;
     let mut d: u8 = 0;
-    let mut min_seq = u64::MAX;
-    let mut max_seq = 0_u64;
 
     while cursor < handles.len() {
         let handle = handles[cursor];
@@ -252,12 +240,6 @@ fn plan_packet<C: Count>(
         }
 
         cells_emitted = cells_emitted.saturating_add(1);
-        if row.origin_sequence < min_seq {
-            min_seq = row.origin_sequence;
-        }
-        if row.origin_sequence > max_seq {
-            max_seq = row.origin_sequence;
-        }
         cursor += 1;
     }
 
@@ -274,8 +256,6 @@ fn plan_packet<C: Count>(
         rule_count: r,
         node_count: d,
         body_len,
-        min_seq: if cells_emitted == 0 { 0 } else { min_seq },
-        max_seq,
     }
 }
 

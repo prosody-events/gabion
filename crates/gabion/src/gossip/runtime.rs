@@ -1,11 +1,18 @@
 //! Single-threaded gossip event loop.
 //!
-//! One `tokio::select!` drives five arms — limit/shutdown requests, inbound
-//! UDP, outbound writable, peer membership churn, gossip tick. After each
-//! iteration the runtime calls [`AggregateStore::apply`] once with whatever
-//! rows the arm produced. The runtime owns the [`CellStore`], pre-allocated
-//! scratch buffers, the outbound send pool, and the peer table; nothing in
-//! the loop allocates after construction.
+//! One `tokio::select!` drives six arms — limit/shutdown requests, inbound
+//! UDP, outbound writable, peer membership churn, gossip tick, relay tick.
+//! After each iteration the runtime calls [`AggregateStore::apply`] once with
+//! whatever rows the arm produced. The runtime owns the [`CellStore`],
+//! pre-allocated scratch buffers, the outbound send pool, and the peer table;
+//! nothing in the loop allocates after construction.
+//!
+//! Dissemination is two-level, with zones (availability zones) as the levels.
+//! A node sends its own cells to every peer in its zone and to one *gateway*
+//! in each other zone; a gateway re-sends what it received from the origin to
+//! every other member of its own zone. Each hop is a cumulatively
+//! acknowledged *stream*, so loss is repaired hop by hop. See "Design notes"
+//! in `crates/gabion/README.md`.
 
 use std::collections::VecDeque;
 use std::io;
@@ -16,65 +23,43 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Incarnation, NodeId, Observation,
-    ObservationBatch,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
 };
 use crate::discovery::PeerEvent;
-use crate::wire::{self, PacketBuf, Packets, WireScratch};
+use crate::wire::{self, FLAG_RELAY, PacketBuf, Packets, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
+use super::peer::{Peer, refresh_gateways};
 use super::store::AggregateStore;
+use super::topology::Zone;
 use super::transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
 use super::transport::UdpTransport;
 use super::{GossipConfig, GossipError};
 
-/// One peer the runtime gossips with. `node_id` is `None` until we receive
-/// our first inbound packet from this peer; `peer_slot` caches the
-/// `PeerFrontierTable` slot once interned.
-struct Peer {
-    addr: SocketAddr,
-    node_id: Option<NodeId>,
-    peer_slot: Option<u16>,
+/// Which stream a packet's cells belong to.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StreamKind {
+    /// The sender's own-origin cells, sequenced by `origin_sequence`.
+    Own,
+    /// Cells a gateway forwards into its zone, sequenced by relay stamps.
+    Relay,
 }
 
-/// Data-oriented scratch for per-row frontier acks decoded from one inbound
-/// packet. The columns are allocated once at runtime construction and reused
-/// for every inbound arm.
-struct AckColumns {
-    origin_node_ids: Vec<NodeId>,
-    incarnations: Vec<Incarnation>,
-    origin_sequences: Vec<u64>,
-}
-
-impl AckColumns {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            origin_node_ids: Vec::with_capacity(capacity),
-            incarnations: Vec::with_capacity(capacity),
-            origin_sequences: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.origin_node_ids.clear();
-        self.incarnations.clear();
-        self.origin_sequences.clear();
-    }
-
-    fn push(&mut self, origin_node_id: NodeId, incarnation: Incarnation, origin_sequence: u64) {
-        self.origin_node_ids.push(origin_node_id);
-        self.incarnations.push(incarnation);
-        self.origin_sequences.push(origin_sequence);
-    }
-
-    fn len(&self) -> usize {
-        self.origin_node_ids.len()
-    }
+/// What woke the gossip loop to send.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Round {
+    /// The heartbeat tick: expire, send both streams, owe standalone acks.
+    Heartbeat,
+    /// An error-budget flush between heartbeats: as `Heartbeat`, minus the
+    /// standalone acks.
+    Threshold,
+    /// A gateway forwarding freshly received cells into its zone.
+    Relay,
 }
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
@@ -103,10 +88,30 @@ where
     recv_buf: Box<[u8]>,
     scratch: WireScratch,
     obs_buf: ObservationBatch<C>,
-    ack_buf: AckColumns,
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
+    /// Stream sequence of each `frame_handles` entry, for the packet header's
+    /// range.
+    frame_stamps: Vec<u64>,
+    /// Live own cells and relayable cells as `(stream sequence, handle)`,
+    /// ascending, rebuilt each round that has something to send. Sized to the
+    /// cell store so a round never grows them.
+    own_scratch: Vec<(u64, CellHandle)>,
+    relay_scratch: Vec<(u64, CellHandle)>,
+
+    // Dissemination state.
+    local_zone: Zone,
+    /// Relay stream sequence of each cell slot: non-zero only for a cell that
+    /// arrived straight from an origin in another zone, which this node
+    /// forwards into its own zone.
+    relay_stamp: Box<[u64]>,
+    /// Highest relay stamp issued.
+    relay_head: u64,
+    /// Highest own-cell `origin_sequence` issued.
+    own_head: u64,
+    /// Cells were stamped for relay since the last relay round.
+    relay_pending: bool,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
@@ -114,7 +119,6 @@ where
     send_free: Vec<u8>,
 
     peers: Vec<Peer>,
-    rng: SplitMix64,
 
     // Pending reply for the in-flight limit request. Sent after the
     // bottom-of-loop apply so callers observe "ack ⇒ AggregateStore reflects
@@ -258,9 +262,23 @@ where
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
         let obs_buf = ObservationBatch::<C>::with_capacity(config.max_cells_per_tick);
-        let ack_buf = AckColumns::with_capacity(config.wire_limits.max_cells as usize);
         let sink_buf = DeltaSink::<C>::with_capacity(config.max_cells_per_tick);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
+        let frame_stamps = Vec::with_capacity(config.max_cells_per_tick);
+        let cell_capacity = store.capacity() as usize;
+        let own_scratch = Vec::with_capacity(cell_capacity);
+        let relay_scratch = Vec::with_capacity(cell_capacity);
+        let relay_stamp = vec![0_u64; cell_capacity].into_boxed_slice();
+        // A transport with no local address (never the case for a bound
+        // socket) falls into the zone of the unspecified address, so every
+        // peer reads as remote and gets a gateway rather than a direct send.
+        let local_zone = Zone::of(
+            transport
+                .local_addr()
+                .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0))),
+            config.zone_prefix_len,
+        );
+        let local_node = store.local_identity().node_id;
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
 
         let send_pool_size = config.send_queue_capacity.max(1);
@@ -270,17 +288,12 @@ where
         let send_free: Vec<u8> = (0..send_pool_size as u8).rev().collect();
         let send_pending = VecDeque::with_capacity(send_pool_size);
 
-        let peers: Vec<Peer> = config
+        let mut peers: Vec<Peer> = config
             .bootstrap_peers
             .iter()
-            .copied()
-            .map(|addr| Peer {
-                addr,
-                node_id: None,
-                peer_slot: None,
-            })
+            .map(|&addr| Peer::new(addr, local_node, Zone::of(addr, config.zone_prefix_len)))
             .collect();
-        let rng = SplitMix64::new(config.rng_seed);
+        refresh_gateways(&mut peers, local_zone);
 
         let rule_capacity = store.rule_dictionary().capacity() as usize;
         let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
@@ -297,15 +310,21 @@ where
             recv_buf,
             scratch,
             obs_buf,
-            ack_buf,
             sink_buf,
             expiration_buf,
             frame_handles,
+            frame_stamps,
+            own_scratch,
+            relay_scratch,
+            local_zone,
+            relay_stamp,
+            relay_head: 0,
+            own_head: 0,
+            relay_pending: false,
             send_pool,
             send_pending,
             send_free,
             peers,
-            rng,
             pending_reply: None,
             decode_reject_count: 0,
             max_send_pending_depth: 0,
@@ -339,6 +358,10 @@ where
     {
         let mut peer_events = std::pin::pin!(peer_events);
         let mut tick = self.clock.ticker(self.config.tick_interval);
+        // Paces relay rounds: polled only while cells await relay, and its
+        // first tick is immediate, so the floor bounds the relay rate without
+        // delaying a relay that follows a quiet spell.
+        let mut relay_tick = self.clock.ticker(self.config.relay_floor);
         // Once the peer-event stream returns `None` (e.g. `stream::empty()`),
         // never poll it again — otherwise it returns `Ready(None)` on every
         // iteration and the loop spins.
@@ -352,6 +375,7 @@ where
             let have_send = !self.send_pending.is_empty();
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
+            let watch_relay = self.relay_pending;
 
             let outcome = if self.want_immediate_flush {
                 // A previous limit request crossed the per-rule error
@@ -368,7 +392,7 @@ where
                 // between threshold fires and heartbeat fires.
                 self.want_immediate_flush = false;
                 self.threshold_fires = self.threshold_fires.saturating_add(1);
-                ArmOutcome::Tick
+                ArmOutcome::Threshold
             } else {
                 // Split-borrow scope: we hand the I/O futures non-overlapping
                 // pieces of `self` so they compose inside `select!`.
@@ -388,7 +412,8 @@ where
                     _ = transport.writable(), if have_send => ArmOutcome::Writable,
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
                     cmd = recv_admin(admin_rx), if watch_admin => ArmOutcome::Admin(cmd),
-                    _ = tick.tick() => ArmOutcome::Tick,
+                    _ = tick.tick() => ArmOutcome::Heartbeat,
+                    _ = relay_tick.tick(), if watch_relay => ArmOutcome::Relay,
                 }
             };
 
@@ -404,7 +429,9 @@ where
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
                 ArmOutcome::Admin(None) => self.admin_rx = None,
-                ArmOutcome::Tick => self.handle_gossip_tick(),
+                ArmOutcome::Heartbeat => self.handle_gossip_round(Round::Heartbeat),
+                ArmOutcome::Threshold => self.handle_gossip_round(Round::Threshold),
+                ArmOutcome::Relay => self.handle_gossip_round(Round::Relay),
             }
 
             // One apply per iteration covering both row sources. CRDT-free
@@ -490,6 +517,14 @@ where
             last_update_millis: req.now_millis,
         });
         self.store.ingest_local(&self.obs_buf, &mut self.sink_buf);
+        // The dirty rings feed no lane in this design (streams are rebuilt
+        // from per-cell sequences), so keep them from filling and warning.
+        self.store.clear_dirty();
+        for &handle in &self.sink_buf.handles {
+            if let Some(row) = self.store.get(handle) {
+                self.own_head = self.own_head.max(row.origin_sequence);
+            }
+        }
         // Reply is sent at the bottom of this loop iteration, AFTER the
         // post-iteration apply runs. Caller observes "ack ⇒ AggregateStore
         // reflects the increment".
@@ -498,18 +533,11 @@ where
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
         self.obs_buf.clear();
-        self.ack_buf.clear();
         self.sink_buf.clear();
         let bytes = &self.recv_buf[..n];
         let decoded = {
             let obs_buf = &mut self.obs_buf;
-            let ack_buf = &mut self.ack_buf;
             let mut on_cell = |cell: wire::WireCell<C>| {
-                ack_buf.push(
-                    cell.origin_node_id,
-                    cell.origin_incarnation,
-                    cell.origin_sequence,
-                );
                 obs_buf.push(Observation {
                     rule_fingerprint: cell.rule_fingerprint,
                     key_hash: cell.key_hash,
@@ -560,31 +588,72 @@ where
                 return;
             }
         };
+        let header = summary.header;
 
         self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
+        self.store.clear_dirty();
 
-        // Frontier update — latency optimization. Best-effort: missing slot
-        // or missing node entry just means we don't get the skip.
-        let sender_id = NodeId(summary.header.sender_node_id);
-        if let Some(peer_slot) = self.store.peer_frontiers_mut().intern_peer(sender_id) {
-            for i in 0..self.ack_buf.len() {
-                let origin_id = self.ack_buf.origin_node_ids[i];
-                let incarnation = self.ack_buf.incarnations[i];
-                let sequence = self.ack_buf.origin_sequences[i];
-                if let Some(node_slot) = self.store.node_dictionary().find(origin_id, incarnation) {
-                    self.store
-                        .peer_frontiers_mut()
-                        .record_acked(peer_slot, node_slot, sequence);
-                }
+        // A cell that arrives straight from an origin in another zone is one
+        // this node forwards into its own zone. Cells that arrive from a
+        // zone peer or in a relay stream were already delivered by their
+        // sender, so they are never forwarded again (stamp 0).
+        let from_origin_across_zones = header.flags & FLAG_RELAY == 0
+            && Zone::of(src, self.config.zone_prefix_len) != self.local_zone;
+        for &handle in &self.sink_buf.handles {
+            let stamp = if from_origin_across_zones {
+                self.relay_head += 1;
+                self.relay_head
+            } else {
+                0
+            };
+            if let Some(slot) = self.relay_stamp.get_mut(handle.index as usize) {
+                *slot = stamp;
             }
-            // Cache the peer_slot on the matching peer entry so future ticks
-            // can prune without re-interning. `node_id` and `peer_slot` are
-            // always set together — see `handle_gossip_tick`, which relies
-            // on this invariant.
-            if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
-                peer.node_id = Some(sender_id);
-                peer.peer_slot = Some(peer_slot);
-            }
+        }
+        self.relay_pending |= from_origin_across_zones && !self.sink_buf.is_empty();
+
+        let now_ms = self.clock.now_millis();
+        let Some(pi) = self.peers.iter().position(|p| p.addr == src) else {
+            // Not (yet) in discovery: the cells are merged, but with no
+            // stream state there is nothing to ack.
+            return;
+        };
+        let identity = (NodeId(header.sender_node_id), header.sender_incarnation);
+        let peer = &mut self.peers[pi];
+        if peer.identity != Some(identity) {
+            // First contact, or a new process behind the same address.
+            peer.reset_streams();
+            peer.identity = Some(identity);
+        }
+
+        // Hearing from a gateway clears its suspicion.
+        let was_suspect = std::mem::take(&mut peer.suspect);
+
+        // What the peer holds of our two streams.
+        let samples = [
+            peer.own.note_ack(header.ack_own, now_ms),
+            peer.relay.note_ack(header.ack_relay, now_ms),
+        ];
+        for sample in samples.into_iter().flatten() {
+            peer.note_rtt(sample);
+        }
+
+        // The peer's stream, closed over `(stream_lower, stream_upper]`: the
+        // range is contiguous with what we hold only if it starts at or
+        // below it. A packet beyond a gap (an earlier one was lost) is
+        // merged but not acked past the gap.
+        let have = if header.flags & FLAG_RELAY == 0 {
+            &mut peer.have_own
+        } else {
+            &mut peer.have_relay
+        };
+        if header.stream_lower <= *have {
+            *have = (*have).max(header.stream_upper);
+        }
+        peer.ack_due |= header.cell_count > 0;
+
+        if was_suspect {
+            refresh_gateways(&mut self.peers, self.local_zone);
         }
     }
 
@@ -616,8 +685,7 @@ where
                         .iter()
                         .map(|p| PeerEntry {
                             addr: p.addr,
-                            node_id: p.node_id,
-                            peer_slot: p.peer_slot,
+                            node_id: p.identity.map(|(node_id, _)| node_id),
                         })
                         .collect(),
                     store_stats: self.store.stats(),
@@ -687,11 +755,10 @@ where
         match evt {
             PeerEvent::Added(p) => {
                 if !self.peers.iter().any(|x| x.addr == p.addr) {
-                    self.peers.push(Peer {
-                        addr: p.addr,
-                        node_id: None,
-                        peer_slot: None,
-                    });
+                    let zone = Zone::of(p.addr, self.config.zone_prefix_len);
+                    let local = self.store.local_identity().node_id;
+                    self.peers.push(Peer::new(p.addr, local, zone));
+                    refresh_gateways(&mut self.peers, self.local_zone);
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
@@ -701,10 +768,8 @@ where
             }
             PeerEvent::Removed(p) => {
                 if let Some(pos) = self.peers.iter().position(|x| x.addr == p.addr) {
-                    let removed = self.peers.remove(pos);
-                    if let Some(node_id) = removed.node_id {
-                        self.store.peer_frontiers_mut().remove_peer(node_id);
-                    }
+                    self.peers.remove(pos);
+                    refresh_gateways(&mut self.peers, self.local_zone);
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
@@ -715,129 +780,244 @@ where
         }
     }
 
-    fn handle_gossip_tick(&mut self) {
-        // Step 0: bump the total-ticks counter. Tracked unconditionally
-        // (even for empty / no-peer ticks) so the bench can split the
-        // run's wall time into heartbeat ticks vs threshold fires.
-        self.ticks_total = self.ticks_total.saturating_add(1);
+    /// One send round. Every round sends each stream's new cells to its
+    /// recipients and resends what a recipient has left unacknowledged for a
+    /// retransmission timeout:
+    ///
+    /// - the **own** stream (this node's cells) goes to every peer in the local
+    ///   zone and to one gateway in each other zone;
+    /// - the **relay** stream (cells this node, as a gateway, received straight
+    ///   from an origin in another zone) goes to every peer in the local zone.
+    ///
+    /// A `Relay` round sends only the relay stream. Heartbeat rounds also
+    /// ack peers that sent data and received nothing from us to piggyback
+    /// the ack on.
+    fn handle_gossip_round(&mut self, round: Round) {
+        let now_ms = self.clock.now_millis();
+        if round != Round::Relay {
+            // Step 0: bump the total-ticks counter. Tracked unconditionally
+            // (even for empty / no-peer ticks) so the bench can split the
+            // run's wall time into heartbeat ticks vs threshold fires.
+            self.ticks_total = self.ticks_total.saturating_add(1);
 
-        // Step 1: expire aged-out cells so we don't gossip them.
-        let now_millis = self.clock.now_millis();
-        self.expiration_buf.clear();
-        self.store.expire_at(now_millis, &mut self.expiration_buf);
+            // Step 1: expire aged-out cells so we don't gossip them.
+            self.expiration_buf.clear();
+            self.store.expire_at(now_ms, &mut self.expiration_buf);
+        } else {
+            self.relay_pending = false;
+        }
 
         if self.store.is_empty() || self.peers.is_empty() || self.send_free.is_empty() {
             return;
         }
-
-        // The store was non-empty when this tick fired — bench harness
-        // counts this as a "dirty tick" so effective-fanout reports
-        // `packets / dirty_ticks` rather than `packets / wall_ticks`.
-        // Bumped before the peer-pick math runs so synthetic threshold
-        // ticks (which by construction have local_dirty>0) always count.
-        self.dirty_ticks = self.dirty_ticks.saturating_add(1);
-
-        // Step 2: pick `fanout` distinct peers via a partial Fisher-Yates
-        // shuffle of `self.peers` in place. With-replacement sampling would
-        // silently break Demers' O(log N) convergence bound — selecting the
-        // same peer twice in one tick burns a send-pool slot encoding the
-        // same frame for the same peer. `self.peers` has no ordering
-        // contract elsewhere (lookups are by `addr`), so shuffling is free.
-        //
-        // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
-        // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`
-        // reaches *every* node with probability → e^(−e^(−c)) — "there is a
-        // sharp threshold in the required fanout at log n." Fanout is
-        // governed by cluster size `n`, not data volume: KMG note the
-        // fanout need only grow by 1 each time `n` rises by a factor of e,
-        // and that a round "can easily be modified … to send several
-        // notifications per gossip message." Gabion already packs the whole
-        // dirty set into one fat frame (`max_cells_per_tick` + packet
-        // splitting), so a burst rides along without widening fanout — the
-        // dirty-set size drives frame fill, not the peer pick. `config.fanout`
-        // is the floor; `.min(n)` makes small clusters full-mesh (at small n
-        // coverage demands it and the bandwidth is trivial). The early return
-        // above guarantees n ≥ 1, so `ln` is never called on 0 and `.min(n)`
-        // never clamps below 1.
-        let n = self.peers.len();
-        let coverage = ((n as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-        let pick_count = self.config.fanout.max(coverage).min(n);
-        // Record the coverage-fanout decision so observers can read the pick
-        // directly instead of reconstructing the formula. Only dirty ticks
-        // reach here, so `last_effective_fanout` is the fanout of the most
-        // recent tick that actually gossiped.
-        self.last_effective_fanout = pick_count;
-        self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
-        for i in 0..pick_count {
-            let j = i + (self.rng.next_u64() as usize) % (n - i);
-            self.peers.swap(i, j);
+        if round != Round::Relay {
+            // The store was non-empty when this tick fired — bench harness
+            // counts this as a "dirty tick" so effective-fanout reports
+            // `packets / dirty_ticks` rather than `packets / wall_ticks`.
+            self.dirty_ticks = self.dirty_ticks.saturating_add(1);
         }
 
-        for peer_idx in 0..pick_count {
+        // Step 2: a stream with data in flight past its retransmission
+        // timeout resumes from its last ack. A gateway that misses the
+        // deadline on our own stream is suspected, and the next-ranked member
+        // of its zone takes over.
+        let rto_floor_ms = self.config.rto_floor.as_millis() as u64;
+        let mut gateway_missed = false;
+        for peer in &mut self.peers {
+            let rto_ms = peer.rto_ms(rto_floor_ms);
+            if round != Round::Relay && peer.own.timed_out(now_ms, rto_ms) {
+                peer.own.rewind(now_ms);
+                if peer.gateway {
+                    peer.suspect = true;
+                    gateway_missed = true;
+                }
+            }
+            if peer.relay.timed_out(now_ms, rto_ms) {
+                peer.relay.rewind(now_ms);
+            }
+        }
+        if gateway_missed {
+            refresh_gateways(&mut self.peers, self.local_zone);
+        }
+
+        // Step 3: order each stream's candidate cells by sequence, from the
+        // lowest sequence any recipient still lacks.
+        let local_zone = self.local_zone;
+        let own_floor = if round == Round::Relay {
+            None
+        } else {
+            self.peers
+                .iter()
+                .filter(|p| p.zone == local_zone || p.gateway)
+                .map(|p| p.own.sent)
+                .min()
+                .filter(|&sent| sent < self.own_head)
+        };
+        let relay_floor = self
+            .peers
+            .iter()
+            .filter(|p| p.zone == local_zone)
+            .map(|p| p.relay.sent)
+            .min()
+            .filter(|&sent| sent < self.relay_head);
+        self.gather_streams(own_floor, relay_floor);
+
+        // Step 4: send, peer by peer.
+        let mut recipients = 0;
+        for i in 0..self.peers.len() {
             if self.send_free.is_empty() {
                 break;
             }
-            let peer_addr = self.peers[peer_idx].addr;
-            // `handle_inbound` writes `node_id` and `peer_slot` together —
-            // when one is `Some`, the other is too. So a single read of
-            // `peer_slot` is the full pruning decision.
-            let peer_slot = self.peers[peer_idx].peer_slot;
-
-            self.frame_handles.clear();
-            match peer_slot {
-                Some(slot) => {
-                    self.store.fill_gossip_frame_for_peer(
-                        self.config.max_cells_per_tick,
-                        slot,
-                        &mut self.frame_handles,
-                    );
-                }
-                None => {
-                    // Bootstrap fallback: we haven't heard from this peer
-                    // yet, so we don't know what to prune. Send an unpruned
-                    // frame; the next inbound from them caches the slot.
-                    self.store
-                        .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
-                }
+            let in_zone = self.peers[i].zone == local_zone;
+            let mut sent = false;
+            if round != Round::Relay && (in_zone || self.peers[i].gateway) {
+                sent |= self.send_stream(i, StreamKind::Own, now_ms);
             }
-            if self.frame_handles.is_empty() {
-                continue;
+            if in_zone {
+                sent |= self.send_stream(i, StreamKind::Relay, now_ms);
             }
-            self.encode_packets_for(peer_addr);
+            if round == Round::Heartbeat && !sent && self.peers[i].ack_due {
+                sent = self.send_ack(i);
+            }
+            recipients += usize::from(sent);
+        }
+        if recipients > 0 {
+            self.last_effective_fanout = recipients;
+            self.peak_effective_fanout = self.peak_effective_fanout.max(recipients);
         }
 
         // Reset per-rule pending. The sweep treats every rule with
-        // non-zero pending as "touched in expectation by the tick" — the
-        // dirty-ring drain in `fill_gossip_frame*` doesn't tell us which
-        // rule slots actually made it onto the wire, but mass conservation
-        // (Kempe, Dobra, Gehrke — FOCS 2003) says every pending hit either
-        // rode out in this frame or sits in the dirty ring awaiting the
-        // next one. Under UDP loss the residual is repaired by the next
-        // round; the N × ε_R bound holds in expectation. A strict bound
-        // would require ack-aware reset against `peer_frontiers`,
-        // deferred until measurements show drift.
-        let stamp = now_millis.max(1);
-        for slot in 0..self.rule_pending.len() {
-            if self.rule_pending[slot] != 0 {
-                self.rule_pending[slot] = 0;
-                self.rule_last_emit_ms[slot] = stamp;
+        // non-zero pending as "touched in expectation by the tick": a hit
+        // either rode out in this round's own-stream packets or waits in a
+        // stream for the next one.
+        if round != Round::Relay {
+            let stamp = now_ms.max(1);
+            for slot in 0..self.rule_pending.len() {
+                if self.rule_pending[slot] != 0 {
+                    self.rule_pending[slot] = 0;
+                    self.rule_last_emit_ms[slot] = stamp;
+                }
             }
         }
     }
 
-    fn encode_packets_for(&mut self, dst: SocketAddr) {
-        let header = wire::Header {
+    /// Rebuild `own_scratch` / `relay_scratch`: the live cells of each stream
+    /// above its floor, by ascending sequence. `None` skips a stream that has
+    /// nothing new for anyone. One pass over the store serves both.
+    fn gather_streams(&mut self, own_floor: Option<u64>, relay_floor: Option<u64>) {
+        self.own_scratch.clear();
+        self.relay_scratch.clear();
+        if own_floor.is_none() && relay_floor.is_none() {
+            return;
+        }
+        let local = self.store.local_node_slot();
+        for handle in self.store.active_handles() {
+            let Some(row) = self.store.get(handle) else {
+                continue;
+            };
+            if row.key.origin == local {
+                if own_floor.is_some_and(|floor| row.origin_sequence > floor) {
+                    self.own_scratch.push((row.origin_sequence, handle));
+                }
+            } else if let Some(floor) = relay_floor {
+                let stamp = self.relay_stamp[handle.index as usize];
+                if stamp > floor {
+                    self.relay_scratch.push((stamp, handle));
+                }
+            }
+        }
+        self.own_scratch.sort_unstable_by_key(|&(seq, _)| seq);
+        self.relay_scratch.sort_unstable_by_key(|&(seq, _)| seq);
+    }
+
+    /// Send peer `pi` the cells of `stream` above what we already sent it, up
+    /// to `max_cells_per_tick`. Returns whether a packet was queued.
+    fn send_stream(&mut self, pi: usize, stream: StreamKind, now_ms: u64) -> bool {
+        let candidates = match stream {
+            StreamKind::Own => &self.own_scratch,
+            StreamKind::Relay => &self.relay_scratch,
+        };
+        let peer = &self.peers[pi];
+        let out = match stream {
+            StreamKind::Own => peer.own,
+            StreamKind::Relay => peer.relay,
+        };
+        let start = candidates.partition_point(|&(seq, _)| seq <= out.sent);
+        self.frame_handles.clear();
+        self.frame_stamps.clear();
+        for &(seq, handle) in candidates[start..]
+            .iter()
+            .take(self.config.max_cells_per_tick)
+        {
+            self.frame_handles.push(handle);
+            self.frame_stamps.push(seq);
+        }
+        if self.frame_handles.is_empty() {
+            return false;
+        }
+        let header = self.header_for(
+            pi,
+            if stream == StreamKind::Relay {
+                FLAG_RELAY
+            } else {
+                0
+            },
+            out.sent,
+        );
+        let dst = self.peers[pi].addr;
+        let consumed = self.encode_packets_for(dst, header);
+        let Some(&upper) = consumed
+            .checked_sub(1)
+            .and_then(|last| self.frame_stamps.get(last))
+        else {
+            return false;
+        };
+        let peer = &mut self.peers[pi];
+        match stream {
+            StreamKind::Own => peer.own.note_sent(upper, now_ms),
+            StreamKind::Relay => peer.relay.note_sent(upper, now_ms),
+        }
+        peer.ack_due = false;
+        true
+    }
+
+    /// Send peer `pi` a header-only packet carrying our acks.
+    fn send_ack(&mut self, pi: usize) -> bool {
+        let Some(slot) = self.send_free.pop() else {
+            return false;
+        };
+        let header = self.header_for(pi, 0, 0);
+        let buf = &mut self.send_pool[slot as usize];
+        wire::encode_header_only::<C>(header, self.config.auth_key.as_ref(), buf);
+        let peer = &mut self.peers[pi];
+        peer.ack_due = false;
+        self.send_pending.push_back((peer.addr, slot));
+        true
+    }
+
+    /// The header for a packet to peer `pi`: our identity, the acks we owe it,
+    /// and the stream range starting after `stream_lower`.
+    fn header_for(&self, pi: usize, flags: u16, stream_lower: u64) -> wire::Header {
+        let peer = &self.peers[pi];
+        wire::Header {
             cluster_id_hash: self.config.cluster_id_hash,
             sender_node_id: self.store.local_identity().node_id.0,
             sender_incarnation: self.store.local_identity().incarnation,
             count_width: 0,
             cell_count: 0,
             body_len: 0,
-            min_origin_sequence: 0,
-            max_origin_sequence: 0,
-            flags: 0,
-        };
+            ack_own: peer.have_own,
+            ack_relay: peer.have_relay,
+            stream_lower,
+            stream_upper: 0,
+            flags,
+        }
+    }
 
+    /// Encode `frame_handles` (stamped by `frame_stamps`) into send slots for
+    /// `dst`. Returns how many handles went into queued packets; the rest wait
+    /// for the next round.
+    fn encode_packets_for(&mut self, dst: SocketAddr, header: wire::Header) -> usize {
         let packets_result = match self.config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
                 header,
@@ -856,25 +1036,36 @@ where
             ),
         };
         let mut packets = match packets_result {
-            Ok(p) => p,
-            Err(_) => return,
+            Ok(p) => p.with_stamps(&self.frame_stamps),
+            Err(_) => return 0,
         };
 
-        while let Some(slot) = self.send_free.pop() {
+        let mut consumed = 0;
+        loop {
+            let Some(slot) = self.send_free.pop() else {
+                // Out of send slots: the rest of the frame waits a round.
+                packets.abandon();
+                break;
+            };
             let buf = &mut self.send_pool[slot as usize];
             match packets.next_into(buf) {
-                Ok(Some(_)) => self.send_pending.push_back((dst, slot)),
+                Ok(Some(written)) => {
+                    consumed += (written.cells_emitted + written.cells_dropped) as usize;
+                    self.send_pending.push_back((dst, slot));
+                }
                 Ok(None) => {
                     self.send_free.push(slot);
                     break;
                 }
                 Err(_) => {
                     self.send_free.push(slot);
+                    packets.abandon();
                     break;
                 }
             }
         }
         drop(packets);
+        consumed
     }
 }
 
@@ -884,7 +1075,9 @@ enum ArmOutcome {
     Writable,
     PeerEvent(Option<PeerEvent>),
     Admin(Option<AdminCommand>),
-    Tick,
+    Heartbeat,
+    Threshold,
+    Relay,
 }
 
 /// Read one admin command. Only invoked when `admin_rx.is_some()` — the
@@ -894,22 +1087,4 @@ async fn recv_admin(rx: &mut Option<mpsc::Receiver<AdminCommand>>) -> Option<Adm
         .expect("admin arm gated by admin_rx.is_some()")
         .recv()
         .await
-}
-
-/// SplitMix64 — small, fast, deterministic. Used only for peer sampling so
-/// no security properties are required.
-pub(super) struct SplitMix64(u64);
-
-impl SplitMix64 {
-    pub(super) fn new(seed: u64) -> Self {
-        Self(seed.wrapping_add(0x9E37_79B9_7F4A_7C15))
-    }
-
-    pub(super) fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
 }

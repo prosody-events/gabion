@@ -22,16 +22,13 @@ pub const STORAGE_MAX_MATCHED_RULES: usize = 16;
 
 pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 
-/// Floor on the number of peers contacted per gossip tick. The runtime does
-/// **not** treat this as the operating fanout — it scales the actual per-tick
-/// fanout up to the coverage threshold `⌈ln(n) + GOSSIP_COVERAGE_MARGIN⌉`
-/// (`n` = live peer count), capped at the peer count. This floor is a hard
-/// minimum: it binds only if `GOSSIP_COVERAGE_MARGIN` is lowered far enough
-/// that the coverage threshold drops below it. At the shipped margin it never
-/// binds. See `handle_gossip_tick` in `gossip/runtime.rs`.
+/// Unused by the zone-hierarchical runtime, which sends to every zone peer and
+/// one gateway per remote zone instead of sampling a fanout. Kept only so the
+/// server config and the legacy bench scenarios still compile.
 pub const GOSSIP_FANOUT: usize = 3;
 
-/// Coverage margin `c` in the gossip fanout law `⌈ln(n) + c⌉` (`n` = live peer
+/// Unused by the zone-hierarchical runtime (see [`GOSSIP_FANOUT`]). Coverage
+/// margin `c` in the gossip fanout law `⌈ln(n) + c⌉` (`n` = live peer
 /// count). Per Kermarrec, Massoulié & Ganesh (IEEE TPDS 2003, "Probabilistic
 /// Reliable Dissemination in Large-Scale Systems", Theorem 1), a directed
 /// gossip round with mean fanout `ln(n) + c` reaches every node with
@@ -58,6 +55,25 @@ pub const GOSSIP_FANOUT: usize = 3;
 /// `const`; promote to a `GossipConfig` field if an operator ever needs to
 /// trade bandwidth for coverage at runtime.
 pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
+
+/// Prefix length, in bits, of the peer-address block that names a zone (an
+/// availability zone). Peers whose gossip addresses share this prefix are in
+/// one zone. `16` assumes one subnet per zone, as with per-AZ VPC subnets; it
+/// stands in for the EndpointSlice `endpoints[].zone` label, which
+/// `PeerEvent` does not carry.
+pub const GOSSIP_ZONE_PREFIX_LEN: u8 = 16;
+
+/// Floor, in milliseconds, on a stream's retransmission timeout. The timeout
+/// is `max(2 * RTT_est, GOSSIP_RTO_FLOOR_MS)`; the floor is one heartbeat
+/// tick, since a peer with nothing to send acks at its next tick.
+pub const GOSSIP_RTO_FLOOR_MS: u64 = 500;
+
+/// Minimum gap, in milliseconds, between two relay rounds: a gateway that
+/// receives cells from another zone forwards them into its own zone at the
+/// next relay round rather than waiting for the heartbeat, and no more than
+/// once per this interval so that arrivals within it share one packet per
+/// local peer.
+pub const GOSSIP_RELAY_FLOOR_MS: u64 = 5;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;

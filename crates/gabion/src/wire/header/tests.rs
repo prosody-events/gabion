@@ -8,14 +8,16 @@ fn sample() -> Header {
         count_width: 4,
         cell_count: 12,
         body_len: 192,
-        min_origin_sequence: 100,
-        max_origin_sequence: 200,
-        flags: FLAG_AUTHENTICATED | FLAG_MORE,
+        ack_own: 100,
+        ack_relay: 150,
+        stream_lower: 200,
+        stream_upper: 300,
+        flags: FLAG_AUTHENTICATED | FLAG_MORE | FLAG_RELAY,
     }
 }
 
 #[test]
-fn header_layout_is_72_bytes() {
+fn header_layout_is_88_bytes() {
     let mut buf = vec![0u8; HEADER_LEN];
     patch_header(&mut buf, &sample());
     assert_eq!(buf.len(), HEADER_LEN);

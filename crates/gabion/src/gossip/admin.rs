@@ -84,15 +84,11 @@ pub struct AdminSnapshot {
 }
 
 /// One peer known to the runtime. `node_id` is `None` until the runtime has
-/// received an inbound packet from this peer; `peer_slot` is `None` until the
-/// peer has been interned in the `PeerFrontierTable`. The two fields are set
-/// together — see the invariant tested in
-/// `quickcheck_peer_slot_pairing_holds_across_lifecycle`.
+/// received an inbound packet from this peer.
 #[derive(Clone, Copy, Debug)]
 pub struct PeerEntry {
     pub addr: SocketAddr,
     pub node_id: Option<NodeId>,
-    pub peer_slot: Option<u16>,
 }
 
 /// Full per-cell view of one runtime's `CellStore`, built inside the gossip

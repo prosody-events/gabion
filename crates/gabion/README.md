@@ -17,6 +17,7 @@ the [repo root README](../../README.md#glossary).
 ## Contents
 
 - [Module map](#module-map)
+- [Design notes](#design-notes)
 - [How gossip works](#how-gossip-works)
   - [The wire frame](#the-wire-frame)
   - [The anti-entropy loop](#the-anti-entropy-loop)
@@ -48,6 +49,76 @@ module, whereas `wire` and `crdt` are independent of each other.
 nothing else in this crate. Adapters consume the public surface of
 `gossip`, `rules`, and `discovery`, together with the constants in
 `defaults`.
+
+## Design notes
+
+This branch replaces main's sampled-fanout dissemination with **zone-hierarchical
+dissemination** (Astrolabe's zone hierarchy with zones set to availability zones;
+Van Renesse, Birman and Vogels, ACM TOCS 21(2), 2003, and the AZ-aligned gossip
+pools of Consul's segments, HashiCorp, "Consul scale test report", 2020). The
+sections below this one that describe coverage fanout, the dirty rings and the
+peer frontier describe main; this section describes what runs here.
+
+**Mechanism.** Every node knows the full membership from discovery and each peer's
+zone from its address.
+
+- *Level 0.* A node sends its own cells to every peer in its zone.
+- *Level 1.* For each other zone `Z` the node sends the same cells to one gateway
+  `g(origin, Z)`: the member of `Z` with the greatest rendezvous weight for the
+  origin (highest-random-weight hashing of the origin's node id and the member's
+  address). The gateway sends the cells it received straight from an origin in
+  another zone to every other member of its own zone, one batched packet per local
+  peer per relay round, and never beyond its zone.
+- *Hops are streams.* As in delta-state anti-entropy with acknowledgements (Almeida,
+  Shoker and Baquero, arXiv:1603.01529), a node's own cells form a stream sequenced by the
+  cells' `origin_sequence`; the cells a gateway relays form a second stream
+  sequenced by a per-node relay stamp. Each packet states the range
+  `(stream_lower, stream_upper]` of live cells it closes, and every packet to a
+  peer carries two cumulative acks (`ack_own`, `ack_relay`): the highest sequence of
+  the receiver's own and relay streams the sender holds contiguously. A packet
+  that starts above what the receiver holds (an earlier one was lost) is merged
+  but not acked past the gap. A header-only packet carries the acks when no data
+  flows back within the heartbeat tick.
+- *Loss repair.* A stream with data in flight for `max(2 * RTT_est, rto_floor)` (500 ms
+  floor, `RTT_est` a per-peer smoothed round trip from one timed in-flight packet,
+  never taken across a resend) resumes from the last ack, so the next round resends
+  exactly what the peer has not confirmed. A peer that is new, or that returned
+  after a long silence, is behind by the whole live window and receives it.
+- *Failover.* A gateway that misses that deadline on the origin's stream is marked
+  suspect and the next-ranked member of its zone takes over; hearing any packet from
+  the suspect clears the mark, so a recovered gateway regains its role. The ranking
+  is a pure function of the origin, the discovered members and the suspect marks.
+  Only missing acks trigger it.
+- *Scheduling.* Rounds are main's: a heartbeat every `tick_interval` and error-budget
+  threshold rounds in between. A relay round runs at most every `relay_floor` (5 ms)
+  while relayed cells await forwarding, and its first run after a quiet spell is
+  immediate.
+
+**Parameters** (`GossipConfig`, defaults in `gabion::defaults`): `zone_prefix_len`
+(16), `rto_floor` (500 ms), `relay_floor` (5 ms). One gateway per remote zone.
+
+**Adaptations from the source designs.**
+
+- *Zone labels from addresses.* `PeerEvent` carries only an address, so a peer's zone is
+  its address truncated to `zone_prefix_len` bits (one subnet per zone, as per-AZ VPC
+  subnets give). Production discovery could supply the EndpointSlice
+  `endpoints[].zone` label instead.
+- *No aggregation.* Astrolabe's gateways forward per-zone aggregates; here they forward
+  the origin's cells unchanged, so the per-origin CRDT join is exact. Astrolabe's
+  aggregation mode is not implemented.
+- *UDP, not TCP.* Per-hop reliability is the cumulative ack and retransmission
+  described above, the minimal substitute for the reliable channel a TCP hop would
+  give. It needs the two ack fields and the stream range in the wire header (88 bytes,
+  version 2) and one flag, `FLAG_RELAY`.
+- *Relay eligibility.* A gateway forwards a cell iff it arrived in an own-stream packet
+  from an origin outside the gateway's zone. Each cell slot carries a relay stamp (zero
+  for cells that must not be forwarded), so a cell is never forwarded twice.
+
+**What no longer applies.** The runtime makes no random choice, so `GossipConfig::rng_seed`
+and `fanout` are unused; the CRDT's dirty rings and peer frontier are no longer written
+to by the runtime (the rings are cleared after each mutation and
+`AdminSnapshot::local_dirty_len` / `forwarded_dirty_len` read `0`); `GOSSIP_FANOUT` and
+`GOSSIP_COVERAGE_MARGIN` remain only for the legacy bench scenarios.
 
 ## How gossip works
 
@@ -86,7 +157,7 @@ state on either side: each frame decodes independently, even if its
 predecessor was dropped. Loss of a packet costs you a few cells until
 the next tick refills them.
 
-The header is fixed at 72 bytes. Every multi-byte field is encoded
+The header is fixed at 88 bytes. Every multi-byte field is encoded
 little-endian; the first four bytes on the wire are `0x32 0x47 0x42
 0x47` so a packet capture reads `2GBG`. (The numeric `MAGIC` literal
 `0x4742_4732` spells "GBG2" when written most-significant byte first;
@@ -96,8 +167,8 @@ the LE encoding then writes those bytes in reverse.)
 byte  field                  width
 ----  ---------------------  -----
 0     MAGIC                  4   (0x4742_4732)
-4     VERSION                2   (= 1)
-6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED)
+4     VERSION                2   (= 2)
+6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED | FLAG_RELAY)
 8     cluster_id_hash       16
 24    sender_node_id        16
 40    sender_incarnation     4
@@ -105,10 +176,12 @@ byte  field                  width
                                   matches u16/u32/u64 `impl Count`)
 48    cell_count             4
 52    body_len               4
-56    min_origin_sequence    8
-64    max_origin_sequence    8
+56    ack_own                8   (receiver's own stream held through n)
+64    ack_relay              8   (receiver's relay stream held through n)
+72    stream_lower           8   (packet covers (stream_lower, stream_upper])
+80    stream_upper           8
 ----                       ----
-                            72
+                            88
 ```
 
 The body follows immediately. When `cell_count > 0` it carries a

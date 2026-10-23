@@ -156,6 +156,9 @@ impl GossipSettings {
             rng_seed,
             target_err_bps: self.target_err_bps,
             min_emit_interval: self.min_emit_interval,
+            zone_prefix_len: defaults::GOSSIP_ZONE_PREFIX_LEN,
+            rto_floor: Duration::from_millis(defaults::GOSSIP_RTO_FLOOR_MS),
+            relay_floor: Duration::from_millis(defaults::GOSSIP_RELAY_FLOOR_MS),
         }
     }
 }

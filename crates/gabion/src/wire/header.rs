@@ -1,15 +1,19 @@
-//! Fixed-length frame header — hand-rolled little-endian, exactly 72 bytes.
+//! Fixed-length frame header — hand-rolled little-endian, exactly 88 bytes.
 
 use super::DecodeError;
 
-pub const HEADER_LEN: usize = 72;
+pub const HEADER_LEN: usize = 88;
 pub const MAGIC: u32 = 0x4742_4732;
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 /// Set on every packet but the last in a multi-packet batch. Each packet is
 /// independently decodable — `FLAG_MORE` is only an advisory hint for
 /// receivers that want to defer downstream work until the batch settles.
 pub const FLAG_MORE: u16 = 0x01;
 pub const FLAG_AUTHENTICATED: u16 = 0x02;
+/// The packet's cells belong to the sender's *relay stream* (cells a gateway
+/// forwards into its own zone) rather than to its own-origin stream. It
+/// selects which sequence space `stream_lower`/`stream_upper` index.
+pub const FLAG_RELAY: u16 = 0x04;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {
@@ -19,8 +23,17 @@ pub struct Header {
     pub count_width: u32,
     pub cell_count: u32,
     pub body_len: u32,
-    pub min_origin_sequence: u64,
-    pub max_origin_sequence: u64,
+    /// Cumulative ack: the highest sequence of the *receiver's* own stream
+    /// the sender holds contiguously (`0` = none).
+    pub ack_own: u64,
+    /// Cumulative ack of the *receiver's* relay stream.
+    pub ack_relay: u64,
+    /// Exclusive lower bound of the stream range this packet covers: it
+    /// carries every live cell of the sender's stream with a sequence in
+    /// `(stream_lower, stream_upper]`.
+    pub stream_lower: u64,
+    /// Inclusive upper bound of the stream range this packet covers.
+    pub stream_upper: u64,
     pub flags: u16,
 }
 
@@ -36,8 +49,10 @@ pub(crate) fn patch_header(buf: &mut [u8], hdr: &Header) {
     dst[44..48].copy_from_slice(&hdr.count_width.to_le_bytes());
     dst[48..52].copy_from_slice(&hdr.cell_count.to_le_bytes());
     dst[52..56].copy_from_slice(&hdr.body_len.to_le_bytes());
-    dst[56..64].copy_from_slice(&hdr.min_origin_sequence.to_le_bytes());
-    dst[64..72].copy_from_slice(&hdr.max_origin_sequence.to_le_bytes());
+    dst[56..64].copy_from_slice(&hdr.ack_own.to_le_bytes());
+    dst[64..72].copy_from_slice(&hdr.ack_relay.to_le_bytes());
+    dst[72..80].copy_from_slice(&hdr.stream_lower.to_le_bytes());
+    dst[80..88].copy_from_slice(&hdr.stream_upper.to_le_bytes());
 }
 
 pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, DecodeError> {
@@ -59,8 +74,10 @@ pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, DecodeError> {
     let count_width = u32::from_le_bytes(bytes[44..48].try_into().unwrap());
     let cell_count = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
     let body_len = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
-    let min_origin_sequence = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
-    let max_origin_sequence = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+    let ack_own = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
+    let ack_relay = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+    let stream_lower = u64::from_le_bytes(bytes[72..80].try_into().unwrap());
+    let stream_upper = u64::from_le_bytes(bytes[80..88].try_into().unwrap());
     Ok(Header {
         cluster_id_hash,
         sender_node_id,
@@ -68,8 +85,10 @@ pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, DecodeError> {
         count_width,
         cell_count,
         body_len,
-        min_origin_sequence,
-        max_origin_sequence,
+        ack_own,
+        ack_relay,
+        stream_lower,
+        stream_upper,
         flags,
     })
 }
