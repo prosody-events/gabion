@@ -135,15 +135,15 @@ fn a_lost_eager_packet_is_asked_for_and_resent() {
             .unwrap();
         let pair = [a, b];
         let router = SimRouter::with_channel_capacity(64);
-        router.set_link_policy(a, b, LinkPolicy::DropFirst { count: 1 });
         let tick = Duration::from_secs(3600);
         let node_a = spawn_node(&router, &pair, 0, &[b], tick);
         let node_b = spawn_node(&router, &pair, 1, &[a], tick);
 
         // Each record crosses the error budget and is sent at once. The first
-        // packet is lost; the second shows B the gap.
-        // Let the heartbeat that fires at start go by.
+        // packet is lost; the second shows B the gap. Let the start-up
+        // traffic go by first.
         run_for(10).await;
+        router.set_link_policy(a, b, LinkPolicy::DropFirst { count: 1 });
         let mut model = Model::new();
         record(&node_a, &mut model, 1, 5).await;
         run_for(50).await;
@@ -163,7 +163,48 @@ fn a_lost_eager_packet_is_asked_for_and_resent() {
 }
 
 #[test]
-fn a_node_that_joins_late_learns_the_state_from_digests() {
+fn a_change_lost_below_the_high_water_mark_is_found_by_ihave() {
+    run_paused(async {
+        let all: Vec<SocketAddr> = addrs(60);
+        let a = all[0];
+        let b = *all[1..]
+            .iter()
+            .find(|x| class_of(x) == class_of(&a))
+            .unwrap();
+        let pair = [a, b];
+        let router = SimRouter::with_channel_capacity(64);
+        // Only A has a heartbeat, so only A announces.
+        let node_a = spawn_node(&router, &pair, 0, &[b], Duration::from_millis(500));
+        let node_b = spawn_node(&router, &pair, 1, &[a], Duration::from_secs(3600));
+        run_for(10).await;
+
+        // A's first packet to B is lost, and so are B's first three control
+        // frames to A: the NACK that would ask for it, and its retries. A's
+        // second change reaches B, which then holds a later change of A's
+        // than the one it lacks.
+        router.set_link_policy(a, b, LinkPolicy::DropFirst { count: 1 });
+        router.set_link_policy(b, a, LinkPolicy::DropFirst { count: 3 });
+        let mut model = Model::new();
+        record(&node_a, &mut model, 1, 5).await;
+        run_for(50).await;
+        record(&node_a, &mut model, 2, 7).await;
+        run_for(300).await;
+        assert_eq!(
+            node_b.agg.snapshot(),
+            Model::from([((rule_fp(0), key_hash(2).0, 0), 7)]),
+            "B should hold the later change and lack the earlier"
+        );
+
+        // A's next heartbeat names both changes. B misses one, waits out the
+        // missing timeout, and asks for it.
+        run_for(1500).await;
+        assert_eq!(node_b.agg.snapshot(), model);
+        stop(vec![node_a, node_b]).await;
+    });
+}
+
+#[test]
+fn a_node_that_joins_late_pulls_the_state_from_a_peer() {
     run_paused(async {
         const OLD: usize = 6;
         let all = addrs(OLD + 1);
@@ -190,9 +231,16 @@ fn a_node_that_joins_late_learns_the_state_from_digests() {
         }
         run_for(500).await;
 
-        // The newcomer lists every member; the members hear of it from
-        // discovery, and each tells it what it holds.
-        let late = spawn_node(&router, &all, OLD, &all[..OLD], tick);
+        // Discovery tells the newcomer of every member, and the members of
+        // the newcomer. The newcomer's first request may reach a member
+        // before discovery has told it of the newcomer, which ignores it, so
+        // the newcomer asks again at its next heartbeat.
+        let late = spawn_node(&router, &all, OLD, &[], Duration::from_millis(500));
+        for member in &all[..OLD] {
+            late.peer_events
+                .send(PeerEvent::Added(Peer::new(*member)))
+                .unwrap();
+        }
         for node in &nodes {
             node.peer_events
                 .send(PeerEvent::Added(Peer::new(all[OLD])))

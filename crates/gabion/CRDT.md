@@ -1039,7 +1039,7 @@ The origin and incarnation columns of the batch are ignored on the local path be
 
 `merge_remote(obs, sink)` is symmetric with `ingest_local` apart from three differences. The origin and incarnation come from the batch — that is, from the peer that attributed the hit. `obs.counts[i]` is an *absolute* observed count rather than a delta, so the store max-merges by keeping `max(stored, observed)`. And `translate_identity` interns both the rule fingerprint and the `(node_id, incarnation)` pair into dictionary slots, admitting unknown rules with a default descriptor. The call is then `upsert(UpsertSpec { …, mode: MaxMerge { observed, origin_sequence } }, sink)`.
 
-The merged cell keeps the origin's own `origin_sequence` from `obs.origin_sequences[i]` instead of taking the next value of a local counter, so `(origin, incarnation, origin_sequence)` names one change on every node, and `highest_origin_sequence(origin)` is the highest sequence of that origin the store holds. The tree dissemination (see the gossip [design notes](README.md#design-notes-thicket-dissemination)) routes a change by that name and announces origins by that mark.
+The merged cell keeps the origin's own `origin_sequence` from `obs.origin_sequences[i]` instead of taking the next value of a local counter, so `(origin, incarnation, origin_sequence)` names one change on every node. The tree dissemination (see the gossip [design notes](README.md#design-notes-thicket-dissemination)) routes a change by that name and announces it by that name.
 
 ### 6.3 The shared `upsert` core
 

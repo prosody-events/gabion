@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use super::*;
+use crate::crdt::CellHandle;
 use crate::defaults::THICKET_TREES;
 
 fn addr(i: u16) -> SocketAddr {
@@ -212,4 +213,31 @@ impl Thicket {
             }
         }
     }
+}
+
+#[test]
+fn a_cell_is_queued_for_ihave_once_per_version_and_again_once_taken() {
+    let mut t = cluster(3);
+    let cell = |index, generation| CellHandle { index, generation };
+
+    t.queue_lazy(cell(4, 1));
+    t.queue_lazy(cell(4, 1));
+    t.queue_lazy(cell(5, 1));
+    assert_eq!(t.lazy.len(), 2, "a cell that changed again is named once");
+
+    // The slot was freed and reused before the next heartbeat: the new cell
+    // is another version and is queued as well.
+    t.queue_lazy(cell(4, 3));
+    assert_eq!(t.lazy.len(), 3);
+
+    t.dequeue_lazy(2);
+    assert_eq!(t.lazy, vec![cell(4, 3)]);
+    t.queue_lazy(cell(4, 3));
+    assert_eq!(
+        t.lazy.len(),
+        1,
+        "the version still queued is not queued twice"
+    );
+    t.queue_lazy(cell(5, 1));
+    assert_eq!(t.lazy.len(), 2, "a taken cell can be queued again");
 }

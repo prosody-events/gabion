@@ -2430,7 +2430,7 @@ fn remote_with_sequence(
 }
 
 #[test]
-fn merged_cell_keeps_the_origin_sequence_and_raises_its_high_water_mark() {
+fn merged_cell_keeps_the_origin_sequence() {
     let mut store = small_store(8, 8);
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
 
@@ -2440,15 +2440,12 @@ fn merged_cell_keeps_the_origin_sequence_and_raises_its_high_water_mark() {
         row.origin_sequence, 40,
         "not re-stamped with a local counter"
     );
-    assert_eq!(store.highest_origin_sequence(row.key.origin), 40);
 
-    // A change with a lower sequence (another cell, delivered late) does not
-    // lower the mark, and one above it raises it.
+    // A change with a lower sequence (another cell, delivered late) keeps its
+    // own number too.
     let late = remote_with_sequence(&mut store, 2, 7, 1, 12).unwrap();
     assert_eq!(store.get(late).unwrap().origin_sequence, 12);
-    assert_eq!(store.highest_origin_sequence(row.key.origin), 40);
     remote_with_sequence(&mut store, 3, 7, 1, 41).unwrap();
-    assert_eq!(store.highest_origin_sequence(row.key.origin), 41);
 
     // The forwarded ring names the change by the origin's sequence.
     let mut seen = Vec::new();
@@ -2469,7 +2466,6 @@ fn local_changes_keep_numbering_from_the_local_counter() {
     assert_eq!(a, again);
     assert_eq!(store.get(b).unwrap().origin_sequence, 2);
     assert_eq!(store.get(again).unwrap().origin_sequence, 3);
-    assert_eq!(store.highest_origin_sequence(store.local_node_slot()), 3);
 }
 
 #[test]
@@ -2494,34 +2490,6 @@ fn find_cell_reports_handle_and_sequence() {
     assert_eq!(store.find_cell(0x11, KeyHash(2), 0, NodeId(7), 1), None);
     assert_eq!(store.find_cell(0x22, KeyHash(1), 0, NodeId(7), 1), None);
     assert_eq!(store.find_cell(0x11, KeyHash(1), 0, NodeId(8), 1), None);
-}
-
-#[test]
-fn visit_cells_after_returns_each_origins_cells_above_its_floor() {
-    let mut store = small_store(8, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
-    let a1 = remote_with_sequence(&mut store, 1, 7, 1, 1).unwrap();
-    let a2 = remote_with_sequence(&mut store, 2, 7, 1, 2).unwrap();
-    let b1 = remote_with_sequence(&mut store, 3, 8, 1, 1).unwrap();
-    let slot_a = store.get(a1).unwrap().key.origin;
-    let slot_b = store.get(b1).unwrap().key.origin;
-
-    let mut since = vec![u64::MAX; store.node_dictionary().capacity() as usize];
-    let visit = |since: &[u64]| {
-        let mut got = Vec::new();
-        store.visit_cells_after(since, |h| {
-            got.push(h);
-            true
-        });
-        got.sort_by_key(|h| h.index);
-        got
-    };
-    assert!(visit(&since).is_empty(), "no origin asked for");
-    since[usize::from(slot_a)] = 1;
-    assert_eq!(visit(&since), vec![a2]);
-    since[usize::from(slot_a)] = 0;
-    since[usize::from(slot_b)] = 0;
-    assert_eq!(visit(&since), vec![a1, a2, b1]);
 }
 
 #[test]

@@ -765,27 +765,6 @@ impl<C: Count> CellStore<C> {
             < u64::from(descriptor.current_epoch(now_millis))
     }
 
-    /// Visit every live cell whose origin has `since[origin] != u64::MAX` and
-    /// whose origin sequence is above `since[origin]`, in storage order.
-    /// `since` is indexed by [`NodeSlot`]. A full scan of the cell columns:
-    /// for answering a pull, not for the per-request path. `visit` returning
-    /// `false` halts the scan.
-    pub fn visit_cells_after(&self, since: &[u64], mut visit: impl FnMut(CellHandle) -> bool) {
-        debug_assert_eq!(since.len(), self.next_sequence_by_origin.len());
-        for slot in 0..self.capacity {
-            if !self.is_active(slot) {
-                continue;
-            }
-            let floor = since[self.origins[slot as usize] as usize];
-            if floor != u64::MAX
-                && self.origin_sequences[slot as usize] > floor
-                && !visit(self.handle_for(slot))
-            {
-                return;
-            }
-        }
-    }
-
     // -- Slot lifecycle -----------------------------------------------------
 
     fn alloc_slot(&mut self) -> Option<u32> {
@@ -851,13 +830,6 @@ impl<C: Count> CellStore<C> {
                 origin_sequence
             }
         }
-    }
-
-    /// Highest sequence of `origin`'s changes this store holds: the origin's
-    /// own counter for the local node, the highest merged for a remote one.
-    /// `0` for an origin with no live cells.
-    pub fn highest_origin_sequence(&self, origin: NodeSlot) -> u64 {
-        self.next_sequence_by_origin[origin as usize]
     }
 
     fn push_dirty(&mut self, origin: NodeSlot, handle: CellHandle, sequence: u64) {

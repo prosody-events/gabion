@@ -9,12 +9,16 @@
 //! [ kind        : u8      ]
 //! [ tree        : u8      ]    which tree the message is about
 //! [ entry_count : u16     ]
-//! [ entries     : 28 × N  ]    node_id u128, incarnation u32, value u64
+//! [ entries     : N × size ]
 //! ```
 //!
-//! What `value` means depends on `kind`; see [`ControlKind`].
+//! An entry is `node_id u128, incarnation u32, value u64` (28 bytes). The
+//! kinds that name one cell version, [`ControlKind::Ihave`] and
+//! [`ControlKind::Graft`], add `rule_fingerprint u128, key_hash u128,
+//! bucket u32` (64 bytes). What `value` means depends on `kind`; see
+//! [`ControlKind`].
 
-use crate::crdt::{Incarnation, NodeId};
+use crate::crdt::{BucketEpoch, Incarnation, KeyHash, NodeId};
 
 use super::auth::{self, AUTH_TAG_LEN};
 use super::header::{patch_header, read_header};
@@ -24,18 +28,21 @@ use super::{
 };
 
 const BODY_PREFIX: usize = 4;
-/// Bytes of one control entry on the wire.
+/// Bytes of one control entry that names an origin only.
 pub const CONTROL_ENTRY_BYTES: usize = 16 + 4 + 8;
+/// Bytes of one control entry that names a cell version.
+pub const CHANGE_ENTRY_BYTES: usize = CONTROL_ENTRY_BYTES + 16 + 16 + 4;
 
 /// What a control frame asks of its receiver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlKind {
-    /// "Origin `node_id` has changes up to sequence `value`." Lazy push: ids
+    /// "I hold this version of this cell": origin `node_id`'s change number
+    /// `value` to the cell named by the rest of the entry. Lazy push: ids
     /// only, no cells.
     Ihave,
-    /// "Send me origin `node_id`'s cells above sequence `value`, and make me
-    /// a tree neighbour for `tree`." `tree == PULL_ONLY_TREE` asks for the
-    /// cells alone.
+    /// "Send me the current cell for each entry whose `value` is not
+    /// [`NO_CELLS`], and make me a tree neighbour for `tree`, for the roots
+    /// the entries name." `tree == PULL_ONLY_TREE` asks for the cells alone.
     Graft,
     /// "Stop pushing origin `node_id`'s changes to me" for each entry, or,
     /// with no entries, "I am no longer your leaf in `tree`."
@@ -45,7 +52,14 @@ pub enum ControlKind {
     /// "My latest packet to you was numbered `value`." Lets a receiver notice
     /// that the end of a burst was lost.
     Probe,
+    /// "Send me your next slice of live cells." No entries. How a node that
+    /// joined with no state is brought up to date.
+    Pull,
 }
+
+/// The `value` of a [`ControlKind::Graft`] entry that asks for no cells, only
+/// a place in the tree.
+pub const NO_CELLS: u64 = u64::MAX;
 
 /// The `tree` of a [`ControlKind::Graft`] that asks for cells only.
 pub const PULL_ONLY_TREE: u8 = u8::MAX;
@@ -58,6 +72,15 @@ impl ControlKind {
             Self::Prune => 3,
             Self::Nack => 4,
             Self::Probe => 5,
+            Self::Pull => 6,
+        }
+    }
+
+    /// Bytes of one entry of this kind.
+    pub fn entry_bytes(self) -> usize {
+        match self {
+            Self::Ihave | Self::Graft => CHANGE_ENTRY_BYTES,
+            Self::Prune | Self::Nack | Self::Probe | Self::Pull => CONTROL_ENTRY_BYTES,
         }
     }
 
@@ -68,6 +91,7 @@ impl ControlKind {
             3 => Self::Prune,
             4 => Self::Nack,
             5 => Self::Probe,
+            6 => Self::Pull,
             _ => return None,
         })
     }
@@ -79,6 +103,10 @@ pub struct ControlEntry {
     pub node_id: NodeId,
     pub incarnation: Incarnation,
     pub value: u64,
+    /// The cell a change is of. Zero in the kinds that do not carry it.
+    pub rule_fingerprint: u128,
+    pub key_hash: KeyHash,
+    pub bucket: BucketEpoch,
 }
 
 /// The fixed part of a decoded control frame.
@@ -111,7 +139,7 @@ pub fn encode_control(
     let room = limits
         .max_payload_bytes
         .saturating_sub(HEADER_LEN + BODY_PREFIX + auth_overhead);
-    let fit = (room / CONTROL_ENTRY_BYTES).min(usize::from(u16::MAX));
+    let fit = (room / kind.entry_bytes()).min(usize::from(u16::MAX));
     if fit == 0 && !entries.is_empty() {
         return Err(EncodeError::BudgetTooSmall);
     }
@@ -126,6 +154,12 @@ pub fn encode_control(
         buf.inner.extend_from_slice(&e.node_id.0.to_le_bytes());
         buf.inner.extend_from_slice(&e.incarnation.to_le_bytes());
         buf.inner.extend_from_slice(&e.value.to_le_bytes());
+        if kind.entry_bytes() == CHANGE_ENTRY_BYTES {
+            buf.inner
+                .extend_from_slice(&e.rule_fingerprint.to_le_bytes());
+            buf.inner.extend_from_slice(&e.key_hash.0.to_le_bytes());
+            buf.inner.extend_from_slice(&e.bucket.to_le_bytes());
+        }
     }
 
     let mut packet_header = header;
@@ -180,16 +214,23 @@ pub fn decode_control(
     let tree = body[1];
     let count = usize::from(u16::from_le_bytes([body[2], body[3]]));
     let rows = &body[BODY_PREFIX..];
-    if rows.len() != count * CONTROL_ENTRY_BYTES {
+    let width = kind.entry_bytes();
+    if rows.len() != count * width {
         return Err(DecodeError::BadControl);
     }
-    let (rows, _) = rows.as_chunks::<CONTROL_ENTRY_BYTES>();
-    for row in rows {
-        on_entry(ControlEntry {
+    for row in rows.chunks_exact(width) {
+        let mut entry = ControlEntry {
             node_id: NodeId(u128::from_le_bytes(std::array::from_fn(|i| row[i]))),
             incarnation: u32::from_le_bytes(std::array::from_fn(|i| row[16 + i])),
             value: u64::from_le_bytes(std::array::from_fn(|i| row[20 + i])),
-        });
+            ..ControlEntry::default()
+        };
+        if width == CHANGE_ENTRY_BYTES {
+            entry.rule_fingerprint = u128::from_le_bytes(std::array::from_fn(|i| row[28 + i]));
+            entry.key_hash = KeyHash(u128::from_le_bytes(std::array::from_fn(|i| row[44 + i])));
+            entry.bucket = u32::from_le_bytes(std::array::from_fn(|i| row[60 + i]));
+        }
+        on_entry(entry);
     }
     Ok(DecodedControl { header, kind, tree })
 }

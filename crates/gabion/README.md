@@ -55,8 +55,9 @@ nothing else in this crate. Adapters consume the public surface of
 > **This branch disseminates along Thicket trees.** Sections "The
 > anti-entropy loop", "Coverage fanout" and "Dirty rings and the peer
 > frontier" below describe the baseline, whose random per-round fanout and
-> peer-frontier pruning the trees replace. The adaptive emit rate, the wire
-> frame and the CRDT are unchanged. What replaces the baseline, and every
+> peer-frontier pruning the trees replace. The adaptive emit rate is unchanged;
+> the wire frame gains an edge number and control frames, and the CRDT keeps
+> the origin's sequence on merge. What replaces the baseline, and every
 > way it departs from the papers, is in
 > [Design notes: Thicket dissemination](#design-notes-thicket-dissemination).
 
@@ -95,7 +96,7 @@ state on either side: each frame decodes independently, even if its
 predecessor was dropped. Loss of a packet costs you a few cells until
 the next tick refills them.
 
-The header is fixed at 72 bytes. Every multi-byte field is encoded
+The header is fixed at 80 bytes. Every multi-byte field is encoded
 little-endian; the first four bytes on the wire are `0x32 0x47 0x42
 0x47` so a packet capture reads `2GBG`. (The numeric `MAGIC` literal
 `0x4742_4732` spells "GBG2" when written most-significant byte first;
@@ -106,7 +107,8 @@ byte  field                  width
 ----  ---------------------  -----
 0     MAGIC                  4   (0x4742_4732)
 4     VERSION                2   (= 1)
-6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED)
+6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED |
+                                  FLAG_EDGE | FLAG_CONTROL)
 8     cluster_id_hash       16
 24    sender_node_id        16
 40    sender_incarnation     4
@@ -116,8 +118,9 @@ byte  field                  width
 52    body_len               4
 56    min_origin_sequence    8
 64    max_origin_sequence    8
+72    edge_sequence          8   (number on the eager edge; 0 off it)
 ----                       ----
-                            72
+                            80
 ```
 
 The body follows immediately. When `cell_count > 0` it carries a
@@ -397,13 +400,14 @@ over Plumtree (Leitão, Pereira & Rodrigues, *Epidemic Broadcast Trees*, SRDS
 5. **PRUNE.** A node that receives a second eager copy of a change moves the
    sender to lazy for that root. A leaf that is pushed to by a node that is
    not its parent detaches from it.
-6. **IHAVE and GRAFT.** Each heartbeat a node sends an IHAVE digest to 2
-   random peers. A digest entry for changes not delivered within 500 ms makes
-   the receiver GRAFT the announcer: it asks for the cells and, if the missing
-   changes travel in its own tree, to become the announcer's tree neighbour.
-   A GRAFT never makes the receiver interior in a second tree: for any other
-   tree the grafting node is at most a leaf child, and only of an interior
-   node of that tree.
+6. **IHAVE and GRAFT.** Each heartbeat a node sends an IHAVE to 2 random peers
+   naming each change it made, or that a tree pushed to it, since the last
+   one. A receiver that holds neither that version of the cell nor a newer one
+   starts a 500 ms timer for the change, and when it runs out GRAFTs the
+   announcer: it asks for the cell and, if the change travels in its own tree,
+   to become the announcer's tree neighbour. A GRAFT never makes the receiver
+   interior in a second tree: for any other tree the grafting node is at most
+   a leaf child, and only of an interior node of that tree.
 7. **Scheduling.** The shared scheduler is unchanged: a node's own changes
    leave on the 500 ms heartbeat or a threshold round (error budget, 5 ms
    floor). A change merged from a peer is forwarded in a relay round.
@@ -418,11 +422,14 @@ All are constants in `gabion::defaults` (`THICKET_*`). They are not
 |---|---|---|
 | `THICKET_TREES` | 3 | `T`, matched to three availability zones |
 | `THICKET_MISSING_TIMEOUT_MS` | 500 | an announced change may be missing this long before GRAFT |
-| `THICKET_LAZY_TARGETS` | 2 | peers sent the IHAVE digest per heartbeat |
+| `THICKET_LAZY_TARGETS` | 2 | peers sent the IHAVE per heartbeat |
 | `THICKET_RELAY_FLOOR_MS` | 5 | spacing of relay rounds |
-| `THICKET_NACK_RETRY_MS` | 100 | wait before asking for a lost packet again; PRUNE spacing |
-| `THICKET_IHAVE_FULL_EVERY` | 8 | heartbeats between full digests |
-| `THICKET_REPAIR_CELLS` | 256 | cells of the repair slice per heartbeat |
+| `THICKET_NACK_RETRY_MS` | 100 | wait before asking for a lost packet again |
+| `THICKET_REPAIR_CELLS` | 256 | cells of the repair slice per heartbeat, and per catch-up request |
+| `THICKET_MISSING_CAPACITY` | 4096 | announced changes tracked at once |
+| `THICKET_GRAFT_ATTEMPTS` | 3 | GRAFTs sent for one change |
+| `THICKET_PROBE_REPEATS` | 3 | heartbeats a PROBE is repeated after the last eager packet |
+| `THICKET_CATCH_UP_ATTEMPTS` | 6 | requests a node that joined empty makes for its first slice |
 
 `fanout` has no effect here, and `max_cells_per_tick` now caps the cells in
 one frame to one neighbour. `GOSSIP_SEND_QUEUE_CAPACITY` is 512: a round
@@ -435,8 +442,9 @@ data and UDP.
 
 - **A message is a cell version, named end to end.** The papers' message ids
   need a cluster-wide name. `CellStore::merge_remote` now keeps the origin's
-  sequence instead of re-stamping the cell with a local counter, and keeps the
-  origin's highest sequence per origin ([`CRDT.md`](CRDT.md)).
+  sequence instead of re-stamping the cell with a local counter
+  ([`CRDT.md`](CRDT.md)), so `(origin, incarnation, sequence)` plus the cell's
+  rule, key and bucket names one change on every node.
 - **Per-root eager sets**, as `riak_core_broadcast` does. A single shared tree
   is unstable with every node sending: wavefronts of different origins meet at
   different edges and prune each other.
@@ -451,13 +459,19 @@ data and UDP.
   per-edge number (`Header::edge_sequence`); a receiver that sees one skipped
   sends a NACK (control frame, `wire::control`) and the sender resends from
   its last 512 packets. A heartbeat PROBE names the latest number so that the
-  loss of a burst's tail shows. A lost packet is asked for 3 times.
-- **IHAVE names an origin, not a message.** Cells supersede one another, so a
-  change cannot be named once it is replaced. A digest entry is an origin and
-  the highest sequence held. Deltas go out each heartbeat, the full digest
-  every 8th, and a full digest goes to a peer as soon as discovery adds it.
-  GRAFT asks for an origin's cells above the sequence the requester holds,
-  oldest first.
+  loss of a burst's tail shows, and is repeated for 3 heartbeats so that one
+  lost probe does not hide it. A lost packet is asked for 3 times, and a GRAFT
+  that nothing answered is sent again, up to 3 times.
+- **IHAVE names a cell version.** Plumtree announces every message id, so a
+  message lost below a later one is still announced. Here a message is a cell
+  version, and an entry is that version's origin, incarnation and sequence
+  and the cell's rule fingerprint, key hash and bucket (64 bytes). The
+  receiver looks the cell up and starts the missing timer only if it holds
+  neither that version nor a newer one. A cell that changed again since it was
+  queued is named once, at its newest version, because the older one is
+  superseded. A GRAFT names the same entries and is answered with the current
+  cell of each. Only changes made here or pushed by a tree are announced, once,
+  to 2 peers: cells delivered by a GRAFT or the repair slice are not.
 - **Duplicates are exact.** A row is a duplicate only if the node holds
   exactly that version and it arrived by a tree edge or was made here. An
   older version arriving after a newer one that took a faster tree is a first
@@ -468,9 +482,23 @@ data and UDP.
   pruned around the old one, so a timeout pulls the cells and leaves the
   parent alone. A parent is replaced when discovery removes it, and the attach
   GRAFT is repeated each heartbeat.
-- **Repair slice.** A max-sequence digest cannot see a hole in the middle of
-  an origin's sequences, so each heartbeat the node also sends one random peer
-  the next 256 cells of the store's rotating repair sweep, outside the trees.
+- **Repair slice.** An IHAVE is sent once, to 2 peers, so a node that missed
+  both the push and the announcement (a partition, a long outage) would never
+  hear of the change. Each heartbeat the node also sends one random peer the
+  next 256 cells of the store's rotating repair sweep, outside the trees. It
+  is the shared store's anti-entropy lane, and the only recovery for changes
+  older than their announcement.
+- **Catching up.** The papers do not move state to a node that joins, because
+  a broadcast has none. A node with an empty store that discovery adds a
+  peer to asks a random peer for its next repair slice (`Pull` control frame) and, as long as a
+  slice teaches it something, for the next from the same peer, until one
+  does not. A request
+  that nothing answers within a heartbeat, for example because the peer has
+  not yet heard of the newcomer from discovery, goes to another peer, up to 6
+  times. Slices are paced by the round trip, so a joiner is not sent the
+  whole store at once.
+- **PRUNE on every duplicate.** As Plumtree does, with no spacing between
+  PRUNEs to one sender.
 - **Expired cells are not merged.** A tree forwards whatever it newly merges,
   so a cell taken back in after its window passed would circulate. Rows of a
   rule whose bucket is already out of the window are dropped before merging.
@@ -500,7 +528,7 @@ it splits into the two adaptive halves of the protocol.
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
 | `fanout`             | 3           | No effect on this branch: changes travel down the trees ([design notes](#design-notes-thicket-dissemination)). The backbone view is sized `⌈ln(m)+c⌉` from `GOSSIP_COVERAGE_MARGIN`. | Leave alone. |
-| `max_cells_per_tick` | 4 096       | Cap on cells in one frame to one tree neighbour. Cells over the cap are not sent to that neighbour, which finds the gap through the lazy digest. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
+| `max_cells_per_tick` | 4 096       | Cap on cells in one frame to one tree neighbour. Cells over the cap are not sent to that neighbour, which finds the gap through the lazy IHAVE. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
 | `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 
 ### Per-rule error budget (adaptive emit rate)

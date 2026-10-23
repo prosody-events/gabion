@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 
 use crate::crdt::{CellHandle, CellStore, Count};
+use crate::defaults::THICKET_PROBE_REPEATS;
 use crate::wire::{self, ControlEntry, ControlKind, FLAG_EDGE, Packets, encode_control};
 
 use super::super::clock::Clock;
@@ -87,6 +88,7 @@ where
                             let consumed = before - packets.remaining();
                             let edge = &mut self.thicket.peers[usize::from(dst)].edge;
                             edge.send_seq = written.edge_sequence;
+                            edge.probes_left = THICKET_PROBE_REPEATS;
                             self.thicket.sent.push(
                                 dst,
                                 written.edge_sequence,
@@ -159,7 +161,7 @@ where
                 "Gossip frames were not sent because the send queue was full, \
                  so this peer will hear of these changes late. They were \
                  dropped, not queued: the peer finds the gap through the \
-                 periodic IHAVE digest and asks for the cells with a GRAFT. \
+                 IHAVE announcement and asks for the cells with a GRAFT. \
                  Usually a burst of new keys, or a socket that is not draining; \
                  if it keeps happening, raise `gossip.send_queue_capacity` \
                  (nginx: `gabion_gossip_send_queue_capacity`).",

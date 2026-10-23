@@ -250,7 +250,8 @@ where
             usize::from(store.peer_frontiers().peer_capacity()),
             store.node_dictionary().capacity() as usize,
             store.capacity() as usize,
-            config.wire_limits.max_payload_bytes / wire::CONTROL_ENTRY_BYTES + 1,
+            (config.wire_limits.max_payload_bytes / wire::CONTROL_ENTRY_BYTES + 1)
+                .max(config.max_cells_per_tick),
         );
         let rng = SplitMix64::new(config.rng_seed);
 
@@ -476,8 +477,9 @@ where
             origin_sequence: 0,
         });
         self.store.ingest_local(&self.obs_buf, &mut self.sink_buf);
-        for handle in &self.sink_buf.handles {
+        for &handle in &self.sink_buf.handles {
             self.thicket.arrival[handle.index as usize] = Arrival::Local;
+            self.thicket.queue_lazy(handle);
         }
         // Reply is sent at the bottom of this loop iteration, AFTER the
         // post-iteration apply runs. Caller observes "ack ⇒ AggregateStore
@@ -549,9 +551,12 @@ where
         } else {
             Arrival::Other
         };
-        for handle in &self.sink_buf.handles {
+        for &handle in &self.sink_buf.handles {
             self.thicket.from_peer[handle.index as usize] = from;
             self.thicket.arrival[handle.index as usize] = arrival;
+            if arrival == Arrival::Eager {
+                self.thicket.queue_lazy(handle);
+            }
         }
         if !self.sink_buf.is_empty() {
             self.thicket.relay_pending = true;
@@ -559,8 +564,13 @@ where
         if let Some(peer) = peer {
             self.thicket.peers[usize::from(peer)].node_id =
                 Some(NodeId(summary.header.sender_node_id));
-            if summary.flags & FLAG_EDGE != 0 && self.edge_receive(peer, &summary.header, now) {
-                self.eager_feedback(peer, now);
+            if summary.flags & FLAG_EDGE != 0 {
+                if self.edge_receive(peer, &summary.header, now) {
+                    self.eager_feedback(peer);
+                }
+            } else {
+                let news = !self.sink_buf.is_empty();
+                self.catch_up_received(peer, summary.flags, news, now);
             }
         }
     }
@@ -687,7 +697,7 @@ where
     fn handle_peer_event(&mut self, evt: PeerEvent) {
         match evt {
             PeerEvent::Added(p) => {
-                let (peer, new) = self.thicket.add_peer(p.addr);
+                let (_, new) = self.thicket.add_peer(p.addr);
                 if new {
                     tracing::info!(
                         peer = %p.addr,
@@ -695,7 +705,7 @@ where
                         "Peer joined the cluster.",
                     );
                     self.maintain_structure();
-                    self.send_digest_to(peer);
+                    self.begin_catch_up();
                 }
             }
             PeerEvent::Removed(p) => {
@@ -737,7 +747,7 @@ where
         // Step 2: heartbeat upkeep, then send this node's changes (and any
         // not yet relayed) along the trees.
         if let Round::Heartbeat = round {
-            self.heartbeat();
+            self.heartbeat(now_millis);
         }
         self.maintain_structure();
         if self.store.is_empty() || self.thicket.alive == 0 {
@@ -775,7 +785,7 @@ enum ArmOutcome {
 }
 
 /// What started a gossip round. Both send the local changes along the trees;
-/// only the heartbeat also probes the eager edges and sends the lazy digest,
+/// only the heartbeat also probes the eager edges and sends the lazy IHAVE,
 /// so a burst of threshold fires cannot multiply that traffic.
 #[derive(Clone, Copy)]
 enum Round {
