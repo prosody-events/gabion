@@ -1,25 +1,31 @@
-//! `gossip-bench` — run a scenario JSON spec on the in-process simulator
-//! and emit a JSON result on stdout.
+//! `gossip-bench` — gossip simulators for gabion.
 //!
 //! Usage:
-//!   gossip-bench run --scenario path/to/scenario.json > result.json
+//!   gossip-bench study run --regime regimes/prod-typical.json --seed 1 --out
+//! r.json   gossip-bench run --scenario path/to/scenario.json > result.json
+//! (legacy)
 //!
-//! The harness Python script (`bench/plot.py`) drives this binary across
-//! a matrix of scenario specs and produces matplotlib/seaborn plots from
-//! the concatenated results.
+//! `study run` drives the comparative study harness (see the crate README);
+//! `judge/matrix.py` runs it across regimes and seeds. The legacy
+//! subcommands run the pre-study scenario suite that `bench/plot.py` drives.
 
+#[cfg(feature = "legacy")]
 use std::fs;
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
+#[cfg(feature = "legacy")]
+use std::io::Read;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use gossip_bench::harness::{self, Regime};
+#[cfg(feature = "legacy")]
 use gossip_bench::{Scenario, scenarios};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "gossip-bench",
-    about = "Run gossip simulator scenarios and emit JSON metrics."
+    about = "Run gabion gossip simulations and emit JSON metrics."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -28,6 +34,17 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// The comparative study harness.
+    #[command(subcommand)]
+    Study(StudyCmd),
+    #[cfg(feature = "legacy")]
+    #[command(flatten)]
+    Legacy(LegacyCmd),
+}
+
+#[cfg(feature = "legacy")]
+#[derive(Subcommand, Debug)]
+enum LegacyCmd {
     /// Run one scenario and emit a single JSON result on stdout.
     Run {
         /// Path to scenario JSON. `-` reads stdin.
@@ -47,19 +64,57 @@ enum Cmd {
     },
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .context("build tokio current-thread runtime")?;
-    runtime.block_on(async_main(cli))
+#[derive(Subcommand, Debug)]
+enum StudyCmd {
+    /// Run one regime under one seed and write the result JSON.
+    Run {
+        /// Regime data file (`crates/gossip-bench/regimes/*.json`).
+        #[arg(long)]
+        regime: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Output file; stdout when omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
-async fn async_main(cli: Cli) -> Result<()> {
+fn main() -> Result<()> {
+    let cli = Cli::parse();
     match cli.command {
-        Cmd::Run { scenario } => {
+        Cmd::Study(StudyCmd::Run { regime, seed, out }) => study_run(&regime, seed, out.as_deref()),
+        #[cfg(feature = "legacy")]
+        Cmd::Legacy(legacy) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .context("build tokio current-thread runtime")?;
+            runtime.block_on(async_main(legacy))
+        }
+    }
+}
+
+fn study_run(regime: &Path, seed: u64, out: Option<&Path>) -> Result<()> {
+    let regime = Regime::load(regime)?;
+    let result = harness::run(&regime, seed)?;
+    let mut json = serde_json::to_string_pretty(&result).context("serialize study result")?;
+    json.push('\n');
+    match out {
+        Some(path) => {
+            std::fs::write(path, json).with_context(|| format!("write {}", path.display()))
+        }
+        None => io::stdout()
+            .lock()
+            .write_all(json.as_bytes())
+            .context("write stdout"),
+    }
+}
+
+#[cfg(feature = "legacy")]
+async fn async_main(command: LegacyCmd) -> Result<()> {
+    match command {
+        LegacyCmd::Run { scenario } => {
             let raw = read_path_or_stdin(&scenario)?;
             let scenario: Scenario = serde_json::from_str(&raw).context("parse scenario JSON")?;
             let result = scenarios::run_scenario(scenario).await?;
@@ -69,7 +124,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             writeln!(out).ok();
             Ok(())
         }
-        Cmd::Batch => {
+        LegacyCmd::Batch => {
             let stdin = io::stdin();
             let mut input = String::new();
             stdin
@@ -91,7 +146,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Example { kind } => {
+        LegacyCmd::Example { kind } => {
             let json =
                 example_scenario(&kind).with_context(|| format!("unknown example kind: {kind}"))?;
             let stdout = io::stdout();
@@ -103,6 +158,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 }
 
+#[cfg(feature = "legacy")]
 fn read_path_or_stdin(path: &PathBuf) -> Result<String> {
     if path.as_os_str() == "-" {
         let mut s = String::new();
@@ -116,6 +172,7 @@ fn read_path_or_stdin(path: &PathBuf) -> Result<String> {
     }
 }
 
+#[cfg(feature = "legacy")]
 fn example_scenario(kind: &str) -> Option<String> {
     use std::time::Duration;
 

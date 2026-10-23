@@ -1,0 +1,14 @@
+{
+  "id": "low-3",
+  "description": "Small deployment: 3 pods, ~19 req/s (32 sites every 3.2 s plus two over-limit hot keys at 1.5x and 3x a 20 req / 10 s limit).",
+  "duration_s": 80,
+  "warmup_s": 20,
+  "nodes": 3,
+  "rule": { "limit": 20, "window_ms": 10000, "bucket_ms": 1000 },
+  "traffic": {
+    "site_rate_rps": 10,
+    "site_period_ms": 3200,
+    "site_jitter": 0.5,
+    "hot_keys": [{ "limit_multiple": 1.5 }, { "limit_multiple": 3.0 }]
+  }
+}

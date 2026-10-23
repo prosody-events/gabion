@@ -1164,10 +1164,12 @@ dependencies = [
 name = "gossip-bench"
 version = "0.3.2"
 dependencies = [
+ "ahash",
  "anyhow",
  "clap",
  "futures",
  "gabion",
+ "gabion-server",
  "humantime",
  "humantime-serde",
  "serde",

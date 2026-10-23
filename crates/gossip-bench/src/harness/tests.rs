@@ -1,0 +1,88 @@
+use super::*;
+
+#[test]
+fn identical_inputs_give_bit_identical_results() {
+    let regime = fixtures::tiny();
+    let first = serde_json::to_string(&run(&regime, 11).expect("first run")).expect("json");
+    let second = serde_json::to_string(&run(&regime, 11).expect("second run")).expect("json");
+    assert_eq!(first, second);
+    let other = serde_json::to_string(&run(&regime, 12).expect("other seed")).expect("json");
+    assert_ne!(first, other);
+}
+
+#[test]
+fn tiny_cluster_run_is_healthy_and_internally_consistent() {
+    let regime = fixtures::tiny();
+    let result = run(&regime, 3).expect("run");
+    assert!(result.valid, "{:?}", result.invalid_reasons);
+    assert_eq!(result.sizing.total_nodes, 7);
+    assert_eq!(result.churn.joiners.len(), 2);
+
+    let traffic = result.traffic.run;
+    assert_eq!(
+        traffic.offered,
+        traffic.admitted + traffic.rejected + traffic.unrouted
+    );
+    assert!(traffic.rejected > 0, "the hot key must hit its limit");
+    // A node's view never exceeds truth, so no reject can be false.
+    assert_eq!(traffic.false_rejects, 0);
+    assert!(result.staleness.limited.min.is_some_and(|m| m >= 0.0));
+    assert!(result.staleness.sampled.min.is_some_and(|m| m >= 0.0));
+    assert!(result.convergence.converged > 0);
+
+    let net = result.network.run;
+    assert!(net.packets_sent > 0);
+    let dropped = net.dropped_loss_packets
+        + net.dropped_partition_packets
+        + net.dropped_rcvbuf_packets
+        + net.dropped_no_receiver_packets;
+    // Every datagram is delivered or dropped exactly once, except the few
+    // still in flight at the end.
+    assert!(net.packets_delivered + dropped <= net.packets_sent);
+    assert!(net.packets_sent - net.packets_delivered - dropped < 100);
+    let loss = net.dropped_loss_packets as f64 / net.packets_sent as f64;
+    assert!((0.02..0.08).contains(&loss), "loss {loss}");
+}
+
+#[test]
+fn offered_load_does_not_depend_on_the_network() {
+    let lossless = {
+        let mut regime = fixtures::tiny();
+        regime.network.loss = 0.0;
+        run(&regime, 5).expect("lossless")
+    };
+    let lossy = {
+        let mut regime = fixtures::tiny();
+        regime.network.loss = 0.3;
+        run(&regime, 5).expect("lossy")
+    };
+    assert_eq!(lossless.traffic.run.offered, lossy.traffic.run.offered);
+    assert_eq!(
+        lossless.traffic.measure.offered,
+        lossy.traffic.measure.offered
+    );
+    let per_key =
+        |r: &StudyResult| -> Vec<u64> { r.accuracy.iter().map(|a| a.measure.offered).collect() };
+    assert_eq!(per_key(&lossless), per_key(&lossy));
+    assert_ne!(
+        lossless.network.run.packets_sent,
+        lossy.network.run.packets_sent
+    );
+}
+
+#[test]
+fn every_regime_file_parses() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("regimes");
+    let mut count = 0;
+    for entry in std::fs::read_dir(&dir).expect("regimes directory") {
+        let path = entry.expect("entry").path();
+        let regime = Regime::load(&path).expect("regime loads");
+        assert_eq!(
+            path.file_stem().and_then(|s| s.to_str()),
+            Some(&*regime.id),
+            "file name matches id"
+        );
+        count += 1;
+    }
+    assert!(count >= 11);
+}

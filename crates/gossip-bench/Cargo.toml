@@ -10,11 +10,21 @@ license.workspace = true
 name = "gossip-bench"
 path = "src/bin/gossip_bench.rs"
 
+[features]
+default = ["legacy"]
+# The pre-study scenario runner (`run`, `batch`, `example`) built on
+# `gabion::gossip::sim`. The comparative study harness (`study`) does not
+# need it, so solution branches that reshape the library's simulator can
+# still build the study with `--no-default-features`.
+legacy = []
+
 [dependencies]
+ahash.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 futures.workspace = true
 gabion.workspace = true
+gabion-server.workspace = true
 humantime.workspace = true
 humantime-serde.workspace = true
 serde = { workspace = true, features = ["derive"] }

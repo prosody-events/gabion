@@ -1,0 +1,32 @@
+{
+  "id": "prod-4x",
+  "description": "Four times peak load on the autoscaler maximum: 300 pods, ~7,200 counted req/s from ~23,040 sites every ~3.2 s, plus the hot keys and burst of prod-peak.",
+  "duration_s": 80,
+  "warmup_s": 20,
+  "nodes": 300,
+  "rule": {
+    "limit": 100,
+    "window_ms": 10000,
+    "bucket_ms": 1000
+  },
+  "traffic": {
+    "site_rate_rps": 7200,
+    "site_period_ms": 3200,
+    "site_jitter": 0.5,
+    "hot_keys": [
+      {
+        "limit_multiple": 1.5
+      },
+      {
+        "limit_multiple": 3.0
+      }
+    ],
+    "bursts": [
+      {
+        "rate_rps": 90,
+        "start_s": 40,
+        "duration_s": 20
+      }
+    ]
+  }
+}

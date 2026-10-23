@@ -24,12 +24,24 @@
 //!
 //! All metrics are emitted in a stable JSON schema so the Python plot
 //! harness can ingest them without re-implementing parsing.
+//!
+//! The scenario runner above is the `legacy` feature (on by default). The
+//! comparative study harness lives in [`harness`]; it owns its transport
+//! and network model and builds with `--no-default-features`.
 
+pub mod harness;
+#[cfg(feature = "legacy")]
 pub mod metrics;
+#[cfg(feature = "legacy")]
 pub mod scenario;
+#[cfg(feature = "legacy")]
 pub mod scenarios;
+#[cfg(feature = "legacy")]
 pub mod transport;
 
+#[cfg(feature = "legacy")]
 pub use metrics::{NodeMetrics, ScenarioResult, TickSnapshot};
+#[cfg(feature = "legacy")]
 pub use scenario::{LinkModel, NetworkModel, Scenario, ScenarioKind, Workload};
+#[cfg(feature = "legacy")]
 pub use transport::CountingTransport;

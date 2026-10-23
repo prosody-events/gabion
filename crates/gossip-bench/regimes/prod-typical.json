@@ -1,0 +1,15 @@
+{
+  "id": "prod-typical",
+  "description": "Reference production deployment at its typical size: 80 pods, ~650 counted req/s from ~2,100 sites each requesting every ~3.2 s, two over-limit hot keys and one 90 req/s site burst; 10 s window, 1 s buckets.",
+  "duration_s": 80,
+  "warmup_s": 20,
+  "nodes": 80,
+  "rule": { "limit": 100, "window_ms": 10000, "bucket_ms": 1000 },
+  "traffic": {
+    "site_rate_rps": 650,
+    "site_period_ms": 3200,
+    "site_jitter": 0.5,
+    "hot_keys": [{ "limit_multiple": 1.5 }, { "limit_multiple": 3.0 }],
+    "bursts": [{ "rate_rps": 90, "start_s": 40, "duration_s": 20 }]
+  }
+}

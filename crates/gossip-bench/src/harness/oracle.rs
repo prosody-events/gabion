@@ -1,0 +1,514 @@
+//! Ground truth and the accuracy metrics computed against it. Nothing here
+//! is visible to nodes.
+//!
+//! * **Truth** is every admitted hit, cluster-wide, per key and bucket.
+//! * **Staleness error** for a (node, tracked key) pair is `truth window total
+//!   − the node's window total`: positive is an under-count, the quantity that
+//!   lets a node over-admit. It is piecewise constant and recomputed on every
+//!   event that can change it (an admission, an aggregate update on that node,
+//!   a bucket boundary), so its distribution is weighted by exact virtual time
+//!   rather than sampled.
+//! * **Convergence time** of an admitted hit is the time until every node that
+//!   was running when it was admitted (and still runs) has a bucket count at
+//!   least the truth count that hit produced.
+//! * **Residual error** counts only buckets that closed at least
+//!   [`RESIDUAL_AGE_MS`] ago: the part of the error that is not in flight.
+
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
+use gabion::crdt::BucketEpoch;
+use serde::Serialize;
+
+use super::node::{KeyKind, KeySpace, NodeStore, Slot, ring_window_total};
+use super::plan::NS_PER_MS;
+
+pub const RESIDUAL_AGE_MS: u64 = 1_500;
+
+/// Tracked keys fall into two classes reported separately: keys whose demand
+/// meets their limit (hot and burst keys) and ordinary sampled sites.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Class {
+    Limited = 0,
+    Sampled = 1,
+}
+
+/// Time-weighted histogram of an integer-valued signal.
+#[derive(Clone, Debug, Default)]
+pub struct WeightedHist {
+    weights: BTreeMap<i64, u128>,
+}
+
+impl WeightedHist {
+    pub fn add(&mut self, value: i64, weight: u64) {
+        if weight > 0 {
+            *self.weights.entry(value).or_insert(0) += u128::from(weight);
+        }
+    }
+
+    pub fn total(&self) -> u128 {
+        self.weights.values().sum()
+    }
+
+    /// Smallest value whose cumulative weight reaches `q` of the total.
+    pub fn quantile(&self, q: f64) -> Option<i64> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        let target = (q * total as f64).ceil().max(1.0) as u128;
+        let mut seen = 0;
+        for (&value, &weight) in &self.weights {
+            seen += weight;
+            if seen >= target {
+                return Some(value);
+            }
+        }
+        self.weights.keys().next_back().copied()
+    }
+
+    pub fn mean(&self) -> Option<f64> {
+        let total = self.total();
+        (total > 0).then(|| {
+            self.weights
+                .iter()
+                .map(|(&v, &w)| v as f64 * w as f64)
+                .sum::<f64>()
+                / total as f64
+        })
+    }
+
+    pub fn min(&self) -> Option<i64> {
+        self.weights.keys().next().copied()
+    }
+
+    pub fn max(&self) -> Option<i64> {
+        self.weights.keys().next_back().copied()
+    }
+}
+
+/// Admissions of one tracked key in one bucket, and how far convergence has
+/// got through them. `admits[j]` produced truth count `j + 1`.
+#[derive(Clone, Debug, Default)]
+struct ConvSlot {
+    bucket: BucketEpoch,
+    admits: Vec<u64>,
+    converged: usize,
+}
+
+/// A pod that joined after the start, followed for one window.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Joiner {
+    pub node: usize,
+    pub join_ns: u64,
+    #[serde(skip)]
+    until_ns: u64,
+    #[serde(skip)]
+    under: i64,
+    #[serde(skip)]
+    last_ns: u64,
+    /// Integral of the summed under-count over tracked keys across the
+    /// first window after joining, in hit-seconds.
+    pub undercount_hit_s: f64,
+    /// Time from joining until the node's tracked-key totals first reach
+    /// 95 % / 99 % of truth.
+    pub t95_ms: Option<f64>,
+    pub t99_ms: Option<f64>,
+}
+
+impl Joiner {
+    fn integrate(&mut self, now_ns: u64) {
+        let to = now_ns.min(self.until_ns);
+        if to > self.last_ns {
+            self.undercount_hit_s += self.under.max(0) as f64 * (to - self.last_ns) as f64 / 1e9;
+        }
+        self.last_ns = self.last_ns.max(to);
+    }
+
+    fn check(&mut self, now_ns: u64, truth: i64) {
+        if truth <= 0 {
+            return;
+        }
+        let coverage = 1.0 - self.under as f64 / truth as f64;
+        let elapsed = (now_ns - self.join_ns) as f64 / NS_PER_MS as f64;
+        if coverage >= 0.95 && self.t95_ms.is_none() {
+            self.t95_ms = Some(elapsed);
+        }
+        if coverage >= 0.99 && self.t99_ms.is_none() {
+            self.t99_ms = Some(elapsed);
+        }
+    }
+}
+
+/// Over-admission tally for one limited key, from bucket-boundary samples
+/// of the trailing window.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct WindowSamples {
+    pub windows: u64,
+    pub over_windows: u64,
+    pub over_max: i64,
+    pub over_sum: i64,
+}
+
+pub struct Oracle {
+    keys: Rc<KeySpace>,
+    nodes: usize,
+    measure_from_ns: u64,
+    truth: Vec<Slot>,
+    class: Vec<Class>,
+    truth_window: Vec<i64>,
+    sum_truth: i64,
+    // Per (tracked key, node): `t * nodes + v`.
+    view: Vec<i64>,
+    err: Vec<i64>,
+    since_ns: Vec<u64>,
+    // Per (tracked key, ring slot): `t * ring + s`; node views of that
+    // bucket at `(t * ring + s) * nodes + v`.
+    conv: Vec<ConvSlot>,
+    bucket_view: Vec<u32>,
+    alive: Vec<bool>,
+    started_ns: Vec<u64>,
+    joiners: Vec<Option<Joiner>>,
+    pub finished_joiners: Vec<Joiner>,
+    pub staleness: [WeightedHist; 2],
+    pub residual: [Vec<i64>; 2],
+    pub convergence_ns: Vec<u64>,
+    pub never_converged: u64,
+    /// Indexed by tracked index; only limited keys are sampled.
+    pub over_admission: Vec<WindowSamples>,
+}
+
+impl Oracle {
+    pub fn new(keys: Rc<KeySpace>, nodes: usize, measure_from_ns: u64) -> Self {
+        let tracked = keys.tracked.len();
+        let ring = keys.ring_len as usize;
+        let class = keys
+            .tracked
+            .iter()
+            .map(|&k| match keys.kinds[k as usize] {
+                KeyKind::Site => Class::Sampled,
+                KeyKind::Hot | KeyKind::Burst => Class::Limited,
+            })
+            .collect();
+        Self {
+            truth: vec![Slot::default(); keys.len() * ring],
+            class,
+            truth_window: vec![0; tracked],
+            sum_truth: 0,
+            view: vec![0; tracked * nodes],
+            err: vec![0; tracked * nodes],
+            since_ns: vec![0; tracked * nodes],
+            conv: vec![ConvSlot::default(); tracked * ring],
+            bucket_view: vec![0; tracked * ring * nodes],
+            alive: vec![false; nodes],
+            started_ns: vec![0; nodes],
+            joiners: vec![None; nodes],
+            finished_joiners: Vec::new(),
+            staleness: Default::default(),
+            residual: Default::default(),
+            convergence_ns: Vec::new(),
+            never_converged: 0,
+            over_admission: vec![WindowSamples::default(); tracked],
+            keys,
+            nodes,
+            measure_from_ns,
+        }
+    }
+
+    fn ring(&self) -> usize {
+        self.keys.ring_len as usize
+    }
+
+    fn conv_index(&self, t: usize, bucket: BucketEpoch) -> usize {
+        t * self.ring() + (bucket % self.keys.ring_len) as usize
+    }
+
+    /// Cluster-wide admitted hits for `key` in the window ending at `bucket`.
+    pub fn truth_window_total(&self, key: u32, bucket: BucketEpoch) -> u64 {
+        ring_window_total(&self.keys, &self.truth, key, bucket)
+    }
+
+    fn set_err(&mut self, t: usize, v: usize, value: i64, now_ns: u64) {
+        let i = t * self.nodes + v;
+        let old = self.err[i];
+        let from = self.since_ns[i].max(self.measure_from_ns);
+        if now_ns > from {
+            self.staleness[self.class[t] as usize].add(old, now_ns - from);
+        }
+        self.since_ns[i] = now_ns;
+        self.err[i] = value;
+        if let Some(joiner) = self.joiners[v].as_mut() {
+            joiner.integrate(now_ns);
+            joiner.under += value.max(0) - old.max(0);
+            joiner.check(now_ns, self.sum_truth);
+        }
+    }
+
+    pub fn node_started(&mut self, v: usize, now_ns: u64, joined: bool) {
+        self.alive[v] = true;
+        self.started_ns[v] = now_ns;
+        for s in 0..self.conv.len() {
+            self.bucket_view[s * self.nodes + v] = 0;
+        }
+        for t in 0..self.truth_window.len() {
+            let i = t * self.nodes + v;
+            self.view[i] = 0;
+            self.err[i] = self.truth_window[t];
+            self.since_ns[i] = now_ns;
+        }
+        if joined && now_ns >= self.measure_from_ns {
+            let mut joiner = Joiner {
+                node: v,
+                join_ns: now_ns,
+                until_ns: now_ns + self.keys.window_ms * NS_PER_MS,
+                under: self.truth_window.iter().map(|&e| e.max(0)).sum(),
+                last_ns: now_ns,
+                undercount_hit_s: 0.0,
+                t95_ms: None,
+                t99_ms: None,
+            };
+            joiner.check(now_ns, self.sum_truth);
+            self.joiners[v] = Some(joiner);
+        }
+    }
+
+    pub fn node_stopped(&mut self, v: usize, now_ns: u64) {
+        if let Some(mut joiner) = self.joiners[v].take() {
+            joiner.integrate(now_ns);
+            self.finished_joiners.push(joiner);
+        }
+        for t in 0..self.truth_window.len() {
+            self.set_err(t, v, 0, now_ns);
+        }
+        self.alive[v] = false;
+        for i in 0..self.conv.len() {
+            self.advance(i, now_ns);
+        }
+    }
+
+    /// A hit for `key` in `bucket` was admitted somewhere in the cluster.
+    pub fn admitted(&mut self, key: u32, bucket: BucketEpoch, now_ns: u64) {
+        let slot = key as usize * self.ring() + (bucket % self.keys.ring_len) as usize;
+        self.truth[slot].add(bucket, 1);
+        let t = self.keys.tracked_of[key as usize];
+        if t == super::node::NOT_TRACKED {
+            return;
+        }
+        let t = t as usize;
+        self.truth_window[t] += 1;
+        self.sum_truth += 1;
+        let c = self.conv_index(t, bucket);
+        if self.conv[c].bucket != bucket {
+            self.retire(c);
+            self.conv[c].bucket = bucket;
+        }
+        self.conv[c].admits.push(now_ns);
+        for v in 0..self.nodes {
+            if self.alive[v] {
+                let value = self.truth_window[t] - self.view[t * self.nodes + v];
+                self.set_err(t, v, value, now_ns);
+            }
+        }
+        self.check_joiners(now_ns);
+    }
+
+    fn check_joiners(&mut self, now_ns: u64) {
+        let truth = self.sum_truth;
+        for joiner in self.joiners.iter_mut().flatten() {
+            joiner.check(now_ns, truth);
+        }
+    }
+
+    /// Node `v`'s aggregate changed for tracked key `t`, bucket `bucket`.
+    pub fn view_changed(
+        &mut self,
+        v: usize,
+        t: usize,
+        bucket: BucketEpoch,
+        bucket_count: u32,
+        window_total: u64,
+        now_ns: u64,
+    ) {
+        let c = self.conv_index(t, bucket);
+        if self.conv[c].bucket == bucket {
+            let cell = c * self.nodes + v;
+            self.bucket_view[cell] = bucket_count;
+            if bucket_count as usize > self.conv[c].converged {
+                self.advance(c, now_ns);
+            }
+        }
+        self.view[t * self.nodes + v] = window_total as i64;
+        let value = self.truth_window[t] - window_total as i64;
+        self.set_err(t, v, value, now_ns);
+    }
+
+    /// Record convergence for every admission of slot `c` that every
+    /// required node now covers. Convergence is monotone in admission
+    /// order: covering count `j + 1` implies covering `j`.
+    fn advance(&mut self, c: usize, now_ns: u64) {
+        let base = c * self.nodes;
+        while self.conv[c].converged < self.conv[c].admits.len() {
+            let j = self.conv[c].converged;
+            let admitted_ns = self.conv[c].admits[j];
+            let need = j as u32 + 1;
+            let lagging = (0..self.nodes).any(|v| {
+                self.alive[v]
+                    && self.started_ns[v] <= admitted_ns
+                    && self.bucket_view[base + v] < need
+            });
+            if lagging {
+                return;
+            }
+            if admitted_ns >= self.measure_from_ns {
+                self.convergence_ns.push(now_ns - admitted_ns);
+            }
+            self.conv[c].converged += 1;
+        }
+    }
+
+    /// Slot `c` is about to be reused or its bucket left the window: any
+    /// admission not yet converged never will.
+    fn retire(&mut self, c: usize) {
+        let slot = &mut self.conv[c];
+        let from = self.measure_from_ns;
+        self.never_converged += slot.admits[slot.converged..]
+            .iter()
+            .filter(|&&t| t >= from)
+            .count() as u64;
+        slot.admits.clear();
+        slot.converged = 0;
+        let base = c * self.nodes;
+        self.bucket_view[base..base + self.nodes].fill(0);
+    }
+
+    /// Admissions still unconverged at the end of the run, whose bucket had
+    /// not yet left the window (right-censored, not failures).
+    pub fn pending(&self) -> u64 {
+        self.conv
+            .iter()
+            .map(|s| {
+                s.admits[s.converged..]
+                    .iter()
+                    .filter(|&&t| t >= self.measure_from_ns)
+                    .count() as u64
+            })
+            .sum()
+    }
+
+    /// The bucket clock ticked over to `current`.
+    pub fn bucket_boundary(
+        &mut self,
+        now_ns: u64,
+        now_millis: u64,
+        current: BucketEpoch,
+        stores: &[Option<Rc<NodeStore>>],
+    ) {
+        let live = self.keys.live_buckets;
+        let in_window = now_ns >= self.measure_from_ns;
+        // The bucket that just left the live window.
+        if let Some(gone) = current.checked_sub(live) {
+            for t in 0..self.truth_window.len() {
+                let c = self.conv_index(t, gone);
+                if self.conv[c].bucket == gone {
+                    self.retire(c);
+                }
+            }
+        }
+        // Over-admission of the trailing complete window.
+        if in_window && let Some(last) = current.checked_sub(1) {
+            for t in 0..self.truth_window.len() {
+                if self.class[t] != Class::Limited {
+                    continue;
+                }
+                let key = self.keys.tracked[t];
+                let total = self.truth_window_total(key, last) as i64;
+                let over = total - self.keys.limit as i64;
+                let samples = &mut self.over_admission[t];
+                samples.windows += 1;
+                if over > 0 {
+                    samples.over_windows += 1;
+                    samples.over_sum += over;
+                }
+                samples.over_max = samples.over_max.max(over);
+            }
+        }
+        // The window slid: refresh truth and every live view.
+        self.sum_truth = 0;
+        for t in 0..self.truth_window.len() {
+            let key = self.keys.tracked[t];
+            self.truth_window[t] = self.truth_window_total(key, current) as i64;
+            self.sum_truth += self.truth_window[t];
+        }
+        for (v, store) in stores.iter().enumerate() {
+            let Some(store) = store else { continue };
+            if !self.alive[v] {
+                continue;
+            }
+            for t in 0..self.truth_window.len() {
+                let total = store.window_total(self.keys.tracked[t], now_millis) as i64;
+                self.view[t * self.nodes + v] = total;
+                self.set_err(t, v, self.truth_window[t] - total, now_ns);
+            }
+        }
+        self.check_joiners(now_ns);
+    }
+
+    /// Sample the residual error at `now_millis`.
+    pub fn residual_sample(&mut self, now_millis: u64) {
+        let bucket_ms = self.keys.bucket_ms;
+        let current = self.keys.bucket_of(now_millis);
+        let Some(cutoff) = now_millis.checked_sub(RESIDUAL_AGE_MS) else {
+            return;
+        };
+        let live = self.keys.live_buckets;
+        // Buckets in the live window that closed at or before `cutoff`.
+        let closed: Vec<BucketEpoch> = (0..live)
+            .filter_map(|o| current.checked_sub(o))
+            .filter(|&b| (u64::from(b) + 1) * bucket_ms <= cutoff)
+            .collect();
+        for t in 0..self.truth_window.len() {
+            let key = self.keys.tracked[t];
+            for v in 0..self.nodes {
+                if !self.alive[v] {
+                    continue;
+                }
+                let mut residual = 0_i64;
+                for &b in &closed {
+                    let truth = i64::from(
+                        self.truth[key as usize * self.ring() + (b % self.keys.ring_len) as usize]
+                            .count_for(b),
+                    );
+                    let c = self.conv_index(t, b);
+                    let seen = if self.conv[c].bucket == b {
+                        i64::from(self.bucket_view[c * self.nodes + v])
+                    } else {
+                        0
+                    };
+                    residual += truth - seen;
+                }
+                self.residual[self.class[t] as usize].push(residual);
+            }
+        }
+    }
+
+    /// Close every open interval at `end_ns`.
+    pub fn finish(&mut self, end_ns: u64) {
+        for v in 0..self.nodes {
+            if !self.alive[v] {
+                continue;
+            }
+            if let Some(mut joiner) = self.joiners[v].take() {
+                joiner.integrate(end_ns);
+                self.finished_joiners.push(joiner);
+            }
+            for t in 0..self.truth_window.len() {
+                let value = self.err[t * self.nodes + v];
+                self.set_err(t, v, value, end_ns);
+            }
+        }
+        self.finished_joiners.sort_by_key(|j| j.join_ns);
+    }
+}
+
+#[cfg(test)]
+mod tests;
