@@ -33,36 +33,67 @@ pub const GOSSIP_FANOUT: usize = 3;
 
 /// Coverage margin `c` in the gossip fanout law `⌈ln(n) + c⌉` (`n` = live peer
 /// count). Per Kermarrec, Massoulié & Ganesh (IEEE TPDS 2003, "Probabilistic
-/// Reliable Dissemination in Large-Scale Systems", Theorem 1), a directed
-/// gossip round with mean fanout `ln(n) + c` reaches every node with
+/// Reliable Dissemination in Large-Scale Systems", Theorem 1), spreading a
+/// message by infect-and-forward-once (each node forwards it once, to
+/// `fanout` random peers) with mean fanout `ln(n) + c` reaches every node with
 /// probability → `e^(−e^(−c))`:
 ///
-/// | `c`   | per-round coverage `e^(−e^(−c))` |
+/// | `c`   | P(one change reaches every node) |
 /// |-------|----------------------------------|
 /// | **3** | **95.1 %**                       |
 /// | 4     | 98.2 %                           |
 /// | 5     | 99.3 %                           |
 ///
-/// **These are single-round figures, and the single round is the wrong unit
-/// for gabion.** KMG's theorem bounds one *one-shot* dissemination; gabion
-/// instead runs continuous anti-entropy — it re-gossips every dirty cell each
-/// tick until the peer frontier shows it acked, with the repair lane behind
-/// that. So a node missed in one round is overwhelmingly likely to be reached
-/// by the next, and the per-round coverage *compounds*: at `c = 3` the 4.9 %
-/// per-round miss falls to ≈ 0.24 % after two rounds and ≈ 0.012 % after three.
-/// We therefore size to the leaner `c = 3` threshold and let anti-entropy close
-/// the gap, rather than paying KMG's one-shot `c ≈ 4` (their validated sims —
-/// fanout 13 @ 10 000 nodes, 15 @ 50 000 — measure single-shot reach, which a
-/// re-gossiping system does not need to match). `c = 3` costs ≈ 1 fewer peer
-/// per tick at every cluster size (≈ 10 % less gossip bandwidth). Kept a
-/// `const`; promote to a `GossipConfig` field if an operator ever needs to
-/// trade bandwidth for coverage at runtime.
+/// The runtime runs this model directly: each change goes out once, to one
+/// round's picks, and each node that merges it forwards it once in its next
+/// round. So at `c = 3` a change misses at least one node ≈ 4.9 % of the time,
+/// and the expected number of nodes it misses is `e^(−c)` ≈ 0.05. Two things
+/// close that gap without a wider fanout: the next change to the same cell
+/// carries its whole count, and the heartbeat repair slice
+/// ([`GOSSIP_REPAIR_CELLS_PER_ROUND`]) resends every live cell once per
+/// rotation. Packet loss and cut frames push the real miss rate above the
+/// theoretical one, and repair covers those too. So we size to `c = 3` rather
+/// than KMG's validated single-shot `c ≈ 4` (fanout 13 @ 10 000 nodes, 15 @
+/// 50 000): it costs ≈ 1 fewer peer per round at every cluster size (≈ 10 %
+/// less change traffic).
 pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;
-pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 128;
+
+/// Send slots, one pre-allocated packet buffer each (about 700 KiB at the
+/// default payload). A round shares them evenly across its picks, so this
+/// bounds the packets one round can queue: `⌈ln(n)+c⌉` picks (9 at 300
+/// peers) times each frame's packets. Sized so a round's frames fit whole at
+/// 300 peers and 1,800 changes a second across the cluster: about 1,000 cells
+/// per frame, plus the repair slice on one pick, within a 56-packet share. A
+/// smaller pool still reaches every pick but cuts each frame's tail: repair
+/// first, then the oldest changes, with a warning when changes are cut.
+pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 512;
+
+/// Cells of the rotating repair slice a heartbeat sends, to one random pick.
+/// Threshold rounds send none.
+///
+/// A round sends each change once, so repair is the only resend: for a
+/// change every forwarder lost, one cut from a full frame or pruned by the
+/// peer frontier, one dropped while a node had no peers, or state a new peer
+/// missed. How much that matters depends on the regime:
+///
+/// - **Large cluster, short window** (300 peers, 10 s): each change reaches
+///   each node through about `⌈ln(n)+c⌉` forwarders, and the next change to a
+///   cell carries its whole count, so a lost packet rarely matters. A sweep of
+///   ~15k live cells at this rate takes longer than the window, so repair is a
+///   backstop costing ~5% of gossip bandwidth.
+/// - **Small cluster or long window**: fewer forwarders, or cells that stop
+///   changing long before they expire. A sweep of a few thousand cells takes
+///   seconds, well inside the window, and the bandwidth is small.
+///
+/// A fixed budget therefore favours novelty where repair cannot pay off and
+/// converges where it can. Kept a `const`, not a `GossipConfig` field: the
+/// legacy scenario suite builds `GossipConfig` literally, and the study harness
+/// leaves it untouched.
+pub const GOSSIP_REPAIR_CELLS_PER_ROUND: usize = 256;
 pub const GOSSIP_LIMIT_QUEUE_CAPACITY: usize = 8192;
 pub const GOSSIP_CLUSTER_ID_HASH: u128 = 1;
 
