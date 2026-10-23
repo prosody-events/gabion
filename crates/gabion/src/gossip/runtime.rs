@@ -71,8 +71,10 @@ where
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
-    send_pending: VecDeque<(SocketAddr, u8)>,
-    send_free: Vec<u8>,
+    send_pending: VecDeque<(SocketAddr, SendSlot)>,
+    send_free: Vec<SendSlot>,
+    // Floor of the per-peer retransmission timeout: one tick.
+    rto_floor_ms: u64,
 
     peers: Vec<Peer>,
     /// Peer a round starts with, advanced every round so that a send pool
@@ -225,19 +227,20 @@ where
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
 
-        let send_pool_size = config.send_queue_capacity.max(1);
-        let send_pool: Vec<PacketBuf> = (0..send_pool_size)
-            .map(|_| PacketBuf::for_limits(config.wire_limits))
-            .collect();
-        let send_free: Vec<u8> = (0..send_pool_size as u8).rev().collect();
-        let send_pending = VecDeque::with_capacity(send_pool_size);
-
         let peers: Vec<Peer> = config
             .bootstrap_peers
             .iter()
             .copied()
             .map(Peer::new)
             .collect();
+
+        let send_pool_size = send_slots_wanted(config.send_queue_capacity, peers.len());
+        let send_pool: Vec<PacketBuf> = (0..send_pool_size)
+            .map(|_| PacketBuf::for_limits(config.wire_limits))
+            .collect();
+        let send_free: Vec<SendSlot> = (0..send_pool_size as SendSlot).rev().collect();
+        let send_pending = VecDeque::with_capacity(send_pool_size);
+        let rto_floor_ms = u64::try_from(config.tick_interval.as_millis()).unwrap_or(u64::MAX);
 
         let rule_capacity = store.rule_dictionary().capacity() as usize;
         let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
@@ -260,6 +263,7 @@ where
             send_pool,
             send_pending,
             send_free,
+            rto_floor_ms,
             peers,
             next_round_start: 0,
             pending_reply: None,
@@ -519,7 +523,7 @@ where
         // its sender re-sends after its retransmission timeout.
         let now_ms = self.clock.now_millis();
         let local_incarnation = self.store.local_identity().incarnation;
-        let min_rto_ms = crate::defaults::GOSSIP_MIN_RTO_MILLIS;
+        let min_rto_ms = self.rto_floor_ms;
         if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
             peer.receive(
                 &summary.header,
@@ -639,6 +643,7 @@ where
             PeerEvent::Added(p) => {
                 if !self.peers.iter().any(|x| x.addr == p.addr) {
                     self.peers.push(Peer::new(p.addr));
+                    self.grow_send_pool();
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
@@ -656,6 +661,26 @@ where
                     );
                 }
             }
+        }
+    }
+
+    /// Grow the send pool to cover the current peer count. Runs on membership
+    /// change, never per packet; the pool does not shrink when peers leave.
+    fn grow_send_pool(&mut self) {
+        let wanted = send_slots_wanted(self.config.send_queue_capacity, self.peers.len());
+        let have = self.send_pool.len();
+        if wanted <= have {
+            return;
+        }
+        self.send_pool.reserve_exact(wanted - have);
+        self.send_free
+            .reserve_exact(wanted.saturating_sub(self.send_free.len()));
+        self.send_pending
+            .reserve(wanted.saturating_sub(self.send_pending.len()));
+        for slot in have..wanted {
+            self.send_pool
+                .push(PacketBuf::for_limits(self.config.wire_limits));
+            self.send_free.push(slot as SendSlot);
         }
     }
 
@@ -681,12 +706,13 @@ where
         // fairly across rounds.
         let n = self.peers.len();
         let start = self.next_round_start % n;
-        self.next_round_start = start + 1;
         let mut sent_data_to = 0;
+        let mut visited = 0;
         for k in 0..n {
             if self.send_free.is_empty() {
                 break;
             }
+            visited += 1;
             // An even share of the free slots, so one large delta cannot take
             // the whole pool and leave later peers with nothing.
             let share = (self.send_free.len() / (n - k)).max(1);
@@ -694,6 +720,9 @@ where
                 sent_data_to += 1;
             }
         }
+        // Next round starts at the first peer this one did not reach, so a
+        // pool that runs dry mid-round cannot starve the same tail of peers.
+        self.next_round_start = start + visited;
         if sent_data_to > 0 {
             self.dirty_ticks = self.dirty_ticks.saturating_add(1);
             self.last_effective_fanout = sent_data_to;
@@ -715,7 +744,7 @@ where
     /// Queue this round's packets for one peer: its delta, or failing that a
     /// standalone ack if one is owed. Returns whether data was queued.
     fn send_round_to(&mut self, peer_idx: usize, max_packets: usize, now_ms: u64) -> bool {
-        let min_rto_ms = crate::defaults::GOSSIP_MIN_RTO_MILLIS;
+        let min_rto_ms = self.rto_floor_ms;
         let (after, retransmit) = self.peers[peer_idx].delta_after(now_ms);
         self.store.delta_since(
             after,
@@ -808,6 +837,18 @@ where
         packets.discard_rest();
         top
     }
+}
+
+/// Index of a slot in the send pool.
+type SendSlot = u32;
+
+/// Send-pool slots needed for `peers` live peers: the configured capacity, or
+/// [`GOSSIP_SEND_SLOTS_PER_PEER`] per peer if that is more, so a round can
+/// always queue at least one packet for every peer.
+fn send_slots_wanted(capacity: usize, peers: usize) -> usize {
+    capacity
+        .max(1)
+        .max(peers.saturating_mul(crate::defaults::GOSSIP_SEND_SLOTS_PER_PEER))
 }
 
 enum ArmOutcome {
