@@ -18,6 +18,11 @@ pub struct Observation<C: Count> {
     pub incarnation: Incarnation,
     pub count: C,
     pub last_update_millis: u64,
+    /// The origin's own sequence number for this version of the cell, as it
+    /// travelled on the wire. `merge_remote` stores it unchanged, so
+    /// `(origin, incarnation, origin_sequence)` names one change on every
+    /// node. `ingest_local` ignores it and allocates the next local sequence.
+    pub origin_sequence: u64,
 }
 
 /// SoA input for `ingest_local` / `merge_remote`. For `ingest_local`, the
@@ -32,6 +37,7 @@ pub struct ObservationBatch<C: Count> {
     pub incarnations: Vec<Incarnation>,
     pub counts: Vec<C>,
     pub last_update_millis: Vec<u64>,
+    pub origin_sequences: Vec<u64>,
 }
 
 impl<C: Count> ObservationBatch<C> {
@@ -44,6 +50,7 @@ impl<C: Count> ObservationBatch<C> {
             incarnations: Vec::with_capacity(capacity),
             counts: Vec::with_capacity(capacity),
             last_update_millis: Vec::with_capacity(capacity),
+            origin_sequences: Vec::with_capacity(capacity),
         }
     }
 
@@ -55,6 +62,7 @@ impl<C: Count> ObservationBatch<C> {
         debug_assert_eq!(self.incarnations.len(), n);
         debug_assert_eq!(self.counts.len(), n);
         debug_assert_eq!(self.last_update_millis.len(), n);
+        debug_assert_eq!(self.origin_sequences.len(), n);
     }
 
     pub fn len(&self) -> usize {
@@ -73,6 +81,36 @@ impl<C: Count> ObservationBatch<C> {
         self.incarnations.clear();
         self.counts.clear();
         self.last_update_millis.clear();
+        self.origin_sequences.clear();
+    }
+
+    /// Keep only the rows `keep` accepts, in order. Allocation-free.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Self, usize) -> bool) {
+        let mut kept = 0;
+        for i in 0..self.len() {
+            if !keep(self, i) {
+                continue;
+            }
+            if kept != i {
+                self.rule_fingerprints[kept] = self.rule_fingerprints[i];
+                self.key_hashes[kept] = self.key_hashes[i];
+                self.buckets[kept] = self.buckets[i];
+                self.origin_node_ids[kept] = self.origin_node_ids[i];
+                self.incarnations[kept] = self.incarnations[i];
+                self.counts[kept] = self.counts[i];
+                self.last_update_millis[kept] = self.last_update_millis[i];
+                self.origin_sequences[kept] = self.origin_sequences[i];
+            }
+            kept += 1;
+        }
+        self.rule_fingerprints.truncate(kept);
+        self.key_hashes.truncate(kept);
+        self.buckets.truncate(kept);
+        self.origin_node_ids.truncate(kept);
+        self.incarnations.truncate(kept);
+        self.counts.truncate(kept);
+        self.last_update_millis.truncate(kept);
+        self.origin_sequences.truncate(kept);
     }
 
     /// Append one observation row. Caller must keep all columns the same
@@ -85,6 +123,7 @@ impl<C: Count> ObservationBatch<C> {
         self.incarnations.push(row.incarnation);
         self.counts.push(row.count);
         self.last_update_millis.push(row.last_update_millis);
+        self.origin_sequences.push(row.origin_sequence);
     }
 }
 

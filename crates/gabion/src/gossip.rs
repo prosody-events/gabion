@@ -4,9 +4,9 @@
 //! [`crate::crdt::CellStore`], a datagram [`GossipTransport`], a
 //! [`Clock`] for bucket arithmetic and tick scheduling, and a downstream
 //! [`AggregateStore`] that absorbs the resulting delta and expiration rows.
-//! A single `tokio::select!` drives five arms (limit request, inbound,
-//! writable, peer event, tick) and calls `aggregates.apply(...)` once per
-//! CRDT-touching iteration.
+//! A single `tokio::select!` drives six arms (limit request, inbound,
+//! writable, peer event, relay, tick) and calls `aggregates.apply(...)` once
+//! per CRDT-touching iteration.
 //!
 //! All polymorphic boundaries are monomorphized generics — no `dyn`, no
 //! `Box`. The production hot path is branch-free; tests and simulators
@@ -55,15 +55,13 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Floor on the number of peers contacted per gossip tick. The runtime
-    /// scales the actual per-tick fanout to the coverage threshold
-    /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
-    /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
-    /// hard minimum when that threshold falls below it.
+    /// No effect: changes travel down the Thicket trees, not to a random
+    /// number of peers per tick. Kept so existing configuration and callers
+    /// still compile; see the "Design notes: Thicket dissemination" section
+    /// of the crate README.
     pub fanout: usize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
-    /// tick. The wire codec splits this into multiple packets if needed.
+    /// Most cells in one frame to one tree neighbour per round. The wire
+    /// codec splits a frame into multiple packets if needed.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,

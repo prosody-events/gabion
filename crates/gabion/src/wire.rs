@@ -23,6 +23,7 @@
 
 mod auth;
 mod body;
+mod control;
 mod header;
 
 #[cfg(test)]
@@ -30,7 +31,13 @@ mod tests;
 
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
-pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
+pub use control::{
+    CONTROL_ENTRY_BYTES, ControlEntry, ControlKind, DecodedControl, PULL_ONLY_TREE, decode_control,
+    encode_control, is_control,
+};
+pub use header::{
+    FLAG_AUTHENTICATED, FLAG_CONTROL, FLAG_EDGE, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION,
+};
 
 use auth::AUTH_TAG_LEN;
 use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
@@ -67,6 +74,8 @@ pub struct PacketWritten {
     pub cells_dropped: u32,
     /// Flags as written to the packet header.
     pub flags: u16,
+    /// The `edge_sequence` written to the packet header.
+    pub edge_sequence: u64,
 }
 
 /// Outcome of a successful decode.
@@ -108,6 +117,8 @@ pub enum DecodeError {
     AuthenticationFailed,
     #[error("trailing bytes after body")]
     Trailing,
+    #[error("control body is shorter than its declared entries, or names an unknown kind")]
+    BadControl,
 }
 
 // -- send-side buffer -------------------------------------------------------
@@ -179,6 +190,9 @@ pub struct Packets<'a, C: Count> {
     scratch: &'a mut WireScratch,
     limits: FrameLimits,
     cursor: usize,
+    /// `edge_sequence` of the next packet: the template header's, then one
+    /// more for each packet emitted.
+    next_edge: u64,
 }
 
 impl<C: Count> Drop for Packets<'_, C> {
@@ -244,12 +258,21 @@ impl<'a, C: Count> Packets<'a, C> {
             scratch,
             limits,
             cursor: 0,
+            next_edge: header.edge_sequence,
         })
     }
 
     /// Handles still to be encoded into a packet.
     pub fn remaining(&self) -> usize {
         self.handles.len() - self.cursor
+    }
+
+    /// Stop encoding: the handles not yet in a packet are dropped. Returns
+    /// how many there were. For a sender whose send queue ran out of room.
+    pub fn abandon(mut self) -> usize {
+        let unsent = self.remaining();
+        self.cursor = self.handles.len();
+        unsent
     }
 
     /// Encode the next packet into `buf`. The encoder clears `buf` first.
@@ -310,6 +333,7 @@ impl<'a, C: Count> Packets<'a, C> {
         packet_header.body_len = encoded.body_len as u32;
         packet_header.min_origin_sequence = encoded.min_origin_sequence;
         packet_header.max_origin_sequence = encoded.max_origin_sequence;
+        packet_header.edge_sequence = self.next_edge;
 
         patch_header(&mut buf.inner[..HEADER_LEN], &packet_header);
 
@@ -324,10 +348,12 @@ impl<'a, C: Count> Packets<'a, C> {
         debug_assert!(buf.inner.len() <= self.limits.max_payload_bytes);
 
         self.cursor = next_cursor;
+        self.next_edge = self.next_edge.wrapping_add(1);
         Ok(Some(PacketWritten {
             cells_emitted: encoded.cells_emitted,
             cells_dropped: encoded.cells_dropped,
             flags,
+            edge_sequence: packet_header.edge_sequence,
         }))
     }
 }
@@ -373,6 +399,7 @@ fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
         incarnation: cell.origin_incarnation,
         count: cell.count,
         last_update_millis: cell.last_update_millis,
+        origin_sequence: cell.origin_sequence,
     }
 }
 

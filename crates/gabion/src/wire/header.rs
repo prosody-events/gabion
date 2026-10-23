@@ -1,8 +1,8 @@
-//! Fixed-length frame header — hand-rolled little-endian, exactly 72 bytes.
+//! Fixed-length frame header — hand-rolled little-endian, exactly 80 bytes.
 
 use super::DecodeError;
 
-pub const HEADER_LEN: usize = 72;
+pub const HEADER_LEN: usize = 80;
 pub const MAGIC: u32 = 0x4742_4732;
 pub const VERSION: u16 = 1;
 /// Set on every packet but the last in a multi-packet batch. Each packet is
@@ -10,6 +10,12 @@ pub const VERSION: u16 = 1;
 /// receivers that want to defer downstream work until the batch settles.
 pub const FLAG_MORE: u16 = 0x01;
 pub const FLAG_AUTHENTICATED: u16 = 0x02;
+/// The packet is one of the sender's eager pushes to this receiver, numbered
+/// in `edge_sequence` so the receiver can tell when one was lost.
+pub const FLAG_EDGE: u16 = 0x04;
+/// The packet carries no cells: its body is a control message (see
+/// `wire::control`).
+pub const FLAG_CONTROL: u16 = 0x08;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {
@@ -21,6 +27,9 @@ pub struct Header {
     pub body_len: u32,
     pub min_origin_sequence: u64,
     pub max_origin_sequence: u64,
+    /// Position of this packet in the sender's eager stream to this receiver,
+    /// counting from 1. Meaningful only with [`FLAG_EDGE`].
+    pub edge_sequence: u64,
     pub flags: u16,
 }
 
@@ -38,6 +47,7 @@ pub(crate) fn patch_header(buf: &mut [u8], hdr: &Header) {
     dst[52..56].copy_from_slice(&hdr.body_len.to_le_bytes());
     dst[56..64].copy_from_slice(&hdr.min_origin_sequence.to_le_bytes());
     dst[64..72].copy_from_slice(&hdr.max_origin_sequence.to_le_bytes());
+    dst[72..80].copy_from_slice(&hdr.edge_sequence.to_le_bytes());
 }
 
 pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, DecodeError> {
@@ -61,6 +71,7 @@ pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, DecodeError> {
     let body_len = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
     let min_origin_sequence = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
     let max_origin_sequence = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+    let edge_sequence = u64::from_le_bytes(bytes[72..80].try_into().unwrap());
     Ok(Header {
         cluster_id_hash,
         sender_node_id,
@@ -70,6 +81,7 @@ pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, DecodeError> {
         body_len,
         min_origin_sequence,
         max_origin_sequence,
+        edge_sequence,
         flags,
     })
 }

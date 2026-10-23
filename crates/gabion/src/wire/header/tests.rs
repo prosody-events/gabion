@@ -10,12 +10,13 @@ fn sample() -> Header {
         body_len: 192,
         min_origin_sequence: 100,
         max_origin_sequence: 200,
-        flags: FLAG_AUTHENTICATED | FLAG_MORE,
+        edge_sequence: 300,
+        flags: FLAG_AUTHENTICATED | FLAG_MORE | FLAG_EDGE,
     }
 }
 
 #[test]
-fn header_layout_is_72_bytes() {
+fn header_layout_is_80_bytes() {
     let mut buf = vec![0u8; HEADER_LEN];
     patch_header(&mut buf, &sample());
     assert_eq!(buf.len(), HEADER_LEN);

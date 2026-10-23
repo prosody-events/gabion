@@ -1,26 +1,27 @@
 //! Single-threaded gossip event loop.
 //!
-//! One `tokio::select!` drives five arms — limit/shutdown requests, inbound
-//! UDP, outbound writable, peer membership churn, gossip tick. After each
-//! iteration the runtime calls [`AggregateStore::apply`] once with whatever
-//! rows the arm produced. The runtime owns the [`CellStore`], pre-allocated
-//! scratch buffers, the outbound send pool, and the peer table; nothing in
-//! the loop allocates after construction.
+//! One `tokio::select!` drives six arms — limit/shutdown requests, inbound
+//! UDP, outbound writable, peer membership churn, relay, gossip tick. After
+//! each iteration the runtime calls [`AggregateStore::apply`] once with
+//! whatever rows the arm produced. The runtime owns the [`CellStore`],
+//! pre-allocated scratch buffers, the outbound send pool, and the peer table;
+//! nothing in the loop allocates after construction.
 
 use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Incarnation, NodeId, Observation,
-    ObservationBatch,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
 };
+use crate::defaults::THICKET_RELAY_FLOOR_MS;
 use crate::discovery::PeerEvent;
-use crate::wire::{self, PacketBuf, Packets, WireScratch};
+use crate::wire::{self, FLAG_EDGE, PacketBuf, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
@@ -33,49 +34,15 @@ use super::transport::GossipTransport;
 use super::transport::UdpTransport;
 use super::{GossipConfig, GossipError};
 
-/// One peer the runtime gossips with. `node_id` is `None` until we receive
-/// our first inbound packet from this peer; `peer_slot` caches the
-/// `PeerFrontierTable` slot once interned.
-struct Peer {
-    addr: SocketAddr,
-    node_id: Option<NodeId>,
-    peer_slot: Option<u16>,
-}
+mod edge;
+mod forward;
+mod repair;
+#[cfg(test)]
+mod tests;
+mod thicket;
 
-/// Data-oriented scratch for per-row frontier acks decoded from one inbound
-/// packet. The columns are allocated once at runtime construction and reused
-/// for every inbound arm.
-struct AckColumns {
-    origin_node_ids: Vec<NodeId>,
-    incarnations: Vec<Incarnation>,
-    origin_sequences: Vec<u64>,
-}
-
-impl AckColumns {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            origin_node_ids: Vec::with_capacity(capacity),
-            incarnations: Vec::with_capacity(capacity),
-            origin_sequences: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.origin_node_ids.clear();
-        self.incarnations.clear();
-        self.origin_sequences.clear();
-    }
-
-    fn push(&mut self, origin_node_id: NodeId, incarnation: Incarnation, origin_sequence: u64) {
-        self.origin_node_ids.push(origin_node_id);
-        self.incarnations.push(incarnation);
-        self.origin_sequences.push(origin_sequence);
-    }
-
-    fn len(&self) -> usize {
-        self.origin_node_ids.len()
-    }
-}
+use forward::Lane;
+use thicket::{Arrival, NONE, Thicket};
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
 pub struct GossipRuntime<C, S, T, K>
@@ -103,17 +70,17 @@ where
     recv_buf: Box<[u8]>,
     scratch: WireScratch,
     obs_buf: ObservationBatch<C>,
-    ack_buf: AckColumns,
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
-    send_pending: VecDeque<(SocketAddr, u8)>,
-    send_free: Vec<u8>,
+    send_pending: VecDeque<(SocketAddr, u16)>,
+    send_free: Vec<u16>,
 
-    peers: Vec<Peer>,
+    // Tree dissemination state: peers, trees, edges, missing-change timers.
+    thicket: Thicket,
     rng: SplitMix64,
 
     // Pending reply for the in-flight limit request. Sent after the
@@ -126,6 +93,10 @@ where
     // decode-failure `warn!` to power-of-two transitions so a peer stuck on
     // the wrong version / cluster secret can't flood the log.
     decode_reject_count: u64,
+
+    // Cumulative count of frames dropped for want of a free send slot;
+    // rate-limits the warning the same way.
+    cut_frames: u64,
 
     // High-water mark of `send_pending.len()`. Strictly observability — the
     // `WouldBlock` re-queue path in `drain_one_send` is otherwise invisible
@@ -162,9 +133,8 @@ where
     threshold_fires: u64,
     dirty_ticks: u64,
     // The adaptive-decision outputs, so observers can *see* the runtime
-    // react rather than infer it. `last_effective_fanout` is the
-    // `pick_count` the most recent dirty tick chose (the coverage fanout
-    // `⌈ln(n)+c⌉`, scaled by cluster size n, not the dirty set);
+    // react rather than infer it. `last_effective_fanout` is the number of
+    // tree neighbours the most recent round that sent changes sent to;
     // `peak_effective_fanout` is its high-water mark since startup.
     // `last_error_budget` is the per-rule
     // error budget ε the most recent `handle_limit_request` computed — the
@@ -258,28 +228,30 @@ where
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
         let obs_buf = ObservationBatch::<C>::with_capacity(config.max_cells_per_tick);
-        let ack_buf = AckColumns::with_capacity(config.wire_limits.max_cells as usize);
         let sink_buf = DeltaSink::<C>::with_capacity(config.max_cells_per_tick);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
 
-        let send_pool_size = config.send_queue_capacity.max(1);
+        let send_pool_size = config.send_queue_capacity.clamp(1, usize::from(u16::MAX));
         let send_pool: Vec<PacketBuf> = (0..send_pool_size)
             .map(|_| PacketBuf::for_limits(config.wire_limits))
             .collect();
-        let send_free: Vec<u8> = (0..send_pool_size as u8).rev().collect();
+        let send_free: Vec<u16> = (0..send_pool_size as u16).rev().collect();
         let send_pending = VecDeque::with_capacity(send_pool_size);
 
-        let peers: Vec<Peer> = config
-            .bootstrap_peers
-            .iter()
-            .copied()
-            .map(|addr| Peer {
-                addr,
-                node_id: None,
-                peer_slot: None,
-            })
-            .collect();
+        // The class (tree) a node is interior in is a hash of its address, so
+        // peers compute each other's from discovery alone.
+        let local_addr = transport
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+        let thicket = Thicket::new(
+            local_addr,
+            &config.bootstrap_peers,
+            usize::from(store.peer_frontiers().peer_capacity()),
+            store.node_dictionary().capacity() as usize,
+            store.capacity() as usize,
+            config.wire_limits.max_payload_bytes / wire::CONTROL_ENTRY_BYTES + 1,
+        );
         let rng = SplitMix64::new(config.rng_seed);
 
         let rule_capacity = store.rule_dictionary().capacity() as usize;
@@ -297,17 +269,17 @@ where
             recv_buf,
             scratch,
             obs_buf,
-            ack_buf,
             sink_buf,
             expiration_buf,
             frame_handles,
             send_pool,
             send_pending,
             send_free,
-            peers,
+            thicket,
             rng,
             pending_reply: None,
             decode_reject_count: 0,
+            cut_frames: 0,
             max_send_pending_depth: 0,
             rule_pending,
             rule_last_emit_ms,
@@ -339,10 +311,20 @@ where
     {
         let mut peer_events = std::pin::pin!(peer_events);
         let mut tick = self.clock.ticker(self.config.tick_interval);
+        // Spaces relay rounds: changes merged from a tree neighbour wait at
+        // most this long to be forwarded. Polled only while there is
+        // something to relay or a timer to watch, so an idle node sleeps.
+        let mut relay = self
+            .clock
+            .ticker(Duration::from_millis(THICKET_RELAY_FLOOR_MS));
         // Once the peer-event stream returns `None` (e.g. `stream::empty()`),
         // never poll it again — otherwise it returns `Ready(None)` on every
         // iteration and the loop spins.
         let mut peer_events_done = false;
+
+        // Attach to a parent in every tree this node is a leaf of before the
+        // first change, so the parents already forward to it.
+        self.maintain_structure();
 
         loop {
             // Decide outside the `select!` whether the send arm has work to do.
@@ -352,6 +334,7 @@ where
             let have_send = !self.send_pending.is_empty();
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
+            let watch_relay = self.thicket.relay_pending || self.thicket.next_deadline.is_some();
 
             let outcome = if self.want_immediate_flush {
                 // A previous limit request crossed the per-rule error
@@ -368,7 +351,7 @@ where
                 // between threshold fires and heartbeat fires.
                 self.want_immediate_flush = false;
                 self.threshold_fires = self.threshold_fires.saturating_add(1);
-                ArmOutcome::Tick
+                ArmOutcome::Tick(Round::Threshold)
             } else {
                 // Split-borrow scope: we hand the I/O futures non-overlapping
                 // pieces of `self` so they compose inside `select!`.
@@ -388,7 +371,8 @@ where
                     _ = transport.writable(), if have_send => ArmOutcome::Writable,
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
                     cmd = recv_admin(admin_rx), if watch_admin => ArmOutcome::Admin(cmd),
-                    _ = tick.tick() => ArmOutcome::Tick,
+                    _ = relay.tick(), if watch_relay => ArmOutcome::Relay,
+                    _ = tick.tick() => ArmOutcome::Tick(Round::Heartbeat),
                 }
             };
 
@@ -404,7 +388,8 @@ where
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
                 ArmOutcome::Admin(None) => self.admin_rx = None,
-                ArmOutcome::Tick => self.handle_gossip_tick(),
+                ArmOutcome::Relay => self.handle_relay(),
+                ArmOutcome::Tick(round) => self.handle_gossip_tick(round),
             }
 
             // One apply per iteration covering both row sources. CRDT-free
@@ -449,7 +434,7 @@ where
             let pending =
                 self.rule_pending[idx].saturating_add(req.hits.min(u32::MAX as u64) as u32);
             self.rule_pending[idx] = pending;
-            let peers = self.peers.len().max(1) as u64;
+            let peers = self.thicket.alive.max(1) as u64;
             let limit = req.rule_limit.max(1);
             let bps = self.config.target_err_bps.max(1) as u64;
             let epsilon = ((limit.saturating_mul(bps)) / (10_000 * peers)).max(1);
@@ -488,8 +473,12 @@ where
             incarnation: 0,
             count: C::saturating_from_u64(req.hits),
             last_update_millis: req.now_millis,
+            origin_sequence: 0,
         });
         self.store.ingest_local(&self.obs_buf, &mut self.sink_buf);
+        for handle in &self.sink_buf.handles {
+            self.thicket.arrival[handle.index as usize] = Arrival::Local;
+        }
         // Reply is sent at the bottom of this loop iteration, AFTER the
         // post-iteration apply runs. Caller observes "ack ⇒ AggregateStore
         // reflects the increment".
@@ -497,19 +486,16 @@ where
     }
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
+        if wire::is_control(&self.recv_buf[..n]) {
+            self.handle_control(n, src);
+            return;
+        }
         self.obs_buf.clear();
-        self.ack_buf.clear();
         self.sink_buf.clear();
         let bytes = &self.recv_buf[..n];
         let decoded = {
             let obs_buf = &mut self.obs_buf;
-            let ack_buf = &mut self.ack_buf;
             let mut on_cell = |cell: wire::WireCell<C>| {
-                ack_buf.push(
-                    cell.origin_node_id,
-                    cell.origin_incarnation,
-                    cell.origin_sequence,
-                );
                 obs_buf.push(Observation {
                     rule_fingerprint: cell.rule_fingerprint,
                     key_hash: cell.key_hash,
@@ -518,6 +504,7 @@ where
                     incarnation: cell.origin_incarnation,
                     count: cell.count,
                     last_update_millis: cell.last_update_millis,
+                    origin_sequence: cell.origin_sequence,
                 });
             };
             match self.config.auth_key.as_ref() {
@@ -539,52 +526,65 @@ where
         let summary = match decoded {
             Ok(s) => s,
             Err(err) => {
-                self.decode_reject_count = self.decode_reject_count.saturating_add(1);
-                if self.decode_reject_count.is_power_of_two() {
-                    tracing::warn!(
-                        peer = %src,
-                        error = %err,
-                        rejected_total = self.decode_reject_count,
-                        "Could not understand a gossip message from this \
-                         peer; dropping it. Common causes: the peer is \
-                         running a different gabion version, the peers are \
-                         configured with different counter sizes \
-                         (`storage.count_width`), the cluster authentication \
-                         key (`gossip.auth_key`) does not match between \
-                         peers, or the peer is sending messages larger than \
-                         this node's `gossip.max_payload_bytes`. Check the \
-                         peer's version and gabion config to find the \
-                         mismatch.",
-                    );
-                }
+                self.note_decode_reject(src, &err);
                 return;
             }
         };
 
+        // A cell already out of its window here is not merged: a tree relays
+        // whatever is newly merged, so an expired cell taken back in would be
+        // handed on to nodes that had just dropped it, and circulate.
+        let now = self.clock.now_millis();
+        let store = &self.store;
+        self.obs_buf
+            .retain(|obs, i| !store.is_expired_at(obs.rule_fingerprints[i], obs.buckets[i], now));
         self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
 
-        // Frontier update — latency optimization. Best-effort: missing slot
-        // or missing node entry just means we don't get the skip.
-        let sender_id = NodeId(summary.header.sender_node_id);
-        if let Some(peer_slot) = self.store.peer_frontiers_mut().intern_peer(sender_id) {
-            for i in 0..self.ack_buf.len() {
-                let origin_id = self.ack_buf.origin_node_ids[i];
-                let incarnation = self.ack_buf.incarnations[i];
-                let sequence = self.ack_buf.origin_sequences[i];
-                if let Some(node_slot) = self.store.node_dictionary().find(origin_id, incarnation) {
-                    self.store
-                        .peer_frontiers_mut()
-                        .record_acked(peer_slot, node_slot, sequence);
-                }
+        // Remember who delivered each changed cell, so it is not sent back,
+        // and forward what changed to this node's tree neighbours.
+        let peer = self.thicket.index_of(src);
+        let from = peer.unwrap_or(NONE);
+        let arrival = if summary.flags & FLAG_EDGE != 0 {
+            Arrival::Eager
+        } else {
+            Arrival::Other
+        };
+        for handle in &self.sink_buf.handles {
+            self.thicket.from_peer[handle.index as usize] = from;
+            self.thicket.arrival[handle.index as usize] = arrival;
+        }
+        if !self.sink_buf.is_empty() {
+            self.thicket.relay_pending = true;
+        }
+        if let Some(peer) = peer {
+            self.thicket.peers[usize::from(peer)].node_id =
+                Some(NodeId(summary.header.sender_node_id));
+            if summary.flags & FLAG_EDGE != 0 && self.edge_receive(peer, &summary.header, now) {
+                self.eager_feedback(peer, now);
             }
-            // Cache the peer_slot on the matching peer entry so future ticks
-            // can prune without re-interning. `node_id` and `peer_slot` are
-            // always set together — see `handle_gossip_tick`, which relies
-            // on this invariant.
-            if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
-                peer.node_id = Some(sender_id);
-                peer.peer_slot = Some(peer_slot);
-            }
+        }
+    }
+
+    /// A frame that did not decode. Rate-limited to powers of two so a peer
+    /// stuck on the wrong version or cluster secret cannot flood the log.
+    pub(super) fn note_decode_reject(&mut self, src: SocketAddr, err: &wire::DecodeError) {
+        self.decode_reject_count = self.decode_reject_count.saturating_add(1);
+        if self.decode_reject_count.is_power_of_two() {
+            tracing::warn!(
+                peer = %src,
+                error = %err,
+                rejected_total = self.decode_reject_count,
+                "Could not understand a gossip message from this \
+                 peer; dropping it. Common causes: the peer is \
+                 running a different gabion version, the peers are \
+                 configured with different counter sizes \
+                 (`storage.count_width`), the cluster authentication \
+                 key (`gossip.auth_key`) does not match between \
+                 peers, or the peer is sending messages larger than \
+                 this node's `gossip.max_payload_bytes`. Check the \
+                 peer's version and gabion config to find the \
+                 mismatch.",
+            );
         }
     }
 
@@ -592,7 +592,7 @@ where
         let Some((dst, slot)) = self.send_pending.pop_front() else {
             return Ok(());
         };
-        let buf = &self.send_pool[slot as usize];
+        let buf = &self.send_pool[usize::from(slot)];
         match self.transport.try_send_to(buf.as_bytes(), dst) {
             Ok(_) => self.send_free.push(slot),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -612,12 +612,13 @@ where
                 let snapshot = AdminSnapshot {
                     local_identity: self.store.local_identity(),
                     peers: self
+                        .thicket
                         .peers
                         .iter()
+                        .filter(|p| p.alive)
                         .map(|p| PeerEntry {
                             addr: p.addr,
                             node_id: p.node_id,
-                            peer_slot: p.peer_slot,
                         })
                         .collect(),
                     store_stats: self.store.stats(),
@@ -686,36 +687,43 @@ where
     fn handle_peer_event(&mut self, evt: PeerEvent) {
         match evt {
             PeerEvent::Added(p) => {
-                if !self.peers.iter().any(|x| x.addr == p.addr) {
-                    self.peers.push(Peer {
-                        addr: p.addr,
-                        node_id: None,
-                        peer_slot: None,
-                    });
+                let (peer, new) = self.thicket.add_peer(p.addr);
+                if new {
                     tracing::info!(
                         peer = %p.addr,
-                        cluster_size = self.peers.len(),
+                        cluster_size = self.thicket.alive,
                         "Peer joined the cluster.",
                     );
+                    self.maintain_structure();
+                    self.send_digest_to(peer);
                 }
             }
             PeerEvent::Removed(p) => {
-                if let Some(pos) = self.peers.iter().position(|x| x.addr == p.addr) {
-                    let removed = self.peers.remove(pos);
-                    if let Some(node_id) = removed.node_id {
-                        self.store.peer_frontiers_mut().remove_peer(node_id);
-                    }
+                if self.thicket.index_of(p.addr).is_some() {
+                    self.thicket.remove_peer(p.addr);
                     tracing::info!(
                         peer = %p.addr,
-                        cluster_size = self.peers.len(),
+                        cluster_size = self.thicket.alive,
                         "Peer left the cluster.",
                     );
+                    self.maintain_structure();
                 }
             }
         }
     }
 
-    fn handle_gossip_tick(&mut self) {
+    /// Forward changes merged from tree neighbours since the last relay
+    /// round, and act on whatever timer is due.
+    fn handle_relay(&mut self) {
+        if self.thicket.relay_pending {
+            self.thicket.relay_pending = false;
+            self.forward_round(false);
+        }
+        let now = self.clock.now_millis();
+        self.check_timers(now);
+    }
+
+    fn handle_gossip_tick(&mut self, round: Round) {
         // Step 0: bump the total-ticks counter. Tracked unconditionally
         // (even for empty / no-peer ticks) so the bench can split the
         // run's wall time into heartbeat ticks vs threshold fires.
@@ -726,96 +734,26 @@ where
         self.expiration_buf.clear();
         self.store.expire_at(now_millis, &mut self.expiration_buf);
 
-        if self.store.is_empty() || self.peers.is_empty() || self.send_free.is_empty() {
+        // Step 2: heartbeat upkeep, then send this node's changes (and any
+        // not yet relayed) along the trees.
+        if let Round::Heartbeat = round {
+            self.heartbeat();
+        }
+        self.maintain_structure();
+        if self.store.is_empty() || self.thicket.alive == 0 {
             return;
         }
-
-        // The store was non-empty when this tick fired — bench harness
-        // counts this as a "dirty tick" so effective-fanout reports
-        // `packets / dirty_ticks` rather than `packets / wall_ticks`.
-        // Bumped before the peer-pick math runs so synthetic threshold
-        // ticks (which by construction have local_dirty>0) always count.
-        self.dirty_ticks = self.dirty_ticks.saturating_add(1);
-
-        // Step 2: pick `fanout` distinct peers via a partial Fisher-Yates
-        // shuffle of `self.peers` in place. With-replacement sampling would
-        // silently break Demers' O(log N) convergence bound — selecting the
-        // same peer twice in one tick burns a send-pool slot encoding the
-        // same frame for the same peer. `self.peers` has no ordering
-        // contract elsewhere (lookups are by `addr`), so shuffling is free.
-        //
-        // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
-        // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`
-        // reaches *every* node with probability → e^(−e^(−c)) — "there is a
-        // sharp threshold in the required fanout at log n." Fanout is
-        // governed by cluster size `n`, not data volume: KMG note the
-        // fanout need only grow by 1 each time `n` rises by a factor of e,
-        // and that a round "can easily be modified … to send several
-        // notifications per gossip message." Gabion already packs the whole
-        // dirty set into one fat frame (`max_cells_per_tick` + packet
-        // splitting), so a burst rides along without widening fanout — the
-        // dirty-set size drives frame fill, not the peer pick. `config.fanout`
-        // is the floor; `.min(n)` makes small clusters full-mesh (at small n
-        // coverage demands it and the bandwidth is trivial). The early return
-        // above guarantees n ≥ 1, so `ln` is never called on 0 and `.min(n)`
-        // never clamps below 1.
-        let n = self.peers.len();
-        let coverage = ((n as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-        let pick_count = self.config.fanout.max(coverage).min(n);
-        // Record the coverage-fanout decision so observers can read the pick
-        // directly instead of reconstructing the formula. Only dirty ticks
-        // reach here, so `last_effective_fanout` is the fanout of the most
-        // recent tick that actually gossiped.
-        self.last_effective_fanout = pick_count;
-        self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
-        for i in 0..pick_count {
-            let j = i + (self.rng.next_u64() as usize) % (n - i);
-            self.peers.swap(i, j);
-        }
-
-        for peer_idx in 0..pick_count {
-            if self.send_free.is_empty() {
-                break;
-            }
-            let peer_addr = self.peers[peer_idx].addr;
-            // `handle_inbound` writes `node_id` and `peer_slot` together —
-            // when one is `Some`, the other is too. So a single read of
-            // `peer_slot` is the full pruning decision.
-            let peer_slot = self.peers[peer_idx].peer_slot;
-
-            self.frame_handles.clear();
-            match peer_slot {
-                Some(slot) => {
-                    self.store.fill_gossip_frame_for_peer(
-                        self.config.max_cells_per_tick,
-                        slot,
-                        &mut self.frame_handles,
-                    );
-                }
-                None => {
-                    // Bootstrap fallback: we haven't heard from this peer
-                    // yet, so we don't know what to prune. Send an unpruned
-                    // frame; the next inbound from them caches the slot.
-                    self.store
-                        .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
-                }
-            }
-            if self.frame_handles.is_empty() {
-                continue;
-            }
-            self.encode_packets_for(peer_addr);
-        }
+        self.forward_round(true);
+        self.thicket.relay_pending = false;
 
         // Reset per-rule pending. The sweep treats every rule with
         // non-zero pending as "touched in expectation by the tick" — the
-        // dirty-ring drain in `fill_gossip_frame*` doesn't tell us which
-        // rule slots actually made it onto the wire, but mass conservation
-        // (Kempe, Dobra, Gehrke — FOCS 2003) says every pending hit either
-        // rode out in this frame or sits in the dirty ring awaiting the
-        // next one. Under UDP loss the residual is repaired by the next
-        // round; the N × ε_R bound holds in expectation. A strict bound
-        // would require ack-aware reset against `peer_frontiers`,
-        // deferred until measurements show drift.
+        // round's frames don't tell us which rule slots actually made it onto
+        // the wire, but mass conservation (Kempe, Dobra, Gehrke — FOCS 2003)
+        // says every pending hit either rode out in this round or is repaired
+        // by the lazy path. The N × ε_R bound holds in expectation. A strict
+        // bound would require ack-aware reset, deferred until measurements
+        // show drift.
         let stamp = now_millis.max(1);
         for slot in 0..self.rule_pending.len() {
             if self.rule_pending[slot] != 0 {
@@ -823,58 +761,6 @@ where
                 self.rule_last_emit_ms[slot] = stamp;
             }
         }
-    }
-
-    fn encode_packets_for(&mut self, dst: SocketAddr) {
-        let header = wire::Header {
-            cluster_id_hash: self.config.cluster_id_hash,
-            sender_node_id: self.store.local_identity().node_id.0,
-            sender_incarnation: self.store.local_identity().incarnation,
-            count_width: 0,
-            cell_count: 0,
-            body_len: 0,
-            min_origin_sequence: 0,
-            max_origin_sequence: 0,
-            flags: 0,
-        };
-
-        let packets_result = match self.config.auth_key.as_ref() {
-            Some(key) => Packets::<C>::auth(
-                header,
-                &self.store,
-                &self.frame_handles,
-                key,
-                &mut self.scratch,
-                self.config.wire_limits,
-            ),
-            None => Packets::<C>::unauth(
-                header,
-                &self.store,
-                &self.frame_handles,
-                &mut self.scratch,
-                self.config.wire_limits,
-            ),
-        };
-        let mut packets = match packets_result {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        while let Some(slot) = self.send_free.pop() {
-            let buf = &mut self.send_pool[slot as usize];
-            match packets.next_into(buf) {
-                Ok(Some(_)) => self.send_pending.push_back((dst, slot)),
-                Ok(None) => {
-                    self.send_free.push(slot);
-                    break;
-                }
-                Err(_) => {
-                    self.send_free.push(slot);
-                    break;
-                }
-            }
-        }
-        drop(packets);
     }
 }
 
@@ -884,7 +770,17 @@ enum ArmOutcome {
     Writable,
     PeerEvent(Option<PeerEvent>),
     Admin(Option<AdminCommand>),
-    Tick,
+    Relay,
+    Tick(Round),
+}
+
+/// What started a gossip round. Both send the local changes along the trees;
+/// only the heartbeat also probes the eager edges and sends the lazy digest,
+/// so a burst of threshold fires cannot multiply that traffic.
+#[derive(Clone, Copy)]
+enum Round {
+    Heartbeat,
+    Threshold,
 }
 
 /// Read one admin command. Only invoked when `admin_rx.is_some()` — the

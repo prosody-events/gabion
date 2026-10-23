@@ -67,6 +67,7 @@ fn observation<C: Count>(
         incarnation: inc,
         count,
         last_update_millis: ts,
+        origin_sequence: 1,
     }
 }
 
@@ -1322,6 +1323,7 @@ fn count_widths_compile_and_saturate() {
         incarnation: 1,
         count: u16::MAX,
         last_update_millis: 0,
+        origin_sequence: 0,
     });
     s16.ingest_local(&obs, &mut sink);
     // Add more hits — should saturate at u16::MAX, no overflow.
@@ -1335,6 +1337,7 @@ fn count_widths_compile_and_saturate() {
         incarnation: 1,
         count: 1,
         last_update_millis: 0,
+        origin_sequence: 0,
     });
     s16.ingest_local(&obs2, &mut sink2);
     // No raise because already at MAX.
@@ -1363,6 +1366,7 @@ fn count_widths_compile_and_saturate() {
         incarnation: 1,
         count: 1_000_000_000_000,
         last_update_millis: 0,
+        origin_sequence: 0,
     });
     s64.merge_remote(&obs64, &mut sink64);
     assert_eq!(sink64.current[0], 1_000_000_000_000);
@@ -2235,6 +2239,7 @@ fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
             incarnation: 1,
             count: row.hits,
             last_update_millis: 0,
+            origin_sequence: 0,
         });
         let mut sink = DeltaSink::<u16>::with_capacity(1);
         store.ingest_local(&obs, &mut sink);
@@ -2404,4 +2409,165 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
     handles_a == handles_b
         && store_a.active_len() == store_b.active_len()
         && portable_snapshot(&store_a) == portable_snapshot(&store_b)
+}
+
+// --- Origin sequences travel with the cell (tree dissemination) ----------
+
+fn remote_with_sequence(
+    store: &mut CellStore<u32>,
+    key: u128,
+    origin: u128,
+    count: u32,
+    sequence: u64,
+) -> Option<CellHandle> {
+    let mut obs = ObservationBatch::with_capacity(1);
+    let mut sink = DeltaSink::with_capacity(1);
+    let mut row = observation(0x11, key, 0, origin, 1, count, 0);
+    row.origin_sequence = sequence;
+    obs.push(row);
+    store.merge_remote(&obs, &mut sink);
+    sink.handles.first().copied()
+}
+
+#[test]
+fn merged_cell_keeps_the_origin_sequence_and_raises_its_high_water_mark() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+
+    let h = remote_with_sequence(&mut store, 1, 7, 5, 40).unwrap();
+    let row = store.get(h).unwrap();
+    assert_eq!(
+        row.origin_sequence, 40,
+        "not re-stamped with a local counter"
+    );
+    assert_eq!(store.highest_origin_sequence(row.key.origin), 40);
+
+    // A change with a lower sequence (another cell, delivered late) does not
+    // lower the mark, and one above it raises it.
+    let late = remote_with_sequence(&mut store, 2, 7, 1, 12).unwrap();
+    assert_eq!(store.get(late).unwrap().origin_sequence, 12);
+    assert_eq!(store.highest_origin_sequence(row.key.origin), 40);
+    remote_with_sequence(&mut store, 3, 7, 1, 41).unwrap();
+    assert_eq!(store.highest_origin_sequence(row.key.origin), 41);
+
+    // The forwarded ring names the change by the origin's sequence.
+    let mut seen = Vec::new();
+    store.visit_forwarded_dirty(|handle, store| {
+        seen.push(store.get(handle).unwrap().origin_sequence);
+        true
+    });
+    assert_eq!(seen, vec![40, 12, 41]);
+}
+
+#[test]
+fn local_changes_keep_numbering_from_the_local_counter() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let a = local_increment_one(&mut store, 0x11, 1, 0, 1, 0);
+    let b = local_increment_one(&mut store, 0x11, 2, 0, 1, 0);
+    let again = local_increment_one(&mut store, 0x11, 1, 0, 1, 0);
+    assert_eq!(a, again);
+    assert_eq!(store.get(b).unwrap().origin_sequence, 2);
+    assert_eq!(store.get(again).unwrap().origin_sequence, 3);
+    assert_eq!(store.highest_origin_sequence(store.local_node_slot()), 3);
+}
+
+#[test]
+fn a_no_op_merge_leaves_the_stored_sequence() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let h = remote_with_sequence(&mut store, 1, 7, 5, 40).unwrap();
+    assert!(remote_with_sequence(&mut store, 1, 7, 5, 99).is_none());
+    assert!(remote_with_sequence(&mut store, 1, 7, 3, 99).is_none());
+    assert_eq!(store.get(h).unwrap().origin_sequence, 40);
+}
+
+#[test]
+fn find_cell_reports_handle_and_sequence() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let h = remote_with_sequence(&mut store, 1, 7, 5, 40).unwrap();
+    assert_eq!(
+        store.find_cell(0x11, KeyHash(1), 0, NodeId(7), 1),
+        Some((h, 40))
+    );
+    assert_eq!(store.find_cell(0x11, KeyHash(2), 0, NodeId(7), 1), None);
+    assert_eq!(store.find_cell(0x22, KeyHash(1), 0, NodeId(7), 1), None);
+    assert_eq!(store.find_cell(0x11, KeyHash(1), 0, NodeId(8), 1), None);
+}
+
+#[test]
+fn visit_cells_after_returns_each_origins_cells_above_its_floor() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let a1 = remote_with_sequence(&mut store, 1, 7, 1, 1).unwrap();
+    let a2 = remote_with_sequence(&mut store, 2, 7, 1, 2).unwrap();
+    let b1 = remote_with_sequence(&mut store, 3, 8, 1, 1).unwrap();
+    let slot_a = store.get(a1).unwrap().key.origin;
+    let slot_b = store.get(b1).unwrap().key.origin;
+
+    let mut since = vec![u64::MAX; store.node_dictionary().capacity() as usize];
+    let visit = |since: &[u64]| {
+        let mut got = Vec::new();
+        store.visit_cells_after(since, |h| {
+            got.push(h);
+            true
+        });
+        got.sort_by_key(|h| h.index);
+        got
+    };
+    assert!(visit(&since).is_empty(), "no origin asked for");
+    since[usize::from(slot_a)] = 1;
+    assert_eq!(visit(&since), vec![a2]);
+    since[usize::from(slot_a)] = 0;
+    since[usize::from(slot_b)] = 0;
+    assert_eq!(visit(&since), vec![a1, a2, b1]);
+}
+
+#[test]
+fn is_expired_at_applies_the_rule_window_and_ignores_unknown_rules() {
+    let mut store = small_store(8, 8);
+    // 1 s buckets, a 2 s window: two live buckets.
+    store
+        .intern_rule(RuleDescriptor {
+            window_millis: 2000,
+            ..rule_descriptor(0x11, 1)
+        })
+        .unwrap();
+    assert!(!store.is_expired_at(0x11, 5, 5_000));
+    assert!(!store.is_expired_at(0x11, 3, 5_000));
+    assert!(store.is_expired_at(0x11, 2, 5_000));
+    assert!(!store.is_expired_at(0x99, 0, 5_000), "unknown rule");
+}
+
+#[test]
+fn clearing_one_dirty_ring_leaves_the_other() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    local_increment_one(&mut store, 0x11, 1, 0, 1, 0);
+    remote_with_sequence(&mut store, 2, 7, 1, 1).unwrap();
+    store.clear_forwarded_dirty();
+    assert_eq!(store.local_dirty().len(), 1);
+    assert_eq!(store.forwarded_dirty().len(), 0);
+    store.clear_local_dirty();
+    assert_eq!(store.local_dirty().len(), 0);
+}
+
+#[test]
+fn observation_batch_retain_keeps_chosen_rows_in_order() {
+    let mut obs = ObservationBatch::<u32>::with_capacity(4);
+    for i in 0..5u128 {
+        let mut row = observation(0x11, i, 0, 7, 1, i as u32 + 1, 0);
+        row.origin_sequence = 10 + i as u64;
+        obs.push(row);
+    }
+    obs.retain(|batch, i| batch.key_hashes[i].0 % 2 == 0);
+    assert_eq!(obs.len(), 3);
+    assert_eq!(
+        obs.key_hashes.iter().map(|k| k.0).collect::<Vec<_>>(),
+        vec![0, 2, 4]
+    );
+    assert_eq!(obs.counts, vec![1, 3, 5]);
+    assert_eq!(obs.origin_sequences, vec![10, 12, 14]);
+    obs.assert_consistent();
 }

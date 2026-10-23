@@ -65,15 +65,12 @@ pub struct AdminSnapshot {
     /// (`packets_emitted / dirty_ticks`) — see
     /// `crates/gossip-bench/README.md`.
     pub dirty_ticks: u64,
-    /// The coverage fanout the most recent dirty tick chose:
-    /// `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`, where `c` is
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]. Scales with cluster size,
-    /// not the dirty set, so it is stable for a given peer count rather than
-    /// pulsing with bursts. `0` before the first dirty tick.
+    /// How many tree neighbours the most recent round that sent changes sent
+    /// them to: backbone neighbours eager for the changes' roots, leaf
+    /// children, and a parent. `0` before the first such round.
     pub last_effective_fanout: usize,
     /// High-water mark of `last_effective_fanout` since startup — the widest
-    /// the node has ever fanned out. Tracks the coverage fanout's peak, which
-    /// rises only when the peer count grows.
+    /// the node has ever fanned out.
     pub peak_effective_fanout: usize,
     /// The per-rule error budget ε the most recent `handle_limit_request`
     /// computed: `limit × target_err_bps / (10_000 × peers)` (floored at 1).
@@ -84,15 +81,11 @@ pub struct AdminSnapshot {
 }
 
 /// One peer known to the runtime. `node_id` is `None` until the runtime has
-/// received an inbound packet from this peer; `peer_slot` is `None` until the
-/// peer has been interned in the `PeerFrontierTable`. The two fields are set
-/// together — see the invariant tested in
-/// `quickcheck_peer_slot_pairing_holds_across_lifecycle`.
+/// received an inbound packet from this peer.
 #[derive(Clone, Copy, Debug)]
 pub struct PeerEntry {
     pub addr: SocketAddr,
     pub node_id: Option<NodeId>,
-    pub peer_slot: Option<u16>,
 }
 
 /// Full per-cell view of one runtime's `CellStore`, built inside the gossip

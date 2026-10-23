@@ -9,9 +9,9 @@ use crate::crdt::{
 };
 
 use super::{
-    DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_MORE, FrameLimits,
-    HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch, decode_auth,
-    decode_auth_visit, decode_unauth, decode_unauth_visit,
+    DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_EDGE, FLAG_MORE,
+    FrameLimits, HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch,
+    decode_auth, decode_auth_visit, decode_unauth, decode_unauth_visit,
 };
 
 const MAX_ROWS: usize = 32;
@@ -65,6 +65,7 @@ fn sample_header() -> Header {
         body_len: 0,
         min_origin_sequence: 0,
         max_origin_sequence: 0,
+        edge_sequence: 0,
         flags: 0,
     }
 }
@@ -105,6 +106,7 @@ fn seed_store<C: Count>(
             incarnation: r.origin_incarnation as Incarnation,
             count: to_count(r.count),
             last_update_millis: r.last_update_millis,
+            origin_sequence: 0,
         });
     }
     store.merge_remote(&obs, &mut sink);
@@ -353,6 +355,7 @@ fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
             incarnation: 1,
             count: 1 + i,
             last_update_millis: 1_000 + i as u64,
+            origin_sequence: 0,
         });
     }
     store.merge_remote(&obs, &mut sink);
@@ -867,4 +870,52 @@ fn visitor_matches_allocating_for_curated_rows() {
         assert_eq!(cell.count, obs.counts[i]);
         assert_eq!(cell.last_update_millis, obs.last_update_millis[i]);
     }
+}
+
+// --- Edge numbering ---------------------------------------------------------
+
+#[test]
+fn packets_are_numbered_from_the_template_and_the_flag_survives() {
+    let n: u32 = 200;
+    let (store, handles) = build_many_origins(n);
+    let limits = FrameLimits {
+        max_payload_bytes: 2048,
+        max_cells: 4096,
+    };
+    let mut header = sample_header();
+    header.flags = FLAG_EDGE;
+    header.edge_sequence = 41;
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut packets =
+        Packets::<u32>::unauth(header, &store, &handles, &mut scratch, limits).expect("ctor");
+    let mut expected = 41;
+    while let Some(written) = packets.next_into(&mut buf).expect("encode") {
+        assert_eq!(written.edge_sequence, expected);
+        assert_ne!(written.flags & FLAG_EDGE, 0);
+        let summary =
+            decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_| true, |_| {}).expect("decode");
+        assert_eq!(summary.header.edge_sequence, expected);
+        assert_ne!(summary.flags & FLAG_EDGE, 0);
+        expected += 1;
+    }
+    assert!(expected > 42, "several packets were numbered");
+}
+
+#[test]
+fn abandon_reports_the_handles_not_sent_and_disarms_the_drain_check() {
+    let (store, handles) = build_many_origins(64);
+    let limits = FrameLimits {
+        max_payload_bytes: 1024,
+        max_cells: 4096,
+    };
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut packets =
+        Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+            .expect("ctor");
+    let first = packets.next_into(&mut buf).expect("encode").expect("one");
+    let unsent = packets.abandon();
+    assert_eq!(unsent, handles.len() - first.cells_emitted as usize);
+    assert!(unsent > 0);
 }
