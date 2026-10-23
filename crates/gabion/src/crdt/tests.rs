@@ -2405,3 +2405,58 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
         && store_a.active_len() == store_b.active_len()
         && portable_snapshot(&store_a) == portable_snapshot(&store_b)
 }
+
+#[test]
+fn visit_local_dirty_after_yields_only_newer_current_entries() {
+    let mut store = small_store(16, 8);
+    let a = local_increment_one(&mut store, 1, 10, 0, 1, 0);
+    let b = local_increment_one(&mut store, 1, 11, 0, 1, 0);
+    // A second hit on `a` supersedes its first dirty entry.
+    let a_again = local_increment_one(&mut store, 1, 10, 0, 1, 0);
+    assert_eq!(a, a_again);
+
+    let mut all = Vec::new();
+    store.visit_local_dirty_after(0, |h, seq| {
+        all.push((h, seq));
+        true
+    });
+    assert_eq!(all.len(), 2, "the superseded entry is skipped");
+    assert_eq!(all[0].0, b);
+    assert_eq!(all[1].0, a);
+    assert!(all[0].1 < all[1].1);
+
+    let mut newer = Vec::new();
+    store.visit_local_dirty_after(all[0].1, |h, _| {
+        newer.push(h);
+        true
+    });
+    assert_eq!(newer, vec![a]);
+
+    let mut none = 0;
+    store.visit_local_dirty_after(all[1].1, |_, _| {
+        none += 1;
+        true
+    });
+    assert_eq!(none, 0);
+}
+
+#[test]
+fn visit_local_dirty_after_survives_ring_wraparound() {
+    let mut store = small_store(16, 4);
+    let mut last = 0;
+    for key in 0..10_u128 {
+        local_increment_one(&mut store, 1, key, 0, 1, 0);
+        store.visit_local_dirty_after(0, |_, seq| {
+            last = seq;
+            true
+        });
+    }
+    let mut seen = Vec::new();
+    store.visit_local_dirty_after(0, |_, seq| {
+        seen.push(seq);
+        true
+    });
+    assert_eq!(seen.len(), 4, "only the ring's capacity survives");
+    assert!(seen.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(*seen.last().unwrap(), last);
+}

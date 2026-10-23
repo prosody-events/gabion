@@ -10,6 +10,9 @@ pub const VERSION: u16 = 1;
 /// receivers that want to defer downstream work until the batch settles.
 pub const FLAG_MORE: u16 = 0x01;
 pub const FLAG_AUTHENTICATED: u16 = 0x02;
+/// The body starts with a length-prefixed control extension that precedes the
+/// cell body. See the module docs of [`crate::wire`].
+pub const FLAG_EXT: u16 = 0x04;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {

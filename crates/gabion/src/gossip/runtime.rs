@@ -1,23 +1,27 @@
 //! Single-threaded gossip event loop.
 //!
-//! One `tokio::select!` drives five arms — limit/shutdown requests, inbound
-//! UDP, outbound writable, peer membership churn, gossip tick. After each
+//! One `tokio::select!` drives six arms — limit/shutdown requests, inbound
+//! UDP, outbound writable, peer membership churn, gossip tick, and (only while
+//! a broadcast awaits acknowledgements) the acknowledgement timer. After each
 //! iteration the runtime calls [`AggregateStore::apply`] once with whatever
 //! rows the arm produced. The runtime owns the [`CellStore`], pre-allocated
-//! scratch buffers, the outbound send pool, and the peer table; nothing in
-//! the loop allocates after construction.
+//! scratch buffers, the outbound send pool, and the membership ring; nothing
+//! in the loop allocates after construction.
+//!
+//! Local changes reach the cluster over a Snow broadcast tree; see
+//! `runtime/snow.rs`.
 
 use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Incarnation, NodeId, Observation,
-    ObservationBatch,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
 };
 use crate::discovery::PeerEvent;
 use crate::wire::{self, PacketBuf, Packets, WireScratch};
@@ -27,53 +31,45 @@ use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
+use super::snow::{Child, Ctrl, MAX_CHILDREN, Origins, Relays, Ring, RttEstimator, TreeParams};
 use super::store::AggregateStore;
 use super::transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
 use super::transport::UdpTransport;
 use super::{GossipConfig, GossipError};
 
-/// One peer the runtime gossips with. `node_id` is `None` until we receive
-/// our first inbound packet from this peer; `peer_slot` caches the
-/// `PeerFrontierTable` slot once interned.
-struct Peer {
-    addr: SocketAddr,
-    node_id: Option<NodeId>,
-    peer_slot: Option<u16>,
+/// The outbound send pool: pre-allocated packet buffers, the queue of
+/// filled buffers waiting for the socket, and the free list.
+struct SendQueue {
+    pool: Vec<PacketBuf>,
+    pending: VecDeque<(SocketAddr, u8)>,
+    free: Vec<u8>,
 }
 
-/// Data-oriented scratch for per-row frontier acks decoded from one inbound
-/// packet. The columns are allocated once at runtime construction and reused
-/// for every inbound arm.
-struct AckColumns {
-    origin_node_ids: Vec<NodeId>,
-    incarnations: Vec<Incarnation>,
-    origin_sequences: Vec<u64>,
-}
-
-impl AckColumns {
-    fn with_capacity(capacity: usize) -> Self {
+impl SendQueue {
+    fn new(size: usize, limits: wire::FrameLimits) -> Self {
+        let size = size.max(1);
         Self {
-            origin_node_ids: Vec::with_capacity(capacity),
-            incarnations: Vec::with_capacity(capacity),
-            origin_sequences: Vec::with_capacity(capacity),
+            pool: (0..size).map(|_| PacketBuf::for_limits(limits)).collect(),
+            pending: VecDeque::with_capacity(size),
+            free: (0..size as u8).rev().collect(),
         }
     }
 
-    fn clear(&mut self) {
-        self.origin_node_ids.clear();
-        self.incarnations.clear();
-        self.origin_sequences.clear();
-    }
-
-    fn push(&mut self, origin_node_id: NodeId, incarnation: Incarnation, origin_sequence: u64) {
-        self.origin_node_ids.push(origin_node_id);
-        self.incarnations.push(incarnation);
-        self.origin_sequences.push(origin_sequence);
-    }
-
-    fn len(&self) -> usize {
-        self.origin_node_ids.len()
+    /// Fill a free buffer with `fill` and queue it for `dst`. `fill` returns
+    /// whether it produced a packet. Returns `false` when no buffer was free
+    /// or `fill` declined; the packet is then not sent.
+    fn enqueue(&mut self, dst: SocketAddr, fill: impl FnOnce(&mut PacketBuf) -> bool) -> bool {
+        let Some(slot) = self.free.pop() else {
+            return false;
+        };
+        if fill(&mut self.pool[slot as usize]) {
+            self.pending.push_back((dst, slot));
+            true
+        } else {
+            self.free.push(slot);
+            false
+        }
     }
 }
 
@@ -103,18 +99,27 @@ where
     recv_buf: Box<[u8]>,
     scratch: WireScratch,
     obs_buf: ObservationBatch<C>,
-    ack_buf: AckColumns,
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
 
-    // Outbound send pool.
-    send_pool: Vec<PacketBuf>,
-    send_pending: VecDeque<(SocketAddr, u8)>,
-    send_free: Vec<u8>,
+    send: SendQueue,
 
-    peers: Vec<Peer>,
+    // Membership view: every node discovery has reported, plus this one,
+    // sorted. The Snow child function reads it; nothing else is peer state.
+    ring: Ring,
     rng: SplitMix64,
+
+    // Snow broadcast state. See `runtime/snow.rs`.
+    tree: TreeParams,
+    origins: Origins,
+    relays: Relays,
+    rtt: RttEstimator,
+    children_buf: Vec<Child>,
+    /// Highest local origin sequence already handed to a broadcast.
+    sent_seq: u64,
+    last_repair_ms: u64,
+    unacked_total: u64,
 
     // Pending reply for the in-flight limit request. Sent after the
     // bottom-of-loop apply so callers observe "ack ⇒ AggregateStore reflects
@@ -162,9 +167,8 @@ where
     threshold_fires: u64,
     dirty_ticks: u64,
     // The adaptive-decision outputs, so observers can *see* the runtime
-    // react rather than infer it. `last_effective_fanout` is the
-    // `pick_count` the most recent dirty tick chose (the coverage fanout
-    // `⌈ln(n)+c⌉`, scaled by cluster size n, not the dirty set);
+    // react rather than infer it. `last_effective_fanout` is the number of
+    // children the most recent broadcast this node rooted went to;
     // `peak_effective_fanout` is its high-water mark since startup.
     // `last_error_budget` is the per-rule
     // error budget ε the most recent `handle_limit_request` computed — the
@@ -258,30 +262,35 @@ where
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
         let obs_buf = ObservationBatch::<C>::with_capacity(config.max_cells_per_tick);
-        let ack_buf = AckColumns::with_capacity(config.wire_limits.max_cells as usize);
         let sink_buf = DeltaSink::<C>::with_capacity(config.max_cells_per_tick);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
 
-        let send_pool_size = config.send_queue_capacity.max(1);
-        let send_pool: Vec<PacketBuf> = (0..send_pool_size)
-            .map(|_| PacketBuf::for_limits(config.wire_limits))
-            .collect();
-        let send_free: Vec<u8> = (0..send_pool_size as u8).rev().collect();
-        let send_pending = VecDeque::with_capacity(send_pool_size);
+        let config_fanout = config.fanout;
+        let send = SendQueue::new(config.send_queue_capacity, config.wire_limits);
 
-        let peers: Vec<Peer> = config
-            .bootstrap_peers
-            .iter()
-            .copied()
-            .map(|addr| Peer {
-                addr,
-                node_id: None,
-                peer_slot: None,
-            })
-            .collect();
-        let rng = SplitMix64::new(config.rng_seed);
+        let local_addr = transport.local_addr().unwrap_or_else(|err| {
+            tracing::warn!(
+                error = %err,
+                "Could not read this node's gossip address, so it cannot place \
+                 itself among its peers and will send broadcasts as if it were \
+                 at 0.0.0.0:0. Usually the gossip socket is not bound yet. \
+                 Check the gossip bind address in your gabion config.",
+            );
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        });
+        let mut ring = Ring::new(local_addr, config.bootstrap_peers.len());
+        for addr in config.bootstrap_peers.iter().copied() {
+            ring.insert(addr);
+        }
+        let mut rng = SplitMix64::new(config.rng_seed);
 
+        let origins = Origins::new(
+            crate::defaults::GOSSIP_TREE_ORIGIN_CAPACITY,
+            config.wire_limits,
+            rng.next_u32(),
+        );
+        let relays = Relays::new(crate::defaults::GOSSIP_TREE_RELAY_CAPACITY);
         let rule_capacity = store.rule_dictionary().capacity() as usize;
         let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
         let rule_last_emit_ms = vec![0_u64; rule_capacity].into_boxed_slice();
@@ -297,15 +306,20 @@ where
             recv_buf,
             scratch,
             obs_buf,
-            ack_buf,
             sink_buf,
             expiration_buf,
             frame_handles,
-            send_pool,
-            send_pending,
-            send_free,
-            peers,
+            send,
+            ring,
             rng,
+            tree: TreeParams::new(config_fanout),
+            origins,
+            relays,
+            rtt: RttEstimator::default(),
+            children_buf: Vec::with_capacity(MAX_CHILDREN),
+            sent_seq: 0,
+            last_repair_ms: 0,
+            unacked_total: 0,
             pending_reply: None,
             decode_reject_count: 0,
             max_send_pending_depth: 0,
@@ -324,6 +338,14 @@ where
         (runtime, client)
     }
 
+    /// Replace the Snow tuning knobs, which production code takes from
+    /// `gabion::defaults`.
+    #[cfg(test)]
+    pub(super) fn with_tree_params(mut self, edit: impl FnOnce(&mut TreeParams)) -> Self {
+        edit(&mut self.tree);
+        self
+    }
+
     /// Local transport address (after binding). Useful for tests that need
     /// the port the kernel chose.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -339,6 +361,9 @@ where
     {
         let mut peer_events = std::pin::pin!(peer_events);
         let mut tick = self.clock.ticker(self.config.tick_interval);
+        let mut ack_tick = self.clock.ticker(Duration::from_millis(
+            crate::defaults::GOSSIP_TREE_TIMER_TICK_MS,
+        ));
         // Once the peer-event stream returns `None` (e.g. `stream::empty()`),
         // never poll it again — otherwise it returns `Ready(None)` on every
         // iteration and the loop spins.
@@ -346,10 +371,11 @@ where
 
         loop {
             // Decide outside the `select!` whether the send arm has work to do.
-            // Reading `self.send_pending.is_empty()` inside the `if` guard
+            // Reading `self.send.pending.is_empty()` inside the `if` guard
             // would re-borrow `self` after we've already
             // split-borrowed for the I/O futures below.
-            let have_send = !self.send_pending.is_empty();
+            let have_send = !self.send.pending.is_empty();
+            let watch_acks = self.origins.live() > 0;
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
 
@@ -389,6 +415,7 @@ where
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
                     cmd = recv_admin(admin_rx), if watch_admin => ArmOutcome::Admin(cmd),
                     _ = tick.tick() => ArmOutcome::Tick,
+                    _ = ack_tick.tick(), if watch_acks => ArmOutcome::AckTimer,
                 }
             };
 
@@ -405,6 +432,7 @@ where
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
                 ArmOutcome::Admin(None) => self.admin_rx = None,
                 ArmOutcome::Tick => self.handle_gossip_tick(),
+                ArmOutcome::AckTimer => self.handle_ack_timer(),
             }
 
             // One apply per iteration covering both row sources. CRDT-free
@@ -416,8 +444,8 @@ where
                 self.expiration_buf.clear();
             }
 
-            if self.send_pending.len() > self.max_send_pending_depth {
-                self.max_send_pending_depth = self.send_pending.len();
+            if self.send.pending.len() > self.max_send_pending_depth {
+                self.max_send_pending_depth = self.send.pending.len();
             }
 
             // Ack any pending limit-request AFTER the apply ran — callers
@@ -449,7 +477,7 @@ where
             let pending =
                 self.rule_pending[idx].saturating_add(req.hits.min(u32::MAX as u64) as u32);
             self.rule_pending[idx] = pending;
-            let peers = self.peers.len().max(1) as u64;
+            let peers = (self.ring.len() - 1).max(1) as u64;
             let limit = req.rule_limit.max(1);
             let bps = self.config.target_err_bps.max(1) as u64;
             let epsilon = ((limit.saturating_mul(bps)) / (10_000 * peers)).max(1);
@@ -498,18 +526,11 @@ where
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
         self.obs_buf.clear();
-        self.ack_buf.clear();
         self.sink_buf.clear();
         let bytes = &self.recv_buf[..n];
         let decoded = {
             let obs_buf = &mut self.obs_buf;
-            let ack_buf = &mut self.ack_buf;
             let mut on_cell = |cell: wire::WireCell<C>| {
-                ack_buf.push(
-                    cell.origin_node_id,
-                    cell.origin_incarnation,
-                    cell.origin_sequence,
-                );
                 obs_buf.push(Observation {
                     rule_fingerprint: cell.rule_fingerprint,
                     key_hash: cell.key_hash,
@@ -539,67 +560,56 @@ where
         let summary = match decoded {
             Ok(s) => s,
             Err(err) => {
-                self.decode_reject_count = self.decode_reject_count.saturating_add(1);
-                if self.decode_reject_count.is_power_of_two() {
-                    tracing::warn!(
-                        peer = %src,
-                        error = %err,
-                        rejected_total = self.decode_reject_count,
-                        "Could not understand a gossip message from this \
-                         peer; dropping it. Common causes: the peer is \
-                         running a different gabion version, the peers are \
-                         configured with different counter sizes \
-                         (`storage.count_width`), the cluster authentication \
-                         key (`gossip.auth_key`) does not match between \
-                         peers, or the peer is sending messages larger than \
-                         this node's `gossip.max_payload_bytes`. Check the \
-                         peer's version and gabion config to find the \
-                         mismatch.",
-                    );
-                }
+                self.note_decode_reject(src, &err);
                 return;
             }
         };
 
         self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
 
-        // Frontier update — latency optimization. Best-effort: missing slot
-        // or missing node entry just means we don't get the skip.
-        let sender_id = NodeId(summary.header.sender_node_id);
-        if let Some(peer_slot) = self.store.peer_frontiers_mut().intern_peer(sender_id) {
-            for i in 0..self.ack_buf.len() {
-                let origin_id = self.ack_buf.origin_node_ids[i];
-                let incarnation = self.ack_buf.incarnations[i];
-                let sequence = self.ack_buf.origin_sequences[i];
-                if let Some(node_slot) = self.store.node_dictionary().find(origin_id, incarnation) {
-                    self.store
-                        .peer_frontiers_mut()
-                        .record_acked(peer_slot, node_slot, sequence);
-                }
-            }
-            // Cache the peer_slot on the matching peer entry so future ticks
-            // can prune without re-interning. `node_id` and `peer_slot` are
-            // always set together — see `handle_gossip_tick`, which relies
-            // on this invariant.
-            if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
-                peer.node_id = Some(sender_id);
-                peer.peer_slot = Some(peer_slot);
+        if !summary.ext.is_empty() {
+            match Ctrl::decode(summary.ext) {
+                Some(ctrl) => self.handle_tree_packet(src, ctrl, n),
+                None => self.note_decode_reject(src, &wire::DecodeError::BodyLenMismatch),
             }
         }
     }
 
+    /// Count a frame this node could not decode and, on power-of-two totals,
+    /// tell the operator why that usually happens.
+    fn note_decode_reject(&mut self, src: SocketAddr, err: &wire::DecodeError) {
+        self.decode_reject_count = self.decode_reject_count.saturating_add(1);
+        if self.decode_reject_count.is_power_of_two() {
+            tracing::warn!(
+                peer = %src,
+                error = %err,
+                rejected_total = self.decode_reject_count,
+                "Could not understand a gossip message from this \
+                 peer; dropping it. Common causes: the peer is \
+                 running a different gabion version, the peers are \
+                 configured with different counter sizes \
+                 (`storage.count_width`), the cluster authentication \
+                 key (`gossip.auth_key`) does not match between \
+                 peers, or the peer is sending messages larger than \
+                 this node's `gossip.max_payload_bytes`. Check the \
+                 peer's version and gabion config to find the \
+                 mismatch.",
+            );
+        }
+    }
+
     fn drain_one_send(&mut self) -> Result<(), GossipError> {
-        let Some((dst, slot)) = self.send_pending.pop_front() else {
+        let Some((dst, slot)) = self.send.pending.pop_front() else {
             return Ok(());
         };
-        let buf = &self.send_pool[slot as usize];
+        let buf = &self.send.pool[slot as usize];
         match self.transport.try_send_to(buf.as_bytes(), dst) {
-            Ok(_) => self.send_free.push(slot),
+            Ok(_) => self.send.free.push(slot),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.send_pending.push_front((dst, slot));
+                self.send.pending.push_front((dst, slot));
             }
             Err(e) => {
-                self.send_free.push(slot);
+                self.send.free.push(slot);
                 return Err(e.into());
             }
         }
@@ -612,18 +622,17 @@ where
                 let snapshot = AdminSnapshot {
                     local_identity: self.store.local_identity(),
                     peers: self
-                        .peers
-                        .iter()
-                        .map(|p| PeerEntry {
-                            addr: p.addr,
-                            node_id: p.node_id,
-                            peer_slot: p.peer_slot,
+                        .ring
+                        .peers()
+                        .map(|addr| PeerEntry {
+                            addr,
+                            node_id: None,
                         })
                         .collect(),
                     store_stats: self.store.stats(),
                     local_dirty_len: self.store.local_dirty().len(),
                     forwarded_dirty_len: self.store.forwarded_dirty().len(),
-                    send_pending_depth: self.send_pending.len(),
+                    send_pending_depth: self.send.pending.len(),
                     decode_reject_count: self.decode_reject_count,
                     max_send_pending_depth: self.max_send_pending_depth,
                     ticks_total: self.ticks_total,
@@ -686,28 +695,19 @@ where
     fn handle_peer_event(&mut self, evt: PeerEvent) {
         match evt {
             PeerEvent::Added(p) => {
-                if !self.peers.iter().any(|x| x.addr == p.addr) {
-                    self.peers.push(Peer {
-                        addr: p.addr,
-                        node_id: None,
-                        peer_slot: None,
-                    });
+                if self.ring.insert(p.addr) {
                     tracing::info!(
                         peer = %p.addr,
-                        cluster_size = self.peers.len(),
+                        cluster_size = self.ring.len() - 1,
                         "Peer joined the cluster.",
                     );
                 }
             }
             PeerEvent::Removed(p) => {
-                if let Some(pos) = self.peers.iter().position(|x| x.addr == p.addr) {
-                    let removed = self.peers.remove(pos);
-                    if let Some(node_id) = removed.node_id {
-                        self.store.peer_frontiers_mut().remove_peer(node_id);
-                    }
+                if self.ring.remove(p.addr) {
                     tracing::info!(
                         peer = %p.addr,
-                        cluster_size = self.peers.len(),
+                        cluster_size = self.ring.len() - 1,
                         "Peer left the cluster.",
                     );
                 }
@@ -726,96 +726,22 @@ where
         self.expiration_buf.clear();
         self.store.expire_at(now_millis, &mut self.expiration_buf);
 
-        if self.store.is_empty() || self.peers.is_empty() || self.send_free.is_empty() {
+        if self.store.is_empty() || self.ring.len() == 1 || self.send.free.is_empty() {
             return;
         }
 
-        // The store was non-empty when this tick fired — bench harness
-        // counts this as a "dirty tick" so effective-fanout reports
-        // `packets / dirty_ticks` rather than `packets / wall_ticks`.
-        // Bumped before the peer-pick math runs so synthetic threshold
-        // ticks (which by construction have local_dirty>0) always count.
-        self.dirty_ticks = self.dirty_ticks.saturating_add(1);
-
-        // Step 2: pick `fanout` distinct peers via a partial Fisher-Yates
-        // shuffle of `self.peers` in place. With-replacement sampling would
-        // silently break Demers' O(log N) convergence bound — selecting the
-        // same peer twice in one tick burns a send-pool slot encoding the
-        // same frame for the same peer. `self.peers` has no ordering
-        // contract elsewhere (lookups are by `addr`), so shuffling is free.
-        //
-        // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
-        // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`
-        // reaches *every* node with probability → e^(−e^(−c)) — "there is a
-        // sharp threshold in the required fanout at log n." Fanout is
-        // governed by cluster size `n`, not data volume: KMG note the
-        // fanout need only grow by 1 each time `n` rises by a factor of e,
-        // and that a round "can easily be modified … to send several
-        // notifications per gossip message." Gabion already packs the whole
-        // dirty set into one fat frame (`max_cells_per_tick` + packet
-        // splitting), so a burst rides along without widening fanout — the
-        // dirty-set size drives frame fill, not the peer pick. `config.fanout`
-        // is the floor; `.min(n)` makes small clusters full-mesh (at small n
-        // coverage demands it and the bandwidth is trivial). The early return
-        // above guarantees n ≥ 1, so `ln` is never called on 0 and `.min(n)`
-        // never clamps below 1.
-        let n = self.peers.len();
-        let coverage = ((n as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-        let pick_count = self.config.fanout.max(coverage).min(n);
-        // Record the coverage-fanout decision so observers can read the pick
-        // directly instead of reconstructing the formula. Only dirty ticks
-        // reach here, so `last_effective_fanout` is the fanout of the most
-        // recent tick that actually gossiped.
-        self.last_effective_fanout = pick_count;
-        self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
-        for i in 0..pick_count {
-            let j = i + (self.rng.next_u64() as usize) % (n - i);
-            self.peers.swap(i, j);
-        }
-
-        for peer_idx in 0..pick_count {
-            if self.send_free.is_empty() {
-                break;
-            }
-            let peer_addr = self.peers[peer_idx].addr;
-            // `handle_inbound` writes `node_id` and `peer_slot` together —
-            // when one is `Some`, the other is too. So a single read of
-            // `peer_slot` is the full pruning decision.
-            let peer_slot = self.peers[peer_idx].peer_slot;
-
-            self.frame_handles.clear();
-            match peer_slot {
-                Some(slot) => {
-                    self.store.fill_gossip_frame_for_peer(
-                        self.config.max_cells_per_tick,
-                        slot,
-                        &mut self.frame_handles,
-                    );
-                }
-                None => {
-                    // Bootstrap fallback: we haven't heard from this peer
-                    // yet, so we don't know what to prune. Send an unpruned
-                    // frame; the next inbound from them caches the slot.
-                    self.store
-                        .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
-                }
-            }
-            if self.frame_handles.is_empty() {
-                continue;
-            }
-            self.encode_packets_for(peer_addr);
-        }
+        // Step 2: broadcast the local changes made since the last round down
+        // this node's tree, and run the periodic repair pass.
+        self.start_broadcasts(now_millis);
+        self.repair_pass(now_millis);
 
         // Reset per-rule pending. The sweep treats every rule with
-        // non-zero pending as "touched in expectation by the tick" — the
-        // dirty-ring drain in `fill_gossip_frame*` doesn't tell us which
-        // rule slots actually made it onto the wire, but mass conservation
-        // (Kempe, Dobra, Gehrke — FOCS 2003) says every pending hit either
-        // rode out in this frame or sits in the dirty ring awaiting the
-        // next one. Under UDP loss the residual is repaired by the next
-        // round; the N × ε_R bound holds in expectation. A strict bound
-        // would require ack-aware reset against `peer_frontiers`,
-        // deferred until measurements show drift.
+        // non-zero pending as "touched in expectation by the tick": every
+        // pending hit either rode out in this round's broadcasts or was
+        // skipped for want of a free send buffer, in which case it stays
+        // above `sent_seq` for the next round. A broadcast the tree could not
+        // complete is repaired by the repair pass; the N × ε_R bound holds in
+        // expectation.
         let stamp = now_millis.max(1);
         for slot in 0..self.rule_pending.len() {
             if self.rule_pending[slot] != 0 {
@@ -826,17 +752,7 @@ where
     }
 
     fn encode_packets_for(&mut self, dst: SocketAddr) {
-        let header = wire::Header {
-            cluster_id_hash: self.config.cluster_id_hash,
-            sender_node_id: self.store.local_identity().node_id.0,
-            sender_incarnation: self.store.local_identity().incarnation,
-            count_width: 0,
-            cell_count: 0,
-            body_len: 0,
-            min_origin_sequence: 0,
-            max_origin_sequence: 0,
-            flags: 0,
-        };
+        let header = self.sender_header();
 
         let packets_result = match self.config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
@@ -860,23 +776,25 @@ where
             Err(_) => return,
         };
 
-        while let Some(slot) = self.send_free.pop() {
-            let buf = &mut self.send_pool[slot as usize];
+        while let Some(slot) = self.send.free.pop() {
+            let buf = &mut self.send.pool[slot as usize];
             match packets.next_into(buf) {
-                Ok(Some(_)) => self.send_pending.push_back((dst, slot)),
+                Ok(Some(_)) => self.send.pending.push_back((dst, slot)),
                 Ok(None) => {
-                    self.send_free.push(slot);
+                    self.send.free.push(slot);
                     break;
                 }
                 Err(_) => {
-                    self.send_free.push(slot);
+                    self.send.free.push(slot);
                     break;
                 }
             }
         }
-        drop(packets);
+        packets.finish();
     }
 }
+
+mod tree;
 
 enum ArmOutcome {
     Request(Option<Request>),
@@ -885,6 +803,7 @@ enum ArmOutcome {
     PeerEvent(Option<PeerEvent>),
     Admin(Option<AdminCommand>),
     Tick,
+    AckTimer,
 }
 
 /// Read one admin command. Only invoked when `admin_rx.is_some()` — the
@@ -896,13 +815,17 @@ async fn recv_admin(rx: &mut Option<mpsc::Receiver<AdminCommand>>) -> Option<Adm
         .await
 }
 
-/// SplitMix64 — small, fast, deterministic. Used only for peer sampling so
-/// no security properties are required.
+/// SplitMix64 — small, fast, deterministic. Used for repair-peer sampling and
+/// the broadcast sequence seed, so no security properties are required.
 pub(super) struct SplitMix64(u64);
 
 impl SplitMix64 {
     pub(super) fn new(seed: u64) -> Self {
         Self(seed.wrapping_add(0x9E37_79B9_7F4A_7C15))
+    }
+
+    pub(super) fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
     }
 
     pub(super) fn next_u64(&mut self) -> u64 {

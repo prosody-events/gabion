@@ -4,9 +4,10 @@
 //! [`crate::crdt::CellStore`], a datagram [`GossipTransport`], a
 //! [`Clock`] for bucket arithmetic and tick scheduling, and a downstream
 //! [`AggregateStore`] that absorbs the resulting delta and expiration rows.
-//! A single `tokio::select!` drives five arms (limit request, inbound,
-//! writable, peer event, tick) and calls `aggregates.apply(...)` once per
-//! CRDT-touching iteration.
+//! A single `tokio::select!` drives six arms (limit request, inbound,
+//! writable, peer event, tick, acknowledgement timer) and calls
+//! `aggregates.apply(...)` once per CRDT-touching iteration. Local changes
+//! travel down a per-origin Snow broadcast tree (see the `snow` module).
 //!
 //! All polymorphic boundaries are monomorphized generics — no `dyn`, no
 //! `Box`. The production hot path is branch-free; tests and simulators
@@ -26,6 +27,7 @@ mod client;
 mod clock;
 mod runtime;
 pub mod sim;
+mod snow;
 mod store;
 mod transport;
 
@@ -55,15 +57,13 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Floor on the number of peers contacted per gossip tick. The runtime
-    /// scales the actual per-tick fanout to the coverage threshold
-    /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
-    /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
-    /// hard minimum when that threshold falls below it.
+    /// Branching factor `k` of the Snow broadcast tree: the most children a
+    /// node forwards a broadcast to, and the acknowledgements a root waits
+    /// for. Clamped to `2..=16`. See [`crate::defaults::GOSSIP_FANOUT`].
     pub fanout: usize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
-    /// tick. The wire codec splits this into multiple packets if needed.
+    /// Frame composition: how many changed cells one round may root
+    /// broadcasts for. The wire codec splits them into packets, one broadcast
+    /// per packet.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,
@@ -94,7 +94,7 @@ impl Default for GossipConfig {
             local_identity: NodeIdentity::new(crate::crdt::NodeId(0), 1),
             cluster_id_hash: 0,
             bootstrap_peers: Vec::new(),
-            fanout: 3,
+            fanout: crate::defaults::GOSSIP_FANOUT,
             max_cells_per_tick: 1024,
             wire_limits: FrameLimits::default(),
             send_queue_capacity: 32,

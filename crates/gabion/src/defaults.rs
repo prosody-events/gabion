@@ -22,42 +22,11 @@ pub const STORAGE_MAX_MATCHED_RULES: usize = 16;
 
 pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 
-/// Floor on the number of peers contacted per gossip tick. The runtime does
-/// **not** treat this as the operating fanout — it scales the actual per-tick
-/// fanout up to the coverage threshold `⌈ln(n) + GOSSIP_COVERAGE_MARGIN⌉`
-/// (`n` = live peer count), capped at the peer count. This floor is a hard
-/// minimum: it binds only if `GOSSIP_COVERAGE_MARGIN` is lowered far enough
-/// that the coverage threshold drops below it. At the shipped margin it never
-/// binds. See `handle_gossip_tick` in `gossip/runtime.rs`.
-pub const GOSSIP_FANOUT: usize = 3;
-
-/// Coverage margin `c` in the gossip fanout law `⌈ln(n) + c⌉` (`n` = live peer
-/// count). Per Kermarrec, Massoulié & Ganesh (IEEE TPDS 2003, "Probabilistic
-/// Reliable Dissemination in Large-Scale Systems", Theorem 1), a directed
-/// gossip round with mean fanout `ln(n) + c` reaches every node with
-/// probability → `e^(−e^(−c))`:
-///
-/// | `c`   | per-round coverage `e^(−e^(−c))` |
-/// |-------|----------------------------------|
-/// | **3** | **95.1 %**                       |
-/// | 4     | 98.2 %                           |
-/// | 5     | 99.3 %                           |
-///
-/// **These are single-round figures, and the single round is the wrong unit
-/// for gabion.** KMG's theorem bounds one *one-shot* dissemination; gabion
-/// instead runs continuous anti-entropy — it re-gossips every dirty cell each
-/// tick until the peer frontier shows it acked, with the repair lane behind
-/// that. So a node missed in one round is overwhelmingly likely to be reached
-/// by the next, and the per-round coverage *compounds*: at `c = 3` the 4.9 %
-/// per-round miss falls to ≈ 0.24 % after two rounds and ≈ 0.012 % after three.
-/// We therefore size to the leaner `c = 3` threshold and let anti-entropy close
-/// the gap, rather than paying KMG's one-shot `c ≈ 4` (their validated sims —
-/// fanout 13 @ 10 000 nodes, 15 @ 50 000 — measure single-shot reach, which a
-/// re-gossiping system does not need to match). `c = 3` costs ≈ 1 fewer peer
-/// per tick at every cluster size (≈ 10 % less gossip bandwidth). Kept a
-/// `const`; promote to a `GossipConfig` field if an operator ever needs to
-/// trade bandwidth for coverage at runtime.
-pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
+/// Branching factor `k` of the Snow broadcast tree (Tong, arXiv 2504.02676,
+/// default `k = 4`): each node forwards a broadcast to at most `k` children and
+/// a root waits for `k` acknowledgements. Each side of a node's range is split
+/// into `k / 2` sub-ranges, so the runtime clamps `k` to `2..=16`.
+pub const GOSSIP_FANOUT: usize = 4;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
@@ -82,6 +51,38 @@ pub const GOSSIP_TARGET_ERR_BPS: u32 = 100;
 /// plane. Independent of the steady-state heartbeat (which still fires at
 /// `GOSSIP_TICK_INTERVAL_MILLIS`).
 pub const GOSSIP_MIN_EMIT_INTERVAL_MS: u64 = 5;
+
+/// A root rebroadcasts after `GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE` times the
+/// expected tree round-trip time without a complete acknowledgement. The
+/// expected round trip is the root's smoothed measurement of completed
+/// broadcasts, seeded by `GOSSIP_TREE_INITIAL_HOP_RTT_MS` until the first
+/// completes.
+pub const GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE: u32 = 2;
+
+/// Rebroadcasts a root attempts before it leaves the broadcast to the
+/// periodic repair pass.
+pub const GOSSIP_ROOT_REBROADCASTS: u8 = 1;
+
+/// Cells the periodic repair pass sends to one random peer per heartbeat.
+/// The repair pass is the rotating anti-entropy slice of the cell store that
+/// backs every dissemination design; it covers broadcasts the tree could not
+/// complete and cells a newly joined node missed.
+pub const GOSSIP_REPAIR_CELLS_PER_TICK: usize = 64;
+
+/// Per-hop round-trip estimate used to seed the acknowledgement timeout
+/// before the first broadcast completes: `tree height * this`.
+pub const GOSSIP_TREE_INITIAL_HOP_RTT_MS: u64 = 4;
+
+/// Granularity at which a root checks acknowledgement deadlines. Only
+/// polled while a broadcast is awaiting acknowledgements.
+pub const GOSSIP_TREE_TIMER_TICK_MS: u64 = 5;
+
+/// Broadcasts a node can forward for other roots at once before the oldest
+/// is forgotten (forgetting costs at most one redundant forward).
+pub const GOSSIP_TREE_RELAY_CAPACITY: usize = 2048;
+
+/// Broadcasts a node can have awaiting acknowledgement as a root.
+pub const GOSSIP_TREE_ORIGIN_CAPACITY: usize = 64;
 
 pub fn random_rng_seed() -> Result<u64, getrandom::Error> {
     let mut bytes = [0_u8; 8];

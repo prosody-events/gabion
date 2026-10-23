@@ -18,6 +18,10 @@
 //!   exactly.
 //! - Each packet is independently useful — losing packet `k` of a batch does
 //!   not invalidate packet `k+1` or any earlier packet.
+//! - A packet may carry an opaque control extension ([`FLAG_EXT`]): the body
+//!   then starts with a little-endian `u16` extension length and the extension
+//!   bytes, followed by the cell body. The extension is covered by the HMAC
+//!   like the rest of the frame; the codec does not interpret it.
 //!
 //! Socket I/O, peer selection, and tick scheduling live outside this module.
 
@@ -30,7 +34,7 @@ mod tests;
 
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
-pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
+pub use header::{FLAG_AUTHENTICATED, FLAG_EXT, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
 
 use auth::AUTH_TAG_LEN;
 use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
@@ -71,19 +75,25 @@ pub struct PacketWritten {
 
 /// Outcome of a successful decode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DecodedSummary {
+pub struct DecodedSummary<'a> {
     pub header: Header,
     pub cell_count: u32,
     /// Mirror of `header.flags`. Receivers may inspect [`FLAG_MORE`] to
     /// decide when a batch is fully delivered. Each packet is decoded and
     /// applied independently regardless of the bit's value.
     pub flags: u16,
+    /// The control extension, empty unless [`FLAG_EXT`] is set.
+    pub ext: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum EncodeError {
     #[error("max_payload_bytes is smaller than the fixed framing overhead + one cell")]
     BudgetTooSmall,
+    #[error("frame with its control extension would exceed max_payload_bytes")]
+    PayloadTooLarge,
+    #[error("source frame to re-frame is not a well-formed gabion frame")]
+    MalformedSource,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -252,6 +262,16 @@ impl<'a, C: Count> Packets<'a, C> {
         self.handles.len() - self.cursor
     }
 
+    /// Stop after the packets already encoded and return how many handles
+    /// they consumed (cells emitted plus stale handles dropped). The caller
+    /// owns the rest, for callers that send one packet per message and carry
+    /// the remainder into the next one.
+    pub fn finish(mut self) -> usize {
+        let consumed = self.cursor;
+        self.cursor = self.handles.len();
+        consumed
+    }
+
     /// Encode the next packet into `buf`. The encoder clears `buf` first.
     ///
     /// - `Ok(Some(p))` — one packet ready; send `buf.as_bytes()`.
@@ -334,11 +354,11 @@ impl<'a, C: Count> Packets<'a, C> {
 
 // -- decode -----------------------------------------------------------------
 
-pub fn decode_unauth<C: Count>(
-    bytes: &[u8],
+pub fn decode_unauth<'a, C: Count>(
+    bytes: &'a [u8],
     limits: FrameLimits,
     obs: &mut ObservationBatch<C>,
-) -> Result<DecodedSummary, DecodeError> {
+) -> Result<DecodedSummary<'a>, DecodeError> {
     decode_inner(
         bytes,
         None,
@@ -348,12 +368,12 @@ pub fn decode_unauth<C: Count>(
     )
 }
 
-pub fn decode_auth<C: Count>(
-    bytes: &[u8],
+pub fn decode_auth<'a, C: Count>(
+    bytes: &'a [u8],
     key: &HmacKey,
     limits: FrameLimits,
     obs: &mut ObservationBatch<C>,
-) -> Result<DecodedSummary, DecodeError> {
+) -> Result<DecodedSummary<'a>, DecodeError> {
     decode_inner(
         bytes,
         Some(key),
@@ -376,32 +396,32 @@ fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
     }
 }
 
-pub fn decode_unauth_visit<C: Count>(
-    bytes: &[u8],
+pub fn decode_unauth_visit<'a, C: Count>(
+    bytes: &'a [u8],
     limits: FrameLimits,
     accept_header: impl FnOnce(&Header) -> bool,
     on_cell: impl FnMut(WireCell<C>),
-) -> Result<DecodedSummary, DecodeError> {
+) -> Result<DecodedSummary<'a>, DecodeError> {
     decode_inner(bytes, None, limits, accept_header, on_cell)
 }
 
-pub fn decode_auth_visit<C: Count>(
-    bytes: &[u8],
+pub fn decode_auth_visit<'a, C: Count>(
+    bytes: &'a [u8],
     key: &HmacKey,
     limits: FrameLimits,
     accept_header: impl FnOnce(&Header) -> bool,
     on_cell: impl FnMut(WireCell<C>),
-) -> Result<DecodedSummary, DecodeError> {
+) -> Result<DecodedSummary<'a>, DecodeError> {
     decode_inner(bytes, Some(key), limits, accept_header, on_cell)
 }
 
-fn decode_inner<C: Count>(
-    bytes: &[u8],
+fn decode_inner<'a, C: Count>(
+    bytes: &'a [u8],
     key: Option<&HmacKey>,
     limits: FrameLimits,
     accept_header: impl FnOnce(&Header) -> bool,
     on_cell: impl FnMut(WireCell<C>),
-) -> Result<DecodedSummary, DecodeError> {
+) -> Result<DecodedSummary<'a>, DecodeError> {
     if bytes.len() > limits.max_payload_bytes {
         return Err(DecodeError::PayloadTooLarge);
     }
@@ -437,18 +457,140 @@ fn decode_inner<C: Count>(
         return Err(DecodeError::Trailing);
     }
 
+    let (ext, cell_bytes) = split_ext(header.flags, &frame[HEADER_LEN..HEADER_LEN + body_len])?;
     let summary = DecodedSummary {
         header,
         cell_count: header.cell_count,
         flags: header.flags,
+        ext,
     };
 
     if !accept_header(&header) {
         return Ok(summary);
     }
 
-    let body_bytes = &frame[HEADER_LEN..HEADER_LEN + body_len];
-    decode_body_visit::<C>(body_bytes, header.cell_count, on_cell)?;
+    decode_body_visit::<C>(cell_bytes, header.cell_count, on_cell)?;
 
     Ok(summary)
+}
+
+/// Bytes the control extension adds to a body: its `u16` length prefix plus
+/// the extension itself.
+const EXT_PREFIX_LEN: usize = 2;
+
+/// Split a body into its control extension and the cell body.
+fn split_ext(flags: u16, body: &[u8]) -> Result<(&[u8], &[u8]), DecodeError> {
+    if flags & FLAG_EXT == 0 {
+        return Ok((&[], body));
+    }
+    let prefix = body
+        .get(..EXT_PREFIX_LEN)
+        .ok_or(DecodeError::BodyLenMismatch)?;
+    let ext_len = usize::from(u16::from_le_bytes([prefix[0], prefix[1]]));
+    let rest = &body[EXT_PREFIX_LEN..];
+    if rest.len() < ext_len {
+        return Err(DecodeError::BodyLenMismatch);
+    }
+    Ok(rest.split_at(ext_len))
+}
+
+// -- control extension ------------------------------------------------------
+
+/// Write `header || [ext] || cell_body` (and the HMAC tag when `key` is set)
+/// into `out`. `header` supplies the identity and cell fields; flags, body
+/// length and the extension are set here.
+fn write_frame(
+    mut header: Header,
+    ext: &[u8],
+    cell_body: &[u8],
+    key: Option<&HmacKey>,
+    limits: FrameLimits,
+    out: &mut PacketBuf,
+) -> Result<(), EncodeError> {
+    let auth_overhead = if key.is_some() { AUTH_TAG_LEN } else { 0 };
+    let ext_overhead = if ext.is_empty() {
+        0
+    } else {
+        EXT_PREFIX_LEN + ext.len()
+    };
+    let body_len = ext_overhead + cell_body.len();
+    if HEADER_LEN + body_len + auth_overhead > limits.max_payload_bytes {
+        return Err(EncodeError::PayloadTooLarge);
+    }
+    header.flags &= !(FLAG_EXT | FLAG_AUTHENTICATED);
+    if !ext.is_empty() {
+        header.flags |= FLAG_EXT;
+    }
+    if key.is_some() {
+        header.flags |= FLAG_AUTHENTICATED;
+    }
+    header.body_len = body_len as u32;
+
+    out.inner.clear();
+    out.inner.resize(HEADER_LEN, 0);
+    if !ext.is_empty() {
+        out.inner
+            .extend_from_slice(&(ext.len() as u16).to_le_bytes());
+        out.inner.extend_from_slice(ext);
+    }
+    out.inner.extend_from_slice(cell_body);
+    patch_header(&mut out.inner[..HEADER_LEN], &header);
+    if let Some(key) = key {
+        let tag = auth::sign(key, &out.inner);
+        out.inner.extend_from_slice(&tag);
+    }
+    Ok(())
+}
+
+/// Re-emit a gabion frame with a different control extension: the cell body
+/// is copied byte for byte, the extension replaced (an empty `ext` removes
+/// it), the sender fields taken from `sender`, and the frame re-signed when
+/// `key` is set. `frame` must be a frame this node encoded or already
+/// verified; it is not re-authenticated here. Interior nodes of a broadcast
+/// tree use this to forward a received packet to a child without decoding
+/// or re-encoding its cells.
+pub fn reframe(
+    frame: &[u8],
+    sender: Header,
+    ext: &[u8],
+    key: Option<&HmacKey>,
+    limits: FrameLimits,
+    out: &mut PacketBuf,
+) -> Result<(), EncodeError> {
+    let auth_overhead = if key.is_some() { AUTH_TAG_LEN } else { 0 };
+    let unsigned = frame
+        .len()
+        .checked_sub(auth_overhead)
+        .map(|end| &frame[..end])
+        .ok_or(EncodeError::MalformedSource)?;
+    let source = read_header(unsigned).map_err(|_| EncodeError::MalformedSource)?;
+    let body = unsigned
+        .get(HEADER_LEN..HEADER_LEN + source.body_len as usize)
+        .ok_or(EncodeError::MalformedSource)?;
+    let (_, cell_body) = split_ext(source.flags, body).map_err(|_| EncodeError::MalformedSource)?;
+    let header = Header {
+        cluster_id_hash: sender.cluster_id_hash,
+        sender_node_id: sender.sender_node_id,
+        sender_incarnation: sender.sender_incarnation,
+        ..source
+    };
+    write_frame(header, ext, cell_body, key, limits, out)
+}
+
+/// Encode a frame that carries only a control extension and no cells.
+pub fn encode_ext_only<C: Count>(
+    sender: Header,
+    ext: &[u8],
+    key: Option<&HmacKey>,
+    limits: FrameLimits,
+    out: &mut PacketBuf,
+) -> Result<(), EncodeError> {
+    let header = Header {
+        count_width: std::mem::size_of::<C>() as u32,
+        cell_count: 0,
+        min_origin_sequence: 0,
+        max_origin_sequence: 0,
+        ..sender
+    };
+    write_frame(header, ext, &[], key, limits, out)
 }

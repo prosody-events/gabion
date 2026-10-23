@@ -29,8 +29,8 @@ pub type SharedNow = Rc<Cell<u64>>;
 /// node by the engine; not `Clone` (the `mpsc::Receiver` is single-consumer).
 pub struct ManualClock {
     now: SharedNow,
-    /// Taken once by [`Clock::ticker`]; `RefCell<Option<_>>` so the `&self`
-    /// trait method can move the receiver out.
+    /// Taken by the first [`Clock::ticker`]; `RefCell<Option<_>>` so the
+    /// `&self` trait method can move the receiver out.
     tick_rx: RefCell<Option<mpsc::Receiver<()>>>,
 }
 
@@ -55,24 +55,27 @@ impl Clock for ManualClock {
         self.now.get()
     }
 
+    /// The first ticker is the engine-driven heartbeat. The runtime's
+    /// acknowledgement timer asks for a second one; the visualizer never fires
+    /// it, so a broadcast that loses a packet is not rebroadcast here.
     fn ticker(&self, _interval: Duration) -> ManualTicker {
-        let rx = self
-            .tick_rx
-            .borrow_mut()
-            .take()
-            .expect("ManualClock::ticker called more than once");
-        ManualTicker(rx)
+        ManualTicker(self.tick_rx.borrow_mut().take())
     }
 }
 
 /// Resolves once per queued tick. After the engine drops the sender, parks
-/// forever rather than spinning the select loop on a closed channel.
-pub struct ManualTicker(mpsc::Receiver<()>);
+/// forever rather than spinning the select loop on a closed channel. A ticker
+/// without an inbox (every one after the first) parks forever too.
+pub struct ManualTicker(Option<mpsc::Receiver<()>>);
 
 impl Ticker for ManualTicker {
     // `async fn` in the impl satisfies the trait's `-> impl Future` signature.
     async fn tick(&mut self) {
-        if self.0.recv().await.is_none() {
+        let closed = match self.0.as_mut() {
+            Some(rx) => rx.recv().await.is_none(),
+            None => true,
+        };
+        if closed {
             std::future::pending::<()>().await;
         }
     }
