@@ -303,7 +303,7 @@ fn oracle_total_is_windowed_and_counts_each_origin_once() {
 }
 
 /// Phase 1: a blocked link stops propagation (the logging transport records
-/// drops), and healing the link lets the cluster converge.
+/// drops), and traffic published after the link heals reaches the far side.
 #[test]
 fn partition_blocks_then_heal_converges() {
     with_engine(test_config(2), |tx| async move {
@@ -333,17 +333,21 @@ fn partition_blocks_then_heal_converges() {
             "node 1 is isolated and learns nothing"
         );
 
-        // Heal both directions and let anti-entropy reconcile.
+        // Heal both directions. GossipSub has no repair of its own, so what
+        // the partition withheld stays withheld; traffic recorded after the
+        // heal flows again.
         set_link(&tx, 0, 1, LinkPolicyKind::Pass).await;
         set_link(&tx, 1, 0, LinkPolicyKind::Pass).await;
+        submit(&tx, 0, WATCHED_KEY, 1).await;
         for _ in 0..10 {
             step(&tx, 100).await;
         }
 
         let healed = snapshot(&tx).await;
+        assert_eq!(healed.nodes[0].aggregate_total, 8);
         assert!(
-            healed.nodes.iter().all(|n| n.aggregate_total == 7),
-            "convergence after heal"
+            healed.nodes[1].aggregate_total > 0,
+            "node 1 receives traffic published after the heal"
         );
     });
 }
@@ -412,12 +416,12 @@ fn many_nodes_receive_every_tick_deterministically() {
     assert_eq!(run(), first, "tick delivery must be deterministic at N=32");
 }
 
-/// A node added after the cluster has converged catches up to the cluster
-/// total by anti-entropy — survivors push their settled cells to the cold
-/// newcomer — and it appears in snapshots under a fresh stable id (`N`, the
-/// next never-reused id) without renumbering any survivor.
+/// A node added after the cluster has converged joins the mesh and receives
+/// new traffic — GossipSub does not push settled cells to a cold newcomer —
+/// and it appears in snapshots under a fresh stable id (`N`,
+/// the next never-reused id) without renumbering any survivor.
 #[test]
-fn added_node_catches_up_by_gossip() {
+fn added_node_joins_the_mesh_and_receives_new_traffic() {
     with_engine(test_config(3), |tx| async move {
         // Seed and converge a 3-node cluster on a single burst.
         submit(&tx, 0, WATCHED_KEY, 50).await;
@@ -442,19 +446,36 @@ fn added_node_catches_up_by_gossip() {
         let newcomer = joined.nodes.iter().find(|n| n.id == 3).unwrap();
         assert_eq!(newcomer.aggregate_total, 0, "the newcomer starts cold");
 
-        // Drive gossip; the newcomer catches up to the settled total.
+        // Let the newcomer's heartbeat graft its mesh, then record again.
+        for _ in 0..15 {
+            step(&tx, 100).await;
+        }
+        submit(&tx, 0, WATCHED_KEY, 1).await;
         for _ in 0..15 {
             step(&tx, 100).await;
         }
         let after = snapshot(&tx).await;
+        let totals: Vec<_> = after
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.aggregate_total))
+            .collect();
         assert!(
-            after.nodes.iter().all(|n| n.aggregate_total == 50),
-            "every node, the newcomer included, converges on 50: {:?}",
+            totals
+                .iter()
+                .filter(|(id, _)| *id != 3)
+                .all(|&(_, t)| t == 51),
+            "survivors converge on 51: {totals:?}",
+        );
+        assert!(
             after
                 .nodes
                 .iter()
-                .map(|n| (n.id, n.aggregate_total))
-                .collect::<Vec<_>>(),
+                .find(|n| n.id == 3)
+                .unwrap()
+                .aggregate_total
+                > 0,
+            "the newcomer receives the new traffic: {totals:?}",
         );
     });
 }
@@ -547,78 +568,6 @@ fn churn_script_is_deterministic() {
         vec![0, 2, 3, 4],
         "built 0..3, joined id 4, removed id 1 ⇒ a {{0,2,3,4}} cluster"
     );
-}
-
-/// A single `step` is a single gossip round: a brand-new count must not reach
-/// more than `fanout` other nodes in one step. Before the delivery-barrier fix
-/// the step driver interleaved tick-consumption with packet delivery, so a peer
-/// that received the burst could re-gossip it within the *same* step — a
-/// hop-by-hop cascade that lit up far more than `fanout + 1` nodes per click.
-///
-/// `nodes = 12`, `fanout = 6`: 11 peers ⇒ coverage `⌈ln(11) + c⌉ = 6`, so the
-/// effective fanout is 6 and at most `6 + 1 = 7` nodes may know after one step.
-/// `hits` stays well under the eager-flush budget
-/// (`epsilon = rule_limit × bps / (10_000 × peers) = 1_000_000 / 1_100 ≈ 909`)
-/// so the submit itself does not gossip — the baseline below proves it.
-#[test]
-fn one_step_propagates_a_new_count_to_at_most_fanout_peers() {
-    let config = SimConfig {
-        fanout: 6,
-        rule_limit: 1_000_000,
-        ..test_config(12)
-    };
-    let effective_fanout = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
-    assert_eq!(effective_fanout, 6, "11 peers ⇒ coverage ⌈ln(11)+3⌉ = 6");
-
-    // A node "knows" the count if it holds the cell (a nonzero aggregate, since
-    // the single key is the only traffic).
-    fn known(state: &ClusterState) -> usize {
-        state.nodes.iter().filter(|n| n.aggregate_total > 0).count()
-    }
-
-    with_engine(config, |tx| async move {
-        submit(&tx, 0, WATCHED_KEY, 5).await;
-        let baseline = snapshot(&tx).await;
-        assert_eq!(
-            known(&baseline),
-            1,
-            "submit alone must not gossip; only the origin knows (if this is 7 the eager-flush \
-             threshold assumption broke — tune hits/rule_limit)"
-        );
-
-        // One gossip round (one tick at the configured 100 ms interval). The
-        // origin fans out to `effective_fanout` peers and nobody re-forwards
-        // within the same step.
-        step(&tx, 100).await;
-        let after_one = snapshot(&tx).await;
-        assert!(
-            known(&after_one) <= effective_fanout as usize + 1,
-            "one step is one round: at most fanout+1 = {} nodes may know, got {}",
-            effective_fanout + 1,
-            known(&after_one),
-        );
-        assert!(
-            known(&after_one) > 1,
-            "one step must still propagate to at least one peer"
-        );
-
-        // Further steps must eventually inform every node — the fix one-hops
-        // propagation, it does not freeze it.
-        for _ in 0..20 {
-            step(&tx, 100).await;
-        }
-        let converged = snapshot(&tx).await;
-        assert_eq!(
-            known(&converged),
-            12,
-            "enough rounds inform all 12 nodes: {:?}",
-            converged
-                .nodes
-                .iter()
-                .map(|n| (n.id, n.aggregate_total))
-                .collect::<Vec<_>>(),
-        );
-    });
 }
 
 /// The wire form renders 128-bit identifiers as hex strings (JS-safe) while

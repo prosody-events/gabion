@@ -1111,6 +1111,13 @@ impl<C: Count> CellStore<C> {
         self.forwarded_dirty.clear();
     }
 
+    /// Drop the forwarded dirty records. A runtime that forwards each
+    /// received datagram verbatim has consumed them once the datagram is
+    /// merged. Stored cells are untouched.
+    pub fn clear_forwarded_dirty(&mut self) {
+        self.forwarded_dirty.clear();
+    }
+
     /// Reset to an empty state — preserves the local identity registration
     /// but clears every other column. Mostly useful in tests.
     pub fn clear(&mut self) {

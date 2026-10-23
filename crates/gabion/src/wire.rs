@@ -23,6 +23,7 @@
 
 mod auth;
 mod body;
+mod control;
 mod header;
 
 #[cfg(test)]
@@ -30,7 +31,10 @@ mod tests;
 
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
-pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
+pub use control::{Control, decode_control, encode_control, max_ids_per_frame};
+pub use header::{
+    FLAG_AUTHENTICATED, FLAG_CONTROL, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION, is_control,
+};
 
 use auth::AUTH_TAG_LEN;
 use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
@@ -139,6 +143,18 @@ impl PacketBuf {
     /// Maximum byte capacity (fixed at construction).
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Replace the contents with `bytes`, for forwarding a received datagram
+    /// verbatim. Returns `false`, leaving the buffer empty, when `bytes`
+    /// exceeds the capacity.
+    pub fn set_bytes(&mut self, bytes: &[u8]) -> bool {
+        self.inner.clear();
+        if bytes.len() > self.capacity {
+            return false;
+        }
+        self.inner.extend_from_slice(bytes);
+        true
     }
 }
 
@@ -364,7 +380,7 @@ pub fn decode_auth<C: Count>(
 }
 
 #[inline]
-fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
+pub(crate) fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
     Observation {
         rule_fingerprint: cell.rule_fingerprint,
         key_hash: cell.key_hash,

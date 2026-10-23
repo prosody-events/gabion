@@ -83,6 +83,48 @@ pub const GOSSIP_TARGET_ERR_BPS: u32 = 100;
 /// `GOSSIP_TICK_INTERVAL_MILLIS`).
 pub const GOSSIP_MIN_EMIT_INTERVAL_MS: u64 = 5;
 
+// -- GossipSub mesh dissemination -------------------------------------------
+//
+// The values below are the GossipSub v1.1 specification defaults
+// (https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.1.md),
+// except the two capacities, which bound the per-node memory the spec leaves
+// open. See "Design notes" in `crates/gabion/README.md`.
+
+/// Target mesh degree `D`: how many peers a node eagerly pushes full messages
+/// to, and the size a mesh is pruned or grafted back to.
+pub const GOSSIPSUB_D: usize = 6;
+/// Lower mesh bound `D_lo`: below this a heartbeat grafts up to `D`.
+pub const GOSSIPSUB_D_LO: usize = 4;
+/// Upper mesh bound `D_hi`: above this a heartbeat prunes down to `D`, and a
+/// GRAFT arriving at this size is refused.
+pub const GOSSIPSUB_D_HI: usize = 12;
+/// Minimum number of non-mesh peers sent an `IHAVE` per heartbeat (`D_lazy`).
+pub const GOSSIPSUB_D_LAZY: usize = 6;
+/// Fraction of non-mesh peers sent an `IHAVE` per heartbeat when that exceeds
+/// `D_lazy` (`gossip_factor`).
+pub const GOSSIPSUB_GOSSIP_FACTOR: f64 = 0.25;
+/// Heartbeats a message stays in the message cache and can answer an `IWANT`
+/// (`history_length`).
+pub const GOSSIPSUB_MCACHE_LEN: u32 = 5;
+/// Newest heartbeats of the message cache whose ids are advertised in
+/// `IHAVE` (`history_gossip`).
+pub const GOSSIPSUB_MCACHE_GOSSIP: u32 = 3;
+/// Mesh heartbeat period, milliseconds.
+pub const GOSSIPSUB_HEARTBEAT_MS: u64 = 1_000;
+/// Seconds a pruned peer must not be grafted again (`prune_backoff`).
+pub const GOSSIPSUB_PRUNE_BACKOFF_SECS: u16 = 60;
+/// Seconds a message id is remembered for duplicate suppression
+/// (`seen_ttl`).
+pub const GOSSIPSUB_SEEN_TTL_SECS: u64 = 120;
+/// Hard bound on messages the cache holds, whatever the heartbeat window.
+pub const GOSSIPSUB_MCACHE_CAPACITY: usize = 4_096;
+/// Bytes reserved per cached message. A message is one datagram, so this is
+/// `GOSSIP_MAX_PAYLOAD_BYTES`; a larger datagram is forwarded but cannot be
+/// served to an `IWANT`.
+pub const GOSSIPSUB_MCACHE_SLOT_BYTES: usize = GOSSIP_MAX_PAYLOAD_BYTES;
+/// Hard bound on message ids remembered for duplicate suppression.
+pub const GOSSIPSUB_SEEN_CAPACITY: usize = 32_768;
+
 pub fn random_rng_seed() -> Result<u64, getrandom::Error> {
     let mut bytes = [0_u8; 8];
     getrandom::fill(&mut bytes)?;

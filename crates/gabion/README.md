@@ -16,6 +16,7 @@ the [repo root README](../../README.md#glossary).
 
 ## Contents
 
+- [Design notes: GossipSub mesh dissemination](#design-notes-gossipsub-mesh-dissemination)
 - [Module map](#module-map)
 - [How gossip works](#how-gossip-works)
   - [The wire frame](#the-wire-frame)
@@ -26,6 +27,92 @@ the [repo root README](../../README.md#glossary).
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
 - [References](#references)
+
+## Design notes: GossipSub mesh dissemination
+
+On this branch the runtime disseminates changes the way GossipSub v1.1
+does ([paper](https://arxiv.org/abs/2007.02754),
+[specification](https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.1.md))
+instead of through the random fanout, forwarded dirty ring, peer frontier
+and repair lane described under [How gossip works](#how-gossip-works).
+Those sections, and the `fanout` / coverage-fanout knobs below, describe
+`main` and do not apply here. The whole cluster is one topic.
+
+**Messages.** A message is one gossip datagram of cells, named by the 64-bit
+XXH3 hash of its bytes (the specification lets a deployment choose its
+message-id function; Eth2 uses a content hash). Cells carry cumulative
+per-origin counts and merge by max, so a later message about a cell
+supersedes an earlier one and a duplicate is harmless.
+
+**Eager push.** Each shared-scheduler round (the 500 ms heartbeat and the
+error-budget threshold rounds are unchanged) *publishes* the local cells
+changed since the last publish to the node's mesh peers. A datagram received
+for the first time is merged, cached, and forwarded verbatim to every mesh
+peer except the one it came from and its publisher. A repeat is dropped by
+the seen cache. Full payloads travel only to mesh peers or in answer to an
+`IWANT`.
+
+**Mesh upkeep and lazy gossip.** A 1 s mesh heartbeat (the
+specification's own timing; it runs on the first shared tick after the period
+has elapsed, ahead of that tick's publish) keeps the mesh between `D_lo` and
+`D_hi`: below
+`D_lo` it sends `GRAFT` to random non-backed-off peers up to `D`; above
+`D_hi` it sends `PRUNE` to random mesh peers down to `D`. It then sends
+`IHAVE`, carrying message ids only, for the messages of the newest
+`mcache_gossip` heartbeats to `max(D_lazy, gossip_factor x non-mesh peers)`
+random non-mesh peers. A node that has not seen an advertised id answers
+`IWANT` at once (`iwant_delay_ms = 0`), and the advertiser serves it from the
+message cache, which holds `mcache_len` heartbeats. A `GRAFT` is refused with
+a `PRUNE` when the sender is unknown, in backoff, or the mesh is at `D_hi`.
+A node builds its mesh in its first heartbeat, before its first round.
+
+| Parameter | Value | `gabion::defaults` / `PubSubConfig` |
+|---|---|---|
+| `D`, `D_lo`, `D_hi`, `D_lazy` | 6, 4, 12, 6 | `GOSSIPSUB_D`, `_D_LO`, `_D_HI`, `_D_LAZY` |
+| `gossip_factor` | 0.25 | `GOSSIPSUB_GOSSIP_FACTOR` |
+| `history_length` / `history_gossip` | 5 / 3 heartbeats | `GOSSIPSUB_MCACHE_LEN`, `_MCACHE_GOSSIP` |
+| mesh heartbeat | 1 s | `GOSSIPSUB_HEARTBEAT_MS` |
+| `prune_backoff`, `seen_ttl` | 60 s, 120 s | `GOSSIPSUB_PRUNE_BACKOFF_SECS`, `_SEEN_TTL_SECS` |
+| message cache, seen cache | 4,096 messages of 1,400 B, 32,768 ids | `GOSSIPSUB_MCACHE_CAPACITY`, `_MCACHE_SLOT_BYTES`, `_SEEN_CAPACITY` |
+
+The parameters live in `PubSubConfig` and are set with
+`GossipRuntime::with_pubsub`, not in `GossipConfig`, so existing
+`GossipConfig` literals (including the legacy bench's) keep compiling. The
+last row is the only addition to the specification: the caches are rings
+sized at construction, so memory cannot grow with traffic or departed peers.
+
+**Wire.** Control messages are four small datagrams that reuse the data
+frame's header and HMAC tag, marked by `FLAG_CONTROL` (`wire/control.rs`).
+`IHAVE` and `IWANT` split their id lists across as many datagrams as the
+payload limit needs.
+
+**Adaptations and omissions.**
+
+- *UDP datagrams instead of libp2p streams.* Each control message is its
+  own datagram and none is retransmitted; libp2p relies on its reliable
+  stream. A lost `GRAFT` or `PRUNE` leaves the two ends' views of the mesh
+  briefly different until a heartbeat or a refusal corrects it.
+- *No flood publishing.* v1.1 sends a publisher's own messages to every
+  peer by default; that would break "full payloads only to mesh peers", so
+  publishers push to their mesh like everyone else.
+- *Scoring and attack defences omitted* because the cluster is trusted: peer
+  scoring and its thresholds, `D_score` and `D_out`, opportunistic grafting,
+  `IWANT` retransmission and `IHAVE` flood limits. Without scores a prune
+  keeps a random `D` mesh peers. Peer exchange on `PRUNE` is omitted too, as
+  membership comes only from discovery.
+- *No repair lane.* Nothing re-sends a cell the mesh and the lazy gossip both
+  missed, and a joiner learns of existing cells only through later messages
+  or advertisements still in a peer's cache. On a cluster of at most `D`
+  peers every peer is a mesh peer, so no `IHAVE` is sent and a lost datagram
+  is recovered only by the next message that touches the same cell.
+- *Peers are identified by source address.* Forwarded datagrams keep the
+  publisher's header, so a peer's node id is learned from its control frames
+  and used to avoid sending a message back to its publisher.
+- *`fanout`, `GOSSIP_COVERAGE_MARGIN`, the peer frontier and
+  `fill_gossip_frame*` are unused by the runtime.* `max_cells_per_tick` still
+  caps the cells one round publishes. `AdminSnapshot::last_effective_fanout`
+  reports the mesh degree of the last round, and `PeerEntry::in_mesh`
+  replaces `peer_slot`.
 
 ## Module map
 

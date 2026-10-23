@@ -10,6 +10,16 @@ pub const VERSION: u16 = 1;
 /// receivers that want to defer downstream work until the batch settles.
 pub const FLAG_MORE: u16 = 0x01;
 pub const FLAG_AUTHENTICATED: u16 = 0x02;
+/// Set on control frames (`GRAFT`, `PRUNE`, `IHAVE`, `IWANT`), which carry no
+/// cells. See [`super::control`].
+pub const FLAG_CONTROL: u16 = 0x04;
+
+/// Whether `bytes` claims to be a control frame. Reads only the unauthenticated
+/// flags field to choose a decoder; the chosen decoder then verifies the
+/// frame, so a forged bit costs a failed decode, nothing more.
+pub fn is_control(bytes: &[u8]) -> bool {
+    bytes.len() >= HEADER_LEN && u16::from_le_bytes([bytes[6], bytes[7]]) & FLAG_CONTROL != 0
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {
