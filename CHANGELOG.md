@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.3.2](https://github.com/prosody-events/gabion/compare/v0.3.1...v0.3.2) (2026-10-23)
+
+
+### Bug fixes
+
+* **nginx:** clear the aggregate table when a leader starts fresh ([#104](https://github.com/prosody-events/gabion/issues/104)) ([20ad951](https://github.com/prosody-events/gabion/commit/20ad95186a2ddecb3d1b2e5b3040ee2b72e8c95f))
+* **nginx:** count a request once across internal redirects ([#97](https://github.com/prosody-events/gabion/issues/97)) ([2a8634f](https://github.com/prosody-events/gabion/commit/2a8634fc367cddfab76dad7b89e854b612868685))
+* **nginx:** drain the SHM queue without allocating per event ([#99](https://github.com/prosody-events/gabion/issues/99)) ([0288d9a](https://github.com/prosody-events/gabion/commit/0288d9a05ba1cff400c80c68f329df48ddafc9dd))
+* **nginx:** refuse rules without a gossip bind; accept hex cluster ids ([#96](https://github.com/prosody-events/gabion/issues/96)) ([330b513](https://github.com/prosody-events/gabion/commit/330b51340c2c2ee8a816d659b0d1be1c30f20273))
+* **nginx:** size the aggregate table from the zone and bound its probes ([#98](https://github.com/prosody-events/gabion/issues/98)) ([f8216d1](https://github.com/prosody-events/gabion/commit/f8216d13e2c22b220c1035cf7b484ce57feb61bd))
+
+
+### Tests
+
+* make time-dependent tests deterministic and fast ([#105](https://github.com/prosody-events/gabion/issues/105)) ([df0e576](https://github.com/prosody-events/gabion/commit/df0e576ea30b956c179daff7c534bbd462b6c2b1))
+* **nginx:** model-check the SHM queue, lease and aggregate seqlock with loom ([#103](https://github.com/prosody-events/gabion/issues/103)) ([eb53584](https://github.com/prosody-events/gabion/commit/eb53584b96d98f3692b4c1ba8dab2c399191814c))
+
+
+### Build / CI
+
+* **docker:** attest the published image index, not per-arch build digests ([#94](https://github.com/prosody-events/gabion/issues/94)) ([c6cee63](https://github.com/prosody-events/gabion/commit/c6cee63fca7fade4e64c8f58b7a9368b143787d9))
+* **kubernetes:** stop the kind scripts rebuilding images CI already loaded ([#106](https://github.com/prosody-events/gabion/issues/106)) ([4fae7df](https://github.com/prosody-events/gabion/commit/4fae7dfbb1fca84b0c4960e7bc3aa6f6a70cfe5a))
+* **nginx:** check nginx-sys bindings against each nginx's C layout ([#102](https://github.com/prosody-events/gabion/issues/102)) ([258b79d](https://github.com/prosody-events/gabion/commit/258b79d6f9b048056640a74fe67cb773e05178ab))
+* **nginx:** run the module smokes under AddressSanitizer ([#101](https://github.com/prosody-events/gabion/issues/101)) ([fca89f9](https://github.com/prosody-events/gabion/commit/fca89f95aa3f77b003d8308435e20ab0c703c48c))
+* **nginx:** run the request smoke against OpenResty too ([#100](https://github.com/prosody-events/gabion/issues/100)) ([63d7017](https://github.com/prosody-events/gabion/commit/63d7017bc0d4004df0b22698706bdbbf13ed78ed))
+
 ## [0.3.1](https://github.com/prosody-events/gabion/compare/v0.3.0...v0.3.1) (2026-10-20)
 
 
