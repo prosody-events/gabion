@@ -58,3 +58,14 @@ paths = [
     "Cargo.toml",
     "Cargo.lock",
 ]
+
+[plan.work.nginx-asan]
+scope = "repository"
+paths = [
+    "deploy/nginx/**",
+    "crates/nginx/**",
+    "crates/gabion/src/**",
+    "crates/gabion/Cargo.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+]

@@ -128,6 +128,7 @@ help:
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
 	@printf '%s\n' '  make nginx-test      Build the module for NGINX and OpenResty and assert 200, 200, 429 responses'
+	@printf '%s\n' '  make nginx-asan      Run the request and reload smokes under AddressSanitizer'
 	@printf '%s\n' '  make nginx-matrix    Build Gabion NGINX images for common official NGINX tags'
 	@printf '%s\n' '  make openresty-matrix Build Gabion OpenResty images for common OpenResty tags'
 	@printf '%s\n' '  make kubernetes-test Run guarded local kind EndpointSlice convergence tests'
@@ -136,7 +137,7 @@ help:
 	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local kind gossip propagation benchmark'
 	@printf '%s\n' '  make kubernetes-clean Delete local Kubernetes test namespaces'
 	@printf '%s\n' '  make ci              Fast contributor pre-merge: test, loom, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
-	@printf '%s\n' '  make ci-full         Mirror GitHub Actions end-to-end: ci + miri-all + every kubernetes-* target'
+	@printf '%s\n' '  make ci-full         Mirror GitHub Actions end-to-end: ci + nginx-asan + miri-all + every kubernetes-* target'
 
 .PHONY: fmt
 fmt: fmt-check
@@ -251,6 +252,10 @@ nginx-test:
 	$(COMPOSE) run $(NGINX_SMOKE_BUILD) --rm nginx-module-request-smoke
 	$(COMPOSE) run $(NGINX_SMOKE_BUILD) --rm openresty-module-request-smoke
 
+.PHONY: nginx-asan
+nginx-asan:
+	$(COMPOSE) run $(NGINX_SMOKE_BUILD) --rm nginx-module-asan-smoke
+
 .PHONY: nginx-matrix
 nginx-matrix:
 	sh deploy/nginx/build-matrix.sh
@@ -289,4 +294,4 @@ kubernetes-clean:
 ci: test loom miri-safety bench-check wasm-check nginx-config nginx-module nginx-test
 
 .PHONY: ci-full
-ci-full: ci miri-all kubernetes-test kubernetes-nginx-test kubernetes-mixed-test kubernetes-gossip-bench
+ci-full: ci nginx-asan miri-all kubernetes-test kubernetes-nginx-test kubernetes-mixed-test kubernetes-gossip-bench

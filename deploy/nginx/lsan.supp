@@ -1,0 +1,13 @@
+# LeakSanitizer suppressions for `make nginx-asan`. Only nginx's own
+# deliberate exit-time leaks belong here; never suppress a gabion frame.
+#
+# nginx never frees two kinds of pool at exit: `main()`'s bootstrap
+# `init_cycle` pool, and the whole cycle pool of `nginx -t` / `nginx -s`,
+# which return from `main()` without destroying it. LeakSanitizer
+# re-scans from suppressed blocks, so everything those pools own,
+# gabion's configuration included, counts as reachable.
+leak:ngx_create_pool
+
+# A worker destroys its cycle pool on exit but never frees the
+# connection and event arrays `ngx_event_process_init` mallocs.
+leak:ngx_event_process_init

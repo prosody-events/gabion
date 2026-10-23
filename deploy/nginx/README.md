@@ -105,6 +105,19 @@ verifies that the rate-limit rules return `200`, `200`, `429` in order.
 When an assertion fails, you can run the script by hand inside the
 container to narrow down which step went wrong.
 
+## Run the smokes under AddressSanitizer
+
+```sh
+make nginx-asan
+```
+
+Miri can't run nginx, so this target checks the module's FFI instead.
+It builds nginx (with `NGX_DEBUG_PALLOC`, so ASan bounds every pool
+allocation) and the module (nightly `-Zsanitizer=address`) with clang's
+AddressSanitizer on `nginx:stable`, runs the request smoke and then
+`reload-smoke.sh`, and fails on any ASan or LeakSanitizer report.
+`lsan.supp` lists the nginx exit-time leaks it ignores.
+
 ## Build matrices
 
 Sweep the common official NGINX variants, then the OpenResty variants:

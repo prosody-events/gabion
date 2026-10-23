@@ -175,3 +175,52 @@ jobs:
           name: cores-${{ github.job }}-${{ github.run_attempt }}
           path: /tmp/cores
           if-no-files-found: ignore
+
+  # Miri can't run nginx, so this AddressSanitizer run of the request and
+  # reload smokes covers the module's FFI. Every run reads the ASan
+  # stages' own cache scope (the nightly cook layer is the slow part);
+  # main refreshes it, and PRs write only a `buildcache-pr-` scope, as in
+  # docker.yml. `ignore-error` keeps fork PRs, which can't push, green.
+  # The Debian chef layers come read-only from the canonical
+  # `nginx:stable` build.
+  nginx-asan:
+    needs: plan
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'nginx-asan') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ASAN_CACHE: ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-asan-amd64
+      ASAN_CACHE_TO: ghcr.io/${{ github.repository }}/nginx:buildcache-${{ github.event_name == 'pull_request' && 'pr-' || '' }}nginx-asan-amd64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:latest
+      # Best-effort login — see nginx-module. Forks miss and cold-compile.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: warm asan image from registry cache
+        run: |
+          docker buildx build \
+            --load \
+            --target asan \
+            --build-arg NGINX_BASE_IMAGE=nginx:stable \
+            --cache-from "type=registry,ref=${ASAN_CACHE_TO}" \
+            --cache-from "type=registry,ref=${ASAN_CACHE}" \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-amd64 \
+            --cache-to "type=registry,ref=${ASAN_CACHE_TO},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
+            -f deploy/nginx/Dockerfile \
+            -t nginx-nginx-module-asan-smoke:latest \
+            .
+      - name: nginx-asan smoke
+        env:
+          NGINX_SMOKE_BUILD: ''
+        run: make nginx-asan
