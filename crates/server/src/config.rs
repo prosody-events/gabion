@@ -425,7 +425,7 @@ pub struct GossipSettings {
     /// See [`gabion::defaults::GOSSIP_BROADCAST_INTERVAL_MS`].
     #[serde(with = "humantime_serde")]
     pub broadcast_interval: Duration,
-    /// Most cells in one owner broadcast. See
+    /// Most keys in one owner broadcast. See
     /// [`gabion::defaults::GOSSIP_BROADCAST_BATCH_LIMIT`].
     pub broadcast_batch_limit: usize,
     pub fanout: usize,

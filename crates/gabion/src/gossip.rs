@@ -82,7 +82,7 @@ pub struct GossipConfig {
     /// How often an owner broadcasts its changed cells to every peer. See
     /// [`crate::defaults::GOSSIP_BROADCAST_INTERVAL_MS`].
     pub broadcast_interval: Duration,
-    /// Most cells in one owner broadcast. See
+    /// Most keys in one owner broadcast. See
     /// [`crate::defaults::GOSSIP_BROADCAST_BATCH_LIMIT`].
     pub broadcast_batch_limit: usize,
     /// Optional HMAC key — when set, every outbound packet is authenticated

@@ -7,7 +7,7 @@
 //! aggregate store's apply signal rather than polling the clock.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::num::NonZeroU128;
 use std::rc::Rc;
@@ -514,25 +514,28 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
             router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Pass);
         }
     }
-    // An owner broadcasts a changed cell once, so a broadcast the partition
-    // swallowed is repaired by the key's next hit, not by a retry. Every
-    // contributor hits each of its keys once more after the heal.
+    // An owner broadcasts a key when it changes and does not retry, so a key
+    // that stays quiet after the heal keeps whatever the partition made
+    // peers miss. One more hit to each key, from any single node, makes its
+    // owner broadcast the key's whole state and repairs every peer.
+    let mut touched = BTreeSet::new();
     let touches: Vec<SimRecord> = case
         .records
         .iter()
+        .filter(|r| touched.insert((r.rule, r.key)))
         .map(|r| SimRecord {
+            node: 0,
             hits: 1,
             ..r.clone()
         })
         .collect();
     for record in &touches {
-        let node = record.node as usize % NODES;
-        clients[node]
+        clients[0]
             .record(rule_fp(record.rule), key_hash(record.key), 0, 1, 0, 0)
             .await
             .unwrap();
     }
-    let global: BTreeMap<_, _> = {
+    let global = {
         let mut model = global;
         for (key, hits) in expected_model(&touches, NODES) {
             *model.entry(key).or_insert(0) += hits;
@@ -1150,6 +1153,63 @@ async fn dropped_sync_is_resent_until_the_owner_acknowledges() {
         .await;
 }
 
+/// A hit that found the sync queue full is not forgotten: the next sweep of
+/// the node's local cells queues it again once the queue has drained.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn hits_that_overflowed_the_sync_queue_still_reach_their_owner() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr_a = sock(40_070);
+            let addr_b = sock(40_071);
+            let id_a = NodeIdentity::new(NodeId(0xAA00), 1);
+            let id_b = NodeIdentity::new(NodeId(0xBB00), 1);
+            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let tiny_queue = CellStore::<u32>::new(
+                CellStoreConfig {
+                    local_dirty_capacity: 2,
+                    ..CellStoreConfig::default()
+                },
+                id_a,
+            );
+            let (rt_a, client_a) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                sim_config(id_a, vec![addr_b], 1),
+                tiny_queue,
+                agg_a.clone(),
+            );
+            let (rt_b, _client_b) = GossipRuntime::from_parts(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                sim_config(id_b, vec![addr_a], 2),
+                store_for(id_b),
+                agg_b.clone(),
+            );
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+
+            let keys: Vec<_> = (0..)
+                .map(KeyHash)
+                .filter(|&key| owner_index(&[addr_a, addr_b], 0xDEAD, key) == 1)
+                .take(6)
+                .collect();
+            for &key in &keys {
+                client_a.record(0xDEAD, key, 0, 1, 0, 0).await.unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 20).await;
+            assert_eq!(agg_b.total(), 6, "the owner holds every hit");
+
+            client_a.shutdown().await.unwrap();
+            let _ = h_a.await;
+            h_b.abort();
+            let _ = h_b.await;
+        })
+        .await;
+}
+
 // -- partition then heal ----------------------------------------------------
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1338,6 +1398,45 @@ async fn hits_reach_other_nodes_only_through_the_owner() {
                 .unwrap();
             sim_advance_ticks(Duration::from_millis(100), 10).await;
             assert_eq!(mesh.aggregates[2].total(), 5);
+            mesh.shutdown().await;
+        })
+        .await;
+}
+
+/// A peer that missed an owner's broadcast catches up on the next change to
+/// the key, whichever cell of the key changed: the broadcast carries the
+/// key's whole state.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn next_change_to_a_key_repairs_a_peer_that_missed_a_broadcast() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let mesh = spawn_mesh(54_050, 3);
+            let key = (0..)
+                .map(KeyHash)
+                .find(|&key| owner_index(&mesh.addrs, 0xDEAD, key) == 1)
+                .unwrap();
+            mesh.router
+                .set_link_policy(mesh.addrs[1], mesh.addrs[2], LinkPolicy::Block);
+            mesh.clients[0]
+                .record(0xDEAD, key, 0, 3, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 10).await;
+            assert_eq!(mesh.aggregates[2].total(), 0);
+
+            // C's own hit changes a different cell (another origin) and a
+            // different bucket of the key; the owner's broadcast carries A's
+            // earlier cell along.
+            mesh.router
+                .set_link_policy(mesh.addrs[1], mesh.addrs[2], LinkPolicy::Pass);
+            mesh.clients[2]
+                .record(0xDEAD, key, 1, 2, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 10).await;
+            assert_eq!(mesh.aggregates[2].total(), 5);
+            assert_eq!(mesh.aggregates[1].total(), 5);
             mesh.shutdown().await;
         })
         .await;
