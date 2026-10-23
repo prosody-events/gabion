@@ -81,10 +81,13 @@ RUN nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
+# `nginx_layout` fails the build when nginx-sys disagrees with this nginx's C
+# struct layout (see README.md, "Binding layout check").
 RUN nginx_version="$(nginx -v 2>&1 | sed 's#nginx version: nginx/##')" \
-    && NGINX_SOURCE_DIR="/workspace/nginx-${nginx_version}" \
-       NGINX_BUILD_DIR="/workspace/nginx-${nginx_version}/objs" \
-       cargo build -p gabion-nginx --release --features ngx-module \
+    && export NGINX_SOURCE_DIR="/workspace/nginx-${nginx_version}" \
+              NGINX_BUILD_DIR="/workspace/nginx-${nginx_version}/objs" \
+    && cargo build -p gabion-nginx --release --features ngx-module \
+    && cargo run -p gabion-nginx --release --features ngx-module --bin nginx_layout \
     && mkdir -p /out \
     && cp target/release/libgabion_nginx.so /out/ngx_http_gabion_module.so \
     && rm -rf target
