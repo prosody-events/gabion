@@ -24,7 +24,8 @@ use crate::harness::{fixtures, node};
 
 /// Standard-normal quantile used for every confidence interval below: a
 /// two-sided 4-sigma band, which a correct simulator misses about once in
-/// 16,000 independent checks.
+/// 16,000 independent checks (the epidemic check's expected value is itself
+/// approximate, so its rate is nearer 1 in 1,000).
 const SIGMAS: f64 = 4.0;
 
 /// Run `count` probes from node 0 to node `to` through a two-or-more-node

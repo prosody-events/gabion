@@ -38,10 +38,6 @@ class ExecutableFromTest(unittest.TestCase):
             executable_from(artifact("gossip-bench", "lib", None))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SweepDeadCopiesTest(unittest.TestCase):
     def test_removes_only_copies_whose_process_is_gone(self):
         gone = subprocess.Popen([sys.executable, "-c", ""])
@@ -55,3 +51,7 @@ class SweepDeadCopiesTest(unittest.TestCase):
             sweep_dead_copies(out)
             self.assertEqual((dead.exists(), live.exists(), other.exists()),
                              (False, True, True))
+
+
+if __name__ == "__main__":
+    unittest.main()

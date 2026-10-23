@@ -403,9 +403,14 @@ check runs a real gabion cluster under the full `Driver`. Seeds are fixed, so
 every run is bit-identical; the whole suite takes about 11 s in release on the
 reference host, 7 s of it the 300-node epidemic. Statistical tolerances are
 4 standard errors (a two-sided band a correct simulator misses about once in
-16,000 checks) unless stated.
+16,000 checks) unless stated. The epidemic check is the exception: its
+expected value is itself approximate (below), so its false-alarm rate is
+nearer 1 in 1,000.
 
-**1. Epidemic reach.** Infect-and-forward-once push gossip: the origin sends
+**1. Epidemic reach.** An end-to-end delivery and event-loop sanity check,
+not a test of the network model: the reference nodes choose their own targets
+and the harness only carries their loss-free datagrams (loss and latency are
+checked in 2 and 3). Infect-and-forward-once push gossip: the origin sends
 the message to `f` distinct nodes chosen uniformly from the others; every
 node does the same once, on first receipt, and then falls silent (non-integer
 `f` by randomised rounding, so the mean is exact). Kermarrec, Massoulié and
@@ -415,7 +420,8 @@ Trans. Parallel and Distributed Systems 14(3), 2003) show that with `f = ln n
 5,000 independent runs per cell. The limit is asymptotic; the same Poisson
 argument at finite `n` with distinct targets gives `exp(-(n-1)(1 -
 f/(n-1))^(n-1))`, the last column. That value is itself a Poisson
-approximation, off by about 0.01 at `c = 0`, which the 4 s.e. band absorbs; an
+approximation, off by about 0.008 at `c = 0` (about 1.2 s.e. at 5,000 trials),
+which the 4 s.e. band absorbs at the cost of a looser false-alarm rate; an
 independent plain-Python simulation of the same protocol (`n = 100`, 40,000
 trials per cell, no harness code) gave 0.402, 0.732 and 0.898 for `c = 0, 1,
 2`, matching the measured column. The harness must match the finite-`n` value

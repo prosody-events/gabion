@@ -176,12 +176,10 @@ fn partition_run_reports_phases_and_heals() {
     let during = &report.during.staleness;
     assert!(during.in_zone.limited.mean > report.before.staleness.in_zone.limited.mean);
     assert!(report.deficit_at_heal_hits > Some(0.0));
-    // The cut outlasts the window and the repair is not instant, so some
-    // cut-era hits expire unrepaired, and then there is no heal to time.
-    assert_eq!(
-        report.time_to_heal_ms.is_some(),
-        report.unrepaired_at_expiry_hits == Some(0.0)
-    );
+    // The cut outlasts the window, but the buckets still in it at the heal
+    // are repaired before they expire, so the heal can be timed.
+    assert_eq!(report.unrepaired_at_expiry_hits, Some(0.0));
+    assert!(report.time_to_heal_ms.is_some());
     // The three phases cover every measured hit, once per side.
     let phases = [&report.before, &report.during, &report.after];
     let sides: u64 = phases

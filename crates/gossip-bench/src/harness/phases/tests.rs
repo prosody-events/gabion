@@ -185,6 +185,35 @@ fn a_repaired_heal_reports_nothing_lost_to_expiry() {
     assert_eq!(report.unrepaired_at_expiry_hits, Some(0.0));
 }
 
+/// The heal falls on a bucket boundary. The bucket that leaves the window at
+/// that instant had no time to be repaired, so it is not charged; the debt is
+/// the buckets still in the window, which pod 1 then reaches.
+#[test]
+fn a_bucket_expiring_at_the_heal_is_not_owed_repair() {
+    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
+    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
+    oracle.node_started(0, 0, false);
+    oracle.node_started(1, 0, false);
+    // B - 2 leaves the 3-bucket window at the heal, which starts bucket B + 1.
+    oracle.admitted(0, B - 2, 11 * S, 0);
+    oracle.view_changed(0, 0, B - 2, 1, 1, 11 * S);
+    oracle.admitted(0, B, 12 * S, 0);
+    oracle.view_changed(0, 0, B, 1, 1, 12 * S);
+
+    assert!(!oracle.heal_sample(20 * S, millis(0)));
+    oracle.bucket_boundary(20 * S, millis(0), B + 1, &[]);
+    oracle.view_changed(1, 0, B, 1, 1, 20 * S + 200 * MS);
+    assert!(oracle.heal_sample(20 * S + 200 * MS, millis(200)));
+    oracle.bucket_boundary(21 * S, millis(1_000), B + 2, &[]);
+    oracle.bucket_boundary(22 * S, millis(2_000), B + 3, &[]);
+    oracle.finish(30 * S);
+
+    let report = oracle.partition_report(10).expect("partition");
+    assert_eq!(report.deficit_at_heal_hits, Some(0.5));
+    assert_eq!(report.time_to_heal_ms, Some(200.0));
+    assert_eq!(report.unrepaired_at_expiry_hits, Some(0.0));
+}
+
 #[test]
 fn a_regime_without_a_partition_has_no_phases() {
     assert!(Schedule::of(&fixtures::tiny()).is_none());

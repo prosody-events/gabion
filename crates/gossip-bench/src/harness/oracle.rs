@@ -732,12 +732,14 @@ impl Oracle {
 
     /// `gone`, a bucket that closed before the heal, just left the window:
     /// whatever some pod still lacked of it was never repaired, and the heal
-    /// can no longer count as complete.
+    /// can no longer count as complete. A bucket that leaves the window at
+    /// the heal instant itself had no time to be repaired and is owed
+    /// nothing (it is outside `heal_deficit`'s window too).
     fn note_unrepaired_expiry(&mut self, gone: BucketEpoch, now_ns: u64, now_millis: u64) {
         let Some(schedule) = self.phases.as_ref().map(PhaseStats::schedule) else {
             return;
         };
-        if now_ns < schedule.heal_ns {
+        if now_ns <= schedule.heal_ns {
             return;
         }
         let Some((last, pods)) = self.heal_debt(schedule, now_ns, now_millis) else {
