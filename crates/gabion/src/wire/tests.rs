@@ -9,9 +9,10 @@ use crate::crdt::{
 };
 
 use super::{
-    DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_MORE, FrameLimits,
-    HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch, decode_auth,
-    decode_auth_visit, decode_unauth, decode_unauth_visit,
+    CONTROL_ENTRY_BYTES, ControlEntry, ControlKind, DecodeError, DecodedSummary, EncodeError,
+    FLAG_AUTHENTICATED, FLAG_MORE, FrameKind, FrameLimits, HEADER_LEN, Header, HmacKey, PacketBuf,
+    Packets, WireCell, WireScratch, decode_auth, decode_auth_visit, decode_control_auth,
+    decode_control_unauth, decode_unauth, decode_unauth_visit, encode_control, frame_kind,
 };
 
 const MAX_ROWS: usize = 32;
@@ -105,6 +106,7 @@ fn seed_store<C: Count>(
             incarnation: r.origin_incarnation as Incarnation,
             count: to_count(r.count),
             last_update_millis: r.last_update_millis,
+            origin_sequence: u64::from(r.count),
         });
     }
     store.merge_remote(&obs, &mut sink);
@@ -353,6 +355,7 @@ fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
             incarnation: 1,
             count: 1 + i,
             last_update_millis: 1_000 + i as u64,
+            origin_sequence: 1 + u64::from(i),
         });
     }
     store.merge_remote(&obs, &mut sink);
@@ -867,4 +870,266 @@ fn visitor_matches_allocating_for_curated_rows() {
         assert_eq!(cell.count, obs.counts[i]);
         assert_eq!(cell.last_update_millis, obs.last_update_millis[i]);
     }
+}
+
+// -- control frames ---------------------------------------------------------
+
+fn control_entries(n: usize) -> Vec<ControlEntry> {
+    (0..n)
+        .map(|i| ControlEntry {
+            node_id: NodeId(0x1000 + i as u128),
+            incarnation: 1 + i as u32,
+            sequence: 100 + i as u64,
+        })
+        .collect()
+}
+
+fn decode_all(
+    bytes: &[u8],
+    limits: FrameLimits,
+) -> Result<(Header, ControlKind, Vec<ControlEntry>), DecodeError> {
+    let mut out = Vec::new();
+    let (header, kind) = decode_control_unauth(bytes, limits, |e| out.push(e))?;
+    Ok((header, kind, out))
+}
+
+#[test]
+fn control_frames_round_trip_every_kind() {
+    let limits = FrameLimits::default();
+    for kind in [
+        ControlKind::IHave,
+        ControlKind::Graft,
+        ControlKind::Prune,
+        ControlKind::Nack,
+        ControlKind::Pull,
+    ] {
+        let mut buf = PacketBuf::for_limits(limits);
+        let entries = control_entries(3);
+        let header = Header {
+            min_origin_sequence: 7,
+            max_origin_sequence: 9,
+            ..sample_header()
+        };
+        let n = encode_control(&mut buf, header, kind, &entries, None, limits);
+        assert_eq!(n, 3);
+        assert_eq!(frame_kind(buf.as_bytes()), Some(FrameKind::Control));
+        let (got, got_kind, got_entries) = decode_all(buf.as_bytes(), limits).unwrap();
+        assert_eq!(got_kind, kind);
+        assert_eq!(got_entries, entries);
+        assert_eq!(got.sender_node_id, header.sender_node_id);
+        assert_eq!((got.min_origin_sequence, got.max_origin_sequence), (7, 9));
+        assert_eq!(got.flags & FLAG_MORE, 0);
+    }
+}
+
+#[test]
+fn a_nack_carries_its_range_and_no_entries() {
+    let limits = FrameLimits::default();
+    let mut buf = PacketBuf::for_limits(limits);
+    let header = Header {
+        min_origin_sequence: 4,
+        max_origin_sequence: 6,
+        ..sample_header()
+    };
+    assert_eq!(
+        encode_control(&mut buf, header, ControlKind::Nack, &[], None, limits),
+        0
+    );
+    assert_eq!(buf.as_bytes().len(), HEADER_LEN);
+    let (got, kind, entries) = decode_all(buf.as_bytes(), limits).unwrap();
+    assert_eq!(kind, ControlKind::Nack);
+    assert!(entries.is_empty());
+    assert_eq!((got.min_origin_sequence, got.max_origin_sequence), (4, 6));
+}
+
+#[test]
+fn control_entries_beyond_the_payload_budget_continue_in_the_next_frame() {
+    let limits = FrameLimits {
+        max_payload_bytes: HEADER_LEN + 2 * CONTROL_ENTRY_BYTES + 5,
+        max_cells: 4096,
+    };
+    let entries = control_entries(5);
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut sent = 0;
+    let mut frames = 0;
+    while sent < entries.len() {
+        let n = encode_control(
+            &mut buf,
+            sample_header(),
+            ControlKind::IHave,
+            &entries[sent..],
+            None,
+            limits,
+        );
+        let (header, _, got) = decode_all(buf.as_bytes(), limits).unwrap();
+        assert_eq!(got, entries[sent..sent + n]);
+        sent += n;
+        frames += 1;
+        assert_eq!(header.flags & FLAG_MORE != 0, sent < entries.len());
+        assert!(buf.as_bytes().len() <= limits.max_payload_bytes);
+    }
+    assert_eq!((sent, frames), (5, 3));
+}
+
+#[test]
+fn authenticated_control_frames_reject_tampering_and_the_wrong_key() {
+    let limits = FrameLimits::default();
+    let key = HmacKey([3; 32]);
+    let mut buf = PacketBuf::for_limits(limits);
+    encode_control(
+        &mut buf,
+        sample_header(),
+        ControlKind::Graft,
+        &control_entries(2),
+        Some(&key),
+        limits,
+    );
+    let bytes = buf.as_bytes().to_vec();
+    assert!(decode_control_auth(&bytes, &key, limits, |_| {}).is_ok());
+    assert_eq!(
+        decode_control_auth(&bytes, &HmacKey([4; 32]), limits, |_| {}).unwrap_err(),
+        DecodeError::AuthenticationFailed
+    );
+    for i in 0..bytes.len() {
+        let mut tampered = bytes.clone();
+        tampered[i] ^= 0x01;
+        assert!(
+            decode_control_auth(&tampered, &key, limits, |_| {}).is_err(),
+            "byte {i}"
+        );
+    }
+    // An unauthenticated decoder does not accept an authenticated frame's
+    // tag as entries.
+    assert!(decode_control_unauth(&bytes, limits, |_| {}).is_err());
+}
+
+#[test]
+fn malformed_control_frames_are_rejected() {
+    let limits = FrameLimits::default();
+    let mut buf = PacketBuf::for_limits(limits);
+    encode_control(
+        &mut buf,
+        sample_header(),
+        ControlKind::Prune,
+        &control_entries(2),
+        None,
+        limits,
+    );
+    let good = buf.as_bytes().to_vec();
+
+    let mut truncated = good.clone();
+    truncated.pop();
+    assert_eq!(
+        decode_all(&truncated, limits).unwrap_err(),
+        DecodeError::BadControl
+    );
+
+    let mut unknown_kind = good.clone();
+    unknown_kind[7] = 0x7F;
+    assert_eq!(
+        decode_all(&unknown_kind, limits).unwrap_err(),
+        DecodeError::BadControl
+    );
+
+    let strict = FrameLimits {
+        max_cells: 1,
+        ..limits
+    };
+    assert_eq!(
+        decode_all(&good, strict).unwrap_err(),
+        DecodeError::BadControl
+    );
+}
+
+#[test]
+fn frame_kind_reads_the_flag_bits_without_decoding() {
+    for kind in [
+        FrameKind::Plain,
+        FrameKind::Eager,
+        FrameKind::Resent,
+        FrameKind::Grafted,
+        FrameKind::Random,
+        FrameKind::Control,
+    ] {
+        let mut bytes = vec![0u8; HEADER_LEN];
+        bytes[6..8].copy_from_slice(&(kind.flags() | FLAG_MORE).to_le_bytes());
+        assert_eq!(frame_kind(&bytes), Some(kind));
+    }
+    assert_eq!(frame_kind(&[0u8; 7]), None);
+    let mut unknown = vec![0u8; HEADER_LEN];
+    unknown[6..8].copy_from_slice(&(7u16 << 2).to_le_bytes());
+    assert_eq!(frame_kind(&unknown), None);
+}
+
+#[test]
+fn numbered_packets_carry_the_edge_sequence_and_keep_the_frame_kind() {
+    let rows: Vec<RawRow> = (0..40)
+        .map(|i| RawRow {
+            rule_fingerprint: 0x99,
+            key_hash: i,
+            bucket: 0,
+            origin_node_id: 0x500 + (i % 3),
+            origin_incarnation: 1,
+            count: 1 + i as u32,
+            last_update_millis: 1_000,
+        })
+        .collect();
+    let (store, handles) = seed_store::<u32>(&rows, |c| c);
+    let limits = FrameLimits {
+        max_payload_bytes: 400,
+        max_cells: 4096,
+    };
+    let mut scratch = WireScratch::for_store(&store);
+    let header = Header {
+        flags: FrameKind::Eager.flags(),
+        ..sample_header()
+    };
+    let mut packets =
+        Packets::<u32>::unauth(header, &store, &handles, &mut scratch, limits).unwrap();
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut numbers = Vec::new();
+    let mut next = 10;
+    while packets
+        .next_into_numbered(&mut buf, next)
+        .unwrap()
+        .is_some()
+    {
+        let mut cells = 0;
+        let summary =
+            decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_| true, |_| cells += 1).unwrap();
+        assert_eq!(frame_kind(buf.as_bytes()), Some(FrameKind::Eager));
+        assert_eq!(summary.header.cell_count, cells);
+        numbers.push(summary.header.min_origin_sequence);
+        next += 1;
+    }
+    assert!(numbers.len() > 1);
+    assert_eq!(numbers, (10..10 + numbers.len() as u64).collect::<Vec<_>>());
+}
+
+#[test]
+fn abandoning_a_frame_gives_up_the_rest_without_tripping_the_drain_check() {
+    let rows: Vec<RawRow> = (0..20)
+        .map(|i| RawRow {
+            rule_fingerprint: 0x99,
+            key_hash: i,
+            bucket: 0,
+            origin_node_id: 0x500,
+            origin_incarnation: 1,
+            count: 1,
+            last_update_millis: 1_000,
+        })
+        .collect();
+    let (store, handles) = seed_store::<u32>(&rows, |c| c);
+    let limits = FrameLimits {
+        max_payload_bytes: 300,
+        max_cells: 4096,
+    };
+    let mut scratch = WireScratch::for_store(&store);
+    let mut packets =
+        Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits).unwrap();
+    let mut buf = PacketBuf::for_limits(limits);
+    packets.next_into(&mut buf).unwrap();
+    let left = packets.remaining();
+    assert!(left > 0);
+    assert_eq!(packets.abandon(), left);
 }

@@ -39,7 +39,9 @@ pub struct AdminSnapshot {
     pub local_identity: NodeIdentity,
     pub peers: Vec<PeerEntry>,
     pub store_stats: CellStoreStats,
+    /// Local changes queued for the next heartbeat or threshold round.
     pub local_dirty_len: u32,
+    /// Changes merged from peers, queued for the next relay round.
     pub forwarded_dirty_len: u32,
     pub send_pending_depth: usize,
     pub decode_reject_count: u64,
@@ -59,21 +61,14 @@ pub struct AdminSnapshot {
     /// and `min_emit_interval` had elapsed, so the run loop dispatched
     /// a synthetic tick without waiting for the heartbeat.
     pub threshold_fires: u64,
-    /// Cumulative ticks (heartbeat + threshold) during which at least
-    /// one cell was dirty when `handle_gossip_tick` entered the peer
-    /// pick. Used by the bench to compute *effective fanout*
-    /// (`packets_emitted / dirty_ticks`) — see
-    /// `crates/gossip-bench/README.md`.
+    /// Cumulative heartbeat and threshold rounds that had changes to push.
     pub dirty_ticks: u64,
-    /// The coverage fanout the most recent dirty tick chose:
-    /// `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`, where `c` is
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]. Scales with cluster size,
-    /// not the dirty set, so it is stable for a given peer count rather than
-    /// pulsing with bursts. `0` before the first dirty tick.
+    /// Peers the most recent round with changes pushed to: at most the active
+    /// view of `⌈ln(peers) + c⌉` peers (`c` is
+    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), fewer as trees prune
+    /// edges to lazy. `0` before the first such round.
     pub last_effective_fanout: usize,
-    /// High-water mark of `last_effective_fanout` since startup — the widest
-    /// the node has ever fanned out. Tracks the coverage fanout's peak, which
-    /// rises only when the peer count grows.
+    /// High-water mark of `last_effective_fanout` since startup.
     pub peak_effective_fanout: usize,
     /// The per-rule error budget ε the most recent `handle_limit_request`
     /// computed: `limit × target_err_bps / (10_000 × peers)` (floored at 1).

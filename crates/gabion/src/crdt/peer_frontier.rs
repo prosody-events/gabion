@@ -2,9 +2,12 @@
 
 use super::{NodeId, NodeSlot};
 
-/// Per-peer × per-origin frontier: what we last sent to / heard acked from a
-/// given peer for each origin. **Latency optimization only** — convergence
-/// is guaranteed by the repair lane, not by this table.
+/// Per-peer × per-origin frontier. `last_acked` is the highest origin
+/// sequence a peer has shown it holds for an origin (a cell it sent us or an
+/// IHAVE it announced); `last_sent` is the highest we announced to it. Cells
+/// keep their origin's sequence when merged, so the numbers mean the same on
+/// every node. **Latency optimization only** — it trims IHAVE digests, and
+/// convergence is guaranteed by the repair slice, not by this table.
 #[derive(Clone, Debug)]
 pub struct PeerFrontierTable {
     peer_ids: Box<[Option<NodeId>]>,

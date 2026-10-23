@@ -23,6 +23,7 @@
 
 mod auth;
 mod body;
+mod control;
 mod header;
 
 #[cfg(test)]
@@ -30,7 +31,13 @@ mod tests;
 
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
-pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
+pub use control::{
+    CONTROL_ENTRY_BYTES, ControlEntry, ControlKind, decode_control_auth, decode_control_unauth,
+    encode_control,
+};
+pub use header::{
+    FLAG_AUTHENTICATED, FLAG_MORE, FrameKind, HEADER_LEN, Header, MAGIC, VERSION, frame_kind,
+};
 
 use auth::AUTH_TAG_LEN;
 use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
@@ -108,6 +115,8 @@ pub enum DecodeError {
     AuthenticationFailed,
     #[error("trailing bytes after body")]
     Trailing,
+    #[error("control frame has an unknown kind or a malformed entry list")]
+    BadControl,
 }
 
 // -- send-side buffer -------------------------------------------------------
@@ -252,11 +261,40 @@ impl<'a, C: Count> Packets<'a, C> {
         self.handles.len() - self.cursor
     }
 
+    /// Stop early: give up the handles not yet encoded and return how many
+    /// there were. The explicit way to send part of a frame when the send
+    /// queue is full; dropping an undrained iterator is a bug.
+    pub fn abandon(mut self) -> usize {
+        let unsent = self.remaining();
+        self.cursor = self.handles.len();
+        unsent
+    }
+
     /// Encode the next packet into `buf`. The encoder clears `buf` first.
     ///
     /// - `Ok(Some(p))` — one packet ready; send `buf.as_bytes()`.
     /// - `Ok(None)` — iterator exhausted.
     pub fn next_into(&mut self, buf: &mut PacketBuf) -> Result<Option<PacketWritten>, EncodeError> {
+        self.next_into_inner(buf, None)
+    }
+
+    /// Like [`Self::next_into`], but writes `edge_sequence` into the packet's
+    /// `min_origin_sequence` header field. Eager-push packets carry their
+    /// per-edge sequence number there, so a receiver can see a lost packet as
+    /// a gap and ask for it again.
+    pub fn next_into_numbered(
+        &mut self,
+        buf: &mut PacketBuf,
+        edge_sequence: u64,
+    ) -> Result<Option<PacketWritten>, EncodeError> {
+        self.next_into_inner(buf, Some(edge_sequence))
+    }
+
+    fn next_into_inner(
+        &mut self,
+        buf: &mut PacketBuf,
+        edge_sequence: Option<u64>,
+    ) -> Result<Option<PacketWritten>, EncodeError> {
         buf.inner.clear();
         if self.cursor >= self.handles.len() {
             return Ok(None);
@@ -308,7 +346,7 @@ impl<'a, C: Count> Packets<'a, C> {
         packet_header.count_width = std::mem::size_of::<C>() as u32;
         packet_header.cell_count = encoded.cells_emitted;
         packet_header.body_len = encoded.body_len as u32;
-        packet_header.min_origin_sequence = encoded.min_origin_sequence;
+        packet_header.min_origin_sequence = edge_sequence.unwrap_or(encoded.min_origin_sequence);
         packet_header.max_origin_sequence = encoded.max_origin_sequence;
 
         patch_header(&mut buf.inner[..HEADER_LEN], &packet_header);
@@ -373,6 +411,7 @@ fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
         incarnation: cell.origin_incarnation,
         count: cell.count,
         last_update_millis: cell.last_update_millis,
+        origin_sequence: cell.origin_sequence,
     }
 }
 

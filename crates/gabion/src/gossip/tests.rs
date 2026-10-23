@@ -728,7 +728,10 @@ fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) 
                 .unwrap();
         }
 
-        sim_advance_ticks(Duration::from_millis(100), 8).await;
+        // A relay round does not expire first, so it can hand a node a cell
+        // that has just aged out; the next tick drops it. Run past
+        // that.
+        sim_advance_ticks(Duration::from_millis(100), 12).await;
         let expired_everywhere = aggregates.iter().all(|agg| agg.snapshot().is_empty());
 
         for client in clients {
@@ -1343,14 +1346,12 @@ async fn partition_then_heal() {
         .await;
 }
 
-// -- peer sampling without replacement -------------------------------------
+// -- small clusters: the view is every peer ---------------------------------
 
-/// Three peers, `fanout = 3` ⇒ a single tick must hit every peer exactly
-/// once. Without-replacement sampling is required for Demers' O(log N)
-/// convergence bound; with-replacement would let a tick visit some peer
-/// twice and skip another entirely.
+/// Three peers, all in the active view and eager for the origin's tree: the
+/// first round after a record must reach every one of them.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn gossip_tick_picks_peers_without_replacement() {
+async fn small_cluster_view_reaches_every_peer() {
     let local = LocalSet::new();
     local
         .run_until(async {
@@ -1374,7 +1375,7 @@ async fn gossip_tick_picks_peers_without_replacement() {
             let agg_c = Rc::new(InMemoryAggregateStore::<u32>::new());
             let agg_d = Rc::new(InMemoryAggregateStore::<u32>::new());
 
-            // A talks to B, C, D with fanout=3 — every tick must hit each.
+            // A talks to B, C, D: a view this small holds all three.
             let mut cfg_a = sim_config(id_a, vec![addr_b, addr_c, addr_d], 0xBAD_5EED);
             cfg_a.fanout = 3;
             let (rt_a, client_a) = GossipRuntime::from_parts(
@@ -1421,10 +1422,8 @@ async fn gossip_tick_picks_peers_without_replacement() {
                 .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
                 .await
                 .unwrap();
-            // With fanout = peer_count, every peer must receive the cell on
-            // the first tick that fires after the record. Without-replacement
-            // sampling is the invariant under test; with-replacement would
-            // leave at least one peer empty whenever the tick double-picks.
+            // The view holds every peer, all eager for A's tree, so each one
+            // receives the cell on the first round after the record.
             sim_advance_ticks(Duration::from_millis(100), 20).await;
 
             let got_b = agg_b.total();
@@ -1444,13 +1443,12 @@ async fn gossip_tick_picks_peers_without_replacement() {
         .await;
 }
 
-// -- coverage fanout: ⌈ln(n)+c⌉, scaled by cluster size --------------------
+// -- active view: ⌈ln(n)+c⌉, scaled by cluster size -------------------------
 
-/// Drive a single node against a sweep of bootstrap-peer counts and read
-/// the chosen per-tick fanout back through the admin snapshot. The pick is
-/// the coverage threshold `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`
-/// (Kermarrec, Massoulié & Ganesh, TPDS 2003, Thm 1) — a function of the
-/// peer count, *not* the dirty set. Covers the `n=1` floor-clip edge
+/// Drive a single node against a sweep of bootstrap-peer counts and read the
+/// peers it pushes to back through the admin snapshot. A fresh node is eager
+/// to its whole active view, whose size is `⌈ln(peers) + c⌉.min(peers)` — a
+/// function of the peer count, *not* the dirty set. Covers the `n=1` edge
 /// (`⌈0+c⌉` clamped to 1) and a 255-peer large cluster.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn coverage_fanout_tracks_ln_n_plus_c() {
@@ -1476,10 +1474,9 @@ async fn coverage_fanout_tracks_ln_n_plus_c() {
 
 /// Build one node with `peers` unbound bootstrap addresses, give it a cell
 /// to gossip, and return the `last_effective_fanout` it records on the next
-/// dirty tick. The peers need not run: the sim transport treats a send to an
-/// unbound address as delivered on the floor (UDP semantics), and the runtime
-/// records `last_effective_fanout` from the computed pick *before* any send,
-/// so the addresses serve only to set `self.peers.len()`.
+/// round that pushes. The peers need not run: the sim transport treats a send
+/// to an unbound address as delivered on the floor (UDP semantics), so the
+/// addresses serve only to set `self.peers.len()`.
 async fn observe_coverage_fanout(peers: usize, base: usize) -> usize {
     use tokio::sync::mpsc;
 
@@ -1667,7 +1664,11 @@ async fn admin_snapshot_reflects_runtime_state() {
             assert_eq!(snapshot.peers[0].addr, sock(40_301));
             assert!(snapshot.peers[0].node_id.is_none());
             assert!(snapshot.store_stats.active_cells >= 1);
-            assert!(snapshot.local_dirty_len >= 1);
+            // The first heartbeat pushed the record to the one peer, so its
+            // queue is empty again.
+            assert_eq!(snapshot.local_dirty_len, 0);
+            assert_eq!(snapshot.dirty_ticks, 1);
+            assert_eq!(snapshot.last_effective_fanout, 1);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;
@@ -1823,118 +1824,6 @@ fn quickcheck_peer_slot_pairing_holds_across_lifecycle(case: PairingCase) -> Tes
     })
 }
 
-// -- Gap 2: without-replacement sampling distribution -----------------------
-
-#[derive(Clone, Debug)]
-struct SamplingCase {
-    seed: u64,
-}
-
-impl Arbitrary for SamplingCase {
-    fn arbitrary(g: &mut Gen) -> Self {
-        Self {
-            seed: u64::arbitrary(g),
-        }
-    }
-}
-
-/// Per-peer delivery counts under strict-fanout sampling should be roughly
-/// uniform. The existing `gossip_tick_picks_peers_without_replacement` uses
-/// `fanout == peer_count` so even a degenerate sampler (always picks peer 0)
-/// passes — every peer ends up picked at least once per tick anyway. This
-/// case keeps the effective pick strictly below the peer count so a broken
-/// sampler concentrates all deliveries on a few peers and starves the rest.
-/// The effective pick is the coverage fanout `⌈ln(8) + c⌉ = 7` (which
-/// overrides the lower configured floor), still 7 of 8 peers per tick.
-#[quickcheck]
-fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
-    case: SamplingCase,
-) -> TestResult {
-    run_paused(async move {
-        const PEERS: usize = 8;
-        const FANOUT: usize = 4;
-        const TICKS: u32 = 100;
-        let router = SimRouter::with_channel_capacity(128);
-        let sender_addr = sock(49_000);
-        let peer_addrs: Vec<SocketAddr> = (0..PEERS).map(|i| sock(49_001 + i as u16)).collect();
-
-        let id_sender = NodeIdentity::new(NodeId(0xB000), 1);
-        let mut cfg_sender = sim_config(id_sender, peer_addrs.clone(), case.seed);
-        cfg_sender.fanout = FANOUT;
-        let agg_sender = Rc::new(InMemoryAggregateStore::<u32>::new());
-        let (rt_sender, client_sender) = GossipRuntime::from_parts(
-            router.bind(sender_addr),
-            TokioClock::from_millis(0),
-            cfg_sender,
-            store_for(id_sender),
-            agg_sender,
-        );
-        let h_sender = tokio::task::spawn_local(rt_sender.run(futures::stream::empty()));
-
-        // Silent recipients — they receive but don't emit gossip themselves
-        // (their stores are empty, so `handle_gossip_tick` early-returns).
-        // We hold the clients to keep their request channels alive.
-        let mut peer_clients = Vec::with_capacity(PEERS);
-        let mut peer_handles = Vec::with_capacity(PEERS);
-        for (i, addr) in peer_addrs.iter().enumerate() {
-            let id = NodeIdentity::new(NodeId(0xB100 + i as u128), 1);
-            let cfg = sim_config(id, Vec::new(), 1000 + i as u64);
-            let (rt, client) = GossipRuntime::from_parts(
-                router.bind(*addr),
-                TokioClock::from_millis(0),
-                cfg,
-                store_for(id),
-                Rc::new(InMemoryAggregateStore::<u32>::new()),
-            );
-            peer_handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-            peer_clients.push(client);
-        }
-
-        // One record so the sender has dirty data to gossip every tick.
-        client_sender
-            .record(0xB055, KeyHash(1), 0, 1, 0, 0)
-            .await
-            .unwrap();
-
-        sim_advance_ticks(Duration::from_millis(100), TICKS).await;
-
-        let counts: Vec<u64> = peer_addrs
-            .iter()
-            .map(|addr| router.received_count(*addr))
-            .collect();
-        let total: u64 = counts.iter().sum();
-        // The runtime scales the per-tick pick to the coverage fanout
-        // `⌈ln(PEERS) + c⌉`, which exceeds the configured `FANOUT` floor —
-        // so the expected per-peer mean is driven by the effective pick, not
-        // by `FANOUT`. Still strictly below `PEERS`, so a broken sampler
-        // starves the unpicked peers.
-        let coverage =
-            ((PEERS as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-        let effective = FANOUT.max(coverage).min(PEERS);
-        let expected = (TICKS as u64) * (effective as u64) / (PEERS as u64);
-        let lower = expected / 2;
-        let upper = expected * 2;
-        let uniform = counts.iter().all(|&c| c >= lower && c <= upper);
-        if !uniform {
-            eprintln!(
-                "non-uniform sampling distribution: seed={}, counts={:?}, total={}, \
-                 expected_per_peer={}, bound=[{},{}]",
-                case.seed, counts, total, expected, lower, upper
-            );
-        }
-
-        client_sender.shutdown().await.unwrap();
-        for client in peer_clients {
-            let _ = client.shutdown().await;
-        }
-        let _ = h_sender.await;
-        for handle in peer_handles {
-            let _ = handle.await;
-        }
-        TestResult::from_bool(uniform)
-    })
-}
-
 // -- Gap 3: decode rejection counter ----------------------------------------
 
 /// Mismatched auth keys cause every inbound frame to fail decode. The
@@ -1981,9 +1870,9 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            // One record on A. Each tick re-encodes A's dirty cell into a
-            // packet for its only peer (B). B rejects each packet because
-            // the auth keys don't match.
+            // One record on A. A pushes it to its only peer (B) once, and each
+            // heartbeat's repair slice carries it again. B rejects every
+            // packet because the auth keys don't match.
             client_a
                 .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
                 .await
@@ -2003,7 +1892,7 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
                 TICKS
             );
             assert!(
-                snap.decode_reject_count <= (TICKS as u64) + 1,
+                snap.decode_reject_count <= (TICKS as u64) + 2,
                 "decode_reject_count too high: {} (after {} ticks)",
                 snap.decode_reject_count,
                 TICKS
