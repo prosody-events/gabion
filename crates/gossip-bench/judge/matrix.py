@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Run the study harness across regimes x seeds for the checked-out solution.
 
-Builds `gossip-bench` (release, `--no-default-features`), runs
-`gossip-bench study run` for every (regime, seed) pair with `--jobs`
+Builds `gossip-bench` (release, `--no-default-features`), copies the binary
+cargo reports for that build to a private directory under `--out` (so a
+concurrent build in another worktree cannot replace it mid-run, and a stale
+binary cannot be stamped), runs `gossip-bench study run` for every (regime, seed) pair with `--jobs`
 parallelism, and writes one stamped result per run to
 `<out>/<solution>/<regime>/seed-<n>.json`. A run whose output already exists
 with the same clean stamp (harness tree hash, solution label, branch and
@@ -26,8 +28,10 @@ import concurrent.futures
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -63,13 +67,27 @@ def stamp_for(repo: Path, solution: str, allow_dirty: bool) -> dict:
 
 
 def build(repo: Path) -> Path:
-    subprocess.run(
-        ["cargo", "build", "--release", "-p", "gossip-bench", "--no-default-features"],
-        cwd=repo,
-        check=True,
+    """Build the study binary and return the path cargo reports for it."""
+    proc = subprocess.run(
+        ["cargo", "build", "--release", "-p", "gossip-bench", "--no-default-features",
+         "--message-format=json-render-diagnostics"],
+        cwd=repo, check=True, stdout=subprocess.PIPE, text=True,
     )
-    target = Path(os.environ.get("CARGO_TARGET_DIR", repo / "target"))
-    return target / "release" / "gossip-bench"
+    return executable_from(proc.stdout)
+
+
+def executable_from(cargo_messages: str) -> Path:
+    """The `gossip-bench` binary named by cargo's `compiler-artifact` message."""
+    for line in cargo_messages.splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        target = message.get("target") or {}
+        if (message.get("reason") == "compiler-artifact" and message.get("executable")
+                and target.get("name") == "gossip-bench" and "bin" in target.get("kind", [])):
+            return Path(message["executable"])
+    sys.exit("error: cargo reported no gossip-bench executable for this build.")
 
 
 def regimes(repo: Path, names: str) -> list[Path]:
@@ -168,8 +186,16 @@ def main() -> None:
     stamp = stamp_for(repo, args.solution, args.allow_dirty)
     # Always build: cargo is a no-op when the binary is current, and reusing a
     # prebuilt binary would stamp old code's numbers with the current commit.
-    binary = build(repo)
+    built = build(repo)
+    args.out.mkdir(parents=True, exist_ok=True)
+    # Run a private copy: another matrix building in a shared target directory
+    # cannot replace the binary under this one mid-run.
+    with tempfile.TemporaryDirectory(prefix=".bin-", dir=args.out) as scratch:
+        binary = Path(shutil.copy2(built, Path(scratch) / built.name))
+        run_matrix(args, repo, stamp, binary)
 
+
+def run_matrix(args: argparse.Namespace, repo: Path, stamp: dict, binary: Path) -> None:
     todo = []
     for regime in regimes(repo, args.regimes):
         for seed in seeds(args.seeds):

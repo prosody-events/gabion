@@ -47,3 +47,27 @@ pub fn quiet(nodes: u32) -> Regime {
     regime.validate().expect("fixture regime is valid");
     regime
 }
+
+/// Six pods with availability zone 0 cut off from `14 s` to `30 s`, longer
+/// than the 10 s window, so hits admitted early in the cut expire unrepaired.
+pub fn partitioned() -> Regime {
+    let regime: Regime = serde_json::from_value(serde_json::json!({
+        "id": "partitioned",
+        "description": "test fixture",
+        "duration_s": 60,
+        "warmup_s": 5,
+        "nodes": 6,
+        "rule": { "limit": 50, "window_ms": 10000, "bucket_ms": 1000 },
+        "traffic": {
+            "site_rate_rps": 10,
+            "site_period_ms": 2000,
+            "site_jitter": 0.5,
+            "hot_keys": [{ "limit_multiple": 2.0 }]
+        },
+        "churn": { "partitions": [{ "at_s": 14, "heal_s": 30, "az": 0 }] },
+        "tracked_sample_keys": 10
+    }))
+    .expect("fixture regime parses");
+    regime.validate().expect("fixture regime is valid");
+    regime
+}

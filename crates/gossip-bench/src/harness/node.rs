@@ -17,7 +17,9 @@ use gabion::crdt::{
     BucketEpoch, CellStore, CellStoreConfig, DeltaSink, ExpirationSink, KeyHash, NodeId,
     NodeIdentity, RuleDescriptor,
 };
-use gabion::gossip::{AdminCommand, AggregateStore, GossipClient, GossipError, GossipRuntime};
+use gabion::gossip::{
+    AdminCommand, AggregateStore, GossipClient, GossipError, GossipRuntime, GossipTransport,
+};
 use gabion::rules::{Descriptor, DescriptorPattern, EnforcementMode, Rule, hash_key};
 use gabion_server::config::GossipSettings;
 use serde::Serialize;
@@ -401,6 +403,24 @@ pub fn launch_node(
     idx: usize,
     seed: u64,
 ) -> Result<Launched<impl Future<Output = Result<(), GossipError>> + use<>>> {
+    let socket = SimSocket {
+        world: Rc::clone(world),
+        idx,
+        addr: node_addr(idx),
+    };
+    launch_on(socket, world, keys, cells, idx, seed)
+}
+
+/// [`launch_node`] over `transport`, a wrapper of the node's [`SimSocket`]
+/// when a test needs to observe what the node sends.
+pub fn launch_on<T: GossipTransport>(
+    transport: T,
+    world: &Rc<World>,
+    keys: &Rc<KeySpace>,
+    cells: CellStoreConfig,
+    idx: usize,
+    seed: u64,
+) -> Result<Launched<impl Future<Output = Result<(), GossipError>> + use<T>>> {
     let identity = node_identity(idx);
     let rng_seed = Rng::stream(seed, Stream::Gossip, idx as u64).next_u64();
     let config = GossipSettings::default().into_runtime_config(identity, rng_seed);
@@ -411,11 +431,7 @@ pub fn launch_node(
     let store = Rc::new(NodeStore::new(Rc::clone(keys)));
     let (admin, admin_rx) = mpsc::channel(4);
     let (runtime, client) = GossipRuntime::from_parts_with_admin(
-        SimSocket {
-            world: Rc::clone(world),
-            idx,
-            addr: node_addr(idx),
-        },
+        transport,
         SimClock {
             world: Rc::clone(world),
         },

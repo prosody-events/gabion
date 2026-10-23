@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::net::Network;
 use super::node::{KeySpace, Launched, NodeStore, Sizing};
 use super::oracle::{Class, Oracle};
+use super::phases::{HEAL_PROBE_NS, Schedule};
 use super::plan::{NS_PER_MS, NS_PER_S, Plan, PlanEvent, node_addr};
 use super::regime::Regime;
 use super::report::{
@@ -67,6 +68,7 @@ pub struct Driver<'r, F, L> {
     rotation: Vec<usize>,
     processes: Vec<KeyProcess>,
     oracle: Oracle,
+    partition: Option<Schedule>,
     measure_from_ns: u64,
     end_ns: u64,
     traffic_run: TrafficCounts,
@@ -97,7 +99,15 @@ where
         let n = plan.nodes.len();
         let measure_from_ns = regime.warmup_s * NS_PER_S;
         let processes = KeyProcess::for_regime(regime, &keys.kinds, seed);
+        let partition = Schedule::of(regime);
         let oracle = Oracle::new(Rc::clone(&keys), n, measure_from_ns);
+        let oracle = match partition {
+            Some(schedule) => {
+                let sides = plan.nodes.iter().map(|p| schedule.side(p.az)).collect();
+                oracle.with_partition(schedule, sides)
+            }
+            None => oracle,
+        };
         let key_traffic = vec![TrafficCounts::default(); keys.len()];
         Self {
             regime,
@@ -112,6 +122,7 @@ where
             rotation: Vec::new(),
             processes,
             oracle,
+            partition,
             measure_from_ns,
             end_ns: regime.duration_s * NS_PER_S,
             traffic_run: TrafficCounts::default(),
@@ -175,6 +186,9 @@ where
             .schedule(RESIDUAL_PHASE_NS, Event::ResidualSample);
         self.world
             .schedule(SNAPSHOT_PHASE_NS, Event::HealthSnapshot);
+        if let Some(schedule) = self.partition {
+            self.world.schedule(schedule.heal_ns, Event::HealSample);
+        }
     }
 
     fn handle(&mut self, event: Event) -> Result<()> {
@@ -212,6 +226,11 @@ where
                 }
                 self.world
                     .schedule(now + RESIDUAL_PERIOD_NS, Event::ResidualSample);
+            }
+            Event::HealSample => {
+                if !self.oracle.heal_sample(now, self.world.now_millis()) {
+                    self.world.schedule(now + HEAL_PROBE_NS, Event::HealSample);
+                }
             }
             Event::HealthSnapshot => {
                 for v in 0..self.plan.nodes.len() {
@@ -380,7 +399,7 @@ where
             return;
         }
         self.count(k, measuring, |c| c.admitted += 1);
-        self.oracle.admitted(key, bucket, now);
+        self.oracle.admitted(key, bucket, now, v);
         self.record(v, key, bucket, now_millis);
     }
 
@@ -494,6 +513,7 @@ where
             self.oracle.pending(),
         );
         let churn = ChurnReport::new(std::mem::take(&mut self.oracle.finished_joiners));
+        let partition = self.oracle.partition_report(limit);
 
         StudyResult {
             schema: SCHEMA,
@@ -520,6 +540,7 @@ where
             convergence,
             accuracy,
             churn,
+            partition,
             health: self.health,
             sim: SimStats {
                 virtual_s: end as f64 / 1e9,

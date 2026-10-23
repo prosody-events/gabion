@@ -33,6 +33,8 @@ pub struct StudyResult {
     pub convergence: ConvergenceReport,
     pub accuracy: Vec<KeyAccuracy>,
     pub churn: ChurnReport,
+    /// Per-phase metrics of the regime's network partition, if it has one.
+    pub partition: Option<PartitionReport>,
     pub health: Health,
     pub sim: SimStats,
 }
@@ -264,6 +266,53 @@ impl ChurnReport {
             undercount_hit_s_total,
         }
     }
+}
+
+/// Metrics of a regime with a network partition, by phase: before the cut,
+/// during it, and after the heal (see `phases.rs`).
+#[derive(Debug, Serialize)]
+pub struct PartitionReport {
+    /// The availability zone that was cut off.
+    pub zone_az: u8,
+    pub at_s: u64,
+    pub heal_s: u64,
+    pub before: PhaseReport,
+    pub during: PhaseReport,
+    pub after: PhaseReport,
+    /// Mean hits missing per (pod, tracked key) at the heal instant, over
+    /// buckets that closed before it: the repair the solution owes.
+    pub deficit_at_heal_hits: Option<f64>,
+    /// From the heal until no pod that ran at the heal misses a hit of a
+    /// bucket that closed before it and is still in the window. `None` when
+    /// the run ended first.
+    pub time_to_heal_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PhaseReport {
+    pub convergence: SideConvergence,
+    pub staleness: SideStaleness,
+}
+
+/// Convergence of hits admitted in a phase, by whether the pods that must
+/// cover them share the origin's side of the cut.
+#[derive(Debug, Serialize)]
+pub struct SideConvergence {
+    pub same_side: ConvergenceReport,
+    pub cross_side: ConvergenceReport,
+}
+
+/// Staleness of the pods inside the cut zone and of the rest.
+#[derive(Debug, Serialize)]
+pub struct SideStaleness {
+    pub in_zone: ObserverStaleness,
+    pub rest: ObserverStaleness,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ObserverStaleness {
+    pub limited: Dist,
+    pub sampled: Dist,
 }
 
 /// Health invariants. Any of `cell_store_full_rejects`,

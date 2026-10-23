@@ -21,7 +21,9 @@ use gabion::crdt::BucketEpoch;
 use serde::Serialize;
 
 use super::node::{KeyKind, KeySpace, NodeStore, Slot, ring_window_total};
+use super::phases::{PhaseStats, Schedule};
 use super::plan::NS_PER_MS;
+use super::report::PartitionReport;
 
 pub const RESIDUAL_AGE_MS: u64 = 1_500;
 
@@ -105,14 +107,34 @@ impl WeightedHist {
     }
 }
 
+/// One admitted hit: when, and on which side of the partition (always 0
+/// without one) its pod sits.
+#[derive(Clone, Copy, Debug)]
+struct Admit {
+    at_ns: u64,
+    origin: u8,
+}
+
 /// Admissions of one tracked key in one bucket, and how far convergence has
-/// got through them. `admits[j]` produced truth count `j + 1`.
+/// got through them. `admits[j]` produced truth count `j + 1`. Observers
+/// are split into [`GROUPS`] by side of the partition, and `covered[g]` is
+/// the number of leading admissions every running pod of group `g` has
+/// reached; a hit has converged once every group in use covers it.
 #[derive(Clone, Debug, Default)]
 struct ConvSlot {
     bucket: BucketEpoch,
-    admits: Vec<u64>,
-    converged: usize,
+    admits: Vec<Admit>,
+    covered: [usize; GROUPS],
 }
+
+impl ConvSlot {
+    fn converged(&self, groups: usize) -> usize {
+        self.covered[..groups].iter().copied().min().unwrap_or(0)
+    }
+}
+
+/// Observer groups: one, or two (either side of a partition).
+const GROUPS: usize = 2;
 
 /// A pod that joined after the start, followed for one window.
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -193,6 +215,13 @@ pub struct Oracle {
     conv: Vec<ConvSlot>,
     bucket_view: Vec<u32>,
     alive: Vec<bool>,
+    /// Running pods per observer group.
+    alive_in: [usize; GROUPS],
+    /// Observer group of each pod, and how many groups are in use.
+    side: Vec<u8>,
+    groups: usize,
+    /// Per-phase metrics, when the regime schedules a partition.
+    phases: Option<PhaseStats>,
     started_ns: Vec<u64>,
     joiners: Vec<Option<Joiner>>,
     pub finished_joiners: Vec<Joiner>,
@@ -234,6 +263,10 @@ impl Oracle {
             conv: vec![ConvSlot::default(); tracked * ring],
             bucket_view: vec![0; tracked * ring * nodes],
             alive: vec![false; nodes],
+            alive_in: [0; GROUPS],
+            side: vec![0; nodes],
+            groups: 1,
+            phases: None,
             started_ns: vec![0; nodes],
             joiners: vec![None; nodes],
             finished_joiners: Vec::new(),
@@ -249,6 +282,15 @@ impl Oracle {
             nodes,
             measure_from_ns,
         }
+    }
+
+    /// Also score the phases of `schedule`'s partition; `sides[v]` is pod
+    /// `v`'s side ([`Schedule::side`]).
+    pub fn with_partition(mut self, schedule: Schedule, sides: Vec<u8>) -> Self {
+        self.side = sides;
+        self.groups = GROUPS;
+        self.phases = Some(PhaseStats::new(schedule));
+        self
     }
 
     fn ring(&self) -> usize {
@@ -269,7 +311,11 @@ impl Oracle {
         let old = self.err[i];
         let from = self.since_ns[i].max(self.measure_from_ns);
         if now_ns > from {
-            self.staleness[self.class[t] as usize].add(old, now_ns - from);
+            let class = self.class[t] as usize;
+            self.staleness[class].add(old, now_ns - from);
+            if let Some(phases) = self.phases.as_mut() {
+                phases.add_staleness(class, self.side[v], old, from, now_ns);
+            }
         }
         self.since_ns[i] = now_ns;
         self.err[i] = value;
@@ -292,6 +338,7 @@ impl Oracle {
 
     pub fn node_started(&mut self, v: usize, now_ns: u64, joined: bool) {
         self.alive[v] = true;
+        self.alive_in[self.side[v] as usize] += 1;
         self.started_ns[v] = now_ns;
         for s in 0..self.conv.len() {
             self.bucket_view[s * self.nodes + v] = 0;
@@ -337,13 +384,16 @@ impl Oracle {
             self.established_count -= 1;
         }
         self.alive[v] = false;
+        self.alive_in[self.side[v] as usize] -= 1;
         for i in 0..self.conv.len() {
-            self.advance(i, now_ns);
+            for g in 0..self.groups {
+                self.advance(i, g, now_ns);
+            }
         }
     }
 
-    /// A hit for `key` in `bucket` was admitted somewhere in the cluster.
-    pub fn admitted(&mut self, key: u32, bucket: BucketEpoch, now_ns: u64) {
+    /// A hit for `key` in `bucket` was admitted by pod `origin`.
+    pub fn admitted(&mut self, key: u32, bucket: BucketEpoch, now_ns: u64, origin: usize) {
         let slot = key as usize * self.ring() + (bucket % self.keys.ring_len) as usize;
         self.truth[slot].add(bucket, 1);
         let t = self.keys.tracked_of[key as usize];
@@ -358,7 +408,16 @@ impl Oracle {
             self.retire(c, now_ns);
             self.conv[c].bucket = bucket;
         }
-        self.conv[c].admits.push(now_ns);
+        self.conv[c].admits.push(Admit {
+            at_ns: now_ns,
+            origin: self.side[origin],
+        });
+        // A group with no running pod covers the hit vacuously.
+        for g in 0..self.groups {
+            if self.alive_in[g] == 0 {
+                self.advance(c, g, now_ns);
+            }
+        }
         for v in 0..self.nodes {
             if self.alive[v] {
                 let value = self.truth_window[t] - self.view[t * self.nodes + v];
@@ -390,8 +449,9 @@ impl Oracle {
         if self.conv[c].bucket == bucket {
             let cell = c * self.nodes + v;
             self.bucket_view[cell] = bucket_count;
-            if bucket_count as usize > self.conv[c].converged {
-                self.advance(c, now_ns);
+            let group = self.side[v] as usize;
+            if bucket_count as usize > self.conv[c].covered[group] {
+                self.advance(c, group, now_ns);
             }
         }
         self.view[t * self.nodes + v] = window_total as i64;
@@ -399,27 +459,37 @@ impl Oracle {
         self.set_err(t, v, value, now_ns);
     }
 
-    /// Record convergence for every admission of slot `c` that every
-    /// required node now covers. Convergence is monotone in admission
-    /// order: covering count `j + 1` implies covering `j`.
-    fn advance(&mut self, c: usize, now_ns: u64) {
+    /// Record, for every admission of slot `c` that every running pod of
+    /// `group` now covers, the time the group took; and the time the whole
+    /// cluster took, once the last group has. Convergence is monotone in
+    /// admission order: covering count `j + 1` implies covering `j`.
+    fn advance(&mut self, c: usize, group: usize, now_ns: u64) {
         let base = c * self.nodes;
-        while self.conv[c].converged < self.conv[c].admits.len() {
-            let j = self.conv[c].converged;
-            let admitted_ns = self.conv[c].admits[j];
+        while self.conv[c].covered[group] < self.conv[c].admits.len() {
+            let j = self.conv[c].covered[group];
+            let admit = self.conv[c].admits[j];
             let need = j as u32 + 1;
             let lagging = (0..self.nodes).any(|v| {
-                self.alive[v]
-                    && self.started_ns[v] <= admitted_ns
+                self.side[v] as usize == group
+                    && self.alive[v]
+                    && self.started_ns[v] <= admit.at_ns
                     && self.bucket_view[base + v] < need
             });
             if lagging {
                 return;
             }
-            if admitted_ns >= self.measure_from_ns {
-                self.convergence_ns.push(now_ns - admitted_ns);
+            self.conv[c].covered[group] += 1;
+            if admit.at_ns < self.measure_from_ns {
+                continue;
             }
-            self.conv[c].converged += 1;
+            let latency_ns = now_ns - admit.at_ns;
+            // A group with no running pod covers vacuously: no sample.
+            if let Some(phases) = self.phases.as_mut().filter(|_| self.alive_in[group] > 0) {
+                phases.converged(admit.at_ns, admit.origin, group, latency_ns);
+            }
+            if self.conv[c].covered[..self.groups].iter().all(|&n| n > j) {
+                self.convergence_ns.push(latency_ns);
+            }
         }
     }
 
@@ -429,13 +499,23 @@ impl Oracle {
         let slot = &mut self.conv[c];
         let from = self.measure_from_ns;
         self.censored_ns.extend(
-            slot.admits[slot.converged..]
+            slot.admits[slot.converged(self.groups)..]
                 .iter()
-                .filter(|&&t| t >= from)
-                .map(|&t| now_ns - t),
+                .filter(|a| a.at_ns >= from)
+                .map(|a| now_ns - a.at_ns),
         );
+        if let Some(phases) = self.phases.as_mut() {
+            for g in 0..self.groups {
+                for a in slot.admits[slot.covered[g]..]
+                    .iter()
+                    .filter(|a| a.at_ns >= from)
+                {
+                    phases.censored(a.at_ns, a.origin, g, now_ns - a.at_ns);
+                }
+            }
+        }
         slot.admits.clear();
-        slot.converged = 0;
+        slot.covered = [0; GROUPS];
         let base = c * self.nodes;
         self.bucket_view[base..base + self.nodes].fill(0);
     }
@@ -446,9 +526,9 @@ impl Oracle {
         self.conv
             .iter()
             .map(|s| {
-                s.admits[s.converged..]
+                s.admits[s.converged(self.groups)..]
                     .iter()
-                    .filter(|&&t| t >= self.measure_from_ns)
+                    .filter(|a| a.at_ns >= self.measure_from_ns)
                     .count() as u64
             })
             .sum()
@@ -550,6 +630,62 @@ impl Oracle {
         }
     }
 
+    /// Hits of buckets that closed before the partition healed and are
+    /// still in the window, which some pod that ran at the heal has not yet
+    /// reached: `(missing hits summed over pods and tracked keys, pairs)`.
+    /// Zero missing means every cross-cut count is repaired (tolerance: none).
+    fn heal_deficit(&self, schedule: Schedule, now_ns: u64, now_millis: u64) -> (u64, u64) {
+        // `now_ns` is at or after the heal, so the heal's millisecond is
+        // exactly `(now_ns - heal_ns)` earlier than `now_millis`.
+        let heal_millis = now_millis - (now_ns - schedule.heal_ns) / NS_PER_MS;
+        let Some(last) = self.keys.bucket_of(heal_millis).checked_sub(1) else {
+            return (0, 0);
+        };
+        let oldest = self
+            .keys
+            .bucket_of(now_millis)
+            .saturating_sub(self.keys.live_buckets - 1);
+        let pods: Vec<usize> = (0..self.nodes)
+            .filter(|&v| self.alive[v] && self.started_ns[v] <= schedule.heal_ns)
+            .collect();
+        let mut missing = 0;
+        for t in 0..self.truth_window.len() {
+            let key = self.keys.tracked[t] as usize;
+            for b in oldest..=last {
+                let truth =
+                    self.truth[key * self.ring() + (b % self.keys.ring_len) as usize].count_for(b);
+                let c = self.conv_index(t, b);
+                if truth == 0 || self.conv[c].bucket != b {
+                    continue;
+                }
+                missing += pods
+                    .iter()
+                    .map(|&v| u64::from(truth.saturating_sub(self.bucket_view[c * self.nodes + v])))
+                    .sum::<u64>();
+            }
+        }
+        (missing, (pods.len() * self.truth_window.len()) as u64)
+    }
+
+    /// Probe the partition's repair at `now_ns` (at or after the heal).
+    /// Returns `true` once nothing is missing, after which the driver stops
+    /// probing.
+    pub fn heal_sample(&mut self, now_ns: u64, now_millis: u64) -> bool {
+        let Some(schedule) = self.phases.as_ref().map(PhaseStats::schedule) else {
+            return true;
+        };
+        let (missing, pairs) = self.heal_deficit(schedule, now_ns, now_millis);
+        if let Some(phases) = self.phases.as_mut() {
+            phases.healed(now_ns, missing, pairs);
+        }
+        missing == 0
+    }
+
+    /// The per-phase report, when the regime has a partition.
+    pub fn partition_report(&mut self, limit: u64) -> Option<PartitionReport> {
+        self.phases.as_mut().map(|p| p.report(limit))
+    }
+
     /// Close every open interval at `end_ns`.
     pub fn finish(&mut self, end_ns: u64) {
         for v in 0..self.nodes {
@@ -566,6 +702,18 @@ impl Oracle {
             }
         }
         self.finished_joiners.sort_by_key(|j| j.join_ns);
+        if let Some(phases) = self.phases.as_mut() {
+            for slot in &self.conv {
+                for g in 0..self.groups {
+                    for a in slot.admits[slot.covered[g]..]
+                        .iter()
+                        .filter(|a| a.at_ns >= self.measure_from_ns)
+                    {
+                        phases.pending(a.at_ns, a.origin, g);
+                    }
+                }
+            }
+        }
     }
 }
 

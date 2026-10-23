@@ -46,6 +46,8 @@ pub enum Event {
     BucketBoundary,
     ResidualSample,
     HealthSnapshot,
+    /// Probe how much of the partition's damage is still unrepaired.
+    HealSample,
 }
 
 struct Entry {

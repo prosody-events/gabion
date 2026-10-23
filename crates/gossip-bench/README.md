@@ -137,8 +137,11 @@ python3 crates/gossip-bench/judge/judge.py ../study-results --baseline main \
 the harness tree hash (`git rev-parse HEAD:crates/gossip-bench`), the
 solution label, branch and commit, plus the process's wall time, CPU time
 and peak RSS from `wait4` (host-dependent; everything else is not). It always
-builds the release binary first (a no-op when current), so a result can
-never carry numbers from a binary older than its stamped commit. It
+builds the release binary first (a no-op when current), takes the binary's
+path from cargo's own report of that build, and runs a private copy under
+`--out`, so a result can never carry numbers from a binary older than its
+stamped commit and a matrix building in another worktree cannot replace the
+binary under a running one. It
 refuses to run when the worktree has uncommitted changes (`--allow-dirty`
 overrides, and the judge then rejects the results), and resumes only over
 results with an identical clean stamp. The judge refuses mixed harness
@@ -147,14 +150,18 @@ under one solution label, and writes
 `summary.md` and `summary.csv` (every metric per regime and solution: mean
 across valid seeds, 95 % Student-t confidence half-width, min–max, ratio to
 the baseline over the seeds valid for both, and in the CSV the paired
-difference with its confidence half-width), `pareto.md` (total bytes against
-limited-key p99 staleness, worst-key over-admission, and p99 convergence
-including never-converged hits, each point a mean over the seeds valid for
-every solution in that table), `flags.md` (non-invalidating saturation and
+difference with its confidence half-width; regimes that cut the network get a
+second table of [partition phases](#metrics)), `pareto.md` (total bytes
+against limited-key p99 staleness, worst-key over-admission, and p99
+convergence including never-converged hits, each point a mean over the seeds
+valid for every solution in that table; when no seed is valid for every
+solution the points are listed without a front, and a metric no solution has
+in that regime, such as hot-key over-admission in `idle`, is marked not
+applicable), `flags.md` (non-invalidating saturation and
 the gabion warnings behind it), and `rejected.md`. A (regime, solution) with
 INVALID seeds shows `INVALID k/n` in every cell rather than silently
 averaging the survivors; one with no valid seed stays in the tables and is
-excluded from the Pareto front with a note. Judge tests:
+excluded from the Pareto tables with a note. Judge tests:
 `python3 -m unittest discover -s crates/gossip-bench/judge`.
 
 Memory is the constraint on `--jobs`: cell-store capacity is allocated up
@@ -316,6 +323,25 @@ All metrics except the whole-run byte totals cover the measurement window
   checked whenever the joiner's error or the truth changes); and its
   integrated summed under-count over the first window after joining
   (hit-seconds).
+- **Partition phases**, for a regime that schedules a partition
+  (`churn.partitions`: one zone cut off from the rest during `[at_s,
+  heal_s)`; the metrics follow that schedule, never the regime's name). The
+  window splits into **before** the cut, **during** it, and **after** the
+  heal, and pods into those inside the cut zone and the rest. Per phase:
+  convergence of the hits admitted in it, as `same_side` (time until every
+  pod on the origin's side covers the hit) and `cross_side` (every pod on the
+  other side), with never-converged hits ranked as in the whole-run figures;
+  and staleness (limited and sampled keys) for observers inside the zone and
+  outside it, time-weighted over the part of each exposure inside the phase.
+  A pod's view is not resolved by origin, so staleness can be split by the
+  observer's side only. **Time to heal** runs from the heal instant until no
+  pod that was running at the heal is missing a hit of any bucket that closed
+  before it and is still in the window: every cross-cut count exact, with no
+  tolerance. It is probed every 100 ms (so quantized to it), counts a hit that
+  expires unrepaired as no longer missing, and is `null` when the run ends
+  first. `deficit_at_heal_hits` is the mean number of hits missing per (pod,
+  tracked key) at the heal instant, the repair the solution owes. Regimes
+  with no partition report `partition: null`.
 - **Health**: cell-store, rule- and node-dictionary full rejects, oversize
   datagrams, decode rejects, runtime exits, failed records, aggregate rows
   for keys the regime never issued, and admin snapshots that failed or a
@@ -348,10 +374,100 @@ burst keys), rule, and the virtual duration (warmup + measurement):
 | `loss-burst` | 183 | as `prod-peak` | as above | 20 + 60 s | Gilbert-Elliott, 5 % mean loss, mean burst 5.3 datagrams |
 | `low-3`, `low-5` | 3 / 5 | 10 req/s sites | 20 / 10 s, 1 s buckets | 20 + 60 s | hot keys at 1.5× and 3× |
 | `idle` | 80 | 1 req/s | 100 / 10 s | 20 + 60 s | protocol floor cost |
-| `churn-rollout` | 80 (90 at most mid-wave; 79 after the crash) | as `prod-typical` | as above | 20 + 90 s | 45-pod rollout from 30 s, one pod every 500 ms + `U(0, 1 s)`, 5 s overlap; silent crash at 75 s |
+| `churn-rollout` | 80 (~92 at most mid-wave; 79 after the crash) | as `prod-typical` | as above | 20 + 90 s | 45-pod rollout from 30 s, one pod every 500 ms + `U(0, 1 s)`, 5 s overlap; silent crash at 75 s |
 | `hot-key` | 183 | 1,800 req/s sites | as above | 20 + 60 s | 20 hot keys, each offered 5x its limit (50 req/s) uniformly across nodes; no burst; stresses over-admission |
 | `az-partition` | 80 | 650 req/s sites | as above | 20 + 90 s | zone 0 isolated from the other two zones for 30 s from 40 s, then healed (data only: `churn.partitions`) |
 | `long-window` | 60 | 30 req/s | 2,000 / 1 h, 1 min buckets | 3,600 + 1,200 s | hot keys; 90 req/s burst for 60 s; first window warmed by real traffic |
+
+### Validation
+
+The simulator is checked against results known independently of gabion's
+protocol (`src/harness/validation/`, run with `cargo nextest run --release -p
+gossip-bench validation --no-capture` to print the figures below). Reference
+nodes, a few lines each, run on the harness's own network model
+(`net.rs`), event queue and single-threaded executor (`world.rs`) through the
+same `SimSocket`, clock and ticker a gabion node uses; the byte-accounting
+check runs a real gabion cluster under the full `Driver`. Seeds are fixed, so
+every run is bit-identical; the whole suite takes about 11 s in release on the
+reference host, 7 s of it the 300-node epidemic. Statistical tolerances are
+4 standard errors (a two-sided band a correct simulator misses about once in
+16,000 checks) unless stated.
+
+**1. Epidemic reach.** Infect-and-forward-once push gossip: the origin sends
+the message to `f` distinct nodes chosen uniformly from the others; every
+node does the same once, on first receipt, and then falls silent (non-integer
+`f` by randomised rounding, so the mean is exact). Kermarrec, Massoulié and
+Ganesh ("Probabilistic Reliable Dissemination in Large-Scale Systems", IEEE
+Trans. Parallel and Distributed Systems 14(3), 2003) show that with `f = ln n
++ c` the probability that every node is reached tends to `exp(-exp(-c))`.
+5,000 independent runs per cell. The limit is asymptotic; the same Poisson
+argument at finite `n` with distinct targets gives `exp(-(n-1)(1 -
+f/(n-1))^(n-1))`, the last column. The harness must match the finite-`n` value
+within 4 standard errors and the limit within 0.05.
+
+| n | c | measured P(all reached) | KMG limit | finite-n | 4 s.e. |
+|---|---|---|---|---|---|
+| 100 | 0 | 0.4038 | 0.3679 | 0.4121 | 0.0278 |
+| 100 | 1 | 0.7300 | 0.6922 | 0.7343 | 0.0250 |
+| 100 | 2 | 0.8926 | 0.8734 | 0.8991 | 0.0170 |
+| 300 | 0 | 0.3956 | 0.3679 | 0.3894 | 0.0276 |
+| 300 | 1 | 0.7086 | 0.6922 | 0.7120 | 0.0256 |
+| 300 | 2 | 0.8888 | 0.8734 | 0.8852 | 0.0180 |
+
+**2. Loss.** One million probes, 1 ms apart, between two nodes, counted at
+the receiving application; the network's own drop counter must equal the
+probes missing at the receiver.
+
+| model | quantity | measured | expected | tolerance |
+|---|---|---|---|---|
+| i.i.d., `p = 0.01` | loss rate | 0.00993 | 0.01 | ± 0.00040 |
+| i.i.d., `p = 0.05` | loss rate | 0.04980 | 0.05 | ± 0.00087 |
+| i.i.d., `p = 0.20` | loss rate | 0.19998 | 0.20 | ± 0.00160 |
+| Gilbert-Elliott, `p = 0.01, r = 0.19`, all lost while bad (the `loss-burst` chain) | loss rate | 0.05042 | `p/(p+r)` = 0.05 | ± 0.00262 |
+| same | mean burst length (9,459 bursts) | 5.331 | `1/r` = 5.263 | ± 0.195 |
+| Gilbert-Elliott, `p = 0.02, r = 0.10`, half lost while bad | loss rate | 0.08162 | `q p/(p+r)` = 0.08333 | ± 0.00306 |
+
+The i.i.d. tolerance is the binomial standard error. The Gilbert-Elliott loss
+tolerance uses the chain's asymptotic variance (`rho = 1 - p - r`
+autocorrelation), and the burst tolerance the geometric distribution's
+variance, `(1 - r)/r^2`.
+
+**3. Latency.** 200,000 probes per path with receive service time set to
+zero, so the delay measured at the read is the network's alone, against the
+model's `base + U(0, jitter)`: the default intra- and cross-zone latencies,
+and a second configuration with very different bases and jitters. The mean
+must be within 4 standard errors of `base + jitter/2`, every delay inside
+`[base, base + jitter]`, and the Kolmogorov-Smirnov distance to the uniform
+distribution below its 0.1 % critical value, `1.95/sqrt(N)` = 0.00436.
+
+| configuration | path | mean (µs) | expected | observed range (ns) | configured range (ns) | KS D |
+|---|---|---|---|---|---|---|
+| default | intra-AZ | 250.1 | 250.0 ± 0.26 | 200,000..300,000 | 200,000..300,000 | 0.00225 |
+| default | cross-AZ | 1,000.1 | 1,000.0 ± 1.03 | 800,001..1,200,000 | 800,000..1,200,000 | 0.00193 |
+| slow | intra-AZ | 3,500.4 | 3,500.0 ± 7.75 | 2,000,003..4,999,989 | 2,000,000..5,000,000 | 0.00164 |
+| slow | cross-AZ | 19,002.0 | 19,000.0 ± 20.66 | 15,000,012..22,999,988 | 15,000,000..23,000,000 | 0.00182 |
+
+**4. Byte accounting.** The `tiny` regime (5 pods, rollout of 2, one crash,
+5 % loss, 30 s) runs under the full driver with every node's socket wrapped
+in a tally that adds `payload length + 28` for each datagram handed to it
+and for each one read from it, independently of the network's counters. The
+totals are equal exactly: 5,251 datagrams, 6,095,936 B over the run (tally
+6,095,936), 5,687,704 B in the measurement window (tally 5,687,704), and
+5,249,280 B read (tally 5,249,280); the run sent bytes equal payload bytes
+plus 28 per datagram, and the run includes datagrams lost, dropped at
+stopped pods and still in flight.
+
+**5. Receive buffer.** A datagram is dropped exactly when the bytes already
+queued plus its own exceed the buffer. (a) Against a queue-of-lengths model
+over 300,000 random arrivals and reads into an 8,192 B buffer (164,947
+arrivals, 32,678 dropped, 44 of them landing exactly on the capacity and
+accepted), the drop decision and every read agree on every operation; the
+boundary is also checked by hand (filling to the byte is accepted, one byte
+over is dropped, a read frees exactly its length). (b) Through the event
+loop, 50 probes of 1,000 B arrive within 50 ns of each other at a node that
+needs 5 µs to read one, with a 10,000 B buffer: the first is read on arrival,
+the next ten fill the buffer to the byte, the other 39 are dropped (11 read,
+39 dropped, as predicted).
 
 ### Solution contract
 

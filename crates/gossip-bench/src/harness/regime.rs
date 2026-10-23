@@ -202,6 +202,14 @@ impl Regime {
         if !(0.0..=1.0).contains(&self.network.loss) {
             bail!("regime {}: `network.loss` must be in [0, 1]", self.id);
         }
+        // The per-phase metrics are defined for one cut.
+        let partitions = &self.churn.partitions;
+        if partitions.len() > 1 || partitions.iter().any(|p| p.at_s >= p.heal_s) {
+            bail!(
+                "regime {}: `churn.partitions` takes at most one partition, with at_s < heal_s",
+                self.id
+            );
+        }
         Ok(())
     }
 

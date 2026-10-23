@@ -36,7 +36,7 @@ fn staleness_and_convergence_on_a_hand_checked_trace() {
     let mut oracle = Oracle::new(keys, 2, 0);
     oracle.node_started(0, 0, false);
     oracle.node_started(1, 0, false);
-    oracle.admitted(0, B, NS_PER_S);
+    oracle.admitted(0, B, NS_PER_S, 0);
     oracle.view_changed(0, 0, B, 1, 1, 1_100 * MS);
     assert!(oracle.convergence_ns.is_empty());
     oracle.view_changed(1, 0, B, 1, 1, 1_500 * MS);
@@ -56,9 +56,9 @@ fn staleness_and_convergence_on_a_hand_checked_trace() {
 fn measurement_window_excludes_warmup_exposure_and_hits() {
     let mut oracle = Oracle::new(quiet_keys(), 1, NS_PER_S);
     oracle.node_started(0, 0, false);
-    oracle.admitted(0, B, 500 * MS);
+    oracle.admitted(0, B, 500 * MS, 0);
     oracle.view_changed(0, 0, B, 1, 1, 700 * MS);
-    oracle.admitted(0, B, 1_200 * MS);
+    oracle.admitted(0, B, 1_200 * MS, 0);
     oracle.view_changed(0, 0, B, 2, 2, 1_500 * MS);
     oracle.finish(2 * NS_PER_S);
     // Only the second hit is measured; only [1 s, 2 s) is exposure.
@@ -75,7 +75,7 @@ fn a_hit_whose_bucket_leaves_the_window_unseen_never_converges() {
     let mut oracle = Oracle::new(keys, 2, 0);
     oracle.node_started(0, 0, false);
     oracle.node_started(1, 0, false);
-    oracle.admitted(0, B, NS_PER_S);
+    oracle.admitted(0, B, NS_PER_S, 0);
     oracle.view_changed(0, 0, B, 1, 1, NS_PER_S);
     assert_eq!(oracle.pending(), 1);
     oracle.bucket_boundary(5 * NS_PER_S, 0, B + live, &[None, None]);
@@ -92,7 +92,7 @@ fn a_stopped_laggard_no_longer_blocks_convergence() {
     let mut oracle = Oracle::new(quiet_keys(), 2, 0);
     oracle.node_started(0, 0, false);
     oracle.node_started(1, 0, false);
-    oracle.admitted(0, B, NS_PER_S);
+    oracle.admitted(0, B, NS_PER_S, 0);
     oracle.view_changed(0, 0, B, 1, 1, NS_PER_S);
     oracle.node_stopped(1, 2 * NS_PER_S);
     assert_eq!(oracle.convergence_ns, vec![NS_PER_S]);
@@ -104,7 +104,7 @@ fn residual_counts_only_buckets_closed_long_enough() {
     oracle.node_started(0, 0, false);
     oracle.node_started(1, 0, false);
     for _ in 0..3 {
-        oracle.admitted(0, B, NS_PER_S);
+        oracle.admitted(0, B, NS_PER_S, 0);
     }
     oracle.view_changed(0, 0, B, 3, 3, NS_PER_S);
     oracle.view_changed(1, 0, B, 1, 1, NS_PER_S);
@@ -121,7 +121,7 @@ fn joiner_time_to_coverage_and_undercount_integral() {
     let mut oracle = Oracle::new(quiet_keys(), 2, 0);
     oracle.node_started(0, 0, false);
     for _ in 0..4 {
-        oracle.admitted(0, B, NS_PER_S);
+        oracle.admitted(0, B, NS_PER_S, 0);
     }
     oracle.view_changed(0, 0, B, 4, 4, NS_PER_S);
     oracle.node_started(1, 2 * NS_PER_S, true);
@@ -144,7 +144,7 @@ fn joiner_parity_is_relative_to_established_pods() {
     let mut oracle = Oracle::new(quiet_keys(), 2, 0);
     oracle.node_started(0, 0, false);
     for _ in 0..4 {
-        oracle.admitted(0, B, NS_PER_S);
+        oracle.admitted(0, B, NS_PER_S, 0);
     }
     // The established pod lags by 2; the joiner reaches parity at a lag of 2
     // and never reaches 95 % of truth.
@@ -168,7 +168,7 @@ fn over_admission_samples_the_trailing_window_of_limited_keys() {
     let limit = keys.limit;
     let mut oracle = Oracle::new(keys, 1, 0);
     for _ in 0..limit + 3 {
-        oracle.admitted(hot, B, NS_PER_S);
+        oracle.admitted(hot, B, NS_PER_S, 0);
     }
     oracle.bucket_boundary(2 * NS_PER_S, 0, B + 1, &[None]);
     let samples = oracle.over_admission[t];

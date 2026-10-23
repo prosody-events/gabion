@@ -147,3 +147,53 @@ fn gabion_saturation_warnings_are_captured_and_flagged() {
             .any(|f| f.starts_with("dirty_ring_overflow"))
     );
 }
+
+/// A run with a partition reports the cut's phases; the cut shows up as
+/// cross-side hits that never converge and a heal that takes time.
+#[test]
+fn partition_run_reports_phases_and_heals() {
+    let regime = fixtures::partitioned();
+    let result = run(&regime, 4).expect("run");
+    assert!(result.valid, "{:?}", result.invalid_reasons);
+    let report = result.partition.expect("partition report");
+    assert_eq!((report.zone_az, report.at_s, report.heal_s), (0, 14, 30));
+    let never = |p: &report::PhaseReport| p.convergence.cross_side.never_fraction;
+    assert!(
+        never(&report.during) > Some(0.25),
+        "{:?}",
+        never(&report.during)
+    );
+    assert!(
+        never(&report.before) < Some(0.1),
+        "{:?}",
+        never(&report.before)
+    );
+    assert!(
+        never(&report.after) < Some(0.1),
+        "{:?}",
+        never(&report.after)
+    );
+    let during = &report.during.staleness;
+    assert!(during.in_zone.limited.mean > report.before.staleness.in_zone.limited.mean);
+    assert!(report.deficit_at_heal_hits > Some(0.0));
+    let heal_ms = report.time_to_heal_ms.expect("healed before the run ended");
+    assert!((0.0..4_000.0).contains(&heal_ms), "{heal_ms}");
+    // The three phases cover every measured hit, once per side.
+    let phases = [&report.before, &report.during, &report.after];
+    let sides: u64 = phases
+        .iter()
+        .map(|p| p.convergence.same_side.converged + p.convergence.cross_side.converged)
+        .sum();
+    assert!(sides >= 2 * result.convergence.converged);
+    assert!(run(&fixtures::tiny(), 4).expect("run").partition.is_none());
+}
+
+#[test]
+fn a_regime_may_cut_the_network_once_and_heal_after_it_starts() {
+    let mut regime = fixtures::partitioned();
+    regime.churn.partitions.push(regime.churn.partitions[0]);
+    assert!(regime.validate().is_err());
+    regime.churn.partitions.truncate(1);
+    regime.churn.partitions[0].heal_s = 10;
+    assert!(regime.validate().is_err());
+}

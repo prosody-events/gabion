@@ -21,9 +21,11 @@ for both, so a solution cannot gain by losing its hardest seed.
 For each regime x solution x metric it reports the mean across valid seeds
 with a 95 % confidence half-width (Student t, n - 1 degrees of freedom), the
 min and max, and the ratio to the baseline over common seeds. Writes
-`summary.md`, `summary.csv` (long format, with paired differences),
-`pareto.md` (means over the seeds valid for every solution on the front), `flags.md` (saturation the harness flagged without
-invalidating, e.g. dirty-ring overflow) and `rejected.md`.
+`summary.md` (with a per-phase table for regimes that cut the network),
+`summary.csv` (long format, with paired differences),
+`pareto.md` (means over the seeds valid for every solution on the front),
+`flags.md` (saturation the harness flagged without invalidating, e.g. dirty-ring
+overflow) and `rejected.md`.
 
 Python 3 standard library only.
 """
@@ -186,6 +188,38 @@ METRICS = [
     ("rss_mib", "Process peak RSS (MiB), noisy", rss_mib),
 ]
 
+def partition_metrics() -> list:
+    """Per-phase metrics of a regime with a network partition (`partition` in
+    the result): convergence by the side of the cut the hit's origin and its
+    observers sit on, staleness by the observer's side, and the heal."""
+    rows = [
+        ("part_deficit_at_heal", "Hits missing per (pod, key) at the heal (hits)",
+         lambda r: dig(r, "partition.deficit_at_heal_hits")),
+        ("part_time_to_heal_ms", "Time to heal: until every cross-cut count is exact (ms)",
+         lambda r: dig(r, "partition.time_to_heal_ms")),
+    ]
+    for phase in ("before", "during", "after"):
+        for relation, side in (("same_side", "same side"), ("cross_side", "cross side")):
+            rows.append((f"part_{phase}_conv_{relation}_p99_ms",
+                         f"{phase}: convergence p99 incl. never, {side} (ms, lower bound)",
+                         lambda r, p=phase, q=relation:
+                         dig(r, f"partition.{p}.convergence.{q}.p99_incl_never_ms")))
+            rows.append((f"part_{phase}_conv_{relation}_never",
+                         f"{phase}: fraction never converged, {side}",
+                         lambda r, p=phase, q=relation:
+                         dig(r, f"partition.{p}.convergence.{q}.never_fraction")))
+        for observers, who in (("in_zone", "cut-off zone"), ("rest", "rest of cluster")):
+            for cls in ("limited", "sampled"):
+                rows.append((f"part_{phase}_stale_{observers}_{cls}_p99",
+                             f"{phase}: staleness p99, {cls} keys, pods in the {who} (hits)",
+                             lambda r, p=phase, o=observers, c=cls:
+                             dig(r, f"partition.{p}.staleness.{o}.{c}.p99")))
+    return rows
+
+
+PARTITION_METRICS = partition_metrics()
+ALL_METRICS = METRICS + PARTITION_METRICS
+
 PARETO = [("bytes_total", "stale_limited_p99"), ("bytes_total", "over_max_pct"),
           ("bytes_total", "conv_p99_incl_never_ms")]
 
@@ -289,18 +323,20 @@ def main() -> None:
         return sum(not r.get("valid") for r in by_seed.values()), len(by_seed)
 
     regimes = sorted({r for r, _ in runs})
+    partitioned = {r for (r, _), by_seed in runs.items()
+                   if any(dig(result, "partition") for result in by_seed.values())}
     solutions = sorted({s for _, s in runs}, key=lambda s: (s != args.baseline, s))
     table: dict[tuple[str, str, str], dict | None] = {}
     for regime, solution in runs:
         valid = valid_seeds(regime, solution)
-        for key, _, extract in METRICS:
+        for key, _, extract in ALL_METRICS:
             values = [v for r in valid.values() if (v := extract(r)) is not None]
             table[(regime, solution, key)] = summarize([float(v) for v in values]) if values else None
 
     def paired(regime: str, solution: str, key: str) -> dict | None:
         """Ratio of means and mean paired difference (solution - baseline)
         over the seeds valid for both with a value for `key`."""
-        extract = next(e for k, _, e in METRICS if k == key)
+        extract = next(e for k, _, e in ALL_METRICS if k == key)
         mine, base = valid_seeds(regime, solution), valid_seeds(regime, args.baseline)
         pairs = [(float(a), float(b)) for s in sorted(mine.keys() & base.keys())
                  if (a := extract(mine[s])) is not None and (b := extract(base[s])) is not None]
@@ -346,10 +382,21 @@ def main() -> None:
                                               for s, (bad, n) in counts.items()), "",
                   "| Metric | " + " | ".join(present) + " |",
                   "|---|" + "---|" * len(present)]
-        for key, label, _ in METRICS:
-            row = [cell(table.get((regime, s, key)), ratio(regime, s, key), *counts[s])
-                   for s in present]
-            lines.append(f"| {label} | " + " | ".join(row) + " |")
+        def rows(metrics):
+            return [f"| {label} | "
+                    + " | ".join(cell(table.get((regime, s, key)), ratio(regime, s, key),
+                                      *counts[s]) for s in present) + " |"
+                    for key, label, _ in metrics]
+
+        lines += rows(METRICS)
+        if regime in partitioned:
+            lines += ["", f"### {regime}: partition phases", "",
+                      "The cut isolates one availability zone, then heals. Convergence is "
+                      "of hits admitted in the phase: `same side` waits for the pods on "
+                      "the origin's side, `cross side` for the other side. Staleness is "
+                      "by the observer's side. The heal is probed every 100 ms.", "",
+                      "| Metric | " + " | ".join(present) + " |",
+                      "|---|" + "---|" * len(present)] + rows(PARTITION_METRICS)
     (args.out / "summary.md").write_text("\n".join(lines) + "\n")
 
     with (args.out / "summary.csv").open("w", newline="") as f:
@@ -362,7 +409,7 @@ def main() -> None:
                 if (regime, solution) not in runs:
                     continue
                 bad, total = invalid_count(regime, solution)
-                for key, _, _ in METRICS:
+                for key, _, _ in METRICS + (PARTITION_METRICS if regime in partitioned else []):
                     stats = table.get((regime, solution, key)) or {}
                     pair = (paired(regime, solution, key)
                             if solution != args.baseline else None) or {}
@@ -376,49 +423,59 @@ def main() -> None:
               "better), over the seeds valid for every solution listed in that table, so "
               "all points rest on the same workloads. **Bold** solutions are not dominated "
               "by any other solution on that pair. A solution with invalid seeds is marked "
-              "with its count; one with no valid seed is listed but excluded from the "
-              "front.", ""]
+              "with its count; one with no valid seed, or no value for a metric, is "
+              "excluded from the table. When no seed is valid for every solution the "
+              "points rest on different seeds, so they are listed without a front.", ""]
     for regime in regimes:
         pareto += [f"## {regime}", ""]
         for x, y in PARETO:
             ex = next(e for k, _, e in METRICS if k == x)
             ey = next(e for k, _, e in METRICS if k == y)
-            values, excluded = {}, []
+            values, invalid, valueless, points = {}, [], [], {}
             for s in solutions:
                 if (regime, s) not in runs:
                     continue
                 bad, total = invalid_count(regime, s)
                 if bad == total:
-                    excluded.append(f"{s} (INVALID {bad}/{total})")
+                    invalid.append(f"{s} (INVALID {bad}/{total})")
                     continue
                 seeds = {seed: (float(a), float(b))
                          for seed, r in valid_seeds(regime, s).items()
                          if (a := ex(r)) is not None and (b := ey(r)) is not None}
                 if seeds:
                     values[s] = seeds
+                else:
+                    valueless.append(s)
             common = set.intersection(*(set(v) for v in values.values())) if values else set()
-            if common:
+            if not values:
+                note = (f"{x} vs {y}: metric not applicable in this regime (no solution "
+                        "has a value for both)." if valueless else
+                        f"{x} vs {y}: no solution has a valid seed.")
+            elif common:
                 note = f"Seeds {', '.join(map(str, sorted(common)))}."
-                points = {s: (statistics.fmean(v[k][0] for k in common),
-                              statistics.fmean(v[k][1] for k in common))
-                          for s, v in values.items()}
             else:
                 note = ("No seed is valid for every solution: points are per-solution "
-                        "means over different seeds and are not directly comparable.")
-                points = {s: (statistics.fmean(a for a, _ in v.values()),
-                              statistics.fmean(b for _, b in v.values()))
-                          for s, v in values.items()}
-            pareto += [note, "", f"| Solution | {x} | {y} |", "|---|---|---|"]
+                        "means over different seeds and are not comparable, so no front "
+                        "is marked.")
+            pareto.append(note)
+            if values:
+                pareto += ["", f"| Solution | {x} | {y} |", "|---|---|---|"]
+            for s, seeds in values.items():
+                used = [v for k, v in seeds.items() if k in common] if common else list(seeds.values())
+                point = (statistics.fmean(a for a, _ in used), statistics.fmean(b for _, b in used))
+                points[s] = point
             for s, point in points.items():
-                front = not any(dominated(point, o) for t, o in points.items() if t != s)
+                front = bool(common) and not any(
+                    dominated(point, o) for t, o in points.items() if t != s)
                 name = f"**{s}**" if front else s
                 bad, total = invalid_count(regime, s)
                 if bad:
                     name += f" (INVALID {bad}/{total})"
                 pareto.append(f"| {name} | {fmt(point[0])} | {fmt(point[1])} |")
-            if excluded:
-                pareto.append("")
-                pareto.append("Excluded, every seed invalid: " + ", ".join(excluded) + ".")
+            if invalid:
+                pareto += ["", "Excluded, every seed invalid: " + ", ".join(invalid) + "."]
+            if valueless:
+                pareto += ["", f"Excluded, no value for {x} or {y}: " + ", ".join(valueless) + "."]
             pareto.append("")
     (args.out / "pareto.md").write_text("\n".join(pareto) + "\n")
 

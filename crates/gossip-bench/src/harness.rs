@@ -14,10 +14,13 @@ mod fixtures;
 mod net;
 mod node;
 mod oracle;
+mod phases;
 mod plan;
 mod regime;
 mod report;
 mod rng;
+#[cfg(test)]
+mod validation;
 mod warnings;
 mod workload;
 mod world;
