@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
-use crate::clock::{ManualClock, SharedNow};
+use crate::clock::{ManualClock, SharedNow, TickSenders};
 use crate::config::{ConfigError, SimConfig};
 use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView};
 use crate::shims::{AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport};
@@ -68,28 +68,19 @@ const LOCAL_RULE_ID: u32 = 0;
 /// rings are persistent — no data loss, just slower flush).
 ///
 /// **The pool ceiling is 255, not a free choice.** The runtime addresses
-/// send-pool slots with a `u8` (`send_pending: VecDeque<(SocketAddr, u8)>`) and
+/// send-pool slots with a `u8` (`send_pending: VecDeque<Outgoing>`) and
 /// builds the free list as `(0..send_pool_size as u8)`, so any capacity ≥ 256
 /// wraps to an *empty* free list and silently kills all gossip. So the pool is
 /// pinned at the largest addressable value, and the per-tick frame is capped so
 /// one tick stays well inside it:
 ///
-/// One tick emits at most `pick_count × packets_per_frame` packets, where
-/// `pick_count = ⌈ln(peers)+c⌉` (the coverage fanout, `c` =
-/// `GOSSIP_COVERAGE_MARGIN` = 3), capped at the peer count. The widest cluster
-/// the visualizer builds is `MAX_NODES` = 256, so `peers ≤ 255` and
-/// `pick_count ≤ ⌈ln(255)+3⌉ = 9`; at the 100-node overload point it is
-/// `⌈ln(99)+3⌉ = 8`. `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK /
+/// One tick queues at most `packets_per_frame` packets, each shared by every
+/// peer: a packet is encoded once and holds its slot while the send queue walks
+/// the peer list. `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK /
 /// cells_per_packet)`, with `cells_per_packet ≈ 21` at a 1400-byte payload in
 /// the worst case (every cell a distinct origin, so the node dictionary costs
-/// 16 B/cell on top of the 46 B row) — so `ceil(160 / 21) = 8`. The worst case
-/// at 100 nodes is therefore ≈ `8 × 8 = 64` packets/tick, which the 255-slot
-/// pool clears ~4×, leaving the rest of the pool for packets still draining
-/// from the previous tick. A native 100-node Sustained-overload run (40 s of
-/// virtual time, debug build with the drain `debug_assert` live) measured an
-/// actual `max_send_pending_depth` peak of **64** — no trap, ~4× under the
-/// pool. (The coverage fanout is stable for a cluster size, so this peak does
-/// not climb with burst volume the way the old dirty-set widening did.)
+/// 16 B/cell on top of the 46 B row) — so `ceil(160 / 21) = 8`, which the
+/// 255-slot pool clears ~30×. Digest packets share the pool.
 ///
 /// Capping the per-tick frame is what keeps one tick inside the fixed pool. The
 /// cap is inert at the default 12-node scenarios — their cross-node working set
@@ -275,9 +266,9 @@ struct NodeHandle {
     client: GossipClient<Count>,
     aggregate: Rc<EventEmittingAggregateStore<Count>>,
     admin_tx: mpsc::Sender<AdminCommand>,
-    /// Fires one gossip tick on this node (its `ManualClock`'s ticker drains
-    /// the matching receiver).
-    tick_tx: mpsc::Sender<()>,
+    /// Fires gossip and repair ticks on this node (its `ManualClock`'s tickers
+    /// drain the matching receivers).
+    ticks: TickSenders,
     /// The discovery stream this node's runtime watches. The engine pushes
     /// `PeerEvent::Added`/`Removed` here as other nodes join and leave, so
     /// membership is dynamic rather than the static `stream::empty()` the bench
@@ -441,6 +432,8 @@ impl EngineState {
             send_queue_capacity: VIZ_SEND_QUEUE_CAPACITY,
             limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
             tick_interval,
+            repair_period: Duration::from_millis(defaults::GOSSIP_REPAIR_PERIOD_MILLIS),
+            repair_max_cells: defaults::GOSSIP_REPAIR_MAX_CELLS,
             auth_key: None,
             rng_seed: self.config.rng_seed.wrapping_add(id as u64),
             target_err_bps: self.config.target_err_bps,
@@ -452,7 +445,7 @@ impl EngineState {
             self.log.clone(),
         ));
         let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
-        let (clock, tick_tx) = ManualClock::new(self.now.clone());
+        let (clock, ticks) = ManualClock::new(self.now.clone());
         let (runtime, client) = GossipRuntime::from_parts_with_admin(
             transport,
             clock,
@@ -476,7 +469,7 @@ impl EngineState {
             client,
             aggregate,
             admin_tx,
-            tick_tx,
+            ticks,
             peer_tx,
             join,
             identity,
@@ -641,6 +634,7 @@ impl EngineState {
 
     async fn step(&mut self, delta_ms: u64) -> EventBatch {
         let tick_ms = self.config.tick_interval_ms.max(1);
+        let repair_ms = defaults::GOSSIP_REPAIR_PERIOD_MILLIS;
         let target = self.virtual_ms.saturating_add(delta_ms);
         let mut events = Vec::new();
         let mut prev = self.admin_counters().await;
@@ -667,10 +661,11 @@ impl EngineState {
             if next_tick > target {
                 break;
             }
+            let repair_due = next_tick / repair_ms != self.virtual_ms / repair_ms;
             self.virtual_ms = next_tick;
             self.now.set(next_tick);
             self.router.begin_deferred();
-            self.fire_tick().await;
+            self.fire_tick(repair_due).await;
             self.drain_pending().await;
             self.router.release_deferred();
             self.drain_pending().await;
@@ -695,13 +690,17 @@ impl EngineState {
         }
     }
 
-    /// Fire one gossip tick on every runtime, in node order. Each send queues
+    /// Fire one gossip tick, and a repair tick when a repair period has
+    /// elapsed, on every runtime, in node order. Each send queues
     /// in that node's bounded tick channel, so a busy runtime still consumes
     /// the tick on its next idle poll rather than dropping it. A closed channel
     /// (the runtime stopped) is ignored — the tick simply has nowhere to land.
-    async fn fire_tick(&self) {
+    async fn fire_tick(&self, repair_due: bool) {
         for node in &self.nodes {
-            let _ = node.tick_tx.send(()).await;
+            let _ = node.ticks.gossip.send(()).await;
+            if repair_due {
+                let _ = node.ticks.repair.send(()).await;
+            }
         }
     }
 
@@ -805,7 +804,6 @@ impl EngineState {
                 peak_fanout: snap.as_ref().map_or(0, |s| s.peak_effective_fanout as u32),
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
                 local_dirty_len: snap.as_ref().map_or(0, |s| s.local_dirty_len),
-                forwarded_dirty_len: snap.as_ref().map_or(0, |s| s.forwarded_dirty_len),
                 send_pending_depth: snap.as_ref().map_or(0, |s| s.send_pending_depth as u64),
                 max_send_pending_depth: snap
                     .as_ref()

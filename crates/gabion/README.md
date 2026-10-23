@@ -17,6 +17,7 @@ the [repo root README](../../README.md#glossary).
 ## Contents
 
 - [Module map](#module-map)
+- [Design notes: bimodal multicast](#design-notes-bimodal-multicast)
 - [How gossip works](#how-gossip-works)
   - [The wire frame](#the-wire-frame)
   - [The anti-entropy loop](#the-anti-entropy-loop)
@@ -48,6 +49,64 @@ module, whereas `wire` and `crdt` are independent of each other.
 nothing else in this crate. Adapters consume the public surface of
 `gossip`, `rules`, and `discovery`, together with the constants in
 `defaults`.
+
+## Design notes: bimodal multicast
+
+> This branch replaces the forward-once coverage-fanout protocol described in
+> the sections below with Bimodal Multicast. Those sections (wire frame
+> aside) describe the protocol it replaces and are kept only until the
+> design comparison is decided.
+
+The protocol follows Birman, Hayden, Ozkasap, Xiao, Budiu and Minsky,
+"Bimodal Multicast", ACM TOCS 17(2), 1999
+(<https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/Bimodal.pdf>).
+
+**Phase one, direct mail.** Every gossip tick (the unchanged 500 ms heartbeat
+plus error-budget threshold rounds) a node sends the changes to its *own*
+cells to *every* peer, once, in packets it encodes once and queues for each
+peer. There is no acknowledgement and no per-receiver state; a change the send
+pool had no room for waits for the next tick. A node never relays a
+cell it learned from a peer. The local dirty ring is therefore a queue: a
+change leaves it when it has been sent.
+
+**Phase two, digest repair.** Every `repair_period` (1 s) a node sends one
+random peer a digest of the origin sequences it holds. The peer answers with
+the cells the digest shows missing, at most `repair_max_cells` (512) per
+repair period across all digests it answers, and, when the digest started an
+exchange, with a digest of its own so the first node can return what the peer
+lacks. Any holder can serve any cell, as pbcast retransmits from any member's
+buffer.
+
+**Adaptations to a state CRDT, and why.**
+
+- *The digest is a bitmap, not a message history.* The paper's digest lists
+  message ids. Here the unit is a cell, and a cell keeps the sequence its
+  origin stamped on it (a cell learned from a peer is no longer re-stamped, so
+  sequences compare across nodes). A digest entry is one origin's maximum
+  sequence held plus a 256-bit bitmap of the sequences held below it;
+  sequences further back are assumed held. A bare maximum, as Scuttlebutt
+  uses over an ordered stream, would never repair a gap left by a lost
+  datagram, because direct mail is unordered and unacknowledged. A newer
+  version of a held cell has a new sequence, so it shows as missing.
+- *Digests are packet-independent.* A digest larger than one packet is sent as
+  several, each naming the half-open range of origin keys it speaks for, so
+  an origin in range with no entry is one the sender holds nothing for.
+  Receivers keep no state across packets.
+- *Repair is bounded per period, not per message.* The paper's per-round
+  retransmission limit becomes `repair_max_cells`, refilled each repair tick.
+- *Datagrams, not multicast.* The unreliable multicast of phase one is one UDP
+  datagram per peer, the transport gabion already has.
+
+**Config.** `GossipConfig::repair_period` and `repair_max_cells` take their
+defaults from `gabion::defaults::GOSSIP_REPAIR_PERIOD_MILLIS` and
+`GOSSIP_REPAIR_MAX_CELLS`. `fanout` is ignored (phase one reaches every peer),
+and `CellStoreConfig::forwarded_dirty_capacity` and `peer_capacity` are
+ignored (nothing is forwarded; no peer frontier is kept); they remain so
+existing callers compile. The coverage margin and the peer frontier are gone.
+
+**Wire.** Digest packets are marked `FLAG_DIGEST` in the common header, carry
+`FLAG_REPLY` when sent in answer to a digest, and are authenticated like cell
+packets.
 
 ## How gossip works
 

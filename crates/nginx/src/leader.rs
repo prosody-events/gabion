@@ -152,6 +152,8 @@ impl GossipSettings {
             send_queue_capacity: self.send_queue_capacity,
             limit_queue_capacity: DRAIN_BATCH,
             tick_interval: self.tick_interval,
+            repair_period: Duration::from_millis(defaults::GOSSIP_REPAIR_PERIOD_MILLIS),
+            repair_max_cells: defaults::GOSSIP_REPAIR_MAX_CELLS,
             auth_key: None,
             rng_seed,
             target_err_bps: self.target_err_bps,

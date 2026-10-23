@@ -23,6 +23,7 @@
 
 mod auth;
 mod body;
+mod digest;
 mod header;
 
 #[cfg(test)]
@@ -30,7 +31,12 @@ mod tests;
 
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
-pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
+pub use digest::{
+    DIGEST_WINDOW, DigestEntry, DigestPackets, DigestScope, OriginKey, decode_digest_visit,
+};
+pub use header::{
+    FLAG_AUTHENTICATED, FLAG_DIGEST, FLAG_MORE, FLAG_REPLY, HEADER_LEN, Header, MAGIC, VERSION,
+};
 
 use auth::AUTH_TAG_LEN;
 use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
@@ -108,6 +114,8 @@ pub enum DecodeError {
     AuthenticationFailed,
     #[error("trailing bytes after body")]
     Trailing,
+    #[error("frame is not a digest")]
+    NotADigest,
 }
 
 // -- send-side buffer -------------------------------------------------------
@@ -252,6 +260,14 @@ impl<'a, C: Count> Packets<'a, C> {
         self.handles.len() - self.cursor
     }
 
+    /// Stop encoding because the caller has no more send buffers. Returns
+    /// the number of handles that were left unencoded.
+    pub fn abandon(mut self) -> usize {
+        let left = self.remaining();
+        self.cursor = self.handles.len();
+        left
+    }
+
     /// Encode the next packet into `buf`. The encoder clears `buf` first.
     ///
     /// - `Ok(Some(p))` — one packet ready; send `buf.as_bytes()`.
@@ -373,6 +389,7 @@ fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
         incarnation: cell.origin_incarnation,
         count: cell.count,
         last_update_millis: cell.last_update_millis,
+        origin_sequence: cell.origin_sequence,
     }
 }
 
@@ -395,13 +412,30 @@ pub fn decode_auth_visit<C: Count>(
     decode_inner(bytes, Some(key), limits, accept_header, on_cell)
 }
 
-fn decode_inner<C: Count>(
-    bytes: &[u8],
+/// What a frame carries, read from the header flags without verifying it.
+/// Receivers use it only to pick a decoder; the decoder authenticates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameKind {
+    Cells,
+    Digest,
+}
+
+pub fn frame_kind(bytes: &[u8]) -> FrameKind {
+    match bytes.get(6..8) {
+        Some(flags) if u16::from_le_bytes([flags[0], flags[1]]) & FLAG_DIGEST != 0 => {
+            FrameKind::Digest
+        }
+        _ => FrameKind::Cells,
+    }
+}
+
+/// Check size and authentication, then parse the header. Returns the header
+/// and the frame without its auth tag.
+fn open_frame<'a>(
+    bytes: &'a [u8],
     key: Option<&HmacKey>,
     limits: FrameLimits,
-    accept_header: impl FnOnce(&Header) -> bool,
-    on_cell: impl FnMut(WireCell<C>),
-) -> Result<DecodedSummary, DecodeError> {
+) -> Result<(Header, &'a [u8]), DecodeError> {
     if bytes.len() > limits.max_payload_bytes {
         return Err(DecodeError::PayloadTooLarge);
     }
@@ -410,32 +444,46 @@ fn decode_inner<C: Count>(
         return Err(DecodeError::TooShort);
     }
 
-    let (frame, _tag) = if let Some(key) = key {
-        let split = bytes.len() - AUTH_TAG_LEN;
-        let (frame, tag) = bytes.split_at(split);
+    let frame = if let Some(key) = key {
+        let (frame, tag) = bytes.split_at(bytes.len() - AUTH_TAG_LEN);
         auth::verify(key, frame, tag).map_err(|_| DecodeError::AuthenticationFailed)?;
-        (frame, Some(tag))
+        frame
     } else {
-        (bytes, None)
+        bytes
     };
+    Ok((read_header(frame)?, frame))
+}
 
-    let header = read_header(frame)?;
+/// The body bytes after the header, which must be exactly `body_len` long.
+fn frame_body<'a>(header: &Header, frame: &'a [u8]) -> Result<&'a [u8], DecodeError> {
+    let body_len = header.body_len as usize;
+    let total_required = HEADER_LEN
+        .checked_add(body_len)
+        .ok_or(DecodeError::BodyLenMismatch)?;
+    if total_required > frame.len() {
+        return Err(DecodeError::BodyLenMismatch);
+    }
+    if total_required < frame.len() {
+        return Err(DecodeError::Trailing);
+    }
+    Ok(&frame[HEADER_LEN..])
+}
+
+fn decode_inner<C: Count>(
+    bytes: &[u8],
+    key: Option<&HmacKey>,
+    limits: FrameLimits,
+    accept_header: impl FnOnce(&Header) -> bool,
+    on_cell: impl FnMut(WireCell<C>),
+) -> Result<DecodedSummary, DecodeError> {
+    let (header, frame) = open_frame(bytes, key, limits)?;
     if header.count_width as usize != std::mem::size_of::<C>() {
         return Err(DecodeError::BadCountWidth);
     }
     if header.cell_count > limits.max_cells {
         return Err(DecodeError::CapacityExceeded);
     }
-    let body_len = header.body_len as usize;
-    let total_required = HEADER_LEN
-        .checked_add(body_len)
-        .ok_or(DecodeError::BodyLenMismatch)?;
-    if total_required != frame.len() {
-        if total_required > frame.len() {
-            return Err(DecodeError::BodyLenMismatch);
-        }
-        return Err(DecodeError::Trailing);
-    }
+    let body = frame_body(&header, frame)?;
 
     let summary = DecodedSummary {
         header,
@@ -447,8 +495,7 @@ fn decode_inner<C: Count>(
         return Ok(summary);
     }
 
-    let body_bytes = &frame[HEADER_LEN..HEADER_LEN + body_len];
-    decode_body_visit::<C>(body_bytes, header.cell_count, on_cell)?;
+    decode_body_visit::<C>(body, header.cell_count, on_cell)?;
 
     Ok(summary)
 }

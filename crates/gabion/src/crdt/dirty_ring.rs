@@ -75,13 +75,27 @@ impl DirtyRing {
         self.head = (self.head + 1) % cap;
     }
 
+    /// Ring index of the oldest entry.
+    fn start(&self) -> u32 {
+        let cap = self.entries.len() as u32;
+        (self.head + cap - self.len) % cap.max(1)
+    }
+
     /// Iterate ring entries in insertion order (oldest first).
     pub fn iter(&self) -> impl Iterator<Item = DirtyEntry> + '_ {
         let cap = self.entries.len() as u32;
-        let len = self.len;
-        let head = self.head;
-        let start = if len == cap { head } else { 0 };
-        (0..len).map(move |offset| self.entries[((start + offset) % cap) as usize])
+        let start = self.start();
+        (0..self.len).map(move |offset| self.entries[((start + offset) % cap) as usize])
+    }
+
+    /// The oldest entry.
+    pub fn front(&self) -> Option<DirtyEntry> {
+        (self.len > 0).then(|| self.entries[self.start() as usize])
+    }
+
+    /// Drop the oldest entry.
+    pub fn pop_front(&mut self) {
+        self.len = self.len.saturating_sub(1);
     }
 
     pub fn clear(&mut self) {
@@ -89,14 +103,4 @@ impl DirtyRing {
         self.len = 0;
         self.overflow_seq = 0;
     }
-}
-
-/// Read a single ring entry by insertion-order offset. Function-local borrow
-/// of the ring releases before the caller's mutating method calls, keeping
-/// the hot send path allocation-free.
-#[inline]
-pub(super) fn ring_entry_at(ring: &DirtyRing, offset: u32) -> DirtyEntry {
-    let cap = ring.entries.len() as u32;
-    let start = if ring.len == cap { ring.head } else { 0 };
-    ring.entries[((start + offset) % cap) as usize]
 }
