@@ -1,0 +1,147 @@
+use std::net::SocketAddr;
+
+use super::*;
+
+fn addr(s: &str) -> SocketAddr {
+    s.parse().expect("socket address")
+}
+
+fn peer(s: &str) -> Peer {
+    let a = addr(s);
+    Peer::new(a, NodeId(7), Zone::of(a, 16))
+}
+
+#[test]
+fn ack_progress_returns_rtt_sample_once() {
+    let mut out = Outbound::default();
+    out.note_sent(10, 1_000);
+    out.note_sent(20, 1_001);
+    assert_eq!(out.note_ack(10, 1_040), Some(40));
+    assert_eq!(
+        out.note_ack(20, 1_050),
+        None,
+        "the probe was already consumed"
+    );
+    assert_eq!((out.acked, out.sent), (20, 20));
+}
+
+#[test]
+fn stale_ack_does_not_regress() {
+    let mut out = Outbound::default();
+    out.note_sent(10, 0);
+    out.note_ack(10, 5);
+    assert_eq!(out.note_ack(4, 6), None);
+    assert_eq!(out.acked, 10);
+}
+
+#[test]
+fn timeout_fires_only_with_data_in_flight() {
+    let mut out = Outbound::default();
+    assert!(!out.timed_out(10_000, 500));
+    out.note_sent(5, 1_000);
+    assert!(!out.timed_out(1_499, 500));
+    assert!(out.timed_out(1_500, 500));
+    out.note_ack(5, 1_200);
+    assert!(!out.timed_out(9_000, 500));
+}
+
+#[test]
+fn ack_progress_restarts_the_timer() {
+    let mut out = Outbound::default();
+    out.note_sent(5, 1_000);
+    out.note_sent(9, 1_100);
+    out.note_ack(5, 1_400);
+    assert!(!out.timed_out(1_800, 500));
+    assert!(out.timed_out(1_900, 500));
+}
+
+#[test]
+fn rewind_resumes_from_the_last_ack_and_drops_the_probe() {
+    let mut out = Outbound::default();
+    out.note_sent(5, 0);
+    out.note_ack(3, 10);
+    out.note_sent(9, 20);
+    out.rewind(600);
+    assert_eq!((out.acked, out.sent), (3, 3));
+    out.note_sent(9, 601);
+    assert_eq!(
+        out.note_ack(9, 700),
+        Some(99),
+        "the new probe times the resend"
+    );
+}
+
+#[test]
+fn late_ack_after_rewind_lifts_sent() {
+    let mut out = Outbound::default();
+    out.note_sent(9, 0);
+    out.rewind(600);
+    out.note_ack(9, 610);
+    assert_eq!((out.acked, out.sent), (9, 9));
+}
+
+#[test]
+fn rto_is_twice_srtt_above_the_floor() {
+    let mut p = peer("10.1.0.1:1");
+    assert_eq!(p.rto_ms(500), 500);
+    p.note_rtt(400);
+    assert_eq!(p.rto_ms(500), 800);
+    p.note_rtt(0);
+    assert_eq!(p.rto_ms(500), 700, "the estimate decays by one eighth");
+}
+
+#[test]
+fn one_gateway_per_remote_zone_and_none_locally() {
+    let local = Zone::of(addr("10.0.0.1:1"), 16);
+    let mut peers: Vec<Peer> = [
+        "10.0.0.2:1",
+        "10.0.0.3:1",
+        "10.1.0.1:1",
+        "10.1.0.2:1",
+        "10.1.0.3:1",
+        "10.2.0.1:1",
+        "10.2.0.2:1",
+    ]
+    .into_iter()
+    .map(peer)
+    .collect();
+    refresh_gateways(&mut peers, local);
+    let gateways = |zone_prefix: &str| {
+        peers
+            .iter()
+            .filter(|p| p.gateway && p.addr.to_string().starts_with(zone_prefix))
+            .count()
+    };
+    assert_eq!(gateways("10.0."), 0);
+    assert_eq!(gateways("10.1."), 1);
+    assert_eq!(gateways("10.2."), 1);
+}
+
+#[test]
+fn suspect_gateway_is_replaced_and_restored_when_unsuspected() {
+    let local = Zone::of(addr("10.0.0.1:1"), 16);
+    let mut peers: Vec<Peer> = ["10.1.0.1:1", "10.1.0.2:1", "10.1.0.3:1"]
+        .into_iter()
+        .map(peer)
+        .collect();
+    refresh_gateways(&mut peers, local);
+    let first = peers.iter().position(|p| p.gateway).expect("gateway");
+    peers[first].suspect = true;
+    refresh_gateways(&mut peers, local);
+    let second = peers.iter().position(|p| p.gateway).expect("gateway");
+    assert_ne!(first, second);
+    peers[first].suspect = false;
+    refresh_gateways(&mut peers, local);
+    assert_eq!(peers.iter().position(|p| p.gateway), Some(first));
+}
+
+#[test]
+fn all_suspect_zone_keeps_a_gateway() {
+    let local = Zone::of(addr("10.0.0.1:1"), 16);
+    let mut peers: Vec<Peer> = ["10.1.0.1:1", "10.1.0.2:1"].into_iter().map(peer).collect();
+    for p in &mut peers {
+        p.suspect = true;
+    }
+    refresh_gateways(&mut peers, local);
+    assert_eq!(peers.iter().filter(|p| p.gateway).count(), 1);
+}

@@ -4,9 +4,9 @@
 //! [`crate::crdt::CellStore`], a datagram [`GossipTransport`], a
 //! [`Clock`] for bucket arithmetic and tick scheduling, and a downstream
 //! [`AggregateStore`] that absorbs the resulting delta and expiration rows.
-//! A single `tokio::select!` drives five arms (limit request, inbound,
-//! writable, peer event, tick) and calls `aggregates.apply(...)` once per
-//! CRDT-touching iteration.
+//! A single `tokio::select!` drives six arms (limit request, inbound,
+//! writable, peer event, tick, relay tick) and calls `aggregates.apply(...)`
+//! once per CRDT-touching iteration.
 //!
 //! All polymorphic boundaries are monomorphized generics — no `dyn`, no
 //! `Box`. The production hot path is branch-free; tests and simulators
@@ -24,9 +24,11 @@ use crate::wire::{self, FrameLimits, HmacKey};
 mod admin;
 mod client;
 mod clock;
+mod peer;
 mod runtime;
 pub mod sim;
 mod store;
+mod topology;
 mod transport;
 
 #[cfg(test)]
@@ -55,15 +57,11 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Floor on the number of peers contacted per gossip tick. The runtime
-    /// scales the actual per-tick fanout to the coverage threshold
-    /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
-    /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
-    /// hard minimum when that threshold falls below it.
+    /// Unused: the runtime sends to every peer in its zone and to one gateway
+    /// per remote zone, not to a sampled fanout.
     pub fanout: usize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
-    /// tick. The wire codec splits this into multiple packets if needed.
+    /// Frame composition: how many cells one stream may send one peer per
+    /// round. The wire codec splits this into multiple packets if needed.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,
@@ -77,7 +75,8 @@ pub struct GossipConfig {
     /// Optional HMAC key — when set, every outbound packet is authenticated
     /// and inbound packets must verify.
     pub auth_key: Option<HmacKey>,
-    /// Deterministic RNG seed for peer sampling.
+    /// Unused: the runtime makes no random choices (peers are ranked by a
+    /// rendezvous hash), so a run is a pure function of its inputs.
     pub rng_seed: u64,
     /// Per-rule error budget in basis points of the rule's own limit, used
     /// for threshold-triggered anti-entropy. See
@@ -86,6 +85,15 @@ pub struct GossipConfig {
     /// Minimum gap between two threshold-fire emissions, in milliseconds.
     /// See [`crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
     pub min_emit_interval: Duration,
+    /// Prefix length, in bits, of a peer address that names its zone. See
+    /// [`crate::defaults::GOSSIP_ZONE_PREFIX_LEN`].
+    pub zone_prefix_len: u8,
+    /// Floor on a stream's retransmission timeout. See
+    /// [`crate::defaults::GOSSIP_RTO_FLOOR_MS`].
+    pub rto_floor: Duration,
+    /// Minimum gap between two relay rounds. See
+    /// [`crate::defaults::GOSSIP_RELAY_FLOOR_MS`].
+    pub relay_floor: Duration,
 }
 
 impl Default for GossipConfig {
@@ -104,6 +112,9 @@ impl Default for GossipConfig {
             rng_seed: crate::defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
             target_err_bps: crate::defaults::GOSSIP_TARGET_ERR_BPS,
             min_emit_interval: Duration::from_millis(crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
+            zone_prefix_len: crate::defaults::GOSSIP_ZONE_PREFIX_LEN,
+            rto_floor: Duration::from_millis(crate::defaults::GOSSIP_RTO_FLOOR_MS),
+            relay_floor: Duration::from_millis(crate::defaults::GOSSIP_RELAY_FLOOR_MS),
         }
     }
 }

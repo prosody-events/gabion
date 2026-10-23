@@ -30,6 +30,9 @@ use crate::wire::HmacKey;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 
+mod mock;
+mod zones;
+
 // -- in-memory aggregate store ----------------------------------------------
 
 /// Single-threaded in-memory aggregate store used as the canonical test
@@ -160,8 +163,6 @@ impl Arbitrary for SimRecord {
 #[derive(Clone, Debug)]
 struct ConnectedClusterCase {
     nodes: u16,
-    fanout: u16,
-    peer_degree: u16,
     records: Vec<SimRecord>,
     drop_first: u8,
 }
@@ -174,12 +175,6 @@ impl Arbitrary for ConnectedClusterCase {
         let len = usize::arbitrary(g) % max_records;
         Self {
             nodes,
-            fanout: if nodes == 1 {
-                0
-            } else {
-                (u16::arbitrary(g) % (nodes - 1)) + 1
-            },
-            peer_degree: (u16::arbitrary(g) % 7) + 4,
             records: (0..len).map(|_| SimRecord::arbitrary(g)).collect(),
             drop_first: u8::arbitrary(g) % 4,
         }
@@ -314,22 +309,14 @@ fn store_for_property_rules(identity: NodeIdentity, node_capacity: u16) -> CellS
     store
 }
 
-fn overlay_peers(addrs: &[SocketAddr], index: usize, degree: usize) -> Vec<SocketAddr> {
-    let nodes = addrs.len();
-    if nodes <= 1 {
-        return Vec::new();
-    }
-    let degree = degree.min((nodes - 1).ilog2() as usize + 1).max(1);
-    let mut peers = Vec::with_capacity(degree * 2);
-    let mut offset = 1_usize;
-    for _ in 0..degree {
-        peers.push(addrs[(index + offset) % nodes]);
-        peers.push(addrs[(index + nodes - (offset % nodes)) % nodes]);
-        offset = (offset * 2).min(nodes - 1);
-    }
-    peers.sort_unstable();
-    peers.dedup();
-    peers
+/// Every other node: discovery gives each node the full membership.
+fn full_mesh(addrs: &[SocketAddr], index: usize) -> Vec<SocketAddr> {
+    addrs
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != index)
+        .map(|(_, &addr)| addr)
+        .collect()
 }
 
 async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
@@ -359,14 +346,12 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
     let mut clients = Vec::with_capacity(nodes);
     let mut handles = Vec::with_capacity(nodes);
     let mut aggregates = Vec::with_capacity(nodes);
-    let peer_degree = case.peer_degree as usize;
     let node_capacity =
         ((case.records.len() + 1).next_power_of_two().max(8)).min(u16::MAX as usize) as u16;
     for i in 0..nodes {
         let identity = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
-        let peers = overlay_peers(&addrs, i, peer_degree);
+        let peers = full_mesh(&addrs, i);
         let mut cfg = sim_config(identity, peers, 0xBAD5_EED0 + i as u64);
-        cfg.fanout = (case.fanout as usize).min(nodes.saturating_sub(1));
         cfg.max_cells_per_tick = 128;
         cfg.send_queue_capacity = 128;
         let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
@@ -1137,63 +1122,6 @@ async fn record_returns_after_apply_completes() {
         .await;
 }
 
-// -- per-peer pruning -------------------------------------------------------
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn per_peer_frame_prunes_acked_cells() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr_a = sock(40_050);
-            let addr_b = sock(40_051);
-            let t_a = router.bind(addr_a);
-            let t_b = router.bind(addr_b);
-
-            let id_a = NodeIdentity::new(NodeId(0xAA00), 1);
-            let id_b = NodeIdentity::new(NodeId(0xBB00), 1);
-
-            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
-
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                t_a,
-                TokioClock::from_millis(0),
-                sim_config(id_a, vec![addr_b], 1),
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            let (rt_b, _client_b) = GossipRuntime::from_parts(
-                t_b,
-                TokioClock::from_millis(0),
-                sim_config(id_b, vec![addr_a], 2),
-                store_for(id_b),
-                agg_b.clone(),
-            );
-
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
-
-            client_a
-                .record(0xDEAD, KeyHash(1), 0, 4, 0, 0)
-                .await
-                .unwrap();
-            // Drive enough ticks for the eager-push lane to converge.
-            sim_advance_ticks(Duration::from_millis(100), 5).await;
-
-            let sum_a = agg_a.total();
-            let sum_b = agg_b.total();
-            assert_eq!(sum_a, 4);
-            assert_eq!(sum_b, 4);
-
-            client_a.shutdown().await.unwrap();
-            let _ = h_a.await;
-            h_b.abort();
-            let _ = h_b.await;
-        })
-        .await;
-}
-
 // -- dropped packet repair --------------------------------------------------
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1341,180 +1269,6 @@ async fn partition_then_heal() {
             let _ = h_c.await;
         })
         .await;
-}
-
-// -- peer sampling without replacement -------------------------------------
-
-/// Three peers, `fanout = 3` ⇒ a single tick must hit every peer exactly
-/// once. Without-replacement sampling is required for Demers' O(log N)
-/// convergence bound; with-replacement would let a tick visit some peer
-/// twice and skip another entirely.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn gossip_tick_picks_peers_without_replacement() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr_a = sock(40_090);
-            let addr_b = sock(40_091);
-            let addr_c = sock(40_092);
-            let addr_d = sock(40_093);
-            let t_a = router.bind(addr_a);
-            let t_b = router.bind(addr_b);
-            let t_c = router.bind(addr_c);
-            let t_d = router.bind(addr_d);
-
-            let id_a = NodeIdentity::new(NodeId(0xA), 1);
-            let id_b = NodeIdentity::new(NodeId(0xB), 1);
-            let id_c = NodeIdentity::new(NodeId(0xC), 1);
-            let id_d = NodeIdentity::new(NodeId(0xD), 1);
-
-            let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let agg_c = Rc::new(InMemoryAggregateStore::<u32>::new());
-            let agg_d = Rc::new(InMemoryAggregateStore::<u32>::new());
-
-            // A talks to B, C, D with fanout=3 — every tick must hit each.
-            let mut cfg_a = sim_config(id_a, vec![addr_b, addr_c, addr_d], 0xBAD_5EED);
-            cfg_a.fanout = 3;
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                t_a,
-                TokioClock::from_millis(0),
-                cfg_a,
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            // B/C/D are silent — they only receive. We hang on to their
-            // clients so the mpsc senders stay alive; dropping the client
-            // closes the channel which would cause the runtime to exit.
-            let cfg_b = sim_config(id_b, Vec::new(), 2);
-            let cfg_c = sim_config(id_c, Vec::new(), 3);
-            let cfg_d = sim_config(id_d, Vec::new(), 4);
-            let (rt_b, _client_b) = GossipRuntime::from_parts(
-                t_b,
-                TokioClock::from_millis(0),
-                cfg_b,
-                store_for(id_b),
-                agg_b.clone(),
-            );
-            let (rt_c, _client_c) = GossipRuntime::from_parts(
-                t_c,
-                TokioClock::from_millis(0),
-                cfg_c,
-                store_for(id_c),
-                agg_c.clone(),
-            );
-            let (rt_d, _client_d) = GossipRuntime::from_parts(
-                t_d,
-                TokioClock::from_millis(0),
-                cfg_d,
-                store_for(id_d),
-                agg_d.clone(),
-            );
-
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
-            let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
-            let h_d = tokio::task::spawn_local(rt_d.run(futures::stream::empty()));
-
-            client_a
-                .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
-                .await
-                .unwrap();
-            // With fanout = peer_count, every peer must receive the cell on
-            // the first tick that fires after the record. Without-replacement
-            // sampling is the invariant under test; with-replacement would
-            // leave at least one peer empty whenever the tick double-picks.
-            sim_advance_ticks(Duration::from_millis(100), 20).await;
-
-            let got_b = agg_b.total();
-            let got_c = agg_c.total();
-            let got_d = agg_d.total();
-            assert_eq!((got_b, got_c, got_d), (1, 1, 1));
-
-            client_a.shutdown().await.unwrap();
-            let _ = h_a.await;
-            h_b.abort();
-            h_c.abort();
-            h_d.abort();
-            let _ = h_b.await;
-            let _ = h_c.await;
-            let _ = h_d.await;
-        })
-        .await;
-}
-
-// -- coverage fanout: ⌈ln(n)+c⌉, scaled by cluster size --------------------
-
-/// Drive a single node against a sweep of bootstrap-peer counts and read
-/// the chosen per-tick fanout back through the admin snapshot. The pick is
-/// the coverage threshold `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`
-/// (Kermarrec, Massoulié & Ganesh, TPDS 2003, Thm 1) — a function of the
-/// peer count, *not* the dirty set. Covers the `n=1` floor-clip edge
-/// (`⌈0+c⌉` clamped to 1) and a 255-peer large cluster.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn coverage_fanout_tracks_ln_n_plus_c() {
-    use crate::defaults::{GOSSIP_COVERAGE_MARGIN, GOSSIP_FANOUT};
-
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            for peers in [1usize, 8, 31, 99, 255] {
-                let coverage = ((peers as f64).ln() + GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-                let expected = GOSSIP_FANOUT.max(coverage).min(peers);
-                let observed = observe_coverage_fanout(peers, GOSSIP_FANOUT).await;
-                assert_eq!(
-                    observed, expected,
-                    "coverage fanout for {peers} peers: expected max({GOSSIP_FANOUT}, \
-                     ⌈ln({peers})+{GOSSIP_COVERAGE_MARGIN}⌉={coverage}).min({peers}) = \
-                     {expected}, got {observed}",
-                );
-            }
-        })
-        .await;
-}
-
-/// Build one node with `peers` unbound bootstrap addresses, give it a cell
-/// to gossip, and return the `last_effective_fanout` it records on the next
-/// dirty tick. The peers need not run: the sim transport treats a send to an
-/// unbound address as delivered on the floor (UDP semantics), and the runtime
-/// records `last_effective_fanout` from the computed pick *before* any send,
-/// so the addresses serve only to set `self.peers.len()`.
-async fn observe_coverage_fanout(peers: usize, base: usize) -> usize {
-    use tokio::sync::mpsc;
-
-    use crate::gossip::AdminCommand;
-
-    let router = SimRouter::new();
-    let local_addr = sock(41_000);
-    let transport = router.bind(local_addr);
-
-    let bootstrap: Vec<SocketAddr> = (0..peers).map(|i| sock(41_001 + i as u16)).collect();
-    let identity = NodeIdentity::new(NodeId(0x5EED), 1);
-    let mut cfg = sim_config(identity, bootstrap, 1);
-    cfg.fanout = base;
-
-    let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(4);
-    let (rt, client) = GossipRuntime::from_parts_with_admin(
-        transport,
-        TokioClock::from_millis(0),
-        cfg,
-        store_for(identity),
-        Rc::new(InMemoryAggregateStore::<u32>::new()),
-        Some(admin_rx),
-    );
-    let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
-
-    client
-        .record(0xC0FFEE, KeyHash(1), 0, 1, 0, 0)
-        .await
-        .unwrap();
-    sim_advance_ticks(Duration::from_millis(100), 3).await;
-
-    let snap = admin_snapshot(&admin_tx).await;
-    client.shutdown().await.unwrap();
-    let _ = handle.await;
-    snap.last_effective_fanout
 }
 
 // -- UDP smoke --------------------------------------------------------------
@@ -1667,7 +1421,6 @@ async fn admin_snapshot_reflects_runtime_state() {
             assert_eq!(snapshot.peers[0].addr, sock(40_301));
             assert!(snapshot.peers[0].node_id.is_none());
             assert!(snapshot.store_stats.active_cells >= 1);
-            assert!(snapshot.local_dirty_len >= 1);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;
@@ -1688,251 +1441,6 @@ async fn admin_snapshot(
         .await
         .expect("admin command channel open");
     reply_rx.await.expect("runtime replied to snapshot")
-}
-
-// -- Gap 1: peer-cache pairing invariant ------------------------------------
-
-#[derive(Clone, Debug)]
-enum PairingOp {
-    AddPeer(u8),
-    RemovePeer(u8),
-    Record(u8),
-}
-
-impl Arbitrary for PairingOp {
-    fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 4 {
-            0 => PairingOp::AddPeer(u8::arbitrary(g)),
-            1 => PairingOp::RemovePeer(u8::arbitrary(g)),
-            _ => PairingOp::Record(u8::arbitrary(g)),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct PairingCase {
-    ops: Vec<PairingOp>,
-}
-
-impl Arbitrary for PairingCase {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let len = (usize::arbitrary(g) % 12) + 2;
-        Self {
-            ops: (0..len).map(|_| PairingOp::arbitrary(g)).collect(),
-        }
-    }
-}
-
-/// Invariant: in every peer entry observed via admin snapshot,
-/// `node_id.is_some()` iff `peer_slot.is_some()`. The runtime sets the two
-/// together (runtime.rs `handle_inbound`); a future refactor that breaks
-/// the pairing would not break convergence — gossip would just silently
-/// re-send unpruned frames — so the bug would slip past every existing
-/// property test. This case stresses `PeerEvent::Added/Removed` interleaved
-/// with `record()` and snapshots after each step.
-#[quickcheck]
-fn quickcheck_peer_slot_pairing_holds_across_lifecycle(case: PairingCase) -> TestResult {
-    use crate::discovery::{Peer, PeerEvent};
-    use tokio::sync::mpsc;
-
-    run_paused(async move {
-        const NODE_COUNT: usize = 3;
-        let router = SimRouter::new();
-        let addrs: Vec<SocketAddr> = (0..NODE_COUNT).map(|i| sock(48_000 + i as u16)).collect();
-
-        let id_local = NodeIdentity::new(NodeId(0xA0A0), 1);
-        let mut cfg = sim_config(id_local, Vec::new(), 1);
-        cfg.fanout = NODE_COUNT.saturating_sub(1);
-
-        let (admin_tx, admin_rx) = mpsc::channel(8);
-        let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
-        let peer_stream = futures::stream::unfold(peer_rx, |mut rx| async move {
-            rx.recv().await.map(|evt| (evt, rx))
-        });
-
-        let local_addr = addrs[0];
-        let (rt_local, client_local) = GossipRuntime::from_parts_with_admin(
-            router.bind(local_addr),
-            TokioClock::from_millis(0),
-            cfg,
-            store_for(id_local),
-            Rc::new(InMemoryAggregateStore::<u32>::new()),
-            Some(admin_rx),
-        );
-        let h_local = tokio::task::spawn_local(rt_local.run(peer_stream));
-
-        let mut remote_clients = Vec::new();
-        let mut remote_handles = Vec::new();
-        for (i, addr) in addrs.iter().enumerate().skip(1) {
-            let id = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
-            let mut cfg = sim_config(id, vec![local_addr], 100 + i as u64);
-            cfg.fanout = 1;
-            let (rt, client) = GossipRuntime::from_parts(
-                router.bind(*addr),
-                TokioClock::from_millis(0),
-                cfg,
-                store_for(id),
-                Rc::new(InMemoryAggregateStore::<u32>::new()),
-            );
-            remote_handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-            remote_clients.push(client);
-        }
-
-        let mut invariant_holds = true;
-        let mut snapshots = 0usize;
-        for op in &case.ops {
-            match op {
-                PairingOp::AddPeer(idx) => {
-                    let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
-                    let _ = peer_tx.send(PeerEvent::Added(Peer::new(target)));
-                }
-                PairingOp::RemovePeer(idx) => {
-                    let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
-                    let _ = peer_tx.send(PeerEvent::Removed(Peer::new(target)));
-                }
-                PairingOp::Record(key) => {
-                    let _ = client_local
-                        .record(0xAAAA, key_hash(*key), 0, 1, 0, 0)
-                        .await;
-                }
-            }
-            sim_advance_ticks(Duration::from_millis(100), 3).await;
-            let snap = admin_snapshot(&admin_tx).await;
-            snapshots += 1;
-            for peer in &snap.peers {
-                if peer.node_id.is_some() != peer.peer_slot.is_some() {
-                    invariant_holds = false;
-                }
-            }
-        }
-
-        client_local.shutdown().await.unwrap();
-        for client in remote_clients {
-            let _ = client.shutdown().await;
-        }
-        let _ = h_local.await;
-        for handle in remote_handles {
-            let _ = handle.await;
-        }
-
-        if snapshots == 0 {
-            TestResult::discard()
-        } else {
-            TestResult::from_bool(invariant_holds)
-        }
-    })
-}
-
-// -- Gap 2: without-replacement sampling distribution -----------------------
-
-#[derive(Clone, Debug)]
-struct SamplingCase {
-    seed: u64,
-}
-
-impl Arbitrary for SamplingCase {
-    fn arbitrary(g: &mut Gen) -> Self {
-        Self {
-            seed: u64::arbitrary(g),
-        }
-    }
-}
-
-/// Per-peer delivery counts under strict-fanout sampling should be roughly
-/// uniform. The existing `gossip_tick_picks_peers_without_replacement` uses
-/// `fanout == peer_count` so even a degenerate sampler (always picks peer 0)
-/// passes — every peer ends up picked at least once per tick anyway. This
-/// case keeps the effective pick strictly below the peer count so a broken
-/// sampler concentrates all deliveries on a few peers and starves the rest.
-/// The effective pick is the coverage fanout `⌈ln(8) + c⌉ = 7` (which
-/// overrides the lower configured floor), still 7 of 8 peers per tick.
-#[quickcheck]
-fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
-    case: SamplingCase,
-) -> TestResult {
-    run_paused(async move {
-        const PEERS: usize = 8;
-        const FANOUT: usize = 4;
-        const TICKS: u32 = 100;
-        let router = SimRouter::with_channel_capacity(128);
-        let sender_addr = sock(49_000);
-        let peer_addrs: Vec<SocketAddr> = (0..PEERS).map(|i| sock(49_001 + i as u16)).collect();
-
-        let id_sender = NodeIdentity::new(NodeId(0xB000), 1);
-        let mut cfg_sender = sim_config(id_sender, peer_addrs.clone(), case.seed);
-        cfg_sender.fanout = FANOUT;
-        let agg_sender = Rc::new(InMemoryAggregateStore::<u32>::new());
-        let (rt_sender, client_sender) = GossipRuntime::from_parts(
-            router.bind(sender_addr),
-            TokioClock::from_millis(0),
-            cfg_sender,
-            store_for(id_sender),
-            agg_sender,
-        );
-        let h_sender = tokio::task::spawn_local(rt_sender.run(futures::stream::empty()));
-
-        // Silent recipients — they receive but don't emit gossip themselves
-        // (their stores are empty, so `handle_gossip_tick` early-returns).
-        // We hold the clients to keep their request channels alive.
-        let mut peer_clients = Vec::with_capacity(PEERS);
-        let mut peer_handles = Vec::with_capacity(PEERS);
-        for (i, addr) in peer_addrs.iter().enumerate() {
-            let id = NodeIdentity::new(NodeId(0xB100 + i as u128), 1);
-            let cfg = sim_config(id, Vec::new(), 1000 + i as u64);
-            let (rt, client) = GossipRuntime::from_parts(
-                router.bind(*addr),
-                TokioClock::from_millis(0),
-                cfg,
-                store_for(id),
-                Rc::new(InMemoryAggregateStore::<u32>::new()),
-            );
-            peer_handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-            peer_clients.push(client);
-        }
-
-        // One record so the sender has dirty data to gossip every tick.
-        client_sender
-            .record(0xB055, KeyHash(1), 0, 1, 0, 0)
-            .await
-            .unwrap();
-
-        sim_advance_ticks(Duration::from_millis(100), TICKS).await;
-
-        let counts: Vec<u64> = peer_addrs
-            .iter()
-            .map(|addr| router.received_count(*addr))
-            .collect();
-        let total: u64 = counts.iter().sum();
-        // The runtime scales the per-tick pick to the coverage fanout
-        // `⌈ln(PEERS) + c⌉`, which exceeds the configured `FANOUT` floor —
-        // so the expected per-peer mean is driven by the effective pick, not
-        // by `FANOUT`. Still strictly below `PEERS`, so a broken sampler
-        // starves the unpicked peers.
-        let coverage =
-            ((PEERS as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-        let effective = FANOUT.max(coverage).min(PEERS);
-        let expected = (TICKS as u64) * (effective as u64) / (PEERS as u64);
-        let lower = expected / 2;
-        let upper = expected * 2;
-        let uniform = counts.iter().all(|&c| c >= lower && c <= upper);
-        if !uniform {
-            eprintln!(
-                "non-uniform sampling distribution: seed={}, counts={:?}, total={}, \
-                 expected_per_peer={}, bound=[{},{}]",
-                case.seed, counts, total, expected, lower, upper
-            );
-        }
-
-        client_sender.shutdown().await.unwrap();
-        for client in peer_clients {
-            let _ = client.shutdown().await;
-        }
-        let _ = h_sender.await;
-        for handle in peer_handles {
-            let _ = handle.await;
-        }
-        TestResult::from_bool(uniform)
-    })
 }
 
 // -- Gap 3: decode rejection counter ----------------------------------------
@@ -1958,6 +1466,8 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
 
             let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
             cfg_a.auth_key = Some(HmacKey([7; 32]));
+            // Resend every tick, so each tick yields one rejected packet.
+            cfg_a.rto_floor = Duration::from_millis(100);
             let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
             cfg_b.auth_key = Some(HmacKey([8; 32]));
 

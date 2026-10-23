@@ -16,6 +16,9 @@
 //!   decoding the body.
 //! - `count_width` is strict: the decoder's `C: Count` must match the sender's
 //!   exactly.
+//! - A packet's header carries the stream range it covers and the sender's
+//!   cumulative acks, so a receiver learns what the sender holds and what the
+//!   packet closes without any session state.
 //! - Each packet is independently useful — losing packet `k` of a batch does
 //!   not invalidate packet `k+1` or any earlier packet.
 //!
@@ -30,7 +33,7 @@ mod tests;
 
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
-pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
+pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, FLAG_RELAY, HEADER_LEN, Header, MAGIC, VERSION};
 
 use auth::AUTH_TAG_LEN;
 use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
@@ -179,6 +182,9 @@ pub struct Packets<'a, C: Count> {
     scratch: &'a mut WireScratch,
     limits: FrameLimits,
     cursor: usize,
+    /// Stream sequence of each handle, ascending and parallel to `handles`.
+    /// Empty when the caller does not use stream ranges.
+    stamps: &'a [u64],
 }
 
 impl<C: Count> Drop for Packets<'_, C> {
@@ -198,7 +204,8 @@ impl<'a, C: Count> Packets<'a, C> {
     /// Build an unauthenticated packet iterator. The `cluster_id_hash`,
     /// `sender_node_id`, `sender_incarnation` fields of `header` are copied
     /// into every packet; the codec overwrites `count_width`, `cell_count`,
-    /// `body_len`, `flags`, `min/max_origin_sequence` on each packet.
+    /// `body_len`, `flags`, and (with [`Packets::with_stamps`]) the stream
+    /// range on each packet.
     pub fn unauth(
         header: Header,
         store: &'a CellStore<C>,
@@ -244,12 +251,31 @@ impl<'a, C: Count> Packets<'a, C> {
             scratch,
             limits,
             cursor: 0,
+            stamps: &[],
         })
+    }
+
+    /// Cover `handles` with stream ranges: `stamps[i]` is the stream
+    /// sequence of `handles[i]`, ascending. Each packet then states the range
+    /// `(lower, upper]` it closes: `header.stream_lower` for the first packet,
+    /// the previous packet's `upper` for the rest, and the stamp of the last
+    /// handle the packet consumed as `upper`.
+    pub fn with_stamps(mut self, stamps: &'a [u64]) -> Self {
+        debug_assert_eq!(stamps.len(), self.handles.len());
+        self.stamps = stamps;
+        self
     }
 
     /// Handles still to be encoded into a packet.
     pub fn remaining(&self) -> usize {
         self.handles.len() - self.cursor
+    }
+
+    /// Give up on the handles not yet encoded, so dropping the iterator is
+    /// not a data-loss bug. For a sender that ran out of send slots and
+    /// will rebuild the frame next round.
+    pub fn abandon(&mut self) {
+        self.cursor = self.handles.len();
     }
 
     /// Encode the next packet into `buf`. The encoder clears `buf` first.
@@ -308,8 +334,12 @@ impl<'a, C: Count> Packets<'a, C> {
         packet_header.count_width = std::mem::size_of::<C>() as u32;
         packet_header.cell_count = encoded.cells_emitted;
         packet_header.body_len = encoded.body_len as u32;
-        packet_header.min_origin_sequence = encoded.min_origin_sequence;
-        packet_header.max_origin_sequence = encoded.max_origin_sequence;
+        if let Some(&upper) = self.stamps.get(next_cursor - 1) {
+            if let Some(&lower) = self.stamps.get(self.cursor.wrapping_sub(1)) {
+                packet_header.stream_lower = lower;
+            }
+            packet_header.stream_upper = upper;
+        }
 
         patch_header(&mut buf.inner[..HEADER_LEN], &packet_header);
 
@@ -330,6 +360,34 @@ impl<'a, C: Count> Packets<'a, C> {
             flags,
         }))
     }
+}
+
+/// Encode a packet that carries no cells, only the header's acks. The
+/// sender uses it when it owes a peer an ack and has no data to piggyback it
+/// on. Unlike [`Packets`], `header.stream_lower`/`stream_upper` are written
+/// as given (callers pass zero: the packet closes no range).
+pub fn encode_header_only<C: Count>(
+    mut header: Header,
+    key: Option<&HmacKey>,
+    buf: &mut PacketBuf,
+) {
+    buf.inner.clear();
+    buf.inner.resize(HEADER_LEN, 0);
+    header.count_width = std::mem::size_of::<C>() as u32;
+    header.cell_count = 0;
+    header.body_len = 0;
+    header.flags &= !FLAG_MORE;
+    if key.is_some() {
+        header.flags |= FLAG_AUTHENTICATED;
+    } else {
+        header.flags &= !FLAG_AUTHENTICATED;
+    }
+    patch_header(&mut buf.inner[..HEADER_LEN], &header);
+    if let Some(key) = key {
+        let tag = auth::sign(key, &buf.inner[..HEADER_LEN]);
+        buf.inner.extend_from_slice(&tag);
+    }
+    debug_assert!(buf.inner.len() <= buf.capacity);
 }
 
 // -- decode -----------------------------------------------------------------
