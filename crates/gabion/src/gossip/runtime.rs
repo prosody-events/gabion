@@ -31,7 +31,7 @@ use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
-use super::snow::{Child, Ctrl, MAX_CHILDREN, Origins, Relays, Ring, RttEstimator, TreeParams};
+use super::snow::{Ctrl, Origins, Relays, Ring, RttEstimator, TreeParams};
 use super::store::AggregateStore;
 use super::transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
@@ -115,11 +115,11 @@ where
     origins: Origins,
     relays: Relays,
     rtt: RttEstimator,
-    children_buf: Vec<Child>,
     /// Highest local origin sequence already handed to a broadcast.
     sent_seq: u64,
     last_repair_ms: u64,
     unacked_total: u64,
+    send_dropped_total: u64,
 
     // Pending reply for the in-flight limit request. Sent after the
     // bottom-of-loop apply so callers observe "ack ⇒ AggregateStore reflects
@@ -316,10 +316,10 @@ where
             origins,
             relays,
             rtt: RttEstimator::default(),
-            children_buf: Vec::with_capacity(MAX_CHILDREN),
             sent_seq: 0,
             last_repair_ms: 0,
             unacked_total: 0,
+            send_dropped_total: 0,
             pending_reply: None,
             decode_reject_count: 0,
             max_send_pending_depth: 0,
@@ -737,11 +737,10 @@ where
 
         // Reset per-rule pending. The sweep treats every rule with
         // non-zero pending as "touched in expectation by the tick": every
-        // pending hit either rode out in this round's broadcasts or was
-        // skipped for want of a free send buffer, in which case it stays
-        // above `sent_seq` for the next round. A broadcast the tree could not
-        // complete is repaired by the repair pass; the N × ε_R bound holds in
-        // expectation.
+        // pending hit was rooted in this round's broadcasts. A packet that
+        // could not be queued (no free send buffer) is counted and logged,
+        // and left to the rebroadcast and the repair pass; the N × ε_R bound
+        // holds in expectation.
         let stamp = now_millis.max(1);
         for slot in 0..self.rule_pending.len() {
             if self.rule_pending[slot] != 0 {

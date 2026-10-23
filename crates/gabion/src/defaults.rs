@@ -25,7 +25,7 @@ pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 /// Branching factor `k` of the Snow broadcast tree (Tong, arXiv 2504.02676,
 /// default `k = 4`): each node forwards a broadcast to at most `k` children and
 /// a root waits for `k` acknowledgements. Each side of a node's range is split
-/// into `k / 2` sub-ranges, so the runtime clamps `k` to `2..=16`.
+/// into `k / 2` sub-ranges, so the runtime clamps `k` to `2..=8`.
 pub const GOSSIP_FANOUT: usize = 4;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
@@ -66,8 +66,11 @@ pub const GOSSIP_ROOT_REBROADCASTS: u8 = 1;
 /// Cells the periodic repair pass sends to one random peer per heartbeat.
 /// The repair pass is the rotating anti-entropy slice of the cell store that
 /// backs every dissemination design; it covers broadcasts the tree could not
-/// complete and cells a newly joined node missed.
-pub const GOSSIP_REPAIR_CELLS_PER_TICK: usize = 64;
+/// complete and cells a newly joined node missed. The paper leaves the repair
+/// lane unspecified; 256 is the heartbeat repair slice the study's other
+/// push design uses (`flat-once`, section 3.4 of the survey), so the lanes
+/// behind each dissemination design carry the same volume.
+pub const GOSSIP_REPAIR_CELLS_PER_TICK: usize = 256;
 
 /// Per-hop round-trip estimate used to seed the acknowledgement timeout
 /// before the first broadcast completes: `tree height * this`.
@@ -79,7 +82,7 @@ pub const GOSSIP_TREE_TIMER_TICK_MS: u64 = 5;
 
 /// Broadcasts a node can forward for other roots at once before the oldest
 /// is forgotten (forgetting costs at most one redundant forward).
-pub const GOSSIP_TREE_RELAY_CAPACITY: usize = 2048;
+pub const GOSSIP_TREE_RELAY_CAPACITY: usize = 1024;
 
 /// Broadcasts a node can have awaiting acknowledgement as a root.
 pub const GOSSIP_TREE_ORIGIN_CAPACITY: usize = 64;

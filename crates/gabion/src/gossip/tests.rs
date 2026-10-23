@@ -1301,6 +1301,16 @@ struct TreeCluster {
 
 impl TreeCluster {
     fn start(n: usize, router: SimRouter, tweak: impl Fn(&mut TreeParams)) -> Self {
+        Self::start_with(n, router, CellStoreConfig::default(), |_| {}, tweak)
+    }
+
+    fn start_with(
+        n: usize,
+        router: SimRouter,
+        cells: CellStoreConfig,
+        config: impl Fn(&mut GossipConfig),
+        tweak: impl Fn(&mut TreeParams),
+    ) -> Self {
         let addrs: Vec<SocketAddr> = (0..n).map(|i| sock(42_000 + i as u16)).collect();
         let mut cluster = Self {
             router,
@@ -1312,13 +1322,14 @@ impl TreeCluster {
         for (i, addr) in addrs.iter().enumerate() {
             let identity = NodeIdentity::new(NodeId(0x7000 + i as u128), 1);
             let peers = addrs.iter().copied().filter(|a| a != addr).collect();
-            let cfg = sim_config(identity, peers, 1 + i as u64);
+            let mut cfg = sim_config(identity, peers, 1 + i as u64);
+            config(&mut cfg);
             let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
             let (rt, client) = GossipRuntime::from_parts(
                 cluster.router.bind(*addr),
                 TokioClock::from_millis(0),
                 cfg,
-                store_for(identity),
+                CellStore::<u32>::new(cells, identity),
                 agg.clone(),
             );
             let rt = rt.with_tree_params(|params| {
@@ -1409,7 +1420,7 @@ async fn root_rebroadcast_recovers_a_lost_first_send() {
 /// sends once more, to the silent child only, then stops.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn acks_aggregate_bottom_up_and_the_root_retries_once() {
-    use crate::gossip::snow::{Child, Ring};
+    use crate::gossip::snow::{Children, Ring};
 
     let local = LocalSet::new();
     local
@@ -1424,14 +1435,14 @@ async fn acks_aggregate_bottom_up_and_the_root_retries_once() {
             };
 
             // The tree this cluster will build with k = 2.
-            let mut root_children: Vec<Child> = Vec::new();
+            let mut root_children = Children::new();
             view(0).root_children(2, &mut root_children);
             let (a, b) = (root_children[0], root_children[1]);
             let index_of = |addr| addrs.iter().position(|x| *x == addr).unwrap();
-            let mut under_a: Vec<Child> = Vec::new();
-            view(index_of(a.addr)).children(addrs[0], a.lo, a.hi, 2, &mut under_a);
-            let mut under_b: Vec<Child> = Vec::new();
-            view(index_of(b.addr)).children(addrs[0], b.lo, b.hi, 2, &mut under_b);
+            let mut under_a = Children::new();
+            view(index_of(a.addr)).children(a.lo, a.hi, 2, &mut under_a);
+            let mut under_b = Children::new();
+            view(index_of(b.addr)).children(b.lo, b.hi, 2, &mut under_b);
             assert!(
                 under_a.len() >= 2,
                 "A is interior with at least two children"
@@ -1465,13 +1476,49 @@ async fn acks_aggregate_bottom_up_and_the_root_retries_once() {
         .await;
 }
 
+/// A round with more changed cells than one packet holds is split into
+/// several broadcasts, and each still fits `max_payload_bytes` once the
+/// control header is added at every hop.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn full_packets_still_fit_once_the_control_header_is_added() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let cluster = TreeCluster::start_with(
+                9,
+                SimRouter::new(),
+                CellStoreConfig {
+                    local_dirty_capacity: 512,
+                    ..CellStoreConfig::default()
+                },
+                |cfg| cfg.wire_limits.max_payload_bytes = crate::defaults::GOSSIP_MAX_PAYLOAD_BYTES,
+                |_| {},
+            );
+            for key in 0..200_u128 {
+                cluster.clients[0]
+                    .record(0xDEAD, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 10).await;
+
+            assert!(
+                cluster.aggs.iter().all(|agg| agg.total() == 200),
+                "totals: {:?}",
+                cluster.aggs.iter().map(|a| a.total()).collect::<Vec<_>>()
+            );
+            cluster.stop().await;
+        })
+        .await;
+}
+
 /// A repeat of a broadcast is pushed on to the silent children only when it
 /// comes from the node that first handed it over. A node that names an
 /// ancestor as its child (views disagree) must not set the packet circling.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_repeat_from_anyone_but_the_parent_is_not_forwarded() {
     use crate::gossip::GossipTransport;
-    use crate::gossip::snow::{CTRL_MAX_LEN, Child, Ctrl, Ring};
+    use crate::gossip::snow::{CTRL_MAX_LEN, Children, Ctrl, Ring};
     use crate::wire::{FrameLimits, Header, PacketBuf, encode_ext_only};
 
     let local = LocalSet::new();
@@ -1488,11 +1535,11 @@ async fn a_repeat_from_anyone_but_the_parent_is_not_forwarded() {
 
             // The range the parent hands X: everything from the first of
             // `others` on. Work out X's children the way X will.
-            let (lo, hi) = (others[0], None);
+            let (lo, hi) = (others[0], root);
             let mut view = Ring::new(x, members.len());
             members.iter().for_each(|m| _ = view.insert(*m));
-            let mut children: Vec<Child> = Vec::new();
-            view.children(root, lo, hi, 2, &mut children);
+            let mut children = Children::new();
+            view.children(lo, hi, 2, &mut children);
             assert!(!children.is_empty());
 
             let sinks: Vec<_> = members[1..].iter().map(|a| router.bind(*a)).collect();

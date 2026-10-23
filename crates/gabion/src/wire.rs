@@ -476,7 +476,7 @@ fn decode_inner<'a, C: Count>(
 
 /// Bytes the control extension adds to a body: its `u16` length prefix plus
 /// the extension itself.
-const EXT_PREFIX_LEN: usize = 2;
+pub const EXT_PREFIX_LEN: usize = 2;
 
 /// Split a body into its control extension and the cell body.
 fn split_ext(flags: u16, body: &[u8]) -> Result<(&[u8], &[u8]), DecodeError> {

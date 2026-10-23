@@ -9,6 +9,7 @@ license.workspace = true
 # by `discovery-kubernetes`. This keeps it (and its `getrandom` backend) out of
 # the wasm build entirely.
 ahash = { workspace = true, optional = true }
+arrayvec.workspace = true
 async-stream.workspace = true
 bon.workspace = true
 educe.workspace = true

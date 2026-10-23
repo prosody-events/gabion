@@ -15,11 +15,11 @@
 use std::net::SocketAddr;
 
 use crate::crdt::Count;
-use crate::wire::{self, Header, Packets};
+use crate::wire::{self, EXT_PREFIX_LEN, FrameLimits, Header, Packets};
 
-use super::{Child, Ctrl, GossipRuntime};
+use super::{Ctrl, GossipRuntime};
 use crate::gossip::clock::Clock;
-use crate::gossip::snow::{CTRL_MAX_LEN, Relay, full_mask, tree_height};
+use crate::gossip::snow::{CTRL_MAX_LEN, Child, Children, Relay, full_mask, tree_height};
 use crate::gossip::store::AggregateStore;
 use crate::gossip::transport::GossipTransport;
 
@@ -88,7 +88,13 @@ where
         let remaining = self.frame_handles.len() - cursor;
         let (idx, _displaced) = self.origins.claim(now_millis);
         let header = self.sender_header();
-        let limits = self.config.wire_limits;
+        // Leave room for the control extension each hop adds, so that a
+        // packet that came out full still fits once it is reframed.
+        let limits = FrameLimits {
+            max_payload_bytes: (self.config.wire_limits.max_payload_bytes)
+                .saturating_sub(EXT_PREFIX_LEN + CTRL_MAX_LEN),
+            ..self.config.wire_limits
+        };
         let encoded = {
             let handles = &self.frame_handles[cursor..];
             let packets = match self.config.auth_key.as_ref() {
@@ -148,19 +154,26 @@ where
             self.config.auth_key.as_ref(),
             self.config.wire_limits,
         );
-        self.send.enqueue(addr, |out| {
+        let queued = self.send.enqueue(addr, |out| {
             wire::reframe(origin.packet.as_bytes(), header, ext, key, limits, out).is_ok()
         });
+        if !queued {
+            self.note_send_dropped(addr);
+        }
     }
 
     /// Acknowledgement deadlines: rebroadcast to the children that have not
     /// answered, or give the broadcast up to the repair pass.
     pub(super) fn handle_ack_timer(&mut self) {
         let now = self.clock.now_millis();
+        let mut backed_off = false;
         for idx in 0..self.origins.len() {
             let origin = self.origins.get(idx);
             if !origin.is_live() || origin.deadline_ms > now {
                 continue;
+            }
+            if !std::mem::replace(&mut backed_off, true) {
+                self.rtt.timed_out();
             }
             if origin.rebroadcasts_left == 0 {
                 self.note_unacked(idx);
@@ -175,6 +188,27 @@ where
             for child in (0..children).filter(|c| acked & (1 << c) == 0) {
                 self.send_to_child_from_origin(idx, child);
             }
+        }
+    }
+
+    /// A tree packet could not be queued: every send buffer was in use, or
+    /// the frame did not fit `max_payload_bytes`.
+    fn note_send_dropped(&mut self, dst: SocketAddr) {
+        self.send_dropped_total = self.send_dropped_total.saturating_add(1);
+        if self.send_dropped_total.is_power_of_two() {
+            tracing::warn!(
+                send_dropped_total = self.send_dropped_total,
+                peer = %dst,
+                send_queue_capacity = self.config.send_queue_capacity,
+                "A gossip packet for this peer was dropped before it was sent, so the \
+                 peer and the nodes behind it may under-count recent requests until \
+                 the periodic repair pass reaches them, and the cluster can briefly \
+                 admit more than the limit. Usually the node is sending in bursts \
+                 faster than the socket drains, or `max_payload_bytes` is too small \
+                 for the tree header. Raise `send_queue_capacity` in the gossip \
+                 config, and check that `max_payload_bytes` leaves room for the \
+                 control header.",
+            );
         }
     }
 
@@ -214,63 +248,57 @@ where
         root: SocketAddr,
         seq: u32,
         lo: SocketAddr,
-        hi: Option<SocketAddr>,
+        hi: SocketAddr,
         n: usize,
     ) {
         if root == self.ring.me() {
             return;
         }
-        let k = self.branching();
-        if let Some(relay) = self
-            .relays
-            .find(root, seq)
-            .and_then(|i| self.relays.get_mut(i))
-        {
+        if let Some(idx) = self.relays.find(root, seq) {
             // The root rebroadcast. Acknowledge again if this node already
             // did. Otherwise push the cells to the children still silent, but
             // only when the rebroadcast came down from the parent: views that
             // disagree can name an ancestor as a child, and following that
             // edge would circulate the packet forever.
-            let relay = *relay;
+            let Some(relay) = self.relays.get_mut(idx).cloned() else {
+                return;
+            };
             if relay.done {
                 self.send_ack(src, root, seq);
-                return;
-            }
-            if src != relay.parent {
-                return;
-            }
-            self.ring
-                .children(root, relay.lo, relay.hi, k, &mut self.children_buf);
-            for child in (0..self.children_buf.len()).filter(|c| relay.acked & (1 << c) == 0) {
-                self.forward_to_child(child, root, seq, n);
+            } else if src == relay.parent {
+                for (i, child) in relay.children.into_iter().enumerate() {
+                    if relay.acked & (1 << i) == 0 {
+                        self.forward_to_child(child, root, seq, n);
+                    }
+                }
             }
             return;
         }
 
-        self.ring.children(root, lo, hi, k, &mut self.children_buf);
-        let leaf = self.children_buf.is_empty();
+        let k = self.branching();
+        let mut children = Children::new();
+        self.ring.children(lo, hi, k, &mut children);
+        let leaf = children.is_empty();
         self.relays.insert(Relay {
             root,
             seq,
             parent: src,
-            lo,
-            hi,
+            children: children.clone(),
             acked: 0,
             done: leaf,
         });
         if leaf {
             self.send_ack(src, root, seq);
-            return;
         }
-        for child in 0..self.children_buf.len() {
+        for child in children {
             self.forward_to_child(child, root, seq, n);
         }
     }
 
-    /// Forward the frame in `recv_buf[..n]` to `children_buf[child]` with
-    /// the range that child is responsible for.
-    fn forward_to_child(&mut self, child: usize, root: SocketAddr, seq: u32, n: usize) {
-        let Child { addr, lo, hi } = self.children_buf[child];
+    /// Forward the frame in `recv_buf[..n]` to `child` with the range it is
+    /// responsible for.
+    fn forward_to_child(&mut self, child: Child, root: SocketAddr, seq: u32, n: usize) {
+        let Child { addr, lo, hi } = child;
         let mut ext = [0_u8; CTRL_MAX_LEN];
         let ext = Ctrl::Data { root, seq, lo, hi }.encode(&mut ext);
         let (header, key, limits) = (
@@ -279,9 +307,12 @@ where
             self.config.wire_limits,
         );
         let frame = &self.recv_buf[..n];
-        self.send.enqueue(addr, |out| {
+        let queued = self.send.enqueue(addr, |out| {
             wire::reframe(frame, header, ext, key, limits, out).is_ok()
         });
+        if !queued {
+            self.note_send_dropped(addr);
+        }
     }
 
     fn send_ack(&mut self, dst: SocketAddr, root: SocketAddr, seq: u32) {
@@ -292,9 +323,12 @@ where
             self.config.auth_key.as_ref(),
             self.config.wire_limits,
         );
-        self.send.enqueue(dst, |out| {
+        let queued = self.send.enqueue(dst, |out| {
             wire::encode_ext_only::<C>(header, ext, key, limits, out).is_ok()
         });
+        if !queued {
+            self.note_send_dropped(dst);
+        }
     }
 
     fn on_ack(&mut self, src: SocketAddr, root: SocketAddr, seq: u32) {
@@ -316,27 +350,23 @@ where
             return;
         }
 
-        let Some(idx) = self.relays.find(root, seq) else {
-            return;
-        };
-        let Some(relay) = self.relays.get_mut(idx) else {
+        let Some(relay) = self
+            .relays
+            .find(root, seq)
+            .and_then(|idx| self.relays.get_mut(idx))
+        else {
             return;
         };
         if relay.done {
             return;
         }
-        let (lo, hi, parent) = (relay.lo, relay.hi, relay.parent);
-        let k = self.branching();
-        self.ring.children(root, lo, hi, k, &mut self.children_buf);
-        let Some(child) = self.children_buf.iter().position(|c| c.addr == src) else {
-            return;
-        };
-        let Some(relay) = self.relays.get_mut(idx) else {
+        let Some(child) = relay.children.iter().position(|c| c.addr == src) else {
             return;
         };
         relay.acked |= 1 << child;
-        if relay.acked == full_mask(self.children_buf.len()) {
+        if relay.acked == full_mask(relay.children.len()) {
             relay.done = true;
+            let parent = relay.parent;
             self.send_ack(parent, root, seq);
         }
     }

@@ -21,7 +21,7 @@ fn ring_of(me: u16, members: impl IntoIterator<Item = u16>) -> Ring {
 /// Returns, per node, the parent it was reached from and its depth.
 fn walk(n: u16, root: u16, k: usize) -> BTreeMap<SocketAddr, (SocketAddr, u32)> {
     let mut reached = BTreeMap::new();
-    let mut out = Vec::new();
+    let mut out = Children::new();
     let mut queue = Vec::new();
     ring_of(root, 0..n).root_children(k, &mut out);
     assert!(out.len() <= k, "root fans out to at most k");
@@ -31,7 +31,7 @@ fn walk(n: u16, root: u16, k: usize) -> BTreeMap<SocketAddr, (SocketAddr, u32)> 
         assert!(previous.is_none(), "{node} reached twice");
         let me = (0..n).find(|&i| addr(i) == node).expect("known node");
         let mut ring = ring_of(me, 0..n);
-        ring.children(addr(root), child.lo, child.hi, k, &mut out);
+        ring.children(child.lo, child.hi, k, &mut out);
         assert!(out.len() <= k, "interior node fans out to at most k");
         queue.extend(out.iter().map(|c| (c.addr, node, depth + 1, *c)));
     }
@@ -64,7 +64,7 @@ fn every_node_is_reached_exactly_once_within_the_tree_height() {
 #[test]
 fn small_clusters_are_flat() {
     // With at most k other nodes the root reaches all of them directly.
-    let mut out = Vec::new();
+    let mut out = Children::new();
     ring_of(0, 0..5).root_children(4, &mut out);
     assert_eq!(out.len(), 4);
     assert!(
@@ -83,12 +83,12 @@ fn small_clusters_are_flat() {
 fn children_depend_only_on_view_root_and_range() {
     let mut a = ring_of(7, 0..50);
     let mut b = ring_of(7, (0..50).rev());
-    let (mut ca, mut cb) = (Vec::new(), Vec::new());
-    a.children(addr(20), addr(30), Some(addr(45)), 4, &mut ca);
-    b.children(addr(20), addr(30), Some(addr(45)), 4, &mut cb);
+    let (mut ca, mut cb) = (Children::new(), Children::new());
+    a.children(addr(30), addr(45), 4, &mut ca);
+    b.children(addr(30), addr(45), 4, &mut cb);
     assert_eq!(ca, cb);
     // Asking twice gives the same answer: no hidden state.
-    a.children(addr(20), addr(30), Some(addr(45)), 4, &mut cb);
+    a.children(addr(30), addr(45), 4, &mut cb);
     assert_eq!(ca, cb);
 }
 
@@ -98,36 +98,86 @@ fn a_boundary_missing_from_the_local_view_is_inserted() {
     // the range it hands over.
     let mut stale = ring_of(41, (0..40).chain(41..50));
     let mut full = ring_of(41, 0..50);
-    let (mut from_stale, mut from_full) = (Vec::new(), Vec::new());
-    stale.children(addr(0), addr(40), Some(addr(50 - 1)), 4, &mut from_stale);
-    full.children(addr(0), addr(40), Some(addr(50 - 1)), 4, &mut from_full);
+    let (mut from_stale, mut from_full) = (Children::new(), Children::new());
+    stale.children(addr(40), addr(49), 4, &mut from_stale);
+    full.children(addr(40), addr(49), 4, &mut from_full);
     assert!(!from_stale.is_empty());
     assert_eq!(from_stale, from_full);
     assert_eq!(stale.len(), 49, "the view itself is not changed");
 }
 
-#[test]
-fn a_root_with_a_stale_view_misses_at_most_the_node_at_the_rotation_cut() {
-    // The root has already dropped node 13; everyone else still lists it.
-    // Rotation puts the root at `len / 2`, so the two views cut the ring one
-    // position apart and the node at the cut can fall out of every carried
-    // range. The rest of the shared view is still reached. This is the cost
-    // the carried-range rule accepts; the repair pass covers the one node.
-    let (n, root, k) = (40_u16, 5_u16, 4);
+/// Walk the tree for `root` when each node's view is given by `view_of`.
+/// Returns every node reached; panics if one is reached twice.
+fn walk_with_views(
+    n: u16,
+    root: u16,
+    k: usize,
+    view_of: impl Fn(u16) -> Vec<u16>,
+) -> BTreeSet<SocketAddr> {
     let mut reached = BTreeSet::new();
-    let mut out = Vec::new();
+    let mut out = Children::new();
     let mut queue = Vec::new();
-    ring_of(root, (0..n).filter(|&i| i != 13)).root_children(k, &mut out);
+    ring_of(root, view_of(root)).root_children(k, &mut out);
     queue.extend(out.iter().copied());
     while let Some(child) = queue.pop() {
-        assert!(reached.insert(child.addr));
+        assert!(reached.insert(child.addr), "{} reached twice", child.addr);
         let me = (0..n).find(|&i| addr(i) == child.addr).expect("node");
-        ring_of(me, 0..n).children(addr(root), child.lo, child.hi, k, &mut out);
+        ring_of(me, view_of(me)).children(child.lo, child.hi, k, &mut out);
         queue.extend(out.iter().copied());
     }
-    let shared: BTreeSet<_> = (0..n).filter(|&i| i != root && i != 13).map(addr).collect();
-    let missed: Vec<_> = shared.difference(&reached).collect();
-    assert!(missed.len() <= 1, "missed {missed:?}");
+    reached
+}
+
+#[test]
+fn a_node_with_a_stale_view_loses_at_most_the_member_it_does_not_know() {
+    // One node (the root, an interior node or a leaf) has not discovered one
+    // member. Ranges are positions on the ring rather than offsets into a
+    // view-sized sequence, so the only node that can be missed is the one that
+    // node does not know about.
+    let k = 4;
+    for n in [8_u16, 20, 40] {
+        for root in (0..n).step_by(if n <= 20 { 1 } else { 7 }) {
+            for stale in (0..n).step_by(if n <= 20 { 1 } else { 3 }) {
+                for unknown in (0..n).filter(|&u| u != stale && u != root) {
+                    let reached = walk_with_views(n, root, k, |me| {
+                        (0..n).filter(|&i| !(me == stale && i == unknown)).collect()
+                    });
+                    let expected: BTreeSet<_> = (0..n).filter(|&i| i != root).map(addr).collect();
+                    let missed: Vec<_> = expected.difference(&reached).collect();
+                    assert!(
+                        missed.iter().all(|&&a| a == addr(unknown)),
+                        "n={n} root={root} stale={stale} unknown={unknown}: missed {missed:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_view_that_lacks_a_member_does_not_cut_a_range_in_two() {
+    // 80 nodes, root 0. Node 50 has not discovered node 1. The range its
+    // parent hands it still starts and ends on shared members, so it keeps
+    // its subtree rather than treating the range as empty.
+    let (n, k) = (80_u16, 4);
+    let reached = walk_with_views(n, 0, k, |me| {
+        (0..n).filter(|&i| !(me == 50 && i == 1)).collect()
+    });
+    let expected: BTreeSet<_> = (1..n).map(addr).collect();
+    let missed: Vec<_> = expected.difference(&reached).collect();
+    assert!(missed.iter().all(|&&a| a == addr(1)), "missed {missed:?}");
+}
+
+#[test]
+fn a_node_given_a_range_with_other_nodes_in_it_is_never_a_leaf() {
+    let mut ring = ring_of(5, 0..20);
+    let mut out = Children::new();
+    for lo in 0..20 {
+        for len in 2..19 {
+            ring.children(addr(lo), addr((lo + len) % 20), 4, &mut out);
+            assert!(!out.is_empty(), "range {lo}+{len} gave no children");
+        }
+    }
 }
 
 #[test]
@@ -162,19 +212,19 @@ fn ctrl_roundtrips_both_address_families() {
             root: v4,
             seq: 9,
             lo: v4,
-            hi: None,
+            hi: v6,
         },
         Ctrl::Data {
             root: v6,
             seq: u32::MAX,
             lo: v6,
-            hi: Some(v4),
+            hi: v4,
         },
         Ctrl::Data {
             root: v6,
             seq: 0,
             lo: v6,
-            hi: Some(v6),
+            hi: v6,
         },
         Ctrl::Ack { root: v4, seq: 1 },
         Ctrl::Ack { root: v6, seq: 2 },
@@ -196,7 +246,7 @@ fn ctrl_roundtrips_both_address_families() {
         root: v6,
         seq: 0,
         lo: v6,
-        hi: Some(v6),
+        hi: v6,
     };
     assert_eq!(worst.encode(&mut [0; CTRL_MAX_LEN]).len(), CTRL_MAX_LEN);
     assert_eq!(Ctrl::decode(&[9, 0]), None);
@@ -208,8 +258,7 @@ fn relay(root: u16, seq: u32) -> Relay {
         root: addr(root),
         seq,
         parent: addr(0),
-        lo: addr(1),
-        hi: None,
+        children: Children::new(),
         acked: 0,
         done: false,
     }
@@ -266,7 +315,7 @@ fn origins_reuse_free_slots_then_displace_the_oldest() {
 fn ack_masks_cover_exactly_the_children() {
     assert_eq!(full_mask(0), 0);
     assert_eq!(full_mask(4), 0b1111);
-    assert_eq!(full_mask(16), u16::MAX);
+    assert_eq!(full_mask(8), u8::MAX);
 }
 
 #[test]
@@ -285,4 +334,22 @@ fn rtt_starts_at_the_seed_then_follows_samples() {
     assert_eq!(rtt.expected_ms(20), 30);
     rtt.sample(0);
     assert!(rtt.expected_ms(20) >= 1);
+}
+
+#[test]
+fn rtt_backs_off_after_a_timeout_and_recovers_at_the_next_sample() {
+    let mut rtt = RttEstimator::default();
+    rtt.sample(10);
+    rtt.timed_out();
+    assert_eq!(rtt.expected_ms(20), 20);
+    for _ in 0..10 {
+        rtt.timed_out();
+    }
+    assert_eq!(
+        rtt.expected_ms(20),
+        10 << RttEstimator::MAX_BACKOFF,
+        "backoff is capped"
+    );
+    rtt.sample(10);
+    assert_eq!(rtt.expected_ms(20), 10);
 }

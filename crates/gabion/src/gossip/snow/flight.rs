@@ -13,19 +13,19 @@ use std::net::SocketAddr;
 
 use crate::wire::{FrameLimits, PacketBuf};
 
-use super::ring::Child;
+use super::ring::Children;
 
 /// Most children one node can have (`k` is clamped to this).
-pub(in crate::gossip) const MAX_CHILDREN: usize = u16::BITS as usize;
+pub(in crate::gossip) const MAX_CHILDREN: usize = u8::BITS as usize;
 
 /// A broadcast this node roots.
 pub(in crate::gossip) struct Origin {
     pub seq: u32,
     /// The cell frame without a control extension.
     pub packet: PacketBuf,
-    pub children: Vec<Child>,
+    pub children: Children,
     /// Bit `i` set once `children[i]` has acknowledged.
-    pub acked: u16,
+    pub acked: u8,
     pub started_ms: u64,
     pub deadline_ms: u64,
     pub rebroadcasts_left: u8,
@@ -56,7 +56,7 @@ impl Origins {
             .map(|_| Origin {
                 seq: 0,
                 packet: PacketBuf::for_limits(limits),
-                children: Vec::with_capacity(MAX_CHILDREN),
+                children: Children::new(),
                 acked: 0,
                 started_ms: 0,
                 deadline_ms: 0,
@@ -127,15 +127,17 @@ impl Origins {
 }
 
 /// A broadcast this node forwards.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(in crate::gossip) struct Relay {
     pub root: SocketAddr,
     pub seq: u32,
     pub parent: SocketAddr,
-    pub lo: SocketAddr,
-    pub hi: Option<SocketAddr>,
-    /// Bit `i` set once the `i`-th child (in child-function order) acked.
-    pub acked: u16,
+    /// The children the first copy was forwarded to, with the ranges handed
+    /// to them. Frozen: a view change while the broadcast is in flight does
+    /// not change who must acknowledge.
+    pub children: Children,
+    /// Bit `i` set once `children[i]` acked.
+    pub acked: u8,
     /// The parent has been acknowledged.
     pub done: bool,
 }
@@ -170,7 +172,7 @@ impl Relays {
     pub fn insert(&mut self, relay: Relay) -> usize {
         let idx = self.next;
         self.next = (self.next + 1) % self.slots.len();
-        if let Some(old) = self.slots[idx] {
+        if let Some(old) = &self.slots[idx] {
             self.index.remove(&(old.root, old.seq));
         }
         self.index.insert((relay.root, relay.seq), idx as u32);
@@ -180,27 +182,32 @@ impl Relays {
 }
 
 /// Bit mask with the low `n` bits set.
-pub(in crate::gossip) fn full_mask(n: usize) -> u16 {
+pub(in crate::gossip) fn full_mask(n: usize) -> u8 {
     debug_assert!(n <= MAX_CHILDREN);
-    if n >= MAX_CHILDREN {
-        u16::MAX
-    } else {
-        (1_u16 << n) - 1
-    }
+    u8::try_from((1_u16 << n) - 1).unwrap_or(u8::MAX)
 }
 
 /// Smoothed round-trip time of whole-tree broadcasts, as the root sees it:
 /// from the first send to the last child's aggregated acknowledgement.
 /// Exponentially weighted with gain 1/8, as TCP's SRTT. Samples are taken
 /// only from broadcasts that completed without a rebroadcast, so a late ack
-/// is never mistaken for the answer to the resend.
+/// is never mistaken for the answer to the resend (Karn and Partridge). For
+/// the same reason the expected time doubles after a round in which a
+/// broadcast timed out, up to [`Self::MAX_BACKOFF`] times, and returns to the
+/// measurement at the next completed broadcast; without it a seed below the
+/// real round trip would rebroadcast every packet forever and never sample.
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::gossip) struct RttEstimator {
     /// Smoothed RTT in 1/8 ms; `0` until the first sample.
     srtt_eighths: u64,
+    /// Doublings applied to the expected time since the last sample.
+    backoff: u8,
 }
 
 impl RttEstimator {
+    /// Most doublings after consecutive timeouts.
+    pub const MAX_BACKOFF: u8 = 3;
+
     pub fn sample(&mut self, rtt_ms: u64) {
         let sample = rtt_ms.max(1) * 8;
         self.srtt_eighths = if self.srtt_eighths == 0 {
@@ -208,14 +215,22 @@ impl RttEstimator {
         } else {
             self.srtt_eighths - self.srtt_eighths / 8 + sample / 8
         };
+        self.backoff = 0;
     }
 
-    /// The smoothed RTT in ms, or `initial_ms` before any sample.
+    /// A broadcast timed out: wait longer before the next one does.
+    pub fn timed_out(&mut self) {
+        self.backoff = (self.backoff + 1).min(Self::MAX_BACKOFF);
+    }
+
+    /// The smoothed RTT in ms (or `initial_ms` before any sample), doubled
+    /// once per outstanding timeout.
     pub fn expected_ms(&self, initial_ms: u64) -> u64 {
-        if self.srtt_eighths == 0 {
+        let base = if self.srtt_eighths == 0 {
             initial_ms
         } else {
             self.srtt_eighths.div_ceil(8)
-        }
+        };
+        base << self.backoff
     }
 }

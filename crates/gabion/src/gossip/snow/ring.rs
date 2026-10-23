@@ -1,24 +1,35 @@
 //! The membership view as a ring, and the Snow child function.
 //!
 //! Every node sorts its view (itself plus the peers discovery reported) into
-//! a ring. For a broadcast rooted at `r` the ring is read starting so that
-//! `r` sits at the midpoint. A node responsible for a range of that rotated
-//! sequence leaves itself out, splits what remains into the part before and
-//! the part after itself, divides each part into `k / 2` sub-ranges, and
-//! makes each sub-range's midpoint node a child that is responsible for the
-//! whole sub-range. When at most `k` nodes remain they are all children and
-//! leaves. Children are therefore a pure function of the local view, the
-//! root and the carried range.
+//! a ring. A node is responsible for a clockwise interval `[lo, hi)` of that
+//! ring (`hi` excluded). It leaves itself out, splits what remains into the
+//! part before itself and the part after itself, divides each part into
+//! `k / 2` sub-ranges, and makes each sub-range's midpoint node a child that
+//! is responsible for the whole sub-range. When at most `k` nodes remain they
+//! are all children and leaves. A root is responsible for the whole ring but
+//! itself: the nodes clockwise from its successor up to, excluding, itself,
+//! split so that it sits at the midpoint. Intervals are positions on the
+//! ring, not offsets into a view-sized sequence, so a view that differs from
+//! its parent's by a member or two shifts nothing: it just counts one node
+//! more or fewer inside the interval. Children are a pure function of the
+//! local view and the carried range.
 
 use std::net::SocketAddr;
 
-/// One child to forward to, with the range it becomes responsible for:
-/// `[lo, hi)` in the root-rotated order, `hi == None` meaning "to the end".
+use arrayvec::ArrayVec;
+
+use super::flight::MAX_CHILDREN;
+
+/// Children of one node.
+pub(in crate::gossip) type Children = ArrayVec<Child, MAX_CHILDREN>;
+
+/// One child to forward to, with the clockwise range `[lo, hi)` it becomes
+/// responsible for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::gossip) struct Child {
     pub addr: SocketAddr,
     pub lo: SocketAddr,
-    pub hi: Option<SocketAddr>,
+    pub hi: SocketAddr,
 }
 
 /// Sorted membership view including the local node.
@@ -85,37 +96,44 @@ impl Ring {
         }
     }
 
-    /// Children of the local node for a broadcast it roots itself: the
-    /// range is the whole ring.
-    pub fn root_children(&mut self, k: usize, out: &mut Vec<Child>) {
-        let me = self.me;
-        children(&self.members, me, me, None, None, k, out);
+    /// Children of the local node for a broadcast it roots itself.
+    pub fn root_children(&self, k: usize, out: &mut Children) {
+        out.clear();
+        let m = self.members.len();
+        let Ok(me_at) = self.members.binary_search(&self.me) else {
+            debug_assert!(false, "the local node is always in its view");
+            return;
+        };
+        // The `m - 1` other nodes clockwise from the successor. The root sits
+        // between the last `m / 2` of them and the first `m - 1 - m / 2`.
+        let split = m - 1 - m / 2;
+        fan_out(
+            &self.members,
+            (me_at + 1) % m,
+            m - 1,
+            (split, split),
+            k,
+            out,
+        );
     }
 
-    /// Children of the local node for a broadcast rooted at `root` whose
-    /// packet carried the range `[lo, hi)`. Boundary nodes missing from the
-    /// local view are inserted for this computation only.
-    pub fn children(
-        &mut self,
-        root: SocketAddr,
-        lo: SocketAddr,
-        hi: Option<SocketAddr>,
-        k: usize,
-        out: &mut Vec<Child>,
-    ) {
+    /// Children of the local node for a broadcast whose packet carried the
+    /// range `[lo, hi)`. Boundary nodes missing from the local view are
+    /// inserted for this computation only.
+    pub fn children(&mut self, lo: SocketAddr, hi: SocketAddr, k: usize, out: &mut Children) {
         let missing = |a: SocketAddr| self.members.binary_search(&a).is_err();
-        if !(missing(root) || missing(lo) || hi.is_some_and(missing)) {
-            children(&self.members, self.me, root, Some(lo), hi, k, out);
+        if !(missing(lo) || missing(hi)) {
+            interval_children(&self.members, self.me, lo, hi, k, out);
             return;
         }
         self.scratch.clear();
         self.scratch.extend_from_slice(&self.members);
-        for a in [Some(root), Some(lo), hi].into_iter().flatten() {
+        for a in [lo, hi] {
             if let Err(at) = self.scratch.binary_search(&a) {
                 self.scratch.insert(at, a);
             }
         }
-        children(&self.scratch, self.me, root, Some(lo), hi, k, out);
+        interval_children(&self.scratch, self.me, lo, hi, k, out);
     }
 }
 
@@ -126,76 +144,73 @@ pub(in crate::gossip) fn tree_height(n: usize, k: usize) -> u32 {
     (((k - 1.0) * n).log(k) + 1.0).ceil().max(1.0) as u32
 }
 
-/// The child function. `view` is sorted and holds `me`, `root` and any named
-/// boundary; `lo == None` means the range starts at the first node of the
-/// rotated order (the root's own range).
-fn children(
+/// The child function for a carried range. `view` is sorted and holds `me`,
+/// `lo` and `hi`.
+fn interval_children(
     view: &[SocketAddr],
     me: SocketAddr,
-    root: SocketAddr,
-    lo: Option<SocketAddr>,
-    hi: Option<SocketAddr>,
+    lo: SocketAddr,
+    hi: SocketAddr,
     k: usize,
-    out: &mut Vec<Child>,
+    out: &mut Children,
 ) {
     out.clear();
     let m = view.len();
-    let position = |a: SocketAddr| view.binary_search(&a).ok();
-    let (Some(root_at), Some(me_at)) = (position(root), position(me)) else {
-        debug_assert!(false, "root and local node are always in the view");
+    let (Ok(me_at), Ok(start), Ok(end)) = (
+        view.binary_search(&me),
+        view.binary_search(&lo),
+        view.binary_search(&hi),
+    ) else {
+        debug_assert!(false, "the local node and both boundaries are in the view");
         return;
     };
-    let mid = m / 2;
-    // Rotated index `j` is ring index `root_at - mid + j`, so the root sits
-    // at `mid`.
-    let rotated = |j: usize| view[(root_at + m - mid + j) % m];
-    let index_of = |ring_at: usize| (ring_at + mid + m - root_at) % m;
-    let start = match lo.map(position) {
-        None => 0,
-        Some(Some(at)) => index_of(at),
-        Some(None) => return,
-    };
-    let end = match hi.map(position) {
-        None => m,
-        Some(Some(at)) => index_of(at),
-        Some(None) => return,
-    };
-    if start >= end {
-        return;
-    }
-
-    // The local node splits the range into what precedes and what follows
-    // it. A node outside the range it was handed (views disagree) treats the
-    // whole range as one side.
-    let me_j = index_of(me_at);
-    let (before_end, after_start) = if (start..end).contains(&me_j) {
-        (me_j, me_j + 1)
-    } else if me_j < start {
-        (start, start)
+    let len = (end + m - start) % m;
+    // The local node splits the interval into what precedes and what follows
+    // it. A node outside the interval it was handed (views disagree) treats
+    // the whole interval as one side.
+    let me_off = (me_at + m - start) % m;
+    let sides = if me_off < len {
+        (me_off, me_off + 1)
     } else {
-        (end, end)
+        (len, len)
     };
+    fan_out(view, start, len, sides, k, out);
+}
 
-    let child = |from: usize, to: usize, out: &mut Vec<Child>| {
-        out.push(Child {
-            addr: rotated(from + (to - from) / 2),
-            lo: rotated(from),
-            hi: (to < m).then(|| rotated(to)),
+/// Split the `len` nodes starting at ring index `start` into children. The
+/// nodes at offsets `[0, before_end)` and `[after_start, len)` are the two
+/// sides; the nodes between them are not this node's to cover.
+fn fan_out(
+    view: &[SocketAddr],
+    start: usize,
+    len: usize,
+    (before_end, after_start): (usize, usize),
+    k: usize,
+    out: &mut Children,
+) {
+    let m = view.len();
+    let at = |offset: usize| view[(start + offset) % m];
+    let mut push = |from: usize, to: usize| {
+        let pushed = out.try_push(Child {
+            addr: at(from + (to - from) / 2),
+            lo: at(from),
+            hi: at(to),
         });
+        debug_assert!(pushed.is_ok(), "k is clamped to MAX_CHILDREN");
     };
 
-    if (before_end - start) + (end - after_start) <= k {
-        for j in (start..before_end).chain(after_start..end) {
-            child(j, j + 1, out);
+    if before_end + (len - after_start) <= k {
+        for j in (0..before_end).chain(after_start..len) {
+            push(j, j + 1);
         }
         return;
     }
     let per_side = (k / 2).max(1);
-    for (from, to) in [(start, before_end), (after_start, end)] {
-        let len = to - from;
-        let parts = per_side.min(len);
+    for (from, to) in [(0, before_end), (after_start, len)] {
+        let side = to - from;
+        let parts = per_side.min(side);
         for p in 0..parts {
-            child(from + len * p / parts, from + len * (p + 1) / parts, out);
+            push(from + side * p / parts, from + side * (p + 1) / parts);
         }
     }
 }

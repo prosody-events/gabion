@@ -39,17 +39,21 @@ for what the branch does.
 
 **Mechanism.** Every node keeps a sorted view of its membership (itself plus
 the peers discovery reported). A node that has local changes roots one
-broadcast per packet of cells. For root `r` the view is read rotated so that
-`r` sits at the midpoint. A node responsible for a range leaves itself out,
-splits the rest into the part before and the part after itself, divides each
-part into `k / 2` sub-ranges, and makes each sub-range's midpoint node a child
-that becomes responsible for the whole sub-range (at most `k` nodes left: they
-are all children and leaves). The packet to a child carries its range
-`[lo, hi)`; the receiver recomputes its own children inside that range from
-its own view, inserting a boundary node it has not discovered yet. Children are
-a pure function of (local view, root, carried range); no random peer is
-involved on the tree path. A leaf acknowledges its parent at once, an interior
-node only after all its children have, and the root rebroadcasts after the
+broadcast per packet of cells. A node is responsible for a clockwise interval
+`[lo, hi)` of the ring (`hi` excluded; the root's own interval is everyone but
+itself, so its `hi` is the root, and it sits at the midpoint of the nodes it
+covers). A node leaves itself out, splits the rest into the part before and the
+part after itself, divides each part into `k / 2` sub-ranges, and makes each
+sub-range's midpoint node a child that becomes responsible for the whole
+sub-range (at most `k` nodes left: they are all children and leaves). The
+packet to a child carries its range `[lo, hi)`; the receiver recomputes its own
+children inside that range from its own view, inserting a boundary node it has
+not discovered yet. Intervals are positions on the ring, so a view that lacks a
+member or two still reaches everything in the interval except what it does not
+know. Children are a pure function of (local view, carried range); the root is
+the `hi` of the outermost ranges. No random peer is involved on the tree path. A
+leaf acknowledges its parent at once, an interior node only after all the
+children it forwarded to have, and the root rebroadcasts after the
 acknowledgement timeout to the children that have not answered. Code:
 `src/gossip/snow/` (child function, control codec, in-flight tables) and
 `src/gossip/runtime/tree.rs` (the runtime half).
@@ -58,11 +62,11 @@ acknowledgement timeout to the children that have not answered. Code:
 
 | Parameter | Value | Where |
 | --- | --- | --- |
-| branching factor `k` | 4, clamped to 2..=16 | `GOSSIP_FANOUT`, `GossipConfig::fanout` |
+| branching factor `k` | 4, clamped to 2..=8 | `GOSSIP_FANOUT`, `GossipConfig::fanout` |
 | acknowledgement timeout | 2 x expected tree round trip | `GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE` |
 | root rebroadcasts | 1 | `GOSSIP_ROOT_REBROADCASTS` |
 | tree height | `ceil(log_k((k-1)N) + 1)` | `snow::tree_height` |
-| repair pass | 64 cells per heartbeat to one random peer | `GOSSIP_REPAIR_CELLS_PER_TICK` |
+| repair pass | 256 cells per heartbeat to one random peer | `GOSSIP_REPAIR_CELLS_PER_TICK` |
 
 **Adaptations to the paper**, each the smallest that makes the design run in
 gabion:
@@ -93,11 +97,26 @@ gabion:
 - *Repair pass.* After the one rebroadcast the paper gives up. gabion keeps an
   anti-entropy backstop for every design: once per heartbeat a rotating slice of
   the cell store goes to one random peer. It is not on the tree path. It also
-  carries cells to a node that joined after they were broadcast. The Plumtree-
-  style lazy `IHAVE` backstop (`snow_lazy`) is not implemented.
+  carries cells to a node that joined after they were broadcast. The paper does
+  not define this lane; its size, 256 cells, is the heartbeat repair slice the
+  study's `flat-once` design uses (survey section 3.4), so the lane
+  behind each design carries the same volume. The Plumtree-style lazy `IHAVE`
+  backstop (`snow_lazy`) is not implemented.
+- *Acknowledgement tables hold the forwarded children.* A relay keeps the
+  addresses and ranges it forwarded to, and matches acknowledgements and
+  repeats against that frozen set, so a view change while a broadcast is in
+  flight cannot change who must answer.
+- *Timeout back-off.* After a round in which a broadcast timed out, the
+  expected round trip doubles (up to 8x) until a broadcast completes without a
+  rebroadcast and is sampled again (Karn and Partridge); otherwise a seed below
+  the real round trip would rebroadcast every packet and never sample.
+- *Packet budget.* Root packets are encoded against `max_payload_bytes` minus
+  the largest control extension, so a full packet still fits after reframing at
+  every hop. A packet that cannot be queued (no free send buffer, or a frame
+  over budget) is counted and logged, not discarded silently.
 - *Wire.* `FLAG_EXT` marks a frame whose body begins with a length-prefixed
   control extension (`wire::reframe`, `wire::encode_ext_only`): data
-  `[1][root][seq][lo][hi?]`, ack `[2][root][seq]`. Forwarding re-frames the
+  `[1][root][seq][lo][hi]`, ack `[2][root][seq]`. Forwarding re-frames the
   received cell bytes without decoding them. The extension is inside the HMAC.
 - *Scheduler unchanged.* Heartbeat and error-budget threshold rounds are
   `main`'s; a round now roots broadcasts instead of picking peers. The
@@ -108,18 +127,17 @@ gabion:
   knobs are `defaults` constants held in `TreeParams` (tests override them).
 
 **Bounded state** (I-4): the relay table holds `GOSSIP_TREE_RELAY_CAPACITY`
-(2048) entries and overwrites the oldest; the origin table holds
+(1024) entries, each with up to 8 children, and overwrites the oldest; the origin table holds
 `GOSSIP_TREE_ORIGIN_CAPACITY` (64) packets and displaces the oldest. Sequence
 numbers start from the node's seeded RNG so a restarted node does not collide
 with entries peers still hold. Randomness is only the repair peer pick and that
 seed.
 
-**Known limitations.** Views that disagree on the member count rotate the ring
-one position apart, so the node at the cut can fall out of a carried range
-(`a_root_with_a_stale_view_misses_at_most_the_node_at_the_rotation_cut`); the
-repair pass covers it. The admin snapshot reports peer `node_id` as `None`;
-`last_effective_fanout` is the root's child count. The WASM visualizer's manual
-clock never fires the acknowledgement timer.
+**Known limitations.** A node that does not know a member cannot send to it,
+so a member known to the root but not to an interior node on the way can miss
+the broadcast until the repair pass reaches it. The admin snapshot reports peer
+`node_id` as `None`; `last_effective_fanout` is the root's child count. The WASM
+visualizer's manual clock never fires the acknowledgement timer.
 
 ## Module map
 
