@@ -121,6 +121,7 @@ fn main() -> io::Result<ExitCode> {
             ngx_http_complex_value_t,
             ngx_http_module_t,
             ngx_http_phase_t,
+            ngx_http_variable_value_t,
             ngx_module_t,
             ngx_queue_t,
             ngx_rbtree_node_t,
@@ -144,7 +145,9 @@ fn main() -> io::Result<ExitCode> {
             ngx_http_phase_t { handlers }
             ngx_http_request_t {
                 connection, main_conf, loc_conf, pool, headers_out, uri, args, unparsed_uri,
+                variables,
             }
+            ngx_http_variable_t { get_handler }
             ngx_http_variable_value_t { data }
             ngx_log_t { log_level }
             ngx_module_t {
