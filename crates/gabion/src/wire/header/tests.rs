@@ -61,3 +61,18 @@ fn patch_header_preserves_layout() {
     let got = read_header(&buf).expect("decode");
     assert_eq!(got, sample());
 }
+
+#[test]
+fn frame_kinds_round_trip_through_flags() {
+    for kind in [FrameKind::Broadcast, FrameKind::Sync, FrameKind::Ack] {
+        assert_eq!(FrameKind::from_flags(kind.flags()), Some(kind));
+        // Unrelated flag bits do not change the kind.
+        let noisy = kind.flags() | FLAG_MORE | FLAG_AUTHENTICATED;
+        assert_eq!(FrameKind::from_flags(noisy), Some(kind));
+    }
+}
+
+#[test]
+fn both_kind_bits_are_not_a_kind() {
+    assert_eq!(FrameKind::from_flags(FLAG_SYNC | FLAG_ACK), None);
+}

@@ -25,26 +25,46 @@ use tokio::sync::mpsc;
 /// cluster's bucket clock at once.
 pub type SharedNow = Rc<Cell<u64>>;
 
-/// One node's clock: shared time plus that node's own tick inbox. Built per
-/// node by the engine; not `Clone` (the `mpsc::Receiver` is single-consumer).
+/// Tickers a runtime asks its clock for: housekeeping, sync and broadcast.
+const TICKERS: usize = 3;
+
+/// One node's clock: shared time plus that node's tick inboxes. Built per
+/// node by the engine; not `Clone` (the `mpsc::Receiver`s are single-consumer).
 pub struct ManualClock {
     now: SharedNow,
-    /// Taken once by [`Clock::ticker`]; `RefCell<Option<_>>` so the `&self`
-    /// trait method can move the receiver out.
-    tick_rx: RefCell<Option<mpsc::Receiver<()>>>,
+    /// Handed out one per [`Clock::ticker`] call; `RefCell` so the `&self`
+    /// trait method can move a receiver out.
+    tick_rxs: RefCell<Vec<mpsc::Receiver<()>>>,
+}
+
+/// The engine's end of a node's tickers: one tick fires every ticker the
+/// runtime created, so a visualizer step runs a full housekeeping, sync and
+/// broadcast round.
+pub struct TickSenders([mpsc::Sender<()>; TICKERS]);
+
+impl TickSenders {
+    pub async fn send(&self, tick: ()) -> Result<(), mpsc::error::SendError<()>> {
+        for tx in &self.0 {
+            tx.send(tick).await?;
+        }
+        Ok(())
+    }
 }
 
 impl ManualClock {
-    /// Pair this node's clock with the tick sender the engine keeps.
-    pub fn new(now: SharedNow) -> (Self, mpsc::Sender<()>) {
+    /// Pair this node's clock with the tick senders the engine keeps.
+    pub fn new(now: SharedNow) -> (Self, TickSenders) {
         // Capacity well above the at-most-one-unconsumed-tick-per-drain the
         // engine produces; sized so a fire never blocks.
-        let (tick_tx, tick_rx) = mpsc::channel(256);
+        let (txs, rxs): (Vec<_>, Vec<_>) = (0..TICKERS).map(|_| mpsc::channel(256)).unzip();
         let clock = Self {
             now,
-            tick_rx: RefCell::new(Some(tick_rx)),
+            tick_rxs: RefCell::new(rxs),
         };
-        (clock, tick_tx)
+        let txs = txs
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("TICKERS senders"));
+        (clock, TickSenders(txs))
     }
 }
 
@@ -57,10 +77,10 @@ impl Clock for ManualClock {
 
     fn ticker(&self, _interval: Duration) -> ManualTicker {
         let rx = self
-            .tick_rx
+            .tick_rxs
             .borrow_mut()
-            .take()
-            .expect("ManualClock::ticker called more than once");
+            .pop()
+            .expect("ManualClock hands out one ticker per runtime ticker");
         ManualTicker(rx)
     }
 }

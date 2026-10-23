@@ -30,7 +30,10 @@ mod tests;
 
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
-pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
+pub use header::{
+    FLAG_ACK, FLAG_AUTHENTICATED, FLAG_MORE, FLAG_SYNC, FrameKind, HEADER_LEN, Header, MAGIC,
+    VERSION,
+};
 
 use auth::AUTH_TAG_LEN;
 use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
@@ -108,6 +111,8 @@ pub enum DecodeError {
     AuthenticationFailed,
     #[error("trailing bytes after body")]
     Trailing,
+    #[error("sync and ack flags are both set")]
+    BadKind,
 }
 
 // -- send-side buffer -------------------------------------------------------
@@ -134,6 +139,14 @@ impl PacketBuf {
     /// The encoded packet's bytes. Pass this to `socket.send_to`.
     pub fn as_bytes(&self) -> &[u8] {
         &self.inner
+    }
+
+    /// Overwrite this buffer with `other`'s bytes. Both buffers share
+    /// `limits`, so the copy never reallocates.
+    pub fn copy_from(&mut self, other: &PacketBuf) {
+        debug_assert!(other.inner.len() <= self.capacity);
+        self.inner.clear();
+        self.inner.extend_from_slice(&other.inner);
     }
 
     /// Maximum byte capacity (fixed at construction).
@@ -420,6 +433,9 @@ fn decode_inner<C: Count>(
     };
 
     let header = read_header(frame)?;
+    if FrameKind::from_flags(header.flags).is_none() {
+        return Err(DecodeError::BadKind);
+    }
     if header.count_width as usize != std::mem::size_of::<C>() {
         return Err(DecodeError::BadCountWidth);
     }
