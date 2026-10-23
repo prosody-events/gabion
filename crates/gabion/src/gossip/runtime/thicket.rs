@@ -25,7 +25,8 @@ use std::net::SocketAddr;
 
 use crate::crdt::{CellHandle, Incarnation, NodeId, NodeSlot};
 use crate::defaults::{
-    GOSSIP_COVERAGE_MARGIN, THICKET_MISSING_CAPACITY, THICKET_TREES, THICKET_VIEW_CAPACITY,
+    GOSSIP_COVERAGE_MARGIN, THICKET_LEAF_CHILDREN_MIN, THICKET_MISSING_CAPACITY, THICKET_TREES,
+    THICKET_VIEW_CAPACITY,
 };
 use crate::wire::ControlEntry;
 
@@ -56,6 +57,15 @@ pub(super) struct TreePeer {
     /// Attached to us as its parent in our tree.
     pub leaf_child: bool,
     pub edge: Edge,
+}
+
+/// A parent chosen or replaced for a tree this node is a leaf of.
+#[derive(Clone, Copy)]
+pub(super) struct Reparent {
+    pub tree: u8,
+    /// The parent replaced, or `NONE`.
+    pub old: u16,
+    pub new: u16,
 }
 
 /// How the version of a cell this node holds reached it.
@@ -252,6 +262,106 @@ impl Thicket {
 
     pub(super) fn is_parent(&self, idx: u16) -> bool {
         self.parents.contains(&idx)
+    }
+
+    // -- Leaf children ------------------------------------------------------
+
+    fn leaf_children(&self) -> usize {
+        self.peers
+            .iter()
+            .filter(|p| p.alive && p.leaf_child)
+            .count()
+    }
+
+    /// Most leaf children this node takes: twice the even share of the known
+    /// leaves over the known interior nodes of its tree, and never fewer than
+    /// `THICKET_LEAF_CHILDREN_MIN`. Thicket bounds an interior node's fanout;
+    /// the bound keeps one popular node from becoming the hub of a tree.
+    fn leaf_cap(&self) -> usize {
+        let mates = usize::from(self.class_alive[usize::from(self.class)]);
+        let leaves = self.alive - mates;
+        (2 * leaves.div_ceil(mates + 1)).max(THICKET_LEAF_CHILDREN_MIN)
+    }
+
+    /// Take `idx` as a leaf child. `false`, with nothing changed, when this
+    /// node already has as many as it takes: the leaf must pick another parent.
+    pub(super) fn adopt_leaf(&mut self, idx: u16) -> bool {
+        debug_assert!(self.peers[usize::from(idx)].class != self.class);
+        if self.peers[usize::from(idx)].leaf_child {
+            return true;
+        }
+        if self.leaf_children() >= self.leaf_cap() {
+            return false;
+        }
+        self.peers[usize::from(idx)].leaf_child = true;
+        true
+    }
+
+    // -- Joining ------------------------------------------------------------
+
+    /// A peer discovery just added is offered a place, so that each view
+    /// member and each parent is uniform over the membership known so far
+    /// (reservoir sampling), however discovery orders the peers.
+    ///
+    /// A class-mate replaces a random view member with probability `view /
+    /// mates`, or joins it when every mate is in it; `fill_view` then tops the
+    /// view up to its target, which grows with the mates, at random. A peer of
+    /// another class replaces that tree's parent with probability `1 / peers
+    /// of that class`. The replaced parent is returned for the caller to
+    /// detach from and attach to the new one.
+    pub(super) fn place_new(&mut self, idx: u16, rng: &mut SplitMix64) -> Option<Reparent> {
+        let class = self.peers[usize::from(idx)].class;
+        let draw = (rng.next_u64() as usize) % usize::from(self.class_alive[usize::from(class)]);
+        if class == self.class {
+            let members = self.view_count();
+            let mates = usize::from(self.class_alive[usize::from(class)]);
+            if members < self.view_target() && members + 1 >= mates {
+                // Every mate known so far is in the view: so is this one.
+                self.view_add(idx);
+            } else if draw < members {
+                let victim = self.view.iter().filter(|&&s| s != NONE).nth(draw).copied();
+                if let Some(victim) = victim {
+                    self.view_remove(victim);
+                    self.view_add(idx);
+                }
+            }
+            return None;
+        }
+        let old = self.parents[usize::from(class)];
+        if old != NONE && draw != 0 {
+            return None;
+        }
+        self.parents[usize::from(class)] = idx;
+        Some(Reparent {
+            tree: class,
+            old,
+            new: idx,
+        })
+    }
+
+    /// Give `tree` a parent chosen uniformly among its known interior nodes
+    /// except `avoid`. `None` when there is no such node.
+    pub(super) fn choose_parent(
+        &mut self,
+        tree: u8,
+        rng: &mut SplitMix64,
+        avoid: u16,
+    ) -> Option<u16> {
+        let parent = self.random_of_class(tree, rng, |i, _| i == avoid)?;
+        self.parents[usize::from(tree)] = parent;
+        Some(parent)
+    }
+
+    /// Top the backbone view up to its target with random class-mates.
+    pub(super) fn fill_view(&mut self, rng: &mut SplitMix64) {
+        let class = self.class;
+        while self.view_count() < self.view_target() {
+            let pick = self.random_of_class(class, rng, |i, _| self.in_view(i));
+            match pick {
+                Some(mate) if self.view_add(mate) => {}
+                _ => break,
+            }
+        }
     }
 
     // -- Backbone view ----------------------------------------------------

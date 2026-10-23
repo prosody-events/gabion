@@ -142,6 +142,12 @@ pub const THICKET_CATCH_UP_ATTEMPTS: u8 = 6;
 /// Most neighbours in the backbone view of the tree a node is interior in.
 pub const THICKET_VIEW_CAPACITY: usize = 32;
 
+/// Fewest leaf children an interior node accepts before it refuses an attach
+/// and the leaf picks another parent. The limit rises to twice the even share
+/// of leaves per interior node when the classes are lopsided, so a tree with a
+/// single interior node still takes every leaf.
+pub const THICKET_LEAF_CHILDREN_MIN: usize = 8;
+
 /// Eager packets kept for retransmission, across all tree neighbours.
 pub const THICKET_RETX_PACKETS: usize = 512;
 
