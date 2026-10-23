@@ -60,7 +60,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
+# CI has already built the image and loaded it into kind.
+if [ "${GABION_SKIP_IMAGE_BUILD:-0}" != 1 ]; then
+    docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
+fi
 
 kubectl create namespace "$namespace"
 
