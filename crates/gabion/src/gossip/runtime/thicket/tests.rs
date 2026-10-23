@@ -200,17 +200,10 @@ impl Thicket {
     /// runtime's upkeep does.
     fn maintain_for_test(&mut self) {
         let mut rng = SplitMix64::new(7);
-        while self.view_count() < self.view_target() {
-            let class = self.class;
-            let Some(mate) = self.random_of_class(class, &mut rng, |i, _| self.in_view(i)) else {
-                break;
-            };
-            assert!(self.view_add(mate));
-        }
-        for tree in (0..THICKET_TREES as u8).filter(|&t| t != self.class) {
-            if let Some(parent) = self.random_of_class(tree, &mut rng, |_, _| false) {
-                self.parents[usize::from(tree)] = parent;
-            }
+        self.fill_view(&mut rng);
+        let class = self.class;
+        for tree in (0..THICKET_TREES as u8).filter(|&t| t != class) {
+            self.choose_parent(tree, &mut rng, NONE);
         }
     }
 }
@@ -240,4 +233,134 @@ fn a_cell_is_queued_for_ihave_once_per_version_and_again_once_taken() {
     );
     t.queue_lazy(cell(5, 1));
     assert_eq!(t.lazy.len(), 2, "a taken cell can be queued again");
+}
+
+/// Addresses as the benchmark harness assigns them.
+fn harness_addr(i: u16) -> SocketAddr {
+    SocketAddr::from(([10, (i % 3) as u8, 0, i as u8], 7946))
+}
+
+/// `n` nodes that each learn the others by discovery events in index order,
+/// then attach their parents, the parents refusing leaves over their cap.
+fn discovered_in_index_order(n: u16) -> Vec<Thicket> {
+    let mut nodes: Vec<Thicket> = (0..n)
+        .map(|i| Thicket::new(harness_addr(i), &[], usize::from(n), 64, 256, 64))
+        .collect();
+    let mut rngs: Vec<SplitMix64> = (0..n).map(|i| SplitMix64::new(u64::from(i))).collect();
+    for peer in 0..n {
+        for (i, node) in nodes.iter_mut().enumerate() {
+            if i as u16 == peer {
+                continue;
+            }
+            let (idx, new) = node.add_peer(harness_addr(peer));
+            assert!(new);
+            node.place_new(idx, &mut rngs[i]);
+            node.fill_view(&mut rngs[i]);
+            let class = node.class;
+            for tree in (0..THICKET_TREES as u8).filter(|&t| t != class) {
+                if node.parents[usize::from(tree)] == NONE {
+                    node.choose_parent(tree, &mut rngs[i], NONE);
+                }
+            }
+        }
+    }
+    // Attach every leaf; a refused one picks another parent, as the runtime
+    // does on the parent's PRUNE.
+    for _round in 0..10 {
+        for child in 0..nodes.len() {
+            let class = nodes[child].class;
+            for tree in (0..THICKET_TREES as u8).filter(|&t| t != class) {
+                let parent = nodes[child].parents[usize::from(tree)];
+                if parent == NONE {
+                    continue;
+                }
+                let at = nodes[child].peers[usize::from(parent)].addr;
+                let p = (0..nodes.len())
+                    .find(|&p| harness_addr(p as u16) == at)
+                    .unwrap();
+                let me = nodes[p].index_of(harness_addr(child as u16)).unwrap();
+                if !nodes[p].adopt_leaf(me) {
+                    nodes[child].choose_parent(tree, &mut rngs[child], parent);
+                }
+            }
+        }
+    }
+    nodes
+}
+
+#[test]
+fn parents_and_views_are_spread_when_discovery_orders_the_peers() {
+    const N: u16 = 80;
+    let nodes = discovered_in_index_order(N);
+    let index = |a: SocketAddr| (0..N).find(|&i| harness_addr(i) == a).unwrap();
+
+    // Parents: each tree's leaves hang off many interior nodes, and none has
+    // more children than it takes.
+    for tree in 0..THICKET_TREES as u8 {
+        let mut children = vec![0usize; usize::from(N)];
+        for node in nodes.iter().filter(|n| n.class != tree) {
+            let parent = node.parents[usize::from(tree)];
+            assert_ne!(parent, NONE, "a leaf without a parent in tree {tree}");
+            children[usize::from(index(node.peers[usize::from(parent)].addr))] += 1;
+        }
+        let distinct = children.iter().filter(|&&c| c > 0).count();
+        let interior = nodes.iter().filter(|n| n.class == tree).count();
+        assert!(
+            distinct * 2 >= interior,
+            "tree {tree}: {distinct} of {interior} interior nodes have a child"
+        );
+        for (p, &c) in children.iter().enumerate() {
+            assert!(
+                c <= nodes[p].leaf_cap(),
+                "node {p} has {c} children in tree {tree}, over its cap {}",
+                nodes[p].leaf_cap()
+            );
+        }
+    }
+
+    // Views: every node is in some view and none is in a disproportionate
+    // share of them.
+    let mut in_views = vec![0usize; usize::from(N)];
+    let mut members = 0;
+    for node in &nodes {
+        for p in node.peers.iter().filter(|p| p.view_pos != NO_POS) {
+            in_views[usize::from(index(p.addr))] += 1;
+            members += 1;
+        }
+    }
+    let mean = members as f64 / f64::from(N);
+    let absent = in_views.iter().filter(|&&c| c == 0).count();
+    let busiest = *in_views.iter().max().unwrap();
+    assert!(absent <= 4, "{absent} of {N} nodes are in no view");
+    assert!(
+        (busiest as f64) <= 3.0 * mean,
+        "a node is in {busiest} views, mean {mean:.1}"
+    );
+}
+
+#[test]
+fn a_parent_over_its_cap_refuses_and_the_leaf_picks_another() {
+    let mut t = cluster(60);
+    let class = t.class;
+    let cap = t.leaf_cap();
+    let leaves: Vec<u16> = (0..t.peers.len() as u16)
+        .filter(|&i| t.peers[usize::from(i)].class != class)
+        .collect();
+    assert!(leaves.len() > cap);
+    for &leaf in &leaves[..cap] {
+        assert!(t.adopt_leaf(leaf));
+    }
+    assert!(!t.adopt_leaf(leaves[cap]), "over the cap");
+    assert!(t.adopt_leaf(leaves[0]), "a child it already has stays");
+    t.peers[usize::from(leaves[0])].leaf_child = false;
+    assert!(t.adopt_leaf(leaves[cap]), "a freed place is taken");
+
+    let tree = (0..THICKET_TREES as u8).find(|&x| x != class).unwrap();
+    let mut rng = SplitMix64::new(3);
+    let refuser = t.choose_parent(tree, &mut rng, NONE).unwrap();
+    for _ in 0..20 {
+        let other = t.choose_parent(tree, &mut rng, refuser).unwrap();
+        assert_ne!(other, refuser);
+        assert_eq!(t.peers[usize::from(other)].class, tree);
+    }
 }

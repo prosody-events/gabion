@@ -385,10 +385,14 @@ over Plumtree (Leitão, Pereira & Rodrigues, *Epidemic Broadcast Trees*, SRDS
    T`, and a *leaf* in the other two. Every node computes every peer's class
    from discovery alone.
 2. **Trees.** In its own tree a node keeps a backbone view of `⌈ln m + c⌉`
-   random class-mates (`m` of them) and, per root (the origin of a change), an
-   eager subset of it, which starts as the whole view and shrinks on PRUNE.
-   It also pushes to the leaves that attached to it. In each other tree it
-   has one parent, an interior node of that tree, that it attached to.
+   class-mates (`m` of them), uniform over the class-mates it knows, and, per
+   root (the origin of a change), an eager subset of it, which starts as the
+   whole view and shrinks on PRUNE. It also pushes to the leaves that attached
+   to it, at most twice the even share of leaves per interior node and never
+   fewer than `THICKET_LEAF_CHILDREN_MIN`. In each other tree it has one
+   parent, an interior node of that tree chosen uniformly among those it
+   knows, that it attached to. A parent that has taken all the leaves it will
+   refuses the attach with a PRUNE and the leaf picks another.
 3. **Which tree.** A change is a cell version named `(origin, incarnation,
    origin sequence)`. Its tree is `(hash(origin) + sequence) mod T`, so an
    origin's consecutive changes rotate through the trees.
@@ -398,8 +402,10 @@ over Plumtree (Leitão, Pereira & Rodrigues, *Epidemic Broadcast Trees*, SRDS
    sends its own changes of that tree to its parent, and receives the rest from
    it. A tree with no interior node at all is served straight from the origin.
 5. **PRUNE.** A node that receives a second eager copy of a change moves the
-   sender to lazy for that root. A leaf that is pushed to by a node that is
-   not its parent detaches from it.
+   sender to lazy for that root, here and at the sender (PRUNE), and the first
+   copy of a change makes its sender eager for that root, as in Plumtree's
+   Algorithm 1. A leaf that is pushed to by a node that is not its parent
+   detaches from it.
 6. **IHAVE and GRAFT.** Each heartbeat a node sends an IHAVE to 2 random peers
    naming each change it made, or that a tree pushed to it, since the last
    one. A receiver that holds neither that version of the cell nor a newer one
@@ -426,6 +432,7 @@ All are constants in `gabion::defaults` (`THICKET_*`). They are not
 | `THICKET_RELAY_FLOOR_MS` | 5 | spacing of relay rounds |
 | `THICKET_NACK_RETRY_MS` | 100 | wait before asking for a lost packet again |
 | `THICKET_REPAIR_CELLS` | 256 | cells of the repair slice per heartbeat, and per catch-up request |
+| `THICKET_LEAF_CHILDREN_MIN` | 8 | leaf children an interior node takes at least before refusing an attach |
 | `THICKET_MISSING_CAPACITY` | 4096 | announced changes tracked at once |
 | `THICKET_GRAFT_ATTEMPTS` | 3 | GRAFTs sent for one change |
 | `THICKET_PROBE_REPEATS` | 3 | heartbeats a PROBE is repeated after the last eager packet |
@@ -477,11 +484,31 @@ data and UDP.
   older version arriving after a newer one that took a faster tree is a first
   copy, and a cell delivered by a pull or the repair slice says nothing about
   the trees. Counting either as a duplicate prunes the edge that delivered it.
+- **Placement is sampled, not first-come.** Discovery delivers peers in a
+  fixed order, and choosing among the peers known when each arrives made every
+  node attach to the first peer of each class: the trees were stars and the
+  views the same first few class-mates. A discovered peer instead takes a
+  parent or view slot by reservoir sampling: a peer of another class replaces
+  that tree's parent with probability `1/k` of the `k` peers of its class
+  known, and a class-mate replaces a random view member with probability
+  `view/mates`, so parents and views are uniform over the membership known at
+  that moment whatever the order. A replaced parent is sent a PRUNE to detach.
+  Thicket bounds the fanout of an interior node by its active view; here an
+  interior node takes at most twice the even share of known leaves (never fewer
+  than `THICKET_LEAF_CHILDREN_MIN`) and refuses the rest, so no node is a hub.
+- **A leaf attaches with a GRAFT, and the parent can refuse it with a PRUNE.**
+  The papers join a tree by asking a neighbour into the tree's overlay. Here a
+  leaf sends an empty-entry GRAFT naming the tree to its chosen parent, and
+  repeats it every heartbeat so a lost datagram or a parent that learned of the
+  leaf later still attaches it. A GRAFT for the receiver's own tree from a
+  non-class-mate is always this attach; the refusal is a PRUNE for that tree
+  sent to a leaf whose parent it is. Both reuse the control kinds of the same
+  meaning (join, leave) rather than adding a kind to the wire format.
 - **No re-parenting on a timeout.** Moving a leaf's parent moves the point
   where its own changes enter that tree, and every root's eager subtree was
   pruned around the old one, so a timeout pulls the cells and leaves the
-  parent alone. A parent is replaced when discovery removes it, and the attach
-  GRAFT is repeated each heartbeat.
+  parent alone. A parent changes only when discovery removes it, a join
+  replaces it by the sampling above, or it refuses the attach.
 - **Repair slice.** An IHAVE is sent once, to 2 peers, so a node that missed
   both the push and the announcement (a partition, a long outage) would never
   hear of the change. Each heartbeat the node also sends one random peer the

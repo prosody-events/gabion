@@ -697,14 +697,14 @@ where
     fn handle_peer_event(&mut self, evt: PeerEvent) {
         match evt {
             PeerEvent::Added(p) => {
-                let (_, new) = self.thicket.add_peer(p.addr);
+                let (idx, new) = self.thicket.add_peer(p.addr);
                 if new {
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.thicket.alive,
                         "Peer joined the cluster.",
                     );
-                    self.maintain_structure();
+                    self.peer_added(idx);
                     self.begin_catch_up();
                 }
             }

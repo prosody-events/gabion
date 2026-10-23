@@ -3,9 +3,10 @@
 //!
 //! Plumtree's rules, as Thicket constrains them:
 //!
-//! - A duplicate eager delivery makes the receiver PRUNE the sender for that
-//!   root. A leaf that is pushed to by a node that is not its parent detaches
-//!   from it.
+//! - A duplicate eager delivery makes the receiver move the sender to lazy for
+//!   that root and PRUNE it; the first copy of a change makes the sender eager.
+//!   A leaf that is pushed to by a node that is not its parent detaches from
+//!   it.
 //! - Each heartbeat a node sends an IHAVE to a few random peers naming each
 //!   change it made or was pushed since the last one. A change a receiver does
 //!   not hold, and that is not delivered within the missing timeout, makes it
@@ -14,7 +15,8 @@
 //! - A GRAFT may only make a node interior in the tree it already is interior
 //!   in. In another tree the grafting node attaches as a leaf, to an interior
 //!   node of that tree, and the grafted node honours it only if it is interior
-//!   there.
+//!   there and has room: past its leaf cap it refuses with a PRUNE and the leaf
+//!   picks another parent.
 //!
 //! A node that joined with no state asks one peer after another for its next
 //! slice of cells, which is outside the papers.
@@ -58,34 +60,36 @@ where
 
     // -- Upkeep ----------------------------------------------------------
 
+    /// A peer discovery just added takes its place in the structure: see
+    /// `Thicket::place_new`. A parent it replaces is detached from, so the
+    /// old parent stops pushing to this node.
+    pub(super) fn peer_added(&mut self, peer: u16) {
+        if let Some(r) = self.thicket.place_new(peer, &mut self.rng) {
+            if r.old != NONE {
+                self.send_control(r.old, ControlKind::Prune, r.tree, &[]);
+            }
+            self.attach(r.tree, r.new);
+        }
+        self.maintain_structure();
+    }
+
     /// Keep the backbone view at its target size and a parent in every tree
     /// this node is a leaf of. Cheap when nothing changed.
     pub(super) fn maintain_structure(&mut self) {
+        self.thicket.fill_view(&mut self.rng);
         let class = self.thicket.class;
-        while self.thicket.view_count() < self.thicket.view_target() {
-            let pick = self
-                .thicket
-                .random_of_class(class, &mut self.rng, |i, _| self.thicket.in_view(i));
-            match pick {
-                Some(mate) if self.thicket.view_add(mate) => {}
-                _ => break,
-            }
-        }
         for tree in (0..THICKET_TREES as u8).filter(|&t| t != class) {
-            let parent = self.thicket.parents[usize::from(tree)];
-            if parent != NONE {
-                continue;
-            }
-            let pick = self
-                .thicket
-                .random_of_class(tree, &mut self.rng, |_, _| false);
-            if let Some(parent) = pick {
+            if self.thicket.parents[usize::from(tree)] == NONE
+                && let Some(parent) = self.thicket.choose_parent(tree, &mut self.rng, NONE)
+            {
                 self.attach(tree, parent);
             }
         }
     }
 
-    /// Become a leaf child of `parent` in `tree`.
+    /// Become a leaf child of `parent` in `tree`. This is a GRAFT, as the
+    /// papers' join of a tree is, and is repeated every heartbeat; the parent
+    /// refuses it with a PRUNE when it has taken all the leaves it will.
     fn attach(&mut self, tree: u8, parent: u16) {
         self.thicket.parents[usize::from(tree)] = parent;
         self.send_control(parent, ControlKind::Graft, tree, &[]);
@@ -338,8 +342,8 @@ where
                         }
                     }
                 }
-            } else {
-                self.thicket.peers[usize::from(peer)].leaf_child = true;
+            } else if !self.thicket.adopt_leaf(peer) {
+                self.send_control(peer, ControlKind::Prune, class, &[]);
             }
         }
         self.answer_pull(peer, entries);
@@ -371,6 +375,12 @@ where
     /// our leaf child.
     fn on_prune(&mut self, peer: u16, tree: u8, entries: &[ControlEntry]) {
         if tree != self.thicket.class {
+            // A parent that has all the leaves it takes refuses the attach:
+            // pick another one.
+            let refused = self.thicket.parents.get(usize::from(tree)) == Some(&peer);
+            if refused && let Some(parent) = self.thicket.choose_parent(tree, &mut self.rng, peer) {
+                self.attach(tree, parent);
+            }
             return;
         }
         if entries.is_empty() {
@@ -442,14 +452,26 @@ where
             let Some(slot) = self.store.find_node(origin, incarnation) else {
                 continue;
             };
+            let root = Root {
+                slot,
+                node_id: origin,
+                incarnation,
+                local: slot == self.store.local_node_slot(),
+            };
             let slot = usize::from(slot);
+            let tree = tree_of(origin, self.obs_buf.origin_sequences[i]);
             if th.fresh[slot] != 0 {
+                // Plumtree: the first copy of a message makes its sender an
+                // eager link for that root.
+                if tree == class {
+                    th.set_eager(peer, &root);
+                }
                 continue;
             }
-            let tree = tree_of(origin, self.obs_buf.origin_sequences[i]);
             if tree == class {
                 if th.seen[slot] != u32::MAX {
                     th.seen[slot] = u32::MAX;
+                    th.set_lazy(peer, &root);
                     prune.push(ControlEntry {
                         node_id: origin,
                         incarnation,
