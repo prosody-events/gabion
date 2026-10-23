@@ -12,12 +12,25 @@ fn header() -> Header {
     }
 }
 
-fn entries(n: u64) -> Vec<ControlEntry> {
+/// `n` entries of the shape `kind` carries.
+fn entries(kind: ControlKind, n: u64) -> Vec<ControlEntry> {
+    let wide = kind.entry_bytes() == CHANGE_ENTRY_BYTES;
     (0..n)
         .map(|i| ControlEntry {
             node_id: NodeId(0x1_0000_0000_0000_0000 + u128::from(i)),
             incarnation: i as u32,
             value: i * 1000,
+            rule_fingerprint: if wide {
+                0x2_0000_0000_0000_0000 + u128::from(i)
+            } else {
+                0
+            },
+            key_hash: KeyHash(if wide {
+                0x3_0000_0000_0000_0000 + u128::from(i)
+            } else {
+                0
+            }),
+            bucket: if wide { 7 + i as u32 } else { 0 },
         })
         .collect()
 }
@@ -46,10 +59,11 @@ fn every_kind_round_trips_with_and_without_auth() {
         ControlKind::Prune,
         ControlKind::Nack,
         ControlKind::Probe,
+        ControlKind::Pull,
     ] {
         for key in [None, Some(&KEY)] {
             let mut buf = PacketBuf::for_limits(limits());
-            let sent = entries(5);
+            let sent = entries(kind, 5);
             let n = encode_control(header(), kind, 2, &sent, key, limits(), &mut buf).unwrap();
             assert_eq!(n, 5);
             assert!(is_control(buf.as_bytes()));
@@ -59,6 +73,29 @@ fn every_kind_round_trips_with_and_without_auth() {
             assert_eq!(got, sent);
         }
     }
+}
+
+#[test]
+fn a_change_entry_is_wider_than_an_origin_entry() {
+    let mut buf = PacketBuf::for_limits(limits());
+    let mut sizes = Vec::new();
+    for kind in [ControlKind::Ihave, ControlKind::Nack] {
+        encode_control(
+            header(),
+            kind,
+            0,
+            &entries(kind, 3),
+            None,
+            limits(),
+            &mut buf,
+        )
+        .unwrap();
+        sizes.push(buf.as_bytes().len());
+    }
+    assert_eq!(
+        sizes[0] - sizes[1],
+        3 * (CHANGE_ENTRY_BYTES - CONTROL_ENTRY_BYTES)
+    );
 }
 
 #[test]
@@ -82,7 +119,7 @@ fn a_frame_without_entries_is_valid() {
 
 #[test]
 fn entries_that_do_not_fit_one_packet_continue_in_the_next() {
-    let sent = entries(120);
+    let sent = entries(ControlKind::Ihave, 120);
     let mut rest = &sent[..];
     let mut got = Vec::new();
     let mut frames = 0;
@@ -119,7 +156,7 @@ fn a_budget_with_no_room_for_an_entry_is_an_error() {
             header(),
             ControlKind::Nack,
             0,
-            &entries(1),
+            &entries(ControlKind::Nack, 1),
             None,
             tiny,
             &mut buf
@@ -135,7 +172,7 @@ fn a_tampered_or_wrongly_keyed_frame_is_rejected() {
         header(),
         ControlKind::Graft,
         1,
-        &entries(2),
+        &entries(ControlKind::Graft, 2),
         Some(&KEY),
         limits(),
         &mut buf,
@@ -160,7 +197,7 @@ fn an_unknown_kind_or_a_wrong_entry_count_is_rejected() {
         header(),
         ControlKind::Ihave,
         0,
-        &entries(2),
+        &entries(ControlKind::Ihave, 2),
         None,
         limits(),
         &mut buf,

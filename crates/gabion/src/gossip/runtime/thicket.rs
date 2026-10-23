@@ -23,9 +23,9 @@
 
 use std::net::SocketAddr;
 
-use crate::crdt::{Incarnation, NodeId, NodeSlot};
+use crate::crdt::{CellHandle, Incarnation, NodeId, NodeSlot};
 use crate::defaults::{
-    GOSSIP_COVERAGE_MARGIN, THICKET_IHAVE_FULL_EVERY, THICKET_TREES, THICKET_VIEW_CAPACITY,
+    GOSSIP_COVERAGE_MARGIN, THICKET_MISSING_CAPACITY, THICKET_TREES, THICKET_VIEW_CAPACITY,
 };
 use crate::wire::ControlEntry;
 
@@ -56,8 +56,6 @@ pub(super) struct TreePeer {
     /// Attached to us as its parent in our tree.
     pub leaf_child: bool,
     pub edge: Edge,
-    /// When we last sent this peer a PRUNE for pushing duplicates.
-    pub last_prune_ms: u64,
 }
 
 /// How the version of a cell this node holds reached it.
@@ -72,16 +70,29 @@ pub(super) enum Arrival {
     Other,
 }
 
-/// A change announced by IHAVE and not yet delivered.
+/// A change announced by IHAVE and not yet delivered: Plumtree's missing
+/// message timer, one per announced change.
 #[derive(Clone, Copy)]
 pub(super) struct Missing {
-    pub node_id: NodeId,
-    pub incarnation: Incarnation,
-    /// Highest sequence announced.
-    pub target: u64,
+    /// The announced version: origin, sequence (`value`) and the cell.
+    pub change: ControlEntry,
     /// Who announced it first, and so who is asked.
     pub announcer: u16,
     pub deadline_ms: u64,
+    /// GRAFTs sent for it so far.
+    pub tries: u8,
+}
+
+/// A node that joined with no state asking one peer after another for its
+/// next slice of cells, until a slice brings nothing new.
+#[derive(Clone, Copy)]
+pub(super) struct CatchUp {
+    pub peer: u16,
+    pub asked_ms: u64,
+    /// Requests sent since the last slice arrived.
+    pub tries: u8,
+    /// Some packet of the slice being received taught this node something.
+    pub fresh: bool,
 }
 
 /// The origin of a change, as routing needs it.
@@ -116,14 +127,16 @@ pub(super) struct Thicket {
     pub missing: Vec<Missing>,
     /// Earliest time `missing` or an edge gap needs attention.
     pub next_deadline: Option<u64>,
-    pub heartbeats: u64,
-    /// Per origin slot: highest sequence in our last IHAVE.
-    pub announced: Box<[u64]>,
+    pub catch_up: Option<CatchUp>,
+    /// Cells changed here or delivered by a tree since the last heartbeat,
+    /// which the next IHAVE announces, and per cell slot the generation
+    /// queued, so a cell is queued once however often it changes.
+    pub lazy: Vec<CellHandle>,
+    lazy_queued: Box<[u32]>,
     pub sent: SentRing,
     // Scratch, sized at construction.
     pub entries: Vec<ControlEntry>,
     pub inbound: Vec<ControlEntry>,
-    pub want: Box<[u64]>,
     pub seen: Box<[u32]>,
     pub fresh: Box<[u32]>,
     pub touched: Vec<NodeSlot>,
@@ -152,14 +165,14 @@ impl Thicket {
             from_peer: vec![NONE; cell_capacity].into_boxed_slice(),
             arrival: vec![Arrival::Local; cell_capacity].into_boxed_slice(),
             relay_pending: false,
-            missing: Vec::with_capacity(node_capacity),
+            missing: Vec::with_capacity(THICKET_MISSING_CAPACITY),
             next_deadline: None,
-            heartbeats: 0,
-            announced: vec![0; node_capacity].into_boxed_slice(),
+            catch_up: None,
+            lazy: Vec::with_capacity(cell_capacity),
+            lazy_queued: vec![0; cell_capacity].into_boxed_slice(),
             sent: SentRing::new(),
-            entries: Vec::with_capacity(node_capacity.max(control_entries)),
+            entries: Vec::with_capacity(control_entries.max(node_capacity)),
             inbound: Vec::with_capacity(control_entries),
-            want: vec![u64::MAX; node_capacity].into_boxed_slice(),
             seen: vec![0; node_capacity].into_boxed_slice(),
             fresh: vec![0; node_capacity].into_boxed_slice(),
             touched: Vec::with_capacity(node_capacity),
@@ -196,7 +209,6 @@ impl Thicket {
             view_pos: NO_POS,
             leaf_child: false,
             edge: Edge::new(),
-            last_prune_ms: 0,
         };
         let idx = match self.peers.iter().position(|p| !p.alive) {
             Some(i) => {
@@ -409,9 +421,24 @@ impl Thicket {
             .nth(pick)
     }
 
-    /// Whether this heartbeat sends the whole IHAVE digest.
-    pub(super) fn full_digest_due(&self) -> bool {
-        self.heartbeats.is_multiple_of(THICKET_IHAVE_FULL_EVERY)
+    /// Queue `handle` for the next IHAVE, unless this version of its slot
+    /// already is. A full queue drops it: the repair slice covers it.
+    pub(super) fn queue_lazy(&mut self, handle: CellHandle) {
+        let queued = &mut self.lazy_queued[handle.index as usize];
+        if *queued != handle.generation && self.lazy.len() < self.lazy.capacity() {
+            *queued = handle.generation;
+            self.lazy.push(handle);
+        }
+    }
+
+    /// The first `n` queued cells leave the queue.
+    pub(super) fn dequeue_lazy(&mut self, n: usize) {
+        for handle in self.lazy.drain(..n) {
+            let queued = &mut self.lazy_queued[handle.index as usize];
+            if *queued == handle.generation {
+                *queued = 0;
+            }
+        }
     }
 }
 

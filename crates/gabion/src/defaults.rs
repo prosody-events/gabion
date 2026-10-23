@@ -97,7 +97,8 @@ pub const THICKET_TREES: usize = 3;
 /// announcer is asked for it with a GRAFT (Plumtree's `timeout1`).
 pub const THICKET_MISSING_TIMEOUT_MS: u64 = 500;
 
-/// Peers sent the lazy IHAVE digest on each heartbeat.
+/// Peers sent the lazy IHAVE announcement of recent changes on each
+/// heartbeat.
 pub const THICKET_LAZY_TARGETS: usize = 2;
 
 /// Minimum gap between two relay rounds. Changes merged from a tree
@@ -105,25 +106,38 @@ pub const THICKET_LAZY_TARGETS: usize = 2;
 /// relay hop waits to batch the changes that arrive together.
 pub const THICKET_RELAY_FLOOR_MS: u64 = 5;
 
-/// How long a lost eager packet is waited for before it is asked for again,
-/// and the least gap between two PRUNEs to one sender.
+/// How long a lost eager packet is waited for before it is asked for again.
 pub const THICKET_NACK_RETRY_MS: u64 = 100;
 
 /// Times a lost eager packet is asked for before it is left to the lazy path.
 pub const THICKET_NACK_ATTEMPTS: u8 = 3;
 
-/// Cells of the rotating repair slice a heartbeat sends to one random peer.
+/// Cells of the rotating repair slice a heartbeat sends to one random peer, and
+/// of the slice a catching-up node asks a peer for in one request.
 ///
-/// IHAVE names an origin by its highest sequence, and cells supersede one
-/// another, so an origin's sequences are sparse and a hole in the middle of a
-/// peer's copy is invisible to it. The slice is the shared store's
-/// anti-entropy sweep: every live cell is eventually resent, whatever the
-/// trees and the lazy path missed.
+/// The slice is the shared store's anti-entropy sweep. IHAVE announces a
+/// change once, to a couple of peers, so a node that missed both the eager
+/// push and its announcements (a partition, a long outage) is repaired by it:
+/// every live cell is eventually resent, whatever the trees and the lazy path
+/// missed.
 pub const THICKET_REPAIR_CELLS: usize = 256;
 
-/// Heartbeats between full IHAVE digests. In between, IHAVE lists only the
-/// origins that advanced since the last one.
-pub const THICKET_IHAVE_FULL_EVERY: u64 = 8;
+/// Most undelivered announced changes a node tracks at once. A change over
+/// the limit is left to the repair slice.
+pub const THICKET_MISSING_CAPACITY: usize = 4096;
+
+/// Times a GRAFT for an announced change is sent, one per missing timeout,
+/// before the change is left to the repair slice.
+pub const THICKET_GRAFT_ATTEMPTS: u8 = 3;
+
+/// Heartbeats a PROBE is repeated after the last eager packet to a peer, so
+/// that the loss of one probe does not hide a lost tail.
+pub const THICKET_PROBE_REPEATS: u8 = 3;
+
+/// Requests, one per heartbeat of silence, a node that joined empty makes for
+/// its first slice of the cluster's cells before it relies on the repair
+/// slice alone.
+pub const THICKET_CATCH_UP_ATTEMPTS: u8 = 6;
 
 /// Most neighbours in the backbone view of the tree a node is interior in.
 pub const THICKET_VIEW_CAPACITY: usize = 32;

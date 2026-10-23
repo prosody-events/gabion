@@ -32,8 +32,8 @@ mod tests;
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
 pub use control::{
-    CONTROL_ENTRY_BYTES, ControlEntry, ControlKind, DecodedControl, PULL_ONLY_TREE, decode_control,
-    encode_control, is_control,
+    CONTROL_ENTRY_BYTES, ControlEntry, ControlKind, DecodedControl, NO_CELLS, PULL_ONLY_TREE,
+    decode_control, encode_control, is_control,
 };
 pub use header::{
     FLAG_AUTHENTICATED, FLAG_CONTROL, FLAG_EDGE, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION,

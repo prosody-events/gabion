@@ -7,7 +7,7 @@
 //! what it sent. A lost packet at the end of a burst leaves no later number to
 //! reveal it, so a heartbeat PROBE names the latest number sent.
 
-use crate::crdt::{CellHandle, NodeId};
+use crate::crdt::CellHandle;
 use crate::defaults::{
     THICKET_EDGE_GAPS, THICKET_NACK_ATTEMPTS, THICKET_NACK_RETRY_MS, THICKET_RETX_CELLS,
     THICKET_RETX_PACKETS,
@@ -35,8 +35,9 @@ struct Gap {
 pub(super) struct Edge {
     /// Number of the last packet sent to the peer.
     pub send_seq: u64,
-    /// Number the last PROBE named.
-    pub probed_seq: u64,
+    /// PROBEs still to send before the edge is left alone: reset by every
+    /// eager packet, so one lost probe does not hide a lost tail.
+    pub probes_left: u8,
     /// Incarnation of the peer whose numbering `recv_high` follows.
     recv_incarnation: u32,
     /// Highest number seen from the peer.
@@ -48,7 +49,7 @@ impl Edge {
     pub(super) fn new() -> Self {
         Self {
             send_seq: 0,
-            probed_seq: 0,
+            probes_left: 0,
             recv_incarnation: 0,
             recv_high: 0,
             gaps: Vec::with_capacity(THICKET_EDGE_GAPS),
@@ -140,9 +141,8 @@ impl Edge {
 
 fn nack(seq: u64) -> ControlEntry {
     ControlEntry {
-        node_id: NodeId(0),
-        incarnation: 0,
         value: seq,
+        ..ControlEntry::default()
     }
 }
 
@@ -254,20 +254,20 @@ where
         self.thicket.entries = lost;
     }
 
-    /// Heartbeat: tell each peer we sent to the number of our latest packet.
+    /// Heartbeat: tell each peer we sent to lately the number of our latest
+    /// packet.
     pub(super) fn edge_probes(&mut self) {
         let mut probe = std::mem::take(&mut self.thicket.entries);
         for idx in 0..self.thicket.peers.len() {
             let peer = &mut self.thicket.peers[idx];
-            if !peer.alive || peer.edge.send_seq <= peer.edge.probed_seq {
+            if !peer.alive || peer.edge.probes_left == 0 {
                 continue;
             }
-            peer.edge.probed_seq = peer.edge.send_seq;
+            peer.edge.probes_left -= 1;
             probe.clear();
             probe.push(ControlEntry {
-                node_id: NodeId(0),
-                incarnation: 0,
                 value: peer.edge.send_seq,
+                ..ControlEntry::default()
             });
             self.send_control(idx as u16, ControlKind::Probe, 0, &probe);
         }
