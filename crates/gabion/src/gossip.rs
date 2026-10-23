@@ -24,7 +24,9 @@ use crate::wire::{self, FrameLimits, HmacKey};
 mod admin;
 mod client;
 mod clock;
+mod pubsub;
 mod runtime;
+mod send_queue;
 pub mod sim;
 mod store;
 mod transport;
@@ -37,6 +39,7 @@ pub use admin::{AdminCommand, AdminSnapshot, PeerEntry};
 pub use admin::{CellDumpEntry, CellDumpSnapshot};
 pub use client::{GossipClient, RecordPermit};
 pub use clock::{Clock, FixedClock, Ticker, TokioClock};
+pub use pubsub::PubSubConfig;
 pub use runtime::GossipRuntime;
 pub use store::AggregateStore;
 pub use transport::GossipTransport;
@@ -55,15 +58,12 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Floor on the number of peers contacted per gossip tick. The runtime
-    /// scales the actual per-tick fanout to the coverage threshold
-    /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
-    /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
-    /// hard minimum when that threshold falls below it.
+    /// Unused: GossipSub pushes to its mesh (see [`PubSubConfig`]), not to a
+    /// per-tick random fanout. Kept so existing configuration still parses.
     pub fanout: usize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
-    /// tick. The wire codec splits this into multiple packets if needed.
+    /// Most cells one publish round may carry. The wire codec splits them
+    /// into as many packets as they need; cells over the cap roll forward to
+    /// the next round.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,
