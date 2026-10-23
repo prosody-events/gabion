@@ -38,6 +38,8 @@ FANOUT = env_int("GABION_BENCH_FANOUT", 8)
 SAMPLE_MS = env_int("GABION_BENCH_SAMPLE_MS", 100)
 TIMEOUT_SECONDS = env_int("GABION_BENCH_TIMEOUT_SECONDS", 90)
 KEEP_NAMESPACE = os.environ.get("GABION_BENCH_KEEP_NAMESPACE") == "1"
+# CI has already built both images and loaded them into kind.
+SKIP_IMAGE_BUILD = os.environ.get("GABION_SKIP_IMAGE_BUILD") == "1"
 
 # Derived from the pid so parallel bench runs against the same kind
 # cluster (CI's "bench matrix" + a local dev run) can't collide on the
@@ -696,10 +698,11 @@ def main():
     sampler = None
     started_at = time.monotonic()
     try:
-        log("building local NGINX module image")
-        run(["docker", "compose", "--profile", "module", "-f", "deploy/nginx/docker-compose.yml", "build", "nginx-module-request-smoke"])
-        log("building local gabiond image")
-        run(["docker", "build", "-f", "deploy/gabiond/Dockerfile", "-t", "gabiond:local", "."])
+        if not SKIP_IMAGE_BUILD:
+            log("building local NGINX module image")
+            run(["docker", "compose", "--profile", "module", "-f", "deploy/nginx/docker-compose.yml", "build", "nginx-module-request-smoke"])
+            log("building local gabiond image")
+            run(["docker", "build", "-f", "deploy/gabiond/Dockerfile", "-t", "gabiond:local", "."])
 
         log(f"creating namespace {NAMESPACE}")
         run(["kubectl", "create", "namespace", NAMESPACE])

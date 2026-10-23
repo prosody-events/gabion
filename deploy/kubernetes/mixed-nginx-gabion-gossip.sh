@@ -66,8 +66,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
-docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
+# CI has already built both images and loaded them into kind.
+if [ "${GABION_SKIP_IMAGE_BUILD:-0}" != 1 ]; then
+    docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
+    docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
+fi
 
 kubectl create namespace "$namespace"
 

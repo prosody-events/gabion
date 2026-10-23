@@ -27,6 +27,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_TEST_DEBUG: 0
+  # The jobs build the smoke images with the registry cache and load them
+  # into kind before running the scripts, so the scripts skip their own
+  # uncached rebuild.
+  GABION_SKIP_IMAGE_BUILD: 1
 
 jobs:
   plan:
@@ -108,7 +112,7 @@ jobs:
       # cargo-chef cook layer from docker.yml's canonical `build` cache
       # (read-only; a miss degrades to today's cold build). Tagged as the
       # compose `<project>-<service>` name so `kind load` and the smoke
-      # script's no-op rebuild both find it.
+      # script both find it.
       - name: build NGINX module image
         run: |
           docker buildx build \
