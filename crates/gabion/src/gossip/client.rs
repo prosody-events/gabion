@@ -44,11 +44,8 @@ impl<C: Count> GossipClient<C> {
     /// and flushed the resulting rows through [`super::AggregateStore::apply`]
     /// — at that point the caller's own store handle reflects the increment.
     ///
-    /// `rule_limit` is the matched rule's cluster-wide budget; the runtime
-    /// uses it to size the per-rule threshold-trigger error budget. Carried
-    /// per-request (rather than registered separately) so the library stays
-    /// oblivious to rule-reload protocols — the freshest limit always rides
-    /// with the hit.
+    /// `rule_limit` is accepted for API compatibility and ignored: the
+    /// local-only runtime has no threshold-triggered rounds to size.
     pub async fn record(
         &self,
         rule_fingerprint: u128,
@@ -123,7 +120,7 @@ impl RecordPermit<'_> {
         key_hash: KeyHash,
         bucket: BucketEpoch,
         hits: u64,
-        rule_limit: u64,
+        _rule_limit: u64,
         now_millis: u64,
     ) {
         self.permit.send(Request::Limit(LimitRequest {
@@ -131,7 +128,6 @@ impl RecordPermit<'_> {
             key_hash,
             bucket,
             hits,
-            rule_limit,
             now_millis,
             reply: self.reply,
         }));
@@ -157,7 +153,6 @@ pub(super) struct LimitRequest {
     pub key_hash: KeyHash,
     pub bucket: BucketEpoch,
     pub hits: u64,
-    pub rule_limit: u64,
     pub now_millis: u64,
     pub reply: Option<oneshot::Sender<()>>,
 }
