@@ -162,14 +162,13 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--allow-dirty", action="store_true")
-    parser.add_argument("--no-build", action="store_true",
-                        help="reuse the existing release binary")
     args = parser.parse_args()
 
     repo = Path(git(args.repo, "rev-parse", "--show-toplevel"))
     stamp = stamp_for(repo, args.solution, args.allow_dirty)
-    binary = (Path(os.environ.get("CARGO_TARGET_DIR", repo / "target")) / "release"
-              / "gossip-bench") if args.no_build else build(repo)
+    # Always build: cargo is a no-op when the binary is current, and reusing a
+    # prebuilt binary would stamp old code's numbers with the current commit.
+    binary = build(repo)
 
     todo = []
     for regime in regimes(repo, args.regimes):

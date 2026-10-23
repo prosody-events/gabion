@@ -136,17 +136,21 @@ python3 crates/gossip-bench/judge/judge.py ../study-results --baseline main \
 `matrix.py` writes `<out>/<solution>/<regime>/seed-<n>.json`, stamped with
 the harness tree hash (`git rev-parse HEAD:crates/gossip-bench`), the
 solution label, branch and commit, plus the process's wall time, CPU time
-and peak RSS from `wait4` (host-dependent; everything else is not). It
+and peak RSS from `wait4` (host-dependent; everything else is not). It always
+builds the release binary first (a no-op when current), so a result can
+never carry numbers from a binary older than its stamped commit. It
 refuses to run when the worktree has uncommitted changes (`--allow-dirty`
 overrides, and the judge then rejects the results), and resumes only over
 results with an identical clean stamp. The judge refuses mixed harness
-hashes and several commits under one solution label, and writes
+hashes, results with an older `gabion-study/*` schema, and several commits
+under one solution label, and writes
 `summary.md` and `summary.csv` (every metric per regime and solution: mean
 across valid seeds, 95 % Student-t confidence half-width, min–max, ratio to
 the baseline over the seeds valid for both, and in the CSV the paired
 difference with its confidence half-width), `pareto.md` (total bytes against
 limited-key p99 staleness, worst-key over-admission, and p99 convergence
-including never-converged hits), `flags.md` (non-invalidating saturation and
+including never-converged hits, each point a mean over the seeds valid for
+every solution in that table), `flags.md` (non-invalidating saturation and
 the gabion warnings behind it), and `rejected.md`. A (regime, solution) with
 INVALID seeds shows `INVALID k/n` in every cell rather than silently
 averaging the survivors; one with no valid seed stays in the tables and is
@@ -209,7 +213,10 @@ buffer (about 145 full frames) and drops. Everything else a node does
 whole network: UDP payload + 28 B IPv4/UDP header. Totals are reported for
 the measurement window and for the whole run, with packets, cross-AZ bytes,
 and bytes and packets dropped by cause (loss, partition, receive buffer, no
-receiver). Derived figures divide the window total by the integral of the
+receiver). A datagram counts as delivered when its node reads it, so every
+sent datagram is exactly one of delivered, dropped (by one cause), or still
+in flight or queued when the run ends; datagrams queued at a pod that stops
+count as dropped with no receiver. Derived figures divide the window total by the integral of the
 running-pod count (bytes per node per second), by window length, and by
 admitted and offered requests. A payload above 1,472 B (one 1,500 B MTU) is
 counted as a violation and invalidates the run.
@@ -237,8 +244,13 @@ runs. Initial pods start at `U(0, 1 s)` so their ticks are not
 phase-aligned, and each lists every initial pod at start. A pod that joins
 later lists every current member at start; each other member learns of it
 after `U(0, 2 s)`. A rollout wave starts replacement `i` (fresh identity and
-address) at `at + i × interval` and stops the oldest surviving initial pod
-gracefully `overlap` later; members learn of the departure after
+address) at `at + i × interval + U(0, 1 s)` and stops the oldest surviving
+initial pod gracefully `overlap` after its replacement starts. The offset
+keeps joiners' ticks out of phase with each other, as for initial pods:
+without it, a 500 ms rollout interval that equals a solution's tick
+interval makes every joiner send its per-tick burst at the same instant,
+filling receive buffers for reasons that depend on the solution's tick
+length rather than its design; members learn of the departure after
 `U(0, 2 s)`. A silent crash stops a seeded-random running pod; discovery
 removes it 10 s later, plus `U(0, 2 s)`. A stopped pod leaves the load
 balancer at once. Optional partitions drop all traffic between one zone and
@@ -336,7 +348,7 @@ burst keys), rule, and the virtual duration (warmup + measurement):
 | `loss-burst` | 183 | as `prod-peak` | as above | 20 + 60 s | Gilbert-Elliott, 5 % mean loss, mean burst 5.3 datagrams |
 | `low-3`, `low-5` | 3 / 5 | 10 req/s sites | 20 / 10 s, 1 s buckets | 20 + 60 s | hot keys at 1.5× and 3× |
 | `idle` | 80 | 1 req/s | 100 / 10 s | 20 + 60 s | protocol floor cost |
-| `churn-rollout` | 80 (90 at most mid-wave; 79 after the crash) | as `prod-typical` | as above | 20 + 90 s | 45-pod rollout from 30 s, one pod every 500 ms, 5 s overlap; silent crash at 75 s |
+| `churn-rollout` | 80 (90 at most mid-wave; 79 after the crash) | as `prod-typical` | as above | 20 + 90 s | 45-pod rollout from 30 s, one pod every 500 ms + `U(0, 1 s)`, 5 s overlap; silent crash at 75 s |
 | `long-window` | 60 | 30 req/s | 2,000 / 1 h, 1 min buckets | 3,600 + 1,200 s | hot keys; 90 req/s burst for 60 s; first window warmed by real traffic |
 
 ### Solution contract

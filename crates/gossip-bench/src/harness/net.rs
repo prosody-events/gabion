@@ -27,7 +27,9 @@ pub const IP_UDP_HEADER_BYTES: u64 = 28;
 pub const MAX_UDP_PAYLOAD_BYTES: usize = 1_472;
 
 /// Datagram tallies. `bytes_*` include the IP/UDP header; `payload_bytes_*`
-/// do not.
+/// do not. A datagram counts as delivered when its node reads it, so each
+/// sent datagram ends up in exactly one of delivered, a drop cause, or (at
+/// the end of the run) still in flight or queued.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NetCounters {
     pub packets_sent: u64,
@@ -266,9 +268,7 @@ impl Network {
         }
         inbox.payload_bytes += len;
         inbox.queue.push_back(datagram);
-        let waker = inbox.waker.take();
-        self.tally(now_ns, |c| c.delivered(wire));
-        waker
+        inbox.waker.take()
     }
 
     /// Hand the oldest queued datagram to node `idx`'s receive call, unless
@@ -300,6 +300,8 @@ impl Network {
         inbox.wake_armed = false;
         let n = len.min(buf.len());
         buf[..n].copy_from_slice(&datagram.bytes[..n]);
+        let wire = datagram.wire_bytes();
+        self.tally(now_ns, |c| c.delivered(wire));
         Recv::Datagram(n, datagram.src)
     }
 

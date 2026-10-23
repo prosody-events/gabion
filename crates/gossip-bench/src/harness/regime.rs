@@ -140,9 +140,9 @@ pub struct ChurnConfig {
     pub partitions: Vec<Partition>,
 }
 
-/// Replace `count` pods: replacement `i` starts at `at_s + i * interval_ms`
-/// with a fresh identity and address; the oldest surviving initial pod
-/// leaves gracefully `overlap_ms` later.
+/// Replace `count` pods: replacement `i` starts at `at_s + i * interval_ms
+/// + U(0, 1 s)` with a fresh identity and address; the oldest surviving
+/// initial pod leaves gracefully `overlap_ms` after its replacement starts.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rollout {

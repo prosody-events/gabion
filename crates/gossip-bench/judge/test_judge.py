@@ -94,6 +94,29 @@ class JudgeTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("different harnesses", proc.stderr)
 
+    def test_stale_schema_is_refused(self):
+        stale = result("alt", 3, 5, harness="d" * 40)
+        stale["schema"] = "gabion-study/1"
+        proc, _ = self.judge([result("main", 1, 10), result("alt", 1, 5), stale])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("gabion-study/1", proc.stderr)
+
+    def test_foreign_json_is_listed_as_rejected(self):
+        proc, out = self.judge([result("main", 1, 10), {"hello": "world"}])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("not a study result", (out / "rejected.md").read_text())
+
+    def test_pareto_uses_seeds_common_to_every_solution(self):
+        proc, out = self.judge([
+            result("main", 1, 10), result("main", 2, 12), result("main", 3, 14),
+            result("alt", 1, 20), result("alt", 2, 22), result("alt", 3, 99, valid=False),
+        ])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        pareto = (out / "pareto.md").read_text()
+        self.assertIn("Seeds 1, 2.", pareto)
+        # main over seeds 1-2 only: bytes 11, staleness 1.1.
+        self.assertIn("| **main** | 11 | 1.1 |", pareto)
+
     def test_flags_are_listed(self):
         proc, out = self.judge([result("main", 1, 10, flags=["dirty_ring_overflow: 3 nodes"])])
         self.assertEqual(proc.returncode, 0, proc.stderr)

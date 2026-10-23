@@ -140,7 +140,8 @@ fn receive_buffer_overflow_drops_without_backpressure() {
     for _ in 0..5 {
         net.arrive(0, 1, datagram());
     }
-    assert_eq!(net.run.packets_delivered, 3);
+    // Delivery is counted when the node reads, not when the buffer queues.
+    assert_eq!(net.run.packets_delivered, 0);
     assert_eq!(net.run.dropped_rcvbuf_packets, 2);
     assert_eq!(net.run.dropped_rcvbuf_bytes, 2 * 1_028);
 
@@ -153,14 +154,22 @@ fn receive_buffer_overflow_drops_without_backpressure() {
     );
     net.arrive(0, 1, datagram());
     net.arrive(0, 1, datagram());
-    assert_eq!(net.run.packets_delivered, 4);
+    assert_eq!(net.run.packets_delivered, 1);
     assert_eq!(net.run.dropped_rcvbuf_packets, 3);
 
-    // A stopped node receives nothing; its queue is discarded.
+    // A stopped node receives nothing; its unread queue is discarded and
+    // counted once, as undelivered.
     net.set_running(0, 1, false);
     assert_eq!(net.run.dropped_no_receiver_packets, 3);
     net.arrive(0, 1, datagram());
     assert_eq!(net.run.dropped_no_receiver_packets, 4);
+    let accounted = net.run.packets_delivered
+        + net.run.dropped_rcvbuf_packets
+        + net.run.dropped_no_receiver_packets;
+    assert_eq!(
+        accounted, 8,
+        "each of the 8 arrivals is counted exactly once"
+    );
 }
 
 /// Reads are paced by the receive path's service time; arrivals during it

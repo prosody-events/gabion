@@ -6,9 +6,10 @@ Usage:
 
 Reads every `*.json` result under the given directories (as written by
 `matrix.py`). Refuses to proceed when results carry different harness tree
-hashes, or one solution label carries several commits: numbers from
-different code are not comparable. Results without a stamp, or produced from
-a dirty harness or solution worktree, are rejected and listed.
+hashes or another `gabion-study/*` schema (stale results from an older
+harness), or one solution label carries several commits: numbers from
+different code are not comparable. Results without a stamp or schema, or
+produced from a dirty harness or solution worktree, are rejected and listed.
 
 Runs the harness marked INVALID (a health invariant failed) stay visible:
 every cell of a (regime, solution) with an invalid seed reads
@@ -21,7 +22,7 @@ For each regime x solution x metric it reports the mean across valid seeds
 with a 95 % confidence half-width (Student t, n - 1 degrees of freedom), the
 min and max, and the ratio to the baseline over common seeds. Writes
 `summary.md`, `summary.csv` (long format, with paired differences),
-`pareto.md`, `flags.md` (saturation the harness flagged without
+`pareto.md` (means over the seeds valid for every solution on the front), `flags.md` (saturation the harness flagged without
 invalidating, e.g. dirty-ring overflow) and `rejected.md`.
 
 Python 3 standard library only.
@@ -39,6 +40,7 @@ from collections import defaultdict
 from pathlib import Path
 
 SCHEMA = "gabion-study/2"
+SCHEMA_FAMILY = "gabion-study/"
 
 # Two-sided 95 % Student t quantiles t(0.975, df) for df = 1..30.
 T975 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
@@ -104,7 +106,7 @@ METRICS = [
      lambda r: dig(r, "network.measure_bytes_per_admitted")),
     ("cross_az_bytes", "Cross-AZ bytes, measurement window",
      lambda r: dig(r, "network.measure.cross_az_bytes")),
-    ("stale_limited_mean", "Staleness, limited keys: mean under-count (hits)",
+    ("stale_limited_mean", "Staleness, limited keys: signed mean, truth - view (hits)",
      lambda r: dig(r, "staleness.limited.mean")),
     ("stale_limited_p99", "Staleness, limited keys: p99 (hits)*",
      lambda r: dig(r, "staleness.limited.p99")),
@@ -198,7 +200,13 @@ def load(dirs: list[Path]):
             except ValueError as error:
                 rejected.append((path, f"unreadable JSON: {error}"))
                 continue
-            if result.get("schema") != SCHEMA:
+            schema = result.get("schema") if isinstance(result, dict) else None
+            if schema != SCHEMA:
+                if isinstance(schema, str) and schema.startswith(SCHEMA_FAMILY):
+                    sys.exit(f"error: {path} has schema `{schema}`, this judge reads "
+                             f"`{SCHEMA}`: it is a stale result from another harness. "
+                             "Delete it or rerun that solution on the current harness.")
+                rejected.append((path, f"not a study result (schema {schema!r})"))
                 continue
             stamp = result.get("stamp")
             if not stamp:
@@ -364,24 +372,43 @@ def main() -> None:
                                      pair.get("diff_mean"), pair.get("diff_ci95")])
 
     pareto = ["# Pareto view", "",
-              "Per regime, each solution's mean over its valid seeds on two objectives "
-              "(both lower is better). **Bold** solutions are not dominated by any other "
-              "solution on that pair. A solution with invalid seeds is marked with its "
-              "count; one with no valid seed is listed but excluded from the front.", ""]
+              "Per regime, each solution's mean on two objectives (both lower is "
+              "better), over the seeds valid for every solution listed in that table, so "
+              "all points rest on the same workloads. **Bold** solutions are not dominated "
+              "by any other solution on that pair. A solution with invalid seeds is marked "
+              "with its count; one with no valid seed is listed but excluded from the "
+              "front.", ""]
     for regime in regimes:
         pareto += [f"## {regime}", ""]
         for x, y in PARETO:
-            points, excluded = {}, []
+            ex = next(e for k, _, e in METRICS if k == x)
+            ey = next(e for k, _, e in METRICS if k == y)
+            values, excluded = {}, []
             for s in solutions:
                 if (regime, s) not in runs:
                     continue
                 bad, total = invalid_count(regime, s)
-                sx, sy = table.get((regime, s, x)), table.get((regime, s, y))
                 if bad == total:
                     excluded.append(f"{s} (INVALID {bad}/{total})")
-                elif sx and sy:
-                    points[s] = (sx["mean"], sy["mean"])
-            pareto += [f"| Solution | {x} | {y} |", "|---|---|---|"]
+                    continue
+                seeds = {seed: (float(a), float(b))
+                         for seed, r in valid_seeds(regime, s).items()
+                         if (a := ex(r)) is not None and (b := ey(r)) is not None}
+                if seeds:
+                    values[s] = seeds
+            common = set.intersection(*(set(v) for v in values.values())) if values else set()
+            if common:
+                note = f"Seeds {', '.join(map(str, sorted(common)))}."
+                points = {s: (statistics.fmean(v[k][0] for k in common),
+                              statistics.fmean(v[k][1] for k in common))
+                          for s, v in values.items()}
+            else:
+                note = ("No seed is valid for every solution: points are per-solution "
+                        "means over different seeds and are not directly comparable.")
+                points = {s: (statistics.fmean(a for a, _ in v.values()),
+                              statistics.fmean(b for _, b in v.values()))
+                          for s, v in values.items()}
+            pareto += [note, "", f"| Solution | {x} | {y} |", "|---|---|---|"]
             for s, point in points.items():
                 front = not any(dominated(point, o) for t, o in points.items() if t != s)
                 name = f"**{s}**" if front else s

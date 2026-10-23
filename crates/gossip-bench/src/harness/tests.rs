@@ -92,6 +92,23 @@ fn every_regime_file_parses() {
     assert!(count >= 11);
 }
 
+/// Rollout replacements must not share a tick phase: with starts on exact
+/// multiples of a 500 ms interval, every joiner of a 500 ms-tick solution
+/// would burst at the same instant.
+#[test]
+fn rollout_joiners_start_out_of_phase() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("regimes");
+    let regime = Regime::load(&dir.join("churn-rollout.json")).expect("regime loads");
+    let plan = plan::Plan::build(&regime, 1);
+    let phases: std::collections::BTreeSet<u64> = plan
+        .nodes
+        .iter()
+        .filter(|n| !n.initial)
+        .map(|n| n.start_ns % (500 * plan::NS_PER_MS))
+        .collect();
+    assert_eq!(phases.len(), 45, "every joiner has its own tick phase");
+}
+
 /// Shrunken dirty rings overflow; the run stays valid but the overflow is
 /// attributed to the nodes that logged it and flagged.
 #[test]

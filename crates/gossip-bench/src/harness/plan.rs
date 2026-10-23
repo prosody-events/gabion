@@ -18,9 +18,10 @@ use super::rng::{Rng, Stream};
 
 pub const NS_PER_MS: u64 = 1_000_000;
 pub const NS_PER_S: u64 = 1_000_000_000;
-/// Initial pods start uniformly within this interval so their gossip ticks
-/// are not phase-aligned.
-pub const INITIAL_START_SPREAD_NS: u64 = NS_PER_S;
+/// Initial pods start uniformly within this interval, and each rollout
+/// replacement within this interval after its scheduled slot, so no two
+/// pods' gossip ticks are phase-aligned whatever the tick interval.
+pub const START_SPREAD_NS: u64 = NS_PER_S;
 /// Each pod learns of a membership change after `U(0, this)`.
 pub const DISCOVERY_JITTER_NS: u64 = 2 * NS_PER_S;
 /// A silently crashed pod stays in discovery this long.
@@ -107,7 +108,7 @@ impl Plan {
         let mut rng = Rng::stream(seed, Stream::Churn, 0);
         let mut nodes: Vec<NodePlan> = (0..regime.nodes as usize)
             .map(|i| NodePlan {
-                start_ns: rng.below(INITIAL_START_SPREAD_NS),
+                start_ns: rng.below(START_SPREAD_NS),
                 stop: None,
                 az: (i % AVAILABILITY_ZONES as usize) as u8,
                 initial: true,
@@ -116,7 +117,9 @@ impl Plan {
 
         for rollout in &regime.churn.rollouts {
             for i in 0..u64::from(rollout.count) {
-                let start_ns = rollout.at_s * NS_PER_S + i * rollout.interval_ms * NS_PER_MS;
+                let start_ns = rollout.at_s * NS_PER_S
+                    + i * rollout.interval_ms * NS_PER_MS
+                    + rng.below(START_SPREAD_NS);
                 let index = nodes.len();
                 nodes.push(NodePlan {
                     start_ns,
