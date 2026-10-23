@@ -135,8 +135,6 @@ export interface NodeState {
   error_budget: number;
   /** Rows in the local-origin dirty ring awaiting gossip out. */
   local_dirty_len: number;
-  /** Rows in the forwarded (received-then-re-gossiped) dirty ring. */
-  forwarded_dirty_len: number;
   /** Outbound packets queued behind the transport right now. */
   send_pending_depth: number;
   /** High-water mark of `send_pending_depth` since startup. */

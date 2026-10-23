@@ -1,5 +1,11 @@
 # The `crdt` module
 
+> **Out of date for direct mail.** This document describes the store as it
+> was with forwarding: the forwarded dirty ring, the repair lane, frame
+> composition (`fill_gossip_frame*`) and the peer frontier table no longer
+> exist. The current delta selection is `CellStore::delta_since`; see the
+> README's "Design notes".
+
 A guide to `crates/gabion/src/crdt/*` for somebody who has never opened this code before. The deep-dive companion to [`README.md`](README.md#how-gossip-works) — which documents the gossip runtime that sits on top of the structures described here. Anti-entropy, coverage fanout, threshold emissions, and peer selection all live there; this file is the data structures and the writes that flow through them.
 
 Read it end-to-end and you should be able to open `crdt.rs` and recognise every type, every column, and every method named below.

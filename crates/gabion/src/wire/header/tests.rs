@@ -10,15 +10,19 @@ fn sample() -> Header {
         body_len: 192,
         min_origin_sequence: 100,
         max_origin_sequence: 200,
+        range_start: 99,
+        ack_sequence: 321,
+        ack_incarnation: 9,
         flags: FLAG_AUTHENTICATED | FLAG_MORE,
     }
 }
 
 #[test]
-fn header_layout_is_72_bytes() {
+fn header_layout_is_92_bytes() {
     let mut buf = vec![0u8; HEADER_LEN];
     patch_header(&mut buf, &sample());
-    assert_eq!(buf.len(), HEADER_LEN);
+    assert_eq!(buf.len(), 92);
+    assert_eq!(HEADER_LEN, 92);
 }
 
 #[test]

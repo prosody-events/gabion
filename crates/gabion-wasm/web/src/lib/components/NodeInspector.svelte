@@ -170,13 +170,12 @@
 
       <div class="io-row">
         <span class="io-label">
-          <InfoTip text="Locally-originated cells waiting in the dirty ring to be gossiped out, and cells received from peers waiting to be re-gossiped (forwarded).">
-            dirty rings
+          <InfoTip text="Locally-originated changes retained in the dirty ring until every peer has acknowledged them.">
+            dirty ring
           </InfoTip>
         </span>
         <span class="rings">
           <span class="ring">local <span class="numeric">{node.local_dirty_len}</span></span>
-          <span class="ring">forwarded <span class="numeric">{node.forwarded_dirty_len}</span></span>
         </span>
       </div>
 

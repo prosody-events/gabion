@@ -57,46 +57,25 @@ const LOCAL_RULE_ID: u32 = 0;
 /// denser regime — up to `MAX_NODES` runtimes on one thread under a 100-node
 /// sustained-overload peak — so it sizes its own pool to that regime.
 ///
-/// The invariant that fixes the high-node gossip freeze: **the send pool must
-/// hold one tick's worst-case packet output, with headroom for any cross-tick
-/// backlog.** Send-pool slots recycle only on the runtime's separate `Writable`
-/// select arm, never within `handle_gossip_tick`, so all `pick_count` peers'
-/// frames for one tick must fit in the free slots at once. If a frame can't
-/// finish, [`gabion::wire::Packets::next_into`] runs out of slots mid-frame and
-/// the iterator's drain contract trips its `debug_assert` (an `unreachable`
-/// freeze in dev wasm; a silent re-send next tick in release, since the dirty
-/// rings are persistent — no data loss, just slower flush).
+/// The visualizer's per-delta cell cap, which bounds what one peer's delta can
+/// cost in send-pool slots.
 ///
 /// **The pool ceiling is 255, not a free choice.** The runtime addresses
 /// send-pool slots with a `u8` (`send_pending: VecDeque<(SocketAddr, u8)>`) and
 /// builds the free list as `(0..send_pool_size as u8)`, so any capacity ≥ 256
 /// wraps to an *empty* free list and silently kills all gossip. So the pool is
-/// pinned at the largest addressable value, and the per-tick frame is capped so
-/// one tick stays well inside it:
+/// pinned at the largest addressable value.
 ///
-/// One tick emits at most `pick_count × packets_per_frame` packets, where
-/// `pick_count = ⌈ln(peers)+c⌉` (the coverage fanout, `c` =
-/// `GOSSIP_COVERAGE_MARGIN` = 3), capped at the peer count. The widest cluster
-/// the visualizer builds is `MAX_NODES` = 256, so `peers ≤ 255` and
-/// `pick_count ≤ ⌈ln(255)+3⌉ = 9`; at the 100-node overload point it is
-/// `⌈ln(99)+3⌉ = 8`. `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK /
-/// cells_per_packet)`, with `cells_per_packet ≈ 21` at a 1400-byte payload in
-/// the worst case (every cell a distinct origin, so the node dictionary costs
-/// 16 B/cell on top of the 46 B row) — so `ceil(160 / 21) = 8`. The worst case
-/// at 100 nodes is therefore ≈ `8 × 8 = 64` packets/tick, which the 255-slot
-/// pool clears ~4×, leaving the rest of the pool for packets still draining
-/// from the previous tick. A native 100-node Sustained-overload run (40 s of
-/// virtual time, debug build with the drain `debug_assert` live) measured an
-/// actual `max_send_pending_depth` peak of **64** — no trap, ~4× under the
-/// pool. (The coverage fanout is stable for a cluster size, so this peak does
-/// not climb with burst volume the way the old dirty-set widening did.)
-///
-/// Capping the per-tick frame is what keeps one tick inside the fixed pool. The
-/// cap is inert at the default 12-node scenarios — their cross-node working set
-/// (≈ 132 cells) never reaches 160 — so it changes nothing user-visible there;
-/// a large cluster's burst simply flushes over a few ticks instead of one (the
-/// dirty rings are persistent, so the residual rides the next tick rather than
-/// dropping). Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
+/// Direct mail sends every peer its own delta each round, so one round can ask
+/// for `peers × packets_per_delta` slots. The runtime splits the free slots
+/// evenly across the peers it visits and defers whatever does not fit to the
+/// next round (the peer's `sent_upto` only advances over packets actually
+/// queued), so an oversubscribed round delays delivery rather than losing
+/// data. Capping the delta at 160 cells (`ceil(160 / 21)` = 8 packets at a
+/// 1400-byte payload in the worst case) keeps a node's share of the pool
+/// useful at the visualizer's widest cluster. The cap is inert at the default
+/// 12-node scenarios, whose cross-node working set (≈ 132 cells) never reaches
+/// it. Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
 const VIZ_MAX_CELLS_PER_TICK: usize = 160;
 const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
 
@@ -659,7 +638,7 @@ impl EngineState {
         // `release_deferred` then delivers this round's packets; the second
         // drain lets receivers merge them. Their ticks are already consumed, so
         // a freshly-merged count cannot re-gossip in the same step — one step
-        // is one epidemic round, capped at `fanout` new peers. This is the
+        // is one round of direct sends. This is the
         // physically correct model and keeps `submit`/churn paths (which never
         // arm deferral) unchanged.
         loop {
@@ -805,7 +784,6 @@ impl EngineState {
                 peak_fanout: snap.as_ref().map_or(0, |s| s.peak_effective_fanout as u32),
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
                 local_dirty_len: snap.as_ref().map_or(0, |s| s.local_dirty_len),
-                forwarded_dirty_len: snap.as_ref().map_or(0, |s| s.forwarded_dirty_len),
                 send_pending_depth: snap.as_ref().map_or(0, |s| s.send_pending_depth as u64),
                 max_send_pending_depth: snap
                     .as_ref()

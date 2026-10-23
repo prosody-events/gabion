@@ -162,7 +162,6 @@ impl From<&Rule> for RuleSnapshot {
 #[derive(Debug, Serialize)]
 pub struct GossipSnapshot {
     pub local_dirty_len: u32,
-    pub forwarded_dirty_len: u32,
     pub send_pending_depth: usize,
 }
 
@@ -226,7 +225,6 @@ async fn snapshot_handler<C: Count + 'static>(
         rules,
         gossip: GossipSnapshot {
             local_dirty_len: gossip.local_dirty_len,
-            forwarded_dirty_len: gossip.forwarded_dirty_len,
             send_pending_depth: gossip.send_pending_depth,
         },
     };

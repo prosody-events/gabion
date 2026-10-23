@@ -65,6 +65,8 @@ pub struct PacketWritten {
     /// generation or missing dictionary descriptor). Stale handles are
     /// consumed in the current packet — never carried forward.
     pub cells_dropped: u32,
+    /// Highest `origin_sequence` among the emitted cells, `0` when none.
+    pub max_origin_sequence: u64,
     /// Flags as written to the packet header.
     pub flags: u16,
 }
@@ -179,6 +181,9 @@ pub struct Packets<'a, C: Count> {
     scratch: &'a mut WireScratch,
     limits: FrameLimits,
     cursor: usize,
+    /// `range_start` of the next packet: the caller's, then the highest
+    /// sequence of the last packet that carried cells.
+    range_start: u64,
 }
 
 impl<C: Count> Drop for Packets<'_, C> {
@@ -198,7 +203,11 @@ impl<'a, C: Count> Packets<'a, C> {
     /// Build an unauthenticated packet iterator. The `cluster_id_hash`,
     /// `sender_node_id`, `sender_incarnation` fields of `header` are copied
     /// into every packet; the codec overwrites `count_width`, `cell_count`,
-    /// `body_len`, `flags`, `min/max_origin_sequence` on each packet.
+    /// `body_len`, `flags`, `min/max_origin_sequence` on each packet. The
+    /// `ack_*` fields are copied into every packet. `range_start` is the lower
+    /// bound of the first packet; each later packet starts at the previous
+    /// one's `max_origin_sequence`, so `handles` must be in ascending
+    /// `origin_sequence` order for the ranges to be contiguous.
     pub fn unauth(
         header: Header,
         store: &'a CellStore<C>,
@@ -237,6 +246,7 @@ impl<'a, C: Count> Packets<'a, C> {
             return Err(EncodeError::BudgetTooSmall);
         }
         Ok(Self {
+            range_start: header.range_start,
             header,
             store,
             handles,
@@ -245,6 +255,12 @@ impl<'a, C: Count> Packets<'a, C> {
             limits,
             cursor: 0,
         })
+    }
+
+    /// Give up on the handles not yet encoded, for a caller that has run out
+    /// of send slots and will offer them again later.
+    pub fn discard_rest(&mut self) {
+        self.cursor = self.handles.len();
     }
 
     /// Handles still to be encoded into a packet.
@@ -310,6 +326,7 @@ impl<'a, C: Count> Packets<'a, C> {
         packet_header.body_len = encoded.body_len as u32;
         packet_header.min_origin_sequence = encoded.min_origin_sequence;
         packet_header.max_origin_sequence = encoded.max_origin_sequence;
+        packet_header.range_start = self.range_start;
 
         patch_header(&mut buf.inner[..HEADER_LEN], &packet_header);
 
@@ -324,11 +341,35 @@ impl<'a, C: Count> Packets<'a, C> {
         debug_assert!(buf.inner.len() <= self.limits.max_payload_bytes);
 
         self.cursor = next_cursor;
+        if encoded.cells_emitted > 0 {
+            self.range_start = encoded.max_origin_sequence;
+        }
         Ok(Some(PacketWritten {
             cells_emitted: encoded.cells_emitted,
             cells_dropped: encoded.cells_dropped,
+            max_origin_sequence: encoded.max_origin_sequence,
             flags,
         }))
+    }
+}
+
+/// Encode a packet that carries no cells, only the header's ack fields, into
+/// `buf`. Used when a node owes a peer an acknowledgement and has no data to
+/// piggyback it on.
+pub fn encode_ack_only<C: Count>(mut header: Header, key: Option<&HmacKey>, buf: &mut PacketBuf) {
+    buf.inner.clear();
+    buf.inner.resize(HEADER_LEN, 0);
+    header.flags = if key.is_some() { FLAG_AUTHENTICATED } else { 0 };
+    header.count_width = std::mem::size_of::<C>() as u32;
+    header.cell_count = 0;
+    header.body_len = 0;
+    header.min_origin_sequence = 0;
+    header.max_origin_sequence = 0;
+    header.range_start = 0;
+    patch_header(&mut buf.inner[..HEADER_LEN], &header);
+    if let Some(key) = key {
+        let tag = auth::sign(key, &buf.inner[..HEADER_LEN]);
+        buf.inner.extend_from_slice(&tag);
     }
 }
 

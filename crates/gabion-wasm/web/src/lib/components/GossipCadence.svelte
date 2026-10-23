@@ -130,7 +130,7 @@
   // otherwise recent ticks mean the heartbeat is alive but idle; no recent ticks
   // means quiet (paused or settled with nothing ticking through). This "right
   // now" tri-state pairs with the "recent window" bars — the micro/macro reading.
-  const hasDirty = $derived(node.local_dirty_len + node.forwarded_dirty_len > 0);
+  const hasDirty = $derived(node.local_dirty_len > 0);
   const recentlyTicking = $derived(samples.some((s) => s.ticks > 0));
   const status = $derived(
     hasDirty ? 'Gossiping' : recentlyTicking ? 'Idle — heartbeat only' : 'Quiet',
