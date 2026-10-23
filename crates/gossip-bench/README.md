@@ -267,7 +267,10 @@ All metrics except the whole-run byte totals cover the measurement window
   admitted, rejected and **false rejects** (rejected although the true
   cluster total plus the request was within the limit) in the window.
 - **Churn**: for every pod that joins during the window, the time until its
-  summed tracked-key totals first reach 95 % and 99 % of truth, and its
+  summed tracked-key totals first reach 95 % and 99 % of truth; the time
+  until its summed under-count first falls to the mean over established
+  pods (parity: catch-up net of the steady-state error every pod carries,
+  checked whenever the joiner's error or the truth changes); and its
   integrated summed under-count over the first window after joining
   (hit-seconds).
 - **Health**: cell-store, rule- and node-dictionary full rejects, oversize

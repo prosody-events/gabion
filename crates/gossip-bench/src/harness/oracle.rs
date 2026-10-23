@@ -114,6 +114,11 @@ pub struct Joiner {
     /// 95 % / 99 % of truth.
     pub t95_ms: Option<f64>,
     pub t99_ms: Option<f64>,
+    /// Time from joining until the node's summed under-count first falls to
+    /// the mean over established pods: catch-up, net of the steady-state
+    /// error every pod carries. Checked whenever the joiner's error or the
+    /// truth changes.
+    pub t_parity_ms: Option<f64>,
 }
 
 impl Joiner {
@@ -125,12 +130,15 @@ impl Joiner {
         self.last_ns = self.last_ns.max(to);
     }
 
-    fn check(&mut self, now_ns: u64, truth: i64) {
+    fn check(&mut self, now_ns: u64, truth: i64, parity: Option<f64>) {
+        let elapsed = (now_ns - self.join_ns) as f64 / NS_PER_MS as f64;
+        if self.t_parity_ms.is_none() && parity.is_some_and(|p| self.under as f64 <= p) {
+            self.t_parity_ms = Some(elapsed);
+        }
         if truth <= 0 {
             return;
         }
         let coverage = 1.0 - self.under as f64 / truth as f64;
-        let elapsed = (now_ns - self.join_ns) as f64 / NS_PER_MS as f64;
         if coverage >= 0.95 && self.t95_ms.is_none() {
             self.t95_ms = Some(elapsed);
         }
@@ -170,6 +178,11 @@ pub struct Oracle {
     started_ns: Vec<u64>,
     joiners: Vec<Option<Joiner>>,
     pub finished_joiners: Vec<Joiner>,
+    /// Running pods that are not followed as joiners, and the sum of their
+    /// summed under-counts: the parity reference for joiners.
+    established: Vec<bool>,
+    established_under: i64,
+    established_count: i64,
     pub staleness: [WeightedHist; 2],
     pub residual: [Vec<i64>; 2],
     pub convergence_ns: Vec<u64>,
@@ -204,6 +217,9 @@ impl Oracle {
             started_ns: vec![0; nodes],
             joiners: vec![None; nodes],
             finished_joiners: Vec::new(),
+            established: vec![false; nodes],
+            established_under: 0,
+            established_count: 0,
             staleness: Default::default(),
             residual: Default::default(),
             convergence_ns: Vec::new(),
@@ -237,11 +253,21 @@ impl Oracle {
         }
         self.since_ns[i] = now_ns;
         self.err[i] = value;
+        let delta = value.max(0) - old.max(0);
+        if self.established[v] {
+            self.established_under += delta;
+        }
+        let parity = self.parity();
         if let Some(joiner) = self.joiners[v].as_mut() {
             joiner.integrate(now_ns);
-            joiner.under += value.max(0) - old.max(0);
-            joiner.check(now_ns, self.sum_truth);
+            joiner.under += delta;
+            joiner.check(now_ns, self.sum_truth, parity);
         }
+    }
+
+    fn parity(&self) -> Option<f64> {
+        (self.established_count > 0)
+            .then(|| self.established_under as f64 / self.established_count as f64)
     }
 
     pub fn node_started(&mut self, v: usize, now_ns: u64, joined: bool) {
@@ -256,19 +282,25 @@ impl Oracle {
             self.err[i] = self.truth_window[t];
             self.since_ns[i] = now_ns;
         }
+        let under = self.truth_window.iter().map(|&e| e.max(0)).sum();
         if joined && now_ns >= self.measure_from_ns {
             let mut joiner = Joiner {
                 node: v,
                 join_ns: now_ns,
                 until_ns: now_ns + self.keys.window_ms * NS_PER_MS,
-                under: self.truth_window.iter().map(|&e| e.max(0)).sum(),
+                under,
                 last_ns: now_ns,
                 undercount_hit_s: 0.0,
                 t95_ms: None,
                 t99_ms: None,
+                t_parity_ms: None,
             };
-            joiner.check(now_ns, self.sum_truth);
+            joiner.check(now_ns, self.sum_truth, self.parity());
             self.joiners[v] = Some(joiner);
+        } else {
+            self.established[v] = true;
+            self.established_under += under;
+            self.established_count += 1;
         }
     }
 
@@ -279,6 +311,10 @@ impl Oracle {
         }
         for t in 0..self.truth_window.len() {
             self.set_err(t, v, 0, now_ns);
+        }
+        if self.established[v] {
+            self.established[v] = false;
+            self.established_count -= 1;
         }
         self.alive[v] = false;
         for i in 0..self.conv.len() {
@@ -314,8 +350,9 @@ impl Oracle {
 
     fn check_joiners(&mut self, now_ns: u64) {
         let truth = self.sum_truth;
+        let parity = self.parity();
         for joiner in self.joiners.iter_mut().flatten() {
-            joiner.check(now_ns, truth);
+            joiner.check(now_ns, truth, parity);
         }
     }
 

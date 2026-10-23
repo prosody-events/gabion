@@ -119,6 +119,7 @@ fn joiner_time_to_coverage_and_undercount_integral() {
     for _ in 0..4 {
         oracle.admitted(0, B, NS_PER_S);
     }
+    oracle.view_changed(0, 0, B, 4, 4, NS_PER_S);
     oracle.node_started(1, 2 * NS_PER_S, true);
     oracle.view_changed(1, 0, B, 3, 3, 2_100 * MS);
     oracle.view_changed(1, 0, B, 4, 4, 2_300 * MS);
@@ -128,8 +129,29 @@ fn joiner_time_to_coverage_and_undercount_integral() {
     // 75 % covered at +100 ms, 100 % at +300 ms.
     assert_eq!(joiner.t95_ms, Some(300.0));
     assert_eq!(joiner.t99_ms, Some(300.0));
+    // The established pod is exact, so parity means a zero under-count.
+    assert_eq!(joiner.t_parity_ms, Some(300.0));
     // 4 hits for 100 ms, then 1 hit for 200 ms.
     assert!((joiner.undercount_hit_s - 0.6).abs() < 1e-9);
+}
+
+#[test]
+fn joiner_parity_is_relative_to_established_pods() {
+    let mut oracle = Oracle::new(quiet_keys(), 2, 0);
+    oracle.node_started(0, 0, false);
+    for _ in 0..4 {
+        oracle.admitted(0, B, NS_PER_S);
+    }
+    // The established pod lags by 2; the joiner reaches parity at a lag of 2
+    // and never reaches 95 % of truth.
+    oracle.view_changed(0, 0, B, 2, 2, NS_PER_S);
+    oracle.node_started(1, 2 * NS_PER_S, true);
+    oracle.view_changed(1, 0, B, 1, 1, 2_100 * MS);
+    oracle.view_changed(1, 0, B, 2, 2, 2_400 * MS);
+    oracle.finish(3 * NS_PER_S);
+    let joiner = oracle.finished_joiners[0];
+    assert_eq!(joiner.t_parity_ms, Some(400.0));
+    assert_eq!(joiner.t95_ms, None);
 }
 
 #[test]

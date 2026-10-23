@@ -186,8 +186,11 @@ pub struct ChurnReport {
     pub t95_max_ms: Option<f64>,
     pub t99_p50_ms: Option<f64>,
     pub t99_max_ms: Option<f64>,
+    pub t_parity_p50_ms: Option<f64>,
+    pub t_parity_max_ms: Option<f64>,
     pub never_reached_95: u64,
     pub never_reached_99: u64,
+    pub never_reached_parity: u64,
     pub undercount_hit_s_total: f64,
     pub undercount_hit_s_mean: Option<f64>,
 }
@@ -202,6 +205,7 @@ impl ChurnReport {
         };
         let (t95_p50_ms, t95_max_ms, never_reached_95) = pick(|j| j.t95_ms);
         let (t99_p50_ms, t99_max_ms, never_reached_99) = pick(|j| j.t99_ms);
+        let (t_parity_p50_ms, t_parity_max_ms, never_reached_parity) = pick(|j| j.t_parity_ms);
         let undercount_hit_s_total = joiners.iter().fold(0.0, |sum, j| sum + j.undercount_hit_s);
         Self {
             undercount_hit_s_mean: (!joiners.is_empty())
@@ -211,8 +215,11 @@ impl ChurnReport {
             t95_max_ms,
             t99_p50_ms,
             t99_max_ms,
+            t_parity_p50_ms,
+            t_parity_max_ms,
             never_reached_95,
             never_reached_99,
+            never_reached_parity,
             undercount_hit_s_total,
         }
     }
