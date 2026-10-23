@@ -22,7 +22,9 @@
 //! Exempt: `module.rs`'s nginx FFI, which needs nginx itself and so can't run
 //! under Miri. That includes `watch_for_shutdown`'s by-value read of
 //! `ngx_exiting` on the worker's event thread (the only thread that writes
-//! it), and `init_zone`, which carves the region out of a zone nginx maps.
+//! it), `init_zone`, which carves the region out of a zone nginx maps, and
+//! the access handler's `$gabion_decided` slot, which lives in the
+//! `r->variables` array nginx allocates per request.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

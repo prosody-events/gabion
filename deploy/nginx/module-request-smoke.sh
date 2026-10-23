@@ -62,6 +62,8 @@ nginx -c "$SHIM_CONF"
 
 api_url="http://127.0.0.1:8080/api/index.html"
 ip_url="http://127.0.0.1:8080/ip/index.html"
+redirect_url="http://127.0.0.1:8080/redirect/"
+named_url="http://127.0.0.1:8080/named/"
 tenant_a_url="http://127.0.0.1:8080/tenant/index.html?tenant=a"
 tenant_b_url="http://127.0.0.1:8080/tenant/index.html?tenant=b"
 tenant_missing_url="http://127.0.0.1:8080/tenant/index.html"
@@ -118,43 +120,25 @@ assert_header_equals() {
 # over-budget probe keeps the assertions deterministic.
 SETTLE_SLEEP="${GABION_SMOKE_SETTLE_SLEEP:-0.25}"
 
-# /api/ — uri_api at 2r/m: first two pass, third gets 429. Each response
-# must carry `X-RateLimit-{Limit,Remaining,Reset}`; the 429 also gets
-# `Retry-After`.
-first_h="$(curl_headers "$api_url")"
-first="$(printf '%s\n' "$first_h" | head -n1 | awk '{print $2}')"
-test "$first" = 200
-assert_header_present "$first_h" 'X-RateLimit-Limit'
-assert_header_present "$first_h" 'X-RateLimit-Remaining'
-assert_header_present "$first_h" 'X-RateLimit-Reset'
-assert_header_absent  "$first_h" 'Retry-After'
-
-second_h="$(curl_headers "$api_url")"
-second="$(printf '%s\n' "$second_h" | head -n1 | awk '{print $2}')"
-test "$second" = 200
-assert_header_present "$second_h" 'X-RateLimit-Limit'
-assert_header_present "$second_h" 'X-RateLimit-Remaining'
-assert_header_present "$second_h" 'X-RateLimit-Reset'
-assert_header_absent  "$second_h" 'Retry-After'
-
-sleep "$SETTLE_SLEEP"
-third_h="$(curl_headers "$api_url")"
-third="$(printf '%s\n' "$third_h" | head -n1 | awk '{print $2}')"
-test "$third" = 429
-assert_header_present "$third_h" 'X-RateLimit-Limit'
-assert_header_equals  "$third_h" 'X-RateLimit-Remaining' '0'
-assert_header_present "$third_h" 'X-RateLimit-Reset'
-assert_header_present "$third_h" 'Retry-After'
-
-# /ip/ — ip_api keyed on $remote_addr at 2r/m: same shape as /api/.
-ip_first="$(curl -fsS -o /dev/null -w '%{http_code}' "$ip_url")"
-ip_second="$(curl -fsS -o /dev/null -w '%{http_code}' "$ip_url")"
-sleep "$SETTLE_SLEEP"
-ip_third="$(curl -sS -o /dev/null -w '%{http_code}' "$ip_url")"
-
-test "$ip_first" = 200
-test "$ip_second" = 200
-test "$ip_third" = 429
+# uri_api / ip_api at 2r/m: first two pass, third gets 429. Every response
+# carries exactly one `X-RateLimit-{Limit,Remaining,Reset}`, and the 429
+# one `Retry-After`. `/redirect/` passes through `index` (and its 429
+# through `error_page`) back into its own limited location, and `/named/`
+# is first limited after `try_files`: each is still counted once.
+for url in "$api_url" "$ip_url" "$redirect_url" "$named_url"; do
+    for status in 200 200 429; do
+        [ "$status" = 429 ] && sleep "$SETTLE_SLEEP"
+        h="$(curl_headers "$url")"
+        test "$(printf '%s\n' "$h" | head -n1 | awk '{print $2}')" = "$status"
+        for name in X-RateLimit-Limit X-RateLimit-Remaining X-RateLimit-Reset Retry-After; do
+            want=1
+            [ "$name" = Retry-After ] && [ "$status" = 200 ] && want=0
+            test "$(printf '%s\n' "$h" | grep -ci "^$name:")" = "$want" \
+                || { echo "$url: expected $want $name"; printf '%s\n' "$h"; exit 1; }
+        done
+    done
+    assert_header_equals "$h" 'X-RateLimit-Remaining' '0'
+done
 
 # /tenant/ — tenant_api at 1r/m keyed on (tenant, path): each distinct
 # tenant gets its own bucket. Missing $arg_tenant declines (allow-by-default

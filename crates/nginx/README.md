@@ -243,7 +243,13 @@ check is the only cardinality gate evaluated at request time; the
 descriptor count and key length are bounded earlier, at config phase.
 Finally, a dry-run rule still pushes its event onto the SHM queue, so
 counters and gossip continue to see real traffic — only the reject
-verdict itself is suppressed.
+verdict itself is suppressed. A request is decided once: internal
+redirects (`index`, `try_files`, `error_page`, named locations) don't
+count it again, though a pass that counted nothing leaves the next
+limited location to decide, as with `limit_req`. So an inherited
+http-level `gabion_limit` that counts a request keeps a stricter rule in
+a location it is redirected to from applying. Subrequests never count,
+and gabion reserves the `$gabion_decided` variable name for this mark.
 
 ## Directive reference
 
