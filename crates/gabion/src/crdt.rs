@@ -15,10 +15,12 @@
 //! per freed cell — so an external aggregate store can keep its summary
 //! consistent with the CRDT's active set.
 //!
-//! Two dirty rings track recent changes — `local_dirty` for cells whose
-//! origin is this node, `forwarded_dirty` for cells learned from peers. A
-//! third lane, the repair cursor, rotates over the entire active set so
-//! anti-entropy still converges when the dirty rings overflow.
+//! Every cell carries the **version** its origin assigned when the cell last
+//! changed. Cells of one origin are threaded onto a version-ordered intrusive
+//! list, and each origin has a **watermark**: the highest version below which
+//! this node holds every cell that still exists. The watermark is the entry
+//! this node advertises in a Scuttlebutt digest; the list is how a peer's
+//! digest is answered with exactly the cells it lacks, oldest first.
 //!
 //! Slot lifecycle uses an intrusive freelist (`free_next` linking inactive
 //! slots) and a generation counter per slot (low bit = active flag, high
@@ -32,23 +34,18 @@
 //! Nothing in this module allocates after construction.
 
 mod dictionary;
-mod dirty_ring;
 mod hash;
 mod index;
 mod io;
-mod peer_frontier;
 
 #[cfg(test)]
 mod tests;
 
 pub use dictionary::{NodeDescriptor, NodeDictionary, RuleDescriptor, RuleDictionary};
-pub use dirty_ring::{DirtyEntry, DirtyRing};
 pub use index::CellIndex;
 pub use io::{DeltaSink, ExpirationSink, Observation, ObservationBatch};
-pub use peer_frontier::PeerFrontierTable;
 
 use dictionary::pow2_index_capacity_for;
-use dirty_ring::ring_entry_at;
 use hash::hash_compact_cell_key;
 
 use std::fmt;
@@ -276,8 +273,13 @@ pub struct CellStoreConfig {
     pub cell_capacity: u32,
     pub rule_dictionary_capacity: u16,
     pub node_dictionary_capacity: u16,
+    /// Unused: Scuttlebutt has no dirty rings. Kept so adapter and harness
+    /// configuration keeps compiling.
     pub local_dirty_capacity: usize,
+    /// Unused: see [`Self::local_dirty_capacity`].
     pub forwarded_dirty_capacity: usize,
+    /// Unused: Scuttlebutt keeps no per-peer frontier. See
+    /// [`Self::local_dirty_capacity`].
     pub peer_capacity: u16,
 }
 
@@ -319,17 +321,17 @@ pub struct CellStore<C: Count = u32> {
     // Identity index.
     index: CellIndex,
 
-    // Gossip lanes.
-    local_dirty: DirtyRing,
-    forwarded_dirty: DirtyRing,
-    repair_cursor: u32,
+    // Per-origin version log. Cells of one origin form a doubly linked list
+    // in ascending `origin_sequences` order; `log_tail` (indexed by NodeSlot)
+    // is its newest cell.
+    log_prev: Box<[u32]>,
+    log_next: Box<[u32]>,
+    log_tail: Box<[u32]>,
 
-    // Frame-level dedup.
-    selection_marks: Box<[u32]>,
-    selection_epoch: u32,
-
-    // Per-origin sequence allocator (indexed by NodeSlot).
-    next_sequence_by_origin: Box<[u64]>,
+    // Per-origin watermark (indexed by NodeSlot): every version at or below
+    // it either is held or no longer exists. For the local origin it is also
+    // the version allocator.
+    watermarks: Box<[u64]>,
 
     // Scratch arrays for `expire_at` — sized to rule_dictionary capacity.
     // Reused across every call; never allocated past `new()`.
@@ -339,9 +341,6 @@ pub struct CellStore<C: Count = u32> {
     // Identity dictionaries.
     rule_dictionary: RuleDictionary,
     node_dictionary: NodeDictionary,
-
-    // Peer state.
-    peer_frontiers: PeerFrontierTable,
 
     // Local identity.
     local_identity: NodeIdentity,
@@ -353,7 +352,8 @@ pub struct CellStore<C: Count = u32> {
     node_dictionary_full_rejects: u64,
 }
 
-const NO_FREE: u32 = u32::MAX;
+/// Null link for the slot freelist and the per-origin version log.
+const NIL: u32 = u32::MAX;
 
 /// Internal arguments for [`CellStore::upsert`]. The mode discriminates the
 /// two valid update shapes; sharing a struct prevents callers from passing a
@@ -372,8 +372,9 @@ enum UpsertMode<C: Count> {
     /// Local hit. The stored count rises by saturating-adding `hits`.
     Accumulate { hits: u64 },
     /// Remote observation. The stored count rises to `observed` if and only
-    /// if `observed` is strictly greater (CRDT max-merge).
-    MaxMerge { observed: C },
+    /// if `observed` is strictly greater (CRDT max-merge), and the cell takes
+    /// the `version` its origin assigned to that change.
+    MaxMerge { observed: C, version: u64 },
 }
 
 impl<C: Count> CellStore<C> {
@@ -391,10 +392,10 @@ impl<C: Count> CellStore<C> {
         let cap = config.cell_capacity;
         let index_cap = pow2_index_capacity_for(cap);
 
-        // Build the intrusive freelist: 0 -> 1 -> 2 -> ... -> cap-1 -> NO_FREE
-        let mut free_next = vec![NO_FREE; cap as usize].into_boxed_slice();
+        // Build the intrusive freelist: 0 -> 1 -> 2 -> ... -> cap-1 -> NIL
+        let mut free_next = vec![NIL; cap as usize].into_boxed_slice();
         for i in 0..cap {
-            free_next[i as usize] = if i + 1 < cap { i + 1 } else { NO_FREE };
+            free_next[i as usize] = if i + 1 < cap { i + 1 } else { NIL };
         }
 
         let mut node_dictionary = NodeDictionary::with_capacity(config.node_dictionary_capacity);
@@ -423,15 +424,10 @@ impl<C: Count> CellStore<C> {
 
             index: CellIndex::with_capacity(index_cap),
 
-            local_dirty: DirtyRing::with_capacity(config.local_dirty_capacity),
-            forwarded_dirty: DirtyRing::with_capacity(config.forwarded_dirty_capacity),
-            repair_cursor: 0,
-
-            selection_marks: vec![0_u32; cap as usize].into_boxed_slice(),
-            selection_epoch: 0,
-
-            next_sequence_by_origin: vec![0_u64; config.node_dictionary_capacity as usize]
-                .into_boxed_slice(),
+            log_prev: vec![NIL; cap as usize].into_boxed_slice(),
+            log_next: vec![NIL; cap as usize].into_boxed_slice(),
+            log_tail: vec![NIL; config.node_dictionary_capacity as usize].into_boxed_slice(),
+            watermarks: vec![0_u64; config.node_dictionary_capacity as usize].into_boxed_slice(),
 
             expire_current_epoch_scratch: vec![0_u32; config.rule_dictionary_capacity as usize]
                 .into_boxed_slice(),
@@ -440,11 +436,6 @@ impl<C: Count> CellStore<C> {
 
             rule_dictionary: RuleDictionary::with_capacity(config.rule_dictionary_capacity),
             node_dictionary,
-
-            peer_frontiers: PeerFrontierTable::new(
-                config.peer_capacity,
-                config.node_dictionary_capacity,
-            ),
 
             local_identity,
             local_node_slot,
@@ -483,26 +474,6 @@ impl<C: Count> CellStore<C> {
 
     pub fn node_dictionary(&self) -> &NodeDictionary {
         &self.node_dictionary
-    }
-
-    pub fn peer_frontiers(&self) -> &PeerFrontierTable {
-        &self.peer_frontiers
-    }
-
-    pub fn peer_frontiers_mut(&mut self) -> &mut PeerFrontierTable {
-        &mut self.peer_frontiers
-    }
-
-    pub fn local_dirty(&self) -> &DirtyRing {
-        &self.local_dirty
-    }
-
-    pub fn forwarded_dirty(&self) -> &DirtyRing {
-        &self.forwarded_dirty
-    }
-
-    pub fn repair_cursor(&self) -> u32 {
-        self.repair_cursor
     }
 
     pub fn index(&self) -> &CellIndex {
@@ -725,12 +696,12 @@ impl<C: Count> CellStore<C> {
     // -- Slot lifecycle -----------------------------------------------------
 
     fn alloc_slot(&mut self) -> Option<u32> {
-        if self.free_head == NO_FREE {
+        if self.free_head == NIL {
             return None;
         }
         let slot = self.free_head;
         self.free_head = self.free_next[slot as usize];
-        self.free_next[slot as usize] = NO_FREE;
+        self.free_next[slot as usize] = NIL;
         // Flip to active: bump generation.
         self.generations[slot as usize] = self.generations[slot as usize].wrapping_add(1);
         debug_assert!(self.is_active(slot));
@@ -759,56 +730,127 @@ impl<C: Count> CellStore<C> {
         };
         let h = hash_compact_cell_key(&key);
         self.index.remove(h, slot);
+        self.log_unlink(slot, origin);
         self.rule_dictionary.dec_ref(rule);
         let freed_node = self.node_dictionary.dec_ref(origin);
         if freed_node {
-            self.peer_frontiers.clear_node_slot(origin);
-            self.next_sequence_by_origin[origin as usize] = 0;
+            self.watermarks[origin as usize] = 0;
         }
         self.free_slot(slot);
     }
 
     // -- Update primitives --------------------------------------------------
 
-    fn next_origin_sequence(&mut self, origin: NodeSlot) -> u64 {
-        let seq = &mut self.next_sequence_by_origin[origin as usize];
-        *seq = seq.saturating_add(1);
-        *seq
+    /// Allocate the next version for a locally originated change.
+    fn next_local_version(&mut self) -> u64 {
+        let w = &mut self.watermarks[self.local_node_slot as usize];
+        *w = w.saturating_add(1);
+        *w
     }
 
-    fn push_dirty(&mut self, origin: NodeSlot, handle: CellHandle, sequence: u64) {
-        let entry = DirtyEntry {
-            handle,
-            origin_sequence: sequence,
-        };
-        if origin == self.local_node_slot {
-            let before = self.local_dirty.overflow_seq();
-            self.local_dirty.push(entry);
-            let after = self.local_dirty.overflow_seq();
-            if after != before && after.is_power_of_two() {
-                tracing::warn!(
-                    overflow_total = after,
-                    capacity = self.local_dirty.capacity(),
-                    "Local gossip dirty ring overflowed. Recent local changes are being \
-                     overwritten before gossip can send them; peers may lag until the repair lane \
-                     catches up. Raise `storage.local_dirty_capacity` or reduce write/cardinality \
-                     pressure.",
-                );
-            }
+    /// Thread `slot` onto `origin`'s version log at the position its
+    /// `origin_sequences` entry dictates. Local changes and in-order remote
+    /// changes land on the tail in O(1); a reordered remote change walks back
+    /// past the newer cells that overtook it.
+    fn log_link(&mut self, slot: u32, origin: NodeSlot) {
+        let version = self.origin_sequences[slot as usize];
+        let mut before = NIL;
+        let mut after = self.log_tail[origin as usize];
+        while after != NIL && self.origin_sequences[after as usize] > version {
+            before = after;
+            after = self.log_prev[after as usize];
+        }
+        self.log_prev[slot as usize] = after;
+        self.log_next[slot as usize] = before;
+        if after != NIL {
+            self.log_next[after as usize] = slot;
+        }
+        if before == NIL {
+            self.log_tail[origin as usize] = slot;
         } else {
-            let before = self.forwarded_dirty.overflow_seq();
-            self.forwarded_dirty.push(entry);
-            let after = self.forwarded_dirty.overflow_seq();
-            if after != before && after.is_power_of_two() {
-                tracing::warn!(
-                    overflow_total = after,
-                    capacity = self.forwarded_dirty.capacity(),
-                    "Forwarded gossip dirty ring overflowed. Recently received peer changes are \
-                     being overwritten before they can be forwarded; convergence will depend on \
-                     repair scans. Raise `storage.forwarded_dirty_capacity` or reduce \
-                     write/cardinality pressure.",
-                );
-            }
+            self.log_prev[before as usize] = slot;
+        }
+    }
+
+    fn log_unlink(&mut self, slot: u32, origin: NodeSlot) {
+        let after = self.log_prev[slot as usize];
+        let before = self.log_next[slot as usize];
+        if after != NIL {
+            self.log_next[after as usize] = before;
+        }
+        if before == NIL {
+            self.log_tail[origin as usize] = after;
+        } else {
+            self.log_prev[before as usize] = after;
+        }
+        self.log_prev[slot as usize] = NIL;
+        self.log_next[slot as usize] = NIL;
+    }
+
+    /// The version this node advertises for `origin` in a digest: it holds
+    /// every cell of `origin` at or below it that still exists.
+    pub fn watermark(&self, origin: NodeSlot) -> u64 {
+        self.watermarks[origin as usize]
+    }
+
+    /// Version of `origin`'s newest cell, or `0` when it has none.
+    pub fn newest_version(&self, origin: NodeSlot) -> u64 {
+        match self.log_tail[origin as usize] {
+            NIL => 0,
+            tail => self.origin_sequences[tail as usize],
+        }
+    }
+
+    /// Append to `out` the cells of `origin` with a version above `after`, in
+    /// ascending version order, stopping once `out` holds `limit` handles.
+    /// Because the order is by version, the cells delivered for one origin
+    /// are always a prefix of what it owes.
+    pub fn collect_newer(
+        &self,
+        origin: NodeSlot,
+        after: u64,
+        limit: usize,
+        out: &mut Vec<CellHandle>,
+    ) {
+        let mut first = NIL;
+        let mut cursor = self.log_tail[origin as usize];
+        while cursor != NIL && self.origin_sequences[cursor as usize] > after {
+            first = cursor;
+            cursor = self.log_prev[cursor as usize];
+        }
+        while first != NIL && out.len() < limit {
+            out.push(self.handle_for(first));
+            first = self.log_next[first as usize];
+        }
+    }
+
+    /// How many versions below this cell's own the sender certifies as
+    /// absent, for the wire's per-cell claim. A cell at or below the
+    /// origin's watermark asserts that nothing exists between it and its
+    /// predecessor on the log. A cell above the watermark sits past a
+    /// possible hole, so it asserts only that nothing sits between it and
+    /// the version just before it.
+    pub(crate) fn claim_gap(&self, slot: u32) -> u32 {
+        let version = self.origin_sequences[slot as usize];
+        let origin = self.origins[slot as usize];
+        if version > self.watermarks[origin as usize] {
+            return 1;
+        }
+        let before = match self.log_prev[slot as usize] {
+            NIL => 0,
+            prev => self.origin_sequences[prev as usize],
+        };
+        (version - before).min(u32::MAX as u64) as u32
+    }
+
+    /// Advance `origin`'s watermark to `version` if the sender's claim ties
+    /// it to what this node already holds: nothing exists strictly between
+    /// `version - gap` and `version`, and the watermark has reached
+    /// `version - gap`.
+    fn advance_watermark(&mut self, origin: NodeSlot, version: u64, gap: u32) {
+        let w = &mut self.watermarks[origin as usize];
+        if version > *w && version.saturating_sub(gap as u64) <= *w {
+            *w = version;
         }
     }
 
@@ -893,7 +935,7 @@ impl<C: Count> CellStore<C> {
             let previous = self.counts[slot as usize];
             let next = match mode {
                 UpsertMode::Accumulate { hits } => previous.saturating_add_hits(hits),
-                UpsertMode::MaxMerge { observed } => {
+                UpsertMode::MaxMerge { observed, .. } => {
                     if observed > previous {
                         observed
                     } else {
@@ -910,10 +952,14 @@ impl<C: Count> CellStore<C> {
             }
             self.counts[slot as usize] = next;
             self.last_update_millis[slot as usize] = now_millis;
-            let seq = self.next_origin_sequence(origin_slot);
-            self.origin_sequences[slot as usize] = seq;
+            let version = match mode {
+                UpsertMode::Accumulate { .. } => self.next_local_version(),
+                UpsertMode::MaxMerge { version, .. } => version,
+            };
+            self.log_unlink(slot, origin_slot);
+            self.origin_sequences[slot as usize] = version;
+            self.log_link(slot, origin_slot);
             let handle = self.handle_for(slot);
-            self.push_dirty(origin_slot, handle, seq);
             let delta = C::saturating_delta(next, previous);
             self.emit_delta(sink, slot, previous, next, delta, rule_slot);
             return Ok(UpdateOutcome {
@@ -933,7 +979,7 @@ impl<C: Count> CellStore<C> {
         };
         let initial = match mode {
             UpsertMode::Accumulate { hits } => C::default().saturating_add_hits(hits),
-            UpsertMode::MaxMerge { observed } => observed,
+            UpsertMode::MaxMerge { observed, .. } => observed,
         };
         self.rules[slot as usize] = rule_slot;
         self.key_hashes[slot as usize] = key_hash;
@@ -942,8 +988,12 @@ impl<C: Count> CellStore<C> {
         self.incarnations[slot as usize] = incarnation;
         self.counts[slot as usize] = initial;
         self.last_update_millis[slot as usize] = now_millis;
-        let seq = self.next_origin_sequence(origin_slot);
-        self.origin_sequences[slot as usize] = seq;
+        let version = match mode {
+            UpsertMode::Accumulate { .. } => self.next_local_version(),
+            UpsertMode::MaxMerge { version, .. } => version,
+        };
+        self.origin_sequences[slot as usize] = version;
+        self.log_link(slot, origin_slot);
 
         // Hold dictionary references on behalf of this cell.
         self.rule_dictionary.inc_ref(rule_slot);
@@ -953,7 +1003,6 @@ impl<C: Count> CellStore<C> {
             .insert_unchecked(hash_compact_cell_key(&key), slot);
 
         let handle = self.handle_for(slot);
-        self.push_dirty(origin_slot, handle, seq);
         let delta = initial;
         self.emit_delta(sink, slot, C::default(), initial, delta, rule_slot);
         Ok(UpdateOutcome {
@@ -1046,10 +1095,29 @@ impl<C: Count> CellStore<C> {
 
     /// Merge observations received from a peer. Each row is max-merged into
     /// the stored count; the resulting deltas (when the stored count rose)
-    /// are appended to `sink`.
-    pub fn merge_remote(&mut self, obs: &ObservationBatch<C>, sink: &mut DeltaSink<C>) {
+    /// are appended to `sink`. A row that was applied (or was already
+    /// covered) also advances its origin's watermark when the row's claim
+    /// chains onto it; a row the store had to reject never does, so a digest
+    /// cannot advertise a version this node lacks.
+    ///
+    /// A row for a known rule whose bucket has already left the live window at
+    /// `now_millis` is acknowledged without being stored. A peer that has not
+    /// yet expired such a cell would otherwise hand it back the moment this
+    /// node's last cell for the origin expired and its watermark reset.
+    pub fn merge_remote(
+        &mut self,
+        obs: &ObservationBatch<C>,
+        now_millis: u64,
+        sink: &mut DeltaSink<C>,
+    ) {
         obs.assert_consistent();
         for i in 0..obs.len() {
+            if self.is_expired(obs.rule_fingerprints[i], obs.buckets[i], now_millis) {
+                if let Some(origin) = self.find_node(obs.origin_node_ids[i], obs.incarnations[i]) {
+                    self.advance_watermark(origin, obs.origin_sequences[i], obs.claim_gaps[i]);
+                }
+                continue;
+            }
             let Some((rule_slot, node_slot)) = self.translate_identity(
                 obs.rule_fingerprints[i],
                 obs.origin_node_ids[i],
@@ -1057,7 +1125,7 @@ impl<C: Count> CellStore<C> {
             ) else {
                 continue;
             };
-            let _ = self.upsert(
+            let applied = self.upsert(
                 UpsertSpec {
                     rule_slot,
                     key_hash: obs.key_hashes[i],
@@ -1067,11 +1135,29 @@ impl<C: Count> CellStore<C> {
                     now_millis: obs.last_update_millis[i],
                     mode: UpsertMode::MaxMerge {
                         observed: obs.counts[i],
+                        version: obs.origin_sequences[i],
                     },
                 },
                 sink,
             );
+            if applied.is_ok() {
+                self.advance_watermark(node_slot, obs.origin_sequences[i], obs.claim_gaps[i]);
+            }
         }
+    }
+
+    /// Whether a cell of the configured or already-seen rule `fingerprint` in
+    /// `bucket` is outside its live window at `now_millis`. `false` for a rule
+    /// this node has never seen, whose window it cannot know.
+    fn is_expired(&self, fingerprint: u128, bucket: BucketEpoch, now_millis: u64) -> bool {
+        let Some(rule) = self
+            .rule_dictionary
+            .find(fingerprint)
+            .and_then(|slot| self.rule_dictionary.descriptor(slot))
+        else {
+            return false;
+        };
+        (bucket as u64) + (rule.live_buckets() as u64) < (rule.current_epoch(now_millis) as u64)
     }
 
     /// Free cells whose bucket has aged out of the per-rule live window.
@@ -1105,206 +1191,17 @@ impl<C: Count> CellStore<C> {
         }
     }
 
-    /// Drop dirty records. Stored cells are untouched.
-    pub fn clear_dirty(&mut self) {
-        self.local_dirty.clear();
-        self.forwarded_dirty.clear();
-    }
-
     /// Reset to an empty state — preserves the local identity registration
     /// but clears every other column. Mostly useful in tests.
     pub fn clear(&mut self) {
         // Free each active cell — this also decrements dictionary refcounts
-        // and clears frontier rows.
+        // and unthreads the version logs.
         for slot in 0..self.capacity {
             if self.is_active(slot) {
                 self.free_cell_at(slot);
             }
         }
-        // Reset the dirty rings and repair cursor explicitly.
-        self.clear_dirty();
-        self.repair_cursor = 0;
-        self.selection_epoch = 0;
-        for m in self.selection_marks.iter_mut() {
-            *m = 0;
-        }
-    }
-
-    // -- Gossip frame composition -------------------------------------------
-
-    fn bump_selection_epoch(&mut self) {
-        let next = self.selection_epoch.wrapping_add(1);
-        if next == 0 {
-            // Wraparound guard: reset all marks so the new epoch (`0`) is
-            // unambiguous. Pathological in practice — u32 epochs cover
-            // billions of frames — but cheap insurance.
-            for m in self.selection_marks.iter_mut() {
-                *m = 0;
-            }
-            self.selection_epoch = 1;
-        } else {
-            self.selection_epoch = next;
-        }
-    }
-
-    fn mark_selected(&mut self, slot: u32) -> bool {
-        if self.selection_marks[slot as usize] == self.selection_epoch {
-            return false;
-        }
-        self.selection_marks[slot as usize] = self.selection_epoch;
-        true
-    }
-
-    /// Visit dirty cells originating on the local node, newest cell state only.
-    /// `visit` returning `false` halts the scan.
-    ///
-    /// Streams every current entry in the ring through `visit` with no
-    /// intra-call dedup — in contrast to `fill_gossip_frame`, which dedups
-    /// via `selection_marks`. Callers composing multi-lane frames must
-    /// dedup themselves.
-    pub fn visit_local_dirty(&self, mut visit: impl FnMut(CellHandle, &CellStore<C>) -> bool) {
-        for entry in self.local_dirty.iter() {
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !visit(entry.handle, self) {
-                return;
-            }
-        }
-    }
-
-    /// Visit dirty cells originating on other peers.
-    ///
-    /// Streams every current entry in the ring through `visit` with no
-    /// intra-call dedup — in contrast to `fill_gossip_frame`, which dedups
-    /// via `selection_marks`. Callers composing multi-lane frames must
-    /// dedup themselves.
-    pub fn visit_forwarded_dirty(&self, mut visit: impl FnMut(CellHandle, &CellStore<C>) -> bool) {
-        for entry in self.forwarded_dirty.iter() {
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !visit(entry.handle, self) {
-                return;
-            }
-        }
-    }
-
-    fn dirty_entry_current(&self, entry: DirtyEntry) -> bool {
-        let i = entry.handle.index as usize;
-        if i >= self.capacity as usize {
-            return false;
-        }
-        if self.generations[i] != entry.handle.generation {
-            return false;
-        }
-        if self.origin_sequences[i] != entry.origin_sequence {
-            return false;
-        }
-        true
-    }
-
-    /// Visit a fair rotating slice of active cells. Anti-entropy lane.
-    pub fn visit_repair_slice(
-        &mut self,
-        max_cells: usize,
-        mut visit: impl FnMut(CellHandle) -> bool,
-    ) -> usize {
-        if self.capacity == 0 || max_cells == 0 || self.active_len == 0 {
-            return 0;
-        }
-        self.bump_selection_epoch();
-        let cap = self.capacity;
-        let mut visited = 0_u32;
-        let mut emitted = 0_usize;
-        let mut next_cursor = self.repair_cursor;
-        while visited < cap && emitted < max_cells {
-            let slot = (self.repair_cursor + visited) % cap;
-            visited += 1;
-            next_cursor = (slot + 1) % cap;
-            if !self.is_active(slot) {
-                continue;
-            }
-            if !self.mark_selected(slot) {
-                continue;
-            }
-            let handle = self.handle_for(slot);
-            emitted += 1;
-            if !visit(handle) {
-                break;
-            }
-        }
-        self.repair_cursor = next_cursor;
-        emitted
-    }
-
-    /// Fill one outgoing gossip frame: local dirty first, then forwarded
-    /// dirty, then a rotating repair slice. Returns the number of handles
-    /// pushed. Uses `selection_marks` for O(1) intra-frame dedup.
-    pub fn fill_gossip_frame(&mut self, max_cells: usize, out: &mut Vec<CellHandle>) -> usize {
-        out.clear();
-        if max_cells == 0 {
-            return 0;
-        }
-        self.bump_selection_epoch();
-
-        // Lane 1: local dirty.
-        let local_len = self.local_dirty.len();
-        for offset in 0..local_len {
-            if out.len() >= max_cells {
-                break;
-            }
-            let entry = ring_entry_at(&self.local_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
-        }
-        if out.len() >= max_cells {
-            return out.len();
-        }
-
-        // Lane 2: forwarded dirty.
-        let forwarded_len = self.forwarded_dirty.len();
-        for offset in 0..forwarded_len {
-            if out.len() >= max_cells {
-                break;
-            }
-            let entry = ring_entry_at(&self.forwarded_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
-        }
-        if out.len() >= max_cells {
-            return out.len();
-        }
-
-        // Lane 3: rotating repair slice. selection_marks has already been
-        // set for dirty cells in lanes 1+2, so repair cannot re-emit them.
-        let cap = self.capacity;
-        let mut visited = 0_u32;
-        let mut next_cursor = self.repair_cursor;
-        while visited < cap && out.len() < max_cells {
-            let slot = (self.repair_cursor + visited) % cap;
-            visited += 1;
-            next_cursor = (slot + 1) % cap;
-            if !self.is_active(slot) {
-                continue;
-            }
-            if !self.mark_selected(slot) {
-                continue;
-            }
-            out.push(self.handle_for(slot));
-        }
-        self.repair_cursor = next_cursor;
-        out.len()
+        self.watermarks[self.local_node_slot as usize] = 0;
     }
 
     /// Convenience wrapper around [`Self::expire`] that derives the per-rule
@@ -1334,111 +1231,5 @@ impl<C: Count> CellStore<C> {
         self.expire(&current, &live, sink);
         self.expire_current_epoch_scratch = current;
         self.expire_live_buckets_scratch = live;
-    }
-
-    /// Peer-aware sibling of [`Self::fill_gossip_frame`]. Walks the same
-    /// three lanes (local dirty → forwarded dirty → repair) in the same
-    /// order, dedup'd via `selection_marks`.
-    ///
-    /// The two dirty lanes prune by the peer frontier — a cell whose
-    /// `origin_sequence` is at or below the peer's recorded `last_acked` for
-    /// that origin is skipped. That is a **latency optimization only**: the
-    /// frontier is a per-(peer, origin) high-watermark, and because remote
-    /// cells are re-stamped with the merging node's local origin counter (see
-    /// [`Self::merge_remote`]), the watermark can sit above a sequence the peer
-    /// never actually received — a gap it cannot represent. So the repair lane
-    /// (lane 3) sweeps the rotating active-set slice **unconditionally**,
-    /// without consulting the frontier. That is what makes anti-entropy
-    /// converge under reordering, loss, or a stale watermark — the guarantee
-    /// the [`PeerFrontierTable`] doc comment delegates to the repair lane.
-    pub fn fill_gossip_frame_for_peer(
-        &mut self,
-        max_cells: usize,
-        peer_slot: u16,
-        out: &mut Vec<CellHandle>,
-    ) -> usize {
-        out.clear();
-        if max_cells == 0 {
-            return 0;
-        }
-        self.bump_selection_epoch();
-
-        // Lane 1: local dirty.
-        let local_len = self.local_dirty.len();
-        for offset in 0..local_len {
-            if out.len() >= max_cells {
-                break;
-            }
-            let entry = ring_entry_at(&self.local_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            let i = entry.handle.index as usize;
-            if !self.peer_lacks(peer_slot, i) {
-                continue;
-            }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
-        }
-        if out.len() >= max_cells {
-            return out.len();
-        }
-
-        // Lane 2: forwarded dirty.
-        let forwarded_len = self.forwarded_dirty.len();
-        for offset in 0..forwarded_len {
-            if out.len() >= max_cells {
-                break;
-            }
-            let entry = ring_entry_at(&self.forwarded_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            let i = entry.handle.index as usize;
-            if !self.peer_lacks(peer_slot, i) {
-                continue;
-            }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
-        }
-        if out.len() >= max_cells {
-            return out.len();
-        }
-
-        // Lane 3: rotating repair slice. Unlike the dirty lanes above, this
-        // does *not* consult `peer_lacks` — the frontier is a gap-blind
-        // high-watermark and cannot be trusted for correctness (see the
-        // method doc). Sweeping every active cell in cursor order, regardless
-        // of the watermark, is what guarantees a cell the frontier wrongly
-        // believes the peer holds still gets re-sent and merged (idempotent
-        // max-merge) until the cluster converges.
-        let cap = self.capacity;
-        let mut visited = 0_u32;
-        let mut next_cursor = self.repair_cursor;
-        while visited < cap && out.len() < max_cells {
-            let slot = (self.repair_cursor + visited) % cap;
-            visited += 1;
-            next_cursor = (slot + 1) % cap;
-            if !self.is_active(slot) {
-                continue;
-            }
-            if !self.mark_selected(slot) {
-                continue;
-            }
-            out.push(self.handle_for(slot));
-        }
-        self.repair_cursor = next_cursor;
-        out.len()
-    }
-
-    #[inline]
-    fn peer_lacks(&self, peer_slot: u16, cell_index: usize) -> bool {
-        let origin = self.origins[cell_index];
-        let last = self.peer_frontiers.last_acked(peer_slot, origin);
-        self.origin_sequences[cell_index] > last
     }
 }

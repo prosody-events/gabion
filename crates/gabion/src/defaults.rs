@@ -22,45 +22,18 @@ pub const STORAGE_MAX_MATCHED_RULES: usize = 16;
 
 pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 
-/// Floor on the number of peers contacted per gossip tick. The runtime does
-/// **not** treat this as the operating fanout — it scales the actual per-tick
-/// fanout up to the coverage threshold `⌈ln(n) + GOSSIP_COVERAGE_MARGIN⌉`
-/// (`n` = live peer count), capped at the peer count. This floor is a hard
-/// minimum: it binds only if `GOSSIP_COVERAGE_MARGIN` is lowered far enough
-/// that the coverage threshold drops below it. At the shipped margin it never
-/// binds. See `handle_gossip_tick` in `gossip/runtime.rs`.
-pub const GOSSIP_FANOUT: usize = 3;
-
-/// Coverage margin `c` in the gossip fanout law `⌈ln(n) + c⌉` (`n` = live peer
-/// count). Per Kermarrec, Massoulié & Ganesh (IEEE TPDS 2003, "Probabilistic
-/// Reliable Dissemination in Large-Scale Systems", Theorem 1), a directed
-/// gossip round with mean fanout `ln(n) + c` reaches every node with
-/// probability → `e^(−e^(−c))`:
-///
-/// | `c`   | per-round coverage `e^(−e^(−c))` |
-/// |-------|----------------------------------|
-/// | **3** | **95.1 %**                       |
-/// | 4     | 98.2 %                           |
-/// | 5     | 99.3 %                           |
-///
-/// **These are single-round figures, and the single round is the wrong unit
-/// for gabion.** KMG's theorem bounds one *one-shot* dissemination; gabion
-/// instead runs continuous anti-entropy — it re-gossips every dirty cell each
-/// tick until the peer frontier shows it acked, with the repair lane behind
-/// that. So a node missed in one round is overwhelmingly likely to be reached
-/// by the next, and the per-round coverage *compounds*: at `c = 3` the 4.9 %
-/// per-round miss falls to ≈ 0.24 % after two rounds and ≈ 0.012 % after three.
-/// We therefore size to the leaner `c = 3` threshold and let anti-entropy close
-/// the gap, rather than paying KMG's one-shot `c ≈ 4` (their validated sims —
-/// fanout 13 @ 10 000 nodes, 15 @ 50 000 — measure single-shot reach, which a
-/// re-gossiping system does not need to match). `c = 3` costs ≈ 1 fewer peer
-/// per tick at every cluster size (≈ 10 % less gossip bandwidth). Kept a
-/// `const`; promote to a `GossipConfig` field if an operator ever needs to
-/// trade bandwidth for coverage at runtime.
-pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
+/// Scuttlebutt's `f`: the number of pairwise digest exchanges a node opens per
+/// gossip round, each with a distinct random peer. Van Renesse, Dumitriu,
+/// Gupta, Bhagwat, "Efficient Reconciliation and Flow Control for Anti-Entropy
+/// Protocols" (LADIS 2008), runs one exchange per round. Raising it trades
+/// bandwidth for freshness; see `crates/gabion/README.md`.
+pub const GOSSIP_FANOUT: usize = 1;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
+/// Reply budget: the most cells one answer to a digest carries. When a peer
+/// owes more than this, origins are served deepest backlog first (the paper's
+/// "scuttle-depth" order) and the rest waits for the next exchange.
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;
 pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 128;
 pub const GOSSIP_LIMIT_QUEUE_CAPACITY: usize = 8192;

@@ -9,9 +9,10 @@ use crate::crdt::{
 };
 
 use super::{
-    DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_MORE, FrameLimits,
-    HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch, decode_auth,
-    decode_auth_visit, decode_unauth, decode_unauth_visit,
+    DecodeError, DecodedSummary, DigestEntry, DigestRange, EncodeError, FLAG_AUTHENTICATED,
+    FLAG_DIGEST, FLAG_MORE, FLAG_SYN, FrameLimits, HEADER_LEN, Header, HmacKey, PacketBuf, Packets,
+    WireCell, WireScratch, decode_auth, decode_auth_visit, decode_unauth, decode_unauth_visit,
+    encode_digest, max_digest_entries, open,
 };
 
 const MAX_ROWS: usize = 32;
@@ -105,9 +106,11 @@ fn seed_store<C: Count>(
             incarnation: r.origin_incarnation as Incarnation,
             count: to_count(r.count),
             last_update_millis: r.last_update_millis,
+            origin_sequence: 0,
+            claim_gap: 0,
         });
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, 0, &mut sink);
 
     let mut handles = Vec::with_capacity(store.active_len() as usize);
     for h in store.active_handles() {
@@ -353,9 +356,11 @@ fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
             incarnation: 1,
             count: 1 + i,
             last_update_millis: 1_000 + i as u64,
+            origin_sequence: 0,
+            claim_gap: 0,
         });
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, 0, &mut sink);
     let handles: Vec<CellHandle> = store.active_handles().collect();
     (store, handles)
 }
@@ -867,4 +872,211 @@ fn visitor_matches_allocating_for_curated_rows() {
         assert_eq!(cell.count, obs.counts[i]);
         assert_eq!(cell.last_update_millis, obs.last_update_millis[i]);
     }
+}
+
+// --- Scuttlebutt digest frames and claims --------------------------------
+
+fn digest_entries(n: u128) -> Vec<DigestEntry> {
+    (0..n)
+        .map(|i| DigestEntry {
+            node_id: NodeId(0x100 + i),
+            incarnation: 1 + i as u32,
+            version: 1_000 * (i as u64 + 1),
+        })
+        .collect()
+}
+
+fn encode_test_digest(
+    syn: bool,
+    entries: &[DigestEntry],
+    key: Option<&HmacKey>,
+    limits: FrameLimits,
+) -> PacketBuf {
+    let mut buf = PacketBuf::for_limits(limits);
+    let range = DigestRange {
+        lo: 0x80,
+        hi: 0x9000,
+    };
+    encode_digest(sample_header(), syn, range, entries, key, limits, &mut buf).expect("encode");
+    buf
+}
+
+#[test]
+fn digest_frames_round_trip_plain_and_authenticated() {
+    let limits = FrameLimits::default();
+    let entries = digest_entries(5);
+    let key = HmacKey([3; 32]);
+
+    for (key, syn) in [(None, true), (None, false), (Some(&key), true)] {
+        let buf = encode_test_digest(syn, &entries, key, limits);
+        let frame = open(buf.as_bytes(), key, limits).expect("open");
+        assert!(frame.is_digest());
+        assert_eq!(frame.is_syn(), syn);
+        assert_eq!(frame.header.flags & FLAG_DIGEST, FLAG_DIGEST);
+        assert_eq!(frame.header.flags & FLAG_SYN != 0, syn);
+        assert_eq!(frame.header.flags & FLAG_AUTHENTICATED != 0, key.is_some());
+        assert_eq!(frame.header.sender_node_id, sample_header().sender_node_id);
+
+        let mut decoded = Vec::new();
+        let range = frame.visit_digest(|e| decoded.push(e)).expect("digest");
+        assert_eq!(
+            range,
+            DigestRange {
+                lo: 0x80,
+                hi: 0x9000
+            }
+        );
+        assert_eq!(decoded, entries);
+    }
+}
+
+#[test]
+fn an_empty_digest_is_a_valid_frame() {
+    let limits = FrameLimits::default();
+    let buf = encode_test_digest(false, &[], None, limits);
+    let frame = open(buf.as_bytes(), None, limits).expect("open");
+    let mut seen = 0;
+    frame.visit_digest(|_| seen += 1).expect("digest");
+    assert_eq!(seen, 0);
+}
+
+#[test]
+fn authenticated_digest_rejects_any_tampering() {
+    let limits = FrameLimits::default();
+    let key = HmacKey([3; 32]);
+    let buf = encode_test_digest(true, &digest_entries(3), Some(&key), limits);
+
+    for i in [0, HEADER_LEN, HEADER_LEN + 40, buf.as_bytes().len() - 1] {
+        let mut bytes = buf.as_bytes().to_vec();
+        bytes[i] ^= 0x01;
+        assert!(
+            open(&bytes, Some(&key), limits).is_err(),
+            "flipping byte {i} must fail authentication or framing"
+        );
+    }
+    assert_eq!(
+        open(buf.as_bytes(), Some(&HmacKey([4; 32])), limits).unwrap_err(),
+        DecodeError::AuthenticationFailed
+    );
+}
+
+#[test]
+fn digest_capacity_matches_what_fits_in_one_payload() {
+    let limits = FrameLimits {
+        max_payload_bytes: 1400,
+        max_cells: 4096,
+    };
+    for authenticated in [false, true] {
+        let key = HmacKey([3; 32]);
+        let key = authenticated.then_some(&key);
+        let capacity = max_digest_entries(limits, authenticated);
+        let buf = encode_test_digest(true, &digest_entries(capacity as u128), key, limits);
+        assert!(buf.as_bytes().len() <= limits.max_payload_bytes);
+        // One more entry would not fit in the payload.
+        assert!(buf.as_bytes().len() + 28 > limits.max_payload_bytes);
+
+        let mut over = PacketBuf::for_limits(limits);
+        let err = encode_digest(
+            sample_header(),
+            true,
+            DigestRange::ALL,
+            &digest_entries(capacity as u128 + 1),
+            key,
+            limits,
+            &mut over,
+        )
+        .unwrap_err();
+        assert_eq!(err, EncodeError::BudgetTooSmall);
+    }
+}
+
+#[test]
+fn cell_and_digest_decoders_refuse_each_others_frames() {
+    let limits = FrameLimits::default();
+    let digest = encode_test_digest(true, &digest_entries(2), None, limits);
+    let mut obs = ObservationBatch::<u32>::with_capacity(1);
+    assert_eq!(
+        decode_unauth::<u32>(digest.as_bytes(), limits, &mut obs).unwrap_err(),
+        DecodeError::WrongFrameKind
+    );
+
+    let rows = [RawRow {
+        rule_fingerprint: 1,
+        key_hash: 2,
+        bucket: 0,
+        origin_node_id: 3,
+        origin_incarnation: 1,
+        count: 4,
+        last_update_millis: 5,
+    }];
+    let (store, handles) = seed_store::<u32>(&rows, |c| c);
+    let mut scratch = WireScratch::for_store(&store);
+    let mut cells = PacketBuf::for_limits(limits);
+    Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+        .expect("ctor")
+        .next_into(&mut cells)
+        .expect("encode");
+    let frame = open(cells.as_bytes(), None, limits).expect("open");
+    assert!(!frame.is_digest());
+    assert_eq!(
+        frame.visit_digest(|_| {}).unwrap_err(),
+        DecodeError::WrongFrameKind
+    );
+}
+
+#[test]
+fn cell_frames_carry_the_stores_claim_for_each_cell() {
+    let rows: Vec<RawRow> = (0..4)
+        .map(|i| RawRow {
+            rule_fingerprint: 1,
+            key_hash: 10 + i as u128,
+            bucket: 0,
+            origin_node_id: 0x77,
+            origin_incarnation: 1,
+            count: 1,
+            last_update_millis: 0,
+        })
+        .collect();
+    let mut store = store_with_cap::<u32>(64, 16);
+    let mut obs = ObservationBatch::<u32>::with_capacity(rows.len());
+    let mut sink = DeltaSink::<u32>::with_capacity(rows.len());
+    // Versions 3, 4, 8 and 20, each claiming the stretch back to the
+    // previous one; the first claims everything from zero.
+    for (r, (version, gap)) in rows.iter().zip([(3, 3), (4, 1), (8, 4), (20, 12)]) {
+        obs.push(Observation {
+            rule_fingerprint: r.rule_fingerprint,
+            key_hash: KeyHash(r.key_hash),
+            bucket: 0,
+            origin: NodeId(r.origin_node_id),
+            incarnation: r.origin_incarnation,
+            count: r.count,
+            last_update_millis: 0,
+            origin_sequence: version,
+            claim_gap: gap,
+        });
+    }
+    store.merge_remote(&obs, 0, &mut sink);
+    let origin = store.find_node(NodeId(0x77), 1).expect("origin");
+    let mut handles = Vec::new();
+    store.collect_newer(origin, 0, usize::MAX, &mut handles);
+
+    let limits = FrameLimits::default();
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+        .expect("ctor")
+        .next_into(&mut buf)
+        .expect("encode");
+
+    let mut got = Vec::new();
+    decode_unauth_visit::<u32>(
+        buf.as_bytes(),
+        limits,
+        |_| true,
+        |c| {
+            got.push((c.origin_sequence, c.claim_gap));
+        },
+    )
+    .expect("decode");
+    assert_eq!(got, [(3, 3), (4, 1), (8, 4), (20, 12)]);
 }

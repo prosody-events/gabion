@@ -1,11 +1,12 @@
 //! On-the-wire codec for per-origin counter CRDT gossip frames.
 //!
-//! Each UDP packet is self-describing: the body carries its own small
-//! `(rule_fp, origin_node_id)` mini-dictionaries followed by per-cell slot
-//! indices. A receiver can decode any packet in isolation regardless of
-//! whether earlier or later packets in the same batch arrived — the only
-//! cross-packet signal is the advisory [`FLAG_MORE`] hint, which receivers
-//! may use to defer downstream work until a batch settles.
+//! Two frame kinds share one header: cell frames and Scuttlebutt digest
+//! frames ([`digest`]). Each UDP packet is self-describing: the body carries
+//! its own small `(rule_fp, origin_node_id)` mini-dictionaries followed by
+//! per-cell slot indices. A receiver can decode any packet in isolation
+//! regardless of whether earlier or later packets in the same batch arrived —
+//! the only cross-packet signal is the advisory [`FLAG_MORE`] hint, which
+//! receivers may use to defer downstream work until a batch settles.
 //!
 //! Invariants:
 //! - Frames are little-endian.
@@ -23,6 +24,7 @@
 
 mod auth;
 mod body;
+mod digest;
 mod header;
 
 #[cfg(test)]
@@ -30,7 +32,10 @@ mod tests;
 
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
-pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
+pub use digest::{DigestEntry, DigestRange, encode_digest, max_digest_entries};
+pub use header::{
+    FLAG_AUTHENTICATED, FLAG_DIGEST, FLAG_MORE, FLAG_SYN, HEADER_LEN, Header, MAGIC, VERSION,
+};
 
 use auth::AUTH_TAG_LEN;
 use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
@@ -108,6 +113,8 @@ pub enum DecodeError {
     AuthenticationFailed,
     #[error("trailing bytes after body")]
     Trailing,
+    #[error("frame kind does not match what the caller decodes")]
+    WrongFrameKind,
 }
 
 // -- send-side buffer -------------------------------------------------------
@@ -334,6 +341,93 @@ impl<'a, C: Count> Packets<'a, C> {
 
 // -- decode -----------------------------------------------------------------
 
+/// A frame whose framing, size limits and authentication have been checked
+/// but whose body is not yet decoded.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame<'a> {
+    pub header: Header,
+    body: &'a [u8],
+}
+
+impl Frame<'_> {
+    /// Whether the body is a digest rather than cells.
+    pub fn is_digest(&self) -> bool {
+        self.header.flags & FLAG_DIGEST != 0
+    }
+
+    /// Whether this digest opens an exchange and wants a digest in return.
+    pub fn is_syn(&self) -> bool {
+        self.header.flags & FLAG_SYN != 0
+    }
+
+    /// Decode a cell frame's cells.
+    pub fn visit_cells<C: Count>(
+        &self,
+        on_cell: impl FnMut(WireCell<C>),
+    ) -> Result<(), DecodeError> {
+        if self.is_digest() {
+            return Err(DecodeError::WrongFrameKind);
+        }
+        if self.header.count_width as usize != std::mem::size_of::<C>() {
+            return Err(DecodeError::BadCountWidth);
+        }
+        decode_body_visit::<C>(self.body, self.header.cell_count, on_cell)
+    }
+
+    /// Decode a digest frame's entries and return the range it covers.
+    pub fn visit_digest(
+        &self,
+        on_entry: impl FnMut(DigestEntry),
+    ) -> Result<DigestRange, DecodeError> {
+        if !self.is_digest() {
+            return Err(DecodeError::WrongFrameKind);
+        }
+        digest::decode_digest_body(self.body, self.header.cell_count, on_entry)
+    }
+}
+
+/// Check one datagram's framing and, when `key` is set, its HMAC.
+pub fn open<'a>(
+    bytes: &'a [u8],
+    key: Option<&HmacKey>,
+    limits: FrameLimits,
+) -> Result<Frame<'a>, DecodeError> {
+    if bytes.len() > limits.max_payload_bytes {
+        return Err(DecodeError::PayloadTooLarge);
+    }
+    let auth_overhead = if key.is_some() { AUTH_TAG_LEN } else { 0 };
+    if bytes.len() < HEADER_LEN + auth_overhead {
+        return Err(DecodeError::TooShort);
+    }
+
+    let frame = if let Some(key) = key {
+        let (frame, tag) = bytes.split_at(bytes.len() - AUTH_TAG_LEN);
+        auth::verify(key, frame, tag).map_err(|_| DecodeError::AuthenticationFailed)?;
+        frame
+    } else {
+        bytes
+    };
+
+    let header = read_header(frame)?;
+    if header.cell_count > limits.max_cells {
+        return Err(DecodeError::CapacityExceeded);
+    }
+    let body_len = header.body_len as usize;
+    let total_required = HEADER_LEN
+        .checked_add(body_len)
+        .ok_or(DecodeError::BodyLenMismatch)?;
+    if total_required != frame.len() {
+        if total_required > frame.len() {
+            return Err(DecodeError::BodyLenMismatch);
+        }
+        return Err(DecodeError::Trailing);
+    }
+    Ok(Frame {
+        header,
+        body: &frame[HEADER_LEN..],
+    })
+}
+
 pub fn decode_unauth<C: Count>(
     bytes: &[u8],
     limits: FrameLimits,
@@ -364,7 +458,7 @@ pub fn decode_auth<C: Count>(
 }
 
 #[inline]
-fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
+pub fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
     Observation {
         rule_fingerprint: cell.rule_fingerprint,
         key_hash: cell.key_hash,
@@ -373,6 +467,8 @@ fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
         incarnation: cell.origin_incarnation,
         count: cell.count,
         last_update_millis: cell.last_update_millis,
+        origin_sequence: cell.origin_sequence,
+        claim_gap: cell.claim_gap,
     }
 }
 
@@ -402,53 +498,15 @@ fn decode_inner<C: Count>(
     accept_header: impl FnOnce(&Header) -> bool,
     on_cell: impl FnMut(WireCell<C>),
 ) -> Result<DecodedSummary, DecodeError> {
-    if bytes.len() > limits.max_payload_bytes {
-        return Err(DecodeError::PayloadTooLarge);
-    }
-    let auth_overhead = if key.is_some() { AUTH_TAG_LEN } else { 0 };
-    if bytes.len() < HEADER_LEN + auth_overhead {
-        return Err(DecodeError::TooShort);
-    }
-
-    let (frame, _tag) = if let Some(key) = key {
-        let split = bytes.len() - AUTH_TAG_LEN;
-        let (frame, tag) = bytes.split_at(split);
-        auth::verify(key, frame, tag).map_err(|_| DecodeError::AuthenticationFailed)?;
-        (frame, Some(tag))
-    } else {
-        (bytes, None)
-    };
-
-    let header = read_header(frame)?;
-    if header.count_width as usize != std::mem::size_of::<C>() {
-        return Err(DecodeError::BadCountWidth);
-    }
-    if header.cell_count > limits.max_cells {
-        return Err(DecodeError::CapacityExceeded);
-    }
-    let body_len = header.body_len as usize;
-    let total_required = HEADER_LEN
-        .checked_add(body_len)
-        .ok_or(DecodeError::BodyLenMismatch)?;
-    if total_required != frame.len() {
-        if total_required > frame.len() {
-            return Err(DecodeError::BodyLenMismatch);
-        }
-        return Err(DecodeError::Trailing);
-    }
-
+    let frame = open(bytes, key, limits)?;
     let summary = DecodedSummary {
-        header,
-        cell_count: header.cell_count,
-        flags: header.flags,
+        header: frame.header,
+        cell_count: frame.header.cell_count,
+        flags: frame.header.flags,
     };
-
-    if !accept_header(&header) {
+    if !accept_header(&frame.header) {
         return Ok(summary);
     }
-
-    let body_bytes = &frame[HEADER_LEN..HEADER_LEN + body_len];
-    decode_body_visit::<C>(body_bytes, header.cell_count, on_cell)?;
-
+    frame.visit_cells(on_cell)?;
     Ok(summary)
 }

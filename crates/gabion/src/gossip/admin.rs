@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 
 use tokio::sync::oneshot;
 
-use super::{CellStoreStats, NodeId, NodeIdentity};
+use super::{CellStoreStats, NodeIdentity};
 #[cfg(feature = "cell-dump")]
 use crate::crdt::{BucketEpoch, Incarnation};
 
@@ -39,8 +39,6 @@ pub struct AdminSnapshot {
     pub local_identity: NodeIdentity,
     pub peers: Vec<PeerEntry>,
     pub store_stats: CellStoreStats,
-    pub local_dirty_len: u32,
-    pub forwarded_dirty_len: u32,
     pub send_pending_depth: usize,
     pub decode_reject_count: u64,
     /// High-water mark of `send_pending_depth` since startup. Useful for
@@ -59,21 +57,13 @@ pub struct AdminSnapshot {
     /// and `min_emit_interval` had elapsed, so the run loop dispatched
     /// a synthetic tick without waiting for the heartbeat.
     pub threshold_fires: u64,
-    /// Cumulative ticks (heartbeat + threshold) during which at least
-    /// one cell was dirty when `handle_gossip_tick` entered the peer
-    /// pick. Used by the bench to compute *effective fanout*
-    /// (`packets_emitted / dirty_ticks`) — see
-    /// `crates/gossip-bench/README.md`.
+    /// Cumulative ticks (heartbeat + threshold) that opened exchanges, i.e.
+    /// had at least one peer to talk to.
     pub dirty_ticks: u64,
-    /// The coverage fanout the most recent dirty tick chose:
-    /// `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`, where `c` is
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]. Scales with cluster size,
-    /// not the dirty set, so it is stable for a given peer count rather than
-    /// pulsing with bursts. `0` before the first dirty tick.
+    /// The number of exchanges the most recent such tick opened:
+    /// `config.fanout.clamp(1, peers)`. `0` before the first one.
     pub last_effective_fanout: usize,
-    /// High-water mark of `last_effective_fanout` since startup — the widest
-    /// the node has ever fanned out. Tracks the coverage fanout's peak, which
-    /// rises only when the peer count grows.
+    /// High-water mark of `last_effective_fanout` since startup.
     pub peak_effective_fanout: usize,
     /// The per-rule error budget ε the most recent `handle_limit_request`
     /// computed: `limit × target_err_bps / (10_000 × peers)` (floored at 1).
@@ -83,16 +73,10 @@ pub struct AdminSnapshot {
     pub last_error_budget: u64,
 }
 
-/// One peer known to the runtime. `node_id` is `None` until the runtime has
-/// received an inbound packet from this peer; `peer_slot` is `None` until the
-/// peer has been interned in the `PeerFrontierTable`. The two fields are set
-/// together — see the invariant tested in
-/// `quickcheck_peer_slot_pairing_holds_across_lifecycle`.
+/// One peer known to the runtime.
 #[derive(Clone, Copy, Debug)]
 pub struct PeerEntry {
     pub addr: SocketAddr,
-    pub node_id: Option<NodeId>,
-    pub peer_slot: Option<u16>,
 }
 
 /// Full per-cell view of one runtime's `CellStore`, built inside the gossip

@@ -129,9 +129,11 @@ fn lead(store: &ShmAggregateStore, incarnation: u32) -> CellStore<u32> {
         incarnation: 1,
         count: 5,
         last_update_millis: 7_000,
+        origin_sequence: 1,
+        claim_gap: 1,
     });
     let mut deltas = DeltaSink::default();
-    cells.merge_remote(&gossip, &mut deltas);
+    cells.merge_remote(&gossip, 0, &mut deltas);
     store.apply(&deltas, &ExpirationSink::default());
     cells
 }

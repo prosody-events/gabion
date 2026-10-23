@@ -804,8 +804,6 @@ impl EngineState {
                 effective_fanout: snap.as_ref().map_or(0, |s| s.last_effective_fanout as u32),
                 peak_fanout: snap.as_ref().map_or(0, |s| s.peak_effective_fanout as u32),
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
-                local_dirty_len: snap.as_ref().map_or(0, |s| s.local_dirty_len),
-                forwarded_dirty_len: snap.as_ref().map_or(0, |s| s.forwarded_dirty_len),
                 send_pending_depth: snap.as_ref().map_or(0, |s| s.send_pending_depth as u64),
                 max_send_pending_depth: snap
                     .as_ref()
@@ -870,7 +868,7 @@ impl EngineState {
             .iter()
             .map(|peer| PeerView {
                 id: addresses.get(&peer.addr).copied(),
-                node_id: peer.node_id.map(|id| id.0),
+                node_id: None,
             })
             .collect()
     }

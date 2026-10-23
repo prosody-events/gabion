@@ -18,7 +18,9 @@
 //! [ node_slot          : u8 ×N  ]    each < D
 //! [ origin_incarnation : u32 ×N ]     4N
 //! [ last_update_millis : u64 ×N ]     8N
-//! [ origin_sequence    : u64 ×N ]     8N
+//! [ origin_sequence    : u64 ×N ]     8N    version the origin assigned
+//! [ claim_gap          : u32 ×N ]     4N    versions below it the sender
+//!                                           certifies absent
 //! [ count              : C  ×N  ]    count_size · N
 //! ```
 //!
@@ -31,8 +33,9 @@ use super::DecodeError;
 
 /// Per-cell identity bytes once the slot indices are encoded.
 /// `1 (rule_slot) + 16 (key_hash) + 4 (bucket) + 1 (node_slot) +
-///  4 (origin_incarnation) + 8 (last_update_millis) + 8 (origin_sequence)`.
-pub(crate) const PER_CELL_IDENT_BYTES: usize = 1 + 16 + 4 + 1 + 4 + 8 + 8;
+///  4 (origin_incarnation) + 8 (last_update_millis) + 8 (origin_sequence) +
+///  4 (claim_gap)`.
+pub(crate) const PER_CELL_IDENT_BYTES: usize = 1 + 16 + 4 + 1 + 4 + 8 + 8 + 4;
 
 /// Fixed body overhead when at least one cell is present: the two
 /// `dict_len` bytes. Dictionary entries themselves cost `16 * (R + D)`.
@@ -54,6 +57,7 @@ pub struct WireCell<C: Count> {
     pub count: C,
     pub last_update_millis: u64,
     pub origin_sequence: u64,
+    pub claim_gap: u32,
 }
 
 /// Per-encode scratch. Re-fills `rule_remap` / `node_remap` with `u8::MAX` on
@@ -320,7 +324,8 @@ fn write_body<C: Count>(
     let origin_inc_off = node_slot_off + n;
     let last_update_off = origin_inc_off + 4 * n;
     let origin_seq_off = last_update_off + 8 * n;
-    let count_off = origin_seq_off + 8 * n;
+    let claim_gap_off = origin_seq_off + 8 * n;
+    let count_off = claim_gap_off + 4 * n;
     debug_assert_eq!(count_off + count_size * n, plan.body_len);
 
     // Pass 2 — walk the same handle range we planned over and fill slabs.
@@ -353,6 +358,9 @@ fn write_body<C: Count>(
             .copy_from_slice(&row.last_update_millis.to_le_bytes());
         body[origin_seq_off + i * 8..origin_seq_off + i * 8 + 8]
             .copy_from_slice(&row.origin_sequence.to_le_bytes());
+
+        body[claim_gap_off + i * 4..claim_gap_off + i * 4 + 4]
+            .copy_from_slice(&store.claim_gap(handle.index).to_le_bytes());
 
         let count_u64: u64 = row.count.into();
         body[count_off + i * count_size..count_off + i * count_size + count_size]
@@ -449,6 +457,8 @@ pub(crate) fn decode_body_visit<C: Count>(
     cursor += 8 * n;
     let origin_seq_slab = &bytes[cursor..cursor + 8 * n];
     cursor += 8 * n;
+    let claim_gap_slab = &bytes[cursor..cursor + 4 * n];
+    cursor += 4 * n;
     let count_slab = &bytes[cursor..cursor + count_size * n];
     debug_assert_eq!(cursor + count_size * n, bytes.len());
 
@@ -468,6 +478,7 @@ pub(crate) fn decode_body_visit<C: Count>(
         let origin_incarnation = read_u32(&origin_inc_slab[i * 4..]);
         let last_update_millis = read_u64(&last_update_slab[i * 8..]);
         let origin_sequence = read_u64(&origin_seq_slab[i * 8..]);
+        let claim_gap = read_u32(&claim_gap_slab[i * 4..]);
         let count = read_count::<C>(&count_slab[i * count_size..]);
         on_cell(WireCell {
             rule_fingerprint,
@@ -478,6 +489,7 @@ pub(crate) fn decode_body_visit<C: Count>(
             count,
             last_update_millis,
             origin_sequence,
+            claim_gap,
         });
     }
 

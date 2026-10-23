@@ -6,7 +6,14 @@
 //! rows the arm produced. The runtime owns the [`CellStore`], pre-allocated
 //! scratch buffers, the outbound send pool, and the peer table; nothing in
 //! the loop allocates after construction.
+//!
+//! Replication is Scuttlebutt push-pull anti-entropy. A tick sends a peer a
+//! digest (the watermark per origin). A peer answers a digest with the cells
+//! the digest lacks and, if the digest opened the exchange, its own digest,
+//! which the initiator answers the same way. Cells move only in response to a
+//! digest.
 
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
@@ -16,11 +23,11 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Incarnation, NodeId, Observation,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, NodeSlot, Observation,
     ObservationBatch,
 };
 use crate::discovery::PeerEvent;
-use crate::wire::{self, PacketBuf, Packets, WireScratch};
+use crate::wire::{self, DecodeError, DigestEntry, DigestRange, PacketBuf, Packets, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
@@ -33,48 +40,13 @@ use super::transport::GossipTransport;
 use super::transport::UdpTransport;
 use super::{GossipConfig, GossipError};
 
-/// One peer the runtime gossips with. `node_id` is `None` until we receive
-/// our first inbound packet from this peer; `peer_slot` caches the
-/// `PeerFrontierTable` slot once interned.
-struct Peer {
-    addr: SocketAddr,
-    node_id: Option<NodeId>,
-    peer_slot: Option<u16>,
-}
-
-/// Data-oriented scratch for per-row frontier acks decoded from one inbound
-/// packet. The columns are allocated once at runtime construction and reused
-/// for every inbound arm.
-struct AckColumns {
-    origin_node_ids: Vec<NodeId>,
-    incarnations: Vec<Incarnation>,
-    origin_sequences: Vec<u64>,
-}
-
-impl AckColumns {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            origin_node_ids: Vec::with_capacity(capacity),
-            incarnations: Vec::with_capacity(capacity),
-            origin_sequences: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.origin_node_ids.clear();
-        self.incarnations.clear();
-        self.origin_sequences.clear();
-    }
-
-    fn push(&mut self, origin_node_id: NodeId, incarnation: Incarnation, origin_sequence: u64) {
-        self.origin_node_ids.push(origin_node_id);
-        self.incarnations.push(incarnation);
-        self.origin_sequences.push(origin_sequence);
-    }
-
-    fn len(&self) -> usize {
-        self.origin_node_ids.len()
-    }
+/// One origin this node owes cells to a peer: everything above `after`.
+/// `backlog` orders origins for the reply when the cell budget binds.
+#[derive(Clone, Copy)]
+struct Owed {
+    origin: NodeSlot,
+    after: u64,
+    backlog: u64,
 }
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
@@ -103,17 +75,29 @@ where
     recv_buf: Box<[u8]>,
     scratch: WireScratch,
     obs_buf: ObservationBatch<C>,
-    ack_buf: AckColumns,
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
+
+    // Digest scratch. `digest_in` holds the frame being answered,
+    // `digest_out` the frame being built, `origin_order` the origins a digest
+    // is cut from, `owed` the origins a reply draws cells from. The two
+    // `digest_*` columns map a node slot to the entry the peer listed for it,
+    // valid when `digest_marks[slot] == digest_epoch`.
+    digest_in: Vec<DigestEntry>,
+    digest_out: Vec<DigestEntry>,
+    origin_order: Vec<NodeSlot>,
+    owed: Vec<Owed>,
+    digest_marks: Box<[u32]>,
+    digest_versions: Box<[u64]>,
+    digest_epoch: u32,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
     send_pending: VecDeque<(SocketAddr, u8)>,
     send_free: Vec<u8>,
 
-    peers: Vec<Peer>,
+    peers: Vec<SocketAddr>,
     rng: SplitMix64,
 
     // Pending reply for the in-flight limit request. Sent after the
@@ -258,7 +242,6 @@ where
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
         let obs_buf = ObservationBatch::<C>::with_capacity(config.max_cells_per_tick);
-        let ack_buf = AckColumns::with_capacity(config.wire_limits.max_cells as usize);
         let sink_buf = DeltaSink::<C>::with_capacity(config.max_cells_per_tick);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
@@ -270,16 +253,11 @@ where
         let send_free: Vec<u8> = (0..send_pool_size as u8).rev().collect();
         let send_pending = VecDeque::with_capacity(send_pool_size);
 
-        let peers: Vec<Peer> = config
-            .bootstrap_peers
-            .iter()
-            .copied()
-            .map(|addr| Peer {
-                addr,
-                node_id: None,
-                peer_slot: None,
-            })
-            .collect();
+        let peers = config.bootstrap_peers.clone();
+
+        let node_capacity = store.node_dictionary().capacity() as usize;
+        let digest_capacity =
+            wire::max_digest_entries(config.wire_limits, config.auth_key.is_some());
         let rng = SplitMix64::new(config.rng_seed);
 
         let rule_capacity = store.rule_dictionary().capacity() as usize;
@@ -297,10 +275,16 @@ where
             recv_buf,
             scratch,
             obs_buf,
-            ack_buf,
             sink_buf,
             expiration_buf,
             frame_handles,
+            digest_in: Vec::with_capacity(digest_capacity),
+            digest_out: Vec::with_capacity(digest_capacity),
+            origin_order: Vec::with_capacity(node_capacity),
+            owed: Vec::with_capacity(node_capacity),
+            digest_marks: vec![0; node_capacity].into_boxed_slice(),
+            digest_versions: vec![0; node_capacity].into_boxed_slice(),
+            digest_epoch: 0,
             send_pool,
             send_pending,
             send_free,
@@ -488,6 +472,8 @@ where
             incarnation: 0,
             count: C::saturating_from_u64(req.hits),
             last_update_millis: req.now_millis,
+            origin_sequence: 0,
+            claim_gap: 0,
         });
         self.store.ingest_local(&self.obs_buf, &mut self.sink_buf);
         // Reply is sent at the bottom of this loop iteration, AFTER the
@@ -497,47 +483,20 @@ where
     }
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
-        self.obs_buf.clear();
-        self.ack_buf.clear();
-        self.sink_buf.clear();
-        let bytes = &self.recv_buf[..n];
-        let decoded = {
-            let obs_buf = &mut self.obs_buf;
-            let ack_buf = &mut self.ack_buf;
-            let mut on_cell = |cell: wire::WireCell<C>| {
-                ack_buf.push(
-                    cell.origin_node_id,
-                    cell.origin_incarnation,
-                    cell.origin_sequence,
-                );
-                obs_buf.push(Observation {
-                    rule_fingerprint: cell.rule_fingerprint,
-                    key_hash: cell.key_hash,
-                    bucket: cell.bucket,
-                    origin: cell.origin_node_id,
-                    incarnation: cell.origin_incarnation,
-                    count: cell.count,
-                    last_update_millis: cell.last_update_millis,
-                });
-            };
-            match self.config.auth_key.as_ref() {
-                Some(key) => wire::decode_auth_visit::<C>(
-                    bytes,
-                    key,
-                    self.config.wire_limits,
-                    |_| true,
-                    &mut on_cell,
-                ),
-                None => wire::decode_unauth_visit::<C>(
-                    bytes,
-                    self.config.wire_limits,
-                    |_| true,
-                    &mut on_cell,
-                ),
+        match self.decode_inbound(n) {
+            Ok(Inbound::Cells) => {
+                let now_millis = self.clock.now_millis();
+                self.store
+                    .merge_remote(&self.obs_buf, now_millis, &mut self.sink_buf);
             }
-        };
-        let summary = match decoded {
-            Ok(s) => s,
+            Ok(Inbound::Digest { range, syn }) => {
+                // The digest goes first: it is small, and the cells below can
+                // use up the send pool.
+                if syn {
+                    self.send_digest(src, false, range);
+                }
+                self.serve_digest(src, range);
+            }
             Err(err) => {
                 self.decode_reject_count = self.decode_reject_count.saturating_add(1);
                 if self.decode_reject_count.is_power_of_two() {
@@ -557,33 +516,177 @@ where
                          mismatch.",
                     );
                 }
-                return;
             }
-        };
+        }
+    }
 
-        self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
+    /// Decode the datagram in `recv_buf[..n]` into `obs_buf` (cells) or
+    /// `digest_in` (digest).
+    fn decode_inbound(&mut self, n: usize) -> Result<Inbound, DecodeError> {
+        self.obs_buf.clear();
+        self.sink_buf.clear();
+        self.digest_in.clear();
+        let frame = wire::open(
+            &self.recv_buf[..n],
+            self.config.auth_key.as_ref(),
+            self.config.wire_limits,
+        )?;
+        if frame.is_digest() {
+            if frame.header.cell_count as usize > self.digest_in.capacity() {
+                return Err(DecodeError::CapacityExceeded);
+            }
+            let digest_in = &mut self.digest_in;
+            let range = frame.visit_digest(|entry| digest_in.push(entry))?;
+            return Ok(Inbound::Digest {
+                range,
+                syn: frame.is_syn(),
+            });
+        }
+        let obs_buf = &mut self.obs_buf;
+        frame.visit_cells::<C>(|cell| obs_buf.push(wire::observation_from_wire(cell)))?;
+        Ok(Inbound::Cells)
+    }
 
-        // Frontier update — latency optimization. Best-effort: missing slot
-        // or missing node entry just means we don't get the skip.
-        let sender_id = NodeId(summary.header.sender_node_id);
-        if let Some(peer_slot) = self.store.peer_frontiers_mut().intern_peer(sender_id) {
-            for i in 0..self.ack_buf.len() {
-                let origin_id = self.ack_buf.origin_node_ids[i];
-                let incarnation = self.ack_buf.incarnations[i];
-                let sequence = self.ack_buf.origin_sequences[i];
-                if let Some(node_slot) = self.store.node_dictionary().find(origin_id, incarnation) {
-                    self.store
-                        .peer_frontiers_mut()
-                        .record_acked(peer_slot, node_slot, sequence);
+    /// Answer the digest in `digest_in` with the cells it lacks. Origins in
+    /// `range` the digest does not list are answered from version `0`.
+    /// Origins are served deepest backlog first (Scuttlebutt's
+    /// "scuttle-depth" order), each oldest version first, until the per-reply
+    /// cell budget runs out, so what one origin receives is always a prefix of
+    /// what it owes.
+    fn serve_digest(&mut self, dst: SocketAddr, range: DigestRange) {
+        self.digest_epoch = self.digest_epoch.wrapping_add(1);
+        if self.digest_epoch == 0 {
+            self.digest_marks.fill(0);
+            self.digest_epoch = 1;
+        }
+        for entry in &self.digest_in {
+            if let Some(slot) = self.store.find_node(entry.node_id, entry.incarnation) {
+                self.digest_marks[slot as usize] = self.digest_epoch;
+                self.digest_versions[slot as usize] = entry.version;
+            }
+        }
+
+        self.owed.clear();
+        for slot in 0..self.store.node_dictionary().capacity() {
+            let Some(origin) = self.store.node_dictionary().descriptor(slot) else {
+                continue;
+            };
+            if !range.contains(origin.node_id) {
+                continue;
+            }
+            let after = if self.digest_marks[slot as usize] == self.digest_epoch {
+                self.digest_versions[slot as usize]
+            } else {
+                0
+            };
+            let newest = self.store.newest_version(slot);
+            if newest > after {
+                self.owed.push(Owed {
+                    origin: slot,
+                    after,
+                    backlog: newest - after,
+                });
+            }
+        }
+        self.owed
+            .sort_unstable_by_key(|o| (Reverse(o.backlog), o.origin));
+
+        self.frame_handles.clear();
+        for o in &self.owed {
+            if self.frame_handles.len() >= self.config.max_cells_per_tick {
+                break;
+            }
+            self.store.collect_newer(
+                o.origin,
+                o.after,
+                self.config.max_cells_per_tick,
+                &mut self.frame_handles,
+            );
+        }
+        if !self.frame_handles.is_empty() {
+            self.encode_packets_for(dst);
+        }
+    }
+
+    /// Send `dst` this node's watermark for every origin in `range`, as one
+    /// or more digest frames whose ranges tile `range`. An empty `range`
+    /// still produces a frame: it tells the receiver this node holds nothing
+    /// there. Every frame is sent even when the peer is already current,
+    /// because the digest is how the peer learns that.
+    fn send_digest(&mut self, dst: SocketAddr, syn: bool, range: DigestRange) {
+        let dictionary = self.store.node_dictionary();
+        self.origin_order.clear();
+        for slot in 0..dictionary.capacity() {
+            if let Some(origin) = dictionary.descriptor(slot)
+                && range.contains(origin.node_id)
+            {
+                self.origin_order.push(slot);
+            }
+        }
+        self.origin_order.sort_unstable_by_key(|&slot| {
+            dictionary
+                .descriptor(slot)
+                .map_or((0, 0), |o| (o.node_id.0, o.incarnation))
+        });
+
+        let per_frame = self.digest_out.capacity().max(1);
+        let frames = self.origin_order.len().div_ceil(per_frame).max(1);
+        for frame in 0..frames {
+            let start = (frame * per_frame).min(self.origin_order.len());
+            let end = (start + per_frame).min(self.origin_order.len());
+            self.digest_out.clear();
+            for &slot in &self.origin_order[start..end] {
+                if let Some(origin) = dictionary.descriptor(slot) {
+                    self.digest_out.push(DigestEntry {
+                        node_id: origin.node_id,
+                        incarnation: origin.incarnation,
+                        version: self.store.watermark(slot),
+                    });
                 }
             }
-            // Cache the peer_slot on the matching peer entry so future ticks
-            // can prune without re-interning. `node_id` and `peer_slot` are
-            // always set together — see `handle_gossip_tick`, which relies
-            // on this invariant.
-            if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
-                peer.node_id = Some(sender_id);
-                peer.peer_slot = Some(peer_slot);
+            // The frames' ranges tile `range`: each ends just before the next
+            // frame's first origin, so an origin the sender lacks falls inside
+            // exactly one frame. Two incarnations of one node id can straddle
+            // a cut, in which case neighbouring ranges share that id.
+            let first = self.digest_out.first().map(|e| e.node_id.0);
+            let last = self.digest_out.last().map(|e| e.node_id.0);
+            let next_first = self
+                .origin_order
+                .get((frame + 1) * per_frame)
+                .and_then(|&slot| dictionary.descriptor(slot))
+                .map(|o| o.node_id.0);
+            let frame_range = DigestRange {
+                lo: if frame == 0 {
+                    range.lo
+                } else {
+                    first.unwrap_or(range.lo)
+                },
+                hi: match (next_first, last) {
+                    (Some(next), Some(last)) => next.saturating_sub(1).max(last),
+                    _ => range.hi,
+                },
+            };
+
+            let Some(slot) = self.send_free.pop() else {
+                return;
+            };
+            let header = self.node_header();
+            let key = self.config.auth_key.as_ref();
+            let buf = &mut self.send_pool[slot as usize];
+            match wire::encode_digest(
+                header,
+                syn,
+                frame_range,
+                &self.digest_out,
+                key,
+                self.config.wire_limits,
+                buf,
+            ) {
+                Ok(()) => self.send_pending.push_back((dst, slot)),
+                Err(_) => {
+                    self.send_free.push(slot);
+                    return;
+                }
             }
         }
     }
@@ -611,18 +714,8 @@ where
             AdminCommand::Snapshot { reply } => {
                 let snapshot = AdminSnapshot {
                     local_identity: self.store.local_identity(),
-                    peers: self
-                        .peers
-                        .iter()
-                        .map(|p| PeerEntry {
-                            addr: p.addr,
-                            node_id: p.node_id,
-                            peer_slot: p.peer_slot,
-                        })
-                        .collect(),
+                    peers: self.peers.iter().map(|&addr| PeerEntry { addr }).collect(),
                     store_stats: self.store.stats(),
-                    local_dirty_len: self.store.local_dirty().len(),
-                    forwarded_dirty_len: self.store.forwarded_dirty().len(),
                     send_pending_depth: self.send_pending.len(),
                     decode_reject_count: self.decode_reject_count,
                     max_send_pending_depth: self.max_send_pending_depth,
@@ -686,12 +779,8 @@ where
     fn handle_peer_event(&mut self, evt: PeerEvent) {
         match evt {
             PeerEvent::Added(p) => {
-                if !self.peers.iter().any(|x| x.addr == p.addr) {
-                    self.peers.push(Peer {
-                        addr: p.addr,
-                        node_id: None,
-                        peer_slot: None,
-                    });
+                if !self.peers.contains(&p.addr) {
+                    self.peers.push(p.addr);
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
@@ -700,11 +789,8 @@ where
                 }
             }
             PeerEvent::Removed(p) => {
-                if let Some(pos) = self.peers.iter().position(|x| x.addr == p.addr) {
-                    let removed = self.peers.remove(pos);
-                    if let Some(node_id) = removed.node_id {
-                        self.store.peer_frontiers_mut().remove_peer(node_id);
-                    }
+                if let Some(pos) = self.peers.iter().position(|&addr| addr == p.addr) {
+                    self.peers.remove(pos);
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
@@ -716,106 +802,41 @@ where
     }
 
     fn handle_gossip_tick(&mut self) {
-        // Step 0: bump the total-ticks counter. Tracked unconditionally
-        // (even for empty / no-peer ticks) so the bench can split the
-        // run's wall time into heartbeat ticks vs threshold fires.
+        // Tracked unconditionally so the bench can split the run's ticks
+        // into heartbeat ticks vs threshold fires.
         self.ticks_total = self.ticks_total.saturating_add(1);
 
-        // Step 1: expire aged-out cells so we don't gossip them.
+        // Expire aged-out cells so the digest and the replies drawn from it
+        // describe live state only.
         let now_millis = self.clock.now_millis();
         self.expiration_buf.clear();
         self.store.expire_at(now_millis, &mut self.expiration_buf);
 
-        if self.store.is_empty() || self.peers.is_empty() || self.send_free.is_empty() {
+        if self.peers.is_empty() || self.send_free.is_empty() {
             return;
         }
-
-        // The store was non-empty when this tick fired — bench harness
-        // counts this as a "dirty tick" so effective-fanout reports
-        // `packets / dirty_ticks` rather than `packets / wall_ticks`.
-        // Bumped before the peer-pick math runs so synthetic threshold
-        // ticks (which by construction have local_dirty>0) always count.
         self.dirty_ticks = self.dirty_ticks.saturating_add(1);
 
-        // Step 2: pick `fanout` distinct peers via a partial Fisher-Yates
-        // shuffle of `self.peers` in place. With-replacement sampling would
-        // silently break Demers' O(log N) convergence bound — selecting the
-        // same peer twice in one tick burns a send-pool slot encoding the
-        // same frame for the same peer. `self.peers` has no ordering
-        // contract elsewhere (lookups are by `addr`), so shuffling is free.
-        //
-        // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
-        // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`
-        // reaches *every* node with probability → e^(−e^(−c)) — "there is a
-        // sharp threshold in the required fanout at log n." Fanout is
-        // governed by cluster size `n`, not data volume: KMG note the
-        // fanout need only grow by 1 each time `n` rises by a factor of e,
-        // and that a round "can easily be modified … to send several
-        // notifications per gossip message." Gabion already packs the whole
-        // dirty set into one fat frame (`max_cells_per_tick` + packet
-        // splitting), so a burst rides along without widening fanout — the
-        // dirty-set size drives frame fill, not the peer pick. `config.fanout`
-        // is the floor; `.min(n)` makes small clusters full-mesh (at small n
-        // coverage demands it and the bandwidth is trivial). The early return
-        // above guarantees n ≥ 1, so `ln` is never called on 0 and `.min(n)`
-        // never clamps below 1.
+        // Open `fanout` exchanges, each with a distinct random peer: a
+        // partial Fisher-Yates shuffle of `self.peers` in place (`self.peers`
+        // has no ordering contract elsewhere). The early return above
+        // guarantees n >= 1.
         let n = self.peers.len();
-        let coverage = ((n as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-        let pick_count = self.config.fanout.max(coverage).min(n);
-        // Record the coverage-fanout decision so observers can read the pick
-        // directly instead of reconstructing the formula. Only dirty ticks
-        // reach here, so `last_effective_fanout` is the fanout of the most
-        // recent tick that actually gossiped.
+        let pick_count = self.config.fanout.clamp(1, n);
         self.last_effective_fanout = pick_count;
         self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
         for i in 0..pick_count {
             let j = i + (self.rng.next_u64() as usize) % (n - i);
             self.peers.swap(i, j);
         }
-
-        for peer_idx in 0..pick_count {
-            if self.send_free.is_empty() {
-                break;
-            }
-            let peer_addr = self.peers[peer_idx].addr;
-            // `handle_inbound` writes `node_id` and `peer_slot` together —
-            // when one is `Some`, the other is too. So a single read of
-            // `peer_slot` is the full pruning decision.
-            let peer_slot = self.peers[peer_idx].peer_slot;
-
-            self.frame_handles.clear();
-            match peer_slot {
-                Some(slot) => {
-                    self.store.fill_gossip_frame_for_peer(
-                        self.config.max_cells_per_tick,
-                        slot,
-                        &mut self.frame_handles,
-                    );
-                }
-                None => {
-                    // Bootstrap fallback: we haven't heard from this peer
-                    // yet, so we don't know what to prune. Send an unpruned
-                    // frame; the next inbound from them caches the slot.
-                    self.store
-                        .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
-                }
-            }
-            if self.frame_handles.is_empty() {
-                continue;
-            }
-            self.encode_packets_for(peer_addr);
+        for i in 0..pick_count {
+            self.send_digest(self.peers[i], true, DigestRange::ALL);
         }
 
         // Reset per-rule pending. The sweep treats every rule with
-        // non-zero pending as "touched in expectation by the tick" — the
-        // dirty-ring drain in `fill_gossip_frame*` doesn't tell us which
-        // rule slots actually made it onto the wire, but mass conservation
-        // (Kempe, Dobra, Gehrke — FOCS 2003) says every pending hit either
-        // rode out in this frame or sits in the dirty ring awaiting the
-        // next one. Under UDP loss the residual is repaired by the next
-        // round; the N × ε_R bound holds in expectation. A strict bound
-        // would require ack-aware reset against `peer_frontiers`,
-        // deferred until measurements show drift.
+        // non-zero pending as "touched in expectation by the tick": the
+        // exchange this tick opened will carry its cells to the peer, and
+        // under UDP loss the residual is repaired by the next round.
         let stamp = now_millis.max(1);
         for slot in 0..self.rule_pending.len() {
             if self.rule_pending[slot] != 0 {
@@ -825,8 +846,8 @@ where
         }
     }
 
-    fn encode_packets_for(&mut self, dst: SocketAddr) {
-        let header = wire::Header {
+    fn node_header(&self) -> wire::Header {
+        wire::Header {
             cluster_id_hash: self.config.cluster_id_hash,
             sender_node_id: self.store.local_identity().node_id.0,
             sender_incarnation: self.store.local_identity().incarnation,
@@ -836,7 +857,11 @@ where
             min_origin_sequence: 0,
             max_origin_sequence: 0,
             flags: 0,
-        };
+        }
+    }
+
+    fn encode_packets_for(&mut self, dst: SocketAddr) {
+        let header = self.node_header();
 
         let packets_result = match self.config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
@@ -876,6 +901,14 @@ where
         }
         drop(packets);
     }
+}
+
+/// What one inbound datagram turned out to be.
+enum Inbound {
+    /// Cells, decoded into `obs_buf`.
+    Cells,
+    /// A digest, decoded into `digest_in`.
+    Digest { range: DigestRange, syn: bool },
 }
 
 enum ArmOutcome {
