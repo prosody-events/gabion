@@ -1644,9 +1644,10 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             sim_advance_ticks(Duration::from_millis(100), TICKS).await;
 
             let snap = admin_snapshot(&admin_tx_b).await;
-            // The initial send plus one retransmission per 500 ms timeout,
-            // give or take one for first-tick scheduling under start_paused.
-            let expected = 1 + u64::from(TICKS) / 5;
+            // The initial send plus one retransmission per timeout; the
+            // timeout floor is one tick, so one per tick, give or take one
+            // for first-tick scheduling under start_paused.
+            let expected = u64::from(TICKS);
             assert!(
                 (expected - 1..=expected + 1).contains(&snap.decode_reject_count),
                 "decode_reject_count {} outside {}±1 (after {} ticks)",
@@ -2367,9 +2368,9 @@ async fn lost_changes_are_resent_only_after_the_retransmission_timeout() {
                 .await
                 .unwrap();
 
-            // The first send and the first retransmission (500 ms later) are
+            // The first send and the first retransmission (one tick later) are
             // lost; nothing is re-sent before the timeout.
-            advance(900).await;
+            advance(100).await;
             assert_eq!(mesh.aggregates[1].total(), 0);
             advance(1_000).await;
             assert_eq!(mesh.aggregates[1].total(), 3);
@@ -2464,6 +2465,49 @@ async fn a_joining_peer_receives_every_live_change_from_every_origin() {
             advance(2_000).await;
             assert_eq!(joiner.snapshot(), mesh.aggregates[0].snapshot());
             assert_eq!(joiner.total(), 6);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn every_peer_is_sent_to_in_the_first_round_however_many_there_are() {
+    LocalSet::new()
+        .run_until(async {
+            // Far more peers than the configured send queue holds, half of
+            // them known at start and half announced by discovery.
+            const PEERS: u16 = 300;
+            let router = SimRouter::new();
+            let addrs: Vec<_> = (0..PEERS).map(|i| sock(52_000 + i)).collect();
+            let sinks: Vec<_> = addrs.iter().map(|a| router.bind(*a)).collect();
+
+            let identity = NodeIdentity::new(NodeId(0xE000), 1);
+            let mut config = sim_config(identity, addrs[..150].to_vec(), 0);
+            config.send_queue_capacity = 8;
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(sock(51_999)),
+                TokioClock::from_millis(0),
+                config,
+                store_for(identity),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            let (events, event_rx) = futures::channel::mpsc::unbounded();
+            tokio::task::spawn_local(rt.run(event_rx));
+            for addr in &addrs[150..] {
+                events
+                    .unbounded_send(PeerEvent::Added(Peer::new(*addr)))
+                    .unwrap();
+            }
+
+            client.record(0xA, KeyHash(1), 0, 3, 0, 0).await.unwrap();
+            advance(300).await;
+
+            for addr in &addrs {
+                assert!(
+                    router.received_count(*addr) >= 1,
+                    "{addr} should have been sent the change in the first round",
+                );
+            }
+            drop(sinks);
         })
         .await;
 }

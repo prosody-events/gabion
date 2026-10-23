@@ -481,7 +481,7 @@ they bound resource use.
 | `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet. Below ~64 the encoder refuses to fit even one cell. |
 | `gabion_gossip_max_cells_per_frame N`           | `4096`  | Maximum cells encoded into one packet.                                                |
 | `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells emitted across all packets in one tick.                                 |
-| `gabion_gossip_send_queue_capacity N`           | `128`   | Outbound UDP send queue depth (per-peer slots in the leader).                         |
+| `gabion_gossip_send_queue_capacity N`           | `128`   | Minimum outbound UDP send queue depth; grows to two slots per live peer.                         |
 
 ### Storage — CRDT capacities
 

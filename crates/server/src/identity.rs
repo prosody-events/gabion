@@ -25,9 +25,11 @@ mod tests;
 ///    single bucketed identity.
 ///
 /// `incarnation` is unix epoch seconds clamped to `u32`, with a minimum of 1.
-/// Sub-second restarts reuse the same incarnation, so a peer's acknowledgement
-/// of the previous boot can be mistaken for one of the new boot, and a packet
-/// lost in that first moment is not retransmitted.
+/// Sub-second restarts reuse the same incarnation, so a peer keeps its
+/// acknowledgement of the previous boot, which can be far above the new
+/// boot's sequence numbers. That acknowledgement is taken to cover every new
+/// sequence up to it, so a packet lost anywhere in that range is not
+/// retransmitted until the node's sequences pass it.
 pub fn derive_identity(seed_override: Option<&str>) -> NodeIdentity {
     let seed = seed_override
         .map(str::to_owned)

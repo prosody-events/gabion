@@ -60,22 +60,19 @@ const LOCAL_RULE_ID: u32 = 0;
 /// The visualizer's per-delta cell cap, which bounds what one peer's delta can
 /// cost in send-pool slots.
 ///
-/// **The pool ceiling is 255, not a free choice.** The runtime addresses
-/// send-pool slots with a `u8` (`send_pending: VecDeque<(SocketAddr, u8)>`) and
-/// builds the free list as `(0..send_pool_size as u8)`, so any capacity ≥ 256
-/// wraps to an *empty* free list and silently kills all gossip. So the pool is
-/// pinned at the largest addressable value.
-///
 /// Direct mail sends every peer its own delta each round, so one round can ask
-/// for `peers × packets_per_delta` slots. The runtime splits the free slots
-/// evenly across the peers it visits and defers whatever does not fit to the
-/// next round (the peer's `sent_upto` only advances over packets actually
-/// queued), so an oversubscribed round delays delivery rather than losing
-/// data. Capping the delta at 160 cells (`ceil(160 / 21)` = 8 packets at a
+/// for `peers × packets_per_delta` slots. The runtime sizes its pool to at
+/// least `GOSSIP_SEND_SLOTS_PER_PEER` slots per live peer, splits the free
+/// slots evenly across the peers it visits, and starts the next round at the
+/// first peer it did not reach. Whatever does not fit is deferred to the next
+/// round (the peer's `sent_upto` only advances over packets actually queued),
+/// so an oversubscribed round delays delivery rather than losing data.
+/// Capping the delta at 160 cells (`ceil(160 / 21)` = 8 packets at a
 /// 1400-byte payload in the worst case) keeps a node's share of the pool
 /// useful at the visualizer's widest cluster. The cap is inert at the default
 /// 12-node scenarios, whose cross-node working set (≈ 132 cells) never reaches
-/// it. Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
+/// it. Pool memory is `max(255, 2 × peers) × 1400 B × live_nodes` ≈ 36 MB at
+/// 100 nodes.
 const VIZ_MAX_CELLS_PER_TICK: usize = 160;
 const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
 

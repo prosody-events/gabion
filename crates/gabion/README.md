@@ -41,7 +41,7 @@ a DAG, so no module imports from a module that imports it.
 | `gossip`     | `src/gossip/*`                | `GossipRuntime`, `GossipClient`, `GossipTransport`, `Clock`, the `sim::SimTransport` used in tests, and the `AdminCommand` / `AdminSnapshot` observability surface. |
 | `wire`       | `src/wire/*`                  | The on-the-wire codec. One UDP packet = header + rule dictionary + node dictionary + cell rows + optional HMAC tag. Each packet decodes independently. |
 | `discovery`  | `src/discovery/*`             | `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation. Adapters consume `PeerEvent` streams; the gossip runtime treats peer add/remove as a normal `select!` arm. |
-| `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, retransmission floor, payload caps, the per-rule error budget, and the min-emit floor. |
+| `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, send-pool slots per peer, payload caps, the per-rule error budget, and the min-emit floor. |
 
 `gossip` sits at the top of that graph and depends on every other
 module, whereas `wire` and `crdt` are independent of each other.
@@ -235,8 +235,8 @@ every cell in it. An ack therefore never covers a cell the acker did not
 merge, and a lost or reordered packet leaves `have` short, which makes
 the sender repeat it.
 
-The retransmission timeout is `max(2 × RTT estimate, 500 ms)`
-(`GOSSIP_MIN_RTO_MILLIS`). The estimate is a smoothed (7/8, 1/8) round
+The retransmission timeout is `max(2 × RTT estimate, tick_interval)`
+(500 ms at the default heartbeat). The estimate is a smoothed (7/8, 1/8) round
 trip from first transmissions only (Karn). The timer runs while anything
 is unacknowledged, restarts when an ack advances, and is not postponed by
 new data. Per-peer state is created when discovery announces a peer,
@@ -363,10 +363,20 @@ implementation departs from the papers, and why:
   data the ack rides on it, otherwise a header-only packet carries it.
   Rounds come from the shared scheduler (500 ms heartbeat plus
   error-budget threshold rounds), so the wait is at most one tick.
-- **Retransmission floor.** `GOSSIP_MIN_RTO_MILLIS` (500 ms) is a
-  `gabion::defaults` constant, not a `GossipConfig` field: adding a field
-  would break the scenario suite's `GossipConfig { .. }` literal in
-  `crates/gossip-bench`, which this branch may not edit.
+- **Retransmission floor is one tick.** The timeout is
+  `max(2 × RTT estimate, tick_interval)`, the spec's `max(2·RTT, 1 tick)`;
+  at the 500 ms heartbeat a lost packet is repaired no later than the second
+  round after it.
+- **The send pool is sized to the peer count.** Direct mail queues a packet
+  for every peer every round, so the pool holds at least
+  `GOSSIP_SEND_SLOTS_PER_PEER` (2) slots per live peer, or
+  `gossip.send_queue_capacity` if that is larger. It grows when discovery
+  adds a peer, never per packet, and does not shrink when peers leave. If the
+  pool still runs dry mid-round (the transport is backed up, or a delta needs
+  more packets than a peer's even share), the unserved peers are first in the
+  next round and nothing is lost: a peer's `sent_upto` advances only over
+  packets actually queued. This is an engineering adaptation, not part of the
+  papers, which assume an unbounded channel.
 - **Config fields that no longer do anything:** `GossipConfig::fanout`,
   `GossipConfig::rng_seed`, `CellStoreConfig::forwarded_dirty_capacity` and
   `CellStoreConfig::peer_capacity` are accepted and ignored so adapter
@@ -410,117 +420,20 @@ the directives.
 
 ## What we measured
 
-> These measurements and figures were taken on the
-> previous dissemination design (coverage-fanout gossip with forwarding)
-> and have not been re-run for direct mail. Use the study harness in
-> [`../gossip-bench/README.md`](../gossip-bench/README.md#study-harness)
-> for current numbers.
-
-Every figure below is regenerated from current code by running the
-gossip simulator across the suites; see
-[`../gossip-bench/README.md`](../gossip-bench/README.md) for the
-"how to re-run it" perspective. The figures here are committed to
-`figures/` so this README renders correctly on GitHub without first
-running the bench.
-
-The suites split into four bundles. Steady-state convergence and scale
-together show that the protocol meets its asymptotic bounds, while the
-resilience suite shows that it survives the failure modes operators
-see in practice. The adaptive machinery suites — `coverage_fanout`,
-`error_budget`, `min_emit_clamp`, and `heartbeat_threshold_mix` — are
-the empirical evidence for the two adaptive aspects of the protocol.
-
-### Steady-state convergence
-
-![convergence](figures/convergence.svg)
-
-**Method.** Single write at node 0; measure rounds-to-converge as both
-cluster size N and the static fanout floor sweep. Bandwidth is total
-bytes sent across the run divided by `N · duration`.
-
-**Takeaway.** Gabion sits at or below the Karp `log₂ N` lower bound at
-every fanout above 1, because peer-frontier dedup lets the sender skip
-cells the recipient already has. The empirical curve at f = 3 — well
-under the f = 6 production default — is within one extra round of f = 8.
-
-![fanout_sweep](figures/fanout_sweep.svg)
-
-**Method.** Fix N = 32, sweep static `fanout` from 1 to 12, measure both
-convergence rounds and bytes-per-node-per-second.
-
-**Takeaway.** Rounds drop sharply between f = 1 and f = 3 and then
-flatten, while bandwidth scales roughly linearly with `fanout`. The
-sweet spot near f = 3–6 is where bandwidth stays modest while
-convergence sits within a round of the asymptote.
-
-### Scale
-
-![scale_n](figures/scale_n.svg)
-
-**Method.** Sweep N from 4 to 1024 at fixed `fanout = 3`. Time-to-
-converge should track `log₂ N`; bytes-per-node-per-second should stay
-roughly constant (SWIM's "constant load per node" property).
-
-**Takeaway.** Rounds-to-converge sits at or below `log₂ N` all the way
-through N = 1024, and per-node bandwidth is flat in N to within the
-noise of a horizontal line.
-
-### Resilience
-
-![loss](figures/loss.svg)
-
-**Method.** Three trials at each per-link drop probability from 0 % to
-50 %. N = 16, f = 3, 20 s of virtual time.
-
-**Takeaway.** Convergence rounds climb only a small constant as loss
-rises, and gabion converges in every trial including the 50 % loss row.
-Bimodal Multicast (Birman et al. 1999) reports stable delivery to
-~25–30 %; gabion's empirical tolerance is roughly twice that, thanks
-to peer-frontier dedup plus the rotating repair lane.
-
-![partition](figures/partition.svg)
-
-**Method.** Two equally-sized partitions, single write inside one,
-heal at t = 10 s. Time-to-reconverge measured from the heal.
-
-**Takeaway.** Once the links open, the next tick after heal drains the
-partition, so reconvergence is bounded above by one `tick_interval`.
-
-![staleness](figures/staleness.svg)
-
-**Method.** Sustained writes from k sources concurrently; measure
-per-hit p50 / p95 lag (Astrolabe-style staleness).
-
-**Takeaway.** P50 and p95 lag both stay flat at a single `tick_interval`
-regardless of the number of concurrent writers, because the dirty ring
-drains in one round under steady state.
+The figures below cover the threshold-triggered emit machinery (the
+per-rule error budget and the min-emit floor), which is unchanged. They
+were taken on an earlier dissemination design and have not been re-run for
+direct mail, so read the bandwidth numbers as relative, not absolute. The
+earlier steady-state, scale, loss and fanout figures described a design
+that no longer exists and are gone; for current numbers use the study
+harness in [`../gossip-bench/README.md`](../gossip-bench/README.md#study-harness).
 
 ### Adaptive machinery
 
-These four suites are the empirical evidence for the two adaptive
-aspects of the protocol. `coverage_fanout` exercises coverage fanout;
-`error_budget` and `min_emit_clamp` exercise adaptive emit rate; and
-`heartbeat_threshold_mix` confirms the cold-rule heartbeat is
-independent of the threshold path.
-
-![coverage_fanout](figures/coverage_fanout.svg)
-
-**Method.** Sweep two axes against a `DistinctKeyBurst` (each write
-lands in its own cell store slot, so `local_dirty.len()` jumps to the
-burst size in one step). Across cluster size `n ∈ {16, 64, 256}` at a
-fixed burst, read the per-tick `peak_effective_fanout`. Across burst
-size `cells ∈ {16, 256, 1024}` at a fixed `n`, read the effective fanout
-(packets ÷ dirty-tick count). Static `fanout = 1` (the floor, which the
-coverage threshold overrides).
-
-**Takeaway.** The left panel: the observed peak fanout tracks
-`⌈ln(n−1)+c⌉` — 6 at `n=16`, 8 at `n=64`, 9 at `n=256` — sitting right
-on the predicted threshold and rising by ~1 per factor-of-e of cluster
-growth, exactly the KMG law. The right panel: at fixed `n` the per-tick
-fanout is **flat** across a 64× change in burst volume, because the
-burst rides one fat frame rather than widening the peer pick — volume is
-a frame-fill concern, not a fanout one. (Volume that overflows the dirty
-ring is repaired by the rotating repair lane, not by fanning out wider.)
+These suites exercise the adaptive emit rate: `error_budget` and
+`min_emit_clamp` against the per-rule budget and the min-emit floor, and
+`heartbeat_threshold_mix` confirms the cold-rule heartbeat is independent of
+the threshold path.
 
 ![error_budget](figures/error_budget.svg)
 
@@ -576,13 +489,13 @@ threshold are independent code paths.
 In-tree primary sources:
 
 - `src/gossip/runtime.rs` — the event loop. `GossipRuntime::run` is the
-  outer `select!`; `handle_gossip_tick` carries the coverage-fanout
-  pick; `handle_limit_request` carries the per-site safe zone and the
+  outer `select!`; `handle_gossip_tick` carries the round that sends
+  every peer its delta; `handle_limit_request` carries the per-site safe zone and the
   threshold-fire flag.
 - `src/wire.rs` and `src/wire/` — packet shape, encoders, HMAC
   authentication.
-- `src/crdt.rs` and `src/crdt/` — counter store, dirty rings, peer
-  frontier, expiry. The structures here are documented in depth in
+- `src/crdt.rs` and `src/crdt/` — counter store, dirty ring,
+  expiry. The structures here are documented in depth in
   [`CRDT.md`](CRDT.md).
 - [`../gossip-bench/REFERENCES.md`](../gossip-bench/REFERENCES.md) — the
   literature survey behind the benchmark methodology (Demers 1987,

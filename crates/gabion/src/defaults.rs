@@ -26,14 +26,13 @@ pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 /// peer every round. Kept so adapter configs keep compiling.
 pub const GOSSIP_FANOUT: usize = 3;
 
-/// Floor on the per-peer retransmission timeout, in milliseconds. A peer's
-/// unacknowledged changes are re-sent once `max(2 × RTT estimate, this)` has
-/// passed since the last data packet to it. The estimate comes from the
-/// ack round trip, which includes the peer's delayed-ack wait of up to one
-/// tick, so on a LAN this floor is the operative timeout. Matches the
-/// 500 ms heartbeat: a lost packet is repaired no later than the second round
-/// after it.
-pub const GOSSIP_MIN_RTO_MILLIS: u64 = 500;
+/// Send-pool slots the runtime keeps per live peer. The pool is at least
+/// `GOSSIP_SEND_QUEUE_CAPACITY`, and grows with membership to this many slots
+/// per peer, so a round can queue a packet for every peer (direct mail sends
+/// every peer its own delta each round) and still have a second round's worth
+/// of slots while the first drains. Pool memory is
+/// `slots × GOSSIP_MAX_PAYLOAD_BYTES`.
+pub const GOSSIP_SEND_SLOTS_PER_PEER: usize = 2;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;

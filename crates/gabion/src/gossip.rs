@@ -63,8 +63,9 @@ pub struct GossipConfig {
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,
-    /// Outbound send queue capacity. Each slot owns a pre-allocated
-    /// [`wire::PacketBuf`].
+    /// Minimum outbound send queue capacity. Each slot owns a pre-allocated
+    /// [`wire::PacketBuf`]. The runtime grows the pool beyond this to
+    /// [`crate::defaults::GOSSIP_SEND_SLOTS_PER_PEER`] slots per live peer.
     pub send_queue_capacity: usize,
     /// Capacity of the incoming limit-request mpsc channel.
     pub limit_queue_capacity: usize,
