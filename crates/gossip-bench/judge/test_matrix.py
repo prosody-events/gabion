@@ -7,10 +7,14 @@ Run: python3 -m unittest discover -s crates/gossip-bench/judge
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
-from matrix import executable_from
+from matrix import executable_from, sweep_dead_copies
 
 
 def artifact(name: str, kind: str, executable: str | None) -> str:
@@ -36,3 +40,18 @@ class ExecutableFromTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SweepDeadCopiesTest(unittest.TestCase):
+    def test_removes_only_copies_whose_process_is_gone(self):
+        gone = subprocess.Popen([sys.executable, "-c", ""])
+        gone.wait()
+        with tempfile.TemporaryDirectory() as out:
+            out = Path(out)
+            dead, live, other = (out / f".bin-{gone.pid}-x", out / f".bin-{os.getpid()}-x",
+                                 out / "main")
+            for d in (dead, live, other):
+                d.mkdir()
+            sweep_dead_copies(out)
+            self.assertEqual((dead.exists(), live.exists(), other.exists()),
+                             (False, True, True))

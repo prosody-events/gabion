@@ -282,9 +282,13 @@ pub struct PartitionReport {
     /// Mean hits missing per (pod, tracked key) at the heal instant, over
     /// buckets that closed before it: the repair the solution owes.
     pub deficit_at_heal_hits: Option<f64>,
+    /// Mean hits per (pod, tracked key) that some pod still lacked of a
+    /// bucket that closed before the heal when that bucket left the window:
+    /// repair that never happened. Zero for a full repair.
+    pub unrepaired_at_expiry_hits: Option<f64>,
     /// From the heal until no pod that ran at the heal misses a hit of a
-    /// bucket that closed before it and is still in the window. `None` when
-    /// the run ended first.
+    /// bucket that closed before it. `None` when the run ended first, or
+    /// when any such hit expired unrepaired (see `unrepaired_at_expiry_hits`).
     pub time_to_heal_ms: Option<f64>,
 }
 

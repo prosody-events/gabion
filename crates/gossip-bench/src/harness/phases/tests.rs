@@ -75,6 +75,32 @@ fn convergence_is_split_by_origin_and_observer_side() {
     assert_eq!(report.before.convergence.cross_side.converged, 0);
 }
 
+/// Each side admits a hit of its own in the same bucket during the cut. A
+/// pod's own hit gives it the count the far side's hit would, but nothing has
+/// crossed, so nothing converges across the cut until the heal.
+#[test]
+fn a_far_sides_own_hits_do_not_count_as_crossing_the_cut() {
+    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
+    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
+    oracle.node_started(0, 0, false);
+    oracle.node_started(1, 0, false);
+    oracle.admitted(0, B, 12 * S, 0);
+    oracle.admitted(0, B, 12 * S, 1);
+    oracle.view_changed(0, 0, B, 1, 1, 12 * S);
+    oracle.view_changed(1, 0, B, 1, 1, 12 * S);
+    assert!(oracle.convergence_ns.is_empty(), "no hit has crossed yet");
+    oracle.view_changed(0, 0, B, 2, 2, 21 * S);
+    oracle.view_changed(1, 0, B, 2, 2, 21 * S);
+    assert_eq!(oracle.convergence_ns, vec![9 * S, 9 * S]);
+
+    let report = oracle.partition_report(10).expect("partition");
+    let during = &report.during.convergence;
+    assert_eq!(during.same_side.converged, 2);
+    assert_eq!(during.cross_side.converged, 2);
+    assert_eq!(during.cross_side.p50_ms, Some(9_000.0));
+    assert_eq!(during.same_side.p50_ms, Some(0.0));
+}
+
 /// A side with no running pod covers every hit vacuously.
 #[test]
 fn an_empty_side_does_not_hold_back_convergence() {
@@ -110,6 +136,53 @@ fn time_to_heal_counts_from_the_heal_until_nothing_is_missing() {
     assert_eq!(report.time_to_heal_ms, Some(500.0));
     // One hit missing at one of two pods, for one tracked key.
     assert_eq!(report.deficit_at_heal_hits, Some(0.5));
+}
+
+/// Pod 1 never receives the cut-era hit, which leaves the window. Expiry is
+/// not repair: the heal never completes and the loss is reported.
+#[test]
+fn a_hit_that_expires_unrepaired_is_not_a_heal() {
+    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
+    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
+    oracle.node_started(0, 0, false);
+    oracle.node_started(1, 0, false);
+    oracle.admitted(0, B, 12 * S, 0);
+    oracle.view_changed(0, 0, B, 1, 1, 12 * S);
+
+    assert!(!oracle.heal_sample(20 * S, millis(500)));
+    // The 3 s window slides past bucket B, 1.5 s after the heal.
+    oracle.bucket_boundary(20 * S + 1_500 * MS, millis(2_000), B + 3, &[]);
+    assert!(
+        oracle.heal_sample(20 * S + 1_500 * MS, millis(2_000)),
+        "nothing left in the window to wait for"
+    );
+    oracle.finish(30 * S);
+
+    let report = oracle.partition_report(10).expect("partition");
+    assert_eq!(report.time_to_heal_ms, None);
+    assert_eq!(report.deficit_at_heal_hits, Some(0.5));
+    assert_eq!(report.unrepaired_at_expiry_hits, Some(0.5));
+}
+
+#[test]
+fn a_repaired_heal_reports_nothing_lost_to_expiry() {
+    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
+    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
+    oracle.node_started(0, 0, false);
+    oracle.node_started(1, 0, false);
+    oracle.admitted(0, B, 12 * S, 0);
+    oracle.view_changed(0, 0, B, 1, 1, 12 * S);
+    assert!(!oracle.heal_sample(20 * S, millis(500)));
+    oracle.view_changed(1, 0, B, 1, 1, 20 * S + 200 * MS);
+    assert!(oracle.heal_sample(20 * S + 200 * MS, millis(700)));
+    // The solution ages the bucket out a moment before the oracle does.
+    oracle.view_changed(1, 0, B, 0, 0, 20 * S + 1_400 * MS);
+    oracle.bucket_boundary(20 * S + 1_500 * MS, millis(2_000), B + 3, &[]);
+    oracle.finish(30 * S);
+
+    let report = oracle.partition_report(10).expect("partition");
+    assert_eq!(report.time_to_heal_ms, Some(200.0));
+    assert_eq!(report.unrepaired_at_expiry_hits, Some(0.0));
 }
 
 #[test]

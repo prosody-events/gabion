@@ -8,17 +8,21 @@
 //!
 //! * **Convergence** of each hit, split by relation: `same_side` is the time
 //!   until every pod on the origin's own side covers the hit, `cross_side` the
-//!   time until every pod on the other side does. A hit belongs to the phase in
-//!   which it was admitted. Hits whose bucket leaves the window first count as
-//!   never converged, as in the whole-run figures.
+//!   time until every pod on the other side does. Nodes report counts, not
+//!   origins, so `cross_side` is a conservative bound: it requires the far pod
+//!   to have caught up on its own side's hits too (see the oracle). A hit
+//!   belongs to the phase in which it was admitted. Hits whose bucket leaves
+//!   the window first count as never converged, as in the whole-run figures.
 //! * **Staleness** of pods on each side, time-weighted over the part of each
 //!   exposure interval inside the phase. A pod's view is not resolved by
 //!   origin, so staleness is split by the observer's side only.
 //! * **Time to heal**: from the heal instant until no pod that ran at the heal
-//!   is missing a hit of any bucket that closed before it and is still in the
-//!   window. Tolerance is none: every cross-cut count is exact. The driver
-//!   probes every [`HEAL_PROBE_NS`], so the figure is quantized to it, and it
-//!   is `None` when the run ends first.
+//!   is missing a hit of any bucket that closed before it. Tolerance is none:
+//!   every cross-cut count is exact. A hit that leaves the window unrepaired is
+//!   never counted as repaired: the figure is then `None`, and
+//!   `unrepaired_at_expiry_hits` says how much was lost. The driver probes
+//!   every [`HEAL_PROBE_NS`], so the figure is quantized to it, and it is
+//!   `None` when the run ends first.
 //!
 //! Everything is driven by the regime's partition schedule; nothing here
 //! looks at a regime's name.
@@ -86,6 +90,10 @@ pub struct PhaseStats {
     staleness: [[[WeightedHist; 2]; 2]; 3],
     /// Mean missing hits per (pod, tracked key) at the heal instant.
     deficit_at_heal: Option<f64>,
+    /// (pod, tracked key) pairs behind `deficit_at_heal`.
+    pairs: u64,
+    /// Hits some pod lacked of a cut-era bucket when it left the window.
+    unrepaired_hits: u64,
     healed_ns: Option<u64>,
 }
 
@@ -96,6 +104,8 @@ impl PhaseStats {
             convergence: Default::default(),
             staleness: Default::default(),
             deficit_at_heal: None,
+            pairs: 0,
+            unrepaired_hits: 0,
             healed_ns: None,
         }
     }
@@ -140,12 +150,21 @@ impl PhaseStats {
     }
 
     /// One heal probe at `now_ns`: `missing` hits over `pairs` pods and keys.
+    /// The heal completes when nothing is missing and no cut-era hit has
+    /// expired unrepaired; expiry is never scored as repair.
     pub fn healed(&mut self, now_ns: u64, missing: u64, pairs: u64) {
-        self.deficit_at_heal
-            .get_or_insert(missing as f64 / pairs.max(1) as f64);
-        if missing == 0 && self.healed_ns.is_none() {
+        if self.deficit_at_heal.is_none() {
+            self.deficit_at_heal = Some(missing as f64 / pairs.max(1) as f64);
+            self.pairs = pairs;
+        }
+        if missing == 0 && self.unrepaired_hits == 0 && self.healed_ns.is_none() {
             self.healed_ns = Some(now_ns);
         }
+    }
+
+    /// A cut-era bucket left the window while pods still lacked `hits` of it.
+    pub fn expired_unrepaired(&mut self, hits: u64) {
+        self.unrepaired_hits += hits;
     }
 
     pub fn report(&mut self, limit: u64) -> PartitionReport {
@@ -179,6 +198,9 @@ impl PhaseStats {
             during: phase(1),
             after: phase(2),
             deficit_at_heal_hits: self.deficit_at_heal,
+            unrepaired_at_expiry_hits: self
+                .deficit_at_heal
+                .map(|_| self.unrepaired_hits as f64 / self.pairs.max(1) as f64),
             time_to_heal_ms: self.healed_ns.map(|t| (t - schedule.heal_ns) as f64 / 1e6),
         }
     }

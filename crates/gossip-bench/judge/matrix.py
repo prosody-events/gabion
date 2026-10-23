@@ -188,11 +188,25 @@ def main() -> None:
     # prebuilt binary would stamp old code's numbers with the current commit.
     built = build(repo)
     args.out.mkdir(parents=True, exist_ok=True)
+    sweep_dead_copies(args.out)
     # Run a private copy: another matrix building in a shared target directory
     # cannot replace the binary under this one mid-run.
-    with tempfile.TemporaryDirectory(prefix=".bin-", dir=args.out) as scratch:
+    with tempfile.TemporaryDirectory(prefix=f".bin-{os.getpid()}-", dir=args.out) as scratch:
         binary = Path(shutil.copy2(built, Path(scratch) / built.name))
         run_matrix(args, repo, stamp, binary)
+
+
+def sweep_dead_copies(out: Path) -> None:
+    """Remove binary copies left by matrix runs that were killed (a normal exit
+    removes its own). Only a copy whose owning process is gone is touched."""
+    for stale in out.glob(".bin-*"):
+        try:
+            pid = int(stale.name.split("-")[1])
+            os.kill(pid, 0)
+        except (ValueError, IndexError, PermissionError):
+            continue
+        except ProcessLookupError:
+            shutil.rmtree(stale, ignore_errors=True)
 
 
 def run_matrix(args: argparse.Namespace, repo: Path, stamp: dict, binary: Path) -> None:

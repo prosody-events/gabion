@@ -159,14 +159,16 @@ class JudgeTest(unittest.TestCase):
                  "staleness": {"in_zone": {"limited": {"p99": 40.0}},
                                "rest": {"limited": {"p99": 20.0}}}}
         cut = {"partition": {"time_to_heal_ms": 6_200.0, "deficit_at_heal_hits": 2.5,
+                             "unrepaired_at_expiry_hits": 0.0,
                              "before": phase, "during": phase, "after": phase}}
         proc, out = self.judge([result("main", 1, 10, regime="az", **cut),
                                 result("main", 1, 10, regime="plain", partition=None)])
         self.assertEqual(proc.returncode, 0, proc.stderr)
         summary = (out / "summary.md").read_text()
         self.assertEqual(summary.count("partition phases"), 1)
-        self.assertIn("| Time to heal: until every cross-cut count is exact (ms) | 6,200 |",
+        self.assertIn("| Time to heal: until every cross-cut count is exact (ms), seeds that healed only | 6,200 |",
                       summary)
+        self.assertIn("| Hits per (pod, key) that expired unrepaired (hits) | 0 |", summary)
         self.assertIn("| during: fraction never converged, cross side | 0.6 |", summary)
         rows = self.rows(out)
         self.assertEqual(rows[("az", "main", "part_time_to_heal_ms")]["mean"], "6200.0")

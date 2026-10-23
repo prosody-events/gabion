@@ -195,8 +195,11 @@ def partition_metrics() -> list:
     rows = [
         ("part_deficit_at_heal", "Hits missing per (pod, key) at the heal (hits)",
          lambda r: dig(r, "partition.deficit_at_heal_hits")),
-        ("part_time_to_heal_ms", "Time to heal: until every cross-cut count is exact (ms)",
+        ("part_time_to_heal_ms",
+         "Time to heal: until every cross-cut count is exact (ms), seeds that healed only",
          lambda r: dig(r, "partition.time_to_heal_ms")),
+        ("part_unrepaired_at_expiry", "Hits per (pod, key) that expired unrepaired (hits)",
+         lambda r: dig(r, "partition.unrepaired_at_expiry_hits")),
     ]
     for phase in ("before", "during", "after"):
         for relation, side in (("same_side", "same side"), ("cross_side", "cross side")):
@@ -394,7 +397,11 @@ def main() -> None:
                       "The cut isolates one availability zone, then heals. Convergence is "
                       "of hits admitted in the phase: `same side` waits for the pods on "
                       "the origin's side, `cross side` for the other side. Staleness is "
-                      "by the observer's side. The heal is probed every 100 ms.", "",
+                      "by the observer's side. `cross side` is a conservative bound: the far pod "
+                      "must also catch up on its own side's hits. The heal is probed every "
+                      "100 ms; a hit that expires unrepaired is not a heal, so time to heal "
+                      "averages only the seeds that healed and the unrepaired row shows the "
+                      "rest.", "",
                       "| Metric | " + " | ".join(present) + " |",
                       "|---|" + "---|" * len(present)] + rows(PARTITION_METRICS)
     (args.out / "summary.md").write_text("\n".join(lines) + "\n")

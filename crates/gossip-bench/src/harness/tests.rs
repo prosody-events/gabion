@@ -149,7 +149,7 @@ fn gabion_saturation_warnings_are_captured_and_flagged() {
 }
 
 /// A run with a partition reports the cut's phases; the cut shows up as
-/// cross-side hits that never converge and a heal that takes time.
+/// cross-side hits that never converge and a repair that is owed.
 #[test]
 fn partition_run_reports_phases_and_heals() {
     let regime = fixtures::partitioned();
@@ -176,8 +176,12 @@ fn partition_run_reports_phases_and_heals() {
     let during = &report.during.staleness;
     assert!(during.in_zone.limited.mean > report.before.staleness.in_zone.limited.mean);
     assert!(report.deficit_at_heal_hits > Some(0.0));
-    let heal_ms = report.time_to_heal_ms.expect("healed before the run ended");
-    assert!((0.0..4_000.0).contains(&heal_ms), "{heal_ms}");
+    // The cut outlasts the window and the repair is not instant, so some
+    // cut-era hits expire unrepaired, and then there is no heal to time.
+    assert_eq!(
+        report.time_to_heal_ms.is_some(),
+        report.unrepaired_at_expiry_hits == Some(0.0)
+    );
     // The three phases cover every measured hit, once per side.
     let phases = [&report.before, &report.during, &report.after];
     let sides: u64 = phases
@@ -186,6 +190,32 @@ fn partition_run_reports_phases_and_heals() {
         .sum();
     assert!(sides >= 2 * result.convergence.converged);
     assert!(run(&fixtures::tiny(), 4).expect("run").partition.is_none());
+}
+
+/// Healed well inside the window: the repair completes before any cut-era
+/// bucket expires, so nothing is lost and the heal takes a moment.
+#[test]
+fn a_cut_shorter_than_the_window_heals_fully() {
+    let mut regime = fixtures::partitioned();
+    regime.churn.partitions[0].heal_s = 20;
+    let report = run(&regime, 4).expect("run").partition.expect("partition");
+    assert!(report.deficit_at_heal_hits > Some(0.0));
+    assert_eq!(report.unrepaired_at_expiry_hits, Some(0.0));
+    let heal_ms = report.time_to_heal_ms.expect("healed before the run ended");
+    assert!((0.0..4_000.0).contains(&heal_ms), "{heal_ms}");
+}
+
+/// With every datagram lost nothing is ever repaired: the cut-era hits age
+/// out of the window, and expiry must not be scored as a heal.
+#[test]
+fn a_run_that_never_repairs_does_not_heal() {
+    let mut regime = fixtures::partitioned();
+    regime.network.loss = 1.0;
+    let result = run(&regime, 4).expect("run");
+    let report = result.partition.expect("partition report");
+    assert!(report.deficit_at_heal_hits > Some(0.0));
+    assert!(report.unrepaired_at_expiry_hits > Some(0.0));
+    assert_eq!(report.time_to_heal_ms, None);
 }
 
 #[test]

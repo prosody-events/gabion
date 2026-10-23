@@ -305,7 +305,14 @@ All metrics except the whole-run byte totals cover the measurement window
 - **Convergence time** of an admitted hit on a tracked key, the `j`-th in
   its bucket, is the time until every pod that was running when it was
   admitted, and still runs, has a count of at least `j` for that bucket.
-  Hits whose bucket leaves the window first count as never converged;
+  Nodes report counts, not origins, so this is count-based. With a
+  partition, hits are ranked within the origin's side of the cut, and an
+  observer on the other side needs `j` plus every hit its own side has
+  admitted in that bucket so far, so a far pod's own hits are never taken
+  for hits that crossed. Cross-cut convergence is therefore a conservative
+  bound (it also waits for the pod to catch up on its own side), and
+  same-side convergence after the heal can be credited early by hits that
+  crossed. Hits whose bucket leaves the window first count as never converged;
   those still pending at the end are reported as censored. The plain
   quantiles cover converged hits only and so are right-censored; the
   `*_incl_never_ms` quantiles rank every hit, valuing a never-converged hit
@@ -330,18 +337,23 @@ All metrics except the whole-run byte totals cover the measurement window
   heal, and pods into those inside the cut zone and the rest. Per phase:
   convergence of the hits admitted in it, as `same_side` (time until every
   pod on the origin's side covers the hit) and `cross_side` (every pod on the
-  other side), with never-converged hits ranked as in the whole-run figures;
+  other side; a conservative bound, see above), with never-converged hits
+  ranked as in the whole-run figures;
   and staleness (limited and sampled keys) for observers inside the zone and
   outside it, time-weighted over the part of each exposure inside the phase.
   A pod's view is not resolved by origin, so staleness can be split by the
   observer's side only. **Time to heal** runs from the heal instant until no
   pod that was running at the heal is missing a hit of any bucket that closed
   before it and is still in the window: every cross-cut count exact, with no
-  tolerance. It is probed every 100 ms (so quantized to it), counts a hit that
-  expires unrepaired as no longer missing, and is `null` when the run ends
-  first. `deficit_at_heal_hits` is the mean number of hits missing per (pod,
-  tracked key) at the heal instant, the repair the solution owes. Regimes
-  with no partition report `partition: null`.
+  tolerance. It is probed every 100 ms (so quantized to it). Expiry is never
+  repair: a hit that leaves the window while some pod still lacks it makes the
+  heal impossible, and the time is then `null`, as it is when the run ends
+  first. `unrepaired_at_expiry_hits` is the mean hits per (pod, tracked key)
+  lost that way (0 for a full repair), so `null` with 0 means the run ended
+  mid-repair and `null` with more than 0 means repair did not finish in time.
+  `deficit_at_heal_hits` is the mean number of hits missing per (pod, tracked
+  key) at the heal instant, the repair the solution owes. Regimes with no
+  partition report `partition: null`.
 - **Health**: cell-store, rule- and node-dictionary full rejects, oversize
   datagrams, decode rejects, runtime exits, failed records, aggregate rows
   for keys the regime never issued, and admin snapshots that failed or a
@@ -402,7 +414,11 @@ Trans. Parallel and Distributed Systems 14(3), 2003) show that with `f = ln n
 + c` the probability that every node is reached tends to `exp(-exp(-c))`.
 5,000 independent runs per cell. The limit is asymptotic; the same Poisson
 argument at finite `n` with distinct targets gives `exp(-(n-1)(1 -
-f/(n-1))^(n-1))`, the last column. The harness must match the finite-`n` value
+f/(n-1))^(n-1))`, the last column. That value is itself a Poisson
+approximation, off by about 0.01 at `c = 0`, which the 4 s.e. band absorbs; an
+independent plain-Python simulation of the same protocol (`n = 100`, 40,000
+trials per cell, no harness code) gave 0.402, 0.732 and 0.898 for `c = 0, 1,
+2`, matching the measured column. The harness must match the finite-`n` value
 within 4 standard errors and the limit within 0.05.
 
 | n | c | measured P(all reached) | KMG limit | finite-n | 4 s.e. |
