@@ -283,9 +283,8 @@ fn partition_blocks_then_heal_converges() {
         );
 
         // Heal both directions. The owner's broadcast was lost with the
-        // partition and is not retried: only cells that change again are
-        // re-broadcast, so the far side learns the new hit's bucket and the
-        // old bucket stays missing until the window slides past it.
+        // partition and is not retried, so the far side hears of the key at
+        // its next change; that broadcast carries the key's whole state.
         set_link(&tx, 0, 1, LinkPolicyKind::Pass).await;
         set_link(&tx, 1, 0, LinkPolicyKind::Pass).await;
         submit(&tx, 0, WATCHED_KEY, 1).await;
@@ -294,10 +293,9 @@ fn partition_blocks_then_heal_converges() {
         }
 
         let healed = snapshot(&tx).await;
-        assert_eq!(healed.nodes[0].aggregate_total, 8);
-        assert_eq!(
-            healed.nodes[1].aggregate_total, 1,
-            "the far side holds the cell that changed after the heal"
+        assert!(
+            healed.nodes.iter().all(|n| n.aggregate_total == 8),
+            "convergence after heal"
         );
     });
 }
@@ -367,10 +365,10 @@ fn many_nodes_receive_every_tick_deterministically() {
     assert_eq!(run(), first, "tick delivery must be deterministic at N=32");
 }
 
-/// A node added after the cluster has converged starts cold and learns only
-/// the cells its owners next broadcast, and it appears in snapshots under a
-/// fresh stable id (`N`, the next never-reused id) without renumbering any
-/// survivor.
+/// A node added after the cluster has converged starts cold and catches up to
+/// the cluster total at the key's next change, when its owner broadcasts the
+/// key's whole state; it appears in snapshots under a fresh stable id (`N`, the
+/// next never-reused id) without renumbering any survivor.
 #[test]
 fn added_node_catches_up_by_gossip() {
     with_engine(test_config(3), |tx| async move {
@@ -397,19 +395,15 @@ fn added_node_catches_up_by_gossip() {
         let newcomer = joined.nodes.iter().find(|n| n.id == 3).unwrap();
         assert_eq!(newcomer.aggregate_total, 0, "the newcomer starts cold");
 
-        // The key's next hit lands in a later bucket, so its owner broadcasts
-        // that one cell and nothing older.
+        // The key's next hit makes its owner broadcast the key to every peer.
         submit(&tx, 0, WATCHED_KEY, 1).await;
         for _ in 0..15 {
             step(&tx, 100).await;
         }
         let after = snapshot(&tx).await;
         assert!(
-            after
-                .nodes
-                .iter()
-                .all(|n| n.aggregate_total == if n.id == 3 { 1 } else { 51 }),
-            "survivors converge on 51 and the newcomer holds the new cell only: {:?}",
+            after.nodes.iter().all(|n| n.aggregate_total == 51),
+            "every node, the newcomer included, converges on 51: {:?}",
             after
                 .nodes
                 .iter()

@@ -358,6 +358,29 @@ fn assert_structural_invariants(store: &CellStore<u32>) -> bool {
     if active != store.active_len() || store.index().len() != active {
         return false;
     }
+    // Every key's chain holds exactly the live cells of that key, once each.
+    let mut keys = BTreeMap::<(RuleSlot, u128), BTreeSet<(u32, u32)>>::new();
+    for handle in store.active_handles() {
+        let key = store
+            .get(handle)
+            .map(|row| (row.key.rule, row.key.key_hash.0));
+        keys.entry(key.unwrap())
+            .or_default()
+            .insert((handle.index, handle.generation));
+    }
+    if store.key_heads.len() as usize != keys.len() {
+        return false;
+    }
+    for (&(rule, key_hash), cells) in &keys {
+        let chain: Vec<_> = store.key_cells(rule, KeyHash(key_hash)).collect();
+        if chain.len() != cells.len()
+            || chain
+                .iter()
+                .any(|h| !cells.contains(&(h.index, h.generation)))
+        {
+            return false;
+        }
+    }
     for slot in 0..store.rule_dictionary().capacity() {
         let expected = rules.get(&slot).copied().unwrap_or(0);
         if store.rule_dictionary().refcount(slot) != expected {

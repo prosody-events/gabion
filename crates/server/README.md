@@ -237,8 +237,8 @@ Tuning the gossip cadence is rarely necessary, since the defaults
 converge in well under a second at production scale. When you do tune,
 `gossip.sync_wait` (how often hits are sent to the owner of their key,
 100 ms), `gossip.broadcast_interval` (how often an owner broadcasts its
-changed cells to every peer, 100 ms) and `gossip.broadcast_batch_limit`
-(most cells per broadcast, 1000) set the cadence. `gossip.fanout`,
+changed keys to every peer, 100 ms) and `gossip.broadcast_batch_limit`
+(most keys per broadcast, 1000) set the cadence. `gossip.fanout`,
 `gossip.target_err_bps` and `gossip.min_emit_interval` are accepted and
 ignored by owner aggregation. The mechanism and tradeoffs live in
 [`../gabion/README.md#how-gossip-works`](../gabion/README.md#how-gossip-works).

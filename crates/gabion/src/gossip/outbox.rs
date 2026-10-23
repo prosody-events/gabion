@@ -5,6 +5,10 @@
 //! once, with per-cell state in a column indexed by store slot. Entries for
 //! cells that have since expired are recognised by their stale generation
 //! and dropped when next visited.
+//!
+//! A broadcast sends a changed key's whole state, so a round of broadcast
+//! marks every cell it gathers: a queued cell whose key is already in the
+//! round is skipped rather than gathered twice.
 
 use std::collections::VecDeque;
 
@@ -24,6 +28,8 @@ struct CellState<C: Count> {
     /// in the queue never blocks the slot's next cell from queueing.
     queued_sync: u32,
     queued_broadcast: u32,
+    /// The broadcast round that last gathered this cell, or 0.
+    broadcast_round: u32,
 }
 
 impl<C: Count> CellState<C> {
@@ -33,6 +39,7 @@ impl<C: Count> CellState<C> {
             owner: Token::default(),
             queued_sync: 0,
             queued_broadcast: 0,
+            broadcast_round: 0,
         }
     }
 }
@@ -45,6 +52,7 @@ pub(super) struct Outbox<C: Count> {
     cells: Box<[CellState<C>]>,
     sync: VecDeque<CellHandle>,
     broadcast: VecDeque<CellHandle>,
+    round: u32,
 }
 
 impl<C: Count> Outbox<C> {
@@ -57,6 +65,7 @@ impl<C: Count> Outbox<C> {
             cells: vec![CellState::new(); cell_capacity].into_boxed_slice(),
             sync: VecDeque::with_capacity(sync_capacity),
             broadcast: VecDeque::with_capacity(broadcast_capacity),
+            round: 0,
         }
     }
 
@@ -119,6 +128,23 @@ impl<C: Count> Outbox<C> {
             state.queued_broadcast = 0;
         }
         Some(handle)
+    }
+
+    /// Start a broadcast round; cells marked in an earlier one no longer
+    /// count as gathered.
+    pub(super) fn begin_broadcast_round(&mut self) {
+        // Round 0 means "never gathered", so a wrapped counter skips it.
+        self.round = self.round.checked_add(1).unwrap_or(1);
+    }
+
+    /// Mark the cell as gathered by the current broadcast round.
+    pub(super) fn mark_gathered(&mut self, handle: CellHandle) {
+        self.cells[handle.index as usize].broadcast_round = self.round;
+    }
+
+    /// Whether the current broadcast round already gathered the cell.
+    pub(super) fn is_gathered(&self, handle: CellHandle) -> bool {
+        self.cells[handle.index as usize].broadcast_round == self.round
     }
 
     /// Record that `owner` holds `count` of the cell.

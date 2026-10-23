@@ -17,18 +17,18 @@ use super::transport::GossipTransport;
 
 pub(super) struct SendQueue {
     pool: Vec<PacketBuf>,
-    free: Vec<u8>,
-    pending: VecDeque<(SocketAddr, u8)>,
+    free: Vec<u32>,
+    pending: VecDeque<(SocketAddr, u32)>,
     max_depth: usize,
     dropped: u64,
 }
 
 impl SendQueue {
     pub(super) fn new(slots: usize, limits: FrameLimits) -> Self {
-        let slots = slots.clamp(1, usize::from(u8::MAX));
+        let slots = slots.max(1);
         Self {
             pool: (0..slots).map(|_| PacketBuf::for_limits(limits)).collect(),
-            free: (0..slots as u8).rev().collect(),
+            free: (0..slots as u32).rev().collect(),
             pending: VecDeque::with_capacity(slots),
             max_depth: 0,
             dropped: 0,
@@ -82,7 +82,7 @@ impl SendQueue {
             }
             return;
         };
-        self.pool[usize::from(slot)].copy_from(packet);
+        self.pool[slot as usize].copy_from(packet);
         self.pending.push_back((dst, slot));
         self.max_depth = self.max_depth.max(self.pending.len());
     }
@@ -95,7 +95,7 @@ impl SendQueue {
         let Some((dst, slot)) = self.pending.pop_front() else {
             return Ok(());
         };
-        match transport.try_send_to(self.pool[usize::from(slot)].as_bytes(), dst) {
+        match transport.try_send_to(self.pool[slot as usize].as_bytes(), dst) {
             Ok(_) => self.free.push(slot),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 self.pending.push_front((dst, slot));

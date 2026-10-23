@@ -149,9 +149,10 @@ the changed member wins or held.
    it holds back to the sender (`FLAG_ACK`). A node that believes it is
    not the owner folds and acknowledges nothing.
 4. **Broadcast.** Every `broadcast_interval` (100 ms) an owner sends the
-   cells that changed since its last broadcast, at most
-   `broadcast_batch_limit` (1 000), to every peer. Receivers merge them
-   and relay nothing.
+   whole state of each key that changed since its last broadcast (every
+   live cell it holds for the key, from every contributor and bucket), at
+   most `broadcast_batch_limit` (1 000) keys, to every peer. Receivers
+   merge them and relay nothing.
 5. **Re-send.** A cell stays queued until its owner acknowledges the
    current count, so a lost sync or ack is re-sent every `sync_wait`. When
    membership changes, every live local cell is re-checked against the new
@@ -160,9 +161,11 @@ the changed member wins or held.
 
 A node never forwards another node's hits, only an owner broadcasts a
 key, and nothing is sent to a non-owner. A broadcast is sent once per
-change: a broadcast lost on the network is repaired only when that cell
-next changes (it otherwise ages out with its window), and a node that
-joins learns a key when the key next changes.
+change and is not retried, but because it carries the key's whole state
+the next change to the key, by any contributor, repairs every peer that
+missed an earlier one. A node that joins learns a key at the key's next
+change; a key that never changes again stays unlearned until it ages out
+of its window.
 
 ### Design notes
 
@@ -172,10 +175,15 @@ This implementation follows Gubernator's `GLOBAL` behaviour (Mailgun,
 adapted as little as the CRDT and UDP require:
 
 - **Cells, not totals.** Gubernator's owner holds one total per key and
-  broadcasts it. Here the owner holds the contributors' origin-tagged
-  cells and broadcasts the changed cells, so a receiver computes the same
-  total through the existing max-merge join, and re-sent or reordered
-  datagrams cannot double count. `batch limit` therefore counts cells.
+  broadcasts the key's current status. Here the owner holds the
+  contributors' origin-tagged cells, and the key's status is all of its
+  live cells (found through a per-key chain in the cell store), so a
+  receiver computes the same total through the existing max-merge join,
+  and re-sent or reordered datagrams cannot double count. The batch limit
+  counts keys, as Gubernator's does. A key with many contributors and live
+  buckets is re-sent in full at each change, where Gubernator sends one
+  number; in the 80-pod `prod-typical` regime this raised the bytes per
+  node per second from about 97 KB (changed cells only) to about 270 KB.
 - **Cadence.** Gubernator batches hits over a sub-millisecond window to
   coalesce requests, which is not a staleness bound. `sync_wait` and
   `broadcast_interval` are both 100 ms, chosen from the sub-second
@@ -184,8 +192,19 @@ adapted as little as the CRDT and UDP require:
   Here the owner acknowledges each folded cell and the contributor
   re-sends until it does, which is the minimal substitute for the retry
   TCP gave the hit path. Gubernator does not retry a failed broadcast
-  either (the next update of the key carries the total), so broadcasts
+  either (the next update of the key carries its status), so broadcasts
   are not acknowledged.
+- **Batch limit.** Gubernator flushes a batch as soon as it holds
+  `GlobalBatchLimit` keys and arms its timers on the first queued item.
+  Here the sync and broadcast tickers are free-running and
+  `broadcast_batch_limit` caps the keys of one broadcast, leaving the rest
+  for the next tick; a sync is capped at `max_cells_per_tick` cells. Neither
+  cap is reached at the loads in the benchmark regimes.
+- **Queue overflow.** If the sync queue is full when a hit arrives, the
+  cell is left to a sweep of every local cell at the next sync tick, so
+  the hit is still re-sent until acknowledged once the queue has drained.
+  The broadcast queue has no such sweep: an overflow there drops the
+  change, and the key's next change repairs it.
 - **Addresses.** Owners are computed from peers' discovered addresses
   (the one identity discovery gives a node for every other), so the
   transport's local address must be the address peers discover the node
@@ -217,7 +236,7 @@ when you do need to tune.
 |-------------------------|---------|--------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
 | `sync_wait`             | 100 ms  | How often a node sends its unacknowledged cells to their owners, and the retry interval for a lost sync or ack.    | Lower for fresher counts at more small packets; raise if packet rate is the bottleneck.          |
 | `broadcast_interval`    | 100 ms  | How often an owner broadcasts its changed cells to every peer.                                                     | Each broadcast costs one packet per peer per interval, so cost grows with cluster size.          |
-| `broadcast_batch_limit` | 1 000   | Most cells in one owner broadcast; the rest wait for the next interval.                                            | Raise if owners' queues back up under bursts (`forwarded_dirty_len` in the admin snapshot).      |
+| `broadcast_batch_limit` | 1 000   | Most keys in one owner broadcast; the rest wait for the next interval.                                             | Raise if owners' queues back up under bursts (`forwarded_dirty_len` in the admin snapshot).      |
 | `tick_interval`         | 500 ms  | Period of the sweep that expires cells whose bucket left the window.                                               | Rarely.                                                                                          |
 | `max_cells_per_tick`    | 4 096   | Most cells one sync sends; the rest wait for the next `sync_wait`.                                                 | Raise if many keys are active per node.                                                          |
 | `max_payload_bytes`     | 1 400   | UDP datagram budget. The codec splits a batch across multiple packets when the cell list overflows.                | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.      |

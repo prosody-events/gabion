@@ -247,7 +247,9 @@ where
         let obs_buf = ObservationBatch::<C>::with_capacity(batch_cells);
         let sink_buf = DeltaSink::<C>::with_capacity(batch_cells);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
-        let frame_handles = Vec::with_capacity(batch_cells);
+        // A broadcast gathers every live cell of each changed key, each at
+        // most once, so the store's capacity bounds it.
+        let frame_handles = Vec::with_capacity(batch_cells.max(store.capacity() as usize));
         let sync_batch = Vec::with_capacity(config.max_cells_per_tick);
         let encode_buf = PacketBuf::for_limits(config.wire_limits);
 
@@ -630,26 +632,14 @@ where
     /// sync, until its owner acknowledges it or it expires.
     fn handle_sync_tick(&mut self) -> Result<(), GossipError> {
         self.ticks_total = self.ticks_total.saturating_add(1);
+        self.collect_sync_batch();
         if self.requeue_local_cells {
+            // Membership changed or the queue overflowed. Entries the first
+            // pass settled have made room, so sweep every local cell in and
+            // gather the batch again.
             self.requeue_local_cells = false;
             self.queue_all_local_cells();
-        }
-
-        self.sync_batch.clear();
-        let mut i = 0;
-        while i < self.outbox.sync_len() && self.sync_batch.len() < self.config.max_cells_per_tick {
-            let handle = self.outbox.sync_at(i);
-            match self.route(handle) {
-                Route::Settled => self.outbox.unqueue_sync(i),
-                Route::Broadcast(count) => {
-                    self.hand_to_broadcast(handle, count);
-                    self.outbox.unqueue_sync(i);
-                }
-                Route::Send(peer) => {
-                    self.sync_batch.push((peer, handle));
-                    i += 1;
-                }
-            }
+            self.collect_sync_batch();
         }
         if self.sync_batch.is_empty() {
             return Ok(());
@@ -674,21 +664,57 @@ where
         Ok(())
     }
 
-    /// Broadcast the cells of keys this node owns that changed since the
-    /// last broadcast, at most `broadcast_batch_limit` of them, to every
-    /// peer.
+    /// Fill `sync_batch` with the queued cells that still owe their owner
+    /// something, dropping those that no longer do.
+    fn collect_sync_batch(&mut self) {
+        self.sync_batch.clear();
+        let mut i = 0;
+        while i < self.outbox.sync_len() && self.sync_batch.len() < self.config.max_cells_per_tick {
+            let handle = self.outbox.sync_at(i);
+            match self.route(handle) {
+                Route::Settled => self.outbox.unqueue_sync(i),
+                Route::Broadcast(count) => {
+                    self.hand_to_broadcast(handle, count);
+                    self.outbox.unqueue_sync(i);
+                }
+                Route::Send(peer) => {
+                    self.sync_batch.push((peer, handle));
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Broadcast the whole state of the keys this node owns that changed
+    /// since the last broadcast, at most `broadcast_batch_limit` keys, to
+    /// every peer. A key's state is every live cell the node holds for it,
+    /// so a peer that missed an earlier broadcast catches up on the next
+    /// change to the key.
     fn handle_broadcast_tick(&mut self) -> Result<(), GossipError> {
         self.ticks_total = self.ticks_total.saturating_add(1);
         self.frame_handles.clear();
-        while self.frame_handles.len() < self.config.broadcast_batch_limit {
+        self.outbox.begin_broadcast_round();
+        let mut keys = 0;
+        while keys < self.config.broadcast_batch_limit {
             let Some(handle) = self.outbox.pop_broadcast() else {
                 break;
             };
+            if self.outbox.is_gathered(handle) {
+                continue;
+            }
             // Only the current owner broadcasts a key. A cell whose owner has
             // since moved is dropped here: its new owner gets the hits from
             // their contributors and broadcasts them.
-            if matches!(self.owner_of(handle), Some(Owner::Local)) {
-                self.frame_handles.push(handle);
+            if !matches!(self.owner_of(handle), Some(Owner::Local)) {
+                continue;
+            }
+            let Some(row) = self.store.get(handle) else {
+                continue;
+            };
+            keys += 1;
+            for cell in self.store.key_cells(row.key.rule, row.key.key_hash) {
+                self.outbox.mark_gathered(cell);
+                self.frame_handles.push(cell);
             }
         }
         if self.frame_handles.is_empty() || self.membership.peers().is_empty() {
@@ -736,8 +762,12 @@ where
         }
     }
 
+    /// Queue `handle` for the next sync. If the queue is full the cell is
+    /// left to the next sweep of every local cell, so its owner still hears
+    /// of it once the queue has drained.
     fn queue_sync(&mut self, handle: CellHandle) {
         if self.outbox.queue_sync(handle).is_err() {
+            self.requeue_local_cells = true;
             self.overflows
                 .sync_queue_full(self.store.config().local_dirty_capacity);
         }
@@ -753,19 +783,20 @@ where
             .delivered(handle, count, self.membership.local_token());
     }
 
-    /// Queue every live local cell for a fresh owner check.
+    /// Queue every live local cell its owner does not yet hold, as the
+    /// membership now stands.
     fn queue_all_local_cells(&mut self) {
-        let Self {
-            store,
-            outbox,
-            overflows,
-            ..
-        } = self;
-        let local = store.local_node_slot();
-        for handle in store.active_handles() {
-            let is_local = store.get(handle).is_some_and(|row| row.key.origin == local);
-            if is_local && outbox.queue_sync(handle).is_err() {
-                overflows.sync_queue_full(store.config().local_dirty_capacity);
+        let local = self.store.local_node_slot();
+        for handle in self.store.active_handles() {
+            let owes = self
+                .store
+                .get(handle)
+                .is_some_and(|row| row.key.origin == local)
+                && !matches!(self.route(handle), Route::Settled);
+            if owes && self.outbox.queue_sync(handle).is_err() {
+                self.requeue_local_cells = true;
+                self.overflows
+                    .sync_queue_full(self.store.config().local_dirty_capacity);
             }
         }
     }
