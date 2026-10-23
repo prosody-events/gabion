@@ -448,7 +448,9 @@ defaults are sized for production loads.
 - **Coverage fanout** — per-tick peer count is sized to the coverage
   threshold `⌈ln(peers)+c⌉`, the fanout that reliably reaches every
   node, capped at the peer-set size. It scales with cluster size, not
-  the dirty set. `gabion_gossip_fanout` sets the **floor**.
+  the dirty set. `gabion_gossip_fanout` sets the **floor**; with the Thicket tree
+  dissemination it has no effect (see the
+  [gossip design notes](../gabion/README.md#design-notes-thicket-dissemination)).
 - **Adaptive emit rate** — the gossip cadence adapts to per-rule
   pressure. Heartbeats fire every `gabion_gossip_tick_interval`;
   between heartbeats, the runtime fires a synthetic "threshold" tick
@@ -466,7 +468,7 @@ adapters; the canonical knob table lives in
 
 | Directive                                   | Default | Adapts                                                       |
 |---------------------------------------------|---------|--------------------------------------------------------------|
-| `gabion_gossip_fanout N`                    | `3`     | **Coverage fanout** — floor on peers selected per tick; the runtime scales the pick to `⌈ln(peers)+c⌉`. |
+| `gabion_gossip_fanout N`                    | `3`     | **Coverage fanout** — no effect with the Thicket tree dissemination. |
 | `gabion_gossip_target_err_bps N`            | `100`   | **Adaptive emit rate** — per-rule unreplicated-error budget in basis points of the rule's limit (`100` = 1%). Lower = tighter accuracy, more emissions. |
 | `gabion_gossip_min_emit_interval DURATION`  | `5ms`   | **Adaptive emit rate** — floor between threshold-fire emissions. Raise when the gossip channel itself is the bottleneck. |
 
@@ -481,7 +483,7 @@ they bound resource use.
 | `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet. Below ~64 the encoder refuses to fit even one cell. |
 | `gabion_gossip_max_cells_per_frame N`           | `4096`  | Maximum cells encoded into one packet.                                                |
 | `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells emitted across all packets in one tick.                                 |
-| `gabion_gossip_send_queue_capacity N`           | `128`   | Outbound UDP send queue depth (per-peer slots in the leader).                         |
+| `gabion_gossip_send_queue_capacity N`           | `512`   | Outbound UDP send queue depth (per-peer slots in the leader).                         |
 
 ### Storage — CRDT capacities
 

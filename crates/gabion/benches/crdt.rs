@@ -61,6 +61,7 @@ fn obs_row(
         incarnation,
         count,
         last_update_millis,
+        origin_sequence: 0,
     }
 }
 use gabion::wire::{FrameLimits, Header, PacketBuf, Packets, WireScratch, decode_unauth};
@@ -1065,6 +1066,7 @@ fn wire_header() -> Header {
         body_len: 0,
         min_origin_sequence: 0,
         max_origin_sequence: 0,
+        edge_sequence: 0,
         flags: 0,
     }
 }

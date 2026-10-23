@@ -29,8 +29,8 @@ pub type SharedNow = Rc<Cell<u64>>;
 /// node by the engine; not `Clone` (the `mpsc::Receiver` is single-consumer).
 pub struct ManualClock {
     now: SharedNow,
-    /// Taken once by [`Clock::ticker`]; `RefCell<Option<_>>` so the `&self`
-    /// trait method can move the receiver out.
+    /// Taken by the first [`Clock::ticker`] call; `RefCell<Option<_>>` so the
+    /// `&self` trait method can move the receiver out.
     tick_rx: RefCell<Option<mpsc::Receiver<()>>>,
 }
 
@@ -55,12 +55,16 @@ impl Clock for ManualClock {
         self.now.get()
     }
 
+    /// The first ticker is the gossip heartbeat, fired by the engine. A runtime
+    /// that asks for another (the relay spacing timer) gets one that never
+    /// fires: the visualizer's time moves a whole gossip tick at a time, so a
+    /// relayed change rides the next heartbeat round instead.
     fn ticker(&self, _interval: Duration) -> ManualTicker {
         let rx = self
             .tick_rx
             .borrow_mut()
             .take()
-            .expect("ManualClock::ticker called more than once");
+            .unwrap_or_else(|| mpsc::channel(1).1);
         ManualTicker(rx)
     }
 }

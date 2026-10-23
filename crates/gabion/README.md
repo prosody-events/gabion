@@ -23,6 +23,7 @@ the [repo root README](../../README.md#glossary).
   - [Coverage fanout](#coverage-fanout)
   - [Adaptive emit rate](#adaptive-emit-rate)
   - [Dirty rings and the peer frontier](#dirty-rings-and-the-peer-frontier)
+- [Design notes: Thicket dissemination](#design-notes-thicket-dissemination)
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
 - [References](#references)
@@ -50,6 +51,14 @@ nothing else in this crate. Adapters consume the public surface of
 `defaults`.
 
 ## How gossip works
+
+> **This branch disseminates along Thicket trees.** Sections "The
+> anti-entropy loop", "Coverage fanout" and "Dirty rings and the peer
+> frontier" below describe the baseline, whose random per-round fanout and
+> peer-frontier pruning the trees replace. The adaptive emit rate, the wire
+> frame and the CRDT are unchanged. What replaces the baseline, and every
+> way it departs from the papers, is in
+> [Design notes: Thicket dissemination](#design-notes-thicket-dissemination).
 
 Gossip is the protocol that turns N independent counter stores into one
 *eventually consistent* counter store. Every node admits requests
@@ -359,6 +368,125 @@ next repair-lane sweep picks the dropped cell back up.
 lifecycles, and invariant proofs. Read it once if you ever need to
 debug the CRDT.
 
+## Design notes: Thicket dissemination
+
+Changes travel down `T = 3` trees instead of to `⌈ln n + c⌉` random peers.
+The design is Thicket (Ferreira, Leitão & Rodrigues, *Thicket: A Protocol
+for Building and Maintaining Multiple Trees in a P2P Overlay*, SRDS 2010)
+over Plumtree (Leitão, Pereira & Rodrigues, *Epidemic Broadcast Trees*, SRDS
+2007). The code is `src/gossip/runtime/{thicket,forward,repair,edge}.rs`.
+
+### Mechanism
+
+1. **Classes.** A node is *interior* in exactly one tree, `hash(address) mod
+   T`, and a *leaf* in the other two. Every node computes every peer's class
+   from discovery alone.
+2. **Trees.** In its own tree a node keeps a backbone view of `⌈ln m + c⌉`
+   random class-mates (`m` of them) and, per root (the origin of a change), an
+   eager subset of it, which starts as the whole view and shrinks on PRUNE.
+   It also pushes to the leaves that attached to it. In each other tree it
+   has one parent, an interior node of that tree, that it attached to.
+3. **Which tree.** A change is a cell version named `(origin, incarnation,
+   origin sequence)`. Its tree is `(hash(origin) + sequence) mod T`, so an
+   origin's consecutive changes rotate through the trees.
+4. **Forwarding.** An interior node forwards a change of its own tree to its
+   eager neighbours for that root and its leaf children, except the sender,
+   in a relay round at most 5 ms after merging it. A leaf never relays: it
+   sends its own changes of that tree to its parent, and receives the rest from
+   it. A tree with no interior node at all is served straight from the origin.
+5. **PRUNE.** A node that receives a second eager copy of a change moves the
+   sender to lazy for that root. A leaf that is pushed to by a node that is
+   not its parent detaches from it.
+6. **IHAVE and GRAFT.** Each heartbeat a node sends an IHAVE digest to 2
+   random peers. A digest entry for changes not delivered within 500 ms makes
+   the receiver GRAFT the announcer: it asks for the cells and, if the missing
+   changes travel in its own tree, to become the announcer's tree neighbour.
+   A GRAFT never makes the receiver interior in a second tree: for any other
+   tree the grafting node is at most a leaf child, and only of an interior
+   node of that tree.
+7. **Scheduling.** The shared scheduler is unchanged: a node's own changes
+   leave on the 500 ms heartbeat or a threshold round (error budget, 5 ms
+   floor). A change merged from a peer is forwarded in a relay round.
+
+### Parameters
+
+All are constants in `gabion::defaults` (`THICKET_*`). They are not
+`GossipConfig` fields: the legacy scenario suite in `gossip-bench` builds
+`GossipConfig` field by field and cannot change here.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `THICKET_TREES` | 3 | `T`, matched to three availability zones |
+| `THICKET_MISSING_TIMEOUT_MS` | 500 | an announced change may be missing this long before GRAFT |
+| `THICKET_LAZY_TARGETS` | 2 | peers sent the IHAVE digest per heartbeat |
+| `THICKET_RELAY_FLOOR_MS` | 5 | spacing of relay rounds |
+| `THICKET_NACK_RETRY_MS` | 100 | wait before asking for a lost packet again; PRUNE spacing |
+| `THICKET_IHAVE_FULL_EVERY` | 8 | heartbeats between full digests |
+| `THICKET_REPAIR_CELLS` | 256 | cells of the repair slice per heartbeat |
+
+`fanout` has no effect here, and `max_cells_per_tick` now caps the cells in
+one frame to one neighbour. `GOSSIP_SEND_QUEUE_CAPACITY` is 512: a round
+queues a frame for each tree neighbour, not for `⌈ln n + c⌉` picks.
+
+### Adaptations
+
+Each is the smallest change that makes the papers' protocol work on gabion's
+data and UDP.
+
+- **A message is a cell version, named end to end.** The papers' message ids
+  need a cluster-wide name. `CellStore::merge_remote` now keeps the origin's
+  sequence instead of re-stamping the cell with a local counter, and keeps the
+  origin's highest sequence per origin ([`CRDT.md`](CRDT.md)).
+- **Per-root eager sets**, as `riak_core_broadcast` does. A single shared tree
+  is unstable with every node sending: wavefronts of different origins meet at
+  different edges and prune each other.
+- **Class from the address, view from discovery.** The class is a hash of the
+  peer's address, so no handshake is needed and membership comes only from
+  discovery events. A node's own class comes from `transport.local_addr()`, so
+  a node bound to a wildcard address would disagree with its peers: a
+  production deployment would carry the node id in the header and hash that.
+  The backbone view of random class-mates stands in for HyParView, since
+  membership is full.
+- **UDP.** Both papers assume reliable links. Each eager packet carries a
+  per-edge number (`Header::edge_sequence`); a receiver that sees one skipped
+  sends a NACK (control frame, `wire::control`) and the sender resends from
+  its last 512 packets. A heartbeat PROBE names the latest number so that the
+  loss of a burst's tail shows. A lost packet is asked for 3 times.
+- **IHAVE names an origin, not a message.** Cells supersede one another, so a
+  change cannot be named once it is replaced. A digest entry is an origin and
+  the highest sequence held. Deltas go out each heartbeat, the full digest
+  every 8th, and a full digest goes to a peer as soon as discovery adds it.
+  GRAFT asks for an origin's cells above the sequence the requester holds,
+  oldest first.
+- **Duplicates are exact.** A row is a duplicate only if the node holds
+  exactly that version and it arrived by a tree edge or was made here. An
+  older version arriving after a newer one that took a faster tree is a first
+  copy, and a cell delivered by a pull or the repair slice says nothing about
+  the trees. Counting either as a duplicate prunes the edge that delivered it.
+- **No re-parenting on a timeout.** Moving a leaf's parent moves the point
+  where its own changes enter that tree, and every root's eager subtree was
+  pruned around the old one, so a timeout pulls the cells and leaves the
+  parent alone. A parent is replaced when discovery removes it, and the attach
+  GRAFT is repeated each heartbeat.
+- **Repair slice.** A max-sequence digest cannot see a hole in the middle of
+  an origin's sequences, so each heartbeat the node also sends one random peer
+  the next 256 cells of the store's rotating repair sweep, outside the trees.
+- **Expired cells are not merged.** A tree forwards whatever it newly merges,
+  so a cell taken back in after its window passed would circulate. Rows of a
+  rule whose bucket is already out of the window are dropped before merging.
+
+### Left as it was
+
+The CRDT's peer frontier, `fill_gossip_frame*` and the repair cursor stay in
+the library and its tests; this runtime no longer calls the frontier or the
+frame fillers (`CellStoreConfig::peer_capacity` is part of the harness
+contract and now sizes the peer table). `PeerEntry::peer_slot` is gone.
+
+Tests that asserted the baseline's behaviour were removed: per-peer frame
+pruning, peer sampling without replacement, coverage fanout, uniform sampling
+and the peer-slot pairing invariant. The convergence, partition-heal,
+loss, authentication and expiration properties still pass.
+
 ## Operator knobs
 
 Most deployments leave the defaults alone, because they are chosen to
@@ -371,8 +499,8 @@ it splits into the two adaptive halves of the protocol.
 | Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
-| `fanout`             | 3           | Fanout floor. The runtime scales the actual pick to the coverage threshold `⌈ln(n)+c⌉` (`c` = `GOSSIP_COVERAGE_MARGIN`, 3), capped at the peer count. | Rarely tune — the floor binds only if you lower `GOSSIP_COVERAGE_MARGIN`. To trade bandwidth for coverage, change the margin, not this floor. |
-| `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame_for_peer` will emit in one tick. Cells over the cap roll forward to the next tick via the repair lane. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
+| `fanout`             | 3           | No effect on this branch: changes travel down the trees ([design notes](#design-notes-thicket-dissemination)). The backbone view is sized `⌈ln(m)+c⌉` from `GOSSIP_COVERAGE_MARGIN`. | Leave alone. |
+| `max_cells_per_tick` | 4 096       | Cap on cells in one frame to one tree neighbour. Cells over the cap are not sent to that neighbour, which finds the gap through the lazy digest. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
 | `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 
 ### Per-rule error budget (adaptive emit rate)

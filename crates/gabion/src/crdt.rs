@@ -368,12 +368,14 @@ struct UpsertSpec<C: Count> {
     mode: UpsertMode<C>,
 }
 
+#[derive(Clone, Copy)]
 enum UpsertMode<C: Count> {
     /// Local hit. The stored count rises by saturating-adding `hits`.
     Accumulate { hits: u64 },
     /// Remote observation. The stored count rises to `observed` if and only
-    /// if `observed` is strictly greater (CRDT max-merge).
-    MaxMerge { observed: C },
+    /// if `observed` is strictly greater (CRDT max-merge). The cell keeps the
+    /// origin's own `origin_sequence`, so a change has one name cluster-wide.
+    MaxMerge { observed: C, origin_sequence: u64 },
 }
 
 impl<C: Count> CellStore<C> {
@@ -722,6 +724,68 @@ impl<C: Count> CellStore<C> {
         })
     }
 
+    /// The handle and origin sequence of the cell `(rule_fingerprint,
+    /// key_hash, bucket, origin, incarnation)`, if this store holds it.
+    pub fn find_cell(
+        &self,
+        rule_fingerprint: u128,
+        key_hash: KeyHash,
+        bucket: BucketEpoch,
+        origin: NodeId,
+        incarnation: Incarnation,
+    ) -> Option<(CellHandle, u64)> {
+        let key = CompactCellKey {
+            rule: self.find_rule(rule_fingerprint)?,
+            key_hash,
+            bucket,
+            origin: self.find_node(origin, incarnation)?,
+            incarnation,
+        };
+        let slot = self.lookup_index(key)?;
+        Some((self.handle_for(slot), self.origin_sequences[slot as usize]))
+    }
+
+    /// Whether a cell of rule `rule_fingerprint` in `bucket` has already left
+    /// the rule's live window at `now_millis`, by the same test `expire_at`
+    /// applies. `false` for a rule not known here, which never expires.
+    pub fn is_expired_at(
+        &self,
+        rule_fingerprint: u128,
+        bucket: BucketEpoch,
+        now_millis: u64,
+    ) -> bool {
+        let Some(descriptor) = self
+            .rule_dictionary
+            .find(rule_fingerprint)
+            .and_then(|slot| self.rule_dictionary.descriptor(slot))
+        else {
+            return false;
+        };
+        u64::from(bucket) + u64::from(descriptor.live_buckets())
+            < u64::from(descriptor.current_epoch(now_millis))
+    }
+
+    /// Visit every live cell whose origin has `since[origin] != u64::MAX` and
+    /// whose origin sequence is above `since[origin]`, in storage order.
+    /// `since` is indexed by [`NodeSlot`]. A full scan of the cell columns:
+    /// for answering a pull, not for the per-request path. `visit` returning
+    /// `false` halts the scan.
+    pub fn visit_cells_after(&self, since: &[u64], mut visit: impl FnMut(CellHandle) -> bool) {
+        debug_assert_eq!(since.len(), self.next_sequence_by_origin.len());
+        for slot in 0..self.capacity {
+            if !self.is_active(slot) {
+                continue;
+            }
+            let floor = since[self.origins[slot as usize] as usize];
+            if floor != u64::MAX
+                && self.origin_sequences[slot as usize] > floor
+                && !visit(self.handle_for(slot))
+            {
+                return;
+            }
+        }
+    }
+
     // -- Slot lifecycle -----------------------------------------------------
 
     fn alloc_slot(&mut self) -> Option<u32> {
@@ -770,10 +834,30 @@ impl<C: Count> CellStore<C> {
 
     // -- Update primitives --------------------------------------------------
 
-    fn next_origin_sequence(&mut self, origin: NodeSlot) -> u64 {
-        let seq = &mut self.next_sequence_by_origin[origin as usize];
-        *seq = seq.saturating_add(1);
-        *seq
+    /// The sequence a changed cell carries: the next local one for a local
+    /// hit, the origin's own for a merged remote version. Either way the
+    /// origin's high-water mark ends at or above it.
+    fn stamp_sequence(&mut self, origin: NodeSlot, mode: UpsertMode<C>) -> u64 {
+        let high = &mut self.next_sequence_by_origin[origin as usize];
+        match mode {
+            UpsertMode::Accumulate { .. } => {
+                *high = high.saturating_add(1);
+                *high
+            }
+            UpsertMode::MaxMerge {
+                origin_sequence, ..
+            } => {
+                *high = (*high).max(origin_sequence);
+                origin_sequence
+            }
+        }
+    }
+
+    /// Highest sequence of `origin`'s changes this store holds: the origin's
+    /// own counter for the local node, the highest merged for a remote one.
+    /// `0` for an origin with no live cells.
+    pub fn highest_origin_sequence(&self, origin: NodeSlot) -> u64 {
+        self.next_sequence_by_origin[origin as usize]
     }
 
     fn push_dirty(&mut self, origin: NodeSlot, handle: CellHandle, sequence: u64) {
@@ -893,7 +977,7 @@ impl<C: Count> CellStore<C> {
             let previous = self.counts[slot as usize];
             let next = match mode {
                 UpsertMode::Accumulate { hits } => previous.saturating_add_hits(hits),
-                UpsertMode::MaxMerge { observed } => {
+                UpsertMode::MaxMerge { observed, .. } => {
                     if observed > previous {
                         observed
                     } else {
@@ -910,7 +994,7 @@ impl<C: Count> CellStore<C> {
             }
             self.counts[slot as usize] = next;
             self.last_update_millis[slot as usize] = now_millis;
-            let seq = self.next_origin_sequence(origin_slot);
+            let seq = self.stamp_sequence(origin_slot, mode);
             self.origin_sequences[slot as usize] = seq;
             let handle = self.handle_for(slot);
             self.push_dirty(origin_slot, handle, seq);
@@ -933,7 +1017,7 @@ impl<C: Count> CellStore<C> {
         };
         let initial = match mode {
             UpsertMode::Accumulate { hits } => C::default().saturating_add_hits(hits),
-            UpsertMode::MaxMerge { observed } => observed,
+            UpsertMode::MaxMerge { observed, .. } => observed,
         };
         self.rules[slot as usize] = rule_slot;
         self.key_hashes[slot as usize] = key_hash;
@@ -942,7 +1026,7 @@ impl<C: Count> CellStore<C> {
         self.incarnations[slot as usize] = incarnation;
         self.counts[slot as usize] = initial;
         self.last_update_millis[slot as usize] = now_millis;
-        let seq = self.next_origin_sequence(origin_slot);
+        let seq = self.stamp_sequence(origin_slot, mode);
         self.origin_sequences[slot as usize] = seq;
 
         // Hold dictionary references on behalf of this cell.
@@ -1067,6 +1151,7 @@ impl<C: Count> CellStore<C> {
                     now_millis: obs.last_update_millis[i],
                     mode: UpsertMode::MaxMerge {
                         observed: obs.counts[i],
+                        origin_sequence: obs.origin_sequences[i],
                     },
                 },
                 sink,
@@ -1107,7 +1192,17 @@ impl<C: Count> CellStore<C> {
 
     /// Drop dirty records. Stored cells are untouched.
     pub fn clear_dirty(&mut self) {
+        self.clear_local_dirty();
+        self.clear_forwarded_dirty();
+    }
+
+    /// Drop the local dirty ring only.
+    pub fn clear_local_dirty(&mut self) {
         self.local_dirty.clear();
+    }
+
+    /// Drop the forwarded dirty ring only.
+    pub fn clear_forwarded_dirty(&mut self) {
         self.forwarded_dirty.clear();
     }
 
@@ -1343,10 +1438,9 @@ impl<C: Count> CellStore<C> {
     /// The two dirty lanes prune by the peer frontier — a cell whose
     /// `origin_sequence` is at or below the peer's recorded `last_acked` for
     /// that origin is skipped. That is a **latency optimization only**: the
-    /// frontier is a per-(peer, origin) high-watermark, and because remote
-    /// cells are re-stamped with the merging node's local origin counter (see
-    /// [`Self::merge_remote`]), the watermark can sit above a sequence the peer
-    /// never actually received — a gap it cannot represent. So the repair lane
+    /// frontier is a per-(peer, origin) high-watermark, and a watermark can sit
+    /// above a sequence the peer never actually received — a gap it cannot
+    /// represent. So the repair lane
     /// (lane 3) sweeps the rotating active-set slice **unconditionally**,
     /// without consulting the frontier. That is what makes anti-entropy
     /// converge under reordering, loss, or a stale watermark — the guarantee
