@@ -2195,6 +2195,153 @@ async fn send_queue_uses_every_slot_past_255() {
         .await;
 }
 
+/// A repair slice cut by its pick's send-queue share resumes at the first
+/// cell it did not send. If the cursor kept its place past the cut, every
+/// heartbeat would resend the same leading cells and the rest would never
+/// arrive.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cut_repair_slice_resumes_where_it_stopped() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            const CELLS: u128 = 6;
+            let router = SimRouter::new();
+            let addr_a = sock(54_000);
+            let addr_b = sock(54_001);
+            let id_a = NodeIdentity::new(NodeId(0xE0), 1);
+            let id_b = NodeIdentity::new(NodeId(0xE1), 1);
+
+            // Two slots of one cell each: every frame is cut after two cells.
+            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+            cfg_a.send_queue_capacity = 2;
+            cfg_a.wire_limits.max_payload_bytes = 160;
+            let (rt_a, client_a) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                cfg_a,
+                store_for(id_a),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt_b, client_b) = GossipRuntime::from_parts(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                sim_config(id_b, vec![addr_a], 2),
+                store_for(id_b),
+                agg_b.clone(),
+            );
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+
+            // The high limit keeps the error budget from adding threshold
+            // rounds. The round that sends these changes is cut to the newest
+            // two; the rest reach B only through repair.
+            for key in 0..CELLS {
+                client_a
+                    .record(0xE05, KeyHash(key), 0, 1, 1_000_000, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 8).await;
+
+            assert_eq!(agg_b.snapshot().len(), CELLS as usize);
+
+            client_a.shutdown().await.unwrap();
+            client_b.shutdown().await.unwrap();
+            let _ = h_a.await;
+            let _ = h_b.await;
+        })
+        .await;
+}
+
+/// A round that cannot give every pick a send slot keeps its changes for
+/// the next round. Sending them to only the first picks and then clearing
+/// them would leave the rest of the picks without them for good.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn round_short_of_send_slots_keeps_its_changes() {
+    use tokio::sync::mpsc;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            // Each peer holds one undrained packet. The first change reaches
+            // all three; a quiet heartbeat's repair packet and the second
+            // change's three packets then block, leaving one slot of five
+            // for the third change's round.
+            let router = SimRouter::with_channel_capacity(1);
+            let peers: Vec<SocketAddr> = (1..=3).map(|i| sock(56_000 + i)).collect();
+            let _inboxes: Vec<_> = peers.iter().map(|addr| router.bind(*addr)).collect();
+            let id = NodeIdentity::new(NodeId(0xF8), 1);
+            let mut cfg = sim_config(id, peers, 1);
+            cfg.fanout = 3;
+            cfg.send_queue_capacity = 5;
+            let (admin_tx, admin_rx) = mpsc::channel(4);
+            let (rt, client) = GossipRuntime::from_parts_with_admin(
+                router.bind(sock(56_000)),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(id),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+            for key in 0..3 {
+                client
+                    .record(0xF85, KeyHash(key), 0, 1, 1_000_000, 0)
+                    .await
+                    .unwrap();
+                sim_advance_ticks(Duration::from_millis(100), 1).await;
+            }
+
+            let snapshot = admin_snapshot(&admin_tx).await;
+            assert_eq!(snapshot.send_pending_depth, 4);
+            assert_eq!(snapshot.local_dirty_len, 1);
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
+        })
+        .await;
+}
+
+/// With no peers, a round settles its changes and the error budget alike.
+/// Leaving the budget unsettled would make every later request past it
+/// dispatch another threshold round, each a full expiry scan.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn threshold_rounds_without_peers_respect_the_emit_floor() {
+    use tokio::sync::mpsc;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let id = NodeIdentity::new(NodeId(0xF0), 1);
+            let (admin_tx, admin_rx) = mpsc::channel(4);
+            let (rt, client) = GossipRuntime::from_parts_with_admin(
+                router.bind(sock(55_000)),
+                TokioClock::from_millis(0),
+                sim_config(id, Vec::new(), 1),
+                store_for(id),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+            // Limit 1: from the third hit on, every request is past the
+            // budget. Paused time stays inside one `min_emit_interval`.
+            for _ in 0..50 {
+                client.record(0xF05, KeyHash(1), 0, 1, 1, 0).await.unwrap();
+            }
+
+            let fires = admin_snapshot(&admin_tx).await.threshold_fires;
+            assert!(fires <= 2, "{fires} threshold rounds for 50 requests");
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
+        })
+        .await;
+}
+
 // -- Gap 5: DropProb i.i.d. packet loss -------------------------------------
 
 #[derive(Clone, Debug)]

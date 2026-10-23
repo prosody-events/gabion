@@ -517,7 +517,7 @@ Each shifted entry's probe distance drops by exactly one.
 
 File: `crates/gabion/src/crdt/dirty_ring.rs`.
 
-A `DirtyRing` is a fixed-capacity ring buffer of "this cell just changed" entries. The cell store keeps two of them: `local_dirty` for changes whose origin is this node, and `forwarded_dirty` for changes learned from peers. The gossip runtime clears both at the end of every round, so they hold only the changes since the last one (a round that finds every send slot still busy returns early and keeps them).
+A `DirtyRing` is a fixed-capacity ring buffer of "this cell just changed" entries. The cell store keeps two of them: `local_dirty` for changes whose origin is this node, and `forwarded_dirty` for changes learned from peers. The gossip runtime clears both at the end of every round, so they hold only the changes since the last one (a round that finds fewer free send slots than it has picks returns early and keeps them, so no pick misses them).
 
 #### The entry
 
@@ -601,7 +601,7 @@ There is no `pop` and no `drain`. The send path reads the ring non-destructively
 
 #### Overflow — bounded loss is fine
 
-Because the rings are cleared every round, overflow means more changes arrived between two rounds than a ring holds; the oldest entries are then dropped. The ring records the loss by bumping `overflow_seq` (a `u64` via `saturating_add`), but the entries themselves are gone, and on its own that would be a correctness bug. The CRDT compensates by composing the dirty rings with a third lane — the repair cursor (§7.2) — that rotates over every active cell so that whatever the rings lose, the repair sweep rediscovers. A rotation usually covers it, but not strictly: a frame cut by its pick's send-queue share drops repair cells after the cursor has already moved past them, so those wait for the next rotation.
+Because the rings are cleared every round, overflow means more changes arrived between two rounds than a ring holds; the oldest entries are then dropped. The ring records the loss by bumping `overflow_seq` (a `u64` via `saturating_add`), but the entries themselves are gone, and on its own that would be a correctness bug. The CRDT compensates by composing the dirty rings with a third lane — the repair cursor (§7.2) — that rotates over every active cell so that whatever the rings lose, the repair sweep rediscovers. When a frame is cut by its pick's send-queue share, the runtime moves the cursor back to the first repair cell it did not send, so the next heartbeat resumes there.
 
 The cell store emits a power-of-two rate-limited `tracing::warn!` from its `push_dirty` overflow path, naming the relevant capacity config key (`storage.local_dirty_capacity` or `storage.forwarded_dirty_capacity`, and the nginx directive) so that operators can see pressure without the log volume scaling with the overflow rate.
 
@@ -1190,7 +1190,7 @@ The `DirtyRing` type itself does not care which lane it is — both instances ar
 
 The dirty rings send each change once. If a ring overflows between two rounds, if every packet carrying a change to some node is lost, if a frame is cut by its send-queue share or by `max_cells`, or if the peer frontier wrongly prunes a change, the dirty lanes never offer that change again: the rings are cleared after every round.
 
-The repair cursor is the safety net, and the only resend path. It is a `u32` that rotates over `0..capacity` and, when asked, sweeps forward a slice and emits handles for any active slot it lands on. The runtime asks only on heartbeat rounds, and only for the frame of the round's first (random) pick, with a budget of `repair_cells` (`defaults::GOSSIP_REPAIR_CELLS_PER_TICK` = 256); threshold rounds carry no repair. The repair cells sit at the frame's tail, after the changes. The cursor only advances over slots it actually visited, so a partial sweep resumes where it left off on the next heartbeat. Over many heartbeats every active cell is therefore resent to some random peer once per full rotation, which is the convergence property dirty-only gossip cannot give you on its own.
+The repair cursor is the safety net, and the only resend path. It is a `u32` that rotates over `0..capacity` and, when asked, sweeps forward a slice and emits handles for any active slot it lands on. The runtime asks only on heartbeat rounds, and only for the frame of the round's first (random) pick, with a budget of `repair_cells` (`defaults::GOSSIP_REPAIR_CELLS_PER_TICK` = 256); threshold rounds carry no repair. The repair cells sit at the frame's tail, after the changes. The cursor only advances over slots it actually visited, so a partial sweep resumes where it left off on the next heartbeat; when the frame is cut by its pick's send-queue share, `resume_repair_at` moves the cursor back to the first repair cell that was not sent. Over many heartbeats every active cell is therefore resent to some random peer once per full rotation, which is the convergence property dirty-only gossip cannot give you on its own.
 
 There is no standalone repair entry point: `fill_gossip_frame` (§7.3) folds the sweep in as lane 3.
 
@@ -1558,6 +1558,7 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `fill_gossip_frame(max_cells, repair_cells, peer, out)` | Compose one pick's frame: local dirty + forwarded dirty (newest first, pruned by `peer_lacks` when `peer` is `Some`) + up to `repair_cells` of the repair slice (never pruned), deduped. Returns the number of changes. |
 | `peer_frontiers()`, `peer_frontiers_mut()` | Per-peer frontier access. |
 | `repair_cursor()` | Read the current cursor position. |
+| `resume_repair_at(handle)` | Move the cursor back to `handle`, the first repair cell of a cut frame, so the next sweep resends it. |
 
 ---
 

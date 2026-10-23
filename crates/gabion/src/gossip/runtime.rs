@@ -733,24 +733,11 @@ where
         self.store.expire_at(now_millis, &mut self.expiration_buf);
 
         // Nothing to send, or nobody to send it to: the changes are owed to
-        // no one, so drop them rather than let them pile up in the rings.
+        // no one, so settle the round rather than let them pile up in the
+        // rings and re-trigger threshold rounds on every request.
         if self.store.is_empty() || self.peers.is_empty() {
-            self.store.clear_dirty();
+            self.end_round(now_millis);
             return;
-        }
-        // Every send slot is still queued behind a blocked socket. Keep the
-        // changes for the next round.
-        if self.send_free.is_empty() {
-            return;
-        }
-
-        // A round with changes is a "dirty tick", so effective fanout
-        // reports `packets / dirty_ticks` rather than `packets / wall_ticks`.
-        // A quiet heartbeat still runs, but only to send the repair slice.
-        let dirty =
-            !self.store.local_dirty().is_empty() || !self.store.forwarded_dirty().is_empty();
-        if dirty {
-            self.dirty_ticks = self.dirty_ticks.saturating_add(1);
         }
 
         // Step 2: pick `fanout` distinct peers via a partial Fisher-Yates
@@ -780,10 +767,23 @@ where
         let n = self.peers.len();
         let coverage = ((n as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
         let pick_count = self.config.fanout.max(coverage).min(n);
-        // Record the coverage-fanout decision so observers can read the pick
-        // directly instead of reconstructing the formula: the fanout of the
-        // most recent round that sent changes.
-        if dirty {
+        // Too few free send slots for every pick to get one: a blocked socket
+        // is still draining an earlier round. Keep the changes for the next
+        // round rather than send them to only some of the picks, which would
+        // then never hear them. A pool smaller than the pick waits until it
+        // is wholly free.
+        if self.send_free.len() < pick_count.min(self.send_pool.len()) {
+            return;
+        }
+
+        // A round with changes is a "dirty tick", so effective fanout
+        // reports `packets / dirty_ticks` rather than `packets / wall_ticks`.
+        // A quiet heartbeat still runs, but only to send the repair slice.
+        // Record the coverage-fanout decision too, so observers can read the
+        // pick directly instead of reconstructing the formula: the fanout of
+        // the most recent round that sent changes.
+        if !self.store.local_dirty().is_empty() || !self.store.forwarded_dirty().is_empty() {
+            self.dirty_ticks = self.dirty_ticks.saturating_add(1);
             self.last_effective_fanout = pick_count;
             self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
         }
@@ -824,15 +824,20 @@ where
             }
             self.encode_packets_for(peer_addr, share, changes);
         }
+        self.end_round(now_millis);
+    }
+
+    /// Settle a round whose changes are sent or owed to no one.
+    fn end_round(&mut self, now_millis: u64) {
         // Each change goes out in one round, to this round's picks; the
         // peers that merge it forward it in theirs (infect-and-forward-once,
-        // the model behind the `⌈ln(n)+c⌉` fanout above). Keeping it dirty
-        // would resend it ahead of newer changes until its cell expired.
+        // the model behind the `⌈ln(n)+c⌉` fanout). Keeping it dirty would
+        // resend it ahead of newer changes until its cell expired.
         self.store.clear_dirty();
 
         // Reset per-rule pending. The sweep treats every rule with
         // non-zero pending as "touched in expectation by the tick" — the
-        // frames built above don't tell us which rule slots actually made
+        // round's frames don't tell us which rule slots actually made
         // it onto the wire, but mass conservation (Kempe, Dobra, Gehrke —
         // FOCS 2003) says every pending hit rode out in this round, to every
         // pick whose frame had room for it. A hit cut from a full frame or
@@ -899,8 +904,18 @@ where
                 }
             }
         }
-        let repair = self.frame_handles.len() - changes;
-        let unsent_changes = packets.abandon().saturating_sub(repair);
+        let unsent = packets.abandon();
+        if unsent == 0 {
+            return;
+        }
+        // The repair cells are the frame's tail, in cursor order. Resume the
+        // sweep at the first one not sent, so a cut slice goes out on the
+        // next heartbeat instead of waiting a whole rotation.
+        let first_unsent = self.frame_handles.len() - unsent;
+        if let Some(&handle) = self.frame_handles.get(first_unsent.max(changes)) {
+            self.store.resume_repair_at(handle);
+        }
+        let unsent_changes = changes.saturating_sub(first_unsent);
         if unsent_changes > 0 {
             self.note_frame_cut(dst, unsent_changes);
         }

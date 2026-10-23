@@ -1259,6 +1259,14 @@ impl<C: Count> CellStore<C> {
         self.repair_cursor = next_cursor;
     }
 
+    /// Move the repair cursor back to `handle`, the first repair cell of a
+    /// frame that was cut before it was sent, so the next sweep resends it
+    /// instead of leaving it for the next rotation.
+    pub fn resume_repair_at(&mut self, handle: CellHandle) {
+        debug_assert!(handle.index < self.capacity);
+        self.repair_cursor = handle.index;
+    }
+
     /// Convenience wrapper around [`Self::expire`] that derives the per-rule
     /// epoch and live-bucket arrays from the current wall-clock time and each
     /// rule's descriptor. Uses scratch storage allocated at construction time
