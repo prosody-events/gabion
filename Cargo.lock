@@ -987,6 +987,7 @@ name = "gabion"
 version = "0.3.2"
 dependencies = [
  "ahash",
+ "arrayvec",
  "async-stream",
  "bon",
  "criterion",

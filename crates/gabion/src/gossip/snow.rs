@@ -7,7 +7,7 @@
 //! * [`flight`] — bounded tables of broadcasts in flight and the round-trip
 //!   estimator behind the acknowledgement timeout.
 //!
-//! The runtime half lives in `runtime/snow.rs`. See "Design notes" in the
+//! The runtime half lives in `runtime/tree.rs`. See "Design notes" in the
 //! gabion README for how this follows the paper and where it adapts it.
 
 use crate::defaults;
@@ -21,7 +21,7 @@ mod tests;
 
 pub(super) use ctrl::{CTRL_MAX_LEN, Ctrl};
 pub(super) use flight::{MAX_CHILDREN, Origins, Relay, Relays, RttEstimator, full_mask};
-pub(super) use ring::{Child, Ring, tree_height};
+pub(super) use ring::{Child, Children, Ring, tree_height};
 
 /// The Snow tuning knobs, fixed at construction. Defaults are the paper's;
 /// see [`crate::defaults`] for the reasoning behind each.
