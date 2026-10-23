@@ -9,9 +9,9 @@ use crate::crdt::{
 };
 
 use super::{
-    DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_MORE, FrameLimits,
+    DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_EXT, FLAG_MORE, FrameLimits,
     HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch, decode_auth,
-    decode_auth_visit, decode_unauth, decode_unauth_visit,
+    decode_auth_visit, decode_unauth, decode_unauth_visit, encode_ext_only, reframe,
 };
 
 const MAX_ROWS: usize = 32;
@@ -618,7 +618,7 @@ fn budget_too_small_rejected_at_constructor() {
         max_cells: 4,
     };
     match Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits) {
-        Err(EncodeError::BudgetTooSmall) => {}
+        Err(err) => assert_eq!(err, EncodeError::BudgetTooSmall),
         Ok(_) => panic!("expected BudgetTooSmall"),
     }
 }
@@ -867,4 +867,160 @@ fn visitor_matches_allocating_for_curated_rows() {
         assert_eq!(cell.count, obs.counts[i]);
         assert_eq!(cell.last_update_millis, obs.last_update_millis[i]);
     }
+}
+
+fn one_cell_frame(key: Option<&HmacKey>) -> (PacketBuf, FrameLimits) {
+    let rows = [RawRow {
+        rule_fingerprint: 1,
+        key_hash: 2,
+        bucket: 3,
+        origin_node_id: 4,
+        origin_incarnation: 1,
+        count: 5,
+        last_update_millis: 6,
+    }];
+    let (store, handles) = seed_store::<u32>(&rows, |c| c);
+    let limits = FrameLimits::default();
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut packets = match key {
+        Some(key) => {
+            Packets::<u32>::auth(sample_header(), &store, &handles, key, &mut scratch, limits)
+        }
+        None => Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits),
+    }
+    .expect("ctor");
+    packets.next_into(&mut buf).expect("encode").expect("some");
+    drop(packets);
+    (buf, limits)
+}
+
+fn other_sender() -> Header {
+    Header {
+        sender_node_id: 0x77,
+        sender_incarnation: 9,
+        ..sample_header()
+    }
+}
+
+#[test]
+fn reframe_adds_extension_and_keeps_cells() {
+    for key in [None, Some(HmacKey([7; 32]))] {
+        let (frame, limits) = one_cell_frame(key.as_ref());
+        let mut out = PacketBuf::for_limits(limits);
+        let ext = [1_u8, 2, 3, 4, 5];
+        reframe(
+            frame.as_bytes(),
+            other_sender(),
+            &ext,
+            key.as_ref(),
+            limits,
+            &mut out,
+        )
+        .expect("reframe");
+
+        let mut cells = Vec::new();
+        let summary = match key.as_ref() {
+            Some(key) => {
+                decode_auth_visit::<u32>(out.as_bytes(), key, limits, |_| true, |c| cells.push(c))
+            }
+            None => decode_unauth_visit::<u32>(out.as_bytes(), limits, |_| true, |c| cells.push(c)),
+        }
+        .expect("decode");
+        assert_eq!(summary.ext, &ext);
+        assert_ne!(summary.flags & FLAG_EXT, 0);
+        assert_eq!(summary.header.sender_node_id, 0x77);
+        assert_eq!(summary.header.sender_incarnation, 9);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].count, 5);
+        assert_eq!(cells[0].key_hash, KeyHash(2));
+    }
+}
+
+#[test]
+fn reframe_replaces_and_removes_extensions() {
+    let (frame, limits) = one_cell_frame(None);
+    let mut with_ext = PacketBuf::for_limits(limits);
+    reframe(
+        frame.as_bytes(),
+        sample_header(),
+        &[9; 40],
+        None,
+        limits,
+        &mut with_ext,
+    )
+    .expect("add");
+    let mut replaced = PacketBuf::for_limits(limits);
+    reframe(
+        with_ext.as_bytes(),
+        sample_header(),
+        &[8; 3],
+        None,
+        limits,
+        &mut replaced,
+    )
+    .expect("replace");
+    let mut stripped = PacketBuf::for_limits(limits);
+    reframe(
+        replaced.as_bytes(),
+        sample_header(),
+        &[],
+        None,
+        limits,
+        &mut stripped,
+    )
+    .expect("strip");
+    assert_eq!(stripped.as_bytes(), frame.as_bytes());
+
+    let summary =
+        decode_unauth_visit::<u32>(replaced.as_bytes(), limits, |_| true, |_| {}).expect("decode");
+    assert_eq!(summary.ext, &[8; 3]);
+}
+
+#[test]
+fn ext_only_frames_carry_no_cells_and_authenticate() {
+    let key = HmacKey([3; 32]);
+    let limits = FrameLimits::default();
+    let mut out = PacketBuf::for_limits(limits);
+    encode_ext_only::<u32>(sample_header(), &[5; 12], Some(&key), limits, &mut out)
+        .expect("encode");
+    let summary = decode_auth_visit::<u32>(
+        out.as_bytes(),
+        &key,
+        limits,
+        |_| true,
+        |_| panic!("no cells"),
+    )
+    .expect("decode");
+    assert_eq!(summary.cell_count, 0);
+    assert_eq!(summary.ext, &[5; 12]);
+
+    let mut tampered = out.as_bytes().to_vec();
+    tampered[HEADER_LEN + 3] ^= 1;
+    let err = decode_auth_visit::<u32>(&tampered, &key, limits, |_| true, |_| {}).unwrap_err();
+    assert_eq!(err, DecodeError::AuthenticationFailed);
+}
+
+#[test]
+fn oversize_extension_is_refused() {
+    let limits = FrameLimits {
+        max_payload_bytes: HEADER_LEN + 8,
+        max_cells: 4,
+    };
+    let mut out = PacketBuf::for_limits(limits);
+    let err =
+        encode_ext_only::<u32>(sample_header(), &[0; 16], None, limits, &mut out).unwrap_err();
+    assert_eq!(err, EncodeError::PayloadTooLarge);
+}
+
+#[test]
+fn truncated_extension_is_rejected() {
+    let limits = FrameLimits::default();
+    let mut out = PacketBuf::for_limits(limits);
+    encode_ext_only::<u32>(sample_header(), &[5; 12], None, limits, &mut out).expect("encode");
+    // Claim a longer extension than the body holds.
+    let mut bytes = out.as_bytes().to_vec();
+    bytes[HEADER_LEN] = 200;
+    let err = decode_unauth_visit::<u32>(&bytes, limits, |_| true, |_| {}).unwrap_err();
+    assert_eq!(err, DecodeError::BodyLenMismatch);
 }

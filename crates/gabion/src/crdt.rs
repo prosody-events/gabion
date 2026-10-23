@@ -1173,6 +1173,34 @@ impl<C: Count> CellStore<C> {
         }
     }
 
+    /// Visit local dirty cells whose origin sequence is above `after`, oldest
+    /// first, passing each handle with its sequence. Sequences in the ring
+    /// ascend, so the scan starts at a binary-searched offset and costs
+    /// `O(log len + new entries)`. Entries superseded by a later update of the
+    /// same cell are skipped. `visit` returning `false` halts the scan.
+    pub fn visit_local_dirty_after(
+        &self,
+        after: u64,
+        mut visit: impl FnMut(CellHandle, u64) -> bool,
+    ) {
+        let len = self.local_dirty.len();
+        let (mut lo, mut hi) = (0, len);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if ring_entry_at(&self.local_dirty, mid).origin_sequence > after {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        for offset in lo..len {
+            let entry = ring_entry_at(&self.local_dirty, offset);
+            if self.dirty_entry_current(entry) && !visit(entry.handle, entry.origin_sequence) {
+                return;
+            }
+        }
+    }
+
     /// Visit dirty cells originating on other peers.
     ///
     /// Streams every current entry in the ring through `visit` with no

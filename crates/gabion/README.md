@@ -16,6 +16,7 @@ the [repo root README](../../README.md#glossary).
 
 ## Contents
 
+- [Design notes](#design-notes)
 - [Module map](#module-map)
 - [How gossip works](#how-gossip-works)
   - [The wire frame](#the-wire-frame)
@@ -26,6 +27,97 @@ the [repo root README](../../README.md#glossary).
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
 - [References](#references)
+
+## Design notes
+
+This branch replaces random-peer gossip with **Snow** broadcast trees (C. Tong,
+*Snow: Self-organizing Broadcast Protocol for Cloud*, arXiv 2504.02676). The
+sections below ("How gossip works", "Coverage fanout", "Dirty rings and the
+peer frontier", the operator knobs and the measurements) describe the random
+fanout design on `main` and do not apply here. This section is the reference
+for what the branch does.
+
+**Mechanism.** Every node keeps a sorted view of its membership (itself plus
+the peers discovery reported). A node that has local changes roots one
+broadcast per packet of cells. For root `r` the view is read rotated so that
+`r` sits at the midpoint. A node responsible for a range leaves itself out,
+splits the rest into the part before and the part after itself, divides each
+part into `k / 2` sub-ranges, and makes each sub-range's midpoint node a child
+that becomes responsible for the whole sub-range (at most `k` nodes left: they
+are all children and leaves). The packet to a child carries its range
+`[lo, hi)`; the receiver recomputes its own children inside that range from
+its own view, inserting a boundary node it has not discovered yet. Children are
+a pure function of (local view, root, carried range); no random peer is
+involved on the tree path. A leaf acknowledges its parent at once, an interior
+node only after all its children have, and the root rebroadcasts after the
+acknowledgement timeout to the children that have not answered. Code:
+`src/gossip/snow/` (child function, control codec, in-flight tables) and
+`src/gossip/runtime/tree.rs` (the runtime half).
+
+**Parameters** (`gabion::defaults`, documented there):
+
+| Parameter | Value | Where |
+| --- | --- | --- |
+| branching factor `k` | 4, clamped to 2..=16 | `GOSSIP_FANOUT`, `GossipConfig::fanout` |
+| acknowledgement timeout | 2 x expected tree round trip | `GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE` |
+| root rebroadcasts | 1 | `GOSSIP_ROOT_REBROADCASTS` |
+| tree height | `ceil(log_k((k-1)N) + 1)` | `snow::tree_height` |
+| repair pass | 64 cells per heartbeat to one random peer | `GOSSIP_REPAIR_CELLS_PER_TICK` |
+
+**Adaptations to the paper**, each the smallest that makes the design run in
+gabion:
+
+- *Addresses, not node ids, order the ring.* Discovery reports socket
+  addresses and a peer's node id is unknown until it speaks, so the ring is
+  sorted by `SocketAddr` and the carried bounds are addresses. A node's own
+  address is its transport's `local_addr`, so it must be the address peers
+  discover it under.
+- *Datagrams.* Acknowledgements are UDP datagrams, as everything else is. A
+  lost data packet or a lost ack looks the same to the root: no complete ack
+  before the timeout.
+- *Rebroadcast reaches below the first hop.* The root resends only to children
+  that did not answer. An interior node that receives a broadcast it already
+  holds either re-acknowledges (if it had completed) or pushes the cells again
+  to its own silent children. Without this a rebroadcast could not repair
+  anything below the root's children. No node resends on its own timer.
+- *Expected tree round trip is measured.* A node cannot know the network, so
+  the timeout is twice a smoothed (gain 1/8) measurement of the root's
+  broadcasts that completed without a rebroadcast, seeded with
+  `tree height x GOSSIP_TREE_INITIAL_HOP_RTT_MS` until the first completes.
+- *One broadcast is one packet*, so each carries its own sequence number and
+  acknowledgement. Only a node's own changes are broadcast: the root tracks a
+  watermark over its local dirty ring (`visit_local_dirty_after`) and cells it
+  receives are forwarded on receipt, not re-queued.
+- *Repair pass.* After the one rebroadcast the paper gives up. gabion keeps an
+  anti-entropy backstop for every design: once per heartbeat a rotating slice of
+  the cell store goes to one random peer. It is not on the tree path. It also
+  carries cells to a node that joined after they were broadcast. The Plumtree-
+  style lazy `IHAVE` backstop (`snow_lazy`) is not implemented.
+- *Wire.* `FLAG_EXT` marks a frame whose body begins with a length-prefixed
+  control extension (`wire::reframe`, `wire::encode_ext_only`): data
+  `[1][root][seq][lo][hi?]`, ack `[2][root][seq]`. Forwarding re-frames the
+  received cell bytes without decoding them. The extension is inside the HMAC.
+- *Scheduler unchanged.* Heartbeat and error-budget threshold rounds are
+  `main`'s; a round now roots broadcasts instead of picking peers. The
+  acknowledgement timer is a second `Clock::ticker`, polled only while a
+  broadcast awaits acknowledgements.
+- *`GossipConfig` gained no fields.* The frozen study harness builds the legacy
+  suite's `GossipConfig` literally, so `fanout` carries `k` and the other
+  knobs are `defaults` constants held in `TreeParams` (tests override them).
+
+**Bounded state** (I-4): the relay table holds `GOSSIP_TREE_RELAY_CAPACITY`
+(2048) entries and overwrites the oldest; the origin table holds
+`GOSSIP_TREE_ORIGIN_CAPACITY` (64) packets and displaces the oldest. Sequence
+numbers start from the node's seeded RNG so a restarted node does not collide
+with entries peers still hold. Randomness is only the repair peer pick and that
+seed.
+
+**Known limitations.** Views that disagree on the member count rotate the ring
+one position apart, so the node at the cut can fall out of a carried range
+(`a_root_with_a_stale_view_misses_at_most_the_node_at_the_rotation_cut`); the
+repair pass covers it. The admin snapshot reports peer `node_id` as `None`;
+`last_effective_fanout` is the root's child count. The WASM visualizer's manual
+clock never fires the acknowledgement timer.
 
 ## Module map
 
