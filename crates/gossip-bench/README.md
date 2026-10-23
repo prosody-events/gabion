@@ -349,6 +349,8 @@ burst keys), rule, and the virtual duration (warmup + measurement):
 | `low-3`, `low-5` | 3 / 5 | 10 req/s sites | 20 / 10 s, 1 s buckets | 20 + 60 s | hot keys at 1.5× and 3× |
 | `idle` | 80 | 1 req/s | 100 / 10 s | 20 + 60 s | protocol floor cost |
 | `churn-rollout` | 80 (90 at most mid-wave; 79 after the crash) | as `prod-typical` | as above | 20 + 90 s | 45-pod rollout from 30 s, one pod every 500 ms + `U(0, 1 s)`, 5 s overlap; silent crash at 75 s |
+| `hot-key` | 183 | 1,800 req/s sites | as above | 20 + 60 s | 20 hot keys, each offered 5x its limit (50 req/s) uniformly across nodes; no burst; stresses over-admission |
+| `az-partition` | 80 | 650 req/s sites | as above | 20 + 90 s | zone 0 isolated from the other two zones for 30 s from 40 s, then healed (data only: `churn.partitions`) |
 | `long-window` | 60 | 30 req/s | 2,000 / 1 h, 1 min buckets | 3,600 + 1,200 s | hot keys; 90 req/s burst for 60 s; first window warmed by real traffic |
 
 ### Solution contract
