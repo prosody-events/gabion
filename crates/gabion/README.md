@@ -25,6 +25,7 @@ the [repo root README](../../README.md#glossary).
   - [Dirty rings and the peer frontier](#dirty-rings-and-the-peer-frontier)
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
+- [Design notes](#design-notes)
 - [References](#references)
 
 ## Module map
@@ -545,6 +546,57 @@ sub-heartbeat through threshold fires, while the right panel shows the
 cold rule riding the proactive heartbeat. Cold-rule replication does
 not depend on the threshold ever firing, because heartbeat and
 threshold are independent code paths.
+
+## Design notes
+
+This branch replaces main's resend-until-acked frames with **flat
+infect-and-forward-once** dissemination (Kermarrec, Massoulié & Ganesh,
+IEEE TPDS 2003, doi:10.1109/TPDS.2003.1189583; anti-entropy repair after
+Demers et al., PODC 1987, doi:10.1145/41840.41841). The sections above
+still describe main's loop where they mention re-gossiping dirty cells
+until acked, the dirty-ring persistence and the per-peer frontier as a
+delivery mechanism; this section is authoritative for this branch.
+
+- **Round.** Each round (the shared scheduler is unchanged: a 500 ms
+  heartbeat plus error-budget threshold rounds, 5 ms floor) sends the
+  changes since the previous round, newest first, to `⌈ln n + c⌉`
+  distinct peers sampled without replacement, with `c = 3`
+  (`defaults::GOSSIP_COVERAGE_MARGIN`, as on main). The pick depends only
+  on the live peer count `n`, never on how many changes are pending.
+- **Forward once.** A node that merges a cell whose count rose puts it in
+  its forwarded dirty ring and sends it in its next round. Both dirty rings
+  are cleared at the end of every round, so a change is sent at most once
+  per node per change.
+- **Repair slice.** A heartbeat's first pick also carries up to
+  `defaults::GOSSIP_REPAIR_CELLS_PER_ROUND` = 256 cells of a rotating slice
+  over the live cells; threshold rounds carry none. The slice is the only
+  resend path.
+- **Frontier is a hint.** The peer frontier only lets the dirty lanes skip a
+  cell the peer's frontier says it holds. Remote cells are re-stamped with
+  the merging node's own sequence, so the hint can be wrong; the repair
+  slice never consults it, and convergence does not depend on it.
+
+Adaptations, each the minimal one:
+
+- **Send queue 128 to 512 slots** (`GOSSIP_SEND_QUEUE_CAPACITY`). One round
+  now queues every pick's whole frame at once, so the pool is sized for a
+  round at 300 peers. The pool's slot index widened from `u8` to `usize`
+  (a pool above 255 slots wrapped to an empty free list). Each pick gets an
+  even share of the free slots; a frame over its share loses its tail
+  (repair first, then the oldest changes) with a power-of-two rate-limited
+  warning. A round whose picks cannot all get a slot (a blocked socket still
+  draining) is deferred whole, keeping its changes.
+- **The repair slice size is a `defaults` constant, not a `GossipConfig`
+  field**, because the legacy scenario suite in `gossip-bench` builds
+  `GossipConfig` literally and that crate must stay untouched.
+- `GossipConfig::fanout` is only the floor under the coverage pick.
+  The harness's other `GossipConfig` fields are unchanged.
+- `PeerFrontierTable::last_sent` and the brute-force `lacks_indices` scan
+  were removed (unused). `visit_local_dirty`, `visit_forwarded_dirty` and
+  `visit_repair_slice` were folded into one `CellStore::fill_gossip_frame`.
+- Dirty-ring overflow keeps its cumulative `overflow_seq` across the
+  per-round clears so the power-of-two warnings stay spaced; the warning
+  text names the new cause.
 
 ## References
 

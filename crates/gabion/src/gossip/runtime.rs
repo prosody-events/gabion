@@ -1,7 +1,8 @@
 //! Single-threaded gossip event loop.
 //!
 //! One `tokio::select!` drives five arms — limit/shutdown requests, inbound
-//! UDP, outbound writable, peer membership churn, gossip tick. After each
+//! UDP, outbound writable, peer membership churn, gossip tick — plus an admin
+//! arm when an admin channel is wired. After each
 //! iteration the runtime calls [`AggregateStore::apply`] once with whatever
 //! rows the arm produced. The runtime owns the [`CellStore`], pre-allocated
 //! scratch buffers, the outbound send pool, and the peer table; nothing in
@@ -110,8 +111,8 @@ where
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
-    send_pending: VecDeque<(SocketAddr, u8)>,
-    send_free: Vec<u8>,
+    send_pending: VecDeque<(SocketAddr, usize)>,
+    send_free: Vec<usize>,
 
     peers: Vec<Peer>,
     rng: SplitMix64,
@@ -126,6 +127,10 @@ where
     // decode-failure `warn!` to power-of-two transitions so a peer stuck on
     // the wrong version / cluster secret can't flood the log.
     decode_reject_count: u64,
+
+    // Cumulative count of frames cut short by a full send-queue share;
+    // rate-limits the warning the same way.
+    cut_frames: u64,
 
     // High-water mark of `send_pending.len()`. Strictly observability — the
     // `WouldBlock` re-queue path in `drain_one_send` is otherwise invisible
@@ -149,7 +154,7 @@ where
     // Set by `handle_limit_request` when the rule's per-site error budget
     // would be exceeded by the new hit and the `min_emit_interval` floor
     // has elapsed. Read at the top of the run loop, which then skips the
-    // `tokio::select!` wait and dispatches a synthetic `Tick` outcome.
+    // `tokio::select!` wait and dispatches a `Tick(Round::Threshold)`.
     want_immediate_flush: bool,
 
     // Observability counters surfaced through `AdminSnapshot`. None of
@@ -163,7 +168,7 @@ where
     dirty_ticks: u64,
     // The adaptive-decision outputs, so observers can *see* the runtime
     // react rather than infer it. `last_effective_fanout` is the
-    // `pick_count` the most recent dirty tick chose (the coverage fanout
+    // `pick_count` the most recent dirty tick (a round with changes) chose (the coverage fanout
     // `⌈ln(n)+c⌉`, scaled by cluster size n, not the dirty set);
     // `peak_effective_fanout` is its high-water mark since startup.
     // `last_error_budget` is the per-rule
@@ -267,7 +272,7 @@ where
         let send_pool: Vec<PacketBuf> = (0..send_pool_size)
             .map(|_| PacketBuf::for_limits(config.wire_limits))
             .collect();
-        let send_free: Vec<u8> = (0..send_pool_size as u8).rev().collect();
+        let send_free: Vec<usize> = (0..send_pool_size).rev().collect();
         let send_pending = VecDeque::with_capacity(send_pool_size);
 
         let peers: Vec<Peer> = config
@@ -308,6 +313,7 @@ where
             rng,
             pending_reply: None,
             decode_reject_count: 0,
+            cut_frames: 0,
             max_send_pending_depth: 0,
             rule_pending,
             rule_last_emit_ms,
@@ -368,7 +374,7 @@ where
                 // between threshold fires and heartbeat fires.
                 self.want_immediate_flush = false;
                 self.threshold_fires = self.threshold_fires.saturating_add(1);
-                ArmOutcome::Tick
+                ArmOutcome::Tick(Round::Threshold)
             } else {
                 // Split-borrow scope: we hand the I/O futures non-overlapping
                 // pieces of `self` so they compose inside `select!`.
@@ -388,7 +394,7 @@ where
                     _ = transport.writable(), if have_send => ArmOutcome::Writable,
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
                     cmd = recv_admin(admin_rx), if watch_admin => ArmOutcome::Admin(cmd),
-                    _ = tick.tick() => ArmOutcome::Tick,
+                    _ = tick.tick() => ArmOutcome::Tick(Round::Heartbeat),
                 }
             };
 
@@ -404,7 +410,7 @@ where
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
                 ArmOutcome::Admin(None) => self.admin_rx = None,
-                ArmOutcome::Tick => self.handle_gossip_tick(),
+                ArmOutcome::Tick(round) => self.handle_gossip_tick(round),
             }
 
             // One apply per iteration covering both row sources. CRDT-free
@@ -439,8 +445,8 @@ where
         // budget: ε_R = max(1, L × target_err_bps / (10_000 × N)). Total
         // cluster-wide unreplicated error per rule is bounded by N × ε_R.
         // `saturating_add` keeps the column monotone across the gap between
-        // crossing and reset; the post-emit sweep in `handle_gossip_tick`
-        // zeroes the slot once a frame is queued.
+        // crossing and reset; the sweep at the end of each gossip round in
+        // `handle_gossip_tick` zeroes it.
         //
         // Falls through silently when the rule isn't interned yet (first
         // hit for that fingerprint) — the next heartbeat picks it up.
@@ -592,7 +598,7 @@ where
         let Some((dst, slot)) = self.send_pending.pop_front() else {
             return Ok(());
         };
-        let buf = &self.send_pool[slot as usize];
+        let buf = &self.send_pool[slot];
         match self.transport.try_send_to(buf.as_bytes(), dst) {
             Ok(_) => self.send_free.push(slot),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -715,7 +721,7 @@ where
         }
     }
 
-    fn handle_gossip_tick(&mut self) {
+    fn handle_gossip_tick(&mut self, round: Round) {
         // Step 0: bump the total-ticks counter. Tracked unconditionally
         // (even for empty / no-peer ticks) so the bench can split the
         // run's wall time into heartbeat ticks vs threshold fires.
@@ -726,16 +732,13 @@ where
         self.expiration_buf.clear();
         self.store.expire_at(now_millis, &mut self.expiration_buf);
 
-        if self.store.is_empty() || self.peers.is_empty() || self.send_free.is_empty() {
+        // Nothing to send, or nobody to send it to: the changes are owed to
+        // no one, so settle the round rather than let them pile up in the
+        // rings and re-trigger threshold rounds on every request.
+        if self.store.is_empty() || self.peers.is_empty() {
+            self.end_round(now_millis);
             return;
         }
-
-        // The store was non-empty when this tick fired — bench harness
-        // counts this as a "dirty tick" so effective-fanout reports
-        // `packets / dirty_ticks` rather than `packets / wall_ticks`.
-        // Bumped before the peer-pick math runs so synthetic threshold
-        // ticks (which by construction have local_dirty>0) always count.
-        self.dirty_ticks = self.dirty_ticks.saturating_add(1);
 
         // Step 2: pick `fanout` distinct peers via a partial Fisher-Yates
         // shuffle of `self.peers` in place. With-replacement sampling would
@@ -745,16 +748,18 @@ where
         // contract elsewhere (lookups are by `addr`), so shuffling is free.
         //
         // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
-        // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`
-        // reaches *every* node with probability → e^(−e^(−c)) — "there is a
+        // Theorem 1): spreading a message by infect-and-forward-once (each
+        // node forwards it once, to `fanout` random peers) with mean fanout
+        // `ln(n) + c` reaches *every* node with probability → e^(−e^(−c)),
+        // which is how each change travels here — "there is a
         // sharp threshold in the required fanout at log n." Fanout is
         // governed by cluster size `n`, not data volume: KMG note the
         // fanout need only grow by 1 each time `n` rises by a factor of e,
         // and that a round "can easily be modified … to send several
-        // notifications per gossip message." Gabion already packs the whole
-        // dirty set into one fat frame (`max_cells_per_tick` + packet
-        // splitting), so a burst rides along without widening fanout — the
-        // dirty-set size drives frame fill, not the peer pick. `config.fanout`
+        // notifications per gossip message." Gabion packs the round's changes
+        // into one frame per pick (`max_cells_per_tick` + packet splitting),
+        // so a burst rides along without widening fanout — the number of
+        // changes drives frame fill, not the peer pick. `config.fanout`
         // is the floor; `.min(n)` makes small clusters full-mesh (at small n
         // coverage demands it and the bandwidth is trivial). The early return
         // above guarantees n ≥ 1, so `ln` is never called on 0 and `.min(n)`
@@ -762,70 +767,112 @@ where
         let n = self.peers.len();
         let coverage = ((n as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
         let pick_count = self.config.fanout.max(coverage).min(n);
-        // Record the coverage-fanout decision so observers can read the pick
-        // directly instead of reconstructing the formula. Only dirty ticks
-        // reach here, so `last_effective_fanout` is the fanout of the most
-        // recent tick that actually gossiped.
-        self.last_effective_fanout = pick_count;
-        self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
+        // Too few free send slots for every pick to get one: a blocked socket
+        // is still draining an earlier round. Keep the changes for the next
+        // round rather than send them to only some of the picks, which would
+        // then never hear them. A pool smaller than the pick waits until it
+        // is wholly free.
+        if self.send_free.len() < pick_count.min(self.send_pool.len()) {
+            // Keep the pending hits too, but restart the emit floor, so a
+            // blocked socket does not turn every later request into another
+            // round that cannot send.
+            self.stamp_emits(now_millis);
+            return;
+        }
+
         for i in 0..pick_count {
             let j = i + (self.rng.next_u64() as usize) % (n - i);
             self.peers.swap(i, j);
         }
 
+        // Anti-entropy with one random partner per heartbeat (Demers et al.,
+        // PODC 1987): the shuffle above makes the first pick random, so it
+        // alone carries the repair slice. The changes go to every pick.
+        let mut sent_changes = false;
+        let mut repair_cells = match round {
+            Round::Heartbeat => crate::defaults::GOSSIP_REPAIR_CELLS_PER_ROUND,
+            Round::Threshold => 0,
+        };
         for peer_idx in 0..pick_count {
+            // An even share of the free send slots, so one large frame cannot
+            // take the whole pool and leave later picks with nothing. A frame
+            // over its share loses its tail: repair, then the oldest changes.
             if self.send_free.is_empty() {
                 break;
             }
+            let share = (self.send_free.len() / (pick_count - peer_idx)).max(1);
             let peer_addr = self.peers[peer_idx].addr;
-            // `handle_inbound` writes `node_id` and `peer_slot` together —
-            // when one is `Some`, the other is too. So a single read of
-            // `peer_slot` is the full pruning decision.
+            // `handle_inbound` writes `node_id` and `peer_slot` together, so
+            // `peer_slot` alone decides pruning. `None` (not heard from yet)
+            // sends an unpruned frame; the peer's next inbound caches it.
             let peer_slot = self.peers[peer_idx].peer_slot;
-
-            self.frame_handles.clear();
-            match peer_slot {
-                Some(slot) => {
-                    self.store.fill_gossip_frame_for_peer(
-                        self.config.max_cells_per_tick,
-                        slot,
-                        &mut self.frame_handles,
-                    );
-                }
-                None => {
-                    // Bootstrap fallback: we haven't heard from this peer
-                    // yet, so we don't know what to prune. Send an unpruned
-                    // frame; the next inbound from them caches the slot.
-                    self.store
-                        .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
-                }
-            }
+            let changes = self.store.fill_gossip_frame(
+                self.config.max_cells_per_tick,
+                repair_cells,
+                peer_slot,
+                &mut self.frame_handles,
+            );
+            repair_cells = 0;
             if self.frame_handles.is_empty() {
                 continue;
             }
-            self.encode_packets_for(peer_addr);
+            sent_changes |= changes > 0;
+            self.encode_packets_for(peer_addr, share, changes);
         }
+        // A round that carried changes is a "dirty tick", so effective fanout
+        // reports `packets / dirty_ticks` rather than `packets / wall_ticks`;
+        // a quiet heartbeat sends only the repair slice. Record the pick too,
+        // so observers can read the coverage fanout of the most recent round
+        // that sent changes instead of reconstructing the formula.
+        if sent_changes {
+            self.dirty_ticks = self.dirty_ticks.saturating_add(1);
+            self.last_effective_fanout = pick_count;
+            self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
+        }
+        self.end_round(now_millis);
+    }
+
+    /// Settle a round whose changes are sent or owed to no one.
+    fn end_round(&mut self, now_millis: u64) {
+        // Each change goes out in one round, to this round's picks; the
+        // peers that merge it forward it in theirs (infect-and-forward-once,
+        // the model behind the `⌈ln(n)+c⌉` fanout). Keeping it dirty would
+        // resend it ahead of newer changes until its cell expired.
+        self.store.clear_dirty();
 
         // Reset per-rule pending. The sweep treats every rule with
         // non-zero pending as "touched in expectation by the tick" — the
-        // dirty-ring drain in `fill_gossip_frame*` doesn't tell us which
-        // rule slots actually made it onto the wire, but mass conservation
-        // (Kempe, Dobra, Gehrke — FOCS 2003) says every pending hit either
-        // rode out in this frame or sits in the dirty ring awaiting the
-        // next one. Under UDP loss the residual is repaired by the next
-        // round; the N × ε_R bound holds in expectation. A strict bound
+        // round's frames don't tell us which rule slots actually made
+        // it onto the wire, but mass conservation (Kempe, Dobra, Gehrke —
+        // FOCS 2003) says every pending hit rode out in this round, to every
+        // pick whose frame had room for it. A hit cut from a full frame or
+        // lost on the wire still reaches the rest through the picks that
+        // forward it, and the repair lane backs that up; the N × ε_R bound
+        // holds in expectation. A strict bound
         // would require ack-aware reset against `peer_frontiers`,
         // deferred until measurements show drift.
+        self.stamp_emits(now_millis);
+        self.rule_pending.fill(0);
+    }
+
+    /// Restart the emit floor for every rule with pending hits.
+    fn stamp_emits(&mut self, now_millis: u64) {
         let stamp = now_millis.max(1);
-        for slot in 0..self.rule_pending.len() {
-            if self.rule_pending[slot] != 0 {
-                self.rule_pending[slot] = 0;
-                self.rule_last_emit_ms[slot] = stamp;
+        for (pending, last_emit) in self
+            .rule_pending
+            .iter()
+            .zip(self.rule_last_emit_ms.iter_mut())
+        {
+            if *pending != 0 {
+                *last_emit = stamp;
             }
         }
     }
 
-    fn encode_packets_for(&mut self, dst: SocketAddr) {
+    /// Encode the frame into at most `max_packets` send slots. The frame's
+    /// first `changes` handles are changes and the rest repair, so a cut
+    /// trims repair first; only a cut into the changes is worth a warning.
+    fn encode_packets_for(&mut self, dst: SocketAddr, max_packets: usize, changes: usize) {
         let header = wire::Header {
             cluster_id_hash: self.config.cluster_id_hash,
             sender_node_id: self.store.local_identity().node_id.0,
@@ -838,7 +885,7 @@ where
             flags: 0,
         };
 
-        let packets_result = match self.config.auth_key.as_ref() {
+        let Ok(mut packets) = (match self.config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
                 header,
                 &self.store,
@@ -854,14 +901,15 @@ where
                 &mut self.scratch,
                 self.config.wire_limits,
             ),
-        };
-        let mut packets = match packets_result {
-            Ok(p) => p,
-            Err(_) => return,
+        }) else {
+            return;
         };
 
-        while let Some(slot) = self.send_free.pop() {
-            let buf = &mut self.send_pool[slot as usize];
+        for _ in 0..max_packets {
+            let Some(slot) = self.send_free.pop() else {
+                break;
+            };
+            let buf = &mut self.send_pool[slot];
             match packets.next_into(buf) {
                 Ok(Some(_)) => self.send_pending.push_back((dst, slot)),
                 Ok(None) => {
@@ -869,12 +917,51 @@ where
                     break;
                 }
                 Err(_) => {
+                    // `Packets::new` checked that the payload fits a cell, so
+                    // the encoder cannot run short mid-frame; this is not a
+                    // send-queue cut and must not be reported as one.
+                    debug_assert!(false, "gossip packet encoding failed mid-frame");
                     self.send_free.push(slot);
-                    break;
+                    packets.abandon();
+                    return;
                 }
             }
         }
-        drop(packets);
+        let unsent = packets.abandon();
+        if unsent == 0 {
+            return;
+        }
+        // The repair cells are the frame's tail, in cursor order. Resume the
+        // sweep at the first one not sent, so a cut slice goes out on the
+        // next heartbeat instead of waiting a whole rotation.
+        let first_unsent = self.frame_handles.len() - unsent;
+        if let Some(&handle) = self.frame_handles.get(first_unsent.max(changes)) {
+            self.store.resume_repair_at(handle);
+        }
+        let unsent_changes = changes.saturating_sub(first_unsent);
+        if unsent_changes > 0 {
+            self.note_frame_cut(dst, unsent_changes);
+        }
+    }
+
+    fn note_frame_cut(&mut self, peer: SocketAddr, unsent_changes: usize) {
+        self.cut_frames = self.cut_frames.saturating_add(1);
+        if self.cut_frames.is_power_of_two() {
+            tracing::warn!(
+                %peer,
+                unsent_changes,
+                cut_frames_total = self.cut_frames,
+                send_queue_capacity = self.send_pool.len(),
+                "A gossip round had more changes than this peer's share of \
+                 the send queue could carry, so its oldest changes were not \
+                 sent to this peer this round. The peers that did get them \
+                 forward them, and the repair lane resends what is still \
+                 missing, so counts converge late rather than never. Usually \
+                 a burst of new keys; if it keeps happening, raise \
+                 `gossip.send_queue_capacity` (nginx: \
+                 `gabion_gossip_send_queue_capacity`).",
+            );
+        }
     }
 }
 
@@ -884,7 +971,16 @@ enum ArmOutcome {
     Writable,
     PeerEvent(Option<PeerEvent>),
     Admin(Option<AdminCommand>),
-    Tick,
+    Tick(Round),
+}
+
+/// What started a gossip round. Both send the changes since the last round;
+/// only the heartbeat carries a repair slice, so a burst of threshold fires
+/// cannot multiply repair traffic.
+#[derive(Clone, Copy)]
+enum Round {
+    Heartbeat,
+    Threshold,
 }
 
 /// Read one admin command. Only invoked when `admin_rx.is_some()` — the

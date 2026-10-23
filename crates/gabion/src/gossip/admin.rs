@@ -59,11 +59,12 @@ pub struct AdminSnapshot {
     /// and `min_emit_interval` had elapsed, so the run loop dispatched
     /// a synthetic tick without waiting for the heartbeat.
     pub threshold_fires: u64,
-    /// Cumulative ticks (heartbeat + threshold) during which at least
-    /// one cell was dirty when `handle_gossip_tick` entered the peer
-    /// pick. Used by the bench to compute *effective fanout*
-    /// (`packets_emitted / dirty_ticks`) — see
-    /// `crates/gossip-bench/README.md`.
+    /// Cumulative rounds (heartbeat + threshold) whose frames carried at
+    /// least one change. Used by the bench to compute *effective fanout*
+    /// (`packets_emitted / dirty_ticks`). The packet count also includes the
+    /// repair slices quiet heartbeats send, so that ratio overstates the pick
+    /// when traffic is light; read `peak_effective_fanout` for the pick
+    /// itself.
     pub dirty_ticks: u64,
     /// The coverage fanout the most recent dirty tick chose:
     /// `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`, where `c` is

@@ -692,8 +692,8 @@ fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
         "cell_capacity {} under the cross-node working set",
         caps.cell_capacity,
     );
-    // The forwarded-dirty ring carries replicas of every *other* origin's live
-    // buckets — the cap the design analysis pins.
+    // One round can merge every *other* origin's live buckets (a node's first
+    // sync), so the forwarded-dirty ring must hold that many changes.
     assert!(
         caps.forwarded_dirty_capacity >= (MAX_NODES - 1) * LIVE_BUCKETS as usize,
         "forwarded_dirty_capacity {} under the replica working set",
