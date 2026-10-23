@@ -1465,6 +1465,101 @@ async fn acks_aggregate_bottom_up_and_the_root_retries_once() {
         .await;
 }
 
+/// A repeat of a broadcast is pushed on to the silent children only when it
+/// comes from the node that first handed it over. A node that names an
+/// ancestor as its child (views disagree) must not set the packet circling.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_repeat_from_anyone_but_the_parent_is_not_forwarded() {
+    use crate::gossip::GossipTransport;
+    use crate::gossip::snow::{CTRL_MAX_LEN, Child, Ctrl, Ring};
+    use crate::wire::{FrameLimits, Header, PacketBuf, encode_ext_only};
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let (x, root, parent, stranger) =
+                (sock(43_000), sock(43_001), sock(43_002), sock(43_003));
+            let others = [sock(43_004), sock(43_005), sock(43_006)];
+            let members: Vec<SocketAddr> = [x, root, parent, stranger]
+                .into_iter()
+                .chain(others)
+                .collect();
+
+            // The range the parent hands X: everything from the first of
+            // `others` on. Work out X's children the way X will.
+            let (lo, hi) = (others[0], None);
+            let mut view = Ring::new(x, members.len());
+            members.iter().for_each(|m| _ = view.insert(*m));
+            let mut children: Vec<Child> = Vec::new();
+            view.children(root, lo, hi, 2, &mut children);
+            assert!(!children.is_empty());
+
+            let sinks: Vec<_> = members[1..].iter().map(|a| router.bind(*a)).collect();
+            let identity = NodeIdentity::new(NodeId(0x7000), 1);
+            let peers = members[1..].to_vec();
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(x),
+                TokioClock::from_millis(0),
+                sim_config(identity, peers, 1),
+                store_for(identity),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            let rt = rt.with_tree_params(|p| {
+                p.branching = 2;
+                p.repair_cells_per_tick = 0;
+            });
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+            let limits = FrameLimits::default();
+            let header = Header {
+                cluster_id_hash: 0xC1,
+                ..Header::default()
+            };
+            let mut ext = [0; CTRL_MAX_LEN];
+            let ext = Ctrl::Data {
+                root,
+                seq: 7,
+                lo,
+                hi,
+            }
+            .encode(&mut ext);
+            let mut frame = PacketBuf::for_limits(limits);
+            encode_ext_only::<u32>(header, ext, None, limits, &mut frame).unwrap();
+            let send_from = |who: SocketAddr| {
+                let index = members.iter().position(|m| *m == who).unwrap() - 1;
+                sinks[index].try_send_to(frame.as_bytes(), x).unwrap();
+            };
+            let forwarded =
+                || -> u64 { children.iter().map(|c| router.received_count(c.addr)).sum() };
+
+            send_from(parent);
+            sim_advance_ticks(Duration::from_millis(1), 3).await;
+            let first = forwarded();
+            assert_eq!(
+                first,
+                children.len() as u64,
+                "the first copy goes to every child"
+            );
+
+            send_from(stranger);
+            sim_advance_ticks(Duration::from_millis(1), 3).await;
+            assert_eq!(forwarded(), first, "a repeat from a stranger is dropped");
+
+            send_from(parent);
+            sim_advance_ticks(Duration::from_millis(1), 3).await;
+            assert_eq!(
+                forwarded(),
+                2 * first,
+                "a repeat from the parent is pushed on"
+            );
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
+        })
+        .await;
+}
+
 /// A root fans out to `min(k, peers)` children: the tree's width, not the
 /// cluster's size.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
