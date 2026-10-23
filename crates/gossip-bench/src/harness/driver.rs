@@ -20,6 +20,7 @@ use super::report::{
     ChurnReport, ConvergenceReport, Dist, Health, KeyAccuracy, NetworkReport, SCHEMA, SimStats,
     StalenessReport, StudyResult, TrafficCounts, TrafficReport, Windows,
 };
+use super::warnings::{NO_NODE, Warnings};
 use super::workload::KeyProcess;
 use super::world::{Event, Tasks, World, peer_event};
 
@@ -40,6 +41,10 @@ struct NodeHandle {
 /// Health counters reported by one node's latest admin snapshot.
 #[derive(Clone, Copy, Default)]
 struct NodeHealth {
+    /// A snapshot was requested from this node.
+    asked: bool,
+    /// The node answered at least one snapshot.
+    answered: bool,
     cell_store_full_rejects: u64,
     rule_dictionary_full_rejects: u64,
     node_dictionary_full_rejects: u64,
@@ -70,6 +75,7 @@ pub struct Driver<'r, F, L> {
     node_health: Vec<NodeHealth>,
     health: Health,
     touched: Vec<(u32, BucketEpoch)>,
+    warnings: Warnings,
     events: u64,
     polls: u64,
 }
@@ -117,6 +123,7 @@ where
                 ..Health::default()
             },
             touched: Vec::new(),
+            warnings: Warnings::new(),
             events: 0,
             polls: 0,
             keys,
@@ -124,7 +131,13 @@ where
         }
     }
 
-    pub fn run(mut self) -> Result<StudyResult> {
+    /// Run to the end with gabion's warnings captured into the result.
+    pub fn run(self) -> Result<StudyResult> {
+        let warnings = self.warnings.clone();
+        tracing::subscriber::with_default(warnings.subscriber(), move || self.simulate())
+    }
+
+    fn simulate(mut self) -> Result<StudyResult> {
         self.schedule_initial();
         loop {
             self.drain_ready();
@@ -218,7 +231,10 @@ where
     fn drain_ready(&mut self) {
         while let Some(v) = self.tasks.next_ready() {
             self.polls += 1;
-            if let Some(exit) = self.tasks.poll(v) {
+            self.warnings.set_node(v);
+            let exit = self.tasks.poll(v);
+            self.warnings.set_node(NO_NODE);
+            if let Some(exit) = exit {
                 self.health.runtime_exits += 1;
                 if self.health.runtime_exit_errors.len() < 8 {
                     self.health.runtime_exit_errors.push(match exit {
@@ -258,7 +274,10 @@ where
 
     fn start(&mut self, v: usize) -> Result<()> {
         let now = self.world.now_ns();
-        let launched = (self.launch)(v)?;
+        self.warnings.set_node(v);
+        let launched = (self.launch)(v);
+        self.warnings.set_node(NO_NODE);
+        let launched = launched?;
         self.tasks.spawn(v, launched.future);
         self.handles[v] = Some(NodeHandle {
             client: launched.client,
@@ -300,16 +319,19 @@ where
         let Some(handle) = self.handles[v].as_ref() else {
             return;
         };
+        self.node_health[v].asked = true;
         let (reply, mut rx) = oneshot::channel();
         if handle
             .admin
             .try_send(AdminCommand::Snapshot { reply })
             .is_err()
         {
+            self.health.snapshot_failures += 1;
             return;
         }
         self.drain_ready();
         let Ok(snapshot) = rx.try_recv() else {
+            self.health.snapshot_failures += 1;
             return;
         };
         let stats = snapshot.store_stats;
@@ -319,6 +341,8 @@ where
             .max_send_pending_depth
             .max(snapshot.max_send_pending_depth);
         self.node_health[v] = NodeHealth {
+            asked: true,
+            answered: true,
             cell_store_full_rejects: stats.cell_store_full_rejects,
             rule_dictionary_full_rejects: stats.rule_dictionary_full_rejects,
             node_dictionary_full_rejects: stats.node_dictionary_full_rejects,
@@ -403,10 +427,13 @@ where
             self.health.rule_dictionary_full_rejects += h.rule_dictionary_full_rejects;
             self.health.node_dictionary_full_rejects += h.node_dictionary_full_rejects;
             self.health.decode_rejects += h.decode_rejects;
+            self.health.nodes_never_snapshotted += u64::from(h.asked && !h.answered);
         }
+        self.health.gabion_warnings = self.warnings.report();
         let net = self.world.net.borrow();
         self.health.oversize_packets = net.run.oversize_packets;
         let invalid_reasons = self.health.invalid_reasons();
+        let flags = self.health.flags();
 
         let measure_s = (end - self.measure_from_ns) as f64 / 1e9;
         let node_seconds_measure = self.plan.node_seconds(self.measure_from_ns, end);
@@ -463,7 +490,7 @@ where
         };
         let convergence = ConvergenceReport::new(
             std::mem::take(&mut self.oracle.convergence_ns),
-            self.oracle.never_converged,
+            &self.oracle.censored_ns,
             self.oracle.pending(),
         );
         let churn = ChurnReport::new(std::mem::take(&mut self.oracle.finished_joiners));
@@ -474,6 +501,7 @@ where
             seed: self.seed,
             valid: invalid_reasons.is_empty(),
             invalid_reasons,
+            flags,
             regime: self.regime.clone(),
             sizing: self.sizing,
             windows: Windows {

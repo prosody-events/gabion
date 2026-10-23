@@ -8,8 +8,9 @@ use super::net::NetCounters;
 use super::node::{KeyKind, Sizing};
 use super::oracle::{Joiner, WeightedHist, WindowSamples};
 use super::regime::Regime;
+use super::warnings::WarningReport;
 
-pub const SCHEMA: &str = "gabion-study/1";
+pub const SCHEMA: &str = "gabion-study/2";
 
 #[derive(Debug, Serialize)]
 pub struct StudyResult {
@@ -19,6 +20,10 @@ pub struct StudyResult {
     /// `false` when a health invariant failed; the judge discards the run.
     pub valid: bool,
     pub invalid_reasons: Vec<String>,
+    /// Saturation the solution reported without failing an invariant (for
+    /// example dirty-ring overflow). The run stays valid; the judge shows
+    /// these next to its numbers.
+    pub flags: Vec<String>,
     pub regime: Regime,
     pub sizing: Sizing,
     pub windows: Windows,
@@ -72,13 +77,22 @@ pub struct NetworkReport {
     pub run_bytes_per_node_per_s: f64,
 }
 
-/// Distribution summary. `weight` is seconds of (node, key) exposure for
-/// time-weighted distributions and a sample count otherwise. `*_pct_limit`
-/// express the value as a percentage of the rule's limit.
+/// Distribution summary of a signed error `truth − view`. `weight` is
+/// seconds of (node, key) exposure for time-weighted distributions and a
+/// sample count otherwise. `*_pct_limit` express the value as a percentage
+/// of the rule's limit. `mean` is signed; `under_mean` and `over_mean`
+/// average the under-count `max(0, error)` and the over-count
+/// `max(0, −error)` separately, so an over-counting solution cannot offset
+/// its under-count. `over_time_fraction` is the share of weight with an
+/// over-count.
 #[derive(Debug, Default, Serialize)]
 pub struct Dist {
     pub weight: f64,
     pub mean: Option<f64>,
+    pub under_mean: Option<f64>,
+    pub over_mean: Option<f64>,
+    pub over_max: Option<f64>,
+    pub over_time_fraction: Option<f64>,
     pub p50: Option<f64>,
     pub p99: Option<f64>,
     pub max: Option<f64>,
@@ -97,6 +111,10 @@ impl Dist {
         Self {
             weight: hist.total() as f64 / 1e9,
             mean,
+            under_mean: hist.mean_by(|v| v.max(0)),
+            over_mean: hist.mean_by(|v| (-v).max(0)),
+            over_max: hist.min().map(|v| (-v).max(0) as f64),
+            over_time_fraction: hist.fraction(|v| v < 0),
             p50: hist.quantile(0.5).map(|v| v as f64),
             p99,
             max,
@@ -126,6 +144,13 @@ pub struct StalenessReport {
     pub residual_sampled: Dist,
 }
 
+/// Convergence latencies of tracked admitted hits. `mean_ms`..`max_ms`
+/// cover converged hits only and are therefore right-censored: read them
+/// with `never_fraction`. The `*_incl_never_ms` figures rank every hit,
+/// valuing a never-converged hit at the time from its admission until its
+/// bucket left the window: a lower bound on its latency, so they are lower
+/// bounds too, but comparable across solutions with different
+/// never-converged fractions.
 #[derive(Debug, Serialize)]
 pub struct ConvergenceReport {
     pub converged: u64,
@@ -138,32 +163,48 @@ pub struct ConvergenceReport {
     pub p50_ms: Option<f64>,
     pub p99_ms: Option<f64>,
     pub max_ms: Option<f64>,
+    pub mean_incl_never_ms: Option<f64>,
+    pub p50_incl_never_ms: Option<f64>,
+    pub p99_incl_never_ms: Option<f64>,
+}
+
+/// `(mean, p50, p99)` in milliseconds of nanosecond samples, sorted.
+fn ms_summary(sorted_ns: &[u64]) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let rank = |q: f64| {
+        (!sorted_ns.is_empty()).then(|| {
+            let i = ((q * sorted_ns.len() as f64).ceil() as usize).clamp(1, sorted_ns.len());
+            ms(sorted_ns[i - 1])
+        })
+    };
+    let mean = (!sorted_ns.is_empty())
+        .then(|| sorted_ns.iter().map(|&n| n as f64).sum::<f64>() / sorted_ns.len() as f64 / 1e6);
+    (mean, rank(0.5), rank(0.99))
 }
 
 impl ConvergenceReport {
-    pub fn new(mut latencies_ns: Vec<u64>, never: u64, pending: u64) -> Self {
+    pub fn new(mut latencies_ns: Vec<u64>, censored_ns: &[u64], pending: u64) -> Self {
         latencies_ns.sort_unstable();
-        let ms = |ns: u64| ns as f64 / 1e6;
-        let rank = |q: f64| {
-            (!latencies_ns.is_empty()).then(|| {
-                let i =
-                    ((q * latencies_ns.len() as f64).ceil() as usize).clamp(1, latencies_ns.len());
-                ms(latencies_ns[i - 1])
-            })
-        };
         let converged = latencies_ns.len() as u64;
+        let never = censored_ns.len() as u64;
+        let (mean_ms, p50_ms, p99_ms) = ms_summary(&latencies_ns);
+        let max_ms = latencies_ns.last().map(|&n| n as f64 / 1e6);
+        latencies_ns.extend_from_slice(censored_ns);
+        latencies_ns.sort_unstable();
+        let (mean_incl_never_ms, p50_incl_never_ms, p99_incl_never_ms) = ms_summary(&latencies_ns);
         Self {
             converged,
             never_converged: never,
             pending_at_end: pending,
             never_fraction: (converged + never > 0)
                 .then(|| never as f64 / (converged + never) as f64),
-            mean_ms: (converged > 0).then(|| {
-                latencies_ns.iter().map(|&n| n as f64).sum::<f64>() / converged as f64 / 1e6
-            }),
-            p50_ms: rank(0.5),
-            p99_ms: rank(0.99),
-            max_ms: latencies_ns.last().map(|&n| ms(n)),
+            mean_ms,
+            p50_ms,
+            p99_ms,
+            max_ms,
+            mean_incl_never_ms,
+            p50_incl_never_ms,
+            p99_incl_never_ms,
         }
     }
 }
@@ -227,8 +268,10 @@ impl ChurnReport {
 
 /// Health invariants. Any of `cell_store_full_rejects`,
 /// `rule_dictionary_full_rejects`, `node_dictionary_full_rejects`,
-/// `oversize_packets`, `runtime_exits`, `record_failures`, or `foreign_rows`
-/// being non-zero makes the run invalid.
+/// `oversize_packets`, `decode_rejects`, `runtime_exits`, `record_failures`,
+/// `foreign_rows`, `snapshot_failures`, or `nodes_never_snapshotted` being
+/// non-zero makes the run invalid. Dirty-ring overflow and gabion ERROR
+/// events are flagged instead (see [`Health::flags`]).
 #[derive(Debug, Default, Serialize)]
 pub struct Health {
     pub cell_store_full_rejects: u64,
@@ -243,6 +286,14 @@ pub struct Health {
     pub runtime_exit_errors: Vec<String>,
     pub record_failures: u64,
     pub foreign_rows: u64,
+    /// Admin snapshots that could not be sent or were not answered after
+    /// the cluster went quiescent.
+    pub snapshot_failures: u64,
+    /// Nodes asked for a snapshot that never answered one, whose health
+    /// counters are therefore unknown.
+    pub nodes_never_snapshotted: u64,
+    /// WARN and ERROR events gabion logged.
+    pub gabion_warnings: WarningReport,
 }
 
 impl Health {
@@ -258,15 +309,33 @@ impl Health {
                 self.node_dictionary_full_rejects,
             ),
             ("oversize_packets", self.oversize_packets),
+            ("decode_rejects", self.decode_rejects),
             ("runtime_exits", self.runtime_exits),
             ("record_failures", self.record_failures),
             ("foreign_rows", self.foreign_rows),
+            ("snapshot_failures", self.snapshot_failures),
+            ("nodes_never_snapshotted", self.nodes_never_snapshotted),
         ];
         checks
             .iter()
             .filter(|(_, n)| *n > 0)
             .map(|(name, n)| format!("{name} = {n}"))
             .collect()
+    }
+
+    pub fn flags(&self) -> Vec<String> {
+        let w = &self.gabion_warnings;
+        let mut flags = Vec::new();
+        if w.dirty_overflow_nodes > 0 {
+            flags.push(format!(
+                "dirty_ring_overflow: {} nodes, >= {} entries overwritten",
+                w.dirty_overflow_nodes, w.dirty_overflow_lower_bound
+            ));
+        }
+        if w.error_events > 0 {
+            flags.push(format!("gabion_error_events = {}", w.error_events));
+        }
+        flags
     }
 }
 
@@ -276,3 +345,6 @@ pub struct SimStats {
     pub events: u64,
     pub polls: u64,
 }
+
+#[cfg(test)]
+mod tests;

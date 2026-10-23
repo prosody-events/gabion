@@ -96,6 +96,13 @@ pub struct NetworkConfig {
     /// One-way latency across availability zones.
     pub cross_az_base_ns: u64,
     pub cross_az_jitter_max_ns: u64,
+    /// Receive-path service time charged per datagram the node reads:
+    /// `rx_ns_per_datagram + rx_ns_per_byte × payload`. While a node is
+    /// still serving the previous datagram, later arrivals wait in its
+    /// receive buffer (and overflow it). Everything else a node does takes
+    /// no virtual time.
+    pub rx_ns_per_datagram: u64,
+    pub rx_ns_per_byte: u64,
 }
 
 impl Default for NetworkConfig {
@@ -108,6 +115,8 @@ impl Default for NetworkConfig {
             intra_az_jitter_max_ns: 100_000,
             cross_az_base_ns: 800_000,
             cross_az_jitter_max_ns: 400_000,
+            rx_ns_per_datagram: 1_500,
+            rx_ns_per_byte: 3,
         }
     }
 }

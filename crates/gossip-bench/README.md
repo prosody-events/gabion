@@ -137,11 +137,21 @@ python3 crates/gossip-bench/judge/judge.py ../study-results --baseline main \
 the harness tree hash (`git rev-parse HEAD:crates/gossip-bench`), the
 solution label, branch and commit, plus the process's wall time, CPU time
 and peak RSS from `wait4` (host-dependent; everything else is not). It
-refuses to run when `crates/gossip-bench/` has uncommitted changes. The
-judge writes `summary.md` and `summary.csv` (every metric per regime and
-solution: mean across seeds, 95 % Student-t confidence half-width, min–max,
-ratio to the baseline), `pareto.md` (total bytes against limited-key p99
-staleness and against worst-key over-admission), and `rejected.md`.
+refuses to run when the worktree has uncommitted changes (`--allow-dirty`
+overrides, and the judge then rejects the results), and resumes only over
+results with an identical clean stamp. The judge refuses mixed harness
+hashes and several commits under one solution label, and writes
+`summary.md` and `summary.csv` (every metric per regime and solution: mean
+across valid seeds, 95 % Student-t confidence half-width, min–max, ratio to
+the baseline over the seeds valid for both, and in the CSV the paired
+difference with its confidence half-width), `pareto.md` (total bytes against
+limited-key p99 staleness, worst-key over-admission, and p99 convergence
+including never-converged hits), `flags.md` (non-invalidating saturation and
+the gabion warnings behind it), and `rejected.md`. A (regime, solution) with
+INVALID seeds shows `INVALID k/n` in every cell rather than silently
+averaging the survivors; one with no valid seed stays in the tables and is
+excluded from the Pareto front with a note. Judge tests:
+`python3 -m unittest discover -s crates/gossip-bench/judge`.
 
 Memory is the constraint on `--jobs`: cell-store capacity is allocated up
 front, so `prod-4x` needs several GB per run. The judge's `rss_mib` and
@@ -181,6 +191,19 @@ or its receive buffer (default 212,992 payload bytes, Linux's
 `rmem_default`) would overflow. The sender never sees backpressure:
 `writable` always resolves and `try_send_to` always succeeds, as for a UDP
 socket with send-buffer room.
+
+**Receive path.** A node reads its buffer at a bounded rate: each datagram
+read occupies the node's receive path for `rx_ns_per_datagram +
+rx_ns_per_byte × payload` (defaults 1.5 µs + 3 ns/B, identical for every
+solution and overridable per regime). The calibration: a 1,378 B datagram,
+`main`'s mean, costs 5.6 µs, which is the whole-process CPU time per
+delivered datagram measured for `main` at `prod-peak` on the reference host
+(an overestimate of receive work, since it includes encoding and the
+harness, but excluding the `recvmsg` syscall the simulation never makes).
+Datagrams that arrive meanwhile wait in the receive buffer, so a burst
+faster than about 170 k full frames per second into one node fills its
+buffer (about 145 full frames) and drops. Everything else a node does
+(ticks, sends, admissions) takes no virtual time.
 
 **Byte accounting.** Every datagram is counted once, at send time, for the
 whole network: UDP payload + 28 B IPv4/UDP header. Totals are reported for
@@ -232,9 +255,10 @@ solution. `cell_capacity` is 1.5 × an upper bound on the cells one pod can
 hold (each request creates at most one `(key, bucket, origin)` cell living
 one window plus two buckets, and a key holds at most one cell per pod per
 bucket), at least 16,384, rounded up to 1,024; any solution that expires
-cells within two buckets of their leaving the window fits; dirty rings keep the production ratios to
-the cell store (`STORAGE_LOCAL_DIRTY_CAPACITY` and
-`STORAGE_FORWARDED_DIRTY_CAPACITY` over `STORAGE_MAX_CELLS`); node and peer
+cells within two buckets of their leaving the window fits; dirty rings are
+the production sizes (`STORAGE_LOCAL_DIRTY_CAPACITY`,
+`STORAGE_FORWARDED_DIRTY_CAPACITY`), or, where the cell store is above
+`STORAGE_MAX_CELLS`, the production ratio to it, never less; node and peer
 dictionaries are the production defaults or the regime's pod count + 16,
 whichever is larger. Gossip settings are the production defaults
 (`GossipSettings::default()` in `gabion-server`); solutions own them.
@@ -251,7 +275,10 @@ All metrics except the whole-run byte totals cover the measurement window
   admission, an aggregate update on that pod, a bucket boundary), so its
   distribution (mean, p50, p99, max, min) is weighted by exact exposure time
   over every running (pod, key) pair, in hits and as a percentage of the
-  limit. Tracked keys are every hot and burst key ("limited") plus a seeded
+  limit. Because the signed mean lets an over-count offset an under-count,
+  the under-count `max(0, error)` and the over-count `max(0, view − truth)`
+  are also reported separately (`under_mean`, `over_mean`, `over_max`,
+  `over_time_fraction`); a correct solution never over-counts. Tracked keys are every hot and burst key ("limited") plus a seeded
   sample of `tracked_sample_keys` sites ("sampled"), reported separately.
 - **Residual error** is the same difference restricted to buckets that
   closed at least 1.5 s ago: error that is no longer in flight. Sampled
@@ -260,7 +287,11 @@ All metrics except the whole-run byte totals cover the measurement window
   its bucket, is the time until every pod that was running when it was
   admitted, and still runs, has a count of at least `j` for that bucket.
   Hits whose bucket leaves the window first count as never converged;
-  those still pending at the end are reported as censored.
+  those still pending at the end are reported as censored. The plain
+  quantiles cover converged hits only and so are right-censored; the
+  `*_incl_never_ms` quantiles rank every hit, valuing a never-converged hit
+  at the time from its admission until its bucket left the window (a lower
+  bound), and are the ones to compare across solutions.
 - **Rate-limit accuracy** per limited key: at every bucket boundary the
   cluster-wide admitted total of the trailing window minus the limit
   (over-admission: max, mean, share of windows over), plus offered,
@@ -274,9 +305,22 @@ All metrics except the whole-run byte totals cover the measurement window
   integrated summed under-count over the first window after joining
   (hit-seconds).
 - **Health**: cell-store, rule- and node-dictionary full rejects, oversize
-  datagrams, runtime exits, failed records, and aggregate rows for keys the
-  regime never issued each make the run **invalid**. Also reported: peak
-  active cells, decode rejects, maximum send-queue depth.
+  datagrams, decode rejects, runtime exits, failed records, aggregate rows
+  for keys the regime never issued, and admin snapshots that failed or a
+  node that never answered one each make the run **invalid**. Also
+  reported: peak active cells and maximum send-queue depth.
+- **gabion warnings**: a run-scoped `tracing` subscriber
+  (`src/harness/warnings.rs`) tallies every WARN and ERROR event gabion
+  logs, per `(level, target, message)` and per node (the node being polled),
+  with the largest `*_total` field each node reported. gabion logs most
+  saturation only on power-of-two totals, so these are lower bounds
+  (within 2×). Messages containing "dirty ring overflowed" (local and
+  forwarded dirty rings overwriting entries before gossip sent them) and
+  any ERROR event **flag** the run without invalidating it: overflow can be
+  a genuine property of a design at a given load. The judge shows the
+  counts and lists every flag in `flags.md`. A solution that keeps
+  gabion's `CellStore` keeps these messages; one that replaces it should
+  log the same phrase for the same condition.
 
 ### Regimes
 
@@ -329,7 +373,11 @@ documented; the harness uses nothing else (`src/harness/node.rs`,
   `AdminSnapshot` carrying `store_stats.{active_cells,
   cell_store_full_rejects, rule_dictionary_full_rejects,
   node_dictionary_full_rejects}`, `decode_reject_count` and
-  `max_send_pending_depth`.
+  `max_send_pending_depth`, before the node next goes idle (a snapshot
+  that is refused or unanswered invalidates the run).
+- Saturation is logged through `tracing` at WARN or ERROR, with a
+  `*_total` field carrying the running count; dirty-ring overflow keeps the
+  phrase "dirty ring overflowed".
 - `gabion::discovery::{Peer::new, PeerEvent::{Added, Removed}}` delivered
   on the `peer_events` stream; `gabion::rules::{Rule::new, hash_key,
   Descriptor, DescriptorPattern, EnforcementMode}`; `gabion::defaults`
@@ -344,11 +392,15 @@ only the legacy suite.
 
 ### Limitations
 
-- **Instantaneous processing.** Nodes take no virtual time to process a
-  datagram, a request or a tick, so CPU saturation, scheduling delay and
-  queueing inside a node are not modelled, and the receive buffer can only
-  overflow when many datagrams arrive at the same instant. Process CPU time
-  and peak RSS are reported as a noisy secondary signal.
+- **Processing is instantaneous except the receive path.** Only reading a
+  datagram costs virtual time (see Receive path), and its cost is a fixed
+  estimate rather than a measurement of each solution's decoder. Ticks,
+  sends and admissions are free, so CPU saturation and scheduling delay are
+  not modelled, and a design that spends more CPU per received byte than
+  the estimate is not charged for it. The receive buffer is charged payload
+  bytes, not the kernel's larger per-datagram `truesize`, so it holds more
+  small datagrams than Linux would. Process CPU time and peak RSS are
+  reported as a noisy secondary signal.
 - **Adapter.** Admission follows the gRPC server adapter. The NGINX adapter
   additionally batches hits through an SHM queue drained every ≤ 5 ms by a
   leader, adding up to 5 ms before a hit reaches the runtime.
@@ -386,4 +438,8 @@ only the legacy suite.
   ship and tunes it in its own code.
 - **The scenario suite moved behind the `legacy` feature** so the study
   does not depend on `gabion::gossip::sim`.
+- **The harness reads gabion's `tracing` output.** Saturation that gabion
+  reports only as a log line is captured into the result. Its `Visit`
+  implementation takes a trait object (`fmt::Debug`), so `warnings.rs` joins the
+  NGINX logger in the Makefile's `dyn` hygiene exemption.
 

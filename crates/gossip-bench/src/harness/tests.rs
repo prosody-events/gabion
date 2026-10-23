@@ -29,6 +29,11 @@ fn tiny_cluster_run_is_healthy_and_internally_consistent() {
     assert!(result.staleness.limited.min.is_some_and(|m| m >= 0.0));
     assert!(result.staleness.sampled.min.is_some_and(|m| m >= 0.0));
     assert!(result.convergence.converged > 0);
+    assert_eq!(result.staleness.limited.over_max, Some(0.0));
+    assert_eq!(result.staleness.sampled.over_time_fraction, Some(0.0));
+    assert_eq!(result.health.snapshot_failures, 0);
+    assert_eq!(result.health.nodes_never_snapshotted, 0);
+    assert!(result.flags.is_empty(), "{:?}", result.flags);
 
     let net = result.network.run;
     assert!(net.packets_sent > 0);
@@ -85,4 +90,43 @@ fn every_regime_file_parses() {
         count += 1;
     }
     assert!(count >= 11);
+}
+
+/// Shrunken dirty rings overflow; the run stays valid but the overflow is
+/// attributed to the nodes that logged it and flagged.
+#[test]
+fn gabion_saturation_warnings_are_captured_and_flagged() {
+    let regime = fixtures::tiny();
+    let seed = 3;
+    let plan = plan::Plan::build(&regime, seed);
+    let keys = Rc::new(node::KeySpace::build(&regime, seed));
+    let mut sizing = node::Sizing::new(&regime, &plan, &keys);
+    sizing.local_dirty_capacity = 2;
+    sizing.forwarded_dirty_capacity = 2;
+    let world = Rc::new(driver::world_for(&regime, seed, &plan));
+    let cells = sizing.cell_store_config();
+    let launch = {
+        let world = Rc::clone(&world);
+        let keys = Rc::clone(&keys);
+        move |idx| node::launch_node(&world, &keys, cells, idx, seed)
+    };
+    let result = driver::Driver::new(&regime, seed, plan, sizing, keys, world, launch)
+        .run()
+        .expect("run");
+    assert!(result.valid, "{:?}", result.invalid_reasons);
+    let warnings = &result.health.gabion_warnings;
+    assert!(warnings.dirty_overflow_nodes >= 5, "{warnings:?}");
+    assert!(warnings.dirty_overflow_lower_bound > 0);
+    assert!(
+        warnings
+            .kinds
+            .iter()
+            .all(|k| k.nodes > 0 && k.target.starts_with("gabion"))
+    );
+    assert!(
+        result
+            .flags
+            .iter()
+            .any(|f| f.starts_with("dirty_ring_overflow"))
+    );
 }

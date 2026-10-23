@@ -314,14 +314,14 @@ impl Sizing {
             .max(16_384)
             .next_multiple_of(1024)
             .min(u64::from(u32::MAX)) as u32;
-        // Keep the production ratios of the dirty rings to the cell store
-        // (`STORAGE_LOCAL_DIRTY_CAPACITY` / `STORAGE_FORWARDED_DIRTY_CAPACITY`
-        // over `STORAGE_MAX_CELLS`).
-        let local_dirty_capacity = (cell_capacity as usize * d::STORAGE_LOCAL_DIRTY_CAPACITY)
-            .div_ceil(d::STORAGE_MAX_CELLS);
-        let forwarded_dirty_capacity = (cell_capacity as usize
-            * d::STORAGE_FORWARDED_DIRTY_CAPACITY)
-            .div_ceil(d::STORAGE_MAX_CELLS);
+        // Never below production; above it, keep the production ratio of the
+        // ring to the cell store (`STORAGE_*_DIRTY_CAPACITY` over
+        // `STORAGE_MAX_CELLS`).
+        let ring = |production: usize| {
+            production.max((cell_capacity as usize * production).div_ceil(d::STORAGE_MAX_CELLS))
+        };
+        let local_dirty_capacity = ring(d::STORAGE_LOCAL_DIRTY_CAPACITY);
+        let forwarded_dirty_capacity = ring(d::STORAGE_FORWARDED_DIRTY_CAPACITY);
         let total_nodes = plan.nodes.len();
         let fit = |floor: u16, n: usize| floor.max((n + 16).min(u16::MAX as usize) as u16);
         Self {

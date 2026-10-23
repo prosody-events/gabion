@@ -68,11 +68,29 @@ impl WeightedHist {
     }
 
     pub fn mean(&self) -> Option<f64> {
+        self.mean_by(|v| v)
+    }
+
+    /// Weighted mean of `f(value)`.
+    pub fn mean_by(&self, f: impl Fn(i64) -> i64) -> Option<f64> {
         let total = self.total();
         (total > 0).then(|| {
             self.weights
                 .iter()
-                .map(|(&v, &w)| v as f64 * w as f64)
+                .map(|(&v, &w)| f(v) as f64 * w as f64)
+                .sum::<f64>()
+                / total as f64
+        })
+    }
+
+    /// Share of the weight on values satisfying `pred`.
+    pub fn fraction(&self, pred: impl Fn(i64) -> bool) -> Option<f64> {
+        let total = self.total();
+        (total > 0).then(|| {
+            self.weights
+                .iter()
+                .filter(|&(&v, _)| pred(v))
+                .map(|(_, &w)| w as f64)
                 .sum::<f64>()
                 / total as f64
         })
@@ -186,7 +204,9 @@ pub struct Oracle {
     pub staleness: [WeightedHist; 2],
     pub residual: [Vec<i64>; 2],
     pub convergence_ns: Vec<u64>,
-    pub never_converged: u64,
+    /// Per never-converged hit, the time from admission until its bucket
+    /// left the window (or its ring slot was reused).
+    pub censored_ns: Vec<u64>,
     /// Indexed by tracked index; only limited keys are sampled.
     pub over_admission: Vec<WindowSamples>,
 }
@@ -223,7 +243,7 @@ impl Oracle {
             staleness: Default::default(),
             residual: Default::default(),
             convergence_ns: Vec::new(),
-            never_converged: 0,
+            censored_ns: Vec::new(),
             over_admission: vec![WindowSamples::default(); tracked],
             keys,
             nodes,
@@ -335,7 +355,7 @@ impl Oracle {
         self.sum_truth += 1;
         let c = self.conv_index(t, bucket);
         if self.conv[c].bucket != bucket {
-            self.retire(c);
+            self.retire(c, now_ns);
             self.conv[c].bucket = bucket;
         }
         self.conv[c].admits.push(now_ns);
@@ -405,13 +425,15 @@ impl Oracle {
 
     /// Slot `c` is about to be reused or its bucket left the window: any
     /// admission not yet converged never will.
-    fn retire(&mut self, c: usize) {
+    fn retire(&mut self, c: usize, now_ns: u64) {
         let slot = &mut self.conv[c];
         let from = self.measure_from_ns;
-        self.never_converged += slot.admits[slot.converged..]
-            .iter()
-            .filter(|&&t| t >= from)
-            .count() as u64;
+        self.censored_ns.extend(
+            slot.admits[slot.converged..]
+                .iter()
+                .filter(|&&t| t >= from)
+                .map(|&t| now_ns - t),
+        );
         slot.admits.clear();
         slot.converged = 0;
         let base = c * self.nodes;
@@ -447,7 +469,7 @@ impl Oracle {
             for t in 0..self.truth_window.len() {
                 let c = self.conv_index(t, gone);
                 if self.conv[c].bucket == gone {
-                    self.retire(c);
+                    self.retire(c, now_ns);
                 }
             }
         }

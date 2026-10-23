@@ -148,8 +148,8 @@ fn receive_buffer_overflow_drops_without_backpressure() {
     let mut cx = Context::from_waker(Waker::noop());
     let mut buf = [0_u8; 1_500];
     assert_eq!(
-        net.poll_recv(1, &mut cx, &mut buf),
-        Poll::Ready((1_000, node_addr(0)))
+        net.poll_recv(1, 0, &mut cx, &mut buf),
+        Recv::Datagram(1_000, node_addr(0))
     );
     net.arrive(0, 1, datagram());
     net.arrive(0, 1, datagram());
@@ -161,6 +161,56 @@ fn receive_buffer_overflow_drops_without_backpressure() {
     assert_eq!(net.run.dropped_no_receiver_packets, 3);
     net.arrive(0, 1, datagram());
     assert_eq!(net.run.dropped_no_receiver_packets, 4);
+}
+
+/// Reads are paced by the receive path's service time; arrivals during it
+/// queue in the buffer and overflow it, and each busy spell schedules one
+/// wake-up.
+#[test]
+fn receive_service_time_paces_reads_and_fills_the_buffer() {
+    let (mut net, _) = network(
+        NetworkConfig {
+            rcvbuf_bytes: 3_000,
+            rx_ns_per_datagram: 1_000,
+            rx_ns_per_byte: 1,
+            ..NetworkConfig::default()
+        },
+        3,
+    );
+    let datagram = || Datagram {
+        src: node_addr(0),
+        bytes: vec![0_u8; 1_000].into_boxed_slice(),
+    };
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut buf = [0_u8; 1_500];
+    assert_eq!(net.poll_recv(1, 0, &mut cx, &mut buf), Recv::Empty);
+    for _ in 0..3 {
+        net.arrive(0, 1, datagram());
+    }
+    let read = Recv::Datagram(1_000, node_addr(0));
+    assert_eq!(net.poll_recv(1, 0, &mut cx, &mut buf), read);
+    // Serving 1,000 B takes 1 µs + 1 µs.
+    assert_eq!(
+        net.poll_recv(1, 0, &mut cx, &mut buf),
+        Recv::Busy(Some(2_000))
+    );
+    assert_eq!(net.poll_recv(1, 1_999, &mut cx, &mut buf), Recv::Busy(None));
+    // Two still queued: room for one more, the next overflows.
+    net.arrive(500, 1, datagram());
+    net.arrive(500, 1, datagram());
+    assert_eq!(net.run.dropped_rcvbuf_packets, 1);
+    for at in [2_000, 4_000, 6_000] {
+        assert_eq!(net.poll_recv(1, at, &mut cx, &mut buf), read);
+        assert_eq!(
+            net.poll_recv(1, at, &mut cx, &mut buf),
+            if at < 6_000 {
+                Recv::Busy(Some(at + 2_000))
+            } else {
+                Recv::Empty
+            }
+        );
+    }
+    assert_eq!(net.run.packets_delivered, 4);
 }
 
 #[test]

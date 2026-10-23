@@ -5,8 +5,10 @@ Builds `gossip-bench` (release, `--no-default-features`), runs
 `gossip-bench study run` for every (regime, seed) pair with `--jobs`
 parallelism, and writes one stamped result per run to
 `<out>/<solution>/<regime>/seed-<n>.json`. A run whose output already exists
-with the same stamp (harness tree hash and solution commit) is skipped, so an
-interrupted matrix resumes where it stopped.
+with the same clean stamp (harness tree hash, solution label, branch and
+commit) is skipped, so an interrupted matrix resumes where it stopped. It
+refuses to run on a worktree with uncommitted changes unless `--allow-dirty`
+is given, and the judge rejects such results.
 
 The stamp identifies what produced the numbers: the harness tree hash
 (`git rev-parse HEAD:crates/gossip-bench`), the solution label, branch and
@@ -41,11 +43,14 @@ def git(repo: Path, *args: str) -> str:
 
 def stamp_for(repo: Path, solution: str, allow_dirty: bool) -> dict:
     harness_dirty = bool(git(repo, "status", "--porcelain", "--", HARNESS_DIR))
-    if harness_dirty and not allow_dirty:
+    solution_dirty = bool(git(repo, "status", "--porcelain"))
+    if solution_dirty and not allow_dirty:
+        where = HARNESS_DIR if harness_dirty else "the worktree"
         sys.exit(
-            f"error: {HARNESS_DIR} has uncommitted changes, so its tree hash would not "
-            "describe the harness that ran. Commit or stash them, or pass --allow-dirty "
-            "for a throwaway run (the judge rejects dirty stamps)."
+            f"error: {where} has uncommitted changes, so the stamped commit would not "
+            "describe the code that ran and the numbers could not be reproduced from the "
+            "pushed branch. Commit or stash them, or pass --allow-dirty for a throwaway "
+            "run (the judge rejects dirty stamps)."
         )
     return {
         "harness_tree_hash": git(repo, "rev-parse", f"HEAD:{HARNESS_DIR}"),
@@ -53,7 +58,7 @@ def stamp_for(repo: Path, solution: str, allow_dirty: bool) -> dict:
         "solution": solution,
         "solution_branch": git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
         "solution_commit": git(repo, "rev-parse", "HEAD"),
-        "solution_dirty": bool(git(repo, "status", "--porcelain")),
+        "solution_dirty": solution_dirty,
     }
 
 
@@ -91,13 +96,15 @@ def seeds(spec: str) -> list[int]:
 
 
 def is_done(path: Path, stamp: dict) -> bool:
+    """A result counts as done only when it was produced by exactly this
+    clean harness and solution commit; dirty runs are always redone."""
+    if stamp["harness_dirty"] or stamp["solution_dirty"]:
+        return False
     try:
         existing = json.loads(path.read_text())["stamp"]
     except (OSError, ValueError, KeyError):
         return False
-    return all(
-        existing.get(k) == stamp[k] for k in ("harness_tree_hash", "solution_commit", "solution")
-    )
+    return existing == stamp
 
 
 def max_rss_bytes(ru_maxrss: int) -> int:

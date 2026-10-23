@@ -7,11 +7,13 @@
 //! jitter_max)` (intra- or cross-availability-zone). On arrival a datagram
 //! is dropped if the destination process has stopped or its receive buffer
 //! would overflow; there is no backpressure toward the sender, exactly as
-//! with a UDP socket.
+//! with a UDP socket. A node reads its buffer at a bounded rate: each read
+//! occupies its receive path for a fixed per-datagram plus per-byte service
+//! time, so a fan-in faster than that fills the buffer.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Waker};
 
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +113,22 @@ struct Inbox {
     queue: VecDeque<Datagram>,
     payload_bytes: u64,
     waker: Option<Waker>,
+    /// The receive path is serving the last datagram read until then.
+    busy_until_ns: u64,
+    /// A wake-up is already scheduled for `busy_until_ns`.
+    wake_armed: bool,
+}
+
+/// Outcome of a node's attempt to read a datagram.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Recv {
+    /// `(payload length copied, source)`.
+    Datagram(usize, SocketAddr),
+    /// Nothing queued; the waker fires on the next arrival.
+    Empty,
+    /// Datagrams are queued but the receive path is busy; `Some(at)` asks
+    /// the caller to wake the node at `at` (`None`: already scheduled).
+    Busy(Option<u64>),
 }
 
 /// Where a sent datagram goes.
@@ -253,26 +271,36 @@ impl Network {
         waker
     }
 
-    /// Hand the oldest queued datagram to node `idx`'s receive call.
+    /// Hand the oldest queued datagram to node `idx`'s receive call, unless
+    /// its receive path is still serving the previous one.
     pub fn poll_recv(
         &mut self,
         idx: usize,
+        now_ns: u64,
         cx: &mut Context<'_>,
         buf: &mut [u8],
-    ) -> Poll<(usize, SocketAddr)> {
+    ) -> Recv {
+        let per_datagram = self.config.rx_ns_per_datagram;
+        let per_byte = self.config.rx_ns_per_byte;
         let inbox = &mut self.inboxes[idx];
-        match inbox.queue.pop_front() {
-            Some(datagram) => {
-                inbox.payload_bytes -= datagram.bytes.len() as u64;
-                let n = datagram.bytes.len().min(buf.len());
-                buf[..n].copy_from_slice(&datagram.bytes[..n]);
-                Poll::Ready((n, datagram.src))
-            }
-            None => {
-                inbox.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
+        if inbox.queue.is_empty() {
+            inbox.waker = Some(cx.waker().clone());
+            return Recv::Empty;
         }
+        if now_ns < inbox.busy_until_ns {
+            let arm = !std::mem::replace(&mut inbox.wake_armed, true);
+            return Recv::Busy(arm.then_some(inbox.busy_until_ns));
+        }
+        let Some(datagram) = inbox.queue.pop_front() else {
+            return Recv::Empty;
+        };
+        let len = datagram.bytes.len();
+        inbox.payload_bytes -= len as u64;
+        inbox.busy_until_ns = now_ns + per_datagram + per_byte * len as u64;
+        inbox.wake_armed = false;
+        let n = len.min(buf.len());
+        buf[..n].copy_from_slice(&datagram.bytes[..n]);
+        Recv::Datagram(n, datagram.src)
     }
 
     pub fn set_running(&mut self, now_ns: u64, idx: usize, running: bool) {

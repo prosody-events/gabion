@@ -6,14 +6,23 @@ Usage:
 
 Reads every `*.json` result under the given directories (as written by
 `matrix.py`). Refuses to proceed when results carry different harness tree
-hashes, a dirty harness, or no stamp at all: numbers from different harnesses
-are not comparable. Runs marked invalid by the harness (a health invariant
-failed) are excluded and listed.
+hashes, or one solution label carries several commits: numbers from
+different code are not comparable. Results without a stamp, or produced from
+a dirty harness or solution worktree, are rejected and listed.
 
-For each regime x solution x metric it reports the mean across seeds with a
-95 % confidence half-width (Student t, n - 1 degrees of freedom), the min and
-max, and the ratio of the mean to the baseline solution's mean. Writes
-`summary.md`, `summary.csv` (long format), `pareto.md`, and `rejected.md`.
+Runs the harness marked INVALID (a health invariant failed) stay visible:
+every cell of a (regime, solution) with an invalid seed reads
+`INVALID k/n`, and a solution whose every seed is invalid stays in the
+tables as INVALID rather than disappearing. Statistics cover valid seeds
+only; ratios to the baseline and paired differences use only the seeds valid
+for both, so a solution cannot gain by losing its hardest seed.
+
+For each regime x solution x metric it reports the mean across valid seeds
+with a 95 % confidence half-width (Student t, n - 1 degrees of freedom), the
+min and max, and the ratio to the baseline over common seeds. Writes
+`summary.md`, `summary.csv` (long format, with paired differences),
+`pareto.md`, `flags.md` (saturation the harness flagged without
+invalidating, e.g. dirty-ring overflow) and `rejected.md`.
 
 Python 3 standard library only.
 """
@@ -29,7 +38,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-SCHEMA = "gabion-study/1"
+SCHEMA = "gabion-study/2"
 
 # Two-sided 95 % Student t quantiles t(0.975, df) for df = 1..30.
 T975 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
@@ -113,11 +122,28 @@ METRICS = [
      lambda r: dig(r, "staleness.residual_limited.p99")),
     ("residual_sampled_p99", "Residual (closed >= 1.5 s), sampled: p99 (hits)",
      lambda r: dig(r, "staleness.residual_sampled.p99")),
-    ("conv_p50_ms", "Convergence p50 (ms)", lambda r: dig(r, "convergence.p50_ms")),
-    ("conv_p99_ms", "Convergence p99 (ms)", lambda r: dig(r, "convergence.p99_ms")),
-    ("conv_max_ms", "Convergence max (ms)", lambda r: dig(r, "convergence.max_ms")),
+    ("stale_limited_under_mean", "Staleness, limited keys: mean of max(0, error) (hits)",
+     lambda r: dig(r, "staleness.limited.under_mean")),
+    ("stale_limited_over_mean", "Over-count, limited keys: mean of max(0, view - truth) (hits)",
+     lambda r: dig(r, "staleness.limited.over_mean")),
+    ("stale_limited_over_max", "Over-count, limited keys: max (hits)",
+     lambda r: dig(r, "staleness.limited.over_max")),
+    ("stale_sampled_over_max", "Over-count, sampled sites: max (hits)",
+     lambda r: dig(r, "staleness.sampled.over_max")),
     ("conv_never_frac", "Fraction never converged before expiry",
      lambda r: dig(r, "convergence.never_fraction")),
+    ("conv_p50_incl_never_ms", "Convergence p50 incl. never-converged (ms, lower bound)",
+     lambda r: dig(r, "convergence.p50_incl_never_ms")),
+    ("conv_p99_incl_never_ms", "Convergence p99 incl. never-converged (ms, lower bound)*",
+     lambda r: dig(r, "convergence.p99_incl_never_ms")),
+    ("conv_mean_incl_never_ms", "Convergence mean incl. never-converged (ms, lower bound)",
+     lambda r: dig(r, "convergence.mean_incl_never_ms")),
+    ("conv_p50_ms", "Convergence p50, converged hits only (ms; read with never-converged)",
+     lambda r: dig(r, "convergence.p50_ms")),
+    ("conv_p99_ms", "Convergence p99, converged hits only (ms; read with never-converged)",
+     lambda r: dig(r, "convergence.p99_ms")),
+    ("conv_max_ms", "Convergence max, converged hits only (ms)",
+     lambda r: dig(r, "convergence.max_ms")),
     ("over_max_pct", "Over-admission, worst limited key: max (% of limit)*",
      lambda r: over_admission(r, "over_max_pct_limit")),
     ("over_mean_pct", "Over-admission, limited keys: mean (% of limit)",
@@ -146,14 +172,24 @@ METRICS = [
      lambda r: dig(r, "network.measure.dropped_rcvbuf_packets")),
     ("peak_cells", "Peak active cells on any node", lambda r: dig(r, "health.peak_active_cells")),
     ("send_pending_max", "Max send-queue depth", lambda r: dig(r, "health.max_send_pending_depth")),
+    ("dirty_overflow_nodes", "Nodes whose dirty ring overflowed (flag)",
+     lambda r: dig(r, "health.gabion_warnings.dirty_overflow_nodes")),
+    ("dirty_overflow_entries", "Dirty-ring entries overwritten, lower bound (flag)",
+     lambda r: dig(r, "health.gabion_warnings.dirty_overflow_lower_bound")),
+    ("gabion_warn_events", "gabion WARN events logged",
+     lambda r: dig(r, "health.gabion_warnings.warn_events")),
+    ("gabion_error_events", "gabion ERROR events logged",
+     lambda r: dig(r, "health.gabion_warnings.error_events")),
     ("cpu_s", "Process CPU time (s), noisy", cpu_s),
     ("rss_mib", "Process peak RSS (MiB), noisy", rss_mib),
 ]
 
-PARETO = [("bytes_total", "stale_limited_p99"), ("bytes_total", "over_max_pct")]
+PARETO = [("bytes_total", "stale_limited_p99"), ("bytes_total", "over_max_pct"),
+          ("bytes_total", "conv_p99_incl_never_ms")]
 
 
 def load(dirs: list[Path]):
+    """Stamped results from clean trees, valid or INVALID, and the rejects."""
     accepted, rejected = [], []
     for directory in dirs:
         for path in sorted(directory.rglob("*.json")):
@@ -169,8 +205,8 @@ def load(dirs: list[Path]):
                 rejected.append((path, "no stamp (not produced by matrix.py)"))
             elif stamp.get("harness_dirty"):
                 rejected.append((path, "harness had uncommitted changes"))
-            elif not result.get("valid"):
-                rejected.append((path, f"INVALID: {', '.join(result.get('invalid_reasons', []))}"))
+            elif stamp.get("solution_dirty", True):
+                rejected.append((path, "solution worktree had uncommitted changes"))
             else:
                 accepted.append((path, result))
     return accepted, rejected
@@ -189,10 +225,11 @@ def fmt(x) -> str:
     return f"{x:,.0f}" if abs(x) >= 1000 else f"{x:.3g}"
 
 
-def cell(stats: dict | None, ratio: float | None) -> str:
+def cell(stats: dict | None, ratio: float | None, invalid: int, total: int) -> str:
+    mark = f"INVALID {invalid}/{total}" if invalid else ""
     if stats is None:
-        return "n/a"
-    text = fmt(stats["mean"])
+        return mark or "n/a"
+    text = (mark + "; " if mark else "") + fmt(stats["mean"])
     if stats["ci95"] is not None:
         text += f" ± {fmt(stats['ci95'])}"
     if stats["n"] > 1:
@@ -216,16 +253,11 @@ def main() -> None:
 
     accepted, rejected = load(args.results)
     hashes = {r["stamp"]["harness_tree_hash"] for _, r in accepted}
-    hashes |= {
-        json.loads(p.read_text()).get("stamp", {}).get("harness_tree_hash")
-        for p, why in rejected if why.startswith("INVALID")
-    }
-    hashes.discard(None)
     if len(hashes) > 1:
         sys.exit("error: results come from different harnesses (tree hashes "
                  f"{', '.join(sorted(hashes))}); rerun every solution on one harness commit.")
     if not accepted:
-        sys.exit("error: no valid stamped results found.")
+        sys.exit("error: no stamped results from clean trees found.")
 
     runs: dict[tuple[str, str], dict[int, dict]] = defaultdict(dict)
     commits: dict[str, set] = defaultdict(set)
@@ -241,28 +273,56 @@ def main() -> None:
             sys.exit(f"error: solution `{solution}` has results from several commits: "
                      f"{', '.join(sorted(shas))}")
 
+    def valid_seeds(regime: str, solution: str) -> dict[int, dict]:
+        return {s: r for s, r in runs.get((regime, solution), {}).items() if r.get("valid")}
+
+    def invalid_count(regime: str, solution: str) -> tuple[int, int]:
+        by_seed = runs.get((regime, solution), {})
+        return sum(not r.get("valid") for r in by_seed.values()), len(by_seed)
+
     regimes = sorted({r for r, _ in runs})
     solutions = sorted({s for _, s in runs}, key=lambda s: (s != args.baseline, s))
     table: dict[tuple[str, str, str], dict | None] = {}
-    for (regime, solution), by_seed in runs.items():
+    for regime, solution in runs:
+        valid = valid_seeds(regime, solution)
         for key, _, extract in METRICS:
-            values = [v for r in by_seed.values() if (v := extract(r)) is not None]
+            values = [v for r in valid.values() if (v := extract(r)) is not None]
             table[(regime, solution, key)] = summarize([float(v) for v in values]) if values else None
 
-    def ratio(regime: str, solution: str, key: str):
-        base = table.get((regime, args.baseline, key))
-        mine = table.get((regime, solution, key))
-        if not base or not mine or base["mean"] == 0:
+    def paired(regime: str, solution: str, key: str) -> dict | None:
+        """Ratio of means and mean paired difference (solution - baseline)
+        over the seeds valid for both with a value for `key`."""
+        extract = next(e for k, _, e in METRICS if k == key)
+        mine, base = valid_seeds(regime, solution), valid_seeds(regime, args.baseline)
+        pairs = [(float(a), float(b)) for s in sorted(mine.keys() & base.keys())
+                 if (a := extract(mine[s])) is not None and (b := extract(base[s])) is not None]
+        if not pairs:
             return None
-        return mine["mean"] / base["mean"]
+        base_mean = statistics.fmean(b for _, b in pairs)
+        diff = summarize([a - b for a, b in pairs])
+        return {
+            "n": len(pairs),
+            "ratio": statistics.fmean(a for a, _ in pairs) / base_mean if base_mean else None,
+            "diff_mean": diff["mean"],
+            "diff_ci95": diff["ci95"],
+        }
+
+    def ratio(regime: str, solution: str, key: str):
+        if solution == args.baseline:
+            return None
+        pair = paired(regime, solution, key)
+        return pair["ratio"] if pair else None
 
     args.out.mkdir(parents=True, exist_ok=True)
     harness = next(iter(hashes))
     lines = [
         "# Gossip study: per-regime comparison", "",
         f"Harness tree hash `{harness}`. Baseline `{args.baseline}`. Cells show the mean "
-        "across seeds ± the 95 % CI half-width (Student t) [min–max] (×ratio to the "
-        "baseline mean). Lower is better unless noted.", "",
+        "across valid seeds ± the 95 % CI half-width (Student t) [min–max] (×ratio of "
+        "means to the baseline over the seeds valid for both). `INVALID k/n` marks a "
+        "solution with k of n seeds invalid (see `rejected.md`); its statistics cover the "
+        "valid seeds only. Lower is better unless noted. Metrics marked (flag) report "
+        "saturation that does not invalidate a run; see `flags.md`.", "",
         "| Solution | Branch | Commit |", "|---|---|---|",
     ]
     for solution in solutions:
@@ -272,55 +332,98 @@ def main() -> None:
                      f"`{stamp['solution_commit'][:12]}` |")
     for regime in regimes:
         present = [s for s in solutions if (regime, s) in runs]
-        seeds = {s: len(runs[(regime, s)]) for s in present}
+        counts = {s: invalid_count(regime, s) for s in present}
         lines += ["", f"## {regime}", "",
-                  "Seeds: " + ", ".join(f"{s} {n}" for s, n in seeds.items()), "",
+                  "Valid seeds: " + ", ".join(f"{s} {n - bad}/{n}"
+                                              for s, (bad, n) in counts.items()), "",
                   "| Metric | " + " | ".join(present) + " |",
                   "|---|" + "---|" * len(present)]
         for key, label, _ in METRICS:
-            row = [cell(table.get((regime, s, key)), ratio(regime, s, key)
-                        if s != args.baseline else None) for s in present]
+            row = [cell(table.get((regime, s, key)), ratio(regime, s, key), *counts[s])
+                   for s in present]
             lines.append(f"| {label} | " + " | ".join(row) + " |")
     (args.out / "summary.md").write_text("\n".join(lines) + "\n")
 
     with (args.out / "summary.csv").open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["regime", "solution", "metric", "n", "mean", "ci95", "min", "max",
-                         "ratio_vs_baseline"])
+        writer.writerow(["regime", "solution", "metric", "n_valid", "n_invalid", "n_total",
+                         "mean", "ci95", "min", "max", "paired_n", "ratio_vs_baseline",
+                         "paired_diff_mean", "paired_diff_ci95"])
         for regime in regimes:
             for solution in solutions:
+                if (regime, solution) not in runs:
+                    continue
+                bad, total = invalid_count(regime, solution)
                 for key, _, _ in METRICS:
-                    stats = table.get((regime, solution, key))
-                    if stats is None:
-                        continue
-                    writer.writerow([regime, solution, key, stats["n"], stats["mean"],
-                                     stats["ci95"], stats["min"], stats["max"],
-                                     ratio(regime, solution, key)])
+                    stats = table.get((regime, solution, key)) or {}
+                    pair = (paired(regime, solution, key)
+                            if solution != args.baseline else None) or {}
+                    writer.writerow([regime, solution, key, stats.get("n", 0), bad, total,
+                                     stats.get("mean"), stats.get("ci95"), stats.get("min"),
+                                     stats.get("max"), pair.get("n"), pair.get("ratio"),
+                                     pair.get("diff_mean"), pair.get("diff_ci95")])
 
     pareto = ["# Pareto view", "",
-              "Per regime, each solution's mean on two objectives (both lower is better). "
-              "**Bold** solutions are not dominated by any other solution on that pair.", ""]
+              "Per regime, each solution's mean over its valid seeds on two objectives "
+              "(both lower is better). **Bold** solutions are not dominated by any other "
+              "solution on that pair. A solution with invalid seeds is marked with its "
+              "count; one with no valid seed is listed but excluded from the front.", ""]
     for regime in regimes:
         pareto += [f"## {regime}", ""]
         for x, y in PARETO:
-            points = {}
+            points, excluded = {}, []
             for s in solutions:
+                if (regime, s) not in runs:
+                    continue
+                bad, total = invalid_count(regime, s)
                 sx, sy = table.get((regime, s, x)), table.get((regime, s, y))
-                if sx and sy:
+                if bad == total:
+                    excluded.append(f"{s} (INVALID {bad}/{total})")
+                elif sx and sy:
                     points[s] = (sx["mean"], sy["mean"])
             pareto += [f"| Solution | {x} | {y} |", "|---|---|---|"]
             for s, point in points.items():
                 front = not any(dominated(point, o) for t, o in points.items() if t != s)
                 name = f"**{s}**" if front else s
+                bad, total = invalid_count(regime, s)
+                if bad:
+                    name += f" (INVALID {bad}/{total})"
                 pareto.append(f"| {name} | {fmt(point[0])} | {fmt(point[1])} |")
+            if excluded:
+                pareto.append("")
+                pareto.append("Excluded, every seed invalid: " + ", ".join(excluded) + ".")
             pareto.append("")
     (args.out / "pareto.md").write_text("\n".join(pareto) + "\n")
 
+    flag_lines = ["# Flagged runs", "",
+                  "Saturation the harness recorded without invalidating the run, and the "
+                  "gabion WARN/ERROR messages behind it.", ""]
+    for regime in regimes:
+        for solution in solutions:
+            for seed, result in sorted(runs.get((regime, solution), {}).items()):
+                if not result.get("flags"):
+                    continue
+                flag_lines.append(f"- {regime} / {solution} / seed {seed}: "
+                                  + "; ".join(result["flags"]))
+                for kind in dig(result, "health.gabion_warnings.kinds") or []:
+                    flag_lines.append(f"  - {kind['level']} {kind['target']} on "
+                                      f"{kind['nodes']} nodes, max total "
+                                      f"{kind['max_total']}: {kind['message']}")
+    if len(flag_lines) == 4:
+        flag_lines.append("None.")
+    (args.out / "flags.md").write_text("\n".join(flag_lines) + "\n")
+
+    for path, result in accepted:
+        if not result.get("valid"):
+            rejected.append((path, "INVALID (shown as INVALID k/n): "
+                             + ", ".join(result.get("invalid_reasons", []))))
     rejected_lines = ["# Rejected results", ""]
     rejected_lines += [f"- `{p}`: {why}" for p, why in rejected] or ["None."]
     (args.out / "rejected.md").write_text("\n".join(rejected_lines) + "\n")
-    print(f"{len(accepted)} results accepted, {len(rejected)} rejected; "
-          f"wrote {args.out}/summary.md, summary.csv, pareto.md, rejected.md")
+    invalid = sum(not r.get("valid") for _, r in accepted)
+    print(f"{len(accepted) - invalid} valid and {invalid} INVALID results accepted, "
+          f"{len(rejected) - invalid} rejected; wrote {args.out}/summary.md, summary.csv, "
+          "pareto.md, flags.md, rejected.md")
 
 
 if __name__ == "__main__":

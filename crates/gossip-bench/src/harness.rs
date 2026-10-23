@@ -18,6 +18,7 @@ mod plan;
 mod regime;
 mod report;
 mod rng;
+mod warnings;
 mod workload;
 mod world;
 

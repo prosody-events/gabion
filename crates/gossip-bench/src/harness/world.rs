@@ -25,7 +25,7 @@ use futures::Stream;
 use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::{Clock, GossipTransport, Ticker};
 
-use super::net::{Datagram, Network, Route};
+use super::net::{Datagram, Network, Recv, Route};
 use super::plan::{NS_PER_MS, PlanEvent};
 
 /// Unix-epoch milliseconds at virtual time zero: 2026-01-01T00:00:00Z, a
@@ -193,9 +193,25 @@ impl GossipTransport for SimSocket {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let received =
-            std::future::poll_fn(|cx| self.world.net.borrow_mut().poll_recv(self.idx, cx, buf))
-                .await;
+        let received = std::future::poll_fn(|cx| {
+            let now_ns = self.world.now_ns();
+            let recv = self
+                .world
+                .net
+                .borrow_mut()
+                .poll_recv(self.idx, now_ns, cx, buf);
+            match recv {
+                Recv::Datagram(n, src) => Poll::Ready((n, src)),
+                Recv::Empty => Poll::Pending,
+                Recv::Busy(wake_at) => {
+                    if let Some(at) = wake_at {
+                        self.world.schedule(at, Event::Wake(cx.waker().clone()));
+                    }
+                    Poll::Pending
+                }
+            }
+        })
+        .await;
         Ok(received)
     }
 }

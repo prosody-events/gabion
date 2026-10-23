@@ -49,7 +49,7 @@ fn staleness_and_convergence_on_a_hand_checked_trace() {
     assert_eq!(hist.quantile(0.99), Some(1));
     assert_eq!(oracle.staleness[Class::Limited as usize].total(), 0);
     assert_eq!(oracle.convergence_ns, vec![500 * MS]);
-    assert_eq!((oracle.never_converged, oracle.pending()), (0, 0));
+    assert_eq!((oracle.censored_ns.len(), oracle.pending()), (0, 0));
 }
 
 #[test]
@@ -79,7 +79,11 @@ fn a_hit_whose_bucket_leaves_the_window_unseen_never_converges() {
     oracle.view_changed(0, 0, B, 1, 1, NS_PER_S);
     assert_eq!(oracle.pending(), 1);
     oracle.bucket_boundary(5 * NS_PER_S, 0, B + live, &[None, None]);
-    assert_eq!((oracle.never_converged, oracle.pending()), (1, 0));
+    // Censored at the boundary that retired its bucket, 4 s after admission.
+    assert_eq!(
+        (oracle.censored_ns.clone(), oracle.pending()),
+        (vec![4 * NS_PER_S], 0)
+    );
     assert!(oracle.convergence_ns.is_empty());
 }
 
