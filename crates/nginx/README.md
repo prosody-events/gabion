@@ -476,7 +476,6 @@ they bound resource use.
 | `gabion_gossip_max_cells_per_frame N`           | `4096`  | Maximum cells encoded into one packet.                                                |
 | `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells emitted across all packets in one tick.                                 |
 | `gabion_gossip_send_queue_capacity N`           | `128`   | Outbound UDP send queue depth (per-peer slots in the leader).                         |
-| `gabion_gossip_limit_queue_capacity N`          | `8192`  | Capacity of the SHM queue the workers push QueueEvents into for the leader to drain.  |
 
 ### Storage — CRDT capacities
 

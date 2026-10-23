@@ -489,14 +489,6 @@ static mut NGX_HTTP_GABION_COMMANDS = [
         post: ptr::null_mut(),
     },
     ngx_command_t {
-        name: ngx_string!("gabion_gossip_limit_queue_capacity"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
-        set: Some(set_gossip_limit_queue_capacity),
-        conf: NGX_HTTP_MAIN_CONF_OFFSET,
-        offset: 0,
-        post: ptr::null_mut(),
-    },
-    ngx_command_t {
         name: ngx_string!("gabion_gossip_target_err_bps"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(set_gossip_target_err_bps),
@@ -1542,21 +1534,6 @@ extern "C" fn set_gossip_send_queue_capacity(
     )
 }
 
-extern "C" fn set_gossip_limit_queue_capacity(
-    cf: *mut ngx_conf_t,
-    _command: *mut ngx_command_t,
-    conf: *mut c_void,
-) -> *mut c_char {
-    set_usize(
-        cf,
-        conf,
-        "expected a positive integer (limit-queue slots)",
-        |main, value| {
-            main.gossip.limit_queue_capacity = value.max(1);
-        },
-    )
-}
-
 extern "C" fn set_gossip_target_err_bps(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
@@ -2099,10 +2076,7 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         discovery: main.discovery.clone(),
         cell_store: main.storage.cell_store_config(),
         rng_seed,
-        max_inflight: leader::DEFAULT_MAX_INFLIGHT,
-        drain_tick: leader::DEFAULT_DRAIN_TICK,
         lease_tick: leader::DEFAULT_LEASE_TICK,
-        lease_ttl: leader::DEFAULT_LEASE_TTL,
     };
 
     let handle = match leader::spawn(region, rules.clone(), cfg) {

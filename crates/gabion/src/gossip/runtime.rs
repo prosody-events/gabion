@@ -493,7 +493,7 @@ where
         // Reply is sent at the bottom of this loop iteration, AFTER the
         // post-iteration apply runs. Caller observes "ack ⇒ AggregateStore
         // reflects the increment".
-        self.pending_reply = Some(req.reply);
+        self.pending_reply = req.reply;
     }
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
