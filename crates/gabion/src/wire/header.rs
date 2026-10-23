@@ -1,10 +1,10 @@
-//! Fixed-length frame header — hand-rolled little-endian, exactly 72 bytes.
+//! Fixed-length frame header — hand-rolled little-endian, exactly 92 bytes.
 
 use super::DecodeError;
 
-pub const HEADER_LEN: usize = 72;
+pub const HEADER_LEN: usize = 92;
 pub const MAGIC: u32 = 0x4742_4732;
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 /// Set on every packet but the last in a multi-packet batch. Each packet is
 /// independently decodable — `FLAG_MORE` is only an advisory hint for
 /// receivers that want to defer downstream work until the batch settles.
@@ -21,6 +21,17 @@ pub struct Header {
     pub body_len: u32,
     pub min_origin_sequence: u64,
     pub max_origin_sequence: u64,
+    /// Exclusive lower bound of the sender's own origin sequences this packet
+    /// covers: it carries every live own cell with a sequence in
+    /// `(range_start, max_origin_sequence]`. A receiver that already holds the
+    /// sender's cells through `range_start` therefore holds them through
+    /// `max_origin_sequence`.
+    pub range_start: u64,
+    /// Cumulative ack: the sender has merged every live cell of the receiver's
+    /// own with `origin_sequence <= ack_sequence`, for the receiver's
+    /// incarnation `ack_incarnation`.
+    pub ack_sequence: u64,
+    pub ack_incarnation: u32,
     pub flags: u16,
 }
 
@@ -38,6 +49,9 @@ pub(crate) fn patch_header(buf: &mut [u8], hdr: &Header) {
     dst[52..56].copy_from_slice(&hdr.body_len.to_le_bytes());
     dst[56..64].copy_from_slice(&hdr.min_origin_sequence.to_le_bytes());
     dst[64..72].copy_from_slice(&hdr.max_origin_sequence.to_le_bytes());
+    dst[72..80].copy_from_slice(&hdr.range_start.to_le_bytes());
+    dst[80..88].copy_from_slice(&hdr.ack_sequence.to_le_bytes());
+    dst[88..92].copy_from_slice(&hdr.ack_incarnation.to_le_bytes());
 }
 
 pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, DecodeError> {
@@ -61,6 +75,9 @@ pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, DecodeError> {
     let body_len = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
     let min_origin_sequence = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
     let max_origin_sequence = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+    let range_start = u64::from_le_bytes(bytes[72..80].try_into().unwrap());
+    let ack_sequence = u64::from_le_bytes(bytes[80..88].try_into().unwrap());
+    let ack_incarnation = u32::from_le_bytes(bytes[88..92].try_into().unwrap());
     Ok(Header {
         cluster_id_hash,
         sender_node_id,
@@ -70,6 +87,9 @@ pub(crate) fn read_header(bytes: &[u8]) -> Result<Header, DecodeError> {
         body_len,
         min_origin_sequence,
         max_origin_sequence,
+        range_start,
+        ack_sequence,
+        ack_incarnation,
         flags,
     })
 }

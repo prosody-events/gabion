@@ -130,23 +130,20 @@ pub struct NodeState {
     /// Subset of `ticks_total` that were threshold-triggered (an eager flush
     /// crossing the per-rule error budget, not the heartbeat timer).
     pub threshold_fires: u64,
-    /// Subset of `ticks_total` during which at least one cell was dirty when
-    /// the peer pick ran — the ticks that actually carried gossip work.
+    /// Subset of `ticks_total` that queued at least one data packet — the
+    /// ticks that actually carried gossip work.
     pub dirty_ticks: u64,
-    /// Coverage fanout the most recent dirty tick chose: `⌈ln(peers)+c⌉`,
-    /// ≥ the base `config.fanout` floor and scaled by cluster size, not the
-    /// dirty set. `0` before the first emit.
+    /// Peers the most recent data-carrying tick sent to. `0` before the first
+    /// emit.
     pub effective_fanout: u32,
     /// High-water mark of `effective_fanout` — the widest this node has fanned
-    /// out, which rises with the peer count rather than with load.
+    /// out.
     pub peak_fanout: u32,
     /// The per-rule error budget ε at the most recent request: a rule's pending
     /// hits crossing it triggers an eager (threshold) flush. `0` until seen.
     pub error_budget: u64,
     /// Rows in the local-origin dirty ring awaiting gossip out.
     pub local_dirty_len: u32,
-    /// Rows in the forwarded (received-then-re-gossiped) dirty ring.
-    pub forwarded_dirty_len: u32,
     /// Outbound packets queued behind the transport right now.
     pub send_pending_depth: u64,
     /// High-water mark of `send_pending_depth` since startup — the only honest

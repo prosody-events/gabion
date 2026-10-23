@@ -24,9 +24,8 @@ pub struct SimConfig {
     /// Number of cluster members. Clamped to `1..=MAX_NODES` by
     /// [`SimConfig::validate`].
     pub nodes: usize,
-    /// Floor on peers contacted per gossip tick; the runtime scales the
-    /// actual fanout to the `⌈ln(n)+c⌉` coverage threshold (`n` = peer count).
-    /// See [`gabion::gossip::GossipConfig::fanout`].
+    /// Ignored by the runtime, which sends every round to every peer. See
+    /// [`gabion::gossip::GossipConfig::fanout`].
     pub fanout: usize,
     /// Period between proactive gossip ticks, in milliseconds.
     pub tick_interval_ms: u64,

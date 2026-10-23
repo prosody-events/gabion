@@ -12,15 +12,18 @@ pub struct DirtyEntry {
     pub origin_sequence: u64,
 }
 
-/// Bounded ring of recent change records. Overflow bumps `overflow_seq` so
-/// observers can detect that the recent-change stream is no longer
-/// authoritative.
+/// Bounded ring of recent change records, pushed in ascending
+/// `origin_sequence` order. Overflow bumps `overflow_seq` and raises
+/// `evicted_through` to the highest sequence the ring no longer holds, so a
+/// reader can tell whether the ring still contains every change newer than a
+/// sequence it has already seen.
 #[derive(Clone, Debug)]
 pub struct DirtyRing {
     entries: Box<[DirtyEntry]>,
     head: u32,
     len: u32,
     overflow_seq: u64,
+    evicted_through: u64,
 }
 
 impl DirtyRing {
@@ -37,6 +40,7 @@ impl DirtyRing {
             head: 0,
             len: 0,
             overflow_seq: 0,
+            evicted_through: 0,
         }
     }
 
@@ -56,6 +60,12 @@ impl DirtyRing {
         self.overflow_seq
     }
 
+    /// Highest `origin_sequence` of any entry the ring has overwritten or
+    /// cleared. The ring holds every change newer than this.
+    pub fn evicted_through(&self) -> u64 {
+        self.evicted_through
+    }
+
     pub fn overflowed(&self) -> bool {
         self.overflow_seq > 0
     }
@@ -64,10 +74,13 @@ impl DirtyRing {
         let cap = self.entries.len() as u32;
         if cap == 0 {
             self.overflow_seq = self.overflow_seq.saturating_add(1);
+            self.evicted_through = self.evicted_through.max(entry.origin_sequence);
             return;
         }
         if self.len == cap {
             self.overflow_seq = self.overflow_seq.saturating_add(1);
+            let oldest = self.entries[self.head as usize];
+            self.evicted_through = self.evicted_through.max(oldest.origin_sequence);
         } else {
             self.len += 1;
         }
@@ -85,6 +98,9 @@ impl DirtyRing {
     }
 
     pub fn clear(&mut self) {
+        if let Some(newest) = self.iter().last() {
+            self.evicted_through = self.evicted_through.max(newest.origin_sequence);
+        }
         self.head = 0;
         self.len = 0;
         self.overflow_seq = 0;

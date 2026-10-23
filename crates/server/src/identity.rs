@@ -1,8 +1,8 @@
 //! Build the gossip [`NodeIdentity`] at startup.
 //!
-//! `node_id` is a stable per-host identifier so `PeerFrontierTable` doesn't
-//! burn a peer slot on every restart. `incarnation` bumps on every boot so
-//! peers see a fresh per-origin sequence and don't silently prune our cells.
+//! `node_id` is a stable per-host identifier across restarts. `incarnation`
+//! bumps on every boot so peers see a fresh per-origin sequence space and
+//! discard acknowledgements that were for the previous boot.
 
 use std::net::UdpSocket;
 use std::process;
@@ -25,8 +25,9 @@ mod tests;
 ///    single bucketed identity.
 ///
 /// `incarnation` is unix epoch seconds clamped to `u32`, with a minimum of 1.
-/// Sub-second restarts reuse the same incarnation — peers catch up via the
-/// repair lane.
+/// Sub-second restarts reuse the same incarnation, so a peer's acknowledgement
+/// of the previous boot can be mistaken for one of the new boot, and a packet
+/// lost in that first moment is not retransmitted.
 pub fn derive_identity(seed_override: Option<&str>) -> NodeIdentity {
     let seed = seed_override
         .map(str::to_owned)

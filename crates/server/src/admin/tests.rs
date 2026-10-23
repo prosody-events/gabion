@@ -142,7 +142,6 @@ fn snapshot_returns_full_state_via_axum_route() {
 
         assert!(body["rules"].is_array(), "rules array missing");
         assert!(body["gossip"]["local_dirty_len"].is_u64());
-        assert!(body["gossip"]["forwarded_dirty_len"].is_u64());
         assert!(body["gossip"]["send_pending_depth"].is_u64());
 
         client.shutdown().await.unwrap();

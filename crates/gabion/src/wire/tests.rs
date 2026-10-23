@@ -11,7 +11,7 @@ use crate::crdt::{
 use super::{
     DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_MORE, FrameLimits,
     HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch, decode_auth,
-    decode_auth_visit, decode_unauth, decode_unauth_visit,
+    decode_auth_visit, decode_unauth, decode_unauth_visit, encode_ack_only,
 };
 
 const MAX_ROWS: usize = 32;
@@ -65,6 +65,9 @@ fn sample_header() -> Header {
         body_len: 0,
         min_origin_sequence: 0,
         max_origin_sequence: 0,
+        range_start: 0,
+        ack_sequence: 0,
+        ack_incarnation: 0,
         flags: 0,
     }
 }
@@ -867,4 +870,109 @@ fn visitor_matches_allocating_for_curated_rows() {
         assert_eq!(cell.count, obs.counts[i]);
         assert_eq!(cell.last_update_millis, obs.last_update_millis[i]);
     }
+}
+
+// -- Acks and covered ranges --------------------------------------------------
+
+fn ack_header() -> Header {
+    Header {
+        range_start: 10,
+        ack_sequence: 77,
+        ack_incarnation: 5,
+        ..sample_header()
+    }
+}
+
+#[test]
+fn every_packet_of_a_batch_carries_the_ack_and_a_contiguous_range() {
+    let mut store = store_with_cap::<u32>(256, 8);
+    let mut obs = ObservationBatch::<u32>::with_capacity(1);
+    let mut sink = DeltaSink::<u32>::with_capacity(1);
+    let mut handles = Vec::new();
+    for key in 0..100_u128 {
+        obs.clear();
+        obs.push(Observation {
+            rule_fingerprint: 0xA,
+            key_hash: KeyHash(key),
+            bucket: 0,
+            origin: NodeId(0),
+            incarnation: 0,
+            count: 1,
+            last_update_millis: 0,
+        });
+        sink.clear();
+        store.ingest_local(&obs, &mut sink);
+        handles.push(sink.handles[0]);
+    }
+    let sent_header = Header {
+        range_start: 0,
+        ..ack_header()
+    };
+    // A small payload budget forces several packets.
+    let limits = FrameLimits {
+        max_payload_bytes: 400,
+        max_cells: 4096,
+    };
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    let packets =
+        Packets::<u32>::unauth(sent_header, &store, &handles, &mut scratch, limits).unwrap();
+    let frames = drain_packets(packets, &mut buf);
+    assert!(frames.len() > 3, "the batch must span several packets");
+
+    let mut expected_start = 0;
+    let mut covered = 0;
+    for frame in &frames {
+        let header = decode_unauth_visit::<u32>(frame, limits, |_| true, |_| {})
+            .unwrap()
+            .header;
+        assert_eq!((header.ack_sequence, header.ack_incarnation), (77, 5));
+        assert_eq!(header.range_start, expected_start);
+        assert!(header.min_origin_sequence > header.range_start);
+        expected_start = header.max_origin_sequence;
+        covered += header.cell_count;
+    }
+    assert_eq!(covered, 100);
+}
+
+#[test]
+fn ack_only_packets_decode_with_no_cells_and_carry_the_ack() {
+    let limits = FrameLimits::default();
+    let mut buf = PacketBuf::for_limits(limits);
+
+    encode_ack_only::<u32>(ack_header(), None, &mut buf);
+    let plain = decode_unauth::<u32>(
+        buf.as_bytes(),
+        limits,
+        &mut ObservationBatch::with_capacity(1),
+    )
+    .unwrap();
+    assert_eq!(plain.cell_count, 0);
+    assert_eq!(plain.header.flags & FLAG_AUTHENTICATED, 0);
+    assert_eq!(
+        (plain.header.ack_sequence, plain.header.ack_incarnation),
+        (77, 5)
+    );
+    assert_eq!(plain.header.range_start, 0, "no cells cover nothing");
+
+    let key = HmacKey([3; 32]);
+    encode_ack_only::<u32>(ack_header(), Some(&key), &mut buf);
+    let signed = decode_auth::<u32>(
+        buf.as_bytes(),
+        &key,
+        limits,
+        &mut ObservationBatch::with_capacity(1),
+    )
+    .unwrap();
+    assert_ne!(signed.header.flags & FLAG_AUTHENTICATED, 0);
+    assert_eq!(signed.header.ack_sequence, 77);
+    assert_eq!(
+        decode_auth::<u32>(
+            buf.as_bytes(),
+            &HmacKey([4; 32]),
+            limits,
+            &mut ObservationBatch::with_capacity(1),
+        ),
+        Err(DecodeError::AuthenticationFailed)
+    );
 }
