@@ -10,6 +10,11 @@ pub const VERSION: u16 = 1;
 /// receivers that want to defer downstream work until the batch settles.
 pub const FLAG_MORE: u16 = 0x01;
 pub const FLAG_AUTHENTICATED: u16 = 0x02;
+/// The body is a digest of the sender's held origin sequences, not cells.
+pub const FLAG_DIGEST: u16 = 0x04;
+/// Set on a digest sent in answer to another digest, so it is not answered
+/// in turn.
+pub const FLAG_REPLY: u16 = 0x08;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {

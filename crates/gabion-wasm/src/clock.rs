@@ -14,6 +14,7 @@
 //! once — the determinism the shareable-URL replay relies on.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -25,26 +26,40 @@ use tokio::sync::mpsc;
 /// cluster's bucket clock at once.
 pub type SharedNow = Rc<Cell<u64>>;
 
-/// One node's clock: shared time plus that node's own tick inbox. Built per
+/// One node's clock: shared time plus that node's own tick inboxes. Built per
 /// node by the engine; not `Clone` (the `mpsc::Receiver` is single-consumer).
 pub struct ManualClock {
     now: SharedNow,
-    /// Taken once by [`Clock::ticker`]; `RefCell<Option<_>>` so the `&self`
-    /// trait method can move the receiver out.
-    tick_rx: RefCell<Option<mpsc::Receiver<()>>>,
+    /// Taken in order by [`Clock::ticker`], one per call: the runtime asks for
+    /// its gossip ticker first and its repair ticker second. `RefCell` so the
+    /// `&self` trait method can move a receiver out.
+    tick_rxs: RefCell<VecDeque<mpsc::Receiver<()>>>,
+}
+
+/// The senders the engine keeps for one node's [`ManualClock`].
+pub struct TickSenders {
+    /// Fires the node's gossip tick.
+    pub gossip: mpsc::Sender<()>,
+    /// Fires the node's digest repair tick.
+    pub repair: mpsc::Sender<()>,
 }
 
 impl ManualClock {
-    /// Pair this node's clock with the tick sender the engine keeps.
-    pub fn new(now: SharedNow) -> (Self, mpsc::Sender<()>) {
+    /// Pair this node's clock with the tick senders the engine keeps.
+    pub fn new(now: SharedNow) -> (Self, TickSenders) {
         // Capacity well above the at-most-one-unconsumed-tick-per-drain the
         // engine produces; sized so a fire never blocks.
-        let (tick_tx, tick_rx) = mpsc::channel(256);
+        let (gossip_tx, gossip_rx) = mpsc::channel(256);
+        let (repair_tx, repair_rx) = mpsc::channel(256);
         let clock = Self {
             now,
-            tick_rx: RefCell::new(Some(tick_rx)),
+            tick_rxs: RefCell::new(VecDeque::from([gossip_rx, repair_rx])),
         };
-        (clock, tick_tx)
+        let senders = TickSenders {
+            gossip: gossip_tx,
+            repair: repair_tx,
+        };
+        (clock, senders)
     }
 }
 
@@ -56,11 +71,9 @@ impl Clock for ManualClock {
     }
 
     fn ticker(&self, _interval: Duration) -> ManualTicker {
-        let rx = self
-            .tick_rx
-            .borrow_mut()
-            .take()
-            .expect("ManualClock::ticker called more than once");
+        // A ticker beyond the two the runtime asks for parks forever.
+        let (_, rx) = mpsc::channel(1);
+        let rx = self.tick_rxs.borrow_mut().pop_front().unwrap_or(rx);
         ManualTicker(rx)
     }
 }

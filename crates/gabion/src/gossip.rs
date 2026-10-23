@@ -24,6 +24,7 @@ use crate::wire::{self, FrameLimits, HmacKey};
 mod admin;
 mod client;
 mod clock;
+mod repair;
 mod runtime;
 pub mod sim;
 mod store;
@@ -55,15 +56,10 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Floor on the number of peers contacted per gossip tick. The runtime
-    /// scales the actual per-tick fanout to the coverage threshold
-    /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
-    /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
-    /// hard minimum when that threshold falls below it.
+    /// Ignored: every round sends a node's own changes to every peer.
     pub fanout: usize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
-    /// tick. The wire codec splits this into multiple packets if needed.
+    /// How many of its own changes a node sends per round. The wire codec
+    /// splits them into multiple packets if needed.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,
@@ -74,6 +70,12 @@ pub struct GossipConfig {
     pub limit_queue_capacity: usize,
     /// Period between proactive gossip ticks.
     pub tick_interval: Duration,
+    /// Period between digest repair exchanges with one random peer. See
+    /// [`crate::defaults::GOSSIP_REPAIR_PERIOD_MILLIS`].
+    pub repair_period: Duration,
+    /// Cells sent in answer to digests per repair period. See
+    /// [`crate::defaults::GOSSIP_REPAIR_MAX_CELLS`].
+    pub repair_max_cells: usize,
     /// Optional HMAC key — when set, every outbound packet is authenticated
     /// and inbound packets must verify.
     pub auth_key: Option<HmacKey>,
@@ -100,6 +102,8 @@ impl Default for GossipConfig {
             send_queue_capacity: 32,
             limit_queue_capacity: 1024,
             tick_interval: Duration::from_millis(100),
+            repair_period: Duration::from_millis(crate::defaults::GOSSIP_REPAIR_PERIOD_MILLIS),
+            repair_max_cells: crate::defaults::GOSSIP_REPAIR_MAX_CELLS,
             auth_key: None,
             rng_seed: crate::defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
             target_err_bps: crate::defaults::GOSSIP_TARGET_ERR_BPS,
