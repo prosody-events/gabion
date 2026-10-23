@@ -95,12 +95,15 @@ NGINX_BASE_IMAGE=nginx:mainline-alpine make nginx-module
 make nginx-test
 ```
 
-This target builds the module, starts NGINX with the smoke config, and
-runs `deploy/nginx/module-request-smoke.sh`. The script first checks
-that the rendered config carries every directive it should, and then
-verifies that the rate-limit rules return `200`, `200`, `429` in
-order. When an assertion fails, you can run the script by hand inside
-the container to narrow down which step went wrong.
+This target builds the module for `nginx:stable-alpine` and for
+`openresty/openresty:alpine`, the OpenResty flavor production runs
+(override with `NGINX_BASE_IMAGE` / `OPENRESTY_BASE_IMAGE`). For each,
+it starts the server with the smoke config and runs
+`deploy/nginx/module-request-smoke.sh`. The script first checks that
+the rendered config carries every directive it should, and then
+verifies that the rate-limit rules return `200`, `200`, `429` in order.
+When an assertion fails, you can run the script by hand inside the
+container to narrow down which step went wrong.
 
 ## Build matrices
 

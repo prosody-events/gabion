@@ -139,19 +139,23 @@ jobs:
           sudo mkdir -p /tmp/cores
           sudo chmod 1777 /tmp/cores
           sudo sysctl -w kernel.core_pattern='/tmp/cores/core.%e.%p'
-      # Warm the `target: smoke` image from the canonical build cache, then
-      # run without `--build` (see nginx-module). Same image, different
-      # command — the request smoke asserts 200, 200, 429.
-      - name: warm smoke image from registry cache
+      # Warm the nginx and OpenResty alpine (the flavor production runs)
+      # `target: smoke` images from their canonical build caches, then run
+      # the request smoke without `--build` (see nginx-module).
+      - name: warm smoke images from registry cache
         run: |
-          docker buildx build \
-            --load \
-            --target smoke \
-            --build-arg NGINX_BASE_IMAGE=nginx:stable-alpine \
-            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}/nginx:buildcache-nginx-stable-alpine-amd64 \
-            -f deploy/nginx/Dockerfile \
-            -t nginx-nginx-module-request-smoke:latest \
-            .
+          warm() { # <image> <flavor> <base-arg> <dockerfile>
+            docker buildx build \
+              --load \
+              --target smoke \
+              --build-arg "$3" \
+              --cache-from "type=registry,ref=ghcr.io/${{ github.repository }}/$1:buildcache-$1-$2-amd64" \
+              -f "$4" \
+              -t "nginx-$1-module-request-smoke:latest" \
+              .
+          }
+          warm nginx stable-alpine NGINX_BASE_IMAGE=nginx:stable-alpine deploy/nginx/Dockerfile
+          warm openresty alpine OPENRESTY_BASE_IMAGE=openresty/openresty:alpine deploy/nginx/Dockerfile.openresty
       - name: nginx-test smoke
         env:
           DOCKER_BUILDKIT: '1'
