@@ -23,6 +23,7 @@ the [repo root README](../../README.md#glossary).
   - [Coverage fanout](#coverage-fanout)
   - [Adaptive emit rate](#adaptive-emit-rate)
   - [Dirty rings and the peer frontier](#dirty-rings-and-the-peer-frontier)
+- [Design notes](#design-notes)
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
 - [References](#references)
@@ -358,6 +359,35 @@ next repair-lane sweep picks the dropped cell back up.
 `CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
 debug the CRDT.
+
+## Design notes
+
+This branch is the **local-only reference arm**: every node admits against its
+own counts only, so cluster-wide over-admission is up to N x limit and
+bandwidth is zero. It is a measurement floor, not a candidate. Per-instance
+local limits multiplying the limit by the instance count is the standard
+failure mode of unsynchronised rate limiters (see the study survey,
+`study/research.md`, section 3.4 `local-only`).
+
+- `GossipRuntime` never encodes or sends a datagram: no heartbeat rounds, no
+  threshold rounds, no repair. Inbound datagrams are read off the transport
+  and discarded.
+- Admission, the `CellStore` CRDT, the wire codec and the aggregate sinks are
+  unchanged. The only periodic work is the expiry tick (every
+  `tick_interval`), which ages out cells and emits the matching decrements.
+- Membership events from discovery are tracked only so the admin snapshot can
+  list them; nothing is sent to those peers.
+- The design has no parameters. `fanout`, `send_queue_capacity`,
+  `target_err_bps`, `min_emit_interval` and the use of `bootstrap_peers` as
+  send targets are now no-ops, as is the `rule_limit` argument of
+  `GossipClient::record`. The gossip-side `AdminSnapshot` counters
+  (`send_pending_depth`, `decode_reject_count`, `max_send_pending_depth`,
+  `threshold_fires`, `dirty_ticks`, `*_fanout`, `last_error_budget`) are
+  constant zero.
+- The CRDT still records every local change in its local dirty ring, which is
+  never drained, so a node that writes more than `local_dirty_capacity`
+  changes logs "dirty ring overflowed" warnings that do not apply to this
+  arm. The harness flags but does not invalidate on them.
 
 ## Operator knobs
 
