@@ -773,20 +773,13 @@ where
         // then never hear them. A pool smaller than the pick waits until it
         // is wholly free.
         if self.send_free.len() < pick_count.min(self.send_pool.len()) {
+            // Keep the pending hits too, but restart the emit floor, so a
+            // blocked socket does not turn every later request into another
+            // round that cannot send.
+            self.stamp_emits(now_millis);
             return;
         }
 
-        // A round with changes is a "dirty tick", so effective fanout
-        // reports `packets / dirty_ticks` rather than `packets / wall_ticks`.
-        // A quiet heartbeat still runs, but only to send the repair slice.
-        // Record the coverage-fanout decision too, so observers can read the
-        // pick directly instead of reconstructing the formula: the fanout of
-        // the most recent round that sent changes.
-        if !self.store.local_dirty().is_empty() || !self.store.forwarded_dirty().is_empty() {
-            self.dirty_ticks = self.dirty_ticks.saturating_add(1);
-            self.last_effective_fanout = pick_count;
-            self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
-        }
         for i in 0..pick_count {
             let j = i + (self.rng.next_u64() as usize) % (n - i);
             self.peers.swap(i, j);
@@ -795,6 +788,7 @@ where
         // Anti-entropy with one random partner per heartbeat (Demers et al.,
         // PODC 1987): the shuffle above makes the first pick random, so it
         // alone carries the repair slice. The changes go to every pick.
+        let mut sent_changes = false;
         let mut repair_cells = match round {
             Round::Heartbeat => crate::defaults::GOSSIP_REPAIR_CELLS_PER_TICK,
             Round::Threshold => 0,
@@ -822,7 +816,18 @@ where
             if self.frame_handles.is_empty() {
                 continue;
             }
+            sent_changes |= changes > 0;
             self.encode_packets_for(peer_addr, share, changes);
+        }
+        // A round that carried changes is a "dirty tick", so effective fanout
+        // reports `packets / dirty_ticks` rather than `packets / wall_ticks`;
+        // a quiet heartbeat sends only the repair slice. Record the pick too,
+        // so observers can read the coverage fanout of the most recent round
+        // that sent changes instead of reconstructing the formula.
+        if sent_changes {
+            self.dirty_ticks = self.dirty_ticks.saturating_add(1);
+            self.last_effective_fanout = pick_count;
+            self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
         }
         self.end_round(now_millis);
     }
@@ -846,11 +851,20 @@ where
         // holds in expectation. A strict bound
         // would require ack-aware reset against `peer_frontiers`,
         // deferred until measurements show drift.
+        self.stamp_emits(now_millis);
+        self.rule_pending.fill(0);
+    }
+
+    /// Restart the emit floor for every rule with pending hits.
+    fn stamp_emits(&mut self, now_millis: u64) {
         let stamp = now_millis.max(1);
-        for slot in 0..self.rule_pending.len() {
-            if self.rule_pending[slot] != 0 {
-                self.rule_pending[slot] = 0;
-                self.rule_last_emit_ms[slot] = stamp;
+        for (pending, last_emit) in self
+            .rule_pending
+            .iter()
+            .zip(self.rule_last_emit_ms.iter_mut())
+        {
+            if *pending != 0 {
+                *last_emit = stamp;
             }
         }
     }
@@ -898,9 +912,18 @@ where
             let buf = &mut self.send_pool[slot];
             match packets.next_into(buf) {
                 Ok(Some(_)) => self.send_pending.push_back((dst, slot)),
-                Ok(None) | Err(_) => {
+                Ok(None) => {
                     self.send_free.push(slot);
                     break;
+                }
+                Err(_) => {
+                    // `Packets::new` checked that the payload fits a cell, so
+                    // the encoder cannot run short mid-frame; this is not a
+                    // send-queue cut and must not be reported as one.
+                    debug_assert!(false, "gossip packet encoding failed mid-frame");
+                    self.send_free.push(slot);
+                    packets.abandon();
+                    return;
                 }
             }
         }

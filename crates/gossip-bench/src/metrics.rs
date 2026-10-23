@@ -51,9 +51,11 @@ pub struct TickSnapshot {
     /// derive `heartbeat_fires_total = ticks_total - threshold_fires_total`.
     #[serde(default)]
     pub ticks_total: u64,
-    /// Cumulative count of ticks (summed across nodes) that found at least
-    /// one dirty cell. Used to compute the *effective* fanout —
-    /// `packets_sent_total / dirty_ticks_total` across a sample window.
+    /// Cumulative count of rounds (summed across nodes) whose frames carried
+    /// at least one change. Used to compute the *effective* fanout —
+    /// `packets_sent_total / dirty_ticks_total` across a sample window. The
+    /// packets include quiet heartbeats' repair slices, so light traffic
+    /// inflates the ratio; `peak_effective_fanout` is the pick itself.
     #[serde(default)]
     pub dirty_ticks_total: u64,
     /// Largest `peak_effective_fanout` any node has reached as of this

@@ -2342,6 +2342,56 @@ async fn threshold_rounds_without_peers_respect_the_emit_floor() {
         .await;
 }
 
+/// A round that finds the send queue blocked keeps its changes, but restarts
+/// the emit floor. Otherwise every later request past the error budget would
+/// dispatch another threshold round that cannot send, each a full expiry scan.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn threshold_rounds_on_a_blocked_socket_respect_the_emit_floor() {
+    use tokio::sync::mpsc;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            // Channel cap 1, never drained: the second packet blocks the only
+            // send slot for the rest of the test.
+            let router = SimRouter::with_channel_capacity(1);
+            let addr_b = sock(56_001);
+            let _inbox = router.bind(addr_b);
+            let id = NodeIdentity::new(NodeId(0xF1), 1);
+            let mut cfg = sim_config(id, vec![addr_b], 1);
+            cfg.send_queue_capacity = 1;
+            let (admin_tx, admin_rx) = mpsc::channel(4);
+            let (rt, client) = GossipRuntime::from_parts_with_admin(
+                router.bind(sock(56_000)),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(id),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+
+            // Limit 1, so every request past the second is over the budget.
+            // The first rounds fill the channel and then block the only slot.
+            for _ in 0..10 {
+                client.record(0xF15, KeyHash(1), 0, 1, 1, 0).await.unwrap();
+            }
+            // Past the emit floor, then a burst that stays inside the next one.
+            sim_advance(Duration::from_millis(10)).await;
+            let before = admin_snapshot(&admin_tx).await.threshold_fires;
+            for _ in 0..50 {
+                client.record(0xF15, KeyHash(1), 0, 1, 1, 10).await.unwrap();
+            }
+
+            let fires = admin_snapshot(&admin_tx).await.threshold_fires - before;
+            assert!(fires <= 1, "{fires} threshold rounds for 50 requests");
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
+        })
+        .await;
+}
+
 // -- Gap 5: DropProb i.i.d. packet loss -------------------------------------
 
 #[derive(Clone, Debug)]
