@@ -22,11 +22,6 @@
 //! * `find/miss`                  — pure miss path, for the Robin Hood
 //!   early-exit baseline.
 //!
-//! * `fill_gossip_frame/steady_state` — moderately loaded node: some dirty
-//!   entries + repair lane filling the rest of a 128-cell frame budget.
-//! * `fill_gossip_frame/repair_only`  — dirty rings empty (gossip went idle);
-//!   pure repair sweep.
-//!
 //! * `expire/window_turnover`     — one bucket out of four ages out per call;
 //!   the steady-state expiry pattern.
 //! * `expire/no_expirations`      — scan-only cost, no frees.
@@ -929,65 +924,6 @@ impl std::fmt::Write for SliceWriter<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// fill_gossip_frame — outbound gossip composition.
-// ---------------------------------------------------------------------------
-
-fn bench_fill_gossip_frame(c: &mut Criterion) {
-    let mut group = c.benchmark_group("crdt/fill_gossip_frame");
-    group.throughput(Throughput::Elements(128));
-
-    let fixture = build_fixture();
-
-    // ─── steady_state ───────────────────────────────────────────────────
-    // Moderately loaded node: dirty rings contain ~64 recent updates;
-    // repair lane fills the remaining 64 slots of a 128-handle frame.
-    let mut steady = fixture.store.clone();
-    {
-        // Generate ~64 recent local updates so local_dirty has entries.
-        let mut rng = Rng::new(0xD1_D1_D1);
-        let mut obs = ObservationBatch::<u32>::with_capacity(64);
-        let mut sink = DeltaSink::<u32>::with_capacity(64);
-        for _ in 0..64 {
-            let key = pareto_key(&mut rng, &fixture.hot_keys, &fixture.warm_keys);
-            let rule_idx = pick_rule(&mut rng) as usize;
-            obs.push(obs_row(
-                fixture.rule_fps[rule_idx],
-                KeyHash(key),
-                0,
-                LOCAL_NODE,
-                LOCAL_INCARNATION,
-                1,
-                0,
-            ));
-        }
-        steady.ingest_local(&obs, &mut sink);
-    }
-    group.bench_function("steady_state", |b| {
-        // fill_gossip_frame only mutates selection_marks (per-frame
-        // ephemeral) and repair_cursor (advances round-robin); over many
-        // iterations the repair cursor wraps but no identity changes ⇒
-        // iter without cloning.
-        let mut out = Vec::<CellHandle>::with_capacity(128);
-        b.iter(|| {
-            steady.fill_gossip_frame(black_box(128), black_box(&mut out));
-        });
-    });
-
-    // ─── repair_only ────────────────────────────────────────────────────
-    // Dirty rings drained; frame composition is entirely the repair scan.
-    let mut repair = fixture.store.clone();
-    repair.clear_dirty();
-    group.bench_function("repair_only", |b| {
-        let mut out = Vec::<CellHandle>::with_capacity(128);
-        b.iter(|| {
-            repair.fill_gossip_frame(black_box(128), black_box(&mut out));
-        });
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
 // expire — periodic sweep.
 // ---------------------------------------------------------------------------
 
@@ -1079,10 +1015,8 @@ fn bench_wire(c: &mut Criterion) {
     // ─── encode_128 ────────────────────────────────────────────────────
     // Compose a 128-cell frame from the fixture, then encode into a
     // pre-allocated buffer. Resembles the runtime's per-tick send path.
-    let mut encode_store = fixture.store.clone();
-    let mut handles = Vec::<CellHandle>::with_capacity(128);
-    encode_store.fill_gossip_frame(128, &mut handles);
-    let handles = handles; // freeze for the closure
+    let encode_store = fixture.store.clone();
+    let handles: Vec<CellHandle> = encode_store.active_handles().take(128).collect();
     group.bench_function("encode_128", |b| {
         let mut scratch = WireScratch::for_store(&encode_store);
         let mut buf = PacketBuf::for_limits(limits);
@@ -1106,10 +1040,8 @@ fn bench_wire(c: &mut Criterion) {
     // 4096-cell fixture under a 64 KiB UDP-style budget. Measures the
     // steady-state multi-packet emission rate — drains the full handle
     // list across however many packets it takes (target ~9–10).
-    let mut multi_store = fixture.store.clone();
-    let mut multi_handles = Vec::<CellHandle>::with_capacity(4096);
-    multi_store.fill_gossip_frame(4096, &mut multi_handles);
-    let multi_handles = multi_handles;
+    let multi_store = fixture.store.clone();
+    let multi_handles: Vec<CellHandle> = multi_store.active_handles().take(4096).collect();
     let multi_limits = FrameLimits {
         max_payload_bytes: 64 * 1024,
         max_cells: 4096,
@@ -1200,7 +1132,6 @@ criterion_group!(
     bench_merge_remote,
     bench_find,
     bench_admission_headers,
-    bench_fill_gossip_frame,
     bench_expire,
     bench_wire,
 );

@@ -145,6 +145,15 @@ pub const ENV_BINDINGS: &[EnvBinding] = &[
     // gossip.*
     EnvBinding::scalar("GABION_GOSSIP_BIND", "gossip.bind"),
     EnvBinding::scalar("GABION_GOSSIP_TICK_INTERVAL", "gossip.tick_interval"),
+    EnvBinding::scalar("GABION_GOSSIP_SYNC_WAIT", "gossip.sync_wait"),
+    EnvBinding::scalar(
+        "GABION_GOSSIP_BROADCAST_INTERVAL",
+        "gossip.broadcast_interval",
+    ),
+    EnvBinding::scalar(
+        "GABION_GOSSIP_BROADCAST_BATCH_LIMIT",
+        "gossip.broadcast_batch_limit",
+    ),
     EnvBinding::scalar("GABION_GOSSIP_FANOUT", "gossip.fanout"),
     EnvBinding::scalar(
         "GABION_GOSSIP_MAX_PAYLOAD_BYTES",
@@ -408,6 +417,17 @@ pub struct GossipSettings {
     pub bind: Option<SocketAddr>,
     #[serde(with = "humantime_serde")]
     pub tick_interval: Duration,
+    /// How often hits are sent to the owners of their keys. See
+    /// [`gabion::defaults::GOSSIP_SYNC_WAIT_MS`].
+    #[serde(with = "humantime_serde")]
+    pub sync_wait: Duration,
+    /// How often a key's owner broadcasts its changed cells to every peer.
+    /// See [`gabion::defaults::GOSSIP_BROADCAST_INTERVAL_MS`].
+    #[serde(with = "humantime_serde")]
+    pub broadcast_interval: Duration,
+    /// Most cells in one owner broadcast. See
+    /// [`gabion::defaults::GOSSIP_BROADCAST_BATCH_LIMIT`].
+    pub broadcast_batch_limit: usize,
     pub fanout: usize,
     pub max_payload_bytes: usize,
     pub max_cells_per_frame: u32,
@@ -431,6 +451,9 @@ impl Default for GossipSettings {
         Self {
             bind: None,
             tick_interval: Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS),
+            sync_wait: Duration::from_millis(defaults::GOSSIP_SYNC_WAIT_MS),
+            broadcast_interval: Duration::from_millis(defaults::GOSSIP_BROADCAST_INTERVAL_MS),
+            broadcast_batch_limit: defaults::GOSSIP_BROADCAST_BATCH_LIMIT,
             fanout: defaults::GOSSIP_FANOUT,
             max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
             max_cells_per_frame: defaults::GOSSIP_MAX_CELLS_PER_FRAME,
@@ -462,6 +485,9 @@ impl GossipSettings {
             send_queue_capacity: self.send_queue_capacity,
             limit_queue_capacity: self.limit_queue_capacity,
             tick_interval: self.tick_interval,
+            sync_wait: self.sync_wait,
+            broadcast_interval: self.broadcast_interval,
+            broadcast_batch_limit: self.broadcast_batch_limit,
             auth_key: None,
             rng_seed,
             target_err_bps: self.target_err_bps,

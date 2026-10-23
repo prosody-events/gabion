@@ -10,6 +10,42 @@ pub const VERSION: u16 = 1;
 /// receivers that want to defer downstream work until the batch settles.
 pub const FLAG_MORE: u16 = 0x01;
 pub const FLAG_AUTHENTICATED: u16 = 0x02;
+/// The packet carries a contributor's own cells to the owner of their keys.
+pub const FLAG_SYNC: u16 = 0x04;
+/// The packet echoes cells an owner has folded, acknowledging a sync.
+pub const FLAG_ACK: u16 = 0x08;
+
+/// What a packet's cells are for, carried in the [`FLAG_SYNC`] and
+/// [`FLAG_ACK`] bits. A packet is exactly one kind; both bits set is not a
+/// kind and fails to parse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameKind {
+    /// An owner's changed cells, sent to every peer.
+    Broadcast,
+    /// A contributor's own cells, sent to the owner of their keys.
+    Sync,
+    /// An owner's acknowledgement of the cells in a [`FrameKind::Sync`].
+    Ack,
+}
+
+impl FrameKind {
+    pub fn flags(self) -> u16 {
+        match self {
+            Self::Broadcast => 0,
+            Self::Sync => FLAG_SYNC,
+            Self::Ack => FLAG_ACK,
+        }
+    }
+
+    pub fn from_flags(flags: u16) -> Option<Self> {
+        match flags & (FLAG_SYNC | FLAG_ACK) {
+            0 => Some(Self::Broadcast),
+            FLAG_SYNC => Some(Self::Sync),
+            FLAG_ACK => Some(Self::Ack),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {

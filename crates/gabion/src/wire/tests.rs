@@ -9,9 +9,9 @@ use crate::crdt::{
 };
 
 use super::{
-    DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_MORE, FrameLimits,
-    HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch, decode_auth,
-    decode_auth_visit, decode_unauth, decode_unauth_visit,
+    DecodeError, DecodedSummary, EncodeError, FLAG_ACK, FLAG_AUTHENTICATED, FLAG_MORE, FLAG_SYNC,
+    FrameKind, FrameLimits, HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch,
+    decode_auth, decode_auth_visit, decode_unauth, decode_unauth_visit,
 };
 
 const MAX_ROWS: usize = 32;
@@ -689,6 +689,50 @@ fn visitor_accept_header_short_circuit() {
         decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_h| false, |_c| visited += 1)
             .expect("decode");
     assert_eq!(visited, 0);
+}
+
+#[test]
+fn frame_kind_survives_encode_and_a_double_kind_is_rejected() {
+    let rows = vec![RawRow {
+        rule_fingerprint: 1,
+        key_hash: 2,
+        bucket: 3,
+        origin_node_id: 3,
+        origin_incarnation: 1,
+        count: 4,
+        last_update_millis: 5,
+    }];
+    let (store, handles) = seed_store::<u32>(&rows, |c| c);
+    let limits = FrameLimits::default();
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    for kind in [FrameKind::Broadcast, FrameKind::Sync, FrameKind::Ack] {
+        let header = Header {
+            flags: kind.flags(),
+            ..sample_header()
+        };
+        let mut packets =
+            Packets::<u32>::unauth(header, &store, &handles, &mut scratch, limits).expect("ctor");
+        packets.next_into(&mut buf).expect("encode").expect("some");
+        drop(packets);
+        let summary =
+            decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_| true, |_| ()).expect("decode");
+        assert_eq!(FrameKind::from_flags(summary.flags), Some(kind));
+    }
+
+    let header = Header {
+        flags: FLAG_SYNC | FLAG_ACK,
+        ..sample_header()
+    };
+    let mut packets =
+        Packets::<u32>::unauth(header, &store, &handles, &mut scratch, limits).expect("ctor");
+    packets.next_into(&mut buf).expect("encode").expect("some");
+    drop(packets);
+    let mut obs = ObservationBatch::<u32>::with_capacity(1);
+    assert_eq!(
+        decode_unauth::<u32>(buf.as_bytes(), limits, &mut obs).unwrap_err(),
+        DecodeError::BadKind
+    );
 }
 
 #[test]

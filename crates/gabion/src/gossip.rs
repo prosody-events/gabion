@@ -4,9 +4,12 @@
 //! [`crate::crdt::CellStore`], a datagram [`GossipTransport`], a
 //! [`Clock`] for bucket arithmetic and tick scheduling, and a downstream
 //! [`AggregateStore`] that absorbs the resulting delta and expiration rows.
-//! A single `tokio::select!` drives five arms (limit request, inbound,
-//! writable, peer event, tick) and calls `aggregates.apply(...)` once per
-//! CRDT-touching iteration.
+//! Each `(rule, key)` has one owner chosen by rendezvous hash over the
+//! discovered membership: contributors send their hits to it, it folds them
+//! and broadcasts the changed cells to every peer. A single `tokio::select!`
+//! drives the arms (limit request, inbound, writable, peer event, admin, and
+//! three tickers) and calls `aggregates.apply(...)` once per CRDT-touching
+//! iteration.
 //!
 //! All polymorphic boundaries are monomorphized generics — no `dyn`, no
 //! `Box`. The production hot path is branch-free; tests and simulators
@@ -24,7 +27,10 @@ use crate::wire::{self, FrameLimits, HmacKey};
 mod admin;
 mod client;
 mod clock;
+mod membership;
+mod outbox;
 mod runtime;
+mod send_queue;
 pub mod sim;
 mod store;
 mod transport;
@@ -55,15 +61,10 @@ pub struct GossipConfig {
     pub cluster_id_hash: u128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
-    /// Floor on the number of peers contacted per gossip tick. The runtime
-    /// scales the actual per-tick fanout to the coverage threshold
-    /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =
-    /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
-    /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
-    /// hard minimum when that threshold falls below it.
+    /// Unused: owner aggregation has no random fanout.
     pub fanout: usize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
-    /// tick. The wire codec splits this into multiple packets if needed.
+    /// Most local cells a node sends to key owners in one sync. The wire
+    /// codec splits them into as many packets as they need.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,
@@ -72,19 +73,26 @@ pub struct GossipConfig {
     pub send_queue_capacity: usize,
     /// Capacity of the incoming limit-request mpsc channel.
     pub limit_queue_capacity: usize,
-    /// Period between proactive gossip ticks.
+    /// Period of the housekeeping tick that expires cells whose bucket has
+    /// left its rule's window.
     pub tick_interval: Duration,
+    /// How often hits are sent to key owners and unacknowledged hits are
+    /// re-sent. See [`crate::defaults::GOSSIP_SYNC_WAIT_MS`].
+    pub sync_wait: Duration,
+    /// How often an owner broadcasts its changed cells to every peer. See
+    /// [`crate::defaults::GOSSIP_BROADCAST_INTERVAL_MS`].
+    pub broadcast_interval: Duration,
+    /// Most cells in one owner broadcast. See
+    /// [`crate::defaults::GOSSIP_BROADCAST_BATCH_LIMIT`].
+    pub broadcast_batch_limit: usize,
     /// Optional HMAC key — when set, every outbound packet is authenticated
     /// and inbound packets must verify.
     pub auth_key: Option<HmacKey>,
-    /// Deterministic RNG seed for peer sampling.
+    /// Unused: owner aggregation draws no random numbers.
     pub rng_seed: u64,
-    /// Per-rule error budget in basis points of the rule's own limit, used
-    /// for threshold-triggered anti-entropy. See
-    /// [`crate::defaults::GOSSIP_TARGET_ERR_BPS`].
+    /// Unused: owner aggregation has no threshold-triggered emit.
     pub target_err_bps: u32,
-    /// Minimum gap between two threshold-fire emissions, in milliseconds.
-    /// See [`crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
+    /// Unused: owner aggregation has no threshold-triggered emit.
     pub min_emit_interval: Duration,
 }
 
@@ -100,6 +108,11 @@ impl Default for GossipConfig {
             send_queue_capacity: 32,
             limit_queue_capacity: 1024,
             tick_interval: Duration::from_millis(100),
+            sync_wait: Duration::from_millis(crate::defaults::GOSSIP_SYNC_WAIT_MS),
+            broadcast_interval: Duration::from_millis(
+                crate::defaults::GOSSIP_BROADCAST_INTERVAL_MS,
+            ),
+            broadcast_batch_limit: crate::defaults::GOSSIP_BROADCAST_BATCH_LIMIT,
             auth_key: None,
             rng_seed: crate::defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
             target_err_bps: crate::defaults::GOSSIP_TARGET_ERR_BPS,

@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
-use crate::clock::{ManualClock, SharedNow};
+use crate::clock::{ManualClock, SharedNow, TickSenders};
 use crate::config::{ConfigError, SimConfig};
 use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView};
 use crate::shims::{AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport};
@@ -52,51 +52,17 @@ const CLUSTER_ID_HASH: u128 = 0xC1;
 const LOCAL_RULE_ID: u32 = 0;
 
 /// The visualizer's per-node gossip buffer sizing. **Not** the library
-/// production defaults (`GOSSIP_SEND_QUEUE_CAPACITY` = 128, tuned for a
-/// deployment whose per-tick output is small): the visualizer drives a far
-/// denser regime — up to `MAX_NODES` runtimes on one thread under a 100-node
-/// sustained-overload peak — so it sizes its own pool to that regime.
+/// production defaults (`GOSSIP_SEND_QUEUE_CAPACITY` = 128): the visualizer
+/// runs up to `MAX_NODES` runtimes on one thread, so it sizes its own pool.
 ///
-/// The invariant that fixes the high-node gossip freeze: **the send pool must
-/// hold one tick's worst-case packet output, with headroom for any cross-tick
-/// backlog.** Send-pool slots recycle only on the runtime's separate `Writable`
-/// select arm, never within `handle_gossip_tick`, so all `pick_count` peers'
-/// frames for one tick must fit in the free slots at once. If a frame can't
-/// finish, [`gabion::wire::Packets::next_into`] runs out of slots mid-frame and
-/// the iterator's drain contract trips its `debug_assert` (an `unreachable`
-/// freeze in dev wasm; a silent re-send next tick in release, since the dirty
-/// rings are persistent — no data loss, just slower flush).
+/// The send pool only holds datagrams the transport refused with
+/// `WouldBlock`; the runtime addresses its slots with a `u8` and clamps the
+/// capacity to 255, so 255 is the ceiling. Pool memory is `255 × 1400 B ×
+/// live_nodes` ≈ 36 MB at 100 nodes.
 ///
-/// **The pool ceiling is 255, not a free choice.** The runtime addresses
-/// send-pool slots with a `u8` (`send_pending: VecDeque<(SocketAddr, u8)>`) and
-/// builds the free list as `(0..send_pool_size as u8)`, so any capacity ≥ 256
-/// wraps to an *empty* free list and silently kills all gossip. So the pool is
-/// pinned at the largest addressable value, and the per-tick frame is capped so
-/// one tick stays well inside it:
-///
-/// One tick emits at most `pick_count × packets_per_frame` packets, where
-/// `pick_count = ⌈ln(peers)+c⌉` (the coverage fanout, `c` =
-/// `GOSSIP_COVERAGE_MARGIN` = 3), capped at the peer count. The widest cluster
-/// the visualizer builds is `MAX_NODES` = 256, so `peers ≤ 255` and
-/// `pick_count ≤ ⌈ln(255)+3⌉ = 9`; at the 100-node overload point it is
-/// `⌈ln(99)+3⌉ = 8`. `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK /
-/// cells_per_packet)`, with `cells_per_packet ≈ 21` at a 1400-byte payload in
-/// the worst case (every cell a distinct origin, so the node dictionary costs
-/// 16 B/cell on top of the 46 B row) — so `ceil(160 / 21) = 8`. The worst case
-/// at 100 nodes is therefore ≈ `8 × 8 = 64` packets/tick, which the 255-slot
-/// pool clears ~4×, leaving the rest of the pool for packets still draining
-/// from the previous tick. A native 100-node Sustained-overload run (40 s of
-/// virtual time, debug build with the drain `debug_assert` live) measured an
-/// actual `max_send_pending_depth` peak of **64** — no trap, ~4× under the
-/// pool. (The coverage fanout is stable for a cluster size, so this peak does
-/// not climb with burst volume the way the old dirty-set widening did.)
-///
-/// Capping the per-tick frame is what keeps one tick inside the fixed pool. The
-/// cap is inert at the default 12-node scenarios — their cross-node working set
-/// (≈ 132 cells) never reaches 160 — so it changes nothing user-visible there;
-/// a large cluster's burst simply flushes over a few ticks instead of one (the
-/// dirty rings are persistent, so the residual rides the next tick rather than
-/// dropping). Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
+/// The per-sync frame cap keeps one sync inside the pool; it is inert at the
+/// default 12-node scenarios, and a larger cluster's burst simply flushes over
+/// a few syncs (unacknowledged cells stay queued).
 const VIZ_MAX_CELLS_PER_TICK: usize = 160;
 const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
 
@@ -277,7 +243,7 @@ struct NodeHandle {
     admin_tx: mpsc::Sender<AdminCommand>,
     /// Fires one gossip tick on this node (its `ManualClock`'s ticker drains
     /// the matching receiver).
-    tick_tx: mpsc::Sender<()>,
+    tick_tx: TickSenders,
     /// The discovery stream this node's runtime watches. The engine pushes
     /// `PeerEvent::Added`/`Removed` here as other nodes join and leave, so
     /// membership is dynamic rather than the static `stream::empty()` the bench
@@ -441,6 +407,9 @@ impl EngineState {
             send_queue_capacity: VIZ_SEND_QUEUE_CAPACITY,
             limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
             tick_interval,
+            sync_wait: Duration::from_millis(defaults::GOSSIP_SYNC_WAIT_MS),
+            broadcast_interval: Duration::from_millis(defaults::GOSSIP_BROADCAST_INTERVAL_MS),
+            broadcast_batch_limit: defaults::GOSSIP_BROADCAST_BATCH_LIMIT,
             auth_key: None,
             rng_seed: self.config.rng_seed.wrapping_add(id as u64),
             target_err_bps: self.config.target_err_bps,
