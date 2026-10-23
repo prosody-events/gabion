@@ -40,7 +40,7 @@ a DAG, so no module imports from a module that imports it.
 | `gossip`     | `src/gossip/*`                | `GossipRuntime`, `GossipClient`, `GossipTransport`, `Clock`, the `sim::SimTransport` used in tests, and the `AdminCommand` / `AdminSnapshot` observability surface. |
 | `wire`       | `src/wire/*`                  | The on-the-wire codec. One UDP packet = header + rule dictionary + node dictionary + cell rows + optional HMAC tag. Each packet decodes independently. |
 | `discovery`  | `src/discovery/*`             | `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation. Adapters consume `PeerEvent` streams; the gossip runtime treats peer add/remove as a normal `select!` arm. |
-| `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, fanout floor, payload caps, the per-rule error budget, and the min-emit floor. |
+| `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: storage capacities, tick interval, fanout floor and coverage margin, payload and per-round cell caps, send-queue capacity, the repair budget, the per-rule error budget, and the min-emit floor. |
 
 `gossip` sits at the top of that graph and depends on every other
 module, whereas `wire` and `crdt` are independent of each other.
@@ -61,11 +61,12 @@ later runtime tick turns those rows into outbound frames.
 The protocol has two adaptive aspects, and they are the reason gabion
 holds up under load that a textbook anti-entropy loop would not:
 
-1. **Coverage fanout** — the per-tick peer count is sized to the
+1. **Coverage fanout** — the per-round peer count is sized to the
    *coverage threshold* `⌈ln(n)+c⌉` (`n` = peer count), the fanout that
-   provably reaches every node. It scales with cluster size, not the
-   dirty set: a burst rides one fat frame instead of widening the pick.
-   `fanout` is the floor; small clusters go full-mesh.
+   reaches every node with high probability. It scales with cluster
+   size, not the number of changes: a burst rides one frame per pick
+   instead of widening the pick. `fanout` is the floor; small clusters
+   go full-mesh.
 2. **Adaptive emit rate** — the gossip cadence adapts to per-rule
    pressure. Heartbeats fire every `tick_interval` unconditionally, but
    the runtime also fires a synthetic *threshold* tick between
@@ -81,10 +82,11 @@ which cells go to which peer.
 
 ### The wire frame
 
-Every gossip frame is one self-describing UDP packet, with no session
-state on either side: each frame decodes independently, even if its
-predecessor was dropped. Loss of a packet costs you a few cells until
-the next tick refills them.
+A gossip frame travels as one or more self-describing UDP packets, with
+no session state on either side: each packet decodes independently,
+even if its predecessor was dropped. A lost packet costs that peer the
+cells it carried until they arrive another way — from another
+forwarder, in the cell's next change, or through the repair lane.
 
 The header is fixed at 72 bytes. Every multi-byte field is encoded
 little-endian; the first four bytes on the wire are `0x32 0x47 0x42
@@ -133,8 +135,9 @@ plus its `key_hash`, `bucket`, origin incarnation, `last_update_millis`,
 [count            : C  ×N  ]    count_width × N bytes
 ```
 
-When the frame carries no cells (a frontier ack, say), the body is
-empty.
+A packet with `cell_count = 0` has an empty body. The codec accepts
+one, but the runtime never sends it: a pick whose frame comes up empty
+gets no packet.
 
 If the cluster is configured with a shared HMAC key, an additional
 **32-byte HMAC-SHA256 tag** is appended over the header and body, and
@@ -178,27 +181,38 @@ sequenceDiagram
     Note over Runtime: set want_immediate_flush<br/>if pending > ε_R
     Runtime->>Adapter: aggregates.apply(deltas, expirations)
 
-    loop every tick (heartbeat OR synthetic threshold)
-        Runtime->>Runtime: handle_gossip_tick
+    loop every round (heartbeat OR synthetic threshold)
+        Runtime->>Runtime: handle_gossip_tick(round)
         Runtime->>Store: expire_at(now)
-        Runtime->>Store: fill_gossip_frame_for_peer
-        Store-->>Runtime: pruned cell list
-        Runtime->>Tx: encode + try_send_to(peer)
-        Tx->>Peer: UDP frame
+        loop each of ⌈ln(n)+c⌉ picks
+            Runtime->>Store: fill_gossip_frame(max_cells, repair_cells, peer_slot)
+            Store-->>Runtime: changes (newest first) + repair slice
+            Note over Runtime: repair_cells = 256 on a heartbeat's<br/>first pick, 0 otherwise
+            Runtime->>Tx: encode into the pick's send-queue share
+            Tx->>Peer: UDP packets
+        end
+        Runtime->>Store: clear_dirty()
         Runtime->>Adapter: aggregates.apply(expirations)
     end
 
-    Peer->>Tx: UDP frame
+    Peer->>Tx: UDP packets
     Tx->>Runtime: recv_from
     Runtime->>Store: merge_remote(observations)
-    Store-->>Runtime: delta rows + frontier acks
+    Store-->>Runtime: delta rows (changed cells marked dirty)
+    Runtime->>Store: record_acked(peer, origin, seq) per received cell
     Runtime->>Adapter: aggregates.apply(deltas, expirations)
 ```
 
 `CellStore::merge_remote` performs the CRDT join: max-merge per
-`(origin, key, bucket)`, sum across origins. Every dirty row also goes
-into a peer-frontier ring so the next outbound frame can prune anything
-that peer has already acknowledged.
+`(origin, key, bucket)`, sum across origins. A cell whose count rose
+joins a dirty ring (`forwarded_dirty` for another node's origin), so
+this node forwards it once, in its next round. The runtime also
+records, per peer and origin, the highest origin sequence among the
+cells that peer just sent (`PeerFrontierTable`). That sequence is in
+the sender's own numbering — every node re-stamps the cells it merges —
+so it is a hint, not an acknowledgement: it only lets later rounds skip
+changes that peer probably holds, a latency optimization that
+convergence never depends on.
 
 ### Coverage fanout
 
@@ -209,20 +223,24 @@ variables, and gabion keeps them apart:
 | Concern | Governed by | Mechanism |
 |---|---|---|
 | **Coverage** — reach every node reliably | cluster size `n` | **fanout** = `⌈ln(n)+c⌉` |
-| **Volume** — a big burst of dirty cells | dirty-set size | frame fill: `max_cells_per_tick` + packet-splitting |
+| **Volume** — a big burst of changes | changes per round | frame fill: `max_cells_per_tick` + packet-splitting, within each pick's share of `send_queue_capacity` |
 | **Urgency** — a fresh delta matters *now* | per-rule error budget | threshold-fire emissions (`target_err_bps`) |
 
 Only the first is a fanout question. Kermarrec, Massoulié & Ganesh (IEEE
 TPDS 2003, *Probabilistic Reliable Dissemination in Large-Scale
-Systems*, Theorem 1) prove that a directed gossip round with mean fanout
-`ln(n)+c` reaches **every** node with probability → `e^(−e^(−c))`:
-*"there is a sharp threshold in the required fanout at log n."* The
-fanout needs to grow by only 1 each time `n` rises by a factor of e, and
-a single round *"can easily be modified … to send several notifications
-per gossip message"* — which is exactly what gabion does: the whole
-dirty set rides one fat frame, so burst **volume** never widens the peer
-pick — many cells share one packet, so a burst does not translate into
-proportionally more rounds.
+Systems*, Theorem 1) prove that spreading a message by
+infect-and-forward-once — each node forwards it once, to `fanout` random
+peers — with mean fanout `ln(n)+c` reaches **every** node with
+probability → `e^(−e^(−c))`: *"there is a sharp threshold in the
+required fanout at log n."* That is how each change travels in gabion:
+a round sends it to that round's picks, and every node that merges it
+forwards it once, in its own next round. The fanout needs to grow by
+only 1 each time `n` rises by a factor of e, and a single round *"can
+easily be modified … to send several notifications per gossip
+message"* — which is exactly what gabion does: each round's changes
+ride one frame per pick, split across as many packets as they need, so
+burst **volume** never widens the peer pick and a burst does not
+translate into proportionally more rounds.
 
 The pick lives in `GossipRuntime::handle_gossip_tick`:
 
@@ -234,7 +252,7 @@ let pick_count = config.fanout.max(coverage.ceil() as usize).min(n);
 
 A partial Fisher-Yates shuffle then picks `pick_count` distinct peers
 from `self.peers`. The peers must be distinct rather than sampled with
-replacement, because sampling the same peer twice in one tick would burn
+replacement, because sampling the same peer twice in one round would burn
 a send-pool slot encoding the same frame twice. `config.fanout` is a
 hard floor; `.min(n)` makes small clusters full-mesh (coverage demands
 it there and the bandwidth is trivial). Some example pick counts at
@@ -250,21 +268,23 @@ it there and the bandwidth is trivial). Some example pick counts at
 | 255       | 9           | 9                          |
 | 9 999     | 13          | 13                         |
 
-Fanout trades **bandwidth** (linear in the pick: the cluster ships
-`n·pick·frame` per tick) against **coverage-failure probability**
-(`≈ e^(−e^(−c))` per round) and **latency** (`≈ log_{1+pick} n` rounds,
-with diminishing return above the threshold). `⌈ln(n)+c⌉` is the
-provably-minimal fanout for reliable coverage of a *single* round, so it
-is the natural operating point. We size to `c = 3` — a 95.1 % per-round
-reach — rather than a higher margin, because gabion is not a one-shot
-disseminator: anti-entropy re-gossips every dirty cell each tick until
-the peer frontier acks it, so a node missed in one round is caught by
-the next and the per-round miss compounds away (4.9 % → ≈ 0.24 % after
-two rounds). KMG's validated single-shot threshold sits near `c ≈ 4`
-(fanout 13 @ 10 000, 15 @ 50 000); a re-gossiping system does not need to
-match it, and `c = 3` saves ≈ 1 peer per tick at every scale. The
-bandwidth floor on quiet ticks is unchanged from a fixed fanout — the
-pick is stable for a given cluster size, not pulsing with load. The
+Fanout trades **change bandwidth** (linear in the pick: every change
+is sent `≈ n·pick` times across the cluster) against
+**coverage-failure probability** (`≈ 1 − e^(−e^(−c))` per change) and
+**latency** (`≈ log_{1+pick} n` rounds, with diminishing return above
+the threshold). `⌈ln(n)+c⌉` is the minimal fanout at which one
+forward-once spread reaches every node with high probability, so it is
+the natural operating point. We size to `c = 3` — a 95.1 % per-change
+chance of reaching every node — rather than a higher margin. At
+`c = 3` a change misses at least one node ≈ 4.9 % of the time, and the
+expected number of nodes it misses is `e^(−c)` ≈ 0.05. Two things close
+that gap without a wider fanout: the cell's next change carries its
+whole count, and the heartbeat repair slice resends every live cell
+once per rotation (and also covers packet loss and frames cut by a full
+send queue). KMG's validated single-shot threshold sits near `c ≈ 4`
+(fanout 13 @ 10 000, 15 @ 50 000); `c = 3` saves ≈ 1 peer per round at
+every scale. The pick only drives traffic when there are changes: a
+quiet heartbeat sends just the repair slice, to one random pick. The
 `coverage_fanout` bench
 [below](#what-we-measured) shows the pick tracking `⌈ln(n)+c⌉` and
 staying flat as burst volume changes.
@@ -334,26 +354,36 @@ sides of this trade.
 
 ### Dirty rings and the peer frontier
 
-Three data structures decide which cells the current tick sends to
+Three data structures decide which cells the current round sends to
 which peer:
 
 1. **`local_dirty`** — every locally-observed hit pushes onto this
-   bounded ring. Drained by every tick (heartbeat and threshold).
-2. **`forwarded_dirty`** — every cell merged from a peer pushes onto a
-   separate ring, so the runtime can forward a remote delta even if
-   its local origin column is quiet. Larger than `local_dirty` because
-   forwarded cells fan out N-to-many.
-3. **`peer_frontier`** — for each peer × each origin slot, the highest
-   sequence number that peer has already acked. The sender uses this
-   to skip cells the recipient already has.
+   bounded ring. Cleared at the end of every round (heartbeat or
+   threshold), so it holds only the changes since the last round.
+2. **`forwarded_dirty`** — every cell merged from a peer whose count
+   rose pushes onto a separate ring, so the runtime can forward a
+   remote delta even if its local origin column is quiet. Cleared at
+   the end of every round, like `local_dirty`. Larger than
+   `local_dirty` because a round can merge changes from every origin
+   in the cluster.
+3. **`peer_frontier`** (`PeerFrontierTable`) — for each peer × each
+   origin slot, the highest origin sequence among the cells that peer
+   has sent us. The dirty lanes skip a change whose sequence is at or
+   below it. The sequence is in the peer's own numbering, so this is a
+   hint that saves bandwidth, never a delivery guarantee.
 
-Together they keep `fill_gossip_frame_for_peer` allocation-free and
-strictly bounded: the runtime walks at most `max_cells_per_tick` cells
-through the three lanes (local dirty → forwarded dirty → repair),
-prunes each candidate against the peer's frontier, and stops when the
-budget is exhausted. The rings are pre-sized at construction; pushes
-that hit the cap bump an overflow counter and silently drop, and the
-next repair-lane sweep picks the dropped cell back up.
+Together they keep `fill_gossip_frame` allocation-free and strictly
+bounded. For each pick the runtime walks the round's changes — local
+dirty, then forwarded dirty, each newest first — skips stale entries
+and those the peer's frontier says it holds, and stops at
+`max_cells_per_tick` cells. Then comes the repair lane, which has its
+own budget (`GOSSIP_REPAIR_CELLS_PER_TICK` = 256 cells, on a
+heartbeat's first pick only, still within `max_cells_per_tick`) and is
+never pruned by the frontier. The rings are pre-sized at construction.
+When more changes arrive between two rounds than a ring holds, a push
+overwrites the oldest entry and logs a rate-limited warning; the lost
+change reaches peers late, through other forwarders, the cell's next
+change, or the repair lane.
 
 `CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
@@ -362,18 +392,22 @@ debug the CRDT.
 ## Operator knobs
 
 Most deployments leave the defaults alone, because they are chosen to
-keep convergence well under a second at typical cluster sizes
-(≤ 256). The table below is for the days when you do need to tune, and
+keep convergence under a second: in the simulator a single write
+converges in two or three rounds at every cluster size up to 1 024
+nodes (see [What we measured](#what-we-measured)), and a hot rule's
+threshold rounds run well inside one heartbeat. The table below is for
+the days when you do need to tune, and
 it splits into the two adaptive halves of the protocol.
 
 ### Heartbeat cadence and fanout (coverage fanout)
 
 | Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
-| `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
+| `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip rounds. Only heartbeat rounds carry the repair slice.                              | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
 | `fanout`             | 3           | Fanout floor. The runtime scales the actual pick to the coverage threshold `⌈ln(n)+c⌉` (`c` = `GOSSIP_COVERAGE_MARGIN`, 3), capped at the peer count. | Rarely tune — the floor binds only if you lower `GOSSIP_COVERAGE_MARGIN`. To trade bandwidth for coverage, change the margin, not this floor. |
-| `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame_for_peer` will emit in one tick. Cells over the cap roll forward to the next tick via the repair lane. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
-| `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
+| `max_cells_per_tick` | 4 096       | Cap on cells in one pick's frame per round: the round's changes, newest first, plus up to 256 repair cells on a heartbeat's first pick. Changes over the cap (the oldest) skip that pick this round and reach it through other forwarders or the repair lane. | Raise if a round regularly carries more than 4 096 changes.                                                   |
+| `send_queue_capacity`| 512         | Pre-allocated outbound packet slots, shared evenly across a round's picks. A frame over its pick's share loses its tail — repair cells first, then the oldest changes — and a rate-limited warning names this knob when changes are cut. | Raise if the "more changes than this peer's share of the send queue" warning keeps firing.                    |
+| `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits each pick's frame across multiple packets when the cell list overflows.                          | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 
 ### Per-rule error budget (adaptive emit rate)
 
@@ -409,66 +443,93 @@ the empirical evidence for the two adaptive aspects of the protocol.
 
 ![convergence](figures/convergence.svg)
 
-**Method.** Single write at node 0; measure rounds-to-converge as both
-cluster size N and the static fanout floor sweep. Bandwidth is total
-bytes sent across the run divided by `N · duration`.
+**Method.** Single write at node 0; measure rounds-to-converge (100 ms
+ticks) as both cluster size N and the static fanout floor sweep.
+Bandwidth is total bytes sent across the run divided by `N · duration`.
 
-**Takeaway.** Gabion sits at or below the Karp `log₂ N` lower bound at
-every fanout above 1, because peer-frontier dedup lets the sender skip
-cells the recipient already has. The empirical curve at f = 3 — well
-under the f = 6 production default — is within one extra round of f = 8.
+**Takeaway.** Every configuration converges in 2 rounds (200 ms) from
+N = 4 to N = 256, at or below the Karp `log₂ N` line. The floor barely
+matters, because the runtime lifts the pick to `⌈ln(N−1)+3⌉` — 3, 5, 6,
+7, 8, 8, 9 for N = 4 … 256 — so at N ≥ 64 every floor up to 8 picks the
+same number of peers. With that pick a single write spreads in about
+`log_{1+pick} N` rounds: each informed node forwards it to `pick`
+peers, so the informed set grows by up to `1 + pick` per round rather
+than doubling. Bandwidth sits at ~1.5–1.6 kB/node/s throughout: once the
+write has spread, a quiet heartbeat sends only the repair slice (here,
+one cell in one packet) to one pick.
 
 ![fanout_sweep](figures/fanout_sweep.svg)
 
-**Method.** Fix N = 32, sweep static `fanout` from 1 to 12, measure both
-convergence rounds and bytes-per-node-per-second.
+**Method.** Fix N = 32, sweep the static `fanout` floor from 1 to 12,
+measure both convergence rounds and bytes-per-node-per-second.
 
-**Takeaway.** Rounds drop sharply between f = 1 and f = 3 and then
-flatten, while bandwidth scales roughly linearly with `fanout`. The
-sweet spot near f = 3–6 is where bandwidth stays modest while
-convergence sits within a round of the asymptote.
+**Takeaway.** Floors 1 through 7 are the same configuration: the
+coverage threshold `⌈ln(31)+3⌉` = 7 overrides them, so the pick is 7
+throughout. Only f = 8 and f = 12 raise it, to 8 and 12. Every point
+converges in 2 rounds, and bandwidth barely moves (~1.59 kB/node/s up
+to f = 8, 1.64 kB/node/s at f = 12), because the write goes out once
+per node and the rest of the run is the repair slice to one pick per
+heartbeat, which the floor does not touch. Below the coverage threshold
+the floor is inert; the coverage margin, not `fanout`, is the lever for
+trading bandwidth against coverage.
 
 ### Scale
 
 ![scale_n](figures/scale_n.svg)
 
-**Method.** Sweep N from 4 to 1024 at fixed `fanout = 3`. Time-to-
-converge should track `log₂ N`; bytes-per-node-per-second should stay
+**Method.** Sweep N from 4 to 1024 with the `fanout` floor at 3; the
+pick grows from 3 to 10 with N, per `⌈ln(N−1)+3⌉`. Time-to-converge
+should track `log₂ N` or better; bytes-per-node-per-second should stay
 roughly constant (SWIM's "constant load per node" property).
 
-**Takeaway.** Rounds-to-converge sits at or below `log₂ N` all the way
-through N = 1024, and per-node bandwidth is flat in N to within the
-noise of a horizontal line.
+**Takeaway.** Rounds-to-converge is 2 up to N = 256 and 3 at N = 512
+and 1024 — under `log₂ N` throughout, since the pick grows with `ln N`.
+Per-node bandwidth is flat at ~1.54 kB/node/s across the whole sweep:
+the write itself is a one-time cost, and afterwards each node sends one
+repair packet per heartbeat to one pick, independent of N.
 
 ### Resilience
 
 ![loss](figures/loss.svg)
 
 **Method.** Three trials at each per-link drop probability from 0 % to
-50 %. N = 16, f = 3, 20 s of virtual time.
+50 %. N = 16, f = 3 (pick 6), 20 s of virtual time.
 
-**Takeaway.** Convergence rounds climb only a small constant as loss
-rises, and gabion converges in every trial including the 50 % loss row.
+**Takeaway.** Every trial converges with zero final divergence, in 2–4
+rounds: 2 at no loss, 2–3 at 10–30 %, 3 at 40 %, and 3–4 at 50 %.
 Bimodal Multicast (Birman et al. 1999) reports stable delivery to
-~25–30 %; gabion's empirical tolerance is roughly twice that, thanks
-to peer-frontier dedup plus the rotating repair lane.
+~25–30 %; gabion tolerates roughly twice that here because forwarding is
+redundant — every node that merges a change forwards it to its own
+picks, so each node is sent the change by about `⌈ln(n)+c⌉` different
+forwarders — and the heartbeat repair slice resends whatever every
+forwarder's packet to a node lost.
 
 ![partition](figures/partition.svg)
 
-**Method.** Two equally-sized partitions, single write inside one,
-heal at t = 10 s. Time-to-reconverge measured from the heal.
+**Method.** Two equally-sized partitions of N = 8, single write inside
+one at t = 200 ms, heal at t = 10 s. Time-to-reconverge measured from
+the heal.
 
-**Takeaway.** Once the links open, the next tick after heal drains the
-partition, so reconvergence is bounded above by one `tick_interval`.
+**Takeaway.** The far side has the write by the first sample at the
+heal (the bench reports 0 ms after heal, at its 100 ms sampling
+resolution). The change itself went out once, in the round after the
+write, and could not cross the cut; what crosses is the heartbeat
+repair slice, which here holds the cluster's only cell every heartbeat.
+So reconvergence after a heal is bounded by a heartbeat whose random
+first pick lands across the cut plus one rotation of the repair cursor
+over the live cells — a single heartbeat with a store this small.
 
 ![staleness](figures/staleness.svg)
 
-**Method.** Sustained writes from k sources concurrently; measure
-per-hit p50 / p95 lag (Astrolabe-style staleness).
+**Method.** Sustained writes from k ∈ {1, 2, 4, 8} sources
+concurrently; measure per-hit p50 / p95 lag (Astrolabe-style
+staleness).
 
-**Takeaway.** P50 and p95 lag both stay flat at a single `tick_interval`
-regardless of the number of concurrent writers, because the dirty ring
-drains in one round under steady state.
+**Takeaway.** P50 lag is 0 ms and p95 stays within one 100 ms
+`tick_interval` (0 ms for 1–4 sources, 100 ms at 8) regardless of the
+number of concurrent writers, because each change goes out in the round
+after it is recorded and the forward-once spread covers the 16-node
+cluster within a round or two.
 
 ### Adaptive machinery
 
@@ -483,19 +544,20 @@ independent of the threshold path.
 **Method.** Sweep two axes against a `DistinctKeyBurst` (each write
 lands in its own cell store slot, so `local_dirty.len()` jumps to the
 burst size in one step). Across cluster size `n ∈ {16, 64, 256}` at a
-fixed burst, read the per-tick `peak_effective_fanout`. Across burst
-size `cells ∈ {16, 256, 1024}` at a fixed `n`, read the effective fanout
-(packets ÷ dirty-tick count). Static `fanout = 1` (the floor, which the
-coverage threshold overrides).
+fixed burst, read the per-round `peak_effective_fanout`. Across burst
+size `cells ∈ {16, 256, 1024}` at each `n`, read the same peak pick.
+Static `fanout = 1` (the floor, which the coverage threshold
+overrides).
 
 **Takeaway.** The left panel: the observed peak fanout tracks
 `⌈ln(n−1)+c⌉` — 6 at `n=16`, 8 at `n=64`, 9 at `n=256` — sitting right
 on the predicted threshold and rising by ~1 per factor-of-e of cluster
-growth, exactly the KMG law. The right panel: at fixed `n` the per-tick
-fanout is **flat** across a 64× change in burst volume, because the
-burst rides one fat frame rather than widening the peer pick — volume is
-a frame-fill concern, not a fanout one. (Volume that overflows the dirty
-ring is repaired by the rotating repair lane, not by fanning out wider.)
+growth, exactly the KMG law. The right panel: the pick does not move
+with volume — the peak is the same 6 / 8 / 9 at all three burst sizes,
+because a round's changes ride one frame per pick, split across as many
+packets as they need, rather than widening the peer pick. Volume shows
+up as packets per frame, not peers per round. Every run converges
+within 100–300 ms.
 
 ![error_budget](figures/error_budget.svg)
 
@@ -506,33 +568,33 @@ threshold-fires/node, and the empirical
 `max_lag = max(ground_truth − min(per_node_total))`, alongside the
 theoretical `N · ε_R` bound.
 
-**Takeaway.** Two regimes show up cleanly. While ε_R is small enough
-that per-sample accumulated hits cross the budget (left of bps ≈ 100
-here), the runtime fires nearly every sample and bandwidth climbs to
-~130 kB/node/s. Past that crossover, ε_R is comfortably above the
-per-sample hit count and the proactive heartbeat carries the work
-alone — bandwidth drops to ~73 kB/node/s and threshold fires go to
-zero. Empirical max lag plateaus at ~65 hits across the entire sweep
-because the heartbeat alone keeps lag bounded by one `tick_interval`
-× per-sample hit count — the budget only matters when it would force
-gossip *faster* than that. Empirical max lag may briefly exceed
-`N · ε_R` at the tight end of the sweep — those are hits in flight
-between the bench's sample point and the next gossip apply, bounded by
-one workload batch and absorbed by the following sample.
+**Takeaway.** Two regimes show up cleanly. At 50 bps, ε_R ≈ 3.3 hits
+(15 peers) — below the 5 hits each node accumulates per sample — so the
+runtime fires a threshold round nearly every sample (99 per node over
+10 s) and bandwidth is ~63 kB/node/s. From 100 bps up, ε_R ≥ 6.7 hits
+is never crossed: threshold fires go to zero, the heartbeat carries the
+work alone at ~51 kB/node/s, and max lag plateaus at 80 hits — one
+sample's cluster-wide hits (16 sources × 5) in flight before the next
+heartbeat. Max lag stays under `N · ε_R` at every point (30 against 50
+at 50 bps, 80 against ≥ 100 above it); the budget only matters when it
+would force gossip *faster* than the heartbeat. Because the workload
+never stops, the last sample also has hits in flight: the heartbeat-only
+runs end with a divergence of 40 and report no convergence time.
 
 ![min_emit_clamp](figures/min_emit_clamp.svg)
 
 **Method.** Adversarial workload: drive 10 000 hits into 50 ms of
-virtual time. The `BurstCompressed` workload calls `record(...)` with
-`rule_limit = 1`, which forces `ε_R = max(1, 1 · bps / 80_000) = 1` at
-every bps — so every hit crosses the budget. Sweep
-`min_emit_interval ∈ {0, 1, 5, 10, 50}` ms.
+virtual time at N = 8. The `BurstCompressed` workload calls
+`record(...)` with `rule_limit = 1`, which forces
+`ε_R = max(1, 1 · bps / 70_000) = 1` (7 peers) at every bps — so every
+hit crosses the budget. Sweep `min_emit_interval ∈ {0, 1, 5, 10, 50}` ms.
 
-**Takeaway.** Bandwidth scales inversely with the floor, which is what
-caps worst-case emit rate. Threshold-fires-per-node drops by ~50×
-across the sweep (6.1 at floor = 0 / 1 ms down to 0.1 at floor = 50 ms),
-and final divergence stays at zero in every configuration — the cluster
-still converges after the burst, just at a different bandwidth budget.
+**Takeaway.** The floor caps the worst-case emit rate. Threshold fires
+per node drop 49× across the sweep (6.125 at floor = 0 and 1 ms, then
+1.25, 0.625, and 0.125 at 5, 10, and 50 ms), and bandwidth falls with
+them (~6.5, 6.5, 2.9, 2.5, and 2.0 kB/node/s). Final divergence is zero
+in every configuration, reached within 100 ms — the cluster still
+converges after the burst, just at a different bandwidth budget.
 
 ![heartbeat_threshold_mix](figures/heartbeat_threshold_mix.svg)
 
@@ -542,9 +604,10 @@ second (heartbeat path). Both must converge.
 
 **Takeaway.** The left panel shows the hot rule converging
 sub-heartbeat through threshold fires, while the right panel shows the
-cold rule riding the proactive heartbeat. Cold-rule replication does
-not depend on the threshold ever firing, because heartbeat and
-threshold are independent code paths.
+cold rule riding the proactive heartbeat; both converge within 100 ms
+with zero final divergence. Cold-rule replication does not depend on
+the threshold ever firing, because heartbeat and threshold are
+independent code paths.
 
 ## References
 

@@ -273,8 +273,12 @@ name and size are unchanged: the node identity and any queued hits
 carry over, and the log line `gabion: zone ready` says `reused=true`.
 The counts do not: whenever a worker takes over gossip (after a reload,
 a crash, or a lost lease), it empties the count table and peers gossip
-the counts back, usually within a gossip tick or two, longer when the
-cluster tracks many thousands of keys. Until then this node under-counts
+the counts back. The next change to a cell carries its whole count, so
+busy keys return within a gossip round or two; the rest come back
+through the repair lane, where each peer sends a 256-cell slice per
+heartbeat to one random peer, so the rebuilding node receives about one
+slice per heartbeat — seconds for a few thousand keys, longer when the
+cluster tracks tens of thousands. Until then this node under-counts
 and may admit requests over the limit. A node with no peers has nothing
 to rebuild from, so a reload or leader change resets its limits as if
 every window had just started. Changing the name or size starts an
@@ -445,10 +449,11 @@ Gabion's gossip protocol has **two adaptive aspects** that distinguish
 it from a textbook anti-entropy loop. Both are operator-tunable; the
 defaults are sized for production loads.
 
-- **Coverage fanout** — per-tick peer count is sized to the coverage
-  threshold `⌈ln(peers)+c⌉`, the fanout that reliably reaches every
-  node, capped at the peer-set size. It scales with cluster size, not
-  the dirty set. `gabion_gossip_fanout` sets the **floor**.
+- **Coverage fanout** — per-round peer count is sized to the coverage
+  threshold `⌈ln(peers)+c⌉`, the fanout that reaches every node with
+  high probability, capped at the peer-set size. It scales with cluster
+  size, not the number of changes. `gabion_gossip_fanout` sets the
+  **floor**.
 - **Adaptive emit rate** — the gossip cadence adapts to per-rule
   pressure. Heartbeats fire every `gabion_gossip_tick_interval`;
   between heartbeats, the runtime fires a synthetic "threshold" tick
@@ -466,7 +471,7 @@ adapters; the canonical knob table lives in
 
 | Directive                                   | Default | Adapts                                                       |
 |---------------------------------------------|---------|--------------------------------------------------------------|
-| `gabion_gossip_fanout N`                    | `3`     | **Coverage fanout** — floor on peers selected per tick; the runtime scales the pick to `⌈ln(peers)+c⌉`. |
+| `gabion_gossip_fanout N`                    | `3`     | **Coverage fanout** — floor on peers selected per round; the runtime scales the pick to `⌈ln(peers)+c⌉`. |
 | `gabion_gossip_target_err_bps N`            | `100`   | **Adaptive emit rate** — per-rule unreplicated-error budget in basis points of the rule's limit (`100` = 1%). Lower = tighter accuracy, more emissions. |
 | `gabion_gossip_min_emit_interval DURATION`  | `5ms`   | **Adaptive emit rate** — floor between threshold-fire emissions. Raise when the gossip channel itself is the bottleneck. |
 
@@ -479,9 +484,9 @@ they bound resource use.
 | `gabion_gossip_cluster ID`                      | `1`     | Cluster identifier: any non-zero u128, in decimal or `0x`-prefixed hex. Frames from peers with a mismatched id are dropped. |
 | `gabion_gossip_tick_interval DURATION`          | `500ms` | Heartbeat period. Shorter = faster convergence, more UDP traffic.                     |
 | `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet. Below ~64 the encoder refuses to fit even one cell. |
-| `gabion_gossip_max_cells_per_frame N`           | `4096`  | Maximum cells encoded into one packet.                                                |
-| `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells emitted across all packets in one tick.                                 |
-| `gabion_gossip_send_queue_capacity N`           | `128`   | Outbound UDP send queue depth (per-peer slots in the leader).                         |
+| `gabion_gossip_max_cells_per_frame N`           | `4096`  | Decoder limit: the most cells an inbound packet may declare. Larger packets are dropped. |
+| `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells in one peer's frame per round (across all its packets): the round's changes, newest first, plus the repair slice on a heartbeat's first pick. |
+| `gabion_gossip_send_queue_capacity N`           | `512`   | Outbound UDP packet slots in the leader: one pool, shared evenly across a round's picks. A frame over its share loses its tail and logs a warning naming this directive. |
 
 ### Storage — CRDT capacities
 
@@ -497,8 +502,8 @@ to touch them if your workload runs into the cap.
 | `gabion_storage_max_cells N`                    | `131072`    | Total cell capacity in the CRDT.                                                      |
 | `gabion_storage_rule_dictionary_capacity N`     | `64`        | Number of distinct rule slots (each unique `rule_fingerprint` interns into one slot). |
 | `gabion_storage_node_dictionary_capacity N`     | `1024`      | Number of distinct (node_id, incarnation) slots.                                      |
-| `gabion_storage_local_dirty_capacity N`         | `65536`     | Local dirty-ring capacity. Sized to absorb a burst between heartbeats.                |
-| `gabion_storage_forwarded_dirty_capacity N`     | `524288`    | Forwarded dirty-ring capacity. Sized larger because it tracks peer-originated edits we still owe other peers. |
+| `gabion_storage_local_dirty_capacity N`         | `65536`     | Local dirty-ring capacity. Sized to absorb a burst between gossip rounds.             |
+| `gabion_storage_forwarded_dirty_capacity N`     | `524288`    | Forwarded dirty-ring capacity. Sized larger because it holds every peer edit merged since the last gossip round, from every origin. |
 | `gabion_storage_peer_capacity N`                | `256`       | Peer slots in the peer-frontier table (one row per peer × node).                      |
 | `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare. Equal to `STORAGE_MAX_MATCHED_RULES`.   |
 | `gabion_storage_max_descriptor_bytes N`         | `512`       | Per-request budget on `(key + value)` bytes summed across descriptors plus the domain. Exceeded ⇒ 400. |
@@ -797,6 +802,7 @@ gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a 
 | `400 Bad Request` from gabion                                                 | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits (`512` by default).                  | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
 | SHM `matched_rule_overflows` counter rising                                   | A location stacked more rules than `STORAGE_MAX_MATCHED_RULES` permits (`16`). **The request was allowed** (allow-by-default); the count under-counts. *No log line — observed only via the SHM stats snapshot.* | Reduce the number of rules applied at this location, or split the location.                                                      |
 | `gabion: the shared-memory count table had no free slot` (warn)               | The zone holds too few slots for the live `(rule, key, bucket)` cells. **The request was allowed** and that key under-counted. Logged at powers of two of `aggregate_dropped`. | Raise SIZE in `gabion_limit_zone` (see its sizing notes); each doubling doubles the slots.                                         |
+| `A gossip round had more changes than this peer's share of the send queue` (warn) | A burst of changes did not fit the packet slots one peer gets in a round, so the oldest changes skipped that peer this round. Other forwarders and the repair lane still deliver them; counts converge late, not never. Logged at powers of two of cut frames. | Usually a burst of new keys. If it keeps firing, raise `gabion_gossip_send_queue_capacity`.                                     |
 | `gabion: this worker stopped leading gossip` (error) in the error log         | The leader's gossip runtime or queue drain failed or panicked, or it lost the lease. The worker released the lease and campaigns again after `retry_in` (doubling, up to 30s); another worker may take over first. Admission keeps running against the shared aggregate. | Read the `error` field. A bind error means `gabion_gossip_bind` is already in use; a lost lease means the worker was starved long enough to miss its renewals. |
 | `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside a leadership term, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
 | `peer discovery error` (warn) in the error log                                | The Kubernetes discovery stream returned an error this tick. Membership is stale until the next successful tick.                                    | Usually transient (apiserver flap, transient watch reset). If persistent, check pod RBAC / network reachability to the API.      |

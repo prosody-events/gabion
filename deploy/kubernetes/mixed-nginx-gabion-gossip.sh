@@ -136,7 +136,6 @@ data:
       max_payload_bytes: 1400
       max_cells_per_frame: 1024
       max_cells_per_tick: 1024
-      send_queue_capacity: 32
       limit_queue_capacity: 1024
       cluster_id_hash: 1
       target_err_bps: 100

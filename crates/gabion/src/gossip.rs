@@ -5,7 +5,8 @@
 //! [`Clock`] for bucket arithmetic and tick scheduling, and a downstream
 //! [`AggregateStore`] that absorbs the resulting delta and expiration rows.
 //! A single `tokio::select!` drives five arms (limit request, inbound,
-//! writable, peer event, tick) and calls `aggregates.apply(...)` once per
+//! writable, peer event, tick; six with an admin channel) and calls
+//! `aggregates.apply(...)` once per
 //! CRDT-touching iteration.
 //!
 //! All polymorphic boundaries are monomorphized generics — no `dyn`, no
@@ -62,13 +63,15 @@ pub struct GossipConfig {
     /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
     /// hard minimum when that threshold falls below it.
     pub fanout: usize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
-    /// tick. The wire codec splits this into multiple packets if needed.
+    /// Cap on cells in one pick's frame per round: the round's changes,
+    /// newest first, plus the repair slice on a heartbeat's first pick. The
+    /// wire codec splits the frame into packets.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,
     /// Outbound send queue capacity. Each slot owns a pre-allocated
-    /// [`wire::PacketBuf`].
+    /// [`wire::PacketBuf`]. A round shares the free slots evenly across its
+    /// picks; a frame over its share loses its tail.
     pub send_queue_capacity: usize,
     /// Capacity of the incoming limit-request mpsc channel.
     pub limit_queue_capacity: usize,

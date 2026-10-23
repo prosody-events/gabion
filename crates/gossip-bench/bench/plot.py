@@ -261,7 +261,7 @@ def suite_coverage_fanout() -> list[dict]:
         `peak_effective_fanout` tracking `⌈ln(n-1) + c⌉`;
       * dirty-set cardinality (distinct keys written at once) at fixed `n`
         shows the per-tick fanout is *flat* in volume — the burst rides one
-        fat frame and does not widen the peer pick.
+        frame per pick and does not widen the peer pick.
 
     `DistinctKeyBurst` makes each write land in its own CellStore slot so
     `local_dirty.len()` actually jumps to `cells`; the fanout staying put
@@ -306,10 +306,10 @@ def suite_error_budget() -> list[dict]:
       - max_lag stays bounded by `N × ε_R` (reported in `extras` as
         `theoretical_max_lag`).
     """
-    # rule_limit=10_000, N=16 → ε_R = bps · 0.0625 hits. Sustained at
-    # per_tick=5 hits/sample/source means each node accumulates 5 hits
+    # rule_limit=10_000 and 15 peers (N=16) → ε_R = bps / 15 hits. Sustained
+    # at per_tick=5 hits/sample/source means each node accumulates 5 hits
     # per 100 ms sample. With this scaling, ε crosses inside one sample
-    # window for bps ≲ 1600 and starts riding the heartbeat above that.
+    # window for bps ≲ 75 and starts riding the heartbeat above that.
     # The bps sweep deliberately spans several decades of ε so we can
     # see the crossing.
     return [
@@ -705,8 +705,8 @@ def plot_scale_n(results: list[dict], out_dir: Path) -> list[PlotResult]:
 def plot_coverage_fanout(results: list[dict], out_dir: Path) -> list[PlotResult]:
     """Two claims, two panels: (left) the per-tick fanout tracks the
     coverage threshold `⌈ln(n)+c⌉` as the cluster grows; (right) it is flat
-    in burst volume, because the dirty set rides one fat frame rather than
-    widening the peer pick.
+    in burst volume, because a round's changes ride one frame per pick rather
+    than widening the peer pick.
     """
     _ensure_plot_libs()
     import pandas as pd
@@ -718,7 +718,6 @@ def plot_coverage_fanout(results: list[dict], out_dir: Path) -> list[PlotResult]
                 "nodes": r["scenario"]["nodes"],
                 "dirty": r["scenario"]["workload"]["cells"],
                 "peak_fanout": r["headline"].get("peak_effective_fanout"),
-                "effective_fanout_p50": r["headline"]["effective_fanout_p50"],
             }
         )
     df = pd.DataFrame(rows).sort_values(["nodes", "dirty"])
@@ -741,14 +740,16 @@ def plot_coverage_fanout(results: list[dict], out_dir: Path) -> list[PlotResult]
         ax.set_title("Coverage fanout tracks ln(N)+c")
         ax.legend(fontsize=8)
 
-        # Right: effective fanout vs dirty-set size, one line per N. Flat
-        # lines are the point — volume does not widen the pick.
+        # Right: peak per-round pick vs burst size, one line per N. Flat
+        # lines are the point — volume fills frames, it does not widen the
+        # pick. (Packets per round do grow with volume: a bigger frame splits
+        # into more packets.)
         ax = axes[1]
         for n, group in df.groupby("nodes"):
-            ax.plot(group["dirty"], group["effective_fanout_p50"], marker="o", label=f"N={n}")
+            ax.plot(group["dirty"], group["peak_fanout"], marker="o", label=f"N={n}")
         ax.set_xscale("log", base=2)
         ax.set_xlabel("burst-write cardinality (dirty cells)")
-        ax.set_ylabel("effective per-tick fanout (packets / dirty-tick)")
+        ax.set_ylabel("peak per-round fanout (peers picked)")
         ax.set_title("Fanout is flat in burst volume")
         ax.legend(fontsize=8)
 

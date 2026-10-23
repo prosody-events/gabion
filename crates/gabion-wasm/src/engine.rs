@@ -52,51 +52,25 @@ const CLUSTER_ID_HASH: u128 = 0xC1;
 const LOCAL_RULE_ID: u32 = 0;
 
 /// The visualizer's per-node gossip buffer sizing. **Not** the library
-/// production defaults (`GOSSIP_SEND_QUEUE_CAPACITY` = 128, tuned for a
-/// deployment whose per-tick output is small): the visualizer drives a far
-/// denser regime — up to `MAX_NODES` runtimes on one thread under a 100-node
-/// sustained-overload peak — so it sizes its own pool to that regime.
+/// production defaults (`GOSSIP_SEND_QUEUE_CAPACITY`,
+/// `GOSSIP_MAX_CELLS_PER_TICK`): the visualizer runs up to `MAX_NODES` runtimes
+/// on one thread, so it keeps each node's pool small (`255 × 1400 B` ≈ 36 MB at
+/// 100 nodes) and caps each frame so a round's packets fit that pool whole.
 ///
-/// The invariant that fixes the high-node gossip freeze: **the send pool must
-/// hold one tick's worst-case packet output, with headroom for any cross-tick
-/// backlog.** Send-pool slots recycle only on the runtime's separate `Writable`
-/// select arm, never within `handle_gossip_tick`, so all `pick_count` peers'
-/// frames for one tick must fit in the free slots at once. If a frame can't
-/// finish, [`gabion::wire::Packets::next_into`] runs out of slots mid-frame and
-/// the iterator's drain contract trips its `debug_assert` (an `unreachable`
-/// freeze in dev wasm; a silent re-send next tick in release, since the dirty
-/// rings are persistent — no data loss, just slower flush).
+/// A round shares the free send slots evenly across its `pick_count =
+/// ⌈ln(peers)+c⌉` picks (`c` = `GOSSIP_COVERAGE_MARGIN` = 3), capped at the
+/// peer count: at most 9 at `MAX_NODES` = 256, and 8 at the 100-node overload
+/// point. A 160-cell frame is at most `ceil(160 / 21) = 8` packets (21 cells
+/// per 1400-byte packet in the worst case, every cell a distinct origin, so
+/// the node dictionary costs 16 B/cell on top of the 46 B row). A round
+/// therefore queues at most `9 × 8 = 72` packets, well inside 255, leaving the
+/// rest of the pool for packets still draining from the previous round.
 ///
-/// **The pool ceiling is 255, not a free choice.** The runtime addresses
-/// send-pool slots with a `u8` (`send_pending: VecDeque<(SocketAddr, u8)>`) and
-/// builds the free list as `(0..send_pool_size as u8)`, so any capacity ≥ 256
-/// wraps to an *empty* free list and silently kills all gossip. So the pool is
-/// pinned at the largest addressable value, and the per-tick frame is capped so
-/// one tick stays well inside it:
-///
-/// One tick emits at most `pick_count × packets_per_frame` packets, where
-/// `pick_count = ⌈ln(peers)+c⌉` (the coverage fanout, `c` =
-/// `GOSSIP_COVERAGE_MARGIN` = 3), capped at the peer count. The widest cluster
-/// the visualizer builds is `MAX_NODES` = 256, so `peers ≤ 255` and
-/// `pick_count ≤ ⌈ln(255)+3⌉ = 9`; at the 100-node overload point it is
-/// `⌈ln(99)+3⌉ = 8`. `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK /
-/// cells_per_packet)`, with `cells_per_packet ≈ 21` at a 1400-byte payload in
-/// the worst case (every cell a distinct origin, so the node dictionary costs
-/// 16 B/cell on top of the 46 B row) — so `ceil(160 / 21) = 8`. The worst case
-/// at 100 nodes is therefore ≈ `8 × 8 = 64` packets/tick, which the 255-slot
-/// pool clears ~4×, leaving the rest of the pool for packets still draining
-/// from the previous tick. A native 100-node Sustained-overload run (40 s of
-/// virtual time, debug build with the drain `debug_assert` live) measured an
-/// actual `max_send_pending_depth` peak of **64** — no trap, ~4× under the
-/// pool. (The coverage fanout is stable for a cluster size, so this peak does
-/// not climb with burst volume the way the old dirty-set widening did.)
-///
-/// Capping the per-tick frame is what keeps one tick inside the fixed pool. The
-/// cap is inert at the default 12-node scenarios — their cross-node working set
-/// (≈ 132 cells) never reaches 160 — so it changes nothing user-visible there;
-/// a large cluster's burst simply flushes over a few ticks instead of one (the
-/// dirty rings are persistent, so the residual rides the next tick rather than
-/// dropping). Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
+/// The cap is inert at the default 12-node scenarios — their cross-node working
+/// set (≈ 132 cells) never reaches 160 — so it changes nothing user-visible
+/// there. In a large cluster's burst, the changes past 160 in one round (the
+/// oldest) skip that round's picks and arrive through the other forwarders or
+/// the repair lane.
 const VIZ_MAX_CELLS_PER_TICK: usize = 160;
 const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
 
@@ -400,12 +374,10 @@ impl EngineState {
         let store_config = self
             .config
             .cell_store_config(self.rule_descriptor().live_buckets());
-        // The per-tick frame is capped (see `VIZ_MAX_CELLS_PER_TICK`) so one
-        // tick's packet output stays inside the send pool. A small cluster's
-        // working set is below the cap, so it still flushes in a single round;
-        // a large cluster's burst flushes over a few ticks (the dirty rings are
-        // persistent, so the residual rides the next tick rather than
-        // dropping).
+        // The per-round frame is capped (see `VIZ_MAX_CELLS_PER_TICK`) so a
+        // round's packets fit the send pool whole. A small cluster's working
+        // set is below the cap; in a large cluster's burst the oldest changes
+        // past it arrive through other forwarders or the repair lane.
         let max_cells_per_tick = VIZ_MAX_CELLS_PER_TICK.min(store_config.cell_capacity as usize);
         let max_cells_per_frame = store_config.cell_capacity;
         let tick_interval = Duration::from_millis(self.config.tick_interval_ms);
@@ -659,9 +631,9 @@ impl EngineState {
         // `release_deferred` then delivers this round's packets; the second
         // drain lets receivers merge them. Their ticks are already consumed, so
         // a freshly-merged count cannot re-gossip in the same step — one step
-        // is one epidemic round, capped at `fanout` new peers. This is the
-        // physically correct model and keeps `submit`/churn paths (which never
-        // arm deferral) unchanged.
+        // is one epidemic round, capped at the coverage pick of new peers. This
+        // is the physically correct model and keeps `submit`/churn
+        // paths (which never arm deferral) unchanged.
         loop {
             let next_tick = (self.virtual_ms / tick_ms + 1).saturating_mul(tick_ms);
             if next_tick > target {

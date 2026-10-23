@@ -142,7 +142,6 @@ data:
       bind: 0.0.0.0:9000
       tick_interval: {LINGER_MS}ms
       fanout: {FANOUT}
-      send_queue_capacity: 32
       limit_queue_capacity: 1024
       cluster_id_hash: 1
     limits:

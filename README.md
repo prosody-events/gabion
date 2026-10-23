@@ -111,20 +111,23 @@ recorded into a local queue.
 
 Everything else happens asynchronously, driven by those recorded hits.
 A background gossip task on each member folds them into a CRDT,
-exchanges dirty rows with peers over UDP roughly every 500 ms, applies
-inbound deltas back into the local aggregate, and expires bucket rows
-as time advances. The wire codec is self-describing and tolerant of
-loss, so a dropped UDP frame costs the cluster one tick of staleness
-rather than a missed update.
+sends the rows that changed since the last round to a few peers over
+UDP roughly every 500 ms (sooner for a hot rule), applies inbound
+deltas back into the local aggregate, and expires bucket rows as time
+advances. The wire codec is self-describing and tolerant of loss: a
+dropped UDP packet costs that peer the change only until another
+forwarder, the cell's next update, or the repair lane delivers it —
+late, never wrong.
 
 Two adaptive aspects of the gossip protocol are worth naming together,
 because operators who only learn one half tend to misjudge how the
 cluster behaves under load:
 
-- **Coverage fanout** — the per-tick peer count is sized to the
+- **Coverage fanout** — the per-round peer count is sized to the
   coverage threshold `⌈ln(n)+c⌉` (`n` = peer count), the fanout that
-  reliably reaches every node. It scales with cluster size, not the
-  dirty set; a burst rides one fat frame instead of widening the pick.
+  reaches every node with high probability. It scales with cluster
+  size, not the number of changes; a burst rides one frame per pick
+  instead of widening the pick.
 - **Adaptive emit rate** — the gossip cadence itself adapts to
   per-rule pressure. A hot rule can fire a synthetic tick between
   heartbeats so that each rule's contribution to cluster-wide
@@ -192,9 +195,10 @@ regardless of which adapter they are running:
 
 1. **Bind a gossip socket.** The choice of UDP is deliberate: gabion's
    wire codec is self-describing and tolerant of loss, so that a
-   dropped frame costs one tick of staleness rather than opening a
-   correctness hole. Each process binds a single socket and uses it
-   both to send and to receive.
+   dropped packet delays a change for that peer — until another
+   forwarder, the cell's next update, or the repair lane delivers it —
+   rather than opening a correctness hole. Each process binds a single
+   socket and uses it both to send and to receive.
 
 2. **Pick a cluster id.** Every gabion process that should share
    counters declares the same non-zero u128. Frames from peers with a
@@ -223,7 +227,8 @@ and
 [`crates/server/README.md#running-across-a-cluster`](crates/server/README.md#running-across-a-cluster).
 
 Tuning the gossip cadence is rarely necessary, since the defaults
-converge in well under a second at production scale. The
+converge in under a second in our simulations of clusters up to
+1 024 nodes. The
 operator-knob reference and measured convergence curves are in
 [`crates/gabion/README.md`](crates/gabion/README.md#operator-knobs).
 

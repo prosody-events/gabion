@@ -10,9 +10,8 @@
 //! * `ingest_local/cold_start`    — empty store filling under realistic key
 //!   distribution (per-window startup).
 //!
-//! * `merge_remote/digest_repair` — what a digest-driven repair frame looks
-//!   like: 50% no-op (we are ahead) + 40% real update + 10% insert, across 8
-//!   peers.
+//! * `merge_remote/digest_repair` — what an inbound repair frame looks like:
+//!   50% no-op (we are ahead) + 40% real update + 10% insert, across 8 peers.
 //! * `merge_remote/bulk_fan_in`   — multiple peers gossiping overlapping cells
 //!   (max-merge collapses duplicates).
 //! * `merge_remote/all_noop`      — peer is behind us on every row.
@@ -22,10 +21,11 @@
 //! * `find/miss`                  — pure miss path, for the Robin Hood
 //!   early-exit baseline.
 //!
-//! * `fill_gossip_frame/steady_state` — moderately loaded node: some dirty
-//!   entries + repair lane filling the rest of a 128-cell frame budget.
-//! * `fill_gossip_frame/repair_only`  — dirty rings empty (gossip went idle);
-//!   pure repair sweep.
+//! * `fill_gossip_frame/steady_state` — a heartbeat's first pick on a
+//!   moderately loaded node: one round's 64 changes, then a 64-cell repair
+//!   slice.
+//! * `fill_gossip_frame/repair_only`  — a quiet heartbeat: no changes since the
+//!   last round, so the frame is pure repair sweep.
 //!
 //! * `expire/window_turnover`     — one bucket out of four ages out per call;
 //!   the steady-state expiry pattern.
@@ -600,7 +600,7 @@ fn bench_merge_remote(c: &mut Criterion) {
     let fixture = build_fixture();
 
     // ─── digest_repair ──────────────────────────────────────────────────
-    // What an incoming digest-repair frame looks like: 50% no-op (we are
+    // What an incoming repair frame looks like: 50% no-op (we are
     // ahead), 40% real update (peer is ahead), 10% insert (cell new to
     // us). Multi-peer, multi-rule.
     for &batch in &[64usize, 128] {
@@ -939,9 +939,11 @@ fn bench_fill_gossip_frame(c: &mut Criterion) {
     let fixture = build_fixture();
 
     // ─── steady_state ───────────────────────────────────────────────────
-    // Moderately loaded node: dirty rings contain ~64 recent updates;
-    // repair lane fills the remaining 64 slots of a 128-handle frame.
+    // A heartbeat's first pick on a moderately loaded node. The rings hold
+    // only the changes since the last round (the runtime clears them after
+    // every round): 64 of them, then a 64-cell repair slice.
     let mut steady = fixture.store.clone();
+    steady.clear_dirty();
     {
         // Generate ~64 recent local updates so local_dirty has entries.
         let mut rng = Rng::new(0xD1_D1_D1);
@@ -969,18 +971,19 @@ fn bench_fill_gossip_frame(c: &mut Criterion) {
         // iter without cloning.
         let mut out = Vec::<CellHandle>::with_capacity(128);
         b.iter(|| {
-            steady.fill_gossip_frame(black_box(128), black_box(&mut out));
+            steady.fill_gossip_frame(black_box(128), black_box(64), None, black_box(&mut out));
         });
     });
 
     // ─── repair_only ────────────────────────────────────────────────────
-    // Dirty rings drained; frame composition is entirely the repair scan.
+    // A quiet heartbeat: no changes since the last round, so the frame is
+    // entirely the repair scan.
     let mut repair = fixture.store.clone();
     repair.clear_dirty();
     group.bench_function("repair_only", |b| {
         let mut out = Vec::<CellHandle>::with_capacity(128);
         b.iter(|| {
-            repair.fill_gossip_frame(black_box(128), black_box(&mut out));
+            repair.fill_gossip_frame(black_box(128), black_box(128), None, black_box(&mut out));
         });
     });
 
@@ -1081,7 +1084,7 @@ fn bench_wire(c: &mut Criterion) {
     // pre-allocated buffer. Resembles the runtime's per-tick send path.
     let mut encode_store = fixture.store.clone();
     let mut handles = Vec::<CellHandle>::with_capacity(128);
-    encode_store.fill_gossip_frame(128, &mut handles);
+    encode_store.fill_gossip_frame(128, 128, None, &mut handles);
     let handles = handles; // freeze for the closure
     group.bench_function("encode_128", |b| {
         let mut scratch = WireScratch::for_store(&encode_store);
@@ -1108,7 +1111,7 @@ fn bench_wire(c: &mut Criterion) {
     // list across however many packets it takes (target ~9–10).
     let mut multi_store = fixture.store.clone();
     let mut multi_handles = Vec::<CellHandle>::with_capacity(4096);
-    multi_store.fill_gossip_frame(4096, &mut multi_handles);
+    multi_store.fill_gossip_frame(4096, 4096, None, &mut multi_handles);
     let multi_handles = multi_handles;
     let multi_limits = FrameLimits {
         max_payload_bytes: 64 * 1024,

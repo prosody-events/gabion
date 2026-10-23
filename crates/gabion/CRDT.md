@@ -36,7 +36,7 @@ Read it end-to-end and you should be able to open `crdt.rs` and recognise every 
    - 7.2 [The repair cursor — the third lane](#72-the-repair-cursor--the-third-lane)
    - 7.3 [`fill_gossip_frame` and per-frame dedup](#73-fill_gossip_frame-and-per-frame-dedup)
    - 7.4 [`peer_frontier` — per-peer × per-origin cursors](#74-peer_frontier--per-peer--per-origin-cursors)
-   - 7.5 [`fill_gossip_frame_for_peer` and `peer_lacks`](#75-fill_gossip_frame_for_peer-and-peer_lacks)
+   - 7.5 [Peer pruning: `peer_lacks`](#75-peer-pruning-peer_lacks)
 8. [Expiry](#8-expiry)
 9. [End-to-end traced example](#9-end-to-end-traced-example)
 10. [Invariants reference](#10-invariants-reference)
@@ -65,7 +65,7 @@ The `crdt` module is responsible for:
 2. **Observing** local hits and **merging** observations heard from peers.
 3. **Emitting deltas** when a stored count rises and **emitting expirations** when an aged-out cell is freed, so an external aggregate store stays consistent with the active set.
 4. **Marking dirty** any cell that just changed, so the gossip layer knows what to send next.
-5. **Repairing** silently by rotating over the active set, so anti-entropy still converges when dirty tracking overflows.
+5. **Repairing** silently by rotating over the active set, so anti-entropy still converges when dirty tracking overflows or a round's one-shot send is lost, cut, or pruned.
 6. **Expiring** cells whose bucket has aged out of the live window.
 
 Everything in the module is single-threaded and bounded, with all capacities picked at `CellStore::new` time and never grown thereafter. The module-level comment says it plainly: *"Nothing in this module allocates after construction."* Two storage conventions enforce this. The store's own columns are `Box<[T]>` — slices that cannot grow, sized once at construction — while the caller-owned I/O containers (§5) are `Vec<T>` so that the caller can `clear()` them between frames and reuse the same capacity, calling `with_capacity` once at startup so they never reallocate in steady state.
@@ -517,7 +517,7 @@ Each shifted entry's probe distance drops by exactly one.
 
 File: `crates/gabion/src/crdt/dirty_ring.rs`.
 
-A `DirtyRing` is a fixed-capacity ring buffer of "this cell just changed" entries. The cell store keeps two of them: `local_dirty` for changes whose origin is this node, and `forwarded_dirty` for changes learned from peers. Both are drained each gossip tick.
+A `DirtyRing` is a fixed-capacity ring buffer of "this cell just changed" entries. The cell store keeps two of them: `local_dirty` for changes whose origin is this node, and `forwarded_dirty` for changes learned from peers. The gossip runtime clears both at the end of every round, so they hold only the changes since the last one (a round that finds fewer free send slots than it has picks returns early and keeps them, so no pick misses them).
 
 #### The entry
 
@@ -530,7 +530,7 @@ pub struct DirtyEntry {
 
 The two fields play different roles. `handle` identifies which cell was touched; it is itself an `(index, generation)` pair, and the generation detects that a slot has been recycled to a different cell since the entry was written (§4.3). `origin_sequence` is the cell's per-origin sequence number at the moment of stamping, and it is what makes the ring safe to be lossy.
 
-When the gossip path drains the ring, it does not blindly trust every entry. `dirty_entry_current` checks three things: that the slot index is in range, that the slot's `generations[i]` still matches `handle.generation` (so the slot has not been recycled), and that the slot's `origin_sequences[i]` still equals the entry's `origin_sequence`.
+When the gossip path reads the ring, it does not blindly trust every entry. `dirty_entry_current` checks three things: that the slot index is in range, that the slot's `generations[i]` still matches `handle.generation` (so the slot has not been recycled), and that the slot's `origin_sequences[i]` still equals the entry's `origin_sequence`.
 
 That last check is the point. If a later mutation on the same cell stamped a new sequence after this entry was pushed, the cell is already represented by the newer ring entry, and re-emitting the older one would only send stale state, so the check silently skips superseded entries. Duplicate entries for the same cell are therefore harmless, since only the most recent one ever passes validation, and the ring does not need to deduplicate on push.
 
@@ -550,7 +550,7 @@ pub struct DirtyRing {
 | `entries`     | Heap-allocated fixed-size slot array. Sized once at construction. |
 | `head`        | Index where the **next** push will write. Always `0 <= head < capacity` when capacity > 0. |
 | `len`         | How many slots currently hold valid data. Grows up to `capacity` then saturates. |
-| `overflow_seq`| Monotonic counter, incremented every time a push displaces an older entry. |
+| `overflow_seq`| Monotonic counter, incremented every time a push displaces an older entry. Cumulative: `clear()` leaves it alone. |
 
 ```mermaid
 flowchart LR
@@ -595,15 +595,15 @@ Each push runs in constant time. `push` does not deduplicate, because deduplicat
 
 #### Read
 
-`iter` yields entries in insertion order, oldest first. `ring_entry_at(ring, offset)` is the same arithmetic exposed as a single-shot read, and it exists for the hot `fill_gossip_frame` path, which calls mutating methods on `self` between successive entry reads. An iterator over `&self.local_dirty` would hold a shared borrow of `self` for the whole loop and forbid those mutations, whereas `ring_entry_at` takes a `&DirtyRing` only for the duration of one call, returns a copy, and lets go.
+`iter` yields entries in insertion order, oldest first. `ring_entry_at(ring, offset)` is the same arithmetic exposed as a single-shot read, and it exists for the hot `fill_gossip_frame` path, which walks the offsets in reverse (newest first) and calls mutating methods on `self` between successive entry reads. An iterator over `&self.local_dirty` would hold a shared borrow of `self` for the whole loop and forbid those mutations, whereas `ring_entry_at` takes a `&DirtyRing` only for the duration of one call, returns a copy, and lets go.
 
-There is no `pop` and no `drain`. The send path reads the ring non-destructively and resets it wholesale via `clear()`, which resets `head`, `len`, and `overflow_seq` to zero.
+There is no `pop` and no `drain`. The send path reads the ring non-destructively, once per pick, and after every round the runtime resets it wholesale via `clear()`, which resets `head` and `len` to zero. `overflow_seq` is cumulative and survives `clear()`, so the power-of-two overflow warnings stay spaced across rounds.
 
 #### Overflow — bounded loss is fine
 
-If a burst of writes overflows the ring, the oldest entries are dropped. The ring records the loss by bumping `overflow_seq` (a `u64` via `saturating_add`), but the entries themselves are gone, and on its own that would be a correctness bug. The CRDT compensates by composing the dirty rings with a third lane — the repair cursor (§7.2) — that rotates over every active cell so that whatever the rings lose, the repair sweep rediscovers within one full rotation.
+Because the rings are cleared every round, overflow means more changes arrived between two rounds than a ring holds; the oldest entries are then dropped. The ring records the loss by bumping `overflow_seq` (a `u64` via `saturating_add`), but the entries themselves are gone, and on its own that would be a correctness bug. The CRDT compensates by composing the dirty rings with a third lane — the repair cursor (§7.2) — that rotates over every active cell so that whatever the rings lose, the repair sweep rediscovers. When a frame is cut by its pick's send-queue share, the runtime moves the cursor back to the first repair cell it did not send, so the next heartbeat resumes there.
 
-The cell store emits a power-of-two rate-limited `tracing::warn!` from its `push_dirty` overflow path, naming the relevant capacity config key (`storage.local_dirty_capacity` or `storage.forwarded_dirty_capacity`) so that operators can see pressure without the log volume scaling with the overflow rate.
+The cell store emits a power-of-two rate-limited `tracing::warn!` from its `push_dirty` overflow path, naming the relevant capacity config key (`storage.local_dirty_capacity` or `storage.forwarded_dirty_capacity`, and the nginx directive) so that operators can see pressure without the log volume scaling with the overflow rate.
 
 ```mermaid
 flowchart TB
@@ -625,8 +625,7 @@ The dirty rings are the optimistic fast path, while the repair sweep
 eventual-consistency backstop that re-emits every active cell on a
 rotating schedule. Together they tolerate ring overflow: although the
 ring *records* the loss by bumping `overflow_seq` and the lost entries
-are themselves gone, the repair sweep picks them up on the next
-rotation.
+are themselves gone, the repair sweep picks them up as it rotates.
 
 #### Dirty ring invariants
 
@@ -635,9 +634,9 @@ rotation.
 3. **Length bounds.** `0 <= len <= capacity()`.
 4. **Logical contents.** The `len` valid entries, oldest to newest, are `entries[0..len]` if `len < capacity()`, otherwise the wrap-around slice starting at `entries[head]`.
 5. **No-op on zero capacity.** Every push is a no-op except for incrementing `overflow_seq`.
-6. **`overflow_seq` monotonicity.** Non-decreasing between calls to `clear()`. Uses `saturating_add`, so it cannot wrap to zero.
+6. **`overflow_seq` monotonicity.** Never decreases, including across `clear()`. Uses `saturating_add`, so it cannot wrap to zero.
 7. **`overflowed()` agreement.** Returns `true` iff `overflow_seq > 0`.
-8. **`clear` is total.** After `clear()`: `head == 0`, `len == 0`, `overflow_seq == 0`.
+8. **`clear` empties the ring.** After `clear()`: `head == 0`, `len == 0`; `overflow_seq` is unchanged.
 9. **`ring_entry_at` is a partial function.** Out-of-bounds offsets panic via the slice index; callers in `crdt.rs` bound `offset < ring.len()` themselves.
 
 ---
@@ -1146,7 +1145,7 @@ The `local_dirty` lane is what gets gossiped first, since it carries changes thi
 
 `next_sequence_by_origin` is sized to `node_dictionary_capacity`. Each origin gets its own monotonic counter, and `next_origin_sequence` saturating-adds one before returning, so the first sequence ever minted is 1; a `0` read back from a never-allocated origin slot means "nothing here yet."
 
-The sequence has two jobs. It disambiguates ring entries for the same cell, since only the latest entry survives validation, and it supplies ordering metadata for `PeerFrontierTable` so that peers can advance their per-origin acknowledgement cursors. When a node slot is freed by refcount, the counter for that slot is reset.
+The sequence has two jobs. It disambiguates ring entries for the same cell, since only the latest entry survives validation, and it rides the wire with each cell, where the receiving node records it in its `PeerFrontierTable` as a per-`(peer, origin)` hint of what the sender holds (§7.4). When a node slot is freed by refcount, the counter for that slot is reset.
 
 #### The `local_node_slot` pin
 
@@ -1167,14 +1166,14 @@ All read primitives are lock-free.
 | `count_of(handle) -> Option<C>` | Hot fast path: touches only the `counts` column. |
 | `active_handles()` | Diagnostic helper that walks `0..capacity` and yields handles only for slots with odd generation. Scans the full capacity, not just `active_len`; not for hot paths. |
 
-There is no atomic "snapshot the whole store" operation. The structure is single-threaded, so a snapshot is logically the iterator `active_handles().map(|h| store.get(h).unwrap())`; higher layers persist via the `DeltaSink`/`ExpirationSink` streams and the `peer_frontier` checkpoints.
+There is no atomic "snapshot the whole store" operation. The structure is single-threaded, so a snapshot is logically the iterator `active_handles().map(|h| store.get(h).unwrap())`; higher layers follow the store through the `DeltaSink`/`ExpirationSink` streams. Nothing is persisted: a restarted node rejoins with a new incarnation and relearns peers' cells from gossip.
 
 ---
 
 <a id="gossip-and-convergence"></a>
 ## 7. Gossip and convergence
 
-A node converges with its peers through three lanes that the cell store composes into each gossip frame.
+A node converges with its peers through three lanes that the cell store composes into each gossip frame. The runtime builds one frame per peer it picks in a round (see [`README.md`](README.md#the-anti-entropy-loop)), sends each change in exactly one round, and clears the dirty rings afterwards; peers that merge a change forward it once in their own next round.
 
 ### 7.1 The two dirty rings
 
@@ -1182,24 +1181,24 @@ The store keeps two `DirtyRing`s (see §3.4 for the ring buffer itself) side by 
 
 | Field            | Origin of entries                                                   | Gossip lane |
 |------------------|---------------------------------------------------------------------|-------------|
-| `local_dirty`    | Updates whose origin is **this** node (`origin == local_node_slot`).| Lane 1 — emitted first in `fill_gossip_frame`. |
-| `forwarded_dirty`| Updates received from **other** nodes that this node is relaying.   | Lane 2 — emitted after the local ring fills its share of the frame. |
+| `local_dirty`    | Updates whose origin is **this** node (`origin == local_node_slot`).| Lane 1 — emitted first in `fill_gossip_frame`, newest first. |
+| `forwarded_dirty`| Updates received from **other** nodes that this node is relaying.   | Lane 2 — emitted after lane 1, newest first, into whatever of `max_cells` is left. |
 
 The `DirtyRing` type itself does not care which lane it is — both instances are identical implementations. The split is a policy decision: locally-originated updates ship before forwarded ones so that a hot local writer does not starve on relayed chatter, and each ring has its own configurable capacity.
 
-`visit_local_dirty` and `visit_forwarded_dirty` stream the ring entries through a caller closure, validating each entry with `dirty_entry_current` and silently skipping stale entries. These visitors do not deduplicate, so a multi-lane composer must dedup itself (§7.3).
-
 ### 7.2 The repair cursor — the third lane
 
-The dirty rings have finite capacity. If a burst of writes overflows the ring, the oldest entries are dropped: the ring bumps `overflow_seq` as a hint, but the entries themselves are gone, and on their own the dirty rings can lose information.
+The dirty rings send each change once. If a ring overflows between two rounds, if every packet carrying a change to some node is lost, if a frame is cut by its send-queue share or by `max_cells`, or if the peer frontier wrongly prunes a change, the dirty lanes never offer that change again: the rings are cleared after every round.
 
-The repair cursor is the safety net. It is a `u32` that rotates over `0..capacity` and, on each gossip frame, sweeps forward a small slice and emits handles for any active slot it lands on. The cursor only advances on slots it actually visited, so a partial sweep resumes where it left off on the next frame. Over many frames every active cell is therefore guaranteed to be retransmitted at least once per full rotation, which is the convergence property dirty-only gossip cannot give you on its own.
+The repair cursor is the safety net, and the only resend path. It is a `u32` that rotates over `0..capacity` and, when asked, sweeps forward a slice and emits handles for any active slot it lands on. The runtime asks only on heartbeat rounds, and only for the frame of the round's first (random) pick, with a budget of `repair_cells` (`defaults::GOSSIP_REPAIR_CELLS_PER_TICK` = 256); threshold rounds carry no repair. The repair cells sit at the frame's tail, after the changes. The cursor only advances over slots it actually visited, so a partial sweep resumes where it left off on the next heartbeat; when the frame is cut by its pick's send-queue share, `resume_repair_at` moves the cursor back to the first repair cell that was not sent. Over many heartbeats every active cell is therefore resent to some random peer once per full rotation, which is the convergence property dirty-only gossip cannot give you on its own.
 
-`visit_repair_slice(max_cells, visit)` is the standalone interface, and `fill_gossip_frame` (§7.3) folds it in as lane 3.
+There is no standalone repair entry point: `fill_gossip_frame` (§7.3) folds the sweep in as lane 3.
 
 ### 7.3 `fill_gossip_frame` and per-frame dedup
 
-`fill_gossip_frame(max_cells, out)` stitches the three lanes together in priority order — local dirty, then forwarded dirty, then a rotating repair slice — into a single output buffer of cell handles capped at `max_cells`. The gossip runtime calls this once per outgoing frame.
+`fill_gossip_frame(max_cells, repair_cells, peer, out)` stitches the three lanes together in priority order — local dirty, then forwarded dirty, each newest first, then up to `repair_cells` of the rotating repair slice — into a single output buffer of cell handles capped at `max_cells`. It returns how many of the handles are changes from the dirty lanes; the rest of `out` is repair. The gossip runtime calls it once per pick per round, and it is the only frame builder.
+
+Newest first matters because a frame can lose its tail. A frame over `max_cells` stops before the oldest changes, and when the runtime encodes it into packets it gets only its pick's share of the free send slots; whatever does not fit is abandoned from the tail — repair cells first, then the oldest changes. Keeping the newest changes keeps the freshest counts, and a dropped change still reaches that peer through other forwarders, the cell's next change, or the repair lane. The returned change count is what lets the runtime warn only when a cut reaches the changes.
 
 Per-frame deduplication is O(1) and allocation-free. Every frame, `bump_selection_epoch` increments `selection_epoch`, and `mark_selected(slot)` writes the current epoch into `selection_marks[slot]`; if the slot was already marked this epoch, the caller skips it. Lane 3 therefore naturally cannot re-emit a cell that lanes 1 or 2 already pushed.
 
@@ -1212,25 +1211,28 @@ sequenceDiagram
     participant SM as selection_marks
     participant RC as repair_cursor
 
-    App->>CS: fill_gossip_frame(max_cells=N, out)
+    App->>CS: fill_gossip_frame(max_cells, repair_cells, peer, out)
     CS->>CS: out.clear(); bump_selection_epoch()
-    loop over local_dirty (oldest first)
+    loop over local_dirty (newest first) until out holds max_cells
         CS->>LD: ring_entry_at(offset)
         CS->>CS: dirty_entry_current(entry)?
+        CS->>CS: peer is None or peer_lacks(peer, slot)?
         CS->>SM: mark_selected(slot)?
-        alt fresh & not yet marked
+        alt fresh, lacking & not yet marked
             CS->>App: out.push(handle)
         end
     end
-    loop over forwarded_dirty
+    loop over forwarded_dirty (newest first) until out holds max_cells
         CS->>FD: ring_entry_at(offset)
         CS->>CS: dirty_entry_current(entry)?
+        CS->>CS: peer is None or peer_lacks(peer, slot)?
         CS->>SM: mark_selected(slot)?
-        alt fresh & not yet marked
+        alt fresh, lacking & not yet marked
             CS->>App: out.push(handle)
         end
     end
-    loop rotating from repair_cursor until budget filled or full sweep
+    Note over CS: changes = out.len()
+    loop from repair_cursor until repair_cells taken, frame full, or full sweep
         CS->>CS: is_active(slot)?
         CS->>SM: mark_selected(slot)?
         alt active & not yet marked
@@ -1238,6 +1240,7 @@ sequenceDiagram
         end
     end
     CS->>RC: repair_cursor = next_cursor
+    CS-->>App: changes
 ```
 
 The `selection_epoch` is a `u32` that wraps. On wrap to zero, `bump_selection_epoch` does a one-shot scrub of `selection_marks` and resets the epoch to 1 so the new epoch is unambiguous. Since `u32` epochs cover billions of frames, the wraparound branch exists as cheap insurance rather than a real hot path.
@@ -1246,16 +1249,16 @@ The `selection_epoch` is a `u32` that wraps. On wrap to zero, `bump_selection_ep
 
 File: `crates/gabion/src/crdt/peer_frontier.rs`.
 
-`PeerFrontierTable` is a small bookkeeping table that lets the outbound gossip layer skip cells a given peer has already acknowledged. It is a latency optimisation rather than a convergence mechanism, as the module's own docstring makes explicit:
+`PeerFrontierTable` is a small bookkeeping table that lets the outbound gossip layer skip changes a given peer probably already holds. It is a latency optimisation rather than a convergence mechanism, as the module's own docstring makes explicit:
 
 > Latency optimization only — convergence is guaranteed by the repair
 > lane, not by this table.
 
-It is not indexed per `(rule, key, bucket)` and it is not consulted from the CRDT's write path. If gossip is dropped or reordered, the repair cursor in `CellStore` eventually rotates over every active cell and reconciles; the frontier just lets the happy path avoid resending what each peer already has.
+It is not indexed per `(rule, key, bucket)` and it is not consulted from the CRDT's write path. If gossip is dropped or reordered, or the table is wrong, the repair cursor in `CellStore` eventually rotates over every active cell and reconciles; the frontier just lets the happy path avoid sending a change back to a peer that has it.
 
 #### What it tracks
 
-For every `(peer, origin-node)` pair this process tracks, the table remembers two monotonic cursors: `last_sent_seq` is the highest origin-sequence number we have transmitted to that peer for cells owned by that origin, and `last_acked_seq` is the highest origin-sequence number the peer has acknowledged receiving. Together these answer one question: *which of my active cells does peer X still need to hear about from origin O?*
+For every `(peer, origin-node)` pair this process tracks, the table remembers one monotonic cursor, `last_acked_seq`: the highest origin sequence among the cells that peer has **sent us** for that origin. `GossipRuntime::handle_inbound` records it, after `merge_remote`, for every cell in every packet it decodes from that peer. There are no acknowledgement frames; the "acked" name reads it as "the peer holds that origin up to here". That reading is only a hint, because the sequence is in the *sender's* numbering — every node re-stamps the cells it merges with its own per-origin counter (§6.3) — while `peer_lacks` compares it with this node's stamps (§7.5).
 
 #### Layout
 
@@ -1263,14 +1266,13 @@ For every `(peer, origin-node)` pair this process tracks, the table remembers tw
 pub struct PeerFrontierTable {
     peer_ids:        Box<[Option<NodeId>]>, // length = peer_capacity
     last_acked_seq:  Box<[u64]>,            // length = peer_capacity * node_capacity
-    last_sent_seq:   Box<[u64]>,            // length = peer_capacity * node_capacity
     peer_capacity:   u16,
     node_capacity:   u16,
     full_rejects:    u64,
 }
 ```
 
-`last_acked_seq` and `last_sent_seq` are conceptually a `peer_capacity × node_capacity` matrix flattened in **peer-major** order: one row per peer, with all that peer's per-origin cursors contiguous in memory.
+`last_acked_seq` is conceptually a `peer_capacity × node_capacity` matrix flattened in **peer-major** order: one row per peer, with all that peer's per-origin cursors contiguous in memory.
 
 ```mermaid
 flowchart TB
@@ -1285,105 +1287,70 @@ flowchart TB
   IDX["flat_index = peer_slot * node_capacity + node_slot"] --> P1
 ```
 
-Two of the three hot operations — `remove_peer`, which clears one peer's row, and `lacks_indices`, which scans one peer's row against the origin column — touch one peer at a time, so peer-major matches the access pattern.
+`remove_peer` clears one peer's row, and one frame build reads only the row of the peer it is for, so peer-major matches the access pattern.
 
-`peer_ids` is a tiny linear-probe interning table of `Option<NodeId>` slots scanned via `position`. `intern_peer` is meant to be a once-per-peer-handshake operation, not a per-message one.
+`peer_ids` is a tiny linear-probe interning table of `Option<NodeId>` slots scanned via `position`. `handle_inbound` calls `intern_peer` for every decoded packet, but it finds an existing entry for a known peer and caches the slot on the runtime's peer entry, so the frame builder never searches the table.
 
-`full_rejects` counts the times `intern_peer` had to refuse because every peer slot was occupied. The same field drives a power-of-two rate-limited `tracing::warn!` that names `storage.peer_capacity` as the config key an operator should raise. Convergence still holds when this happens, because gossip to the unregistered peer simply pays the cost of not having the per-peer frontier and falls back on full-frame compose plus repair.
+`full_rejects` counts the times `intern_peer` had to refuse because every peer slot was occupied. The same field drives a power-of-two rate-limited `tracing::warn!` that names `storage.peer_capacity` as the config key an operator should raise. Convergence still holds when this happens, because gossip to the unregistered peer simply goes without pruning (`peer: None`, §7.5) and pays for it in redundant changes.
 
 #### Primitives
 
 | Operation | Purpose |
 |---|---|
 | `intern_peer(peer)` / `find_peer(peer)` / `remove_peer(peer)` | Manage peer slot allocation. `intern_peer` scans for an existing entry first, then claims a free slot. Table full returns `None` and bumps `full_rejects`. |
-| `last_sent(peer, origin)` / `last_acked(peer, origin)` | Plain indexed `u64` reads. Zero means "no information." |
-| `record_sent(peer, origin, seq)` / `record_acked(peer, origin, seq)` | "Raise the high-water mark" operations — guarded by `<`, so stale or duplicate calls are no-ops. |
+| `last_acked(peer, origin)` | Plain indexed `u64` read. Zero means "no information." |
+| `record_acked(peer, origin, seq)` | "Raise the high-water mark" — guarded by `<`, so stale or duplicate calls are no-ops. |
 | `clear_node_slot(node_slot)` | Wipes one origin column when its slot is recycled by the cell store. |
-| `lacks_indices(peer, active_origins, origin_sequences, active_indices, out)` | Brute-force "which cells does this peer lack" scan — used in tests and digest-mismatch repair. The hot per-frame consumer is `peer_lacks`, inlined into `fill_gossip_frame_for_peer` (§7.5). |
 
-**Idempotence.** The `<` guards on `record_*` make every update a max-merge, so a late or duplicate `record_*` carrying a stale sequence is silently ignored. If two callers race, both succeed and the one carrying the smaller sequence is a no-op; if an ack arrives twice, the second call is a no-op.
+**Idempotence.** The `<` guard on `record_acked` makes every update a max-merge, so a late or duplicate packet carrying a smaller sequence is silently ignored.
 
 #### Why per-`(peer, origin)`, and not a single cursor?
 
-Imagine origin **O** emits sequences `1, 2, 3`. Peer **A** received `1` and `2`, while peer **B** received `1` and `3` because frame `2` was dropped on the wire to B. With a single global "highest sequence sent to anyone" cursor, the next gossip round cannot distinguish whose frontier is lagging, so it either re-broadcasts everything (wasteful) or under-delivers (incorrect). Per-`(peer, origin)` state captures exactly which peer is behind on which origin's stream.
+Each origin's cells are stamped from that origin slot's own counter, so sequences from different origins are not comparable, and peers hear different subsets of the cluster's changes. A single "highest sequence heard from this peer" cursor could not say which origins' changes the peer has caught up on; per-`(peer, origin)` state at least keeps each origin's hint separate.
 
-#### Reordered acks: the canonical scenario
+#### Reordered packets: the guard at work
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Tx as gossip transport
+    participant Rx as GossipRuntime::handle_inbound
     participant F as PeerFrontierTable
     Note over F: last_acked[A,O] = 0, last_acked[B,O] = 0
 
-    Tx->>F: record_acked(A, O, 1)
+    Rx->>F: record_acked(A, O, 1)
     Note over F: 0 < 1 → last_acked[A,O] = 1
 
-    Tx->>F: record_acked(A, O, 2)
+    Rx->>F: record_acked(A, O, 2)
     Note over F: 1 < 2 → last_acked[A,O] = 2
 
-    Tx->>F: record_acked(B, O, 1)
+    Rx->>F: record_acked(B, O, 1)
     Note over F: 0 < 1 → last_acked[B,O] = 1
 
-    Tx->>F: record_acked(A, O, 1)   (delayed duplicate)
+    Rx->>F: record_acked(A, O, 1)   (delayed packet)
     Note over F: 2 < 1 is false → NO-OP
 
     Note over F: state: last_acked[A,O] = 2, last_acked[B,O] = 1
-
-    Note over F: a later fill_gossip_frame_for_peer(B) will see B lacks 2 and 3
 ```
 
-The duplicate `record_acked(A, O, 1)` is silently dropped because A's
-frontier is already at 2; without that guard we would rewind A's
-cursor and uselessly retransmit sequence 2 to A. B's frontier sits
-at 1 independently of A's, and a subsequent peer-aware frame compose
-for B correctly identifies that B is missing sequences 2 and 3 — a
-distinction that a single-cursor design would have lost.
-
-#### `lacks_indices` — the test / digest-repair helper
-
-`lacks_indices(peer, active_origins, origin_sequences, active_indices, out)` walks a caller-supplied list of `active_indices`, joins each index against the peer's row, and writes back the indices the peer hasn't acked yet:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Repair as Repair driver (tests / digest mismatch)
-    participant Front as PeerFrontierTable
-    participant Cells as CellStore arrays
-
-    Repair->>Cells: borrow active_indices, active_origins, origin_sequences
-    Repair->>Front: lacks_indices(peer_slot, ..., out=&mut Vec)
-    loop for each idx in active_indices
-        Front->>Front: origin := active_origins[idx]
-        Front->>Front: last := last_acked_seq[flat_index(peer_slot, origin)]
-        alt origin_sequences[idx] > last
-            Front-->>Repair: push idx into out
-        else
-            Front-->>Repair: skip (peer already has this)
-        end
-    end
-    Repair->>Repair: gossip cells named by out to this peer
-```
-
-This is the brute-force form: it builds the whole "needs to be sent" list up front and is the right tool when something has gone wrong, such as a digest mismatch or a manual repair test. The production hot path does not buy that list; it makes the same decision one cell at a time inside the frame composer (§7.5).
+The delayed packet from A cannot rewind A's cursor, and B's cursor sits at 1 independently of A's. In the next round, a change from origin O stamped above 1 still goes to B if B is picked; one stamped at or below A's 2 is skipped for A. Neither decision is ever revisited: the dirty rings are cleared after the round, so a change wrongly skipped for a peer reaches it through other forwarders or the repair lane.
 
 #### Interaction with the cell store
 
-The only call to a `peer_frontier` mutator from inside `crdt.rs` is `clear_node_slot`, invoked from `free_cell_at` when the node dictionary frees a `NodeSlot` because the last cell owned by that origin was evicted. Two things must reset together: the origin-sequence allocator, so the next user of the slot starts at sequence 1 again, and every peer's frontier into this slot, so old acks from a long-departed origin do not silently suppress retransmission of the new origin's cells. Every other call to `record_sent`, `record_acked`, or `intern_peer` is driven from the gossip transport layer outside this module.
+The only call to a `peer_frontier` mutator from inside `crdt.rs` is `clear_node_slot`, invoked from `free_cell_at` when the node dictionary frees a `NodeSlot` because the last cell owned by that origin was evicted. Two things must reset together: the origin-sequence allocator, so the next user of the slot starts at sequence 1 again, and every peer's frontier into this slot, so stale cursors from a long-departed origin do not suppress the new origin's changes. Every call to `record_acked` and `intern_peer` comes from `GossipRuntime::handle_inbound`, outside this module.
 
 #### Frontier invariants
 
-1. **Monotonic non-decreasing per cell.** For any fixed `(peer_slot, node_slot)`, both `last_sent_seq` and `last_acked_seq` only ever stay the same or increase. Enforced by the `<` guards.
-2. **Idempotent updates.** Repeated `record_sent` / `record_acked` with the same arguments leave state unchanged.
-3. **Order-independence.** Applying any permutation of `record_*` calls produces the same final state.
+1. **Monotonic non-decreasing per cell.** For any fixed `(peer_slot, node_slot)`, `last_acked_seq` only ever stays the same or increases. Enforced by the `<` guard.
+2. **Idempotent updates.** Repeated `record_acked` with the same arguments leaves state unchanged.
+3. **Order-independence.** Applying any permutation of `record_acked` calls produces the same final state.
 4. **Zero is "no information."** A freshly-constructed table, a freshly-cleared row (via `remove_peer`), and a freshly-cleared column (via `clear_node_slot`) all read as 0 on every cell.
-5. **No allocation after construction.** All three arrays are `Box<[T]>` of fixed length set in `new`.
+5. **No allocation after construction.** Both arrays are `Box<[T]>` of fixed length set in `new`.
 6. **No stale state across slot reuse.** When the parent `CellStore` recycles a `NodeSlot`, it calls `clear_node_slot` before the slot can be re-handed-out to a new `(NodeId, Incarnation)`.
 7. **Convergence is someone else's job.** Lose every byte of this table and the CRDT still converges — the repair cursor takes over.
 
-### 7.5 `fill_gossip_frame_for_peer` and `peer_lacks`
+### 7.5 Peer pruning: `peer_lacks`
 
-The peer-aware sibling of `fill_gossip_frame` is `fill_gossip_frame_for_peer(max_cells, peer_slot, out)`. It walks the same three lanes in the same order, with the same `selection_marks` dedup. The two **dirty** lanes add one filter per cell — skip it if the peer already has it — but the **repair** lane (lane 3) does *not*: it sweeps the rotating active-set slice unconditionally. That asymmetry is load-bearing for correctness, not just bandwidth (see below).
+`fill_gossip_frame` takes `peer: Option<u16>`. With `Some(peer_slot)`, the two **dirty** lanes add one filter per cell — skip it if the peer already has it — but the **repair** lane (lane 3) does *not*: it sweeps the rotating active-set slice unconditionally. That asymmetry is load-bearing for correctness, not just bandwidth (see below). With `None` — a peer we have not heard from yet, or one the frontier table had no slot for — nothing is pruned.
 
 That filter is a tiny inlined helper:
 
@@ -1398,13 +1365,13 @@ fn peer_lacks(&self, peer_slot: u16, cell_index: usize) -> bool {
 
 `peer_lacks` is the hot per-frame consumer of the frontier table. Per candidate cell, it reads two contiguous slices — `origins[cell_index]` and `origin_sequences[cell_index]` — and one `u64` out of the peer-major `last_acked_seq` array, with no allocation and no branch other than the comparison itself.
 
-`fill_gossip_frame_for_peer` chains its checks per candidate cell in the order they fail fastest. The dirty lanes run `dirty_entry_current`, then `peer_lacks(peer_slot, cell_index)` to skip cells the peer is already current on, then `mark_selected(slot)` to deduplicate across lanes within this frame; otherwise the handle is pushed. The repair lane runs only `is_active` and `mark_selected` — it deliberately omits `peer_lacks`.
+The dirty lanes chain their checks per candidate cell in the order they fail fastest: `dirty_entry_current`, then (with a peer) `peer_lacks(peer_slot, cell_index)` to skip cells the peer is already current on, then `mark_selected(slot)` to deduplicate across lanes within this frame; otherwise the handle is pushed. The repair lane runs only `is_active` and `mark_selected` — it deliberately omits `peer_lacks`.
 
-The gossip runtime calls `fill_gossip_frame_for_peer` once per peer-target per tick, so the per-tick UDP fanout is peer-shaped: the dirty lanes hand each peer the fresh cells it has not yet acknowledged, capped at the frame budget, while the repair lane rotates the rest of the active set past it over successive ticks. Two peers receiving from the same compositor therefore see overlapping but not identical content.
+The gossip runtime calls `fill_gossip_frame` once per pick per round, so the fanout is peer-shaped: the dirty lanes hand each pick the round's changes it probably lacks, capped at the frame budget and the pick's send-queue share, while the repair lane rides only on a heartbeat's first pick and rotates the rest of the active set past one random peer per heartbeat. Two peers receiving from the same compositor in one round therefore see overlapping but not identical content.
 
 The repair lane omits `peer_lacks` for **correctness**, not bandwidth. `last_acked` is a per-`(peer, origin)` high-watermark, and `merge_remote` re-stamps a remote cell with the *merging* node's local origin counter rather than carrying the origin's sequence on the wire — so a replica's stored `origin_sequence` and a peer's `last_acked` live in different per-node sequence spaces, and a single watermark cannot represent a gap (a peer holding sequence 5 but not 4). If every lane pruned on it, a cell the watermark wrongly believes the peer holds would be suppressed on *every* holder forever and the cluster would never converge. Gating only the dirty lanes keeps `peer_lacks` as the latency optimization it is; the repair lane's unconditional sweep — re-merged idempotently via the max-merge in `merge_remote` — is the convergence guarantee the `PeerFrontierTable` doc comment delegates to it. (This was a real bug: a rare partition-heal counterexample stranded one cell on one node forever until the repair lane was ungated.)
 
-When a peer has not been interned because the table was full, the runtime falls back to plain `fill_gossip_frame`; the wasted bandwidth shows up as redundant retransmission, and the `full_rejects` log line points the operator at the relevant config key.
+When a peer has not been interned because the table was full, the runtime passes `None`; the wasted bandwidth shows up as redundant changes, and the `full_rejects` log line points the operator at the relevant config key.
 
 ---
 
@@ -1531,9 +1498,9 @@ The whole structure relies on the following properties. They are grouped by subm
 3. `0 <= len <= capacity()`.
 4. Logical contents are `entries[0..len]` while filling, else the wrap-around slice starting at `head`.
 5. Zero capacity is a no-op except for `overflow_seq`.
-6. `overflow_seq` is monotonic; uses `saturating_add`.
+6. `overflow_seq` never decreases, even across `clear()`; uses `saturating_add`.
 7. `overflowed()` iff `overflow_seq > 0`.
-8. `clear` is total.
+8. `clear` empties the ring (`head == 0`, `len == 0`) and keeps `overflow_seq`.
 9. `ring_entry_at` panics on out-of-bounds; callers bound the offset.
 
 ### I/O containers
@@ -1570,7 +1537,7 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `hash_compact_cell_key`, `hash_fingerprint`, `hash_node_identity`, `mix64` | `hash` | SplitMix / MurmurHash-style mixers. |
 | `CellIndex` | `index` | Robin Hood open-addressing hash table, backshift deletion, power-of-two capacity. |
 | `Observation`, `ObservationBatch`, `DeltaSink`, `ExpirationSink` | `io` | SoA input row + input/output buffers. |
-| `PeerFrontierTable` | `peer_frontier` | Per-peer × per-origin send/ack cursors — latency hint only; convergence is the repair lane's job. |
+| `PeerFrontierTable` | `peer_frontier` | Per-peer × per-origin cursor of the highest sequence each peer has sent us — latency hint only; convergence is the repair lane's job. |
 
 #### Public entry points on `CellStore`, at a glance
 
@@ -1586,14 +1553,12 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `merge_remote(obs, sink)` | Merge peer observations (max-merge). |
 | `expire(current_epoch_by_rule, live_buckets, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell. |
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
-| `clear_dirty()` | Drop the dirty rings; stored cells untouched. |
+| `clear_dirty()` | Drop the dirty rings; stored cells untouched (the runtime calls it after every round). |
 | `clear()` | Reset to empty; preserves local identity registration. |
-| `visit_local_dirty`, `visit_forwarded_dirty` | Stream dirty lanes (no dedup). |
-| `visit_repair_slice(max, visit)` | Rotate a slice of active cells. |
-| `fill_gossip_frame(max, out)` | Compose a frame: local dirty + forwarded dirty + repair slice, deduped. |
-| `fill_gossip_frame_for_peer(max, peer_slot, out)` | Peer-aware variant; the two dirty lanes add a `peer_lacks` filter, the repair lane sweeps unconditionally (convergence backstop). |
-| `peer_frontiers()`, `peer_frontiers_mut()` | Per-peer send/ack frontier access. |
+| `fill_gossip_frame(max_cells, repair_cells, peer, out)` | Compose one pick's frame: local dirty + forwarded dirty (newest first, pruned by `peer_lacks` when `peer` is `Some`) + up to `repair_cells` of the repair slice (never pruned), deduped. Returns the number of changes. |
+| `peer_frontiers()`, `peer_frontiers_mut()` | Per-peer frontier access. |
 | `repair_cursor()` | Read the current cursor position. |
+| `resume_repair_at(handle)` | Move the cursor back to `handle`, the first repair cell of a cut frame, so the next sweep resends it. |
 
 ---
 
@@ -1615,7 +1580,7 @@ CRDT-internal terms first; a couple of cluster-wide terms repeated here for self
 - **Dictionary / interning.** Giving every distinct value a single canonical home in a fixed-size array, handing out a small integer slot in exchange.
 - **Dirty ring.** Bounded ring of "this cell just changed" entries.
 - **Fingerprint.** A canonical 128-bit hash of a rule's shape and parameters. Same on every node by construction; produced by `gabion::rules::Descriptor`.
-- **Frontier / high-water mark.** Watermark up to which something is known true; max-merged over time.
+- **Frontier / high-water mark.** Watermark up to which something is believed to hold; max-merged over time. The peer frontier is only a hint (§7.4).
 - **G-counter.** Grow-only counter — a CRDT where each replica only ever increases its own component, and merge is element-wise max.
 - **Generation.** A `u32` per slot; low bit is the active flag, high 31 bits are the ABA tag.
 - **Handle.** `(index, generation)` pair that points at a cell and detects recycling.
@@ -1625,7 +1590,7 @@ CRDT-internal terms first; a couple of cluster-wide terms repeated here for self
 - **Origin.** Node that originally produced a write. Origin tags do not change when peers forward an update.
 - **Origin sequence.** Per-origin monotonic `u64` counter, allocated on every write.
 - **Probe distance.** How far an entry sits from its ideal slot, measured along the probe sequence.
-- **Repair cursor.** A `u32` that rotates over every active slot to retransmit cells the dirty rings missed.
+- **Repair cursor.** A `u32` that rotates over every active slot to resend cells a round's one-shot send missed (lost, cut, pruned, or overflowed).
 - **Robin Hood hashing.** Linear probing with displacement-equalising swaps on insert.
 - **Saturating arithmetic.** Operations that clamp at the type's max instead of overflowing. The whole module uses saturating adds so a hot counter can never wrap to zero.
 - **Slot.** Index in `0..capacity` into the SoA columns.

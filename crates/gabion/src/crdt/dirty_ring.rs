@@ -84,10 +84,11 @@ impl DirtyRing {
         (0..len).map(move |offset| self.entries[((start + offset) % cap) as usize])
     }
 
+    /// Forget every entry. `overflow_seq` is cumulative and survives, so
+    /// the power-of-two overflow warnings stay spaced across clears.
     pub fn clear(&mut self) {
         self.head = 0;
         self.len = 0;
-        self.overflow_seq = 0;
     }
 }
 
