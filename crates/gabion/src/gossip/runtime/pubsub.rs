@@ -910,8 +910,9 @@ where
 
     /// Publish the local cells changed since the last publish to the mesh.
     /// Cells that do not fit in this round's send buffers stay unpublished
-    /// for the next one.
-    pub(super) fn publish_local_changes(&mut self) {
+    /// for the next one. Returns whether every cell in `frame_handles` was
+    /// published.
+    pub(super) fn publish_local_changes(&mut self) -> bool {
         let published = self.pubsub.published_sequence;
         let limit = self.config.max_cells_per_tick;
         let handles = &mut self.frame_handles;
@@ -927,7 +928,7 @@ where
         });
         let total = self.frame_handles.len();
         if total == 0 {
-            return;
+            return true;
         }
 
         let header = self.header();
@@ -950,7 +951,7 @@ where
             ),
         };
         let Ok(mut packets) = packets else {
-            return;
+            return false;
         };
         let now_ms = self.clock.now_millis();
         let mut sent = 0;
@@ -977,5 +978,6 @@ where
         let degree = self.pubsub.mesh_degree();
         self.last_effective_fanout = degree;
         self.peak_effective_fanout = self.peak_effective_fanout.max(degree);
+        sent == total
     }
 }
