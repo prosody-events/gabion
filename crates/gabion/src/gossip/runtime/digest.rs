@@ -381,6 +381,9 @@ where
             }
         }
         let behind = unknown || (0..d.groups.len() * n).any(|i| d.theirs[i] > d.acc[i]);
+        // `send_digest` accumulates into the same scratch at another stride
+        // and expects it zeroed.
+        d.acc[..d.groups.len() * n].fill(0);
         if !push.is_empty() {
             self.thicket.peers[usize::from(peer)].repair_sent += push.len();
             self.send_cells(peer, &push, Lane::Pull);

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::tests::{IdleRuntime, addrs, idle_runtime};
 use super::*;
@@ -288,6 +288,100 @@ fn a_node_that_holds_nothing_asks_with_an_empty_digest_and_gets_everything() {
             pushed(&b),
             BTreeSet::from([(0xF1, 10, 2), (0xF2, 23, 1)]),
             "every settled cell, and nothing newer"
+        );
+    });
+}
+
+/// The sums `rt` has queued in digest frames: `origin -> [(bucket, sum)]`
+/// for the non-zero sums.
+fn digest_sums(rt: &IdleRuntime) -> BTreeMap<u128, Vec<(BucketEpoch, u32)>> {
+    let mut out = BTreeMap::<u128, Vec<(BucketEpoch, u32)>>::new();
+    for &(_, slot) in &rt.send_pending {
+        let bytes = rt.send_pool[usize::from(slot)].as_bytes();
+        if !wire::is_digest(bytes) {
+            continue;
+        }
+        let mut groups = Vec::new();
+        let frame = wire::decode_digest(bytes, None, rt.config.wire_limits, |node, _, sums| {
+            groups.push((
+                node.0,
+                (0..sums.len()).map(|i| sums.get(i)).collect::<Vec<_>>(),
+            ));
+        })
+        .unwrap();
+        for (node, sums) in groups {
+            let row = out.entry(node).or_default();
+            for (i, sum) in sums.into_iter().enumerate() {
+                if sum != 0 {
+                    row.push((frame.scope.first_bucket + i as BucketEpoch, sum));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn drop_queued(rt: &mut IdleRuntime) {
+    for (_, slot) in std::mem::take(&mut rt.send_pending) {
+        rt.send_free.push(slot);
+    }
+}
+
+const X: u128 = 0xF1;
+const Y: u128 = 0xF2;
+const Z: u128 = 0xF3;
+
+#[test]
+fn answering_a_digest_leaves_no_sums_behind_for_the_next_one() {
+    run_paused(async {
+        let all = addrs(4);
+        let router = SimRouter::new();
+        let mut a = idle_runtime(&router, &all, 0);
+        let mut b = idle_runtime(&router, &all, 1);
+        let held = [(X, 10, 2), (Y, 12, 1), (Z, 20, 7), (Z, 21, 9)];
+        hold(&mut a, &held);
+        hold(&mut b, &held);
+        let b_in_a = a.thicket.index_of(all[1]).unwrap();
+        let a_in_b = b.thicket.index_of(all[0]).unwrap();
+        let truth = BTreeMap::from([
+            (X, vec![(10, 2)]),
+            (Y, vec![(12, 1)]),
+            (Z, vec![(20, 7), (21, 9)]),
+        ]);
+
+        digest(&mut b, a_in_b);
+        deliver_digests(&mut b, &mut a, b_in_a);
+        drop_queued(&mut a);
+        digest(&mut a, b_in_a);
+        assert_eq!(digest_sums(&a), truth);
+    });
+}
+
+#[test]
+fn a_reply_digest_carries_the_sums_this_node_holds() {
+    run_paused(async {
+        let all = addrs(4);
+        let router = SimRouter::new();
+        let mut a = idle_runtime(&router, &all, 0);
+        let mut b = idle_runtime(&router, &all, 1);
+        hold(&mut a, &[(X, 10, 2), (Y, 12, 1), (Z, 20, 7), (Z, 21, 9)]);
+        hold(
+            &mut b,
+            &[(X, 10, 2), (X, 11, 5), (Y, 12, 1), (Z, 20, 7), (Z, 21, 9)],
+        );
+        let b_in_a = a.thicket.index_of(all[1]).unwrap();
+        let a_in_b = b.thicket.index_of(all[0]).unwrap();
+
+        // A is behind on X, so it answers with a digest of what it holds.
+        digest(&mut b, a_in_b);
+        deliver_digests(&mut b, &mut a, b_in_a);
+        assert_eq!(
+            digest_sums(&a),
+            BTreeMap::from([
+                (X, vec![(10, 2)]),
+                (Y, vec![(12, 1)]),
+                (Z, vec![(20, 7), (21, 9)]),
+            ])
         );
     });
 }
