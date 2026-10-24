@@ -19,12 +19,22 @@
 //!
 //! Retransmission is go-back-N: when the timeout expires the send cursor
 //! (`sent_upto`) rewinds to `acked`, and the rounds that follow walk the chain
-//! from there, as many packets per round as the send pool allows.
+//! from there, as many packets per round as the send pool allows. Each timeout
+//! that passes with no ack doubles the next (RFC 6298 §5.5), up to
+//! [`GOSSIP_MAX_RTO_BACKOFF`] doublings, so only a silent peer stays backed
+//! off: any packet from the peer ends the backoff, and a peer whose
+//! retransmissions went unanswered twice is resent at once when heard.
 
 use std::net::SocketAddr;
 
 use crate::crdt::{Incarnation, NodeId, NodeIdentity};
+use crate::defaults::GOSSIP_MAX_RTO_BACKOFF;
 use crate::wire;
+
+/// Consecutive unanswered timeouts after which hearing from the peer triggers
+/// an immediate retransmission. Takes effect only when the backoff cap
+/// reaches it.
+const UNREACHABLE_AFTER_TIMEOUTS: u32 = 2;
 
 /// One in-flight round-trip measurement: the highest sequence of a first
 /// transmission and when it left. Cleared by a retransmission, whose ack would
@@ -57,6 +67,11 @@ pub(super) struct Peer {
     /// When the oldest unacknowledged data is re-sent; `0` when nothing is
     /// outstanding.
     rto_deadline_ms: u64,
+    /// Timeouts since the peer last acknowledged anything; each doubles the
+    /// next timeout.
+    backoff: u32,
+    /// When the last retransmission was queued.
+    retransmitted_ms: u64,
     /// Smoothed ack round trip, `0` before the first sample.
     srtt_ms: u64,
     probe: Option<Probe>,
@@ -74,6 +89,8 @@ impl Peer {
             ahead: None,
             ack_owed: false,
             rto_deadline_ms: 0,
+            backoff: 0,
+            retransmitted_ms: 0,
             srtt_ms: 0,
             probe: None,
         }
@@ -94,9 +111,9 @@ impl Peer {
     }
 
     /// Retransmission timeout: twice the smoothed round trip, never below the
-    /// configured floor.
+    /// configured floor, doubled per timeout since the last ack.
     fn rto_ms(&self, min_rto_ms: u64) -> u64 {
-        self.srtt_ms.saturating_mul(2).max(min_rto_ms)
+        self.srtt_ms.saturating_mul(2).max(min_rto_ms) << self.backoff
     }
 
     /// Fold in the header of a packet from this peer. `merged_all` is false if
@@ -117,10 +134,14 @@ impl Peer {
         }
         self.identity = Some(sender);
 
+        // Timeouts that went unanswered before this packet arrived.
+        let backed_off = self.backoff;
+
         // The ack only counts if it is about this incarnation of us, and can
         // never cover more than we sent.
         let acked = header.ack_sequence.min(self.sent_max);
-        if header.ack_incarnation == local_incarnation && acked > self.acked {
+        let progressed = header.ack_incarnation == local_incarnation && acked > self.acked;
+        if progressed {
             self.acked = acked;
             self.sent_upto = self.sent_upto.max(acked);
             if let Some(probe) = self.probe
@@ -134,11 +155,27 @@ impl Peer {
                 };
                 self.probe = None;
             }
+            self.backoff = 0;
             self.rto_deadline_ms = if self.acked < self.sent_max {
                 now_ms + self.rto_ms(min_rto_ms)
             } else {
                 0
             };
+        }
+        if backed_off > 0 && self.rto_deadline_ms != 0 {
+            // The peer is heard again, so the backoff ends. A peer treated as
+            // unreachable is resent at once; otherwise, without an ack, the
+            // next resend is timed from the last one at the base timeout. The
+            // resend backs off again, so a peer that keeps talking without
+            // catching up is resent at most once per base timeout.
+            self.backoff = 0;
+            if backed_off >= UNREACHABLE_AFTER_TIMEOUTS {
+                self.rto_deadline_ms = now_ms;
+            } else if !progressed {
+                self.rto_deadline_ms = self
+                    .rto_deadline_ms
+                    .min(self.retransmitted_ms + self.rto_ms(min_rto_ms));
+            }
         }
 
         if header.cell_count > 0 {
@@ -170,11 +207,16 @@ impl Peer {
         }
     }
 
+    /// Whether a retransmission to this peer is due.
+    pub(super) fn retransmit_due(&self, now_ms: u64) -> bool {
+        self.rto_deadline_ms != 0 && now_ms >= self.rto_deadline_ms
+    }
+
     /// Where this peer's next delta starts, and whether it is a
     /// retransmission: everything past the last ack once the timeout has
     /// expired, otherwise only what has not been sent yet.
     pub(super) fn delta_after(&self, now_ms: u64) -> (u64, bool) {
-        if self.rto_deadline_ms != 0 && now_ms >= self.rto_deadline_ms {
+        if self.retransmit_due(now_ms) {
             (self.acked, true)
         } else {
             (self.sent_upto, false)
@@ -186,14 +228,19 @@ impl Peer {
     /// next rounds.
     pub(super) fn sent(&mut self, top: u64, retransmit: bool, now_ms: u64, min_rto_ms: u64) {
         self.ack_owed = false;
+        // Only a first transmission is timed (Karn): the rounds after a
+        // retransmission re-send sequences up to `sent_max`.
+        let first_transmission = top > self.sent_max;
         self.sent_max = self.sent_max.max(top);
         if retransmit {
             self.sent_upto = top;
             self.probe = None;
+            self.backoff = (self.backoff + 1).min(GOSSIP_MAX_RTO_BACKOFF);
+            self.retransmitted_ms = now_ms;
             self.rto_deadline_ms = now_ms + self.rto_ms(min_rto_ms);
         } else {
             self.sent_upto = self.sent_upto.max(top);
-            if self.probe.is_none() {
+            if self.probe.is_none() && first_transmission {
                 self.probe = Some(Probe {
                     sequence: top,
                     sent_ms: now_ms,
@@ -211,6 +258,7 @@ impl Peer {
         self.sent_upto = self.acked;
         self.sent_max = self.acked;
         self.rto_deadline_ms = 0;
+        self.backoff = 0;
         self.probe = None;
     }
 

@@ -245,9 +245,18 @@ rounds rather than one share per timeout.
 
 The retransmission timeout is `max(2 × RTT estimate, tick_interval)`
 (500 ms at the default heartbeat). The estimate is a smoothed (7/8, 1/8) round
-trip from first transmissions only (Karn). The timer runs while anything
+trip from first transmissions only (Karn; the re-sent tail of a go-back-N
+walk is not timed either). The timer runs while anything
 is unacknowledged, restarts when an ack advances, and is not postponed by
-new data. Per-peer state is created when discovery announces a peer,
+new data. Each timeout that passes with no ack doubles the next, up to
+`GOSSIP_MAX_RTO_BACKOFF` (2) doublings, so a peer behind a partition or a
+crashed one is re-sent its backlog every 2 s rather than every tick. Any
+packet heard from the peer (data or ack) ends the backoff, so a peer that
+is merely losing packets is resent once per base timeout as before. Once
+two timeouts in a row have gone unanswered the peer is treated as
+unreachable, and the first packet heard from it again sends the
+outstanding chain at once, from the receive path, without waiting for a
+timeout or the next round. Per-peer state is created when discovery announces a peer,
 freed when it leaves, and reset if the same address answers with a
 different node identity.
 
@@ -375,6 +384,19 @@ implementation departs from the papers, and why:
   `max(2 × RTT estimate, tick_interval)`, the spec's `max(2·RTT, 1 tick)`;
   at the 500 ms heartbeat a lost packet is repaired no later than the second
   round after it.
+- **Go-back-N, exponential backoff, resend on reachability.** The spec
+  re-sends everything above the ack once per timeout. Here a retransmission
+  rewinds the send cursor to the ack and the next rounds walk the chain,
+  so a backlog larger than one round's share of the send pool does not
+  take one timeout per share. Unanswered timeouts double the next one
+  (RFC 6298 §5.5), capped at 4× the base; any packet from the peer ends
+  the backoff, and a peer heard again after two unanswered timeouts is
+  re-sent at once. Reason: with a fixed timeout
+  every node re-sent its whole growing window to every peer across a cut
+  every 500 ms (az-partition: 1.18 GB against 0.66 GB for the same load
+  without the cut), and the repair after the heal waited for the next
+  timeout and then for one share per timeout (3.1 s to heal). Retransmission
+  stays driven by acks and timers only.
 - **The send pool is sized to the peer count.** Direct mail queues a packet
   for every peer every round, so the pool holds at least
   `GOSSIP_SEND_SLOTS_PER_PEER` (2) slots per live peer, or

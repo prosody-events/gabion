@@ -524,14 +524,23 @@ where
         let now_ms = self.clock.now_millis();
         let local_incarnation = self.store.local_identity().incarnation;
         let min_rto_ms = self.rto_floor_ms;
-        if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
-            peer.receive(
-                &summary.header,
-                local_incarnation,
-                merged_all,
-                now_ms,
-                min_rto_ms,
-            );
+        let Some(idx) = self.peers.iter().position(|p| p.addr == src) else {
+            return;
+        };
+        let peer = &mut self.peers[idx];
+        peer.receive(
+            &summary.header,
+            local_incarnation,
+            merged_all,
+            now_ms,
+            min_rto_ms,
+        );
+        // The peer can be reached and is owed a retransmission (typically it
+        // was backed off and has just been heard again): send it now rather
+        // than at the next round.
+        if peer.retransmit_due(now_ms) {
+            let share = (self.send_free.len() / self.peers.len()).max(1);
+            self.send_round_to(idx, share, now_ms);
         }
     }
 

@@ -34,6 +34,13 @@ pub const GOSSIP_FANOUT: usize = 3;
 /// `slots × GOSSIP_MAX_PAYLOAD_BYTES`.
 pub const GOSSIP_SEND_SLOTS_PER_PEER: usize = 2;
 
+/// Cap on the exponential backoff of a peer's retransmission timeout. Each
+/// timeout that passes without the peer acknowledging anything doubles the
+/// next one, up to `2^GOSSIP_MAX_RTO_BACKOFF` times the base timeout (2 s at
+/// the default 500 ms heartbeat), so an unreachable peer is not re-sent its
+/// whole backlog every tick. Any packet from the peer ends the backoff.
+pub const GOSSIP_MAX_RTO_BACKOFF: u32 = 2;
+
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;

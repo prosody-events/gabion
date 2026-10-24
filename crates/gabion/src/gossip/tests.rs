@@ -1644,10 +1644,21 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             sim_advance_ticks(Duration::from_millis(100), TICKS).await;
 
             let snap = admin_snapshot(&admin_tx_b).await;
-            // The initial send plus one retransmission per timeout; the
-            // timeout floor is one tick, so one per tick, give or take one
-            // for first-tick scheduling under start_paused.
-            let expected = u64::from(TICKS);
+            // The initial send plus one retransmission per timeout. B never
+            // acknowledges, so the timeout starts at the one-tick floor and
+            // doubles per timeout up to the backoff cap. Give or take one for
+            // first-tick scheduling under start_paused.
+            let tick_ms = 100;
+            let horizon_ms = u64::from(TICKS) * tick_ms;
+            let (mut at_ms, mut expected, mut doublings) = (0, 1, 0);
+            loop {
+                at_ms += tick_ms << doublings;
+                if at_ms > horizon_ms {
+                    break;
+                }
+                expected += 1;
+                doublings = (doublings + 1).min(crate::defaults::GOSSIP_MAX_RTO_BACKOFF);
+            }
             assert!(
                 (expected - 1..=expected + 1).contains(&snap.decode_reject_count),
                 "decode_reject_count {} outside {}±1 (after {} ticks)",

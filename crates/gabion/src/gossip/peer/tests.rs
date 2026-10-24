@@ -109,10 +109,11 @@ fn unacknowledged_data_is_retransmitted_after_the_timeout_only() {
     assert_eq!(peer.delta_after(1_499), (10, false));
     assert_eq!(peer.delta_after(1_500), (0, true));
 
-    // A retransmission restarts the timer.
+    // A retransmission restarts the timer, doubled.
     peer.sent(10, true, 1_500, MIN_RTO_MS);
     assert_eq!(peer.delta_after(1_600), (10, false));
-    assert_eq!(peer.delta_after(2_000), (0, true));
+    assert_eq!(peer.delta_after(2_499), (10, false));
+    assert_eq!(peer.delta_after(2_500), (0, true));
 }
 
 #[test]
@@ -233,4 +234,94 @@ fn a_late_ack_above_the_rewound_cursor_moves_it() {
     // The ack is still clamped to the highest sequence ever sent.
     receive(&mut peer, &ack(99), 520);
     assert_eq!(peer.delta_after(100_000), (20, false));
+}
+
+#[test]
+fn timeouts_without_an_ack_back_off_up_to_the_cap() {
+    let mut peer = peer();
+    peer.sent(10, false, 0, MIN_RTO_MS);
+    let mut now = MIN_RTO_MS;
+    for doublings in 1..=GOSSIP_MAX_RTO_BACKOFF + 2 {
+        assert_eq!(peer.delta_after(now), (0, true));
+        peer.sent(10, true, now, MIN_RTO_MS);
+        let timeout = MIN_RTO_MS << doublings.min(GOSSIP_MAX_RTO_BACKOFF);
+        assert_eq!(peer.delta_after(now + timeout - 1), (10, false));
+        now += timeout;
+    }
+}
+
+#[test]
+fn an_ack_ends_the_backoff() {
+    let mut peer = peer();
+    peer.sent(10, false, 0, MIN_RTO_MS);
+    peer.sent(10, true, 500, MIN_RTO_MS);
+    receive(&mut peer, &ack(4), 600);
+    // Back to the base timeout, timed from the ack, not the doubled one.
+    assert_eq!(peer.delta_after(1_099), (10, false));
+    assert_eq!(peer.delta_after(1_100), (4, true));
+}
+
+#[test]
+fn hearing_from_a_peer_after_two_unanswered_timeouts_resends_at_once() {
+    let mut peer = peer();
+    peer.sent(10, false, 0, MIN_RTO_MS);
+    peer.sent(10, true, 500, MIN_RTO_MS);
+    // One unanswered timeout: the peer is heard without catching up (its ack
+    // is for another incarnation of us), which ends the backoff but resends
+    // no sooner than the base timeout after the last resend.
+    let stale = wire::Header {
+        ack_incarnation: LOCAL_INCARNATION + 1,
+        ..header(0, 3, 1)
+    };
+    receive(&mut peer, &stale, 600);
+    assert!(!peer.retransmit_due(600));
+    assert_eq!(peer.delta_after(999), (10, false));
+    assert_eq!(peer.delta_after(1_000), (0, true));
+    // Two in a row: the next packet from the peer makes the resend due at
+    // once.
+    peer.sent(10, true, 1_000, MIN_RTO_MS);
+    peer.sent(10, true, 2_000, MIN_RTO_MS);
+    receive(&mut peer, &stale, 2_200);
+    assert!(peer.retransmit_due(2_200));
+    assert_eq!(peer.delta_after(2_200), (0, true));
+    // That resend backs off again, so further packets resend it no sooner
+    // than the base timeout.
+    peer.sent(10, true, 2_200, MIN_RTO_MS);
+    receive(&mut peer, &stale, 2_300);
+    assert_eq!(peer.delta_after(2_699), (10, false));
+    assert_eq!(peer.delta_after(2_700), (0, true));
+}
+#[test]
+fn an_ack_from_a_peer_heard_again_does_not_delay_the_resend() {
+    let mut peer = peer();
+    peer.sent(10, false, 0, MIN_RTO_MS);
+    peer.sent(10, true, 500, MIN_RTO_MS);
+    peer.sent(10, true, 1_500, MIN_RTO_MS);
+    // The peer comes back acknowledging part of what it was sent before it
+    // went quiet: the rest is resent at once, not a timeout later.
+    receive(&mut peer, &ack(4), 3_000);
+    assert_eq!(peer.delta_after(3_000), (4, true));
+}
+
+#[test]
+fn the_rounds_after_a_retransmission_are_not_timed() {
+    let mut peer = peer();
+    peer.sent(20, false, 0, MIN_RTO_MS);
+    peer.sent(8, true, 500, MIN_RTO_MS);
+    // The rest of the chain is re-sent, not sent for the first time.
+    peer.sent(20, false, 510, MIN_RTO_MS);
+    receive(&mut peer, &ack(20), 900);
+    peer.sent(30, false, 1_000, MIN_RTO_MS);
+    // No sample, so the timeout is still the floor.
+    assert_eq!(peer.delta_after(1_499), (30, false));
+    assert_eq!(peer.delta_after(1_500), (20, true));
+}
+
+#[test]
+fn a_packet_from_a_peer_that_is_not_backed_off_changes_no_timer() {
+    let mut peer = peer();
+    peer.sent(10, false, 0, MIN_RTO_MS);
+    receive(&mut peer, &header(0, 3, 1), 100);
+    assert_eq!(peer.delta_after(499), (10, false));
+    assert_eq!(peer.delta_after(500), (0, true));
 }
