@@ -55,7 +55,7 @@ billed and zone partitions must heal, after a multi-rule check: that tip
 keeps a per-rule threshold trigger whose firing rate, and so the design's
 accuracy and bytes, depends on the workload. On total bytes and
 steady-state accuracy alone the data do not single it out: improved
-Plumtree is more accurate on most error cells and cheaper at 300 pods and
+Plumtree is better on most error cells (42 of 78) and cheaper at 300 pods and
 under 5 % and 20 % loss, but never heals the partition, and the ablation
 ties its lead at 80 pods to a scheduler rule the study disallowed in
 `imp-main`. The data suggest,
@@ -329,8 +329,9 @@ drafted, checked and revised this report, under the direction of one
 human. The human chose the question and the candidate designs, set the
 rules (the frozen harness, the faithfulness invariants of §4.4, Bayesian
 reporting), started each stage and read its summaries; the human did not
-review individual audit findings before the workflow acted on them. Each
-stage ran as a scripted workflow of agents with three roles.
+review individual audit findings before the workflow acted on them. Stages 2 to 4, and the
+harness in Stage 1, ran as scripted workflows of agents with three roles;
+the survey in Stage 1 and the analysis in Stage 5 did not.
 
 - An *implementer* built or repaired one design on its own branch and
   returned a structured report: commits, design notes, tests run, and smoke
@@ -349,7 +350,7 @@ An audit passed when the auditor returned a pass verdict with no open
 blocker or major; minors never blocked, and fixers repaired them only
 where cheap. A stage allowed at most two audits per design in Stage 2 and
 three in Stages 3 and 4. Thicket ended Stage 2 with a failed audit (one
-open major) and passed after its Stage 3 repair (item 2 below); every other
+open major) and passed after its Stage 2 repair, re-audited in Stage 3 (item 3 below); every other
 design, the per-key fix and the harness passed within the limit, and in
 the end no blocker or major was left open (the records below list the
 open minors). Auditors re-ran tests and a small part of the evidence
@@ -360,8 +361,8 @@ matrix; the 1,287 judged runs were made afterwards, by the study's run
 scripts, from the audited commits. Independence was limited: implementers
 and auditors were instances of the same model family (Anthropic's Claude;
 a smaller model implemented in Stage 2 and fixed in Stages 2 to 4, a
-larger one audited in every stage, implemented in Stages 1 and 4 and fixed
-in Stage 1), each auditor read the implementer's report, and an error that implementer and auditor
+larger one audited in every stage, implemented the harness and judge in Stage 1
+and improvements in Stage 4, and fixed in Stage 1), each auditor read the implementer's report, and an error that implementer and auditor
 share would not be caught. The sanitised implementation and audit records
 of Stages 2 to 4, with local paths replaced, are in `data/audit/` (see
 *Reproducibility*); the code changes they describe are the commits on the
@@ -370,7 +371,8 @@ named public branches, whose messages also give each change's reason.
 The study ran in five stages.
 
 1. **Survey and candidate set** ([`research.md`](research.md)), fixing the
-   designs, parameters, invariants and bolt-on components.
+   designs, parameters, invariants and bolt-on components. The only
+   implementation here was the harness and the judge; no design was built.
 2. **Implementation and audit.** Each design was implemented on its own
    branch (`sim/sol-<arm>`) and audited against I-1 to I-6 and its
    design-specific invariants. The ten literature designs and the
@@ -383,7 +385,8 @@ The study ran in five stages.
    (below). Its audit found one major defect, a bucket expiring at the heal
    instant charged as unrepaired; it was fixed before any baseline run
    (`fdf7390`, *do not charge the bucket that expires at the heal as
-   unrepaired*).
+   unrepaired*). Thicket's repair (item 2) was also re-audited here and
+   passed.
 4. **Improvement.** Each design was diagnosed from the baseline data,
    repaired on `sim/imp-<arm>`, and audited again; every Stage 4 audit
    ended with a pass and no open blocker or major. One defect was shared by every arm
@@ -394,7 +397,7 @@ The study ran in five stages.
    `imp-main` is `main` with its defects repaired (§6.3).
 5. **Analysis** of the final 1,287 runs by the judge (§4.6), and this
    report, which analyst agents drafted and two verifier agents checked,
-   one against the data for every number and one for claims the evidence
+   one checked the numbers against the data and one checked claims the evidence
    does not support.
 
 **Validation suite** (harness README at `896ea20`, *Validation*; seeds
@@ -1421,12 +1424,17 @@ criteria:
    error or health cell (below).
 
 Where cross-zone bytes cost no more than other bytes and partitions are
-rare, the data do not single out a design. Bimodal then costs fewer total
-bytes in 7 regimes (0.677 to 0.998 of az-hier's), with equal staleness p99
-except at 20 % loss, but its convergence p99 is 2.98 and 4.42 times
+rare, the data do not single out a design. Bimodal then costs fewer or tied
+(within ±5 %) total bytes in 7 regimes (0.677 to 0.998 of az-hier's; the
+saving is only 0.2 to 2.3 % at `prod-peak`, `prod-4x` and `hot-key`), with equal or lower staleness p99
+except at 20 % loss (in churn it is lower, 4.67 against 5), but its convergence p99 is 2.98 and 4.42 times
 az-hier's under 5 % and 20 % loss and it never heals the partition;
 Plumtree is the stronger candidate on accuracy, and on bytes at 300 pods
-and under 5 % and 20 % loss, if relay-carry is accepted (R5). The evidence
+and under 5 % and 20 % loss, if relay-carry is accepted (R5). Where
+cross-zone bytes are billed but partitions are rare, it still
+favours az-hier on cross-zone bytes (criterion 1), with Plumtree as the
+accuracy alternative; where partitions must heal but cross-zone bytes are
+not billed, az-hier and direct-ack are tied on criteria 2 and 3. The evidence
 for the four criteria:
 
 - *Accuracy.* At every production size it has the same posterior
@@ -1437,7 +1445,9 @@ for the four criteria:
   `[P: imp-az-hier-nopk, main/prod-*/stale_limited_p99_pct]`.
   `imp-plumtree-nopk` and `imp-owner-agg` are credibly lower at 80 and 183
   pods (1 % [0.255, 1.75]; 0.25 [0.116, 0.539] and 0.275 [0.12, 0.628]
-  times its staleness p99, P ≥ 0.99) through a scheduler change: for
+  times its staleness p99 at 80 and 183 pods respectively, the same for
+  each tip; P ≥ 0.989), and owner aggregation also at `prod-4x` (0.5
+  [0.217, 1.15], P 0.964, better under the §4.6 rule), through a scheduler change: for
   Plumtree a Stage 4
   ablation traces the lead at 80 pods to relay-carry; for owner
   aggregation the urgency rule was not measured on its own (§8.1).
@@ -1535,7 +1545,7 @@ receive-buffer drops in any regime.
   at `prod-4x`. If R5 accepts relay-carry, Plumtree is the design to
   re-examine first; not settled.
 - *Bimodal* matches az-hier's accuracy at production sizes and costs
-  fewer total bytes from 183 pods up and under loss (above), but never
+  fewer or tied (within ±5 %) total bytes from 183 pods up and under loss (above), but never
   heals the partition (§4.3; 0.189 [0.179, 0.2] hits per (pod, key) expire unrepaired) and
   converges slowest of the direct-mail family under 20 % loss (5,547 ms
   [5,277, 5,817]). *Direct-ack* has among the slowest joiner catch-up
@@ -1586,10 +1596,14 @@ it.
   that leaves the shared scheduler alone has a lower staleness p99. It is not the most accurate tip: improved Plumtree, through
   relay-carry, is credibly better on 42 of 78 error cells, and owner
   aggregation on 41; and on total bytes it is on the improved tips' front
-  in only 5 to 7 of 12 or 13 regimes; on staleness p99 bimodal dominates
+  in only 5 to 7 of 12 or 13 regimes (owner aggregation excluded); on staleness p99 bimodal dominates
   it at 183 and 300 pods, under 5 % and burst loss, with hot keys and in
   churn, and Plumtree at 300 pods and under 5 % and 20 % loss (Table 12). Where cross-zone bytes cost no more than other bytes and
-  partitions are rare, the data do not single out a design. *Not
+  partitions are rare, the data do not single out a design. Where cross-zone bytes are
+  billed but partitions are rare, it still favours az-hier on cross-zone
+  bytes, with Plumtree as the accuracy alternative; where partitions must
+  heal but cross-zone bytes are not billed, az-hier and direct-ack are tied
+  on criteria 2 and 3 (§8.2). *Not
   settled*: how its accuracy and bytes hold up with several rules, because
   the `-nopk` tip keeps the per-rule threshold trigger whose firing rate
   depends on the rules, the keys per rule and the per-pod rate (§7, §8.2);
@@ -1601,7 +1615,9 @@ it.
   and departure behaviour are fixed.
 - **R3. Do not ship the per-key threshold fix as a default.** It lowers
   bytes in every regime but `idle` and `long-window` (0.370 to 0.983 in the
-  nine arms other than Plumtree) and credibly raises staleness p99 in 8 to
+  nine arms other than Plumtree) and credibly raises staleness p99 (P ≤ 0.05, whatever the size of the
+  effect; Snow at `az-partition` counts, at 1.027 [0.997, 1.06], P 0.031,
+  under 5 %) in 8 to
   10 of the ten arms in every regime with limited keys but `low-5` and
   `long-window`, by a factor that grows with cluster size: 3.0 to 3.4 times
   at 80 pods, 3.6 to 4.3 at 183 and 5.0 to 8.5 at 300, with worst-key
@@ -1756,7 +1772,7 @@ under loss, the cheapest in total bytes: improved Plumtree is credibly
 more accurate on 42 of 78 error cells, and cheaper at 300 pods and under
 5 % and 20 % loss, and a Stage 4 ablation (3 seeds) traces its lead at
 80 pods to a scheduler change that the study's rules treated
-inconsistently (§8.1); bimodal is as accurate at production sizes for fewer total
+inconsistently (§8.1); bimodal is as accurate at production sizes for fewer or tied (within ±5 %) total
 bytes from 183 pods up but never heals the partition. Without a price on
 cross-zone bytes the data do not single out one design. The zone
 hierarchy's accuracy rests partly on a per-rule threshold trigger whose cadence depends on the
@@ -1836,9 +1852,11 @@ mkdir -p ../perkey-az-hier && cp -R ../improved-results/imp-az-hier \
 python3 $J ../perkey-az-hier --baseline imp-az-hier-nopk --out ../perkey-az-hier-judge
 ```
 
-Re-running `refresh.sh` on the published runs reproduces `data/judge/`,
-`data/posterior.json` and `data/self_posterior.json` byte for byte, and
-`data/runs.json` except its `generated_at` stamp.
+The 1,287 run files are not in the snapshot. Regenerate them
+deterministically with `matrix.py` at the commits listed in this report;
+`refresh.sh` then reproduces `data/judge/`, `data/posterior.json` and
+`data/self_posterior.json` byte for byte, and `data/runs.json` except its
+`generated_at` stamp.
 
 **Data snapshot** (`study/data/`):
 
