@@ -3,12 +3,15 @@
 
 Usage:
     judge.py RESULTS_DIR [RESULTS_DIR ...] --out REPORT_DIR [--baseline main]
+             [--level 0.95]
 
 Reads every `*.json` result under the given directories (as written by
 `matrix.py`). Refuses to proceed when results carry different harness tree
 hashes or another `gabion-study/*` schema (stale results from an older
 harness), or one solution label carries several commits: numbers from
-different code are not comparable. Results without a stamp or schema, or
+different code are not comparable. Hashes that differ only under `judge/` or
+in `README.md` (checked with `git diff --name-only` in the checkout holding
+this file) count as one harness: the study code is unchanged. Results without a stamp or schema, or
 produced from a dirty harness or solution worktree, are rejected and listed.
 
 Runs the harness marked INVALID (a health invariant failed) stay visible:
@@ -18,11 +21,24 @@ tables as INVALID rather than disappearing. Statistics cover valid seeds
 only; ratios to the baseline and paired differences use only the seeds valid
 for both, so a solution cannot gain by losing its hardest seed.
 
-For each regime x solution x metric it reports the mean across valid seeds
-with a 95 % confidence half-width (Student t, n - 1 degrees of freedom), the
-min and max, and the ratio to the baseline over common seeds. Writes
+For each regime x solution x metric it reports a Bayesian summary. The seed
+values y_1..y_n are modelled as Normal(mu, sigma^2) with the Jeffreys prior
+p(mu, sigma) proportional to 1/sigma, so the marginal posterior of the mean mu
+is Student t with n - 1 degrees of freedom, located at the sample mean with
+scale s / sqrt(n). The tables show the posterior mean and the equal-tailed
+credible interval (CrI, 95 % by default, `--level`; by symmetry also the
+highest-density interval). With one seed the posterior is improper and no
+interval is shown; with zero spread it is a point mass and the interval is
+exactly the value.
+
+The comparison with the baseline is paired over the seeds valid for both. When
+every paired value is positive the model applies to d_i = ln(a_i) - ln(b_i):
+the judge reports the geometric-mean ratio exp(mean d) with its credible
+interval and P(better), the posterior probability that the mean log ratio
+favours the solution. Otherwise it models d_i = a_i - b_i and reports the mean
+difference the same way. Lower is better except for `HIGHER_IS_BETTER`. Writes
 `summary.md` (with a per-phase table for regimes that cut the network),
-`summary.csv` (long format, with paired differences),
+`summary.csv` (long format, with the paired comparison),
 `pareto.md` (means over the seeds valid for every solution on the front),
 `flags.md` (saturation the harness flagged without invalidating, e.g. dirty-ring
 overflow) and `rejected.md`.
@@ -34,9 +50,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
+import itertools
 import json
 import math
 import statistics
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -44,22 +63,63 @@ from pathlib import Path
 SCHEMA = "gabion-study/2"
 SCHEMA_FAMILY = "gabion-study/"
 
-# Two-sided 95 % Student t quantiles t(0.975, df) for df = 1..30.
-T975 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
-        2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
-        2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042]
 
 
-def t975(df: int) -> float:
-    if df <= 30:
-        return T975[df - 1]
-    if df <= 40:
-        return 2.021
-    if df <= 60:
-        return 2.000
-    if df <= 120:
-        return 1.980
-    return 1.960
+def betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction for the incomplete beta function (modified Lentz,
+    as in Numerical Recipes `betacf`)."""
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 1000):
+        m2 = 2 * m
+        for aa in (m * (b - m) * x / ((qam + m2) * (a + m2)),
+                   -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))):
+            d = 1.0 + aa * d
+            d = 1.0 / (d if abs(d) > tiny else tiny)
+            c = 1.0 + aa / c
+            c = c if abs(c) > tiny else tiny
+            step = d * c
+            h *= step
+        if abs(step - 1.0) < 3e-16:
+            break
+    return h
+
+
+def betai(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta function I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                     + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * betacf(a, b, x) / a
+    return 1.0 - front * betacf(b, a, 1.0 - x) / b
+
+
+def t_cdf(t: float, df: float) -> float:
+    """P(T <= t) for Student t with `df` degrees of freedom."""
+    tail = 0.5 * betai(df / 2.0, 0.5, df / (df + t * t))
+    return 1.0 - tail if t > 0 else tail
+
+
+@functools.lru_cache(maxsize=None)
+def t_quantile(p: float, df: int) -> float:
+    """The t with P(T <= t) = p, by bisection on `t_cdf`."""
+    if p < 0.5:
+        return -t_quantile(1.0 - p, df)
+    lo, hi = 0.0, 1.0
+    while t_cdf(hi, df) < p and hi < 1e300:
+        lo, hi = hi, hi * 2.0
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        lo, hi = (mid, hi) if t_cdf(mid, df) < p else (lo, mid)
+    return (lo + hi) / 2.0
 
 
 def dig(result: dict, path: str):
@@ -93,8 +153,8 @@ def rss_mib(result: dict):
     return p["max_rss_bytes"] / 2**20 if "max_rss_bytes" in p else None
 
 
-# (key, label, extractor). Lower is better for every metric except where
-# noted in the label; the Pareto view uses the starred ones.
+# (key, label, extractor). Lower is better for every metric except those in
+# HIGHER_IS_BETTER; the Pareto view uses the starred ones.
 METRICS = [
     ("bytes_total", "Total bytes sent, measurement window (whole network)*",
      lambda r: dig(r, "network.measure.bytes_sent")),
@@ -221,6 +281,7 @@ def partition_metrics() -> list:
 
 
 PARTITION_METRICS = partition_metrics()
+HIGHER_IS_BETTER = {"admitted"}
 ALL_METRICS = METRICS + PARTITION_METRICS
 
 PARETO = [("bytes_total", "stale_limited_p99"), ("bytes_total", "over_max_pct"),
@@ -257,11 +318,26 @@ def load(dirs: list[Path]):
     return accepted, rejected
 
 
-def summarize(values: list[float]) -> dict:
+def posterior(values: list[float], level: float) -> dict:
+    """Posterior of the mean under the normal model with the Jeffreys prior:
+    Student t, n - 1 degrees of freedom, scale s / sqrt(n). `lo`/`hi` are the
+    equal-tailed credible interval, absent for one value (improper posterior)."""
     n = len(values)
     mean = statistics.fmean(values)
-    ci = t975(n - 1) * statistics.stdev(values) / math.sqrt(n) if n > 1 else None
-    return {"n": n, "mean": mean, "ci95": ci, "min": min(values), "max": max(values)}
+    post = {"n": n, "mean": mean, "se": None, "lo": None, "hi": None,
+            "min": min(values), "max": max(values)}
+    if n > 1:
+        post["se"] = statistics.stdev(values) / math.sqrt(n)
+        half = t_quantile(0.5 + level / 2.0, n - 1) * post["se"] if post["se"] else 0.0
+        post["lo"], post["hi"] = mean - half, mean + half
+    return post
+
+
+def p_below(post: dict, x: float) -> float:
+    """Posterior probability that the mean is below `x` (n > 1)."""
+    if not post["se"]:
+        return 1.0 if post["mean"] < x else 0.5 if post["mean"] == x else 0.0
+    return t_cdf((x - post["mean"]) / post["se"], post["n"] - 1)
 
 
 def fmt(x) -> str:
@@ -270,18 +346,45 @@ def fmt(x) -> str:
     return f"{x:,.0f}" if abs(x) >= 1000 else f"{x:.3g}"
 
 
-def cell(stats: dict | None, ratio: float | None, invalid: int, total: int) -> str:
+def cell(stats: dict | None, pair: dict | None, invalid: int, total: int,
+         note: str = "") -> str:
     mark = f"INVALID {invalid}/{total}" if invalid else ""
     if stats is None:
-        return mark or "n/a"
-    text = (mark + "; " if mark else "") + fmt(stats["mean"])
-    if stats["ci95"] is not None:
-        text += f" ± {fmt(stats['ci95'])}"
-    if stats["n"] > 1:
-        text += f" [{fmt(stats['min'])}–{fmt(stats['max'])}]"
-    if ratio is not None:
-        text += f" (×{ratio:.2f})"
-    return text
+        return "; ".join(filter(None, [mark, note])) or "n/a"
+    text = fmt(stats["mean"])
+    if stats["lo"] is not None:
+        text += f" [{fmt(stats['lo'])}, {fmt(stats['hi'])}]"
+    if pair is not None:
+        if pair["scale"] == "log":
+            parts = [f"×{pair['ratio']:.2f}"]
+            if pair["ratio_lo"] is not None:
+                parts[0] += f" [{pair['ratio_lo']:.2f}, {pair['ratio_hi']:.2f}]"
+        else:
+            parts = [f"Δ{fmt(pair['diff_mean'])}"]
+            if pair["diff_lo"] is not None:
+                parts[0] += f" [{fmt(pair['diff_lo'])}, {fmt(pair['diff_hi'])}]"
+        if pair["p_better"] is not None:
+            parts.append(f"P={pair['p_better']:.2f}")
+        text += f" ({', '.join(parts)})"
+    return "; ".join(filter(None, [mark, text, note]))
+
+
+def hash_equivalence(hashes: list[str], repo: Path) -> str | None:
+    """None when every pair of harness tree hashes differs only under `judge/`
+    or in `README.md` (paths relative to the harness tree), else the reason."""
+    for a, b in itertools.combinations(sorted(hashes), 2):
+        try:
+            proc = subprocess.run(["git", "-C", str(repo), "diff", "--name-only", a, b, "--"],
+                                  capture_output=True, text=True)
+        except OSError as error:
+            return f"git could not be run ({error})"
+        if proc.returncode:
+            return f"git in {repo} cannot compare {a} and {b} ({proc.stderr.strip()})"
+        other = [p for p in proc.stdout.splitlines()
+                 if p != "README.md" and not p.startswith("judge/")]
+        if other:
+            return f"{a} and {b} differ in {', '.join(other[:5])}"
+    return None
 
 
 def dominated(a: tuple, b: tuple) -> bool:
@@ -294,13 +397,28 @@ def main() -> None:
     parser.add_argument("results", type=Path, nargs="+")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--baseline", default="main")
+    parser.add_argument("--level", type=float, default=0.95,
+                        help="credibility level of the intervals, in (0, 1)")
     args = parser.parse_args()
+    if not 0.0 < args.level < 1.0:
+        sys.exit(f"error: --level {args.level} is not a probability. Pass a credibility "
+                 "level strictly between 0 and 1, e.g. 0.95.")
+    percent = f"{args.level * 100:g} %"
 
     accepted, rejected = load(args.results)
     hashes = {r["stamp"]["harness_tree_hash"] for _, r in accepted}
+    equivalent = ""
     if len(hashes) > 1:
-        sys.exit("error: results come from different harnesses (tree hashes "
-                 f"{', '.join(sorted(hashes))}); rerun every solution on one harness commit.")
+        repo = Path(__file__).resolve().parent
+        why = hash_equivalence(sorted(hashes), repo)
+        if why:
+            sys.exit("error: results come from different harnesses (tree hashes "
+                     f"{', '.join(sorted(hashes))}): {why}. The judge accepts hashes that "
+                     "differ only under `judge/` or in `README.md`. Rerun every solution on "
+                     "one harness commit; if git cannot resolve a hash, fetch that harness "
+                     f"commit into the checkout containing {Path(__file__).name} and retry.")
+        equivalent = (" Treated as equivalent (they differ only under `judge/` or in "
+                      f"`README.md`): {', '.join(f'`{h}`' for h in sorted(hashes))}.")
     if not accepted:
         sys.exit("error: no stamped results from clean trees found.")
 
@@ -334,39 +452,50 @@ def main() -> None:
         valid = valid_seeds(regime, solution)
         for key, _, extract in ALL_METRICS:
             values = [v for r in valid.values() if (v := extract(r)) is not None]
-            table[(regime, solution, key)] = summarize([float(v) for v in values]) if values else None
+            table[(regime, solution, key)] = posterior([float(v) for v in values], args.level) if values else None
 
     def paired(regime: str, solution: str, key: str) -> dict | None:
-        """Ratio of means and mean paired difference (solution - baseline)
-        over the seeds valid for both with a value for `key`."""
+        """Posterior of the mean paired comparison (solution against baseline)
+        over the seeds valid for both with a value for `key`: the log ratio
+        when every value is positive, else the difference."""
         extract = next(e for k, _, e in ALL_METRICS if k == key)
         mine, base = valid_seeds(regime, solution), valid_seeds(regime, args.baseline)
         pairs = [(float(a), float(b)) for s in sorted(mine.keys() & base.keys())
                  if (a := extract(mine[s])) is not None and (b := extract(base[s])) is not None]
         if not pairs:
             return None
-        base_mean = statistics.fmean(b for _, b in pairs)
-        diff = summarize([a - b for a, b in pairs])
-        return {
-            "n": len(pairs),
-            "ratio": statistics.fmean(a for a, _ in pairs) / base_mean if base_mean else None,
-            "diff_mean": diff["mean"],
-            "diff_ci95": diff["ci95"],
-        }
+        log = all(a > 0 and b > 0 for a, b in pairs)
+        post = posterior([math.log(a) - math.log(b) if log else a - b for a, b in pairs],
+                         args.level)
+        sign = -1.0 if key in HIGHER_IS_BETTER else 1.0
+        better = None
+        if post["n"] > 1:
+            better = p_below({**post, "mean": sign * post["mean"]}, 0.0)
+        convert = math.exp if log else (lambda x: x)
+        lo, hi = (None, None) if post["lo"] is None else (convert(post["lo"]), convert(post["hi"]))
+        est = convert(post["mean"])
+        return {"n": post["n"], "scale": "log" if log else "diff", "p_better": better,
+                "ratio": est if log else None, "ratio_lo": lo if log else None,
+                "ratio_hi": hi if log else None,
+                "diff_mean": None if log else est, "diff_lo": None if log else lo,
+                "diff_hi": None if log else hi}
 
-    def ratio(regime: str, solution: str, key: str):
-        if solution == args.baseline:
-            return None
-        pair = paired(regime, solution, key)
-        return pair["ratio"] if pair else None
+    def compare(regime: str, solution: str, key: str) -> dict | None:
+        return None if solution == args.baseline else paired(regime, solution, key)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    harness = next(iter(hashes))
+    harness = ", ".join(f"`{h}`" for h in sorted(hashes))
     lines = [
         "# Gossip study: per-regime comparison", "",
-        f"Harness tree hash `{harness}`. Baseline `{args.baseline}`. Cells show the mean "
-        "across valid seeds ± the 95 % CI half-width (Student t) [min–max] (×ratio of "
-        "means to the baseline over the seeds valid for both). `INVALID k/n` marks a "
+        f"Harness tree hash {harness}. Baseline `{args.baseline}`.{equivalent}",
+        "",
+        f"Cells show the posterior mean [{percent} credible interval for the mean across "
+        "seeds (normal model, Jeffreys prior; posterior Student t, n-1 df)], then for "
+        "solutions other than the baseline (×geometric-mean ratio to the baseline "
+        f"[{percent} credible interval], P = posterior probability the solution is better), "
+        "paired over the seeds valid for both. Where a paired value is zero or negative "
+        "the comparison is the mean difference Δ instead of a ratio. One seed has no "
+        "interval and no P; zero spread gives a point-mass interval. `INVALID k/n` marks a "
         "solution with k of n seeds invalid (see `rejected.md`); its statistics cover the "
         "valid seeds only. Lower is better unless noted. Metrics marked (flag) report "
         "saturation that does not invalidate a run; see `flags.md`.", "",
@@ -385,10 +514,17 @@ def main() -> None:
                                               for s, (bad, n) in counts.items()), "",
                   "| Metric | " + " | ".join(present) + " |",
                   "|---|" + "---|" * len(present)]
+        def healed(regime: str, solution: str, key: str) -> str:
+            if key != "part_time_to_heal_ms" or not valid_seeds(regime, solution):
+                return ""
+            stats = table.get((regime, solution, key))
+            return f"healed {stats['n'] if stats else 0}/{len(valid_seeds(regime, solution))}"
+
         def rows(metrics):
             return [f"| {label} | "
-                    + " | ".join(cell(table.get((regime, s, key)), ratio(regime, s, key),
-                                      *counts[s]) for s in present) + " |"
+                    + " | ".join(cell(table.get((regime, s, key)), compare(regime, s, key),
+                                      *counts[s], healed(regime, s, key)) for s in present)
+                    + " |"
                     for key, label, _ in metrics]
 
         lines += rows(METRICS)
@@ -400,8 +536,8 @@ def main() -> None:
                       "by the observer's side. `cross side` is a conservative bound: the far pod "
                       "must also catch up on its own side's hits. The heal is probed every "
                       "100 ms; a hit that expires unrepaired is not a heal, so time to heal "
-                      "averages only the seeds that healed and the unrepaired row shows the "
-                      "rest.", "",
+                      "averages only the seeds that healed (`healed k/n` counts them) and "
+                      "the unrepaired row shows the rest.", "",
                       "| Metric | " + " | ".join(present) + " |",
                       "|---|" + "---|" * len(present)] + rows(PARTITION_METRICS)
     (args.out / "summary.md").write_text("\n".join(lines) + "\n")
@@ -409,8 +545,9 @@ def main() -> None:
     with (args.out / "summary.csv").open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["regime", "solution", "metric", "n_valid", "n_invalid", "n_total",
-                         "mean", "ci95", "min", "max", "paired_n", "ratio_vs_baseline",
-                         "paired_diff_mean", "paired_diff_ci95"])
+                         "mean", "cri_lo", "cri_hi", "min", "max", "ratio", "ratio_lo",
+                         "ratio_hi", "diff_mean", "diff_lo", "diff_hi", "p_better", "scale",
+                         "n"])
         for regime in regimes:
             for solution in solutions:
                 if (regime, solution) not in runs:
@@ -418,12 +555,14 @@ def main() -> None:
                 bad, total = invalid_count(regime, solution)
                 for key, _, _ in METRICS + (PARTITION_METRICS if regime in partitioned else []):
                     stats = table.get((regime, solution, key)) or {}
-                    pair = (paired(regime, solution, key)
-                            if solution != args.baseline else None) or {}
+                    pair = compare(regime, solution, key) or {}
                     writer.writerow([regime, solution, key, stats.get("n", 0), bad, total,
-                                     stats.get("mean"), stats.get("ci95"), stats.get("min"),
-                                     stats.get("max"), pair.get("n"), pair.get("ratio"),
-                                     pair.get("diff_mean"), pair.get("diff_ci95")])
+                                     stats.get("mean"), stats.get("lo"), stats.get("hi"),
+                                     stats.get("min"), stats.get("max"), pair.get("ratio"),
+                                     pair.get("ratio_lo"), pair.get("ratio_hi"),
+                                     pair.get("diff_mean"), pair.get("diff_lo"),
+                                     pair.get("diff_hi"), pair.get("p_better"),
+                                     pair.get("scale"), pair.get("n")])
 
     pareto = ["# Pareto view", "",
               "Per regime, each solution's mean on two objectives (both lower is "

@@ -145,13 +145,23 @@ binary under a running one. It
 refuses to run when the worktree has uncommitted changes (`--allow-dirty`
 overrides, and the judge then rejects the results), and resumes only over
 results with an identical clean stamp. The judge refuses mixed harness
-hashes, results with an older `gabion-study/*` schema, and several commits
+hashes (except hashes that differ only under `judge/` or in `README.md`, which
+it checks with `git diff --name-only` and lists in the `summary.md` header),
+results with an older `gabion-study/*` schema, and several commits
 under one solution label, and writes
-`summary.md` and `summary.csv` (every metric per regime and solution: mean
-across valid seeds, 95 % Student-t confidence half-width, min–max, ratio to
-the baseline over the seeds valid for both, and in the CSV the paired
-difference with its confidence half-width; regimes that cut the network get a
-second table of [partition phases](#metrics)), `pareto.md` (total bytes
+`summary.md` and `summary.csv` (every metric per regime and solution).
+The seed values are modelled as normal with the Jeffreys prior, so the
+posterior of the mean is Student t with n - 1 degrees of freedom; cells show
+the posterior mean and the equal-tailed credible interval (95 % by default,
+`--level` changes it). One seed has no interval (the posterior is improper);
+identical seeds give a point-mass interval. Against the baseline, paired over
+the seeds valid for both, the judge models the log ratio when every value is
+positive and reports the geometric-mean ratio with its credible interval and
+P, the posterior probability that the solution is better (lower is better
+except for `admitted`); with a zero or negative value it reports the mean
+difference instead. Regimes that cut the network get a second table of
+[partition phases](#metrics), whose time-to-heal cell also shows how many seeds
+healed (`healed k/n`); `pareto.md` (total bytes
 against limited-key p99 staleness, worst-key over-admission, and p99
 convergence including never-converged hits, each point a mean over the seeds
 valid for every solution in that table; when no seed is valid for every
