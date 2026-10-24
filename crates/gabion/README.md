@@ -182,24 +182,28 @@ sequenceDiagram
     loop every tick (heartbeat OR synthetic threshold)
         Runtime->>Runtime: handle_gossip_tick
         Runtime->>Store: expire_at(now)
-        Runtime->>Store: fill_gossip_frame_for_peer
-        Store-->>Runtime: pruned cell list
-        Runtime->>Tx: encode + try_send_to(peer)
-        Tx->>Peer: UDP frame
+        Runtime->>Store: fill_gossip_frame (changes since the last round)
+        Store-->>Runtime: cell list, pruned by the frontier hint
+        Runtime->>Tx: encode + try_send_to(each of ⌈ln n + c⌉ picks)
+        Runtime->>Tx: heartbeat only: repair digest to the first pick
+        Tx->>Peer: UDP frames
+        Runtime->>Store: clear_dirty (each change goes out once)
         Runtime->>Adapter: aggregates.apply(expirations)
     end
 
-    Peer->>Tx: UDP frame
+    Peer->>Tx: UDP frame (cells or digest)
     Tx->>Runtime: recv_from
-    Runtime->>Store: merge_remote(observations)
-    Store-->>Runtime: delta rows + frontier acks
+    Runtime->>Store: merge_remote (news, forwarded once) or merge_repair
+    Store-->>Runtime: delta rows
+    Runtime->>Tx: for a digest: the cells it lacks + our digest back
     Runtime->>Adapter: aggregates.apply(deltas, expirations)
 ```
 
 `CellStore::merge_remote` performs the CRDT join: max-merge per
-`(origin, key, bucket)`, sum across origins. Every dirty row also goes
-into a peer-frontier ring so the next outbound frame can prune anything
-that peer has already acknowledged.
+`(origin, key, bucket)`, sum across origins. A cell whose count rose goes
+into the forwarded dirty ring and out in the next round, once; a cell that
+arrived as a repair answer does not. [Design notes](#design-notes) has the
+full round, forward-once and digest-repair rules.
 
 ### Coverage fanout
 
@@ -256,14 +260,13 @@ Fanout trades **bandwidth** (linear in the pick: the cluster ships
 (`≈ e^(−e^(−c))` per round) and **latency** (`≈ log_{1+pick} n` rounds,
 with diminishing return above the threshold). `⌈ln(n)+c⌉` is the
 provably-minimal fanout for reliable coverage of a *single* round, so it
-is the natural operating point. We size to `c = 3` — a 95.1 % per-round
-reach — rather than a higher margin, because gabion is not a one-shot
-disseminator: anti-entropy re-gossips every dirty cell each tick until
-the peer frontier acks it, so a node missed in one round is caught by
-the next and the per-round miss compounds away (4.9 % → ≈ 0.24 % after
-two rounds). KMG's validated single-shot threshold sits near `c ≈ 4`
-(fanout 13 @ 10 000, 15 @ 50 000); a re-gossiping system does not need to
-match it, and `c = 3` saves ≈ 1 peer per tick at every scale. The
+is the natural operating point. Each change spreads exactly that way,
+forwarded once by every node that merges it, so at `c = 3` a change
+misses some node about 2 % of the time at 80 to 300 nodes. We size to
+`c = 3` rather than KMG's validated single-shot `c ≈ 4` (fanout 13 @
+10 000, 15 @ 50 000) because the heartbeat repair digest finds and
+resends what a node missed within about a second, and `c = 3` saves ≈ 1
+peer per round at every scale. The
 bandwidth floor on quiet ticks is unchanged from a fixed fanout — the
 pick is stable for a given cluster size, not pulsing with load. The
 `coverage_fanout` bench
@@ -335,26 +338,26 @@ sides of this trade.
 
 ### Dirty rings and the peer frontier
 
-Three data structures decide which cells the current tick sends to
+Three data structures decide which cells the current round sends to
 which peer:
 
 1. **`local_dirty`** — every locally-observed hit pushes onto this
-   bounded ring. Drained by every tick (heartbeat and threshold).
-2. **`forwarded_dirty`** — every cell merged from a peer pushes onto a
-   separate ring, so the runtime can forward a remote delta even if
-   its local origin column is quiet. Larger than `local_dirty` because
-   forwarded cells fan out N-to-many.
+   bounded ring.
+2. **`forwarded_dirty`** — every cell a peer's news raised pushes onto a
+   separate ring, so the runtime forwards it once. Larger than
+   `local_dirty` because a node merges the whole cluster's changes.
 3. **`peer_frontier`** — for each peer × each origin slot, the highest
-   sequence number that peer has already acked. The sender uses this
-   to skip cells the recipient already has.
+   origin sequence among the cells that peer has sent us. The sender
+   uses it as a hint to skip cells the recipient probably has; one
+   watermark cannot represent a gap, so repair never relies on it.
 
-Together they keep `fill_gossip_frame_for_peer` allocation-free and
-strictly bounded: the runtime walks at most `max_cells_per_tick` cells
-through the three lanes (local dirty → forwarded dirty → repair),
-prunes each candidate against the peer's frontier, and stops when the
-budget is exhausted. The rings are pre-sized at construction; pushes
-that hit the cap bump an overflow counter and silently drop, and the
-next repair-lane sweep picks the dropped cell back up.
+Both rings are cleared at the end of every round: they hold only the
+changes since the last one. `fill_gossip_frame` walks them (local dirty
+→ forwarded dirty, newest first) without allocating, prunes each
+candidate against the peer's frontier, and stops at
+`max_cells_per_tick`. A push that hits a ring's cap bumps an overflow
+counter and overwrites the oldest entry; the repair digest finds the
+cell later.
 
 `CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
@@ -373,7 +376,7 @@ it splits into the two adaptive halves of the protocol.
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
 | `fanout`             | 3           | Fanout floor. The runtime scales the actual pick to the coverage threshold `⌈ln(n)+c⌉` (`c` = `GOSSIP_COVERAGE_MARGIN`, 3), capped at the peer count. | Rarely tune — the floor binds only if you lower `GOSSIP_COVERAGE_MARGIN`. To trade bandwidth for coverage, change the margin, not this floor. |
-| `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame_for_peer` will emit in one tick. Cells over the cap roll forward to the next tick via the repair lane. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
+| `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame` puts in one pick's frame per round, and on one repair answer. Changes over the cap reach that pick through other forwarders or repair. | Raise if you run many rules and frames are cut visibly under burst.                                           |
 | `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 
 ### Per-rule error budget (adaptive emit rate)
@@ -552,10 +555,9 @@ threshold are independent code paths.
 This branch replaces main's resend-until-acked frames with **flat
 infect-and-forward-once** dissemination (Kermarrec, Massoulié & Ganesh,
 IEEE TPDS 2003, doi:10.1109/TPDS.2003.1189583; anti-entropy repair after
-Demers et al., PODC 1987, doi:10.1145/41840.41841). The sections above
-still describe main's loop where they mention re-gossiping dirty cells
-until acked, the dirty-ring persistence and the per-peer frontier as a
-delivery mechanism; this section is authoritative for this branch.
+Demers et al., PODC 1987, doi:10.1145/41840.41841). The figures and
+numbers under [What we measured](#what-we-measured) were taken on main's
+resend-until-acked loop; the rest of this README describes this branch.
 
 - **Round.** Each round (the shared scheduler is unchanged: a 500 ms
   heartbeat plus error-budget threshold rounds, 5 ms floor) sends the

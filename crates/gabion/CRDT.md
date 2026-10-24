@@ -4,6 +4,8 @@ A guide to `crates/gabion/src/crdt/*` for somebody who has never opened this cod
 
 Read it end-to-end and you should be able to open `crdt.rs` and recognise every type, every column, and every method named below.
 
+> **On this branch** the gossip layer sends each change once and repairs by digest (see the README's [Design notes](README.md#design-notes)), which changes three things this guide describes as main has them. A relayed cell keeps the `origin_sequence` its origin stamped on it, so sequences compare across nodes. There is no repair cursor (§7.2): `visit_active` scans the active set for the runtime's repair digest instead, and `fill_gossip_frame(max, peer, out)` composes the two dirty lanes only, with `peer_lacks` as a hint. `merge_repair` merges a repair answer without queueing it for forwarding. `last_sent`, `lacks_indices` and `fill_gossip_frame_for_peer` do not exist here.
+
 ---
 
 ## Table of contents
@@ -1588,12 +1590,10 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
 | `clear_dirty()` | Drop the dirty rings; stored cells untouched. |
 | `clear()` | Reset to empty; preserves local identity registration. |
-| `visit_local_dirty`, `visit_forwarded_dirty` | Stream dirty lanes (no dedup). |
-| `visit_repair_slice(max, visit)` | Rotate a slice of active cells. |
-| `fill_gossip_frame(max, out)` | Compose a frame: local dirty + forwarded dirty + repair slice, deduped. |
-| `fill_gossip_frame_for_peer(max, peer_slot, out)` | Peer-aware variant; the two dirty lanes add a `peer_lacks` filter, the repair lane sweeps unconditionally (convergence backstop). |
-| `peer_frontiers()`, `peer_frontiers_mut()` | Per-peer send/ack frontier access. |
-| `repair_cursor()` | Read the current cursor position. |
+| `merge_repair(obs, sink)` | Merge a repair answer (max-merge) without queueing it for forwarding. |
+| `visit_active(visit)` | Scan every active cell (the repair digest's input). |
+| `fill_gossip_frame(max, peer_slot, out)` | Compose a frame: local dirty + forwarded dirty, newest first, deduped; with a peer slot, skip cells its frontier hint says it holds. |
+| `peer_frontiers()`, `peer_frontiers_mut()` | Per-peer frontier hint access. |
 
 ---
 
