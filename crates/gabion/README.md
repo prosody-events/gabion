@@ -397,20 +397,21 @@ implementation departs from the papers, and why:
   without the cut), and the repair after the heal waited for the next
   timeout and then for one share per timeout (3.1 s to heal). Retransmission
   stays driven by acks and timers only.
-- **The send pool is sized to the peer count.** Direct mail queues a packet
-  for every peer every round, so the pool holds at least
-  `GOSSIP_SEND_SLOTS_PER_PEER` (2) slots per live peer, or
-  `gossip.send_queue_capacity` if that is larger. It grows when discovery
-  adds a peer, never per packet, and does not shrink when peers leave. If the
+- **The send pool is sized to the peer table.** Direct mail queues a packet
+  for every peer every round, so the pool holds
+  `GOSSIP_SEND_SLOTS_PER_PEER` (2) slots for every peer the table can hold
+  (`storage.peer_capacity`, default 256), or `gossip.send_queue_capacity`
+  if that is larger. Both are allocated at construction and never grow. A
+  peer that discovery announces when the table is full is not gossiped
+  with, and a warning names the knob to raise. If the
   pool still runs dry mid-round (the transport is backed up, or a delta needs
   more packets than a peer's even share), the unserved peers are first in the
   next round and nothing is lost: a peer's `sent_upto` advances only over
   packets actually queued. This is an engineering adaptation, not part of the
   papers, which assume an unbounded channel.
 - **Config fields that no longer do anything:** `GossipConfig::fanout`,
-  `GossipConfig::rng_seed`, `CellStoreConfig::forwarded_dirty_capacity` and
-  `CellStoreConfig::peer_capacity` are accepted and ignored so adapter
-  configs keep compiling. The wire format version is 2.
+  `GossipConfig::rng_seed` and `CellStoreConfig::forwarded_dirty_capacity`
+  are accepted and ignored so adapter configs keep compiling. The wire format version is 2.
 - **Full mesh assumed.** Discovery supplies every member as a peer; a
   cluster whose discovery shows each node only a subset would see only
   that subset's changes.

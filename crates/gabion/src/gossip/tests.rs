@@ -2485,7 +2485,8 @@ async fn every_peer_is_sent_to_in_the_first_round_however_many_there_are() {
     LocalSet::new()
         .run_until(async {
             // Far more peers than the configured send queue holds, half of
-            // them known at start and half announced by discovery.
+            // them known at start and half announced by discovery; the peer
+            // table holds them all.
             const PEERS: u16 = 300;
             let router = SimRouter::new();
             let addrs: Vec<_> = (0..PEERS).map(|i| sock(52_000 + i)).collect();
@@ -2498,7 +2499,13 @@ async fn every_peer_is_sent_to_in_the_first_round_however_many_there_are() {
                 router.bind(sock(51_999)),
                 TokioClock::from_millis(0),
                 config,
-                store_for(identity),
+                CellStore::<u32>::new(
+                    CellStoreConfig {
+                        peer_capacity: PEERS,
+                        ..CellStoreConfig::default()
+                    },
+                    identity,
+                ),
                 Rc::new(InMemoryAggregateStore::<u32>::new()),
             );
             let (events, event_rx) = futures::channel::mpsc::unbounded();
@@ -2518,6 +2525,45 @@ async fn every_peer_is_sent_to_in_the_first_round_however_many_there_are() {
                     "{addr} should have been sent the change in the first round",
                 );
             }
+            drop(sinks);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_peer_announced_when_the_table_is_full_is_not_gossiped_with() {
+    LocalSet::new()
+        .run_until(async {
+            let router = SimRouter::new();
+            let addrs: Vec<_> = (0..3).map(|i| sock(53_000 + i)).collect();
+            let sinks: Vec<_> = addrs.iter().map(|a| router.bind(*a)).collect();
+
+            let identity = NodeIdentity::new(NodeId(0xE100), 1);
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(sock(52_999)),
+                TokioClock::from_millis(0),
+                sim_config(identity, addrs[..2].to_vec(), 0),
+                CellStore::<u32>::new(
+                    CellStoreConfig {
+                        peer_capacity: 2,
+                        ..CellStoreConfig::default()
+                    },
+                    identity,
+                ),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            let (events, event_rx) = futures::channel::mpsc::unbounded();
+            tokio::task::spawn_local(rt.run(event_rx));
+            events
+                .unbounded_send(PeerEvent::Added(Peer::new(addrs[2])))
+                .unwrap();
+
+            client.record(0xA, KeyHash(1), 0, 3, 0, 0).await.unwrap();
+            advance(300).await;
+
+            assert!(router.received_count(addrs[0]) >= 1);
+            assert!(router.received_count(addrs[1]) >= 1);
+            assert_eq!(router.received_count(addrs[2]), 0);
             drop(sinks);
         })
         .await;

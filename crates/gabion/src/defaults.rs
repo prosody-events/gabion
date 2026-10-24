@@ -26,12 +26,13 @@ pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 /// peer every round. Kept so adapter configs keep compiling.
 pub const GOSSIP_FANOUT: usize = 3;
 
-/// Send-pool slots the runtime keeps per live peer. The pool is at least
-/// `GOSSIP_SEND_QUEUE_CAPACITY`, and grows with membership to this many slots
-/// per peer, so a round can queue a packet for every peer (direct mail sends
-/// every peer its own delta each round) and still have a second round's worth
-/// of slots while the first drains. Pool memory is
-/// `slots × GOSSIP_MAX_PAYLOAD_BYTES`.
+/// Send-pool slots the runtime keeps per peer it can track
+/// (`STORAGE_PEER_CAPACITY`, or the configured `peer_capacity`). The pool is
+/// sized once at construction to this many slots per peer, or
+/// `GOSSIP_SEND_QUEUE_CAPACITY` if that is more, so a round can queue a packet
+/// for every peer (direct mail sends every peer its own delta each round) and
+/// still have a second round's worth of slots while the first drains. Pool
+/// memory is `slots × GOSSIP_MAX_PAYLOAD_BYTES`.
 pub const GOSSIP_SEND_SLOTS_PER_PEER: usize = 2;
 
 /// Cap on the exponential backoff of a peer's retransmission timeout. Each

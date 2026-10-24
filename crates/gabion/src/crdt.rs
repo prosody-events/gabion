@@ -280,8 +280,9 @@ pub struct CellStoreConfig {
     /// Ignored: direct mail forwards nothing, so there is no forwarded ring.
     /// Kept so adapter configs keep compiling.
     pub forwarded_dirty_capacity: usize,
-    /// Ignored: per-peer state lives in the gossip runtime, sized by the live
-    /// peer list. Kept so adapter configs keep compiling.
+    /// Peers the gossip runtime keeps per-peer state for. The store only
+    /// carries it: the runtime sizes its peer table and send pool from it at
+    /// construction.
     pub peer_capacity: u16,
 }
 
@@ -325,6 +326,7 @@ pub struct CellStore<C: Count = u32> {
 
     // Gossip lanes.
     local_dirty: DirtyRing,
+    peer_capacity: u16,
 
     // Per-origin sequence allocator (indexed by NodeSlot).
     next_sequence_by_origin: Box<[u64]>,
@@ -419,6 +421,7 @@ impl<C: Count> CellStore<C> {
             index: CellIndex::with_capacity(index_cap),
 
             local_dirty: DirtyRing::with_capacity(config.local_dirty_capacity),
+            peer_capacity: config.peer_capacity,
 
             next_sequence_by_origin: vec![0_u64; config.node_dictionary_capacity as usize]
                 .into_boxed_slice(),
@@ -472,6 +475,11 @@ impl<C: Count> CellStore<C> {
 
     pub fn local_dirty(&self) -> &DirtyRing {
         &self.local_dirty
+    }
+
+    /// [`CellStoreConfig::peer_capacity`], for the gossip runtime's sizing.
+    pub fn peer_capacity(&self) -> u16 {
+        self.peer_capacity
     }
 
     pub fn index(&self) -> &CellIndex {

@@ -499,7 +499,7 @@ to touch them if your workload runs into the cap.
 | `gabion_storage_node_dictionary_capacity N`     | `1024`      | Number of distinct (node_id, incarnation) slots.                                      |
 | `gabion_storage_local_dirty_capacity N`         | `65536`     | Local dirty-ring capacity. Sized to absorb a burst between heartbeats.                |
 | `gabion_storage_forwarded_dirty_capacity N`     | `524288`    | Forwarded dirty-ring capacity. Sized larger because it tracks peer-originated edits we still owe other peers. |
-| `gabion_storage_peer_capacity N`                | `256`       | Peer slots in the peer-frontier table (one row per peer × node).                      |
+| `gabion_storage_peer_capacity N`                | `256`       | Most peers this node gossips with; sizes the peer table and send pool at startup.     |
 | `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare. Equal to `STORAGE_MAX_MATCHED_RULES`.   |
 | `gabion_storage_max_descriptor_bytes N`         | `512`       | Per-request budget on `(key + value)` bytes summed across descriptors plus the domain. Exceeded ⇒ 400. |
 | `gabion_storage_max_key_bytes N`                | `128`       | Cap on a single descriptor key's length (validated at config phase).                  |

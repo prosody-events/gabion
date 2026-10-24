@@ -71,8 +71,7 @@ const LOCAL_RULE_ID: u32 = 0;
 /// 1400-byte payload in the worst case) keeps a node's share of the pool
 /// useful at the visualizer's widest cluster. The cap is inert at the default
 /// 12-node scenarios, whose cross-node working set (≈ 132 cells) never reaches
-/// it. Pool memory is `max(255, 2 × peers) × 1400 B × live_nodes` ≈ 36 MB at
-/// 100 nodes.
+/// it. Pool memory is `max(255, 2 × peer_capacity) × 1400 B × live_nodes`.
 const VIZ_MAX_CELLS_PER_TICK: usize = 160;
 const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
 

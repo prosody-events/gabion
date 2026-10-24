@@ -77,6 +77,8 @@ where
     rto_floor_ms: u64,
 
     peers: Vec<Peer>,
+    /// Most peers `peers` may hold; it is allocated for that many.
+    peer_capacity: usize,
     /// Peer a round starts with, advanced every round so that a send pool
     /// smaller than the peer list does not starve the peers at its tail.
     next_round_start: usize,
@@ -227,14 +229,23 @@ where
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
 
-        let peers: Vec<Peer> = config
-            .bootstrap_peers
-            .iter()
-            .copied()
-            .map(Peer::new)
-            .collect();
+        let peer_capacity = usize::from(store.peer_capacity());
+        let mut peers: Vec<Peer> = Vec::with_capacity(peer_capacity);
+        for &addr in &config.bootstrap_peers {
+            if peers.len() == peer_capacity {
+                warn_peer_capacity(addr, peer_capacity, config.bootstrap_peers.len());
+                break;
+            }
+            peers.push(Peer::new(addr));
+        }
 
-        let send_pool_size = send_slots_wanted(config.send_queue_capacity, peers.len());
+        // Direct mail queues a packet for every peer every round, so the pool
+        // holds `GOSSIP_SEND_SLOTS_PER_PEER` slots for every peer the table can
+        // hold, or `send_queue_capacity` if that is more.
+        let send_pool_size = config
+            .send_queue_capacity
+            .max(1)
+            .max(peer_capacity.saturating_mul(crate::defaults::GOSSIP_SEND_SLOTS_PER_PEER));
         let send_pool: Vec<PacketBuf> = (0..send_pool_size)
             .map(|_| PacketBuf::for_limits(config.wire_limits))
             .collect();
@@ -265,6 +276,7 @@ where
             send_free,
             rto_floor_ms,
             peers,
+            peer_capacity,
             next_round_start: 0,
             pending_reply: None,
             decode_reject_count: 0,
@@ -650,9 +662,13 @@ where
     fn handle_peer_event(&mut self, evt: PeerEvent) {
         match evt {
             PeerEvent::Added(p) => {
-                if !self.peers.iter().any(|x| x.addr == p.addr) {
+                if self.peers.iter().any(|x| x.addr == p.addr) {
+                    return;
+                }
+                if self.peers.len() == self.peer_capacity {
+                    warn_peer_capacity(p.addr, self.peer_capacity, self.peers.len() + 1);
+                } else {
                     self.peers.push(Peer::new(p.addr));
-                    self.grow_send_pool();
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
@@ -670,26 +686,6 @@ where
                     );
                 }
             }
-        }
-    }
-
-    /// Grow the send pool to cover the current peer count. Runs on membership
-    /// change, never per packet; the pool does not shrink when peers leave.
-    fn grow_send_pool(&mut self) {
-        let wanted = send_slots_wanted(self.config.send_queue_capacity, self.peers.len());
-        let have = self.send_pool.len();
-        if wanted <= have {
-            return;
-        }
-        self.send_pool.reserve_exact(wanted - have);
-        self.send_free
-            .reserve_exact(wanted.saturating_sub(self.send_free.len()));
-        self.send_pending
-            .reserve(wanted.saturating_sub(self.send_pending.len()));
-        for slot in have..wanted {
-            self.send_pool
-                .push(PacketBuf::for_limits(self.config.wire_limits));
-            self.send_free.push(slot as SendSlot);
         }
     }
 
@@ -851,13 +847,23 @@ where
 /// Index of a slot in the send pool.
 type SendSlot = u32;
 
-/// Send-pool slots needed for `peers` live peers: the configured capacity, or
-/// [`GOSSIP_SEND_SLOTS_PER_PEER`] per peer if that is more, so a round can
-/// always queue at least one packet for every peer.
-fn send_slots_wanted(capacity: usize, peers: usize) -> usize {
-    capacity
-        .max(1)
-        .max(peers.saturating_mul(crate::defaults::GOSSIP_SEND_SLOTS_PER_PEER))
+/// A peer was announced while the peer table is full. It is not gossiped
+/// with: it never receives this node's changes, and its own are merged but
+/// never acknowledged. Discovery announces peers once, so this logs once per
+/// refused peer.
+fn warn_peer_capacity(peer: SocketAddr, peer_capacity: usize, cluster_size: usize) {
+    tracing::warn!(
+        peer = %peer,
+        peer_capacity,
+        cluster_size,
+        "Not gossiping with a peer discovery announced: the peer table is \
+         full. That peer will not see this node's rate-limit counts, so it \
+         under-counts every key this node admits, and this node keeps \
+         merging its counts without acknowledging them. The cluster has \
+         grown past `storage.peer_capacity` (`gabion_storage_peer_capacity` \
+         in nginx); raise it above the largest cluster size you expect and \
+         restart.",
+    );
 }
 
 enum ArmOutcome {
