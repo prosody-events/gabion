@@ -479,7 +479,11 @@ data and UDP.
 - **IHAVE names a cell version.** Plumtree announces every message id, so a
   message lost below a later one is still announced. Here a message is a cell
   version, and an entry is that version's origin, incarnation and sequence
-  and the cell's rule fingerprint, key hash and bucket (64 bytes). The
+  and the cell's rule fingerprint, key hash and bucket. Every node announces
+  every change it receives, so these entries were half of all bytes at 64
+  bytes each; an IHAVE now groups its entries by origin and rule, sorted by
+  sequence, so a change costs its key hash and its bucket and sequence past
+  the group's first (22 bytes) plus a share of the group's 50. The
   receiver looks the cell up and starts the missing timer only if it holds
   neither that version nor a newer one. A cell that changed again since it was
   queued is named once, at its newest version, because the older one is

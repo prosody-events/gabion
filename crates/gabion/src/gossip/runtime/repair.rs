@@ -153,6 +153,8 @@ where
             digest.extend(self.change_of(handle));
         }
         self.thicket.dequeue_lazy(n);
+        // Grouped by origin and rule on the wire: sorted, they share groups.
+        digest.sort_unstable_by_key(|e| (e.node_id.0, e.incarnation, e.rule_fingerprint, e.value));
         if !digest.is_empty() {
             let mut chosen = [NONE; THICKET_LAZY_TARGETS];
             for k in 0..THICKET_LAZY_TARGETS {

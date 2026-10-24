@@ -12,11 +12,25 @@
 //! [ entries     : N × size ]
 //! ```
 //!
-//! An entry is `node_id u128, incarnation u32, value u64` (28 bytes). The
-//! kinds that name one cell version, [`ControlKind::Ihave`] and
-//! [`ControlKind::Graft`], add `rule_fingerprint u128, key_hash u128,
-//! bucket u32` (64 bytes). What `value` means depends on `kind`; see
-//! [`ControlKind`].
+//! An entry is `node_id u128, incarnation u32, value u64` (28 bytes).
+//! [`ControlKind::Graft`], which names cell versions, adds `rule_fingerprint
+//! u128, key_hash u128, bucket u32` (64 bytes). What `value` means depends on
+//! `kind`; see [`ControlKind`].
+//!
+//! [`ControlKind::Ihave`] names the same cell versions, many to a frame, so
+//! its entries are grouped by origin and rule, and `entry_count` counts the
+//! groups:
+//!
+//! ```text
+//! group: [ node_id u128 ][ incarnation u32 ][ rule_fingerprint u128 ]
+//!        [ bucket u32 ][ value u64 ][ n u16 ]                    50 bytes
+//!        n × [ key_hash u128 ][ bucket − group bucket : u16 ]
+//!            [ value − group value : u32 ]                       22 bytes
+//! ```
+//!
+//! Entries sorted by origin, rule and value fill groups best; an entry that
+//! is not of the group's origin and rule, or below or too far past its bucket
+//! or value, starts a new group.
 
 use crate::crdt::{BucketEpoch, Incarnation, KeyHash, NodeId};
 
@@ -32,6 +46,10 @@ pub(super) const BODY_PREFIX: usize = 4;
 pub const CONTROL_ENTRY_BYTES: usize = 16 + 4 + 8;
 /// Bytes of one control entry that names a cell version.
 pub const CHANGE_ENTRY_BYTES: usize = CONTROL_ENTRY_BYTES + 16 + 16 + 4;
+/// Bytes of the fixed part of an IHAVE group.
+const GROUP_HEAD: usize = 16 + 4 + 16 + 4 + 8 + 2;
+/// Bytes of one IHAVE entry within its group.
+const GROUP_ENTRY: usize = 16 + 2 + 4;
 
 /// What a control frame asks of its receiver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,7 +99,8 @@ impl ControlKind {
         }
     }
 
-    /// Bytes of one entry of this kind.
+    /// Bytes of one entry of this kind; an IHAVE entry takes fewer within a
+    /// group, and its group's share of the group's fixed part.
     pub fn entry_bytes(self) -> usize {
         match self {
             Self::Ihave | Self::Graft => CHANGE_ENTRY_BYTES,
@@ -150,28 +169,39 @@ pub fn encode_control(
     let room = limits
         .max_payload_bytes
         .saturating_sub(HEADER_LEN + BODY_PREFIX + auth_overhead);
-    let fit = (room / kind.entry_bytes()).min(usize::from(u16::MAX));
-    if fit == 0 && !entries.is_empty() {
+    let smallest = match kind {
+        ControlKind::Ihave => GROUP_HEAD + GROUP_ENTRY,
+        _ => kind.entry_bytes(),
+    };
+    if room < smallest && !entries.is_empty() {
         return Err(EncodeError::BudgetTooSmall);
     }
-    let written = entries.len().min(fit);
 
     buf.inner.clear();
     buf.inner.resize(HEADER_LEN, 0);
     buf.inner.push(kind.code());
     buf.inner.push(tree);
-    buf.inner.extend_from_slice(&(written as u16).to_le_bytes());
-    for e in &entries[..written] {
-        buf.inner.extend_from_slice(&e.node_id.0.to_le_bytes());
-        buf.inner.extend_from_slice(&e.incarnation.to_le_bytes());
-        buf.inner.extend_from_slice(&e.value.to_le_bytes());
-        if kind.entry_bytes() == CHANGE_ENTRY_BYTES {
-            buf.inner
-                .extend_from_slice(&e.rule_fingerprint.to_le_bytes());
-            buf.inner.extend_from_slice(&e.key_hash.0.to_le_bytes());
-            buf.inner.extend_from_slice(&e.bucket.to_le_bytes());
+    buf.inner.extend_from_slice(&0u16.to_le_bytes());
+    let (written, count) = match kind {
+        ControlKind::Ihave => encode_groups(&mut buf.inner, entries, room),
+        _ => {
+            let fit = (room / kind.entry_bytes()).min(usize::from(u16::MAX));
+            let written = entries.len().min(fit);
+            for e in &entries[..written] {
+                buf.inner.extend_from_slice(&e.node_id.0.to_le_bytes());
+                buf.inner.extend_from_slice(&e.incarnation.to_le_bytes());
+                buf.inner.extend_from_slice(&e.value.to_le_bytes());
+                if kind.entry_bytes() == CHANGE_ENTRY_BYTES {
+                    buf.inner
+                        .extend_from_slice(&e.rule_fingerprint.to_le_bytes());
+                    buf.inner.extend_from_slice(&e.key_hash.0.to_le_bytes());
+                    buf.inner.extend_from_slice(&e.bucket.to_le_bytes());
+                }
+            }
+            (written, written as u16)
         }
-    }
+    };
+    buf.inner[HEADER_LEN + 2..HEADER_LEN + BODY_PREFIX].copy_from_slice(&count.to_le_bytes());
 
     let mut packet_header = header;
     packet_header.flags = FLAG_CONTROL;
@@ -225,6 +255,10 @@ pub fn decode_control(
     let tree = body[1];
     let count = usize::from(u16::from_le_bytes([body[2], body[3]]));
     let rows = &body[BODY_PREFIX..];
+    if kind == ControlKind::Ihave {
+        decode_groups(rows, count, on_entry)?;
+        return Ok(DecodedControl { header, kind, tree });
+    }
     let width = kind.entry_bytes();
     if rows.len() != count * width {
         return Err(DecodeError::BadControl);
@@ -244,6 +278,89 @@ pub fn decode_control(
         on_entry(entry);
     }
     Ok(DecodedControl { header, kind, tree })
+}
+
+/// Whether `e` can join the IHAVE group that starts with `first`.
+fn joins(first: &ControlEntry, e: &ControlEntry) -> bool {
+    (e.node_id, e.incarnation, e.rule_fingerprint)
+        == (first.node_id, first.incarnation, first.rule_fingerprint)
+        && e.bucket
+            .checked_sub(first.bucket)
+            .is_some_and(|d| d <= u32::from(u16::MAX))
+        && e.value
+            .checked_sub(first.value)
+            .is_some_and(|d| d <= u64::from(u32::MAX))
+}
+
+/// Write as many of `entries` as fit `room` bytes as IHAVE groups. Returns
+/// how many entries and how many groups were written.
+fn encode_groups(out: &mut Vec<u8>, entries: &[ControlEntry], mut room: usize) -> (usize, u16) {
+    let mut written = 0;
+    let mut groups = 0u16;
+    while let Some(first) = entries.get(written)
+        && room >= GROUP_HEAD + GROUP_ENTRY
+        && groups < u16::MAX
+    {
+        let fit = ((room - GROUP_HEAD) / GROUP_ENTRY).min(usize::from(u16::MAX));
+        let n = entries[written..]
+            .iter()
+            .take(fit)
+            .take_while(|e| joins(first, e))
+            .count();
+        out.extend_from_slice(&first.node_id.0.to_le_bytes());
+        out.extend_from_slice(&first.incarnation.to_le_bytes());
+        out.extend_from_slice(&first.rule_fingerprint.to_le_bytes());
+        out.extend_from_slice(&first.bucket.to_le_bytes());
+        out.extend_from_slice(&first.value.to_le_bytes());
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        for e in &entries[written..written + n] {
+            out.extend_from_slice(&e.key_hash.0.to_le_bytes());
+            out.extend_from_slice(&((e.bucket - first.bucket) as u16).to_le_bytes());
+            out.extend_from_slice(&((e.value - first.value) as u32).to_le_bytes());
+        }
+        room -= GROUP_HEAD + n * GROUP_ENTRY;
+        written += n;
+        groups += 1;
+    }
+    (written, groups)
+}
+
+/// Read `groups` IHAVE groups that must fill `rows` exactly.
+fn decode_groups(
+    mut rows: &[u8],
+    groups: usize,
+    mut on_entry: impl FnMut(ControlEntry),
+) -> Result<(), DecodeError> {
+    for _ in 0..groups {
+        let head = rows.get(..GROUP_HEAD).ok_or(DecodeError::BadControl)?;
+        let node_id = NodeId(u128::from_le_bytes(std::array::from_fn(|i| head[i])));
+        let incarnation = u32::from_le_bytes(std::array::from_fn(|i| head[16 + i]));
+        let rule_fingerprint = u128::from_le_bytes(std::array::from_fn(|i| head[20 + i]));
+        let bucket = u32::from_le_bytes(std::array::from_fn(|i| head[36 + i]));
+        let value = u64::from_le_bytes(std::array::from_fn(|i| head[40 + i]));
+        let n = usize::from(u16::from_le_bytes([head[48], head[49]]));
+        let body = rows
+            .get(GROUP_HEAD..GROUP_HEAD + n * GROUP_ENTRY)
+            .ok_or(DecodeError::BadControl)?;
+        for row in body.as_chunks::<GROUP_ENTRY>().0 {
+            on_entry(ControlEntry {
+                node_id,
+                incarnation,
+                value: value.saturating_add(u64::from(u32::from_le_bytes(std::array::from_fn(
+                    |i| row[18 + i],
+                )))),
+                rule_fingerprint,
+                key_hash: KeyHash(u128::from_le_bytes(std::array::from_fn(|i| row[i]))),
+                bucket: bucket.saturating_add(u32::from(u16::from_le_bytes([row[16], row[17]]))),
+            });
+        }
+        rows = &rows[GROUP_HEAD + n * GROUP_ENTRY..];
+    }
+    if rows.is_empty() {
+        Ok(())
+    } else {
+        Err(DecodeError::BadControl)
+    }
 }
 
 #[cfg(test)]

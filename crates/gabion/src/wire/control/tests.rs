@@ -79,7 +79,7 @@ fn every_kind_round_trips_with_and_without_auth() {
 fn a_change_entry_is_wider_than_an_origin_entry() {
     let mut buf = PacketBuf::for_limits(limits());
     let mut sizes = Vec::new();
-    for kind in [ControlKind::Ihave, ControlKind::Nack] {
+    for kind in [ControlKind::Graft, ControlKind::Nack] {
         encode_control(
             header(),
             kind,
@@ -223,4 +223,101 @@ fn a_frame_of_cells_is_not_a_control_frame() {
     crate::wire::header::patch_header(&mut data, &header());
     assert!(!is_control(&data));
     assert!(!is_control(&data[..4]));
+}
+
+/// `n` changes of one origin and rule, in consecutive buckets and values.
+fn changes_of(origin: u128, n: u64) -> Vec<ControlEntry> {
+    (0..n)
+        .map(|i| ControlEntry {
+            node_id: NodeId(origin),
+            incarnation: 2,
+            value: 1_000 + i,
+            rule_fingerprint: 0xABC,
+            key_hash: KeyHash(0x5000 + u128::from(i)),
+            bucket: 70 + (i / 4) as u32,
+        })
+        .collect()
+}
+
+fn ihave_bytes(sent: &[ControlEntry]) -> usize {
+    let mut buf = PacketBuf::for_limits(limits());
+    let n = encode_control(
+        header(),
+        ControlKind::Ihave,
+        0,
+        sent,
+        None,
+        limits(),
+        &mut buf,
+    )
+    .unwrap();
+    assert_eq!(n, sent.len());
+    assert_eq!(decode(&buf, None).unwrap().1, sent);
+    buf.as_bytes().len()
+}
+
+#[test]
+fn ihave_entries_of_one_origin_and_rule_share_a_group() {
+    let empty = ihave_bytes(&[]);
+    assert_eq!(
+        ihave_bytes(&changes_of(7, 1)) - empty,
+        GROUP_HEAD + GROUP_ENTRY
+    );
+    assert_eq!(
+        ihave_bytes(&changes_of(7, 10)) - empty,
+        GROUP_HEAD + 10 * GROUP_ENTRY
+    );
+    let mut two = changes_of(7, 3);
+    two.extend(changes_of(8, 3));
+    assert_eq!(
+        ihave_bytes(&two) - empty,
+        2 * (GROUP_HEAD + 3 * GROUP_ENTRY)
+    );
+}
+
+#[test]
+fn an_ihave_entry_out_of_its_groups_reach_starts_a_new_one() {
+    let empty = ihave_bytes(&[]);
+    let first = changes_of(7, 1)[0];
+    let behind = ControlEntry {
+        bucket: first.bucket - 1,
+        ..first
+    };
+    let far = ControlEntry {
+        value: first.value + u64::from(u32::MAX) + 1,
+        ..first
+    };
+    let other_rule = ControlEntry {
+        rule_fingerprint: 0xDEF,
+        ..first
+    };
+    for second in [behind, far, other_rule] {
+        assert_eq!(
+            ihave_bytes(&[first, second]) - empty,
+            2 * (GROUP_HEAD + GROUP_ENTRY)
+        );
+    }
+}
+
+#[test]
+fn a_truncated_ihave_group_is_rejected() {
+    let mut buf = PacketBuf::for_limits(limits());
+    encode_control(
+        header(),
+        ControlKind::Ihave,
+        0,
+        &changes_of(7, 3),
+        None,
+        limits(),
+        &mut buf,
+    )
+    .unwrap();
+    let mut bytes = buf.as_bytes().to_vec();
+    bytes.truncate(bytes.len() - GROUP_ENTRY);
+    let body_len = (bytes.len() - HEADER_LEN) as u32;
+    bytes[52..56].copy_from_slice(&body_len.to_le_bytes());
+    assert_eq!(
+        decode_control(&bytes, None, limits(), |_| {}),
+        Err(DecodeError::BadControl)
+    );
 }
