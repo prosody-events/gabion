@@ -6,6 +6,8 @@
 //! * [`ctrl`] — the control extension each tree packet carries.
 //! * [`flight`] — bounded tables of broadcasts in flight and the round-trip
 //!   estimator behind the acknowledgement timeout.
+//! * [`roots`] — what this node has of each root's changes, and the gaps it
+//!   pulls from the root.
 //!
 //! The runtime half lives in `runtime/tree.rs`. See "Design notes" in the
 //! gabion README for how this follows the paper and where it adapts it.
@@ -15,6 +17,7 @@ use crate::defaults;
 mod ctrl;
 mod flight;
 mod ring;
+mod roots;
 
 #[cfg(test)]
 mod tests;
@@ -22,6 +25,7 @@ mod tests;
 pub(super) use ctrl::{CTRL_MAX_LEN, Ctrl};
 pub(super) use flight::{MAX_CHILDREN, Origins, Relay, Relays, RttEstimator, full_mask};
 pub(super) use ring::{Child, Children, Ring, tree_height};
+pub(super) use roots::Roots;
 
 /// The Snow tuning knobs, fixed at construction. Defaults are the paper's;
 /// see [`crate::defaults`] for the reasoning behind each.

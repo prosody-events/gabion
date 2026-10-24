@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use super::flight::full_mask;
+use super::roots::{Gap, MAX_GAPS};
 use super::*;
 
 fn addr(i: u16) -> SocketAddr {
@@ -367,4 +368,160 @@ fn rtt_backs_off_only_while_unmeasured() {
         10,
         "loss does not stretch a measured round trip"
     );
+}
+
+fn gap(after: u64, before: u64) -> Gap {
+    Gap { after, before }
+}
+
+#[test]
+fn ctrl_roundtrips_pull_and_fill() {
+    for ctrl in [
+        Ctrl::Pull {
+            after: 7,
+            before: u64::MAX,
+        },
+        Ctrl::Fill {
+            after: 0,
+            through: 1 << 40,
+        },
+    ] {
+        let mut buf = [0; CTRL_MAX_LEN];
+        let bytes = ctrl.encode(&mut buf);
+        assert_eq!(bytes.len(), 17);
+        assert_eq!(Ctrl::decode(bytes), Some(ctrl));
+        assert_eq!(Ctrl::decode(&bytes[..16]), None);
+    }
+}
+
+#[test]
+fn consecutive_broadcasts_leave_no_gap_and_a_skipped_one_does() {
+    let mut roots = Roots::new(4);
+    roots.broadcast(addr(1), 10, (1, 3), 0, 5);
+    roots.broadcast(addr(1), 11, (5, 9), 0, 5);
+    assert!(
+        roots.gaps(addr(1)).is_empty(),
+        "4 was superseded by a later change"
+    );
+    roots.broadcast(addr(1), 13, (14, 15), 0, 5);
+    assert_eq!(roots.gaps(addr(1)), vec![gap(9, 14)]);
+    assert!(roots.maybe_gaps());
+}
+
+#[test]
+fn a_late_copy_fills_what_it_carries() {
+    let mut roots = Roots::new(4);
+    roots.broadcast(addr(1), 1, (1, 1), 0, 0);
+    roots.broadcast(addr(1), 5, (20, 20), 0, 0);
+    assert_eq!(roots.gaps(addr(1)), vec![gap(1, 20)]);
+    roots.broadcast(addr(1), 3, (8, 10), 0, 0);
+    assert_eq!(roots.gaps(addr(1)), vec![gap(1, 8), gap(10, 20)]);
+    roots.broadcast(addr(1), 2, (2, 7), 0, 0);
+    roots.broadcast(addr(1), 4, (11, 19), 0, 0);
+    assert!(roots.gaps(addr(1)).is_empty());
+}
+
+#[test]
+fn the_first_broadcast_from_a_root_opens_the_gap_below_it() {
+    let mut roots = Roots::new(4);
+    roots.broadcast(addr(1), 1, (1, 2), 0, 0);
+    assert!(roots.gaps(addr(1)).is_empty(), "nothing came before");
+    roots.broadcast(addr(2), 40, (300, 310), 0, 0);
+    assert_eq!(roots.gaps(addr(2)), vec![gap(0, 300)]);
+}
+
+#[test]
+fn a_restarted_root_starts_a_new_log() {
+    let mut roots = Roots::new(4);
+    roots.broadcast(addr(1), 1, (1, 500), 0, 0);
+    roots.broadcast(addr(1), 2, (3, 4), 0, 0);
+    assert_eq!(roots.gaps(addr(1)), vec![gap(0, 3)]);
+}
+
+#[test]
+fn pulls_wait_for_their_due_time_and_back_off_until_answered() {
+    let mut roots = Roots::new(4);
+    roots.broadcast(addr(1), 1, (1, 1), 0, 0);
+    roots.broadcast(addr(1), 3, (9, 9), 0, 100);
+    let mut sent = Vec::new();
+    let mut pull = |roots: &mut Roots, now| {
+        roots.pull_due(
+            now,
+            10,
+            500,
+            |_| true,
+            |root, g| {
+                sent.push((now, root, g));
+                true
+            },
+        )
+    };
+    pull(&mut roots, 99);
+    pull(&mut roots, 100);
+    pull(&mut roots, 105);
+    pull(&mut roots, 110);
+    pull(&mut roots, 125);
+    pull(&mut roots, 130);
+    let times: Vec<u64> = sent.iter().map(|s| s.0).collect();
+    assert_eq!(times, vec![100, 110, 130], "retries after 10, then 20 ms");
+    assert!(sent.iter().all(|s| s.2 == gap(1, 9)));
+
+    assert!(roots.filled(addr(1), 1, 4, 140), "5..=8 remain");
+    assert_eq!(roots.gaps(addr(1)), vec![gap(4, 9)]);
+    assert!(
+        !roots.filled(addr(1), 1, 6, 141),
+        "a stale answer is ignored"
+    );
+    assert!(!roots.filled(addr(1), 4, 8, 142));
+    assert!(roots.gaps(addr(1)).is_empty());
+}
+
+#[test]
+fn pulls_to_a_root_that_is_not_a_member_stop() {
+    let mut roots = Roots::new(4);
+    roots.broadcast(addr(1), 5, (9, 9), 0, 0);
+    roots.broadcast(addr(2), 5, (9, 9), 0, 0);
+    let mut sent = [0; 3];
+    for now in 0..10_000 {
+        roots.pull_due(
+            now,
+            10,
+            500,
+            |root| root == addr(2),
+            |root, _| {
+                sent[usize::from(root.port() - 4000)] += 1;
+                true
+            },
+        );
+    }
+    assert_eq!(sent[1], u32::from(Roots::MAX_ATTEMPTS));
+    assert!(sent[2] > 20, "a member keeps being asked");
+    assert!(roots.gaps(addr(1)).is_empty());
+}
+
+#[test]
+fn gaps_beyond_the_table_merge_with_a_neighbour() {
+    let mut roots = Roots::new(4);
+    roots.broadcast(addr(1), 1, (1, 1), 0, 0);
+    let mut seq = 1;
+    for i in 0..(MAX_GAPS as u64 + 2) {
+        seq += 2;
+        roots.broadcast(addr(1), seq, (10 * i + 5, 10 * i + 5), 0, 0);
+    }
+    let gaps = roots.gaps(addr(1));
+    assert_eq!(gaps.len(), MAX_GAPS);
+    assert!(gaps.windows(2).all(|w| w[0].before <= w[1].after));
+    assert_eq!(gaps[0].after, 1);
+    assert_eq!(gaps.last().unwrap().before, 10 * (MAX_GAPS as u64 + 1) + 5);
+}
+
+#[test]
+fn a_full_table_forgets_the_root_heard_from_longest_ago() {
+    let mut roots = Roots::new(2);
+    roots.broadcast(addr(1), 1, (5, 5), 10, 0);
+    roots.broadcast(addr(2), 1, (5, 5), 20, 0);
+    roots.broadcast(addr(3), 1, (5, 5), 30, 0);
+    assert!(roots.gaps(addr(1)).is_empty());
+    assert_eq!(roots.gaps(addr(2)), vec![gap(0, 5)]);
+    assert_eq!(roots.gaps(addr(3)), vec![gap(0, 5)]);
 }

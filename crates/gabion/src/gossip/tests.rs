@@ -1512,6 +1512,98 @@ async fn full_packets_still_fit_once_the_control_header_is_added() {
         .await;
 }
 
+/// A broadcast lost on its first send and on the rebroadcast is pulled from
+/// the root once the root's next broadcast shows it missing.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_broadcast_lost_twice_is_pulled_from_the_root() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addrs: Vec<SocketAddr> = (0..9).map(|i| sock(42_000 + i)).collect();
+            for dst in &addrs[1..] {
+                router.set_link_policy(addrs[0], *dst, LinkPolicy::DropFirst { count: 2 });
+            }
+            let cluster = TreeCluster::start(9, router, |_| {});
+            cluster.clients[0]
+                .record(0xDEAD, KeyHash(1), 0, 5, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert!(cluster.aggs[1..].iter().all(|a| a.total() == 0));
+
+            cluster.clients[0]
+                .record(0xDEAD, KeyHash(2), 0, 1, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 20).await;
+            assert!(
+                cluster.aggs.iter().all(|agg| agg.total() == 6),
+                "totals: {:?}",
+                cluster.aggs.iter().map(|a| a.total()).collect::<Vec<_>>()
+            );
+            cluster.stop().await;
+        })
+        .await;
+}
+
+/// A root cut off for a while is caught up by pulls once it is reachable
+/// again, over several answers when its missed cells fill more than a
+/// packet.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_long_outage_is_pulled_back_in_several_answers() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addrs: Vec<SocketAddr> = (0..9).map(|i| sock(42_000 + i)).collect();
+            for dst in &addrs[1..] {
+                router.set_link_policy(addrs[0], *dst, LinkPolicy::Block);
+            }
+            let cluster = TreeCluster::start_with(
+                9,
+                router,
+                CellStoreConfig {
+                    local_dirty_capacity: 512,
+                    ..CellStoreConfig::default()
+                },
+                |cfg| cfg.wire_limits.max_payload_bytes = crate::defaults::GOSSIP_MAX_PAYLOAD_BYTES,
+                |_| {},
+            );
+            cluster.clients[0]
+                .record(0xDEAD, KeyHash(0), 0, 1, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 2).await;
+            for key in 1..200_u128 {
+                cluster.clients[0]
+                    .record(0xDEAD, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert!(cluster.aggs[1..].iter().all(|a| a.total() == 0));
+
+            for dst in &cluster.addrs[1..] {
+                cluster
+                    .router
+                    .set_link_policy(cluster.addrs[0], *dst, LinkPolicy::Pass);
+            }
+            cluster.clients[0]
+                .record(0xDEAD, KeyHash(200), 0, 1, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 20).await;
+            assert!(
+                cluster.aggs.iter().all(|agg| agg.total() == 201),
+                "totals: {:?}",
+                cluster.aggs.iter().map(|a| a.total()).collect::<Vec<_>>()
+            );
+            cluster.stop().await;
+        })
+        .await;
+}
+
 /// A repeat of a broadcast is pushed on to the silent children only when it
 /// comes from the node that first handed it over. A node that names an
 /// ancestor as its child (views disagree) must not set the packet circling.

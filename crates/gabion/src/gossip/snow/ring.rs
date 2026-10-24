@@ -68,6 +68,10 @@ impl Ring {
         self.members.iter().copied().filter(move |&a| a != me)
     }
 
+    pub fn contains(&self, addr: SocketAddr) -> bool {
+        self.members.binary_search(&addr).is_ok()
+    }
+
     /// Add a member. Returns `false` if it was already known (or is the
     /// local node).
     pub fn insert(&mut self, addr: SocketAddr) -> bool {

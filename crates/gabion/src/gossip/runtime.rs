@@ -32,7 +32,7 @@ use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
-use super::snow::{Ctrl, Origins, Relays, Ring, RttEstimator, TreeParams};
+use super::snow::{Ctrl, Origins, Relays, Ring, Roots, RttEstimator, TreeParams};
 use super::store::AggregateStore;
 use super::transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
@@ -116,6 +116,11 @@ where
     origins: Origins,
     relays: Relays,
     rtt: RttEstimator,
+    /// What this node has of each root's broadcasts, and the gaps it pulls.
+    roots: Roots,
+    /// Encodes the cells of one pull answer before its control header is
+    /// added.
+    pull_buf: PacketBuf,
     /// Highest local origin sequence already handed to a broadcast.
     sent_seq: u64,
     last_repair_ms: u64,
@@ -295,6 +300,8 @@ where
             rng.next_u32(),
         );
         let relays = Relays::new(crate::defaults::GOSSIP_TREE_RELAY_CAPACITY);
+        let roots = Roots::new(usize::from(store.node_dictionary().capacity()));
+        let pull_buf = PacketBuf::for_limits(config.wire_limits);
         let rule_capacity = store.rule_dictionary().capacity() as usize;
         let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
         let rule_last_emit_ms = vec![0_u64; rule_capacity].into_boxed_slice();
@@ -320,6 +327,8 @@ where
             origins,
             relays,
             rtt: RttEstimator::default(),
+            roots,
+            pull_buf,
             sent_seq: 0,
             last_repair_ms: 0,
             unacked_total: 0,
@@ -379,7 +388,7 @@ where
             // would re-borrow `self` after we've already
             // split-borrowed for the I/O futures below.
             let have_send = !self.send.pending.is_empty();
-            let watch_acks = self.origins.live() > 0;
+            let watch_acks = self.origins.live() > 0 || self.roots.maybe_gaps();
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
 
@@ -573,7 +582,11 @@ where
 
         if !summary.ext.is_empty() {
             match Ctrl::decode(summary.ext) {
-                Some(ctrl) => self.handle_tree_packet(src, ctrl, n),
+                Some(ctrl) => {
+                    let header = summary.header;
+                    let seqs = (header.min_origin_sequence, header.max_origin_sequence);
+                    self.handle_tree_packet(src, ctrl, n, seqs);
+                }
                 None => self.note_decode_reject(src, &wire::DecodeError::BodyLenMismatch),
             }
         }
@@ -708,6 +721,7 @@ where
                 }
             }
             PeerEvent::Removed(p) => {
+                self.roots.remove(p.addr);
                 if self.ring.remove(p.addr) {
                     tracing::info!(
                         peer = %p.addr,
@@ -797,6 +811,7 @@ where
     }
 }
 
+mod pull;
 mod tree;
 
 enum ArmOutcome {

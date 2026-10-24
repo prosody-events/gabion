@@ -3,17 +3,25 @@
 //! ```text
 //! data: [ 1 ][ root ][ seq u32 ][ lo ][ hi ]      // cells follow in the frame
 //! ack:  [ 2 ][ root ][ seq u32 ]                   // no cells
+//! pull: [ 3 ][ after u64 ][ before u64 ]           // no cells
+//! fill: [ 4 ][ after u64 ][ through u64 ]          // cells follow in the frame
 //! addr: [ 4 ][ ip 4 ][ port u16 ]  |  [ 6 ][ ip 16 ][ port u16 ]
 //! ```
 //!
 //! `(root, seq)` names one broadcast. `[lo, hi)` is the clockwise interval of
 //! the sorted ring the receiver becomes responsible for; `hi` is excluded,
 //! and for the outermost ranges it is the root itself.
+//!
+//! A pull asks the receiver for its own cells with an origin sequence
+//! strictly between `after` and `before`; the fill that answers carries them
+//! from just after `after` up to and including `through`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
+const KIND_PULL: u8 = 3;
+const KIND_FILL: u8 = 4;
 const ADDR_V4: u8 = 4;
 const ADDR_V6: u8 = 6;
 
@@ -33,6 +41,14 @@ pub(in crate::gossip) enum Ctrl {
     Ack {
         root: SocketAddr,
         seq: u32,
+    },
+    Pull {
+        after: u64,
+        before: u64,
+    },
+    Fill {
+        after: u64,
+        through: u64,
     },
 }
 
@@ -57,6 +73,22 @@ impl Ctrl {
                 buf[at..at + 4].copy_from_slice(&seq.to_le_bytes());
                 at += 4;
             }
+            Ctrl::Pull { after, before: end }
+            | Ctrl::Fill {
+                after,
+                through: end,
+            } => {
+                buf[at] = if matches!(self, Ctrl::Pull { .. }) {
+                    KIND_PULL
+                } else {
+                    KIND_FILL
+                };
+                at += 1;
+                for n in [after, end] {
+                    buf[at..at + 8].copy_from_slice(&n.to_le_bytes());
+                    at += 8;
+                }
+            }
         }
         &buf[..at]
     }
@@ -64,6 +96,19 @@ impl Ctrl {
     /// Decode an extension; `None` if it is malformed or has trailing bytes.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let (&kind, rest) = bytes.split_first()?;
+        if let KIND_PULL | KIND_FILL = kind {
+            let (after, rest) = rest.split_first_chunk::<8>()?;
+            let (end, rest) = rest.split_first_chunk::<8>()?;
+            let (after, end) = (u64::from_le_bytes(*after), u64::from_le_bytes(*end));
+            return rest.is_empty().then_some(if kind == KIND_PULL {
+                Ctrl::Pull { after, before: end }
+            } else {
+                Ctrl::Fill {
+                    after,
+                    through: end,
+                }
+            });
+        }
         let (root, rest) = get_addr(rest)?;
         let (seq, rest) = rest.split_first_chunk::<4>()?;
         let seq = u32::from_le_bytes(*seq);

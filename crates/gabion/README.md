@@ -100,6 +100,23 @@ gabion:
   acknowledgement. Only a node's own changes are broadcast: the root tracks a
   watermark over its local dirty ring (`visit_local_dirty_after`) and cells it
   receives are forwarded on receipt, not re-queued.
+- *Missed broadcasts are pulled from their root* (study component
+  `edge-nack`, adapted to Snow's message ids). A root numbers its broadcasts
+  consecutively and each carries the root's own cells, whose origin sequences
+  rise from one broadcast to the next. A node that receives broadcast `b` when
+  the last it saw from that root was `b - 3` knows it missed exactly the root's
+  cells with an origin sequence between the highest it had and the lowest in
+  `b`. After twice the acknowledgement timeout, so the rebroadcast arrives
+  first if it can, it asks the root for that interval (`Pull`); the root, which
+  holds every one of its own cells under the sequence of its latest change,
+  answers one packet at a time from its local dirty ring (`Fill`), and the
+  requester asks again for the rest, or after a timeout (doubling, at most
+  one heartbeat) when no answer comes. The first broadcast from a root opens
+  the gap below it, so a node that joins late pulls each root's live window
+  from that root. The paper stops after the rebroadcast and leaves loss to
+  its anti-entropy; pulling by message id keeps the repair on the tree's own
+  identifiers and puts it on the one node that certainly holds the data.
+  Code: `src/gossip/snow/roots.rs`, `src/gossip/runtime/pull.rs`.
 - *Repair pass.* After the one rebroadcast the paper gives up. gabion keeps an
   anti-entropy backstop for every design: once per heartbeat a rotating slice of
   the cell store goes to one random peer. It is not on the tree path. It also
@@ -122,7 +139,8 @@ gabion:
   over budget) is counted and logged, not discarded silently.
 - *Wire.* `FLAG_EXT` marks a frame whose body begins with a length-prefixed
   control extension (`wire::reframe`, `wire::encode_ext_only`): data
-  `[1][root][seq][lo][hi]`, ack `[2][root][seq]`. Forwarding re-frames the
+  `[1][root][seq][lo][hi]`, ack `[2][root][seq]`, pull `[3][after][before]`,
+  fill `[4][after][through]`. Forwarding re-frames the
   received cell bytes without decoding them. The extension is inside the HMAC.
 - *Scheduler unchanged.* Heartbeat and error-budget threshold rounds are
   `main`'s; a round now roots broadcasts instead of picking peers. The
@@ -134,7 +152,10 @@ gabion:
 
 **Bounded state** (I-4): the relay table holds `GOSSIP_TREE_RELAY_CAPACITY`
 (1024) entries, each with up to 8 children, and overwrites the oldest; the origin table holds
-`GOSSIP_TREE_ORIGIN_CAPACITY` (64) packets and displaces the oldest. Sequence
+`GOSSIP_TREE_ORIGIN_CAPACITY` (64) packets and displaces the oldest; the
+per-root log holds one entry per root up to the node dictionary capacity (the
+root heard from longest ago is forgotten when full), each with at most 8
+gaps, and drops a root when discovery removes it. Sequence
 numbers start from the node's seeded RNG so a restarted node does not collide
 with entries peers still hold. Randomness is only the repair peer pick and that
 seed.

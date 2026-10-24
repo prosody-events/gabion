@@ -40,7 +40,7 @@ where
         }
     }
 
-    fn branching(&self) -> usize {
+    pub(super) fn branching(&self) -> usize {
         self.tree.branching
     }
 
@@ -49,7 +49,7 @@ where
     /// whole broadcasts when that is longer (see [`RttEstimator`]).
     ///
     /// [`RttEstimator`]: crate::gossip::snow::RttEstimator
-    fn ack_timeout_ms(&self) -> u64 {
+    pub(super) fn ack_timeout_ms(&self) -> u64 {
         let height = tree_height(self.ring.len(), self.branching());
         let expected = self
             .rtt
@@ -192,11 +192,12 @@ where
                 self.send_to_child_from_origin(idx, child);
             }
         }
+        self.pull_due(now);
     }
 
     /// A tree packet could not be queued: every send buffer was in use, or
     /// the frame did not fit `max_payload_bytes`.
-    fn note_send_dropped(&mut self, dst: SocketAddr) {
+    pub(super) fn note_send_dropped(&mut self, dst: SocketAddr) {
         self.send_dropped_total = self.send_dropped_total.saturating_add(1);
         if self.send_dropped_total.is_power_of_two() {
             tracing::warn!(
@@ -237,22 +238,31 @@ where
     // -- receiving ----------------------------------------------------------
 
     /// A frame with a control extension arrived from `src`; its cells are
-    /// already merged. `n` is the frame length in `recv_buf`.
-    pub(super) fn handle_tree_packet(&mut self, src: SocketAddr, ctrl: Ctrl, n: usize) {
+    /// already merged. `n` is the frame length in `recv_buf`, `seqs` the
+    /// lowest and highest origin sequence of its cells.
+    pub(super) fn handle_tree_packet(
+        &mut self,
+        src: SocketAddr,
+        ctrl: Ctrl,
+        n: usize,
+        seqs: (u64, u64),
+    ) {
         match ctrl {
-            Ctrl::Data { root, seq, lo, hi } => self.on_data(src, root, seq, lo, hi, n),
+            Ctrl::Data { root, seq, lo, hi } => self.on_data(src, (root, seq), lo, hi, n, seqs),
             Ctrl::Ack { root, seq } => self.on_ack(src, root, seq),
+            Ctrl::Pull { after, before } => self.serve_pull(src, after, before),
+            Ctrl::Fill { after, through } => self.on_fill(src, after, through),
         }
     }
 
     fn on_data(
         &mut self,
         src: SocketAddr,
-        root: SocketAddr,
-        seq: u32,
+        (root, seq): (SocketAddr, u32),
         lo: SocketAddr,
         hi: SocketAddr,
         n: usize,
+        seqs: (u64, u64),
     ) {
         if root == self.ring.me() {
             return;
@@ -281,6 +291,10 @@ where
             return;
         }
 
+        let now = self.clock.now_millis();
+        let due = now + self.pull_grace_ms();
+        self.roots.broadcast(root, seq, seqs, now, due);
+
         let k = self.branching();
         let mut children = Children::new();
         self.ring.children(lo, hi, k, &mut children);
@@ -292,7 +306,7 @@ where
             children: children.clone(),
             acked: 0,
             done: leaf,
-            sent_ms: self.clock.now_millis(),
+            sent_ms: now,
             resent: false,
         });
         if leaf {
