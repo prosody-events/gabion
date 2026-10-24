@@ -2,11 +2,14 @@
 """Figures and the verdict table for study/report.md.
 
 Reads only the data snapshot in study/data/ (posterior.json, self_posterior.json,
-metrics.json, regimes.json, arms.json) and writes PNGs plus verdicts.csv next to
-this file. Every estimate is drawn with its 95 % equal-tailed credible interval
-as reported by the harness judge (crates/gossip-bench/judge/judge.py).
+metrics.json, regimes.json, arms.json) and writes PNGs plus verdicts.csv,
+fronts.csv, az_hier_fronts.csv and perkey_by_regime.csv next to this file. Every
+estimate is drawn with its 95 % equal-tailed credible interval as reported by the
+harness judge (crates/gossip-bench/judge/judge.py).
 
     python3 study/figures/make_figures.py
+
+Requires matplotlib (tested with Python 3.11 and matplotlib 3.10).
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ POST = json.loads((DATA / "posterior.json").read_text())
 SELF = json.loads((DATA / "self_posterior.json").read_text())
 METRICS = json.loads((DATA / "metrics.json").read_text())
 ARMS = json.loads((DATA / "arms.json").read_text())
+GROUP = {r["regime"]: r["group"] for r in json.loads((DATA / "regimes.json").read_text())}
 
 IDX = {(r["solution"], r["regime"], r["metric"]): r for r in POST}
 SIDX = {(r["comparison"], r["solution"], r["regime"], r["metric"]): r for r in SELF}
@@ -38,6 +42,8 @@ REGIMES = ["low-3", "low-5", "idle", "prod-typical", "prod-peak", "prod-4x", "lo
            "loss-20", "loss-burst", "hot-key", "churn-rollout", "az-partition", "long-window"]
 DESIGNS = [a["arm"] for a in ARMS if a["improved"]]  # main + 10 designs, in arms.json order
 FAMILY = {a["arm"]: a["family"] for a in ARMS}
+FRONT_METRICS = ("stale_limited_p99_pct", "over_max_pct", "conv_p99_incl_never_ms")
+REFERENCE = "imp-az-hier-nopk"  # the comparator of self_posterior.json's vs_reference rows
 
 # Okabe-Ito hues, one per design family (validated for CVD separation with the
 # dataviz palette checker); marker shape is the secondary encoding per design.
@@ -327,32 +333,129 @@ def fig_bytes_by_regime() -> None:
     plt.close(fig)
 
 
-def write_fronts() -> None:
-    """fronts.csv: the non-dominated solutions on (bytes, error metric), by
-    posterior median, within the baseline set and within the improved set (no
-    per-key tips plus imp-owner-agg), per regime. Every seed is valid for every
-    solution, so the means rest on the same three workloads."""
-    sets = {
+def improved_tips() -> list[str]:
+    """The improved tips without the per-key fix, plus imp-owner-agg."""
+    return [("imp-main-nopk" if a == "main" else nopk(a)) for a in DESIGNS]
+
+
+def front(sols: list[str], reg: str, cost: str, m: str) -> list[tuple[str, float, float]]:
+    """Solutions not dominated on (cost, error metric m) by posterior median."""
+    pts = [(s, IDX[(s, reg, cost)]["mean"], IDX[(s, reg, m)]["mean"])
+           for s in sols if IDX.get((s, reg, m)) and IDX[(s, reg, m)]["mean"] is not None]
+    return [p for p in pts if not any(
+        q[1] <= p[1] and q[2] <= p[2] and (q[1] < p[1] or q[2] < p[2]) for q in pts)]
+
+
+def front_sets() -> dict[str, list[str]]:
+    tips = improved_tips()
+    return {
         "baseline": DESIGNS,
-        "improved": [("imp-main-nopk" if a == "main" else nopk(a)) for a in DESIGNS],
+        "improved": tips,
+        "improved-excl-owner-agg": [s for s in tips if s != "imp-owner-agg"],
     }
+
+
+def write_fronts() -> None:
+    """fronts.csv: the non-dominated solutions on (cost, error metric), by
+    posterior median, per regime, for three sets: the baselines, the improved
+    tips (no per-key fix, plus imp-owner-agg), and the improved tips without
+    owner aggregation. The cost is total bytes or cross-zone bytes. Every seed is
+    valid for every solution, so the medians rest on the same three workloads."""
     with open(HERE / "fronts.csv", "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["set", "regime", "metric", "solution", "bytes_total", "value"])
-        for name, sols in sets.items():
-            for m in ("stale_limited_p99_pct", "over_max_pct", "conv_p99_incl_never_ms"):
-                for reg in REGIMES:
-                    pts = [(s, IDX[(s, reg, "bytes_total")]["mean"], IDX[(s, reg, m)]["mean"])
-                           for s in sols if IDX.get((s, reg, m)) and IDX[(s, reg, m)]["mean"] is not None]
-                    front = [p for p in pts if not any(
-                        q[1] <= p[1] and q[2] <= p[2] and (q[1] < p[1] or q[2] < p[2]) for q in pts)]
-                    for s, b, v in sorted(front, key=lambda p: p[1]):
-                        w.writerow([name, reg, m, s, f"{b:.6g}", f"{v:.6g}"])
+        w.writerow(["set", "cost", "regime", "metric", "solution", "cost_value", "value"])
+        for name, sols in front_sets().items():
+            for cost in ("bytes_total", "cross_az_bytes"):
+                for m in FRONT_METRICS:
+                    for reg in REGIMES:
+                        for s, b, v in sorted(front(sols, reg, cost, m), key=lambda p: p[1]):
+                            w.writerow([name, cost, reg, m, s, f"{b:.6g}", f"{v:.6g}"])
+
+
+def paired(sol: str, reg: str, m: str) -> str:
+    """A vs_reference comparison as 'ratio [lo, hi] P p' or 'Δ d [lo, hi] P p'."""
+    r = SIDX.get(("vs_reference", sol, reg, m))
+    if r is None or r.get("scale") is None:
+        return ""
+    p = "" if r["p_better"] is None else f" P {r['p_better']:.3f}"
+    if r["scale"] == "log":
+        if r["ratio_lo"] is None:
+            return f"{r['ratio']:.3g}{p}"
+        return f"{r['ratio']:.3g} [{r['ratio_lo']:.3g}, {r['ratio_hi']:.3g}]{p}"
+    if r["diff_lo"] is None:
+        return f"Δ {r['diff_mean']:.3g}{p}"
+    return f"Δ {r['diff_mean']:.3g} [{r['diff_lo']:.3g}, {r['diff_hi']:.3g}]{p}"
+
+
+def write_az_hier_fronts() -> None:
+    """az_hier_fronts.csv: for every regime, error metric, improved set (with and
+    without owner aggregation) and cost (total or cross-zone bytes), whether the
+    recommended tip is on the posterior-median front, and if not, each tip that
+    dominates it, with that tip's paired comparison against it on the cost and
+    on the error metric (vs_reference rows: ratio or Δ, 95 % CrI, P = posterior
+    probability that the dominating tip is better) and the §4.6 verdict class."""
+    sets = {k: v for k, v in front_sets().items() if k != "baseline"}
+    with open(HERE / "az_hier_fronts.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["family", "regime", "metric", "set", "cost", "on_front", "dominated_by",
+                    "cost_vs_az_hier", "cost_verdict", "error_vs_az_hier", "error_verdict"])
+        for reg in sorted(REGIMES, key=lambda r: ("Scale", "Faults", "Dynamics").index(GROUP[r])):
+            for m in FRONT_METRICS:
+                if IDX.get((REFERENCE, reg, m), {}).get("mean") is None:
+                    continue
+                for name, sols in sets.items():
+                    for cost in ("bytes_total", "cross_az_bytes"):
+                        pts = {s: (IDX[(s, reg, cost)]["mean"], IDX[(s, reg, m)]["mean"]) for s in sols
+                               if IDX.get((s, reg, m)) and IDX[(s, reg, m)]["mean"] is not None}
+                        az = pts[REFERENCE]
+                        dom = [s for s, q in pts.items() if q[0] <= az[0] and q[1] <= az[1] and q != az]
+                        row = [GROUP[reg], reg, m, name, cost, "yes" if not dom else "no"]
+                        if not dom:
+                            w.writerow(row + ["", "", "", "", ""])
+                        for s in sorted(dom, key=lambda s: pts[s][0]):
+                            ref_cost = IDX[(REFERENCE, reg, cost)]["mean"]
+                            ref_err = IDX[(REFERENCE, reg, m)]["mean"]
+                            w.writerow(row + [s, paired(s, reg, cost),
+                                              verdict(SIDX.get(("vs_reference", s, reg, cost)), ref_cost) or "",
+                                              paired(s, reg, m),
+                                              verdict(SIDX.get(("vs_reference", s, reg, m)), ref_err) or ""])
+
+
+def write_perkey_by_regime() -> None:
+    """perkey_by_regime.csv: the per-key fix alone (imp-<arm> against
+    imp-<arm>-nopk) per regime and metric: the range of posterior-median ratios
+    over the arms other than Plumtree (whose relay rounds carry local changes
+    whatever the trigger), Plumtree's ratio, and how many of the ten arms are
+    credibly worse (P <= 0.05) and credibly better (P >= 0.95)."""
+    metrics = ["bytes_total", "stale_limited_p99_pct", "over_max_pct", "conv_p50_incl_never_ms",
+               "conv_never_frac", "part_time_to_heal_ms"]
+    arms = [next(x for x in ARMS if x["arm"] == a)["improved"] for a in DESIGNS
+            if next(x for x in ARMS if x["arm"] == a)["improved_nopk"]]
+    with open(HERE / "perkey_by_regime.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["family", "regime", "metric", "ratio_min_excl_plumtree", "ratio_max_excl_plumtree",
+                    "plumtree_ratio", "arms_compared", "arms_worse", "arms_better"])
+        for reg in sorted(REGIMES, key=lambda r: ("Scale", "Faults", "Dynamics").index(GROUP[r])):
+            for m in metrics:
+                rows = {a: SIDX.get(("perkey_effect", a, reg, m)) for a in arms}
+                rows = {a: r for a, r in rows.items() if r and r.get("scale")}
+                if not rows:
+                    continue
+                ratios = [r["ratio"] for a, r in rows.items() if r["scale"] == "log" and a != "imp-plumtree"]
+                pt = rows.get("imp-plumtree")
+                worse = sum(1 for r in rows.values() if r["p_better"] is not None and r["p_better"] <= 0.05)
+                better = sum(1 for r in rows.values() if r["p_better"] is not None and r["p_better"] >= 0.95)
+                w.writerow([GROUP[reg], reg, m,
+                            f"{min(ratios):.3g}" if ratios else "", f"{max(ratios):.3g}" if ratios else "",
+                            f"{pt['ratio']:.3g}" if pt and pt["scale"] == "log" else "",
+                            len(rows), worse, better])
 
 
 if __name__ == "__main__":
     write_verdicts()
     write_fronts()
+    write_az_hier_fronts()
+    write_perkey_by_regime()
     fig_tradeoff()
     fig_own_baseline()
     fig_perkey()

@@ -1,0 +1,97 @@
+[
+ {
+  "kind": "harness",
+  "result": {
+   "branch": "sim/harness",
+   "sha": "fdf7390ed761484b87dd9eb5f90bf7da73d4f46c",
+   "tree_hash": "8fb4e2dde6e9fb13f7cc0da30f5f6557efd87dc5",
+   "pushed": true,
+   "summary": "Pushed sim/harness as a fast-forward from 6304bde to fdf7390 (one commit). The audit's one major and both minors are fixed.\n\nMajor, expiry at the heal charged as unrepaired. note_unrepaired_expiry in oracle.rs now ignores a bucket that leaves the window at or before the heal instant (the guard changed from `<` to `<=`). That bucket had no time to be repaired, and heal_deficit already excludes it, so the two now agree. Only buckets still in the window after the heal are owed repair.\n- az-partition, main, seed 1: unrepaired_at_expiry_hits is now 0.0019 (the audit's 31 hits), down from 0.279. deficit_at_heal_hits is unchanged at 2.38. time_to_heal_ms is still null, now for a real reason: main loses those 31 hits to expiry before the repair finishes. Under the old accounting 99.3% of the unrepaired figure was the bucket expiring at the heal.\n- New oracle test a_bucket_expiring_at_the_heal_is_not_owed_repair puts the heal on a bucket boundary. The bucket expiring at the heal lacks a far hit, and the in-window debt is repaired 200 ms later. It reports time_to_heal 200 ms and unrepaired 0. I checked it discriminates: with the old guard it fails, along with partition_run_reports_phases_and_heals.\n\nMinor, non-discriminating run tests. partition_run_reports_phases_and_heals now asserts unrepaired == 0 and that a heal is timed, instead of restating the healed() rule. The loss = 1.0 test now asserts unrepaired > 0, which comes from buckets still in the window after the heal. I left `sides >= 2 * converged` as it was.\n\nMinor, test_matrix.py. The `__main__` guard now sits at the end of the file, so running it directly runs all 3 tests.\n\nMinor, README epidemic caveat. The README and the SIGMAS doc now say the epidemic check's expected value is approximate (off by about 0.008, about 1.2 s.e.), so its false-alarm rate is nearer 1 in 1,000. The check is described as an end-to-end delivery and event-loop sanity check, not a test of the network model.\n\nHousekeeping: cargo clean was run in the worktree; 177 GB free. Nothing else was touched.",
+   "tests": "`cargo nextest run --release -p gabion -p gossip-bench`: 202 passed, 1 skipped (the ignored kubernetes discovery test). `cargo nextest run --release -p gossip-bench --no-default-features`: 48 passed. `python3 -m unittest discover -s crates/gossip-bench/judge`: 15 tests OK. `python3 test_matrix.py` run directly from judge/: 3 tests OK. `cargo +nightly fmt --check` and `cargo clippy --release -p gossip-bench --all-targets -- -D warnings` are clean.",
+   "validation_results": "Smoke run: `python3 crates/gossip-bench/judge/matrix.py --solution main --regimes low-3,az-partition --seeds 1 --jobs 2 --out <scratch>/study-smoke-3c`, run on the committed tree (harness tree hash 8fb4e2dde6e9). low-3 seed 1 was valid (0.5 s wall, 39 MiB RSS). az-partition seed 1 was valid (23.3 s wall, 1,228 MiB RSS). The az-partition partition block is zone_az 0, at_s 40, heal_s 70, deficit_at_heal_hits 2.383, unrepaired_at_expiry_hits 0.0019, time_to_heal_ms null."
+  },
+  "audit_verdict": "pass",
+  "open_serious": [],
+  "minors": [
+   {
+    "severity": "minor",
+    "where": "crates/gossip-bench/src/harness/driver.rs:229-233 with oracle.rs heal_deficit / note_unrepaired_expiry",
+    "problem": "Correctness depends on event tie order. When a heal probe and a bucket boundary fall on the same instant, the probe must run after BucketBoundary, or the expiring bucket is already outside heal_deficit's window (oldest is taken from bucket_of(now_millis)) but has not yet been charged by note_unrepaired_expiry. The probe then sees missing == 0 with unrepaired == 0 and records a heal, so expiry gets scored as repair. With bucket_ms <= 100 ms, the probe for T is scheduled at T-100ms, no earlier than BucketBoundary's T-bucket_ms, so it runs first (seq order, world.rs:77). This is latent: every shipped regime uses bucket_ms >= 1000, and validate() allows any bucket_ms > 0.",
+    "evidence": "Reasoning from the scheduling code: HealSample reschedules at now+HEAL_PROBE_NS (driver.rs:231), BucketBoundary at now+bucket_ms (driver.rs:221), and ties pop by (at_ns, seq). The first probe at heal_ns is the only tie handled explicitly, by the `now_ns <= heal_ns` guard.",
+    "fix": "Make the probe independent of order. Either compute heal_deficit's oldest bucket from the oracle's last processed boundary rather than bucket_of(now_millis), or call note_unrepaired_expiry from heal_sample for any bucket that has slid out since the last boundary. Alternatively, reject bucket_ms not a multiple of HEAL_PROBE_NS or below it. Add a test with bucket_ms = 50."
+   },
+   {
+    "severity": "minor",
+    "where": "crates/gossip-bench/README.md Partition phases bullet; oracle.rs heal_deficit/missing_in",
+    "problem": "The README calls time to heal 'every cross-cut count exact'. The code counts every hit (same-side, pre-cut, and in-flight at the heal) in every bucket closed before the heal, at every pod running at the heal, against truth. Hits admitted before a pod started (a pod that joined mid-cut) count too. So deficit_at_heal and unrepaired include ordinary steady-state propagation lag, not only partition damage. For main on az-partition this makes time_to_heal null over 31 hits, about 1 s after the heal. Any solution whose steady-state convergence tail approaches the window (main's before-cut same-side p99 is 7.4 s against a 10 s window) is likely to report null whatever its repair quality, so the metric may not separate solutions.",
+    "evidence": "az-partition seed 1, new run: before.convergence.same_side.p99_incl_never_ms = 7414; unrepaired_at_expiry_hits 0.0019 (about 31 hits); time_to_heal_ms null. missing_in uses truth = all admits in the slot minus peak_view, with no side or start-time filter.",
+    "fix": "Correct the README wording ('every count of a bucket closed before the heal exact, including same-side and in-flight hits'). Consider restricting the debt to cross-side admissions (admits[other side]) and to hits admitted after the pod started, or report time-to-heal for a tolerance as well as for exactness."
+   },
+   {
+    "severity": "minor",
+    "where": "crates/gossip-bench/judge/judge.py cell()/partition table (part_time_to_heal_ms)",
+    "problem": "Time to heal is averaged over only the seeds that healed, but summary.md does not show how many seeds that was. A solution that healed 1 of 10 seeds quickly reads better, and gets a better ratio, than one that healed 10 of 10 somewhat slower. The unrepaired row only hints at this.",
+    "evidence": "cell() prints mean ± ci [min–max] (×ratio). stats['n'] is computed but never shown, and the label only says 'seeds that healed only'.",
+    "fix": "Show 'healed n/k' in the time-to-heal cell, for example by passing stats['n'] and the valid-seed count, or add a 'seeds healed' row."
+   },
+   {
+    "severity": "minor",
+    "where": "crates/gossip-bench/README.md Validation intro and section 1; validation/tests.rs SIGMAS doc",
+    "problem": "The stated false-alarm rate of the epidemic check is too optimistic. A bias of 1.2–1.4 s.e. inside a 4 s.e. band gives P ≈ 0.0026–0.0035 per check (about 1 in 300–400), not 'nearer 1 in 1,000'. At n=300, c=0 the finite-n approximation is off by about 0.010 (1.4 s.e.), not 0.008.",
+    "evidence": "Independent Python simulation (scratch audit-fdf7390/py/epi.py): n=300, c=0 gives 0.3795 ± 0.0049 against finite-n 0.3894; n=100, c=0 gives 0.4044 ± 0.0025 against 0.4121. P(Z > 4 - 1.3) ≈ 0.0035.",
+    "fix": "State about 1 in 300 per check, or widen the band to about 5 s.e., or compare against a higher-trial reference value instead of the Poisson approximation."
+   },
+   {
+    "severity": "minor",
+    "where": "crates/gossip-bench/src/harness/oracle.rs ConvSlot::need / advance (whole-run convergence when a partition is scheduled)",
+    "problem": "With a partition scheduled, the side-ranked conservative bound applies to whole-run convergence for the entire run, before the cut and after the heal included. az-partition's headline convergence is therefore defined more strictly than in every other regime: on the same seed, never_fraction rises from 0.280 to 0.336 and p50 from 4.85 s to 5.03 s. The README documents this, but cross-regime comparison of convergence is not like-for-like.",
+    "evidence": "Diff of old vs new az-partition seed 1: convergence.converged 6098->5617, never_converged 2372->2839, p50_ms 4849.9->5033.5. Every other non-partition field is identical.",
+    "fix": "Either keep the plain count-based whole-run convergence (groups = 1) and apply side ranking only in the per-phase report, or flag in the judge summary that az-partition convergence uses the conservative definition."
+   }
+  ]
+ },
+ {
+  "kind": "thicket",
+  "result": {
+   "branch": "sim/sol-thicket",
+   "sha": "7ece5f28e584cfd5b2e16c4dc5a2a5167303990e",
+   "tree_hash": "6995a446671d6f34a707c7d1da9c85d293296792",
+   "pushed": true,
+   "summary": "Fixed the MAJOR issue: Thicket parents and backbone views are no longer first-come.\n\n- **Sampling.** `Thicket::place_new` reservoir-samples each discovered peer. A peer of another class replaces that tree's parent with probability 1/k, and a class-mate replaces a random view member with probability view/mates. `fill_view` then tops the view up at random. The new `peer_added` in `repair.rs` sends a detach PRUNE to a replaced parent and attaches to the new one.\n- **Leaf cap.** An interior node takes at most max(`THICKET_LEAF_CHILDREN_MIN`=8, 2 x the even share of known leaves per interior node), a new constant in `defaults.rs`. Past that it refuses the attach with a PRUNE, and the leaf picks another parent via `choose_parent`, avoiding the refuser. The cap rises with lopsided classes so a tree with one interior node still takes every leaf.\n- **Minor (a), done.** On a duplicate eager delivery the receiver also sets the sender lazy locally for that root. A first (non-duplicate) delivery from a view member sets it eager, as in Plumtree Algorithm 1.\n- **Minor (b), done.** The README Design notes now document the leaf attach and its per-heartbeat repeat as an adaptation with the reason, and the PRUNE refusal. I reused GRAFT and PRUNE rather than adding a control kind. The Trees, PRUNE and no-re-parenting notes are corrected, and the parameter table has the new constant.\n- **New test.** `parents_and_views_are_spread_when_discovery_orders_the_peers` builds 80 nodes with addresses 10.<i%3>.0.<i>:7946, delivers Added in index order, and attaches parents under the cap with refusal and redirect. It asserts every leaf has a parent, no node is over its cap, at least half of each tree's interior nodes have a child, at most 4 nodes are in no view, and no node is in more than 3x the mean number of views. A second test covers the cap, refusal and redirect on their own.\n- **Measured spread.** Of 80 nodes, 20 to 24 distinct parents per tree (the probe had 3). The largest child count is 6. All 80 nodes appear in some view, with a busiest node in 12 views against a mean of 7 (the probe had only 57/80 in any view).\n\nSmoke run on `matrix.py --solution thicket` with regimes low-3, low-5, prod-typical, prod-peak, seed 1: all VALID with no flags. The max send-queue depth at prod-peak is 197 of the 512 capacity. The other regimes were 13 (low-3), 18 (low-5) and 93 (prod-typical). Smoke output is in <scratch>/study-smoke. Pushed to sim/sol-thicket. I ran `cargo clean` in the worktree, and `crates/gossip-bench` is unchanged.",
+   "tests": "`cargo nextest run --release -p gabion -p gossip-bench`: 216 run, 216 passed, 1 skipped. `cargo +nightly fmt` clean, and `cargo clippy --release -p gabion --all-targets -D warnings` clean.",
+   "validation_results": "All 4 smoke runs VALID, no flags. Max send-queue depth: low-3 13, low-5 18, prod-typical 93, prod-peak 197 (capacity 512)."
+  },
+  "audit_verdict": "pass",
+  "open_serious": [],
+  "minors": [
+   {
+    "severity": "minor",
+    "where": "crates/gabion/src/gossip/runtime/repair.rs on_graft -> thicket.rs view_add; crates/gabion/README.md Mechanism item 2",
+    "problem": "Backbone views grow past the documented target ⌈ln m + c⌉ and never shrink back. Every own-tree GRAFT from a class-mate adds it to the view permanently, and every newly added member is made eager for every root. Views therefore drift toward THICKET_VIEW_CAPACITY=32, which inflates duplicate and PRUNE churn. This departs from Plumtree/Thicket, where a GRAFT only moves a peer from lazy to eager inside a fixed-size active view.",
+    "evidence": "prod-peak (target 8): mean view size rose from about 10 at 2 s to 16.6, 19.9 and 15.5 per tree by 72 s, with a max of 29, and was still rising. prod-typical rose from 9.8 to 11.3; churn-rollout reached 17-19.6.",
+    "fix": "Bound view_add at view_target. On a GRAFT into a full view, evict a random member, or reply without adding the grafter to the view. Alternatively, document the drift and its bound."
+   },
+   {
+    "severity": "minor",
+    "where": "repair.rs announce/handle_inbound queue_lazy (Eager/Local only); graft_for (no leaf re-parent); THICKET_REPAIR_CELLS rotation",
+    "problem": "Changes that miss a node are often never recovered within the 10 s window. Three mechanisms combine: (1) IHAVE is one-shot, sent once by each holder to 2 random known peers. A joiner is known by few peers during the U(0,2s) discovery lag, so it gets few IHAVEs and no eager pushes. (2) Cells pulled by GRAFT are neither re-announced nor relayed at leaves. A leaf whose parent crashed silently has its own changes in that tree black-holed for about 10 s, reaching only the 2 IHAVE receivers. (3) A repair-slice rotation takes cells/256 × 0.5 s, about 15-40 s, which is longer than the window. These are documented adaptations, but the cost is large.",
+    "evidence": "churn-rollout seed 1: never_fraction 4.8% (369 hits, against 0.06% for main), p99_incl_never 9.7 s. A temporary oracle log showed the misses are single cells missing at single pods, clustered at 30-60 s (rollout) and 75-85 s (crash). The lagging pods are mostly joiners 1-2 s after start (e.g. pod 86, started at 33.05 s, missing hits at 34.1-34.9 s) plus a few established pods. 111 GRAFT give-ups and 208 NACK give-ups. Announcing pulled cells as well only reduced the count to 318.",
+    "fix": "Have the 2 IHAVE receivers re-announce cells they pull, so announcements spread epidemically. Re-parent a leaf after repeated missing timeouts in a tree whose parent is silent. Or size the repair cadence so a rotation fits inside one window."
+   },
+   {
+    "severity": "minor",
+    "where": "repair.rs begin_catch_up (called on the first PeerEvent::Added)",
+    "problem": "Catch-up does not ask a random peer, as the README says. It is triggered on the first Added event, when only one peer is known, so a joiner always pulls from the first-discovered peer. In the harness that is the lowest-index surviving pod, which is also the next pod the rollout stops. That pod usually has not learned of the joiner yet, so it ignores the Pull and the joiner waits for 500 ms retries.",
+    "evidence": "churn-rollout joiner t95 values are multiples of about 500 ms (513, 1014, 1553, 2047 ms), and t99_max is 19.6 s.",
+    "fix": "Start catch-up after the initial discovery batch, or choose the Pull target at the first heartbeat, so it is uniform over the known membership. Correct the README."
+   },
+   {
+    "severity": "minor",
+    "where": "branch base",
+    "problem": "sim/harness has moved from a17747d to 5d747fb (crates/gossip-bench tree 2f983dc). sim/sol-thicket is still based on a17747d (tree 6995a44). The judge refuses mixed harness hashes, so this branch must be rebased before it is compared with solutions built on the new harness.",
+    "evidence": "`git ls-remote` shows refs/heads/sim/harness at 5d747fb9; `git rev-parse 5d747fb:crates/gossip-bench` gives 2f983dcde8eb.",
+    "fix": "Rebase onto the current sim/harness before the final matrix runs."
+   }
+  ]
+ }
+]
