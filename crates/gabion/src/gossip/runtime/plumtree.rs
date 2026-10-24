@@ -233,6 +233,8 @@ pub(super) struct Plumtree {
     relay: Vec<Queued>,
     queue_capacity: usize,
     overflow_total: u64,
+    /// Frames the full send queue cut short or dropped.
+    send_cut_total: u64,
     relay_due: Option<u64>,
     missing: Vec<Missing>,
     /// Earliest time a missing-announcement or NACK timer may fire.
@@ -335,6 +337,7 @@ impl Plumtree {
             relay: Vec::with_capacity(queue_capacity),
             queue_capacity,
             overflow_total: 0,
+            send_cut_total: 0,
             relay_due: None,
             missing: Vec::with_capacity(nodes),
             deadline: None,
@@ -1478,64 +1481,93 @@ where
     /// slots allow, and return how many of the cells went out; cells that do
     /// not fit are left to the IHAVE and repair digests.
     fn send_cells(&mut self, dst: SocketAddr, kind: FrameKind, numbering: Numbering) -> usize {
-        let header = self.header(kind.flags());
-        let packets = match self.config.auth_key.as_ref() {
-            Some(key) => Packets::<C>::auth(
-                header,
-                &self.store,
-                &self.frame_handles,
-                key,
-                &mut self.scratch,
-                self.config.wire_limits,
-            ),
-            None => Packets::<C>::unauth(
-                header,
-                &self.store,
-                &self.frame_handles,
-                &mut self.scratch,
-                self.config.wire_limits,
-            ),
-        };
-        let Ok(mut packets) = packets else {
-            return 0;
-        };
-        let peer = self.peers.iter().position(|p| p.addr == dst);
-        let mut resend = match numbering {
-            Numbering::Resend(number) => Some(number),
-            _ => None,
-        };
-        let mut cursor = 0;
-        while packets.remaining() > 0 {
-            let Some(slot) = self.send_free.pop() else {
-                break;
+        let (cursor, cut) = {
+            let header = self.header(kind.flags());
+            let packets = match self.config.auth_key.as_ref() {
+                Some(key) => Packets::<C>::auth(
+                    header,
+                    &self.store,
+                    &self.frame_handles,
+                    key,
+                    &mut self.scratch,
+                    self.config.wire_limits,
+                ),
+                None => Packets::<C>::unauth(
+                    header,
+                    &self.store,
+                    &self.frame_handles,
+                    &mut self.scratch,
+                    self.config.wire_limits,
+                ),
             };
-            let before = packets.remaining();
-            let buf = &mut self.send_pool[slot as usize];
-            let number = match (numbering, peer) {
-                (Numbering::Next, Some(pi)) => Some(self.peers[pi].edge.send_seq + 1),
-                (Numbering::Resend(_), _) => Some(resend.take().unwrap_or(0)),
+            let Ok(mut packets) = packets else {
+                return 0;
+            };
+            let peer = self.peers.iter().position(|p| p.addr == dst);
+            let mut resend = match numbering {
+                Numbering::Resend(number) => Some(number),
                 _ => None,
             };
-            let written = match number {
-                Some(number) => packets.next_into_numbered(buf, number),
-                None => packets.next_into(buf),
-            };
-            if !matches!(written, Ok(Some(_))) {
-                self.send_free.push(slot);
-                break;
+            let mut cursor = 0;
+            let mut cut = false;
+            while packets.remaining() > 0 {
+                let Some(slot) = self.send_free.pop() else {
+                    cut = true;
+                    break;
+                };
+                let before = packets.remaining();
+                let buf = &mut self.send_pool[slot as usize];
+                let number = match (numbering, peer) {
+                    (Numbering::Next, Some(pi)) => Some(self.peers[pi].edge.send_seq + 1),
+                    (Numbering::Resend(_), _) => Some(resend.take().unwrap_or(0)),
+                    _ => None,
+                };
+                let written = match number {
+                    Some(number) => packets.next_into_numbered(buf, number),
+                    None => packets.next_into(buf),
+                };
+                if !matches!(written, Ok(Some(_))) {
+                    self.send_free.push(slot);
+                    break;
+                }
+                let consumed = before - packets.remaining();
+                if let (Numbering::Next, Some(number), Some(pi)) = (numbering, number, peer) {
+                    self.peers[pi].edge.send_seq = number;
+                    self.pt
+                        .sent
+                        .push(dst, number, &self.frame_handles[cursor..cursor + consumed]);
+                }
+                cursor += consumed;
+                self.send_pending.push_back((dst, slot));
             }
-            let consumed = before - packets.remaining();
-            if let (Numbering::Next, Some(number), Some(pi)) = (numbering, number, peer) {
-                self.peers[pi].edge.send_seq = number;
-                self.pt
-                    .sent
-                    .push(dst, number, &self.frame_handles[cursor..cursor + consumed]);
-            }
-            cursor += consumed;
-            self.send_pending.push_back((dst, slot));
+            packets.abandon();
+            (cursor, cut)
+        };
+        if cut {
+            self.note_send_cut(dst, kind, self.frame_handles.len() - cursor);
         }
-        packets.abandon();
         cursor
+    }
+
+    /// A frame to `dst` found the send queue full and lost its tail
+    /// (`cells_unsent` cells, none for a control frame). Warned on
+    /// power-of-two totals.
+    fn note_send_cut(&mut self, dst: SocketAddr, kind: FrameKind, cells_unsent: usize) {
+        self.pt.send_cut_total = self.pt.send_cut_total.saturating_add(1);
+        if self.pt.send_cut_total.is_power_of_two() {
+            tracing::warn!(
+                peer = %dst,
+                frame_kind = ?kind,
+                cells_unsent,
+                send_cut_total = self.pt.send_cut_total,
+                capacity = self.config.send_queue_capacity,
+                "Gossip send queue is full, so part of a message to this peer was not sent. \
+                 Unsent changes stay in this node's store and the IHAVE and repair digests \
+                 deliver them, so the peer may lag by a few seconds. This happens when a large \
+                 catch-up reply or a burst of changes meets a queue that is already full; if it \
+                 keeps happening, raise `gossip.send_queue_capacity`.",
+            );
+        }
     }
 
     /// Encode `entries` as control packets of `kind`. `range` is the edge
@@ -1555,6 +1587,7 @@ where
         let mut sent = 0;
         loop {
             let Some(slot) = self.send_free.pop() else {
+                self.note_send_cut(dst, FrameKind::Control, 0);
                 return;
             };
             let n = wire::encode_control(

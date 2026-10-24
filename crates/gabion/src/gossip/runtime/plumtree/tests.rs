@@ -761,6 +761,29 @@ fn a_reply_stops_at_its_cap_and_the_next_one_picks_up_after_it() {
     assert_eq!(held.last(), Some(&keys));
 }
 
+#[test]
+fn a_frame_the_full_send_queue_cuts_short_is_counted() {
+    let (mut all, _clock) = cluster(2, no_pull());
+    hit(&mut all[0].rt, 1);
+    let handle = all[0].rt.store.active_handles().next().expect("a cell");
+    let b = all[1].addr;
+    let free = std::mem::take(&mut all[0].rt.send_free);
+    all[0].rt.frame_handles.clear();
+    all[0].rt.frame_handles.push(handle);
+    assert_eq!(
+        all[0].rt.send_cells(b, FrameKind::Plain, Numbering::None),
+        0
+    );
+    all[0].rt.send_control(b, ControlKind::Prune, (0, 0), &[]);
+    assert_eq!(all[0].rt.pt.send_cut_total, 2);
+    all[0].rt.send_free = free;
+    assert_eq!(
+        all[0].rt.send_cells(b, FrameKind::Plain, Numbering::None),
+        1
+    );
+    assert_eq!(all[0].rt.pt.send_cut_total, 2);
+}
+
 // -- UDP adaptation: edge numbers, NACK, resend -------------------------------
 
 #[test]
