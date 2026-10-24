@@ -41,7 +41,8 @@ pub const GOSSIP_CLUSTER_ID_HASH: u128 = 1;
 pub const GOSSIP_SYNC_WAIT_MS: u64 = 100;
 
 /// How often a key's owner broadcasts the keys that changed since its last
-/// broadcast, with their whole state, to every peer, in milliseconds
+/// broadcast, as the per-bucket totals of every live bucket, to every peer,
+/// in milliseconds
 /// (`broadcast_interval`). Chosen with [`GOSSIP_SYNC_WAIT_MS`]: a hit reaches
 /// every peer within about one sync wait plus one broadcast interval.
 pub const GOSSIP_BROADCAST_INTERVAL_MS: u64 = 100;

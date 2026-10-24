@@ -20,7 +20,8 @@ pub const FLAG_ACK: u16 = 0x08;
 /// kind and fails to parse.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameKind {
-    /// An owner's changed cells, sent to every peer.
+    /// An owner's per-bucket totals of its changed keys, sent to every peer.
+    /// The body is in the totals layout, not the cell layout.
     Broadcast,
     /// A contributor's own cells, sent to the owner of their keys.
     Sync,

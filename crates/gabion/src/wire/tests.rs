@@ -5,7 +5,7 @@ use quickcheck_macros::quickcheck;
 
 use crate::crdt::{
     BucketEpoch, CellHandle, CellStore, CellStoreConfig, Count, DeltaSink, Incarnation, KeyHash,
-    NodeId, NodeIdentity, Observation, ObservationBatch,
+    KeyTotal, NodeId, NodeIdentity, Observation, ObservationBatch, RuleDescriptor,
 };
 
 use super::{
@@ -65,7 +65,7 @@ fn sample_header() -> Header {
         body_len: 0,
         min_origin_sequence: 0,
         max_origin_sequence: 0,
-        flags: 0,
+        flags: FLAG_SYNC,
     }
 }
 
@@ -74,7 +74,7 @@ fn store_with_cap<C: Count>(cells: u32, dicts: u16) -> CellStore<C> {
         CellStoreConfig {
             cell_capacity: cells.max(1),
             rule_dictionary_capacity: dicts.max(1),
-            node_dictionary_capacity: dicts.max(1),
+            node_dictionary_capacity: dicts.max(2),
             local_dirty_capacity: 128,
             forwarded_dirty_capacity: 128,
             peer_capacity: 64,
@@ -85,14 +85,15 @@ fn store_with_cap<C: Count>(cells: u32, dicts: u16) -> CellStore<C> {
 
 /// Build a store, ingest the rows as merge_remote observations (so each
 /// row's origin is its own peer), then return the store + ordered handle
-/// list.
+/// list of those contributor cells.
 fn seed_store<C: Count>(
     rows: &[RawRow],
     to_count: impl Fn(u32) -> C,
 ) -> (CellStore<C>, Vec<CellHandle>) {
     // Size dictionaries to comfortably hold every distinct identity in the
     // fixture.
-    let mut store = store_with_cap::<C>((rows.len() as u32).max(64), 256);
+    // Each row may also raise its bucket's others cell.
+    let mut store = store_with_cap::<C>((2 * rows.len() as u32).max(64), 256);
 
     let mut obs = ObservationBatch::<C>::with_capacity(rows.len());
     let mut sink = DeltaSink::<C>::with_capacity(rows.len());
@@ -108,12 +109,20 @@ fn seed_store<C: Count>(
         });
     }
     store.merge_remote(&obs, &mut sink);
-
-    let mut handles = Vec::with_capacity(store.active_len() as usize);
-    for h in store.active_handles() {
-        handles.push(h);
-    }
+    let handles = contributor_handles(&store);
     (store, handles)
+}
+
+/// The store's cells other than its others cells, in storage order.
+fn contributor_handles<C: Count>(store: &CellStore<C>) -> Vec<CellHandle> {
+    store
+        .active_handles()
+        .filter(|&h| {
+            store
+                .get(h)
+                .is_some_and(|row| row.key.origin != store.others_node_slot())
+        })
+        .collect()
 }
 
 fn cell_set<C: Count>(cells: &[WireCell<C>]) -> std::collections::HashSet<CellKey> {
@@ -356,7 +365,7 @@ fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
         });
     }
     store.merge_remote(&obs, &mut sink);
-    let handles: Vec<CellHandle> = store.active_handles().collect();
+    let handles = contributor_handles(&store);
     (store, handles)
 }
 
@@ -703,6 +712,12 @@ fn frame_kind_survives_encode_and_a_double_kind_is_rejected() {
         last_update_millis: 5,
     }];
     let (store, handles) = seed_store::<u32>(&rows, |c| c);
+    let totals = [KeyTotal {
+        rule: store.find_rule(1).expect("rule"),
+        key_hash: KeyHash(2),
+        bucket: 3,
+        count: 4,
+    }];
     let limits = FrameLimits::default();
     let mut scratch = WireScratch::for_store(&store);
     let mut buf = PacketBuf::for_limits(limits);
@@ -711,8 +726,15 @@ fn frame_kind_survives_encode_and_a_double_kind_is_rejected() {
             flags: kind.flags(),
             ..sample_header()
         };
-        let mut packets =
-            Packets::<u32>::unauth(header, &store, &handles, &mut scratch, limits).expect("ctor");
+        let mut packets = match kind {
+            FrameKind::Broadcast => {
+                Packets::<u32>::totals(header, &store, &totals, None, &mut scratch, limits)
+            }
+            FrameKind::Sync | FrameKind::Ack => {
+                Packets::<u32>::unauth(header, &store, &handles, &mut scratch, limits)
+            }
+        }
+        .expect("ctor");
         packets.next_into(&mut buf).expect("encode").expect("some");
         drop(packets);
         let summary =
@@ -911,4 +933,88 @@ fn visitor_matches_allocating_for_curated_rows() {
         assert_eq!(cell.count, obs.counts[i]);
         assert_eq!(cell.last_update_millis, obs.last_update_millis[i]);
     }
+}
+
+/// A broadcast's totals survive a multi-packet encode, each decoding as a
+/// cell of the sender with the total as its count, and every packet fits the
+/// budget.
+#[test]
+fn totals_round_trip_across_packets() {
+    let mut store = store_with_cap::<u32>(8, 8);
+    let rules: Vec<_> = [0xA1_u128, 0xA2]
+        .iter()
+        .map(|&fingerprint| {
+            store
+                .intern_rule(RuleDescriptor {
+                    fingerprint,
+                    ..RuleDescriptor::default()
+                })
+                .expect("rule")
+        })
+        .collect();
+    let totals: Vec<KeyTotal<u32>> = (0..200_u32)
+        .map(|i| KeyTotal {
+            rule: rules[i as usize % 2],
+            key_hash: KeyHash(0xBEEF + u128::from(i / 3)),
+            bucket: 7 + i % 3,
+            count: 1 + i,
+        })
+        .collect();
+    let limits = FrameLimits {
+        max_payload_bytes: 1400,
+        max_cells: 4096,
+    };
+    let header = Header {
+        flags: FrameKind::Broadcast.flags(),
+        min_origin_sequence: 5,
+        max_origin_sequence: 9,
+        ..sample_header()
+    };
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut packets =
+        Packets::<u32>::totals(header, &store, &totals, None, &mut scratch, limits).expect("ctor");
+    let mut decoded = Vec::new();
+    let mut frames = 0;
+    while packets.next_into(&mut buf).expect("encode").is_some() {
+        frames += 1;
+        assert!(buf.as_bytes().len() <= limits.max_payload_bytes);
+        let summary =
+            decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_| true, |cell| decoded.push(cell))
+                .expect("decode");
+        assert_eq!(
+            FrameKind::from_flags(summary.flags),
+            Some(FrameKind::Broadcast)
+        );
+        assert_eq!(
+            (
+                summary.header.min_origin_sequence,
+                summary.header.max_origin_sequence
+            ),
+            (5, 9)
+        );
+    }
+    assert!(frames > 1, "200 totals must not fit one 1400-byte packet");
+    let expected: Vec<_> = totals
+        .iter()
+        .map(|t| {
+            let fingerprint = store
+                .rule_dictionary()
+                .descriptor(t.rule)
+                .unwrap()
+                .fingerprint;
+            (fingerprint, t.key_hash, t.bucket, t.count)
+        })
+        .collect();
+    let got: Vec<_> = decoded
+        .iter()
+        .map(|c| (c.rule_fingerprint, c.key_hash, c.bucket, c.count))
+        .collect();
+    assert_eq!(got, expected);
+    assert!(
+        decoded
+            .iter()
+            .all(|c| c.origin_node_id == NodeId(header.sender_node_id)
+                && c.origin_incarnation == header.sender_incarnation)
+    );
 }

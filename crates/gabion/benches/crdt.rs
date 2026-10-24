@@ -25,6 +25,12 @@
 //! * `expire/window_turnover`     — one bucket out of four ages out per call;
 //!   the steady-state expiry pattern.
 //! * `expire/no_expirations`      — scan-only cost, no frees.
+//!
+//! * `owner_broadcast/hot_key`    — an owner's per-tick broadcast of one key at
+//!   its limit: gather the per-bucket totals of a key with 10 live buckets and
+//!   10 contributors each, and encode them into 1400-byte packets.
+//! * `owner_broadcast/site_keys`  — the common round: four changed keys of 3
+//!   live buckets and one contributor each.
 
 use std::hint::black_box;
 
@@ -32,7 +38,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 
 use gabion::crdt::{
     BucketEpoch, CellHandle, CellStore, CellStoreConfig, CompactCellKey, DeltaSink, ExpirationSink,
-    Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
+    Incarnation, KeyHash, KeyTotal, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
     RuleDescriptor,
 };
 
@@ -58,7 +64,9 @@ fn obs_row(
         last_update_millis,
     }
 }
-use gabion::wire::{FrameLimits, Header, PacketBuf, Packets, WireScratch, decode_unauth};
+use gabion::wire::{
+    FLAG_SYNC, FrameLimits, Header, PacketBuf, Packets, WireScratch, decode_unauth,
+};
 
 // ---------------------------------------------------------------------------
 // SplitMix64 RNG. Deterministic so iteration order is reproducible.
@@ -1001,7 +1009,7 @@ fn wire_header() -> Header {
         body_len: 0,
         min_origin_sequence: 0,
         max_origin_sequence: 0,
-        flags: 0,
+        flags: FLAG_SYNC,
     }
 }
 
@@ -1126,6 +1134,90 @@ fn bench_wire(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// owner_broadcast — an owner's per-tick gather and encode of changed keys.
+// ---------------------------------------------------------------------------
+
+/// An owner's store: `keys` keys of one rule, each with `buckets` live
+/// buckets holding this node's hits and `contributors` contributors' cells.
+fn owner_store(keys: u128, buckets: u32, contributors: usize) -> (CellStore<u32>, Vec<KeyHash>) {
+    let mut store = CellStore::<u32>::new(config(), local_identity());
+    store
+        .intern_rule(rule_descriptor(rule_fingerprint(0), 0))
+        .expect("rule interned");
+    let key_hashes: Vec<KeyHash> = (0..keys).map(|k| KeyHash(0x5EED_0000 + k)).collect();
+    let mut sink = DeltaSink::<u32>::with_capacity(1);
+    let mut obs = ObservationBatch::<u32>::with_capacity(1);
+    for &key in &key_hashes {
+        for bucket in 0..buckets {
+            obs.clear();
+            obs.push(obs_row(
+                rule_fingerprint(0),
+                key,
+                bucket,
+                LOCAL_NODE,
+                LOCAL_INCARNATION,
+                1,
+                0,
+            ));
+            store.ingest_local(&obs, &mut sink);
+            for peer in 0..contributors {
+                obs.clear();
+                obs.push(obs_row(
+                    rule_fingerprint(0),
+                    key,
+                    bucket,
+                    peer_node(peer),
+                    1,
+                    2,
+                    0,
+                ));
+                store.merge_remote(&obs, &mut sink);
+                sink.clear();
+            }
+        }
+    }
+    (store, key_hashes)
+}
+
+fn bench_owner_broadcast(c: &mut Criterion) {
+    let mut group = c.benchmark_group("crdt/owner_broadcast");
+    let limits = FrameLimits {
+        max_payload_bytes: 1400,
+        max_cells: 4096,
+    };
+    for (name, keys, buckets, contributors) in [("hot_key", 1, 10, 10), ("site_keys", 4, 3, 1)] {
+        let (store, key_hashes) = owner_store(keys, buckets, contributors);
+        let rule = store.find_rule(rule_fingerprint(0)).expect("rule");
+        let mut totals: Vec<KeyTotal<u32>> = Vec::with_capacity(store.capacity() as usize);
+        let mut scratch = WireScratch::for_store(&store);
+        let mut buf = PacketBuf::for_limits(limits);
+        group.throughput(Throughput::Elements(keys as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                totals.clear();
+                for &key in &key_hashes {
+                    totals.extend(store.key_totals(rule, black_box(key)));
+                }
+                let mut packets = Packets::<u32>::totals(
+                    wire_header(),
+                    &store,
+                    &totals,
+                    None,
+                    &mut scratch,
+                    limits,
+                )
+                .expect("ctor");
+                while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
+                    black_box(pkt);
+                    black_box(buf.as_bytes());
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_ingest_local,
@@ -1134,5 +1226,6 @@ criterion_group!(
     bench_admission_headers,
     bench_expire,
     bench_wire,
+    bench_owner_broadcast,
 );
 criterion_main!(benches);

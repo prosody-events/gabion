@@ -8,12 +8,21 @@
 //! totalling 28 bytes instead of the 52-byte AoS struct the previous layout
 //! used.
 //!
-//! Every mutation that raises a stored count appends one row to a
+//! A node's view of a `(rule, key, bucket)` is the sum of two counted cells:
+//! its own hits (origin: the local identity) and its count of every other
+//! node's hits (origin: [`OTHERS`], which never goes on the wire). The others
+//! cell only ever rises, and only to a lower bound of the truth: a key
+//! owner's total less this node's own hits ([`CellStore::merge_totals`]), or,
+//! on the owner, the sum of the per-contributor cells it has folded
+//! ([`CellStore::merge_remote`]). Per-contributor cells are exact (max-merged
+//! per origin) but are the owner's bookkeeping: they never reach a sink.
+//!
+//! Every mutation that raises a counted cell appends one row to a
 //! caller-owned [`DeltaSink`], whose SoA shape lets a higher-level
 //! rate-limit aggregator fold deltas without per-record dispatch.
 //! Expirations are surfaced symmetrically via [`ExpirationSink`] — one row
-//! per freed cell — so an external aggregate store can keep its summary
-//! consistent with the CRDT's active set.
+//! per freed counted cell — so an external aggregate store can keep its
+//! summary consistent with the view.
 //!
 //! Slot lifecycle uses an intrusive freelist (`free_next` linking inactive
 //! slots) and a generation counter per slot (low bit = active flag, high
@@ -81,6 +90,14 @@ impl NodeIdentity {
         }
     }
 }
+
+/// Origin of the cell in which a node counts every other node's hits on a
+/// `(rule, key, bucket)`. Node-local: it is never sent on the wire, and a
+/// peer row that claims it is ignored.
+pub const OTHERS: NodeIdentity = NodeIdentity {
+    node_id: NodeId(u128::MAX),
+    incarnation: 0,
+};
 
 /// Count column abstraction. One `CellStore<C>` is monomorphized to a single
 /// count width — narrow for high-throughput tables, wide for large limits.
@@ -203,13 +220,14 @@ pub struct CellExpiration<C: Count> {
     pub applies_locally: bool,
 }
 
-/// Result of a single-row update — useful for callers who do not want the
-/// SoA `DeltaSink` shape.
+/// A node's view total of one bucket of a key: its own hits plus its count
+/// of everyone else's. What a key's owner broadcasts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UpdateOutcome<C: Count> {
-    pub handle: CellHandle,
-    pub changed: bool,
-    pub delta: Option<CellDelta<C>>,
+pub struct KeyTotal<C: Count> {
+    pub rule: RuleSlot,
+    pub key_hash: KeyHash,
+    pub bucket: BucketEpoch,
+    pub count: C,
 }
 
 /// Snapshot of one stored cell.
@@ -303,6 +321,10 @@ pub struct CellStore<C: Count = u32> {
     counts: Box<[C]>,
     last_update_millis: Box<[u64]>,
     origin_sequences: Box<[u64]>,
+    // For an others cell, the sum of the contributor cells this node folded
+    // into it as the key's owner; its count never falls below it. Unused
+    // for every other cell.
+    contributions: Box<[C]>,
 
     // Slot lifecycle.
     generations: Box<[u32]>,
@@ -315,7 +337,7 @@ pub struct CellStore<C: Count = u32> {
     index: CellIndex,
 
     // Every cell of one `(rule, key)` (all buckets, all origins) is linked
-    // into a doubly linked chain, so an owner can gather a key's whole state
+    // into a doubly linked chain, so an owner can gather a key's totals
     // without scanning the store. `key_heads` maps `(rule, key)` to the
     // chain's head slot.
     key_heads: CellIndex,
@@ -340,6 +362,7 @@ pub struct CellStore<C: Count = u32> {
     // Local identity.
     local_identity: NodeIdentity,
     local_node_slot: NodeSlot,
+    others_node_slot: NodeSlot,
 
     // Counters.
     cell_store_full_rejects: u64,
@@ -349,27 +372,6 @@ pub struct CellStore<C: Count = u32> {
 
 const NO_FREE: u32 = u32::MAX;
 
-/// Internal arguments for [`CellStore::upsert`]. The mode discriminates the
-/// two valid update shapes; sharing a struct prevents callers from passing a
-/// remote `observed` count alongside a local `hits` delta or vice versa.
-struct UpsertSpec<C: Count> {
-    rule_slot: RuleSlot,
-    key_hash: KeyHash,
-    bucket: BucketEpoch,
-    origin_slot: NodeSlot,
-    incarnation: Incarnation,
-    now_millis: u64,
-    mode: UpsertMode<C>,
-}
-
-enum UpsertMode<C: Count> {
-    /// Local hit. The stored count rises by saturating-adding `hits`.
-    Accumulate { hits: u64 },
-    /// Remote observation. The stored count rises to `observed` if and only
-    /// if `observed` is strictly greater (CRDT max-merge).
-    MaxMerge { observed: C },
-}
-
 impl<C: Count> CellStore<C> {
     pub fn new(config: CellStoreConfig, local_identity: NodeIdentity) -> Self {
         assert!(config.cell_capacity > 0, "cell capacity must be > 0");
@@ -378,8 +380,8 @@ impl<C: Count> CellStore<C> {
             "rule dictionary capacity must be > 0"
         );
         assert!(
-            config.node_dictionary_capacity > 0,
-            "node dictionary capacity must be > 0"
+            config.node_dictionary_capacity >= 2,
+            "node dictionary capacity must hold the local and others identities (>= 2)"
         );
 
         let cap = config.cell_capacity;
@@ -394,9 +396,14 @@ impl<C: Count> CellStore<C> {
         let mut node_dictionary = NodeDictionary::with_capacity(config.node_dictionary_capacity);
         let local_node_slot = node_dictionary
             .intern(local_identity.node_id, local_identity.incarnation)
-            .expect("node dictionary capacity > 0");
-        // Pin the local slot so it cannot be freed via dec_ref.
+            .expect("node dictionary capacity >= 2");
+        debug_assert_ne!(local_identity, OTHERS, "the local identity is reserved");
+        let others_node_slot = node_dictionary
+            .intern(OTHERS.node_id, OTHERS.incarnation)
+            .expect("node dictionary capacity >= 2");
+        // Pin both slots so they cannot be freed via dec_ref.
         node_dictionary.inc_ref(local_node_slot);
+        node_dictionary.inc_ref(others_node_slot);
 
         Self {
             rules: vec![0_u16; cap as usize].into_boxed_slice(),
@@ -408,6 +415,7 @@ impl<C: Count> CellStore<C> {
             counts: vec![C::default(); cap as usize].into_boxed_slice(),
             last_update_millis: vec![0_u64; cap as usize].into_boxed_slice(),
             origin_sequences: vec![0_u64; cap as usize].into_boxed_slice(),
+            contributions: vec![C::default(); cap as usize].into_boxed_slice(),
 
             generations: vec![0_u32; cap as usize].into_boxed_slice(),
             free_next,
@@ -436,6 +444,7 @@ impl<C: Count> CellStore<C> {
 
             local_identity,
             local_node_slot,
+            others_node_slot,
 
             cell_store_full_rejects: 0,
             rule_dictionary_full_rejects: 0,
@@ -463,6 +472,16 @@ impl<C: Count> CellStore<C> {
 
     pub fn local_node_slot(&self) -> NodeSlot {
         self.local_node_slot
+    }
+
+    pub fn others_node_slot(&self) -> NodeSlot {
+        self.others_node_slot
+    }
+
+    /// Whether cells of `origin` are part of this node's view: its own hits
+    /// and its count of the others'. Contributor cells are not.
+    fn in_view(&self, origin: NodeSlot) -> bool {
+        origin == self.local_node_slot || origin == self.others_node_slot
     }
 
     pub fn rule_dictionary(&self) -> &RuleDictionary {
@@ -825,16 +844,9 @@ impl<C: Count> CellStore<C> {
     }
 
     /// Append a row to the SoA delta sink.
-    fn emit_delta(
-        &self,
-        sink: &mut DeltaSink<C>,
-        slot: u32,
-        previous: C,
-        current: C,
-        delta: C,
-        rule_slot: RuleSlot,
-    ) {
+    fn emit_delta(&self, sink: &mut DeltaSink<C>, slot: u32, previous: C, current: C) {
         let handle = self.handle_for(slot);
+        let rule_slot = self.rules[slot as usize];
         let descriptor = self
             .rule_dictionary
             .descriptor(rule_slot)
@@ -849,7 +861,7 @@ impl<C: Count> CellStore<C> {
             key,
             previous,
             current,
-            delta,
+            C::saturating_delta(current, previous),
             descriptor.applies_locally(),
         );
     }
@@ -878,99 +890,124 @@ impl<C: Count> CellStore<C> {
         );
     }
 
-    /// Insert or update a row: returns the resulting handle and whether the
-    /// stored count rose.
-    fn upsert(
-        &mut self,
-        spec: UpsertSpec<C>,
-        sink: &mut DeltaSink<C>,
-    ) -> Result<UpdateOutcome<C>, InsertReject> {
-        let UpsertSpec {
-            rule_slot,
-            key_hash,
-            bucket,
-            origin_slot,
-            incarnation,
-            now_millis,
-            mode,
-        } = spec;
-        let key = CompactCellKey {
-            rule: rule_slot,
-            key_hash,
-            bucket,
-            origin: origin_slot,
-            incarnation,
-        };
+    /// The slot of the cell `key`, inserted at count zero if absent.
+    fn find_or_insert(&mut self, key: CompactCellKey) -> Result<u32, InsertReject> {
         if let Some(slot) = self.lookup_index(key) {
-            let previous = self.counts[slot as usize];
-            let next = match mode {
-                UpsertMode::Accumulate { hits } => previous.saturating_add_hits(hits),
-                UpsertMode::MaxMerge { observed } => {
-                    if observed > previous {
-                        observed
-                    } else {
-                        previous
-                    }
-                }
-            };
-            if next == previous {
-                return Ok(UpdateOutcome {
-                    handle: self.handle_for(slot),
-                    changed: false,
-                    delta: None,
-                });
-            }
-            self.counts[slot as usize] = next;
-            self.last_update_millis[slot as usize] = now_millis;
-            let seq = self.next_origin_sequence(origin_slot);
-            self.origin_sequences[slot as usize] = seq;
-            let handle = self.handle_for(slot);
-            let delta = C::saturating_delta(next, previous);
-            self.emit_delta(sink, slot, previous, next, delta, rule_slot);
-            return Ok(UpdateOutcome {
-                handle,
-                changed: true,
-                delta: sink.row(sink.len() - 1),
-            });
+            return Ok(slot);
         }
-
-        // Insert path.
-        let slot = match self.alloc_slot() {
-            Some(s) => s,
-            None => {
-                self.note_cell_store_full();
-                return Err(InsertReject::CellStoreFull);
-            }
+        let Some(slot) = self.alloc_slot() else {
+            self.note_cell_store_full();
+            return Err(InsertReject::CellStoreFull);
         };
-        let initial = match mode {
-            UpsertMode::Accumulate { hits } => C::default().saturating_add_hits(hits),
-            UpsertMode::MaxMerge { observed } => observed,
-        };
-        self.rules[slot as usize] = rule_slot;
-        self.key_hashes[slot as usize] = key_hash;
-        self.buckets[slot as usize] = bucket;
-        self.origins[slot as usize] = origin_slot;
-        self.incarnations[slot as usize] = incarnation;
-        self.counts[slot as usize] = initial;
-        self.last_update_millis[slot as usize] = now_millis;
-        let seq = self.next_origin_sequence(origin_slot);
-        self.origin_sequences[slot as usize] = seq;
+        let i = slot as usize;
+        self.rules[i] = key.rule;
+        self.key_hashes[i] = key.key_hash;
+        self.buckets[i] = key.bucket;
+        self.origins[i] = key.origin;
+        self.incarnations[i] = key.incarnation;
+        self.counts[i] = C::default();
+        self.contributions[i] = C::default();
+        self.last_update_millis[i] = 0;
+        self.origin_sequences[i] = 0;
 
         // Hold dictionary references on behalf of this cell.
-        self.rule_dictionary.inc_ref(rule_slot);
-        self.node_dictionary.inc_ref(origin_slot);
+        self.rule_dictionary.inc_ref(key.rule);
+        self.node_dictionary.inc_ref(key.origin);
 
         self.index
             .insert_unchecked(hash_compact_cell_key(&key), slot);
         self.link_key(slot);
+        Ok(slot)
+    }
 
-        let handle = self.handle_for(slot);
-        let delta = initial;
-        self.emit_delta(sink, slot, C::default(), initial, delta, rule_slot);
-        Ok(UpdateOutcome {
-            handle,
-            changed: true,
-            delta: sink.row(sink.len() - 1),
+    /// Raise the cell at `slot` to `next`, if that is higher, and report a
+    /// cell in the view to `sink`. Returns the rise.
+    fn raise(&mut self, slot: u32, next: C, now_millis: u64, sink: &mut DeltaSink<C>) -> C {
+        let i = slot as usize;
+        let previous = self.counts[i];
+        if next <= previous {
+            return C::default();
+        }
+        self.counts[i] = next;
+        self.last_update_millis[i] = now_millis;
+        self.origin_sequences[i] = self.next_origin_sequence(self.origins[i]);
+        if self.in_view(self.origins[i]) {
+            self.emit_delta(sink, slot, previous, next);
+        }
+        C::saturating_delta(next, previous)
+    }
+
+    /// The slot of this node's others cell for `(rule, key_hash, bucket)`.
+    fn others_slot(
+        &mut self,
+        rule: RuleSlot,
+        key_hash: KeyHash,
+        bucket: BucketEpoch,
+    ) -> Result<u32, InsertReject> {
+        self.find_or_insert(CompactCellKey {
+            rule,
+            key_hash,
+            bucket,
+            origin: self.others_node_slot,
+            incarnation: OTHERS.incarnation,
+        })
+    }
+
+    /// The count of the cell `(rule, key_hash, bucket, origin)`, zero if
+    /// absent.
+    fn count_at(
+        &self,
+        rule: RuleSlot,
+        key_hash: KeyHash,
+        bucket: BucketEpoch,
+        origin: NodeSlot,
+    ) -> C {
+        let incarnation = if origin == self.others_node_slot {
+            OTHERS.incarnation
+        } else {
+            self.local_identity.incarnation
+        };
+        self.lookup_index(CompactCellKey {
+            rule,
+            key_hash,
+            bucket,
+            origin,
+            incarnation,
+        })
+        .map_or_else(C::default, |slot| self.counts[slot as usize])
+    }
+
+    /// This node's view of `(rule, key_hash, bucket)`: its own hits plus its
+    /// count of everyone else's.
+    pub fn view(&self, rule: RuleSlot, key_hash: KeyHash, bucket: BucketEpoch) -> C {
+        let own = self.count_at(rule, key_hash, bucket, self.local_node_slot);
+        let others = self.count_at(rule, key_hash, bucket, self.others_node_slot);
+        own.saturating_add_hits(others.into())
+    }
+
+    /// The view total of every live bucket of `(rule, key_hash)`, one row per
+    /// bucket this node holds a counted cell for.
+    pub fn key_totals(
+        &self,
+        rule: RuleSlot,
+        key_hash: KeyHash,
+    ) -> impl Iterator<Item = KeyTotal<C>> + '_ {
+        self.key_cells(rule, key_hash).filter_map(move |handle| {
+            let i = handle.index as usize;
+            let bucket = self.buckets[i];
+            let origin = self.origins[i];
+            // A bucket with an others cell is reported through it; one with
+            // only this node's own hits, through the local cell.
+            let reported = origin == self.others_node_slot
+                || (origin == self.local_node_slot
+                    && self.count_at(rule, key_hash, bucket, self.others_node_slot)
+                        == C::default());
+            reported.then(|| KeyTotal {
+                rule,
+                key_hash,
+                bucket,
+                count: self.view(rule, key_hash, bucket),
+            })
         })
     }
 
@@ -983,25 +1020,7 @@ impl<C: Count> CellStore<C> {
         node_id: NodeId,
         incarnation: Incarnation,
     ) -> Option<(RuleSlot, NodeSlot)> {
-        let rule_slot = match self.rule_dictionary.find(rule_fingerprint) {
-            Some(slot) => slot,
-            None => {
-                // Unknown rule — admit with default descriptor so cells are
-                // still stored, forwarded, and expired. `applies_locally`
-                // will be `false` because `local_rule_id == u32::MAX`.
-                let descriptor = RuleDescriptor {
-                    fingerprint: rule_fingerprint,
-                    ..RuleDescriptor::default()
-                };
-                match self.rule_dictionary.intern(descriptor) {
-                    Some(slot) => slot,
-                    None => {
-                        self.note_rule_dictionary_full(rule_fingerprint);
-                        return None;
-                    }
-                }
-            }
-        };
+        let rule_slot = self.translate_rule(rule_fingerprint)?;
         let node_slot = match self.node_dictionary.find(node_id, incarnation) {
             Some(slot) => slot,
             None => match self.node_dictionary.intern(node_id, incarnation) {
@@ -1015,6 +1034,25 @@ impl<C: Count> CellStore<C> {
         Some((rule_slot, node_slot))
     }
 
+    /// The slot of `rule_fingerprint`, interned with the default descriptor
+    /// if unknown so its cells are still stored and expired (with
+    /// `applies_locally = false`). `None`, with the rejection counter bumped,
+    /// when the dictionary is full.
+    fn translate_rule(&mut self, rule_fingerprint: u128) -> Option<RuleSlot> {
+        if let Some(slot) = self.rule_dictionary.find(rule_fingerprint) {
+            return Some(slot);
+        }
+        let descriptor = RuleDescriptor {
+            fingerprint: rule_fingerprint,
+            ..RuleDescriptor::default()
+        };
+        let slot = self.rule_dictionary.intern(descriptor);
+        if slot.is_none() {
+            self.note_rule_dictionary_full(rule_fingerprint);
+        }
+        slot
+    }
+
     // -- Primary mutation entry points --------------------------------------
 
     /// Record locally-observed hits. The local node is always the origin —
@@ -1022,66 +1060,86 @@ impl<C: Count> CellStore<C> {
     pub fn ingest_local(&mut self, obs: &ObservationBatch<C>, sink: &mut DeltaSink<C>) {
         obs.assert_consistent();
         for i in 0..obs.len() {
-            let rule_fingerprint = obs.rule_fingerprints[i];
-            let rule_slot = match self.rule_dictionary.find(rule_fingerprint) {
-                Some(slot) => slot,
-                None => {
-                    let descriptor = RuleDescriptor {
-                        fingerprint: rule_fingerprint,
-                        ..RuleDescriptor::default()
-                    };
-                    match self.rule_dictionary.intern(descriptor) {
-                        Some(slot) => slot,
-                        None => {
-                            self.note_rule_dictionary_full(rule_fingerprint);
-                            continue;
-                        }
-                    }
-                }
+            let Some(rule) = self.translate_rule(obs.rule_fingerprints[i]) else {
+                continue;
             };
-            let hits_u64: u64 = obs.counts[i].into();
-            let _ = self.upsert(
-                UpsertSpec {
-                    rule_slot,
-                    key_hash: obs.key_hashes[i],
-                    bucket: obs.buckets[i],
-                    origin_slot: self.local_node_slot,
-                    incarnation: self.local_identity.incarnation,
-                    now_millis: obs.last_update_millis[i],
-                    mode: UpsertMode::Accumulate { hits: hits_u64 },
-                },
-                sink,
-            );
+            let Ok(slot) = self.find_or_insert(CompactCellKey {
+                rule,
+                key_hash: obs.key_hashes[i],
+                bucket: obs.buckets[i],
+                origin: self.local_node_slot,
+                incarnation: self.local_identity.incarnation,
+            }) else {
+                continue;
+            };
+            let next = self.counts[slot as usize].saturating_add_hits(obs.counts[i].into());
+            self.raise(slot, next, obs.last_update_millis[i], sink);
         }
     }
 
-    /// Merge observations received from a peer. Each row is max-merged into
-    /// the stored count; the resulting deltas (when the stored count rose)
-    /// are appended to `sink`.
+    /// Fold contributors' cells into this node as the owner of their keys.
+    /// Each row is max-merged into its origin's cell; whatever a cell rose
+    /// by is added to the bucket's contributions, and the others cell rises
+    /// to at least their sum. Only others cells reach `sink`. A row that
+    /// claims this node's own identity, or [`OTHERS`], is ignored.
     pub fn merge_remote(&mut self, obs: &ObservationBatch<C>, sink: &mut DeltaSink<C>) {
         obs.assert_consistent();
         for i in 0..obs.len() {
-            let Some((rule_slot, node_slot)) = self.translate_identity(
+            let origin = NodeIdentity::new(obs.origin_node_ids[i], obs.incarnations[i]);
+            if origin == self.local_identity || origin == OTHERS {
+                continue;
+            }
+            let Some((rule, node)) = self.translate_identity(
                 obs.rule_fingerprints[i],
-                obs.origin_node_ids[i],
-                obs.incarnations[i],
+                origin.node_id,
+                origin.incarnation,
             ) else {
                 continue;
             };
-            let _ = self.upsert(
-                UpsertSpec {
-                    rule_slot,
-                    key_hash: obs.key_hashes[i],
-                    bucket: obs.buckets[i],
-                    origin_slot: node_slot,
-                    incarnation: obs.incarnations[i],
-                    now_millis: obs.last_update_millis[i],
-                    mode: UpsertMode::MaxMerge {
-                        observed: obs.counts[i],
-                    },
-                },
-                sink,
-            );
+            let (key_hash, bucket, now) =
+                (obs.key_hashes[i], obs.buckets[i], obs.last_update_millis[i]);
+            let Ok(slot) = self.find_or_insert(CompactCellKey {
+                rule,
+                key_hash,
+                bucket,
+                origin: node,
+                incarnation: origin.incarnation,
+            }) else {
+                continue;
+            };
+            let rise = self.raise(slot, obs.counts[i], now, sink);
+            if rise == C::default() {
+                continue;
+            }
+            let Ok(others) = self.others_slot(rule, key_hash, bucket) else {
+                continue;
+            };
+            let o = others as usize;
+            self.contributions[o] = self.contributions[o].saturating_add_hits(rise.into());
+            self.raise(others, self.contributions[o], now, sink);
+        }
+    }
+
+    /// Fold key owners' totals. Each row's count is the owner's view total
+    /// of `(rule, key, bucket)`; this node's others cell rises to that total
+    /// less its own hits, a lower bound of everyone else's since the owner
+    /// cannot hold more of this node's hits than it has. The rows' origin
+    /// columns are ignored.
+    pub fn merge_totals(&mut self, obs: &ObservationBatch<C>, sink: &mut DeltaSink<C>) {
+        obs.assert_consistent();
+        for i in 0..obs.len() {
+            let Some(rule) = self.translate_rule(obs.rule_fingerprints[i]) else {
+                continue;
+            };
+            let (key_hash, bucket) = (obs.key_hashes[i], obs.buckets[i]);
+            let own = self.count_at(rule, key_hash, bucket, self.local_node_slot);
+            let others = C::saturating_delta(obs.counts[i], own);
+            if others <= self.count_at(rule, key_hash, bucket, self.others_node_slot) {
+                continue;
+            }
+            if let Ok(slot) = self.others_slot(rule, key_hash, bucket) {
+                self.raise(slot, others, obs.last_update_millis[i], sink);
+            }
         }
     }
 
@@ -1089,8 +1147,8 @@ impl<C: Count> CellStore<C> {
     ///
     /// For each rule slot `r`, the cell is kept iff
     /// `buckets[slot] + live_buckets[r] >= current_epoch_by_rule[r]`. Each
-    /// freed cell is emitted into `sink` *before* its slot is released, so
-    /// external aggregators see one row per active-set departure.
+    /// freed cell in the view is emitted into `sink` *before* its slot is
+    /// released, so external aggregators see one row per counted departure.
     pub fn expire(
         &mut self,
         current_epoch_by_rule: &[BucketEpoch],
@@ -1110,7 +1168,9 @@ impl<C: Count> CellStore<C> {
             let bucket = self.buckets[slot as usize];
             let expired = (bucket as u64) + (live as u64) < (current as u64);
             if expired {
-                self.emit_expiration(sink, slot);
+                if self.in_view(self.origins[slot as usize]) {
+                    self.emit_expiration(sink, slot);
+                }
                 self.free_cell_at(slot);
             }
         }

@@ -24,8 +24,22 @@
 //!
 //! When `cell_count == 0` the body is empty (no dict section). All integers
 //! are little-endian; no alignment requirement.
+//!
+//! A broadcast carries an owner's per-bucket key totals instead of cells,
+//! with no origin columns (the sender is the origin):
+//!
+//! ```text
+//! [ rule_dict_len      : u8     ]    R, 1..=255
+//! [ rule_dict          : u128×R ]    16R bytes, slot order
+//! [ rule_slot          : u8 ×N  ]    each < R
+//! [ key_hash           : u128×N ]    16N
+//! [ bucket             : u32 ×N ]     4N
+//! [ count              : C  ×N  ]    count_size · N
+//! ```
 
-use crate::crdt::{BucketEpoch, CellHandle, CellStore, Count, Incarnation, KeyHash, NodeId};
+use crate::crdt::{
+    BucketEpoch, CellHandle, CellStore, Count, Incarnation, KeyHash, KeyTotal, NodeId,
+};
 
 use super::DecodeError;
 
@@ -38,12 +52,17 @@ pub(crate) const PER_CELL_IDENT_BYTES: usize = 1 + 16 + 4 + 1 + 4 + 8 + 8;
 /// `dict_len` bytes. Dictionary entries themselves cost `16 * (R + D)`.
 pub(crate) const DICT_LEN_BYTES: usize = 2;
 
+/// Per-total identity bytes: `1 (rule_slot) + 16 (key_hash) + 4 (bucket)`.
+const PER_TOTAL_IDENT_BYTES: usize = 1 + 16 + 4;
+
 /// Maximum slots per packet for each mini-dictionary. The 255 cap is encoded
 /// by the `u8` slot type at the call site; this constant is for boundary
 /// arithmetic.
 pub(crate) const MAX_DICT_SLOTS: usize = 255;
 
-/// Decoded cell handed to visitor callbacks.
+/// Decoded cell handed to visitor callbacks. A broadcast's totals decode as
+/// cells of the sender (origin = the sending node, `last_update_millis` and
+/// `origin_sequence` zero), each `count` the sender's view total.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WireCell<C: Count> {
     pub rule_fingerprint: u128,
@@ -363,6 +382,76 @@ fn write_body<C: Count>(
     debug_assert_eq!(i, n, "pass 2 emitted a different cell count than pass 1");
 }
 
+/// Encode the next packet of `totals` into `out`, starting at `start_at`, in
+/// the totals layout. Same contract as [`encode_packet_body`]; totals are
+/// plain values, so none is ever dropped.
+pub(crate) fn encode_totals_body<C: Count>(
+    store: &CellStore<C>,
+    totals: &[KeyTotal<C>],
+    start_at: usize,
+    body_budget: usize,
+    scratch: &mut WireScratch,
+    out: &mut Vec<u8>,
+) -> EncodedBody {
+    debug_assert!(start_at <= totals.len());
+    scratch.reset();
+    let per_row = PER_TOTAL_IDENT_BYTES + std::mem::size_of::<C>();
+    let mut end = start_at;
+    while end < totals.len() {
+        let rule = totals[end].rule;
+        let unseen = scratch.rule_remap[rule as usize] == u8::MAX;
+        let rules = scratch.rule_fps.len() + usize::from(unseen);
+        let rows = end - start_at + 1;
+        if rules > MAX_DICT_SLOTS || 1 + 16 * rules + rows * per_row > body_budget {
+            break;
+        }
+        if unseen {
+            let Some(descriptor) = store.rule_dictionary().descriptor(rule) else {
+                break;
+            };
+            scratch.rule_remap[rule as usize] = scratch.rule_fps.len() as u8;
+            scratch.rule_fps.push(descriptor.fingerprint);
+        }
+        end += 1;
+    }
+    let n = end - start_at;
+    if n == 0 {
+        return EncodedBody::default();
+    }
+
+    let r = scratch.rule_fps.len();
+    let body_len = 1 + 16 * r + n * per_row;
+    let base = out.len();
+    out.resize(base + body_len, 0);
+    let body = &mut out[base..];
+    body[0] = r as u8;
+    for (i, fp) in scratch.rule_fps.iter().enumerate() {
+        body[1 + 16 * i..17 + 16 * i].copy_from_slice(&fp.to_le_bytes());
+    }
+    let rule_slot_off = 1 + 16 * r;
+    let key_hash_off = rule_slot_off + n;
+    let bucket_off = key_hash_off + 16 * n;
+    let count_off = bucket_off + 4 * n;
+    let count_size = std::mem::size_of::<C>();
+    for (i, total) in totals[start_at..end].iter().enumerate() {
+        body[rule_slot_off + i] = scratch.rule_remap[total.rule as usize];
+        body[key_hash_off + 16 * i..key_hash_off + 16 * i + 16]
+            .copy_from_slice(&total.key_hash.0.to_le_bytes());
+        body[bucket_off + 4 * i..bucket_off + 4 * i + 4]
+            .copy_from_slice(&total.bucket.to_le_bytes());
+        let count: u64 = total.count.into();
+        body[count_off + count_size * i..count_off + count_size * (i + 1)]
+            .copy_from_slice(&count.to_le_bytes()[..count_size]);
+    }
+
+    EncodedBody {
+        body_len,
+        cells_emitted: n as u32,
+        handles_consumed: n,
+        ..EncodedBody::default()
+    }
+}
+
 fn read_count<C: Count>(src: &[u8]) -> C {
     let mut buf = [0u8; 8];
     let n = std::mem::size_of::<C>();
@@ -481,6 +570,60 @@ pub(crate) fn decode_body_visit<C: Count>(
         });
     }
 
+    Ok(())
+}
+
+/// Decode one totals body, handing each total to `on_cell` as a cell of
+/// `sender` (see [`WireCell`]).
+pub(crate) fn decode_totals_visit<C: Count>(
+    bytes: &[u8],
+    cell_count: u32,
+    sender: NodeId,
+    sender_incarnation: Incarnation,
+    mut on_cell: impl FnMut(WireCell<C>),
+) -> Result<(), DecodeError> {
+    if cell_count == 0 {
+        return if bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(DecodeError::BodyLenMismatch)
+        };
+    }
+    let rule_dict_len = *bytes.first().ok_or(DecodeError::BodyLenMismatch)? as usize;
+    if rule_dict_len == 0 {
+        return Err(DecodeError::BodyLenMismatch);
+    }
+    let count_size = std::mem::size_of::<C>();
+    let n = cell_count as usize;
+    let rule_dict_end = 1 + 16 * rule_dict_len;
+    let expected = n
+        .checked_mul(PER_TOTAL_IDENT_BYTES + count_size)
+        .and_then(|rows| rows.checked_add(rule_dict_end))
+        .ok_or(DecodeError::BodyLenMismatch)?;
+    if bytes.len() != expected {
+        return Err(DecodeError::BodyLenMismatch);
+    }
+    let rule_dict = &bytes[1..rule_dict_end];
+    let rule_slot = &bytes[rule_dict_end..rule_dict_end + n];
+    let key_hash_slab = &bytes[rule_dict_end + n..rule_dict_end + 17 * n];
+    let bucket_slab = &bytes[rule_dict_end + 17 * n..rule_dict_end + 21 * n];
+    let count_slab = &bytes[rule_dict_end + 21 * n..];
+    for i in 0..n {
+        let rs = rule_slot[i] as usize;
+        if rs >= rule_dict_len {
+            return Err(DecodeError::BadSlot);
+        }
+        on_cell(WireCell {
+            rule_fingerprint: read_u128(&rule_dict[rs * 16..]),
+            key_hash: KeyHash(read_u128(&key_hash_slab[i * 16..])),
+            bucket: read_u32(&bucket_slab[i * 4..]),
+            origin_node_id: sender,
+            origin_incarnation: sender_incarnation,
+            count: read_count::<C>(&count_slab[i * count_size..]),
+            last_update_millis: 0,
+            origin_sequence: 0,
+        });
+    }
     Ok(())
 }
 

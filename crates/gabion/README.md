@@ -112,8 +112,19 @@ plus its `key_hash`, `bucket`, origin incarnation, `last_update_millis`,
 [count            : C  ×N  ]    count_width × N bytes
 ```
 
-`FLAG_SYNC` and `FLAG_ACK` say what the cells are for (neither: a
-broadcast); a frame never sets both.
+`FLAG_SYNC` and `FLAG_ACK` say what the cells are for; a frame never sets
+both. A frame with neither is an owner's **broadcast**, whose body carries
+per-bucket key totals instead of cells. The sender is their origin, so a
+total row drops the node dictionary and the origin columns:
+
+```
+[rule_dict_len    : u8     ]    R rules in this frame (1–255)
+[rule_dict        : u128×R ]    rule fingerprints
+[rule_slot        : u8 ×N  ]    each < R
+[key_hash         : u128×N ]
+[bucket           : u32 ×N ]
+[count            : C  ×N  ]    the owner's total for (rule, key, bucket)
+```
 
 If the cluster is configured with a shared HMAC key, an additional
 **32-byte HMAC-SHA256 tag** is appended over the header and body, and
@@ -144,28 +155,41 @@ the changed member wins or held.
 2. **Sync.** Every `sync_wait` (100 ms) the node sends each unacknowledged
    queued cell to its owner, one batch per owner (`FLAG_SYNC`).
 3. **Fold and acknowledge.** The owner max-merges the cells into its store
-   (they stay tagged with the contributor's origin, so the CRDT join is
-   exact), queues the ones that rose for broadcast, and echoes every cell
-   it holds back to the sender (`FLAG_ACK`). A node that believes it is
-   not the owner folds and acknowledges nothing.
+   (they stay tagged with the contributor's origin, so a re-sent or
+   reordered sync cannot double count), adds whatever they rose by to the
+   bucket's count of the others' hits, queues the keys that rose for
+   broadcast, and echoes every cell it holds back to the sender
+   (`FLAG_ACK`). A node that believes it is not the owner folds and
+   acknowledges nothing.
 4. **Broadcast.** Every `broadcast_interval` (100 ms) an owner sends the
-   whole state of each key that changed since its last broadcast (every
-   live cell it holds for the key, from every contributor and bucket), at
-   most `broadcast_batch_limit` (1 000) keys, to every peer. Receivers
-   merge them and relay nothing.
+   total of every live bucket of each key that changed since its last
+   broadcast (its own hits plus the others'), at most
+   `broadcast_batch_limit` (1 000) keys, to every peer. A receiver counts
+   the total less its own hits as the others' count of that bucket,
+   unless it already holds more, and relays nothing.
 5. **Re-send.** A cell stays queued until its owner acknowledges the
    current count, so a lost sync or ack is re-sent every `sync_wait`. When
    membership changes, every live local cell is re-checked against the new
-   owner: hits the old owner never acknowledged go to the new one, which
-   folds and broadcasts them.
+   owner, and because acknowledgements are per owner, every live local
+   cell of a key whose owner moved is re-sent until the new owner
+   acknowledges it, acknowledged by the old owner or not. The new owner
+   rebuilds the key from these and broadcasts it.
+
+A node's view of a bucket is therefore its own hits plus one number for
+everyone else's, which only rises and never exceeds the truth: an owner's
+total cannot include more of the receiver's hits than the receiver has, and
+an owner's sum of contributors' cells cannot exceed their hits. A node that
+held a larger count from a previous owner keeps it until the new owner's
+count passes it, so an ownership move never double counts and never drops
+the view.
 
 A node never forwards another node's hits, only an owner broadcasts a
 key, and nothing is sent to a non-owner. A broadcast is sent once per
-change and is not retried, but because it carries the key's whole state
-the next change to the key, by any contributor, repairs every peer that
-missed an earlier one. A node that joins learns a key at the key's next
-change; a key that never changes again stays unlearned until it ages out
-of its window.
+change and is not retried, but because it carries every live bucket of
+the key the next change to the key, by any contributor, repairs every peer
+that missed an earlier one. A node that joins learns a key at the key's
+next change; a key that never changes again stays unlearned until it ages
+out of its window.
 
 ### Design notes
 
@@ -174,16 +198,19 @@ This implementation follows Gubernator's `GLOBAL` behaviour (Mailgun,
 [blog](https://www.mailgun.com/blog/gubernator-cloud-native-distributed-rate-limiting-microservices)),
 adapted as little as the CRDT and UDP require:
 
-- **Cells, not totals.** Gubernator's owner holds one total per key and
+- **Totals per bucket.** Gubernator's owner holds one total per key and
   broadcasts the key's current status. Here the owner holds the
-  contributors' origin-tagged cells, and the key's status is all of its
-  live cells (found through a per-key chain in the cell store), so a
-  receiver computes the same total through the existing max-merge join,
-  and re-sent or reordered datagrams cannot double count. The batch limit
-  counts keys, as Gubernator's does. A key with many contributors and live
-  buckets is re-sent in full at each change, where Gubernator sends one
-  number; in the 80-pod `prod-typical` regime this raised the bytes per
-  node per second from about 97 KB (changed cells only) to about 270 KB.
+  contributors' origin-tagged cells (so a re-sent sync cannot double
+  count) and broadcasts the key's status as one total per live bucket,
+  found through a per-key chain in the cell store; a bucketed window has
+  one number per bucket where Gubernator's single window has one. A
+  receiver holds one others count per bucket, raised to the total less its
+  own hits, rather than a replica of every contributor's cell. An earlier
+  version of this design broadcast every contributor's cell of a changed
+  key, which cost about 5.6 times `main`'s bytes in the `long-window`
+  regime (60 one-minute buckets, up to 60 contributors each); totals
+  carry at most one row per bucket, at 25 bytes instead of 46 plus a
+  16-byte origin. The batch limit counts keys, as Gubernator's does.
 - **Cadence.** Gubernator batches hits over a sub-millisecond window to
   coalesce requests, which is not a staleness bound. `sync_wait` and
   `broadcast_interval` are both 100 ms, chosen from the sub-second
@@ -235,7 +262,7 @@ when you do need to tune.
 | Knob                    | Default | What it controls                                                                                                   | When to tune                                                                                     |
 |-------------------------|---------|--------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
 | `sync_wait`             | 100 ms  | How often a node sends its unacknowledged cells to their owners, and the retry interval for a lost sync or ack.    | Lower for fresher counts at more small packets; raise if packet rate is the bottleneck.          |
-| `broadcast_interval`    | 100 ms  | How often an owner broadcasts its changed cells to every peer.                                                     | Each broadcast costs one packet per peer per interval, so cost grows with cluster size.          |
+| `broadcast_interval`    | 100 ms  | How often an owner broadcasts the totals of its changed keys to every peer.                                         | Each broadcast costs one packet per peer per interval, so cost grows with cluster size.          |
 | `broadcast_batch_limit` | 1 000   | Most keys in one owner broadcast; the rest wait for the next interval.                                             | Raise if owners' queues back up under bursts (`forwarded_dirty_len` in the admin snapshot).      |
 | `tick_interval`         | 500 ms  | Period of the sweep that expires cells whose bucket left the window.                                               | Rarely.                                                                                          |
 | `max_cells_per_tick`    | 4 096   | Most cells one sync sends; the rest wait for the next `sync_wait`.                                                 | Raise if many keys are active per node.                                                          |

@@ -82,11 +82,8 @@ fn remote_merge_one(
     let mut sink = DeltaSink::with_capacity(1);
     obs.push(observation(rule_fp, 0xabc, 0, origin, inc, count, ts));
     store.merge_remote(&obs, &mut sink);
-    // A no-op merge (count <= stored) leaves the sink empty; recover the
-    // handle via key lookup instead.
-    if let Some(handle) = sink.handles.first().copied() {
-        return handle;
-    }
+    // The sink reports the others cell, not the contributor's; look the
+    // contributor's cell up by key.
     let rule_slot = store.find_rule(rule_fp).expect("rule interned");
     let node_slot = store
         .find_node(NodeId(origin), inc)
@@ -267,6 +264,8 @@ fn apply_local_rows(store: &mut CellStore<u32>, rows: &[LocalRow]) -> DeltaSink<
 
 type PortableKey = (u128, u128, BucketEpoch, u128, Incarnation);
 
+/// Contributor cells max-merged per origin, plus, for every bucket whose
+/// contributors sum above zero, an others cell holding that sum.
 fn remote_model(rows: &[RemoteRow]) -> BTreeMap<PortableKey, u32> {
     let mut model = BTreeMap::new();
     for row in rows {
@@ -282,6 +281,13 @@ fn remote_model(rows: &[RemoteRow]) -> BTreeMap<PortableKey, u32> {
             .and_modify(|stored: &mut u32| *stored = (*stored).max(row.count))
             .or_insert(row.count);
     }
+    let mut sums = BTreeMap::<PortableKey, u32>::new();
+    for (&(rule, key, bucket, ..), &count) in &model {
+        *sums
+            .entry((rule, key, bucket, OTHERS.node_id.0, OTHERS.incarnation))
+            .or_default() += count;
+    }
+    model.extend(sums.into_iter().filter(|&(_, sum)| sum > 0));
     model
 }
 
@@ -354,6 +360,7 @@ fn assert_structural_invariants(store: &CellStore<u32>) -> bool {
     }
 
     *nodes.entry(store.local_node_slot()).or_default() += 1;
+    *nodes.entry(store.others_node_slot()).or_default() += 1;
 
     if active != store.active_len() || store.index().len() != active {
         return false;
@@ -450,10 +457,14 @@ fn quickcheck_local_ingest_accumulates_saturating_and_ignores_batch_origin(
         })
 }
 
+/// A contributor row that raises its origin's cell emits exactly one sink
+/// row: its bucket's others cell rising by the same amount. Nothing else
+/// reaches the sink.
 #[quickcheck]
 fn quickcheck_delta_sink_rows_are_exact_remote_raises(rows: RemoteRows) -> bool {
     let mut store = quickcheck_store();
-    let mut model = BTreeMap::<PortableKey, u32>::new();
+    let mut cells = BTreeMap::<PortableKey, u32>::new();
+    let mut sums = BTreeMap::<(u128, u128, BucketEpoch), u32>::new();
     let mut sink = DeltaSink::with_capacity(rows.0.len());
 
     for row in &rows.0 {
@@ -464,33 +475,49 @@ fn quickcheck_delta_sink_rows_are_exact_remote_raises(rows: RemoteRows) -> bool 
             row.origin as u128,
             row.incarnation as Incarnation,
         );
-        let previous = model.get(&key).copied().unwrap_or(0);
+        let previous = cells.get(&key).copied().unwrap_or(0);
         let mut obs = ObservationBatch::with_capacity(1);
         obs.push(remote_observation(row));
         let before = sink.len();
         store.merge_remote(&obs, &mut sink);
-        if row.count > previous || !model.contains_key(&key) {
-            let after = sink.len();
-            if after != before + 1 {
-                return false;
-            }
-            let i = after - 1;
-            if sink.previous[i] != previous
-                || sink.current[i] != row.count
-                || sink.deltas[i] != row.count.saturating_sub(previous)
+        if row.count > previous {
+            let sum = sums.entry((key.0, key.1, key.2)).or_default();
+            let i = before;
+            if sink.len() != before + 1
+                || sink.handles[i] != store.find(others_key(&store, key.0, key.1, key.2)).unwrap()
+                || sink.previous[i] != *sum
+                || sink.current[i] != *sum + row.count - previous
+                || sink.deltas[i] != row.count - previous
                 || sink.keys[i].rule_fingerprint != key.0
                 || sink.keys[i].key_hash.0 != key.1
                 || sink.keys[i].bucket != key.2
             {
                 return false;
             }
-            model.insert(key, row.count);
+            *sum += row.count - previous;
         } else if sink.len() != before {
             return false;
         }
+        cells.insert(key, previous.max(row.count));
     }
 
-    portable_snapshot(&store) == model && assert_structural_invariants(&store)
+    portable_snapshot(&store) == remote_model(&rows.0) && assert_structural_invariants(&store)
+}
+
+/// The key of the others cell for `(rule_fp, key, bucket)`.
+fn others_key(
+    store: &CellStore<u32>,
+    rule_fp: u128,
+    key: u128,
+    bucket: BucketEpoch,
+) -> CompactCellKey {
+    CompactCellKey {
+        rule: store.find_rule(rule_fp).expect("rule interned"),
+        key_hash: KeyHash(key),
+        bucket,
+        origin: store.others_node_slot(),
+        incarnation: OTHERS.incarnation,
+    }
 }
 
 #[quickcheck]
@@ -519,10 +546,21 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(rows: RemoteRows, current_seed
         .map(|row| row.handle.index)
         .collect();
 
+    // Every aged-out cell is freed; only the counted ones (here, the others
+    // cells) reach the sink.
+    let expected_emitted: BTreeSet<u32> = before
+        .iter()
+        .filter(|row| {
+            row.key.origin == store.others_node_slot()
+                && expected_expired.contains(&row.handle.index)
+        })
+        .map(|row| row.handle.index)
+        .collect();
+
     let mut exp = ExpirationSink::<u32>::with_capacity(before.len());
     store.expire(&current, &live, &mut exp);
-    let expired: BTreeSet<u32> = exp.handles.iter().map(|h| h.index).collect();
-    if expired != expected_expired || exp.len() != expected_expired.len() {
+    let emitted: BTreeSet<u32> = exp.handles.iter().map(|h| h.index).collect();
+    if emitted != expected_emitted || exp.len() != expected_emitted.len() {
         return false;
     }
     for handle in &exp.handles {
@@ -548,8 +586,13 @@ fn merge_remote_is_monotonic() {
     let mut obs = ObservationBatch::with_capacity(1);
     obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 100));
     store.merge_remote(&obs, &mut sink);
+    // The contributor's rise reaches the sink as its bucket's others cell.
     assert_eq!(sink.len(), 1);
     let handle = sink.handles[0];
+    assert_eq!(
+        store.get(handle).unwrap().key.origin,
+        store.others_node_slot()
+    );
     assert_eq!(sink.previous[0], 0);
     assert_eq!(sink.current[0], 5);
 
@@ -577,9 +620,13 @@ fn merge_remote_is_monotonic() {
 fn different_origins_are_independent() {
     let mut store = store_u32();
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
-    let _a = remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
-    let _b = remote_merge_one(&mut store, 0x11, 2, 1, 7, 0);
-    assert_eq!(store.active_len(), 2);
+    let a = remote_merge_one(&mut store, 0x11, 2, 1, 5, 0);
+    let b = remote_merge_one(&mut store, 0x11, 3, 1, 7, 0);
+    assert_ne!(a, b);
+    // Two contributor cells and the bucket's others cell, holding their sum.
+    assert_eq!(store.active_len(), 3);
+    let others = store.find(others_key(&store, 0x11, 0xabc, 0)).unwrap();
+    assert_eq!(store.count_of(others), Some(12));
 }
 
 #[test]
@@ -602,9 +649,9 @@ fn merge_order_does_not_matter() {
         out
     };
 
-    let a = (1_u128, 5_u32);
-    let b = (1_u128, 9_u32);
-    let c = (2_u128, 3_u32);
+    let a = (2_u128, 5_u32);
+    let b = (2_u128, 9_u32);
+    let c = (3_u128, 3_u32);
     assert_eq!(make(&[a, b, c]), make(&[c, b, a]));
     assert_eq!(make(&[a, b, c]), make(&[b, c, a]));
 }
@@ -622,20 +669,21 @@ fn increment_local_accumulates() {
 
 #[test]
 fn capacity_is_enforced_without_growing() {
-    let mut store = small_store(1, 4);
+    // Room for one contributor cell and its bucket's others cell.
+    let mut store = small_store(2, 4);
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(2);
     let mut a = ObservationBatch::with_capacity(1);
-    a.push(observation(0x11, 0xabc, 0, 1, 1, 1, 0));
+    a.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
     store.merge_remote(&a, &mut sink);
     let mut b = ObservationBatch::with_capacity(1);
-    b.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
+    b.push(observation(0x11, 0xabc, 0, 3, 1, 1, 0));
     sink.clear();
     store.merge_remote(&b, &mut sink);
     assert_eq!(sink.len(), 0); // second insert was rejected
-    assert_eq!(store.active_len(), 1);
+    assert_eq!(store.active_len(), 2);
     assert_eq!(store.stats().cell_store_full_rejects, 1);
-    assert_eq!(store.capacity(), 1);
+    assert_eq!(store.capacity(), 2);
 }
 
 // --- New tests required by the plan -----------------------------------
@@ -646,16 +694,19 @@ fn delta_sink_records_exact_raises() {
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(4);
     let mut obs = ObservationBatch::with_capacity(2);
-    obs.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
-    obs.push(observation(0x11, 0xabc, 0, 2, 1, 7, 0));
+    obs.push(observation(0x11, 0xabc, 0, 2, 1, 5, 0));
+    obs.push(observation(0x11, 0xabc, 0, 3, 1, 7, 0));
     store.merge_remote(&obs, &mut sink);
+    // One others-cell row per raising contributor: 0 -> 5 -> 12.
     assert_eq!(sink.len(), 2);
+    assert_eq!((sink.previous[0], sink.current[0]), (0, 5));
+    assert_eq!((sink.previous[1], sink.current[1]), (5, 12));
 
     sink.clear();
     // No-op merges (count <= stored) produce nothing.
     let mut obs2 = ObservationBatch::with_capacity(2);
-    obs2.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
-    obs2.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
+    obs2.push(observation(0x11, 0xabc, 0, 2, 1, 5, 0));
+    obs2.push(observation(0x11, 0xabc, 0, 3, 1, 1, 0));
     store.merge_remote(&obs2, &mut sink);
     assert_eq!(sink.len(), 0);
 }
@@ -741,8 +792,9 @@ fn dictionary_refcount_frees_unreferenced_slots() {
     let node_slot = row.key.origin;
     let rule_slot = row.key.rule;
     assert_eq!(store.node_dictionary().refcount(node_slot), 1);
-    // A configured rule carries its registration pin (1) plus the cell's ref.
-    assert_eq!(store.rule_dictionary().refcount(rule_slot), 2);
+    // A configured rule carries its registration pin (1) plus a ref for the
+    // contributor's cell and one for the bucket's others cell.
+    assert_eq!(store.rule_dictionary().refcount(rule_slot), 3);
 
     // Expire the cell.
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
@@ -784,9 +836,9 @@ fn configured_rule_pinned_survives_cell_expiry() {
     assert_eq!(store.rule_dictionary().refcount(slot), 1);
     assert_eq!(store.rule_dictionary().descriptor(slot), Some(&configured));
 
-    // One cell on the rule: pin (1) + cell ref (1).
+    // A contributor cell and its others cell on the rule: pin (1) + 2 refs.
     let h = remote_merge_one(&mut store, 0xCAFE, 100, 1, 3, 0);
-    assert_eq!(store.rule_dictionary().refcount(slot), 2);
+    assert_eq!(store.rule_dictionary().refcount(slot), 3);
 
     // Force the cell to expire (bucket 0, current 20, live 0).
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
@@ -837,8 +889,9 @@ fn wire_only_rule_frees_when_cells_expire() {
     let mut store = small_store(4, 8);
     let h = remote_merge_one(&mut store, 0xBEEF, 100, 1, 3, 0);
     let slot = store.get(h).unwrap().key.rule;
-    // No pin: the cell is the only reference.
-    assert_eq!(store.rule_dictionary().refcount(slot), 1);
+    // No pin: the contributor's cell and its others cell are the only
+    // references.
+    assert_eq!(store.rule_dictionary().refcount(slot), 2);
     assert!(
         !store
             .rule_dictionary()
@@ -1002,7 +1055,10 @@ fn incarnation_change_isolates() {
     let r1 = store.get(h1).unwrap();
     let r2 = store.get(h2).unwrap();
     assert_ne!(r1.key.origin, r2.key.origin);
-    assert_eq!(store.active_len(), 2);
+    // Two contributor cells and one others cell holding both.
+    assert_eq!(store.active_len(), 3);
+    let others = store.find(others_key(&store, 0x11, 0xabc, 0)).unwrap();
+    assert_eq!(store.count_of(others), Some(10));
 }
 
 #[test]
@@ -1064,10 +1120,16 @@ fn expire_emits_one_row_per_freed_cell() {
         })
         .unwrap();
 
-    let snap_a = store.get(h_doomed_a).unwrap();
-    let snap_b = store.get(h_doomed_b).unwrap();
-    // Registration pin (1) + two cell refs.
-    assert_eq!(store.rule_dictionary().refcount(rule_doomed), 3);
+    // The counted cells, the ones whose expiry reaches the sink, are the two
+    // buckets' others cells, each holding its one contributor's count.
+    let others_a = store.find(others_key(&store, 0x22, 0xabc, 0)).unwrap();
+    let others_b = store.find(others_key(&store, 0x22, 0xdef, 0)).unwrap();
+    let snap_a = store.get(others_a).unwrap();
+    let snap_b = store.get(others_b).unwrap();
+    assert_eq!(snap_a.count, store.count_of(h_doomed_a).unwrap());
+    assert_eq!(snap_b.count, store.count_of(h_doomed_b).unwrap());
+    // Registration pin (1) + two contributor cells + their two others cells.
+    assert_eq!(store.rule_dictionary().refcount(rule_doomed), 5);
 
     // Build thresholds: doomed cells (bucket 0, live 0, current 5) expire;
     // the keep cell on rule_local stays because its rule lives 1000 buckets.
@@ -1081,10 +1143,13 @@ fn expire_emits_one_row_per_freed_cell() {
     let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
     store.expire(&cur, &live, &mut exp);
 
-    assert_eq!(store.active_len(), 1);
+    // The keep cell and its others cell survive; all four doomed cells are
+    // freed, but only the two others cells are emitted.
+    assert_eq!(store.active_len(), 2);
     assert_eq!(exp.len(), 2);
+    assert!(store.get(h_doomed_a).is_none() && store.get(h_doomed_b).is_none());
 
-    // Both cell refs drop, but the registration pin keeps the doomed rule
+    // Every cell ref drops, but the registration pin keeps the doomed rule
     // interned (refcount 1, descriptor still present). The expired rows still
     // carry applies_locally=true (asserted below), read from the descriptor the
     // pin keeps live.
@@ -1113,7 +1178,8 @@ fn expire_frees_slots_and_dictionary_refs() {
     let mut store = small_store(4, 4);
     let rule_slot = store.intern_rule(rule_descriptor(0xCC, 1)).unwrap();
     let _h = remote_merge_one(&mut store, 0xCC, 100, 1, 5, 0);
-    assert_eq!(store.active_len(), 1);
+    // The contributor's cell and its bucket's others cell.
+    assert_eq!(store.active_len(), 2);
     assert_eq!(
         store
             .node_dictionary()
@@ -1136,11 +1202,12 @@ fn expire_frees_slots_and_dictionary_refs() {
 fn handle_generation_is_aba_safe() {
     let mut store = small_store(2, 4);
     store.intern_rule(rule_descriptor(0xDD, 1)).unwrap();
-    let h1 = remote_merge_one(&mut store, 0xDD, 1, 1, 1, 0);
+    let h1 = remote_merge_one(&mut store, 0xDD, 2, 1, 1, 0);
     // Free the slot directly.
     store.free_cell_at(h1.index);
-    // Reuse the slot via a new merge.
-    let h2 = remote_merge_one(&mut store, 0xDD, 2, 1, 1, 0);
+    // Reuse the slot via a new merge (the bucket's others cell is still
+    // there, so the new contributor takes the freed slot).
+    let h2 = remote_merge_one(&mut store, 0xDD, 3, 1, 1, 0);
     assert_eq!(h1.index, h2.index);
     assert_ne!(h1.generation, h2.generation);
     // Old handle does not resolve.
@@ -1247,9 +1314,9 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
 
     // now=150ms -> current bucket 3. A 101ms window spans ceil(101/50)=3
     // buckets, so bucket 0 is still live. Floor division would use 2 live
-    // buckets and expire this cell.
+    // buckets and expire the contributor's cell and its others cell.
     assert_eq!(expirations.len(), 0);
-    assert_eq!(store.active_len(), 1);
+    assert_eq!(store.active_len(), 2);
 }
 
 // --- Coverage extensions (Gaps 1-6) -----------------------------------
@@ -1324,6 +1391,7 @@ fn assert_invariants_with_pinned_rules(
         *rules.entry(*slot).or_default() += 1;
     }
     *nodes.entry(store.local_node_slot()).or_default() += 1;
+    *nodes.entry(store.others_node_slot()).or_default() += 1;
 
     if active != store.active_len() || store.index().len() != active {
         return false;
@@ -1488,6 +1556,24 @@ fn apply_mixed_op_to_model(model: &mut BTreeMap<PortableKey, u32>, op: &MixedOp)
     }
 }
 
+/// `model` (contributor and local cells) plus, for every bucket whose
+/// contributors sum above zero, the others cell holding that sum. Contributor
+/// and others cells share a bucket, so they expire together and the sum
+/// stays the sum of the contributors present.
+fn with_others(model: &BTreeMap<PortableKey, u32>) -> BTreeMap<PortableKey, u32> {
+    let mut out = model.clone();
+    let mut sums = BTreeMap::<PortableKey, u32>::new();
+    for (&(rule, key, bucket, origin, inc), &count) in model {
+        if (origin, inc) != (local().node_id.0, local().incarnation) {
+            *sums
+                .entry((rule, key, bucket, OTHERS.node_id.0, OTHERS.incarnation))
+                .or_default() += count;
+        }
+    }
+    out.extend(sums.into_iter().filter(|&(_, sum)| sum > 0));
+    out
+}
+
 // Gap 1 + Gap 2: mixed local+remote+expire ops, with `applies_locally`
 // driven by the pinned-fingerprint set so the flag is no longer uniformly
 // false across the QC suite.
@@ -1520,7 +1606,7 @@ fn quickcheck_mixed_ops_match_model(ops: MixedOps) -> bool {
             }
         }
 
-        if portable_snapshot(&store) != model {
+        if portable_snapshot(&store) != with_others(&model) {
             return false;
         }
         if !assert_invariants_with_pinned_rules(&store, &pinned_rule_slots) {
@@ -1586,12 +1672,15 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
     rows: TightRemoteRows,
 ) -> TestResult {
     let mut store = quickcheck_store_tight();
-    // Model mirrors translate_identity → upsert: rule intern first, then
-    // node intern, then cell alloc. A failing intern is permanent for the
-    // row (skip) but the slot it already took stays consumed.
+    // Model mirrors merge_remote: a row claiming the local identity is
+    // skipped; then rule intern, node intern, contributor cell alloc and, if
+    // the contributor rose, the others cell's alloc. A failing intern is
+    // permanent for the row (skip) but the slot it already took stays
+    // consumed.
     let mut interned_rules: BTreeSet<u128> = BTreeSet::new();
     let mut interned_nodes: BTreeSet<(u128, Incarnation)> = BTreeSet::new();
     interned_nodes.insert((local().node_id.0, local().incarnation));
+    interned_nodes.insert((OTHERS.node_id.0, OTHERS.incarnation));
     let mut cells: BTreeMap<PortableKey, u32> = BTreeMap::new();
     let mut model_rule_full = 0_u64;
     let mut model_node_full = 0_u64;
@@ -1614,6 +1703,9 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
         let mut sink = DeltaSink::with_capacity(1);
         store.merge_remote(&obs, &mut sink);
 
+        if (origin, inc) == (local().node_id.0, local().incarnation) {
+            continue;
+        }
         if !interned_rules.contains(&fp) {
             if interned_rules.len() >= 2 {
                 model_rule_full += 1;
@@ -1635,12 +1727,26 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
             origin,
             inc,
         );
-        if let Some(stored) = cells.get_mut(&key) {
-            *stored = (*stored).max(row.count);
+        let previous = match cells.get(&key) {
+            Some(&stored) => stored,
+            None if cells.len() >= 4 => {
+                model_cell_full += 1;
+                continue;
+            }
+            None => 0,
+        };
+        cells.insert(key, previous.max(row.count));
+        let rise = row.count.saturating_sub(previous);
+        if rise == 0 {
+            continue;
+        }
+        let others = (key.0, key.1, key.2, OTHERS.node_id.0, OTHERS.incarnation);
+        if let Some(sum) = cells.get_mut(&others) {
+            *sum += rise;
         } else if cells.len() >= 4 {
             model_cell_full += 1;
         } else {
-            cells.insert(key, row.count);
+            cells.insert(others, rise);
         }
     }
 
@@ -1829,4 +1935,122 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
     handles_a == handles_b
         && store_a.active_len() == store_b.active_len()
         && portable_snapshot(&store_a) == portable_snapshot(&store_b)
+}
+
+// --- Owner totals and the others cell -------------------------------------
+
+fn totals_row(rule_fp: u128, key: u128, bucket: BucketEpoch, total: u32) -> ObservationBatch<u32> {
+    let mut obs = ObservationBatch::with_capacity(1);
+    // The origin columns of a total are ignored.
+    obs.push(observation(rule_fp, key, bucket, 0x77, 3, total, 0));
+    obs
+}
+
+/// An owner's total raises the others cell to the total less this node's own
+/// hits, and never lowers it: a stale or smaller total is a no-op.
+#[test]
+fn merge_totals_counts_everyone_but_this_node() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    local_increment_one(&mut store, 0x11, 0xabc, 0, 4, 0);
+    let mut sink = DeltaSink::with_capacity(4);
+
+    store.merge_totals(&totals_row(0x11, 0xabc, 0, 10), &mut sink);
+    assert_eq!(sink.len(), 1);
+    assert_eq!((sink.previous[0], sink.current[0]), (0, 6));
+    let rule = store.find_rule(0x11).unwrap();
+    assert_eq!(store.view(rule, KeyHash(0xabc), 0), 10);
+
+    // A total that the node's own hits already cover adds nothing, and an
+    // older, smaller total does not lower the view.
+    sink.clear();
+    store.merge_totals(&totals_row(0x11, 0xabc, 0, 3), &mut sink);
+    store.merge_totals(&totals_row(0x11, 0xabc, 0, 8), &mut sink);
+    assert_eq!(sink.len(), 0);
+    assert_eq!(store.view(rule, KeyHash(0xabc), 0), 10);
+
+    // Own hits the owner has not seen yet keep counting on top.
+    local_increment_one(&mut store, 0x11, 0xabc, 0, 2, 0);
+    assert_eq!(store.view(rule, KeyHash(0xabc), 0), 12);
+    // The owner's next total includes them: the view is the total again.
+    store.merge_totals(&totals_row(0x11, 0xabc, 0, 13), &mut sink);
+    assert_eq!(store.view(rule, KeyHash(0xabc), 0), 13);
+}
+
+/// A node that becomes a key's owner keeps the others count it learned from
+/// the previous owner until its own contributors' cells sum past it, so the
+/// view never drops and never counts a hit twice.
+#[test]
+fn others_cell_is_the_larger_of_totals_and_contributions() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let rule = store.find_rule(0x11).unwrap();
+    let mut sink = DeltaSink::with_capacity(4);
+    store.merge_totals(&totals_row(0x11, 0xabc, 0, 10), &mut sink);
+
+    remote_merge_one(&mut store, 0x11, 2, 1, 6, 0);
+    assert_eq!(store.view(rule, KeyHash(0xabc), 0), 10);
+    remote_merge_one(&mut store, 0x11, 3, 1, 3, 0);
+    assert_eq!(store.view(rule, KeyHash(0xabc), 0), 10);
+    remote_merge_one(&mut store, 0x11, 3, 1, 7, 0);
+    assert_eq!(store.view(rule, KeyHash(0xabc), 0), 13);
+}
+
+/// `key_totals` reports one view total per live bucket of a key, whether the
+/// bucket holds an others cell, only this node's own hits, or both.
+#[test]
+fn key_totals_report_each_bucket_once() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let rule = store.find_rule(0x11).unwrap();
+    // Bucket 0: own hits only. Bucket 1: own hits and a contributor.
+    // Bucket 2: a contributor only. Another key's cells stay out.
+    local_increment_one(&mut store, 0x11, 0xabc, 0, 2, 0);
+    local_increment_one(&mut store, 0x11, 0xabc, 1, 3, 0);
+    local_increment_one(&mut store, 0x11, 0xdef, 1, 9, 0);
+    let mut obs = ObservationBatch::with_capacity(2);
+    obs.push(observation(0x11, 0xabc, 1, 2, 1, 5, 0));
+    obs.push(observation(0x11, 0xabc, 2, 2, 1, 4, 0));
+    store.merge_remote(&obs, &mut DeltaSink::with_capacity(2));
+
+    let mut totals: Vec<(BucketEpoch, u32)> = store
+        .key_totals(rule, KeyHash(0xabc))
+        .map(|t| {
+            assert_eq!((t.rule, t.key_hash), (rule, KeyHash(0xabc)));
+            (t.bucket, t.count)
+        })
+        .collect();
+    totals.sort();
+    assert_eq!(totals, vec![(0, 2), (1, 8), (2, 4)]);
+}
+
+/// A peer cannot speak for this node or for its others cell: rows claiming
+/// either identity are ignored.
+#[test]
+fn merge_remote_ignores_reserved_origins() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut sink = DeltaSink::with_capacity(2);
+    let mut obs = ObservationBatch::with_capacity(2);
+    obs.push(observation(
+        0x11,
+        0xabc,
+        0,
+        local().node_id.0,
+        local().incarnation,
+        5,
+        0,
+    ));
+    obs.push(observation(
+        0x11,
+        0xabc,
+        0,
+        OTHERS.node_id.0,
+        OTHERS.incarnation,
+        5,
+        0,
+    ));
+    store.merge_remote(&obs, &mut sink);
+    assert_eq!(sink.len(), 0);
+    assert_eq!(store.active_len(), 0);
 }

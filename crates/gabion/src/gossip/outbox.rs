@@ -6,9 +6,9 @@
 //! cells that have since expired are recognised by their stale generation
 //! and dropped when next visited.
 //!
-//! A broadcast sends a changed key's whole state, so a round of broadcast
-//! marks every cell it gathers: a queued cell whose key is already in the
-//! round is skipped rather than gathered twice.
+//! A broadcast sends the totals of every live bucket of a changed key, so a
+//! round of broadcast marks every cell of the keys it gathers: a queued cell
+//! whose key is already in the round is skipped rather than gathered twice.
 
 use std::collections::VecDeque;
 

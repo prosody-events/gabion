@@ -12,8 +12,8 @@
 //! discovered membership. A hit is recorded locally at once and queued for
 //! the owner; every `sync_wait` the node sends its unacknowledged cells to
 //! their owners, which fold them, acknowledge them, and every
-//! `broadcast_interval` broadcast the changed cells to every peer. See the
-//! "Design notes" in `crates/gabion/README.md`.
+//! `broadcast_interval` broadcast the per-bucket totals of each changed key
+//! to every peer. See the "Design notes" in `crates/gabion/README.md`.
 
 use std::cell::Cell;
 use std::io;
@@ -24,7 +24,8 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, KeyTotal, NodeId, Observation,
+    ObservationBatch,
 };
 use crate::discovery::PeerEvent;
 use crate::wire::{self, FrameKind, PacketBuf, Packets, WireScratch};
@@ -132,6 +133,8 @@ where
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
+    /// Per-bucket totals of the keys one broadcast carries.
+    totals: Vec<KeyTotal<C>>,
     /// `(peer index, cell)` rows of one sync, sorted to group by owner.
     sync_batch: Vec<(usize, CellHandle)>,
     encode_buf: PacketBuf,
@@ -240,16 +243,21 @@ where
         let (req_tx, req_rx) = mpsc::channel(config.limit_queue_capacity);
 
         let sizing = store.config();
-        let frame_cells = config.max_cells_per_tick.max(config.broadcast_batch_limit);
-        let batch_cells = frame_cells.max(config.wire_limits.max_cells as usize);
+        // A sync sends at most `max_cells_per_tick` cells and an inbound
+        // frame carries at most `max_cells` rows.
+        let batch_cells = config
+            .max_cells_per_tick
+            .max(config.wire_limits.max_cells as usize);
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
         let obs_buf = ObservationBatch::<C>::with_capacity(batch_cells);
         let sink_buf = DeltaSink::<C>::with_capacity(batch_cells);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
-        // A broadcast gathers every live cell of each changed key, each at
-        // most once, so the store's capacity bounds it.
-        let frame_handles = Vec::with_capacity(batch_cells.max(store.capacity() as usize));
+        let frame_handles = Vec::with_capacity(batch_cells);
+        // A broadcast carries each live bucket of a changed key at most once,
+        // and every such bucket holds a cell, so the store's capacity bounds
+        // it.
+        let totals = Vec::with_capacity(store.capacity() as usize);
         let sync_batch = Vec::with_capacity(config.max_cells_per_tick);
         let encode_buf = PacketBuf::for_limits(config.wire_limits);
 
@@ -278,6 +286,7 @@ where
             sink_buf,
             expiration_buf,
             frame_handles,
+            totals,
             sync_batch,
             encode_buf,
             membership,
@@ -497,10 +506,10 @@ where
 
         match kind.get() {
             // The owner's totals: fold them, relay nothing.
-            FrameKind::Broadcast => self.store.merge_remote(&self.obs_buf, &mut self.sink_buf),
-            // Hits for keys this node owns: fold them, broadcast whatever
-            // changed, and acknowledge every cell so the sender stops
-            // re-sending it.
+            FrameKind::Broadcast => self.store.merge_totals(&self.obs_buf, &mut self.sink_buf),
+            // Hits for keys this node owns: fold them, broadcast the keys
+            // whose totals rose, and acknowledge every cell so the sender
+            // stops re-sending it.
             FrameKind::Sync => {
                 self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
                 let capacity = self.store.config().forwarded_dirty_capacity;
@@ -685,14 +694,14 @@ where
         }
     }
 
-    /// Broadcast the whole state of the keys this node owns that changed
-    /// since the last broadcast, at most `broadcast_batch_limit` keys, to
-    /// every peer. A key's state is every live cell the node holds for it,
-    /// so a peer that missed an earlier broadcast catches up on the next
-    /// change to the key.
+    /// Broadcast the per-bucket totals of the keys this node owns that
+    /// changed since the last broadcast, at most `broadcast_batch_limit`
+    /// keys, to every peer. Every live bucket of a key goes out, so a peer
+    /// that missed an earlier broadcast catches up on the next change to the
+    /// key.
     fn handle_broadcast_tick(&mut self) -> Result<(), GossipError> {
         self.ticks_total = self.ticks_total.saturating_add(1);
-        self.frame_handles.clear();
+        self.totals.clear();
         self.outbox.begin_broadcast_round();
         let mut keys = 0;
         while keys < self.config.broadcast_batch_limit {
@@ -714,10 +723,11 @@ where
             keys += 1;
             for cell in self.store.key_cells(row.key.rule, row.key.key_hash) {
                 self.outbox.mark_gathered(cell);
-                self.frame_handles.push(cell);
             }
+            self.totals
+                .extend(self.store.key_totals(row.key.rule, row.key.key_hash));
         }
-        if self.frame_handles.is_empty() || self.membership.peers().is_empty() {
+        if self.totals.is_empty() || self.membership.peers().is_empty() {
             return Ok(());
         }
         self.dirty_ticks = self.dirty_ticks.saturating_add(1);
@@ -804,8 +814,9 @@ where
     // -- sending
     // ---------------------------------------------------------------
 
-    /// Encode `self.frame_handles` as packets of `kind` and offer each to
-    /// `audience`. The packet is encoded once however many peers receive it.
+    /// Encode a frame of `kind` and offer each of its packets to `audience`:
+    /// `self.totals` for a broadcast, `self.frame_handles` otherwise. A
+    /// packet is encoded once however many peers receive it.
     fn send_frame(&mut self, kind: FrameKind, audience: Audience) -> Result<(), GossipError> {
         let identity = self.store.local_identity();
         let header = wire::Header {
@@ -820,14 +831,19 @@ where
             store,
             scratch,
             frame_handles,
+            totals,
             encode_buf,
             membership,
             send_queue,
             transport,
             ..
         } = self;
-        let mut packets = match config.auth_key.as_ref() {
-            Some(key) => Packets::<C>::auth(
+        let key = config.auth_key.as_ref();
+        let mut packets = match (kind, key) {
+            (FrameKind::Broadcast, _) => {
+                Packets::<C>::totals(header, store, totals, key, scratch, config.wire_limits)?
+            }
+            (_, Some(key)) => Packets::<C>::auth(
                 header,
                 store,
                 frame_handles,
@@ -835,7 +851,7 @@ where
                 scratch,
                 config.wire_limits,
             )?,
-            None => {
+            (_, None) => {
                 Packets::<C>::unauth(header, store, frame_handles, scratch, config.wire_limits)?
             }
         };

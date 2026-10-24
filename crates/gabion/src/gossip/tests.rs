@@ -517,7 +517,8 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
     // An owner broadcasts a key when it changes and does not retry, so a key
     // that stays quiet after the heal keeps whatever the partition made
     // peers miss. One more hit to each key, from any single node, makes its
-    // owner broadcast the key's whole state and repairs every peer.
+    // owner broadcast the totals of every live bucket of the key and repairs
+    // every peer.
     let mut touched = BTreeSet::new();
     let touches: Vec<SimRecord> = case
         .records
@@ -1404,8 +1405,8 @@ async fn hits_reach_other_nodes_only_through_the_owner() {
 }
 
 /// A peer that missed an owner's broadcast catches up on the next change to
-/// the key, whichever cell of the key changed: the broadcast carries the
-/// key's whole state.
+/// the key, whichever bucket of the key changed: the broadcast carries the
+/// totals of every live bucket.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn next_change_to_a_key_repairs_a_peer_that_missed_a_broadcast() {
     let local = LocalSet::new();

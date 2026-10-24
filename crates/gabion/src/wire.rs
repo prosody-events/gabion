@@ -36,10 +36,13 @@ pub use header::{
 };
 
 use auth::AUTH_TAG_LEN;
-use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
+use body::{
+    DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, decode_totals_visit,
+    encode_packet_body, encode_totals_body,
+};
 use header::{patch_header, read_header};
 
-use crate::crdt::{CellHandle, CellStore, Count, Observation, ObservationBatch};
+use crate::crdt::{CellHandle, CellStore, Count, KeyTotal, NodeId, Observation, ObservationBatch};
 
 use thiserror::Error;
 
@@ -187,11 +190,28 @@ fn min_payload_bytes(count_size: usize, auth_overhead: usize) -> usize {
 pub struct Packets<'a, C: Count> {
     header: Header,
     store: &'a CellStore<C>,
-    handles: &'a [CellHandle],
+    rows: Rows<'a, C>,
     key: Option<&'a HmacKey>,
     scratch: &'a mut WireScratch,
     limits: FrameLimits,
     cursor: usize,
+}
+
+/// What a frame carries: stored cells (a sync or an acknowledgement) or an
+/// owner's key totals (a broadcast).
+#[derive(Clone, Copy)]
+enum Rows<'a, C: Count> {
+    Cells(&'a [CellHandle]),
+    Totals(&'a [KeyTotal<C>]),
+}
+
+impl<C: Count> Rows<'_, C> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Cells(handles) => handles.len(),
+            Self::Totals(totals) => totals.len(),
+        }
+    }
 }
 
 impl<C: Count> Drop for Packets<'_, C> {
@@ -208,10 +228,12 @@ impl<C: Count> Drop for Packets<'_, C> {
 }
 
 impl<'a, C: Count> Packets<'a, C> {
-    /// Build an unauthenticated packet iterator. The `cluster_id_hash`,
-    /// `sender_node_id`, `sender_incarnation` fields of `header` are copied
-    /// into every packet; the codec overwrites `count_width`, `cell_count`,
-    /// `body_len`, `flags`, `min/max_origin_sequence` on each packet.
+    /// Build an unauthenticated packet iterator over stored cells, for a
+    /// sync or an acknowledgement (the kind in `header.flags`). The
+    /// `cluster_id_hash`, `sender_node_id`, `sender_incarnation` fields of
+    /// `header` are copied into every packet; the codec overwrites
+    /// `count_width`, `cell_count`, `body_len`, `flags`,
+    /// `min/max_origin_sequence` on each packet.
     pub fn unauth(
         header: Header,
         store: &'a CellStore<C>,
@@ -219,7 +241,25 @@ impl<'a, C: Count> Packets<'a, C> {
         scratch: &'a mut WireScratch,
         limits: FrameLimits,
     ) -> Result<Self, EncodeError> {
-        Self::new(header, store, handles, None, scratch, limits)
+        Self::new(header, store, Rows::Cells(handles), None, scratch, limits)
+    }
+
+    /// A broadcast of an owner's key totals, authenticated when `key` is
+    /// set. The header's kind is forced to [`FrameKind::Broadcast`], and its
+    /// `min/max_origin_sequence` are copied into every packet unchanged.
+    pub fn totals(
+        header: Header,
+        store: &'a CellStore<C>,
+        totals: &'a [KeyTotal<C>],
+        key: Option<&'a HmacKey>,
+        scratch: &'a mut WireScratch,
+        limits: FrameLimits,
+    ) -> Result<Self, EncodeError> {
+        let header = Header {
+            flags: header.flags & !(FLAG_SYNC | FLAG_ACK),
+            ..header
+        };
+        Self::new(header, store, Rows::Totals(totals), key, scratch, limits)
     }
 
     /// Authenticated variant — HMAC-SHA256 over each packet's
@@ -233,13 +273,20 @@ impl<'a, C: Count> Packets<'a, C> {
         scratch: &'a mut WireScratch,
         limits: FrameLimits,
     ) -> Result<Self, EncodeError> {
-        Self::new(header, store, handles, Some(key), scratch, limits)
+        Self::new(
+            header,
+            store,
+            Rows::Cells(handles),
+            Some(key),
+            scratch,
+            limits,
+        )
     }
 
     fn new(
         header: Header,
         store: &'a CellStore<C>,
-        handles: &'a [CellHandle],
+        rows: Rows<'a, C>,
         key: Option<&'a HmacKey>,
         scratch: &'a mut WireScratch,
         limits: FrameLimits,
@@ -252,7 +299,7 @@ impl<'a, C: Count> Packets<'a, C> {
         Ok(Self {
             header,
             store,
-            handles,
+            rows,
             key,
             scratch,
             limits,
@@ -260,9 +307,9 @@ impl<'a, C: Count> Packets<'a, C> {
         })
     }
 
-    /// Handles still to be encoded into a packet.
+    /// Rows still to be encoded into a packet.
     pub fn remaining(&self) -> usize {
-        self.handles.len() - self.cursor
+        self.rows.len() - self.cursor
     }
 
     /// Encode the next packet into `buf`. The encoder clears `buf` first.
@@ -271,7 +318,7 @@ impl<'a, C: Count> Packets<'a, C> {
     /// - `Ok(None)` — iterator exhausted.
     pub fn next_into(&mut self, buf: &mut PacketBuf) -> Result<Option<PacketWritten>, EncodeError> {
         buf.inner.clear();
-        if self.cursor >= self.handles.len() {
+        if self.cursor >= self.rows.len() {
             return Ok(None);
         }
 
@@ -283,14 +330,24 @@ impl<'a, C: Count> Packets<'a, C> {
 
         // Reserve the header slot; encode_packet_body appends the body.
         buf.inner.resize(HEADER_LEN, 0);
-        let encoded = encode_packet_body::<C>(
-            self.store,
-            self.handles,
-            self.cursor,
-            body_budget,
-            self.scratch,
-            &mut buf.inner,
-        );
+        let encoded = match self.rows {
+            Rows::Cells(handles) => encode_packet_body::<C>(
+                self.store,
+                handles,
+                self.cursor,
+                body_budget,
+                self.scratch,
+                &mut buf.inner,
+            ),
+            Rows::Totals(totals) => encode_totals_body::<C>(
+                self.store,
+                totals,
+                self.cursor,
+                body_budget,
+                self.scratch,
+                &mut buf.inner,
+            ),
+        };
 
         // A stale-only run with no emitted cells advances the cursor and
         // emits an empty packet — but only if the dropped handles are real.
@@ -302,7 +359,7 @@ impl<'a, C: Count> Packets<'a, C> {
         }
 
         let next_cursor = self.cursor + encoded.handles_consumed;
-        let more = next_cursor < self.handles.len();
+        let more = next_cursor < self.rows.len();
 
         let mut flags = self.header.flags;
         if more {
@@ -321,8 +378,10 @@ impl<'a, C: Count> Packets<'a, C> {
         packet_header.count_width = std::mem::size_of::<C>() as u32;
         packet_header.cell_count = encoded.cells_emitted;
         packet_header.body_len = encoded.body_len as u32;
-        packet_header.min_origin_sequence = encoded.min_origin_sequence;
-        packet_header.max_origin_sequence = encoded.max_origin_sequence;
+        if let Rows::Cells(_) = self.rows {
+            packet_header.min_origin_sequence = encoded.min_origin_sequence;
+            packet_header.max_origin_sequence = encoded.max_origin_sequence;
+        }
 
         patch_header(&mut buf.inner[..HEADER_LEN], &packet_header);
 
@@ -433,9 +492,7 @@ fn decode_inner<C: Count>(
     };
 
     let header = read_header(frame)?;
-    if FrameKind::from_flags(header.flags).is_none() {
-        return Err(DecodeError::BadKind);
-    }
+    let kind = FrameKind::from_flags(header.flags).ok_or(DecodeError::BadKind)?;
     if header.count_width as usize != std::mem::size_of::<C>() {
         return Err(DecodeError::BadCountWidth);
     }
@@ -464,7 +521,18 @@ fn decode_inner<C: Count>(
     }
 
     let body_bytes = &frame[HEADER_LEN..HEADER_LEN + body_len];
-    decode_body_visit::<C>(body_bytes, header.cell_count, on_cell)?;
+    match kind {
+        FrameKind::Broadcast => decode_totals_visit::<C>(
+            body_bytes,
+            header.cell_count,
+            NodeId(header.sender_node_id),
+            header.sender_incarnation,
+            on_cell,
+        )?,
+        FrameKind::Sync | FrameKind::Ack => {
+            decode_body_visit::<C>(body_bytes, header.cell_count, on_cell)?
+        }
+    }
 
     Ok(summary)
 }
