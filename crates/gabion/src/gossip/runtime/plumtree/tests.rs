@@ -322,6 +322,28 @@ fn a_duplicate_eager_delivery_prunes_the_sender_for_that_root_only() {
 }
 
 #[test]
+fn a_relay_round_carries_the_local_changes_queued_with_it() {
+    let (mut all, clock) = cluster(3, no_pull());
+    hit(&mut all[0].rt, 1);
+    heartbeat(&mut all[0]);
+    settle(&mut all, |p| p.kind() == FrameKind::Eager);
+
+    // B relays A's change in a relay round; its own hit, queued meanwhile,
+    // goes with it instead of waiting for B's heartbeat.
+    hit(&mut all[1].rt, 2);
+    relay(&mut all, &clock);
+    settle(&mut all, |_| true);
+    let id = all[1].rt.store.local_identity();
+    assert!(
+        all[2]
+            .rt
+            .store
+            .find_node(id.node_id, id.incarnation)
+            .is_some()
+    );
+}
+
+#[test]
 fn a_pruned_edge_carries_no_cells_for_that_root() {
     let (mut all, clock) = cluster(3, no_pull());
     hit(&mut all[0].rt, 1);

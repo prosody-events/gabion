@@ -38,8 +38,8 @@ pub(super) enum Round {
     Heartbeat,
     /// The error budget of some rule was crossed: local and relayed changes.
     Threshold,
-    /// A change arrived `relay_floor` ago: relayed changes only. Local changes
-    /// wait for the shared scheduler.
+    /// A change arrived `relay_floor` ago: local and relayed changes, but no
+    /// expiry, IHAVE or digest.
     Relay,
 }
 
@@ -693,7 +693,7 @@ where
     /// Send the queued changes along their roots' eager edges: one frame per
     /// destination, never back to the peer a change came from.
     fn eager_push(&mut self, round: Round) {
-        self.collect_changes(round);
+        self.collect_changes();
         let changes = std::mem::take(&mut self.pt.unique);
 
         self.pt.routes.clear();
@@ -748,12 +748,10 @@ where
     /// cell counts. Its sender is skipped only if it sent the newest state;
     /// when the state moved on since (a pull brought a newer version), nobody
     /// is skipped.
-    fn collect_changes(&mut self, round: Round) {
+    fn collect_changes(&mut self) {
         let mut batch = std::mem::take(&mut self.pt.batch);
         batch.clear();
-        if round != Round::Relay {
-            batch.append(&mut self.pt.local);
-        }
+        batch.append(&mut self.pt.local);
         batch.append(&mut self.pt.relay);
 
         self.pt.epoch = self.pt.epoch.wrapping_add(1);
@@ -1486,8 +1484,9 @@ where
 
     /// Answer a GRAFT or PULL: the live cells of each requested origin above
     /// the requested sequence, in one pass over the store, at most
-    /// [`defaults::PLUMTREE_REPLY_CELLS`] of them so a reply never floods the
-    /// requester's receive buffer. What did not fit shows up as a difference
+    /// [`defaults::PLUMTREE_REPLY_CELLS`] (and `max_cells_per_tick`, the size
+    /// of `frame_handles`) of them so a reply never floods the requester's
+    /// receive buffer. What did not fit shows up as a difference
     /// in the requester's next repair digest, which pulls it; each reply
     /// starts where the last one stopped, so repeated pulls make progress.
     fn reply_with_cells(&mut self, dst: SocketAddr, kind: FrameKind) {
@@ -1498,6 +1497,7 @@ where
             }
         }
         self.frame_handles.clear();
+        let reply_cap = defaults::PLUMTREE_REPLY_CELLS.min(self.config.max_cells_per_tick);
         let start = self.pt.reply_cursor;
         let rotated = self
             .store
@@ -1506,7 +1506,7 @@ where
             .chain(self.store.active_handles().filter(|h| h.index < start));
         let mut rest = None;
         for handle in rotated {
-            if self.frame_handles.len() >= defaults::PLUMTREE_REPLY_CELLS {
+            if self.frame_handles.len() >= reply_cap {
                 rest = Some(handle.index);
                 break;
             }

@@ -93,9 +93,12 @@ at different edges and keep pruning each other's tree.
   so a quiet origin does not rebuild its tree by flooding every edge.
 - **Eager push.** A node pushes the cells of a round to the peers that are eager
   for their origin, never back to the peer a change came from. Local changes go
-  out in heartbeat and threshold rounds (main's scheduler). A change that
-  arrived from a peer goes out in a relay round `relay_floor` after it arrives,
-  which batches one burst into one frame per edge.
+  out in the next round of any kind: heartbeat, threshold or relay. A change
+  that arrived from a peer goes out in a relay round `relay_floor` after it
+  arrives, which batches one burst into one frame per edge, and that round
+  carries whatever local changes are queued too, as main's relay flush does.
+  Without that, a local change would wait for the 500 ms heartbeat whenever no
+  threshold fire came first, which per-key thresholds make the common case.
 - **PRUNE.** A duplicate delivery on an *eager* frame (the merge did not raise
   the cell) makes the receiver send PRUNE for that origin; the sender moves the
   receiver to its lazy set for that root. One PRUNE per origin per frame.
@@ -136,8 +139,10 @@ at different edges and keep pruning each other's tree.
 | digest settle time | 1 s | `PLUMTREE_DIGEST_SETTLE_MS` |
 | cells per GRAFT or PULL reply | 2,048 | `PLUMTREE_REPLY_CELLS` |
 
-They are the fields of `gossip::PlumtreeConfig`, whose `Default` reads these
-constants. `GossipRuntime::with_plumtree` replaces them; `GossipConfig` is
+The first seven rows are fields of `gossip::PlumtreeConfig`, whose `Default`
+reads their constants; the last four are fixed constants. The repair digest
+(adaptation 6) is always on and has no switch: it replaced the repair slice,
+and a Plumtree without either leaves holes beneath a watermark open. `GossipRuntime::with_plumtree` replaces them; `GossipConfig` is
 unchanged, because adapters and the harness build it field by field.
 `extra_random = 1` is the **hybrid** variant: each round also gives its changes
 to one random peer off the tree of their roots, on frames of kind `Random`.
@@ -203,9 +208,14 @@ Each is the smallest change that lets the paper's algorithm run here.
    window, because it reaches a given cell at a given peer only every few tens
    of seconds. A digest costs 28 bytes per origin and moves cells only where a
    difference exists. It is not part of Plumtree, and is labelled as the study's
-   `digest-repair` component.
+   `digest-repair` component. Its limits: it compares one sum per origin, so a
+   receiver ahead on one cell and behind on another by the same amount sees
+   equal sums and pulls nothing; a cell evicted without a change of the settled
+   range leaves the incremental sum too high until the next rescan; and repair
+   flows one way: a node that is behind is repaired only when a peer that is
+   ahead picks it for a digest.
 7. **Relay round.** The paper forwards on receipt; a relay round waits
-   `relay_floor` to batch. The clock offers only periodic tickers, so the runtime
+   `relay_floor` to batch, and carries the queued local changes with them. The clock offers only periodic tickers, so the runtime
    arms one extra ticker per deadline (`arm_wake`).
 8. **`lazy_targets`.** The paper announces to every lazy peer; the spec caps it
    at 2 per heartbeat. A lost IHAVE is repaired by the full digest.
