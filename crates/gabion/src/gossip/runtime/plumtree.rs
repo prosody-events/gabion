@@ -671,21 +671,28 @@ where
             self.lazy_announce();
             self.send_digest(now);
         }
-        if round != Round::Relay {
-            self.sweep_rule_pending(now);
-        }
         self.check_timers(now);
     }
 
-    /// Reset the per-rule pending counters the threshold trigger reads. Every
-    /// rule with pending hits counts as touched by the round: its hits either
-    /// rode out in a frame or wait in the queue for the next one.
-    fn sweep_rule_pending(&mut self, now_millis: u64) {
-        let stamp = now_millis.max(1);
-        for slot in 0..self.rule_pending.len() {
-            if self.rule_pending[slot] != 0 {
-                self.rule_pending[slot] = 0;
-                self.rule_last_emit_ms[slot] = stamp;
+    /// Zero the pending count of every local cell in the frame just encoded
+    /// and stamp its rule's `rule_last_emit_ms`, so the `min_emit_interval`
+    /// floor measures from this emit. A key whose cell did not fit in any
+    /// frame keeps its count and can fire again on its next hit. Clearing on
+    /// send, not on ack, means the N × ε_R bound holds in expectation under
+    /// UDP loss; NACK and the repair digests recover what was lost. Only
+    /// called once the whole frame is queued for sending: a frame cut short
+    /// leaves its counts.
+    fn clear_emitted_pending(&mut self, stamp: u64) {
+        let local = self.store.local_node_slot();
+        for &handle in &self.frame_handles {
+            if self.pending.is_empty() {
+                return;
+            }
+            let Some(row) = self.store.get(handle) else {
+                continue;
+            };
+            if row.key.origin == local && self.pending.clear(row.key.rule, row.key.key_hash) {
+                self.rule_last_emit_ms[usize::from(row.key.rule)] = stamp;
             }
         }
     }
@@ -712,6 +719,7 @@ where
         self.pt.routes.sort_unstable();
 
         let frame_cap = self.config.max_cells_per_tick;
+        let stamp = self.clock.now_millis().max(1);
         let mut fanout = 0;
         let mut k = 0;
         while k < self.pt.routes.len() {
@@ -726,7 +734,11 @@ where
             }
             if let Some(dst) = self.pt.view[pos as usize] {
                 fanout += 1;
-                self.send_cells(dst, FrameKind::Eager, Numbering::Next);
+                if self.send_cells(dst, FrameKind::Eager, Numbering::Next)
+                    == self.frame_handles.len()
+                {
+                    self.clear_emitted_pending(stamp);
+                }
             }
         }
         if fanout > 0 {

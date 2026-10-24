@@ -37,6 +37,9 @@ use super::transport::UdpTransport;
 use super::{GossipConfig, GossipError, PlumtreeConfig};
 use plumtree::{Edge, NO_POS, Plumtree, Round};
 
+mod pending;
+use pending::PendingHits;
+
 /// One peer the runtime gossips with. `node_id` is `None` until we receive
 /// our first inbound packet from this peer; `peer_slot` caches the
 /// `PeerFrontierTable` slot once interned.
@@ -156,20 +159,19 @@ where
     // path verify the queue actually grew under saturation.
     max_send_pending_depth: usize,
 
-    // Threshold-triggered anti-entropy state. One column per interned rule
-    // slot; sized to `STORAGE_RULE_DICTIONARY_CAPACITY` at construction and
-    // reused for the runtime's lifetime. Total cost ~1 KiB regardless of
-    // rule churn. Indexed by `RuleSlot` to keep the hot path's single
-    // dictionary lookup (`RuleDictionary::find`) the only identity work.
+    // Threshold-triggered anti-entropy state, sized at construction and
+    // reused for the runtime's lifetime.
     //
-    // - `rule_pending[slot]`     — local hits accumulated against rule `slot` since the last
-    //   gossip emit. Zeroed by the post-emit sweep in `handle_gossip_tick`.
-    // - `rule_last_emit_ms[slot]` — wall-clock stamp of the last emit that included this rule
-    //   (also stamped post-emit).
-    rule_pending: Box<[u32]>,
+    // - `pending` — local hits per `(rule, key)` not yet carried by a gossip frame. Sized to the
+    //   local dirty ring, which bounds the keys that can be in flight between emits. Cleared per
+    //   emitted cell by `clear_emitted_pending`.
+    // - `rule_last_emit_ms[slot]` — clock stamp of the last threshold fire or emit that carried
+    //   pending hits of rule `slot`; the `min_emit_interval` floor measures from it. One column
+    //   per interned rule slot, indexed by `RuleSlot`.
+    pending: PendingHits,
     rule_last_emit_ms: Box<[u64]>,
 
-    // Set by `handle_limit_request` when the rule's per-site error budget
+    // Set by `handle_limit_request` when a key's per-site error budget
     // would be exceeded by the new hit and the `min_emit_interval` floor
     // has elapsed. Read at the top of the run loop, which then skips the
     // `tokio::select!` wait and dispatches a synthetic `Tick` outcome.
@@ -189,9 +191,9 @@ where
     // `pick_count` the most recent dirty tick chose (the coverage fanout
     // `⌈ln(n)+c⌉`, scaled by cluster size n, not the dirty set);
     // `peak_effective_fanout` is its high-water mark since startup.
-    // `last_error_budget` is the per-rule
+    // `last_error_budget` is the per-key
     // error budget ε the most recent `handle_limit_request` computed — the
-    // threshold a burst's accumulated `rule_pending` must cross to trigger
+    // threshold one key's accumulated `pending` must cross to trigger
     // an eager (threshold) flush. All three are decision *outputs* that are
     // otherwise lost when their enclosing scope ends.
     last_effective_fanout: usize,
@@ -303,7 +305,7 @@ where
         let pt = Plumtree::new(PlumtreeConfig::default(), &store, config.max_cells_per_tick);
 
         let rule_capacity = store.rule_dictionary().capacity() as usize;
-        let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
+        let pending = PendingHits::with_capacity(store.local_dirty().capacity() as usize);
         let rule_last_emit_ms = vec![0_u64; rule_capacity].into_boxed_slice();
 
         let mut runtime = Self {
@@ -331,7 +333,7 @@ where
             pending_reply: None,
             decode_reject_count: 0,
             max_send_pending_depth: 0,
-            rule_pending,
+            pending,
             rule_last_emit_ms,
             want_immediate_flush: false,
             ticks_total: 0,
@@ -381,7 +383,7 @@ where
             let watch_wake = self.wake.is_some();
 
             let outcome = if self.want_immediate_flush {
-                // A previous limit request crossed the per-rule error
+                // A previous limit request crossed a key's error
                 // budget; skip the wait and dispatch a synthetic tick to
                 // emit the dirty rows immediately. `tick.tick()` is not
                 // consumed, so the heartbeat cadence naturally drifts
@@ -468,31 +470,29 @@ where
     // -- per-arm handlers ---------------------------------------------------
 
     fn handle_limit_request(&mut self, req: LimitRequest) {
-        // Threshold-triggered anti-entropy: track local hits per rule slot
+        // Threshold-triggered anti-entropy: track local hits per (rule, key)
         // and fire an immediate flush once the per-site safe zone (Sharfman,
         // Schuster, Keren — SIGMOD 2006) would be crossed, calibrated by
-        // the Olston/Jiang/Widom (SIGMOD 2003) error budget. Per-site
-        // budget: ε_R = max(1, L × target_err_bps / (10_000 × N)). Total
-        // cluster-wide unreplicated error per rule is bounded by N × ε_R.
-        // `saturating_add` keeps the column monotone across the gap between
-        // crossing and reset; the post-emit sweep in `handle_gossip_tick`
-        // zeroes the slot once a frame is queued.
+        // the Olston/Jiang/Widom (SIGMOD 2003) error budget. The limit L
+        // applies to each key, so the budget does too:
+        // ε_R = max(1, L × target_err_bps / (10_000 × N)), and the
+        // cluster-wide unreplicated error per key is bounded by N × ε_R.
+        // The count saturates across the gap between crossing and reset;
+        // `clear_emitted_pending` zeroes it once the key's cell is framed.
         //
         // Falls through silently when the rule isn't interned yet (first
         // hit for that fingerprint) — the next heartbeat picks it up.
         if let Some(slot) = self.store.rule_dictionary().find(req.rule_fingerprint) {
             let idx = slot as usize;
-            let pending =
-                self.rule_pending[idx].saturating_add(req.hits.min(u32::MAX as u64) as u32);
-            self.rule_pending[idx] = pending;
+            let pending = self.pending.add(slot, req.key_hash, req.hits);
             let peers = self.peers.len().max(1) as u64;
             let limit = req.rule_limit.max(1);
             let bps = self.config.target_err_bps.max(1) as u64;
             let epsilon = ((limit.saturating_mul(bps)) / (10_000 * peers)).max(1);
-            // Surface the budget so observers can see the threshold a burst's
+            // Surface the budget so observers can see the threshold a key's
             // accumulated `pending` must cross to trigger an eager flush.
             self.last_error_budget = epsilon;
-            if (pending as u64) > epsilon {
+            if pending > epsilon {
                 // The runtime's clock is the canonical floor reference, not
                 // `req.now_millis`. Adapter-supplied wall clock and
                 // `self.clock.now_millis()` may live on different epochs
@@ -502,13 +502,19 @@ where
                 // still well-defined in monotonic-rate terms — both fire
                 // and reset use the same clock — so the floor is correct.
                 // `last == 0` is the "never emitted" sentinel so the very
-                // first crossing always fires; the post-emit sweep stamps
-                // `max(1)` so the sentinel is not re-introduced.
+                // first crossing always fires; the stamp is `max(1)` so the
+                // sentinel is not re-introduced.
+                //
+                // The fire stamps the floor itself: whether the firing key's
+                // cell makes the next frame is up to `max_cells_per_tick` and
+                // the store's capacity, and a rule must not fire on every hit
+                // when it does not.
                 let now = self.clock.now_millis();
                 let last = self.rule_last_emit_ms[idx];
                 let floor = self.config.min_emit_interval.as_millis() as u64;
                 if last == 0 || now.saturating_sub(last) >= floor {
                     self.want_immediate_flush = true;
+                    self.rule_last_emit_ms[idx] = now.max(1);
                 }
             }
         }

@@ -1953,13 +1953,16 @@ async fn send_queue_drains_after_recipient_backpressure() {
             let transport_b = router.bind(addr_b);
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
 
+            // A record before each of six heartbeats: six frames for B,
+            // and only the first fits its channel.
             for i in 0..6_u128 {
                 client_a
                     .record(0xBA5, KeyHash(i), 0, 1, 0, 0)
                     .await
                     .unwrap();
+                sim_advance_ticks(Duration::from_millis(100), 1).await;
             }
-            sim_advance_ticks(Duration::from_millis(100), 12).await;
+            sim_advance_ticks(Duration::from_millis(100), 6).await;
 
             let snap_saturated = admin_snapshot(&admin_tx).await;
             assert!(
