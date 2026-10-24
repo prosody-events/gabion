@@ -350,7 +350,7 @@ An audit passed when the auditor returned a pass verdict with no open
 blocker or major; minors never blocked, and fixers repaired them only
 where cheap. A stage allowed at most two audits per design in Stage 2 and
 three in Stages 3 and 4. Thicket ended Stage 2 with a failed audit (one
-open major) and passed after its Stage 2 repair, re-audited in Stage 3 (item 3 below); every other
+open major) and passed after its Stage 3 repair (item 3 below); every other
 design, the per-key fix and the harness passed within the limit, and in
 the end no blocker or major was left open (the records below list the
 open minors). Auditors re-ran tests and a small part of the evidence
