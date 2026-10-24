@@ -89,7 +89,7 @@ def nopk(arm: str) -> str:
 # better: P >= 0.95 and ratio < 0.95; worse: P <= 0.05 and ratio > 1.05;
 # tie: whole 95 % CrI inside [0.95, 1.05]; "credible <5 %": P beyond a threshold
 # but the estimate inside the band; otherwise unsettled. On the difference scale
-# the band is ±5 % of the comparator's posterior mean; two all-zero samples tie.
+# the band is ±5 % of the comparator's posterior median; two all-zero samples tie.
 # ---------------------------------------------------------------------------
 
 def verdict(row: dict | None, comparator_mean: float | None) -> str | None:
@@ -193,7 +193,7 @@ def fig_tradeoff() -> None:
                        label="improved, no per-key (filled)")]
     fig.legend(handles=handles, loc="lower center", ncol=5, frameon=False,
                bbox_to_anchor=(0.5, -0.09))
-    fig.suptitle("Bytes against limited-key staleness p99 (posterior mean, 95 % CrI; log-log). "
+    fig.suptitle("Bytes against limited-key staleness p99 (posterior median, 95 % CrI; lower whiskers clipped at 0.3 %; log-log). "
                  "Lower-left is better.", fontsize=8.5)
     fig.tight_layout()
     fig.savefig(HERE / "fig1_tradeoff.png")
@@ -327,7 +327,7 @@ def fig_bytes_by_regime() -> None:
 
 def write_fronts() -> None:
     """fronts.csv: the non-dominated solutions on (bytes, error metric), by
-    posterior mean, within the baseline set and within the improved set (no
+    posterior median, within the baseline set and within the improved set (no
     per-key tips plus imp-owner-agg), per regime. Every seed is valid for every
     solution, so the means rest on the same three workloads."""
     sets = {

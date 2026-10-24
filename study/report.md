@@ -17,29 +17,37 @@ Every design runs on the same simulator, workload, network model and judge,
 over 13 regimes (3 to 300 pods, loss, churn, a zone partition, a 1 h
 window) and 3 seeds: 468 baseline runs and 819 runs of 21 improved variants,
 1,287 runs in all, every one valid. Statistics are Bayesian: posterior
-means with 95 % equal-tailed credible intervals (CrI) and the posterior
+medians with 95 % equal-tailed credible intervals (CrI) and the posterior
 probability P that a solution is better than its comparator.
 
-Baseline `main` is saturated: at the typical production size (80 pods) its
-limited-key staleness p99 is 177 % [160, 194] of the limit and its median
-convergence 4,775 ms [4,730, 4,821]. Every other design is credibly better
-than `main` on at least 48 of 78 error cells. After each design's
-implementation defects were repaired, the direct-mail family delivers the
-same steady-state accuracy as every other fast-delivery design (staleness p99
-4 % [3.25, 4.75] at 80 pods) for 0.084 to 0.088 of `main`'s bytes; the
-zone hierarchy (`imp-az-hier-nopk`) additionally cuts cross-zone bytes to
-1.26e7 [1.26e7, 1.26e7] against 2.97e8 [2.96e8, 2.98e8] for direct mail,
-heals the zone partition on 3 of 3 seeds in 600 ms [352, 848], and is not
-credibly worse than its own baseline on any error or health cell. Owner
-aggregation reaches 1 % [0.255, 1.75] staleness at 0.0703 [0.0702, 0.0704]
-of `main`'s bytes but over-admits during a partition (staleness p99
+In simulation, baseline `main` saturates at every production-shaped size
+(§9 lists what the simulator does not model; R1 asks for a canary): at the
+typical production size (80 pods) its limited-key staleness p99 is
+177 % [160, 194] of the limit and its median convergence 4,775 ms
+[4,730, 4,821]. Every other design is credibly better than `main` on at
+least 48 of 78 error cells. After each design was repaired, the
+direct-mail, GossipSub and Snow tips reach the same limited-key staleness
+p99 at the metric's one-hit resolution (4 % [3.25, 4.75] at 80 pods), the
+direct-mail tips for 0.084 to 0.088 of `main`'s bytes; improved Plumtree
+is lower (1 % [0.255, 1.75]), probably because its relay rounds also change
+when a node's own changes leave (§8.1). The zone hierarchy
+(`imp-az-hier-nopk`) additionally cuts cross-zone bytes to 1.26e7 [1.26e7,
+1.26e7] against 2.97e8 [2.96e8, 2.98e8] for direct mail, reaches exact
+counts after the zone partition on 3 of 3 seeds in 600 ms [352, 848], and
+is not credibly worse than its own baseline on any error or health cell.
+Owner aggregation reaches 1 % [0.255, 1.75] staleness at 0.0703 [0.0702,
+0.0704] of `main`'s bytes but over-admits during a partition (staleness p99
 365 % [326, 404]). At `prod-typical`, a shared per-key threshold fix, as
 implemented, lowers bytes by a ratio of 0.566 to 0.937 in 9 of 10 designs
 while raising staleness p99 by 3.0 to 3.4 times. We recommend the
 zone-hierarchical direct-mail design without the per-key fix as the
-replacement for `main`. The data suggest, without an ablation to confirm
-it, that the round scheduler rather than the dissemination topology sets
-steady-state accuracy.
+replacement for `main`, after a multi-rule check: that tip keeps a
+per-rule threshold trigger whose firing rate, and so the design's accuracy
+and bytes, depends on the workload. The data suggest, without an ablation
+to confirm it, that the round scheduler rather than the dissemination
+topology sets limited-key staleness; topology still matters for median
+convergence, where baseline Plumtree's and Thicket's relay trees are 1.6
+to 5.4 times slower than direct mail.
 
 ## 1. Introduction
 
@@ -57,7 +65,11 @@ published evaluations use different workloads, network models, metrics and
 implementations, and most do not target tiny, superseding, single-writer
 counter updates ([`research.md`](research.md) §1). The closest prior study
 we found is a master's thesis on a CRDT-counter rate limiter that trades
-precision for performance [30]. No production rate limiter we found
+precision for performance [30]; we have not verified its numbers and cite
+it only as related work. The closest production analogue is Akka
+Distributed Data [25], whose default gossip cadence is an order of
+magnitude slower than our staleness target ([`research.md`](research.md)
+§2.1). No production rate limiter we found
 publishes the byte cost of peer counter synchronisation
 ([`research.md`](research.md) §2.6). The measurements here are therefore
 the primary evidence.
@@ -67,15 +79,18 @@ the primary evidence.
 1. A controlled comparison of eleven dissemination designs plus a
    no-dissemination reference on a single deterministic simulator, with a
    frozen harness that every design must leave byte-identical (§4.4), 13
-   production-shaped regimes, and an independently validated network and
-   byte-accounting model (§4.5).
-2. A baseline result (§5): the shipped design is saturated at every
-   production size, and the fast-delivery designs are indistinguishable on
-   steady-state accuracy, so they differ on bytes and fault behaviour.
-3. An improvement phase (§6) that separates implementation defects from
-   design-inherent limits by repairing each design and judging it against
-   its own baseline, plus a paired ablation of one shared fix, the per-key
-   threshold (§7).
+   production-shaped regimes, and a network and byte-accounting model
+   validated against closed forms, with an independent byte tally and an
+   independent epidemic simulation (§4.5).
+2. A baseline result (§5): in simulation, the shipped design saturates at
+   every production-shaped size (§9; R1's canary caveat), and the
+   fast-delivery designs have the same limited-key staleness p99 at the
+   metric's one-hit resolution, so they differ on bytes, fault behaviour
+   and, for the relay trees, median convergence.
+3. An improvement phase (§6) that repairs each design and judges it against
+   its own baseline, and classifies, by audit judgement, what was repaired
+   as implementation defects and what was left as design-inherent limits,
+   plus a paired ablation of one shared fix, the per-key threshold (§7).
 4. Recommendations with the evidence for each, and a list of what the data
    do not settle (§8, §9).
 
@@ -247,6 +262,19 @@ heal for a solution that healed on at least one seed (79), and 26 health
 cells. A paired comparison includes the time-to-heal cell only when both
 sides healed, so verdict counts are out of 78 or, for such pairs, 79.
 
+Two caveats on reading these metrics. First, *time to heal* is stricter
+than partition repair: it requires every hit in every bucket closed before
+the heal to be exact at every pod, with no tolerance, so it also counts
+same-side hits and ordinary propagation lag. The harness audit warned that
+a design whose steady-state convergence tail approaches the window may
+never "heal" whatever its repair quality (Stage 3). In this report "healed"
+means "reached exact counts", and "never healed" means "did not reach exact
+counts before the buckets expired". Second, convergence values near the
+10 s window are right-censored: a never-converged hit counts only its
+remaining life, so such a value is a lower bound, its tight interval
+describes the bound rather than the true tail, and a ratio against it
+understates the improvement. Tables mark these cells with †.
+
 ### 4.4 Identical-harness enforcement
 
 Every solution is a branch based on `sim/harness` that leaves
@@ -260,7 +288,7 @@ or `README.md`, refuses several commits under one solution label, and
 rejects dirty results. The 1,287 runs carry two harness tree hashes,
 `8fb4e2d` (baseline runs) and `011e8be` (improved runs), which the judge
 verified differ only in those exempt files; it rejected no result
-(`data/judge/rejected.md` in the judge output: "None").
+(`data/judge/rejected.md`: "None").
 
 A solution may use only the harness's documented contract (gossip
 configuration, `CellStore`, `GossipRuntime`, transport, clock, aggregate
@@ -319,9 +347,11 @@ band is a test rule, not evidence, and is not repeated here.
   5.331 [5.235, 5.427] (5.263 inside).
 - *Latency.* 200,000 probes per path; intra-zone mean 250.10 µs
   [249.97, 250.22] (250.0 inside), cross-zone 1,000.14 µs [999.63, 1,000.64]
-  (1,000.0 inside); every delay lies in the configured range and the
-  empirical distribution's Kolmogorov-Smirnov distance from the uniform is
-  0.00225 and 0.00193, under the test's fixed bound of 0.00436.
+  (1,000.0 inside); every delay lies in the configured range. As a
+  descriptive check, the empirical distribution's largest distance from
+  the configured uniform (Kolmogorov-Smirnov distance) is 0.00225 and
+  0.00193; the test compares it with a fixed pass/fail bound, a test rule
+  like the bands above and not evidence.
 - *Byte accounting.* An independent per-socket tally equals the network's
   counters exactly (6,095,936 B over the `tiny` run).
 - *Receive buffer.* The drop decision agrees with a reference queue model on
@@ -342,23 +372,28 @@ standard library only.
 `y_1..y_n` are modelled as Normal(μ, σ²) with prior p(μ, σ) ∝ 1/σ on
 σ ≥ σ_min. σ_min = h/√12 is the metric's rounding noise on its reporting
 grid h (`RESOLUTION` in `judge.py`): 1 for counts and integer hit
-quantiles (bytes, drops, send-queue depth), 100/limit for a percentage of
-the limit, 1/hits for a fraction of hits, 100 ms for the time to heal; a
-metric with no declared grid has σ_min = 0 (the Jeffreys prior). Let
+quantiles (bytes, drops, send-queue depth), 100/limit for the staleness
+p99 and worst-key over-admission percentages, 1/hits for a fraction of
+hits, 100 ms for the time to heal; a metric with no declared grid,
+including mean over-admission (`over_mean_pct`), has σ_min = 0 (the
+Jeffreys prior). Let
 κ = (n − 1)s² / (2σ_min²). When the floor removes negligible posterior mass
 (κ ≥ 30 + (n−1)/2 + 10√((n−1)/2)), the posterior of μ is Student t with
 n − 1 degrees of freedom, location the sample mean and scale s/√n.
 Otherwise it is the normal mixture over σ cut at σ_min, integrated
 numerically. The judge reports the posterior median of μ (the sample mean)
 and its 95 % equal-tailed credible interval, which for this symmetric
-unimodal posterior is also the highest-density interval. The model ignores
+unimodal posterior is also the highest-density interval; the posterior
+mean coincides with the median, and this report says "posterior median"
+throughout. The model ignores
 bounds, so a count that ties at 0 gets an interval reaching below 0
 (for example a never-converged fraction of `0 [-0.000144, 0.000144]`). One
 seed, or seeds that agree exactly on a metric without a grid, give an
 improper posterior and no interval.
 
 **Paired comparisons.** A solution is compared with its comparator over the
-seeds valid for both (here always 3). When every paired value is positive,
+seeds valid for both (3 in every cell except one per-key time-to-heal cell
+for GossipSub, which has 1 and no interval). When every paired value is positive,
 the judge models d_i = ln a_i − ln b_i with rounding noise
 h_a²/(12a²) + h_b²/(12b²) by the delta method and reports the
 geometric-mean ratio exp(mean d) with its 95 % CrI. Otherwise it models the
@@ -381,7 +416,7 @@ the ratio is below 0.95; **worse** if P ≤ 0.05 and the ratio is above 1.05;
 **tie** if the whole 95 % CrI lies inside [0.95, 1.05]; **credible but
 < 5 %** if P passes a threshold with the estimate inside the band;
 **unsettled** otherwise. On the difference scale the band is ±5 % of the
-comparator's posterior mean, and two all-zero samples tie. The
+comparator's posterior median, and two all-zero samples tie. The
 classification is ours, not the judge's; it is implemented in
 `figures/make_figures.py` and its output is `figures/verdicts.csv`. With 3
 seeds a "worse" cell can have an interval that includes 1 (for example a
@@ -389,7 +424,7 @@ ratio of 2.00 [0.869, 4.60], P 0.036), so the counts summarise; the
 intervals decide.
 
 **Fronts.** `figures/fronts.csv` lists the solutions not dominated on
-(bytes, error metric) by posterior mean, within the baselines and within
+(bytes, error metric) by posterior median, within the baselines and within
 the improved variants. Fronts ignore uncertainty; the judge's own fronts
 over all 33 solutions are in `data/judge/pareto.md`.
 
@@ -402,12 +437,12 @@ solution s, regime r, metric m (absolute value, and ratio or Δ against
 caption names one source for all its cells. `[A: arm]` refers to the Stage
 2 and Stage 4 implementation and audit records of the study, which are not
 part of this snapshot; the code changes they describe are the commits on
-the named public branches. Numbers are posterior mean [95 % CrI], with P
+the named public branches. Numbers are posterior median [95 % CrI], with P
 where a comparison is made.
 
 ## 5. Results: baselines
 
-### 5.1 `main` is saturated
+### 5.1 `main` saturates in simulation
 
 At `prod-typical`, `main` sends 5.01e9 [4.98e9, 5.04e9] bytes in the 60 s
 window, its limited-key staleness p99 is 177 % [160, 194] of the limit,
@@ -415,13 +450,17 @@ worst-key over-admission 209 % [170, 248], and median convergence
 4,775 ms [4,730, 4,821] (Table 4). It drops 1,127 [737, 1,517] datagrams at
 receive buffers at 80 pods and 22,876 [21,582, 24,171] at 300 pods
 `[P: main/*/drop_rcvbuf_pkts]`; at `prod-4x` 0.538 [0.527, 0.549] of hits
-never converge, and every `prod-4x` seed is flagged for forwarded
-dirty-ring overflow on 293 to 296 of 300 nodes `[J: flags.md]`. The Stage 4
-diagnosis [A: main] traced this to two defects: the per-peer frontier
+never converge, and every `prod-4x` seed is flagged for dirty-ring overflow
+on 293 to 296 of 300 nodes (the warning names the forwarded ring)
+`[J: flags.md]`. The Stage 4 diagnosis [A: main] traced this to two
+defects: the per-peer frontier
 compared sequence numbers from two unrelated numberings, so it skipped
 cells peers never had; and frames never drained the dirty rings, so every
 round re-sent the whole store oldest first and exhausted the 128-slot send
-pool, leaving new changes queued behind old ones. The shipped code
+pool, leaving new changes queued behind old ones. The overflow flag is a
+symptom of those never-drained rings rather than a measure of live data
+lost: the commit that drains them (`de37e35`) records that nearly every
+entry the forwarded ring overwrote was stale. The shipped code
 documents the frontier as a deliberate, gap-blind latency optimisation
 backed by an unconditional repair lane (`fdf7390`, `crates/gabion/src/crdt.rs`,
 `fill_gossip_frame_for_peer`); it works as documented, but it prunes cells
@@ -441,7 +480,7 @@ other columns absolute. Source: `[P: <solution>/prod-typical/<metric>]`.
 | design | bytes / `main` | staleness p99, % | worst-key over-admission, % | conv p50, ms | conv p99 incl. never, ms | never converged |
 |---|---|---|---|---|---|---|
 | main | 1 | 177 [160, 194] | 209 [170, 248] | 4,775 [4,730, 4,821] | 6,239 [6,035, 6,444] | 0 [-0.000135, 0.000135] |
-| flat-once | 0.324 [0.323, 0.325] | 8 [5.52, 10.5] | 13 [8.03, 18] | 224 [217, 231] | 9,256 [9,052, 9,460] | 0.0137 [0.00892, 0.0185] |
+| flat-once | 0.324 [0.323, 0.325] | 8 [5.52, 10.5] | 13 [8.03, 18] | 224 [217, 231] | 9,256 [9,052, 9,460]† | 0.0137 [0.00892, 0.0185] |
 | gossipsub | 0.647 [0.624, 0.672] | 4 [3.25, 4.75] | 6.33 [2.54, 10.1] | 25.9 [23.9, 27.8] | 337 [306, 369] | 0 [-0.000144, 0.000144] |
 | plumtree | 0.107 [0.106, 0.108] | 4.33 [2.88, 5.78] | 6.67 [1.5, 11.8] | 42.1 [38.8, 45.4] | 355 [321, 389] | 0 [-0.000144, 0.000144] |
 | thicket | 0.222 [0.221, 0.223] | 4.33 [2.88, 5.78] | 7 [2.03, 12] | 39.8 [37.4, 42.3] | 417 [364, 471] | 0.000258 [-0.000477, 0.000994] |
@@ -451,23 +490,42 @@ other columns absolute. Source: `[P: <solution>/prod-typical/<metric>]`.
 | az-hier | 0.0845 [0.0839, 0.0851] | 4 [3.25, 4.75] | 6.33 [2.54, 10.1] | 25.2 [22.7, 27.7] | 337 [306, 368] | 0 [-0.000144, 0.000144] |
 | scuttlebutt | 0.069 [0.0689, 0.0691] | 25.7 [21.9, 29.5] | 36 [31.7, 40.3] | 721 [714, 727] | 1,039 [983, 1,095] | 0 [-0.000142, 0.000142] |
 | owner-agg | 0.258 [0.256, 0.26] | 7.67 [6.22, 9.12] | 10.3 [6.54, 14.1] | 101 [99.3, 102] | 186 [185, 187] | 0 [-0.000144, 0.000144] |
-| local-only | 0 | 892 [850, 933] | 840 [792, 888] | 9,499 [9,476, 9,522] | 9,990 [9,985, 9,994] | 1 [1, 1] |
+| local-only | 0 | 892 [850, 933] | 840 [792, 888] | 9,499 [9,476, 9,522]† | 9,990 [9,985, 9,994]† | 1 [1, 1] |
 
-### 5.2 Steady state: fast-delivery designs are scheduler-bound
+† Right-censored lower bound near the 10 s window (§4.3).
+
+### 5.2 Steady state: fast-delivery designs share a staleness floor
 
 Seven designs, which we call the fast-delivery designs (GossipSub, the
 three tree designs and the three direct-mail designs), reach the same
-steady-state accuracy at `prod-typical`:
-staleness p99 of 4 % [3.25, 4.75] (GossipSub, direct-ack, bimodal,
-az-hier) or 4.33 % [2.88, 5.78] (Plumtree, Thicket, Snow), and convergence
-p99 between 336 and 417 ms (Table 4). For the direct-mail designs and
+limited-key staleness p99 at `prod-typical`, at the metric's one-hit
+resolution: 4 % [3.25, 4.75] (GossipSub, direct-ack, bimodal, az-hier) or
+4.33 % [2.88, 5.78] (Plumtree, Thicket, Snow), with convergence p99
+between 336 and 417 ms (Table 4). For the direct-mail designs and
 GossipSub the rows agree within one hit on staleness and within 5 % on
 convergence (p50 24.8 to 25.9 ms, p99 336 to 337 ms).
-These designs deliver a change to every pod in a few sub-millisecond
-hops, so what remains is the time a change waits to leave its origin:
-the 500 ms heartbeat, or a threshold round. The data are consistent with
-the shared scheduler, not the topology, setting steady-state accuracy
-(§8.1).
+These designs deliver a change to every pod in a few hops of about a
+millisecond or less, so what remains is the time a change waits to leave
+its origin: the 500 ms heartbeat, or a threshold round. The data are
+consistent with the shared scheduler, not the topology, setting
+limited-key staleness at that resolution (§8.1).
+
+Median convergence does separate them by topology. Plumtree's and
+Thicket's relay trees take 42.1 ms [38.8, 45.4] and 39.8 ms [37.4, 42.3]
+at `prod-typical` against 24.8 ms [22.7, 27.0] for direct-ack, about 1.6
+to 1.7 times as long, and at `prod-4x` 32.8 ms [31.5, 34.0] and 23.6 ms
+[21.7, 25.4] against 6.12 ms [4.63, 7.60], about 3.9 to 5.4 times; Snow's
+trees, whose packets carry each child's range, stay close to direct mail
+(26.8 and 8.51 ms) `[P: */prod-typical, prod-4x/conv_p50_incl_never_ms]`.
+After repair Thicket stays 1.55 and 4.0 times slower (38.5 ms [36.1,
+41.0] and 24.6 ms [24.2, 25.0] against 24.9 and 6.12 ms for
+`imp-direct-ack-nopk`), and improved Plumtree, whose relay rounds now
+carry local changes (§8.1), is faster than direct mail at 80 pods (19.8 ms
+[18.5, 21.0]) but 4.7 times slower at 300 (28.9 ms [28.2, 29.5]). These
+are ratios of posterior medians whose intervals do not overlap, not paired
+comparisons. Thicket's convergence p99 is also higher, 417 ms [364, 471]
+against 337 ms [305, 368] for direct-ack, though those intervals overlap
+(Table 4).
 
 What separates them is bytes: at `prod-typical` from 0.0845 [0.0839,
 0.0851] of `main` (az-hier) to 0.647 [0.624, 0.672] (GossipSub). Among the
@@ -486,40 +544,55 @@ near `1 − exp(−exp(−3))` [14], and its only repair is a slow rotating slic
 ### 5.3 Scale
 
 At 300 pods (`prod-4x`, Table 5) the designs separate on bytes. GossipSub
-costs 3.16 [3.1, 3.21] times `main`'s bytes, as its design leads one to
-expect from eager mesh duplicates and per-heartbeat `IHAVE` to a quarter of
-the cluster (no byte breakdown by message type was measured), and flat-once
-1.54 [1.54, 1.54].
+costs 3.16 [3.1, 3.21] times `main`'s bytes, and flat-once 1.54 [1.54,
+1.54]. GossipSub's design leads one to expect eager mesh duplicates and
+per-heartbeat `IHAVE` to a quarter of the cluster (one Stage 4 probe at
+`prod-typical` put eager forwards at 73 % of its bytes and `IHAVE` at
+26 %), but the Stage 4 diagnosis also traces much of its message count, and
+so its per-message overhead, to the shared per-rule threshold trigger,
+which published about every second hit as a one-cell message
+[A: gossipsub]; the per-key fix alone cuts its `prod-typical` bytes to
+0.584 [0.547, 0.623] (§7).
 Plumtree is the cheapest accurate design, at 0.247 [0.247, 0.248], then
 bimodal (0.359 [0.358, 0.359]) and direct-ack (0.376 [0.376, 0.376]).
 Baseline az-hier starved its send pool when the 100-pod zones outgrew it:
 convergence p99 9,859 ms [9,656, 10,062] and 0.0994 [0.0202, 0.179] of hits
 never converged. Baseline Thicket dropped 1.84e5 [1.79e5, 1.88e5]
-datagrams at receive buffers `[P: thicket/prod-4x/drop_rcvbuf_pkts]`, and
-every `prod-4x` seed of Snow is flagged for dirty-ring overflow on all 300
-nodes `[J: flags.md]`.
+datagrams at receive buffers `[P: thicket/prod-4x/drop_rcvbuf_pkts]`. Every
+`prod-4x` seed of Snow is also flagged for dirty-ring overflow on all 300
+nodes `[J: flags.md]`, but that flag is spurious: the shared merge path fed
+a forwarded ring that only `main`'s frame filler reads, and Snow never
+reads it (fixed in `42cd7b7`; [A: snow]).
 
 **Table 5.** Baselines at `prod-4x` (300 pods). Source:
 `[P: <solution>/prod-4x/<metric>]`.
 
 | design | bytes / `main` | staleness p99, % | conv p99 incl. never, ms | never converged |
 |---|---|---|---|---|
-| main | 1 | 461 [428, 494] | 9,975 [9,971, 9,980] | 0.538 [0.527, 0.549] |
-| flat-once | 1.54 [1.54, 1.54] | 5 [4.25, 5.75] | 9,599 [9,358, 9,839] | 0.0298 [0.0181, 0.0415] |
+| main | 1 | 461 [428, 494] | 9,975 [9,971, 9,980]† | 0.538 [0.527, 0.549] |
+| flat-once | 1.54 [1.54, 1.54] | 5 [4.25, 5.75] | 9,599 [9,358, 9,839]† | 0.0298 [0.0181, 0.0415] |
 | gossipsub | 3.16 [3.1, 3.21] | 2 [1.25, 2.75] | 144 [126, 161] | 0 [-0.000145, 0.000145] |
 | plumtree | 0.247 [0.247, 0.248] | 3 [2.25, 3.75] | 169 [156, 181] | 0 [-0.000144, 0.000144] |
 | thicket | 0.724 [0.722, 0.725] | 3 [2.25, 3.75] | 248 [139, 357] | 0.000904 [0.000178, 0.00163] |
 | snow | 0.569 [0.569, 0.57] | 2 [1.25, 2.75] | 146 [124, 167] | 0 [-0.000145, 0.000145] |
 | direct-ack | 0.376 [0.376, 0.376] | 2 [1.25, 2.75] | 144 [129, 158] | 0 [-0.000145, 0.000145] |
 | bimodal | 0.359 [0.358, 0.359] | 2 [1.25, 2.75] | 143 [127, 159] | 0 [-0.000145, 0.000145] |
-| az-hier | 0.526 [0.478, 0.579] | 8 [3.03, 13] | 9,859 [9,656, 10,062] | 0.0994 [0.0202, 0.179] |
+| az-hier | 0.526 [0.478, 0.579] | 8 [3.03, 13] | 9,859 [9,656, 10,062]† | 0.0994 [0.0202, 0.179] |
 | scuttlebutt | 0.293 [0.292, 0.293] | 16.3 [14.9, 17.8] | 551 [539, 563] | 0 [-0.000143, 0.000143] |
 | owner-agg | 0.87 [0.868, 0.871] | 8 [7.25, 8.75] | 186 [182, 190] | 0 [-0.000144, 0.000144] |
 
-At the other end of scale (`low-3`, `low-5`) every accurate design ties on
-error and the direct-mail designs are cheapest: az-hier at 0.0257 [0.0249,
-0.0265] and direct-ack at 0.0262 [0.0254, 0.027] of `main`'s bytes at
-`low-3` `[P: */low-3/bytes_total]`. In `long-window` the baseline owner
+† Right-censored lower bound near the 10 s window (§4.3).
+
+At the other end of scale (`low-3`, `low-5`) every disseminating baseline but Scuttlebutt
+has the same staleness p99, 5 % [1.27, 8.73] at `low-3` and 10 % [6.27,
+13.7] at `low-5` (Scuttlebutt 10 % and 15 %)
+`[P: */low-*/stale_limited_p99_pct]`, and the direct-mail designs are
+cheapest: az-hier at 0.0257 [0.0249, 0.0265] and direct-ack at 0.0262
+[0.0254, 0.027] of `main`'s bytes at `low-3` `[P: */low-3/bytes_total]`.
+Convergence does differ: owner aggregation's convergence p99 is 189 ms
+[176, 202] at `low-3` and 190 ms [187, 194] at `low-5`, against about 452
+and 483 ms for most designs, and Thicket's is 512 ms [435, 589] and 704 ms
+[546, 862] `[P: */low-*/conv_p99_incl_never_ms]`. In `long-window` the baseline owner
 aggregation is the outlier: it re-broadcast every contributor cell of a key
 on each change and sent 5.65 [5.64, 5.66] times `main`'s bytes
 `[P: owner-agg/long-window/bytes_total]`.
@@ -543,8 +616,9 @@ classify as implementation defects (§6.5):
   [9,493, 10,779] under flat-once, against 1,337 ms [591, 2,083] under
   Scuttlebutt, the fastest `[P: */churn-rollout/churn_parity_max_ms]`.
 - **Partition.** Only direct-ack (3,100 ms [2,443, 3,757]) and Scuttlebutt
-  (1,000 ms [503, 1,497]) healed the 30 s zone cut on all three seeds; no
-  other baseline healed on any seed `[P: */az-partition/part_time_to_heal_ms]`.
+  (1,000 ms [503, 1,497]) healed the 30 s zone cut (reached exact
+  closed-bucket counts, §4.3) on all three seeds; no other baseline did on
+  any seed `[P: */az-partition/part_time_to_heal_ms]`.
   In every design about 30 % or more of the hits never converge (`main`
   0.335 [0.324, 0.346]), because a 30 s cut is longer than the 10 s window
   and cross-cut hits expire before the heal.
@@ -616,7 +690,8 @@ repair budget rose from 256 to 2,048 cells per heartbeat (a flagged
 departure from the specification), and the send queue grew from 512 to
 1,024 slots. Never-converged hits went to 0: `prod-typical` Δ −0.0137
 [−0.0185, −0.0089], P 0.997, with convergence p99 0.0986 [0.0918, 0.106]
-of baseline (913 against 9,256 ms). Joiner parity fell to 0.223 [0.172,
+of baseline (913 against 9,256 ms; the baseline value is a censored lower
+bound, so the ratio overstates the remaining fraction, §4.3). Joiner parity fell to 0.223 [0.172,
 0.29] of baseline (2,268 against 10,136 ms). Bytes rose where nothing is
 missing: `idle` 1.18 [1.15, 1.20], `churn-rollout` 1.13 [1.12, 1.13]. Which
 of the changes costs these bytes is not separated (§9, *Separability*).
@@ -628,7 +703,11 @@ of the changes costs these bytes is not separated (§9, *Separability*).
 [0.111, 0.154] of baseline, and partition expired-unrepaired hits Δ −1.34
 [−1.40, −1.28]. It is credibly worse on three cells, for example churn
 convergence p99 1.12 [1.09, 1.14] (762 against 683 ms). Bytes are
-unchanged; the arm's cost is its specification (`D`, gossip factor).
+unchanged. The diagnosis attributes the per-message cost to the
+specification (`D`, gossip factor) but much of the message count to the
+shared per-rule threshold trigger, which published about every second hit
+as a one-cell message; the per-key fix alone cuts `prod-typical` bytes to
+0.584 [0.547, 0.623] (§7).
 
 **plumtree** (`6c6a08d`). `IHAVE` and `GRAFT` compare with what the tree
 delivered; per-origin digest repair replaced the blind slice; an edge
@@ -669,7 +748,8 @@ p50 0.960 [0.952, 0.968], inside the tie band.
 digesting, and compact digest entries. Churn staleness p99 0.0787 [0.055,
 0.113] of baseline (4.67 against 59.0 %), joiner parity 0.493 [0.305,
 0.796]; loss convergence p99 0.798 [0.771, 0.827] at 5 % loss. The
-partition still never heals: expired-unrepaired 0.731 [0.582, 0.919] of
+partition still never heals (no seed reaches exact counts before expiry,
+§4.3): expired-unrepaired 0.731 [0.582, 0.919] of
 baseline, 0.189 [0.179, 0.2] hits per (pod, key). The compact digest
 changed the encoding without a wire version bump (open audit item).
 
@@ -677,7 +757,9 @@ changed the encoding without a wire version bump (open audit item).
 instead of starving the end of the peer table; gap reports trigger an
 immediate resend; a gateway forwards fresh cells after failover; joiners
 and silent leaves trigger a zone sweep. At `prod-4x` convergence p99 fell to
-0.0146 [0.0133, 0.0159] of baseline (144 against 9,859 ms) and bytes to
+0.0146 [0.0133, 0.0159] of baseline (144 against 9,859 ms, a censored lower
+bound, so the ratio bounds the improvement rather than estimating it) and
+bytes to
 0.695 [0.631, 0.764]; loss convergence p50 to 0.287 [0.278, 0.297] at 5 %
 loss; the partition heals in 600 ms [352, 848] on 3 of 3 seeds. No error or
 health cell is worse. Total bytes at 20 % loss rose to 1.20 [1.19, 1.21]
@@ -728,10 +810,10 @@ Without per-key, staleness reaches 4.33 % [2.88, 5.78] at 0.386 [0.384,
 fix. Which of `imp-main`'s other changes causes it is not separated (§9,
 *Separability*); the audit flags one candidate, a welcome chunk that can
 take every free send slot so that the next round returns early, but calls
-the link unproven [A: main]. At `prod-4x` bytes *rise* to 1.56
-[1.56, 1.56] of `main`, because baseline `main` was saturated rather than
-frugal; `imp-main` leaves only 0.00905 [0.00789, 0.0102] of hits
-unconverged there.
+the link unproven [A: main]. At `prod-4x` bytes *rise*, `imp-main`'s to
+1.56 [1.56, 1.56] of `main` and `imp-main-nopk`'s to 1.77 [1.77, 1.78],
+because baseline `main` was saturated rather than frugal; `imp-main`
+leaves only 0.00905 [0.00789, 0.0102] of hits unconverged there.
 
 After these repairs `main` is structurally a send-once push design with
 repair, close to flat-once, and its relay pacer is a third scheduler in
@@ -785,27 +867,39 @@ branch commit messages; numbers as cited in §6.2.
 | snow | single rebroadcast with only a slow slice behind it; Karn-starved timer; dead interior node cut off its subtree | `N − 1` data plus `N − 1` acks per broadcast |
 | direct-ack | no RTO backoff; reordered chain stalled the ack; pool grew on joins | joiner catch-up: only the origin sends (parity 0.978 [0.933, 1.03] of baseline) |
 | bimodal | one budget-capped repair answer per period; expired buckets served | partition heal bound by the repair budget; loss convergence by the 1 s repair period |
-| az-hier | send-pool starvation; Karn's rule violated; gaps repaired only at the RTO; no forwarding after gateway failover | none material in the data |
+| az-hier | send-pool starvation; Karn's rule violated; gaps repaired only at the RTO; no forwarding after gateway failover | none named by the audit; open in the data: the 128-slot send pool is full in every 183- and 300-pod regime and in the partition (no receive-buffer drops), a possible scaling limit of direct mail to a third of the cluster |
 | scuttlebutt | SYN answered with a second full digest; watermark stalls | latency from one exchange per round at `f = 1` |
 | owner-agg | every contributor cell re-broadcast on each change; no retry; no catch-up; 200 ms batching at the limit | partition over-admission; hits of departed non-owner contributors lost. Open implementation item, not inherent: a successor owner holds the max of two lower bounds, which the audit says carrying the owner's own count per bucket would fix (R4) |
 | all | — | ~30 % of hits near a 30 s zone cut never converge, because the cut outlasts the 10 s window (for example `imp-az-hier-nopk` 0.296 [0.294, 0.298]) |
 
-Within a design, the largest error gains came from defect repairs: Snow's
-5 % loss and Thicket's 20 % loss never-converged fractions fell to 0, owner
-aggregation's long-window bytes by a factor of about 430, and GossipSub's
-churn drops to 0 (§6.2). The study does not compare these gains with those
-of switching designs, which are also large (every baseline design is
-credibly better than `main` on 48 to 60 error cells, §5.1), and the
-defect-or-limit label is the implementers' and auditors' judgement.
+Within a design, the largest error gains came from repairs, but not all of
+them from defect repairs. Snow's 5 % loss and Thicket's 20 % loss
+never-converged fractions fell to 0 through defect repairs bundled with
+adopted components (Snow's `edge-nack` pulls and digest repair, Thicket's
+digest repair) (§6.2, [A: arm]); flat-once's never-converged hits and
+Plumtree's convergence p99 (0.0869 of baseline) fell with digest repair, an
+adopted component, alongside defect fixes; owner aggregation's staleness
+p99 (0.131 of baseline) fell with the whole stack, including the adopted
+near-limit urgency. Defect repairs and adopted components are not
+separated inside an arm (§9). Gains on bytes and health follow the same
+pattern (owner aggregation's long-window bytes fell by a factor of about
+430, GossipSub's churn drops to 0). The study does not compare these gains
+with those of switching designs, which are also large (every baseline
+design is credibly better than `main` on 48 to 60 error cells, §5.1), and
+the defect-or-limit label is the implementers' and auditors' judgement.
 
 ## 7. The per-key threshold fix
 
 **Defect.** The shared scheduler fires an early round when a rule's
 unreplicated local hits exceed the error budget ε. It compared a *rule's*
 hits, summed over all of its keys, against a *per-key* budget. With many
-keys per rule the sum crossed ε on nearly every hit, so threshold rounds
-fired almost continuously (in one Scuttlebutt probe, 65 % of 36.6k ticks at
-`prod-typical`) [A: scuttlebutt].
+keys per rule and ε rounding to one hit, the sum crossed ε about every
+second local hit [A: gossipsub], so threshold rounds fired at a high,
+workload-dependent rate: one Scuttlebutt probe at `prod-typical` counted
+about 5.7 rounds per node per second, 65 % of them threshold fires (36.6k
+ticks in all), against the roughly 200 per second the 5 ms floor would
+allow [A: scuttlebutt]. The rate depends on the number of rules, the keys
+per rule and the per-pod hit rate; every regime here has one rule.
 
 **Fix** (`00c159e`, on `sim/fix-perkey`). A direct-mapped table of pending
 hits keyed by (rule slot, folded key hash), 65,536 slots sized once; a
@@ -832,7 +926,9 @@ triggering itself.
 per-key over without, 95 % CrI; P = probability per-key is better). Source:
 `[K: imp-<arm>/prod-typical/<metric>]`; worse-cell counts `[V: perkey_effect]`,
 out of 78 error cells (79 for GossipSub, Snow, direct-ack and az-hier, where
-both sides healed the partition; §4.3).
+both sides healed the partition on at least one common seed; GossipSub's
+time-to-heal cell rests on the one seed `imp-gossipsub-nopk` healed and has
+no interval; §4.3, §4.6).
 
 | design | bytes | conv p50 | staleness p99 | worst-key over-admission | error cells worse |
 |---|---|---|---|---|---|
@@ -873,44 +969,62 @@ the accuracy cost may disappear.
 
 ## 8. Discussion
 
-### 8.1 The scheduler, not the topology, sets steady-state accuracy
+### 8.1 The scheduler, not the topology, probably sets limited-key staleness
 
-Three observations point the same way.
+This section is about limited-key staleness p99 at the metric's one-hit
+resolution. It does not extend to median convergence, where the relay
+trees of baseline Plumtree and Thicket are 1.6 to 1.7 times slower than
+direct mail at 80 pods and 3.9 to 5.4 times at 300 (§5.2). Three observations point the
+same way.
 
-1. Seven baselines that deliver in a few sub-millisecond hops have the
-   same staleness p99, 4 % to 4.33 %, and convergence p99 of 336 to 417 ms
-   at `prod-typical` (Table 4); after repair the direct-mail designs'
-   staleness p99 is identical at `prod-typical` (4 % [3.25, 4.75]) and in
-   the partition (103 % [102, 105]) (Table 8). Their latency is the time a
-   change waits to leave its origin.
+1. Seven baselines that deliver in a few hops of about a millisecond or
+   less have the same staleness p99, 4 % to 4.33 %, and convergence p99 of
+   336 to 417 ms at `prod-typical` (Table 4); after repair the direct-mail
+   designs' staleness p99 is identical at `prod-typical` (4 % [3.25, 4.75])
+   and in the partition (103 % [102, 105]) (Table 8). Their staleness is
+   consistent with the time a change waits to leave its origin.
 2. The two improved designs that beat that floor both change *when* a
    node's own changes leave it. `imp-plumtree-nopk` lets relay rounds,
    which fire 5 ms after any arrival, carry queued local changes
    (`6c6a08d`); its convergence p99 is 30.8 ms [29.9, 31.8] and staleness
-   p99 1 % [0.255, 1.75] at `prod-typical`. `imp-owner-agg` syncs and
-   broadcasts at once when a key is at 50 % of its limit, where most
-   limited keys (the hot and burst keys the staleness metric tracks) sit
-   for most of the window; it reaches 1 % [0.255, 1.75]. The same
-   relay-carry mechanism was ruled a bypass of the shared scheduler, and
-   removed, in `imp-main` (`ba9ee1c`, [A: main]), while the Plumtree
-   implementer argued that it touches no Plumtree invariant and the audit
-   did not dispute this (it noted only that the module doc still says the
-   shared scheduler alone decides origination) [A: plumtree]. The study's
-   faithfulness enforcement was therefore not
+   p99 1 % [0.255, 1.75] at `prod-typical`. The same tip also bundles
+   per-origin digest repair, the `IHAVE`/`GRAFT` fix, edge-outage restart
+   and tree retention across slot reuse (`5364649` to `6c6a08d`), none
+   separated from the relay-carry change, so its lead is confounded.
+   `imp-owner-agg` syncs and broadcasts at once when a key's view reaches
+   50 % of its limit; by the workload's design (hot keys request at a
+   multiple of the sustainable rate) we expect limited keys to spend much
+   of the window above that mark, though no metric measured it. It reaches
+   1 % [0.255, 1.75]. The same relay-carry mechanism was ruled a bypass of
+   the shared scheduler, and removed, in `imp-main` (`ba9ee1c`, [A: main]),
+   while the Plumtree implementer argued that it touches no Plumtree
+   invariant and the audit did not dispute this (it noted only that the
+   module doc still says the shared scheduler alone decides origination)
+   [A: plumtree]. The study's faithfulness enforcement was therefore not
    symmetric on this point, and Plumtree's accuracy lead cannot be
    attributed to trees.
 3. The per-key fix changes only the threshold trigger and moves staleness
    by 3 to 3.4 times in every arm that depends on that trigger (§7).
 
-This is a reading of the evidence, not a settled result: no arm was run
-with the relay-carry or urgency rule as a single change. The corresponding
+This is a reading of the evidence, not a settled result. Single-change
+evidence for relay-carry exists only as implementer and audit measurements
+on per-key tips, not judged in the final data: removing relay-carry from
+`imp-main` moved `prod-typical` median convergence from 33 to 252 ms and
+staleness p99 from 2 % to 14 % [A: main], and on Plumtree's per-key tip
+`6c6a08d` alone moved `prod-typical` median convergence from 5.87 [5.49,
+6.28] to 0.506 [0.488, 0.525] times Plumtree's baseline [A: plumtree].
+There is no such evidence for owner aggregation's urgency rule alone: the
+staleness ratio its implementer reported, 0.131 [0.061, 0.280], is the
+whole stack against its baseline (it equals
+`[O: imp-owner-agg/prod-typical/stale_limited_p99_pct]`). A judged
 ablation (§8.4, R5) would settle it.
 
 ### 8.2 What to ship and why
 
 **Table 8.** Candidates at the reference sizes and under faults. Bytes as
 ratio to `main`. Sources: `[P: <variant>/<regime>/<metric>]`; time to heal
-shows the number of seeds that healed.
+shows the number of seeds that reached exact counts (§4.3); † marks a
+right-censored lower bound near the 10 s window (§4.3).
 
 | variant | `prod-typical` bytes | `prod-typical` staleness p99, % | `prod-4x` bytes | `loss-20` conv p99, ms | `churn-rollout` joiner parity, ms | `az-partition` staleness p99, % | `az-partition` time to heal, ms (healed) |
 |---|---|---|---|---|---|---|---|
@@ -919,7 +1033,7 @@ shows the number of seeds that healed.
 | `imp-direct-ack-nopk` | 0.0879 [0.0877, 0.0881] | 4 [3.25, 4.75] | 0.376 [0.376, 0.376] | 3,061 [3,009, 3,113] | 10,843 [9,832, 11,853] | 103 [102, 105] | 600 [352, 848] (3/3) |
 | `imp-plumtree-nopk` | 0.105 [0.103, 0.107] | 1 [0.255, 1.75] | 0.272 [0.272, 0.273] | 692 [652, 732] | 3,735 [3,085, 4,385] | 122 [87.5, 157] | never (0/3) |
 | `imp-owner-agg` | 0.0703 [0.0702, 0.0704] | 1 [0.255, 1.75] | 0.208 [0.207, 0.208] | 1,380 [1,324, 1,435] | 10,038 [8,917, 11,158] | 365 [326, 404] | 300 [225, 375] (3/3) |
-| `imp-main-nopk` | 0.386 [0.384, 0.387] | 4.33 [2.88, 5.78] | 1.77 [1.77, 1.78] | 9,658 [9,598, 9,718] | 10,188 [8,886, 11,490] | 110 [107, 113] | never (0/3) |
+| `imp-main-nopk` | 0.386 [0.384, 0.387] | 4.33 [2.88, 5.78] | 1.77 [1.77, 1.78] | 9,658 [9,598, 9,718]† | 10,188 [8,886, 11,490] | 110 [107, 113] | never (0/3) |
 | `imp-scuttlebutt-nopk` | 0.0593 [0.0592, 0.0593] | 26.3 [22.5, 30.1] | 0.256 [0.256, 0.256] | 2,040 [1,979, 2,102] | 1,312 [461, 2,163] | 136 [121, 151] | 967 [822, 1,112] (3/3) |
 
 ![Figure 1](figures/fig1_tradeoff.png)
@@ -927,7 +1041,8 @@ shows the number of seeds that healed.
 **Figure 1.** Bytes against limited-key staleness p99 for each baseline
 (hollow) and its improved tip without per-key (filled; for `main`, the
 filled star is `imp-main-nopk`), in three scale regimes and three fault or
-dynamics regimes. Posterior means with 95 % CrIs, log-log; lower-left is
+dynamics regimes. Posterior medians with 95 % CrIs, log-log (lower
+whiskers clipped at 0.3 % staleness for the log axis); lower-left is
 better. Colour is the design family, marker the design. Source:
 `[P: <solution>/<regime>/bytes_total, stale_limited_p99_pct]`.
 
@@ -944,13 +1059,21 @@ log scale). Source:
 **Recommendation: replace `main` with the zone-hierarchical direct-mail
 design, `imp-az-hier-nopk`, without the per-key fix.** The evidence:
 
-- *Accuracy.* At every production size it has the same staleness p99 as
-  the other improved direct-mail, GossipSub and Snow tips: 4 % [3.25, 4.75]
-  at 80 pods, 3.67 % [2.22, 5.12] at 183, 2 % [1.25, 2.75] at 300, against
-  177 %, 415 % [367, 464] and 461 % [428, 494] for `main`
-  `[P: imp-az-hier-nopk, main/prod-*/stale_limited_p99_pct]`. Only
+- *Accuracy.* At every production size it has the same posterior
+  staleness p99 as the other improved direct-mail, GossipSub and Snow tips,
+  within the metric's one-hit grid (not a paired comparison): 4 % [3.25,
+  4.75] at 80 pods, 3.67 % [2.22, 5.12] at 183, 2 % [1.25, 2.75] at 300,
+  against 177 %, 415 % [367, 464] and 461 % [428, 494] for `main`
+  `[P: imp-az-hier-nopk, main/prod-*/stale_limited_p99_pct]`.
   `imp-plumtree-nopk` and `imp-owner-agg` are lower at 80 and 183 pods
-  (1 %), both through a scheduler change (§8.1).
+  (1 % [0.255, 1.75]), probably through a scheduler change (§8.1).
+- *The trigger it keeps.* As a `-nopk` tip it keeps the per-rule threshold
+  trigger that §7 calls a defect. Part of its accuracy therefore comes from
+  that trigger firing about every second local hit in this one-rule
+  workload; with more rules, a different number of keys per rule or a
+  different per-pod rate, its cadence, and with it its accuracy and bytes,
+  will change (§7, §9). With the per-key fix its `prod-typical` staleness
+  p99 is 3.40 [2.52, 4.59] times higher (Table 9).
 - *Bytes.* 0.0844 [0.0842, 0.0846] of `main` at 80 pods, 0.201 [0.2,
   0.201] at 183, 0.366 [0.365, 0.366] at 300, and 0.0203 [0.0202, 0.0204]
   in `long-window` (Figure 4). Among the ten exact-CRDT tips without
@@ -971,22 +1094,28 @@ design, `imp-az-hier-nopk`, without the per-key fix.** The evidence:
   about 60 % for Plumtree, 65 % for Thicket, 70 to 73 % for GossipSub,
   and 7 to 13 % for Snow, whose ring-derived trees keep most traffic inside
   a zone (`cross_az_bytes / bytes_total`). Its absolute cross-zone bytes
-  are the lowest of any solution without per-key, level with its own
-  baseline.
+  are, with its own baseline's, the lowest of any disseminating solution
+  without per-key. Against that baseline they are level at 80 and 183 pods
+  (1.00 [0.998, 1.00] at `prod-typical`), 0.96 in churn and the partition,
+  and 0.52 to 0.67 under loss and at 300 pods (`loss-20` 0.519 [0.513,
+  0.524], `prod-4x` 0.668 [0.610, 0.731])
+  `[O: imp-az-hier-nopk/*/cross_az_bytes]`.
 - *Faults.* It converges every hit at 20 % loss, with the lowest
   convergence p99 of the direct-mail family (1,254 ms [1,199, 1,310]); it
-  heals the partition on 3 of 3 seeds in 600 ms [352, 848] and is on the
+  heals the partition (reaches exact counts, §4.3) on 3 of 3 seeds in
+  600 ms [352, 848] and is on the
   partition's bytes-staleness front `[F: improved/az-partition]`.
 - *Safety of the change.* It is credibly worse than its own baseline on no
-  error or health cell (Table 6), and its audit left no material design
-  limit (Table 7).
+  error or health cell (Table 6), and its audit named no material design
+  limit; its full send pool from 183 pods up (below) remains an open
+  scaling question (Table 7).
 
 Its weaknesses are the direct-mail family's and its own: it is
 heartbeat-bound in steady state (convergence p99 337 ms [307, 367] at 80
 pods); its joiner parity interval is wide (3,507 ms [−881, 7,895]); at 20 %
 loss it spends 1.20 [1.19, 1.21] times its baseline's bytes on resends, and
 its staleness p99 there, 7.33 % [5.89, 8.78], is about twice GossipSub's
-(3.67 % [2.22, 5.12]) and Plumtree's (4 % [3.26, 4.75]), though below
+(3.67 % [2.22, 5.12]) and Plumtree's (4 % [3.25, 4.75]), though below
 direct-ack's and bimodal's `[P: */loss-20/stale_limited_p99_pct]`; and its
 128-slot send pool is full (128 slots) in every 183- and 300-pod regime and
 in the partition `[P: imp-az-hier-nopk/*/send_pending_max]`, the same
@@ -1007,20 +1136,26 @@ receive-buffer drops in any regime.
   datagrams, about a 2,500x reflection amplification on an unauthenticated
   cluster; and the improved arm replaces per-origin cells with an owner
   total view, a larger change to the state model than any other candidate
-  [A: owner-agg]. Its accuracy also rests on near-limit urgency (§8.1).
+  [A: owner-agg]. Its accuracy probably owes much to near-limit urgency
+  (§8.1), though that commit was not measured on its own: the 0.131
+  staleness ratio its implementer reported is the whole stack against its
+  baseline.
   It is the most promising direction for further work, not a drop-in
   replacement.
-- *Plumtree* has the best latency at moderate bytes, but its lead comes
-  from a scheduler change the study disallowed elsewhere (§8.1), its bytes
+- *Plumtree* has the best latency at moderate bytes, but its lead is
+  probably due to a scheduler change the study disallowed elsewhere, and
+  is confounded with its other repairs (§8.1); its bytes
   at 183 to 300 pods rose by a ratio of 1.10 to 1.135 with the Stage 4
   changes as a whole
   (not separated by commit; §9), its send queue peaks at 128
   slots at `prod-4x`, and its `-nopk` tip fails a harness fixture test
   (§6.4). Not settled.
 - *Bimodal* matches az-hier's bytes and accuracy but never heals the
-  partition (0.189 [0.179, 0.2] hits per (pod, key) expire unrepaired) and
-  converges slowest under 20 % loss. *Direct-ack* has the slowest joiner
-  catch-up (10,843 ms [9,832, 11,853]), a design-inherent limit.
+  partition (§4.3; 0.189 [0.179, 0.2] hits per (pod, key) expire unrepaired) and
+  converges slowest of the direct-mail family under 20 % loss (5,547 ms
+  [5,277, 5,817]). *Direct-ack* has among the slowest joiner catch-up
+  (10,843 ms [9,832, 11,853], an interval that overlaps owner
+  aggregation's and `imp-main-nopk`'s), a design-inherent limit.
 - *Scuttlebutt* is the cheapest design in most regimes but carries 26 %
   staleness at `f = 1`; raising `f` is its lever and was not swept.
 - *`imp-main`* is far better than `main` but needs 4.4 to 4.6 times the
@@ -1047,23 +1182,33 @@ faster than each origin's own resend.
 Each recommendation is followed by its evidence and whether the data settle
 it.
 
-- **R1. Retire `main`'s frontier-and-resend loop.** `main` is saturated at
-  every production size (§5.1): 177 % to 461 % staleness, 0.538 of hits
-  unconverged at 300 pods, dirty-ring overflow flagged on every `prod-4x`
-  seed. *Settled* in the simulator; confirm on a production-shaped canary,
-  since the simulator does not model CPU or clock skew (§9).
-- **R2. Ship `imp-az-hier-nopk` as the dissemination design** (§8.2).
-  *Settled in the simulator, on three seeds,* that it matches the accurate
-  designs at every production size and is among the cheapest, though up to
-  2.06 times Scuttlebutt's bytes under loss and with a full send pool from
-  183 pods up; *not settled* how it ranks against owner aggregation once
-  the latter's partition and departure behaviour are fixed.
+- **R1. Retire `main`'s frontier-and-resend loop.** In simulation `main`
+  saturates at every production-shaped size (§5.1): 177 % to 461 %
+  staleness, 0.538 of hits unconverged at 300 pods, and dirty-ring overflow
+  flagged on every `prod-4x` seed (a symptom of the never-drained rings;
+  most overwritten entries were stale). *Settled* in the simulator; confirm
+  on a production-shaped canary, since the simulator does not model CPU,
+  scheduling, send buffers or clock skew (§9).
+- **R2. Ship `imp-az-hier-nopk` as the dissemination design, after a
+  multi-rule check or the scheduler ablation (R5)** (§8.2). In the
+  simulator, on three seeds, it has the same posterior staleness p99 as
+  the other direct-mail, GossipSub and Snow tips at every production size
+  within the one-hit grid (not paired against them), while improved
+  Plumtree and owner aggregation are lower at 80 and 183 pods; it is among
+  the cheapest, though up to 2.06 times Scuttlebutt's bytes under loss and
+  with a full send pool from 183 pods up. *Not settled*: how its accuracy
+  and bytes hold up with several rules, because the `-nopk` tip keeps the
+  per-rule threshold trigger whose firing rate depends on the rules, the
+  keys per rule and the per-pod rate (§7, §8.2); and how it ranks against
+  owner aggregation once the latter's partition and departure behaviour
+  are fixed.
 - **R3. Do not ship the per-key threshold fix as a default.** At
   `prod-typical` it trades 3.0 to 3.4 times the staleness for 0.57 to 0.94
   of the bytes, and drops come with it at 300 pods in two arms (§7, §6.4).
   *Settled* for the fix as implemented, which leaves a floor-blocked
   crossing un-re-armed (§7); that gap fixed, a different ε, or a per-key
-  trigger with a lower floor was not tested.
+  trigger with a lower floor was not tested. Not shipping it keeps the
+  per-rule trigger and its workload-dependent cadence (R2).
 - **R4. Fix owner aggregation's open items before reconsidering it**: answer
   NACKs only from discovered members; carry the owner's own count per bucket
   so a successor can add it exactly, as the audit proposes; decide whether
@@ -1100,8 +1245,12 @@ it.
   designs are within about one grid step.
 - **Time to heal** is defined only for seeds that healed. Most baselines
   never healed, so improvements there are absolute values, not paired
-  ratios; `imp-gossipsub-nopk` healed on 1 of 3 seeds and `imp-thicket` on 2
-  of 3, so their heal times carry little weight.
+  ratios; `imp-gossipsub-nopk` and `imp-main` healed on 1 of 3 seeds and
+  `imp-thicket` on 2 of 3, so their heal times carry little weight. The
+  metric requires exact counts in every closed bucket at every pod, so it
+  also charges ordinary propagation lag (§4.3), and the harness audit
+  warned that it may not separate designs whose steady-state tail
+  approaches the window.
 - **Partition convergence is stricter.** With a partition scheduled,
   whole-run convergence ranks hits within the origin's side of the cut for
   the entire run, a conservative bound; `az-partition` convergence is not
@@ -1133,28 +1282,39 @@ it.
   deployment's typical and peak sizes. Other key cardinalities, request
   skews, window lengths and zone layouts may rank the designs differently;
   the scheduler result (§8.1) suggests that accuracy rankings in particular
-  depend on the cadence at which origins emit.
+  depend on the cadence at which origins emit. That cadence comes partly
+  from the per-rule threshold trigger the `-nopk` tips keep, whose firing
+  rate depends on the number of rules, the keys per rule and the per-pod
+  rate; every regime here has one rule (§7, §8.2).
 
 ## 10. Conclusion
 
 On one deterministic harness with identical load, network and churn,
 eleven dissemination designs for a gossiped CRDT rate limiter separate
-cleanly on cost and on fault behaviour, and hardly at all on steady-state
-accuracy once they deliver in a few sub-millisecond hops. The shipped
-design is saturated at every production size. Within each design the
-largest error gains came from repairing implementation defects, and the
+cleanly on cost and on fault behaviour, and hardly at all on limited-key
+staleness, at the metric's one-hit resolution, once they deliver in a few
+hops of about a millisecond or less; the baseline relay trees still make
+median convergence 1.6 to 5.4 times slower than direct mail. In simulation, the
+shipped design saturates at every production-shaped size; a canary should
+confirm this, since the simulator does not model CPU, scheduling, send
+buffers or clock skew (§9, R1). Within each design the largest error gains
+came from repairs, defect fixes and adopted components together, and the
 repairs without the per-key fix cost little on the error metrics, though
 some cost bytes and send-queue headroom. The zone-hierarchical direct-mail
-design is the best-supported replacement: as accurate as any exact-CRDT
-design at every production size except improved Plumtree, whose lead comes
-from a scheduler change (§8.1), the cheapest or second-cheapest exact-CRDT
-design at 3, 5 and 80 pods (outside the rollout) and in the 1 h window, and
-within 1.61 times the cheapest (Scuttlebutt) at 183 to 300 pods (2.06
-times under 20 % loss), with about 3 % of its bytes crossing zones, and it heals
-a zone partition. The per-key threshold fix, as implemented, acts as a
-bytes-for-accuracy dial rather than a correction. The data suggest that the
-next gains in accuracy will come from the round scheduler; the ablation
-that would establish this is the most useful next experiment.
+design is the best-supported replacement: at every production size it is
+as accurate on staleness as any exact-CRDT tip within the one-hit grid,
+except improved Plumtree at 80 and 183 pods, whose lead probably comes from
+a scheduler change (§8.1); it is the cheapest or second-cheapest
+exact-CRDT design at 3, 5 and 80 pods (outside the rollout) and in the 1 h
+window, and within 1.61 times the cheapest (Scuttlebutt) at 183 to 300
+pods (2.06 times under 20 % loss), with about 3 % of its bytes crossing
+zones, and it reaches exact counts after a zone partition. Its accuracy
+rests partly on a per-rule threshold trigger whose cadence depends on the
+workload, so a multi-rule check should precede shipping it. The per-key
+threshold fix, as implemented, acts as a bytes-for-accuracy dial rather
+than a correction. The data suggest that the next gains in accuracy will
+come from the round scheduler; the ablation that would establish this is
+the most useful next experiment.
 
 ## Reproducibility
 
@@ -1208,8 +1368,9 @@ python3 study/figures/make_figures.py
 - `metrics.json`, `regimes.json`, `arms.json`: definitions.
 - `runs.json`: every run's regime, solution, seed, validity, solution commit
   and harness tree hash (1,287 rows, all valid).
-- `judge/summary.csv`, `judge/pareto.md`, `judge/flags.md`: the final
-  judge's outputs over all 1,287 runs (its `rejected.md` read "None").
+- `judge/summary.csv`, `judge/pareto.md`, `judge/flags.md`,
+  `judge/rejected.md`: the final judge's outputs over all 1,287 runs
+  (`rejected.md` reads "None").
 
 **Derived outputs** (`study/figures/`): `fig1_tradeoff.png`,
 `fig2_own_baseline.png`, `fig3_perkey.png`, `fig4_bytes_by_regime.png`,
