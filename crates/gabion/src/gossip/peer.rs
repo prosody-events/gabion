@@ -19,11 +19,15 @@ pub(super) struct Outbound {
     pub(super) acked: u64,
     /// Highest sequence sent to the peer; `sent > acked` means data in flight.
     pub(super) sent: u64,
+    /// Highest sequence ever sent, kept across rewinds: a send at or below it
+    /// is a retransmission.
+    high: u64,
     /// When the oldest unacknowledged send went out; restarted on ack
     /// progress.
     timer_ms: u64,
     /// `(sequence, send time)` of one in-flight send whose ack yields an RTT
-    /// sample. Dropped on retransmission, so a sample never spans a resend.
+    /// sample. Dropped on retransmission and armed only by a send of new data
+    /// (Karn's rule), so a sample never spans a resend.
     probe: Option<(u64, u64)>,
 }
 
@@ -33,8 +37,11 @@ impl Outbound {
         if self.sent == self.acked {
             self.timer_ms = now_ms;
         }
-        self.probe.get_or_insert((upper, now_ms));
+        if self.sent >= self.high {
+            self.probe.get_or_insert((upper, now_ms));
+        }
         self.sent = self.sent.max(upper);
+        self.high = self.high.max(upper);
     }
 
     /// Apply a cumulative ack. Returns an RTT sample, in milliseconds, when

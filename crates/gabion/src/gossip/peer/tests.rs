@@ -56,7 +56,7 @@ fn ack_progress_restarts_the_timer() {
 }
 
 #[test]
-fn rewind_resumes_from_the_last_ack_and_drops_the_probe() {
+fn rewind_resumes_from_the_last_ack_and_no_sample_spans_a_resend() {
     let mut out = Outbound::default();
     out.note_sent(5, 0);
     out.note_ack(3, 10);
@@ -66,9 +66,11 @@ fn rewind_resumes_from_the_last_ack_and_drops_the_probe() {
     out.note_sent(9, 601);
     assert_eq!(
         out.note_ack(9, 700),
-        Some(99),
-        "the new probe times the resend"
+        None,
+        "an ack of resent data may answer the original send (Karn's rule)",
     );
+    out.note_sent(12, 800);
+    assert_eq!(out.note_ack(12, 850), Some(50), "new data is timed again");
 }
 
 #[test]
