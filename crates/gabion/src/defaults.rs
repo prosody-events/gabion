@@ -136,9 +136,11 @@ pub const THICKET_MISSING_CAPACITY: usize = 4096;
 /// before the change is left to the repair slice.
 pub const THICKET_GRAFT_ATTEMPTS: u8 = 3;
 
-/// Heartbeats a PROBE is repeated after the last eager packet to a peer, so
-/// that the loss of one probe does not hide a lost tail.
-pub const THICKET_PROBE_REPEATS: u8 = 3;
+/// Heartbeats a PROBE is sent after the last eager packet to a peer. One: a
+/// tail hidden by a lost probe is still announced by IHAVE and, failing that,
+/// found by the repair digest, and in a quiet cluster probes were a third of
+/// the bytes.
+pub const THICKET_PROBE_REPEATS: u8 = 1;
 
 /// Requests, one per heartbeat of silence, a node that joined empty makes for
 /// its first slice of the cluster's cells before it relies on the repair

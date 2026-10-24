@@ -442,7 +442,7 @@ All are constants in `gabion::defaults` (`THICKET_*`). They are not
 | `THICKET_LEAF_CHILDREN_MIN` | 8 | leaf children an interior node takes at least before refusing an attach |
 | `THICKET_MISSING_CAPACITY` | 4096 | announced changes tracked at once |
 | `THICKET_GRAFT_ATTEMPTS` | 3 | GRAFTs sent for one change |
-| `THICKET_PROBE_REPEATS` | 3 | heartbeats a PROBE is repeated after the last eager packet |
+| `THICKET_PROBE_REPEATS` | 1 | heartbeats a PROBE is sent after the last eager packet |
 | `THICKET_CATCH_UP_ATTEMPTS` | 6 | requests a node that joined empty makes for its first slice |
 
 `fanout` has no effect here, and `max_cells_per_tick` now caps the cells in
@@ -472,10 +472,10 @@ data and UDP.
 - **UDP.** Both papers assume reliable links. Each eager packet carries a
   per-edge number (`Header::edge_sequence`); a receiver that sees one skipped
   sends a NACK (control frame, `wire::control`) and the sender resends from
-  its last 512 packets. A heartbeat PROBE names the latest number so that the
-  loss of a burst's tail shows, and is repeated for 3 heartbeats so that one
-  lost probe does not hide it. A lost packet is asked for 3 times, and a GRAFT
-  that nothing answered is sent again, up to 3 times.
+  its last 512 packets. The next heartbeat's PROBE names the latest number so
+  that the loss of a burst's tail shows; a tail that a lost probe hides is
+  left to IHAVE and the repair digest. A lost packet is asked for 3 times, and
+  a GRAFT that nothing answered is sent again, up to 3 times.
 - **IHAVE names a cell version.** Plumtree announces every message id, so a
   message lost below a later one is still announced. Here a message is a cell
   version, and an entry is that version's origin, incarnation and sequence
