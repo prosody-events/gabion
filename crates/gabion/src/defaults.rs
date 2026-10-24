@@ -62,15 +62,19 @@ pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;
 
-/// Send slots, one pre-allocated packet buffer each (about 700 KiB at the
+/// Send slots, one pre-allocated packet buffer each (about 1.4 MiB at the
 /// default payload). A round shares them evenly across its picks, so this
 /// bounds the packets one round can queue: `⌈ln(n)+c⌉` picks (9 at 300
-/// peers) times each frame's packets. Sized so a round's frames fit whole at
-/// 300 peers and 1,800 changes a second across the cluster: about 1,000 cells
-/// per frame within a 56-packet share, beside a heartbeat's repair digest and
-/// an answer to a peer's. A smaller pool still reaches every pick but cuts
-/// each frame's tail, its oldest changes, with a warning.
-pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 512;
+/// peers) times each frame's packets. A heartbeat round sends everything
+/// changed since the last round, and a cluster whose keys rarely reach their
+/// error budget has few other rounds, so the frame must hold about half a
+/// second of the cluster's changes. Sized so a round's frames fit whole at
+/// 300 peers and 6,000 changes a second across the cluster: about 3,000
+/// cells per frame within a 113-packet share, beside a heartbeat's repair
+/// digest and an answer to a peer's. A smaller pool still reaches every pick
+/// but cuts each frame's tail, its oldest changes, with a warning; at 512
+/// slots a 183-node hot-key load cut about a third of its rounds.
+pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 1024;
 
 /// Cells a node sends per heartbeat interval in answer to repair digests: the
 /// repair slice. Each heartbeat a node sends a digest of the origin sequences

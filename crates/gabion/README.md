@@ -583,9 +583,13 @@ resend-until-acked loop; the rest of this README describes this branch.
 
 Adaptations, each the minimal one:
 
-- **Send queue 128 to 512 slots** (`GOSSIP_SEND_QUEUE_CAPACITY`). One round
+- **Send queue 128 to 1,024 slots** (`GOSSIP_SEND_QUEUE_CAPACITY`). One round
   now queues every pick's whole frame at once, so the pool is sized for a
-  round at 300 peers. The pool's slot index widened from `u8` to `usize`
+  round at 300 peers. A heartbeat round carries everything changed since the
+  last round, so when keys rarely reach their error budget (per-key
+  thresholds) a frame holds about half a second of the cluster's changes.
+  At 512 slots a 183-node hot-key load cut a third of its rounds; 1,024
+  holds about 3,000 cells per frame at 9 picks. The pool's slot index widened from `u8` to `usize`
   (a pool above 255 slots wrapped to an empty free list). Each pick gets an
   even share of the free slots; a frame over its share loses its tail, the
   oldest changes, with a power-of-two rate-limited warning. A round whose picks cannot all get a slot (a blocked socket still
@@ -617,8 +621,8 @@ Adaptations, each the minimal one:
   being re-stamped by every node that merges it.
   - *What the answer leaves out.* A cell whose origin changed it less than
     one and a half heartbeat intervals ago (`GOSSIP_REPAIR_SETTLE_TICKS`) is
-    still spreading; the forwarders deliver it. The answering node also expires
-    its cells first, so a bucket that just left the window is not resent.
+    still spreading; the forwarders deliver it. A cell whose bucket is
+    already below its rule's oldest live bucket is not resent either.
   - *Repair is not news.* Cells that arrive in an answer
     (`FLAG_REPAIR`) raise the count but are not forwarded: the answering
     node holds them settled, so they have spread and only the requester
@@ -642,6 +646,17 @@ Adaptations, each the minimal one:
     node pulls the window from its first pick, which answers to the
     digest's source address even before discovery has announced the new
     node to it.
+  - *Trade-offs.*
+    - Digest repair replaces the blind rotation outright; there is no
+      switch to restore it, and the two differ only by commit.
+    - Without `auth_key`, a digest claiming to hold nothing makes a node
+      send up to 2,048 cells (about 75 packets) per heartbeat interval to
+      the datagram's source address, which a spoofed sender can choose. The
+      budget bounds the amplification but does not remove it, so set
+      `auth_key` on any network that is not closed.
+    - The digest's bitmap covers 256 sequences below each origin's maximum
+      (`GOSSIP_DIGEST_WINDOW_WORDS`); an origin changing more than about 20
+      cells a second leaves older losses unrepaired.
 
 ## References
 
