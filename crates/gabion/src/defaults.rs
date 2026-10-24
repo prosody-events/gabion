@@ -112,15 +112,21 @@ pub const THICKET_NACK_RETRY_MS: u64 = 100;
 /// Times a lost eager packet is asked for before it is left to the lazy path.
 pub const THICKET_NACK_ATTEMPTS: u8 = 3;
 
-/// Cells of the rotating repair slice a heartbeat sends to one random peer, and
-/// of the slice a catching-up node asks a peer for in one request.
-///
-/// The slice is the shared store's anti-entropy sweep. IHAVE announces a
-/// change once, to a couple of peers, so a node that missed both the eager
-/// push and its announcements (a partition, a long outage) is repaired by it:
-/// every live cell is eventually resent, whatever the trees and the lazy path
-/// missed.
+/// Cells of the slice of the store a catching-up node asks a peer for in one
+/// request.
 pub const THICKET_REPAIR_CELLS: usize = 256;
+
+/// Newest settled buckets of a rule a repair digest covers. A bucket is
+/// settled once it closed at least one bucket ago, and stays so until it is
+/// the oldest in the window. Each digest names, per origin, the sum of the
+/// counts held in each of these buckets; a longer window is compared on its
+/// newest buckets only.
+pub const THICKET_DIGEST_BUCKETS: usize = 64;
+
+/// Most cells a node pushes back in answer to one digest frame. The rest of
+/// what the sender lacks is pushed in answer to its next digest, a bucket
+/// later.
+pub const THICKET_DIGEST_PUSH_CELLS: usize = 1024;
 
 /// Most undelivered announced changes a node tracks at once. A change over
 /// the limit is left to the repair slice.

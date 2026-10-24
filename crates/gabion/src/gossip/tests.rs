@@ -497,11 +497,13 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
         cfg.fanout = 4;
         cfg.max_cells_per_tick = 32;
         let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+        // Windowed rules: the repair lane compares settled buckets, which a
+        // rule interned without a window does not have.
         let (rt, client) = GossipRuntime::from_parts(
             router.bind(addrs[i]),
             TokioClock::from_millis(0),
             cfg,
-            store_for(identity),
+            store_for_property_rules(identity, NODES as u16 + 8),
             agg.clone(),
         );
         handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
@@ -1692,11 +1694,13 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
             cfg.fanout = nodes.saturating_sub(1).clamp(1, 4);
             cfg.max_cells_per_tick = 32;
             let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            // Windowed rules: the repair lane compares settled buckets,
+            // which a rule interned without a window does not have.
             let (rt, client) = GossipRuntime::from_parts(
                 router.bind(addrs[i]),
                 TokioClock::from_millis(0),
                 cfg,
-                store_for(identity),
+                store_for_property_rules(identity, nodes as u16 + 8),
                 agg.clone(),
             );
             handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));

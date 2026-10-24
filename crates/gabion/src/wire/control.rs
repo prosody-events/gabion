@@ -27,7 +27,7 @@ use super::{
     HmacKey, PacketBuf,
 };
 
-const BODY_PREFIX: usize = 4;
+pub(super) const BODY_PREFIX: usize = 4;
 /// Bytes of one control entry that names an origin only.
 pub const CONTROL_ENTRY_BYTES: usize = 16 + 4 + 8;
 /// Bytes of one control entry that names a cell version.
@@ -56,6 +56,11 @@ pub enum ControlKind {
     /// joined with no state is brought up to date.
     Pull,
 }
+
+/// The kind byte of a digest frame: "here is what I hold of one rule's settled
+/// buckets; push me what I lack." Its body is groups, not entries, so it is
+/// not a [`ControlKind`]: [`super::decode_digest`] decodes it.
+pub(super) const DIGEST_KIND: u8 = 7;
 
 /// The `value` of a [`ControlKind::Graft`] entry that asks for no cells, only
 /// a place in the tree.
@@ -121,6 +126,12 @@ pub struct DecodedControl {
 /// nothing about whether the frame is well formed or authentic.
 pub fn is_control(bytes: &[u8]) -> bool {
     bytes.len() >= HEADER_LEN && u16::from_le_bytes([bytes[6], bytes[7]]) & FLAG_CONTROL != 0
+}
+
+/// Whether control frame `bytes` is a digest, which [`super::decode_digest`]
+/// decodes. Reads only the kind, as [`is_control`] reads only the flags.
+pub fn is_digest(bytes: &[u8]) -> bool {
+    bytes.get(HEADER_LEN).copied() == Some(DIGEST_KIND)
 }
 
 /// Encode as many of `entries` as fit one packet into `buf`. Returns how many

@@ -23,7 +23,7 @@ use crate::wire::{ControlEntry, ControlKind, PULL_ONLY_TREE, decode_control};
 type Model = BTreeMap<(u128, u128, BucketEpoch), u64>;
 
 /// `n` distinct addresses, spread over three /16s like three zones.
-fn addrs(n: usize) -> Vec<SocketAddr> {
+pub(super) fn addrs(n: usize) -> Vec<SocketAddr> {
     (0..n)
         .map(|i| SocketAddr::from(([10, (i % 3) as u8, (i / 256) as u8, (i % 256) as u8], 7000)))
         .collect()
@@ -298,12 +298,13 @@ fn a_departed_parent_is_replaced_and_changes_keep_flowing() {
     });
 }
 
-type IdleRuntime = GossipRuntime<u32, Rc<InMemoryAggregateStore<u32>>, SimTransport, TokioClock>;
+pub(super) type IdleRuntime =
+    GossipRuntime<u32, Rc<InMemoryAggregateStore<u32>>, SimTransport, TokioClock>;
 
 /// Node `index` of `all`, built but not running, so a test can drive its
 /// handlers directly. It knows every other address and has attached to a
 /// parent in each tree it is a leaf of.
-fn idle_runtime(router: &SimRouter, all: &[SocketAddr], index: usize) -> IdleRuntime {
+pub(super) fn idle_runtime(router: &SimRouter, all: &[SocketAddr], index: usize) -> IdleRuntime {
     let identity = NodeIdentity::new(NodeId(0xA000 + index as u128), 1);
     let peers: Vec<_> = all.iter().copied().filter(|a| *a != all[index]).collect();
     let (mut rt, _client) = GossipRuntime::from_parts(

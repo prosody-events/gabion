@@ -34,6 +34,7 @@ use super::transport::GossipTransport;
 use super::transport::UdpTransport;
 use super::{GossipConfig, GossipError};
 
+mod digest;
 mod edge;
 mod forward;
 mod repair;
@@ -41,6 +42,7 @@ mod repair;
 mod tests;
 mod thicket;
 
+use digest::Digests;
 use forward::Lane;
 use thicket::{Arrival, NONE, Thicket};
 
@@ -81,6 +83,8 @@ where
 
     // Tree dissemination state: peers, trees, edges, missing-change timers.
     thicket: Thicket,
+    // The repair lane's digest scratch.
+    digests: Digests,
     rng: SplitMix64,
 
     // Pending reply for the in-flight limit request. Sent after the
@@ -254,6 +258,10 @@ where
             (config.wire_limits.max_payload_bytes / wire::CONTROL_ENTRY_BYTES + 1)
                 .max(config.max_cells_per_tick),
         );
+        let digests = Digests::new(
+            store.node_dictionary().capacity() as usize,
+            config.wire_limits.max_payload_bytes,
+        );
         let rng = SplitMix64::new(config.rng_seed);
 
         let rule_capacity = store.rule_dictionary().capacity() as usize;
@@ -278,6 +286,7 @@ where
             send_pending,
             send_free,
             thicket,
+            digests,
             rng,
             pending_reply: None,
             decode_reject_count: 0,
@@ -490,7 +499,12 @@ where
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
         if wire::is_control(&self.recv_buf[..n]) {
-            self.handle_control(n, src);
+            if !wire::is_digest(&self.recv_buf[..n]) {
+                self.handle_control(n, src);
+            } else if let Some(peer) = self.thicket.index_of(src) {
+                self.thicket.peers[usize::from(peer)].heard_ms = self.clock.now_millis();
+                self.handle_digest(peer, n);
+            }
             return;
         }
         self.obs_buf.clear();

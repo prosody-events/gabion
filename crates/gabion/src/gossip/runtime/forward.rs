@@ -31,7 +31,7 @@ where
     T: GossipTransport,
     K: Clock,
 {
-    fn frame_header(&self) -> wire::Header {
+    pub(super) fn frame_header(&self) -> wire::Header {
         wire::Header {
             cluster_id_hash: self.config.cluster_id_hash,
             sender_node_id: self.store.local_identity().node_id.0,
@@ -150,7 +150,7 @@ where
         }
     }
 
-    fn note_send_queue_full(&mut self, peer: SocketAddr, unsent: usize) {
+    pub(super) fn note_send_queue_full(&mut self, peer: SocketAddr, unsent: usize) {
         self.cut_frames = self.cut_frames.saturating_add(1);
         if self.cut_frames.is_power_of_two() {
             tracing::warn!(

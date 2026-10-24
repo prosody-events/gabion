@@ -95,7 +95,7 @@ where
         self.send_control(parent, ControlKind::Graft, tree, &[]);
     }
 
-    /// One heartbeat of upkeep: edge probes, parent links, the repair slice
+    /// One heartbeat of upkeep: edge probes, parent links, the repair digest
     /// and the lazy announcement.
     pub(super) fn heartbeat(&mut self, now: u64) {
         self.edge_probes();
@@ -107,14 +107,12 @@ where
                 self.attach(tree, parent);
             }
         }
-        if let Some(peer) = self.thicket.random_alive(&mut self.rng, |_| false) {
-            self.send_slice(peer);
-        }
+        self.digest_due(now);
         self.announce();
     }
 
-    /// Send `peer` the next slice of live cells, whatever their state: the
-    /// anti-entropy backstop.
+    /// Send `peer` the next slice of live cells, whatever their state, for a
+    /// node catching up.
     fn send_slice(&mut self, peer: u16) {
         let mut frame = std::mem::take(&mut self.frame_handles);
         frame.clear();
