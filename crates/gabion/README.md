@@ -233,7 +233,7 @@ The pick lives in `GossipRuntime::handle_gossip_tick`:
 
 ```rust
 let n = peers.len();
-let coverage = (n as f64).ln() + GOSSIP_COVERAGE_MARGIN;   // c = 3.0
+let coverage = (n as f64).ln() + GOSSIP_COVERAGE_MARGIN;   // c = 4.0
 let pick_count = config.fanout.max(coverage.ceil() as usize).min(n);
 ```
 
@@ -243,17 +243,17 @@ replacement, because sampling the same peer twice in one tick would burn
 a send-pool slot encoding the same frame twice. `config.fanout` is a
 hard floor; `.min(n)` makes small clusters full-mesh (coverage demands
 it there and the bandwidth is trivial). Some example pick counts at
-`fanout = 3`, `c = 3`:
+`fanout = 3`, `c = 4`:
 
 | peers `n` | `⌈ln(n)+c⌉` | `pick_count`               |
 |-----------|-------------|----------------------------|
-| 1         | 3           | 1 (capped at peers)        |
-| 4         | 5           | 4 (capped at peers)        |
-| 15        | 6           | 6                          |
-| 31        | 7           | 7                          |
-| 63        | 8           | 8                          |
-| 255       | 9           | 9                          |
-| 9 999     | 13          | 13                         |
+| 1         | 4           | 1 (capped at peers)        |
+| 4         | 6           | 4 (capped at peers)        |
+| 15        | 7           | 7                          |
+| 31        | 8           | 8                          |
+| 63        | 9           | 9                          |
+| 255       | 10          | 10                         |
+| 9 999     | 14          | 14                         |
 
 Fanout trades **bandwidth** (linear in the pick: the cluster ships
 `n·pick·frame` per tick) against **coverage-failure probability**
@@ -262,10 +262,11 @@ with diminishing return above the threshold). `⌈ln(n)+c⌉` is the
 provably-minimal fanout for reliable coverage of a *single* round, so it
 is the natural operating point. Each change is disseminated once — every
 node that first learns it forwards it in one round — so KMG's one-shot
-figure applies: at `c = 3` about 5 % of changes miss some node. A later
-change to the same cell supersedes the miss, and the repair lane reaches
-the rest; each extra step of `c` costs about one more peer per round for
-about e× fewer misses. The
+figure applies, and gabion uses KMG's one-shot threshold `c = 4`: about
+2 % of changes miss some node. A later change to the same cell
+supersedes the miss, and the repair lane reaches the rest. Each step of
+`c` costs about one more peer per round for about e× fewer misses, far
+more coverage per byte than a larger repair slice buys. The
 bandwidth floor on quiet ticks is unchanged from a fixed fanout — the
 pick is stable for a given cluster size, not pulsing with load. The
 `coverage_fanout` bench
@@ -357,7 +358,7 @@ one frame, and sends each pick that frame minus the cells it already
 holds. The budget is what the free send slots carry for every pick, at
 most `max_cells_per_tick`; dirty entries past it stay, oldest first, for
 the next round. The repair lane rides heartbeat rounds only, at most
-`GOSSIP_REPAIR_CELLS_PER_HEARTBEAT` (64) cells and no faster than one
+`GOSSIP_REPAIR_CELLS_PER_HEARTBEAT` (16) cells and no faster than one
 sweep of the store per `GOSSIP_REPAIR_MIN_SWEEP_MILLIS` (2 s), so it is
 what reaches a peer a round's picks missed or a packet the network lost.
 The rings are pre-sized at construction; a push into a full ring
@@ -392,7 +393,7 @@ it splits into the two adaptive halves of the protocol.
 | Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
-| `fanout`             | 3           | Fanout floor. The runtime scales the actual pick to the coverage threshold `⌈ln(n)+c⌉` (`c` = `GOSSIP_COVERAGE_MARGIN`, 3), capped at the peer count. | Rarely tune — the floor binds only if you lower `GOSSIP_COVERAGE_MARGIN`. To trade bandwidth for coverage, change the margin, not this floor. |
+| `fanout`             | 3           | Fanout floor. The runtime scales the actual pick to the coverage threshold `⌈ln(n)+c⌉` (`c` = `GOSSIP_COVERAGE_MARGIN`, 4), capped at the peer count. | Rarely tune — the floor binds only if you lower `GOSSIP_COVERAGE_MARGIN`. To trade bandwidth for coverage, change the margin, not this floor. |
 | `max_cells_per_tick` | 4 096       | Cap on cells one gossip round sends. Dirty changes over the cap, or over what the free send slots carry, wait for the next round. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
 | `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 

@@ -558,8 +558,8 @@ fn churn_script_is_deterministic() {
 /// that received the burst could re-gossip it within the *same* step — a
 /// hop-by-hop cascade that lit up far more than `fanout + 1` nodes per click.
 ///
-/// `nodes = 12`, `fanout = 6`: 11 peers ⇒ coverage `⌈ln(11) + c⌉ = 6`, so the
-/// effective fanout is 6 and at most `6 + 1 = 7` nodes may know after one step.
+/// `nodes = 12`, `fanout = 6`: 11 peers ⇒ coverage `⌈ln(11) + c⌉ = 7`, so the
+/// effective fanout is 7 and at most `7 + 1 = 8` nodes may know after one step.
 /// `hits` stays well under the eager-flush budget
 /// (`epsilon = rule_limit × bps / (10_000 × peers) = 1_000_000 / 1_100 ≈ 909`)
 /// so the submit itself does not gossip — the baseline below proves it.
@@ -571,7 +571,7 @@ fn one_step_propagates_a_new_count_to_at_most_fanout_peers() {
         ..test_config(12)
     };
     let effective_fanout = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
-    assert_eq!(effective_fanout, 6, "11 peers ⇒ coverage ⌈ln(11)+3⌉ = 6");
+    assert_eq!(effective_fanout, 7, "11 peers ⇒ coverage ⌈ln(11)+4⌉ = 7");
 
     // A node "knows" the count if it holds the cell (a nonzero aggregate, since
     // the single key is the only traffic).
@@ -585,7 +585,7 @@ fn one_step_propagates_a_new_count_to_at_most_fanout_peers() {
         assert_eq!(
             known(&baseline),
             1,
-            "submit alone must not gossip; only the origin knows (if this is 7 the eager-flush \
+            "submit alone must not gossip; only the origin knows (if this is 8 the eager-flush \
              threshold assumption broke — tune hits/rule_limit)"
         );
 

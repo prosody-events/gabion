@@ -42,19 +42,20 @@ pub const GOSSIP_FANOUT: usize = 3;
 ///
 /// | `c`   | per-round coverage `e^(−e^(−c))` |
 /// |-------|----------------------------------|
-/// | **3** | **95.1 %**                       |
-/// | 4     | 98.2 %                           |
+/// | 3     | 95.1 %                           |
+/// | **4** | **98.2 %**                       |
 /// | 5     | 99.3 %                           |
 ///
 /// Each change is disseminated once, KMG's one-shot setting: every node
-/// that first learns it forwards it in one round. At `c = 3` about 5 % of
-/// changes miss some node; a later change to the same cell supersedes the
-/// miss, and the repair lane (`GOSSIP_REPAIR_CELLS_PER_HEARTBEAT`) reaches
-/// the rest. Each step of `c` adds about one peer per round (≈ 10 % more
-/// gossip bandwidth) for about e× fewer misses. Kept a `const`; promote to a
-/// `GossipConfig` field if an operator ever needs to trade bandwidth for
-/// coverage at runtime.
-pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
+/// that first learns it forwards it in one round. So the margin is KMG's
+/// one-shot threshold, `c = 4`: about 2 % of changes miss some node, a later
+/// change to the same cell supersedes the miss, and the repair lane
+/// (`GOSSIP_REPAIR_CELLS_PER_HEARTBEAT`) reaches the rest. Each step of `c`
+/// adds about one peer per round (≈ 10 % more gossip bandwidth) for about e×
+/// fewer misses, which buys far more coverage per byte than a larger repair
+/// slice. Kept a `const`; promote to a `GossipConfig` field if an operator
+/// ever needs to trade bandwidth for coverage at runtime.
+pub const GOSSIP_COVERAGE_MARGIN: f64 = 4.0;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 /// Pace of relay rounds. A node that merged changes from a peer forwards
@@ -66,7 +67,7 @@ pub const GOSSIP_RELAY_INTERVAL_MILLIS: u64 = 20;
 /// after the dirty lanes. Dirty changes are sent in one round each, so the
 /// repair lane is what reaches a peer the round's picks missed, or a packet
 /// the network lost; a slice per heartbeat bounds what that costs.
-pub const GOSSIP_REPAIR_CELLS_PER_HEARTBEAT: usize = 64;
+pub const GOSSIP_REPAIR_CELLS_PER_HEARTBEAT: usize = 16;
 /// Shortest time the repair lane takes to sweep a node's whole store. A
 /// store smaller than this many heartbeats' slices is swept at this pace
 /// instead of being resent in full on every heartbeat.
