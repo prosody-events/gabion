@@ -78,6 +78,53 @@ impl Outbound {
     }
 }
 
+/// The receiver's view of one of a peer's streams.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Inbound {
+    /// Highest sequence held contiguously: the cumulative ack.
+    pub(super) have: u64,
+    /// Highest sequence any packet closed; above `have` while a gap is open.
+    seen: u64,
+    /// When the open gap is next reported to the sender, if one is open.
+    report_at: Option<u64>,
+}
+
+impl Inbound {
+    /// Take in a packet closing `(lower, upper]`. A packet that starts above
+    /// `have` follows a lost one: it opens (or extends) a gap, which is
+    /// reported once it has stayed open `hold_ms`, longer than packets of one
+    /// round can be reordered by.
+    pub(super) fn receive(&mut self, lower: u64, upper: u64, now_ms: u64, hold_ms: u64) {
+        if lower <= self.have {
+            self.have = self.have.max(upper);
+        }
+        self.seen = self.seen.max(upper);
+        if self.have >= self.seen {
+            self.report_at = None;
+        } else {
+            self.report_at.get_or_insert(now_ms + hold_ms);
+        }
+    }
+
+    /// Whether a gap is open.
+    pub(super) fn gap(&self) -> bool {
+        self.report_at.is_some()
+    }
+
+    /// Whether the open gap is due to be reported.
+    pub(super) fn report_due(&self, now_ms: u64) -> bool {
+        self.report_at.is_some_and(|at| now_ms >= at)
+    }
+
+    /// The gap was reported; report it again after `retry_ms` if it is still
+    /// open then (the report or the resend it asked for was lost).
+    pub(super) fn reported(&mut self, now_ms: u64, retry_ms: u64) {
+        if self.report_at.is_some() {
+            self.report_at = Some(now_ms + retry_ms);
+        }
+    }
+}
+
 pub(super) struct Peer {
     pub(super) addr: SocketAddr,
     pub(super) zone: Zone,
@@ -90,10 +137,13 @@ pub(super) struct Peer {
     pub(super) own: Outbound,
     /// The cells we relay into our zone, towards this peer.
     pub(super) relay: Outbound,
-    /// Highest sequence of the peer's own stream we hold contiguously.
-    pub(super) have_own: u64,
-    /// Highest sequence of the peer's relay stream we hold contiguously.
-    pub(super) have_relay: u64,
+    /// The peer's own stream, as we hold it.
+    pub(super) own_in: Inbound,
+    /// The peer's relay stream, as we hold it.
+    pub(super) relay_in: Inbound,
+    /// The peer reported a gap in our own stream; resend it at the next
+    /// prompt round rather than the next heartbeat.
+    pub(super) resend_own: bool,
     /// Data arrived from the peer since we last told it what we hold.
     pub(super) ack_due: bool,
     /// Smoothed round-trip time in milliseconds; `0` until the first sample.
@@ -114,8 +164,9 @@ impl Peer {
             identity: None,
             own: Outbound::default(),
             relay: Outbound::default(),
-            have_own: 0,
-            have_relay: 0,
+            own_in: Inbound::default(),
+            relay_in: Inbound::default(),
+            resend_own: false,
             ack_due: false,
             srtt_ms: 0,
             suspect: false,
@@ -127,8 +178,9 @@ impl Peer {
     pub(super) fn reset_streams(&mut self) {
         self.own = Outbound::default();
         self.relay = Outbound::default();
-        self.have_own = 0;
-        self.have_relay = 0;
+        self.own_in = Inbound::default();
+        self.relay_in = Inbound::default();
+        self.resend_own = false;
         self.ack_due = false;
         self.srtt_ms = 0;
         self.suspect = false;

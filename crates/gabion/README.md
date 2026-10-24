@@ -79,20 +79,28 @@ zone from its address.
   that starts above what the receiver holds (an earlier one was lost) is merged
   but not acked past the gap. A header-only packet carries the acks when no data
   flows back within the heartbeat tick.
-- *Loss repair.* A stream with data in flight for `max(2 * RTT_est, rto_floor)` (500 ms
-  floor, `RTT_est` a per-peer smoothed round trip from one timed in-flight packet,
-  never taken across a resend) resumes from the last ack, so the next round resends
-  exactly what the peer has not confirmed. A peer that is new, or that returned
-  after a long silence, is behind by the whole live window and receives it.
+- *Loss repair.* A receiver that gets a packet starting above what it holds has lost
+  an earlier one. Once that gap has stayed open for one `relay_floor` (longer than
+  packets of one round can be reordered by) it reports the gap to the sender, on its
+  next packet to it or alone in a header-only packet, and repeats the report every
+  four relay floors while the gap stays open. The sender resumes that stream from the
+  receiver's ack at its next prompt round. Behind that, a stream with data in flight
+  for `max(2 * RTT_est, rto_floor)` (500 ms floor, `RTT_est` a per-peer smoothed round
+  trip from one timed in-flight packet, never taken across a resend) resumes from the
+  last ack, which covers a lost last packet that no later packet reveals. A peer that
+  is new, or that returned after a long silence, is behind by the whole live window
+  and receives it.
 - *Failover.* A gateway that misses that deadline on the origin's stream is marked
   suspect and the next-ranked member of its zone takes over; hearing any packet from
   the suspect clears the mark, so a recovered gateway regains its role. The ranking
   is a pure function of the origin, the discovered members and the suspect marks.
   Only missing acks trigger it.
 - *Scheduling.* Rounds are main's: a heartbeat every `tick_interval` and error-budget
-  threshold rounds in between. A relay round runs at most every `relay_floor` (5 ms)
-  while relayed cells await forwarding, and its first run after a quiet spell is
-  immediate.
+  threshold rounds in between. A prompt round runs at most every `relay_floor` (5 ms)
+  while relayed cells await forwarding, a peer reported a gap, or a gap of our own
+  awaits its report, and its first run after a quiet spell is immediate. The 5 ms is
+  a floor between relay rounds rather than a batching delay after the first arrival:
+  a relay is never held back, and arrivals within the floor still share a packet.
 
 **Parameters** (`GossipConfig`, defaults in `gabion::defaults`): `zone_prefix_len`
 (16), `rto_floor` (500 ms), `relay_floor` (5 ms). One gateway per remote zone.
@@ -110,6 +118,12 @@ zone from its address.
   described above, the minimal substitute for the reliable channel a TCP hop would
   give. It needs the two ack fields and the stream range in the wire header (88 bytes,
   version 2) and one flag, `FLAG_RELAY`.
+- *Gap reports* (component `edge-nack`). The source designs repair a hop by
+  retransmission timeout alone, which at the 500 ms floor dominated convergence under
+  loss. Per-hop streams already carry the sequence ranges a receiver needs to see a
+  gap, so the receiver reports it with one of two header flags (`FLAG_GAP_OWN`,
+  `FLAG_GAP_RELAY`) next to the cumulative ack, and the sender resends at once. The
+  timeout and failover stay as specified: a report never marks a gateway suspect.
 - *Relay eligibility.* A gateway forwards a cell iff it arrived in an own-stream packet
   from an origin outside the gateway's zone. Each cell slot carries a relay stamp (zero
   for cells that must not be forwarded), so a cell is never forwarded twice.
@@ -168,7 +182,7 @@ byte  field                  width
 ----  ---------------------  -----
 0     MAGIC                  4   (0x4742_4732)
 4     VERSION                2   (= 2)
-6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED | FLAG_RELAY)
+6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED | FLAG_RELAY | FLAG_GAP_*)
 8     cluster_id_hash       16
 24    sender_node_id        16
 40    sender_incarnation     4

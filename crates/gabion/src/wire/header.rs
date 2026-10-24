@@ -14,6 +14,12 @@ pub const FLAG_AUTHENTICATED: u16 = 0x02;
 /// forwards into its own zone) rather than to its own-origin stream. It
 /// selects which sequence space `stream_lower`/`stream_upper` index.
 pub const FLAG_RELAY: u16 = 0x04;
+/// The sender holds cells of the receiver's own stream beyond `ack_own` but
+/// is missing some at or below them (a packet was lost): resend from
+/// `ack_own` now rather than at the retransmission timeout.
+pub const FLAG_GAP_OWN: u16 = 0x08;
+/// As [`FLAG_GAP_OWN`], for the receiver's relay stream and `ack_relay`.
+pub const FLAG_GAP_RELAY: u16 = 0x10;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {

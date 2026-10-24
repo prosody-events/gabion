@@ -26,7 +26,9 @@ use crate::crdt::{
     CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
 };
 use crate::discovery::PeerEvent;
-use crate::wire::{self, FLAG_RELAY, PacketBuf, Packets, WireScratch};
+use crate::wire::{
+    self, FLAG_GAP_OWN, FLAG_GAP_RELAY, FLAG_RELAY, PacketBuf, Packets, WireScratch,
+};
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
@@ -58,8 +60,11 @@ enum Round {
     /// An error-budget flush between heartbeats: as `Heartbeat`, minus the
     /// standalone acks.
     Threshold,
-    /// A gateway forwarding freshly received cells into its zone.
-    Relay,
+    /// Work that should not wait for the heartbeat: a gateway forwarding
+    /// freshly received cells into its zone, a stream a peer reported a gap
+    /// in, and gap reports of our own. Sends the relay stream, the own stream
+    /// only to peers that reported a gap in it, and the reports.
+    Prompt,
 }
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
@@ -110,8 +115,13 @@ where
     relay_head: u64,
     /// Highest own-cell `origin_sequence` issued.
     own_head: u64,
-    /// Cells were stamped for relay since the last relay round.
+    /// Cells were stamped for relay since the last prompt round, or a peer
+    /// reported a gap in our relay stream.
     relay_pending: bool,
+    /// A peer reported a gap in our own stream.
+    resend_pending: bool,
+    /// A gap is open in some peer's stream to us.
+    gaps_open: bool,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
@@ -324,6 +334,8 @@ where
             relay_head: 0,
             own_head: 0,
             relay_pending: false,
+            resend_pending: false,
+            gaps_open: false,
             send_pool,
             send_pending,
             send_free,
@@ -362,10 +374,10 @@ where
     {
         let mut peer_events = std::pin::pin!(peer_events);
         let mut tick = self.clock.ticker(self.config.tick_interval);
-        // Paces relay rounds: polled only while cells await relay, and its
-        // first tick is immediate, so the floor bounds the relay rate without
+        // Paces prompt rounds: polled only while there is prompt work, and
+        // its first tick is immediate, so the floor bounds the rate without
         // delaying a relay that follows a quiet spell.
-        let mut relay_tick = self.clock.ticker(self.config.relay_floor);
+        let mut prompt_tick = self.clock.ticker(self.config.relay_floor);
         // Once the peer-event stream returns `None` (e.g. `stream::empty()`),
         // never poll it again — otherwise it returns `Ready(None)` on every
         // iteration and the loop spins.
@@ -379,7 +391,7 @@ where
             let have_send = !self.send_pending.is_empty();
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
-            let watch_relay = self.relay_pending;
+            let watch_prompt = self.relay_pending || self.resend_pending || self.gaps_open;
 
             let outcome = if self.want_immediate_flush {
                 // A previous limit request crossed the per-rule error
@@ -417,7 +429,7 @@ where
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
                     cmd = recv_admin(admin_rx), if watch_admin => ArmOutcome::Admin(cmd),
                     _ = tick.tick() => ArmOutcome::Heartbeat,
-                    _ = relay_tick.tick(), if watch_relay => ArmOutcome::Relay,
+                    _ = prompt_tick.tick(), if watch_prompt => ArmOutcome::Prompt,
                 }
             };
 
@@ -435,7 +447,7 @@ where
                 ArmOutcome::Admin(None) => self.admin_rx = None,
                 ArmOutcome::Heartbeat => self.handle_gossip_round(Round::Heartbeat)?,
                 ArmOutcome::Threshold => self.handle_gossip_round(Round::Threshold)?,
-                ArmOutcome::Relay => self.handle_gossip_round(Round::Relay)?,
+                ArmOutcome::Prompt => self.handle_gossip_round(Round::Prompt)?,
             }
 
             // One apply per iteration covering both row sources. CRDT-free
@@ -624,11 +636,12 @@ where
         };
         let identity = (NodeId(header.sender_node_id), header.sender_incarnation);
         let peer = &mut self.peers[pi];
-        if peer.identity != Some(identity) {
-            // First contact, or a new process behind the same address.
+        if peer.identity.is_some_and(|known| known != identity) {
+            // A new process behind the same address: what the old one held
+            // or acked is void. First contact keeps what we already sent.
             peer.reset_streams();
-            peer.identity = Some(identity);
         }
+        peer.identity = Some(identity);
 
         // Hearing from a gateway clears its suspicion.
         let was_suspect = std::mem::take(&mut peer.suspect);
@@ -642,18 +655,32 @@ where
             peer.note_rtt(sample);
         }
 
+        // A gap the peer reports in one of our streams is resent from its
+        // ack at the next prompt round. Nothing in flight means the resend
+        // already went out.
+        if header.flags & FLAG_GAP_OWN != 0 && peer.own.sent > peer.own.acked {
+            peer.own.rewind(now_ms);
+            peer.resend_own = true;
+            self.resend_pending = true;
+        }
+        if header.flags & FLAG_GAP_RELAY != 0 && peer.relay.sent > peer.relay.acked {
+            peer.relay.rewind(now_ms);
+            self.relay_pending = true;
+        }
+
         // The peer's stream, closed over `(stream_lower, stream_upper]`: the
         // range is contiguous with what we hold only if it starts at or
         // below it. A packet beyond a gap (an earlier one was lost) is
-        // merged but not acked past the gap.
-        let have = if header.flags & FLAG_RELAY == 0 {
-            &mut peer.have_own
+        // merged but not acked past the gap, and the gap is reported once it
+        // has outlived one relay floor.
+        let inbound = if header.flags & FLAG_RELAY == 0 {
+            &mut peer.own_in
         } else {
-            &mut peer.have_relay
+            &mut peer.relay_in
         };
-        if header.stream_lower <= *have {
-            *have = (*have).max(header.stream_upper);
-        }
+        let hold_ms = self.config.relay_floor.as_millis() as u64;
+        inbound.receive(header.stream_lower, header.stream_upper, now_ms, hold_ms);
+        self.gaps_open |= inbound.gap();
         peer.ack_due |= header.cell_count > 0;
 
         if was_suspect {
@@ -789,12 +816,13 @@ where
     /// - the **relay** stream (cells this node, as a gateway, received straight
     ///   from an origin in another zone) goes to every peer in the local zone.
     ///
-    /// A `Relay` round sends only the relay stream. Heartbeat rounds also
-    /// ack peers that sent data and received nothing from us to piggyback
-    /// the ack on.
+    /// A `Prompt` round sends the relay stream, and the own stream only to
+    /// peers that reported a gap in it. Heartbeat rounds also ack peers that
+    /// sent data and received nothing from us to piggyback the ack on, and
+    /// every round reports gaps that have outlived their hold.
     fn handle_gossip_round(&mut self, round: Round) -> Result<(), GossipError> {
         let now_ms = self.clock.now_millis();
-        if round != Round::Relay {
+        if round != Round::Prompt {
             // Step 0: bump the total-ticks counter. Tracked unconditionally
             // (even for empty / no-peer ticks) so the bench can split the
             // run's wall time into heartbeat ticks vs threshold fires.
@@ -807,10 +835,12 @@ where
             self.relay_pending = false;
         }
 
-        if self.store.is_empty() || self.peers.is_empty() {
+        if self.peers.is_empty() {
+            self.resend_pending = false;
+            self.gaps_open = false;
             return Ok(());
         }
-        if round != Round::Relay {
+        if round != Round::Prompt && !self.store.is_empty() {
             // The store was non-empty when this tick fired — bench harness
             // counts this as a "dirty tick" so effective-fanout reports
             // `packets / dirty_ticks` rather than `packets / wall_ticks`.
@@ -825,7 +855,7 @@ where
         let mut gateway_missed = false;
         for peer in &mut self.peers {
             let rto_ms = peer.rto_ms(rto_floor_ms);
-            if round != Round::Relay && peer.own.timed_out(now_ms, rto_ms) {
+            if round != Round::Prompt && peer.own.timed_out(now_ms, rto_ms) {
                 peer.own.rewind(now_ms);
                 if peer.gateway {
                     peer.suspect = true;
@@ -843,16 +873,14 @@ where
         // Step 3: order each stream's candidate cells by sequence, from the
         // lowest sequence any recipient still lacks.
         let local_zone = self.local_zone;
-        let own_floor = if round == Round::Relay {
-            None
-        } else {
-            self.peers
-                .iter()
-                .filter(|p| p.zone == local_zone || p.gateway)
-                .map(|p| p.own.sent)
-                .min()
-                .filter(|&sent| sent < self.own_head)
-        };
+        let own_floor = self
+            .peers
+            .iter()
+            .filter(|p| p.zone == local_zone || p.gateway)
+            .filter(|p| round != Round::Prompt || p.resend_own)
+            .map(|p| p.own.sent)
+            .min()
+            .filter(|&sent| sent < self.own_head);
         let relay_floor = self
             .peers
             .iter()
@@ -863,28 +891,47 @@ where
         self.gather_streams(own_floor, relay_floor);
 
         // Step 4: send, peer by peer, starting where the socket last pushed
-        // back.
+        // back. A gap report rides on any packet to the peer, or goes alone.
+        let retry_ms = 4 * self.config.relay_floor.as_millis() as u64;
         let mut recipients = 0;
         let n = self.peers.len();
         let first = self.next_peer % n;
         for i in (first..n).chain(0..first) {
-            let in_zone = self.peers[i].zone == local_zone;
+            let peer = &self.peers[i];
+            let in_zone = peer.zone == local_zone;
+            let own_due = (in_zone || peer.gateway) && (round != Round::Prompt || peer.resend_own);
+            let gaps = gap_flags(peer, now_ms);
             let mut sent = Sent::Nothing;
-            if round != Round::Relay && (in_zone || self.peers[i].gateway) {
-                sent = sent.or(self.send_stream(i, StreamKind::Own, now_ms)?);
+            if own_due {
+                sent = sent.or(self.send_stream(i, StreamKind::Own, now_ms, gaps)?);
             }
             if in_zone {
-                sent = sent.or(self.send_stream(i, StreamKind::Relay, now_ms)?);
+                sent = sent.or(self.send_stream(i, StreamKind::Relay, now_ms, gaps)?);
             }
-            if round == Round::Heartbeat && sent == Sent::Nothing && self.peers[i].ack_due {
-                sent = self.send_ack(i)?;
+            if sent == Sent::Nothing
+                && (gaps != 0 || (round == Round::Heartbeat && self.peers[i].ack_due))
+            {
+                sent = self.send_ack(i, gaps)?;
             }
             if sent == Sent::Blocked {
                 self.next_peer = i;
                 break;
             }
+            let peer = &mut self.peers[i];
+            peer.resend_own = false;
+            if gaps & FLAG_GAP_OWN != 0 {
+                peer.own_in.reported(now_ms, retry_ms);
+            }
+            if gaps & FLAG_GAP_RELAY != 0 {
+                peer.relay_in.reported(now_ms, retry_ms);
+            }
             recipients += usize::from(sent == Sent::Data);
         }
+        self.resend_pending = self.peers.iter().any(|p| p.resend_own);
+        self.gaps_open = self
+            .peers
+            .iter()
+            .any(|p| p.own_in.gap() || p.relay_in.gap());
         if recipients > 0 {
             self.last_effective_fanout = recipients;
             self.peak_effective_fanout = self.peak_effective_fanout.max(recipients);
@@ -894,7 +941,7 @@ where
         // non-zero pending as "touched in expectation by the tick": a hit
         // either rode out in this round's own-stream packets or waits in a
         // stream for the next one.
-        if round != Round::Relay {
+        if round != Round::Prompt {
             let stamp = now_ms.max(1);
             for slot in 0..self.rule_pending.len() {
                 if self.rule_pending[slot] != 0 {
@@ -942,6 +989,7 @@ where
         pi: usize,
         stream: StreamKind,
         now_ms: u64,
+        gaps: u16,
     ) -> Result<Sent, GossipError> {
         let candidates = match stream {
             StreamKind::Own => &self.own_scratch,
@@ -967,7 +1015,7 @@ where
         }
         let header = self.header_for(
             pi,
-            if stream == StreamKind::Relay {
+            gaps | if stream == StreamKind::Relay {
                 FLAG_RELAY
             } else {
                 0
@@ -995,8 +1043,9 @@ where
         Ok(if blocked { Sent::Blocked } else { Sent::Data })
     }
 
-    /// Send peer `pi` a header-only packet carrying our acks.
-    fn send_ack(&mut self, pi: usize) -> Result<Sent, GossipError> {
+    /// Send peer `pi` a header-only packet carrying our acks and the gap
+    /// reports `gaps`.
+    fn send_ack(&mut self, pi: usize, gaps: u16) -> Result<Sent, GossipError> {
         let Some(slot) = take_send_slot(
             &self.transport,
             &self.send_pool,
@@ -1006,7 +1055,7 @@ where
         else {
             return Ok(Sent::Blocked);
         };
-        let header = self.header_for(pi, 0, 0);
+        let header = self.header_for(pi, gaps, 0);
         let buf = &mut self.send_pool[slot as usize];
         wire::encode_header_only::<C>(header, self.config.auth_key.as_ref(), buf);
         let peer = &mut self.peers[pi];
@@ -1026,8 +1075,8 @@ where
             count_width: 0,
             cell_count: 0,
             body_len: 0,
-            ack_own: peer.have_own,
-            ack_relay: peer.have_relay,
+            ack_own: peer.own_in.have,
+            ack_relay: peer.relay_in.have,
             stream_lower,
             stream_upper: 0,
             flags,
@@ -1109,6 +1158,22 @@ where
     }
 }
 
+/// The gap reports due to `peer`: a flag per stream of its with a gap that
+/// has stayed open past its hold.
+fn gap_flags(peer: &Peer, now_ms: u64) -> u16 {
+    let own = if peer.own_in.report_due(now_ms) {
+        FLAG_GAP_OWN
+    } else {
+        0
+    };
+    let relay = if peer.relay_in.report_due(now_ms) {
+        FLAG_GAP_RELAY
+    } else {
+        0
+    };
+    own | relay
+}
+
 /// A free send slot. When every slot holds a queued packet, the oldest is
 /// handed to the socket first: one round can owe a zone more packets than the
 /// pool holds (two streams to each of 100 peers), and the queue exists only to
@@ -1181,7 +1246,7 @@ enum ArmOutcome {
     Admin(Option<AdminCommand>),
     Heartbeat,
     Threshold,
-    Relay,
+    Prompt,
 }
 
 /// Read one admin command. Only invoked when `admin_rx.is_some()` — the

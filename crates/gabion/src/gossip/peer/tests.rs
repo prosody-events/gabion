@@ -147,3 +147,21 @@ fn all_suspect_zone_keeps_a_gateway() {
     refresh_gateways(&mut peers, local);
     assert_eq!(peers.iter().filter(|p| p.gateway).count(), 1);
 }
+
+#[test]
+fn a_gap_is_reported_after_its_hold_and_again_until_filled() {
+    let mut inbound = Inbound::default();
+    inbound.receive(0, 4, 100, 5);
+    assert!(!inbound.gap(), "contiguous data opens no gap");
+    inbound.receive(6, 9, 110, 5);
+    assert_eq!(inbound.have, 4, "nothing past the gap is acked");
+    assert!(inbound.gap());
+    assert!(!inbound.report_due(114), "reordering gets the hold");
+    assert!(inbound.report_due(115));
+    inbound.reported(115, 20);
+    assert!(!inbound.report_due(134));
+    assert!(inbound.report_due(135), "an unanswered report repeats");
+    inbound.receive(4, 9, 140, 5);
+    assert_eq!(inbound.have, 9);
+    assert!(!inbound.gap(), "the resend closes the gap");
+}
