@@ -11,11 +11,17 @@
 //! [ version     : u64  ×N ]               the sender's watermark for the origin
 //! ```
 //!
-//! An origin inside `[range_lo, range_hi]` that the frame does not list is one
-//! the sender holds nothing for, so the receiver answers it from version `0`.
-//! That makes every frame self-describing: a large digest is cut into several
-//! frames whose ranges tile the node-id space, and the receiver needs no state
-//! linking them, which is what keeps a lost frame harmless.
+//! A SYN frame (`FLAG_SYN`) opens an exchange. An origin inside `[range_lo,
+//! range_hi]` that it does not list is one the sender holds nothing for, so
+//! the receiver answers it from version `0`. That makes every frame
+//! self-describing: a large digest is cut into several frames whose ranges
+//! tile the node-id space, and the receiver needs no state linking them, which
+//! is what keeps a lost frame harmless.
+//!
+//! A frame without `FLAG_SYN` is a request answering one SYN frame: it lists
+//! only the origins the SYN was ahead on, each with the requester's own
+//! watermark, and is owed cells of those origins alone. Its range echoes the
+//! SYN frame's.
 
 use crate::crdt::{Incarnation, NodeId};
 

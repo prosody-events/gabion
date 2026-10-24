@@ -1525,9 +1525,12 @@ async fn drain_datagrams(probe: &crate::gossip::sim::SimTransport) -> Vec<Vec<u8
     datagrams
 }
 
+/// Send `to` a digest frame covering the whole node-id space: a SYN opening
+/// an exchange, or (`syn == false`) a request answering one.
 fn send_digest(
     probe: &crate::gossip::sim::SimTransport,
     to: SocketAddr,
+    syn: bool,
     entries: &[crate::wire::DigestEntry],
 ) {
     use crate::gossip::GossipTransport;
@@ -1543,7 +1546,7 @@ fn send_digest(
     };
     encode_digest(
         header,
-        false,
+        syn,
         DigestRange::ALL,
         entries,
         None,
@@ -1557,7 +1560,7 @@ fn send_digest(
 /// Cells move only in answer to a digest. A node that nobody has spoken to
 /// offers digests and nothing else, however much it holds; a digest that says
 /// what the asker lacks is answered with exactly those cells, and a digest
-/// that is already current is answered with nothing.
+/// that is already current is answered with nothing, not even a request.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn cells_move_only_in_answer_to_a_digest() {
     use crate::wire::{self, DigestEntry, FrameLimits};
@@ -1604,7 +1607,7 @@ async fn cells_move_only_in_answer_to_a_digest() {
 
             // A digest that knows nothing of this node is answered with its
             // cell, and only the cell.
-            send_digest(&probe, addr, &[]);
+            send_digest(&probe, addr, true, &[]);
             sim_advance_ticks(Duration::from_millis(1), 3).await;
             let answer = drain_datagrams(&probe)
                 .await
@@ -1628,6 +1631,7 @@ async fn cells_move_only_in_answer_to_a_digest() {
             send_digest(
                 &probe,
                 addr,
+                true,
                 &[DigestEntry {
                     node_id: identity.node_id,
                     incarnation: 1,
@@ -1645,6 +1649,129 @@ async fn cells_move_only_in_answer_to_a_digest() {
                 })
                 .count();
             assert_eq!(current, 0);
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
+        })
+        .await;
+}
+
+/// A SYN is answered with a request naming only the origins it is ahead on,
+/// each with this node's own watermark (`0` for an origin it has never seen),
+/// and a request is answered with cells of the origins it names and no
+/// others.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_syn_is_answered_with_a_request_for_what_it_is_ahead_on() {
+    use crate::wire::{self, DigestEntry, FrameLimits};
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr = sock(40_950);
+            let probe_addr = sock(40_951);
+            let probe = router.bind(probe_addr);
+            let identity = NodeIdentity::new(NodeId(0xA11CE), 1);
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(addr),
+                TokioClock::from_millis(0),
+                sim_config(identity, vec![probe_addr], 1),
+                store_for(identity),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+            for key in [1, 2] {
+                client
+                    .record(0xFEED, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 2).await;
+            drain_datagrams(&probe).await;
+
+            // The SYN is behind on this node's own origin and ahead on one it
+            // has never seen.
+            let stranger = DigestEntry {
+                node_id: NodeId(0x5757),
+                incarnation: 3,
+                version: 9,
+            };
+            send_digest(
+                &probe,
+                addr,
+                true,
+                &[
+                    DigestEntry {
+                        node_id: identity.node_id,
+                        incarnation: 1,
+                        version: 1,
+                    },
+                    stranger,
+                ],
+            );
+            sim_advance_ticks(Duration::from_millis(1), 3).await;
+            let mut requests = Vec::new();
+            let mut cells = Vec::new();
+            for bytes in drain_datagrams(&probe).await {
+                let frame = wire::open(&bytes, None, FrameLimits::default()).unwrap();
+                if frame.is_syn() {
+                    continue;
+                }
+                if frame.is_digest() {
+                    frame.visit_digest(|e| requests.push(e)).unwrap();
+                } else {
+                    frame.visit_cells::<u32>(|c| cells.push(c)).unwrap();
+                }
+            }
+            assert_eq!(
+                requests,
+                [DigestEntry {
+                    version: 0,
+                    ..stranger
+                }]
+            );
+            assert_eq!(
+                cells.iter().map(|c| c.origin_sequence).collect::<Vec<_>>(),
+                [2]
+            );
+
+            // A request is owed only what it names: an empty one, nothing.
+            send_digest(&probe, addr, false, &[]);
+            sim_advance_ticks(Duration::from_millis(1), 3).await;
+            let unsolicited = drain_datagrams(&probe)
+                .await
+                .into_iter()
+                .filter(|bytes| {
+                    !wire::open(bytes, None, FrameLimits::default())
+                        .unwrap()
+                        .is_syn()
+                })
+                .count();
+            assert_eq!(unsolicited, 0);
+
+            // A request naming this node's origin gets everything above it.
+            send_digest(
+                &probe,
+                addr,
+                false,
+                &[DigestEntry {
+                    node_id: identity.node_id,
+                    incarnation: 1,
+                    version: 0,
+                }],
+            );
+            sim_advance_ticks(Duration::from_millis(1), 3).await;
+            let mut cells = Vec::new();
+            for bytes in drain_datagrams(&probe).await {
+                let frame = wire::open(&bytes, None, FrameLimits::default()).unwrap();
+                if !frame.is_digest() {
+                    frame.visit_cells::<u32>(|c| cells.push(c)).unwrap();
+                }
+            }
+            assert_eq!(
+                cells.iter().map(|c| c.origin_sequence).collect::<Vec<_>>(),
+                [1, 2]
+            );
 
             client.shutdown().await.unwrap();
             let _ = handle.await;

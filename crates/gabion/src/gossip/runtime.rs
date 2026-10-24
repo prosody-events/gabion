@@ -8,10 +8,10 @@
 //! the loop allocates after construction.
 //!
 //! Replication is Scuttlebutt push-pull anti-entropy. A tick sends a peer a
-//! digest (the watermark per origin). A peer answers a digest with the cells
-//! the digest lacks and, if the digest opened the exchange, its own digest,
-//! which the initiator answers the same way. Cells move only in response to a
-//! digest.
+//! digest (the watermark per origin). The peer answers with the cells the
+//! digest lacks and a request naming the origins the digest is ahead on, with
+//! its own watermark for each, which the initiator answers the same way.
+//! Cells move only in response to a digest.
 
 use std::cmp::Reverse;
 use std::collections::VecDeque;
@@ -490,12 +490,12 @@ where
                     .merge_remote(&self.obs_buf, now_millis, &mut self.sink_buf);
             }
             Ok(Inbound::Digest { range, syn }) => {
-                // The digest goes first: it is small, and the cells below can
+                // The request goes first: it is small, and the cells below can
                 // use up the send pool.
                 if syn {
-                    self.send_digest(src, false, range);
+                    self.send_request(src, range);
                 }
-                self.serve_digest(src, range);
+                self.serve_digest(src, syn.then_some(range));
             }
             Err(err) => {
                 self.decode_reject_count = self.decode_reject_count.saturating_add(1);
@@ -547,13 +547,14 @@ where
         Ok(Inbound::Cells)
     }
 
-    /// Answer the digest in `digest_in` with the cells it lacks. Origins in
-    /// `range` the digest does not list are answered from version `0`.
-    /// Origins are served deepest backlog first (Scuttlebutt's
-    /// "scuttle-depth" order), each oldest version first, until the per-reply
-    /// cell budget runs out, so what one origin receives is always a prefix of
-    /// what it owes.
-    fn serve_digest(&mut self, dst: SocketAddr, range: DigestRange) {
+    /// Answer the digest in `digest_in` with the cells it lacks. For a SYN,
+    /// `range` is the slice it covers, and origins in it the digest does not
+    /// list are answered from version `0`; a request (`None`) is owed only the
+    /// origins it lists. Origins are served deepest backlog first
+    /// (Scuttlebutt's "scuttle-depth" order), each oldest version first, until
+    /// the per-reply cell budget runs out, so what one origin receives is
+    /// always a prefix of what it owes.
+    fn serve_digest(&mut self, dst: SocketAddr, range: Option<DigestRange>) {
         self.digest_epoch = self.digest_epoch.wrapping_add(1);
         if self.digest_epoch == 0 {
             self.digest_marks.fill(0);
@@ -571,13 +572,12 @@ where
             let Some(origin) = self.store.node_dictionary().descriptor(slot) else {
                 continue;
             };
-            if !range.contains(origin.node_id) {
-                continue;
-            }
             let after = if self.digest_marks[slot as usize] == self.digest_epoch {
                 self.digest_versions[slot as usize]
-            } else {
+            } else if range.is_some_and(|r| r.contains(origin.node_id)) {
                 0
+            } else {
+                continue;
             };
             let newest = self.store.newest_version(slot);
             if newest > after {
@@ -608,21 +608,44 @@ where
         }
     }
 
-    /// Send `dst` this node's watermark for every origin in `range`, as one
-    /// or more digest frames whose ranges tile `range`. An empty `range`
-    /// still produces a frame: it tells the receiver this node holds nothing
-    /// there. Every frame is sent even when the peer is already current,
-    /// because the digest is how the peer learns that.
-    fn send_digest(&mut self, dst: SocketAddr, syn: bool, range: DigestRange) {
-        let dictionary = self.store.node_dictionary();
-        self.origin_order.clear();
-        for slot in 0..dictionary.capacity() {
-            if let Some(origin) = dictionary.descriptor(slot)
-                && range.contains(origin.node_id)
-            {
-                self.origin_order.push(slot);
+    /// Answer the SYN frame in `digest_in`, which covers `range`, with a
+    /// request: this node's watermark for each origin the SYN is ahead on,
+    /// `0` for an origin this node does not know (Cassandra's
+    /// `GossipDigestAck`). An origin the SYN is not ahead on has nothing for
+    /// this node, so a full digest would only repeat what the SYN's sender
+    /// can already work out. The request never outgrows the SYN frame it
+    /// answers, so it is one frame, and none at all when nothing is asked.
+    fn send_request(&mut self, dst: SocketAddr, range: DigestRange) {
+        self.digest_out.clear();
+        for entry in &self.digest_in {
+            let held = self
+                .store
+                .find_node(entry.node_id, entry.incarnation)
+                .map_or(0, |slot| self.store.watermark(slot));
+            if entry.version > held {
+                self.digest_out.push(DigestEntry {
+                    version: held,
+                    ..*entry
+                });
             }
         }
+        if !self.digest_out.is_empty() {
+            self.queue_digest_frame(dst, false, range);
+        }
+    }
+
+    /// Open an exchange with `dst`: send this node's watermark for every
+    /// origin it knows, as one or more SYN frames whose ranges tile the
+    /// node-id space. With no origins it still sends one frame: it tells the
+    /// receiver this node holds nothing. Every frame is sent even when the
+    /// peer is already current, because the digest is how the peer learns
+    /// that.
+    fn send_digest(&mut self, dst: SocketAddr) {
+        let dictionary = self.store.node_dictionary();
+        self.origin_order.clear();
+        self.origin_order.extend(
+            (0..dictionary.capacity()).filter(|&slot| dictionary.descriptor(slot).is_some()),
+        );
         self.origin_order.sort_unstable_by_key(|&slot| {
             dictionary
                 .descriptor(slot)
@@ -632,6 +655,7 @@ where
         let per_frame = self.digest_out.capacity().max(1);
         let frames = self.origin_order.len().div_ceil(per_frame).max(1);
         for frame in 0..frames {
+            let dictionary = self.store.node_dictionary();
             let start = (frame * per_frame).min(self.origin_order.len());
             let end = (start + per_frame).min(self.origin_order.len());
             self.digest_out.clear();
@@ -644,10 +668,11 @@ where
                     });
                 }
             }
-            // The frames' ranges tile `range`: each ends just before the next
-            // frame's first origin, so an origin the sender lacks falls inside
-            // exactly one frame. Two incarnations of one node id can straddle
-            // a cut, in which case neighbouring ranges share that id.
+            // The frames' ranges tile the node-id space: each ends just before
+            // the next frame's first origin, so an origin the sender lacks
+            // falls inside exactly one frame. Two incarnations of one node id
+            // can straddle a cut, in which case neighbouring ranges share that
+            // id.
             let first = self.digest_out.first().map(|e| e.node_id.0);
             let last = self.digest_out.last().map(|e| e.node_id.0);
             let next_first = self
@@ -657,36 +682,47 @@ where
                 .map(|o| o.node_id.0);
             let frame_range = DigestRange {
                 lo: if frame == 0 {
-                    range.lo
+                    DigestRange::ALL.lo
                 } else {
-                    first.unwrap_or(range.lo)
+                    first.unwrap_or(DigestRange::ALL.lo)
                 },
                 hi: match (next_first, last) {
                     (Some(next), Some(last)) => next.saturating_sub(1).max(last),
-                    _ => range.hi,
+                    _ => DigestRange::ALL.hi,
                 },
             };
 
-            let Some(slot) = self.send_free.pop() else {
+            if !self.queue_digest_frame(dst, true, frame_range) {
                 return;
-            };
-            let header = self.node_header();
-            let key = self.config.auth_key.as_ref();
-            let buf = &mut self.send_pool[slot as usize];
-            match wire::encode_digest(
-                header,
-                syn,
-                frame_range,
-                &self.digest_out,
-                key,
-                self.config.wire_limits,
-                buf,
-            ) {
-                Ok(()) => self.send_pending.push_back((dst, slot)),
-                Err(_) => {
-                    self.send_free.push(slot);
-                    return;
-                }
+            }
+        }
+    }
+
+    /// Queue `digest_out` as one digest frame covering `range` for `dst`.
+    /// Returns `false` when the send pool is exhausted or the frame does not
+    /// encode.
+    fn queue_digest_frame(&mut self, dst: SocketAddr, syn: bool, range: DigestRange) -> bool {
+        let Some(slot) = self.send_free.pop() else {
+            return false;
+        };
+        let header = self.node_header();
+        let buf = &mut self.send_pool[slot as usize];
+        match wire::encode_digest(
+            header,
+            syn,
+            range,
+            &self.digest_out,
+            self.config.auth_key.as_ref(),
+            self.config.wire_limits,
+            buf,
+        ) {
+            Ok(()) => {
+                self.send_pending.push_back((dst, slot));
+                true
+            }
+            Err(_) => {
+                self.send_free.push(slot);
+                false
             }
         }
     }
@@ -830,7 +866,7 @@ where
             self.peers.swap(i, j);
         }
         for i in 0..pick_count {
-            self.send_digest(self.peers[i], true, DigestRange::ALL);
+            self.send_digest(self.peers[i]);
         }
 
         // Reset per-rule pending. The sweep treats every rule with

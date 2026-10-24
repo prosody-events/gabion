@@ -386,9 +386,19 @@ and the anti-entropy framing of Demers et al. (PODC 1987,
    origin's *watermark*, the version below which it holds every cell that
    still exists.
 2. **Reply.** The peer answers with the cells whose origin version is above
-   the digest's, oldest version first per origin, and with its own digest.
-3. **Reply to the reply.** The initiator answers the peer's digest the same
-   way, sending the cells the peer lacks.
+   the digest's, oldest version first per origin, and with a request: its own
+   watermark for each origin the digest is ahead on, and `0` for an origin it
+   has never seen.
+3. **Reply to the reply.** The initiator answers the request the same way,
+   sending the cells of the origins it names that the peer lacks.
+
+The request is Cassandra's `GossipDigestAck`, which lists only the endpoints
+the receiver needs, rather than the paper's full second digest: for an origin
+the SYN is not ahead on, the initiator holds nothing the peer lacks, so its
+entry would carry no information. A request never outgrows the SYN frame it
+answers, and none is sent when nothing is asked. At 80 pods this took reply
+digests from 20 % to 8 % of the bytes sent, about 13 % fewer bytes in all,
+with no change in staleness.
 
 Cells move only in response to a digest; there is no unsolicited push, no
 dirty ring, no forwarding lane, no repair sweep and no per-peer frontier. A
@@ -444,8 +454,8 @@ never claims a version its sender lacks:
   names the node-id range `[lo, hi]` it covers; an origin inside the range
   that the frame does not list is one the sender holds nothing for and is
   answered from version `0`. Every frame is therefore answerable on its own,
-  and a lost frame costs only its range. The reply digest echoes the ranges of
-  the SYN frames it answers.
+  and a lost frame costs only its range. Each request answers one SYN frame
+  and lists its origins explicitly, so it is answerable on its own too.
 - **Cells already out of window are acknowledged, not stored.** An origin's
   watermark resets when its last cell expires, and a peer that has not yet
   expired the same cells would hand them straight back. `merge_remote` takes
