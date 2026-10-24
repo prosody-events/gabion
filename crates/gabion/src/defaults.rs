@@ -60,11 +60,11 @@ pub const GOSSIP_REPAIR_MAX_CELLS: usize =
 /// Words of the per-origin held-sequence bitmap in a digest entry. The
 /// bitmap covers `64 * words` sequences below the origin's maximum (256 by
 /// default); a gap further back than that is assumed held and never
-/// repaired. Each word adds 8 bytes to every digest entry. 256 covers the
-/// live window of an origin that stamps up to about 2 sequences a second
-/// over a two-minute window; an origin that changes more cells per window than
-/// that, such as a long-window rule at a high per-origin hit rate, can have
-/// older losses that repair cannot see.
+/// repaired. Each word adds 8 bytes to every digest entry. Repair sees every
+/// live cell while an origin's change rate times its rules' live span (window
+/// plus one bucket) stays at or under `64 * words`; past that, such as a
+/// long-window rule at a high per-origin hit rate, a joiner or a node back
+/// from a partition never recovers the origin's older live cells.
 pub const GOSSIP_DIGEST_WINDOW_WORDS: usize = 4;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;

@@ -65,7 +65,7 @@ change leaves it when it has been sent.
 
 **Phase two, digest repair.** Every `repair_period` (1 s) a node sends one
 random peer a digest of the origin sequences it holds. The peer answers with
-the cells the digest shows missing, at most `repair_max_cells` (512) per
+the cells the digest shows missing, at most `repair_max_cells` (1,298) per
 repair period across all digests it answers, and, when the digest started an
 exchange, with a digest of its own so the first node can return what the peer
 lacks. Any holder can serve any cell, as pbcast retransmits from any member's
@@ -81,7 +81,13 @@ buffer.
   sequences further back are assumed held. A bare maximum, as Scuttlebutt
   uses over an ordered stream, would never repair a gap left by a lost
   datagram, because direct mail is unordered and unacknowledged. A newer
-  version of a held cell has a new sequence, so it shows as missing.
+  version of a held cell has a new sequence, so it shows as missing. The
+  reverse is not visible: a digest cannot tell a superseded sequence from a
+  missing one, so a responder that holds an older version of a cell than the
+  requester serves it, and the requester's join drops it. That costs the
+  responder repair budget, most under loss, where the lagging node is often
+  the one answering; telling the two apart would take per-cell state in the
+  digest.
 - *Digests are packet-independent.* A digest larger than one packet is sent as
   several, each naming the half-open range of origin keys it speaks for, so
   an origin in range with no entry is one the sender holds nothing for.
@@ -105,12 +111,19 @@ buffer.
   next digest, which no longer lists what it received.
 - *The digest window is bounded.* The bitmap covers
   `GOSSIP_DIGEST_WINDOW_WORDS * 64` (256) sequences below an origin's maximum.
-  A lost cell more than 256 sequences behind its origin's newest is taken as
-  held and never repaired. That covers the live window when an origin stamps
-  up to about 2 sequences a second over a two-minute window; a long-window rule
-  (hours) at a high per-origin hit rate, or a very high-rate regime, can have
-  older losses that repair cannot see. Widening the window costs 8 bytes per
-  word in every digest entry.
+  A cell more than 256 sequences behind the newest sequence the requester holds
+  for its origin is taken as held and never served. Repair therefore sees every
+  live cell only while an origin's change rate times its rules' live span
+  (window plus one bucket) stays at or under `64 * GOSSIP_DIGEST_WINDOW_WORDS`
+  sequences. A joiner, or a node back from a partition, that has received any
+  direct mail from an origin since lists it with that newest sequence, so the
+  origin's older live cells below the window never reach it. At 1,800 req/s
+  over 183 pods and a 10 s window the span is about 110 sequences; at 7,200
+  req/s over 300 pods it is about 260, just past the window, so the oldest live
+  bucket can fall outside repair; a one-hour rule at 0.5 changes a second per
+  origin spans about 1,800, and a joiner or a long partition never recovers its
+  older buckets. Widening the window costs 8 bytes per word in every digest
+  entry.
 - *A node far behind pulls again at once (adapted from the `pull-sweep-join`
   component).* A repair answer that stops at the responder's budget, or at its
   free send slots, carries `FLAG_CUT` on its last packet. The receiver then

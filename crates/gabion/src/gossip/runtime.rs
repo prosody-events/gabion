@@ -823,33 +823,33 @@ where
         // changes stay queued for the first peer to arrive.
         self.store
             .pending_local_changes(self.config.max_cells_per_tick, &mut self.frame_handles);
-        if self.frame_handles.is_empty() {
-            return;
+        if !self.frame_handles.is_empty() {
+            // Bench counters: a tick that had changes to send, and the peers
+            // it reached (all of them).
+            self.dirty_ticks = self.dirty_ticks.saturating_add(1);
+            let n = self.peers.len();
+            self.last_effective_fanout = n;
+            self.peak_effective_fanout = self.peak_effective_fanout.max(n);
+
+            // The changes go out exactly once. Those the send pool had no room
+            // for stay queued for the next tick.
+            let sent = self.encode_packets(Target::All);
+            if let Some(last) = sent
+                .checked_sub(1)
+                .and_then(|i| self.store.get(self.frame_handles[i]))
+            {
+                self.store.release_local_changes(last.origin_sequence);
+            }
         }
 
-        // Bench counters: a tick that had changes to send, and the peers it
-        // reached (all of them).
-        self.dirty_ticks = self.dirty_ticks.saturating_add(1);
-        let n = self.peers.len();
-        self.last_effective_fanout = n;
-        self.peak_effective_fanout = self.peak_effective_fanout.max(n);
-
-        // The changes go out exactly once. Those the send pool had no room for
-        // stay queued for the next tick.
-        let sent = self.encode_packets(Target::All);
-        if let Some(last) = sent
-            .checked_sub(1)
-            .and_then(|i| self.store.get(self.frame_handles[i]))
-        {
-            self.store.release_local_changes(last.origin_sequence);
-        }
-
-        // Reset per-rule pending. The sweep treats every rule with
-        // non-zero pending as "touched in expectation by the tick" — mass
-        // conservation (Kempe, Dobra, Gehrke — FOCS 2003) says every pending
-        // hit either rode out in this round or sits in the queue awaiting
-        // the next one. Under UDP loss the residual is repaired by digest;
-        // the N × ε_R bound holds in expectation.
+        // Reset per-rule pending. The sweep treats every rule with non-zero
+        // pending as "touched in expectation by the tick" — mass conservation
+        // (Kempe, Dobra, Gehrke — FOCS 2003) says every pending hit either
+        // rode out in this round or sits in the queue awaiting the next one.
+        // Under UDP loss the residual is repaired by digest; the N × ε_R bound
+        // holds in expectation. It runs even on a tick with nothing queued: a
+        // hit the cell store refused raises pending without queueing a
+        // change, and must not keep firing threshold ticks at the floor.
         let stamp = now_millis.max(1);
         for slot in 0..self.rule_pending.len() {
             if self.rule_pending[slot] != 0 {
