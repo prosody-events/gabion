@@ -44,15 +44,18 @@ where
         self.tree.branching
     }
 
-    /// Twice (by default) the expected tree round trip: the smoothed
-    /// measurement of completed broadcasts, or the tree height times a
-    /// per-hop estimate until the first one completes.
+    /// Twice (by default) the expected tree round trip: the tree height
+    /// times the measured hop round trip, or the measured round trip of
+    /// whole broadcasts when that is longer (see [`RttEstimator`]).
+    ///
+    /// [`RttEstimator`]: crate::gossip::snow::RttEstimator
     fn ack_timeout_ms(&self) -> u64 {
-        let initial = u64::from(tree_height(self.ring.len(), self.branching()))
-            * crate::defaults::GOSSIP_TREE_INITIAL_HOP_RTT_MS;
+        let height = tree_height(self.ring.len(), self.branching());
+        let expected = self
+            .rtt
+            .expected_ms(height, crate::defaults::GOSSIP_TREE_INITIAL_HOP_RTT_MS);
         let multiple = u64::from(self.tree.ack_timeout_rtt_multiple.max(1));
-        (multiple * self.rtt.expected_ms(initial))
-            .max(2 * crate::defaults::GOSSIP_TREE_TIMER_TICK_MS)
+        (multiple * expected).max(2 * crate::defaults::GOSSIP_TREE_TIMER_TICK_MS)
     }
 
     // -- root side ----------------------------------------------------------
@@ -266,6 +269,9 @@ where
             if relay.done {
                 self.send_ack(src, root, seq);
             } else if src == relay.parent {
+                if let Some(stored) = self.relays.get_mut(idx) {
+                    stored.resent = true;
+                }
                 for (i, child) in relay.children.into_iter().enumerate() {
                     if relay.acked & (1 << i) == 0 {
                         self.forward_to_child(child, root, seq, n);
@@ -286,6 +292,8 @@ where
             children: children.clone(),
             acked: 0,
             done: leaf,
+            sent_ms: self.clock.now_millis(),
+            resent: false,
         });
         if leaf {
             self.send_ack(src, root, seq);
@@ -336,14 +344,19 @@ where
             let Some(idx) = self.origins.find(seq) else {
                 return;
             };
+            let now = self.clock.now_millis();
             let origin = self.origins.get_mut(idx);
+            let first_send = origin.rebroadcasts_left == self.tree.rebroadcasts;
+            let elapsed = now.saturating_sub(origin.started_ms);
             if let Some(child) = origin.children.iter().position(|c| c.addr == src) {
+                if first_send && is_leaf(&origin.children[child]) {
+                    self.rtt.sample_hop(elapsed);
+                }
                 origin.acked |= 1 << child;
             }
             if origin.all_acked() {
-                if origin.rebroadcasts_left == self.tree.rebroadcasts {
-                    let now = self.clock.now_millis();
-                    self.rtt.sample(now.saturating_sub(origin.started_ms));
+                if first_send {
+                    self.rtt.sample_tree(elapsed);
                 }
                 self.origins.release(idx);
             }
@@ -364,6 +377,10 @@ where
             return;
         };
         relay.acked |= 1 << child;
+        if !relay.resent && is_leaf(&relay.children[child]) {
+            let elapsed = self.clock.now_millis().saturating_sub(relay.sent_ms);
+            self.rtt.sample_hop(elapsed);
+        }
         if relay.acked == full_mask(relay.children.len()) {
             relay.done = true;
             let parent = relay.parent;
@@ -398,4 +415,10 @@ where
             self.encode_packets_for(peer);
         }
     }
+}
+
+/// A child handed a range of just itself: it acknowledges as soon as the data
+/// arrives, so its ack times one hop.
+fn is_leaf(child: &Child) -> bool {
+    child.lo == child.addr
 }

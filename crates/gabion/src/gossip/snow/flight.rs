@@ -140,6 +140,11 @@ pub(in crate::gossip) struct Relay {
     pub acked: u8,
     /// The parent has been acknowledged.
     pub done: bool,
+    /// When the children were first sent the data.
+    pub sent_ms: u64,
+    /// The data went to the children a second time, so their acks no longer
+    /// time one send.
+    pub resent: bool,
 }
 
 pub(in crate::gossip) struct Relays {
@@ -187,20 +192,28 @@ pub(in crate::gossip) fn full_mask(n: usize) -> u8 {
     u8::try_from((1_u16 << n) - 1).unwrap_or(u8::MAX)
 }
 
-/// Smoothed round-trip time of whole-tree broadcasts, as the root sees it:
-/// from the first send to the last child's aggregated acknowledgement.
-/// Exponentially weighted with gain 1/8, as TCP's SRTT. Samples are taken
-/// only from broadcasts that completed without a rebroadcast, so a late ack
-/// is never mistaken for the answer to the resend (Karn and Partridge). For
-/// the same reason the expected time doubles after a round in which a
-/// broadcast timed out, up to [`Self::MAX_BACKOFF`] times, and returns to the
-/// measurement at the next completed broadcast; without it a seed below the
-/// real round trip would rebroadcast every packet forever and never sample.
+/// The expected round trip of a whole-tree broadcast: the tree height times
+/// the smoothed round trip of one hop, or the smoothed round trip of whole
+/// broadcasts when that is longer. Both gain 1/8, as TCP's SRTT.
+///
+/// A whole-broadcast sample is taken only when a broadcast completes without
+/// a rebroadcast, so a late ack is never mistaken for the answer to the
+/// resend (Karn and Partridge). With loss nearly every broadcast over a
+/// large tree needs its rebroadcast, so whole-broadcast samples stop. The
+/// hop estimate keeps the timeout measured regardless: a leaf acknowledges
+/// as soon as the data arrives, so a leaf's ack to a parent that sent once
+/// is an unambiguous one-hop round trip, and every node sees many of them
+/// as a relay. Until the first hop sample the hop time is the seed, and the
+/// expected time doubles after each round in which a broadcast timed out
+/// (up to [`Self::MAX_BACKOFF`] times), so a seed below the real round trip
+/// cannot rebroadcast forever without ever being measured.
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::gossip) struct RttEstimator {
-    /// Smoothed RTT in 1/8 ms; `0` until the first sample.
-    srtt_eighths: u64,
-    /// Doublings applied to the expected time since the last sample.
+    /// Smoothed whole-broadcast RTT in 1/8 ms; `0` until the first sample.
+    tree_eighths: u64,
+    /// Smoothed one-hop RTT in 1/8 ms; `0` until the first sample.
+    hop_eighths: u64,
+    /// Doublings applied to the expected time while nothing is measured.
     backoff: u8,
 }
 
@@ -208,29 +221,43 @@ impl RttEstimator {
     /// Most doublings after consecutive timeouts.
     pub const MAX_BACKOFF: u8 = 3;
 
-    pub fn sample(&mut self, rtt_ms: u64) {
-        let sample = rtt_ms.max(1) * 8;
-        self.srtt_eighths = if self.srtt_eighths == 0 {
-            sample
-        } else {
-            self.srtt_eighths - self.srtt_eighths / 8 + sample / 8
-        };
+    /// A broadcast this node rooted completed without a rebroadcast.
+    pub fn sample_tree(&mut self, rtt_ms: u64) {
+        smooth(&mut self.tree_eighths, rtt_ms);
         self.backoff = 0;
     }
 
-    /// A broadcast timed out: wait longer before the next one does.
-    pub fn timed_out(&mut self) {
-        self.backoff = (self.backoff + 1).min(Self::MAX_BACKOFF);
+    /// A leaf acknowledged data this node sent it once.
+    pub fn sample_hop(&mut self, rtt_ms: u64) {
+        smooth(&mut self.hop_eighths, rtt_ms);
+        self.backoff = 0;
     }
 
-    /// The smoothed RTT in ms (or `initial_ms` before any sample), doubled
-    /// once per outstanding timeout.
-    pub fn expected_ms(&self, initial_ms: u64) -> u64 {
-        let base = if self.srtt_eighths == 0 {
-            initial_ms
-        } else {
-            self.srtt_eighths.div_ceil(8)
-        };
-        base << self.backoff
+    /// A broadcast timed out: while the round trip is unmeasured, wait
+    /// longer before the next one does.
+    pub fn timed_out(&mut self) {
+        if self.tree_eighths == 0 && self.hop_eighths == 0 {
+            self.backoff = (self.backoff + 1).min(Self::MAX_BACKOFF);
+        }
     }
+
+    /// The expected whole-tree round trip in ms for a tree of `height`,
+    /// with `seed_hop_ms` standing in for the hop time until it is measured.
+    pub fn expected_ms(&self, height: u32, seed_hop_ms: u64) -> u64 {
+        let hop = match self.hop_eighths {
+            0 => seed_hop_ms,
+            eighths => eighths.div_ceil(8),
+        };
+        let tree = self.tree_eighths.div_ceil(8);
+        (u64::from(height) * hop).max(tree) << self.backoff
+    }
+}
+
+fn smooth(eighths: &mut u64, rtt_ms: u64) {
+    let sample = rtt_ms.max(1) * 8;
+    *eighths = if *eighths == 0 {
+        sample
+    } else {
+        *eighths - *eighths / 8 + sample / 8
+    };
 }

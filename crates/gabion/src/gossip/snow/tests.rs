@@ -261,6 +261,8 @@ fn relay(root: u16, seq: u32) -> Relay {
         children: Children::new(),
         acked: 0,
         done: false,
+        sent_ms: 0,
+        resent: false,
     }
 }
 
@@ -319,37 +321,50 @@ fn ack_masks_cover_exactly_the_children() {
 }
 
 #[test]
-fn rtt_starts_at_the_seed_then_follows_samples() {
+fn rtt_is_the_height_times_the_seed_until_measured() {
     let mut rtt = RttEstimator::default();
-    assert_eq!(rtt.expected_ms(20), 20);
-    rtt.sample(10);
+    assert_eq!(rtt.expected_ms(5, 4), 20);
+    rtt.sample_hop(2);
     assert_eq!(
-        rtt.expected_ms(20),
+        rtt.expected_ms(5, 4),
         10,
-        "the first sample replaces the seed"
+        "the first hop sample replaces the seed"
     );
     for _ in 0..200 {
-        rtt.sample(30);
+        rtt.sample_hop(3);
     }
-    assert_eq!(rtt.expected_ms(20), 30);
-    rtt.sample(0);
-    assert!(rtt.expected_ms(20) >= 1);
+    assert_eq!(rtt.expected_ms(5, 4), 15);
+    rtt.sample_hop(0);
+    assert!(rtt.expected_ms(5, 4) >= 5, "a sample is at least 1 ms");
 }
 
 #[test]
-fn rtt_backs_off_after_a_timeout_and_recovers_at_the_next_sample() {
+fn a_slower_whole_tree_measurement_wins_over_the_hop_estimate() {
     let mut rtt = RttEstimator::default();
-    rtt.sample(10);
-    rtt.timed_out();
-    assert_eq!(rtt.expected_ms(20), 20);
+    rtt.sample_hop(1);
+    rtt.sample_tree(40);
+    assert_eq!(rtt.expected_ms(5, 4), 40);
+    rtt.sample_tree(1);
+    assert_eq!(rtt.expected_ms(5, 4), 40 - 40 / 8 + 1);
+}
+
+#[test]
+fn rtt_backs_off_only_while_unmeasured() {
+    let mut rtt = RttEstimator::default();
     for _ in 0..10 {
         rtt.timed_out();
     }
     assert_eq!(
-        rtt.expected_ms(20),
-        10 << RttEstimator::MAX_BACKOFF,
+        rtt.expected_ms(5, 4),
+        20 << RttEstimator::MAX_BACKOFF,
         "backoff is capped"
     );
-    rtt.sample(10);
-    assert_eq!(rtt.expected_ms(20), 10);
+    rtt.sample_hop(2);
+    assert_eq!(rtt.expected_ms(5, 4), 10, "a sample ends the backoff");
+    rtt.timed_out();
+    assert_eq!(
+        rtt.expected_ms(5, 4),
+        10,
+        "loss does not stretch a measured round trip"
+    );
 }

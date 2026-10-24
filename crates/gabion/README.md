@@ -87,9 +87,15 @@ gabion:
   circulate the packet). Without this a rebroadcast could not repair anything
   below the root's children. No node resends on its own timer.
 - *Expected tree round trip is measured.* A node cannot know the network, so
-  the timeout is twice a smoothed (gain 1/8) measurement of the root's
-  broadcasts that completed without a rebroadcast, seeded with
-  `tree height x GOSSIP_TREE_INITIAL_HOP_RTT_MS` until the first completes.
+  the timeout is twice `tree height x` a smoothed (gain 1/8) one-hop round
+  trip, or twice the smoothed round trip of the root's broadcasts that
+  completed without a rebroadcast when that is longer. A leaf acknowledges as
+  soon as the data arrives, so its ack to a parent that sent once is an
+  unambiguous one-hop sample; roots and relays take them. Whole-broadcast
+  samples alone stop under loss, because a large tree almost never completes
+  on its first send (Karn's rule then discards every sample), which left the
+  timeout at its backed-off maximum. The hop time is seeded with
+  `GOSSIP_TREE_INITIAL_HOP_RTT_MS` until measured.
 - *One broadcast is one packet*, so each carries its own sequence number and
   acknowledgement. Only a node's own changes are broadcast: the root tracks a
   watermark over its local dirty ring (`visit_local_dirty_after`) and cells it
@@ -106,10 +112,10 @@ gabion:
   addresses and ranges it forwarded to, and matches acknowledgements and
   repeats against that frozen set, so a view change while a broadcast is in
   flight cannot change who must answer.
-- *Timeout back-off.* After a round in which a broadcast timed out, the
-  expected round trip doubles (up to 8x) until a broadcast completes without a
-  rebroadcast and is sampled again (Karn and Partridge); otherwise a seed below
-  the real round trip would rebroadcast every packet and never sample.
+- *Timeout back-off.* While nothing is measured yet, a round in which a
+  broadcast timed out doubles the expected round trip (up to 8x), so a seed
+  below the real round trip cannot rebroadcast every packet without ever being
+  measured (Karn and Partridge). The first sample ends the back-off.
 - *Packet budget.* Root packets are encoded against `max_payload_bytes` minus
   the largest control extension, so a full packet still fits after reframing at
   every hop. A packet that cannot be queued (no free send buffer, or a frame
