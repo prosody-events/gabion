@@ -1183,19 +1183,21 @@ The store keeps two `DirtyRing`s (see §3.4 for the ring buffer itself) side by 
 
 The `DirtyRing` type itself does not care which lane it is — both instances are identical implementations. The split is a policy decision: locally-originated updates ship before forwarded ones so that a hot local writer does not starve on relayed chatter, and each ring has its own configurable capacity.
 
+The rings are queues of changes not yet sent. `fill_gossip_frame` consumes every entry it reads (`DirtyRing::consume` drops the oldest entries), so each change leaves in one gossip round, and entries beyond the round's budget wait, oldest first, for the next one. A ring therefore overflows only when changes arrive faster than rounds send them, and an overflow loses a change that was never sent.
+
 `visit_local_dirty` and `visit_forwarded_dirty` stream the ring entries through a caller closure, validating each entry with `dirty_entry_current` and silently skipping stale entries. These visitors do not deduplicate, so a multi-lane composer must dedup itself (§7.3).
 
 ### 7.2 The repair cursor — the third lane
 
-The dirty rings have finite capacity. If a burst of writes overflows the ring, the oldest entries are dropped: the ring bumps `overflow_seq` as a hint, but the entries themselves are gone, and on their own the dirty rings can lose information.
+The dirty rings send each change once, to one round's picks. A peer no pick reached, a packet the network dropped, or an entry an overflowing ring overwrote is gone from the dirty lanes.
 
-The repair cursor is the safety net. It is a `u32` that rotates over `0..capacity` and, on each gossip frame, sweeps forward a small slice and emits handles for any active slot it lands on. The cursor only advances on slots it actually visited, so a partial sweep resumes where it left off on the next frame. Over many frames every active cell is therefore guaranteed to be retransmitted at least once per full rotation, which is the convergence property dirty-only gossip cannot give you on its own.
+The repair cursor is the safety net. It is a `u32` that rotates over `0..capacity` and, on each heartbeat round, sweeps forward a slice of up to `repair_cells` active cells and emits handles for them. The cursor only advances on slots it actually visited, so a partial sweep resumes where it left off on the next frame. Over many frames every active cell is therefore guaranteed to be retransmitted at least once per full rotation, which is the convergence property dirty-only gossip cannot give you on its own.
 
 `visit_repair_slice(max_cells, visit)` is the standalone interface, and `fill_gossip_frame` (§7.3) folds it in as lane 3.
 
 ### 7.3 `fill_gossip_frame` and per-frame dedup
 
-`fill_gossip_frame(max_cells, out)` stitches the three lanes together in priority order — local dirty, then forwarded dirty, then a rotating repair slice — into a single output buffer of cell handles capped at `max_cells`. The gossip runtime calls this once per outgoing frame.
+`fill_gossip_frame(max_cells, repair_cells, out)` stitches the three lanes together in priority order — local dirty, then forwarded dirty, then a rotating repair slice of at most `repair_cells` — into a single output buffer of cell handles capped at `max_cells`. The gossip runtime calls this once per round and sends the same frame to every pick, minus the cells each pick already holds (§7.4).
 
 Per-frame deduplication is O(1) and allocation-free. Every frame, `bump_selection_epoch` increments `selection_epoch`, and `mark_selected(slot)` writes the current epoch into `selection_marks[slot]`; if the slot was already marked this epoch, the caller skips it. Lane 3 therefore naturally cannot re-emit a cell that lanes 1 or 2 already pushed.
 
@@ -1208,7 +1210,7 @@ sequenceDiagram
     participant SM as selection_marks
     participant RC as repair_cursor
 
-    App->>CS: fill_gossip_frame(max_cells=N, out)
+    App->>CS: fill_gossip_frame(max_cells=N, repair_cells=R, out)
     CS->>CS: out.clear(); bump_selection_epoch()
     loop over local_dirty (oldest first)
         CS->>LD: ring_entry_at(offset)
@@ -1218,6 +1220,7 @@ sequenceDiagram
             CS->>App: out.push(handle)
         end
     end
+    CS->>LD: consume(entries read)
     loop over forwarded_dirty
         CS->>FD: ring_entry_at(offset)
         CS->>CS: dirty_entry_current(entry)?
@@ -1226,7 +1229,8 @@ sequenceDiagram
             CS->>App: out.push(handle)
         end
     end
-    loop rotating from repair_cursor until budget filled or full sweep
+    CS->>FD: consume(entries read)
+    loop rotating from repair_cursor until R more or full sweep
         CS->>CS: is_active(slot)?
         CS->>SM: mark_selected(slot)?
         alt active & not yet marked
@@ -1426,7 +1430,7 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `clear()` | Reset to empty; preserves local identity registration. |
 | `visit_local_dirty`, `visit_forwarded_dirty` | Stream dirty lanes (no dedup). |
 | `visit_repair_slice(max, visit)` | Rotate a slice of active cells. |
-| `fill_gossip_frame(max, out)` | Compose a frame: local dirty + forwarded dirty + repair slice, deduped. |
+| `fill_gossip_frame(max, repair, out)` | Compose a round's frame: drain local dirty + forwarded dirty, then a repair slice, deduped. |
 | `repair_cursor()` | Read the current cursor position. |
 
 ---

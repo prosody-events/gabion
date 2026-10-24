@@ -24,7 +24,7 @@ use crate::crdt::{
 use crate::discovery::{Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
-use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
+use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance, sim_advance_ticks};
 use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, parse_cluster_id};
 use crate::wire::HmacKey;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -736,6 +736,59 @@ fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) 
             let _ = handle.await;
         }
         TestResult::from_bool(expired_everywhere)
+    })
+}
+
+/// A node that merges a change forwards it in a relay round of its own,
+/// well before its next heartbeat: C, which only B gossips with, learns A's
+/// hits within the relay pacing while every heartbeat is 10 s away.
+#[test]
+fn sim_relay_round_forwards_before_the_heartbeat() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = [sock(45_100), sock(45_101), sock(45_102)];
+        let peers = [vec![addrs[1]], vec![addrs[0], addrs[2]], vec![addrs[1]]];
+        let mut clients = Vec::new();
+        let mut handles = Vec::new();
+        let mut aggregates = Vec::new();
+        for (i, addr) in addrs.iter().enumerate() {
+            let identity = NodeIdentity::new(NodeId(0xD0 + i as u128), 1);
+            let mut cfg = sim_config(identity, peers[i].clone(), 7 + i as u64);
+            cfg.fanout = 2;
+            cfg.tick_interval = Duration::from_secs(10);
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(*addr),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(identity),
+                agg.clone(),
+            );
+            handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+            clients.push(client);
+            aggregates.push(agg);
+        }
+        // Let the first heartbeats, due at start, go by on empty stores.
+        sim_advance(Duration::from_millis(1)).await;
+
+        // The first hit interns the rule; the second crosses its error
+        // budget and flushes at once.
+        for _ in 0..2 {
+            clients[0]
+                .record(0xFACE, KeyHash(1), 0, 2, 0, 0)
+                .await
+                .unwrap();
+        }
+        sim_advance_ticks(Duration::from_millis(10), 10).await;
+        let got = aggregates[2].total();
+
+        for client in clients {
+            client.shutdown().await.unwrap();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        assert_eq!(got, 4);
     })
 }
 
@@ -1665,7 +1718,10 @@ async fn admin_snapshot_reflects_runtime_state() {
             assert_eq!(snapshot.peers[0].addr, sock(40_301));
             assert!(snapshot.peers[0].node_id.is_none());
             assert!(snapshot.store_stats.active_cells >= 1);
-            assert!(snapshot.local_dirty_len >= 1);
+            // The first heartbeat, due at start, sent the hit and drained
+            // the local dirty ring.
+            assert!(snapshot.ticks_total >= 1);
+            assert_eq!(snapshot.local_dirty_len, 0);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;

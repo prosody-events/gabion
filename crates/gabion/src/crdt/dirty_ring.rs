@@ -75,13 +75,21 @@ impl DirtyRing {
         self.head = (self.head + 1) % cap;
     }
 
+    /// Drop the `n` oldest entries; a gossip frame has taken them.
+    pub fn consume(&mut self, n: u32) {
+        debug_assert!(n <= self.len);
+        self.len -= n.min(self.len);
+    }
+
+    /// Index of the oldest entry. Only meaningful while `len > 0`.
+    fn start(&self) -> u32 {
+        let cap = self.entries.len() as u32;
+        (self.head + cap - self.len) % cap
+    }
+
     /// Iterate ring entries in insertion order (oldest first).
     pub fn iter(&self) -> impl Iterator<Item = DirtyEntry> + '_ {
-        let cap = self.entries.len() as u32;
-        let len = self.len;
-        let head = self.head;
-        let start = if len == cap { head } else { 0 };
-        (0..len).map(move |offset| self.entries[((start + offset) % cap) as usize])
+        (0..self.len).map(move |offset| ring_entry_at(self, offset))
     }
 
     pub fn clear(&mut self) {
@@ -96,7 +104,7 @@ impl DirtyRing {
 /// the hot send path allocation-free.
 #[inline]
 pub(super) fn ring_entry_at(ring: &DirtyRing, offset: u32) -> DirtyEntry {
+    debug_assert!(offset < ring.len);
     let cap = ring.entries.len() as u32;
-    let start = if ring.len == cap { ring.head } else { 0 };
-    ring.entries[((start + offset) % cap) as usize]
+    ring.entries[((ring.start() + offset) % cap) as usize]
 }

@@ -536,7 +536,7 @@ fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
 
     let max_cells = (max_seed as usize % 32) + 1;
     let mut out = Vec::with_capacity(max_cells);
-    let emitted = store.fill_gossip_frame(max_cells, &mut out);
+    let emitted = store.fill_gossip_frame(max_cells, max_cells, &mut out);
     if emitted != out.len() || out.len() > max_cells {
         return TestResult::failed();
     }
@@ -552,7 +552,7 @@ fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
     let mut seen = BTreeSet::new();
     let mut one = Vec::with_capacity(1);
     for _ in 0..(store.capacity() * 2) {
-        store.fill_gossip_frame(1, &mut one);
+        store.fill_gossip_frame(1, 1, &mut one);
         if let Some(handle) = one.first() {
             if store.get(*handle).is_none() {
                 return TestResult::failed();
@@ -699,6 +699,110 @@ fn dirty_ring_overflows_when_full() {
     assert_eq!(store.forwarded_dirty().len(), 2);
 }
 
+/// A frame drains what it takes from the dirty rings: each change goes out
+/// in one round, the overflow of a small budget waits for the next, oldest
+/// first, and a round with no repair budget then sends nothing.
+#[test]
+fn gossip_frames_drain_dirty_lanes_oldest_first() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let origin_of = |store: &CellStore<u32>, h: CellHandle| {
+        let row = store.get(h).unwrap();
+        store
+            .node_dictionary()
+            .descriptor(row.key.origin)
+            .unwrap()
+            .node_id
+            .0
+    };
+    for origin in 2..=4 {
+        remote_merge_one(&mut store, 0x11, origin, 1, 1, 0);
+    }
+    let mut out = Vec::with_capacity(8);
+    store.fill_gossip_frame(2, 0, &mut out);
+    let first: Vec<u128> = out.iter().map(|&h| origin_of(&store, h)).collect();
+    assert_eq!(first, vec![2, 3]);
+    assert_eq!(store.forwarded_dirty().len(), 1);
+
+    store.fill_gossip_frame(2, 0, &mut out);
+    let second: Vec<u128> = out.iter().map(|&h| origin_of(&store, h)).collect();
+    assert_eq!(second, vec![4]);
+    assert!(store.forwarded_dirty().is_empty());
+
+    store.fill_gossip_frame(8, 0, &mut out);
+    assert!(out.is_empty());
+
+    // A raise makes the cell dirty again; the superseded entry it left
+    // behind is dropped on the way.
+    remote_merge_one(&mut store, 0x11, 3, 1, 2, 1);
+    store.fill_gossip_frame(8, 0, &mut out);
+    let third: Vec<u128> = out.iter().map(|&h| origin_of(&store, h)).collect();
+    assert_eq!(third, vec![3]);
+}
+
+/// The repair slice is bounded by its own budget, inside the frame's.
+#[test]
+fn gossip_frame_repair_slice_respects_its_budget() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    for origin in 2..=6 {
+        remote_merge_one(&mut store, 0x11, origin, 1, 1, 0);
+    }
+    store.clear_dirty();
+    local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 0);
+    let mut out = Vec::with_capacity(8);
+    store.fill_gossip_frame(8, 2, &mut out);
+    assert_eq!(out.len(), 3);
+    store.fill_gossip_frame(3, 8, &mut out);
+    assert_eq!(out.len(), 3);
+}
+
+/// A ring that has been partly drained keeps insertion order across the
+/// wrap, and overflow overwrites the oldest unsent entry.
+#[test]
+fn dirty_ring_consume_keeps_order_across_wrap() {
+    let entry = |seq: u64| DirtyEntry {
+        handle: CellHandle::default(),
+        origin_sequence: seq,
+    };
+    let mut ring = DirtyRing::with_capacity(3);
+    for seq in 1..=3 {
+        ring.push(entry(seq));
+    }
+    ring.consume(2);
+    ring.push(entry(4));
+    ring.push(entry(5));
+    let seqs: Vec<u64> = ring.iter().map(|e| e.origin_sequence).collect();
+    assert_eq!(seqs, vec![3, 4, 5]);
+    assert!(!ring.overflowed());
+    ring.push(entry(6));
+    let seqs: Vec<u64> = ring.iter().map(|e| e.origin_sequence).collect();
+    assert_eq!(seqs, vec![4, 5, 6]);
+    assert!(ring.overflowed());
+    ring.consume(3);
+    assert!(ring.is_empty());
+    assert_eq!(ring.iter().count(), 0);
+}
+
+/// A cell the last sweep would have freed is not merged back in from a peer
+/// that has not swept yet; a live one still is.
+#[test]
+fn merge_remote_refuses_cells_expired_at_the_last_sweep() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut exp = ExpirationSink::<u32>::with_capacity(8);
+    // 1 s buckets, 1 s window: at t = 5 s the live buckets are 4 and 5.
+    store.expire_at(5_000, &mut exp);
+    let mut obs = ObservationBatch::with_capacity(2);
+    obs.push(observation(0x11, 0xabc, 3, 2, 1, 1_u32, 0));
+    obs.push(observation(0x11, 0xabc, 4, 2, 1, 1_u32, 0));
+    let mut sink = DeltaSink::with_capacity(2);
+    store.merge_remote(peer(), &obs, &mut sink);
+    assert_eq!(sink.len(), 1);
+    assert_eq!(store.get(sink.handles[0]).unwrap().key.bucket, 4);
+    assert_eq!(store.active_len(), 1);
+}
+
 #[test]
 fn clear_dirty_keeps_cells_but_drops_change_record() {
     let mut store = small_store(2, 4);
@@ -725,7 +829,7 @@ fn gossip_frame_prioritizes_local_then_forwarded_then_repair() {
     local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 1);
 
     let mut out = Vec::with_capacity(3);
-    store.fill_gossip_frame(3, &mut out);
+    store.fill_gossip_frame(3, 3, &mut out);
     let origins: Vec<u128> = out
         .iter()
         .map(|h| {
@@ -753,7 +857,7 @@ fn gossip_frame_forwards_remote_dirty_cells_without_local_dirty() {
     remote_merge_one(&mut store, 0x11, 3, 1, 30, 0);
 
     let mut out = Vec::with_capacity(2);
-    store.fill_gossip_frame(2, &mut out);
+    store.fill_gossip_frame(2, 2, &mut out);
     let mut origins: Vec<u128> = out
         .iter()
         .map(|h| {
@@ -779,28 +883,28 @@ fn repair_slice_rotates_across_active_cells() {
     store.clear_dirty();
 
     let mut out = Vec::with_capacity(1);
-    store.fill_gossip_frame(1, &mut out);
+    store.fill_gossip_frame(1, 1, &mut out);
     let first = store
         .node_dictionary()
         .descriptor(store.get(out[0]).unwrap().key.origin)
         .unwrap()
         .node_id
         .0;
-    store.fill_gossip_frame(1, &mut out);
+    store.fill_gossip_frame(1, 1, &mut out);
     let second = store
         .node_dictionary()
         .descriptor(store.get(out[0]).unwrap().key.origin)
         .unwrap()
         .node_id
         .0;
-    store.fill_gossip_frame(1, &mut out);
+    store.fill_gossip_frame(1, 1, &mut out);
     let third = store
         .node_dictionary()
         .descriptor(store.get(out[0]).unwrap().key.origin)
         .unwrap()
         .node_id
         .0;
-    store.fill_gossip_frame(1, &mut out);
+    store.fill_gossip_frame(1, 1, &mut out);
     let fourth = store
         .node_dictionary()
         .descriptor(store.get(out[0]).unwrap().key.origin)
@@ -1148,7 +1252,7 @@ fn selection_epoch_dedupes_within_frame() {
     local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 0);
     local_increment_one(&mut store, 0x11, 0xabc, 0, 2, 0);
     let mut out = Vec::with_capacity(8);
-    store.fill_gossip_frame(8, &mut out);
+    store.fill_gossip_frame(8, 8, &mut out);
     let mut indices: Vec<u32> = out.iter().map(|h| h.index).collect();
     indices.sort();
     indices.dedup();
@@ -1211,7 +1315,7 @@ fn repair_cursor_skips_freed_slots() {
     let mut seen = Vec::with_capacity(4);
     let mut out = Vec::with_capacity(4);
     for _ in 0..4 {
-        store.fill_gossip_frame(1, &mut out);
+        store.fill_gossip_frame(1, 1, &mut out);
         if let Some(h) = out.first() {
             seen.push(h.index);
         }
@@ -2156,7 +2260,7 @@ fn quickcheck_gossip_frame_order_matches_lane_model(ops: MixedOps, max_seed: u8)
     let max_cells = (max_seed as usize % 32) + 1;
     let predicted = predict_gossip_order(&store, max_cells);
     let mut got = Vec::with_capacity(max_cells);
-    store.fill_gossip_frame(max_cells, &mut got);
+    store.fill_gossip_frame(max_cells, max_cells, &mut got);
     TestResult::from_bool(predicted == got)
 }
 

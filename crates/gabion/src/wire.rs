@@ -154,6 +154,19 @@ impl AsRef<[u8]> for PacketBuf {
 /// packet has both dict lengths = 1, one rule fingerprint, one node id, and
 /// one cell row. Used by the constructors to reject undersized budgets up
 /// front rather than mid-stream.
+/// The fewest cells one packet under `limits` is sure to carry: the count
+/// when every cell brings a new rule and a new origin into the packet's
+/// dictionaries. Gossip sizes a round with it so that every pick's frame
+/// fits the free send slots.
+pub fn min_cells_per_packet<C: Count>(limits: FrameLimits, authenticated: bool) -> usize {
+    let auth_overhead = if authenticated { AUTH_TAG_LEN } else { 0 };
+    let body = limits
+        .max_payload_bytes
+        .saturating_sub(HEADER_LEN + DICT_LEN_BYTES + auth_overhead);
+    let worst_cell = 16 + 16 + PER_CELL_IDENT_BYTES + std::mem::size_of::<C>();
+    (body / worst_cell).min(limits.max_cells as usize).max(1)
+}
+
 fn min_payload_bytes(count_size: usize, auth_overhead: usize) -> usize {
     HEADER_LEN
         + DICT_LEN_BYTES        // rule_dict_len + node_dict_len

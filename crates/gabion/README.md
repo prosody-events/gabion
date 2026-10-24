@@ -151,10 +151,16 @@ independently decodable.
 ### The anti-entropy loop
 
 The runtime (`GossipRuntime`, in `src/gossip/runtime.rs`) is a
-single-threaded event loop driven by one `tokio::select!` with six
+single-threaded event loop driven by one `tokio::select!` with seven
 arms: limit requests from the adapter, inbound packets, outbound
-writability, peer membership churn, admin commands, and the heartbeat
-tick. After every iteration that produced delta or expiration rows, the
+writability, peer membership churn, admin commands, the relay pacer and
+the heartbeat tick. A gossip round runs on three triggers: the heartbeat
+(every `tick_interval`), a threshold fire when local hits cross their
+error budget (below), and a relay round, at most every
+`GOSSIP_RELAY_INTERVAL_MILLIS` (20 ms), while changes merged from peers
+wait to be forwarded. Every round sends its unsent dirty changes to the
+round's picks and drains them; the heartbeat also expires aged-out cells
+and adds a slice of the repair lane. After every iteration that produced delta or expiration rows, the
 runtime calls `aggregates.apply(...)` exactly once — that is the
 contract with the downstream rate-limit decision path. Empty iterations
 (an idle tick, a peer event with no CRDT effect) short-circuit the
@@ -177,12 +183,12 @@ sequenceDiagram
     Note over Runtime: set want_immediate_flush<br/>if pending > ε_R
     Runtime->>Adapter: aggregates.apply(deltas, expirations)
 
-    loop every tick (heartbeat OR synthetic threshold)
+    loop every round (heartbeat, threshold fire or relay)
         Runtime->>Runtime: handle_gossip_tick
-        Runtime->>Store: expire_at(now)
-        Runtime->>Store: fill_gossip_frame
-        Store-->>Runtime: cell list, minus cells the peer holds (bp-skip)
-        Runtime->>Tx: encode + try_send_to(peer)
+        Runtime->>Store: expire_at(now) (heartbeat only)
+        Runtime->>Store: fill_gossip_frame (drains the dirty rings)
+        Store-->>Runtime: the round's cells
+        Runtime->>Tx: per pick, encode the cells it lacks (bp-skip) + try_send_to
         Tx->>Peer: UDP frame
         Runtime->>Adapter: aggregates.apply(expirations)
     end
@@ -254,14 +260,12 @@ Fanout trades **bandwidth** (linear in the pick: the cluster ships
 (`≈ e^(−e^(−c))` per round) and **latency** (`≈ log_{1+pick} n` rounds,
 with diminishing return above the threshold). `⌈ln(n)+c⌉` is the
 provably-minimal fanout for reliable coverage of a *single* round, so it
-is the natural operating point. We size to `c = 3` — a 95.1 % per-round
-reach — rather than a higher margin, because gabion is not a one-shot
-disseminator: anti-entropy re-gossips every dirty cell while it stays in
-its dirty ring, so a node missed in one round is caught by
-the next and the per-round miss compounds away (4.9 % → ≈ 0.24 % after
-two rounds). KMG's validated single-shot threshold sits near `c ≈ 4`
-(fanout 13 @ 10 000, 15 @ 50 000); a re-gossiping system does not need to
-match it, and `c = 3` saves ≈ 1 peer per tick at every scale. The
+is the natural operating point. Each change is disseminated once — every
+node that first learns it forwards it in one round — so KMG's one-shot
+figure applies: at `c = 3` about 5 % of changes miss some node. A later
+change to the same cell supersedes the miss, and the repair lane reaches
+the rest; each extra step of `c` costs about one more peer per round for
+about e× fewer misses. The
 bandwidth floor on quiet ticks is unchanged from a fixed fanout — the
 pick is stable for a given cluster size, not pulsing with load. The
 `coverage_fanout` bench
@@ -333,11 +337,11 @@ sides of this trade.
 
 ### Dirty rings and bp-skip
 
-Three data structures decide which cells the current tick sends to
+Three data structures decide which cells the current round sends to
 which peer:
 
 1. **`local_dirty`** — every locally-observed hit pushes onto this
-   bounded ring. Drained by every tick (heartbeat and threshold).
+   bounded ring. Drained by every round: a change leaves in one round.
 2. **`forwarded_dirty`** — every cell merged from a peer pushes onto a
    separate ring, so the runtime can forward a remote delta even if
    its local origin column is quiet. Larger than `local_dirty` because
@@ -347,12 +351,19 @@ which peer:
    originated or sent us, since it already holds them.
 
 Together they keep `fill_gossip_frame` allocation-free and strictly
-bounded: the runtime walks at most `max_cells_per_tick` cells through
-the three lanes (local dirty → forwarded dirty → repair), drops from
-each pick's frame the cells that peer already holds, and stops when the
-budget is exhausted. The rings are pre-sized at construction; pushes
-that hit the cap bump an overflow counter and silently drop, and the
-next repair-lane sweep picks the dropped cell back up.
+bounded. Once per round the runtime takes at most a budget of cells
+through the three lanes (local dirty → forwarded dirty → repair) into
+one frame, and sends each pick that frame minus the cells it already
+holds. The budget is what the free send slots carry for every pick, at
+most `max_cells_per_tick`; dirty entries past it stay, oldest first, for
+the next round. The repair lane rides heartbeat rounds only, at most
+`GOSSIP_REPAIR_CELLS_PER_HEARTBEAT` (64) cells and no faster than one
+sweep of the store per `GOSSIP_REPAIR_MIN_SWEEP_MILLIS` (2 s), so it is
+what reaches a peer a round's picks missed or a packet the network lost.
+The rings are pre-sized at construction; a push into a full ring
+overwrites the oldest unsent change, bumps an overflow counter and warns,
+and the repair lane picks that cell up later. A cell the last expiry
+sweep freed is not merged back in from a peer that has yet to sweep.
 
 `CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
@@ -371,7 +382,7 @@ it splits into the two adaptive halves of the protocol.
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
 | `fanout`             | 3           | Fanout floor. The runtime scales the actual pick to the coverage threshold `⌈ln(n)+c⌉` (`c` = `GOSSIP_COVERAGE_MARGIN`, 3), capped at the peer count. | Rarely tune — the floor binds only if you lower `GOSSIP_COVERAGE_MARGIN`. To trade bandwidth for coverage, change the margin, not this floor. |
-| `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame` will emit in one tick. Cells over the cap roll forward to the next tick via the repair lane. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
+| `max_cells_per_tick` | 4 096       | Cap on cells one gossip round sends. Dirty changes over the cap, or over what the free send slots carry, wait for the next round. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
 | `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 
 ### Per-rule error budget (adaptive emit rate)

@@ -58,23 +58,21 @@ const LOCAL_RULE_ID: u32 = 0;
 /// sustained-overload peak — so it sizes its own pool to that regime.
 ///
 /// The invariant that fixes the high-node gossip freeze: **the send pool must
-/// hold one tick's worst-case packet output, with headroom for any cross-tick
+/// hold one round's worst-case packet output, with headroom for any cross-round
 /// backlog.** Send-pool slots recycle only on the runtime's separate `Writable`
 /// select arm, never within `handle_gossip_tick`, so all `pick_count` peers'
-/// frames for one tick must fit in the free slots at once. If a frame can't
-/// finish, [`gabion::wire::Packets::next_into`] runs out of slots mid-frame and
-/// the iterator's drain contract trips its `debug_assert` (an `unreachable`
-/// freeze in dev wasm; a silent re-send next tick in release, since the dirty
-/// rings are persistent — no data loss, just slower flush).
+/// frames for one round must fit in the free slots at once. The runtime sizes
+/// each round to the free slots, so a round that finds the pool partly full
+/// takes fewer cells and leaves the rest in the dirty rings for the next one.
 ///
 /// **The pool ceiling is 255, not a free choice.** The runtime addresses
 /// send-pool slots with a `u8` (`send_pending: VecDeque<(SocketAddr, u8)>`) and
 /// builds the free list as `(0..send_pool_size as u8)`, so any capacity ≥ 256
 /// wraps to an *empty* free list and silently kills all gossip. So the pool is
-/// pinned at the largest addressable value, and the per-tick frame is capped so
-/// one tick stays well inside it:
+/// pinned at the largest addressable value, and the per-round frame is capped
+/// so one round stays well inside it:
 ///
-/// One tick emits at most `pick_count × packets_per_frame` packets, where
+/// One round emits at most `pick_count × packets_per_frame` packets, where
 /// `pick_count = ⌈ln(peers)+c⌉` (the coverage fanout, `c` =
 /// `GOSSIP_COVERAGE_MARGIN` = 3), capped at the peer count. The widest cluster
 /// the visualizer builds is `MAX_NODES` = 256, so `peers ≤ 255` and
@@ -83,19 +81,16 @@ const LOCAL_RULE_ID: u32 = 0;
 /// cells_per_packet)`, with `cells_per_packet ≈ 21` at a 1400-byte payload in
 /// the worst case (every cell a distinct origin, so the node dictionary costs
 /// 16 B/cell on top of the 46 B row) — so `ceil(160 / 21) = 8`. The worst case
-/// at 100 nodes is therefore ≈ `8 × 8 = 64` packets/tick, which the 255-slot
-/// pool clears ~4×, leaving the rest of the pool for packets still draining
-/// from the previous tick. A native 100-node Sustained-overload run (40 s of
-/// virtual time, debug build with the drain `debug_assert` live) measured an
-/// actual `max_send_pending_depth` peak of **64** — no trap, ~4× under the
-/// pool. (The coverage fanout is stable for a cluster size, so this peak does
-/// not climb with burst volume the way the old dirty-set widening did.)
+/// at 100 nodes is therefore ≈ `8 × 8 = 64` packets per round, which the
+/// 255-slot pool clears ~4×, leaving the rest of the pool for packets still
+/// draining from the previous round. (The coverage fanout is stable for a
+/// cluster size, so this does not climb with burst volume.)
 ///
-/// Capping the per-tick frame is what keeps one tick inside the fixed pool. The
-/// cap is inert at the default 12-node scenarios — their cross-node working set
-/// (≈ 132 cells) never reaches 160 — so it changes nothing user-visible there;
-/// a large cluster's burst simply flushes over a few ticks instead of one (the
-/// dirty rings are persistent, so the residual rides the next tick rather than
+/// Capping the per-round frame is what keeps one round inside the fixed pool.
+/// The cap is inert at the default 12-node scenarios — their cross-node working
+/// set (≈ 132 cells) never reaches 160 — so it changes nothing user-visible
+/// there; a large cluster's burst simply flushes over a few rounds instead of
+/// one (the residual stays in the dirty rings for the next round rather than
 /// dropping). Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
 const VIZ_MAX_CELLS_PER_TICK: usize = 160;
 const VIZ_SEND_QUEUE_CAPACITY: usize = 255;

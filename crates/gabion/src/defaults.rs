@@ -46,23 +46,31 @@ pub const GOSSIP_FANOUT: usize = 3;
 /// | 4     | 98.2 %                           |
 /// | 5     | 99.3 %                           |
 ///
-/// **These are single-round figures, and the single round is the wrong unit
-/// for gabion.** KMG's theorem bounds one *one-shot* dissemination; gabion
-/// instead runs continuous anti-entropy — it re-gossips every dirty cell each
-/// tick while it stays in its dirty ring, with the repair lane behind that. So
-/// a node missed in one round is overwhelmingly likely to be reached
-/// by the next, and the per-round coverage *compounds*: at `c = 3` the 4.9 %
-/// per-round miss falls to ≈ 0.24 % after two rounds and ≈ 0.012 % after three.
-/// We therefore size to the leaner `c = 3` threshold and let anti-entropy close
-/// the gap, rather than paying KMG's one-shot `c ≈ 4` (their validated sims —
-/// fanout 13 @ 10 000 nodes, 15 @ 50 000 — measure single-shot reach, which a
-/// re-gossiping system does not need to match). `c = 3` costs ≈ 1 fewer peer
-/// per tick at every cluster size (≈ 10 % less gossip bandwidth). Kept a
-/// `const`; promote to a `GossipConfig` field if an operator ever needs to
-/// trade bandwidth for coverage at runtime.
+/// Each change is disseminated once, KMG's one-shot setting: every node
+/// that first learns it forwards it in one round. At `c = 3` about 5 % of
+/// changes miss some node; a later change to the same cell supersedes the
+/// miss, and the repair lane (`GOSSIP_REPAIR_CELLS_PER_HEARTBEAT`) reaches
+/// the rest. Each step of `c` adds about one peer per round (≈ 10 % more
+/// gossip bandwidth) for about e× fewer misses. Kept a `const`; promote to a
+/// `GossipConfig` field if an operator ever needs to trade bandwidth for
+/// coverage at runtime.
 pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
+/// Pace of relay rounds. A node that merged changes from a peer forwards
+/// them in a round of their own, at most once per this interval, instead of
+/// waiting for the heartbeat; the wait lets a few dozen changes share each
+/// packet's header and dictionaries.
+pub const GOSSIP_RELAY_INTERVAL_MILLIS: u64 = 20;
+/// Cells of the rotating repair slice each heartbeat round adds to its frame,
+/// after the dirty lanes. Dirty changes are sent in one round each, so the
+/// repair lane is what reaches a peer the round's picks missed, or a packet
+/// the network lost; a slice per heartbeat bounds what that costs.
+pub const GOSSIP_REPAIR_CELLS_PER_HEARTBEAT: usize = 64;
+/// Shortest time the repair lane takes to sweep a node's whole store. A
+/// store smaller than this many heartbeats' slices is swept at this pace
+/// instead of being resent in full on every heartbeat.
+pub const GOSSIP_REPAIR_MIN_SWEEP_MILLIS: u64 = 2_000;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;
 pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 128;

@@ -358,6 +358,13 @@ pub struct CellStore<C: Count = u32> {
 
 const NO_FREE: u32 = u32::MAX;
 
+/// The two dirty rings a gossip frame drains.
+#[derive(Clone, Copy)]
+enum DirtyLane {
+    Local,
+    Forwarded,
+}
+
 /// Internal arguments for [`CellStore::upsert`]. The mode discriminates the
 /// two valid update shapes; sharing a struct prevents callers from passing a
 /// remote `observed` count alongside a local `hits` delta or vice versa.
@@ -1073,6 +1080,9 @@ impl<C: Count> CellStore<C> {
             .find(from.node_id, from.incarnation)
             .unwrap_or(self.local_node_slot);
         for i in 0..obs.len() {
+            if self.expired_at_last_sweep(obs.rule_fingerprints[i], obs.buckets[i]) {
+                continue;
+            }
             let Some((rule_slot, node_slot)) = self.translate_identity(
                 obs.rule_fingerprints[i],
                 obs.origin_node_ids[i],
@@ -1096,6 +1106,19 @@ impl<C: Count> CellStore<C> {
                 sink,
             );
         }
+    }
+
+    /// Whether the last `expire_at` sweep would have freed a cell of this
+    /// rule and bucket. A peer that has not swept yet may still send such a
+    /// cell; merging it would bring it back until this node's next sweep.
+    fn expired_at_last_sweep(&self, rule_fingerprint: u128, bucket: BucketEpoch) -> bool {
+        let Some(rule) = self.rule_dictionary.find(rule_fingerprint) else {
+            return false;
+        };
+        let rule = rule as usize;
+        let current = self.expire_current_epoch_scratch[rule];
+        let live = self.expire_live_buckets_scratch[rule];
+        u64::from(bucket) + u64::from(live) < u64::from(current)
     }
 
     /// Whether `node` already holds the cell's current value: it is the
@@ -1269,60 +1292,37 @@ impl<C: Count> CellStore<C> {
         emitted
     }
 
-    /// Fill one outgoing gossip frame: local dirty first, then forwarded
-    /// dirty, then a rotating repair slice. Returns the number of handles
+    /// Compose one gossip round's frame: unsent local changes first, then
+    /// unsent forwarded changes, oldest first, then up to `repair_cells`
+    /// cells of the rotating repair slice. Returns the number of handles
     /// pushed. Uses `selection_marks` for O(1) intra-frame dedup.
-    pub fn fill_gossip_frame(&mut self, max_cells: usize, out: &mut Vec<CellHandle>) -> usize {
+    ///
+    /// The dirty lanes drain: an entry the frame took leaves its ring, so
+    /// each change is sent in one round, and entries beyond `max_cells` stay
+    /// for the next one.
+    pub fn fill_gossip_frame(
+        &mut self,
+        max_cells: usize,
+        repair_cells: usize,
+        out: &mut Vec<CellHandle>,
+    ) -> usize {
         out.clear();
         if max_cells == 0 {
             return 0;
         }
         self.bump_selection_epoch();
 
-        // Lane 1: local dirty.
-        let local_len = self.local_dirty.len();
-        for offset in 0..local_len {
-            if out.len() >= max_cells {
-                break;
-            }
-            let entry = ring_entry_at(&self.local_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
-        }
-        if out.len() >= max_cells {
-            return out.len();
-        }
-
-        // Lane 2: forwarded dirty.
-        let forwarded_len = self.forwarded_dirty.len();
-        for offset in 0..forwarded_len {
-            if out.len() >= max_cells {
-                break;
-            }
-            let entry = ring_entry_at(&self.forwarded_dirty, offset);
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !self.mark_selected(entry.handle.index) {
-                continue;
-            }
-            out.push(entry.handle);
-        }
-        if out.len() >= max_cells {
-            return out.len();
-        }
+        // Lanes 1 and 2: local dirty, then forwarded dirty.
+        self.take_dirty(DirtyLane::Local, max_cells, out);
+        self.take_dirty(DirtyLane::Forwarded, max_cells, out);
 
         // Lane 3: rotating repair slice. selection_marks has already been
         // set for dirty cells in lanes 1+2, so repair cannot re-emit them.
+        let repair_end = out.len().saturating_add(repair_cells).min(max_cells);
         let cap = self.capacity;
         let mut visited = 0_u32;
         let mut next_cursor = self.repair_cursor;
-        while visited < cap && out.len() < max_cells {
+        while visited < cap && out.len() < repair_end {
             let slot = (self.repair_cursor + visited) % cap;
             visited += 1;
             next_cursor = (slot + 1) % cap;
@@ -1336,6 +1336,32 @@ impl<C: Count> CellStore<C> {
         }
         self.repair_cursor = next_cursor;
         out.len()
+    }
+
+    /// Move the current, not yet selected cells of `lane`'s ring into `out`,
+    /// oldest first, until `out` holds `max_cells`. Every entry read leaves
+    /// the ring; superseded and freed ones are dropped on the way.
+    fn take_dirty(&mut self, lane: DirtyLane, max_cells: usize, out: &mut Vec<CellHandle>) {
+        let len = self.dirty_ring(lane).len();
+        let mut taken = 0;
+        while taken < len && out.len() < max_cells {
+            let entry = ring_entry_at(self.dirty_ring(lane), taken);
+            taken += 1;
+            if self.dirty_entry_current(entry) && self.mark_selected(entry.handle.index) {
+                out.push(entry.handle);
+            }
+        }
+        match lane {
+            DirtyLane::Local => self.local_dirty.consume(taken),
+            DirtyLane::Forwarded => self.forwarded_dirty.consume(taken),
+        }
+    }
+
+    fn dirty_ring(&self, lane: DirtyLane) -> &DirtyRing {
+        match lane {
+            DirtyLane::Local => &self.local_dirty,
+            DirtyLane::Forwarded => &self.forwarded_dirty,
+        }
     }
 
     /// Convenience wrapper around [`Self::expire`] that derives the per-rule

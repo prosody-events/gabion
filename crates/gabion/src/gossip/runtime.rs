@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
@@ -68,7 +69,13 @@ where
     obs_buf: ObservationBatch<C>,
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
+    // A round's frame, shared by every pick, and the pick's copy of it
+    // without the cells that peer already holds (bp-skip).
+    round_handles: Vec<CellHandle>,
     frame_handles: Vec<CellHandle>,
+    // The fewest cells one packet carries; sizes a round to the free send
+    // slots so that every pick's frame fits.
+    cells_per_packet: usize,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
@@ -221,7 +228,10 @@ where
         let scratch = WireScratch::for_store(&store);
         let obs_buf = ObservationBatch::<C>::with_capacity(config.max_cells_per_tick);
         let sink_buf = DeltaSink::<C>::with_capacity(config.max_cells_per_tick);
+        let round_handles = Vec::with_capacity(config.max_cells_per_tick);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
+        let cells_per_packet =
+            wire::min_cells_per_packet::<C>(config.wire_limits, config.auth_key.is_some());
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
 
         let send_pool_size = config.send_queue_capacity.max(1);
@@ -259,7 +269,9 @@ where
             obs_buf,
             sink_buf,
             expiration_buf,
+            round_handles,
             frame_handles,
+            cells_per_packet,
             send_pool,
             send_pending,
             send_free,
@@ -298,6 +310,12 @@ where
     {
         let mut peer_events = std::pin::pin!(peer_events);
         let mut tick = self.clock.ticker(self.config.tick_interval);
+        // Paces relay rounds: forwarded changes leave in a round of their
+        // own, at most one per `GOSSIP_RELAY_INTERVAL_MILLIS`, rather than
+        // waiting for the heartbeat.
+        let mut relay = self.clock.ticker(Duration::from_millis(
+            crate::defaults::GOSSIP_RELAY_INTERVAL_MILLIS,
+        ));
         // Once the peer-event stream returns `None` (e.g. `stream::empty()`),
         // never poll it again — otherwise it returns `Ready(None)` on every
         // iteration and the loop spins.
@@ -311,6 +329,7 @@ where
             let have_send = !self.send_pending.is_empty();
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
+            let relay_due = !self.store.forwarded_dirty().is_empty();
 
             let outcome = if self.want_immediate_flush {
                 // A previous limit request crossed the per-rule error
@@ -327,7 +346,7 @@ where
                 // between threshold fires and heartbeat fires.
                 self.want_immediate_flush = false;
                 self.threshold_fires = self.threshold_fires.saturating_add(1);
-                ArmOutcome::Tick
+                ArmOutcome::Flush
             } else {
                 // Split-borrow scope: we hand the I/O futures non-overlapping
                 // pieces of `self` so they compose inside `select!`.
@@ -347,6 +366,7 @@ where
                     _ = transport.writable(), if have_send => ArmOutcome::Writable,
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
                     cmd = recv_admin(admin_rx), if watch_admin => ArmOutcome::Admin(cmd),
+                    _ = relay.tick(), if relay_due => ArmOutcome::Flush,
                     _ = tick.tick() => ArmOutcome::Tick,
                 }
             };
@@ -363,7 +383,8 @@ where
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
                 ArmOutcome::Admin(None) => self.admin_rx = None,
-                ArmOutcome::Tick => self.handle_gossip_tick(),
+                ArmOutcome::Tick => self.handle_gossip_tick(Round::Heartbeat),
+                ArmOutcome::Flush => self.handle_gossip_tick(Round::Flush),
             }
 
             // One apply per iteration covering both row sources. CRDT-free
@@ -646,16 +667,34 @@ where
         }
     }
 
-    fn handle_gossip_tick(&mut self) {
+    /// Cells of the repair lane one heartbeat carries: at most
+    /// `GOSSIP_REPAIR_CELLS_PER_HEARTBEAT`, and no more than sweeps the store
+    /// once per `GOSSIP_REPAIR_MIN_SWEEP_MILLIS`, so a small store is not
+    /// resent to every pick on every heartbeat.
+    fn repair_slice(&self) -> usize {
+        use crate::defaults::{GOSSIP_REPAIR_CELLS_PER_HEARTBEAT, GOSSIP_REPAIR_MIN_SWEEP_MILLIS};
+        let tick = (self.config.tick_interval.as_millis() as u64).max(1);
+        let heartbeats = GOSSIP_REPAIR_MIN_SWEEP_MILLIS.div_ceil(tick) as usize;
+        (self.store.active_len() as usize)
+            .div_ceil(heartbeats.max(1))
+            .min(GOSSIP_REPAIR_CELLS_PER_HEARTBEAT)
+    }
+
+    fn handle_gossip_tick(&mut self, round: Round) {
         // Step 0: bump the total-ticks counter. Tracked unconditionally
         // (even for empty / no-peer ticks) so the bench can split the
         // run's wall time into heartbeat ticks vs threshold fires.
         self.ticks_total = self.ticks_total.saturating_add(1);
 
-        // Step 1: expire aged-out cells so we don't gossip them.
+        // Step 1: expire aged-out cells so we don't gossip them. The sweep
+        // walks the whole store, so it runs on heartbeats only; flush rounds
+        // come as often as every `min_emit_interval`, and a cell that
+        // outlives its window by one heartbeat no longer counts toward it.
         let now_millis = self.clock.now_millis();
-        self.expiration_buf.clear();
-        self.store.expire_at(now_millis, &mut self.expiration_buf);
+        if let Round::Heartbeat = round {
+            self.expiration_buf.clear();
+            self.store.expire_at(now_millis, &mut self.expiration_buf);
+        }
 
         if self.store.is_empty() || self.peers.is_empty() || self.send_free.is_empty() {
             return;
@@ -704,10 +743,23 @@ where
             self.peers.swap(i, j);
         }
 
+        // One frame for the whole round, sized so that every pick's copy
+        // fits the free send slots: changes it takes leave their dirty ring,
+        // and the rest wait for the next round instead of being cut short
+        // for the later picks. Only heartbeat rounds add a repair slice.
+        let per_pick_cells = self.send_free.len() / pick_count * self.cells_per_packet;
+        let budget = per_pick_cells.min(self.config.max_cells_per_tick);
+        if budget == 0 {
+            return;
+        }
+        let repair = match round {
+            Round::Heartbeat => self.repair_slice(),
+            Round::Flush => 0,
+        };
+        self.store
+            .fill_gossip_frame(budget, repair, &mut self.round_handles);
+
         for peer_idx in 0..pick_count {
-            if self.send_free.is_empty() {
-                break;
-            }
             let peer = &self.peers[peer_idx];
             let peer_addr = peer.addr;
             // bp-skip: never send a cell to its origin or back to the peer
@@ -716,13 +768,13 @@ where
             let peer_node = peer
                 .identity
                 .and_then(|id| self.store.find_node(id.node_id, id.incarnation));
-
-            self.store
-                .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
-            if let Some(node) = peer_node {
-                let store = &self.store;
-                self.frame_handles.retain(|&h| !store.known_to(h, node));
-            }
+            self.frame_handles.clear();
+            let store = &self.store;
+            self.frame_handles.extend(
+                self.round_handles
+                    .iter()
+                    .filter(|&&h| peer_node.is_none_or(|node| !store.known_to(h, node))),
+            );
             if self.frame_handles.is_empty() {
                 continue;
             }
@@ -807,6 +859,16 @@ enum ArmOutcome {
     PeerEvent(Option<PeerEvent>),
     Admin(Option<AdminCommand>),
     Tick,
+    /// A threshold fire or a relay round.
+    Flush,
+}
+
+/// Why a gossip round runs. Every round sends the unsent dirty changes; the
+/// heartbeat also carries a slice of the repair lane.
+#[derive(Clone, Copy)]
+enum Round {
+    Heartbeat,
+    Flush,
 }
 
 /// Read one admin command. Only invoked when `admin_rx.is_some()` — the
