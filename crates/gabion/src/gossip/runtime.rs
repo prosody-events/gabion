@@ -36,7 +36,7 @@ use super::{GossipConfig, GossipError};
 
 mod pubsub;
 
-use pubsub::{Peer, PubSub};
+use pubsub::{Framing, Peer, PubSub};
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
 pub struct GossipRuntime<C, S, T, K>
@@ -581,11 +581,16 @@ where
                 }
             }
             PeerEvent::Removed(p) => {
-                if let Some(pos) = peers.iter().position(|x| x.addr == p.addr) {
-                    peers.remove(pos);
+                let framing = Framing {
+                    header: self.header(),
+                    key: self.config.auth_key.as_ref(),
+                    limits: self.config.wire_limits,
+                };
+                let now_ms = self.clock.now_millis();
+                if self.pubsub.remove_peer(&framing, p.addr, now_ms) {
                     tracing::info!(
                         peer = %p.addr,
-                        cluster_size = peers.len(),
+                        cluster_size = self.pubsub.peers.len(),
                         "Peer left the cluster.",
                     );
                 }

@@ -713,7 +713,14 @@ impl<C: Count> CellStore<C> {
     /// Walks the full `capacity`, not `active_len` — suitable for diagnostics
     /// and tests, not hot paths.
     pub fn active_handles(&self) -> impl Iterator<Item = CellHandle> + '_ {
-        (0..self.capacity).filter_map(move |i| {
+        self.active_handles_from(0)
+    }
+
+    /// Active cell handles in storage order from slot `start` on. A walk that
+    /// resumes at the slot after the last handle it took visits every cell
+    /// that stayed active throughout exactly once.
+    pub fn active_handles_from(&self, start: u32) -> impl Iterator<Item = CellHandle> + '_ {
+        (start.min(self.capacity)..self.capacity).filter_map(move |i| {
             if self.is_active(i) {
                 Some(self.handle_for(i))
             } else {

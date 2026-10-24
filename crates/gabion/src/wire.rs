@@ -31,9 +31,10 @@ mod tests;
 
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
-pub use control::{Control, decode_control, encode_control, max_ids_per_frame};
+pub use control::{Control, SWEEP_COMPLETE, decode_control, encode_control, max_ids_per_frame};
 pub use header::{
-    FLAG_AUTHENTICATED, FLAG_CONTROL, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION, is_control,
+    FLAG_AUTHENTICATED, FLAG_CONTROL, FLAG_MORE, FLAG_SWEEP, HEADER_LEN, Header, MAGIC, VERSION,
+    is_control, is_sweep,
 };
 
 use auth::AUTH_TAG_LEN;

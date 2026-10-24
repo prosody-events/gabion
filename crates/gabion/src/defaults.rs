@@ -124,6 +124,12 @@ pub const GOSSIPSUB_MCACHE_CAPACITY: usize = 4_096;
 pub const GOSSIPSUB_MCACHE_SLOT_BYTES: usize = GOSSIP_MAX_PAYLOAD_BYTES;
 /// Hard bound on message ids remembered for duplicate suppression.
 pub const GOSSIPSUB_SEEN_CAPACITY: usize = 32_768;
+/// Cells per answer of the catch-up sweep, the study's `pull-sweep-join`
+/// component (not part of GossipSub; see the design notes). A node that
+/// finds most of an `IHAVE` unseen pulls the advertiser's live cells this
+/// many at a time, about 18 full datagrams per round trip, well inside a
+/// receive buffer. `0` turns the sweep off.
+pub const GOSSIPSUB_SWEEP_SLICE_CELLS: usize = 512;
 
 pub fn random_rng_seed() -> Result<u64, getrandom::Error> {
     let mut bytes = [0_u8; 8];

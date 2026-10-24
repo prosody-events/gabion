@@ -1,15 +1,19 @@
 //! Control frames: the four GossipSub control messages (`GRAFT`, `PRUNE`,
-//! `IHAVE`, `IWANT`), one per datagram.
+//! `IHAVE`, `IWANT`) and the three of the catch-up sweep (`SWEEP`,
+//! `SWEEP_DONE`, `CAUGHT_UP`), one per datagram.
 //!
 //! A control frame reuses the data frame's header and authentication tag so a
 //! cluster key covers both; it is told apart by [`FLAG_CONTROL`], and carries
 //! no cells (`cell_count == 0`). Message ids are 64-bit and the body is:
 //!
 //! ```text
-//! [ kind : u8 ]                       1 GRAFT, 2 PRUNE, 3 IHAVE, 4 IWANT
-//! GRAFT: nothing more
+//! [ kind : u8 ]                       1 GRAFT, 2 PRUNE, 3 IHAVE, 4 IWANT,
+//!                                     5 SWEEP, 6 SWEEP_DONE, 7 CAUGHT_UP
+//! GRAFT, CAUGHT_UP: nothing more
 //! PRUNE: [ backoff_secs : u16 ]
 //! IHAVE / IWANT: [ n : u16 ][ id : u64 × n ]
+//! SWEEP: [ cursor : u32 ]
+//! SWEEP_DONE: [ cursor : u32 ][ next : u32 ][ frames : u16 ]
 //! ```
 
 use super::auth::{self, AUTH_TAG_LEN};
@@ -22,6 +26,9 @@ const KIND_GRAFT: u8 = 1;
 const KIND_PRUNE: u8 = 2;
 const KIND_IHAVE: u8 = 3;
 const KIND_IWANT: u8 = 4;
+const KIND_SWEEP: u8 = 5;
+const KIND_SWEEP_DONE: u8 = 6;
+const KIND_CAUGHT_UP: u8 = 7;
 
 /// One control message. `IHAVE` and `IWANT` carry their ids beside it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,7 +42,19 @@ pub enum Control {
     IHave,
     /// Request the full messages for ids the sender lacks.
     IWant,
+    /// Ask the receiver for its live cells from storage slot `cursor` on.
+    Sweep { cursor: u32 },
+    /// Ends the answer to `Sweep { cursor }`: `frames` datagrams of cells
+    /// were sent, stopping before slot `next`, or the store is exhausted
+    /// when `next` is [`SWEEP_COMPLETE`].
+    SweepDone { cursor: u32, next: u32, frames: u16 },
+    /// The sender just repaired a cut with a sweep: a mesh peer that has not
+    /// swept lately sweeps the sender in turn.
+    CaughtUp,
 }
+
+/// `SweepDone::next` once every live cell has been sent.
+pub const SWEEP_COMPLETE: u32 = u32::MAX;
 
 /// Most ids one `IHAVE` / `IWANT` datagram can carry within `limits`.
 pub fn max_ids_per_frame(limits: FrameLimits, authenticated: bool) -> usize {
@@ -58,7 +77,11 @@ pub fn encode_control(
 ) -> Result<(), EncodeError> {
     let id_count = match control {
         Control::IHave | Control::IWant => ids.len(),
-        Control::Graft | Control::Prune { .. } => 0,
+        Control::Graft
+        | Control::Prune { .. }
+        | Control::Sweep { .. }
+        | Control::SweepDone { .. }
+        | Control::CaughtUp => 0,
     };
     if id_count > max_ids_per_frame(limits, key.is_some()) {
         return Err(EncodeError::BudgetTooSmall);
@@ -67,9 +90,24 @@ pub fn encode_control(
     buf.inner.resize(HEADER_LEN, 0);
     match control {
         Control::Graft => buf.inner.push(KIND_GRAFT),
+        Control::CaughtUp => buf.inner.push(KIND_CAUGHT_UP),
         Control::Prune { backoff_secs } => {
             buf.inner.push(KIND_PRUNE);
             buf.inner.extend_from_slice(&backoff_secs.to_le_bytes());
+        }
+        Control::Sweep { cursor } => {
+            buf.inner.push(KIND_SWEEP);
+            buf.inner.extend_from_slice(&cursor.to_le_bytes());
+        }
+        Control::SweepDone {
+            cursor,
+            next,
+            frames,
+        } => {
+            buf.inner.push(KIND_SWEEP_DONE);
+            buf.inner.extend_from_slice(&cursor.to_le_bytes());
+            buf.inner.extend_from_slice(&next.to_le_bytes());
+            buf.inner.extend_from_slice(&frames.to_le_bytes());
         }
         Control::IHave | Control::IWant => {
             buf.inner.push(if control == Control::IHave {
@@ -130,8 +168,17 @@ pub fn decode_control(
     let (&kind, rest) = body.split_first().ok_or(DecodeError::TooShort)?;
     let control = match kind {
         KIND_GRAFT if rest.is_empty() => Control::Graft,
+        KIND_CAUGHT_UP if rest.is_empty() => Control::CaughtUp,
         KIND_PRUNE if rest.len() == 2 => Control::Prune {
             backoff_secs: u16::from_le_bytes([rest[0], rest[1]]),
+        },
+        KIND_SWEEP if rest.len() == 4 => Control::Sweep {
+            cursor: u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]),
+        },
+        KIND_SWEEP_DONE if rest.len() == 10 => Control::SweepDone {
+            cursor: u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]),
+            next: u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]),
+            frames: u16::from_le_bytes([rest[8], rest[9]]),
         },
         KIND_IHAVE | KIND_IWANT if rest.len() >= 2 => {
             let n = u16::from_le_bytes([rest[0], rest[1]]) as usize;

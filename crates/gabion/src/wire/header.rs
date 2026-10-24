@@ -13,12 +13,25 @@ pub const FLAG_AUTHENTICATED: u16 = 0x02;
 /// Set on control frames (`GRAFT`, `PRUNE`, `IHAVE`, `IWANT`), which carry no
 /// cells. See [`super::control`].
 pub const FLAG_CONTROL: u16 = 0x04;
+/// Set on a data frame answering a catch-up sweep request: the receiver
+/// merges its cells but does not cache or forward it as a gossip message.
+pub const FLAG_SWEEP: u16 = 0x08;
 
 /// Whether `bytes` claims to be a control frame. Reads only the unauthenticated
 /// flags field to choose a decoder; the chosen decoder then verifies the
 /// frame, so a forged bit costs a failed decode, nothing more.
 pub fn is_control(bytes: &[u8]) -> bool {
-    bytes.len() >= HEADER_LEN && u16::from_le_bytes([bytes[6], bytes[7]]) & FLAG_CONTROL != 0
+    has_flag(bytes, FLAG_CONTROL)
+}
+
+/// Whether `bytes` claims to be a sweep answer. Unauthenticated like
+/// [`is_control`]; the decoder verifies the frame, flags included.
+pub fn is_sweep(bytes: &[u8]) -> bool {
+    has_flag(bytes, FLAG_SWEEP)
+}
+
+fn has_flag(bytes: &[u8], flag: u16) -> bool {
+    bytes.len() >= HEADER_LEN && u16::from_le_bytes([bytes[6], bytes[7]]) & flag != 0
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

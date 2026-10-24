@@ -31,6 +31,22 @@ fn every_control_kind_round_trips_with_and_without_auth() {
             (Control::IHave, vec![1, 2, u64::MAX]),
             (Control::IWant, vec![]),
             (Control::IWant, vec![0, 7]),
+            (Control::Sweep { cursor: 0 }, vec![]),
+            (Control::CaughtUp, vec![]),
+            (
+                Control::Sweep {
+                    cursor: u32::MAX - 1,
+                },
+                vec![],
+            ),
+            (
+                Control::SweepDone {
+                    cursor: 512,
+                    next: SWEEP_COMPLETE,
+                    frames: 19,
+                },
+                vec![],
+            ),
         ];
         for (control, ids) in cases {
             let (hdr, ctl, out) = round_trip(control, &ids, key);

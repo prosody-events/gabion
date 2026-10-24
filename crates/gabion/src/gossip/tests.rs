@@ -1146,6 +1146,7 @@ async fn ihave_and_iwant_deliver_to_a_peer_outside_the_mesh() {
                 d: 0,
                 d_lo: 0,
                 d_hi: 0,
+                sweep_slice_cells: 0,
                 ..Default::default()
             };
 
@@ -1315,6 +1316,283 @@ async fn graft_before_discovery_meshes_once_discovered() {
             let _ = h_b.await;
         })
         .await;
+}
+
+/// A node cut off for longer than the message cache holds learns what it
+/// missed from a sweep: the first advertisement it hears after the cut is
+/// mostly news, so it pulls the advertiser's live cells, a slice at a time.
+/// Without the sweep only the messages still cached would reach it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sweep_repairs_what_the_message_cache_no_longer_holds() {
+    for (sweep_slice_cells, expected) in [(2, 6), (0, 1)] {
+        assert_eq!(
+            cut_off_node_total(sweep_slice_cells, LinkPolicy::Pass).await,
+            expected
+        );
+    }
+}
+
+/// A slice that lost a frame is asked for again rather than skipped.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sweep_asks_again_for_a_slice_that_lost_a_frame() {
+    let lossy = LinkPolicy::DropProb { p: 0.3 };
+    assert_eq!(cut_off_node_total(2, lossy).await, 6);
+}
+
+/// A sweep whose peer stops answering is taken up again from another peer.
+/// C hears A again but cannot reach it, so its sweep of A goes unanswered;
+/// once B is reachable the retried sweep runs against B, which holds A's
+/// cells.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn an_unanswered_sweep_moves_to_another_peer() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let [a, b, c] = [sock(40_120), sock(40_121), sock(40_122)];
+            let cfg = crate::gossip::PubSubConfig {
+                d: 0,
+                d_lo: 0,
+                d_hi: 0,
+                ..Default::default()
+            };
+            let c_agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let mut clients = Vec::new();
+            let mut handles = Vec::new();
+            for (i, addr) in [a, b, c].into_iter().enumerate() {
+                let identity = NodeIdentity::new(NodeId(0xE0 + i as u128), 1);
+                let peers = [a, b, c].into_iter().filter(|p| *p != addr).collect();
+                let agg = if addr == c {
+                    c_agg.clone()
+                } else {
+                    Rc::new(InMemoryAggregateStore::<u32>::new())
+                };
+                let (rt, client) = GossipRuntime::from_parts(
+                    router.bind(addr),
+                    TokioClock::from_millis(0),
+                    sim_config(identity, peers, 60 + i as u64),
+                    store_for(identity),
+                    agg,
+                );
+                let rt = rt.with_pubsub(cfg.clone());
+                handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+                clients.push(client);
+            }
+            let link = |x: SocketAddr, y: SocketAddr, policy: LinkPolicy| {
+                router.set_link_policy(x, y, policy);
+                router.set_link_policy(y, x, policy);
+            };
+
+            link(a, c, LinkPolicy::Block);
+            link(b, c, LinkPolicy::Block);
+            for key in 1..=5 {
+                clients[0]
+                    .record(0xDEAD, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 80).await;
+
+            // C hears A's next advertisement and sweeps A, which never hears
+            // the request.
+            router.set_link_policy(a, c, LinkPolicy::Pass);
+            clients[0]
+                .record(0xDEAD, KeyHash(6), 0, 1, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 15).await;
+            link(b, c, LinkPolicy::Pass);
+            sim_advance_ticks(Duration::from_millis(100), 80).await;
+            assert_eq!(c_agg.total(), 6, "C swept B for A's cells");
+
+            for client in clients {
+                client.shutdown().await.unwrap();
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+}
+
+/// C is cut off while A records five cells, rejoins (over links with
+/// `rejoin` policy) after A's message has left every cache, then B records
+/// one more. Returns C's total. No node has a mesh, so everything travels by
+/// IHAVE.
+async fn cut_off_node_total(sweep_slice_cells: usize, rejoin: LinkPolicy) -> u64 {
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let router = SimRouter::new();
+            let addrs = [sock(40_090), sock(40_091), sock(40_092)];
+            let cfg = crate::gossip::PubSubConfig {
+                d: 0,
+                d_lo: 0,
+                d_hi: 0,
+                sweep_slice_cells,
+                ..Default::default()
+            };
+            let c_agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let mut clients = Vec::new();
+            let mut handles = Vec::new();
+            for (i, &addr) in addrs.iter().enumerate() {
+                let identity = NodeIdentity::new(NodeId(0xC0 + i as u128), 1);
+                let peers = addrs.iter().copied().filter(|a| *a != addr).collect();
+                let (rt, client) = GossipRuntime::from_parts(
+                    router.bind(addr),
+                    TokioClock::from_millis(0),
+                    sim_config(identity, peers, 30 + i as u64),
+                    store_for(identity),
+                    if i == 2 {
+                        c_agg.clone()
+                    } else {
+                        Rc::new(InMemoryAggregateStore::<u32>::new())
+                    },
+                );
+                let rt = rt.with_pubsub(cfg.clone());
+                handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+                clients.push(client);
+            }
+            let cut = |policy: LinkPolicy| {
+                for other in &addrs[..2] {
+                    router.set_link_policy(addrs[2], *other, policy);
+                    router.set_link_policy(*other, addrs[2], policy);
+                }
+            };
+
+            cut(LinkPolicy::Block);
+            for key in 1..=5 {
+                clients[0]
+                    .record(0xDEAD, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 80).await;
+            assert_eq!(c_agg.total(), 0, "the cut kept everything from C");
+
+            cut(rejoin);
+            clients[1]
+                .record(0xDEAD, KeyHash(9), 0, 1, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 80).await;
+            let total = c_agg.total();
+
+            for client in clients {
+                client.shutdown().await.unwrap();
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+            total
+        })
+        .await
+}
+
+/// After a cut longer than the message cache holds, each side sweeps a peer
+/// of the other as soon as it hears from it again: that mesh peer stayed
+/// silent while the rest of the mesh kept pushing. Without the sweep, cells
+/// written during the cut and never touched again stay one-sided.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn mesh_peers_back_from_a_cut_are_swept() {
+    assert_eq!(split_brain_totals(4, 64).await, [284; 4]);
+    assert!(
+        split_brain_totals(4, 0)
+            .await
+            .iter()
+            .all(|&total| total < 284)
+    );
+}
+
+/// A node that still cannot reach the far side after a cut heals learns of
+/// the heal from a mesh peer that swept across it (`CAUGHT_UP`), and sweeps
+/// that peer.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_node_with_no_link_across_a_healed_cut_catches_up_from_its_mesh() {
+    assert_eq!(split_brain_totals(5, 64).await, [355; 5]);
+}
+
+/// Nodes 0 and 1 are cut off from 2 and 3. Each node publishes 70
+/// single-cell messages over ten keys, the cut heals after they left every
+/// cache, and every node then records one more hit. A fifth node, if any,
+/// sits on 0 and 1's side and never reaches 2 and 3. Returns each node's
+/// total. Up to six nodes are one full mesh, so no IHAVE is ever sent.
+async fn split_brain_totals(nodes: u16, sweep_slice_cells: usize) -> Vec<u64> {
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            let router = SimRouter::new();
+            let addrs: Vec<SocketAddr> = (0..nodes).map(|i| sock(40_100 + i)).collect();
+            let cfg = crate::gossip::PubSubConfig {
+                sweep_slice_cells,
+                ..Default::default()
+            };
+            let mut aggs = Vec::new();
+            let mut clients = Vec::new();
+            let mut handles = Vec::new();
+            for (i, &addr) in addrs.iter().enumerate() {
+                let identity = NodeIdentity::new(NodeId(0xD0 + i as u128), 1);
+                let peers = addrs.iter().copied().filter(|a| *a != addr).collect();
+                let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+                let (rt, client) = GossipRuntime::from_parts(
+                    router.bind(addr),
+                    TokioClock::from_millis(0),
+                    sim_config(identity, peers, 50 + i as u64),
+                    store_for(identity),
+                    agg.clone(),
+                );
+                let rt = rt.with_pubsub(cfg.clone());
+                handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+                aggs.push(agg);
+                clients.push(client);
+            }
+            let cut = |policy: LinkPolicy| {
+                for &near in &addrs[..2] {
+                    for &far in &addrs[2..4] {
+                        router.set_link_policy(near, far, policy);
+                        router.set_link_policy(far, near, policy);
+                    }
+                }
+            };
+            for &near in &addrs[4..] {
+                for &far in &addrs[2..4] {
+                    router.set_link_policy(near, far, LinkPolicy::Block);
+                    router.set_link_policy(far, near, LinkPolicy::Block);
+                }
+            }
+
+            sim_advance_ticks(Duration::from_millis(100), 2).await;
+            cut(LinkPolicy::Block);
+            for key in 0..70 {
+                for (node, client) in clients.iter().enumerate() {
+                    client
+                        .record(0xDEAD, KeyHash(1_000 * node as u128 + key % 10), 0, 1, 0, 0)
+                        .await
+                        .unwrap();
+                }
+                sim_advance_ticks(Duration::from_millis(100), 1).await;
+            }
+            sim_advance_ticks(Duration::from_millis(100), 80).await;
+
+            cut(LinkPolicy::Pass);
+            for (node, client) in clients.iter().enumerate() {
+                client
+                    .record(0xBEEF, KeyHash(node as u128), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 30).await;
+            let totals = aggs.iter().map(|agg| agg.total()).collect();
+
+            for client in clients {
+                client.shutdown().await.unwrap();
+            }
+            for handle in handles {
+                let _ = handle.await;
+            }
+            totals
+        })
+        .await
 }
 
 // -- partition then heal ----------------------------------------------------

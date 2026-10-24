@@ -1,6 +1,8 @@
 //! GossipSub dissemination for the runtime: publishing local changes to the
 //! mesh, forwarding what arrives, and the control plane (`GRAFT`, `PRUNE`,
-//! `IHAVE`, `IWANT`) that keeps the mesh and repairs what it misses.
+//! `IHAVE`, `IWANT`) that keeps the mesh and repairs what it misses, plus the
+//! catch-up sweep (`SWEEP`, `SWEEP_DONE`) for gaps the message cache cannot
+//! fill.
 //!
 //! A *message* is one datagram of cells, named by [`message_id`]. Messages
 //! are forwarded byte-for-byte, so a receiver identifies the forwarding peer
@@ -9,7 +11,7 @@
 use std::net::SocketAddr;
 
 use crate::crdt::{Count, NodeId};
-use crate::wire::{self, Control, FrameLimits, Header, HmacKey, Packets};
+use crate::wire::{self, Control, FrameLimits, Header, HmacKey, Packets, SWEEP_COMPLETE};
 
 use super::super::clock::Clock;
 use super::super::pubsub::{IdRing, MessageCache, PubSubConfig, message_id};
@@ -35,6 +37,11 @@ pub(super) struct Peer {
     /// the peer refused a GRAFT because discovery had not reported this node
     /// to it yet. Unlike the backoff, the peer's own GRAFT is still welcome.
     graft_after_ms: u64,
+    /// When the peer last sent this node cells or joined its mesh.
+    heard: Heard,
+    /// Cells from the peer before this time may answer this node's `IWANT`,
+    /// which any peer serves, so they say nothing about the mesh link.
+    iwant_until_ms: u64,
 }
 
 impl Peer {
@@ -45,8 +52,56 @@ impl Peer {
             mesh: false,
             backoff_until_ms: 0,
             graft_after_ms: 0,
+            heard: Heard::default(),
+            iwant_until_ms: 0,
         }
     }
+}
+
+/// A point in a peer's traffic: [`PubSub::accepted`] and the clock then.
+#[derive(Clone, Copy, Default)]
+struct Heard {
+    accepted: u64,
+    at_ms: u64,
+}
+
+/// New messages the rest of the mesh must push to this node while one mesh
+/// peer sends it nothing for that peer to count as cut off (besides a silence
+/// longer than `IHAVE` can repair). A mesh peer forwards every message it does
+/// not first receive from this node, about half of them, so it misses this
+/// many in a row by chance about once in 256 tries, while a quiet cluster,
+/// where silence is normal, never qualifies.
+const SWEEP_SILENCE_MESSAGES: u64 = 8;
+
+/// Times a catch-up sweep request is re-sent, one heartbeat apart, before the
+/// sweep is abandoned.
+const SWEEP_RETRIES: u8 = 3;
+
+/// A catch-up sweep in progress: the peer's live cells from storage slot
+/// `cursor` on are still to come.
+struct Sweep {
+    peer: SocketAddr,
+    cursor: u32,
+    asked_ms: u64,
+    retries: u8,
+    /// Frames of the slice asked for that have arrived.
+    received: u16,
+    /// The peer's `SWEEP_DONE` for that slice: where the next slice starts
+    /// and how many frames this one had. Frames may arrive after it.
+    done: Option<(u32, u16)>,
+    cause: SweepCause,
+}
+
+/// Why a sweep started, weakest first: a stronger cause takes over a sweep
+/// under way for a weaker one.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SweepCause {
+    /// An `IHAVE` frame of mostly unseen ids.
+    Advertisement,
+    /// A mesh peer swept across a healed cut and said so (`CAUGHT_UP`).
+    CaughtUp,
+    /// A mesh peer back from a cut; the mesh hears `CAUGHT_UP` when done.
+    Cut,
 }
 
 /// What every outgoing control frame needs to be encoded and signed.
@@ -71,6 +126,14 @@ pub(super) struct PubSub {
     targets: Vec<SocketAddr>,
     candidates: Vec<u32>,
     rng: SplitMix64,
+    sweep: Option<Sweep>,
+    /// No sweep starts on an advertisement before this time (milliseconds).
+    sweep_idle_until_ms: u64,
+    /// No sweep starts on a `CAUGHT_UP` before this time (milliseconds).
+    caught_up_until_ms: u64,
+    /// New messages mesh peers have pushed to this node so far (answers to
+    /// its `IWANT`s excluded).
+    accepted: u64,
 }
 
 impl PubSub {
@@ -97,6 +160,10 @@ impl PubSub {
             targets: Vec::with_capacity(PEER_SCRATCH),
             candidates: Vec::with_capacity(PEER_SCRATCH),
             rng: SplitMix64::new(rng_seed),
+            sweep: None,
+            sweep_idle_until_ms: 0,
+            caught_up_until_ms: 0,
+            accepted: 0,
         }
     }
 
@@ -123,6 +190,14 @@ impl PubSub {
         self.seen.contains(id)
     }
 
+    pub(super) fn is_peer(&self, addr: SocketAddr) -> bool {
+        self.peers.iter().any(|p| p.addr == addr)
+    }
+
+    pub(super) fn sweep_slice_cells(&self) -> usize {
+        self.cfg.sweep_slice_cells
+    }
+
     /// Remember `datagram` and push it to every mesh peer except the one it
     /// came from and its publisher. Returns `false` when no send buffer was
     /// free, in which case the mesh peers were not reached.
@@ -136,6 +211,13 @@ impl PubSub {
         let id = message_id(datagram);
         if !self.seen.contains(id) {
             self.seen.insert(id, now_ms);
+        }
+        if self
+            .peers
+            .iter()
+            .any(|p| Some(p.addr) == from && p.mesh && now_ms >= p.iwant_until_ms)
+        {
+            self.accepted += 1;
         }
         self.mcache.insert(id, self.heartbeats, datagram);
         let Some(slot) = self.sendq.claim("forward a message to the mesh") else {
@@ -185,9 +267,31 @@ impl PubSub {
             }
             Control::IHave => {
                 // Ask for the advertised messages we have not seen. Ids are
-                // requested at once (`iwant_delay_ms = 0`).
+                // requested at once (`iwant_delay_ms = 0`). An advertisement
+                // that is mostly news means this node missed more than the
+                // message cache can serve, so it also sweeps the advertiser.
+                // The swept peer's store holds every message it advertises,
+                // so while the sweep runs those count as seen.
+                let advertised = self.ids.len();
                 let seen = &self.seen;
                 self.ids.retain(|&id| !seen.contains(id));
+                if self.ids.is_empty() {
+                    return;
+                }
+                match &self.sweep {
+                    Some(sweep) if sweep.peer == src => return self.mark_seen(now_ms),
+                    Some(_) => {}
+                    None if 2 * self.ids.len() > advertised
+                        && now_ms >= self.sweep_idle_until_ms =>
+                    {
+                        self.begin_sweep(framing, src, now_ms, SweepCause::Advertisement);
+                    }
+                    None => {}
+                }
+                let answer_by_ms = now_ms + self.heartbeat_interval_ms();
+                if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
+                    peer.iwant_until_ms = answer_by_ms;
+                }
                 self.targets.clear();
                 self.targets.push(src);
                 self.send_ids(framing, Control::IWant);
@@ -206,6 +310,207 @@ impl PubSub {
                     self.sendq.settle(slot);
                 }
             }
+            // The runtime answers a sweep request: it owns the store.
+            Control::Sweep { .. } => {}
+            Control::CaughtUp => {
+                if now_ms >= self.caught_up_until_ms {
+                    self.begin_sweep(framing, src, now_ms, SweepCause::CaughtUp);
+                }
+            }
+            Control::SweepDone {
+                cursor,
+                next,
+                frames,
+            } => {
+                if let Some(sweep) = self
+                    .sweep
+                    .as_mut()
+                    .filter(|s| s.peer == src && s.cursor == cursor)
+                {
+                    sweep.done = Some((next, frames));
+                    self.advance_sweep(framing, now_ms);
+                }
+            }
+        }
+    }
+
+    // -- catch-up sweep -----------------------------------------------------
+
+    /// Count the unseen ids in `self.ids` as seen: a sweep brings their cells.
+    fn mark_seen(&mut self, now_ms: u64) {
+        for &id in &self.ids {
+            self.seen.insert(id, now_ms);
+        }
+    }
+
+    /// Cells arrived from `src`. A mesh peer that sent nothing for longer than
+    /// `IHAVE` advertises a message (`mcache_gossip` heartbeats), while the
+    /// rest of the mesh pushed [`SWEEP_SILENCE_MESSAGES`] new messages, was
+    /// cut off from this node, so sweep it. A peer back while another cut-off
+    /// peer is swept is left to that sweep: a cut heals for every peer on its
+    /// far side at once.
+    pub(super) fn note_cells_from(&mut self, framing: &Framing<'_>, src: SocketAddr, now_ms: u64) {
+        let accepted = self.accepted;
+        let repairable_ms = u64::from(self.cfg.mcache_gossip) * self.heartbeat_interval_ms();
+        let Some(peer) = self
+            .peers
+            .iter_mut()
+            .find(|p| p.addr == src && now_ms >= p.iwant_until_ms)
+        else {
+            return;
+        };
+        let cut_off = peer.mesh
+            && accepted - peer.heard.accepted >= SWEEP_SILENCE_MESSAGES
+            && now_ms - peer.heard.at_ms >= repairable_ms;
+        peer.heard = Heard {
+            accepted,
+            at_ms: now_ms,
+        };
+        if cut_off {
+            self.begin_sweep(framing, src, now_ms, SweepCause::Cut);
+        }
+    }
+
+    /// Start pulling `src`'s live cells, unless sweeps are off, `src` is not a
+    /// discovered peer, or a sweep for an equal or stronger cause runs.
+    fn begin_sweep(
+        &mut self,
+        framing: &Framing<'_>,
+        src: SocketAddr,
+        now_ms: u64,
+        cause: SweepCause,
+    ) {
+        if self.cfg.sweep_slice_cells == 0
+            || self.sweep.as_ref().is_some_and(|s| s.cause >= cause)
+            || !self.is_peer(src)
+        {
+            return;
+        }
+        self.sweep = Some(Sweep {
+            peer: src,
+            cursor: 0,
+            asked_ms: now_ms,
+            retries: 0,
+            received: 0,
+            done: None,
+            cause,
+        });
+        self.send_control(framing, src, Control::Sweep { cursor: 0 });
+    }
+
+    /// A frame of cells answering this node's sweep arrived from `src`.
+    pub(super) fn on_sweep_frame(&mut self, framing: &Framing<'_>, src: SocketAddr, now_ms: u64) {
+        if let Some(sweep) = self.sweep.as_mut().filter(|s| s.peer == src) {
+            sweep.received = sweep.received.saturating_add(1);
+            self.advance_sweep(framing, now_ms);
+        }
+    }
+
+    /// Once every frame of the slice asked for has arrived, ask for the next
+    /// one, or finish when the store is exhausted. A slice that lost a frame
+    /// is asked for again by [`Self::retry_sweep`].
+    fn advance_sweep(&mut self, framing: &Framing<'_>, now_ms: u64) {
+        let Some(sweep) = self.sweep.as_mut() else {
+            return;
+        };
+        let Some((next, _)) = sweep.done.filter(|&(_, frames)| sweep.received >= frames) else {
+            return;
+        };
+        if next == SWEEP_COMPLETE {
+            let (swept, cause) = (sweep.peer, sweep.cause);
+            self.finish_sweep(now_ms);
+            if cause == SweepCause::Cut {
+                // A mesh peer with no link across the cut of its own learns
+                // of the heal from this node.
+                self.select(|p| p.mesh && p.addr != swept);
+                for i in 0..self.candidates.len() {
+                    let addr = self.peers[self.candidates[i] as usize].addr;
+                    self.send_control(framing, addr, Control::CaughtUp);
+                }
+            }
+            return;
+        }
+        *sweep = Sweep {
+            cursor: next,
+            asked_ms: now_ms,
+            retries: 0,
+            received: 0,
+            done: None,
+            ..*sweep
+        };
+        let peer = sweep.peer;
+        self.send_control(framing, peer, Control::Sweep { cursor: next });
+    }
+
+    /// Re-ask a slice not complete within a heartbeat, giving up
+    /// after [`SWEEP_RETRIES`] or once the peer has left.
+    fn retry_sweep(&mut self, framing: &Framing<'_>, now_ms: u64) {
+        let heartbeat_ms = self.heartbeat_interval_ms();
+        let peers = &self.peers;
+        let Some(sweep) = self
+            .sweep
+            .as_mut()
+            .filter(|s| now_ms >= s.asked_ms + heartbeat_ms)
+        else {
+            return;
+        };
+        if sweep.retries >= SWEEP_RETRIES || !peers.iter().any(|p| p.addr == sweep.peer) {
+            return self.abandon_sweep(framing, now_ms);
+        }
+        sweep.retries += 1;
+        sweep.asked_ms = now_ms;
+        sweep.received = 0;
+        sweep.done = None;
+        let (peer, cursor) = (sweep.peer, sweep.cursor);
+        self.send_control(framing, peer, Control::Sweep { cursor });
+    }
+
+    /// Take a sweep whose peer left or stopped answering up again from a
+    /// random other peer: the node is still short, and the advertisements the
+    /// sweep counted as seen will not start another.
+    fn abandon_sweep(&mut self, framing: &Framing<'_>, now_ms: u64) {
+        let Some(failed) = self.sweep.take() else {
+            return;
+        };
+        self.select(|p| p.addr != failed.peer);
+        if self.candidates.is_empty() {
+            return;
+        }
+        let pick = self.candidates[(self.rng.next_u64() as usize) % self.candidates.len()];
+        let peer = self.peers[pick as usize].addr;
+        self.begin_sweep(framing, peer, now_ms, failed.cause);
+    }
+
+    /// Forget a peer discovery reported gone. Returns whether it was known.
+    pub(super) fn remove_peer(
+        &mut self,
+        framing: &Framing<'_>,
+        addr: SocketAddr,
+        now_ms: u64,
+    ) -> bool {
+        let Some(pos) = self.peers.iter().position(|p| p.addr == addr) else {
+            return false;
+        };
+        self.peers.remove(pos);
+        if self.sweep.as_ref().is_some_and(|s| s.peer == addr) {
+            self.abandon_sweep(framing, now_ms);
+        }
+        true
+    }
+
+    /// After a sweep, wait until the advertisements it may have raced (the
+    /// ids of `mcache_gossip` heartbeats) have aged out before another one
+    /// starts on an advertisement, and after one that repaired a cut, until
+    /// every neighbour's `CAUGHT_UP` about that cut has come. A cut-off mesh
+    /// peer starts one at once.
+    fn finish_sweep(&mut self, now_ms: u64) {
+        let Some(sweep) = self.sweep.take() else {
+            return;
+        };
+        let idle_until = now_ms + u64::from(self.cfg.mcache_gossip) * self.heartbeat_interval_ms();
+        self.sweep_idle_until_ms = idle_until;
+        if sweep.cause > SweepCause::Advertisement {
+            self.caught_up_until_ms = idle_until;
         }
     }
 
@@ -216,10 +521,17 @@ impl PubSub {
     fn on_graft(&mut self, framing: &Framing<'_>, src: SocketAddr, now_ms: u64) {
         let degree = self.mesh_degree();
         let backoff = now_ms + u64::from(self.cfg.prune_backoff_secs) * 1_000;
+        let heard = Heard {
+            accepted: self.accepted,
+            at_ms: now_ms,
+        };
         match self.peers.iter_mut().find(|p| p.addr == src) {
-            Some(peer) if peer.mesh => {}
+            // Already in this node's mesh: the peer (re)joined from its side,
+            // so its silence until now says nothing about the link.
+            Some(peer) if peer.mesh => peer.heard = heard,
             Some(peer) if now_ms >= peer.backoff_until_ms && degree < self.cfg.d_hi => {
                 peer.mesh = true;
+                peer.heard = heard;
             }
             Some(peer) => {
                 peer.backoff_until_ms = backoff;
@@ -235,7 +547,12 @@ impl PubSub {
         }
     }
 
-    fn send_control(&mut self, framing: &Framing<'_>, dst: SocketAddr, control: Control) {
+    pub(super) fn send_control(
+        &mut self,
+        framing: &Framing<'_>,
+        dst: SocketAddr,
+        control: Control,
+    ) {
         let Some(slot) = self.sendq.claim("send a GRAFT or PRUNE") else {
             return;
         };
@@ -287,6 +604,7 @@ impl PubSub {
     pub(super) fn heartbeat(&mut self, framing: &Framing<'_>, now_ms: u64) {
         let seen_ttl_ms = self.cfg.seen_ttl.as_millis() as u64;
         self.seen.expire_before(now_ms.saturating_sub(seen_ttl_ms));
+        self.retry_sweep(framing, now_ms);
         self.maintain_mesh(framing, now_ms);
         self.emit_gossip(framing);
         self.heartbeats += 1;
@@ -304,6 +622,10 @@ impl PubSub {
             for i in 0..take {
                 let peer = &mut self.peers[self.candidates[i] as usize];
                 peer.mesh = true;
+                peer.heard = Heard {
+                    accepted: self.accepted,
+                    at_ms: now_ms,
+                };
                 let addr = peer.addr;
                 self.send_control(framing, addr, Control::Graft);
             }
@@ -388,10 +710,19 @@ where
         self.pubsub.heartbeat(&framing, now_ms);
     }
 
-    /// A datagram of cells: merge it, then forward it if it is new.
+    /// A datagram of cells: merge it, then forward it if it is a new message.
+    /// A sweep answer is merged only.
     pub(super) fn handle_message(&mut self, n: usize, src: SocketAddr) {
+        let now_ms = self.clock.now_millis();
+        let framing = Framing {
+            header: self.header(),
+            key: self.config.auth_key.as_ref(),
+            limits: self.config.wire_limits,
+        };
+        self.pubsub.note_cells_from(&framing, src, now_ms);
         let bytes = &self.recv_buf[..n];
-        if self.pubsub.has_seen(message_id(bytes)) {
+        let sweep = wire::is_sweep(bytes);
+        if !sweep && self.pubsub.has_seen(message_id(bytes)) {
             return;
         }
         self.obs_buf.clear();
@@ -421,15 +752,106 @@ where
             Err(err) => return self.note_decode_reject(src, &err),
         };
         self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
-        // The datagram is forwarded as received, so nothing remains to send
-        // from the forwarded dirty ring.
+        // The datagram is forwarded as received (or, answering a sweep, not
+        // at all), so nothing remains to send from the forwarded dirty ring.
         self.store.clear_forwarded_dirty();
-        let now_ms = self.clock.now_millis();
+        if sweep {
+            let framing = Framing {
+                header: self.header(),
+                key: self.config.auth_key.as_ref(),
+                limits: self.config.wire_limits,
+            };
+            return self.pubsub.on_sweep_frame(&framing, src, now_ms);
+        }
         self.pubsub.accept_message(
             &self.recv_buf[..n],
             now_ms,
             Some(src),
             Some(NodeId(summary.header.sender_node_id)),
+        );
+    }
+
+    /// Answer a sweep request from a discovered peer with up to
+    /// `sweep_slice_cells` live cells from storage slot `cursor` on, then a
+    /// `SWEEP_DONE` naming where the next slice starts. The cells go out as
+    /// `FLAG_SWEEP` frames, which the requester merges without forwarding.
+    fn answer_sweep(&mut self, src: SocketAddr, cursor: u32) {
+        let slice = self
+            .pubsub
+            .sweep_slice_cells()
+            .min(self.config.max_cells_per_tick);
+        if slice == 0 || !self.pubsub.is_peer(src) {
+            return;
+        }
+        let handles = &mut self.frame_handles;
+        handles.clear();
+        let mut next = SWEEP_COMPLETE;
+        for handle in self.store.active_handles_from(cursor) {
+            if handles.len() == slice {
+                next = handle.index;
+                break;
+            }
+            handles.push(handle);
+        }
+
+        let framing = Framing {
+            header: self.header(),
+            key: self.config.auth_key.as_ref(),
+            limits: self.config.wire_limits,
+        };
+        let header = Header {
+            flags: wire::FLAG_SWEEP,
+            ..framing.header
+        };
+        let packets = match framing.key {
+            Some(key) => Packets::<C>::auth(
+                header,
+                &self.store,
+                &self.frame_handles,
+                key,
+                &mut self.scratch,
+                framing.limits,
+            ),
+            None => Packets::<C>::unauth(
+                header,
+                &self.store,
+                &self.frame_handles,
+                &mut self.scratch,
+                framing.limits,
+            ),
+        };
+        let mut frames: u16 = 0;
+        if let Ok(mut packets) = packets {
+            let sendq = &mut self.pubsub.sendq;
+            loop {
+                let unsent = packets.remaining();
+                if unsent == 0 {
+                    break;
+                }
+                let Some(slot) = sendq.claim("answer a sweep") else {
+                    // Resume at the first cell not sent.
+                    next = self.frame_handles[self.frame_handles.len() - unsent].index;
+                    break;
+                };
+                let written = packets.next_into(sendq.buf_mut(slot));
+                if let Ok(Some(_)) = written {
+                    sendq.send_to(slot, src);
+                    frames += 1;
+                }
+                sendq.settle(slot);
+                if !matches!(written, Ok(Some(_))) {
+                    break;
+                }
+            }
+        }
+        self.pubsub.send_control(
+            &framing,
+            src,
+            Control::SweepDone {
+                cursor,
+                next,
+                frames,
+            },
         );
     }
 
@@ -444,6 +866,9 @@ where
             Ok(decoded) => decoded,
             Err(err) => return self.note_decode_reject(src, &err),
         };
+        if let Control::Sweep { cursor } = control {
+            return self.answer_sweep(src, cursor);
+        }
         let now_ms = self.clock.now_millis();
         let framing = Framing {
             header: self.header(),

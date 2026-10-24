@@ -74,15 +74,19 @@ A node builds its mesh in its first heartbeat, before its first round.
 | mesh heartbeat | 1 s | `GOSSIPSUB_HEARTBEAT_MS` |
 | `prune_backoff`, `seen_ttl` | 60 s, 120 s | `GOSSIPSUB_PRUNE_BACKOFF_SECS`, `_SEEN_TTL_SECS` |
 | message cache, seen cache | 4,096 messages of 1,400 B, 32,768 ids | `GOSSIPSUB_MCACHE_CAPACITY`, `_MCACHE_SLOT_BYTES`, `_SEEN_CAPACITY` |
+| catch-up sweep slice (not GossipSub; see below) | 512 cells | `GOSSIPSUB_SWEEP_SLICE_CELLS` |
 
 The parameters live in `PubSubConfig` and are set with
 `GossipRuntime::with_pubsub`, not in `GossipConfig`, so existing
 `GossipConfig` literals (including the legacy bench's) keep compiling. The
-last row is the only addition to the specification: the caches are rings
-sized at construction, so memory cannot grow with traffic or departed peers.
+cache bounds are the only addition to the specification's parameters: the
+caches are rings sized at construction, so memory cannot grow with traffic or
+departed peers. The sweep slice belongs to the catch-up sweep, which is not
+part of GossipSub (see below).
 
-**Wire.** Control messages are four small datagrams that reuse the data
-frame's header and HMAC tag, marked by `FLAG_CONTROL` (`wire/control.rs`).
+**Wire.** Control messages are small datagrams that reuse the data frame's
+header and HMAC tag, marked by `FLAG_CONTROL` (`wire/control.rs`): the four
+of GossipSub and the sweep's `SWEEP` and `SWEEP_DONE`.
 `IHAVE` and `IWANT` split their id lists across as many datagrams as the
 payload limit needs.
 
@@ -97,14 +101,52 @@ payload limit needs.
   publishers push to their mesh like everyone else.
 - *Scoring and attack defences omitted* because the cluster is trusted: peer
   scoring and its thresholds, `D_score` and `D_out`, opportunistic grafting,
-  `IWANT` retransmission and `IHAVE` flood limits. Without scores a prune
-  keeps a random `D` mesh peers. Peer exchange on `PRUNE` is omitted too, as
-  membership comes only from discovery.
-- *No repair lane.* Nothing re-sends a cell the mesh and the lazy gossip both
-  missed, and a joiner learns of existing cells only through later messages
-  or advertisements still in a peer's cache. On a cluster of at most `D`
-  peers every peer is a mesh peer, so no `IHAVE` is sent and a lost datagram
-  is recovered only by the next message that touches the same cell.
+  the `IWANT` retransmission limit and the count of `IHAVE` messages
+  accepted per heartbeat. Without scores a prune keeps a random `D` mesh
+  peers. Peer exchange on `PRUNE` is omitted too, as membership comes only
+  from discovery.
+- *Catch-up sweep (an addition: the study's `pull-sweep-join` component).*
+  GossipSub repairs only what the message cache still holds, a few
+  heartbeats. A joiner never sees the cells written before it started, and
+  after a partition longer than the cache each side lacks the other's cells
+  until they leave the window; in our runs this left joiners short of the
+  truth for 5 to 8 s and about 1.3 hits per pod and tracked key unrepaired
+  after a 30 s zone cut. libp2p applications fill this gap outside
+  GossipSub, with a request/response sync protocol run on joining (Eth2's
+  beacon nodes sync blocks by range before relying on gossip); the sweep is
+  that protocol here.
+  - *Transfer.* A node pulls a peer's live cells `sweep_slice_cells` at a
+    time (512, `GOSSIPSUB_SWEEP_SLICE_CELLS`; `0` turns the sweep off):
+    `SWEEP` names a storage cursor, and the peer answers with that many cells
+    in `FLAG_SWEEP` frames, which are merged but never cached or forwarded,
+    then a `SWEEP_DONE` naming the next cursor and how many frames it sent.
+    The next slice is asked for once they have all arrived, so each burst
+    stays far below a receive buffer; a slice still incomplete after a
+    heartbeat is asked for again, up to three times.
+  - *Triggers,* all read from datagrams. An `IHAVE` frame whose ids are
+    mostly unseen (a joiner, or a gap the cache cannot serve) sweeps the
+    advertiser, besides the usual `IWANT`; not again until the ids it raced
+    have aged out of the gossip window. A mesh peer that sent nothing for
+    longer than that window, while the rest of the mesh pushed at least 8
+    new messages, and then speaks again, was cut off: sweep it at once
+    (answers to this node's own `IWANT`s do not count, since any peer serves
+    them, and a peer that grafts this node starts afresh). A mesh peer
+    forwards about half the messages, so missing 8 in a row by chance is a
+    1-in-256 event, and a quiet cluster, where silence is normal, never
+    qualifies. A node that repaired a cut this way sends its
+    mesh `CAUGHT_UP`, and a mesh peer that has not swept lately sweeps it in
+    turn: a node with no mesh link across the cut would otherwise learn of
+    the heal only from advertisements its neighbours' `IWANT`s have already
+    made stale.
+  - One sweep runs at a time. A cut-off mesh peer takes over a sweep started
+    for a weaker cause (`CAUGHT_UP`, then an advertisement); one back while
+    another cut-off peer is swept is taken as covered by it. After a sweep
+    for a cut, `CAUGHT_UP`s about the same cut are ignored for the gossip
+    window. A sweep whose peer leaves or stops answering is taken up again
+    from a random other peer. While a sweep runs, the swept peer's
+    advertisements count as seen, since its store holds their cells.
+  - On a cluster of at most `D` peers no `IHAVE` is sent, so a datagram lost
+    there is still recovered only by the next message touching the same cell.
 - *A `GRAFT` from an address discovery has not reported yet is refused with
   a zero backoff.* In libp2p a `GRAFT` arrives only over an open connection,
   so the sender is always known. Here discovery reports a new pod to each
