@@ -543,8 +543,10 @@ data and UDP.
   store, a node sends one random peer a digest of each rule's settled buckets:
   per origin, the sum of the counts it holds in each bucket (`wire::digest`;
   20 bytes per origin plus 4 per bucket). A bucket is settled once it closed
-  at least one bucket ago, so changes in flight do not make two up-to-date
-  nodes disagree; at most the newest 64 still in the window are compared.
+  a heartbeat and a missing timeout ago, by when a node's own changes of it
+  have left in a round and the trees and IHAVE have had their turn, so
+  changes in flight do not make two up-to-date nodes disagree; at most the
+  newest 64 still in the window are compared.
   Each frame lists origins in node id order and names the node ids it covers,
   so an origin in its range that it leaves out is one the sender holds none
   of. The peer pushes back, outside the trees, the cells of each listed
@@ -557,7 +559,9 @@ data and UDP.
   never with a digest: as in Scuttlebutt, one exchange repairs both sides.
   Equal sums of different cells are left to the next exchange with another
   peer. A rule a node holds no settled cells of is left out of its unprompted
-  digests. The digest replaces the blind repair slice, which sent a random
+  digests, unless it holds nothing at all: then its empty digest asks for
+  everything, which is how a node that started among peers already holding
+  state, with no discovery event to start a catch-up, gets it. The digest replaces the blind repair slice, which sent a random
   peer the next 256 cells of the store whatever it held: when nodes agree a
   digest costs a fraction of the slice's bytes, and it repairs within a round
   trip what the slice took tens of seconds to reach. A rule interned without

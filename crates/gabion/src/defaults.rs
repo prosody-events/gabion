@@ -117,7 +117,8 @@ pub const THICKET_NACK_ATTEMPTS: u8 = 3;
 pub const THICKET_REPAIR_CELLS: usize = 256;
 
 /// Newest settled buckets of a rule a repair digest covers. A bucket is
-/// settled once it closed at least one bucket ago, until it leaves the window.
+/// settled once it closed a heartbeat and `THICKET_MISSING_TIMEOUT_MS` ago,
+/// until it leaves the window.
 /// Each digest names, per origin, the sum of the counts held in each of these
 /// buckets; a longer window is compared on its newest buckets only.
 pub const THICKET_DIGEST_BUCKETS: usize = 64;

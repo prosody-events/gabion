@@ -7,8 +7,8 @@ use crate::gossip::sim::SimRouter;
 use crate::gossip::tests::{key_hash, rule_fp, run_paused};
 use crate::wire;
 
-/// 100 ms buckets: at 3 s the current bucket is 30 and buckets up to 28 are
-/// settled.
+/// 100 ms buckets and a 100 ms heartbeat: at 3 s, buckets that closed by
+/// 2.4 s, a heartbeat and a missing timeout earlier, are settled: up to 23.
 const NOW: u64 = 3_000;
 
 /// Merge cells `(origin, bucket, count)` of rule 0, one key per origin and
@@ -73,16 +73,16 @@ fn digest(rt: &mut IdleRuntime, to: u16) {
 }
 
 #[test]
-fn settled_buckets_are_those_in_the_window_closed_a_bucket_ago() {
+fn settled_buckets_are_those_in_the_window_closed_a_heartbeat_and_timeout_ago() {
     run_paused(async {
         let mut rt = idle_runtime(&SimRouter::new(), &addrs(4), 0);
         let rule = rt.store.find_rule(rule_fp(0)).unwrap();
         let s = rt.settled(rule, NOW).unwrap();
-        assert_eq!((s.first, s.last), (0, 28));
+        assert_eq!((s.first, s.last), (0, 23));
         // An hour of 100 ms buckets: only the newest 64 settled ones.
         let late = 10 * 3_600_000;
         let s = rt.settled(rule, late).unwrap();
-        assert_eq!((s.first, s.last), (359_998 - 63, 359_998));
+        assert_eq!((s.first, s.last), (359_993 - 63, 359_993));
         // A window shorter than the cap: from the oldest bucket still in it.
         let mut short = rt
             .store
@@ -94,8 +94,8 @@ fn settled_buckets_are_those_in_the_window_closed_a_bucket_ago() {
         short.window_millis = 1_000;
         let short = rt.store.intern_rule(short).unwrap();
         let s = rt.settled(short, NOW).unwrap();
-        assert_eq!((s.first, s.last), (20, 28));
-        assert!(rt.settled(rule, 150).is_none(), "nothing has settled yet");
+        assert_eq!((s.first, s.last), (20, 23));
+        assert!(rt.settled(rule, 650).is_none(), "nothing has settled yet");
     });
 }
 
@@ -131,7 +131,7 @@ fn nodes_that_agree_send_nothing_but_the_digest() {
         let router = SimRouter::new();
         let mut a = idle_runtime(&router, &all, 0);
         let mut b = idle_runtime(&router, &all, 1);
-        let cells = [(0xF1, 10, 2), (0xF2, 12, 1), (0xF3, 28, 7)];
+        let cells = [(0xF1, 10, 2), (0xF2, 12, 1), (0xF3, 23, 7)];
         hold(&mut a, &cells);
         hold(&mut b, &cells);
 
@@ -264,5 +264,30 @@ fn pushes_to_one_peer_are_capped_between_heartbeats() {
         b.digest_due(NOW);
         b.send_pending.clear();
         assert_eq!(exchange(&mut a, &mut b), 4);
+    });
+}
+
+#[test]
+fn a_node_that_holds_nothing_asks_with_an_empty_digest_and_gets_everything() {
+    run_paused(async {
+        let all = addrs(4);
+        let router = SimRouter::new();
+        let mut a = idle_runtime(&router, &all, 0);
+        let mut b = idle_runtime(&router, &all, 1);
+        hold(&mut b, &[(0xF1, 10, 2), (0xF2, 23, 1), (0xF3, 29, 1)]);
+        // Only peer: B. Each rule gets an empty digest, as A holds nothing.
+        let others: Vec<_> = (2..4).map(|i| all[i]).collect();
+        for addr in others {
+            a.thicket.remove_peer(addr);
+        }
+        a.digest_due(NOW);
+        let a_in_b = b.thicket.index_of(all[0]).unwrap();
+        deliver_digests(&mut a, &mut b, a_in_b);
+
+        assert_eq!(
+            pushed(&b),
+            BTreeSet::from([(0xF1, 10, 2), (0xF2, 23, 1)]),
+            "every settled cell, and nothing newer"
+        );
     });
 }

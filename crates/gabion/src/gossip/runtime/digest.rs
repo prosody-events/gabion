@@ -6,19 +6,21 @@
 //! sent again. Once per bucket, and at every heartbeat while repair keeps
 //! bringing news, a node sends one random peer a digest of each rule's
 //! settled buckets: per origin, the sum of the counts it holds in each. A
-//! bucket is settled once it closed at least one bucket ago, so changes in
-//! flight do not make two up-to-date nodes disagree. The peer pushes back the
-//! cells of each origin and bucket where it holds more, and of each origin the
-//! digest's range leaves out, which the sender holds none of: the sender is
-//! repaired. Where the sender holds more, the peer answers with its own
-//! digest of the same range, marked as a reply, which the sender answers by
+//! bucket is settled once it closed a heartbeat and a missing timeout ago, so
+//! changes in flight do not make two up-to-date nodes disagree. The peer pushes
+//! back the cells of each origin and bucket where it holds more, and of each
+//! origin the digest's range leaves out, which the sender holds none of: the
+//! sender is repaired. Where the sender holds more, the peer answers with its
+//! own digest of the same range, marked as a reply, which the sender answers by
 //! pushing: one exchange repairs both, as Scuttlebutt's does.
 //!
 //! This replaces the blind repair slice, which sent a random peer the next
 //! 256 cells of the store whatever it held.
 
 use crate::crdt::{BucketEpoch, Count, NodeSlot, RuleSlot};
-use crate::defaults::{THICKET_DIGEST_BUCKETS, THICKET_DIGEST_PUSH_CELLS};
+use crate::defaults::{
+    THICKET_DIGEST_BUCKETS, THICKET_DIGEST_PUSH_CELLS, THICKET_MISSING_TIMEOUT_MS,
+};
 use crate::wire::{DigestFrame, DigestScope, DigestWriter, decode_digest};
 
 use super::super::clock::Clock;
@@ -32,8 +34,8 @@ mod tests;
 
 /// Scratch for building and answering digests, sized at construction.
 pub(super) struct Digests {
-    /// Sum over rules of the newest settled bucket when the last digest went
-    /// out: a digest is due when it moves.
+    /// Sum over rules of one past the newest settled bucket when the last
+    /// digest went out: a digest is due when it moves.
     sent_mark: u64,
     /// Cells from outside the trees changed the store since the last digest:
     /// repair is under way, so the next heartbeat sends another.
@@ -102,12 +104,16 @@ where
 {
     /// Rule `slot`'s settled buckets at `now`, at most the newest
     /// `THICKET_DIGEST_BUCKETS`: those still in the window that closed at
-    /// least one bucket ago. `None` for a window too short to have any.
+    /// least a heartbeat and a missing timeout ago, by when this node's own
+    /// changes of them have left in a round and the trees and IHAVE have had
+    /// their turn. `None` when there are none.
     fn settled(&self, slot: RuleSlot, now: u64) -> Option<Settled> {
         let rule = self.store.rule_dictionary().descriptor(slot)?;
-        let current = rule.current_epoch(now);
-        let last = current.checked_sub(2)?;
-        let oldest = current.saturating_sub(rule.live_buckets());
+        let bucket_ms = u64::from(rule.bucket_millis);
+        let margin = self.config.tick_interval.as_millis() as u64 + THICKET_MISSING_TIMEOUT_MS;
+        let closed = now.checked_sub(margin)?.checked_div(bucket_ms)?;
+        let last = BucketEpoch::try_from(closed.checked_sub(1)?).ok()?;
+        let oldest = rule.current_epoch(now).saturating_sub(rule.live_buckets());
         let first = oldest.max((last + 1).saturating_sub(THICKET_DIGEST_BUCKETS as u32));
         (first <= last).then_some(Settled { first, last })
     }
@@ -122,7 +128,7 @@ where
         let rules = self.store.rule_dictionary().capacity() as RuleSlot;
         let mark = (0..rules)
             .filter_map(|r| self.settled(r, now))
-            .map(|s| u64::from(s.last))
+            .map(|s| u64::from(s.last) + 1)
             .sum();
         if mark == self.digests.sent_mark && !self.digests.repairing {
             return;
@@ -185,9 +191,11 @@ where
             *sum = sum.saturating_add(count_u32(row.count));
         }
         d.order.sort_unstable_by_key(|&(node_id, _)| node_id);
-        // A digest of nothing still says so when it answers one; unprompted,
+        // A digest of nothing says "send me everything": worth sending in
+        // answer to a digest, or from a node that holds nothing at all, such
+        // as one that started among peers that already hold state. Otherwise
         // a rule this node holds nothing of is left to the trees.
-        if d.order.is_empty() && !reply {
+        if d.order.is_empty() && !reply && !self.store.is_empty() {
             return;
         }
 
