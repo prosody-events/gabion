@@ -9,7 +9,8 @@
 //! in the loop allocates after construction.
 //!
 //! Local changes reach the cluster over a Snow broadcast tree; see
-//! `runtime/snow.rs`.
+//! `runtime/tree.rs`, and `runtime/pull.rs` for the pulls and digests that
+//! repair what the tree missed.
 
 use std::collections::VecDeque;
 use std::io;
@@ -111,7 +112,7 @@ where
     ring: Ring,
     rng: SplitMix64,
 
-    // Snow broadcast state. See `runtime/snow.rs`.
+    // Snow broadcast state. See `runtime/tree.rs`.
     tree: TreeParams,
     origins: Origins,
     relays: Relays,
@@ -130,6 +131,7 @@ where
     sent_seq: u64,
     last_digest_ms: u64,
     unacked_total: u64,
+    displaced_total: u64,
     send_dropped_total: u64,
 
     // Pending reply for the in-flight limit request. Sent after the
@@ -340,6 +342,7 @@ where
             sent_seq: 0,
             last_digest_ms: 0,
             unacked_total: 0,
+            displaced_total: 0,
             send_dropped_total: 0,
             pending_reply: None,
             decode_reject_count: 0,

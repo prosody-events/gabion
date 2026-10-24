@@ -59,7 +59,8 @@ pub struct GossipConfig {
     pub bootstrap_peers: Vec<SocketAddr>,
     /// Branching factor `k` of the Snow broadcast tree: the most children a
     /// node forwards a broadcast to, and the acknowledgements a root waits
-    /// for. Clamped to `2..=16`. See [`crate::defaults::GOSSIP_FANOUT`].
+    /// for. Rounded down to an even number and clamped to `2..=8`. See
+    /// [`crate::defaults::GOSSIP_FANOUT`].
     pub fanout: usize,
     /// Frame composition: how many changed cells one round may root
     /// broadcasts for. The wire codec splits them into packets, one broadcast

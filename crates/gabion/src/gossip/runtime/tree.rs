@@ -89,7 +89,10 @@ where
     /// send it to this node's children. Returns the handles consumed.
     fn begin_broadcast(&mut self, cursor: usize, now_millis: u64) -> usize {
         let remaining = self.frame_handles.len() - cursor;
-        let (idx, _displaced) = self.origins.claim(now_millis);
+        let (idx, displaced) = self.origins.claim(now_millis);
+        if displaced {
+            self.note_displaced();
+        }
         let header = self.sender_header();
         // Leave room for the control extension each hop adds, so that a
         // packet that came out full still fits once it is reframed.
@@ -217,6 +220,25 @@ where
                  for the tree header. Raise `send_queue_capacity` in the gossip \
                  config, and check that `max_payload_bytes` leaves room for the \
                  control header.",
+            );
+        }
+    }
+
+    /// Every slot for broadcasts awaiting acknowledgement was taken, so the
+    /// oldest gave up its rebroadcast.
+    fn note_displaced(&mut self) {
+        self.displaced_total = self.displaced_total.saturating_add(1);
+        if self.displaced_total.is_power_of_two() {
+            tracing::warn!(
+                displaced_total = self.displaced_total,
+                capacity = crate::defaults::GOSSIP_TREE_ORIGIN_CAPACITY,
+                "This node had more broadcasts awaiting acknowledgement than it can track, so the \
+                 oldest will not be sent again if part of the cluster missed it. Those peers \
+                 under-count this node's recent requests until they notice the gap and pull the \
+                 change, usually within a second. Usually acknowledgements are slow because peers \
+                 are overloaded or the network is losing packets while this node changes many \
+                 keys per round. Check peer health and packet loss; if both are fine, raise \
+                 `GOSSIP_TREE_ORIGIN_CAPACITY`.",
             );
         }
     }

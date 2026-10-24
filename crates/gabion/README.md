@@ -62,7 +62,7 @@ acknowledgement timeout to the children that have not answered. Code:
 
 | Parameter | Value | Where |
 | --- | --- | --- |
-| branching factor `k` | 4, clamped to 2..=8 | `GOSSIP_FANOUT`, `GossipConfig::fanout` |
+| branching factor `k` | 4, rounded down to even, clamped to 2..=8 | `GOSSIP_FANOUT`, `GossipConfig::fanout` |
 | acknowledgement timeout | 2 x expected tree round trip | `GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE` |
 | root rebroadcasts | 1 | `GOSSIP_ROOT_REBROADCASTS` |
 | tree height | `ceil(log_k((k-1)N) + 1)` | `snow::tree_height` |
@@ -77,6 +77,13 @@ gabion:
   sorted by `SocketAddr` and the carried bounds are addresses. A node's own
   address is its transport's `local_addr`, so it must be the address peers
   discover it under.
+- *Ranges are half-open ring intervals.* The paper hands each child closed
+  `(left, right)` node boundaries and a leaf the range `(i, i)`, so a leaf never
+  forwards. Here a child gets `[lo, hi)`, where `hi` is the next node in the
+  parent's view, and a leaf gets `[i, next)`. With agreeing views the two are
+  the same tree. When views disagree (churn, rollout), a "leaf" that knows a
+  member inside its interval that its parent did not know forwards to it, so
+  Snow reaches nodes the paper's tree would miss.
 - *Datagrams.* Acknowledgements are UDP datagrams, as everything else is. A
   lost data packet or a lost ack looks the same to the root: no complete ack
   before the timeout.
@@ -86,7 +93,12 @@ gabion:
   to its own silent children, but only if the repeat came from its parent (views
   that disagree can name an ancestor as a child, and following that edge would
   circulate the packet). Without this a rebroadcast could not repair anything
-  below the root's children. No node resends on its own timer.
+  below the root's children. No node resends on its own timer. The rebroadcast
+  goes to the same children with the same ranges, frozen when first sent. The
+  paper expects failure detection to have removed a dead node by the time it
+  rebroadcasts (section 4.4); here membership changes only through discovery,
+  which takes seconds, so a rebroadcast cannot route around a dead child. The
+  nodes below it learn of the gap from digests and pull from the root.
 - *Expected tree round trip is measured.* A node cannot know the network, so
   the timeout is twice `tree height x` a smoothed (gain 1/8) one-hop round
   trip, or twice the smoothed round trip of the root's broadcasts that
@@ -153,6 +165,11 @@ gabion:
   `main`'s; a round now roots broadcasts instead of picking peers. The
   acknowledgement timer is a second `Clock::ticker`, polled only while a
   broadcast awaits acknowledgements.
+- *`main`'s frame filler stays unused.* `CellStore::fill_gossip_frame*`, the
+  peer frontier and the forwarded dirty ring belong to the shared store API
+  that `main`'s runtime and the adapters' configuration use; this runtime
+  calls none of them and turns the forwarded ring off
+  (`ForwardedLane::Skip`), so merges do not fill or overflow it.
 - *`GossipConfig` gained no fields.* The frozen study harness builds the legacy
   suite's `GossipConfig` literally, so `fanout` carries `k` and the other
   knobs are `defaults` constants held in `TreeParams` (tests override them).

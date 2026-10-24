@@ -53,11 +53,13 @@ pub(super) enum Digests {
 }
 
 impl TreeParams {
-    /// Parameters for branching factor `fanout` (clamped to what the ack
-    /// masks can hold) and the shipped defaults for the rest.
+    /// Parameters for branching factor `fanout` and the shipped defaults for
+    /// the rest. Each side of a node's range splits into `k / 2` sub-ranges,
+    /// so `k` is rounded down to an even number (the paper requires one) and
+    /// clamped to what the ack masks can hold.
     pub fn new(fanout: usize) -> Self {
         Self {
-            branching: fanout.clamp(2, MAX_CHILDREN),
+            branching: (fanout & !1).clamp(2, MAX_CHILDREN),
             ack_timeout_rtt_multiple: defaults::GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE,
             rebroadcasts: defaults::GOSSIP_ROOT_REBROADCASTS,
             digests: Digests::Push,

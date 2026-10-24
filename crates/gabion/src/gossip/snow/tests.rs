@@ -582,3 +582,12 @@ fn a_digest_ahead_of_this_node_opens_the_gap_to_it() {
         "an unknown root: pull it all"
     );
 }
+
+#[test]
+fn branching_is_even_and_within_the_ack_mask() {
+    let k = |fanout| TreeParams::new(fanout).branching;
+    assert_eq!(
+        [0, 1, 2, 3, 4, 5, 7, 8, 16].map(k),
+        [2, 2, 2, 2, 4, 4, 6, 8, 8]
+    );
+}
