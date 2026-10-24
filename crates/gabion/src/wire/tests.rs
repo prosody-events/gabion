@@ -105,6 +105,7 @@ fn seed_store<C: Count>(
             incarnation: r.origin_incarnation as Incarnation,
             count: to_count(r.count),
             last_update_millis: r.last_update_millis,
+            origin_sequence: r.count.into(),
         });
     }
     store.merge_remote(&obs, &mut sink);
@@ -353,6 +354,7 @@ fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
             incarnation: 1,
             count: 1 + i,
             last_update_millis: 1_000 + i as u64,
+            origin_sequence: 1 + i as u64,
         });
     }
     store.merge_remote(&obs, &mut sink);

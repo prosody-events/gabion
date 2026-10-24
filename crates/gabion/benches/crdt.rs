@@ -61,6 +61,7 @@ fn obs_row(
         incarnation,
         count,
         last_update_millis,
+        origin_sequence: count.into(),
     }
 }
 use gabion::wire::{FrameLimits, Header, PacketBuf, Packets, WireScratch, decode_unauth};

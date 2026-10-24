@@ -383,6 +383,7 @@ fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
         incarnation: cell.origin_incarnation,
         count: cell.count,
         last_update_millis: cell.last_update_millis,
+        origin_sequence: cell.origin_sequence,
     }
 }
 

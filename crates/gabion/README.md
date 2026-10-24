@@ -572,9 +572,10 @@ delivery mechanism; this section is authoritative for this branch.
   over the live cells; threshold rounds carry none. The slice is the only
   resend path.
 - **Frontier is a hint.** The peer frontier only lets the dirty lanes skip a
-  cell the peer's frontier says it holds. Remote cells are re-stamped with
-  the merging node's own sequence, so the hint can be wrong; the repair
-  slice never consults it, and convergence does not depend on it.
+  cell the peer's frontier says it holds. A cell keeps the sequence its
+  origin stamped on it wherever it is relayed, but one watermark per
+  (peer, origin) cannot represent a gap, so the hint can be wrong; the
+  repair slice never consults it, and convergence does not depend on it.
 
 Adaptations, each the minimal one:
 

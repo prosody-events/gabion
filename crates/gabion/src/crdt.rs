@@ -329,8 +329,10 @@ pub struct CellStore<C: Count = u32> {
     selection_marks: Box<[u32]>,
     selection_epoch: u32,
 
-    // Per-origin sequence allocator (indexed by NodeSlot).
-    next_sequence_by_origin: Box<[u64]>,
+    // Sequence allocator for the cells this node originates. A cell learned
+    // from a peer keeps the sequence its origin stamped on it, so sequences
+    // compare across nodes.
+    local_sequence: u64,
 
     // Scratch arrays for `expire_at` — sized to rule_dictionary capacity.
     // Reused across every call; never allocated past `new()`.
@@ -373,8 +375,9 @@ enum UpsertMode<C: Count> {
     /// Local hit. The stored count rises by saturating-adding `hits`.
     Accumulate { hits: u64 },
     /// Remote observation. The stored count rises to `observed` if and only
-    /// if `observed` is strictly greater (CRDT max-merge).
-    MaxMerge { observed: C },
+    /// if `observed` is strictly greater (CRDT max-merge), and the cell takes
+    /// the `sequence` its origin stamped on that version.
+    MaxMerge { observed: C, sequence: u64 },
 }
 
 impl<C: Count> CellStore<C> {
@@ -431,8 +434,7 @@ impl<C: Count> CellStore<C> {
             selection_marks: vec![0_u32; cap as usize].into_boxed_slice(),
             selection_epoch: 0,
 
-            next_sequence_by_origin: vec![0_u64; config.node_dictionary_capacity as usize]
-                .into_boxed_slice(),
+            local_sequence: 0,
 
             expire_current_epoch_scratch: vec![0_u32; config.rule_dictionary_capacity as usize]
                 .into_boxed_slice(),
@@ -761,20 +763,17 @@ impl<C: Count> CellStore<C> {
         let h = hash_compact_cell_key(&key);
         self.index.remove(h, slot);
         self.rule_dictionary.dec_ref(rule);
-        let freed_node = self.node_dictionary.dec_ref(origin);
-        if freed_node {
+        if self.node_dictionary.dec_ref(origin) {
             self.peer_frontiers.clear_node_slot(origin);
-            self.next_sequence_by_origin[origin as usize] = 0;
         }
         self.free_slot(slot);
     }
 
     // -- Update primitives --------------------------------------------------
 
-    fn next_origin_sequence(&mut self, origin: NodeSlot) -> u64 {
-        let seq = &mut self.next_sequence_by_origin[origin as usize];
-        *seq = seq.saturating_add(1);
-        *seq
+    fn next_local_sequence(&mut self) -> u64 {
+        self.local_sequence = self.local_sequence.saturating_add(1);
+        self.local_sequence
     }
 
     fn push_dirty(&mut self, origin: NodeSlot, handle: CellHandle, sequence: u64) {
@@ -898,7 +897,7 @@ impl<C: Count> CellStore<C> {
             let previous = self.counts[slot as usize];
             let next = match mode {
                 UpsertMode::Accumulate { hits } => previous.saturating_add_hits(hits),
-                UpsertMode::MaxMerge { observed } => {
+                UpsertMode::MaxMerge { observed, .. } => {
                     if observed > previous {
                         observed
                     } else {
@@ -915,7 +914,12 @@ impl<C: Count> CellStore<C> {
             }
             self.counts[slot as usize] = next;
             self.last_update_millis[slot as usize] = now_millis;
-            let seq = self.next_origin_sequence(origin_slot);
+            let seq = match mode {
+                UpsertMode::Accumulate { .. } => self.next_local_sequence(),
+                UpsertMode::MaxMerge { sequence, .. } => {
+                    sequence.max(self.origin_sequences[slot as usize])
+                }
+            };
             self.origin_sequences[slot as usize] = seq;
             let handle = self.handle_for(slot);
             self.push_dirty(origin_slot, handle, seq);
@@ -938,7 +942,7 @@ impl<C: Count> CellStore<C> {
         };
         let initial = match mode {
             UpsertMode::Accumulate { hits } => C::default().saturating_add_hits(hits),
-            UpsertMode::MaxMerge { observed } => observed,
+            UpsertMode::MaxMerge { observed, .. } => observed,
         };
         self.rules[slot as usize] = rule_slot;
         self.key_hashes[slot as usize] = key_hash;
@@ -947,7 +951,10 @@ impl<C: Count> CellStore<C> {
         self.incarnations[slot as usize] = incarnation;
         self.counts[slot as usize] = initial;
         self.last_update_millis[slot as usize] = now_millis;
-        let seq = self.next_origin_sequence(origin_slot);
+        let seq = match mode {
+            UpsertMode::Accumulate { .. } => self.next_local_sequence(),
+            UpsertMode::MaxMerge { sequence, .. } => sequence,
+        };
         self.origin_sequences[slot as usize] = seq;
 
         // Hold dictionary references on behalf of this cell.
@@ -1072,6 +1079,7 @@ impl<C: Count> CellStore<C> {
                     now_millis: obs.last_update_millis[i],
                     mode: UpsertMode::MaxMerge {
                         observed: obs.counts[i],
+                        sequence: obs.origin_sequences[i],
                     },
                 },
                 sink,
@@ -1190,10 +1198,8 @@ impl<C: Count> CellStore<C> {
     /// With `peer`, the dirty lanes skip a cell whose `origin_sequence` is at
     /// or below that peer's `last_acked` for the cell's origin. That is a
     /// **latency optimization only**: the frontier is a per-(peer, origin)
-    /// high-watermark, and because remote cells are re-stamped with the
-    /// merging node's local origin counter (see [`Self::merge_remote`]), the
-    /// watermark can sit above a sequence the peer never actually received —
-    /// a gap it cannot represent. So the repair lane sweeps
+    /// high-watermark, so it can sit above a sequence the peer never actually
+    /// received — a gap it cannot represent. So the repair lane sweeps
     /// **unconditionally**, without consulting the frontier. That is what
     /// makes anti-entropy converge under reordering, loss, or a stale
     /// watermark — the guarantee the [`PeerFrontierTable`] doc comment

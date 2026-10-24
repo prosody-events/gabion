@@ -4,9 +4,10 @@ use super::{NodeId, NodeSlot};
 
 /// Per-peer × per-origin frontier: for each peer and origin, the highest
 /// origin sequence among the cells that peer has sent us. The "acked" names
-/// read it as "the peer holds that origin up to here", but the sequence is in
-/// the peer's own numbering (each node re-stamps the cells it merges), so it
-/// is a hint, not an acknowledgement. **Latency optimization only** —
+/// read it as "the peer holds that origin up to here", but a peer can hold a
+/// later sequence and still lack an earlier one (a lost datagram leaves a
+/// gap a single watermark cannot represent), so it is a hint, not an
+/// acknowledgement. **Latency optimization only** —
 /// convergence is guaranteed by the repair lane, not by this table.
 #[derive(Clone, Debug)]
 pub struct PeerFrontierTable {

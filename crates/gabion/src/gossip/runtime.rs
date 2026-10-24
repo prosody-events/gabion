@@ -494,6 +494,7 @@ where
             incarnation: 0,
             count: C::saturating_from_u64(req.hits),
             last_update_millis: req.now_millis,
+            origin_sequence: 0,
         });
         self.store.ingest_local(&self.obs_buf, &mut self.sink_buf);
         // Reply is sent at the bottom of this loop iteration, AFTER the
@@ -524,6 +525,7 @@ where
                     incarnation: cell.origin_incarnation,
                     count: cell.count,
                     last_update_millis: cell.last_update_millis,
+                    origin_sequence: cell.origin_sequence,
                 });
             };
             match self.config.auth_key.as_ref() {

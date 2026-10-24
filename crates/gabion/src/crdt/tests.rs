@@ -67,6 +67,7 @@ fn observation<C: Count>(
         incarnation: inc,
         count,
         last_update_millis: ts,
+        origin_sequence: count.into(),
     }
 }
 
@@ -639,6 +640,36 @@ fn merge_remote_is_monotonic() {
     assert_eq!(sink.deltas[0], 3);
 
     assert_eq!(store.count_of(handle).unwrap(), 8);
+}
+
+#[test]
+fn relayed_cell_keeps_its_origin_sequence() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut sink = DeltaSink::with_capacity(4);
+    let mut obs = ObservationBatch::with_capacity(1);
+    let mut row = observation(0x11, 0xabc, 0, 7, 1, 5_u32, 100);
+    row.origin_sequence = 42;
+    obs.push(row);
+    store.merge_remote(&obs, &mut sink);
+    let handle = sink.handles[0];
+    assert_eq!(store.get(handle).unwrap().origin_sequence, 42);
+
+    // A stale version carries an older sequence and changes nothing; a newer
+    // one takes the origin's newer sequence.
+    for (count, sequence, expected) in [(3_u32, 40, 42), (8, 57, 57)] {
+        obs.clear();
+        let mut row = observation(0x11, 0xabc, 0, 7, 1, count, 200);
+        row.origin_sequence = sequence;
+        obs.push(row);
+        store.merge_remote(&obs, &mut sink);
+        assert_eq!(store.get(handle).unwrap().origin_sequence, expected);
+    }
+
+    // Local cells number from this node's own counter, which merging other
+    // origins never advances.
+    let local = local_increment_one(&mut store, 0x11, 0xdef, 0, 1, 10);
+    assert_eq!(store.get(local).unwrap().origin_sequence, 1);
 }
 
 #[test]
@@ -1299,6 +1330,7 @@ fn count_widths_compile_and_saturate() {
         incarnation: 1,
         count: u16::MAX,
         last_update_millis: 0,
+        origin_sequence: 1,
     });
     s16.ingest_local(&obs, &mut sink);
     // Add more hits — should saturate at u16::MAX, no overflow.
@@ -1312,6 +1344,7 @@ fn count_widths_compile_and_saturate() {
         incarnation: 1,
         count: 1,
         last_update_millis: 0,
+        origin_sequence: 1,
     });
     s16.ingest_local(&obs2, &mut sink2);
     // No raise because already at MAX.
@@ -1340,6 +1373,7 @@ fn count_widths_compile_and_saturate() {
         incarnation: 1,
         count: 1_000_000_000_000,
         last_update_millis: 0,
+        origin_sequence: 1,
     });
     s64.merge_remote(&obs64, &mut sink64);
     assert_eq!(sink64.current[0], 1_000_000_000_000);
@@ -2214,6 +2248,7 @@ fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
             incarnation: 1,
             count: row.hits,
             last_update_millis: 0,
+            origin_sequence: 1,
         });
         let mut sink = DeltaSink::<u16>::with_capacity(1);
         store.ingest_local(&obs, &mut sink);

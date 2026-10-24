@@ -18,6 +18,9 @@ pub struct Observation<C: Count> {
     pub incarnation: Incarnation,
     pub count: C,
     pub last_update_millis: u64,
+    /// The sequence the origin stamped on this version of the cell. Ignored
+    /// by `ingest_local`, which stamps its own.
+    pub origin_sequence: u64,
 }
 
 /// SoA input for `ingest_local` / `merge_remote`. For `ingest_local`, the
@@ -32,6 +35,7 @@ pub struct ObservationBatch<C: Count> {
     pub incarnations: Vec<Incarnation>,
     pub counts: Vec<C>,
     pub last_update_millis: Vec<u64>,
+    pub origin_sequences: Vec<u64>,
 }
 
 impl<C: Count> ObservationBatch<C> {
@@ -44,6 +48,7 @@ impl<C: Count> ObservationBatch<C> {
             incarnations: Vec::with_capacity(capacity),
             counts: Vec::with_capacity(capacity),
             last_update_millis: Vec::with_capacity(capacity),
+            origin_sequences: Vec::with_capacity(capacity),
         }
     }
 
@@ -55,6 +60,7 @@ impl<C: Count> ObservationBatch<C> {
         debug_assert_eq!(self.incarnations.len(), n);
         debug_assert_eq!(self.counts.len(), n);
         debug_assert_eq!(self.last_update_millis.len(), n);
+        debug_assert_eq!(self.origin_sequences.len(), n);
     }
 
     pub fn len(&self) -> usize {
@@ -73,6 +79,7 @@ impl<C: Count> ObservationBatch<C> {
         self.incarnations.clear();
         self.counts.clear();
         self.last_update_millis.clear();
+        self.origin_sequences.clear();
     }
 
     /// Append one observation row. Caller must keep all columns the same
@@ -85,6 +92,7 @@ impl<C: Count> ObservationBatch<C> {
         self.incarnations.push(row.incarnation);
         self.counts.push(row.count);
         self.last_update_millis.push(row.last_update_millis);
+        self.origin_sequences.push(row.origin_sequence);
     }
 }
 

@@ -565,7 +565,7 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
 /// Deterministic regression for the partition-heal stuck-cell flake. These
 /// records are a captured `PartitionCase` counterexample: node 3's
 /// `(rule 0, key 0)` cell never reached node 1 because the peer-frontier
-/// high-watermark sat at that cell's (locally re-stamped) sequence, so every
+/// high-watermark sat at that cell's sequence, so every
 /// send lane — including repair — pruned it via `peer_lacks`. With the repair
 /// lane ungated (see `CellStore::fill_gossip_frame`) the cluster
 /// converges. Pinned as a fast `#[test]` so the fix cannot regress behind the
