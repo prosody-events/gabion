@@ -31,6 +31,7 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 
 mod mock;
+mod rounds;
 mod zones;
 
 // -- in-memory aggregate store ----------------------------------------------

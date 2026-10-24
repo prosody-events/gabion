@@ -119,6 +119,9 @@ where
     send_free: Vec<u8>,
 
     peers: Vec<Peer>,
+    /// The peer the next round serves first: where the last round stopped
+    /// when the socket pushed back, so no peer is starved by its position.
+    next_peer: usize,
 
     // Pending reply for the in-flight limit request. Sent after the
     // bottom-of-loop apply so callers observe "ack ⇒ AggregateStore reflects
@@ -325,6 +328,7 @@ where
             send_pending,
             send_free,
             peers,
+            next_peer: 0,
             pending_reply: None,
             decode_reject_count: 0,
             max_send_pending_depth: 0,
@@ -429,9 +433,9 @@ where
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
                 ArmOutcome::Admin(None) => self.admin_rx = None,
-                ArmOutcome::Heartbeat => self.handle_gossip_round(Round::Heartbeat),
-                ArmOutcome::Threshold => self.handle_gossip_round(Round::Threshold),
-                ArmOutcome::Relay => self.handle_gossip_round(Round::Relay),
+                ArmOutcome::Heartbeat => self.handle_gossip_round(Round::Heartbeat)?,
+                ArmOutcome::Threshold => self.handle_gossip_round(Round::Threshold)?,
+                ArmOutcome::Relay => self.handle_gossip_round(Round::Relay)?,
             }
 
             // One apply per iteration covering both row sources. CRDT-free
@@ -658,19 +662,15 @@ where
     }
 
     fn drain_one_send(&mut self) -> Result<(), GossipError> {
-        let Some((dst, slot)) = self.send_pending.pop_front() else {
-            return Ok(());
-        };
-        let buf = &self.send_pool[slot as usize];
-        match self.transport.try_send_to(buf.as_bytes(), dst) {
-            Ok(_) => self.send_free.push(slot),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.send_pending.push_front((dst, slot));
-            }
-            Err(e) => {
-                self.send_free.push(slot);
-                return Err(e.into());
-            }
+        let Self {
+            transport,
+            send_pool,
+            send_pending,
+            send_free,
+            ..
+        } = self;
+        if let Some(slot) = send_queued(transport, send_pool, send_pending, send_free)? {
+            send_free.push(slot);
         }
         Ok(())
     }
@@ -792,7 +792,7 @@ where
     /// A `Relay` round sends only the relay stream. Heartbeat rounds also
     /// ack peers that sent data and received nothing from us to piggyback
     /// the ack on.
-    fn handle_gossip_round(&mut self, round: Round) {
+    fn handle_gossip_round(&mut self, round: Round) -> Result<(), GossipError> {
         let now_ms = self.clock.now_millis();
         if round != Round::Relay {
             // Step 0: bump the total-ticks counter. Tracked unconditionally
@@ -807,8 +807,8 @@ where
             self.relay_pending = false;
         }
 
-        if self.store.is_empty() || self.peers.is_empty() || self.send_free.is_empty() {
-            return;
+        if self.store.is_empty() || self.peers.is_empty() {
+            return Ok(());
         }
         if round != Round::Relay {
             // The store was non-empty when this tick fired — bench harness
@@ -862,24 +862,28 @@ where
             .filter(|&sent| sent < self.relay_head);
         self.gather_streams(own_floor, relay_floor);
 
-        // Step 4: send, peer by peer.
+        // Step 4: send, peer by peer, starting where the socket last pushed
+        // back.
         let mut recipients = 0;
-        for i in 0..self.peers.len() {
-            if self.send_free.is_empty() {
-                break;
-            }
+        let n = self.peers.len();
+        let first = self.next_peer % n;
+        for i in (first..n).chain(0..first) {
             let in_zone = self.peers[i].zone == local_zone;
-            let mut sent = false;
+            let mut sent = Sent::Nothing;
             if round != Round::Relay && (in_zone || self.peers[i].gateway) {
-                sent |= self.send_stream(i, StreamKind::Own, now_ms);
+                sent = sent.or(self.send_stream(i, StreamKind::Own, now_ms)?);
             }
             if in_zone {
-                sent |= self.send_stream(i, StreamKind::Relay, now_ms);
+                sent = sent.or(self.send_stream(i, StreamKind::Relay, now_ms)?);
             }
-            if round == Round::Heartbeat && !sent && self.peers[i].ack_due {
-                sent = self.send_ack(i);
+            if round == Round::Heartbeat && sent == Sent::Nothing && self.peers[i].ack_due {
+                sent = self.send_ack(i)?;
             }
-            recipients += usize::from(sent);
+            if sent == Sent::Blocked {
+                self.next_peer = i;
+                break;
+            }
+            recipients += usize::from(sent == Sent::Data);
         }
         if recipients > 0 {
             self.last_effective_fanout = recipients;
@@ -899,6 +903,7 @@ where
                 }
             }
         }
+        Ok(())
     }
 
     /// Rebuild `own_scratch` / `relay_scratch`: the live cells of each stream
@@ -931,8 +936,13 @@ where
     }
 
     /// Send peer `pi` the cells of `stream` above what we already sent it, up
-    /// to `max_cells_per_tick`. Returns whether a packet was queued.
-    fn send_stream(&mut self, pi: usize, stream: StreamKind, now_ms: u64) -> bool {
+    /// to `max_cells_per_tick`.
+    fn send_stream(
+        &mut self,
+        pi: usize,
+        stream: StreamKind,
+        now_ms: u64,
+    ) -> Result<Sent, GossipError> {
         let candidates = match stream {
             StreamKind::Own => &self.own_scratch,
             StreamKind::Relay => &self.relay_scratch,
@@ -953,7 +963,7 @@ where
             self.frame_stamps.push(seq);
         }
         if self.frame_handles.is_empty() {
-            return false;
+            return Ok(Sent::Nothing);
         }
         let header = self.header_for(
             pi,
@@ -965,12 +975,16 @@ where
             out.sent,
         );
         let dst = self.peers[pi].addr;
-        let consumed = self.encode_packets_for(dst, header);
+        let (consumed, blocked) = self.encode_packets_for(dst, header)?;
         let Some(&upper) = consumed
             .checked_sub(1)
             .and_then(|last| self.frame_stamps.get(last))
         else {
-            return false;
+            return Ok(if blocked {
+                Sent::Blocked
+            } else {
+                Sent::Nothing
+            });
         };
         let peer = &mut self.peers[pi];
         match stream {
@@ -978,13 +992,19 @@ where
             StreamKind::Relay => peer.relay.note_sent(upper, now_ms),
         }
         peer.ack_due = false;
-        true
+        Ok(if blocked { Sent::Blocked } else { Sent::Data })
     }
 
     /// Send peer `pi` a header-only packet carrying our acks.
-    fn send_ack(&mut self, pi: usize) -> bool {
-        let Some(slot) = self.send_free.pop() else {
-            return false;
+    fn send_ack(&mut self, pi: usize) -> Result<Sent, GossipError> {
+        let Some(slot) = take_send_slot(
+            &self.transport,
+            &self.send_pool,
+            &mut self.send_pending,
+            &mut self.send_free,
+        )?
+        else {
+            return Ok(Sent::Blocked);
         };
         let header = self.header_for(pi, 0, 0);
         let buf = &mut self.send_pool[slot as usize];
@@ -992,7 +1012,7 @@ where
         let peer = &mut self.peers[pi];
         peer.ack_due = false;
         self.send_pending.push_back((peer.addr, slot));
-        true
+        Ok(Sent::Ack)
     }
 
     /// The header for a packet to peer `pi`: our identity, the acks we owe it,
@@ -1015,9 +1035,14 @@ where
     }
 
     /// Encode `frame_handles` (stamped by `frame_stamps`) into send slots for
-    /// `dst`. Returns how many handles went into queued packets; the rest wait
-    /// for the next round.
-    fn encode_packets_for(&mut self, dst: SocketAddr, header: wire::Header) -> usize {
+    /// `dst`. Returns how many handles went into queued packets, and whether
+    /// the socket pushed back before all of them did; the rest wait for the
+    /// next round.
+    fn encode_packets_for(
+        &mut self,
+        dst: SocketAddr,
+        header: wire::Header,
+    ) -> Result<(usize, bool), GossipError> {
         let packets_result = match self.config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
                 header,
@@ -1037,15 +1062,30 @@ where
         };
         let mut packets = match packets_result {
             Ok(p) => p.with_stamps(&self.frame_stamps),
-            Err(_) => return 0,
+            Err(_) => return Ok((0, false)),
         };
 
         let mut consumed = 0;
-        loop {
-            let Some(slot) = self.send_free.pop() else {
-                // Out of send slots: the rest of the frame waits a round.
-                packets.abandon();
-                break;
+        let mut blocked = false;
+        while packets.remaining() > 0 {
+            let slot = match take_send_slot(
+                &self.transport,
+                &self.send_pool,
+                &mut self.send_pending,
+                &mut self.send_free,
+            ) {
+                Ok(Some(slot)) => slot,
+                Ok(None) => {
+                    // The socket pushed back: the rest of the frame waits a
+                    // round.
+                    packets.abandon();
+                    blocked = true;
+                    break;
+                }
+                Err(e) => {
+                    packets.abandon();
+                    return Err(e);
+                }
             };
             let buf = &mut self.send_pool[slot as usize];
             match packets.next_into(buf) {
@@ -1065,7 +1105,71 @@ where
             }
         }
         drop(packets);
-        consumed
+        Ok((consumed, blocked))
+    }
+}
+
+/// A free send slot. When every slot holds a queued packet, the oldest is
+/// handed to the socket first: one round can owe a zone more packets than the
+/// pool holds (two streams to each of 100 peers), and the queue exists only to
+/// absorb socket backpressure. `None` when the socket pushes back.
+fn take_send_slot<T: GossipTransport>(
+    transport: &T,
+    pool: &[PacketBuf],
+    pending: &mut VecDeque<(SocketAddr, u8)>,
+    free: &mut Vec<u8>,
+) -> Result<Option<u8>, GossipError> {
+    match free.pop() {
+        Some(slot) => Ok(Some(slot)),
+        None => send_queued(transport, pool, pending, free),
+    }
+}
+
+/// Hand the oldest queued packet to the socket. Returns its slot once sent,
+/// or `None` when nothing is queued or the socket pushes back (the packet then
+/// stays at the head of the queue).
+fn send_queued<T: GossipTransport>(
+    transport: &T,
+    pool: &[PacketBuf],
+    pending: &mut VecDeque<(SocketAddr, u8)>,
+    free: &mut Vec<u8>,
+) -> Result<Option<u8>, GossipError> {
+    let Some((dst, slot)) = pending.pop_front() else {
+        return Ok(None);
+    };
+    match transport.try_send_to(pool[slot as usize].as_bytes(), dst) {
+        Ok(_) => Ok(Some(slot)),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            pending.push_front((dst, slot));
+            Ok(None)
+        }
+        Err(e) => {
+            free.push(slot);
+            Err(e.into())
+        }
+    }
+}
+
+/// What a round sent one peer.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Sent {
+    Nothing,
+    Ack,
+    Data,
+    /// The socket pushed back before the peer's packets were all queued.
+    Blocked,
+}
+
+impl Sent {
+    /// Combine the outcomes of two sends to one peer: a push-back dominates,
+    /// then data.
+    fn or(self, other: Sent) -> Sent {
+        match (self, other) {
+            (Sent::Blocked, _) | (_, Sent::Blocked) => Sent::Blocked,
+            (Sent::Data, _) | (_, Sent::Data) => Sent::Data,
+            (Sent::Ack, _) | (_, Sent::Ack) => Sent::Ack,
+            (Sent::Nothing, Sent::Nothing) => Sent::Nothing,
+        }
     }
 }
 
