@@ -167,6 +167,35 @@ fn a_gap_is_reported_after_its_hold_and_again_until_filled() {
 }
 
 #[test]
+fn a_late_packet_from_below_closes_a_reordered_gap() {
+    let mut inbound = Inbound::default();
+    inbound.receive(10, 20, 100, 5);
+    assert!(inbound.gap());
+    inbound.receive(0, 10, 101, 5);
+    assert_eq!(inbound.have, 20, "the stashed range joins what is held");
+    assert!(!inbound.gap(), "reordering is not loss");
+}
+
+#[test]
+fn a_gap_nobody_answers_is_dropped_after_its_reports() {
+    let mut inbound = Inbound::default();
+    inbound.receive(0, 4, 0, 5);
+    inbound.receive(6, 9, 1, 5);
+    let mut now = 6;
+    for _ in 0..GOSSIP_GAP_REPORTS {
+        assert!(inbound.gap());
+        assert!(inbound.report_due(now));
+        inbound.reported(now, 20);
+        now += 20;
+    }
+    assert!(!inbound.gap(), "the sender never answered");
+    assert_eq!(inbound.have, 4);
+    assert_eq!(inbound.seen(), 4);
+    inbound.receive(7, 12, now, 5);
+    assert!(inbound.gap(), "a later packet beyond the hole reopens it");
+}
+
+#[test]
 fn sweep_sources_are_the_top_ranked_members_of_the_zone() {
     let peers: Vec<Peer> = [
         "10.0.0.2:1",

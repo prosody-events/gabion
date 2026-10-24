@@ -19,6 +19,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 
+use arrayvec::ArrayVec;
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
@@ -137,7 +138,7 @@ where
     /// and when a zone member leaves before ever reaching us.
     sweep_wanted: bool,
     /// Sweep requests being answered; at most `GOSSIP_SWEEP_CONCURRENCY`.
-    sweeps: Vec<Sweep>,
+    sweeps: ArrayVec<Sweep, GOSSIP_SWEEP_CONCURRENCY>,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
@@ -353,7 +354,7 @@ where
             resend_pending: false,
             gaps_open: false,
             sweep_wanted: true,
-            sweeps: Vec::with_capacity(GOSSIP_SWEEP_CONCURRENCY),
+            sweeps: ArrayVec::new(),
             send_pool,
             send_pending,
             send_free,
@@ -771,11 +772,12 @@ where
     fn accept_sweep(&mut self, src: SocketAddr) {
         if Zone::of(src, self.config.zone_prefix_len) != self.local_zone
             || self.sweeps.iter().any(|s| s.dst == src)
-            || self.sweeps.len() >= GOSSIP_SWEEP_CONCURRENCY
         {
             return;
         }
-        self.sweeps.push(Sweep { dst: src, next: 0 });
+        // A full table drops the request; the requester's other sweep peers
+        // still answer.
+        let _ = self.sweeps.try_push(Sweep { dst: src, next: 0 });
     }
 
     /// Ask the top-ranked zone members for their live window, once there are

@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 
 use crate::crdt::{Incarnation, NodeId};
-use crate::defaults::GOSSIP_SWEEP_PEERS;
+use crate::defaults::{GOSSIP_GAP_REPORTS, GOSSIP_SWEEP_PEERS};
 
 use super::topology::{Zone, rendezvous_weight};
 
@@ -86,22 +86,43 @@ pub(super) struct Inbound {
     pub(super) have: u64,
     /// Highest sequence any packet closed; above `have` while a gap is open.
     seen: u64,
+    /// The range `(lower, upper]` held beyond a gap, which a late packet from
+    /// below can join to `have`: packets of one round arrive out of order
+    /// without any of them having been lost.
+    stash: Option<(u64, u64)>,
     /// When the open gap is next reported to the sender, if one is open.
     report_at: Option<u64>,
+    /// Reports sent for the open gap so far.
+    reports: u8,
 }
 
 impl Inbound {
     /// Take in a packet closing `(lower, upper]`. A packet that starts above
-    /// `have` follows a lost one: it opens (or extends) a gap, which is
-    /// reported once it has stayed open `hold_ms`, longer than packets of one
-    /// round can be reordered by.
+    /// `have` follows a lost or late one: it opens (or extends) a gap, which
+    /// is reported once it has stayed open `hold_ms`, longer than packets of
+    /// one round can be reordered by.
     pub(super) fn receive(&mut self, lower: u64, upper: u64, now_ms: u64, hold_ms: u64) {
         if lower <= self.have {
             self.have = self.have.max(upper);
+        } else {
+            // Joined to the stash when they touch; of two disjoint ranges the
+            // higher is kept, and the sender's resend covers the other.
+            self.stash = match self.stash {
+                Some((lo, hi)) if lower <= hi && upper >= lo => {
+                    Some((lo.min(lower), hi.max(upper)))
+                }
+                Some((_, hi)) if hi > upper => self.stash,
+                _ => Some((lower, upper)),
+            };
+        }
+        if let Some((_, hi)) = self.stash.filter(|&(lo, _)| lo <= self.have) {
+            self.have = self.have.max(hi);
+            self.stash = None;
         }
         self.seen = self.seen.max(upper);
         if self.have >= self.seen {
             self.report_at = None;
+            self.reports = 0;
         } else {
             self.report_at.get_or_insert(now_ms + hold_ms);
         }
@@ -123,9 +144,22 @@ impl Inbound {
     }
 
     /// The gap was reported; report it again after `retry_ms` if it is still
-    /// open then (the report or the resend it asked for was lost).
+    /// open then (the report or the resend it asked for was lost). After
+    /// [`GOSSIP_GAP_REPORTS`] reports the gap is dropped: a sender that no
+    /// longer sends this stream here (it moved its gateway, or left) never
+    /// answers, and one that does is repaired by its retransmission timeout
+    /// and reopens the gap with its next packet.
     pub(super) fn reported(&mut self, now_ms: u64, retry_ms: u64) {
-        if self.report_at.is_some() {
+        if self.report_at.is_none() {
+            return;
+        }
+        self.reports += 1;
+        if self.reports >= GOSSIP_GAP_REPORTS {
+            self.seen = self.have;
+            self.stash = None;
+            self.report_at = None;
+            self.reports = 0;
+        } else {
             self.report_at = Some(now_ms + retry_ms);
         }
     }

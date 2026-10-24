@@ -75,6 +75,13 @@ pub const GOSSIP_RTO_FLOOR_MS: u64 = 500;
 /// local peer.
 pub const GOSSIP_RELAY_FLOOR_MS: u64 = 5;
 
+/// Times a receiver reports one open gap in a peer's stream (`edge-nack`)
+/// before dropping it, at four relay floors apart. A sender that still sends
+/// the stream answers the first report; one that stopped (it moved its gateway
+/// to another member, or left) never would, and would otherwise be reported to
+/// for as long as it stays in discovery.
+pub const GOSSIP_GAP_REPORTS: u8 = 4;
+
 /// Members of its zone a node asks for their live window when it joins, or
 /// when a zone member leaves before ever reaching it (`pull-sweep-join`).
 pub const GOSSIP_SWEEP_PEERS: usize = 2;

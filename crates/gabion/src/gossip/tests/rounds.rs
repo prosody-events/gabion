@@ -142,6 +142,56 @@ fn a_reported_gap_is_resent_before_the_retransmission_timeout() {
     });
 }
 
+/// A gateway that sees a gap in an origin's stream, after the origin has
+/// moved on to a better-ranked gateway, reports it a few times and gives up:
+/// the origin no longer sends that stream there, so no resend would ever
+/// close it.
+#[test]
+fn a_gap_report_stops_when_the_origin_moves_to_another_gateway() {
+    run_paused(async {
+        let origin = SocketAddr::from(([10, 0, 0, 1], 7946));
+        let mut zone: Vec<SocketAddr> = (1..=2)
+            .map(|i| SocketAddr::from(([10, 1, 0, i], 7946)))
+            .collect();
+        zone.sort_by_key(|&m| std::cmp::Reverse(rendezvous_weight(NodeId(0xC000), m)));
+        let (top, low) = (zone[0], zone[1]);
+        let addrs = [origin, low, top];
+        let router = SimRouter::new();
+        let nodes = Nodes::start(&router, &addrs, |i, c| {
+            if i == 0 {
+                // The origin has not yet discovered the better gateway.
+                c.bootstrap_peers.retain(|&p| p != top);
+            }
+        });
+        sim_advance_ticks(Duration::from_millis(100), 5).await;
+        router.set_link_policy(origin, low, LinkPolicy::Block);
+        nodes.clients[0]
+            .record(rule_fp(0), KeyHash(1), 0, 2, 0, 0)
+            .await
+            .expect("record");
+        sim_advance_ticks(Duration::from_millis(10), 2).await;
+        router.set_link_policy(origin, low, LinkPolicy::Pass);
+        nodes.clients[0]
+            .record(rule_fp(0), KeyHash(2), 0, 2, 0, 0)
+            .await
+            .expect("record");
+        nodes.events[0]
+            .send(PeerEvent::Added(Peer::new(top)))
+            .expect("discovery open");
+        sim_advance_ticks(Duration::from_millis(100), 20).await;
+        assert_eq!(nodes.lagging(4), Vec::<usize>::new(), "everyone converges");
+
+        let before = router.received_count(origin);
+        sim_advance_ticks(Duration::from_millis(100), 100).await;
+        assert_eq!(
+            router.received_count(origin),
+            before,
+            "the quiet cluster hears no more reports about the abandoned stream",
+        );
+        nodes.stop().await;
+    });
+}
+
 /// A gateway that takes over forwards the origin's whole live window into
 /// its zone, even the cells it already holds: the previous gateway may have
 /// relayed them to every member but one it did not know of.

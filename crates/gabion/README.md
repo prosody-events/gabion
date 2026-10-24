@@ -83,7 +83,12 @@ zone from its address.
   an earlier one. Once that gap has stayed open for one `relay_floor` (longer than
   packets of one round can be reordered by) it reports the gap to the sender, on its
   next packet to it or alone in a header-only packet, and repeats the report every
-  four relay floors while the gap stays open. The sender resumes that stream from the
+  four relay floors while the gap stays open, and drops the gap after `GOSSIP_GAP_REPORTS`
+  (4) reports: a sender that moved its gateway elsewhere never answers, and one that
+  still sends is repaired by the timeout below and reopens the gap with its next
+  packet. A range that arrives ahead of an earlier, late packet is held aside and
+  joins the acked prefix when the late packet fills the hole, so reordering costs no
+  report. The sender resumes that stream from the
   receiver's ack at its next prompt round. Behind that, a stream with data in flight
   for `max(2 * RTT_est, rto_floor)` (500 ms floor, `RTT_est` a per-peer smoothed round
   trip from one timed in-flight packet, never taken across a resend) resumes from the
@@ -124,6 +129,8 @@ zone from its address.
   gap, so the receiver reports it with one of two header flags (`FLAG_GAP_OWN`,
   `FLAG_GAP_RELAY`) next to the cumulative ack, and the sender resends at once. The
   timeout and failover stay as specified: a report never marks a gateway suspect.
+  The component is always on in this arm; the baseline arm (tag `sim-baseline/az-hier`)
+  is what separates the two; so does `pull-sweep-join` below.
 - *Join sweeps* (component `pull-sweep-join`). The source designs say nothing about a
   member that joins: it waits for every peer to learn of it from discovery before
   their streams reach it, and a zone member that left before learning of it took
@@ -133,7 +140,9 @@ zone from its address.
   zone member leaves without ever having sent it a packet. The answer
   (`FLAG_SWEEP`, outside any stream, never acked or relayed) is paced at
   `GOSSIP_SWEEP_CELLS_PER_ROUND` (256) cells per prompt round, and a node answers at
-  most `GOSSIP_SWEEP_CONCURRENCY` (4) requests at once. A request from another zone
+  most `GOSSIP_SWEEP_CONCURRENCY` (4) requests at once (a request beyond that is dropped
+  and not retried: the requester's other sweep peer answers it, and the streams
+  reach it in the end). A request from another zone
   is ignored, so cells still cross a zone boundary only from an origin to its gateway.
   The requester need not be in the answering node's discovery yet; answering it is a
   reply to a request, and it does not make the requester a member or a stream peer.
