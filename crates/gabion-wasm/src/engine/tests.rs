@@ -365,9 +365,9 @@ fn many_nodes_receive_every_tick_deterministically() {
     assert_eq!(run(), first, "tick delivery must be deterministic at N=32");
 }
 
-/// A node added after the cluster has converged starts cold and catches up to
-/// the cluster total at the key's next change, when its owner broadcasts the
-/// key's whole state; it appears in snapshots under a fresh stable id (`N`, the
+/// A node added after the cluster has converged catches up to the cluster
+/// total from the owners' snapshots, with no further hit, and converges on the
+/// key's next change; it appears in snapshots under a fresh stable id (`N`, the
 /// next never-reused id) without renumbering any survivor.
 #[test]
 fn added_node_catches_up_by_gossip() {
@@ -392,8 +392,14 @@ fn added_node_catches_up_by_gossip() {
             vec![0, 1, 2, 3],
             "ids are stable; the newcomer is 3, not a renumber"
         );
-        let newcomer = joined.nodes.iter().find(|n| n.id == 3).unwrap();
-        assert_eq!(newcomer.aggregate_total, 0, "the newcomer starts cold");
+        // The newcomer asks the owners for snapshots, and owners that discover
+        // it hand it theirs: it catches up with no further hit.
+        for _ in 0..3 {
+            step(&tx, 100).await;
+        }
+        let caught_up = snapshot(&tx).await;
+        let newcomer = caught_up.nodes.iter().find(|n| n.id == 3).unwrap();
+        assert_eq!(newcomer.aggregate_total, 50, "the newcomer catches up");
 
         // The key's next hit makes its owner broadcast the key to every peer.
         submit(&tx, 0, WATCHED_KEY, 1).await;
