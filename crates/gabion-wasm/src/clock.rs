@@ -12,6 +12,11 @@
 //! queues (unlike a `watch`, which coalesces and would silently drop a tick a
 //! busy runtime hadn't polled yet), so every fired tick is delivered exactly
 //! once — the determinism the shareable-URL replay relies on.
+//!
+//! The runtime's first ticker is its heartbeat and gets that inbox. Any later
+//! ticker (the runtime's prompt-round pacer) never fires: one engine step is
+//! one gossip round, so the work a prompt round would do early (relaying,
+//! gap reports, sweeps) rides the next heartbeat instead.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -29,8 +34,8 @@ pub type SharedNow = Rc<Cell<u64>>;
 /// node by the engine; not `Clone` (the `mpsc::Receiver` is single-consumer).
 pub struct ManualClock {
     now: SharedNow,
-    /// Taken once by [`Clock::ticker`]; `RefCell<Option<_>>` so the `&self`
-    /// trait method can move the receiver out.
+    /// Taken by the first [`Clock::ticker`]; `RefCell<Option<_>>` so the
+    /// `&self` trait method can move the receiver out.
     tick_rx: RefCell<Option<mpsc::Receiver<()>>>,
 }
 
@@ -56,23 +61,23 @@ impl Clock for ManualClock {
     }
 
     fn ticker(&self, _interval: Duration) -> ManualTicker {
-        let rx = self
-            .tick_rx
-            .borrow_mut()
-            .take()
-            .expect("ManualClock::ticker called more than once");
-        ManualTicker(rx)
+        ManualTicker(self.tick_rx.borrow_mut().take())
     }
 }
 
-/// Resolves once per queued tick. After the engine drops the sender, parks
-/// forever rather than spinning the select loop on a closed channel.
-pub struct ManualTicker(mpsc::Receiver<()>);
+/// Resolves once per queued tick. After the engine drops the sender, or for
+/// a ticker without the inbox, parks forever rather than spinning the select
+/// loop on a closed channel.
+pub struct ManualTicker(Option<mpsc::Receiver<()>>);
 
 impl Ticker for ManualTicker {
     // `async fn` in the impl satisfies the trait's `-> impl Future` signature.
     async fn tick(&mut self) {
-        if self.0.recv().await.is_none() {
+        let fired = match &mut self.0 {
+            Some(rx) => rx.recv().await.is_some(),
+            None => false,
+        };
+        if !fired {
             std::future::pending::<()>().await;
         }
     }

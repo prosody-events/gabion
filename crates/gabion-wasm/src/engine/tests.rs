@@ -201,26 +201,25 @@ fn submit_creates_and_gossips_a_cell() {
     });
 }
 
-/// The adaptive-decision outputs reach the snapshot. The runtime sizes its
-/// per-tick fanout by the coverage threshold `⌈ln(peers) + c⌉` — driven by
-/// cluster size, not the dirty set — so a node in a 12-member cluster (11
-/// peers) fans out above the configured floor of 2, and the effective/peak
-/// fanout and the error budget all surface on the node: the metrics whose
-/// absence made the adaptation invisible in the inspector.
+/// The adaptive-decision outputs reach the snapshot. A node sends its own
+/// cells to every peer in its zone (and one gateway per other zone), whatever
+/// the configured fanout or the dirty set. Every visualizer node shares one
+/// address block, so the cluster is one zone and a node in a 12-member
+/// cluster reaches all 11 peers; the effective/peak fanout and the error
+/// budget all surface on the node.
 #[test]
-fn coverage_fanout_and_budget_surface_in_snapshot() {
+fn fanout_and_budget_surface_in_snapshot() {
     let config = SimConfig {
         fanout: 2,
         rule_limit: 1_000,
         target_err_bps: 100,
         ..test_config(12)
     };
-    // 12 members → 11 peers per node → coverage `⌈ln(11) + c⌉`, well above
-    // the configured floor of 2. The dirty set does not move it.
-    let expected = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
+    // 12 members in one zone → 11 peers per node, all of them recipients.
+    let expected = 11;
     with_engine(config, |tx| async move {
-        // A 16-key burst makes the dirty set large; the coverage fanout
-        // ignores it — the burst rides one fat frame, not a wider peer pick.
+        // A 16-key burst makes the dirty set large; the recipients do not
+        // change — the burst rides one fat frame per peer.
         for key in 0..16u128 {
             submit(&tx, 0, key, 7).await;
         }
@@ -235,8 +234,8 @@ fn coverage_fanout_and_budget_surface_in_snapshot() {
             .expect("node 0 present");
         assert_eq!(
             origin.effective_fanout, expected,
-            "a 12-member cluster fans out to the coverage threshold ⌈ln(11)+c⌉={expected}, \
-             independent of the dirty set; got {}",
+            "a node of a 12-member zone sends to its {expected} zone peers, independent of the \
+             dirty set; got {}",
             origin.effective_fanout,
         );
         assert!(
@@ -549,26 +548,21 @@ fn churn_script_is_deterministic() {
     );
 }
 
-/// A single `step` is a single gossip round: a brand-new count must not reach
-/// more than `fanout` other nodes in one step. Before the delivery-barrier fix
-/// the step driver interleaved tick-consumption with packet delivery, so a peer
-/// that received the burst could re-gossip it within the *same* step — a
-/// hop-by-hop cascade that lit up far more than `fanout + 1` nodes per click.
+/// A single `step` is a single gossip round: the origin sends a brand-new
+/// count to every peer of its zone, and the visualizer's cluster is one zone,
+/// so one step informs all 12 nodes — and no fewer, since a zone peer never
+/// needs a second hop.
 ///
-/// `nodes = 12`, `fanout = 6`: 11 peers ⇒ coverage `⌈ln(11) + c⌉ = 6`, so the
-/// effective fanout is 6 and at most `6 + 1 = 7` nodes may know after one step.
 /// `hits` stays well under the eager-flush budget
 /// (`epsilon = rule_limit × bps / (10_000 × peers) = 1_000_000 / 1_100 ≈ 909`)
 /// so the submit itself does not gossip — the baseline below proves it.
 #[test]
-fn one_step_propagates_a_new_count_to_at_most_fanout_peers() {
+fn one_step_propagates_a_new_count_to_the_whole_zone() {
     let config = SimConfig {
         fanout: 6,
         rule_limit: 1_000_000,
         ..test_config(12)
     };
-    let effective_fanout = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
-    assert_eq!(effective_fanout, 6, "11 peers ⇒ coverage ⌈ln(11)+3⌉ = 6");
 
     // A node "knows" the count if it holds the cell (a nonzero aggregate, since
     // the single key is the only traffic).
@@ -582,37 +576,19 @@ fn one_step_propagates_a_new_count_to_at_most_fanout_peers() {
         assert_eq!(
             known(&baseline),
             1,
-            "submit alone must not gossip; only the origin knows (if this is 7 the eager-flush \
+            "submit alone must not gossip; only the origin knows (if this is 12 the eager-flush \
              threshold assumption broke — tune hits/rule_limit)"
         );
 
-        // One gossip round (one tick at the configured 100 ms interval). The
-        // origin fans out to `effective_fanout` peers and nobody re-forwards
-        // within the same step.
+        // One gossip round (one tick at the configured 100 ms interval): the
+        // origin reaches every zone peer directly.
         step(&tx, 100).await;
         let after_one = snapshot(&tx).await;
-        assert!(
-            known(&after_one) <= effective_fanout as usize + 1,
-            "one step is one round: at most fanout+1 = {} nodes may know, got {}",
-            effective_fanout + 1,
-            known(&after_one),
-        );
-        assert!(
-            known(&after_one) > 1,
-            "one step must still propagate to at least one peer"
-        );
-
-        // Further steps must eventually inform every node — the fix one-hops
-        // propagation, it does not freeze it.
-        for _ in 0..20 {
-            step(&tx, 100).await;
-        }
-        let converged = snapshot(&tx).await;
         assert_eq!(
-            known(&converged),
+            known(&after_one),
             12,
-            "enough rounds inform all 12 nodes: {:?}",
-            converged
+            "one round informs the whole zone: {:?}",
+            after_one
                 .nodes
                 .iter()
                 .map(|n| (n.id, n.aggregate_total))
