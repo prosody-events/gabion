@@ -164,7 +164,10 @@ Each is the smallest change that lets the paper's algorithm run here.
    skips starts a NACK after one `relay_floor` (datagrams of one burst reorder);
    the NACK names the window (first number and a bit mask of the missing ones)
    and repeats every `nack_retry`, at most ten times or until the packet leaves
-   the window. The sender keeps its last 512 eager packets
+   the window. A jump past the whole window is an outage (a partition, a
+   pause), not loss: the edge starts afresh rather than NACK the last 63
+   numbers of it, which the resend ring mostly no longer holds; the IHAVE and
+   repair digests catch the node up. The sender keeps its last 512 eager packets
    (`PLUMTREE_RESEND_PACKETS`) and resends the cells of a requested one, in
    their newest state, under its original number (frame kind `Resent`). A packet
    over 48 cells is not kept.

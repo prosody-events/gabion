@@ -84,8 +84,16 @@ impl Edge {
 
     /// Account for the arrival of packet `number`. Returns true when it opened
     /// a new gap.
+    ///
+    /// A jump past the whole window is an outage (a partition, a pause), not
+    /// loss: the edge starts afresh at `number`. NACKing the last 63 numbers of
+    /// an outage would resend a sliver of it from the resend ring, mostly
+    /// stale; the IHAVE and repair digests catch the node up instead.
     fn arrived(&mut self, number: u64, sender_incarnation: u32) -> bool {
-        if self.recv_last == 0 || self.recv_incarnation != sender_incarnation {
+        if self.recv_last == 0
+            || self.recv_incarnation != sender_incarnation
+            || number >= self.recv_last + 64
+        {
             *self = Self {
                 send_seq: self.send_seq,
                 recv_incarnation: sender_incarnation,
@@ -96,11 +104,7 @@ impl Edge {
             };
         } else if number > self.recv_last {
             let shift = number - self.recv_last;
-            self.recv_mask = if shift < 64 {
-                (self.recv_mask << shift) | 1
-            } else {
-                1
-            };
+            self.recv_mask = (self.recv_mask << shift) | 1;
             self.recv_last = number;
             return shift > 1;
         } else if self.recv_last - number < 64 {

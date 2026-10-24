@@ -815,9 +815,12 @@ fn the_receive_window_tracks_numbers_across_reordering_and_long_gaps() {
     assert!(!edge.arrived(13, 1), "a late packet fills its place");
     assert_eq!(edge.missing(), (0, 1 << 12));
     assert!(!edge.arrived(13, 1), "a repeat changes nothing");
-    // A jump of more than a window forgets what fell out of it.
-    assert!(edge.arrived(200, 1));
-    assert_eq!(edge.missing(), (137, (1u64 << 63) - 1));
+    // A jump within the window opens a gap (15 to 75; 12 has left the
+    // window); a jump past it is an outage, and the edge starts afresh.
+    assert!(edge.arrived(76, 1));
+    assert_eq!(edge.missing(), (13, ((1u64 << 61) - 1) << 2));
+    assert!(!edge.arrived(140, 1));
+    assert_eq!(edge.missing(), (77, 0));
 }
 
 #[test]
