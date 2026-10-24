@@ -14,11 +14,16 @@ use crate::wire::{FrameLimits, PacketBuf};
 use super::GossipError;
 use super::transport::GossipTransport;
 
+#[cfg(test)]
+mod tests;
+
 pub(super) struct SendQueue {
     pool: Box<[PacketBuf]>,
     refs: Box<[u16]>,
     free: Vec<u8>,
     pending: VecDeque<(SocketAddr, u8)>,
+    /// Datagrams skipped because every buffer was still queued.
+    exhausted: u64,
 }
 
 impl SendQueue {
@@ -30,6 +35,7 @@ impl SendQueue {
             refs: vec![0; slots].into_boxed_slice(),
             free: (0..slots).map(|slot| (slots - 1 - slot) as u8).collect(),
             pending: VecDeque::with_capacity(slots),
+            exhausted: 0,
         }
     }
 
@@ -41,9 +47,30 @@ impl SendQueue {
         self.pending.len()
     }
 
+    pub(super) fn exhausted(&self) -> u64 {
+        self.exhausted
+    }
+
     /// Take a free buffer to fill. Pair every claim with [`Self::settle`].
-    pub(super) fn claim(&mut self) -> Option<u8> {
-        self.free.pop()
+    /// With none free, counts `what` as skipped and warns on power-of-two
+    /// totals.
+    pub(super) fn claim(&mut self, what: &'static str) -> Option<u8> {
+        let slot = self.free.pop();
+        if slot.is_none() {
+            self.exhausted = self.exhausted.saturating_add(1);
+            if self.exhausted.is_power_of_two() {
+                tracing::warn!(
+                    skipped = what,
+                    send_pool_exhausted_total = self.exhausted,
+                    "Every gossip send buffer is still queued, so this node skipped a datagram; \
+                     peers learn of the update late, through IHAVE/IWANT or a later message \
+                     touching the same cells. Usually a burst of gossip traffic larger than the \
+                     send pool, or a socket that cannot keep up. Raise \
+                     `gossip.send_queue_capacity` if this repeats.",
+                );
+            }
+        }
+        slot
     }
 
     pub(super) fn buf_mut(&mut self, slot: u8) -> &mut PacketBuf {

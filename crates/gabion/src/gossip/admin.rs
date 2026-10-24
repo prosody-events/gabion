@@ -48,6 +48,9 @@ pub struct AdminSnapshot {
     /// exercised under saturation — without re-queue, the depth never
     /// rises above 1.
     pub max_send_pending_depth: usize,
+    /// Datagrams skipped because every send buffer was still queued
+    /// (`gossip.send_queue_capacity`).
+    pub send_pool_exhausted: u64,
     /// Cumulative ticks the runtime has processed. Includes both
     /// heartbeat ticks (the proactive timer) and synthetic ticks
     /// triggered by `handle_limit_request` crossing a per-rule error

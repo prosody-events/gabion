@@ -507,6 +507,7 @@ where
                     local_dirty_len: self.store.local_dirty().len(),
                     forwarded_dirty_len: self.store.forwarded_dirty().len(),
                     send_pending_depth: self.pubsub.sendq.pending_len(),
+                    send_pool_exhausted: self.pubsub.sendq.exhausted(),
                     decode_reject_count: self.decode_reject_count,
                     max_send_pending_depth: self.max_send_pending_depth,
                     ticks_total: self.ticks_total,

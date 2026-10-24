@@ -138,7 +138,7 @@ impl PubSub {
             self.seen.insert(id, now_ms);
         }
         self.mcache.insert(id, self.heartbeats, datagram);
-        let Some(slot) = self.sendq.claim() else {
+        let Some(slot) = self.sendq.claim("forward a message to the mesh") else {
             return false;
         };
         if self.sendq.buf_mut(slot).set_bytes(datagram) {
@@ -197,7 +197,7 @@ impl PubSub {
                     let Some(datagram) = self.mcache.get(id) else {
                         continue;
                     };
-                    let Some(slot) = self.sendq.claim() else {
+                    let Some(slot) = self.sendq.claim("answer an IWANT") else {
                         break;
                     };
                     if self.sendq.buf_mut(slot).set_bytes(datagram) {
@@ -236,7 +236,7 @@ impl PubSub {
     }
 
     fn send_control(&mut self, framing: &Framing<'_>, dst: SocketAddr, control: Control) {
-        let Some(slot) = self.sendq.claim() else {
+        let Some(slot) = self.sendq.claim("send a GRAFT or PRUNE") else {
             return;
         };
         let encoded = wire::encode_control(
@@ -257,8 +257,12 @@ impl PubSub {
     /// `self.targets`, one datagram per `max_ids_per_frame` ids.
     fn send_ids(&mut self, framing: &Framing<'_>, control: Control) {
         let per_frame = wire::max_ids_per_frame(framing.limits, framing.key.is_some()).max(1);
+        let what = match control {
+            Control::IHave => "send an IHAVE",
+            _ => "send an IWANT",
+        };
         for chunk in self.ids.chunks(per_frame) {
-            let Some(slot) = self.sendq.claim() else {
+            let Some(slot) = self.sendq.claim(what) else {
                 break;
             };
             let encoded = wire::encode_control(
