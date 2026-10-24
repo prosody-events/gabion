@@ -49,12 +49,13 @@ pub struct AdminSnapshot {
     pub max_send_pending_depth: usize,
     /// Cumulative ticks the runtime has processed. Includes both
     /// heartbeat ticks (the proactive timer) and synthetic ticks
-    /// triggered by `handle_limit_request` crossing a per-rule error
+    /// triggered by `handle_limit_request` crossing a key's error
     /// budget. Combined with `threshold_fires`, lets observers split
     /// the two.
     pub ticks_total: u64,
     /// Subset of `ticks_total` that were threshold-triggered — i.e. a
-    /// `LimitRequest` crossed `target_err_bps × limit / (10_000 × N)`
+    /// `LimitRequest` took its key's unemitted local hits past
+    /// `target_err_bps × limit / (10_000 × N)`
     /// and `min_emit_interval` had elapsed, so the run loop dispatched
     /// a synthetic tick without waiting for the heartbeat.
     pub threshold_fires: u64,
@@ -69,9 +70,9 @@ pub struct AdminSnapshot {
     pub last_effective_fanout: usize,
     /// High-water mark of `last_effective_fanout` since startup.
     pub peak_effective_fanout: usize,
-    /// The per-rule error budget ε the most recent `handle_limit_request`
+    /// The per-key error budget ε the most recent `handle_limit_request`
     /// computed: `limit × target_err_bps / (10_000 × peers)` (floored at 1).
-    /// A rule's accumulated `pending` crossing ε is what triggers an eager
+    /// One key's accumulated `pending` crossing ε is what triggers an eager
     /// (threshold) flush — so this is the threshold behind `threshold_fires`.
     /// `0` before the first request is seen.
     pub last_error_budget: u64,

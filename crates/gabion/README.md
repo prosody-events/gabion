@@ -324,51 +324,61 @@ admissions past the limit before the next tick. Lowering
 bandwidth on every quiet rule in the cluster.
 
 The runtime crosses this trade with a per-rule error budget.
-`GossipRuntime::handle_limit_request` keeps a small `rule_pending`
-column indexed by rule slot; each admission adds its hits. The runtime
-also computes a per-site safe zone:
+`GossipRuntime::handle_limit_request` keeps a `pending` count per
+`(rule, key)`, since a rule's limit applies to each key; each admission
+adds its hits to its key's count. The runtime also computes a per-site
+safe zone:
 
 ```
 ε_R = max(1, L_R · target_err_bps / (10_000 · N))
 ```
 
-where `L_R` is the rule's limit and `N` is the peer count. When
-`rule_pending` for that rule crosses `ε_R`, the runtime sets
+where `L_R` is the rule's limit and `N` is the peer count. When one
+key's `pending` crosses `ε_R`, the runtime sets
 `want_immediate_flush = true`. On the next loop iteration the top of
 the run loop reads that flag (instead of waiting on `tick.tick()`) and
-dispatches a synthetic gossip tick straight away. The post-emit sweep
-inside `handle_gossip_tick` zeroes the rule's pending column and stamps
-its `last_emit_ms`.
+dispatches a synthetic gossip tick straight away. As each frame is
+encoded, `handle_gossip_tick` zeroes the count of every local cell the
+frame carries and stamps its rule's `last_emit_ms`; a key whose cell did
+not fit keeps its count.
+
+The counts live in a direct-mapped table sized to the local dirty ring
+and indexed by folding the key hash the admission already computed.
+Two keys that share a slot share one count, their sum, so a collision
+brings a threshold flush forward. The one way it delays one is when
+`max_cells_per_tick` truncation frames only one of the two keys and the
+slot is cleared: the other key's count restarts, and its dirty cell goes
+out on the next tick regardless.
 
 The constant `target_err_bps` is in basis points of each rule's own
-limit, default 100 = 1 %. The cluster-wide unreplicated error per rule
+limit, default 100 = 1 %. The cluster-wide unreplicated error per key
 is then bounded by `N · ε_R` (Sharfman, Schuster & Keren, SIGMOD 2006)
 — roughly 1 % of the rule's limit, regardless of the request rate.
 
 A floor `min_emit_interval` (default 5 ms) sits in front of the flush:
 the runtime won't set `want_immediate_flush` if the gap since the last
-emit is below the floor. Under adversarial traffic ε saturates to 1 and
+fire or emit of that rule is below the floor. Under adversarial traffic ε saturates to 1 and
 every hit would otherwise emit; the floor caps the worst-case emit rate
 so a bad client cannot pin the gossip socket.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Accumulating: limit request<br/>adds hits to rule_pending
+    Idle --> Accumulating: limit request<br/>adds hits to the key's pending
     Accumulating --> Accumulating: pending ≤ ε_R
     Accumulating --> ReadyToFire: pending > ε_R
     ReadyToFire --> Idle: now − last_emit < min_emit_interval<br/>(floor blocks the emit)
     ReadyToFire --> Emit: now − last_emit ≥ min_emit_interval
-    Emit --> Idle: synthetic tick dispatched,<br/>rule_pending reset,<br/>last_emit_ms stamped
+    Emit --> Idle: synthetic tick dispatched,<br/>emitted keys' pending reset,<br/>last_emit_ms stamped
     Idle --> Emit: heartbeat tick<br/>(unconditional; drains cold rules)
 ```
 
 Three operational properties fall out of this design. The cluster-wide
-unreplicated error per rule is bounded: at the default
+unreplicated error per key is bounded: at the default
 `target_err_bps = 100`, the global error never exceeds 1 % of the
 rule's limit no matter how fast requests come in. Cold rules still
 propagate, because the heartbeat is independent of the threshold path
-and any rule whose pending count never reaches ε_R still replicates
+and any key whose pending count never reaches ε_R still replicates
 every `tick_interval`. Finally, under an adversarial workload where ε
 saturates and every hit would otherwise emit, `min_emit_interval` caps
 the worst-case emit rate; convergence still happens, but the cluster
