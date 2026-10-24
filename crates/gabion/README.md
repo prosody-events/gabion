@@ -195,8 +195,9 @@ the changed member wins or held.
    below it are missing. As soon as a broadcast shows it missed earlier
    ones, and again every `sync_wait` until they arrive, it sends the owner
    a NACK naming them, and the owner re-sends those buckets' current
-   totals (`FLAG_REPAIR`). A receiver that has not yet heard from an owner since discovering it
-   (every peer, for a node that just started), that fell more than 64
+   totals (`FLAG_REPAIR`). A receiver that has not yet heard from an owner
+   since discovering it (every peer, for a node that just started), that
+   fell more than 64
    broadcasts behind, or that asks for a broadcast the owner no longer
    remembers, gets a snapshot instead: the total of every bucket of every
    key the owner owns, as of its last broadcast, in up to 128 packets. A
@@ -289,14 +290,23 @@ adapted as little as the CRDT and UDP require:
 - **Batch limit.** Gubernator flushes a batch as soon as it holds
   `GlobalBatchLimit` keys and arms its timers on the first queued item.
   Here the sync and broadcast tickers are free-running and
-  `broadcast_batch_limit` caps the key buckets of one broadcast, leaving the rest
-  for the next tick; a sync is capped at `max_cells_per_tick` cells. Neither
-  cap is reached at the loads in the benchmark regimes.
+  `broadcast_batch_limit` caps the key buckets of one broadcast, leaving
+  the rest for the next tick; a sync is capped at `max_cells_per_tick`
+  cells. Neither cap is reached at the loads in the benchmark regimes.
 - **Queue overflow.** If the sync queue is full when a hit arrives, the
   cell is left to a sweep of every local cell at the next sync tick, so
   the hit is still re-sent until acknowledged once the queue has drained.
   The broadcast queue has no such sweep: an overflow there drops the
-  change, and the key's next change repairs it.
+  change from the broadcast until the bucket changes again (a peer's
+  snapshot still carries it).
+- **Partitions.** Discovery does not change when the network splits, so
+  ownership does not move: a pod cut off from a key's owner counts only its
+  own hits on top of what it held when the cut began, and its hits are
+  re-sent until the owner acknowledges them after the heal. This is the
+  price of a single owner per key; the zone's pods over-admit keys owned
+  across the cut. On the heal, the owners' next broadcasts show each pod
+  how far behind it fell, and repairs or snapshots close the gap (about
+  300 ms in the `az-partition` regime, seed 1).
 - **Addresses.** Owners are computed from peers' discovered addresses
   (the one identity discovery gives a node for every other), so the
   transport's local address must be the address peers discover the node
@@ -305,13 +315,14 @@ adapted as little as the CRDT and UDP require:
   `GOSSIP_BROADCAST_INTERVAL_MS` and `GOSSIP_BROADCAST_BATCH_LIMIT` in
   `gabion::defaults`; the runtime config fields are `sync_wait`,
   `broadcast_interval` and `broadcast_batch_limit`. Repair is tuned by
-  `GOSSIP_BROADCAST_HISTORY` and `GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC`, which
-  are not runtime config. The local and
-  forwarded dirty-ring capacities size the sync and broadcast queues, and
-  `peer_capacity` sizes the membership table.
+  `GOSSIP_BROADCAST_HISTORY`, `GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC` and
+  `GOSSIP_URGENT_PERCENT_OF_LIMIT`, which are not runtime config. The
+  local and forwarded dirty-ring capacities size the sync and broadcast
+  queues, and `peer_capacity` sizes the membership table.
 - **Unused knobs.** `fanout`, `rng_seed`, `target_err_bps` and
   `min_emit_interval` are accepted and ignored (there is no random
-  fanout, no random numbers and no threshold-triggered emit);
+  fanout, no random numbers and no error-budget emit; the near-limit
+  urgency reads each rule's limit from its registered descriptor);
   `tick_interval` is the period of the expiry sweep.
   `GossipClient::record`'s `rule_limit` is ignored. The admin snapshot's
   `threshold_fires` and `last_error_budget` are always zero;
