@@ -210,6 +210,7 @@ where
         self.thicket.collect_candidates();
         let dests = std::mem::take(&mut self.thicket.dests);
         let mut frame = std::mem::take(&mut self.frame_handles);
+        let stamp = self.clock.now_millis().max(1);
         let mut sent_to = 0;
         for &dest in &dests {
             frame.clear();
@@ -218,7 +219,10 @@ where
                 continue;
             }
             sent_to += 1;
-            self.send_cells(dest, &frame, Lane::Push);
+            let unsent = self.send_cells(dest, &frame, Lane::Push);
+            if include_local && unsent == 0 {
+                self.clear_emitted_pending(&frame, stamp);
+            }
             if full {
                 let addr = self.thicket.peers[usize::from(dest)].addr;
                 self.note_send_queue_full(addr, 1);
