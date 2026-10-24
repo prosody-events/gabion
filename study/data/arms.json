@@ -1,0 +1,122 @@
+[
+ {
+  "arm": "main",
+  "name": "Main (baseline)",
+  "mechanism": "Fanout \u2308ln n+3\u2309 anti-entropy rounds with peer frontier and repair lane, as on main.",
+  "order": 0,
+  "family": "Baseline",
+  "improved": "imp-main",
+  "improved_nopk": "imp-main-nopk",
+  "improved_branch": "sim/imp-main"
+ },
+ {
+  "arm": "flat-once",
+  "name": "Flat forward-once",
+  "mechanism": "Send each change once, newest first, to \u2308ln n+3\u2309 peers; receivers forward once (PR #108).",
+  "order": 1,
+  "family": "Flat epidemic",
+  "improved": "imp-flat-once",
+  "improved_nopk": "imp-flat-once-nopk",
+  "improved_branch": "sim/imp-flat-once"
+ },
+ {
+  "arm": "gossipsub",
+  "name": "GossipSub v1.1",
+  "mechanism": "Degree-D mesh push with IHAVE/IWANT gossip to non-mesh peers (scoring omitted).",
+  "order": 2,
+  "family": "Flat epidemic",
+  "improved": "imp-gossipsub",
+  "improved_nopk": "imp-gossipsub-nopk",
+  "improved_branch": "sim/imp-gossipsub"
+ },
+ {
+  "arm": "plumtree",
+  "name": "Plumtree",
+  "mechanism": "Per-origin epidemic broadcast trees: eager push on the tree, lazy IHAVE/GRAFT repair.",
+  "order": 3,
+  "family": "Trees",
+  "improved": "imp-plumtree",
+  "improved_nopk": "imp-plumtree-nopk",
+  "improved_branch": "sim/imp-plumtree"
+ },
+ {
+  "arm": "thicket",
+  "name": "Thicket",
+  "mechanism": "Several Plumtree-style trees; each node is interior in at most one.",
+  "order": 4,
+  "family": "Trees",
+  "improved": "imp-thicket",
+  "improved_nopk": "imp-thicket-nopk",
+  "improved_branch": "sim/imp-thicket"
+ },
+ {
+  "arm": "snow",
+  "name": "Snow",
+  "mechanism": "Balanced k-ary tree per root over the sorted membership ring.",
+  "order": 5,
+  "family": "Trees",
+  "improved": "imp-snow",
+  "improved_nopk": "imp-snow-nopk",
+  "improved_branch": "sim/imp-snow"
+ },
+ {
+  "arm": "direct-ack",
+  "name": "Direct mail + acks",
+  "mechanism": "Origin sends its own changes to every peer; per-peer cumulative acks drive retransmit.",
+  "order": 6,
+  "family": "Direct mail",
+  "improved": "imp-direct-ack",
+  "improved_nopk": "imp-direct-ack-nopk",
+  "improved_branch": "sim/imp-direct-ack"
+ },
+ {
+  "arm": "bimodal",
+  "name": "Bimodal Multicast",
+  "mechanism": "Unacked direct mail to every peer plus periodic digest anti-entropy repair.",
+  "order": 7,
+  "family": "Direct mail",
+  "improved": "imp-bimodal",
+  "improved_nopk": "imp-bimodal-nopk",
+  "improved_branch": "sim/imp-bimodal"
+ },
+ {
+  "arm": "az-hier",
+  "name": "AZ hierarchy",
+  "mechanism": "Direct mail within the zone; one rendezvous gateway per other zone relays.",
+  "order": 8,
+  "family": "Direct mail",
+  "improved": "imp-az-hier",
+  "improved_nopk": "imp-az-hier-nopk",
+  "improved_branch": "sim/imp-az-hier"
+ },
+ {
+  "arm": "scuttlebutt",
+  "name": "Scuttlebutt",
+  "mechanism": "Push-pull reconciliation of per-origin version digests with random peers.",
+  "order": 9,
+  "family": "Reconciliation",
+  "improved": "imp-scuttlebutt",
+  "improved_nopk": "imp-scuttlebutt-nopk",
+  "improved_branch": "sim/imp-scuttlebutt"
+ },
+ {
+  "arm": "owner-agg",
+  "name": "Owner aggregation",
+  "mechanism": "Each key's rendezvous-hash owner aggregates hits and broadcasts the total.",
+  "order": 10,
+  "family": "Aggregation",
+  "improved": "imp-owner-agg",
+  "improved_nopk": null,
+  "improved_branch": "sim/imp-owner-agg"
+ },
+ {
+  "arm": "local-only",
+  "name": "Local only (reference)",
+  "mechanism": "No dissemination at all: each pod admits on its own counts. The floor for bytes, the ceiling for error.",
+  "order": 11,
+  "family": "Reference",
+  "improved": null,
+  "improved_nopk": null,
+  "improved_branch": null
+ }
+]
