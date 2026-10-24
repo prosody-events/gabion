@@ -1250,6 +1250,30 @@ impl<C: Count> CellStore<C> {
         true
     }
 
+    /// Visit at most `max` active cells in slot order, starting at slot
+    /// `from`. Returns the slot to resume from, or `None` once the scan has
+    /// passed the last slot. Cells inserted behind the cursor while a caller
+    /// pages through the store are not visited.
+    pub fn visit_active_from(
+        &self,
+        from: u32,
+        max: usize,
+        mut visit: impl FnMut(CellHandle),
+    ) -> Option<u32> {
+        let mut visited = 0;
+        for slot in from..self.capacity {
+            if !self.is_active(slot) {
+                continue;
+            }
+            if visited == max {
+                return Some(slot);
+            }
+            visit(self.handle_for(slot));
+            visited += 1;
+        }
+        None
+    }
+
     /// Visit a fair rotating slice of active cells. Anti-entropy lane.
     pub fn visit_repair_slice(
         &mut self,

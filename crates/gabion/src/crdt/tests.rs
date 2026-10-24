@@ -2472,3 +2472,29 @@ fn visit_local_dirty_after_survives_ring_wraparound() {
     assert!(seen.windows(2).all(|w| w[0] < w[1]));
     assert_eq!(*seen.last().unwrap(), last);
 }
+
+#[test]
+fn visit_active_from_pages_through_every_active_cell_once() {
+    let mut store = small_store(16, 16);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    for key in 0..10 {
+        local_increment_one(&mut store, 0x11, key, 0, 1, 0);
+    }
+    let mut seen = Vec::new();
+    let mut from = Some(0);
+    let mut pages = 0;
+    while let Some(at) = from {
+        from = store.visit_active_from(at, 3, |h| seen.push(h));
+        pages += 1;
+    }
+    assert_eq!(pages, 4);
+    assert_eq!(seen.len(), 10);
+    assert_eq!(
+        seen.iter().map(|h| h.index).collect::<BTreeSet<_>>().len(),
+        10
+    );
+    assert_eq!(
+        store.visit_active_from(16, 3, |_| panic!("past the end")),
+        None
+    );
+}

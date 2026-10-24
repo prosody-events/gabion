@@ -68,6 +68,7 @@ acknowledgement timeout to the children that have not answered. Code:
 | tree height | `ceil(log_k((k-1)N) + 1)` | `snow::tree_height` |
 | version digest | one per heartbeat to one random peer | `runtime/pull.rs` |
 | pull retry | 2 x expected tree round trip, doubling, at most one heartbeat | `runtime/pull.rs` |
+| starting sweep | 2 random peers, one packet per request | `runtime/pull.rs` |
 
 **Adaptations to the paper**, each the smallest that makes the design run in
 gabion:
@@ -144,6 +145,15 @@ gabion:
   the whole store to one random peer, which needed far longer than a window to
   sweep a large store and was most of the bytes at low scale. The
   Plumtree-style lazy `IHAVE` backstop (`snow_lazy`) is not implemented.
+- *A starting node sweeps its peers* (study component `pull-sweep-join`,
+  `k = 2`, and the paper's join, section 4.5.1, which synchronizes the
+  newcomer with an existing node). Pulls come only from roots, so a node that
+  starts after a root has left (a rollout stops the old pod seconds after its
+  replacement starts) could never get that root's cells, which stay in the
+  window for its full length. On its first heartbeat with peers a node asks
+  two random peers for every live cell they hold, one packet per request, in
+  store order (`Sweep [6][from]`, answered by `Swept [7][from][next]` with the
+  cells), and gives a peer up after 8 unanswered requests.
 - *Acknowledgement tables hold the forwarded children.* A relay keeps the
   addresses and ranges it forwarded to, and matches acknowledgements and
   repeats against that frozen set, so a view change while a broadcast is in
@@ -159,7 +169,8 @@ gabion:
 - *Wire.* `FLAG_EXT` marks a frame whose body begins with a length-prefixed
   control extension (`wire::reframe`, `wire::encode_ext_only`): data
   `[1][root][seq][lo][hi]`, ack `[2][root][seq]`, pull `[3][after][before]`,
-  fill `[4][after][through]`. Forwarding re-frames the
+  fill `[4][after][through]`, digest `[5][entries]`, sweep `[6][from]`,
+  swept `[7][from][next]`. Forwarding re-frames the
   received cell bytes without decoding them. The extension is inside the HMAC.
 - *Scheduler unchanged.* Heartbeat and error-budget threshold rounds are
   `main`'s; a round now roots broadcasts instead of picking peers. The
@@ -188,7 +199,8 @@ seed.
 so a member known to the root but not to an interior node on the way misses
 the broadcast until a digest or the root's next broadcast shows the gap. Only
 the root serves a pull, so cells of a root that crashed before every node had
-them stay missing until they expire; and a pull reaching back past the oldest
+them stay missing until they expire (a node that starts later still gets them
+from its sweep); and a pull reaching back past the oldest
 change in the root's local dirty ring (hours at production rates) is answered
 only from what the ring still holds. The admin snapshot reports peer
 `node_id` as `None`; `last_effective_fanout` is the root's child count. The WASM

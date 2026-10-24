@@ -376,7 +376,7 @@ fn gap(after: u64, before: u64) -> Gap {
 }
 
 #[test]
-fn ctrl_roundtrips_pull_and_fill() {
+fn ctrl_roundtrips_pull_fill_and_sweep() {
     for ctrl in [
         Ctrl::Pull {
             after: 7,
@@ -391,7 +391,19 @@ fn ctrl_roundtrips_pull_and_fill() {
         let bytes = ctrl.encode(&mut buf);
         assert_eq!(bytes.len(), 17);
         assert_eq!(Ctrl::decode(bytes), Some(ctrl));
-        assert_eq!(Ctrl::decode(&bytes[..16]), None);
+        assert_eq!(Ctrl::decode(&bytes[..bytes.len() - 1]), None);
+    }
+    for ctrl in [
+        Ctrl::Sweep { from: 7 },
+        Ctrl::Swept {
+            from: 7,
+            next: SWEEP_DONE,
+        },
+    ] {
+        let mut buf = [0; CTRL_MAX_LEN];
+        let bytes = ctrl.encode(&mut buf);
+        assert_eq!(Ctrl::decode(bytes), Some(ctrl));
+        assert_eq!(Ctrl::decode(&bytes[..bytes.len() - 1]), None);
     }
 }
 

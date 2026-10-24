@@ -201,6 +201,7 @@ where
             }
         }
         self.pull_due(now);
+        self.sweep_due(now);
     }
 
     /// A tree packet could not be queued: every send buffer was in use, or
@@ -279,6 +280,8 @@ where
             Ctrl::Ack { root, seq } => self.on_ack(src, root, seq),
             Ctrl::Pull { after, before } => self.serve_pull(src, after, before),
             Ctrl::Fill { after, through } => self.on_fill(src, after, through),
+            Ctrl::Sweep { from } => self.serve_sweep(src, from),
+            Ctrl::Swept { from, next } => self.on_swept(src, from, next),
         }
     }
 

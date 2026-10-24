@@ -124,6 +124,8 @@ where
     pull_buf: PacketBuf,
     /// Builds the version digest pushed each heartbeat.
     digest_buf: Vec<u8>,
+    /// The sweep of peers' live windows this node makes when it starts.
+    join_sweep: JoinSweep,
     /// Number and highest origin sequence of the last broadcast this node
     /// rooted: its own entry in the digest.
     rooted: (u32, u64),
@@ -338,6 +340,7 @@ where
             roots,
             pull_buf,
             digest_buf: Vec::with_capacity(config_max_payload),
+            join_sweep: JoinSweep::Waiting,
             rooted: (0, 0),
             sent_seq: 0,
             last_digest_ms: 0,
@@ -399,7 +402,8 @@ where
             // would re-borrow `self` after we've already
             // split-borrowed for the I/O futures below.
             let have_send = !self.send.pending.is_empty();
-            let watch_acks = self.origins.live() > 0 || self.roots.maybe_gaps();
+            let watch_acks =
+                self.origins.live() > 0 || self.roots.maybe_gaps() || self.join_sweep.is_running();
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
 
@@ -762,6 +766,7 @@ where
         let now_millis = self.clock.now_millis();
         self.expiration_buf.clear();
         self.store.expire_at(now_millis, &mut self.expiration_buf);
+        self.start_join_sweep(now_millis);
 
         if self.store.is_empty() || self.ring.len() == 1 || self.send.free.is_empty() {
             return;
@@ -790,6 +795,8 @@ where
 
 mod pull;
 mod tree;
+
+use pull::JoinSweep;
 
 enum ArmOutcome {
     Request(Option<Request>),

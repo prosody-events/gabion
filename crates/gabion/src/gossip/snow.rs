@@ -25,7 +25,7 @@ mod roots;
 #[cfg(test)]
 mod tests;
 
-pub(super) use ctrl::{CTRL_MAX_LEN, Ctrl};
+pub(super) use ctrl::{CTRL_MAX_LEN, Ctrl, SWEEP_DONE};
 pub(super) use flight::{MAX_CHILDREN, Origins, Relay, Relays, RttEstimator, full_mask};
 pub(super) use ring::{Child, Children, Ring, tree_height};
 pub(super) use roots::Roots;
@@ -40,15 +40,16 @@ pub(super) struct TreeParams {
     pub ack_timeout_rtt_multiple: u32,
     /// Rebroadcasts a root attempts before leaving a broadcast to repair.
     pub rebroadcasts: u8,
-    /// Whether the heartbeat pushes a version digest.
-    pub digests: Digests,
+    /// Whether the random-peer anti-entropy lanes run: the heartbeat's
+    /// version digest and the sweep a starting node makes.
+    pub anti_entropy: AntiEntropy,
 }
 
-/// Whether each heartbeat pushes the node's version digest to a random peer.
-/// Production always does; tests turn it off to watch the tree alone.
+/// Whether the random-peer anti-entropy lanes run. Production always runs
+/// them; tests turn them off to watch the tree and its pulls alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Digests {
-    Push,
+pub(super) enum AntiEntropy {
+    Run,
     Off,
 }
 
@@ -62,7 +63,7 @@ impl TreeParams {
             branching: (fanout & !1).clamp(2, MAX_CHILDREN),
             ack_timeout_rtt_multiple: defaults::GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE,
             rebroadcasts: defaults::GOSSIP_ROOT_REBROADCASTS,
-            digests: Digests::Push,
+            anti_entropy: AntiEntropy::Run,
         }
     }
 }

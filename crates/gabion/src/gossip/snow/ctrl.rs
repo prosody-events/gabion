@@ -6,6 +6,8 @@
 //! pull: [ 3 ][ after u64 ][ before u64 ]           // no cells
 //! fill: [ 4 ][ after u64 ][ through u64 ]          // cells follow in the frame
 //! (kind 5 is the version digest, `digest.rs`)
+//! sweep:  [ 6 ][ from u32 ]                         // no cells
+//! swept:  [ 7 ][ from u32 ][ next u32 ]             // cells follow in the frame
 //! addr: [ 4 ][ ip 4 ][ port u16 ]  |  [ 6 ][ ip 16 ][ port u16 ]
 //! ```
 //!
@@ -15,7 +17,9 @@
 //!
 //! A pull asks the receiver for its own cells with an origin sequence
 //! strictly between `after` and `before`; the fill that answers carries them
-//! from just after `after` up to and including `through`.
+//! from just after `after` up to and including `through`. A sweep asks for
+//! every live cell the receiver holds, in store order from slot `from`; the
+//! answer says where to resume, [`SWEEP_DONE`] once it reached the end.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -25,6 +29,11 @@ const KIND_PULL: u8 = 3;
 const KIND_FILL: u8 = 4;
 /// A version digest (see `digest.rs`), which [`Ctrl::decode`] does not parse.
 pub(super) const KIND_DIGEST: u8 = 5;
+const KIND_SWEEP: u8 = 6;
+const KIND_SWEPT: u8 = 7;
+
+/// The `next` of a sweep answer that reached the end of the store.
+pub(in crate::gossip) const SWEEP_DONE: u32 = u32::MAX;
 const ADDR_V4: u8 = 4;
 const ADDR_V6: u8 = 6;
 
@@ -54,6 +63,13 @@ pub(in crate::gossip) enum Ctrl {
     Fill {
         after: u64,
         through: u64,
+    },
+    Sweep {
+        from: u32,
+    },
+    Swept {
+        from: u32,
+        next: u32,
     },
 }
 
@@ -94,6 +110,17 @@ impl Ctrl {
                     at += 8;
                 }
             }
+            Ctrl::Sweep { from } => {
+                buf[at] = KIND_SWEEP;
+                buf[at + 1..at + 5].copy_from_slice(&from.to_le_bytes());
+                at += 5;
+            }
+            Ctrl::Swept { from, next } => {
+                buf[at] = KIND_SWEPT;
+                buf[at + 1..at + 5].copy_from_slice(&from.to_le_bytes());
+                buf[at + 5..at + 9].copy_from_slice(&next.to_le_bytes());
+                at += 9;
+            }
         }
         &buf[..at]
     }
@@ -101,6 +128,16 @@ impl Ctrl {
     /// Decode an extension; `None` if it is malformed or has trailing bytes.
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let (&kind, rest) = bytes.split_first()?;
+        if let KIND_SWEEP | KIND_SWEPT = kind {
+            let (from, rest) = rest.split_first_chunk::<4>()?;
+            let from = u32::from_le_bytes(*from);
+            if kind == KIND_SWEEP {
+                return rest.is_empty().then_some(Ctrl::Sweep { from });
+            }
+            let (next, rest) = rest.split_first_chunk::<4>()?;
+            let next = u32::from_le_bytes(*next);
+            return rest.is_empty().then_some(Ctrl::Swept { from, next });
+        }
         if let KIND_PULL | KIND_FILL = kind {
             let (after, rest) = rest.split_first_chunk::<8>()?;
             let (end, rest) = rest.split_first_chunk::<8>()?;

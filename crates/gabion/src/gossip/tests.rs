@@ -25,7 +25,7 @@ use crate::discovery::{Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
-use crate::gossip::snow::{Digests, TreeParams};
+use crate::gossip::snow::{AntiEntropy, TreeParams};
 use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, parse_cluster_id};
 use crate::wire::HmacKey;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -1290,7 +1290,8 @@ async fn partition_then_heal() {
 // -- Snow broadcast tree ----------------------------------------------------
 
 /// `n` runtimes on one router, each told about every other node, with the
-/// version digests off so only the tree and its pulls move cells.
+/// random-peer anti-entropy (digests, the starting sweep) off so only the
+/// tree and its pulls move cells.
 struct TreeCluster {
     router: SimRouter,
     addrs: Vec<SocketAddr>,
@@ -1333,7 +1334,7 @@ impl TreeCluster {
                 agg.clone(),
             );
             let rt = rt.with_tree_params(|params| {
-                params.digests = Digests::Off;
+                params.anti_entropy = AntiEntropy::Off;
                 tweak(params);
             });
             cluster
@@ -1519,12 +1520,16 @@ async fn a_broadcast_lost_twice_is_pulled_from_the_root() {
     let local = LocalSet::new();
     local
         .run_until(async {
-            let router = SimRouter::new();
-            let addrs: Vec<SocketAddr> = (0..9).map(|i| sock(42_000 + i)).collect();
-            for dst in &addrs[1..] {
-                router.set_link_policy(addrs[0], *dst, LinkPolicy::DropFirst { count: 2 });
+            let cluster = TreeCluster::start(9, SimRouter::new(), |_| {});
+            // Let the starting sweeps finish before the losses begin.
+            sim_advance_ticks(Duration::from_millis(100), 2).await;
+            for dst in &cluster.addrs[1..] {
+                cluster.router.set_link_policy(
+                    cluster.addrs[0],
+                    *dst,
+                    LinkPolicy::DropFirst { count: 2 },
+                );
             }
-            let cluster = TreeCluster::start(9, router, |_| {});
             cluster.clients[0]
                 .record(0xDEAD, KeyHash(1), 0, 5, 0, 0)
                 .await
@@ -1552,27 +1557,78 @@ async fn a_broadcast_lost_twice_is_pulled_from_the_root() {
 /// own digest entry does, and spreads.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_quiet_roots_last_broadcast_is_recovered_through_digests() {
-    for digests in [Digests::Push, Digests::Off] {
+    for digests in [AntiEntropy::Run, AntiEntropy::Off] {
         let local = LocalSet::new();
         local
             .run_until(async move {
-                let router = SimRouter::new();
-                let addrs: Vec<SocketAddr> = (0..9).map(|i| sock(42_000 + i)).collect();
-                for dst in &addrs[1..] {
-                    router.set_link_policy(addrs[0], *dst, LinkPolicy::DropFirst { count: 2 });
+                let cluster = TreeCluster::start(9, SimRouter::new(), |p| p.anti_entropy = digests);
+                // Let the starting sweeps finish before the losses begin.
+                sim_advance_ticks(Duration::from_millis(100), 2).await;
+                for dst in &cluster.addrs[1..] {
+                    cluster.router.set_link_policy(
+                        cluster.addrs[0],
+                        *dst,
+                        LinkPolicy::DropFirst { count: 2 },
+                    );
                 }
-                let cluster = TreeCluster::start(9, router, |p| p.digests = digests);
                 cluster.clients[0]
                     .record(0xDEAD, KeyHash(1), 0, 5, 0, 0)
                     .await
                     .unwrap();
                 sim_advance_ticks(Duration::from_millis(100), 100).await;
                 let informed = cluster.aggs[1..].iter().filter(|a| a.total() == 5).count();
-                assert_eq!(informed, if digests == Digests::Push { 8 } else { 0 });
+                assert_eq!(informed, if digests == AntiEntropy::Run { 8 } else { 0 });
                 cluster.stop().await;
             })
             .await;
     }
+}
+
+/// A node that starts after a root has left holds that root's cells anyway:
+/// it sweeps the live window from its peers.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_late_starter_sweeps_the_cells_of_a_root_that_left() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let mut cluster = TreeCluster::start(4, SimRouter::new(), |_| {});
+            for key in 0..50_u128 {
+                cluster.clients[0]
+                    .record(0xDEAD, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert!(cluster.aggs.iter().all(|agg| agg.total() == 50));
+
+            // The root leaves; a new node that never knew it joins the rest.
+            for dst in &cluster.addrs[1..] {
+                cluster
+                    .router
+                    .set_link_policy(cluster.addrs[0], *dst, LinkPolicy::Block);
+            }
+            let addr = sock(42_100);
+            let identity = NodeIdentity::new(NodeId(0x7100), 1);
+            let peers = cluster.addrs[1..].to_vec();
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt, client) = GossipRuntime::from_parts(
+                cluster.router.bind(addr),
+                TokioClock::from_millis(0),
+                sim_config(identity, peers, 99),
+                CellStore::<u32>::new(CellStoreConfig::default(), identity),
+                agg.clone(),
+            );
+            cluster
+                .handles
+                .push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+            cluster.clients.push(client);
+            sim_advance_ticks(Duration::from_millis(100), 10).await;
+
+            assert_eq!(agg.total(), 50);
+            cluster.aggs.push(agg);
+            cluster.stop().await;
+        })
+        .await;
 }
 
 /// A root cut off for a while is caught up by pulls once it is reachable
@@ -1674,7 +1730,7 @@ async fn a_repeat_from_anyone_but_the_parent_is_not_forwarded() {
             );
             let rt = rt.with_tree_params(|p| {
                 p.branching = 2;
-                p.digests = Digests::Off;
+                p.anti_entropy = AntiEntropy::Off;
             });
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
@@ -2009,8 +2065,9 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             sim_advance_ticks(Duration::from_millis(100), TICKS).await;
 
             let snap = admin_snapshot(&admin_tx_b).await;
-            // B rejects one repair frame per heartbeat, plus A's broadcast and
-            // its single rebroadcast. Allow a one-tick slop for first-tick
+            // B rejects A's broadcast and its single rebroadcast, A's digest
+            // each heartbeat, and each of A's starting sweep requests, retried
+            // until A gives B up. Allow a one-tick slop for first-tick
             // scheduling under start_paused (the first interval fires at t=0
             // in some configurations).
             assert!(
@@ -2020,7 +2077,7 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
                 TICKS
             );
             assert!(
-                snap.decode_reject_count <= (TICKS as u64) + 3,
+                snap.decode_reject_count <= (TICKS as u64) + 3 + 8,
                 "decode_reject_count too high: {} (after {} ticks)",
                 snap.decode_reject_count,
                 TICKS
