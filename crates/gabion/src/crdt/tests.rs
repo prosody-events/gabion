@@ -2002,7 +2002,7 @@ fn claim_gap_certifies_the_stretch_below_a_cell() {
             .iter()
             .map(|h| store.claim_gap(h.index))
             .collect::<Vec<_>>(),
-        [1, 2, 1]
+        [u32::MAX, 2, 1]
     );
     assert_eq!(store.get(updated).unwrap().origin_sequence, 4);
 
@@ -2024,7 +2024,7 @@ fn claim_gap_certifies_the_stretch_below_a_cell() {
             .iter()
             .map(|h| store.claim_gap(h.index))
             .collect::<Vec<_>>(),
-        [5, 1, 3]
+        [u32::MAX, 1, 3]
     );
 }
 
@@ -2067,4 +2067,45 @@ fn watermark_restarts_when_an_origin_loses_its_last_cell() {
         }],
     );
     assert_eq!(store.watermark(origin_slot(&store, 7)), 900);
+}
+
+#[test]
+fn an_origins_oldest_cell_certifies_everything_below_it() {
+    // A clock-seeded origin's first versions sit far above zero, beyond what
+    // a gap can span, yet a fresh receiver must still chain them on.
+    let mut origin_store = store_u32();
+    origin_store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    origin_store.seed_local_version(1_767_225_600_000_000);
+    let first = local_increment_one(&mut origin_store, 0x11, 1, 0, 1, 0);
+    let second = local_increment_one(&mut origin_store, 0x11, 2, 0, 1, 0);
+    let first = origin_store.get(first).unwrap();
+    let second = origin_store.get(second).unwrap();
+    assert_eq!(first.origin_sequence, 1_767_225_600_000_001);
+    assert_eq!(origin_store.claim_gap(first.handle.index), u32::MAX);
+    assert_eq!(origin_store.claim_gap(second.handle.index), 1);
+
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    merge_rows(
+        &mut store,
+        0,
+        &[
+            versioned(2, 7, 1, second.origin_sequence, 1),
+            versioned(1, 7, 1, first.origin_sequence, u32::MAX),
+        ],
+    );
+    assert_eq!(
+        store.watermark(origin_slot(&store, 7)),
+        second.origin_sequence
+    );
+}
+
+#[test]
+fn seeding_never_lowers_the_version_counter() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.seed_local_version(100);
+    store.seed_local_version(10);
+    let cell = local_increment_one(&mut store, 0x11, 1, 0, 1, 0);
+    assert_eq!(store.get(cell).unwrap().origin_sequence, 101);
 }

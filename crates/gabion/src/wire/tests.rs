@@ -1078,5 +1078,6 @@ fn cell_frames_carry_the_stores_claim_for_each_cell() {
         },
     )
     .expect("decode");
-    assert_eq!(got, [(3, 3), (4, 1), (8, 4), (20, 12)]);
+    // The oldest cell is re-certified as the oldest the sender holds.
+    assert_eq!(got, [(3, u32::MAX), (4, 1), (8, 4), (20, 12)]);
 }

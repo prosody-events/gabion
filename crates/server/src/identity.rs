@@ -25,8 +25,9 @@ mod tests;
 ///    single bucketed identity.
 ///
 /// `incarnation` is unix epoch seconds clamped to `u32`, with a minimum of 1.
-/// Sub-second restarts reuse the same incarnation — peers catch up via the
-/// repair lane.
+/// Sub-second restarts reuse the same incarnation; the gossip runtime seeds
+/// its version counter from the clock, so the restarted node's versions still
+/// start above every one its peers hold.
 pub fn derive_identity(seed_override: Option<&str>) -> NodeIdentity {
     let seed = seed_override
         .map(str::to_owned)

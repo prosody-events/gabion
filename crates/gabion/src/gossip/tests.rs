@@ -1625,7 +1625,7 @@ async fn cells_move_only_in_answer_to_a_digest() {
             frame.visit_cells::<u32>(|c| cells.push(c)).unwrap();
             assert_eq!(cells.len(), 1);
             assert_eq!((cells[0].count, cells[0].origin_sequence), (3, 1));
-            assert_eq!(cells[0].claim_gap, 1);
+            assert_eq!(cells[0].claim_gap, u32::MAX);
 
             // A digest that is already current is answered with nothing.
             send_digest(

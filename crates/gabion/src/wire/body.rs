@@ -20,7 +20,8 @@
 //! [ last_update_millis : u64 ×N ]     8N
 //! [ origin_sequence    : u64 ×N ]     8N    version the origin assigned
 //! [ claim_gap          : u32 ×N ]     4N    versions below it the sender
-//!                                           certifies absent
+//!                                           certifies absent; u32::MAX:
+//!                                           every version below it
 //! [ count              : C  ×N  ]    count_size · N
 //! ```
 //!

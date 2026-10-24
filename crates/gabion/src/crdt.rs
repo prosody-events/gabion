@@ -359,6 +359,22 @@ pub struct CellStore<C: Count = u32> {
 /// Null link for the slot freelist and the per-origin version log.
 const NIL: u32 = u32::MAX;
 
+/// The `claim_gap` that certifies every version below a cell absent: the
+/// sender holds nothing older of that origin. Versions are seeded from the
+/// clock (see [`CellStore::seed_local_version`]), so the first cell's distance
+/// from zero does not fit a `u32`; a real gap saturates one below this.
+const CLAIM_FROM_ZERO: u32 = u32::MAX;
+
+/// The lowest version a claim of `gap` below `version` reaches: nothing
+/// exists strictly between it and `version`.
+fn claim_floor(version: u64, gap: u32) -> u64 {
+    if gap == CLAIM_FROM_ZERO {
+        0
+    } else {
+        version.saturating_sub(u64::from(gap))
+    }
+}
+
 /// Internal arguments for [`CellStore::upsert`]. The mode discriminates the
 /// two valid update shapes; sharing a struct prevents callers from passing a
 /// remote `observed` count alongside a local `hits` delta or vice versa.
@@ -751,6 +767,17 @@ impl<C: Count> CellStore<C> {
 
     // -- Update primitives --------------------------------------------------
 
+    /// Raise the local version allocator to at least `floor`. A node that
+    /// restarts under the identity it had (the server's incarnation is in
+    /// whole seconds) must not reuse versions its peers already hold, or they
+    /// would take its new cells for ones they have; seeding from the clock in
+    /// microseconds keeps a restart above every earlier version as long as
+    /// the earlier run allocated fewer than one version per microsecond.
+    pub fn seed_local_version(&mut self, floor: u64) {
+        let w = &mut self.watermarks[self.local_node_slot as usize];
+        *w = (*w).max(floor);
+    }
+
     /// Allocate the next version for a locally originated change.
     fn next_local_version(&mut self) -> u64 {
         let w = &mut self.watermarks[self.local_node_slot as usize];
@@ -846,11 +873,11 @@ impl<C: Count> CellStore<C> {
         if version > self.watermarks[origin as usize] {
             return self.claims[slot as usize].max(1);
         }
-        let before = match self.log_prev[slot as usize] {
-            NIL => 0,
-            prev => self.origin_sequences[prev as usize],
-        };
-        (version - before).min(u32::MAX as u64) as u32
+        match self.log_prev[slot as usize] {
+            NIL => CLAIM_FROM_ZERO,
+            prev => (version - self.origin_sequences[prev as usize])
+                .min(u64::from(CLAIM_FROM_ZERO - 1)) as u32,
+        }
     }
 
     /// Advance `origin`'s watermark to `version` if the sender's claim ties
@@ -862,7 +889,7 @@ impl<C: Count> CellStore<C> {
     /// instead of waiting for the cells above it to be sent again.
     fn advance_watermark(&mut self, origin: NodeSlot, version: u64, gap: u32) {
         let mut w = self.watermarks[origin as usize];
-        if version <= w || version.saturating_sub(gap as u64) > w {
+        if version <= w || claim_floor(version, gap) > w {
             return;
         }
         w = version;
@@ -874,7 +901,7 @@ impl<C: Count> CellStore<C> {
         }
         while next != NIL {
             let version = self.origin_sequences[next as usize];
-            if version.saturating_sub(self.claims[next as usize] as u64) > w {
+            if claim_floor(version, self.claims[next as usize]) > w {
                 break;
             }
             w = version;

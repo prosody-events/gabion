@@ -447,8 +447,9 @@ never claims a version its sender lacks:
   stretch it does not itself hold, and above it passes on the claim it
   received: a version that was superseded or expired never comes back, so a
   claim stays true. The watermark never advances for a cell the store
-  rejected. `claim_gap` saturates at `u32::MAX`; a wider stretch is certified
-  only up to that width.
+  rejected. `claim_gap = u32::MAX` certifies every version below the cell (the
+  sender holds nothing older of that origin); a wider stretch above a real
+  predecessor is certified only up to `u32::MAX - 1`.
 - **Digests tile the node-id space.** One digest does not fit one datagram at
   80 or 300 origins (28 B per entry). A digest is cut into frames each of which
   names the node-id range `[lo, hi]` it covers; an origin inside the range
@@ -475,6 +476,15 @@ digest frame in `wire/digest.rs`, and the `claim_gap` column in cell frames.
   `f`. The admin snapshot lost `local_dirty_len`, `forwarded_dirty_len` and the
   peers' `node_id` / `peer_slot`; `last_effective_fanout` and
   `peak_effective_fanout` report the exchanges a tick opened.
+- A node that restarts under its old identity (the server's incarnation is in
+  whole seconds, so a sub-second restart keeps it) must not reuse versions
+  its peers hold, or they would take its new cells for ones they already
+  have. The runtime seeds the local version counter from the clock in
+  microseconds, which stays above the earlier run's versions unless that run
+  averaged more than one version per microsecond. The baseline's repair lane
+  covered this case; nothing else here would.
+- `CRDT.md` and the wasm web frontend (`crates/gabion-wasm/web`) still
+  describe or read the baseline's dirty rings and peer frontier.
 - A hole at the *top* of an origin's version range (its newest cell expired
   while older ones live) is not certified, so a digest can sit below the
   sender's true watermark until those cells expire. That costs a few resent

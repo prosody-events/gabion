@@ -238,6 +238,8 @@ where
         admin_rx: Option<mpsc::Receiver<AdminCommand>>,
     ) -> (Self, GossipClient<C>) {
         let (req_tx, req_rx) = mpsc::channel(config.limit_queue_capacity);
+        let mut store = store;
+        store.seed_local_version(clock.now_millis().saturating_mul(1_000));
 
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
