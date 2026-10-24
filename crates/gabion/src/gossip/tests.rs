@@ -1316,6 +1316,14 @@ struct Mesh {
 }
 
 fn spawn_mesh(first_port: u16, n: usize) -> Mesh {
+    spawn_mesh_with(first_port, n, store_for)
+}
+
+fn spawn_mesh_with(
+    first_port: u16,
+    n: usize,
+    store: impl Fn(NodeIdentity) -> CellStore<u32>,
+) -> Mesh {
     let router = SimRouter::new();
     let addrs: Vec<SocketAddr> = (0..n).map(|i| sock(first_port + i as u16)).collect();
     let mut mesh = Mesh {
@@ -1340,7 +1348,7 @@ fn spawn_mesh(first_port: u16, n: usize) -> Mesh {
             router.bind(addrs[i]),
             TokioClock::from_millis(0),
             sim_config(identity, peers, i as u64),
-            store_for(identity),
+            store(identity),
             agg.clone(),
         );
         mesh.handles.push(tokio::task::spawn_local(rt.run(stream)));
@@ -1436,6 +1444,58 @@ async fn next_change_to_a_key_repairs_a_peer_that_missed_a_broadcast() {
             sim_advance_ticks(Duration::from_millis(100), 10).await;
             assert_eq!(mesh.aggregates[2].total(), 5);
             assert_eq!(mesh.aggregates[1].total(), 5);
+            mesh.shutdown().await;
+        })
+        .await;
+}
+
+/// A key that reaches half its limit is sent to its owner, and broadcast by
+/// it, at once rather than at the next sync and broadcast ticks; a key below
+/// that waits for them.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_key_near_its_limit_is_sent_at_once() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let limited = |identity| {
+                let mut store = store_for(identity);
+                store
+                    .intern_rule(RuleDescriptor {
+                        fingerprint: 0xDEAD,
+                        window_millis: 10_000,
+                        bucket_millis: 1_000,
+                        limit: 4,
+                        flags: 0,
+                        local_rule_id: 1,
+                    })
+                    .unwrap();
+                store
+            };
+            let mesh = spawn_mesh_with(54_400, 3, limited);
+            let key = (0..)
+                .map(KeyHash)
+                .find(|&key| owner_index(&mesh.addrs, 0xDEAD, key) == 1)
+                .unwrap();
+            // Halfway between ticks.
+            sim_advance_ticks(Duration::from_millis(10), 15).await;
+
+            mesh.clients[0]
+                .record(0xDEAD, key, 0, 1, 4, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(1), 5).await;
+            assert_eq!(
+                mesh.aggregates[2].total(),
+                0,
+                "a quarter of the limit waits"
+            );
+
+            mesh.clients[0]
+                .record(0xDEAD, key, 0, 1, 4, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(1), 5).await;
+            assert_eq!(mesh.aggregates[2].total(), 2, "half the limit goes at once");
             mesh.shutdown().await;
         })
         .await;

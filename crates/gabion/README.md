@@ -164,7 +164,10 @@ the changed member wins or held.
    cell for `(rule, key, bucket)`, so the node's aggregate counts it at
    once. If another member owns the key, the cell is queued for sync.
 2. **Sync.** Every `sync_wait` (100 ms) the node sends each unacknowledged
-   queued cell to its owner, one batch per owner (`FLAG_SYNC`).
+   queued cell to its owner, one batch per owner (`FLAG_SYNC`). A hit on a
+   key whose window total in the node's view has reached half its limit
+   (`GOSSIP_URGENT_PERCENT_OF_LIMIT`) is sent to the owner at once, and an
+   owner whose total of a key reaches it broadcasts at once (step 4).
 3. **Fold and acknowledge.** The owner max-merges the cells into its store
    (they stay tagged with the contributor's origin, so a re-sent or
    reordered sync cannot double count), adds whatever they rose by to the
@@ -250,6 +253,17 @@ adapted as little as the CRDT and UDP require:
   coalesce requests, which is not a staleness bound. `sync_wait` and
   `broadcast_interval` are both 100 ms, chosen from the sub-second
   staleness target.
+- **Near the limit (adapted `near-limit-urgency` component).** The 100 ms
+  cadences put about 100 ms of staleness on every hit, and at a key's limit
+  that staleness is over-admission: every pod admits against a count that
+  lags by the hits of the last tick or two. A key at half its limit or more
+  is therefore sent and broadcast at once, as Gubernator's sub-millisecond
+  batching would, while keys far below their limit, which a stale count
+  cannot over-admit, keep the batched cadence. The extra cost is bounded by
+  the admitted rate of keys near their limit: at most one sync and one
+  broadcast per admitted hit. In the 80-pod `prod-typical` regime (seed 1)
+  this cut the limited keys' p99 staleness from 8 % to 1 % of the limit and
+  the worst over-admission from 12 % to 1 %, for 3 % more bytes.
 - **UDP.** Gubernator sends hits over gRPC and gets delivery from TCP.
   Here the owner acknowledges each folded cell and the contributor
   re-sends until it does, which is the minimal substitute for the retry

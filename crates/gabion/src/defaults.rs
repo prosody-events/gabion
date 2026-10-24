@@ -51,6 +51,13 @@ pub const GOSSIP_BROADCAST_INTERVAL_MS: u64 = 100;
 /// interval.
 pub const GOSSIP_BROADCAST_BATCH_LIMIT: usize = 1000;
 
+/// Share of its limit, in percent, at which a key's hits are sent to its
+/// owner, and its owner's totals broadcast, at once instead of at the next
+/// `sync_wait` or `broadcast_interval`. A key far below its limit cannot be
+/// over-admitted by a stale count, so it rides the batched cadence; a key
+/// near its limit is where staleness turns into over-admission.
+pub const GOSSIP_URGENT_PERCENT_OF_LIMIT: u64 = 50;
+
 /// Broadcast packets an owner remembers the key buckets of, so it can
 /// re-send one a receiver reports missing. A receiver that misses an older
 /// one gets a snapshot of every key the owner owns instead. At 10 packets a

@@ -900,6 +900,30 @@ impl<C: Count> CellStore<C> {
         .map_or_else(C::default, |slot| self.counts[slot as usize])
     }
 
+    /// Whether this node's view of `(rule, key_hash)` over the rule's window
+    /// ending at `now_millis` has reached `percent` of the rule's limit.
+    /// `false` for a rule with no limit or no window.
+    pub fn near_limit(
+        &self,
+        rule: RuleSlot,
+        key_hash: KeyHash,
+        now_millis: u64,
+        percent: u64,
+    ) -> bool {
+        let Some(descriptor) = self.rule_dictionary.descriptor(rule) else {
+            return false;
+        };
+        let live = descriptor.live_buckets();
+        if descriptor.limit == 0 || live == 0 {
+            return false;
+        }
+        let current = descriptor.current_epoch(now_millis);
+        let total: u64 = (current.saturating_sub(live - 1)..=current)
+            .map(|bucket| self.view(rule, key_hash, bucket).into())
+            .sum();
+        total.saturating_mul(100) >= descriptor.limit.saturating_mul(percent)
+    }
+
     /// This node's view of `(rule, key_hash, bucket)`: its own hits plus its
     /// count of everyone else's.
     pub fn view(&self, rule: RuleSlot, key_hash: KeyHash, bucket: BucketEpoch) -> C {

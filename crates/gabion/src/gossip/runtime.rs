@@ -28,7 +28,9 @@ use crate::crdt::{
     CellHandle, CellStore, Count, DeltaSink, ExpirationSink, KeyHash, KeyTotal, NodeId,
     NodeIdentity, Observation, ObservationBatch, RuleSlot,
 };
-use crate::defaults::{GOSSIP_BROADCAST_HISTORY, GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC};
+use crate::defaults::{
+    GOSSIP_BROADCAST_HISTORY, GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC, GOSSIP_URGENT_PERCENT_OF_LIMIT,
+};
 use crate::discovery::PeerEvent;
 use crate::wire::{self, FLAG_MORE, FrameKind, Nack, PacketBuf, Packets, WireScratch};
 
@@ -412,7 +414,7 @@ where
                 ArmOutcome::Request(None) | ArmOutcome::Request(Some(Request::Shutdown)) => {
                     return Ok(());
                 }
-                ArmOutcome::Request(Some(Request::Limit(r))) => self.handle_limit_request(r),
+                ArmOutcome::Request(Some(Request::Limit(r))) => self.handle_limit_request(r)?,
                 ArmOutcome::Inbound(Ok((n, src))) => self.handle_inbound(n, src)?,
                 ArmOutcome::Inbound(Err(e)) => return Err(e.into()),
                 ArmOutcome::Writable => self.send_queue.drain_one(&self.transport)?,
@@ -445,7 +447,7 @@ where
 
     // -- per-arm handlers ---------------------------------------------------
 
-    fn handle_limit_request(&mut self, req: LimitRequest) {
+    fn handle_limit_request(&mut self, req: LimitRequest) -> Result<(), GossipError> {
         self.obs_buf.clear();
         self.sink_buf.clear();
         self.obs_buf.push(Observation {
@@ -459,13 +461,42 @@ where
             last_update_millis: req.now_millis,
         });
         self.store.ingest_local(&self.obs_buf, &mut self.sink_buf);
-        if let Some(&handle) = self.sink_buf.handles.first() {
-            self.queue_local_cell(handle);
-        }
         // Reply is sent at the bottom of this loop iteration, AFTER the
         // post-iteration apply runs. Caller observes "ack ⇒ AggregateStore
         // reflects the increment".
         self.pending_reply = req.reply;
+        let Some(&handle) = self.sink_buf.handles.first() else {
+            return Ok(());
+        };
+        let route = self.queue_local_cell(handle);
+        if !self.near_limit(handle, req.now_millis) {
+            return Ok(());
+        }
+        // Near its limit a key's staleness becomes over-admission: send the
+        // hit to its owner, or broadcast it, now.
+        match route {
+            Route::Send(peer) => {
+                self.frame_handles.clear();
+                self.frame_handles.push(handle);
+                let owner = self.membership.peers()[peer].addr;
+                self.send_frame(FrameKind::Sync, Audience::One(owner), (0, 0))
+            }
+            Route::Broadcast(_) => self.broadcast_round(),
+            Route::Settled => Ok(()),
+        }
+    }
+
+    /// Whether the key of `handle` has reached the urgent share of its
+    /// limit in this node's view.
+    fn near_limit(&self, handle: CellHandle, now_millis: u64) -> bool {
+        self.store.get(handle).is_some_and(|row| {
+            self.store.near_limit(
+                row.key.rule,
+                row.key.key_hash,
+                now_millis,
+                GOSSIP_URGENT_PERCENT_OF_LIMIT,
+            )
+        })
     }
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) -> Result<(), GossipError> {
@@ -584,10 +615,13 @@ where
             FrameKind::Sync => {
                 self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
                 let capacity = self.store.config().forwarded_dirty_capacity;
+                let now = self.clock.now_millis();
+                let mut urgent = false;
                 for &handle in &self.sink_buf.handles {
                     if self.outbox.queue_broadcast(handle).is_err() {
                         self.overflows.broadcast_queue_full(capacity);
                     }
+                    urgent = urgent || self.near_limit(handle, now);
                 }
                 self.frame_handles.clear();
                 for row in 0..self.obs_buf.len() {
@@ -597,6 +631,9 @@ where
                 }
                 if !self.frame_handles.is_empty() {
                     self.send_frame(FrameKind::Ack, Audience::One(src), (0, 0))?;
+                }
+                if urgent {
+                    self.broadcast_round()?;
                 }
             }
             // An owner holds these cells of ours.
@@ -922,6 +959,12 @@ where
     /// asks for a repair.
     fn handle_broadcast_tick(&mut self) -> Result<(), GossipError> {
         self.ticks_total = self.ticks_total.saturating_add(1);
+        self.broadcast_round()
+    }
+
+    /// Broadcast what is queued, at most `broadcast_batch_limit` key
+    /// buckets: on the tick, or at once for a key near its limit.
+    fn broadcast_round(&mut self) -> Result<(), GossipError> {
         self.totals.clear();
         self.outbox.begin_broadcast_round();
         while self.totals.len() < self.config.broadcast_batch_limit {
@@ -990,13 +1033,15 @@ where
     }
 
     /// A local hit changed `handle`: broadcast it if this node owns the key,
-    /// otherwise queue it for the next sync to the owner.
-    fn queue_local_cell(&mut self, handle: CellHandle) {
-        match self.route(handle) {
+    /// otherwise queue it for the next sync to the owner. Returns the route.
+    fn queue_local_cell(&mut self, handle: CellHandle) -> Route<C> {
+        let route = self.route(handle);
+        match route {
             Route::Settled => {}
             Route::Broadcast(count) => self.hand_to_broadcast(handle, count),
             Route::Send(_) => self.queue_sync(handle),
         }
+        route
     }
 
     /// Queue `handle` for the next sync. If the queue is full the cell is
