@@ -26,9 +26,11 @@ use crate::crdt::{
     CellHandle, CellStore, CompactCellKey, Count, DeltaSink, ExpirationSink, NodeId, Observation,
     ObservationBatch,
 };
+use crate::defaults::{GOSSIP_SWEEP_CELLS_PER_ROUND, GOSSIP_SWEEP_CONCURRENCY};
 use crate::discovery::PeerEvent;
 use crate::wire::{
-    self, FLAG_GAP_OWN, FLAG_GAP_RELAY, FLAG_RELAY, PacketBuf, Packets, WireScratch,
+    self, FLAG_GAP_OWN, FLAG_GAP_RELAY, FLAG_RELAY, FLAG_SWEEP, FLAG_SWEEP_REQUEST, PacketBuf,
+    Packets, WireScratch,
 };
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
@@ -36,7 +38,7 @@ use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
-use super::peer::{Peer, refresh_gateways};
+use super::peer::{Peer, refresh_gateways, sweep_sources};
 use super::store::AggregateStore;
 use super::topology::Zone;
 use super::transport::GossipTransport;
@@ -51,6 +53,14 @@ enum StreamKind {
     Own,
     /// Cells a gateway forwards into its zone, sequenced by relay stamps.
     Relay,
+}
+
+/// A sweep this node is answering: its live window, paced out to `dst` in
+/// cell-slot order from `next`.
+#[derive(Clone, Copy)]
+struct Sweep {
+    dst: SocketAddr,
+    next: u32,
 }
 
 /// What woke the gossip loop to send.
@@ -123,6 +133,11 @@ where
     resend_pending: bool,
     /// A gap is open in some peer's stream to us.
     gaps_open: bool,
+    /// Ask zone peers for their live window at the next round: set at start
+    /// and when a zone member leaves before ever reaching us.
+    sweep_wanted: bool,
+    /// Sweep requests being answered; at most `GOSSIP_SWEEP_CONCURRENCY`.
+    sweeps: Vec<Sweep>,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
@@ -337,6 +352,8 @@ where
             relay_pending: false,
             resend_pending: false,
             gaps_open: false,
+            sweep_wanted: true,
+            sweeps: Vec::with_capacity(GOSSIP_SWEEP_CONCURRENCY),
             send_pool,
             send_pending,
             send_free,
@@ -392,7 +409,11 @@ where
             let have_send = !self.send_pending.is_empty();
             let watch_peers = !peer_events_done;
             let watch_admin = self.admin_rx.is_some();
-            let watch_prompt = self.relay_pending || self.resend_pending || self.gaps_open;
+            let watch_prompt = self.relay_pending
+                || self.resend_pending
+                || self.gaps_open
+                || self.sweep_wanted
+                || !self.sweeps.is_empty();
 
             let outcome = if self.want_immediate_flush {
                 // A previous limit request crossed the per-rule error
@@ -606,6 +627,10 @@ where
             }
         };
         let header = summary.header;
+        if header.flags & FLAG_SWEEP_REQUEST != 0 {
+            self.accept_sweep(src);
+            return;
+        }
 
         self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
         self.store.clear_dirty();
@@ -614,7 +639,7 @@ where
         // this node forwards into its own zone. Cells that arrive from a
         // zone peer or in a relay stream were already delivered by their
         // sender, so they are never forwarded again (stamp 0).
-        let from_origin_across_zones = header.flags & FLAG_RELAY == 0
+        let from_origin_across_zones = header.flags & (FLAG_RELAY | FLAG_SWEEP) == 0
             && Zone::of(src, self.config.zone_prefix_len) != self.local_zone;
         let pi = self.peers.iter().position(|p| p.addr == src);
         if from_origin_across_zones {
@@ -634,6 +659,10 @@ where
             }
         }
 
+        if header.flags & FLAG_SWEEP != 0 {
+            // A sweep answer belongs to no stream: nothing to ack or track.
+            return;
+        }
         let now_ms = self.clock.now_millis();
         let Some(pi) = pi else {
             // Not (yet) in discovery: the cells are merged, but with no
@@ -733,6 +762,93 @@ where
             }
         }
         self.relay_pending |= self.relay_head > before;
+    }
+
+    /// Answer a zone member's sweep request with our live window over the
+    /// next prompt rounds. The requester need not be in discovery yet: a
+    /// member that just started is the one that asks. A request from another
+    /// zone is ignored, since cells cross zones only from origin to gateway.
+    fn accept_sweep(&mut self, src: SocketAddr) {
+        if Zone::of(src, self.config.zone_prefix_len) != self.local_zone
+            || self.sweeps.iter().any(|s| s.dst == src)
+            || self.sweeps.len() >= GOSSIP_SWEEP_CONCURRENCY
+        {
+            return;
+        }
+        self.sweeps.push(Sweep { dst: src, next: 0 });
+    }
+
+    /// Ask the top-ranked zone members for their live window, once there are
+    /// any. Left wanted when the socket pushes back.
+    fn request_sweep(&mut self) -> Result<(), GossipError> {
+        let sources = sweep_sources(&self.peers, self.local_zone);
+        if !self.sweep_wanted || sources[0].is_none() {
+            return Ok(());
+        }
+        for pi in sources.into_iter().flatten() {
+            let Some(slot) = take_send_slot(
+                &self.transport,
+                &self.send_pool,
+                &mut self.send_pending,
+                &mut self.send_free,
+            )?
+            else {
+                return Ok(());
+            };
+            let header = self.header(FLAG_SWEEP_REQUEST);
+            wire::encode_header_only::<C>(
+                header,
+                self.config.auth_key.as_ref(),
+                &mut self.send_pool[slot as usize],
+            );
+            self.send_pending.push_back((self.peers[pi].addr, slot));
+        }
+        self.sweep_wanted = false;
+        Ok(())
+    }
+
+    /// Send each sweep being answered its next `GOSSIP_SWEEP_CELLS_PER_ROUND`
+    /// live cells, in cell-slot order, and retire the sweeps that reach the
+    /// end of the store. Cells that arrive behind a sweep's position reach
+    /// the requester through the streams.
+    fn serve_sweeps(&mut self) -> Result<(), GossipError> {
+        let budget = GOSSIP_SWEEP_CELLS_PER_ROUND.min(self.config.max_cells_per_tick);
+        let mut i = 0;
+        while i < self.sweeps.len() {
+            let Sweep { dst, next } = self.sweeps[i];
+            self.frame_handles.clear();
+            self.frame_handles.extend(
+                self.store
+                    .active_handles()
+                    .filter(|h| h.index >= next)
+                    .take(budget),
+            );
+            let last = self.frame_handles.len() < budget;
+            self.frame_stamps.clear();
+            self.frame_stamps.resize(self.frame_handles.len(), 0);
+            let (consumed, blocked) = if self.frame_handles.is_empty() {
+                (0, false)
+            } else {
+                let header = self.header(FLAG_SWEEP);
+                self.encode_packets_for(dst, header)?
+            };
+            if blocked {
+                if let Some(&h) = consumed
+                    .checked_sub(1)
+                    .and_then(|c| self.frame_handles.get(c))
+                {
+                    self.sweeps[i].next = h.index + 1;
+                }
+                return Ok(());
+            }
+            if last {
+                self.sweeps.swap_remove(i);
+            } else {
+                self.sweeps[i].next = self.frame_handles[consumed - 1].index + 1;
+                i += 1;
+            }
+        }
+        Ok(())
     }
 
     fn drain_one_send(&mut self) -> Result<(), GossipError> {
@@ -842,6 +958,13 @@ where
             }
             PeerEvent::Removed(p) => {
                 if let Some(pos) = self.peers.iter().position(|x| x.addr == p.addr) {
+                    // A zone member is the only sender of its own cells to
+                    // the rest of its zone. One that leaves before ever
+                    // reaching us (it had not yet learned of us) took cells we
+                    // lack, which our zone peers hold.
+                    let removed = &self.peers[pos];
+                    self.sweep_wanted |=
+                        removed.zone == self.local_zone && removed.own_in.seen() == 0;
                     self.peers.remove(pos);
                     refresh_gateways(&mut self.peers, self.local_zone);
                     tracing::info!(
@@ -974,6 +1097,8 @@ where
             }
             recipients += usize::from(sent == Sent::Data);
         }
+        self.request_sweep()?;
+        self.serve_sweeps()?;
         self.resend_pending = self.peers.iter().any(|p| p.resend_own);
         self.gaps_open = self
             .peers
@@ -1116,17 +1241,21 @@ where
     fn header_for(&self, pi: usize, flags: u16, stream_lower: u64) -> wire::Header {
         let peer = &self.peers[pi];
         wire::Header {
-            cluster_id_hash: self.config.cluster_id_hash,
-            sender_node_id: self.store.local_identity().node_id.0,
-            sender_incarnation: self.store.local_identity().incarnation,
-            count_width: 0,
-            cell_count: 0,
-            body_len: 0,
             ack_own: peer.own_in.have,
             ack_relay: peer.relay_in.have,
             stream_lower,
-            stream_upper: 0,
+            ..self.header(flags)
+        }
+    }
+
+    /// A header with our identity and `flags`, acking nothing.
+    fn header(&self, flags: u16) -> wire::Header {
+        wire::Header {
+            cluster_id_hash: self.config.cluster_id_hash,
+            sender_node_id: self.store.local_identity().node_id.0,
+            sender_incarnation: self.store.local_identity().incarnation,
             flags,
+            ..wire::Header::default()
         }
     }
 

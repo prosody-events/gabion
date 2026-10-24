@@ -1506,7 +1506,7 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             let snap = admin_snapshot(&admin_tx_b).await;
             // Allow a one-tick slop for first-tick scheduling under
             // start_paused (the first interval fires at t=0 in some
-            // configurations).
+            // configurations), plus A's start-up sweep request.
             assert!(
                 snap.decode_reject_count >= (TICKS as u64) - 1,
                 "decode_reject_count too low: {} (after {} ticks)",
@@ -1514,7 +1514,7 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
                 TICKS
             );
             assert!(
-                snap.decode_reject_count <= (TICKS as u64) + 1,
+                snap.decode_reject_count <= (TICKS as u64) + 2,
                 "decode_reject_count too high: {} (after {} ticks)",
                 snap.decode_reject_count,
                 TICKS

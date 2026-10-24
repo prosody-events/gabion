@@ -10,7 +10,7 @@ use crate::crdt::{BucketEpoch, NodeId, NodeIdentity, ObservationBatch};
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
 use crate::gossip::topology::{Zone, rendezvous_weight};
 use crate::gossip::{GossipClient, GossipRuntime, TokioClock};
-use crate::wire::{self, FLAG_RELAY, FrameLimits};
+use crate::wire::{self, FLAG_RELAY, FLAG_SWEEP, FrameLimits};
 
 use super::mock::{RecordingTransport, Sent, SentLog};
 use super::{
@@ -117,6 +117,7 @@ impl Cluster {
 /// Decoded view of one sent datagram.
 struct Packet {
     relay: bool,
+    sweep: bool,
     cell_origins: Vec<NodeId>,
 }
 
@@ -126,6 +127,7 @@ fn decode(sent: &Sent) -> Packet {
         .expect("every datagram the runtime sends decodes");
     Packet {
         relay: summary.header.flags & FLAG_RELAY != 0,
+        sweep: summary.header.flags & FLAG_SWEEP != 0,
         cell_origins: obs.origin_node_ids.clone(),
     }
 }
@@ -149,7 +151,13 @@ fn cells_cross_zones_only_from_origin_to_its_gateway() {
             let dst = (0..NODES)
                 .find(|&n| addr(n) == sent.dst)
                 .expect("recipient");
-            if packet.relay {
+            if packet.sweep {
+                assert_eq!(
+                    zone(sent.src),
+                    zone(sent.dst),
+                    "a sweep answers only a member of the same zone"
+                );
+            } else if packet.relay {
                 relay_data += 1;
                 assert_eq!(
                     zone(sent.src),

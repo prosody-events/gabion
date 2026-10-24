@@ -20,6 +20,12 @@ pub const FLAG_RELAY: u16 = 0x04;
 pub const FLAG_GAP_OWN: u16 = 0x08;
 /// As [`FLAG_GAP_OWN`], for the receiver's relay stream and `ack_relay`.
 pub const FLAG_GAP_RELAY: u16 = 0x10;
+/// A header-only packet asking the receiver, a member of the sender's zone,
+/// for every live cell it holds.
+pub const FLAG_SWEEP_REQUEST: u16 = 0x20;
+/// The packet's cells answer a [`FLAG_SWEEP_REQUEST`]: part of the sender's
+/// live window, outside any stream.
+pub const FLAG_SWEEP: u16 = 0x40;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {

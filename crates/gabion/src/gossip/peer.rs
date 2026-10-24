@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 
 use crate::crdt::{Incarnation, NodeId};
+use crate::defaults::GOSSIP_SWEEP_PEERS;
 
 use super::topology::{Zone, rendezvous_weight};
 
@@ -211,6 +212,32 @@ impl Peer {
     fn rank(&self) -> (bool, u64, SocketAddr) {
         (!self.suspect, self.weight, self.addr)
     }
+}
+
+/// The members of `zone` a node asks for their live window: the
+/// [`GOSSIP_SWEEP_PEERS`] it ranks highest, by the same rendezvous weight
+/// that orders gateways.
+pub(super) fn sweep_sources(peers: &[Peer], zone: Zone) -> [Option<usize>; GOSSIP_SWEEP_PEERS] {
+    let mut best = [None; GOSSIP_SWEEP_PEERS];
+    let key = |i: usize| (peers[i].weight, peers[i].addr);
+    for i in (0..peers.len()).filter(|&i| peers[i].zone == zone) {
+        // Insert into the descending ranking; the last one falls off.
+        let mut carry = i;
+        for slot in &mut best {
+            match *slot {
+                None => {
+                    *slot = Some(carry);
+                    break;
+                }
+                Some(j) if key(carry) > key(j) => {
+                    *slot = Some(carry);
+                    carry = j;
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    best
 }
 
 /// Mark each remote-zone peer that ranks first in its zone as a gateway.

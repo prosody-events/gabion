@@ -124,6 +124,19 @@ zone from its address.
   gap, so the receiver reports it with one of two header flags (`FLAG_GAP_OWN`,
   `FLAG_GAP_RELAY`) next to the cumulative ack, and the sender resends at once. The
   timeout and failover stay as specified: a report never marks a gateway suspect.
+- *Join sweeps* (component `pull-sweep-join`). The source designs say nothing about a
+  member that joins: it waits for every peer to learn of it from discovery before
+  their streams reach it, and a zone member that left before learning of it took
+  cells only that member would ever have sent it, so a joiner stayed short until those
+  cells expired. A node now asks the `GOSSIP_SWEEP_PEERS` (2) members of its zone it
+  ranks highest by rendezvous weight for their live window at start, and again when a
+  zone member leaves without ever having sent it a packet. The answer
+  (`FLAG_SWEEP`, outside any stream, never acked or relayed) is paced at
+  `GOSSIP_SWEEP_CELLS_PER_ROUND` (256) cells per prompt round, and a node answers at
+  most `GOSSIP_SWEEP_CONCURRENCY` (4) requests at once. A request from another zone
+  is ignored, so cells still cross a zone boundary only from an origin to its gateway.
+  The requester need not be in the answering node's discovery yet; answering it is a
+  reply to a request, and it does not make the requester a member or a stream peer.
 - *Relay eligibility.* A gateway forwards the cells of an own-stream packet from an
   origin outside the gateway's zone, and never a cell that reached it from its own
   zone or in a relay stream, so a cell is forwarded by one gateway per zone. It
@@ -189,7 +202,7 @@ byte  field                  width
 ----  ---------------------  -----
 0     MAGIC                  4   (0x4742_4732)
 4     VERSION                2   (= 2)
-6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED | FLAG_RELAY | FLAG_GAP_*)
+6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED | FLAG_RELAY | FLAG_GAP_* | FLAG_SWEEP*)
 8     cluster_id_hash       16
 24    sender_node_id        16
 40    sender_incarnation     4

@@ -4,7 +4,10 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
 use crate::crdt::{KeyHash, NodeId, NodeIdentity};
+use crate::discovery::{Peer, PeerEvent};
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
 use crate::gossip::topology::rendezvous_weight;
 use crate::gossip::{GossipClient, GossipConfig, GossipRuntime, TokioClock};
@@ -22,6 +25,8 @@ fn zone_addrs(n: u8) -> Vec<SocketAddr> {
 
 struct Nodes {
     clients: Vec<GossipClient<u32>>,
+    /// Discovery events for each node, on top of its bootstrap peers.
+    events: Vec<mpsc::UnboundedSender<PeerEvent>>,
     aggregates: Vec<Rc<InMemoryAggregateStore<u32>>>,
     handles: Vec<tokio::task::JoinHandle<Result<(), crate::gossip::GossipError>>>,
 }
@@ -36,6 +41,7 @@ impl Nodes {
     ) -> Self {
         let mut nodes = Self {
             clients: Vec::new(),
+            events: Vec::new(),
             aggregates: Vec::new(),
             handles: Vec::new(),
         };
@@ -51,9 +57,14 @@ impl Nodes {
                 store_for_property_rules(identity, 64),
                 aggregate.clone(),
             );
-            nodes.handles.push(tokio::task::spawn_local(
-                runtime.run(futures::stream::empty()),
-            ));
+            let (events, rx) = mpsc::unbounded_channel();
+            let discovery = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|evt| (evt, rx))
+            });
+            nodes
+                .handles
+                .push(tokio::task::spawn_local(runtime.run(discovery)));
+            nodes.events.push(events);
             nodes.clients.push(client);
             nodes.aggregates.push(aggregate);
         }
@@ -151,6 +162,8 @@ fn a_new_gateway_forwards_cells_the_old_one_could_not() {
                 c.bootstrap_peers.retain(|&p| p != member);
             }
         });
+        // Let the start-up sweeps of the still empty stores finish.
+        sim_advance_ticks(Duration::from_millis(100), 10).await;
         nodes.clients[0]
             .record(rule_fp(0), KeyHash(1), 0, 1, 0, 0)
             .await
@@ -170,6 +183,73 @@ fn a_new_gateway_forwards_cells_the_old_one_could_not() {
             .expect("record");
         sim_advance_ticks(Duration::from_millis(100), 30).await;
         assert_eq!(nodes.lagging(2), Vec::<usize>::new(), "all hold both hits");
+        nodes.stop().await;
+    });
+}
+
+/// A node that joins a zone pulls the live window from zone members that
+/// have not yet learned of it, instead of waiting for them to.
+#[test]
+fn a_joiner_sweeps_the_window_from_its_zone() {
+    run_paused(async {
+        let addrs = zone_addrs(3);
+        let joiner = addrs[2];
+        let router = SimRouter::new();
+        let nodes = Nodes::start(&router, &addrs, |i, c| {
+            // Nobody knows the joiner, and it learns of the zone later.
+            c.bootstrap_peers.retain(|&p| p != joiner);
+            if i == 2 {
+                c.bootstrap_peers.clear();
+            }
+        });
+        for (node, key) in [(0, 1), (1, 2)] {
+            nodes.clients[node]
+                .record(rule_fp(0), KeyHash(key), 0, 1, 0, 0)
+                .await
+                .expect("record");
+        }
+        sim_advance_ticks(Duration::from_millis(100), 5).await;
+        assert_eq!(nodes.lagging(2), vec![2]);
+
+        for &member in &addrs[..2] {
+            nodes.events[2]
+                .send(PeerEvent::Added(Peer::new(member)))
+                .expect("discovery open");
+        }
+        sim_advance_ticks(Duration::from_millis(10), 5).await;
+        assert_eq!(nodes.lagging(2), Vec::<usize>::new(), "swept within 50 ms");
+        nodes.stop().await;
+    });
+}
+
+/// A zone member that leaves before it ever reached us took cells only it
+/// would have sent us; the rest of the zone holds them, and we sweep them.
+#[test]
+fn a_member_leaving_unheard_triggers_a_sweep() {
+    run_paused(async {
+        let addrs = zone_addrs(3);
+        let (leaver, observer) = (addrs[1], addrs[2]);
+        let router = SimRouter::new();
+        let nodes = Nodes::start(&router, &addrs, |i, c| {
+            if i == 1 {
+                // The leaver never learns of the observer.
+                c.bootstrap_peers.retain(|&p| p != observer);
+            }
+        });
+        // Let the start-up sweeps of the still empty stores finish.
+        sim_advance_ticks(Duration::from_millis(100), 5).await;
+        nodes.clients[1]
+            .record(rule_fp(0), KeyHash(1), 0, 1, 0, 0)
+            .await
+            .expect("record");
+        sim_advance_ticks(Duration::from_millis(100), 5).await;
+        assert_eq!(nodes.lagging(1), vec![2]);
+
+        nodes.events[2]
+            .send(PeerEvent::Removed(Peer::new(leaver)))
+            .expect("discovery open");
+        sim_advance_ticks(Duration::from_millis(10), 5).await;
+        assert_eq!(nodes.aggregates[2].total(), 1, "swept from the zone");
         nodes.stop().await;
     });
 }

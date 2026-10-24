@@ -75,6 +75,20 @@ pub const GOSSIP_RTO_FLOOR_MS: u64 = 500;
 /// local peer.
 pub const GOSSIP_RELAY_FLOOR_MS: u64 = 5;
 
+/// Members of its zone a node asks for their live window when it joins, or
+/// when a zone member leaves before ever reaching it (`pull-sweep-join`).
+pub const GOSSIP_SWEEP_PEERS: usize = 2;
+
+/// Cells a node sends per prompt round while answering a sweep request, so a
+/// window of tens of thousands of cells reaches the requester as a paced
+/// stream (about eight packets every `GOSSIP_RELAY_FLOOR_MS`) rather than a
+/// burst that would overflow its receive buffer.
+pub const GOSSIP_SWEEP_CELLS_PER_ROUND: usize = 256;
+
+/// Sweep requests a node answers at once; more are dropped, and their
+/// requesters still hear from their other sweep peers.
+pub const GOSSIP_SWEEP_CONCURRENCY: usize = 4;
+
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;

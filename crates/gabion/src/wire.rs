@@ -34,8 +34,8 @@ mod tests;
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
 pub use header::{
-    FLAG_AUTHENTICATED, FLAG_GAP_OWN, FLAG_GAP_RELAY, FLAG_MORE, FLAG_RELAY, HEADER_LEN, Header,
-    MAGIC, VERSION,
+    FLAG_AUTHENTICATED, FLAG_GAP_OWN, FLAG_GAP_RELAY, FLAG_MORE, FLAG_RELAY, FLAG_SWEEP,
+    FLAG_SWEEP_REQUEST, HEADER_LEN, Header, MAGIC, VERSION,
 };
 
 use auth::AUTH_TAG_LEN;

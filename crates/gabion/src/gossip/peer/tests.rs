@@ -165,3 +165,27 @@ fn a_gap_is_reported_after_its_hold_and_again_until_filled() {
     assert_eq!(inbound.have, 9);
     assert!(!inbound.gap(), "the resend closes the gap");
 }
+
+#[test]
+fn sweep_sources_are_the_top_ranked_members_of_the_zone() {
+    let peers: Vec<Peer> = [
+        "10.0.0.2:1",
+        "10.0.0.3:1",
+        "10.0.0.4:1",
+        "10.0.0.5:1",
+        "10.1.0.2:1",
+        "10.1.0.3:1",
+    ]
+    .iter()
+    .map(|s| peer(s))
+    .collect();
+    let zone = peers[0].zone;
+    let mut ranked: Vec<usize> = (0..4).collect();
+    ranked.sort_by_key(|&i| std::cmp::Reverse((peers[i].weight, peers[i].addr)));
+    assert_eq!(
+        sweep_sources(&peers, zone),
+        [Some(ranked[0]), Some(ranked[1])]
+    );
+    assert_eq!(sweep_sources(&peers[..1], zone), [Some(0), None]);
+    assert_eq!(sweep_sources(&peers[4..], zone), [None, None]);
+}
