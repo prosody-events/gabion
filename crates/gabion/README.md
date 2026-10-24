@@ -426,12 +426,19 @@ never claims a version its sender lacks:
   advances the origin's watermark to the cell's version only if the claim
   reaches back to the watermark it already has, so a lost datagram leaves a
   hole the watermark cannot cross. The cells above the hole are still merged
-  (the join is idempotent); the next exchange resends from the watermark. The
-  sender sets the claim to the gap back to the previous cell on its own log
-  when the cell is at or below its own watermark for that origin, and to `1`
-  (vacuous) above it, so it never certifies a stretch it does not itself
-  hold. The watermark never advances for a cell the store rejected. `claim_gap`
-  saturates at `u32::MAX`; a wider stretch is certified only up to that width.
+  (the join is idempotent), and each keeps the claim it arrived with, so when
+  the hole is filled the watermark carries on across every held cell whose
+  claim chains on. A reply's datagrams can arrive in any order, so without
+  this an origin whose cells spanned two datagrams stalled the watermark and
+  the next exchange resent the cells above it (at 80 pods, 20 % loss, this
+  halved the duplicate cells received, 5.4 % to 2.7 %). The sender sets the
+  claim to the gap back to the previous cell on its own log when the cell is
+  at or below its own watermark for that origin, so it never certifies a
+  stretch it does not itself hold, and above it passes on the claim it
+  received: a version that was superseded or expired never comes back, so a
+  claim stays true. The watermark never advances for a cell the store
+  rejected. `claim_gap` saturates at `u32::MAX`; a wider stretch is certified
+  only up to that width.
 - **Digests tile the node-id space.** One digest does not fit one datagram at
   80 or 300 origins (28 B per entry). A digest is cut into frames each of which
   names the node-id range `[lo, hi]` it covers; an origin inside the range

@@ -310,6 +310,10 @@ pub struct CellStore<C: Count = u32> {
     counts: Box<[C]>,
     last_update_millis: Box<[u64]>,
     origin_sequences: Box<[u64]>,
+    // The stretch below a remote cell's version its sender certified empty
+    // (the wire's `claim_gap`), kept so the watermark can later cross a cell
+    // that arrived ahead of the hole below it. Unused for local cells.
+    claims: Box<[u32]>,
 
     // Slot lifecycle.
     generations: Box<[u32]>,
@@ -373,8 +377,13 @@ enum UpsertMode<C: Count> {
     Accumulate { hits: u64 },
     /// Remote observation. The stored count rises to `observed` if and only
     /// if `observed` is strictly greater (CRDT max-merge), and the cell takes
-    /// the `version` its origin assigned to that change.
-    MaxMerge { observed: C, version: u64 },
+    /// the `version` its origin assigned to that change and the sender's
+    /// `claim` below it.
+    MaxMerge {
+        observed: C,
+        version: u64,
+        claim: u32,
+    },
 }
 
 impl<C: Count> CellStore<C> {
@@ -415,6 +424,7 @@ impl<C: Count> CellStore<C> {
             counts: vec![C::default(); cap as usize].into_boxed_slice(),
             last_update_millis: vec![0_u64; cap as usize].into_boxed_slice(),
             origin_sequences: vec![0_u64; cap as usize].into_boxed_slice(),
+            claims: vec![0_u32; cap as usize].into_boxed_slice(),
 
             generations: vec![0_u32; cap as usize].into_boxed_slice(),
             free_next,
@@ -828,13 +838,13 @@ impl<C: Count> CellStore<C> {
     /// absent, for the wire's per-cell claim. A cell at or below the
     /// origin's watermark asserts that nothing exists between it and its
     /// predecessor on the log. A cell above the watermark sits past a
-    /// possible hole, so it asserts only that nothing sits between it and
-    /// the version just before it.
+    /// possible hole, so it passes on the claim it arrived with: versions,
+    /// once superseded or expired, never come back, so a claim stays true.
     pub(crate) fn claim_gap(&self, slot: u32) -> u32 {
         let version = self.origin_sequences[slot as usize];
         let origin = self.origins[slot as usize];
         if version > self.watermarks[origin as usize] {
-            return 1;
+            return self.claims[slot as usize].max(1);
         }
         let before = match self.log_prev[slot as usize] {
             NIL => 0,
@@ -846,12 +856,31 @@ impl<C: Count> CellStore<C> {
     /// Advance `origin`'s watermark to `version` if the sender's claim ties
     /// it to what this node already holds: nothing exists strictly between
     /// `version - gap` and `version`, and the watermark has reached
-    /// `version - gap`.
+    /// `version - gap`. The watermark then keeps going across the cells
+    /// already held above it whose own claims chain on, which is what lets a
+    /// hole filled late (a datagram overtaken by a later one) close at once
+    /// instead of waiting for the cells above it to be sent again.
     fn advance_watermark(&mut self, origin: NodeSlot, version: u64, gap: u32) {
-        let w = &mut self.watermarks[origin as usize];
-        if version > *w && version.saturating_sub(gap as u64) <= *w {
-            *w = version;
+        let mut w = self.watermarks[origin as usize];
+        if version <= w || version.saturating_sub(gap as u64) > w {
+            return;
         }
+        w = version;
+        let mut next = NIL;
+        let mut cursor = self.log_tail[origin as usize];
+        while cursor != NIL && self.origin_sequences[cursor as usize] > w {
+            next = cursor;
+            cursor = self.log_prev[cursor as usize];
+        }
+        while next != NIL {
+            let version = self.origin_sequences[next as usize];
+            if version.saturating_sub(self.claims[next as usize] as u64) > w {
+                break;
+            }
+            w = version;
+            next = self.log_next[next as usize];
+        }
+        self.watermarks[origin as usize] = w;
     }
 
     /// Append a row to the SoA delta sink.
@@ -952,12 +981,13 @@ impl<C: Count> CellStore<C> {
             }
             self.counts[slot as usize] = next;
             self.last_update_millis[slot as usize] = now_millis;
-            let version = match mode {
-                UpsertMode::Accumulate { .. } => self.next_local_version(),
-                UpsertMode::MaxMerge { version, .. } => version,
+            let (version, claim) = match mode {
+                UpsertMode::Accumulate { .. } => (self.next_local_version(), 0),
+                UpsertMode::MaxMerge { version, claim, .. } => (version, claim),
             };
             self.log_unlink(slot, origin_slot);
             self.origin_sequences[slot as usize] = version;
+            self.claims[slot as usize] = claim;
             self.log_link(slot, origin_slot);
             let handle = self.handle_for(slot);
             let delta = C::saturating_delta(next, previous);
@@ -988,11 +1018,12 @@ impl<C: Count> CellStore<C> {
         self.incarnations[slot as usize] = incarnation;
         self.counts[slot as usize] = initial;
         self.last_update_millis[slot as usize] = now_millis;
-        let version = match mode {
-            UpsertMode::Accumulate { .. } => self.next_local_version(),
-            UpsertMode::MaxMerge { version, .. } => version,
+        let (version, claim) = match mode {
+            UpsertMode::Accumulate { .. } => (self.next_local_version(), 0),
+            UpsertMode::MaxMerge { version, claim, .. } => (version, claim),
         };
         self.origin_sequences[slot as usize] = version;
+        self.claims[slot as usize] = claim;
         self.log_link(slot, origin_slot);
 
         // Hold dictionary references on behalf of this cell.
@@ -1136,6 +1167,7 @@ impl<C: Count> CellStore<C> {
                     mode: UpsertMode::MaxMerge {
                         observed: obs.counts[i],
                         version: obs.origin_sequences[i],
+                        claim: obs.claim_gaps[i],
                     },
                 },
                 sink,

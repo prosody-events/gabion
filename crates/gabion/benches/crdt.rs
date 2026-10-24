@@ -713,6 +713,49 @@ fn bench_merge_remote(c: &mut Criterion) {
         });
     }
 
+    // ─── reordered_reply ────────────────────────────────────────────────
+    // A reply's four datagrams overtaking each other on the network: four
+    // origins new to us, 32 versions each, eight per datagram, arriving last
+    // datagram first. The first three park above the watermark; the last
+    // fills the hole and the watermark sweeps across all 128 cells.
+    group.throughput(Throughput::Elements(128));
+    group.bench_function("reordered_reply", |b| {
+        const ORIGINS: u64 = 4;
+        const PER_DATAGRAM: u64 = 8;
+        let mut rng = Rng::new(0x0DD0_0DD0);
+        let datagrams: Vec<ObservationBatch<u32>> = (0..4_u64)
+            .rev()
+            .map(|datagram| {
+                let mut obs = ObservationBatch::<u32>::with_capacity(32);
+                for origin in 0..ORIGINS {
+                    for k in 0..PER_DATAGRAM {
+                        obs.push(obs_row(
+                            fixture.rule_fps[pick_rule(&mut rng) as usize],
+                            KeyHash(fresh_key(&mut rng)),
+                            0,
+                            NodeId(0xBBBB_0000_0000_0000_0000_0000_0000_0000 ^ origin as u128),
+                            1,
+                            1,
+                            0,
+                        ));
+                        stamp_version(&mut obs, 1 + datagram * PER_DATAGRAM + k);
+                    }
+                }
+                obs
+            })
+            .collect();
+        b.iter_batched_ref(
+            || (fixture.store.clone(), DeltaSink::<u32>::with_capacity(32)),
+            |(store, sink)| {
+                for obs in &datagrams {
+                    sink.clear();
+                    store.merge_remote(black_box(obs), 0, black_box(sink));
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     // ─── all_noop ───────────────────────────────────────────────────────
     // Pure fast-path: every row is below stored count ⇒ next == previous.
     // No state change ⇒ iter without cloning.

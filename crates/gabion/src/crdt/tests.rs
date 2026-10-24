@@ -1937,13 +1937,36 @@ fn watermark_follows_only_contiguous_claims() {
     assert_eq!(store.watermark(origin), 5);
     assert_eq!(origin_versions(&store, origin, 0, usize::MAX), [5, 10]);
 
-    // Version 9 closes the hole, but it alone only reaches 9 ...
+    // Version 9 closes the hole, and the watermark carries on across version
+    // 10, already held, whose claim chains onto 9.
     merge_rows(&mut store, 0, &[versioned(9, 7, 1, 9, 4)]);
-    assert_eq!(store.watermark(origin), 9);
-
-    // ... and the next delivery of version 10, already held, finishes it.
-    merge_rows(&mut store, 0, &[versioned(10, 7, 1, 10, 1)]);
     assert_eq!(store.watermark(origin), 10);
+}
+
+#[test]
+fn a_late_hole_fill_carries_the_watermark_across_every_chained_cell() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    // A reply's datagrams arrive last first: 6..=8 chain on each other but
+    // not on the watermark, and 12 sits past a second hole (9, 12).
+    merge_rows(
+        &mut store,
+        0,
+        &[
+            versioned(8, 7, 1, 8, 1),
+            versioned(12, 7, 1, 12, 1),
+            versioned(7, 7, 1, 7, 1),
+            versioned(6, 7, 1, 6, 2),
+        ],
+    );
+    let origin = origin_slot(&store, 7);
+    assert_eq!(store.watermark(origin), 0);
+
+    // Version 4 chains from zero and closes the first hole; the watermark
+    // runs up to 8 and stops below 12, whose claim does not reach 8.
+    merge_rows(&mut store, 0, &[versioned(4, 7, 1, 4, 4)]);
+    assert_eq!(store.watermark(origin), 8);
+    assert_eq!(origin_versions(&store, origin, 8, usize::MAX), [12]);
 }
 
 #[test]
@@ -1983,11 +2006,15 @@ fn claim_gap_certifies_the_stretch_below_a_cell() {
     );
     assert_eq!(store.get(updated).unwrap().origin_sequence, 4);
 
-    // A remote cell past the watermark certifies only the version before it.
+    // A remote cell past the watermark passes on the claim it arrived with.
     merge_rows(
         &mut store,
         0,
-        &[versioned(5, 7, 1, 5, 5), versioned(9, 7, 1, 9, 1)],
+        &[
+            versioned(5, 7, 1, 5, 5),
+            versioned(9, 7, 1, 9, 1),
+            versioned(14, 7, 1, 14, 3),
+        ],
     );
     let origin = origin_slot(&store, 7);
     let mut handles = Vec::new();
@@ -1997,7 +2024,7 @@ fn claim_gap_certifies_the_stretch_below_a_cell() {
             .iter()
             .map(|h| store.claim_gap(h.index))
             .collect::<Vec<_>>(),
-        [5, 1]
+        [5, 1, 3]
     );
 }
 
