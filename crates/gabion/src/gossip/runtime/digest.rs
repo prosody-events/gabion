@@ -3,20 +3,23 @@
 //! Thicket, like Plumtree, is a broadcast and moves no state: a change that
 //! both its tree and the lazy IHAVE path missed (a packet lost past its NACKs,
 //! an announcement lost, a partition, a parent that went silent) is never
-//! sent again. Once per bucket a node sends one random peer a digest of each
-//! rule's settled buckets: per origin, the sum of the counts it holds in each.
-//! A bucket is settled when it closed at least one bucket ago and is not the
-//! oldest still in the window, so changes in flight and expiry timing do not
-//! make two up-to-date nodes disagree. The peer pushes back the cells of each
-//! origin and bucket where it holds more, and of each origin the digest's
-//! range leaves out, which the sender holds none of: the sender is repaired.
+//! sent again. Once per bucket, and at every heartbeat while repair keeps
+//! bringing news, a node sends one random peer a digest of each rule's
+//! settled buckets: per origin, the sum of the counts it holds in each. A
+//! bucket is settled once it closed at least one bucket ago, so changes in
+//! flight do not make two up-to-date nodes disagree. The peer pushes back the
+//! cells of each origin and bucket where it holds more, and of each origin the
+//! digest's range leaves out, which the sender holds none of: the sender is
+//! repaired. Where the sender holds more, the peer answers with its own
+//! digest of the same range, marked as a reply, which the sender answers by
+//! pushing: one exchange repairs both, as Scuttlebutt's does.
 //!
 //! This replaces the blind repair slice, which sent a random peer the next
 //! 256 cells of the store whatever it held.
 
 use crate::crdt::{BucketEpoch, Count, NodeSlot, RuleSlot};
 use crate::defaults::{THICKET_DIGEST_BUCKETS, THICKET_DIGEST_PUSH_CELLS};
-use crate::wire::{DigestFrame, DigestWriter, decode_digest};
+use crate::wire::{DigestFrame, DigestScope, DigestWriter, decode_digest};
 
 use super::super::clock::Clock;
 use super::super::store::AggregateStore;
@@ -32,6 +35,9 @@ pub(super) struct Digests {
     /// Sum over rules of the newest settled bucket when the last digest went
     /// out: a digest is due when it moves.
     sent_mark: u64,
+    /// Cells from outside the trees changed the store since the last digest:
+    /// repair is under way, so the next heartbeat sends another.
+    pub repairing: bool,
     /// Count sums, `THICKET_DIGEST_BUCKETS` per row: a row per origin slot
     /// while building, per received group while answering.
     acc: Box<[u32]>,
@@ -56,6 +62,7 @@ impl Digests {
         let groups = max_payload_bytes / 24 + 1;
         Self {
             sent_mark: 0,
+            repairing: false,
             acc: vec![0; node_capacity.max(groups) * THICKET_DIGEST_BUCKETS].into_boxed_slice(),
             order: Vec::with_capacity(node_capacity),
             listed: vec![false; node_capacity].into_boxed_slice(),
@@ -94,43 +101,56 @@ where
     K: Clock,
 {
     /// Rule `slot`'s settled buckets at `now`, at most the newest
-    /// `THICKET_DIGEST_BUCKETS`: those closed at least one bucket ago, except
-    /// the oldest still in the window. `None` for a window too short to have
-    /// any.
+    /// `THICKET_DIGEST_BUCKETS`: those still in the window that closed at
+    /// least one bucket ago. `None` for a window too short to have any.
     fn settled(&self, slot: RuleSlot, now: u64) -> Option<Settled> {
         let rule = self.store.rule_dictionary().descriptor(slot)?;
         let current = rule.current_epoch(now);
         let last = current.checked_sub(2)?;
-        let oldest = (current + 1).saturating_sub(rule.live_buckets());
+        let oldest = current.saturating_sub(rule.live_buckets());
         let first = oldest.max((last + 1).saturating_sub(THICKET_DIGEST_BUCKETS as u32));
         (first <= last).then_some(Settled { first, last })
     }
 
     /// Heartbeat: once a rule's newest settled bucket has moved since the
-    /// last digest, send one random peer a digest of every rule.
+    /// last digest, or while repair keeps bringing news, send one random peer
+    /// a digest of every rule.
     pub(super) fn digest_due(&mut self, now: u64) {
+        for peer in &mut self.thicket.peers {
+            peer.repair_sent = 0;
+        }
         let rules = self.store.rule_dictionary().capacity() as RuleSlot;
         let mark = (0..rules)
             .filter_map(|r| self.settled(r, now))
             .map(|s| u64::from(s.last))
             .sum();
-        if mark == self.digests.sent_mark {
+        if mark == self.digests.sent_mark && !self.digests.repairing {
             return;
         }
         self.digests.sent_mark = mark;
+        self.digests.repairing = false;
         let Some(peer) = self.thicket.random_alive(&mut self.rng, |_| false) else {
             return;
         };
         for rule in 0..rules {
             if let Some(settled) = self.settled(rule, now) {
-                self.send_digest(peer, rule, settled);
+                self.send_digest(peer, rule, settled, 0..u128::MAX, false);
             }
         }
     }
 
-    /// Sum this node's settled cells of `rule` per origin and bucket, and
-    /// send them to `peer` in node id order, as many frames as they take.
-    fn send_digest(&mut self, peer: u16, rule: RuleSlot, settled: Settled) {
+    /// Sum this node's settled cells of `rule` per origin and bucket, for the
+    /// origins whose node id is in `range`, and send them to `peer` in node id
+    /// order, as many frames as they take. A `reply` asks to be answered by
+    /// pushing only.
+    fn send_digest(
+        &mut self,
+        peer: u16,
+        rule: RuleSlot,
+        settled: Settled,
+        range: std::ops::Range<u128>,
+        reply: bool,
+    ) {
         let n = settled.len();
         let fingerprint = self
             .store
@@ -155,6 +175,9 @@ where
                 let Some(node) = self.store.node_dictionary().descriptor(origin) else {
                     continue;
                 };
+                if !range.contains(&node.node_id.0) {
+                    continue;
+                }
                 d.listed[usize::from(origin)] = true;
                 d.order.push((node.node_id.0, origin));
             }
@@ -162,10 +185,15 @@ where
             *sum = sum.saturating_add(count_u32(row.count));
         }
         d.order.sort_unstable_by_key(|&(node_id, _)| node_id);
+        // A digest of nothing still says so when it answers one; unprompted,
+        // a rule this node holds nothing of is left to the trees.
+        if d.order.is_empty() && !reply {
+            return;
+        }
 
         let key = self.config.auth_key.as_ref();
         let mut next = 0;
-        let mut lo = 0;
+        let mut lo = range.start;
         let mut unsent = 0;
         loop {
             let Some(slot) = self.send_free.pop() else {
@@ -173,15 +201,15 @@ where
                 break;
             };
             let buf = &mut self.send_pool[usize::from(slot)];
-            let Ok(mut writer) = DigestWriter::begin(
-                buf,
-                fingerprint,
-                settled.first,
-                n as u8,
-                lo,
-                key.is_some(),
-                self.config.wire_limits,
-            ) else {
+            let scope = DigestScope {
+                rule_fingerprint: fingerprint,
+                first_bucket: settled.first,
+                buckets: n as u8,
+                reply,
+            };
+            let Ok(mut writer) =
+                DigestWriter::begin(buf, scope, lo, key.is_some(), self.config.wire_limits)
+            else {
                 self.send_free.push(slot);
                 break;
             };
@@ -197,7 +225,7 @@ where
                 );
                 next += 1;
             }
-            let hi = d.order.get(next).map_or(u128::MAX, |&(node_id, _)| node_id);
+            let hi = d.order.get(next).map_or(range.end, |&(node_id, _)| node_id);
             writer.finish(header, hi, key);
             self.send_pending.push_back((addr, slot));
             if next == d.order.len() {
@@ -219,11 +247,13 @@ where
 
     /// A digest frame from `peer`: push back what this node holds more of in
     /// the buckets it names, for the origins it lists and for those in its
-    /// range it leaves out.
+    /// range it leaves out, and, unless it is a reply, answer with this
+    /// node's own digest of that range where the peer holds more.
     pub(super) fn handle_digest(&mut self, peer: u16, len: usize) {
         let d = &mut self.digests;
         d.groups.clear();
         d.theirs.clear();
+        let mut unknown = false;
         let store = &self.store;
         let decoded = decode_digest(
             &self.recv_buf[..len],
@@ -231,6 +261,8 @@ where
             self.config.wire_limits,
             |node_id, incarnation, sums| {
                 let Some(origin) = store.find_node(node_id, incarnation) else {
+                    // The peer holds an origin this node has never seen.
+                    unknown |= (0..sums.len()).any(|i| sums.get(i) != 0);
                     return;
                 };
                 if d.group_of[usize::from(origin)] != NONE || d.groups.len() == d.groups.capacity()
@@ -243,7 +275,7 @@ where
             },
         );
         match decoded {
-            Ok(frame) => self.answer_digest(peer, &frame),
+            Ok(frame) => self.answer_digest(peer, &frame, unknown),
             Err(err) => {
                 let src = self.thicket.peers[usize::from(peer)].addr;
                 self.note_decode_reject(src, &err);
@@ -255,19 +287,28 @@ where
         }
     }
 
-    fn answer_digest(&mut self, peer: u16, frame: &DigestFrame) {
-        let Some(rule) = self.store.find_rule(frame.rule_fingerprint) else {
-            return;
-        };
-        let n = usize::from(frame.buckets);
+    fn answer_digest(&mut self, peer: u16, frame: &DigestFrame, unknown: bool) {
+        let scope = frame.scope;
+        let n = usize::from(scope.buckets);
         if n == 0 || n > THICKET_DIGEST_BUCKETS {
             return;
         }
-        let settled = Settled {
-            first: frame.first_bucket,
-            last: frame.first_bucket + (n as u32 - 1),
+        let Some(settled) = scope
+            .first_bucket
+            .checked_add(n as u32 - 1)
+            .map(|last| Settled {
+                first: scope.first_bucket,
+                last,
+            })
+        else {
+            return;
         };
-        let cap = THICKET_DIGEST_PUSH_CELLS.min(self.config.max_cells_per_tick);
+        let Some(rule) = self.store.find_rule(scope.rule_fingerprint) else {
+            return;
+        };
+        let cap = THICKET_DIGEST_PUSH_CELLS
+            .min(self.config.max_cells_per_tick)
+            .saturating_sub(self.thicket.peers[usize::from(peer)].repair_sent);
         let mut push = std::mem::take(&mut self.frame_handles);
         push.clear();
         let d = &mut self.digests;
@@ -331,10 +372,15 @@ where
                 }
             }
         }
+        let behind = unknown || (0..d.groups.len() * n).any(|i| d.theirs[i] > d.acc[i]);
         if !push.is_empty() {
+            self.thicket.peers[usize::from(peer)].repair_sent += push.len();
             self.send_cells(peer, &push, Lane::Pull);
         }
         self.frame_handles = push;
+        if behind && !scope.reply {
+            self.send_digest(peer, rule, settled, frame.lo..frame.hi, true);
+        }
     }
 }
 

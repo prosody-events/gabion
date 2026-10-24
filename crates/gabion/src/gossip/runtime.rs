@@ -586,6 +586,7 @@ where
                 }
             } else {
                 let news = !self.sink_buf.is_empty();
+                self.digests.repairing |= news;
                 self.catch_up_received(peer, summary.flags, news, now);
             }
         }

@@ -438,7 +438,7 @@ All are constants in `gabion::defaults` (`THICKET_*`). They are not
 | `THICKET_NACK_RETRY_MS` | 100 | wait before asking for a lost packet again |
 | `THICKET_REPAIR_CELLS` | 256 | cells of the store slice a catching-up node asks for in one request |
 | `THICKET_DIGEST_BUCKETS` | 64 | newest settled buckets of a rule a repair digest compares |
-| `THICKET_DIGEST_PUSH_CELLS` | 1024 | most cells pushed back in answer to one digest frame |
+| `THICKET_DIGEST_PUSH_CELLS` | 1024 | most cells pushed to one peer in answer to its digests between two heartbeats |
 | `THICKET_LEAF_CHILDREN_MIN` | 8 | leaf children an interior node takes at least before refusing an attach |
 | `THICKET_MISSING_CAPACITY` | 4096 | announced changes tracked at once |
 | `THICKET_GRAFT_ATTEMPTS` | 3 | GRAFTs sent for one change |
@@ -538,26 +538,31 @@ data and UDP.
   parent that went silent, a joiner that peers did not know yet) would never
   hear of the change: the papers are a broadcast and move no state. The
   backstop is a Scuttlebutt-style digest exchange, adapted to cells. Once per
-  bucket (at the first heartbeat after a rule's newest settled bucket moves) a
-  node sends one random peer a digest of each rule's settled buckets: per
-  origin, the sum of the counts it holds in each bucket (`wire::digest`; 20
-  bytes per origin plus 4 per bucket). A bucket is settled once it closed at
-  least one bucket ago, and stays so until it is the oldest in the window, so
-  changes in flight and the moment each node expires a bucket do not make two
-  up-to-date nodes disagree; at most the newest 64 are compared. Each frame
-  lists origins in node id order and names the node ids it covers, so an
-  origin in its range that it leaves out is one the sender holds none of. The
-  peer pushes back, outside the trees, the cells of each listed origin and
-  bucket where its sum is higher, and every settled cell of an origin in range
-  that is not listed, up to 1,024 cells per frame. Counts only grow, so a
-  higher sum means the peer holds something the sender lacks; equal sums of
-  different cells, or each side lacking something, are left to the sender's
-  next digest to another peer. The digest replaces the blind repair slice,
-  which sent a random peer the next 256 cells of the store whatever it held:
-  when nodes agree a digest costs a fraction of the slice's bytes, and it
-  repairs within a round trip what the slice took tens of seconds to reach. A rule
-  interned without a window (the fallback for a fingerprint no config names)
-  has no settled buckets, so only the trees and IHAVE carry it.
+  bucket (at the first heartbeat after a rule's newest settled bucket moves),
+  and at every heartbeat while cells from outside the trees keep changing its
+  store, a node sends one random peer a digest of each rule's settled buckets:
+  per origin, the sum of the counts it holds in each bucket (`wire::digest`;
+  20 bytes per origin plus 4 per bucket). A bucket is settled once it closed
+  at least one bucket ago, so changes in flight do not make two up-to-date
+  nodes disagree; at most the newest 64 still in the window are compared.
+  Each frame lists origins in node id order and names the node ids it covers,
+  so an origin in its range that it leaves out is one the sender holds none
+  of. The peer pushes back, outside the trees, the cells of each listed
+  origin and bucket where its sum is higher, and every settled cell of an
+  origin in range that is not listed, up to 1,024 cells to one peer between
+  two heartbeats. Counts only grow, so a higher sum means the peer holds
+  something the sender lacks. Where the sender's sum is higher, or it lists
+  an origin the peer has never seen, the peer also answers with its own digest
+  of that range, marked as a reply, which the sender answers by pushing and
+  never with a digest: as in Scuttlebutt, one exchange repairs both sides.
+  Equal sums of different cells are left to the next exchange with another
+  peer. A rule a node holds no settled cells of is left out of its unprompted
+  digests. The digest replaces the blind repair slice, which sent a random
+  peer the next 256 cells of the store whatever it held: when nodes agree a
+  digest costs a fraction of the slice's bytes, and it repairs within a round
+  trip what the slice took tens of seconds to reach. A rule interned without
+  a window (the fallback for a fingerprint no config names) has no settled
+  buckets, so only the trees and IHAVE carry it.
 - **Catching up.** The papers do not move state to a node that joins, because
   a broadcast has none. A node with an empty store that discovery adds a
   peer to asks a random peer for the next slice of its store (`Pull` control

@@ -32,13 +32,16 @@ fn hold(rt: &mut IdleRuntime, cells: &[(u128, BucketEpoch, u32)]) {
     assert_eq!(sink.len(), cells.len());
 }
 
-/// Deliver every frame `from` has queued to `to`, as from peer `peer`.
+/// Deliver every digest frame `from` has queued to `to`, as from peer
+/// `peer`, and drop the rest of `from`'s queue.
 fn deliver_digests(from: &mut IdleRuntime, to: &mut IdleRuntime, peer: u16) {
     for (_, slot) in std::mem::take(&mut from.send_pending) {
         let bytes = from.send_pool[usize::from(slot)].as_bytes();
-        assert!(wire::is_digest(bytes));
-        to.recv_buf[..bytes.len()].copy_from_slice(bytes);
-        to.handle_digest(peer, bytes.len());
+        if wire::is_digest(bytes) {
+            to.recv_buf[..bytes.len()].copy_from_slice(bytes);
+            to.handle_digest(peer, bytes.len());
+        }
+        from.send_free.push(slot);
     }
 }
 
@@ -47,6 +50,9 @@ fn pushed(rt: &IdleRuntime) -> BTreeSet<(u128, BucketEpoch, u32)> {
     let mut cells = BTreeSet::new();
     for &(_, slot) in &rt.send_pending {
         let bytes = rt.send_pool[usize::from(slot)].as_bytes();
+        if wire::is_control(bytes) {
+            continue;
+        }
         wire::decode_unauth_visit::<u32>(
             bytes,
             rt.config.wire_limits,
@@ -63,13 +69,13 @@ fn pushed(rt: &IdleRuntime) -> BTreeSet<(u128, BucketEpoch, u32)> {
 fn digest(rt: &mut IdleRuntime, to: u16) {
     let rule = rt.store.find_rule(rule_fp(0)).unwrap();
     let settled = rt.settled(rule, NOW).unwrap();
-    rt.send_digest(to, rule, settled);
+    rt.send_digest(to, rule, settled, 0..u128::MAX, false);
 }
 
 #[test]
-fn settled_buckets_skip_the_newest_two_and_the_oldest_in_the_window() {
+fn settled_buckets_are_those_in_the_window_closed_a_bucket_ago() {
     run_paused(async {
-        let rt = idle_runtime(&SimRouter::new(), &addrs(4), 0);
+        let mut rt = idle_runtime(&SimRouter::new(), &addrs(4), 0);
         let rule = rt.store.find_rule(rule_fp(0)).unwrap();
         let s = rt.settled(rule, NOW).unwrap();
         assert_eq!((s.first, s.last), (0, 28));
@@ -77,6 +83,18 @@ fn settled_buckets_skip_the_newest_two_and_the_oldest_in_the_window() {
         let late = 10 * 3_600_000;
         let s = rt.settled(rule, late).unwrap();
         assert_eq!((s.first, s.last), (359_998 - 63, 359_998));
+        // A window shorter than the cap: from the oldest bucket still in it.
+        let mut short = rt
+            .store
+            .rule_dictionary()
+            .descriptor(rule)
+            .copied()
+            .unwrap();
+        short.fingerprint = 0x5;
+        short.window_millis = 1_000;
+        let short = rt.store.intern_rule(short).unwrap();
+        let s = rt.settled(short, NOW).unwrap();
+        assert_eq!((s.first, s.last), (20, 28));
         assert!(rt.settled(rule, 150).is_none(), "nothing has settled yet");
     });
 }
@@ -151,5 +169,100 @@ fn a_digest_spanning_frames_lists_every_origin_in_one_of_them() {
         deliver_digests(&mut a, &mut b, a_in_b);
 
         assert!(b.send_pending.is_empty(), "pushed {:?}", pushed(&b));
+    });
+}
+
+/// The digest frames `rt` has queued, by their reply mark.
+fn digests_queued(rt: &IdleRuntime) -> Vec<bool> {
+    rt.send_pending
+        .iter()
+        .filter_map(|&(_, slot)| {
+            let bytes = rt.send_pool[usize::from(slot)].as_bytes();
+            let frame = wire::decode_digest(bytes, None, rt.config.wire_limits, |_, _, _| {});
+            frame.ok().map(|f| f.scope.reply)
+        })
+        .collect()
+}
+
+#[test]
+fn a_digest_from_a_node_ahead_is_answered_with_a_reply_that_repairs_this_one() {
+    run_paused(async {
+        let all = addrs(4);
+        let router = SimRouter::new();
+        let mut a = idle_runtime(&router, &all, 0);
+        let mut b = idle_runtime(&router, &all, 1);
+        // A holds more of X, and an origin Y that B has never seen.
+        hold(&mut a, &[(0xF1, 10, 5), (0xF2, 11, 2)]);
+        hold(&mut b, &[(0xF1, 10, 1)]);
+
+        let b_in_a = a.thicket.index_of(all[1]).unwrap();
+        let a_in_b = b.thicket.index_of(all[0]).unwrap();
+        digest(&mut a, b_in_a);
+        deliver_digests(&mut a, &mut b, a_in_b);
+        assert!(pushed(&b).is_empty(), "B holds nothing A lacks");
+        assert_eq!(digests_queued(&b), vec![true], "B answers with a reply");
+
+        // A answers the reply by pushing what B lacks, and sends no digest.
+        deliver_digests(&mut b, &mut a, b_in_a);
+        assert_eq!(pushed(&a), BTreeSet::from([(0xF1, 10, 5), (0xF2, 11, 2)]));
+        assert!(digests_queued(&a).is_empty());
+    });
+}
+
+#[test]
+fn a_digest_is_due_once_a_bucket_and_each_heartbeat_while_repair_brings_news() {
+    run_paused(async {
+        let all = addrs(4);
+        let mut rt = idle_runtime(&SimRouter::new(), &all, 0);
+        hold(&mut rt, &[(0xF1, 10, 1)]);
+        let sent = |rt: &mut IdleRuntime| {
+            let n = digests_queued(rt).len();
+            rt.send_pending.clear();
+            n
+        };
+        rt.digest_due(NOW);
+        assert_eq!(sent(&mut rt), 1);
+        rt.digest_due(NOW + 50);
+        assert_eq!(sent(&mut rt), 0, "same bucket, nothing new");
+        rt.digests.repairing = true;
+        rt.digest_due(NOW + 60);
+        assert_eq!(sent(&mut rt), 1, "repair brought news");
+        rt.digest_due(NOW + 70);
+        assert_eq!(sent(&mut rt), 0);
+        rt.digest_due(NOW + 100);
+        assert_eq!(sent(&mut rt), 1, "a bucket later");
+    });
+}
+
+#[test]
+fn pushes_to_one_peer_are_capped_between_heartbeats() {
+    run_paused(async {
+        let all = addrs(4);
+        let router = SimRouter::new();
+        let mut a = idle_runtime(&router, &all, 0);
+        let mut b = idle_runtime(&router, &all, 1);
+        hold(&mut a, &[(0xF1, 5, 1)]);
+        let theirs: Vec<_> = (0..6).map(|o| (0x100 + o, 6, 1)).collect();
+        hold(&mut b, &theirs);
+        b.config.max_cells_per_tick = 4;
+        let b_in_a = a.thicket.index_of(all[1]).unwrap();
+        let a_in_b = b.thicket.index_of(all[0]).unwrap();
+        let exchange = |a: &mut IdleRuntime, b: &mut IdleRuntime| {
+            digest(a, b_in_a);
+            deliver_digests(a, b, a_in_b);
+            let n = pushed(b).len();
+            b.send_pending.clear();
+            n
+        };
+
+        assert_eq!(exchange(&mut a, &mut b), 4);
+        assert_eq!(
+            exchange(&mut a, &mut b),
+            0,
+            "the cap holds until the heartbeat"
+        );
+        b.digest_due(NOW);
+        b.send_pending.clear();
+        assert_eq!(exchange(&mut a, &mut b), 4);
     });
 }

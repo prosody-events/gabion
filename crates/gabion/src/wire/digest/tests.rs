@@ -1,5 +1,7 @@
 use super::*;
-use crate::wire::{ControlKind, decode_control, encode_control, is_control, is_digest};
+use crate::wire::{
+    ControlKind, DigestScope, decode_control, encode_control, is_control, is_digest,
+};
 
 const KEY: HmacKey = HmacKey([9; 32]);
 
@@ -21,12 +23,21 @@ fn limits() -> FrameLimits {
 
 type Group = (NodeId, Incarnation, Vec<u32>);
 
+fn scope(buckets: u8) -> DigestScope {
+    DigestScope {
+        rule_fingerprint: 0xF00D,
+        first_bucket: 40,
+        buckets,
+        reply: buckets.is_multiple_of(2),
+    }
+}
+
 /// Write as many of `groups` as fit one frame; returns the frame and how many
 /// were written.
 fn write(groups: &[Group], buckets: u8, key: Option<&HmacKey>) -> (PacketBuf, usize) {
     let mut buf = PacketBuf::for_limits(limits());
     let mut writer =
-        DigestWriter::begin(&mut buf, 0xF00D, 40, buckets, 5, key.is_some(), limits()).unwrap();
+        DigestWriter::begin(&mut buf, scope(buckets), 5, key.is_some(), limits()).unwrap();
     let mut written = 0;
     for (node_id, incarnation, sums) in groups {
         if !writer.has_room() {
@@ -75,16 +86,8 @@ fn a_digest_round_trips_with_and_without_auth() {
         assert!(is_control(buf.as_bytes()) && is_digest(buf.as_bytes()));
         let (frame, got) = read(&buf, key).unwrap();
         assert_eq!(got, all);
-        assert_eq!(
-            (
-                frame.rule_fingerprint,
-                frame.first_bucket,
-                frame.buckets,
-                frame.lo,
-                frame.hi
-            ),
-            (0xF00D, 40, 8, 5, u128::MAX)
-        );
+        assert_eq!(frame.scope, scope(8));
+        assert_eq!((frame.lo, frame.hi), (5, u128::MAX));
         assert_eq!(frame.header.sender_node_id, 0xAA);
     }
 }
@@ -159,9 +162,20 @@ fn a_budget_too_small_for_one_group_is_refused() {
         max_cells: 1,
     };
     let mut buf = PacketBuf::for_limits(tiny);
-    assert!(DigestWriter::begin(&mut buf, 1, 0, 1, 0, false, tiny).is_ok());
+    assert!(DigestWriter::begin(&mut buf, scope(1), 0, false, tiny).is_ok());
     assert_eq!(
-        DigestWriter::begin(&mut buf, 1, 0, 2, 0, false, tiny).err(),
+        DigestWriter::begin(&mut buf, scope(2), 0, false, tiny).err(),
         Some(EncodeError::BudgetTooSmall)
     );
+}
+
+#[test]
+fn the_reply_mark_round_trips() {
+    for buckets in [3, 4] {
+        let (buf, _) = write(&groups(1, u32::from(buckets)), buckets, None);
+        assert_eq!(
+            read(&buf, None).unwrap().0.scope.reply,
+            buckets.is_multiple_of(2)
+        );
+    }
 }

@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! [ kind         : u8     ]    7, beside the ControlKind codes
-//! [ reserved     : u8     ]
+//! [ reply        : u8     ]    1: answer by pushing only, not with a digest
 //! [ group_count  : u16    ]    G
 //! [ rule_fp      : u128   ]
 //! [ first_bucket : u32    ]
@@ -45,13 +45,23 @@ const HI_AT: usize = LO_AT + 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DigestFrame {
     pub header: Header,
-    pub rule_fingerprint: u128,
-    pub first_bucket: BucketEpoch,
-    pub buckets: u8,
+    pub scope: DigestScope,
     /// Every origin whose node id is in `lo..hi` and that holds anything in
     /// these buckets is listed in this frame.
     pub lo: u128,
     pub hi: u128,
+}
+
+/// What a digest frame summarises: which rule and buckets, and whether it
+/// answers another digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DigestScope {
+    pub rule_fingerprint: u128,
+    pub first_bucket: BucketEpoch,
+    pub buckets: u8,
+    /// The digest answers another: its receiver pushes, and sends no digest
+    /// back.
+    pub reply: bool,
 }
 
 /// One group's per-bucket sums, as they lie in the frame.
@@ -83,19 +93,16 @@ pub struct DigestWriter<'b> {
 }
 
 impl<'b> DigestWriter<'b> {
-    /// Start a frame for `buckets` buckets of rule `rule_fingerprint` from
-    /// `first_bucket`, covering origins from node id `lo`.
+    /// Start a frame for `scope`, covering origins from node id `lo`.
     pub fn begin(
         buf: &'b mut PacketBuf,
-        rule_fingerprint: u128,
-        first_bucket: BucketEpoch,
-        buckets: u8,
+        scope: DigestScope,
         lo: u128,
         authenticated: bool,
         limits: FrameLimits,
     ) -> Result<Self, EncodeError> {
         let tag = if authenticated { AUTH_TAG_LEN } else { 0 };
-        let group = GROUP_IDENT + 4 * usize::from(buckets);
+        let group = GROUP_IDENT + 4 * usize::from(scope.buckets);
         let room = limits
             .max_payload_bytes
             .checked_sub(HEADER_LEN + FIXED + tag)
@@ -104,16 +111,18 @@ impl<'b> DigestWriter<'b> {
         buf.inner.clear();
         buf.inner.resize(HEADER_LEN, 0);
         buf.inner.push(DIGEST_KIND);
-        buf.inner.push(0);
+        buf.inner.push(u8::from(scope.reply));
         buf.inner.extend_from_slice(&0u16.to_le_bytes());
-        buf.inner.extend_from_slice(&rule_fingerprint.to_le_bytes());
-        buf.inner.extend_from_slice(&first_bucket.to_le_bytes());
-        buf.inner.push(buckets);
+        buf.inner
+            .extend_from_slice(&scope.rule_fingerprint.to_le_bytes());
+        buf.inner
+            .extend_from_slice(&scope.first_bucket.to_le_bytes());
+        buf.inner.push(scope.buckets);
         buf.inner.extend_from_slice(&lo.to_le_bytes());
         buf.inner.extend_from_slice(&u128::MAX.to_le_bytes());
         Ok(Self {
             buf,
-            buckets: usize::from(buckets),
+            buckets: usize::from(scope.buckets),
             groups: 0,
             room,
         })
@@ -199,6 +208,7 @@ pub fn decode_digest(
         return Err(DecodeError::BadControl);
     }
     let at = |i: usize| HEADER_LEN + i;
+    let reply = frame[at(1)] & 1 != 0;
     let groups = usize::from(u16::from_le_bytes([frame[at(2)], frame[at(3)]]));
     let u128_at = |i: usize| u128::from_le_bytes(std::array::from_fn(|k| frame[i + k]));
     let rule_fingerprint = u128_at(at(BODY_PREFIX));
@@ -218,9 +228,12 @@ pub fn decode_digest(
     }
     Ok(DigestFrame {
         header,
-        rule_fingerprint,
-        first_bucket,
-        buckets,
+        scope: DigestScope {
+            rule_fingerprint,
+            first_bucket,
+            buckets,
+            reply,
+        },
         lo,
         hi,
     })

@@ -58,6 +58,9 @@ pub(super) struct TreePeer {
     pub leaf_child: bool,
     /// When a packet from this peer last arrived, or discovery added it.
     pub heard_ms: u64,
+    /// Cells pushed to this peer in answer to its digests since the last
+    /// heartbeat.
+    pub repair_sent: usize,
     pub edge: Edge,
 }
 
@@ -222,6 +225,7 @@ impl Thicket {
             view_pos: NO_POS,
             leaf_child: false,
             heard_ms: now_ms,
+            repair_sent: 0,
             edge: Edge::new(),
         };
         let idx = match self.peers.iter().position(|p| !p.alive) {

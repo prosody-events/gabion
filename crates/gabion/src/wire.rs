@@ -36,7 +36,7 @@ pub use control::{
     CONTROL_ENTRY_BYTES, ControlEntry, ControlKind, DecodedControl, NO_CELLS, PULL_ONLY_TREE,
     decode_control, encode_control, is_control, is_digest,
 };
-pub use digest::{DigestFrame, DigestSums, DigestWriter, decode_digest};
+pub use digest::{DigestFrame, DigestScope, DigestSums, DigestWriter, decode_digest};
 pub use header::{
     FLAG_AUTHENTICATED, FLAG_CONTROL, FLAG_EDGE, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION,
 };
