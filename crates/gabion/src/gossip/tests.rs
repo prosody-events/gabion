@@ -26,7 +26,7 @@ use crate::discovery::{Peer, PeerEvent};
 use crate::gossip::UdpTransport;
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance, sim_advance_ticks};
 use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, parse_cluster_id};
-use crate::wire::HmacKey;
+use crate::wire::{FrameLimits, HmacKey};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 
@@ -792,6 +792,63 @@ fn sim_relay_round_forwards_before_the_heartbeat() {
     })
 }
 
+/// A relay round forwards what a node merged and nothing of its own: B takes
+/// a hit well under its error budget just before A's flush reaches it, and
+/// C learns A's hits within the relay pacing but B's only at B's heartbeat.
+#[test]
+fn sim_relay_round_leaves_the_nodes_own_changes_to_the_heartbeat() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = [sock(45_150), sock(45_151), sock(45_152)];
+        let peers = [vec![addrs[1]], vec![addrs[0], addrs[2]], vec![addrs[1]]];
+        let mut clients = Vec::new();
+        let mut handles = Vec::new();
+        let mut aggregates = Vec::new();
+        for (i, addr) in addrs.iter().enumerate() {
+            let identity = NodeIdentity::new(NodeId(0xD8 + i as u128), 1);
+            let mut cfg = sim_config(identity, peers[i].clone(), 7 + i as u64);
+            cfg.fanout = 2;
+            cfg.tick_interval = Duration::from_secs(10);
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(*addr),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(identity),
+                agg.clone(),
+            );
+            handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
+            clients.push(client);
+            aggregates.push(agg);
+        }
+        sim_advance(Duration::from_millis(1)).await;
+
+        clients[1]
+            .record(0xBEEF, KeyHash(2), 0, 1, 0, 0)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            clients[0]
+                .record(0xFACE, KeyHash(1), 0, 2, 0, 0)
+                .await
+                .unwrap();
+        }
+        sim_advance_ticks(Duration::from_millis(10), 10).await;
+        let before_heartbeat = aggregates[2].total();
+        sim_advance_ticks(Duration::from_secs(1), 10).await;
+        let after_heartbeat = aggregates[2].total();
+
+        for client in clients {
+            client.shutdown().await.unwrap();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        assert_eq!(before_heartbeat, 4);
+        assert_eq!(after_heartbeat, 5);
+    })
+}
+
 /// A member that discovers a new peer sends it its own live cells at once,
 /// so the newcomer does not wait for the repair lane to learn the window.
 #[test]
@@ -921,6 +978,87 @@ fn sim_peer_heard_after_silence_is_welcomed_back() {
         let _ = h_b.await;
         assert_eq!(before, 4);
         assert_eq!(after, 4 + 2 + 6);
+    })
+}
+
+/// A store larger than one welcome chunk, at production sizing, reaches the
+/// newcomer in full: the welcome resumes as the send pool drains, long
+/// before the 10 s heartbeat.
+#[test]
+fn sim_welcome_of_a_store_larger_than_the_send_pool_arrives_in_chunks() {
+    const KEYS: u64 = 5_000;
+    run_paused(async {
+        let router = SimRouter::new();
+        let addr_a = sock(45_400);
+        let addr_b = sock(45_401);
+        let id_a = NodeIdentity::new(NodeId(0xA0), 1);
+        let id_b = NodeIdentity::new(NodeId(0xA1), 1);
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel::<PeerEvent>();
+        let peer_stream = futures::stream::unfold(peer_rx, |mut rx| async move {
+            rx.recv().await.map(|evt| (evt, rx))
+        });
+        let production = |identity, seed| {
+            let mut cfg = sim_config(identity, Vec::new(), seed);
+            cfg.tick_interval = Duration::from_secs(10);
+            cfg.max_cells_per_tick = crate::defaults::GOSSIP_MAX_CELLS_PER_TICK;
+            cfg.send_queue_capacity = crate::defaults::GOSSIP_SEND_QUEUE_CAPACITY;
+            cfg.wire_limits = FrameLimits {
+                max_payload_bytes: crate::defaults::GOSSIP_MAX_PAYLOAD_BYTES,
+                max_cells: crate::defaults::GOSSIP_MAX_CELLS_PER_FRAME,
+            };
+            cfg
+        };
+        let store = |identity| {
+            CellStore::<u32>::new(
+                CellStoreConfig {
+                    cell_capacity: 16_384,
+                    rule_dictionary_capacity: 8,
+                    node_dictionary_capacity: 32,
+                    local_dirty_capacity: 16_384,
+                    forwarded_dirty_capacity: 16_384,
+                    peer_capacity: 16,
+                },
+                identity,
+            )
+        };
+        // More cells than the pool carries in one chunk.
+        let cells_per_packet =
+            crate::wire::min_cells_per_packet::<u32>(production(id_a, 1).wire_limits, false);
+        assert!(KEYS as usize > crate::defaults::GOSSIP_SEND_QUEUE_CAPACITY * cells_per_packet);
+
+        let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let (rt_a, client_a) = GossipRuntime::from_parts(
+            router.bind(addr_a),
+            TokioClock::from_millis(0),
+            production(id_a, 1),
+            store(id_a),
+            Rc::new(InMemoryAggregateStore::<u32>::new()),
+        );
+        let (rt_b, client_b) = GossipRuntime::from_parts(
+            router.bind(addr_b),
+            TokioClock::from_millis(0),
+            production(id_b, 2),
+            store(id_b),
+            agg_b.clone(),
+        );
+        let h_a = tokio::task::spawn_local(rt_a.run(peer_stream));
+        let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+        sim_advance(Duration::from_millis(1)).await;
+        for key in 0..KEYS {
+            client_a
+                .record(0xFACE, KeyHash(u128::from(key) + 1), 0, 1, 1_000_000, 0)
+                .await
+                .unwrap();
+        }
+        peer_tx.send(PeerEvent::Added(Peer::new(addr_b))).unwrap();
+        sim_advance_ticks(Duration::from_millis(10), 100).await;
+        let got = agg_b.total();
+
+        client_a.shutdown().await.unwrap();
+        client_b.shutdown().await.unwrap();
+        let _ = h_a.await;
+        let _ = h_b.await;
+        assert_eq!(got, KEYS);
     })
 }
 

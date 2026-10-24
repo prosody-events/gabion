@@ -803,6 +803,104 @@ fn merge_remote_refuses_cells_expired_at_the_last_sweep() {
     assert_eq!(store.active_len(), 1);
 }
 
+/// The refusal reads the rule's current window: a slot freed by the sweep
+/// and taken by a rule with longer buckets does not inherit the old rule's
+/// verdict.
+#[test]
+fn merge_remote_judges_a_reused_rule_slot_by_its_own_window() {
+    let mut store = small_store(8, 8);
+    let mut obs = ObservationBatch::with_capacity(1);
+    let mut sink = DeltaSink::with_capacity(1);
+    // A rule learned from the wire only: its last cell expiring frees it.
+    obs.push(observation(0x33, 0xabc, 100, 2, 1, 1_u32, 0));
+    store.merge_remote(peer(), &obs, &mut sink);
+    assert_eq!(store.active_len(), 1);
+    let mut exp = ExpirationSink::<u32>::with_capacity(8);
+    store.expire_at(200_000, &mut exp);
+    assert_eq!(store.active_len(), 0);
+    assert!(store.find_rule(0x33).is_none());
+
+    // The freed slot goes to a rule with 10 s buckets: at the sweep its
+    // oldest live bucket was 10, so bucket 15 is live and bucket 5 is not.
+    store
+        .intern_rule(RuleDescriptor {
+            fingerprint: 0x44,
+            window_millis: 100_000,
+            bucket_millis: 10_000,
+            limit: 1000,
+            flags: 0,
+            local_rule_id: 1,
+        })
+        .unwrap();
+    let mut obs = ObservationBatch::with_capacity(2);
+    obs.push(observation(0x44, 0xabc, 5, 2, 1, 1_u32, 0));
+    obs.push(observation(0x44, 0xabc, 15, 2, 1, 1_u32, 0));
+    let mut sink = DeltaSink::with_capacity(2);
+    store.merge_remote(peer(), &obs, &mut sink);
+    assert_eq!(sink.len(), 1);
+    assert_eq!(store.get(sink.handles[0]).unwrap().key.bucket, 15);
+}
+
+/// A relay frame carries the forwarded changes only; this node's own stay
+/// in their ring for the round that owns them.
+#[test]
+fn relay_frame_takes_the_forwarded_lane_and_leaves_the_local_one() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 0);
+    remote_merge_one(&mut store, 0x11, 2, 1, 20, 0);
+    remote_merge_one(&mut store, 0x11, 3, 1, 30, 0);
+
+    let mut out = Vec::with_capacity(8);
+    assert_eq!(store.fill_relay_frame(8, &mut out), 2);
+    let origins: Vec<u128> = out
+        .iter()
+        .map(|h| {
+            store
+                .node_dictionary()
+                .descriptor(store.get(*h).unwrap().key.origin)
+                .unwrap()
+                .node_id
+                .0
+        })
+        .collect();
+    assert_eq!(origins, vec![2, 3]);
+    assert_eq!(store.forwarded_dirty().len(), 0);
+    assert_eq!(store.local_dirty().len(), 1);
+
+    // The local change goes out with the next full frame.
+    assert_eq!(store.fill_gossip_frame(8, 0, &mut out), 1);
+    assert_eq!(store.local_dirty().len(), 0);
+}
+
+#[test]
+fn local_cells_come_in_chunks_that_resume_where_the_last_stopped() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    for key in 1..=5 {
+        local_increment_one(&mut store, 0x11, key, 0, 1, 0);
+    }
+    remote_merge_one(&mut store, 0x11, 2, 1, 20, 0);
+
+    let mut chunk = Vec::with_capacity(2);
+    let mut seen = Vec::new();
+    let mut from = 0;
+    let mut chunks = 0;
+    loop {
+        let resume = store.fill_local_cells(from, 2, &mut chunk);
+        assert!(chunk.len() <= 2);
+        seen.extend(chunk.iter().copied());
+        chunks += 1;
+        match resume {
+            Some(next) => from = next,
+            None => break,
+        }
+    }
+    assert_eq!(chunks, 3);
+    assert_eq!(seen.len(), 5);
+    assert!(seen.iter().all(|&h| store.get(h).unwrap().key.origin == 0));
+}
+
 #[test]
 fn clear_dirty_keeps_cells_but_drops_change_record() {
     let mut store = small_store(2, 4);

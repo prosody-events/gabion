@@ -10,7 +10,8 @@ pub const STORAGE_LOCAL_DIRTY_CAPACITY: usize = 65_536;
 pub const STORAGE_FORWARDED_DIRTY_CAPACITY: usize = 524_288;
 /// Has no effect: it sized the per-peer gossip frontier, which no longer
 /// exists. Kept, like `CellStoreConfig::peer_capacity`, because the frozen
-/// `gossip-bench` study harness and existing operator configs still name it.
+/// `gossip-bench` study harness and the adapters' `storage.peer_capacity` and
+/// `gabion_storage_peer_capacity` settings still name it.
 pub const STORAGE_PEER_CAPACITY: u16 = 256;
 
 pub const STORAGE_MAX_DESCRIPTOR_COUNT: usize = 16;

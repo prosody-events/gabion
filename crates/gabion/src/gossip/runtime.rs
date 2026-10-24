@@ -41,19 +41,28 @@ struct Peer {
     identity: Option<NodeIdentity>,
     /// When a packet from this peer last arrived; `None` until one has.
     last_heard_ms: Option<u64>,
-    /// The peer is owed this node's own cells (see `serve_welcomes`).
-    welcome_due: bool,
+    welcome: Welcome,
 }
 
 impl Peer {
-    fn new(addr: SocketAddr, welcome_due: bool) -> Self {
+    fn new(addr: SocketAddr, welcome: Welcome) -> Self {
         Self {
             addr,
             identity: None,
             last_heard_ms: None,
-            welcome_due,
+            welcome,
         }
     }
+}
+
+/// Whether a peer is owed this node's own cells (see `serve_welcomes`).
+#[derive(Clone, Copy)]
+enum Welcome {
+    Settled,
+    /// The cells from store slot `next_slot` on are still to send.
+    Owed {
+        next_slot: u32,
+    },
 }
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
@@ -260,7 +269,7 @@ where
             .bootstrap_peers
             .iter()
             .copied()
-            .map(|addr| Peer::new(addr, false))
+            .map(|addr| Peer::new(addr, Welcome::Settled))
             .collect();
         let rng = SplitMix64::new(config.rng_seed);
 
@@ -378,7 +387,7 @@ where
                     _ = transport.writable(), if have_send => ArmOutcome::Writable,
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
                     cmd = recv_admin(admin_rx), if watch_admin => ArmOutcome::Admin(cmd),
-                    _ = relay.tick(), if relay_due => ArmOutcome::Flush,
+                    _ = relay.tick(), if relay_due => ArmOutcome::Relay,
                     _ = tick.tick() => ArmOutcome::Tick,
                 }
             };
@@ -390,13 +399,20 @@ where
                 ArmOutcome::Request(Some(Request::Limit(r))) => self.handle_limit_request(r),
                 ArmOutcome::Inbound(Ok((n, src))) => self.handle_inbound(n, src),
                 ArmOutcome::Inbound(Err(e)) => return Err(e.into()),
-                ArmOutcome::Writable => self.drain_one_send()?,
+                ArmOutcome::Writable => {
+                    self.drain_one_send()?;
+                    // The pool is whole again: send the next welcome chunk.
+                    if self.send_pending.is_empty() {
+                        self.serve_welcomes();
+                    }
+                }
                 ArmOutcome::PeerEvent(Some(evt)) => self.handle_peer_event(evt),
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
                 ArmOutcome::Admin(None) => self.admin_rx = None,
                 ArmOutcome::Tick => self.handle_gossip_tick(Round::Heartbeat),
                 ArmOutcome::Flush => self.handle_gossip_tick(Round::Flush),
+                ArmOutcome::Relay => self.handle_gossip_tick(Round::Relay),
             }
 
             // One apply per iteration covering both row sources. CRDT-free
@@ -562,7 +578,7 @@ where
                 .last_heard_ms
                 .is_some_and(|t| now.saturating_sub(t) >= silence)
             {
-                peer.welcome_due = true;
+                peer.welcome = Welcome::Owed { next_slot: 0 };
             }
             peer.last_heard_ms = Some(now);
         }
@@ -667,7 +683,8 @@ where
         match evt {
             PeerEvent::Added(p) => {
                 if !self.peers.iter().any(|x| x.addr == p.addr) {
-                    self.peers.push(Peer::new(p.addr, true));
+                    self.peers
+                        .push(Peer::new(p.addr, Welcome::Owed { next_slot: 0 }));
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
@@ -707,26 +724,29 @@ where
     /// `GOSSIP_REWELCOME_SILENCE_MILLIS` of silence, such as across a healed
     /// partition. Each origin welcomes the peer with its own share, so it
     /// holds the whole window once every member has, without waiting for
-    /// the repair lane. A welcome waits until the free send slots carry all
-    /// of it; every round and every inbound packet tries again.
+    /// the repair lane. A welcome goes out in chunks of what the free send
+    /// slots carry, resuming where the last one stopped; every round and
+    /// every inbound packet sends the next.
     fn serve_welcomes(&mut self) {
-        if !self.peers.iter().any(|p| p.welcome_due) {
-            return;
-        }
-        self.store
-            .fill_local_cells(self.config.max_cells_per_tick, &mut self.frame_handles);
-        let packets = self.frame_handles.len().div_ceil(self.cells_per_packet);
         for i in 0..self.peers.len() {
-            if !self.peers[i].welcome_due {
+            let Welcome::Owed { next_slot } = self.peers[i].welcome else {
                 continue;
+            };
+            let budget =
+                (self.send_free.len() * self.cells_per_packet).min(self.config.max_cells_per_tick);
+            if budget == 0 {
+                return;
             }
-            if packets > 0 {
-                if self.send_free.len() < packets {
-                    return;
-                }
+            let resume = self
+                .store
+                .fill_local_cells(next_slot, budget, &mut self.frame_handles);
+            if !self.frame_handles.is_empty() {
                 self.encode_packets_for(self.peers[i].addr);
             }
-            self.peers[i].welcome_due = false;
+            self.peers[i].welcome = match resume {
+                Some(next_slot) => Welcome::Owed { next_slot },
+                None => Welcome::Settled,
+            };
         }
     }
 
@@ -802,12 +822,20 @@ where
         if budget == 0 {
             return;
         }
-        let repair = match round {
-            Round::Heartbeat => self.repair_slice(),
-            Round::Flush => 0,
-        };
-        self.store
-            .fill_gossip_frame(budget, repair, &mut self.round_handles);
+        match round {
+            Round::Heartbeat => {
+                let repair = self.repair_slice();
+                self.store
+                    .fill_gossip_frame(budget, repair, &mut self.round_handles);
+            }
+            Round::Flush => {
+                self.store
+                    .fill_gossip_frame(budget, 0, &mut self.round_handles);
+            }
+            Round::Relay => {
+                self.store.fill_relay_frame(budget, &mut self.round_handles);
+            }
+        }
 
         for peer_idx in 0..pick_count {
             let peer = &self.peers[peer_idx];
@@ -832,6 +860,11 @@ where
         }
 
         self.serve_welcomes();
+
+        // A relay round carried none of this node's own changes.
+        if let Round::Relay = round {
+            return;
+        }
 
         // Reset per-rule pending. The sweep treats every rule with
         // non-zero pending as "touched in expectation by the tick" — the
@@ -911,16 +944,20 @@ enum ArmOutcome {
     PeerEvent(Option<PeerEvent>),
     Admin(Option<AdminCommand>),
     Tick,
-    /// A threshold fire or a relay round.
     Flush,
+    Relay,
 }
 
-/// Why a gossip round runs. Every round sends the unsent dirty changes; the
-/// heartbeat also carries a slice of the repair lane.
+/// Why a gossip round runs, and so what it sends. The heartbeat and a
+/// threshold flush send this node's own unsent changes, the schedule that
+/// bounds how long they wait; the heartbeat adds a slice of the repair lane.
+/// Both also forward what other nodes sent. A relay round, paced faster so
+/// forwarded changes do not wait for the heartbeat, sends only those.
 #[derive(Clone, Copy)]
 enum Round {
     Heartbeat,
     Flush,
+    Relay,
 }
 
 /// Read one admin command. Only invoked when `admin_rx.is_some()` — the

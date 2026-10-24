@@ -341,6 +341,8 @@ pub struct CellStore<C: Count = u32> {
     // Reused across every call; never allocated past `new()`.
     expire_current_epoch_scratch: Box<[BucketEpoch]>,
     expire_live_buckets_scratch: Box<[u32]>,
+    // When `expire_at` last swept; `merge_remote` refuses what it freed.
+    last_sweep_millis: Option<u64>,
 
     // Identity dictionaries.
     rule_dictionary: RuleDictionary,
@@ -449,6 +451,7 @@ impl<C: Count> CellStore<C> {
                 .into_boxed_slice(),
             expire_live_buckets_scratch: vec![0_u32; config.rule_dictionary_capacity as usize]
                 .into_boxed_slice(),
+            last_sweep_millis: None,
 
             rule_dictionary: RuleDictionary::with_capacity(config.rule_dictionary_capacity),
             node_dictionary,
@@ -708,18 +711,27 @@ impl<C: Count> CellStore<C> {
     }
 
     /// Push up to `max_cells` of this node's own active cells, in storage
-    /// order: what it welcomes a newly discovered peer with. Walks the full
-    /// `capacity`, so it is for membership changes, not the hot path.
-    pub fn fill_local_cells(&self, max_cells: usize, out: &mut Vec<CellHandle>) {
+    /// order from slot `from`: what it welcomes a peer with, a chunk at a
+    /// time. Returns the slot to resume from, or `None` once the store has
+    /// no more. Walks the slots between `from` and the chunk's end, so a
+    /// welcome costs one pass over `capacity` in all; it is for membership
+    /// changes, not the hot path.
+    pub fn fill_local_cells(
+        &self,
+        from: u32,
+        max_cells: usize,
+        out: &mut Vec<CellHandle>,
+    ) -> Option<u32> {
         out.clear();
-        for slot in 0..self.capacity {
+        for slot in from..self.capacity {
             if out.len() >= max_cells {
-                return;
+                return Some(slot);
             }
             if self.is_active(slot) && self.origins[slot as usize] == self.local_node_slot {
                 out.push(self.handle_for(slot));
             }
         }
+        None
     }
 
     /// Iterate all active cell handles in storage order.
@@ -1126,14 +1138,16 @@ impl<C: Count> CellStore<C> {
     /// Whether the last `expire_at` sweep would have freed a cell of this
     /// rule and bucket. A peer that has not swept yet may still send such a
     /// cell; merging it would bring it back until this node's next sweep.
+    /// Read from the rule's current descriptor, so a rule slot reused since
+    /// the sweep is judged by its own window.
     fn expired_at_last_sweep(&self, rule_fingerprint: u128, bucket: BucketEpoch) -> bool {
-        let Some(rule) = self.rule_dictionary.find(rule_fingerprint) else {
+        let Some(swept) = self.last_sweep_millis else {
             return false;
         };
-        let rule = rule as usize;
-        let current = self.expire_current_epoch_scratch[rule];
-        let live = self.expire_live_buckets_scratch[rule];
-        u64::from(bucket) + u64::from(live) < u64::from(current)
+        self.rule_dictionary
+            .find(rule_fingerprint)
+            .and_then(|slot| self.rule_dictionary.descriptor(slot))
+            .is_some_and(|rule| bucket < rule.oldest_live_epoch(swept))
     }
 
     /// Whether `node` already holds the cell's current value: it is the
@@ -1353,6 +1367,21 @@ impl<C: Count> CellStore<C> {
         out.len()
     }
 
+    /// Compose a relay round's frame: only the unsent forwarded changes,
+    /// oldest first, up to `max_cells`. The local lane and the repair slice
+    /// are left for the rounds that own them, so a relay round never sends
+    /// this node's own changes ahead of their schedule. Returns the number
+    /// of handles pushed.
+    pub fn fill_relay_frame(&mut self, max_cells: usize, out: &mut Vec<CellHandle>) -> usize {
+        out.clear();
+        if max_cells == 0 {
+            return 0;
+        }
+        self.bump_selection_epoch();
+        self.take_dirty(DirtyLane::Forwarded, max_cells, out);
+        out.len()
+    }
+
     /// Move the current, not yet selected cells of `lane`'s ring into `out`,
     /// oldest first, until `out` holds `max_cells`. Every entry read leaves
     /// the ring; superseded and freed ones are dropped on the way.
@@ -1404,6 +1433,7 @@ impl<C: Count> CellStore<C> {
         let current = std::mem::take(&mut self.expire_current_epoch_scratch);
         let live = std::mem::take(&mut self.expire_live_buckets_scratch);
         self.expire(&current, &live, sink);
+        self.last_sweep_millis = Some(now_millis);
         self.expire_current_epoch_scratch = current;
         self.expire_live_buckets_scratch = live;
     }

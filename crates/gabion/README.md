@@ -158,9 +158,12 @@ the heartbeat tick. A gossip round runs on three triggers: the heartbeat
 (every `tick_interval`), a threshold fire when local hits cross their
 error budget (below), and a relay round, at most every
 `GOSSIP_RELAY_INTERVAL_MILLIS` (20 ms), while changes merged from peers
-wait to be forwarded. Every round sends its unsent dirty changes to the
-round's picks and drains them; the heartbeat also expires aged-out cells
-and adds a slice of the repair lane. After every iteration that produced delta or expiration rows, the
+wait to be forwarded. A heartbeat or a threshold fire sends this node's
+own unsent changes and forwards what peers sent; a relay round sends only
+the forwarded changes, so how long a node's own changes wait stays with
+the heartbeat and the error budget. Rounds drain the changes they send;
+the heartbeat also expires aged-out cells and adds a slice of the repair
+lane. After every iteration that produced delta or expiration rows, the
 runtime calls `aggregates.apply(...)` exactly once — that is the
 contract with the downstream rate-limit decision path. Empty iterations
 (an idle tick, a peer event with no CRDT effect) short-circuit the
@@ -186,7 +189,7 @@ sequenceDiagram
     loop every round (heartbeat, threshold fire or relay)
         Runtime->>Runtime: handle_gossip_tick
         Runtime->>Store: expire_at(now) (heartbeat only)
-        Runtime->>Store: fill_gossip_frame (drains the dirty rings)
+        Runtime->>Store: fill_gossip_frame, or fill_relay_frame (drains the dirty rings)
         Store-->>Runtime: the round's cells
         Runtime->>Tx: per pick, encode the cells it lacks (bp-skip) + try_send_to
         Tx->>Peer: UDP frame
@@ -368,7 +371,8 @@ sweep freed is not merged back in from a peer that has yet to sweep.
 
 A peer that discovery adds starts with an empty store, and rounds only
 carry what changed since. So a member that discovers a new peer welcomes
-it with its own live cells, straight away and only those: each origin
+it with its own live cells, straight away and only those, a chunk at a
+time as the send slots free up: each origin
 sends its own share, and the newcomer holds the whole window once every
 member has discovered it, rather than waiting for the repair lane. A
 peer heard from again after `GOSSIP_REWELCOME_SILENCE_MILLIS` (10 s)
