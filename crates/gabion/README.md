@@ -227,8 +227,9 @@ Each is the smallest change that lets the paper's algorithm run here.
 (`local_dirty_capacity`, `forwarded_dirty_capacity` are part of the solution
 contract) are cleared after every event and no longer read by the runtime;
 `AdminSnapshot::{local,forwarded}_dirty_len` report the changes queued for
-the next heartbeat/threshold and relay round instead. `CellStore::fill_gossip_frame*`
-and the `visit_*_dirty` functions are no longer called by the runtime.
+the next heartbeat/threshold and relay round instead. `CellStore::fill_gossip_frame*`,
+`visit_repair_slice` and the `visit_*_dirty` functions are no longer called by
+the runtime; the repair digest (adaptation 6) replaced the rotating slice.
 
 ## How gossip works
 
