@@ -9,10 +9,12 @@ Reads every `*.json` result under the given directories (as written by
 `matrix.py`). Refuses to proceed when results carry different harness tree
 hashes or another `gabion-study/*` schema (stale results from an older
 harness), or one solution label carries several commits: numbers from
-different code are not comparable. Hashes that differ only under `judge/` or
-in `README.md` (checked with `git diff --name-only` in the checkout holding
-this file) count as one harness: the study code is unchanged. Results without a stamp or schema, or
-produced from a dirty harness or solution worktree, are rejected and listed.
+different code are not comparable. Hashes that differ only in `judge/judge.py`,
+`judge/test_*.py` or `README.md` (compared with `git diff-tree` in the checkout
+holding this file) count as one harness: nothing that builds or drives a run
+changed. `judge/matrix.py` is not exempt: it builds the binary and passes its
+arguments. Results without a stamp or schema, or produced from a dirty harness
+or solution worktree, are rejected and listed.
 
 Runs the harness marked INVALID (a health invariant failed) stay visible:
 every cell of a (regime, solution) with an invalid seed reads
@@ -22,21 +24,35 @@ only; ratios to the baseline and paired differences use only the seeds valid
 for both, so a solution cannot gain by losing its hardest seed.
 
 For each regime x solution x metric it reports a Bayesian summary. The seed
-values y_1..y_n are modelled as Normal(mu, sigma^2) with the Jeffreys prior
-p(mu, sigma) proportional to 1/sigma, so the marginal posterior of the mean mu
-is Student t with n - 1 degrees of freedom, located at the sample mean with
-scale s / sqrt(n). The tables show the posterior mean and the equal-tailed
-credible interval (CrI, 95 % by default, `--level`; by symmetry also the
-highest-density interval). With one seed the posterior is improper and no
-interval is shown; with zero spread it is a point mass and the interval is
-exactly the value.
+values y_1..y_n are modelled as Normal(mu, sigma^2) with the prior
+p(mu, sigma) proportional to 1/sigma on sigma >= sigma_min, where sigma_min is
+the metric's rounding noise: a value reported on a grid of step h (`RESOLUTION`:
+1 for counts and integer hit quantiles, one count per node-second or per
+admitted request for rates, 100 / limit for a percentage of the limit,
+1 / hits for a fraction of hits, the 100 ms probe for the time to heal) is
+known only to within h / 2, which adds uniform noise of standard deviation
+h / sqrt(12), so the reported values cannot vary less than that. Three seeds
+that tie on an integer therefore say "within about one step", not "exactly".
+For a metric without a declared grid sigma_min = 0 and the prior is the
+Jeffreys prior. The model ignores bounds: a count that ties at 0 gets an
+interval reaching below 0. The tables show the posterior median of mu (the
+sample mean) and its equal-tailed credible interval (95 % by default,
+`--level`; the posterior is symmetric and unimodal, so this is also the
+highest-density interval). When
+sigma_min is far below the sample spread s the posterior of mu is Student t
+with n - 1 degrees of freedom and scale s / sqrt(n), as with the Jeffreys
+prior; otherwise it is the same normal mixture over sigma cut at sigma_min,
+integrated numerically. With one seed, or seeds that agree exactly on a metric
+without a grid, the posterior is improper and no interval or P is shown.
 
 The comparison with the baseline is paired over the seeds valid for both. When
-every paired value is positive the model applies to d_i = ln(a_i) - ln(b_i):
-the judge reports the geometric-mean ratio exp(mean d) with its credible
+every paired value is positive the model applies to d_i = ln(a_i) - ln(b_i)
+(rounding noise h_a^2 / (12 a^2) + h_b^2 / (12 b^2) by the delta method): the
+judge reports the geometric-mean ratio exp(mean d) with its credible
 interval and P(better), the posterior probability that the mean log ratio
-favours the solution. Otherwise it models d_i = a_i - b_i and reports the mean
-difference the same way. Lower is better except for `HIGHER_IS_BETTER`. Writes
+favours the solution. Otherwise it models d_i = a_i - b_i (rounding noise
+(h_a^2 + h_b^2) / 12) and reports the mean difference the same way. Lower is
+better except for `HIGHER_IS_BETTER`. Writes
 `summary.md` (with a per-phase table for regimes that cut the network),
 `summary.csv` (long format, with the paired comparison),
 `pareto.md` (means over the seeds valid for every solution on the front),
@@ -54,6 +70,7 @@ import functools
 import itertools
 import json
 import math
+import re
 import statistics
 import subprocess
 import sys
@@ -89,22 +106,31 @@ def betacf(a: float, b: float, x: float) -> float:
     return h
 
 
-def betai(a: float, b: float, x: float) -> float:
-    """Regularized incomplete beta function I_x(a, b)."""
+def betai(a: float, b: float, x: float, y: float | None = None) -> float:
+    """Regularized incomplete beta function I_x(a, b). `y` is 1 - x, for a
+    caller that has it without the rounding of 1 - x near x = 1."""
+    y = 1.0 - x if y is None else y
     if x <= 0.0:
         return 0.0
-    if x >= 1.0:
+    if y <= 0.0:
         return 1.0
     front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-                     + a * math.log(x) + b * math.log1p(-x))
+                     + a * math.log(x) + b * math.log(y))
     if x < (a + 1.0) / (a + b + 2.0):
         return front * betacf(a, b, x) / a
-    return 1.0 - front * betacf(b, a, 1.0 - x) / b
+    return 1.0 - front * betacf(b, a, y) / b
 
 
 def t_cdf(t: float, df: float) -> float:
     """P(T <= t) for Student t with `df` degrees of freedom."""
-    tail = 0.5 * betai(df / 2.0, 0.5, df / (df + t * t))
+    if t == 0.0:
+        return 0.5
+    # x = df / (df + t^2) and y = 1 - x, each formed without cancellation,
+    # overflow or division by zero at |t| near 0 or infinity.
+    q = t * t / df
+    x, y = (1.0 / (1.0 + q), q / (1.0 + q)) if q <= 1.0 else ((1.0 / q) / (1.0 + 1.0 / q),
+                                                              1.0 / (1.0 + 1.0 / q))
+    tail = 0.5 * betai(df / 2.0, 0.5, x, y)
     return 1.0 - tail if t > 0 else tail
 
 
@@ -119,6 +145,82 @@ def t_quantile(p: float, df: int) -> float:
     for _ in range(200):
         mid = (lo + hi) / 2.0
         lo, hi = (mid, hi) if t_cdf(mid, df) < p else (lo, mid)
+    return (lo + hi) / 2.0
+
+
+def integrate(f, a: float, b: float, tol: float = 1e-12) -> float:
+    """Adaptive Simpson's rule on [a, b], starting from 16 panels so a narrow
+    feature cannot fall between the first samples."""
+    edges = [a + (b - a) * i / 16 for i in range(17)]
+    stack = []
+    for lo, hi in zip(edges, edges[1:]):
+        f_lo, f_mid, f_hi = f(lo), f((lo + hi) / 2.0), f(hi)
+        stack.append((lo, hi, f_lo, f_mid, f_hi, (hi - lo) / 6.0 * (f_lo + 4.0 * f_mid + f_hi),
+                      tol / 16, 0))
+    total = 0.0
+    while stack:
+        lo, hi, f_lo, f_mid, f_hi, whole, eps, depth = stack.pop()
+        mid = (lo + hi) / 2.0
+        f_left, f_right = f((lo + mid) / 2.0), f((mid + hi) / 2.0)
+        left = (mid - lo) / 6.0 * (f_lo + 4.0 * f_left + f_mid)
+        right = (hi - mid) / 6.0 * (f_mid + 4.0 * f_right + f_hi)
+        if depth >= 40 or abs(left + right - whole) <= 15.0 * eps:
+            total += left + right + (left + right - whole) / 15.0
+        else:
+            stack.append((lo, mid, f_lo, f_left, f_mid, left, eps / 2.0, depth + 1))
+            stack.append((mid, hi, f_mid, f_right, f_hi, right, eps / 2.0, depth + 1))
+    return total
+
+
+def floor_negligible(n: int, kappa: float) -> bool:
+    """Whether the cut at sigma_min removes negligible posterior mass (below
+    1e-12): the precision 1 / sigma^2 has a Gamma((n - 1) / 2) posterior whose
+    mass past the cut is the upper incomplete gamma Q((n - 1) / 2, kappa)."""
+    shape = (n - 1) / 2.0
+    return kappa >= 30.0 + shape + 10.0 * math.sqrt(shape)
+
+
+@functools.lru_cache(maxsize=None)
+def floored_weight(n: int, kappa: float):
+    """Posterior density of r = sigma_min / sigma on (0, 1], unnormalized and
+    scaled to peak 1, and its integral."""
+    peak = min(1.0, math.sqrt((n - 2) / (2.0 * kappa))) if kappa > 0 else 1.0
+    top = peak ** (n - 2) * math.exp(-kappa * peak * peak)
+
+    def weight(r: float) -> float:
+        return r ** (n - 2) * math.exp(-kappa * r * r) / top
+
+    return weight, integrate(weight, 0.0, 1.0)
+
+
+def floored_cdf(z: float, n: int, kappa: float) -> float:
+    """P(Z <= z) for Z = (mu - mean) sqrt(n) / sigma_min under the prior
+    1/sigma on sigma >= sigma_min: mu | sigma is Normal(mean, sigma^2 / n) and
+    r = sigma_min / sigma has density proportional to r^(n-2) exp(-kappa r^2)
+    on (0, 1], kappa = (n - 1) s^2 / (2 sigma_min^2)."""
+    if z < 0.0:
+        return 1.0 - floored_cdf(-z, n, kappa)
+    weight, norm = floored_weight(n, kappa)
+    # Integrate the upper tail, and only where it lives: Phi(-z r) is below
+    # 1e-15 past r = 8 / z, a sliver an integrator sampling all of (0, 1]
+    # would step over.
+    edge = min(1.0, 8.0 / z) if z > 0.0 else 1.0
+    tail = integrate(lambda r: weight(r) * math.erfc(z * r / math.sqrt(2.0)), 0.0, edge) / 2.0
+    return max(0.5, 1.0 - tail / norm)
+
+
+@functools.lru_cache(maxsize=None)
+def floored_quantile(p: float, n: int, kappa: float) -> float:
+    """The z with `floored_cdf(z) = p`, by bracketing and bisection; the
+    distribution is symmetric about 0."""
+    if p < 0.5:
+        return -floored_quantile(1.0 - p, n, kappa)
+    lo, hi = 0.0, 1.0
+    while floored_cdf(hi, n, kappa) < p and hi < 1e15:
+        lo, hi = hi, hi * 2.0
+    while hi - lo > 1e-10 * hi:
+        mid = (lo + hi) / 2.0
+        lo, hi = (mid, hi) if floored_cdf(mid, n, kappa) < p else (lo, mid)
     return (lo + hi) / 2.0
 
 
@@ -284,6 +386,71 @@ PARTITION_METRICS = partition_metrics()
 HIGHER_IS_BETTER = {"admitted"}
 ALL_METRICS = METRICS + PARTITION_METRICS
 
+
+def one_hit_of_limit(result: dict) -> float:
+    """Grid of a percentage of the rule's limit computed from whole hits."""
+    limit = dig(result, "regime.rule.limit")
+    return 100.0 / limit if limit else 0.0
+
+
+def one_count_per(path: str):
+    """Grid of a count divided by the figure at `path` (node-seconds, admitted
+    requests): one unit of the count."""
+    def grid(result: dict) -> float:
+        per = dig(result, path)
+        return 1.0 / per if per else 0.0
+    return grid
+
+
+def one_hit_of(path: str):
+    """Grid of a never-converged fraction: one hit of those scored at `path`."""
+    def grid(result: dict) -> float:
+        node = dig(result, path) or {}
+        hits = (node.get("converged") or 0) + (node.get("never_converged") or 0)
+        return 1.0 / hits if hits else 0.0
+    return grid
+
+
+# Step h of the grid each metric's value lies on, or a function of the result
+# giving it: the value is known only to within h / 2, which puts the floor
+# h / sqrt(12) under sigma (see the module docstring). Metrics not listed are
+# treated as continuous (no floor). HEAL_PROBE_MS is `HEAL_PROBE_NS` in
+# src/harness/phases.rs.
+HEAL_PROBE_MS = 100.0
+RESOLUTION = {
+    **dict.fromkeys(
+        ["bytes_total", "bytes_total_run", "cross_az_bytes", "stale_limited_p99",
+         "stale_limited_max", "stale_sampled_p99", "residual_limited_p99",
+         "residual_sampled_p99", "stale_limited_over_max", "stale_sampled_over_max",
+         "false_rejects", "admitted", "rejected", "churn_never95", "churn_never_parity",
+         "drop_loss_pkts", "drop_rcvbuf_pkts", "peak_cells", "send_pending_max",
+         "dirty_overflow_nodes", "dirty_overflow_entries", "gabion_warn_events",
+         "gabion_error_events"]
+        + [k for k, _, _ in PARTITION_METRICS if "_stale_" in k],
+        1.0),
+    "bytes_per_node_s": one_count_per("windows.node_seconds_measure"),
+    "packets_per_node_s": one_count_per("windows.node_seconds_measure"),
+    "bytes_per_admitted": one_count_per("traffic.measure.admitted"),
+    "stale_limited_p99_pct": one_hit_of_limit,
+    "over_max_pct": one_hit_of_limit,
+    "conv_never_frac": one_hit_of("convergence"),
+    "part_time_to_heal_ms": HEAL_PROBE_MS,
+    **{f"part_{phase}_conv_{relation}_never":
+       one_hit_of(f"partition.{phase}.convergence.{relation}")
+       for phase in ("before", "during", "after") for relation in ("same_side", "cross_side")},
+}
+
+
+def resolution(key: str, result: dict) -> float:
+    grid = RESOLUTION.get(key, 0.0)
+    return grid(result) if callable(grid) else grid
+
+
+def rounding_sd(grid_squares: list[float]) -> float:
+    """The floor under sigma: the standard deviation of rounding to a grid,
+    sqrt(h^2 / 12), with h^2 averaged over the values."""
+    return math.sqrt(statistics.fmean(grid_squares) / 12.0) if grid_squares else 0.0
+
 PARETO = [("bytes_total", "stale_limited_p99"), ("bytes_total", "over_max_pct"),
           ("bytes_total", "conv_p99_incl_never_ms")]
 
@@ -318,26 +485,50 @@ def load(dirs: list[Path]):
     return accepted, rejected
 
 
-def posterior(values: list[float], level: float) -> dict:
-    """Posterior of the mean under the normal model with the Jeffreys prior:
-    Student t, n - 1 degrees of freedom, scale s / sqrt(n). `lo`/`hi` are the
-    equal-tailed credible interval, absent for one value (improper posterior)."""
+def posterior(values: list[float], level: float, floor: float = 0.0) -> dict:
+    """Posterior of the mean mu under the normal model with the prior 1/sigma
+    on sigma >= `floor` (see the module docstring). `lo`/`hi` are the
+    equal-tailed credible interval, absent when the posterior is improper."""
     n = len(values)
     mean = statistics.fmean(values)
-    post = {"n": n, "mean": mean, "se": None, "lo": None, "hi": None,
-            "min": min(values), "max": max(values)}
-    if n > 1:
-        post["se"] = statistics.stdev(values) / math.sqrt(n)
-        half = t_quantile(0.5 + level / 2.0, n - 1) * post["se"] if post["se"] else 0.0
+    post = {"n": n, "mean": mean, "sd": statistics.stdev(values) if n > 1 else 0.0,
+            "floor": floor, "lo": None, "hi": None, "min": min(values), "max": max(values)}
+    if proper(post):
+        half = offset_quantile(post, 0.5 + level / 2.0)
         post["lo"], post["hi"] = mean - half, mean + half
     return post
 
 
+def proper(post: dict) -> bool:
+    """Whether the posterior of the mean is proper: at least two values, and
+    spread among them or a floor under sigma. Otherwise the 1/sigma prior
+    piles unbounded mass at sigma = 0 and the data cannot say how close mu
+    is to the mean."""
+    return post["n"] > 1 and (post["sd"] > 0.0 or post["floor"] > 0.0)
+
+
+def kappa(post: dict) -> float:
+    """(n - 1) s^2 / (2 sigma_min^2): how far the sample spread sits above the
+    floor, which decides whether the floor shapes the posterior at all."""
+    if post["floor"] <= 0.0:
+        return math.inf
+    return (post["n"] - 1) * post["sd"] ** 2 / (2.0 * post["floor"] ** 2)
+
+
+def offset_quantile(post: dict, p: float) -> float:
+    """The p-quantile of mu - mean (`proper(post)` holds)."""
+    n, k = post["n"], kappa(post)
+    if floor_negligible(n, k):
+        return t_quantile(p, n - 1) * post["sd"] / math.sqrt(n)
+    return floored_quantile(p, n, k) * post["floor"] / math.sqrt(n)
+
+
 def p_below(post: dict, x: float) -> float:
-    """Posterior probability that the mean is below `x` (n > 1)."""
-    if not post["se"]:
-        return 1.0 if post["mean"] < x else 0.5 if post["mean"] == x else 0.0
-    return t_cdf((x - post["mean"]) / post["se"], post["n"] - 1)
+    """Posterior probability that the mean is below `x` (`proper(post)` holds)."""
+    n, k = post["n"], kappa(post)
+    if floor_negligible(n, k):
+        return t_cdf((x - post["mean"]) * math.sqrt(n) / post["sd"], n - 1)
+    return floored_cdf((x - post["mean"]) * math.sqrt(n) / post["floor"], n, k)
 
 
 def fmt(x) -> str:
@@ -369,19 +560,33 @@ def cell(stats: dict | None, pair: dict | None, invalid: int, total: int,
     return "; ".join(filter(None, [mark, text, note]))
 
 
+# Paths inside the harness tree that neither build nor drive a run: a change
+# to them alone leaves the study's numbers unchanged. `judge/matrix.py` is not
+# among them, since it builds the binary and passes its arguments.
+EXEMPT = re.compile(r"README\.md|judge/judge\.py|judge/test_[^/]*\.py")
+TREE_HASH = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
 def hash_equivalence(hashes: list[str], repo: Path) -> str | None:
-    """None when every pair of harness tree hashes differs only under `judge/`
-    or in `README.md` (paths relative to the harness tree), else the reason."""
+    """None when every pair of harness tree hashes differs only in `EXEMPT`
+    paths (relative to the harness tree), else the reason. Uses plumbing with
+    renames off, so no user diff configuration (`diff.relative`,
+    `diff.renames`) can hide a path, and a file moved into an exempt path still
+    shows where it left."""
+    for h in hashes:
+        if not TREE_HASH.fullmatch(h):
+            return f"`{h}` is not a git object id"
     for a, b in itertools.combinations(sorted(hashes), 2):
         try:
-            proc = subprocess.run(["git", "-C", str(repo), "diff", "--name-only", a, b, "--"],
+            proc = subprocess.run(["git", "-C", str(repo), "diff-tree", "-r", "-z",
+                                   "--no-renames", "--name-only", f"{a}^{{tree}}",
+                                   f"{b}^{{tree}}"],
                                   capture_output=True, text=True)
         except OSError as error:
             return f"git could not be run ({error})"
         if proc.returncode:
             return f"git in {repo} cannot compare {a} and {b} ({proc.stderr.strip()})"
-        other = [p for p in proc.stdout.splitlines()
-                 if p != "README.md" and not p.startswith("judge/")]
+        other = [p for p in proc.stdout.split("\0") if p and not EXEMPT.fullmatch(p)]
         if other:
             return f"{a} and {b} differ in {', '.join(other[:5])}"
     return None
@@ -414,11 +619,13 @@ def main() -> None:
         if why:
             sys.exit("error: results come from different harnesses (tree hashes "
                      f"{', '.join(sorted(hashes))}): {why}. The judge accepts hashes that "
-                     "differ only under `judge/` or in `README.md`. Rerun every solution on "
+                     "differ only in `judge/judge.py`, `judge/test_*.py` or `README.md`. "
+                     "Rerun every solution on "
                      "one harness commit; if git cannot resolve a hash, fetch that harness "
                      f"commit into the checkout containing {Path(__file__).name} and retry.")
-        equivalent = (" Treated as equivalent (they differ only under `judge/` or in "
-                      f"`README.md`): {', '.join(f'`{h}`' for h in sorted(hashes))}.")
+        equivalent = (" Treated as one harness (they differ only in `judge/judge.py`, "
+                      "`judge/test_*.py` or `README.md`): "
+                      f"{', '.join(f'`{h}`' for h in sorted(hashes))}.")
     if not accepted:
         sys.exit("error: no stamped results from clean trees found.")
 
@@ -451,8 +658,11 @@ def main() -> None:
     for regime, solution in runs:
         valid = valid_seeds(regime, solution)
         for key, _, extract in ALL_METRICS:
-            values = [v for r in valid.values() if (v := extract(r)) is not None]
-            table[(regime, solution, key)] = posterior([float(v) for v in values], args.level) if values else None
+            seen = [(float(v), resolution(key, r)) for r in valid.values()
+                    if (v := extract(r)) is not None]
+            table[(regime, solution, key)] = posterior(
+                [v for v, _ in seen], args.level,
+                rounding_sd([h * h for _, h in seen])) if seen else None
 
     def paired(regime: str, solution: str, key: str) -> dict | None:
         """Posterior of the mean paired comparison (solution against baseline)
@@ -460,16 +670,21 @@ def main() -> None:
         when every value is positive, else the difference."""
         extract = next(e for k, _, e in ALL_METRICS if k == key)
         mine, base = valid_seeds(regime, solution), valid_seeds(regime, args.baseline)
-        pairs = [(float(a), float(b)) for s in sorted(mine.keys() & base.keys())
+        pairs = [(float(a), float(b), resolution(key, mine[s]), resolution(key, base[s]))
+                 for s in sorted(mine.keys() & base.keys())
                  if (a := extract(mine[s])) is not None and (b := extract(base[s])) is not None]
         if not pairs:
             return None
-        log = all(a > 0 and b > 0 for a, b in pairs)
-        post = posterior([math.log(a) - math.log(b) if log else a - b for a, b in pairs],
-                         args.level)
+        log = all(a > 0 and b > 0 for a, b, _, _ in pairs)
+        # Rounding variance of each paired value: on the log scale by the
+        # delta method, var(ln a) = var(a) / a^2.
+        noise = [(ha / a) ** 2 + (hb / b) ** 2 if log else ha * ha + hb * hb
+                 for a, b, ha, hb in pairs]
+        post = posterior([math.log(a) - math.log(b) if log else a - b for a, b, _, _ in pairs],
+                         args.level, rounding_sd(noise))
         sign = -1.0 if key in HIGHER_IS_BETTER else 1.0
         better = None
-        if post["n"] > 1:
+        if proper(post):
             better = p_below({**post, "mean": sign * post["mean"]}, 0.0)
         convert = math.exp if log else (lambda x: x)
         lo, hi = (None, None) if post["lo"] is None else (convert(post["lo"]), convert(post["hi"]))
@@ -489,13 +704,16 @@ def main() -> None:
         "# Gossip study: per-regime comparison", "",
         f"Harness tree hash {harness}. Baseline `{args.baseline}`.{equivalent}",
         "",
-        f"Cells show the posterior mean [{percent} credible interval for the mean across "
-        "seeds (normal model, Jeffreys prior; posterior Student t, n-1 df)], then for "
-        "solutions other than the baseline (×geometric-mean ratio to the baseline "
+        f"Cells show the mean across seeds [{percent} credible interval for it: normal "
+        "model, prior 1/sigma with sigma no smaller than the metric's rounding noise, so "
+        "seeds that tie on a count still leave about one step of doubt; Student t with "
+        "n-1 df when the seeds spread well past that], then for solutions other than the "
+        "baseline (×geometric-mean ratio to the baseline "
         f"[{percent} credible interval], P = posterior probability the solution is better), "
         "paired over the seeds valid for both. Where a paired value is zero or negative "
-        "the comparison is the mean difference Δ instead of a ratio. One seed has no "
-        "interval and no P; zero spread gives a point-mass interval. `INVALID k/n` marks a "
+        "the comparison is the mean difference Δ instead of a ratio. One seed, or seeds "
+        "that agree exactly on a metric without a known grid, give no interval and no P. "
+        "`INVALID k/n` marks a "
         "solution with k of n seeds invalid (see `rejected.md`); its statistics cover the "
         "valid seeds only. Lower is better unless noted. Metrics marked (flag) report "
         "saturation that does not invalidate a run; see `flags.md`.", "",

@@ -185,7 +185,6 @@ class JudgeTest(unittest.TestCase):
         self.assertNotIn(("plain", "main", "part_time_to_heal_ms"), rows)
 
 
-
 class StatsTest(unittest.TestCase):
     def test_t_cdf_matches_closed_forms(self):
         for t in (-3.0, -0.5, 0.0, 0.7, 2.5, 40.0):
@@ -208,11 +207,73 @@ class StatsTest(unittest.TestCase):
         self.assertAlmostEqual(post["hi"], 2.0 + half, delta=1e-5)
         single = judge_module.posterior([5.0], 0.95)
         self.assertEqual((single["mean"], single["lo"], single["hi"]), (5.0, None, None))
+        # No spread and no grid: the 1/sigma prior leaves the posterior improper.
         point = judge_module.posterior([4.0, 4.0, 4.0], 0.95)
-        self.assertEqual((point["lo"], point["hi"]), (4.0, 4.0))
-        self.assertEqual(judge_module.p_below(point, 5.0), 1.0)
-        self.assertEqual(judge_module.p_below(point, 4.0), 0.5)
-        self.assertEqual(judge_module.p_below(point, 3.0), 0.0)
+        self.assertFalse(judge_module.proper(point))
+        self.assertEqual((point["lo"], point["hi"]), (None, None))
+
+    def test_t_cdf_keeps_precision_near_zero_with_many_df(self):
+        # 1 - x rounds to 0 when t^2 << df; the tail must still move with t.
+        phi0 = 1.0 / math.sqrt(2.0 * math.pi)
+        self.assertAlmostEqual(judge_module.t_cdf(1e-6, 1e7), 0.5 + 1e-6 * phi0, places=13)
+        self.assertEqual(judge_module.t_cdf(math.inf, 3), 1.0)
+        self.assertEqual(judge_module.t_cdf(-math.inf, 3), 0.0)
+        self.assertEqual(judge_module.t_cdf(1e200, 3), 1.0)
+
+
+class FloorTest(unittest.TestCase):
+    def phi(self, z: float) -> float:
+        return math.exp(-z * z / 2.0) / math.sqrt(2.0 * math.pi)
+
+    def big_phi(self, z: float) -> float:
+        return 0.5 * math.erfc(-z / math.sqrt(2.0))
+
+    def test_tied_seeds_match_closed_forms(self):
+        # kappa = 0: F(z) = int_0^1 r^(n-2) Phi(z r) dr / int_0^1 r^(n-2) dr.
+        for z in (0.1, 0.8, 2.0, 7.5, 40.0):
+            n2 = self.big_phi(z) - (self.phi(0.0) - self.phi(z)) / z
+            n3 = self.big_phi(z) - (self.big_phi(z) - 0.5 - z * self.phi(z)) / (z * z)
+            self.assertAlmostEqual(judge_module.floored_cdf(z, 2, 0.0), n2, places=10)
+            self.assertAlmostEqual(judge_module.floored_cdf(z, 3, 0.0), n3, places=10)
+            self.assertAlmostEqual(judge_module.floored_cdf(-z, 3, 0.0), 1.0 - n3, places=10)
+        # Far tails, where the mass sits in a sliver r < 1 / z: 1 - F -> 1 / (2 z^2)
+        # for n = 3 and 1 / (z sqrt(2 pi)) for n = 2.
+        for z in (543.0, 1e4):
+            self.assertAlmostEqual((1.0 - judge_module.floored_cdf(z, 3, 0.0)) * 2 * z * z, 1.0,
+                                   places=6)
+            self.assertAlmostEqual(judge_module.floored_cdf(-z, 2, 0.0) * z / self.phi(0.0), 1.0,
+                                   places=6)
+
+    def test_three_tied_integers_leave_about_one_step_of_doubt(self):
+        post = judge_module.posterior([2.0, 2.0, 2.0], 0.95, 1.0 / math.sqrt(12.0))
+        self.assertTrue(judge_module.proper(post))
+        # 97.5 % point of the kappa = 0, n = 3 mixture, from the closed form.
+        z = judge_module.floored_quantile(0.975, 3, 0.0)
+        n3 = self.big_phi(z) - (self.big_phi(z) - 0.5 - z * self.phi(z)) / (z * z)
+        self.assertAlmostEqual(n3, 0.975, places=9)
+        self.assertAlmostEqual(post["hi"], 2.0 + z / math.sqrt(12.0) / math.sqrt(3.0), places=9)
+        self.assertAlmostEqual(post["lo"], 4.0 - post["hi"], places=9)
+        self.assertTrue(1.2 < post["lo"] < 1.3 and 2.7 < post["hi"] < 2.8)
+
+    def test_floor_far_below_the_spread_is_the_jeffreys_posterior(self):
+        values = [10.0, 20.0, 40.0]
+        jeffreys = judge_module.posterior(values, 0.95)
+        floored = judge_module.posterior(values, 0.95, 0.01)
+        self.assertEqual((floored["lo"], floored["hi"]), (jeffreys["lo"], jeffreys["hi"]))
+        # Close to the floor the cut changes little while the spread dominates.
+        near = judge_module.posterior([1.0, 2.0, 3.0], 0.95, 1.0 / math.sqrt(12.0))
+        self.assertAlmostEqual(near["hi"], 2.0 + 4.302653 / math.sqrt(3.0), places=3)
+        self.assertGreater(judge_module.kappa(near), 0.0)
+        self.assertFalse(judge_module.floor_negligible(3, judge_module.kappa(near)))
+
+    def test_every_grid_names_a_metric(self):
+        keys = {k for k, _, _ in judge_module.ALL_METRICS}
+        self.assertLessEqual(set(judge_module.RESOLUTION), keys)
+        result = {"regime": {"rule": {"limit": 2000}},
+                  "convergence": {"converged": 999, "never_converged": 1}}
+        self.assertEqual(judge_module.resolution("over_max_pct", result), 0.05)
+        self.assertEqual(judge_module.resolution("conv_never_frac", result), 0.001)
+        self.assertEqual(judge_module.resolution("conv_p99_ms", result), 0.0)
 
 
 class ComparisonTest(unittest.TestCase):
@@ -227,8 +288,9 @@ class ComparisonTest(unittest.TestCase):
         return self.rows(out)[("r", "alt", "bytes_total")], out
 
     def test_log_ratio_posterior_by_hand(self):
-        # d = ln 2, ln 4, ln 8 -> mean 2 ln 2, s = ln 2, se = ln 2 / sqrt(3).
-        row, out = self.pair([2, 4, 8], [1, 1, 1])
+        # d = ln 2, ln 4, ln 8 -> mean 2 ln 2, s = ln 2, scale ln 2 / sqrt(3).
+        # Values in the thousands keep the rounding floor negligible.
+        row, out = self.pair([2000, 4000, 8000], [1000, 1000, 1000])
         self.assertEqual(row["scale"], "log")
         ln2 = math.log(2)
         half = 4.302653 * ln2 / math.sqrt(3)
@@ -272,15 +334,34 @@ class ComparisonTest(unittest.TestCase):
         self.assertEqual((row["ratio_lo"], row["ratio_hi"], row["p_better"], row["cri_lo"]),
                          ("", "", "", ""))
 
-    def test_zero_spread_gives_a_point_mass(self):
-        row, out = self.pair([20, 20, 20], [10, 10, 10])
-        self.assertEqual((row["cri_lo"], row["cri_hi"]), ("20.0", "20.0"))
-        self.assertAlmostEqual(float(row["ratio_lo"]), 2.0)
-        self.assertEqual(float(row["p_better"]), 0.0)
+    def test_tied_counts_are_not_certain(self):
+        # bytes_total and stale_limited_p99 are counts: seeds that tie still
+        # carry rounding doubt, so no interval collapses and no P reaches 0 or 1.
+        row, out = self.pair([20, 20, 20], [30, 30, 30])
+        self.assertLess(float(row["cri_lo"]), 20.0)
+        self.assertGreater(float(row["cri_hi"]), 20.0)
+        self.assertLess(float(row["ratio_lo"]), 2 / 3)
+        self.assertGreater(float(row["ratio_hi"]), 2 / 3)
+        self.assertTrue(0.99 < float(row["p_better"]) < 1.0)
+        # p99 staleness 2, 2, 2 against 3, 3, 3: about 0.97, not 1.00.
+        p99 = self.rows(out)[("r", "alt", "stale_limited_p99")]
+        self.assertTrue(0.9 < float(p99["p_better"]) < 0.99, p99["p_better"])
+        self.assertTrue(1.2 < float(p99["cri_lo"]) < 1.3, p99["cri_lo"])
+        self.assertNotIn("2 [2, 2]", (out / "summary.md").read_text())
         same, _ = self.pair([10, 10, 10], [10, 10, 10])
-        self.assertEqual(float(same["p_better"]), 0.5)
-        better, _ = self.pair([5, 5, 5], [10, 10, 10])
-        self.assertEqual(float(better["p_better"]), 1.0)
+        self.assertAlmostEqual(float(same["p_better"]), 0.5)
+
+    def test_exact_tie_on_a_continuous_metric_has_no_interval(self):
+        conv = {"convergence": {"p99_incl_never_ms": 500.0}}
+        runs = [result("main", i, 10 + i, **conv) for i in range(3)]
+        runs += [result("alt", i, 20 + i, **conv) for i in range(3)]
+        proc, out = self.judge(runs)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        row = self.rows(out)[("r", "alt", "conv_p99_incl_never_ms")]
+        self.assertEqual((row["cri_lo"], row["cri_hi"], row["ratio_lo"], row["p_better"]),
+                         ("", "", "", ""))
+        self.assertAlmostEqual(float(row["ratio"]), 1.0)
+        self.assertIn("| 500 (×1.00) |", (out / "summary.md").read_text())
 
     def test_level_widens_the_interval(self):
         narrow, _ = self.pair([1, 2, 3], [1, 1, 1], "--level", "0.5")
@@ -318,8 +399,46 @@ class HarnessHashTest(unittest.TestCase):
 
     def test_judge_and_readme_changes_are_equivalent(self):
         a = self.tree({"scenario.json": "1", "judge/judge.py": "a", "README.md": "a"})
-        b = self.tree({"judge/judge.py": "b", "README.md": "b", "judge/new.py": "x"})
+        b = self.tree({"judge/judge.py": "b", "README.md": "b", "judge/test_new.py": "x"})
         self.assertIsNone(judge_module.hash_equivalence([a, b], self.repo))
+
+    def test_matrix_and_other_judge_files_are_not_exempt(self):
+        a = self.tree({"judge/matrix.py": "--release", "judge/judge.py": "a"})
+        b = self.tree({"judge/matrix.py": "--debug"})
+        self.assertIn("judge/matrix.py", judge_module.hash_equivalence([a, b], self.repo))
+        c = self.tree({"judge/helper.py": "x"})
+        self.assertIn("judge/helper.py", judge_module.hash_equivalence([b, c], self.repo))
+        d = self.tree({"src/README.md": "x"})
+        self.assertIn("src/README.md", judge_module.hash_equivalence([c, d], self.repo))
+
+    def test_a_file_moved_into_an_exempt_path_is_seen_leaving(self):
+        # With rename detection only the destination would show, and only when
+        # the source tree's hash sorts first; vary the content until it does.
+        for salt in range(256):
+            a = self.tree({"src/sim.rs": f"fn simulate() {{}} // {salt}\n" * 40,
+                           "judge/judge.py": "j"})
+            (self.repo / "src/sim.rs").rename(self.repo / "judge/test_sim.py")
+            b = self.tree({})
+            (self.repo / "judge/test_sim.py").rename(self.repo / "src/sim.rs")
+            if a < b:
+                break
+        self.assertLess(a, b)
+        self.assertIn("src/sim.rs", judge_module.hash_equivalence([a, b], self.repo))
+
+    def test_diff_configuration_cannot_hide_a_change(self):
+        harness = Path("crates/gossip-bench")
+        a = self.tree({str(harness / "src/sim.rs"): "1", str(harness / "judge/judge.py"): "j"})
+        b = self.tree({str(harness / "src/sim.rs"): "2"})
+        ta, tb = (self.git("rev-parse", f"{t}:{harness}") for t in (a, b))
+        self.git("config", "diff.relative", "true")
+        self.git("config", "diff.renames", "copies")
+        why = judge_module.hash_equivalence([ta, tb], self.repo / harness / "judge")
+        self.assertIn("src/sim.rs", why)
+
+    def test_a_hash_that_is_not_an_object_id_is_refused(self):
+        a = self.tree({"x": "1"})
+        why = judge_module.hash_equivalence(["--output=/dev/null", a], self.repo)
+        self.assertIn("not a git object id", why)
 
     def test_other_changes_are_refused(self):
         a = self.tree({"scenario.json": "1", "judge/judge.py": "a"})
@@ -328,9 +447,9 @@ class HarnessHashTest(unittest.TestCase):
         self.assertIn("scenario.json", why)
 
     def test_every_pair_must_be_equivalent(self):
-        a = self.tree({"x.rs": "1", "judge/j.py": "a"})
-        b = self.tree({"judge/j.py": "b"})
-        c = self.tree({"x.rs": "2", "judge/j.py": "b"})
+        a = self.tree({"x.rs": "1", "judge/judge.py": "a"})
+        b = self.tree({"judge/judge.py": "b"})
+        c = self.tree({"x.rs": "2", "judge/judge.py": "b"})
         self.assertIsNone(judge_module.hash_equivalence([a, b], self.repo))
         self.assertIn("x.rs", judge_module.hash_equivalence([a, b, c], self.repo))
 

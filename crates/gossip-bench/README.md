@@ -128,7 +128,7 @@ cargo run --release -p gossip-bench --no-default-features -- \
 python3 crates/gossip-bench/judge/matrix.py --solution main --seeds 3 \
     --jobs 2 --out ../study-results
 
-# Compare solutions. Refuses mixed harness hashes and invalid runs.
+# Compare solutions. Refuses mixed harness hashes and dirty results.
 python3 crates/gossip-bench/judge/judge.py ../study-results --baseline main \
     --out ../study-report
 ```
@@ -145,23 +145,33 @@ binary under a running one. It
 refuses to run when the worktree has uncommitted changes (`--allow-dirty`
 overrides, and the judge then rejects the results), and resumes only over
 results with an identical clean stamp. The judge refuses mixed harness
-hashes (except hashes that differ only under `judge/` or in `README.md`, which
-it checks with `git diff --name-only` and lists in the `summary.md` header),
-results with an older `gabion-study/*` schema, and several commits
-under one solution label, and writes
+hashes (except hashes whose trees differ only in `judge/judge.py`,
+`judge/test_*.py` or `README.md`, which it checks with `git diff-tree` and
+lists in the `summary.md` header; `judge/matrix.py` builds and drives the runs,
+so it is not exempt), results with an older `gabion-study/*` schema, and
+several commits under one solution label, and writes
 `summary.md` and `summary.csv` (every metric per regime and solution).
-The seed values are modelled as normal with the Jeffreys prior, so the
-posterior of the mean is Student t with n - 1 degrees of freedom; cells show
-the posterior mean and the equal-tailed credible interval (95 % by default,
-`--level` changes it). One seed has no interval (the posterior is improper);
-identical seeds give a point-mass interval. Against the baseline, paired over
-the seeds valid for both, the judge models the log ratio when every value is
-positive and reports the geometric-mean ratio with its credible interval and
-P, the posterior probability that the solution is better (lower is better
-except for `admitted`); with a zero or negative value it reports the mean
-difference instead. Regimes that cut the network get a second table of
-[partition phases](#metrics), whose time-to-heal cell also shows how many seeds
-healed (`healed k/n`); `pareto.md` (total bytes
+The seed values are modelled as normal with the prior 1/sigma on the spread,
+cut at the metric's rounding noise: a count, or anything else reported on a
+grid of step h (one hit of the limit for a percentage, the 100 ms probe for
+the time to heal, and so on; `RESOLUTION` in `judge.py` lists them), is known
+only to within h / 2, so sigma is at least h / sqrt(12). Cells show the mean
+across seeds and the equal-tailed credible interval for it (95 % by default,
+`--level` changes it); when the seeds spread well past the rounding noise this
+is the Jeffreys posterior, Student t with n - 1 degrees of freedom. Seeds that
+tie on a count therefore keep about one step of doubt (three seeds at p99
+staleness 2 read `2 [1.25, 2.75]`, not `2 [2, 2]`). One seed, or seeds that
+agree exactly on a metric without a grid, give no interval: the posterior is
+improper. The model ignores bounds, so a count that ties at 0 gets an interval
+reaching below 0. Against the baseline, paired over the seeds valid for both,
+the judge models the log ratio when every value is positive and reports the
+geometric-mean ratio with its credible interval and P, the posterior
+probability that the solution is better (lower is better except for
+`admitted`); with a zero or negative value it reports the mean difference
+instead. The rounding noise carries over to the paired values: three tied
+seeds one count apart give P near 0.97, not 1. Regimes that cut the network get a
+second table of [partition phases](#metrics), whose time-to-heal cell also
+shows how many seeds healed (`healed k/n`); `pareto.md` (total bytes
 against limited-key p99 staleness, worst-key over-admission, and p99
 convergence including never-converged hits, each point a mean over the seeds
 valid for every solution in that table; when no seed is valid for every
