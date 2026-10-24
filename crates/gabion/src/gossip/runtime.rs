@@ -416,7 +416,7 @@ where
                 ArmOutcome::Inbound(Ok((n, src))) => self.handle_inbound(n, src)?,
                 ArmOutcome::Inbound(Err(e)) => return Err(e.into()),
                 ArmOutcome::Writable => self.send_queue.drain_one(&self.transport)?,
-                ArmOutcome::PeerEvent(Some(evt)) => self.handle_peer_event(evt),
+                ArmOutcome::PeerEvent(Some(evt)) => self.handle_peer_event(evt)?,
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
                 ArmOutcome::Admin(None) => self.admin_rx = None,
@@ -653,7 +653,7 @@ where
         }
     }
 
-    fn handle_peer_event(&mut self, evt: PeerEvent) {
+    fn handle_peer_event(&mut self, evt: PeerEvent) -> Result<(), GossipError> {
         match evt {
             PeerEvent::Added(p) => match self.membership.add(p.addr) {
                 Added::Joined => {
@@ -663,6 +663,10 @@ where
                         cluster_size = self.membership.peers().len() + 1,
                         "Peer joined the cluster.",
                     );
+                    // The peer heard none of this node's broadcasts until now,
+                    // and a quiet owner may not broadcast again for a while:
+                    // hand it the keys this node owns.
+                    self.send_snapshot(p.addr)?;
                 }
                 Added::Known => {}
                 Added::Full => {
@@ -695,6 +699,7 @@ where
                 }
             }
         }
+        Ok(())
     }
 
     /// Expire cells whose bucket has left its rule's window.

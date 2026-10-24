@@ -2129,3 +2129,162 @@ fn parse_cluster_id_rejects_zero_signs_unprefixed_hex_and_garbage() {
         assert_eq!(parse_cluster_id(value), None, "{value:?} should not parse");
     }
 }
+
+/// An owner that discovers a node hands it the keys it owns, so the node gets
+/// what was broadcast before the owner knew it even if the owner never
+/// broadcasts again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_discovered_node_gets_the_keys_its_discoverer_owns() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let mesh = spawn_mesh(54_300, 3);
+            let joiner = sock(54_310);
+            let identity = NodeIdentity::new(NodeId(0xF0DD), 1);
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt, client) = GossipRuntime::from_parts(
+                mesh.router.bind(joiner),
+                TokioClock::from_millis(0),
+                sim_config(identity, mesh.addrs.clone(), 55),
+                store_for(identity),
+                agg.clone(),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+            sim_advance_ticks(Duration::from_millis(100), 3).await;
+
+            // Hits while no original node knows the joiner: their owners
+            // broadcast to the original nodes only.
+            for key in 0..12_u128 {
+                mesh.clients[key as usize % 2]
+                    .record(0xDEAD, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 3).await;
+            for events in &mesh.events {
+                events.send(PeerEvent::Added(Peer::new(joiner))).unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 3).await;
+            assert_eq!(agg.snapshot(), mesh.aggregates[0].snapshot());
+            assert_eq!(agg.total(), 12);
+
+            let _ = client.shutdown().await;
+            let _ = handle.await;
+            mesh.shutdown().await;
+        })
+        .await;
+}
+
+/// A rolling replacement: a node joins and is discovered by the others one
+/// at a time, then an original node leaves and is forgotten one at a time,
+/// with hits on every key throughout. Once the hits stop, every remaining
+/// node holds every hit, without any key changing again. The leaving node
+/// takes no hits of its own: the totals of the keys it owned keep its hits,
+/// but its successors rebuild them from the remaining contributors, and the
+/// larger of the two lower bounds can miss some of each (see the README's
+/// design notes).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_rolling_replacement_converges_without_further_changes() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let mut mesh = spawn_mesh(54_200, 3);
+            let joiner = sock(54_210);
+            let identity = NodeIdentity::new(NodeId(0xF0EE), 1);
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PeerEvent>();
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|evt| (evt, rx))
+            });
+            let mut model = BTreeMap::<(u128, u128, BucketEpoch), u64>::new();
+            let mut step = 0_u64;
+            // The `step`-th hit: a key, a bucket, and which of the original
+            // nodes that stay takes it.
+            let next = |step: u64| {
+                (
+                    u128::from(step * 7 % 23),
+                    (step % 2) as BucketEpoch,
+                    (step % 2) as usize,
+                )
+            };
+
+            for _ in 0..30 {
+                step += 1;
+                let (key, bucket, node) = next(step);
+                mesh.clients[node]
+                    .record(0xDEAD, KeyHash(key), bucket, 1, 0, 0)
+                    .await
+                    .unwrap();
+                *model.entry((0xDEAD, key, bucket)).or_default() += 1;
+            }
+            sim_advance_ticks(Duration::from_millis(100), 3).await;
+
+            let (rt, client_j) = GossipRuntime::from_parts(
+                mesh.router.bind(joiner),
+                TokioClock::from_millis(0),
+                sim_config(identity, mesh.addrs.clone(), 77),
+                store_for(identity),
+                agg.clone(),
+            );
+            let handle_j = tokio::task::spawn_local(rt.run(stream));
+            let clients: Vec<_> = mesh.clients[..2].iter().chain([&client_j]).collect();
+            // The others discover the joiner one at a time, while the nodes
+            // that stay, the joiner included, keep taking hits; then node 2
+            // stops, and the others forget it one at a time.
+            let joins = mesh
+                .events
+                .iter()
+                .map(|events| (events.clone(), PeerEvent::Added(Peer::new(joiner))));
+            let leaver = mesh.addrs[2];
+            let leaves = [&mesh.events[0], &mesh.events[1], &tx]
+                .into_iter()
+                .map(|events| (events.clone(), PeerEvent::Removed(Peer::new(leaver))));
+            let events: Vec<_> = joins.chain(leaves).collect();
+            for (index, (events, event)) in events.into_iter().enumerate() {
+                if index == 3 {
+                    let _ = mesh.clients[2].shutdown().await;
+                }
+                for round in 0..12 {
+                    step += 1;
+                    let (key, bucket, by) = next(step);
+                    let client = if round % 3 == 0 {
+                        clients[2]
+                    } else {
+                        clients[by]
+                    };
+                    client
+                        .record(0xDEAD, KeyHash(key), bucket, 1, 0, 0)
+                        .await
+                        .unwrap();
+                    *model.entry((0xDEAD, key, bucket)).or_default() += 1;
+                    if round % 4 == 0 {
+                        sim_advance_ticks(Duration::from_millis(100), 1).await;
+                    }
+                }
+                events.send(event).unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 30).await;
+
+            for (name, view) in [
+                ("node 0", mesh.aggregates[0].snapshot()),
+                ("node 1", mesh.aggregates[1].snapshot()),
+                ("joiner", agg.snapshot()),
+            ] {
+                let short: Vec<_> = model
+                    .iter()
+                    .filter(|(key, hits)| view.get(key) != Some(hits))
+                    .map(|(key, hits)| (key.1, key.2, *hits, view.get(key).copied()))
+                    .collect();
+                assert!(
+                    short.is_empty(),
+                    "{name} differs: (key, bucket, hits, view) {short:?}"
+                );
+            }
+            let _ = client_j.shutdown().await;
+            let _ = handle_j.await;
+            mesh.handles.remove(2);
+            mesh.clients.remove(2);
+            mesh.shutdown().await;
+        })
+        .await;
+}

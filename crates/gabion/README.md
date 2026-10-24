@@ -198,7 +198,10 @@ the changed member wins or held.
    remembers, gets a snapshot instead: the total of every bucket of every
    key the owner owns, as of its last broadcast, in up to 128 packets. A
    node asks at most `GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC` (32) owners for a
-   snapshot per sync, so the replies fit its receive buffer.
+   snapshot per sync, so the replies fit its receive buffer. An owner that
+   discovers a peer also sends it a snapshot unasked: until then it did not
+   broadcast to the peer at all, and a quiet owner might not broadcast
+   again for a long time, so no gap would show.
 
 A node's view of a bucket is therefore its own hits plus one number for
 everyone else's, which only rises and never exceeds the truth: an owner's
@@ -206,7 +209,13 @@ total cannot include more of the receiver's hits than the receiver has, and
 an owner's sum of contributors' cells cannot exceed their hits. A node that
 held a larger count from a previous owner keeps it until the new owner's
 count passes it, so an ownership move never double counts and never drops
-the view.
+the view. The price is that the larger of two lower bounds is not their
+union: when a key's owner leaves, its successor rebuilds the key from the
+remaining contributors, and until their hits since the move outweigh the
+leaver's own (and those of contributors that left earlier, whose cells only
+the old owner held), the view misses the smaller of the two. Keeping every
+contributor's cell on every node, as an earlier version did, avoids this
+but costs a replica of every cell everywhere.
 
 A node never forwards another node's hits, only an owner sends a key's
 totals (broadcast, repair or snapshot), and nothing is sent to a
