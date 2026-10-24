@@ -51,11 +51,12 @@ pub struct OriginKey {
 
 impl OriginKey {
     /// Upper bound of the last packet's scope. No origin has this key.
-    const END: Self = Self {
+    pub const END: Self = Self {
         node_id: NodeId(u128::MAX),
         incarnation: u32::MAX,
     };
-    const MIN: Self = Self {
+    /// Lower bound of the first packet's scope.
+    pub const MIN: Self = Self {
         node_id: NodeId(0),
         incarnation: 0,
     };

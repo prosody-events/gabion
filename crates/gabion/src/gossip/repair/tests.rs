@@ -5,6 +5,10 @@ use crate::crdt::{
 };
 
 const RULE: u128 = 0x11;
+const SOURCE: DigestSource = DigestSource {
+    addr: std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 9),
+    reply: false,
+};
 
 fn store(local: u128) -> CellStore<u32> {
     let mut store = CellStore::new(
@@ -56,7 +60,9 @@ fn merge_at(
 }
 
 fn digest_of(store: &CellStore<u32>) -> (Vec<DigestEntry>, DigestScope) {
-    let entries = DigestBuilder::for_store(store).build(store).to_vec();
+    let mut builder = DigestBuilder::for_store(store);
+    builder.build(store);
+    let entries = builder.last_built().to_vec();
     let scope = DigestScope {
         from: OriginKey::default(),
         to: OriginKey {
@@ -70,9 +76,9 @@ fn digest_of(store: &CellStore<u32>) -> (Vec<DigestEntry>, DigestScope) {
 /// What `holder` would send to a peer whose digest is `(entries, scope)`.
 fn lacked(holder: &CellStore<u32>, entries: Vec<DigestEntry>, scope: DigestScope) -> Vec<u64> {
     let mut reader = DigestReader::for_store(holder);
-    reader.begin();
-    entries.into_iter().for_each(|e| reader.push(e));
-    reader.set_scope(scope);
+    reader.begin(SOURCE);
+    reader.add_packet(scope, &entries);
+    reader.finish().unwrap();
     let mut out = Vec::new();
     reader.cells_lacked(holder, 100, 0, 0, &mut out);
     let mut sequences: Vec<_> = out
@@ -159,9 +165,9 @@ fn the_cell_budget_bounds_the_answer() {
     }
     let (entries, scope) = digest_of(&store(2));
     let mut reader = DigestReader::for_store(&holder);
-    reader.begin();
-    entries.into_iter().for_each(|e| reader.push(e));
-    reader.set_scope(scope);
+    reader.begin(SOURCE);
+    reader.add_packet(scope, &entries);
+    reader.finish().unwrap();
     let mut out = Vec::new();
     reader.cells_lacked(&holder, 4, 0, 0, &mut out);
     assert_eq!(out.len(), 4);
@@ -174,9 +180,9 @@ fn a_change_still_spreading_is_left_to_the_forwarders() {
     merge_at(&mut holder, 9, 2, 1, 2, 2_000);
     let (entries, scope) = digest_of(&store(2));
     let mut reader = DigestReader::for_store(&holder);
-    reader.begin();
-    entries.into_iter().for_each(|e| reader.push(e));
-    reader.set_scope(scope);
+    reader.begin(SOURCE);
+    reader.add_packet(scope, &entries);
+    reader.finish().unwrap();
     let mut out = Vec::new();
     reader.cells_lacked(&holder, 100, 2_000, 500, &mut out);
     let sequences: Vec<_> = out
@@ -192,13 +198,66 @@ fn a_cell_whose_bucket_left_the_window_is_not_resent() {
     merge(&mut holder, 9, 1, 1, 1);
     let (entries, scope) = digest_of(&store(2));
     let mut reader = DigestReader::for_store(&holder);
-    reader.begin();
-    entries.into_iter().for_each(|e| reader.push(e));
-    reader.set_scope(scope);
+    reader.begin(SOURCE);
+    reader.add_packet(scope, &entries);
+    reader.finish().unwrap();
     let mut out = Vec::new();
     // Bucket 0 of a 60 s window of 1 s buckets is live through 60,999 ms.
     reader.cells_lacked(&holder, 100, 60_999, 0, &mut out);
     assert_eq!(out.len(), 1);
     reader.cells_lacked(&holder, 100, 61_000, 0, &mut out);
     assert!(out.is_empty(), "the requester has expired it");
+}
+
+#[test]
+fn a_digest_is_whole_once_its_packets_cover_every_origin_in_any_order() {
+    let key = |id: u128| OriginKey {
+        node_id: NodeId(id),
+        incarnation: 1,
+    };
+    let scope = |from, to| DigestScope { from, to };
+    let mut reader = DigestReader::for_store(&store(1));
+    reader.begin(SOURCE);
+    assert!(reader.gathering(SOURCE));
+    assert!(!reader.gathering(DigestSource {
+        reply: true,
+        ..SOURCE
+    }));
+
+    reader.add_packet(scope(key(20), OriginKey::END), &[]);
+    assert!(!reader.complete());
+    reader.add_packet(scope(OriginKey::MIN, key(10)), &[]);
+    assert!(!reader.complete(), "origins 10..20 are not spoken for yet");
+    reader.add_packet(scope(key(10), key(20)), &[]);
+    assert!(reader.complete());
+    assert_eq!(reader.finish(), Some(SOURCE));
+    assert_eq!(reader.finish(), None);
+}
+
+#[test]
+fn origins_in_no_gathered_packet_are_left_alone() {
+    let mut holder = store(1);
+    merge(&mut holder, 9, 1, 1, 1);
+    merge(&mut holder, 50, 2, 1, 1);
+    let mut reader = DigestReader::for_store(&holder);
+    reader.begin(SOURCE);
+    // Only the packet for origins 40 and up arrived; it lists nothing.
+    reader.add_packet(
+        DigestScope {
+            from: OriginKey {
+                node_id: NodeId(40),
+                incarnation: 0,
+            },
+            to: OriginKey::END,
+        },
+        &[],
+    );
+    reader.finish();
+    let mut out = Vec::new();
+    reader.cells_lacked(&holder, 100, 0, 0, &mut out);
+    let origins: Vec<_> = out
+        .iter()
+        .map(|h| holder.get(*h).unwrap().origin_sequence)
+        .collect();
+    assert_eq!(out.len(), 1, "only origin 50 is spoken for: {origins:?}");
 }

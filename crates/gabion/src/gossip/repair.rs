@@ -5,6 +5,8 @@
 //! names the cells the peer lacks. Both own their scratch, sized once from
 //! the store's node dictionary.
 
+use std::net::SocketAddr;
+
 use crate::crdt::{BucketEpoch, CellHandle, CellStore, Count, NodeSlot, RuleSlot};
 use crate::wire::{DigestEntry, DigestScope, OriginKey};
 
@@ -35,9 +37,9 @@ impl DigestBuilder {
         }
     }
 
-    /// Rebuild the digest from `store`, in one pass over its cells. The
-    /// result is sorted by origin.
-    pub(super) fn build<C: Count>(&mut self, store: &CellStore<C>) -> &[DigestEntry] {
+    /// Rebuild the digest from `store`, in one pass over its cells, sorted by
+    /// origin. Read it with [`Self::last_built`].
+    pub(super) fn build<C: Count>(&mut self, store: &CellStore<C>) {
         self.entries.clear();
         self.entry_of_slot.fill(NO_ENTRY);
 
@@ -58,7 +60,6 @@ impl DigestBuilder {
         });
 
         self.entries.sort_unstable_by_key(|entry| entry.origin);
-        &self.entries
     }
 
     /// The digest last built.
@@ -78,9 +79,20 @@ enum Verdict {
     Listed(u16),
 }
 
-/// Compares a peer's digest packet with the local store.
+/// Who sent the digest being read, and whether it answers this node's own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DigestSource {
+    pub(super) addr: SocketAddr,
+    pub(super) reply: bool,
+}
+
+/// Compares a peer's digest with the local store. A digest larger than one
+/// packet is gathered packet by packet, in whatever order its packets arrive,
+/// so the store is scanned once per digest rather than once per packet.
 pub(super) struct DigestReader {
-    scope: DigestScope,
+    source: Option<DigestSource>,
+    /// The ranges of origins the packets gathered so far speak for.
+    scopes: Vec<DigestScope>,
     entries: Vec<DigestEntry>,
     verdicts: Box<[Verdict]>,
     /// Per rule slot, the oldest bucket still in the window at the time of
@@ -92,36 +104,62 @@ impl DigestReader {
     pub(super) fn for_store<C: Count>(store: &CellStore<C>) -> Self {
         let nodes = store.node_dictionary().capacity() as usize;
         Self {
-            scope: DigestScope {
-                from: OriginKey::default(),
-                to: OriginKey::default(),
-            },
+            source: None,
+            // Every packet but an empty digest's lists at least one origin.
+            scopes: Vec::with_capacity(nodes + 1),
             entries: Vec::with_capacity(nodes),
             verdicts: vec![Verdict::Unspoken; nodes].into_boxed_slice(),
             oldest_live: vec![0; store.rule_dictionary().capacity() as usize].into_boxed_slice(),
         }
     }
 
-    /// Forget the previous packet, ready for the entries of the next.
-    pub(super) fn begin(&mut self) {
+    /// Whether the digest being gathered came from `source`.
+    pub(super) fn gathering(&self, source: DigestSource) -> bool {
+        self.source == Some(source)
+    }
+
+    /// Start gathering a new digest.
+    pub(super) fn begin(&mut self, source: DigestSource) {
+        self.scopes.clear();
         self.entries.clear();
+        self.source = Some(source);
     }
 
-    /// Set the origins the packet whose entries were just pushed speaks for.
-    pub(super) fn set_scope(&mut self, scope: DigestScope) {
-        self.scope = scope;
-    }
-
-    /// Take one decoded entry. Entries past the node dictionary's capacity
-    /// are dropped: the origins they name are then treated as unlisted, which
-    /// at worst sends cells the peer already holds.
-    pub(super) fn push(&mut self, entry: DigestEntry) {
-        if self.entries.len() < self.entries.capacity() {
-            self.entries.push(entry);
+    /// Add one packet: the range of origins it speaks for and its entries.
+    /// Entries past the node dictionary's capacity are dropped: the origins
+    /// they name are then treated as unlisted, which at worst sends cells the
+    /// peer already holds.
+    pub(super) fn add_packet(&mut self, scope: DigestScope, entries: &[DigestEntry]) {
+        if self.scopes.len() < self.scopes.capacity() {
+            self.scopes.push(scope);
         }
+        let room = self.entries.capacity() - self.entries.len();
+        self.entries
+            .extend_from_slice(&entries[..entries.len().min(room)]);
     }
 
-    /// Whether the packet shows its sender holding a sequence that `ours`,
+    /// Whether the packets gathered so far speak for every origin, so the
+    /// digest is whole.
+    pub(super) fn complete(&mut self) -> bool {
+        self.scopes.sort_unstable_by_key(|scope| scope.from);
+        let mut covered = OriginKey::MIN;
+        for scope in &self.scopes {
+            if scope.from > covered {
+                return false;
+            }
+            covered = covered.max(scope.to);
+        }
+        covered == OriginKey::END
+    }
+
+    /// End the digest being gathered, returning its sender. Its entries stay
+    /// readable until the next `begin`.
+    pub(super) fn finish(&mut self) -> Option<DigestSource> {
+        self.entries.sort_unstable_by_key(|entry| entry.origin);
+        self.source.take()
+    }
+
+    /// Whether the digest shows its sender holding a sequence that `ours`,
     /// this node's digest, does not.
     pub(super) fn holds_any_missing_from(&self, ours: &[DigestEntry]) -> bool {
         self.entries.iter().any(|theirs| {
@@ -132,7 +170,7 @@ impl DigestReader {
         })
     }
 
-    /// Collect up to `max_cells` cells the sender of the packet lacks. A
+    /// Collect up to `max_cells` cells the sender of the digest lacks. A
     /// cell whose origin changed it less than `settle_millis` before
     /// `now_millis` is left out, since it is most likely still on its way
     /// through the forwarders, and so is one whose bucket has left the
@@ -152,7 +190,7 @@ impl DigestReader {
         }
         for (slot, verdict) in self.verdicts.iter_mut().enumerate() {
             *verdict = match origin_key(store, slot as NodeSlot) {
-                Some(origin) if self.scope.contains(origin) => {
+                Some(origin) if self.scopes.iter().any(|scope| scope.contains(origin)) => {
                     match self.entries.binary_search_by_key(&origin, |e| e.origin) {
                         Ok(index) => Verdict::Listed(index as u16),
                         Err(_) => Verdict::Absent,

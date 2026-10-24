@@ -28,7 +28,7 @@ use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
-use super::repair::{DigestBuilder, DigestReader};
+use super::repair::{DigestBuilder, DigestReader, DigestSource};
 use super::store::AggregateStore;
 use super::transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
@@ -114,10 +114,9 @@ where
     // Cells this node may still send in answer to repair digests before its
     // next heartbeat refills it to `GOSSIP_REPAIR_CELLS_PER_ROUND`.
     repair_budget: usize,
-    // The peer whose digest, in a packet read so far, showed it holding
-    // something this node lacks, so it is owed this node's digest back once
-    // its last packet arrives.
-    reply_owed: Option<SocketAddr>,
+    // The entries of the digest packet being read, before the reader learns
+    // whether it continues the digest it is gathering.
+    digest_packet: Vec<wire::DigestEntry>,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
@@ -278,6 +277,7 @@ where
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
         let digest_builder = DigestBuilder::for_store(&store);
+        let store_nodes = store.node_dictionary().capacity() as usize;
         let digest_reader = DigestReader::for_store(&store);
 
         let send_pool_size = config.send_queue_capacity.max(1);
@@ -321,7 +321,7 @@ where
             digest_builder,
             digest_reader,
             repair_budget: 0,
-            reply_owed: None,
+            digest_packet: Vec::with_capacity(store_nodes),
             send_pool,
             send_pending,
             send_free,
@@ -521,7 +521,7 @@ where
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
         if wire::frame_kind(&self.recv_buf[..n]) == FrameKind::Digest {
-            self.answer_digest(n, src);
+            self.read_digest_packet(n, src);
             return;
         }
         self.obs_buf.clear();
@@ -624,19 +624,22 @@ where
         }
     }
 
-    /// Answer one packet of a peer's repair digest with the cells it shows
-    /// the peer lacks, from what is left of this heartbeat's repair budget.
-    /// The answer is an ordinary gossip frame. The peer may not be in the
-    /// peer list yet (a new node pulling the window before discovery has
-    /// announced it), so it goes back to the address it came from.
-    fn answer_digest(&mut self, n: usize, src: SocketAddr) {
-        let reader = &mut self.digest_reader;
-        reader.begin();
+    /// Read one packet of a peer's repair digest. Packets of the digest
+    /// being gathered join it, in any order; a packet of another digest first
+    /// answers that one. The digest is answered once its packets speak for
+    /// every origin.
+    fn read_digest_packet(&mut self, n: usize, src: SocketAddr) {
+        let packet = &mut self.digest_packet;
+        packet.clear();
         let decoded = wire::decode_digest_visit(
             &self.recv_buf[..n],
             self.config.auth_key.as_ref(),
             self.config.wire_limits,
-            |entry| reader.push(entry),
+            |entry| {
+                if packet.len() < packet.capacity() {
+                    packet.push(entry);
+                }
+            },
         );
         let (header, scope) = match decoded {
             Ok(decoded) => decoded,
@@ -645,13 +648,36 @@ where
                 return;
             }
         };
-        reader.set_scope(scope);
+        let source = DigestSource {
+            addr: src,
+            reply: header.flags & wire::FLAG_REPLY != 0,
+        };
+        if !self.digest_reader.gathering(source) {
+            self.answer_digest();
+            self.digest_reader.begin(source);
+        }
+        self.digest_reader.add_packet(scope, &self.digest_packet);
+        if self.digest_reader.complete() {
+            self.answer_digest();
+        }
+    }
+
+    /// Answer the digest gathered so far with the cells it shows its sender
+    /// lacks, from what is left of this heartbeat's repair budget. The answer
+    /// is an ordinary gossip frame flagged as repair. The sender may not be
+    /// in the peer list yet (a new node pulling the window before discovery
+    /// has announced it), so it goes back to the address the digest came
+    /// from.
+    fn answer_digest(&mut self) {
+        let Some(source) = self.digest_reader.finish() else {
+            return;
+        };
         let settle = self
             .config
             .tick_interval
             .mul_f64(crate::defaults::GOSSIP_REPAIR_SETTLE_TICKS);
         let max_cells = self.repair_budget.min(self.frame_handles.capacity());
-        reader.cells_lacked(
+        self.digest_reader.cells_lacked(
             &self.store,
             max_cells,
             self.clock.now_millis(),
@@ -663,25 +689,18 @@ where
             // A repair answer cut short by a full send queue is not worth a
             // warning: the peer's next digest asks again.
             let free = self.send_free.len();
-            self.encode_packets_for(src, free, wire::FLAG_REPAIR);
+            self.encode_packets_for(source.addr, free, wire::FLAG_REPAIR);
         }
-        // Push-pull: once the peer's whole digest is in, send ours back if it
-        // showed the peer holding something this node lacks, so the peer
-        // answers it in the same exchange. The comparison uses this node's
-        // last heartbeat digest, which can only overstate what it lacks.
-        if header.flags & wire::FLAG_REPLY != 0 {
-            return;
-        }
-        if self
-            .digest_reader
-            .holds_any_missing_from(self.digest_builder.last_built())
+        // Push-pull: send ours back if the digest showed its sender holding
+        // something this node lacks, so the sender answers it in the same
+        // exchange. The comparison uses this node's last heartbeat digest,
+        // which can only overstate what it lacks.
+        if !source.reply
+            && self
+                .digest_reader
+                .holds_any_missing_from(self.digest_builder.last_built())
         {
-            self.reply_owed = Some(src);
-        }
-        if header.flags & wire::FLAG_MORE == 0
-            && self.reply_owed.take_if(|owed| *owed == src).is_some()
-        {
-            self.send_digest(src, wire::FLAG_REPLY);
+            self.send_digest(source.addr, wire::FLAG_REPLY);
         }
     }
 
@@ -886,7 +905,11 @@ where
         // slice. The heartbeat also refills the budget this node answers
         // other nodes' digests from. The changes go to every pick.
         if heartbeat {
+            // A digest whose last packet never came is answered as far as
+            // it got, from the budget it arrived in.
+            self.answer_digest();
             self.repair_budget = crate::defaults::GOSSIP_REPAIR_CELLS_PER_ROUND;
+            self.digest_builder.build(&self.store);
             self.send_digest(self.peers[0].addr, 0);
         }
         let mut sent_changes = false;
@@ -967,13 +990,16 @@ where
         }
     }
 
-    /// Send this node's repair digest to `dst`, one packet per send slot
-    /// while slots last. A packet that finds no slot is simply not sent: each
-    /// packet speaks for its own range of origins, so the peer answers the
-    /// rest, and the next heartbeat's digest asks again.
+    /// Send this node's repair digest, as its last heartbeat built it, to
+    /// `dst`, one packet per send slot while slots last. A reply reuses the
+    /// heartbeat's digest rather than scanning the store again: it can only
+    /// be older, so at worst the peer resends a cell this node has received
+    /// since. A packet that finds no slot is simply not sent: each packet
+    /// speaks for its own range of origins, so the peer answers the rest, and
+    /// the next heartbeat's digest asks again.
     fn send_digest(&mut self, dst: SocketAddr, flags: u16) {
         let header = self.frame_header(flags);
-        let entries = self.digest_builder.build(&self.store);
+        let entries = self.digest_builder.last_built();
         let Ok(mut packets) = DigestPackets::new(
             header,
             entries,
