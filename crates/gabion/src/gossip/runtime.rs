@@ -595,6 +595,7 @@ where
             }
         };
         self.digest_reader.set_scope(scope);
+        self.expire_now();
 
         // An answer never outgrows the free send slots, so it goes out whole
         // and its last packet carries the cut flag.
@@ -811,9 +812,7 @@ where
         self.ticks_total = self.ticks_total.saturating_add(1);
 
         // Step 1: expire aged-out cells so we don't gossip them.
-        let now_millis = self.clock.now_millis();
-        self.expiration_buf.clear();
-        self.store.expire_at(now_millis, &mut self.expiration_buf);
+        let now_millis = self.expire_now();
 
         if self.peers.is_empty() || self.send_free.is_empty() {
             return;
@@ -892,6 +891,7 @@ where
     /// Queue a digest of the local store for `dst`. `reply` marks a digest
     /// sent in answer to one, which is not answered again.
     fn send_digest(&mut self, dst: SocketAddr, reply: bool) {
+        self.expire_now();
         let header = self.frame_header();
         let entries = self.digest_builder.build(&self.store);
         let packets = DigestPackets::new(
@@ -912,6 +912,17 @@ where
                 break;
             }
         }
+    }
+
+    /// Free every cell whose bucket has left its rule's window by now, so a
+    /// round neither sends it nor lists it in a digest. Expiry otherwise
+    /// waits for the next gossip tick: a digest built or answered in between
+    /// would offer cells of a bucket the peer has already dropped, and the
+    /// peer would take them back.
+    fn expire_now(&mut self) -> u64 {
+        let now = self.clock.now_millis();
+        self.store.expire_at(now, &mut self.expiration_buf);
+        now
     }
 
     fn frame_header(&self) -> wire::Header {

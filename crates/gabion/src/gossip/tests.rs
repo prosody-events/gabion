@@ -1383,6 +1383,60 @@ async fn a_repair_tick_with_no_peer_pulls_from_the_first_peer_to_arrive() {
         .await;
 }
 
+/// B holds cells of a bucket that has left the window but has not ticked
+/// since, and A, starting later, pulls from it. B expires before answering, so
+/// it does not hand A cells A would only take back and drop again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_digest_answer_never_serves_an_expired_bucket() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addrs = [sock(40_100), sock(40_101)];
+            let ids = [
+                NodeIdentity::new(NodeId(0xA4), 1),
+                NodeIdentity::new(NodeId(0xB4), 1),
+            ];
+            let aggs: Vec<_> = (0..2)
+                .map(|_| Rc::new(InMemoryAggregateStore::<u32>::new()))
+                .collect();
+            let start = |i: usize, peers: Vec<SocketAddr>| {
+                let mut cfg = sim_config(ids[i], peers, i as u64 + 1);
+                cfg.tick_interval = Duration::from_secs(3600);
+                cfg.repair_period = Duration::from_secs(3600);
+                GossipRuntime::from_parts(
+                    router.bind(addrs[i]),
+                    TokioClock::from_millis(0),
+                    cfg,
+                    store_for_expiring_rule(ids[i]),
+                    aggs[i].clone(),
+                )
+            };
+            let (rt_b, client_b) = start(1, Vec::new());
+            let mut handles = vec![tokio::task::spawn_local(rt_b.run(futures::stream::empty()))];
+            for key in 0..3 {
+                client_b
+                    .record(rule_fp(0), KeyHash(key), 0, 1, 1_000, 0)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(aggs[1].total(), 3);
+            sim_advance_ticks(Duration::from_millis(100), 10).await;
+
+            let (rt_a, _client_a) = start(0, vec![addrs[1]]);
+            handles.push(tokio::task::spawn_local(rt_a.run(futures::stream::empty())));
+            sim_advance_ticks(Duration::from_millis(1), 5).await;
+            assert_eq!(aggs[0].total(), 0, "A got no expired cells");
+            assert_eq!(aggs[1].total(), 0, "B dropped them when answering");
+
+            for handle in handles {
+                handle.abort();
+                let _ = handle.await;
+            }
+        })
+        .await;
+}
+
 // -- partition then heal ----------------------------------------------------
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
