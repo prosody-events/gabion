@@ -43,10 +43,8 @@ fn have_advances_only_over_a_contiguous_range() {
     receive(&mut peer, &header(9, 12, 2), 0);
     assert_eq!(peer.ack_fields().0, 5);
 
-    // The packet that fills the hole lets the next in-order one count.
+    // The packet that fills the hole lets the one beyond it count too.
     receive(&mut peer, &header(5, 9, 2), 0);
-    assert_eq!(peer.ack_fields().0, 9);
-    receive(&mut peer, &header(9, 12, 2), 0);
     assert_eq!(peer.ack_fields().0, 12);
 }
 
@@ -183,4 +181,56 @@ fn a_restarted_peer_voids_all_sequence_state() {
         (0, false),
         "everything is resent"
     );
+}
+
+#[test]
+fn a_reordered_chain_is_acknowledged_once_the_hole_fills() {
+    let mut peer = peer();
+    // Three packets of one chain arrive last first.
+    receive(&mut peer, &header(9, 12, 2), 0);
+    receive(&mut peer, &header(5, 9, 2), 0);
+    assert_eq!(peer.ack_fields().0, 0, "nothing contiguous yet");
+    receive(&mut peer, &header(0, 5, 2), 0);
+    assert_eq!(peer.ack_fields().0, 12);
+}
+
+#[test]
+fn a_range_beyond_the_hole_is_kept_until_a_disjoint_newer_one_replaces_it() {
+    let mut peer = peer();
+    receive(&mut peer, &header(0, 2, 1), 0);
+    receive(&mut peer, &header(4, 6, 1), 0);
+    // Disjoint from (4, 6]: the newer range is kept instead.
+    receive(&mut peer, &header(8, 10, 1), 0);
+    receive(&mut peer, &header(2, 4, 1), 0);
+    assert_eq!(peer.ack_fields().0, 4, "(4, 6] was dropped");
+    receive(&mut peer, &header(4, 8, 1), 0);
+    assert_eq!(peer.ack_fields().0, 10, "(8, 10] was kept");
+}
+
+#[test]
+fn a_retransmission_cut_short_resumes_next_round() {
+    let mut peer = peer();
+    peer.sent(20, false, 0, MIN_RTO_MS);
+    assert_eq!(peer.delta_after(500), (0, true));
+    // The send pool took the chain only up to 8.
+    peer.sent(8, true, 500, MIN_RTO_MS);
+    assert_eq!(
+        peer.delta_after(501),
+        (8, false),
+        "the rest follows at once"
+    );
+    peer.sent(20, false, 501, MIN_RTO_MS);
+    assert_eq!(peer.delta_after(502), (20, false));
+}
+
+#[test]
+fn a_late_ack_above_the_rewound_cursor_moves_it() {
+    let mut peer = peer();
+    peer.sent(20, false, 0, MIN_RTO_MS);
+    peer.sent(8, true, 500, MIN_RTO_MS);
+    receive(&mut peer, &ack(15), 510);
+    assert_eq!(peer.delta_after(511), (15, false));
+    // The ack is still clamped to the highest sequence ever sent.
+    receive(&mut peer, &ack(99), 520);
+    assert_eq!(peer.delta_after(100_000), (20, false));
 }

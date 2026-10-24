@@ -232,8 +232,16 @@ every live own cell in it (packets of one delta chain: each starts where
 the previous ended). `have` advances to a packet's top only if it had
 already reached the packet's `range_start`, and only if the store merged
 every cell in it. An ack therefore never covers a cell the acker did not
-merge, and a lost or reordered packet leaves `have` short, which makes
-the sender repeat it.
+merge, and a lost packet leaves `have` short, which makes the sender
+repeat it. A packet that arrives beyond a hole is remembered as one range,
+and `have` takes it in once the hole fills, so a reordered chain (two
+packets of one round take different latencies) does not stall the ack.
+
+Retransmission is go-back-N: when the timeout expires the send cursor
+rewinds to `acked`, and that round and the ones after it walk the chain
+from there, as many packets per round as the send pool gives the peer. A
+backlog larger than one round's share therefore drains in consecutive
+rounds rather than one share per timeout.
 
 The retransmission timeout is `max(2 × RTT estimate, tick_interval)`
 (500 ms at the default heartbeat). The estimate is a smoothed (7/8, 1/8) round

@@ -13,7 +13,13 @@
 //! cannot show that nothing below it is missing. Instead each packet states the
 //! range it covers (`range_start`, `max_origin_sequence`] and carries every
 //! live own cell in it; `have` advances to the packet's top only if it already
-//! reached the packet's `range_start`.
+//! reached the packet's `range_start`. A packet that arrives beyond a hole is
+//! remembered as one range (`ahead`), and `have` takes it in once the hole is
+//! filled, so a reordered chain does not stall the ack.
+//!
+//! Retransmission is go-back-N: when the timeout expires the send cursor
+//! (`sent_upto`) rewinds to `acked`, and the rounds that follow walk the chain
+//! from there, as many packets per round as the send pool allows.
 
 use std::net::SocketAddr;
 
@@ -34,12 +40,18 @@ pub(super) struct Peer {
     /// Learned from the peer's packets. A different identity at the same
     /// address means the peer restarted and all sequence state is void.
     pub(super) identity: Option<NodeIdentity>,
-    /// Highest own sequence the peer has acknowledged. Never above `sent_upto`.
+    /// Highest own sequence the peer has acknowledged. Never above `sent_max`.
     acked: u64,
-    /// Highest own sequence handed to the send queue for this peer.
+    /// Send cursor: the next round sends the live own cells above it. Rewound
+    /// to `acked` by a retransmission.
     sent_upto: u64,
+    /// Highest own sequence ever handed to the send queue for this peer. An
+    /// ack is clamped to it.
+    sent_max: u64,
     /// Highest contiguous sequence of the peer's own cells merged here.
     have: u64,
+    /// `(range_start, top]` of packets merged beyond a hole above `have`.
+    ahead: Option<(u64, u64)>,
     /// A data packet arrived since we last sent the peer our `have`.
     ack_owed: bool,
     /// When the oldest unacknowledged data is re-sent; `0` when nothing is
@@ -57,7 +69,9 @@ impl Peer {
             identity: None,
             acked: 0,
             sent_upto: 0,
+            sent_max: 0,
             have: 0,
+            ahead: None,
             ack_owed: false,
             rto_deadline_ms: 0,
             srtt_ms: 0,
@@ -105,9 +119,10 @@ impl Peer {
 
         // The ack only counts if it is about this incarnation of us, and can
         // never cover more than we sent.
-        let acked = header.ack_sequence.min(self.sent_upto);
+        let acked = header.ack_sequence.min(self.sent_max);
         if header.ack_incarnation == local_incarnation && acked > self.acked {
             self.acked = acked;
+            self.sent_upto = self.sent_upto.max(acked);
             if let Some(probe) = self.probe
                 && acked >= probe.sequence
             {
@@ -119,7 +134,7 @@ impl Peer {
                 };
                 self.probe = None;
             }
-            self.rto_deadline_ms = if self.acked < self.sent_upto {
+            self.rto_deadline_ms = if self.acked < self.sent_max {
                 now_ms + self.rto_ms(min_rto_ms)
             } else {
                 0
@@ -128,9 +143,30 @@ impl Peer {
 
         if header.cell_count > 0 {
             self.ack_owed = true;
-            if merged_all && header.range_start <= self.have {
-                self.have = self.have.max(header.max_origin_sequence);
+            if merged_all {
+                self.cover(header.range_start, header.max_origin_sequence);
             }
+        }
+    }
+
+    /// Record that every live cell of the peer's in `(start, top]` is merged.
+    fn cover(&mut self, start: u64, top: u64) {
+        if start > self.have {
+            // Beyond a hole. Keep it, joined to the range already held when the
+            // two touch, otherwise in its place: later packets extend the
+            // newer range.
+            self.ahead = Some(match self.ahead {
+                Some((s, t)) if start <= t && s <= top => (s.min(start), t.max(top)),
+                _ => (start, top),
+            });
+            return;
+        }
+        self.have = self.have.max(top);
+        if let Some((s, t)) = self.ahead
+            && s <= self.have
+        {
+            self.have = self.have.max(t);
+            self.ahead = None;
         }
     }
 
@@ -145,14 +181,18 @@ impl Peer {
         }
     }
 
-    /// Record that data up to `top` was queued for the peer.
+    /// Record that data up to `top` was queued for the peer. A retransmission
+    /// rewinds the cursor to `top`, so the rest of the chain follows in the
+    /// next rounds.
     pub(super) fn sent(&mut self, top: u64, retransmit: bool, now_ms: u64, min_rto_ms: u64) {
         self.ack_owed = false;
-        self.sent_upto = self.sent_upto.max(top);
+        self.sent_max = self.sent_max.max(top);
         if retransmit {
+            self.sent_upto = top;
             self.probe = None;
             self.rto_deadline_ms = now_ms + self.rto_ms(min_rto_ms);
         } else {
+            self.sent_upto = self.sent_upto.max(top);
             if self.probe.is_none() {
                 self.probe = Some(Probe {
                     sequence: top,
@@ -169,6 +209,7 @@ impl Peer {
     /// outstanding has expired, so nothing is owed.
     pub(super) fn nothing_outstanding(&mut self) {
         self.sent_upto = self.acked;
+        self.sent_max = self.acked;
         self.rto_deadline_ms = 0;
         self.probe = None;
     }
