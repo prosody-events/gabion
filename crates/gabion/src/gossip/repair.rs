@@ -60,6 +60,11 @@ impl DigestBuilder {
         self.entries.sort_unstable_by_key(|entry| entry.origin);
         &self.entries
     }
+
+    /// The digest last built.
+    pub(super) fn last_built(&self) -> &[DigestEntry] {
+        &self.entries
+    }
 }
 
 /// How a received digest packet treats one local origin.
@@ -114,6 +119,17 @@ impl DigestReader {
         if self.entries.len() < self.entries.capacity() {
             self.entries.push(entry);
         }
+    }
+
+    /// Whether the packet shows its sender holding a sequence that `ours`,
+    /// this node's digest, does not.
+    pub(super) fn holds_any_missing_from(&self, ours: &[DigestEntry]) -> bool {
+        self.entries.iter().any(|theirs| {
+            match ours.binary_search_by_key(&theirs.origin, |e| e.origin) {
+                Ok(index) => theirs.holds_any_missing_from(&ours[index]),
+                Err(_) => theirs.holds_any_missing_from(&DigestEntry::new(theirs.origin, 0)),
+            }
+        })
     }
 
     /// Collect up to `max_cells` cells the sender of the packet lacks. A

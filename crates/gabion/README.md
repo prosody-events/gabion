@@ -625,10 +625,11 @@ Adaptations, each the minimal one:
     lacked them.
     Each change is still forwarded at most once per node, and only as
     news.
-  - *Push-pull.* A digest that is not itself a reply gets this node's
-    digest back (`FLAG_REPLY`), so both sides repair in one exchange. A
-    healed partition then repairs in both directions whichever side's
-    heartbeat picks across the cut.
+  - *Push-pull.* A digest that shows its sender holding something this
+    node lacks, and is not itself a reply, gets this node's digest back
+    (`FLAG_REPLY`), so both sides repair in one exchange. A healed partition
+    then repairs in both directions whichever side's heartbeat picks across
+    the cut, while a quiet cluster whose digests agree sends no replies.
   - *Bound.* The 256-cell rotation became a 2,048-cell budget per heartbeat
     interval. The slice now carries only missing cells, so the bound binds
     only on catch-up (a new node pulling the window, or a zone back from a

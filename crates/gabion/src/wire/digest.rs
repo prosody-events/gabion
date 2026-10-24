@@ -133,6 +133,21 @@ impl DigestEntry {
         }
     }
 
+    /// Whether this entry marks a sequence that `other` does not hold.
+    pub fn holds_any_missing_from(&self, other: &DigestEntry) -> bool {
+        self.held.iter().enumerate().any(|(word, &bits)| {
+            let mut bits = bits;
+            while bits != 0 {
+                let back = word as u64 * 64 + u64::from(bits.trailing_zeros());
+                if !other.holds(self.max_sequence - back) {
+                    return true;
+                }
+                bits &= bits - 1;
+            }
+            false
+        })
+    }
+
     /// Whether the sender holds `sequence`. Anything beyond the window is
     /// taken as held.
     pub fn holds(&self, sequence: u64) -> bool {

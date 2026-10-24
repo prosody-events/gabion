@@ -114,6 +114,10 @@ where
     // Cells this node may still send in answer to repair digests before its
     // next heartbeat refills it to `GOSSIP_REPAIR_CELLS_PER_ROUND`.
     repair_budget: usize,
+    // The peer whose digest, in a packet read so far, showed it holding
+    // something this node lacks, so it is owed this node's digest back once
+    // its last packet arrives.
+    reply_owed: Option<SocketAddr>,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
@@ -317,6 +321,7 @@ where
             digest_builder,
             digest_reader,
             repair_budget: 0,
+            reply_owed: None,
             send_pool,
             send_pending,
             send_free,
@@ -660,9 +665,22 @@ where
             let free = self.send_free.len();
             self.encode_packets_for(src, free, wire::FLAG_REPAIR);
         }
-        // Push-pull: once the peer's whole digest is in, send ours back so
-        // the peer answers what this node lacks in the same exchange.
-        if header.flags & (wire::FLAG_REPLY | wire::FLAG_MORE) == 0 {
+        // Push-pull: once the peer's whole digest is in, send ours back if it
+        // showed the peer holding something this node lacks, so the peer
+        // answers it in the same exchange. The comparison uses this node's
+        // last heartbeat digest, which can only overstate what it lacks.
+        if header.flags & wire::FLAG_REPLY != 0 {
+            return;
+        }
+        if self
+            .digest_reader
+            .holds_any_missing_from(self.digest_builder.last_built())
+        {
+            self.reply_owed = Some(src);
+        }
+        if header.flags & wire::FLAG_MORE == 0
+            && self.reply_owed.take_if(|owed| *owed == src).is_some()
+        {
             self.send_digest(src, wire::FLAG_REPLY);
         }
     }

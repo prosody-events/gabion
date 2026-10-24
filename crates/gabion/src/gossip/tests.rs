@@ -2265,15 +2265,19 @@ async fn changes_cut_from_a_round_arrive_by_digest_repair() {
         .await;
 }
 
-/// Repair is push-pull: a node answers a peer's digest with its own, flagged
-/// as a reply, so the peer can answer what this node lacks in the same
-/// exchange. A reply is not answered with another digest.
+/// Repair is push-pull: a node answers a peer's digest that shows the peer
+/// holding something it lacks with its own digest, flagged as a reply, so the
+/// peer can answer in the same exchange. A digest that shows nothing new, or
+/// that is itself a reply, gets no digest back.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_digest_gets_a_reply_digest_and_a_reply_gets_none() {
     use futures::FutureExt;
 
     use crate::gossip::GossipTransport;
-    use crate::wire::{DigestPackets, FLAG_DIGEST, FLAG_REPLY, FrameLimits, Header, PacketBuf};
+    use crate::wire::{
+        DigestEntry, DigestPackets, FLAG_DIGEST, FLAG_REPLY, FrameLimits, Header, OriginKey,
+        PacketBuf,
+    };
 
     let local = LocalSet::new();
     local
@@ -2310,7 +2314,16 @@ async fn a_digest_gets_a_reply_digest_and_a_reply_gets_none() {
             // A's first heartbeat fired at start.
             assert_eq!(drain(&x), [FLAG_DIGEST]);
 
-            let send = |flags: u16| {
+            // X holds sequence 3 of an origin A has never heard of.
+            let mut news = DigestEntry::new(
+                OriginKey {
+                    node_id: NodeId(0x55),
+                    incarnation: 1,
+                },
+                3,
+            );
+            news.mark(3);
+            let send = |flags: u16, entries: &[DigestEntry]| {
                 let header = Header {
                     cluster_id_hash: 0xC1,
                     sender_node_id: 0x77,
@@ -2319,19 +2332,23 @@ async fn a_digest_gets_a_reply_digest_and_a_reply_gets_none() {
                     ..Header::default()
                 };
                 let limits = FrameLimits::default();
-                let mut packets = DigestPackets::new(header, &[], None, limits).unwrap();
+                let mut packets = DigestPackets::new(header, entries, None, limits).unwrap();
                 let mut out = PacketBuf::for_limits(limits);
                 assert!(packets.next_into(&mut out));
                 x.try_send_to(out.as_bytes(), addr_a).unwrap();
             };
 
-            send(0);
+            send(0, &[news]);
             sim_advance(Duration::from_millis(10)).await;
             assert_eq!(drain(&x), [FLAG_DIGEST | FLAG_REPLY]);
 
-            send(FLAG_REPLY);
+            send(0, &[]);
             sim_advance(Duration::from_millis(10)).await;
-            assert_eq!(drain(&x), Vec::<u16>::new());
+            assert_eq!(drain(&x), Vec::<u16>::new(), "nothing new: no reply");
+
+            send(FLAG_REPLY, &[news]);
+            sim_advance(Duration::from_millis(10)).await;
+            assert_eq!(drain(&x), Vec::<u16>::new(), "a reply gets no reply");
 
             client.shutdown().await.unwrap();
             let _ = handle.await;

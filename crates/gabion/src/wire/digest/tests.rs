@@ -162,3 +162,15 @@ fn marking_while_raising_matches_marking_under_the_final_maximum() {
         assert_eq!(raised.holds(sequence), direct.holds(sequence), "{sequence}");
     }
 }
+
+#[test]
+fn an_entry_knows_what_another_lacks() {
+    let ours = entry(1, 100, &[100, 99, 97]);
+    assert!(!entry(1, 100, &[100, 97]).holds_any_missing_from(&ours));
+    assert!(entry(1, 100, &[98]).holds_any_missing_from(&ours), "a gap");
+    assert!(entry(1, 101, &[101]).holds_any_missing_from(&ours), "newer");
+    assert!(
+        !entry(1, 400, &[400 - DIGEST_WINDOW]).holds_any_missing_from(&ours),
+        "nothing marked inside the window"
+    );
+}
