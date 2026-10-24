@@ -88,10 +88,13 @@ impl Settled {
         (self.last - self.first) as usize + 1
     }
 
-    fn offset(self, bucket: BucketEpoch) -> Option<usize> {
-        (self.first..=self.last)
-            .contains(&bucket)
-            .then(|| (bucket - self.first) as usize)
+    fn buckets(self) -> std::ops::RangeInclusive<BucketEpoch> {
+        self.first..=self.last
+    }
+
+    /// Index of `bucket`, one of these, in a row of sums.
+    fn index(self, bucket: BucketEpoch) -> usize {
+        (bucket - self.first) as usize
     }
 }
 
@@ -166,30 +169,22 @@ where
         let addr = self.thicket.peers[usize::from(peer)].addr;
         let header = self.frame_header();
         let d = &mut self.digests;
-        for handle in self.store.active_handles() {
-            let Some(row) = self.store.get(handle) else {
-                continue;
-            };
-            let Some(i) = settled
-                .offset(row.key.bucket)
-                .filter(|_| row.key.rule == rule)
-            else {
-                continue;
-            };
-            let origin = row.key.origin;
+        let store = &self.store;
+        store.visit_rule_buckets(rule, settled.buckets(), |_, origin, bucket, count| {
             if !d.listed[usize::from(origin)] {
-                let Some(node) = self.store.node_dictionary().descriptor(origin) else {
-                    continue;
+                let Some(node) = store.node_dictionary().descriptor(origin) else {
+                    return;
                 };
                 if !range.contains(&node.node_id.0) {
-                    continue;
+                    return;
                 }
                 d.listed[usize::from(origin)] = true;
                 d.order.push((node.node_id.0, origin));
             }
+            let i = settled.index(bucket);
             let sum = &mut d.acc[usize::from(origin) * THICKET_DIGEST_BUCKETS + i];
-            *sum = sum.saturating_add(count_u32(row.count));
-        }
+            *sum = sum.saturating_add(count_u32(count));
+        });
         d.order.sort_unstable_by_key(|&(node_id, _)| node_id);
         // A digest of nothing says "send me everything": worth sending in
         // answer to a digest, or from a node that holds nothing at all, such
@@ -324,33 +319,26 @@ where
 
         // What this node holds of each listed group; every cell of an origin
         // in range that is not listed, which the peer holds none of.
-        for handle in self.store.active_handles() {
-            let Some(row) = self.store.get(handle) else {
-                continue;
-            };
-            let Some(i) = settled
-                .offset(row.key.bucket)
-                .filter(|_| row.key.rule == rule)
-            else {
-                continue;
-            };
-            match d.group_of[usize::from(row.key.origin)] {
+        let store = &self.store;
+        store.visit_rule_buckets(
+            rule,
+            settled.buckets(),
+            |handle, origin, bucket, count| match d.group_of[usize::from(origin)] {
                 NONE => {
-                    let in_range = self
-                        .store
+                    let in_range = store
                         .node_dictionary()
-                        .descriptor(row.key.origin)
+                        .descriptor(origin)
                         .is_some_and(|node| (frame.lo..frame.hi).contains(&node.node_id.0));
                     if in_range && push.len() < cap {
                         push.push(handle);
                     }
                 }
                 g => {
-                    let sum = &mut d.acc[usize::from(g) * n + i];
-                    *sum = sum.saturating_add(count_u32(row.count));
+                    let sum = &mut d.acc[usize::from(g) * n + settled.index(bucket)];
+                    *sum = sum.saturating_add(count_u32(count));
                 }
-            }
-        }
+            },
+        );
 
         // The buckets of listed origins where this node holds more.
         d.ahead.clear();
@@ -361,24 +349,15 @@ where
             d.ahead.push(ahead);
         }
         if d.ahead.iter().any(|&bits| bits != 0) {
-            for handle in self.store.active_handles() {
-                if push.len() >= cap {
-                    break;
-                }
-                let Some(row) = self.store.get(handle) else {
-                    continue;
-                };
-                let Some(i) = settled
-                    .offset(row.key.bucket)
-                    .filter(|_| row.key.rule == rule)
-                else {
-                    continue;
-                };
-                let g = d.group_of[usize::from(row.key.origin)];
-                if g != NONE && d.ahead[usize::from(g)] & (1 << i) != 0 {
+            store.visit_rule_buckets(rule, settled.buckets(), |handle, origin, bucket, _| {
+                let g = d.group_of[usize::from(origin)];
+                if push.len() < cap
+                    && g != NONE
+                    && d.ahead[usize::from(g)] & (1 << settled.index(bucket)) != 0
+                {
                     push.push(handle);
                 }
-            }
+            });
         }
         let behind = unknown || (0..d.groups.len() * n).any(|i| d.theirs[i] > d.acc[i]);
         // `send_digest` accumulates into the same scratch at another stride

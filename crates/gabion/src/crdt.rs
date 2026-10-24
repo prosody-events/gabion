@@ -710,6 +710,32 @@ impl<C: Count> CellStore<C> {
         self.resolve(handle).map(|i| self.counts[i as usize])
     }
 
+    /// Visit every active cell of rule `rule` whose bucket is in `buckets`,
+    /// in storage order, with its handle, origin, bucket and count. Reads the
+    /// columns directly and walks the whole capacity: for a scan that sums a
+    /// rule's cells, such as a repair digest, not for a per-request path.
+    pub fn visit_rule_buckets(
+        &self,
+        rule: RuleSlot,
+        buckets: std::ops::RangeInclusive<BucketEpoch>,
+        mut visit: impl FnMut(CellHandle, NodeSlot, BucketEpoch, C),
+    ) {
+        for slot in 0..self.capacity {
+            let i = slot as usize;
+            if self.generations[i] & 1 == 1
+                && self.rules[i] == rule
+                && buckets.contains(&self.buckets[i])
+            {
+                visit(
+                    self.handle_for(slot),
+                    self.origins[i],
+                    self.buckets[i],
+                    self.counts[i],
+                );
+            }
+        }
+    }
+
     /// Iterate all active cell handles in storage order.
     ///
     /// Walks the full `capacity`, not `active_len` — suitable for diagnostics

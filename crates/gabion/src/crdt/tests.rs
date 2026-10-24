@@ -2539,3 +2539,43 @@ fn observation_batch_retain_keeps_chosen_rows_in_order() {
     assert_eq!(obs.origin_sequences, vec![10, 12, 14]);
     obs.assert_consistent();
 }
+
+#[test]
+fn visit_rule_buckets_sees_exactly_the_active_cells_of_one_rule_in_range() {
+    let mut store = store_u32();
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(rule_descriptor(0x22, 2)).unwrap();
+    let mut obs = ObservationBatch::with_capacity(12);
+    for (rule, origin, bucket) in
+        (0..3u32).flat_map(|b| [(0x11, 7, b), (0x11, 8, b), (0x22, 7, b), (0x22, 8, b)])
+    {
+        obs.push(observation(rule, 0xabc, bucket, origin, 1, 3 + bucket, 100));
+    }
+    let mut sink = DeltaSink::with_capacity(12);
+    store.merge_remote(&obs, &mut sink);
+    assert_eq!(sink.len(), 12);
+
+    let rule = store.find_rule(0x22).unwrap();
+    let mut visited = BTreeSet::new();
+    store.visit_rule_buckets(rule, 1..=2, |handle, origin, bucket, count| {
+        let row = store.get(handle).unwrap();
+        assert_eq!(
+            (row.key.origin, row.key.bucket, row.count),
+            (origin, bucket, count)
+        );
+        visited.insert((
+            store
+                .node_dictionary()
+                .descriptor(origin)
+                .unwrap()
+                .node_id
+                .0,
+            bucket,
+            count,
+        ));
+    });
+    assert_eq!(
+        visited,
+        BTreeSet::from([(7, 1, 4), (8, 1, 4), (7, 2, 5), (8, 2, 5)])
+    );
+}
