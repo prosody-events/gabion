@@ -22,13 +22,8 @@ use super::{AggregateStore, Clock, GossipRuntime, GossipTransport, Ticker};
 const VIEW_MAX: usize = 32;
 /// `Peer::view_pos` of a peer outside the active view.
 pub(super) const NO_POS: u8 = u8::MAX;
-/// GRAFTs sent for one missing origin before the repair slice is left to
-/// finish the job.
-const MAX_TRIES: u8 = 3;
-/// NACKs sent for the packets missing from an edge before giving up on a quiet
-/// edge, ten `nack_retry` periods. A busy edge gives up on a packet sooner: it
-/// leaves the 64-packet receive window.
-const MAX_NACK_TRIES: u8 = 10;
+/// Distinct announcers one missing origin remembers, to GRAFT in turn.
+const ANNOUNCERS: usize = 4;
 
 /// Why a round runs, which decides what it sends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,26 +124,42 @@ struct Change {
     from: Option<SocketAddr>,
 }
 
-/// A lazily announced change that has not arrived.
+/// Lazily announced changes of one origin that the tree has not delivered.
+///
+/// The paper runs a timer per announced message and, when it expires, GRAFTs
+/// the first announcer and moves on to the next one for the retry. Changes of
+/// one origin are announced as a watermark here, so the record keeps the
+/// oldest announcement still running with its own deadline, the newest one
+/// with its own, and the first few distinct announcers to GRAFT in turn.
 struct Missing {
     node_id: NodeId,
     incarnation: Incarnation,
-    /// What this node held of the origin when the announcement arrived: where
-    /// a GRAFT asks to start, so changes lost before then are fetched too.
-    since: u64,
+    /// The announced sequence whose timer runs, and when it expires.
     target: u64,
-    announcer: SocketAddr,
     deadline: u64,
+    /// The highest sequence announced after `target`, and when the
+    /// announcement that raised it expires; `0` when there is none.
+    newer: u64,
+    newer_deadline: u64,
+    announcers: [Option<SocketAddr>; ANNOUNCERS],
+    /// The announcer the next GRAFT goes to.
+    next: usize,
     tries: u8,
 }
 
-/// Per-root tree state: which view positions are lazy for this origin. Every
-/// other occupied position is eager, so the two sets partition the view.
+/// Per-root tree state. `lazy` holds the view positions that are lazy for this
+/// origin; every other occupied position is eager, so the two sets partition
+/// the view.
 #[derive(Clone, Copy)]
 struct Root {
     node_id: NodeId,
     incarnation: Incarnation,
     lazy: u32,
+    /// The highest sequence of this origin that the tree (an eager, resent or
+    /// grafted frame) delivered here. A version that arrived off the tree does
+    /// not raise it, so an announcement above it means the tree has not
+    /// delivered the change, however the cell got here.
+    delivered: u64,
 }
 
 /// The last eager packets this node sent, newest overwriting oldest, so a NACK
@@ -258,7 +269,8 @@ impl Plumtree {
                 Root {
                     node_id: NodeId(0),
                     incarnation: 0,
-                    lazy: 0
+                    lazy: 0,
+                    delivered: 0,
                 };
                 nodes
             ]
@@ -318,9 +330,9 @@ impl Plumtree {
         }
     }
 
-    /// The lazy mask of the root in `slot`. A slot freed and reused by another
-    /// origin starts again with every view position eager.
-    fn lazy_mut(&mut self, nodes: &NodeDictionary, slot: NodeSlot) -> &mut u32 {
+    /// The root in `slot`. A slot freed and reused by another origin starts
+    /// again with every view position eager and nothing delivered.
+    fn root_mut(&mut self, nodes: &NodeDictionary, slot: NodeSlot) -> &mut Root {
         let root = &mut self.roots[slot as usize];
         if let Some(d) = nodes.descriptor(slot)
             && (root.node_id, root.incarnation) != (d.node_id, d.incarnation)
@@ -329,9 +341,14 @@ impl Plumtree {
                 node_id: d.node_id,
                 incarnation: d.incarnation,
                 lazy: 0,
+                delivered: 0,
             };
         }
-        &mut root.lazy
+        root
+    }
+
+    fn lazy_mut(&mut self, nodes: &NodeDictionary, slot: NodeSlot) -> &mut u32 {
+        &mut self.root_mut(nodes, slot).lazy
     }
 
     fn eager_mask(&mut self, nodes: &NodeDictionary, slot: NodeSlot) -> u32 {
@@ -459,6 +476,18 @@ where
                 return;
             };
             self.view_insert(index);
+        }
+    }
+
+    /// How far the tree has delivered the origin in `slot` here: what an
+    /// announcement is compared with. This node's own changes need no tree.
+    fn tree_held(&mut self, slot: NodeSlot) -> u64 {
+        if slot == self.store.local_node_slot() {
+            self.store.origin_watermark(slot)
+        } else {
+            self.pt
+                .root_mut(self.store.node_dictionary(), slot)
+                .delivered
         }
     }
 
@@ -793,27 +822,53 @@ where
         self.pt.grafts.clear();
         let mut k = 0;
         while k < self.pt.missing.len() {
-            let m = &mut self.pt.missing[k];
+            let (node_id, incarnation) =
+                (self.pt.missing[k].node_id, self.pt.missing[k].incarnation);
             let held = self
                 .store
-                .find_node(m.node_id, m.incarnation)
-                .map_or(0, |slot| self.store.origin_watermark(slot));
-            if held >= m.target || (m.tries >= MAX_TRIES && m.deadline <= now) {
-                self.pt.missing.swap_remove(k);
-                continue;
+                .find_node(node_id, incarnation)
+                .map_or(0, |slot| self.tree_held(slot));
+            let m = &mut self.pt.missing[k];
+            if held >= m.target {
+                if m.newer <= held {
+                    self.pt.missing.swap_remove(k);
+                    continue;
+                }
+                // The oldest announcement was delivered; the newest one's
+                // timer takes over.
+                m.target = m.newer;
+                m.deadline = m.newer_deadline;
+                m.newer = 0;
+                m.tries = 0;
             }
             if m.deadline <= now {
-                // The announced change never came by the tree: GRAFT.
+                if m.tries >= defaults::PLUMTREE_MAX_GRAFT_TRIES {
+                    self.pt.missing.swap_remove(k);
+                    continue;
+                }
+                // The announced change never came by the tree: GRAFT the next
+                // announcer, asking for everything above what the tree
+                // delivered.
+                let count = m.announcers.iter().flatten().count();
+                let Some(announcer) = m.announcers[m.next % count] else {
+                    self.pt.missing.swap_remove(k);
+                    continue;
+                };
                 self.pt.grafts.push((
-                    m.announcer,
+                    announcer,
                     ControlEntry {
-                        node_id: m.node_id,
-                        incarnation: m.incarnation,
-                        sequence: m.since,
+                        node_id,
+                        incarnation,
+                        sequence: held,
                     },
                 ));
+                m.next = (m.next + 1) % count;
                 m.tries += 1;
                 m.deadline = now + timeout;
+                if m.newer != 0 && m.newer_deadline <= now {
+                    m.target = m.target.max(m.newer);
+                    m.newer = 0;
+                }
             }
             k += 1;
         }
@@ -837,7 +892,7 @@ where
             let edge = &mut peer.edge;
             if edge.nack_at.is_some_and(|at| at <= now) {
                 let (base, mask) = edge.missing();
-                if mask == 0 || edge.nack_tries >= MAX_NACK_TRIES {
+                if mask == 0 || edge.nack_tries >= defaults::PLUMTREE_MAX_NACK_TRIES {
                     edge.nack_at = None;
                 } else {
                     edge.nack_tries += 1;
@@ -980,6 +1035,12 @@ where
                 continue;
             };
             let slot = outcome.handle.index as usize;
+            if forwards && let Some(row) = self.store.get(outcome.handle) {
+                let root = self
+                    .pt
+                    .root_mut(self.store.node_dictionary(), row.key.origin);
+                root.delivered = root.delivered.max(self.obs_buf.origin_sequences[i]);
+            }
             if outcome.changed {
                 self.pt.off_tree[slot] = !forwards;
                 if forwards {
@@ -1155,7 +1216,7 @@ where
                     self.pt.pulls.push(ControlEntry { sequence: 0, ..e });
                     continue;
                 }
-                self.note_missing(&e, 0, src, now + timeout);
+                self.note_missing(&e, src, now + timeout);
                 continue;
             };
             if let Some(ps) = peer_slot {
@@ -1163,31 +1224,45 @@ where
                     .peer_frontiers_mut()
                     .record_acked(ps, slot, e.sequence);
             }
-            let held = self.store.origin_watermark(slot);
-            if e.sequence > held {
-                self.note_missing(&e, held, src, now + timeout);
+            if e.sequence > self.tree_held(slot) {
+                self.note_missing(&e, src, now + timeout);
             }
         }
         self.send_prunes_and_pulls(src);
     }
 
-    /// Remember that `announcer` announced `e`, which has not arrived.
-    fn note_missing(&mut self, e: &ControlEntry, held: u64, announcer: SocketAddr, deadline: u64) {
+    /// Remember that `announcer` announced `e`, which the tree has not
+    /// delivered; its timer expires at `deadline`.
+    fn note_missing(&mut self, e: &ControlEntry, announcer: SocketAddr, deadline: u64) {
         if let Some(m) = self
             .pt
             .missing
             .iter_mut()
             .find(|m| m.node_id == e.node_id && m.incarnation == e.incarnation)
         {
-            m.target = m.target.max(e.sequence);
+            if let Some(free) = m
+                .announcers
+                .iter_mut()
+                .find(|a| a.is_none_or(|a| a == announcer))
+            {
+                *free = Some(announcer);
+            }
+            if e.sequence > m.target && e.sequence > m.newer {
+                m.newer = e.sequence;
+                m.newer_deadline = deadline;
+            }
         } else if self.pt.missing.len() < self.pt.missing.capacity() {
+            let mut announcers = [None; ANNOUNCERS];
+            announcers[0] = Some(announcer);
             self.pt.missing.push(Missing {
                 node_id: e.node_id,
                 incarnation: e.incarnation,
-                since: held,
                 target: e.sequence,
-                announcer,
                 deadline,
+                newer: 0,
+                newer_deadline: 0,
+                announcers,
+                next: 0,
                 tries: 0,
             });
             self.pt.arm_deadline(deadline);

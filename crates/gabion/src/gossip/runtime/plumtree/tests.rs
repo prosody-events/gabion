@@ -456,6 +456,129 @@ fn a_change_the_tree_delivers_in_time_cancels_the_graft() {
     assert!(all[2].rt.pt.missing.is_empty());
 }
 
+/// Deliver to `to` an IHAVE from `from` announcing `origin`'s changes up to
+/// `sequence`.
+fn announce(all: &mut [Node], from: usize, to: usize, origin: usize, sequence: u64) {
+    let o = all[origin].rt.store.local_identity();
+    let entry = ControlEntry {
+        node_id: o.node_id,
+        incarnation: o.incarnation,
+        sequence,
+    };
+    let mut buf = crate::wire::PacketBuf::for_limits(FrameLimits::default());
+    let header = all[from].rt.header(0);
+    wire::encode_control(
+        &mut buf,
+        header,
+        ControlKind::IHave,
+        &[entry],
+        None,
+        FrameLimits::default(),
+    );
+    let packet = Packet {
+        from,
+        to: Some(to),
+        bytes: buf.as_bytes().to_vec(),
+    };
+    receive(all, &packet);
+}
+
+#[test]
+fn a_version_that_arrived_off_the_tree_does_not_hide_a_missing_tree_delivery() {
+    let (mut all, clock) = pruned_with_change_missing_at_c();
+    // The change reaches C off the tree, as a repair or a pull would bring it.
+    let handle = all[0]
+        .rt
+        .store
+        .active_handles()
+        .find(|&h| {
+            all[0]
+                .rt
+                .store
+                .get(h)
+                .is_some_and(|r| r.key.key_hash == KeyHash(2))
+        })
+        .expect("A holds key 2");
+    all[0].rt.frame_handles.clear();
+    all[0].rt.frame_handles.push(handle);
+    let c = all[2].addr;
+    all[0].rt.send_cells(c, FrameKind::Plain, Numbering::None);
+    settle(&mut all, |_| true);
+    assert_eq!(all[2].rt.store.active_len(), 2);
+
+    // B's announcement still finds the tree behind at C, so C grafts.
+    heartbeat(&mut all[1]);
+    settle(&mut all, |p| p.control() == Some(ControlKind::IHave));
+    assert_eq!(all[2].rt.pt.missing.len(), 1);
+    clock.advance(all[2].rt.pt.cfg.missing_timeout.as_millis() as u64);
+    all[2].rt.handle_wake();
+    let log = settle(&mut all, |_| true);
+    assert_eq!(count(&log, ControlKind::Graft), 1);
+    let a_root = slot_of(&all[1], &all[0]);
+    assert!(
+        !is_lazy(&mut all[1], a_root, c),
+        "B's edge to C is eager again"
+    );
+}
+
+#[test]
+fn graft_retries_go_to_the_next_announcer() {
+    let (mut all, clock) = cluster(4, no_pull());
+    hit(&mut all[0].rt, 1);
+    let seq = all[0]
+        .rt
+        .store
+        .origin_watermark(all[0].rt.store.local_node_slot());
+    // D hears of A's change from B, then from C, and the tree never delivers.
+    announce(&mut all, 1, 3, 0, seq);
+    clock.advance(100);
+    announce(&mut all, 2, 3, 0, seq);
+    let timeout = all[3].rt.pt.cfg.missing_timeout.as_millis() as u64;
+    let mut grafted = Vec::new();
+    for _ in 0..usize::from(defaults::PLUMTREE_MAX_GRAFT_TRIES) + 1 {
+        clock.advance(timeout);
+        all[3].rt.handle_wake();
+        for p in outbox(&mut all) {
+            if p.control() == Some(ControlKind::Graft) {
+                grafted.push(p.to.expect("a node"));
+            }
+        }
+    }
+    assert_eq!(grafted, [1, 2, 1], "B, then C, then B again, then give up");
+    assert!(all[3].rt.pt.missing.is_empty());
+}
+
+#[test]
+fn a_graft_waits_for_its_own_announcement_to_time_out() {
+    let (mut all, clock) = cluster(3, no_pull());
+    hit(&mut all[0].rt, 1);
+    let seq = all[0]
+        .rt
+        .store
+        .origin_watermark(all[0].rt.store.local_node_slot());
+    let timeout = all[2].rt.pt.cfg.missing_timeout.as_millis() as u64;
+    announce(&mut all, 1, 2, 0, seq);
+    // The announced change arrives on the tree in time.
+    all[0].rt.handle_gossip_tick(Round::Threshold);
+    settle(&mut all, |p| {
+        p.kind() == FrameKind::Eager && p.to == Some(2)
+    });
+    hit(&mut all[0].rt, 2);
+    clock.advance(timeout - 100);
+    // A newer change is announced just before the first timer expires.
+    announce(&mut all, 1, 2, 0, seq + 1);
+    clock.advance(100);
+    all[2].rt.handle_wake();
+    assert_eq!(
+        count(&outbox(&mut all), ControlKind::Graft),
+        0,
+        "the newer timer still runs"
+    );
+    clock.advance(timeout - 100);
+    all[2].rt.handle_wake();
+    assert_eq!(count(&outbox(&mut all), ControlKind::Graft), 1);
+}
+
 #[test]
 fn an_announcement_for_an_unknown_origin_pulls_at_once_or_grafts_after_the_timeout() {
     let ihave = |all: &mut Vec<Node>| {

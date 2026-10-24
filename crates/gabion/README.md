@@ -80,7 +80,11 @@ at different edges and keep pruning each other's tree.
   full. It is a uniform random sample kept by reservoir sampling over discovery
   events; a departing member is replaced by a random peer from outside. Views
   are directed, not symmetric: there is no NEIGHBOR handshake, because every node
-  already knows every peer from discovery.
+  already knows every peer from discovery. So the paper's local half of each
+  move has no edge to act on (the receiver of a new message putting the sender
+  in its own eager set, of a duplicate moving it to lazy, the GRAFT sender
+  moving the announcer to eager): a node's sets govern only its outbound edges,
+  and each move is made by the edge's sender when PRUNE or GRAFT reaches it.
 - **Eager and lazy sets, per root.** For each origin, the view splits into an
   eager set and a lazy set. A new neighbour, and a root first seen, start
   eager.
@@ -97,13 +101,15 @@ at different edges and keep pruning each other's tree.
   full digests (every `full_ihave_every` heartbeats) only origins that advanced
   past what the peer announced or was told are listed (the peer frontier is the
   hint).
-- **GRAFT.** An IHAVE naming a sequence above the receiver's watermark starts a
-  `missing_timeout` timer. If the watermark has not caught up when it expires,
-  the receiver sends GRAFT to the announcer, naming the sequence it held when
-  the announcement arrived. The announcer
-  makes the receiver eager for that root again and replies with the origin's
-  live cells above the sequence; the receiver forwards them like any delivery.
-  After three unanswered GRAFTs for an origin the announcement is dropped.
+- **GRAFT.** An IHAVE naming a sequence above what the *tree* delivered here
+  (the highest sequence of that origin that came in an eager, resent or
+  grafted frame) starts a `missing_timeout` timer for that announcement. If the
+  tree has not delivered it when the timer expires, the receiver sends GRAFT to
+  the announcer, naming the sequence the tree delivered. The announcer makes
+  the receiver eager for that root again and replies with the origin's live
+  cells above the sequence; the receiver forwards them like any delivery. A
+  retry goes to the next of up to four announcers, as the paper moves on to the
+  next announcement; after `max_graft_tries` GRAFTs the record is dropped.
 - **Wire.** Eager frames use the shared cell codec. IHAVE, GRAFT, PRUNE, NACK
   and PULL are cell-less control frames (`wire::control`): the 72-byte header,
   28-byte `(origin, incarnation, sequence)` entries, and the HMAC tag when
@@ -122,6 +128,8 @@ at different edges and keep pruning each other's tree.
 | `nack_retry` | 100 ms | `PLUMTREE_NACK_RETRY_MS` |
 | `extra_random` | 0 | `PLUMTREE_EXTRA_RANDOM` |
 | `first_contact_pull` | on | `PLUMTREE_FIRST_CONTACT_PULL` |
+| `max_graft_tries` | 3 | `PLUMTREE_MAX_GRAFT_TRIES` |
+| `max_nack_tries` | 10 | `PLUMTREE_MAX_NACK_TRIES` |
 
 They are the fields of `gossip::PlumtreeConfig`, whose `Default` reads these
 constants. `GossipRuntime::with_plumtree` replaces them; `GossipConfig` is
@@ -142,7 +150,12 @@ Each is the smallest change that lets the paper's algorithm run here.
 2. **IHAVE is a per-origin watermark, not a message id.** Because of (1), a
    receiver cannot tell a lost sequence from a superseded one, so IHAVE
    announces how far a peer holds an origin. A hole below the watermark is not
-   visible to IHAVE; NACK (3) and the repair slice (8) close it.
+   visible to IHAVE; NACK (3) and the repair slice (6) close it. The receiver
+   compares an announcement with how far the *tree* delivered the origin, not
+   with what its store holds, so a version that arrived off the tree (4) cannot
+   hide a parent that stopped delivering. The paper's per-message timers become
+   two per origin: the oldest announcement still undelivered and the newest
+   one, each GRAFTed only after its own `missing_timeout`.
 3. **UDP instead of reliable links.** The paper assumes reliable FIFO links.
    Each eager packet carries a per-edge number in `min_origin_sequence`. A
    receiver remembers which of the last 64 numbers arrived. A number that

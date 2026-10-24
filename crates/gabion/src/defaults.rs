@@ -119,6 +119,17 @@ pub const PLUMTREE_EXTRA_RANDOM: usize = 0;
 /// slice to sweep every cell.
 pub const PLUMTREE_FIRST_CONTACT_PULL: bool = true;
 
+/// GRAFTs sent for one origin's missing announcements, each to the next
+/// announcer, before the record is dropped and the repair lane is left to
+/// deliver. The paper retries without bound; a bound keeps a dead announcer
+/// set from costing a GRAFT every `missing_timeout` forever.
+pub const PLUMTREE_MAX_GRAFT_TRIES: u8 = 3;
+
+/// NACKs sent for the packets missing from an edge, one per `nack_retry`,
+/// before giving up on a quiet edge. A busy edge gives up on a packet sooner:
+/// it leaves the 64-packet receive window.
+pub const PLUMTREE_MAX_NACK_TRIES: u8 = 10;
+
 /// Cells of the rotating repair slice one random peer receives per heartbeat.
 pub const PLUMTREE_REPAIR_CELLS_PER_HEARTBEAT: usize = 256;
 
