@@ -849,6 +849,81 @@ fn sim_new_peer_is_welcomed_with_the_members_own_cells() {
     })
 }
 
+/// A peer heard from again after a long silence, here across a healed cut,
+/// is welcomed back with the member's own cells: B learns the hits A took
+/// while the link was down as soon as A hears from B again, before A's next
+/// heartbeat could repair them.
+#[test]
+fn sim_peer_heard_after_silence_is_welcomed_back() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addr_a = sock(45_300);
+        let addr_b = sock(45_301);
+        let id_a = NodeIdentity::new(NodeId(0xF0), 1);
+        let id_b = NodeIdentity::new(NodeId(0xF1), 1);
+        let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+        cfg_a.tick_interval = Duration::from_secs(5);
+        let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+        cfg_b.tick_interval = Duration::from_secs(5);
+        let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let (rt_a, client_a) = GossipRuntime::from_parts(
+            router.bind(addr_a),
+            TokioClock::from_millis(0),
+            cfg_a,
+            store_for(id_a),
+            Rc::new(InMemoryAggregateStore::<u32>::new()),
+        );
+        let (rt_b, client_b) = GossipRuntime::from_parts(
+            router.bind(addr_b),
+            TokioClock::from_millis(0),
+            cfg_b,
+            store_for(id_b),
+            agg_b.clone(),
+        );
+        let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+        let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+        sim_advance(Duration::from_millis(1)).await;
+
+        // A hears from B once, then the link goes down while A takes hits
+        // that cross their budget and flush into the cut.
+        for _ in 0..2 {
+            client_b
+                .record(0xBEEF, KeyHash(2), 0, 2, 0, 0)
+                .await
+                .unwrap();
+        }
+        sim_advance(Duration::from_millis(10)).await;
+        router.set_link_policy(addr_a, addr_b, LinkPolicy::Block);
+        router.set_link_policy(addr_b, addr_a, LinkPolicy::Block);
+        for _ in 0..2 {
+            client_a
+                .record(0xFACE, KeyHash(1), 0, 3, 0, 0)
+                .await
+                .unwrap();
+        }
+        sim_advance_ticks(Duration::from_secs(1), 12).await;
+        let before = agg_b.total();
+
+        // Heal, and let B speak first, mid-way between A's heartbeats.
+        router.set_link_policy(addr_a, addr_b, LinkPolicy::Pass);
+        router.set_link_policy(addr_b, addr_a, LinkPolicy::Pass);
+        sim_advance(Duration::from_millis(1_500)).await;
+        client_b
+            .record(0xBEEF, KeyHash(2), 0, 2, 0, 0)
+            .await
+            .unwrap();
+        sim_advance(Duration::from_millis(50)).await;
+        let after = agg_b.total();
+
+        client_a.shutdown().await.unwrap();
+        client_b.shutdown().await.unwrap();
+        let _ = h_a.await;
+        let _ = h_b.await;
+        assert_eq!(before, 4);
+        assert_eq!(after, 4 + 2 + 6);
+    })
+}
+
 #[quickcheck]
 fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> TestResult {
     run_paused(async move {

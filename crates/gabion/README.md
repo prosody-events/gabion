@@ -369,7 +369,12 @@ A peer that discovery adds starts with an empty store, and rounds only
 carry what changed since. So a member that discovers a new peer welcomes
 it with its own live cells, straight away and only those: each origin
 sends its own share, and the newcomer holds the whole window once every
-member has discovered it, rather than waiting for the repair lane.
+member has discovered it, rather than waiting for the repair lane. A
+peer heard from again after `GOSSIP_REWELCOME_SILENCE_MILLIS` (10 s)
+without a packet, typically across a healed partition, missed every
+change sent meanwhile and is welcomed back the same way. Silence only
+triggers that resend; it never removes a peer, since membership comes
+from discovery alone.
 
 `CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to

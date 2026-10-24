@@ -39,6 +39,21 @@ use super::{GossipConfig, GossipError};
 struct Peer {
     addr: SocketAddr,
     identity: Option<NodeIdentity>,
+    /// When a packet from this peer last arrived; `None` until one has.
+    last_heard_ms: Option<u64>,
+    /// The peer is owed this node's own cells (see `serve_welcomes`).
+    welcome_due: bool,
+}
+
+impl Peer {
+    fn new(addr: SocketAddr, welcome_due: bool) -> Self {
+        Self {
+            addr,
+            identity: None,
+            last_heard_ms: None,
+            welcome_due,
+        }
+    }
 }
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
@@ -245,10 +260,7 @@ where
             .bootstrap_peers
             .iter()
             .copied()
-            .map(|addr| Peer {
-                addr,
-                identity: None,
-            })
+            .map(|addr| Peer::new(addr, false))
             .collect();
         let rng = SplitMix64::new(config.rng_seed);
 
@@ -540,9 +552,21 @@ where
         );
         self.store
             .merge_remote(sender, &self.obs_buf, &mut self.sink_buf);
+        let now = self.clock.now_millis();
         if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
             peer.identity = Some(sender);
+            // A peer silent this long was likely cut off, and missed every
+            // change sent meanwhile; welcome it back like a new peer.
+            let silence = crate::defaults::GOSSIP_REWELCOME_SILENCE_MILLIS;
+            if peer
+                .last_heard_ms
+                .is_some_and(|t| now.saturating_sub(t) >= silence)
+            {
+                peer.welcome_due = true;
+            }
+            peer.last_heard_ms = Some(now);
         }
+        self.serve_welcomes();
     }
 
     fn drain_one_send(&mut self) -> Result<(), GossipError> {
@@ -643,16 +667,13 @@ where
         match evt {
             PeerEvent::Added(p) => {
                 if !self.peers.iter().any(|x| x.addr == p.addr) {
-                    self.peers.push(Peer {
-                        addr: p.addr,
-                        identity: None,
-                    });
+                    self.peers.push(Peer::new(p.addr, true));
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
                         "Peer joined the cluster.",
                     );
-                    self.welcome(p.addr);
+                    self.serve_welcomes();
                 }
             }
             PeerEvent::Removed(p) => {
@@ -681,19 +702,31 @@ where
             .min(GOSSIP_REPAIR_CELLS_PER_HEARTBEAT)
     }
 
-    /// Send a newly discovered peer this node's own live cells. Each origin
-    /// welcomes the peer with its own share, so a joining node holds the
-    /// whole window once every member has discovered it, without waiting for
-    /// the repair lane. What the free send slots cannot carry, it leaves to
-    /// that lane.
-    fn welcome(&mut self, addr: SocketAddr) {
-        if self.store.is_empty() {
+    /// Send this node's own live cells to every peer owed them: one that
+    /// discovery has just added, or one heard from again after
+    /// `GOSSIP_REWELCOME_SILENCE_MILLIS` of silence, such as across a healed
+    /// partition. Each origin welcomes the peer with its own share, so it
+    /// holds the whole window once every member has, without waiting for
+    /// the repair lane. A welcome waits until the free send slots carry all
+    /// of it; every round and every inbound packet tries again.
+    fn serve_welcomes(&mut self) {
+        if !self.peers.iter().any(|p| p.welcome_due) {
             return;
         }
         self.store
             .fill_local_cells(self.config.max_cells_per_tick, &mut self.frame_handles);
-        if !self.frame_handles.is_empty() {
-            self.encode_packets_for(addr);
+        let packets = self.frame_handles.len().div_ceil(self.cells_per_packet);
+        for i in 0..self.peers.len() {
+            if !self.peers[i].welcome_due {
+                continue;
+            }
+            if packets > 0 {
+                if self.send_free.len() < packets {
+                    return;
+                }
+                self.encode_packets_for(self.peers[i].addr);
+            }
+            self.peers[i].welcome_due = false;
         }
     }
 
@@ -797,6 +830,8 @@ where
             }
             self.encode_packets_for(peer_addr);
         }
+
+        self.serve_welcomes();
 
         // Reset per-rule pending. The sweep treats every rule with
         // non-zero pending as "touched in expectation by the tick" — the
