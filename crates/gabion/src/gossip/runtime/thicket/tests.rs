@@ -11,7 +11,7 @@ fn addr(i: u16) -> SocketAddr {
 /// A node at `addr(0)` that knows peers `addr(1)..=addr(n)`.
 fn cluster(n: u16) -> Thicket {
     let peers: Vec<SocketAddr> = (1..=n).map(addr).collect();
-    Thicket::new(addr(0), &peers, 64, 64, 256, 64)
+    Thicket::new(addr(0), &peers, 0, 64, 64, 256, 64)
 }
 
 fn root(slot: NodeSlot, local: bool) -> Root {
@@ -122,14 +122,14 @@ fn a_local_change_in_another_tree_goes_to_the_parent_alone() {
 #[test]
 fn a_tree_with_no_interior_node_is_served_directly() {
     // Peers of one class only: the other trees have no interior node here.
-    let mut t = Thicket::new(addr(0), &[], 64, 64, 256, 64);
+    let mut t = Thicket::new(addr(0), &[], 0, 64, 64, 256, 64);
     let mates: Vec<SocketAddr> = (1..400)
         .map(addr)
         .filter(|a| class_of(a) == t.class)
         .take(4)
         .collect();
     for a in &mates {
-        t.add_peer(*a);
+        t.add_peer(*a, 0);
     }
     let empty = (0..THICKET_TREES as u8)
         .find(|&tree| t.tree_is_empty(tree))
@@ -155,11 +155,11 @@ fn peer_slots_are_reused_and_class_counts_follow_membership() {
     assert_eq!(t.class_alive[usize::from(class)], before - 1);
     assert!(t.index_of(gone).is_none());
 
-    let (idx, new) = t.add_peer(addr(500));
+    let (idx, new) = t.add_peer(addr(500), 0);
     assert!(new);
     assert_eq!(idx, 3, "the freed slot is reused");
     assert_eq!(t.peers.len(), 20);
-    assert!(!t.add_peer(addr(500)).1, "a known peer is not new");
+    assert!(!t.add_peer(addr(500), 0).1, "a known peer is not new");
 }
 
 #[test]
@@ -244,7 +244,7 @@ fn harness_addr(i: u16) -> SocketAddr {
 /// then attach their parents, the parents refusing leaves over their cap.
 fn discovered_in_index_order(n: u16) -> Vec<Thicket> {
     let mut nodes: Vec<Thicket> = (0..n)
-        .map(|i| Thicket::new(harness_addr(i), &[], usize::from(n), 64, 256, 64))
+        .map(|i| Thicket::new(harness_addr(i), &[], 0, usize::from(n), 64, 256, 64))
         .collect();
     let mut rngs: Vec<SplitMix64> = (0..n).map(|i| SplitMix64::new(u64::from(i))).collect();
     for peer in 0..n {
@@ -252,7 +252,7 @@ fn discovered_in_index_order(n: u16) -> Vec<Thicket> {
             if i as u16 == peer {
                 continue;
             }
-            let (idx, new) = node.add_peer(harness_addr(peer));
+            let (idx, new) = node.add_peer(harness_addr(peer), 0);
             assert!(new);
             node.place_new(idx, &mut rngs[i]);
             node.fill_view(&mut rngs[i]);

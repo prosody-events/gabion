@@ -252,8 +252,9 @@ where
             Ok(frame) => {
                 let now = self.clock.now_millis();
                 if let Some(peer) = self.thicket.index_of(src) {
-                    self.thicket.peers[usize::from(peer)].node_id =
-                        Some(NodeId(frame.header.sender_node_id));
+                    let p = &mut self.thicket.peers[usize::from(peer)];
+                    p.node_id = Some(NodeId(frame.header.sender_node_id));
+                    p.heard_ms = now;
                     match frame.kind {
                         ControlKind::Ihave => self.on_ihave(peer, &entries, now),
                         ControlKind::Graft => self.on_graft(peer, frame.tree, &entries),
@@ -562,7 +563,7 @@ where
             if let Some(announcer) = announcer
                 && !asked.is_empty()
             {
-                self.graft_for(announcer, &asked);
+                self.graft_for(announcer, &asked, now);
             }
             self.thicket.entries = asked;
         }
@@ -571,27 +572,37 @@ where
     /// Ask `announcer` for the cells of the changes in `asked`, and repair the
     /// trees they travel in through it, as Thicket does:
     ///
-    /// - When some of them travel in a tree this node is a leaf of and the
-    ///   announcer is interior in that tree, the announcer becomes this node's
-    ///   parent there: the GRAFT that asks for the cells also attaches to it,
-    ///   and the old parent, whose tree did not deliver, is detached. A GRAFT
-    ///   never makes a node interior in a second tree, because the announcer
-    ///   already is interior in this one.
+    /// - When some of them travel in a tree this node is a leaf of, its parent
+    ///   there has not been heard from for a missing timeout, and the announcer
+    ///   is interior in that tree, the announcer becomes this node's parent
+    ///   there: the GRAFT that asks for the cells also attaches to it, the old
+    ///   parent is detached, and this node's own recent changes of that tree,
+    ///   which the old parent may never have passed on, go to the new one. A
+    ///   GRAFT never makes a node interior in a second tree, because the
+    ///   announcer already is interior in this one. A parent that is heard from
+    ///   stays: a change lost on a live tree is pulled, and moving the leaf
+    ///   would move where its own changes enter the tree, whose eager links
+    ///   every root pruned around the old entry.
     /// - When some travel in this node's own tree, a class-mate is GRAFTed for
     ///   a backbone link: the announcer when it is one.
-    pub(super) fn graft_for(&mut self, announcer: u16, asked: &[ControlEntry]) {
+    pub(super) fn graft_for(&mut self, announcer: u16, asked: &[ControlEntry], now: u64) {
         let class = self.thicket.class;
         let tree = self.thicket.peers[usize::from(announcer)].class;
-        let reparent = tree != class && asked.iter().any(|e| tree_of(e.node_id, e.value) == tree);
+        let old = self.thicket.parents[usize::from(tree)];
+        let since = match old {
+            NONE => 0,
+            old => self.thicket.peers[usize::from(old)].heard_ms,
+        };
+        let reparent = tree != class
+            && now.saturating_sub(since) >= THICKET_MISSING_TIMEOUT_MS
+            && asked.iter().any(|e| tree_of(e.node_id, e.value) == tree);
         if reparent {
-            let old = self.thicket.parents[usize::from(tree)];
-            if old != announcer {
-                if old != NONE {
-                    self.send_control(old, ControlKind::Prune, tree, &[]);
-                }
-                self.thicket.parents[usize::from(tree)] = announcer;
+            if old != NONE {
+                self.send_control(old, ControlKind::Prune, tree, &[]);
             }
+            self.thicket.parents[usize::from(tree)] = announcer;
             self.send_control(announcer, ControlKind::Graft, tree, asked);
+            self.resend_own(tree, announcer, since);
         } else {
             self.send_control(announcer, ControlKind::Graft, PULL_ONLY_TREE, asked);
         }

@@ -56,6 +56,8 @@ pub(super) struct TreePeer {
     view_pos: u8,
     /// Attached to us as its parent in our tree.
     pub leaf_child: bool,
+    /// When a packet from this peer last arrived, or discovery added it.
+    pub heard_ms: u64,
     pub edge: Edge,
 }
 
@@ -157,6 +159,7 @@ impl Thicket {
     pub(super) fn new(
         local: SocketAddr,
         bootstrap: &[SocketAddr],
+        now_ms: u64,
         peer_capacity: usize,
         node_capacity: usize,
         cell_capacity: usize,
@@ -189,7 +192,7 @@ impl Thicket {
             dests: Vec::with_capacity(peer_capacity),
         };
         for &addr in bootstrap {
-            thicket.add_peer(addr);
+            thicket.add_peer(addr, now_ms);
         }
         thicket
     }
@@ -206,7 +209,7 @@ impl Thicket {
     /// Register a peer from discovery, reusing the slot of a departed one so
     /// the table is bounded by peak membership. Returns its index, and
     /// whether it is new.
-    pub(super) fn add_peer(&mut self, addr: SocketAddr) -> (u16, bool) {
+    pub(super) fn add_peer(&mut self, addr: SocketAddr, now_ms: u64) -> (u16, bool) {
         if let Some(i) = self.index_of(addr) {
             return (i, false);
         }
@@ -218,6 +221,7 @@ impl Thicket {
             class,
             view_pos: NO_POS,
             leaf_child: false,
+            heard_ms: now_ms,
             edge: Edge::new(),
         };
         let idx = match self.peers.iter().position(|p| !p.alive) {

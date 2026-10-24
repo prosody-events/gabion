@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use super::SplitMix64;
 use super::thicket::{NONE, class_of, tree_of};
 use crate::crdt::{BucketEpoch, NodeId, NodeIdentity};
-use crate::defaults::THICKET_TREES;
+use crate::defaults::{THICKET_MISSING_TIMEOUT_MS, THICKET_TREES};
 use crate::discovery::{Peer, PeerEvent};
 use crate::gossip::sim::{LinkPolicy, SimRouter, SimTransport, sim_advance_ticks};
 use crate::gossip::tests::{
@@ -358,7 +358,8 @@ fn a_leaf_regrafts_to_an_announcer_interior_in_the_tree_that_failed_it() {
             .random_of_class(tree, &mut SplitMix64::new(7), |i, _| i == old)
             .unwrap();
 
-        rt.graft_for(announcer, &[change_in(tree)]);
+        // Nothing heard from the old parent for a missing timeout.
+        rt.graft_for(announcer, &[change_in(tree)], THICKET_MISSING_TIMEOUT_MS);
 
         assert_eq!(rt.thicket.parents[usize::from(tree)], announcer);
         assert_eq!(
@@ -387,9 +388,34 @@ fn an_announcer_that_is_a_leaf_of_the_tree_is_only_asked_for_cells() {
             .random_of_class(leaf_there, &mut SplitMix64::new(7), |_, _| false)
             .unwrap();
 
-        rt.graft_for(announcer, &[change_in(tree)]);
+        rt.graft_for(announcer, &[change_in(tree)], THICKET_MISSING_TIMEOUT_MS);
 
         assert_eq!(rt.thicket.parents, parents);
+        assert_eq!(
+            queued_control(&rt),
+            vec![(announcer, ControlKind::Graft, PULL_ONLY_TREE)]
+        );
+    });
+}
+
+#[test]
+fn a_parent_heard_from_lately_is_kept_and_only_cells_are_asked_for() {
+    run_paused(async {
+        let all = addrs(30);
+        let router = SimRouter::with_channel_capacity(64);
+        let mut rt = idle_runtime(&router, &all, 0);
+        let tree = (rt.thicket.class + 1) % THICKET_TREES as u8;
+        let old = rt.thicket.parents[usize::from(tree)];
+        let announcer = rt
+            .thicket
+            .random_of_class(tree, &mut SplitMix64::new(7), |i, _| i == old)
+            .unwrap();
+        let now = 10_000;
+        rt.thicket.peers[usize::from(old)].heard_ms = now - THICKET_MISSING_TIMEOUT_MS + 1;
+
+        rt.graft_for(announcer, &[change_in(tree)], now);
+
+        assert_eq!(rt.thicket.parents[usize::from(tree)], old);
         assert_eq!(
             queued_control(&rt),
             vec![(announcer, ControlKind::Graft, PULL_ONLY_TREE)]
@@ -421,5 +447,59 @@ fn a_missing_change_keeps_an_announcer_interior_in_its_tree() {
 
         assert_eq!(rt.thicket.missing.len(), 1);
         assert_eq!(rt.thicket.missing[0].announcer, inside);
+    });
+}
+
+#[test]
+fn a_leaf_resends_its_changes_to_the_parent_that_replaces_a_departed_one() {
+    run_paused(async {
+        const N: usize = 12;
+        let all = addrs(N);
+        // A leaf whose first change travels in a tree it is a leaf of.
+        let (leaf, tree) = (0..N)
+            .map(|i| (i, tree_of(NodeId(0xA000 + i as u128), 1)))
+            .find(|&(i, t)| t != class_of(&all[i]))
+            .unwrap();
+        // Its parent there, as the node will pick it: the same seed and peers.
+        let parent = {
+            let twin = idle_runtime(&SimRouter::new(), &all, leaf);
+            twin.thicket.peers[usize::from(twin.thicket.parents[usize::from(tree)])].addr
+        };
+        let keep = *all
+            .iter()
+            .find(|a| class_of(a) == tree && **a != parent)
+            .expect("a second interior node of the tree");
+
+        let router = SimRouter::with_channel_capacity(256);
+        let tick = Duration::from_secs(3600);
+        let nodes: Vec<Node> = (0..N)
+            .map(|i| {
+                let peers: Vec<_> = all.iter().copied().filter(|a| *a != all[i]).collect();
+                spawn_node(&router, &all, i, &peers, tick)
+            })
+            .collect();
+        run_for(50).await;
+
+        // The leaf's change goes to its parent, which is gone without word.
+        router.set_link_policy(all[leaf], parent, LinkPolicy::Block);
+        let mut model = Model::new();
+        record(&nodes[leaf], &mut model, 1, 3).await;
+        run_for(100).await;
+
+        // Discovery then removes every interior node of the tree but one, so
+        // the leaf's new parent can only be that one. No heartbeat falls in
+        // the run, so nothing but the resend can carry the change.
+        for a in all.iter().filter(|a| class_of(a) == tree && **a != keep) {
+            nodes[leaf]
+                .peer_events
+                .send(PeerEvent::Removed(Peer::new(*a)))
+                .unwrap();
+        }
+        run_for(500).await;
+
+        for (i, node) in nodes.iter().enumerate() {
+            assert_eq!(node.agg.snapshot(), model, "node {i}");
+        }
+        stop(nodes).await;
     });
 }

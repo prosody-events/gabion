@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::crdt::{
     CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
 };
-use crate::defaults::THICKET_RELAY_FLOOR_MS;
+use crate::defaults::{THICKET_RELAY_FLOOR_MS, THICKET_TREES};
 use crate::discovery::PeerEvent;
 use crate::wire::{self, FLAG_EDGE, PacketBuf, WireScratch};
 
@@ -247,6 +247,7 @@ where
         let thicket = Thicket::new(
             local_addr,
             &config.bootstrap_peers,
+            clock.now_millis(),
             usize::from(store.peer_frontiers().peer_capacity()),
             store.node_dictionary().capacity() as usize,
             store.capacity() as usize,
@@ -562,8 +563,9 @@ where
             self.thicket.relay_pending = true;
         }
         if let Some(peer) = peer {
-            self.thicket.peers[usize::from(peer)].node_id =
-                Some(NodeId(summary.header.sender_node_id));
+            let p = &mut self.thicket.peers[usize::from(peer)];
+            p.node_id = Some(NodeId(summary.header.sender_node_id));
+            p.heard_ms = now;
             if summary.flags & FLAG_EDGE != 0 {
                 if self.edge_receive(peer, &summary.header, now) {
                     self.eager_feedback(peer);
@@ -697,7 +699,8 @@ where
     fn handle_peer_event(&mut self, evt: PeerEvent) {
         match evt {
             PeerEvent::Added(p) => {
-                let (idx, new) = self.thicket.add_peer(p.addr);
+                let now = self.clock.now_millis();
+                let (idx, new) = self.thicket.add_peer(p.addr, now);
                 if new {
                     tracing::info!(
                         peer = %p.addr,
@@ -709,7 +712,9 @@ where
                 }
             }
             PeerEvent::Removed(p) => {
-                if self.thicket.index_of(p.addr).is_some() {
+                if let Some(idx) = self.thicket.index_of(p.addr) {
+                    let orphaned = self.thicket.parents.map(|parent| parent == idx);
+                    let heard_ms = self.thicket.peers[usize::from(idx)].heard_ms;
                     self.thicket.remove_peer(p.addr);
                     tracing::info!(
                         peer = %p.addr,
@@ -717,6 +722,14 @@ where
                         "Peer left the cluster.",
                     );
                     self.maintain_structure();
+                    // The departed parent may have taken this node's last
+                    // changes of its tree with it.
+                    for tree in (0..THICKET_TREES).filter(|&t| orphaned[t]) {
+                        let parent = self.thicket.parents[tree];
+                        if parent != NONE {
+                            self.resend_own(tree as u8, parent, heard_ms);
+                        }
+                    }
                 }
             }
         }

@@ -169,6 +169,38 @@ where
         }
     }
 
+    /// Push this node's own changes of `tree` made since `since_ms`, less one
+    /// heartbeat, to `parent`: a new parent there, standing in for one that
+    /// went silent or left and may have dropped them. The heartbeat's margin
+    /// covers a change made earlier and sent at the next heartbeat. Walks the
+    /// store, which only a change of parent does.
+    pub(super) fn resend_own(&mut self, tree: u8, parent: u16, since_ms: u64) {
+        let since = since_ms.saturating_sub(self.config.tick_interval.as_millis() as u64);
+        let me = self.store.local_identity().node_id;
+        let local = self.store.local_node_slot();
+        let cap = self.config.max_cells_per_tick;
+        let mut frame = std::mem::take(&mut self.frame_handles);
+        frame.clear();
+        for handle in self.store.active_handles() {
+            if frame.len() == cap {
+                break;
+            }
+            let Some(row) = self.store.get(handle) else {
+                continue;
+            };
+            if row.key.origin == local
+                && row.last_update_millis >= since
+                && tree_of(me, row.origin_sequence) == tree
+            {
+                frame.push(handle);
+            }
+        }
+        if !frame.is_empty() {
+            self.send_cells(parent, &frame, Lane::Push);
+        }
+        self.frame_handles = frame;
+    }
+
     /// Push the changes in the dirty rings along the trees: to each backbone
     /// neighbour that is eager for a change's root, to leaf children, and for
     /// this node's own changes in a tree it is a leaf of, to its parent. A
