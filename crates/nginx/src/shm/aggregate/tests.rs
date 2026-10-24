@@ -131,7 +131,7 @@ fn lead(store: &ShmAggregateStore, incarnation: u32) -> CellStore<u32> {
         last_update_millis: 7_000,
     });
     let mut deltas = DeltaSink::default();
-    cells.merge_remote(&gossip, &mut deltas);
+    cells.merge_remote(NodeIdentity::new(NodeId(2), 1), &gossip, &mut deltas);
     store.apply(&deltas, &ExpirationSink::default());
     cells
 }

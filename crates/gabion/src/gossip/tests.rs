@@ -564,12 +564,10 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
 
 /// Deterministic regression for the partition-heal stuck-cell flake. These
 /// records are a captured `PartitionCase` counterexample: node 3's
-/// `(rule 0, key 0)` cell never reached node 1 because the peer-frontier
+/// `(rule 0, key 0)` cell never reached node 1 because a per-peer frontier
 /// high-watermark sat at that cell's (locally re-stamped) sequence, so every
-/// send lane — including repair — pruned it via `peer_lacks`. With the repair
-/// lane ungated (see `CellStore::fill_gossip_frame_for_peer`) the cluster
-/// converges. Pinned as a fast `#[test]` so the fix cannot regress behind the
-/// ~1-in-100k random trigger.
+/// send lane pruned it. Pinned as a fast `#[test]` so no future pruning can
+/// strand a cell behind the ~1-in-100k random trigger.
 #[test]
 fn sim_partition_heal_converges_on_captured_stuck_cell() {
     let records: Vec<SimRecord> = [
@@ -1688,139 +1686,6 @@ async fn admin_snapshot(
         .await
         .expect("admin command channel open");
     reply_rx.await.expect("runtime replied to snapshot")
-}
-
-// -- Gap 1: peer-cache pairing invariant ------------------------------------
-
-#[derive(Clone, Debug)]
-enum PairingOp {
-    AddPeer(u8),
-    RemovePeer(u8),
-    Record(u8),
-}
-
-impl Arbitrary for PairingOp {
-    fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 4 {
-            0 => PairingOp::AddPeer(u8::arbitrary(g)),
-            1 => PairingOp::RemovePeer(u8::arbitrary(g)),
-            _ => PairingOp::Record(u8::arbitrary(g)),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct PairingCase {
-    ops: Vec<PairingOp>,
-}
-
-impl Arbitrary for PairingCase {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let len = (usize::arbitrary(g) % 12) + 2;
-        Self {
-            ops: (0..len).map(|_| PairingOp::arbitrary(g)).collect(),
-        }
-    }
-}
-
-/// Invariant: in every peer entry observed via admin snapshot,
-/// `node_id.is_some()` iff `peer_slot.is_some()`. The runtime sets the two
-/// together (runtime.rs `handle_inbound`); a future refactor that breaks
-/// the pairing would not break convergence — gossip would just silently
-/// re-send unpruned frames — so the bug would slip past every existing
-/// property test. This case stresses `PeerEvent::Added/Removed` interleaved
-/// with `record()` and snapshots after each step.
-#[quickcheck]
-fn quickcheck_peer_slot_pairing_holds_across_lifecycle(case: PairingCase) -> TestResult {
-    use crate::discovery::{Peer, PeerEvent};
-    use tokio::sync::mpsc;
-
-    run_paused(async move {
-        const NODE_COUNT: usize = 3;
-        let router = SimRouter::new();
-        let addrs: Vec<SocketAddr> = (0..NODE_COUNT).map(|i| sock(48_000 + i as u16)).collect();
-
-        let id_local = NodeIdentity::new(NodeId(0xA0A0), 1);
-        let mut cfg = sim_config(id_local, Vec::new(), 1);
-        cfg.fanout = NODE_COUNT.saturating_sub(1);
-
-        let (admin_tx, admin_rx) = mpsc::channel(8);
-        let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
-        let peer_stream = futures::stream::unfold(peer_rx, |mut rx| async move {
-            rx.recv().await.map(|evt| (evt, rx))
-        });
-
-        let local_addr = addrs[0];
-        let (rt_local, client_local) = GossipRuntime::from_parts_with_admin(
-            router.bind(local_addr),
-            TokioClock::from_millis(0),
-            cfg,
-            store_for(id_local),
-            Rc::new(InMemoryAggregateStore::<u32>::new()),
-            Some(admin_rx),
-        );
-        let h_local = tokio::task::spawn_local(rt_local.run(peer_stream));
-
-        let mut remote_clients = Vec::new();
-        let mut remote_handles = Vec::new();
-        for (i, addr) in addrs.iter().enumerate().skip(1) {
-            let id = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
-            let mut cfg = sim_config(id, vec![local_addr], 100 + i as u64);
-            cfg.fanout = 1;
-            let (rt, client) = GossipRuntime::from_parts(
-                router.bind(*addr),
-                TokioClock::from_millis(0),
-                cfg,
-                store_for(id),
-                Rc::new(InMemoryAggregateStore::<u32>::new()),
-            );
-            remote_handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-            remote_clients.push(client);
-        }
-
-        let mut invariant_holds = true;
-        let mut snapshots = 0usize;
-        for op in &case.ops {
-            match op {
-                PairingOp::AddPeer(idx) => {
-                    let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
-                    let _ = peer_tx.send(PeerEvent::Added(Peer::new(target)));
-                }
-                PairingOp::RemovePeer(idx) => {
-                    let target = addrs[(*idx as usize % (NODE_COUNT - 1)) + 1];
-                    let _ = peer_tx.send(PeerEvent::Removed(Peer::new(target)));
-                }
-                PairingOp::Record(key) => {
-                    let _ = client_local
-                        .record(0xAAAA, key_hash(*key), 0, 1, 0, 0)
-                        .await;
-                }
-            }
-            sim_advance_ticks(Duration::from_millis(100), 3).await;
-            let snap = admin_snapshot(&admin_tx).await;
-            snapshots += 1;
-            for peer in &snap.peers {
-                if peer.node_id.is_some() != peer.peer_slot.is_some() {
-                    invariant_holds = false;
-                }
-            }
-        }
-
-        client_local.shutdown().await.unwrap();
-        for client in remote_clients {
-            let _ = client.shutdown().await;
-        }
-        let _ = h_local.await;
-        for handle in remote_handles {
-            let _ = handle.await;
-        }
-
-        if snapshots == 0 {
-            TestResult::discard()
-        } else {
-            TestResult::from_bool(invariant_holds)
-        }
-    })
 }
 
 // -- Gap 2: without-replacement sampling distribution -----------------------

@@ -16,7 +16,7 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Incarnation, NodeId, Observation,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, NodeIdentity, Observation,
     ObservationBatch,
 };
 use crate::discovery::PeerEvent;
@@ -33,48 +33,11 @@ use super::transport::GossipTransport;
 use super::transport::UdpTransport;
 use super::{GossipConfig, GossipError};
 
-/// One peer the runtime gossips with. `node_id` is `None` until we receive
-/// our first inbound packet from this peer; `peer_slot` caches the
-/// `PeerFrontierTable` slot once interned.
+/// One peer the runtime gossips with. `identity` is `None` until we receive
+/// our first inbound packet from this peer, whose header names it.
 struct Peer {
     addr: SocketAddr,
-    node_id: Option<NodeId>,
-    peer_slot: Option<u16>,
-}
-
-/// Data-oriented scratch for per-row frontier acks decoded from one inbound
-/// packet. The columns are allocated once at runtime construction and reused
-/// for every inbound arm.
-struct AckColumns {
-    origin_node_ids: Vec<NodeId>,
-    incarnations: Vec<Incarnation>,
-    origin_sequences: Vec<u64>,
-}
-
-impl AckColumns {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            origin_node_ids: Vec::with_capacity(capacity),
-            incarnations: Vec::with_capacity(capacity),
-            origin_sequences: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.origin_node_ids.clear();
-        self.incarnations.clear();
-        self.origin_sequences.clear();
-    }
-
-    fn push(&mut self, origin_node_id: NodeId, incarnation: Incarnation, origin_sequence: u64) {
-        self.origin_node_ids.push(origin_node_id);
-        self.incarnations.push(incarnation);
-        self.origin_sequences.push(origin_sequence);
-    }
-
-    fn len(&self) -> usize {
-        self.origin_node_ids.len()
-    }
+    identity: Option<NodeIdentity>,
 }
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
@@ -103,7 +66,6 @@ where
     recv_buf: Box<[u8]>,
     scratch: WireScratch,
     obs_buf: ObservationBatch<C>,
-    ack_buf: AckColumns,
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
@@ -258,7 +220,6 @@ where
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
         let obs_buf = ObservationBatch::<C>::with_capacity(config.max_cells_per_tick);
-        let ack_buf = AckColumns::with_capacity(config.wire_limits.max_cells as usize);
         let sink_buf = DeltaSink::<C>::with_capacity(config.max_cells_per_tick);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
@@ -276,8 +237,7 @@ where
             .copied()
             .map(|addr| Peer {
                 addr,
-                node_id: None,
-                peer_slot: None,
+                identity: None,
             })
             .collect();
         let rng = SplitMix64::new(config.rng_seed);
@@ -297,7 +257,6 @@ where
             recv_buf,
             scratch,
             obs_buf,
-            ack_buf,
             sink_buf,
             expiration_buf,
             frame_handles,
@@ -498,18 +457,11 @@ where
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
         self.obs_buf.clear();
-        self.ack_buf.clear();
         self.sink_buf.clear();
         let bytes = &self.recv_buf[..n];
         let decoded = {
             let obs_buf = &mut self.obs_buf;
-            let ack_buf = &mut self.ack_buf;
             let mut on_cell = |cell: wire::WireCell<C>| {
-                ack_buf.push(
-                    cell.origin_node_id,
-                    cell.origin_incarnation,
-                    cell.origin_sequence,
-                );
                 obs_buf.push(Observation {
                     rule_fingerprint: cell.rule_fingerprint,
                     key_hash: cell.key_hash,
@@ -561,30 +513,14 @@ where
             }
         };
 
-        self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
-
-        // Frontier update — latency optimization. Best-effort: missing slot
-        // or missing node entry just means we don't get the skip.
-        let sender_id = NodeId(summary.header.sender_node_id);
-        if let Some(peer_slot) = self.store.peer_frontiers_mut().intern_peer(sender_id) {
-            for i in 0..self.ack_buf.len() {
-                let origin_id = self.ack_buf.origin_node_ids[i];
-                let incarnation = self.ack_buf.incarnations[i];
-                let sequence = self.ack_buf.origin_sequences[i];
-                if let Some(node_slot) = self.store.node_dictionary().find(origin_id, incarnation) {
-                    self.store
-                        .peer_frontiers_mut()
-                        .record_acked(peer_slot, node_slot, sequence);
-                }
-            }
-            // Cache the peer_slot on the matching peer entry so future ticks
-            // can prune without re-interning. `node_id` and `peer_slot` are
-            // always set together — see `handle_gossip_tick`, which relies
-            // on this invariant.
-            if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
-                peer.node_id = Some(sender_id);
-                peer.peer_slot = Some(peer_slot);
-            }
+        let sender = NodeIdentity::new(
+            NodeId(summary.header.sender_node_id),
+            summary.header.sender_incarnation,
+        );
+        self.store
+            .merge_remote(sender, &self.obs_buf, &mut self.sink_buf);
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
+            peer.identity = Some(sender);
         }
     }
 
@@ -616,8 +552,7 @@ where
                         .iter()
                         .map(|p| PeerEntry {
                             addr: p.addr,
-                            node_id: p.node_id,
-                            peer_slot: p.peer_slot,
+                            node_id: p.identity.map(|id| id.node_id),
                         })
                         .collect(),
                     store_stats: self.store.stats(),
@@ -689,8 +624,7 @@ where
                 if !self.peers.iter().any(|x| x.addr == p.addr) {
                     self.peers.push(Peer {
                         addr: p.addr,
-                        node_id: None,
-                        peer_slot: None,
+                        identity: None,
                     });
                     tracing::info!(
                         peer = %p.addr,
@@ -701,10 +635,7 @@ where
             }
             PeerEvent::Removed(p) => {
                 if let Some(pos) = self.peers.iter().position(|x| x.addr == p.addr) {
-                    let removed = self.peers.remove(pos);
-                    if let Some(node_id) = removed.node_id {
-                        self.store.peer_frontiers_mut().remove_peer(node_id);
-                    }
+                    self.peers.remove(pos);
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
@@ -777,28 +708,20 @@ where
             if self.send_free.is_empty() {
                 break;
             }
-            let peer_addr = self.peers[peer_idx].addr;
-            // `handle_inbound` writes `node_id` and `peer_slot` together —
-            // when one is `Some`, the other is too. So a single read of
-            // `peer_slot` is the full pruning decision.
-            let peer_slot = self.peers[peer_idx].peer_slot;
+            let peer = &self.peers[peer_idx];
+            let peer_addr = peer.addr;
+            // bp-skip: never send a cell to its origin or back to the peer
+            // its value came from. A peer whose identity no cell mentions
+            // has no dictionary slot, and nothing to skip.
+            let peer_node = peer
+                .identity
+                .and_then(|id| self.store.find_node(id.node_id, id.incarnation));
 
-            self.frame_handles.clear();
-            match peer_slot {
-                Some(slot) => {
-                    self.store.fill_gossip_frame_for_peer(
-                        self.config.max_cells_per_tick,
-                        slot,
-                        &mut self.frame_handles,
-                    );
-                }
-                None => {
-                    // Bootstrap fallback: we haven't heard from this peer
-                    // yet, so we don't know what to prune. Send an unpruned
-                    // frame; the next inbound from them caches the slot.
-                    self.store
-                        .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
-                }
+            self.store
+                .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
+            if let Some(node) = peer_node {
+                let store = &self.store;
+                self.frame_handles.retain(|&h| !store.known_to(h, node));
             }
             if self.frame_handles.is_empty() {
                 continue;
@@ -808,14 +731,13 @@ where
 
         // Reset per-rule pending. The sweep treats every rule with
         // non-zero pending as "touched in expectation by the tick" — the
-        // dirty-ring drain in `fill_gossip_frame*` doesn't tell us which
+        // dirty-ring drain in `fill_gossip_frame` doesn't tell us which
         // rule slots actually made it onto the wire, but mass conservation
         // (Kempe, Dobra, Gehrke — FOCS 2003) says every pending hit either
         // rode out in this frame or sits in the dirty ring awaiting the
         // next one. Under UDP loss the residual is repaired by the next
         // round; the N × ε_R bound holds in expectation. A strict bound
-        // would require ack-aware reset against `peer_frontiers`,
-        // deferred until measurements show drift.
+        // would require per-peer acks, which this design does not keep.
         let stamp = now_millis.max(1);
         for slot in 0..self.rule_pending.len() {
             if self.rule_pending[slot] != 0 {

@@ -131,7 +131,7 @@ cluster behaves under load:
   unreplicated error stays inside a per-rule error budget, while a
   cold rule simply rides the heartbeat.
 
-The full protocol, including the dirty rings, the peer frontier, the
+The full protocol, including the dirty rings, bp-skip, the
 math behind the budget, and the operator knobs that control them, is
 documented in
 [`crates/gabion/README.md`](crates/gabion/README.md#how-gossip-works).

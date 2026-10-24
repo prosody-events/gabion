@@ -35,8 +35,7 @@ Read it end-to-end and you should be able to open `crdt.rs` and recognise every 
    - 7.1 [The two dirty rings](#71-the-two-dirty-rings)
    - 7.2 [The repair cursor — the third lane](#72-the-repair-cursor--the-third-lane)
    - 7.3 [`fill_gossip_frame` and per-frame dedup](#73-fill_gossip_frame-and-per-frame-dedup)
-   - 7.4 [`peer_frontier` — per-peer × per-origin cursors](#74-peer_frontier--per-peer--per-origin-cursors)
-   - 7.5 [`fill_gossip_frame_for_peer` and `peer_lacks`](#75-fill_gossip_frame_for_peer-and-peer_lacks)
+   - 7.4 [bp-skip — the `vias` column](#74-bp-skip--the-vias-column)
 8. [Expiry](#8-expiry)
 9. [End-to-end traced example](#9-end-to-end-traced-example)
 10. [Invariants reference](#10-invariants-reference)
@@ -94,10 +93,6 @@ flowchart TB
         IO["io — Observation, ObservationBatch, DeltaSink, ExpirationSink"]
     end
 
-    subgraph gossip["Gossip"]
-        PF["peer_frontier — PeerFrontierTable"]
-    end
-
     CS --> D
     CS --> I
     I --> H
@@ -105,7 +100,6 @@ flowchart TB
     D --> I
     CS --> DR
     CS --> IO
-    CS --> PF
 ```
 
 §3 walks the four foundations bottom-up — they have no dependencies on the cell store and compose into it. §4 introduces the store; §5 the I/O containers; §6 traces a write through both; §7 covers gossip frame composition; §8 covers expiry.
@@ -329,7 +323,7 @@ The interned key is the *pair* `(node_id, incarnation)`, not just the node id, a
 The three asymmetries with the rule version are:
 
 1. **`intern` does not overwrite the descriptor on a hit.** There is nothing to overwrite, because the descriptor *is* the key.
-2. **`dec_ref` returns `bool`.** A return value of `true` means this call dropped the refcount to zero and freed the slot, which the caller uses to decide whether to also tear down per-origin auxiliary state — the per-origin sequence allocator and the per-peer frontier rows.
+2. **`dec_ref` returns `bool`.** A return value of `true` means this call dropped the refcount to zero and freed the slot, which the caller uses to decide whether to also tear down per-origin auxiliary state — the per-origin sequence allocator.
 3. **Different incarnations get different slots.** A node that bumps its incarnation never shares a `NodeSlot` with its previous identity.
 
 #### Capacity sizing — `pow2_index_capacity_for`
@@ -740,7 +734,7 @@ When a cell is freed (e.g. expired), `free_cell_at` does the bookkeeping the slo
 1. Reconstruct `CompactCellKey` from the columns.
 2. Remove the corresponding entry from `CellIndex`.
 3. Decrement the rule dictionary refcount; the rule slot is released if nothing else references it.
-4. Decrement the node dictionary refcount; if that frees the node slot, also clear the `PeerFrontierTable` column for it (§7.4) and reset its `next_sequence_by_origin` counter.
+4. Decrement the node dictionary refcounts of the cell's origin and of its `via` (§7.4); a slot freed here also resets its `next_sequence_by_origin` counter.
 5. Call `free_slot` to flip the generation and push onto the freelist.
 
 Dictionary refcounts are why each `upsert` insert path calls `rule_dictionary.inc_ref(...)` and `node_dictionary.inc_ref(...)`: the cell *holds* a reference and releases it here.
@@ -818,7 +812,9 @@ The cell store carries its own construction-time defaults (`CellStoreConfig::def
 | `node_dictionary_capacity`              | 32                           | `STORAGE_NODE_DICTIONARY_CAPACITY` = 1,024 |
 | `local_dirty_capacity`                  | 64                           | `STORAGE_LOCAL_DIRTY_CAPACITY` = 65,536 |
 | `forwarded_dirty_capacity`              | 64                           | `STORAGE_FORWARDED_DIRTY_CAPACITY` = 524,288 |
-| `peer_capacity`                         | 16                           | `STORAGE_PEER_CAPACITY` = 256          |
+| `peer_capacity`                         | 16                           | `STORAGE_PEER_CAPACITY` = 256 (no effect) |
+
+`peer_capacity` sized the per-peer frontier table that gossip no longer keeps; it has no effect and stays only because the frozen `gossip-bench` study harness still sets it.
 
 `gabion::defaults` is the canonical home for the production tunables; both adapters (`gabion-server`, `gabion-nginx`) read them. Each is exposed as an operator-visible config key — touching any of them is an operator decision, not a library-level one.
 
@@ -1037,7 +1033,7 @@ The origin and incarnation columns of the batch are ignored on the local path be
 
 ### 6.2 Write: `merge_remote`
 
-`merge_remote(obs, sink)` is symmetric with `ingest_local` apart from three differences. The origin and incarnation come from the batch — that is, from the peer that attributed the hit. `obs.counts[i]` is an *absolute* observed count rather than a delta, so the store max-merges by keeping `max(stored, observed)`. And `translate_identity` interns both the rule fingerprint and the `(node_id, incarnation)` pair into dictionary slots, admitting unknown rules with a default descriptor. The call is then `upsert(UpsertSpec { …, mode: MaxMerge { observed } }, sink)`.
+`merge_remote(from, obs, sink)` is symmetric with `ingest_local` apart from three differences. The origin and incarnation come from the batch — that is, from the peer that attributed the hit. `obs.counts[i]` is an *absolute* observed count rather than a delta, so the store max-merges by keeping `max(stored, observed)`. And `translate_identity` interns both the rule fingerprint and the `(node_id, incarnation)` pair into dictionary slots, admitting unknown rules with a default descriptor. The call is then `upsert(UpsertSpec { …, via, mode: MaxMerge { observed } }, sink)`, where `via` is the sender `from`'s node slot (§7.4).
 
 ### 6.3 The shared `upsert` core
 
@@ -1146,7 +1142,7 @@ The `local_dirty` lane is what gets gossiped first, since it carries changes thi
 
 `next_sequence_by_origin` is sized to `node_dictionary_capacity`. Each origin gets its own monotonic counter, and `next_origin_sequence` saturating-adds one before returning, so the first sequence ever minted is 1; a `0` read back from a never-allocated origin slot means "nothing here yet."
 
-The sequence has two jobs. It disambiguates ring entries for the same cell, since only the latest entry survives validation, and it supplies ordering metadata for `PeerFrontierTable` so that peers can advance their per-origin acknowledgement cursors. When a node slot is freed by refcount, the counter for that slot is reset.
+The sequence has two jobs. It disambiguates ring entries for the same cell, since only the latest entry survives validation, and it travels on the wire as ordering metadata. When a node slot is freed by refcount, the counter for that slot is reset.
 
 #### The `local_node_slot` pin
 
@@ -1167,7 +1163,7 @@ All read primitives are lock-free.
 | `count_of(handle) -> Option<C>` | Hot fast path: touches only the `counts` column. |
 | `active_handles()` | Diagnostic helper that walks `0..capacity` and yields handles only for slots with odd generation. Scans the full capacity, not just `active_len`; not for hot paths. |
 
-There is no atomic "snapshot the whole store" operation. The structure is single-threaded, so a snapshot is logically the iterator `active_handles().map(|h| store.get(h).unwrap())`; higher layers persist via the `DeltaSink`/`ExpirationSink` streams and the `peer_frontier` checkpoints.
+There is no atomic "snapshot the whole store" operation. The structure is single-threaded, so a snapshot is logically the iterator `active_handles().map(|h| store.get(h).unwrap())`; higher layers persist via the `DeltaSink`/`ExpirationSink` streams.
 
 ---
 
@@ -1242,169 +1238,13 @@ sequenceDiagram
 
 The `selection_epoch` is a `u32` that wraps. On wrap to zero, `bump_selection_epoch` does a one-shot scrub of `selection_marks` and resets the epoch to 1 so the new epoch is unambiguous. Since `u32` epochs cover billions of frames, the wraparound branch exists as cheap insurance rather than a real hot path.
 
-### 7.4 `peer_frontier` — per-peer × per-origin cursors
+### 7.4 bp-skip — the `vias` column
 
-File: `crates/gabion/src/crdt/peer_frontier.rs`.
+Gossip never sends a cell to its origin or back to the peer its current value came from: both already hold it. `CellStore` records the second of those per cell in the `vias` column, the node slot of the sender whose frame last raised the cell (the local slot for a local hit). `merge_remote(from, obs, sink)` takes the sender's identity from the frame header, and `known_to(handle, node)` answers the skip test the runtime applies to each pick's frame: `origins[i] == node || vias[i] == node`.
 
-`PeerFrontierTable` is a small bookkeeping table that lets the outbound gossip layer skip cells a given peer has already acknowledged. It is a latency optimisation rather than a convergence mechanism, as the module's own docstring makes explicit:
+`via` holds a node dictionary reference exactly like `origin`: the insert path takes one, a raise from a different sender moves it, and `free_cell_at` releases it. `merge_remote` only *finds* the sender's slot and never interns it, so remembering senders cannot take dictionary capacity an origin needs. Every active peer originates cells of its own and is therefore already interned; a sender that is not leaves the local slot as `via`, which matches no peer, and its cells are simply never skipped.
 
-> Latency optimization only — convergence is guaranteed by the repair
-> lane, not by this table.
-
-It is not indexed per `(rule, key, bucket)` and it is not consulted from the CRDT's write path. If gossip is dropped or reordered, the repair cursor in `CellStore` eventually rotates over every active cell and reconciles; the frontier just lets the happy path avoid resending what each peer already has.
-
-#### What it tracks
-
-For every `(peer, origin-node)` pair this process tracks, the table remembers two monotonic cursors: `last_sent_seq` is the highest origin-sequence number we have transmitted to that peer for cells owned by that origin, and `last_acked_seq` is the highest origin-sequence number the peer has acknowledged receiving. Together these answer one question: *which of my active cells does peer X still need to hear about from origin O?*
-
-#### Layout
-
-```rust
-pub struct PeerFrontierTable {
-    peer_ids:        Box<[Option<NodeId>]>, // length = peer_capacity
-    last_acked_seq:  Box<[u64]>,            // length = peer_capacity * node_capacity
-    last_sent_seq:   Box<[u64]>,            // length = peer_capacity * node_capacity
-    peer_capacity:   u16,
-    node_capacity:   u16,
-    full_rejects:    u64,
-}
-```
-
-`last_acked_seq` and `last_sent_seq` are conceptually a `peer_capacity × node_capacity` matrix flattened in **peer-major** order: one row per peer, with all that peer's per-origin cursors contiguous in memory.
-
-```mermaid
-flowchart TB
-  subgraph last_acked["last_acked_seq (peer_capacity × node_capacity, flattened peer-major)"]
-    direction TB
-    P0["peer 0:  [n=0]  [n=1]  [n=2]  …  [n=node_capacity-1]"]
-    P1["peer 1:  [n=0]  [n=1]  [n=2]  …  [n=node_capacity-1]"]
-    P2["peer 2:  [n=0]  [n=1]  [n=2]  …  [n=node_capacity-1]"]
-    DOTS["…"]
-    P0 --> P1 --> P2 --> DOTS
-  end
-  IDX["flat_index = peer_slot * node_capacity + node_slot"] --> P1
-```
-
-Two of the three hot operations — `remove_peer`, which clears one peer's row, and `lacks_indices`, which scans one peer's row against the origin column — touch one peer at a time, so peer-major matches the access pattern.
-
-`peer_ids` is a tiny linear-probe interning table of `Option<NodeId>` slots scanned via `position`. `intern_peer` is meant to be a once-per-peer-handshake operation, not a per-message one.
-
-`full_rejects` counts the times `intern_peer` had to refuse because every peer slot was occupied. The same field drives a power-of-two rate-limited `tracing::warn!` that names `storage.peer_capacity` as the config key an operator should raise. Convergence still holds when this happens, because gossip to the unregistered peer simply pays the cost of not having the per-peer frontier and falls back on full-frame compose plus repair.
-
-#### Primitives
-
-| Operation | Purpose |
-|---|---|
-| `intern_peer(peer)` / `find_peer(peer)` / `remove_peer(peer)` | Manage peer slot allocation. `intern_peer` scans for an existing entry first, then claims a free slot. Table full returns `None` and bumps `full_rejects`. |
-| `last_sent(peer, origin)` / `last_acked(peer, origin)` | Plain indexed `u64` reads. Zero means "no information." |
-| `record_sent(peer, origin, seq)` / `record_acked(peer, origin, seq)` | "Raise the high-water mark" operations — guarded by `<`, so stale or duplicate calls are no-ops. |
-| `clear_node_slot(node_slot)` | Wipes one origin column when its slot is recycled by the cell store. |
-| `lacks_indices(peer, active_origins, origin_sequences, active_indices, out)` | Brute-force "which cells does this peer lack" scan — used in tests and digest-mismatch repair. The hot per-frame consumer is `peer_lacks`, inlined into `fill_gossip_frame_for_peer` (§7.5). |
-
-**Idempotence.** The `<` guards on `record_*` make every update a max-merge, so a late or duplicate `record_*` carrying a stale sequence is silently ignored. If two callers race, both succeed and the one carrying the smaller sequence is a no-op; if an ack arrives twice, the second call is a no-op.
-
-#### Why per-`(peer, origin)`, and not a single cursor?
-
-Imagine origin **O** emits sequences `1, 2, 3`. Peer **A** received `1` and `2`, while peer **B** received `1` and `3` because frame `2` was dropped on the wire to B. With a single global "highest sequence sent to anyone" cursor, the next gossip round cannot distinguish whose frontier is lagging, so it either re-broadcasts everything (wasteful) or under-delivers (incorrect). Per-`(peer, origin)` state captures exactly which peer is behind on which origin's stream.
-
-#### Reordered acks: the canonical scenario
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Tx as gossip transport
-    participant F as PeerFrontierTable
-    Note over F: last_acked[A,O] = 0, last_acked[B,O] = 0
-
-    Tx->>F: record_acked(A, O, 1)
-    Note over F: 0 < 1 → last_acked[A,O] = 1
-
-    Tx->>F: record_acked(A, O, 2)
-    Note over F: 1 < 2 → last_acked[A,O] = 2
-
-    Tx->>F: record_acked(B, O, 1)
-    Note over F: 0 < 1 → last_acked[B,O] = 1
-
-    Tx->>F: record_acked(A, O, 1)   (delayed duplicate)
-    Note over F: 2 < 1 is false → NO-OP
-
-    Note over F: state: last_acked[A,O] = 2, last_acked[B,O] = 1
-
-    Note over F: a later fill_gossip_frame_for_peer(B) will see B lacks 2 and 3
-```
-
-The duplicate `record_acked(A, O, 1)` is silently dropped because A's
-frontier is already at 2; without that guard we would rewind A's
-cursor and uselessly retransmit sequence 2 to A. B's frontier sits
-at 1 independently of A's, and a subsequent peer-aware frame compose
-for B correctly identifies that B is missing sequences 2 and 3 — a
-distinction that a single-cursor design would have lost.
-
-#### `lacks_indices` — the test / digest-repair helper
-
-`lacks_indices(peer, active_origins, origin_sequences, active_indices, out)` walks a caller-supplied list of `active_indices`, joins each index against the peer's row, and writes back the indices the peer hasn't acked yet:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Repair as Repair driver (tests / digest mismatch)
-    participant Front as PeerFrontierTable
-    participant Cells as CellStore arrays
-
-    Repair->>Cells: borrow active_indices, active_origins, origin_sequences
-    Repair->>Front: lacks_indices(peer_slot, ..., out=&mut Vec)
-    loop for each idx in active_indices
-        Front->>Front: origin := active_origins[idx]
-        Front->>Front: last := last_acked_seq[flat_index(peer_slot, origin)]
-        alt origin_sequences[idx] > last
-            Front-->>Repair: push idx into out
-        else
-            Front-->>Repair: skip (peer already has this)
-        end
-    end
-    Repair->>Repair: gossip cells named by out to this peer
-```
-
-This is the brute-force form: it builds the whole "needs to be sent" list up front and is the right tool when something has gone wrong, such as a digest mismatch or a manual repair test. The production hot path does not buy that list; it makes the same decision one cell at a time inside the frame composer (§7.5).
-
-#### Interaction with the cell store
-
-The only call to a `peer_frontier` mutator from inside `crdt.rs` is `clear_node_slot`, invoked from `free_cell_at` when the node dictionary frees a `NodeSlot` because the last cell owned by that origin was evicted. Two things must reset together: the origin-sequence allocator, so the next user of the slot starts at sequence 1 again, and every peer's frontier into this slot, so old acks from a long-departed origin do not silently suppress retransmission of the new origin's cells. Every other call to `record_sent`, `record_acked`, or `intern_peer` is driven from the gossip transport layer outside this module.
-
-#### Frontier invariants
-
-1. **Monotonic non-decreasing per cell.** For any fixed `(peer_slot, node_slot)`, both `last_sent_seq` and `last_acked_seq` only ever stay the same or increase. Enforced by the `<` guards.
-2. **Idempotent updates.** Repeated `record_sent` / `record_acked` with the same arguments leave state unchanged.
-3. **Order-independence.** Applying any permutation of `record_*` calls produces the same final state.
-4. **Zero is "no information."** A freshly-constructed table, a freshly-cleared row (via `remove_peer`), and a freshly-cleared column (via `clear_node_slot`) all read as 0 on every cell.
-5. **No allocation after construction.** All three arrays are `Box<[T]>` of fixed length set in `new`.
-6. **No stale state across slot reuse.** When the parent `CellStore` recycles a `NodeSlot`, it calls `clear_node_slot` before the slot can be re-handed-out to a new `(NodeId, Incarnation)`.
-7. **Convergence is someone else's job.** Lose every byte of this table and the CRDT still converges — the repair cursor takes over.
-
-### 7.5 `fill_gossip_frame_for_peer` and `peer_lacks`
-
-The peer-aware sibling of `fill_gossip_frame` is `fill_gossip_frame_for_peer(max_cells, peer_slot, out)`. It walks the same three lanes in the same order, with the same `selection_marks` dedup. The two **dirty** lanes add one filter per cell — skip it if the peer already has it — but the **repair** lane (lane 3) does *not*: it sweeps the rotating active-set slice unconditionally. That asymmetry is load-bearing for correctness, not just bandwidth (see below).
-
-That filter is a tiny inlined helper:
-
-```rust
-#[inline]
-fn peer_lacks(&self, peer_slot: u16, cell_index: usize) -> bool {
-    let origin = self.origins[cell_index];
-    let last   = self.peer_frontiers.last_acked(peer_slot, origin);
-    self.origin_sequences[cell_index] > last
-}
-```
-
-`peer_lacks` is the hot per-frame consumer of the frontier table. Per candidate cell, it reads two contiguous slices — `origins[cell_index]` and `origin_sequences[cell_index]` — and one `u64` out of the peer-major `last_acked_seq` array, with no allocation and no branch other than the comparison itself.
-
-`fill_gossip_frame_for_peer` chains its checks per candidate cell in the order they fail fastest. The dirty lanes run `dirty_entry_current`, then `peer_lacks(peer_slot, cell_index)` to skip cells the peer is already current on, then `mark_selected(slot)` to deduplicate across lanes within this frame; otherwise the handle is pushed. The repair lane runs only `is_active` and `mark_selected` — it deliberately omits `peer_lacks`.
-
-The gossip runtime calls `fill_gossip_frame_for_peer` once per peer-target per tick, so the per-tick UDP fanout is peer-shaped: the dirty lanes hand each peer the fresh cells it has not yet acknowledged, capped at the frame budget, while the repair lane rotates the rest of the active set past it over successive ticks. Two peers receiving from the same compositor therefore see overlapping but not identical content.
-
-The repair lane omits `peer_lacks` for **correctness**, not bandwidth. `last_acked` is a per-`(peer, origin)` high-watermark, and `merge_remote` re-stamps a remote cell with the *merging* node's local origin counter rather than carrying the origin's sequence on the wire — so a replica's stored `origin_sequence` and a peer's `last_acked` live in different per-node sequence spaces, and a single watermark cannot represent a gap (a peer holding sequence 5 but not 4). If every lane pruned on it, a cell the watermark wrongly believes the peer holds would be suppressed on *every* holder forever and the cluster would never converge. Gating only the dirty lanes keeps `peer_lacks` as the latency optimization it is; the repair lane's unconditional sweep — re-merged idempotently via the max-merge in `merge_remote` — is the convergence guarantee the `PeerFrontierTable` doc comment delegates to it. (This was a real bug: a rare partition-heal counterexample stranded one cell on one node forever until the repair lane was ungated.)
-
-When a peer has not been interned because the table was full, the runtime falls back to plain `fill_gossip_frame`; the wasted bandwidth shows up as redundant retransmission, and the `full_rejects` log line points the operator at the relevant config key.
+The skip is exact rather than a hint. It replaces a per-peer × per-origin frontier of acknowledged sequence numbers, which compared counters that each node allocates independently (`merge_remote` re-stamps every raise with the merging node's own `next_origin_sequence`), so in an aged fleet it pruned cells peers had never received.
 
 ---
 
@@ -1545,15 +1385,11 @@ The whole structure relies on the following properties. They are grouped by subm
 5. `applies_locally` is canonical 0/1.
 6. `DeltaSink::keys` and `ExpirationSink::keys` carry `CellIdentity` — the portable identity that omits the node-local slot.
 
-### Peer frontier
+### bp-skip
 
-1. Monotonic non-decreasing per cell.
-2. Idempotent updates.
-3. Order-independence.
-4. Zero is "no information."
-5. No allocation after construction.
-6. No stale state across slot reuse.
-7. Convergence is someone else's job (the repair cursor).
+1. Every active cell's `via` is a live node slot it holds one reference to.
+2. `known_to(h, n)` is true only for the cell's origin and its `via`.
+3. `merge_remote` never interns a sender.
 
 ---
 
@@ -1570,7 +1406,6 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `hash_compact_cell_key`, `hash_fingerprint`, `hash_node_identity`, `mix64` | `hash` | SplitMix / MurmurHash-style mixers. |
 | `CellIndex` | `index` | Robin Hood open-addressing hash table, backshift deletion, power-of-two capacity. |
 | `Observation`, `ObservationBatch`, `DeltaSink`, `ExpirationSink` | `io` | SoA input row + input/output buffers. |
-| `PeerFrontierTable` | `peer_frontier` | Per-peer × per-origin send/ack cursors — latency hint only; convergence is the repair lane's job. |
 
 #### Public entry points on `CellStore`, at a glance
 
@@ -1583,7 +1418,8 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `resolve(handle)`, `get(handle)`, `count_of(handle)` | Handle-based reads. |
 | `active_handles()` | Diagnostic full-scan iterator. |
 | `ingest_local(obs, sink)` | Apply locally observed hits (saturating add). |
-| `merge_remote(obs, sink)` | Merge peer observations (max-merge). |
+| `merge_remote(from, obs, sink)` | Merge observations from peer `from` (max-merge); a raised cell remembers `from` as its `via`. |
+| `known_to(handle, node)` | bp-skip test: is `node` the cell's origin or its `via`? |
 | `expire(current_epoch_by_rule, live_buckets, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell. |
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
 | `clear_dirty()` | Drop the dirty rings; stored cells untouched. |
@@ -1591,8 +1427,6 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `visit_local_dirty`, `visit_forwarded_dirty` | Stream dirty lanes (no dedup). |
 | `visit_repair_slice(max, visit)` | Rotate a slice of active cells. |
 | `fill_gossip_frame(max, out)` | Compose a frame: local dirty + forwarded dirty + repair slice, deduped. |
-| `fill_gossip_frame_for_peer(max, peer_slot, out)` | Peer-aware variant; the two dirty lanes add a `peer_lacks` filter, the repair lane sweeps unconditionally (convergence backstop). |
-| `peer_frontiers()`, `peer_frontiers_mut()` | Per-peer send/ack frontier access. |
 | `repair_cursor()` | Read the current cursor position. |
 
 ---
@@ -1615,7 +1449,6 @@ CRDT-internal terms first; a couple of cluster-wide terms repeated here for self
 - **Dictionary / interning.** Giving every distinct value a single canonical home in a fixed-size array, handing out a small integer slot in exchange.
 - **Dirty ring.** Bounded ring of "this cell just changed" entries.
 - **Fingerprint.** A canonical 128-bit hash of a rule's shape and parameters. Same on every node by construction; produced by `gabion::rules::Descriptor`.
-- **Frontier / high-water mark.** Watermark up to which something is known true; max-merged over time.
 - **G-counter.** Grow-only counter — a CRDT where each replica only ever increases its own component, and merge is element-wise max.
 - **Generation.** A `u32` per slot; low bit is the active flag, high 31 bits are the ABA tag.
 - **Handle.** `(index, generation)` pair that points at a cell and detects recycling.

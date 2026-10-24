@@ -8,6 +8,9 @@ pub const STORAGE_RULE_DICTIONARY_CAPACITY: u16 = 64;
 pub const STORAGE_NODE_DICTIONARY_CAPACITY: u16 = 1024;
 pub const STORAGE_LOCAL_DIRTY_CAPACITY: usize = 65_536;
 pub const STORAGE_FORWARDED_DIRTY_CAPACITY: usize = 524_288;
+/// Has no effect: it sized the per-peer gossip frontier, which no longer
+/// exists. Kept, like `CellStoreConfig::peer_capacity`, because the frozen
+/// `gossip-bench` study harness and existing operator configs still name it.
 pub const STORAGE_PEER_CAPACITY: u16 = 256;
 
 pub const STORAGE_MAX_DESCRIPTOR_COUNT: usize = 16;
@@ -46,8 +49,8 @@ pub const GOSSIP_FANOUT: usize = 3;
 /// **These are single-round figures, and the single round is the wrong unit
 /// for gabion.** KMG's theorem bounds one *one-shot* dissemination; gabion
 /// instead runs continuous anti-entropy — it re-gossips every dirty cell each
-/// tick until the peer frontier shows it acked, with the repair lane behind
-/// that. So a node missed in one round is overwhelmingly likely to be reached
+/// tick while it stays in its dirty ring, with the repair lane behind that. So
+/// a node missed in one round is overwhelmingly likely to be reached
 /// by the next, and the per-round coverage *compounds*: at `c = 3` the 4.9 %
 /// per-round miss falls to ≈ 0.24 % after two rounds and ≈ 0.012 % after three.
 /// We therefore size to the leaner `c = 3` threshold and let anti-entropy close

@@ -107,7 +107,7 @@ fn seed_store<C: Count>(
             last_update_millis: r.last_update_millis,
         });
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(NodeIdentity::new(NodeId(0xFEED), 1), &obs, &mut sink);
 
     let mut handles = Vec::with_capacity(store.active_len() as usize);
     for h in store.active_handles() {
@@ -355,7 +355,7 @@ fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
             last_update_millis: 1_000 + i as u64,
         });
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(NodeIdentity::new(NodeId(0xFEED), 1), &obs, &mut sink);
     let handles: Vec<CellHandle> = store.active_handles().collect();
     (store, handles)
 }

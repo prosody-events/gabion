@@ -8,6 +8,12 @@ fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
 }
 
+/// The peer remote observations arrive from in tests that don't care which
+/// peer sent them.
+fn peer() -> NodeIdentity {
+    NodeIdentity::new(NodeId(0xFEED), 1)
+}
+
 fn rule_descriptor(fingerprint: u128, local_id: u32) -> RuleDescriptor {
     RuleDescriptor {
         fingerprint,
@@ -81,7 +87,7 @@ fn remote_merge_one(
     let mut obs = ObservationBatch::with_capacity(1);
     let mut sink = DeltaSink::with_capacity(1);
     obs.push(observation(rule_fp, 0xabc, 0, origin, inc, count, ts));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(peer(), &obs, &mut sink);
     // A no-op merge (count <= stored) leaves the sink empty; recover the
     // handle via key lookup instead.
     if let Some(handle) = sink.handles.first().copied() {
@@ -242,7 +248,7 @@ fn apply_remote_rows(store: &mut CellStore<u32>, rows: &[RemoteRow]) -> DeltaSin
     for row in rows {
         let mut obs = ObservationBatch::with_capacity(1);
         obs.push(remote_observation(row));
-        store.merge_remote(&obs, &mut sink);
+        store.merge_remote(peer(), &obs, &mut sink);
     }
     sink
 }
@@ -351,6 +357,7 @@ fn assert_structural_invariants(store: &CellStore<u32>) -> bool {
         }
         *rules.entry(row.key.rule).or_default() += 1;
         *nodes.entry(row.key.origin).or_default() += 1;
+        *nodes.entry(store.vias[handle.index as usize]).or_default() += 1;
     }
 
     *nodes.entry(store.local_node_slot()).or_default() += 1;
@@ -445,7 +452,7 @@ fn quickcheck_delta_sink_rows_are_exact_remote_raises(rows: RemoteRows) -> bool 
         let mut obs = ObservationBatch::with_capacity(1);
         obs.push(remote_observation(row));
         let before = sink.len();
-        store.merge_remote(&obs, &mut sink);
+        store.merge_remote(peer(), &obs, &mut sink);
         if row.count > previous || !model.contains_key(&key) {
             let after = sink.len();
             if after != before + 1 {
@@ -559,49 +566,6 @@ fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
     TestResult::from_bool(seen == expected)
 }
 
-#[quickcheck]
-fn quickcheck_repair_lane_sweeps_active_despite_acked_frontier(
-    rows: RemoteRows,
-    ack_seed: u8,
-) -> bool {
-    let mut store = quickcheck_store();
-    apply_remote_rows(&mut store, &rows.0);
-    // Drop the dirty rings so the frame is composed purely by the repair lane.
-    store.clear_dirty();
-    let peer_slot = store
-        .peer_frontiers_mut()
-        .intern_peer(NodeId(0x999))
-        .unwrap();
-
-    let active: Vec<CellRow<u32>> = store
-        .active_handles()
-        .map(|h| store.get(h).unwrap())
-        .collect();
-    // Ack roughly half the origins through their current sequence.
-    for row in &active {
-        if ((row.key.origin as u8).wrapping_add(ack_seed) & 1) == 0 {
-            store
-                .peer_frontiers_mut()
-                .record_acked(peer_slot, row.key.origin, row.origin_sequence);
-        }
-    }
-
-    // The repair lane is the convergence backstop: it ignores the frontier, so
-    // a full-capacity sweep re-sends *every* active cell, acked or not. Pruning
-    // it by `last_acked` is exactly what stranded a cell forever in the
-    // partition-heal flake.
-    let expected: BTreeSet<u32> = active.iter().map(|row| row.handle.index).collect();
-
-    let mut out = Vec::with_capacity(store.capacity() as usize);
-    store.fill_gossip_frame_for_peer(store.capacity() as usize, peer_slot, &mut out);
-    let got: BTreeSet<u32> = out.iter().map(|h| h.index).collect();
-
-    got == expected
-        && out.len() == got.len()
-        && out.iter().all(|h| store.get(*h).is_some())
-        && assert_structural_invariants(&store)
-}
-
 #[test]
 fn merge_remote_is_monotonic() {
     let mut store = store_u32();
@@ -610,7 +574,7 @@ fn merge_remote_is_monotonic() {
 
     let mut obs = ObservationBatch::with_capacity(1);
     obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 100));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(peer(), &obs, &mut sink);
     assert_eq!(sink.len(), 1);
     let handle = sink.handles[0];
     assert_eq!(sink.previous[0], 0);
@@ -620,14 +584,14 @@ fn merge_remote_is_monotonic() {
     sink.clear();
     let mut obs2 = ObservationBatch::with_capacity(1);
     obs2.push(observation(0x11, 0xabc, 0, 7, 1, 3, 200));
-    store.merge_remote(&obs2, &mut sink);
+    store.merge_remote(peer(), &obs2, &mut sink);
     assert_eq!(sink.len(), 0);
 
     // Higher (8 > 5) — delta of 3.
     sink.clear();
     let mut obs3 = ObservationBatch::with_capacity(1);
     obs3.push(observation(0x11, 0xabc, 0, 7, 1, 8, 300));
-    store.merge_remote(&obs3, &mut sink);
+    store.merge_remote(peer(), &obs3, &mut sink);
     assert_eq!(sink.len(), 1);
     assert_eq!(sink.previous[0], 5);
     assert_eq!(sink.current[0], 8);
@@ -690,11 +654,11 @@ fn capacity_is_enforced_without_growing() {
     let mut sink = DeltaSink::with_capacity(2);
     let mut a = ObservationBatch::with_capacity(1);
     a.push(observation(0x11, 0xabc, 0, 1, 1, 1, 0));
-    store.merge_remote(&a, &mut sink);
+    store.merge_remote(peer(), &a, &mut sink);
     let mut b = ObservationBatch::with_capacity(1);
     b.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
     sink.clear();
-    store.merge_remote(&b, &mut sink);
+    store.merge_remote(peer(), &b, &mut sink);
     assert_eq!(sink.len(), 0); // second insert was rejected
     assert_eq!(store.active_len(), 1);
     assert_eq!(store.stats().cell_store_full_rejects, 1);
@@ -861,7 +825,7 @@ fn delta_sink_records_exact_raises() {
     let mut obs = ObservationBatch::with_capacity(2);
     obs.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
     obs.push(observation(0x11, 0xabc, 0, 2, 1, 7, 0));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(peer(), &obs, &mut sink);
     assert_eq!(sink.len(), 2);
 
     sink.clear();
@@ -869,7 +833,7 @@ fn delta_sink_records_exact_raises() {
     let mut obs2 = ObservationBatch::with_capacity(2);
     obs2.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
     obs2.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
-    store.merge_remote(&obs2, &mut sink);
+    store.merge_remote(peer(), &obs2, &mut sink);
     assert_eq!(sink.len(), 0);
 }
 
@@ -882,7 +846,7 @@ fn delta_applies_locally_reflects_rule_dictionary() {
     let mut obs = ObservationBatch::with_capacity(2);
     obs.push(observation(0x11, 0xabc, 0, 9, 1, 1, 0));
     obs.push(observation(0x22, 0xabc, 0, 9, 1, 1, 0));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(peer(), &obs, &mut sink);
     assert_eq!(sink.len(), 2);
     assert_eq!(sink.applies_locally[0], 1);
     assert_eq!(sink.applies_locally[1], 0);
@@ -903,7 +867,7 @@ fn unknown_rule_cells_round_trip() {
     let mut sink = DeltaSink::with_capacity(1);
     let mut obs = ObservationBatch::with_capacity(1);
     obs.push(observation(0x33, 0xabc, 0, 5, 1, 30, 2));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(peer(), &obs, &mut sink);
     assert_eq!(sink.applies_locally[0], 0);
 
     // Expire: bucket 0, live = 0, current = 5 -> expired.
@@ -973,6 +937,79 @@ fn dictionary_refcount_frees_unreferenced_slots() {
     // re-interning the 60 s `RuleDescriptor::default()` fallback.
     assert_eq!(store.rule_dictionary().refcount(rule_slot), 1);
     assert!(store.rule_dictionary().descriptor(rule_slot).is_some());
+}
+
+/// bp-skip: a merged cell is known to its origin and to the peer its value
+/// came from, and to no one else. A sender is remembered only while it is
+/// already in the node dictionary, and only while a cell's value came from
+/// it does that cell reference it.
+#[test]
+fn merged_cells_are_known_to_origin_and_sender_only() {
+    let mut store = small_store(8, 8);
+    store.intern_rule(rule_descriptor(0xBB, 1)).unwrap();
+    let sender = NodeIdentity::new(NodeId(0x50), 1);
+    let other = NodeIdentity::new(NodeId(0x60), 1);
+    let stranger = NodeIdentity::new(NodeId(0x70), 1);
+    let mut sink = DeltaSink::with_capacity(1);
+    // `sender` and `other` originate cells of their own, so the dictionary
+    // knows them; `stranger` does not.
+    let mut own = ObservationBatch::with_capacity(2);
+    own.push(observation(0xBB, 0x1, 0, 0x50, 1, 1_u32, 0));
+    own.push(observation(0xBB, 0x2, 0, 0x60, 1, 1_u32, 0));
+    store.merge_remote(stranger, &own, &mut sink);
+    let from = store.find_node(sender.node_id, sender.incarnation).unwrap();
+    let to = store.find_node(other.node_id, other.incarnation).unwrap();
+    assert!(!store.known_to(sink.handles[0], to));
+    assert!(
+        store
+            .find_node(stranger.node_id, stranger.incarnation)
+            .is_none()
+    );
+
+    let mut obs = ObservationBatch::with_capacity(1);
+    obs.push(observation(0xBB, 0xabc, 0, 100, 1, 3_u32, 0));
+    sink.clear();
+    store.merge_remote(sender, &obs, &mut sink);
+    let h = sink.handles[0];
+    let origin = store.find_node(NodeId(100), 1).unwrap();
+    assert!(store.known_to(h, origin));
+    assert!(store.known_to(h, from));
+    assert!(!store.known_to(h, to));
+    assert!(!store.known_to(h, store.local_node_slot()));
+    assert_eq!(store.node_dictionary().refcount(from), 2);
+
+    // A no-op merge from another peer leaves the cell's source alone.
+    sink.clear();
+    store.merge_remote(other, &obs, &mut sink);
+    assert!(sink.is_empty());
+    assert!(store.known_to(h, from));
+
+    // A raise moves the source and its reference.
+    obs.clear();
+    obs.push(observation(0xBB, 0xabc, 0, 100, 1, 4_u32, 1));
+    sink.clear();
+    store.merge_remote(other, &obs, &mut sink);
+    assert!(store.known_to(h, to));
+    assert!(!store.known_to(h, from));
+    assert_eq!(store.node_dictionary().refcount(from), 1);
+    assert_eq!(store.node_dictionary().refcount(to), 2);
+
+    // A local hit's only holder is this node.
+    let local = local_increment_one(&mut store, 0xBB, 0xdef, 0, 1, 2);
+    assert!(store.known_to(local, store.local_node_slot()));
+    assert!(!store.known_to(local, to));
+
+    // Expiry releases every reference the cells held.
+    let rule_slot = store.find_rule(0xBB).unwrap();
+    let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
+    let live = vec![0_u32; cur.len()];
+    cur[rule_slot as usize] = 5;
+    let mut exp = ExpirationSink::<u32>::with_capacity(4);
+    store.expire(&cur, &live, &mut exp);
+    assert_eq!(store.active_len(), 0);
+    for node in [from, to, origin] {
+        assert!(store.node_dictionary().descriptor(node).is_none());
+    }
 }
 
 /// A configured rule (applies_locally = true) must keep its descriptor across a
@@ -1094,7 +1131,7 @@ fn dictionary_full_rejects_with_counter() {
     let mut sink = DeltaSink::with_capacity(1);
     let mut obs = ObservationBatch::with_capacity(1);
     obs.push(observation(0x20, 0xabc, 0, 3, 1, 1, 0));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(peer(), &obs, &mut sink);
     assert_eq!(sink.len(), 0);
     assert!(store.stats().rule_dictionary_full_rejects >= 1);
 }
@@ -1187,107 +1224,6 @@ fn repair_cursor_skips_freed_slots() {
 }
 
 #[test]
-fn peer_frontier_lacks_matches_scan() {
-    let mut store = small_store(8, 16);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
-    let h1 = remote_merge_one(&mut store, 0x11, 1, 1, 1, 0);
-    let _h2 = remote_merge_one(&mut store, 0x11, 2, 1, 1, 0);
-    let row1 = store.get(h1).unwrap();
-    let peer_slot = store.peer_frontiers_mut().intern_peer(NodeId(7)).unwrap();
-    // Mark origin slot of h1 as fully acked.
-    store
-        .peer_frontiers_mut()
-        .record_acked(peer_slot, row1.key.origin, row1.origin_sequence);
-
-    // Build active arrays.
-    let mut active_indices = Vec::new();
-    let mut active_origins = Vec::new();
-    for slot in 0..store.capacity() {
-        if (store.generations[slot as usize] & 1) == 1 {
-            active_indices.push(slot);
-            active_origins.push(store.origins[slot as usize]);
-        }
-    }
-    // origin_sequences for active slots.
-    let origin_sequences: Vec<u64> = (0..store.capacity())
-        .map(|s| store.origin_sequences[s as usize])
-        .collect();
-    let active_origins_full: Vec<NodeSlot> = (0..store.capacity())
-        .map(|s| store.origins[s as usize])
-        .collect();
-
-    let mut lacks = Vec::new();
-    store.peer_frontiers().lacks_indices(
-        peer_slot,
-        &active_origins_full,
-        &origin_sequences,
-        &active_indices,
-        &mut lacks,
-    );
-    // Brute-force expected: everything but h1 (which is at last_acked).
-    let mut expected: Vec<u32> = active_indices
-        .iter()
-        .copied()
-        .filter(|i| *i != h1.index)
-        .collect();
-    expected.sort();
-    lacks.sort();
-    assert_eq!(lacks, expected);
-}
-
-#[test]
-fn node_slot_reuse_clears_frontier_rows() {
-    let mut store = CellStore::<u32>::new(
-        CellStoreConfig {
-            cell_capacity: 4,
-            rule_dictionary_capacity: 4,
-            node_dictionary_capacity: 4,
-            local_dirty_capacity: 4,
-            forwarded_dirty_capacity: 4,
-            peer_capacity: 2,
-        },
-        local(),
-    );
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
-    let h = remote_merge_one(&mut store, 0x11, 42, 1, 5, 0);
-    let row = store.get(h).unwrap();
-    let original_slot = row.key.origin;
-    let peer_slot = store.peer_frontiers_mut().intern_peer(NodeId(7)).unwrap();
-    store
-        .peer_frontiers_mut()
-        .record_acked(peer_slot, original_slot, 99);
-    store
-        .peer_frontiers_mut()
-        .record_sent(peer_slot, original_slot, 88);
-
-    // Expire the cell — node slot freed (rule was pre-interned, stays).
-    let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
-    let mut live = vec![0_u32; cur.len()];
-    cur[row.key.rule as usize] = 5;
-    live[row.key.rule as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(1);
-    store.expire(&cur, &live, &mut exp);
-
-    // The slot is now free. Frontier rows must be zeroed.
-    assert_eq!(
-        store.peer_frontiers().last_acked(peer_slot, original_slot),
-        0
-    );
-    assert_eq!(
-        store.peer_frontiers().last_sent(peer_slot, original_slot),
-        0
-    );
-
-    // Reassign to a different (node_id, incarnation). Since dict allocates
-    // from freelist head, this should reuse the same slot.
-    let _h2 = remote_merge_one(&mut store, 0x11, 99, 9, 1, 0);
-    let reused_slot = store.node_dictionary().find(NodeId(99), 9).unwrap();
-    assert_eq!(reused_slot, original_slot);
-    // Frontier state must still be zero for the reused slot.
-    assert_eq!(store.peer_frontiers().last_acked(peer_slot, reused_slot), 0);
-}
-
-#[test]
 fn dirty_lanes_separate() {
     let mut store = small_store(4, 8);
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
@@ -1364,7 +1300,7 @@ fn count_widths_compile_and_saturate() {
         count: 1_000_000_000_000,
         last_update_millis: 0,
     });
-    s64.merge_remote(&obs64, &mut sink64);
+    s64.merge_remote(peer(), &obs64, &mut sink64);
     assert_eq!(sink64.current[0], 1_000_000_000_000);
 }
 
@@ -1412,7 +1348,7 @@ fn expire_emits_one_row_per_freed_cell() {
     let mut sink = DeltaSink::with_capacity(2);
     obs.push(observation(0x22, 0xabc, 0, 5, 1, 7, 100));
     obs.push(observation(0x22, 0xdef, 0, 6, 1, 11, 200));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(peer(), &obs, &mut sink);
 
     let rule_local_slot = store.find_rule(0x11).unwrap();
     let rule_doomed_slot = store.find_rule(0x22).unwrap();
@@ -1561,7 +1497,7 @@ fn expire_at_and_expire_agree_for_same_now() {
         let mut sink = DeltaSink::with_capacity(2);
         obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
         obs.push(observation(0x11, 0xdef, 5, 8, 1, 5, 250));
-        s.merge_remote(&obs, &mut sink);
+        s.merge_remote(peer(), &obs, &mut sink);
         s
     };
 
@@ -1633,7 +1569,7 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
     let mut obs = ObservationBatch::with_capacity(1);
     let mut deltas = DeltaSink::with_capacity(1);
     obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
-    store.merge_remote(&obs, &mut deltas);
+    store.merge_remote(peer(), &obs, &mut deltas);
 
     let mut expirations = ExpirationSink::<u32>::with_capacity(1);
     store.expire_at(150, &mut expirations);
@@ -1643,54 +1579,6 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
     // buckets and expire this cell.
     assert_eq!(expirations.len(), 0);
     assert_eq!(store.active_len(), 1);
-}
-
-#[test]
-fn fill_gossip_frame_for_peer_prunes_dirty_but_repairs_acked() {
-    let mut store = small_store(8, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
-
-    // Seed three cells (three distinct origins).
-    let h1 = remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
-    let h2 = remote_merge_one(&mut store, 0x11, 2, 1, 5, 0);
-    let h3 = remote_merge_one(&mut store, 0x11, 3, 1, 5, 0);
-
-    let row1 = store.get(h1).unwrap();
-    let row2 = store.get(h2).unwrap();
-
-    // Intern a peer and ack the first two origins through their current
-    // sequences. The third remains unacked.
-    let peer_slot = store.peer_frontiers_mut().intern_peer(NodeId(99)).unwrap();
-    store
-        .peer_frontiers_mut()
-        .record_acked(peer_slot, row1.key.origin, row1.origin_sequence);
-    store
-        .peer_frontiers_mut()
-        .record_acked(peer_slot, row2.key.origin, row2.origin_sequence);
-
-    // A single-cell budget never reaches the repair lane, so the frame is
-    // composed purely from the dirty lanes — which prune the two acked cells,
-    // leaving only the unacked one. This is the latency optimization.
-    let mut dirty_only = Vec::with_capacity(8);
-    store.fill_gossip_frame_for_peer(1, peer_slot, &mut dirty_only);
-    assert_eq!(dirty_only.len(), 1);
-    assert_eq!(dirty_only[0].index, h3.index);
-
-    // With budget to spare, the repair lane sweeps the whole active set
-    // regardless of the frontier and backfills the acked cells too — the
-    // convergence backstop the frontier doc comment delegates to it. All three
-    // cells ride out. (Pre-fix, the repair lane also pruned by `last_acked`,
-    // so the acked cells were suppressed forever — the partition-heal flake.)
-    let mut full = Vec::with_capacity(8);
-    store.fill_gossip_frame_for_peer(8, peer_slot, &mut full);
-    let mut got: Vec<u32> = full.iter().map(|h| h.index).collect();
-    got.sort_unstable();
-    let mut want = [h1.index, h2.index, h3.index];
-    want.sort_unstable();
-    assert_eq!(
-        got, want,
-        "repair lane must backfill cells the frontier marks acked"
-    );
 }
 
 // --- Coverage extensions (Gaps 1-6) -----------------------------------
@@ -1760,6 +1648,7 @@ fn assert_invariants_with_pinned_rules(
         }
         *rules.entry(row.key.rule).or_default() += 1;
         *nodes.entry(row.key.origin).or_default() += 1;
+        *nodes.entry(store.vias[handle.index as usize]).or_default() += 1;
     }
     for slot in pinned_rule_slots {
         *rules.entry(*slot).or_default() += 1;
@@ -1932,7 +1821,7 @@ fn apply_mixed_op_with_sinks(
         MixedOp::Remote(row) => {
             let mut obs = ObservationBatch::with_capacity(1);
             obs.push(remote_observation(row));
-            store.merge_remote(&obs, sink);
+            store.merge_remote(peer(), &obs, sink);
         }
         MixedOp::Local(row) => {
             let mut obs = ObservationBatch::with_capacity(1);
@@ -2131,7 +2020,7 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
             row.ts as u64,
         ));
         let mut sink = DeltaSink::with_capacity(1);
-        store.merge_remote(&obs, &mut sink);
+        store.merge_remote(peer(), &obs, &mut sink);
 
         if !interned_rules.contains(&fp) {
             if interned_rules.len() >= 2 {
@@ -2250,44 +2139,6 @@ fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
 }
 
 // --- Gap 4: peer-aware frame across all three lanes ----------------------
-
-#[quickcheck]
-fn quickcheck_gossip_frame_for_peer_across_all_lanes(rows: RemoteRows, ack_seed: u8) -> bool {
-    let mut store = quickcheck_store();
-    apply_remote_rows(&mut store, &rows.0);
-    // No `clear_dirty` here — exercise the union across local, forwarded,
-    // and repair lanes simultaneously.
-    let peer_slot = store
-        .peer_frontiers_mut()
-        .intern_peer(NodeId(0x999))
-        .unwrap();
-
-    let active: Vec<CellRow<u32>> = store
-        .active_handles()
-        .map(|h| store.get(h).unwrap())
-        .collect();
-    for row in &active {
-        if ((row.key.origin as u8).wrapping_add(ack_seed) & 1) == 0 {
-            store
-                .peer_frontiers_mut()
-                .record_acked(peer_slot, row.key.origin, row.origin_sequence);
-        }
-    }
-
-    // Dirty lanes prune by the frontier, but the repair lane backfills
-    // unconditionally, so a full-capacity sweep across all three lanes is every
-    // active cell regardless of which origins were acked.
-    let expected: BTreeSet<u32> = active.iter().map(|row| row.handle.index).collect();
-
-    let mut out = Vec::with_capacity(store.capacity() as usize);
-    store.fill_gossip_frame_for_peer(store.capacity() as usize, peer_slot, &mut out);
-    let got: BTreeSet<u32> = out.iter().map(|h| h.index).collect();
-
-    got == expected
-        && out.len() == got.len()
-        && out.iter().all(|h| store.get(*h).is_some())
-        && assert_structural_invariants(&store)
-}
 
 // --- Gap 5: lane priority as ordered prediction --------------------------
 

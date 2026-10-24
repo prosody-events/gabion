@@ -120,6 +120,12 @@ const WARM_KEYS: usize = 8_192;
 const LOCAL_NODE: NodeId = NodeId(0x1111_2222_3333_4444_5555_6666_7777_8888);
 const LOCAL_INCARNATION: Incarnation = 1;
 
+/// The peer every benchmarked remote frame arrives from.
+const SENDER: NodeIdentity = NodeIdentity {
+    node_id: NodeId(0x9999),
+    incarnation: 1,
+};
+
 fn local_identity() -> NodeIdentity {
     NodeIdentity::new(LOCAL_NODE, LOCAL_INCARNATION)
 }
@@ -260,7 +266,7 @@ fn seed_remote(
             0,
         ));
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(SENDER, &obs, &mut sink);
     rows
 }
 
@@ -649,7 +655,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                             0,
                         ));
                     }
-                    store.merge_remote(black_box(obs), black_box(sink));
+                    store.merge_remote(SENDER, black_box(obs), black_box(sink));
                 },
                 BatchSize::SmallInput,
             );
@@ -689,7 +695,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                     ));
                 }
                 counter = counter.wrapping_add(1).max(200);
-                store.merge_remote(black_box(&obs), black_box(&mut sink));
+                store.merge_remote(SENDER, black_box(&obs), black_box(&mut sink));
             });
         });
     }
@@ -719,7 +725,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                     0,
                 ));
             }
-            store.merge_remote(black_box(&obs), black_box(&mut sink));
+            store.merge_remote(SENDER, black_box(&obs), black_box(&mut sink));
         });
     });
 
