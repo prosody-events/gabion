@@ -77,7 +77,7 @@ pub const GOSSIP_REPAIR_MIN_SWEEP_MILLIS: u64 = 2_000;
 /// back like a newly discovered one: sent this node's own live cells, which
 /// it likely missed while cut off. Silence never removes a peer; membership
 /// comes from discovery alone.
-pub const GOSSIP_REWELCOME_SILENCE_MILLIS: u64 = 10_000;
+pub const GOSSIP_REWELCOME_SILENCE_MILLIS: u64 = 5_000;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;
 pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 128;

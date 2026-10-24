@@ -375,11 +375,14 @@ it with its own live cells, straight away and only those, a chunk at a
 time as the send slots free up: each origin
 sends its own share, and the newcomer holds the whole window once every
 member has discovered it, rather than waiting for the repair lane. A
-peer heard from again after `GOSSIP_REWELCOME_SILENCE_MILLIS` (10 s)
+peer heard from again after `GOSSIP_REWELCOME_SILENCE_MILLIS` (5 s)
 without a packet, typically across a healed partition, missed every
-change sent meanwhile and is welcomed back the same way. Silence only
-triggers that resend; it never removes a peer, since membership comes
-from discovery alone.
+change sent meanwhile and is welcomed back the same way. The repair lane
+sweeps a store of a hundred cells in about four seconds, so without the
+welcome a cut of several seconds, short of a 10 s window, heals too
+slowly for the oldest cut-era hits to be counted before they expire.
+Silence only triggers that resend; it never removes a peer, since
+membership comes from discovery alone.
 
 `CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
