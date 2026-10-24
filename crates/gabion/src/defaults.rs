@@ -124,6 +124,13 @@ pub const GOSSIPSUB_MCACHE_CAPACITY: usize = 4_096;
 pub const GOSSIPSUB_MCACHE_SLOT_BYTES: usize = GOSSIP_MAX_PAYLOAD_BYTES;
 /// Hard bound on message ids remembered for duplicate suppression.
 pub const GOSSIPSUB_SEEN_CAPACITY: usize = 32_768;
+/// Most message ids one node requests from one peer per heartbeat with
+/// `IWANT` (`max_ihave_length`, which go-libp2p sets to 5,000 for a TCP
+/// stream). Over UDP the answer is a burst of datagrams, and the advertiser
+/// can queue no more of them than its send pool holds
+/// (`GOSSIP_SEND_QUEUE_CAPACITY`), so the cap matches it; the asked ids are a
+/// random sample of the unseen ones, as in go-libp2p.
+pub const GOSSIPSUB_MAX_IWANT_IDS: usize = GOSSIP_SEND_QUEUE_CAPACITY;
 /// Cells per answer of the catch-up sweep, the study's `pull-sweep-join`
 /// component (not part of GossipSub; see the design notes). A node that
 /// finds most of an `IHAVE` unseen pulls the advertiser's live cells this

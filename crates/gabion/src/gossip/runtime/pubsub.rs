@@ -42,6 +42,8 @@ pub(super) struct Peer {
     /// Cells from the peer before this time may answer this node's `IWANT`,
     /// which any peer serves, so they say nothing about the mesh link.
     iwant_until_ms: u64,
+    /// Ids requested from the peer with `IWANT` since the last heartbeat.
+    iwant_asked: usize,
 }
 
 impl Peer {
@@ -54,6 +56,7 @@ impl Peer {
             graft_after_ms: 0,
             heard: Heard::default(),
             iwant_until_ms: 0,
+            iwant_asked: 0,
         }
     }
 }
@@ -288,10 +291,28 @@ impl PubSub {
                     }
                     None => {}
                 }
+                // Ask a random sample, within the peer's budget for this
+                // heartbeat (a peer discovery has not reported yet is not
+                // tracked, so each of its frames gets the whole budget).
                 let answer_by_ms = now_ms + self.heartbeat_interval_ms();
-                if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
+                let mut peer = self.peers.iter_mut().find(|p| p.addr == src);
+                let asked = peer.as_ref().map_or(0, |p| p.iwant_asked);
+                let ask = self
+                    .ids
+                    .len()
+                    .min(self.cfg.max_iwant_ids.saturating_sub(asked));
+                if ask == 0 {
+                    return;
+                }
+                if let Some(peer) = peer.as_mut() {
+                    peer.iwant_asked += ask;
                     peer.iwant_until_ms = answer_by_ms;
                 }
+                for i in 0..ask {
+                    let j = i + (self.rng.next_u64() as usize) % (self.ids.len() - i);
+                    self.ids.swap(i, j);
+                }
+                self.ids.truncate(ask);
                 self.targets.clear();
                 self.targets.push(src);
                 self.send_ids(framing, Control::IWant);
@@ -605,6 +626,9 @@ impl PubSub {
         let seen_ttl_ms = self.cfg.seen_ttl.as_millis() as u64;
         self.seen.expire_before(now_ms.saturating_sub(seen_ttl_ms));
         self.retry_sweep(framing, now_ms);
+        for peer in &mut self.peers {
+            peer.iwant_asked = 0;
+        }
         self.maintain_mesh(framing, now_ms);
         self.emit_gossip(framing);
         self.heartbeats += 1;

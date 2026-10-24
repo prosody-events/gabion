@@ -105,6 +105,15 @@ payload limit needs.
   accepted per heartbeat. Without scores a prune keeps a random `D` mesh
   peers. Peer exchange on `PRUNE` is omitted too, as membership comes only
   from discovery.
+- *`IWANT` asks are capped per peer and heartbeat, at the send pool's size.*
+  The specification's `max_ihave_length` bounds the ids a node requests from
+  one peer per heartbeat (5,000 in go-libp2p, sized for a TCP stream), and
+  go-libp2p asks for a random sample when more are unseen. Here the answer
+  is a burst of datagrams that the advertiser cannot queue beyond its send
+  pool, so the cap is `GOSSIPSUB_MAX_IWANT_IDS` = `GOSSIP_SEND_QUEUE_CAPACITY`
+  (128). Without it a joiner's first advertisements drew answers of
+  thousands of messages that overflowed send pools and receive buffers
+  (about 20,000 receive-buffer drops per churn-rollout run).
 - *Catch-up sweep (an addition: the study's `pull-sweep-join` component).*
   GossipSub repairs only what the message cache still holds, a few
   heartbeats. A joiner never sees the cells written before it started, and

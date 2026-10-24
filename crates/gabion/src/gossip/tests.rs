@@ -1195,6 +1195,71 @@ async fn ihave_and_iwant_deliver_to_a_peer_outside_the_mesh() {
         .await;
 }
 
+/// `IWANT` asks one advertiser for at most `max_iwant_ids` ids per
+/// heartbeat; the rest come on later heartbeats while the ids are still
+/// advertised.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn iwant_asks_are_capped_per_peer_and_heartbeat() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr_a = sock(40_110);
+            let addr_b = sock(40_111);
+            let id_a = NodeIdentity::new(NodeId(0xA2), 1);
+            let id_b = NodeIdentity::new(NodeId(0xB2), 1);
+            let lazy_only = crate::gossip::PubSubConfig {
+                d: 0,
+                d_lo: 0,
+                d_hi: 0,
+                max_iwant_ids: 2,
+                sweep_slice_cells: 0,
+                ..Default::default()
+            };
+            let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt_a, client_a) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                sim_config(id_a, vec![addr_b], 1),
+                store_for(id_a),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            let (rt_b, client_b) = GossipRuntime::from_parts(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                sim_config(id_b, vec![addr_a], 2),
+                store_for(id_b),
+                agg_b.clone(),
+            );
+            let h_a = tokio::task::spawn_local(
+                rt_a.with_pubsub(lazy_only.clone())
+                    .run(futures::stream::empty()),
+            );
+            let h_b =
+                tokio::task::spawn_local(rt_b.with_pubsub(lazy_only).run(futures::stream::empty()));
+
+            // Five messages, one per round, before A's second heartbeat.
+            sim_advance_ticks(Duration::from_millis(100), 1).await;
+            for key in 1..=5 {
+                client_a
+                    .record(0xDEAD, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+                sim_advance_ticks(Duration::from_millis(100), 1).await;
+            }
+            sim_advance_ticks(Duration::from_millis(100), 9).await;
+            assert_eq!(agg_b.total(), 2, "one heartbeat's asks");
+            sim_advance_ticks(Duration::from_millis(100), 20).await;
+            assert_eq!(agg_b.total(), 5, "later heartbeats ask for the rest");
+
+            client_a.shutdown().await.unwrap();
+            client_b.shutdown().await.unwrap();
+            let _ = h_a.await;
+            let _ = h_b.await;
+        })
+        .await;
+}
+
 /// Heartbeat maintenance alone keeps every node's mesh within
 /// `[D_lo, D_hi]` on a cluster larger than `D_hi`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]

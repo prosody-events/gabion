@@ -43,6 +43,8 @@ pub struct PubSubConfig {
     pub mcache_slot_bytes: usize,
     /// Bound on remembered message ids.
     pub seen_capacity: usize,
+    /// Most ids requested from one peer per heartbeat with `IWANT`.
+    pub max_iwant_ids: usize,
     /// Cells per answer of the catch-up sweep; `0` disables it.
     pub sweep_slice_cells: usize,
 }
@@ -63,6 +65,7 @@ impl Default for PubSubConfig {
             mcache_capacity: defaults::GOSSIPSUB_MCACHE_CAPACITY,
             mcache_slot_bytes: defaults::GOSSIPSUB_MCACHE_SLOT_BYTES,
             seen_capacity: defaults::GOSSIPSUB_SEEN_CAPACITY,
+            max_iwant_ids: defaults::GOSSIPSUB_MAX_IWANT_IDS,
             sweep_slice_cells: defaults::GOSSIPSUB_SWEEP_SLICE_CELLS,
         }
     }
