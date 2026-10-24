@@ -421,11 +421,25 @@ nodes, a few lines each, run on the harness's own network model
 same `SimSocket`, clock and ticker a gabion node uses; the byte-accounting
 check runs a real gabion cluster under the full `Driver`. Seeds are fixed, so
 every run is bit-identical; the whole suite takes about 11 s in release on the
-reference host, 7 s of it the 300-node epidemic. Statistical tolerances are
-4 standard errors (a two-sided band a correct simulator misses about once in
-16,000 checks) unless stated. The epidemic check is the exception: its
-expected value is itself approximate (below), so its false-alarm rate is
-nearer 1 in 1,000.
+reference host, 7 s of it the 300-node epidemic. Every measured proportion is
+reported as a Bayesian posterior. A count of `k` events in `n` independent
+trials has the Jeffreys posterior Beta(`k` + 1/2, `n` - `k` + 1/2); the tables give
+its median and equal-tailed 95 % credible interval, and whether the closed-form
+value lies inside that interval. A measured mean (latency, burst length) has the
+Jeffreys posterior for a normal mean: Student t with `n` - 1 degrees of freedom,
+centred on the sample mean, with scale `s/sqrt(n)` for sample standard
+deviation `s`. The seeds are fixed, so each figure is one draw of the
+simulator and the interval carries only that draw's sampling noise.
+
+Separately, each test asserts a fixed acceptance band: the measured value must
+lie within 4 binomial standard deviations of the closed-form value, where
+the standard deviation is `sqrt(p (1 - p) / n)` for a proportion and the
+model's own standard deviation divided by `sqrt(n)` for a mean (the
+autocorrelated cases use the chain's asymptotic variance, below). The band is a
+pass/fail rule about 2x wider than the 95 % interval, so it is looser than the
+credible intervals reported here; it is not itself evidence. The epidemic
+check's closed-form value is approximate (below), which the band's slack
+absorbs.
 
 **1. Epidemic reach.** An end-to-end delivery and event-loop sanity check,
 not a test of the network model: the reference nodes choose their own targets
@@ -437,57 +451,87 @@ node does the same once, on first receipt, and then falls silent (non-integer
 Ganesh ("Probabilistic Reliable Dissemination in Large-Scale Systems", IEEE
 Trans. Parallel and Distributed Systems 14(3), 2003) show that with `f = ln n
 + c` the probability that every node is reached tends to `exp(-exp(-c))`.
-5,000 independent runs per cell. The limit is asymptotic; the same Poisson
-argument at finite `n` with distinct targets gives `exp(-(n-1)(1 -
-f/(n-1))^(n-1))`, the last column. That value is itself a Poisson
-approximation, off by about 0.008 at `c = 0` (about 1.2 s.e. at 5,000 trials),
-which the 4 s.e. band absorbs at the cost of a looser false-alarm rate; an
-independent plain-Python simulation of the same protocol (`n = 100`, 40,000
-trials per cell, no harness code) gave 0.402, 0.732 and 0.898 for `c = 0, 1,
-2`, matching the measured column. The harness must match the finite-`n` value
-within 4 standard errors and the limit within 0.05.
+5,000 independent runs per cell.
+The limit is asymptotic; the same Poisson argument at finite `n` with distinct
+targets gives `exp(-(n-1)(1 - f/(n-1))^(n-1))`, the "finite-n" column. That
+value is itself a Poisson approximation. An independent plain-Python
+simulation of the same protocol (`n = 100`, 40,000 trials per cell, no harness
+code; the script is not part of the repository) reached every node in 15,959,
+29,363 and 36,004 trials for `c = 0, 1, 2`: posterior medians 0.3990 [0.3942,
+0.4038], 0.7341 [0.7297, 0.7384] and 0.9001 [0.8971, 0.9030]. Its `c = 0`
+interval excludes the finite-n value 0.4121, so that value is about 0.013
+above the true probability there; at `c = 1, 2` the finite-n value lies
+inside the interval. The independent run's median lies inside each of the
+harness's three `n = 100` intervals. The harness
+must land within 4 binomial standard deviations of the finite-n value and
+within 0.05 of the limit.
 
-| n | c | measured P(all reached) | KMG limit | finite-n | 4 s.e. |
-|---|---|---|---|---|---|
-| 100 | 0 | 0.4038 | 0.3679 | 0.4121 | 0.0278 |
-| 100 | 1 | 0.7300 | 0.6922 | 0.7343 | 0.0250 |
-| 100 | 2 | 0.8926 | 0.8734 | 0.8991 | 0.0170 |
-| 300 | 0 | 0.3956 | 0.3679 | 0.3894 | 0.0276 |
-| 300 | 1 | 0.7086 | 0.6922 | 0.7120 | 0.0256 |
-| 300 | 2 | 0.8888 | 0.8734 | 0.8852 | 0.0180 |
+| n | c | runs reaching all (of 5,000) | posterior median [95 % credible interval] | finite-n | finite-n inside? | KMG limit | limit inside? | acceptance band (±) |
+|---|---|---|---|---|---|---|---|---|
+| 100 | 0 | 2,019 | 0.4038 [0.3903, 0.4175] | 0.4121 | yes | 0.3679 | no | 0.0278 |
+| 100 | 1 | 3,650 | 0.7300 [0.7176, 0.7422] | 0.7343 | yes | 0.6922 | no | 0.0250 |
+| 100 | 2 | 4,463 | 0.8926 [0.8838, 0.9010] | 0.8991 | yes | 0.8734 | no | 0.0170 |
+| 300 | 0 | 1,978 | 0.3956 [0.3821, 0.4092] | 0.3894 | yes | 0.3679 | no | 0.0276 |
+| 300 | 1 | 3,543 | 0.7086 [0.6959, 0.7211] | 0.7120 | yes | 0.6922 | no | 0.0256 |
+| 300 | 2 | 4,444 | 0.8888 [0.8799, 0.8973] | 0.8852 | yes | 0.8734 | no | 0.0180 |
+
+All six intervals contain the finite-n value. The asymptotic limit lies
+outside every interval, 0.015 to 0.038 below the posterior median, as expected
+of a limit evaluated at `n` = 100 and 300; the harness only requires it to be
+within 0.05.
 
 **2. Loss.** One million probes, 1 ms apart, between two nodes, counted at
 the receiving application; the network's own drop counter must equal the
 probes missing at the receiver.
 
-| model | quantity | measured | expected | tolerance |
-|---|---|---|---|---|
-| i.i.d., `p = 0.01` | loss rate | 0.00993 | 0.01 | ± 0.00040 |
-| i.i.d., `p = 0.05` | loss rate | 0.04980 | 0.05 | ± 0.00087 |
-| i.i.d., `p = 0.20` | loss rate | 0.19998 | 0.20 | ± 0.00160 |
-| Gilbert-Elliott, `p = 0.01, r = 0.19`, all lost while bad (the `loss-burst` chain) | loss rate | 0.05042 | `p/(p+r)` = 0.05 | ± 0.00262 |
-| same | mean burst length (9,459 bursts) | 5.331 | `1/r` = 5.263 | ± 0.195 |
-| Gilbert-Elliott, `p = 0.02, r = 0.10`, half lost while bad | loss rate | 0.08162 | `q p/(p+r)` = 0.08333 | ± 0.00306 |
+| model | quantity | posterior median [95 % credible interval] | closed form | inside? | acceptance band (±) |
+|---|---|---|---|---|---|
+| i.i.d., `p = 0.01` (9,933 lost) | loss rate | 0.00993 [0.00974, 0.01013] | 0.01 | yes | 0.00040 |
+| i.i.d., `p = 0.05` (49,804 lost) | loss rate | 0.04980 [0.04938, 0.05023] | 0.05 | yes | 0.00087 |
+| i.i.d., `p = 0.20` (199,983 lost) | loss rate | 0.19998 [0.19920, 0.20077] | 0.20 | yes | 0.00160 |
+| Gilbert-Elliott, `p = 0.01, r = 0.19`, all lost while bad (the `loss-burst` chain) (50,425 lost) | loss rate | 0.05043 [0.04915, 0.05172] | `p/(p+r)` = 0.05 | yes | 0.00262 |
+| same | mean burst length (9,459 bursts, sample sd 4.761) | 5.331 [5.235, 5.427] | `1/r` = 5.263 | yes | 0.195 |
+| Gilbert-Elliott, `p = 0.02, r = 0.10`, half lost while bad (81,617 lost) | loss rate | 0.08162 [0.08014, 0.08311] | `q p/(p+r)` = 0.08333 | no | 0.00306 |
 
-The i.i.d. tolerance is the binomial standard error. The Gilbert-Elliott loss
-tolerance uses the chain's asymptotic variance (`rho = 1 - p - r`
-autocorrelation), and the burst tolerance the geometric distribution's
-variance, `(1 - r)/r^2`.
+For the i.i.d. rows the Jeffreys Beta posterior applies directly, and the
+acceptance band is 4 binomial standard deviations. Gilbert-Elliott losses are
+autocorrelated (`rho = 1 - p - r`), so a million probes carry fewer than a
+million independent trials: the loss-rate rows use the Beta posterior at the
+effective sample size `n_eff = n e (1 - e) / v`, where `e` is the closed-form
+rate and `v` the chain's asymptotic per-probe variance of the loss indicator
+(111,111 for the first chain, 130,435 for the second), with the observed
+fraction scaled to match; the acceptance band uses the same variance. The burst
+mean uses the Student t posterior above, with the sample standard deviation
+of the burst lengths; the geometric distribution's variance is `(1 - r)/r^2`.
+
+The one interval that excludes its closed form is the second Gilbert-Elliott
+loss rate: its posterior puts the rate 0.00171 below `q p/(p+r)` with
+posterior probability 0.988 that the rate is below the closed form, and
+its 99 % credible interval [0.07968, 0.08358] contains it. The test's seed is one draw; as a
+one-off check outside the suite, seeds 2 to 21 of the same configuration lost 81,617
+(seed 1) and 82,062 to 85,294 probes, and the posterior of the mean loss rate
+across all 21 seeds (Student t, 20 degrees of freedom) is 0.08320 [0.08280, 0.08359], which contains 0.08333; for the first chain the
+same 21-seed posterior is 0.05014 [0.04980, 0.05047], which contains 0.05. The
+seed-1 draw of the test is the low one of the 21.
 
 **3. Latency.** 200,000 probes per path with receive service time set to
 zero, so the delay measured at the read is the network's alone, against the
 model's `base + U(0, jitter)`: the default intra- and cross-zone latencies,
-and a second configuration with very different bases and jitters. The mean
-must be within 4 standard errors of `base + jitter/2`, every delay inside
-`[base, base + jitter]`, and the Kolmogorov-Smirnov distance to the uniform
-distribution below its 0.1 % critical value, `1.95/sqrt(N)` = 0.00436.
+and a second configuration with very different bases and jitters. The mean's
+Student t posterior uses the sample standard deviation (28.9 µs, 115.2 µs,
+866.1 µs and 2,309.9 µs, close to `jitter/sqrt(12)`). The tests require the
+mean to lie within 4 standard deviations of the mean (`jitter/sqrt(12)/sqrt(N)`)
+of `base + jitter/2`, every delay inside `[base, base + jitter]`, and the
+Kolmogorov-Smirnov distance `D` between the empirical and the uniform
+distribution below the fixed bound `1.95/sqrt(N)` = 0.00436, the value the
+Kolmogorov distribution gives for a uniform sample at the 0.1 % tail.
 
-| configuration | path | mean (µs) | expected | observed range (ns) | configured range (ns) | KS D |
-|---|---|---|---|---|---|---|
-| default | intra-AZ | 250.1 | 250.0 ± 0.26 | 200,000..300,000 | 200,000..300,000 | 0.00225 |
-| default | cross-AZ | 1,000.1 | 1,000.0 ± 1.03 | 800,001..1,200,000 | 800,000..1,200,000 | 0.00193 |
-| slow | intra-AZ | 3,500.4 | 3,500.0 ± 7.75 | 2,000,003..4,999,989 | 2,000,000..5,000,000 | 0.00164 |
-| slow | cross-AZ | 19,002.0 | 19,000.0 ± 20.66 | 15,000,012..22,999,988 | 15,000,000..23,000,000 | 0.00182 |
+| configuration | path | mean (µs): posterior median [95 % credible interval] | expected (µs) | inside? | acceptance band (± µs) | observed range (ns) | configured range (ns) | KS D |
+|---|---|---|---|---|---|---|---|---|
+| default | intra-AZ | 250.10 [249.97, 250.22] | 250.0 | yes | 0.26 | 200,000..300,000 | 200,000..300,000 | 0.00225 |
+| default | cross-AZ | 1,000.14 [999.63, 1,000.64] | 1,000.0 | yes | 1.03 | 800,001..1,200,000 | 800,000..1,200,000 | 0.00193 |
+| slow | intra-AZ | 3,500.41 [3,496.62, 3,504.21] | 3,500.0 | yes | 7.75 | 2,000,003..4,999,989 | 2,000,000..5,000,000 | 0.00164 |
+| slow | cross-AZ | 19,002.04 [18,991.92, 19,012.17] | 19,000.0 | yes | 20.66 | 15,000,012..22,999,988 | 15,000,000..23,000,000 | 0.00182 |
 
 **4. Byte accounting.** The `tiny` regime (5 pods, rollout of 2, one crash,
 5 % loss, 30 s) runs under the full driver with every node's socket wrapped
