@@ -10,8 +10,8 @@
 //! - Each heartbeat a node sends an IHAVE to a few random peers naming each
 //!   change it made or was pushed since the last one. A change a receiver does
 //!   not hold, and that is not delivered within the missing timeout, makes it
-//!   GRAFT the announcer: ask for the cell, and ask to become its tree
-//!   neighbour.
+//!   GRAFT the announcer: ask for the cell, and repair the change's tree
+//!   through the announcer, as its backbone neighbour or its leaf child.
 //! - A GRAFT may only make a node interior in the tree it already is interior
 //!   in. In another tree the grafting node attaches as a leaf, to an interior
 //!   node of that tree, and the grafted node honours it only if it is interior
@@ -292,7 +292,7 @@ where
 
     /// A lazy announcement: start the missing timer for each change we do
     /// not hold, as Plumtree does for each IHAVE of a message not received.
-    fn on_ihave(&mut self, peer: u16, entries: &[ControlEntry], now: u64) {
+    pub(super) fn on_ihave(&mut self, peer: u16, entries: &[ControlEntry], now: u64) {
         for e in entries {
             if self.has_change(e, now) {
                 continue;
@@ -315,6 +315,14 @@ where
             });
             if let Some(m) = known {
                 m.change.value = m.change.value.max(e.value);
+                // Thicket repairs a tree through a node interior in it: keep
+                // an announcer that is, so the GRAFT can re-attach there.
+                let tree = tree_of(e.node_id, e.value);
+                let interior =
+                    |i: u16| i != NONE && self.thicket.peers[usize::from(i)].class == tree;
+                if !interior(m.announcer) && interior(peer) {
+                    m.announcer = peer;
+                }
             } else if self.thicket.missing.len() < THICKET_MISSING_CAPACITY {
                 self.thicket.missing.push(Missing {
                     change: *e,
@@ -560,18 +568,33 @@ where
         }
     }
 
-    /// Ask `announcer` for the cells of the changes in `asked`, and repair
-    /// this node's own tree if some of them travel in it: GRAFT a backbone
-    /// link.
+    /// Ask `announcer` for the cells of the changes in `asked`, and repair the
+    /// trees they travel in through it, as Thicket does:
     ///
-    /// In any other tree this node is a leaf and does not change parent: a
-    /// change of parent moves the point where this node's own changes enter
-    /// that tree, and the tree for each root was pruned around the old one.
-    /// The cells come from the announcer; the parent link is refreshed on
-    /// every heartbeat.
-    fn graft_for(&mut self, announcer: u16, asked: &[ControlEntry]) {
-        self.send_control(announcer, ControlKind::Graft, PULL_ONLY_TREE, asked);
+    /// - When some of them travel in a tree this node is a leaf of and the
+    ///   announcer is interior in that tree, the announcer becomes this node's
+    ///   parent there: the GRAFT that asks for the cells also attaches to it,
+    ///   and the old parent, whose tree did not deliver, is detached. A GRAFT
+    ///   never makes a node interior in a second tree, because the announcer
+    ///   already is interior in this one.
+    /// - When some travel in this node's own tree, a class-mate is GRAFTed for
+    ///   a backbone link: the announcer when it is one.
+    pub(super) fn graft_for(&mut self, announcer: u16, asked: &[ControlEntry]) {
         let class = self.thicket.class;
+        let tree = self.thicket.peers[usize::from(announcer)].class;
+        let reparent = tree != class && asked.iter().any(|e| tree_of(e.node_id, e.value) == tree);
+        if reparent {
+            let old = self.thicket.parents[usize::from(tree)];
+            if old != announcer {
+                if old != NONE {
+                    self.send_control(old, ControlKind::Prune, tree, &[]);
+                }
+                self.thicket.parents[usize::from(tree)] = announcer;
+            }
+            self.send_control(announcer, ControlKind::Graft, tree, asked);
+        } else {
+            self.send_control(announcer, ControlKind::Graft, PULL_ONLY_TREE, asked);
+        }
         let mut roots = std::mem::take(&mut self.thicket.inbound);
         roots.clear();
         roots.extend(

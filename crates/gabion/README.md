@@ -410,10 +410,14 @@ over Plumtree (Leitão, Pereira & Rodrigues, *Epidemic Broadcast Trees*, SRDS
    naming each change it made, or that a tree pushed to it, since the last
    one. A receiver that holds neither that version of the cell nor a newer one
    starts a 500 ms timer for the change, and when it runs out GRAFTs the
-   announcer: it asks for the cell and, if the change travels in its own tree,
-   to become the announcer's tree neighbour. A GRAFT never makes the receiver
-   interior in a second tree: for any other tree the grafting node is at most
-   a leaf child, and only of an interior node of that tree.
+   announcer, preferring among the peers that announced it one interior in
+   the change's tree: it asks for the cell and repairs that tree through the
+   announcer, which evidently receives it. In its own tree the node asks to
+   become the announcer's backbone neighbour; in a tree it is a leaf of, an
+   announcer interior there becomes its parent, and the old parent, whose tree
+   did not deliver, is detached. A GRAFT never makes the receiver interior in
+   a second tree: for any other tree the grafting node is at most a leaf
+   child, and only of an interior node of that tree.
 7. **Scheduling.** The shared scheduler is unchanged: a node's own changes
    leave on the 500 ms heartbeat or a threshold round (error budget, 5 ms
    floor). A change merged from a peer is forwarded in a relay round.
@@ -504,11 +508,14 @@ data and UDP.
   non-class-mate is always this attach; the refusal is a PRUNE for that tree
   sent to a leaf whose parent it is. Both reuse the control kinds of the same
   meaning (join, leave) rather than adding a kind to the wire format.
-- **No re-parenting on a timeout.** Moving a leaf's parent moves the point
-  where its own changes enter that tree, and every root's eager subtree was
-  pruned around the old one, so a timeout pulls the cells and leaves the
-  parent alone. A parent changes only when discovery removes it, a join
-  replaces it by the sampling above, or it refuses the attach.
+- **Re-parenting on a timeout, as Thicket repairs a tree.** Discovery removes
+  a crashed pod only after seconds, and a partition removes nothing, so a
+  leaf whose parent is gone or cut off would neither receive that tree nor
+  get its own changes into it. A missing timer that runs out is the paper's
+  repair trigger: the leaf GRAFTs an announcer interior in the change's tree,
+  which becomes its parent there. A missing change remembers the first peer
+  that announced it, replaced by a later one only when that one is interior
+  in the change's tree and the first is not.
 - **Repair slice.** An IHAVE is sent once, to 2 peers, so a node that missed
   both the push and the announcement (a partition, a long outage) would never
   hear of the change. Each heartbeat the node also sends one random peer the

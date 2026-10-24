@@ -8,14 +8,17 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use super::thicket::class_of;
+use super::SplitMix64;
+use super::thicket::{NONE, class_of, tree_of};
 use crate::crdt::{BucketEpoch, NodeId, NodeIdentity};
+use crate::defaults::THICKET_TREES;
 use crate::discovery::{Peer, PeerEvent};
-use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
+use crate::gossip::sim::{LinkPolicy, SimRouter, SimTransport, sim_advance_ticks};
 use crate::gossip::tests::{
     InMemoryAggregateStore, key_hash, rule_fp, run_paused, sim_config, store_for_property_rules,
 };
 use crate::gossip::{GossipClient, GossipRuntime, TokioClock};
+use crate::wire::{ControlEntry, ControlKind, PULL_ONLY_TREE, decode_control};
 
 type Model = BTreeMap<(u128, u128, BucketEpoch), u64>;
 
@@ -292,5 +295,131 @@ fn a_departed_parent_is_replaced_and_changes_keep_flowing() {
             assert_eq!(node.agg.snapshot(), model, "node {i}");
         }
         stop(nodes).await;
+    });
+}
+
+type IdleRuntime = GossipRuntime<u32, Rc<InMemoryAggregateStore<u32>>, SimTransport, TokioClock>;
+
+/// Node `index` of `all`, built but not running, so a test can drive its
+/// handlers directly. It knows every other address and has attached to a
+/// parent in each tree it is a leaf of.
+fn idle_runtime(router: &SimRouter, all: &[SocketAddr], index: usize) -> IdleRuntime {
+    let identity = NodeIdentity::new(NodeId(0xA000 + index as u128), 1);
+    let peers: Vec<_> = all.iter().copied().filter(|a| *a != all[index]).collect();
+    let (mut rt, _client) = GossipRuntime::from_parts(
+        router.bind(all[index]),
+        TokioClock::from_millis(0),
+        sim_config(identity, peers, 0x51 + index as u64),
+        store_for_property_rules(identity, all.len() as u16 + 8),
+        Rc::new(InMemoryAggregateStore::<u32>::new()),
+    );
+    rt.maintain_structure();
+    rt.send_pending.clear();
+    rt
+}
+
+/// A change of another origin that travels in `tree`.
+fn change_in(tree: u8) -> ControlEntry {
+    let origin = NodeId(0xBEEF);
+    let value = (1..).find(|&s| tree_of(origin, s) == tree).unwrap();
+    ControlEntry {
+        node_id: origin,
+        incarnation: 1,
+        value,
+        rule_fingerprint: rule_fp(0),
+        key_hash: key_hash(1),
+        bucket: 0,
+    }
+}
+
+/// The control frames `rt` has queued, as `(destination peer, kind, tree)`.
+fn queued_control(rt: &IdleRuntime) -> Vec<(u16, ControlKind, u8)> {
+    rt.send_pending
+        .iter()
+        .filter_map(|&(addr, slot)| {
+            let bytes = rt.send_pool[usize::from(slot)].as_bytes();
+            let frame = decode_control(bytes, None, rt.config.wire_limits, |_| {}).ok()?;
+            Some((rt.thicket.index_of(addr)?, frame.kind, frame.tree))
+        })
+        .collect()
+}
+
+#[test]
+fn a_leaf_regrafts_to_an_announcer_interior_in_the_tree_that_failed_it() {
+    run_paused(async {
+        let all = addrs(30);
+        let router = SimRouter::with_channel_capacity(64);
+        let mut rt = idle_runtime(&router, &all, 0);
+        let tree = (rt.thicket.class + 1) % THICKET_TREES as u8;
+        let old = rt.thicket.parents[usize::from(tree)];
+        assert_ne!(old, NONE);
+        let announcer = rt
+            .thicket
+            .random_of_class(tree, &mut SplitMix64::new(7), |i, _| i == old)
+            .unwrap();
+
+        rt.graft_for(announcer, &[change_in(tree)]);
+
+        assert_eq!(rt.thicket.parents[usize::from(tree)], announcer);
+        assert_eq!(
+            queued_control(&rt),
+            vec![
+                (old, ControlKind::Prune, tree),
+                (announcer, ControlKind::Graft, tree),
+            ],
+            "detach from the old parent, then attach and ask in one GRAFT"
+        );
+    });
+}
+
+#[test]
+fn an_announcer_that_is_a_leaf_of_the_tree_is_only_asked_for_cells() {
+    run_paused(async {
+        let all = addrs(30);
+        let router = SimRouter::with_channel_capacity(64);
+        let mut rt = idle_runtime(&router, &all, 0);
+        let class = rt.thicket.class;
+        let tree = (class + 1) % THICKET_TREES as u8;
+        let leaf_there = (class + 2) % THICKET_TREES as u8;
+        let parents = rt.thicket.parents;
+        let announcer = rt
+            .thicket
+            .random_of_class(leaf_there, &mut SplitMix64::new(7), |_, _| false)
+            .unwrap();
+
+        rt.graft_for(announcer, &[change_in(tree)]);
+
+        assert_eq!(rt.thicket.parents, parents);
+        assert_eq!(
+            queued_control(&rt),
+            vec![(announcer, ControlKind::Graft, PULL_ONLY_TREE)]
+        );
+    });
+}
+
+#[test]
+fn a_missing_change_keeps_an_announcer_interior_in_its_tree() {
+    run_paused(async {
+        let all = addrs(30);
+        let router = SimRouter::with_channel_capacity(64);
+        let mut rt = idle_runtime(&router, &all, 0);
+        let tree = (rt.thicket.class + 1) % THICKET_TREES as u8;
+        let mut rng = SplitMix64::new(7);
+        let outside = rt
+            .thicket
+            .random_of_class((tree + 1) % THICKET_TREES as u8, &mut rng, |_, _| false)
+            .unwrap();
+        let inside = rt
+            .thicket
+            .random_of_class(tree, &mut rng, |_, _| false)
+            .unwrap();
+        let change = change_in(tree);
+
+        rt.on_ihave(outside, &[change], 0);
+        rt.on_ihave(inside, &[change], 0);
+        rt.on_ihave(outside, &[change], 0);
+
+        assert_eq!(rt.thicket.missing.len(), 1);
+        assert_eq!(rt.thicket.missing[0].announcer, inside);
     });
 }
