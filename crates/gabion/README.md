@@ -105,6 +105,15 @@ payload limit needs.
   or advertisements still in a peer's cache. On a cluster of at most `D`
   peers every peer is a mesh peer, so no `IHAVE` is sent and a lost datagram
   is recovered only by the next message that touches the same cell.
+- *A `GRAFT` from an address discovery has not reported yet is refused with
+  a zero backoff.* In libp2p a `GRAFT` arrives only over an open connection,
+  so the sender is always known. Here discovery reports a new pod to each
+  member up to a couple of seconds apart, so a joiner's first grafts reach
+  members that do not know it yet. With the full `prune_backoff` both sides
+  would shun each other for a minute. Instead the joiner sits out one
+  heartbeat (so the member keeps it as an `IHAVE` target) and grafts again,
+  while a `GRAFT` from the member, once discovery reports the joiner, is
+  accepted at once.
 - *Peers are identified by source address.* Forwarded datagrams keep the
   publisher's header, so a peer's node id is learned from its control frames
   and used to avoid sending a message back to its publisher.

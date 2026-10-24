@@ -31,6 +31,10 @@ pub(super) struct Peer {
     pub(super) mesh: bool,
     /// No GRAFT in either direction before this time (milliseconds).
     backoff_until_ms: u64,
+    /// This node does not graft the peer before this time (milliseconds):
+    /// the peer refused a GRAFT because discovery had not reported this node
+    /// to it yet. Unlike the backoff, the peer's own GRAFT is still welcome.
+    graft_after_ms: u64,
 }
 
 impl Peer {
@@ -40,6 +44,7 @@ impl Peer {
             node_id: None,
             mesh: false,
             backoff_until_ms: 0,
+            graft_after_ms: 0,
         }
     }
 }
@@ -166,9 +171,16 @@ impl PubSub {
         match control {
             Control::Graft => self.on_graft(framing, src, now_ms),
             Control::Prune { backoff_secs } => {
+                // A refusal without a backoff comes from a peer that has not
+                // discovered this node yet: sit out the next heartbeat, so the
+                // peer stays an IHAVE target meanwhile, then graft again.
+                let retry_ms = now_ms + 2 * self.heartbeat_interval_ms();
                 if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
                     peer.mesh = false;
                     peer.backoff_until_ms = now_ms + u64::from(backoff_secs) * 1_000;
+                    if backoff_secs == 0 {
+                        peer.graft_after_ms = retry_ms;
+                    }
                 }
             }
             Control::IHave => {
@@ -198,7 +210,9 @@ impl PubSub {
     }
 
     /// Accept a GRAFT unless the sender is unknown, still in backoff, or the
-    /// mesh is already at `D_hi`; refuse with a PRUNE.
+    /// mesh is already at `D_hi`; refuse with a PRUNE. A sender discovery has
+    /// not reported yet is refused without a backoff, so it grafts again on a
+    /// later heartbeat instead of shunning this node for `prune_backoff`.
     fn on_graft(&mut self, framing: &Framing<'_>, src: SocketAddr, now_ms: u64) {
         let degree = self.mesh_degree();
         let backoff = now_ms + u64::from(self.cfg.prune_backoff_secs) * 1_000;
@@ -211,7 +225,7 @@ impl PubSub {
                 peer.backoff_until_ms = backoff;
                 self.send_control(framing, src, self.prune());
             }
-            None => self.send_control(framing, src, self.prune()),
+            None => self.send_control(framing, src, Control::Prune { backoff_secs: 0 }),
         }
     }
 
@@ -280,7 +294,7 @@ impl PubSub {
     fn maintain_mesh(&mut self, framing: &Framing<'_>, now_ms: u64) {
         let degree = self.mesh_degree();
         if degree < self.cfg.d_lo {
-            self.select(|p| !p.mesh && p.backoff_until_ms <= now_ms);
+            self.select(|p| !p.mesh && p.backoff_until_ms <= now_ms && p.graft_after_ms <= now_ms);
             let take = self.cfg.d.saturating_sub(degree).min(self.candidates.len());
             self.sample_candidates(take);
             for i in 0..take {

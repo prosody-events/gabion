@@ -1250,6 +1250,73 @@ async fn mesh_degree_settles_within_bounds() {
         .await;
 }
 
+/// A GRAFT that reaches a node before discovery has reported the grafter is
+/// refused without a backoff, so the two form a mesh as soon as discovery
+/// catches up rather than shunning each other for `prune_backoff`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn graft_before_discovery_meshes_once_discovered() {
+    use tokio::sync::mpsc;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr_a = sock(40_080);
+            let addr_b = sock(40_081);
+            let id_a = NodeIdentity::new(NodeId(0xA1), 1);
+            let id_b = NodeIdentity::new(NodeId(0xB1), 1);
+
+            let (admin_a, admin_rx_a) = mpsc::channel(4);
+            let (admin_b, admin_rx_b) = mpsc::channel(4);
+            let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
+            let b_discovery = futures::stream::unfold(peer_rx, |mut rx| async move {
+                rx.recv().await.map(|evt| (evt, rx))
+            });
+            let (rt_a, client_a) = GossipRuntime::from_parts_with_admin(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                sim_config(id_a, vec![addr_b], 1),
+                store_for(id_a),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx_a),
+            );
+            let (rt_b, client_b) = GossipRuntime::from_parts_with_admin(
+                router.bind(addr_b),
+                TokioClock::from_millis(0),
+                sim_config(id_b, Vec::new(), 2),
+                store_for(id_b),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+                Some(admin_rx_b),
+            );
+            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+            let h_b = tokio::task::spawn_local(rt_b.run(b_discovery));
+
+            // A grafts B on its first heartbeat; B has not discovered A yet.
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert!(!admin_snapshot(&admin_a).await.peers[0].in_mesh);
+
+            peer_tx
+                .send(PeerEvent::Added(Peer::new(addr_a)))
+                .expect("peer stream open");
+            sim_advance_ticks(Duration::from_millis(100), 20).await;
+
+            assert!(
+                admin_snapshot(&admin_a).await.peers[0].in_mesh,
+                "A meshed B"
+            );
+            assert!(
+                admin_snapshot(&admin_b).await.peers[0].in_mesh,
+                "B meshed A"
+            );
+
+            client_a.shutdown().await.unwrap();
+            client_b.shutdown().await.unwrap();
+            let _ = h_a.await;
+            let _ = h_b.await;
+        })
+        .await;
+}
+
 // -- partition then heal ----------------------------------------------------
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
