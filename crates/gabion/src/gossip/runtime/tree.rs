@@ -80,14 +80,23 @@ where
         self.dirty_ticks = self.dirty_ticks.saturating_add(1);
 
         let mut cursor = 0;
+        let mut queued = true;
         while cursor < self.frame_handles.len() {
-            cursor += self.begin_broadcast(cursor, now_millis);
+            let (consumed, all_queued) = self.begin_broadcast(cursor, now_millis);
+            cursor += consumed;
+            queued &= all_queued;
+        }
+        // Like a frame on `main`, the round's cells count as emitted only
+        // when every packet of it was queued for every child.
+        if queued {
+            self.clear_emitted_pending(0..self.frame_handles.len(), now_millis.max(1));
         }
     }
 
     /// Encode the next packet of `frame_handles[cursor..]` as a broadcast and
-    /// send it to this node's children. Returns the handles consumed.
-    fn begin_broadcast(&mut self, cursor: usize, now_millis: u64) -> usize {
+    /// send it to this node's children. Returns the handles consumed and
+    /// whether every send was queued.
+    fn begin_broadcast(&mut self, cursor: usize, now_millis: u64) -> (usize, bool) {
         let remaining = self.frame_handles.len() - cursor;
         let (idx, displaced) = self.origins.claim(now_millis);
         if displaced {
@@ -118,11 +127,18 @@ where
         };
         let Some((written, consumed)) = encoded else {
             self.origins.release(idx);
-            return remaining;
+            return (remaining, false);
         };
-        if !matches!(written, Ok(Some(w)) if w.cells_emitted > 0) {
-            self.origins.release(idx);
-            return consumed.max(1);
+        match written {
+            Ok(Some(w)) if w.cells_emitted > 0 => {}
+            Ok(_) => {
+                self.origins.release(idx);
+                return (consumed.max(1), true);
+            }
+            Err(_) => {
+                self.origins.release(idx);
+                return (consumed.max(1), false);
+            }
         }
 
         let k = self.branching();
@@ -131,24 +147,27 @@ where
         self.ring.root_children(k, &mut origin.children);
         if origin.children.is_empty() {
             self.origins.release(idx);
-            return consumed;
+            return (consumed, false);
         }
         origin.deadline_ms = now_millis + timeout;
         origin.rebroadcasts_left = self.tree.rebroadcasts;
         let (seq, children) = (origin.seq, origin.children.len());
         self.last_effective_fanout = children;
         self.peak_effective_fanout = self.peak_effective_fanout.max(children);
+        let mut queued = true;
         for child in 0..children {
-            self.send_to_child_from_origin(idx, child);
+            queued &= self.send_to_child_from_origin(idx, child);
         }
         let last = self.frame_handles[cursor + consumed.max(1) - 1];
         if let Some(row) = self.store.get(last) {
             self.rooted = (seq, row.origin_sequence);
         }
-        consumed
+        (consumed, queued)
     }
 
-    fn send_to_child_from_origin(&mut self, idx: usize, child: usize) {
+    /// Send the broadcast in origin slot `idx` to its child `child`.
+    /// Returns whether the packet was queued.
+    fn send_to_child_from_origin(&mut self, idx: usize, child: usize) -> bool {
         let origin = self.origins.get(idx);
         let Child { addr, lo, hi } = origin.children[child];
         let ctrl = Ctrl::Data {
@@ -170,6 +189,7 @@ where
         if !queued {
             self.note_send_dropped(addr);
         }
+        queued
     }
 
     /// Acknowledgement deadlines: rebroadcast to the children that have not
