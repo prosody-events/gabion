@@ -15,6 +15,9 @@ pub const FLAG_DIGEST: u16 = 0x04;
 /// Set on a digest sent in answer to another digest, so it is not answered
 /// in turn.
 pub const FLAG_REPLY: u16 = 0x08;
+/// Set on the cell packets of a repair answer that stopped at the sender's
+/// repair budget: the receiver lacks more than it was sent.
+pub const FLAG_CUT: u16 = 0x10;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {

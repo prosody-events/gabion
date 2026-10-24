@@ -11,7 +11,7 @@ use crate::crdt::{
 use super::{
     DecodeError, DecodedSummary, EncodeError, FLAG_AUTHENTICATED, FLAG_MORE, FrameLimits,
     HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch, decode_auth,
-    decode_auth_visit, decode_unauth, decode_unauth_visit,
+    decode_auth_visit, decode_unauth, decode_unauth_visit, min_cells_per_packet,
 };
 
 const MAX_ROWS: usize = 32;
@@ -406,6 +406,55 @@ fn packets_split_on_intern_cap() {
         assert_eq!(more, !last, "FLAG_MORE mismatch on packet {i}");
     }
     assert_eq!(total_cells, n);
+}
+
+/// Every cell with its own rule and origin is the costliest frame there is;
+/// even it never needs more packets than `min_cells_per_packet` promises.
+#[test]
+fn min_cells_per_packet_bounds_the_packet_count() {
+    let rows: Vec<RawRow> = (0..200)
+        .map(|i| RawRow {
+            rule_fingerprint: 0x5000 + i,
+            key_hash: i,
+            bucket: 0,
+            origin_node_id: 0x9000 + i,
+            origin_incarnation: 1,
+            count: 1,
+            last_update_millis: 0,
+        })
+        .collect();
+    let (store, handles) = seed_store::<u32>(&rows, |c| c);
+    let limits = FrameLimits {
+        max_payload_bytes: 1400,
+        max_cells: 4096,
+    };
+    let key = HmacKey([7; 32]);
+    for authenticated in [false, true] {
+        let mut scratch = WireScratch::for_store(&store);
+        let mut buf = PacketBuf::for_limits(limits);
+        let packets = if authenticated {
+            Packets::<u32>::auth(
+                sample_header(),
+                &store,
+                &handles,
+                &key,
+                &mut scratch,
+                limits,
+            )
+        } else {
+            Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+        }
+        .expect("ctor");
+        let frames = drain_packets(packets, &mut buf);
+        let per_packet = min_cells_per_packet::<u32>(limits, authenticated);
+        assert!(per_packet > 0);
+        assert!(
+            frames.len() <= handles.len().div_ceil(per_packet),
+            "{} packets for {} cells at {per_packet} per packet (auth {authenticated})",
+            frames.len(),
+            handles.len(),
+        );
+    }
 }
 
 #[test]

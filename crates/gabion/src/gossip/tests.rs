@@ -1257,6 +1257,132 @@ async fn digest_repair_serves_cells_the_first_phase_did_not_deliver() {
     }
 }
 
+// -- a node far behind pulls again when an answer is cut ---------------------
+
+/// A and B hold 30 cells; C starts empty and pulls with a repair budget of 10
+/// cells per period and one period in the whole test. Without a follow-up
+/// pull C would get one answer, 10 cells. The answer is cut at the budget, so
+/// C pulls again from the other peer at once and gets 10 more; the third pull
+/// reaches a peer whose budget is spent and ends the chain.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_cut_answer_triggers_a_pull_from_another_peer() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addrs = [sock(40_080), sock(40_081), sock(40_082)];
+            let ids = [
+                NodeIdentity::new(NodeId(0xA2), 1),
+                NodeIdentity::new(NodeId(0xB2), 1),
+                NodeIdentity::new(NodeId(0xC2), 1),
+            ];
+            let peers = [vec![addrs[1]], vec![addrs[0]], vec![addrs[0], addrs[1]]];
+            let aggs: Vec<_> = (0..3)
+                .map(|_| Rc::new(InMemoryAggregateStore::<u32>::new()))
+                .collect();
+            let start = |i: usize| {
+                let mut cfg = sim_config(ids[i], peers[i].clone(), i as u64 + 1);
+                cfg.repair_period = Duration::from_secs(3600);
+                cfg.repair_max_cells = 10;
+                GossipRuntime::from_parts(
+                    router.bind(addrs[i]),
+                    TokioClock::from_millis(0),
+                    cfg,
+                    store_for(ids[i]),
+                    aggs[i].clone(),
+                )
+            };
+            let (rt_a, client_a) = start(0);
+            let (rt_b, _client_b) = start(1);
+            let mut handles = vec![
+                tokio::task::spawn_local(rt_a.run(futures::stream::empty())),
+                tokio::task::spawn_local(rt_b.run(futures::stream::empty())),
+            ];
+            sim_advance_ticks(Duration::from_millis(100), 1).await;
+            for key in 0..30 {
+                client_a
+                    .record(0xDEAD, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert_eq!(aggs[1].total(), 30, "B got A's changes by direct mail");
+
+            let (rt_c, _client_c) = start(2);
+            handles.push(tokio::task::spawn_local(rt_c.run(futures::stream::empty())));
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert_eq!(aggs[2].total(), 20, "one answer from each peer's budget");
+
+            for handle in handles {
+                handle.abort();
+                let _ = handle.await;
+            }
+        })
+        .await;
+}
+
+/// B starts with no peers, so its first repair tick has nobody to pull from.
+/// The tick is owed, not skipped: when discovery reports A, B pulls from it at
+/// once rather than a repair period later (an hour here).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_repair_tick_with_no_peer_pulls_from_the_first_peer_to_arrive() {
+    use crate::discovery::Peer;
+    use tokio::sync::mpsc;
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addrs = [sock(40_090), sock(40_091)];
+            let ids = [
+                NodeIdentity::new(NodeId(0xA3), 1),
+                NodeIdentity::new(NodeId(0xB3), 1),
+            ];
+            let aggs: Vec<_> = (0..2)
+                .map(|_| Rc::new(InMemoryAggregateStore::<u32>::new()))
+                .collect();
+            let start = |i: usize| {
+                let mut cfg = sim_config(ids[i], Vec::new(), i as u64 + 1);
+                cfg.repair_period = Duration::from_secs(3600);
+                GossipRuntime::from_parts(
+                    router.bind(addrs[i]),
+                    TokioClock::from_millis(0),
+                    cfg,
+                    store_for(ids[i]),
+                    aggs[i].clone(),
+                )
+            };
+            let (rt_a, client_a) = start(0);
+            let (rt_b, _client_b) = start(1);
+            let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
+            let peers_b = futures::stream::unfold(peer_rx, |mut rx| async move {
+                rx.recv().await.map(|evt| (evt, rx))
+            });
+            let handles = [
+                tokio::task::spawn_local(rt_a.run(futures::stream::empty())),
+                tokio::task::spawn_local(rt_b.run(peers_b)),
+            ];
+            for key in 0..5 {
+                client_a
+                    .record(0xDEAD, KeyHash(key), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert_eq!(aggs[1].total(), 0, "A knows no peer to mail");
+
+            peer_tx.send(PeerEvent::Added(Peer::new(addrs[0]))).unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 2).await;
+            assert_eq!(aggs[1].total(), 5, "B pulled from its first peer");
+
+            for handle in handles {
+                handle.abort();
+                let _ = handle.await;
+            }
+        })
+        .await;
+}
+
 // -- partition then heal ----------------------------------------------------
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

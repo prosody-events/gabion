@@ -28,7 +28,8 @@ use crate::crdt::{
 };
 use crate::discovery::PeerEvent;
 use crate::wire::{
-    self, DigestPackets, FLAG_MORE, FLAG_REPLY, FrameKind, PacketBuf, Packets, WireScratch,
+    self, DigestPackets, FLAG_CUT, FLAG_MORE, FLAG_REPLY, FrameKind, PacketBuf, Packets,
+    WireScratch,
 };
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
@@ -53,7 +54,12 @@ struct Peer {
 /// Who an encoded packet goes to.
 #[derive(Clone, Copy)]
 enum Target {
-    One(SocketAddr),
+    /// A repair answer for one peer; `cut` when it stopped at the repair
+    /// budget.
+    Answer {
+        dst: SocketAddr,
+        cut: bool,
+    },
     All,
 }
 
@@ -110,6 +116,10 @@ where
     digest_builder: DigestBuilder,
     digest_reader: DigestReader,
     repair_budget: usize,
+    // A repair tick that found no peer to pull from: the first peer to
+    // arrive gets the digest instead, so a node that starts before
+    // discovery reports its peers still catches up at once.
+    repair_owed: bool,
 
     // Pending reply for the in-flight limit request. Sent after the
     // bottom-of-loop apply so callers observe "ack ⇒ AggregateStore reflects
@@ -304,6 +314,7 @@ where
             digest_builder,
             digest_reader,
             repair_budget: 0,
+            repair_owed: false,
             pending_reply: None,
             decode_reject_count: 0,
             max_send_pending_depth: 0,
@@ -555,6 +566,12 @@ where
             }
         };
         self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
+        // The last packet of an answer cut at its sender's repair budget: this
+        // node lacks more than one answer carries, so it pulls again at once
+        // from another peer rather than waiting a repair period.
+        if summary.header.flags & (FLAG_CUT | FLAG_MORE) == FLAG_CUT {
+            self.pull_again(src);
+        }
         Some(NodeId(summary.header.sender_node_id))
     }
 
@@ -579,11 +596,22 @@ where
         };
         self.digest_reader.set_scope(scope);
 
-        let budget = self.repair_budget.min(self.config.max_cells_per_tick);
-        self.digest_reader
+        // An answer never outgrows the free send slots, so it goes out whole
+        // and its last packet carries the cut flag.
+        let room = self.send_free.len()
+            * wire::min_cells_per_packet::<C>(
+                self.config.wire_limits,
+                self.config.auth_key.is_some(),
+            );
+        let budget = self
+            .repair_budget
+            .min(self.config.max_cells_per_tick)
+            .min(room);
+        let cut = self
+            .digest_reader
             .cells_lacked(&self.store, budget, &mut self.frame_handles);
         if !self.frame_handles.is_empty() {
-            let sent = self.encode_packets(Target::One(src));
+            let sent = self.encode_packets(Target::Answer { dst: src, cut });
             self.repair_budget = self.repair_budget.saturating_sub(sent);
         }
         let exchange_open = header.flags & (FLAG_REPLY | FLAG_MORE) == 0;
@@ -746,6 +774,10 @@ where
                         cluster_size = self.peers.len(),
                         "Peer joined the cluster.",
                     );
+                    if self.repair_owed {
+                        self.repair_owed = false;
+                        self.send_digest(p.addr, false);
+                    }
                 }
             }
             PeerEvent::Removed(p) => {
@@ -832,11 +864,29 @@ where
     fn handle_repair_tick(&mut self) {
         self.repair_budget = self.config.repair_max_cells;
         if self.peers.is_empty() {
+            self.repair_owed = true;
             return;
         }
         let pick = (self.rng.next_u64() as usize) % self.peers.len();
         let dst = self.peers[pick].addr;
         self.send_digest(dst, false);
+    }
+
+    /// Send a digest to a random peer other than `answered`, whose answer
+    /// stopped at its repair budget or its free send slots. A chain of these
+    /// pulls ends at the first answer that is not cut, and every link spends
+    /// a peer's repair budget, so their number per period is bounded by the
+    /// budgets.
+    fn pull_again(&mut self, answered: SocketAddr) {
+        let others = self.peers.iter().filter(|p| p.addr != answered);
+        let count = others.clone().count();
+        if count == 0 {
+            return;
+        }
+        let pick = (self.rng.next_u64() as usize) % count;
+        if let Some(dst) = others.map(|p| p.addr).nth(pick) {
+            self.send_digest(dst, false);
+        }
     }
 
     /// Queue a digest of the local store for `dst`. `reply` marks a digest
@@ -882,7 +932,10 @@ where
     /// how many handles were encoded; the rest did not fit the send pool and
     /// are dropped (best effort: digest repair covers them).
     fn encode_packets(&mut self, target: Target) -> usize {
-        let header = self.frame_header();
+        let mut header = self.frame_header();
+        if let Target::Answer { cut: true, .. } = target {
+            header.flags = FLAG_CUT;
+        }
         let packets_result = match self.config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
                 header,
@@ -908,7 +961,7 @@ where
             let buf = &mut self.send_pool[slot as usize];
             match packets.next_into(buf) {
                 Ok(Some(_)) => self.send_pending.push_back(match target {
-                    Target::One(dst) => Outgoing::One { slot, dst },
+                    Target::Answer { dst, .. } => Outgoing::One { slot, dst },
                     Target::All => Outgoing::All { slot, next: 0 },
                 }),
                 Ok(None) | Err(_) => {

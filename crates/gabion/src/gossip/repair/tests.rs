@@ -152,6 +152,14 @@ fn the_cell_budget_bounds_the_answer() {
     entries.into_iter().for_each(|e| reader.push(e));
     reader.set_scope(scope);
     let mut out = Vec::new();
-    reader.cells_lacked(&holder, 4, &mut out);
+    assert!(
+        reader.cells_lacked(&holder, 4, &mut out),
+        "the answer is cut"
+    );
     assert_eq!(out.len(), 4);
+    assert!(
+        !reader.cells_lacked(&holder, 10, &mut out),
+        "an answer that holds every lacked cell is not cut",
+    );
+    assert_eq!(out.len(), 10);
 }

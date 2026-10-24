@@ -111,6 +111,23 @@ buffer.
   (hours) at a high per-origin hit rate, or a very high-rate regime, can have
   older losses that repair cannot see. Widening the window costs 8 bytes per
   word in every digest entry.
+- *A node far behind pulls again at once (adapted from the `pull-sweep-join`
+  component).* A repair answer that stops at the responder's budget, or at its
+  free send slots, carries `FLAG_CUT` on its last packet. The receiver then
+  sends a digest to another random peer at once instead of waiting a repair
+  period, and keeps doing so until an answer arrives whole. The paper has no
+  join or catch-up path: a member that falls far behind recovers at one
+  budget-limited exchange per round, which here took a joining pod three to
+  five seconds to fetch a live window of about 8,000 cells. The component as
+  specified pulls from two rendezvous-chosen peers on join; the adaptation keeps
+  the paper's random pairwise exchange and its per-round retransmission limit,
+  and covers a joiner and a node returning from a partition alike, with no
+  join detection. Every link of a chain spends a peer's repair budget, so the
+  extra pulls per period are bounded by the budgets; a link that reaches a peer
+  whose budget is spent gets no answer and the chain ends, to resume at the
+  next repair tick. A repair tick that finds no peer (a node that starts before
+  discovery reports its peers) is owed to the first peer to arrive rather than
+  skipped.
 - *Peer removal during a broadcast.* A broadcast walks the peer list by index
   and steps back over a removed peer, so no peer is skipped. A peer added
   mid-broadcast joins the walk's tail or misses that one packet; digest repair
@@ -131,7 +148,8 @@ peer-frontier machinery for knobs and structures that are now inert.
 
 **Wire.** Digest packets are marked `FLAG_DIGEST` in the common header, carry
 `FLAG_REPLY` when sent in answer to a digest, and are authenticated like cell
-packets.
+packets. The cell packets of a repair answer cut at the responder's budget
+carry `FLAG_CUT`.
 
 ## How gossip works
 

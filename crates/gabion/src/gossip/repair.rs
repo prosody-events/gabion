@@ -122,15 +122,17 @@ impl DigestReader {
     }
 
     /// Collect up to `max_cells` cells the sender of the packet lacks.
+    /// Returns whether the scan stopped at `max_cells` with more lacked
+    /// cells left over: the sender is further behind than one answer.
     pub(super) fn cells_lacked<C: Count>(
         &mut self,
         store: &CellStore<C>,
         max_cells: usize,
         out: &mut Vec<CellHandle>,
-    ) {
+    ) -> bool {
         out.clear();
         if max_cells == 0 {
-            return;
+            return false;
         }
         for (slot, verdict) in self.verdicts.iter_mut().enumerate() {
             *verdict = match origin_key(store, slot as NodeSlot) {
@@ -143,6 +145,7 @@ impl DigestReader {
                 _ => Verdict::Unspoken,
             };
         }
+        let mut cut = false;
         store.visit_active(|handle, slot, sequence| {
             let lacked = match self.verdicts[slot as usize] {
                 Verdict::Unspoken => false,
@@ -150,10 +153,15 @@ impl DigestReader {
                 Verdict::Listed(index) => !self.entries[index as usize].holds(sequence),
             };
             if lacked {
+                if out.len() == max_cells {
+                    cut = true;
+                    return false;
+                }
                 out.push(handle);
             }
-            out.len() < max_cells
+            true
         });
+        cut
     }
 }
 

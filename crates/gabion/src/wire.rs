@@ -35,7 +35,8 @@ pub use digest::{
     DIGEST_WINDOW, DigestEntry, DigestPackets, DigestScope, OriginKey, decode_digest_visit,
 };
 pub use header::{
-    FLAG_AUTHENTICATED, FLAG_DIGEST, FLAG_MORE, FLAG_REPLY, HEADER_LEN, Header, MAGIC, VERSION,
+    FLAG_AUTHENTICATED, FLAG_CUT, FLAG_DIGEST, FLAG_MORE, FLAG_REPLY, HEADER_LEN, Header, MAGIC,
+    VERSION,
 };
 
 use auth::AUTH_TAG_LEN;
@@ -157,6 +158,18 @@ impl AsRef<[u8]> for PacketBuf {
 }
 
 // -- packet iterator --------------------------------------------------------
+
+/// The fewest cells one packet under `limits` carries: every cell brings its
+/// own rule and node dictionary entries. A frame of `n` cells never needs
+/// more than `n.div_ceil(min_cells_per_packet(..))` packets.
+pub fn min_cells_per_packet<C: Count>(limits: FrameLimits, authenticated: bool) -> usize {
+    let auth_overhead = if authenticated { AUTH_TAG_LEN } else { 0 };
+    let per_cell = PER_CELL_IDENT_BYTES + std::mem::size_of::<C>() + 16 + 16;
+    limits
+        .max_payload_bytes
+        .saturating_sub(HEADER_LEN + DICT_LEN_BYTES + auth_overhead)
+        / per_cell
+}
 
 /// Compute the minimum bytes needed to hold one minimal cell. A minimal
 /// packet has both dict lengths = 1, one rule fingerprint, one node id, and
