@@ -21,7 +21,8 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, ForwardedLane, NodeId, Observation,
+    ObservationBatch,
 };
 use crate::discovery::PeerEvent;
 use crate::wire::{self, PacketBuf, Packets, WireScratch};
@@ -253,11 +254,14 @@ where
         transport: T,
         clock: K,
         config: GossipConfig,
-        store: CellStore<C>,
+        mut store: CellStore<C>,
         aggregates: S,
         admin_rx: Option<mpsc::Receiver<AdminCommand>>,
     ) -> (Self, GossipClient<C>) {
         let (req_tx, req_rx) = mpsc::channel(config.limit_queue_capacity);
+        // Only roots send their own changes and relays forward the packet
+        // they received, so nothing reads the forwarded dirty ring.
+        store.set_forwarded_lane(ForwardedLane::Skip);
 
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);

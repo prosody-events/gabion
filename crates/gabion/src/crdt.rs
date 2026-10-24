@@ -322,6 +322,7 @@ pub struct CellStore<C: Count = u32> {
     // Gossip lanes.
     local_dirty: DirtyRing,
     forwarded_dirty: DirtyRing,
+    forwarded_lane: ForwardedLane,
     repair_cursor: u32,
 
     // Frame-level dedup.
@@ -354,6 +355,16 @@ pub struct CellStore<C: Count = u32> {
 }
 
 const NO_FREE: u32 = u32::MAX;
+
+/// Whether changes learned from peers are recorded in the forwarded dirty
+/// ring. A runtime that never forwards from that ring turns it off, so the
+/// ring neither costs a write per merge nor reports overflow of changes
+/// nobody was going to send.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForwardedLane {
+    Record,
+    Skip,
+}
 
 /// Internal arguments for [`CellStore::upsert`]. The mode discriminates the
 /// two valid update shapes; sharing a struct prevents callers from passing a
@@ -425,6 +436,7 @@ impl<C: Count> CellStore<C> {
 
             local_dirty: DirtyRing::with_capacity(config.local_dirty_capacity),
             forwarded_dirty: DirtyRing::with_capacity(config.forwarded_dirty_capacity),
+            forwarded_lane: ForwardedLane::Record,
             repair_cursor: 0,
 
             selection_marks: vec![0_u32; cap as usize].into_boxed_slice(),
@@ -499,6 +511,12 @@ impl<C: Count> CellStore<C> {
 
     pub fn forwarded_dirty(&self) -> &DirtyRing {
         &self.forwarded_dirty
+    }
+
+    /// Choose whether merged peer changes are recorded in the forwarded
+    /// dirty ring ([`ForwardedLane::Record`] by default).
+    pub fn set_forwarded_lane(&mut self, lane: ForwardedLane) {
+        self.forwarded_lane = lane;
     }
 
     pub fn repair_cursor(&self) -> u32 {
@@ -795,7 +813,7 @@ impl<C: Count> CellStore<C> {
                      pressure.",
                 );
             }
-        } else {
+        } else if self.forwarded_lane == ForwardedLane::Record {
             let before = self.forwarded_dirty.overflow_seq();
             self.forwarded_dirty.push(entry);
             let after = self.forwarded_dirty.overflow_seq();

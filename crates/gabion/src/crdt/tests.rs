@@ -1298,6 +1298,18 @@ fn dirty_lanes_separate() {
 }
 
 #[test]
+fn a_skipped_forwarded_lane_records_only_local_changes() {
+    let mut store = small_store(4, 8);
+    store.set_forwarded_lane(ForwardedLane::Skip);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 0);
+    remote_merge_one(&mut store, 0x11, 99, 1, 1, 0);
+    assert_eq!(store.local_dirty().len(), 1);
+    assert!(store.forwarded_dirty().is_empty());
+    assert_eq!(store.active_len(), 2, "the merged cell is still stored");
+}
+
+#[test]
 fn count_widths_compile_and_saturate() {
     // u16 saturation.
     let mut s16 = CellStore::<u16>::new(
