@@ -553,8 +553,10 @@ where
             // arrived, relay nothing.
             FrameKind::Broadcast => {
                 self.store.merge_totals(&self.obs_buf, &mut self.sink_buf);
-                if let Some(heard) = heard {
-                    heard.broadcast(header.max_origin_sequence);
+                let gap = heard.and_then(|heard| heard.broadcast(header.max_origin_sequence));
+                if let Some(nack) = gap {
+                    self.totals.clear();
+                    self.send_frame(FrameKind::Nack, Audience::One(src), nack.sequence_fields())?;
                 }
             }
             FrameKind::Repair => {

@@ -122,10 +122,13 @@ impl Heard {
     }
 
     /// Broadcast `seq` arrived.
-    pub(super) fn broadcast(&mut self, seq: u64) {
+    /// Broadcast `seq` arrived. Returns the NACK to send the owner at once
+    /// if it revealed broadcasts this node missed; later syncs repeat it
+    /// until they are repaired.
+    pub(super) fn broadcast(&mut self, seq: u64) -> Option<Nack> {
         if seq <= self.latest {
             self.repaired(seq);
-            return;
+            return None;
         }
         let shift = seq - self.latest;
         // Broadcasts `latest + 1 .. seq` are missing; the bits of those
@@ -143,6 +146,11 @@ impl Heard {
         if lost && self.snapshot == Snapshot::Current {
             self.snapshot = Snapshot::Wanted;
         }
+        // A snapshot request waits for the sync, which paces them.
+        if fresh == 0 || self.snapshot != Snapshot::Current {
+            return None;
+        }
+        self.request()
     }
 
     /// A repair of broadcast `seq` arrived.

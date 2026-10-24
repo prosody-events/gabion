@@ -68,22 +68,22 @@ fn a_new_owner_is_asked_for_a_snapshot() {
     let mut heard = Heard::new();
     assert_eq!(heard.request(), Some(Nack::Snapshot));
     // Broadcasts alone do not stand in for it: earlier ones are unknown.
-    heard.broadcast(1);
+    // The request waits for the sync, which paces snapshot requests.
+    assert_eq!(heard.broadcast(3), None);
     assert_eq!(heard.request(), Some(Nack::Snapshot));
 }
 
 #[test]
 fn gaps_are_asked_for_and_cleared_by_repairs_or_late_arrivals() {
     let mut heard = caught_up(10);
-    heard.broadcast(11);
+    assert_eq!(heard.broadcast(11), None);
     assert_eq!(heard.request(), None);
-    heard.broadcast(14);
-    // 12 and 13 missing: bits 1 (= 14 - 1 - 12) and 0.
+    // 12 and 13 missing: bits 1 (= 14 - 1 - 12) and 0, asked for at once.
+    assert_eq!(heard.broadcast(14), missed(14, 0b11));
     assert_eq!(heard.request(), missed(14, 0b11));
-    heard.broadcast(13); // late, reordered
+    assert_eq!(heard.broadcast(13), None); // late, reordered
     assert_eq!(heard.request(), missed(14, 0b10));
-    heard.broadcast(16);
-    assert_eq!(heard.request(), missed(16, 0b1001));
+    assert_eq!(heard.broadcast(16), missed(16, 0b1001));
     heard.repaired(12);
     heard.repaired(15);
     assert_eq!(heard.request(), None);
@@ -93,7 +93,7 @@ fn gaps_are_asked_for_and_cleared_by_repairs_or_late_arrivals() {
 fn falling_too_far_behind_asks_for_a_snapshot() {
     let mut heard = caught_up(1);
     heard.broadcast(3); // 2 missing
-    heard.broadcast(70); // 2's bit falls off the top
+    assert_eq!(heard.broadcast(70), None); // 2's bit falls off the top
     assert_eq!(heard.request(), Some(Nack::Snapshot));
 
     let mut heard = caught_up(1);

@@ -189,9 +189,10 @@ the changed member wins or held.
 6. **Repair.** An owner numbers its broadcast packets and remembers the
    key buckets of the last `GOSSIP_BROADCAST_HISTORY` (256). A receiver
    tracks, per owner, the highest number it has seen and which of the 64
-   below it are missing. Every `sync_wait` it sends each owner it missed
-   broadcasts from a NACK naming them, and the owner re-sends those
-   buckets' current totals (`FLAG_REPAIR`), until none is missing. A
+   below it are missing. As soon as a broadcast shows it missed earlier
+   ones, and again every `sync_wait` until they arrive, it sends the owner
+   a NACK naming them, and the owner re-sends those buckets' current
+   totals (`FLAG_REPAIR`). A
    receiver that has not yet heard from an owner since discovering it
    (every peer, for a node that just started), that fell more than 64
    broadcasts behind, or that asks for a broadcast the owner no longer
