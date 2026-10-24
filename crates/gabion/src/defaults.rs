@@ -51,6 +51,17 @@ pub const GOSSIP_BROADCAST_INTERVAL_MS: u64 = 100;
 /// `GlobalBatchLimit`). Changed keys beyond it wait for the next interval.
 pub const GOSSIP_BROADCAST_BATCH_LIMIT: usize = 1000;
 
+/// Broadcast packets an owner remembers the key buckets of, so it can
+/// re-send one a receiver reports missing. A receiver that misses an older
+/// one gets a snapshot of every key the owner owns instead. At 10 packets a
+/// second this covers about 25 s.
+pub const GOSSIP_BROADCAST_HISTORY: usize = 256;
+
+/// Most owners a node asks for a snapshot at one sync. A joining node asks
+/// every owner; pacing the requests keeps the replies from overflowing its
+/// receive buffer (about 150 full packets at Linux's default).
+pub const GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC: usize = 32;
+
 /// Unused by owner aggregation, which has no threshold-triggered emit. Kept
 /// as the default of the `target_err_bps` setting.
 pub const GOSSIP_TARGET_ERR_BPS: u32 = 100;

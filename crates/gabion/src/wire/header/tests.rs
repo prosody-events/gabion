@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use super::*;
 
 fn sample() -> Header {
@@ -64,7 +66,14 @@ fn patch_header_preserves_layout() {
 
 #[test]
 fn frame_kinds_round_trip_through_flags() {
-    for kind in [FrameKind::Broadcast, FrameKind::Sync, FrameKind::Ack] {
+    for kind in [
+        FrameKind::Broadcast,
+        FrameKind::Sync,
+        FrameKind::Ack,
+        FrameKind::Nack,
+        FrameKind::Repair,
+        FrameKind::Snapshot,
+    ] {
         assert_eq!(FrameKind::from_flags(kind.flags()), Some(kind));
         // Unrelated flag bits do not change the kind.
         let noisy = kind.flags() | FLAG_MORE | FLAG_AUTHENTICATED;
@@ -73,6 +82,25 @@ fn frame_kinds_round_trip_through_flags() {
 }
 
 #[test]
-fn both_kind_bits_are_not_a_kind() {
+fn two_kind_bits_are_not_a_kind() {
     assert_eq!(FrameKind::from_flags(FLAG_SYNC | FLAG_ACK), None);
+    assert_eq!(FrameKind::from_flags(FLAG_NACK | FLAG_REPAIR), None);
+    assert_eq!(FrameKind::from_flags(FLAG_SNAPSHOT | FLAG_SYNC), None);
+}
+
+#[test]
+fn nacks_round_trip_through_the_sequence_fields() {
+    let missed = Nack::Missed {
+        latest: 41,
+        missing: NonZeroU64::new(0b101).unwrap(),
+    };
+    for nack in [missed, Nack::Snapshot] {
+        let (min, max) = nack.sequence_fields();
+        let header = Header {
+            min_origin_sequence: min,
+            max_origin_sequence: max,
+            ..sample()
+        };
+        assert_eq!(Nack::from_header(&header), nack);
+    }
 }

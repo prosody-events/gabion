@@ -31,8 +31,8 @@ mod tests;
 pub use auth::HmacKey;
 pub use body::{WireCell, WireScratch};
 pub use header::{
-    FLAG_ACK, FLAG_AUTHENTICATED, FLAG_MORE, FLAG_SYNC, FrameKind, HEADER_LEN, Header, MAGIC,
-    VERSION,
+    FLAG_ACK, FLAG_AUTHENTICATED, FLAG_MORE, FLAG_NACK, FLAG_REPAIR, FLAG_SNAPSHOT, FLAG_SYNC,
+    FrameKind, HEADER_LEN, Header, MAGIC, Nack, VERSION,
 };
 
 use auth::AUTH_TAG_LEN;
@@ -180,6 +180,17 @@ fn min_payload_bytes(count_size: usize, auth_overhead: usize) -> usize {
         + auth_overhead
 }
 
+/// Most key totals one packet holds, for sizing buffers that track them:
+/// one rule fingerprint and `count_width`-wide totals in the budget left by
+/// the header and, if `authenticated`, the tag.
+pub fn max_totals_per_packet<C: Count>(limits: FrameLimits, authenticated: bool) -> usize {
+    let auth_overhead = if authenticated { AUTH_TAG_LEN } else { 0 };
+    limits
+        .max_payload_bytes
+        .saturating_sub(HEADER_LEN + auth_overhead + 1 + 16)
+        / (body::PER_TOTAL_IDENT_BYTES + std::mem::size_of::<C>())
+}
+
 /// Synchronous iterator over outbound packets. Not `std::iter::Iterator` —
 /// `next_into` takes a caller-owned buffer; `Iterator::next` cannot.
 ///
@@ -195,10 +206,12 @@ pub struct Packets<'a, C: Count> {
     scratch: &'a mut WireScratch,
     limits: FrameLimits,
     cursor: usize,
+    /// Packets emitted so far; numbers a totals frame's packets.
+    emitted: u64,
 }
 
-/// What a frame carries: stored cells (a sync or an acknowledgement) or an
-/// owner's key totals (a broadcast).
+/// What a frame carries: stored cells (a sync or an acknowledgement) or key
+/// totals (a broadcast, repair or snapshot, or none for a NACK).
 #[derive(Clone, Copy)]
 enum Rows<'a, C: Count> {
     Cells(&'a [CellHandle]),
@@ -244,9 +257,14 @@ impl<'a, C: Count> Packets<'a, C> {
         Self::new(header, store, Rows::Cells(handles), None, scratch, limits)
     }
 
-    /// A broadcast of an owner's key totals, authenticated when `key` is
-    /// set. The header's kind is forced to [`FrameKind::Broadcast`], and its
-    /// `min/max_origin_sequence` are copied into every packet unchanged.
+    /// A frame of key totals of the kind in `header.flags` (a broadcast,
+    /// repair or snapshot; with no totals, also a NACK), authenticated when
+    /// `key` is set. Unlike a frame of cells, it emits one packet even with
+    /// no totals: an empty snapshot still says what it covers. Packets are
+    /// numbered as [`FrameKind`] describes: packet `i` of a broadcast
+    /// carries `max_origin_sequence + i`, packet `i` of a snapshot carries
+    /// `min_origin_sequence = i`, and any other kind carries the header's
+    /// sequence fields unchanged.
     pub fn totals(
         header: Header,
         store: &'a CellStore<C>,
@@ -255,10 +273,11 @@ impl<'a, C: Count> Packets<'a, C> {
         scratch: &'a mut WireScratch,
         limits: FrameLimits,
     ) -> Result<Self, EncodeError> {
-        let header = Header {
-            flags: header.flags & !(FLAG_SYNC | FLAG_ACK),
-            ..header
-        };
+        debug_assert!(
+            FrameKind::from_flags(header.flags)
+                .is_some_and(|kind| kind.carries_totals() || totals.is_empty()),
+            "a frame of totals is a broadcast, repair or snapshot",
+        );
         Self::new(header, store, Rows::Totals(totals), key, scratch, limits)
     }
 
@@ -304,6 +323,7 @@ impl<'a, C: Count> Packets<'a, C> {
             scratch,
             limits,
             cursor: 0,
+            emitted: 0,
         })
     }
 
@@ -318,7 +338,8 @@ impl<'a, C: Count> Packets<'a, C> {
     /// - `Ok(None)` — iterator exhausted.
     pub fn next_into(&mut self, buf: &mut PacketBuf) -> Result<Option<PacketWritten>, EncodeError> {
         buf.inner.clear();
-        if self.cursor >= self.rows.len() {
+        let first_of_totals = matches!(self.rows, Rows::Totals(_)) && self.emitted == 0;
+        if self.cursor >= self.rows.len() && !first_of_totals {
             return Ok(None);
         }
 
@@ -354,7 +375,7 @@ impl<'a, C: Count> Packets<'a, C> {
         // If we made zero progress (no drops, no cells), the budget is too
         // tight for even a minimal cell; constructor-time validation should
         // have caught this. Bail rather than spin.
-        if encoded.cells_emitted == 0 && encoded.handles_consumed == 0 {
+        if encoded.handles_consumed == 0 && self.cursor < self.rows.len() {
             return Err(EncodeError::BudgetTooSmall);
         }
 
@@ -378,9 +399,18 @@ impl<'a, C: Count> Packets<'a, C> {
         packet_header.count_width = std::mem::size_of::<C>() as u32;
         packet_header.cell_count = encoded.cells_emitted;
         packet_header.body_len = encoded.body_len as u32;
-        if let Rows::Cells(_) = self.rows {
-            packet_header.min_origin_sequence = encoded.min_origin_sequence;
-            packet_header.max_origin_sequence = encoded.max_origin_sequence;
+        match (self.rows, FrameKind::from_flags(self.header.flags)) {
+            (Rows::Cells(_), _) => {
+                packet_header.min_origin_sequence = encoded.min_origin_sequence;
+                packet_header.max_origin_sequence = encoded.max_origin_sequence;
+            }
+            (Rows::Totals(_), Some(FrameKind::Broadcast)) => {
+                packet_header.max_origin_sequence += self.emitted;
+            }
+            (Rows::Totals(_), Some(FrameKind::Snapshot)) => {
+                packet_header.min_origin_sequence = self.emitted;
+            }
+            (Rows::Totals(_), _) => {}
         }
 
         patch_header(&mut buf.inner[..HEADER_LEN], &packet_header);
@@ -396,6 +426,7 @@ impl<'a, C: Count> Packets<'a, C> {
         debug_assert!(buf.inner.len() <= self.limits.max_payload_bytes);
 
         self.cursor = next_cursor;
+        self.emitted += 1;
         Ok(Some(PacketWritten {
             cells_emitted: encoded.cells_emitted,
             cells_dropped: encoded.cells_dropped,
@@ -493,6 +524,10 @@ fn decode_inner<C: Count>(
 
     let header = read_header(frame)?;
     let kind = FrameKind::from_flags(header.flags).ok_or(DecodeError::BadKind)?;
+    if kind == FrameKind::Nack && header.cell_count != 0 {
+        // A NACK is a request; it carries no rows.
+        return Err(DecodeError::BodyLenMismatch);
+    }
     if header.count_width as usize != std::mem::size_of::<C>() {
         return Err(DecodeError::BadCountWidth);
     }
@@ -522,13 +557,15 @@ fn decode_inner<C: Count>(
 
     let body_bytes = &frame[HEADER_LEN..HEADER_LEN + body_len];
     match kind {
-        FrameKind::Broadcast => decode_totals_visit::<C>(
-            body_bytes,
-            header.cell_count,
-            NodeId(header.sender_node_id),
-            header.sender_incarnation,
-            on_cell,
-        )?,
+        FrameKind::Broadcast | FrameKind::Repair | FrameKind::Snapshot | FrameKind::Nack => {
+            decode_totals_visit::<C>(
+                body_bytes,
+                header.cell_count,
+                NodeId(header.sender_node_id),
+                header.sender_incarnation,
+                on_cell,
+            )?
+        }
         FrameKind::Sync | FrameKind::Ack => {
             decode_body_visit::<C>(body_bytes, header.cell_count, on_cell)?
         }

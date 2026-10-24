@@ -24,11 +24,12 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, KeyTotal, NodeId, Observation,
-    ObservationBatch,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, KeyHash, KeyTotal, NodeId,
+    NodeIdentity, Observation, ObservationBatch, RuleSlot,
 };
+use crate::defaults::{GOSSIP_BROADCAST_HISTORY, GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC};
 use crate::discovery::PeerEvent;
-use crate::wire::{self, FrameKind, PacketBuf, Packets, WireScratch};
+use crate::wire::{self, FLAG_MORE, FrameKind, Nack, PacketBuf, Packets, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
@@ -37,6 +38,7 @@ use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
 use super::membership::{Added, Membership, Owner, Token};
 use super::outbox::Outbox;
+use super::repair::{History, SNAPSHOT_MAX_PARTS};
 use super::send_queue::SendQueue;
 use super::store::AggregateStore;
 use super::transport::GossipTransport;
@@ -69,6 +71,7 @@ struct Overflows {
     sync_queue: u64,
     broadcast_queue: u64,
     peer_table: u64,
+    snapshot_truncated: u64,
 }
 
 impl Overflows {
@@ -83,6 +86,25 @@ impl Overflows {
                  delivery to their owners, so peers will under-count requests handled here \
                  (requests were still allowed). Raise `storage.local_dirty_capacity` (currently \
                  {capacity}) or reduce write/cardinality pressure.",
+            );
+        }
+    }
+
+    fn snapshot_truncated(&mut self, sent: usize, owned: usize) {
+        self.snapshot_truncated = self.snapshot_truncated.saturating_add(1);
+        if self.snapshot_truncated.is_power_of_two() {
+            tracing::warn!(
+                truncated_total = self.snapshot_truncated,
+                sent_buckets = sent,
+                owned_buckets = owned,
+                max_packets = SNAPSHOT_MAX_PARTS,
+                config_key = "gossip.max_payload_bytes",
+                "A peer asked for a snapshot of the keys this node owns, but they do not fit in \
+                 {SNAPSHOT_MAX_PARTS} packets, so the peer got only the first {sent} of {owned} \
+                 key buckets and will under-count the rest until they next change (requests were \
+                 still allowed). This node owns an unusually large share of the live keys; add \
+                 nodes to spread them, or raise `gossip.max_payload_bytes` if your network path \
+                 allows larger datagrams.",
             );
         }
     }
@@ -142,6 +164,13 @@ where
     membership: Membership,
     outbox: Outbox<C>,
     send_queue: SendQueue,
+    /// Sequence number of the last broadcast packet sent; the first is 1.
+    broadcast_seq: u64,
+    /// The key buckets of recent broadcast packets, for repairs.
+    history: History,
+    /// Where the next sync starts its round of snapshot requests, so that
+    /// unresponsive owners cannot starve the rest.
+    snapshot_cursor: usize,
     /// Set when membership changed: the next sync re-evaluates the owner of
     /// every local cell, so hits an old owner never acknowledged reach the
     /// new one.
@@ -271,6 +300,14 @@ where
             sizing.forwarded_dirty_capacity,
         );
         let send_queue = SendQueue::new(config.send_queue_capacity, config.wire_limits);
+        // Enough bucket slots for every remembered packet to be full, but no
+        // more than the store holds cells.
+        let history = History::new(
+            GOSSIP_BROADCAST_HISTORY,
+            (GOSSIP_BROADCAST_HISTORY
+                * wire::max_totals_per_packet::<C>(config.wire_limits, config.auth_key.is_some()))
+            .min(store.capacity() as usize),
+        );
 
         let runtime = Self {
             config,
@@ -292,6 +329,9 @@ where
             membership,
             outbox,
             send_queue,
+            broadcast_seq: 0,
+            history,
+            snapshot_cursor: 0,
             requeue_local_cells: false,
             pending_reply: None,
             overflows: Overflows::default(),
@@ -501,12 +541,40 @@ where
                 return Ok(());
             }
         };
-        self.membership
-            .learn_node_id(src, NodeId(summary.header.sender_node_id));
+        let header = summary.header;
+        let sender = NodeIdentity::new(NodeId(header.sender_node_id), header.sender_incarnation);
+        let heard = self
+            .membership
+            .heard_from(src, sender)
+            .map(|member| &mut member.heard);
 
         match kind.get() {
-            // The owner's totals: fold them, relay nothing.
-            FrameKind::Broadcast => self.store.merge_totals(&self.obs_buf, &mut self.sink_buf),
+            // An owner's totals: fold them, note which of its broadcasts
+            // arrived, relay nothing.
+            FrameKind::Broadcast => {
+                self.store.merge_totals(&self.obs_buf, &mut self.sink_buf);
+                if let Some(heard) = heard {
+                    heard.broadcast(header.max_origin_sequence);
+                }
+            }
+            FrameKind::Repair => {
+                self.store.merge_totals(&self.obs_buf, &mut self.sink_buf);
+                if let Some(heard) = heard {
+                    heard.repaired(header.max_origin_sequence);
+                }
+            }
+            FrameKind::Snapshot => {
+                self.store.merge_totals(&self.obs_buf, &mut self.sink_buf);
+                if let Some(heard) = heard {
+                    heard.snapshot_part(
+                        header.max_origin_sequence,
+                        header.min_origin_sequence,
+                        header.flags & FLAG_MORE == 0,
+                    );
+                }
+            }
+            // A peer missed some of this node's broadcasts.
+            FrameKind::Nack => self.answer_nack(Nack::from_header(&header), src)?,
             // Hits for keys this node owns: fold them, broadcast the keys
             // whose totals rose, and acknowledge every cell so the sender
             // stops re-sending it.
@@ -525,7 +593,7 @@ where
                     }
                 }
                 if !self.frame_handles.is_empty() {
-                    self.send_frame(FrameKind::Ack, Audience::One(src))?;
+                    self.send_frame(FrameKind::Ack, Audience::One(src), (0, 0))?;
                 }
             }
             // An owner holds these cells of ours.
@@ -637,8 +705,9 @@ where
     }
 
     /// Send every local cell an owner has not acknowledged to that owner,
-    /// one batch per owner. A cell stays queued, and is re-sent on the next
-    /// sync, until its owner acknowledges it or it expires.
+    /// one batch per owner, and ask owners for the broadcasts this node
+    /// missed. A cell stays queued, and is re-sent on the next sync, until
+    /// its owner acknowledges it or it expires.
     fn handle_sync_tick(&mut self) -> Result<(), GossipError> {
         self.ticks_total = self.ticks_total.saturating_add(1);
         self.collect_sync_batch();
@@ -650,6 +719,11 @@ where
             self.queue_all_local_cells();
             self.collect_sync_batch();
         }
+        self.send_syncs()?;
+        self.send_nacks()
+    }
+
+    fn send_syncs(&mut self) -> Result<(), GossipError> {
         if self.sync_batch.is_empty() {
             return Ok(());
         }
@@ -667,10 +741,150 @@ where
                 end += 1;
             }
             let owner = self.membership.peers()[peer].addr;
-            self.send_frame(FrameKind::Sync, Audience::One(owner))?;
+            self.send_frame(FrameKind::Sync, Audience::One(owner), (0, 0))?;
             start = end;
         }
         Ok(())
+    }
+
+    /// Ask each owner for the broadcasts this node missed, or for a
+    /// snapshot of the keys it owns; at most
+    /// `GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC` snapshots per sync, starting where
+    /// the last sync stopped.
+    fn send_nacks(&mut self) -> Result<(), GossipError> {
+        let members = self.membership.peers().len();
+        let mut snapshots = 0;
+        self.totals.clear();
+        for i in 0..members {
+            let member = self.membership.peers()[(self.snapshot_cursor + i) % members];
+            let Some(nack) = member.heard.request() else {
+                continue;
+            };
+            if nack == Nack::Snapshot {
+                if snapshots == GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC {
+                    continue;
+                }
+                snapshots += 1;
+            }
+            self.send_frame(
+                FrameKind::Nack,
+                Audience::One(member.addr),
+                nack.sequence_fields(),
+            )?;
+        }
+        self.snapshot_cursor = (self.snapshot_cursor + snapshots) % members.max(1);
+        Ok(())
+    }
+
+    /// Re-send what a peer reports missing: each missed broadcast this node
+    /// still remembers, or, if it remembers none of them, a snapshot.
+    fn answer_nack(&mut self, nack: Nack, peer: SocketAddr) -> Result<(), GossipError> {
+        let (latest, missing) = match nack {
+            Nack::Missed { latest, missing } => (latest, missing.get()),
+            Nack::Snapshot => return self.send_snapshot(peer),
+        };
+        for bit in 0..u64::BITS {
+            if missing & (1 << bit) == 0 {
+                continue;
+            }
+            let Some(seq) = latest.checked_sub(1 + u64::from(bit)) else {
+                break;
+            };
+            if !self.send_repair(seq, peer)? {
+                return self.send_snapshot(peer);
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-send broadcast `seq` to `peer` with its buckets' current totals.
+    /// `false` if this node does not remember it.
+    fn send_repair(&mut self, seq: u64, peer: SocketAddr) -> Result<bool, GossipError> {
+        let Some(buckets) = self.history.get(seq) else {
+            return Ok(false);
+        };
+        self.totals.clear();
+        for (rule, key_hash, bucket) in buckets {
+            // A key whose owner has since moved is the new owner's to send.
+            if !owns(&self.store, &self.membership, rule, key_hash) {
+                continue;
+            }
+            let count = self.store.view(rule, key_hash, bucket);
+            if count != C::default() {
+                self.totals.push(KeyTotal {
+                    rule,
+                    key_hash,
+                    bucket,
+                    count,
+                });
+            }
+        }
+        // Sent even when empty, so the peer stops asking for it.
+        self.send_frame(FrameKind::Repair, Audience::One(peer), (0, seq))?;
+        Ok(true)
+    }
+
+    /// Send `peer` the total of every bucket of every key this node owns,
+    /// as of its last broadcast, in at most `SNAPSHOT_MAX_PARTS` packets.
+    fn send_snapshot(&mut self, peer: SocketAddr) -> Result<(), GossipError> {
+        self.totals.clear();
+        let Self {
+            store,
+            membership,
+            totals,
+            ..
+        } = self;
+        totals.extend(
+            store
+                .view_totals()
+                .filter(|total| owns(store, membership, total.rule, total.key_hash)),
+        );
+        let owned = self.totals.len();
+        let fits = self.snapshot_rows_that_fit()?;
+        if fits < owned {
+            self.totals.truncate(fits);
+            self.overflows.snapshot_truncated(fits, owned);
+        }
+        self.send_frame(
+            FrameKind::Snapshot,
+            Audience::One(peer),
+            (0, self.broadcast_seq),
+        )
+    }
+
+    /// How many of `self.totals` the first `SNAPSHOT_MAX_PARTS` packets of a
+    /// snapshot hold, found by encoding them without sending.
+    fn snapshot_rows_that_fit(&mut self) -> Result<usize, GossipError> {
+        let Self {
+            config,
+            store,
+            scratch,
+            totals,
+            encode_buf,
+            ..
+        } = self;
+        let header = wire::Header {
+            flags: FrameKind::Snapshot.flags(),
+            ..wire::Header::default()
+        };
+        let mut packets = Packets::<C>::totals(
+            header,
+            store,
+            totals,
+            config.auth_key.as_ref(),
+            scratch,
+            config.wire_limits,
+        )?;
+        let mut rows = 0;
+        for _ in 0..SNAPSHOT_MAX_PARTS {
+            match packets.next_into(encode_buf)? {
+                Some(packet) => rows += packet.cells_emitted as usize,
+                None => break,
+            }
+        }
+        // Drain the rest unsent; only the count matters.
+        while packets.next_into(encode_buf)?.is_some() {}
+        Ok(rows)
     }
 
     /// Fill `sync_batch` with the queued cells that still owe their owner
@@ -733,7 +947,11 @@ where
         self.dirty_ticks = self.dirty_ticks.saturating_add(1);
         self.last_effective_fanout = self.membership.peers().len();
         self.peak_effective_fanout = self.peak_effective_fanout.max(self.last_effective_fanout);
-        self.send_frame(FrameKind::Broadcast, Audience::EveryPeer)
+        self.send_frame(
+            FrameKind::Broadcast,
+            Audience::EveryPeer,
+            (0, self.broadcast_seq + 1),
+        )
     }
 
     // -- ownership and delivery ----------------------------------------------
@@ -815,15 +1033,25 @@ where
     // ---------------------------------------------------------------
 
     /// Encode a frame of `kind` and offer each of its packets to `audience`:
-    /// `self.totals` for a broadcast, `self.frame_handles` otherwise. A
-    /// packet is encoded once however many peers receive it.
-    fn send_frame(&mut self, kind: FrameKind, audience: Audience) -> Result<(), GossipError> {
+    /// `self.totals` for a broadcast, repair, snapshot or NACK (none),
+    /// `self.frame_handles` for a sync or acknowledgement. `sequence` is the
+    /// header's `(min, max)_origin_sequence` (see [`FrameKind`]). A packet is
+    /// encoded once however many peers receive it, and a broadcast's packets
+    /// are remembered for repairs.
+    fn send_frame(
+        &mut self,
+        kind: FrameKind,
+        audience: Audience,
+        sequence: (u64, u64),
+    ) -> Result<(), GossipError> {
         let identity = self.store.local_identity();
         let header = wire::Header {
             cluster_id_hash: self.config.cluster_id_hash,
             sender_node_id: identity.node_id.0,
             sender_incarnation: identity.incarnation,
             flags: kind.flags(),
+            min_origin_sequence: sequence.0,
+            max_origin_sequence: sequence.1,
             ..wire::Header::default()
         };
         let Self {
@@ -836,14 +1064,13 @@ where
             membership,
             send_queue,
             transport,
+            history,
+            broadcast_seq,
             ..
         } = self;
         let key = config.auth_key.as_ref();
         let mut packets = match (kind, key) {
-            (FrameKind::Broadcast, _) => {
-                Packets::<C>::totals(header, store, totals, key, scratch, config.wire_limits)?
-            }
-            (_, Some(key)) => Packets::<C>::auth(
+            (FrameKind::Sync | FrameKind::Ack, Some(key)) => Packets::<C>::auth(
                 header,
                 store,
                 frame_handles,
@@ -851,11 +1078,13 @@ where
                 scratch,
                 config.wire_limits,
             )?,
-            (_, None) => {
+            (FrameKind::Sync | FrameKind::Ack, None) => {
                 Packets::<C>::unauth(header, store, frame_handles, scratch, config.wire_limits)?
             }
+            _ => Packets::<C>::totals(header, store, totals, key, scratch, config.wire_limits)?,
         };
-        while packets.next_into(encode_buf)?.is_some() {
+        let mut row = 0;
+        while let Some(packet) = packets.next_into(encode_buf)? {
             match audience {
                 Audience::One(dst) => send_queue.transmit(transport, encode_buf, dst)?,
                 Audience::EveryPeer => {
@@ -864,6 +1093,12 @@ where
                     }
                 }
             }
+            let rows = packet.cells_emitted as usize;
+            if kind == FrameKind::Broadcast {
+                *broadcast_seq += 1;
+                history.record(*broadcast_seq, &totals[row..row + rows]);
+            }
+            row += rows;
         }
         Ok(())
     }
@@ -879,7 +1114,7 @@ where
                         .iter()
                         .map(|p| PeerEntry {
                             addr: p.addr,
-                            node_id: p.node_id,
+                            node_id: p.identity.map(|identity| identity.node_id),
                         })
                         .collect(),
                     store_stats: self.store.stats(),
@@ -904,6 +1139,19 @@ where
             }
         }
     }
+}
+
+/// Whether this node owns `(rule, key_hash)`.
+fn owns<C: Count>(
+    store: &CellStore<C>,
+    membership: &Membership,
+    rule: RuleSlot,
+    key_hash: KeyHash,
+) -> bool {
+    store
+        .rule_dictionary()
+        .descriptor(rule)
+        .is_some_and(|rule| membership.owner(rule.fingerprint, key_hash) == Owner::Local)
 }
 
 enum ArmOutcome {

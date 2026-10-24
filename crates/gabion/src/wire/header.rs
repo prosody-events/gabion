@@ -1,5 +1,7 @@
 //! Fixed-length frame header — hand-rolled little-endian, exactly 72 bytes.
 
+use std::num::NonZeroU64;
+
 use super::DecodeError;
 
 pub const HEADER_LEN: usize = 72;
@@ -14,10 +16,33 @@ pub const FLAG_AUTHENTICATED: u16 = 0x02;
 pub const FLAG_SYNC: u16 = 0x04;
 /// The packet echoes cells an owner has folded, acknowledging a sync.
 pub const FLAG_ACK: u16 = 0x08;
+/// The packet asks an owner to repair broadcasts this node missed.
+pub const FLAG_NACK: u16 = 0x10;
+/// The packet re-sends one broadcast an owner was asked to repair.
+pub const FLAG_REPAIR: u16 = 0x20;
+/// The packet is part of an owner's snapshot of every key it owns.
+pub const FLAG_SNAPSHOT: u16 = 0x40;
 
-/// What a packet's cells are for, carried in the [`FLAG_SYNC`] and
-/// [`FLAG_ACK`] bits. A packet is exactly one kind; both bits set is not a
-/// kind and fails to parse.
+const KIND_FLAGS: u16 = FLAG_SYNC | FLAG_ACK | FLAG_NACK | FLAG_REPAIR | FLAG_SNAPSHOT;
+
+/// What a packet is for, carried in the kind bits ([`FLAG_SYNC`],
+/// [`FLAG_ACK`], [`FLAG_NACK`], [`FLAG_REPAIR`], [`FLAG_SNAPSHOT`]; none is a
+/// broadcast). A packet is exactly one kind; two kind bits set is not a kind
+/// and fails to parse.
+///
+/// Broadcasts, repairs and snapshots carry key totals and number their
+/// packets in the header's sequence fields:
+///
+/// - a **broadcast** packet's `max_origin_sequence` is its sequence number: an
+///   owner numbers every broadcast packet it sends 1, 2, 3, ..., so a receiver
+///   can tell which it missed;
+/// - a **repair** packet's `max_origin_sequence` is the sequence number of the
+///   broadcast it re-sends, with the keys' current totals;
+/// - a **snapshot** packet's `max_origin_sequence` is the last broadcast the
+///   snapshot covers and its `min_origin_sequence` is the packet's index in the
+///   snapshot, [`FLAG_MORE`] marking every packet but the last.
+///
+/// A NACK carries no rows; see [`Nack`] for its fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameKind {
     /// An owner's per-bucket totals of its changed keys, sent to every peer.
@@ -27,6 +52,12 @@ pub enum FrameKind {
     Sync,
     /// An owner's acknowledgement of the cells in a [`FrameKind::Sync`].
     Ack,
+    /// A receiver's request for the broadcasts it missed, or for a snapshot.
+    Nack,
+    /// An owner's re-send of one broadcast a receiver missed.
+    Repair,
+    /// Part of an owner's snapshot of every key it owns.
+    Snapshot,
 }
 
 impl FrameKind {
@@ -35,15 +66,59 @@ impl FrameKind {
             Self::Broadcast => 0,
             Self::Sync => FLAG_SYNC,
             Self::Ack => FLAG_ACK,
+            Self::Nack => FLAG_NACK,
+            Self::Repair => FLAG_REPAIR,
+            Self::Snapshot => FLAG_SNAPSHOT,
         }
     }
 
     pub fn from_flags(flags: u16) -> Option<Self> {
-        match flags & (FLAG_SYNC | FLAG_ACK) {
+        match flags & KIND_FLAGS {
             0 => Some(Self::Broadcast),
             FLAG_SYNC => Some(Self::Sync),
             FLAG_ACK => Some(Self::Ack),
+            FLAG_NACK => Some(Self::Nack),
+            FLAG_REPAIR => Some(Self::Repair),
+            FLAG_SNAPSHOT => Some(Self::Snapshot),
             _ => None,
+        }
+    }
+
+    /// Whether the body is in the totals layout rather than the cell layout.
+    pub fn carries_totals(self) -> bool {
+        matches!(self, Self::Broadcast | Self::Repair | Self::Snapshot)
+    }
+}
+
+/// What a [`FrameKind::Nack`] asks of an owner, carried in the header's
+/// sequence fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Nack {
+    /// Re-send the broadcasts whose bits are set in `missing`: bit `i` is
+    /// broadcast `latest - 1 - i`, `latest` being the highest broadcast the
+    /// receiver has seen (`max_origin_sequence`; `missing` is
+    /// `min_origin_sequence`).
+    Missed { latest: u64, missing: NonZeroU64 },
+    /// Send a snapshot of every key the owner owns (both fields zero).
+    Snapshot,
+}
+
+impl Nack {
+    /// `(min_origin_sequence, max_origin_sequence)` of the NACK's header.
+    pub fn sequence_fields(self) -> (u64, u64) {
+        match self {
+            Self::Missed { latest, missing } => (missing.get(), latest),
+            Self::Snapshot => (0, 0),
+        }
+    }
+
+    pub fn from_header(header: &Header) -> Self {
+        match NonZeroU64::new(header.min_origin_sequence) {
+            Some(missing) => Self::Missed {
+                latest: header.max_origin_sequence,
+                missing,
+            },
+            None => Self::Snapshot,
         }
     }
 }

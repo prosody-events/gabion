@@ -8,7 +8,9 @@
 
 use std::net::SocketAddr;
 
-use crate::crdt::{KeyHash, NodeId};
+use crate::crdt::{KeyHash, NodeIdentity};
+
+use super::repair::Heard;
 
 /// A member's weight in the rendezvous hash: a hash of its address, the one
 /// identity discovery gives every node for every other.
@@ -41,8 +43,10 @@ pub(super) enum Owner {
 pub(super) struct Member {
     pub(super) addr: SocketAddr,
     pub(super) token: Token,
-    /// Learned from the first packet the member sends; observability only.
-    pub(super) node_id: Option<NodeId>,
+    /// Learned from the packets the member sends.
+    pub(super) identity: Option<NodeIdentity>,
+    /// What this node has heard of the member's broadcasts as an owner.
+    pub(super) heard: Heard,
 }
 
 impl Member {
@@ -50,7 +54,8 @@ impl Member {
         Self {
             addr,
             token: Token::of(addr),
-            node_id: None,
+            identity: None,
+            heard: Heard::new(),
         }
     }
 }
@@ -110,11 +115,20 @@ impl Membership {
         }
     }
 
-    /// Record the node id a peer's packet carried.
-    pub(super) fn learn_node_id(&mut self, addr: SocketAddr, node_id: NodeId) {
-        if let Some(member) = self.peers.iter_mut().find(|m| m.addr == addr) {
-            member.node_id = Some(node_id);
+    /// The peer at `addr`, which sent a packet as `identity`. A peer that
+    /// restarted at the same address numbers its broadcasts afresh, so what
+    /// was heard of its previous identity is forgotten.
+    pub(super) fn heard_from(
+        &mut self,
+        addr: SocketAddr,
+        identity: NodeIdentity,
+    ) -> Option<&mut Member> {
+        let member = self.peers.iter_mut().find(|m| m.addr == addr)?;
+        if member.identity.is_some_and(|known| known != identity) {
+            member.heard = Heard::new();
         }
+        member.identity = Some(identity);
+        Some(member)
     }
 
     pub(super) fn local_token(&self) -> Token {

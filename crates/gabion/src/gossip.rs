@@ -30,6 +30,7 @@ mod client;
 mod clock;
 mod membership;
 mod outbox;
+mod repair;
 mod runtime;
 mod send_queue;
 pub mod sim;

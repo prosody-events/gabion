@@ -9,9 +9,10 @@ use crate::crdt::{
 };
 
 use super::{
-    DecodeError, DecodedSummary, EncodeError, FLAG_ACK, FLAG_AUTHENTICATED, FLAG_MORE, FLAG_SYNC,
-    FrameKind, FrameLimits, HEADER_LEN, Header, HmacKey, PacketBuf, Packets, WireCell, WireScratch,
-    decode_auth, decode_auth_visit, decode_unauth, decode_unauth_visit,
+    DecodeError, DecodedSummary, EncodeError, FLAG_ACK, FLAG_AUTHENTICATED, FLAG_MORE, FLAG_NACK,
+    FLAG_REPAIR, FLAG_SYNC, FrameKind, FrameLimits, HEADER_LEN, Header, HmacKey, PacketBuf,
+    Packets, WireCell, WireScratch, decode_auth, decode_auth_visit, decode_unauth,
+    decode_unauth_visit,
 };
 
 const MAX_ROWS: usize = 32;
@@ -721,17 +722,27 @@ fn frame_kind_survives_encode_and_a_double_kind_is_rejected() {
     let limits = FrameLimits::default();
     let mut scratch = WireScratch::for_store(&store);
     let mut buf = PacketBuf::for_limits(limits);
-    for kind in [FrameKind::Broadcast, FrameKind::Sync, FrameKind::Ack] {
+    for kind in [
+        FrameKind::Broadcast,
+        FrameKind::Sync,
+        FrameKind::Ack,
+        FrameKind::Nack,
+        FrameKind::Repair,
+        FrameKind::Snapshot,
+    ] {
         let header = Header {
             flags: kind.flags(),
             ..sample_header()
         };
         let mut packets = match kind {
-            FrameKind::Broadcast => {
-                Packets::<u32>::totals(header, &store, &totals, None, &mut scratch, limits)
-            }
             FrameKind::Sync | FrameKind::Ack => {
                 Packets::<u32>::unauth(header, &store, &handles, &mut scratch, limits)
+            }
+            FrameKind::Nack => {
+                Packets::<u32>::totals(header, &store, &[], None, &mut scratch, limits)
+            }
+            FrameKind::Broadcast | FrameKind::Repair | FrameKind::Snapshot => {
+                Packets::<u32>::totals(header, &store, &totals, None, &mut scratch, limits)
             }
         }
         .expect("ctor");
@@ -977,7 +988,6 @@ fn totals_round_trip_across_packets() {
     let mut decoded = Vec::new();
     let mut frames = 0;
     while packets.next_into(&mut buf).expect("encode").is_some() {
-        frames += 1;
         assert!(buf.as_bytes().len() <= limits.max_payload_bytes);
         let summary =
             decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_| true, |cell| decoded.push(cell))
@@ -986,13 +996,15 @@ fn totals_round_trip_across_packets() {
             FrameKind::from_flags(summary.flags),
             Some(FrameKind::Broadcast)
         );
+        // Each broadcast packet carries its own sequence number.
         assert_eq!(
             (
                 summary.header.min_origin_sequence,
                 summary.header.max_origin_sequence
             ),
-            (5, 9)
+            (5, 9 + frames)
         );
+        frames += 1;
     }
     assert!(frames > 1, "200 totals must not fit one 1400-byte packet");
     let expected: Vec<_> = totals
@@ -1016,5 +1028,107 @@ fn totals_round_trip_across_packets() {
             .iter()
             .all(|c| c.origin_node_id == NodeId(header.sender_node_id)
                 && c.origin_incarnation == header.sender_incarnation)
+    );
+}
+
+/// Each kind of totals frame numbers its packets as `FrameKind` documents,
+/// and a NACK or an empty snapshot is still one packet.
+#[test]
+fn totals_frames_number_their_packets_by_kind() {
+    let mut store = store_with_cap::<u32>(8, 8);
+    let rule = store
+        .intern_rule(RuleDescriptor {
+            fingerprint: 0xA1,
+            ..RuleDescriptor::default()
+        })
+        .expect("rule");
+    let totals: Vec<KeyTotal<u32>> = (0..120_u32)
+        .map(|i| KeyTotal {
+            rule,
+            key_hash: KeyHash(u128::from(i)),
+            bucket: 1,
+            count: i,
+        })
+        .collect();
+    let limits = FrameLimits {
+        max_payload_bytes: 1400,
+        max_cells: 4096,
+    };
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut numbers = |kind: FrameKind, rows: &[KeyTotal<u32>]| {
+        let header = Header {
+            flags: kind.flags(),
+            min_origin_sequence: 3,
+            max_origin_sequence: 40,
+            ..sample_header()
+        };
+        let mut packets =
+            Packets::<u32>::totals(header, &store, rows, None, &mut scratch, limits).expect("ctor");
+        let mut out = Vec::new();
+        while packets.next_into(&mut buf).expect("encode").is_some() {
+            let summary = decode_unauth_visit::<u32>(buf.as_bytes(), limits, |_| true, |_| ())
+                .expect("decode");
+            let h = summary.header;
+            out.push((
+                h.min_origin_sequence,
+                h.max_origin_sequence,
+                h.flags & FLAG_MORE != 0,
+            ));
+        }
+        out
+    };
+    assert_eq!(
+        numbers(FrameKind::Broadcast, &totals),
+        vec![(3, 40, true), (3, 41, true), (3, 42, false)]
+    );
+    assert_eq!(
+        numbers(FrameKind::Snapshot, &totals),
+        vec![(0, 40, true), (1, 40, true), (2, 40, false)]
+    );
+    assert_eq!(numbers(FrameKind::Snapshot, &[]), vec![(0, 40, false)]);
+    assert_eq!(
+        numbers(FrameKind::Repair, &totals[..10]),
+        vec![(3, 40, false)]
+    );
+    assert_eq!(numbers(FrameKind::Nack, &[]), vec![(3, 40, false)]);
+}
+
+#[test]
+fn a_nack_with_rows_is_rejected() {
+    let mut store = store_with_cap::<u32>(8, 8);
+    let rule = store
+        .intern_rule(RuleDescriptor {
+            fingerprint: 0xA1,
+            ..RuleDescriptor::default()
+        })
+        .expect("rule");
+    let totals = [KeyTotal {
+        rule,
+        key_hash: KeyHash(1),
+        bucket: 1,
+        count: 1,
+    }];
+    let limits = FrameLimits::default();
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    // Encode as a repair, then flip the kind to a NACK.
+    let header = Header {
+        flags: FrameKind::Repair.flags(),
+        ..sample_header()
+    };
+    let mut packets =
+        Packets::<u32>::totals(header, &store, &totals, None, &mut scratch, limits).expect("ctor");
+    packets
+        .next_into(&mut buf)
+        .expect("encode")
+        .expect("one packet");
+    drop(packets);
+    let mut bytes = buf.as_bytes().to_vec();
+    let flags = u16::from_le_bytes([bytes[6], bytes[7]]) & !FLAG_REPAIR | FLAG_NACK;
+    bytes[6..8].copy_from_slice(&flags.to_le_bytes());
+    assert_eq!(
+        decode_unauth_visit::<u32>(&bytes, limits, |_| true, |_| ()).unwrap_err(),
+        DecodeError::BodyLenMismatch
     );
 }

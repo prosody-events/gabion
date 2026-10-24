@@ -514,11 +514,10 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
             router.set_link_policy(addrs[right], addrs[left], LinkPolicy::Pass);
         }
     }
-    // An owner broadcasts a key when it changes and does not retry, so a key
-    // that stays quiet after the heal keeps whatever the partition made
-    // peers miss. One more hit to each key, from any single node, makes its
-    // owner broadcast the totals of every live bucket of the key and repairs
-    // every peer.
+    // A peer learns that it missed an owner's broadcasts from the owner's
+    // next one, so an owner that stays quiet after the heal leaves its peers
+    // short. One more hit to each key, from any single node, makes its owner
+    // broadcast again; peers ask for what they missed and are repaired.
     let mut touched = BTreeSet::new();
     let touches: Vec<SimRecord> = case
         .records
@@ -1443,6 +1442,87 @@ async fn next_change_to_a_key_repairs_a_peer_that_missed_a_broadcast() {
         .await;
 }
 
+/// A peer that missed a broadcast asks the owner for it as soon as a later
+/// broadcast shows the gap, and the owner re-sends it: the key it carried
+/// needs no further change.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_missed_broadcast_is_repaired_on_request() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let mesh = spawn_mesh(54_100, 3);
+            let mut owned = (0..)
+                .map(KeyHash)
+                .filter(|&key| owner_index(&mesh.addrs, 0xDEAD, key) == 1);
+            let (quiet, busy) = (owned.next().unwrap(), owned.next().unwrap());
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+
+            mesh.router
+                .set_link_policy(mesh.addrs[1], mesh.addrs[2], LinkPolicy::Block);
+            mesh.clients[0]
+                .record(0xDEAD, quiet, 0, 3, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert_eq!(mesh.aggregates[2].total(), 0);
+
+            // Another key's broadcast reveals the gap; the repair carries
+            // the quiet key's total.
+            mesh.router
+                .set_link_policy(mesh.addrs[1], mesh.addrs[2], LinkPolicy::Pass);
+            mesh.clients[0]
+                .record(0xDEAD, busy, 0, 1, 0, 0)
+                .await
+                .unwrap();
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+            assert_eq!(mesh.aggregates[2].snapshot(), mesh.aggregates[1].snapshot());
+            assert_eq!(mesh.aggregates[2].total(), 4);
+            mesh.shutdown().await;
+        })
+        .await;
+}
+
+/// A node that starts after the others learns every key from the owners'
+/// snapshots, without waiting for any key to change.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_late_starter_catches_up_from_snapshots() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let mesh = spawn_mesh(54_150, 3);
+            let mut hits = 0;
+            for key in 0..12_u128 {
+                let node = key as usize % 3;
+                mesh.clients[node]
+                    .record(0xDEAD, KeyHash(key), 0, 1 + key as u64, 0, 0)
+                    .await
+                    .unwrap();
+                hits += 1 + key as u64;
+            }
+            sim_advance_ticks(Duration::from_millis(100), 5).await;
+
+            let late = sock(54_160);
+            let identity = NodeIdentity::new(NodeId(0xF0FF), 1);
+            let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+            let (rt, client) = GossipRuntime::from_parts(
+                mesh.router.bind(late),
+                TokioClock::from_millis(0),
+                sim_config(identity, mesh.addrs.clone(), 99),
+                store_for(identity),
+                agg.clone(),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+            sim_advance_ticks(Duration::from_millis(100), 3).await;
+            assert_eq!(agg.total(), hits);
+            assert_eq!(agg.snapshot(), mesh.aggregates[0].snapshot());
+
+            let _ = client.shutdown().await;
+            let _ = handle.await;
+            mesh.shutdown().await;
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn unacknowledged_hits_move_to_the_new_owner() {
     let local = LocalSet::new();
@@ -1705,8 +1785,9 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            // One record on A for a key B owns. B rejects every sync because
-            // the auth keys don't match, so A re-sends it each sync_wait.
+            // One record on A for a key B owns. B rejects every packet
+            // because the auth keys don't match, so each sync_wait A re-sends
+            // the sync and again asks B for a snapshot: two rejects a tick.
             let key = (0..)
                 .map(KeyHash)
                 .find(|&key| owner_index(&[addr_a, addr_b], 0xDEAD, key) == 1)
@@ -1721,13 +1802,13 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             // start_paused (the first interval fires at t=0 in some
             // configurations).
             assert!(
-                snap.decode_reject_count >= (TICKS as u64) - 1,
+                snap.decode_reject_count >= 2 * (TICKS as u64 - 1),
                 "decode_reject_count too low: {} (after {} ticks)",
                 snap.decode_reject_count,
                 TICKS
             );
             assert!(
-                snap.decode_reject_count <= (TICKS as u64) + 1,
+                snap.decode_reject_count <= 2 * (TICKS as u64 + 1),
                 "decode_reject_count too high: {} (after {} ticks)",
                 snap.decode_reject_count,
                 TICKS

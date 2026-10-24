@@ -992,22 +992,33 @@ impl<C: Count> CellStore<C> {
         rule: RuleSlot,
         key_hash: KeyHash,
     ) -> impl Iterator<Item = KeyTotal<C>> + '_ {
-        self.key_cells(rule, key_hash).filter_map(move |handle| {
-            let i = handle.index as usize;
-            let bucket = self.buckets[i];
-            let origin = self.origins[i];
-            // A bucket with an others cell is reported through it; one with
-            // only this node's own hits, through the local cell.
-            let reported = origin == self.others_node_slot
-                || (origin == self.local_node_slot
-                    && self.count_at(rule, key_hash, bucket, self.others_node_slot)
-                        == C::default());
-            reported.then(|| KeyTotal {
-                rule,
-                key_hash,
-                bucket,
-                count: self.view(rule, key_hash, bucket),
-            })
+        self.key_cells(rule, key_hash)
+            .filter_map(|handle| self.reported_total(handle.index))
+    }
+
+    /// The view total of every bucket of every key, one row per bucket this
+    /// node holds a counted cell for. Walks the whole store.
+    pub fn view_totals(&self) -> impl Iterator<Item = KeyTotal<C>> + '_ {
+        (0..self.capacity)
+            .filter(|&slot| self.is_active(slot))
+            .filter_map(|slot| self.reported_total(slot))
+    }
+
+    /// The view total of the bucket of the cell at `slot`, if that cell is
+    /// the one that reports it: the bucket's others cell, or its local cell
+    /// when it has no others cell. Each bucket in the view has exactly one.
+    fn reported_total(&self, slot: u32) -> Option<KeyTotal<C>> {
+        let i = slot as usize;
+        let (rule, key_hash, bucket) = (self.rules[i], self.key_hashes[i], self.buckets[i]);
+        let origin = self.origins[i];
+        let reports = origin == self.others_node_slot
+            || (origin == self.local_node_slot
+                && self.count_at(rule, key_hash, bucket, self.others_node_slot) == C::default());
+        reports.then(|| KeyTotal {
+            rule,
+            key_hash,
+            bucket,
+            count: self.view(rule, key_hash, bucket),
         })
     }
 

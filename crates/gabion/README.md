@@ -62,8 +62,9 @@ the frame it speaks is below.
 
 Every gossip frame is one self-describing UDP packet, with no session
 state on either side: each frame decodes independently, even if its
-predecessor was dropped. A lost sync or acknowledgement is re-sent; a
-lost broadcast is not (see [Owner aggregation](#owner-aggregation)).
+predecessor was dropped. A lost sync or acknowledgement is re-sent, and
+a lost broadcast is repaired on request (see
+[Owner aggregation](#owner-aggregation)).
 
 The header is fixed at 72 bytes. Every multi-byte field is encoded
 little-endian; the first four bytes on the wire are `0x32 0x47 0x42
@@ -76,7 +77,9 @@ byte  field                  width
 ----  ---------------------  -----
 0     MAGIC                  4   (0x4742_4732)
 4     VERSION                2   (= 1)
-6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED | FLAG_SYNC | FLAG_ACK)
+6     flags                  2   (FLAG_MORE | FLAG_AUTHENTICATED, and at most
+                                  one kind: FLAG_SYNC | FLAG_ACK | FLAG_NACK |
+                                  FLAG_REPAIR | FLAG_SNAPSHOT)
 8     cluster_id_hash       16
 24    sender_node_id        16
 40    sender_incarnation     4
@@ -112,9 +115,17 @@ plus its `key_hash`, `bucket`, origin incarnation, `last_update_millis`,
 [count            : C  ×N  ]    count_width × N bytes
 ```
 
-`FLAG_SYNC` and `FLAG_ACK` say what the cells are for; a frame never sets
-both. A frame with neither is an owner's **broadcast**, whose body carries
-per-bucket key totals instead of cells. The sender is their origin, so a
+`FLAG_SYNC` and `FLAG_ACK` say what the cells are for; a frame sets at
+most one kind bit. A frame with none is an owner's **broadcast**, whose
+body carries per-bucket key totals instead of cells, as do a **repair**
+(`FLAG_REPAIR`) and a **snapshot** (`FLAG_SNAPSHOT`). A **NACK**
+(`FLAG_NACK`) has no body. These four use the sequence fields: a broadcast
+packet's `max_origin_sequence` is its number in the owner's sequence (1,
+2, 3, ...), a repair's is the number of the broadcast it re-sends, a
+snapshot's is the last broadcast it covers (with the packet's index in the
+snapshot in `min_origin_sequence`), and a NACK carries the highest number
+its sender has seen in `max_origin_sequence` and a bitmap of the ones it
+missed below it in `min_origin_sequence` (zero asks for a snapshot). The sender is their origin, so a
 total row drops the node dictionary and the origin columns:
 
 ```
@@ -173,7 +184,21 @@ the changed member wins or held.
    owner, and because acknowledgements are per owner, every live local
    cell of a key whose owner moved is re-sent until the new owner
    acknowledges it, acknowledged by the old owner or not. The new owner
-   rebuilds the key from these and broadcasts it.
+   rebuilds the key from these and broadcasts it. During a rolling
+   restart this re-sends each moved key's live cells once per move.
+6. **Repair.** An owner numbers its broadcast packets and remembers the
+   key buckets of the last `GOSSIP_BROADCAST_HISTORY` (256). A receiver
+   tracks, per owner, the highest number it has seen and which of the 64
+   below it are missing. Every `sync_wait` it sends each owner it missed
+   broadcasts from a NACK naming them, and the owner re-sends those
+   buckets' current totals (`FLAG_REPAIR`), until none is missing. A
+   receiver that has not yet heard from an owner since discovering it
+   (every peer, for a node that just started), that fell more than 64
+   broadcasts behind, or that asks for a broadcast the owner no longer
+   remembers, gets a snapshot instead: the total of every bucket of every
+   key the owner owns, as of its last broadcast, in up to 128 packets. A
+   node asks at most `GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC` (32) owners for a
+   snapshot per sync, so the replies fit its receive buffer.
 
 A node's view of a bucket is therefore its own hits plus one number for
 everyone else's, which only rises and never exceeds the truth: an owner's
@@ -183,13 +208,12 @@ held a larger count from a previous owner keeps it until the new owner's
 count passes it, so an ownership move never double counts and never drops
 the view.
 
-A node never forwards another node's hits, only an owner broadcasts a
-key, and nothing is sent to a non-owner. A broadcast is sent once per
-change and is not retried, but because it carries every live bucket of
-the key the next change to the key, by any contributor, repairs every peer
-that missed an earlier one. A node that joins learns a key at the key's
-next change; a key that never changes again stays unlearned until it ages
-out of its window.
+A node never forwards another node's hits, only an owner sends a key's
+totals (broadcast, repair or snapshot), and nothing is sent to a
+non-owner. A receiver learns that it missed an owner's broadcast from the
+owner's next one, so a broadcast lost just before its owner falls silent
+stays missing until the owner broadcasts again; the next change to the
+key, which carries every live bucket of it, also repairs it.
 
 ### Design notes
 
@@ -218,9 +242,25 @@ adapted as little as the CRDT and UDP require:
 - **UDP.** Gubernator sends hits over gRPC and gets delivery from TCP.
   Here the owner acknowledges each folded cell and the contributor
   re-sends until it does, which is the minimal substitute for the retry
-  TCP gave the hit path. Gubernator does not retry a failed broadcast
-  either (the next update of the key carries its status), so broadcasts
-  are not acknowledged.
+  TCP gave the hit path.
+- **Broadcast repair (adapted `edge-nack` component).** Gubernator's
+  broadcasts also ride gRPC, so TCP retransmits a lost segment; only a
+  failed RPC is dropped, and the key's next update carries its status. Over
+  UDP a broadcast reaches each of N - 1 peers independently, so at 20 %
+  loss almost none reaches all 182 peers of the `loss-20` regime, and a key
+  that changes every few seconds left over a third of its hits short at
+  some pod until they aged out. Each owner-to-peer broadcast is therefore
+  numbered, and receivers NACK the gaps (the per-edge sequence number,
+  NACK and selective resend of the `edge-nack` component), which is the
+  substitute for TCP's retransmission on the broadcast path, at a cost
+  proportional to the loss. Repairs carry the buckets' current totals, so
+  a repair is never stale, and only the owner sends them.
+- **Snapshots (adapted `pull-sweep-join` and `full-state-fallback`).**
+  Gubernator has no catch-up: a node that joins learns a key at its next
+  update. A node that starts, or that falls further behind than repair can
+  track (a partition of a zone for 30 s does that), asks each owner for the
+  totals of the keys it owns. It asks owners rather than `k` random peers
+  because only an owner may send a key's total.
 - **Batch limit.** Gubernator flushes a batch as soon as it holds
   `GlobalBatchLimit` keys and arms its timers on the first queued item.
   Here the sync and broadcast tickers are free-running and
@@ -239,7 +279,9 @@ adapted as little as the CRDT and UDP require:
 - **Shared tunables.** Keys and defaults are `GOSSIP_SYNC_WAIT_MS`,
   `GOSSIP_BROADCAST_INTERVAL_MS` and `GOSSIP_BROADCAST_BATCH_LIMIT` in
   `gabion::defaults`; the runtime config fields are `sync_wait`,
-  `broadcast_interval` and `broadcast_batch_limit`. The local and
+  `broadcast_interval` and `broadcast_batch_limit`. Repair is tuned by
+  `GOSSIP_BROADCAST_HISTORY` and `GOSSIP_SNAPSHOT_REQUESTS_PER_SYNC`, which
+  are not runtime config. The local and
   forwarded dirty-ring capacities size the sync and broadcast queues, and
   `peer_capacity` sizes the membership table.
 - **Unused knobs.** `fanout`, `rng_seed`, `target_err_bps` and

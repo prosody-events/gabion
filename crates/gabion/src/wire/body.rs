@@ -53,7 +53,7 @@ pub(crate) const PER_CELL_IDENT_BYTES: usize = 1 + 16 + 4 + 1 + 4 + 8 + 8;
 pub(crate) const DICT_LEN_BYTES: usize = 2;
 
 /// Per-total identity bytes: `1 (rule_slot) + 16 (key_hash) + 4 (bucket)`.
-const PER_TOTAL_IDENT_BYTES: usize = 1 + 16 + 4;
+pub(crate) const PER_TOTAL_IDENT_BYTES: usize = 1 + 16 + 4;
 
 /// Maximum slots per packet for each mini-dictionary. The 255 cap is encoded
 /// by the `u8` slot type at the call site; this constant is for boundary
