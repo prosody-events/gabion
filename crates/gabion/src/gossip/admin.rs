@@ -62,9 +62,9 @@ pub struct AdminSnapshot {
     /// Cumulative rounds (heartbeat + threshold) whose frames carried at
     /// least one change. Used by the bench to compute *effective fanout*
     /// (`packets_emitted / dirty_ticks`). The packet count also includes the
-    /// repair slices quiet heartbeats send, so that ratio overstates the pick
-    /// when traffic is light; read `peak_effective_fanout` for the pick
-    /// itself.
+    /// repair digests and answers every heartbeat sends, so that ratio
+    /// overstates the pick when traffic is light; read
+    /// `peak_effective_fanout` for the pick itself.
     pub dirty_ticks: u64,
     /// The coverage fanout the most recent dirty tick chose:
     /// `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`, where `c` is

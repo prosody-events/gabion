@@ -17,9 +17,10 @@
 //!
 //! Two dirty rings track the changes since the last gossip round —
 //! `local_dirty` for cells whose origin is this node, `forwarded_dirty` for
-//! cells learned from peers. A third lane, the repair cursor, rotates over the
-//! entire active set so anti-entropy still converges when a ring overflows or
-//! a round's one-shot send is lost, cut, or pruned.
+//! cells learned from peers. Every cell keeps the sequence its origin stamped
+//! on it, so the gossip runtime's repair digest can compare what two nodes
+//! hold and resend only the difference when a ring overflows or a round's
+//! one-shot send is lost, cut, or pruned.
 //!
 //! Slot lifecycle uses an intrusive freelist (`free_next` linking inactive
 //! slots) and a generation counter per slot (low bit = active flag, high
@@ -323,7 +324,6 @@ pub struct CellStore<C: Count = u32> {
     // Gossip lanes.
     local_dirty: DirtyRing,
     forwarded_dirty: DirtyRing,
-    repair_cursor: u32,
 
     // Frame-level dedup.
     selection_marks: Box<[u32]>,
@@ -377,7 +377,35 @@ enum UpsertMode<C: Count> {
     /// Remote observation. The stored count rises to `observed` if and only
     /// if `observed` is strictly greater (CRDT max-merge), and the cell takes
     /// the `sequence` its origin stamped on that version.
-    MaxMerge { observed: C, sequence: u64 },
+    MaxMerge {
+        observed: C,
+        sequence: u64,
+        relay: Relay,
+    },
+}
+
+/// Whether a remote change that raised a cell is forwarded in the next
+/// gossip round.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Relay {
+    /// Dissemination: the change is news, so it is forwarded once.
+    Forward,
+    /// Repair: a peer resent a change it has held long enough for it to have
+    /// spread, so only this node lacked it and forwarding would resend it to
+    /// peers that hold it.
+    Hold,
+}
+
+impl<C: Count> UpsertMode<C> {
+    fn forwards(&self) -> bool {
+        !matches!(
+            self,
+            Self::MaxMerge {
+                relay: Relay::Hold,
+                ..
+            }
+        )
+    }
 }
 
 impl<C: Count> CellStore<C> {
@@ -429,7 +457,6 @@ impl<C: Count> CellStore<C> {
 
             local_dirty: DirtyRing::with_capacity(config.local_dirty_capacity),
             forwarded_dirty: DirtyRing::with_capacity(config.forwarded_dirty_capacity),
-            repair_cursor: 0,
 
             selection_marks: vec![0_u32; cap as usize].into_boxed_slice(),
             selection_epoch: 0,
@@ -502,10 +529,6 @@ impl<C: Count> CellStore<C> {
 
     pub fn forwarded_dirty(&self) -> &DirtyRing {
         &self.forwarded_dirty
-    }
-
-    pub fn repair_cursor(&self) -> u32 {
-        self.repair_cursor
     }
 
     pub fn index(&self) -> &CellIndex {
@@ -922,7 +945,9 @@ impl<C: Count> CellStore<C> {
             };
             self.origin_sequences[slot as usize] = seq;
             let handle = self.handle_for(slot);
-            self.push_dirty(origin_slot, handle, seq);
+            if mode.forwards() {
+                self.push_dirty(origin_slot, handle, seq);
+            }
             let delta = C::saturating_delta(next, previous);
             self.emit_delta(sink, slot, previous, next, delta, rule_slot);
             return Ok(UpdateOutcome {
@@ -965,7 +990,9 @@ impl<C: Count> CellStore<C> {
             .insert_unchecked(hash_compact_cell_key(&key), slot);
 
         let handle = self.handle_for(slot);
-        self.push_dirty(origin_slot, handle, seq);
+        if mode.forwards() {
+            self.push_dirty(origin_slot, handle, seq);
+        }
         let delta = initial;
         self.emit_delta(sink, slot, C::default(), initial, delta, rule_slot);
         Ok(UpdateOutcome {
@@ -1058,8 +1085,21 @@ impl<C: Count> CellStore<C> {
 
     /// Merge observations received from a peer. Each row is max-merged into
     /// the stored count; the resulting deltas (when the stored count rose)
-    /// are appended to `sink`.
+    /// are appended to `sink`, and the raised cells are queued to be
+    /// forwarded once.
     pub fn merge_remote(&mut self, obs: &ObservationBatch<C>, sink: &mut DeltaSink<C>) {
+        self.merge_observed(obs, sink, Relay::Forward);
+    }
+
+    /// Merge a peer's answer to this node's repair digest: as
+    /// [`Self::merge_remote`], but the raised cells are not forwarded. The
+    /// peer held them long enough for them to have spread, so only this node
+    /// lacked them.
+    pub fn merge_repair(&mut self, obs: &ObservationBatch<C>, sink: &mut DeltaSink<C>) {
+        self.merge_observed(obs, sink, Relay::Hold);
+    }
+
+    fn merge_observed(&mut self, obs: &ObservationBatch<C>, sink: &mut DeltaSink<C>, relay: Relay) {
         obs.assert_consistent();
         for i in 0..obs.len() {
             let Some((rule_slot, node_slot)) = self.translate_identity(
@@ -1080,6 +1120,7 @@ impl<C: Count> CellStore<C> {
                     mode: UpsertMode::MaxMerge {
                         observed: obs.counts[i],
                         sequence: obs.origin_sequences[i],
+                        relay,
                     },
                 },
                 sink,
@@ -1136,9 +1177,8 @@ impl<C: Count> CellStore<C> {
                 self.free_cell_at(slot);
             }
         }
-        // Reset the dirty rings and repair cursor explicitly.
+        // Reset the dirty rings explicitly.
         self.clear_dirty();
-        self.repair_cursor = 0;
         self.selection_epoch = 0;
         for m in self.selection_marks.iter_mut() {
             *m = 0;
@@ -1185,10 +1225,8 @@ impl<C: Count> CellStore<C> {
     }
 
     /// Fill one outgoing gossip frame with at most `max_cells` handles: the
-    /// local dirty lane, then the forwarded one, each newest first, then up
-    /// to `repair_cells` of the rotating repair slice. Returns how many of
-    /// the handles are changes from the dirty lanes; the rest of `out` is
-    /// repair. `selection_marks` dedups across lanes in O(1).
+    /// local dirty lane, then the forwarded one, each newest first.
+    /// `selection_marks` dedups across lanes in O(1).
     ///
     /// Newest first because a frame over `max_cells`, or over its pick's share
     /// of the send queue, loses its tail: keeping the newest changes keeps the
@@ -1199,29 +1237,23 @@ impl<C: Count> CellStore<C> {
     /// or below that peer's `last_acked` for the cell's origin. That is a
     /// **latency optimization only**: the frontier is a per-(peer, origin)
     /// high-watermark, so it can sit above a sequence the peer never actually
-    /// received — a gap it cannot represent. So the repair lane sweeps
-    /// **unconditionally**, without consulting the frontier. That is what
-    /// makes anti-entropy converge under reordering, loss, or a stale
-    /// watermark — the guarantee the [`PeerFrontierTable`] doc comment
-    /// delegates to the repair lane. Pass `None` for a peer with no
-    /// frontier slot yet.
+    /// received — a gap it cannot represent. Repair never consults it: the
+    /// runtime's digest repair compares the sequences a peer reports holding,
+    /// which is what makes anti-entropy converge under reordering, loss, or a
+    /// stale watermark. Pass `None` for a peer with no frontier slot yet.
     pub fn fill_gossip_frame(
         &mut self,
         max_cells: usize,
-        repair_cells: usize,
         peer: Option<u16>,
         out: &mut Vec<CellHandle>,
-    ) -> usize {
+    ) {
         out.clear();
         if max_cells == 0 {
-            return 0;
+            return;
         }
         self.bump_selection_epoch();
         self.fill_dirty_lane(|store| &store.local_dirty, peer, max_cells, out);
         self.fill_dirty_lane(|store| &store.forwarded_dirty, peer, max_cells, out);
-        let changes = out.len();
-        self.fill_repair_slice(changes.saturating_add(repair_cells).min(max_cells), out);
-        changes
     }
 
     /// Push one dirty lane's current entries, newest first, until `out`
@@ -1247,30 +1279,24 @@ impl<C: Count> CellStore<C> {
         }
     }
 
-    /// Advance the repair cursor over active cells not already in this
-    /// frame until `out` holds `end` handles or the cursor has gone round
-    /// once.
-    fn fill_repair_slice(&mut self, end: usize, out: &mut Vec<CellHandle>) {
-        let cap = self.capacity;
-        let mut visited = 0_u32;
-        let mut next_cursor = self.repair_cursor;
-        while visited < cap && out.len() < end {
-            let slot = (self.repair_cursor + visited) % cap;
-            visited += 1;
-            next_cursor = (slot + 1) % cap;
-            if self.is_active(slot) && self.mark_selected(slot) {
-                out.push(self.handle_for(slot));
+    /// Visit every active cell with its origin slot, origin sequence and
+    /// last-update stamp, in slot order. `visit` returning `false` stops the
+    /// scan.
+    pub fn visit_active(&self, mut visit: impl FnMut(CellHandle, NodeSlot, u64, u64) -> bool) {
+        for slot in 0..self.capacity {
+            if !self.is_active(slot) {
+                continue;
+            }
+            let i = slot as usize;
+            if !visit(
+                self.handle_for(slot),
+                self.origins[i],
+                self.origin_sequences[i],
+                self.last_update_millis[i],
+            ) {
+                return;
             }
         }
-        self.repair_cursor = next_cursor;
-    }
-
-    /// Move the repair cursor back to `handle`, the first repair cell of a
-    /// frame that was cut before it was sent, so the next sweep resends it
-    /// instead of leaving it for the next rotation.
-    pub fn resume_repair_at(&mut self, handle: CellHandle) {
-        debug_assert!(handle.index < self.capacity);
-        self.repair_cursor = handle.index;
     }
 
     /// Convenience wrapper around [`Self::expire`] that derives the per-rule

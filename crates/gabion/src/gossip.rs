@@ -25,6 +25,7 @@ use crate::wire::{self, FrameLimits, HmacKey};
 mod admin;
 mod client;
 mod clock;
+mod repair;
 mod runtime;
 pub mod sim;
 mod store;
@@ -63,9 +64,9 @@ pub struct GossipConfig {
     /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
     /// hard minimum when that threshold falls below it.
     pub fanout: usize,
-    /// Cap on cells in one pick's frame per round: the round's changes,
-    /// newest first, plus the repair slice on a heartbeat's first pick. The
-    /// wire codec splits the frame into packets.
+    /// Cap on cells in one pick's frame per round, the round's changes newest
+    /// first, and on one answer to a repair digest. The wire codec splits a
+    /// frame into packets.
     pub max_cells_per_tick: usize,
     /// Per-packet UDP budget + decoder safety limits.
     pub wire_limits: FrameLimits,

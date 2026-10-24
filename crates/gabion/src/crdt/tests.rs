@@ -518,7 +518,7 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(rows: RemoteRows, current_seed
 }
 
 #[quickcheck]
-fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
+fn quickcheck_gossip_frames_are_bounded_current_and_unique(
     rows: RemoteRows,
     max_seed: u8,
 ) -> TestResult {
@@ -530,8 +530,8 @@ fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
 
     let max_cells = (max_seed as usize % 32) + 1;
     let mut out = Vec::with_capacity(max_cells);
-    let changes = store.fill_gossip_frame(max_cells, max_cells, None, &mut out);
-    if changes > out.len() || out.len() > max_cells {
+    store.fill_gossip_frame(max_cells, None, &mut out);
+    if out.len() > max_cells {
         return TestResult::failed();
     }
     let mut unique = BTreeSet::new();
@@ -540,72 +540,32 @@ fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
             return TestResult::failed();
         }
     }
-
-    store.clear_dirty();
-    let expected: BTreeSet<u32> = store.active_handles().map(|h| h.index).collect();
-    let mut seen = BTreeSet::new();
-    let mut one = Vec::with_capacity(1);
-    for _ in 0..(store.capacity() * 2) {
-        store.fill_gossip_frame(1, 1, None, &mut one);
-        if let Some(handle) = one.first() {
-            if store.get(*handle).is_none() {
-                return TestResult::failed();
-            }
-            seen.insert(handle.index);
-        }
-        if seen == expected {
-            return TestResult::passed();
-        }
-    }
-    TestResult::from_bool(seen == expected)
+    TestResult::passed()
 }
 
 #[quickcheck]
-fn quickcheck_repair_lane_sweeps_active_despite_acked_frontier(
-    rows: RemoteRows,
-    ack_seed: u8,
-) -> bool {
+fn quickcheck_visit_active_sees_every_active_cell_once(rows: RemoteRows) -> bool {
     let mut store = quickcheck_store();
     apply_remote_rows(&mut store, &rows.0);
-    // Drop the dirty rings so the frame is composed purely by the repair lane.
-    store.clear_dirty();
-    let peer_slot = store
-        .peer_frontiers_mut()
-        .intern_peer(NodeId(0x999))
-        .unwrap();
-
-    let active: Vec<CellRow<u32>> = store
+    let expected: BTreeMap<u32, (NodeSlot, u64, u64)> = store
         .active_handles()
-        .map(|h| store.get(h).unwrap())
+        .map(|h| {
+            let row = store.get(h).unwrap();
+            (
+                h.index,
+                (row.key.origin, row.origin_sequence, row.last_update_millis),
+            )
+        })
         .collect();
-    // Ack roughly half the origins through their current sequence.
-    for row in &active {
-        if ((row.key.origin as u8).wrapping_add(ack_seed) & 1) == 0 {
-            store
-                .peer_frontiers_mut()
-                .record_acked(peer_slot, row.key.origin, row.origin_sequence);
-        }
-    }
-
-    // The repair lane is the convergence backstop: it ignores the frontier, so
-    // a full-capacity sweep re-sends *every* active cell, acked or not. Pruning
-    // it by `last_acked` is exactly what stranded a cell forever in the
-    // partition-heal flake.
-    let expected: BTreeSet<u32> = active.iter().map(|row| row.handle.index).collect();
-
-    let mut out = Vec::with_capacity(store.capacity() as usize);
-    store.fill_gossip_frame(
-        store.capacity() as usize,
-        store.capacity() as usize,
-        Some(peer_slot),
-        &mut out,
-    );
-    let got: BTreeSet<u32> = out.iter().map(|h| h.index).collect();
-
-    got == expected
-        && out.len() == got.len()
-        && out.iter().all(|h| store.get(*h).is_some())
-        && assert_structural_invariants(&store)
+    let mut seen = BTreeMap::new();
+    let mut duplicate = false;
+    store.visit_active(|handle, origin, sequence, last_update| {
+        duplicate |= seen
+            .insert(handle.index, (origin, sequence, last_update))
+            .is_some();
+        true
+    });
+    !duplicate && seen == expected
 }
 
 #[test]
@@ -746,13 +706,30 @@ fn dirty_ring_yields_each_changed_cell_once() {
     remote_merge_one(&mut store, 0x11, 10, 1, 9, 0);
     remote_merge_one(&mut store, 0x11, 20, 1, 3, 0);
 
-    // Three ring entries, two cells: the superseded entry is skipped, and
-    // the dirty lanes alone (no repair) yield each changed cell once.
+    // Three ring entries, two cells: the superseded entry is skipped, so
+    // the dirty lanes yield each changed cell once.
     let mut out = Vec::with_capacity(4);
-    store.fill_gossip_frame(4, 0, None, &mut out);
+    store.fill_gossip_frame(4, None, &mut out);
     assert_eq!(store.forwarded_dirty().len(), 3);
     assert_eq!(out.len(), 2);
     assert!(out.iter().all(|h| store.resolve(*h).is_some()));
+}
+
+#[test]
+fn repaired_cells_are_held_not_forwarded() {
+    let mut store = small_store(4, 16);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut sink = DeltaSink::with_capacity(4);
+    let mut obs = ObservationBatch::with_capacity(1);
+    obs.push(observation(0x11, 0xabc, 0, 10, 1, 5_u32, 0));
+    store.merge_repair(&obs, &mut sink);
+    assert_eq!(sink.len(), 1, "a repair still raises the count");
+    assert_eq!(store.forwarded_dirty().len(), 0);
+
+    obs.clear();
+    obs.push(observation(0x11, 0xabc, 0, 10, 1, 7_u32, 0));
+    store.merge_remote(&obs, &mut sink);
+    assert_eq!(store.forwarded_dirty().len(), 1, "news is forwarded once");
 }
 
 #[test]
@@ -778,7 +755,7 @@ fn clear_dirty_keeps_cells_but_drops_change_record() {
 }
 
 #[test]
-fn gossip_frame_prioritizes_local_then_forwarded_then_repair() {
+fn gossip_frame_carries_local_then_forwarded_changes_only() {
     let mut store = small_store(8, 8);
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
 
@@ -792,7 +769,7 @@ fn gossip_frame_prioritizes_local_then_forwarded_then_repair() {
     local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 1);
 
     let mut out = Vec::with_capacity(3);
-    store.fill_gossip_frame(3, 3, None, &mut out);
+    store.fill_gossip_frame(3, None, &mut out);
     let origins: Vec<u128> = out
         .iter()
         .map(|h| {
@@ -806,10 +783,9 @@ fn gossip_frame_prioritizes_local_then_forwarded_then_repair() {
         })
         .collect();
 
-    // First two are dirty (local then forwarded), third is repair.
-    assert_eq!(origins[0], 1);
-    assert_eq!(origins[1], 2);
-    assert_eq!(origins[2], 3);
+    // Local then forwarded; origin 3 did not change since the last round,
+    // so the frame leaves it to repair.
+    assert_eq!(origins, [1, 2]);
 }
 
 #[test]
@@ -820,7 +796,7 @@ fn gossip_frame_forwards_remote_dirty_cells_without_local_dirty() {
     remote_merge_one(&mut store, 0x11, 3, 1, 30, 0);
 
     let mut out = Vec::with_capacity(2);
-    store.fill_gossip_frame(2, 2, None, &mut out);
+    store.fill_gossip_frame(2, None, &mut out);
     let mut origins: Vec<u128> = out
         .iter()
         .map(|h| {
@@ -845,74 +821,12 @@ fn gossip_frame_over_budget_keeps_the_newest_changes() {
     }
 
     let mut out = Vec::with_capacity(2);
-    store.fill_gossip_frame(2, 0, None, &mut out);
+    store.fill_gossip_frame(2, None, &mut out);
     let keys: Vec<u128> = out
         .iter()
         .map(|h| store.get(*h).unwrap().key.key_hash.0)
         .collect();
     assert_eq!(keys, vec![4, 3]);
-}
-
-#[test]
-fn gossip_frame_caps_the_repair_slice() {
-    let mut store = small_store(8, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
-    for origin in 1..=4 {
-        remote_merge_one(&mut store, 0x11, origin, 1, 1, 0);
-    }
-    store.clear_dirty();
-    local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 0);
-
-    // The local change plus one repair cell, though the budget fits all five.
-    let mut out = Vec::with_capacity(8);
-    store.fill_gossip_frame(8, 1, None, &mut out);
-    assert_eq!(out.len(), 2);
-}
-
-#[test]
-fn repair_slice_rotates_across_active_cells() {
-    let mut store = small_store(4, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
-    for origin in 1..=3 {
-        remote_merge_one(&mut store, 0x11, origin, 1, origin as u32, 0);
-    }
-    store.clear_dirty();
-
-    let mut out = Vec::with_capacity(1);
-    store.fill_gossip_frame(1, 1, None, &mut out);
-    let first = store
-        .node_dictionary()
-        .descriptor(store.get(out[0]).unwrap().key.origin)
-        .unwrap()
-        .node_id
-        .0;
-    store.fill_gossip_frame(1, 1, None, &mut out);
-    let second = store
-        .node_dictionary()
-        .descriptor(store.get(out[0]).unwrap().key.origin)
-        .unwrap()
-        .node_id
-        .0;
-    store.fill_gossip_frame(1, 1, None, &mut out);
-    let third = store
-        .node_dictionary()
-        .descriptor(store.get(out[0]).unwrap().key.origin)
-        .unwrap()
-        .node_id
-        .0;
-    store.fill_gossip_frame(1, 1, None, &mut out);
-    let fourth = store
-        .node_dictionary()
-        .descriptor(store.get(out[0]).unwrap().key.origin)
-        .unwrap()
-        .node_id
-        .0;
-
-    let mut seen = vec![first, second, third];
-    seen.sort();
-    assert_eq!(seen, vec![1, 2, 3]);
-    // Fourth wrap returns to one of the previously seen origins.
-    assert!([1_u128, 2, 3].contains(&fourth));
 }
 
 // --- New tests required by the plan -----------------------------------
@@ -1175,7 +1089,7 @@ fn selection_epoch_dedupes_within_frame() {
     local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 0);
     local_increment_one(&mut store, 0x11, 0xabc, 0, 2, 0);
     let mut out = Vec::with_capacity(8);
-    store.fill_gossip_frame(8, 8, None, &mut out);
+    store.fill_gossip_frame(8, None, &mut out);
     let mut indices: Vec<u32> = out.iter().map(|h| h.index).collect();
     indices.sort();
     indices.dedup();
@@ -1219,7 +1133,7 @@ fn robin_hood_backshift_keeps_probe_bounded() {
 }
 
 #[test]
-fn repair_cursor_skips_freed_slots() {
+fn visit_active_skips_freed_slots() {
     let mut store = small_store(8, 16);
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     // Insert 4 cells at known origins.
@@ -1234,20 +1148,14 @@ fn repair_cursor_skips_freed_slots() {
     store.free_cell_at(h3.index);
     assert_eq!(store.active_len(), 2);
 
-    // Repair visits exactly the active 2.
+    // The scan behind every repair digest visits exactly the active 2.
     let mut seen = Vec::with_capacity(4);
-    let mut out = Vec::with_capacity(4);
-    for _ in 0..4 {
-        store.fill_gossip_frame(1, 1, None, &mut out);
-        if let Some(h) = out.first() {
-            seen.push(h.index);
-        }
-    }
-    // Across 4 calls, only the 2 active slots are returned (each twice).
-    let mut unique = seen.clone();
-    unique.sort();
-    unique.dedup();
-    assert_eq!(unique.len(), 2);
+    store.visit_active(|h, _, _, _| {
+        seen.push(h.index);
+        true
+    });
+    assert_eq!(seen.len(), 2);
+    assert!(!seen.contains(&h1.index) && !seen.contains(&h3.index));
 }
 
 #[test]
@@ -1657,7 +1565,7 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
 }
 
 #[test]
-fn peer_frame_prunes_dirty_but_repairs_acked() {
+fn peer_frame_prunes_acked_changes() {
     let mut store = small_store(8, 8);
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
 
@@ -1679,29 +1587,12 @@ fn peer_frame_prunes_dirty_but_repairs_acked() {
         .peer_frontiers_mut()
         .record_acked(peer_slot, row2.key.origin, row2.origin_sequence);
 
-    // A single-cell budget never reaches the repair lane, so the frame is
-    // composed purely from the dirty lanes — which prune the two acked cells,
-    // leaving only the unacked one. This is the latency optimization.
-    let mut dirty_only = Vec::with_capacity(8);
-    store.fill_gossip_frame(1, 1, Some(peer_slot), &mut dirty_only);
-    assert_eq!(dirty_only.len(), 1);
-    assert_eq!(dirty_only[0].index, h3.index);
-
-    // With budget to spare, the repair lane sweeps the whole active set
-    // regardless of the frontier and backfills the acked cells too — the
-    // convergence backstop the frontier doc comment delegates to it. All three
-    // cells ride out. (Pre-fix, the repair lane also pruned by `last_acked`,
-    // so the acked cells were suppressed forever — the partition-heal flake.)
-    let mut full = Vec::with_capacity(8);
-    store.fill_gossip_frame(8, 8, Some(peer_slot), &mut full);
-    let mut got: Vec<u32> = full.iter().map(|h| h.index).collect();
-    got.sort_unstable();
-    let mut want = [h1.index, h2.index, h3.index];
-    want.sort_unstable();
-    assert_eq!(
-        got, want,
-        "repair lane must backfill cells the frontier marks acked"
-    );
+    // The dirty lanes prune the two acked cells, leaving only the unacked
+    // one. This is the latency optimization; repair never consults it.
+    let mut frame = Vec::with_capacity(8);
+    store.fill_gossip_frame(8, Some(peer_slot), &mut frame);
+    assert_eq!(frame.len(), 1);
+    assert_eq!(frame[0].index, h3.index);
 }
 
 // --- Coverage extensions (Gaps 1-6) -----------------------------------
@@ -1857,26 +1748,6 @@ fn predict_gossip_order(store: &CellStore<u32>, max_cells: usize) -> Vec<CellHan
             continue;
         }
         out.push(entry.handle);
-    }
-    if out.len() >= max_cells {
-        return out;
-    }
-
-    // Lane 3: rotating repair slice.
-    let mut visited = 0_u32;
-    while visited < cap && out.len() < max_cells {
-        let slot = (store.repair_cursor() + visited) % cap;
-        visited += 1;
-        if (store.generations[slot as usize] & 1) != 1 {
-            continue;
-        }
-        if !marks.insert(slot) {
-            continue;
-        }
-        out.push(CellHandle {
-            index: slot,
-            generation: store.generations[slot as usize],
-        });
     }
     out
 }
@@ -2263,14 +2134,12 @@ fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
     stored == expected
 }
 
-// --- Gap 4: peer-aware frame across all three lanes ----------------------
+// --- Gap 4: peer-aware frame across both dirty lanes ---------------------
 
 #[quickcheck]
-fn quickcheck_peer_frame_across_all_lanes(rows: RemoteRows, ack_seed: u8) -> bool {
+fn quickcheck_peer_frame_is_the_unacked_changes(rows: RemoteRows, ack_seed: u8) -> bool {
     let mut store = quickcheck_store();
     apply_remote_rows(&mut store, &rows.0);
-    // No `clear_dirty` here — exercise the union across local, forwarded,
-    // and repair lanes simultaneously.
     let peer_slot = store
         .peer_frontiers_mut()
         .intern_peer(NodeId(0x999))
@@ -2288,24 +2157,27 @@ fn quickcheck_peer_frame_across_all_lanes(rows: RemoteRows, ack_seed: u8) -> boo
         }
     }
 
-    // Dirty lanes prune by the frontier, but the repair lane backfills
-    // unconditionally, so a full-capacity sweep across all three lanes is every
-    // active cell regardless of which origins were acked.
-    let expected: BTreeSet<u32> = active.iter().map(|row| row.handle.index).collect();
+    // A full-capacity frame is every current change the frontier does not
+    // mark acked, each once.
+    let expected: BTreeSet<u32> = store
+        .local_dirty()
+        .iter()
+        .chain(store.forwarded_dirty().iter())
+        .filter(|entry| {
+            store.get(entry.handle).is_some_and(|row| {
+                row.origin_sequence == entry.origin_sequence
+                    && row.origin_sequence
+                        > store.peer_frontiers().last_acked(peer_slot, row.key.origin)
+            })
+        })
+        .map(|entry| entry.handle.index)
+        .collect();
 
     let mut out = Vec::with_capacity(store.capacity() as usize);
-    store.fill_gossip_frame(
-        store.capacity() as usize,
-        store.capacity() as usize,
-        Some(peer_slot),
-        &mut out,
-    );
+    store.fill_gossip_frame(store.capacity() as usize, Some(peer_slot), &mut out);
     let got: BTreeSet<u32> = out.iter().map(|h| h.index).collect();
 
-    got == expected
-        && out.len() == got.len()
-        && out.iter().all(|h| store.get(*h).is_some())
-        && assert_structural_invariants(&store)
+    got == expected && out.len() == got.len() && assert_structural_invariants(&store)
 }
 
 // --- Gap 5: lane priority as ordered prediction --------------------------
@@ -2324,7 +2196,7 @@ fn quickcheck_gossip_frame_order_matches_lane_model(ops: MixedOps, max_seed: u8)
     let max_cells = (max_seed as usize % 32) + 1;
     let predicted = predict_gossip_order(&store, max_cells);
     let mut got = Vec::with_capacity(max_cells);
-    store.fill_gossip_frame(max_cells, max_cells, None, &mut got);
+    store.fill_gossip_frame(max_cells, None, &mut got);
     TestResult::from_bool(predicted == got)
 }
 

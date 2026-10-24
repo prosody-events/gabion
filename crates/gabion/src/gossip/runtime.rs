@@ -21,13 +21,14 @@ use crate::crdt::{
     ObservationBatch,
 };
 use crate::discovery::PeerEvent;
-use crate::wire::{self, PacketBuf, Packets, WireScratch};
+use crate::wire::{self, DigestPackets, FrameKind, PacketBuf, Packets, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
+use super::repair::{DigestBuilder, DigestReader};
 use super::store::AggregateStore;
 use super::transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
@@ -108,6 +109,11 @@ where
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
+    digest_builder: DigestBuilder,
+    digest_reader: DigestReader,
+    // Cells this node may still send in answer to repair digests before its
+    // next heartbeat refills it to `GOSSIP_REPAIR_CELLS_PER_ROUND`.
+    repair_budget: usize,
 
     // Outbound send pool.
     send_pool: Vec<PacketBuf>,
@@ -267,6 +273,8 @@ where
         let sink_buf = DeltaSink::<C>::with_capacity(config.max_cells_per_tick);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
+        let digest_builder = DigestBuilder::for_store(&store);
+        let digest_reader = DigestReader::for_store(&store);
 
         let send_pool_size = config.send_queue_capacity.max(1);
         let send_pool: Vec<PacketBuf> = (0..send_pool_size)
@@ -306,6 +314,9 @@ where
             sink_buf,
             expiration_buf,
             frame_handles,
+            digest_builder,
+            digest_reader,
+            repair_budget: 0,
             send_pool,
             send_pending,
             send_free,
@@ -504,6 +515,10 @@ where
     }
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
+        if wire::frame_kind(&self.recv_buf[..n]) == FrameKind::Digest {
+            self.answer_digest(n, src);
+            return;
+        }
         self.obs_buf.clear();
         self.ack_buf.clear();
         self.sink_buf.clear();
@@ -547,29 +562,16 @@ where
         let summary = match decoded {
             Ok(s) => s,
             Err(err) => {
-                self.decode_reject_count = self.decode_reject_count.saturating_add(1);
-                if self.decode_reject_count.is_power_of_two() {
-                    tracing::warn!(
-                        peer = %src,
-                        error = %err,
-                        rejected_total = self.decode_reject_count,
-                        "Could not understand a gossip message from this \
-                         peer; dropping it. Common causes: the peer is \
-                         running a different gabion version, the peers are \
-                         configured with different counter sizes \
-                         (`storage.count_width`), the cluster authentication \
-                         key (`gossip.auth_key`) does not match between \
-                         peers, or the peer is sending messages larger than \
-                         this node's `gossip.max_payload_bytes`. Check the \
-                         peer's version and gabion config to find the \
-                         mismatch.",
-                    );
-                }
+                self.note_decode_reject(src, err);
                 return;
             }
         };
 
-        self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
+        if summary.flags & wire::FLAG_REPAIR == 0 {
+            self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
+        } else {
+            self.store.merge_repair(&self.obs_buf, &mut self.sink_buf);
+        }
 
         // Frontier update — latency optimization. Best-effort: missing slot
         // or missing node entry just means we don't get the skip.
@@ -593,6 +595,78 @@ where
                 peer.node_id = Some(sender_id);
                 peer.peer_slot = Some(peer_slot);
             }
+        }
+    }
+
+    fn note_decode_reject(&mut self, src: SocketAddr, err: wire::DecodeError) {
+        self.decode_reject_count = self.decode_reject_count.saturating_add(1);
+        if self.decode_reject_count.is_power_of_two() {
+            tracing::warn!(
+                peer = %src,
+                error = %err,
+                rejected_total = self.decode_reject_count,
+                "Could not understand a gossip message from this \
+                 peer; dropping it. Common causes: the peer is \
+                 running a different gabion version, the peers are \
+                 configured with different counter sizes \
+                 (`storage.count_width`), the cluster authentication \
+                 key (`gossip.auth_key`) does not match between \
+                 peers, or the peer is sending messages larger than \
+                 this node's `gossip.max_payload_bytes`. Check the \
+                 peer's version and gabion config to find the \
+                 mismatch.",
+            );
+        }
+    }
+
+    /// Answer one packet of a peer's repair digest with the cells it shows
+    /// the peer lacks, from what is left of this heartbeat's repair budget.
+    /// The answer is an ordinary gossip frame. The peer may not be in the
+    /// peer list yet (a new node pulling the window before discovery has
+    /// announced it), so it goes back to the address it came from.
+    fn answer_digest(&mut self, n: usize, src: SocketAddr) {
+        let reader = &mut self.digest_reader;
+        reader.begin();
+        let decoded = wire::decode_digest_visit(
+            &self.recv_buf[..n],
+            self.config.auth_key.as_ref(),
+            self.config.wire_limits,
+            |entry| reader.push(entry),
+        );
+        let (header, scope) = match decoded {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                self.note_decode_reject(src, err);
+                return;
+            }
+        };
+        reader.set_scope(scope);
+        // Expire first: the requester expired its cells when it built the
+        // digest, so a cell whose bucket has since left the window would read
+        // as lacked and be resent only to expire again.
+        let now_millis = self.clock.now_millis();
+        self.expiration_buf.clear();
+        self.store.expire_at(now_millis, &mut self.expiration_buf);
+        let settle = self
+            .config
+            .tick_interval
+            .mul_f64(crate::defaults::GOSSIP_REPAIR_SETTLE_TICKS);
+        self.frame_handles.clear();
+        if let Some(settled_at) = now_millis.checked_sub(settle.as_millis() as u64) {
+            let max_cells = self.repair_budget.min(self.frame_handles.capacity());
+            reader.cells_lacked(&self.store, max_cells, settled_at, &mut self.frame_handles);
+        }
+        if !self.frame_handles.is_empty() {
+            self.repair_budget -= self.frame_handles.len();
+            // A repair answer cut short by a full send queue is not worth a
+            // warning: the peer's next digest asks again.
+            let free = self.send_free.len();
+            self.encode_packets_for(src, free, wire::FLAG_REPAIR);
+        }
+        // Push-pull: once the peer's whole digest is in, send ours back so
+        // the peer answers what this node lacks in the same exchange.
+        if header.flags & (wire::FLAG_REPLY | wire::FLAG_MORE) == 0 {
+            self.send_digest(src, wire::FLAG_REPLY);
         }
     }
 
@@ -734,10 +808,14 @@ where
         self.expiration_buf.clear();
         self.store.expire_at(now_millis, &mut self.expiration_buf);
 
-        // Nothing to send, or nobody to send it to: the changes are owed to
-        // no one, so settle the round rather than let them pile up in the
-        // rings and re-trigger threshold rounds on every request.
-        if self.store.is_empty() || self.peers.is_empty() {
+        // Nobody to send to, or (outside a heartbeat, which also sends the
+        // repair digest) nothing to send: the changes are owed to no one, so
+        // settle the round rather than let them pile up in the rings and
+        // re-trigger threshold rounds on every request. A node with an empty
+        // store still sends its heartbeat digest, so a new node pulls the
+        // live window.
+        let heartbeat = matches!(round, Round::Heartbeat);
+        if self.peers.is_empty() || (self.store.is_empty() && !heartbeat) {
             self.end_round(now_millis);
             return;
         }
@@ -789,12 +867,14 @@ where
 
         // Anti-entropy with one random partner per heartbeat (Demers et al.,
         // PODC 1987): the shuffle above makes the first pick random, so it
-        // alone carries the repair slice. The changes go to every pick.
+        // alone gets this node's repair digest and answers with the repair
+        // slice. The heartbeat also refills the budget this node answers
+        // other nodes' digests from. The changes go to every pick.
+        if heartbeat {
+            self.repair_budget = crate::defaults::GOSSIP_REPAIR_CELLS_PER_ROUND;
+            self.send_digest(self.peers[0].addr, 0);
+        }
         let mut sent_changes = false;
-        let mut repair_cells = match round {
-            Round::Heartbeat => crate::defaults::GOSSIP_REPAIR_CELLS_PER_ROUND,
-            Round::Threshold => 0,
-        };
         for peer_idx in 0..pick_count {
             // An even share of the free send slots, so one large frame cannot
             // take the whole pool and leave later picks with nothing. A frame
@@ -808,22 +888,23 @@ where
             // `peer_slot` alone decides pruning. `None` (not heard from yet)
             // sends an unpruned frame; the peer's next inbound caches it.
             let peer_slot = self.peers[peer_idx].peer_slot;
-            let changes = self.store.fill_gossip_frame(
+            self.store.fill_gossip_frame(
                 self.config.max_cells_per_tick,
-                repair_cells,
                 peer_slot,
                 &mut self.frame_handles,
             );
-            repair_cells = 0;
             if self.frame_handles.is_empty() {
                 continue;
             }
-            sent_changes |= changes > 0;
-            self.encode_packets_for(peer_addr, share, changes);
+            sent_changes = true;
+            let unsent = self.encode_packets_for(peer_addr, share, 0);
+            if unsent > 0 {
+                self.note_frame_cut(peer_addr, unsent);
+            }
         }
         // A round that carried changes is a "dirty tick", so effective fanout
         // reports `packets / dirty_ticks` rather than `packets / wall_ticks`;
-        // a quiet heartbeat sends only the repair slice. Record the pick too,
+        // a quiet heartbeat sends only the repair digest. Record the pick too,
         // so observers can read the coverage fanout of the most recent round
         // that sent changes instead of reconstructing the formula.
         if sent_changes {
@@ -871,11 +952,33 @@ where
         }
     }
 
-    /// Encode the frame into at most `max_packets` send slots. The frame's
-    /// first `changes` handles are changes and the rest repair, so a cut
-    /// trims repair first; only a cut into the changes is worth a warning.
-    fn encode_packets_for(&mut self, dst: SocketAddr, max_packets: usize, changes: usize) {
-        let header = wire::Header {
+    /// Send this node's repair digest to `dst`, one packet per send slot
+    /// while slots last. A packet that finds no slot is simply not sent: each
+    /// packet speaks for its own range of origins, so the peer answers the
+    /// rest, and the next heartbeat's digest asks again.
+    fn send_digest(&mut self, dst: SocketAddr, flags: u16) {
+        let header = self.frame_header(flags);
+        let entries = self.digest_builder.build(&self.store);
+        let Ok(mut packets) = DigestPackets::new(
+            header,
+            entries,
+            self.config.auth_key.as_ref(),
+            self.config.wire_limits,
+        ) else {
+            return;
+        };
+        while let Some(slot) = self.send_free.pop() {
+            if packets.next_into(&mut self.send_pool[slot]) {
+                self.send_pending.push_back((dst, slot));
+            } else {
+                self.send_free.push(slot);
+                return;
+            }
+        }
+    }
+
+    fn frame_header(&self, flags: u16) -> wire::Header {
+        wire::Header {
             cluster_id_hash: self.config.cluster_id_hash,
             sender_node_id: self.store.local_identity().node_id.0,
             sender_incarnation: self.store.local_identity().incarnation,
@@ -884,9 +987,15 @@ where
             body_len: 0,
             min_origin_sequence: 0,
             max_origin_sequence: 0,
-            flags: 0,
-        };
+            flags,
+        }
+    }
 
+    /// Encode `frame_handles` into at most `max_packets` send slots, with
+    /// `flags` on every packet. Returns how many handles were left unsent:
+    /// the frame's tail.
+    fn encode_packets_for(&mut self, dst: SocketAddr, max_packets: usize, flags: u16) -> usize {
+        let header = self.frame_header(flags);
         let Ok(mut packets) = (match self.config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
                 header,
@@ -904,7 +1013,7 @@ where
                 self.config.wire_limits,
             ),
         }) else {
-            return;
+            return 0;
         };
 
         for _ in 0..max_packets {
@@ -925,25 +1034,11 @@ where
                     debug_assert!(false, "gossip packet encoding failed mid-frame");
                     self.send_free.push(slot);
                     packets.abandon();
-                    return;
+                    return 0;
                 }
             }
         }
-        let unsent = packets.abandon();
-        if unsent == 0 {
-            return;
-        }
-        // The repair cells are the frame's tail, in cursor order. Resume the
-        // sweep at the first one not sent, so a cut slice goes out on the
-        // next heartbeat instead of waiting a whole rotation.
-        let first_unsent = self.frame_handles.len() - unsent;
-        if let Some(&handle) = self.frame_handles.get(first_unsent.max(changes)) {
-            self.store.resume_repair_at(handle);
-        }
-        let unsent_changes = changes.saturating_sub(first_unsent);
-        if unsent_changes > 0 {
-            self.note_frame_cut(dst, unsent_changes);
-        }
+        packets.abandon()
     }
 
     fn note_frame_cut(&mut self, peer: SocketAddr, unsent_changes: usize) {
@@ -977,8 +1072,8 @@ enum ArmOutcome {
 }
 
 /// What started a gossip round. Both send the changes since the last round;
-/// only the heartbeat carries a repair slice, so a burst of threshold fires
-/// cannot multiply repair traffic.
+/// only the heartbeat sends a repair digest and refills the repair budget, so
+/// a burst of threshold fires cannot multiply repair traffic.
 #[derive(Clone, Copy)]
 enum Round {
     Heartbeat,

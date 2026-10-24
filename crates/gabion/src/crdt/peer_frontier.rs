@@ -8,7 +8,7 @@ use super::{NodeId, NodeSlot};
 /// later sequence and still lack an earlier one (a lost datagram leaves a
 /// gap a single watermark cannot represent), so it is a hint, not an
 /// acknowledgement. **Latency optimization only** —
-/// convergence is guaranteed by the repair lane, not by this table.
+/// convergence is guaranteed by digest repair, not by this table.
 #[derive(Clone, Debug)]
 pub struct PeerFrontierTable {
     peer_ids: Box<[Option<NodeId>]>,

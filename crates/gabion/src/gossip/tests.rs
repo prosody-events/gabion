@@ -1987,9 +1987,9 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            // One record on A. Each tick re-encodes A's dirty cell into a
-            // packet for its only peer (B). B rejects each packet because
-            // the auth keys don't match.
+            // One record on A. The first round sends it to A's only peer (B),
+            // and every heartbeat sends B a repair digest. B rejects each
+            // packet because the auth keys don't match.
             client_a
                 .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
                 .await
@@ -2009,7 +2009,7 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
                 TICKS
             );
             assert!(
-                snap.decode_reject_count <= (TICKS as u64) + 1,
+                snap.decode_reject_count <= (TICKS as u64) + 2,
                 "decode_reject_count too high: {} (after {} ticks)",
                 snap.decode_reject_count,
                 TICKS
@@ -2104,10 +2104,11 @@ async fn send_queue_drains_after_recipient_backpressure() {
         .await;
 }
 
-/// A round sends each change once, to every pick. Later heartbeats with no
-/// new changes carry only the repair slice, to a single pick.
+/// A round sends each change once, to every pick. Every heartbeat also sends
+/// its repair digest, one packet here, to a single pick; later heartbeats
+/// with no new changes send only that.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn round_sends_each_change_once_then_repairs_one_pick() {
+async fn round_sends_each_change_once_then_digests_one_pick() {
     let local = LocalSet::new();
     local
         .run_until(async {
@@ -2137,10 +2138,10 @@ async fn round_sends_each_change_once_then_repairs_one_pick() {
             let picks = ((f64::from(PEERS)).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN)
                 .ceil()
                 .min(f64::from(PEERS)) as u64;
-            assert_eq!(received(), picks);
+            assert_eq!(received(), picks + 1);
 
             sim_advance_ticks(Duration::from_millis(100), 5).await;
-            assert_eq!(received(), picks + 5);
+            assert_eq!(received(), picks + 6);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;
@@ -2157,15 +2158,16 @@ async fn send_queue_uses_every_slot_past_255() {
     let local = LocalSet::new();
     local
         .run_until(async {
-            const CELLS: u128 = 300;
+            const KEYS: u128 = 50;
+            const ROUNDS: usize = 6;
             let router = SimRouter::with_channel_capacity(1);
             let addr_b = sock(53_001);
             // Bound but never run, so every packet past the first queues.
             let _inbox = router.bind(addr_b);
             let id = NodeIdentity::new(NodeId(0xD0), 1);
             let mut cfg = sim_config(id, vec![addr_b], 1);
-            cfg.send_queue_capacity = CELLS as usize;
-            // One cell per packet, so the round needs a slot per cell.
+            cfg.send_queue_capacity = KEYS as usize * ROUNDS;
+            // One cell per packet, so each change needs a slot.
             cfg.wire_limits.max_payload_bytes = 160;
             let (admin_tx, admin_rx) = mpsc::channel(4);
             let (rt, client) = GossipRuntime::from_parts_with_admin(
@@ -2178,13 +2180,17 @@ async fn send_queue_uses_every_slot_past_255() {
             );
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
-            for key in 0..CELLS {
-                client
-                    .record(0xD05, KeyHash(key), 0, 1, 1_000_000, 0)
-                    .await
-                    .unwrap();
+            // Each round sends the same keys' new counts, one packet each,
+            // and none of them drain.
+            for _ in 0..ROUNDS {
+                for key in 0..KEYS {
+                    client
+                        .record(0xD05, KeyHash(key), 0, 1, 1_000_000, 0)
+                        .await
+                        .unwrap();
+                }
+                sim_advance_ticks(Duration::from_millis(100), 1).await;
             }
-            sim_advance_ticks(Duration::from_millis(100), 2).await;
 
             let depth = admin_snapshot(&admin_tx).await.max_send_pending_depth;
             assert!(depth > 255, "send queue peaked at {depth} slots");
@@ -2195,26 +2201,28 @@ async fn send_queue_uses_every_slot_past_255() {
         .await;
 }
 
-/// A repair slice cut by its pick's send-queue share resumes at the first
-/// cell it did not send. If the cursor kept its place past the cut, every
-/// heartbeat would resend the same leading cells and the rest would never
-/// arrive.
+/// A change cut from its only round reaches the peer through repair: the
+/// peer's digest shows it missing once it has settled, and the answer carries
+/// it.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn cut_repair_slice_resumes_where_it_stopped() {
+async fn changes_cut_from_a_round_arrive_by_digest_repair() {
     let local = LocalSet::new();
     local
         .run_until(async {
-            const CELLS: u128 = 6;
+            const CELLS: u128 = 12;
             let router = SimRouter::new();
             let addr_a = sock(54_000);
             let addr_b = sock(54_001);
             let id_a = NodeIdentity::new(NodeId(0xE0), 1);
             let id_b = NodeIdentity::new(NodeId(0xE1), 1);
 
-            // Two slots of one cell each: every frame is cut after two cells.
+            // Packets of at most two cells, a digest of one origin, and two
+            // send slots: every round is cut to its newest few changes.
             let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
             cfg_a.send_queue_capacity = 2;
-            cfg_a.wire_limits.max_payload_bytes = 160;
+            cfg_a.wire_limits.max_payload_bytes = 200;
+            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+            cfg_b.wire_limits.max_payload_bytes = 200;
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 router.bind(addr_a),
                 TokioClock::from_millis(0),
@@ -2226,7 +2234,7 @@ async fn cut_repair_slice_resumes_where_it_stopped() {
             let (rt_b, client_b) = GossipRuntime::from_parts(
                 router.bind(addr_b),
                 TokioClock::from_millis(0),
-                sim_config(id_b, vec![addr_a], 2),
+                cfg_b,
                 store_for(id_b),
                 agg_b.clone(),
             );
@@ -2234,22 +2242,99 @@ async fn cut_repair_slice_resumes_where_it_stopped() {
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
             // The high limit keeps the error budget from adding threshold
-            // rounds. The round that sends these changes is cut to the newest
-            // two; the rest reach B only through repair.
+            // rounds.
             for key in 0..CELLS {
                 client_a
-                    .record(0xE05, KeyHash(key), 0, 1, 1_000_000, 0)
+                    .record(0xE05, KeyHash(key), 0, 1, 1_000_000, 10)
                     .await
                     .unwrap();
             }
-            sim_advance_ticks(Duration::from_millis(100), 8).await;
+            sim_advance_ticks(Duration::from_millis(100), 1).await;
+            let delivered = agg_b.snapshot().len();
+            assert!(delivered < CELLS as usize, "rounds were cut: {delivered}");
 
+            // Past the settle time (two heartbeats), B's digest pulls the rest.
+            sim_advance_ticks(Duration::from_millis(100), 8).await;
             assert_eq!(agg_b.snapshot().len(), CELLS as usize);
 
             client_a.shutdown().await.unwrap();
             client_b.shutdown().await.unwrap();
             let _ = h_a.await;
             let _ = h_b.await;
+        })
+        .await;
+}
+
+/// Repair is push-pull: a node answers a peer's digest with its own, flagged
+/// as a reply, so the peer can answer what this node lacks in the same
+/// exchange. A reply is not answered with another digest.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_digest_gets_a_reply_digest_and_a_reply_gets_none() {
+    use futures::FutureExt;
+
+    use crate::gossip::GossipTransport;
+    use crate::wire::{DigestPackets, FLAG_DIGEST, FLAG_REPLY, FrameLimits, Header, PacketBuf};
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let router = SimRouter::new();
+            let addr_a = sock(57_000);
+            let addr_x = sock(57_001);
+            // X is a bare socket: the test speaks for it.
+            let x = router.bind(addr_x);
+            let id_a = NodeIdentity::new(NodeId(0xA7), 1);
+            // A long heartbeat keeps A's own digests out of the window.
+            let mut cfg = sim_config(id_a, vec![addr_x], 1);
+            cfg.tick_interval = Duration::from_secs(60);
+            let (rt, client) = GossipRuntime::from_parts(
+                router.bind(addr_a),
+                TokioClock::from_millis(0),
+                cfg,
+                store_for(id_a),
+                Rc::new(InMemoryAggregateStore::<u32>::new()),
+            );
+            let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+            sim_advance(Duration::from_millis(10)).await;
+
+            let mut buf = vec![0_u8; 64 * 1024];
+            let mut drain = |x: &crate::gossip::sim::SimTransport| -> Vec<u16> {
+                let mut flags = Vec::new();
+                while let Some(Ok((n, _))) = x.recv_from(&mut buf).now_or_never() {
+                    assert!(n >= 8);
+                    // Leave out FLAG_MORE and FLAG_AUTHENTICATED.
+                    flags.push(u16::from_le_bytes([buf[6], buf[7]]) & !0x03);
+                }
+                flags
+            };
+            // A's first heartbeat fired at start.
+            assert_eq!(drain(&x), [FLAG_DIGEST]);
+
+            let send = |flags: u16| {
+                let header = Header {
+                    cluster_id_hash: 0xC1,
+                    sender_node_id: 0x77,
+                    sender_incarnation: 1,
+                    flags,
+                    ..Header::default()
+                };
+                let limits = FrameLimits::default();
+                let mut packets = DigestPackets::new(header, &[], None, limits).unwrap();
+                let mut out = PacketBuf::for_limits(limits);
+                assert!(packets.next_into(&mut out));
+                x.try_send_to(out.as_bytes(), addr_a).unwrap();
+            };
+
+            send(0);
+            sim_advance(Duration::from_millis(10)).await;
+            assert_eq!(drain(&x), [FLAG_DIGEST | FLAG_REPLY]);
+
+            send(FLAG_REPLY);
+            sim_advance(Duration::from_millis(10)).await;
+            assert_eq!(drain(&x), Vec::<u16>::new());
+
+            client.shutdown().await.unwrap();
+            let _ = handle.await;
         })
         .await;
 }
@@ -2264,10 +2349,10 @@ async fn round_short_of_send_slots_keeps_its_changes() {
     let local = LocalSet::new();
     local
         .run_until(async {
-            // Each peer holds one undrained packet. The first change reaches
-            // all three; a quiet heartbeat's repair packet and the second
-            // change's three packets then block, leaving one slot of five
-            // for the third change's round.
+            // Each peer holds one undrained packet. The first heartbeat's
+            // digest fills one peer, so the first change's packet to it
+            // blocks the queue's head: three of five slots stay taken, and
+            // the later rounds, short of a slot per pick, keep their changes.
             let router = SimRouter::with_channel_capacity(1);
             let peers: Vec<SocketAddr> = (1..=3).map(|i| sock(56_000 + i)).collect();
             let _inboxes: Vec<_> = peers.iter().map(|addr| router.bind(*addr)).collect();
@@ -2295,8 +2380,8 @@ async fn round_short_of_send_slots_keeps_its_changes() {
             }
 
             let snapshot = admin_snapshot(&admin_tx).await;
-            assert_eq!(snapshot.send_pending_depth, 4);
-            assert_eq!(snapshot.local_dirty_len, 1);
+            assert_eq!(snapshot.send_pending_depth, 3);
+            assert_eq!(snapshot.local_dirty_len, 2);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;

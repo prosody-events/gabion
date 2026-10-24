@@ -567,15 +567,17 @@ delivery mechanism; this section is authoritative for this branch.
   its forwarded dirty ring and sends it in its next round. Both dirty rings
   are cleared at the end of every round, so a change is sent at most once
   per node per change.
-- **Repair slice.** A heartbeat's first pick also carries up to
-  `defaults::GOSSIP_REPAIR_CELLS_PER_ROUND` = 256 cells of a rotating slice
-  over the live cells; threshold rounds carry none. The slice is the only
-  resend path.
+- **Repair slice, chosen by digest.** A heartbeat also sends its first
+  pick a digest of the origin sequences this node holds; threshold rounds
+  send none. The pick answers with the cells the digest shows missing, at
+  most `defaults::GOSSIP_REPAIR_CELLS_PER_ROUND` = 2,048 per heartbeat
+  interval across every digest it answers, and sends its own digest back so
+  the first node answers in turn. The answer is the only resend path.
 - **Frontier is a hint.** The peer frontier only lets the dirty lanes skip a
   cell the peer's frontier says it holds. A cell keeps the sequence its
   origin stamped on it wherever it is relayed, but one watermark per
-  (peer, origin) cannot represent a gap, so the hint can be wrong; the
-  repair slice never consults it, and convergence does not depend on it.
+  (peer, origin) cannot represent a gap, so the hint can be wrong; repair
+  never consults it, and convergence does not depend on it.
 
 Adaptations, each the minimal one:
 
@@ -583,9 +585,8 @@ Adaptations, each the minimal one:
   now queues every pick's whole frame at once, so the pool is sized for a
   round at 300 peers. The pool's slot index widened from `u8` to `usize`
   (a pool above 255 slots wrapped to an empty free list). Each pick gets an
-  even share of the free slots; a frame over its share loses its tail
-  (repair first, then the oldest changes) with a power-of-two rate-limited
-  warning. A round whose picks cannot all get a slot (a blocked socket still
+  even share of the free slots; a frame over its share loses its tail, the
+  oldest changes, with a power-of-two rate-limited warning. A round whose picks cannot all get a slot (a blocked socket still
   draining) is deferred whole, keeping its changes.
 - **The repair slice size is a `defaults` constant, not a `GossipConfig`
   field**, because the legacy scenario suite in `gossip-bench` builds
@@ -598,6 +599,46 @@ Adaptations, each the minimal one:
 - Dirty-ring overflow keeps its cumulative `overflow_seq` across the
   per-round clears so the power-of-two warnings stay spaced; the warning
   text names the new cause.
+- **Digest repair in place of the blind rotation** (the `digest-repair`
+  component; Demers et al.'s anti-entropy compares two replicas and sends
+  only the difference). The baseline slice swept 256 cells per heartbeat
+  over the whole store whether or not anyone lacked them. That cost a fixed
+  share of bandwidth, yet a sweep took longer than the 10 s window at
+  production load, so the ~2 % of single-hit changes that forward-once at
+  `c = 3` leaves short of some node mostly expired unrepaired (1.3 % of
+  tracked hits never converged at `prod-typical`, 16 % during a rollout).
+  The digest is one entry per origin: the highest sequence held and a
+  256-bit map of the sequences below it (`GOSSIP_DIGEST_WINDOW_WORDS`), the
+  codec the `bimodal` arm uses. Each packet of it names the range of origins
+  it speaks for, so packets decode alone. To make the sequences comparable,
+  a relayed cell now keeps the sequence its origin stamped on it instead of
+  being re-stamped by every node that merges it.
+  - *What the answer leaves out.* A cell whose origin changed it less than
+    one and a half heartbeat intervals ago (`GOSSIP_REPAIR_SETTLE_TICKS`) is
+    still spreading; the forwarders deliver it. The answering node also expires
+    its cells first, so a bucket that just left the window is not resent.
+  - *Repair is not news.* Cells that arrive in an answer
+    (`FLAG_REPAIR`) raise the count but are not forwarded: the answering
+    node holds them settled, so they have spread and only the requester
+    lacked them.
+    Each change is still forwarded at most once per node, and only as
+    news.
+  - *Push-pull.* A digest that is not itself a reply gets this node's
+    digest back (`FLAG_REPLY`), so both sides repair in one exchange. A
+    healed partition then repairs in both directions whichever side's
+    heartbeat picks across the cut.
+  - *Bound.* The 256-cell rotation became a 2,048-cell budget per heartbeat
+    interval. The slice now carries only missing cells, so the bound binds
+    only on catch-up (a new node pulling the window, or a zone back from a
+    partition) and costs nothing in steady state; there it sets the pace.
+    At 256 a new node in an 80-node, 650 req/s cluster needs about 15 s to
+    pull a 10 s window, longer than the window itself. 2,048 is half of
+    `rmem_default` at about 52 wire bytes a cell, so one answer cannot fill
+    a receiver's socket buffer.
+  - A node with an empty store still sends its heartbeat digest, so a new
+    node pulls the window from its first pick, which answers to the
+    digest's source address even before discovery has announced the new
+    node to it.
 
 ## References
 

@@ -10,6 +10,14 @@ pub const VERSION: u16 = 1;
 /// receivers that want to defer downstream work until the batch settles.
 pub const FLAG_MORE: u16 = 0x01;
 pub const FLAG_AUTHENTICATED: u16 = 0x02;
+/// The body is a digest of the sender's held origin sequences, not cells.
+pub const FLAG_DIGEST: u16 = 0x04;
+/// The cells answer the receiver's repair digest: changes the receiver
+/// lacked, not news to forward.
+pub const FLAG_REPAIR: u16 = 0x08;
+/// A digest sent back in answer to a peer's digest, so the peer can answer
+/// what this node lacks in turn. It is not answered with another digest.
+pub const FLAG_REPLY: u16 = 0x10;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Header {

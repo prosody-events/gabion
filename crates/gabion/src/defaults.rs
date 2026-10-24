@@ -49,9 +49,9 @@ pub const GOSSIP_FANOUT: usize = 3;
 /// round. So at `c = 3` a change misses at least one node ≈ 4.9 % of the time,
 /// and the expected number of nodes it misses is `e^(−c)` ≈ 0.05. Two things
 /// close that gap without a wider fanout: the next change to the same cell
-/// carries its whole count, and the heartbeat repair slice
-/// ([`GOSSIP_REPAIR_CELLS_PER_ROUND`]) resends every live cell once per
-/// rotation. Packet loss and cut frames push the real miss rate above the
+/// carries its whole count, and the heartbeat repair digest
+/// ([`GOSSIP_REPAIR_CELLS_PER_ROUND`]) finds and resends what a node still
+/// lacks. Packet loss and cut frames push the real miss rate above the
 /// theoretical one, and repair covers those too. So we size to `c = 3` rather
 /// than KMG's validated single-shot `c ≈ 4` (fanout 13 @ 10 000 nodes, 15 @
 /// 50 000): it costs ≈ 1 fewer peer per round at every cluster size (≈ 10 %
@@ -67,33 +67,51 @@ pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;
 /// bounds the packets one round can queue: `⌈ln(n)+c⌉` picks (9 at 300
 /// peers) times each frame's packets. Sized so a round's frames fit whole at
 /// 300 peers and 1,800 changes a second across the cluster: about 1,000 cells
-/// per frame, plus the repair slice on one pick, within a 56-packet share. A
-/// smaller pool still reaches every pick but cuts each frame's tail: repair
-/// first, then the oldest changes, with a warning when changes are cut.
+/// per frame within a 56-packet share, beside a heartbeat's repair digest and
+/// an answer to a peer's. A smaller pool still reaches every pick but cuts
+/// each frame's tail, its oldest changes, with a warning.
 pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 512;
 
-/// Cells of the rotating repair slice a heartbeat sends, to one random pick.
-/// Threshold rounds send none.
+/// Cells a node sends per heartbeat interval in answer to repair digests: the
+/// repair slice. Each heartbeat a node sends a digest of the origin sequences
+/// it holds to its first pick, and the pick answers with the cells the digest
+/// shows missing (anti-entropy after Demers et al., PODC 1987: compare, then
+/// send the difference). Threshold rounds send no digest.
 ///
 /// A round sends each change once, so repair is the only resend: for a
-/// change every forwarder lost, one cut from a full frame or pruned by the
-/// peer frontier, one dropped while a node had no peers, or state a new peer
-/// missed. How much that matters depends on the regime:
-///
-/// - **Large cluster, short window** (300 peers, 10 s): each change reaches
-///   each node through about `⌈ln(n)+c⌉` forwarders, and the next change to a
-///   cell carries its whole count, so a lost packet rarely matters. A sweep of
-///   ~15k live cells at this rate takes longer than the window, so repair is a
-///   backstop costing ~5% of gossip bandwidth.
-/// - **Small cluster or long window**: fewer forwarders, or cells that stop
-///   changing long before they expire. A sweep of a few thousand cells takes
-///   seconds, well inside the window, and the bandwidth is small.
-///
-/// A fixed budget therefore favours novelty where repair cannot pay off and
-/// converges where it can. Kept a `const`, not a `GossipConfig` field: the
-/// legacy scenario suite builds `GossipConfig` literally, and the study harness
-/// leaves it untouched.
-pub const GOSSIP_REPAIR_CELLS_PER_ROUND: usize = 256;
+/// change every forwarder lost, one cut from a full frame, one dropped while
+/// a node had no peers, or state a new peer missed. Because the digest names
+/// what is missing, the slice carries only those cells, so in steady state it
+/// is nearly empty and this bound binds only on catch-up: a new node pulling
+/// the live window, or a zone back from a partition. There it sets the pace,
+/// so it is sized to the receiver rather than to steady state: half of
+/// Linux's `rmem_default` (212,992 bytes) at about 52 wire bytes per cell in a
+/// full packet is about 2,048 cells (about 75 packets), which a new node in an
+/// 80-node, 650 req/s cluster pulls its window in within about two seconds.
+/// Kept a `const`, not a `GossipConfig` field: the legacy scenario suite
+/// builds `GossipConfig` literally, and the study harness leaves it
+/// untouched.
+pub const GOSSIP_REPAIR_CELLS_PER_ROUND: usize = 2048;
+
+/// A repair answer leaves out a cell whose origin changed it less than this
+/// many heartbeat intervals ago (by the cell's own `last_update_millis`):
+/// that change is most likely still spreading through the forwarders, and
+/// answering it would hand the requester, as repair it does not forward, a
+/// change it should receive and forward as news. One and a half: a change
+/// can wait up to one heartbeat at its origin before its first round, and
+/// spreading after that takes a few hundred milliseconds. A shorter settle
+/// repairs a lost change sooner (about 0.65 s at p99 with one interval
+/// against 0.93 s with one and a half at 80 nodes in the study harness).
+pub const GOSSIP_REPAIR_SETTLE_TICKS: f64 = 1.5;
+
+/// Words of the per-origin held-sequence bitmap in a digest entry. The
+/// bitmap covers `64 * words` sequences below the origin's maximum (256 by
+/// default); a gap further back than that is assumed held and never
+/// repaired. Each word adds 8 bytes to every digest entry. 256 covers an
+/// origin's live window when it changes up to about 20 cells a second over a
+/// 10 s window; an origin that changes more, such as a long-window rule at a
+/// high per-origin hit rate, can have older losses that repair cannot see.
+pub const GOSSIP_DIGEST_WINDOW_WORDS: usize = 4;
 pub const GOSSIP_LIMIT_QUEUE_CAPACITY: usize = 8192;
 pub const GOSSIP_CLUSTER_ID_HASH: u128 = 1;
 
