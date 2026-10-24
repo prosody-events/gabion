@@ -629,6 +629,7 @@ where
     /// Queue the cells the last local hit raised, to go out in the next
     /// heartbeat or threshold round.
     pub(super) fn queue_local_changes(&mut self) {
+        self.track_settled();
         for &handle in &self.sink_buf.handles {
             if let Some(row) = self.store.get(handle) {
                 self.pt.off_tree[handle.index as usize] = false;
@@ -896,7 +897,6 @@ where
         let Some(dst) = self.random_peer() else {
             return;
         };
-        self.pt.sums_at = None;
         self.settled_sums(now);
         let mut entries = std::mem::take(&mut self.pt.entries);
         entries.clear();
@@ -919,6 +919,35 @@ where
         self.pt.entries = entries;
     }
 
+    /// Add the changes in `sink_buf` that fall in settled cells to `pt.sums`.
+    /// A rule without buckets settles by time, so a change to one of its cells
+    /// leaves the sums to the next full pass.
+    fn track_settled(&mut self) {
+        if self.pt.sums_at.is_none() {
+            return;
+        }
+        for i in 0..self.sink_buf.handles.len() {
+            let Some(row) = self.store.get(self.sink_buf.handles[i]) else {
+                continue;
+            };
+            match self.pt.settled[row.key.rule as usize] {
+                Some(Settled::Buckets(oldest, newest))
+                    if (oldest..=newest).contains(&row.key.bucket) =>
+                {
+                    let rise = Into::<u64>::into(self.sink_buf.current[i])
+                        .saturating_sub(self.sink_buf.previous[i].into());
+                    let sum = &mut self.pt.sums[row.key.origin as usize];
+                    *sum = sum.saturating_add(rise);
+                }
+                Some(Settled::UpdatedBy(_)) => {
+                    self.pt.sums_at = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// A repair digest from `src`, stamped `at`: pull every origin of which
     /// this node holds fewer settled hits.
     fn on_digest(&mut self, src: SocketAddr, at: u64) {
@@ -937,11 +966,10 @@ where
         self.send_prunes_and_pulls(src);
     }
 
-    /// Fill `pt.sums` with the hits held per origin in the buckets settled at
-    /// `at`. One pass over the store; skipped when the sums already cover the
-    /// same buckets. A heartbeat recomputes them before its own digest, so
-    /// digests received in between compare against sums at most one
-    /// heartbeat old.
+    /// Fill `pt.sums` with the hits held per origin in the cells settled at
+    /// `at`: one pass over the store, skipped when the sums already cover the
+    /// same buckets, which [`Self::track_settled`] keeps them current for. So
+    /// the pass runs about once per bucket width, not once per digest.
     fn settled_sums(&mut self, at: u64) {
         let rules = self.store.rule_dictionary();
         for slot in 0..rules.capacity() {
@@ -1269,6 +1297,7 @@ where
         if !self.pt.relay.is_empty() {
             self.pt.arm_relay(now);
         }
+        self.track_settled();
 
         // Frontier update: the sender holds each origin up to the sequences it
         // just sent. A hint that only trims IHAVE digests.

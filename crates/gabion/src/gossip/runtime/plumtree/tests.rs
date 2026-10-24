@@ -758,6 +758,31 @@ fn a_digest_pulls_a_hole_the_tree_left_behind() {
 }
 
 #[test]
+fn settled_sums_follow_merges_without_another_pass_over_the_store() {
+    let (mut all, clock) = cluster(2, no_pull());
+    hit(&mut all[0].rt, 1);
+    all[0].rt.handle_gossip_tick(Round::Threshold);
+    settle(&mut all, |_| true);
+    clock.advance(SETTLED);
+    let at = clock.now_millis();
+    all[1].rt.settled_sums(at);
+    let a = slot_of(&all[1], &all[0]);
+    assert_eq!(all[1].rt.pt.sums[a as usize], 1);
+
+    // Late changes to the settled bucket arrive: the sums follow them.
+    for key in [1, 2, 2] {
+        hit(&mut all[0].rt, key);
+        all[0].rt.handle_gossip_tick(Round::Threshold);
+        settle(&mut all, |_| true);
+    }
+    let tracked = all[1].rt.pt.sums[a as usize];
+    all[1].rt.pt.sums_at = None;
+    all[1].rt.settled_sums(at);
+    assert_eq!(tracked, all[1].rt.pt.sums[a as usize]);
+    assert_eq!(tracked, 4);
+}
+
+#[test]
 fn equal_settled_counts_pull_nothing() {
     let (mut all, clock) = cluster(2, no_pull());
     for key in 1..=3 {
