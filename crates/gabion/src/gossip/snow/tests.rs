@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use super::digest::{self, Entry};
 use super::flight::full_mask;
 use super::roots::{Gap, MAX_GAPS};
 use super::*;
@@ -524,4 +525,60 @@ fn a_full_table_forgets_the_root_heard_from_longest_ago() {
     assert!(roots.gaps(addr(1)).is_empty());
     assert_eq!(roots.gaps(addr(2)), vec![gap(0, 5)]);
     assert_eq!(roots.gaps(addr(3)), vec![gap(0, 5)]);
+}
+
+#[test]
+fn digests_roundtrip_and_stop_at_a_torn_entry() {
+    let entries = [
+        Entry {
+            root: addr(1),
+            seq: 7,
+            high: 99,
+        },
+        Entry {
+            root: SocketAddr::from((Ipv6Addr::LOCALHOST, 9)),
+            seq: u32::MAX,
+            high: u64::MAX,
+        },
+    ];
+    let mut buf = Vec::new();
+    digest::begin(&mut buf);
+    assert!(!digest::has_entries(&buf));
+    for e in entries {
+        digest::push(&mut buf, e);
+    }
+    assert!(digest::is_digest(&buf));
+    assert!(
+        Ctrl::decode(&buf).is_none(),
+        "the tree codec leaves digests alone"
+    );
+    assert_eq!(digest::entries(&buf).collect::<Vec<_>>(), entries);
+    let torn = &buf[..buf.len() - 1];
+    assert_eq!(digest::entries(torn).collect::<Vec<_>>(), entries[..1]);
+}
+
+#[test]
+fn a_digest_ahead_of_this_node_opens_the_gap_to_it() {
+    let mut roots = Roots::new(4);
+    roots.broadcast(addr(1), 10, (1, 5), 0, 0);
+    roots.advertised(addr(1), 9, 3, 0, 0);
+    roots.advertised(addr(1), 10, 5, 0, 0);
+    assert!(
+        roots.gaps(addr(1)).is_empty(),
+        "behind or level: nothing to pull"
+    );
+    roots.advertised(addr(1), 12, 20, 0, 0);
+    assert_eq!(roots.gaps(addr(1)), vec![gap(5, 21)]);
+    roots.broadcast(addr(1), 13, (21, 22), 0, 0);
+    assert_eq!(
+        roots.gaps(addr(1)),
+        vec![gap(5, 21)],
+        "13 continues the run"
+    );
+    roots.advertised(addr(2), 4, 8, 0, 0);
+    assert_eq!(
+        roots.gaps(addr(2)),
+        vec![gap(0, 9)],
+        "an unknown root: pull it all"
+    );
 }

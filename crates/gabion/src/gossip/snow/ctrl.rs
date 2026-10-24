@@ -5,6 +5,7 @@
 //! ack:  [ 2 ][ root ][ seq u32 ]                   // no cells
 //! pull: [ 3 ][ after u64 ][ before u64 ]           // no cells
 //! fill: [ 4 ][ after u64 ][ through u64 ]          // cells follow in the frame
+//! (kind 5 is the version digest, `digest.rs`)
 //! addr: [ 4 ][ ip 4 ][ port u16 ]  |  [ 6 ][ ip 16 ][ port u16 ]
 //! ```
 //!
@@ -22,10 +23,14 @@ const KIND_DATA: u8 = 1;
 const KIND_ACK: u8 = 2;
 const KIND_PULL: u8 = 3;
 const KIND_FILL: u8 = 4;
+/// A version digest (see `digest.rs`), which [`Ctrl::decode`] does not parse.
+pub(super) const KIND_DIGEST: u8 = 5;
 const ADDR_V4: u8 = 4;
 const ADDR_V6: u8 = 6;
 
 const V6_ADDR_LEN: usize = 1 + 16 + 2;
+/// Longest encoded address.
+pub(super) const ADDR_LEN_MAX: usize = V6_ADDR_LEN;
 
 /// Longest encoded extension: a data header with three IPv6 addresses.
 pub(in crate::gossip) const CTRL_MAX_LEN: usize = 1 + 4 + 3 * V6_ADDR_LEN;
@@ -124,7 +129,7 @@ impl Ctrl {
     }
 }
 
-fn put_addr(buf: &mut [u8], addr: SocketAddr) -> usize {
+pub(super) fn put_addr(buf: &mut [u8], addr: SocketAddr) -> usize {
     match addr {
         SocketAddr::V4(a) => {
             buf[0] = ADDR_V4;
@@ -141,7 +146,7 @@ fn put_addr(buf: &mut [u8], addr: SocketAddr) -> usize {
     }
 }
 
-fn get_addr(bytes: &[u8]) -> Option<(SocketAddr, &[u8])> {
+pub(super) fn get_addr(bytes: &[u8]) -> Option<(SocketAddr, &[u8])> {
     let (&tag, rest) = bytes.split_first()?;
     match tag {
         ADDR_V4 => {

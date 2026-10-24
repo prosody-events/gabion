@@ -25,7 +25,7 @@ use crate::discovery::{Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
-use crate::gossip::snow::TreeParams;
+use crate::gossip::snow::{Digests, TreeParams};
 use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, parse_cluster_id};
 use crate::wire::HmacKey;
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -1290,7 +1290,7 @@ async fn partition_then_heal() {
 // -- Snow broadcast tree ----------------------------------------------------
 
 /// `n` runtimes on one router, each told about every other node, with the
-/// repair pass off so only the tree moves cells.
+/// version digests off so only the tree and its pulls move cells.
 struct TreeCluster {
     router: SimRouter,
     addrs: Vec<SocketAddr>,
@@ -1333,7 +1333,7 @@ impl TreeCluster {
                 agg.clone(),
             );
             let rt = rt.with_tree_params(|params| {
-                params.repair_cells_per_tick = 0;
+                params.digests = Digests::Off;
                 tweak(params);
             });
             cluster
@@ -1547,6 +1547,34 @@ async fn a_broadcast_lost_twice_is_pulled_from_the_root() {
         .await;
 }
 
+/// A root's last broadcast, lost on both sends, reaches every node through
+/// the version digests: no later broadcast reveals the gap, but the root's
+/// own digest entry does, and spreads.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_quiet_roots_last_broadcast_is_recovered_through_digests() {
+    for digests in [Digests::Push, Digests::Off] {
+        let local = LocalSet::new();
+        local
+            .run_until(async move {
+                let router = SimRouter::new();
+                let addrs: Vec<SocketAddr> = (0..9).map(|i| sock(42_000 + i)).collect();
+                for dst in &addrs[1..] {
+                    router.set_link_policy(addrs[0], *dst, LinkPolicy::DropFirst { count: 2 });
+                }
+                let cluster = TreeCluster::start(9, router, |p| p.digests = digests);
+                cluster.clients[0]
+                    .record(0xDEAD, KeyHash(1), 0, 5, 0, 0)
+                    .await
+                    .unwrap();
+                sim_advance_ticks(Duration::from_millis(100), 100).await;
+                let informed = cluster.aggs[1..].iter().filter(|a| a.total() == 5).count();
+                assert_eq!(informed, if digests == Digests::Push { 8 } else { 0 });
+                cluster.stop().await;
+            })
+            .await;
+    }
+}
+
 /// A root cut off for a while is caught up by pulls once it is reachable
 /// again, over several answers when its missed cells fill more than a
 /// packet.
@@ -1646,7 +1674,7 @@ async fn a_repeat_from_anyone_but_the_parent_is_not_forwarded() {
             );
             let rt = rt.with_tree_params(|p| {
                 p.branching = 2;
-                p.repair_cells_per_tick = 0;
+                p.digests = Digests::Off;
             });
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 

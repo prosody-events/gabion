@@ -15,7 +15,8 @@ use crate::wire::{self, EXT_PREFIX_LEN, FrameLimits, Packets};
 
 use super::{Ctrl, GossipRuntime};
 use crate::gossip::clock::Clock;
-use crate::gossip::snow::CTRL_MAX_LEN;
+use crate::gossip::snow::digest::{self, Entry};
+use crate::gossip::snow::{CTRL_MAX_LEN, Digests};
 use crate::gossip::store::AggregateStore;
 use crate::gossip::transport::GossipTransport;
 
@@ -145,6 +146,58 @@ where
         });
         if !queued {
             self.note_send_dropped(dst);
+        }
+    }
+
+    /// Once per heartbeat, push this node's position on every root it has
+    /// heard from, itself included, to one random peer.
+    pub(super) fn push_digest(&mut self, now_millis: u64) {
+        let interval = self.config.tick_interval.as_millis() as u64;
+        if self.tree.digests == Digests::Off
+            || now_millis.saturating_sub(self.last_digest_ms) < interval
+        {
+            return;
+        }
+        self.last_digest_ms = now_millis;
+        let peers = self.ring.len() - 1;
+        let pick = self.rng.next_u64() as usize % peers;
+        let Some(peer) = self.ring.peers().nth(pick) else {
+            return;
+        };
+        let header = self.sender_header();
+        let (key, limits) = (self.config.auth_key.as_ref(), self.config.wire_limits);
+        let capacity = wire::ext_capacity(limits, key.is_some());
+        let (seq, high) = self.rooted;
+        let me = (high > 0).then_some(Entry {
+            root: self.ring.me(),
+            seq,
+            high,
+        });
+        let Self {
+            roots,
+            send,
+            digest_buf: buf,
+            ..
+        } = self;
+        let others = roots
+            .positions()
+            .map(|(root, seq, high)| Entry { root, seq, high });
+        digest::begin(buf);
+        for entry in me.into_iter().chain(others) {
+            if buf.len() + digest::ENTRY_LEN_MAX > capacity {
+                if !send.enqueue(peer, |out| {
+                    wire::encode_ext_only::<C>(header, buf, key, limits, out).is_ok()
+                }) {
+                    return;
+                }
+                digest::begin(buf);
+            }
+            digest::push(buf, entry);
+        }
+        if digest::has_entries(buf) {
+            send.enqueue(peer, |out| {
+                wire::encode_ext_only::<C>(header, buf, key, limits, out).is_ok()
+            });
         }
     }
 

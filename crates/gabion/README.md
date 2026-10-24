@@ -66,7 +66,8 @@ acknowledgement timeout to the children that have not answered. Code:
 | acknowledgement timeout | 2 x expected tree round trip | `GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE` |
 | root rebroadcasts | 1 | `GOSSIP_ROOT_REBROADCASTS` |
 | tree height | `ceil(log_k((k-1)N) + 1)` | `snow::tree_height` |
-| repair pass | 256 cells per heartbeat to one random peer | `GOSSIP_REPAIR_CELLS_PER_TICK` |
+| version digest | one per heartbeat to one random peer | `runtime/pull.rs` |
+| pull retry | 2 x expected tree round trip, doubling, at most one heartbeat | `runtime/pull.rs` |
 
 **Adaptations to the paper**, each the smallest that makes the design run in
 gabion:
@@ -117,14 +118,20 @@ gabion:
   its anti-entropy; pulling by message id keeps the repair on the tree's own
   identifiers and puts it on the one node that certainly holds the data.
   Code: `src/gossip/snow/roots.rs`, `src/gossip/runtime/pull.rs`.
-- *Repair pass.* After the one rebroadcast the paper gives up. gabion keeps an
-  anti-entropy backstop for every design: once per heartbeat a rotating slice of
-  the cell store goes to one random peer. It is not on the tree path. It also
-  carries cells to a node that joined after they were broadcast. The paper does
-  not define this lane; its size, 256 cells, is the heartbeat repair slice the
-  study's `flat-once` design uses (survey section 3.4), so the lane
-  behind each design carries the same volume. The Plumtree-style lazy `IHAVE`
-  backstop (`snow_lazy`) is not implemented.
+- *Version digests replace the repair slice* (study component
+  `digest-repair`, and the paper's own anti-entropy, section 4.5.1, which
+  periodically synchronizes with one randomly selected node). Gaps in a root's
+  broadcast numbers cannot show the last broadcasts before the root falls
+  quiet, nor anything routed through an interior node that has died but is
+  still in the views (discovery removes a crashed pod only after about 10 s).
+  So once per heartbeat each node pushes to one random peer, for every root it
+  has heard from and for itself, the highest broadcast number and origin
+  sequence it holds (`[5]` then `[root][seq u32][high u64]` per root, a few
+  hundred bytes per 20 roots). A receiver that is behind opens the gap and
+  pulls it from the root as above. This replaces the rotating 256-cell slice of
+  the whole store to one random peer, which needed far longer than a window to
+  sweep a large store and was most of the bytes at low scale. The
+  Plumtree-style lazy `IHAVE` backstop (`snow_lazy`) is not implemented.
 - *Acknowledgement tables hold the forwarded children.* A relay keeps the
   addresses and ranges it forwarded to, and matches acknowledgements and
   repeats against that frozen set, so a view change while a broadcast is in
@@ -157,12 +164,16 @@ per-root log holds one entry per root up to the node dictionary capacity (the
 root heard from longest ago is forgotten when full), each with at most 8
 gaps, and drops a root when discovery removes it. Sequence
 numbers start from the node's seeded RNG so a restarted node does not collide
-with entries peers still hold. Randomness is only the repair peer pick and that
+with entries peers still hold. Randomness is only the digest peer pick and that
 seed.
 
 **Known limitations.** A node that does not know a member cannot send to it,
-so a member known to the root but not to an interior node on the way can miss
-the broadcast until the repair pass reaches it. The admin snapshot reports peer
+so a member known to the root but not to an interior node on the way misses
+the broadcast until a digest or the root's next broadcast shows the gap. Only
+the root serves a pull, so cells of a root that crashed before every node had
+them stay missing until they expire; and a pull reaching back past the oldest
+change in the root's local dirty ring (hours at production rates) is answered
+only from what the ring still holds. The admin snapshot reports peer
 `node_id` as `None`; `last_effective_fanout` is the root's child count. The WASM
 visualizer's manual clock never fires the acknowledgement timer.
 

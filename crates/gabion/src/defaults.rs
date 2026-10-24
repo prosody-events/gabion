@@ -54,26 +54,18 @@ pub const GOSSIP_MIN_EMIT_INTERVAL_MS: u64 = 5;
 
 /// A root rebroadcasts after `GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE` times the
 /// expected tree round-trip time without a complete acknowledgement. The
-/// expected round trip is the root's smoothed measurement of completed
-/// broadcasts, seeded by `GOSSIP_TREE_INITIAL_HOP_RTT_MS` until the first
-/// completes.
+/// expected round trip is the tree height times the smoothed one-hop round
+/// trip (leaf acknowledgements), or the smoothed round trip of whole
+/// broadcasts that completed without a rebroadcast when that is longer. The
+/// hop time is seeded by `GOSSIP_TREE_INITIAL_HOP_RTT_MS` until measured.
 pub const GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE: u32 = 2;
 
 /// Rebroadcasts a root attempts before it leaves the broadcast to the
-/// periodic repair pass.
+/// peers that missed it to pull it (see "Design notes" in the gabion README).
 pub const GOSSIP_ROOT_REBROADCASTS: u8 = 1;
 
-/// Cells the periodic repair pass sends to one random peer per heartbeat.
-/// The repair pass is the rotating anti-entropy slice of the cell store that
-/// backs every dissemination design; it covers broadcasts the tree could not
-/// complete and cells a newly joined node missed. The paper leaves the repair
-/// lane unspecified; 256 is the heartbeat repair slice the study's other
-/// push design uses (`flat-once`, section 3.4 of the survey), so the lanes
-/// behind each dissemination design carry the same volume.
-pub const GOSSIP_REPAIR_CELLS_PER_TICK: usize = 256;
-
 /// Per-hop round-trip estimate used to seed the acknowledgement timeout
-/// before the first broadcast completes: `tree height * this`.
+/// until the first leaf acknowledgement is timed: `tree height * this`.
 pub const GOSSIP_TREE_INITIAL_HOP_RTT_MS: u64 = 4;
 
 /// Granularity at which a root checks acknowledgement deadlines. Only

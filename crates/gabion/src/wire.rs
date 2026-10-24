@@ -478,6 +478,15 @@ fn decode_inner<'a, C: Count>(
 /// the extension itself.
 pub const EXT_PREFIX_LEN: usize = 2;
 
+/// Most extension bytes a frame without cells can carry within `limits`.
+pub fn ext_capacity(limits: FrameLimits, authenticated: bool) -> usize {
+    let auth_overhead = if authenticated { AUTH_TAG_LEN } else { 0 };
+    limits
+        .max_payload_bytes
+        .saturating_sub(HEADER_LEN + EXT_PREFIX_LEN + auth_overhead)
+        .min(usize::from(u16::MAX))
+}
+
 /// Split a body into its control extension and the cell body.
 fn split_ext(flags: u16, body: &[u8]) -> Result<(&[u8], &[u8]), DecodeError> {
     if flags & FLAG_EXT == 0 {

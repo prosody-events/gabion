@@ -216,6 +216,52 @@ impl Roots {
         self.maybe_gaps |= !log.gaps.is_empty();
     }
 
+    /// A peer reports holding the root's broadcasts up to `seq` and its
+    /// cells up to origin sequence `high`. If that is ahead of this node,
+    /// the difference is a gap, pulled no earlier than `due_ms`.
+    pub fn advertised(&mut self, root: SocketAddr, seq: u32, high: u64, now_ms: u64, due_ms: u64) {
+        let everything = Gap {
+            after: 0,
+            before: high.saturating_add(1),
+        };
+        let at = match self.logs.binary_search_by(|l| l.root.cmp(&root)) {
+            Ok(at) => at,
+            Err(_) => {
+                let Some(at) = self.insert(RootLog::new(root, seq, high, now_ms)) else {
+                    return;
+                };
+                self.logs[at].open(everything, due_ms);
+                self.maybe_gaps |= !self.logs[at].gaps.is_empty();
+                return;
+            }
+        };
+        let log = &mut self.logs[at];
+        let ahead = seq.wrapping_sub(log.seq);
+        if ahead == 0 || ahead > u32::MAX - MAX_SEQ_JUMP {
+            return;
+        }
+        if ahead > MAX_SEQ_JUMP {
+            // Not a continuation of the run this node holds: the root
+            // restarted.
+            *log = RootLog::new(root, seq, high, now_ms);
+            log.open(everything, due_ms);
+        } else if high > log.high {
+            let gap = Gap {
+                after: log.high,
+                before: high.saturating_add(1),
+            };
+            log.open(gap, due_ms);
+            log.seq = seq;
+            log.high = high;
+        }
+        self.maybe_gaps |= !log.gaps.is_empty();
+    }
+
+    /// Each root's position as this node holds it.
+    pub fn positions(&self) -> impl Iterator<Item = (SocketAddr, u32, u64)> + '_ {
+        self.logs.iter().map(|l| (l.root, l.seq, l.high))
+    }
+
     /// The root answered a pull of the gap starting after `after` with its
     /// cells up to and including `through`. Returns whether more remains to
     /// pull from it.

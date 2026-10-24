@@ -25,14 +25,14 @@ use crate::crdt::{
     ObservationBatch,
 };
 use crate::discovery::PeerEvent;
-use crate::wire::{self, PacketBuf, Packets, WireScratch};
+use crate::wire::{self, PacketBuf, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
-use super::snow::{Ctrl, Origins, Relays, Ring, Roots, RttEstimator, TreeParams};
+use super::snow::{Ctrl, Origins, Relays, Ring, Roots, RttEstimator, TreeParams, digest};
 use super::store::AggregateStore;
 use super::transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
@@ -121,9 +121,14 @@ where
     /// Encodes the cells of one pull answer before its control header is
     /// added.
     pull_buf: PacketBuf,
+    /// Builds the version digest pushed each heartbeat.
+    digest_buf: Vec<u8>,
+    /// Number and highest origin sequence of the last broadcast this node
+    /// rooted: its own entry in the digest.
+    rooted: (u32, u64),
     /// Highest local origin sequence already handed to a broadcast.
     sent_seq: u64,
-    last_repair_ms: u64,
+    last_digest_ms: u64,
     unacked_total: u64,
     send_dropped_total: u64,
 
@@ -302,6 +307,7 @@ where
         let relays = Relays::new(crate::defaults::GOSSIP_TREE_RELAY_CAPACITY);
         let roots = Roots::new(usize::from(store.node_dictionary().capacity()));
         let pull_buf = PacketBuf::for_limits(config.wire_limits);
+        let config_max_payload = config.wire_limits.max_payload_bytes;
         let rule_capacity = store.rule_dictionary().capacity() as usize;
         let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
         let rule_last_emit_ms = vec![0_u64; rule_capacity].into_boxed_slice();
@@ -329,8 +335,10 @@ where
             rtt: RttEstimator::default(),
             roots,
             pull_buf,
+            digest_buf: Vec::with_capacity(config_max_payload),
+            rooted: (0, 0),
             sent_seq: 0,
-            last_repair_ms: 0,
+            last_digest_ms: 0,
             unacked_total: 0,
             send_dropped_total: 0,
             pending_reply: None,
@@ -580,7 +588,15 @@ where
 
         self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
 
-        if !summary.ext.is_empty() {
+        if digest::is_digest(summary.ext) {
+            let now = self.clock.now_millis();
+            let due = now + self.pull_grace_ms();
+            let me = self.ring.me();
+            for entry in digest::entries(summary.ext).filter(|e| e.root != me) {
+                self.roots
+                    .advertised(entry.root, entry.seq, entry.high, now, due);
+            }
+        } else if !summary.ext.is_empty() {
             match Ctrl::decode(summary.ext) {
                 Some(ctrl) => {
                     let header = summary.header;
@@ -749,15 +765,15 @@ where
         }
 
         // Step 2: broadcast the local changes made since the last round down
-        // this node's tree, and run the periodic repair pass.
+        // this node's tree, and push the version digest once per heartbeat.
         self.start_broadcasts(now_millis);
-        self.repair_pass(now_millis);
+        self.push_digest(now_millis);
 
         // Reset per-rule pending. The sweep treats every rule with
         // non-zero pending as "touched in expectation by the tick": every
         // pending hit was rooted in this round's broadcasts. A packet that
         // could not be queued (no free send buffer) is counted and logged,
-        // and left to the rebroadcast and the repair pass; the N × ε_R bound
+        // and left to the rebroadcast and to pulls; the N × ε_R bound
         // holds in expectation.
         let stamp = now_millis.max(1);
         for slot in 0..self.rule_pending.len() {
@@ -766,48 +782,6 @@ where
                 self.rule_last_emit_ms[slot] = stamp;
             }
         }
-    }
-
-    fn encode_packets_for(&mut self, dst: SocketAddr) {
-        let header = self.sender_header();
-
-        let packets_result = match self.config.auth_key.as_ref() {
-            Some(key) => Packets::<C>::auth(
-                header,
-                &self.store,
-                &self.frame_handles,
-                key,
-                &mut self.scratch,
-                self.config.wire_limits,
-            ),
-            None => Packets::<C>::unauth(
-                header,
-                &self.store,
-                &self.frame_handles,
-                &mut self.scratch,
-                self.config.wire_limits,
-            ),
-        };
-        let mut packets = match packets_result {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        while let Some(slot) = self.send.free.pop() {
-            let buf = &mut self.send.pool[slot as usize];
-            match packets.next_into(buf) {
-                Ok(Some(_)) => self.send.pending.push_back((dst, slot)),
-                Ok(None) => {
-                    self.send.free.push(slot);
-                    break;
-                }
-                Err(_) => {
-                    self.send.free.push(slot);
-                    break;
-                }
-            }
-        }
-        packets.finish();
     }
 }
 

@@ -10,7 +10,7 @@
 //! acknowledges only after every child has. A root still missing
 //! acknowledgements after the timeout rebroadcasts, to the children that
 //! have not answered, up to `TreeParams::rebroadcasts` times; beyond that the
-//! periodic repair pass is the backstop.
+//! nodes that still miss it pull it from the root (`runtime/pull.rs`).
 
 use std::net::SocketAddr;
 
@@ -132,11 +132,15 @@ where
         }
         origin.deadline_ms = now_millis + timeout;
         origin.rebroadcasts_left = self.tree.rebroadcasts;
-        let children = origin.children.len();
+        let (seq, children) = (origin.seq, origin.children.len());
         self.last_effective_fanout = children;
         self.peak_effective_fanout = self.peak_effective_fanout.max(children);
         for child in 0..children {
             self.send_to_child_from_origin(idx, child);
+        }
+        let last = self.frame_handles[cursor + consumed.max(1) - 1];
+        if let Some(row) = self.store.get(last) {
+            self.rooted = (seq, row.origin_sequence);
         }
         consumed
     }
@@ -166,7 +170,8 @@ where
     }
 
     /// Acknowledgement deadlines: rebroadcast to the children that have not
-    /// answered, or give the broadcast up to the repair pass.
+    /// answered, or leave the broadcast to the pulls of the nodes that missed
+    /// it.
     pub(super) fn handle_ack_timer(&mut self) {
         let now = self.clock.now_millis();
         let mut backed_off = false;
@@ -206,8 +211,8 @@ where
                 send_queue_capacity = self.config.send_queue_capacity,
                 "A gossip packet for this peer was dropped before it was sent, so the \
                  peer and the nodes behind it may under-count recent requests until \
-                 the periodic repair pass reaches them, and the cluster can briefly \
-                 admit more than the limit. Usually the node is sending in bursts \
+                 they notice the gap and pull the missed changes, usually within a \
+                 second, and the cluster can briefly admit more than the limit. Usually the node is sending in bursts \
                  faster than the socket drains, or `max_payload_bytes` is too small \
                  for the tree header. Raise `send_queue_capacity` in the gossip \
                  config, and check that `max_payload_bytes` leaves room for the \
@@ -225,12 +230,12 @@ where
                 missing_children = origin.children.len() - origin.acked.count_ones() as usize,
                 rebroadcasts = self.tree.rebroadcasts,
                 "A change this node broadcast was not acknowledged by every part of the cluster, \
-                 even after being sent again. Peers behind the missing acknowledgements may \
-                 under-count this node's recent requests until the periodic repair pass reaches \
-                 them, so the cluster can briefly admit more than the limit. Usually a peer is \
-                 down or slow, or the network is dropping packets. Check peer health first; if \
-                 peers are healthy but the network is slow, raise \
-                 `GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE`.",
+                 even after being sent again. Peers behind the missing acknowledgements \
+                 under-count this node's recent requests until they notice the gap and pull the \
+                 change from this node, usually within a second, so the cluster can briefly admit \
+                 more than the limit. Usually a peer is down or slow, or the network is dropping \
+                 packets. Check peer health first; if peers are healthy but the network is slow, \
+                 raise `GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE`.",
             );
         }
     }
@@ -399,34 +404,6 @@ where
             relay.done = true;
             let parent = relay.parent;
             self.send_ack(parent, root, seq);
-        }
-    }
-
-    // -- repair -------------------------------------------------------------
-
-    /// Once per heartbeat, send a rotating slice of the whole cell store to
-    /// one random peer. This is the anti-entropy backstop for broadcasts that
-    /// stayed incomplete and for cells a new node missed.
-    pub(super) fn repair_pass(&mut self, now_millis: u64) {
-        let interval = self.config.tick_interval.as_millis() as u64;
-        if now_millis.saturating_sub(self.last_repair_ms) < interval {
-            return;
-        }
-        self.last_repair_ms = now_millis;
-        let peers = self.ring.len() - 1;
-        let pick = self.rng.next_u64() as usize % peers;
-        let Some(peer) = self.ring.peers().nth(pick) else {
-            return;
-        };
-        self.frame_handles.clear();
-        let handles = &mut self.frame_handles;
-        self.store
-            .visit_repair_slice(self.tree.repair_cells_per_tick, |handle| {
-                handles.push(handle);
-                true
-            });
-        if !self.frame_handles.is_empty() {
-            self.encode_packets_for(peer);
         }
     }
 }

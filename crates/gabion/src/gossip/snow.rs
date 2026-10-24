@@ -8,6 +8,8 @@
 //!   estimator behind the acknowledgement timeout.
 //! * [`roots`] — what this node has of each root's changes, and the gaps it
 //!   pulls from the root.
+//! * [`digest`] — the per-root versions a node pushes to one random peer each
+//!   heartbeat.
 //!
 //! The runtime half lives in `runtime/tree.rs`. See "Design notes" in the
 //! gabion README for how this follows the paper and where it adapts it.
@@ -15,6 +17,7 @@
 use crate::defaults;
 
 mod ctrl;
+pub(super) mod digest;
 mod flight;
 mod ring;
 mod roots;
@@ -37,8 +40,16 @@ pub(super) struct TreeParams {
     pub ack_timeout_rtt_multiple: u32,
     /// Rebroadcasts a root attempts before leaving a broadcast to repair.
     pub rebroadcasts: u8,
-    /// Cells per heartbeat in the repair pass.
-    pub repair_cells_per_tick: usize,
+    /// Whether the heartbeat pushes a version digest.
+    pub digests: Digests,
+}
+
+/// Whether each heartbeat pushes the node's version digest to a random peer.
+/// Production always does; tests turn it off to watch the tree alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Digests {
+    Push,
+    Off,
 }
 
 impl TreeParams {
@@ -49,7 +60,7 @@ impl TreeParams {
             branching: fanout.clamp(2, MAX_CHILDREN),
             ack_timeout_rtt_multiple: defaults::GOSSIP_ACK_TIMEOUT_RTT_MULTIPLE,
             rebroadcasts: defaults::GOSSIP_ROOT_REBROADCASTS,
-            repair_cells_per_tick: defaults::GOSSIP_REPAIR_CELLS_PER_TICK,
+            digests: Digests::Push,
         }
     }
 }
