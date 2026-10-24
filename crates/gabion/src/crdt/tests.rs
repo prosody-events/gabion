@@ -547,22 +547,25 @@ fn quickcheck_gossip_frames_are_bounded_current_and_unique(
 fn quickcheck_visit_active_sees_every_active_cell_once(rows: RemoteRows) -> bool {
     let mut store = quickcheck_store();
     apply_remote_rows(&mut store, &rows.0);
-    let expected: BTreeMap<u32, (NodeSlot, u64, u64)> = store
+    let expected: BTreeMap<u32, ActiveCell> = store
         .active_handles()
         .map(|h| {
             let row = store.get(h).unwrap();
-            (
-                h.index,
-                (row.key.origin, row.origin_sequence, row.last_update_millis),
-            )
+            let cell = ActiveCell {
+                handle: h,
+                rule: row.key.rule,
+                bucket: row.key.bucket,
+                origin: row.key.origin,
+                origin_sequence: row.origin_sequence,
+                last_update_millis: row.last_update_millis,
+            };
+            (h.index, cell)
         })
         .collect();
     let mut seen = BTreeMap::new();
     let mut duplicate = false;
-    store.visit_active(|handle, origin, sequence, last_update| {
-        duplicate |= seen
-            .insert(handle.index, (origin, sequence, last_update))
-            .is_some();
+    store.visit_active(|cell| {
+        duplicate |= seen.insert(cell.handle.index, cell).is_some();
         true
     });
     !duplicate && seen == expected
@@ -1150,8 +1153,8 @@ fn visit_active_skips_freed_slots() {
 
     // The scan behind every repair digest visits exactly the active 2.
     let mut seen = Vec::with_capacity(4);
-    store.visit_active(|h, _, _, _| {
-        seen.push(h.index);
+    store.visit_active(|cell| {
+        seen.push(cell.handle.index);
         true
     });
     assert_eq!(seen.len(), 2);

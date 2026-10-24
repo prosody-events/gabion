@@ -102,6 +102,37 @@ impl DigestEntry {
         }
     }
 
+    /// Record that `sequence` is held, raising the maximum to it first if it
+    /// is higher, so a digest can be built in one pass over unordered cells.
+    pub fn mark_raising(&mut self, sequence: u64) {
+        if let Some(raise) = sequence.checked_sub(self.max_sequence)
+            && raise > 0
+        {
+            self.shift_back(raise);
+            self.max_sequence = sequence;
+        }
+        self.mark(sequence);
+    }
+
+    /// Move every held bit `by` sequences further back from the maximum,
+    /// dropping the bits that leave the window.
+    fn shift_back(&mut self, by: u64) {
+        if by >= DIGEST_WINDOW {
+            self.held = [0; DIGEST_WORDS];
+            return;
+        }
+        let words = (by / 64) as usize;
+        let bits = (by % 64) as u32;
+        for i in (0..DIGEST_WORDS).rev() {
+            let low = i.checked_sub(words).map_or(0, |j| self.held[j]);
+            let carry = match (bits, i.checked_sub(words + 1)) {
+                (0, _) | (_, None) => 0,
+                (_, Some(j)) => self.held[j] >> (64 - bits),
+            };
+            self.held[i] = (low << bits) | carry;
+        }
+    }
+
     /// Whether the sender holds `sequence`. Anything beyond the window is
     /// taken as held.
     pub fn holds(&self, sequence: u64) -> bool {

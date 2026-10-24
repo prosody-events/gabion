@@ -641,21 +641,18 @@ where
             }
         };
         reader.set_scope(scope);
-        // Expire first: the requester expired its cells when it built the
-        // digest, so a cell whose bucket has since left the window would read
-        // as lacked and be resent only to expire again.
-        let now_millis = self.clock.now_millis();
-        self.expiration_buf.clear();
-        self.store.expire_at(now_millis, &mut self.expiration_buf);
         let settle = self
             .config
             .tick_interval
             .mul_f64(crate::defaults::GOSSIP_REPAIR_SETTLE_TICKS);
-        self.frame_handles.clear();
-        if let Some(settled_at) = now_millis.checked_sub(settle.as_millis() as u64) {
-            let max_cells = self.repair_budget.min(self.frame_handles.capacity());
-            reader.cells_lacked(&self.store, max_cells, settled_at, &mut self.frame_handles);
-        }
+        let max_cells = self.repair_budget.min(self.frame_handles.capacity());
+        reader.cells_lacked(
+            &self.store,
+            max_cells,
+            self.clock.now_millis(),
+            settle.as_millis() as u64,
+            &mut self.frame_handles,
+        );
         if !self.frame_handles.is_empty() {
             self.repair_budget -= self.frame_handles.len();
             // A repair answer cut short by a full send queue is not worth a

@@ -983,9 +983,9 @@ fn bench_fill_gossip_frame(c: &mut Criterion) {
         let mut max_by_origin = vec![0_u64; digest.node_dictionary().capacity() as usize];
         b.iter(|| {
             max_by_origin.fill(0);
-            digest.visit_active(|_, origin, sequence, _| {
-                let max = &mut max_by_origin[origin as usize];
-                *max = (*max).max(sequence);
+            digest.visit_active(|cell| {
+                let max = &mut max_by_origin[cell.origin as usize];
+                *max = (*max).max(cell.origin_sequence);
                 true
             });
             black_box(&max_by_origin);

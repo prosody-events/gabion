@@ -5,7 +5,7 @@
 //! names the cells the peer lacks. Both own their scratch, sized once from
 //! the store's node dictionary.
 
-use crate::crdt::{CellHandle, CellStore, Count, NodeSlot};
+use crate::crdt::{BucketEpoch, CellHandle, CellStore, Count, NodeSlot, RuleSlot};
 use crate::wire::{DigestEntry, DigestScope, OriginKey};
 
 const NO_ENTRY: u16 = u16::MAX;
@@ -35,34 +35,25 @@ impl DigestBuilder {
         }
     }
 
-    /// Rebuild the digest from `store`. The result is sorted by origin.
+    /// Rebuild the digest from `store`, in one pass over its cells. The
+    /// result is sorted by origin.
     pub(super) fn build<C: Count>(&mut self, store: &CellStore<C>) -> &[DigestEntry] {
         self.entries.clear();
         self.entry_of_slot.fill(NO_ENTRY);
 
-        store.visit_active(|_, slot, sequence, _| {
-            let index = match self.entry_of_slot[slot as usize] {
+        store.visit_active(|cell| {
+            let index = match self.entry_of_slot[cell.origin as usize] {
                 NO_ENTRY => {
-                    let Some(origin) = origin_key(store, slot) else {
+                    let Some(origin) = origin_key(store, cell.origin) else {
                         return true;
                     };
-                    self.entry_of_slot[slot as usize] = self.entries.len() as u16;
+                    self.entry_of_slot[cell.origin as usize] = self.entries.len() as u16;
                     self.entries.push(DigestEntry::new(origin, 0));
                     self.entries.len() - 1
                 }
                 index => index as usize,
             };
-            let entry = &mut self.entries[index];
-            entry.max_sequence = entry.max_sequence.max(sequence);
-            true
-        });
-        store.visit_active(|_, slot, sequence, _| {
-            if let Some(entry) = self
-                .entries
-                .get_mut(self.entry_of_slot[slot as usize] as usize)
-            {
-                entry.mark(sequence);
-            }
+            self.entries[index].mark_raising(cell.origin_sequence);
             true
         });
 
@@ -87,6 +78,9 @@ pub(super) struct DigestReader {
     scope: DigestScope,
     entries: Vec<DigestEntry>,
     verdicts: Box<[Verdict]>,
+    /// Per rule slot, the oldest bucket still in the window at the time of
+    /// the comparison.
+    oldest_live: Box<[BucketEpoch]>,
 }
 
 impl DigestReader {
@@ -99,6 +93,7 @@ impl DigestReader {
             },
             entries: Vec::with_capacity(nodes),
             verdicts: vec![Verdict::Unspoken; nodes].into_boxed_slice(),
+            oldest_live: vec![0; store.rule_dictionary().capacity() as usize].into_boxed_slice(),
         }
     }
 
@@ -121,14 +116,18 @@ impl DigestReader {
         }
     }
 
-    /// Collect up to `max_cells` cells the sender of the packet lacks, among
-    /// those last changed at or before `settled_at` (milliseconds): a newer
-    /// change is most likely still on its way through the forwarders.
+    /// Collect up to `max_cells` cells the sender of the packet lacks. A
+    /// cell whose origin changed it less than `settle_millis` before
+    /// `now_millis` is left out, since it is most likely still on its way
+    /// through the forwarders, and so is one whose bucket has left the
+    /// window: the sender expired it before building the digest, and the
+    /// store expires it only on its next round.
     pub(super) fn cells_lacked<C: Count>(
         &mut self,
         store: &CellStore<C>,
         max_cells: usize,
-        settled_at: u64,
+        now_millis: u64,
+        settle_millis: u64,
         out: &mut Vec<CellHandle>,
     ) {
         out.clear();
@@ -146,17 +145,25 @@ impl DigestReader {
                 _ => Verdict::Unspoken,
             };
         }
-        store.visit_active(|handle, slot, sequence, last_update_millis| {
-            if last_update_millis > settled_at {
+        for (slot, oldest) in self.oldest_live.iter_mut().enumerate() {
+            *oldest = store
+                .rule_dictionary()
+                .descriptor(slot as RuleSlot)
+                .map_or(0, |rule| rule.oldest_live_epoch(now_millis));
+        }
+        store.visit_active(|cell| {
+            if cell.last_update_millis.saturating_add(settle_millis) > now_millis
+                || cell.bucket < self.oldest_live[cell.rule as usize]
+            {
                 return true;
             }
-            let lacked = match self.verdicts[slot as usize] {
+            let lacked = match self.verdicts[cell.origin as usize] {
                 Verdict::Unspoken => false,
                 Verdict::Absent => true,
-                Verdict::Listed(index) => !self.entries[index as usize].holds(sequence),
+                Verdict::Listed(index) => !self.entries[index as usize].holds(cell.origin_sequence),
             };
             if lacked {
-                out.push(handle);
+                out.push(cell.handle);
             }
             out.len() < max_cells
         });

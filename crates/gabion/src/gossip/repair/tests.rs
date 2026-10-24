@@ -74,7 +74,7 @@ fn lacked(holder: &CellStore<u32>, entries: Vec<DigestEntry>, scope: DigestScope
     entries.into_iter().for_each(|e| reader.push(e));
     reader.set_scope(scope);
     let mut out = Vec::new();
-    reader.cells_lacked(holder, 100, u64::MAX, &mut out);
+    reader.cells_lacked(holder, 100, 0, 0, &mut out);
     let mut sequences: Vec<_> = out
         .iter()
         .map(|h| holder.get(*h).unwrap().origin_sequence)
@@ -163,7 +163,7 @@ fn the_cell_budget_bounds_the_answer() {
     entries.into_iter().for_each(|e| reader.push(e));
     reader.set_scope(scope);
     let mut out = Vec::new();
-    reader.cells_lacked(&holder, 4, u64::MAX, &mut out);
+    reader.cells_lacked(&holder, 4, 0, 0, &mut out);
     assert_eq!(out.len(), 4);
 }
 
@@ -178,10 +178,27 @@ fn a_change_still_spreading_is_left_to_the_forwarders() {
     entries.into_iter().for_each(|e| reader.push(e));
     reader.set_scope(scope);
     let mut out = Vec::new();
-    reader.cells_lacked(&holder, 100, 1_500, &mut out);
+    reader.cells_lacked(&holder, 100, 2_000, 500, &mut out);
     let sequences: Vec<_> = out
         .iter()
         .map(|h| holder.get(*h).unwrap().origin_sequence)
         .collect();
     assert_eq!(sequences, [1], "only the change settled by 1,500 ms");
+}
+
+#[test]
+fn a_cell_whose_bucket_left_the_window_is_not_resent() {
+    let mut holder = store(1);
+    merge(&mut holder, 9, 1, 1, 1);
+    let (entries, scope) = digest_of(&store(2));
+    let mut reader = DigestReader::for_store(&holder);
+    reader.begin();
+    entries.into_iter().for_each(|e| reader.push(e));
+    reader.set_scope(scope);
+    let mut out = Vec::new();
+    // Bucket 0 of a 60 s window of 1 s buckets is live through 60,999 ms.
+    reader.cells_lacked(&holder, 100, 60_999, 0, &mut out);
+    assert_eq!(out.len(), 1);
+    reader.cells_lacked(&holder, 100, 61_000, 0, &mut out);
+    assert!(out.is_empty(), "the requester has expired it");
 }

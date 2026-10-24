@@ -142,3 +142,23 @@ fn budget_too_small_for_one_entry_is_an_error() {
         Err(EncodeError::BudgetTooSmall)
     ));
 }
+
+#[test]
+fn marking_while_raising_matches_marking_under_the_final_maximum() {
+    // Sequences arrive in store order, not sequence order; some fall out of
+    // the window once the maximum rises past them.
+    let order = [
+        7_u64, 300, 3, 299, 64, 65, 128, 1, 44, 236, 237, 191, 512, 260,
+    ];
+    let max = *order.iter().max().unwrap();
+    let mut direct = DigestEntry::new(origin(1), max);
+    let mut raised = DigestEntry::new(origin(1), 0);
+    for &sequence in &order {
+        direct.mark(sequence);
+        raised.mark_raising(sequence);
+    }
+    assert_eq!(raised, direct);
+    for sequence in max.saturating_sub(DIGEST_WINDOW + 4)..=max + 1 {
+        assert_eq!(raised.holds(sequence), direct.holds(sequence), "{sequence}");
+    }
+}

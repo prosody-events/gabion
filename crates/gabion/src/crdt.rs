@@ -224,6 +224,18 @@ pub struct UpdateOutcome<C: Count> {
     pub delta: Option<CellDelta<C>>,
 }
 
+/// What [`CellStore::visit_active`] reports of one stored cell: the columns
+/// a repair digest compares, without the count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveCell {
+    pub handle: CellHandle,
+    pub rule: RuleSlot,
+    pub bucket: BucketEpoch,
+    pub origin: NodeSlot,
+    pub origin_sequence: u64,
+    pub last_update_millis: u64,
+}
+
 /// Snapshot of one stored cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CellRow<C: Count> {
@@ -1279,21 +1291,23 @@ impl<C: Count> CellStore<C> {
         }
     }
 
-    /// Visit every active cell with its origin slot, origin sequence and
-    /// last-update stamp, in slot order. `visit` returning `false` stops the
-    /// scan.
-    pub fn visit_active(&self, mut visit: impl FnMut(CellHandle, NodeSlot, u64, u64) -> bool) {
+    /// Visit every active cell, in slot order. `visit` returning `false`
+    /// stops the scan.
+    pub fn visit_active(&self, mut visit: impl FnMut(ActiveCell) -> bool) {
         for slot in 0..self.capacity {
             if !self.is_active(slot) {
                 continue;
             }
             let i = slot as usize;
-            if !visit(
-                self.handle_for(slot),
-                self.origins[i],
-                self.origin_sequences[i],
-                self.last_update_millis[i],
-            ) {
+            let cell = ActiveCell {
+                handle: self.handle_for(slot),
+                rule: self.rules[i],
+                bucket: self.buckets[i],
+                origin: self.origins[i],
+                origin_sequence: self.origin_sequences[i],
+                last_update_millis: self.last_update_millis[i],
+            };
+            if !visit(cell) {
                 return;
             }
         }
