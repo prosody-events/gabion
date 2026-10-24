@@ -168,16 +168,16 @@ the changed member wins or held.
 3. **Fold and acknowledge.** The owner max-merges the cells into its store
    (they stay tagged with the contributor's origin, so a re-sent or
    reordered sync cannot double count), adds whatever they rose by to the
-   bucket's count of the others' hits, queues the keys that rose for
+   bucket's count of the others' hits, queues the buckets that rose for
    broadcast, and echoes every cell it holds back to the sender
    (`FLAG_ACK`). A node that believes it is not the owner folds and
    acknowledges nothing.
 4. **Broadcast.** Every `broadcast_interval` (100 ms) an owner sends the
-   total of every live bucket of each key that changed since its last
-   broadcast (its own hits plus the others'), at most
-   `broadcast_batch_limit` (1 000) keys, to every peer. A receiver counts
-   the total less its own hits as the others' count of that bucket,
-   unless it already holds more, and relays nothing.
+   total (its own hits plus the others') of each key bucket that changed
+   since its last broadcast, at most `broadcast_batch_limit` (1 000), to
+   every peer. A receiver counts the total less its own hits as the
+   others' count of that bucket, unless it already holds more, and relays
+   nothing.
 5. **Re-send.** A cell stays queued until its owner acknowledges the
    current count, so a lost sync or ack is re-sent every `sync_wait`. When
    membership changes, every live local cell is re-checked against the new
@@ -192,8 +192,7 @@ the changed member wins or held.
    below it are missing. As soon as a broadcast shows it missed earlier
    ones, and again every `sync_wait` until they arrive, it sends the owner
    a NACK naming them, and the owner re-sends those buckets' current
-   totals (`FLAG_REPAIR`). A
-   receiver that has not yet heard from an owner since discovering it
+   totals (`FLAG_REPAIR`). A receiver that has not yet heard from an owner since discovering it
    (every peer, for a node that just started), that fell more than 64
    broadcasts behind, or that asks for a broadcast the owner no longer
    remembers, gets a snapshot instead: the total of every bucket of every
@@ -213,8 +212,7 @@ A node never forwards another node's hits, only an owner sends a key's
 totals (broadcast, repair or snapshot), and nothing is sent to a
 non-owner. A receiver learns that it missed an owner's broadcast from the
 owner's next one, so a broadcast lost just before its owner falls silent
-stays missing until the owner broadcasts again; the next change to the
-key, which carries every live bucket of it, also repairs it.
+stays missing until the owner broadcasts again.
 
 ### Design notes
 
@@ -226,16 +224,19 @@ adapted as little as the CRDT and UDP require:
 - **Totals per bucket.** Gubernator's owner holds one total per key and
   broadcasts the key's current status. Here the owner holds the
   contributors' origin-tagged cells (so a re-sent sync cannot double
-  count) and broadcasts the key's status as one total per live bucket,
-  found through a per-key chain in the cell store; a bucketed window has
-  one number per bucket where Gubernator's single window has one. A
-  receiver holds one others count per bucket, raised to the total less its
-  own hits, rather than a replica of every contributor's cell. An earlier
-  version of this design broadcast every contributor's cell of a changed
-  key, which cost about 5.6 times `main`'s bytes in the `long-window`
-  regime (60 one-minute buckets, up to 60 contributors each); totals
-  carry at most one row per bucket, at 25 bytes instead of 46 plus a
-  16-byte origin. The batch limit counts keys, as Gubernator's does.
+  count) and broadcasts the key's status as one total per bucket; a
+  bucketed window has one number per bucket where Gubernator's single
+  window has one, and only the buckets that changed are sent. A receiver
+  holds one others count per bucket, raised to the total less its own
+  hits, rather than a replica of every contributor's cell. An earlier
+  version of this design broadcast every live cell of a changed key, from
+  every contributor and bucket, so that the key's next change repaired a
+  peer that missed a broadcast; that cost about 5.6 times `main`'s bytes
+  in the `long-window` regime (60 one-minute buckets, up to 60
+  contributors each). Repair on request (below) makes the re-send
+  unnecessary, and a total is 25 bytes where a cell was 46 plus a 16-byte
+  origin. The batch limit counts key buckets where Gubernator's counts
+  keys.
 - **Cadence.** Gubernator batches hits over a sub-millisecond window to
   coalesce requests, which is not a staleness bound. `sync_wait` and
   `broadcast_interval` are both 100 ms, chosen from the sub-second
@@ -265,7 +266,7 @@ adapted as little as the CRDT and UDP require:
 - **Batch limit.** Gubernator flushes a batch as soon as it holds
   `GlobalBatchLimit` keys and arms its timers on the first queued item.
   Here the sync and broadcast tickers are free-running and
-  `broadcast_batch_limit` caps the keys of one broadcast, leaving the rest
+  `broadcast_batch_limit` caps the key buckets of one broadcast, leaving the rest
   for the next tick; a sync is capped at `max_cells_per_tick` cells. Neither
   cap is reached at the loads in the benchmark regimes.
 - **Queue overflow.** If the sync queue is full when a hit arrives, the
@@ -306,7 +307,7 @@ when you do need to tune.
 |-------------------------|---------|--------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
 | `sync_wait`             | 100 ms  | How often a node sends its unacknowledged cells to their owners, and the retry interval for a lost sync or ack.    | Lower for fresher counts at more small packets; raise if packet rate is the bottleneck.          |
 | `broadcast_interval`    | 100 ms  | How often an owner broadcasts the totals of its changed keys to every peer.                                         | Each broadcast costs one packet per peer per interval, so cost grows with cluster size.          |
-| `broadcast_batch_limit` | 1 000   | Most keys in one owner broadcast; the rest wait for the next interval.                                             | Raise if owners' queues back up under bursts (`forwarded_dirty_len` in the admin snapshot).      |
+| `broadcast_batch_limit` | 1 000   | Most key buckets in one owner broadcast; the rest wait for the next interval.                                      | Raise if owners' queues back up under bursts (`forwarded_dirty_len` in the admin snapshot).      |
 | `tick_interval`         | 500 ms  | Period of the sweep that expires cells whose bucket left the window.                                               | Rarely.                                                                                          |
 | `max_cells_per_tick`    | 4 096   | Most cells one sync sends; the rest wait for the next `sync_wait`.                                                 | Raise if many keys are active per node.                                                          |
 | `max_payload_bytes`     | 1 400   | UDP datagram budget. The codec splits a batch across multiple packets when the cell list overflows.                | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.      |

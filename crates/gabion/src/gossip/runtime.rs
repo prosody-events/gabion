@@ -12,8 +12,9 @@
 //! discovered membership. A hit is recorded locally at once and queued for
 //! the owner; every `sync_wait` the node sends its unacknowledged cells to
 //! their owners, which fold them, acknowledge them, and every
-//! `broadcast_interval` broadcast the per-bucket totals of each changed key
-//! to every peer. See the "Design notes" in `crates/gabion/README.md`.
+//! `broadcast_interval` broadcast the totals of the changed key buckets to
+//! every peer, repairing on request the broadcasts a peer missed. See the
+//! "Design notes" in `crates/gabion/README.md`.
 
 use std::cell::Cell;
 use std::io;
@@ -283,9 +284,9 @@ where
         let sink_buf = DeltaSink::<C>::with_capacity(batch_cells);
         let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
         let frame_handles = Vec::with_capacity(batch_cells);
-        // A broadcast carries each live bucket of a changed key at most once,
-        // and every such bucket holds a cell, so the store's capacity bounds
-        // it.
+        // A broadcast or repair carries each bucket at most once, and a
+        // snapshot every bucket in the view; each holds a cell, so the
+        // store's capacity bounds them.
         let totals = Vec::with_capacity(store.capacity() as usize);
         let sync_batch = Vec::with_capacity(config.max_cells_per_tick);
         let encode_buf = PacketBuf::for_limits(config.wire_limits);
@@ -910,23 +911,18 @@ where
         }
     }
 
-    /// Broadcast the per-bucket totals of the keys this node owns that
-    /// changed since the last broadcast, at most `broadcast_batch_limit`
-    /// keys, to every peer. Every live bucket of a key goes out, so a peer
-    /// that missed an earlier broadcast catches up on the next change to the
-    /// key.
+    /// Broadcast the totals of the buckets of keys this node owns that
+    /// changed since the last broadcast, at most `broadcast_batch_limit`, to
+    /// every peer. A peer that misses one learns of it from the next and
+    /// asks for a repair.
     fn handle_broadcast_tick(&mut self) -> Result<(), GossipError> {
         self.ticks_total = self.ticks_total.saturating_add(1);
         self.totals.clear();
         self.outbox.begin_broadcast_round();
-        let mut keys = 0;
-        while keys < self.config.broadcast_batch_limit {
+        while self.totals.len() < self.config.broadcast_batch_limit {
             let Some(handle) = self.outbox.pop_broadcast() else {
                 break;
             };
-            if self.outbox.is_gathered(handle) {
-                continue;
-            }
             // Only the current owner broadcasts a key. A cell whose owner has
             // since moved is dropped here: its new owner gets the hits from
             // their contributors and broadcasts them.
@@ -936,12 +932,18 @@ where
             let Some(row) = self.store.get(handle) else {
                 continue;
             };
-            keys += 1;
-            for cell in self.store.key_cells(row.key.rule, row.key.key_hash) {
-                self.outbox.mark_gathered(cell);
+            // A bucket's own and others cells may both have changed; it goes
+            // out once, through the cell that reports it.
+            let Some((reporter, total)) =
+                self.store
+                    .bucket_total(row.key.rule, row.key.key_hash, row.key.bucket)
+            else {
+                continue;
+            };
+            if !self.outbox.is_gathered(reporter) {
+                self.outbox.mark_gathered(reporter);
+                self.totals.push(total);
             }
-            self.totals
-                .extend(self.store.key_totals(row.key.rule, row.key.key_hash));
         }
         if self.totals.is_empty() || self.membership.peers().is_empty() {
             return Ok(());

@@ -1388,8 +1388,8 @@ async fn hits_reach_other_nodes_only_through_the_owner() {
             assert_eq!(mesh.aggregates[1].total(), 3, "the owner folds it");
             assert_eq!(mesh.aggregates[2].total(), 0, "no non-owner relays a hit");
 
-            // Once the owner can reach C, its next broadcast carries the
-            // whole cell, so C catches up.
+            // Once the owner can reach C, its next broadcast shows C the one
+            // it missed, and C asks for a repair.
             mesh.router
                 .set_link_policy(mesh.addrs[1], mesh.addrs[2], LinkPolicy::Pass);
             mesh.clients[0]
@@ -1403,9 +1403,9 @@ async fn hits_reach_other_nodes_only_through_the_owner() {
         .await;
 }
 
-/// A peer that missed an owner's broadcast catches up on the next change to
-/// the key, whichever bucket of the key changed: the broadcast carries the
-/// totals of every live bucket.
+/// A peer that missed an owner's broadcast catches up once the owner
+/// broadcasts again, whichever bucket of the key changed: the new broadcast
+/// shows the gap, and the peer asks for a repair.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn next_change_to_a_key_repairs_a_peer_that_missed_a_broadcast() {
     let local = LocalSet::new();
@@ -1425,9 +1425,8 @@ async fn next_change_to_a_key_repairs_a_peer_that_missed_a_broadcast() {
             sim_advance_ticks(Duration::from_millis(100), 10).await;
             assert_eq!(mesh.aggregates[2].total(), 0);
 
-            // C's own hit changes a different cell (another origin) and a
-            // different bucket of the key; the owner's broadcast carries A's
-            // earlier cell along.
+            // C's own hit changes a different bucket of the key; its
+            // broadcast reveals the one C missed, which the owner repairs.
             mesh.router
                 .set_link_policy(mesh.addrs[1], mesh.addrs[2], LinkPolicy::Pass);
             mesh.clients[2]

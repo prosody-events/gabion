@@ -6,7 +6,7 @@
 //! [`AggregateStore`] that absorbs the resulting delta and expiration rows.
 //! Each `(rule, key)` has one owner chosen by rendezvous hash over the
 //! discovered membership: contributors send their hits to it, it folds them
-//! and broadcasts the per-bucket totals of each changed key to every peer.
+//! and broadcasts the totals of the changed key buckets to every peer.
 //! A single `tokio::select!`
 //! drives the arms (limit request, inbound, writable, peer event, admin, and
 //! three tickers) and calls `aggregates.apply(...)` once per CRDT-touching
@@ -81,11 +81,11 @@ pub struct GossipConfig {
     /// How often hits are sent to key owners and unacknowledged hits are
     /// re-sent. See [`crate::defaults::GOSSIP_SYNC_WAIT_MS`].
     pub sync_wait: Duration,
-    /// How often an owner broadcasts the totals of its changed keys to every
-    /// peer. See
+    /// How often an owner broadcasts the totals of its changed key buckets to
+    /// every peer. See
     /// [`crate::defaults::GOSSIP_BROADCAST_INTERVAL_MS`].
     pub broadcast_interval: Duration,
-    /// Most keys in one owner broadcast. See
+    /// Most key buckets in one owner broadcast. See
     /// [`crate::defaults::GOSSIP_BROADCAST_BATCH_LIMIT`].
     pub broadcast_batch_limit: usize,
     /// Optional HMAC key — when set, every outbound packet is authenticated

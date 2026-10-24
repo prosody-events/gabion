@@ -22,13 +22,6 @@ pub(super) fn hash_compact_cell_key(key: &CompactCellKey) -> u64 {
 }
 
 #[inline(always)]
-pub(super) fn hash_rule_key(rule: u16, key_hash: super::KeyHash) -> u64 {
-    let lo = key_hash.0 as u64;
-    let hi = (key_hash.0 >> 64) as u64;
-    mix64(lo ^ u64::from(rule)) ^ mix64(hi.wrapping_add(0xD6E8_FEB8_6659_FD93))
-}
-
-#[inline(always)]
 pub(super) fn hash_fingerprint(fingerprint: u128) -> u64 {
     let lo = fingerprint as u64;
     let hi = (fingerprint >> 64) as u64;

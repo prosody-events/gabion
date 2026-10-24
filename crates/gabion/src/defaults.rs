@@ -40,15 +40,15 @@ pub const GOSSIP_CLUSTER_ID_HASH: u128 = 1;
 /// instead. Unacknowledged hits are re-sent on the same cadence.
 pub const GOSSIP_SYNC_WAIT_MS: u64 = 100;
 
-/// How often a key's owner broadcasts the keys that changed since its last
-/// broadcast, as the per-bucket totals of every live bucket, to every peer,
-/// in milliseconds
+/// How often a key's owner broadcasts the totals of the key buckets that
+/// changed since its last broadcast to every peer, in milliseconds
 /// (`broadcast_interval`). Chosen with [`GOSSIP_SYNC_WAIT_MS`]: a hit reaches
 /// every peer within about one sync wait plus one broadcast interval.
 pub const GOSSIP_BROADCAST_INTERVAL_MS: u64 = 100;
 
-/// Most keys an owner puts in one broadcast (Gubernator's
-/// `GlobalBatchLimit`). Changed keys beyond it wait for the next interval.
+/// Most key buckets an owner puts in one broadcast (after Gubernator's
+/// `GlobalBatchLimit`). Changed buckets beyond it wait for the next
+/// interval.
 pub const GOSSIP_BROADCAST_BATCH_LIMIT: usize = 1000;
 
 /// Broadcast packets an owner remembers the key buckets of, so it can

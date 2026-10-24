@@ -26,11 +26,12 @@
 //!   the steady-state expiry pattern.
 //! * `expire/no_expirations`      — scan-only cost, no frees.
 //!
-//! * `owner_broadcast/hot_key`    — an owner's per-tick broadcast of one key at
-//!   its limit: gather the per-bucket totals of a key with 10 live buckets and
-//!   10 contributors each, and encode them into 1400-byte packets.
-//! * `owner_broadcast/site_keys`  — the common round: four changed keys of 3
-//!   live buckets and one contributor each.
+//! * `owner_broadcast/round`      — an owner's per-tick broadcast: look up the
+//!   totals of four changed key buckets (10 contributors each) and encode them
+//!   into a 1400-byte packet.
+//! * `owner_broadcast/snapshot`   — the owner's answer to a joining peer: the
+//!   totals of every bucket it owns (1,000 keys of 3 buckets) from a scan of
+//!   the whole store, encoded into 1400-byte packets.
 
 use std::hint::black_box;
 
@@ -1186,35 +1187,52 @@ fn bench_owner_broadcast(c: &mut Criterion) {
         max_payload_bytes: 1400,
         max_cells: 4096,
     };
-    for (name, keys, buckets, contributors) in [("hot_key", 1, 10, 10), ("site_keys", 4, 3, 1)] {
-        let (store, key_hashes) = owner_store(keys, buckets, contributors);
-        let rule = store.find_rule(rule_fingerprint(0)).expect("rule");
-        let mut totals: Vec<KeyTotal<u32>> = Vec::with_capacity(store.capacity() as usize);
-        let mut scratch = WireScratch::for_store(&store);
-        let mut buf = PacketBuf::for_limits(limits);
-        group.throughput(Throughput::Elements(keys as u64));
-        group.bench_function(name, |b| {
-            b.iter(|| {
-                totals.clear();
-                for &key in &key_hashes {
-                    totals.extend(store.key_totals(rule, black_box(key)));
-                }
-                let mut packets = Packets::<u32>::totals(
-                    wire_header(),
-                    &store,
-                    &totals,
-                    None,
-                    &mut scratch,
-                    limits,
-                )
-                .expect("ctor");
-                while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
-                    black_box(pkt);
-                    black_box(buf.as_bytes());
-                }
-            });
+    let header = Header {
+        flags: 0,
+        ..wire_header()
+    };
+
+    let (store, key_hashes) = owner_store(4, 3, 10);
+    let rule = store.find_rule(rule_fingerprint(0)).expect("rule");
+    let mut totals: Vec<KeyTotal<u32>> = Vec::with_capacity(store.capacity() as usize);
+    let mut scratch = WireScratch::for_store(&store);
+    let mut buf = PacketBuf::for_limits(limits);
+    group.throughput(Throughput::Elements(key_hashes.len() as u64));
+    group.bench_function("round", |b| {
+        b.iter(|| {
+            totals.clear();
+            for &key in &key_hashes {
+                let (_, total) = store
+                    .bucket_total(rule, black_box(key), 2)
+                    .expect("in view");
+                totals.push(total);
+            }
+            let mut packets =
+                Packets::<u32>::totals(header, &store, &totals, None, &mut scratch, limits)
+                    .expect("ctor");
+            while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
+                black_box(pkt);
+                black_box(buf.as_bytes());
+            }
         });
-    }
+    });
+
+    let (store, _) = owner_store(1_000, 3, 1);
+    let mut scratch = WireScratch::for_store(&store);
+    group.throughput(Throughput::Elements(3_000));
+    group.bench_function("snapshot", |b| {
+        b.iter(|| {
+            totals.clear();
+            totals.extend(store.view_totals());
+            let mut packets =
+                Packets::<u32>::totals(header, &store, &totals, None, &mut scratch, limits)
+                    .expect("ctor");
+            while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
+                black_box(pkt);
+                black_box(buf.as_bytes());
+            }
+        });
+    });
     group.finish();
 }
 

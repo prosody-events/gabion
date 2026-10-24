@@ -48,7 +48,7 @@ pub use index::CellIndex;
 pub use io::{DeltaSink, ExpirationSink, Observation, ObservationBatch};
 
 use dictionary::pow2_index_capacity_for;
-use hash::{hash_compact_cell_key, hash_rule_key};
+use hash::hash_compact_cell_key;
 
 use std::fmt;
 
@@ -336,14 +336,6 @@ pub struct CellStore<C: Count = u32> {
     // Identity index.
     index: CellIndex,
 
-    // Every cell of one `(rule, key)` (all buckets, all origins) is linked
-    // into a doubly linked chain, so an owner can gather a key's totals
-    // without scanning the store. `key_heads` maps `(rule, key)` to the
-    // chain's head slot.
-    key_heads: CellIndex,
-    key_next: Box<[u32]>,
-    key_prev: Box<[u32]>,
-
     // Per-origin sequence allocator (indexed by NodeSlot).
     next_sequence_by_origin: Box<[u64]>,
 
@@ -424,10 +416,6 @@ impl<C: Count> CellStore<C> {
             capacity: cap,
 
             index: CellIndex::with_capacity(index_cap),
-
-            key_heads: CellIndex::with_capacity(index_cap),
-            key_next: vec![NO_FREE; cap as usize].into_boxed_slice(),
-            key_prev: vec![NO_FREE; cap as usize].into_boxed_slice(),
 
             next_sequence_by_origin: vec![0_u64; config.node_dictionary_capacity as usize]
                 .into_boxed_slice(),
@@ -712,69 +700,6 @@ impl<C: Count> CellStore<C> {
         self.resolve(handle).map(|i| self.counts[i as usize])
     }
 
-    /// Every live cell of `(rule, key_hash)`, whatever its bucket or origin.
-    pub fn key_cells(
-        &self,
-        rule: RuleSlot,
-        key_hash: KeyHash,
-    ) -> impl Iterator<Item = CellHandle> + '_ {
-        let head = self.find_key_head(rule, key_hash);
-        std::iter::successors(head, |&slot| {
-            Some(self.key_next[slot as usize]).filter(|&next| next != NO_FREE)
-        })
-        .map(|slot| self.handle_for(slot))
-    }
-
-    fn find_key_head(&self, rule: RuleSlot, key_hash: KeyHash) -> Option<u32> {
-        self.key_heads.find(hash_rule_key(rule, key_hash), |slot| {
-            self.rules[slot as usize] == rule && self.key_hashes[slot as usize] == key_hash
-        })
-    }
-
-    /// Add the freshly filled `slot` to its key's chain.
-    fn link_key(&mut self, slot: u32) {
-        let rule = self.rules[slot as usize];
-        let key_hash = self.key_hashes[slot as usize];
-        match self.find_key_head(rule, key_hash) {
-            Some(head) => {
-                // Splice in behind the head so the head, and with it the
-                // `key_heads` entry, stays put.
-                let next = self.key_next[head as usize];
-                self.key_next[slot as usize] = next;
-                self.key_prev[slot as usize] = head;
-                self.key_next[head as usize] = slot;
-                if next != NO_FREE {
-                    self.key_prev[next as usize] = slot;
-                }
-            }
-            None => {
-                self.key_next[slot as usize] = NO_FREE;
-                self.key_prev[slot as usize] = NO_FREE;
-                self.key_heads
-                    .insert_unchecked(hash_rule_key(rule, key_hash), slot);
-            }
-        }
-    }
-
-    /// Remove `slot` from its key's chain.
-    fn unlink_key(&mut self, slot: u32) {
-        let next = self.key_next[slot as usize];
-        let prev = self.key_prev[slot as usize];
-        if prev != NO_FREE {
-            self.key_next[prev as usize] = next;
-            if next != NO_FREE {
-                self.key_prev[next as usize] = prev;
-            }
-            return;
-        }
-        let h = hash_rule_key(self.rules[slot as usize], self.key_hashes[slot as usize]);
-        self.key_heads.remove(h, slot);
-        if next != NO_FREE {
-            self.key_prev[next as usize] = NO_FREE;
-            self.key_heads.insert_unchecked(h, next);
-        }
-    }
-
     /// Iterate all active cell handles in storage order.
     ///
     /// Walks the full `capacity`, not `active_len` — suitable for diagnostics
@@ -826,7 +751,6 @@ impl<C: Count> CellStore<C> {
         };
         let h = hash_compact_cell_key(&key);
         self.index.remove(h, slot);
-        self.unlink_key(slot);
         self.rule_dictionary.dec_ref(rule);
         let freed_node = self.node_dictionary.dec_ref(origin);
         if freed_node {
@@ -916,7 +840,6 @@ impl<C: Count> CellStore<C> {
 
         self.index
             .insert_unchecked(hash_compact_cell_key(&key), slot);
-        self.link_key(slot);
         Ok(slot)
     }
 
@@ -985,15 +908,27 @@ impl<C: Count> CellStore<C> {
         own.saturating_add_hits(others.into())
     }
 
-    /// The view total of every live bucket of `(rule, key_hash)`, one row per
-    /// bucket this node holds a counted cell for.
-    pub fn key_totals(
+    /// The view total of `(rule, key_hash, bucket)`, with the handle of the
+    /// cell that reports it (see [`Self::view_totals`]); `None` if the
+    /// bucket is not in the view.
+    pub fn bucket_total(
         &self,
         rule: RuleSlot,
         key_hash: KeyHash,
-    ) -> impl Iterator<Item = KeyTotal<C>> + '_ {
-        self.key_cells(rule, key_hash)
-            .filter_map(|handle| self.reported_total(handle.index))
+        bucket: BucketEpoch,
+    ) -> Option<(CellHandle, KeyTotal<C>)> {
+        let cell = |origin, incarnation| {
+            self.lookup_index(CompactCellKey {
+                rule,
+                key_hash,
+                bucket,
+                origin,
+                incarnation,
+            })
+        };
+        let slot = cell(self.others_node_slot, OTHERS.incarnation)
+            .or_else(|| cell(self.local_node_slot, self.local_identity.incarnation))?;
+        Some((self.handle_for(slot), self.reported_total(slot)?))
     }
 
     /// The view total of every bucket of every key, one row per bucket this

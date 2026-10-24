@@ -421,12 +421,12 @@ pub struct GossipSettings {
     /// [`gabion::defaults::GOSSIP_SYNC_WAIT_MS`].
     #[serde(with = "humantime_serde")]
     pub sync_wait: Duration,
-    /// How often a key's owner broadcasts the totals of its changed keys to
-    /// every peer.
+    /// How often a key's owner broadcasts the totals of its changed key
+    /// buckets to every peer.
     /// See [`gabion::defaults::GOSSIP_BROADCAST_INTERVAL_MS`].
     #[serde(with = "humantime_serde")]
     pub broadcast_interval: Duration,
-    /// Most keys in one owner broadcast. See
+    /// Most key buckets in one owner broadcast. See
     /// [`gabion::defaults::GOSSIP_BROADCAST_BATCH_LIMIT`].
     pub broadcast_batch_limit: usize,
     pub fanout: usize,

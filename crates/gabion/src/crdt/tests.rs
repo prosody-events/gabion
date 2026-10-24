@@ -365,29 +365,6 @@ fn assert_structural_invariants(store: &CellStore<u32>) -> bool {
     if active != store.active_len() || store.index().len() != active {
         return false;
     }
-    // Every key's chain holds exactly the live cells of that key, once each.
-    let mut keys = BTreeMap::<(RuleSlot, u128), BTreeSet<(u32, u32)>>::new();
-    for handle in store.active_handles() {
-        let key = store
-            .get(handle)
-            .map(|row| (row.key.rule, row.key.key_hash.0));
-        keys.entry(key.unwrap())
-            .or_default()
-            .insert((handle.index, handle.generation));
-    }
-    if store.key_heads.len() as usize != keys.len() {
-        return false;
-    }
-    for (&(rule, key_hash), cells) in &keys {
-        let chain: Vec<_> = store.key_cells(rule, KeyHash(key_hash)).collect();
-        if chain.len() != cells.len()
-            || chain
-                .iter()
-                .any(|h| !cells.contains(&(h.index, h.generation)))
-        {
-            return false;
-        }
-    }
     for slot in 0..store.rule_dictionary().capacity() {
         let expected = rules.get(&slot).copied().unwrap_or(0);
         if store.rule_dictionary().refcount(slot) != expected {
@@ -1996,25 +1973,25 @@ fn others_cell_is_the_larger_of_totals_and_contributions() {
     assert_eq!(store.view(rule, KeyHash(0xabc), 0), 13);
 }
 
-/// `key_totals` reports one view total per live bucket of a key, whether the
-/// bucket holds an others cell, only this node's own hits, or both.
+/// Every bucket in the view is reported exactly once, by `view_totals` and by
+/// `bucket_total`, whether it holds an others cell, only this node's own
+/// hits, or both; contributor cells report nothing of their own.
 #[test]
-fn key_totals_report_each_bucket_once() {
+fn each_bucket_in_the_view_reports_one_total() {
     let mut store = store_u32();
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let rule = store.find_rule(0x11).unwrap();
     // Bucket 0: own hits only. Bucket 1: own hits and a contributor.
-    // Bucket 2: a contributor only. Another key's cells stay out.
+    // Bucket 2: a contributor only.
     local_increment_one(&mut store, 0x11, 0xabc, 0, 2, 0);
     local_increment_one(&mut store, 0x11, 0xabc, 1, 3, 0);
-    local_increment_one(&mut store, 0x11, 0xdef, 1, 9, 0);
     let mut obs = ObservationBatch::with_capacity(2);
     obs.push(observation(0x11, 0xabc, 1, 2, 1, 5, 0));
     obs.push(observation(0x11, 0xabc, 2, 2, 1, 4, 0));
     store.merge_remote(&obs, &mut DeltaSink::with_capacity(2));
 
     let mut totals: Vec<(BucketEpoch, u32)> = store
-        .key_totals(rule, KeyHash(0xabc))
+        .view_totals()
         .map(|t| {
             assert_eq!((t.rule, t.key_hash), (rule, KeyHash(0xabc)));
             (t.bucket, t.count)
@@ -2022,6 +1999,19 @@ fn key_totals_report_each_bucket_once() {
         .collect();
     totals.sort();
     assert_eq!(totals, vec![(0, 2), (1, 8), (2, 4)]);
+
+    for (bucket, count) in totals {
+        let (reporter, total) = store.bucket_total(rule, KeyHash(0xabc), bucket).unwrap();
+        assert_eq!(total.count, count);
+        let origin = store.get(reporter).unwrap().key.origin;
+        let expected = if bucket == 0 {
+            store.local_node_slot()
+        } else {
+            store.others_node_slot()
+        };
+        assert_eq!(origin, expected);
+    }
+    assert!(store.bucket_total(rule, KeyHash(0xabc), 3).is_none());
 }
 
 /// A peer cannot speak for this node or for its others cell: rows claiming
