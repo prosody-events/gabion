@@ -121,10 +121,10 @@ pub const GOSSIP_CLUSTER_ID_HASH: u128 = 1;
 
 /// Per-rule error budget for threshold-triggered anti-entropy, expressed in
 /// basis points of the rule's own limit. A node emits the moment its locally
-/// unreplicated delta for some rule R would cross `target_err_bps / 10_000 ×
-/// L_R / N` (per-site safe zone of Sharfman, Schuster, Keren, SIGMOD 2006,
-/// calibrated by the Olston/Jiang/Widom SIGMOD 2003 error budget). The
-/// cluster-wide unreplicated error per rule is then bounded by
+/// unreplicated delta for one key of some rule R would cross `target_err_bps /
+/// 10_000 × L_R / N` (per-site safe zone of Sharfman, Schuster, Keren, SIGMOD
+/// 2006, calibrated by the Olston/Jiang/Widom SIGMOD 2003 error budget). The
+/// cluster-wide unreplicated error per key is then bounded by
 /// `target_err_bps / 10_000 × L_R`, independent of request rate; default
 /// 100 bps = 1 % of the rule's limit.
 pub const GOSSIP_TARGET_ERR_BPS: u32 = 100;
