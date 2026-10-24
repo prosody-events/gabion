@@ -124,9 +124,16 @@ zone from its address.
   gap, so the receiver reports it with one of two header flags (`FLAG_GAP_OWN`,
   `FLAG_GAP_RELAY`) next to the cumulative ack, and the sender resends at once. The
   timeout and failover stay as specified: a report never marks a gateway suspect.
-- *Relay eligibility.* A gateway forwards a cell iff it arrived in an own-stream packet
-  from an origin outside the gateway's zone. Each cell slot carries a relay stamp (zero
-  for cells that must not be forwarded), so a cell is never forwarded twice.
+- *Relay eligibility.* A gateway forwards the cells of an own-stream packet from an
+  origin outside the gateway's zone, and never a cell that reached it from its own
+  zone or in a relay stream, so a cell is forwarded by one gateway per zone. It
+  forwards every cell of such a packet that extends the origin's stream beyond what it
+  had seen, whether or not the cell changed its store: after a failover the new
+  gateway receives the origin's window and may already hold cells the previous gateway
+  relayed, but the previous gateway could not reach a member that joined after it
+  learned the zone, nor relay what it held when it left. A packet wholly inside what
+  the gateway had seen (a resend after a gap) forwards only the cells it changed. Each
+  cell slot carries a relay stamp (zero for cells that must not be forwarded).
 
 **What no longer applies.** The runtime makes no random choice, so `GossipConfig::rng_seed`
 and `fanout` are unused; the CRDT's dirty rings and peer frontier are no longer written

@@ -23,7 +23,8 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, NodeId, Observation, ObservationBatch,
+    CellHandle, CellStore, CompactCellKey, Count, DeltaSink, ExpirationSink, NodeId, Observation,
+    ObservationBatch,
 };
 use crate::discovery::PeerEvent;
 use crate::wire::{
@@ -615,21 +616,26 @@ where
         // sender, so they are never forwarded again (stamp 0).
         let from_origin_across_zones = header.flags & FLAG_RELAY == 0
             && Zone::of(src, self.config.zone_prefix_len) != self.local_zone;
-        for &handle in &self.sink_buf.handles {
-            let stamp = if from_origin_across_zones {
-                self.relay_head += 1;
-                self.relay_head
-            } else {
-                0
-            };
-            if let Some(slot) = self.relay_stamp.get_mut(handle.index as usize) {
-                *slot = stamp;
+        let pi = self.peers.iter().position(|p| p.addr == src);
+        if from_origin_across_zones {
+            // Forward every cell of the origin's stream we had not seen from
+            // it before, changed here or not: a cell this node already holds
+            // may have reached the zone through a previous gateway, which
+            // could not reach a member that joined after it, or left before
+            // relaying it. A packet wholly inside what the origin sent us
+            // before is a resend, and only its changes are new to the zone.
+            let fresh = pi.is_some_and(|i| header.stream_upper > self.peers[i].own_in.seen());
+            self.stamp_for_relay(fresh);
+        } else {
+            for &handle in &self.sink_buf.handles {
+                if let Some(slot) = self.relay_stamp.get_mut(handle.index as usize) {
+                    *slot = 0;
+                }
             }
         }
-        self.relay_pending |= from_origin_across_zones && !self.sink_buf.is_empty();
 
         let now_ms = self.clock.now_millis();
-        let Some(pi) = self.peers.iter().position(|p| p.addr == src) else {
+        let Some(pi) = pi else {
             // Not (yet) in discovery: the cells are merged, but with no
             // stream state there is nothing to ack.
             return;
@@ -686,6 +692,47 @@ where
         if was_suspect {
             refresh_gateways(&mut self.peers, self.local_zone);
         }
+    }
+
+    /// Stamp the cells just merged from an origin in another zone for relay:
+    /// every cell of the packet that the store holds when `everything`,
+    /// otherwise only the ones the merge changed.
+    fn stamp_for_relay(&mut self, everything: bool) {
+        let before = self.relay_head;
+        if everything {
+            let obs = &self.obs_buf;
+            for i in 0..obs.len() {
+                let handle = self
+                    .store
+                    .find_rule(obs.rule_fingerprints[i])
+                    .zip(
+                        self.store
+                            .find_node(obs.origin_node_ids[i], obs.incarnations[i]),
+                    )
+                    .and_then(|(rule, origin)| {
+                        self.store.find(CompactCellKey {
+                            rule,
+                            key_hash: obs.key_hashes[i],
+                            bucket: obs.buckets[i],
+                            origin,
+                            incarnation: obs.incarnations[i],
+                        })
+                    });
+                if let Some(slot) = handle.and_then(|h| self.relay_stamp.get_mut(h.index as usize))
+                {
+                    self.relay_head += 1;
+                    *slot = self.relay_head;
+                }
+            }
+        } else {
+            for &handle in &self.sink_buf.handles {
+                if let Some(slot) = self.relay_stamp.get_mut(handle.index as usize) {
+                    self.relay_head += 1;
+                    *slot = self.relay_head;
+                }
+            }
+        }
+        self.relay_pending |= self.relay_head > before;
     }
 
     fn drain_one_send(&mut self) -> Result<(), GossipError> {

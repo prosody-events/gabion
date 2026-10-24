@@ -106,6 +106,11 @@ impl Inbound {
         }
     }
 
+    /// Highest sequence any packet closed.
+    pub(super) fn seen(&self) -> u64 {
+        self.seen
+    }
+
     /// Whether a gap is open.
     pub(super) fn gap(&self) -> bool {
         self.report_at.is_some()

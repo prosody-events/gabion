@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::crdt::{KeyHash, NodeId, NodeIdentity};
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
+use crate::gossip::topology::rendezvous_weight;
 use crate::gossip::{GossipClient, GossipConfig, GossipRuntime, TokioClock};
 
 use super::{
@@ -126,6 +127,49 @@ fn a_reported_gap_is_resent_before_the_retransmission_timeout() {
             4,
             "the first flush was lost, reported and resent within 50 ms of the second",
         );
+        nodes.stop().await;
+    });
+}
+
+/// A gateway that takes over forwards the origin's whole live window into
+/// its zone, even the cells it already holds: the previous gateway may have
+/// relayed them to every member but one it did not know of.
+#[test]
+fn a_new_gateway_forwards_cells_the_old_one_could_not() {
+    run_paused(async {
+        let origin = SocketAddr::from(([10, 0, 0, 1], 7946));
+        let mut zone: Vec<SocketAddr> = (1..=3)
+            .map(|i| SocketAddr::from(([10, 1, 0, i], 7946)))
+            .collect();
+        zone.sort_by_key(|&m| std::cmp::Reverse(rendezvous_weight(NodeId(0xC000), m)));
+        let (first, second, member) = (zone[0], zone[1], zone[2]);
+        let addrs = [origin, first, second, member];
+        let router = SimRouter::new();
+        let nodes = Nodes::start(&router, &addrs, |i, c| {
+            if addrs[i] == first {
+                // The first gateway never learns of `member`.
+                c.bootstrap_peers.retain(|&p| p != member);
+            }
+        });
+        nodes.clients[0]
+            .record(rule_fp(0), KeyHash(1), 0, 1, 0, 0)
+            .await
+            .expect("record");
+        sim_advance_ticks(Duration::from_millis(100), 10).await;
+        assert_eq!(
+            nodes.aggregates[3].total(),
+            0,
+            "the first gateway skipped it"
+        );
+
+        router.set_link_policy(origin, first, LinkPolicy::Block);
+        router.set_link_policy(first, origin, LinkPolicy::Block);
+        nodes.clients[0]
+            .record(rule_fp(0), KeyHash(2), 0, 1, 0, 0)
+            .await
+            .expect("record");
+        sim_advance_ticks(Duration::from_millis(100), 30).await;
+        assert_eq!(nodes.lagging(2), Vec::<usize>::new(), "all hold both hits");
         nodes.stop().await;
     });
 }
