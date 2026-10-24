@@ -110,10 +110,14 @@ fn no_pull() -> PlumtreeConfig {
 
 /// One local hit on `key`, as the limit-request arm handles it.
 fn hit(rt: &mut Rt, key: u128) {
+    hit_in(rt, key, 1);
+}
+
+fn hit_in(rt: &mut Rt, key: u128, bucket: u32) {
     rt.handle_limit_request(LimitRequest {
         rule_fingerprint: RULE,
         key_hash: KeyHash(key),
-        bucket: 1,
+        bucket,
         hits: 1,
         rule_limit: 1_000,
         now_millis: rt.clock.now_millis(),
@@ -361,6 +365,42 @@ fn a_version_that_arrived_off_the_tree_is_forwarded_on_its_first_tree_delivery()
         assert_eq!(count(&log, ControlKind::Prune), 0, "{off_tree:?}");
         assert_eq!(all[1].rt.pt.queued_relay(), 1, "{off_tree:?}");
     }
+}
+
+#[test]
+fn an_origin_whose_cells_expired_comes_back_to_its_pruned_tree() {
+    let (mut all, clock) = cluster(3, no_pull());
+    hit(&mut all[0].rt, 1);
+    heartbeat(&mut all[0]);
+    settle(&mut all, |p| p.kind() == FrameKind::Eager);
+    relay(&mut all, &clock);
+    settle(&mut all, |_| true);
+    let c = all[2].addr;
+    let a_root = slot_of(&all[1], &all[0]);
+    assert!(is_lazy(&mut all[1], a_root, c));
+
+    // A goes quiet until its cells expire at B, which frees A's node slot;
+    // C's next change takes that slot.
+    clock.advance(12 * 60_000);
+    heartbeat(&mut all[1]);
+    settle(&mut all, |_| false);
+    assert_eq!(all[1].rt.store.active_len(), 0);
+    let bucket = (clock.now_millis() / 60_000) as u32;
+    hit_in(&mut all[2].rt, 2, bucket);
+    all[2].rt.handle_gossip_tick(Round::Threshold);
+    settle(&mut all, |p| {
+        p.kind() == FrameKind::Eager && p.to == Some(1)
+    });
+    assert_eq!(slot_of(&all[1], &all[2]), a_root, "C took A's slot");
+
+    // A's next change finds B's edge to C still lazy for A's root.
+    hit_in(&mut all[0].rt, 3, bucket);
+    all[0].rt.handle_gossip_tick(Round::Threshold);
+    settle(&mut all, |p| {
+        p.kind() == FrameKind::Eager && p.to == Some(1)
+    });
+    let a_root = slot_of(&all[1], &all[0]);
+    assert!(is_lazy(&mut all[1], a_root, c));
 }
 
 // -- trees: IHAVE and GRAFT ---------------------------------------------------

@@ -27,6 +27,8 @@ const VIEW_MAX: usize = 32;
 pub(super) const NO_POS: u8 = u8::MAX;
 /// Distinct announcers one missing origin remembers, to GRAFT in turn.
 const ANNOUNCERS: usize = 4;
+/// Positions of the parked-root table one origin may take.
+const PARK_PROBES: usize = 8;
 
 /// Why a round runs, which decides what it sends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,6 +161,7 @@ struct Missing {
 /// the view.
 #[derive(Clone, Copy)]
 struct Root {
+    /// `NodeId(0)`: no origin.
     node_id: NodeId,
     incarnation: Incarnation,
     lazy: u32,
@@ -167,6 +170,15 @@ struct Root {
     /// not raise it, so an announcement above it means the tree has not
     /// delivered the change, however the cell got here.
     delivered: u64,
+}
+
+impl Root {
+    const EMPTY: Self = Self {
+        node_id: NodeId(0),
+        incarnation: 0,
+        lazy: 0,
+        delivered: 0,
+    };
 }
 
 /// The last eager packets this node sent, newest overwriting oldest, so a NACK
@@ -228,6 +240,8 @@ pub(super) struct Plumtree {
     occupied: u32,
     /// Per origin node slot.
     roots: Box<[Root]>,
+    /// Roots of origins whose node slot went to another origin, by identity.
+    parked: Box<[Root]>,
     /// Changes waiting for a round, capped at `max_cells_per_tick` each.
     local: Vec<Queued>,
     relay: Vec<Queued>,
@@ -323,16 +337,8 @@ impl Plumtree {
             cfg,
             view: [None; VIEW_MAX],
             occupied: 0,
-            roots: vec![
-                Root {
-                    node_id: NodeId(0),
-                    incarnation: 0,
-                    lazy: 0,
-                    delivered: 0,
-                };
-                nodes
-            ]
-            .into_boxed_slice(),
+            roots: vec![Root::EMPTY; nodes].into_boxed_slice(),
+            parked: vec![Root::EMPTY; nodes].into_boxed_slice(),
             local: Vec::with_capacity(queue_capacity),
             relay: Vec::with_capacity(queue_capacity),
             queue_capacity,
@@ -395,21 +401,75 @@ impl Plumtree {
         }
     }
 
-    /// The root in `slot`. A slot freed and reused by another origin starts
-    /// again with every view position eager and nothing delivered.
+    /// The root in `slot`. The store frees an origin's node slot when its
+    /// last cell expires, and may hand the slot to another origin. The tree
+    /// state of an origin outlives its slot: the previous holder of the slot
+    /// is parked, and an origin that comes back finds its own state, parked
+    /// or left in a slot it held before. Only an origin never seen, or one
+    /// whose parked state was overwritten, starts with every view position
+    /// eager and nothing delivered, flooding its first change to prune again.
     fn root_mut(&mut self, nodes: &NodeDictionary, slot: NodeSlot) -> &mut Root {
-        let root = &mut self.roots[slot as usize];
-        if let Some(d) = nodes.descriptor(slot)
-            && (root.node_id, root.incarnation) != (d.node_id, d.incarnation)
-        {
-            *root = Root {
-                node_id: d.node_id,
-                incarnation: d.incarnation,
-                lazy: 0,
-                delivered: 0,
-            };
+        if let Some(d) = nodes.descriptor(slot) {
+            let held = &self.roots[slot as usize];
+            if (held.node_id, held.incarnation) != (d.node_id, d.incarnation) {
+                let previous = *held;
+                if previous.node_id != NodeId(0) {
+                    self.park(previous);
+                }
+                self.roots[slot as usize] = self.unpark(nodes, d.node_id, d.incarnation);
+            }
         }
-        root
+        &mut self.roots[slot as usize]
+    }
+
+    /// Up to [`PARK_PROBES`] positions of the parked table `node_id` may sit
+    /// in.
+    fn park_probe(&self, node_id: NodeId) -> impl Iterator<Item = usize> {
+        let len = self.parked.len();
+        let home = (node_id.0 as u64 ^ (node_id.0 >> 64) as u64) as usize % len;
+        (0..PARK_PROBES.min(len)).map(move |i| (home + i) % len)
+    }
+
+    /// Keep `root` until its origin comes back. When every position it may
+    /// take is held by another origin, the first is overwritten.
+    fn park(&mut self, root: Root) {
+        let free = self
+            .park_probe(root.node_id)
+            .find(|&i| [NodeId(0), root.node_id].contains(&self.parked[i].node_id));
+        if let Some(i) = free.or_else(|| self.park_probe(root.node_id).next()) {
+            self.parked[i] = root;
+        }
+    }
+
+    /// The tree state `(node_id, incarnation)` left behind: parked, or still
+    /// in a slot it no longer holds. A fresh, all-eager root if there is none.
+    fn unpark(
+        &mut self,
+        nodes: &NodeDictionary,
+        node_id: NodeId,
+        incarnation: Incarnation,
+    ) -> Root {
+        let fresh = Root {
+            node_id,
+            incarnation,
+            lazy: 0,
+            delivered: 0,
+        };
+        let parked = self.park_probe(node_id).find(|&i| {
+            (self.parked[i].node_id, self.parked[i].incarnation) == (node_id, incarnation)
+        });
+        if let Some(i) = parked {
+            return std::mem::replace(&mut self.parked[i], Root::EMPTY);
+        }
+        let stale = (0..self.roots.len()).find(|&i| {
+            (self.roots[i].node_id, self.roots[i].incarnation) == (node_id, incarnation)
+                && nodes
+                    .descriptor(i as NodeSlot)
+                    .is_none_or(|d| (d.node_id, d.incarnation) != (node_id, incarnation))
+        });
+        stale.map_or(fresh, |i| {
+            std::mem::replace(&mut self.roots[i], Root::EMPTY)
+        })
     }
 
     fn lazy_mut(&mut self, nodes: &NodeDictionary, slot: NodeSlot) -> &mut u32 {
@@ -502,7 +562,7 @@ where
         self.pt.view[pos] = Some(self.peers[index].addr);
         self.pt.occupied |= 1 << pos;
         self.peers[index].view_pos = pos as u8;
-        for root in self.pt.roots.iter_mut() {
+        for root in self.pt.roots.iter_mut().chain(self.pt.parked.iter_mut()) {
             root.lazy &= !(1 << pos);
         }
     }
@@ -515,7 +575,7 @@ where
         if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == addr) {
             peer.view_pos = NO_POS;
         }
-        for root in self.pt.roots.iter_mut() {
+        for root in self.pt.roots.iter_mut().chain(self.pt.parked.iter_mut()) {
             root.lazy &= !(1 << pos);
         }
     }

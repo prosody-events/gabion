@@ -87,7 +87,10 @@ at different edges and keep pruning each other's tree.
   and each move is made by the edge's sender when PRUNE or GRAFT reaches it.
 - **Eager and lazy sets, per root.** For each origin, the view splits into an
   eager set and a lazy set. A new neighbour, and a root first seen, start
-  eager.
+  eager. A root's sets outlive the store's slot for its origin, which is freed
+  when the origin's last cell expires and may go to another origin: they are
+  parked by identity and found again when the origin's next change arrives,
+  so a quiet origin does not rebuild its tree by flooding every edge.
 - **Eager push.** A node pushes the cells of a round to the peers that are eager
   for their origin, never back to the peer a change came from. Local changes go
   out in heartbeat and threshold rounds (main's scheduler). A change that
