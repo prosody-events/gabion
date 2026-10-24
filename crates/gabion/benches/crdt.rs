@@ -301,6 +301,14 @@ fn pareto_key(rng: &mut Rng, hot: &[u128], warm: &[u128]) -> u128 {
     }
 }
 
+/// The runtime's per-(rule, key) pending-table index
+/// (`gossip/runtime/pending.rs`): the key hash folded, never re-hashed.
+fn pending_index(rule: u16, key: u128, slots: usize) -> usize {
+    let folded =
+        (key as u64) ^ ((key >> 64) as u64) ^ u64::from(rule).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    folded as usize & (slots - 1)
+}
+
 /// Fresh key never previously inserted. Encoded outside the warm/hot
 /// universe so it can't collide.
 fn fresh_key(rng: &mut Rng) -> u128 {
@@ -447,9 +455,10 @@ fn bench_ingest_local(c: &mut Criterion) {
     // ─── threshold_trigger_steady_state ────────────────────────────────
     // Models the runtime's additional per-request work (`handle_limit_request`
     // in `crates/gabion/src/gossip/runtime.rs`): one `rule_dictionary.find`
-    // lookup, one saturating-add into a per-rule pending column, one
-    // mul/div for ε, one compare. Target: < 1% regression vs `steady_state`
-    // with `batch == 128`.
+    // lookup, one fold of the key hash into the per-(rule, key) pending
+    // table, one saturating add, one mul/div for ε, one compare. Target:
+    // < 1% regression vs `steady_state` with `batch == 128`.
+    let pending_slots = gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY.next_power_of_two();
     for &batch in &[1usize, 32, 128] {
         group.throughput(Throughput::Elements(batch as u64));
         group.bench_function(
@@ -462,7 +471,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                             ObservationBatch::<u32>::with_capacity(batch),
                             DeltaSink::<u32>::with_capacity(batch),
                             Rng::new(0x7E57_7E57),
-                            vec![0_u32; 64].into_boxed_slice(),
+                            vec![0_u32; pending_slots].into_boxed_slice(),
                         )
                     },
                     |(store, obs, sink, rng, pending)| {
@@ -480,12 +489,12 @@ fn bench_ingest_local(c: &mut Criterion) {
                             let fp = fixture.rule_fps[rule_idx];
                             // Mirror the runtime's threshold-trigger
                             // arithmetic:
-                            // lookup the rule slot, bump per-rule pending,
-                            // compute ε, compare. We don't store the flag; the
-                            // compare's side effects are observed via
-                            // `black_box`.
+                            // lookup the rule slot, bump the key's pending
+                            // count, compute ε, compare. We don't store the
+                            // flag; the compare's side effects are observed
+                            // via `black_box`.
                             if let Some(slot) = store.rule_dictionary().find(fp) {
-                                let idx = slot as usize;
+                                let idx = pending_index(slot, key, pending.len());
                                 let p = pending[idx].saturating_add(1);
                                 pending[idx] = p;
                                 let epsilon = (1_000_000_u64 * 100) / (10_000 * 8);
@@ -510,28 +519,28 @@ fn bench_ingest_local(c: &mut Criterion) {
     }
 
     // ─── threshold_trigger_burst ───────────────────────────────────────
-    // Burst of 50k hits to a previously-quiet single rule: measures
-    // crossing-detection + repeated immediate-tick cost on the
-    // adversarial path. ε saturates to 1, so every iteration past the
-    // first crosses. We don't measure the runtime's tick dispatch here
-    // — only the per-request lookup/add/compare — but the bench is
-    // sized so a future regression in those primitives is visible.
-    let burst_keys: Vec<u128> = fixture.hot_keys.iter().take(64).copied().collect();
+    // Burst of hits to one rule spread Pareto-wise over its hot and warm
+    // keys: measures the runtime's per-request crossing detection, which
+    // keeps one pending count per (rule, key) in a direct-mapped table
+    // sized to the local dirty ring and indexed by folding the
+    // already-computed key hash. ε saturates to 1, the adversarial case.
+    // The runtime's tick dispatch is not measured here — only the
+    // per-request fold/add/compare beside the ingest it rides with.
     group.throughput(Throughput::Elements(128));
     group.bench_function("threshold_trigger_burst", |b| {
         let mut store = fixture.store.clone();
         let mut obs = ObservationBatch::<u32>::with_capacity(128);
         let mut sink = DeltaSink::<u32>::with_capacity(128);
         let mut rng = Rng::new(0xB0_B0_B0);
-        let mut pending = vec![0_u32; 64].into_boxed_slice();
+        let mut pending = vec![0_u32; pending_slots].into_boxed_slice();
         b.iter(|| {
             obs.clear();
             sink.clear();
             for _ in 0..128 {
-                let key = burst_keys[rng.range(burst_keys.len() as u32) as usize];
+                let key = pareto_key(&mut rng, &fixture.hot_keys, &fixture.warm_keys);
                 let fp = fixture.rule_fps[0];
                 if let Some(slot) = store.rule_dictionary().find(fp) {
-                    let idx = slot as usize;
+                    let idx = pending_index(slot, key, pending.len());
                     let p = pending[idx].saturating_add(1);
                     pending[idx] = p;
                     let epsilon = 1_u64; // saturated case
