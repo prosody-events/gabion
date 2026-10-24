@@ -15,7 +15,8 @@ fn origin(id: u128) -> OriginKey {
 }
 
 fn entry(id: u128, max: u64, held: &[u64]) -> DigestEntry {
-    let mut entry = DigestEntry::new(origin(id), max);
+    let oldest = held.iter().copied().min().unwrap_or(max);
+    let mut entry = DigestEntry::new(origin(id), max, oldest);
     for &sequence in held {
         entry.mark(sequence);
     }
@@ -54,6 +55,61 @@ fn entry_holds_exactly_what_was_marked_inside_the_window() {
         "beyond the window is assumed held"
     );
     assert!(entry.holds(3));
+}
+
+#[test]
+fn a_whole_entry_holds_nothing_older_than_its_bitmap() {
+    let max = 1_000;
+    let entry = entry(1, max, &[max, max - 2, max - 70]);
+    assert!(entry.holds(max - 70));
+    assert!(!entry.holds(max - 71));
+    assert!(
+        !entry.holds(max - DIGEST_WINDOW),
+        "below the oldest held is lacked, not assumed held"
+    );
+}
+
+#[test]
+fn an_entry_costs_only_the_words_it_needs() {
+    let one = encode_all(&[entry(1, 9, &[9, 3])], false, None);
+    let two = encode_all(&[entry(1, 99, &[99, 3])], false, None);
+    let window = encode_all(&[entry(1, 999, &[999, 3])], false, None);
+    assert_eq!(one[0].len() + 8, two[0].len());
+    assert_eq!(one[0].len() + 8 * (DIGEST_WORDS - 1), window[0].len());
+    assert_eq!(
+        one[0].len(),
+        HEADER_LEN + BODY_OVERHEAD + ENTRY_FIXED_BYTES + 8
+    );
+}
+
+#[test]
+fn entries_of_every_reach_round_trip() {
+    let entries: Vec<_> = (1..=12)
+        .map(|id| {
+            let max = id as u64 * 50;
+            entry(id, max, &[max, max - 1, max.saturating_sub(id as u64 * 40)])
+        })
+        .collect();
+    let mut decoded = Vec::new();
+    for bytes in encode_all(&entries, false, None) {
+        decode_digest_visit(&bytes, None, LIMITS, |e| decoded.push(e)).unwrap();
+    }
+    assert_eq!(decoded, entries);
+}
+
+#[test]
+fn a_reach_out_of_range_is_rejected() {
+    let packets = encode_all(&[entry(1, 5, &[5])], false, None);
+    let reach_at = HEADER_LEN + BODY_OVERHEAD + ENTRY_FIXED_BYTES - 1;
+    for bad in [0, DIGEST_WORDS as u8 + 1, REACH_CUT | 1] {
+        let mut bytes = packets[0].clone();
+        bytes[reach_at] = bad;
+        assert_eq!(
+            decode_digest_visit(&bytes, None, LIMITS, |_| ()).unwrap_err(),
+            DecodeError::BadDigestReach,
+            "reach byte {bad:#x}",
+        );
+    }
 }
 
 #[test]
@@ -136,7 +192,7 @@ fn malformed_digests_are_rejected() {
 #[test]
 fn budget_too_small_for_one_entry_is_an_error() {
     let tiny = FrameLimits {
-        max_payload_bytes: HEADER_LEN + BODY_OVERHEAD + ENTRY_BYTES - 1,
+        max_payload_bytes: HEADER_LEN + BODY_OVERHEAD + MAX_ENTRY_BYTES - 1,
         max_cells: 1,
     };
     assert!(matches!(

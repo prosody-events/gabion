@@ -117,6 +117,8 @@ pub enum DecodeError {
     Trailing,
     #[error("frame is not a digest")]
     NotADigest,
+    #[error("digest entry's bitmap length is out of range")]
+    BadDigestReach,
 }
 
 // -- send-side buffer -------------------------------------------------------

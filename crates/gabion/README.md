@@ -77,8 +77,9 @@ buffer.
   message ids. Here the unit is a cell, and a cell keeps the sequence its
   origin stamped on it (a cell learned from a peer is no longer re-stamped, so
   sequences compare across nodes). A digest entry is one origin's maximum
-  sequence held plus a 256-bit bitmap of the sequences held below it;
-  sequences further back are assumed held. A bare maximum, as Scuttlebutt
+  sequence held plus a bitmap of the sequences held below it, in as many
+  64-bit words as reach the oldest sequence held (see the window below). A
+  bare maximum, as Scuttlebutt
   uses over an ordered stream, would never repair a gap left by a lost
   datagram, because direct mail is unordered and unacknowledged. A newer
   version of a held cell has a new sequence, so it shows as missing. The
@@ -109,21 +110,27 @@ buffer.
   one origin. The scan stops at the budget, so the cells served first are
   whichever the store holds first. Progress still comes from the requester's
   next digest, which no longer lists what it received.
-- *The digest window is bounded.* The bitmap covers
-  `GOSSIP_DIGEST_WINDOW_WORDS * 64` (256) sequences below an origin's maximum.
-  A cell more than 256 sequences behind the newest sequence the requester holds
-  for its origin is taken as held and never served. Repair therefore sees every
-  live cell only while an origin's change rate times its rules' live span
-  (window plus one bucket) stays at or under `64 * GOSSIP_DIGEST_WINDOW_WORDS`
-  sequences. A joiner, or a node back from a partition, that has received any
-  direct mail from an origin since lists it with that newest sequence, so the
-  origin's older live cells below the window never reach it. At 1,800 req/s
-  over 183 pods and a 10 s window the span is about 110 sequences; at 7,200
-  req/s over 300 pods it is about 260, just past the window, so the oldest live
+- *The digest window is bounded, and an entry pays only for the words it
+  uses.* The bitmap covers at most `GOSSIP_DIGEST_WINDOW_WORDS * 64` (256)
+  sequences below an origin's maximum. An entry whose held sequences, newest
+  to oldest, fit in fewer words sends only those words, and says that nothing
+  older is held: a joiner, or a node back from a partition, that has received
+  some direct mail from an origin since is still sent that origin's older live
+  cells. An entry whose held sequences span more than the window sends all its
+  words and says that older sequences are held, so a cell more than 256
+  sequences behind the newest the requester holds is never served. Repair
+  therefore sees every live cell while an origin's change rate times its
+  rules' live span (window plus one bucket) stays at or under
+  `64 * GOSSIP_DIGEST_WINDOW_WORDS` sequences. At 1,800 req/s over 183 pods and
+  a 10 s window the span is about 110 sequences (two words); at 7,200 req/s
+  over 300 pods it is about 260, just past the window, so the oldest live
   bucket can fall outside repair; a one-hour rule at 0.5 changes a second per
-  origin spans about 1,800, and a joiner or a long partition never recovers its
-  older buckets. Widening the window costs 8 bytes per word in every digest
-  entry.
+  origin spans about 1,800, and a lost cell in its older buckets is never
+  repaired. Widening the window costs 8 bytes per word only in entries that
+  need it. The paper's digest is a list of message ids and has no such
+  encoding; the trimming saves about a quarter of the digest bytes at
+  `prod-typical` and of the whole protocol's bytes when idle, where digests are
+  most of the traffic.
 - *A node far behind pulls again at once (adapted from the `pull-sweep-join`
   component).* A repair answer that stops at the responder's budget, or at its
   free send slots, carries `FLAG_CUT` on its last packet. The receiver then

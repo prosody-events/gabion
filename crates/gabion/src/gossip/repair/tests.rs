@@ -99,6 +99,25 @@ fn a_gap_in_the_middle_is_named_and_served() {
     assert_eq!(lacked(&holder, entries, scope), [3]);
 }
 
+/// A node that has only the newest cells of an origin (a joiner, or a node
+/// back from a partition, that got some direct mail since) is sent the older
+/// ones too: its digest's bitmap reaches its oldest held sequence and stops.
+#[test]
+fn cells_older_than_everything_the_peer_holds_are_served() {
+    let mut holder = store(1);
+    let mut peer = store(2);
+    for sequence in [1, 2, 3, 400] {
+        merge(&mut holder, 9, sequence as u128, 1, sequence);
+    }
+    merge(&mut peer, 9, 400, 1, 400);
+    let (entries, scope) = digest_of(&peer);
+    assert_eq!(
+        lacked(&holder, entries, scope),
+        [1, 2, 3],
+        "more than a window below the peer's newest, yet lacked"
+    );
+}
+
 #[test]
 fn a_newer_version_of_a_held_cell_is_served() {
     let mut holder = store(1);

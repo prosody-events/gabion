@@ -23,6 +23,9 @@ fn origin_key<C: Count>(store: &CellStore<C>, slot: NodeSlot) -> Option<OriginKe
 /// Summarises the local store as one [`DigestEntry`] per origin.
 pub(super) struct DigestBuilder {
     entries: Vec<DigestEntry>,
+    /// Per entry, in order of first sight: origin, highest and oldest
+    /// sequence held.
+    spans: Vec<(OriginKey, u64, u64)>,
     entry_of_slot: Box<[u16]>,
 }
 
@@ -31,31 +34,38 @@ impl DigestBuilder {
         let nodes = store.node_dictionary().capacity() as usize;
         Self {
             entries: Vec::with_capacity(nodes),
+            spans: Vec::with_capacity(nodes),
             entry_of_slot: vec![NO_ENTRY; nodes].into_boxed_slice(),
         }
     }
 
     /// Rebuild the digest from `store`. The result is sorted by origin.
     pub(super) fn build<C: Count>(&mut self, store: &CellStore<C>) -> &[DigestEntry] {
-        self.entries.clear();
+        self.spans.clear();
         self.entry_of_slot.fill(NO_ENTRY);
 
         store.visit_active(|_, slot, sequence| {
-            let index = match self.entry_of_slot[slot as usize] {
+            match self.entry_of_slot[slot as usize] {
                 NO_ENTRY => {
-                    let Some(origin) = origin_key(store, slot) else {
-                        return true;
-                    };
-                    self.entry_of_slot[slot as usize] = self.entries.len() as u16;
-                    self.entries.push(DigestEntry::new(origin, 0));
-                    self.entries.len() - 1
+                    if let Some(origin) = origin_key(store, slot) {
+                        self.entry_of_slot[slot as usize] = self.spans.len() as u16;
+                        self.spans.push((origin, sequence, sequence));
+                    }
                 }
-                index => index as usize,
-            };
-            let entry = &mut self.entries[index];
-            entry.max_sequence = entry.max_sequence.max(sequence);
+                index => {
+                    let (_, max, oldest) = &mut self.spans[index as usize];
+                    *max = (*max).max(sequence);
+                    *oldest = (*oldest).min(sequence);
+                }
+            }
             true
         });
+        self.entries.clear();
+        self.entries.extend(
+            self.spans
+                .iter()
+                .map(|&(origin, max, oldest)| DigestEntry::new(origin, max, oldest)),
+        );
         store.visit_active(|_, slot, sequence| {
             if let Some(entry) = self
                 .entries
