@@ -19,7 +19,8 @@ const FRAME_KIND_MASK: u16 = 0b111 << FRAME_KIND_SHIFT;
 /// `gossip::runtime::plumtree`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameKind {
-    /// Repair slices and pull replies: merge, never forward.
+    /// PULL replies, the catch-up that leaves the tree alone: merge, never
+    /// forward.
     Plain = 0,
     /// Eager push along a root's tree, numbered per edge (the number rides in
     /// `min_origin_sequence`). A duplicate here is the PRUNE signal.
@@ -32,7 +33,8 @@ pub enum FrameKind {
     /// Hybrid random push: merge, forward only once a tree edge delivers the
     /// same change.
     Random = 4,
-    /// IHAVE, GRAFT, PRUNE, NACK or PULL: no cells, see [`super::ControlKind`].
+    /// IHAVE, GRAFT, PRUNE, NACK, PULL or DIGEST: no cells, see
+    /// [`super::ControlKind`].
     Control = 5,
 }
 

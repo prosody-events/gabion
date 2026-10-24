@@ -12,6 +12,7 @@
 //! | `Pull`  | as `Graft`, without joining the tree | 0 |
 //! | `Prune` | `(origin, incarnation, 0)`      | 0 |
 //! | `Nack`  | none                            | first number of a 64-packet window, and a mask of its missing numbers |
+//! | `Digest` | `(origin, incarnation, count of its settled cells)` | the sender's clock, which fixes the settled buckets |
 
 use super::auth::{self, AUTH_TAG_LEN};
 use super::header::{
@@ -40,6 +41,10 @@ pub enum ControlKind {
     /// A catch-up request for an origin's live cells that leaves the tree
     /// alone.
     Pull = 5,
+    /// Repair: "this is how many hits I hold of each origin in buckets that
+    /// should have settled". The header's `min_origin_sequence` is the
+    /// sender's clock in milliseconds, which fixes which buckets count.
+    Digest = 6,
 }
 
 impl ControlKind {
@@ -50,6 +55,7 @@ impl ControlKind {
             3 => Some(Self::Prune),
             4 => Some(Self::Nack),
             5 => Some(Self::Pull),
+            6 => Some(Self::Digest),
             _ => None,
         }
     }

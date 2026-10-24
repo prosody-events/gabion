@@ -11,7 +11,10 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::crdt::{CellHandle, CellStore, Count, Incarnation, NodeDictionary, NodeId, NodeSlot};
+use crate::crdt::{
+    BucketEpoch, CellHandle, CellStore, Count, Incarnation, NodeDictionary, NodeId, NodeSlot,
+    RuleDescriptor,
+};
 use crate::defaults;
 use crate::wire::{self, ControlEntry, ControlKind, FrameKind, Header, Packets};
 
@@ -186,7 +189,7 @@ impl SentRing {
     }
 
     /// Remember a packet. One with more cells than a slot holds is not kept; a
-    /// NACK for it goes unanswered and the repair slice delivers its cells.
+    /// NACK for it goes unanswered and the repair digests recover its cells.
     fn push(&mut self, dst: SocketAddr, sequence: u64, handles: &[CellHandle]) {
         let width = defaults::PLUMTREE_RESEND_CELLS_PER_PACKET;
         let i = self.head;
@@ -231,8 +234,8 @@ pub(super) struct Plumtree {
     /// Earliest time a missing-announcement or NACK timer may fire.
     deadline: Option<u64>,
     sent: SentRing,
-    /// Per cell slot: the stored version arrived off the tree (a repair slice,
-    /// a pull, a random push) and has not been forwarded. The tree's own
+    /// Per cell slot: the stored version arrived off the tree (a pull, a
+    /// random push) and has not been forwarded. The tree's own
     /// delivery of it is a first delivery, not a duplicate.
     off_tree: Box<[bool]>,
     heartbeats: u64,
@@ -252,6 +255,55 @@ pub(super) struct Plumtree {
     /// Per origin node slot: send cells above this sequence (`u64::MAX`: not
     /// asked for).
     want: Box<[u64]>,
+    /// Per origin node slot: the hits held in its settled cells
+    /// ([`settled`]) as of `sums_at`, for repair digests.
+    sums: Box<[u64]>,
+    sums_at: Option<u64>,
+    /// The cell slot the next GRAFT or PULL reply starts from.
+    reply_cursor: u32,
+    /// Per rule slot: its settled cells as of `sums_at`, and scratch for
+    /// another instant's.
+    settled: Box<[Option<Settled>]>,
+    settled_scratch: Box<[Option<Settled>]>,
+}
+
+/// Which cells of a rule a repair digest counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Settled {
+    /// Cells in these buckets, oldest and newest included.
+    Buckets(BucketEpoch, BucketEpoch),
+    /// A rule without buckets never expires its cells: those last updated at
+    /// or before this instant.
+    UpdatedBy(u64),
+}
+
+impl Settled {
+    fn covers(self, bucket: BucketEpoch, last_update_millis: u64) -> bool {
+        match self {
+            Self::Buckets(oldest, newest) => (oldest..=newest).contains(&bucket),
+            Self::UpdatedBy(cutoff) => last_update_millis <= cutoff,
+        }
+    }
+}
+
+/// The cells of `rule` a repair digest stamped `at` counts: those in buckets
+/// closed at least [`defaults::PLUMTREE_DIGEST_SETTLE_MS`] before `at` and
+/// still live, so a change still in flight does not read as a hole. Every node
+/// keeps the oldest live bucket until its own clock passes the next boundary,
+/// so sender and receiver agree on it. `None` when no bucket has settled yet.
+fn settled(rule: &RuleDescriptor, at: u64) -> Option<Settled> {
+    let width = u64::from(rule.bucket_millis);
+    if width == 0 {
+        return at
+            .checked_sub(defaults::PLUMTREE_DIGEST_SETTLE_MS)
+            .map(Settled::UpdatedBy);
+    }
+    let newest = (at.saturating_sub(defaults::PLUMTREE_DIGEST_SETTLE_MS) / width).checked_sub(1)?;
+    let oldest = (at / width).saturating_sub(u64::from(rule.live_buckets()));
+    (oldest <= newest).then_some(Settled::Buckets(
+        oldest as BucketEpoch,
+        newest as BucketEpoch,
+    ))
 }
 
 impl Plumtree {
@@ -297,6 +349,12 @@ impl Plumtree {
             grafts: Vec::with_capacity(nodes),
             nacks: Vec::with_capacity(store.peer_frontiers().peer_capacity() as usize),
             want: vec![u64::MAX; nodes].into_boxed_slice(),
+            sums: vec![0; nodes].into_boxed_slice(),
+            sums_at: None,
+            reply_cursor: 0,
+            settled: vec![None; store.rule_dictionary().capacity() as usize].into_boxed_slice(),
+            settled_scratch: vec![None; store.rule_dictionary().capacity() as usize]
+                .into_boxed_slice(),
         }
     }
 
@@ -374,8 +432,8 @@ impl Plumtree {
                 capacity = self.queue_capacity,
                 "Gossip dirty ring overflowed: more changes arrived than the next round can \
                  forward, so the newest are not being pushed along their trees. They stay in this \
-                 node's store, and the IHAVE digests and the repair slice recover them, so peers \
-                 may lag until then. This is usually a burst of distinct keys; raise \
+                 node's store, and the IHAVE and repair digests recover them, so peers may lag \
+                 until then. This is usually a burst of distinct keys; raise \
                  `gossip.max_cells_per_tick` to forward bigger bursts.",
             );
         }
@@ -543,7 +601,7 @@ where
         self.eager_push(round);
         if round == Round::Heartbeat {
             self.lazy_announce();
-            self.repair_slice();
+            self.send_digest(now);
         }
         if round != Round::Relay {
             self.sweep_rule_pending(now);
@@ -620,8 +678,8 @@ where
     /// Move the queued changes into `pt.unique`, one entry per cell. A frame
     /// always carries a cell's newest state, so only the newest entry for a
     /// cell counts. Its sender is skipped only if it sent the newest state;
-    /// when the state moved on since (a repair slice or a pull brought a newer
-    /// version), nobody is skipped.
+    /// when the state moved on since (a pull brought a newer version), nobody
+    /// is skipped.
     fn collect_changes(&mut self, round: Round) {
         let mut batch = std::mem::take(&mut self.pt.batch);
         batch.clear();
@@ -763,23 +821,83 @@ where
         }
     }
 
-    /// The anti-entropy backstop kept from the flat design: a rotating slice of
-    /// the store to one random peer, which repairs what loss left behind. Its
-    /// cells are merged but not forwarded.
-    fn repair_slice(&mut self) {
+    /// The repair lane behind the tree: tell one random peer how many hits this
+    /// node holds of each origin in buckets that should have settled. A peer
+    /// that holds fewer has a hole the tree will not fill, and pulls the
+    /// origin's cells.
+    fn send_digest(&mut self, now: u64) {
         let Some(dst) = self.random_peer() else {
             return;
         };
-        self.frame_handles.clear();
-        let frame = &mut self.frame_handles;
-        self.store
-            .visit_repair_slice(defaults::PLUMTREE_REPAIR_CELLS_PER_HEARTBEAT, |handle| {
-                frame.push(handle);
-                true
-            });
-        if !self.frame_handles.is_empty() {
-            self.send_cells(dst, FrameKind::Plain, Numbering::None);
+        self.pt.sums_at = None;
+        self.settled_sums(now);
+        let mut entries = std::mem::take(&mut self.pt.entries);
+        entries.clear();
+        for slot in 0..self.store.node_dictionary().capacity() {
+            let sum = self.pt.sums[slot as usize];
+            if sum == 0 {
+                continue;
+            }
+            if let Some(node) = self.store.node_dictionary().descriptor(slot) {
+                entries.push(ControlEntry {
+                    node_id: node.node_id,
+                    incarnation: node.incarnation,
+                    sequence: sum,
+                });
+            }
         }
+        if !entries.is_empty() {
+            self.send_control(dst, ControlKind::Digest, (now, 0), &entries);
+        }
+        self.pt.entries = entries;
+    }
+
+    /// A repair digest from `src`, stamped `at`: pull every origin of which
+    /// this node holds fewer settled hits.
+    fn on_digest(&mut self, src: SocketAddr, at: u64) {
+        self.settled_sums(at);
+        self.pt.pulls.clear();
+        for i in 0..self.pt.inbound.len() {
+            let e = self.pt.inbound[i];
+            let held = self
+                .store
+                .find_node(e.node_id, e.incarnation)
+                .map_or(0, |slot| self.pt.sums[slot as usize]);
+            if held < e.sequence {
+                self.pt.pulls.push(ControlEntry { sequence: 0, ..e });
+            }
+        }
+        self.send_prunes_and_pulls(src);
+    }
+
+    /// Fill `pt.sums` with the hits held per origin in the buckets settled at
+    /// `at`. One pass over the store; skipped when the sums already cover the
+    /// same buckets. A heartbeat recomputes them before its own digest, so
+    /// digests received in between compare against sums at most one
+    /// heartbeat old.
+    fn settled_sums(&mut self, at: u64) {
+        let rules = self.store.rule_dictionary();
+        for slot in 0..rules.capacity() {
+            self.pt.settled_scratch[slot as usize] =
+                rules.descriptor(slot).and_then(|rule| settled(rule, at));
+        }
+        if self.pt.sums_at.is_some() && self.pt.settled == self.pt.settled_scratch {
+            return;
+        }
+        std::mem::swap(&mut self.pt.settled, &mut self.pt.settled_scratch);
+        self.pt.sums.fill(0);
+        for handle in self.store.active_handles() {
+            let Some(row) = self.store.get(handle) else {
+                continue;
+            };
+            if self.pt.settled[row.key.rule as usize]
+                .is_some_and(|s| s.covers(row.key.bucket, row.last_update_millis))
+            {
+                let sum = &mut self.pt.sums[row.key.origin as usize];
+                *sum = sum.saturating_add(row.count.into());
+            }
+        }
+        self.pt.sums_at = Some(at);
     }
 
     // -- wake-ups
@@ -1053,7 +1171,7 @@ where
             } else if forwards {
                 if std::mem::take(&mut self.pt.off_tree[slot]) {
                     // First tree delivery of a version that arrived off the
-                    // tree (a repair slice, a pull, a random push): it was
+                    // tree (a pull, a random push): it was
                     // never forwarded, so forward it now. It says nothing
                     // against this edge.
                     if let Some(row) = self.store.get(outcome.handle) {
@@ -1199,6 +1317,7 @@ where
             ControlKind::Nack => {
                 self.resend(src, header.min_origin_sequence, header.max_origin_sequence)
             }
+            ControlKind::Digest => self.on_digest(src, header.min_origin_sequence),
         }
     }
 
@@ -1269,8 +1388,12 @@ where
         }
     }
 
-    /// Answer a GRAFT or PULL: every live cell of each requested origin above
-    /// the requested sequence, in one pass over the store.
+    /// Answer a GRAFT or PULL: the live cells of each requested origin above
+    /// the requested sequence, in one pass over the store, at most
+    /// [`defaults::PLUMTREE_REPLY_CELLS`] of them so a reply never floods the
+    /// requester's receive buffer. What did not fit shows up as a difference
+    /// in the requester's next repair digest, which pulls it; each reply
+    /// starts where the last one stopped, so repeated pulls make progress.
     fn reply_with_cells(&mut self, dst: SocketAddr, kind: FrameKind) {
         for i in 0..self.pt.inbound.len() {
             let e = self.pt.inbound[i];
@@ -1279,8 +1402,16 @@ where
             }
         }
         self.frame_handles.clear();
-        for handle in self.store.active_handles() {
-            if self.frame_handles.len() >= self.config.max_cells_per_tick {
+        let start = self.pt.reply_cursor;
+        let rotated = self
+            .store
+            .active_handles()
+            .filter(|h| h.index >= start)
+            .chain(self.store.active_handles().filter(|h| h.index < start));
+        let mut rest = None;
+        for handle in rotated {
+            if self.frame_handles.len() >= defaults::PLUMTREE_REPLY_CELLS {
+                rest = Some(handle.index);
                 break;
             }
             let Some(row) = self.store.get(handle) else {
@@ -1298,7 +1429,13 @@ where
             }
         }
         if !self.frame_handles.is_empty() {
-            self.send_cells(dst, kind, Numbering::None);
+            let sent = self.send_cells(dst, kind, Numbering::None);
+            if let Some(unsent) = self.frame_handles.get(sent) {
+                rest = Some(unsent.index);
+            }
+        }
+        if let Some(index) = rest {
+            self.pt.reply_cursor = index;
         }
     }
 
@@ -1334,9 +1471,9 @@ where
     }
 
     /// Encode `self.frame_handles` into free send slots, as many packets as the
-    /// slots allow; cells that do not fit are left to the digests and the
-    /// repair slice.
-    fn send_cells(&mut self, dst: SocketAddr, kind: FrameKind, numbering: Numbering) {
+    /// slots allow, and return how many of the cells went out; cells that do
+    /// not fit are left to the IHAVE and repair digests.
+    fn send_cells(&mut self, dst: SocketAddr, kind: FrameKind, numbering: Numbering) -> usize {
         let header = self.header(kind.flags());
         let packets = match self.config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
@@ -1356,7 +1493,7 @@ where
             ),
         };
         let Ok(mut packets) = packets else {
-            return;
+            return 0;
         };
         let peer = self.peers.iter().position(|p| p.addr == dst);
         let mut resend = match numbering {
@@ -1394,6 +1531,7 @@ where
             self.send_pending.push_back((dst, slot));
         }
         packets.abandon();
+        cursor
     }
 
     /// Encode `entries` as control packets of `kind`. `range` is the edge

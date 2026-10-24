@@ -902,6 +902,7 @@ fn control_frames_round_trip_every_kind() {
         ControlKind::Prune,
         ControlKind::Nack,
         ControlKind::Pull,
+        ControlKind::Digest,
     ] {
         let mut buf = PacketBuf::for_limits(limits);
         let entries = control_entries(3);

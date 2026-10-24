@@ -1240,8 +1240,10 @@ async fn dropped_packet_is_repaired() {
                 .record(0xDEAD, KeyHash(1), 0, 7, 0, 0)
                 .await
                 .unwrap();
-            // Many ticks to allow the repair lane to retry.
-            sim_advance_ticks(Duration::from_millis(100), 10).await;
+            // Enough ticks for the cell to settle and a repair digest to
+            // show B the difference.
+            let settle = crate::defaults::PLUMTREE_DIGEST_SETTLE_MS as u32;
+            sim_advance_ticks(Duration::from_millis(100), settle / 100 + 10).await;
 
             let sum_b = agg_b.total();
             assert_eq!(sum_b, 7, "B converged despite the first-packet drop");
@@ -1870,16 +1872,17 @@ async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            // One record on A. A pushes it to its only peer (B) once, and each
-            // heartbeat's repair slice carries it again. B rejects every
-            // packet because the auth keys don't match.
-            client_a
-                .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
-                .await
-                .unwrap();
-
+            // A record on A before every heartbeat, each pushed to its only
+            // peer (B). B rejects every packet because the auth keys don't
+            // match.
             const TICKS: u32 = 8;
-            sim_advance_ticks(Duration::from_millis(100), TICKS).await;
+            for _ in 0..TICKS {
+                client_a
+                    .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
+                    .await
+                    .unwrap();
+                sim_advance_ticks(Duration::from_millis(100), 1).await;
+            }
 
             let snap = admin_snapshot(&admin_tx_b).await;
             // Allow a one-tick slop for first-tick scheduling under

@@ -7,7 +7,7 @@ use super::{NodeId, NodeSlot};
 /// IHAVE it announced); `last_sent` is the highest we announced to it. Cells
 /// keep their origin's sequence when merged, so the numbers mean the same on
 /// every node. **Latency optimization only** — it trims IHAVE digests, and
-/// convergence is guaranteed by the repair slice, not by this table.
+/// convergence is guaranteed by the repair digests, not by this table.
 #[derive(Clone, Debug)]
 pub struct PeerFrontierTable {
     peer_ids: Box<[Option<NodeId>]>,

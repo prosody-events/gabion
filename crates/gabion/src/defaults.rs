@@ -86,8 +86,9 @@ pub const GOSSIP_MIN_EMIT_INTERVAL_MS: u64 = 5;
 // -- Plumtree dissemination ---------------------------------------------------
 //
 // Parameters of the Plumtree overlay (`gossip::runtime::plumtree`). The first
-// seven are the fields of `gossip::PlumtreeConfig`; the last two size
-// bounded buffers. See "Design notes" in `crates/gabion/README.md`.
+// seven are the fields of `gossip::PlumtreeConfig`; the rest bound retries,
+// time the repair digest and size bounded buffers. See "Design notes" in
+// `crates/gabion/README.md`.
 
 /// How long a lazily announced change may stay undelivered before the
 /// announcer is sent a GRAFT, in milliseconds (Leitao et al., SRDS 2007).
@@ -130,8 +131,15 @@ pub const PLUMTREE_MAX_GRAFT_TRIES: u8 = 3;
 /// it leaves the 64-packet receive window.
 pub const PLUMTREE_MAX_NACK_TRIES: u8 = 10;
 
-/// Cells of the rotating repair slice one random peer receives per heartbeat.
-pub const PLUMTREE_REPAIR_CELLS_PER_HEARTBEAT: usize = 256;
+/// How long a bucket must have been closed before a repair digest counts its
+/// cells, in milliseconds. A change still on its way through the tree is not a
+/// hole; the tree delivers within a few hundred milliseconds.
+pub const PLUMTREE_DIGEST_SETTLE_MS: u64 = 1_000;
+
+/// Most cells one GRAFT or PULL reply carries, about 80 full packets: a
+/// joiner or a healed partition asks for whole origins at once, and a reply
+/// much larger would overflow the requester's receive buffer.
+pub const PLUMTREE_REPLY_CELLS: usize = 2_048;
 
 /// Eager packets remembered per node so a NACK can be answered, and the most
 /// cells one remembered packet keeps (a fuller packet cannot be resent).

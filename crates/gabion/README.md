@@ -110,8 +110,8 @@ at different edges and keep pruning each other's tree.
   cells above the sequence; the receiver forwards them like any delivery. A
   retry goes to the next of up to four announcers, as the paper moves on to the
   next announcement; after `max_graft_tries` GRAFTs the record is dropped.
-- **Wire.** Eager frames use the shared cell codec. IHAVE, GRAFT, PRUNE, NACK
-  and PULL are cell-less control frames (`wire::control`): the 72-byte header,
+- **Wire.** Eager frames use the shared cell codec. IHAVE, GRAFT, PRUNE, NACK,
+  PULL and DIGEST are cell-less control frames (`wire::control`): the 72-byte header,
   28-byte `(origin, incarnation, sequence)` entries, and the HMAC tag when
   authenticated. The frame kind rides in three flag bits (`wire::FrameKind`);
   every control byte is counted by the harness like any datagram.
@@ -130,6 +130,8 @@ at different edges and keep pruning each other's tree.
 | `first_contact_pull` | on | `PLUMTREE_FIRST_CONTACT_PULL` |
 | `max_graft_tries` | 3 | `PLUMTREE_MAX_GRAFT_TRIES` |
 | `max_nack_tries` | 10 | `PLUMTREE_MAX_NACK_TRIES` |
+| digest settle time | 1 s | `PLUMTREE_DIGEST_SETTLE_MS` |
+| cells per GRAFT or PULL reply | 2,048 | `PLUMTREE_REPLY_CELLS` |
 
 They are the fields of `gossip::PlumtreeConfig`, whose `Default` reads these
 constants. `GossipRuntime::with_plumtree` replaces them; `GossipConfig` is
@@ -150,7 +152,7 @@ Each is the smallest change that lets the paper's algorithm run here.
 2. **IHAVE is a per-origin watermark, not a message id.** Because of (1), a
    receiver cannot tell a lost sequence from a superseded one, so IHAVE
    announces how far a peer holds an origin. A hole below the watermark is not
-   visible to IHAVE; NACK (3) and the repair slice (6) close it. The receiver
+   visible to IHAVE; NACK (3) and the repair digest (6) close it. The receiver
    compares an announcement with how far the *tree* delivered the origin, not
    with what its store holds, so a version that arrived off the tree (4) cannot
    hide a parent that stopped delivering. The paper's per-message timers become
@@ -166,23 +168,36 @@ Each is the smallest change that lets the paper's algorithm run here.
    (`PLUMTREE_RESEND_PACKETS`) and resends the cells of a requested one, in
    their newest state, under its original number (frame kind `Resent`). A packet
    over 48 cells is not kept.
-4. **Off-tree arrivals.** A version that arrives by repair slice, by pull, or by
-   random push is kept but not forwarded. When the tree later delivers it, that
-   is a first delivery: it is forwarded, and the sender is **not** pruned.
-   Without this a repair slice that wins the race against the tree makes the
-   receiver prune its own parent and drop its subtree.
+4. **Off-tree arrivals.** A version that arrives by pull or by random push is
+   kept but not forwarded. When the tree later delivers it, that is a first
+   delivery: it is forwarded, and the sender is **not** pruned. Without this a
+   repair that wins the race against the tree makes the receiver prune its own
+   parent and drop its subtree.
 5. **Catch-up.** Plumtree has no state transfer, and a node that joins or
    restarts holds no cells. The first time a node sees an origin it has no
    cells of (in a frame or an IHAVE), it sends the announcer **PULL**, which is
    answered with the origin's live cells and does not touch the tree. PULL is
    separate from GRAFT so that GRAFT is sent only after an announcement timed
-   out.
-6. **Repair slice.** Main's anti-entropy backstop stays, narrowed to 256 cells
-   of the rotating store slice to one random peer per heartbeat
-   (`PLUMTREE_REPAIR_CELLS_PER_HEARTBEAT`). It is not part of Plumtree. It is
-   what keeps the store convergent when a hole is below the watermark, a NACK
-   arrives after its packet left the resend ring, or the resend or
-   announcement bounds above are exhausted.
+   out. A GRAFT or PULL reply carries at most `PLUMTREE_REPLY_CELLS` cells
+   (2,048, about 80 packets), starting where the previous reply stopped, so a
+   large catch-up never overruns the requester's receive buffer and repeated
+   requests make progress.
+6. **Repair digest** (study component `digest-repair`). Plumtree has no repair
+   of its own, and a watermark cannot see a hole beneath it: a packet whose
+   NACK came too late, a parent that left with changes it never forwarded, a
+   node whose every in-neighbour is unreachable. Each heartbeat a node sends
+   one random peer a `Digest` control frame: for every origin, the hits it
+   holds in that origin's *settled* buckets, those closed at least
+   `PLUMTREE_DIGEST_SETTLE_MS` (1 s) before the frame's timestamp and not yet
+   expired. Settled counts are final at the origin, so equal views give equal
+   sums, and a receiver that holds fewer than the digest pulls the origin from
+   its sender. This replaces main's rotating repair slice, which this branch
+   first kept (256 cells to one random peer per heartbeat): the slice cost
+   about a fifth of all bytes and still left holes for longer than the 10 s
+   window, because it reaches a given cell at a given peer only every few tens
+   of seconds. A digest costs 28 bytes per origin and moves cells only where a
+   difference exists. It is not part of Plumtree, and is labelled as the study's
+   `digest-repair` component.
 7. **Relay round.** The paper forwards on receipt; a relay round waits
    `relay_floor` to batch. The clock offers only periodic tickers, so the runtime
    arms one extra ticker per deadline (`arm_wake`).

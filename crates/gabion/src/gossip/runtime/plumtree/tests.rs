@@ -55,7 +55,11 @@ struct Node {
 /// runtime's handlers and move packets between nodes themselves.
 fn node(router: &SimRouter, clock: &TestClock, i: u16, peers: &[u16], cfg: PlumtreeConfig) -> Node {
     let identity = NodeIdentity::new(NodeId(0x7000 + u128::from(i)), 1);
-    let mut store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
+    let config = CellStoreConfig {
+        cell_capacity: 4_096,
+        ..CellStoreConfig::default()
+    };
+    let mut store = CellStore::<u32>::new(config, identity);
     store.intern_rule(RuleDescriptor {
         fingerprint: RULE,
         window_millis: 600_000,
@@ -374,7 +378,7 @@ fn pruned_with_change_missing_at_c() -> (Vec<Node>, TestClock) {
 
     hit(&mut all[0].rt, 2);
     heartbeat(&mut all[0]);
-    // A's push to C is lost, and no repair slice makes it.
+    // A's push to C is lost, and no repair digest runs.
     settle(&mut all, |p| {
         p.kind() == FrameKind::Eager && p.to != Some(2)
     });
@@ -646,6 +650,115 @@ fn first_contact_with_an_origin_pulls_its_older_cells() {
     let log = settle(&mut all, |_| true);
     assert_eq!(count(&log, ControlKind::Pull), 1);
     assert_eq!(all[1].rt.store.active_len(), 6);
+}
+
+// -- repair digest
+// ----------------------------------------------------------------
+
+#[test]
+fn a_digest_counts_cells_settled_and_still_live() {
+    let rule = RuleDescriptor {
+        fingerprint: RULE,
+        window_millis: 10_000,
+        bucket_millis: 1_000,
+        limit: 100,
+        flags: 0,
+        local_rule_id: 0,
+    };
+    // At 20.5 s bucket 20 is open and bucket 19 closed only 0.5 s ago; bucket
+    // 10 is the oldest the store still keeps.
+    assert_eq!(settled(&rule, 20_500), Some(Settled::Buckets(10, 18)));
+    assert_eq!(settled(&rule, 21_000), Some(Settled::Buckets(11, 19)));
+    assert_eq!(settled(&rule, 1_500), None, "nothing has settled yet");
+    // A rule without buckets never expires: a cell counts once it has gone
+    // a settle time without changing.
+    let no_buckets = RuleDescriptor {
+        bucket_millis: 0,
+        ..rule
+    };
+    let cutoff = settled(&no_buckets, 20_500).expect("settled");
+    assert_eq!(cutoff, Settled::UpdatedBy(19_500));
+    assert!(cutoff.covers(0, 19_500) && !cutoff.covers(0, 19_501));
+}
+
+/// The fixture rule has one-minute buckets and `hit` lands in bucket 1, which
+/// has settled at this instant.
+const SETTLED: u64 = 121_000;
+
+#[test]
+fn a_digest_pulls_a_hole_the_tree_left_behind() {
+    let (mut all, clock) = cluster(2, no_pull());
+    hit(&mut all[0].rt, 1);
+    all[0].rt.handle_gossip_tick(Round::Threshold);
+    settle(&mut all, |_| true);
+    hit(&mut all[0].rt, 2);
+    hit(&mut all[0].rt, 3);
+    all[0].rt.handle_gossip_tick(Round::Threshold);
+    // The push of keys 2 and 3 is lost, and nothing on the edge follows it, so
+    // there is no gap to NACK and the watermark has nothing to announce.
+    settle(&mut all, |_| false);
+    assert_eq!(all[1].rt.store.active_len(), 1);
+    let relayed = all[1].rt.pt.queued_relay();
+
+    clock.advance(SETTLED);
+    heartbeat(&mut all[0]);
+    let log = settle(&mut all, |p| {
+        p.kind() != FrameKind::Control || p.control() != Some(ControlKind::IHave)
+    });
+    assert_eq!(count(&log, ControlKind::Digest), 1);
+    assert_eq!(count(&log, ControlKind::Pull), 1);
+    assert_eq!(all[1].rt.store.active_len(), 3);
+    let pulled = log.iter().filter(|p| p.kind() == FrameKind::Plain).count();
+    assert_eq!(pulled, 1);
+    assert_eq!(
+        all[1].rt.pt.queued_relay(),
+        relayed,
+        "the reply is kept off the tree"
+    );
+}
+
+#[test]
+fn equal_settled_counts_pull_nothing() {
+    let (mut all, clock) = cluster(2, no_pull());
+    for key in 1..=3 {
+        hit(&mut all[0].rt, key);
+    }
+    all[0].rt.handle_gossip_tick(Round::Threshold);
+    settle(&mut all, |_| true);
+    clock.advance(SETTLED);
+    heartbeat(&mut all[0]);
+    let log = settle(&mut all, |_| true);
+    assert_eq!(count(&log, ControlKind::Digest), 1);
+    assert_eq!(count(&log, ControlKind::Pull), 0);
+}
+
+#[test]
+fn a_reply_stops_at_its_cap_and_the_next_one_picks_up_after_it() {
+    let (mut all, _clock) = cluster(2, no_pull());
+    let keys = defaults::PLUMTREE_REPLY_CELLS + 10;
+    for key in 0..keys as u128 {
+        hit(&mut all[0].rt, key);
+    }
+    let a = all[0].rt.store.local_identity();
+    let mut held = Vec::new();
+    while held.last() != Some(&keys) && held.len() < 1_000 {
+        all[0].rt.pt.inbound.clear();
+        all[0].rt.pt.inbound.push(ControlEntry {
+            node_id: a.node_id,
+            incarnation: a.incarnation,
+            sequence: 0,
+        });
+        let b = all[1].addr;
+        all[0].rt.reply_with_cells(b, FrameKind::Plain);
+        settle(&mut all, |_| true);
+        held.push(all[1].rt.store.active_len() as usize);
+    }
+    assert!(held[0] <= defaults::PLUMTREE_REPLY_CELLS, "{held:?}");
+    assert!(
+        held.windows(2).all(|w| w[0] < w[1]),
+        "every reply adds cells: {held:?}"
+    );
+    assert_eq!(held.last(), Some(&keys));
 }
 
 // -- UDP adaptation: edge numbers, NACK, resend -------------------------------
