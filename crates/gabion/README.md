@@ -466,6 +466,26 @@ never claims a version its sender lacks:
 The wire format is version 2: header flags `FLAG_DIGEST` and `FLAG_SYN`, the
 digest frame in `wire/digest.rs`, and the `claim_gap` column in cell frames.
 
+### Fanout
+
+`f` stays at the paper's one exchange per round. More exchanges buy freshness
+with digest bytes, and the price is set by how often rounds run. Measured in
+the study harness at `prod-typical` (80 pods), seeds 1 to 3, means:
+
+| Round trigger                          | `f` | bytes/node/s | limited-key staleness, mean / p99 (hits) | convergence p50 / p99 |
+|----------------------------------------|-----|--------------|------------------------------------------|-----------------------|
+| error budget summed per rule           | 1   | 61,900       | 3.3 / 26                                 | 0.72 s / 1.05 s       |
+|                                        | 2   | 89,800       | 1.6 / 14                                 | 0.43 s / 0.66 s       |
+|                                        | 3   | 114,900      | 1.1 / 10                                 | 0.31 s / 0.51 s       |
+| error budget per key (heartbeat rounds) | 1   | 46,200       | 12.1 / 85                                | 1.96 s / 2.62 s       |
+|                                        | 2   | 63,200       | 6.0 / 46                                 | 1.14 s / 1.59 s       |
+|                                        | 3   | 79,500       | 4.2 / 32                                 | 0.86 s / 1.25 s       |
+
+Staleness falls roughly as `1/f` while bytes grow by the digest share only,
+since every cell version still reaches each node about once. `f = 1` is the
+cheapest point; a deployment that wants fresher counts raises `fanout` in
+the gossip config.
+
 ### What is deliberately not here
 
 - The paper's AIMD flow control is off, as specified for this study.
