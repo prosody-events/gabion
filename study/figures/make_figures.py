@@ -88,8 +88,10 @@ def nopk(arm: str) -> str:
 # that the solution is better (mean log ratio, or mean difference, below 0).
 # better: P >= 0.95 and ratio < 0.95; worse: P <= 0.05 and ratio > 1.05;
 # tie: whole 95 % CrI inside [0.95, 1.05]; "credible <5 %": P beyond a threshold
-# but the estimate inside the band; otherwise unsettled. On the difference scale
-# the band is ±5 % of the comparator's posterior median; two all-zero samples tie.
+# but the estimate inside the band; otherwise unsettled. The first rule that
+# matches wins, in that order. On the difference scale the band is ±5 % of the
+# comparator's posterior median; two all-zero samples tie, with or without an
+# interval.
 # ---------------------------------------------------------------------------
 
 def verdict(row: dict | None, comparator_mean: float | None) -> str | None:
@@ -109,10 +111,10 @@ def verdict(row: dict | None, comparator_mean: float | None) -> str | None:
     else:
         est, lo, hi = row["diff_mean"], row["diff_lo"], row["diff_hi"]
         band = 0.05 * abs(comparator_mean) if comparator_mean else 0.0
-        if lo is None:
-            return "unsettled"
         if est == 0 and band == 0:
             return "tie"
+        if lo is None:
+            return "unsettled"
         if p is not None and p >= 0.95 and est < -band:
             return "better"
         if p is not None and p <= 0.05 and est > band:

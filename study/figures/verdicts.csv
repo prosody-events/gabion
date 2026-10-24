@@ -63,11 +63,11 @@ vs_main,snow,main,error,48,10,13,0,7
 vs_main,snow,main,health,23,0,3,0,0
 vs_main,thicket,main,error,54,9,7,0,8
 vs_main,thicket,main,health,12,11,3,0,0
-perkey_effect,imp-az-hier,imp-az-hier-nopk,error,0,54,15,0,10
+perkey_effect,imp-az-hier,imp-az-hier-nopk,error,0,54,16,0,9
 perkey_effect,imp-az-hier,imp-az-hier-nopk,health,0,0,21,0,5
 perkey_effect,imp-bimodal,imp-bimodal-nopk,error,0,53,15,1,9
 perkey_effect,imp-bimodal,imp-bimodal-nopk,health,3,0,13,0,10
-perkey_effect,imp-direct-ack,imp-direct-ack-nopk,error,0,53,14,0,12
+perkey_effect,imp-direct-ack,imp-direct-ack-nopk,error,0,53,15,0,11
 perkey_effect,imp-direct-ack,imp-direct-ack-nopk,health,1,0,16,0,9
 perkey_effect,imp-flat-once,imp-flat-once-nopk,error,1,52,14,0,11
 perkey_effect,imp-flat-once,imp-flat-once-nopk,health,4,2,16,0,4
@@ -79,7 +79,7 @@ perkey_effect,imp-plumtree,imp-plumtree-nopk,error,1,20,19,2,36
 perkey_effect,imp-plumtree,imp-plumtree-nopk,health,0,1,13,0,12
 perkey_effect,imp-scuttlebutt,imp-scuttlebutt-nopk,error,0,56,13,0,9
 perkey_effect,imp-scuttlebutt,imp-scuttlebutt-nopk,health,0,5,13,0,8
-perkey_effect,imp-snow,imp-snow-nopk,error,0,52,14,3,10
+perkey_effect,imp-snow,imp-snow-nopk,error,0,52,15,3,9
 perkey_effect,imp-snow,imp-snow-nopk,health,1,0,16,0,9
 perkey_effect,imp-thicket,imp-thicket-nopk,error,1,49,16,2,10
 perkey_effect,imp-thicket,imp-thicket-nopk,health,3,1,14,0,8
@@ -91,9 +91,9 @@ vs_own_baseline,imp-bimodal,bimodal,error,9,48,15,1,5
 vs_own_baseline,imp-bimodal,bimodal,health,2,3,13,0,8
 vs_own_baseline,imp-bimodal-nopk,bimodal,error,14,0,31,1,32
 vs_own_baseline,imp-bimodal-nopk,bimodal,health,0,1,14,0,11
-vs_own_baseline,imp-direct-ack,direct-ack,error,1,52,14,2,10
+vs_own_baseline,imp-direct-ack,direct-ack,error,1,52,15,2,9
 vs_own_baseline,imp-direct-ack,direct-ack,health,0,2,15,0,9
-vs_own_baseline,imp-direct-ack-nopk,direct-ack,error,7,0,34,2,36
+vs_own_baseline,imp-direct-ack-nopk,direct-ack,error,7,0,35,2,35
 vs_own_baseline,imp-direct-ack-nopk,direct-ack,health,0,2,15,0,9
 vs_own_baseline,imp-flat-once,flat-once,error,23,38,8,1,8
 vs_own_baseline,imp-flat-once,flat-once,health,6,8,12,0,0
@@ -115,7 +115,7 @@ vs_own_baseline,imp-plumtree-nopk,plumtree,error,59,0,10,1,8
 vs_own_baseline,imp-plumtree-nopk,plumtree,health,5,5,10,0,6
 vs_own_baseline,imp-scuttlebutt,scuttlebutt,error,0,56,15,0,7
 vs_own_baseline,imp-scuttlebutt,scuttlebutt,health,0,4,13,0,9
-vs_own_baseline,imp-scuttlebutt-nopk,scuttlebutt,error,0,0,47,3,29
+vs_own_baseline,imp-scuttlebutt-nopk,scuttlebutt,error,0,0,48,3,28
 vs_own_baseline,imp-scuttlebutt-nopk,scuttlebutt,health,2,0,15,3,6
 vs_own_baseline,imp-snow,snow,error,24,36,13,0,5
 vs_own_baseline,imp-snow,snow,health,3,8,13,0,2
