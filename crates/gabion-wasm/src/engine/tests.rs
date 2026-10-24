@@ -413,9 +413,9 @@ fn many_nodes_receive_every_tick_deterministically() {
 }
 
 /// A node added after the cluster has converged catches up to the cluster
-/// total by anti-entropy — survivors push their settled cells to the cold
-/// newcomer — and it appears in snapshots under a fresh stable id (`N`, the
-/// next never-reused id) without renumbering any survivor.
+/// total at once — each survivor welcomes the newcomer with its own cells as
+/// soon as it discovers it — and it appears in snapshots under a fresh stable
+/// id (`N`, the next never-reused id) without renumbering any survivor.
 #[test]
 fn added_node_catches_up_by_gossip() {
     with_engine(test_config(3), |tx| async move {
@@ -440,9 +440,12 @@ fn added_node_catches_up_by_gossip() {
             "ids are stable; the newcomer is 3, not a renumber"
         );
         let newcomer = joined.nodes.iter().find(|n| n.id == 3).unwrap();
-        assert_eq!(newcomer.aggregate_total, 0, "the newcomer starts cold");
+        assert_eq!(
+            newcomer.aggregate_total, 50,
+            "the members welcomed the newcomer with their own cells"
+        );
 
-        // Drive gossip; the newcomer catches up to the settled total.
+        // Drive gossip; every node stays on the settled total.
         for _ in 0..15 {
             step(&tx, 100).await;
         }

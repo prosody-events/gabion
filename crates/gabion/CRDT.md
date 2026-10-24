@@ -1424,6 +1424,7 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `ingest_local(obs, sink)` | Apply locally observed hits (saturating add). |
 | `merge_remote(from, obs, sink)` | Merge observations from peer `from` (max-merge); a raised cell remembers `from` as its `via`. |
 | `known_to(handle, node)` | bp-skip test: is `node` the cell's origin or its `via`? |
+| `fill_local_cells(max, out)` | This node's own active cells, which it welcomes a newly discovered peer with. Full-capacity scan; membership changes only. |
 | `expire(current_epoch_by_rule, live_buckets, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell. |
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
 | `clear_dirty()` | Drop the dirty rings; stored cells untouched. |

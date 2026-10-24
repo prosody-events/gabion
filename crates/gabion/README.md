@@ -365,6 +365,12 @@ overwrites the oldest unsent change, bumps an overflow counter and warns,
 and the repair lane picks that cell up later. A cell the last expiry
 sweep freed is not merged back in from a peer that has yet to sweep.
 
+A peer that discovery adds starts with an empty store, and rounds only
+carry what changed since. So a member that discovers a new peer welcomes
+it with its own live cells, straight away and only those: each origin
+sends its own share, and the newcomer holds the whole window once every
+member has discovered it, rather than waiting for the repair lane.
+
 `CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
 debug the CRDT.

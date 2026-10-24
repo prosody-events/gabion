@@ -707,6 +707,21 @@ impl<C: Count> CellStore<C> {
         self.resolve(handle).map(|i| self.counts[i as usize])
     }
 
+    /// Push up to `max_cells` of this node's own active cells, in storage
+    /// order: what it welcomes a newly discovered peer with. Walks the full
+    /// `capacity`, so it is for membership changes, not the hot path.
+    pub fn fill_local_cells(&self, max_cells: usize, out: &mut Vec<CellHandle>) {
+        out.clear();
+        for slot in 0..self.capacity {
+            if out.len() >= max_cells {
+                return;
+            }
+            if self.is_active(slot) && self.origins[slot as usize] == self.local_node_slot {
+                out.push(self.handle_for(slot));
+            }
+        }
+    }
+
     /// Iterate all active cell handles in storage order.
     ///
     /// Walks the full `capacity`, not `active_len` — suitable for diagnostics

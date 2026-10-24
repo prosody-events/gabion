@@ -652,6 +652,7 @@ where
                         cluster_size = self.peers.len(),
                         "Peer joined the cluster.",
                     );
+                    self.welcome(p.addr);
                 }
             }
             PeerEvent::Removed(p) => {
@@ -678,6 +679,22 @@ where
         (self.store.active_len() as usize)
             .div_ceil(heartbeats.max(1))
             .min(GOSSIP_REPAIR_CELLS_PER_HEARTBEAT)
+    }
+
+    /// Send a newly discovered peer this node's own live cells. Each origin
+    /// welcomes the peer with its own share, so a joining node holds the
+    /// whole window once every member has discovered it, without waiting for
+    /// the repair lane. What the free send slots cannot carry, it leaves to
+    /// that lane.
+    fn welcome(&mut self, addr: SocketAddr) {
+        if self.store.is_empty() {
+            return;
+        }
+        self.store
+            .fill_local_cells(self.config.max_cells_per_tick, &mut self.frame_handles);
+        if !self.frame_handles.is_empty() {
+            self.encode_packets_for(addr);
+        }
     }
 
     fn handle_gossip_tick(&mut self, round: Round) {

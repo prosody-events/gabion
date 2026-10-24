@@ -792,6 +792,63 @@ fn sim_relay_round_forwards_before_the_heartbeat() {
     })
 }
 
+/// A member that discovers a new peer sends it its own live cells at once,
+/// so the newcomer does not wait for the repair lane to learn the window.
+#[test]
+fn sim_new_peer_is_welcomed_with_the_members_own_cells() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addr_a = sock(45_200);
+        let addr_b = sock(45_201);
+        let id_a = NodeIdentity::new(NodeId(0xE0), 1);
+        let id_b = NodeIdentity::new(NodeId(0xE1), 1);
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel::<PeerEvent>();
+        let peer_stream = futures::stream::unfold(peer_rx, |mut rx| async move {
+            rx.recv().await.map(|evt| (evt, rx))
+        });
+        let mut cfg_a = sim_config(id_a, Vec::new(), 1);
+        cfg_a.tick_interval = Duration::from_secs(10);
+        let mut cfg_b = sim_config(id_b, Vec::new(), 2);
+        cfg_b.tick_interval = Duration::from_secs(10);
+        let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let (rt_a, client_a) = GossipRuntime::from_parts(
+            router.bind(addr_a),
+            TokioClock::from_millis(0),
+            cfg_a,
+            store_for(id_a),
+            Rc::new(InMemoryAggregateStore::<u32>::new()),
+        );
+        let (rt_b, client_b) = GossipRuntime::from_parts(
+            router.bind(addr_b),
+            TokioClock::from_millis(0),
+            cfg_b,
+            store_for(id_b),
+            agg_b.clone(),
+        );
+        let h_a = tokio::task::spawn_local(rt_a.run(peer_stream));
+        let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
+        sim_advance(Duration::from_millis(1)).await;
+
+        // A has no peers yet, so its hits stay local until it learns of B.
+        client_a
+            .record(0xFACE, KeyHash(1), 0, 3, 0, 0)
+            .await
+            .unwrap();
+        sim_advance(Duration::from_millis(100)).await;
+        assert_eq!(agg_b.total(), 0);
+
+        peer_tx.send(PeerEvent::Added(Peer::new(addr_b))).unwrap();
+        sim_advance(Duration::from_millis(10)).await;
+        let got = agg_b.total();
+
+        client_a.shutdown().await.unwrap();
+        client_b.shutdown().await.unwrap();
+        let _ = h_a.await;
+        let _ = h_b.await;
+        assert_eq!(got, 3);
+    })
+}
+
 #[quickcheck]
 fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> TestResult {
     run_paused(async move {
