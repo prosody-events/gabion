@@ -25,15 +25,14 @@ use arrayvec::ArrayVec;
 use gabion::crdt::{Count, KeyHash};
 use gabion::defaults;
 use gabion::gossip::GossipClient;
-use gabion::rules::{Descriptor, EnforcementMode, RuleSpec, RuleTable, hash_key};
+use gabion::rules::{
+    CardinalityLimit, CardinalityLimits, Descriptor, EnforcementMode, RuleSpec, RuleTable, hash_key,
+};
 use gabion::settings::Setting;
 use gabion::throttle;
 use thiserror::Error;
 
-use crate::admission::{
-    CardinalityLimit, CardinalityLimits, Decision, LimitRequest, QuotaContext, RejectContext,
-    RejectReason,
-};
+use crate::admission::{Decision, LimitRequest, Quota, RejectReason};
 use crate::store::DashMapStore;
 
 const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
@@ -140,9 +139,7 @@ impl<C: Count> SharedLimiter<C> {
                 self.note_cardinality_reject(
                     &request.domain,
                     CardinalityLimit::Count,
-                    self.cardinality_limits
-                        .max_descriptor_count
-                        .min(MAX_DESCRIPTORS),
+                    self.cardinality_limits.max_descriptor_count(),
                 )
             };
 
@@ -162,7 +159,10 @@ impl<C: Count> SharedLimiter<C> {
     }
 
     async fn evaluate(&self, request: LimitRequest<'_>, now_millis: u64) -> Decision {
-        if let Some((limit, max)) = request.exceeded_limit(self.cardinality_limits) {
+        if let Some((limit, max)) = self
+            .cardinality_limits
+            .exceeded(request.domain, request.descriptors)
+        {
             return self.note_cardinality_reject(request.domain, limit, max);
         }
 
@@ -173,7 +173,7 @@ impl<C: Count> SharedLimiter<C> {
         // Rules in `DryRun` mode are evaluated and recorded but never
         // produce a reject verdict.
         let mut planned: ArrayVec<(RuleSpec, KeyHash, u32), MAX_MATCHED_RULES> = ArrayVec::new();
-        let mut tightest: Option<QuotaContext> = None;
+        let mut tightest: Option<Quota> = None;
         for rule in self
             .rule_table
             .matching(request.domain, request.descriptors)
@@ -199,7 +199,7 @@ impl<C: Count> SharedLimiter<C> {
                 );
                 return Decision::Reject(
                     RejectReason::GlobalLimit,
-                    Some(RejectContext {
+                    Some(Quota {
                         limit: spec.limit,
                         remaining: gabion::window::limit_remaining(spec.limit, total),
                         duration_until_reset_millis,
@@ -218,7 +218,7 @@ impl<C: Count> SharedLimiter<C> {
                     now_millis,
                     spec.bucket_millis,
                 );
-            let candidate = QuotaContext {
+            let candidate = Quota {
                 limit: spec.limit,
                 remaining,
                 duration_until_reset_millis,
@@ -261,7 +261,7 @@ impl<C: Count> SharedLimiter<C> {
 /// Pick the rule the client is closest to tripping (smallest
 /// `remaining`). Ties keep the existing pick — first match wins,
 /// preserving the rule-declaration order surfaced by `RuleTable::matching`.
-fn pick_min_remaining_ctx(current: Option<QuotaContext>, candidate: QuotaContext) -> QuotaContext {
+fn pick_min_remaining_ctx(current: Option<Quota>, candidate: Quota) -> Quota {
     match current {
         Some(c) if c.remaining <= candidate.remaining => c,
         _ => candidate,
@@ -434,9 +434,8 @@ fn code_for_decision(decision: Decision) -> i32 {
     }) as i32
 }
 
-/// Build the `DescriptorStatus` Envoy renders into the response. Both
-/// allow paths (with a [`QuotaContext`]) and scoped rejects (with a
-/// [`RejectContext`]) populate `limit_remaining` and
+/// Build the `DescriptorStatus` Envoy renders into the response. Allows and
+/// scoped rejects (each with a [`Quota`]) populate `limit_remaining` and
 /// `duration_until_reset`; the Envoy filter with
 /// `enable_x_ratelimit_headers: DRAFT_VERSION_03` turns those into
 /// `X-RateLimit-*` response headers on the upstream response.
@@ -450,18 +449,14 @@ fn code_for_decision(decision: Decision) -> i32 {
 fn descriptor_status_for(decision: Decision) -> rate_limit_response::DescriptorStatus {
     let code = code_for_decision(decision);
     match decision {
-        Decision::Reject(_, Some(ctx)) => rate_limit_response::DescriptorStatus {
-            code,
-            limit_remaining: u32::try_from(ctx.remaining).unwrap_or(u32::MAX),
-            duration_until_reset: Some(duration_from_millis(ctx.duration_until_reset_millis)),
-            ..Default::default()
-        },
-        Decision::Allow(Some(ctx)) => rate_limit_response::DescriptorStatus {
-            code,
-            limit_remaining: u32::try_from(ctx.remaining).unwrap_or(u32::MAX),
-            duration_until_reset: Some(duration_from_millis(ctx.duration_until_reset_millis)),
-            ..Default::default()
-        },
+        Decision::Reject(_, Some(ctx)) | Decision::Allow(Some(ctx)) => {
+            rate_limit_response::DescriptorStatus {
+                code,
+                limit_remaining: u32::try_from(ctx.remaining).unwrap_or(u32::MAX),
+                duration_until_reset: Some(duration_from_millis(ctx.duration_until_reset_millis)),
+                ..Default::default()
+            }
+        }
         _ => rate_limit_response::DescriptorStatus {
             code,
             ..Default::default()

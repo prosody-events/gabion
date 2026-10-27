@@ -10,14 +10,13 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use tokio::task::LocalSet;
 
-use gabion::crdt::{CellStore, CellStoreConfig, NodeId, NodeIdentity, RuleDescriptor};
+use gabion::crdt::{CellStore, NodeId, NodeIdentity, RuleDescriptor, ValidStorageConfig};
 use gabion::gossip::sim::SimRouter;
-use gabion::gossip::{GossipConfig, GossipRuntime, TokioClock};
+use gabion::gossip::{GossipRuntime, TokioClock, ValidGossipConfig};
 use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleTable};
-use gabion::settings::Setting;
+use gabion::settings::{Setting, Settings};
 
 use super::*;
-use crate::admission::CardinalityLimits;
 use crate::store::DashMapStore;
 
 static TEST_PORT: AtomicU16 = AtomicU16::new(40_500);
@@ -63,13 +62,37 @@ fn rule_tenant(limit: u64) -> Rule {
     )
 }
 
-async fn harness(max_descriptor_bytes: usize, limit: u64) -> Harness {
-    let cardinality_limits = CardinalityLimits {
-        max_descriptor_count: 16,
-        max_descriptor_bytes,
-        max_key_bytes: 64,
+/// A small node's settings, then `tune`, validated as gabiond validates them.
+fn validated(tune: impl FnOnce(&mut Settings)) -> (ValidGossipConfig, ValidStorageConfig) {
+    let mut settings = Settings {
+        max_cells: 256.try_into().unwrap(),
+        rule_dictionary_capacity: 32.try_into().unwrap(),
+        node_dictionary_capacity: 32.try_into().unwrap(),
+        local_dirty_capacity: 64.try_into().unwrap(),
+        forwarded_dirty_capacity: 64.try_into().unwrap(),
+        peer_capacity: 16.try_into().unwrap(),
+        rng_seed: Some(1),
+        ..Settings::default()
     };
-    harness_with(vec![rule_tenant(limit)], cardinality_limits).await
+    tune(&mut settings);
+    settings.validate().expect("test settings validate")
+}
+
+fn limits(count: u16, bytes: usize, key: usize) -> CardinalityLimits {
+    let (_, storage) = validated(|s| {
+        s.max_descriptor_count = count.try_into().unwrap();
+        s.max_descriptor_bytes = bytes.try_into().unwrap();
+        s.max_key_bytes = key.try_into().unwrap();
+    });
+    storage.cardinality
+}
+
+async fn harness(max_descriptor_bytes: usize, limit: u64) -> Harness {
+    harness_with(
+        vec![rule_tenant(limit)],
+        limits(16, max_descriptor_bytes, 64),
+    )
+    .await
 }
 
 async fn harness_with(rules: Vec<Rule>, cardinality_limits: CardinalityLimits) -> Harness {
@@ -77,7 +100,8 @@ async fn harness_with(rules: Vec<Rule>, cardinality_limits: CardinalityLimits) -
     let addr = next_test_addr();
     let transport = router.bind(addr);
     let identity = NodeIdentity::new(NodeId(0xAA00), 1);
-    let mut store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
+    let (gossip_config, storage) = validated(|_| {});
+    let mut store = CellStore::<u32>::new(storage, identity);
     for rule in &rules {
         store.intern_rule(RuleDescriptor {
             fingerprint: rule.fingerprint,
@@ -89,12 +113,6 @@ async fn harness_with(rules: Vec<Rule>, cardinality_limits: CardinalityLimits) -
         });
     }
     let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
-
-    let gossip_config = GossipConfig {
-        local_identity: identity,
-        rng_seed: 1,
-        ..GossipConfig::default()
-    };
 
     let (rt, client) = GossipRuntime::from_parts(
         transport,
@@ -314,7 +332,7 @@ fn matched_rule_overflow_says_allowed() {
                     )
                 })
                 .collect();
-            let harness = harness_with(rules, CardinalityLimits::default()).await;
+            let harness = harness_with(rules, limits(16, 512, 128)).await;
             let request = RateLimitRequest {
                 domain: "api".into(),
                 descriptors: vec![descriptor([("tenant", "a")])],
@@ -358,11 +376,6 @@ fn cardinality_reject_logs(
 
 #[test]
 fn cardinality_warning_names_the_exceeded_key() {
-    let limits = |count, bytes, key| CardinalityLimits {
-        max_descriptor_count: count,
-        max_descriptor_bytes: bytes,
-        max_key_bytes: key,
-    };
     let cases = [
         (
             Setting::StorageMaxDescriptorCount,
@@ -415,21 +428,39 @@ fn cardinality_warning_names_the_exceeded_key() {
     }
 }
 
+/// gabiond rejects exactly the requests the library's one cardinality check
+/// flags, on both sides of the byte budget.
+#[test]
+fn one_cardinality_check_for_both_adapters() {
+    const BUDGET: usize = 32;
+    let limits = limits(16, BUDGET, 64);
+    let flagged: Vec<bool> = [BUDGET - 1, BUDGET, BUDGET + 1]
+        .into_iter()
+        .map(|bytes| {
+            let value = "v".repeat(bytes - "api".len() - "tenant".len());
+            let entry = Descriptor {
+                key: "tenant",
+                value: &value,
+            };
+            let flagged = limits.exceeded("api", &[entry]).is_some();
+            let (response, _) =
+                cardinality_reject_logs(limits, vec![descriptor([("tenant", value.as_str())])]);
+            let rejected = response.overall_code == rate_limit_response::Code::OverLimit as i32;
+            assert_eq!(rejected, flagged, "{bytes} bytes");
+            flagged
+        })
+        .collect();
+    assert_eq!(flagged, [false, false, true]);
+}
+
 #[test]
 fn every_cardinality_reject_logs() {
-    let defaults = CardinalityLimits {
-        max_descriptor_count: 16,
-        max_descriptor_bytes: 512,
-        max_key_bytes: 64,
-    };
+    let defaults = limits(16, 512, 64);
     let too_many_descriptors = (0..=MAX_DESCRIPTORS)
         .map(|i| descriptor([("tenant", format!("t-{i}"))]))
         .collect();
     let too_many_entries = descriptor((0..=MAX_DESCRIPTORS).map(|i| (format!("k{i}"), "v")));
-    let too_long = CardinalityLimits {
-        max_descriptor_bytes: 8,
-        ..defaults
-    };
+    let too_long = limits(16, 8, 64);
     let cases = [
         (
             "request descriptors",
@@ -733,7 +764,8 @@ fn dry_run_over_limit_populates_descriptor_status_fields() {
             100,
             EnforcementMode::DryRun,
         );
-        let mut store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
+        let (gossip_config, storage) = validated(|_| {});
+        let mut store = CellStore::<u32>::new(storage, identity);
         store.intern_rule(RuleDescriptor {
             fingerprint: rule.fingerprint,
             window_millis: rule.window_millis as u32,
@@ -743,11 +775,6 @@ fn dry_run_over_limit_populates_descriptor_status_fields() {
             local_rule_id: rule.id,
         });
         let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
-        let gossip_config = GossipConfig {
-            local_identity: identity,
-            rng_seed: 1,
-            ..GossipConfig::default()
-        };
         let (rt, client) = GossipRuntime::from_parts(
             transport,
             TokioClock::from_millis(0),
@@ -758,12 +785,7 @@ fn dry_run_over_limit_populates_descriptor_status_fields() {
         let _handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
         let rule_table = Arc::new(RuleTable::new(vec![rule]));
-        let cardinality_limits = CardinalityLimits {
-            max_descriptor_count: 16,
-            max_descriptor_bytes: 512,
-            max_key_bytes: 64,
-        };
-        let limiter = SharedLimiter::new(rule_table, client.clone(), counts, cardinality_limits);
+        let limiter = SharedLimiter::new(rule_table, client.clone(), counts, storage.cardinality);
 
         // Drive enough hits to push past the DryRun budget. Each
         // request is allowed because the rule never rejects.

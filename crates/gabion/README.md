@@ -144,9 +144,10 @@ If the cluster is configured with a shared HMAC key, an additional
 dropped on the floor, and the whole cluster must agree on the key.
 
 The codec lives in `src/wire/{header,body,auth}.rs`. The library's own
-`FrameLimits::default()` is 256 KB — useful for tests and the simulator
-— but production adapters plumb `gabion::defaults::GOSSIP_MAX_PAYLOAD_BYTES`
-(1400 bytes, the safe IPv4 MSS floor) into `FrameLimits` so frames stay
+`FrameLimits::default()` is 256 KB — useful for the codec's own tests —
+but the runtime takes its limits from the validated settings, whose
+`gossip.max_payload_bytes` defaults to 1400 bytes (the safe IPv4 MSS
+floor) and must lie between 152 and 65,507, so frames stay
 well below the path MTU and avoid IP fragmentation. Frames larger than
 the cap split into multiple packets at the sender, and each packet is
 independently decodable.
@@ -369,19 +370,21 @@ it splits into the two adaptive halves of the protocol.
 | `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
 | `fanout`             | 3           | Fanout floor. The runtime scales the actual pick to the coverage threshold `⌈ln(n)+c⌉` (`c` = `GOSSIP_COVERAGE_MARGIN`, 3), capped at the peer count. | Rarely tune — the floor binds only if you lower `GOSSIP_COVERAGE_MARGIN`. To trade bandwidth for coverage, change the margin, not this floor. |
 | `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame_for_peer` will emit in one tick. Cells over the cap roll forward to the next tick via the repair lane. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
-| `max_payload_bytes`  | 1 400       | UDP datagram budget. The codec splits a tick's frame across multiple packets when the cell list overflows.                             | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
+| `max_payload_bytes`  | 1 400       | UDP datagram budget, 152 to 65 507 bytes. The codec splits a tick's frame across multiple packets when the cell list overflows.        | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 
 ### Per-rule error budget (adaptive emit rate)
 
 | Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
-| `target_err_bps`     | 100 (= 1 %) | Per-rule error budget in basis points of the rule's limit. Tighter = more threshold fires, looser = more local lag.                    | Lower if a hot rule needs tighter convergence than 1 %; higher if bandwidth is the bottleneck.                |
-| `min_emit_interval`  | 5 ms        | Floor between two threshold-fire emissions. Caps worst-case emit rate when ε saturates under adversarial load.                         | Raise if a bad client is pinning the gossip socket; lower to chase microsecond convergence on tiny clusters.  |
+| `target_err_bps`     | 100 (= 1 %) | Per-rule error budget in basis points of the rule's limit, 1 to 10 000. Tighter = more threshold fires, looser = more local lag.       | Lower if a hot rule needs tighter convergence than 1 %; higher if bandwidth is the bottleneck.                |
+| `min_emit_interval`  | 5 ms        | Floor between two threshold-fire emissions, at least 1 ms and below `tick_interval`. Caps worst-case emit rate when ε saturates under adversarial load. | Raise if a bad client is pinning the gossip socket.                                                            |
 
-The `gabion::defaults` module is the single source of truth for these
-constants. Both adapters read from it, so if you change a default the
-two adapters move together. Per-adapter configuration translates each
-knob to its surface name — see [`crates/server/README.md`](../server/README.md)
+The `gabion::defaults` module holds these defaults, and `gabion::settings`
+is the one table both adapters name, parse and validate every setting
+through: each row gives the YAML key, the environment variable and the
+NGINX directive, so if you change a default or a bound the two adapters
+move together, and a bad value fails configuration load with the same
+message in both. See [`crates/server/README.md`](../server/README.md)
 for the YAML keys and [`crates/nginx/README.md`](../nginx/README.md) for
 the directives.
 

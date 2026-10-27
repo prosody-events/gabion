@@ -55,10 +55,7 @@ fn raised_max_key_bytes_admits_long_key() {
         parse_binding(&format!("${long_key}")).unwrap(),
         parse_binding(&format!("{long_key}x:$http_x")).unwrap(),
     ];
-    let cardinality = CardinalitySettings {
-        max_key_bytes: 256,
-        ..Default::default()
-    };
+    let cardinality = crate::mock::limits(|s| s.max_key_bytes = 256.try_into().unwrap());
     let rules = CompiledRules::compile_with(
         &[cfg("long", bindings)],
         cardinality,
@@ -117,24 +114,6 @@ fn parse_binding_rejects_empty_source() {
 }
 
 #[test]
-fn is_dns_label_accepts_valid_names() {
-    assert!(is_dns_label("default"));
-    assert!(is_dns_label("gabion-mixed-1234"));
-    assert!(is_dns_label("a"));
-    assert!(is_dns_label("a1"));
-}
-
-#[test]
-fn is_dns_label_rejects_invalid_names() {
-    assert!(!is_dns_label(""));
-    assert!(!is_dns_label("-leading-dash"));
-    assert!(!is_dns_label("trailing-dash-"));
-    assert!(!is_dns_label("UPPER"));
-    assert!(!is_dns_label("under_score"));
-    assert!(!is_dns_label(&"a".repeat(64)));
-}
-
-#[test]
 fn is_zone_name_matches_nginx_grammar() {
     assert!(is_zone_name("api"));
     assert!(is_zone_name("api_v2"));
@@ -142,17 +121,4 @@ fn is_zone_name_matches_nginx_grammar() {
     assert!(!is_zone_name(""));
     assert!(!is_zone_name("api.v2"));
     assert!(!is_zone_name("api-v2"));
-}
-
-#[test]
-fn is_descriptor_key_matches_grammar() {
-    assert!(is_descriptor_key("tenant"));
-    assert!(is_descriptor_key("tenant_id"));
-    assert!(is_descriptor_key("tenant.id"));
-    assert!(is_descriptor_key("tenant-id"));
-    assert!(is_descriptor_key("_internal"));
-    assert!(!is_descriptor_key(""));
-    assert!(!is_descriptor_key("9leading"));
-    assert!(!is_descriptor_key(".dot-first"));
-    assert!(!is_descriptor_key("with space"));
 }

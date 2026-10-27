@@ -1,4 +1,5 @@
 use super::*;
+use crate::settings::mock::storage;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,31 +22,11 @@ fn rule_descriptor(fingerprint: u128, local_id: u32) -> RuleDescriptor {
 }
 
 fn store_u32() -> CellStore<u32> {
-    CellStore::new(
-        CellStoreConfig {
-            cell_capacity: 16,
-            rule_dictionary_capacity: 8,
-            node_dictionary_capacity: 8,
-            local_dirty_capacity: 16,
-            forwarded_dirty_capacity: 16,
-            peer_capacity: 4,
-        },
-        local(),
-    )
+    CellStore::new(storage(16, 8, 8, 16, 16, 4), local())
 }
 
 fn small_store(cell_cap: u32, dirty_cap: usize) -> CellStore<u32> {
-    CellStore::new(
-        CellStoreConfig {
-            cell_capacity: cell_cap,
-            rule_dictionary_capacity: 8,
-            node_dictionary_capacity: 8,
-            local_dirty_capacity: dirty_cap,
-            forwarded_dirty_capacity: dirty_cap,
-            peer_capacity: 4,
-        },
-        local(),
-    )
+    CellStore::new(storage(cell_cap, 8, 8, dirty_cap, dirty_cap, 4), local())
 }
 
 /// Build an `Observation` row with positional args. Test convenience for the
@@ -145,17 +126,7 @@ fn local_increment_one(
 }
 
 fn quickcheck_store() -> CellStore<u32> {
-    CellStore::new(
-        CellStoreConfig {
-            cell_capacity: 256,
-            rule_dictionary_capacity: 16,
-            node_dictionary_capacity: 16,
-            local_dirty_capacity: 512,
-            forwarded_dirty_capacity: 512,
-            peer_capacity: 8,
-        },
-        local(),
-    )
+    CellStore::new(storage(256, 16, 16, 512, 512, 8), local())
 }
 
 #[derive(Clone, Debug)]
@@ -1130,17 +1101,7 @@ fn wire_only_rule_frees_when_cells_expire() {
 
 #[test]
 fn dictionary_full_rejects_with_counter() {
-    let mut store = CellStore::<u32>::new(
-        CellStoreConfig {
-            cell_capacity: 16,
-            rule_dictionary_capacity: 1,
-            node_dictionary_capacity: 4,
-            local_dirty_capacity: 4,
-            forwarded_dirty_capacity: 4,
-            peer_capacity: 4,
-        },
-        local(),
-    );
+    let mut store = CellStore::<u32>::new(storage(16, 1, 4, 4, 4, 4), local());
     // First merge interns a rule. Second merge with a distinct fingerprint
     // must fail.
     let h1 = remote_merge_one(&mut store, 0x10, 2, 1, 1, 0);
@@ -1259,17 +1220,7 @@ fn peer_frontier_lacks_matches_scan() {
 
 #[test]
 fn node_slot_reuse_clears_frontier_rows() {
-    let mut store = CellStore::<u32>::new(
-        CellStoreConfig {
-            cell_capacity: 4,
-            rule_dictionary_capacity: 4,
-            node_dictionary_capacity: 4,
-            local_dirty_capacity: 4,
-            forwarded_dirty_capacity: 4,
-            peer_capacity: 2,
-        },
-        local(),
-    );
+    let mut store = CellStore::<u32>::new(storage(4, 4, 4, 4, 4, 2), local());
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let h = remote_merge_one(&mut store, 0x11, 42, 1, 5, 0);
     let row = store.get(h).unwrap();
@@ -1322,17 +1273,7 @@ fn dirty_lanes_separate() {
 #[test]
 fn count_widths_compile_and_saturate() {
     // u16 saturation.
-    let mut s16 = CellStore::<u16>::new(
-        CellStoreConfig {
-            cell_capacity: 4,
-            rule_dictionary_capacity: 4,
-            node_dictionary_capacity: 4,
-            local_dirty_capacity: 4,
-            forwarded_dirty_capacity: 4,
-            peer_capacity: 2,
-        },
-        local(),
-    );
+    let mut s16 = CellStore::<u16>::new(storage(4, 4, 4, 4, 4, 2), local());
     s16.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let mut obs = ObservationBatch::<u16>::with_capacity(1);
     let mut sink = DeltaSink::<u16>::with_capacity(1);
@@ -1363,17 +1304,7 @@ fn count_widths_compile_and_saturate() {
     assert_eq!(sink2.len(), 0);
 
     // u64 stores big counts.
-    let mut s64 = CellStore::<u64>::new(
-        CellStoreConfig {
-            cell_capacity: 4,
-            rule_dictionary_capacity: 4,
-            node_dictionary_capacity: 4,
-            local_dirty_capacity: 4,
-            forwarded_dirty_capacity: 4,
-            peer_capacity: 2,
-        },
-        local(),
-    );
+    let mut s64 = CellStore::<u64>::new(storage(4, 4, 4, 4, 4, 2), local());
     s64.intern_rule(rule_descriptor(0x11, 1)).unwrap();
     let mut obs64 = ObservationBatch::<u64>::with_capacity(1);
     let mut sink64 = DeltaSink::<u64>::with_capacity(1);
@@ -2109,17 +2040,7 @@ impl Arbitrary for TightRemoteRows {
 }
 
 fn quickcheck_store_tight() -> CellStore<u32> {
-    CellStore::new(
-        CellStoreConfig {
-            cell_capacity: 4,
-            rule_dictionary_capacity: 2,
-            node_dictionary_capacity: 3,
-            local_dirty_capacity: 16,
-            forwarded_dirty_capacity: 16,
-            peer_capacity: 4,
-        },
-        local(),
-    )
+    CellStore::new(storage(4, 2, 3, 16, 16, 4), local())
 }
 
 #[quickcheck]
@@ -2235,17 +2156,7 @@ impl Arbitrary for U16HitRows {
 
 #[quickcheck]
 fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
-    let mut store = CellStore::<u16>::new(
-        CellStoreConfig {
-            cell_capacity: 4,
-            rule_dictionary_capacity: 4,
-            node_dictionary_capacity: 4,
-            local_dirty_capacity: 32,
-            forwarded_dirty_capacity: 32,
-            peer_capacity: 4,
-        },
-        local(),
-    );
+    let mut store = CellStore::<u16>::new(storage(4, 4, 4, 32, 32, 4), local());
     let mut model_sum: u64 = 0;
     for row in &rows.0 {
         let mut obs = ObservationBatch::<u16>::with_capacity(1);

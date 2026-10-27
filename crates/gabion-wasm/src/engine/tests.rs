@@ -46,7 +46,8 @@ where
     let local = LocalSet::new();
     local.block_on(&rt, async move {
         let (tx, rx) = mpsc::channel(16);
-        let engine = tokio::task::spawn_local(run_engine(config, rx));
+        let valid = config.validate().expect("test config validates");
+        let engine = tokio::task::spawn_local(run_engine(config, valid, rx));
         driver(tx.clone()).await;
         drop(tx);
         engine
@@ -645,7 +646,7 @@ fn events_serialize_with_hex_identifiers() {
     assert_eq!(back, event);
 }
 
-/// The derived per-node sizing (`SimConfig::cell_store_config`) is anchored on
+/// The derived per-node sizing (`SimConfig::settings`) is anchored on
 /// the `MAX_NODES` *growth ceiling*, not the initial cluster size — so every
 /// node, however small the cluster starts, holds the full cross-node replica
 /// working set it could ever grow into (the `CellStore` never resizes, and
@@ -658,7 +659,7 @@ fn events_serialize_with_hex_identifiers() {
 /// once saturates the deterministic `SimRouter`'s inbound queues and trips a
 /// debug-only wire backpressure assert unrelated to cell-store sizing.)
 #[test]
-fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
+fn settings_are_ceiling_sized_and_hold_the_working_set() {
     // The viz-default window: a 10 s / 1 s rule has 10 live buckets.
     const LIVE_BUCKETS: u32 = 10;
 
@@ -666,13 +667,14 @@ fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
     // byte-for- byte identical caps. This is the property that makes live
     // growth safe — size is a function of the ceiling and the rule, never
     // of `config.nodes`.
-    let small = SimConfig::default().cell_store_config(LIVE_BUCKETS);
+    let small = SimConfig::default().settings().expect("default settings");
     let full = SimConfig {
         nodes: MAX_NODES,
         ..SimConfig::default()
     }
-    .cell_store_config(LIVE_BUCKETS);
-    assert_eq!(small.cell_capacity, full.cell_capacity);
+    .settings()
+    .expect("full settings");
+    assert_eq!(small.max_cells, full.max_cells);
     assert_eq!(
         small.forwarded_dirty_capacity,
         full.forwarded_dirty_capacity
@@ -688,14 +690,14 @@ fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
     // holds a replica of every origin's set — so the cell store must cover
     // `MAX_NODES × (live_buckets + 1)`.
     assert!(
-        caps.cell_capacity as usize >= MAX_NODES * (LIVE_BUCKETS as usize + 1),
-        "cell_capacity {} under the cross-node working set",
-        caps.cell_capacity,
+        caps.max_cells.get() as usize >= MAX_NODES * (LIVE_BUCKETS as usize + 1),
+        "max_cells {} under the cross-node working set",
+        caps.max_cells,
     );
     // The forwarded-dirty ring carries replicas of every *other* origin's live
     // buckets — the cap the design analysis pins.
     assert!(
-        caps.forwarded_dirty_capacity >= (MAX_NODES - 1) * LIVE_BUCKETS as usize,
+        caps.forwarded_dirty_capacity.get() >= (MAX_NODES - 1) * LIVE_BUCKETS as usize,
         "forwarded_dirty_capacity {} under the replica working set",
         caps.forwarded_dirty_capacity,
     );
@@ -703,20 +705,23 @@ fn cell_store_config_is_ceiling_sized_and_holds_the_working_set() {
     // the slack is only a couple of slots) without truncating to a u16 below
     // it.
     assert!(
-        usize::from(caps.node_dictionary_capacity) >= MAX_NODES,
+        usize::from(caps.node_dictionary_capacity.get()) >= MAX_NODES,
         "node_dictionary_capacity {} cannot hold {MAX_NODES} origins",
         caps.node_dictionary_capacity,
     );
-    assert!(usize::from(caps.peer_capacity) >= MAX_NODES);
+    assert!(usize::from(caps.peer_capacity.get()) >= MAX_NODES);
 
     // …and the shrink is real: even at the ceiling every cap is a few thousand
     // entries, well under the production floors (`gabion::defaults::STORAGE_*`)
     // it replaces — `STORAGE_FORWARDED_DIRTY_CAPACITY` alone is 524 288.
     assert!(
-        caps.forwarded_dirty_capacity < gabion::defaults::STORAGE_FORWARDED_DIRTY_CAPACITY / 50
+        caps.forwarded_dirty_capacity.get()
+            < gabion::defaults::STORAGE_FORWARDED_DIRTY_CAPACITY / 50
     );
-    assert!((caps.cell_capacity as usize) < gabion::defaults::STORAGE_MAX_CELLS / 20);
-    assert!(caps.local_dirty_capacity < gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY / 1_000);
+    assert!((caps.max_cells.get() as usize) < gabion::defaults::STORAGE_MAX_CELLS / 20);
+    assert!(
+        caps.local_dirty_capacity.get() < gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY / 1_000
+    );
 }
 
 /// The live runtime honors the shrunk, derived sizing: a cluster the size of
@@ -732,7 +737,7 @@ fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
         rule_bucket_ms: 1_000,
         ..test_config(NODES)
     };
-    let caps = config.cell_store_config(10);
+    let caps = config.settings().expect("settings");
 
     with_engine(config, |tx| async move {
         // Eight origins across two buckets: enough cross-node replication to
@@ -766,7 +771,7 @@ fn moderate_cluster_runtime_honors_the_shrunk_sizing() {
             assert_eq!(s.node_dictionary_full_rejects, 0, "node {}", node.id);
             // The runtime was built with the derived (small) capacity, not a
             // production floor — proof the shrink is in effect end-to-end.
-            assert_eq!(s.cell_capacity, caps.cell_capacity);
+            assert_eq!(s.cell_capacity, caps.max_cells.get());
         }
         // The 40 hits (8 origins × 5) propagate to every node within the
         // window.

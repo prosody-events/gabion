@@ -5,7 +5,9 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use gabion::defaults;
-use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId};
+use gabion::rules::{
+    CardinalityLimits, DescriptorPattern, EnforcementMode, Rule, RuleId, is_descriptor_key,
+};
 use thiserror::Error;
 
 /// Default domain assigned to rules that don't name one explicitly. nginx
@@ -17,25 +19,6 @@ pub const DEFAULT_DOMAIN: &str = "nginx";
 /// envelope so cross-node fingerprints can never grow past what one side can
 /// admit.
 pub const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
-
-/// Operator-visible cardinality envelope, enforced both at config-compile
-/// time (descriptor count, key length) and per-request (byte budget).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CardinalitySettings {
-    pub max_descriptor_count: usize,
-    pub max_descriptor_bytes: usize,
-    pub max_key_bytes: usize,
-}
-
-impl Default for CardinalitySettings {
-    fn default() -> Self {
-        Self {
-            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
-            max_descriptor_bytes: defaults::STORAGE_MAX_DESCRIPTOR_BYTES,
-            max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
-        }
-    }
-}
 
 /// One descriptor binding declared in nginx config — a descriptor `key` paired
 /// with the nginx variable specification to evaluate at request time.
@@ -230,40 +213,10 @@ pub fn is_single_ident(s: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-/// Match a descriptor key against `[A-Za-z_][A-Za-z0-9_.-]*`. Identifier-
-/// like with `.` and `-` so operator-readable names (`tenant-id`,
-/// `app.tenant`) round-trip through the directive parser and the YAML
-/// adapter unchanged.
-pub fn is_descriptor_key(s: &str) -> bool {
-    let mut chars = s.chars();
-    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
-        && chars.all(|c| c == '_' || c == '.' || c == '-' || c.is_ascii_alphanumeric())
-}
-
 /// Match an nginx-style zone name against `[A-Za-z0-9_]+`, the same shape
 /// nginx core's `limit_req_zone` imposes on its own zone names.
 pub fn is_zone_name(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
-}
-
-/// Match a Kubernetes DNS label per RFC 1123:
-/// `[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?`. Lower-case, 1–63 chars, must
-/// start and end with `[a-z0-9]`. Used for namespace / service allowlist
-/// arguments so a typo doesn't silently match nothing.
-pub fn is_dns_label(s: &str) -> bool {
-    let len = s.len();
-    if !(1..=63).contains(&len) {
-        return false;
-    }
-    let bytes = s.as_bytes();
-    let head_ok = bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit();
-    let tail_ok = bytes[len - 1].is_ascii_lowercase() || bytes[len - 1].is_ascii_digit();
-    if !head_ok || !tail_ok {
-        return false;
-    }
-    bytes
-        .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
 }
 
 /// Parse a positional descriptor binding argument. Accepts:
@@ -275,7 +228,8 @@ pub fn is_dns_label(s: &str) -> bool {
 ///
 /// Templates (anything with literal text or multiple `$` substitutions)
 /// require the explicit `key:source` form — there's no useful auto-name
-/// to derive. Keys are validated against [`is_descriptor_key`] so spaces,
+/// to derive. Keys are validated against
+/// [`gabion::rules::is_descriptor_key`] so spaces,
 /// punctuation, or anything else not matching `[A-Za-z_][A-Za-z0-9_.-]*`
 /// is rejected at parse time.
 pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
@@ -318,7 +272,7 @@ impl CompiledRules {
     /// Tests pass [`NopBindingCompiler`].
     pub fn compile_with<C: BindingCompiler>(
         configs: &[RuleConfig],
-        cardinality: CardinalitySettings,
+        cardinality: CardinalityLimits,
         compiler: &mut C,
     ) -> Result<Self, RuleConfigError> {
         let mut compiled = Vec::with_capacity(configs.len());
@@ -326,11 +280,11 @@ impl CompiledRules {
             if cfg.bindings.is_empty() {
                 return Err(RuleConfigError::EmptyBindings(cfg.name.to_string()));
             }
-            if cfg.bindings.len() > cardinality.max_descriptor_count {
+            if cfg.bindings.len() > cardinality.max_descriptor_count() {
                 return Err(RuleConfigError::TooManyBindings(cfg.name.to_string()));
             }
             for binding in &cfg.bindings {
-                if binding.key.len() > cardinality.max_key_bytes {
+                if binding.key.len() > cardinality.max_key_bytes() {
                     return Err(RuleConfigError::KeyTooLong {
                         rule: cfg.name.to_string(),
                         key: binding.key.to_string(),

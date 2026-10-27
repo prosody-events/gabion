@@ -22,10 +22,9 @@ impl CellIndex {
     /// Construct an index with `capacity` buckets. `capacity` must be a power
     /// of two greater than zero.
     pub fn with_capacity(capacity: u32) -> Self {
-        assert!(capacity > 0, "CellIndex capacity must be > 0");
-        assert!(
+        debug_assert!(
             capacity.is_power_of_two(),
-            "CellIndex capacity must be power of two"
+            "CellIndex capacity must be a power of two"
         );
         Self {
             slot_indexes: vec![EMPTY_INDEX_SLOT; capacity as usize].into_boxed_slice(),

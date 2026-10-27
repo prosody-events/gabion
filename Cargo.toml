@@ -20,7 +20,6 @@ anyhow = "1"
 arrayvec = "0.7"
 axum = "0.8"
 async-stream = "0.3"
-bon = "3"
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", default-features = false, features = ["yaml"] }
 criterion = "0.8"
@@ -30,7 +29,6 @@ either = "1"
 envoy-types = "0.7"
 futures = "0.3"
 gabion = { path = "crates/gabion" }
-gabion-server = { path = "crates/server" }
 # `std` so `getrandom::Error` implements `std::error::Error` (anyhow `.context`
 # in gabiond); `sys_rng` selects the OS backend (0.4 made it opt-in). The
 # wasm32 target adds `wasm_js` in gabion's manifest.

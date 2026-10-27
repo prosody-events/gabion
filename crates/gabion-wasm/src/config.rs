@@ -4,10 +4,13 @@
 //! bucket)` rule the user drives with requests for arbitrary keys. A
 //! multi-rule mix is a future extension (it becomes a `Vec` here).
 
-use gabion::crdt::CellStoreConfig;
+use gabion::crdt::{RuleDescriptor, ValidStorageConfig};
 use gabion::defaults;
+use gabion::gossip::ValidGossipConfig;
+use gabion::settings::{Setting, SettingError, Settings};
 use serde::{Deserialize, Serialize};
 
+use crate::engine::{CLUSTER_ID_HASH, VIZ_MAX_CELLS_PER_TICK, VIZ_SEND_QUEUE_CAPACITY};
 use crate::hex::u128_hex;
 
 /// Largest cluster the visualizer constructs. Bounded so a stray config from
@@ -26,7 +29,7 @@ pub struct SimConfig {
     pub nodes: usize,
     /// Floor on peers contacted per gossip tick; the runtime scales the
     /// actual fanout to the `⌈ln(n)+c⌉` coverage threshold (`n` = peer count).
-    /// See [`gabion::gossip::GossipConfig::fanout`].
+    /// See `gossip.fanout` in [`gabion::settings`].
     pub fanout: usize,
     /// Period between proactive gossip ticks, in milliseconds.
     pub tick_interval_ms: u64,
@@ -97,14 +100,17 @@ pub enum ConfigError {
          0.1 for 10% loss)."
     )]
     LossOutOfRange { got: f64 },
+    #[error(transparent)]
+    Setting(#[from] SettingError),
 }
 
 impl SimConfig {
-    /// Validate the user-facing invariants. Bucket/window math is checked here
-    /// because a zero bucket silently disables expiry inside the CRDT
+    /// Validate the user-facing invariants and build every node's gossip and
+    /// storage configs, once. Bucket/window math is checked here because a
+    /// zero bucket silently disables expiry inside the CRDT
     /// (`RuleDescriptor::default`'s footgun), which would mislead rather than
     /// inform.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(ValidGossipConfig, ValidStorageConfig), ConfigError> {
         if self.nodes < 1 || self.nodes > MAX_NODES {
             return Err(ConfigError::NodeCountOutOfRange { got: self.nodes });
         }
@@ -122,13 +128,16 @@ impl SimConfig {
                 got: self.uniform_loss,
             });
         }
-        Ok(())
+        Ok(self.settings()?.validate()?)
     }
 
-    /// Per-node CRDT capacities for the browser sim, derived from the watched
-    /// rule's live-bucket count and the cluster's *growth ceiling*. The single
-    /// sizing site: every node ([`crate::engine`]'s initial build and
-    /// `add_node` both route through `spawn_node`, which calls this).
+    /// The node settings for this session: the controls' gossip tuning and
+    /// per-node CRDT capacities derived from the watched rule's live-bucket
+    /// count and the cluster's *growth ceiling*, passed through
+    /// [`Settings::apply`] so a bad control value reports the same error an
+    /// adapter would. The single sizing site: every node ([`crate::engine`]'s
+    /// initial build and `add_node`) uses the configs [`Self::validate`]
+    /// builds from it.
     ///
     /// The node-count term is [`MAX_NODES`], **not** `self.nodes`. A
     /// [`gabion::crdt::CellStore`] allocates once and never resizes, and the
@@ -136,20 +145,17 @@ impl SimConfig {
     /// no rebuild (the `live-node-membership-requirement`). Sizing from
     /// `self.nodes` would overflow the node dictionary, peer table, and
     /// cell store the moment a user joined past `config.nodes`, so every
-    /// cluster is sized for the ceiling it can grow to — the same guarantee
-    /// the old per-`spawn_node` floors gave, now in one expression.
+    /// cluster is sized for the ceiling it can grow to.
     ///
-    /// Unlike the adapters' production configs
-    /// (`gabion::defaults::STORAGE_*` via `server::config::cell_store_config`
-    /// and `nginx::leader::production_cell_store_config`), these carry **no
-    /// production floors**: the visualizer watches one rule for a handful of
-    /// keys, so even at the ceiling the working set is the cross-node replica
-    /// set — `MAX_NODES × live_buckets` cells — a few thousand entries, not
-    /// the hundreds of thousands a real deployment sizes for. A small
-    /// constant `SLACK` keeps the largest cluster clear of eviction; if a
-    /// probe ever overflows a ring, raise `SLACK` here — the one place —
-    /// not a scattered floor.
-    pub fn cell_store_config(&self, live_buckets: u32) -> CellStoreConfig {
+    /// Unlike the adapters' production defaults (`Settings::default`), these
+    /// carry **no production floors**: the visualizer watches one rule for a
+    /// handful of keys, so even at the ceiling the working set is the
+    /// cross-node replica set — `MAX_NODES × live_buckets` cells — a few
+    /// thousand entries, not the hundreds of thousands a real deployment
+    /// sizes for. A small constant `SLACK` keeps the largest cluster clear of
+    /// eviction; if a probe ever overflows a ring, raise `SLACK` here — the
+    /// one place — not a scattered floor.
+    pub fn settings(&self) -> Result<Settings, ConfigError> {
         // Headroom over the exact working set, absorbing churn and the bucket
         // just emerging under "now". One knob for the whole sizing.
         const SLACK: u32 = 2;
@@ -160,21 +166,63 @@ impl SimConfig {
         // emerging. A node holds a replica of every origin's set, so the cell
         // store and forwarded-dirty ring both scale with `ceiling ×
         // per_origin`.
+        let live_buckets = RuleDescriptor {
+            window_millis: self.rule_window_ms,
+            bucket_millis: self.rule_bucket_ms,
+            ..RuleDescriptor::default()
+        }
+        .live_buckets();
         let per_origin = live_buckets + 1;
         let cross_node = ceiling
             .saturating_mul(per_origin)
             .saturating_mul(SLACK)
             .max(SLACK);
-        CellStoreConfig {
-            cell_capacity: cross_node,
-            // One watched rule; headroom for an interned default / wire-only rule.
-            rule_dictionary_capacity: 4,
-            node_dictionary_capacity: (ceiling + SLACK).min(u16::MAX as u32) as u16,
+        let mut settings = Settings::default();
+        for (setting, value) in [
+            (Setting::GossipFanout, self.fanout.to_string()),
+            (
+                Setting::GossipTickInterval,
+                format!("{}ms", self.tick_interval_ms),
+            ),
+            (Setting::GossipTargetErrBps, self.target_err_bps.to_string()),
+            (
+                Setting::GossipMinEmitInterval,
+                format!("{}ms", self.min_emit_interval_ms),
+            ),
+            (Setting::GossipClusterIdHash, CLUSTER_ID_HASH.to_string()),
+            // The per-tick frame is capped (see `VIZ_MAX_CELLS_PER_TICK`) so
+            // one tick's packet output stays inside the send pool.
+            (
+                Setting::GossipMaxCellsPerTick,
+                VIZ_MAX_CELLS_PER_TICK.min(cross_node as usize).to_string(),
+            ),
+            (Setting::GossipMaxCellsPerFrame, cross_node.to_string()),
+            (
+                Setting::GossipSendQueueCapacity,
+                VIZ_SEND_QUEUE_CAPACITY.to_string(),
+            ),
+            (Setting::StorageMaxCells, cross_node.to_string()),
+            // One watched rule; headroom for an interned default / wire-only
+            // rule.
+            (Setting::StorageRuleDictionaryCapacity, "4".to_owned()),
+            (
+                Setting::StorageNodeDictionaryCapacity,
+                (ceiling + SLACK).to_string(),
+            ),
             // Local-origin dirty cells are this node's *own* live buckets —
             // independent of cluster size, so this stays small at any ceiling.
-            local_dirty_capacity: (per_origin * SLACK) as usize,
-            forwarded_dirty_capacity: cross_node as usize,
-            peer_capacity: (ceiling + SLACK).min(u16::MAX as u32) as u16,
+            (
+                Setting::StorageLocalDirtyCapacity,
+                (per_origin * SLACK).to_string(),
+            ),
+            (
+                Setting::StorageForwardedDirtyCapacity,
+                cross_node.to_string(),
+            ),
+            (Setting::StoragePeerCapacity, (ceiling + SLACK).to_string()),
+        ] {
+            settings.apply(setting, &value)?;
         }
+        Ok(settings)
     }
 }

@@ -1,25 +1,46 @@
-use std::collections::BTreeSet;
+use gabion::settings::{Setting, SettingError, Settings};
 
-use gabion::settings::Setting;
-
-/// `include_str!` because module.rs only builds with the `ngx-module` feature.
+/// On `main` these directives turned 0 into 1 without a word. Through the
+/// settings table a 0 now fails `nginx -t`: at the directive for a count, and
+/// at validation for the packet size, whose zero is out of range.
 #[test]
-fn settings_table_matches_module_directives() {
-    const NON_SETTINGS: [&str; 4] = [
-        "gabion",
-        "gabion_limit",
-        "gabion_limit_rule",
-        "gabion_limit_zone",
-    ];
-    let module: BTreeSet<&str> = include_str!("module.rs")
-        .split("name: ngx_string!(\"")
-        .skip(1)
-        .filter_map(|rest| rest.split_once('"').map(|(name, _)| name))
-        .filter(|name| !NON_SETTINGS.contains(name))
-        .collect();
-    let table: BTreeSet<&str> = Setting::ALL
-        .iter()
-        .filter_map(|setting| setting.nginx_directive())
-        .collect();
-    assert_eq!(module, table);
+fn nginx_zero_is_rejected_not_clamped() {
+    for directive in [
+        "gabion_gossip_fanout",
+        "gabion_gossip_max_payload_bytes",
+        "gabion_gossip_max_cells_per_frame",
+        "gabion_gossip_max_cells_per_tick",
+        "gabion_gossip_send_queue_capacity",
+        "gabion_storage_max_cells",
+        "gabion_storage_rule_dictionary_capacity",
+        "gabion_storage_node_dictionary_capacity",
+        "gabion_storage_local_dirty_capacity",
+        "gabion_storage_forwarded_dirty_capacity",
+        "gabion_storage_peer_capacity",
+        "gabion_storage_max_descriptor_bytes",
+        "gabion_storage_max_key_bytes",
+    ] {
+        let setting = *Setting::ALL
+            .iter()
+            .find(|setting| setting.nginx_directive() == Some(directive))
+            .expect(directive);
+        let mut settings = Settings::default();
+        let applied = settings.apply(setting, "0");
+        if setting == Setting::GossipMaxPayloadBytes {
+            assert_eq!(applied, Ok(()));
+            assert!(
+                matches!(
+                    settings.validate(),
+                    Err(SettingError::PayloadOutOfRange { configured: 0, .. })
+                ),
+                "{directive}"
+            );
+        } else {
+            assert_eq!(
+                applied,
+                Err(SettingError::NotPositive { setting }),
+                "{directive}"
+            );
+        }
+    }
 }

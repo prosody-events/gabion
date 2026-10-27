@@ -34,7 +34,7 @@ use super::store::AggregateStore;
 use super::transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
 use super::transport::UdpTransport;
-use super::{GossipConfig, GossipError};
+use super::{GossipError, ValidGossipConfig};
 
 /// One peer the runtime gossips with. `node_id` is `None` until we receive
 /// our first inbound packet from this peer; `peer_slot` caches the
@@ -88,7 +88,7 @@ where
     T: GossipTransport,
     K: Clock,
 {
-    config: GossipConfig,
+    config: ValidGossipConfig,
     store: CellStore<C>,
     transport: T,
     clock: K,
@@ -190,7 +190,7 @@ where
     /// production transport and a wall-clock-anchored `TokioClock`.
     pub async fn bind(
         bind_addr: SocketAddr,
-        config: GossipConfig,
+        config: ValidGossipConfig,
         store: CellStore<C>,
         aggregates: S,
     ) -> Result<(Self, GossipClient<C>), GossipError> {
@@ -208,7 +208,7 @@ where
     /// admin select arm is only polled when this constructor is used.
     pub async fn bind_with_admin(
         bind_addr: SocketAddr,
-        config: GossipConfig,
+        config: ValidGossipConfig,
         store: CellStore<C>,
         aggregates: S,
         admin_rx: mpsc::Receiver<AdminCommand>,
@@ -237,7 +237,7 @@ where
     pub fn from_parts(
         transport: T,
         clock: K,
-        config: GossipConfig,
+        config: ValidGossipConfig,
         store: CellStore<C>,
         aggregates: S,
     ) -> (Self, GossipClient<C>) {
@@ -250,27 +250,28 @@ where
     pub fn from_parts_with_admin(
         transport: T,
         clock: K,
-        config: GossipConfig,
+        config: ValidGossipConfig,
         store: CellStore<C>,
         aggregates: S,
         admin_rx: Option<mpsc::Receiver<AdminCommand>>,
     ) -> (Self, GossipClient<C>) {
-        let (req_tx, req_rx) = mpsc::channel(config.limit_queue_capacity);
+        let (req_tx, req_rx) = mpsc::channel(config.limit_queue_capacity.get());
 
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
-        let obs_buf = ObservationBatch::<C>::with_capacity(config.max_cells_per_tick);
+        let cells_per_tick = config.max_cells_per_tick.get();
+        let obs_buf = ObservationBatch::<C>::with_capacity(cells_per_tick);
         let ack_buf = AckColumns::with_capacity(config.wire_limits.max_cells as usize);
-        let sink_buf = DeltaSink::<C>::with_capacity(config.max_cells_per_tick);
-        let frame_handles = Vec::with_capacity(config.max_cells_per_tick);
-        let expiration_buf = ExpirationSink::<C>::with_capacity(config.max_cells_per_tick);
+        let sink_buf = DeltaSink::<C>::with_capacity(cells_per_tick);
+        let frame_handles = Vec::with_capacity(cells_per_tick);
+        let expiration_buf = ExpirationSink::<C>::with_capacity(cells_per_tick);
 
-        let send_pool_size = config.send_queue_capacity.max(1);
+        let send_pool_size = config.send_queue_capacity.get();
         let send_pool: Vec<PacketBuf> = (0..send_pool_size)
             .map(|_| PacketBuf::for_limits(config.wire_limits))
             .collect();
-        let send_free: Vec<u8> = (0..send_pool_size as u8).rev().collect();
-        let send_pending = VecDeque::with_capacity(send_pool_size);
+        let send_free: Vec<u8> = (0..send_pool_size).rev().collect();
+        let send_pending = VecDeque::with_capacity(send_pool_size.into());
 
         let peers: Vec<Peer> = config
             .bootstrap_peers
@@ -452,7 +453,7 @@ where
             self.rule_pending[idx] = pending;
             let peers = self.peers.len().max(1) as u64;
             let limit = req.rule_limit.max(1);
-            let bps = self.config.target_err_bps.max(1) as u64;
+            let bps = u64::from(self.config.target_err_bps.get());
             let epsilon = ((limit.saturating_mul(bps)) / (10_000 * peers)).max(1);
             // Surface the budget so observers can see the threshold a burst's
             // accumulated `pending` must cross to trigger an eager flush.
@@ -760,7 +761,7 @@ where
         // never clamps below 1.
         let n = self.peers.len();
         let coverage = ((n as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-        let pick_count = self.config.fanout.max(coverage).min(n);
+        let pick_count = self.config.fanout.get().max(coverage).min(n);
         // Record the coverage-fanout decision so observers can read the pick
         // directly instead of reconstructing the formula. Only dirty ticks
         // reach here, so `last_effective_fanout` is the fanout of the most
@@ -786,7 +787,7 @@ where
             match peer_slot {
                 Some(slot) => {
                     self.store.fill_gossip_frame_for_peer(
-                        self.config.max_cells_per_tick,
+                        self.config.max_cells_per_tick.get(),
                         slot,
                         &mut self.frame_handles,
                     );
@@ -795,8 +796,10 @@ where
                     // Bootstrap fallback: we haven't heard from this peer
                     // yet, so we don't know what to prune. Send an unpruned
                     // frame; the next inbound from them caches the slot.
-                    self.store
-                        .fill_gossip_frame(self.config.max_cells_per_tick, &mut self.frame_handles);
+                    self.store.fill_gossip_frame(
+                        self.config.max_cells_per_tick.get(),
+                        &mut self.frame_handles,
+                    );
                 }
             }
             if self.frame_handles.is_empty() {
@@ -826,7 +829,7 @@ where
 
     fn encode_packets_for(&mut self, dst: SocketAddr) {
         let header = wire::Header {
-            cluster_id_hash: self.config.cluster_id_hash,
+            cluster_id_hash: self.config.cluster_id_hash.get(),
             sender_node_id: self.store.local_identity().node_id.0,
             sender_incarnation: self.store.local_identity().incarnation,
             count_width: 0,

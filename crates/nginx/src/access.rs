@@ -7,9 +7,9 @@
 
 use arrayvec::ArrayVec;
 use gabion::defaults;
-use gabion::rules::{Descriptor, EnforcementMode, RuleId, RuleSpec, hash_key};
+use gabion::rules::{CardinalityLimits, Descriptor, EnforcementMode, RuleId, RuleSpec, hash_key};
 
-use crate::rules::{BindingLookup, CardinalitySettings, CompiledRules, MAX_DESCRIPTORS};
+use crate::rules::{BindingLookup, CompiledRules, MAX_DESCRIPTORS};
 use crate::shm::aggregate::AggregateTable;
 use crate::shm::queue::{QueueEvent, RequestQueue};
 use crate::shm::stats::Stats;
@@ -80,7 +80,7 @@ pub struct AccessCtx<'a> {
     /// Default domain assigned to requests when the location config doesn't
     /// override it.
     pub domain: &'a str,
-    pub cardinality: CardinalitySettings,
+    pub cardinality: CardinalityLimits,
 }
 
 /// Per-rule outcome before [`decide_all`] folds it into a single
@@ -246,31 +246,25 @@ fn decide_one(
 
     // Build descriptors on the stack in one pass over `bindings`. Variable
     // misses decline; UTF-8 failures decline (and bump a stat so the bypass
-    // is observable); the dynamic byte budget is the only per-request
-    // cardinality check — count and key length are gated at compile time.
+    // is observable). Then the one cardinality check both adapters share;
+    // count and key length already passed it at compile time, so only the
+    // byte budget can fail here.
     let mut descriptors: ArrayVec<Descriptor<'_>, MAX_DESCRIPTORS> = ArrayVec::new();
-    let mut bytes = ctx.domain.len();
     for binding in &compiled.bindings {
         let Some(value) = vars.lookup(&binding.lookup) else {
             return RuleOutcome::Decline;
         };
-        bytes = bytes
-            .saturating_add(binding.key.len())
-            .saturating_add(value.len());
-        if bytes > ctx.cardinality.max_descriptor_bytes {
-            return RuleOutcome::Cardinality;
-        }
-        let value_str = match std::str::from_utf8(value) {
-            Ok(s) => s,
-            Err(_) => {
-                ctx.stats.record_decline_invalid_descriptor();
-                return RuleOutcome::Decline;
-            }
+        let Ok(value) = std::str::from_utf8(value) else {
+            ctx.stats.record_decline_invalid_descriptor();
+            return RuleOutcome::Decline;
         };
         descriptors.push(Descriptor {
             key: &binding.key,
-            value: value_str,
+            value,
         });
+    }
+    if ctx.cardinality.exceeded(ctx.domain, &descriptors).is_some() {
+        return RuleOutcome::Cardinality;
     }
 
     // Evaluate this one specific rule. The rule's `RuleTable` row is

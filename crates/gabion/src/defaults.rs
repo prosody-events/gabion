@@ -56,8 +56,8 @@ pub const GOSSIP_FANOUT: usize = 3;
 /// fanout 13 @ 10 000 nodes, 15 @ 50 000 — measure single-shot reach, which a
 /// re-gossiping system does not need to match). `c = 3` costs ≈ 1 fewer peer
 /// per tick at every cluster size (≈ 10 % less gossip bandwidth). Kept a
-/// `const`; promote to a `GossipConfig` field if an operator ever needs to
-/// trade bandwidth for coverage at runtime.
+/// `const`; promote to a setting in `gabion::settings` if an operator ever
+/// needs to trade bandwidth for coverage at runtime.
 pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;

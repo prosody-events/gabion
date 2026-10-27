@@ -33,14 +33,14 @@ use std::thread;
 
 use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
 use gabion::gossip::AggregateStore;
-use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, hash_key};
+use gabion::rules::{CardinalityLimits, DescriptorPattern, EnforcementMode, Rule, hash_key};
+use gabion::settings::Settings;
 
 use gabion::crdt::{NodeId, NodeIdentity};
 
 use gabion_nginx::access::{AccessCtx, AccessOutcome, VariableLookup, decide_all};
 use gabion_nginx::rules::{
-    BindingLookup, CardinalitySettings, CompiledRules, DescriptorBinding, NopBindingCompiler,
-    RuleConfig,
+    BindingLookup, CompiledRules, DescriptorBinding, NopBindingCompiler, RuleConfig,
 };
 use gabion_nginx::shm::aggregate::ShmAggregateStore;
 use gabion_nginx::shm::header::{SHM_MAGIC, SHM_VERSION};
@@ -104,6 +104,11 @@ fn build_zone(queue_cap: usize, agg_cap: usize) -> (TestZone, ShmRegion) {
     (zone, region)
 }
 
+fn default_limits() -> CardinalityLimits {
+    let (_, storage) = Settings::default().validate().expect("defaults validate");
+    storage.cardinality
+}
+
 fn build_rules() -> CompiledRules {
     CompiledRules::compile_with(
         &[RuleConfig {
@@ -119,7 +124,7 @@ fn build_rules() -> CompiledRules {
             mode: EnforcementMode::Enforce,
             except_if: None,
         }],
-        CardinalitySettings::default(),
+        default_limits(),
         &mut NopBindingCompiler,
     )
     .expect("compile rules")
@@ -300,7 +305,7 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
         queue: region.queue(),
         stats: region.stats(),
         domain: DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: default_limits(),
     };
     let vars = MockVars {
         tenant: b"alice".to_vec(),
@@ -609,7 +614,7 @@ fn decide_all_and_leader_apply_concurrent() {
                 queue: r.queue(),
                 stats: r.stats(),
                 domain: DEFAULT_DOMAIN,
-                cardinality: CardinalitySettings::default(),
+                cardinality: default_limits(),
             };
             assert!(matches!(
                 decide_all(ctx, &[0], &vars, 0),
@@ -713,12 +718,8 @@ fn decide_all_multi_rule_concurrent() {
         },
     ];
     let rules = Arc::new(
-        CompiledRules::compile_with(
-            &rule_configs,
-            CardinalitySettings::default(),
-            &mut NopBindingCompiler,
-        )
-        .expect("compile two rules"),
+        CompiledRules::compile_with(&rule_configs, default_limits(), &mut NopBindingCompiler)
+            .expect("compile two rules"),
     );
     let stop = Arc::new(AtomicBool::new(false));
     let worker_rules = rules.clone();
@@ -735,7 +736,7 @@ fn decide_all_multi_rule_concurrent() {
                 queue: r.queue(),
                 stats: r.stats(),
                 domain: DEFAULT_DOMAIN,
-                cardinality: CardinalitySettings::default(),
+                cardinality: default_limits(),
             };
             assert!(matches!(
                 decide_all(ctx, &[0, 1], &vars, 0),
@@ -809,4 +810,52 @@ fn lease_concurrent_acquire_distinct_winners() {
         let won = won.load(Ordering::Relaxed);
         assert_eq!(won, 1, "round {round}: expected exactly one lease winner");
     }
+}
+
+// -- 9. A configured queue capacity bounds the ring ------------------------
+
+/// `gabion_gossip_limit_queue_capacity` of 100 lays the zone out with a
+/// 128-slot ring: producers fill exactly those slots, the rest drop, and the
+/// leader pops every accepted event intact. Under Miri, every slot write
+/// stays inside the region `Layout::for_zone` sized.
+#[test]
+fn custom_queue_capacity_bounds_the_ring() {
+    const PER_PRODUCER: u64 = 100;
+    let layout = Layout::for_zone(256 * 1024, 4096, 100).expect("layout");
+    assert_eq!(layout.queue_capacity, 128);
+    let zone = Arc::new(TestZone::allocate(layout.total_bytes.div_ceil(8)));
+    // SAFETY: see build_zone.
+    let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
+    let event = |producer: u64, i: u64| QueueEvent {
+        rule_fingerprint: u128::from(producer) << 64 | u128::from(i),
+        key_hash: u128::from(i) << 64 | u128::from(producer),
+        bucket: i as u32,
+        hits: producer + 1,
+        rule_limit: i + 1,
+        now_millis: producer * 1_000 + i,
+    };
+    let producers: Vec<_> = (0..2_u64)
+        .map(|producer| {
+            thread::spawn(move || {
+                let queue = region.queue();
+                (0..PER_PRODUCER)
+                    .map(|i| event(producer, i))
+                    .filter(|event| queue.push(*event).is_ok())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let mut accepted: Vec<QueueEvent> = producers
+        .into_iter()
+        .flat_map(|producer| producer.join().expect("producer joined"))
+        .collect();
+    let queue = region.queue();
+    assert_eq!(accepted.len(), 128);
+    assert_eq!(queue.dropped(), 2 * PER_PRODUCER - 128);
+    let mut popped: Vec<QueueEvent> = std::iter::from_fn(|| queue.pop()).collect();
+    let key = |event: &QueueEvent| (event.rule_fingerprint, event.key_hash);
+    accepted.sort_by_key(key);
+    popped.sort_by_key(key);
+    assert_eq!(popped, accepted);
+    drop(zone);
 }

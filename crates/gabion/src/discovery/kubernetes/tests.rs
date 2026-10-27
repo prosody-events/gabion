@@ -318,7 +318,7 @@ fn service_change_ignores_init_marker() {
 #[test]
 fn service_change_filters_by_allow_list() {
     let svc = service("default", "other", true, true);
-    let change = service_change(Event::Apply(svc), &["gabion".to_string()]);
+    let change = service_change(Event::Apply(svc), &["gabion".into()]);
     assert!(
         matches!(change, ServiceChange::Ignore),
         "Service not in allow list should Ignore",
@@ -468,8 +468,8 @@ async fn local_kubernetes_endpoint_slice_watcher_emits_added_peer() {
     // first `Added` arrives. The timeout only bounds a broken watcher.
     let discovery = EndpointSliceDiscovery {
         self_addr: None,
-        namespace_allow: vec![namespace.clone()],
-        service_allow: vec!["gabion".to_string()],
+        namespace_allow: Box::new([namespace.as_str().into()]),
+        service_allow: Box::new(["gabion".into()]),
         preconnected: Some(client),
     };
     let first_added = async {

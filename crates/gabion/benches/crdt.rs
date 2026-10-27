@@ -36,10 +36,11 @@ use std::hint::black_box;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use gabion::crdt::{
-    BucketEpoch, CellHandle, CellStore, CellStoreConfig, CompactCellKey, DeltaSink, ExpirationSink,
-    Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
-    RuleDescriptor, RuleSlot,
+    BucketEpoch, CellHandle, CellStore, CompactCellKey, DeltaSink, ExpirationSink, Incarnation,
+    KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch, RuleDescriptor,
+    RuleSlot, ValidStorageConfig,
 };
+use gabion::settings::Settings;
 
 /// Build an `Observation` row with positional args. Used by the bench
 /// fixtures, where the field-named struct literal would be very verbose.
@@ -124,15 +125,18 @@ fn local_identity() -> NodeIdentity {
     NodeIdentity::new(LOCAL_NODE, LOCAL_INCARNATION)
 }
 
-fn config() -> CellStoreConfig {
-    CellStoreConfig {
-        cell_capacity: CELL_CAPACITY,
-        rule_dictionary_capacity: RULE_CAPACITY,
-        node_dictionary_capacity: NODE_CAPACITY,
-        local_dirty_capacity: DIRTY_CAPACITY,
-        forwarded_dirty_capacity: DIRTY_CAPACITY,
-        peer_capacity: PEER_CAPACITY,
-    }
+fn config() -> ValidStorageConfig {
+    let nz = "bench capacities are non-zero";
+    let settings = Settings {
+        max_cells: CELL_CAPACITY.try_into().expect(nz),
+        rule_dictionary_capacity: RULE_CAPACITY.try_into().expect(nz),
+        node_dictionary_capacity: NODE_CAPACITY.try_into().expect(nz),
+        local_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
+        forwarded_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
+        peer_capacity: PEER_CAPACITY.try_into().expect(nz),
+        ..Settings::default()
+    };
+    settings.validate().expect("bench settings validate").1
 }
 
 fn rule_fingerprint(i: usize) -> u128 {

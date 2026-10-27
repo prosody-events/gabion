@@ -6,14 +6,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use futures::StreamExt;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::task::LocalSet;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use gabion::crdt::{CellStore, RuleDescriptor};
-use gabion::discovery::{self, PeerDiscovery, PeerEvent};
+use gabion::discovery;
 use gabion::gossip::GossipRuntime;
 
 use gabion_server::admin::{self, AdminState};
@@ -64,17 +63,17 @@ async fn run() -> anyhow::Result<()> {
 
     let config = load_config()?;
     tracing::info!(
-        gossip_bind = ?config.gossip.bind,
-        envoy_bind = ?config.envoy_bind,
-        admin_bind = ?config.admin_bind,
+        gossip_bind = ?config.settings.gossip_bind,
+        envoy_bind = ?config.settings.envoy_bind,
+        admin_bind = ?config.settings.admin_bind,
         rules_loaded = config.limits.len(),
-        max_keys = config.cell_store_config().cell_capacity,
-        max_rules = config.cell_store_config().rule_dictionary_capacity,
-        max_peer_instances = config.cell_store_config().node_dictionary_capacity,
+        max_keys = config.settings.max_cells,
+        max_rules = config.settings.rule_dictionary_capacity,
+        max_peer_instances = config.settings.node_dictionary_capacity,
         "Starting gabion.",
     );
 
-    let identity = derive_identity(config.runtime.node_id_seed.as_deref());
+    let identity = derive_identity(config.settings.node_id_seed.as_deref());
     tracing::info!(
         node_id = %format!("{:032x}", identity.node_id.0),
         incarnation = identity.incarnation,
@@ -83,21 +82,21 @@ async fn run() -> anyhow::Result<()> {
     );
 
     let rule_table = Arc::new(config.rule_table()?);
-    let mut cell_store = CellStore::<u32>::new(config.cell_store_config(), identity);
+    let mut cell_store = CellStore::<u32>::new(config.storage, identity);
     register_rules(&mut cell_store, &rule_table).context("register configured rules")?;
     let counts = Arc::new(DashMapStore::<u32>::with_capacity(
-        config.storage.max_cells.unwrap_or(4096),
+        config.settings.max_cells.get() as usize,
     ));
 
-    let gossip_bind = config.gossip.bind.ok_or(ConfigError::MissingGossipBind)?;
-    let rng_seed = match config.runtime.rng_seed {
-        Some(seed) => seed,
-        None => gabion::defaults::random_rng_seed().context("draw gossip RNG seed")?,
-    };
-    let gossip_runtime_config = config
-        .gossip
-        .clone()
-        .into_runtime_config(identity, rng_seed);
+    let gossip_bind = config
+        .settings
+        .gossip_bind
+        .ok_or(ConfigError::MissingGossipBind)?;
+    let mut gossip_runtime_config = config.gossip.clone();
+    if config.settings.rng_seed.is_none() {
+        gossip_runtime_config.rng_seed =
+            gabion::defaults::random_rng_seed().context("draw gossip RNG seed")?;
+    }
 
     let (admin_tx, admin_rx) = admin::admin_channel();
 
@@ -119,10 +118,10 @@ async fn run() -> anyhow::Result<()> {
         rule_table.clone(),
         gossip_client.clone(),
         counts.clone(),
-        config.cardinality_limits(),
+        config.storage.cardinality,
     );
 
-    let peer_events = discovery_stream(config.discovery.clone());
+    let peer_events = discovery::peer_events(config.settings.discovery());
 
     let gossip_task = tokio::task::spawn_local(async move { gossip_rt.run(peer_events).await });
 
@@ -146,7 +145,7 @@ async fn run() -> anyhow::Result<()> {
         )
         .await;
 
-    let envoy_task = config.envoy_bind.map(|bind| {
+    let envoy_task = config.settings.envoy_bind.map(|bind| {
         tracing::info!(
             listen_addr = %bind,
             health_service = "grpc.health.v1.Health",
@@ -170,7 +169,7 @@ async fn run() -> anyhow::Result<()> {
         })
     });
 
-    let admin_task = config.admin_bind.map(|bind| {
+    let admin_task = config.settings.admin_bind.map(|bind| {
         tracing::info!(
             listen_addr = %bind,
             "Admin HTTP endpoint is up. Hit /snapshot for a live view of \
@@ -310,29 +309,6 @@ fn register_rules(
         }
     }
     Ok(())
-}
-
-fn discovery_stream(
-    cfg: gabion::discovery::DiscoveryConfig,
-) -> impl futures::Stream<Item = PeerEvent> {
-    discovery::from_config(cfg)
-        .peer_events()
-        .filter_map(|res| async move {
-            match res {
-                Ok(event) => Some(event),
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Peer discovery hit an error and skipped an update; \
-                         gabion will keep retrying. If this keeps happening, \
-                         check API access (e.g. Kubernetes RBAC for Services \
-                         and EndpointSlices) and the values under `discovery` \
-                         in your gabion config.",
-                    );
-                    None
-                }
-            }
-        })
 }
 
 fn load_config() -> anyhow::Result<AppConfig> {

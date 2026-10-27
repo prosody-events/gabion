@@ -6,9 +6,7 @@
 
 use std::net::SocketAddr;
 
-use bon::Builder;
 use futures::Stream;
-use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "discovery-kubernetes")]
 pub mod kubernetes;
@@ -36,26 +34,47 @@ pub enum PeerEvent {
     Removed(Peer),
 }
 
-/// Peer discovery settings used by gossip.
-#[derive(Clone, Debug, Default, Builder, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+/// Peer discovery settings used by gossip, filled from the settings table
+/// ([`crate::settings::Settings::discovery`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveryConfig {
     /// Local gossip address to exclude from emitted peer events.
     pub self_addr: Option<SocketAddr>,
     /// Kubernetes namespaces allowed for Service discovery; empty allows all
     /// namespaces.
-    pub namespace_allow: Vec<String>,
+    pub namespace_allow: Box<[Box<str>]>,
     /// Kubernetes Service names allowed for discovery; empty allows all
     /// Services.
-    pub service_allow: Vec<String>,
+    pub service_allow: Box<[Box<str>]>,
 }
 
-/// Build the configured peer discovery.
+/// The configured discovery's peer events, as both adapters consume them: a
+/// failed update is skipped and logged as `discovery_error` at powers of two.
 #[cfg(feature = "discovery-kubernetes")]
-pub fn from_config(config: DiscoveryConfig) -> impl PeerDiscovery {
-    kubernetes::EndpointSliceDiscovery::new(
-        config.self_addr,
-        config.namespace_allow,
-        config.service_allow,
-    )
+pub fn peer_events(config: DiscoveryConfig) -> impl Stream<Item = PeerEvent> {
+    use futures::StreamExt;
+
+    let mut errors_total = 0_u64;
+    kubernetes::EndpointSliceDiscovery::new(config)
+        .peer_events()
+        .filter_map(move |result| {
+            let event = match result {
+                Ok(event) => Some(event),
+                Err(error) => {
+                    if let Some(errors_total) = crate::throttle::bump(&mut errors_total) {
+                        tracing::warn!(
+                            code = "discovery_error",
+                            error = %error,
+                            errors_total,
+                            "Peer discovery hit an error and skipped an update; gabion will keep \
+                             retrying. If this keeps happening, check API access (Kubernetes RBAC \
+                             for Services and EndpointSlices) and the discovery settings \
+                             (`discovery.*` in gabiond, `gabion_discovery_*` in NGINX).",
+                        );
+                    }
+                    None
+                }
+            };
+            std::future::ready(event)
+        })
 }

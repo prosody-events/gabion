@@ -20,31 +20,28 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor};
-use gabion::defaults;
+use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor, ValidStorageConfig};
 use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::sim::{LinkPolicy, SimRouter};
 use gabion::gossip::{
-    AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipConfig, GossipError,
-    GossipRuntime,
+    AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipError, GossipRuntime,
+    ValidGossipConfig,
 };
-use gabion::wire::FrameLimits;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
 use crate::clock::{ManualClock, SharedNow};
-use crate::config::{ConfigError, SimConfig};
+use crate::config::SimConfig;
 use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView};
 use crate::shims::{AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport};
 
 /// First UDP port the engine assigns; node `i` binds `BASE_PORT + i`.
 const BASE_PORT: u16 = 40_000;
 /// Cluster id mixed into every packet header (matches the bench).
-const CLUSTER_ID_HASH: u128 = 0xC1;
+pub(crate) const CLUSTER_ID_HASH: u128 = 0xC1;
 /// Local rule id for the single watched rule. Any value other than
 /// `u32::MAX` marks the rule as locally applicable so its cells count toward
 /// the aggregate (see `RuleDescriptor::applies_locally`).
@@ -96,8 +93,8 @@ const LOCAL_RULE_ID: u32 = 0;
 /// a large cluster's burst simply flushes over a few ticks instead of one (the
 /// dirty rings are persistent, so the residual rides the next tick rather than
 /// dropping). Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
-const VIZ_MAX_CELLS_PER_TICK: usize = 160;
-const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
+pub(crate) const VIZ_MAX_CELLS_PER_TICK: usize = 160;
+pub(crate) const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
 
 /// The count width every node uses. `u32` matches the bench and is plenty for
 /// the visualizer's hit volumes.
@@ -128,8 +125,6 @@ impl From<LinkPolicyKind> for LinkPolicy {
 /// Things the engine cannot do, surfaced back to the caller.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    #[error(transparent)]
-    Config(#[from] ConfigError),
     #[error(
         "node {id} is not a member of this cluster — it never joined, or it has already left. \
          Node ids are stable and are never reused, so a removed node's id stays gone. Pick an id \
@@ -199,22 +194,23 @@ pub enum Command {
 }
 
 /// Spawn the engine and process commands until the channel closes or a
-/// `Shutdown` arrives. Validates the config up front so a bad config fails
-/// before any runtime is built.
+/// `Shutdown` arrives. `valid` is `config`'s [`SimConfig::validate`], which
+/// the caller ran once, so a bad config fails before any runtime is built.
 pub async fn run_engine(
     config: SimConfig,
+    valid: (ValidGossipConfig, ValidStorageConfig),
     cmd_rx: mpsc::Receiver<Command>,
 ) -> Result<(), EngineError> {
-    config.validate()?;
     let local = LocalSet::new();
-    local.run_until(engine_loop(config, cmd_rx)).await
+    local.run_until(engine_loop(config, valid, cmd_rx)).await
 }
 
 async fn engine_loop(
     config: SimConfig,
+    valid: (ValidGossipConfig, ValidStorageConfig),
     mut cmd_rx: mpsc::Receiver<Command>,
 ) -> Result<(), EngineError> {
-    let mut state = EngineState::build(config);
+    let mut state = EngineState::build(config, valid);
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Command::SubmitRequest {
@@ -290,6 +286,10 @@ struct NodeHandle {
 /// wrapper — the task owns it outright).
 struct EngineState {
     config: SimConfig,
+    /// Every node's gossip config, before its bootstrap peers and seed.
+    gossip: ValidGossipConfig,
+    /// Every node's storage, sized by [`SimConfig::settings`].
+    storage: ValidStorageConfig,
     router: SimRouter,
     nodes: Vec<NodeHandle>,
     addresses: AddressBook,
@@ -311,7 +311,10 @@ struct EngineState {
 }
 
 impl EngineState {
-    fn build(config: SimConfig) -> Self {
+    fn build(
+        config: SimConfig,
+        (gossip, storage): (ValidGossipConfig, ValidStorageConfig),
+    ) -> Self {
         let log: EventLog = Rc::new(RefCell::new(Vec::new()));
         let addresses: AddressBook = Rc::new(RefCell::new(HashMap::new()));
         // One shared time base for the whole cluster; each node gets its own
@@ -321,6 +324,8 @@ impl EngineState {
         let initial_nodes = config.nodes;
         let mut state = Self {
             config,
+            gossip,
+            storage,
             // The inbound channel is kept in lockstep with the send pool: if a
             // receiver's queue fills, `try_send_to` returns `WouldBlock`, the
             // sender re-queues the packet, and the slot never frees between
@@ -385,7 +390,7 @@ impl EngineState {
     /// [`EngineState::add_node`] route through here, so the rule-intern footgun
     /// guard below is honored identically on every path.
     ///
-    /// Per-node storage is sized by [`SimConfig::cell_store_config`] from the
+    /// Per-node storage is sized by [`SimConfig::settings`] from the
     /// cluster size and the watched rule's live buckets — the one sizing site,
     /// with no production floors (the browser working set is a few hundred
     /// cells, not the hundreds of thousands a deployment sizes for). The caps
@@ -396,20 +401,7 @@ impl EngineState {
         let addr = addr_of_id(id);
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
 
-        let store_config = self
-            .config
-            .cell_store_config(self.rule_descriptor().live_buckets());
-        // The per-tick frame is capped (see `VIZ_MAX_CELLS_PER_TICK`) so one
-        // tick's packet output stays inside the send pool. A small cluster's
-        // working set is below the cap, so it still flushes in a single round;
-        // a large cluster's burst flushes over a few ticks (the dirty rings are
-        // persistent, so the residual rides the next tick rather than
-        // dropping).
-        let max_cells_per_tick = VIZ_MAX_CELLS_PER_TICK.min(store_config.cell_capacity as usize);
-        let max_cells_per_frame = store_config.cell_capacity;
-        let tick_interval = Duration::from_millis(self.config.tick_interval_ms);
-
-        let mut store = CellStore::<Count>::new(store_config, identity);
+        let mut store = CellStore::<Count>::new(self.storage, identity);
         // Footgun guard: intern the watched rule with the configured
         // window/bucket *before* any request. Unknown rules otherwise intern
         // with `RuleDescriptor::default()` (60 s / 1 s), making bucket and
@@ -427,24 +419,9 @@ impl EngineState {
             self.log.clone(),
         );
 
-        let gossip_cfg = GossipConfig {
-            local_identity: identity,
-            cluster_id_hash: CLUSTER_ID_HASH,
-            bootstrap_peers,
-            fanout: self.config.fanout,
-            max_cells_per_tick,
-            wire_limits: FrameLimits {
-                max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
-                max_cells: max_cells_per_frame,
-            },
-            send_queue_capacity: VIZ_SEND_QUEUE_CAPACITY,
-            limit_queue_capacity: defaults::GOSSIP_LIMIT_QUEUE_CAPACITY,
-            tick_interval,
-            auth_key: None,
-            rng_seed: self.config.rng_seed.wrapping_add(id as u64),
-            target_err_bps: self.config.target_err_bps,
-            min_emit_interval: Duration::from_millis(self.config.min_emit_interval_ms),
-        };
+        let mut gossip_cfg = self.gossip.clone();
+        gossip_cfg.bootstrap_peers = bootstrap_peers;
+        gossip_cfg.rng_seed = self.config.rng_seed.wrapping_add(id as u64);
 
         let aggregate = Rc::new(EventEmittingAggregateStore::<Count>::new(
             id,
@@ -483,7 +460,7 @@ impl EngineState {
     }
 
     fn current_tick(&self) -> u64 {
-        self.virtual_ms / self.config.tick_interval_ms.max(1)
+        self.virtual_ms / self.config.tick_interval_ms
     }
 
     /// Position in the `nodes` `Vec` of the live node with stable id `id`,
@@ -639,7 +616,7 @@ impl EngineState {
     }
 
     async fn step(&mut self, delta_ms: u64) -> EventBatch {
-        let tick_ms = self.config.tick_interval_ms.max(1);
+        let tick_ms = self.config.tick_interval_ms;
         let target = self.virtual_ms.saturating_add(delta_ms);
         let mut events = Vec::new();
         let mut prev = self.admin_counters().await;

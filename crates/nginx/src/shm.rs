@@ -35,15 +35,14 @@ pub fn align_up(value: usize, align: usize) -> usize {
     (value + mask) & !mask
 }
 
-/// Depth of the queue workers push hits onto for the leader to drain.
-const QUEUE_CAPACITY: usize = 2048;
-
 /// The fewest aggregate slots a zone may hold.
 pub const MIN_AGGREGATE_CAPACITY: usize = 1024;
 
 /// Lays out the SHM zone given capacity targets. Computed once per config
-/// load, from the zone's size; nginx reuses a zone across reload only when
-/// its size is unchanged, so a reused region keeps a matching layout.
+/// load, from the zone's size and `gabion_gossip_limit_queue_capacity`.
+/// nginx reuses a zone across reload when its name and size are unchanged,
+/// and a reused region keeps its layout, so `init_zone` refuses a reload
+/// that would change it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Layout {
     pub queue_capacity: usize,
@@ -95,24 +94,41 @@ impl Layout {
         })
     }
 
-    /// Lay out a zone of `zone_bytes` on `page_bytes` pages: the fixed
-    /// queue plus the largest power-of-two aggregate table that fits, or
-    /// `None` below `MIN_AGGREGATE_CAPACITY` slots. nginx's slab pool keeps
-    /// a 24-byte descriptor per page (under 1/128 of the zone for pages of
-    /// 4 KiB or more) and loses up to a page each to its header, to
-    /// aligning its first page, and to rounding its page count down; our
-    /// block is rounded up to whole pages, which can cost one more.
-    pub fn for_zone(zone_bytes: usize, page_bytes: usize) -> Option<Self> {
-        let usable = zone_bytes.checked_sub(zone_bytes / 128 + 4 * page_bytes)?;
-        let mut capacity = 1 << (usable / size_of::<AggregateSlot>()).checked_ilog2()?;
-        while capacity >= MIN_AGGREGATE_CAPACITY {
-            let layout = Self::new(QUEUE_CAPACITY, capacity)?;
-            if layout.total_bytes <= usable {
-                return Some(layout);
+    /// Lay out a zone of `zone_bytes` on `page_bytes` pages: a queue of
+    /// `queue_capacity` rounded up to a power of two, plus the largest
+    /// power-of-two aggregate table that fits. A zone too small for the
+    /// queue and `MIN_AGGREGATE_CAPACITY` slots returns the smallest zone
+    /// that fits them. nginx's slab pool keeps a 24-byte descriptor per page
+    /// (under 1/128 of the zone for pages of 4 KiB or more) and loses up to
+    /// a page each to its header, to aligning its first page, and to
+    /// rounding its page count down; our block is rounded up to whole pages,
+    /// which can cost one more.
+    pub fn for_zone(
+        zone_bytes: usize,
+        page_bytes: usize,
+        queue_capacity: usize,
+    ) -> Result<Self, usize> {
+        let queue = queue_capacity.next_power_of_two();
+        let fit = || {
+            let usable = zone_bytes.checked_sub(zone_bytes / 128 + 4 * page_bytes)?;
+            let mut capacity = 1 << (usable / size_of::<AggregateSlot>()).checked_ilog2()?;
+            while capacity >= MIN_AGGREGATE_CAPACITY {
+                let layout = Self::new(queue, capacity)?;
+                if layout.total_bytes <= usable {
+                    return Some(layout);
+                }
+                capacity /= 2;
             }
-            capacity /= 2;
-        }
-        None
+            None
+        };
+        fit().ok_or_else(|| {
+            let smallest = Self::new(queue, MIN_AGGREGATE_CAPACITY)
+                .map_or(usize::MAX, |layout| layout.total_bytes);
+            smallest
+                .saturating_add(4 * page_bytes)
+                .saturating_mul(128)
+                .div_ceil(127)
+        })
     }
 }
 

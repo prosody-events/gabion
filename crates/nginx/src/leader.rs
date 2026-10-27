@@ -11,6 +11,7 @@
 //! in one `select!`, sharing plain `Rc<...>` handles.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,11 +21,9 @@ use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::task::LocalSet;
 
-use gabion::crdt::{CellStore, CellStoreConfig, KeyHash, NodeIdentity, RuleDescriptor};
-use gabion::defaults;
-use gabion::discovery::{self, DiscoveryConfig, PeerDiscovery, PeerEvent};
-use gabion::gossip::{GossipClient, GossipConfig, GossipRuntime, TokioClock, UdpTransport};
-use gabion::wire::FrameLimits;
+use gabion::crdt::{CellStore, KeyHash, NodeIdentity, RuleDescriptor, ValidStorageConfig};
+use gabion::discovery::{self, DiscoveryConfig};
+use gabion::gossip::{GossipClient, GossipRuntime, TokioClock, UdpTransport, ValidGossipConfig};
 
 use crate::identity::fresh_incarnation;
 use crate::rules::CompiledRules;
@@ -36,7 +35,7 @@ use crate::shm::lease::now_millis;
 /// request queue. The drain waits for the runtime to take one batch before
 /// popping the next, so a backlog waits in SHM, and a queue this shallow
 /// recycles tokio's storage instead of allocating.
-const DRAIN_BATCH: usize = 32;
+const DRAIN_BATCH: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
 /// How often the drain polls an empty SHM queue.
 const DRAIN_TICK: Duration = Duration::from_millis(5);
@@ -64,101 +63,14 @@ pub struct LeaderConfig {
     /// `None` runs this node alone: the leader still folds its hits into
     /// the shared counts, but nothing can reach it to gossip.
     pub gossip_bind: Option<SocketAddr>,
-    pub gossip: GossipSettings,
+    pub gossip: ValidGossipConfig,
     pub discovery: DiscoveryConfig,
-    pub cell_store: CellStoreConfig,
-    pub rng_seed: u64,
+    pub cell_store: ValidStorageConfig,
     pub lease_tick: Duration,
-}
-
-impl Default for LeaderConfig {
-    fn default() -> Self {
-        Self {
-            worker_id: 0,
-            gossip_bind: None,
-            gossip: GossipSettings::default(),
-            discovery: DiscoveryConfig::default(),
-            cell_store: production_cell_store_config(),
-            rng_seed: defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
-            lease_tick: DEFAULT_LEASE_TICK,
-        }
-    }
-}
-
-/// Gossip tuning knobs. Mirrors `gabion_server::config::GossipSettings`.
-#[derive(Clone, Debug)]
-pub struct GossipSettings {
-    pub tick_interval: Duration,
-    pub fanout: usize,
-    pub max_payload_bytes: usize,
-    pub max_cells_per_frame: u32,
-    pub max_cells_per_tick: usize,
-    pub send_queue_capacity: usize,
-    pub cluster_id_hash: u128,
-    /// Per-rule error budget for threshold-triggered anti-entropy, in
-    /// basis points of the rule's own limit. See
-    /// [`gabion::defaults::GOSSIP_TARGET_ERR_BPS`] for the derivation.
-    pub target_err_bps: u32,
-    /// Floor between two threshold-fire emissions. See
-    /// [`gabion::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
-    pub min_emit_interval: Duration,
-}
-
-impl Default for GossipSettings {
-    /// Matches `gabion_server::config::GossipSettings::default()` so an
-    /// out-of-the-box nginx + gabiond cluster gossips with identical
-    /// frame/queue tuning.
-    fn default() -> Self {
-        Self {
-            tick_interval: Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS),
-            fanout: defaults::GOSSIP_FANOUT,
-            max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
-            max_cells_per_frame: defaults::GOSSIP_MAX_CELLS_PER_FRAME,
-            max_cells_per_tick: defaults::GOSSIP_MAX_CELLS_PER_TICK,
-            send_queue_capacity: defaults::GOSSIP_SEND_QUEUE_CAPACITY,
-            cluster_id_hash: defaults::GOSSIP_CLUSTER_ID_HASH,
-            target_err_bps: defaults::GOSSIP_TARGET_ERR_BPS,
-            min_emit_interval: Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
-        }
-    }
-}
-
-pub fn production_cell_store_config() -> CellStoreConfig {
-    CellStoreConfig {
-        cell_capacity: defaults::STORAGE_MAX_CELLS as u32,
-        rule_dictionary_capacity: defaults::STORAGE_RULE_DICTIONARY_CAPACITY,
-        node_dictionary_capacity: defaults::STORAGE_NODE_DICTIONARY_CAPACITY,
-        local_dirty_capacity: defaults::STORAGE_LOCAL_DIRTY_CAPACITY,
-        forwarded_dirty_capacity: defaults::STORAGE_FORWARDED_DIRTY_CAPACITY,
-        peer_capacity: defaults::STORAGE_PEER_CAPACITY,
-    }
 }
 
 #[cfg(test)]
 mod tests;
-
-impl GossipSettings {
-    pub fn into_runtime_config(self, identity: NodeIdentity, rng_seed: u64) -> GossipConfig {
-        GossipConfig {
-            local_identity: identity,
-            cluster_id_hash: self.cluster_id_hash,
-            bootstrap_peers: Vec::new(),
-            fanout: self.fanout,
-            max_cells_per_tick: self.max_cells_per_tick,
-            wire_limits: FrameLimits {
-                max_payload_bytes: self.max_payload_bytes,
-                max_cells: self.max_cells_per_frame,
-            },
-            send_queue_capacity: self.send_queue_capacity,
-            limit_queue_capacity: DRAIN_BATCH,
-            tick_interval: self.tick_interval,
-            auth_key: None,
-            rng_seed,
-            target_err_bps: self.target_err_bps,
-            min_emit_interval: self.min_emit_interval,
-        }
-    }
-}
 
 /// A worker's leader thread, and the means to stop it.
 pub struct LeaderHandle {
@@ -326,16 +238,16 @@ async fn leader_main(
 
     let mut cell_store = CellStore::<u32>::new(config.cell_store, identity);
     register_rules(&mut cell_store, &rules);
-    let gossip_cfg = config
-        .gossip
-        .clone()
-        .into_runtime_config(identity, config.rng_seed);
+    // The setting sizes the SHM queue; the runtime's own queue only needs
+    // room for one drain batch.
+    let mut gossip_cfg = config.gossip.clone();
+    gossip_cfg.limit_queue_capacity = DRAIN_BATCH;
 
     // A lone node still needs a socket for the runtime; an ephemeral
     // loopback port can't collide with another nginx on the same host, and
     // there is no one to discover.
     let (bind, peers) = match config.gossip_bind {
-        Some(bind) => (bind, discovery_stream(config.discovery).left_stream()),
+        Some(bind) => (bind, discovery::peer_events(config.discovery).left_stream()),
         None => (LONE_NODE_BIND, futures::stream::empty().right_stream()),
     };
     // Bind before the store empties the count table: a term that cannot
@@ -362,20 +274,6 @@ async fn leader_main(
     }
 }
 
-fn discovery_stream(cfg: DiscoveryConfig) -> impl futures::Stream<Item = PeerEvent> {
-    discovery::from_config(cfg)
-        .peer_events()
-        .filter_map(|res| async move {
-            match res {
-                Ok(event) => Some(event),
-                Err(error) => {
-                    tracing::warn!(error = %error, "peer discovery error");
-                    None
-                }
-            }
-        })
-}
-
 fn register_rules(cell_store: &mut CellStore<u32>, rules: &CompiledRules) {
     for compiled in rules.rules() {
         let spec = compiled.rule.spec();
@@ -400,7 +298,7 @@ async fn drain_loop(client: GossipClient<u32>, shm: ShmRegion, worker_id: u32) -
         if !lease.try_acquire(worker_id, now_millis(), LEASE_TTL_MILLIS) {
             return anyhow::anyhow!("worker {worker_id} lost the leader lease to another worker");
         }
-        let Ok(permits) = client.reserve(DRAIN_BATCH).await else {
+        let Ok(permits) = client.reserve(DRAIN_BATCH.get()).await else {
             return anyhow::anyhow!("gossip runtime shut down");
         };
         // `zip` takes a permit before each pop, so no event leaves SHM

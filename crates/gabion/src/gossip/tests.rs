@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::num::NonZeroU128;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,14 +18,16 @@ use tokio::sync::Notify;
 use tokio::task::LocalSet;
 
 use crate::crdt::{
-    BucketEpoch, CellStore, CellStoreConfig, Count, DeltaSink, ExpirationSink, KeyHash, NodeId,
-    NodeIdentity, RuleDescriptor,
+    BucketEpoch, CellStore, Count, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
+    RuleDescriptor,
 };
 use crate::discovery::{Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
-use crate::gossip::{AggregateStore, GossipConfig, GossipRuntime, TokioClock, parse_cluster_id};
+use crate::gossip::{AggregateStore, GossipRuntime, TokioClock, ValidGossipConfig};
+use crate::settings::mock::storage;
+use crate::settings::{Millis, Settings};
 use crate::wire::HmacKey;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
@@ -98,23 +100,43 @@ impl<C: Count> AggregateStore<C> for InMemoryAggregateStore<C> {
 // -- helpers ----------------------------------------------------------------
 
 fn store_for(identity: NodeIdentity) -> CellStore<u32> {
-    CellStore::<u32>::new(CellStoreConfig::default(), identity)
+    CellStore::<u32>::new(storage(256, 32, 32, 64, 64, 16), identity)
 }
 
 fn sock(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-fn sim_config(identity: NodeIdentity, peers: Vec<SocketAddr>, seed: u64) -> GossipConfig {
-    GossipConfig {
-        local_identity: identity,
-        cluster_id_hash: 0xC1,
-        bootstrap_peers: peers,
-        fanout: 1,
-        tick_interval: Duration::from_millis(100),
-        rng_seed: seed,
-        ..GossipConfig::default()
-    }
+fn sim_config(peers: Vec<SocketAddr>, seed: u64) -> ValidGossipConfig {
+    tuned_config(peers, seed, |_| {})
+}
+
+/// The tests' gossip settings, then `tune`, built through
+/// `Settings::validate` as production builds them.
+fn tuned_config(
+    peers: Vec<SocketAddr>,
+    seed: u64,
+    tune: impl FnOnce(&mut Settings),
+) -> ValidGossipConfig {
+    let mut settings = Settings {
+        cluster_id_hash: 0xC1.try_into().unwrap(),
+        fanout: NonZeroUsize::MIN,
+        tick_interval: ms(100),
+        max_cells_per_tick: 1024.try_into().unwrap(),
+        max_payload_bytes: 65_507,
+        send_queue_capacity: 32.try_into().unwrap(),
+        limit_queue_capacity: 1024.try_into().unwrap(),
+        ..Settings::default()
+    };
+    tune(&mut settings);
+    let (mut config, _) = settings.validate().expect("test gossip settings validate");
+    config.bootstrap_peers = peers;
+    config.rng_seed = seed;
+    config
+}
+
+fn ms(millis: u64) -> Millis {
+    Millis(millis.try_into().unwrap())
 }
 
 fn quickcheck_max_nodes() -> u16 {
@@ -289,14 +311,7 @@ fn store_for_expiring_rule(identity: NodeIdentity) -> CellStore<u32> {
 
 fn store_for_property_rules(identity: NodeIdentity, node_capacity: u16) -> CellStore<u32> {
     let mut store = CellStore::<u32>::new(
-        CellStoreConfig {
-            cell_capacity: 512,
-            rule_dictionary_capacity: 8,
-            node_dictionary_capacity: node_capacity.max(8),
-            local_dirty_capacity: 512,
-            forwarded_dirty_capacity: 512,
-            peer_capacity: 32,
-        },
+        storage(512, 8, node_capacity.max(8), 512, 512, 32),
         identity,
     );
     for rule in 0..3 {
@@ -365,10 +380,15 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
     for i in 0..nodes {
         let identity = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
         let peers = overlay_peers(&addrs, i, peer_degree);
-        let mut cfg = sim_config(identity, peers, 0xBAD5_EED0 + i as u64);
-        cfg.fanout = (case.fanout as usize).min(nodes.saturating_sub(1));
-        cfg.max_cells_per_tick = 128;
-        cfg.send_queue_capacity = 128;
+        let cfg = tuned_config(peers, 0xBAD5_EED0 + i as u64, |s| {
+            s.fanout = (case.fanout as usize)
+                .min(nodes.saturating_sub(1))
+                .max(1)
+                .try_into()
+                .unwrap();
+            s.max_cells_per_tick = 128.try_into().unwrap();
+            s.send_queue_capacity = 128.try_into().unwrap();
+        });
         let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
         let (rt, client) = GossipRuntime::from_parts(
             router.bind(addrs[i]),
@@ -486,9 +506,10 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
             .copied()
             .filter(|addr| *addr != addrs[i])
             .collect();
-        let mut cfg = sim_config(identity, peers, 0xC0FF_EE00 + i as u64);
-        cfg.fanout = 4;
-        cfg.max_cells_per_tick = 32;
+        let cfg = tuned_config(peers, 0xC0FF_EE00 + i as u64, |s| {
+            s.fanout = 4.try_into().unwrap();
+            s.max_cells_per_tick = 32.try_into().unwrap();
+        });
         let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
         let (rt, client) = GossipRuntime::from_parts(
             router.bind(addrs[i]),
@@ -627,9 +648,9 @@ fn quickcheck_sim_authentication_admits_only_matching_keys(case: AuthCase) -> Te
             HmacKey([8; 32])
         };
 
-        let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+        let mut cfg_a = sim_config(vec![addr_b], 1);
         cfg_a.auth_key = Some(key_a);
-        let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+        let mut cfg_b = sim_config(vec![addr_a], 2);
         cfg_b.auth_key = Some(key_b);
         let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
         let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
@@ -697,9 +718,10 @@ fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) 
                 .copied()
                 .filter(|addr| *addr != addrs[i])
                 .collect();
-            let mut cfg = sim_config(identity, peers, 0xEED0 + i as u64);
-            cfg.fanout = nodes.saturating_sub(1).clamp(1, 8);
-            cfg.max_cells_per_tick = 32;
+            let cfg = tuned_config(peers, 0xEED0 + i as u64, |s| {
+                s.fanout = nodes.saturating_sub(1).clamp(1, 8).try_into().unwrap();
+                s.max_cells_per_tick = 32.try_into().unwrap();
+            });
             let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
             let (rt, client) = GossipRuntime::from_parts(
                 router.bind(addrs[i]),
@@ -764,14 +786,14 @@ fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> Tes
         let (rt_a, client_a) = GossipRuntime::from_parts(
             router.bind(addr_a),
             TokioClock::from_millis(0),
-            sim_config(id_a, Vec::new(), 1),
+            sim_config(Vec::new(), 1),
             store_for(id_a),
             agg_a.clone(),
         );
         let (rt_b, client_b) = GossipRuntime::from_parts(
             router.bind(addr_b),
             TokioClock::from_millis(0),
-            sim_config(id_b, Vec::new(), 2),
+            sim_config(Vec::new(), 2),
             store_for(id_b),
             agg_b.clone(),
         );
@@ -819,7 +841,7 @@ async fn record_acks_after_apply() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 clock,
-                sim_config(identity, Vec::new(), 1),
+                sim_config(Vec::new(), 1),
                 store,
                 agg.clone(),
             );
@@ -867,14 +889,14 @@ async fn two_runtimes_converge_on_cluster_aggregate() {
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 t_a,
                 TokioClock::from_millis(0),
-                sim_config(id_a, vec![addr_b], 1),
+                sim_config(vec![addr_b], 1),
                 store_for(id_a),
                 agg_a.clone(),
             );
             let (rt_b, client_b) = GossipRuntime::from_parts(
                 t_b,
                 TokioClock::from_millis(0),
-                sim_config(id_b, vec![addr_a], 2),
+                sim_config(vec![addr_a], 2),
                 store_for(id_b),
                 agg_b.clone(),
             );
@@ -922,7 +944,7 @@ async fn apply_called_once_per_crdt_iteration() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(identity, Vec::new(), 1),
+                sim_config(Vec::new(), 1),
                 store,
                 agg.clone(),
             );
@@ -971,7 +993,7 @@ async fn gossip_tick_drives_expiration() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(identity, Vec::new(), 1),
+                sim_config(Vec::new(), 1),
                 store,
                 agg.clone(),
             );
@@ -1030,7 +1052,7 @@ async fn configured_rule_reexpires_after_idle_window() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(identity, Vec::new(), 1),
+                sim_config(Vec::new(), 1),
                 store,
                 agg.clone(),
             );
@@ -1120,7 +1142,7 @@ async fn record_returns_after_apply_completes() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(identity, Vec::new(), 1),
+                sim_config(Vec::new(), 1),
                 store,
                 agg.clone(),
             );
@@ -1159,14 +1181,14 @@ async fn per_peer_frame_prunes_acked_cells() {
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 t_a,
                 TokioClock::from_millis(0),
-                sim_config(id_a, vec![addr_b], 1),
+                sim_config(vec![addr_b], 1),
                 store_for(id_a),
                 agg_a.clone(),
             );
             let (rt_b, _client_b) = GossipRuntime::from_parts(
                 t_b,
                 TokioClock::from_millis(0),
-                sim_config(id_b, vec![addr_a], 2),
+                sim_config(vec![addr_a], 2),
                 store_for(id_b),
                 agg_b.clone(),
             );
@@ -1218,14 +1240,14 @@ async fn dropped_packet_is_repaired() {
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 t_a,
                 TokioClock::from_millis(0),
-                sim_config(id_a, vec![addr_b], 1),
+                sim_config(vec![addr_b], 1),
                 store_for(id_a),
                 agg_a.clone(),
             );
             let (rt_b, _client_b) = GossipRuntime::from_parts(
                 t_b,
                 TokioClock::from_millis(0),
-                sim_config(id_b, vec![addr_a], 2),
+                sim_config(vec![addr_a], 2),
                 store_for(id_b),
                 agg_b.clone(),
             );
@@ -1281,21 +1303,21 @@ async fn partition_then_heal() {
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 t_a,
                 TokioClock::from_millis(0),
-                sim_config(id_a, vec![addr_b, addr_c], 1),
+                sim_config(vec![addr_b, addr_c], 1),
                 store_for(id_a),
                 agg_a.clone(),
             );
             let (rt_b, client_b) = GossipRuntime::from_parts(
                 t_b,
                 TokioClock::from_millis(0),
-                sim_config(id_b, vec![addr_a, addr_c], 2),
+                sim_config(vec![addr_a, addr_c], 2),
                 store_for(id_b),
                 agg_b.clone(),
             );
             let (rt_c, client_c) = GossipRuntime::from_parts(
                 t_c,
                 TokioClock::from_millis(0),
-                sim_config(id_c, vec![addr_a, addr_b], 3),
+                sim_config(vec![addr_a, addr_b], 3),
                 store_for(id_c),
                 agg_c.clone(),
             );
@@ -1375,8 +1397,9 @@ async fn gossip_tick_picks_peers_without_replacement() {
             let agg_d = Rc::new(InMemoryAggregateStore::<u32>::new());
 
             // A talks to B, C, D with fanout=3 — every tick must hit each.
-            let mut cfg_a = sim_config(id_a, vec![addr_b, addr_c, addr_d], 0xBAD_5EED);
-            cfg_a.fanout = 3;
+            let cfg_a = tuned_config(vec![addr_b, addr_c, addr_d], 0xBAD_5EED, |s| {
+                s.fanout = 3.try_into().unwrap();
+            });
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 t_a,
                 TokioClock::from_millis(0),
@@ -1387,9 +1410,9 @@ async fn gossip_tick_picks_peers_without_replacement() {
             // B/C/D are silent — they only receive. We hang on to their
             // clients so the mpsc senders stay alive; dropping the client
             // closes the channel which would cause the runtime to exit.
-            let cfg_b = sim_config(id_b, Vec::new(), 2);
-            let cfg_c = sim_config(id_c, Vec::new(), 3);
-            let cfg_d = sim_config(id_d, Vec::new(), 4);
+            let cfg_b = sim_config(Vec::new(), 2);
+            let cfg_c = sim_config(Vec::new(), 3);
+            let cfg_d = sim_config(Vec::new(), 4);
             let (rt_b, _client_b) = GossipRuntime::from_parts(
                 t_b,
                 TokioClock::from_millis(0),
@@ -1491,8 +1514,7 @@ async fn observe_coverage_fanout(peers: usize, base: usize) -> usize {
 
     let bootstrap: Vec<SocketAddr> = (0..peers).map(|i| sock(41_001 + i as u16)).collect();
     let identity = NodeIdentity::new(NodeId(0x5EED), 1);
-    let mut cfg = sim_config(identity, bootstrap, 1);
-    cfg.fanout = base;
+    let cfg = tuned_config(bootstrap, 1, |s| s.fanout = base.try_into().unwrap());
 
     let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(4);
     let (rt, client) = GossipRuntime::from_parts_with_admin(
@@ -1542,24 +1564,8 @@ async fn udp_round_trip_smoke() {
             let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
             let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
 
-            let config_a = GossipConfig {
-                local_identity: id_a,
-                cluster_id_hash: 0xC1,
-                bootstrap_peers: vec![addr_b],
-                fanout: 1,
-                tick_interval: Duration::from_millis(20),
-                rng_seed: 1,
-                ..GossipConfig::default()
-            };
-            let config_b = GossipConfig {
-                local_identity: id_b,
-                cluster_id_hash: 0xC1,
-                bootstrap_peers: vec![addr_a],
-                fanout: 1,
-                tick_interval: Duration::from_millis(20),
-                rng_seed: 2,
-                ..GossipConfig::default()
-            };
+            let config_a = tuned_config(vec![addr_b], 1, |s| s.tick_interval = ms(20));
+            let config_b = tuned_config(vec![addr_a], 2, |s| s.tick_interval = ms(20));
 
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 UdpTransport(sock_a),
@@ -1641,7 +1647,7 @@ async fn admin_snapshot_reflects_runtime_state() {
             let (rt, client) = GossipRuntime::from_parts_with_admin(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(identity, vec![sock(40_301)], 1),
+                sim_config(vec![sock(40_301)], 1),
                 store,
                 agg.clone(),
                 Some(admin_rx),
@@ -1742,8 +1748,9 @@ fn quickcheck_peer_slot_pairing_holds_across_lifecycle(case: PairingCase) -> Tes
         let addrs: Vec<SocketAddr> = (0..NODE_COUNT).map(|i| sock(48_000 + i as u16)).collect();
 
         let id_local = NodeIdentity::new(NodeId(0xA0A0), 1);
-        let mut cfg = sim_config(id_local, Vec::new(), 1);
-        cfg.fanout = NODE_COUNT.saturating_sub(1);
+        let cfg = tuned_config(Vec::new(), 1, |s| {
+            s.fanout = NODE_COUNT.saturating_sub(1).try_into().unwrap();
+        });
 
         let (admin_tx, admin_rx) = mpsc::channel(8);
         let (peer_tx, peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
@@ -1766,8 +1773,7 @@ fn quickcheck_peer_slot_pairing_holds_across_lifecycle(case: PairingCase) -> Tes
         let mut remote_handles = Vec::new();
         for (i, addr) in addrs.iter().enumerate().skip(1) {
             let id = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
-            let mut cfg = sim_config(id, vec![local_addr], 100 + i as u64);
-            cfg.fanout = 1;
+            let cfg = sim_config(vec![local_addr], 100 + i as u64);
             let (rt, client) = GossipRuntime::from_parts(
                 router.bind(*addr),
                 TokioClock::from_millis(0),
@@ -1860,8 +1866,9 @@ fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
         let peer_addrs: Vec<SocketAddr> = (0..PEERS).map(|i| sock(49_001 + i as u16)).collect();
 
         let id_sender = NodeIdentity::new(NodeId(0xB000), 1);
-        let mut cfg_sender = sim_config(id_sender, peer_addrs.clone(), case.seed);
-        cfg_sender.fanout = FANOUT;
+        let cfg_sender = tuned_config(peer_addrs.clone(), case.seed, |s| {
+            s.fanout = FANOUT.try_into().unwrap();
+        });
         let agg_sender = Rc::new(InMemoryAggregateStore::<u32>::new());
         let (rt_sender, client_sender) = GossipRuntime::from_parts(
             router.bind(sender_addr),
@@ -1879,7 +1886,7 @@ fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
         let mut peer_handles = Vec::with_capacity(PEERS);
         for (i, addr) in peer_addrs.iter().enumerate() {
             let id = NodeIdentity::new(NodeId(0xB100 + i as u128), 1);
-            let cfg = sim_config(id, Vec::new(), 1000 + i as u64);
+            let cfg = sim_config(Vec::new(), 1000 + i as u64);
             let (rt, client) = GossipRuntime::from_parts(
                 router.bind(*addr),
                 TokioClock::from_millis(0),
@@ -1956,9 +1963,9 @@ async fn decode_rejects_increment_on_wrong_auth() {
             let id_a = NodeIdentity::new(NodeId(0xDA), 1);
             let id_b = NodeIdentity::new(NodeId(0xDB), 1);
 
-            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
+            let mut cfg_a = sim_config(vec![addr_b], 1);
             cfg_a.auth_key = Some(HmacKey([7; 32]));
-            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
+            let mut cfg_b = sim_config(vec![addr_a], 2);
             cfg_b.auth_key = Some(HmacKey([8; 32]));
 
             let (admin_tx_b, admin_rx_b) = mpsc::channel(4);
@@ -2040,9 +2047,9 @@ async fn send_queue_drains_after_recipient_backpressure() {
             let addr_b = sock(51_001);
             let id_a = NodeIdentity::new(NodeId(0xBA), 1);
 
-            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
-            cfg_a.fanout = 1;
-            cfg_a.send_queue_capacity = 8;
+            let cfg_a = tuned_config(vec![addr_b], 1, |s| {
+                s.send_queue_capacity = 8.try_into().unwrap();
+            });
 
             let (admin_tx, admin_rx) = mpsc::channel(4);
 
@@ -2158,9 +2165,10 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
                 .copied()
                 .filter(|addr| *addr != addrs[i])
                 .collect();
-            let mut cfg = sim_config(identity, peers, 0xD0D0 + i as u64);
-            cfg.fanout = nodes.saturating_sub(1).clamp(1, 4);
-            cfg.max_cells_per_tick = 32;
+            let cfg = tuned_config(peers, 0xD0D0 + i as u64, |s| {
+                s.fanout = nodes.saturating_sub(1).clamp(1, 4).try_into().unwrap();
+                s.max_cells_per_tick = 32.try_into().unwrap();
+            });
             let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
             let (rt, client) = GossipRuntime::from_parts(
                 router.bind(addrs[i]),
@@ -2251,7 +2259,7 @@ async fn peer_event_lifecycle_is_idempotent_and_tolerant() {
             let (rt, client) = GossipRuntime::from_parts_with_admin(
                 router.bind(addr_local),
                 TokioClock::from_millis(0),
-                sim_config(id_local, Vec::new(), 1),
+                sim_config(Vec::new(), 1),
                 store_for(id_local),
                 Rc::new(InMemoryAggregateStore::<u32>::new()),
                 Some(admin_rx),
@@ -2313,12 +2321,8 @@ async fn threshold_trigger_fires_before_heartbeat() {
 
             // Heartbeat is far in the future; only the threshold trigger
             // could possibly deliver in the short window we sample.
-            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
-            cfg_a.tick_interval = Duration::from_secs(1);
-            cfg_a.target_err_bps = 100;
-            cfg_a.min_emit_interval = Duration::from_millis(5);
-            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
-            cfg_b.tick_interval = Duration::from_secs(1);
+            let cfg_a = tuned_config(vec![addr_b], 1, |s| s.tick_interval = ms(1_000));
+            let cfg_b = tuned_config(vec![addr_a], 2, |s| s.tick_interval = ms(1_000));
 
             let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
             let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
@@ -2388,12 +2392,8 @@ async fn min_emit_interval_clamps_adversarial_rate() {
 
             // ε saturates to 1 (limit=1). Heartbeat is far in the future
             // so the only emissions are threshold-triggered.
-            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
-            cfg_a.tick_interval = Duration::from_secs(10);
-            cfg_a.target_err_bps = 100;
-            cfg_a.min_emit_interval = Duration::from_millis(5);
-            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
-            cfg_b.tick_interval = Duration::from_secs(10);
+            let cfg_a = tuned_config(vec![addr_b], 1, |s| s.tick_interval = ms(10_000));
+            let cfg_b = tuned_config(vec![addr_a], 2, |s| s.tick_interval = ms(10_000));
 
             let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
             let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
@@ -2468,11 +2468,8 @@ async fn heartbeat_still_drains_cold_rules() {
             let id_b = NodeIdentity::new(NodeId(0xB3), 1);
 
             // High budget so the single hit cannot cross ε.
-            let mut cfg_a = sim_config(id_a, vec![addr_b], 1);
-            cfg_a.tick_interval = Duration::from_millis(100);
-            cfg_a.target_err_bps = 100;
-            let mut cfg_b = sim_config(id_b, vec![addr_a], 2);
-            cfg_b.tick_interval = Duration::from_millis(100);
+            let cfg_a = sim_config(vec![addr_b], 1);
+            let cfg_b = sim_config(vec![addr_a], 2);
 
             let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
             let agg_b = Rc::new(InMemoryAggregateStore::<u32>::new());
@@ -2539,12 +2536,12 @@ async fn error_bound_holds_under_load() {
             for i in 0..NODES {
                 let identity = NodeIdentity::new(NodeId(0xC000 + i as u128), 1);
                 let peers: Vec<_> = addrs.iter().copied().filter(|a| *a != addrs[i]).collect();
-                let mut cfg = sim_config(identity, peers, 0xBEEF + i as u64);
-                cfg.fanout = NODES - 1;
-                cfg.target_err_bps = TARGET_BPS;
-                cfg.min_emit_interval = Duration::from_millis(1);
-                cfg.tick_interval = Duration::from_millis(100);
-                cfg.max_cells_per_tick = 64;
+                let cfg = tuned_config(peers, 0xBEEF + i as u64, |s| {
+                    s.fanout = (NODES - 1).try_into().unwrap();
+                    s.target_err_bps = TARGET_BPS;
+                    s.min_emit_interval = ms(1);
+                    s.max_cells_per_tick = 64.try_into().unwrap();
+                });
                 let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
                 let (rt, client) = GossipRuntime::from_parts(
                     router.bind(addrs[i]),
@@ -2602,23 +2599,4 @@ async fn error_bound_holds_under_load() {
             }
         })
         .await;
-}
-
-#[test]
-fn parse_cluster_id_accepts_decimal_and_prefixed_hex() {
-    let parse = |value| parse_cluster_id(value).map(NonZeroU128::get);
-    assert_eq!(parse("32201612552594806"), Some(32_201_612_552_594_806));
-    assert_eq!(parse("0xc0ffee"), Some(0x00c0_ffee));
-    assert_eq!(parse("0XC0FFEE"), Some(0x00c0_ffee));
-    assert_eq!(parse(" 1 "), Some(1));
-    assert_eq!(parse("0xffffffffffffffffffffffffffffffff"), Some(u128::MAX));
-}
-
-#[test]
-fn parse_cluster_id_rejects_zero_signs_unprefixed_hex_and_garbage() {
-    for value in [
-        "0", "0x0", "+1", "0x+1", "-1", "c0ffee", "0x", "", "0xg1", "1e3",
-    ] {
-        assert_eq!(parse_cluster_id(value), None, "{value:?} should not parse");
-    }
 }

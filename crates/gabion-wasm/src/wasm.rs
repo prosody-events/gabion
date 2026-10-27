@@ -52,7 +52,7 @@ impl Sim {
     #[wasm_bindgen(constructor)]
     pub fn new(config: JsValue) -> Result<Sim, JsValue> {
         let config: SimConfig = serde_wasm_bindgen::from_value(config)?;
-        config
+        let valid = config
             .validate()
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -62,7 +62,7 @@ impl Sim {
         // test confirms the spawned task runs the full submit → gossip
         // → snapshot loop on the wasm microtask queue.
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = run_engine(config, cmd_rx).await;
+            let _ = run_engine(config, valid, cmd_rx).await;
         });
         Ok(Sim { cmd_tx })
     }

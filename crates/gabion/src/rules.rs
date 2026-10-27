@@ -4,10 +4,12 @@
 //! Both adapters feed the gossip CRDT a `(rule_fingerprint, key_hash, bucket)`
 //! tuple. This module owns the deterministic functions that produce those
 //! identifiers so two nodes with identical rule sets emit identical
-//! identifiers without coordinating. Admission policy (decision codes,
-//! cardinality enforcement, request mapping) is the adapter's job — kept out
-//! of this module on purpose.
+//! identifiers without coordinating. It also owns the one cardinality check
+//! both adapters enforce on client-supplied descriptors, and the descriptor
+//! key grammar both accept. Admission policy (decision codes, request
+//! mapping) is the adapter's job — kept out of this module on purpose.
 
+use std::fmt;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
@@ -15,6 +17,8 @@ use thiserror::Error;
 use twox_hash::xxhash3_128::{DEFAULT_SECRET_LENGTH, RawHasher, SecretBuffer};
 
 pub use crate::crdt::KeyHash;
+use crate::defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
+use crate::settings::Setting;
 
 /// Application-level rule identifier. Internal to one process; gossip uses
 /// [`Rule::fingerprint`] for cross-node identity instead.
@@ -180,6 +184,104 @@ impl RuleTable {
                     .zip(descriptors)
                     .all(|(pattern, descriptor)| pattern.matches(*descriptor))
         })
+    }
+}
+
+/// Match a descriptor key against `[A-Za-z_][A-Za-z0-9_.-]*`, the grammar
+/// both adapters accept, so equal rules produce equal identifiers.
+pub fn is_descriptor_key(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c == '.' || c == '-' || c.is_ascii_alphanumeric())
+}
+
+// -- cardinality ------------------------------------------------------------
+
+/// Upper bounds on the descriptors one request attaches, checked before any
+/// counter is touched so a malicious or buggy client cannot drive cell-store
+/// growth. Built only by [`crate::settings::Settings::validate`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CardinalityLimits {
+    pub(crate) max_descriptor_count: usize,
+    pub(crate) max_descriptor_bytes: usize,
+    pub(crate) max_key_bytes: usize,
+}
+
+impl CardinalityLimits {
+    pub fn max_descriptor_count(self) -> usize {
+        self.max_descriptor_count
+    }
+
+    pub fn max_key_bytes(self) -> usize {
+        self.max_key_bytes
+    }
+
+    /// The first limit `descriptors` exceed under `domain`, and its bound.
+    pub fn exceeded(
+        self,
+        domain: &str,
+        descriptors: &[Descriptor<'_>],
+    ) -> Option<(CardinalityLimit, usize)> {
+        if descriptors.len() > self.max_descriptor_count {
+            return Some((CardinalityLimit::Count, self.max_descriptor_count));
+        }
+        let mut bytes = domain.len();
+        for descriptor in descriptors {
+            if descriptor.key.len() > self.max_key_bytes {
+                return Some((CardinalityLimit::KeyBytes, self.max_key_bytes));
+            }
+            bytes = bytes
+                .saturating_add(descriptor.key.len())
+                .saturating_add(descriptor.value.len());
+            if bytes > self.max_descriptor_bytes {
+                return Some((CardinalityLimit::Bytes, self.max_descriptor_bytes));
+            }
+        }
+        None
+    }
+}
+
+/// Which part of the cardinality envelope a request exceeded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CardinalityLimit {
+    /// More descriptors in one Envoy request than gabion evaluates (a build
+    /// constant).
+    RequestDescriptors,
+    /// More entries in one descriptor than `max_descriptor_count`.
+    Count,
+    /// A descriptor's domain, keys and values total more than
+    /// `max_descriptor_bytes`.
+    Bytes,
+    /// One descriptor key is longer than `max_key_bytes`.
+    KeyBytes,
+}
+
+impl CardinalityLimit {
+    /// The `limit` log field and the setting that raises this limit (none for
+    /// the build constant).
+    pub fn describe(self) -> (&'static str, Option<Setting>) {
+        match self {
+            Self::RequestDescriptors => ("request_descriptors", None),
+            Self::Count => ("count", Some(Setting::StorageMaxDescriptorCount)),
+            Self::Bytes => ("bytes", Some(Setting::StorageMaxDescriptorBytes)),
+            Self::KeyBytes => ("key_bytes", Some(Setting::StorageMaxKeyBytes)),
+        }
+    }
+}
+
+/// The operator's next step when a request exceeds this limit.
+impl fmt::Display for CardinalityLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.describe().1 {
+            Some(setting) => write!(f, "If the traffic is legitimate, raise {setting}."),
+            None => write!(
+                f,
+                "gabion evaluates at most {STORAGE_MAX_DESCRIPTOR_COUNT} descriptors of one \
+                 request, a build-time constant (`STORAGE_MAX_DESCRIPTOR_COUNT`) that config \
+                 cannot raise; if the traffic is legitimate, have Envoy send fewer descriptors \
+                 per request."
+            ),
+        }
     }
 }
 

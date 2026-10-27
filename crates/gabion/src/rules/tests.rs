@@ -220,3 +220,16 @@ fn stable_hash_values_are_pinned() {
         0xec42_b938_8905_54a6_8a84_ad23_b6e1_13ba,
     );
 }
+
+#[test]
+fn is_descriptor_key_matches_grammar() {
+    assert!(is_descriptor_key("tenant"));
+    assert!(is_descriptor_key("tenant_id"));
+    assert!(is_descriptor_key("tenant.id"));
+    assert!(is_descriptor_key("tenant-id"));
+    assert!(is_descriptor_key("_internal"));
+    assert!(!is_descriptor_key(""));
+    assert!(!is_descriptor_key("9leading"));
+    assert!(!is_descriptor_key(".dot-first"));
+    assert!(!is_descriptor_key("with space"));
+}

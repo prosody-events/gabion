@@ -1,60 +1,5 @@
 use super::*;
 
-#[test]
-fn defaults_match_shared_production_defaults() {
-    let gossip = GossipSettings::default();
-    assert_eq!(
-        gossip.tick_interval,
-        Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS)
-    );
-    assert_eq!(gossip.fanout, defaults::GOSSIP_FANOUT);
-    assert_eq!(gossip.max_payload_bytes, defaults::GOSSIP_MAX_PAYLOAD_BYTES);
-    assert_eq!(
-        gossip.max_cells_per_frame,
-        defaults::GOSSIP_MAX_CELLS_PER_FRAME
-    );
-    assert_eq!(
-        gossip.max_cells_per_tick,
-        defaults::GOSSIP_MAX_CELLS_PER_TICK
-    );
-    assert_eq!(
-        gossip.send_queue_capacity,
-        defaults::GOSSIP_SEND_QUEUE_CAPACITY
-    );
-    assert_eq!(gossip.cluster_id_hash, defaults::GOSSIP_CLUSTER_ID_HASH);
-    assert_eq!(gossip.target_err_bps, defaults::GOSSIP_TARGET_ERR_BPS);
-    assert_eq!(
-        gossip.min_emit_interval,
-        Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS)
-    );
-
-    let cell_store = production_cell_store_config();
-    assert_eq!(cell_store.cell_capacity, defaults::STORAGE_MAX_CELLS as u32);
-    assert_eq!(
-        cell_store.rule_dictionary_capacity,
-        defaults::STORAGE_RULE_DICTIONARY_CAPACITY
-    );
-    assert_eq!(
-        cell_store.node_dictionary_capacity,
-        defaults::STORAGE_NODE_DICTIONARY_CAPACITY
-    );
-    assert_eq!(
-        cell_store.local_dirty_capacity,
-        defaults::STORAGE_LOCAL_DIRTY_CAPACITY
-    );
-    assert_eq!(
-        cell_store.forwarded_dirty_capacity,
-        defaults::STORAGE_FORWARDED_DIRTY_CAPACITY
-    );
-    assert_eq!(cell_store.peer_capacity, defaults::STORAGE_PEER_CAPACITY);
-
-    let leader = LeaderConfig::default();
-    assert_eq!(
-        leader.cell_store.cell_capacity,
-        defaults::STORAGE_MAX_CELLS as u32
-    );
-}
-
 use std::cell::Cell;
 use std::num::NonZeroU64;
 use std::sync::mpsc as std_mpsc;
@@ -101,11 +46,14 @@ fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
         except_if: None,
     }])
     .expect("rules");
+    let (gossip, cell_store) = crate::mock::validated(|_| {});
     let config = LeaderConfig {
         worker_id,
         gossip_bind: Some("127.0.0.1:0".parse().expect("addr")),
+        gossip,
+        discovery: DiscoveryConfig::default(),
+        cell_store,
         lease_tick: LEASE_TICK,
-        ..LeaderConfig::default()
     };
     spawn(region, Arc::new(rules), config).expect("spawn leader thread")
 }
@@ -183,7 +131,7 @@ impl AggregateStore<u32> for AppliedHits {
 #[tokio::test(start_paused = true)]
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
 async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
-    const EVENTS: usize = DRAIN_BATCH + 8;
+    const EVENTS: usize = DRAIN_BATCH.get() + 8;
     let region = leaked_region();
     let event = QueueEvent {
         hits: 1,
@@ -194,10 +142,12 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
         .expect("queue has room");
     let identity = NodeIdentity::new(gabion::crdt::NodeId(1), 1);
     let applied = Rc::new(AppliedHits::default());
+    let (mut gossip, cell_store) = crate::mock::validated(|_| {});
+    gossip.limit_queue_capacity = DRAIN_BATCH;
     let (runtime, client) = GossipRuntime::bind(
         LONE_NODE_BIND,
-        GossipSettings::default().into_runtime_config(identity, 0),
-        CellStore::new(production_cell_store_config(), identity),
+        gossip,
+        CellStore::new(cell_store, identity),
         applied.clone(),
     )
     .await
@@ -205,7 +155,7 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
     let drained = || region.stats().snapshot().queue_drained as usize;
     let mut drain = std::pin::pin!(drain_loop(client, region, 1));
     assert!(timeout(DEADLINE, drain.as_mut()).await.is_err());
-    assert_eq!(drained(), DRAIN_BATCH);
+    assert_eq!(drained(), DRAIN_BATCH.get());
     let both = async { tokio::join!(drain.as_mut(), runtime.run(futures::stream::empty())) };
     assert!(timeout(DEADLINE, both).await.is_err());
     assert_eq!((applied.0.get(), drained()), (EVENTS, EVENTS));

@@ -15,10 +15,9 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::num::NonZeroU128;
+use std::num::{NonZeroU8, NonZeroU32, NonZeroU128, NonZeroUsize};
 use std::time::Duration;
 
-use crate::crdt::{CellStoreStats, NodeId, NodeIdentity};
 use crate::wire::{self, FrameLimits, HmacKey};
 
 mod admin;
@@ -43,16 +42,14 @@ pub use transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
 pub use transport::UdpTransport;
 
-/// Configuration for [`GossipRuntime`]. Non-generic — holds scalar tuning
-/// knobs only. [`Clock`] and [`GossipTransport`] are constructor parameters
-/// because they are generic on the runtime.
+/// Configuration for [`GossipRuntime`], built only by
+/// [`crate::settings::Settings::validate`], so every value is in range.
+/// [`Clock`] and [`GossipTransport`] are constructor parameters because they
+/// are generic on the runtime. The public fields are the adapter's to set.
 #[derive(Clone, Debug)]
-pub struct GossipConfig {
-    /// Local identity used in outbound packet headers and as the cell origin
-    /// for locally-observed hits.
-    pub local_identity: NodeIdentity,
+pub struct ValidGossipConfig {
     /// Cluster identifier mixed into every outbound packet header.
-    pub cluster_id_hash: u128,
+    pub(crate) cluster_id_hash: NonZeroU128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
     /// Floor on the number of peers contacted per gossip tick. The runtime
@@ -61,19 +58,21 @@ pub struct GossipConfig {
     /// [`crate::defaults::GOSSIP_COVERAGE_MARGIN`]), capped at the peer count;
     /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
     /// hard minimum when that threshold falls below it.
-    pub fanout: usize,
+    pub(crate) fanout: NonZeroUsize,
     /// Frame composition: how many cells `fill_gossip_frame*` may emit per
     /// tick. The wire codec splits this into multiple packets if needed.
-    pub max_cells_per_tick: usize,
+    pub(crate) max_cells_per_tick: NonZeroUsize,
     /// Per-packet UDP budget + decoder safety limits.
-    pub wire_limits: FrameLimits,
+    pub(crate) wire_limits: FrameLimits,
     /// Outbound send queue capacity. Each slot owns a pre-allocated
     /// [`wire::PacketBuf`].
-    pub send_queue_capacity: usize,
-    /// Capacity of the incoming limit-request mpsc channel.
-    pub limit_queue_capacity: usize,
+    pub(crate) send_queue_capacity: NonZeroU8,
+    /// Capacity of the incoming limit-request channel. NGINX's leader sets
+    /// its drain batch here, because there the setting sizes the
+    /// shared-memory queue instead.
+    pub limit_queue_capacity: NonZeroUsize,
     /// Period between proactive gossip ticks.
-    pub tick_interval: Duration,
+    pub(crate) tick_interval: Duration,
     /// Optional HMAC key — when set, every outbound packet is authenticated
     /// and inbound packets must verify.
     pub auth_key: Option<HmacKey>,
@@ -82,51 +81,10 @@ pub struct GossipConfig {
     /// Per-rule error budget in basis points of the rule's own limit, used
     /// for threshold-triggered anti-entropy. See
     /// [`crate::defaults::GOSSIP_TARGET_ERR_BPS`].
-    pub target_err_bps: u32,
-    /// Minimum gap between two threshold-fire emissions, in milliseconds.
-    /// See [`crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
-    pub min_emit_interval: Duration,
-}
-
-impl Default for GossipConfig {
-    fn default() -> Self {
-        Self {
-            local_identity: NodeIdentity::new(crate::crdt::NodeId(0), 1),
-            cluster_id_hash: 0,
-            bootstrap_peers: Vec::new(),
-            fanout: 3,
-            max_cells_per_tick: 1024,
-            wire_limits: FrameLimits::default(),
-            send_queue_capacity: 32,
-            limit_queue_capacity: 1024,
-            tick_interval: Duration::from_millis(100),
-            auth_key: None,
-            rng_seed: crate::defaults::random_rng_seed().expect("OS entropy for gossip RNG seed"),
-            target_err_bps: crate::defaults::GOSSIP_TARGET_ERR_BPS,
-            min_emit_interval: Duration::from_millis(crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS),
-        }
-    }
-}
-
-/// Parse a cluster identifier as both adapters' configs spell it: decimal
-/// (`12345`) or `0x`-prefixed hex (`0xc0ffee`), ignoring surrounding
-/// whitespace. `None` for anything else, including `0`.
-pub fn parse_cluster_id(value: &str) -> Option<NonZeroU128> {
-    let value = value.trim();
-    let (digits, radix) = match value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        Some(hex) => (hex, 16),
-        None => (value, 10),
-    };
-    // `from_str_radix` also takes a leading `+`; an id is digits only.
-    if !digits.starts_with(|c: char| c.is_digit(radix)) {
-        return None;
-    }
-    u128::from_str_radix(digits, radix)
-        .ok()
-        .and_then(NonZeroU128::new)
+    pub(crate) target_err_bps: NonZeroU32,
+    /// Minimum gap between two threshold-fire emissions. See
+    /// [`crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
+    pub(crate) min_emit_interval: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]

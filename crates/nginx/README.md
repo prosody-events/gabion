@@ -279,22 +279,27 @@ and may admit requests over the limit. A node with no peers has nothing
 to rebuild from, so a reload or leader change resets its limits as if
 every window had just started. Changing the name or size starts an
 empty zone, and the master releases the old one once no configuration
-uses it.
+uses it. A reload that changes only `gabion_gossip_limit_queue_capacity`
+cannot resize a reused zone's queue, so nginx refuses it and keeps the
+previous configuration (`limit_queue_resized_on_reload`); change SIZE
+with it, or restart nginx.
 
 ```nginx
 gabion_limit_zone zone=api:128m;
 ```
 
 SIZE sets how many `(rule, key, bucket)` counters the zone holds: after
-the ~150 KiB request queue and nginx's slab bookkeeping (under 1%), the
-rest becomes a power-of-two table of 64-byte slots, so each doubling of
+the request queue (`gabion_gossip_limit_queue_capacity` × 72 bytes,
+rounded up to a power of two: 576 KiB at the default) and nginx's slab
+bookkeeping (under 1%), the rest becomes a power-of-two table of 64-byte slots, so each doubling of
 SIZE doubles the slots (`2m` holds 16,384, `64m` holds 524,288; the
 `gabion: zone ready` log line reports `slots`). A rule needs about
 *active keys × (window / bucket + 1)* slots, and lookups stay short
 while the table is under half full. For example, 650 keys a second under
 `rate=20r/s window=10s bucket=1s` keep about 650 × 11 ≈ 7,200 cells
-live, so choose 16,384 slots: `zone=api:2m`. Sizes under `1m` may be
-refused. When the table runs out of room, gabion allows the request,
+live, so choose 16,384 slots: `zone=api:2m`. A zone too small for the
+queue and 1,024 slots fails `nginx -t` naming the smallest SIZE that fits;
+`1m` fits the default queue capacity. When the table runs out of room, gabion allows the request,
 under-counts that key, increments `aggregate_dropped` and logs a warning.
 
 #### `gabion_limit_rule NAME [$bindings...] rate=Nr/<unit> [...]` *(http)*
@@ -479,10 +484,11 @@ they bound resource use.
 | `gabion_gossip_bind ADDR:PORT`                  | *(none)* | UDP bind for the gossip channel. Required for clustering; without it the node counts alone and runs no peer discovery. |
 | `gabion_gossip_cluster ID`                      | `1`     | Cluster identifier: any non-zero u128, in decimal or `0x`-prefixed hex. |
 | `gabion_gossip_tick_interval DURATION`          | `500ms` | Heartbeat period. Shorter = faster convergence, more UDP traffic.                     |
-| `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet. Below ~64 the encoder refuses to fit even one cell. |
+| `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet: 152 to 65,507. 152 bytes hold the header and one counter; 65,507 is the largest UDP payload over IPv4. |
 | `gabion_gossip_max_cells_per_frame N`           | `4096`  | Maximum cells encoded into one packet.                                                |
 | `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells emitted across all packets in one tick.                                 |
-| `gabion_gossip_send_queue_capacity N`           | `128`   | Outbound UDP send queue depth (per-peer slots in the leader).                         |
+| `gabion_gossip_send_queue_capacity N`           | `128`   | Outbound UDP send queue depth (per-peer slots in the leader), 1 to 255.               |
+| `gabion_gossip_limit_queue_capacity N`          | `8192`  | Slots in the shared-memory request queue workers push counted hits onto for the leader, 64 to 1,048,576, rounded up to a power of two. Each slot is 72 bytes of the `gabion_limit_zone` SIZE, so raise SIZE with it. The default covers a 1.3 s leader handover at up to 6,300 counted hits a second per pod; raise it when the `queue_dropped` counter rises. A reload that changes it needs a new SIZE or a restart. |
 
 ### Storage — CRDT capacities
 
@@ -501,7 +507,7 @@ to touch them if your workload runs into the cap.
 | `gabion_storage_local_dirty_capacity N`         | `65536`     | Local dirty-ring capacity. Sized to absorb a burst between heartbeats.                |
 | `gabion_storage_forwarded_dirty_capacity N`     | `524288`    | Forwarded dirty-ring capacity. Sized larger because it tracks peer-originated edits we still owe other peers. |
 | `gabion_storage_peer_capacity N`                | `256`       | Peer slots in the peer-frontier table (one row per peer × node).                      |
-| `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare. At most 16 (`STORAGE_MAX_DESCRIPTOR_COUNT`). |
+| `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare, 1 to 16 (`STORAGE_MAX_DESCRIPTOR_COUNT`); a larger value fails `nginx -t`. |
 | `gabion_storage_max_descriptor_bytes N`         | `512`       | Per-request budget on `(key + value)` bytes summed across descriptors plus the domain. Exceeded ⇒ 400. |
 | `gabion_storage_max_key_bytes N`                | `128`       | Cap on a single descriptor key's length (validated at config phase).                  |
 
@@ -761,13 +767,18 @@ local readout; the server adapter exposes the same data via
 ## Configuration error messages
 
 Every `gabion_*` directive emits an operator-readable error at
-`nginx -t` time when something is wrong, with the offending value
-quoted and the fix named. The shape from the shared `set_scalar`
-helper is
-
-```
-gabion: `<directive>` rejected value `<offending>`: <expected>
-```
+`nginx -t` time when something is wrong, naming the file and line, with
+the offending value quoted and the fix named. Every setting directive
+(`gabion_gossip_*`, `gabion_storage_*`, `gabion_discovery_*`,
+`gabion_node_id_seed`, `gabion_runtime_rng_seed`) is parsed and
+validated by the gabion library's settings table, the same one
+`gabiond` uses, so its errors name the setting in both adapters'
+spellings: a zero count or duration, a value that does not parse, or a
+value out of range fails `nginx -t` rather than being clamped. A rule
+between settings (`gabion_gossip_min_emit_interval` below
+`gabion_gossip_tick_interval`, the packet size and error-budget ranges)
+is checked once the whole `http {}` block is read, so its error points
+at the block's end.
 
 Examples (verbatim, all from the current source):
 
@@ -780,9 +791,10 @@ gabion: `gabion_limit_rule` argument `rate=100r/fortnight` is invalid: rate peri
 gabion: `gabion_limit_rule` rule `inverted`: the window is shorter than the rate's period, so the rate cannot be spread over it. To enforce N requests in a shorter span, put the period in the rate itself (for example `100r/500ms`)
 gabion: `gabion_limit_rule` rule `per_ip` is declared more than once; rule names must be unique within an http {} block
 gabion: `gabion_limit` references rule `tenant_api`, which is not declared via `gabion_limit_rule`
-gabion: `gabion_gossip_cluster` rejected value `0`: expected a non-zero 128-bit cluster identifier shared by every peer, in decimal or `0x`-prefixed hex (e.g. `1`, `0xc0ffee`)
+gabion: `gossip.cluster_id_hash` is `0`, which is not a non-zero cluster id in decimal or `0x`-prefixed hex, for example `0xc0ffee`. Correct it (`GABION_GOSSIP_CLUSTER_ID_HASH`; NGINX `gabion_gossip_cluster`) or remove it to use the default, 1.
 gabion: rules are declared but `gabion_limit_zone` is not set, so no request would ever be counted or limited: the zone is the shared memory that holds the counts. Add `gabion_limit_zone zone=gabion:64m;` to the http {} block.
-gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a duration like `100ms` or `1s`
+gabion: `gossip.tick_interval` is `notaduration`, which is not a duration in whole milliseconds, for example `500ms`. Correct it (`GABION_GOSSIP_TICK_INTERVAL`; NGINX `gabion_gossip_tick_interval`) or remove it to use the default, 500ms.
+gabion: `storage.max_cells` is 0, but it must be at least 1: gabion could not track any rate-limit key. Remove the setting to use the default, 131072, or set a positive value (`GABION_STORAGE_MAX_CELLS`; NGINX `gabion_storage_max_cells`).
 ```
 
 ## Troubleshooting
@@ -799,16 +811,19 @@ below are the module's own.
 | `gabion_limit_rule argument 'rate=0r/s' is invalid`                           | Zero rate; would deny all traffic.                                                                                                                  | Pick a non-zero positive integer. To temporarily disable a rule, use `mode=disabled`.                                            |
 | `gabion_limit_rule rule X: the window is shorter than the rate's period`         | `window=` was paired with a rate whose period is longer (e.g. `rate=200r/s window=500ms`); a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (for example `rate=100r/500ms`) instead of pairing a short window with a longer-period rate.       |
 | `gabion_limit_rule rule X has more descriptor bindings than …`, `… binding key K is longer than …`, or `… rule X: nginx could not compile binding …` | The rule's bindings exceed `gabion_storage_max_descriptor_count` or `gabion_storage_max_key_bytes`, or nginx rejected a binding (an invalid template, or it ran out of configuration memory); the message says which. | Fix the rule (or raise the named directive), then run `nginx -t` to re-check. |
-| `gabion_gossip_cluster rejected value 0`                                      | The cluster ID parsed to `0`, which is almost certainly unintended.                                                                                 | Pick any non-zero u128 value shared by every peer, in decimal or `0x`-prefixed hex (`1`, `0xc0ffee`).                            |
+| `` gabion: `X` is 0, but it must be at least 1: … ``                           | A count, capacity or duration directive was set to 0, which would disable what it sizes.                                                            | Remove the directive to use the default the message names, or set a positive value.                                              |
+| `` gabion: `X` is `V`, which is not …, for example `E`. … ``                   | The directive's argument does not parse: an integer in range, a duration in whole milliseconds (`500ms`), a socket address, a Kubernetes name, or a non-zero cluster id. | Write it like the example, or remove the directive to use the default.                                                           |
+| `` gabion: `X` is N; gabion supports MIN to MAX. … ``                          | A capacity directive is outside the range gabion can hold; the message gives the reason.                                                            | Set it inside the range, or remove it.                                                                                           |
+| `gabion: The gossip packet size …`, `… error budget …`, or `` … `gossip.min_emit_interval` … must be at least 1ms and shorter than … `` | A settings rule failed once the `http {}` block was read: the packet size outside 152 to 65,507, the error budget outside 1 to 10,000, or the emit floor at or above the heartbeat. | Follow the message; it names the directive and the range.                                                                        |
+| `` gabion: `gabion_limit_zone` size N bytes is too small to hold gabion's request queue … `` | SIZE cannot hold the request queue (`gabion_gossip_limit_queue_capacity` × 72 bytes) and 1,024 counter slots.                              | Raise SIZE to at least the size the message names, or lower `gabion_gossip_limit_queue_capacity`.                               |
 | `rules are declared but gabion_limit_zone is not set`                         | The config declares rules but no zone, so there is nowhere to count hits and every request would be admitted uncounted.                             | Add `gabion_limit_zone zone=gabion:64m;` to the `http {}` block, or check that the include declaring it is loaded.               |
-| `gabion: <directive> rejected value 'X': expected a duration like '100ms'`    | A tuning directive received a value it couldn't parse.                                                                                              | The error names the directive and the expected format; supply a humantime duration (`100ms`, `5s`).                              |
 | Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`      | A client crossed a rule's limit.                                                                                                                    | Expected. `Retry-After` says how long to back off; the rule with the longest window owns the header.                             |
 | `400 Bad Request` from gabion                                                 | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits (`512` by default).                  | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
 | SHM `matched_rule_overflows` counter rising                                   | A location stacked more rules than `STORAGE_MAX_MATCHED_RULES` permits (`16`). **The request was allowed** (allow-by-default); the count under-counts. *No log line — observed only via the SHM stats snapshot.* | Reduce the number of rules applied at this location, or split the location.                                                      |
 | `gabion: the shared-memory count table had no free slot` (warn)               | The zone holds too few slots for the live `(rule, key, bucket)` cells. **The request was allowed** and that key under-counted. Logged at powers of two of `aggregate_dropped`. | Raise SIZE in `gabion_limit_zone` (see its sizing notes); each doubling doubles the slots.                                         |
 | `gabion: this worker stopped leading gossip` (error) in the error log         | The leader's gossip runtime or queue drain failed or panicked, or it lost the lease. The worker released the lease and campaigns again after `retry_in` (doubling, up to 30s); another worker may take over first. Admission keeps running against the shared aggregate. | Read the `error` field. A bind error means `gabion_gossip_bind` is already in use; a lost lease means the worker was starved long enough to miss its renewals. |
 | `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside a leadership term, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
-| `peer discovery error` (warn) in the error log                                | The Kubernetes discovery stream returned an error this tick. Membership is stale until the next successful tick.                                    | Usually transient (apiserver flap, transient watch reset). If persistent, check pod RBAC / network reachability to the API.      |
+| `Peer discovery hit an error and skipped an update` (warn) in the error log   | `discovery_error`, a library message: see [`../gabion/TROUBLESHOOTING.md`](../gabion/TROUBLESHOOTING.md#discovery_error).                           | Usually transient. If it keeps repeating, check pod RBAC and network reachability to the API.                                    |
 | `gabion: failed to draw gossip RNG seed` (error) in the error log             | `getrandom` failed at worker startup. This worker keeps serving requests but never drives gossip; another worker can still lead.                              | Inspect the wrapped `error` field. Usually a sandboxed environment denying `/dev/urandom`; either lift the restriction or supply `gabion_runtime_rng_seed N` to bypass the entropy draw. |
 
 ### `leader_takeover`
@@ -824,6 +839,20 @@ Message starts: "gabion: this worker took over gossip and emptied the previous l
 **What to do next.** Nothing, unless it lasts more than a few gossip ticks. If it does, check that this node receives gossip from its peers ("Verifying convergence" above).
 
 **Fields** `cleared` · **Knob** none
+
+### `limit_queue_resized_on_reload`
+
+**Level** error, once per refused reload · **Request allowed** yes, the previous configuration keeps serving · **Emitted by** NGINX module only
+
+Message starts: "gabion: this reload changes `gabion_gossip_limit_queue_capacity`"
+
+**What happened.** nginx refused the reload and kept the previous configuration, including its rules. The reload changed the queue capacity, but the `gabion_limit_zone` name and size stayed the same, so nginx reused the running zone, whose queue the running workers still use and cannot resize.
+
+**Why.** nginx maps a fresh shared-memory zone only when a zone's name or size changes.
+
+**What to do next.** Change SIZE in `gabion_limit_zone` along with `gabion_gossip_limit_queue_capacity` (a larger queue needs a larger SIZE anyway, 72 bytes a slot), so nginx maps a fresh zone, or restart nginx.
+
+**Fields** `running`, `configured` · **Knob** `gabion_gossip_limit_queue_capacity`, `gabion_limit_zone`
 
 Operator-facing errors are written to answer three questions: *what
 happened*, *why it likely happened*, and *what to do next*. If you

@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests;
 
-use crate::discovery::{Peer, PeerDiscovery, PeerEvent};
+use crate::discovery::{DiscoveryConfig, Peer, PeerDiscovery, PeerEvent};
 use ahash::{AHashMap, AHashSet};
 use async_stream::stream;
 use futures::stream::{SelectAll, Stream, StreamExt, select_all};
@@ -27,8 +27,8 @@ const DEFAULT_GABION_SERVICE_NAME: &str = "gabion";
 #[derive(Clone)]
 pub struct EndpointSliceDiscovery {
     self_addr: Option<SocketAddr>,
-    namespace_allow: Vec<String>,
-    service_allow: Vec<String>,
+    namespace_allow: Box<[Box<str>]>,
+    service_allow: Box<[Box<str>]>,
     /// Pre-built client; when `Some` we skip the in-cluster client
     /// construction entirely and use it as-is. Only the `#[ignore]`d
     /// live-cluster test in `tests.rs` sets it — production constructors
@@ -37,15 +37,11 @@ pub struct EndpointSliceDiscovery {
 }
 
 impl EndpointSliceDiscovery {
-    pub fn new(
-        self_addr: Option<SocketAddr>,
-        namespace_allow: Vec<String>,
-        service_allow: Vec<String>,
-    ) -> Self {
+    pub fn new(config: DiscoveryConfig) -> Self {
         Self {
-            self_addr,
-            namespace_allow,
-            service_allow,
+            self_addr: config.self_addr,
+            namespace_allow: config.namespace_allow,
+            service_allow: config.service_allow,
             preconnected: None,
         }
     }
@@ -266,7 +262,7 @@ enum ServiceChange {
     Ignore,
 }
 
-fn service_change(event: Event<Service>, allow: &[String]) -> ServiceChange {
+fn service_change(event: Event<Service>, allow: &[Box<str>]) -> ServiceChange {
     let (svc, present) = match event {
         Event::Apply(svc) | Event::InitApply(svc) => {
             let present = has_gabion_udp_port(&svc);
@@ -307,7 +303,7 @@ fn mark_listed(listed: &mut [bool], index: usize) -> bool {
 /// namespace's index, plus the number of namespaces.
 fn watch_services(
     client: &Client,
-    namespace_allow: &[String],
+    namespace_allow: &[Box<str>],
 ) -> (
     impl Stream<Item = (usize, Result<Event<Service>, WatcherError>)> + Send + Unpin,
     usize,
@@ -364,9 +360,9 @@ fn fatal_status(err: &WatcherError) -> Option<u16> {
 
 /// True if `name` matches any non-empty entry in `allow`. An allow list
 /// with no non-empty entries matches everything.
-fn matches_allow(name: &str, allow: &[String]) -> bool {
+fn matches_allow(name: &str, allow: &[Box<str>]) -> bool {
     let mut entries = allow.iter().filter(|s| !s.is_empty()).peekable();
-    entries.peek().is_none() || entries.any(|s| s == name)
+    entries.peek().is_none() || entries.any(|s| &**s == name)
 }
 
 fn is_gabion_udp(name: Option<&str>, protocol: Option<&str>) -> bool {

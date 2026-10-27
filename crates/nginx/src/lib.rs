@@ -28,4 +28,6 @@ mod log;
 mod module;
 
 #[cfg(test)]
+mod mock;
+#[cfg(test)]
 mod tests;

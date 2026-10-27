@@ -3,28 +3,29 @@
 //! one test see another's env state and fail in non-obvious ways.
 
 use super::*;
+use gabion::settings::Millis;
 use std::sync::Mutex;
 
 /// Held for the duration of any test that mutates the env. Guarantees
 /// `set_env` / `clear_all` see a consistent view of the process env.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Remove every env var declared in [`ENV_BINDINGS`]. Run at the start
-/// of each test so leftovers from a prior test (in the same binary
-/// run) can't leak across cases.
+/// Remove every setting's env var. Run at the start of each test so
+/// leftovers from a prior test (in the same binary run) can't leak across
+/// cases.
 fn clear_all_env() {
-    for binding in ENV_BINDINGS {
+    for setting in Setting::ALL {
         // SAFETY: serialized through `ENV_LOCK`; no concurrent access.
-        unsafe { std::env::remove_var(binding.env_name) };
+        unsafe { std::env::remove_var(setting.env_var()) };
     }
 }
 
-/// Set an env var. Asserts the key is a known binding so a typo in the
-/// test surfaces immediately instead of silently doing nothing.
+/// Set an env var. Asserts the key is a setting's so a typo in the test
+/// surfaces immediately instead of silently doing nothing.
 fn set_env(key: &str, value: &str) {
     assert!(
-        ENV_BINDINGS.iter().any(|b| b.env_name == key),
-        "test set unknown env var: {key} (add it to ENV_BINDINGS)",
+        Setting::ALL.iter().any(|setting| setting.env_var() == key),
+        "test set unknown env var: {key}",
     );
     // SAFETY: serialized through `ENV_LOCK`; no concurrent access.
     unsafe { std::env::set_var(key, value) };
@@ -50,33 +51,18 @@ impl Drop for EnvGuard {
     }
 }
 
+fn ms(millis: u64) -> Millis {
+    Millis(millis.try_into().unwrap())
+}
+
 #[test]
 fn defaults_apply_when_neither_yaml_nor_env_set_a_value() {
     let _env = EnvGuard::lock();
 
     let cfg = AppConfig::load(None).expect("load with neither yaml nor env");
 
-    assert_eq!(cfg.envoy_bind, None);
-    assert_eq!(
-        cfg.storage.rule_dictionary_capacity,
-        defaults::STORAGE_RULE_DICTIONARY_CAPACITY
-    );
-    assert_eq!(cfg.gossip.fanout, defaults::GOSSIP_FANOUT);
-    assert_eq!(cfg.gossip.target_err_bps, defaults::GOSSIP_TARGET_ERR_BPS);
-    assert_eq!(
-        cfg.gossip.min_emit_interval,
-        Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS)
-    );
-    assert!(cfg.discovery.namespace_allow.is_empty());
-    assert_eq!(cfg.runtime.rng_seed, None);
-    assert_eq!(
-        cfg.cardinality_limits().max_descriptor_bytes,
-        defaults::STORAGE_MAX_DESCRIPTOR_BYTES
-    );
-    assert_eq!(
-        cfg.cell_store_config().cell_capacity,
-        defaults::STORAGE_MAX_CELLS as u32
-    );
+    assert_eq!(cfg.settings, Settings::default());
+    assert!(cfg.limits.is_empty());
 }
 
 #[test]
@@ -90,12 +76,13 @@ fn yaml_values_load_when_no_env_overrides() {
     )
     .expect("load yaml");
 
-    assert_eq!(cfg.envoy_bind, Some("127.0.0.1:8000".parse().unwrap()));
-    assert_eq!(cfg.storage.max_cells, Some(256));
-    assert_eq!(cfg.storage.rule_dictionary_capacity, 8);
-    assert_eq!(cfg.gossip.fanout, 3);
-    assert_eq!(cfg.gossip.target_err_bps, 250);
-    assert_eq!(cfg.gossip.min_emit_interval, Duration::from_millis(7));
+    let settings = &cfg.settings;
+    assert_eq!(settings.envoy_bind, Some("127.0.0.1:8000".parse().unwrap()));
+    assert_eq!(settings.max_cells.get(), 256);
+    assert_eq!(settings.rule_dictionary_capacity.get(), 8);
+    assert_eq!(settings.fanout.get(), 3);
+    assert_eq!(settings.target_err_bps, 250);
+    assert_eq!(settings.min_emit_interval, ms(7));
 }
 
 #[test]
@@ -111,11 +98,11 @@ fn env_overrides_yaml_for_scalars() {
     )
     .expect("load yaml + env");
 
-    assert_eq!(cfg.storage.max_cells, Some(9999));
-    assert_eq!(cfg.gossip.fanout, 12);
-    assert_eq!(cfg.gossip.target_err_bps, 250);
+    assert_eq!(cfg.settings.max_cells.get(), 9999);
+    assert_eq!(cfg.settings.fanout.get(), 12);
+    assert_eq!(cfg.settings.target_err_bps, 250);
     // Untouched YAML value stays.
-    assert_eq!(cfg.storage.rule_dictionary_capacity, 8);
+    assert_eq!(cfg.settings.rule_dictionary_capacity.get(), 8);
 }
 
 #[test]
@@ -127,9 +114,12 @@ fn env_only_with_no_yaml_file() {
 
     let cfg = AppConfig::load(None).expect("load env-only");
 
-    assert_eq!(cfg.storage.max_cells, Some(5555));
-    assert_eq!(cfg.envoy_bind, Some("0.0.0.0:8081".parse().unwrap()));
-    assert_eq!(cfg.runtime.rng_seed, Some(42));
+    assert_eq!(cfg.settings.max_cells.get(), 5555);
+    assert_eq!(
+        cfg.settings.envoy_bind,
+        Some("0.0.0.0:8081".parse().unwrap())
+    );
+    assert_eq!(cfg.settings.rng_seed, Some(42));
 }
 
 #[test]
@@ -141,12 +131,12 @@ fn comma_separated_lists_split_into_vec() {
     let cfg = AppConfig::load(None).expect("load env-only with lists");
 
     assert_eq!(
-        cfg.discovery.namespace_allow,
-        ["ns-a", "ns-b", "ns-c"].map(String::from),
+        &*cfg.settings.namespace_allow,
+        ["ns-a", "ns-b", "ns-c"].map(Box::from),
     );
     assert_eq!(
-        cfg.discovery.service_allow,
-        ["svc-1", "svc-2"].map(String::from),
+        &*cfg.settings.service_allow,
+        ["svc-1", "svc-2"].map(Box::from)
     );
 }
 
@@ -161,8 +151,8 @@ fn list_parsing_trims_whitespace_and_skips_empties() {
     let cfg = AppConfig::load(None).expect("load env list");
 
     assert_eq!(
-        cfg.discovery.namespace_allow,
-        ["ns-a", "ns-b", "ns-c"].map(String::from),
+        &*cfg.settings.namespace_allow,
+        ["ns-a", "ns-b", "ns-c"].map(Box::from),
     );
 }
 
@@ -174,8 +164,8 @@ fn duration_env_uses_humantime_syntax() {
 
     let cfg = AppConfig::load(None).expect("load tick_interval from env");
 
-    assert_eq!(cfg.gossip.tick_interval, Duration::from_millis(250));
-    assert_eq!(cfg.gossip.min_emit_interval, Duration::from_millis(10));
+    assert_eq!(cfg.settings.tick_interval, ms(250));
+    assert_eq!(cfg.settings.min_emit_interval, ms(10));
 }
 
 #[test]
@@ -186,38 +176,133 @@ fn bad_scalar_env_value_returns_error_not_panic() {
     let err = AppConfig::load(None).expect_err("non-integer max_cells should error");
 
     assert!(
-        err.to_string().contains("max_cells"),
-        "error should name the offending key, got: {err}",
+        matches!(
+            err,
+            ConfigError::Setting(SettingError::Malformed {
+                setting: Setting::StorageMaxCells,
+                ..
+            })
+        ),
+        "{err:?}"
     );
 }
 
 #[test]
-fn env_binding_names_use_single_underscores_only() {
-    for binding in ENV_BINDINGS {
-        assert!(
-            binding.env_name.starts_with("GABION_"),
-            "{} should be GABION_-prefixed",
-            binding.env_name,
-        );
-        assert!(
-            !binding.env_name.contains("__"),
-            "{} contains a double underscore",
-            binding.env_name,
-        );
+fn send_queue_capacity_above_255_fails_to_load() {
+    let _env = EnvGuard::lock();
+    let err = AppConfig::load_with_yaml_str("gossip:\n  send_queue_capacity: 256\n")
+        .expect_err("256 send slots overflow the slot numbers");
+    assert!(
+        matches!(
+            err,
+            ConfigError::Setting(SettingError::Malformed {
+                setting: Setting::GossipSendQueueCapacity,
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+}
+
+/// A valid value for `setting`, different from its default.
+fn sample(setting: Setting) -> &'static str {
+    match setting {
+        Setting::EnvoyBind => "127.0.0.1:8000",
+        Setting::AdminBind => "127.0.0.1:9090",
+        Setting::StorageMaxCells => "4096",
+        Setting::StorageRuleDictionaryCapacity => "8",
+        Setting::StorageNodeDictionaryCapacity => "16",
+        Setting::StorageLocalDirtyCapacity => "128",
+        Setting::StorageForwardedDirtyCapacity => "256",
+        Setting::StoragePeerCapacity => "32",
+        Setting::StorageMaxDescriptorCount => "8",
+        Setting::StorageMaxDescriptorBytes => "256",
+        Setting::StorageMaxKeyBytes => "64",
+        Setting::RuntimeNodeIdSeed => "pod-7",
+        Setting::RuntimeRngSeed => "42",
+        Setting::GossipBind => "127.0.0.1:9000",
+        Setting::GossipTickInterval => "250ms",
+        Setting::GossipFanout => "5",
+        Setting::GossipMaxPayloadBytes => "1200",
+        Setting::GossipMaxCellsPerFrame => "1024",
+        Setting::GossipMaxCellsPerTick => "2048",
+        Setting::GossipSendQueueCapacity => "64",
+        Setting::GossipLimitQueueCapacity => "1024",
+        Setting::GossipClusterIdHash => "0xc0ffee",
+        Setting::GossipTargetErrBps => "250",
+        Setting::GossipMinEmitInterval => "10ms",
+        Setting::DiscoverySelfAddr => "10.0.0.1:9000",
+        Setting::DiscoveryNamespaceAllow => "team-a",
+        Setting::DiscoveryServiceAllow => "gabion",
+    }
+}
+
+/// Every setting's environment variable and YAML key reaches
+/// `Settings::apply`.
+#[test]
+fn setting_table_spellings_parse() {
+    for &setting in Setting::ALL {
+        let mut expected = Settings::default();
+        expected
+            .apply(setting, sample(setting))
+            .expect("valid sample");
+        assert_ne!(expected, Settings::default(), "{setting:?}");
+
+        let _env = EnvGuard::lock();
+        set_env(setting.env_var(), sample(setting));
+        let from_env =
+            AppConfig::load(None).unwrap_or_else(|error| panic!("{}: {error}", setting.env_var()));
+        assert_eq!(from_env.settings, expected, "{}", setting.env_var());
+        clear_all_env();
+
+        let value = format!("\"{}\"", sample(setting));
+        let value = if setting.is_list() {
+            format!("[{value}]")
+        } else {
+            value
+        };
+        let yaml = match setting.yaml_key().split_once('.') {
+            Some((block, key)) => format!("{block}:\n  {key}: {value}\n"),
+            None => format!("{}: {value}\n", setting.yaml_key()),
+        };
+        let from_yaml =
+            AppConfig::load_with_yaml_str(&yaml).unwrap_or_else(|error| panic!("{yaml}: {error}"));
+        assert_eq!(from_yaml.settings, expected, "{yaml}");
     }
 }
 
 #[test]
-fn setting_table_matches_env_bindings() {
-    let table: std::collections::BTreeSet<_> = gabion::settings::Setting::ALL
-        .iter()
-        .map(|setting| (setting.yaml_key(), setting.env_var()))
-        .collect();
-    let loader: std::collections::BTreeSet<_> = ENV_BINDINGS
-        .iter()
-        .map(|binding| (binding.config_path, binding.env_name))
-        .collect();
-    assert_eq!(table, loader);
+fn unknown_yaml_key_fails_naming_it() {
+    let _env = EnvGuard::lock();
+    let rule = "limits:\n  - name: per_ip\n    domain: nginx\n    rate: 10r/s\n";
+    for (yaml, key) in [
+        (
+            "gossip:\n  tick_intervl: 1s\n".to_owned(),
+            "gossip.tick_intervl",
+        ),
+        ("gosip:\n  bind: 0.0.0.0:9000\n".to_owned(), "gosip.bind"),
+        (
+            format!("{rule}    descriptors: [{{ key: ip }}]\n    ratee: 5r/s\n"),
+            "limits[0].ratee",
+        ),
+        (
+            format!("{rule}    descriptors: [{{ key: ip, vaule: \"*\" }}]\n"),
+            "limits[0].descriptors[0].vaule",
+        ),
+    ] {
+        let err = AppConfig::load_with_yaml_str(&yaml).expect_err(key);
+        assert!(
+            matches!(err, ConfigError::UnknownKey(ref unknown) if unknown == key),
+            "{yaml}: {err:?}"
+        );
+    }
+    let err = AppConfig::load_with_yaml_str("gossip:\n  tick_intervl: 1s\n").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "The configuration file sets `gossip.tick_intervl`, which gabiond does not know. This key \
+         was removed or renamed in this release, or it is misspelled; see the release notes for \
+         its replacement."
+    );
 }
 
 #[test]
@@ -348,24 +433,21 @@ fn explicit_bucket_overrides_window() {
 
 #[test]
 fn cluster_id_hash_accepts_integer_decimal_and_hex_strings() {
-    // Regression: serde's default `u128` deserializer only invokes
-    // `visit_u128`, which the `config` crate's pipeline never emits
-    // (YAML integers come in as i64/u64; env vars come in as String).
-    // The `u128_any` deserializer must accept all three shapes so a
-    // YAML `cluster_id_hash: 1` doesn't panic gabiond at boot.
+    // Regression: a YAML integer, a decimal string and a hex string all
+    // reach the cluster id's parser, so `cluster_id_hash: 1` loads.
     let _env = EnvGuard::lock();
 
     let integer_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: 1\n")
         .expect("integer cluster_id_hash should deserialize");
-    assert_eq!(integer_cfg.gossip.cluster_id_hash, 1);
+    assert_eq!(integer_cfg.settings.cluster_id_hash.get(), 1);
 
     let decimal_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: \"42\"\n")
         .expect("decimal-string cluster_id_hash should deserialize");
-    assert_eq!(decimal_cfg.gossip.cluster_id_hash, 42);
+    assert_eq!(decimal_cfg.settings.cluster_id_hash.get(), 42);
 
     let hex_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: \"0xff\"\n")
         .expect("hex-string cluster_id_hash should deserialize");
-    assert_eq!(hex_cfg.gossip.cluster_id_hash, 0xff);
+    assert_eq!(hex_cfg.settings.cluster_id_hash.get(), 0xff);
 
     // Above-u64 values must round-trip when expressed as a hex string —
     // YAML's integer scalar can't hold a u128 max anyway, but the env-
@@ -374,7 +456,7 @@ fn cluster_id_hash_accepts_integer_decimal_and_hex_strings() {
         "gossip:\n  cluster_id_hash: \"0xffffffffffffffffffffffffffffffff\"\n",
     )
     .expect("u128 max hex string should deserialize");
-    assert_eq!(big_cfg.gossip.cluster_id_hash, u128::MAX);
+    assert_eq!(big_cfg.settings.cluster_id_hash.get(), u128::MAX);
 }
 
 #[test]
@@ -395,15 +477,12 @@ fn cluster_id_hash_rejects_zero() {
 
 #[test]
 fn cluster_id_hash_from_env_var() {
-    // The env layer always presents the value as a String. The
-    // u128_any deserializer's visit_str branch is what the env path
-    // ultimately exercises; this test pins that behaviour so a
-    // future refactor of the env→Value pipeline can't regress it.
+    // The env layer always presents the value as a string.
     let _env = EnvGuard::lock();
     set_env("GABION_GOSSIP_CLUSTER_ID_HASH", "0xdeadbeef");
 
     let cfg = AppConfig::load(None).expect("env-only cluster_id_hash should deserialize");
-    assert_eq!(cfg.gossip.cluster_id_hash, 0xdeadbeef);
+    assert_eq!(cfg.settings.cluster_id_hash.get(), 0xdeadbeef);
 }
 
 #[test]

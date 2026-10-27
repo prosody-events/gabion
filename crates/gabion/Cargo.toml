@@ -10,7 +10,6 @@ license.workspace = true
 # the wasm build entirely.
 ahash = { workspace = true, optional = true }
 async-stream.workspace = true
-bon.workspace = true
 educe.workspace = true
 either.workspace = true
 futures.workspace = true
@@ -19,7 +18,6 @@ hmac.workspace = true
 humantime.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
-serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

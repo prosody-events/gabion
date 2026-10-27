@@ -74,17 +74,3 @@ fn find_query_arg_mock<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     }
     None
 }
-
-use crate::shm::ShmRegion;
-
-#[allow(dead_code)]
-pub(crate) fn ctx<'a>(rules: &'a CompiledRules, region: &'a ShmRegion) -> AccessCtx<'a> {
-    AccessCtx {
-        rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
-    }
-}

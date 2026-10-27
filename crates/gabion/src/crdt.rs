@@ -51,6 +51,9 @@ use dirty_ring::ring_entry_at;
 use hash::hash_compact_cell_key;
 use index::CellIndex;
 
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
+
+use crate::rules::CardinalityLimits;
 use crate::settings::Setting;
 use crate::throttle;
 
@@ -242,28 +245,18 @@ pub struct CellStoreStats {
 // CellStore
 // ---------------------------------------------------------------------------
 
-/// Construction-time configuration.
+/// Construction-time configuration, built only by
+/// [`crate::settings::Settings::validate`], so every capacity is in range.
 #[derive(Clone, Copy, Debug)]
-pub struct CellStoreConfig {
-    pub cell_capacity: u32,
-    pub rule_dictionary_capacity: u16,
-    pub node_dictionary_capacity: u16,
-    pub local_dirty_capacity: usize,
-    pub forwarded_dirty_capacity: usize,
-    pub peer_capacity: u16,
-}
-
-impl Default for CellStoreConfig {
-    fn default() -> Self {
-        Self {
-            cell_capacity: 256,
-            rule_dictionary_capacity: 32,
-            node_dictionary_capacity: 32,
-            local_dirty_capacity: 64,
-            forwarded_dirty_capacity: 64,
-            peer_capacity: 16,
-        }
-    }
+pub struct ValidStorageConfig {
+    pub(crate) cell_capacity: NonZeroU32,
+    pub(crate) rule_dictionary_capacity: NonZeroU16,
+    pub(crate) node_dictionary_capacity: NonZeroU16,
+    pub(crate) local_dirty_capacity: NonZeroUsize,
+    pub(crate) forwarded_dirty_capacity: NonZeroUsize,
+    pub(crate) peer_capacity: NonZeroU16,
+    /// The per-request descriptor limits both adapters' admission enforces.
+    pub cardinality: CardinalityLimits,
 }
 
 /// Single global structure-of-arrays cell store.
@@ -349,18 +342,10 @@ enum UpsertMode<C: Count> {
 }
 
 impl<C: Count> CellStore<C> {
-    pub fn new(config: CellStoreConfig, local_identity: NodeIdentity) -> Self {
-        assert!(config.cell_capacity > 0, "cell capacity must be > 0");
-        assert!(
-            config.rule_dictionary_capacity > 0,
-            "rule dictionary capacity must be > 0"
-        );
-        assert!(
-            config.node_dictionary_capacity > 0,
-            "node dictionary capacity must be > 0"
-        );
-
-        let cap = config.cell_capacity;
+    pub fn new(config: ValidStorageConfig, local_identity: NodeIdentity) -> Self {
+        let cap = config.cell_capacity.get();
+        let rule_capacity = usize::from(config.rule_dictionary_capacity.get());
+        let node_capacity = config.node_dictionary_capacity.get();
         let index_cap = pow2_index_capacity_for(cap);
 
         // Build the intrusive freelist: 0 -> 1 -> 2 -> ... -> cap-1 -> NO_FREE
@@ -372,7 +357,7 @@ impl<C: Count> CellStore<C> {
         let mut node_dictionary = NodeDictionary::with_capacity(config.node_dictionary_capacity);
         let local_node_slot = node_dictionary
             .intern(local_identity.node_id, local_identity.incarnation)
-            .expect("node dictionary capacity > 0");
+            .expect("a fresh dictionary with a non-zero capacity has a free slot");
         // Pin the local slot so it cannot be freed via dec_ref.
         node_dictionary.inc_ref(local_node_slot);
 
@@ -395,28 +380,22 @@ impl<C: Count> CellStore<C> {
 
             index: CellIndex::with_capacity(index_cap),
 
-            local_dirty: DirtyRing::with_capacity(config.local_dirty_capacity),
-            forwarded_dirty: DirtyRing::with_capacity(config.forwarded_dirty_capacity),
+            local_dirty: DirtyRing::with_capacity(config.local_dirty_capacity.get()),
+            forwarded_dirty: DirtyRing::with_capacity(config.forwarded_dirty_capacity.get()),
             repair_cursor: 0,
 
             selection_marks: vec![0_u32; cap as usize].into_boxed_slice(),
             selection_epoch: 0,
 
-            next_sequence_by_origin: vec![0_u64; config.node_dictionary_capacity as usize]
-                .into_boxed_slice(),
+            next_sequence_by_origin: vec![0_u64; usize::from(node_capacity)].into_boxed_slice(),
 
-            expire_current_epoch_scratch: vec![0_u32; config.rule_dictionary_capacity as usize]
-                .into_boxed_slice(),
-            expire_live_buckets_scratch: vec![0_u32; config.rule_dictionary_capacity as usize]
-                .into_boxed_slice(),
+            expire_current_epoch_scratch: vec![0_u32; rule_capacity].into_boxed_slice(),
+            expire_live_buckets_scratch: vec![0_u32; rule_capacity].into_boxed_slice(),
 
             rule_dictionary: RuleDictionary::with_capacity(config.rule_dictionary_capacity),
             node_dictionary,
 
-            peer_frontiers: PeerFrontierTable::new(
-                config.peer_capacity,
-                config.node_dictionary_capacity,
-            ),
+            peer_frontiers: PeerFrontierTable::new(config.peer_capacity.get(), node_capacity),
 
             local_identity,
             local_node_slot,

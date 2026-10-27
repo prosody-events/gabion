@@ -1,5 +1,7 @@
 //! Rule and node identity dictionaries.
 
+use std::num::NonZeroU16;
+
 use super::hash::{hash_fingerprint, hash_node_identity};
 use super::index::CellIndex;
 use super::{BucketEpoch, Incarnation, NodeId, NodeSlot, RuleSlot};
@@ -94,11 +96,11 @@ pub struct RuleDictionary {
 }
 
 impl RuleDictionary {
-    pub fn with_capacity(capacity: u16) -> Self {
-        assert!(capacity > 0, "RuleDictionary capacity must be > 0");
-        assert!(
+    pub fn with_capacity(capacity: NonZeroU16) -> Self {
+        let capacity = capacity.get();
+        debug_assert!(
             capacity < EMPTY_DICT_SLOT,
-            "RuleDictionary capacity must be < u16::MAX"
+            "`Settings::validate` bounds RuleDictionary capacity below u16::MAX"
         );
         let index_cap = pow2_index_capacity_for(capacity as u32);
         let mut free_next = vec![EMPTY_DICT_SLOT; capacity as usize].into_boxed_slice();
@@ -220,11 +222,11 @@ pub struct NodeDictionary {
 }
 
 impl NodeDictionary {
-    pub fn with_capacity(capacity: u16) -> Self {
-        assert!(capacity > 0, "NodeDictionary capacity must be > 0");
-        assert!(
+    pub fn with_capacity(capacity: NonZeroU16) -> Self {
+        let capacity = capacity.get();
+        debug_assert!(
             capacity < EMPTY_DICT_SLOT,
-            "NodeDictionary capacity must be < u16::MAX"
+            "`Settings::validate` bounds NodeDictionary capacity below u16::MAX"
         );
         let index_cap = pow2_index_capacity_for(capacity as u32);
         let mut free_next = vec![EMPTY_DICT_SLOT; capacity as usize].into_boxed_slice();

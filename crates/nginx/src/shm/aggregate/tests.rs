@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
 use gabion::crdt::{
-    CellStore, CellStoreConfig, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch,
-    RuleDescriptor,
+    CellStore, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch, RuleDescriptor,
 };
 
 use super::*;
@@ -113,7 +112,7 @@ fn churn_keeps_cells_findable_and_frees_every_slot() {
 /// from gossip and `store` applies the resulting delta.
 fn lead(store: &ShmAggregateStore, incarnation: u32) -> CellStore<u32> {
     let identity = NodeIdentity::new(NodeId(1), incarnation);
-    let mut cells = CellStore::new(CellStoreConfig::default(), identity);
+    let mut cells = CellStore::new(crate::mock::validated(|_| {}).1, identity);
     let rule = RuleDescriptor {
         fingerprint: 0x42,
         local_rule_id: 0,

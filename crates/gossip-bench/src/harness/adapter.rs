@@ -15,16 +15,16 @@ use ahash::AHashMap;
 use anyhow::{Result, bail};
 pub use gabion::crdt::BucketEpoch;
 use gabion::crdt::{
-    CellStore, CellStoreConfig, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
-    RuleDescriptor,
+    CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity, RuleDescriptor,
+    ValidStorageConfig,
 };
 use gabion::defaults as d;
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipError, GossipRuntime,
-    GossipTransport, Ticker,
+    GossipTransport, Ticker, ValidGossipConfig,
 };
 use gabion::rules::{Descriptor, DescriptorPattern, EnforcementMode, Rule, hash_key};
-use gabion_server::config::GossipSettings;
+use gabion::settings::Settings;
 use tokio::sync::{mpsc, oneshot};
 
 use super::driver::Counters;
@@ -265,7 +265,8 @@ pub struct Launcher {
     world: Rc<World>,
     keys: Rc<KeySpace>,
     identity: Rc<Identity>,
-    cells: CellStoreConfig,
+    gossip: ValidGossipConfig,
+    cells: ValidStorageConfig,
     seed: u64,
 }
 
@@ -276,7 +277,7 @@ impl Launcher {
         world: &Rc<World>,
         keys: &Rc<KeySpace>,
         seed: u64,
-    ) -> Self {
+    ) -> Result<Self> {
         // Never below production; above it, keep the production ratio of the
         // ring to the cell store (`STORAGE_*_DIRTY_CAPACITY` over
         // `STORAGE_MAX_CELLS`).
@@ -285,23 +286,26 @@ impl Launcher {
                 .max((sizing.cell_capacity as usize * production).div_ceil(d::STORAGE_MAX_CELLS))
         };
         let fit = |floor: u16, n: usize| floor.max((n + 16).min(u16::MAX as usize) as u16);
-        Self {
+        // The production settings, with the store sized for the regime,
+        // validated once as `gabiond` validates them.
+        let settings = Settings {
+            max_cells: sizing.cell_capacity.try_into()?,
+            node_dictionary_capacity: fit(d::STORAGE_NODE_DICTIONARY_CAPACITY, sizing.total_nodes)
+                .try_into()?,
+            local_dirty_capacity: ring(d::STORAGE_LOCAL_DIRTY_CAPACITY).try_into()?,
+            forwarded_dirty_capacity: ring(d::STORAGE_FORWARDED_DIRTY_CAPACITY).try_into()?,
+            peer_capacity: fit(d::STORAGE_PEER_CAPACITY, sizing.max_running_nodes).try_into()?,
+            ..Settings::default()
+        };
+        let (gossip, cells) = settings.validate()?;
+        Ok(Self {
             world: Rc::clone(world),
             keys: Rc::clone(keys),
             identity: Rc::new(Identity::build(regime, keys.len())),
-            cells: CellStoreConfig {
-                cell_capacity: sizing.cell_capacity,
-                rule_dictionary_capacity: d::STORAGE_RULE_DICTIONARY_CAPACITY,
-                node_dictionary_capacity: fit(
-                    d::STORAGE_NODE_DICTIONARY_CAPACITY,
-                    sizing.total_nodes,
-                ),
-                local_dirty_capacity: ring(d::STORAGE_LOCAL_DIRTY_CAPACITY),
-                forwarded_dirty_capacity: ring(d::STORAGE_FORWARDED_DIRTY_CAPACITY),
-                peer_capacity: fit(d::STORAGE_PEER_CAPACITY, sizing.max_running_nodes),
-            },
+            gossip,
+            cells,
             seed,
-        }
+        })
     }
 
     /// Start node `idx` on its own [`SimSocket`].
@@ -328,8 +332,8 @@ impl Launcher {
     ) -> Result<Launched<impl Future<Output = Result<(), GossipError>> + use<T>>> {
         let id = (u128::from(mix64(idx as u64 ^ 0x6761_6269_6f6e)) << 64) | idx as u128 | 1 << 63;
         let identity = NodeIdentity::new(NodeId(id), 1);
-        let rng_seed = Rng::stream(self.seed, Stream::Gossip, idx as u64).next_u64();
-        let config = GossipSettings::default().into_runtime_config(identity, rng_seed);
+        let mut config = self.gossip.clone();
+        config.rng_seed = Rng::stream(self.seed, Stream::Gossip, idx as u64).next_u64();
         let mut cell_store = CellStore::<u32>::new(self.cells, identity);
         if cell_store.intern_rule(self.identity.rule).is_none() {
             bail!("node {idx}: the cell store refused to register the regime's rule");

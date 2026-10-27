@@ -104,3 +104,17 @@ Message starts: "Kubernetes auto-discovery is up but no Service in the watched n
 **What to do next.** Rename the Service port to `name: gabion` with `protocol: UDP` and re-apply the manifest (see the [Kubernetes checklist](../../README.md#kubernetes-checklist)). Also check `discovery.namespace_allow` and `discovery.service_allow` (NGINX `gabion_discovery_namespace_allow`, `gabion_discovery_service_allow`).
 
 **Fields** `watched_namespaces`, `gabion_port_name` · **Knob** the Service's port `name` and `protocol`
+
+### `discovery_error`
+
+**Level** warn, power of two · **Request allowed** yes, the peer list may be stale · **Emitted by** library (both adapters)
+
+Message starts: "Peer discovery hit an error and skipped an update"
+
+**What happened.** The Kubernetes discovery stream returned an error, so gabion skipped that update and kept the peer list it had. It keeps retrying; until an update succeeds, peers that joined or left since are not reflected, and gossip to a missing peer under-counts what it handled.
+
+**Why.** Usually transient: the API server restarted or a watch was reset. If it keeps repeating, the pod cannot reach the API or lacks RBAC access to Services and EndpointSlices.
+
+**What to do next.** If it repeats, check API access (the Role in the [Kubernetes checklist](../../README.md#kubernetes-checklist)) and the discovery settings: `discovery.namespace_allow`, `discovery.service_allow`, `discovery.self_addr` in `gabiond`, `gabion_discovery_*` in NGINX.
+
+**Fields** `error`, `errors_total` · **Knob** `discovery.*` / `gabion_discovery_*`

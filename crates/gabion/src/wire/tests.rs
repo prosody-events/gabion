@@ -1,11 +1,12 @@
 //! End-to-end wire codec tests.
 
+use crate::settings::mock::storage;
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 
 use crate::crdt::{
-    BucketEpoch, CellHandle, CellStore, CellStoreConfig, Count, DeltaSink, Incarnation, KeyHash,
-    NodeId, NodeIdentity, Observation, ObservationBatch,
+    BucketEpoch, CellHandle, CellStore, Count, DeltaSink, Incarnation, KeyHash, NodeId,
+    NodeIdentity, Observation, ObservationBatch,
 };
 
 use super::{
@@ -71,14 +72,7 @@ fn sample_header() -> Header {
 
 fn store_with_cap<C: Count>(cells: u32, dicts: u16) -> CellStore<C> {
     CellStore::<C>::new(
-        CellStoreConfig {
-            cell_capacity: cells.max(1),
-            rule_dictionary_capacity: dicts.max(1),
-            node_dictionary_capacity: dicts.max(1),
-            local_dirty_capacity: 128,
-            forwarded_dirty_capacity: 128,
-            peer_capacity: 64,
-        },
+        storage(cells.max(1), dicts.max(1), dicts.max(1), 128, 128, 64),
         local_identity(),
     )
 }
@@ -332,14 +326,7 @@ fn tampering_rejects(rows: Rows, byte_idx: usize) -> bool {
 /// 255-slot node-dict cap forces a packet split.
 fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
     let mut store = CellStore::<u32>::new(
-        CellStoreConfig {
-            cell_capacity: n.max(1) * 2,
-            rule_dictionary_capacity: 4,
-            node_dictionary_capacity: ((n as u16) + 8).max(2),
-            local_dirty_capacity: 256,
-            forwarded_dirty_capacity: 256,
-            peer_capacity: 64,
-        },
+        storage(n.max(1) * 2, 4, ((n as u16) + 8).max(2), 256, 256, 64),
         local_identity(),
     );
     let mut obs = ObservationBatch::<u32>::with_capacity(n as usize);

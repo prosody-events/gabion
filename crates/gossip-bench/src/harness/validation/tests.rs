@@ -419,7 +419,7 @@ fn byte_totals_equal_an_independent_tally_on_a_real_run() {
     let sizing = node::Sizing::new(&regime, &plan, &keys);
     let world = Rc::new(driver::world_for(&regime, seed, &plan));
     let tally = Rc::new(Tally::default());
-    let launcher = Launcher::new(&regime, &sizing, &world, &keys, seed);
+    let launcher = Launcher::new(&regime, &sizing, &world, &keys, seed).expect("launcher");
     let launch = {
         let world = Rc::clone(&world);
         let tally = Rc::clone(&tally);

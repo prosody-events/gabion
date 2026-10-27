@@ -295,7 +295,8 @@ production sizes (`STORAGE_LOCAL_DIRTY_CAPACITY`,
 `STORAGE_MAX_CELLS`, the production ratio to it, never less; node and peer
 dictionaries at the production defaults or the regime's pod count + 16,
 whichever is larger. Gossip settings are the production defaults
-(`GossipSettings::default()` in `gabion-server`); the adapter builds them.
+(`Settings::default()` in `gabion::settings`); the adapter validates them
+once, as `gabiond` does.
 
 ## Metrics
 

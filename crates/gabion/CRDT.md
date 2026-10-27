@@ -800,18 +800,18 @@ This trait is the only place width matters, and everywhere else the store is col
 
 ### 4.5 Defaults and the production tunables
 
-The cell store carries its own construction-time defaults (`CellStoreConfig::default()`) that are deliberately small — the type exists to keep unit tests cheap and to make the construction surface explicit. The deployed adapters use the larger constants from `gabion::defaults` instead.
+The cell store takes a `ValidStorageConfig`, which only `Settings::validate` (`gabion::settings`) builds, so a zero or out-of-range capacity fails configuration load instead of reaching `CellStore::new`. Its fields default to the production constants:
 
-| Knob                                    | `CellStoreConfig::default()` | `gabion::defaults`                     |
-|-----------------------------------------|------------------------------|----------------------------------------|
-| `cell_capacity`                         | 256                          | `STORAGE_MAX_CELLS` = 131,072          |
-| `rule_dictionary_capacity`              | 32                           | `STORAGE_RULE_DICTIONARY_CAPACITY` = 64|
-| `node_dictionary_capacity`              | 32                           | `STORAGE_NODE_DICTIONARY_CAPACITY` = 1,024 |
-| `local_dirty_capacity`                  | 64                           | `STORAGE_LOCAL_DIRTY_CAPACITY` = 65,536 |
-| `forwarded_dirty_capacity`              | 64                           | `STORAGE_FORWARDED_DIRTY_CAPACITY` = 524,288 |
-| `peer_capacity`                         | 16                           | `STORAGE_PEER_CAPACITY` = 256          |
+| Knob                                    | Setting                              | `gabion::defaults`                     |
+|-----------------------------------------|--------------------------------------|----------------------------------------|
+| `cell_capacity`                         | `storage.max_cells`                  | `STORAGE_MAX_CELLS` = 131,072          |
+| `rule_dictionary_capacity`              | `storage.rule_dictionary_capacity`   | `STORAGE_RULE_DICTIONARY_CAPACITY` = 64|
+| `node_dictionary_capacity`              | `storage.node_dictionary_capacity`   | `STORAGE_NODE_DICTIONARY_CAPACITY` = 1,024 |
+| `local_dirty_capacity`                  | `storage.local_dirty_capacity`       | `STORAGE_LOCAL_DIRTY_CAPACITY` = 65,536 |
+| `forwarded_dirty_capacity`              | `storage.forwarded_dirty_capacity`   | `STORAGE_FORWARDED_DIRTY_CAPACITY` = 524,288 |
+| `peer_capacity`                         | `storage.peer_capacity`              | `STORAGE_PEER_CAPACITY` = 256          |
 
-`gabion::defaults` is the canonical home for the production tunables; both adapters (`gabion-server`, `gabion-nginx`) read them. Each is exposed as an operator-visible config key — touching any of them is an operator decision, not a library-level one.
+`gabion::defaults` is the canonical home for the production tunables, and `gabion::settings` the one table both adapters (`gabion-server`, `gabion-nginx`) parse and validate them through. Each is an operator-visible setting — touching any of them is an operator decision, not a library-level one.
 
 ---
 

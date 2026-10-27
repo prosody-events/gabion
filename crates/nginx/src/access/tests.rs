@@ -34,7 +34,7 @@ fn allow_on_empty_aggregate() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0], &vars, 1_000);
@@ -74,7 +74,7 @@ fn reject_when_window_total_exceeds_limit() {
         queue: region.queue(),
         stats: region.stats(),
         domain,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0], &vars, 1_000);
@@ -121,7 +121,7 @@ fn reject_delta_reflects_oldest_non_empty_bucket() {
         queue: region.queue(),
         stats: region.stats(),
         domain,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0], &vars, 1_000);
@@ -144,7 +144,7 @@ fn decline_when_variable_missing() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new(); // no http_x_tenant set
     let outcome = decide_all(ctx, &[0], &vars, 1_000);
@@ -161,11 +161,11 @@ fn cardinality_settings_reject_oversized_descriptors() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings {
-            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
-            max_descriptor_bytes: crate::rules::DEFAULT_DOMAIN.len() + "tenant".len(),
-            max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
-        },
+        cardinality: crate::mock::limits(|s| {
+            s.max_descriptor_bytes = (crate::rules::DEFAULT_DOMAIN.len() + "tenant".len())
+                .try_into()
+                .unwrap();
+        }),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
 
@@ -174,18 +174,39 @@ fn cardinality_settings_reject_oversized_descriptors() {
     assert!(matches!(outcome, AccessOutcome::Cardinality));
 }
 
+/// NGINX rejects exactly the requests the library's one cardinality check
+/// flags, on both sides of the byte budget.
 #[test]
-fn default_cardinality_settings_match_shared_defaults() {
-    let settings = CardinalitySettings::default();
-    assert_eq!(
-        settings.max_descriptor_count,
-        defaults::STORAGE_MAX_DESCRIPTOR_COUNT
-    );
-    assert_eq!(
-        settings.max_descriptor_bytes,
-        defaults::STORAGE_MAX_DESCRIPTOR_BYTES
-    );
-    assert_eq!(settings.max_key_bytes, defaults::STORAGE_MAX_KEY_BYTES);
+fn one_cardinality_check_for_both_adapters() {
+    const BUDGET: usize = 32;
+    let domain = crate::rules::DEFAULT_DOMAIN;
+    let limits = crate::mock::limits(|s| s.max_descriptor_bytes = BUDGET.try_into().unwrap());
+    let rules = build_rules();
+    let flagged: Vec<bool> = [BUDGET - 1, BUDGET, BUDGET + 1]
+        .into_iter()
+        .map(|bytes| {
+            let (_buf, region) = TestZone::new(8, 16);
+            let ctx = AccessCtx {
+                rules: &rules,
+                aggregate: region.aggregate(),
+                queue: region.queue(),
+                stats: region.stats(),
+                domain,
+                cardinality: limits,
+            };
+            let value = "v".repeat(bytes - domain.len() - "tenant".len());
+            let entry = Descriptor {
+                key: "tenant",
+                value: &value,
+            };
+            let flagged = limits.exceeded(domain, &[entry]).is_some();
+            let vars = MockVars::new().set("http_x_tenant", &value);
+            let rejected = decide_all(ctx, &[0], &vars, 1_000) == AccessOutcome::Cardinality;
+            assert_eq!(rejected, flagged, "{bytes} bytes");
+            flagged
+        })
+        .collect();
+    assert_eq!(flagged, [false, false, true]);
 }
 
 #[test]
@@ -198,7 +219,7 @@ fn invalid_utf8_descriptor_declines_and_bumps_counter() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     // `0xFF` is never a valid UTF-8 lead byte — guaranteed decline.
     let vars = MockVars::new().set_bytes("http_x_tenant", &[0xFFu8, 0xFE, 0xFD]);
@@ -226,7 +247,7 @@ fn disabled_rule_declines_before_any_check() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let over_budget = "a".repeat(defaults::STORAGE_MAX_DESCRIPTOR_BYTES);
     // In the order the checks run last to first, so a disabled check moved
@@ -300,7 +321,7 @@ fn except_truthy_skips_rule() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
@@ -328,7 +349,7 @@ fn except_falsy_applies_rule() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
@@ -350,7 +371,7 @@ fn except_missing_applies_rule() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     // `trusted` is not set — the predicate variable resolves to None;
     // per allow-by-default and the documented semantic, the rule still
@@ -374,7 +395,7 @@ fn except_empty_applies_rule() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
@@ -425,7 +446,7 @@ fn decide_all_allow_when_all_pass() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
@@ -448,7 +469,7 @@ fn decide_all_decline_when_all_decline() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     // No variable set — every rule declines.
     let vars = MockVars::new();
@@ -482,7 +503,7 @@ fn decide_all_picks_longest_window() {
         queue: region.queue(),
         stats: region.stats(),
         domain,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
@@ -535,7 +556,7 @@ fn decide_all_one_declines_one_allows() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
@@ -580,7 +601,7 @@ fn dry_run_records_but_never_rejects() {
         queue: region.queue(),
         stats: region.stats(),
         domain,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     // DryRun: over the limit but never rejects.
@@ -637,10 +658,7 @@ fn decide_all_one_rule_cardinality_others_still_evaluate() {
         queue: region.queue(),
         stats: region.stats(),
         domain,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: budget,
-            ..CardinalitySettings::default()
-        },
+        cardinality: crate::mock::limits(|s| s.max_descriptor_bytes = budget.try_into().unwrap()),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
@@ -668,10 +686,9 @@ fn decide_all_all_rules_cardinality_returns_cardinality() {
         queue: region.queue(),
         stats: region.stats(),
         domain,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: domain.len() + 1,
-            ..CardinalitySettings::default()
-        },
+        cardinality: crate::mock::limits(|s| {
+            s.max_descriptor_bytes = (domain.len() + 1).try_into().unwrap()
+        }),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
@@ -718,10 +735,9 @@ fn decide_all_mixed_decline_and_cardinality_returns_cardinality() {
         queue: region.queue(),
         stats: region.stats(),
         domain,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: domain.len() + 1,
-            ..CardinalitySettings::default()
-        },
+        cardinality: crate::mock::limits(|s| {
+            s.max_descriptor_bytes = (domain.len() + 1).try_into().unwrap()
+        }),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
@@ -775,7 +791,7 @@ fn decide_all_one_rule_exempt_one_rejects() {
         queue: region.queue(),
         stats: region.stats(),
         domain,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
@@ -800,10 +816,9 @@ fn cardinality_skip_does_not_push_queue_event() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: crate::rules::DEFAULT_DOMAIN.len() + 1,
-            ..CardinalitySettings::default()
-        },
+        cardinality: crate::mock::limits(|s| {
+            s.max_descriptor_bytes = (crate::rules::DEFAULT_DOMAIN.len() + 1).try_into().unwrap()
+        }),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0], &vars, 0);
@@ -823,10 +838,7 @@ fn except_does_not_count_cardinality() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings {
-            max_descriptor_bytes: 1,
-            ..CardinalitySettings::default()
-        },
+        cardinality: crate::mock::limits(|s| s.max_descriptor_bytes = 1.try_into().unwrap()),
     };
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
@@ -878,7 +890,7 @@ fn per_rule_exempt_counter_bumps_only_target_rule() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     // Rule a exempts (truthy); rule b applies (falsy predicate).
     let vars = MockVars::new()
@@ -937,7 +949,7 @@ fn allow_info_picks_min_remaining_across_rules() {
         queue: region.queue(),
         stats: region.stats(),
         domain,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
@@ -965,7 +977,7 @@ fn allow_info_tie_break_prefers_longer_window() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0, 1], &vars, 0);
@@ -1008,7 +1020,7 @@ fn allow_info_under_limit_dry_run_emits_positive_remaining() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: CardinalitySettings::default(),
+        cardinality: crate::mock::limits(|_| {}),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide_all(ctx, &[0], &vars, 0);

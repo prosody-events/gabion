@@ -72,17 +72,24 @@ per-pod env vars, which is the shape gabiond is built for.
 │   /etc/gabion/config.yaml. Full schema including rules.     │
 ├─────────────────────────────────────────────────────────────┤
 │ Built-in defaults                                           │
-│   `gabion::defaults` + per-struct `Default` impls.          │
+│   `Settings::default()` in `gabion::settings`.              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Every overridable field has exactly one `GABION_*` env var; see
-`ENV_BINDINGS` in `crates/server/src/config.rs` for the full table.
-Comma-separated values feed list fields, as in
-`GABION_DISCOVERY_NAMESPACE_ALLOW=ns-a,ns-b`. Structured lists such as
-the `limits:` block, along with anything that contains nested
-durations, live in YAML only because flat env vars cannot express
-them.
+Every setting has exactly one `GABION_*` env var, named in the one
+settings table both adapters share (`Setting` in `gabion::settings`,
+which also gives each setting's NGINX directive). Comma-separated values
+feed list settings, as in `GABION_DISCOVERY_NAMESPACE_ALLOW=ns-a,ns-b`;
+in YAML a list setting is a sequence (`namespace_allow: ["ns-a"]`), not a
+bare string. Structured lists such as the `limits:` block, along with
+anything that contains nested durations, live in YAML only because flat
+env vars cannot express them.
+
+gabiond parses and validates every value once, at startup, before it
+binds a socket: a zero count, a malformed value, an out-of-range value
+or a YAML key the table and the `limits:` fields do not know (a typo, or
+a key a release removed) stops startup with a message that names the
+setting in both spellings. See [Troubleshooting](#troubleshooting).
 
 ## Glossary
 
@@ -278,6 +285,13 @@ the entries below are `gabiond`'s own.
 | `` rule `X` has an invalid `rate:` value: …. ``                                                                                | The `rate:` string didn't parse, its count is zero, or its period is under 1 ms.                      | Write a count of at least 1 and a period of at least 1 ms: a unit (`s`, `m`, `h`, `d`) or a duration such as `500ms` or `5m`. A zero rate is refused because it would deny all traffic. |
 | `` rule `X`: the window is shorter than the rate's period, so the rate cannot be spread over it. … for example `100r/500ms` ``   | An explicit `window:` was shorter than the rate's period; a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
 | `` rule `X` descriptor key `Y` must match `[A-Za-z_][A-Za-z0-9_.-]*` ``                                                        | A descriptor key uses an unsupported character.                                                        | Use identifier-like names. Underscore, dot, and dash are allowed inside; the first character must be a letter or underscore.  |
+| `` The configuration file sets `X`, which gabiond does not know. … ``                                                            | The YAML sets a key that is not a setting or a field of a `limits:` entry: a typo, or a key this release removed or renamed. | Correct or delete the key; the release notes name each removed key's replacement.                                             |
+| `` `X` is 0, but it must be at least 1: … ``                                                                                    | A count, capacity or duration was set to 0, which would disable what it sizes.                         | Remove the setting to use the default the message names, or set a positive value.                                             |
+| `` `X` is `V`, which is not …, for example `E`. … ``                                                                            | The value does not parse as the setting's type (an integer in range, a duration in whole milliseconds such as `500ms`, a socket address, a Kubernetes name). | Write it like the example, or remove it to use the default.                                                                   |
+| `` `X` is N; gabion supports MIN to MAX. … ``                                                                                   | A capacity is outside the range gabion can hold; the message gives the reason.                         | Set it inside the range, or remove it to use the default.                                                                     |
+| `The gossip packet size is N bytes, but gabion needs between 152 and 65507 …`                                                  | `gossip.max_payload_bytes` is too small for one counter or larger than the largest UDP payload.        | Set it inside that range, and to the same value on every node.                                                                |
+| `The gossip error budget is N basis points, outside 1 to 10000 …`                                                               | `gossip.target_err_bps` is 0 or above 100 % of a rule's limit.                                         | Set it between 1 and 10000; the default, 100, is 1 % of each rule's limit.                                                    |
+| `` `gossip.min_emit_interval` … must be at least 1ms and shorter than `gossip.tick_interval` … ``                               | The gap between two sends is at or above the heartbeat, so every change would wait for the heartbeat.  | Set it below `gossip.tick_interval`, or remove it to use the default of 5ms.                                                  |
 | `gabiond cannot start: it has no gossip address to listen on …`                                                                | No bind address was supplied.                                                                          | Set `gossip.bind` in YAML or `GABION_GOSSIP_BIND` in env.                                                                     |
 | `` `GABION_X` contains bytes that are not valid UTF-8 ``                                                                       | A non-UTF-8 byte appeared in `GABION_X`.                                                               | Re-export the env var with a valid UTF-8 value.                                                                               |
 | `OVER_LIMIT` for every descriptor                                                                                              | The configured `rate:` is below sustained load.                                                        | Raise the rate, widen the window, or split the rule. Re-run with `mode: dry_run` while you measure.                           |
@@ -292,7 +306,7 @@ Message starts: "Rejecting requests that attach too many or too large rate-limit
 
 **Why.** Usually a misbehaving client or an attack trying to exhaust gabion's tracking memory; occasionally a legitimate client whose descriptors outgrew the defaults.
 
-**What to do next.** If the traffic is legitimate, raise the setting in `config_key` and restart: `storage.max_descriptor_count` (values above the build-time cap of 16 have no effect), `storage.max_descriptor_bytes` or `storage.max_key_bytes`. `request_descriptors` has no setting: it is the build-time constant `STORAGE_MAX_DESCRIPTOR_COUNT` (16), so have Envoy send fewer descriptors per request.
+**What to do next.** If the traffic is legitimate, raise the setting in `config_key` and restart: `storage.max_descriptor_count` (at most 16 for now; a larger value fails to load), `storage.max_descriptor_bytes` or `storage.max_key_bytes`. `request_descriptors` has no setting: it is the build-time constant `STORAGE_MAX_DESCRIPTOR_COUNT` (16), so have Envoy send fewer descriptors per request.
 
 **Fields** `domain`, `limit`, `max`, `rejected_total`, `config_key` (absent for `request_descriptors`) · **Knob** `storage.max_descriptor_count` (`GABION_STORAGE_MAX_DESCRIPTOR_COUNT`), `storage.max_descriptor_bytes` (`GABION_STORAGE_MAX_DESCRIPTOR_BYTES`), `storage.max_key_bytes` (`GABION_STORAGE_MAX_KEY_BYTES`)
 

@@ -12,10 +12,11 @@ use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tower::ServiceExt;
 
-use gabion::crdt::{CellStore, CellStoreConfig, NodeId, NodeIdentity};
+use gabion::crdt::{CellStore, NodeId, NodeIdentity};
 use gabion::gossip::sim::SimRouter;
-use gabion::gossip::{AdminCommand, GossipConfig, GossipRuntime, TokioClock};
+use gabion::gossip::{AdminCommand, GossipRuntime, TokioClock};
 use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleTable};
+use gabion::settings::Settings;
 
 use crate::admin::{AdminState, admin_channel, router};
 use crate::store::DashMapStore;
@@ -66,16 +67,17 @@ fn snapshot_returns_full_state_via_axum_route() {
         let bind_addr = next_addr();
         let transport = sim.bind(bind_addr);
         let identity = NodeIdentity::new(NodeId(0xBEEF_CAFE), 11);
-        let store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
+        let settings = Settings {
+            max_cells: 256.try_into().unwrap(),
+            rng_seed: Some(7),
+            ..Settings::default()
+        };
+        let (mut gossip_config, storage) = settings.validate().expect("settings validate");
+        let store = CellStore::<u32>::new(storage, identity);
         let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
 
         let bootstrap = next_addr();
-        let gossip_config = GossipConfig {
-            local_identity: identity,
-            bootstrap_peers: vec![bootstrap],
-            rng_seed: 7,
-            ..GossipConfig::default()
-        };
+        gossip_config.bootstrap_peers = vec![bootstrap];
 
         let (admin_tx, admin_rx) = admin_channel();
         let (rt, client) = GossipRuntime::from_parts_with_admin(

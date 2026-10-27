@@ -40,6 +40,10 @@ use crate::crdt::{CellHandle, CellStore, Count, Observation, ObservationBatch};
 
 use thiserror::Error;
 
+/// The smallest `max_payload_bytes` that holds one `u32` counter without
+/// HMAC: 152 bytes. HMAC adds 32 bytes, and a `u64` count 4 more.
+pub const MIN_PAYLOAD_BYTES: usize = min_payload_bytes(size_of::<u32>(), 0);
+
 /// Limits applied at frame boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameLimits {
@@ -154,7 +158,7 @@ impl AsRef<[u8]> for PacketBuf {
 /// packet has both dict lengths = 1, one rule fingerprint, one node id, and
 /// one cell row. Used by the constructors to reject undersized budgets up
 /// front rather than mid-stream.
-fn min_payload_bytes(count_size: usize, auth_overhead: usize) -> usize {
+const fn min_payload_bytes(count_size: usize, auth_overhead: usize) -> usize {
     HEADER_LEN
         + DICT_LEN_BYTES        // rule_dict_len + node_dict_len
         + 16                    // one rule fingerprint

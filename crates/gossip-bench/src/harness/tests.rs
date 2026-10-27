@@ -174,7 +174,7 @@ fn starved_run() -> StudyResult {
     let mut sizing = node::Sizing::new(&regime, &plan, &keys);
     sizing.cell_capacity = 64;
     let world = Rc::new(driver::world_for(&regime, seed, &plan));
-    let launcher = adapter::Launcher::new(&regime, &sizing, &world, &keys, seed);
+    let launcher = adapter::Launcher::new(&regime, &sizing, &world, &keys, seed).expect("launcher");
     driver::Driver::new(&regime, seed, plan, sizing, keys, world, move |idx| {
         launcher.launch(idx)
     })

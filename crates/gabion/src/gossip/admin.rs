@@ -9,9 +9,9 @@ use std::net::SocketAddr;
 
 use tokio::sync::oneshot;
 
-use super::{CellStoreStats, NodeId, NodeIdentity};
 #[cfg(feature = "cell-dump")]
 use crate::crdt::{BucketEpoch, Incarnation};
+use crate::crdt::{CellStoreStats, NodeId, NodeIdentity};
 
 /// Request sent into the gossip runtime over the admin channel. New shapes
 /// (e.g. forced repair) can be added without changing the `select!` arm.

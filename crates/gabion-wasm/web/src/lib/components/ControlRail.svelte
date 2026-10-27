@@ -140,7 +140,7 @@
     </div>
     <div class="knob" class:changed={changed.has('target_err_bps')}>
       <label for="knob-bps">Error budget<span class="val numeric">{knobs.target_err_bps} bps</span></label>
-      <input id="knob-bps" type="range" min="0" max="2000" step="50" bind:value={knobs.target_err_bps} />
+      <input id="knob-bps" type="range" min="50" max="2000" step="50" bind:value={knobs.target_err_bps} />
     </div>
     <div class="knob" class:changed={changed.has('uniform_loss')}>
       <label for="knob-loss">Packet loss<span class="val numeric">{lossPct}%</span></label>
