@@ -341,7 +341,7 @@ pub struct Health {
     /// Admin snapshots that could not be sent or were not answered after
     /// the cluster went quiescent.
     pub snapshot_failures: u64,
-    /// Nodes asked for a snapshot that never answered one, whose health
+    /// Nodes that started but never answered a snapshot, whose health
     /// counters are therefore unknown.
     pub nodes_never_snapshotted: u64,
     /// WARN and ERROR events gabion logged.

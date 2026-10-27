@@ -34,6 +34,8 @@ fn tiny_cluster_run_is_healthy_and_internally_consistent() {
     assert_eq!(result.health.snapshot_failures, 0);
     assert_eq!(result.health.nodes_never_snapshotted, 0);
     assert!(result.flags.is_empty(), "{:?}", result.flags);
+    let kinds: Vec<node::KeyKind> = result.accuracy.iter().map(|a| a.kind).collect();
+    assert_eq!(kinds, [node::KeyKind::Hot, node::KeyKind::Burst]);
 
     let net = result.network.run;
     assert!(net.packets_sent > 0);
@@ -137,6 +139,29 @@ fn rollout_joiners_start_out_of_phase() {
         regime.churn.rollouts[0].count as usize,
         "every joiner has its own tick phase"
     );
+}
+
+/// Replaying the plan's discovery leaves every surviving pod listing exactly
+/// the other survivors: each departure is announced as a removal.
+#[test]
+fn discovery_ends_listing_exactly_the_surviving_pods() {
+    let plan = plan::Plan::build(&fixtures::tiny(), 3);
+    let mut views = vec![std::collections::BTreeSet::new(); plan.nodes.len()];
+    for &(_, event) in &plan.events {
+        if let plan::PlanEvent::Discover { to, about, added } = event {
+            if added {
+                views[to].insert(about);
+            } else {
+                views[to].remove(&about);
+            }
+        }
+    }
+    let survivors = (0..plan.nodes.len()).filter(|&i| plan.nodes[i].stop.is_none());
+    for i in survivors.clone() {
+        let others: std::collections::BTreeSet<usize> =
+            survivors.clone().filter(|&j| j != i).collect();
+        assert_eq!(views[i], others, "pod {i}");
+    }
 }
 
 /// A tiny regime on cell stores far smaller than its keys need: every node

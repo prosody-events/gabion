@@ -46,8 +46,8 @@ pub struct Counters {
 /// One node's latest answered snapshot.
 #[derive(Clone, Copy, Default)]
 struct NodeHealth {
-    /// A snapshot was requested from this node.
-    asked: bool,
+    /// The node started, so it owes at least one answered snapshot.
+    started: bool,
     /// The node answered at least one snapshot.
     answered: bool,
     counters: Counters,
@@ -293,6 +293,7 @@ where
         let launched = launched?;
         self.tasks.spawn(v, launched.future);
         self.nodes[v] = Some(launched.node);
+        self.node_health[v].started = true;
         self.stores[v] = Some(launched.store);
         self.world.net.borrow_mut().set_running(now, v, true);
         if let Err(pos) = self.rotation.binary_search(&v) {
@@ -337,7 +338,6 @@ where
         let Some(node) = self.nodes[v].as_ref() else {
             return;
         };
-        self.node_health[v].asked = true;
         let Some(reply) = node.ask_health() else {
             self.health.snapshot_failures += 1;
             return;
@@ -349,7 +349,7 @@ where
         };
         self.health.peak_active_cells = self.health.peak_active_cells.max(counters.active_cells);
         self.node_health[v] = NodeHealth {
-            asked: true,
+            started: true,
             answered: true,
             counters,
         };
@@ -425,7 +425,7 @@ where
             self.health.rule_dictionary_full_rejects += c.rule_dictionary_full_rejects;
             self.health.node_dictionary_full_rejects += c.node_dictionary_full_rejects;
             self.health.decode_rejects += c.decode_rejects;
-            self.health.nodes_never_snapshotted += u64::from(h.asked && !h.answered);
+            self.health.nodes_never_snapshotted += u64::from(h.started && !h.answered);
         }
         self.health.gabion_warnings = self.warnings.report();
         let net = self.world.net.borrow();

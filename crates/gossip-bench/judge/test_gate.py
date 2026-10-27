@@ -92,14 +92,23 @@ class RuleTest(unittest.TestCase):
         self.assertOnly(failures(REGIMES, rows, passing()), "G-b3")
 
 
-class MissingArmTest(unittest.TestCase):
-    def test_a_missing_arm_is_named_without_a_traceback(self):
+class ExitTest(unittest.TestCase):
+    def gate(self, *arms: str) -> str:
+        """gate.py's stderr over empty directories for `arms`; it must exit 1 cleanly."""
         with tempfile.TemporaryDirectory() as tmp:
+            for arm in arms:
+                Path(tmp, arm).mkdir()
             proc = subprocess.run([sys.executable, str(Path(__file__).with_name("gate.py")), tmp,
                                    "--out", tmp], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("make sim-baselines", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
+        return proc.stderr
+
+    def test_a_missing_arm_is_named(self):
+        self.assertIn(f"{NOPK} is missing", self.gate(MAIN, ZONE))
+
+    def test_a_judge_refusal_is_reported(self):
+        self.assertIn("judge.py refused", self.gate(MAIN, NOPK, ZONE))
 
 
 class VerdictTest(unittest.TestCase):

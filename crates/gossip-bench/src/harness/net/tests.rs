@@ -66,6 +66,20 @@ fn latency_is_base_plus_bounded_jitter_and_cross_az_is_slower() {
     );
 }
 
+/// `jitter_max` is inclusive: a 1 ns jitter delivers at `base` and `base + 1`.
+#[test]
+fn the_largest_jitter_is_reachable() {
+    let config = NetworkConfig {
+        intra_az_base_ns: 10,
+        intra_az_jitter_max_ns: 1,
+        ..NetworkConfig::default()
+    };
+    let (mut net, _) = network(config, 6);
+    let seen: std::collections::BTreeSet<u64> =
+        latencies(&mut net, 0, 3, 100).into_iter().collect();
+    assert_eq!(seen, [10, 11].into());
+}
+
 #[test]
 fn bernoulli_loss_rate_is_within_four_sigma() {
     let p = 0.05;
