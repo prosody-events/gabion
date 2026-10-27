@@ -37,6 +37,11 @@ fn robin_hood_backshift_keeps_probe_bounded() {
         index.insert_unchecked(h, slot);
         occupants.push((h, slot));
     }
+    // Backshift must keep every survivor reachable, not just shorten probes.
+    assert_eq!(index.len() as usize, occupants.len());
+    for &(h, slot) in &occupants {
+        assert_eq!(index.find(h, |s| s == slot), Some(slot));
+    }
     let max_dist = max_probe_distance(&index);
     // Bound is generous: should be <= load * small constant. Cap log2 = 10,
     // and load factor is below 50%. Empirical worst case ~ a few dozen.

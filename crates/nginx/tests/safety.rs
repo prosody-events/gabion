@@ -27,7 +27,7 @@
 //! `r->variables` array nginx allocates per request.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
@@ -305,7 +305,7 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
         tenant: b"alice".to_vec(),
     };
 
-    // First two requests — limit is 2 — should be allowed.
+    // The first request is under the limit of 2, so it is allowed.
     assert!(matches!(
         decide_all(ctx, &[0], &vars, 0),
         AccessOutcome::Allow(_)
@@ -334,10 +334,9 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
         other => panic!("expected Reject after apply, got {other:?}"),
     }
 
-    // The queue should hold the original two hits plus this one.
+    // The allowed request queued one event; the rejected one queued none.
     let mut drained = [QueueEvent::default(); 4];
-    let n = region.queue().drain(&mut drained);
-    assert!(n >= 1, "queue should retain pushed events");
+    assert_eq!(region.queue().drain(&mut drained), 1);
 }
 
 // -- 4. Concurrent leader writer + worker readers --------------------------
@@ -611,12 +610,16 @@ fn decide_all_and_leader_apply_concurrent() {
                 domain: DEFAULT_DOMAIN,
                 cardinality: CardinalitySettings::default(),
             };
-            let _ = decide_all(ctx, &[0], &vars, 0);
+            assert!(matches!(
+                decide_all(ctx, &[0], &vars, 0),
+                AccessOutcome::Allow(_)
+            ));
         }
         worker_stop.store(true, Ordering::Release);
     });
 
-    // Leader thread continuously applies deltas until the worker stops.
+    // Leader thread applies a hit and its expiry until the worker stops, so
+    // the cell keeps appearing and vanishing but never reaches the limit.
     let leader_stop = stop.clone();
     let leader_rules = rules.clone();
     let leader = thread::spawn(move || {
@@ -628,10 +631,10 @@ fn decide_all_and_leader_apply_concurrent() {
         }];
         let spec = leader_rules.rules()[0].rule.spec();
         let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
+        let hit = [(key_hash, 0, 1)];
+        let (d, e) = deltas_and_expirations(&leader_rules.rules()[0].rule, &hit, &hit);
         let mut applied = 0_u32;
         while !leader_stop.load(Ordering::Acquire) {
-            let (d, e) =
-                deltas_and_expirations(&leader_rules.rules()[0].rule, &[(key_hash, 0, 1)], &[]);
             store.apply(&d, &e);
             applied += 1;
             if applied > 1_000 {
@@ -644,15 +647,22 @@ fn decide_all_and_leader_apply_concurrent() {
     worker.join().expect("worker joined");
     let _ = leader.join().expect("leader joined");
 
-    // Final read through the seqlock; must not panic.
-    let view = region.aggregate();
+    // Every allowed request queued one event, up to the queue's capacity.
+    let mut drained = [QueueEvent::default(); 32];
+    assert_eq!(region.queue().drain(&mut drained), ITERATIONS.min(32));
+    // Every hit the leader applied was expired again.
     let descriptors = [gabion::rules::Descriptor {
         key: "tenant",
         value: "alice",
     }];
     let spec = rules.rules()[0].rule.spec();
     let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
-    let _ = view.get(spec.fingerprint, key_hash.0, 0);
+    assert!(
+        region
+            .aggregate()
+            .get(spec.fingerprint, key_hash.0, 0)
+            .is_none()
+    );
 }
 
 // -- 8b. Multi-rule decide_all + leader apply running concurrently --------
@@ -727,7 +737,10 @@ fn decide_all_multi_rule_concurrent() {
                 domain: DEFAULT_DOMAIN,
                 cardinality: CardinalitySettings::default(),
             };
-            let _ = gabion_nginx::access::decide_all(ctx, &[0, 1], &vars, 0);
+            assert!(matches!(
+                decide_all(ctx, &[0, 1], &vars, 0),
+                AccessOutcome::Allow(_)
+            ));
         }
         worker_stop.store(true, Ordering::Release);
     });
@@ -759,40 +772,44 @@ fn decide_all_multi_rule_concurrent() {
     worker.join().expect("worker joined");
     let _ = leader.join().expect("leader joined");
 
-    let view = region.aggregate();
-    for compiled in rules.rules() {
-        let rule = &compiled.rule;
-        let descriptors = [gabion::rules::Descriptor {
-            key: &compiled.bindings[0].key,
-            value: "alice",
-        }];
-        let key_hash = hash_key(rule.id, DEFAULT_DOMAIN, &descriptors);
-        let _ = view.get(rule.fingerprint, key_hash.0, 0);
-    }
+    // Every allowed request queued one event per rule, up to the capacity.
+    let mut drained = [QueueEvent::default(); 32];
+    assert_eq!(region.queue().drain(&mut drained), (2 * ITERATIONS).min(32));
 }
 
 // -- 8. Concurrent lease contention: only one winner among many threads ---
 
 #[test]
 fn lease_concurrent_acquire_distinct_winners() {
-    use std::sync::Barrier;
+    // A lost-update race shows in well under 1% of rounds, so run many.
+    #[cfg(not(miri))]
+    const ROUNDS: u64 = 4096;
+    #[cfg(miri)]
+    const ROUNDS: u64 = 4;
+
     let (_zone, region) = build_zone(8, 16);
-    let barrier = std::sync::Arc::new(Barrier::new(4));
-    let mut handles = Vec::new();
-    let winners = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    for worker in 1..=4_u32 {
-        let barrier = barrier.clone();
-        let winners = winners.clone();
-        handles.push(thread::spawn(move || {
-            barrier.wait();
-            if region.lease().try_acquire(worker, 0, 1_000) {
-                winners.lock().unwrap().push(worker);
-            }
-        }));
-    }
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let winners: Arc<[AtomicU32]> = (0..ROUNDS).map(|_| AtomicU32::new(0)).collect();
+    let handles: Vec<_> = (1..=4_u32)
+        .map(|worker| {
+            let (barrier, winners) = (barrier.clone(), winners.clone());
+            thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    barrier.wait();
+                    // Each round starts after the previous round's lease
+                    // expired.
+                    if region.lease().try_acquire(worker, round * 2_000, 1_000) {
+                        winners[round as usize].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
     for h in handles {
         h.join().unwrap();
     }
-    let winners = winners.lock().unwrap();
-    assert_eq!(winners.len(), 1, "expected exactly one lease winner");
+    for (round, won) in winners.iter().enumerate() {
+        let won = won.load(Ordering::Relaxed);
+        assert_eq!(won, 1, "round {round}: expected exactly one lease winner");
+    }
 }

@@ -488,3 +488,22 @@ async fn local_kubernetes_endpoint_slice_watcher_emits_added_peer() {
         "unexpected peer {peer:?}",
     );
 }
+
+#[test]
+fn fatal_status_stops_only_on_auth_and_missing_resource() {
+    let status = |code| kube::core::Status::failure("", "").with_code(code).boxed();
+    for code in [401, 403, 404] {
+        assert_eq!(
+            fatal_status(&WatcherError::WatchError(status(code))),
+            Some(code)
+        );
+        let failed = WatcherError::InitialListFailed(kube::Error::Api(status(code)));
+        assert_eq!(fatal_status(&failed), Some(code));
+    }
+    for code in [409, 500, 503] {
+        assert_eq!(fatal_status(&WatcherError::WatchError(status(code))), None);
+        let failed = WatcherError::WatchFailed(kube::Error::Api(status(code)));
+        assert_eq!(fatal_status(&failed), None);
+    }
+    assert_eq!(fatal_status(&WatcherError::NoResourceVersion), None);
+}

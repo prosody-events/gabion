@@ -7,7 +7,7 @@
 //! record that a member left. Every [`Event`] carries the `tick` and
 //! `virtual_ms` at which the engine observed it, so the frontend can place it
 //! on a shared timeline and scrub. `u128` identifiers serialize as hex strings
-//! (see [`crate::hex`]).
+//! (see `crate::hex`).
 
 use serde::{Deserialize, Serialize};
 

@@ -766,17 +766,16 @@ fn dirty_ring_yields_each_changed_cell_once() {
     remote_merge_one(&mut store, 0x11, 10, 1, 9, 0);
     remote_merge_one(&mut store, 0x11, 20, 1, 3, 0);
 
-    // Count current entries in forwarded_dirty.
+    // The ring holds three entries; the first cell's 5 was superseded by 9,
+    // so the staleness filter must skip it.
     let mut seen: Vec<u32> = Vec::new();
-    store.visit_forwarded_dirty(|h, s| {
-        if !seen.contains(&h.index) {
-            seen.push(h.index);
-        }
-        // Also assert each is current — staleness filter applied internally.
-        assert!(s.resolve(h).is_some());
+    store.visit_forwarded_dirty(|h, _| {
+        seen.push(h.index);
         true
     });
+    assert_eq!(store.forwarded_dirty().len(), 3);
     assert_eq!(seen.len(), 2);
+    assert_ne!(seen[0], seen[1]);
 }
 
 #[test]
@@ -1146,12 +1145,16 @@ fn dictionary_full_rejects_with_counter() {
     // must fail.
     let h1 = remote_merge_one(&mut store, 0x10, 2, 1, 1, 0);
     assert!(store.get(h1).is_some());
-    let mut sink = DeltaSink::with_capacity(1);
-    let mut obs = ObservationBatch::with_capacity(1);
+    // A rejected row must not drop the valid row behind it, on either path.
+    let mut sink = DeltaSink::with_capacity(2);
+    let mut obs = ObservationBatch::with_capacity(2);
     obs.push(observation(0x20, 0xabc, 0, 3, 1, 1, 0));
+    obs.push(observation(0x10, 0xabd, 0, 3, 1, 1, 0));
     store.merge_remote(&obs, &mut sink);
-    assert_eq!(sink.len(), 0);
-    assert_eq!(store.stats().rule_dictionary_full_rejects, 1);
+    assert_eq!(sink.len(), 1);
+    store.ingest_local(&obs, &mut sink);
+    assert_eq!(sink.len(), 2);
+    assert_eq!(store.stats().rule_dictionary_full_rejects, 2);
 }
 
 #[test]

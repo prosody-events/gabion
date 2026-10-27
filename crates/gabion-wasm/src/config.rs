@@ -140,7 +140,7 @@ impl SimConfig {
     /// the old per-`spawn_node` floors gave, now in one expression.
     ///
     /// Unlike the adapters' production configs
-    /// ([`gabion::defaults::STORAGE_*`] via `server::config::cell_store_config`
+    /// (`gabion::defaults::STORAGE_*` via `server::config::cell_store_config`
     /// and `nginx::leader::production_cell_store_config`), these carry **no
     /// production floors**: the visualizer watches one rule for a handful of
     /// keys, so even at the ceiling the working set is the cross-node replica
