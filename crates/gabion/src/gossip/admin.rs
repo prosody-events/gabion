@@ -61,9 +61,7 @@ pub struct AdminSnapshot {
     pub threshold_fires: u64,
     /// Cumulative ticks (heartbeat + threshold) during which at least
     /// one cell was dirty when `handle_gossip_tick` entered the peer
-    /// pick. Used by the bench to compute *effective fanout*
-    /// (`packets_emitted / dirty_ticks`) — see
-    /// `crates/gossip-bench/README.md`.
+    /// pick.
     pub dirty_ticks: u64,
     /// The coverage fanout the most recent dirty tick chose:
     /// `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`, where `c` is

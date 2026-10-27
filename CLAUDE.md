@@ -52,16 +52,18 @@ The workspace lives under `crates/`:
   endpoint sitting in front of nginx) with a configurable tenant /
   hit-rate mix; used in `make kubernetes-*` smoke tests.
 
-- **`gossip-bench`** — gossip propagation simulator. Runs scenario JSON
-  specs through `gossip::sim::SimTransport` and emits result JSON;
-  `bench/plot.py` produces the convergence plots. See
+- **`gossip-bench`** — the study harness: a deterministic simulator of a
+  gabion cluster, an oracle that scores every node against the true
+  count, and the Python judge and regression gate (`make sim-smoke`,
+  `make sim-gate`). Outside `src/harness/adapter.rs` it names only the
+  library's gossip and discovery traits. See
   `crates/gossip-bench/README.md`.
 
 Deployment manifests, NGINX docker-compose, Kubernetes smoke harnesses,
 and the cross-version NGINX/OpenResty build matrices live under
-`deploy/`. The gossip protocol explainer, operator-knob reference, and
-benchmark results live in `crates/gabion/README.md`; the CRDT design
-deep-dive lives in `crates/gabion/CRDT.md`.
+`deploy/`. The gossip protocol explainer and operator-knob reference
+live in `crates/gabion/README.md`; the CRDT design deep-dive lives in
+`crates/gabion/CRDT.md`.
 
 ## How a request flows
 

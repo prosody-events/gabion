@@ -1,0 +1,32 @@
+{
+  "id": "long-window",
+  "description": "Long-window rule: 60 pods, ~30 req/s from ~96 sites every ~3.2 s against a 2,000 per hour limit with 1 min buckets, two over-limit hot keys and a 90 req/s burst for 60 s. The first full window (3,600 s) is warmed up with real traffic; 1,200 s are measured. The load is a tenth of the 300 req/s first proposed: that implies ~1.1 M live cells per pod, more than 7 GB and several hours per run, and 170x the reference deployment's live-cell count.",
+  "duration_s": 4800,
+  "warmup_s": 3600,
+  "nodes": 60,
+  "rule": {
+    "limit": 2000,
+    "window_ms": 3600000,
+    "bucket_ms": 60000
+  },
+  "traffic": {
+    "site_rate_rps": 30,
+    "site_period_ms": 3200,
+    "site_jitter": 0.5,
+    "hot_keys": [
+      {
+        "limit_multiple": 1.5
+      },
+      {
+        "limit_multiple": 3.0
+      }
+    ],
+    "bursts": [
+      {
+        "rate_rps": 90,
+        "start_s": 4000,
+        "duration_s": 60
+      }
+    ]
+  }
+}

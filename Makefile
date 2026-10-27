@@ -124,6 +124,9 @@ help:
 	@printf '%s\n' '  make miri-lib        Run all gabion-nginx lib tests under miri'
 	@printf '%s\n' '  make miri-all        Run miri (Stacked + Tree Borrows) on every gabion-nginx test'
 	@printf '%s\n' '  make bench-check     Compile the crdt and SHM aggregate benchmarks'
+	@printf '%s\n' '  make sim-smoke       Run the study harness judge tests and one small regime; fails on an unhealthy run'
+	@printf '%s\n' '  make sim-baselines   Run the main and imp-az-hier-nopk baseline arms of the regression gate (H1=<sha>)'
+	@printf '%s\n' '  make sim-gate        Run this checkout as the zone arm and apply the regression gate pass rules'
 	@printf '%s\n' '  make wasm-check      Cross-compile gabion-wasm, run its native tests, and build the web frontend'
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
@@ -134,7 +137,6 @@ help:
 	@printf '%s\n' '  make kubernetes-test Run guarded local kind EndpointSlice convergence tests'
 	@printf '%s\n' '  make kubernetes-nginx-test Run guarded local kind NGINX scale rate-limit tests'
 	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local kind NGINX plus Gabion server gossip test'
-	@printf '%s\n' '  make kubernetes-gossip-bench Run guarded local kind gossip propagation benchmark'
 	@printf '%s\n' '  make kubernetes-clean Delete local Kubernetes test namespaces'
 	@printf '%s\n' '  make ci              Fast contributor pre-merge: test, loom, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
 	@printf '%s\n' '  make ci-full         Mirror GitHub Actions end-to-end: ci + nginx-asan + miri-all + every kubernetes-* target'
@@ -230,6 +232,51 @@ hygiene:
 .PHONY: test
 test: fmt clippy unit safety hygiene
 
+# The study harness (crates/gossip-bench). `sim-smoke` runs the judge's tests
+# and one small regime, failing on a run that broke a health invariant;
+# `sim-baselines` and `sim-gate` are the regression gate (see its README).
+SIM := crates/gossip-bench
+SIM_OUT ?= target/sim
+SIM_JOBS ?= 2
+SIM_REGIMES ?= all
+SIM_SEEDS ?= 3
+# The commit that landed the harness: its adapter and manifest build every baseline.
+H1 ?= $(shell git log --diff-filter=A --format=%H -- $(SIM)/src/harness/adapter.rs | tail -n 1)
+# The measured branch, sim/imp-az-hier-nopk.
+SIM_NOPK := 328f7cf214b95a505c528dcaa8e1f26498157968
+
+.PHONY: sim-smoke
+sim-smoke:
+	python3 -m unittest discover -s $(SIM)/judge
+	mkdir -p $(SIM_OUT)
+	$(CARGO_ENV) $(STABLE_CARGO) run -q -p gossip-bench -- --regime $(SIM)/regimes/low-3.json --seed 1 --require-valid --out $(SIM_OUT)/smoke.json
+
+.PHONY: sim-baselines
+sim-baselines:
+	@test -n "$(H1)" || { echo 'sim-baselines: no commit added $(SIM)/src/harness/adapter.rs; pass H1=<sha>' >&2; exit 1; }
+	set -e; date=$$(git log -1 --format=%cI $(H1)); \
+	for arm in main=$(H1) imp-az-hier-nopk=$(SIM_NOPK); do \
+		label=$${arm%%=*}; wt=$(SIM_OUT)/worktrees/$$label; \
+		git worktree remove --force $$wt 2>/dev/null || true; \
+		git worktree add -q --detach $$wt $${arm#*=}; \
+		rm -rf $$wt/$(SIM); git archive HEAD $(SIM) | tar -x -C $$wt; \
+		git show $(H1):$(SIM)/src/harness/adapter.rs > $$wt/$(SIM)/src/harness/adapter.rs; \
+		git show $(H1):$(SIM)/Cargo.toml > $$wt/$(SIM)/Cargo.toml; \
+		$(CARGO_ENV) $(STABLE_CARGO) metadata -q --format-version 1 --manifest-path $$wt/Cargo.toml > /dev/null; \
+		git -C $$wt add -A $(SIM) Cargo.lock; \
+		git -C $$wt diff --cached --quiet || GIT_AUTHOR_DATE=$$date GIT_COMMITTER_DATE=$$date \
+			git -C $$wt -c user.name=sim-baselines -c user.email=sim-baselines@localhost \
+			commit -q -m "sim: $$label with the current harness core"; \
+		CARGO_TARGET_DIR=$(abspath $(SIM_OUT))/target/$$label python3 $(SIM)/judge/matrix.py \
+			--repo $$wt --solution $$label --regimes $(SIM_REGIMES) --seeds $(SIM_SEEDS) \
+			--jobs $(SIM_JOBS) --out $(SIM_OUT)/results; \
+	done
+
+.PHONY: sim-gate
+sim-gate:
+	python3 $(SIM)/judge/matrix.py --solution zone --seeds 3 --jobs $(SIM_JOBS) --out $(SIM_OUT)/results
+	python3 $(SIM)/judge/gate.py $(SIM_OUT)/results --out $(SIM_OUT)/gate
+
 .PHONY: bench-check
 bench-check:
 	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion --bench crdt --no-run
@@ -286,10 +333,6 @@ kubernetes-nginx-test:
 kubernetes-mixed-test:
 	sh deploy/kubernetes/mixed-nginx-gabion-gossip.sh
 
-.PHONY: kubernetes-gossip-bench
-kubernetes-gossip-bench:
-	python3 deploy/kubernetes/gossip-propagation-bench.py
-
 .PHONY: kubernetes-clean
 kubernetes-clean:
 	sh deploy/kubernetes/local-clean.sh
@@ -304,4 +347,4 @@ kubernetes-clean:
 ci: test loom miri-safety bench-check wasm-check nginx-config nginx-module nginx-test
 
 .PHONY: ci-full
-ci-full: ci nginx-asan miri-all kubernetes-test kubernetes-nginx-test kubernetes-mixed-test kubernetes-gossip-bench
+ci-full: ci nginx-asan miri-all kubernetes-test kubernetes-nginx-test kubernetes-mixed-test

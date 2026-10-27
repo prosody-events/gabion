@@ -4,9 +4,9 @@ The visualizer's bridge: the **real** gabion gossip + CRDT core compiled to
 WebAssembly and driven from a TypeScript frontend. There is no new simulator
 here — [`engine::run_engine`](src/engine.rs) stands up N
 [`GossipRuntime`](../gabion/src/gossip/runtime.rs)s on one shared
-`gossip::sim::SimRouter`, exactly the machinery `gossip-bench` exercises, and
-exposes it over a command channel (`submit_request`, `step`, `set_link_policy`,
-`snapshot`, …).
+`gossip::sim::SimRouter`, the same deterministic router the library's own
+tests run on, and exposes it over a command channel (`submit_request`,
+`step`, `set_link_policy`, `snapshot`, …).
 
 ## Why a hand-driven clock
 

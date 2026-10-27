@@ -313,7 +313,7 @@ The workspace lives under `crates/`:
 | [`gabion-nginx`](crates/nginx/README.md)           | The nginx dynamic module. Builds with `cargo build -p gabion-nginx --features ngx-module --release`. |
 | `gabion-loader`                                    | Load generator. Drives the gRPC service (or an HTTP endpoint sitting in front of nginx) with a configurable tenant / hit-rate mix. |
 | [`gabion-wasm`](crates/gabion-wasm/README.md)      | The visualizer's WebAssembly bridge. Stands up N gossip runtimes on the deterministic in-process router and exposes them over a command channel to the browser frontend that ships to the hosted simulator. |
-| [`gossip-bench`](crates/gossip-bench/README.md)    | Headless gossip propagation harness. Runs scenario JSON specs through the same deterministic sim transport and emits result JSON; a Python script turns the JSON into convergence plots. |
+| [`gossip-bench`](crates/gossip-bench/README.md)    | The study harness: a deterministic simulator of a gabion cluster under production-shaped load, scored against the true count, with the judge and regression gate that compare a change with the measured baselines. |
 
 Deployment manifests, the nginx docker-compose harness, Kubernetes
 smoke tests, and the cross-version nginx / OpenResty build matrices
@@ -322,13 +322,13 @@ live under [`deploy/`](deploy).
 ## Further reading
 
 - [Interactive gossip simulator](https://prosody-events.github.io/gabion/) — the gabion runtime in a browser, for stepping through convergence interactively.
-- [`crates/gabion/README.md`](crates/gabion/README.md) — the gossip protocol explainer, operator-knob reference, and benchmark results.
+- [`crates/gabion/README.md`](crates/gabion/README.md) — the gossip protocol explainer and operator-knob reference.
 - [`crates/gabion/CRDT.md`](crates/gabion/CRDT.md) — design of the counter store, end to end.
 - [`crates/gabion/TROUBLESHOOTING.md`](crates/gabion/TROUBLESHOOTING.md) — what each library log message means and what to do about it.
 - [`crates/nginx/README.md`](crates/nginx/README.md) — operator guide for the nginx module.
 - [`crates/server/README.md`](crates/server/README.md) — operator guide for `gabiond` (experimental).
 - [`crates/gabion-wasm/README.md`](crates/gabion-wasm/README.md) — how the visualizer is wired to the gossip core.
-- [`crates/gossip-bench/README.md`](crates/gossip-bench/README.md) — how to re-run the benchmark suite locally.
+- [`crates/gossip-bench/README.md`](crates/gossip-bench/README.md) — running the study harness, its CI smoke and the regression gate.
 - [`deploy/nginx/README.md`](deploy/nginx/README.md) — building the module against different nginx / OpenResty base images.
 
 ## Contributing

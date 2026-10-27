@@ -1,11 +1,10 @@
 //! The single long-lived simulation engine.
 //!
 //! There is no new simulator here: [`run_engine`] stands up N
-//! [`GossipRuntime`]s on one shared [`SimRouter`] under paused virtual time —
-//! exactly the shape `gossip-bench`'s `run_inner` proves — and then loops over
-//! a command channel, replying on a `oneshot` per command. The same function
-//! backs both faces of the visualizer: playback (`step`) and live interaction
-//! (`submit_request`, `set_link_policy`).
+//! [`GossipRuntime`]s on one shared [`SimRouter`] under paused virtual time,
+//! then loops over a command channel, replying on a `oneshot` per command. The
+//! same function backs both faces of the visualizer: playback (`step`) and
+//! live interaction (`submit_request`, `set_link_policy`).
 //!
 //! **Spawn once, drive forever.** `run_engine` owns the `Vec<NodeHandle>` and
 //! the `LocalSet` for the whole session; the runtimes are `spawn_local`'d once
@@ -719,9 +718,8 @@ impl EngineState {
     }
 
     /// Number of yields needed so every spawned runtime task gets polled after
-    /// a virtual-time advance. Mirrors `gossip-bench`'s `drain_pending_tasks`:
-    /// single-thread tokio polls one task per yield, so a large cluster needs
-    /// an explicit drain or it under-polls.
+    /// a virtual-time advance. Single-thread tokio polls one task per yield,
+    /// so a large cluster needs an explicit drain or it under-polls.
     async fn drain_pending(&self) {
         // Scale with the *live* node count, not the initial config, so a
         // cluster grown by joins is still fully polled.

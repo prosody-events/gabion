@@ -63,7 +63,7 @@ struct SimRouterInner {
     /// step driver arms this so one simulated step is one gossip round: every
     /// node makes its gossip decision against this round's state before any
     /// packet lands, then `release_deferred` delivers them all. Default `false`
-    /// — core gossip tests and gossip-bench never arm it, so their behavior is
+    /// — core gossip tests never arm it, so their behavior is
     /// unchanged.
     deferring: Cell<bool>,
     /// Packets buffered while `deferring` is set, in push (send) order. Drained

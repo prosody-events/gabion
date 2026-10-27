@@ -1,7 +1,6 @@
 //! Observation shims that turn the runtime's existing push surfaces into the
-//! visualizer's event log. Neither shim changes gossip behavior — they mirror
-//! the precedents already in tree (`gossip-bench`'s `BenchAggregateStore` and
-//! `CountingTransport`) and only record what flows past.
+//! visualizer's event log. Neither shim changes gossip behavior — they only
+//! record what flows past.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

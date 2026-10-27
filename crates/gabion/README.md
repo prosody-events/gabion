@@ -266,10 +266,7 @@ two rounds). KMG's validated single-shot threshold sits near `c ≈ 4`
 (fanout 13 @ 10 000, 15 @ 50 000); a re-gossiping system does not need to
 match it, and `c = 3` saves ≈ 1 peer per tick at every scale. The
 bandwidth floor on quiet ticks is unchanged from a fixed fanout — the
-pick is stable for a given cluster size, not pulsing with load. The
-`coverage_fanout` bench
-[below](#what-we-measured) shows the pick tracking `⌈ln(n)+c⌉` and
-staying flat as burst volume changes.
+pick is stable for a given cluster size, not pulsing with load.
 
 ### Adaptive emit rate
 
@@ -331,9 +328,6 @@ saturates and every hit would otherwise emit, `min_emit_interval` caps
 the worst-case emit rate; convergence still happens, but the cluster
 absorbs the burst at a different bandwidth budget.
 
-The `error_budget` and `min_emit_clamp` bench suites measure both
-sides of this trade.
-
 ### Dirty rings and the peer frontier
 
 Three data structures decide which cells the current tick sends to
@@ -393,160 +387,9 @@ the directives.
 
 ## What we measured
 
-Every figure below is regenerated from current code by running the
-gossip simulator across the suites; see
-[`../gossip-bench/README.md`](../gossip-bench/README.md) for the
-"how to re-run it" perspective. The figures here are committed to
-`figures/` so this README renders correctly on GitHub without first
-running the bench.
-
-The suites split into four bundles. Steady-state convergence and scale
-together show that the protocol meets its asymptotic bounds, while the
-resilience suite shows that it survives the failure modes operators
-see in practice. The adaptive machinery suites — `coverage_fanout`,
-`error_budget`, `min_emit_clamp`, and `heartbeat_threshold_mix` — are
-the empirical evidence for the two adaptive aspects of the protocol.
-
-### Steady-state convergence
-
-![convergence](figures/convergence.svg)
-
-**Method.** Single write at node 0; measure rounds-to-converge as both
-cluster size N and the static fanout floor sweep. Bandwidth is total
-bytes sent across the run divided by `N · duration`.
-
-**Takeaway.** Gabion sits at or below the Karp `log₂ N` lower bound at
-every fanout above 1, because peer-frontier dedup lets the sender skip
-cells the recipient already has. The empirical curve at f = 3 — well
-under the f = 6 production default — is within one extra round of f = 8.
-
-![fanout_sweep](figures/fanout_sweep.svg)
-
-**Method.** Fix N = 32, sweep static `fanout` from 1 to 12, measure both
-convergence rounds and bytes-per-node-per-second.
-
-**Takeaway.** Rounds drop sharply between f = 1 and f = 3 and then
-flatten, while bandwidth scales roughly linearly with `fanout`. The
-sweet spot near f = 3–6 is where bandwidth stays modest while
-convergence sits within a round of the asymptote.
-
-### Scale
-
-![scale_n](figures/scale_n.svg)
-
-**Method.** Sweep N from 4 to 1024 at fixed `fanout = 3`. Time-to-
-converge should track `log₂ N`; bytes-per-node-per-second should stay
-roughly constant (SWIM's "constant load per node" property).
-
-**Takeaway.** Rounds-to-converge sits at or below `log₂ N` all the way
-through N = 1024, and per-node bandwidth is flat in N to within the
-noise of a horizontal line.
-
-### Resilience
-
-![loss](figures/loss.svg)
-
-**Method.** Three trials at each per-link drop probability from 0 % to
-50 %. N = 16, f = 3, 20 s of virtual time.
-
-**Takeaway.** Convergence rounds climb only a small constant as loss
-rises, and gabion converges in every trial including the 50 % loss row.
-Bimodal Multicast (Birman et al. 1999) reports stable delivery to
-~25–30 %; gabion's empirical tolerance is roughly twice that, thanks
-to peer-frontier dedup plus the rotating repair lane.
-
-![partition](figures/partition.svg)
-
-**Method.** Two equally-sized partitions, single write inside one,
-heal at t = 10 s. Time-to-reconverge measured from the heal.
-
-**Takeaway.** Once the links open, the next tick after heal drains the
-partition, so reconvergence is bounded above by one `tick_interval`.
-
-![staleness](figures/staleness.svg)
-
-**Method.** Sustained writes from k sources concurrently; measure
-per-hit p50 / p95 lag (Astrolabe-style staleness).
-
-**Takeaway.** P50 and p95 lag both stay flat at a single `tick_interval`
-regardless of the number of concurrent writers, because the dirty ring
-drains in one round under steady state.
-
-### Adaptive machinery
-
-These four suites are the empirical evidence for the two adaptive
-aspects of the protocol. `coverage_fanout` exercises coverage fanout;
-`error_budget` and `min_emit_clamp` exercise adaptive emit rate; and
-`heartbeat_threshold_mix` confirms the cold-rule heartbeat is
-independent of the threshold path.
-
-![coverage_fanout](figures/coverage_fanout.svg)
-
-**Method.** Sweep two axes against a `DistinctKeyBurst` (each write
-lands in its own cell store slot, so `local_dirty.len()` jumps to the
-burst size in one step). Across cluster size `n ∈ {16, 64, 256}` at a
-fixed burst, read the per-tick `peak_effective_fanout`. Across burst
-size `cells ∈ {16, 256, 1024}` at a fixed `n`, read the effective fanout
-(packets ÷ dirty-tick count). Static `fanout = 1` (the floor, which the
-coverage threshold overrides).
-
-**Takeaway.** The left panel: the observed peak fanout tracks
-`⌈ln(n−1)+c⌉` — 6 at `n=16`, 8 at `n=64`, 9 at `n=256` — sitting right
-on the predicted threshold and rising by ~1 per factor-of-e of cluster
-growth, exactly the KMG law. The right panel: at fixed `n` the per-tick
-fanout is **flat** across a 64× change in burst volume, because the
-burst rides one fat frame rather than widening the peer pick — volume is
-a frame-fill concern, not a fanout one. (Volume that overflows the dirty
-ring is repaired by the rotating repair lane, not by fanning out wider.)
-
-![error_budget](figures/error_budget.svg)
-
-**Method.** Sustained workload at N = 16, `rule_limit = 10 000`,
-`per_tick = 5` hits / source / sample. Sweep `target_err_bps` across
-nearly three decades. Each scenario reports bandwidth,
-threshold-fires/node, and the empirical
-`max_lag = max(ground_truth − min(per_node_total))`, alongside the
-theoretical `N · ε_R` bound.
-
-**Takeaway.** Two regimes show up cleanly. While ε_R is small enough
-that per-sample accumulated hits cross the budget (left of bps ≈ 100
-here), the runtime fires nearly every sample and bandwidth climbs to
-~130 kB/node/s. Past that crossover, ε_R is comfortably above the
-per-sample hit count and the proactive heartbeat carries the work
-alone — bandwidth drops to ~73 kB/node/s and threshold fires go to
-zero. Empirical max lag plateaus at ~65 hits across the entire sweep
-because the heartbeat alone keeps lag bounded by one `tick_interval`
-× per-sample hit count — the budget only matters when it would force
-gossip *faster* than that. Empirical max lag may briefly exceed
-`N · ε_R` at the tight end of the sweep — those are hits in flight
-between the bench's sample point and the next gossip apply, bounded by
-one workload batch and absorbed by the following sample.
-
-![min_emit_clamp](figures/min_emit_clamp.svg)
-
-**Method.** Adversarial workload: drive 10 000 hits into 50 ms of
-virtual time. The `BurstCompressed` workload calls `record(...)` with
-`rule_limit = 1`, which forces `ε_R = max(1, 1 · bps / 80_000) = 1` at
-every bps — so every hit crosses the budget. Sweep
-`min_emit_interval ∈ {0, 1, 5, 10, 50}` ms.
-
-**Takeaway.** Bandwidth scales inversely with the floor, which is what
-caps worst-case emit rate. Threshold-fires-per-node drops by ~50×
-across the sweep (6.1 at floor = 0 / 1 ms down to 0.1 at floor = 50 ms),
-and final divergence stays at zero in every configuration — the cluster
-still converges after the burst, just at a different bandwidth budget.
-
-![heartbeat_threshold_mix](figures/heartbeat_threshold_mix.svg)
-
-**Method.** Two rules side by side. The hot rule receives a saturating
-burst every tick (threshold path); the cold rule receives one hit per
-second (heartbeat path). Both must converge.
-
-**Takeaway.** The left panel shows the hot rule converging
-sub-heartbeat through threshold fires, while the right panel shows the
-cold rule riding the proactive heartbeat. Cold-rule replication does
-not depend on the threshold ever firing, because heartbeat and
-threshold are independent code paths.
+The comparative study of gossip designs, its method and its results are in
+[`docs/study/README.md`](../../docs/study/README.md); the harness that produced
+them is [`crates/gossip-bench`](../gossip-bench/README.md).
 
 ## References
 
@@ -561,8 +404,3 @@ In-tree primary sources:
 - `src/crdt.rs` and `src/crdt/` — counter store, dirty rings, peer
   frontier, expiry. The structures here are documented in depth in
   [`CRDT.md`](CRDT.md).
-- [`../gossip-bench/REFERENCES.md`](../gossip-bench/REFERENCES.md) — the
-  literature survey behind the benchmark methodology (Demers 1987,
-  Karp 2000, SWIM 2002, HyParView / Plumtree 2007, Astrolabe 2003,
-  Bimodal Multicast 1999, plus Sharfman/Schuster/Keren and
-  Olston/Jiang/Widom for the error-budget machinery).

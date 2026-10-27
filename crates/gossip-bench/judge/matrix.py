@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Run the study harness across regimes x seeds for the checked-out solution.
+
+Builds `gossip-bench` (release), copies the binary
+cargo reports for that build to a private directory under `--out` (so a
+concurrent build in another worktree cannot replace it mid-run, and a stale
+binary cannot be stamped), runs `gossip-bench` for every (regime, seed) pair with `--jobs`
+parallelism, and writes one stamped result per run to
+`<out>/<solution>/<regime>/seed-<n>.json`. A run whose output already exists
+with the same clean stamp (harness tree hash, solution label, branch and
+commit) is skipped, so an interrupted matrix resumes where it stopped. It
+refuses to run on a worktree with uncommitted changes unless `--allow-dirty`
+is given, and the judge rejects such results.
+
+The stamp identifies what produced the numbers: the harness tree hash
+(`git rev-parse HEAD:crates/gossip-bench`), the solution label, branch and
+commit. The judge refuses to compare results with different harness hashes.
+`process` carries wall time, CPU time and peak RSS of the run as measured by
+`wait4`; these are host-dependent and noisy, unlike everything else.
+
+Python 3 standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HARNESS_DIR = "crates/gossip-bench"
+
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def stamp_for(repo: Path, solution: str, allow_dirty: bool) -> dict:
+    harness_dirty = bool(git(repo, "status", "--porcelain", "--", HARNESS_DIR))
+    solution_dirty = bool(git(repo, "status", "--porcelain"))
+    if solution_dirty and not allow_dirty:
+        where = HARNESS_DIR if harness_dirty else "the worktree"
+        sys.exit(
+            f"error: {where} has uncommitted changes, so the stamped commit would not "
+            "describe the code that ran and the numbers could not be reproduced from the "
+            "pushed branch. Commit or stash them, or pass --allow-dirty for a throwaway "
+            "run (the judge rejects dirty stamps)."
+        )
+    return {
+        "harness_tree_hash": git(repo, "rev-parse", f"HEAD:{HARNESS_DIR}"),
+        "harness_dirty": harness_dirty,
+        "solution": solution,
+        "solution_branch": git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+        "solution_commit": git(repo, "rev-parse", "HEAD"),
+        "solution_dirty": solution_dirty,
+    }
+
+
+def build(repo: Path) -> Path:
+    """Build the study binary and return the path cargo reports for it."""
+    proc = subprocess.run(
+        ["cargo", "build", "--release", "-p", "gossip-bench",
+         "--message-format=json-render-diagnostics"],
+        cwd=repo, check=True, stdout=subprocess.PIPE, text=True,
+    )
+    return executable_from(proc.stdout)
+
+
+def executable_from(cargo_messages: str) -> Path:
+    """The `gossip-bench` binary named by cargo's `compiler-artifact` message."""
+    for line in cargo_messages.splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        target = message.get("target") or {}
+        if (message.get("reason") == "compiler-artifact" and message.get("executable")
+                and target.get("name") == "gossip-bench" and "bin" in target.get("kind", [])):
+            return Path(message["executable"])
+    sys.exit("error: cargo reported no gossip-bench executable for this build.")
+
+
+def regimes(repo: Path, names: str) -> list[Path]:
+    directory = repo / HARNESS_DIR / "regimes"
+    available = {p.stem: p for p in sorted(directory.glob("*.json"))}
+    if names == "all":
+        return list(available.values())
+    picked = []
+    for name in names.split(","):
+        if name not in available:
+            sys.exit(f"error: no regime `{name}` in {directory}; have {', '.join(available)}")
+        picked.append(available[name])
+    return picked
+
+
+def seeds(spec: str) -> list[int]:
+    if "," in spec or "-" in spec:
+        out = []
+        for part in spec.split(","):
+            lo, _, hi = part.partition("-")
+            out.extend(range(int(lo), int(hi or lo) + 1))
+        return out
+    return list(range(1, int(spec) + 1))
+
+
+def is_done(path: Path, stamp: dict) -> bool:
+    """A result counts as done only when it was produced by exactly this
+    clean harness and solution commit; dirty runs are always redone."""
+    if stamp["harness_dirty"] or stamp["solution_dirty"]:
+        return False
+    try:
+        existing = json.loads(path.read_text())["stamp"]
+    except (OSError, ValueError, KeyError):
+        return False
+    return existing == stamp
+
+
+def max_rss_bytes(ru_maxrss: int) -> int:
+    # Darwin reports bytes, Linux kilobytes.
+    return ru_maxrss if platform.system() == "Darwin" else ru_maxrss * 1024
+
+
+def run_one(binary: Path, regime: Path, seed: int, out: Path, stamp: dict) -> str:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    partial = out.with_suffix(".partial")
+    start = time.monotonic()
+    log = out.with_suffix(".stderr")
+    with log.open("wb") as stderr_file:
+        proc = subprocess.Popen(
+            [str(binary), "--regime", str(regime), "--seed", str(seed), "--out", str(partial)],
+            stderr=stderr_file,
+        )
+        _, status, usage = os.wait4(proc.pid, 0)
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    wall = time.monotonic() - start
+    stderr = log.read_text(errors="replace")
+    log.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        return f"FAILED {regime.stem} seed {seed} (exit {proc.returncode}): {stderr.strip()}"
+    result = json.loads(partial.read_text())
+    result["stamp"] = stamp
+    result["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    result["process"] = {
+        "wall_s": round(wall, 3),
+        "cpu_user_s": round(usage.ru_utime, 3),
+        "cpu_sys_s": round(usage.ru_stime, 3),
+        "max_rss_bytes": max_rss_bytes(usage.ru_maxrss),
+        "host": platform.node(),
+        "noisy": True,
+    }
+    tmp = out.with_suffix(".tmp")
+    tmp.write_text(json.dumps(result, indent=1) + "\n")
+    tmp.replace(out)
+    partial.unlink(missing_ok=True)
+    valid = "valid" if result.get("valid") else f"INVALID {result.get('invalid_reasons')}"
+    return (
+        f"{regime.stem} seed {seed}: {valid}, wall {wall:.1f} s, "
+        f"rss {result['process']['max_rss_bytes'] / 2**20:.0f} MiB"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--solution", required=True,
+                        help="label for this solution, e.g. `main` (the baseline)")
+    parser.add_argument("--regimes", default="all", help="comma-separated ids, or `all`")
+    parser.add_argument("--seeds", default="1",
+                        help="count (`3` = seeds 1..3) or list/ranges (`1,4-6`)")
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--repo", type=Path, default=Path.cwd())
+    parser.add_argument("--allow-dirty", action="store_true")
+    args = parser.parse_args()
+
+    repo = Path(git(args.repo, "rev-parse", "--show-toplevel"))
+    stamp = stamp_for(repo, args.solution, args.allow_dirty)
+    # Always build: cargo is a no-op when the binary is current, and reusing a
+    # prebuilt binary would stamp old code's numbers with the current commit.
+    built = build(repo)
+    args.out.mkdir(parents=True, exist_ok=True)
+    sweep_dead_copies(args.out)
+    # Run a private copy: another matrix building in a shared target directory
+    # cannot replace the binary under this one mid-run.
+    with tempfile.TemporaryDirectory(prefix=f".bin-{os.getpid()}-", dir=args.out) as scratch:
+        binary = Path(shutil.copy2(built, Path(scratch) / built.name))
+        run_matrix(args, repo, stamp, binary)
+
+
+def sweep_dead_copies(out: Path) -> None:
+    """Remove binary copies left by matrix runs that were killed (a normal exit
+    removes its own). Only a copy whose owning process is gone is touched."""
+    for stale in out.glob(".bin-*"):
+        try:
+            pid = int(stale.name.split("-")[1])
+            os.kill(pid, 0)
+        except (ValueError, IndexError, PermissionError):
+            continue
+        except ProcessLookupError:
+            shutil.rmtree(stale, ignore_errors=True)
+
+
+def run_matrix(args: argparse.Namespace, repo: Path, stamp: dict, binary: Path) -> None:
+    todo = []
+    for regime in regimes(repo, args.regimes):
+        for seed in seeds(args.seeds):
+            out = args.out / args.solution / regime.stem / f"seed-{seed}.json"
+            if is_done(out, stamp):
+                print(f"skip {regime.stem} seed {seed}: already done", flush=True)
+            else:
+                todo.append((regime, seed, out))
+    print(f"{len(todo)} runs, {args.jobs} at a time; harness {stamp['harness_tree_hash'][:12]}, "
+          f"{stamp['solution']} @ {stamp['solution_commit'][:12]}", flush=True)
+
+    lock = threading.Lock()
+    failures = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = [pool.submit(run_one, binary, r, s, o, stamp) for r, s, o in todo]
+        for future in concurrent.futures.as_completed(futures):
+            line = future.result()
+            with lock:
+                failures += line.startswith("FAILED")
+                print(line, flush=True)
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()

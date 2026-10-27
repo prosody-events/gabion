@@ -95,6 +95,11 @@ debug = "line-tables-only"
 [profile.test.package.gabion]
 opt-level = 2
 
+# The gossip-bench validation epidemics (300 simulated nodes) dominate its
+# suite: measured 78 s unoptimised, about 15 s at opt-level 2.
+[profile.test.package.gossip-bench]
+opt-level = 2
+
 # Loom spends its time in its own scheduler; optimizing just that crate makes
 # `make loom` several times faster without slowing any other build.
 [profile.dev.package.loom]
