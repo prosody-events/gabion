@@ -212,10 +212,20 @@ miri-lib:
 miri-all: miri-lib miri-safety miri-safety-tb miri-ffi-alignment miri-ffi-alignment-tb
 	MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-disable-isolation" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
 
+# Operator-message catalogue: every `code` field has an entry, and every
+# library entry names a code some library message still emits.
+CATALOGUES := crates/gabion/TROUBLESHOOTING.md crates/server/README.md crates/nginx/README.md
+
 .PHONY: hygiene
 hygiene:
 	! rg -n 'Box\s*<\s*dyn|dyn\s+' --glob '!crates/nginx/src/log.rs' Cargo.toml crates deploy
 	! rg -n 'version\s*=\s*"|=\s*\{\s*version' crates/*/Cargo.toml
+	@for code in $$(rg -oNI 'code = "([a-z_]+)"' -r '$$1' crates/*/src -g '!**/tests.rs' -g '!**/tests/**' | sort -u); do \
+		rg -q "^### \`$$code\`$$" $(CATALOGUES) || { echo "operator message code \`$$code\` has no entry in $(CATALOGUES)"; exit 1; }; \
+	done
+	@for code in $$(rg -oNI '^### `([a-z_]+)`$$' -r '$$1' crates/gabion/TROUBLESHOOTING.md); do \
+		rg -q "code = \"$$code\"" crates/gabion/src || { echo "crates/gabion/TROUBLESHOOTING.md documents \`$$code\`, which no library message emits"; exit 1; }; \
+	done
 
 .PHONY: test
 test: fmt clippy unit safety hygiene

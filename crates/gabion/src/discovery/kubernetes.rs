@@ -30,10 +30,9 @@ pub struct EndpointSliceDiscovery {
     namespace_allow: Vec<String>,
     service_allow: Vec<String>,
     /// Pre-built client; when `Some` we skip the in-cluster client
-    /// construction entirely and use it as-is. Only the
-    /// kubeconfig-aware test constructor populates this — production
-    /// constructors leave it `None` so the in-cluster credential
-    /// loading path on the production hot start path is byte-identical.
+    /// construction entirely and use it as-is. Only the `#[ignore]`d
+    /// live-cluster test in `tests.rs` sets it — production constructors
+    /// leave it `None`.
     preconnected: Option<Client>,
 }
 
@@ -48,27 +47,6 @@ impl EndpointSliceDiscovery {
             namespace_allow,
             service_allow,
             preconnected: None,
-        }
-    }
-
-    /// Build an `EndpointSliceDiscovery` from an already-constructed
-    /// `kube::Client`. Used by the live-cluster integration test, which
-    /// resolves credentials via `Config::infer()` (kubeconfig + env
-    /// vars) so it can run against a kind cluster from the workstation.
-    /// Production code paths never reach this — they construct the
-    /// client lazily via [`build_incluster_client`].
-    #[doc(hidden)]
-    pub fn with_client(
-        client: Client,
-        self_addr: Option<SocketAddr>,
-        namespace_allow: Vec<String>,
-        service_allow: Vec<String>,
-    ) -> Self {
-        Self {
-            self_addr,
-            namespace_allow,
-            service_allow,
-            preconnected: Some(client),
         }
     }
 }
@@ -125,12 +103,19 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                             let fatal = is_fatal_watcher_error(&err);
                             if fatal {
                                 tracing::error!(
+                                    code = "kubernetes_forbidden",
+                                    resource = "Service",
                                     error = %err,
-                                    "Kubernetes API rejected our credentials \
-                                     for service watches; stopping peer \
-                                     discovery. Grant the pod's ServiceAccount \
-                                     get/list/watch on Services and \
-                                     EndpointSlices, then restart this pod.",
+                                    "The Kubernetes API rejected gabion's Service watch, so peer \
+                                     discovery has stopped and the peer list stays as it was; \
+                                     gossip continues with the peers already known. Usually the \
+                                     pod's ServiceAccount lacks RBAC permission (HTTP 401 or 403 \
+                                     in `error`), or the API does not serve the resource (404). \
+                                     Grant the ServiceAccount get/list/watch on Services and \
+                                     EndpointSlices and get on Pods (see \
+                                     `deploy/kubernetes/gabion-discovery-rbac.yaml` and the \
+                                     Kubernetes checklist in gabion's README), then restart the \
+                                     pod.",
                                 );
                             }
                             yield Err(err.into());
@@ -176,6 +161,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                         watched_namespaces.join(",")
                                     };
                                     tracing::warn!(
+                                        code = "no_gabion_service",
                                         watched_namespaces = %ns_display,
                                         gabion_port_name = DEFAULT_GABION_SERVICE_NAME,
                                         "Kubernetes auto-discovery is up but no \
@@ -188,10 +174,10 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                          literal name `gabion` and \
                                          protocol `UDP`. Rename the port to \
                                          `name: gabion` with `protocol: UDP` \
-                                         (see \
-                                         `deploy/kubernetes/nginx-scale-rate-limit.sh` \
-                                         for a working example), then re-apply \
-                                         the manifest.",
+                                         (see the Kubernetes checklist in gabion's \
+                                         README, \
+                                         https://github.com/prosody-events/gabion#kubernetes-checklist), \
+                                         then re-apply the manifest.",
                                     );
                                     zero_match_warned = true;
                                 }
@@ -404,12 +390,21 @@ fn watch_target(
                         let fatal = is_fatal_watcher_error(&err);
                         if fatal {
                             tracing::error!(
+                                code = "kubernetes_forbidden",
+                                resource = "EndpointSlice",
                                 namespace = %target.namespace,
                                 service = %target.service_name,
                                 error = %err,
-                                "Kubernetes API rejected our credentials for \
-                                 EndpointSlice watches on this service; \
-                                 stopping discovery for it.",
+                                "The Kubernetes API rejected gabion's EndpointSlice watch for \
+                                 this Service, so discovery of its peers has stopped and they \
+                                 stay in the peer list as they were; gossip continues with the \
+                                 peers already known. Usually the pod's ServiceAccount lacks \
+                                 RBAC permission (HTTP 401 or 403 in `error`), or the API does \
+                                 not serve the resource (404). Grant the ServiceAccount \
+                                 get/list/watch on Services and EndpointSlices and get on Pods \
+                                 (see `deploy/kubernetes/gabion-discovery-rbac.yaml` and the \
+                                 Kubernetes checklist in gabion's README), then restart the \
+                                 pod.",
                             );
                         }
                         yield Err(err.into());
@@ -499,29 +494,10 @@ impl EndpointSlicePeerSet {
             .unwrap_or_default()
     }
 
-    /// Replace the entire peer map with `other`'s. Used on
-    /// relist/re-init to drop slices the watcher no longer reports.
-    /// Returns nothing — callers handle the diff by comparing their
-    /// own snapshots before and after.
-    #[cfg(test)]
-    pub(super) fn replace(&mut self, other: EndpointSlicePeerSet) {
-        self.by_slice = other.by_slice;
-    }
-
     /// Empty the map and yield every peer it contained — used at
     /// watcher shutdown to emit `Removed` for everything still live.
     pub(super) fn drain_peers(&mut self) -> impl Iterator<Item = Peer> + '_ {
         std::mem::take(&mut self.by_slice).into_values().flatten()
-    }
-
-    /// Sorted, deduplicated union of every cached slice's peer set.
-    /// Used by tests to assert against a model snapshot.
-    #[cfg(test)]
-    pub(super) fn snapshot_peers(&self) -> Vec<Peer> {
-        let mut peers: Vec<Peer> = self.by_slice.values().flatten().copied().collect();
-        peers.sort();
-        peers.dedup();
-        peers
     }
 }
 

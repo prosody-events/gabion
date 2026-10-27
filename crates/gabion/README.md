@@ -29,8 +29,8 @@ the [repo root README](../../README.md#glossary).
 
 ## Module map
 
-The library is divided into six modules, and every type that crosses an
-adapter boundary lives in exactly one of them. The dependency graph is
+Every type that crosses an adapter boundary lives in exactly one of the
+library's modules. The dependency graph is
 a DAG, so no module imports from a module that imports it.
 
 | Module       | Path                          | What it owns                                                                                                                              |
@@ -41,11 +41,13 @@ a DAG, so no module imports from a module that imports it.
 | `wire`       | `src/wire/*`                  | The on-the-wire codec. One UDP packet = header + rule dictionary + node dictionary + cell rows + optional HMAC tag. Each packet decodes independently. |
 | `discovery`  | `src/discovery/*`             | `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation. Adapters consume `PeerEvent` streams; the gossip runtime treats peer add/remove as a normal `select!` arm. |
 | `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, fanout floor, payload caps, the per-rule error budget, and the min-emit floor. |
+| `settings`   | `src/settings.rs`             | Every operator setting named once: `gabiond` YAML key, environment variable and NGINX directive. Messages interpolate from it so each names both adapters' spellings. |
+| `throttle`   | `src/throttle.rs`             | The one power-of-two log throttle every repeating warning counts through. |
 
 `gossip` sits at the top of that graph and depends on every other
 module, whereas `wire` and `crdt` are independent of each other.
-`defaults` is a leaf: `rules` and `gossip` import it, and it imports
-nothing else in this crate. Adapters consume the public surface of
+`defaults`, `settings` and `throttle` are leaves: the other modules import
+them, and they import nothing else in this crate. Adapters consume the public surface of
 `gossip`, `rules`, and `discovery`, together with the constants in
 `defaults`.
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::rules::mock::compile;
 use crate::rules::{DescriptorBinding, RuleConfig};
 use crate::shm::ShmAggregateStore;
 use crate::shm::mock::TestZone;
@@ -6,7 +7,7 @@ use gabion::rules::EnforcementMode;
 use std::time::Duration;
 
 fn build_rules() -> CompiledRules {
-    CompiledRules::compile(&[RuleConfig {
+    compile(&[RuleConfig {
         name: "per_tenant".into(),
         domain: crate::rules::DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
@@ -35,7 +36,7 @@ fn allow_on_empty_aggregate() {
         cardinality: CardinalitySettings::default(),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide_all(ctx, &[0], &vars, 1_000);
     // Single matched rule, aggregate empty: limit=2, hits=1 -> remaining=1.
     match outcome {
         AccessOutcome::Allow(Some(info)) => {
@@ -75,7 +76,7 @@ fn reject_when_window_total_exceeds_limit() {
         cardinality: CardinalitySettings::default(),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide_all(ctx, &[0], &vars, 1_000);
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.spec.id, spec.id);
@@ -122,7 +123,7 @@ fn reject_delta_reflects_oldest_non_empty_bucket() {
         cardinality: CardinalitySettings::default(),
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide_all(ctx, &[0], &vars, 1_000);
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.total, 5);
@@ -145,7 +146,7 @@ fn decline_when_variable_missing() {
         cardinality: CardinalitySettings::default(),
     };
     let vars = MockVars::new(); // no http_x_tenant set
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide_all(ctx, &[0], &vars, 1_000);
     assert!(matches!(outcome, AccessOutcome::Decline));
 }
 
@@ -167,7 +168,7 @@ fn cardinality_settings_reject_oversized_descriptors() {
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
 
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide_all(ctx, &[0], &vars, 1_000);
 
     assert!(matches!(outcome, AccessOutcome::Cardinality));
 }
@@ -202,7 +203,7 @@ fn invalid_utf8_descriptor_declines_and_bumps_counter() {
     };
     // `0xFF` is never a valid UTF-8 lead byte — guaranteed decline.
     let vars = MockVars::new().set_bytes("http_x_tenant", &[0xFFu8, 0xFE, 0xFD]);
-    let outcome = decide(ctx, 0, &vars, 1_000);
+    let outcome = decide_all(ctx, &[0], &vars, 1_000);
     assert!(matches!(outcome, AccessOutcome::Decline));
     let snap = region.stats().snapshot();
     assert_eq!(snap.declines_invalid_descriptor, 1);
@@ -235,7 +236,7 @@ fn is_truthy_matches_documented_falsy_set() {
 }
 
 fn rule_with_predicate(predicate: Option<&str>) -> CompiledRules {
-    CompiledRules::compile(&[RuleConfig {
+    compile(&[RuleConfig {
         name: "per_tenant".into(),
         domain: crate::rules::DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
@@ -266,7 +267,7 @@ fn except_truthy_skips_rule() {
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
         .set("trusted", "1");
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide_all(ctx, &[0], &vars, 0);
     // Exempt-only outcome: no rule produced a quota view, so no
     // `X-RateLimit-*` headers should be emitted on the response.
     assert!(matches!(outcome, AccessOutcome::Allow(None)));
@@ -294,7 +295,7 @@ fn except_falsy_applies_rule() {
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
         .set("trusted", "off");
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide_all(ctx, &[0], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Allow(_)));
     let snap = region.stats().snapshot();
     assert_eq!(snap.exempted, 0);
@@ -318,7 +319,7 @@ fn except_missing_applies_rule() {
     // applies (the operator's intent for predicate=set is opt-in
     // exemption, not opt-in enforcement).
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide_all(ctx, &[0], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Allow(_)));
     let snap = region.stats().snapshot();
     assert_eq!(snap.exempted, 0);
@@ -340,7 +341,7 @@ fn except_empty_applies_rule() {
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
         .set("trusted", "");
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide_all(ctx, &[0], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Allow(_)));
     let snap = region.stats().snapshot();
     assert_eq!(snap.exempted, 0);
@@ -369,7 +370,7 @@ fn build_two_rules(
         mode: EnforcementMode::Enforce,
         except_if: None,
     };
-    CompiledRules::compile(&[
+    compile(&[
         mk("first", first_limit, first_window_secs),
         mk("second", second_limit, second_window_secs),
     ])
@@ -489,7 +490,7 @@ fn decide_all_one_declines_one_allows() {
         mode: EnforcementMode::Enforce,
         except_if: None,
     };
-    let rules = CompiledRules::compile(&[rule_a, rule_b]).expect("compile");
+    let rules = compile(&[rule_a, rule_b]).expect("compile");
     let ctx = AccessCtx {
         rules: &rules,
         aggregate: region.aggregate(),
@@ -522,7 +523,7 @@ fn dry_run_records_but_never_rejects() {
         mode: EnforcementMode::DryRun,
         except_if: None,
     };
-    let rules = CompiledRules::compile(&[cfg]).expect("compile");
+    let rules = compile(&[cfg]).expect("compile");
     let domain = crate::rules::DEFAULT_DOMAIN;
 
     // Pre-populate so the aggregate is way over the limit.
@@ -583,7 +584,7 @@ fn build_two_rules_varied(name_a: &str, key_a: &str, name_b: &str, key_b: &str) 
         mode: EnforcementMode::Enforce,
         except_if: None,
     };
-    CompiledRules::compile(&[mk(name_a, key_a), mk(name_b, key_b)]).expect("compile two rules")
+    compile(&[mk(name_a, key_a), mk(name_b, key_b)]).expect("compile two rules")
 }
 
 #[test]
@@ -671,7 +672,7 @@ fn decide_all_mixed_decline_and_cardinality_returns_cardinality() {
         mode: EnforcementMode::Enforce,
         except_if: None,
     };
-    let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
+    let rules = compile(&[cfg_a, cfg_b]).expect("compile");
     let domain = crate::rules::DEFAULT_DOMAIN;
     let ctx = AccessCtx {
         rules: &rules,
@@ -718,7 +719,7 @@ fn decide_all_one_rule_exempt_one_rejects() {
         mode: EnforcementMode::Enforce,
         except_if: None,
     };
-    let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
+    let rules = compile(&[cfg_a, cfg_b]).expect("compile");
     let domain = crate::rules::DEFAULT_DOMAIN;
 
     let store = ShmAggregateStore::new(region);
@@ -767,7 +768,7 @@ fn cardinality_skip_does_not_push_queue_event() {
         },
     };
     let vars = MockVars::new().set("http_x_tenant", "alice");
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide_all(ctx, &[0], &vars, 0);
     assert!(matches!(outcome, AccessOutcome::Cardinality));
     let mut out = [QueueEvent::default(); 4];
     assert_eq!(region.queue().drain(&mut out), 0);
@@ -792,7 +793,7 @@ fn except_does_not_count_cardinality() {
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
         .set("trusted", "1");
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide_all(ctx, &[0], &vars, 0);
     // Exempt-only outcome — no rule produced a quota view.
     assert!(matches!(outcome, AccessOutcome::Allow(None)));
     let snap = region.stats().snapshot();
@@ -832,7 +833,7 @@ fn per_rule_exempt_counter_bumps_only_target_rule() {
         mode: EnforcementMode::Enforce,
         except_if: Some("trusted_b".into()),
     };
-    let rules = CompiledRules::compile(&[cfg_a, cfg_b]).expect("compile");
+    let rules = compile(&[cfg_a, cfg_b]).expect("compile");
     let ctx = AccessCtx {
         rules: &rules,
         aggregate: region.aggregate(),
@@ -876,7 +877,7 @@ fn unknown_predicate_variable_fails_at_compile() {
         mode: EnforcementMode::Enforce,
         except_if: Some("bad-ident".into()),
     };
-    let err = CompiledRules::compile(&[cfg]).expect_err("predicate compile rejected");
+    let err = compile(&[cfg]).expect_err("predicate compile rejected");
     assert!(
         matches!(err, RuleConfigError::CompileBinding { .. }),
         "expected CompileBinding, got {err:?}"
@@ -962,7 +963,7 @@ fn allow_info_under_limit_dry_run_emits_positive_remaining() {
         mode: EnforcementMode::DryRun,
         except_if: None,
     };
-    let rules = CompiledRules::compile(&[cfg]).expect("compile");
+    let rules = compile(&[cfg]).expect("compile");
     let ctx = AccessCtx {
         rules: &rules,
         aggregate: region.aggregate(),

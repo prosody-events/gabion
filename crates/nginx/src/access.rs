@@ -33,7 +33,7 @@ pub use crate::rules::CardinalitySettings;
 
 /// Resolve a compiled binding against the in-flight request. The access
 /// path borrows directly from nginx-owned buffers; the `&[u8]` returned
-/// must live for the duration of `decide`. A return value of `None` skips
+/// must live for the duration of `decide_all`. A return value of `None` skips
 /// the rule for the request (fail-open under the allow-by-default
 /// principle).
 pub trait VariableLookup {
@@ -139,18 +139,6 @@ struct QuotaSnapshot {
     /// Budget remaining after this request. Saturating: a `DryRun` rule
     /// already past `spec.limit` reports `0`.
     remaining: u64,
-}
-
-/// Evaluate one request against the rule indicated by `rule_index`.
-/// Wraps [`decide_all`] for the common single-rule case (and the legacy
-/// in-crate tests).
-pub fn decide(
-    ctx: AccessCtx<'_>,
-    rule_index: usize,
-    vars: &impl VariableLookup,
-    now_millis: u64,
-) -> AccessOutcome {
-    decide_all(ctx, &[rule_index], vars, now_millis)
 }
 
 /// Evaluate one request against every rule in `rule_indices`. Rules

@@ -21,6 +21,7 @@
 use gabion::crdt::{DeltaSink, ExpirationSink};
 use gabion::gossip::AggregateStore;
 use gabion::rules::RuleSpec;
+use gabion::throttle;
 
 use super::atomic::{AtomicU64, Ordering, fence};
 use super::{AggregateCell, ShmRegion};
@@ -253,12 +254,14 @@ impl ShmAggregateStore {
         }
         if cleared > 0 {
             tracing::info!(
+                code = "leader_takeover",
                 cleared,
                 "gabion: this worker took over gossip and emptied the previous leader's counts, \
                  so that peers' gossip refills them without counting them twice. Until then, \
                  usually a gossip tick or two, this node under-counts and may admit requests over \
-                 their limits. Nothing to do unless that persists; see `gabion_limit_zone` in the \
-                 gabion-nginx README.",
+                 their limits. Nothing to do unless it lasts more than a few gossip ticks; if it \
+                 does, check that this node receives gossip from its peers (\"Verifying \
+                 convergence\" in the gabion-nginx README).",
             );
         }
         Self {
@@ -341,11 +344,10 @@ impl ShmAggregateStore {
     /// The table had no free slot near this cell's home, so its count was
     /// not recorded.
     fn note_dropped_write(&self) {
-        let n = self.region.stats().record_aggregate_drop();
-        if n.is_power_of_two() {
+        if let Some(dropped_total) = throttle::bump_shared(&self.region.stats().aggregate_dropped) {
             tracing::warn!(
                 capacity = self.region.layout().aggregate_capacity,
-                dropped_total = n,
+                dropped_total,
                 "gabion: the shared-memory count table had no free slot for a rate-limit key, so \
                  that key's hits were not counted: its requests were allowed and it is now \
                  under-counted. The table needs a slot per rule × active key × live bucket \

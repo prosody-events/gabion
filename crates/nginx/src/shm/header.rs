@@ -81,13 +81,3 @@ impl Default for Header {
         }
     }
 }
-
-impl Header {
-    pub fn is_initialized(&self) -> bool {
-        self.magic.load(Ordering::Acquire) == SHM_MAGIC
-            && self.version.load(Ordering::Acquire) == SHM_VERSION
-    }
-}
-
-#[cfg(test)]
-mod tests;

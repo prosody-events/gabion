@@ -5,6 +5,21 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::BTreeMap;
 
+impl EndpointSlicePeerSet {
+    /// Replace the entire peer map with `other`'s, as a relist does.
+    fn replace(&mut self, other: EndpointSlicePeerSet) {
+        self.by_slice = other.by_slice;
+    }
+
+    /// Sorted, deduplicated union of every cached slice's peer set.
+    fn snapshot_peers(&self) -> Vec<Peer> {
+        let mut peers: Vec<Peer> = self.by_slice.values().flatten().copied().collect();
+        peers.sort();
+        peers.dedup();
+        peers
+    }
+}
+
 #[derive(Clone, Debug)]
 struct EndpointSliceEventsCase {
     events: Vec<EndpointSliceEvent>,
@@ -440,12 +455,12 @@ async fn local_kubernetes_endpoint_slice_watcher_emits_added_peer() {
     // ---- discovery --------------------------------------------------------
     // The watcher's stream is the signal: the test proceeds the moment the
     // first `Added` arrives. The timeout only bounds a broken watcher.
-    let discovery = EndpointSliceDiscovery::with_client(
-        client,
-        None,
-        vec![namespace.clone()],
-        vec!["gabion".to_string()],
-    );
+    let discovery = EndpointSliceDiscovery {
+        self_addr: None,
+        namespace_allow: vec![namespace.clone()],
+        service_allow: vec!["gabion".to_string()],
+        preconnected: Some(client),
+    };
     let first_added = async {
         let stream = discovery.peer_events();
         futures::pin_mut!(stream);

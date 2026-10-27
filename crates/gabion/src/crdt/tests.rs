@@ -1,8 +1,9 @@
-use super::hash::mix64;
 use super::*;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::sync::{Arc, Mutex};
 
 fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
@@ -87,9 +88,10 @@ fn remote_merge_one(
     if let Some(handle) = sink.handles.first().copied() {
         return handle;
     }
-    let rule_slot = store.find_rule(rule_fp).expect("rule interned");
+    let rule_slot = store.rule_dictionary.find(rule_fp).expect("rule interned");
     let node_slot = store
-        .find_node(NodeId(origin), inc)
+        .node_dictionary
+        .find(NodeId(origin), inc)
         .expect("origin interned");
     store
         .find(CompactCellKey {
@@ -126,9 +128,10 @@ fn local_increment_one(
         return handle;
     }
     // Saturating-already-at-max case: recover the handle by key.
-    let rule_slot = store.find_rule(rule_fp).expect("rule interned");
+    let rule_slot = store.rule_dictionary.find(rule_fp).expect("rule interned");
     let node_slot = store
-        .find_node(local().node_id, local().incarnation)
+        .node_dictionary
+        .find(local().node_id, local().incarnation)
         .expect("local node interned");
     store
         .find(CompactCellKey {
@@ -633,7 +636,7 @@ fn merge_remote_is_monotonic() {
     assert_eq!(sink.current[0], 8);
     assert_eq!(sink.deltas[0], 3);
 
-    assert_eq!(store.count_of(handle).unwrap(), 8);
+    assert_eq!(store.get(handle).unwrap().count, 8);
 }
 
 #[test]
@@ -699,6 +702,59 @@ fn capacity_is_enforced_without_growing() {
     assert_eq!(store.active_len(), 1);
     assert_eq!(store.stats().cell_store_full_rejects, 1);
     assert_eq!(store.capacity(), 1);
+}
+
+/// Collects `tracing` output so a test can read the line it asserts on.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for LogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn with_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let buffer = LogBuffer::default();
+    let writer = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+    (value, logs)
+}
+
+#[test]
+fn library_warning_names_both_spellings() {
+    let ((), logs) = with_logs(|| {
+        let mut store = small_store(1, 4);
+        store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+        let mut sink = DeltaSink::with_capacity(2);
+        for origin in [1, 2] {
+            let mut batch = ObservationBatch::with_capacity(1);
+            batch.push(observation(0x11, 0xabc, 0, origin, 1, 1, 0));
+            store.merge_remote(&batch, &mut sink);
+        }
+    });
+    let line = logs
+        .lines()
+        .find(|line| line.contains("cell_store_full"))
+        .unwrap_or_else(|| panic!("no cell_store_full line in {logs:?}"));
+    for spelling in [
+        "storage.max_cells",
+        "GABION_STORAGE_MAX_CELLS",
+        "gabion_storage_max_cells",
+        "allowed",
+    ] {
+        assert!(line.contains(spelling), "missing `{spelling}` in {line}");
+    }
 }
 
 #[test]
@@ -934,9 +990,9 @@ fn unknown_rule_cells_expire_at_default_window() {
 fn compact_id_round_trip() {
     let mut store = store_u32();
     store.intern_rule(rule_descriptor(0xAA, 1)).unwrap();
-    let rule_slot = store.find_rule(0xAA).unwrap();
+    let rule_slot = store.rule_dictionary.find(0xAA).unwrap();
     let _ = remote_merge_one(&mut store, 0xAA, 99, 7, 1, 0);
-    let node_slot = store.find_node(NodeId(99), 7).unwrap();
+    let node_slot = store.node_dictionary.find(NodeId(99), 7).unwrap();
     // Round-trip the dictionaries.
     let rd = store.rule_dictionary().descriptor(rule_slot).unwrap();
     assert_eq!(rd.fingerprint, 0xAA);
@@ -1032,7 +1088,7 @@ fn configured_rule_pinned_survives_cell_expiry() {
         21_000,
     ));
     store.ingest_local(&obs, &mut sink);
-    assert_eq!(store.find_rule(0xCAFE), Some(slot));
+    assert_eq!(store.rule_dictionary.find(0xCAFE), Some(slot));
     assert_eq!(sink.len(), 1);
     assert_ne!(
         sink.applies_locally[0], 0,
@@ -1116,42 +1172,6 @@ fn selection_epoch_dedupes_within_frame() {
     indices.sort();
     indices.dedup();
     assert_eq!(out.len(), indices.len());
-}
-
-#[test]
-fn robin_hood_backshift_keeps_probe_bounded() {
-    // Deterministic churn — insert and remove many entries and verify
-    // the index keeps probe distance bounded relative to log2(capacity).
-    let cap = 1024_u32;
-    let mut index = CellIndex::with_capacity(cap);
-    let mut occupants: Vec<(u64, u32)> = Vec::new();
-    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-    for _ in 0..(cap as usize / 2) {
-        state = mix64(state);
-        let slot = (state as u32) % (cap / 2);
-        let h = mix64(state.wrapping_add(slot as u64));
-        index.insert_unchecked(h, slot);
-        occupants.push((h, slot));
-    }
-    // Churn: remove half, insert different.
-    for _ in 0..(occupants.len() / 2) {
-        let (h, slot) = occupants.pop().unwrap();
-        index.remove(h, slot);
-    }
-    for _ in 0..(cap as usize / 4) {
-        state = mix64(state);
-        let slot = ((state >> 16) as u32) % (cap / 2) + (cap / 2);
-        let h = mix64(state.wrapping_add(slot as u64));
-        index.insert_unchecked(h, slot);
-        occupants.push((h, slot));
-    }
-    let max_dist = index.max_probe_distance();
-    // Bound is generous: should be <= load * small constant. Cap log2 = 10,
-    // and load factor is below 50%. Empirical worst case ~ a few dozen.
-    assert!(
-        max_dist < 64,
-        "max probe distance {max_dist} too large under churn"
-    );
 }
 
 #[test]
@@ -1414,12 +1434,12 @@ fn expire_emits_one_row_per_freed_cell() {
     obs.push(observation(0x22, 0xdef, 0, 6, 1, 11, 200));
     store.merge_remote(&obs, &mut sink);
 
-    let rule_local_slot = store.find_rule(0x11).unwrap();
-    let rule_doomed_slot = store.find_rule(0x22).unwrap();
+    let rule_local_slot = store.rule_dictionary.find(0x11).unwrap();
+    let rule_doomed_slot = store.rule_dictionary.find(0x22).unwrap();
     assert_eq!(rule_local_slot, rule_local);
     assert_eq!(rule_doomed_slot, rule_doomed);
-    let node5 = store.find_node(NodeId(5), 1).unwrap();
-    let node6 = store.find_node(NodeId(6), 1).unwrap();
+    let node5 = store.node_dictionary.find(NodeId(5), 1).unwrap();
+    let node6 = store.node_dictionary.find(NodeId(6), 1).unwrap();
     let h_doomed_a = store
         .find(CompactCellKey {
             rule: rule_doomed,
@@ -1579,7 +1599,7 @@ fn expire_at_and_expire_agree_for_same_now() {
     let dict_cap = b.rule_dictionary().capacity() as usize;
     let mut cur = vec![0_u32; dict_cap];
     let mut lv = vec![0_u32; dict_cap];
-    let rule_slot = b.find_rule(0x11).unwrap();
+    let rule_slot = b.rule_dictionary.find(0x11).unwrap();
     cur[rule_slot as usize] = current;
     lv[rule_slot as usize] = live;
     let mut sink_b = ExpirationSink::<u32>::with_capacity(8);
@@ -1954,7 +1974,7 @@ fn apply_mixed_op_with_sinks(
             let mut live = vec![0_u32; dict_cap];
             for fp_idx in 0..4 {
                 let fp = 0x100 + fp_idx as u128;
-                if let Some(slot) = store.find_rule(fp) {
+                if let Some(slot) = store.rule_dictionary.find(fp) {
                     cur[slot as usize] = tick.current_by_fp[fp_idx] as u32;
                     live[slot as usize] = tick.live_by_fp[fp_idx] as u32;
                 }
@@ -2014,8 +2034,8 @@ fn apply_mixed_op_to_model(model: &mut BTreeMap<PortableKey, u32>, op: &MixedOp)
 fn quickcheck_mixed_ops_match_model(ops: MixedOps) -> bool {
     let mut store = quickcheck_store_with_pinned_rules();
     let pinned_rule_slots = [
-        store.find_rule(0x100).unwrap(),
-        store.find_rule(0x101).unwrap(),
+        store.rule_dictionary.find(0x100).unwrap(),
+        store.rule_dictionary.find(0x101).unwrap(),
     ];
     let pinned_fps: BTreeSet<u128> = [0x100_u128, 0x101_u128].into_iter().collect();
     let mut model: BTreeMap<PortableKey, u32> = BTreeMap::new();

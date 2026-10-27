@@ -292,8 +292,8 @@ Other rules:
 - **Attach structured fields** (`domain = ..., descriptor_count = ...,
   failed_total = ...`) so logs are filterable. Don't bake values into
   the prose if a field will do.
-- **Rate-limit chatty warnings** with the power-of-two pattern in
-  `crates/server/src/lib.rs`. A bad client at 50k rps should produce
+- **Rate-limit chatty warnings** through `gabion::throttle`, the one
+  power-of-two helper. A bad client at 50k rps should produce
   ~log₂(N) lines, not 50k.
 - **Name the knob.** If raising a limit fixes it, name the constant
   (`STORAGE_MAX_MATCHED_RULES`) or the config key
@@ -369,6 +369,6 @@ the relevant README and link it from the surrounding context.
 - The library crate (`gabion`) knows nothing about YAML, gRPC, or
   nginx. Adapters bridge their own config to library types.
 - High-volume operator warnings (cardinality rejects, gossip record
-  failures, matched-rule overflows) use the power-of-two rate-limited
-  `tracing::warn!` pattern in `crates/server/src/lib.rs` — copy it
-  rather than inventing another throttle.
+  failures, matched-rule overflows) count each occurrence with
+  `gabion::throttle` and log only when it returns `Some`; never write
+  another throttle.

@@ -1,3 +1,4 @@
+use super::mock::compile;
 use super::*;
 
 fn binding(key: &str, var: &str) -> DescriptorBinding {
@@ -22,37 +23,30 @@ fn cfg(name: &str, bindings: Vec<DescriptorBinding>) -> RuleConfig {
 
 #[test]
 fn compiles_simple_rules() {
-    let rules = CompiledRules::compile(&[
+    let rules = compile(&[
         cfg("per_tenant", vec![binding("tenant", "http_x_tenant")]),
         cfg("per_uri", vec![binding("uri", "uri")]),
     ])
     .expect("compile");
-    assert_eq!(rules.len(), 2);
+    assert_eq!(rules.rules().len(), 2);
     assert_eq!(rules.rules()[0].rule.spec().limit, 10);
     assert_eq!(rules.rules()[0].rule.spec().live_buckets, 60);
-    let table = rules.table();
-    assert_eq!(table.len(), 2);
 }
 
 #[test]
 fn empty_bindings_reject() {
-    let err = CompiledRules::compile(&[cfg("bad", vec![])]).unwrap_err();
+    let err = compile(&[cfg("bad", vec![])]).unwrap_err();
     assert!(matches!(err, RuleConfigError::EmptyBindings(_)));
-}
-
-#[test]
-fn empty_set_rejects() {
-    let err = CompiledRules::compile(&[]).unwrap_err();
-    assert_eq!(err, RuleConfigError::Empty);
 }
 
 #[test]
 fn key_too_long_at_compile() {
     let long_key = "k".repeat(200);
     let cardinality = CardinalitySettings::default();
-    let err = CompiledRules::compile_with_cardinality(
+    let err = CompiledRules::compile_with(
         &[cfg("long", vec![binding(&long_key, "http_x")])],
         cardinality,
+        &mut NopBindingCompiler,
     )
     .unwrap_err();
     assert!(matches!(err, RuleConfigError::KeyTooLong { .. }));
@@ -63,16 +57,8 @@ fn too_many_bindings_at_compile() {
     let bindings = (0..MAX_DESCRIPTORS + 1)
         .map(|i| binding(&format!("k{i}"), &format!("v{i}")))
         .collect();
-    let err = CompiledRules::compile(&[cfg("wide", bindings)]).unwrap_err();
+    let err = compile(&[cfg("wide", bindings)]).unwrap_err();
     assert!(matches!(err, RuleConfigError::TooManyBindings(_)));
-}
-
-#[test]
-fn zero_limit_is_rejected_at_compile() {
-    let mut rule = cfg("zero", vec![binding("uri", "uri")]);
-    rule.limit = 0;
-    let err = CompiledRules::compile(&[rule]).unwrap_err();
-    assert!(matches!(err, RuleConfigError::ZeroLimit(_)));
 }
 
 #[test]

@@ -3,5 +3,7 @@ pub mod defaults;
 pub mod discovery;
 pub mod gossip;
 pub mod rules;
+pub mod settings;
+pub mod throttle;
 pub mod window;
 pub mod wire;

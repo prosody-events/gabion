@@ -19,7 +19,6 @@ gabion = { workspace = true, features = ["cell-dump"] }
 humantime.workspace = true
 humantime-serde.workspace = true
 serde.workspace = true
-serde_yaml.workspace = true
 thiserror.workspace = true
 # Host-only drivers the workspace base no longer carries: TCP/UDP sockets,
 # the multi-threaded runtime (tests), and Unix signal handling for gabiond.

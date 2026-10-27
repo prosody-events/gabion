@@ -18,7 +18,7 @@
 //! - `GABION_STORAGE_MAX_CELLS=131072`
 //! - `GABION_GOSSIP_BIND=0.0.0.0:9090`
 //! - `GABION_GOSSIP_TICK_INTERVAL=100ms`
-//! - `GABION_DISCOVERY_NAMESPACE_WHITELIST=ns-a,ns-b` (comma-separated)
+//! - `GABION_DISCOVERY_NAMESPACE_ALLOW=ns-a,ns-b` (comma-separated)
 //!
 //! Structured lists (notably `limits`, where each entry is itself a
 //! struct with nested fields and durations) cannot be expressed through
@@ -191,12 +191,6 @@ impl AppConfig {
             builder = builder.add_source(File::new(&path.to_string_lossy(), FileFormat::Yaml));
         }
         finalize(builder)
-    }
-
-    /// Parse YAML text directly, ignoring any env layering. Retained for
-    /// tests; production paths should use [`Self::load`].
-    pub fn parse_yaml(text: &str) -> Result<Self, ConfigError> {
-        serde_yaml::from_str(text).map_err(ConfigError::Yaml)
     }
 
     /// Test-only loader that takes inline YAML instead of a file path.
@@ -579,11 +573,17 @@ impl From<EnforcementModeConfig> for EnforcementMode {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("config error: {0}")]
+    #[error(
+        "gabiond could not read its configuration: {0}. Settings come from built-in defaults, \
+         then the YAML file given as the first argument, then `GABION_*` environment variables, \
+         which win over the file, so the value may come from either. See \"How configuration \
+         layers\" in the gabiond README."
+    )]
     Config(#[source] config::ConfigError),
-    #[error("yaml parse error: {0}")]
-    Yaml(#[source] serde_yaml::Error),
-    #[error("rule {0} has no descriptors")]
+    #[error(
+        "rule `{0}` has no `descriptors:`, so it could only match an Envoy descriptor with no \
+         entries. Add at least one `- key: …` entry, or remove the rule."
+    )]
     EmptyDescriptorSet(String),
     #[error("rule `{name}` is declared more than once; rule names must be unique")]
     DuplicateRule { name: String },
@@ -600,9 +600,16 @@ pub enum ConfigError {
     },
     #[error("rule `{rule}` descriptor key `{key}` must match `[A-Za-z_][A-Za-z0-9_.-]*`")]
     InvalidDescriptorKey { rule: String, key: String },
-    #[error("gossip.bind is required")]
+    #[error(
+        "gabiond cannot start: it has no gossip address to listen on, and other gabion nodes need \
+         one to reach it. Set `gossip.bind` in the YAML file (for example `0.0.0.0:9000`) or \
+         export `GABION_GOSSIP_BIND`."
+    )]
     MissingGossipBind,
-    #[error("environment variable {0} is not valid UTF-8")]
+    #[error(
+        "`{0}` contains bytes that are not valid UTF-8, which gabiond cannot read. Set it again \
+         as plain text."
+    )]
     NonUtf8EnvVar(&'static str),
 }
 

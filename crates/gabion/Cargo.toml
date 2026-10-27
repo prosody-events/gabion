@@ -53,6 +53,7 @@ cell-dump = []
 criterion.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "crdt"

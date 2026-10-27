@@ -243,7 +243,7 @@ impl http::HttpModule for Module {
                     ngx::ngx_conf_log_error!(
                         NGX_LOG_EMERG,
                         cf,
-                        "gabion: rule compile failed: {}",
+                        "gabion: `gabion_limit_rule` {}",
                         error
                     );
                     return core::Status::NGX_ERROR.into();

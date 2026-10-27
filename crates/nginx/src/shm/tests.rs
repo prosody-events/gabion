@@ -1,5 +1,7 @@
 use super::*;
+use crate::shm::header::{SHM_MAGIC, SHM_VERSION};
 use crate::shm::mock::TestZone;
+use std::sync::atomic::Ordering;
 
 #[test]
 fn layout_minimum_capacities() {
@@ -43,7 +45,8 @@ fn zone_size_sets_aggregate_capacity() {
 #[test]
 fn initialize_then_read_round_trip() {
     let (_zone, region) = TestZone::new(8, 16);
-    assert!(region.header().is_initialized());
+    assert_eq!(region.header().magic.load(Ordering::Acquire), SHM_MAGIC);
+    assert_eq!(region.header().version.load(Ordering::Acquire), SHM_VERSION);
     assert_eq!(region.queue().capacity(), 8);
     assert_eq!(region.aggregate().capacity(), 16);
     // Stats fields default to zero.

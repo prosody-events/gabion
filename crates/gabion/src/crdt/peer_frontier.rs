@@ -1,6 +1,7 @@
 //! Per-peer × per-origin frontier table.
 
 use super::{NodeId, NodeSlot};
+use crate::throttle;
 
 /// Per-peer × per-origin frontier: what we last sent to / heard acked from a
 /// given peer for each origin. **Latency optimization only** — convergence
@@ -53,10 +54,9 @@ impl PeerFrontierTable {
                 return Some(i as u16);
             }
         }
-        self.full_rejects = self.full_rejects.saturating_add(1);
-        if self.full_rejects.is_power_of_two() {
+        if let Some(rejected_total) = throttle::bump(&mut self.full_rejects) {
             tracing::warn!(
-                rejected_total = self.full_rejects,
+                rejected_total,
                 capacity = self.peer_capacity,
                 peer_node_id = %format!("{:032x}", peer.0),
                 config_key = "storage.peer_capacity",

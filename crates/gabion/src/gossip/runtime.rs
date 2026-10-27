@@ -20,6 +20,8 @@ use crate::crdt::{
     ObservationBatch,
 };
 use crate::discovery::PeerEvent;
+use crate::settings::Setting;
+use crate::throttle;
 use crate::wire::{self, PacketBuf, Packets, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
@@ -539,22 +541,20 @@ where
         let summary = match decoded {
             Ok(s) => s,
             Err(err) => {
-                self.decode_reject_count = self.decode_reject_count.saturating_add(1);
-                if self.decode_reject_count.is_power_of_two() {
+                if let Some(rejected_total) = throttle::bump(&mut self.decode_reject_count) {
                     tracing::warn!(
+                        code = "decode_rejected",
                         peer = %src,
                         error = %err,
-                        rejected_total = self.decode_reject_count,
-                        "Could not understand a gossip message from this \
-                         peer; dropping it. Common causes: the peer is \
-                         running a different gabion version, the peers are \
-                         configured with different counter sizes \
-                         (`storage.count_width`), the cluster authentication \
-                         key (`gossip.auth_key`) does not match between \
-                         peers, or the peer is sending messages larger than \
-                         this node's `gossip.max_payload_bytes`. Check the \
-                         peer's version and gabion config to find the \
-                         mismatch.",
+                        rejected_total,
+                        "Could not understand a gossip message from this peer, so it was dropped \
+                         and limits here under-count the traffic that peer handled. Usually the \
+                         peer runs a different gabion version, or its {} or {} is larger than \
+                         this node's; otherwise another program is sending UDP to this node's \
+                         gossip port. Check the peer's gabion version, and set both settings to \
+                         the same value on every node.",
+                        Setting::GossipMaxPayloadBytes,
+                        Setting::GossipMaxCellsPerFrame,
                     );
                 }
                 return;

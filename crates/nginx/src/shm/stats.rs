@@ -166,12 +166,6 @@ impl Stats {
         self.queue_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The aggregate table had no free slot for a cell, so its count was
-    /// dropped (allowed and under-counted). Returns the new total.
-    pub fn record_aggregate_drop(&self) -> u64 {
-        self.aggregate_dropped.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
     pub fn record_queue_drain(&self, n: u64) {
         if n > 0 {
             self.queue_drained.fetch_add(n, Ordering::Relaxed);

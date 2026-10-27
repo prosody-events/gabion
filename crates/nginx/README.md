@@ -476,7 +476,7 @@ they bound resource use.
 | Directive                                       | Default | Effect                                                                                |
 |-------------------------------------------------|---------|---------------------------------------------------------------------------------------|
 | `gabion_gossip_bind ADDR:PORT`                  | *(none)* | UDP bind for the gossip channel. Required for clustering; without it the node counts alone and runs no peer discovery. |
-| `gabion_gossip_cluster ID`                      | `1`     | Cluster identifier: any non-zero u128, in decimal or `0x`-prefixed hex. Frames from peers with a mismatched id are dropped. |
+| `gabion_gossip_cluster ID`                      | `1`     | Cluster identifier: any non-zero u128, in decimal or `0x`-prefixed hex. |
 | `gabion_gossip_tick_interval DURATION`          | `500ms` | Heartbeat period. Shorter = faster convergence, more UDP traffic.                     |
 | `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet. Below ~64 the encoder refuses to fit even one cell. |
 | `gabion_gossip_max_cells_per_frame N`           | `4096`  | Maximum cells encoded into one packet.                                                |
@@ -700,6 +700,10 @@ narrative. The nginx directives that bind each piece are:
 | Cluster identifier     | `gabion_gossip_cluster ID` (non-zero u128, decimal or `0x` hex) |
 | Discovery filter       | `gabion_discovery_namespace_allow`, `gabion_discovery_service_allow`, `gabion_discovery_self_addr` |
 
+On Kubernetes, discovery also needs a Service port named `gabion` and a Role;
+see the root README's
+[Kubernetes checklist](../../README.md#kubernetes-checklist).
+
 A complete cluster-side `http {}` block:
 
 ```nginx
@@ -743,8 +747,7 @@ the discovery filter doesn't match anything. The second check is the
 counter delta under load: send traffic to one replica and watch the
 counters on every other replica rise within a tick or two. If they
 don't, the gossip channel is partitioned — typical causes are a UDP
-firewall, a cluster-id mismatch, or `gabion_gossip_bind` being
-unreachable between pods.
+firewall or `gabion_gossip_bind` being unreachable between pods.
 
 The nginx adapter does not currently expose an admin HTTP endpoint.
 The SHM `Stats` snapshot (`requests`, `allowed`, `rejected`,
@@ -773,7 +776,7 @@ gabion: `gabion_limit_zone` zone name `nope!` must match `[A-Za-z0-9_]+` (matche
 gabion: `gabion_limit_rule` rule `per_ip` is missing the required `rate=Nr/s` argument
 gabion: `gabion_limit_rule` argument `key=$uri` is invalid: expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, `mode=`, `dry_run`, `except_if=`, `domain=`
 gabion: `gabion_limit_rule` argument `rate=100r/fortnight` is invalid: rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`
-gabion: `gabion_limit_rule` rule `inverted`: `window=` must be at least as long as the rate's period; a sub-period window would resolve to a zero limit. To enforce N requests in a shorter span, write the period into the rate itself (e.g. `rate=100r/500ms`).
+gabion: `gabion_limit_rule` rule `inverted`: the window must be at least as long as the rate's period; a shorter window would resolve to a zero limit. To enforce N requests in a shorter span, put the period in the rate itself (for example `100r/500ms`)
 gabion: `gabion_limit_rule` rule `per_ip` is declared more than once; rule names must be unique within an http {} block
 gabion: `gabion_limit` references rule `tenant_api`, which is not declared via `gabion_limit_rule`
 gabion: `gabion_gossip_cluster` rejected value `0`: expected a non-zero 128-bit cluster identifier shared by every peer, in decimal or `0x`-prefixed hex (e.g. `1`, `0xc0ffee`)
@@ -783,13 +786,17 @@ gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a 
 
 ## Troubleshooting
 
+Messages from the gabion library (gossip, discovery, the counter store) are
+in [`../gabion/TROUBLESHOOTING.md`](../gabion/TROUBLESHOOTING.md); the entries
+below are the module's own.
+
 | Symptom                                                                       | What it means                                                                                                                                       | Fix                                                                                                                              |
 |-------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
 | `nginx -t` says `unknown 'foo' variable`                                      | A `gabion_limit_rule` references a variable no loaded module defines.                                                                               | Load the providing module (`geoip2`, `map`, `geo`) before the `gabion_limit_rule` that references it.                            |
 | `gabion_limit references rule X, which is not declared`                       | A `gabion_limit X;` names a rule with no `gabion_limit_rule X` declaration in the same `http {}` block.                                             | Add the missing declaration or fix the name.                                                                                     |
 | `gabion_limit_rule rule X is declared more than once`                         | Two `gabion_limit_rule X ...` directives with the same name. The grammar is unambiguous; almost always a copy-paste bug.                            | Pick distinct names.                                                                                                             |
 | `gabion_limit_rule argument 'rate=0r/s' is invalid`                           | Zero rate; would deny all traffic.                                                                                                                  | Pick a non-zero positive integer. To temporarily disable a rule, use `mode=disabled`.                                            |
-| `gabion_limit_rule rule X: window= must be at least as long as the rate's period` | `window=` was paired with a rate whose period is longer (e.g. `rate=200r/s window=500ms`); the resolved limit would be zero.                    | Move the period into the rate itself (e.g. `rate=100r/500ms`) instead of pairing a short window with a longer-period rate.       |
+| `gabion_limit_rule rule X: the window must be at least as long as the rate's period` | `window=` was paired with a rate whose period is longer (e.g. `rate=200r/s window=500ms`); the resolved limit would be zero.                    | Move the period into the rate itself (for example `rate=100r/500ms`) instead of pairing a short window with a longer-period rate.       |
 | `gabion_gossip_cluster rejected value 0`                                      | The cluster ID parsed to `0`, which is almost certainly unintended.                                                                                 | Pick any non-zero u128 value shared by every peer, in decimal or `0x`-prefixed hex (`1`, `0xc0ffee`).                            |
 | `rules are declared but gabion_limit_zone is not set`                         | The config declares rules but no zone, so there is nowhere to count hits and every request would be admitted uncounted.                             | Add `gabion_limit_zone zone=gabion:64m;` to the `http {}` block, or check that the include declaring it is loaded.               |
 | `gabion: <directive> rejected value 'X': expected a duration like '100ms'`    | A tuning directive received a value it couldn't parse.                                                                                              | The error names the directive and the expected format; supply a humantime duration (`100ms`, `5s`).                              |
@@ -801,6 +808,20 @@ gabion: `gabion_gossip_tick_interval` rejected value `notaduration`: expected a 
 | `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside a leadership term, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
 | `peer discovery error` (warn) in the error log                                | The Kubernetes discovery stream returned an error this tick. Membership is stale until the next successful tick.                                    | Usually transient (apiserver flap, transient watch reset). If persistent, check pod RBAC / network reachability to the API.      |
 | `gabion: failed to draw gossip RNG seed` (error) in the error log             | `getrandom` failed at worker startup. This worker keeps serving requests but never drives gossip; another worker can still lead.                              | Inspect the wrapped `error` field. Usually a sandboxed environment denying `/dev/urandom`; either lift the restriction or supply `gabion_runtime_rng_seed N` to bypass the entropy draw. |
+
+### `leader_takeover`
+
+**Level** info, once per takeover · **Request allowed** yes, and may briefly over-admit · **Emitted by** NGINX module only
+
+Message starts: "gabion: this worker took over gossip and emptied the previous leader's counts"
+
+**What happened.** This worker became the gossip leader and emptied the shared count table the previous leader left behind, so peers' gossip can refill it without counting anything twice. Until then, usually a gossip tick or two, this node under-counts and may admit requests over their limits.
+
+**Why.** The previous leader exited (a reload, `nginx -s quit`, or a crash) and this worker won the lease.
+
+**What to do next.** Nothing, unless it lasts more than a few gossip ticks. If it does, check that this node receives gossip from its peers ("Verifying convergence" above).
+
+**Fields** `cleared` · **Knob** none
 
 Operator-facing errors are written to answer three questions: *what
 happened*, *why it likely happened*, and *what to do next*. If you

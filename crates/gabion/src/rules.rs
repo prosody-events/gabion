@@ -250,33 +250,36 @@ fn stable_hasher() -> RawHasher<[u8; DEFAULT_SECRET_LENGTH]> {
 
 // -- rate parsing & window/bucket resolution --------------------------------
 
+const RATE_PERIOD_ERR: &str =
+    "rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`";
+
 /// Parse a `rate=` value into `(count, period)`.
 ///
 /// The suffix after `r/` is either a single-letter unit (`s`, `m`, `h`,
 /// `d`) or a [humantime] duration (`30s`, `5m`, `2h30m`). Zero counts and
-/// zero periods are rejected at parse time so `cfg.limit.max(1)` is never
-/// load-bearing in downstream code.
+/// periods under 1 ms are rejected at parse time so `cfg.limit.max(1)` is
+/// never load-bearing in downstream code.
 ///
 /// Shared by both adapters so two nodes with identical rule text agree on
 /// what `rate=10r/s` means.
 ///
 /// [humantime]: https://docs.rs/humantime
-const RATE_PERIOD_ERR: &str =
-    "rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`";
-
 pub fn parse_rate(input: &str) -> Result<(u64, Duration), &'static str> {
     let input = input.trim();
     let Some((number, period)) = input.split_once("r/") else {
         return Err(
-            "expected `rate=Nr/<unit>` where unit is `s|m|h|d` or a duration (e.g. `rate=100r/s`, \
-             `rate=10r/5m`)",
+            "expected `Nr/<unit>`, where unit is `s`, `m`, `h`, `d` or a duration (for example \
+             `100r/s` or `10r/5m`)",
         );
     };
-    let count: u64 = number
-        .parse()
-        .map_err(|_| "rate count must be a non-negative integer (e.g. `rate=100r/s`)")?;
+    let count: u64 = number.parse().map_err(|_| {
+        "the request count before `r/` must be a whole number of at least 1 (for example `100r/s`)"
+    })?;
     if count == 0 {
-        return Err("`rate=` must be a positive integer; zero would deny all traffic");
+        return Err(
+            "the request count is 0, which would deny all traffic; use a whole number of at least \
+             1, or mode `disabled` to turn the rule off",
+        );
     }
     let duration = match period {
         "s" => Duration::from_secs(1),
@@ -285,8 +288,11 @@ pub fn parse_rate(input: &str) -> Result<(u64, Duration), &'static str> {
         "d" => Duration::from_secs(60 * 60 * 24),
         other => humantime::parse_duration(other).map_err(|_| RATE_PERIOD_ERR)?,
     };
-    if duration.is_zero() {
-        return Err("rate period must be greater than zero");
+    if duration < Duration::from_millis(1) {
+        return Err(
+            "the rate's period is shorter than 1 ms, gabion's smallest time unit; use a period of \
+             at least `1ms`",
+        );
     }
     Ok((count, duration))
 }
@@ -307,18 +313,21 @@ pub struct ResolvedRate {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum RateResolveError {
     #[error(
-        "`window=` must be at least as long as the rate's period; a sub-period window would \
-         resolve to a zero limit. To enforce N requests in a shorter span, write the period into \
-         the rate itself (e.g. `rate=100r/500ms`)."
+        "the window must be at least as long as the rate's period; a shorter window would resolve \
+         to a zero limit. To enforce N requests in a shorter span, put the period in the rate \
+         itself (for example `100r/500ms`)"
     )]
     WindowShorterThanPeriod,
-    #[error("`window=` must be greater than zero")]
+    #[error(
+        "the window is zero, so the rule could never admit a request. Omit the window to use the \
+         rate's period; to turn a rule off, use mode `disabled`"
+    )]
     ZeroWindow,
-    #[error("`bucket=` must be greater than zero")]
+    #[error("the bucket is zero. `bucket` defaults to `window`; omit it for one bucket per window")]
     ZeroBucket,
     #[error(
-        "rate × window would overflow a 64-bit limit; pick a smaller `rate=` count or a shorter \
-         `window=`"
+        "rate × window overflows a 64-bit limit; check for a unit typo (`ms` versus `m`), or use \
+         a smaller count or a shorter window"
     )]
     LimitOverflow,
 }

@@ -56,18 +56,6 @@ impl<C: Count> EventEmittingAggregateStore<C> {
     pub fn total(&self) -> u64 {
         self.inner.borrow().values().copied().sum()
     }
-
-    /// Total stored count for one rule fingerprint. The visualizer watches a
-    /// single rule in v1, so this is the per-node line the convergence fan
-    /// draws.
-    pub fn total_for_rule(&self, rule: u128) -> u64 {
-        self.inner
-            .borrow()
-            .iter()
-            .filter(|((r, ..), _)| *r == rule)
-            .map(|(_, c)| *c)
-            .sum()
-    }
 }
 
 impl<C: Count> AggregateStore<C> for EventEmittingAggregateStore<C> {

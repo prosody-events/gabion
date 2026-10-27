@@ -1,9 +1,10 @@
 //! gRPC adapter tests. Driven through a sim-routed gossip runtime so the
 //! whole record-then-read flow exercises real CRDT + AggregateStore code.
 
+use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
 
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
@@ -13,6 +14,7 @@ use gabion::crdt::{CellStore, CellStoreConfig, NodeId, NodeIdentity, RuleDescrip
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{GossipConfig, GossipRuntime, TokioClock};
 use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleTable};
+use gabion::settings::Setting;
 
 use super::*;
 use crate::admission::CardinalityLimits;
@@ -47,20 +49,30 @@ fn rule_tenant(limit: u64) -> Rule {
 }
 
 async fn harness(max_descriptor_bytes: usize, limit: u64) -> Harness {
+    let cardinality_limits = CardinalityLimits {
+        max_descriptor_count: 16,
+        max_descriptor_bytes,
+        max_key_bytes: 64,
+    };
+    harness_with(vec![rule_tenant(limit)], cardinality_limits).await
+}
+
+async fn harness_with(rules: Vec<Rule>, cardinality_limits: CardinalityLimits) -> Harness {
     let router = SimRouter::new();
     let addr = next_test_addr();
     let transport = router.bind(addr);
     let identity = NodeIdentity::new(NodeId(0xAA00), 1);
-    let rule = rule_tenant(limit);
     let mut store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
-    store.intern_rule(RuleDescriptor {
-        fingerprint: rule.fingerprint,
-        window_millis: rule.window_millis as u32,
-        bucket_millis: rule.bucket_millis as u32,
-        limit: rule.limit,
-        flags: 0,
-        local_rule_id: rule.id,
-    });
+    for rule in &rules {
+        store.intern_rule(RuleDescriptor {
+            fingerprint: rule.fingerprint,
+            window_millis: rule.window_millis as u32,
+            bucket_millis: rule.bucket_millis as u32,
+            limit: rule.limit,
+            flags: 0,
+            local_rule_id: rule.id,
+        });
+    }
     let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
 
     let gossip_config = GossipConfig {
@@ -78,12 +90,7 @@ async fn harness(max_descriptor_bytes: usize, limit: u64) -> Harness {
     );
     let gossip_handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
-    let rule_table = Arc::new(RuleTable::new(vec![rule]));
-    let cardinality_limits = CardinalityLimits {
-        max_descriptor_count: 16,
-        max_descriptor_bytes,
-        max_key_bytes: 64,
-    };
+    let rule_table = Arc::new(RuleTable::new(rules));
     let limiter = SharedLimiter::new(rule_table, client.clone(), counts, cardinality_limits);
 
     Harness {
@@ -91,6 +98,43 @@ async fn harness(max_descriptor_bytes: usize, limit: u64) -> Harness {
         gossip_handle,
         client,
     }
+}
+
+/// Collects `tracing` output so a test can read the line it asserts on.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for LogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Run `body` and return its value with everything it logged. `run_local`
+/// polls every task on the calling thread, so the thread-local subscriber
+/// sees every event.
+fn with_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
+    let buffer = LogBuffer::default();
+    let writer = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, body);
+    let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+    (value, logs)
+}
+
+/// The one log line carrying `code`.
+fn line_with<'a>(logs: &'a str, code: &str) -> &'a str {
+    logs.lines()
+        .find(|line| line.contains(code))
+        .unwrap_or_else(|| panic!("no `{code}` line in {logs:?}"))
 }
 
 fn run_local<F: std::future::Future<Output = T>, T>(future: F) -> T {
@@ -233,82 +277,162 @@ fn rejects_requests_over_cardinality_limits_before_recording() {
 /// More rules match a single request than `STORAGE_MAX_MATCHED_RULES`
 /// allows. Per the allow-by-default principle in CLAUDE.md, gabion's
 /// internal cap is not a client-facing reject — the request must pass
-/// through. Records for the rules that fit in the buffer are still
-/// emitted; the rest are silently under-counted.
+/// through, and the warning must say so.
 #[test]
-fn matched_rule_overflow_allows_rather_than_rejects() {
-    run_local(async {
-        let router = SimRouter::new();
-        let addr = next_test_addr();
-        let transport = router.bind(addr);
-        let identity = NodeIdentity::new(NodeId(0xAA01), 1);
+fn matched_rule_overflow_says_allowed() {
+    let (code, logs) = with_logs(|| {
+        run_local(async {
+            let overflow = gabion::defaults::STORAGE_MAX_MATCHED_RULES + 4;
+            let rules: Vec<Rule> = (0..overflow)
+                .map(|i| {
+                    Rule::new(
+                        (i + 1) as u32,
+                        "api",
+                        vec![DescriptorPattern {
+                            key: "tenant".into(),
+                            value: "*".into(),
+                        }],
+                        100,
+                        1_000,
+                        100,
+                        EnforcementMode::Enforce,
+                    )
+                })
+                .collect();
+            let harness = harness_with(rules, CardinalityLimits::default()).await;
+            let request = RateLimitRequest {
+                domain: "api".into(),
+                descriptors: vec![descriptor([("tenant", "a")])],
+                hits_addend: 1,
+            };
+            let response = harness.limiter.should_rate_limit_at(request, 0).await;
+            let _ = harness.client.shutdown().await;
+            response.overall_code
+        })
+    });
 
-        let overflow = gabion::defaults::STORAGE_MAX_MATCHED_RULES + 4;
-        let rules: Vec<Rule> = (0..overflow)
-            .map(|i| {
-                Rule::new(
-                    (i + 1) as u32,
-                    "api",
-                    vec![DescriptorPattern {
-                        key: "tenant".into(),
-                        value: "*".into(),
-                    }],
-                    100,
-                    1_000,
-                    100,
-                    EnforcementMode::Enforce,
-                )
-            })
-            .collect();
+    assert_eq!(code, rate_limit_response::Code::Ok as i32);
+    let line = line_with(&logs, "matched_rule_overflow");
+    assert!(line.contains("allowed"), "{line}");
+    assert!(line.contains("under-count"), "{line}");
+    assert!(!line.contains("rejected"), "{line}");
+}
 
-        let mut store = CellStore::<u32>::new(CellStoreConfig::default(), identity);
-        for rule in &rules {
-            store.intern_rule(RuleDescriptor {
-                fingerprint: rule.fingerprint,
-                window_millis: rule.window_millis as u32,
-                bucket_millis: rule.bucket_millis as u32,
-                limit: rule.limit,
-                flags: 0,
-                local_rule_id: rule.id,
-            });
-        }
-        let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
-        let gossip_config = GossipConfig {
-            local_identity: identity,
-            rng_seed: 1,
-            ..GossipConfig::default()
-        };
-        let (rt, client) = GossipRuntime::from_parts(
-            transport,
-            TokioClock::from_millis(0),
-            gossip_config,
-            store,
-            counts.clone(),
-        );
-        let _handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+/// Send one request with `descriptors` through a limiter built with `limits`
+/// and return its response with the logs it wrote.
+fn cardinality_reject_logs(
+    limits: CardinalityLimits,
+    descriptors: Vec<RateLimitDescriptor>,
+) -> (RateLimitResponse, String) {
+    with_logs(|| {
+        run_local(async {
+            let harness = harness_with(vec![rule_tenant(u64::from(u32::MAX))], limits).await;
+            let request = RateLimitRequest {
+                domain: "api".into(),
+                descriptors,
+                hits_addend: 1,
+            };
+            let response = harness.limiter.should_rate_limit_at(request, 0).await;
+            let _ = harness.client.shutdown().await;
+            response
+        })
+    })
+}
 
-        let rule_table = Arc::new(RuleTable::new(rules));
-        let cardinality_limits = CardinalityLimits {
-            max_descriptor_count: 16,
-            max_descriptor_bytes: 512,
-            max_key_bytes: 64,
-        };
-        let limiter = SharedLimiter::new(rule_table, client.clone(), counts, cardinality_limits);
-
-        let request = RateLimitRequest {
-            domain: "api".into(),
-            descriptors: vec![descriptor([("tenant", "a")])],
-            hits_addend: 1,
-        };
-        let response = limiter.should_rate_limit_at(request, 0).await;
-
+#[test]
+fn cardinality_warning_names_the_exceeded_key() {
+    let limits = |count, bytes, key| CardinalityLimits {
+        max_descriptor_count: count,
+        max_descriptor_bytes: bytes,
+        max_key_bytes: key,
+    };
+    let cases = [
+        (
+            Setting::StorageMaxDescriptorCount,
+            limits(1, 512, 64),
+            descriptor([("tenant", "a"), ("x", "b")]),
+            1,
+        ),
+        (
+            Setting::StorageMaxDescriptorBytes,
+            limits(16, 8, 64),
+            descriptor([("tenant", "long-value")]),
+            8,
+        ),
+        (
+            Setting::StorageMaxKeyBytes,
+            limits(16, 512, 2),
+            descriptor([("tenant", "a")]),
+            2,
+        ),
+    ];
+    let all = [
+        Setting::StorageMaxDescriptorCount,
+        Setting::StorageMaxDescriptorBytes,
+        Setting::StorageMaxKeyBytes,
+    ];
+    for (setting, limits, descriptor, max) in cases {
+        let (response, logs) = cardinality_reject_logs(limits, vec![descriptor]);
         assert_eq!(
             response.overall_code,
-            rate_limit_response::Code::Ok as i32,
-            "matched-rules overflow must allow, not reject — see CLAUDE.md",
+            rate_limit_response::Code::OverLimit as i32
         );
-        let _ = client.shutdown().await;
-    });
+        let line = line_with(&logs, "cardinality_rejected");
+        assert!(line.contains(setting.yaml_key()), "{line}");
+        assert!(line.contains(setting.env_var()), "{line}");
+        assert!(line.contains(&format!("max={max}")), "{line}");
+        for other in all.into_iter().filter(|other| *other != setting) {
+            assert!(!line.contains(other.yaml_key()), "{line}");
+        }
+    }
+}
+
+#[test]
+fn every_cardinality_reject_logs() {
+    let defaults = CardinalityLimits {
+        max_descriptor_count: 16,
+        max_descriptor_bytes: 512,
+        max_key_bytes: 64,
+    };
+    let too_many_descriptors = (0..=MAX_DESCRIPTORS)
+        .map(|i| descriptor([("tenant", format!("t-{i}"))]))
+        .collect();
+    let too_many_entries = descriptor((0..=MAX_DESCRIPTORS).map(|i| (format!("k{i}"), "v")));
+    let too_long = CardinalityLimits {
+        max_descriptor_bytes: 8,
+        ..defaults
+    };
+    let cases = [
+        (
+            "request descriptors",
+            defaults,
+            too_many_descriptors,
+            "request_descriptors",
+        ),
+        (
+            "mapping",
+            defaults,
+            vec![too_many_entries],
+            "storage.max_descriptor_count",
+        ),
+        (
+            "evaluate",
+            too_long,
+            vec![descriptor([("tenant", "long-value")])],
+            "storage.max_descriptor_bytes",
+        ),
+    ];
+    for (site, limits, descriptors, expected) in cases {
+        let (response, logs) = cardinality_reject_logs(limits, descriptors);
+        let status = response.statuses.last().expect("a status");
+        assert_eq!(
+            status.code,
+            rate_limit_response::Code::OverLimit as i32,
+            "{site}"
+        );
+        let line = line_with(&logs, "cardinality_rejected");
+        assert!(line.contains(expected), "{site}: {line}");
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -3,6 +3,7 @@
 //! presents to the rule table.
 
 use gabion::rules::Descriptor;
+use gabion::settings::Setting;
 
 /// Result of evaluating one descriptor's rules.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,23 +93,74 @@ pub struct LimitRequest<'a> {
     pub hits: u64,
 }
 
+/// Which part of the cardinality envelope a request exceeded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CardinalityLimit {
+    /// More descriptors in one request than gabion evaluates (a build
+    /// constant).
+    RequestDescriptors,
+    /// More entries in one descriptor than `max_descriptor_count`.
+    Count,
+    /// A descriptor's domain, keys and values total more than
+    /// `max_descriptor_bytes`.
+    Bytes,
+    /// One descriptor key is longer than `max_key_bytes`.
+    KeyBytes,
+}
+
+impl CardinalityLimit {
+    /// The `limit` log field, the setting that raises this limit (none for a
+    /// build constant), and the operator's next step.
+    pub(crate) fn describe(self) -> (&'static str, Option<Setting>, &'static str) {
+        match self {
+            Self::RequestDescriptors => (
+                "request_descriptors",
+                None,
+                "gabion evaluates at most `max` descriptors of one request, a build-time constant \
+                 (`STORAGE_MAX_DESCRIPTOR_COUNT`) that config cannot raise; if the traffic is \
+                 legitimate, have Envoy send fewer descriptors per request.",
+            ),
+            Self::Count => (
+                "count",
+                Some(Setting::StorageMaxDescriptorCount),
+                "If the traffic is legitimate, raise `storage.max_descriptor_count` \
+                 (`GABION_STORAGE_MAX_DESCRIPTOR_COUNT`); values above 16, the build-time cap \
+                 `STORAGE_MAX_DESCRIPTOR_COUNT`, have no effect.",
+            ),
+            Self::Bytes => (
+                "bytes",
+                Some(Setting::StorageMaxDescriptorBytes),
+                "If the traffic is legitimate, raise `storage.max_descriptor_bytes` \
+                 (`GABION_STORAGE_MAX_DESCRIPTOR_BYTES`).",
+            ),
+            Self::KeyBytes => (
+                "key_bytes",
+                Some(Setting::StorageMaxKeyBytes),
+                "If the traffic is legitimate, raise `storage.max_key_bytes` \
+                 (`GABION_STORAGE_MAX_KEY_BYTES`).",
+            ),
+        }
+    }
+}
+
 impl LimitRequest<'_> {
-    pub fn violates_cardinality(self, limits: CardinalityLimits) -> bool {
+    /// The first limit this request exceeds and its bound, if any.
+    pub fn exceeded_limit(self, limits: CardinalityLimits) -> Option<(CardinalityLimit, usize)> {
         if self.descriptors.len() > limits.max_descriptor_count {
-            return true;
+            return Some((CardinalityLimit::Count, limits.max_descriptor_count));
         }
         let mut bytes = self.domain.len();
         for descriptor in self.descriptors {
             if descriptor.key.len() > limits.max_key_bytes {
-                return true;
+                return Some((CardinalityLimit::KeyBytes, limits.max_key_bytes));
             }
             bytes = bytes
                 .saturating_add(descriptor.key.len())
                 .saturating_add(descriptor.value.len());
             if bytes > limits.max_descriptor_bytes {
-                return true;
+                return Some((CardinalityLimit::Bytes, limits.max_descriptor_bytes));
             }
         }
-        false
+        None
     }
 }

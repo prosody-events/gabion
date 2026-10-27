@@ -173,20 +173,7 @@ impl CellIndex {
         self.hashes.iter_mut().for_each(|h| *h = 0);
         self.len = 0;
     }
-
-    /// Maximum probe distance currently in use. O(capacity).
-    pub fn max_probe_distance(&self) -> u32 {
-        let mut max = 0_u32;
-        for slot in 0..self.capacity {
-            let stored = self.slot_indexes[slot as usize];
-            if stored == EMPTY_INDEX_SLOT {
-                continue;
-            }
-            let d = self.probe_distance(slot, self.hashes[slot as usize]);
-            if d > max {
-                max = d;
-            }
-        }
-        max
-    }
 }
+
+#[cfg(test)]
+mod tests;

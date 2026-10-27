@@ -228,9 +228,13 @@ The `gabiond` YAML keys are `gossip.bind` (UDP `host:port`),
 `gossip.cluster_id_hash` (non-zero u128 shared across peers),
 `discovery.namespace_allow` / `discovery.service_allow` (Kubernetes
 EndpointSlice filters), and `discovery.self_addr` (this pod's own
-`host:port` from `POD_IP`, excluded from the peer set). Bind a
-ServiceAccount with `endpointslices` `get`/`list`/`watch` on the
-deployment; without it, discovery logs `403` and the peer set stays
+`host:port` from `POD_IP`, excluded from the peer set). Discovery needs
+the Role in the root README's
+[Kubernetes checklist](../../README.md#kubernetes-checklist): `get` on
+Pods and `get`/`list`/`watch` on Services and EndpointSlices, bound to the
+pod's ServiceAccount
+([`deploy/kubernetes/gabion-discovery-rbac.yaml`](../../deploy/kubernetes/gabion-discovery-rbac.yaml)).
+Without it, discovery logs `kubernetes_forbidden` and the peer set stays
 empty.
 
 Tuning the gossip cadence is rarely necessary, since the defaults
@@ -263,21 +267,62 @@ Every operator-facing warning answers three questions: what happened,
 why it is likely happening, and the next thing to try. Warnings that
 can fire at request rate are throttled, so a misbehaving client at
 high rate produces a handful of log lines rather than a continuous
-flood.
+flood. Messages from the gabion library (gossip, discovery, the counter
+store) are in [`../gabion/TROUBLESHOOTING.md`](../gabion/TROUBLESHOOTING.md);
+the entries below are `gabiond`'s own.
 
 | Symptom (verbatim from the error string)                                                                                       | What it means                                                                                          | Fix                                                                                                                          |
 |--------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
-| `` config error: … missing field `name` ``                                                                                     | A `limits:` entry is missing a required field.                                                         | Supply `name`, `domain`, `descriptors`, and `rate`. `window` and `bucket` are optional.                                       |
+| `` gabiond could not read its configuration: … missing field `name` ``                                                         | A `limits:` entry is missing a required field.                                                         | Supply `name`, `domain`, `descriptors`, and `rate`. `window` and `bucket` are optional.                                       |
 | `` rule `X` is declared more than once; rule names must be unique ``                                                           | Two `limits:` entries share a `name:`.                                                                 | Pick distinct names.                                                                                                          |
 | `` rule `X` has an invalid `rate:` value: …. Use e.g. `rate: 100r/s` or `rate: 10r/5m`. ``                                     | The `rate:` string didn't parse, or its count is zero.                                                 | Write a non-zero count and a unit (`s`, `ms`, `m`, `h`). A zero rate is refused because it would deny all traffic.            |
-| `` rule `X`: `window=` must be at least as long as the rate's period; … e.g. `rate=100r/500ms` ``                              | An explicit `window:` was shorter than the rate's period; the resolved limit would be zero.            | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
+| `` rule `X`: the window must be at least as long as the rate's period; … for example `100r/500ms` ``                              | An explicit `window:` was shorter than the rate's period; the resolved limit would be zero.            | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
 | `` rule `X` descriptor key `Y` must match `[A-Za-z_][A-Za-z0-9_.-]*` ``                                                        | A descriptor key uses an unsupported character.                                                        | Use identifier-like names. Underscore, dot, and dash are allowed inside; the first character must be a letter or underscore.  |
-| `gossip.bind is required`                                                                                                      | No bind address was supplied.                                                                          | Set `gossip.bind` in YAML or `GABION_GOSSIP_BIND` in env.                                                                     |
-| `environment variable GABION_X is not valid UTF-8`                                                                             | A non-UTF-8 byte appeared in `GABION_X`.                                                               | Re-export the env var with a valid UTF-8 value.                                                                               |
+| `gabiond cannot start: it has no gossip address to listen on …`                                                                | No bind address was supplied.                                                                          | Set `gossip.bind` in YAML or `GABION_GOSSIP_BIND` in env.                                                                     |
+| `` `GABION_X` contains bytes that are not valid UTF-8 ``                                                                       | A non-UTF-8 byte appeared in `GABION_X`.                                                               | Re-export the env var with a valid UTF-8 value.                                                                               |
 | `OVER_LIMIT` for every descriptor                                                                                              | The configured `rate:` is below sustained load.                                                        | Raise the rate, widen the window, or split the rule. Re-run with `mode: dry_run` while you measure.                           |
-| *"Rejecting requests that attach too many rate-limit descriptors."*                                                            | A client sent more descriptors, larger descriptors, or larger keys than the configured envelope.       | Raise `storage.max_descriptor_count`, `storage.max_descriptor_bytes`, or `storage.max_key_bytes` in YAML; restart.            |
-| *"This node can no longer share rate-limit counts with the rest of the cluster."*                                              | The gossip background task has stopped. Counters keep working off local traffic only.                  | Look for an earlier error log entry — gossip exits after surfacing a typed error. Fix that and restart.                       |
-| *"A single request matched more rules than gabion's per-request cap allows"*                                                   | A request matched more than `STORAGE_MAX_MATCHED_RULES` (= 16) rules. Gabion **allowed** the request.  | Reduce overlapping rule patterns or split the rule space across multiple `domain:` values. The cap is a compile-time const.   |
+
+### `cardinality_rejected`
+
+**Level** warn, power of two · **Request allowed** no, rejected (`OVER_LIMIT`) · **Emitted by** `gabiond`
+
+Message starts: "Rejecting requests that attach too many or too large rate-limit descriptors."
+
+**What happened.** A request exceeded the cardinality envelope, so `gabiond` rejected that descriptor before touching any counter. The `limit` field says which part: `count` (too many entries in one descriptor), `bytes` (domain, keys and values too long in total), `key_bytes` (one key too long) or `request_descriptors` (too many descriptors in one request).
+
+**Why.** Usually a misbehaving client or an attack trying to exhaust gabion's tracking memory; occasionally a legitimate client whose descriptors outgrew the defaults.
+
+**What to do next.** If the traffic is legitimate, raise the setting in `config_key` and restart: `storage.max_descriptor_count` (values above the build-time cap of 16 have no effect), `storage.max_descriptor_bytes` or `storage.max_key_bytes`. `request_descriptors` has no setting: it is the build-time constant `STORAGE_MAX_DESCRIPTOR_COUNT` (16), so have Envoy send fewer descriptors per request.
+
+**Fields** `domain`, `limit`, `max`, `rejected_total`, `config_key` (absent for `request_descriptors`) · **Knob** `storage.max_descriptor_count` (`GABION_STORAGE_MAX_DESCRIPTOR_COUNT`), `storage.max_descriptor_bytes` (`GABION_STORAGE_MAX_DESCRIPTOR_BYTES`), `storage.max_key_bytes` (`GABION_STORAGE_MAX_KEY_BYTES`)
+
+### `gossip_record_failure`
+
+**Level** warn, power of two · **Request allowed** yes, hits not recorded · **Emitted by** `gabiond`
+
+Message starts: "This node can no longer share rate-limit counts with the rest of the cluster."
+
+**What happened.** `gabiond` could not hand a count to the gossip task. The request was allowed and its hits were not recorded, so limits under-count the requests this node handled.
+
+**Why.** The gossip background task has stopped, which happens after it surfaces a typed error.
+
+**What to do next.** Look for an earlier error log entry that says why gossip stopped, fix that, and restart the pod.
+
+**Fields** `error`, `failed_total` · **Knob** none
+
+### `matched_rule_overflow`
+
+**Level** warn, power of two · **Request allowed** yes, only the first `cap` rules counted it · **Emitted by** `gabiond`
+
+Message starts: "A request matched more than 16 rate-limit rules, the most this node counts per request."
+
+**What happened.** One request matched more rules than `gabiond` counts per request. It was allowed; the first `cap` matched rules counted and checked it, and the rest under-count.
+
+**Why.** Usually overlapping rule patterns, for example a wildcard rule alongside several specific ones.
+
+**What to do next.** Merge or narrow the overlapping rules under `limits:`, or split the rule space across `domain:` values. The cap is the build-time constant `STORAGE_MAX_MATCHED_RULES` and cannot be set in config.
+
+**Fields** `domain`, `cap`, `overflowed_total` · **Knob** none (build constant `STORAGE_MAX_MATCHED_RULES`)
 
 ## Fail-open invariant
 

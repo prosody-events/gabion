@@ -53,10 +53,6 @@ impl UdpTransport {
     pub async fn bind(addr: SocketAddr) -> io::Result<Self> {
         Ok(Self(UdpSocket::bind(addr).await?))
     }
-
-    pub fn from_socket(socket: UdpSocket) -> Self {
-        Self(socket)
-    }
 }
 
 #[cfg(feature = "transport-udp")]

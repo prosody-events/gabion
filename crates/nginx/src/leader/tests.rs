@@ -64,6 +64,7 @@ use gabion::gossip::AggregateStore;
 use gabion::rules::EnforcementMode;
 use tokio::time::timeout;
 
+use crate::rules::mock::compile;
 use crate::rules::{DEFAULT_DOMAIN, DescriptorBinding, RuleConfig};
 use crate::shm::Layout;
 use crate::shm::queue::QueueEvent;
@@ -85,7 +86,7 @@ fn leaked_region() -> ShmRegion {
 }
 
 fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
-    let rules = CompiledRules::compile(&[RuleConfig {
+    let rules = compile(&[RuleConfig {
         name: "per_tenant".into(),
         domain: DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {

@@ -89,11 +89,7 @@ async fn run() -> anyhow::Result<()> {
         config.storage.max_cells.unwrap_or(4096),
     ));
 
-    let gossip_bind = config
-        .gossip
-        .bind
-        .ok_or(ConfigError::MissingGossipBind)
-        .context("gossip.bind missing")?;
+    let gossip_bind = config.gossip.bind.ok_or(ConfigError::MissingGossipBind)?;
     let rng_seed = match config.runtime.rng_seed {
         Some(seed) => seed,
         None => gabion::defaults::random_rng_seed().context("draw gossip RNG seed")?,

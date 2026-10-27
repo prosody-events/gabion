@@ -5,11 +5,10 @@
 //! same hot-path-ready summary; this module re-exports it for source
 //! compatibility.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use gabion::defaults;
-use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId, RuleTable};
+use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId};
 use thiserror::Error;
 
 pub use gabion::rules::{RateResolveError, ResolvedRate, RuleSpec, parse_rate, resolve_rate};
@@ -154,12 +153,11 @@ pub struct CompiledRule {
     pub except_if: Option<BindingLookup>,
 }
 
-/// Composite of `RuleTable` + per-rule [`CompiledBinding`]s. Shared (via
-/// `Arc`) between every worker's location config and the leader's drain
-/// task.
+/// Every compiled `gabion_limit_rule`, in declaration order, with its
+/// per-rule [`CompiledBinding`]s. Shared (via `Arc`) between every worker's
+/// location config and the leader's drain task.
 #[derive(Debug)]
 pub struct CompiledRules {
-    table: Arc<RuleTable>,
     rules: Box<[CompiledRule]>,
 }
 
@@ -337,39 +335,15 @@ pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
 }
 
 impl CompiledRules {
-    /// Compile a list of `RuleConfig`s into a `RuleTable` + per-rule specs.
-    /// Uses the default cardinality envelope and [`NopBindingCompiler`];
-    /// for production paths, use [`Self::compile_with`] with an FFI-backed
-    /// compiler.
-    pub fn compile(configs: &[RuleConfig]) -> Result<Self, RuleConfigError> {
-        Self::compile_with(
-            configs,
-            CardinalitySettings::default(),
-            &mut NopBindingCompiler,
-        )
-    }
-
-    /// Compile with operator-supplied cardinality limits and the default
-    /// [`NopBindingCompiler`] (suitable for tests).
-    pub fn compile_with_cardinality(
-        configs: &[RuleConfig],
-        cardinality: CardinalitySettings,
-    ) -> Result<Self, RuleConfigError> {
-        Self::compile_with(configs, cardinality, &mut NopBindingCompiler)
-    }
-
-    /// Full compile path: resolves each binding source through the supplied
+    /// The one constructor: resolves each binding source through the supplied
     /// [`BindingCompiler`], including the per-rule `except_if` predicate.
+    /// Tests pass [`NopBindingCompiler`].
     pub fn compile_with<C: BindingCompiler>(
         configs: &[RuleConfig],
         cardinality: CardinalitySettings,
         compiler: &mut C,
     ) -> Result<Self, RuleConfigError> {
-        if configs.is_empty() {
-            return Err(RuleConfigError::Empty);
-        }
         let mut compiled = Vec::with_capacity(configs.len());
-        let mut rules = Vec::with_capacity(configs.len());
         for (idx, cfg) in configs.iter().enumerate() {
             if cfg.bindings.is_empty() {
                 return Err(RuleConfigError::EmptyBindings(cfg.name.to_string()));
@@ -394,9 +368,6 @@ impl CompiledRules {
                     value: Box::from("*"),
                 })
                 .collect();
-            if cfg.limit == 0 {
-                return Err(RuleConfigError::ZeroLimit(cfg.name.to_string()));
-            }
             let rule = Rule::new(
                 id,
                 cfg.domain.to_string(),
@@ -406,7 +377,6 @@ impl CompiledRules {
                 duration_millis(cfg.bucket),
                 cfg.mode,
             );
-            rules.push(rule.clone());
             let mut bindings = Vec::with_capacity(cfg.bindings.len());
             for binding in &cfg.bindings {
                 let lookup = compiler.compile(&binding.source).map_err(|err| {
@@ -443,55 +413,37 @@ impl CompiledRules {
             });
         }
         Ok(Self {
-            table: Arc::new(RuleTable::new(rules)),
             rules: compiled.into_boxed_slice(),
         })
-    }
-
-    pub fn table(&self) -> &Arc<RuleTable> {
-        &self.table
     }
 
     pub fn rules(&self) -> &[CompiledRule] {
         &self.rules
     }
 
-    pub fn by_name(&self, name: &str) -> Option<&CompiledRule> {
-        self.rules.iter().find(|r| &*r.name == name)
-    }
-
-    pub fn index_by_name(&self, name: &str) -> Option<usize> {
-        self.rules.iter().position(|r| &*r.name == name)
-    }
-
     pub fn get(&self, index: usize) -> Option<&CompiledRule> {
         self.rules.get(index)
-    }
-
-    pub fn len(&self) -> usize {
-        self.rules.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
     }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum RuleConfigError {
-    #[error("no rules configured")]
-    Empty,
-    #[error("rule {0} has no descriptor bindings")]
+    #[error("rule `{0}` has no descriptor bindings")]
     EmptyBindings(String),
-    #[error("rule {0} declares too many bindings")]
+    #[error(
+        "rule `{0}` has more descriptor bindings than `gabion_storage_max_descriptor_count` \
+         allows. Remove bindings from the rule, or raise that directive (up to 16), then run \
+         `nginx -t`."
+    )]
     TooManyBindings(String),
-    #[error("rule {0} has `rate=0`, which would deny all traffic")]
-    ZeroLimit(String),
-    #[error("rule {rule} binding key '{key}' exceeds max_key_bytes")]
+    #[error(
+        "rule `{rule}` binding key `{key}` is longer than `gabion_storage_max_key_bytes` allows. \
+         Shorten the key or raise that directive, then run `nginx -t`."
+    )]
     KeyTooLong { rule: String, key: String },
     #[error(
-        "rule {rule} could not compile binding `{spec}`: {message}; to use this kind of binding \
-         the FFI-backed compiler is required"
+        "rule `{rule}`: nginx could not compile binding `{spec}`: {message}. Check the binding's \
+         `$variable` names and quoting, then run `nginx -t`."
     )]
     CompileBinding {
         rule: String,
@@ -509,5 +461,7 @@ fn duration_millis(d: Duration) -> u64 {
     d.as_millis().try_into().unwrap_or(u64::MAX).max(1)
 }
 
+#[cfg(test)]
+pub(crate) mod mock;
 #[cfg(test)]
 mod tests;

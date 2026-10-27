@@ -26,3 +26,6 @@ pub mod shm;
 mod log;
 #[cfg(feature = "ngx-module")]
 mod module;
+
+#[cfg(test)]
+mod tests;

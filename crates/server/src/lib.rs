@@ -18,7 +18,7 @@
 //! admission.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrayvec::ArrayVec;
@@ -26,10 +26,13 @@ use gabion::crdt::{Count, KeyHash};
 use gabion::defaults;
 use gabion::gossip::GossipClient;
 use gabion::rules::{Descriptor, EnforcementMode, RuleSpec, RuleTable, hash_key};
+use gabion::settings::Setting;
+use gabion::throttle;
 use thiserror::Error;
 
 use crate::admission::{
-    CardinalityLimits, Decision, LimitRequest, QuotaContext, RejectContext, RejectReason,
+    CardinalityLimit, CardinalityLimits, Decision, LimitRequest, QuotaContext, RejectContext,
+    RejectReason,
 };
 use crate::store::DashMapStore;
 
@@ -71,6 +74,16 @@ pub struct SharedLimiter<C: Count = u32> {
     gossip_client: GossipClient<C>,
     counts: Arc<DashMapStore<C>>,
     cardinality_limits: CardinalityLimits,
+    warnings: Arc<WarningCounts>,
+}
+
+/// Occurrence counters behind the rate-limited warnings, shared by every
+/// clone of one limiter.
+#[derive(Debug, Default)]
+struct WarningCounts {
+    cardinality_rejects: AtomicU64,
+    gossip_record_failures: AtomicU64,
+    matched_rule_overflows: AtomicU64,
 }
 
 impl<C: Count> SharedLimiter<C> {
@@ -85,15 +98,8 @@ impl<C: Count> SharedLimiter<C> {
             gossip_client,
             counts,
             cardinality_limits,
+            warnings: Arc::default(),
         }
-    }
-
-    pub fn rule_table(&self) -> &Arc<RuleTable> {
-        &self.rule_table
-    }
-
-    pub fn counts(&self) -> &Arc<DashMapStore<C>> {
-        &self.counts
     }
 
     /// Evaluate one Envoy rate-limit request at the given wall-clock time.
@@ -118,19 +124,24 @@ impl<C: Count> SharedLimiter<C> {
 
         for (idx, envoy_descriptor) in request.descriptors.iter().enumerate() {
             let decision = if idx >= MAX_DESCRIPTORS {
-                Decision::Reject(RejectReason::Cardinality, None)
+                self.note_cardinality_reject(
+                    &request.domain,
+                    CardinalityLimit::RequestDescriptors,
+                    MAX_DESCRIPTORS,
+                )
+            } else if map_envoy_descriptor(envoy_descriptor, &mut mapped) {
+                let core_request = LimitRequest {
+                    domain: request.domain.as_str(),
+                    descriptors: mapped.as_slice(),
+                    hits,
+                };
+                self.evaluate(core_request, now_millis).await
             } else {
-                match map_envoy_descriptor(envoy_descriptor, &mut mapped) {
-                    Ok(()) => {
-                        let core_request = LimitRequest {
-                            domain: request.domain.as_str(),
-                            descriptors: mapped.as_slice(),
-                            hits,
-                        };
-                        self.evaluate(core_request, now_millis).await
-                    }
-                    Err(reason) => Decision::Reject(reason, None),
-                }
+                self.note_cardinality_reject(
+                    &request.domain,
+                    CardinalityLimit::Count,
+                    MAX_DESCRIPTORS,
+                )
             };
 
             over_limit |= decision.is_reject();
@@ -149,9 +160,8 @@ impl<C: Count> SharedLimiter<C> {
     }
 
     async fn evaluate(&self, request: LimitRequest<'_>, now_millis: u64) -> Decision {
-        if request.violates_cardinality(self.cardinality_limits) {
-            note_cardinality_reject(request.domain, request.descriptors.len());
-            return Decision::Reject(RejectReason::Cardinality, None);
+        if let Some((limit, max)) = request.exceeded_limit(self.cardinality_limits) {
+            return self.note_cardinality_reject(request.domain, limit, max);
         }
 
         // Pass 1: decide allow/reject and buffer (spec, key_hash, bucket)
@@ -219,7 +229,7 @@ impl<C: Count> SharedLimiter<C> {
                 // client cardinality violation: let the request through
                 // with the events we managed to buffer rather than
                 // rejecting because our cap is undersized.
-                note_matched_overflow(request.domain, MAX_MATCHED_RULES);
+                self.note_matched_overflow(request.domain);
                 break;
             }
         }
@@ -239,7 +249,7 @@ impl<C: Count> SharedLimiter<C> {
                 )
                 .await
             {
-                note_gossip_record_failure(&err);
+                self.note_gossip_record_failure(&err);
             }
         }
         Decision::Allow(tightest)
@@ -256,77 +266,89 @@ fn pick_min_remaining_ctx(current: Option<QuotaContext>, candidate: QuotaContext
     }
 }
 
+/// Borrow an Envoy descriptor's entries into `mapped`. False when it has more
+/// than `MAX_DESCRIPTORS` entries.
 fn map_envoy_descriptor<'a>(
     envoy_descriptor: &'a RateLimitDescriptor,
     mapped: &mut Vec<Descriptor<'a>>,
-) -> Result<(), RejectReason> {
+) -> bool {
     mapped.clear();
     for entry in &envoy_descriptor.entries {
         if mapped.len() == MAX_DESCRIPTORS {
-            return Err(RejectReason::Cardinality);
+            return false;
         }
         mapped.push(Descriptor {
             key: entry.key.as_str(),
             value: entry.value.as_str(),
         });
     }
-    Ok(())
+    true
 }
 
 // -- Rate-limited operator warnings -----------------------------------------
 //
-// These two failure modes can both fire at full request rate when something
-// is wrong (mass-cardinality attack; gossip runtime dead). Each emits a
-// `tracing::warn!` only on power-of-two transitions of its counter, so the
-// log volume is bounded at ~log2(N) regardless of request rate.
+// These failure modes can all fire at full request rate when something is
+// wrong (mass-cardinality attack; gossip runtime dead). Each counts through
+// `gabion::throttle`, so the log volume is bounded at ~log2(N) regardless of
+// request rate.
 
-static CARDINALITY_REJECTS: AtomicU64 = AtomicU64::new(0);
-static GOSSIP_RECORD_FAILURES: AtomicU64 = AtomicU64::new(0);
-static MATCHED_RULE_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
-
-fn note_cardinality_reject(domain: &str, descriptor_count: usize) {
-    let n = CARDINALITY_REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n.is_power_of_two() {
-        tracing::warn!(
-            domain,
-            descriptor_count,
-            rejected_total = n,
-            config_key = "cardinality_limits",
-            "Rejecting requests that attach too many rate-limit descriptors. This is usually a \
-             misbehaving client or an attack trying to exhaust gabion's tracking memory. If the \
-             traffic is legitimate, raise the relevant key under `cardinality_limits` in your \
-             gabion config.",
-        );
+impl<C: Count> SharedLimiter<C> {
+    /// Reject a request that exceeds `limit`, logging at powers of two.
+    fn note_cardinality_reject(
+        &self,
+        domain: &str,
+        limit: CardinalityLimit,
+        max: usize,
+    ) -> Decision {
+        if let Some(rejected_total) = throttle::bump_shared(&self.warnings.cardinality_rejects) {
+            let (name, setting, next_step) = limit.describe();
+            tracing::warn!(
+                code = "cardinality_rejected",
+                domain,
+                limit = name,
+                max,
+                rejected_total,
+                config_key = setting.map(Setting::yaml_key),
+                "Rejecting requests that attach too many or too large rate-limit descriptors. \
+                 This is usually a misbehaving client or an attack trying to exhaust gabion's \
+                 tracking memory. {next_step}",
+            );
+        }
+        Decision::Reject(RejectReason::Cardinality, None)
     }
-}
 
-fn note_gossip_record_failure(err: &gabion::gossip::GossipError) {
-    let n = GOSSIP_RECORD_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-    if n.is_power_of_two() {
-        tracing::warn!(
-            error = %err,
-            failed_total = n,
-            "This node can no longer share rate-limit counts with the \
-             rest of the cluster. Rate limits are now using only this \
-             node's local traffic, so they will under-count requests \
-             handled by other nodes. The gossip background task has \
-             stopped — look for an earlier error log entry to find out \
-             why.",
-        );
+    fn note_gossip_record_failure(&self, err: &gabion::gossip::GossipError) {
+        if let Some(failed_total) = throttle::bump_shared(&self.warnings.gossip_record_failures) {
+            tracing::warn!(
+                code = "gossip_record_failure",
+                error = %err,
+                failed_total,
+                "This node can no longer share rate-limit counts with the \
+                 rest of the cluster. Rate limits are now using only this \
+                 node's local traffic, so they will under-count requests \
+                 handled by other nodes. The gossip background task has \
+                 stopped — look for an earlier error log entry to find out \
+                 why.",
+            );
+        }
     }
-}
 
-fn note_matched_overflow(domain: &str, cap: usize) {
-    let n = MATCHED_RULE_OVERFLOWS.fetch_add(1, Ordering::Relaxed) + 1;
-    if n.is_power_of_two() {
-        tracing::warn!(
-            domain,
-            cap,
-            overflowed_total = n,
-            "A single request matched more rules than gabion's per-request cap allows; the \
-             request was rejected conservatively rather than truncated. Reduce overlapping rule \
-             patterns or raise STORAGE_MAX_MATCHED_RULES."
-        );
+    fn note_matched_overflow(&self, domain: &str) {
+        if let Some(overflowed_total) = throttle::bump_shared(&self.warnings.matched_rule_overflows)
+        {
+            tracing::warn!(
+                code = "matched_rule_overflow",
+                domain,
+                cap = MAX_MATCHED_RULES,
+                overflowed_total,
+                "A request matched more than {MAX_MATCHED_RULES} rate-limit rules, the most this \
+                 node counts per request. It was allowed, and only the first {MAX_MATCHED_RULES} \
+                 matched rules counted and checked it, so the rest under-count. Usually \
+                 overlapping rule patterns. Merge or narrow the overlapping rules under \
+                 `limits:`; the cap is a build-time constant (`STORAGE_MAX_MATCHED_RULES`) and \
+                 cannot be set in config.",
+            );
+        }
     }
 }
 
@@ -399,25 +421,6 @@ where
             .should_rate_limit_at(request.into_inner(), now_millis())
             .await;
         Ok(tonic::Response::new(response))
-    }
-}
-
-pub fn response_from_decisions(decisions: &[Decision]) -> RateLimitResponse {
-    let over_limit = decisions.iter().any(|decision| decision.is_reject());
-    let overall_code = if over_limit {
-        rate_limit_response::Code::OverLimit
-    } else {
-        rate_limit_response::Code::Ok
-    } as i32;
-    let statuses = decisions
-        .iter()
-        .map(|decision| descriptor_status_for(*decision))
-        .collect();
-
-    RateLimitResponse {
-        overall_code,
-        statuses,
-        ..Default::default()
     }
 }
 

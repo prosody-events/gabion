@@ -197,13 +197,11 @@ regardless of which adapter they are running:
    both to send and to receive.
 
 2. **Pick a cluster id.** Every gabion process that should share
-   counters declares the same non-zero u128. Frames from peers with a
-   mismatched cluster id are dropped on the floor, which provides a
-   cheap firewall against accidental cross-cluster contamination —
-   most obviously, the case where staging traffic bleeds into a
-   production counter store.
+   counters declares the same non-zero u128. This release does not
+   check the id on the frames it receives, so clusters that must stay
+   apart need separate gossip ports or networks.
 
-3. **Run on Kubernetes.** Peer discovery is built around Kubernetes
+3. **Run on Kubernetes** (see the [Kubernetes checklist](#kubernetes-checklist)). Peer discovery is built around Kubernetes
    EndpointSlices, and at present this is the only implementation the
    library ships. A member is configured with the namespaces and
    Service names it should watch, and from there it picks peer pods
@@ -221,6 +219,48 @@ the shape is identical. The precise syntax for each is documented in
 [`crates/nginx/README.md#running-across-a-cluster`](crates/nginx/README.md#running-across-a-cluster)
 and
 [`crates/server/README.md#running-across-a-cluster`](crates/server/README.md#running-across-a-cluster).
+
+### Kubernetes checklist
+
+Discovery finds peers through three Kubernetes objects. If one is missing,
+the pod logs the code in parentheses and finds no peers; each code has an
+entry in [`crates/gabion/TROUBLESHOOTING.md`](crates/gabion/TROUBLESHOOTING.md).
+
+- **A Service with a UDP port named `gabion`** whose `port` is the gossip bind
+  port, in a namespace discovery watches. Without it discovery logs
+  `no_gabion_service`.
+
+  ```yaml
+  ports:
+    - name: gabion
+      protocol: UDP
+      port: 9000
+  ```
+
+- **A Role** that lets the pods read what discovery watches, in every
+  namespace discovery watches. Without it discovery logs `kubernetes_forbidden`
+  and stops.
+
+  ```yaml
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  metadata:
+    name: gabion-endpointslice-reader
+  rules:
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["get"]
+    - apiGroups: [""]
+      resources: ["services"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: ["discovery.k8s.io"]
+      resources: ["endpointslices"]
+      verbs: ["get", "list", "watch"]
+  ```
+
+- **A RoleBinding** from that Role to the pods' ServiceAccount, in the same
+  namespace. A complete set, with the ServiceAccount, is in
+  [`deploy/kubernetes/gabion-discovery-rbac.yaml`](deploy/kubernetes/gabion-discovery-rbac.yaml).
 
 Tuning the gossip cadence is rarely necessary, since the defaults
 converge in well under a second at production scale. The
@@ -284,6 +324,7 @@ live under [`deploy/`](deploy).
 - [Interactive gossip simulator](https://prosody-events.github.io/gabion/) — the gabion runtime in a browser, for stepping through convergence interactively.
 - [`crates/gabion/README.md`](crates/gabion/README.md) — the gossip protocol explainer, operator-knob reference, and benchmark results.
 - [`crates/gabion/CRDT.md`](crates/gabion/CRDT.md) — design of the counter store, end to end.
+- [`crates/gabion/TROUBLESHOOTING.md`](crates/gabion/TROUBLESHOOTING.md) — what each library log message means and what to do about it.
 - [`crates/nginx/README.md`](crates/nginx/README.md) — operator guide for the nginx module.
 - [`crates/server/README.md`](crates/server/README.md) — operator guide for `gabiond` (experimental).
 - [`crates/gabion-wasm/README.md`](crates/gabion-wasm/README.md) — how the visualizer is wired to the gossip core.

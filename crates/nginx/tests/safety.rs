@@ -36,9 +36,14 @@ use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, hash_key};
 
 use gabion::crdt::{NodeId, NodeIdentity};
 
-use gabion_nginx::access::{AccessCtx, AccessOutcome, CardinalitySettings, VariableLookup, decide};
-use gabion_nginx::rules::{BindingLookup, CompiledRules, DescriptorBinding, RuleConfig};
+use gabion_nginx::access::{
+    AccessCtx, AccessOutcome, CardinalitySettings, VariableLookup, decide_all,
+};
+use gabion_nginx::rules::{
+    BindingLookup, CompiledRules, DescriptorBinding, NopBindingCompiler, RuleConfig,
+};
 use gabion_nginx::shm::aggregate::ShmAggregateStore;
+use gabion_nginx::shm::header::{SHM_MAGIC, SHM_VERSION};
 use gabion_nginx::shm::queue::QueueEvent;
 use gabion_nginx::shm::{Layout, ShmRegion};
 
@@ -100,19 +105,23 @@ fn build_zone(queue_cap: usize, agg_cap: usize) -> (TestZone, ShmRegion) {
 }
 
 fn build_rules() -> CompiledRules {
-    CompiledRules::compile(&[RuleConfig {
-        name: "per_tenant".into(),
-        domain: DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
+    CompiledRules::compile_with(
+        &[RuleConfig {
+            name: "per_tenant".into(),
+            domain: DEFAULT_DOMAIN.into(),
+            bindings: vec![DescriptorBinding {
+                key: "tenant".into(),
+                source: "$http_x_tenant".into(),
+            }],
+            limit: 2,
+            window: std::time::Duration::from_secs(1),
+            bucket: std::time::Duration::from_millis(250),
+            mode: EnforcementMode::Enforce,
+            except_if: None,
         }],
-        limit: 2,
-        window: std::time::Duration::from_secs(1),
-        bucket: std::time::Duration::from_millis(250),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    }])
+        CardinalitySettings::default(),
+        &mut NopBindingCompiler,
+    )
     .expect("compile rules")
 }
 
@@ -185,7 +194,8 @@ fn master_stamps_node_id_and_initializes_region() {
     let identity = test_identity(0xdead_beef_cafe, 1);
     region.header().identity.store_node_id(identity.node_id.0);
     assert_eq!(region.header().identity.load_node_id(), identity.node_id.0);
-    assert!(region.header().is_initialized());
+    assert_eq!(region.header().magic.load(Ordering::Acquire), SHM_MAGIC);
+    assert_eq!(region.header().version.load(Ordering::Acquire), SHM_VERSION);
     // Geometry is reachable through the region.
     assert_eq!(region.queue().capacity(), 8);
     assert_eq!(region.aggregate().capacity(), 16);
@@ -297,7 +307,10 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
     };
 
     // First two requests — limit is 2 — should be allowed.
-    assert!(matches!(decide(ctx, 0, &vars, 0), AccessOutcome::Allow(_)));
+    assert!(matches!(
+        decide_all(ctx, &[0], &vars, 0),
+        AccessOutcome::Allow(_)
+    ));
 
     // Simulate leader applying the recorded hits before the third arrives.
     let store = ShmAggregateStore::new(region);
@@ -313,7 +326,7 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
     store.apply(&deltas, &expirations);
 
     // Third request must now be rejected — total (3) + 1 > limit (2).
-    let outcome = decide(ctx, 0, &vars, 0);
+    let outcome = decide_all(ctx, &[0], &vars, 0);
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.spec.id, spec.id);
@@ -590,7 +603,7 @@ fn decide_and_leader_apply_concurrent() {
     let rules = Arc::new(build_rules());
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Worker thread runs the access path (decide()) repeatedly. This
+    // Worker thread runs the access path (decide_all()) repeatedly. This
     // exercises every read-side unsafe accessor as well as queue push and
     // aggregate seqlock retries when the writer races us.
     let worker_rules = rules.clone();
@@ -609,7 +622,7 @@ fn decide_and_leader_apply_concurrent() {
                 domain: DEFAULT_DOMAIN,
                 cardinality: CardinalitySettings::default(),
             };
-            let _ = decide(ctx, 0, &vars, 0);
+            let _ = decide_all(ctx, &[0], &vars, 0);
         }
         worker_stop.store(true, Ordering::Release);
     });
@@ -700,7 +713,14 @@ fn decide_all_multi_rule_concurrent() {
             except_if: None,
         },
     ];
-    let rules = Arc::new(CompiledRules::compile(&rule_configs).expect("compile two rules"));
+    let rules = Arc::new(
+        CompiledRules::compile_with(
+            &rule_configs,
+            CardinalitySettings::default(),
+            &mut NopBindingCompiler,
+        )
+        .expect("compile two rules"),
+    );
     let stop = Arc::new(AtomicBool::new(false));
     let worker_rules = rules.clone();
     let worker_stop = stop.clone();

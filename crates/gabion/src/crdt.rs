@@ -51,6 +51,8 @@ use dictionary::pow2_index_capacity_for;
 use dirty_ring::ring_entry_at;
 use hash::hash_compact_cell_key;
 
+use crate::settings::Setting;
+use crate::throttle;
 use std::fmt;
 
 /// Application-level rule identifier — opaque to the CRDT.
@@ -559,86 +561,64 @@ impl<C: Count> CellStore<C> {
         }
     }
 
-    pub fn intern_node(&mut self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
-        let result = self.node_dictionary.intern(node_id, incarnation);
-        if result.is_none() {
-            self.note_node_dictionary_full(node_id, incarnation);
-        }
-        result
-    }
-
     // -- Capacity-pressure warnings -----------------------------------------
     //
-    // Each helper bumps the relevant rejection counter and emits a
-    // `tracing::warn!` only on power-of-two thresholds (1, 2, 4, 8, ...) so
-    // log volume stays bounded at ~log2(N) lines regardless of how many rows
-    // are being dropped per second. The message names the `CellStoreConfig`
-    // field the operator should raise.
+    // Each helper counts through `crate::throttle` and names its setting in
+    // both adapters' spellings.
 
     fn note_cell_store_full(&mut self) {
-        self.cell_store_full_rejects = self.cell_store_full_rejects.saturating_add(1);
-        if self.cell_store_full_rejects.is_power_of_two() {
+        if let Some(rejected_total) = throttle::bump(&mut self.cell_store_full_rejects) {
             tracing::warn!(
-                rejected_total = self.cell_store_full_rejects,
+                code = "cell_store_full",
+                rejected_total,
                 capacity = self.capacity,
                 in_use = self.active_len,
-                config_key = "storage.max_cells",
-                "Too many distinct rate-limit keys are being tracked at once. New keys are not \
-                 being limited and will not contribute to global counts until older time buckets \
-                 expire. To fix, raise `storage.max_cells` in your gabion config (currently {}).",
-                self.capacity,
+                config_key = Setting::StorageMaxCells.yaml_key(),
+                "Too many distinct rate-limit keys are being tracked at once. New keys were \
+                 allowed and are not counted until older time buckets expire, so their limits \
+                 under-count. Usually many clients, an attack spraying keys, or a store smaller \
+                 than the keys live within the rules' windows. Raise {}.",
+                Setting::StorageMaxCells,
             );
         }
     }
 
     fn note_rule_dictionary_full(&mut self, rule_fingerprint: u128) {
-        self.rule_dictionary_full_rejects = self.rule_dictionary_full_rejects.saturating_add(1);
-        if self.rule_dictionary_full_rejects.is_power_of_two() {
+        if let Some(rejected_total) = throttle::bump(&mut self.rule_dictionary_full_rejects) {
             tracing::warn!(
-                rejected_total = self.rule_dictionary_full_rejects,
+                code = "rule_dictionary_full",
+                rejected_total,
                 capacity = self.rule_dictionary.capacity(),
                 in_use = self.rule_dictionary.len(),
                 rule_fingerprint = %format!("{:032x}", rule_fingerprint),
-                config_key = "storage.rule_dictionary_capacity",
-                "Too many distinct rate-limit rules are in flight. New \
-                 rules cannot be registered on this node and will not \
-                 enforce limits here. To fix, raise \
-                 `storage.rule_dictionary_capacity` in your gabion config \
-                 (currently {}).",
-                self.rule_dictionary.capacity(),
+                config_key = Setting::StorageRuleDictionaryCapacity.yaml_key(),
+                "Too many distinct rate-limit rules are in flight. New rules cannot be \
+                 registered on this node and will not enforce limits here. Usually more rules \
+                 are configured across the cluster than the dictionary holds, for example \
+                 during a configuration rollout. Raise {}.",
+                Setting::StorageRuleDictionaryCapacity,
             );
         }
     }
 
     fn note_node_dictionary_full(&mut self, node_id: NodeId, incarnation: Incarnation) {
-        self.node_dictionary_full_rejects = self.node_dictionary_full_rejects.saturating_add(1);
-        if self.node_dictionary_full_rejects.is_power_of_two() {
+        if let Some(rejected_total) = throttle::bump(&mut self.node_dictionary_full_rejects) {
             tracing::warn!(
-                rejected_total = self.node_dictionary_full_rejects,
+                code = "node_dictionary_full",
+                rejected_total,
                 capacity = self.node_dictionary.capacity(),
                 in_use = self.node_dictionary.len(),
                 peer_node_id = %format!("{:032x}", node_id.0),
                 peer_incarnation = incarnation,
-                config_key = "storage.node_dictionary_capacity",
-                "Too many gabion peer instances are being tracked (every \
-                 peer restart counts as a new instance until its data \
-                 ages out). Counts from some peers are now being dropped, \
-                 so cluster-wide rate limits will under-count requests \
-                 handled by those peers. To fix, raise \
-                 `storage.node_dictionary_capacity` in your gabion config \
-                 (currently {}); size it comfortably above 2× the \
-                 cluster's peer count to absorb rolling restarts.",
-                self.node_dictionary.capacity(),
+                config_key = Setting::StorageNodeDictionaryCapacity.yaml_key(),
+                "Too many gabion peer instances are being tracked (every peer restart counts \
+                 as a new instance until its data ages out). Counts from some peers are now \
+                 being dropped, so cluster-wide rate limits will under-count requests handled \
+                 by those peers. Raise {}; size it above pods × (1 + restarts within your \
+                 longest rule window).",
+                Setting::StorageNodeDictionaryCapacity,
             );
         }
-    }
-
-    pub fn find_rule(&self, fingerprint: u128) -> Option<RuleSlot> {
-        self.rule_dictionary.find(fingerprint)
-    }
-
-    pub fn find_node(&self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
-        self.node_dictionary.find(node_id, incarnation)
     }
 
     // -- Cell lookups -------------------------------------------------------
@@ -702,10 +682,6 @@ impl<C: Count> CellStore<C> {
             last_update_millis: self.last_update_millis[i],
             origin_sequence: self.origin_sequences[i],
         })
-    }
-
-    pub fn count_of(&self, handle: CellHandle) -> Option<C> {
-        self.resolve(handle).map(|i| self.counts[i as usize])
     }
 
     /// Iterate all active cell handles in storage order.
@@ -782,12 +758,9 @@ impl<C: Count> CellStore<C> {
             origin_sequence: sequence,
         };
         if origin == self.local_node_slot {
-            let before = self.local_dirty.overflow_seq();
-            self.local_dirty.push(entry);
-            let after = self.local_dirty.overflow_seq();
-            if after != before && after.is_power_of_two() {
+            if let Some(overflow_total) = self.local_dirty.push(entry) {
                 tracing::warn!(
-                    overflow_total = after,
+                    overflow_total,
                     capacity = self.local_dirty.capacity(),
                     "Local gossip dirty ring overflowed. Recent local changes are being \
                      overwritten before gossip can send them; peers may lag until the repair lane \
@@ -795,20 +768,15 @@ impl<C: Count> CellStore<C> {
                      pressure.",
                 );
             }
-        } else {
-            let before = self.forwarded_dirty.overflow_seq();
-            self.forwarded_dirty.push(entry);
-            let after = self.forwarded_dirty.overflow_seq();
-            if after != before && after.is_power_of_two() {
-                tracing::warn!(
-                    overflow_total = after,
-                    capacity = self.forwarded_dirty.capacity(),
-                    "Forwarded gossip dirty ring overflowed. Recently received peer changes are \
-                     being overwritten before they can be forwarded; convergence will depend on \
-                     repair scans. Raise `storage.forwarded_dirty_capacity` or reduce \
-                     write/cardinality pressure.",
-                );
-            }
+        } else if let Some(overflow_total) = self.forwarded_dirty.push(entry) {
+            tracing::warn!(
+                overflow_total,
+                capacity = self.forwarded_dirty.capacity(),
+                "Forwarded gossip dirty ring overflowed. Recently received peer changes are being \
+                 overwritten before they can be forwarded; convergence will depend on repair \
+                 scans. Raise `storage.forwarded_dirty_capacity` or reduce write/cardinality \
+                 pressure.",
+            );
         }
     }
 

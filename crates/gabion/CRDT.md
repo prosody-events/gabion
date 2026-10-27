@@ -30,7 +30,7 @@ Read it end-to-end and you should be able to open `crdt.rs` and recognise every 
    - 6.1 [Write: `ingest_local`](#61-write-ingest_local)
    - 6.2 [Write: `merge_remote`](#62-write-merge_remote)
    - 6.3 [The shared `upsert` core](#63-the-shared-upsert-core)
-   - 6.4 [Read: `find`, `resolve`, `get`, `count_of`](#64-read-find-resolve-get-count_of)
+   - 6.4 [Read: `find`, `resolve`, `get`](#64-read-find-resolve-get)
 7. [Gossip and convergence](#7-gossip-and-convergence)
    - 7.1 [The two dirty rings](#71-the-two-dirty-rings)
    - 7.2 [The repair cursor — the third lane](#72-the-repair-cursor--the-third-lane)
@@ -1154,17 +1154,15 @@ When `CellStore::new` runs, it interns the local identity into the node dictiona
 
 This matters because `free_cell_at` decrements the node refcount and releases the slot if the count hits zero. Without the pin, freeing the last cell whose origin is the local node could free the local node slot itself, leaving the store unable to attribute its own writes. The extra refcount is a one-time pin that is never released.
 
-### 6.4 Read: `find`, `resolve`, `get`, `count_of`
+### 6.4 Read: `find`, `resolve`, `get`
 
 All read primitives are lock-free.
 
 | Method | Role |
 |---|---|
 | `find(key) -> Option<CellHandle>` | Hashes the key, walks `CellIndex` until a probe hit matches all five cold columns. Returns the generation-tagged handle. |
-| `find_rule(fp)` / `find_node(id, inc)` | Read-only dictionary lookups; do not intern. |
 | `resolve(handle) -> Option<u32>` | Bounds-checks, then `generations[handle.index] == handle.generation && (handle.generation & 1) == 1`. |
 | `get(handle) -> Option<CellRow<C>>` | Reads every column for a slot and assembles a snapshot. |
-| `count_of(handle) -> Option<C>` | Hot fast path: touches only the `counts` column. |
 | `active_handles()` | Diagnostic helper that walks `0..capacity` and yields handles only for slots with odd generation. Scans the full capacity, not just `active_len`; not for hot paths. |
 
 There is no atomic "snapshot the whole store" operation. The structure is single-threaded, so a snapshot is logically the iterator `active_handles().map(|h| store.get(h).unwrap())`; higher layers persist via the `DeltaSink`/`ExpirationSink` streams and the `peer_frontier` checkpoints.
@@ -1578,9 +1576,9 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 |---|---|
 | `new(config, local_identity)` | Build a store; all allocation happens here. |
 | `capacity()`, `active_len()`, `is_empty()`, `stats()` | Observability. |
-| `intern_rule`, `intern_node`, `find_rule`, `find_node` | Dictionary plumbing. |
+| `intern_rule` | Dictionary plumbing. |
 | `find(key)` | Hash-index lookup by `CompactCellKey`. |
-| `resolve(handle)`, `get(handle)`, `count_of(handle)` | Handle-based reads. |
+| `resolve(handle)`, `get(handle)` | Handle-based reads. |
 | `active_handles()` | Diagnostic full-scan iterator. |
 | `ingest_local(obs, sink)` | Apply locally observed hits (saturating add). |
 | `merge_remote(obs, sink)` | Merge peer observations (max-merge). |

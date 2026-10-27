@@ -38,7 +38,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use gabion::crdt::{
     BucketEpoch, CellHandle, CellStore, CellStoreConfig, CompactCellKey, DeltaSink, ExpirationSink,
     Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
-    RuleDescriptor,
+    RuleDescriptor, RuleSlot,
 };
 
 /// Build an `Observation` row with positional args. Used by the bench
@@ -159,6 +159,7 @@ fn peer_node(i: usize) -> NodeId {
 struct Fixture {
     store: CellStore<u32>,
     rule_fps: Vec<u128>,
+    rule_slots: Vec<RuleSlot>,
     local_node_slot: NodeSlot,
     hot_keys: Vec<u128>,
     warm_keys: Vec<u128>,
@@ -178,18 +179,21 @@ struct RemoteRow {
 
 /// Build a fresh store, intern N rules, and return the seed material the
 /// benches share.
-fn new_store() -> (CellStore<u32>, Vec<u128>, NodeSlot) {
+fn new_store() -> (CellStore<u32>, Vec<u128>, Vec<RuleSlot>, NodeSlot) {
     let mut store = CellStore::<u32>::new(config(), local_identity());
     let mut rule_fps = Vec::with_capacity(NUM_RULES);
+    let mut rule_slots = Vec::with_capacity(NUM_RULES);
     for i in 0..NUM_RULES {
         let fp = rule_fingerprint(i);
-        store
-            .intern_rule(rule_descriptor(fp, i as u32))
-            .expect("rule interned");
+        rule_slots.push(
+            store
+                .intern_rule(rule_descriptor(fp, i as u32))
+                .expect("rule interned"),
+        );
         rule_fps.push(fp);
     }
     let local_node_slot = store.local_node_slot();
-    (store, rule_fps, local_node_slot)
+    (store, rule_fps, rule_slots, local_node_slot)
 }
 
 /// Seed `count` cells under the local origin, sampling rule and bucket
@@ -302,7 +306,7 @@ fn fresh_key(rng: &mut Rng) -> u128 {
 }
 
 fn build_fixture() -> Fixture {
-    let (mut store, rule_fps, local_node_slot) = new_store();
+    let (mut store, rule_fps, rule_slots, local_node_slot) = new_store();
 
     // Pre-generate the key universe deterministically.
     let mut key_rng = Rng::new(0xA110_CA7E_FACE_BEEF);
@@ -344,6 +348,7 @@ fn build_fixture() -> Fixture {
     Fixture {
         store,
         rule_fps,
+        rule_slots,
         local_node_slot,
         hot_keys,
         warm_keys,
@@ -551,7 +556,7 @@ fn bench_ingest_local(c: &mut Criterion) {
     // empty fixture so the freelist actually has room across many
     // iterations.
     let empty = {
-        let (store, rule_fps, _) = new_store();
+        let (store, rule_fps, ..) = new_store();
         (store, rule_fps)
     };
     group.throughput(Throughput::Elements(32));
@@ -758,10 +763,7 @@ fn bench_find(c: &mut Criterion) {
             } else {
                 (fresh_key(&mut rng), 0, 0)
             };
-            let rule_slot = fixture
-                .store
-                .find_rule(fixture.rule_fps[rule_idx])
-                .expect("rule");
+            let rule_slot = fixture.rule_slots[rule_idx];
             let h = fixture.store.find(black_box(CompactCellKey {
                 rule: rule_slot,
                 key_hash: KeyHash(key),
@@ -776,7 +778,7 @@ fn bench_find(c: &mut Criterion) {
     // ─── miss ───────────────────────────────────────────────────────────
     // Pure miss path — Robin Hood early-exit baseline.
     group.bench_function("miss", |b| {
-        let rule_slot = fixture.store.find_rule(fixture.rule_fps[0]).expect("rule");
+        let rule_slot = fixture.rule_slots[0];
         let mut rng = Rng::new(0xDEAD_BEEF);
         b.iter(|| {
             let h = fixture.store.find(black_box(CompactCellKey {
@@ -833,10 +835,7 @@ fn bench_admission_headers(c: &mut Criterion) {
             } else {
                 (fresh_key(&mut rng), 0, 0)
             };
-            let rule_slot = fixture
-                .store
-                .find_rule(fixture.rule_fps[rule_idx])
-                .expect("rule");
+            let rule_slot = fixture.rule_slots[rule_idx];
             let h = fixture.store.find(black_box(CompactCellKey {
                 rule: rule_slot,
                 key_hash: KeyHash(key),
@@ -867,10 +866,7 @@ fn bench_admission_headers(c: &mut Criterion) {
             } else {
                 (fresh_key(&mut rng), 0, 0)
             };
-            let rule_slot = fixture
-                .store
-                .find_rule(fixture.rule_fps[rule_idx])
-                .expect("rule");
+            let rule_slot = fixture.rule_slots[rule_idx];
             let handle = fixture.store.find(black_box(CompactCellKey {
                 rule: rule_slot,
                 key_hash: KeyHash(key),
@@ -882,8 +878,8 @@ fn bench_admission_headers(c: &mut Criterion) {
             // enough for the cost we want to measure — the bench is
             // about the header math, not about an exact admission walk.
             let total: u64 = handle
-                .and_then(|h| fixture.store.count_of(h))
-                .map(u64::from)
+                .and_then(|h| fixture.store.get(h))
+                .map(|row| u64::from(row.count))
                 .unwrap_or(0);
             let hits: u64 = 1;
             let remaining = RULE_LIMIT.saturating_sub(total).saturating_sub(hits);

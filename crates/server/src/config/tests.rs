@@ -208,6 +208,19 @@ fn env_binding_names_use_single_underscores_only() {
 }
 
 #[test]
+fn setting_table_spellings_parse() {
+    let table: std::collections::BTreeSet<_> = gabion::settings::Setting::ALL
+        .iter()
+        .map(|setting| (setting.yaml_key(), setting.env_var()))
+        .collect();
+    let loader: std::collections::BTreeSet<_> = ENV_BINDINGS
+        .iter()
+        .map(|binding| (binding.config_path, binding.env_name))
+        .collect();
+    assert_eq!(table, loader);
+}
+
+#[test]
 fn duplicate_rule_names_are_rejected() {
     let _env = EnvGuard::lock();
     let cfg = AppConfig::load_with_yaml_str(

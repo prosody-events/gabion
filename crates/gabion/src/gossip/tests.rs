@@ -1561,14 +1561,14 @@ async fn udp_round_trip_smoke() {
             };
 
             let (rt_a, client_a) = GossipRuntime::from_parts(
-                UdpTransport::from_socket(sock_a),
+                UdpTransport(sock_a),
                 TokioClock::new(),
                 config_a,
                 store_for(id_a),
                 agg_a.clone(),
             );
             let (rt_b, client_b) = GossipRuntime::from_parts(
-                UdpTransport::from_socket(sock_b),
+                UdpTransport(sock_b),
                 TokioClock::new(),
                 config_b,
                 store_for(id_b),

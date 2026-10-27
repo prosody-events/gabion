@@ -50,6 +50,13 @@ fn parse_rate_rejects_zero_period() {
     assert!(parse_rate("10r/0s").is_err());
 }
 
+#[test]
+fn parse_rate_rejects_sub_millisecond_period() {
+    assert!(parse_rate("10r/500us").is_err());
+    assert!(parse_rate("1r/999us").is_err());
+    assert_eq!(parse_rate("1r/1ms").unwrap(), (1, Duration::from_millis(1)));
+}
+
 // -- resolve_rate -----------------------------------------------------------
 
 #[test]
