@@ -620,7 +620,9 @@ fn decide_all_and_leader_apply_concurrent() {
     });
 
     // Leader thread applies a hit and its expiry until the worker stops, so
-    // the cell keeps appearing and vanishing but never reaches the limit.
+    // the cell keeps appearing and vanishing but never reaches the limit. It
+    // applies at least once, so the final check sees an expiry, not a table
+    // the leader never touched.
     let leader_stop = stop.clone();
     let leader_rules = rules.clone();
     let leader = thread::spawn(move || {
@@ -634,19 +636,16 @@ fn decide_all_and_leader_apply_concurrent() {
         let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
         let hit = [(key_hash, 0, 1)];
         let (d, e) = deltas_and_expirations(&leader_rules.rules()[0].rule, &hit, &hit);
-        let mut applied = 0_u32;
-        while !leader_stop.load(Ordering::Acquire) {
+        for _ in 0..=1_000 {
             store.apply(&d, &e);
-            applied += 1;
-            if applied > 1_000 {
+            if leader_stop.load(Ordering::Acquire) {
                 break;
             }
         }
-        applied
     });
 
     worker.join().expect("worker joined");
-    let _ = leader.join().expect("leader joined");
+    leader.join().expect("leader joined");
 
     // Every allowed request queued one event, up to the queue's capacity.
     let mut drained = [QueueEvent::default(); 32];
@@ -750,8 +749,7 @@ fn decide_all_multi_rule_concurrent() {
     let leader = thread::spawn(move || {
         let r = region;
         let store = ShmAggregateStore::new(r);
-        let mut applied = 0_u32;
-        while !leader_stop.load(Ordering::Acquire) {
+        for _ in 0..=1_000 {
             for compiled in leader_rules.rules() {
                 let rule = &compiled.rule;
                 let descriptors = [gabion::rules::Descriptor {
@@ -762,16 +760,14 @@ fn decide_all_multi_rule_concurrent() {
                 let (d, e) = deltas_and_expirations(rule, &[(key_hash, 0, 1)], &[]);
                 store.apply(&d, &e);
             }
-            applied += 1;
-            if applied > 1_000 {
+            if leader_stop.load(Ordering::Acquire) {
                 break;
             }
         }
-        applied
     });
 
     worker.join().expect("worker joined");
-    let _ = leader.join().expect("leader joined");
+    leader.join().expect("leader joined");
 
     // Every allowed request queued one event per rule, up to the capacity.
     let mut drained = [QueueEvent::default(); 32];
