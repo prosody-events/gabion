@@ -28,20 +28,17 @@ use ngx::{http_request_handler, ngx_string};
 use gabion::crdt::CellStoreConfig;
 use gabion::defaults;
 use gabion::discovery::DiscoveryConfig;
-use gabion::rules::EnforcementMode;
+use gabion::rules::{EnforcementMode, parse_rate, resolve_rate};
 
-use crate::access::{
-    AccessCtx, AccessOutcome, AllowInfo, CardinalitySettings, RejectInfo, VariableLookup,
-    decide_all,
-};
+use crate::access::{AccessCtx, AccessOutcome, AllowInfo, RejectInfo, VariableLookup, decide_all};
 use crate::headers::AdmissionHeaders;
 use crate::identity::derive_identity;
 use crate::leader::{self, GossipSettings, LeaderConfig, LeaderHandle};
 use crate::log;
 use crate::rules::{
-    BindingCompiler, BindingLookup, CompiledRules, DEFAULT_DOMAIN, DescriptorBinding, RuleConfig,
-    is_descriptor_key, is_dns_label, is_single_ident, is_zone_name, parse_binding, parse_rate,
-    resolve_rate,
+    BindingCompiler, BindingLookup, CardinalitySettings, CompiledRules, DEFAULT_DOMAIN,
+    DescriptorBinding, RuleConfig, is_descriptor_key, is_dns_label, is_single_ident, is_zone_name,
+    parse_binding,
 };
 use crate::shm::lease::now_millis;
 use crate::shm::{Layout, MIN_AGGREGATE_CAPACITY, ShmRegion};
@@ -314,17 +311,10 @@ unsafe extern "C" fn drop_main_config(data: *mut c_void) {
     unsafe { drop(Box::from_raw(data.cast::<MainConfig>())) };
 }
 
-// SAFETY: `HttpModuleMainConf` is an `unsafe trait` in ngx-rs because nginx's
-// configuration slot machinery is implemented in C: nginx allocates a block of
-// memory of size `size_of::<MainConf>()` in `create_main_conf`, treats it as
-// an opaque `void*`, and hands it back to our directive callbacks. The trait
-// requires that `MainConf` be a plain old data type whose default-initialised
-// bit pattern is a valid Rust value, and that no extra invariant ride on top
-// of what ngx-rs already documents. `MainConfig` derives `Default` and
-// contains only `Option`/`Vec`/`String`/integer fields (all safe to
-// default-construct), so it satisfies the contract. No additional invariant
-// beyond what ngx-rs requires. See the nomicon chapters on unsafe traits and
-// FFI.
+// SAFETY: ngx-rs 0.5.1 requires that `MainConf` is the configuration type
+// stored in this module's main-conf slot. `MainConf` is `MainConfig`, the type
+// this module's `create_main_conf` allocates (a `Box<MainConfig>` whose
+// pointer it returns), so every `main_conf` access reads a `MainConfig`.
 unsafe impl HttpModuleMainConf for Module {
     type MainConf = MainConfig;
 }
@@ -345,10 +335,11 @@ unsafe impl HttpModuleMainConf for Module {
 // the CI native-amd64 nginx smokes crash inside the config phase. Keep
 // the override; the heap path is the only thing making this safe.
 
-// SAFETY: Same justification as `HttpModuleMainConf` above — `LocationConfig`
-// is a POD type with a safe `Default` impl, fitting the ngx-rs contract for
-// nginx's C-managed per-location config slot. See the nomicon chapter on
-// unsafe traits.
+// SAFETY: ngx-rs 0.5.1 requires that `LocationConf` is the configuration type
+// stored in this module's location-conf slot. `LocationConf` is
+// `LocationConfig`, the type ngx-rs's default `create_loc_conf` allocates for
+// this module (`Pool::allocate::<Self::LocationConf>`), so every `loc_conf`
+// access reads a `LocationConfig`.
 unsafe impl HttpModuleLocationConf for Module {
     type LocationConf = LocationConfig;
 }
@@ -2019,14 +2010,10 @@ struct NgxBindingCompiler {
 
 #[derive(Debug, thiserror::Error)]
 enum NgxBindingError {
-    #[error(
-        "could not resolve variable `${0}`; load the providing module before `gabion_limit_rule`"
-    )]
-    UnknownVariable(String),
-    #[error("could not compile template `{0}` as a complex value")]
-    ComplexCompile(String),
-    #[error("could not allocate {0} bytes from the cycle pool")]
-    PoolAlloc(usize),
+    #[error("the template is not valid; check its `$variable` names and quoting")]
+    ComplexCompile,
+    #[error("nginx could not allocate memory for it in the configuration pool")]
+    OutOfMemory,
 }
 
 impl BindingCompiler for NgxBindingCompiler {
@@ -2053,7 +2040,7 @@ impl BindingCompiler for NgxBindingCompiler {
             // and copies the name internally.
             let index = unsafe { ngx::ffi::ngx_http_get_variable_index(self.cf, &mut name_str) };
             if index == ngx::core::Status::NGX_ERROR.0 {
-                return Err(NgxBindingError::UnknownVariable(stripped.to_string()));
+                return Err(NgxBindingError::OutOfMemory);
             }
             return Ok(BindingLookup::IndexedVariable {
                 name: stripped.into(),
@@ -2069,12 +2056,16 @@ impl BindingCompiler for NgxBindingCompiler {
         let cv_ptr: *mut ngx::ffi::ngx_http_complex_value_t =
             unsafe { ngx::ffi::ngx_palloc((*self.cf).pool, cv_size).cast() };
         if cv_ptr.is_null() {
-            return Err(NgxBindingError::PoolAlloc(cv_size));
+            return Err(NgxBindingError::OutOfMemory);
         }
         let mut value_str = ngx_str_t {
             len: source.len(),
             data: source.as_ptr() as *mut _,
         };
+        // SAFETY: `ngx_http_compile_complex_value_t` is a C struct of
+        // pointers, integers and bitfields, for which all-zero is a valid
+        // value; nginx's own modules initialise it the same way
+        // (`ngx_memzero`).
         let mut ccv: ngx::ffi::ngx_http_compile_complex_value_t = unsafe { std::mem::zeroed() };
         ccv.cf = self.cf;
         ccv.value = &mut value_str;
@@ -2085,7 +2076,7 @@ impl BindingCompiler for NgxBindingCompiler {
         // allocating any auxiliary arrays against the pool.
         let rc = unsafe { ngx::ffi::ngx_http_compile_complex_value(&mut ccv) };
         if rc != ngx::core::Status::NGX_OK.0 {
-            return Err(NgxBindingError::ComplexCompile(source.to_string()));
+            return Err(NgxBindingError::ComplexCompile);
         }
         Ok(BindingLookup::ComplexValue {
             source: source.into(),

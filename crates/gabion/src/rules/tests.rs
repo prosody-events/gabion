@@ -139,7 +139,8 @@ fn resolve_rate_window_equal_to_period_keeps_count() {
 
 #[test]
 fn resolve_rate_rejects_window_shorter_than_period() {
-    // rate=10r/m window=500ms would give limit=0; reject up front.
+    // A window shorter than the rate's period is refused, whatever it would
+    // scale to.
     let err = resolve_rate(
         10,
         Duration::from_secs(60),

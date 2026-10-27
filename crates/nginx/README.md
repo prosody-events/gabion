@@ -393,8 +393,9 @@ under-budgets non-multiples — `rate=10r/m window=85s` resolves to
 `limit=14` because the leftover 0.16 of a period vanishes — so if
 you care about every last request, pick `window=` values that are
 integer multiples of the rate's period. Finally, a `window=` shorter
-than the rate's period is refused at `nginx -t` time, because the
-resolved limit would be zero; to enforce "100 in 500ms", write
+than the rate's period is refused at `nginx -t` time, because a
+window shorter than the rate's period has nothing to scale the rate
+over; to enforce "100 in 500ms", write
 `rate=100r/500ms` rather than `rate=200r/s window=500ms`.
 
 #### `gabion_limit NAME [NAME ...]` *(http, server, location)*
@@ -500,7 +501,7 @@ to touch them if your workload runs into the cap.
 | `gabion_storage_local_dirty_capacity N`         | `65536`     | Local dirty-ring capacity. Sized to absorb a burst between heartbeats.                |
 | `gabion_storage_forwarded_dirty_capacity N`     | `524288`    | Forwarded dirty-ring capacity. Sized larger because it tracks peer-originated edits we still owe other peers. |
 | `gabion_storage_peer_capacity N`                | `256`       | Peer slots in the peer-frontier table (one row per peer × node).                      |
-| `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare. Equal to `STORAGE_MAX_MATCHED_RULES`.   |
+| `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare. At most 16 (`STORAGE_MAX_DESCRIPTOR_COUNT`). |
 | `gabion_storage_max_descriptor_bytes N`         | `512`       | Per-request budget on `(key + value)` bytes summed across descriptors plus the domain. Exceeded ⇒ 400. |
 | `gabion_storage_max_key_bytes N`                | `128`       | Cap on a single descriptor key's length (validated at config phase).                  |
 
@@ -776,7 +777,7 @@ gabion: `gabion_limit_zone` zone name `nope!` must match `[A-Za-z0-9_]+` (matche
 gabion: `gabion_limit_rule` rule `per_ip` is missing the required `rate=Nr/s` argument
 gabion: `gabion_limit_rule` argument `key=$uri` is invalid: expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, `mode=`, `dry_run`, `except_if=`, `domain=`
 gabion: `gabion_limit_rule` argument `rate=100r/fortnight` is invalid: rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`
-gabion: `gabion_limit_rule` rule `inverted`: the window must be at least as long as the rate's period; a shorter window would resolve to a zero limit. To enforce N requests in a shorter span, put the period in the rate itself (for example `100r/500ms`)
+gabion: `gabion_limit_rule` rule `inverted`: the window is shorter than the rate's period, so the rate cannot be spread over it. To enforce N requests in a shorter span, put the period in the rate itself (for example `100r/500ms`)
 gabion: `gabion_limit_rule` rule `per_ip` is declared more than once; rule names must be unique within an http {} block
 gabion: `gabion_limit` references rule `tenant_api`, which is not declared via `gabion_limit_rule`
 gabion: `gabion_gossip_cluster` rejected value `0`: expected a non-zero 128-bit cluster identifier shared by every peer, in decimal or `0x`-prefixed hex (e.g. `1`, `0xc0ffee`)
@@ -796,7 +797,8 @@ below are the module's own.
 | `gabion_limit references rule X, which is not declared`                       | A `gabion_limit X;` names a rule with no `gabion_limit_rule X` declaration in the same `http {}` block.                                             | Add the missing declaration or fix the name.                                                                                     |
 | `gabion_limit_rule rule X is declared more than once`                         | Two `gabion_limit_rule X ...` directives with the same name. The grammar is unambiguous; almost always a copy-paste bug.                            | Pick distinct names.                                                                                                             |
 | `gabion_limit_rule argument 'rate=0r/s' is invalid`                           | Zero rate; would deny all traffic.                                                                                                                  | Pick a non-zero positive integer. To temporarily disable a rule, use `mode=disabled`.                                            |
-| `gabion_limit_rule rule X: the window must be at least as long as the rate's period` | `window=` was paired with a rate whose period is longer (e.g. `rate=200r/s window=500ms`); the resolved limit would be zero.                    | Move the period into the rate itself (for example `rate=100r/500ms`) instead of pairing a short window with a longer-period rate.       |
+| `gabion_limit_rule rule X: the window is shorter than the rate's period`         | `window=` was paired with a rate whose period is longer (e.g. `rate=200r/s window=500ms`); a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (for example `rate=100r/500ms`) instead of pairing a short window with a longer-period rate.       |
+| `gabion_limit_rule rule X has more descriptor bindings than …`, `… binding key K is longer than …`, or `… rule X: nginx could not compile binding …` | The rule's bindings exceed `gabion_storage_max_descriptor_count` or `gabion_storage_max_key_bytes`, or nginx rejected a binding (an invalid template, or it ran out of configuration memory); the message says which. | Fix the rule (or raise the named directive), then run `nginx -t` to re-check. |
 | `gabion_gossip_cluster rejected value 0`                                      | The cluster ID parsed to `0`, which is almost certainly unintended.                                                                                 | Pick any non-zero u128 value shared by every peer, in decimal or `0x`-prefixed hex (`1`, `0xc0ffee`).                            |
 | `rules are declared but gabion_limit_zone is not set`                         | The config declares rules but no zone, so there is nowhere to count hits and every request would be admitted uncounted.                             | Add `gabion_limit_zone zone=gabion:64m;` to the `http {}` block, or check that the include declaring it is loaded.               |
 | `gabion: <directive> rejected value 'X': expected a duration like '100ms'`    | A tuning directive received a value it couldn't parse.                                                                                              | The error names the directive and the expected format; supply a humantime duration (`100ms`, `5s`).                              |
@@ -815,7 +817,7 @@ below are the module's own.
 
 Message starts: "gabion: this worker took over gossip and emptied the previous leader's counts"
 
-**What happened.** This worker became the gossip leader and emptied the shared count table the previous leader left behind, so peers' gossip can refill it without counting anything twice. Until then, usually a gossip tick or two, this node under-counts and may admit requests over their limits.
+**What happened.** This worker became the gossip leader and emptied the shared count table the previous leader left behind, so peers' gossip can refill it without counting anything twice. Until then, usually a gossip tick or two, this node under-counts and may admit requests over their limits; a node with no peers instead under-counts until each rule's window has passed.
 
 **Why.** The previous leader exited (a reload, `nginx -s quit`, or a crash) and this worker won the lease.
 

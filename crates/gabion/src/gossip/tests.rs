@@ -1520,9 +1520,10 @@ async fn observe_coverage_fanout(peers: usize, base: usize) -> usize {
 // -- UDP smoke --------------------------------------------------------------
 
 // `UdpTransport` and the `tokio::net::UdpSocket` it wraps live behind the
-// `transport-udp` feature (see `crates/gabion/src/gossip.rs:42-43`). Without
-// the gate, `cargo nextest run -p gabion --no-default-features` — the form
-// the kubernetes smokes use — fails to compile this whole test crate.
+// `transport-udp` feature (see the `transport-udp` gate on the `UdpTransport`
+// re-export in `gossip.rs`). Without the gate, `cargo nextest run -p gabion
+// --no-default-features` — the form the kubernetes smokes use — fails to
+// compile this whole test crate.
 #[cfg(feature = "transport-udp")]
 #[tokio::test(flavor = "current_thread")]
 async fn udp_round_trip_smoke() {
@@ -1941,10 +1942,9 @@ fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
 /// runtime increments `decode_reject_count` per drop and rate-limits a
 /// `warn!` to power-of-two transitions. The existing authentication
 /// quickcheck verifies *convergence* under mismatched keys but never reads
-/// the counter — a regression that breaks the increment (e.g. dropping the
-/// `saturating_add`) wouldn't fail any current test.
+/// the counter.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn decode_rejects_increment_on_wrong_auth_and_throttle_warns() {
+async fn decode_rejects_increment_on_wrong_auth() {
     use tokio::sync::mpsc;
 
     let local = LocalSet::new();

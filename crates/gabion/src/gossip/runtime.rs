@@ -4,8 +4,9 @@
 //! UDP, outbound writable, peer membership churn, gossip tick. After each
 //! iteration the runtime calls [`AggregateStore::apply`] once with whatever
 //! rows the arm produced. The runtime owns the [`CellStore`], pre-allocated
-//! scratch buffers, the outbound send pool, and the peer table; nothing in
-//! the loop allocates after construction.
+//! scratch buffers, the outbound send pool, and the peer table; the request
+//! and packet arms reuse those buffers; peer churn and admin commands may
+//! allocate.
 
 use std::collections::VecDeque;
 use std::io;
@@ -124,9 +125,8 @@ where
     // iteration is processed.
     pending_reply: Option<oneshot::Sender<()>>,
 
-    // Cumulative count of dropped inbound frames. Used to rate-limit the
-    // decode-failure `warn!` to power-of-two transitions so a peer stuck on
-    // the wrong version / cluster secret can't flood the log.
+    // Inbound packets that failed to decode. Throttles `decode_rejected` and
+    // is reported in `AdminSnapshot`.
     decode_reject_count: u64,
 
     // High-water mark of `send_pending.len()`. Strictly observability — the
@@ -353,7 +353,6 @@ where
             // split-borrowed for the I/O futures below.
             let have_send = !self.send_pending.is_empty();
             let watch_peers = !peer_events_done;
-            let watch_admin = self.admin_rx.is_some();
 
             let outcome = if self.want_immediate_flush {
                 // A previous limit request crossed the per-rule error
@@ -389,7 +388,7 @@ where
                     recv = transport.recv_from(recv_buf) => ArmOutcome::Inbound(recv),
                     _ = transport.writable(), if have_send => ArmOutcome::Writable,
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
-                    cmd = recv_admin(admin_rx), if watch_admin => ArmOutcome::Admin(cmd),
+                    cmd = recv_admin(admin_rx) => ArmOutcome::Admin(cmd),
                     _ = tick.tick() => ArmOutcome::Tick,
                 }
             };
@@ -887,13 +886,12 @@ enum ArmOutcome {
     Tick,
 }
 
-/// Read one admin command. Only invoked when `admin_rx.is_some()` — the
-/// `select!` guard ensures the unwrap is safe.
+/// Read one admin command; never resolves once the channel is gone.
 async fn recv_admin(rx: &mut Option<mpsc::Receiver<AdminCommand>>) -> Option<AdminCommand> {
-    rx.as_mut()
-        .expect("admin arm gated by admin_rx.is_some()")
-        .recv()
-        .await
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// SplitMix64 — small, fast, deterministic. Used only for peer sampling so

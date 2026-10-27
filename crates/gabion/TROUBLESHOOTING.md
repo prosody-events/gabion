@@ -27,7 +27,7 @@ Message starts: "Too many distinct rate-limit keys are being tracked at once."
 
 Message starts: "Too many distinct rate-limit rules are in flight."
 
-**What happened.** The rule dictionary had no free slot for a rule. The rule cannot be registered on this node, so it does not enforce limits here.
+**What happened.** The rule dictionary had no free slot for a rule. The rule cannot be registered on this node, so requests it matches are allowed and its limit under-counts here.
 
 **Why.** Usually more rules are configured across the cluster than the dictionary holds, for example during a configuration rollout that briefly runs old and new rule sets together.
 
@@ -48,6 +48,20 @@ Message starts: "Too many gabion peer instances are being tracked"
 **What to do next.** Raise `storage.node_dictionary_capacity` (`GABION_STORAGE_NODE_DICTIONARY_CAPACITY`) in `gabiond`, or `gabion_storage_node_dictionary_capacity` in NGINX. Size it above pods × (1 + restarts within your longest rule window).
 
 **Fields** `config_key`, `capacity`, `in_use`, `peer_node_id`, `peer_incarnation`, `rejected_total` · **Knob** `storage.node_dictionary_capacity` (`GABION_STORAGE_NODE_DICTIONARY_CAPACITY`) / `gabion_storage_node_dictionary_capacity`
+
+### `peer_frontier_full`
+
+**Level** warn, power of two · **Request allowed** yes, gossip to that peer uses more bandwidth · **Emitted by** library (both adapters)
+
+Message starts: "Too many gabion peers to optimize gossip with."
+
+**What happened.** The peer frontier, which remembers what each peer already has so gossip can skip it, had no free slot for a peer. Counts still converge; gossip with that peer resends rows it already holds.
+
+**Why.** Usually the cluster has more peers than `storage.peer_capacity`, for example after scaling out.
+
+**What to do next.** Raise `storage.peer_capacity` (`GABION_STORAGE_PEER_CAPACITY`) in `gabiond`, or `gabion_storage_peer_capacity` in NGINX, above the number of peers in the cluster.
+
+**Fields** `config_key`, `capacity`, `peer_node_id`, `rejected_total` (packets from peers without a slot, not peers) · **Knob** `storage.peer_capacity` (`GABION_STORAGE_PEER_CAPACITY`) / `gabion_storage_peer_capacity`
 
 ### `decode_rejected`
 
@@ -71,11 +85,11 @@ Message starts: "The Kubernetes API rejected gabion's"
 
 **What happened.** The Kubernetes API rejected gabion's Service or EndpointSlice watch (the `resource` field says which), so peer discovery has stopped and the peer list stays as it was. Gossip continues with the peers already known; no new peers are found.
 
-**Why.** Usually the pod's ServiceAccount lacks RBAC permission (HTTP 401 or 403 in `error`), or the API does not serve the resource (404).
+**Why.** Usually the pod's ServiceAccount lacks RBAC permission (`status` 401 or 403); `status` 404 means the cluster does not serve `discovery.k8s.io/v1` EndpointSlices (Kubernetes 1.21 or later is required).
 
 **What to do next.** Grant the ServiceAccount get/list/watch on Services and EndpointSlices and get on Pods, in every namespace discovery watches (see [`deploy/kubernetes/gabion-discovery-rbac.yaml`](../../deploy/kubernetes/gabion-discovery-rbac.yaml) and the [Kubernetes checklist](../../README.md#kubernetes-checklist)), then restart the pod.
 
-**Fields** `resource`, `error`, `namespace` and `service` (EndpointSlice watch only) · **Knob** the Role in the Kubernetes checklist
+**Fields** `resource`, `status`, `error`, `namespace` and `service` (EndpointSlice watch only) · **Knob** the Role in the Kubernetes checklist
 
 ### `no_gabion_service`
 

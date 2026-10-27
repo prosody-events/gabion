@@ -36,16 +36,9 @@ impl CellIndex {
         }
     }
 
-    pub fn capacity(&self) -> u32 {
-        self.capacity
-    }
-
+    #[cfg(test)]
     pub fn len(&self) -> u32 {
         self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     #[inline(always)]
@@ -86,8 +79,8 @@ impl CellIndex {
     /// Insert `(hash, slot_index)`. Caller must have already verified that
     /// the entry is not already present.
     pub fn insert_unchecked(&mut self, hash: u64, slot_index: u32) {
-        assert!(slot_index != EMPTY_INDEX_SLOT, "slot index reserved");
-        assert!(self.len < self.capacity, "CellIndex full");
+        debug_assert!(slot_index != EMPTY_INDEX_SLOT, "slot index reserved");
+        debug_assert!(self.len < self.capacity, "CellIndex full");
         let mut slot = (hash as u32) & self.mask;
         let mut cur_hash = hash;
         let mut cur_slot_idx = slot_index;
@@ -164,14 +157,6 @@ impl CellIndex {
             self.hashes[slot as usize] = next_hash;
             slot = next;
         }
-    }
-
-    pub fn clear(&mut self) {
-        self.slot_indexes
-            .iter_mut()
-            .for_each(|s| *s = EMPTY_INDEX_SLOT);
-        self.hashes.iter_mut().for_each(|h| *h = 0);
-        self.len = 0;
     }
 }
 

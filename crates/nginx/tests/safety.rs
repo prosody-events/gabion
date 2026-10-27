@@ -36,11 +36,10 @@ use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, hash_key};
 
 use gabion::crdt::{NodeId, NodeIdentity};
 
-use gabion_nginx::access::{
-    AccessCtx, AccessOutcome, CardinalitySettings, VariableLookup, decide_all,
-};
+use gabion_nginx::access::{AccessCtx, AccessOutcome, VariableLookup, decide_all};
 use gabion_nginx::rules::{
-    BindingLookup, CompiledRules, DescriptorBinding, NopBindingCompiler, RuleConfig,
+    BindingLookup, CardinalitySettings, CompiledRules, DescriptorBinding, NopBindingCompiler,
+    RuleConfig,
 };
 use gabion_nginx::shm::aggregate::ShmAggregateStore;
 use gabion_nginx::shm::header::{SHM_MAGIC, SHM_VERSION};
@@ -419,31 +418,21 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
 #[test]
 fn lease_takeover_under_contention() {
     let (_zone, region) = build_zone(8, 16);
-    let lease = std::sync::Arc::new(LeaseFacade { region });
+    let lease = region.lease();
 
     // Millisecond precision now that the lease packs `(owner: u24,
     // expires_millis: u40)` into a single atomic.
-    assert!(lease.region.lease().try_acquire(1, 0, 100));
+    assert!(lease.try_acquire(1, 0, 100));
     // Worker 2 cannot steal a live lease.
-    assert!(!lease.region.lease().try_acquire(2, 50, 100));
+    assert!(!lease.try_acquire(2, 50, 100));
     // After the lease expires (now=200ms > expires=100ms), worker 2 takes over.
-    assert!(lease.region.lease().try_acquire(2, 200, 100));
+    assert!(lease.try_acquire(2, 200, 100));
     // Worker 1's renewal must now fail.
-    assert!(!lease.region.lease().try_acquire(1, 210, 100));
+    assert!(!lease.try_acquire(1, 210, 100));
     // Release lets the next worker grab it immediately.
-    assert!(lease.region.lease().release(2));
-    assert!(lease.region.lease().try_acquire(3, 300, 100));
+    assert!(lease.release(2));
+    assert!(lease.try_acquire(3, 300, 100));
 }
-
-// We need a wrapper to bypass the lack of `Send` impl for `*mut u8` inside
-// `ShmRegion` if we want it shared between threads. `ShmRegion` is `Send`
-// + `Sync` by `unsafe impl`. Use it directly.
-struct LeaseFacade {
-    region: ShmRegion,
-}
-
-unsafe impl Send for LeaseFacade {}
-unsafe impl Sync for LeaseFacade {}
 
 // -- 6. End-to-end nginx flow: workers push, leader drains+applies, workers
 // reread
@@ -584,10 +573,10 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
     assert_eq!(cell.count, TOTAL);
 }
 
-// -- 7. Decide() + leader apply running concurrently -----------------------
+// -- 7. decide_all + leader apply running concurrently ----------------------
 
 #[test]
-fn decide_and_leader_apply_concurrent() {
+fn decide_all_and_leader_apply_concurrent() {
     // Smaller iteration counts under miri to keep runtime reasonable.
     #[cfg(not(miri))]
     const ITERATIONS: usize = 64;
@@ -668,7 +657,7 @@ fn decide_and_leader_apply_concurrent() {
 
 // -- 8b. Multi-rule decide_all + leader apply running concurrently --------
 
-/// Same shape as `decide_and_leader_apply_concurrent`, but with two stacked
+/// Same shape as `decide_all_and_leader_apply_concurrent`, but with two stacked
 /// rules so the multi-rule queue-flush path is exercised under the
 /// writer/reader race. Catches regressions in the queue-batching logic
 /// that single-rule tests can't surface.
@@ -788,17 +777,15 @@ fn decide_all_multi_rule_concurrent() {
 fn lease_concurrent_acquire_distinct_winners() {
     use std::sync::Barrier;
     let (_zone, region) = build_zone(8, 16);
-    let region = std::sync::Arc::new(LeaseFacade { region });
     let barrier = std::sync::Arc::new(Barrier::new(4));
     let mut handles = Vec::new();
     let winners = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     for worker in 1..=4_u32 {
-        let region = region.clone();
         let barrier = barrier.clone();
         let winners = winners.clone();
         handles.push(thread::spawn(move || {
             barrier.wait();
-            if region.region.lease().try_acquire(worker, 0, 1_000) {
+            if region.lease().try_acquire(worker, 0, 1_000) {
                 winners.lock().unwrap().push(worker);
             }
         }));

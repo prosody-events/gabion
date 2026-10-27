@@ -1,7 +1,6 @@
 //! Bounded dirty-change ring used by gossip lanes.
 
 use super::CellHandle;
-use crate::throttle;
 
 /// One entry in a [`DirtyRing`]. The `origin_sequence` is validated against
 /// the cell's current `origin_sequences[slot]` on consumption — a later
@@ -57,22 +56,21 @@ impl DirtyRing {
         self.overflow_seq > 0
     }
 
-    /// Returns the overflow count when it reaches a power of two, for the
-    /// caller to log.
-    pub fn push(&mut self, entry: DirtyEntry) -> Option<u64> {
+    /// Append `entry`, overwriting the oldest one when the ring is full and
+    /// bumping `overflow_seq`.
+    pub fn push(&mut self, entry: DirtyEntry) {
         let cap = self.entries.len() as u32;
         if cap == 0 {
-            return throttle::bump(&mut self.overflow_seq);
+            self.overflow_seq = self.overflow_seq.saturating_add(1);
+            return;
         }
-        let overflow = if self.len == cap {
-            throttle::bump(&mut self.overflow_seq)
+        if self.len == cap {
+            self.overflow_seq = self.overflow_seq.saturating_add(1);
         } else {
             self.len += 1;
-            None
-        };
+        }
         self.entries[self.head as usize] = entry;
         self.head = (self.head + 1) % cap;
-        overflow
     }
 
     /// Iterate ring entries in insertion order (oldest first).

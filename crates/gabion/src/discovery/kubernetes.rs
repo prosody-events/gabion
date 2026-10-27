@@ -22,7 +22,7 @@ const DEFAULT_GABION_SERVICE_NAME: &str = "gabion";
 /// peer the Service had contributed before its watcher is shut down.
 ///
 /// The kube `Client` is built lazily when `peer_events` is first polled. If
-/// the in-cluster/kubeconfig environment is missing, a warning is logged and
+/// the in-cluster environment is missing, a warning is logged and
 /// the stream completes empty.
 #[derive(Clone)]
 pub struct EndpointSliceDiscovery {
@@ -80,14 +80,17 @@ impl PeerDiscovery for EndpointSliceDiscovery {
             let mut services = watch_services(&client, &self.namespace_allow);
             let mut endpoints = SelectAll::new();
             let mut watched: AHashMap<Target, oneshot::Sender<()>> = AHashMap::new();
-            // True once *any* namespace has finished its initial Service list
-            // without producing a single Track. The first time that happens
-            // we emit a one-shot operator warning (see CLAUDE.md's
-            // operator-facing-errors rules). Tracks observed after the
-            // warning fires don't unset it — the operator already has the
-            // information they need, and re-firing on every relist would
-            // be noisy.
+            // True once every watched namespace has finished its initial
+            // Service list without producing a single Track. The first time
+            // that happens we emit a one-shot operator warning (see
+            // CLAUDE.md's operator-facing-errors rules). Tracks observed
+            // after the warning fires don't unset it — the operator already
+            // has the information they need, and re-firing on every relist
+            // would be noisy. `unsynced` counts the namespace watchers
+            // `watch_services` merged that have not yet sent `InitDone`.
             let mut zero_match_warned = false;
+            let mut unsynced =
+                self.namespace_allow.iter().filter(|ns| !ns.is_empty()).count().max(1);
             let watched_namespaces = self.namespace_allow.clone();
 
             loop {
@@ -100,28 +103,27 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                             // those wastes CPU and floods error_log without
                             // making forward progress — the operator has to
                             // fix the SA/RBAC and restart the pod either way.
-                            let fatal = is_fatal_watcher_error(&err);
-                            if fatal {
+                            if let Some(status) = fatal_status(&err) {
                                 tracing::error!(
                                     code = "kubernetes_forbidden",
                                     resource = "Service",
+                                    status,
                                     error = %err,
                                     "The Kubernetes API rejected gabion's Service watch, so peer \
                                      discovery has stopped and the peer list stays as it was; \
                                      gossip continues with the peers already known. Usually the \
-                                     pod's ServiceAccount lacks RBAC permission (HTTP 401 or 403 \
-                                     in `error`), or the API does not serve the resource (404). \
-                                     Grant the ServiceAccount get/list/watch on Services and \
-                                     EndpointSlices and get on Pods (see \
+                                     pod's ServiceAccount lacks RBAC permission (`status` 401 or \
+                                     403); `status` 404 means the cluster does not serve \
+                                     `discovery.k8s.io/v1` EndpointSlices (Kubernetes 1.21 or \
+                                     later is required). Grant the ServiceAccount get/list/watch \
+                                     on Services and EndpointSlices and get on Pods (see \
                                      `deploy/kubernetes/gabion-discovery-rbac.yaml` and the \
                                      Kubernetes checklist in gabion's README), then restart the \
                                      pod.",
                                 );
-                            }
-                            yield Err(err.into());
-                            if fatal {
                                 return;
                             }
+                            yield Err(err.into());
                         }
                         Ok(event) => match service_change(event, &self.service_allow) {
                             ServiceChange::Track(target) => {
@@ -154,7 +156,8 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                 }
                             }
                             ServiceChange::InitDone => {
-                                if !zero_match_warned && watched.is_empty() {
+                                unsynced = unsynced.saturating_sub(1);
+                                if unsynced == 0 && !zero_match_warned && watched.is_empty() {
                                     let ns_display = if watched_namespaces.is_empty() {
                                         "<pod's own namespace>".to_string()
                                     } else {
@@ -325,30 +328,28 @@ fn watch_services(
     )
 }
 
-/// Decide whether a kube-rs watcher error is worth retrying. `watcher()`
-/// reconnects on every Err, but auth and "this resource doesn't exist"
-/// failures don't heal without an operator change — we'd just spin
-/// forever in the meantime. Anything transport-shaped (TLS, hyper,
-/// service errors, no resource version) is left to retry.
-fn is_fatal_watcher_error(err: &WatcherError) -> bool {
-    let client_err = match err {
+/// The HTTP status of a kube-rs watcher error that is not worth retrying.
+/// `watcher()` reconnects on every Err, but auth (401, 403) and "this
+/// resource doesn't exist" (404) failures don't heal without an operator
+/// change — we'd just spin forever in the meantime. Anything
+/// transport-shaped (TLS, hyper, service errors, no resource version) is
+/// `None` and left to retry.
+fn fatal_status(err: &WatcherError) -> Option<u16> {
+    let code = match err {
         WatcherError::InitialListFailed(e)
         | WatcherError::WatchStartFailed(e)
-        | WatcherError::WatchFailed(e) => e,
+        | WatcherError::WatchFailed(e) => {
+            let kube::Error::Api(api_err) = e else {
+                return None;
+            };
+            api_err.code
+        }
         // `WatchError` carries an `ErrorResponse` directly (apiserver sent
         // back a Status object mid-stream), so check its code too.
-        WatcherError::WatchError(api_err) => return is_fatal_status_code(api_err.code),
-        WatcherError::NoResourceVersion => return false,
+        WatcherError::WatchError(api_err) => api_err.code,
+        WatcherError::NoResourceVersion => return None,
     };
-    if let kube::Error::Api(api_err) = client_err {
-        is_fatal_status_code(api_err.code)
-    } else {
-        false
-    }
-}
-
-fn is_fatal_status_code(code: u16) -> bool {
-    matches!(code, 401 | 403 | 404)
+    matches!(code, 401 | 403 | 404).then_some(code)
 }
 
 /// True if `name` matches any non-empty entry in `allow`. An allow list
@@ -387,30 +388,30 @@ fn watch_target(
                 event = events.next() => match event {
                     None => return,
                     Some(Err(err)) => {
-                        let fatal = is_fatal_watcher_error(&err);
-                        if fatal {
+                        if let Some(status) = fatal_status(&err) {
                             tracing::error!(
                                 code = "kubernetes_forbidden",
                                 resource = "EndpointSlice",
                                 namespace = %target.namespace,
                                 service = %target.service_name,
+                                status,
                                 error = %err,
                                 "The Kubernetes API rejected gabion's EndpointSlice watch for \
                                  this Service, so discovery of its peers has stopped and they \
                                  stay in the peer list as they were; gossip continues with the \
                                  peers already known. Usually the pod's ServiceAccount lacks \
-                                 RBAC permission (HTTP 401 or 403 in `error`), or the API does \
-                                 not serve the resource (404). Grant the ServiceAccount \
-                                 get/list/watch on Services and EndpointSlices and get on Pods \
-                                 (see `deploy/kubernetes/gabion-discovery-rbac.yaml` and the \
+                                 RBAC permission (`status` 401 or 403); `status` 404 means the \
+                                 cluster does not serve `discovery.k8s.io/v1` EndpointSlices \
+                                 (Kubernetes 1.21 or later is required). Grant the \
+                                 ServiceAccount get/list/watch on Services and EndpointSlices \
+                                 and get on Pods (see \
+                                 `deploy/kubernetes/gabion-discovery-rbac.yaml` and the \
                                  Kubernetes checklist in gabion's README), then restart the \
                                  pod.",
                             );
-                        }
-                        yield Err(err.into());
-                        if fatal {
                             return;
                         }
+                        yield Err(err.into());
                     }
                     Some(Ok(Event::Init | Event::InitDone)) => {}
                     Some(Ok(Event::Apply(slice) | Event::InitApply(slice))) => {
@@ -458,8 +459,7 @@ pub(super) struct PeerSetDiff {
 impl EndpointSlicePeerSet {
     /// Replace the cached peer set for `slice.metadata.name` with the
     /// parsed peers of `slice`. Returns the symmetric difference. A
-    /// slice with no name is silently dropped (matches the in-tree
-    /// `continue` in `watch_target`).
+    /// slice with no name is silently dropped.
     pub(super) fn apply(
         &mut self,
         slice: &EndpointSlice,

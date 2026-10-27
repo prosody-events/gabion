@@ -173,7 +173,7 @@ impl<'a> AggregateTable<'a> {
     }
 
     /// Sum the counts for the live `[bucket - live_buckets + 1 .. bucket]`
-    /// range. Drops back to `bucket = 0` if the subtraction underflows.
+    /// range. Stops at bucket 0.
     pub fn window_total(
         &self,
         fp: u128,
@@ -259,7 +259,8 @@ impl ShmAggregateStore {
                 "gabion: this worker took over gossip and emptied the previous leader's counts, \
                  so that peers' gossip refills them without counting them twice. Until then, \
                  usually a gossip tick or two, this node under-counts and may admit requests over \
-                 their limits. Nothing to do unless it lasts more than a few gossip ticks; if it \
+                 their limits; a node with no peers instead under-counts until each rule's window \
+                 has passed. Nothing to do unless it lasts more than a few gossip ticks; if it \
                  does, check that this node receives gossip from its peers (\"Verifying \
                  convergence\" in the gabion-nginx README).",
             );

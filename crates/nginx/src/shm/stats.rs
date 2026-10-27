@@ -1,4 +1,5 @@
-//! Lightweight per-zone counters surfaced via `/snapshot` and logs. All
+//! Lightweight per-zone counters, read by tests and the leader; only
+//! `aggregate_dropped` reaches a log line today. All
 //! mutation is `Relaxed` — these are best-effort observability values, not
 //! synchronization signals.
 
@@ -7,10 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gabion::defaults;
 use gabion::rules::RuleId;
 
-/// Cap on per-rule counters held in [`Stats::exempted_per_rule`]. Matches
-/// the cluster-wide rule-dictionary cap so a rule that fits in the gossip
-/// CRDT also has a per-rule slot here. Operators see the cap via the same
-/// config key (`STORAGE_RULE_DICTIONARY_CAPACITY`).
+/// Cap on per-rule counters held in [`Stats::exempted_per_rule`]. A build
+/// constant equal to the default rule-dictionary capacity;
+/// `gabion_storage_rule_dictionary_capacity` does not change it.
 pub const STATS_MAX_RULES: usize = defaults::STORAGE_RULE_DICTIONARY_CAPACITY as usize;
 
 #[repr(C)]
@@ -25,8 +25,9 @@ pub struct Stats {
     pub exempted: AtomicU64,
     /// Per-rule exempt counter, indexed by `rule_id - 1`. A rule whose id
     /// falls outside `1..=STATS_MAX_RULES` contributes only to the global
-    /// `exempted` counter (the dictionary cap is observable via the same
-    /// `STORAGE_RULE_DICTIONARY_CAPACITY` operators already configure).
+    /// `exempted` counter. `STATS_MAX_RULES` is a build constant equal to the
+    /// default rule-dictionary capacity;
+    /// `gabion_storage_rule_dictionary_capacity` does not change it.
     pub exempted_per_rule: [AtomicU64; STATS_MAX_RULES],
     pub queue_pushed: AtomicU64,
     pub queue_drained: AtomicU64,
@@ -67,25 +68,6 @@ pub struct StatsSnapshot {
     pub queue_drained: u64,
     pub queue_dropped: u64,
     pub aggregate_dropped: u64,
-}
-
-impl Default for StatsSnapshot {
-    fn default() -> Self {
-        Self {
-            requests: 0,
-            allowed: 0,
-            rejected: 0,
-            rejected_cardinality: 0,
-            declines_invalid_descriptor: 0,
-            matched_rule_overflows: 0,
-            exempted: 0,
-            exempted_per_rule: [0_u64; STATS_MAX_RULES],
-            queue_pushed: 0,
-            queue_drained: 0,
-            queue_dropped: 0,
-            aggregate_dropped: 0,
-        }
-    }
 }
 
 impl Stats {
@@ -130,17 +112,15 @@ impl Stats {
     }
 
     /// A descriptor's value could not be read as a UTF-8 string; the
-    /// request was declined (passed through without recording). Unmasks
-    /// what was previously a silent bypass.
+    /// request was declined (passed through without recording).
     pub fn record_decline_invalid_descriptor(&self) {
         self.declines_invalid_descriptor
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A single request matched more rules than the per-request cap. Per
-    /// the allow-by-default principle the request still passes through
-    /// (best-effort: events buffered before the overflow are still
-    /// recorded), but operators want visibility into the bypass.
+    /// One per allowed rule whose count did not fit in the request's
+    /// `STORAGE_MAX_MATCHED_RULES`-event buffer; the request was still
+    /// allowed and that rule under-counts.
     pub fn record_matched_rule_overflow(&self) {
         self.matched_rule_overflows.fetch_add(1, Ordering::Relaxed);
     }

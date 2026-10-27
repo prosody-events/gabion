@@ -185,8 +185,6 @@ fn default_cardinality_settings_match_shared_defaults() {
         defaults::STORAGE_MAX_DESCRIPTOR_BYTES
     );
     assert_eq!(settings.max_key_bytes, defaults::STORAGE_MAX_KEY_BYTES);
-    assert_eq!(MAX_DESCRIPTOR_BYTES, defaults::STORAGE_MAX_DESCRIPTOR_BYTES);
-    assert_eq!(MAX_KEY_BYTES, defaults::STORAGE_MAX_KEY_BYTES);
 }
 
 #[test]
@@ -213,6 +211,37 @@ fn invalid_utf8_descriptor_declines_and_bumps_counter() {
     assert_eq!(snap.rejected_cardinality, 0);
 }
 
+/// A `mode=disabled` rule declines before its predicate, byte budget and
+/// UTF-8 checks, so none of them answers or moves a counter.
+#[test]
+fn disabled_rule_declines_before_any_check() {
+    let (_buf, region) = TestZone::new(8, 16);
+    let mut config = rule_config(Some("trusted"));
+    config.mode = EnforcementMode::Disabled;
+    let rules = compile(&[config]).expect("compile rules");
+    let ctx = AccessCtx {
+        rules: &rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        domain: crate::rules::DEFAULT_DOMAIN,
+        cardinality: CardinalitySettings::default(),
+    };
+    let over_budget = "a".repeat(defaults::STORAGE_MAX_DESCRIPTOR_BYTES);
+    for vars in [
+        MockVars::new().set("trusted", "1"),
+        MockVars::new().set("http_x_tenant", &over_budget),
+        MockVars::new().set_bytes("http_x_tenant", &[0xFF]),
+    ] {
+        let outcome = decide_all(ctx, &[0], &vars, 1_000);
+        assert!(matches!(outcome, AccessOutcome::Decline), "{outcome:?}");
+    }
+    let snap = region.stats().snapshot();
+    assert_eq!(snap.exempted, 0);
+    assert_eq!(snap.rejected_cardinality, 0);
+    assert_eq!(snap.declines_invalid_descriptor, 0);
+}
+
 #[test]
 fn is_truthy_matches_documented_falsy_set() {
     for falsy in [
@@ -227,6 +256,9 @@ fn is_truthy_matches_documented_falsy_set() {
         b"no",
         b"No",
         b"NO",
+        b"fAlSe",
+        b"oFf",
+        b"nO",
     ] {
         assert!(!is_truthy(falsy), "{:?} should be falsy", falsy);
     }
@@ -235,8 +267,8 @@ fn is_truthy_matches_documented_falsy_set() {
     }
 }
 
-fn rule_with_predicate(predicate: Option<&str>) -> CompiledRules {
-    compile(&[RuleConfig {
+fn rule_config(predicate: Option<&str>) -> RuleConfig {
+    RuleConfig {
         name: "per_tenant".into(),
         domain: crate::rules::DEFAULT_DOMAIN.into(),
         bindings: vec![DescriptorBinding {
@@ -248,8 +280,11 @@ fn rule_with_predicate(predicate: Option<&str>) -> CompiledRules {
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
         except_if: predicate.map(Into::into),
-    }])
-    .expect("compile rules")
+    }
+}
+
+fn rule_with_predicate(predicate: Option<&str>) -> CompiledRules {
+    compile(&[rule_config(predicate)]).expect("compile rules")
 }
 
 #[test]

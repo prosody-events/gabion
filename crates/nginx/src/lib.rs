@@ -5,10 +5,10 @@
 //!   - Every nginx worker handles requests on its event loop. The access phase
 //!     reads the SHM aggregate table (no syscalls, no allocation), decides
 //!     allow/reject, and pushes a record into the SHM queue.
-//!   - One elected worker spawns a dedicated OS thread that owns a
-//!     `current_thread` tokio runtime + `LocalSet`. The thread drains the SHM
-//!     queue, drives the `GossipRuntime`, and writes deltas back into the SHM
-//!     aggregate table via `ShmAggregateStore`.
+//!   - Every worker runs a leader thread that campaigns for the SHM lease; the
+//!     holder owns a `current_thread` tokio runtime + `LocalSet`, drains the
+//!     SHM queue, drives the `GossipRuntime`, and writes deltas back into the
+//!     SHM aggregate table via `ShmAggregateStore`.
 //!
 //! The library half (this file plus the `access`, `headers`, `identity`,
 //! `leader`, `rules`, `shm` modules) builds and tests without the

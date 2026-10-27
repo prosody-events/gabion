@@ -154,18 +154,6 @@ impl RuleTable {
         self.rules.iter()
     }
 
-    pub fn len(&self) -> usize {
-        self.rules.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
-    }
-
-    pub fn get(&self, id: RuleId) -> Option<&Rule> {
-        self.rules.iter().find(|rule| rule.id == id)
-    }
-
     /// Rules whose `(domain, descriptor pattern)` matches the request shape,
     /// excluding any rule in [`EnforcementMode::Disabled`]. Rules in
     /// [`EnforcementMode::DryRun`] are returned so adapters can still hash
@@ -257,8 +245,8 @@ const RATE_PERIOD_ERR: &str =
 ///
 /// The suffix after `r/` is either a single-letter unit (`s`, `m`, `h`,
 /// `d`) or a [humantime] duration (`30s`, `5m`, `2h30m`). Zero counts and
-/// periods under 1 ms are rejected at parse time so `cfg.limit.max(1)` is
-/// never load-bearing in downstream code.
+/// periods under 1 ms are rejected at parse time so `resolve_rate` always
+/// yields a limit of at least 1.
 ///
 /// Shared by both adapters so two nodes with identical rule text agree on
 /// what `rate=10r/s` means.
@@ -308,14 +296,13 @@ pub struct ResolvedRate {
 }
 
 /// Reasons [`resolve_rate`] can refuse a (rate, window, bucket) tuple. Each
-/// variant carries enough context for the adapter to print an
-/// operator-quality error per CLAUDE.md (what / why / what to do).
+/// variant's message answers what, why and what next.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum RateResolveError {
     #[error(
-        "the window must be at least as long as the rate's period; a shorter window would resolve \
-         to a zero limit. To enforce N requests in a shorter span, put the period in the rate \
-         itself (for example `100r/500ms`)"
+        "the window is shorter than the rate's period, so the rate cannot be spread over it. To \
+         enforce N requests in a shorter span, put the period in the rate itself (for example \
+         `100r/500ms`)"
     )]
     WindowShorterThanPeriod,
     #[error(
@@ -326,7 +313,8 @@ pub enum RateResolveError {
     #[error("the bucket is zero. `bucket` defaults to `window`; omit it for one bucket per window")]
     ZeroBucket,
     #[error(
-        "rate × window overflows a 64-bit limit; check for a unit typo (`ms` versus `m`), or use \
+        "the count multiplied by the window in milliseconds does not fit in 64 bits; usually a \
+         count or window far larger than intended (extra zeros, or `y` where `s` was meant). Use \
          a smaller count or a shorter window"
     )]
     LimitOverflow,
@@ -344,9 +332,9 @@ pub enum RateResolveError {
 ///   checked multiplication so an operator who writes `rate=1r/ms window=10y`
 ///   gets a clean `LimitOverflow` instead of wrap-around.
 ///
-/// `window < period` is rejected because the integer-floor would resolve
-/// to `limit = 0`, which `parse_rate` already refuses to express
-/// directly — surfacing it here as an error keeps the two paths aligned.
+/// `window < period` is rejected: a window shorter than the rate's period has
+/// no rate to scale down from; the operator writes the shorter period into
+/// the rate instead.
 pub fn resolve_rate(
     rate_count: u64,
     period: Duration,

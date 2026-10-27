@@ -42,14 +42,30 @@ fn empty_bindings_reject() {
 #[test]
 fn key_too_long_at_compile() {
     let long_key = "k".repeat(200);
-    let cardinality = CardinalitySettings::default();
-    let err = CompiledRules::compile_with(
-        &[cfg("long", vec![binding(&long_key, "http_x")])],
+    let err = compile(&[cfg("long", vec![binding(&long_key, "http_x")])]).unwrap_err();
+    assert!(matches!(err, RuleConfigError::KeyTooLong { .. }));
+}
+
+/// The configured `gabion_storage_max_key_bytes` is the only key-length
+/// bound: a key over the default parses and compiles once the zone raises it.
+#[test]
+fn raised_max_key_bytes_admits_long_key() {
+    let long_key = "k".repeat(200);
+    let bindings = vec![
+        parse_binding(&format!("${long_key}")).unwrap(),
+        parse_binding(&format!("{long_key}x:$http_x")).unwrap(),
+    ];
+    let cardinality = CardinalitySettings {
+        max_key_bytes: 256,
+        ..Default::default()
+    };
+    let rules = CompiledRules::compile_with(
+        &[cfg("long", bindings)],
         cardinality,
         &mut NopBindingCompiler,
     )
-    .unwrap_err();
-    assert!(matches!(err, RuleConfigError::KeyTooLong { .. }));
+    .expect("a 200-byte key fits a 256-byte budget");
+    assert_eq!(rules.rules()[0].bindings[0].key.len(), 200);
 }
 
 #[test]

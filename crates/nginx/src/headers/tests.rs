@@ -1,6 +1,6 @@
 use super::*;
 use crate::access::AllowInfo;
-use crate::rules::RuleSpec;
+use gabion::rules::RuleSpec;
 
 fn spec(limit: u64) -> RuleSpec {
     RuleSpec {

@@ -16,7 +16,7 @@
 //! Examples:
 //!
 //! - `GABION_STORAGE_MAX_CELLS=131072`
-//! - `GABION_GOSSIP_BIND=0.0.0.0:9090`
+//! - `GABION_GOSSIP_BIND=0.0.0.0:9000`
 //! - `GABION_GOSSIP_TICK_INTERVAL=100ms`
 //! - `GABION_DISCOVERY_NAMESPACE_ALLOW=ns-a,ns-b` (comma-separated)
 //!
@@ -587,10 +587,7 @@ pub enum ConfigError {
     EmptyDescriptorSet(String),
     #[error("rule `{name}` is declared more than once; rule names must be unique")]
     DuplicateRule { name: String },
-    #[error(
-        "rule `{name}` has an invalid `rate:` value: {reason}. Use e.g. `rate: 100r/s` or `rate: \
-         10r/5m`."
-    )]
+    #[error("rule `{name}` has an invalid `rate:` value: {reason}.")]
     InvalidRate { name: String, reason: &'static str },
     #[error("rule `{name}`: {source}")]
     ResolveRate {

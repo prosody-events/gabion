@@ -776,7 +776,6 @@ fn dirty_ring_yields_each_changed_cell_once() {
         assert!(s.resolve(h).is_some());
         true
     });
-    seen.sort();
     assert_eq!(seen.len(), 2);
 }
 
@@ -1152,7 +1151,7 @@ fn dictionary_full_rejects_with_counter() {
     obs.push(observation(0x20, 0xabc, 0, 3, 1, 1, 0));
     store.merge_remote(&obs, &mut sink);
     assert_eq!(sink.len(), 0);
-    assert!(store.stats().rule_dictionary_full_rejects >= 1);
+    assert_eq!(store.stats().rule_dictionary_full_rejects, 1);
 }
 
 #[test]

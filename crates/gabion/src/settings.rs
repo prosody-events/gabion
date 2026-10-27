@@ -1,4 +1,4 @@
-//! Every operator setting, named once: the `gabiond` YAML key (also the
+//! Every scalar operator setting, named once: the `gabiond` YAML key (also the
 //! `config_key` log field), its environment variable, and its NGINX
 //! directive. Messages interpolate a [`Setting`] instead of spelling it.
 

@@ -1,15 +1,14 @@
-//! SHM zone header: magic, version, identity, geometry summary, rule digest,
-//! aggregate write sequence.
+//! SHM zone header: magic, version, identity, aggregate write sequence.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const SHM_MAGIC: u32 = 0x4742_4e58; // "GBNX"
 pub const SHM_VERSION: u32 = 3;
 
-/// Node identity fields stored cross-process. `node_id` is stamped once by
-/// the master process before fork; `incarnation` is updated atomically by
-/// each leader takeover so peers see fresh `(node_id, incarnation)` pairs
-/// after a flip.
+/// Node identity fields stored cross-process. `node_id` is stamped by the
+/// master on every config load, before fork; `incarnation` is updated
+/// atomically by each leader takeover so peers see fresh `(node_id,
+/// incarnation)` pairs after a flip.
 ///
 /// `node_id` is logically a `u128` but stored as a paired
 /// `(AtomicU64, AtomicU64)` for the same reason `MainConfig` in

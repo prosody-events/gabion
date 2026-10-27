@@ -14,10 +14,11 @@ pub const STORAGE_MAX_DESCRIPTOR_COUNT: usize = 16;
 pub const STORAGE_MAX_DESCRIPTOR_BYTES: usize = 512;
 pub const STORAGE_MAX_KEY_BYTES: usize = 128;
 
-/// Most rules one request is counted and checked against, in both adapters.
-/// A request that matches more is **allowed**: only the first this-many rules
-/// count it and check it, so the rest under-count (gabiond logs
-/// `matched_rule_overflow`). A build-time constant, not a setting.
+/// Most rules one request is counted against. A request that matches more is
+/// **allowed** and the rest under-count: gabiond checks one rule past the
+/// cap, stops, and logs `matched_rule_overflow`; NGINX still checks every
+/// rule but queues counts for only the first this-many and bumps the SHM
+/// `matched_rule_overflows` counter. A build-time constant, not a setting.
 pub const STORAGE_MAX_MATCHED_RULES: usize = 16;
 
 pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;

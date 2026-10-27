@@ -1,17 +1,11 @@
-//! Bridge from operator-provided nginx configuration (`gabion_limit_rule`)
-//! to `gabion::rules::Rule` + a precomputed `RuleSpec` table.
-//!
-//! `RuleSpec` itself lives in `gabion::rules` so both adapters share the
-//! same hot-path-ready summary; this module re-exports it for source
-//! compatibility.
+//! Bridge from `gabion_limit_rule` configuration to `gabion::rules::Rule`
+//! plus compiled bindings.
 
 use std::time::Duration;
 
 use gabion::defaults;
 use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId};
 use thiserror::Error;
-
-pub use gabion::rules::{RateResolveError, ResolvedRate, RuleSpec, parse_rate, resolve_rate};
 
 /// Default domain assigned to rules that don't name one explicitly. nginx
 /// requests carry no inherent "domain" the way Envoy descriptors do, so we
@@ -137,14 +131,12 @@ pub struct RuleConfig {
     pub except_if: Option<Box<str>>,
 }
 
-/// Compiled rule data ready for the runtime. Holds the gossip `Rule`, the
-/// operator-facing name (so locations can be wired up by string), and the
+/// Compiled rule data ready for the runtime. Holds the gossip `Rule` and the
 /// per-request descriptor bindings already compiled into the
 /// [`CompiledBinding`] form the access path can dispatch over. The hot-path
 /// `RuleSpec` is reachable via `rule.spec()`.
 #[derive(Debug)]
 pub struct CompiledRule {
-    pub name: Box<str>,
     pub rule: Rule,
     pub bindings: Box<[CompiledBinding]>,
     /// Optional compiled predicate. When `Some` and the variable resolves
@@ -175,12 +167,12 @@ pub trait BindingCompiler {
     fn compile(&mut self, source: &str) -> Result<BindingLookup, Self::Error>;
 }
 
-/// Best-effort compiler used in tests and any non-FFI build. Maps inline
+/// Best-effort compiler used by unit tests (via `rules::mock`) and
+/// tests/safety.rs. Maps inline
 /// variables to their fast-path arms and synthesises an `IndexedVariable`
 /// for anything else, with the index field set to zero. Always fails on
 /// templates because the test harness has no `ngx_http_complex_value_t` to
 /// hand back.
-#[derive(Default)]
 pub struct NopBindingCompiler;
 
 impl BindingCompiler for NopBindingCompiler {
@@ -284,19 +276,10 @@ pub fn is_dns_label(s: &str) -> bool {
 /// require the explicit `key:source` form — there's no useful auto-name
 /// to derive. Keys are validated against [`is_descriptor_key`] so spaces,
 /// punctuation, or anything else not matching `[A-Za-z_][A-Za-z0-9_.-]*`
-/// is rejected at parse time. Keys longer than the default
-/// `gabion_storage_max_key_bytes` are also rejected here so the error
-/// names the directive line (a second, authoritative check runs at
-/// compile time once any per-zone override takes effect).
+/// is rejected at parse time.
 pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
     if let Some(stripped) = rest.strip_prefix('$') {
         if is_single_ident(stripped) {
-            if stripped.len() > defaults::STORAGE_MAX_KEY_BYTES {
-                return Err(
-                    "binding key exceeds the default `gabion_storage_max_key_bytes` budget; \
-                     tighten the key or raise the directive",
-                );
-            }
             return Ok(DescriptorBinding {
                 key: stripped.into(),
                 source: rest.into(),
@@ -321,12 +304,6 @@ pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
     }
     if source.is_empty() {
         return Err("binding source after `:` is empty; supply a `$variable` or template");
-    }
-    if key.len() > defaults::STORAGE_MAX_KEY_BYTES {
-        return Err(
-            "binding key exceeds the default `gabion_storage_max_key_bytes` budget; tighten the \
-             key or raise the directive",
-        );
     }
     Ok(DescriptorBinding {
         key: key.into(),
@@ -406,7 +383,6 @@ impl CompiledRules {
                 None => None,
             };
             compiled.push(CompiledRule {
-                name: cfg.name.clone(),
                 rule,
                 bindings: bindings.into_boxed_slice(),
                 except_if,
@@ -442,8 +418,8 @@ pub enum RuleConfigError {
     )]
     KeyTooLong { rule: String, key: String },
     #[error(
-        "rule `{rule}`: nginx could not compile binding `{spec}`: {message}. Check the binding's \
-         `$variable` names and quoting, then run `nginx -t`."
+        "rule `{rule}`: nginx could not compile binding `{spec}`: {message}. Fix the rule, then \
+         run `nginx -t`."
     )]
     CompileBinding {
         rule: String,

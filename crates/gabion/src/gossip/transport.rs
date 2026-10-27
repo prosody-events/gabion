@@ -34,8 +34,7 @@ pub trait GossipTransport {
     fn try_send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize>;
 
     /// Await one inbound packet. Writes into the caller-owned buffer.
-    /// Production is zero-copy (the kernel writes directly into `buf`); the
-    /// sim impl performs exactly one byte-copy per packet.
+    /// Production is zero-copy (the kernel writes directly into `buf`).
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
@@ -46,7 +45,7 @@ pub trait GossipTransport {
 /// socket — zero overhead in production.
 #[cfg(feature = "transport-udp")]
 #[derive(Debug)]
-pub struct UdpTransport(pub UdpSocket);
+pub struct UdpTransport(pub(crate) UdpSocket);
 
 #[cfg(feature = "transport-udp")]
 impl UdpTransport {

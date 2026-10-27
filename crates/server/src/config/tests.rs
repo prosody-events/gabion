@@ -208,7 +208,7 @@ fn env_binding_names_use_single_underscores_only() {
 }
 
 #[test]
-fn setting_table_spellings_parse() {
+fn setting_table_matches_env_bindings() {
     let table: std::collections::BTreeSet<_> = gabion::settings::Setting::ALL
         .iter()
         .map(|setting| (setting.yaml_key(), setting.env_var()))
@@ -239,16 +239,18 @@ fn duplicate_rule_names_are_rejected() {
 #[test]
 fn zero_rate_is_rejected_in_yaml() {
     let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
-        "limits:\n  - name: doomed\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
-         0r/s\n",
-    )
-    .expect("yaml parses");
-    let err = cfg.rule_table().expect_err("zero rate must error");
-    assert!(
-        matches!(err, ConfigError::InvalidRate { ref name, .. } if name == "doomed"),
-        "expected InvalidRate, got {err:?}",
-    );
+    for rate in ["0r/s", "10r/500us"] {
+        let cfg = AppConfig::load_with_yaml_str(&format!(
+            "limits:\n  - name: doomed\n    domain: nginx\n    descriptors: [{{ key: ip }}]\n    \
+             rate: {rate}\n",
+        ))
+        .expect("yaml parses");
+        let err = cfg.rule_table().expect_err("zero rate must error");
+        assert!(
+            matches!(err, ConfigError::InvalidRate { ref name, .. } if name == "doomed"),
+            "{rate}: expected InvalidRate, got {err:?}",
+        );
+    }
 }
 
 #[test]

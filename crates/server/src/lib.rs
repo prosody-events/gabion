@@ -79,7 +79,7 @@ pub struct SharedLimiter<C: Count = u32> {
 
 /// Occurrence counters behind the rate-limited warnings, shared by every
 /// clone of one limiter.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct WarningCounts {
     cardinality_rejects: AtomicU64,
     gossip_record_failures: AtomicU64,
@@ -140,7 +140,9 @@ impl<C: Count> SharedLimiter<C> {
                 self.note_cardinality_reject(
                     &request.domain,
                     CardinalityLimit::Count,
-                    MAX_DESCRIPTORS,
+                    self.cardinality_limits
+                        .max_descriptor_count
+                        .min(MAX_DESCRIPTORS),
                 )
             };
 
@@ -288,12 +290,13 @@ fn map_envoy_descriptor<'a>(
 // -- Rate-limited operator warnings -----------------------------------------
 //
 // These failure modes can all fire at full request rate when something is
-// wrong (mass-cardinality attack; gossip runtime dead). Each counts through
+// wrong (mass-cardinality attack; gossip runtime dead; overlapping rules
+// matching past the per-request cap). Each counts through
 // `gabion::throttle`, so the log volume is bounded at ~log2(N) regardless of
 // request rate.
 
 impl<C: Count> SharedLimiter<C> {
-    /// Reject a request that exceeds `limit`, logging at powers of two.
+    /// Reject one descriptor that exceeds `limit`, logging at powers of two.
     fn note_cardinality_reject(
         &self,
         domain: &str,
@@ -324,11 +327,11 @@ impl<C: Count> SharedLimiter<C> {
                 error = %err,
                 failed_total,
                 "This node can no longer share rate-limit counts with the \
-                 rest of the cluster. Rate limits are now using only this \
-                 node's local traffic, so they will under-count requests \
-                 handled by other nodes. The gossip background task has \
-                 stopped — look for an earlier error log entry to find out \
-                 why.",
+                 rest of the cluster. Its limits have stopped counting: no \
+                 hits from this node or its peers reach the counts it \
+                 checks, so as their windows pass they allow traffic they \
+                 should reject. The gossip background task has stopped — \
+                 look for an earlier error log entry to find out why.",
             );
         }
     }
@@ -343,10 +346,9 @@ impl<C: Count> SharedLimiter<C> {
                 overflowed_total,
                 "A request matched more than {MAX_MATCHED_RULES} rate-limit rules, the most this \
                  node counts per request. It was allowed, and only the first {MAX_MATCHED_RULES} \
-                 matched rules counted and checked it, so the rest under-count. Usually \
-                 overlapping rule patterns. Merge or narrow the overlapping rules under \
-                 `limits:`; the cap is a build-time constant (`STORAGE_MAX_MATCHED_RULES`) and \
-                 cannot be set in config.",
+                 matched rules counted it, so the rest under-count. Usually overlapping rule \
+                 patterns. Merge or narrow the overlapping rules under `limits:`; the cap is a \
+                 build-time constant (`STORAGE_MAX_MATCHED_RULES`) and cannot be set in config.",
             );
         }
     }
@@ -474,22 +476,7 @@ fn duration_from_millis(millis: u64) -> envoy_types::pb::google::protobuf::Durat
     }
 }
 
-pub fn descriptor(
-    entries: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
-) -> RateLimitDescriptor {
-    RateLimitDescriptor {
-        entries: entries
-            .into_iter()
-            .map(|(key, value)| rate_limit_descriptor::Entry {
-                key: key.into(),
-                value: value.into(),
-            })
-            .collect(),
-        ..Default::default()
-    }
-}
-
-pub fn now_millis() -> u64 {
+fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

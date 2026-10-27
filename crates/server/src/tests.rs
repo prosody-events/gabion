@@ -22,6 +22,21 @@ use crate::store::DashMapStore;
 
 static TEST_PORT: AtomicU16 = AtomicU16::new(40_500);
 
+fn descriptor(
+    entries: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+) -> RateLimitDescriptor {
+    RateLimitDescriptor {
+        entries: entries
+            .into_iter()
+            .map(|(key, value)| rate_limit_descriptor::Entry {
+                key: key.into(),
+                value: value.into(),
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
 fn next_test_addr() -> SocketAddr {
     let port = TEST_PORT.fetch_add(1, Ordering::Relaxed);
     SocketAddr::from(([127, 0, 0, 1], port))
@@ -315,7 +330,9 @@ fn matched_rule_overflow_says_allowed() {
     let line = line_with(&logs, "matched_rule_overflow");
     assert!(line.contains("allowed"), "{line}");
     assert!(line.contains("under-count"), "{line}");
+    assert!(line.contains("STORAGE_MAX_MATCHED_RULES"), "{line}");
     assert!(!line.contains("rejected"), "{line}");
+    assert!(!line.contains("checked"), "{line}");
 }
 
 /// Send one request with `descriptors` through a limiter built with `limits`
@@ -349,18 +366,28 @@ fn cardinality_warning_names_the_exceeded_key() {
     let cases = [
         (
             Setting::StorageMaxDescriptorCount,
+            "count",
             limits(1, 512, 64),
             descriptor([("tenant", "a"), ("x", "b")]),
             1,
         ),
         (
+            Setting::StorageMaxDescriptorCount,
+            "count",
+            limits(1, 512, 64),
+            descriptor((0..=MAX_DESCRIPTORS).map(|i| (format!("k{i}"), "v"))),
+            1,
+        ),
+        (
             Setting::StorageMaxDescriptorBytes,
+            "bytes",
             limits(16, 8, 64),
             descriptor([("tenant", "long-value")]),
             8,
         ),
         (
             Setting::StorageMaxKeyBytes,
+            "key_bytes",
             limits(16, 512, 2),
             descriptor([("tenant", "a")]),
             2,
@@ -371,7 +398,7 @@ fn cardinality_warning_names_the_exceeded_key() {
         Setting::StorageMaxDescriptorBytes,
         Setting::StorageMaxKeyBytes,
     ];
-    for (setting, limits, descriptor, max) in cases {
+    for (setting, limit, limits, descriptor, max) in cases {
         let (response, logs) = cardinality_reject_logs(limits, vec![descriptor]);
         assert_eq!(
             response.overall_code,
@@ -380,7 +407,8 @@ fn cardinality_warning_names_the_exceeded_key() {
         let line = line_with(&logs, "cardinality_rejected");
         assert!(line.contains(setting.yaml_key()), "{line}");
         assert!(line.contains(setting.env_var()), "{line}");
-        assert!(line.contains(&format!("max={max}")), "{line}");
+        assert!(line.contains(&format!("limit={limit:?} ")), "{line}");
+        assert!(line.contains(&format!("max={max} ")), "{line}");
         for other in all.into_iter().filter(|other| *other != setting) {
             assert!(!line.contains(other.yaml_key()), "{line}");
         }

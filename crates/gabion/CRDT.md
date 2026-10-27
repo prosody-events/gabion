@@ -517,7 +517,7 @@ Each shifted entry's probe distance drops by exactly one.
 
 File: `crates/gabion/src/crdt/dirty_ring.rs`.
 
-A `DirtyRing` is a fixed-capacity ring buffer of "this cell just changed" entries. The cell store keeps two of them: `local_dirty` for changes whose origin is this node, and `forwarded_dirty` for changes learned from peers. Both are drained each gossip tick.
+A `DirtyRing` is a fixed-capacity ring buffer of "this cell just changed" entries. The cell store keeps two of them: `local_dirty` for changes whose origin is this node, and `forwarded_dirty` for changes learned from peers.
 
 #### The entry
 
@@ -597,13 +597,11 @@ Each push runs in constant time. `push` does not deduplicate, because deduplicat
 
 `iter` yields entries in insertion order, oldest first. `ring_entry_at(ring, offset)` is the same arithmetic exposed as a single-shot read, and it exists for the hot `fill_gossip_frame` path, which calls mutating methods on `self` between successive entry reads. An iterator over `&self.local_dirty` would hold a shared borrow of `self` for the whole loop and forbid those mutations, whereas `ring_entry_at` takes a `&DirtyRing` only for the duration of one call, returns a copy, and lets go.
 
-There is no `pop` and no `drain`. The send path reads the ring non-destructively and resets it wholesale via `clear()`, which resets `head`, `len`, and `overflow_seq` to zero.
+There is no `pop` and no `drain`. The send path reads the ring non-destructively. Nothing in production clears it, so once full it holds the last `capacity` changes; `clear()` (tests) resets `head`, `len` and `overflow_seq`.
 
 #### Overflow — bounded loss is fine
 
 If a burst of writes overflows the ring, the oldest entries are dropped. The ring records the loss by bumping `overflow_seq` (a `u64` via `saturating_add`), but the entries themselves are gone, and on its own that would be a correctness bug. The CRDT compensates by composing the dirty rings with a third lane — the repair cursor (§7.2) — that rotates over every active cell so that whatever the rings lose, the repair sweep rediscovers within one full rotation.
-
-The cell store emits a power-of-two rate-limited `tracing::warn!` from its `push_dirty` overflow path, naming the relevant capacity config key (`storage.local_dirty_capacity` or `storage.forwarded_dirty_capacity`) so that operators can see pressure without the log volume scaling with the overflow rate.
 
 ```mermaid
 flowchart TB
@@ -686,7 +684,7 @@ Each column is a `Box<[T]>` of length `capacity`. Cell `i` is reconstructed by r
 
 The interning that makes this compaction possible is exactly what the two dictionaries from §3.2 buy.
 
-The four most load-bearing public types in this section are `CompactCellKey` (the node-local interned identity used as the hash-index key), `CellIdentity` (the portable boundary identity exported through the sinks), `CellHandle` (a generation-stamped slot reference), and `InsertReject` (the single enum that names every capacity-exceeded rejection). The exhaustive list lives in `.audit/api-surface.md` and in `crates/gabion/src/crdt.rs`; rather than restate it here, those types are introduced inline at the section that depends on them, and `CellIdentity` versus `CompactCellKey` gets a dedicated treatment in §5.4.
+The four most load-bearing public types in this section are `CompactCellKey` (the node-local interned identity used as the hash-index key), `CellIdentity` (the portable boundary identity exported through the sinks), and `CellHandle` (a generation-stamped slot reference). The exhaustive list lives in `.audit/api-surface.md` and in `crates/gabion/src/crdt.rs`; rather than restate it here, those types are introduced inline at the section that depends on them, and `CellIdentity` versus `CompactCellKey` gets a dedicated treatment in §5.4.
 
 ---
 
@@ -1044,11 +1042,7 @@ The origin and incarnation columns of the batch are ignored on the local path be
 `upsert` is the worker that both entry points call. Its signature is designed to make the two modes mutually exclusive at the type level:
 
 ```rust
-fn upsert(
-    &mut self,
-    spec: UpsertSpec<C>,
-    sink: &mut DeltaSink<C>,
-) -> Result<UpdateOutcome<C>, InsertReject>;
+fn upsert(&mut self, spec: UpsertSpec<C>, sink: &mut DeltaSink<C>);
 
 struct UpsertSpec<C: Count> {
     rule_slot: RuleSlot,
@@ -1091,19 +1085,20 @@ sequenceDiagram
             CS->>CS: current = if observed > previous { observed } else { previous }
         end
         alt current == previous
-            CS-->>Cl: UpdateOutcome { changed: false, delta: None }
+            CS-->>Cl: return (no delta)
         else current > previous
             CS->>Cols: counts[slot] = current; last_update_millis[slot] = now
             CS->>Seq: seq = ++next_sequence_by_origin[origin_slot]
             CS->>Cols: origin_sequences[slot] = seq
             CS->>DR: push_dirty(origin_slot, handle, seq)
             CS->>Sink: emit_delta(slot, previous, current, delta, rule_slot)
-            CS-->>Cl: UpdateOutcome { changed: true, delta: Some(...) }
+            CS-->>Cl: return (delta in sink)
         end
     else cell does not exist
         CS->>CS: alloc_slot()
         alt freelist exhausted
-            CS-->>Cl: Err(InsertReject::CellStoreFull)
+            CS->>CS: note_cell_store_full()
+            CS-->>Cl: return (no delta)
         else slot allocated
             CS->>Cols: write rules/key_hashes/buckets/origins/incarnations/counts/last_update
             CS->>Seq: seq = ++next_sequence_by_origin[origin_slot]
@@ -1112,7 +1107,7 @@ sequenceDiagram
             CS->>Idx: insert_unchecked(hash, slot)
             CS->>DR: push_dirty(origin_slot, handle, seq)
             CS->>Sink: emit_delta(slot, 0, initial, initial, rule_slot)
-            CS-->>Cl: UpdateOutcome { changed: true, delta: Some(...) }
+            CS-->>Cl: return (delta in sink)
         end
     end
 ```
@@ -1185,15 +1180,13 @@ The store keeps two `DirtyRing`s (see §3.4 for the ring buffer itself) side by 
 
 The `DirtyRing` type itself does not care which lane it is — both instances are identical implementations. The split is a policy decision: locally-originated updates ship before forwarded ones so that a hot local writer does not starve on relayed chatter, and each ring has its own configurable capacity.
 
-`visit_local_dirty` and `visit_forwarded_dirty` stream the ring entries through a caller closure, validating each entry with `dirty_entry_current` and silently skipping stale entries. These visitors do not deduplicate, so a multi-lane composer must dedup itself (§7.3).
+`visit_forwarded_dirty` streams the ring entries through a caller closure, validating each entry with `dirty_entry_current` and silently skipping stale entries. It does not deduplicate, so a multi-lane composer must dedup itself (§7.3).
 
 ### 7.2 The repair cursor — the third lane
 
 The dirty rings have finite capacity. If a burst of writes overflows the ring, the oldest entries are dropped: the ring bumps `overflow_seq` as a hint, but the entries themselves are gone, and on their own the dirty rings can lose information.
 
 The repair cursor is the safety net. It is a `u32` that rotates over `0..capacity` and, on each gossip frame, sweeps forward a small slice and emits handles for any active slot it lands on. The cursor only advances on slots it actually visited, so a partial sweep resumes where it left off on the next frame. Over many frames every active cell is therefore guaranteed to be retransmitted at least once per full rotation, which is the convergence property dirty-only gossip cannot give you on its own.
-
-`visit_repair_slice(max_cells, visit)` is the standalone interface, and `fill_gossip_frame` (§7.3) folds it in as lane 3.
 
 ### 7.3 `fill_gossip_frame` and per-frame dedup
 
@@ -1297,7 +1290,7 @@ Two of the three hot operations — `remove_peer`, which clears one peer's row, 
 | `last_sent(peer, origin)` / `last_acked(peer, origin)` | Plain indexed `u64` reads. Zero means "no information." |
 | `record_sent(peer, origin, seq)` / `record_acked(peer, origin, seq)` | "Raise the high-water mark" operations — guarded by `<`, so stale or duplicate calls are no-ops. |
 | `clear_node_slot(node_slot)` | Wipes one origin column when its slot is recycled by the cell store. |
-| `lacks_indices(peer, active_origins, origin_sequences, active_indices, out)` | Brute-force "which cells does this peer lack" scan — used in tests and digest-mismatch repair. The hot per-frame consumer is `peer_lacks`, inlined into `fill_gossip_frame_for_peer` (§7.5). |
+| `lacks_indices(peer, active_origins, origin_sequences, active_indices, out)` | Brute-force "which cells does this peer lack" scan — used in tests. The hot per-frame consumer is `peer_lacks`, inlined into `fill_gossip_frame_for_peer` (§7.5). |
 
 **Idempotence.** The `<` guards on `record_*` make every update a max-merge, so a late or duplicate `record_*` carrying a stale sequence is silently ignored. If two callers race, both succeed and the one carrying the smaller sequence is a no-op; if an ack arrives twice, the second call is a no-op.
 
@@ -1338,14 +1331,14 @@ at 1 independently of A's, and a subsequent peer-aware frame compose
 for B correctly identifies that B is missing sequences 2 and 3 — a
 distinction that a single-cursor design would have lost.
 
-#### `lacks_indices` — the test / digest-repair helper
+#### `lacks_indices` — the test helper
 
 `lacks_indices(peer, active_origins, origin_sequences, active_indices, out)` walks a caller-supplied list of `active_indices`, joins each index against the peer's row, and writes back the indices the peer hasn't acked yet:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Repair as Repair driver (tests / digest mismatch)
+    participant Repair as Repair driver (tests)
     participant Front as PeerFrontierTable
     participant Cells as CellStore arrays
 
@@ -1586,8 +1579,7 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
 | `clear_dirty()` | Drop the dirty rings; stored cells untouched. |
 | `clear()` | Reset to empty; preserves local identity registration. |
-| `visit_local_dirty`, `visit_forwarded_dirty` | Stream dirty lanes (no dedup). |
-| `visit_repair_slice(max, visit)` | Rotate a slice of active cells. |
+| `visit_forwarded_dirty` | Stream the forwarded dirty lane (no dedup). |
 | `fill_gossip_frame(max, out)` | Compose a frame: local dirty + forwarded dirty + repair slice, deduped. |
 | `fill_gossip_frame_for_peer(max, peer_slot, out)` | Peer-aware variant; the two dirty lanes add a `peer_lacks` filter, the repair lane sweeps unconditionally (convergence backstop). |
 | `peer_frontiers()`, `peer_frontiers_mut()` | Per-peer send/ack frontier access. |

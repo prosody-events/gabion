@@ -43,17 +43,16 @@ mod tests;
 
 pub use dictionary::{NodeDescriptor, NodeDictionary, RuleDescriptor, RuleDictionary};
 pub use dirty_ring::{DirtyEntry, DirtyRing};
-pub use index::CellIndex;
 pub use io::{DeltaSink, ExpirationSink, Observation, ObservationBatch};
 pub use peer_frontier::PeerFrontierTable;
 
 use dictionary::pow2_index_capacity_for;
 use dirty_ring::ring_entry_at;
 use hash::hash_compact_cell_key;
+use index::CellIndex;
 
 use crate::settings::Setting;
 use crate::throttle;
-use std::fmt;
 
 /// Application-level rule identifier — opaque to the CRDT.
 pub type RuleId = u32;
@@ -215,15 +214,6 @@ pub struct CellExpiration<C: Count> {
     pub applies_locally: bool,
 }
 
-/// Result of a single-row update — useful for callers who do not want the
-/// SoA `DeltaSink` shape.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UpdateOutcome<C: Count> {
-    pub handle: CellHandle,
-    pub changed: bool,
-    pub delta: Option<CellDelta<C>>,
-}
-
 /// Snapshot of one stored cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CellRow<C: Count> {
@@ -233,26 +223,6 @@ pub struct CellRow<C: Count> {
     pub last_update_millis: u64,
     pub origin_sequence: u64,
 }
-
-/// Error returned when an insertion would exceed bounded capacity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InsertReject {
-    CellStoreFull,
-    RuleDictionaryFull,
-    NodeDictionaryFull,
-}
-
-impl fmt::Display for InsertReject {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            InsertReject::CellStoreFull => f.write_str("cell store at capacity"),
-            InsertReject::RuleDictionaryFull => f.write_str("rule dictionary at capacity"),
-            InsertReject::NodeDictionaryFull => f.write_str("node dictionary at capacity"),
-        }
-    }
-}
-
-impl std::error::Error for InsertReject {}
 
 /// Counters surfaced for observability.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -507,7 +477,8 @@ impl<C: Count> CellStore<C> {
         self.repair_cursor
     }
 
-    pub fn index(&self) -> &CellIndex {
+    #[cfg(test)]
+    pub(crate) fn index(&self) -> &CellIndex {
         &self.index
     }
 
@@ -525,7 +496,7 @@ impl<C: Count> CellStore<C> {
         }
     }
 
-    // -- Dictionary access (test-public; runtime-public for orchestration) --
+    // -- Rule registration --
 
     /// Register a configured rule and **pin** it: the first registration holds
     /// one persistent reference so the slot survives cell churn. Without the
@@ -577,7 +548,7 @@ impl<C: Count> CellStore<C> {
                 "Too many distinct rate-limit keys are being tracked at once. New keys were \
                  allowed and are not counted until older time buckets expire, so their limits \
                  under-count. Usually many clients, an attack spraying keys, or a store smaller \
-                 than the keys live within the rules' windows. Raise {}.",
+                 than the number of keys live within the rules' windows. Raise {}.",
                 Setting::StorageMaxCells,
             );
         }
@@ -593,7 +564,8 @@ impl<C: Count> CellStore<C> {
                 rule_fingerprint = %format!("{:032x}", rule_fingerprint),
                 config_key = Setting::StorageRuleDictionaryCapacity.yaml_key(),
                 "Too many distinct rate-limit rules are in flight. New rules cannot be \
-                 registered on this node and will not enforce limits here. Usually more rules \
+                 registered on this node, so requests they match are allowed and their limits \
+                 under-count here. Usually more rules \
                  are configured across the cluster than the dictionary holds, for example \
                  during a configuration rollout. Raise {}.",
                 Setting::StorageRuleDictionaryCapacity,
@@ -758,25 +730,9 @@ impl<C: Count> CellStore<C> {
             origin_sequence: sequence,
         };
         if origin == self.local_node_slot {
-            if let Some(overflow_total) = self.local_dirty.push(entry) {
-                tracing::warn!(
-                    overflow_total,
-                    capacity = self.local_dirty.capacity(),
-                    "Local gossip dirty ring overflowed. Recent local changes are being \
-                     overwritten before gossip can send them; peers may lag until the repair lane \
-                     catches up. Raise `storage.local_dirty_capacity` or reduce write/cardinality \
-                     pressure.",
-                );
-            }
-        } else if let Some(overflow_total) = self.forwarded_dirty.push(entry) {
-            tracing::warn!(
-                overflow_total,
-                capacity = self.forwarded_dirty.capacity(),
-                "Forwarded gossip dirty ring overflowed. Recently received peer changes are being \
-                 overwritten before they can be forwarded; convergence will depend on repair \
-                 scans. Raise `storage.forwarded_dirty_capacity` or reduce write/cardinality \
-                 pressure.",
-            );
+            self.local_dirty.push(entry);
+        } else {
+            self.forwarded_dirty.push(entry);
         }
     }
 
@@ -834,13 +790,8 @@ impl<C: Count> CellStore<C> {
         );
     }
 
-    /// Insert or update a row: returns the resulting handle and whether the
-    /// stored count rose.
-    fn upsert(
-        &mut self,
-        spec: UpsertSpec<C>,
-        sink: &mut DeltaSink<C>,
-    ) -> Result<UpdateOutcome<C>, InsertReject> {
+    /// Insert or update a row, emitting a delta when the stored count rose.
+    fn upsert(&mut self, spec: UpsertSpec<C>, sink: &mut DeltaSink<C>) {
         let UpsertSpec {
             rule_slot,
             key_hash,
@@ -870,11 +821,7 @@ impl<C: Count> CellStore<C> {
                 }
             };
             if next == previous {
-                return Ok(UpdateOutcome {
-                    handle: self.handle_for(slot),
-                    changed: false,
-                    delta: None,
-                });
+                return;
             }
             self.counts[slot as usize] = next;
             self.last_update_millis[slot as usize] = now_millis;
@@ -884,20 +831,13 @@ impl<C: Count> CellStore<C> {
             self.push_dirty(origin_slot, handle, seq);
             let delta = C::saturating_delta(next, previous);
             self.emit_delta(sink, slot, previous, next, delta, rule_slot);
-            return Ok(UpdateOutcome {
-                handle,
-                changed: true,
-                delta: sink.row(sink.len() - 1),
-            });
+            return;
         }
 
         // Insert path.
-        let slot = match self.alloc_slot() {
-            Some(s) => s,
-            None => {
-                self.note_cell_store_full();
-                return Err(InsertReject::CellStoreFull);
-            }
+        let Some(slot) = self.alloc_slot() else {
+            self.note_cell_store_full();
+            return;
         };
         let initial = match mode {
             UpsertMode::Accumulate { hits } => C::default().saturating_add_hits(hits),
@@ -924,11 +864,26 @@ impl<C: Count> CellStore<C> {
         self.push_dirty(origin_slot, handle, seq);
         let delta = initial;
         self.emit_delta(sink, slot, C::default(), initial, delta, rule_slot);
-        Ok(UpdateOutcome {
-            handle,
-            changed: true,
-            delta: sink.row(sink.len() - 1),
-        })
+    }
+
+    /// The slot for `rule_fingerprint`. An unknown rule is interned with the
+    /// default descriptor so its cells are still stored, forwarded and
+    /// expired; `applies_locally` is `false` because `local_rule_id ==
+    /// u32::MAX`. `None` (with the rejection counter bumped) when the rule
+    /// dictionary is full.
+    fn rule_slot_for(&mut self, rule_fingerprint: u128) -> Option<RuleSlot> {
+        if let Some(slot) = self.rule_dictionary.find(rule_fingerprint) {
+            return Some(slot);
+        }
+        let descriptor = RuleDescriptor {
+            fingerprint: rule_fingerprint,
+            ..RuleDescriptor::default()
+        };
+        let slot = self.rule_dictionary.intern(descriptor);
+        if slot.is_none() {
+            self.note_rule_dictionary_full(rule_fingerprint);
+        }
+        slot
     }
 
     /// Translate a batch row's `(fingerprint, node_id, incarnation)` into
@@ -940,25 +895,7 @@ impl<C: Count> CellStore<C> {
         node_id: NodeId,
         incarnation: Incarnation,
     ) -> Option<(RuleSlot, NodeSlot)> {
-        let rule_slot = match self.rule_dictionary.find(rule_fingerprint) {
-            Some(slot) => slot,
-            None => {
-                // Unknown rule — admit with default descriptor so cells are
-                // still stored, forwarded, and expired. `applies_locally`
-                // will be `false` because `local_rule_id == u32::MAX`.
-                let descriptor = RuleDescriptor {
-                    fingerprint: rule_fingerprint,
-                    ..RuleDescriptor::default()
-                };
-                match self.rule_dictionary.intern(descriptor) {
-                    Some(slot) => slot,
-                    None => {
-                        self.note_rule_dictionary_full(rule_fingerprint);
-                        return None;
-                    }
-                }
-            }
-        };
+        let rule_slot = self.rule_slot_for(rule_fingerprint)?;
         let node_slot = match self.node_dictionary.find(node_id, incarnation) {
             Some(slot) => slot,
             None => match self.node_dictionary.intern(node_id, incarnation) {
@@ -979,25 +916,11 @@ impl<C: Count> CellStore<C> {
     pub fn ingest_local(&mut self, obs: &ObservationBatch<C>, sink: &mut DeltaSink<C>) {
         obs.assert_consistent();
         for i in 0..obs.len() {
-            let rule_fingerprint = obs.rule_fingerprints[i];
-            let rule_slot = match self.rule_dictionary.find(rule_fingerprint) {
-                Some(slot) => slot,
-                None => {
-                    let descriptor = RuleDescriptor {
-                        fingerprint: rule_fingerprint,
-                        ..RuleDescriptor::default()
-                    };
-                    match self.rule_dictionary.intern(descriptor) {
-                        Some(slot) => slot,
-                        None => {
-                            self.note_rule_dictionary_full(rule_fingerprint);
-                            continue;
-                        }
-                    }
-                }
+            let Some(rule_slot) = self.rule_slot_for(obs.rule_fingerprints[i]) else {
+                continue;
             };
             let hits_u64: u64 = obs.counts[i].into();
-            let _ = self.upsert(
+            self.upsert(
                 UpsertSpec {
                     rule_slot,
                     key_hash: obs.key_hashes[i],
@@ -1025,7 +948,7 @@ impl<C: Count> CellStore<C> {
             ) else {
                 continue;
             };
-            let _ = self.upsert(
+            self.upsert(
                 UpsertSpec {
                     rule_slot,
                     key_hash: obs.key_hashes[i],
@@ -1123,24 +1046,6 @@ impl<C: Count> CellStore<C> {
         true
     }
 
-    /// Visit dirty cells originating on the local node, newest cell state only.
-    /// `visit` returning `false` halts the scan.
-    ///
-    /// Streams every current entry in the ring through `visit` with no
-    /// intra-call dedup — in contrast to `fill_gossip_frame`, which dedups
-    /// via `selection_marks`. Callers composing multi-lane frames must
-    /// dedup themselves.
-    pub fn visit_local_dirty(&self, mut visit: impl FnMut(CellHandle, &CellStore<C>) -> bool) {
-        for entry in self.local_dirty.iter() {
-            if !self.dirty_entry_current(entry) {
-                continue;
-            }
-            if !visit(entry.handle, self) {
-                return;
-            }
-        }
-    }
-
     /// Visit dirty cells originating on other peers.
     ///
     /// Streams every current entry in the ring through `visit` with no
@@ -1170,40 +1075,6 @@ impl<C: Count> CellStore<C> {
             return false;
         }
         true
-    }
-
-    /// Visit a fair rotating slice of active cells. Anti-entropy lane.
-    pub fn visit_repair_slice(
-        &mut self,
-        max_cells: usize,
-        mut visit: impl FnMut(CellHandle) -> bool,
-    ) -> usize {
-        if self.capacity == 0 || max_cells == 0 || self.active_len == 0 {
-            return 0;
-        }
-        self.bump_selection_epoch();
-        let cap = self.capacity;
-        let mut visited = 0_u32;
-        let mut emitted = 0_usize;
-        let mut next_cursor = self.repair_cursor;
-        while visited < cap && emitted < max_cells {
-            let slot = (self.repair_cursor + visited) % cap;
-            visited += 1;
-            next_cursor = (slot + 1) % cap;
-            if !self.is_active(slot) {
-                continue;
-            }
-            if !self.mark_selected(slot) {
-                continue;
-            }
-            let handle = self.handle_for(slot);
-            emitted += 1;
-            if !visit(handle) {
-                break;
-            }
-        }
-        self.repair_cursor = next_cursor;
-        emitted
     }
 
     /// Fill one outgoing gossip frame: local dirty first, then forwarded

@@ -215,8 +215,8 @@ resolves to `limit = 10 * 5 * 3600 = 180_000`, `window = 5h`,
 > 180k-request 5-hour budget but smooths it to roughly 10 r/s.
 
 A `window:` shorter than the rate's period is refused at config-load
-time because it would resolve to `limit = 0`. To enforce "100 in
-500ms", write `rate: 100r/500ms`.
+time because it has nothing to scale the rate over. To enforce "100
+in 500ms", write `rate: 100r/500ms`.
 
 ## Running across a cluster
 
@@ -275,8 +275,8 @@ the entries below are `gabiond`'s own.
 |--------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
 | `` gabiond could not read its configuration: … missing field `name` ``                                                         | A `limits:` entry is missing a required field.                                                         | Supply `name`, `domain`, `descriptors`, and `rate`. `window` and `bucket` are optional.                                       |
 | `` rule `X` is declared more than once; rule names must be unique ``                                                           | Two `limits:` entries share a `name:`.                                                                 | Pick distinct names.                                                                                                          |
-| `` rule `X` has an invalid `rate:` value: …. Use e.g. `rate: 100r/s` or `rate: 10r/5m`. ``                                     | The `rate:` string didn't parse, or its count is zero.                                                 | Write a non-zero count and a unit (`s`, `ms`, `m`, `h`). A zero rate is refused because it would deny all traffic.            |
-| `` rule `X`: the window must be at least as long as the rate's period; … for example `100r/500ms` ``                              | An explicit `window:` was shorter than the rate's period; the resolved limit would be zero.            | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
+| `` rule `X` has an invalid `rate:` value: …. ``                                                                                | The `rate:` string didn't parse, or its count is zero.                                                 | Write a non-zero count and a unit (`s`, `ms`, `m`, `h`). A zero rate is refused because it would deny all traffic.            |
+| `` rule `X`: the window is shorter than the rate's period, so the rate cannot be spread over it. … for example `100r/500ms` ``   | An explicit `window:` was shorter than the rate's period; a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
 | `` rule `X` descriptor key `Y` must match `[A-Za-z_][A-Za-z0-9_.-]*` ``                                                        | A descriptor key uses an unsupported character.                                                        | Use identifier-like names. Underscore, dot, and dash are allowed inside; the first character must be a letter or underscore.  |
 | `gabiond cannot start: it has no gossip address to listen on …`                                                                | No bind address was supplied.                                                                          | Set `gossip.bind` in YAML or `GABION_GOSSIP_BIND` in env.                                                                     |
 | `` `GABION_X` contains bytes that are not valid UTF-8 ``                                                                       | A non-UTF-8 byte appeared in `GABION_X`.                                                               | Re-export the env var with a valid UTF-8 value.                                                                               |
@@ -302,7 +302,7 @@ Message starts: "Rejecting requests that attach too many or too large rate-limit
 
 Message starts: "This node can no longer share rate-limit counts with the rest of the cluster."
 
-**What happened.** `gabiond` could not hand a count to the gossip task. The request was allowed and its hits were not recorded, so limits under-count the requests this node handled.
+**What happened.** `gabiond` could not hand a count to the gossip task. The request was allowed and its hits were not recorded. The same task applies peers' counts, so this node's counts stop rising altogether: its limits under-count all traffic and, as windows pass, allow everything.
 
 **Why.** The gossip background task has stopped, which happens after it surfaces a typed error.
 
@@ -316,7 +316,7 @@ Message starts: "This node can no longer share rate-limit counts with the rest o
 
 Message starts: "A request matched more than 16 rate-limit rules, the most this node counts per request."
 
-**What happened.** One request matched more rules than `gabiond` counts per request. It was allowed; the first `cap` matched rules counted and checked it, and the rest under-count.
+**What happened.** One request matched more rules than `gabiond` counts per request. It was allowed; the first `cap` matched rules counted it, and the rest under-count.
 
 **Why.** Usually overlapping rule patterns, for example a wildcard rule alongside several specific ones.
 
@@ -331,8 +331,9 @@ Every other condition results in `OK`: gossip queue saturation, a
 rule-table inconsistency, and transient internal failures all allow
 the request through. The deliberate exception is `OVER_LIMIT` from
 the cardinality envelope (`storage.max_descriptor_count`,
-`storage.max_descriptor_bytes`, `storage.max_key_bytes`), which exists
-to bound memory consumption against pathological client input.
+`storage.max_descriptor_bytes`, `storage.max_key_bytes`, and more than
+16 descriptors in one request, `STORAGE_MAX_DESCRIPTOR_COUNT`), which
+exists to bound memory consumption against pathological client input.
 
 See the [Fail-open invariant](../../README.md#fail-open-invariant)
 section of the root README for the policy statement.
@@ -348,7 +349,7 @@ been replaced by a mandatory `rate:` string together with optional
 | `limit: 100, window: 60s`                    | `rate: 100r/m`                                                                                                   |
 | `limit: 10, window: 1s`                      | `rate: 10r/s`                                                                                                    |
 | `limit: 180000, window: 5h`                  | `rate: 10r/s, window: 5h` (same resolved limit, original intent preserved)                                       |
-| `limit: 100, window: 500ms` (sub-period)     | `rate: 100r/500ms`. A `window:` shorter than the rate's period is refused (would resolve to `limit = 0`).        |
+| `limit: 100, window: 500ms` (sub-period)     | `rate: 100r/500ms`. A `window:` shorter than the rate's period is refused (it has nothing to scale the rate over). |
 
 Read [Rate, window, and bucket](#rate-window-and-bucket) before
 reaching for `window:`, because long windows with the default

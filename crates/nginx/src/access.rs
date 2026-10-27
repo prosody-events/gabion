@@ -2,17 +2,14 @@
 //! hot path is exercisable from unit tests.
 //!
 //! Allocation discipline: descriptors live in a stack-resident `ArrayVec`;
-//! `RuleTable::matching` returns an iterator we walk without collecting;
 //! the SHM aggregate is read through `AggregateTable::window_total` which
 //! does only atomic loads.
 
 use arrayvec::ArrayVec;
 use gabion::defaults;
-use gabion::rules::{Descriptor, EnforcementMode, hash_key};
+use gabion::rules::{Descriptor, EnforcementMode, RuleId, RuleSpec, hash_key};
 
-use gabion::rules::RuleId;
-
-use crate::rules::{BindingLookup, CompiledRules, MAX_DESCRIPTORS, RuleSpec};
+use crate::rules::{BindingLookup, CardinalitySettings, CompiledRules, MAX_DESCRIPTORS};
 use crate::shm::aggregate::AggregateTable;
 use crate::shm::queue::{QueueEvent, RequestQueue};
 use crate::shm::stats::Stats;
@@ -20,16 +17,6 @@ use crate::shm::stats::Stats;
 /// Cap on rules that may match a single request. Mirrors the server limit
 /// (`gabion::defaults::STORAGE_MAX_MATCHED_RULES`).
 const MAX_MATCHED_RULES: usize = defaults::STORAGE_MAX_MATCHED_RULES;
-
-/// Maximum descriptor bytes per request (key + value, summed across all
-/// descriptors plus the domain). Matches the server's default cardinality
-/// envelope.
-pub const MAX_DESCRIPTOR_BYTES: usize = defaults::STORAGE_MAX_DESCRIPTOR_BYTES;
-
-/// Maximum per-descriptor key length in bytes.
-pub const MAX_KEY_BYTES: usize = defaults::STORAGE_MAX_KEY_BYTES;
-
-pub use crate::rules::CardinalitySettings;
 
 /// Resolve a compiled binding against the in-flight request. The access
 /// path borrows directly from nginx-owned buffers; the `&[u8]` returned
@@ -116,8 +103,8 @@ enum RuleOutcome {
     /// `Enforce` mode.
     Reject(RejectInfo),
     /// Rule had no opinion on this request — a binding variable was
-    /// missing or no `RuleTable::matching` row applied. Fail-open: the
-    /// request still allows for this rule.
+    /// missing or not UTF-8, or the rule is disabled. Fail-open: the request
+    /// still allows for this rule.
     Decline,
     /// Rule was over the per-request byte budget. The sibling rules may
     /// still evaluate independently; if *every* configured rule
@@ -228,8 +215,8 @@ pub fn decide_all(
     AccessOutcome::Decline
 }
 
-/// Per-rule worker for [`decide_all`]. Builds descriptors on the stack,
-/// runs `RuleTable::matching`, and returns the per-rule outcome without
+/// Per-rule worker for [`decide_all`]. Builds descriptors on the stack and
+/// returns the per-rule outcome without
 /// committing to the queue — the orchestrator does the commit only if no
 /// enforcing rule rejected the request.
 fn decide_one(
@@ -241,6 +228,9 @@ fn decide_one(
     let Some(compiled) = ctx.rules.get(rule_index) else {
         return RuleOutcome::Decline;
     };
+    if compiled.rule.mode == EnforcementMode::Disabled {
+        return RuleOutcome::Decline;
+    }
 
     // Predicate gate. Evaluated before descriptors so a truthy predicate
     // exempts the request without billing the cardinality budget. A
@@ -291,9 +281,6 @@ fn decide_one(
     // sibling that happens to share the same descriptor shape.
     let descriptors_slice: &[Descriptor<'_>] = descriptors.as_slice();
     let rule = &compiled.rule;
-    if rule.mode == EnforcementMode::Disabled {
-        return RuleOutcome::Decline;
-    }
     let spec = rule.spec();
     let key_hash = hash_key(spec.id, ctx.domain, descriptors_slice);
     let total = ctx.aggregate.window_total(
@@ -370,14 +357,10 @@ fn pick_min_remaining(current: Option<QuotaSnapshot>, candidate: QuotaSnapshot) 
 /// including `1`, `true`, `yes`, and any non-empty arbitrary string, is
 /// truthy.
 pub fn is_truthy(value: &[u8]) -> bool {
-    if value.is_empty() {
-        return false;
-    }
-    // Case-insensitive ASCII comparison without allocating.
-    !matches!(
-        value,
-        b"0" | b"false" | b"False" | b"FALSE" | b"off" | b"Off" | b"OFF" | b"no" | b"No" | b"NO"
-    )
+    !value.is_empty()
+        && ![&b"0"[..], b"false", b"off", b"no"]
+            .iter()
+            .any(|falsy| value.eq_ignore_ascii_case(falsy))
 }
 
 #[cfg(test)]

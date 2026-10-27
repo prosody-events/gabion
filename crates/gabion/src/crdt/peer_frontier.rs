@@ -1,6 +1,7 @@
 //! Per-peer × per-origin frontier table.
 
 use super::{NodeId, NodeSlot};
+use crate::settings::Setting;
 use crate::throttle;
 
 /// Per-peer × per-origin frontier: what we last sent to / heard acked from a
@@ -29,14 +30,6 @@ impl PeerFrontierTable {
         }
     }
 
-    pub fn peer_capacity(&self) -> u16 {
-        self.peer_capacity
-    }
-
-    pub fn node_capacity(&self) -> u16 {
-        self.node_capacity
-    }
-
     pub fn find_peer(&self, peer: NodeId) -> Option<u16> {
         self.peer_ids
             .iter()
@@ -56,16 +49,15 @@ impl PeerFrontierTable {
         }
         if let Some(rejected_total) = throttle::bump(&mut self.full_rejects) {
             tracing::warn!(
+                code = "peer_frontier_full",
                 rejected_total,
                 capacity = self.peer_capacity,
                 peer_node_id = %format!("{:032x}", peer.0),
-                config_key = "storage.peer_capacity",
+                config_key = Setting::StoragePeerCapacity.yaml_key(),
                 "Too many gabion peers to optimize gossip with. The cluster \
                  will still converge correctly, but gossip with this peer \
-                 will use more network bandwidth than necessary. To fix, \
-                 raise `storage.peer_capacity` in your gabion config \
-                 (currently {}).",
-                self.peer_capacity,
+                 will use more network bandwidth than necessary. Raise {}.",
+                Setting::StoragePeerCapacity,
             );
         }
         None
@@ -121,7 +113,7 @@ impl PeerFrontierTable {
     }
 
     /// Brute-force "what does this peer lack" scan against the supplied
-    /// origin-sequence column. Used by tests and by digest-mismatch repair.
+    /// origin-sequence column. Used by tests.
     pub fn lacks_indices(
         &self,
         peer_slot: u16,
