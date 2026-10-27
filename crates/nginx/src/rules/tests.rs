@@ -13,7 +13,7 @@ fn cfg(name: &str, bindings: Vec<DescriptorBinding>) -> RuleConfig {
         name: name.into(),
         domain: DEFAULT_DOMAIN.into(),
         bindings,
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(60),
         bucket: Duration::from_secs(1),
         mode: EnforcementMode::Enforce,

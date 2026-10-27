@@ -26,6 +26,7 @@
 //! the access handler's `$gabion_decided` slot, which lives in the
 //! `r->variables` array nginx allocates per request.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
@@ -112,7 +113,7 @@ fn build_rules() -> CompiledRules {
                 key: "tenant".into(),
                 source: "$http_x_tenant".into(),
             }],
-            limit: 2,
+            limit: NonZeroU64::new(2).unwrap(),
             window: std::time::Duration::from_secs(1),
             bucket: std::time::Duration::from_millis(250),
             mode: EnforcementMode::Enforce,
@@ -692,7 +693,7 @@ fn decide_all_multi_rule_concurrent() {
                 key: "tenant_a".into(),
                 source: "$http_x_tenant".into(),
             }],
-            limit: u64::MAX / 2,
+            limit: NonZeroU64::new(u64::MAX / 2).unwrap(),
             window: std::time::Duration::from_secs(1),
             bucket: std::time::Duration::from_millis(250),
             mode: EnforcementMode::Enforce,
@@ -705,7 +706,7 @@ fn decide_all_multi_rule_concurrent() {
                 key: "tenant_b".into(),
                 source: "$http_x_tenant".into(),
             }],
-            limit: u64::MAX / 2,
+            limit: NonZeroU64::new(u64::MAX / 2).unwrap(),
             window: std::time::Duration::from_secs(1),
             bucket: std::time::Duration::from_millis(250),
             mode: EnforcementMode::Enforce,

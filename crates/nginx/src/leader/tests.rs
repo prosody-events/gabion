@@ -56,6 +56,7 @@ fn defaults_match_shared_production_defaults() {
 }
 
 use std::cell::Cell;
+use std::num::NonZeroU64;
 use std::sync::mpsc as std_mpsc;
 use std::time::Instant;
 
@@ -93,7 +94,7 @@ fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
             key: "tenant".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 2,
+        limit: NonZeroU64::new(2).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_secs(1),
         mode: EnforcementMode::Enforce,

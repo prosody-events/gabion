@@ -296,6 +296,17 @@ fn service_change_returns_init_done_at_end_of_initial_sync() {
 }
 
 #[test]
+fn relist_of_one_namespace_does_not_count_for_another() {
+    let mut listed = [false; 2];
+    assert!(!mark_listed(&mut listed, 0));
+    assert!(
+        !mark_listed(&mut listed, 0),
+        "a relist of namespace 0 listed 1"
+    );
+    assert!(mark_listed(&mut listed, 1));
+}
+
+#[test]
 fn service_change_ignores_init_marker() {
     let change = service_change(Event::<Service>::Init, &[]);
     assert!(

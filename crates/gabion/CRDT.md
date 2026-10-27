@@ -541,7 +541,6 @@ pub struct DirtyRing {
     entries: Box<[DirtyEntry]>,
     head:    u32,
     len:     u32,
-    overflow_seq: u64,
 }
 ```
 
@@ -550,7 +549,6 @@ pub struct DirtyRing {
 | `entries`     | Heap-allocated fixed-size slot array. Sized once at construction. |
 | `head`        | Index where the **next** push will write. Always `0 <= head < capacity` when capacity > 0. |
 | `len`         | How many slots currently hold valid data. Grows up to `capacity` then saturates. |
-| `overflow_seq`| Monotonic counter, incremented every time a push displaces an older entry. |
 
 ```mermaid
 flowchart LR
@@ -564,7 +562,7 @@ flowchart LR
 
 `head` is the write cursor rather than a pointer to the newest entry — it is the address of the slot the next push will fill. The newest entry sits at `(head - 1) mod cap`, and the oldest is at `head` once the ring is full or at index `0` while it is still filling. There is no separate `tail`; that information is reconstructed on demand from `head` and `len`.
 
-While `len < capacity` the ring is *filling*: the oldest entry is at index `0`, the newest is at `head - 1`, and `head == len`. Once `len == capacity` the ring is *full*: the oldest entry is at `head`, every push overwrites that slot, and `overflow_seq` is bumped.
+While `len < capacity` the ring is *filling*: the oldest entry is at index `0`, the newest is at `head - 1`, and `head == len`. Once `len == capacity` the ring is *full*: the oldest entry is at `head`, and every push overwrites that slot.
 
 #### Push
 
@@ -576,7 +574,6 @@ sequenceDiagram
     participant Buf as entries[]
     App->>Push: push(DirtyEntry { handle, origin_sequence })
     alt capacity == 0
-        Push->>Push: overflow_seq += 1
         Push-->>App: (entry dropped)
     else len < capacity
         Push->>Push: len += 1
@@ -584,7 +581,6 @@ sequenceDiagram
         Push->>Push: head = (head + 1) % cap
         Push-->>App: ok
     else len == capacity (full)
-        Push->>Push: overflow_seq += 1
         Push->>Buf: entries[head] = entry  (overwrites oldest)
         Push->>Push: head = (head + 1) % cap
         Push-->>App: ok (oldest entry lost)
@@ -597,11 +593,11 @@ Each push runs in constant time. `push` does not deduplicate, because deduplicat
 
 `iter` yields entries in insertion order, oldest first. `ring_entry_at(ring, offset)` is the same arithmetic exposed as a single-shot read, and it exists for the hot `fill_gossip_frame` path, which calls mutating methods on `self` between successive entry reads. An iterator over `&self.local_dirty` would hold a shared borrow of `self` for the whole loop and forbid those mutations, whereas `ring_entry_at` takes a `&DirtyRing` only for the duration of one call, returns a copy, and lets go.
 
-There is no `pop` and no `drain`. The send path reads the ring non-destructively. Nothing in production clears it, so once full it holds the last `capacity` changes; `clear()` (tests) resets `head`, `len` and `overflow_seq`.
+There is no `pop` and no `drain`. The send path reads the ring non-destructively. Nothing in production clears it, so once full it holds the last `capacity` changes; `clear()` (reached through `CellStore::clear_dirty`, which benches and tests call) resets `head` and `len`.
 
 #### Overflow — bounded loss is fine
 
-If a burst of writes overflows the ring, the oldest entries are dropped. The ring records the loss by bumping `overflow_seq` (a `u64` via `saturating_add`), but the entries themselves are gone, and on its own that would be a correctness bug. The CRDT compensates by composing the dirty rings with a third lane — the repair cursor (§7.2) — that rotates over every active cell so that whatever the rings lose, the repair sweep rediscovers within one full rotation.
+If a burst of writes overflows the ring, the oldest entries are dropped and gone, and on its own that would be a correctness bug. The CRDT compensates by composing the dirty rings with a third lane — the repair cursor (§7.2) — that rotates over every active cell so that whatever the rings lose, the repair sweep rediscovers within one full rotation.
 
 ```mermaid
 flowchart TB
@@ -610,7 +606,7 @@ flowchart TB
         B0["A (oldest)"]:::filled --> B1["B"]:::filled --> B2["C"]:::filled --> B3["D (newest)"]:::filled
     end
     Before -.push E.-> After
-    subgraph After["After push(E): A is gone, overflow_seq += 1"]
+    subgraph After["After push(E): A is gone"]
         direction LR
         A0["E (newest)"]:::new --> A1["B (oldest)"]:::filled --> A2["C"]:::filled --> A3["D"]:::filled
     end
@@ -621,9 +617,8 @@ flowchart TB
 The dirty rings are the optimistic fast path, while the repair sweep
 ([§7.2](#72-the-repair-cursor--the-third-lane)) is the
 eventual-consistency backstop that re-emits every active cell on a
-rotating schedule. Together they tolerate ring overflow: although the
-ring *records* the loss by bumping `overflow_seq` and the lost entries
-are themselves gone, the repair sweep picks them up on the next
+rotating schedule. Together they tolerate ring overflow: the lost
+entries are gone, but the repair sweep picks their cells up on the next
 rotation.
 
 #### Dirty ring invariants
@@ -632,11 +627,9 @@ rotation.
 2. **Head bounds.** If `capacity() > 0`, then `0 <= head < capacity()`.
 3. **Length bounds.** `0 <= len <= capacity()`.
 4. **Logical contents.** The `len` valid entries, oldest to newest, are `entries[0..len]` if `len < capacity()`, otherwise the wrap-around slice starting at `entries[head]`.
-5. **No-op on zero capacity.** Every push is a no-op except for incrementing `overflow_seq`.
-6. **`overflow_seq` monotonicity.** Non-decreasing between calls to `clear()`. Uses `saturating_add`, so it cannot wrap to zero.
-7. **`overflowed()` agreement.** Returns `true` iff `overflow_seq > 0`.
-8. **`clear` is total.** After `clear()`: `head == 0`, `len == 0`, `overflow_seq == 0`.
-9. **`ring_entry_at` is a partial function.** Out-of-bounds offsets panic via the slice index; callers in `crdt.rs` bound `offset < ring.len()` themselves.
+5. **No-op on zero capacity.** Every push is a no-op.
+6. **`clear` is total.** After `clear()`: `head == 0`, `len == 0`.
+7. **`ring_entry_at` is a partial function.** Out-of-bounds offsets panic via the slice index; callers in `crdt.rs` bound `offset < ring.len()` themselves.
 
 ---
 
@@ -684,7 +677,7 @@ Each column is a `Box<[T]>` of length `capacity`. Cell `i` is reconstructed by r
 
 The interning that makes this compaction possible is exactly what the two dictionaries from §3.2 buy.
 
-The four most load-bearing public types in this section are `CompactCellKey` (the node-local interned identity used as the hash-index key), `CellIdentity` (the portable boundary identity exported through the sinks), and `CellHandle` (a generation-stamped slot reference). The exhaustive list lives in `.audit/api-surface.md` and in `crates/gabion/src/crdt.rs`; rather than restate it here, those types are introduced inline at the section that depends on them, and `CellIdentity` versus `CompactCellKey` gets a dedicated treatment in §5.4.
+The three most load-bearing public types in this section are `CompactCellKey` (the node-local interned identity used as the hash-index key), `CellIdentity` (the portable boundary identity exported through the sinks), and `CellHandle` (a generation-stamped slot reference). The exhaustive list lives in `crates/gabion/src/crdt.rs`; rather than restate it here, those types are introduced inline at the section that depends on them, and `CellIdentity` versus `CompactCellKey` gets a dedicated treatment in §5.4.
 
 ---
 
@@ -1184,7 +1177,7 @@ The `DirtyRing` type itself does not care which lane it is — both instances ar
 
 ### 7.2 The repair cursor — the third lane
 
-The dirty rings have finite capacity. If a burst of writes overflows the ring, the oldest entries are dropped: the ring bumps `overflow_seq` as a hint, but the entries themselves are gone, and on their own the dirty rings can lose information.
+The dirty rings have finite capacity. If a burst of writes overflows the ring, the oldest entries are dropped and gone, and on their own the dirty rings can lose information.
 
 The repair cursor is the safety net. It is a `u32` that rotates over `0..capacity` and, on each gossip frame, sweeps forward a small slice and emits handles for any active slot it lands on. The cursor only advances on slots it actually visited, so a partial sweep resumes where it left off on the next frame. Over many frames every active cell is therefore guaranteed to be retransmitted at least once per full rotation, which is the convergence property dirty-only gossip cannot give you on its own.
 
@@ -1521,11 +1514,9 @@ The whole structure relies on the following properties. They are grouped by subm
 2. `0 <= head < capacity()`.
 3. `0 <= len <= capacity()`.
 4. Logical contents are `entries[0..len]` while filling, else the wrap-around slice starting at `head`.
-5. Zero capacity is a no-op except for `overflow_seq`.
-6. `overflow_seq` is monotonic; uses `saturating_add`.
-7. `overflowed()` iff `overflow_seq > 0`.
-8. `clear` is total.
-9. `ring_entry_at` panics on out-of-bounds; callers bound the offset.
+5. Zero capacity is a no-op.
+6. `clear` is total.
+7. `ring_entry_at` panics on out-of-bounds; callers bound the offset.
 
 ### I/O containers
 
@@ -1557,7 +1548,7 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `RuleDictionary`, `NodeDictionary` | `dictionary` | Bounded interners with refcounts and their own free-list lifecycle. |
 | `RuleDescriptor`, `NodeDescriptor` | `dictionary` | Per-slot payload for each dictionary. |
 | `pow2_index_capacity_for` | `dictionary` | Power-of-two sizing helper for `CellIndex`. |
-| `DirtyRing`, `DirtyEntry`, `ring_entry_at` | `dirty_ring` | Bounded ring of recent changes, with `overflow_seq` for loss detection. |
+| `DirtyRing`, `DirtyEntry`, `ring_entry_at` | `dirty_ring` | Bounded ring of recent changes; when full, a push overwrites the oldest. |
 | `hash_compact_cell_key`, `hash_fingerprint`, `hash_node_identity`, `mix64` | `hash` | SplitMix / MurmurHash-style mixers. |
 | `CellIndex` | `index` | Robin Hood open-addressing hash table, backshift deletion, power-of-two capacity. |
 | `Observation`, `ObservationBatch`, `DeltaSink`, `ExpirationSink` | `io` | SoA input row + input/output buffers. |
@@ -1578,7 +1569,6 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `expire(current_epoch_by_rule, live_buckets, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell. |
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
 | `clear_dirty()` | Drop the dirty rings; stored cells untouched. |
-| `clear()` | Reset to empty; preserves local identity registration. |
 | `visit_forwarded_dirty` | Stream the forwarded dirty lane (no dedup). |
 | `fill_gossip_frame(max, out)` | Compose a frame: local dirty + forwarded dirty + repair slice, deduped. |
 | `fill_gossip_frame_for_peer(max, peer_slot, out)` | Peer-aware variant; the two dirty lanes add a `peer_lacks` filter, the repair lane sweeps unconditionally (convergence backstop). |

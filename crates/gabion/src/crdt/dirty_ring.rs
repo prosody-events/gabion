@@ -12,15 +12,13 @@ pub struct DirtyEntry {
     pub origin_sequence: u64,
 }
 
-/// Bounded ring of recent change records. Overflow bumps `overflow_seq` so
-/// observers can detect that the recent-change stream is no longer
-/// authoritative.
+/// Bounded ring of recent change records. When full, a push overwrites the
+/// oldest entry; the repair sweep rediscovers whatever that drops.
 #[derive(Clone, Debug)]
 pub struct DirtyRing {
     entries: Box<[DirtyEntry]>,
     head: u32,
     len: u32,
-    overflow_seq: u64,
 }
 
 impl DirtyRing {
@@ -36,7 +34,6 @@ impl DirtyRing {
             .into_boxed_slice(),
             head: 0,
             len: 0,
-            overflow_seq: 0,
         }
     }
 
@@ -52,21 +49,13 @@ impl DirtyRing {
         self.len == 0
     }
 
-    pub fn overflowed(&self) -> bool {
-        self.overflow_seq > 0
-    }
-
-    /// Append `entry`, overwriting the oldest one when the ring is full and
-    /// bumping `overflow_seq`.
+    /// Append `entry`, overwriting the oldest one when the ring is full.
     pub fn push(&mut self, entry: DirtyEntry) {
         let cap = self.entries.len() as u32;
         if cap == 0 {
-            self.overflow_seq = self.overflow_seq.saturating_add(1);
             return;
         }
-        if self.len == cap {
-            self.overflow_seq = self.overflow_seq.saturating_add(1);
-        } else {
+        if self.len < cap {
             self.len += 1;
         }
         self.entries[self.head as usize] = entry;
@@ -85,7 +74,6 @@ impl DirtyRing {
     pub fn clear(&mut self) {
         self.head = 0;
         self.len = 0;
-        self.overflow_seq = 0;
     }
 }
 

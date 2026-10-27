@@ -2,6 +2,9 @@
 //! cardinality envelope it enforces, and the borrowed request shape it
 //! presents to the rule table.
 
+use std::fmt;
+
+use gabion::defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
 use gabion::rules::Descriptor;
 use gabion::settings::Setting;
 
@@ -109,37 +112,44 @@ pub enum CardinalityLimit {
 }
 
 impl CardinalityLimit {
-    /// The `limit` log field, the setting that raises this limit (none for a
-    /// build constant), and the operator's next step.
-    pub(crate) fn describe(self) -> (&'static str, Option<Setting>, &'static str) {
+    /// The `limit` log field and the setting that raises this limit (none for
+    /// the build constant).
+    pub(crate) fn describe(self) -> (&'static str, Option<Setting>) {
         match self {
-            Self::RequestDescriptors => (
-                "request_descriptors",
-                None,
-                "gabion evaluates at most `max` descriptors of one request, a build-time constant \
-                 (`STORAGE_MAX_DESCRIPTOR_COUNT`) that config cannot raise; if the traffic is \
-                 legitimate, have Envoy send fewer descriptors per request.",
-            ),
-            Self::Count => (
-                "count",
-                Some(Setting::StorageMaxDescriptorCount),
-                "If the traffic is legitimate, raise `storage.max_descriptor_count` \
-                 (`GABION_STORAGE_MAX_DESCRIPTOR_COUNT`); values above 16, the build-time cap \
-                 `STORAGE_MAX_DESCRIPTOR_COUNT`, have no effect.",
-            ),
-            Self::Bytes => (
-                "bytes",
-                Some(Setting::StorageMaxDescriptorBytes),
-                "If the traffic is legitimate, raise `storage.max_descriptor_bytes` \
-                 (`GABION_STORAGE_MAX_DESCRIPTOR_BYTES`).",
-            ),
-            Self::KeyBytes => (
-                "key_bytes",
-                Some(Setting::StorageMaxKeyBytes),
-                "If the traffic is legitimate, raise `storage.max_key_bytes` \
-                 (`GABION_STORAGE_MAX_KEY_BYTES`).",
-            ),
+            Self::RequestDescriptors => ("request_descriptors", None),
+            Self::Count => ("count", Some(Setting::StorageMaxDescriptorCount)),
+            Self::Bytes => ("bytes", Some(Setting::StorageMaxDescriptorBytes)),
+            Self::KeyBytes => ("key_bytes", Some(Setting::StorageMaxKeyBytes)),
         }
+    }
+}
+
+/// The operator's next step when a request exceeds this limit.
+impl fmt::Display for CardinalityLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cap = STORAGE_MAX_DESCRIPTOR_COUNT;
+        let Some(setting) = self.describe().1 else {
+            return write!(
+                f,
+                "gabion evaluates at most {cap} descriptors of one request, a build-time constant \
+                 (`STORAGE_MAX_DESCRIPTOR_COUNT`) that config cannot raise; if the traffic is \
+                 legitimate, have Envoy send fewer descriptors per request."
+            );
+        };
+        write!(
+            f,
+            "If the traffic is legitimate, raise `{}` (`{}`)",
+            setting.yaml_key(),
+            setting.env_var()
+        )?;
+        if *self == Self::Count {
+            write!(
+                f,
+                "; values above {cap}, the build-time cap `STORAGE_MAX_DESCRIPTOR_COUNT`, have no \
+                 effect"
+            )?;
+        }
+        f.write_str(".")
     }
 }
 

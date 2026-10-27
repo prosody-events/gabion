@@ -1002,25 +1002,6 @@ impl<C: Count> CellStore<C> {
         self.forwarded_dirty.clear();
     }
 
-    /// Reset to an empty state — preserves the local identity registration
-    /// but clears every other column. Mostly useful in tests.
-    pub fn clear(&mut self) {
-        // Free each active cell — this also decrements dictionary refcounts
-        // and clears frontier rows.
-        for slot in 0..self.capacity {
-            if self.is_active(slot) {
-                self.free_cell_at(slot);
-            }
-        }
-        // Reset the dirty rings and repair cursor explicitly.
-        self.clear_dirty();
-        self.repair_cursor = 0;
-        self.selection_epoch = 0;
-        for m in self.selection_marks.iter_mut() {
-            *m = 0;
-        }
-    }
-
     // -- Gossip frame composition -------------------------------------------
 
     fn bump_selection_epoch(&mut self) {

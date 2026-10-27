@@ -779,14 +779,14 @@ fn dirty_ring_yields_each_changed_cell_once() {
 }
 
 #[test]
-fn dirty_ring_overflows_when_full() {
+fn full_dirty_ring_overwrites_oldest() {
     let mut store = small_store(8, 2);
     store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
-    for origin in 1..=4 {
-        remote_merge_one(&mut store, 0x11, origin, 1, 1, 0);
-    }
-    assert!(store.forwarded_dirty().overflowed());
-    assert_eq!(store.forwarded_dirty().len(), 2);
+    let handles: Vec<CellHandle> = (1..=4)
+        .map(|origin| remote_merge_one(&mut store, 0x11, origin, 1, 1, 0))
+        .collect();
+    let ring: Vec<CellHandle> = store.forwarded_dirty().iter().map(|e| e.handle).collect();
+    assert_eq!(ring, handles[2..]);
 }
 
 #[test]

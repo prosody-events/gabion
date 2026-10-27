@@ -524,7 +524,7 @@ impl LimitRuleConfig {
             id,
             self.domain.to_string(),
             descriptors,
-            resolved.limit,
+            resolved.limit.get(),
             resolved.window_millis,
             resolved.bucket_millis,
             self.mode.into(),

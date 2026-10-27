@@ -77,7 +77,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                     }
                 },
             };
-            let mut services = watch_services(&client, &self.namespace_allow);
+            let (mut services, namespace_count) = watch_services(&client, &self.namespace_allow);
             let mut endpoints = SelectAll::new();
             let mut watched: AHashMap<Target, oneshot::Sender<()>> = AHashMap::new();
             // True once every watched namespace has finished its initial
@@ -86,16 +86,15 @@ impl PeerDiscovery for EndpointSliceDiscovery {
             // CLAUDE.md's operator-facing-errors rules). Tracks observed
             // after the warning fires don't unset it — the operator already
             // has the information they need, and re-firing on every relist
-            // would be noisy. `unsynced` counts the namespace watchers
-            // `watch_services` merged that have not yet sent `InitDone`.
+            // would be noisy. `listed[i]` turns true at namespace `i`'s first
+            // `InitDone`; a relist of one namespace says nothing of another.
             let mut zero_match_warned = false;
-            let mut unsynced =
-                self.namespace_allow.iter().filter(|ns| !ns.is_empty()).count().max(1);
+            let mut listed = vec![false; namespace_count].into_boxed_slice();
             let watched_namespaces = self.namespace_allow.clone();
 
             loop {
                 tokio::select! {
-                    Some(svc_event) = services.next() => match svc_event {
+                    Some((namespace, svc_event)) = services.next() => match svc_event {
                         Err(err) => {
                             // kube-rs's `watcher()` reconnects on every Err,
                             // even ones that will never heal (401/403, the
@@ -156,8 +155,10 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                 }
                             }
                             ServiceChange::InitDone => {
-                                unsynced = unsynced.saturating_sub(1);
-                                if unsynced == 0 && !zero_match_warned && watched.is_empty() {
+                                if mark_listed(&mut listed, namespace)
+                                    && !zero_match_warned
+                                    && watched.is_empty()
+                                {
                                     let ns_display = if watched_namespaces.is_empty() {
                                         "<pod's own namespace>".to_string()
                                     } else {
@@ -257,13 +258,10 @@ impl Target {
 enum ServiceChange {
     Track(Target),
     Untrack(Target),
-    /// One namespace's initial Service list has finished syncing. The
-    /// caller uses this boundary to detect a zero-match
-    /// misconfiguration (no Service in any watched namespace exposes a
-    /// `gabion`-named UDP port) and surface a one-shot operator
-    /// warning. Distinct from `Ignore` so the warning path can fire
-    /// exactly once at the first end-of-init-sync that still has no
-    /// tracks.
+    /// One namespace's Service list (initial or a relist) has finished
+    /// syncing. Once every watched namespace has listed with no tracks, the
+    /// caller surfaces a one-shot operator warning: no Service in any
+    /// watched namespace exposes a `gabion`-named UDP port.
     InitDone,
     Ignore,
 }
@@ -299,10 +297,21 @@ fn has_gabion_udp_port(service: &Service) -> bool {
         .any(|p| is_gabion_udp(p.name.as_deref(), p.protocol.as_deref()))
 }
 
+/// Mark namespace `index` as listed; true once every namespace has listed.
+fn mark_listed(listed: &mut [bool], index: usize) -> bool {
+    listed[index] = true;
+    listed.iter().all(|&done| done)
+}
+
+/// One Service watcher per namespace, merged, each event tagged with its
+/// namespace's index, plus the number of namespaces.
 fn watch_services(
     client: &Client,
     namespace_allow: &[String],
-) -> impl Stream<Item = Result<Event<Service>, WatcherError>> + Send + Unpin {
+) -> (
+    impl Stream<Item = (usize, Result<Event<Service>, WatcherError>)> + Send + Unpin,
+    usize,
+) {
     let mut apis: Vec<Api<Service>> = namespace_allow
         .iter()
         .filter(|s| !s.is_empty())
@@ -322,10 +331,11 @@ fn watch_services(
         let ns = client.default_namespace().to_owned();
         apis.push(Api::namespaced(client.clone(), &ns));
     }
-    select_all(
-        apis.into_iter()
-            .map(|api| Box::pin(watcher(api, WatcherConfig::default()))),
-    )
+    let count = apis.len();
+    let watchers = apis.into_iter().enumerate().map(|(index, api)| {
+        Box::pin(watcher(api, WatcherConfig::default()).map(move |event| (index, event)))
+    });
+    (select_all(watchers), count)
 }
 
 /// The HTTP status of a kube-rs watcher error that is not worth retrying.

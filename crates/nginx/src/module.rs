@@ -5,6 +5,7 @@
 
 use std::ffi::{c_char, c_void};
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1111,7 +1112,7 @@ extern "C" fn set_rule(
         let mut bindings: Vec<DescriptorBinding> = Vec::new();
         let mut mode = EnforcementMode::Enforce;
         let mut mode_explicit = false;
-        let mut rate: Option<(u64, Duration)> = None;
+        let mut rate: Option<(NonZeroU64, Duration)> = None;
         let mut except_if: Option<Box<str>> = None;
 
         for index in 2..nelts {
@@ -1230,7 +1231,7 @@ extern "C" fn set_rule(
 enum RuleArg {
     /// `rate=Nr/<period>` — `(count, period)`. Period comes from the unit
     /// letter (`s|m|h|d`) or a humantime-parsed duration (`30s`, `5m`).
-    Rate(u64, Duration),
+    Rate(NonZeroU64, Duration),
     /// `window=DURATION` — the time horizon the rate is enforced over.
     /// When set, the resolved `limit` scales from the rate's count up to
     /// the window-sized budget. Defaults to the rate's period when

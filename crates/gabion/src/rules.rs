@@ -8,6 +8,7 @@
 //! cardinality enforcement, request mapping) is the adapter's job — kept out
 //! of this module on purpose.
 
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -244,15 +245,14 @@ const RATE_PERIOD_ERR: &str =
 /// Parse a `rate=` value into `(count, period)`.
 ///
 /// The suffix after `r/` is either a single-letter unit (`s`, `m`, `h`,
-/// `d`) or a [humantime] duration (`30s`, `5m`, `2h30m`). Zero counts and
-/// periods under 1 ms are rejected at parse time so `resolve_rate` always
-/// yields a limit of at least 1.
+/// `d`) or a [humantime] duration (`30s`, `5m`, `2h30m`). The count is
+/// non-zero by type, and periods under 1 ms are rejected.
 ///
 /// Shared by both adapters so two nodes with identical rule text agree on
 /// what `rate=10r/s` means.
 ///
 /// [humantime]: https://docs.rs/humantime
-pub fn parse_rate(input: &str) -> Result<(u64, Duration), &'static str> {
+pub fn parse_rate(input: &str) -> Result<(NonZeroU64, Duration), &'static str> {
     let input = input.trim();
     let Some((number, period)) = input.split_once("r/") else {
         return Err(
@@ -263,12 +263,10 @@ pub fn parse_rate(input: &str) -> Result<(u64, Duration), &'static str> {
     let count: u64 = number.parse().map_err(|_| {
         "the request count before `r/` must be a whole number of at least 1 (for example `100r/s`)"
     })?;
-    if count == 0 {
-        return Err(
-            "the request count is 0, which would deny all traffic; use a whole number of at least \
-             1, or mode `disabled` to turn the rule off",
-        );
-    }
+    let count = NonZeroU64::new(count).ok_or(
+        "the request count is 0, which would deny all traffic; use a whole number of at least 1, \
+         or mode `disabled` to turn the rule off",
+    )?;
     let duration = match period {
         "s" => Duration::from_secs(1),
         "m" => Duration::from_secs(60),
@@ -290,7 +288,7 @@ pub fn parse_rate(input: &str) -> Result<(u64, Duration), &'static str> {
 /// matches the operator's mental model exactly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolvedRate {
-    pub limit: u64,
+    pub limit: NonZeroU64,
     pub window_millis: u64,
     pub bucket_millis: u64,
 }
@@ -329,14 +327,14 @@ pub enum RateResolveError {
 /// * `bucket` defaults to `window` (one fixed-window bucket — same shape as
 ///   before this surface existed).
 /// * `limit = floor(rate_count * window_millis / period_millis)`, computed with
-///   checked multiplication so an operator who writes `rate=1r/ms window=10y`
-///   gets a clean `LimitOverflow` instead of wrap-around.
+///   checked multiplication so an oversized count or window is a clean
+///   `LimitOverflow` instead of wrap-around.
 ///
 /// `window < period` is rejected: a window shorter than the rate's period has
 /// no rate to scale down from; the operator writes the shorter period into
 /// the rate instead.
 pub fn resolve_rate(
-    rate_count: u64,
+    rate_count: NonZeroU64,
     period: Duration,
     window: Option<Duration>,
     bucket: Option<Duration>,
@@ -356,9 +354,13 @@ pub fn resolve_rate(
     let period_millis = duration_to_millis(period).max(1);
     let bucket_millis = duration_to_millis(bucket);
     let limit = rate_count
+        .get()
         .checked_mul(window_millis)
         .ok_or(RateResolveError::LimitOverflow)?
         / period_millis;
+    // Only a window under 1 ms floors to a zero limit: from 1 ms up, the
+    // window is at least the period, so the limit is at least `rate_count`.
+    let limit = NonZeroU64::new(limit).ok_or(RateResolveError::ZeroWindow)?;
     Ok(ResolvedRate {
         limit,
         window_millis,

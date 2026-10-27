@@ -304,7 +304,7 @@ impl<C: Count> SharedLimiter<C> {
         max: usize,
     ) -> Decision {
         if let Some(rejected_total) = throttle::bump_shared(&self.warnings.cardinality_rejects) {
-            let (name, setting, next_step) = limit.describe();
+            let (name, setting) = limit.describe();
             tracing::warn!(
                 code = "cardinality_rejected",
                 domain,
@@ -314,7 +314,7 @@ impl<C: Count> SharedLimiter<C> {
                 config_key = setting.map(Setting::yaml_key),
                 "Rejecting requests that attach too many or too large rate-limit descriptors. \
                  This is usually a misbehaving client or an attack trying to exhaust gabion's \
-                 tracking memory. {next_step}",
+                 tracking memory. {limit}",
             );
         }
         Decision::Reject(RejectReason::Cardinality, None)

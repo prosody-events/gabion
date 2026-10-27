@@ -4,6 +4,7 @@ use crate::rules::{DescriptorBinding, RuleConfig};
 use crate::shm::ShmAggregateStore;
 use crate::shm::mock::TestZone;
 use gabion::rules::EnforcementMode;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 fn build_rules() -> CompiledRules {
@@ -14,7 +15,7 @@ fn build_rules() -> CompiledRules {
             key: "tenant".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 2,
+        limit: NonZeroU64::new(2).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -228,18 +229,20 @@ fn disabled_rule_declines_before_any_check() {
         cardinality: CardinalitySettings::default(),
     };
     let over_budget = "a".repeat(defaults::STORAGE_MAX_DESCRIPTOR_BYTES);
+    // In the order the checks run last to first, so a disabled check moved
+    // past any one of them fails on that check's own case.
     for vars in [
-        MockVars::new().set("trusted", "1"),
-        MockVars::new().set("http_x_tenant", &over_budget),
         MockVars::new().set_bytes("http_x_tenant", &[0xFF]),
+        MockVars::new().set("http_x_tenant", &over_budget),
+        MockVars::new().set("trusted", "1"),
     ] {
         let outcome = decide_all(ctx, &[0], &vars, 1_000);
         assert!(matches!(outcome, AccessOutcome::Decline), "{outcome:?}");
+        let snap = region.stats().snapshot();
+        assert_eq!(snap.exempted, 0);
+        assert_eq!(snap.rejected_cardinality, 0);
+        assert_eq!(snap.declines_invalid_descriptor, 0);
     }
-    let snap = region.stats().snapshot();
-    assert_eq!(snap.exempted, 0);
-    assert_eq!(snap.rejected_cardinality, 0);
-    assert_eq!(snap.declines_invalid_descriptor, 0);
 }
 
 #[test]
@@ -275,7 +278,7 @@ fn rule_config(predicate: Option<&str>) -> RuleConfig {
             key: "tenant".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 2,
+        limit: NonZeroU64::new(2).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -399,7 +402,7 @@ fn build_two_rules(
             key: "tenant".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit,
+        limit: NonZeroU64::new(limit).unwrap(),
         window: Duration::from_secs(window_secs),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -506,7 +509,7 @@ fn decide_all_one_declines_one_allows() {
             key: "nonexistent".into(),
             source: "$does_not_exist".into(),
         }],
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -519,7 +522,7 @@ fn decide_all_one_declines_one_allows() {
             key: "tenant".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -552,7 +555,7 @@ fn dry_run_records_but_never_rejects() {
             key: "tenant".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 1,
+        limit: NonZeroU64::new(1).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::DryRun,
@@ -613,7 +616,7 @@ fn build_two_rules_varied(name_a: &str, key_a: &str, name_b: &str, key_b: &str) 
             key: key.into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -688,7 +691,7 @@ fn decide_all_mixed_decline_and_cardinality_returns_cardinality() {
             key: "k".into(),
             source: "$does_not_exist".into(),
         }],
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -701,7 +704,7 @@ fn decide_all_mixed_decline_and_cardinality_returns_cardinality() {
             key: "long_descriptor_key".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -735,7 +738,7 @@ fn decide_all_one_rule_exempt_one_rejects() {
             key: "tenant".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -748,7 +751,7 @@ fn decide_all_one_rule_exempt_one_rejects() {
             key: "k".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 1,
+        limit: NonZeroU64::new(1).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -849,7 +852,7 @@ fn per_rule_exempt_counter_bumps_only_target_rule() {
             key: "tenant_a".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -862,7 +865,7 @@ fn per_rule_exempt_counter_bumps_only_target_rule() {
             key: "tenant_b".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -906,7 +909,7 @@ fn unknown_predicate_variable_fails_at_compile() {
             key: "tenant".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 10,
+        limit: NonZeroU64::new(10).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::Enforce,
@@ -992,7 +995,7 @@ fn allow_info_under_limit_dry_run_emits_positive_remaining() {
             key: "tenant".into(),
             source: "$http_x_tenant".into(),
         }],
-        limit: 5,
+        limit: NonZeroU64::new(5).unwrap(),
         window: Duration::from_secs(1),
         bucket: Duration::from_millis(250),
         mode: EnforcementMode::DryRun,

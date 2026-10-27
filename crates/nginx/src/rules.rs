@@ -1,6 +1,7 @@
 //! Bridge from `gabion_limit_rule` configuration to `gabion::rules::Rule`
 //! plus compiled bindings.
 
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use gabion::defaults;
@@ -118,7 +119,7 @@ pub struct RuleConfig {
     pub name: Box<str>,
     pub domain: Box<str>,
     pub bindings: Vec<DescriptorBinding>,
-    pub limit: u64,
+    pub limit: NonZeroU64,
     pub window: Duration,
     pub bucket: Duration,
     pub mode: EnforcementMode,
@@ -349,7 +350,7 @@ impl CompiledRules {
                 id,
                 cfg.domain.to_string(),
                 descriptors,
-                cfg.limit,
+                cfg.limit.get(),
                 duration_millis(cfg.window),
                 duration_millis(cfg.bucket),
                 cfg.mode,
@@ -408,8 +409,9 @@ pub enum RuleConfigError {
     EmptyBindings(String),
     #[error(
         "rule `{0}` has more descriptor bindings than `gabion_storage_max_descriptor_count` \
-         allows. Remove bindings from the rule, or raise that directive (up to 16), then run \
-         `nginx -t`."
+         allows. Remove bindings from the rule, or raise that directive (up to {cap}), then run \
+         `nginx -t`.",
+        cap = defaults::STORAGE_MAX_DESCRIPTOR_COUNT
     )]
     TooManyBindings(String),
     #[error(
