@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use gossip_bench::harness::{self, Regime};
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(
     name = "gossip-bench",
     about = "Run one study regime and emit its JSON result."

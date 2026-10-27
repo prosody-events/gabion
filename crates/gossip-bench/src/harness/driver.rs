@@ -11,7 +11,7 @@ use anyhow::Result;
 
 use super::adapter::{BucketEpoch, Launched, Node, NodeStore};
 use super::net::Network;
-use super::node::{KeySpace, Sizing};
+use super::node::{KeyKind, KeySpace, Sizing};
 use super::oracle::{Class, Oracle};
 use super::phases::{HEAL_PROBE_NS, Schedule};
 use super::plan::{NS_PER_MS, NS_PER_S, Plan, PlanEvent, node_addr};
@@ -165,11 +165,7 @@ where
         }
         self.world.set_now_ns(self.end_ns);
         self.drain_ready();
-        for v in 0..self.plan.nodes.len() {
-            if self.tasks.is_running(v) {
-                self.snapshot(v);
-            }
-        }
+        self.snapshot_running();
         Ok(self.finish())
     }
 
@@ -235,11 +231,7 @@ where
                 }
             }
             Event::HealthSnapshot => {
-                for v in 0..self.plan.nodes.len() {
-                    if self.tasks.is_running(v) {
-                        self.snapshot(v);
-                    }
-                }
+                self.snapshot_running();
                 self.world
                     .schedule(now + SNAPSHOT_PERIOD_NS, Event::HealthSnapshot);
             }
@@ -331,6 +323,14 @@ where
             self.rotation.remove(pos);
         }
         self.oracle.node_stopped(v, now);
+    }
+
+    fn snapshot_running(&mut self) {
+        for v in 0..self.plan.nodes.len() {
+            if self.tasks.is_running(v) {
+                self.snapshot(v);
+            }
+        }
     }
 
     fn snapshot(&mut self, v: usize) {
@@ -456,9 +456,7 @@ where
             .tracked
             .iter()
             .enumerate()
-            .filter(|&(t, _)| {
-                self.keys.kinds[self.keys.tracked[t] as usize] != super::node::KeyKind::Site
-            })
+            .filter(|&(_, &key)| self.keys.kinds[key as usize] != KeyKind::Site)
             .map(|(t, &key)| {
                 let windows = self.oracle.over_admission[t];
                 let pct = |x: f64| 100.0 * x / limit as f64;

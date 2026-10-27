@@ -62,9 +62,8 @@ struct SimRouterInner {
     /// delivering them to the destination's inbound channel immediately. The
     /// step driver arms this so one simulated step is one gossip round: every
     /// node makes its gossip decision against this round's state before any
-    /// packet lands, then `release_deferred` delivers them all. Default `false`
-    /// — core gossip tests never arm it, so their behavior is
-    /// unchanged.
+    /// packet lands, then `release_deferred` delivers them all. Default
+    /// `false`; only the wasm step driver arms it.
     deferring: Cell<bool>,
     /// Packets buffered while `deferring` is set, in push (send) order. Drained
     /// deterministically by `release_deferred`.

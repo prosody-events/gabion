@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Run the study harness across regimes x seeds for the checked-out solution.
 
-Builds `gossip-bench` (release), copies the binary
-cargo reports for that build to a private directory under `--out` (so a
-concurrent build in another worktree cannot replace it mid-run, and a stale
-binary cannot be stamped), runs `gossip-bench` for every (regime, seed) pair with `--jobs`
-parallelism, and writes one stamped result per run to
-`<out>/<solution>/<regime>/seed-<n>.json`. A run whose output already exists
-with the same clean stamp (harness tree hash, solution label, branch and
-commit) is skipped, so an interrupted matrix resumes where it stopped. It
-refuses to run on a worktree with uncommitted changes unless `--allow-dirty`
-is given, and the judge rejects such results.
+Builds `gossip-bench` (release) and copies the binary cargo reports to a
+private directory under `--out`, so a concurrent build in another worktree
+cannot replace it mid-run and a stale binary cannot be stamped. Runs it for
+every (regime, seed) pair with `--jobs` parallelism and writes one stamped
+result per run to `<out>/<solution>/<regime>/seed-<n>.json`, with
+`finished_at` (UTC) beside the stamp, outside it, so a rerun still matches. A
+run whose output already exists with the same clean stamp (harness tree hash,
+solution label, branch and commit) is skipped, so an interrupted matrix
+resumes where it stopped. It refuses to run on a worktree with uncommitted
+changes unless `--allow-dirty` is given, and the judge rejects such results.
 
 The stamp identifies what produced the numbers: the harness tree hash
 (`git rev-parse HEAD:crates/gossip-bench`), the solution label, branch and
@@ -32,7 +32,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -156,7 +155,6 @@ def run_one(binary: Path, regime: Path, seed: int, out: Path, stamp: dict) -> st
         "cpu_user_s": round(usage.ru_utime, 3),
         "cpu_sys_s": round(usage.ru_stime, 3),
         "max_rss_bytes": max_rss_bytes(usage.ru_maxrss),
-        "host": platform.node(),
         "noisy": True,
     }
     tmp = out.with_suffix(".tmp")
@@ -204,7 +202,7 @@ def sweep_dead_copies(out: Path) -> None:
         try:
             pid = int(stale.name.split("-")[1])
             os.kill(pid, 0)
-        except (ValueError, IndexError, PermissionError):
+        except (ValueError, PermissionError):
             continue
         except ProcessLookupError:
             shutil.rmtree(stale, ignore_errors=True)
@@ -222,15 +220,13 @@ def run_matrix(args: argparse.Namespace, repo: Path, stamp: dict, binary: Path) 
     print(f"{len(todo)} runs, {args.jobs} at a time; harness {stamp['harness_tree_hash'][:12]}, "
           f"{stamp['solution']} @ {stamp['solution_commit'][:12]}", flush=True)
 
-    lock = threading.Lock()
     failures = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures = [pool.submit(run_one, binary, r, s, o, stamp) for r, s, o in todo]
         for future in concurrent.futures.as_completed(futures):
             line = future.result()
-            with lock:
-                failures += line.startswith("FAILED")
-                print(line, flush=True)
+            failures += line.startswith("FAILED")
+            print(line, flush=True)
     sys.exit(1 if failures else 0)
 
 

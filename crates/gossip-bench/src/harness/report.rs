@@ -20,9 +20,9 @@ pub struct StudyResult {
     /// `false` when a health invariant failed; the judge discards the run.
     pub valid: bool,
     pub invalid_reasons: Vec<String>,
-    /// Saturation the solution reported without failing an invariant (for
-    /// example dirty-ring overflow). The run stays valid; the judge shows
-    /// these next to its numbers.
+    /// Saturation the solution reported without failing an invariant (gabion
+    /// ERROR events). The run stays valid; the judge lists these in
+    /// `flags.md`.
     pub flags: Vec<String>,
     pub regime: Regime,
     pub sizing: Sizing,

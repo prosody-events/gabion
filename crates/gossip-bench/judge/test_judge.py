@@ -49,7 +49,7 @@ def result(solution: str, seed: int, bytes_sent: float, *, regime: str = "r",
 
 class JudgeTest(unittest.TestCase):
     def judge(self, results: list[dict], *args: str) -> tuple[subprocess.CompletedProcess, Path]:
-        tmp = Path(tempfile.mkdtemp())
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for i, r in enumerate(results):
             (tmp / f"{i}.json").write_text(json.dumps(r))
         out = tmp / "report"
@@ -339,7 +339,7 @@ class ComparisonTest(unittest.TestCase):
 
 class HarnessHashTest(unittest.TestCase):
     def setUp(self):
-        self.repo = Path(tempfile.mkdtemp())
+        self.repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.git("init", "-q")
 
     def git(self, *args: str) -> str:

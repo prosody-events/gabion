@@ -40,7 +40,7 @@ fn probe_run(
     len: usize,
 ) -> (Vec<Arrival>, NetCounters) {
     let nodes = to.max(1) + 1;
-    let plan = Plan::build(&crate::harness::fixtures::quiet(nodes as u32), 1);
+    let plan = Plan::build(&fixtures::quiet(nodes as u32), 1);
     let world = reference::world(&plan, config, seed);
     let log = Rc::new(RefCell::new(Vec::new()));
     let probes = Probes {
@@ -53,7 +53,7 @@ fn probe_run(
         let send = (idx == 0).then_some(probes);
         probe_node(Rc::clone(&world), idx, send, Rc::clone(&log))
     });
-    let arrivals = log.borrow().clone();
+    let arrivals = log.take();
     let counters = world.net.borrow().run;
     (arrivals, counters)
 }

@@ -10,6 +10,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::plan::AVAILABILITY_ZONES;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Regime {
@@ -180,34 +182,36 @@ impl Regime {
     }
 
     pub fn validate(&self) -> Result<()> {
+        let id = &self.id;
         if self.nodes == 0 {
-            bail!("regime {}: `nodes` must be at least 1", self.id);
+            bail!("regime {id}: `nodes` must be at least 1");
         }
         if self.warmup_s >= self.duration_s {
-            bail!("regime {}: `warmup_s` must be below `duration_s`", self.id);
+            bail!("regime {id}: `warmup_s` must be below `duration_s`");
         }
         let rule = self.rule;
         if rule.bucket_ms == 0 || rule.window_ms < rule.bucket_ms || rule.limit == 0 {
-            bail!(
-                "regime {}: the rule needs limit > 0 and window_ms >= bucket_ms > 0",
-                self.id
-            );
+            bail!("regime {id}: the rule needs limit > 0 and window_ms >= bucket_ms > 0");
         }
         if !(0.0..1.0).contains(&self.traffic.site_jitter) {
-            bail!("regime {}: `site_jitter` must be in [0, 1)", self.id);
+            bail!("regime {id}: `site_jitter` must be in [0, 1)");
         }
         if self.traffic.site_period_ms == 0 {
-            bail!("regime {}: `site_period_ms` must be positive", self.id);
+            bail!("regime {id}: `site_period_ms` must be positive");
         }
         if !(0.0..=1.0).contains(&self.network.loss) {
-            bail!("regime {}: `network.loss` must be in [0, 1]", self.id);
+            bail!("regime {id}: `network.loss` must be in [0, 1]");
         }
         // The per-phase metrics are defined for one cut.
         let partitions = &self.churn.partitions;
-        if partitions.len() > 1 || partitions.iter().any(|p| p.at_s >= p.heal_s) {
+        if partitions.len() > 1
+            || partitions
+                .iter()
+                .any(|p| p.at_s >= p.heal_s || p.az >= AVAILABILITY_ZONES)
+        {
             bail!(
-                "regime {}: `churn.partitions` takes at most one partition, with at_s < heal_s",
-                self.id
+                "regime {id}: `churn.partitions` takes at most one partition, with at_s < heal_s \
+                 and az below {AVAILABILITY_ZONES}"
             );
         }
         Ok(())
@@ -222,7 +226,8 @@ impl Regime {
     }
 
     /// The highest offered request rate at any instant: every site, every
-    /// hot key, and every burst that overlaps another.
+    /// hot key, and every burst at once: an upper bound, which is safe for
+    /// sizing.
     pub fn peak_offered_rps(&self) -> f64 {
         let sustainable = self.rule.limit as f64 * 1000.0 / self.rule.window_ms as f64;
         let hot: f64 = self

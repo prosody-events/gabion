@@ -93,8 +93,8 @@ comparator's mean). The rules, with the study's ten error metrics
 
 `gate.py` writes `gate.md` into its `--out`: the core hash, the broken rules
 or "Every rule passes.", the measured cost ratios of G-a3 beside the 0.93 the
-design predicted, and the `git diff` of `adapter.rs` and `Cargo.toml` from each
-baseline to zone. Read that diff: the adapter is outside the core hash, so
+design predicted, and the `git diff` of `adapter.rs` and `Cargo.toml` from the
+baselines (both carry H1's copy) to zone. Read that diff: the adapter is outside the core hash, so
 the diff is where a change to what the adapter does shows. It exits 1 when a
 rule fails.
 
@@ -104,12 +104,12 @@ entries without the paths the judge exempts. It is unchanged by edits to
 with:
 
 ```sh
-python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "crates/gossip-bench/judge"); import judge; print(judge.core_hash(sys.argv[1], Path(".")))' HEAD:crates/gossip-bench
+python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "crates/gossip-bench/judge"); import judge; print(judge.core_hash(sys.argv[1], Path(".")))' "$(git rev-parse HEAD:crates/gossip-bench)"
 ```
 
-Core hash at the commit that landed the harness: `7fb744aa7f041b65f238c22ec9a359946a9174d2`. A new or changed
-regime, or any other edit to the core, changes it and requires rerunning
-`make sim-baselines`.
+Core hash: `dfe7bb871c436dfcef6c14016530517665852d94`. A new or
+changed regime, or any other edit to the core, changes it, requires rerunning
+`make sim-baselines`, and updates this line.
 
 ## Reading the judge's output
 

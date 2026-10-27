@@ -2,8 +2,9 @@
 //!
 //! Every datagram is accounted at send time, for the whole network, as its
 //! UDP payload plus [`IP_UDP_HEADER_BYTES`]. Its fate is then decided in a
-//! fixed order: partition, unknown destination, i.i.d. loss, Gilbert-Elliott
-//! burst loss. Survivors arrive after a one-way latency of `base + U(0,
+//! fixed order: unknown destination, partition, i.i.d. loss, Gilbert-Elliott
+//! burst loss (the burst chain steps only for datagrams the i.i.d. draw
+//! kept). Survivors arrive after a one-way latency of `base + U(0,
 //! jitter_max)` (intra- or cross-availability-zone). On arrival a datagram
 //! is dropped if the destination process has stopped or its receive buffer
 //! would overflow; there is no backpressure toward the sender, exactly as
@@ -51,7 +52,7 @@ pub struct NetCounters {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Drop {
+enum DropCause {
     Loss,
     Partition,
     Rcvbuf,
@@ -72,18 +73,18 @@ impl NetCounters {
         }
     }
 
-    fn dropped(&mut self, cause: Drop, wire: u64) {
+    fn dropped(&mut self, cause: DropCause, wire: u64) {
         let (packets, bytes) = match cause {
-            Drop::Loss => (&mut self.dropped_loss_packets, &mut self.dropped_loss_bytes),
-            Drop::Partition => (
+            DropCause::Loss => (&mut self.dropped_loss_packets, &mut self.dropped_loss_bytes),
+            DropCause::Partition => (
                 &mut self.dropped_partition_packets,
                 &mut self.dropped_partition_bytes,
             ),
-            Drop::Rcvbuf => (
+            DropCause::Rcvbuf => (
                 &mut self.dropped_rcvbuf_packets,
                 &mut self.dropped_rcvbuf_bytes,
             ),
-            Drop::NoReceiver => (
+            DropCause::NoReceiver => (
                 &mut self.dropped_no_receiver_packets,
                 &mut self.dropped_no_receiver_bytes,
             ),
@@ -209,15 +210,15 @@ impl Network {
         self.tally(now_ns, |c| c.sent(wire, len as u64, cross_az, oversize));
 
         let Some(dst) = dst else {
-            self.tally(now_ns, |c| c.dropped(Drop::NoReceiver, wire));
+            self.tally(now_ns, |c| c.dropped(DropCause::NoReceiver, wire));
             return Route::Dropped;
         };
         if self.partitioned(now_ns, self.az[src], self.az[dst]) {
-            self.tally(now_ns, |c| c.dropped(Drop::Partition, wire));
+            self.tally(now_ns, |c| c.dropped(DropCause::Partition, wire));
             return Route::Dropped;
         }
         if self.rng.chance(self.config.loss) || self.burst_lost(src, dst) {
-            self.tally(now_ns, |c| c.dropped(Drop::Loss, wire));
+            self.tally(now_ns, |c| c.dropped(DropCause::Loss, wire));
             return Route::Dropped;
         }
         let (base, jitter) = if cross_az {
@@ -233,7 +234,7 @@ impl Network {
         };
         Route::Deliver {
             dst,
-            latency_ns: base + self.rng.up_to(jitter),
+            latency_ns: base + self.rng.below(jitter + 1),
         }
     }
 
@@ -257,13 +258,13 @@ impl Network {
     pub fn arrive(&mut self, now_ns: u64, dst: usize, datagram: Datagram) -> Option<Waker> {
         let wire = datagram.wire_bytes();
         if !self.running[dst] {
-            self.tally(now_ns, |c| c.dropped(Drop::NoReceiver, wire));
+            self.tally(now_ns, |c| c.dropped(DropCause::NoReceiver, wire));
             return None;
         }
         let inbox = &mut self.inboxes[dst];
         let len = datagram.bytes.len() as u64;
         if inbox.payload_bytes + len > self.config.rcvbuf_bytes {
-            self.tally(now_ns, |c| c.dropped(Drop::Rcvbuf, wire));
+            self.tally(now_ns, |c| c.dropped(DropCause::Rcvbuf, wire));
             return None;
         }
         inbox.payload_bytes += len;
@@ -311,7 +312,7 @@ impl Network {
             let inbox = std::mem::take(&mut self.inboxes[idx]);
             for datagram in inbox.queue {
                 let wire = datagram.wire_bytes();
-                self.tally(now_ns, |c| c.dropped(Drop::NoReceiver, wire));
+                self.tally(now_ns, |c| c.dropped(DropCause::NoReceiver, wire));
             }
         }
     }

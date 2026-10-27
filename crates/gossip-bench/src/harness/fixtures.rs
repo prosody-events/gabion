@@ -5,7 +5,7 @@ use super::regime::Regime;
 /// A five-pod regime small enough to run in well under a second, with every
 /// feature switched on: hot keys, a burst, loss, a rollout and a crash.
 pub fn tiny() -> Regime {
-    let regime: Regime = serde_json::from_value(serde_json::json!({
+    regime(serde_json::json!({
         "id": "tiny",
         "description": "test fixture",
         "duration_s": 30,
@@ -26,14 +26,11 @@ pub fn tiny() -> Regime {
         },
         "tracked_sample_keys": 10
     }))
-    .expect("fixture regime parses");
-    regime.validate().expect("fixture regime is valid");
-    regime
 }
 
 /// `nodes` pods and nothing else: no traffic, no loss, no churn.
 pub fn quiet(nodes: u32) -> Regime {
-    let regime: Regime = serde_json::from_value(serde_json::json!({
+    regime(serde_json::json!({
         "id": "quiet",
         "description": "test fixture",
         "duration_s": 10,
@@ -43,15 +40,12 @@ pub fn quiet(nodes: u32) -> Regime {
         "traffic": { "site_rate_rps": 1, "site_period_ms": 1000, "site_jitter": 0.0 },
         "tracked_sample_keys": 1
     }))
-    .expect("fixture regime parses");
-    regime.validate().expect("fixture regime is valid");
-    regime
 }
 
 /// Six pods with availability zone 0 cut off from `14 s` to `30 s`, longer
 /// than the 10 s window, so hits admitted early in the cut expire unrepaired.
 pub fn partitioned() -> Regime {
-    let regime: Regime = serde_json::from_value(serde_json::json!({
+    regime(serde_json::json!({
         "id": "partitioned",
         "description": "test fixture",
         "duration_s": 60,
@@ -67,7 +61,10 @@ pub fn partitioned() -> Regime {
         "churn": { "partitions": [{ "at_s": 14, "heal_s": 30, "az": 0 }] },
         "tracked_sample_keys": 10
     }))
-    .expect("fixture regime parses");
+}
+
+fn regime(json: serde_json::Value) -> Regime {
+    let regime: Regime = serde_json::from_value(json).expect("fixture regime parses");
     regime.validate().expect("fixture regime is valid");
     regime
 }

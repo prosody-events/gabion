@@ -326,12 +326,8 @@ impl Oracle {
         self
     }
 
-    fn ring(&self) -> usize {
-        self.keys.ring_len as usize
-    }
-
     fn conv_index(&self, t: usize, bucket: BucketEpoch) -> usize {
-        t * self.ring() + (bucket % self.keys.ring_len) as usize
+        t * self.keys.ring_len as usize + (bucket % self.keys.ring_len) as usize
     }
 
     /// Cluster-wide admitted hits for `key` in the window ending at `bucket`.
@@ -426,8 +422,7 @@ impl Oracle {
 
     /// A hit for `key` in `bucket` was admitted by pod `origin`.
     pub fn admitted(&mut self, key: u32, bucket: BucketEpoch, now_ns: u64, origin: usize) {
-        let slot = key as usize * self.ring() + (bucket % self.keys.ring_len) as usize;
-        self.truth[slot].add(bucket, 1);
+        self.truth[self.keys.slot(key, bucket)].add(bucket, 1);
         let t = self.keys.tracked_of[key as usize];
         if t == super::node::NOT_TRACKED {
             return;
@@ -660,10 +655,7 @@ impl Oracle {
                 }
                 let mut residual = 0_i64;
                 for &b in &closed {
-                    let truth = i64::from(
-                        self.truth[key as usize * self.ring() + (b % self.keys.ring_len) as usize]
-                            .count_for(b),
-                    );
+                    let truth = i64::from(self.truth[self.keys.slot(key, b)].count_for(b));
                     let c = self.conv_index(t, b);
                     let seen = if self.conv[c].bucket == b {
                         i64::from(self.bucket_view[c * self.nodes + v])

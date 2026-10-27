@@ -1,31 +1,7 @@
-//! Per-phase metrics for a regime that schedules a network partition.
-//!
-//! The regime's partition (`churn.partitions`) cuts one availability zone
-//! off from the rest during `[at, heal)`, which splits the measurement
-//! window into three phases: **before** the cut, **during** it, and
-//! **after** the heal. Pods fall on one of two *sides*: those inside the cut
-//! zone and the rest. The oracle scores, per phase:
-//!
-//! * **Convergence** of each hit, split by relation: `same_side` is the time
-//!   until every pod on the origin's own side covers the hit, `cross_side` the
-//!   time until every pod on the other side does. Nodes report counts, not
-//!   origins, so `cross_side` is a conservative bound: it requires the far pod
-//!   to have caught up on its own side's hits too (see the oracle). A hit
-//!   belongs to the phase in which it was admitted. Hits whose bucket leaves
-//!   the window first count as never converged, as in the whole-run figures.
-//! * **Staleness** of pods on each side, time-weighted over the part of each
-//!   exposure interval inside the phase. A pod's view is not resolved by
-//!   origin, so staleness is split by the observer's side only.
-//! * **Time to heal**: from the heal instant until no pod that ran at the heal
-//!   is missing a hit of any bucket that closed before it. Tolerance is none:
-//!   every cross-cut count is exact. A hit that leaves the window unrepaired is
-//!   never counted as repaired: the figure is then `None`, and
-//!   `unrepaired_at_expiry_hits` says how much was lost. The driver probes
-//!   every [`HEAL_PROBE_NS`], so the figure is quantized to it, and it is
-//!   `None` when the run ends first.
-//!
-//! Everything is driven by the regime's partition schedule; nothing here
-//! looks at a regime's name.
+//! Per-phase metrics for a regime that schedules a network partition
+//! (`churn.partitions`): before, during and after the cut, split by side.
+//! "Partition phases" under "Metrics" in the crate README defines each one;
+//! nothing here looks at a regime's name.
 
 use super::oracle::{Class, WeightedHist};
 use super::plan::NS_PER_S;

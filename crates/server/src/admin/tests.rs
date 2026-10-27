@@ -153,10 +153,9 @@ fn snapshot_returns_full_state_via_axum_route() {
 #[test]
 fn readyz_returns_200_with_static_body() {
     run_local(async {
-        // `/readyz` is intentionally independent of the gossip runtime —
-        // the bench needs it to confirm the port-forward attached
-        // before it starts sampling, and the runtime might still be
-        // converging on peers at that point.
+        // `/readyz` is intentionally independent of the gossip runtime: a
+        // liveness probe must answer while the runtime is still converging
+        // on peers.
         let (admin_tx, admin_rx) = admin_channel();
         drop(admin_rx);
 

@@ -19,6 +19,15 @@ fn cut() -> Schedule {
     }
 }
 
+/// Pods 0 and 1, both running from 0, on opposite sides of [`cut`].
+fn two_pods_across_the_cut() -> Oracle {
+    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
+    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
+    oracle.node_started(0, 0, false);
+    oracle.node_started(1, 0, false);
+    oracle
+}
+
 /// Epoch milliseconds at `ms` into bucket `B + 1`, where the heal falls in
 /// the tests below.
 fn millis(ms: u64) -> u64 {
@@ -59,10 +68,7 @@ fn hits_belong_to_the_phase_they_were_admitted_in() {
 /// once; pod 1, across the cut, only after the heal.
 #[test]
 fn convergence_is_split_by_origin_and_observer_side() {
-    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
-    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
-    oracle.node_started(0, 0, false);
-    oracle.node_started(1, 0, false);
+    let mut oracle = two_pods_across_the_cut();
     oracle.admitted(0, B, 12 * S, 0);
     oracle.view_changed(0, 0, B, 1, 1, 12 * S);
     assert!(oracle.convergence_ns.is_empty(), "pod 1 has not seen it");
@@ -80,10 +86,7 @@ fn convergence_is_split_by_origin_and_observer_side() {
 /// crossed, so nothing converges across the cut until the heal.
 #[test]
 fn a_far_sides_own_hits_do_not_count_as_crossing_the_cut() {
-    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
-    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
-    oracle.node_started(0, 0, false);
-    oracle.node_started(1, 0, false);
+    let mut oracle = two_pods_across_the_cut();
     oracle.admitted(0, B, 12 * S, 0);
     oracle.admitted(0, B, 12 * S, 1);
     oracle.view_changed(0, 0, B, 1, 1, 12 * S);
@@ -118,10 +121,7 @@ fn an_empty_side_does_not_hold_back_convergence() {
 /// Pod 1 misses a bucket that closed before the heal until 500 ms after it.
 #[test]
 fn time_to_heal_counts_from_the_heal_until_nothing_is_missing() {
-    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
-    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
-    oracle.node_started(0, 0, false);
-    oracle.node_started(1, 0, false);
+    let mut oracle = two_pods_across_the_cut();
     oracle.admitted(0, B, 12 * S, 0);
     oracle.view_changed(0, 0, B, 1, 1, 12 * S);
 
@@ -142,10 +142,7 @@ fn time_to_heal_counts_from_the_heal_until_nothing_is_missing() {
 /// not repair: the heal never completes and the loss is reported.
 #[test]
 fn a_hit_that_expires_unrepaired_is_not_a_heal() {
-    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
-    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
-    oracle.node_started(0, 0, false);
-    oracle.node_started(1, 0, false);
+    let mut oracle = two_pods_across_the_cut();
     oracle.admitted(0, B, 12 * S, 0);
     oracle.view_changed(0, 0, B, 1, 1, 12 * S);
 
@@ -166,10 +163,7 @@ fn a_hit_that_expires_unrepaired_is_not_a_heal() {
 
 #[test]
 fn a_repaired_heal_reports_nothing_lost_to_expiry() {
-    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
-    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
-    oracle.node_started(0, 0, false);
-    oracle.node_started(1, 0, false);
+    let mut oracle = two_pods_across_the_cut();
     oracle.admitted(0, B, 12 * S, 0);
     oracle.view_changed(0, 0, B, 1, 1, 12 * S);
     assert!(!oracle.heal_sample(20 * S, millis(500)));
@@ -190,10 +184,7 @@ fn a_repaired_heal_reports_nothing_lost_to_expiry() {
 /// the buckets still in the window, which pod 1 then reaches.
 #[test]
 fn a_bucket_expiring_at_the_heal_is_not_owed_repair() {
-    let keys = Rc::new(KeySpace::build(&fixtures::quiet(2), 1));
-    let mut oracle = Oracle::new(keys, 2, 0).with_partition(cut(), vec![0, 1]);
-    oracle.node_started(0, 0, false);
-    oracle.node_started(1, 0, false);
+    let mut oracle = two_pods_across_the_cut();
     // B - 2 leaves the 3-bucket window at the heal, which starts bucket B + 1.
     oracle.admitted(0, B - 2, 11 * S, 0);
     oracle.view_changed(0, 0, B - 2, 1, 1, 11 * S);

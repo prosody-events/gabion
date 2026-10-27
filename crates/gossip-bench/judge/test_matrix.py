@@ -12,9 +12,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
-
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from matrix import executable_from, is_done, run_one, sweep_dead_copies
 
@@ -75,6 +74,7 @@ class RunOneTest(unittest.TestCase):
             finished = datetime.fromisoformat(result["finished_at"])
             self.assertEqual(finished.utcoffset(), timedelta(0))
             self.assertTrue(is_done(out, stamp()))
+            self.assertFalse(is_done(out, {**stamp(), "solution_commit": "c" * 40}))
 
 
 if __name__ == "__main__":

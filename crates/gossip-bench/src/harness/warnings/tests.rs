@@ -1,8 +1,8 @@
 use super::*;
 
 /// A throttled warning logs on the 1st, 2nd, 4th … occurrence. Node 3 logs
-/// 1, 2, 4 of its 5 rejects and node 5 its 1st; a Display field holding
-/// spaces and `=` must not hide the total.
+/// 1, 2, 4 of its 5 rejects and node 5 its 1st; a u64 field not named
+/// `*_total` must not count.
 #[test]
 fn warnings_capture_counts_power_of_two_lines() {
     let warnings = Warnings::new();
@@ -11,7 +11,7 @@ fn warnings_capture_counts_power_of_two_lines() {
             warnings.set_node(node);
             for total in (1..=rejects).filter(|n| n.is_power_of_two()) {
                 tracing::warn!(
-                    error = %"frame too short: want=8 got=3",
+                    count = 99_u64,
                     rejected_total = total,
                     "Dropped a packet. Raise `x`."
                 );

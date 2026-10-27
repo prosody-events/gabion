@@ -89,7 +89,33 @@ fn every_regime_file_parses() {
         );
         count += 1;
     }
-    assert!(count >= 11);
+    assert_eq!(count, 13);
+}
+
+/// `Regime::validate` refuses each value a regime author can get wrong.
+#[test]
+fn validate_refuses_each_invalid_field() {
+    fn cut(at_s: u64, heal_s: u64, az: u8) -> regime::Partition {
+        regime::Partition { at_s, heal_s, az }
+    }
+    let cases: [fn(&mut Regime); 11] = [
+        |r| r.nodes = 0,
+        |r| r.warmup_s = r.duration_s,
+        |r| r.rule.bucket_ms = 0,
+        |r| r.rule.window_ms = r.rule.bucket_ms - 1,
+        |r| r.rule.limit = 0,
+        |r| r.traffic.site_jitter = 1.0,
+        |r| r.traffic.site_period_ms = 0,
+        |r| r.network.loss = 1.5,
+        |r| r.churn.partitions = vec![cut(20, 20, 0)],
+        |r| r.churn.partitions = vec![cut(10, 20, 0); 2],
+        |r| r.churn.partitions = vec![cut(10, 20, plan::AVAILABILITY_ZONES)],
+    ];
+    for (i, mutate) in cases.iter().enumerate() {
+        let mut regime = fixtures::tiny();
+        mutate(&mut regime);
+        assert!(regime.validate().is_err(), "case {i} was accepted");
+    }
 }
 
 /// Rollout replacements must not share a tick phase: with starts on exact
@@ -106,7 +132,11 @@ fn rollout_joiners_start_out_of_phase() {
         .filter(|n| !n.initial)
         .map(|n| n.start_ns % (500 * plan::NS_PER_MS))
         .collect();
-    assert_eq!(phases.len(), 45, "every joiner has its own tick phase");
+    assert_eq!(
+        phases.len(),
+        regime.churn.rollouts[0].count as usize,
+        "every joiner has its own tick phase"
+    );
 }
 
 /// A tiny regime on cell stores far smaller than its keys need: every node

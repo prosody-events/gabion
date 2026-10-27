@@ -58,9 +58,12 @@ def verdicts(rows: dict, solution: str, comparator: str) -> dict:
             for (regime, s, metric), row in rows.items() if s == solution}
 
 
-def failures(regimes: list[str], rows: dict, vs_nopk: dict, vs_main: dict,
-             nopk_vs_main: dict) -> list[str]:
-    """Every broken rule, one line each. `rows` is a `read()` holding all arms."""
+def failures(regimes: list[str], rows: dict, nopk_rows: dict) -> list[str]:
+    """Every broken rule, one line each. `rows` is the judge table against `main`
+    and `nopk_rows` the one against `imp-az-hier-nopk`, each a `read()` holding
+    all arms."""
+    vs_nopk, vs_main, nopk_vs_main = (verdicts(nopk_rows, ZONE, NOPK),
+                                      verdicts(rows, ZONE, MAIN), verdicts(rows, NOPK, MAIN))
     fails = [f"G-v: {arm} has {(rows.get((r, arm, 'bytes_total')) or {}).get('n_valid', 0)} "
              f"valid seeds of {SEEDS} in {r}"
              for r in regimes for arm in (MAIN, NOPK, ZONE)
@@ -109,14 +112,16 @@ def main() -> None:
                      f"{MAIN} and {NOPK}, `make sim-gate` writes {ZONE}")
     rows = {}
     for comparator in (MAIN, NOPK):
-        subprocess.run([sys.executable, str(HERE / "judge.py"),
-                        *(str(args.results / arm) for arm in arms), "--baseline", comparator,
-                        "--out", str(args.out / comparator)], check=True)
+        if subprocess.run([sys.executable, str(HERE / "judge.py"),
+                           *(str(args.results / arm) for arm in arms), "--baseline", comparator,
+                           "--out", str(args.out / comparator)]).returncode:
+            sys.exit(f"gate: judge.py refused the arms against {comparator} (its reason is "
+                     "above). Regenerate the arm it names (`make sim-baselines` or "
+                     "`make sim-gate`) and rerun.")
         rows[comparator] = read(args.out / comparator / "summary.csv")
     regimes = sorted(p.stem for p in (HERE.parent / "regimes").glob("*.json"))
+    fails = failures(regimes, rows[MAIN], rows[NOPK])
     vs_nopk = verdicts(rows[NOPK], ZONE, NOPK)
-    fails = failures(regimes, rows[MAIN], vs_nopk, verdicts(rows[MAIN], ZONE, MAIN),
-                     verdicts(rows[MAIN], NOPK, MAIN))
     stamps = {arm: json.loads(next((args.results / arm).rglob("seed-*.json")).read_text())
               ["stamp"] for arm in arms}
     lines = ["# Regression gate", "",
@@ -129,12 +134,11 @@ def main() -> None:
             lines.append(f"| {r} | {m} | {row.get('ratio')} [{row.get('ratio_lo')}, "
                          f"{row.get('ratio_hi')}] | {row.get('p_better')} | "
                          f"{PREDICTED_COST_RATIO} |")
-    for arm in (MAIN, NOPK):
-        for path in ("src/harness/adapter.rs", "Cargo.toml"):
-            path = f"crates/gossip-bench/{path}"
-            lines += ["", f"## `{path}`: {arm} to {ZONE}", "", "```diff",
-                      git("diff", f"{stamps[arm]['solution_commit']}:{path}",
-                          f"{stamps[ZONE]['solution_commit']}:{path}").rstrip(), "```"]
+    for path in ("src/harness/adapter.rs", "Cargo.toml"):
+        path = f"crates/gossip-bench/{path}"
+        lines += ["", f"## `{path}`: baselines (H1's copy) to {ZONE}", "", "```diff",
+                  git("diff", f"{stamps[MAIN]['solution_commit']}:{path}",
+                      f"{stamps[ZONE]['solution_commit']}:{path}").rstrip(), "```"]
     (args.out / "gate.md").write_text("\n".join(lines) + "\n")
     print("\n".join(fails) or "Every rule passes.", f"Wrote {args.out}/gate.md", sep="\n")
     sys.exit(1 if fails else 0)

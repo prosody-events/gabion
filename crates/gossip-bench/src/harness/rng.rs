@@ -46,20 +46,11 @@ impl Rng {
     }
 
     /// Uniform integer in `[0, n)`; `n` must be non-zero. Lemire's
-    /// multiply-shift, whose bias is below 2^-64 per draw for the `n`
-    /// used here.
+    /// multiply-shift without rejection: each outcome's probability is off by
+    /// at most n / 2^64, negligible for the `n` used here.
     pub fn below(&mut self, n: u64) -> u64 {
         debug_assert!(n > 0);
         ((u128::from(self.next_u64()) * u128::from(n)) >> 64) as u64
-    }
-
-    /// Uniform integer in `[0, n]`.
-    pub fn up_to(&mut self, n: u64) -> u64 {
-        if n == u64::MAX {
-            self.next_u64()
-        } else {
-            self.below(n + 1)
-        }
     }
 
     /// Bernoulli trial with success probability `p`.

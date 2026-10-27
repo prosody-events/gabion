@@ -15,8 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Serialize;
 use serde_json::Value;
-use tracing::Level;
-use tracing::Subscriber;
+use tracing::{Level, Subscriber};
 use tracing_subscriber::fmt::MakeWriter;
 
 pub const NO_NODE: usize = usize::MAX;
@@ -30,7 +29,6 @@ struct Tally {
     nodes: BTreeMap<usize, u64>,
 }
 
-#[derive(Default)]
 struct Inner {
     node: AtomicUsize,
     tallies: Mutex<BTreeMap<Kind, Tally>>,
@@ -38,14 +36,15 @@ struct Inner {
 
 /// Handle shared by the driver (which names the polled node) and the
 /// subscriber's writer.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Warnings(Arc<Inner>);
 
 impl Warnings {
     pub fn new() -> Self {
-        let warnings = Self::default();
-        warnings.set_node(NO_NODE);
-        warnings
+        Self(Arc::new(Inner {
+            node: AtomicUsize::new(NO_NODE),
+            tallies: Mutex::default(),
+        }))
     }
 
     pub fn set_node(&self, node: usize) {
@@ -180,6 +179,8 @@ pub struct WarningKind {
     /// Events logged (gabion rate-limits most of these to power-of-two
     /// totals, so this is not the number of occurrences).
     pub events: u64,
+    /// Polled nodes that logged it. Lines outside a poll ([`NO_NODE`]) count
+    /// toward the totals below but not here.
     pub nodes: u64,
     /// Largest `*_total` field any node reported.
     pub max_total: Option<u64>,

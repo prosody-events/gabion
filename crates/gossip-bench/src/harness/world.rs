@@ -196,7 +196,7 @@ impl GossipTransport for SimSocket {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let received = std::future::poll_fn(|cx| {
+        std::future::poll_fn(|cx| {
             let now_ns = self.world.now_ns();
             let recv = self
                 .world
@@ -204,7 +204,7 @@ impl GossipTransport for SimSocket {
                 .borrow_mut()
                 .poll_recv(self.idx, now_ns, cx, buf);
             match recv {
-                Recv::Datagram(n, src) => Poll::Ready((n, src)),
+                Recv::Datagram(n, src) => Poll::Ready(Ok((n, src))),
                 Recv::Empty => Poll::Pending,
                 Recv::Busy(wake_at) => {
                     if let Some(at) = wake_at {
@@ -214,8 +214,7 @@ impl GossipTransport for SimSocket {
                 }
             }
         })
-        .await;
-        Ok(received)
+        .await
     }
 }
 
@@ -265,8 +264,7 @@ impl SimTicker {
         let now = self.world.now_ns();
         let due = *self.due_ns.get_or_insert(now);
         if now >= due {
-            let next = if now > due { now } else { due };
-            self.due_ns = Some(next + self.interval_ns);
+            self.due_ns = Some(now + self.interval_ns);
             return Poll::Ready(due);
         }
         if self.armed_ns != Some(due) {

@@ -627,7 +627,10 @@ def main() -> None:
         equivalent = (f" Treated as one harness (they differ only in {EXEMPT_NAMES}): "
                       f"{', '.join(f'`{h}`' for h in sorted(hashes))}.")
     if not accepted:
-        sys.exit("error: no stamped results from clean trees found.")
+        sys.exit(f"error: no result under {', '.join(map(str, args.results))} is stamped from "
+                 f"a clean tree ({len(rejected)} rejected), so there is nothing to compare. "
+                 "Run matrix.py for each arm from a clean checkout and pass its --out "
+                 "directories.")
 
     runs: dict[tuple[str, str], dict[int, dict]] = defaultdict(dict)
     commits: dict[str, set] = defaultdict(set)
@@ -635,13 +638,17 @@ def main() -> None:
         solution = result["stamp"]["solution"]
         key = (result["regime_id"], solution)
         if result["seed"] in runs[key]:
-            sys.exit(f"error: duplicate result for {key} seed {result['seed']} ({path})")
+            sys.exit(f"error: two results for {key} seed {result['seed']} ({path}): the same "
+                     "run was passed twice. Pass each arm's results directory once, or delete "
+                     "one copy.")
         runs[key][result["seed"]] = result
         commits[solution].add(result["stamp"]["solution_commit"])
     for solution, shas in commits.items():
         if len(shas) > 1:
-            sys.exit(f"error: solution `{solution}` has results from several commits: "
-                     f"{', '.join(sorted(shas))}")
+            sys.exit(f"error: solution `{solution}` has results from several commits "
+                     f"({', '.join(sorted(shas))}), so its seeds do not measure one code. "
+                     "Rerun it at one commit with matrix.py, or delete the other commits' "
+                     "results.")
 
     def valid_seeds(regime: str, solution: str) -> dict[int, dict]:
         return {s: r for s, r in runs.get((regime, solution), {}).items() if r.get("valid")}
@@ -715,8 +722,8 @@ def main() -> None:
         "that agree exactly on a metric without a known grid, give no interval and no P. "
         "`INVALID k/n` marks a "
         "solution with k of n seeds invalid (see `rejected.md`); its statistics cover the "
-        "valid seeds only. Lower is better unless noted. Metrics marked (flag) report "
-        "saturation that does not invalidate a run; see `flags.md`.", "",
+        "valid seeds only. Lower is better unless noted. Saturation that does not "
+        "invalidate a run is listed in `flags.md`.", "",
         "| Solution | Branch | Commit |", "|---|---|---|",
     ]
     for solution in solutions:

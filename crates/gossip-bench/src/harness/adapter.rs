@@ -110,8 +110,8 @@ pub struct NodeStore {
     ring: RefCell<Box<[Slot]>>,
     /// `(tracked index, bucket)` rows touched since the driver last looked.
     touched: RefCell<Vec<(u32, BucketEpoch)>>,
-    /// Rows for a rule or key the regime never issued. Always zero for a
-    /// correct solution.
+    /// Rows under the regime's rule for a key the regime never issued. Always
+    /// zero for a correct solution.
     pub foreign_rows: Cell<u64>,
 }
 

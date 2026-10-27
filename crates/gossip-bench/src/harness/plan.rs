@@ -175,7 +175,8 @@ impl Plan {
                     ));
                 }
             }
-            if !plan.initial {
+            // Every member at `t` learns of pod `j` after its own jitter.
+            let mut announce = |t: u64, added: bool| {
                 for (i, other) in nodes.iter().enumerate() {
                     if i != j && other.is_member_at(t) {
                         let at = t + rng.below(DISCOVERY_JITTER_NS);
@@ -184,27 +185,17 @@ impl Plan {
                             PlanEvent::Discover {
                                 to: i,
                                 about: j,
-                                added: true,
+                                added,
                             },
                         ));
                     }
                 }
+            };
+            if !plan.initial {
+                announce(t, true);
             }
             if plan.stop.is_some() {
-                let t = plan.member_until();
-                for (i, other) in nodes.iter().enumerate() {
-                    if i != j && other.is_member_at(t) {
-                        let at = t + rng.below(DISCOVERY_JITTER_NS);
-                        events.push((
-                            at,
-                            PlanEvent::Discover {
-                                to: i,
-                                about: j,
-                                added: false,
-                            },
-                        ));
-                    }
-                }
+                announce(plan.member_until(), false);
             }
         }
         events.sort_by_key(|(t, _)| *t);

@@ -155,11 +155,11 @@ where
     want_immediate_flush: bool,
 
     // Observability counters surfaced through `AdminSnapshot`. None of
-    // them feed back into the hot path — they exist purely so the
-    // benchmark harness can split heartbeat-driven emits from
-    // threshold-driven ones and compute the *effective* fanout (packets
-    // emitted ÷ dirty ticks). Single-threaded `!Send` runtime, so plain
-    // `u64`s are cheaper and clearer than atomics.
+    // them feed back into the hot path — they let observers (the wasm
+    // visualizer) split heartbeat-driven emits from threshold-driven ones
+    // and compute the *effective* fanout (packets emitted ÷ dirty ticks).
+    // Single-threaded `!Send` runtime, so plain `u64`s are cheaper and
+    // clearer than atomics.
     ticks_total: u64,
     threshold_fires: u64,
     dirty_ticks: u64,
@@ -365,7 +365,7 @@ where
                 // tick. Multiple requests in the same `select!`
                 // iteration can all set `want_immediate_flush=true`,
                 // but only one synthetic tick consumes the flag, so
-                // bumping here gives the bench an accurate split
+                // bumping here gives observers an accurate split
                 // between threshold fires and heartbeat fires.
                 self.want_immediate_flush = false;
                 self.threshold_fires = self.threshold_fires.saturating_add(1);
@@ -716,7 +716,7 @@ where
 
     fn handle_gossip_tick(&mut self) {
         // Step 0: bump the total-ticks counter. Tracked unconditionally
-        // (even for empty / no-peer ticks) so the bench can split the
+        // (even for empty / no-peer ticks) so observers can split the
         // run's wall time into heartbeat ticks vs threshold fires.
         self.ticks_total = self.ticks_total.saturating_add(1);
 
@@ -729,11 +729,11 @@ where
             return;
         }
 
-        // The store was non-empty when this tick fired — bench harness
-        // counts this as a "dirty tick" so effective-fanout reports
-        // `packets / dirty_ticks` rather than `packets / wall_ticks`.
-        // Bumped before the peer-pick math runs so synthetic threshold
-        // ticks (which by construction have local_dirty>0) always count.
+        // The store was non-empty when this tick fired: count it as a
+        // "dirty tick" so effective fanout is `packets / dirty_ticks`
+        // rather than `packets / wall_ticks`. Bumped before the peer-pick
+        // math runs so synthetic threshold ticks (which by construction
+        // have local_dirty>0) always count.
         self.dirty_ticks = self.dirty_ticks.saturating_add(1);
 
         // Step 2: pick `fanout` distinct peers via a partial Fisher-Yates
