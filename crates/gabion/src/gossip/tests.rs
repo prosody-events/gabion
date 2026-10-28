@@ -2407,11 +2407,9 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
 
 // -- Gap 6: peer event lifecycle idempotence --------------------------------
 
-/// `handle_peer_event` guards `Added` against duplicates (`peers.iter()
-/// .any(...)`) and tolerates `Removed` of a peer that was never added
-/// (`peers.iter().position(...).map(...)`). Neither edge is exercised by
-/// existing tests. This case walks the sequence
-/// `Added → Added → Removed → Removed → Added` and asserts the peer-list
+/// The peer table ignores an `Added` for a peer it already holds and a
+/// `Removed` for one it does not. This case walks the sequence
+/// `Added → Added → Removed → Removed → Added` and asserts the table's
 /// length transitions are `1 → 1 → 0 → 0 → 1`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn peer_event_lifecycle_is_idempotent_and_tolerant() {
