@@ -59,11 +59,11 @@ const CASES: [Case; 7] = [
 ];
 
 /// The same rules in `gabiond`'s spelling, in the opposite order.
-/// `per_minute` spells out the window and bucket NGINX leaves to defaults.
+/// `per_minute` leaves its window and bucket to the defaults in both.
 const GABIOND: &str = r#"
 limits:
   - {name: shadow, domain: nginx, descriptors: [{key: ip}], rate: 10r/s, mode: dry_run}
-  - {name: per_minute, domain: nginx, descriptors: [{key: user}], rate: 60r/m, window: 1m, bucket: 1m}
+  - {name: per_minute, domain: nginx, descriptors: [{key: user}], rate: 60r/m}
   - {name: api, domain: api, descriptors: [{key: tenant}], rate: 10r/s}
   - {name: coarse, domain: nginx, descriptors: [{key: session}], rate: 10r/10s, bucket: 1s}
   - {name: api_tenant, domain: nginx, descriptors: [{key: uri, value: "*"}, {key: tenant}], rate: 100r/10s, bucket: 1s}

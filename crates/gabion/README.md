@@ -368,10 +368,12 @@ both adapters write it the same way: the same domain, the same descriptor keys
 and value patterns in the same order, and the same window and bucket. Those
 fields are the rule's identity, hashed into the fingerprint every counter is
 filed under, so neither the rule's name nor its position in either
-configuration matters. The rate and the mode are not part of the identity:
-changing either keeps a rule's counts. Write them the same in both adapters
-too, because each adapter enforces its own rate and mode against the shared
-count.
+configuration matters. The rate's count and the mode are not part of the
+identity: changing either keeps a rule's counts. The rate's period is, when
+`window` is omitted, because it sets the default window and through it the
+default bucket: `rate=10r/s` and `rate=600r/m` without a window are two rules.
+Write the rate and mode the same in both adapters too, because each adapter
+enforces its own against the shared count.
 
 | Field | `gabiond` YAML (`limits:` entry) | NGINX `gabion_limit_rule` argument | When omitted | Identity |
 |---|---|---|---|---|
@@ -379,7 +381,7 @@ count.
 | domain | `domain: nginx` | `domain=nginx` | `gabiond`: required; NGINX: `nginx` | yes |
 | descriptors, in order | `descriptors: [{key: uri}, {key: tenant}]` | one binding per descriptor: `$uri tenant:$arg_t` (a bare `$uri` is keyed `uri`; `key:$source` names the key) | required, at least one | yes: keys and their order |
 | value pattern | `value: acme` on a descriptor | `value=tenant:acme` | `*`, any value | yes |
-| rate | `rate: 100r/10s` | `rate=100r/10s` | required | no |
+| rate | `rate: 100r/10s` | `rate=100r/10s` | required | count: no; period: yes when `window` is omitted |
 | window | `window: 10s` | `window=10s` | the rate's period | yes |
 | bucket | `bucket: 1s` | `bucket=1s` | the window | yes |
 | mode | `mode: dry_run` (`enforce`, `dry_run`, `disabled`) | `mode=dry_run`, or the flag `dry_run` | `enforce` | no |
