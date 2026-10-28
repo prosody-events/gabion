@@ -1454,6 +1454,9 @@ fn bench_inbound(c: &mut Criterion) {
     let mut packets = Packets::new(wire_header(), &sender, &handles, &mut scratch, limits);
     assert_eq!(packets.next_into(&mut buf), Some(2));
     let packet: Box<[u8]> = buf.as_bytes().into();
+    // A packet the runtime rejects would time the reject path, not the lookup.
+    decode(&packet, limits, settings.cluster_id_hash, |_| {})
+        .expect("the runtime accepts the packet");
 
     let tokio = tokio::runtime::Builder::new_current_thread()
         .build()
