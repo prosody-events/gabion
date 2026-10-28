@@ -1007,17 +1007,33 @@ def check_tip(text, v, unit, arm_name):
 
 def check_label_c1(S, scope):
     S.pg.evaluate(JS_HELPERS)
-    bad = []; n = 0
+    bad = []; n = 0; bad_t = []; tipped = set(); nt = 0
     for metric in MET_ORDER:
         S.params(metric=metric, rope='0.05')
-        for c in hub_cells(S):
+        cells = hub_cells(S); stride = max(1, len(cells) // 24)
+        for i, c in enumerate(cells):
+            tag = f'{metric} {c["arm"]}/{c["regime"]}'
             _, body = parse_label(c['label'], LNAME[c['arm']])
             head = body.split(' of main')[0]
             if head.startswith('×'):
                 n += 1
-                if not re.match(r'^×\S+ (\[|on every|\(|±)', head): bad.append(f'{metric} {c["arm"]}/{c["regime"]}: "{head}"')
-            if verdict_from_label(body) == 'one' and 'seed' not in body: bad.append(f'{metric} {c["arm"]}/{c["regime"]}: one-seed label "{body}" lacks "seed"')
+                if not re.match(r'^×\S+ (\[|on every|\(|±)', head): bad.append(f'{tag}: "{head}"')
+            if verdict_from_label(body) == 'one' and 'seed' not in body: bad.append(f'{tag}: one-seed label "{body}" lacks "seed"')
+            # Tooltips: the first cell of each vs-main form (kind, interval or not, difference or not) in every metric,
+            # plus a stride through bytes_total, so every branch of the full form is read back at every unit.
+            v = V.get((c['arm'], c['regime'], metric))
+            if not v or v['kind'] == 'na': continue
+            form = (metric, v['kind'], v['lo'] is None, has_diff(v))
+            if form in tipped and not (metric == 'bytes_total' and i % stride == 0): continue
+            tipped.add(form); nt += 1
+            try:
+                S.pg.locator('#g3-hub-plot .cell').nth(i).hover(force=True, timeout=3000); S.pg.wait_for_timeout(40)
+                bad_t += [f'{tag}: {e}' for e in check_tip(S.pg.evaluate("document.querySelector('.tip').innerText"), v, MET[metric]['unit'], SNAME[c['arm']])]
+            except Exception as e:
+                bad_t.append(f'{tag}: hover failed: {str(e)[:80]}')
     fails_to_rec('C1.aria-label-ratio-followed-by-interval', scope, bad, f'{n} labels')
+    fails_to_rec('C1.tooltip-numbers-and-intervals', scope, bad_t, f'{nt} tooltips covering {len(tipped)} metric/vs-main forms: ratio, [CrI], P, seeds vs posterior')
+    S.pg.mouse.move(0, 0)
     if CUR_VAR != 'baseline':
         bad_d = []; nd = 0
         for metric in ('bytes_total', 'conv_p99_incl_never_ms', 'stale_limited_p99_pct'):
@@ -1035,22 +1051,6 @@ def check_label_c1(S, scope):
                 bad_d += [f'{metric} {c["arm"]}/{c["regime"]}: {e}' for e in check_full(m.group(2), v, MET[metric]['unit'])]
                 if WORD_KEY[m.group(3)] != v[0.05]: bad_d.append(f'{metric} {c["arm"]}/{c["regime"]}: verdict {m.group(3)} expected {v[0.05]}')
         fails_to_rec('C1.aria-description-vs-own-baseline', scope, bad_d, f'{nd} cells')
-    bad_t = []
-    S.params(metric='bytes_total', rope='0.05')
-    cells = S.pg.locator('#g3-hub-plot .cell'); nn = cells.count()
-    for i in range(0, nn, max(1, nn // 24)):
-        try:
-            cells.nth(i).hover(force=True, timeout=3000); S.pg.wait_for_timeout(40)
-            t = S.pg.evaluate("document.querySelector('.tip').innerText")
-            fk = cells.nth(i).get_attribute('data-fk')
-            a, g = fk.split('|')[1:]
-            v = V.get((a, g, 'bytes_total'))
-            if v and v['kind'] in ('ratio',):
-                for e in check_tip(t, v, 'bytes', SNAME[a]): bad_t.append(f'{fk}: {e}')
-        except Exception as e:
-            bad_t.append(f'hover {i}: {str(e)[:80]}')
-    fails_to_rec('C1.tooltip-numbers-and-intervals', scope, bad_t, 'tooltip ratio, [CrI], P, seeds vs posterior (bytes_total)')
-    S.pg.mouse.move(0, 0)
 
 ROWS_SEEN = {}          # variant -> the row names every view showed, for the cross-variant identity check
 def check_order(S, scope):
