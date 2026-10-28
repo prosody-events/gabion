@@ -292,8 +292,10 @@ impl Launcher {
             max_cells: sizing.cell_capacity.try_into()?,
             node_dictionary_capacity: fit(d::STORAGE_NODE_DICTIONARY_CAPACITY, sizing.total_nodes)
                 .try_into()?,
-            local_dirty_capacity: ring(d::STORAGE_LOCAL_DIRTY_CAPACITY).try_into()?,
-            forwarded_dirty_capacity: ring(d::STORAGE_FORWARDED_DIRTY_CAPACITY).try_into()?,
+            local_dirty_capacity: u32::try_from(ring(d::STORAGE_LOCAL_DIRTY_CAPACITY))?
+                .try_into()?,
+            forwarded_dirty_capacity: u32::try_from(ring(d::STORAGE_FORWARDED_DIRTY_CAPACITY))?
+                .try_into()?,
             peer_capacity: fit(d::STORAGE_PEER_CAPACITY, sizing.max_running_nodes).try_into()?,
             ..Settings::default()
         };

@@ -197,14 +197,10 @@ impl<C: Count> SharedLimiter<C> {
                     total,
                     request.hits,
                 );
-                return Decision::Reject(
-                    RejectReason::GlobalLimit,
-                    Some(Quota {
-                        limit: spec.limit,
-                        remaining: gabion::window::limit_remaining(spec.limit, total),
-                        duration_until_reset_millis,
-                    }),
-                );
+                return Decision::Reject(RejectReason::GlobalLimit(Quota {
+                    remaining: 0,
+                    duration_until_reset_millis,
+                }));
             }
             // Saturating: DryRun rule past its limit (which the gate
             // above lets through) reports `remaining = 0` rather than
@@ -219,11 +215,10 @@ impl<C: Count> SharedLimiter<C> {
                     spec.bucket_millis,
                 );
             let candidate = Quota {
-                limit: spec.limit,
                 remaining,
                 duration_until_reset_millis,
             };
-            tightest = Some(pick_min_remaining_ctx(tightest, candidate));
+            tightest = Some(pick_min_remaining(tightest, candidate));
             let bucket = (now_millis / spec.bucket_millis) as u32;
             if planned.try_push((spec, key_hash, bucket)).is_err() {
                 // Per the allow-by-default principle (see CLAUDE.md), a
@@ -261,7 +256,7 @@ impl<C: Count> SharedLimiter<C> {
 /// Pick the rule the client is closest to tripping (smallest
 /// `remaining`). Ties keep the existing pick — first match wins,
 /// preserving the rule-declaration order surfaced by `RuleTable::matching`.
-fn pick_min_remaining_ctx(current: Option<Quota>, candidate: Quota) -> Quota {
+fn pick_min_remaining(current: Option<Quota>, candidate: Quota) -> Quota {
     match current {
         Some(c) if c.remaining <= candidate.remaining => c,
         _ => candidate,
@@ -317,7 +312,7 @@ impl<C: Count> SharedLimiter<C> {
                  tracking memory. {limit}",
             );
         }
-        Decision::Reject(RejectReason::Cardinality, None)
+        Decision::Reject(RejectReason::Cardinality)
     }
 
     fn note_gossip_record_failure(&self, err: &gabion::gossip::GossipError) {
@@ -434,13 +429,12 @@ fn code_for_decision(decision: Decision) -> i32 {
     }) as i32
 }
 
-/// Build the `DescriptorStatus` Envoy renders into the response. Allows and
-/// scoped rejects (each with a [`Quota`]) populate `limit_remaining` and
-/// `duration_until_reset`; the Envoy filter with
-/// `enable_x_ratelimit_headers: DRAFT_VERSION_03` turns those into
-/// `X-RateLimit-*` response headers on the upstream response.
-/// Pre-admission rejects (no rule scope) leave both fields at their proto
-/// defaults — there is no rule to compute a real reset moment against.
+/// Build the `DescriptorStatus` Envoy renders into the response. A decision
+/// with a [`Quota`] populates `limit_remaining` and `duration_until_reset`;
+/// the Envoy filter with `enable_x_ratelimit_headers: DRAFT_VERSION_03` turns
+/// those into `X-RateLimit-*` response headers on the upstream response.
+/// A cardinality reject leaves both fields at their proto defaults — there is
+/// no rule to compute a real reset moment against.
 ///
 /// `current_limit` (the `RateLimit { requests_per_unit, unit }`
 /// sub-message) stays `None`: there is no lossless mapping from arbitrary
@@ -449,11 +443,11 @@ fn code_for_decision(decision: Decision) -> i32 {
 fn descriptor_status_for(decision: Decision) -> rate_limit_response::DescriptorStatus {
     let code = code_for_decision(decision);
     match decision {
-        Decision::Reject(_, Some(ctx)) | Decision::Allow(Some(ctx)) => {
+        Decision::Reject(RejectReason::GlobalLimit(quota)) | Decision::Allow(Some(quota)) => {
             rate_limit_response::DescriptorStatus {
                 code,
-                limit_remaining: u32::try_from(ctx.remaining).unwrap_or(u32::MAX),
-                duration_until_reset: Some(duration_from_millis(ctx.duration_until_reset_millis)),
+                limit_remaining: u32::try_from(quota.remaining).unwrap_or(u32::MAX),
+                duration_until_reset: Some(duration_from_millis(quota.duration_until_reset_millis)),
                 ..Default::default()
             }
         }

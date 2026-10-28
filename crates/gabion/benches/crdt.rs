@@ -98,7 +98,7 @@ impl Rng {
 const CELL_CAPACITY: u32 = 16_384;
 const RULE_CAPACITY: u16 = 64;
 const NODE_CAPACITY: u16 = 64; // 1 local + ~63 peers
-const DIRTY_CAPACITY: usize = 256;
+const DIRTY_CAPACITY: u32 = 256;
 const PEER_CAPACITY: u16 = 32;
 
 /// Distinct rate-limit rules a node enforces. Production fleets typically

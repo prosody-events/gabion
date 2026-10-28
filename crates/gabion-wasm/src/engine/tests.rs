@@ -47,7 +47,7 @@ where
     local.block_on(&rt, async move {
         let (tx, rx) = mpsc::channel(16);
         let valid = config.validate().expect("test config validates");
-        let engine = tokio::task::spawn_local(run_engine(config, valid, rx));
+        let engine = tokio::task::spawn_local(run_engine(valid, rx));
         driver(tx.clone()).await;
         drop(tx);
         engine
@@ -651,8 +651,8 @@ fn events_serialize_with_hex_identifiers() {
 /// node, however small the cluster starts, holds the full cross-node replica
 /// working set it could ever grow into (the `CellStore` never resizes, and
 /// `add_node` grows the live set with no rebuild). It must cover that ceiling
-/// without overflow while staying far below the production floors it replaces.
-/// This is a pure check of the sizing math; the runtime path is exercised by
+/// without overflow while staying far below the production defaults, and the
+/// ceiling-sized settings must validate. The runtime path is exercised by
 /// [`moderate_cluster_runtime_honors_the_shrunk_sizing`] and the growth path by
 /// [`grown_cluster_holds_every_origin_without_overflow`]. (A `MAX_NODES`
 /// *functional* run is intentionally not attempted — 256 nodes gossiping at
@@ -660,20 +660,20 @@ fn events_serialize_with_hex_identifiers() {
 /// debug-only wire backpressure assert unrelated to cell-store sizing.)
 #[test]
 fn settings_are_ceiling_sized_and_hold_the_working_set() {
-    // The viz-default window: a 10 s / 1 s rule has 10 live buckets.
-    const LIVE_BUCKETS: u32 = 10;
+    let defaults = SimConfig::default();
+    let live_buckets = (defaults.rule_window_ms / defaults.rule_bucket_ms) as usize;
 
     // Ceiling-anchored: a 12-node cluster and a `MAX_NODES` cluster get
-    // byte-for- byte identical caps. This is the property that makes live
+    // byte-for-byte identical caps. This is the property that makes live
     // growth safe — size is a function of the ceiling and the rule, never
     // of `config.nodes`.
     let small = SimConfig::default().settings().expect("default settings");
-    let full = SimConfig {
+    let ceiling = SimConfig {
         nodes: MAX_NODES,
         ..SimConfig::default()
-    }
-    .settings()
-    .expect("full settings");
+    };
+    let full = ceiling.settings().expect("full settings");
+    ceiling.validate().expect("ceiling-sized config validates");
     assert_eq!(small.max_cells, full.max_cells);
     assert_eq!(
         small.forwarded_dirty_capacity,
@@ -690,14 +690,14 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
     // holds a replica of every origin's set — so the cell store must cover
     // `MAX_NODES × (live_buckets + 1)`.
     assert!(
-        caps.max_cells.get() as usize >= MAX_NODES * (LIVE_BUCKETS as usize + 1),
+        caps.max_cells.get() as usize >= MAX_NODES * (live_buckets + 1),
         "max_cells {} under the cross-node working set",
         caps.max_cells,
     );
     // The forwarded-dirty ring carries replicas of every *other* origin's live
     // buckets — the cap the design analysis pins.
     assert!(
-        caps.forwarded_dirty_capacity.get() >= (MAX_NODES - 1) * LIVE_BUCKETS as usize,
+        caps.forwarded_dirty_capacity.get() as usize >= (MAX_NODES - 1) * live_buckets,
         "forwarded_dirty_capacity {} under the replica working set",
         caps.forwarded_dirty_capacity,
     );
@@ -712,15 +712,17 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
     assert!(usize::from(caps.peer_capacity.get()) >= MAX_NODES);
 
     // …and the shrink is real: even at the ceiling every cap is a few thousand
-    // entries, well under the production floors (`gabion::defaults::STORAGE_*`)
-    // it replaces — `STORAGE_FORWARDED_DIRTY_CAPACITY` alone is 524 288.
+    // entries, well under the production defaults
+    // (`gabion::defaults::STORAGE_*`) — `STORAGE_FORWARDED_DIRTY_CAPACITY`
+    // alone is 524 288.
     assert!(
-        caps.forwarded_dirty_capacity.get()
+        (caps.forwarded_dirty_capacity.get() as usize)
             < gabion::defaults::STORAGE_FORWARDED_DIRTY_CAPACITY / 50
     );
     assert!((caps.max_cells.get() as usize) < gabion::defaults::STORAGE_MAX_CELLS / 20);
     assert!(
-        caps.local_dirty_capacity.get() < gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY / 1_000
+        (caps.local_dirty_capacity.get() as usize)
+            < gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY / 1_000
     );
 }
 

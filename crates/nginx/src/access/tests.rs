@@ -151,29 +151,6 @@ fn decline_when_variable_missing() {
     assert!(matches!(outcome, AccessOutcome::Decline));
 }
 
-#[test]
-fn cardinality_settings_reject_oversized_descriptors() {
-    let (_buf, region) = TestZone::new(8, 16);
-    let rules = build_rules();
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: crate::mock::limits(|s| {
-            s.max_descriptor_bytes = (crate::rules::DEFAULT_DOMAIN.len() + "tenant".len())
-                .try_into()
-                .unwrap();
-        }),
-    };
-    let vars = MockVars::new().set("http_x_tenant", "alice");
-
-    let outcome = decide_all(ctx, &[0], &vars, 1_000);
-
-    assert!(matches!(outcome, AccessOutcome::Cardinality));
-}
-
 /// NGINX rejects exactly the requests the library's one cardinality check
 /// flags, on both sides of the byte budget.
 #[test]
@@ -219,7 +196,10 @@ fn invalid_utf8_descriptor_declines_and_bumps_counter() {
         queue: region.queue(),
         stats: region.stats(),
         domain: crate::rules::DEFAULT_DOMAIN,
-        cardinality: crate::mock::limits(|_| {}),
+        // Over budget too, so a budget check moved before UTF-8 rejects.
+        cardinality: crate::mock::limits(|s| {
+            s.max_descriptor_bytes = crate::rules::DEFAULT_DOMAIN.len().try_into().unwrap();
+        }),
     };
     // `0xFF` is never a valid UTF-8 lead byte — guaranteed decline.
     let vars = MockVars::new().set_bytes("http_x_tenant", &[0xFFu8, 0xFE, 0xFD]);
@@ -233,8 +213,8 @@ fn invalid_utf8_descriptor_declines_and_bumps_counter() {
     assert_eq!(snap.rejected_cardinality, 0);
 }
 
-/// A `mode=disabled` rule declines before its predicate, byte budget and
-/// UTF-8 checks, so none of them answers or moves a counter.
+/// A `mode=disabled` rule declines before its predicate, UTF-8 and byte
+/// budget checks, so none of them answers or moves a counter.
 #[test]
 fn disabled_rule_declines_before_any_check() {
     let (_buf, region) = TestZone::new(8, 16);
@@ -253,8 +233,8 @@ fn disabled_rule_declines_before_any_check() {
     // In the order the checks run last to first, so a disabled check moved
     // past any one of them fails on that check's own case.
     for vars in [
-        MockVars::new().set_bytes("http_x_tenant", &[0xFF]),
         MockVars::new().set("http_x_tenant", &over_budget),
+        MockVars::new().set_bytes("http_x_tenant", &[0xFF]),
         MockVars::new().set("trusted", "1"),
     ] {
         let outcome = decide_all(ctx, &[0], &vars, 1_000);

@@ -607,6 +607,7 @@ fn decide_all_and_leader_apply_concurrent() {
         let vars = MockVars {
             tenant: b"alice".to_vec(),
         };
+        let limits = default_limits();
         for _ in 0..ITERATIONS {
             let ctx = AccessCtx {
                 rules: &worker_rules,
@@ -614,7 +615,7 @@ fn decide_all_and_leader_apply_concurrent() {
                 queue: r.queue(),
                 stats: r.stats(),
                 domain: DEFAULT_DOMAIN,
-                cardinality: default_limits(),
+                cardinality: limits,
             };
             assert!(matches!(
                 decide_all(ctx, &[0], &vars, 0),
@@ -729,6 +730,7 @@ fn decide_all_multi_rule_concurrent() {
         let vars = MockVars {
             tenant: b"alice".to_vec(),
         };
+        let limits = default_limits();
         for _ in 0..ITERATIONS {
             let ctx = AccessCtx {
                 rules: &worker_rules,
@@ -736,7 +738,7 @@ fn decide_all_multi_rule_concurrent() {
                 queue: r.queue(),
                 stats: r.stats(),
                 domain: DEFAULT_DOMAIN,
-                cardinality: default_limits(),
+                cardinality: limits,
             };
             assert!(matches!(
                 decide_all(ctx, &[0, 1], &vars, 0),

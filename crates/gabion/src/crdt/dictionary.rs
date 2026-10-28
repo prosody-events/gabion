@@ -1,6 +1,6 @@
 //! Rule and node identity dictionaries.
 
-use std::num::NonZeroU16;
+use std::num::{NonZeroU16, NonZeroU32};
 
 use super::hash::{hash_fingerprint, hash_node_identity};
 use super::index::CellIndex;
@@ -97,12 +97,12 @@ pub struct RuleDictionary {
 
 impl RuleDictionary {
     pub fn with_capacity(capacity: NonZeroU16) -> Self {
+        let index_cap = pow2_index_capacity_for(capacity.into());
         let capacity = capacity.get();
         debug_assert!(
             capacity < EMPTY_DICT_SLOT,
             "`Settings::validate` bounds RuleDictionary capacity below u16::MAX"
         );
-        let index_cap = pow2_index_capacity_for(capacity as u32);
         let mut free_next = vec![EMPTY_DICT_SLOT; capacity as usize].into_boxed_slice();
         for i in 0..capacity {
             free_next[i as usize] = if i + 1 < capacity {
@@ -223,12 +223,12 @@ pub struct NodeDictionary {
 
 impl NodeDictionary {
     pub fn with_capacity(capacity: NonZeroU16) -> Self {
+        let index_cap = pow2_index_capacity_for(capacity.into());
         let capacity = capacity.get();
         debug_assert!(
             capacity < EMPTY_DICT_SLOT,
             "`Settings::validate` bounds NodeDictionary capacity below u16::MAX"
         );
-        let index_cap = pow2_index_capacity_for(capacity as u32);
         let mut free_next = vec![EMPTY_DICT_SLOT; capacity as usize].into_boxed_slice();
         for i in 0..capacity {
             free_next[i as usize] = if i + 1 < capacity {
@@ -329,8 +329,8 @@ impl NodeDictionary {
     }
 }
 
-pub(super) fn pow2_index_capacity_for(capacity: u32) -> u32 {
-    // Load factor target ~50%: index buckets = next_power_of_two(capacity) * 2.
-    let base = capacity.max(1).next_power_of_two();
-    base.saturating_mul(2).max(2)
+/// Index buckets for `capacity` entries: a power of two at a ~50% load
+/// factor. Cells are capped at 2^30, so the result fits a `u32`.
+pub(super) fn pow2_index_capacity_for(capacity: NonZeroU32) -> u32 {
+    capacity.get().next_power_of_two() * 2
 }

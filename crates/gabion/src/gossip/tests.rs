@@ -100,7 +100,7 @@ impl<C: Count> AggregateStore<C> for InMemoryAggregateStore<C> {
 // -- helpers ----------------------------------------------------------------
 
 fn store_for(identity: NodeIdentity) -> CellStore<u32> {
-    CellStore::<u32>::new(storage(256, 32, 32, 64, 64, 16), identity)
+    CellStore::<u32>::new(storage(256, 32, 32, 64, 16), identity)
 }
 
 fn sock(port: u16) -> SocketAddr {
@@ -310,10 +310,7 @@ fn store_for_expiring_rule(identity: NodeIdentity) -> CellStore<u32> {
 }
 
 fn store_for_property_rules(identity: NodeIdentity, node_capacity: u16) -> CellStore<u32> {
-    let mut store = CellStore::<u32>::new(
-        storage(512, 8, node_capacity.max(8), 512, 512, 32),
-        identity,
-    );
+    let mut store = CellStore::<u32>::new(storage(512, 8, node_capacity.max(8), 512, 32), identity);
     for rule in 0..3 {
         store
             .intern_rule(RuleDescriptor {
@@ -2321,7 +2318,10 @@ async fn threshold_trigger_fires_before_heartbeat() {
 
             // Heartbeat is far in the future; only the threshold trigger
             // could possibly deliver in the short window we sample.
-            let cfg_a = tuned_config(vec![addr_b], 1, |s| s.tick_interval = ms(1_000));
+            let cfg_a = tuned_config(vec![addr_b], 1, |s| {
+                s.tick_interval = ms(1_000);
+                s.target_err_bps = 100;
+            });
             let cfg_b = tuned_config(vec![addr_a], 2, |s| s.tick_interval = ms(1_000));
 
             let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
@@ -2392,7 +2392,10 @@ async fn min_emit_interval_clamps_adversarial_rate() {
 
             // ε saturates to 1 (limit=1). Heartbeat is far in the future
             // so the only emissions are threshold-triggered.
-            let cfg_a = tuned_config(vec![addr_b], 1, |s| s.tick_interval = ms(10_000));
+            let cfg_a = tuned_config(vec![addr_b], 1, |s| {
+                s.tick_interval = ms(10_000);
+                s.min_emit_interval = ms(5);
+            });
             let cfg_b = tuned_config(vec![addr_a], 2, |s| s.tick_interval = ms(10_000));
 
             let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());
@@ -2468,7 +2471,7 @@ async fn heartbeat_still_drains_cold_rules() {
             let id_b = NodeIdentity::new(NodeId(0xB3), 1);
 
             // High budget so the single hit cannot cross ε.
-            let cfg_a = sim_config(vec![addr_b], 1);
+            let cfg_a = tuned_config(vec![addr_b], 1, |s| s.target_err_bps = 100);
             let cfg_b = sim_config(vec![addr_a], 2);
 
             let agg_a = Rc::new(InMemoryAggregateStore::<u32>::new());

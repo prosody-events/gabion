@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU128, NonZeroUsize};
 use std::time::Duration;
 
+use crate::settings::Millis;
 use crate::wire::{self, FrameLimits, HmacKey};
 
 mod admin;
@@ -84,7 +85,7 @@ pub struct ValidGossipConfig {
     pub(crate) target_err_bps: NonZeroU32,
     /// Minimum gap between two threshold-fire emissions. See
     /// [`crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
-    pub(crate) min_emit_interval: Duration,
+    pub(crate) min_emit_interval: Millis,
 }
 
 #[derive(Debug, thiserror::Error)]

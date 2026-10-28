@@ -82,12 +82,6 @@ pub fn reset_unix_seconds(now_millis: u64, delta_millis: u64) -> u64 {
     (now_millis / 1_000).saturating_add(retry_after_seconds(delta_millis))
 }
 
-/// `X-RateLimit-Remaining` floor. On the reject path this is always 0; on
-/// the (future) allow-success path it's `limit - total` saturated at u64.
-pub fn limit_remaining(limit: u64, total: u64) -> u64 {
-    limit.saturating_sub(total)
-}
-
 /// Wall-clock ms until the next bucket boundary — equivalently, until the
 /// oldest live bucket ages off in gabion's uniform sliding window.
 ///

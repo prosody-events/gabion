@@ -15,9 +15,8 @@ use thiserror::Error;
 /// default to a single per-zone bucket.
 pub const DEFAULT_DOMAIN: &str = "nginx";
 
-/// Hard cap on descriptors per rule. Mirrors the server's cardinality
-/// envelope so cross-node fingerprints can never grow past what one side can
-/// admit.
+/// Build-time cap on descriptors per rule: the `ArrayVec` bound that
+/// `storage.max_descriptor_count` is validated against.
 pub const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
 
 /// One descriptor binding declared in nginx config — a descriptor `key` paired
@@ -228,8 +227,7 @@ pub fn is_zone_name(s: &str) -> bool {
 ///
 /// Templates (anything with literal text or multiple `$` substitutions)
 /// require the explicit `key:source` form — there's no useful auto-name
-/// to derive. Keys are validated against
-/// [`gabion::rules::is_descriptor_key`] so spaces,
+/// to derive. Keys are validated against [`is_descriptor_key`] so spaces,
 /// punctuation, or anything else not matching `[A-Za-z_][A-Za-z0-9_.-]*`
 /// is rejected at parse time.
 pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {

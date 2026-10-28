@@ -123,7 +123,7 @@ fn env_only_with_no_yaml_file() {
 }
 
 #[test]
-fn comma_separated_lists_split_into_vec() {
+fn comma_separated_lists_split_into_a_list() {
     let _env = EnvGuard::lock();
     set_env("GABION_DISCOVERY_NAMESPACE_ALLOW", "ns-a,ns-b,ns-c");
     set_env("GABION_DISCOVERY_SERVICE_ALLOW", "svc-1,svc-2");
@@ -281,6 +281,8 @@ fn unknown_yaml_key_fails_naming_it() {
             "gossip.tick_intervl",
         ),
         ("gosip:\n  bind: 0.0.0.0:9000\n".to_owned(), "gosip.bind"),
+        ("gosip:\n".to_owned(), "gosip"),
+        ("gossip:\n  fanoutt:\n".to_owned(), "gossip.fanoutt"),
         (
             format!("{rule}    descriptors: [{{ key: ip }}]\n    ratee: 5r/s\n"),
             "limits[0].ratee",
@@ -303,6 +305,48 @@ fn unknown_yaml_key_fails_naming_it() {
          was removed or renamed in this release, or it is misspelled; see the release notes for \
          its replacement."
     );
+}
+
+/// Each YAML shape either loads as the setting's value or fails naming the
+/// setting, never a rounded or silently dropped value.
+#[test]
+fn yaml_value_shapes_load_or_fail_typed() {
+    let _env = EnvGuard::lock();
+    let loaded = |yaml: &str| AppConfig::load_with_yaml_str(yaml).map(|cfg| cfg.settings);
+    let wrong_shape = |yaml: &str, expected: Setting| match loaded(yaml) {
+        Err(ConfigError::WrongShape { setting, .. }) => assert_eq!(setting, expected, "{yaml}"),
+        other => panic!("{yaml}: {other:?}"),
+    };
+
+    wrong_shape(
+        "gossip:\n  cluster_id_hash: 18446744073709551615\n",
+        Setting::GossipClusterIdHash,
+    );
+    wrong_shape("gossip:\n  fanout: [1]\n", Setting::GossipFanout);
+    let quoted = loaded("gossip:\n  cluster_id_hash: \"18446744073709551615\"\n").expect("quoted");
+    assert_eq!(quoted.cluster_id_hash.get(), u128::from(u64::MAX));
+    let bind = loaded("gossip:\n  bind:\n").expect("null bind");
+    assert_eq!(bind.gossip_bind, None);
+    let allow = loaded("discovery:\n  namespace_allow: team-a\n").expect("scalar list");
+    assert_eq!(&*allow.namespace_allow, ["team-a"].map(Box::from));
+    assert!(
+        matches!(
+            loaded("gossip:\n  max_payload_bytes: 100\n"),
+            Err(ConfigError::Setting(SettingError::PayloadOutOfRange { .. }))
+        ),
+        "load validates the settings"
+    );
+}
+
+#[test]
+fn env_list_replaces_the_yaml_list() {
+    let _env = EnvGuard::lock();
+    set_env("GABION_DISCOVERY_NAMESPACE_ALLOW", "b,c");
+
+    let cfg = AppConfig::load_with_yaml_str("discovery:\n  namespace_allow: [a]\n")
+        .expect("load yaml + env list");
+
+    assert_eq!(&*cfg.settings.namespace_allow, ["b", "c"].map(Box::from));
 }
 
 #[test]
@@ -438,15 +482,15 @@ fn cluster_id_hash_accepts_integer_decimal_and_hex_strings() {
     let _env = EnvGuard::lock();
 
     let integer_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: 1\n")
-        .expect("integer cluster_id_hash should deserialize");
+        .expect("integer cluster_id_hash should load");
     assert_eq!(integer_cfg.settings.cluster_id_hash.get(), 1);
 
     let decimal_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: \"42\"\n")
-        .expect("decimal-string cluster_id_hash should deserialize");
+        .expect("decimal-string cluster_id_hash should load");
     assert_eq!(decimal_cfg.settings.cluster_id_hash.get(), 42);
 
     let hex_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: \"0xff\"\n")
-        .expect("hex-string cluster_id_hash should deserialize");
+        .expect("hex-string cluster_id_hash should load");
     assert_eq!(hex_cfg.settings.cluster_id_hash.get(), 0xff);
 
     // Above-u64 values must round-trip when expressed as a hex string —
@@ -455,7 +499,7 @@ fn cluster_id_hash_accepts_integer_decimal_and_hex_strings() {
     let big_cfg = AppConfig::load_with_yaml_str(
         "gossip:\n  cluster_id_hash: \"0xffffffffffffffffffffffffffffffff\"\n",
     )
-    .expect("u128 max hex string should deserialize");
+    .expect("u128 max hex string should load");
     assert_eq!(big_cfg.settings.cluster_id_hash.get(), u128::MAX);
 }
 
@@ -481,7 +525,7 @@ fn cluster_id_hash_from_env_var() {
     let _env = EnvGuard::lock();
     set_env("GABION_GOSSIP_CLUSTER_ID_HASH", "0xdeadbeef");
 
-    let cfg = AppConfig::load(None).expect("env-only cluster_id_hash should deserialize");
+    let cfg = AppConfig::load(None).expect("env-only cluster_id_hash should load");
     assert_eq!(cfg.settings.cluster_id_hash.get(), 0xdeadbeef);
 }
 

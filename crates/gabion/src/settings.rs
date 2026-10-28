@@ -162,11 +162,12 @@ settings! {
         "gabion could not count the hits of any node, not even this one";
     StorageLocalDirtyCapacity => "storage.local_dirty_capacity",
         "GABION_STORAGE_LOCAL_DIRTY_CAPACITY", "gabion_storage_local_dirty_capacity";
-        local_dirty_capacity: NonZeroUsize = nz!(defaults::STORAGE_LOCAL_DIRTY_CAPACITY),
+        local_dirty_capacity: NonZeroU32 = nz!(defaults::STORAGE_LOCAL_DIRTY_CAPACITY as u32),
         "this node could not queue its own counts for gossip";
     StorageForwardedDirtyCapacity => "storage.forwarded_dirty_capacity",
         "GABION_STORAGE_FORWARDED_DIRTY_CAPACITY", "gabion_storage_forwarded_dirty_capacity";
-        forwarded_dirty_capacity: NonZeroUsize = nz!(defaults::STORAGE_FORWARDED_DIRTY_CAPACITY),
+        forwarded_dirty_capacity: NonZeroU32 =
+            nz!(defaults::STORAGE_FORWARDED_DIRTY_CAPACITY as u32),
         "this node could not pass its peers' counts on";
     StoragePeerCapacity => "storage.peer_capacity", "GABION_STORAGE_PEER_CAPACITY",
         "gabion_storage_peer_capacity";
@@ -317,8 +318,8 @@ impl Settings {
                 1,
                 defaults::STORAGE_MAX_DESCRIPTOR_COUNT as u64,
                 "Descriptors with more entries than this are rejected with \
-                 `cardinality_rejected`; raise it only if your rules and Envoy's actions \
-                 legitimately use more.",
+                 `cardinality_rejected`. The maximum is a build-time cap in this release, so \
+                 lower the value or remove it to use the default.",
             ),
         ];
         for (setting, configured, min, max, reason) in capacities {
@@ -347,7 +348,7 @@ impl Settings {
             auth_key: None,
             rng_seed: self.rng_seed.unwrap_or_default(),
             target_err_bps,
-            min_emit_interval: self.min_emit_interval.duration(),
+            min_emit_interval: self.min_emit_interval,
         };
         let storage = ValidStorageConfig {
             cell_capacity: self.max_cells,
@@ -401,12 +402,12 @@ trait Field {
 }
 
 macro_rules! int_field {
-    ($($ty:ty => $expected:literal;)*) => {$(
+    ($($ty:ty => $expected:literal, $example:literal;)*) => {$(
         impl Field for $ty {
             fn set(&mut self, text: &str) -> Result<(), Problem> {
                 *self = text.parse().map_err(|error: ParseIntError| match error.kind() {
                     IntErrorKind::Zero => Problem::Zero,
-                    _ => Problem::Malformed($expected, "100"),
+                    _ => Problem::Malformed($expected, $example),
                 })?;
                 Ok(())
             }
@@ -419,12 +420,12 @@ macro_rules! int_field {
 }
 
 int_field! {
-    NonZeroU8 => "a whole number from 1 to 255";
-    NonZeroU16 => "a whole number from 1 to 65535";
-    NonZeroU32 => "a whole number from 1 to 4294967295";
-    NonZeroUsize => "a positive whole number";
-    usize => "a whole number";
-    u32 => "a whole number from 0 to 4294967295";
+    NonZeroU8 => "a whole number from 1 to 255", "100";
+    NonZeroU16 => "a whole number from 1 to 65535", "100";
+    NonZeroU32 => "a whole number from 1 to 4294967295", "100";
+    NonZeroUsize => "a positive whole number", "100";
+    usize => "a whole number", "1400";
+    u32 => "a whole number from 0 to 4294967295", "100";
 }
 
 macro_rules! optional_field {
@@ -629,9 +630,9 @@ impl fmt::Display for SettingError {
             ),
             Self::ErrorBudgetOutOfRange { configured } => write!(
                 f,
-                "The gossip error budget is {configured} basis points, outside 1 to 10000 (0.01 % \
-                 to 100 % of a rule's limit). Set {} in that range; the default, {}, is 1 % of \
-                 each rule's limit.",
+                "The gossip error budget is {configured} basis points, outside 1 to \
+                 {MAX_ERROR_BUDGET_BPS} (0.01 % to 100 % of a rule's limit). Set {} in that \
+                 range; the default, {}, is 1 % of each rule's limit.",
                 Setting::GossipTargetErrBps,
                 defaults::GOSSIP_TARGET_ERR_BPS
             ),

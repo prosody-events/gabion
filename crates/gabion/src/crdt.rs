@@ -51,7 +51,7 @@ use dirty_ring::ring_entry_at;
 use hash::hash_compact_cell_key;
 use index::CellIndex;
 
-use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32};
 
 use crate::rules::CardinalityLimits;
 use crate::settings::Setting;
@@ -245,15 +245,16 @@ pub struct CellStoreStats {
 // CellStore
 // ---------------------------------------------------------------------------
 
-/// Construction-time configuration, built only by
-/// [`crate::settings::Settings::validate`], so every capacity is in range.
+/// The storage half of the validated settings: the cell store's capacities
+/// and the cardinality limits both adapters' admission enforces. Built only
+/// by [`crate::settings::Settings::validate`].
 #[derive(Clone, Copy, Debug)]
 pub struct ValidStorageConfig {
     pub(crate) cell_capacity: NonZeroU32,
     pub(crate) rule_dictionary_capacity: NonZeroU16,
     pub(crate) node_dictionary_capacity: NonZeroU16,
-    pub(crate) local_dirty_capacity: NonZeroUsize,
-    pub(crate) forwarded_dirty_capacity: NonZeroUsize,
+    pub(crate) local_dirty_capacity: NonZeroU32,
+    pub(crate) forwarded_dirty_capacity: NonZeroU32,
     pub(crate) peer_capacity: NonZeroU16,
     /// The per-request descriptor limits both adapters' admission enforces.
     pub cardinality: CardinalityLimits,
@@ -346,7 +347,7 @@ impl<C: Count> CellStore<C> {
         let cap = config.cell_capacity.get();
         let rule_capacity = usize::from(config.rule_dictionary_capacity.get());
         let node_capacity = config.node_dictionary_capacity.get();
-        let index_cap = pow2_index_capacity_for(cap);
+        let index_cap = pow2_index_capacity_for(config.cell_capacity);
 
         // Build the intrusive freelist: 0 -> 1 -> 2 -> ... -> cap-1 -> NO_FREE
         let mut free_next = vec![NO_FREE; cap as usize].into_boxed_slice();
@@ -380,8 +381,8 @@ impl<C: Count> CellStore<C> {
 
             index: CellIndex::with_capacity(index_cap),
 
-            local_dirty: DirtyRing::with_capacity(config.local_dirty_capacity.get()),
-            forwarded_dirty: DirtyRing::with_capacity(config.forwarded_dirty_capacity.get()),
+            local_dirty: DirtyRing::with_capacity(config.local_dirty_capacity),
+            forwarded_dirty: DirtyRing::with_capacity(config.forwarded_dirty_capacity),
             repair_cursor: 0,
 
             selection_marks: vec![0_u32; cap as usize].into_boxed_slice(),

@@ -1,27 +1,25 @@
 //! Test-only configs, built through [`Settings::validate`] as production
 //! builds them.
 
-use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
-
 use super::Settings;
 use crate::crdt::ValidStorageConfig;
 
-/// A cell store of the given capacities.
+/// A storage config of the given capacities; `dirty` sizes both dirty rings.
 pub(crate) fn storage(
     cells: u32,
     rules: u16,
     nodes: u16,
-    local_dirty: usize,
-    forwarded_dirty: usize,
+    dirty: u32,
     peers: u16,
 ) -> ValidStorageConfig {
+    let dirty = dirty.try_into().expect("dirty");
     let settings = Settings {
-        max_cells: NonZeroU32::new(cells).expect("cells"),
-        rule_dictionary_capacity: NonZeroU16::new(rules).expect("rules"),
-        node_dictionary_capacity: NonZeroU16::new(nodes).expect("nodes"),
-        local_dirty_capacity: NonZeroUsize::new(local_dirty).expect("local dirty"),
-        forwarded_dirty_capacity: NonZeroUsize::new(forwarded_dirty).expect("forwarded dirty"),
-        peer_capacity: NonZeroU16::new(peers).expect("peers"),
+        max_cells: cells.try_into().expect("cells"),
+        rule_dictionary_capacity: rules.try_into().expect("rules"),
+        node_dictionary_capacity: nodes.try_into().expect("nodes"),
+        local_dirty_capacity: dirty,
+        forwarded_dirty_capacity: dirty,
+        peer_capacity: peers.try_into().expect("peers"),
         ..Settings::default()
     };
     settings.validate().expect("test storage validates").1

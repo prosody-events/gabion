@@ -1,25 +1,5 @@
 use super::*;
 
-/// Every setting typed `NonZero*` or `Millis`.
-const NON_ZERO: [Setting; 16] = [
-    Setting::StorageMaxCells,
-    Setting::StorageRuleDictionaryCapacity,
-    Setting::StorageNodeDictionaryCapacity,
-    Setting::StorageLocalDirtyCapacity,
-    Setting::StorageForwardedDirtyCapacity,
-    Setting::StoragePeerCapacity,
-    Setting::StorageMaxDescriptorCount,
-    Setting::StorageMaxDescriptorBytes,
-    Setting::StorageMaxKeyBytes,
-    Setting::GossipTickInterval,
-    Setting::GossipFanout,
-    Setting::GossipMaxCellsPerFrame,
-    Setting::GossipMaxCellsPerTick,
-    Setting::GossipSendQueueCapacity,
-    Setting::GossipLimitQueueCapacity,
-    Setting::GossipMinEmitInterval,
-];
-
 fn applied(key: Setting, text: &str) -> Result<Settings, SettingError> {
     let mut settings = Settings::default();
     settings.apply(key, text).map(|()| settings)
@@ -33,7 +13,14 @@ fn validated(tune: impl FnOnce(&mut Settings)) -> Result<(), SettingError> {
 
 #[test]
 fn zero_is_not_positive() {
-    for setting in NON_ZERO {
+    for &setting in Setting::ALL {
+        let Some(reason) = setting.zero_reason() else {
+            assert!(
+                !matches!(applied(setting, "0"), Err(SettingError::NotPositive { .. })),
+                "{setting:?} has no zero reason"
+            );
+            continue;
+        };
         let zeros: &[&str] = match setting {
             Setting::GossipTickInterval | Setting::GossipMinEmitInterval => &["0", "0ms"],
             _ => &["0"],
@@ -46,7 +33,7 @@ fn zero_is_not_positive() {
                 setting.yaml_key(),
                 setting.env_var(),
                 setting.nginx_directive().unwrap(),
-                setting.zero_reason().unwrap(),
+                reason,
                 &setting.default_text().unwrap(),
             ] {
                 assert!(text.contains(part), "{text:?} lacks {part:?}");
@@ -115,7 +102,18 @@ fn cluster_id_accepts_decimal_and_prefixed_hex() {
 #[test]
 fn cluster_id_rejects_zero_signs_and_garbage() {
     for text in [
-        "0", "0x0", "+1", "0x+1", "-1", "c0ffee", "0x", "", "0xg1", "1e3",
+        "0",
+        "0x0",
+        "+1",
+        "0x+1",
+        "-1",
+        "c0ffee",
+        "0x",
+        "",
+        "0xg1",
+        "1e3",
+        "0x100000000000000000000000000000000",
+        "340282366920938463463374607431768211456",
     ] {
         assert!(
             applied(Setting::GossipClusterIdHash, text).is_err(),
@@ -219,6 +217,7 @@ fn emit_interval_at_or_above_the_heartbeat_fails() {
         }
     );
     assert_eq!(emit(99), Ok(()));
+    assert!(emit(101).is_err());
     assert_eq!(
         error.to_string(),
         "`gossip.min_emit_interval` (`GABION_GOSSIP_MIN_EMIT_INTERVAL`; NGINX \
@@ -233,9 +232,7 @@ fn emit_interval_at_or_above_the_heartbeat_fails() {
 #[test]
 fn capacity_outside_its_range_fails() {
     let capacity = |setting: Setting, value: u64| {
-        let mut settings = Settings::default();
-        settings.apply(setting, &value.to_string())?;
-        settings.validate().map(drop)
+        applied(setting, &value.to_string()).and_then(|s| s.validate().map(drop))
     };
     for (setting, min, max) in [
         (Setting::StorageMaxCells, 1, 1 << 30),
@@ -268,6 +265,21 @@ fn capacity_outside_its_range_fails() {
     );
 }
 
+/// Every message's "use the default, …" clause names text that parses back
+/// to the default.
+#[test]
+fn every_printed_default_parses_back_to_the_default() {
+    for &setting in Setting::ALL {
+        if let Some(text) = setting.default_text() {
+            assert_eq!(
+                applied(setting, &text),
+                Ok(Settings::default()),
+                "{setting:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn defaults_validate_to_the_production_values() {
     let (gossip, storage) = Settings::default().validate().expect("defaults validate");
@@ -276,8 +288,8 @@ fn defaults_validate_to_the_production_values() {
         Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS)
     );
     assert_eq!(
-        gossip.min_emit_interval,
-        Duration::from_millis(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS)
+        gossip.min_emit_interval.0.get(),
+        defaults::GOSSIP_MIN_EMIT_INTERVAL_MS
     );
     assert_eq!(gossip.fanout.get(), defaults::GOSSIP_FANOUT);
     assert_eq!(
@@ -317,11 +329,11 @@ fn defaults_validate_to_the_production_values() {
         defaults::STORAGE_NODE_DICTIONARY_CAPACITY
     );
     assert_eq!(
-        storage.local_dirty_capacity.get(),
+        storage.local_dirty_capacity.get() as usize,
         defaults::STORAGE_LOCAL_DIRTY_CAPACITY
     );
     assert_eq!(
-        storage.forwarded_dirty_capacity.get(),
+        storage.forwarded_dirty_capacity.get() as usize,
         defaults::STORAGE_FORWARDED_DIRTY_CAPACITY
     );
     assert_eq!(storage.peer_capacity.get(), defaults::STORAGE_PEER_CAPACITY);
@@ -339,7 +351,13 @@ fn defaults_validate_to_the_production_values() {
 /// so a row misspelling one fails here.
 #[test]
 fn spellings_follow_the_yaml_key() {
-    for &setting in Setting::ALL {
+    for (i, &setting) in Setting::ALL.iter().enumerate() {
+        assert!(
+            Setting::ALL[..i]
+                .iter()
+                .all(|earlier| earlier.yaml_key() != setting.yaml_key()),
+            "{setting:?} repeats a YAML key"
+        );
         let snake = setting.yaml_key().replace('.', "_");
         assert_eq!(
             setting.env_var(),

@@ -59,9 +59,8 @@ fn nginx_queue_capacity_sizes_the_shm_queue() {
         let layout = Layout::for_zone(ZONE, PAGE, queue).expect("layout");
         assert_eq!(layout.queue_capacity, queue.next_power_of_two());
     }
-    let Err(needed) = Layout::for_zone(PAGE, PAGE, default) else {
-        panic!("a one-page zone cannot hold the queue");
-    };
+    let needed =
+        Layout::for_zone(PAGE, PAGE, default).expect_err("a one-page zone cannot hold the queue");
     assert_eq!(Layout::for_zone(needed - PAGE, PAGE, default), Err(needed));
     let layout = Layout::for_zone(needed, PAGE, default).expect("the reported size fits");
     assert_eq!(layout.aggregate_capacity, MIN_AGGREGATE_CAPACITY);

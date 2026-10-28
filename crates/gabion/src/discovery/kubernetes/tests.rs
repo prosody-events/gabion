@@ -317,11 +317,21 @@ fn service_change_ignores_init_marker() {
 
 #[test]
 fn service_change_filters_by_allow_list() {
-    let svc = service("default", "other", true, true);
-    let change = service_change(Event::Apply(svc), &["gabion".into()]);
+    let allow = ["gabion".into()];
+    let change = |name, allow: &[Box<str>]| {
+        service_change(Event::Apply(service("default", name, true, true)), allow)
+    };
     assert!(
-        matches!(change, ServiceChange::Ignore),
+        matches!(change("other", &allow), ServiceChange::Ignore),
         "Service not in allow list should Ignore",
+    );
+    assert!(
+        matches!(change("gabion", &allow), ServiceChange::Track(_)),
+        "Service in the allow list should Track",
+    );
+    assert!(
+        matches!(change("other", &[]), ServiceChange::Track(_)),
+        "an empty allow list should Track every Service",
     );
 }
 
@@ -467,9 +477,11 @@ async fn local_kubernetes_endpoint_slice_watcher_emits_added_peer() {
     // The watcher's stream is the signal: the test proceeds the moment the
     // first `Added` arrives. The timeout only bounds a broken watcher.
     let discovery = EndpointSliceDiscovery {
-        self_addr: None,
-        namespace_allow: Box::new([namespace.as_str().into()]),
-        service_allow: Box::new(["gabion".into()]),
+        config: DiscoveryConfig {
+            self_addr: None,
+            namespace_allow: Box::new([namespace.as_str().into()]),
+            service_allow: Box::new(["gabion".into()]),
+        },
         preconnected: Some(client),
     };
     let first_added = async {

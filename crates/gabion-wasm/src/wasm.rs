@@ -62,7 +62,7 @@ impl Sim {
         // test confirms the spawned task runs the full submit → gossip
         // → snapshot loop on the wasm microtask queue.
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = run_engine(config, valid, cmd_rx).await;
+            let _ = run_engine(valid, cmd_rx).await;
         });
         Ok(Sim { cmd_tx })
     }

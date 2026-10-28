@@ -80,8 +80,8 @@ Every setting has exactly one `GABION_*` env var, named in the one
 settings table both adapters share (`Setting` in `gabion::settings`,
 which also gives each setting's NGINX directive). Comma-separated values
 feed list settings, as in `GABION_DISCOVERY_NAMESPACE_ALLOW=ns-a,ns-b`;
-in YAML a list setting is a sequence (`namespace_allow: ["ns-a"]`), not a
-bare string. Structured lists such as the `limits:` block, along with
+in YAML a list setting is a sequence (`namespace_allow: ["ns-a"]`) or
+one name. Structured lists such as the `limits:` block, along with
 anything that contains nested durations, live in YAML only because flat
 env vars cannot express them.
 
@@ -286,6 +286,7 @@ the entries below are `gabiond`'s own.
 | `` rule `X`: the window is shorter than the rate's period, so the rate cannot be spread over it. … for example `100r/500ms` ``   | An explicit `window:` was shorter than the rate's period; a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
 | `` rule `X` descriptor key `Y` must match `[A-Za-z_][A-Za-z0-9_.-]*` ``                                                        | A descriptor key uses an unsupported character.                                                        | Use identifier-like names. Underscore, dot, and dash are allowed inside; the first character must be a letter or underscore.  |
 | `` The configuration file sets `X`, which gabiond does not know. … ``                                                            | The YAML sets a key that is not a setting or a field of a `limits:` entry: a typo, or a key this release removed or renamed. | Correct or delete the key; the release notes name each removed key's replacement.                                             |
+| `` The configuration file sets `X` (…) to …, which gabiond cannot read as its value. … ``                                       | A table, a list where one value belongs, or an unquoted integer above 9223372036854775807, which YAML reads as a fraction and rounds. | Fix the indentation or quote the number, or remove the key.                                                                   |
 | `` `X` is 0, but it must be at least 1: … ``                                                                                    | A count, capacity or duration was set to 0, which would disable what it sizes.                         | Remove the setting to use the default the message names, or set a positive value.                                             |
 | `` `X` is `V`, which is not …, for example `E`. … ``                                                                            | The value does not parse as the setting's type (an integer in range, a duration in whole milliseconds such as `500ms`, a socket address, a Kubernetes name). | Write it like the example, or remove it to use the default.                                                                   |
 | `` `X` is N; gabion supports MIN to MAX. … ``                                                                                   | A capacity is outside the range gabion can hold; the message gives the reason.                         | Set it inside the range, or remove it to use the default.                                                                     |

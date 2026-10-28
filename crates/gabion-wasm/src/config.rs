@@ -24,8 +24,8 @@ pub const MAX_NODES: usize = 256;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SimConfig {
-    /// Number of cluster members. Clamped to `1..=MAX_NODES` by
-    /// [`SimConfig::validate`].
+    /// Number of cluster members. Must be in `1..=MAX_NODES`;
+    /// [`SimConfig::validate`] rejects anything else.
     pub nodes: usize,
     /// Floor on peers contacted per gossip tick; the runtime scales the
     /// actual fanout to the `⌈ln(n)+c⌉` coverage threshold (`n` = peer count).
@@ -104,13 +104,21 @@ pub enum ConfigError {
     Setting(#[from] SettingError),
 }
 
+/// A [`SimConfig`] with every node's gossip and storage configs, built only by
+/// [`SimConfig::validate`].
+pub struct ValidSimConfig {
+    pub(crate) config: SimConfig,
+    pub(crate) gossip: ValidGossipConfig,
+    pub(crate) storage: ValidStorageConfig,
+}
+
 impl SimConfig {
     /// Validate the user-facing invariants and build every node's gossip and
     /// storage configs, once. Bucket/window math is checked here because a
     /// zero bucket silently disables expiry inside the CRDT
     /// (`RuleDescriptor::default`'s footgun), which would mislead rather than
     /// inform.
-    pub fn validate(&self) -> Result<(ValidGossipConfig, ValidStorageConfig), ConfigError> {
+    pub fn validate(self) -> Result<ValidSimConfig, ConfigError> {
         if self.nodes < 1 || self.nodes > MAX_NODES {
             return Err(ConfigError::NodeCountOutOfRange { got: self.nodes });
         }
@@ -128,7 +136,12 @@ impl SimConfig {
                 got: self.uniform_loss,
             });
         }
-        Ok(self.settings()?.validate()?)
+        let (gossip, storage) = self.settings()?.validate()?;
+        Ok(ValidSimConfig {
+            config: self,
+            gossip,
+            storage,
+        })
     }
 
     /// The node settings for this session: the controls' gossip tuning and
@@ -226,3 +239,6 @@ impl SimConfig {
         Ok(settings)
     }
 }
+
+#[cfg(test)]
+mod tests;

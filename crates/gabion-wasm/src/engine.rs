@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
 use crate::clock::{ManualClock, SharedNow};
-use crate::config::SimConfig;
+use crate::config::{SimConfig, ValidSimConfig};
 use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView};
 use crate::shims::{AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport};
 
@@ -63,12 +63,9 @@ const LOCAL_RULE_ID: u32 = 0;
 /// freeze in dev wasm; a silent re-send next tick in release, since the dirty
 /// rings are persistent — no data loss, just slower flush).
 ///
-/// **The pool ceiling is 255, not a free choice.** The runtime addresses
-/// send-pool slots with a `u8` (`send_pending: VecDeque<(SocketAddr, u8)>`) and
-/// builds the free list as `(0..send_pool_size as u8)`, so any capacity ≥ 256
-/// wraps to an *empty* free list and silently kills all gossip. So the pool is
-/// pinned at the largest addressable value, and the per-tick frame is capped so
-/// one tick stays well inside it:
+/// 255 is the largest value `gossip.send_queue_capacity` admits, so the pool is
+/// pinned there and the per-tick frame is capped so one tick stays well inside
+/// it:
 ///
 /// One tick emits at most `pick_count × packets_per_frame` packets, where
 /// `pick_count = ⌈ln(peers)+c⌉` (the coverage fanout, `c` =
@@ -194,23 +191,20 @@ pub enum Command {
 }
 
 /// Spawn the engine and process commands until the channel closes or a
-/// `Shutdown` arrives. `valid` is `config`'s [`SimConfig::validate`], which
-/// the caller ran once, so a bad config fails before any runtime is built.
+/// `Shutdown` arrives.
 pub async fn run_engine(
-    config: SimConfig,
-    valid: (ValidGossipConfig, ValidStorageConfig),
+    valid: ValidSimConfig,
     cmd_rx: mpsc::Receiver<Command>,
 ) -> Result<(), EngineError> {
     let local = LocalSet::new();
-    local.run_until(engine_loop(config, valid, cmd_rx)).await
+    local.run_until(engine_loop(valid, cmd_rx)).await
 }
 
 async fn engine_loop(
-    config: SimConfig,
-    valid: (ValidGossipConfig, ValidStorageConfig),
+    valid: ValidSimConfig,
     mut cmd_rx: mpsc::Receiver<Command>,
 ) -> Result<(), EngineError> {
-    let mut state = EngineState::build(config, valid);
+    let mut state = EngineState::build(valid);
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Command::SubmitRequest {
@@ -312,8 +306,11 @@ struct EngineState {
 
 impl EngineState {
     fn build(
-        config: SimConfig,
-        (gossip, storage): (ValidGossipConfig, ValidStorageConfig),
+        ValidSimConfig {
+            config,
+            gossip,
+            storage,
+        }: ValidSimConfig,
     ) -> Self {
         let log: EventLog = Rc::new(RefCell::new(Vec::new()));
         let addresses: AddressBook = Rc::new(RefCell::new(HashMap::new()));
@@ -390,13 +387,8 @@ impl EngineState {
     /// [`EngineState::add_node`] route through here, so the rule-intern footgun
     /// guard below is honored identically on every path.
     ///
-    /// Per-node storage is sized by [`SimConfig::settings`] from the
-    /// cluster size and the watched rule's live buckets — the one sizing site,
-    /// with no production floors (the browser working set is a few hundred
-    /// cells, not the hundreds of thousands a deployment sizes for). The caps
-    /// scale with `config.nodes`, so a newcomer is sized for the same
-    /// `MAX_NODES`-bounded cluster the initial members were — no resize on
-    /// join.
+    /// Every node shares the storage and gossip configs `SimConfig::validate`
+    /// built once, so a joiner is sized like the initial members.
     fn spawn_node(&mut self, id: u32, bootstrap: &[SocketAddr]) {
         let addr = addr_of_id(id);
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);

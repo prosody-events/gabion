@@ -335,13 +335,12 @@ The three asymmetries with the rule version are:
 #### Capacity sizing — `pow2_index_capacity_for`
 
 ```rust
-pub(super) fn pow2_index_capacity_for(capacity: u32) -> u32 {
-    let base = capacity.max(1).next_power_of_two();
-    base.saturating_mul(2).max(2)
+pub(super) fn pow2_index_capacity_for(capacity: NonZeroU32) -> u32 {
+    capacity.get().next_power_of_two() * 2
 }
 ```
 
-The helper offers three guarantees. The result is always a power of two, which lets the hash index use bitmasking instead of modulo; it doubles the descriptor capacity so the index sits at roughly a 50% load factor at full occupancy; and the bounds are safe at the edges, because `.max(1)` keeps `next_power_of_two` defined, `.saturating_mul(2)` guards against `u32` overflow at the absurd end, and `.max(2)` floors the result at two buckets. As a worked example, `capacity = 100` rounds up to `next_power_of_two(100) = 128`, which doubles to `256` index buckets, giving about 39% load at full occupancy.
+The helper offers three guarantees. The result is always a power of two, which lets the hash index use bitmasking instead of modulo; it doubles the descriptor capacity so the index sits at roughly a 50% load factor at full occupancy; and it needs no floors, because the `NonZeroU32` capacity keeps `next_power_of_two` at least 1 and `Settings::validate` caps cells at 2^30, so the doubling cannot overflow a `u32`. As a worked example, `capacity = 100` rounds up to `next_power_of_two(100) = 128`, which doubles to `256` index buckets, giving about 39% load at full occupancy.
 
 #### Dictionary invariants
 

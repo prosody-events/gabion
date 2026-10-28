@@ -662,13 +662,25 @@ fn over_limit_populates_descriptor_status_fields() {
             hits_addend: 1,
         };
 
-        // Fill to the limit at now=0.
+        // Fill to the limit at now=0. Between the two hits, a request of
+        // weight 2 at total 1 is rejected with nothing remaining, not the
+        // 1 left before it.
         for tick in 0..2_u64 {
             let r = harness
                 .limiter
                 .should_rate_limit_at(make_request(), tick)
                 .await;
             assert_eq!(r.overall_code, rate_limit_response::Code::Ok as i32);
+            if tick == 0 {
+                let heavy = RateLimitRequest {
+                    hits_addend: 2,
+                    ..make_request()
+                };
+                let r = harness.limiter.should_rate_limit_at(heavy, 0).await;
+                let status = r.statuses.first().expect("one status");
+                assert_eq!(status.code, rate_limit_response::Code::OverLimit as i32);
+                assert_eq!(status.limit_remaining, 0, "remaining must be 0 on reject");
+            }
         }
 
         // 3rd request at now=0 trips the reject. With both prior hits
@@ -748,10 +760,6 @@ fn under_limit_populates_descriptor_status_fields() {
 #[test]
 fn dry_run_over_limit_populates_descriptor_status_fields() {
     run_local(async {
-        let router = SimRouter::new();
-        let addr = next_test_addr();
-        let transport = router.bind(addr);
-        let identity = NodeIdentity::new(NodeId(0xAA02), 1);
         let rule = Rule::new(
             1,
             "api",
@@ -764,28 +772,8 @@ fn dry_run_over_limit_populates_descriptor_status_fields() {
             100,
             EnforcementMode::DryRun,
         );
-        let (gossip_config, storage) = validated(|_| {});
-        let mut store = CellStore::<u32>::new(storage, identity);
-        store.intern_rule(RuleDescriptor {
-            fingerprint: rule.fingerprint,
-            window_millis: rule.window_millis as u32,
-            bucket_millis: rule.bucket_millis as u32,
-            limit: rule.limit,
-            flags: 0,
-            local_rule_id: rule.id,
-        });
-        let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
-        let (rt, client) = GossipRuntime::from_parts(
-            transport,
-            TokioClock::from_millis(0),
-            gossip_config,
-            store,
-            counts.clone(),
-        );
-        let _handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
-
-        let rule_table = Arc::new(RuleTable::new(vec![rule]));
-        let limiter = SharedLimiter::new(rule_table, client.clone(), counts, storage.cardinality);
+        let harness = harness_with(vec![rule], validated(|_| {}).1.cardinality).await;
+        let limiter = &harness.limiter;
 
         // Drive enough hits to push past the DryRun budget. Each
         // request is allowed because the rule never rejects.
@@ -834,7 +822,7 @@ fn dry_run_over_limit_populates_descriptor_status_fields() {
             status.duration_until_reset.is_some(),
             "duration_until_reset must still be populated"
         );
-        let _ = client.shutdown().await;
+        let _ = harness.client.shutdown().await;
     });
 }
 

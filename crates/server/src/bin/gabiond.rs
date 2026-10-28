@@ -92,7 +92,7 @@ async fn run() -> anyhow::Result<()> {
         .settings
         .gossip_bind
         .ok_or(ConfigError::MissingGossipBind)?;
-    let mut gossip_runtime_config = config.gossip.clone();
+    let mut gossip_runtime_config = config.gossip;
     if config.settings.rng_seed.is_none() {
         gossip_runtime_config.rng_seed =
             gabion::defaults::random_rng_seed().context("draw gossip RNG seed")?;

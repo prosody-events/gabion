@@ -228,8 +228,17 @@ fn is_descriptor_key_matches_grammar() {
     assert!(is_descriptor_key("tenant.id"));
     assert!(is_descriptor_key("tenant-id"));
     assert!(is_descriptor_key("_internal"));
-    assert!(!is_descriptor_key(""));
-    assert!(!is_descriptor_key("9leading"));
-    assert!(!is_descriptor_key(".dot-first"));
-    assert!(!is_descriptor_key("with space"));
+    assert!(is_descriptor_key("a"));
+    for key in [
+        "",
+        "9leading",
+        ".dot-first",
+        "with space",
+        "tenant:id",
+        "tenant/id",
+        "té",
+        "-x",
+    ] {
+        assert!(!is_descriptor_key(key), "{key:?}");
+    }
 }

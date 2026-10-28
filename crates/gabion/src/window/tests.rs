@@ -152,13 +152,6 @@ fn reset_anchors_on_now_seconds_plus_retry_after() {
 }
 
 #[test]
-fn limit_remaining_saturates_at_zero() {
-    assert_eq!(limit_remaining(10, 4), 6);
-    assert_eq!(limit_remaining(10, 10), 0);
-    assert_eq!(limit_remaining(10, 25), 0);
-}
-
-#[test]
 fn next_bucket_boundary_is_full_bucket_at_boundary() {
     // now exactly on the boundary -> a full bucket until the next one.
     assert_eq!(time_until_next_bucket_boundary_millis(0, 1_000), 1_000);

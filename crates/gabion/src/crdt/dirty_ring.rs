@@ -1,5 +1,7 @@
 //! Bounded dirty-change ring used by gossip lanes.
 
+use std::num::NonZeroU32;
+
 use super::CellHandle;
 
 /// One entry in a [`DirtyRing`]. The `origin_sequence` is validated against
@@ -22,14 +24,14 @@ pub struct DirtyRing {
 }
 
 impl DirtyRing {
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: NonZeroU32) -> Self {
         Self {
             entries: vec![
                 DirtyEntry {
                     handle: CellHandle::default(),
                     origin_sequence: 0,
                 };
-                capacity
+                capacity.get() as usize
             ]
             .into_boxed_slice(),
             head: 0,
@@ -52,9 +54,6 @@ impl DirtyRing {
     /// Append `entry`, overwriting the oldest one when the ring is full.
     pub fn push(&mut self, entry: DirtyEntry) {
         let cap = self.entries.len() as u32;
-        if cap == 0 {
-            return;
-        }
         if self.len < cap {
             self.len += 1;
         }

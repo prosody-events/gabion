@@ -4,7 +4,7 @@ use crate::settings::mock::storage;
 
 fn store() -> CellStore<u32> {
     CellStore::<u32>::new(
-        storage(256, 32, 32, 64, 64, 16),
+        storage(256, 32, 48, 64, 16),
         NodeIdentity::new(NodeId(0xABCD), 1),
     )
 }

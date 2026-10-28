@@ -26,9 +26,7 @@ const DEFAULT_GABION_SERVICE_NAME: &str = "gabion";
 /// the stream completes empty.
 #[derive(Clone)]
 pub struct EndpointSliceDiscovery {
-    self_addr: Option<SocketAddr>,
-    namespace_allow: Box<[Box<str>]>,
-    service_allow: Box<[Box<str>]>,
+    config: DiscoveryConfig,
     /// Pre-built client; when `Some` we skip the in-cluster client
     /// construction entirely and use it as-is. Only the `#[ignore]`d
     /// live-cluster test in `tests.rs` sets it — production constructors
@@ -39,9 +37,7 @@ pub struct EndpointSliceDiscovery {
 impl EndpointSliceDiscovery {
     pub fn new(config: DiscoveryConfig) -> Self {
         Self {
-            self_addr: config.self_addr,
-            namespace_allow: config.namespace_allow,
-            service_allow: config.service_allow,
+            config,
             preconnected: None,
         }
     }
@@ -73,7 +69,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                     }
                 },
             };
-            let (mut services, namespace_count) = watch_services(&client, &self.namespace_allow);
+            let (mut services, namespace_count) = watch_services(&client, &self.config.namespace_allow);
             let mut endpoints = SelectAll::new();
             let mut watched: AHashMap<Target, oneshot::Sender<()>> = AHashMap::new();
             // True once every watched namespace has finished its initial
@@ -86,7 +82,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
             // `InitDone`; a relist of one namespace says nothing of another.
             let mut zero_match_warned = false;
             let mut listed = vec![false; namespace_count].into_boxed_slice();
-            let watched_namespaces = self.namespace_allow.clone();
+            let watched_namespaces = self.config.namespace_allow.clone();
 
             loop {
                 tokio::select! {
@@ -120,7 +116,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                             }
                             yield Err(err.into());
                         }
-                        Ok(event) => match service_change(event, &self.service_allow) {
+                        Ok(event) => match service_change(event, &self.config.service_allow) {
                             ServiceChange::Track(target) => {
                                 if let Entry::Vacant(slot) = watched.entry(target) {
                                     tracing::info!(
@@ -133,7 +129,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                     endpoints.push(Box::pin(watch_target(
                                         client.clone(),
                                         slot.key().clone(),
-                                        self.self_addr,
+                                        self.config.self_addr,
                                         cancel_rx,
                                     )));
                                     slot.insert(cancel_tx);
@@ -310,7 +306,6 @@ fn watch_services(
 ) {
     let mut apis: Vec<Api<Service>> = namespace_allow
         .iter()
-        .filter(|s| !s.is_empty())
         .map(|ns| Api::namespaced(client.clone(), ns))
         .collect();
     if apis.is_empty() {
@@ -358,11 +353,9 @@ fn fatal_status(err: &WatcherError) -> Option<u16> {
     matches!(code, 401 | 403 | 404).then_some(code)
 }
 
-/// True if `name` matches any non-empty entry in `allow`. An allow list
-/// with no non-empty entries matches everything.
+/// True if `name` is in `allow`. An empty list allows every name.
 fn matches_allow(name: &str, allow: &[Box<str>]) -> bool {
-    let mut entries = allow.iter().filter(|s| !s.is_empty()).peekable();
-    entries.peek().is_none() || entries.any(|s| &**s == name)
+    allow.is_empty() || allow.iter().any(|s| **s == *name)
 }
 
 fn is_gabion_udp(name: Option<&str>, protocol: Option<&str>) -> bool {

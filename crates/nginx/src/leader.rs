@@ -240,7 +240,7 @@ async fn leader_main(
     register_rules(&mut cell_store, &rules);
     // The setting sizes the SHM queue; the runtime's own queue only needs
     // room for one drain batch.
-    let mut gossip_cfg = config.gossip.clone();
+    let mut gossip_cfg = config.gossip;
     gossip_cfg.limit_queue_capacity = DRAIN_BATCH;
 
     // A lone node still needs a socket for the runtime; an ephemeral

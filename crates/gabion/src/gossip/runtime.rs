@@ -452,9 +452,8 @@ where
                 self.rule_pending[idx].saturating_add(req.hits.min(u32::MAX as u64) as u32);
             self.rule_pending[idx] = pending;
             let peers = self.peers.len().max(1) as u64;
-            let limit = req.rule_limit.max(1);
             let bps = u64::from(self.config.target_err_bps.get());
-            let epsilon = ((limit.saturating_mul(bps)) / (10_000 * peers)).max(1);
+            let epsilon = (req.rule_limit.saturating_mul(bps) / (10_000 * peers)).max(1);
             // Surface the budget so observers can see the threshold a burst's
             // accumulated `pending` must cross to trigger an eager flush.
             self.last_error_budget = epsilon;
@@ -472,7 +471,7 @@ where
                 // `max(1)` so the sentinel is not re-introduced.
                 let now = self.clock.now_millis();
                 let last = self.rule_last_emit_ms[idx];
-                let floor = self.config.min_emit_interval.as_millis() as u64;
+                let floor = self.config.min_emit_interval.0.get();
                 if last == 0 || now.saturating_sub(last) >= floor {
                     self.want_immediate_flush = true;
                 }

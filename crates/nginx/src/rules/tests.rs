@@ -67,11 +67,22 @@ fn raised_max_key_bytes_admits_long_key() {
 
 #[test]
 fn too_many_bindings_at_compile() {
-    let bindings = (0..MAX_DESCRIPTORS + 1)
-        .map(|i| binding(&format!("k{i}"), &format!("v{i}")))
-        .collect();
-    let err = compile(&[cfg("wide", bindings)]).unwrap_err();
-    assert!(matches!(err, RuleConfigError::TooManyBindings(_)));
+    let cardinality = crate::mock::limits(|s| s.max_descriptor_count = 2.try_into().unwrap());
+    let compile_wide = |n: usize| {
+        let bindings = (0..n)
+            .map(|i| binding(&format!("k{i}"), &format!("v{i}")))
+            .collect();
+        CompiledRules::compile_with(
+            &[cfg("wide", bindings)],
+            cardinality,
+            &mut NopBindingCompiler,
+        )
+    };
+    compile_wide(2).expect("two bindings fit a count of two");
+    assert!(matches!(
+        compile_wide(3),
+        Err(RuleConfigError::TooManyBindings(_))
+    ));
 }
 
 #[test]
