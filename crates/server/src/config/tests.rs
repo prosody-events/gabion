@@ -221,7 +221,7 @@ fn sample(setting: Setting) -> &'static str {
     }
 }
 
-/// Every setting's environment variable and YAML key reaches
+/// Every setting's documented environment variable and YAML key reaches
 /// `Settings::apply`.
 #[test]
 fn setting_table_spellings_parse() {
@@ -232,11 +232,15 @@ fn setting_table_spellings_parse() {
             .expect("valid sample");
         assert_ne!(expected, Settings::default(), "{setting:?}");
 
+        // The documented spelling, derived independently of the table.
+        let env_var = format!(
+            "GABION_{}",
+            setting.yaml_key().replace('.', "_").to_uppercase()
+        );
         let _env = EnvGuard::lock();
-        set_env(setting.env_var(), sample(setting));
-        let from_env =
-            AppConfig::load(None).unwrap_or_else(|error| panic!("{}: {error}", setting.env_var()));
-        assert_eq!(from_env.settings, expected, "{}", setting.env_var());
+        set_env(&env_var, sample(setting));
+        let from_env = AppConfig::load(None).unwrap_or_else(|error| panic!("{env_var}: {error}"));
+        assert_eq!(from_env.settings, expected, "{env_var}");
         clear_all_env();
 
         let value = format!("\"{}\"", sample(setting));
