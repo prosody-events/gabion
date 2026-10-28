@@ -749,6 +749,19 @@ fn dirty_ring_yields_each_changed_cell_once() {
     assert_ne!(seen[0], seen[1]);
 }
 
+/// An index stays at most half full: a power of two with at least twice the
+/// buckets of the entries it holds, up to the 2^30 cell cap.
+#[test]
+fn index_capacity_keeps_half_the_buckets_free() {
+    for capacity in [1, 2, 3, 1_000, 1 << 16, (1 << 29) + 1, 1 << 30] {
+        let buckets = pow2_index_capacity_for(NonZeroU32::new(capacity).unwrap());
+        assert!(
+            buckets.is_power_of_two() && buckets / 2 >= capacity && buckets / 4 < capacity,
+            "{capacity} entries get {buckets} buckets"
+        );
+    }
+}
+
 #[test]
 fn full_dirty_ring_overwrites_oldest() {
     let mut store = small_store(8, 2);

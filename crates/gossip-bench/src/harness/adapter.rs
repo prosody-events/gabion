@@ -260,6 +260,27 @@ impl HealthReply {
     }
 }
 
+/// The production settings with the store sized for the regime, which the
+/// launcher validates once as `gabiond` validates them. The dirty rings never
+/// drop below production; above it they keep the production ratio of ring to
+/// cell store (`STORAGE_*_DIRTY_CAPACITY` over `STORAGE_MAX_CELLS`).
+pub(super) fn settings(sizing: &Sizing) -> Result<Settings> {
+    let ring = |production: usize| {
+        production.max((sizing.cell_capacity as usize * production).div_ceil(d::STORAGE_MAX_CELLS))
+    };
+    let fit = |floor: u16, n: usize| floor.max((n + 16).min(u16::MAX as usize) as u16);
+    Ok(Settings {
+        max_cells: sizing.cell_capacity.try_into()?,
+        node_dictionary_capacity: fit(d::STORAGE_NODE_DICTIONARY_CAPACITY, sizing.total_nodes)
+            .try_into()?,
+        local_dirty_capacity: u32::try_from(ring(d::STORAGE_LOCAL_DIRTY_CAPACITY))?.try_into()?,
+        forwarded_dirty_capacity: u32::try_from(ring(d::STORAGE_FORWARDED_DIRTY_CAPACITY))?
+            .try_into()?,
+        peer_capacity: fit(d::STORAGE_PEER_CAPACITY, sizing.max_running_nodes).try_into()?,
+        ..Settings::default()
+    })
+}
+
 /// Starts nodes on a world: everything they share is built once.
 pub struct Launcher {
     world: Rc<World>,
@@ -278,28 +299,7 @@ impl Launcher {
         keys: &Rc<KeySpace>,
         seed: u64,
     ) -> Result<Self> {
-        // Never below production; above it, keep the production ratio of the
-        // ring to the cell store (`STORAGE_*_DIRTY_CAPACITY` over
-        // `STORAGE_MAX_CELLS`).
-        let ring = |production: usize| {
-            production
-                .max((sizing.cell_capacity as usize * production).div_ceil(d::STORAGE_MAX_CELLS))
-        };
-        let fit = |floor: u16, n: usize| floor.max((n + 16).min(u16::MAX as usize) as u16);
-        // The production settings, with the store sized for the regime,
-        // validated once as `gabiond` validates them.
-        let settings = Settings {
-            max_cells: sizing.cell_capacity.try_into()?,
-            node_dictionary_capacity: fit(d::STORAGE_NODE_DICTIONARY_CAPACITY, sizing.total_nodes)
-                .try_into()?,
-            local_dirty_capacity: u32::try_from(ring(d::STORAGE_LOCAL_DIRTY_CAPACITY))?
-                .try_into()?,
-            forwarded_dirty_capacity: u32::try_from(ring(d::STORAGE_FORWARDED_DIRTY_CAPACITY))?
-                .try_into()?,
-            peer_capacity: fit(d::STORAGE_PEER_CAPACITY, sizing.max_running_nodes).try_into()?,
-            ..Settings::default()
-        };
-        let (gossip, cells) = settings.validate()?;
+        let (gossip, cells) = settings(sizing)?.validate()?;
         Ok(Self {
             world: Rc::clone(world),
             keys: Rc::clone(keys),

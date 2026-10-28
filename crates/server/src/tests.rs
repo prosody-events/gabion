@@ -754,6 +754,54 @@ fn under_limit_populates_descriptor_status_fields() {
     });
 }
 
+/// When two rules match, the status reports the one the client is closest to
+/// tripping, and on a tie the one declared first.
+#[test]
+fn allow_reports_the_tightest_rule_and_the_first_on_a_tie() {
+    run_local(async {
+        let rule = |id, value: &str, limit, bucket_millis| {
+            Rule::new(
+                id,
+                "api",
+                vec![DescriptorPattern {
+                    key: "tenant".into(),
+                    value: value.into(),
+                }],
+                limit,
+                1_000,
+                bucket_millis,
+                EnforcementMode::Enforce,
+            )
+        };
+        // The first rule's buckets are 100 ms and the second's 200 ms, so the
+        // reset says which rule the status reports.
+        for (first, second, expected) in [(10, 5, (4, 200)), (5, 10, (4, 100)), (5, 5, (4, 100))] {
+            let rules = vec![rule(1, "*", first, 100), rule(2, "a", second, 200)];
+            let harness = harness_with(rules, validated(|_| {}).1.cardinality).await;
+            let response = harness
+                .limiter
+                .should_rate_limit_at(
+                    RateLimitRequest {
+                        domain: "api".into(),
+                        descriptors: vec![descriptor([("tenant", "a")])],
+                        hits_addend: 1,
+                    },
+                    0,
+                )
+                .await;
+            let status = response.statuses.first().expect("one status");
+            let reset = status.duration_until_reset.as_ref().expect("allow reset");
+            let reset_millis = reset.seconds as u64 * 1_000 + reset.nanos as u64 / 1_000_000;
+            assert_eq!(
+                (status.limit_remaining, reset_millis),
+                expected,
+                "limits {first} then {second}"
+            );
+            let _ = harness.client.shutdown().await;
+        }
+    });
+}
+
 /// DryRun rule already past its limit must still emit an OK status with
 /// `limit_remaining = 0`, mirroring the nginx adapter's behaviour so the
 /// proxy fleet can graph "share that would have been 429'd".

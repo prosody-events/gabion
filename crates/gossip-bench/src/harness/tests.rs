@@ -164,6 +164,35 @@ fn discovery_ends_listing_exactly_the_surviving_pods() {
     }
 }
 
+/// The launcher's dirty rings never drop below production, and on a store
+/// larger than production's they keep production's ratio of ring to cells.
+#[test]
+fn launcher_scales_the_dirty_rings_with_the_cell_store() {
+    use gabion::defaults as d;
+    for (cells, scale) in [(16_384, 1), (4 * d::STORAGE_MAX_CELLS, 4)] {
+        let sizing = node::Sizing {
+            cell_capacity: cells as u32,
+            total_nodes: 3,
+            max_running_nodes: 3,
+            keys: 1,
+            tracked_keys: 1,
+            peak_offered_rps: 1.0,
+        };
+        let settings = adapter::settings(&sizing).expect("settings");
+        assert_eq!(
+            (
+                settings.local_dirty_capacity.get() as usize,
+                settings.forwarded_dirty_capacity.get() as usize
+            ),
+            (
+                scale * d::STORAGE_LOCAL_DIRTY_CAPACITY,
+                scale * d::STORAGE_FORWARDED_DIRTY_CAPACITY
+            ),
+            "{cells} cells"
+        );
+    }
+}
+
 /// A tiny regime on cell stores far smaller than its keys need: every node
 /// rejects cells, so the run is invalid.
 fn starved_run() -> StudyResult {

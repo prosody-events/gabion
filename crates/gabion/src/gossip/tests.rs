@@ -2344,8 +2344,12 @@ async fn threshold_trigger_fires_before_heartbeat() {
             let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
             let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
-            // rule_limit=100, N=2 peers, target=100 bps =>
-            // ε = max(1, 100*100/(10000*2)) = 1. First hit puts pending=1
+            // A tokio interval's first tick is immediate: let both runtimes
+            // spend it while nothing is dirty, so it cannot deliver the hits.
+            sim_advance_ticks(Duration::from_millis(10), 1).await;
+
+            // rule_limit=100, N=1 peer, target=100 bps =>
+            // ε = max(1, 100*100/(10000*1)) = 1. First hit puts pending=1
             // (not yet > 1). Subsequent hits cross the budget.
             //
             // The rule has to be interned first or the threshold path is
