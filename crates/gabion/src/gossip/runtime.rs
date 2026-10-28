@@ -842,7 +842,8 @@ where
             ),
             None => Packets::<C>::unauth(header, store, frame_handles, scratch, config.wire_limits),
         }?;
-        outbox.send_frame(packets, dst, transport, counters)
+        outbox.send_frame(packets, dst, transport, counters);
+        Ok(())
     }
 }
 

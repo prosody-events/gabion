@@ -1143,7 +1143,7 @@ fn bench_wire(c: &mut Criterion) {
                 limits,
             )
             .expect("ctor");
-            while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
+            while let Some(pkt) = packets.next_into(&mut buf) {
                 black_box(pkt);
                 black_box(buf.as_bytes());
             }
@@ -1175,7 +1175,7 @@ fn bench_wire(c: &mut Criterion) {
         )
         .expect("ctor");
         let mut n_packets = 0;
-        while packets.next_into(&mut buf).expect("encode").is_some() {
+        while packets.next_into(&mut buf).is_some() {
             n_packets += 1;
         }
         assert!(
@@ -1197,7 +1197,7 @@ fn bench_wire(c: &mut Criterion) {
                 multi_limits,
             )
             .expect("ctor");
-            while let Some(pkt) = packets.next_into(&mut buf).expect("encode") {
+            while let Some(pkt) = packets.next_into(&mut buf) {
                 black_box(pkt);
                 black_box(buf.as_bytes());
             }
@@ -1223,7 +1223,6 @@ fn bench_wire(c: &mut Criterion) {
         .expect("preflight ctor");
         let packet = packets
             .next_into(&mut preflight_buf)
-            .expect("preflight encode")
             .expect("at least one packet");
         // 128 cells fits in the default 256 KiB budget, so it's one packet.
         assert_eq!(packet.cells_emitted, 128);

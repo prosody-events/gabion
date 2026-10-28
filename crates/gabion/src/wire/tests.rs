@@ -165,7 +165,7 @@ impl CellKey {
 /// `PacketBuf`.
 fn drain_packets<C: Count>(mut packets: Packets<'_, C>, buf: &mut PacketBuf) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    while packets.next_into(buf).expect("encode").is_some() {
+    while packets.next_into(buf).is_some() {
         out.push(buf.as_bytes().to_vec());
     }
     out
@@ -453,7 +453,6 @@ fn packet_cells_is_what_one_packet_carries() {
                 .expect("ctor");
         packets
             .next_into(&mut buf)
-            .expect("encode")
             .expect("one packet")
             .cells_emitted as usize
     }
@@ -492,7 +491,7 @@ fn flag_more_unset_on_only_packet() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        let pkt = packets.next_into(&mut buf).expect("some");
         assert_eq!(pkt.flags & FLAG_MORE, 0);
         assert_eq!(pkt.cells_emitted, handles.len() as u32);
     }
@@ -540,7 +539,7 @@ fn decoder_rejects_bad_slot() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        let pkt = packets.next_into(&mut buf).expect("some");
         assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
     let mut frame = buf.as_bytes().to_vec();
@@ -581,7 +580,7 @@ fn decoder_rejects_truncated_dict() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        let pkt = packets.next_into(&mut buf).expect("some");
         assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
     let mut frame = buf.as_bytes().to_vec();
@@ -632,7 +631,7 @@ fn empty_handles_emits_zero_packets() {
     let mut buf = PacketBuf::for_limits(limits);
     let mut packets =
         Packets::<u32>::unauth(sample_header(), &store, &[], &mut scratch, limits).expect("ctor");
-    assert!(packets.next_into(&mut buf).expect("encode").is_none());
+    assert!(packets.next_into(&mut buf).is_none());
 }
 
 #[test]
@@ -654,7 +653,7 @@ fn count_width_mismatch_is_rejected() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        let pkt = packets.next_into(&mut buf).expect("some");
         assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
     let mut obs = ObservationBatch::<u64>::with_capacity(1);
@@ -681,7 +680,7 @@ fn visitor_accept_header_short_circuit() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        let pkt = packets.next_into(&mut buf).expect("some");
         assert_eq!(pkt.cells_emitted, 1);
     }
     let mut visited = 0_usize;
@@ -729,7 +728,7 @@ fn body_len_mismatch_reported() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        let pkt = packets.next_into(&mut buf).expect("some");
         assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
     let mut frame = buf.as_bytes().to_vec();
@@ -770,7 +769,7 @@ fn header_flags_track_auth() {
             limits,
         )
         .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        let pkt = packets.next_into(&mut buf).expect("some");
         assert_eq!(pkt.flags & FLAG_AUTHENTICATED, FLAG_AUTHENTICATED);
         assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
@@ -812,7 +811,7 @@ fn auth_visit_works() {
             limits,
         )
         .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        let pkt = packets.next_into(&mut buf).expect("some");
         assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
 
@@ -845,7 +844,7 @@ fn visitor_matches_allocating_for_curated_rows() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        let pkt = packets.next_into(&mut buf).expect("some");
         assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
 

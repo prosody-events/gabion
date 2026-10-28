@@ -18,7 +18,7 @@ use super::admin::GossipCounters;
 use crate::crdt::Count;
 use crate::settings::Setting;
 use crate::throttle;
-use crate::wire::{EncodeError, PacketBuf, Packets};
+use crate::wire::{PacketBuf, Packets};
 
 /// Bidirectional datagram transport. The runtime borrows `&self.transport`
 /// (not `&mut`) on every arm so disjoint-field borrows compose cleanly inside
@@ -89,11 +89,10 @@ impl Outbox {
         dst: SocketAddr,
         transport: &T,
         counters: &mut GossipCounters,
-    ) -> Result<(), EncodeError> {
-        while self.held.is_none() && packets.next_into(&mut self.packet)?.is_some() {
+    ) {
+        while self.held.is_none() && packets.next_into(&mut self.packet).is_some() {
             self.send(dst, transport, counters);
         }
-        Ok(())
     }
 
     /// Send the held packet, if any; a refusal holds it again.

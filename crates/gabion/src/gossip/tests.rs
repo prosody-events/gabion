@@ -2123,7 +2123,8 @@ fn assert_logged(logs: &str, code: &str, count: usize, fields: &[&str]) {
     }
 }
 
-/// Twelve requests at one instant against a rule whose error budget is one
+/// A heartbeat that sends one packet (held, if the socket refuses it), then
+/// twelve requests at one instant against a rule whose error budget is one
 /// hit (limit 100), then the snapshot. The third request crosses the budget
 /// with no emit yet; if that round settles, every later crossing falls inside
 /// the 5 ms emit floor, so one threshold round runs.
@@ -2131,6 +2132,8 @@ async fn threshold_rounds_in_a_burst(peers: Vec<SocketAddr>, refuse: bool) -> Ad
     let wire = Rc::new(Wire::default());
     wire.refuse.set(refuse);
     let (client, admin, _runtime) = mocked(&wire, peers, store_for(node(0xA)), |_| {}).await;
+    hit(&client, 1).await;
+    heartbeats(1).await;
     for _ in 0..12 {
         client
             .record(0xC0DE, KeyHash(9), 0, 1, 100, 10)
@@ -2148,14 +2151,15 @@ fn lone_node_settles_the_error_budget() {
     assert_eq!(snapshot.threshold_fires, 1);
 }
 
-/// A round cut by a refused send still settles and stamps the emit floor, so
-/// a blocked socket does not turn every later request into another threshold
-/// round (and another refused retry).
+/// A round that falls due while a packet is held still settles and stamps
+/// the emit floor, so a blocked socket does not turn every later request into
+/// another threshold round (and another refused retry).
 #[test]
 fn blocked_socket_does_not_fire_a_threshold_round_per_request() {
     let snapshot = run_paused(threshold_rounds_in_a_burst(vec![sock(2)], true));
     assert_eq!(snapshot.threshold_fires, 1);
-    assert_eq!(snapshot.counters.send_blocked, 1);
+    // The heartbeat's refusal, then the threshold round's refused retry.
+    assert_eq!(snapshot.counters.send_blocked, 2);
 }
 
 /// A refused packet is held and retried first on every later round,

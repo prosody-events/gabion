@@ -246,14 +246,12 @@ impl<'a, C: Count> Packets<'a, C> {
         })
     }
 
-    /// Encode the next packet into `buf`. The encoder clears `buf` first.
-    ///
-    /// - `Ok(Some(p))` — one packet ready; send `buf.as_bytes()`.
-    /// - `Ok(None)` — iterator exhausted.
-    pub fn next_into(&mut self, buf: &mut PacketBuf) -> Result<Option<PacketWritten>, EncodeError> {
+    /// Encode the next packet into `buf`, or return `None` once every handle
+    /// is consumed. The encoder clears `buf` first.
+    pub fn next_into(&mut self, buf: &mut PacketBuf) -> Option<PacketWritten> {
         buf.inner.clear();
         if self.cursor >= self.handles.len() {
-            return Ok(None);
+            return None;
         }
 
         let auth_overhead = if self.key.is_some() { AUTH_TAG_LEN } else { 0 };
@@ -274,12 +272,12 @@ impl<'a, C: Count> Packets<'a, C> {
         );
 
         // A stale-only run with no emitted cells advances the cursor and
-        // emits an empty packet — but only if the dropped handles are real.
-        // If we made zero progress (no drops, no cells), the budget is too
-        // tight for even a minimal cell; constructor-time validation should
-        // have caught this. Bail rather than spin.
-        if encoded.cells_emitted == 0 && encoded.handles_consumed == 0 {
-            return Err(EncodeError::BudgetTooSmall);
+        // emits an empty packet. The constructor checked that one cell fits
+        // an empty packet, so every call consumes a handle; stop rather than
+        // spin if that ever breaks.
+        debug_assert!(encoded.handles_consumed > 0);
+        if encoded.handles_consumed == 0 {
+            return None;
         }
 
         let next_cursor = self.cursor + encoded.handles_consumed;
@@ -318,11 +316,11 @@ impl<'a, C: Count> Packets<'a, C> {
         debug_assert!(buf.inner.len() <= self.limits.max_payload_bytes);
 
         self.cursor = next_cursor;
-        Ok(Some(PacketWritten {
+        Some(PacketWritten {
             cells_emitted: encoded.cells_emitted,
             cells_dropped: encoded.cells_dropped,
             flags,
-        }))
+        })
     }
 }
 
