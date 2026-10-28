@@ -1,0 +1,70 @@
+use std::net::Ipv6Addr;
+
+use quickcheck_macros::quickcheck;
+
+use super::*;
+use crate::crdt::NodeId;
+
+/// Twice the capacity: inserts collide, removes hit and the table fills.
+const POOL: u8 = 16;
+const CAPACITY: usize = 8;
+
+/// Both families, so both arms of `addr_hash` run.
+fn addr(i: u8) -> SocketAddr {
+    if i.is_multiple_of(2) {
+        SocketAddr::from(([10, 0, 0, i], 9000))
+    } else {
+        SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, u16::from(i)), 9000))
+    }
+}
+
+/// After any mix of inserts, removes, swaps and identity updates, `find`
+/// returns exactly the row a linear scan finds, and the rows hold exactly the
+/// model's peers with their identities.
+#[quickcheck]
+fn peer_table_index_matches_linear_scan(ops: Vec<(u8, u8, u8)>) {
+    let capacity = NonZeroU16::new(CAPACITY as u16).unwrap();
+    let mut table = PeerTable::with_capacity(capacity);
+    let mut model: Vec<(SocketAddr, Option<NodeIdentity>)> = Vec::new();
+    for (op, x, y) in ops {
+        let a = addr(x % POOL);
+        match op % 4 {
+            0 => {
+                let expected = if model.iter().any(|p| p.0 == a) {
+                    Insert::Present
+                } else if model.len() == CAPACITY {
+                    Insert::Full
+                } else {
+                    model.push((a, None));
+                    Insert::Added
+                };
+                assert_eq!(table.insert(a), expected);
+            }
+            1 => {
+                let had = model.iter().any(|p| p.0 == a);
+                model.retain(|p| p.0 != a);
+                assert_eq!(table.remove(a), had);
+            }
+            2 if table.len() > 0 => {
+                table.swap(usize::from(x) % table.len(), usize::from(y) % table.len())
+            }
+            3 => {
+                let identity = NodeIdentity::new(NodeId(u128::from(y)), 1);
+                table.set_identity(a, identity);
+                if let Some(p) = model.iter_mut().find(|p| p.0 == a) {
+                    p.1 = Some(identity);
+                }
+            }
+            _ => {}
+        }
+        for i in 0..POOL {
+            let a = addr(i);
+            let scan = (0..table.len()).find(|&row| table.addr(row) == a);
+            assert_eq!(table.find(a), scan, "{a}");
+        }
+        let mut rows: Vec<_> = table.rows().collect();
+        rows.sort_by_key(|p| p.0);
+        model.sort_by_key(|p| p.0);
+        assert_eq!(rows, model);
+    }
+}

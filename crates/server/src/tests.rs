@@ -100,7 +100,6 @@ fn rule_tenant(limit: u64) -> Rule {
 fn validated(tune: impl FnOnce(&mut Settings)) -> (ValidGossipConfig, ValidStorageConfig) {
     let mut settings = Settings {
         max_cells: 256.try_into().unwrap(),
-        node_dictionary_capacity: 32.try_into().unwrap(),
         local_dirty_capacity: 64.try_into().unwrap(),
         forwarded_dirty_capacity: 64.try_into().unwrap(),
         rng_seed: Some(1),

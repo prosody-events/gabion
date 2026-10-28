@@ -116,7 +116,6 @@ data:
     admin_bind: 0.0.0.0:9090
     storage:
       max_cells: 4096
-      node_dictionary_capacity: 256
       local_dirty_capacity: 2048
       forwarded_dirty_capacity: 8192
       max_descriptor_count: 16

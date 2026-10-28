@@ -15,7 +15,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::num::{NonZeroU32, NonZeroU128, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU128, NonZeroUsize};
 use std::time::Duration;
 
 use crate::defaults;
@@ -27,6 +27,7 @@ mod client;
 mod clock;
 #[cfg(test)]
 mod mock;
+mod peer;
 mod runtime;
 pub mod sim;
 mod store;
@@ -57,6 +58,9 @@ pub struct ValidGossipConfig {
     pub(crate) cluster_id_hash: NonZeroU128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
+    /// Rows of the runtime's peer table, `gossip.peer_capacity`; a peer
+    /// discovery reports past it is declined and logged as `peer_table_full`.
+    pub(crate) peer_capacity: NonZeroU16,
     /// Floor on the number of peers contacted per gossip tick. The runtime
     /// scales the actual per-tick fanout to the coverage threshold
     /// `⌈ln(n) + c⌉` (`n` = live peer count, `c` =

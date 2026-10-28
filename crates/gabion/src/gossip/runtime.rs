@@ -6,7 +6,7 @@
 //! whatever rows the arm produced, and once more per full expiry batch. The
 //! runtime owns the [`CellStore`], pre-allocated scratch buffers, one packet
 //! buffer, and the peer table; the request and packet arms reuse those
-//! buffers; peer churn and admin commands may allocate.
+//! buffers; admin commands may allocate.
 
 use std::io;
 use std::marker::PhantomData;
@@ -29,18 +29,12 @@ use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
+use super::peer::{Insert, PeerTable};
 use super::store::AggregateStore;
 #[cfg(feature = "transport-udp")]
 use super::transport::UdpTransport;
 use super::transport::{GossipTransport, Outbox};
 use super::{GossipError, ValidGossipConfig};
-
-/// One peer the runtime gossips with. `node_id` is `None` until we receive
-/// our first inbound packet from this peer.
-struct Peer {
-    addr: SocketAddr,
-    node_id: Option<NodeId>,
-}
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
 pub struct GossipRuntime<S, T, K>
@@ -72,7 +66,7 @@ where
     frame_handles: Vec<CellHandle>,
     outbox: Outbox,
 
-    peers: Vec<Peer>,
+    peers: PeerTable,
     rng: SplitMix64,
 
     // Pending reply for the in-flight limit request. Sent after the
@@ -194,7 +188,7 @@ where
     pub fn from_parts_with_admin(
         transport: T,
         clock: K,
-        config: ValidGossipConfig,
+        mut config: ValidGossipConfig,
         store: CellStore,
         aggregates: S,
         admin_rx: Option<mpsc::Receiver<AdminCommand>>,
@@ -212,22 +206,15 @@ where
         let expiration_buf = ExpirationSink::with_capacity(defaults::GOSSIP_EXPIRATION_BATCH);
         let outbox = Outbox::new(&config);
 
-        let peers: Vec<Peer> = config
-            .bootstrap_peers
-            .iter()
-            .copied()
-            .map(|addr| Peer {
-                addr,
-                node_id: None,
-            })
-            .collect();
+        let bootstrap = std::mem::take(&mut config.bootstrap_peers);
+        let peers = PeerTable::with_capacity(config.peer_capacity);
         let rng = SplitMix64::new(config.rng_seed);
 
         let rule_capacity = store.rule_dictionary().capacity() as usize;
         let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
         let rule_last_emit_ms = vec![0_u64; rule_capacity].into_boxed_slice();
 
-        let runtime = Self {
+        let mut runtime = Self {
             config,
             store,
             transport,
@@ -257,6 +244,9 @@ where
             last_error_budget: 0,
             _not_send: PhantomData,
         };
+        for addr in bootstrap {
+            runtime.add_peer(addr);
+        }
         let client = GossipClient::new(req_tx);
         (runtime, client)
     }
@@ -438,9 +428,7 @@ where
         // Every data kind merges the same way; header-only kinds carry no
         // cells.
         self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
-        if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
-            peer.node_id = Some(header.sender.node_id);
-        }
+        self.peers.set_identity(src, header.sender);
     }
 
     /// Count a dropped packet against its cause, and log at powers of two of
@@ -551,10 +539,10 @@ where
                     local_identity: self.store.local_identity(),
                     peers: self
                         .peers
-                        .iter()
-                        .map(|p| PeerEntry {
-                            addr: p.addr,
-                            node_id: p.node_id,
+                        .rows()
+                        .map(|(addr, identity)| PeerEntry {
+                            addr,
+                            node_id: identity.map(|identity| identity.node_id),
                         })
                         .collect(),
                     store_stats: self.store.stats(),
@@ -620,26 +608,45 @@ where
 
     fn handle_peer_event(&mut self, evt: PeerEvent) {
         match evt {
-            PeerEvent::Added(p) => {
-                if !self.peers.iter().any(|x| x.addr == p.addr) {
-                    self.peers.push(Peer {
-                        addr: p.addr,
-                        node_id: None,
-                    });
-                    tracing::info!(
-                        peer = %p.addr,
-                        cluster_size = self.peers.len(),
-                        "Peer joined the cluster.",
-                    );
-                }
-            }
+            PeerEvent::Added(p) => self.add_peer(p.addr),
             PeerEvent::Removed(p) => {
-                if let Some(pos) = self.peers.iter().position(|x| x.addr == p.addr) {
-                    self.peers.remove(pos);
+                if self.peers.remove(p.addr) {
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
                         "Peer left the cluster.",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Add a peer to the table: a known one is ignored, and past
+    /// `gossip.peer_capacity` it is declined, its packets still merged.
+    fn add_peer(&mut self, addr: SocketAddr) {
+        match self.peers.insert(addr) {
+            Insert::Added => tracing::info!(
+                peer = %addr,
+                cluster_size = self.peers.len(),
+                "Peer joined the cluster.",
+            ),
+            Insert::Present => {}
+            Insert::Full => {
+                if let Some(declined_total) = throttle::bump(&mut self.counters.peers_declined) {
+                    let capacity = self.config.peer_capacity;
+                    tracing::warn!(
+                        code = "peer_table_full",
+                        peer = %addr,
+                        capacity,
+                        declined_total,
+                        config_key = Setting::GossipPeerCapacity.yaml_key(),
+                        "This node's peer table is full ({capacity} peers), so it ignored a new \
+                         peer, {addr}, reported by discovery. This node does not send its counts \
+                         to {addr}, so limits enforced at {addr} under-count this node's traffic \
+                         and allow requests over the limit; counts {addr} sends here are still \
+                         merged. The cluster has grown past the table. Raise {} above the \
+                         cluster's pod count; each slot costs about 100 bytes.",
+                        Setting::GossipPeerCapacity,
                     );
                 }
             }
@@ -687,7 +694,7 @@ where
     /// Send this round's frames, stopping at the first packet the kernel
     /// refuses. A round that falls due while a packet is held sends nothing.
     fn gossip(&mut self) {
-        if self.outbox.is_held() || self.store.is_empty() || self.peers.is_empty() {
+        if self.outbox.is_held() || self.store.is_empty() || self.peers.len() == 0 {
             return;
         }
 
@@ -702,8 +709,8 @@ where
         // `self.peers` in place. With-replacement sampling would silently
         // break Demers' O(log N) convergence bound — selecting the same peer
         // twice in one tick encodes and sends the same frame twice.
-        // `self.peers` has no ordering contract elsewhere (lookups are by
-        // `addr`), so shuffling is free.
+        // Rows have no order, and `PeerTable::swap` keeps the address index
+        // exact, so shuffling them is free.
         //
         // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
         // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`
@@ -735,7 +742,7 @@ where
         }
 
         for peer_idx in 0..pick_count {
-            let peer_addr = self.peers[peer_idx].addr;
+            let peer_addr = self.peers.addr(peer_idx);
             self.store.fill_gossip_frame(
                 self.config.max_cells_per_tick.get(),
                 &mut self.frame_handles,

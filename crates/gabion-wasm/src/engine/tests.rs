@@ -679,11 +679,13 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
         small.forwarded_dirty_capacity,
         full.forwarded_dirty_capacity
     );
-    assert_eq!(
-        small.node_dictionary_capacity,
-        full.node_dictionary_capacity
-    );
+    assert_eq!(small.peer_capacity, full.peer_capacity);
 
+    let node_dictionary_capacity = full
+        .validate()
+        .expect("full settings validate")
+        .1
+        .node_dictionary_capacity();
     let caps = full;
     // Each origin holds its live buckets plus the one emerging, and every node
     // holds a replica of every origin's set — so the cell store must cover
@@ -704,9 +706,8 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
     // the slack is only a couple of slots) without truncating to a u16 below
     // it.
     assert!(
-        usize::from(caps.node_dictionary_capacity.get()) >= MAX_NODES,
-        "node_dictionary_capacity {} cannot hold {MAX_NODES} origins",
-        caps.node_dictionary_capacity,
+        usize::from(node_dictionary_capacity.get()) >= MAX_NODES,
+        "node_dictionary_capacity {node_dictionary_capacity} cannot hold {MAX_NODES} origins",
     );
 
     // …and the shrink is real: even at the ceiling every cap is a few thousand

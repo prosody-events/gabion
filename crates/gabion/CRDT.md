@@ -782,7 +782,7 @@ The cell store takes a `ValidStorageConfig`, which only `Settings::validate` (`g
 |-----------------------------------------|--------------------------------------|----------------------------------------|
 | `cell_capacity`                         | `storage.max_cells`                  | `STORAGE_MAX_CELLS` = 131,072          |
 | `rule_dictionary_capacity`              | `storage.rule_dictionary_capacity`   | `max(STORAGE_RULE_DICTIONARY_FLOOR` = 256`, 2 × rules)`, resolved by `RuleTable::new` |
-| `node_dictionary_capacity`              | `storage.node_dictionary_capacity`   | `STORAGE_NODE_DICTIONARY_CAPACITY` = 1,024 |
+| `node_dictionary_capacity`              | `storage.node_dictionary_capacity`   | twice `gossip.peer_capacity` (`GOSSIP_PEER_CAPACITY` = 512), 1,024 |
 | `local_dirty_capacity`                  | `storage.local_dirty_capacity`       | `STORAGE_LOCAL_DIRTY_CAPACITY` = 65,536 |
 | `forwarded_dirty_capacity`              | `storage.forwarded_dirty_capacity`   | `STORAGE_FORWARDED_DIRTY_CAPACITY` = 524,288 |
 

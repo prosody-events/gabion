@@ -236,6 +236,7 @@ the root README's
 [Running across a cluster](../../README.md#running-across-a-cluster).
 The `gabiond` YAML keys are `gossip.bind` (UDP `host:port`),
 `gossip.cluster_id_hash` (non-zero u128 shared across peers),
+`gossip.peer_capacity` (the most peers a node tracks, default 512),
 `discovery.namespace_allow` / `discovery.service_allow` (Kubernetes
 EndpointSlice filters), and `discovery.self_addr` (this pod's own
 `host:port` from `POD_IP`, excluded from the peer set). Discovery needs

@@ -22,7 +22,7 @@ pub(super) fn hash_compact_cell_key(key: &CompactCellKey) -> u64 {
 }
 
 #[inline(always)]
-pub(super) fn hash_fingerprint(fingerprint: u128) -> u64 {
+pub(crate) fn hash_fingerprint(fingerprint: u128) -> u64 {
     let lo = fingerprint as u64;
     let hi = (fingerprint >> 64) as u64;
     mix64(lo) ^ mix64(hi.wrapping_add(0x517C_C1B7_2722_0A95))

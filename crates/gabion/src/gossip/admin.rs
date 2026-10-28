@@ -106,6 +106,9 @@ pub struct GossipCounters {
     /// Packets dropped for another cluster id; logged as `decode_rejected`
     /// with `reason = "cluster"`.
     pub decode_rejects_cluster: u64,
+    /// Peers discovery reported while the peer table was full; logged as
+    /// `peer_table_full`.
+    pub peers_declined: u64,
 }
 
 impl GossipCounters {

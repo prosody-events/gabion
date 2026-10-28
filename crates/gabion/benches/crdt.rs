@@ -38,8 +38,14 @@
 //!   buckets, 95% for a key active in the window, 5% for a key never seen.
 //! * `aggregate/apply_one_second`  — the table's writer for one second of that
 //!   traffic: 650 inserts plus 650 expiries.
+//!
+//! * `inbound/peer_lookup`         — a node with 300 peers takes a 2-cell
+//!   packet from each in turn, through the public runtime.
 
+use std::cell::Cell;
 use std::hint::black_box;
+use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -51,7 +57,7 @@ use gabion::crdt::{
     RuleSlot, ValidStorageConfig,
 };
 use gabion::defaults::{GOSSIP_EXPIRATION_BATCH, GOSSIP_MAX_PAYLOAD_BYTES};
-use gabion::gossip::AggregateStore;
+use gabion::gossip::{AggregateStore, FixedClock, GossipRuntime, GossipTransport};
 use gabion::rules::{EnforcementMode, RuleDef, RuleSpec, RuleTable};
 use gabion::settings::Settings;
 
@@ -144,7 +150,8 @@ fn config() -> ValidStorageConfig {
     let settings = Settings {
         max_cells: CELL_CAPACITY.try_into().expect(nz),
         rule_dictionary_capacity: Some(RULE_CAPACITY.try_into().expect(nz)),
-        node_dictionary_capacity: NODE_CAPACITY.try_into().expect(nz),
+        node_dictionary_capacity: Some(NODE_CAPACITY.try_into().expect(nz)),
+        peer_capacity: (NODE_CAPACITY - 1).try_into().expect(nz),
         local_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
         forwarded_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
         ..Settings::default()
@@ -1370,6 +1377,111 @@ fn bench_aggregate(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// inbound — the runtime's per-packet path with a production-sized peer table.
+// ---------------------------------------------------------------------------
+
+const PEERS: u16 = 300;
+const INBOUND_PACKETS: usize = 3_000;
+
+/// Hands the runtime one copy of `packet` per call, each from the next peer,
+/// and fails after `left` calls so `run` returns.
+struct Replay {
+    packet: Box<[u8]>,
+    left: Cell<usize>,
+}
+
+impl GossipTransport for Replay {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(peer_addr(PEERS))
+    }
+
+    fn try_send_to(&self, buf: &[u8], _dst: SocketAddr) -> io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let left = self
+            .left
+            .get()
+            .checked_sub(1)
+            .ok_or(io::ErrorKind::UnexpectedEof)?;
+        self.left.set(left);
+        buf[..self.packet.len()].copy_from_slice(&self.packet);
+        Ok((self.packet.len(), peer_addr(left as u16 % PEERS)))
+    }
+}
+
+fn peer_addr(i: u16) -> SocketAddr {
+    SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 9000))
+}
+
+fn bench_inbound(c: &mut Criterion) {
+    let nz = "bench capacities are non-zero";
+    let settings = Settings {
+        max_cells: CELL_CAPACITY.try_into().expect(nz),
+        local_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
+        forwarded_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
+        cluster_id_hash: wire_header().cluster_id_hash,
+        ..Settings::default()
+    };
+    let (mut gossip, storage) = settings.validate().expect("bench settings validate");
+    gossip.bootstrap_peers = (0..PEERS).map(peer_addr).collect();
+    let rules = rules(1, "100r/s", Duration::from_secs(1), &storage);
+
+    // The packet: two cells of the bench rule, sent by `local_identity()`.
+    let mut sender = CellStore::new(storage, local_identity(), &rules);
+    let fingerprint = rules.rules()[0].fingerprint();
+    let mut obs = ObservationBatch::with_capacity(2);
+    for key in [1, 2] {
+        obs.push(obs_row(
+            fingerprint,
+            KeyHash(key),
+            0,
+            LOCAL_NODE,
+            LOCAL_INCARNATION,
+            1,
+            1,
+        ));
+    }
+    sender.ingest_local(&obs, &mut DeltaSink::with_capacity(2));
+    let mut handles = Vec::with_capacity(2);
+    sender.fill_gossip_frame(2, &mut handles);
+    let limits = FrameLimits::new(GOSSIP_MAX_PAYLOAD_BYTES).expect("default payload");
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut scratch = WireScratch::for_store(&sender);
+    let mut packets = Packets::new(wire_header(), &sender, &handles, &mut scratch, limits);
+    assert_eq!(packets.next_into(&mut buf), Some(2));
+    let packet: Box<[u8]> = buf.as_bytes().into();
+
+    let tokio = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("tokio runtime");
+    let mut group = c.benchmark_group("inbound");
+    group.throughput(Throughput::Elements(INBOUND_PACKETS as u64));
+    group.bench_function(BenchmarkId::new("peer_lookup", PEERS), |b| {
+        b.iter_batched(
+            || {
+                GossipRuntime::from_parts(
+                    Replay {
+                        packet: packet.clone(),
+                        left: Cell::new(INBOUND_PACKETS),
+                    },
+                    FixedClock::new(1),
+                    gossip.clone(),
+                    CellStore::new(storage, NodeIdentity::new(peer_node(0), 1), &rules),
+                    Aggregate::new(&storage),
+                )
+            },
+            // Holding the client keeps the request arm pending, so `run`
+            // serves every packet instead of shutting down.
+            |(runtime, _client)| tokio.block_on(runtime.run(futures::stream::empty())),
+            BatchSize::LargeInput,
+        )
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_ingest_local,
@@ -1380,5 +1492,6 @@ criterion_group!(
     bench_expire,
     bench_wire,
     bench_aggregate,
+    bench_inbound,
 );
 criterion_main!(benches);

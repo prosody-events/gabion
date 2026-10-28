@@ -48,7 +48,8 @@ pub(crate) use dictionary::MAX_DICTIONARY_CAPACITY;
 pub(crate) use dictionary::pow2_index_capacity_for;
 use dirty_ring::ring_entry_at;
 use hash::hash_compact_cell_key;
-use index::CellIndex;
+pub(crate) use hash::hash_fingerprint;
+pub(crate) use index::CellIndex;
 
 use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
@@ -201,6 +202,12 @@ impl ValidStorageConfig {
     /// against, and so the size of each admission scratch.
     pub fn max_matched_rules(&self) -> NonZeroUsize {
         self.max_matched_rules.into()
+    }
+
+    /// The node dictionary's capacity: `storage.node_dictionary_capacity`, or
+    /// twice `gossip.peer_capacity` by default.
+    pub fn node_dictionary_capacity(&self) -> NonZeroU16 {
+        self.node_dictionary_capacity
     }
 }
 
@@ -497,7 +504,7 @@ impl CellStore {
                  as a new instance until its data ages out). Counts from some peers are now \
                  being dropped, so cluster-wide rate limits will under-count requests handled \
                  by those peers. Raise {}; size it above pods × (1 + restarts within your \
-                 longest rule window).",
+                 longest rule window). The default is twice `gossip.peer_capacity`.",
                 Setting::StorageNodeDictionaryCapacity,
             );
         }

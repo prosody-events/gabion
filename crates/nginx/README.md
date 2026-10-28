@@ -500,6 +500,7 @@ they bound resource use.
 | `gabion_gossip_tick_interval DURATION`          | `500ms` | Heartbeat period. Shorter = faster convergence, more UDP traffic.                     |
 | `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet: 158 to 65,507. 158 bytes hold the header and one counter; 65,507 is the largest UDP payload over IPv4. |
 | `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells emitted across all packets in one tick.                                 |
+| `gabion_gossip_peer_capacity N`                 | `512`   | The most peers this node gossips with, 1 to 32,767, sized once at start, about 100 bytes a peer. Past it, a new peer is declined (`peer_table_full`) and its counts still merged. Also sets the node dictionary's default, twice it. |
 | `gabion_gossip_limit_queue_capacity N`          | `8192`  | Slots in the shared-memory request queue workers push counted hits onto for the leader, 64 to 1,048,576, rounded up to a power of two. Each slot is 72 bytes of the `gabion_limit_zone` SIZE, so raise SIZE with it. The default covers a 1.3 s leader handover at up to 6,300 counted hits a second per pod; raise it when the `queue_dropped` counter rises. A reload that changes it needs a new SIZE or a restart. |
 | `gabion_gossip_recv_buffer_bytes N`            | `4194304` | Receive buffer the gossip socket asks the kernel for, 65,536 to 1,073,741,823 bytes. The host's `net.core.rmem_max` caps it; `socket_buffer_capped` says when. See [Socket buffers](../gabion/README.md#socket-buffers). |
 | `gabion_gossip_send_buffer_bytes N`            | `1048576` | Send buffer the gossip socket asks the kernel for, 65,536 to 1,073,741,823 bytes. The host's `net.core.wmem_max` caps it; `send_blocked` warns when a round fills it. |
@@ -517,7 +518,7 @@ into the cap.
 |-------------------------------------------------|-------------|---------------------------------------------------------------------------------------|
 | `gabion_storage_max_cells N`                    | `131072`    | Total cell capacity in the CRDT.                                                      |
 | `gabion_storage_rule_dictionary_capacity N`     | twice the rules, at least `256` | Number of distinct rule slots (each unique `rule_fingerprint` interns into one slot). Set it only on `rule_dictionary_full`; below the number of rules fails `nginx -t`. |
-| `gabion_storage_node_dictionary_capacity N`     | `1024`      | Number of distinct (node_id, incarnation) slots.                                      |
+| `gabion_storage_node_dictionary_capacity N`     | twice `gabion_gossip_peer_capacity` (`1024`) | Number of distinct (node_id, incarnation) slots; must exceed `gabion_gossip_peer_capacity`. |
 | `gabion_storage_local_dirty_capacity N`         | `65536`     | Local dirty-ring capacity. Sized to absorb a burst between heartbeats.                |
 | `gabion_storage_forwarded_dirty_capacity N`     | `524288`    | Forwarded dirty-ring capacity. Sized larger because it tracks peer-originated edits we still owe other peers. |
 | `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare, up to 65,535.                           |

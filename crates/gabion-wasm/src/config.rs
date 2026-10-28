@@ -18,7 +18,7 @@ use crate::engine::{CLUSTER_ID_HASH, VIZ_MAX_CELLS_PER_TICK};
 
 /// Largest cluster the visualizer constructs. Bounded so a stray config from
 /// the URL or a fuzzed control can't ask the engine to build an unbounded
-/// number of runtimes; mirrors the gossip peer-table capacity floor.
+/// number of runtimes; every node's peer table is sized to it.
 pub const MAX_NODES: usize = 256;
 
 /// Deterministic given `(rng_seed, SimConfig, command-script)` — the same
@@ -215,10 +215,7 @@ impl SimConfig {
             // One watched rule; headroom for an interned default / wire-only
             // rule.
             (Setting::StorageRuleDictionaryCapacity, "4".to_owned()),
-            (
-                Setting::StorageNodeDictionaryCapacity,
-                (ceiling + SLACK).to_string(),
-            ),
+            (Setting::GossipPeerCapacity, ceiling.to_string()),
             // Local-origin dirty cells are this node's *own* live buckets —
             // independent of cluster size, so this stays small at any ceiling.
             (

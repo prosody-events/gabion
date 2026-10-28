@@ -279,7 +279,8 @@ fn capacity_outside_its_range_fails() {
             MAX_SOCKET_BUFFER_BYTES,
         ),
         (Setting::StorageRuleDictionaryCapacity, 1, 65_534),
-        (Setting::StorageNodeDictionaryCapacity, 1, 65_534),
+        (Setting::GossipPeerCapacity, 1, 32_767),
+        (Setting::StorageNodeDictionaryCapacity, 513, 65_534),
     ] {
         assert_eq!(capacity(setting, min), Ok(()), "{setting:?} {min}");
         assert_eq!(capacity(setting, max), Ok(()), "{setting:?} {max}");
@@ -313,6 +314,31 @@ fn capacity_outside_its_range_fails() {
          largest value marks an empty slot, so it holds at most 65,534 rules. Remove it to use \
          the default, twice the configured rules and at least 256."
     );
+    assert_eq!(
+        capacity(Setting::StorageNodeDictionaryCapacity, 512)
+            .unwrap_err()
+            .to_string(),
+        "`storage.node_dictionary_capacity` is 512; gabion supports 513 to 65534. Set it inside \
+         that range (`GABION_STORAGE_NODE_DICTIONARY_CAPACITY`; NGINX \
+         `gabion_storage_node_dictionary_capacity`). It must exceed `gossip.peer_capacity`, \
+         because every peer and this node need an entry, and its slots are numbered by a `u16` \
+         whose largest value marks an empty slot, so it holds at most 65,534. Remove it to use \
+         the default, twice `gossip.peer_capacity`."
+    );
+}
+
+/// The node dictionary defaults to twice the peer table; setting it wins.
+#[test]
+fn node_dictionary_defaults_to_twice_the_peer_table_and_honours_an_override() {
+    let nodes = |peers: &str, over: Option<&str>| {
+        let mut s = applied(Setting::GossipPeerCapacity, peers).unwrap();
+        if let Some(n) = over {
+            s.apply(Setting::StorageNodeDictionaryCapacity, n).unwrap();
+        }
+        s.validate().unwrap().1.node_dictionary_capacity().get()
+    };
+    assert_eq!(nodes("100", None), 200);
+    assert_eq!(nodes("100", Some("150")), 150);
 }
 
 /// The per-request bounds have no build-time cap: each takes any value its
@@ -407,9 +433,10 @@ fn defaults_validate_to_the_production_values() {
         storage.max_matched_rules().get(),
         usize::from(defaults::STORAGE_MAX_MATCHED_RULES)
     );
+    assert_eq!(gossip.peer_capacity.get(), defaults::GOSSIP_PEER_CAPACITY);
     assert_eq!(
         storage.node_dictionary_capacity.get(),
-        defaults::STORAGE_NODE_DICTIONARY_CAPACITY
+        2 * defaults::GOSSIP_PEER_CAPACITY
     );
     assert_eq!(
         storage.local_dirty_capacity.get() as usize,

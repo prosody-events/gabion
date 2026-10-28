@@ -7,7 +7,6 @@ pub const STORAGE_MAX_CELLS: usize = 131_072;
 /// Floor of the rule dictionary's default capacity, `max(256, 2 × rules)`;
 /// `storage.rule_dictionary_capacity` overrides it.
 pub const STORAGE_RULE_DICTIONARY_FLOOR: u16 = 256;
-pub const STORAGE_NODE_DICTIONARY_CAPACITY: u16 = 1024;
 pub const STORAGE_LOCAL_DIRTY_CAPACITY: usize = 65_536;
 pub const STORAGE_FORWARDED_DIRTY_CAPACITY: usize = 524_288;
 
@@ -37,6 +36,10 @@ pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 /// that the coverage threshold drops below it. At the shipped margin it never
 /// binds. See `handle_gossip_tick` in `gossip/runtime.rs`.
 pub const GOSSIP_FANOUT: usize = 3;
+
+/// Default of `gossip.peer_capacity`, the most peers one node gossips with:
+/// 300 pods with 1.7x headroom. The node dictionary's default is twice it.
+pub const GOSSIP_PEER_CAPACITY: u16 = 512;
 
 /// Coverage margin `c` in the gossip fanout law `⌈ln(n) + c⌉` (`n` = live peer
 /// count). Per Kermarrec, Massoulié & Ganesh (IEEE TPDS 2003, "Probabilistic

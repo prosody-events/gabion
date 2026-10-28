@@ -158,8 +158,9 @@ settings! {
          rules, at least 256";
     StorageNodeDictionaryCapacity => "storage.node_dictionary_capacity",
         "GABION_STORAGE_NODE_DICTIONARY_CAPACITY", "gabion_storage_node_dictionary_capacity";
-        node_dictionary_capacity: NonZeroU16 = nz!(defaults::STORAGE_NODE_DICTIONARY_CAPACITY),
-        "gabion could not count the hits of any node, not even this one";
+        node_dictionary_capacity: Option<NonZeroU16> = None,
+        "gabion could not count the hits of any node, not even this one; the default is twice \
+         `gossip.peer_capacity`";
     StorageLocalDirtyCapacity => "storage.local_dirty_capacity",
         "GABION_STORAGE_LOCAL_DIRTY_CAPACITY", "gabion_storage_local_dirty_capacity";
         local_dirty_capacity: NonZeroU32 = nz!(defaults::STORAGE_LOCAL_DIRTY_CAPACITY as u32),
@@ -203,6 +204,10 @@ settings! {
     GossipFanout => "gossip.fanout", "GABION_GOSSIP_FANOUT", "gabion_gossip_fanout";
         fanout: NonZeroUsize = nz!(defaults::GOSSIP_FANOUT),
         "each gossip round needs at least one peer to send to";
+    GossipPeerCapacity => "gossip.peer_capacity", "GABION_GOSSIP_PEER_CAPACITY",
+        "gabion_gossip_peer_capacity";
+        peer_capacity: NonZeroU16 = nz!(defaults::GOSSIP_PEER_CAPACITY),
+        "this node could not track any peer";
     GossipMaxPayloadBytes => "gossip.max_payload_bytes", "GABION_GOSSIP_MAX_PAYLOAD_BYTES",
         "gabion_gossip_max_payload_bytes";
         max_payload_bytes: usize = defaults::GOSSIP_MAX_PAYLOAD_BYTES;
@@ -291,13 +296,14 @@ impl Settings {
                 tick: self.tick_interval,
             });
         }
-        let dictionary = "Its slots are numbered by a `u16` whose largest value marks an empty \
-                          slot, so it holds at most 65,534 entries.";
         let socket = "The kernel doubles the request and keeps it in a C `int`, so it grants at \
                       most 1,073,741,823 bytes; below 64 KiB one burst of gossip packets \
                       overflows it. The host's `net.core.rmem_max` (receive) and \
                       `net.core.wmem_max` (send) cap what it grants; see \"Socket buffers\" in \
                       the gabion README.";
+        let node_dictionary_capacity = self
+            .node_dictionary_capacity
+            .unwrap_or(self.peer_capacity.saturating_mul(nz!(2)));
         let capacities = [
             (
                 Setting::StorageMaxCells,
@@ -339,11 +345,23 @@ impl Settings {
                  rules and at least 256.",
             ),
             (
-                Setting::StorageNodeDictionaryCapacity,
-                u64::from(self.node_dictionary_capacity.get()),
+                Setting::GossipPeerCapacity,
+                u64::from(self.peer_capacity.get()),
                 1,
+                u64::from(MAX_DICTIONARY_CAPACITY / 2),
+                "The node dictionary's default is twice this many origins, and its slots are \
+                 numbered by a `u16` whose largest value marks an empty slot, so it holds at most \
+                 65,534; a cluster larger than 32,767 pods is outside what gabion supports.",
+            ),
+            (
+                Setting::StorageNodeDictionaryCapacity,
+                u64::from(node_dictionary_capacity.get()),
+                u64::from(self.peer_capacity.get()) + 1,
                 MAX_DICTIONARY_CAPACITY.into(),
-                dictionary,
+                "It must exceed `gossip.peer_capacity`, because every peer and this node need an \
+                 entry, and its slots are numbered by a `u16` whose largest value marks an empty \
+                 slot, so it holds at most 65,534. Remove it to use the default, twice \
+                 `gossip.peer_capacity`.",
             ),
         ];
         for (setting, configured, min, max, reason) in capacities {
@@ -360,6 +378,7 @@ impl Settings {
         let gossip = ValidGossipConfig {
             cluster_id_hash: self.cluster_id_hash,
             bootstrap_peers: Vec::new(),
+            peer_capacity: self.peer_capacity,
             fanout: self.fanout,
             max_cells_per_tick: self.max_cells_per_tick,
             wire_limits,
@@ -376,7 +395,7 @@ impl Settings {
             cell_capacity: self.max_cells,
             rule_dictionary_capacity: self.rule_dictionary_capacity,
             max_matched_rules: self.max_matched_rules,
-            node_dictionary_capacity: self.node_dictionary_capacity,
+            node_dictionary_capacity,
             local_dirty_capacity: self.local_dirty_capacity,
             forwarded_dirty_capacity: self.forwarded_dirty_capacity,
             cardinality: CardinalityLimits {

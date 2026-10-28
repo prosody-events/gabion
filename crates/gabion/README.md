@@ -39,7 +39,7 @@ a DAG, so no module imports from a module that imports it.
 | `crdt`       | `src/crdt/*`                  | The per-origin counter store. Robin Hood hash index, structure-of-arrays columns, bounded dirty rings. Allocates only at construction. See [`CRDT.md`](CRDT.md). |
 | `rules`      | `src/rules/*`                 | `RuleDef::build` and `RuleTable::new`, the one way both adapters build rules; `Descriptor`, fingerprint and key hashing. Two nodes with the same rules produce identical `rule_fingerprint` values and key hashes, whatever order they list them in, which is what makes the CRDT addressable across the cluster. |
 | `aggregate`  | `src/aggregate.rs`            | The cluster-aggregate table both adapters read on admission: seqlocked slots, linear probing within 128 slots of home, backward-shift removal. NGINX lays it over shared memory; `gabiond` owns one as `Aggregate`, sized from `storage.max_cells`. |
-| `gossip`     | `src/gossip/*`                | `GossipRuntime`, `GossipClient`, `GossipTransport`, `Clock`, the `sim::SimTransport` used in tests, and the `AdminCommand` / `AdminSnapshot` observability surface. |
+| `gossip`     | `src/gossip/*`                | `GossipRuntime`, `GossipClient`, `GossipTransport`, `Clock`, the `sim::SimTransport` used in tests, the pre-sized peer table, and the `AdminCommand` / `AdminSnapshot` observability surface. |
 | `wire`       | `src/wire/*`                  | The on-the-wire codec. One UDP packet = header + rule dictionary + node dictionary + cell rows. Each packet decodes independently. |
 | `discovery`  | `src/discovery/*`             | `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation. Adapters consume `PeerEvent` streams; the gossip runtime treats peer add/remove as a normal `select!` arm. |
 | `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, fanout floor, payload caps, the per-rule error budget, and the min-emit floor. |
@@ -478,6 +478,15 @@ move together, and a bad value fails configuration load with the same
 message in both. See [`crates/server/README.md`](../server/README.md)
 for the YAML keys and [`crates/nginx/README.md`](../nginx/README.md) for
 the directives.
+
+### Peer table
+
+`gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`; NGINX
+`gabion_gossip_peer_capacity`, default 512) sizes the table of peers a node
+gossips with, once, at start. A peer discovery reports past it is declined,
+logged as `peer_table_full`, and still has its counts merged. It also sets the
+node dictionary's default, twice the peer table, which
+`storage.node_dictionary_capacity` overrides.
 
 ### Socket buffers
 

@@ -59,9 +59,23 @@ Message starts: "Too many gabion peer instances are being tracked"
 
 **Why.** Every peer restart counts as a new instance until its data ages out, so a large cluster with frequent restarts can outgrow the dictionary.
 
-**What to do next.** Raise `storage.node_dictionary_capacity` (`GABION_STORAGE_NODE_DICTIONARY_CAPACITY`) in `gabiond`, or `gabion_storage_node_dictionary_capacity` in NGINX. Size it above pods × (1 + restarts within your longest rule window).
+**What to do next.** Raise `storage.node_dictionary_capacity` (`GABION_STORAGE_NODE_DICTIONARY_CAPACITY`) in `gabiond`, or `gabion_storage_node_dictionary_capacity` in NGINX. Size it above pods × (1 + restarts within your longest rule window). The default is twice `gossip.peer_capacity`.
 
 **Fields** `config_key`, `capacity`, `in_use`, `peer_node_id`, `peer_incarnation`, `rejected_total` · **Knob** `storage.node_dictionary_capacity` (`GABION_STORAGE_NODE_DICTIONARY_CAPACITY`) / `gabion_storage_node_dictionary_capacity`
+
+### `peer_table_full`
+
+**Level** warn, power of two · **Request allowed** yes, under-counted at the declined peer · **Emitted by** library (both adapters)
+
+Message starts: "This node's peer table is full"
+
+**What happened.** Discovery reported a peer after the table of peers this node gossips with was full, so the node ignored it. It sends that peer none of its counts, so limits enforced at that peer under-count this node's traffic and allow requests over the limit. Counts that peer sends here are still merged.
+
+**Why.** The cluster has more pods than `gossip.peer_capacity`.
+
+**What to do next.** Raise `gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`) in `gabiond`, or `gabion_gossip_peer_capacity` in NGINX, above the cluster's pod count. Each slot costs about 100 bytes.
+
+**Fields** `config_key`, `capacity`, `peer`, `declined_total` · **Knob** `gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`) / `gabion_gossip_peer_capacity`
 
 ### `decode_rejected`
 

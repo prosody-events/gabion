@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2079,6 +2079,71 @@ fn each_decode_cause_has_its_own_throttle() {
         lines(&["reason=\"peer_limits\"", "length=2000"]),
         1,
         "{logs}"
+    );
+}
+
+/// A peer past `gossip.peer_capacity` is declined: counted, logged once, and
+/// never sent to. The counts it sends are still merged.
+#[test]
+fn full_table_declines_and_still_merges() {
+    let (a, b, c) = (sock(46_000), sock(46_001), sock(46_002));
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let router = SimRouter::new();
+            let agg_a = Rc::new(InMemoryAggregateStore::new());
+            let (admin, admin_rx) = mpsc::channel(4);
+            let (rt_a, client_a) = GossipRuntime::from_parts_with_admin(
+                router.bind(a),
+                TokioClock::from_millis(0),
+                tuned_config(vec![], 1, |s| s.peer_capacity = NonZeroU16::MIN),
+                store_for(node(0xA)),
+                agg_a.clone(),
+                Some(admin_rx),
+            );
+            let events = futures::stream::iter([
+                PeerEvent::Added(Peer::new(b)),
+                PeerEvent::Added(Peer::new(c)),
+            ]);
+            let h_a = tokio::task::spawn_local(rt_a.run(events));
+            let (rt_c, client_c) = GossipRuntime::from_parts(
+                router.bind(c),
+                TokioClock::from_millis(0),
+                sim_config(vec![a], 2),
+                store_for(node(0xC)),
+                Rc::new(InMemoryAggregateStore::new()),
+            );
+            let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
+            hit(&client_a, 1).await;
+            hit(&client_c, 2).await;
+            heartbeats(3).await;
+            let snapshot = admin_snapshot(&admin).await;
+            assert_eq!(snapshot.counters.peers_declined, 1);
+            assert_eq!(
+                snapshot.peers.iter().map(|p| p.addr).collect::<Vec<_>>(),
+                [b]
+            );
+            assert_eq!(agg_a.total(), 2, "A counts its own hit and the one C sent");
+            assert_eq!(
+                router.received_count(c),
+                0,
+                "A never sends to the declined peer"
+            );
+            client_a.shutdown().await.unwrap();
+            client_c.shutdown().await.unwrap();
+            let _ = h_a.await;
+            let _ = h_c.await;
+        })
+    });
+    assert_logged(
+        &logs,
+        "peer_table_full",
+        1,
+        &[
+            &format!("peer={c}"),
+            "capacity=1",
+            "declined_total=1",
+            "config_key=\"gossip.peer_capacity\"",
+        ],
     );
 }
 
