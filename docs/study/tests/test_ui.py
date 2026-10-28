@@ -189,7 +189,6 @@ def val_ok(shown, true, unit):
     return ok, f'{shown} vs {true:.6g} (tolerance {half:.3g})'
 
 NUM = r'[−-]?[\d,]*\.?\d+'
-def to_f(t): return float(t.replace(',', '').replace('−', '-'))
 def dec_ok(shown, true, factor=1.0):
     """shown printed with its own number of decimals; equals true/factor rounded to those decimals."""
     t = shown.replace(',', '').replace('−', '-'); d = len(t.split('.')[1]) if '.' in t else 0
@@ -204,7 +203,6 @@ def unit_scale(unit, ref):
     if unit == 'fraction': return 0.01, ' %'
     if unit == '% of limit': return 1, ' %'
     return 1, ' ' + unit
-def pm_expect(hw): return 100 * hw
 def has_diff(v): return v['scale'] == 'diff' and v['dlo'] is not None
 def is_exact(v): return v['kind'] == 'ratio' and v['lo'] is None and v['paired'] and v['scale'] == 'log' and v['ratio'] == 1.0
 

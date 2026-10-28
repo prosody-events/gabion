@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Rewrite the datasets refresh.sh generates with compact separators and every
-float rounded to 7 significant figures, which moves no value by more than
-5e-7 of itself (docs/study/README.md, "Data"). Every row and key is kept.
+"""Rewrite the datasets refresh.sh generates with compact separators. Every
+row, key and value is kept exactly (docs/study/README.md, "Data").
 
     python3 docs/study/scripts/compact.py [<data-dir>]
 
@@ -18,9 +17,7 @@ DATASETS = ("posterior.json", "self_posterior.json", "runs.json", "seed_metrics.
 
 
 def compact(text: str) -> str:
-    rows = json.loads(text)
-    return json.dumps([{k: float(f"{v:.7g}") if isinstance(v, float) else v for k, v in r.items()} for r in rows],
-                      separators=(",", ":"))
+    return json.dumps(json.loads(text), separators=(",", ":"))
 
 
 def main() -> None:

@@ -118,11 +118,12 @@ Eight datasets, each a JSON array of flat rows:
 | `arms.json`, `metrics.json`, `regimes.json` | hand-edited definitions |
 | `scale.json` | a frozen one-off measurement, not rebuilt by refresh |
 
-Compaction writes compact separators and rounds every float to 7 significant
-figures, which moves no value by more than 5e-7 of itself, and keeps every row
-and key. The four files went from 6,900,716 to 5,674,167 bytes (gzip 795 KB to
-505 KB). `test_compact.py` proves it from the judge's full-precision
-`data/judge/summary.csv`.
+Compaction writes compact separators and keeps every row, key and value
+exactly. It rounds nothing: the page prints differences of nearly equal floats
+(an interval's half-width is `ratio_hi / ratio - 1`), so rounding at any
+precision short of a float's own changes printed text. The four files went from
+6,900,716 to 6,271,714 bytes (gzip 796 KB to 783 KB). `test_compact.py` proves
+it from the judge's full-precision `data/judge/summary.csv`.
 
 `scale.json` draws "Beyond the autoscaler maximum" from one-off runs of
 `imp-az-hier-nopk` at `328f7cf` on harness tree `011e8be`; its inputs are not in

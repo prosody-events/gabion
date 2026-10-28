@@ -1,5 +1,5 @@
-// The static stand-in for the hosted dashboard runtime: exactly the calls
-// index.html makes (docs/study/README.md, "How the page runs").
+// The page's runtime: exactly the calls index.html makes
+// (docs/study/README.md, "How the page runs").
 (() => {
   const FILES = { posterior: 'posterior', self_posterior: 'self_posterior', seeds: 'seed_metrics', runs: 'runs', arms: 'arms', regimes: 'regimes', metrics: 'metrics', scale: 'scale' };
   const SOURCE = 'https://github.com/prosody-events/gabion/blob/main/docs/study/dashboard/index.html';
@@ -44,8 +44,8 @@
         .then((set) => { sets[id] = set; run(); });
     }
   });
-  // The hosted runtime showed each calculation's title, description and code;
-  // this keeps the first two, under the method section, and links the code.
+  // Each calculation's title and description, under the method section, with
+  // one link to the code.
   document.addEventListener('DOMContentLoaded', () => {
     const make = (tag, props, ...kids) => { const n = Object.assign(document.createElement(tag), props); n.append(...kids); return n; };
     const note = (...kids) => make('p', { className: 'note' }, ...kids);
