@@ -1,12 +1,9 @@
-//! U33: a rule written for NGINX and the same rule written for `gabiond`
-//! are one rule. Each adapter builds its rules as in production: NGINX's
-//! directives through `parse_rule_directive` and `CompiledRules::compile_with`,
-//! `gabiond`'s YAML from a file through `AppConfig::load`, the two listing the
-//! rules in opposite orders. Every pair agrees on domain, descriptors, mode,
-//! limit and window. A hit NGINX admits, folded into the cluster aggregate as
-//! its leader folds it, is a hit `gabiond` counts for the same request exactly
-//! when the pair also agrees on its bucket: the check reads each adapter's own
-//! key hash, NGINX's in the hit it queues and `gabiond`'s in what it reads.
+//! A rule written for NGINX and the same rule written for `gabiond` are one
+//! rule. Each adapter loads its rules through its production path, the two
+//! configs listing them in opposite orders. A hit NGINX queues, folded into
+//! the cluster aggregate, is one `gabiond` counts for the same request
+//! exactly when the pair also agrees on its bucket, so each adapter's own key
+//! hash is on the line.
 
 use std::sync::Arc;
 
