@@ -18,6 +18,9 @@ humantime.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
+# The `loom` feature swaps the aggregate table's slot atomics for loom's;
+# `gabion-nginx`'s `make loom` only.
+loom = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sha2.workspace = true
 socket2 = { workspace = true, optional = true }
@@ -52,6 +55,7 @@ serde = ["dep:serde"]
 # task and used by the visualizer to render every node's CRDT cells. Off by
 # default so the production runtime never compiles the cell-iteration path.
 cell-dump = []
+loom = ["dep:loom"]
 
 [dev-dependencies]
 criterion.workspace = true

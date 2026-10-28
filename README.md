@@ -101,9 +101,9 @@ Admission sits on every request's hot path, so the work it does has
 to be both cheap and bounded. Each cluster member matches the request
 against its rule table and then, for each matched rule, reads the
 cluster-wide aggregate for that rule's live buckets — through atomic
-loads against a shared-memory zone in the case of nginx, or through
-`DashMap` reads in the case of `gabiond`, in either case one read per
-live bucket. The decision is taken without issuing any system calls
+loads against one aggregate table, which nginx keeps in a shared-memory
+zone and `gabiond` on its heap, in either case one probe per live
+bucket. The decision is taken without issuing any system calls
 or allocating on the heap. If the aggregate plus the hits attributed
 to the current request would cross the rule's configured limit the
 request is rejected; otherwise it is allowed through and the hit is

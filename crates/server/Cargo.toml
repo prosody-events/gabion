@@ -6,10 +6,8 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1"
-arrayvec.workspace = true
 axum.workspace = true
 config.workspace = true
-dashmap.workspace = true
 envoy-types.workspace = true
 futures.workspace = true
 gabion = { workspace = true, features = ["serde"] }
@@ -28,7 +26,12 @@ twox-hash.workspace = true
 whoami.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
 serde_json.workspace = true
 tower.workspace = true
+
+[[bench]]
+name = "admission"
+harness = false

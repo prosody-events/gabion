@@ -123,7 +123,7 @@ help:
 	@printf '%s\n' '  make miri-ffi-alignment-tb Run FFI alignment tests under miri (Tree Borrows)'
 	@printf '%s\n' '  make miri-lib        Run all gabion-nginx lib tests under miri'
 	@printf '%s\n' '  make miri-all        Run miri (Stacked + Tree Borrows) on every gabion-nginx test'
-	@printf '%s\n' '  make bench-check     Compile the crdt and SHM aggregate benchmarks'
+	@printf '%s\n' '  make bench-check     Compile the crdt, aggregate and admission benchmarks'
 	@printf '%s\n' '  make sim-smoke       Run the study harness judge tests and one small regime; fails on an unhealthy run'
 	@printf '%s\n' '  make sim-baselines   Run the main and imp-az-hier-nopk baseline arms of the regression gate (H1=<sha>)'
 	@printf '%s\n' '  make sim-gate        Run this checkout as the zone arm and apply the regression gate pass rules'
@@ -171,7 +171,7 @@ safety: require-nextest
 	$(CARGO_ENV) $(NEXTEST) -p gabion-nginx --test safety
 
 # Loom model checks for the SHM queue, leader lease and aggregate seqlock, in
-# crates/nginx/tests/loom.rs. The `loom` feature rebuilds only gabion-nginx.
+# crates/nginx/tests/loom.rs. The `loom` feature rebuilds gabion and gabion-nginx.
 .PHONY: loom
 loom: require-nextest
 	$(CARGO_ENV) $(NEXTEST) -p gabion-nginx --features loom --test loom
@@ -294,7 +294,8 @@ study-test:
 .PHONY: bench-check
 bench-check:
 	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion --bench crdt --no-run
-	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-nginx --bench aggregate --no-run
+	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-server --bench admission --no-run
+	$(CARGO_ENV) $(STABLE_CARGO) bench -p gabion-nginx --bench access --no-run
 
 # Gate the visualizer's wasm bridge and frontend: (1) type-check gabion-wasm
 # for wasm32 with the browser getrandom backend (the make-or-break

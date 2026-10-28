@@ -11,7 +11,8 @@ const EMPTY_DICT_SLOT: u16 = u16::MAX;
 /// Descriptor stored per interned rule slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuleDescriptor {
-    /// Canonical hash of the rule shape and parameters.
+    /// The rule's identity: a hash of its domain, descriptor patterns, window
+    /// and bucket (`rules::RuleDef::build`).
     pub fingerprint: u128,
     pub window_millis: u32,
     pub bucket_millis: u32,

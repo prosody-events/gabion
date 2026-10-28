@@ -6,7 +6,7 @@
 // Numeric boundary convention (asserted at runtime in `sim.ts`, checked
 // statically by `pnpm run check`):
 //
-//   • u128 ids — `rule`, `key`, `node_id`, `rule_fingerprint` — cross as
+//   • u128 ids — `rule`, `key`, `node_id` — cross as
 //     **hex strings** ("0x…"), serialized by `crate::hex`.
 //   • u64 counts and timestamps — `virtual_ms`, `tick`, `count`,
 //     `aggregate_total`, `oracle_total`, … — cross as JS **numbers**.
@@ -30,7 +30,6 @@ export interface SimConfig {
   tick_interval_ms: number;
   target_err_bps: number;
   min_emit_interval_ms: number;
-  rule_fingerprint: Hex;
   rule_limit: number;
   rule_window_ms: number;
   rule_bucket_ms: number;

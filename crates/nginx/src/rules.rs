@@ -1,23 +1,16 @@
 //! Bridge from `gabion_limit_rule` configuration to `gabion::rules::Rule`
 //! plus compiled bindings.
 
-use std::num::NonZeroU64;
 use std::time::Duration;
 
-use gabion::defaults;
-use gabion::rules::{
-    CardinalityLimits, DescriptorPattern, EnforcementMode, Rule, RuleId, is_descriptor_key,
-};
+use gabion::crdt::ValidStorageConfig;
+use gabion::rules::{EnforcementMode, Rule, RuleDef, RuleError, RuleTable, parse_rate};
 use thiserror::Error;
 
 /// Default domain assigned to rules that don't name one explicitly. nginx
 /// requests carry no inherent "domain" the way Envoy descriptors do, so we
 /// default to a single per-zone bucket.
 pub const DEFAULT_DOMAIN: &str = "nginx";
-
-/// Build-time cap on descriptors per rule: the `ArrayVec` bound that
-/// `storage.max_descriptor_count` is validated against.
-pub const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
 
 /// One descriptor binding declared in nginx config — a descriptor `key` paired
 /// with the nginx variable specification to evaluate at request time.
@@ -30,6 +23,9 @@ pub struct DescriptorBinding {
     /// multiple `$identifier` substitutions) compiled via
     /// `ngx_http_compile_complex_value` at config phase.
     pub source: Box<str>,
+    /// The value pattern: `*` (any value) unless `value=KEY:LITERAL` names
+    /// this binding.
+    pub value: Box<str>,
 }
 
 /// Runtime-ready binding produced by compiling a [`DescriptorBinding`].
@@ -87,23 +83,18 @@ pub enum BindingLookup {
 unsafe impl Send for BindingLookup {}
 unsafe impl Sync for BindingLookup {}
 
-/// Compiled binding ready for the runtime — pairs the operator-visible
-/// descriptor key with its [`BindingLookup`].
-#[derive(Debug)]
-pub struct CompiledBinding {
-    pub key: Box<str>,
-    pub lookup: BindingLookup,
-}
-
-/// Operator-facing rule configuration. Parsed from `gabion_limit_rule`.
+/// Operator-facing rule configuration, parsed from `gabion_limit_rule` by
+/// [`parse_rule_directive`] and built into a [`Rule`] by
+/// [`CompiledRules::compile_with`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuleConfig {
     pub name: Box<str>,
     pub domain: Box<str>,
-    pub bindings: Vec<DescriptorBinding>,
-    pub limit: NonZeroU64,
-    pub window: Duration,
-    pub bucket: Duration,
+    pub bindings: Box<[DescriptorBinding]>,
+    /// `rate=`, whose syntax [`parse_rate`] already accepted.
+    pub rate: Box<str>,
+    pub window: Option<Duration>,
+    pub bucket: Option<Duration>,
     pub mode: EnforcementMode,
     /// Optional per-rule predicate variable (nginx variable name with `$`
     /// stripped). When the variable resolves to a truthy value at request
@@ -114,25 +105,24 @@ pub struct RuleConfig {
     pub except_if: Option<Box<str>>,
 }
 
-/// Compiled rule data ready for the runtime. Holds the gossip `Rule` and the
-/// per-request descriptor bindings already compiled into the
-/// [`CompiledBinding`] form the access path can dispatch over. The hot-path
-/// `RuleSpec` is reachable via `rule.spec()`.
+/// One rule's compiled request-time bindings, in the order of its
+/// [`Rule::descriptors`], whose patterns give each binding's key and value.
 #[derive(Debug)]
 pub struct CompiledRule {
-    pub rule: Rule,
-    pub bindings: Box<[CompiledBinding]>,
+    pub bindings: Box<[BindingLookup]>,
     /// Optional compiled predicate. When `Some` and the variable resolves
     /// to a truthy value at request time, the access path skips this rule
     /// — see `access::decide_one`.
     pub except_if: Option<BindingLookup>,
 }
 
-/// Every compiled `gabion_limit_rule`, in declaration order, with its
-/// per-rule [`CompiledBinding`]s. Shared (via `Arc`) between every worker's
-/// location config and the leader's drain task.
+/// Every compiled `gabion_limit_rule`, in declaration order: the library's
+/// [`RuleTable`] and, at the same index, each rule's compiled bindings.
+/// Shared (via `Arc`) between every worker's location config and the
+/// leader's drain task.
 #[derive(Debug)]
 pub struct CompiledRules {
+    table: RuleTable,
     rules: Box<[CompiledRule]>,
 }
 
@@ -227,15 +217,15 @@ pub fn is_zone_name(s: &str) -> bool {
 ///
 /// Templates (anything with literal text or multiple `$` substitutions)
 /// require the explicit `key:source` form — there's no useful auto-name
-/// to derive. Keys are validated against [`is_descriptor_key`] so spaces,
-/// punctuation, or anything else not matching `[A-Za-z_][A-Za-z0-9_.-]*`
-/// is rejected at parse time.
+/// to derive. The key grammar is the library's, checked when the rule is
+/// built.
 pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
     if let Some(stripped) = rest.strip_prefix('$') {
         if is_single_ident(stripped) {
             return Ok(DescriptorBinding {
                 key: stripped.into(),
                 source: rest.into(),
+                value: "*".into(),
             });
         }
         return Err(
@@ -249,128 +239,216 @@ pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
              `mode=`, `dry_run`, `except_if=`, `domain=`",
         );
     };
-    if !is_descriptor_key(key) {
-        return Err(
-            "binding key must match `[A-Za-z_][A-Za-z0-9_.-]*` (e.g. `tenant`, `app.tenant`, \
-             `tenant-id`)",
-        );
-    }
     if source.is_empty() {
         return Err("binding source after `:` is empty; supply a `$variable` or template");
     }
     Ok(DescriptorBinding {
         key: key.into(),
         source: source.into(),
+        value: "*".into(),
     })
 }
 
+/// Parse one `gabion_limit_rule` directive's arguments: the rule name, then
+/// descriptor bindings — `$var` auto-keyed by the variable name, or
+/// `name:$var` with an explicit key — and named arguments recognised by
+/// their `keyword=` prefix; the bare `dry_run` flag is an alias for
+/// `mode=dry_run`.
+///
+/// `rate=` carries the sustained allowance, `window=` widens the time
+/// horizon (defaults to the rate's period), and `bucket=` controls the
+/// granularity inside the window (defaults to the window). `value=KEY:LITERAL`
+/// makes the binding keyed `KEY` match only `LITERAL`. Every syntax error is
+/// reported here, at the directive's line; the rule itself is validated when
+/// [`CompiledRules::compile_with`] builds it, once every setting is read.
+pub fn parse_rule_directive(args: &[&str]) -> Result<RuleConfig, RuleArgError> {
+    let Some((&name, args)) = args.split_first() else {
+        return Err(RuleArgError::MissingName);
+    };
+    let invalid = |arg: &str, reason| RuleArgError::Invalid {
+        arg: arg.into(),
+        reason,
+    };
+    let mut domain = DEFAULT_DOMAIN;
+    let (mut window, mut bucket, mut except_if) = (None, None, None);
+    let mut bindings = Vec::new();
+    let mut values = Vec::new();
+    let mut rate = None;
+    let mut mode = None;
+    for &arg in args {
+        // `window=` and `bucket=` must parse as durations here; a zero one
+        // is refused when the rule is built, in the words gabiond uses too.
+        let duration = |rest: &str, expected| {
+            humantime::parse_duration(rest).map_err(|_| invalid(arg, expected))
+        };
+        if arg == "dry_run" {
+            if mode.is_some_and(|mode| mode != EnforcementMode::DryRun) {
+                return Err(RuleArgError::DryRunConflict { rule: name.into() });
+            }
+            mode = Some(EnforcementMode::DryRun);
+        } else if let Some(rest) = arg.strip_prefix("rate=") {
+            parse_rate(rest).map_err(|reason| invalid(arg, reason))?;
+            rate = Some(rest);
+        } else if let Some(rest) = arg.strip_prefix("window=") {
+            window = Some(duration(
+                rest,
+                "expected `window=DURATION` (e.g. `window=5h`)",
+            )?);
+        } else if let Some(rest) = arg.strip_prefix("bucket=") {
+            bucket = Some(duration(
+                rest,
+                "expected `bucket=DURATION` (e.g. `bucket=1s`)",
+            )?);
+        } else if let Some(rest) = arg.strip_prefix("domain=") {
+            domain = rest;
+        } else if let Some(rest) = arg.strip_prefix("mode=") {
+            mode = Some(match rest {
+                "enforce" => EnforcementMode::Enforce,
+                "dry_run" => EnforcementMode::DryRun,
+                "disabled" => EnforcementMode::Disabled,
+                _ => return Err(invalid(arg, "expected `mode=enforce|dry_run|disabled`")),
+            });
+        } else if let Some(rest) = arg.strip_prefix("except_if=") {
+            let var = rest.strip_prefix('$').unwrap_or(rest);
+            if !is_single_ident(var) {
+                return Err(invalid(arg, "`except_if=` expects `$variable_name`"));
+            }
+            except_if = Some(var.into());
+        } else if let Some(rest) = arg.strip_prefix("value=") {
+            match rest.split_once(':') {
+                Some((key, literal)) if !key.is_empty() => values.push((key, literal)),
+                _ => {
+                    return Err(invalid(
+                        arg,
+                        "expected `value=KEY:LITERAL` (e.g. `value=tenant:acme`)",
+                    ));
+                }
+            }
+        } else {
+            bindings.push(parse_binding(arg).map_err(|reason| invalid(arg, reason))?);
+        }
+    }
+    let Some(rate) = rate else {
+        return Err(RuleArgError::MissingRate { rule: name.into() });
+    };
+    for (key, literal) in values {
+        let Some(binding) = bindings.iter_mut().find(|b| &*b.key == key) else {
+            return Err(RuleArgError::UnknownValueKey {
+                rule: name.into(),
+                key: key.into(),
+            });
+        };
+        binding.value = literal.into();
+    }
+    Ok(RuleConfig {
+        name: name.into(),
+        domain: domain.into(),
+        bindings: bindings.into_boxed_slice(),
+        rate: rate.into(),
+        window,
+        bucket,
+        mode: mode.unwrap_or_default(),
+        except_if,
+    })
+}
+
+/// A `gabion_limit_rule` directive `nginx -t` refuses at its line.
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum RuleArgError {
+    #[error("requires a rule name: `gabion_limit_rule NAME $variable rate=10r/s;`")]
+    MissingName,
+    #[error("argument `{arg}` is invalid: {reason}")]
+    Invalid { arg: Box<str>, reason: &'static str },
+    #[error(
+        "rule `{rule}` sets both `dry_run` and a different `mode=`; remove one of them, then run \
+         `nginx -t`"
+    )]
+    DryRunConflict { rule: Box<str> },
+    #[error(
+        "rule `{rule}` has no `rate=`, so it has no limit to enforce. Add one (for example \
+         `rate=10r/s`), then run `nginx -t`"
+    )]
+    MissingRate { rule: Box<str> },
+    #[error(
+        "`value={key}:…` in rule `{rule}` names no binding of that rule. Add a binding with key \
+         `{key}` (for example `{key}:$arg_{key}`) or correct the key. Run `nginx -t` again"
+    )]
+    UnknownValueKey { rule: Box<str>, key: Box<str> },
+}
+
 impl CompiledRules {
-    /// The one constructor: resolves each binding source through the supplied
-    /// [`BindingCompiler`], including the per-rule `except_if` predicate.
-    /// Tests pass [`NopBindingCompiler`].
+    /// The one constructor: builds every rule through the library and
+    /// resolves each binding source through the supplied [`BindingCompiler`],
+    /// including the per-rule `except_if` predicate. Tests pass
+    /// [`NopBindingCompiler`].
     pub fn compile_with<C: BindingCompiler>(
         configs: &[RuleConfig],
-        cardinality: CardinalityLimits,
+        storage: &ValidStorageConfig,
         compiler: &mut C,
     ) -> Result<Self, RuleConfigError> {
-        let mut compiled = Vec::with_capacity(configs.len());
-        for (idx, cfg) in configs.iter().enumerate() {
-            if cfg.bindings.is_empty() {
-                return Err(RuleConfigError::EmptyBindings(cfg.name.to_string()));
-            }
-            if cfg.bindings.len() > cardinality.max_descriptor_count() {
-                return Err(RuleConfigError::TooManyBindings(cfg.name.to_string()));
-            }
-            for binding in &cfg.bindings {
-                if binding.key.len() > cardinality.max_key_bytes() {
-                    return Err(RuleConfigError::KeyTooLong {
-                        rule: cfg.name.to_string(),
-                        key: binding.key.to_string(),
-                    });
+        let rules = configs
+            .iter()
+            .map(|cfg| {
+                let patterns: Box<[(&str, &str)]> =
+                    cfg.bindings.iter().map(|b| (&*b.key, &*b.value)).collect();
+                RuleDef {
+                    name: &cfg.name,
+                    domain: &cfg.domain,
+                    patterns: &patterns,
+                    rate: &cfg.rate,
+                    window: cfg.window,
+                    bucket: cfg.bucket,
+                    mode: cfg.mode,
                 }
-            }
-            let id: RuleId = (idx + 1) as RuleId;
-            let descriptors: Vec<DescriptorPattern> = cfg
-                .bindings
-                .iter()
-                .map(|b| DescriptorPattern {
-                    key: b.key.clone(),
-                    value: Box::from("*"),
+                .build(&storage.cardinality)
+            })
+            .collect::<Result<_, _>>()?;
+        let table = RuleTable::new(rules, storage.rule_dictionary_capacity())?;
+        let mut compile = |rule: &str, source: &str| {
+            compiler
+                .compile(source)
+                .map_err(|err| RuleConfigError::CompileBinding {
+                    rule: rule.into(),
+                    spec: source.into(),
+                    message: err.to_string(),
                 })
-                .collect();
-            let rule = Rule::new(
-                id,
-                cfg.domain.to_string(),
-                descriptors,
-                cfg.limit.get(),
-                duration_millis(cfg.window),
-                duration_millis(cfg.bucket),
-                cfg.mode,
-            );
-            let mut bindings = Vec::with_capacity(cfg.bindings.len());
-            for binding in &cfg.bindings {
-                let lookup = compiler.compile(&binding.source).map_err(|err| {
-                    RuleConfigError::CompileBinding {
-                        rule: cfg.name.to_string(),
-                        spec: binding.source.to_string(),
-                        message: err.to_string(),
-                    }
-                })?;
-                bindings.push(CompiledBinding {
-                    key: binding.key.clone(),
-                    lookup,
-                });
-            }
-            let except_if = match cfg.except_if.as_deref() {
-                Some(var) => {
-                    let source = format!("${var}");
-                    let lookup = compiler.compile(&source).map_err(|err| {
-                        RuleConfigError::CompileBinding {
-                            rule: cfg.name.to_string(),
-                            spec: source,
-                            message: err.to_string(),
-                        }
-                    })?;
-                    Some(lookup)
-                }
-                None => None,
-            };
-            compiled.push(CompiledRule {
-                rule,
-                bindings: bindings.into_boxed_slice(),
-                except_if,
-            });
-        }
-        Ok(Self {
-            rules: compiled.into_boxed_slice(),
-        })
+        };
+        let rules = configs
+            .iter()
+            .map(|cfg| {
+                let bindings = cfg
+                    .bindings
+                    .iter()
+                    .map(|binding| compile(&cfg.name, &binding.source))
+                    .collect::<Result<_, _>>()?;
+                let except_if = cfg
+                    .except_if
+                    .as_deref()
+                    .map(|var| compile(&cfg.name, &format!("${var}")))
+                    .transpose()?;
+                Ok(CompiledRule {
+                    bindings,
+                    except_if,
+                })
+            })
+            .collect::<Result<_, RuleConfigError>>()?;
+        Ok(Self { table, rules })
     }
 
-    pub fn rules(&self) -> &[CompiledRule] {
-        &self.rules
+    pub fn table(&self) -> &RuleTable {
+        &self.table
     }
 
-    pub fn get(&self, index: usize) -> Option<&CompiledRule> {
-        self.rules.get(index)
+    /// The rule at `index` and its compiled bindings.
+    pub fn get(&self, index: usize) -> Option<(&Rule, &CompiledRule)> {
+        Some((self.table.rules().get(index)?, self.rules.get(index)?))
     }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum RuleConfigError {
-    #[error("rule `{0}` has no descriptor bindings")]
-    EmptyBindings(String),
-    #[error(
-        "rule `{0}` has more descriptor bindings than `gabion_storage_max_descriptor_count` \
-         allows. Remove bindings from the rule, or raise that directive (up to {cap}), then run \
-         `nginx -t`.",
-        cap = defaults::STORAGE_MAX_DESCRIPTOR_COUNT
-    )]
-    TooManyBindings(String),
-    #[error(
-        "rule `{rule}` binding key `{key}` is longer than `gabion_storage_max_key_bytes` allows. \
-         Shorten the key or raise that directive, then run `nginx -t`."
-    )]
-    KeyTooLong { rule: String, key: String },
+    #[error(transparent)]
+    Rule(#[from] RuleError),
     #[error(
         "rule `{rule}`: nginx could not compile binding `{spec}`: {message}. Fix the rule, then \
          run `nginx -t`."
@@ -385,10 +463,6 @@ pub enum RuleConfigError {
          or build with the `ngx-module` feature"
     )]
     UnsupportedBinding { spec: String },
-}
-
-fn duration_millis(d: Duration) -> u64 {
-    d.as_millis().try_into().unwrap_or(u64::MAX).max(1)
 }
 
 #[cfg(test)]

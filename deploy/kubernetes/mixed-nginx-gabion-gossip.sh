@@ -116,7 +116,6 @@ data:
     admin_bind: 0.0.0.0:9090
     storage:
       max_cells: 4096
-      rule_dictionary_capacity: 64
       node_dictionary_capacity: 256
       local_dirty_capacity: 2048
       forwarded_dirty_capacity: 8192

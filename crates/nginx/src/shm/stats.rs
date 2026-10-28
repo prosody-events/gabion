@@ -5,14 +5,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gabion::defaults;
-use gabion::rules::RuleId;
-
-/// Cap on per-rule counters held in [`Stats::exempted_per_rule`]. A build
-/// constant equal to the default rule-dictionary capacity;
-/// `gabion_storage_rule_dictionary_capacity` does not change it.
-pub const STATS_MAX_RULES: usize = defaults::STORAGE_RULE_DICTIONARY_CAPACITY as usize;
-
 #[repr(C)]
 #[derive(Debug)]
 pub struct Stats {
@@ -23,12 +15,6 @@ pub struct Stats {
     pub declines_invalid_descriptor: AtomicU64,
     pub matched_rule_overflows: AtomicU64,
     pub exempted: AtomicU64,
-    /// Per-rule exempt counter, indexed by `rule_id - 1`. A rule whose id
-    /// falls outside `1..=STATS_MAX_RULES` contributes only to the global
-    /// `exempted` counter. `STATS_MAX_RULES` is a build constant equal to the
-    /// default rule-dictionary capacity;
-    /// `gabion_storage_rule_dictionary_capacity` does not change it.
-    pub exempted_per_rule: [AtomicU64; STATS_MAX_RULES],
     pub queue_pushed: AtomicU64,
     pub queue_drained: AtomicU64,
     pub queue_dropped: AtomicU64,
@@ -45,7 +31,6 @@ impl Default for Stats {
             declines_invalid_descriptor: AtomicU64::new(0),
             matched_rule_overflows: AtomicU64::new(0),
             exempted: AtomicU64::new(0),
-            exempted_per_rule: [const { AtomicU64::new(0) }; STATS_MAX_RULES],
             queue_pushed: AtomicU64::new(0),
             queue_drained: AtomicU64::new(0),
             queue_dropped: AtomicU64::new(0),
@@ -63,7 +48,6 @@ pub struct StatsSnapshot {
     pub declines_invalid_descriptor: u64,
     pub matched_rule_overflows: u64,
     pub exempted: u64,
-    pub exempted_per_rule: [u64; STATS_MAX_RULES],
     pub queue_pushed: u64,
     pub queue_drained: u64,
     pub queue_dropped: u64,
@@ -72,13 +56,6 @@ pub struct StatsSnapshot {
 
 impl Stats {
     pub fn snapshot(&self) -> StatsSnapshot {
-        let mut exempted_per_rule = [0_u64; STATS_MAX_RULES];
-        for (slot, atom) in exempted_per_rule
-            .iter_mut()
-            .zip(self.exempted_per_rule.iter())
-        {
-            *slot = atom.load(Ordering::Relaxed);
-        }
         StatsSnapshot {
             requests: self.requests.load(Ordering::Relaxed),
             allowed: self.allowed.load(Ordering::Relaxed),
@@ -87,7 +64,6 @@ impl Stats {
             declines_invalid_descriptor: self.declines_invalid_descriptor.load(Ordering::Relaxed),
             matched_rule_overflows: self.matched_rule_overflows.load(Ordering::Relaxed),
             exempted: self.exempted.load(Ordering::Relaxed),
-            exempted_per_rule,
             queue_pushed: self.queue_pushed.load(Ordering::Relaxed),
             queue_drained: self.queue_drained.load(Ordering::Relaxed),
             queue_dropped: self.queue_dropped.load(Ordering::Relaxed),
@@ -118,24 +94,17 @@ impl Stats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One per allowed rule whose count did not fit in the request's
-    /// `STORAGE_MAX_MATCHED_RULES`-event buffer; the request was still
-    /// allowed and that rule under-counts.
+    /// One per request that matched more rules than
+    /// `gabion_storage_max_matched_rules`; the request was still allowed and
+    /// the rules past the bound under-count.
     pub fn record_matched_rule_overflow(&self) {
         self.matched_rule_overflows.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A rule's `except_if=` predicate resolved truthy, so the rule was
-    /// skipped for this request. Operators watch this counter to detect a
-    /// misconfigured predicate that always-exempts; the per-rule slot
-    /// (indexed by `rule_id - 1`) lets them attribute the bypass to a
-    /// specific rule rather than the aggregate.
-    pub fn record_exempt(&self, rule_id: RuleId) {
+    /// skipped for this request.
+    pub fn record_exempt(&self) {
         self.exempted.fetch_add(1, Ordering::Relaxed);
-        let idx = (rule_id as usize).wrapping_sub(1);
-        if idx < STATS_MAX_RULES {
-            self.exempted_per_rule[idx].fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     pub fn record_queue_push(&self) {

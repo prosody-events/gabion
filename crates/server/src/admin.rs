@@ -23,26 +23,24 @@ use axum::routing::get;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
+use gabion::aggregate::Aggregate;
 use gabion::gossip::{AdminCommand, AdminSnapshot};
 use gabion::rules::RuleTable;
 
-use crate::store::DashMapStore;
-use gabion::crdt::Count;
-
 /// Adapter state for the admin endpoint. Holds:
 /// - the rule table for `/snapshot` to surface rules
-/// - the DashMap aggregate (for its row count)
+/// - the aggregate table (for its row count)
 /// - the gossip admin channel (for runtime/peer/store stats)
-pub struct AdminState<C: Count> {
+pub struct AdminState {
     rule_table: Arc<RuleTable>,
-    counts: Arc<DashMapStore<C>>,
+    counts: Arc<Aggregate>,
     gossip_admin: mpsc::Sender<AdminCommand>,
 }
 
-impl<C: Count> AdminState<C> {
+impl AdminState {
     pub fn new(
         rule_table: Arc<RuleTable>,
-        counts: Arc<DashMapStore<C>>,
+        counts: Arc<Aggregate>,
         gossip_admin: mpsc::Sender<AdminCommand>,
     ) -> Self {
         Self {
@@ -65,29 +63,25 @@ struct SnapshotJson<'a> {
 
 /// Build an axum router exposing the admin endpoints. See the module
 /// docs for the route map.
-pub fn router<C: Count + 'static>(state: AdminState<C>) -> Router {
+pub fn router(state: AdminState) -> Router {
     Router::new()
-        .route("/snapshot", get(snapshot_handler::<C>))
+        .route("/snapshot", get(snapshot_handler))
         .route("/readyz", get(readyz_handler))
         .with_state(Arc::new(state))
 }
 
-pub async fn serve<C: Count + 'static>(
-    bind: SocketAddr,
-    state: AdminState<C>,
-) -> std::io::Result<()> {
+pub async fn serve(bind: SocketAddr, state: AdminState) -> std::io::Result<()> {
     serve_with_shutdown(bind, state, std::future::pending()).await
 }
 
 /// Like [`serve`] but stops accepting new connections and drains in-flight
 /// admin requests when `shutdown` resolves.
-pub async fn serve_with_shutdown<C, F>(
+pub async fn serve_with_shutdown<F>(
     bind: SocketAddr,
-    state: AdminState<C>,
+    state: AdminState,
     shutdown: F,
 ) -> std::io::Result<()>
 where
-    C: Count + 'static,
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -96,13 +90,13 @@ where
         .await
 }
 
-async fn snapshot_handler<C: Count + 'static>(
-    State(state): State<Arc<AdminState<C>>>,
+async fn snapshot_handler(
+    State(state): State<Arc<AdminState>>,
 ) -> Result<Response, (StatusCode, String)> {
     let snapshot = SnapshotJson {
         runtime: admin_snapshot(&state.gossip_admin).await?,
         rules: &state.rule_table,
-        aggregate_rows: state.counts.len(),
+        aggregate_rows: state.counts.table().occupied(),
     };
     Ok(Json(snapshot).into_response())
 }

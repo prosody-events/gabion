@@ -1,6 +1,6 @@
 //! End-to-end wire codec tests.
 
-use crate::settings::mock::storage;
+use crate::settings::mock::{rules, storage};
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 
@@ -71,7 +71,11 @@ fn sample_header() -> Header {
 }
 
 fn store_with_cap<C: Count>(cells: u32, dicts: u16) -> CellStore<C> {
-    CellStore::<C>::new(storage(cells, dicts, dicts, 128, 64), local_identity())
+    CellStore::<C>::new(
+        storage(cells, dicts, 128, 64),
+        local_identity(),
+        &rules(dicts),
+    )
 }
 
 /// Build a store, ingest the rows as merge_remote observations (so each
@@ -322,8 +326,11 @@ fn tampering_rejects(rows: Rows, byte_idx: usize) -> bool {
 /// Build a store with `n` distinct origin nodes (one cell each) so the
 /// 255-slot node-dict cap forces a packet split.
 fn build_many_origins(n: u32) -> (CellStore<u32>, Vec<CellHandle>) {
-    let mut store =
-        CellStore::<u32>::new(storage(n * 2, 4, n as u16 + 8, 256, 64), local_identity());
+    let mut store = CellStore::<u32>::new(
+        storage(n * 2, n as u16 + 8, 256, 64),
+        local_identity(),
+        &rules(4),
+    );
     let mut obs = ObservationBatch::<u32>::with_capacity(n as usize);
     let mut sink = DeltaSink::<u32>::with_capacity(n as usize);
     for i in 0..n {

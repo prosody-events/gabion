@@ -1,6 +1,101 @@
 use std::time::Duration;
 
+use quickcheck_macros::quickcheck;
+
 use super::*;
+use crate::settings::Settings;
+
+/// A rule on `tenant` in domain `api`, built as both adapters build theirs.
+fn build(
+    name: &str,
+    rate: &str,
+    window_secs: u64,
+    bucket_secs: u64,
+    mode: EnforcementMode,
+) -> Rule {
+    RuleDef {
+        name,
+        domain: "api",
+        patterns: &[("tenant", "*")],
+        rate,
+        window: Some(Duration::from_secs(window_secs)),
+        bucket: Some(Duration::from_secs(bucket_secs)),
+        mode,
+    }
+    .build(&Settings::default().validate().unwrap().1.cardinality)
+    .unwrap()
+}
+
+/// A rule's identity covers its window and bucket, not its limit or mode;
+/// two rules with one identity fail to load; and a rule keeps its identity
+/// wherever it sits in the table. A key's hash has no rule input at all.
+#[test]
+fn rule_identity_separates_windows_and_survives_reordering() {
+    use EnforcementMode::{DryRun, Enforce};
+    let base = build("a", "10r/s", 60, 1, Enforce);
+    let fingerprint = |rule: Rule| rule.fingerprint;
+    assert_ne!(
+        base.fingerprint,
+        fingerprint(build("a", "10r/s", 120, 1, Enforce))
+    );
+    assert_ne!(
+        base.fingerprint,
+        fingerprint(build("a", "10r/s", 60, 2, Enforce))
+    );
+    assert_eq!(
+        base.fingerprint,
+        fingerprint(build("a", "20r/s", 60, 1, Enforce))
+    );
+    assert_eq!(
+        base.fingerprint,
+        fingerprint(build("a", "10r/s", 60, 1, DryRun))
+    );
+    assert_eq!(
+        RuleTable::new(
+            Box::new([base.clone(), build("b", "20r/s", 60, 1, DryRun)]),
+            None
+        ),
+        Err(RuleError::DuplicateRuleIdentity {
+            first: "a".into(),
+            second: "b".into(),
+        })
+    );
+    let other = build("b", "10r/s", 120, 1, Enforce);
+    let forward = RuleTable::new(Box::new([base.clone(), other.clone()]), None).unwrap();
+    let backward = RuleTable::new(Box::new([other, base]), None).unwrap();
+    for rule in forward.rules() {
+        let twin = backward
+            .rules()
+            .iter()
+            .find(|r| r.name == rule.name)
+            .unwrap();
+        assert_eq!(twin.fingerprint, rule.fingerprint, "{}", rule.name);
+    }
+}
+
+/// Feeding descriptors one at a time hashes as the whole request does, and
+/// the separators keep pairs that run together apart.
+#[quickcheck]
+fn key_hasher_equals_hash_key(domain: String, pairs: Vec<(String, String)>) -> bool {
+    let mut hasher = KeyHasher::new(&domain);
+    for (key, value) in &pairs {
+        hasher.push(key, value);
+    }
+    let descriptors = pairs.iter().map(|(key, value)| Descriptor { key, value });
+    hasher.finish() == hash_key(&domain, descriptors)
+}
+
+#[test]
+fn key_hash_separates_pairs_that_run_together() {
+    let hash = |pairs: &[(&'static str, &'static str)]| {
+        hash_key(
+            "api",
+            pairs.iter().map(|&(key, value)| Descriptor { key, value }),
+        )
+    };
+    assert_ne!(hash(&[("ab", "c")]), hash(&[("a", "bc")]));
+    assert_ne!(hash(&[("a", "b"), ("c", "d")]), hash(&[("a", "bc\0d")]));
+}
 
 /// `parse_rate` with the count unwrapped, for comparing against literals.
 fn rate(input: &str) -> (u64, Duration) {
@@ -207,13 +302,20 @@ fn resolve_rate_rejects_overflow() {
 /// to known constants here.
 #[test]
 fn stable_hash_values_are_pinned() {
-    let descriptors = vec![DescriptorPattern {
-        key: "tenant".into(),
-        value: "acme".into(),
-    }];
     assert_eq!(
-        rule_fingerprint("api.requests", &descriptors),
-        0xf0db_dfc4_2215_eb87_23c1_caf4_5793_04b4,
+        rule_fingerprint("api.requests", &[("tenant", "acme")], 1_000, 1_000),
+        0x7ccb_f8ab_a069_fd05_6d24_463a_bad1_bc35,
+    );
+    assert_eq!(
+        hash_key(
+            "api.requests",
+            [Descriptor {
+                key: "tenant",
+                value: "acme",
+            }]
+        )
+        .0,
+        0x1cdc_0717_91aa_9e3b_3a1d_3f93_4b2b_54d6,
     );
     assert_eq!(
         hash_domain("api.requests").0,

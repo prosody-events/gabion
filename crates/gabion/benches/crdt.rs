@@ -32,17 +32,27 @@
 //! * `expire/no_expirations`      — scan-only cost, no frees.
 //! * `expire/bucket_boundary`     — a production-sized bucket ages out and is
 //!   freed in the runtime's batches.
+//!
+//! * `aggregate/window_total_95_5` — the aggregate table both adapters read on
+//!   admission, in production steady state: one request's window total over 10
+//!   buckets, 95% for a key active in the window, 5% for a key never seen.
+//! * `aggregate/apply_one_second`  — the table's writer for one second of that
+//!   traffic: 650 inserts plus 650 expiries.
 
 use std::hint::black_box;
+use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
+use gabion::aggregate::Aggregate;
 use gabion::crdt::{
-    BucketEpoch, CellHandle, CellStore, CompactCellKey, DeltaSink, ExpirationSink, Expiry,
-    Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
-    RuleDescriptor, RuleSlot, ValidStorageConfig,
+    BucketEpoch, CellHandle, CellIdentity, CellStore, CompactCellKey, DeltaSink, ExpirationSink,
+    Expiry, Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
+    RuleSlot, ValidStorageConfig,
 };
 use gabion::defaults::GOSSIP_EXPIRATION_BATCH;
+use gabion::gossip::AggregateStore;
+use gabion::rules::{EnforcementMode, RuleDef, RuleSpec, RuleTable};
 use gabion::settings::Settings;
 
 /// Build an `Observation` row with positional args. Used by the bench
@@ -132,7 +142,7 @@ fn config() -> ValidStorageConfig {
     let nz = "bench capacities are non-zero";
     let settings = Settings {
         max_cells: CELL_CAPACITY.try_into().expect(nz),
-        rule_dictionary_capacity: RULE_CAPACITY.try_into().expect(nz),
+        rule_dictionary_capacity: Some(RULE_CAPACITY.try_into().expect(nz)),
         node_dictionary_capacity: NODE_CAPACITY.try_into().expect(nz),
         local_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
         forwarded_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
@@ -142,20 +152,27 @@ fn config() -> ValidStorageConfig {
     settings.validate().expect("bench settings validate").1
 }
 
-fn rule_fingerprint(i: usize) -> u128 {
-    // Distinct, deterministic per-rule fingerprints.
-    0xC0FE_BEEF_DEAD_F00D_0000_0000_0000_0000_u128 ^ ((i as u128) << 64) ^ (i as u128)
-}
-
-fn rule_descriptor(fp: u128, local_rule_id: u32) -> RuleDescriptor {
-    RuleDescriptor {
-        fingerprint: fp,
-        window_millis: 60_000,
-        bucket_millis: 15_000,
-        limit: 1_000_000,
-        flags: 0,
-        local_rule_id,
-    }
+/// `n` rules of `rate` in `bucket`s, each on its own key, built as the
+/// adapters build theirs.
+fn rules(n: usize, rate: &str, bucket: Duration, storage: &ValidStorageConfig) -> RuleTable {
+    let keys: Vec<String> = (0..n).map(|i| format!("key{i}")).collect();
+    let rules = keys
+        .iter()
+        .map(|key| {
+            RuleDef {
+                name: key,
+                domain: "bench",
+                patterns: &[(key, "*")],
+                rate,
+                window: None,
+                bucket: Some(bucket),
+                mode: EnforcementMode::Enforce,
+            }
+            .build(&storage.cardinality)
+            .expect("bench rule builds")
+        })
+        .collect();
+    RuleTable::new(rules, storage.rule_dictionary_capacity()).expect("bench rules fit")
 }
 
 fn peer_node(i: usize) -> NodeId {
@@ -184,21 +201,16 @@ struct RemoteRow {
     peer_idx: u32,
 }
 
-/// Build a fresh store, intern N rules, and return the seed material the
-/// benches share.
+/// Build a fresh store with N rules of a 60 s window in 15 s buckets, and
+/// return the seed material the benches share.
 fn new_store() -> (CellStore<u32>, Vec<u128>, Vec<RuleSlot>, NodeSlot) {
-    let mut store = CellStore::<u32>::new(config(), local_identity());
-    let mut rule_fps = Vec::with_capacity(NUM_RULES);
-    let mut rule_slots = Vec::with_capacity(NUM_RULES);
-    for i in 0..NUM_RULES {
-        let fp = rule_fingerprint(i);
-        rule_slots.push(
-            store
-                .intern_rule(rule_descriptor(fp, i as u32))
-                .expect("rule interned"),
-        );
-        rule_fps.push(fp);
-    }
+    let table = rules(NUM_RULES, "1000000r/m", Duration::from_secs(15), &config());
+    let store = CellStore::<u32>::new(config(), local_identity(), &table);
+    let rule_fps: Vec<u128> = table.rules().iter().map(|rule| rule.fingerprint).collect();
+    let rule_slots = rule_fps
+        .iter()
+        .map(|&fp| store.rule_dictionary().find(fp).expect("rule interned"))
+        .collect();
     let local_node_slot = store.local_node_slot();
     (store, rule_fps, rule_slots, local_node_slot)
 }
@@ -1059,13 +1071,9 @@ fn bench_expire(c: &mut Criterion) {
     // 7,222 (two).
     for (name, cells) in [("prod_peak", 20_075_usize), ("prod_4x", 79_442)] {
         let (_, storage) = Settings::default().validate().expect("defaults validate");
-        let mut store = CellStore::<u32>::new(storage, local_identity());
-        let rule = RuleDescriptor {
-            window_millis: 10_000,
-            bucket_millis: 1_000,
-            ..rule_descriptor(rule_fingerprint(0), 0)
-        };
-        store.intern_rule(rule).expect("rule interned");
+        let table = rules(1, "1000000r/10s", Duration::from_secs(1), &storage);
+        let mut store = CellStore::<u32>::new(storage, local_identity(), &table);
+        let rule = &table.rules()[0];
         let mut obs = ObservationBatch::<u32>::with_capacity(cells);
         for i in 0..cells {
             let bucket = (i % 11) as BucketEpoch;
@@ -1241,6 +1249,132 @@ fn bench_wire(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── aggregate ──────────────────────────────────────────────────────────
+// The table in production steady state, modelled on a measured fleet: a
+// `rate=20r/s window=10s bucket=1s` rule, about 650 distinct keys a second
+// drawn from 2,200 active over ten seconds, and the CRDT keeping 11 buckets
+// live per key, so about 7,000 live cells in a 16,384-slot table. Each
+// second the writer inserts the new bucket's cells and expires the bucket
+// that aged out. Warm-up runs two minutes of that churn first, so the table
+// holds the residue of ~80,000 cells.
+
+const AGGREGATE_SLOTS: u32 = 16_384;
+const ACTIVE_KEYS: u64 = 2_200;
+const KEYS_PER_SECOND: usize = 650;
+const AGGREGATE_LIVE_BUCKETS: u32 = 11;
+
+struct Traffic {
+    rng: u64,
+    aggregate: Aggregate,
+    rule: RuleSpec,
+    second: u32,
+    deltas: DeltaSink<u32>,
+    expirations: ExpirationSink<u32>,
+    /// The keys written in each live bucket, by `bucket % LIVE_BUCKETS`.
+    history: Vec<Vec<KeyHash>>,
+}
+
+impl Traffic {
+    fn new() -> Self {
+        let settings = Settings {
+            max_cells: AGGREGATE_SLOTS.try_into().expect("non-zero"),
+            ..Settings::default()
+        };
+        let (_, storage) = settings.validate().expect("bench settings validate");
+        let mut traffic = Self {
+            rng: 0x9E37_79B9_7F4A_7C15,
+            aggregate: Aggregate::new(&storage),
+            rule: rules(1, "200r/10s", Duration::from_secs(1), &storage).rules()[0].spec(),
+            second: AGGREGATE_LIVE_BUCKETS,
+            deltas: DeltaSink::with_capacity(KEYS_PER_SECOND),
+            expirations: ExpirationSink::with_capacity(KEYS_PER_SECOND),
+            history: vec![Vec::with_capacity(KEYS_PER_SECOND); AGGREGATE_LIVE_BUCKETS as usize],
+        };
+        for _ in 0..120 {
+            traffic.advance();
+        }
+        traffic
+    }
+
+    fn next(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    fn active_key(&mut self) -> KeyHash {
+        KeyHash(u128::from(self.next() % ACTIVE_KEYS) * 0x9E37_79B9_7F4A_7C15)
+    }
+
+    fn cell(&self, key_hash: KeyHash, bucket: BucketEpoch) -> CellIdentity {
+        CellIdentity {
+            rule_fingerprint: self.rule.fingerprint,
+            key_hash,
+            bucket,
+        }
+    }
+
+    /// One second: expire the bucket that aged out, record the new one.
+    fn advance(&mut self) {
+        self.second += 1;
+        let slot = (self.second % AGGREGATE_LIVE_BUCKETS) as usize;
+        let expired = self.second - AGGREGATE_LIVE_BUCKETS;
+        let mut keys = std::mem::take(&mut self.history[slot]);
+        self.deltas.clear();
+        self.expirations.clear();
+        for &key_hash in &keys {
+            let key = self.cell(key_hash, expired);
+            self.expirations.handles.push(CellHandle::default());
+            self.expirations.keys.push(key);
+            self.expirations.last_counts.push(1);
+            self.expirations.last_update_millis.push(0);
+            self.expirations.applies_locally.push(1);
+        }
+        keys.clear();
+        for _ in 0..KEYS_PER_SECOND {
+            let key_hash = self.active_key();
+            keys.push(key_hash);
+            let key = self.cell(key_hash, self.second);
+            self.deltas.handles.push(CellHandle::default());
+            self.deltas.keys.push(key);
+            self.deltas.previous.push(0);
+            self.deltas.current.push(1);
+            self.deltas.deltas.push(1);
+            self.deltas.applies_locally.push(1);
+        }
+        self.history[slot] = keys;
+        self.aggregate.apply(&self.deltas, &self.expirations);
+    }
+}
+
+fn bench_aggregate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("aggregate");
+    let mut traffic = Traffic::new();
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("window_total_95_5", |b| {
+        b.iter(|| {
+            let key = if traffic.next().is_multiple_of(20) {
+                KeyHash(u128::from(traffic.next()) << 64)
+            } else {
+                traffic.active_key()
+            };
+            let now = u64::from(traffic.second) * 1_000;
+            black_box(
+                traffic
+                    .aggregate
+                    .table()
+                    .window_total(traffic.rule, key, now),
+            )
+        });
+    });
+
+    group.throughput(Throughput::Elements(2 * KEYS_PER_SECOND as u64));
+    group.bench_function("apply_one_second", |b| b.iter(|| traffic.advance()));
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_ingest_local,
@@ -1250,5 +1384,6 @@ criterion_group!(
     bench_fill_gossip_frame,
     bench_expire,
     bench_wire,
+    bench_aggregate,
 );
 criterion_main!(benches);

@@ -33,7 +33,7 @@ use crate::gossip::{
     GossipTransport, TokioClock, ValidGossipConfig,
 };
 use crate::mock::with_logs;
-use crate::settings::mock::storage;
+use crate::settings::mock::{rules, storage};
 use crate::settings::{Millis, Settings};
 use crate::wire::{HmacKey, MIN_PAYLOAD_BYTES};
 use quickcheck::{Arbitrary, Gen, TestResult};
@@ -107,7 +107,7 @@ impl<C: Count> AggregateStore<C> for InMemoryAggregateStore<C> {
 // -- helpers ----------------------------------------------------------------
 
 fn store_for(identity: NodeIdentity) -> CellStore<u32> {
-    CellStore::<u32>::new(storage(256, 32, 32, 64, 16), identity)
+    CellStore::<u32>::new(storage(256, 32, 64, 16), identity, &rules(32))
 }
 
 fn sock(port: u16) -> SocketAddr {
@@ -316,7 +316,11 @@ fn store_for_expiring_rule(identity: NodeIdentity) -> CellStore<u32> {
 }
 
 fn store_for_property_rules(identity: NodeIdentity, node_capacity: u16) -> CellStore<u32> {
-    let mut store = CellStore::<u32>::new(storage(512, 8, node_capacity.max(8), 512, 32), identity);
+    let mut store = CellStore::<u32>::new(
+        storage(512, node_capacity.max(8), 512, 32),
+        identity,
+        &rules(8),
+    );
     for rule in 0..3 {
         store
             .intern_rule(RuleDescriptor {
@@ -1024,8 +1028,11 @@ async fn gossip_tick_drives_expiration() {
 #[test]
 fn expiry_applies_each_full_batch_before_the_next() {
     let cells = GOSSIP_EXPIRATION_BATCH + 1;
-    let mut store =
-        CellStore::<u32>::new(storage(cells as u32, 32, 32, cells as u32, 16), node(0xA));
+    let mut store = CellStore::<u32>::new(
+        storage(cells as u32, 32, cells as u32, 16),
+        node(0xA),
+        &rules(32),
+    );
     store
         .intern_rule(RuleDescriptor {
             fingerprint: 0xFEED,
@@ -2269,7 +2276,7 @@ fn encode_failure_is_counted_and_logged() {
     let ((), logs) = with_logs(|| {
         run_paused(async {
             let wire = Rc::new(Wire::default());
-            let store = CellStore::<u64>::new(storage(256, 32, 32, 64, 16), node(0xA));
+            let store = CellStore::<u64>::new(storage(256, 32, 64, 16), node(0xA), &rules(32));
             let (client, admin, _runtime) = mocked(&wire, vec![sock(2)], store, |s| {
                 s.max_payload_bytes = MIN_PAYLOAD_BYTES;
             })

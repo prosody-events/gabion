@@ -17,13 +17,11 @@ license = "MIT"
 [workspace.dependencies]
 ahash = "0.8"
 anyhow = "1"
-arrayvec = "0.7"
 axum = "0.8"
 async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", default-features = false, features = ["yaml"] }
 criterion = "0.8"
-dashmap = "6"
 either = "1"
 envoy-types = "0.7"
 futures = "0.3"

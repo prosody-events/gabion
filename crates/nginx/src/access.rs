@@ -1,22 +1,18 @@
 //! Per-request access decision. Pure logic — no `ngx` imports — so the
 //! hot path is exercisable from unit tests.
 //!
-//! Allocation discipline: descriptors live in a stack-resident `ArrayVec`;
-//! the SHM aggregate is read through `AggregateTable::window_total` which
-//! does only atomic loads.
+//! Allocation discipline: each binding's value is fed into the rule's
+//! `KeyHasher` as it is read, so no buffer holds descriptors; the matched
+//! rules' events go to the worker's admission scratch, reserved once; and the
+//! SHM aggregate is read through `AggregateTable::window_total`, which does
+//! only atomic loads.
 
-use arrayvec::ArrayVec;
-use gabion::defaults;
-use gabion::rules::{CardinalityLimits, Descriptor, EnforcementMode, RuleId, RuleSpec, hash_key};
+use gabion::aggregate::AggregateTable;
+use gabion::rules::{CardinalityLimits, EnforcementMode, KeyHasher, RuleSpec};
 
-use crate::rules::{BindingLookup, CompiledRules, MAX_DESCRIPTORS};
-use crate::shm::aggregate::AggregateTable;
+use crate::rules::{BindingLookup, CompiledRules};
 use crate::shm::queue::{QueueEvent, RequestQueue};
 use crate::shm::stats::Stats;
-
-/// Cap on rules that may match a single request. Mirrors the server limit
-/// (`gabion::defaults::STORAGE_MAX_MATCHED_RULES`).
-const MAX_MATCHED_RULES: usize = defaults::STORAGE_MAX_MATCHED_RULES;
 
 /// Resolve a compiled binding against the in-flight request. The access
 /// path borrows directly from nginx-owned buffers; the `&[u8]` returned
@@ -77,28 +73,22 @@ pub struct AccessCtx<'a> {
     pub aggregate: AggregateTable<'a>,
     pub queue: RequestQueue<'a>,
     pub stats: &'a Stats,
-    /// Default domain assigned to requests when the location config doesn't
-    /// override it.
-    pub domain: &'a str,
     pub cardinality: CardinalityLimits,
+    /// `gabion_storage_max_matched_rules`: the most rules one request is
+    /// counted against.
+    pub max_matched_rules: usize,
 }
 
 /// Per-rule outcome before [`decide_all`] folds it into a single
 /// [`AccessOutcome`] for the request.
-#[derive(Clone, Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the Allow variant carries the plan-then-commit ArrayVec on the stack; boxing it \
-              would force a heap allocation on the hot path, violating the no-alloc-on-admit rule \
-              in CLAUDE.md."
-)]
+#[derive(Clone, Copy, Debug)]
 enum RuleOutcome {
-    /// Rule evaluated cleanly and would allow the request. The buffered
-    /// queue events ride along so a sibling-rule reject can drop them
-    /// without committing partial work, and the rule's quota snapshot
-    /// feeds the most-constrained-rule selection that drives the
-    /// `X-RateLimit-*` headers on the allowed response.
-    Allow(QuotaSnapshot, ArrayVec<QueueEvent, MAX_MATCHED_RULES>),
+    /// Rule evaluated cleanly and would allow the request. Its queue event
+    /// rides along so a sibling-rule reject can drop it without committing
+    /// partial work, and the rule's quota snapshot feeds the
+    /// most-constrained-rule selection that drives the `X-RateLimit-*`
+    /// headers on the allowed response.
+    Allow(QuotaSnapshot, QueueEvent),
     /// Rule evaluated and crossed its configured limit while in
     /// `Enforce` mode.
     Reject(RejectInfo),
@@ -112,9 +102,8 @@ enum RuleOutcome {
     /// 400 just like the single-rule path.
     Cardinality,
     /// Predicate `except_if=` resolved truthy; rule is skipped for this
-    /// request. Carries the rule id so the orchestrator can attribute the
-    /// per-rule exempt counter to the right slot.
-    Exempt(RuleId),
+    /// request.
+    Exempt,
 }
 
 /// Per-rule quota view captured at the same instant the admission
@@ -133,35 +122,42 @@ struct QuotaSnapshot {
 /// `Retry-After` and the `X-RateLimit-*` triplet pinned to the rule with
 /// the longest window (so the client doesn't see a short retry that
 /// puts it right back into 429 against the wider rule).
+///
+/// `events` is the worker's admission scratch: reserved here, once, for the
+/// most rules a request can be counted against, and never grown after.
 pub fn decide_all(
     ctx: AccessCtx<'_>,
     rule_indices: &[usize],
     vars: &impl VariableLookup,
     now_millis: u64,
+    events: &mut Vec<QueueEvent>,
 ) -> AccessOutcome {
     ctx.stats.record_request();
+    let bound = ctx.max_matched_rules.min(ctx.rules.table().rules().len());
+    if events.capacity() < bound {
+        *events = Vec::with_capacity(bound);
+    }
+    events.clear();
 
     let mut worst_reject: Option<RejectInfo> = None;
     let mut tightest_allow: Option<QuotaSnapshot> = None;
-    let mut all_events: ArrayVec<QueueEvent, MAX_MATCHED_RULES> = ArrayVec::new();
     let mut had_non_exempt_outcome = false;
+    let mut overflowed = false;
     let mut any_exempt = false;
     let mut any_cardinality = false;
 
     for &index in rule_indices {
         match decide_one(ctx, index, vars, now_millis) {
-            RuleOutcome::Allow(snapshot, events) => {
+            RuleOutcome::Allow(snapshot, event) => {
                 had_non_exempt_outcome = true;
                 tightest_allow = Some(pick_min_remaining(tightest_allow, snapshot));
-                for ev in events {
-                    if all_events.try_push(ev).is_err() {
-                        // The combined buffer can hold up to one event per
-                        // matched-rules slot; if siblings push us past
-                        // that, treat the overflow like the single-rule
-                        // case: under-count rather than over-reject.
-                        ctx.stats.record_matched_rule_overflow();
-                        break;
-                    }
+                // Past the bound the rule is allowed but not counted: the
+                // bound is gabion's own, so the request under-counts rather
+                // than over-rejects.
+                if events.len() < ctx.max_matched_rules {
+                    events.push(event);
+                } else {
+                    overflowed = true;
                 }
             }
             RuleOutcome::Reject(info) => {
@@ -176,9 +172,9 @@ pub fn decide_all(
                 any_cardinality = true;
                 ctx.stats.record_cardinality_reject();
             }
-            RuleOutcome::Exempt(rule_id) => {
+            RuleOutcome::Exempt => {
                 any_exempt = true;
-                ctx.stats.record_exempt(rule_id);
+                ctx.stats.record_exempt();
             }
         }
     }
@@ -188,11 +184,14 @@ pub fn decide_all(
         return AccessOutcome::Reject(info);
     }
     if had_non_exempt_outcome {
-        for event in all_events {
+        for &event in events.iter() {
             match ctx.queue.push(event) {
                 Ok(()) => ctx.stats.record_queue_push(),
                 Err(_) => ctx.stats.record_queue_drop(),
             }
+        }
+        if overflowed {
+            ctx.stats.record_matched_rule_overflow();
         }
         ctx.stats.record_allow();
         return AccessOutcome::Allow(tightest_allow.map(|snap| AllowInfo {
@@ -215,8 +214,7 @@ pub fn decide_all(
     AccessOutcome::Decline
 }
 
-/// Per-rule worker for [`decide_all`]. Builds descriptors on the stack and
-/// returns the per-rule outcome without
+/// Per-rule worker for [`decide_all`]. Returns the per-rule outcome without
 /// committing to the queue — the orchestrator does the commit only if no
 /// enforcing rule rejected the request.
 fn decide_one(
@@ -225,10 +223,10 @@ fn decide_one(
     vars: &impl VariableLookup,
     now_millis: u64,
 ) -> RuleOutcome {
-    let Some(compiled) = ctx.rules.get(rule_index) else {
+    let Some((rule, compiled)) = ctx.rules.get(rule_index) else {
         return RuleOutcome::Decline;
     };
-    if compiled.rule.mode == EnforcementMode::Disabled {
+    if rule.mode == EnforcementMode::Disabled {
         return RuleOutcome::Decline;
     }
 
@@ -241,56 +239,47 @@ fn decide_one(
         && let Some(value) = vars.lookup(predicate)
         && is_truthy(value)
     {
-        return RuleOutcome::Exempt(compiled.rule.id);
+        return RuleOutcome::Exempt;
     }
 
-    // Build descriptors on the stack in one pass over `bindings`. Variable
-    // misses decline; UTF-8 failures decline (and bump a stat so the bypass
-    // is observable). Then the one cardinality check both adapters share;
-    // count and key length already passed it at compile time, so only the
-    // byte budget can fail here.
-    let mut descriptors: ArrayVec<Descriptor<'_>, MAX_DESCRIPTORS> = ArrayVec::new();
-    for binding in &compiled.bindings {
-        let Some(value) = vars.lookup(&binding.lookup) else {
+    // One pass over the bindings, each value hashed as it is read under the
+    // rule's own domain. A variable miss declines; so does a value that is
+    // not UTF-8 (counted, so the bypass is observable) or that differs from
+    // the rule's `value=` literal. Count and key length passed the shared
+    // cardinality check when the rule was built, so only the byte budget can
+    // fail here.
+    let mut hasher = KeyHasher::new(&rule.domain);
+    let mut bytes = rule.domain.len();
+    for (lookup, pattern) in compiled.bindings.iter().zip(&rule.descriptors) {
+        let Some(value) = vars.lookup(lookup) else {
             return RuleOutcome::Decline;
         };
         let Ok(value) = std::str::from_utf8(value) else {
             ctx.stats.record_decline_invalid_descriptor();
             return RuleOutcome::Decline;
         };
-        descriptors.push(Descriptor {
-            key: &binding.key,
-            value,
-        });
+        if !pattern.accepts(value) {
+            return RuleOutcome::Decline;
+        }
+        hasher.push(&pattern.key, value);
+        bytes = bytes
+            .saturating_add(pattern.key.len())
+            .saturating_add(value.len());
     }
-    if ctx.cardinality.exceeded(ctx.domain, &descriptors).is_some() {
+    if bytes > ctx.cardinality.max_descriptor_bytes() {
         return RuleOutcome::Cardinality;
     }
 
-    // Evaluate this one specific rule. The rule's `RuleTable` row is
-    // looked up by id; we don't walk `RuleTable::matching` here because
-    // (a) the descriptors were built from this rule's bindings — the
-    // pattern matches by construction — and (b) under multi-rule per
-    // location, each `rule_index` evaluates exactly that rule, not every
-    // sibling that happens to share the same descriptor shape.
-    let descriptors_slice: &[Descriptor<'_>] = descriptors.as_slice();
-    let rule = &compiled.rule;
     let spec = rule.spec();
-    let key_hash = hash_key(spec.id, ctx.domain, descriptors_slice);
-    let total = ctx.aggregate.window_total(
-        spec.fingerprint,
-        key_hash.0,
-        now_millis,
-        spec.bucket_millis,
-        spec.live_buckets,
-    );
+    let key_hash = hasher.finish();
+    let total = ctx.aggregate.window_total(spec, key_hash, now_millis);
     // DryRun rules count and gossip but never reject — they let operators
     // observe what enforcement would do before flipping the switch.
     let hits = 1u64;
     if total.saturating_add(hits) > spec.limit && rule.mode == EnforcementMode::Enforce {
         let delta_until_admit_millis = ctx
             .aggregate
-            .time_until_admit_millis(spec, key_hash.0, now_millis, total, hits);
+            .time_until_admit_millis(spec, key_hash, now_millis, total, hits);
         return RuleOutcome::Reject(RejectInfo {
             spec,
             total,
@@ -298,21 +287,19 @@ fn decide_one(
             delta_until_admit_millis,
         });
     }
-    let bucket = (now_millis / spec.bucket_millis) as u32;
-    let mut planned: ArrayVec<QueueEvent, MAX_MATCHED_RULES> = ArrayVec::new();
-    planned.push(QueueEvent {
+    let event = QueueEvent {
         rule_fingerprint: spec.fingerprint,
         key_hash: key_hash.0,
-        bucket,
-        hits: 1,
+        bucket: (now_millis / spec.bucket_millis) as u32,
+        hits,
         rule_limit: spec.limit,
         now_millis,
-    });
+    };
     // Saturating remaining: under-limit Enforce/DryRun reports the real
     // budget; over-limit DryRun (which the gate above lets through)
     // reports 0 rather than underflowing.
     let remaining = spec.limit.saturating_sub(total).saturating_sub(hits);
-    RuleOutcome::Allow(QuotaSnapshot { spec, remaining }, planned)
+    RuleOutcome::Allow(QuotaSnapshot { spec, remaining }, event)
 }
 
 /// Pick the rule with the longer window among a candidate and a current

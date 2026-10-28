@@ -1,6 +1,11 @@
+use std::time::Duration;
+
 use super::*;
+use crate::aggregate::Aggregate;
+use crate::gossip::AggregateStore;
 use crate::mock::with_logs;
-use crate::settings::mock::storage;
+use crate::rules::{EnforcementMode, RuleDef};
+use crate::settings::mock::{rules, storage};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,7 +14,7 @@ fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
 }
 
-fn rule_descriptor(fingerprint: u128, local_id: u32) -> RuleDescriptor {
+fn descriptor_for(fingerprint: u128, local_id: u32) -> RuleDescriptor {
     RuleDescriptor {
         fingerprint,
         window_millis: 1000,
@@ -21,11 +26,11 @@ fn rule_descriptor(fingerprint: u128, local_id: u32) -> RuleDescriptor {
 }
 
 fn store_u32() -> CellStore<u32> {
-    CellStore::new(storage(16, 8, 8, 16, 4), local())
+    CellStore::new(storage(16, 8, 16, 4), local(), &rules(8))
 }
 
 fn small_store(cell_cap: u32, dirty_cap: u32) -> CellStore<u32> {
-    CellStore::new(storage(cell_cap, 8, 8, dirty_cap, 4), local())
+    CellStore::new(storage(cell_cap, 8, dirty_cap, 4), local(), &rules(8))
 }
 
 /// Build an `Observation` row with positional args. Test convenience for the
@@ -125,7 +130,7 @@ fn local_increment_one(
 }
 
 fn quickcheck_store() -> CellStore<u32> {
-    CellStore::new(storage(256, 16, 16, 512, 8), local())
+    CellStore::new(storage(256, 16, 512, 8), local(), &rules(16))
 }
 
 #[derive(Clone, Debug)]
@@ -593,7 +598,7 @@ fn quickcheck_repair_lane_sweeps_active_despite_acked_frontier(
 #[test]
 fn merge_remote_is_monotonic() {
     let mut store = store_u32();
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(4);
 
     let mut obs = ObservationBatch::with_capacity(1);
@@ -627,7 +632,7 @@ fn merge_remote_is_monotonic() {
 #[test]
 fn different_origins_are_independent() {
     let mut store = store_u32();
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let _a = remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
     let _b = remote_merge_one(&mut store, 0x11, 2, 1, 7, 0);
     assert_eq!(store.active_len(), 2);
@@ -637,7 +642,7 @@ fn different_origins_are_independent() {
 fn merge_order_does_not_matter() {
     let make = |order: &[(u128, u32)]| {
         let mut store = store_u32();
-        store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+        store.intern_rule(descriptor_for(0x11, 1)).unwrap();
         for (origin, count) in order {
             remote_merge_one(&mut store, 0x11, *origin, 1, *count, 0);
         }
@@ -663,7 +668,7 @@ fn merge_order_does_not_matter() {
 #[test]
 fn increment_local_accumulates() {
     let mut store = store_u32();
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let handle = local_increment_one(&mut store, 0x11, 0xabc, 0, 3, 10);
     let _ = local_increment_one(&mut store, 0x11, 0xabc, 0, 4, 20);
     let row = store.get(handle).unwrap();
@@ -674,7 +679,7 @@ fn increment_local_accumulates() {
 #[test]
 fn capacity_is_enforced_without_growing() {
     let mut store = small_store(1, 4);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(2);
     let mut a = ObservationBatch::with_capacity(1);
     a.push(observation(0x11, 0xabc, 0, 1, 1, 1, 0));
@@ -695,7 +700,7 @@ fn capacity_is_enforced_without_growing() {
 #[test]
 fn bucket_boundary_expires_in_batches_without_growth() {
     let mut store = small_store(64, 64);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut batch = ObservationBatch::with_capacity(20);
     for key in 0..20 {
         batch.push(observation(0x11, key, 0, 1, 1, 1_u32, 0));
@@ -733,7 +738,7 @@ fn bucket_boundary_expires_in_batches_without_growth() {
 fn library_warning_names_both_spellings() {
     let ((), logs) = with_logs(|| {
         let mut store = small_store(1, 4);
-        store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+        store.intern_rule(descriptor_for(0x11, 1)).unwrap();
         let mut sink = DeltaSink::with_capacity(2);
         for origin in [1, 2] {
             let mut batch = ObservationBatch::with_capacity(1);
@@ -758,7 +763,7 @@ fn library_warning_names_both_spellings() {
 #[test]
 fn dirty_ring_yields_each_changed_cell_once() {
     let mut store = small_store(4, 16);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     // Non-local origins so both cells route through forwarded_dirty.
     remote_merge_one(&mut store, 0x11, 10, 1, 5, 0);
     remote_merge_one(&mut store, 0x11, 10, 1, 9, 0);
@@ -792,7 +797,7 @@ fn index_capacity_keeps_half_the_buckets_free() {
 #[test]
 fn full_dirty_ring_overwrites_oldest() {
     let mut store = small_store(8, 2);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let handles: Vec<CellHandle> = (1..=4)
         .map(|origin| remote_merge_one(&mut store, 0x11, origin, 1, 1, 0))
         .collect();
@@ -803,7 +808,7 @@ fn full_dirty_ring_overwrites_oldest() {
 #[test]
 fn clear_dirty_keeps_cells_but_drops_change_record() {
     let mut store = small_store(2, 4);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
     store.clear_dirty();
     assert_eq!(store.active_len(), 1);
@@ -814,7 +819,7 @@ fn clear_dirty_keeps_cells_but_drops_change_record() {
 #[test]
 fn gossip_frame_prioritizes_local_then_forwarded_then_repair() {
     let mut store = small_store(8, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
 
     remote_merge_one(&mut store, 0x11, 3, 1, 30, 0);
     local_increment_one(&mut store, 0x11, 0xabc, 0, 10, 0);
@@ -849,7 +854,7 @@ fn gossip_frame_prioritizes_local_then_forwarded_then_repair() {
 #[test]
 fn gossip_frame_forwards_remote_dirty_cells_without_local_dirty() {
     let mut store = small_store(4, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     remote_merge_one(&mut store, 0x11, 2, 1, 20, 0);
     remote_merge_one(&mut store, 0x11, 3, 1, 30, 0);
 
@@ -873,7 +878,7 @@ fn gossip_frame_forwards_remote_dirty_cells_without_local_dirty() {
 #[test]
 fn repair_slice_rotates_across_active_cells() {
     let mut store = small_store(4, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     for origin in 1..=3 {
         remote_merge_one(&mut store, 0x11, origin, 1, origin as u32, 0);
     }
@@ -921,7 +926,7 @@ fn repair_slice_rotates_across_active_cells() {
 #[test]
 fn delta_sink_records_exact_raises() {
     let mut store = small_store(4, 4);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(4);
     let mut obs = ObservationBatch::with_capacity(2);
     obs.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
@@ -941,7 +946,7 @@ fn delta_sink_records_exact_raises() {
 #[test]
 fn delta_applies_locally_reflects_rule_dictionary() {
     let mut store = small_store(4, 4);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     // 0x22 fingerprint unknown locally.
     let mut sink = DeltaSink::with_capacity(2);
     let mut obs = ObservationBatch::with_capacity(2);
@@ -998,7 +1003,7 @@ fn unknown_rule_cells_expire_at_default_window() {
 #[test]
 fn compact_id_round_trip() {
     let mut store = store_u32();
-    store.intern_rule(rule_descriptor(0xAA, 1)).unwrap();
+    store.intern_rule(descriptor_for(0xAA, 1)).unwrap();
     let rule_slot = store.rule_dictionary.find(0xAA).unwrap();
     let _ = remote_merge_one(&mut store, 0xAA, 99, 7, 1, 0);
     let node_slot = store.node_dictionary.find(NodeId(99), 7).unwrap();
@@ -1013,7 +1018,7 @@ fn compact_id_round_trip() {
 #[test]
 fn dictionary_refcount_frees_unreferenced_slots() {
     let mut store = small_store(4, 4);
-    store.intern_rule(rule_descriptor(0xBB, 1)).unwrap();
+    store.intern_rule(descriptor_for(0xBB, 1)).unwrap();
     let h = remote_merge_one(&mut store, 0xBB, 100, 1, 1, 0);
     let row = store.get(h).unwrap();
     let node_slot = row.key.origin;
@@ -1141,7 +1146,7 @@ fn wire_only_rule_frees_when_cells_expire() {
 
 #[test]
 fn dictionary_full_rejects_with_counter() {
-    let mut store = CellStore::<u32>::new(storage(16, 1, 4, 4, 4), local());
+    let mut store = CellStore::<u32>::new(storage(16, 4, 4, 4), local(), &rules(1));
     // First merge interns a rule. Second merge with a distinct fingerprint
     // must fail.
     let h1 = remote_merge_one(&mut store, 0x10, 2, 1, 1, 0);
@@ -1161,7 +1166,7 @@ fn dictionary_full_rejects_with_counter() {
 #[test]
 fn selection_epoch_dedupes_within_frame() {
     let mut store = small_store(4, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     // Same handle dirty as both local and forwarded paths? Forwarded
     // dirty entries with handle equal to a local-dirty handle should not
     // be re-emitted.  We construct two updates against the same handle
@@ -1180,7 +1185,7 @@ fn selection_epoch_dedupes_within_frame() {
 #[test]
 fn repair_cursor_skips_freed_slots() {
     let mut store = small_store(8, 16);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     // Insert 4 cells at known origins.
     let h1 = remote_merge_one(&mut store, 0x11, 1, 1, 1, 0);
     let _h2 = remote_merge_one(&mut store, 0x11, 2, 1, 1, 0);
@@ -1212,7 +1217,7 @@ fn repair_cursor_skips_freed_slots() {
 #[test]
 fn peer_frontier_lacks_matches_scan() {
     let mut store = small_store(8, 16);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let h1 = remote_merge_one(&mut store, 0x11, 1, 1, 1, 0);
     let _h2 = remote_merge_one(&mut store, 0x11, 2, 1, 1, 0);
     let row1 = store.get(h1).unwrap();
@@ -1260,8 +1265,8 @@ fn peer_frontier_lacks_matches_scan() {
 
 #[test]
 fn node_slot_reuse_clears_frontier_rows() {
-    let mut store = CellStore::<u32>::new(storage(4, 4, 4, 4, 2), local());
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut store = CellStore::<u32>::new(storage(4, 4, 4, 2), local(), &rules(4));
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let h = remote_merge_one(&mut store, 0x11, 42, 1, 5, 0);
     let row = store.get(h).unwrap();
     let original_slot = row.key.origin;
@@ -1303,7 +1308,7 @@ fn node_slot_reuse_clears_frontier_rows() {
 #[test]
 fn dirty_lanes_separate() {
     let mut store = small_store(4, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 0);
     remote_merge_one(&mut store, 0x11, 99, 1, 1, 0);
     assert_eq!(store.local_dirty().len(), 1);
@@ -1313,8 +1318,8 @@ fn dirty_lanes_separate() {
 #[test]
 fn count_widths_compile_and_saturate() {
     // u16 saturation.
-    let mut s16 = CellStore::<u16>::new(storage(4, 4, 4, 4, 2), local());
-    s16.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut s16 = CellStore::<u16>::new(storage(4, 4, 4, 2), local(), &rules(4));
+    s16.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut obs = ObservationBatch::<u16>::with_capacity(1);
     let mut sink = DeltaSink::<u16>::with_capacity(1);
     obs.push(Observation {
@@ -1344,8 +1349,8 @@ fn count_widths_compile_and_saturate() {
     assert_eq!(sink2.len(), 0);
 
     // u64 stores big counts.
-    let mut s64 = CellStore::<u64>::new(storage(4, 4, 4, 4, 2), local());
-    s64.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut s64 = CellStore::<u64>::new(storage(4, 4, 4, 2), local(), &rules(4));
+    s64.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut obs64 = ObservationBatch::<u64>::with_capacity(1);
     let mut sink64 = DeltaSink::<u64>::with_capacity(1);
     obs64.push(Observation {
@@ -1364,7 +1369,7 @@ fn count_widths_compile_and_saturate() {
 #[test]
 fn incarnation_change_isolates() {
     let mut store = store_u32();
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let h1 = remote_merge_one(&mut store, 0x11, 42, 1, 5, 0);
     let h2 = remote_merge_one(&mut store, 0x11, 42, 2, 5, 0);
     let r1 = store.get(h1).unwrap();
@@ -1384,7 +1389,7 @@ fn expire_emits_one_row_per_freed_cell() {
     // have degraded applies_locally to false. The pin removes that hazard;
     // emission still runs before free_cell_at for the cell rows.)
     let mut store = small_store(8, 16);
-    let rule_local = store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let rule_local = store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let rule_doomed = store
         .intern_rule(RuleDescriptor {
             fingerprint: 0x22,
@@ -1479,7 +1484,7 @@ fn expire_emits_one_row_per_freed_cell() {
 #[test]
 fn expire_frees_slots_and_dictionary_refs() {
     let mut store = small_store(4, 4);
-    let rule_slot = store.intern_rule(rule_descriptor(0xCC, 1)).unwrap();
+    let rule_slot = store.intern_rule(descriptor_for(0xCC, 1)).unwrap();
     let _h = remote_merge_one(&mut store, 0xCC, 100, 1, 5, 0);
     assert_eq!(store.active_len(), 1);
     assert_eq!(
@@ -1503,7 +1508,7 @@ fn expire_frees_slots_and_dictionary_refs() {
 #[test]
 fn handle_generation_is_aba_safe() {
     let mut store = small_store(2, 4);
-    store.intern_rule(rule_descriptor(0xDD, 1)).unwrap();
+    store.intern_rule(descriptor_for(0xDD, 1)).unwrap();
     let h1 = remote_merge_one(&mut store, 0xDD, 1, 1, 1, 0);
     // Free the slot directly.
     store.free_cell_at(h1.index);
@@ -1520,7 +1525,7 @@ fn handle_generation_is_aba_safe() {
 #[test]
 fn selection_epoch_wraparound_resets_marks() {
     let mut store = small_store(4, 4);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     // Seed the store with a real cell so mark_selected has something to act on.
     remote_merge_one(&mut store, 0x11, 1, 1, 1, 0);
     // Force the epoch close to wraparound and seed a stale mark.
@@ -1583,7 +1588,7 @@ fn expire_at_and_expire_agree_for_same_now() {
 }
 
 #[test]
-fn rule_descriptor_epoch_helpers_pin_window_math() {
+fn descriptor_epoch_helpers_pin_window_math() {
     let rd = RuleDescriptor {
         fingerprint: 0x1,
         window_millis: 10_000,
@@ -1641,7 +1646,7 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
 #[test]
 fn fill_gossip_frame_for_peer_prunes_dirty_but_repairs_acked() {
     let mut store = small_store(8, 8);
-    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
 
     // Seed three cells (three distinct origins).
     let h1 = remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
@@ -2080,7 +2085,7 @@ impl Arbitrary for TightRemoteRows {
 }
 
 fn quickcheck_store_tight() -> CellStore<u32> {
-    CellStore::new(storage(4, 2, 3, 16, 4), local())
+    CellStore::new(storage(4, 3, 16, 4), local(), &rules(2))
 }
 
 #[quickcheck]
@@ -2196,7 +2201,7 @@ impl Arbitrary for U16HitRows {
 
 #[quickcheck]
 fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
-    let mut store = CellStore::<u16>::new(storage(4, 4, 4, 32, 4), local());
+    let mut store = CellStore::<u16>::new(storage(4, 4, 32, 4), local(), &rules(4));
     let mut model_sum: u64 = 0;
     for row in &rows.0 {
         let mut obs = ObservationBatch::<u16>::with_capacity(1);
@@ -2377,4 +2382,103 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
     handles_a == handles_b
         && store_a.active_len() == store_b.active_len()
         && portable_snapshot(&store_a) == portable_snapshot(&store_b)
+}
+
+/// `n` rules on distinct keys, each `rate` over its own period and `bucket`.
+fn configured(n: usize, rate: &str, bucket: Duration) -> RuleTable {
+    let limits = storage(16, 8, 16, 4).cardinality;
+    let keys: Vec<String> = (0..n).map(|i| format!("tenant{i}")).collect();
+    let rules = keys
+        .iter()
+        .map(|key| {
+            RuleDef {
+                name: key,
+                domain: "api",
+                patterns: &[(key, "*")],
+                rate,
+                window: None,
+                bucket: Some(bucket),
+                mode: EnforcementMode::Enforce,
+            }
+            .build(&limits)
+            .unwrap()
+        })
+        .collect();
+    RuleTable::new(rules, None).unwrap()
+}
+
+/// One key hit once a millisecond from `t0` for 10 ms under a 10 ms window of
+/// 1 ms buckets: its window total at `t0 + 9`, and how many of its cells
+/// `expire_at(t0 + 15)` frees.
+fn wrap_run(t0: u64) -> (u64, usize) {
+    let table = configured(1, "10r/10ms", Duration::from_millis(1));
+    let rule = &table.rules()[0];
+    let config = storage(64, 8, 64, 4);
+    let mut store = CellStore::<u32>::new(config, local(), &table);
+    let aggregate = Aggregate::new(&config);
+    let mut batch = ObservationBatch::with_capacity(10);
+    for t in t0..t0 + 10 {
+        let node = local();
+        batch.push(observation(
+            rule.fingerprint,
+            7,
+            t as BucketEpoch,
+            node.node_id.0,
+            node.incarnation,
+            1,
+            t,
+        ));
+    }
+    let mut deltas = DeltaSink::with_capacity(10);
+    store.ingest_local(&batch, &mut deltas);
+    aggregate.apply(&deltas, &ExpirationSink::default());
+    let total = aggregate
+        .table()
+        .window_total(rule.spec(), KeyHash(7), t0 + 9);
+    let mut expired = ExpirationSink::with_capacity(64);
+    assert_eq!(store.expire_at(t0 + 15, &mut expired), Expiry::Done);
+    (total, expired.len())
+}
+
+/// The window total and expiry give the same answers when the `u32` epoch
+/// wraps inside the window as when it does not.
+#[test]
+fn epoch_comparisons_survive_wrap() {
+    assert_eq!(wrap_run(1_000), (10, 5));
+    assert_eq!(wrap_run((1 << 32) - 4), (10, 5));
+}
+
+/// With no override, the rule dictionary holds twice the configured rules,
+/// so 300 rules load where a fixed 256 would refuse them.
+#[test]
+fn rule_dictionary_default_grows_with_rules() {
+    let table = configured(300, "10r/s", Duration::from_secs(1));
+    assert_eq!(table.dictionary_capacity().get(), 600);
+    let stats = CellStore::<u32>::new(storage(16, 8, 16, 4), local(), &table).stats();
+    assert_eq!(
+        (stats.rule_slots_capacity, stats.rule_slots_used),
+        (600, 300)
+    );
+}
+
+/// Every configured rule is interned and pinned before any runtime exists,
+/// with its own window and bucket.
+#[test]
+fn cell_store_interns_every_rule_at_construction() {
+    let table = configured(3, "10r/s", Duration::from_millis(250));
+    let store = CellStore::<u32>::new(storage(16, 8, 16, 4), local(), &table);
+    for rule in table.rules() {
+        let slot = store
+            .rule_dictionary()
+            .find(rule.fingerprint)
+            .expect("interned");
+        assert_eq!(store.rule_dictionary().refcount(slot), 1, "{}", rule.name);
+        let interned = store.rule_dictionary().descriptor(slot).unwrap();
+        assert_eq!(
+            (interned.window_millis, interned.bucket_millis),
+            (1_000, 250),
+            "{}",
+            rule.name
+        );
+    }
 }

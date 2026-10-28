@@ -1,7 +1,4 @@
-//! Admission-time types: the decision codes the server returns and the
-//! borrowed request shape it presents to the rule table.
-
-use gabion::rules::Descriptor;
+//! Admission-time types: the decision codes the server returns.
 
 /// Result of evaluating one descriptor's rules.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,13 +34,4 @@ pub enum RejectReason {
     /// Request violated the configured cardinality envelope and was rejected
     /// before any counter was touched.
     Cardinality,
-}
-
-/// Borrowed admission-time request shape. Maps 1:1 to the per-descriptor
-/// slice the gRPC service walks before dispatching to gossip.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LimitRequest<'a> {
-    pub domain: &'a str,
-    pub descriptors: &'a [Descriptor<'a>],
-    pub hits: u64,
 }

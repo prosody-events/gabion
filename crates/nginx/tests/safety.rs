@@ -9,9 +9,8 @@
 //!    queue. Every worker spawns a leader thread; the one holding the lease
 //!    (`LeaderLease::try_acquire`) stamps the incarnation, drains the queue,
 //!    drives the gossip runtime, and writes back into the aggregate via
-//!    `ShmAggregateStore::apply` (which invokes
-//!    `write_delta`/`write_expiration` per row of the `DeltaSink`/
-//!    `ExpirationSink`).
+//!    `ShmAggregateStore::apply` (which folds each row of the `DeltaSink`/
+//!    `ExpirationSink` into the library's table over the zone's slots).
 //!
 //! These tests run under `cargo +nightly miri test --test safety` and exercise
 //! every memory-unsafe entry point on the production hot paths. Networking
@@ -26,21 +25,22 @@
 //! the access handler's `$gabion_decided` slot, which lives in the
 //! `r->variables` array nginx allocates per request.
 
-use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
+use std::time::Duration;
 
+use gabion::crdt::ValidStorageConfig;
 use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
 use gabion::gossip::AggregateStore;
-use gabion::rules::{CardinalityLimits, DescriptorPattern, EnforcementMode, Rule, hash_key};
+use gabion::rules::{EnforcementMode, Rule, RuleDef, hash_key};
 use gabion::settings::Settings;
 
 use gabion::crdt::{NodeId, NodeIdentity};
 
 use gabion_nginx::access::{AccessCtx, AccessOutcome, VariableLookup, decide_all};
 use gabion_nginx::rules::{
-    BindingLookup, CompiledRules, DescriptorBinding, NopBindingCompiler, RuleConfig,
+    BindingLookup, CompiledRules, NopBindingCompiler, RuleConfig, parse_rule_directive,
 };
 use gabion_nginx::shm::aggregate::ShmAggregateStore;
 use gabion_nginx::shm::header::{SHM_MAGIC, SHM_VERSION};
@@ -104,30 +104,55 @@ fn build_zone(queue_cap: usize, agg_cap: usize) -> (TestZone, ShmRegion) {
     (zone, region)
 }
 
-fn default_limits() -> CardinalityLimits {
-    let (_, storage) = Settings::default().validate().expect("defaults validate");
-    storage.cardinality
+fn storage() -> ValidStorageConfig {
+    Settings::default().validate().expect("defaults validate").1
+}
+
+/// A rule of `rate` on `key`, in 250 ms buckets, built as both adapters
+/// build theirs.
+fn rule(key: &str, rate: &str) -> Rule {
+    RuleDef {
+        name: key,
+        domain: DEFAULT_DOMAIN,
+        patterns: &[(key, "*")],
+        rate,
+        window: None,
+        bucket: Some(Duration::from_millis(250)),
+        mode: EnforcementMode::Enforce,
+    }
+    .build(&storage().cardinality)
+    .expect("rule")
+}
+
+/// One rule per `gabion_limit_rule` directive, compiled as nginx compiles
+/// them.
+fn compile(directives: &[&str]) -> CompiledRules {
+    let configs: Vec<RuleConfig> = directives
+        .iter()
+        .map(|text| {
+            let args: Vec<&str> = text.split_whitespace().collect();
+            parse_rule_directive(&args).expect("directive")
+        })
+        .collect();
+    CompiledRules::compile_with(&configs, &storage(), &mut NopBindingCompiler)
+        .expect("compile rules")
 }
 
 fn build_rules() -> CompiledRules {
-    CompiledRules::compile_with(
-        &[RuleConfig {
-            name: "per_tenant".into(),
-            domain: DEFAULT_DOMAIN.into(),
-            bindings: vec![DescriptorBinding {
-                key: "tenant".into(),
-                source: "$http_x_tenant".into(),
-            }],
-            limit: NonZeroU64::new(2).unwrap(),
-            window: std::time::Duration::from_secs(1),
-            bucket: std::time::Duration::from_millis(250),
-            mode: EnforcementMode::Enforce,
-            except_if: None,
-        }],
-        default_limits(),
-        &mut NopBindingCompiler,
-    )
-    .expect("compile rules")
+    compile(&["per_tenant tenant:$http_x_tenant rate=2r/s bucket=250ms"])
+}
+
+/// The access context over `region` for `rules`, with the default settings.
+fn ctx<'a>(rules: &'a CompiledRules, region: &'a ShmRegion) -> AccessCtx<'a> {
+    let storage = storage();
+    AccessCtx {
+        rules,
+        aggregate: region.aggregate(),
+        queue: region.queue(),
+        stats: region.stats(),
+        cardinality: storage.cardinality,
+        max_matched_rules: storage.max_matched_rules(),
+    }
 }
 
 struct MockVars {
@@ -224,18 +249,7 @@ fn leader_stamps_incarnation_and_applies_deltas() {
     // Build the store and feed it a synthetic delta batch.
     let store = ShmAggregateStore::new(region);
 
-    let rule = Rule::new(
-        1,
-        DEFAULT_DOMAIN.to_string(),
-        vec![DescriptorPattern {
-            key: "tenant".into(),
-            value: "*".into(),
-        }],
-        2,
-        1_000,
-        250,
-        EnforcementMode::Enforce,
-    );
+    let rule = rule("tenant", "2r/s");
     let key_hash = KeyHash(0xABCD);
     let (deltas, expirations) = deltas_and_expirations(&rule, &[(key_hash, 3, 5)], &[]);
     store.apply(&deltas, &expirations);
@@ -250,18 +264,7 @@ fn leader_stamps_incarnation_and_applies_deltas() {
 fn expiration_subtracts_then_empties_when_zero() {
     let (_zone, region) = build_zone(8, 16);
     let store = ShmAggregateStore::new(region);
-    let rule = Rule::new(
-        1,
-        DEFAULT_DOMAIN.to_string(),
-        vec![DescriptorPattern {
-            key: "k".into(),
-            value: "*".into(),
-        }],
-        100,
-        1_000,
-        250,
-        EnforcementMode::Enforce,
-    );
+    let rule = rule("k", "100r/s");
     let kh = KeyHash(0x42);
 
     let (d1, e_empty) = deltas_and_expirations(&rule, &[(kh, 1, 7)], &[]);
@@ -299,21 +302,15 @@ fn expiration_subtracts_then_empties_when_zero() {
 fn access_path_allows_then_rejects_via_aggregate_seqlock() {
     let (_zone, region) = build_zone(8, 16);
     let rules = build_rules();
-    let ctx = AccessCtx {
-        rules: &rules,
-        aggregate: region.aggregate(),
-        queue: region.queue(),
-        stats: region.stats(),
-        domain: DEFAULT_DOMAIN,
-        cardinality: default_limits(),
-    };
+    let ctx = ctx(&rules, &region);
     let vars = MockVars {
         tenant: b"alice".to_vec(),
     };
+    let mut events = Vec::new();
 
     // The first request is under the limit of 2, so it is allowed.
     assert!(matches!(
-        decide_all(ctx, &[0], &vars, 0),
+        decide_all(ctx, &[0], &vars, 0, &mut events),
         AccessOutcome::Allow(_)
     ));
 
@@ -323,15 +320,15 @@ fn access_path_allows_then_rejects_via_aggregate_seqlock() {
         key: "tenant",
         value: "alice",
     }];
-    let spec = rules.rules()[0].rule.spec();
-    let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
+    let spec = rules.table().rules()[0].spec();
+    let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
     let bucket = 0_u32;
     let (deltas, expirations) =
-        deltas_and_expirations(&rules.rules()[0].rule, &[(key_hash, bucket, 3)], &[]);
+        deltas_and_expirations(&rules.table().rules()[0], &[(key_hash, bucket, 3)], &[]);
     store.apply(&deltas, &expirations);
 
     // Third request must now be rejected — total (3) + 1 > limit (2).
-    let outcome = decide_all(ctx, &[0], &vars, 0);
+    let outcome = decide_all(ctx, &[0], &vars, 0, &mut events);
     match outcome {
         AccessOutcome::Reject(info) => {
             assert_eq!(info.spec.id, spec.id);
@@ -360,18 +357,7 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
     const STEADY: u32 = 1_000_000;
 
     let (_zone, region) = build_zone(8, 16);
-    let rule = Rule::new(
-        1,
-        DEFAULT_DOMAIN.to_string(),
-        vec![DescriptorPattern {
-            key: "k".into(),
-            value: "*".into(),
-        }],
-        u64::MAX,
-        1_000,
-        250,
-        EnforcementMode::Enforce,
-    );
+    let rule = rule("k", &format!("{}r/s", u64::MAX / 1_000));
     let fp = rule.fingerprint;
     let steady = KeyHash(0x777);
     let store = ShmAggregateStore::new(region);
@@ -468,24 +454,13 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
 
     // Build a rule and its fingerprint+key the same way nginx would.
-    let rule = Rule::new(
-        1,
-        DEFAULT_DOMAIN.to_string(),
-        vec![DescriptorPattern {
-            key: "tenant".into(),
-            value: "*".into(),
-        }],
-        TOTAL * 2,
-        1_000,
-        250,
-        EnforcementMode::Enforce,
-    );
+    let rule = rule("tenant", &format!("{}r/s", TOTAL * 2));
     let fingerprint = rule.fingerprint;
     let descriptors = [gabion::rules::Descriptor {
         key: "tenant",
         value: "alice",
     }];
-    let key_hash = hash_key(rule.id, DEFAULT_DOMAIN, &descriptors);
+    let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
     let bucket = 1_u32;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -607,18 +582,11 @@ fn decide_all_and_leader_apply_concurrent() {
         let vars = MockVars {
             tenant: b"alice".to_vec(),
         };
-        let limits = default_limits();
+        let mut events = Vec::new();
         for _ in 0..ITERATIONS {
-            let ctx = AccessCtx {
-                rules: &worker_rules,
-                aggregate: r.aggregate(),
-                queue: r.queue(),
-                stats: r.stats(),
-                domain: DEFAULT_DOMAIN,
-                cardinality: limits,
-            };
+            let ctx = ctx(&worker_rules, &r);
             assert!(matches!(
-                decide_all(ctx, &[0], &vars, 0),
+                decide_all(ctx, &[0], &vars, 0, &mut events),
                 AccessOutcome::Allow(_)
             ));
         }
@@ -638,10 +606,9 @@ fn decide_all_and_leader_apply_concurrent() {
             key: "tenant",
             value: "alice",
         }];
-        let spec = leader_rules.rules()[0].rule.spec();
-        let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
+        let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
         let hit = [(key_hash, 0, 1)];
-        let (d, e) = deltas_and_expirations(&leader_rules.rules()[0].rule, &hit, &hit);
+        let (d, e) = deltas_and_expirations(&leader_rules.table().rules()[0], &hit, &hit);
         for _ in 0..=1_000 {
             store.apply(&d, &e);
             if leader_stop.load(Ordering::Acquire) {
@@ -661,8 +628,8 @@ fn decide_all_and_leader_apply_concurrent() {
         key: "tenant",
         value: "alice",
     }];
-    let spec = rules.rules()[0].rule.spec();
-    let key_hash = hash_key(spec.id, DEFAULT_DOMAIN, &descriptors);
+    let spec = rules.table().rules()[0].spec();
+    let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
     assert!(
         region
             .aggregate()
@@ -690,38 +657,10 @@ fn decide_all_multi_rule_concurrent() {
     // SAFETY: zone is fresh, 8-byte aligned, exclusive during init.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
 
-    let rule_configs = vec![
-        RuleConfig {
-            name: "rule_a".into(),
-            domain: DEFAULT_DOMAIN.into(),
-            bindings: vec![DescriptorBinding {
-                key: "tenant_a".into(),
-                source: "$http_x_tenant".into(),
-            }],
-            limit: NonZeroU64::new(u64::MAX / 2).unwrap(),
-            window: std::time::Duration::from_secs(1),
-            bucket: std::time::Duration::from_millis(250),
-            mode: EnforcementMode::Enforce,
-            except_if: None,
-        },
-        RuleConfig {
-            name: "rule_b".into(),
-            domain: DEFAULT_DOMAIN.into(),
-            bindings: vec![DescriptorBinding {
-                key: "tenant_b".into(),
-                source: "$http_x_tenant".into(),
-            }],
-            limit: NonZeroU64::new(u64::MAX / 2).unwrap(),
-            window: std::time::Duration::from_secs(1),
-            bucket: std::time::Duration::from_millis(250),
-            mode: EnforcementMode::Enforce,
-            except_if: None,
-        },
-    ];
-    let rules = Arc::new(
-        CompiledRules::compile_with(&rule_configs, default_limits(), &mut NopBindingCompiler)
-            .expect("compile two rules"),
-    );
+    let rules = Arc::new(compile(&[
+        "rule_a tenant_a:$http_x_tenant rate=9223372036854775r/s bucket=250ms",
+        "rule_b tenant_b:$http_x_tenant rate=9223372036854775r/s bucket=250ms",
+    ]));
     let stop = Arc::new(AtomicBool::new(false));
     let worker_rules = rules.clone();
     let worker_stop = stop.clone();
@@ -730,18 +669,11 @@ fn decide_all_multi_rule_concurrent() {
         let vars = MockVars {
             tenant: b"alice".to_vec(),
         };
-        let limits = default_limits();
+        let mut events = Vec::new();
         for _ in 0..ITERATIONS {
-            let ctx = AccessCtx {
-                rules: &worker_rules,
-                aggregate: r.aggregate(),
-                queue: r.queue(),
-                stats: r.stats(),
-                domain: DEFAULT_DOMAIN,
-                cardinality: limits,
-            };
+            let ctx = ctx(&worker_rules, &r);
             assert!(matches!(
-                decide_all(ctx, &[0, 1], &vars, 0),
+                decide_all(ctx, &[0, 1], &vars, 0, &mut events),
                 AccessOutcome::Allow(_)
             ));
         }
@@ -753,13 +685,12 @@ fn decide_all_multi_rule_concurrent() {
         let r = region;
         let store = ShmAggregateStore::new(r);
         for _ in 0..=1_000 {
-            for compiled in leader_rules.rules() {
-                let rule = &compiled.rule;
+            for rule in leader_rules.table().rules() {
                 let descriptors = [gabion::rules::Descriptor {
-                    key: &compiled.bindings[0].key,
+                    key: &rule.descriptors[0].key,
                     value: "alice",
                 }];
-                let key_hash = hash_key(rule.id, DEFAULT_DOMAIN, &descriptors);
+                let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);
                 let (d, e) = deltas_and_expirations(rule, &[(key_hash, 0, 1)], &[]);
                 store.apply(&d, &e);
             }

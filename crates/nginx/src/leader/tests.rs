@@ -1,17 +1,14 @@
 use super::*;
 
 use std::cell::Cell;
-use std::num::NonZeroU64;
 use std::sync::mpsc as std_mpsc;
 use std::time::Instant;
 
 use gabion::crdt::{DeltaSink, ExpirationSink};
 use gabion::gossip::AggregateStore;
-use gabion::rules::EnforcementMode;
 use tokio::time::timeout;
 
-use crate::rules::mock::compile;
-use crate::rules::{DEFAULT_DOMAIN, DescriptorBinding, RuleConfig};
+use crate::rules::mock::rules;
 use crate::shm::Layout;
 use crate::shm::queue::QueueEvent;
 
@@ -32,20 +29,7 @@ fn leaked_region() -> ShmRegion {
 }
 
 fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
-    let rules = compile(&[RuleConfig {
-        name: "per_tenant".into(),
-        domain: DEFAULT_DOMAIN.into(),
-        bindings: vec![DescriptorBinding {
-            key: "tenant".into(),
-            source: "$http_x_tenant".into(),
-        }],
-        limit: NonZeroU64::new(2).unwrap(),
-        window: Duration::from_secs(1),
-        bucket: Duration::from_secs(1),
-        mode: EnforcementMode::Enforce,
-        except_if: None,
-    }])
-    .expect("rules");
+    let rules = rules(&["per_tenant tenant:$http_x_tenant rate=2r/s"]);
     let (gossip, cell_store) = crate::mock::validated(|_| {});
     let config = LeaderConfig {
         worker_id,
@@ -146,7 +130,7 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
     let (runtime, client) = GossipRuntime::bind(
         LONE_NODE_BIND,
         gossip.with_shallow_limit_queue(),
-        CellStore::new(cell_store, identity),
+        CellStore::new(cell_store, identity, rules(&[]).table()),
         applied.clone(),
     )
     .await

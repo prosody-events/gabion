@@ -2,6 +2,8 @@
 
 use std::marker::PhantomData;
 
+use thiserror::Error;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{BucketEpoch, Count, KeyHash};
@@ -79,6 +81,43 @@ impl<C: Count> GossipClient<C> {
         applied.await.map_err(|_| GossipError::RuntimeShutDown)
     }
 
+    /// Hand one hit to the runtime without waiting: no reply channel, and a
+    /// full queue refuses the hit rather than block the caller. The path
+    /// `gabiond`'s admission takes; [`Self::record`] remains for the wasm
+    /// engine.
+    pub fn try_record(
+        &self,
+        rule_fingerprint: u128,
+        key_hash: KeyHash,
+        bucket: BucketEpoch,
+        hits: u64,
+        rule_limit: u64,
+        now_millis: u64,
+    ) -> Result<(), TryRecordError> {
+        let permit = self.requests.try_reserve().map_err(|error| match error {
+            TrySendError::Full(()) => TryRecordError::Full,
+            TrySendError::Closed(()) => TryRecordError::ShutDown,
+        })?;
+        RecordPermit {
+            permit,
+            reply: None,
+        }
+        .record(
+            rule_fingerprint,
+            key_hash,
+            bucket,
+            hits,
+            rule_limit,
+            now_millis,
+        );
+        Ok(())
+    }
+
+    /// The request queue's depth, `gossip.limit_queue_capacity`.
+    pub fn capacity(&self) -> usize {
+        self.requests.max_capacity()
+    }
+
     /// Wait until the runtime's request queue has room for `n` hits, so a
     /// caller can leave its hits where they are until the runtime can take
     /// them. `n` must not exceed the queue's capacity,
@@ -107,6 +146,15 @@ impl<C: Count> GossipClient<C> {
             .await
             .map_err(|_| GossipError::RuntimeShutDown)
     }
+}
+
+/// Why [`GossipClient::try_record`] refused a hit.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum TryRecordError {
+    #[error("the gossip request queue is full")]
+    Full,
+    #[error("gossip runtime is no longer running")]
+    ShutDown,
 }
 
 /// A slot in the runtime's request queue, from [`GossipClient::reserve`].

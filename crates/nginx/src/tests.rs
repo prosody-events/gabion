@@ -18,6 +18,7 @@ fn nginx_zero_is_rejected_not_clamped() {
         "gabion_storage_peer_capacity",
         "gabion_storage_max_descriptor_bytes",
         "gabion_storage_max_key_bytes",
+        "gabion_storage_max_matched_rules",
     ] {
         let setting = *Setting::ALL
             .iter()

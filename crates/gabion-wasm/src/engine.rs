@@ -29,6 +29,7 @@ use gabion::gossip::{
     AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipError, GossipRuntime,
     ValidGossipConfig,
 };
+use gabion::rules::RuleTable;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
@@ -42,10 +43,6 @@ use crate::shims::{AddressBook, EventEmittingAggregateStore, EventLog, LoggingSi
 const BASE_PORT: u16 = 40_000;
 /// Cluster id mixed into every packet header (matches the bench).
 pub(crate) const CLUSTER_ID_HASH: u128 = 0xC1;
-/// Local rule id for the single watched rule. Any value other than
-/// `u32::MAX` marks the rule as locally applicable so its cells count toward
-/// the aggregate (see `RuleDescriptor::applies_locally`).
-const LOCAL_RULE_ID: u32 = 0;
 
 /// Caps one round's frame at 160 cells, about eight 1,400-byte packets, so
 /// one round's packets to a node stay well inside [`VIZ_ROUTER_CAPACITY`]; a
@@ -251,6 +248,12 @@ struct EngineState {
     gossip: ValidGossipConfig,
     /// Every node's storage, sized by [`SimConfig::settings`].
     storage: ValidStorageConfig,
+    /// The watched rule, which every node interns at construction.
+    rules: RuleTable,
+    /// That rule as the cell store holds it. The one source of the rule the
+    /// nodes intern, the bucket epoch the submission path stamps, and the
+    /// window the snapshot reports, so they never drift apart.
+    rule: RuleDescriptor,
     router: SimRouter,
     nodes: Vec<NodeHandle>,
     addresses: AddressBook,
@@ -277,6 +280,8 @@ impl EngineState {
             config,
             gossip,
             storage,
+            rules,
+            rule,
         }: ValidSimConfig,
     ) -> Self {
         let log: EventLog = Rc::new(RefCell::new(Vec::new()));
@@ -290,6 +295,8 @@ impl EngineState {
             config,
             gossip,
             storage,
+            rules,
+            rule,
             router: SimRouter::with_channel_capacity(VIZ_ROUTER_CAPACITY),
             nodes: Vec::with_capacity(initial_nodes),
             addresses,
@@ -327,27 +334,10 @@ impl EngineState {
         state
     }
 
-    /// The watched rule as a [`RuleDescriptor`], built from `self.config`. The
-    /// one construction site, so the rule the nodes intern, the bucket epoch
-    /// the submission path stamps, and the window the snapshot reports can
-    /// never drift from one another (or from gabion's own window/epoch
-    /// helpers).
-    fn rule_descriptor(&self) -> RuleDescriptor {
-        RuleDescriptor {
-            fingerprint: self.config.rule_fingerprint,
-            window_millis: self.config.rule_window_ms,
-            bucket_millis: self.config.rule_bucket_ms,
-            limit: self.config.rule_limit,
-            flags: 0,
-            local_rule_id: LOCAL_RULE_ID,
-        }
-    }
-
     /// Build, spawn, and register one node with stable id `id`, bootstrapped
     /// against `bootstrap` (its own address is filtered out if present). The
     /// single node-construction path: both [`EngineState::build`] and
-    /// [`EngineState::add_node`] route through here, so the rule-intern footgun
-    /// guard below is honored identically on every path.
+    /// [`EngineState::add_node`] route through here.
     ///
     /// Every node shares the storage and gossip configs `SimConfig::validate`
     /// built once, so a joiner is sized like the initial members.
@@ -355,12 +345,9 @@ impl EngineState {
         let addr = addr_of_id(id);
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
 
-        let mut store = CellStore::<Count>::new(self.storage, identity);
-        // Footgun guard: intern the watched rule with the configured
-        // window/bucket *before* any request. Unknown rules otherwise intern
-        // with `RuleDescriptor::default()` (60 s / 1 s), making bucket and
-        // expiry math silently wrong.
-        store.intern_rule(self.rule_descriptor());
+        // The store interns the watched rule, with its window and bucket,
+        // before any request.
+        let store = CellStore::<Count>::new(self.storage, identity, &self.rules);
 
         let bootstrap_peers: Vec<SocketAddr> =
             bootstrap.iter().copied().filter(|a| *a != addr).collect();
@@ -436,15 +423,15 @@ impl EngineState {
             .position_of(node)
             .map(|pos| &self.nodes[pos])
             .ok_or(EngineError::UnknownNode { id: node })?;
-        let bucket = self.rule_descriptor().current_epoch(self.virtual_ms);
+        let bucket = self.rule.current_epoch(self.virtual_ms);
         handle
             .client
             .record(
-                self.config.rule_fingerprint,
+                self.rule.fingerprint,
                 KeyHash(key),
                 bucket,
                 hits,
-                self.config.rule_limit,
+                self.rule.limit,
                 self.virtual_ms,
             )
             .await
@@ -752,14 +739,13 @@ impl EngineState {
         // sum counts each hit exactly once — and it decays with the window as
         // cells age out, which a monotonic counter never did. This is the
         // honest target the convergence fan races toward.
-        let fingerprint = self.config.rule_fingerprint;
+        let fingerprint = self.rule.fingerprint;
         let oracle_total: u64 = nodes
             .iter()
             .flat_map(|node| &node.cells)
             .filter(|cell| cell.is_local && cell.rule == fingerprint)
             .map(|cell| cell.count)
             .sum();
-        let rd = self.rule_descriptor();
         ClusterState {
             virtual_ms: self.virtual_ms,
             tick: self.current_tick(),
@@ -768,7 +754,7 @@ impl EngineState {
             // The CRDT's own window position at this instant — the Strata
             // right-anchors its fixed-width grid on this epoch instead of
             // recomputing the boundary in TypeScript.
-            bucket_epoch_now: rd.current_epoch(self.virtual_ms),
+            bucket_epoch_now: self.rule.current_epoch(self.virtual_ms),
         }
     }
 

@@ -248,15 +248,17 @@ requests every `period × U(1 − jitter, 1 + jitter)`, first at
 rate `limit / window`; burst keys are Poisson at `rate_rps` during their
 interval. Every request lands on a uniformly random running pod, as a load
 balancer would place it. The adapter (`src/harness/adapter.rs`) hashes keys with
-`gabion::rules::hash_key` and takes the rule fingerprint from
-`gabion::rules::Rule::new`, as the production adapters do.
+`gabion::rules::hash_key` and builds the rule through
+`gabion::rules::RuleDef::build` and `RuleTable::new`, as the production adapters
+do.
 
-**Admission** follows `SharedLimiter::evaluate`
+**Admission** follows `SharedLimiter::decide`
 (`crates/server/src/lib.rs`): read the pod's window total, reject iff
 `total + hits > limit`, otherwise record the hit with
 `GossipClient::record(fingerprint, key_hash, now_ms / bucket_ms, 1, limit,
 now_ms)` and wait for the acknowledgement (the runtime has applied it to the
-pod's aggregate). Only admitted hits are recorded. The offered load is
+pod's aggregate), where `gabiond` hands the hit over with `try_record` and
+does not wait. Only admitted hits are recorded. The offered load is
 identical across solutions; the admitted load legitimately differs.
 
 **Membership and churn** (`src/harness/plan.rs`), computed before any node
@@ -276,11 +278,11 @@ removes it 10 s later, plus `U(0, 2 s)`. A stopped pod leaves the load
 balancer at once. Optional partitions drop all traffic between one zone and
 the rest during an interval.
 
-**Aggregate store.** Each pod's `AggregateStore` (`NodeStore` in the adapter) is a per-key ring of
-per-bucket totals: deltas add, expirations subtract the origin's last count,
-the window total sums the live buckets. This is the server adapter's
-`DashMapStore` (`crates/server/src/store.rs`) laid out for a key population
-known up front; within the live window the two are equivalent.
+**Aggregate store.** Each pod's `AggregateStore` (`NodeStore` in the adapter) is
+the library's aggregate table (`gabion::aggregate::Aggregate`), sized from the
+pod's `cell_capacity` as `gabiond` sizes it from `storage.max_cells`: deltas
+add, expirations subtract the origin's last count, the window total sums the
+live buckets, exactly as both adapters read it on admission.
 
 **Sizing.** Capacities are derived from the regime, identically for every
 arm. The core fixes `cell_capacity`: 1.5 × an upper bound on the cells one

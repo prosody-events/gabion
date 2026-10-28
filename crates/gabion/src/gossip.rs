@@ -37,7 +37,7 @@ mod tests;
 pub use admin::{AdminCommand, AdminSnapshot, GossipCounters, PeerEntry};
 #[cfg(feature = "cell-dump")]
 pub use admin::{CellDumpEntry, CellDumpSnapshot};
-pub use client::{GossipClient, RecordPermit};
+pub use client::{GossipClient, RecordPermit, TryRecordError};
 pub use clock::{Clock, FixedClock, Ticker, TokioClock};
 pub use runtime::GossipRuntime;
 pub use store::AggregateStore;

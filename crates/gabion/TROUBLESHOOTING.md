@@ -29,11 +29,25 @@ Message starts: "Too many distinct rate-limit rules are in flight."
 
 **What happened.** The rule dictionary had no free slot for a rule. The rule cannot be registered on this node, so requests it matches are allowed and its limit under-counts here.
 
-**Why.** Usually more rules are configured across the cluster than the dictionary holds, for example during a configuration rollout that briefly runs old and new rule sets together.
+**Why.** Usually more rules are live across the cluster than the dictionary holds, for example during a configuration rollout that briefly runs old and new rule sets together.
 
-**What to do next.** Raise `storage.rule_dictionary_capacity` (`GABION_STORAGE_RULE_DICTIONARY_CAPACITY`) in `gabiond`, or `gabion_storage_rule_dictionary_capacity` in NGINX, above the number of distinct rules alive in the cluster at once.
+**What to do next.** The default is twice the configured rules, at least 256. Set `storage.rule_dictionary_capacity` (`GABION_STORAGE_RULE_DICTIONARY_CAPACITY`) in `gabiond`, or `gabion_storage_rule_dictionary_capacity` in NGINX, above the number of distinct rules alive in the cluster at once, and only above that default.
 
 **Fields** `config_key`, `capacity`, `in_use`, `rule_fingerprint`, `rejected_total` · **Knob** `storage.rule_dictionary_capacity` (`GABION_STORAGE_RULE_DICTIONARY_CAPACITY`) / `gabion_storage_rule_dictionary_capacity`
+
+### `aggregate_full`
+
+**Level** warn, power of two · **Request allowed** yes, that key not counted · **Emitted by** library (both adapters)
+
+Message starts: "The count table had no free slot for a rate-limit key"
+
+**What happened.** The aggregate table both adapters read on admission had no free slot near a key's home, so that key's hits were not counted: its requests were allowed and it is under-counted.
+
+**Why.** The table needs a slot per rule × active key × live bucket (window / bucket + 1), and it is too small for the current traffic; lookups stay short only while it is under half full.
+
+**What to do next.** Raise `storage.max_cells` (`GABION_STORAGE_MAX_CELLS`) in `gabiond`, whose table holds that many slots rounded up to a power of two, or SIZE in `gabion_limit_zone zone=NAME:SIZE` in NGINX.
+
+**Fields** `config_key`, `capacity`, `dropped_total` · **Knob** `storage.max_cells` (`GABION_STORAGE_MAX_CELLS`) / SIZE in `gabion_limit_zone`
 
 ### `node_dictionary_full`
 

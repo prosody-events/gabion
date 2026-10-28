@@ -10,11 +10,11 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 anyhow.workspace = true
-arrayvec.workspace = true
 futures.workspace = true
 gabion.workspace = true
 humantime.workspace = true
-# The `loom` feature swaps the SHM atomics for loom's; `make loom` only.
+# The `loom` feature swaps the SHM atomics, and the library aggregate table's,
+# for loom's; `make loom` only.
 loom = { workspace = true, optional = true }
 nginx-sys = { workspace = true, optional = true }
 ngx = { workspace = true, optional = true }
@@ -26,6 +26,7 @@ whoami.workspace = true
 
 [features]
 default = []
+loom = ["dep:loom", "gabion/loom"]
 ngx-module = ["dep:nginx-sys", "dep:ngx", "ngx/async", "export-modules"]
 export-modules = []
 
@@ -39,5 +40,5 @@ quickcheck.workspace = true
 quickcheck_macros.workspace = true
 
 [[bench]]
-name = "aggregate"
+name = "access"
 harness = false

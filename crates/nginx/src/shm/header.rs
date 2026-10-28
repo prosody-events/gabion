@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const SHM_MAGIC: u32 = 0x4742_4e58; // "GBNX"
-pub const SHM_VERSION: u32 = 3;
+pub const SHM_VERSION: u32 = 4;
 
 /// Node identity fields stored cross-process. `node_id` is stamped by the
 /// master on every config load, before fork; `incarnation` is updated
@@ -16,7 +16,7 @@ pub const SHM_VERSION: u32 = 3;
 /// `align_of::<u64>` = 8, and a 16-aligned `u128` placed directly here
 /// would be UB on amd64 (LLVM lowers u128 access to aligned SSE). See
 /// `Module::create_main_conf`'s doc comment for the same hazard in the
-/// nginx pool. `shm/queue.rs` and `shm/aggregate.rs` use the same
+/// nginx pool. `shm/queue.rs` and `gabion::aggregate` use the same
 /// paired-u64 convention for their own logical-u128 fields.
 #[repr(C)]
 #[derive(Debug, Default)]

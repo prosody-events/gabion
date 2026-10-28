@@ -4,22 +4,30 @@
 //! tests and examples. Server-facing binaries should use these values.
 
 pub const STORAGE_MAX_CELLS: usize = 131_072;
-pub const STORAGE_RULE_DICTIONARY_CAPACITY: u16 = 64;
+/// Floor of the rule dictionary's default capacity, `max(256, 2 × rules)`;
+/// `storage.rule_dictionary_capacity` overrides it.
+pub const STORAGE_RULE_DICTIONARY_FLOOR: u16 = 256;
 pub const STORAGE_NODE_DICTIONARY_CAPACITY: u16 = 1024;
 pub const STORAGE_LOCAL_DIRTY_CAPACITY: usize = 65_536;
 pub const STORAGE_FORWARDED_DIRTY_CAPACITY: usize = 524_288;
 pub const STORAGE_PEER_CAPACITY: u16 = 256;
 
-pub const STORAGE_MAX_DESCRIPTOR_COUNT: usize = 16;
+pub const STORAGE_MAX_DESCRIPTOR_COUNT: u16 = 16;
 pub const STORAGE_MAX_DESCRIPTOR_BYTES: usize = 512;
 pub const STORAGE_MAX_KEY_BYTES: usize = 128;
 
-/// Most rules one request is counted against. A request that matches more is
-/// **allowed** and the rest under-count: gabiond checks one rule past the
-/// cap, stops, and logs `matched_rule_overflow`; NGINX still checks every
-/// rule but queues counts for only the first this-many and bumps the SHM
-/// `matched_rule_overflows` counter. A build-time constant, not a setting.
-pub const STORAGE_MAX_MATCHED_RULES: usize = 16;
+/// Default of `storage.max_matched_rules`, the most rules one request is
+/// counted against. A request that matches more is **allowed** and the rest
+/// under-count: gabiond checks one rule past the bound, stops, and logs
+/// `matched_rule_overflow`; NGINX still checks every rule but queues counts
+/// for only the first this-many and bumps the SHM `matched_rule_overflows`
+/// counter.
+pub const STORAGE_MAX_MATCHED_RULES: u16 = 16;
+
+/// Default of `storage.max_request_descriptors`, the most descriptors of one
+/// Envoy request gabiond evaluates; the rest are rejected as
+/// `cardinality_rejected`.
+pub const STORAGE_MAX_REQUEST_DESCRIPTORS: u16 = 16;
 
 pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 

@@ -300,7 +300,8 @@ while the table is under half full. For example, 650 keys a second under
 live, so choose 16,384 slots: `zone=api:2m`. A zone too small for the
 queue and 1,024 slots fails `nginx -t` naming the smallest SIZE that fits;
 `1m` fits the default queue capacity. When the table runs out of room, gabion allows the request,
-under-counts that key, increments `aggregate_dropped` and logs a warning.
+under-counts that key, increments `aggregate_dropped` and logs
+`aggregate_full` ([library troubleshooting](../gabion/TROUBLESHOOTING.md#aggregate_full)).
 
 #### `gabion_limit_rule NAME [$bindings...] rate=Nr/<unit> [...]` *(http)*
 
@@ -308,18 +309,28 @@ Declares a rate-limit rule. Positional arguments after the name are
 descriptor bindings; named arguments and bare flags follow.
 
 ```nginx
-gabion_limit_rule per_ip    $remote_addr                  rate=100r/s;
-gabion_limit_rule per_uri   $uri                          rate=10r/s;
-gabion_limit_rule per_route tenant:$arg_tenant path:$uri  rate=5r/s;
+gabion_limit_rule per_ip     $remote_addr                  rate=100r/s;
+gabion_limit_rule per_uri    $uri                          rate=10r/s;
+gabion_limit_rule per_route  tenant:$arg_tenant path:$uri  rate=5r/s;
 
-gabion_limit_rule by_asn    $geoip2_asn_number   rate=50r/s except_if=$trusted_ip;
-gabion_limit_rule by_bot    class:$bot_class     rate=10r/s;
-gabion_limit_rule shadow    $uri                 rate=1r/s  dry_run;
+gabion_limit_rule by_asn     $geoip2_asn_number   rate=50r/s except_if=$trusted_ip;
+gabion_limit_rule by_bot     class:$bot_class     rate=10r/s;
+gabion_limit_rule shadow     $uri                 rate=60r/m dry_run;
 
-gabion_limit_rule slow_path $uri                 rate=5r/30s;
-gabion_limit_rule daily_cap tenant:$arg_tenant   rate=10000r/d;
-gabion_limit_rule sustained tenant:$arg_tenant   rate=10r/s window=5h bucket=1h;
+gabion_limit_rule slow_path  $uri                 rate=5r/30s;
+gabion_limit_rule smooth     $uri                 rate=5r/30s bucket=5s;
+gabion_limit_rule daily_cap  tenant:$arg_tenant   rate=10000r/d;
+gabion_limit_rule sustained  tenant:$arg_tenant   rate=10r/s window=5h bucket=1h;
+gabion_limit_rule acme_cap   tenant:$arg_tenant   rate=100r/s value=tenant:acme;
 ```
+
+**A rule's identity** is its domain, its bindings' keys and values, its
+window and its bucket; the limit and the mode stay out, so changing either
+keeps the rule's counts. Two rules with one identity would share counters,
+so `nginx -t` refuses them; above, `per_uri`, `shadow`, `slow_path` and
+`smooth` all key on `$uri` but each has its own window or bucket. A
+`gabiond` rule with the same identity shares counts with the NGINX one in a
+mixed cluster, whichever order either configuration lists them in.
 
 **Descriptor bindings.** A binding pairs a descriptor key with a
 variable expression evaluated at request time:
@@ -351,7 +362,8 @@ since they only pay for what they use.
 | `mode=disabled`         | Skip the rule entirely.                                                                                                                    |
 | `dry_run`               | Bare flag; alias for `mode=dry_run`.                                                                                                       |
 | `except_if=$variable`   | Skip the rule when `$variable` resolves truthy. See [Predicates](#predicates-except_ifvariable).                                           |
-| `domain=NAME`           | Domain bucket for the rule (defaults to `nginx`). Must match `[A-Za-z_][A-Za-z0-9_.-]*`.                                                   |
+| `domain=NAME`           | Domain for the rule (defaults to `nginx`): 1 to 255 bytes with no whitespace or control characters, as in `gabiond`. Keys hash in it.        |
+| `value=KEY:LITERAL`     | The binding keyed `KEY` matches only `LITERAL` (default `*`, any value); any other value declines the rule for that request, counting nothing. `KEY` must name one of the rule's bindings. |
 
 **Rate, window, and bucket.** A rule resolves internally to three
 numbers — a `limit`, a `window`, and a `bucket` — controlled by
@@ -503,14 +515,15 @@ to touch them if your workload runs into the cap.
 | Directive                                       | Default     | Effect                                                                                |
 |-------------------------------------------------|-------------|---------------------------------------------------------------------------------------|
 | `gabion_storage_max_cells N`                    | `131072`    | Total cell capacity in the CRDT.                                                      |
-| `gabion_storage_rule_dictionary_capacity N`     | `64`        | Number of distinct rule slots (each unique `rule_fingerprint` interns into one slot). |
+| `gabion_storage_rule_dictionary_capacity N`     | twice the rules, at least `256` | Number of distinct rule slots (each unique `rule_fingerprint` interns into one slot). Set it only on `rule_dictionary_full`; below the number of rules fails `nginx -t`. |
 | `gabion_storage_node_dictionary_capacity N`     | `1024`      | Number of distinct (node_id, incarnation) slots.                                      |
 | `gabion_storage_local_dirty_capacity N`         | `65536`     | Local dirty-ring capacity. Sized to absorb a burst between heartbeats.                |
 | `gabion_storage_forwarded_dirty_capacity N`     | `524288`    | Forwarded dirty-ring capacity. Sized larger because it tracks peer-originated edits we still owe other peers. |
 | `gabion_storage_peer_capacity N`                | `256`       | Peer slots in the peer-frontier table (one row per peer × node).                      |
-| `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare, 1 to 16 (`STORAGE_MAX_DESCRIPTOR_COUNT`); a larger value fails `nginx -t`. |
+| `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare, up to 65,535.                           |
 | `gabion_storage_max_descriptor_bytes N`         | `512`       | Per-request budget on `(key + value)` bytes summed across descriptors plus the domain. Exceeded ⇒ 400. |
 | `gabion_storage_max_key_bytes N`                | `128`       | Cap on a single descriptor key's length (validated at config phase).                  |
+| `gabion_storage_max_matched_rules N`            | `16`        | Most rules one request is counted against; past it the request is allowed and the rest under-count (`matched_rule_overflows`). Each worker reserves 64 bytes per rule once, on its first request. |
 
 ### Runtime / identity
 
@@ -649,10 +662,9 @@ through, so the rule applies as if the predicate were not there,
 which is the same fail-open shape as a missing descriptor variable;
 operator-typo protection runs at startup, because `nginx -t` rejects
 a predicate that names a variable no loaded module provides.
-Finally, exempted requests bump a separate counter: the SHM stats
-snapshot exposes `exempted` globally and `exempted_per_rule[]`
-indexed by `rule_id - 1`, so a misconfigured always-true predicate
-is visible against the global allow counter.
+Finally, exempted requests bump a separate SHM counter, `exempted`, so a
+misconfigured always-true predicate is visible against the allow
+counter.
 
 ### Combining multiple bypass conditions
 
@@ -757,13 +769,13 @@ counters on every other replica rise within a tick or two. If they
 don't, the gossip channel is partitioned — typical causes are a UDP
 firewall or `gabion_gossip_bind` being unreachable between pods.
 
-The nginx adapter does not currently expose an admin HTTP endpoint.
-The SHM `Stats` snapshot (`requests`, `allowed`, `rejected`,
+The nginx adapter does not currently expose an admin HTTP endpoint; its
+SHM `Stats` counters (`requests`, `allowed`, `rejected`,
 `rejected_cardinality`, `declines_invalid_descriptor`,
-`matched_rule_overflows`, `exempted`, `exempted_per_rule[]`,
-`queue_pushed`, `queue_drained`, `queue_dropped`, `aggregate_dropped`) is the operator's
-local readout; the server adapter exposes the same data via
-`/snapshot` (see [`../server/README.md`](../server/README.md)).
+`matched_rule_overflows`, `exempted`, `queue_pushed`, `queue_drained`,
+`queue_dropped`, `aggregate_dropped`) are read by the module's tests, and
+the counters with a warning surface in the log. The server adapter exposes
+its state via `/snapshot` (see [`../server/README.md`](../server/README.md)).
 
 ## Configuration error messages
 
@@ -786,11 +798,11 @@ Examples (verbatim, all from the current source):
 ```
 gabion: `gabion_limit_zone` argument must start with `zone=` (e.g. `zone=api:128m`)
 gabion: `gabion_limit_zone` zone name `nope!` must match `[A-Za-z0-9_]+` (matches nginx core's `limit_req_zone` grammar)
-gabion: `gabion_limit_rule` rule `per_ip` is missing the required `rate=Nr/s` argument
+gabion: `gabion_limit_rule` rule `per_ip` has no `rate=`, so it has no limit to enforce. Add one (for example `rate=10r/s`), then run `nginx -t`
 gabion: `gabion_limit_rule` argument `key=$uri` is invalid: expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, `mode=`, `dry_run`, `except_if=`, `domain=`
 gabion: `gabion_limit_rule` argument `rate=100r/fortnight` is invalid: rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`
-gabion: `gabion_limit_rule` rule `inverted`: the window is shorter than the rate's period, so the rate cannot be spread over it. To enforce N requests in a shorter span, put the period in the rate itself (for example `100r/500ms`)
-gabion: `gabion_limit_rule` rule `per_ip` is declared more than once; rule names must be unique within an http {} block
+gabion: Rule `inverted`: the window is shorter than the rate's period, so the rate cannot be spread over it. To enforce N requests in a shorter span, put the period in the rate itself (for example `100r/500ms`).
+gabion: Two rules are named `per_ip`. Rule names must be unique; rename one.
 gabion: `gabion_limit` references rule `tenant_api`, which is not declared via `gabion_limit_rule`
 gabion: `gossip.cluster_id_hash` is `0`, which is not a non-zero cluster id in decimal or `0x`-prefixed hex, for example `0xc0ffee`. Correct it (`GABION_GOSSIP_CLUSTER_ID_HASH`; NGINX `gabion_gossip_cluster`) or remove it to use the default, 1.
 gabion: rules are declared but `gabion_limit_zone` is not set, so no request would ever be counted or limited: the zone is the shared memory that holds the counts. Add `gabion_limit_zone zone=gabion:64m;` to the http {} block.
@@ -808,10 +820,13 @@ below are the module's own.
 |-------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
 | `nginx -t` says `unknown 'foo' variable`                                      | A `gabion_limit_rule` references a variable no loaded module defines.                                                                               | Load the providing module (`geoip2`, `map`, `geo`) before the `gabion_limit_rule` that references it.                            |
 | `gabion_limit references rule X, which is not declared`                       | A `gabion_limit X;` names a rule with no `gabion_limit_rule X` declaration in the same `http {}` block.                                             | Add the missing declaration or fix the name.                                                                                     |
-| `gabion_limit_rule rule X is declared more than once`                         | Two `gabion_limit_rule X ...` directives with the same name. The grammar is unambiguous; almost always a copy-paste bug.                            | Pick distinct names.                                                                                                             |
+| `Two rules are named X`                                                       | Two `gabion_limit_rule X ...` directives with the same name. The grammar is unambiguous; almost always a copy-paste bug.                            | Pick distinct names.                                                                                                             |
+| `Rules X and Y count the same keys with the same domain, descriptors, window and bucket` | Two rules share an identity, so their counters could not be told apart; they may differ only in limit or mode.                         | Give one a different binding, `window=` or `bucket=`, or merge them.                                                             |
+| `` `value=K:…` in rule X names no binding of that rule ``                     | `value=` names a key none of the rule's bindings has.                                                                                               | Add a binding keyed `K`, or correct the key.                                                                                     |
 | `gabion_limit_rule argument 'rate=0r/s' is invalid`                           | Zero rate; would deny all traffic.                                                                                                                  | Pick a non-zero positive integer. To temporarily disable a rule, use `mode=disabled`.                                            |
-| `gabion_limit_rule rule X: the window is shorter than the rate's period`         | `window=` was paired with a rate whose period is longer (e.g. `rate=200r/s window=500ms`); a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (for example `rate=100r/500ms`) instead of pairing a short window with a longer-period rate.       |
-| `gabion_limit_rule rule X has more descriptor bindings than …`, `… binding key K is longer than …`, or `… rule X: nginx could not compile binding …` | The rule's bindings exceed `gabion_storage_max_descriptor_count` or `gabion_storage_max_key_bytes`, or nginx rejected a binding (an invalid template, or it ran out of configuration memory); the message says which. | Fix the rule (or raise the named directive), then run `nginx -t` to re-check. |
+| `Rule X: the window is shorter than the rate's period`                           | `window=` was paired with a rate whose period is longer (e.g. `rate=200r/s window=500ms`); a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (for example `rate=100r/500ms`) instead of pairing a short window with a longer-period rate.       |
+| `Rule X has N descriptors, above …`, `Rule X has descriptor key K of N bytes, above …`, `Rule X has descriptor key K, but keys must match …`, `Rule X has a domain …`, or `rule X: nginx could not compile binding …` | The rule's bindings exceed `gabion_storage_max_descriptor_count` or `gabion_storage_max_key_bytes`, a key or the domain breaks the grammar both adapters share, or nginx rejected a binding (an invalid template, or it ran out of configuration memory); the message says which. | Fix the rule (or raise the named directive), then run `nginx -t` to re-check. |
+| `N rate-limit rules are configured, but storage.rule_dictionary_capacity … is M` | `gabion_storage_rule_dictionary_capacity` is set below the number of rules.                                                                     | Remove it to use the default (twice the rules, at least 256), or raise it.                                                       |
 | `` gabion: `X` is 0, but it must be at least 1: … ``                           | A count, capacity or duration directive was set to 0, which would disable what it sizes.                                                            | Remove the directive to use the default the message names, or set a positive value.                                              |
 | `` gabion: `X` is `V`, which is not …, for example `E`. … ``                   | The directive's argument does not parse: an integer in range, a duration in whole milliseconds (`500ms`), a socket address, a Kubernetes name, or a non-zero cluster id. | Write it like the example, or remove the directive to use the default.                                                           |
 | `` gabion: `X` is N; gabion supports MIN to MAX. … ``                          | A capacity directive is outside the range gabion can hold; the message gives the reason.                                                            | Set it inside the range, or remove it.                                                                                           |
@@ -820,8 +835,8 @@ below are the module's own.
 | `rules are declared but gabion_limit_zone is not set`                         | The config declares rules but no zone, so there is nowhere to count hits and every request would be admitted uncounted.                             | Add `gabion_limit_zone zone=gabion:64m;` to the `http {}` block, or check that the include declaring it is loaded.               |
 | Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`      | A client crossed a rule's limit.                                                                                                                    | Expected. `Retry-After` says how long to back off; the rule with the longest window owns the header.                             |
 | `400 Bad Request` from gabion                                                 | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits (`512` by default).                  | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
-| SHM `matched_rule_overflows` counter rising                                   | A location stacked more rules than `STORAGE_MAX_MATCHED_RULES` permits (`16`). **The request was allowed** (allow-by-default); the count under-counts. *No log line — observed only via the SHM stats snapshot.* | Reduce the number of rules applied at this location, or split the location.                                                      |
-| `gabion: the shared-memory count table had no free slot` (warn)               | The zone holds too few slots for the live `(rule, key, bucket)` cells. **The request was allowed** and that key under-counted. Logged at powers of two of `aggregate_dropped`. | Raise SIZE in `gabion_limit_zone` (see its sizing notes); each doubling doubles the slots.                                         |
+| SHM `matched_rule_overflows` counter rising                                   | Requests matched more allowed rules than `gabion_storage_max_matched_rules` (`16` by default). **The request was allowed** (allow-by-default); the rules past the bound under-count. *No log line — observed only via the SHM stats counters.* | Reduce the number of rules applied at this location, split the location, or raise `gabion_storage_max_matched_rules`.            |
+| `The count table had no free slot for a rate-limit key` (warn, `aggregate_full`) | The zone holds too few slots for the live `(rule, key, bucket)` cells. **The request was allowed** and that key under-counted. Logged at powers of two of `aggregate_dropped`; see [`aggregate_full`](../gabion/TROUBLESHOOTING.md#aggregate_full). | Raise SIZE in `gabion_limit_zone` (see its sizing notes); each doubling doubles the slots.                                         |
 | `gabion: this worker stopped leading gossip` (error) in the error log         | The leader's gossip runtime or queue drain failed or panicked, or it lost the lease. The worker released the lease and campaigns again after `retry_in` (doubling, up to 30s); another worker may take over first. Admission keeps running against the shared aggregate. | Read the `error` field. A bind error means `gabion_gossip_bind` is already in use; a lost lease means the worker was starved long enough to miss its renewals. |
 | `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside a leadership term, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
 | `Peer discovery hit an error and skipped an update` (warn) in the error log   | `discovery_error`, a library message: see [`../gabion/TROUBLESHOOTING.md`](../gabion/TROUBLESHOOTING.md#discovery_error).                           | Usually transient. If it keeps repeating, check pod RBAC and network reachability to the API.                                    |

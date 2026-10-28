@@ -53,7 +53,7 @@ use index::CellIndex;
 
 use std::num::{NonZeroU16, NonZeroU32};
 
-use crate::rules::CardinalityLimits;
+use crate::rules::{CardinalityLimits, RuleTable};
 use crate::settings::Setting;
 use crate::throttle;
 
@@ -265,13 +265,28 @@ pub enum Expiry {
 #[derive(Clone, Copy, Debug)]
 pub struct ValidStorageConfig {
     pub(crate) cell_capacity: NonZeroU32,
-    pub(crate) rule_dictionary_capacity: NonZeroU16,
+    pub(crate) rule_dictionary_capacity: Option<NonZeroU16>,
+    pub(crate) max_matched_rules: NonZeroU16,
     pub(crate) node_dictionary_capacity: NonZeroU16,
     pub(crate) local_dirty_capacity: NonZeroU32,
     pub(crate) forwarded_dirty_capacity: NonZeroU32,
     pub(crate) peer_capacity: NonZeroU16,
     /// The per-request descriptor limits both adapters' admission enforces.
     pub cardinality: CardinalityLimits,
+}
+
+impl ValidStorageConfig {
+    /// `storage.rule_dictionary_capacity`, which overrides the default
+    /// [`RuleTable::new`] derives from the rule count.
+    pub fn rule_dictionary_capacity(&self) -> Option<NonZeroU16> {
+        self.rule_dictionary_capacity
+    }
+
+    /// `storage.max_matched_rules`: the most rules one request is counted
+    /// against, and so the size of each admission scratch.
+    pub fn max_matched_rules(&self) -> usize {
+        self.max_matched_rules.get().into()
+    }
 }
 
 /// Single global structure-of-arrays cell store.
@@ -359,9 +374,15 @@ enum UpsertMode<C: Count> {
 }
 
 impl<C: Count> CellStore<C> {
-    pub fn new(config: ValidStorageConfig, local_identity: NodeIdentity) -> Self {
+    /// A store sized by `config`, with every rule of `rules` interned and
+    /// pinned before any gossip runtime can exist.
+    pub fn new(
+        config: ValidStorageConfig,
+        local_identity: NodeIdentity,
+        rules: &RuleTable,
+    ) -> Self {
         let cap = config.cell_capacity.get();
-        let rule_capacity = usize::from(config.rule_dictionary_capacity.get());
+        let rule_capacity = usize::from(rules.dictionary_capacity().get());
         let node_capacity = config.node_dictionary_capacity.get();
         let index_cap = pow2_index_capacity_for(config.cell_capacity);
 
@@ -378,7 +399,7 @@ impl<C: Count> CellStore<C> {
         // Pin the local slot so it cannot be freed via dec_ref.
         node_dictionary.inc_ref(local_node_slot);
 
-        Self {
+        let mut store = Self {
             rules: vec![0_u16; cap as usize].into_boxed_slice(),
             key_hashes: vec![KeyHash(0); cap as usize].into_boxed_slice(),
             buckets: vec![0_u32; cap as usize].into_boxed_slice(),
@@ -410,7 +431,7 @@ impl<C: Count> CellStore<C> {
             expire_current_epoch_scratch: vec![0_u32; rule_capacity].into_boxed_slice(),
             expire_live_buckets_scratch: vec![0_u32; rule_capacity].into_boxed_slice(),
 
-            rule_dictionary: RuleDictionary::with_capacity(config.rule_dictionary_capacity),
+            rule_dictionary: RuleDictionary::with_capacity(rules.dictionary_capacity()),
             node_dictionary,
 
             peer_frontiers: PeerFrontierTable::new(config.peer_capacity.get(), node_capacity),
@@ -421,7 +442,16 @@ impl<C: Count> CellStore<C> {
             cell_store_full_rejects: 0,
             rule_dictionary_full_rejects: 0,
             node_dictionary_full_rejects: 0,
+        };
+        for rule in rules.rules() {
+            let slot = store.intern_rule(rule.descriptor());
+            debug_assert!(
+                slot.is_some(),
+                "`RuleTable::new` sizes the dictionary for every rule and keeps fingerprints \
+                 unique"
+            );
         }
+        store
     }
 
     // -- Accessors ----------------------------------------------------------
@@ -507,12 +537,9 @@ impl<C: Count> CellStore<C> {
     /// accumulate. Re-registering an already-known rule refreshes its
     /// descriptor without adding a second pin.
     ///
-    /// Edge case: if a rule were first learned wire-only (via gossip) and only
-    /// later registered here, the `already_known` guard would skip the pin and
-    /// leave it freeable. That ordering doesn't occur in practice — every
-    /// adapter calls `intern_rule` for its configured rules at startup, before
-    /// the gossip runtime spawns — so the pin always lands on a fresh slot.
-    pub fn intern_rule(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
+    /// [`Self::new`] interns every configured rule before any runtime exists,
+    /// so the pin always lands on a fresh slot.
+    pub(crate) fn intern_rule(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
         let already_known = self.rule_dictionary.find(descriptor.fingerprint).is_some();
         let result = self.rule_dictionary.intern(descriptor);
         match result {
@@ -562,9 +589,9 @@ impl<C: Count> CellStore<C> {
                 config_key = Setting::StorageRuleDictionaryCapacity.yaml_key(),
                 "Too many distinct rate-limit rules are in flight. New rules cannot be \
                  registered on this node, so requests they match are allowed and their limits \
-                 under-count here. Usually more rules \
-                 are configured across the cluster than the dictionary holds, for example \
-                 during a configuration rollout. Raise {}.",
+                 under-count here. Usually more rules are live across the cluster than the \
+                 dictionary holds, for example during a configuration rollout. The default is \
+                 twice the configured rules, at least 256; set {} only above that.",
                 Setting::StorageRuleDictionaryCapacity,
             );
         }
@@ -964,8 +991,9 @@ impl<C: Count> CellStore<C> {
 
     /// Free cells whose bucket has aged out of the per-rule live window.
     ///
-    /// For each rule slot `r`, the cell is kept iff
-    /// `buckets[slot] + live_buckets[r] >= current_epoch_by_rule[r]`. Each
+    /// For each rule slot `r`, the cell is kept iff its age,
+    /// `current_epoch_by_rule[r] - buckets[slot]` in serial-number
+    /// arithmetic, is at most `live_buckets[r]`. Each
     /// freed cell is emitted into `sink` *before* its slot is released, so
     /// external aggregators see one row per active-set departure.
     ///
@@ -992,7 +1020,9 @@ impl<C: Count> CellStore<C> {
             let current = current_epoch_by_rule[rule];
             let live = live_buckets[rule];
             let bucket = self.buckets[slot as usize];
-            let expired = (bucket as u64) + (live as u64) < (current as u64);
+            // Serial-number age, so the comparison holds across the `u32`
+            // epoch wrap; a window spans fewer than 2^31 buckets.
+            let expired = current.wrapping_sub(bucket) as i32 > live as i32;
             if expired {
                 if sink.is_full() {
                     self.expire_cursor = slot;

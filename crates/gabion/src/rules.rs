@@ -2,22 +2,24 @@
 //! `gabion-server` (gRPC) and `gabion-nginx` (in-process RLM).
 //!
 //! Both adapters feed the gossip CRDT a `(rule_fingerprint, key_hash, bucket)`
-//! tuple. This module owns the deterministic functions that produce those
-//! identifiers so two nodes with identical rule sets emit identical
-//! identifiers without coordinating. It also owns the one cardinality check
-//! both adapters enforce on client-supplied descriptors, and the descriptor
-//! key grammar both accept. Admission policy (decision codes, request
-//! mapping) is the adapter's job — kept out of this module on purpose.
+//! tuple. Both build every rule through [`RuleDef::build`] and
+//! [`RuleTable::new`], so they validate, default and identify rules one way:
+//! two nodes with identical rules emit identical identifiers without
+//! coordinating, whatever order either lists them in. This module also owns
+//! the one cardinality check both adapters enforce on client-supplied
+//! descriptors. Admission policy (decision codes, request mapping) is the
+//! adapter's job — kept out of this module on purpose.
 
 use std::fmt;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU16, NonZeroU64};
 use std::time::Duration;
 
 use thiserror::Error;
 use twox_hash::xxhash3_128::{DEFAULT_SECRET_LENGTH, RawHasher, SecretBuffer};
 
 pub use crate::crdt::KeyHash;
-use crate::defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
+use crate::crdt::RuleDescriptor;
+use crate::defaults::STORAGE_RULE_DICTIONARY_FLOOR;
 use crate::settings::Setting;
 
 /// Application-level rule identifier. Internal to one process; gossip uses
@@ -65,18 +67,28 @@ pub struct DescriptorPattern {
 
 impl DescriptorPattern {
     fn matches(&self, descriptor: Descriptor<'_>) -> bool {
-        &*self.key == descriptor.key && (&*self.value == "*" || &*self.value == descriptor.value)
+        &*self.key == descriptor.key && self.accepts(descriptor.value)
+    }
+
+    /// Whether `value` meets this pattern: any value for `*`, else only the
+    /// literal.
+    pub fn accepts(&self, value: &str) -> bool {
+        &*self.value == "*" || &*self.value == value
     }
 }
 
-/// One rate-limit rule. Constructed by the adapter from its own typed config;
-/// `fingerprint` and `domain_hash` are derived deterministically so two nodes
-/// with identical rules produce identical fingerprints.
+/// One rate-limit rule, built only by [`RuleDef::build`]. `fingerprint` and
+/// `domain_hash` are derived deterministically so two nodes with identical
+/// rules produce identical fingerprints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Rule {
-    pub id: RuleId,
-    /// Stable, cross-node identity. Hashed from `(domain, descriptors)`.
+    /// Position in its [`RuleTable`], from 1; assigned by [`RuleTable::new`].
+    pub(crate) id: RuleId,
+    pub name: Box<str>,
+    /// Stable, cross-node identity: a hash of the domain, the descriptor
+    /// patterns, the window and the bucket. The limit and the mode stay out,
+    /// so changing either keeps the rule's counters.
     #[cfg_attr(feature = "serde", serde(serialize_with = "crate::hex"))]
     pub fingerprint: u128,
     pub domain: Box<str>,
@@ -90,41 +102,6 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Construct a rule, deriving `fingerprint` and `domain_hash` from
-    /// `domain` + `descriptors`. `domain` accepts anything `Into<String>`
-    /// for operator-friendly construction; the field is stored as the
-    /// owned-immutable `Box<str>` per the no-capacity-after-construction
-    /// rule in CLAUDE.md.
-    pub fn new(
-        id: RuleId,
-        domain: impl Into<String>,
-        descriptors: Vec<DescriptorPattern>,
-        limit: u64,
-        window_millis: u64,
-        bucket_millis: u64,
-        mode: EnforcementMode,
-    ) -> Self {
-        let domain: Box<str> = domain.into().into_boxed_str();
-        let descriptors: Box<[DescriptorPattern]> = descriptors.into_boxed_slice();
-        let fingerprint = rule_fingerprint(&domain, &descriptors);
-        let domain_hash = hash_domain(&domain);
-        let window_millis = window_millis.max(1);
-        let bucket_millis = bucket_millis.max(1);
-        let live_buckets = window_millis.div_ceil(bucket_millis).max(1) as u32;
-        Self {
-            id,
-            fingerprint,
-            domain,
-            domain_hash,
-            descriptors,
-            limit,
-            window_millis,
-            bucket_millis,
-            live_buckets,
-            mode,
-        }
-    }
-
     /// Hot-path-ready summary. O(1) field copies.
     pub fn spec(&self) -> RuleSpec {
         RuleSpec {
@@ -134,6 +111,19 @@ impl Rule {
             bucket_millis: self.bucket_millis,
             window_millis: self.window_millis,
             live_buckets: self.live_buckets,
+        }
+    }
+
+    /// The rule as the cell store interns it. [`RuleDef::build`] keeps the
+    /// window, and so the bucket, under `u32::MAX` milliseconds.
+    pub fn descriptor(&self) -> RuleDescriptor {
+        RuleDescriptor {
+            fingerprint: self.fingerprint,
+            window_millis: self.window_millis as u32,
+            bucket_millis: self.bucket_millis as u32,
+            limit: self.limit,
+            flags: 0,
+            local_rule_id: self.id,
         }
     }
 }
@@ -151,21 +141,172 @@ pub struct RuleSpec {
     pub live_buckets: u32,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// One rule as an adapter writes it, before validation: the one input to
+/// [`RuleDef::build`], which both adapters call.
+#[derive(Clone, Copy, Debug)]
+pub struct RuleDef<'a> {
+    pub name: &'a str,
+    pub domain: &'a str,
+    /// Ordered `(key, value)` patterns; a value of `*` matches any value.
+    pub patterns: &'a [(&'a str, &'a str)],
+    /// `100r/s`, parsed by [`parse_rate`].
+    pub rate: &'a str,
+    /// Defaults to the rate's period.
+    pub window: Option<Duration>,
+    /// Defaults to the window.
+    pub bucket: Option<Duration>,
+    pub mode: EnforcementMode,
+}
+
+impl RuleDef<'_> {
+    /// Validate the rule and derive its identity. Its id is assigned by
+    /// [`RuleTable::new`].
+    pub fn build(&self, limits: &CardinalityLimits) -> Result<Rule, RuleError> {
+        let rule = || self.name.into();
+        if let Some(reason) = domain_problem(self.domain) {
+            return Err(RuleError::InvalidDomain {
+                rule: rule(),
+                reason,
+            });
+        }
+        if self.patterns.is_empty() {
+            return Err(RuleError::NoDescriptors { rule: rule() });
+        }
+        if self.patterns.len() > limits.max_descriptor_count {
+            return Err(RuleError::TooManyDescriptors {
+                rule: rule(),
+                count: self.patterns.len(),
+                max: limits.max_descriptor_count,
+            });
+        }
+        for &(key, _) in self.patterns {
+            if !is_descriptor_key(key) {
+                return Err(RuleError::InvalidKey {
+                    rule: rule(),
+                    key: key.into(),
+                });
+            }
+            if key.len() > limits.max_key_bytes {
+                return Err(RuleError::KeyTooLong {
+                    rule: rule(),
+                    key: key.into(),
+                    bytes: key.len(),
+                    max: limits.max_key_bytes,
+                });
+            }
+        }
+        let (count, period) = parse_rate(self.rate).map_err(|reason| RuleError::Rate {
+            rule: rule(),
+            reason,
+        })?;
+        let resolved = resolve_rate(count, period, self.window, self.bucket).map_err(|source| {
+            RuleError::Window {
+                rule: rule(),
+                source,
+            }
+        })?;
+        let descriptors: Box<[DescriptorPattern]> = self
+            .patterns
+            .iter()
+            .map(|&(key, value)| DescriptorPattern {
+                key: key.into(),
+                value: value.into(),
+            })
+            .collect();
+        Ok(Rule {
+            id: 0,
+            name: rule(),
+            fingerprint: rule_fingerprint(
+                self.domain,
+                self.patterns,
+                resolved.window_millis,
+                resolved.bucket_millis,
+            ),
+            domain: self.domain.into(),
+            domain_hash: hash_domain(self.domain),
+            descriptors,
+            limit: resolved.limit.get(),
+            window_millis: resolved.window_millis,
+            bucket_millis: resolved.bucket_millis,
+            live_buckets: resolved.window_millis.div_ceil(resolved.bucket_millis) as u32,
+            mode: self.mode,
+        })
+    }
+}
+
+/// Why `domain` is not 1 to 255 bytes without whitespace or control
+/// characters, or `None` when it is.
+fn domain_problem(domain: &str) -> Option<&'static str> {
+    if domain.is_empty() {
+        Some("that is empty")
+    } else if domain.len() > 255 {
+        Some("longer than 255 bytes")
+    } else if domain.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        Some("with whitespace or a control character")
+    } else {
+        None
+    }
+}
+
+/// Every configured rule, in declaration order, and the capacity of the rule
+/// dictionary that interns them. Built only by [`RuleTable::new`], so no two
+/// rules share a name or an identity and the dictionary holds every rule.
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
 pub struct RuleTable {
     rules: Box<[Rule]>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    dictionary_capacity: NonZeroU16,
 }
 
 impl RuleTable {
-    pub fn new(rules: Vec<Rule>) -> Self {
-        Self {
-            rules: rules.into_boxed_slice(),
+    /// Number `rules` from 1 in order, and size the rule dictionary:
+    /// `capacity` when `storage.rule_dictionary_capacity` sets it, else twice
+    /// the rules and at least 256, leaving room for the rules peers gossip
+    /// during a rollout.
+    pub fn new(mut rules: Box<[Rule]>, capacity: Option<NonZeroU16>) -> Result<Self, RuleError> {
+        let floor = const { NonZeroU16::new(STORAGE_RULE_DICTIONARY_FLOOR).unwrap() };
+        let dictionary_capacity = capacity.unwrap_or_else(|| {
+            NonZeroU16::new((2 * rules.len()).min(MAX_RULES) as u16)
+                .map_or(floor, |derived| derived.max(floor))
+        });
+        if rules.len() > usize::from(dictionary_capacity.get()) {
+            return Err(RuleError::TooManyRules {
+                rules: rules.len(),
+                capacity: dictionary_capacity.get(),
+            });
         }
+        for (i, rule) in rules.iter().enumerate() {
+            for earlier in &rules[..i] {
+                if earlier.name == rule.name {
+                    return Err(RuleError::DuplicateRuleName {
+                        name: rule.name.clone(),
+                    });
+                }
+                if earlier.fingerprint == rule.fingerprint {
+                    return Err(RuleError::DuplicateRuleIdentity {
+                        first: earlier.name.clone(),
+                        second: rule.name.clone(),
+                    });
+                }
+            }
+        }
+        for (i, rule) in rules.iter_mut().enumerate() {
+            rule.id = i as RuleId + 1;
+        }
+        Ok(Self {
+            rules,
+            dictionary_capacity,
+        })
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Rule> {
-        self.rules.iter()
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    /// Slots in the rule dictionary, at least the number of rules.
+    pub fn dictionary_capacity(&self) -> NonZeroU16 {
+        self.dictionary_capacity
     }
 
     /// Rules whose `(domain, descriptor pattern)` matches the request shape,
@@ -174,14 +315,16 @@ impl RuleTable {
     /// the bucket and gossip the hit; adapters must check `rule.mode`
     /// before mapping a verdict to a rejection.
     ///
-    /// The server adapter uses this for pattern-based filtering of Envoy
-    /// descriptors; the nginx adapter dispatches by `rule_index` (per
-    /// configured `gabion_limit`) and does not walk `matching` per request.
-    pub fn matching<'a>(
-        &'a self,
-        domain: &'a str,
-        descriptors: &'a [Descriptor<'a>],
-    ) -> impl Iterator<Item = &'a Rule> + 'a {
+    /// `descriptors` is cloned once per rule, so an adapter passes an
+    /// iterator over its request's entries in place rather than a buffer.
+    pub fn matching<'r, 'd, I>(
+        &'r self,
+        domain: &str,
+        descriptors: I,
+    ) -> impl Iterator<Item = &'r Rule> + use<'r, 'd, I>
+    where
+        I: ExactSizeIterator<Item = Descriptor<'d>> + Clone,
+    {
         let domain_hash = hash_domain(domain);
         self.rules.iter().filter(move |rule| {
             rule.mode != EnforcementMode::Disabled
@@ -190,18 +333,95 @@ impl RuleTable {
                 && rule
                     .descriptors
                     .iter()
-                    .zip(descriptors)
-                    .all(|(pattern, descriptor)| pattern.matches(*descriptor))
+                    .zip(descriptors.clone())
+                    .all(|(pattern, descriptor)| pattern.matches(descriptor))
         })
     }
 }
 
+/// The most entries a rule dictionary holds: its slots are numbered by a
+/// `u16` whose largest value marks an empty slot.
+const MAX_RULES: usize = 65_534;
+
 /// Match a descriptor key against `[A-Za-z_][A-Za-z0-9_.-]*`, the grammar
 /// both adapters accept, so equal rules produce equal identifiers.
-pub fn is_descriptor_key(s: &str) -> bool {
+fn is_descriptor_key(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c == '.' || c == '-' || c.is_ascii_alphanumeric())
+}
+
+/// A rule [`RuleDef::build`] or [`RuleTable::new`] refused. Both adapters
+/// print these at load: `gabiond` exits, `nginx -t` fails.
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum RuleError {
+    #[error("Two rules are named `{name}`. Rule names must be unique; rename one.")]
+    DuplicateRuleName { name: Box<str> },
+    #[error(
+        "Rules `{first}` and `{second}` count the same keys with the same domain, descriptors, \
+         window and bucket, so gabion cannot tell their counters apart. Give one of them a \
+         different binding, window or bucket, or merge them."
+    )]
+    DuplicateRuleIdentity { first: Box<str>, second: Box<str> },
+    #[error(
+        "{rules} rate-limit rules are configured, but {setting} is {capacity}. Every configured \
+         rule needs an entry, plus room for the rules other nodes gossip while a configuration \
+         rolls out. Remove the setting to use the default (twice the configured rules, at least \
+         256), or raise it to at least {wanted}.",
+        setting = Setting::StorageRuleDictionaryCapacity,
+        wanted = (2 * rules).min(MAX_RULES)
+    )]
+    TooManyRules { rules: usize, capacity: u16 },
+    #[error(
+        "Rule `{rule}` has a domain {reason}. A domain is 1 to 255 bytes with no whitespace or \
+         control characters, the same in YAML and in `domain=`."
+    )]
+    InvalidDomain {
+        rule: Box<str>,
+        reason: &'static str,
+    },
+    #[error(
+        "Rule `{rule}` has descriptor key `{key}`, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` \
+         in both adapters (for example `tenant`, `app.tenant`). Rename the key."
+    )]
+    InvalidKey { rule: Box<str>, key: Box<str> },
+    #[error(
+        "Rule `{rule}` has no descriptors, so it would match every request in its domain. Add at \
+         least one (`descriptors:` in YAML, a `$variable` binding in NGINX), or remove the rule."
+    )]
+    NoDescriptors { rule: Box<str> },
+    #[error(
+        "Rule `{rule}` has {count} descriptors, above {setting} ({max}). Remove descriptors from \
+         the rule or raise that setting, which may go up to 65,535.",
+        setting = Setting::StorageMaxDescriptorCount
+    )]
+    TooManyDescriptors {
+        rule: Box<str>,
+        count: usize,
+        max: usize,
+    },
+    #[error(
+        "Rule `{rule}` has descriptor key `{key}` of {bytes} bytes, above {setting} ({max}). \
+         Shorten the key or raise that setting.",
+        setting = Setting::StorageMaxKeyBytes
+    )]
+    KeyTooLong {
+        rule: Box<str>,
+        key: Box<str>,
+        bytes: usize,
+        max: usize,
+    },
+    #[error("Rule `{rule}` has an invalid rate: {reason}.")]
+    Rate {
+        rule: Box<str>,
+        reason: &'static str,
+    },
+    #[error("Rule `{rule}`: {source}.")]
+    Window {
+        rule: Box<str>,
+        #[source]
+        source: RateResolveError,
+    },
 }
 
 // -- cardinality ------------------------------------------------------------
@@ -214,6 +434,7 @@ pub struct CardinalityLimits {
     pub(crate) max_descriptor_count: usize,
     pub(crate) max_descriptor_bytes: usize,
     pub(crate) max_key_bytes: usize,
+    pub(crate) max_request_descriptors: usize,
 }
 
 impl CardinalityLimits {
@@ -221,15 +442,19 @@ impl CardinalityLimits {
         self.max_descriptor_count
     }
 
-    pub fn max_key_bytes(self) -> usize {
-        self.max_key_bytes
+    pub fn max_descriptor_bytes(self) -> usize {
+        self.max_descriptor_bytes
+    }
+
+    pub fn max_request_descriptors(self) -> usize {
+        self.max_request_descriptors
     }
 
     /// The first limit `descriptors` exceed under `domain`, and its bound.
-    pub fn exceeded(
+    pub fn exceeded<'a>(
         self,
         domain: &str,
-        descriptors: &[Descriptor<'_>],
+        descriptors: impl ExactSizeIterator<Item = Descriptor<'a>>,
     ) -> Option<(CardinalityLimit, usize)> {
         if descriptors.len() > self.max_descriptor_count {
             return Some((CardinalityLimit::Count, self.max_descriptor_count));
@@ -253,8 +478,7 @@ impl CardinalityLimits {
 /// Which part of the cardinality envelope a request exceeded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CardinalityLimit {
-    /// More descriptors in one Envoy request than gabion evaluates (a build
-    /// constant).
+    /// More descriptors in one Envoy request than `max_request_descriptors`.
     RequestDescriptors,
     /// More entries in one descriptor than `max_descriptor_count`.
     Count,
@@ -266,14 +490,15 @@ pub enum CardinalityLimit {
 }
 
 impl CardinalityLimit {
-    /// The `limit` log field and the setting that raises this limit (none for
-    /// the build constant).
-    pub fn describe(self) -> (&'static str, Option<Setting>) {
+    /// The `limit` log field and the setting that raises this limit.
+    pub fn describe(self) -> (&'static str, Setting) {
         match self {
-            Self::RequestDescriptors => ("request_descriptors", None),
-            Self::Count => ("count", Some(Setting::StorageMaxDescriptorCount)),
-            Self::Bytes => ("bytes", Some(Setting::StorageMaxDescriptorBytes)),
-            Self::KeyBytes => ("key_bytes", Some(Setting::StorageMaxKeyBytes)),
+            Self::RequestDescriptors => {
+                ("request_descriptors", Setting::StorageMaxRequestDescriptors)
+            }
+            Self::Count => ("count", Setting::StorageMaxDescriptorCount),
+            Self::Bytes => ("bytes", Setting::StorageMaxDescriptorBytes),
+            Self::KeyBytes => ("key_bytes", Setting::StorageMaxKeyBytes),
         }
     }
 }
@@ -281,16 +506,11 @@ impl CardinalityLimit {
 /// The operator's next step when a request exceeds this limit.
 impl fmt::Display for CardinalityLimit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.describe().1 {
-            Some(setting) => write!(f, "If the traffic is legitimate, raise {setting}."),
-            None => write!(
-                f,
-                "gabion evaluates at most {STORAGE_MAX_DESCRIPTOR_COUNT} descriptors of one \
-                 request, a build-time constant (`STORAGE_MAX_DESCRIPTOR_COUNT`) that config \
-                 cannot raise; if the traffic is legitimate, have Envoy send fewer descriptors \
-                 per request."
-            ),
-        }
+        write!(
+            f,
+            "If the traffic is legitimate, raise {}.",
+            self.describe().1
+        )
     }
 }
 
@@ -304,42 +524,68 @@ pub fn hash_domain(domain: &str) -> KeyHash {
     KeyHash(hasher.finish_128())
 }
 
-pub fn hash_key(rule_id: RuleId, domain: &str, descriptors: &[Descriptor<'_>]) -> KeyHash {
-    let mut hasher = stable_hasher();
-    hasher.write(b"gabion.key.v1");
-    hasher.write(&[0]);
-    hasher.write(&u64::from(rule_id).to_le_bytes());
-    hasher.write(domain.as_bytes());
-    hasher.write(&[0]);
-    write_descriptors(&mut hasher, descriptors.iter().map(|d| (d.key, d.value)));
-    KeyHash(hasher.finish_128())
+/// A key's hash, fed one descriptor at a time as an adapter reads them, so
+/// neither adapter copies descriptors into a buffer to hash them. Rule order
+/// and adapter never enter it: the fingerprint separates rules.
+pub struct KeyHasher(RawHasher<[u8; DEFAULT_SECRET_LENGTH]>);
+
+impl KeyHasher {
+    pub fn new(domain: &str) -> Self {
+        let mut hasher = stable_hasher();
+        hasher.write(b"gabion.key.v2");
+        hasher.write(&[0]);
+        hasher.write(domain.as_bytes());
+        hasher.write(&[0]);
+        Self(hasher)
+    }
+
+    pub fn push(&mut self, key: &str, value: &str) {
+        write_pair(&mut self.0, key, value);
+    }
+
+    pub fn finish(self) -> KeyHash {
+        KeyHash(self.0.finish_128())
+    }
 }
 
-/// Canonical fingerprint of a rule's shape — the cross-node identity gossip
-/// uses as its key, independent of any process-local `RuleId`.
-pub fn rule_fingerprint(domain: &str, descriptors: &[DescriptorPattern]) -> u128 {
+/// [`KeyHasher`] over a whole request.
+pub fn hash_key<'a>(
+    domain: &str,
+    descriptors: impl IntoIterator<Item = Descriptor<'a>>,
+) -> KeyHash {
+    let mut hasher = KeyHasher::new(domain);
+    for descriptor in descriptors {
+        hasher.push(descriptor.key, descriptor.value);
+    }
+    hasher.finish()
+}
+
+/// Canonical fingerprint of a rule — the cross-node identity gossip uses as
+/// its key: the domain, the patterns, the window and the bucket.
+fn rule_fingerprint(
+    domain: &str,
+    patterns: &[(&str, &str)],
+    window_millis: u64,
+    bucket_millis: u64,
+) -> u128 {
     let mut hasher = stable_hasher();
-    hasher.write(b"gabion.rule.v1");
+    hasher.write(b"gabion.rule.v2");
     hasher.write(&[0]);
     hasher.write(domain.as_bytes());
     hasher.write(&[0]);
-    write_descriptors(
-        &mut hasher,
-        descriptors.iter().map(|p| (&*p.key, &*p.value)),
-    );
+    for &(key, value) in patterns {
+        write_pair(&mut hasher, key, value);
+    }
+    hasher.write(&window_millis.to_le_bytes());
+    hasher.write(&bucket_millis.to_le_bytes());
     hasher.finish_128()
 }
 
-fn write_descriptors<'a>(
-    hasher: &mut RawHasher<[u8; DEFAULT_SECRET_LENGTH]>,
-    descriptors: impl IntoIterator<Item = (&'a str, &'a str)>,
-) {
-    for (key, value) in descriptors {
-        hasher.write(key.as_bytes());
-        hasher.write(&[0]);
-        hasher.write(value.as_bytes());
-        hasher.write(&[0xff]);
-    }
+fn write_pair(hasher: &mut RawHasher<[u8; DEFAULT_SECRET_LENGTH]>, key: &str, value: &str) {
+    hasher.write(key.as_bytes());
+    hasher.write(&[0]);
+    hasher.write(value.as_bytes());
+    hasher.write(&[0xff]);
 }
 
 fn stable_hasher() -> RawHasher<[u8; DEFAULT_SECRET_LENGTH]> {
@@ -394,17 +640,17 @@ pub fn parse_rate(input: &str) -> Result<(NonZeroU64, Duration), &'static str> {
     Ok((count, duration))
 }
 
-/// Resolved triple consumed by [`Rule::new`]. The limit has already been
-/// scaled from the rate to fit the window so the CRDT representation
+/// Resolved triple consumed by [`RuleDef::build`]. The limit has already
+/// been scaled from the rate to fit the window so the CRDT representation
 /// matches the operator's mental model exactly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResolvedRate {
-    pub limit: NonZeroU64,
-    pub window_millis: u64,
-    pub bucket_millis: u64,
+struct ResolvedRate {
+    limit: NonZeroU64,
+    window_millis: u64,
+    bucket_millis: u64,
 }
 
-/// Reasons [`resolve_rate`] can refuse a (rate, window, bucket) tuple. Each
+/// Reasons [`RuleDef::build`] can refuse a rule's (rate, window, bucket). Each
 /// variant's message answers what, why and what next.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum RateResolveError {
@@ -419,8 +665,16 @@ pub enum RateResolveError {
          rate's period; to turn a rule off, use mode `disabled`"
     )]
     ZeroWindow,
-    #[error("the bucket is zero. `bucket` defaults to `window`; omit it for one bucket per window")]
+    #[error(
+        "the bucket is shorter than 1 ms, gabion's smallest time unit. `bucket` defaults to \
+         `window`; omit it for one bucket per window"
+    )]
     ZeroBucket,
+    #[error(
+        "the window is longer than gabion tracks: under 49 days and fewer than 2,147,483,648 \
+         buckets. Use a shorter window or a larger bucket"
+    )]
+    WindowTooLong,
     #[error(
         "the count multiplied by the window in milliseconds does not fit in 64 bits; usually a \
          count or window far larger than intended (extra zeros, or `y` where `s` was meant). Use \
@@ -444,33 +698,38 @@ pub enum RateResolveError {
 /// `window < period` is rejected: a window shorter than the rate's period has
 /// no rate to scale down from; the operator writes the shorter period into
 /// the rate instead.
-pub fn resolve_rate(
+fn resolve_rate(
     rate_count: NonZeroU64,
     period: Duration,
     window: Option<Duration>,
     bucket: Option<Duration>,
 ) -> Result<ResolvedRate, RateResolveError> {
     let window = window.unwrap_or(period);
-    if window.is_zero() {
+    let window_millis = duration_to_millis(window);
+    // A window under 1 ms would floor to a zero limit.
+    if window_millis == 0 {
         return Err(RateResolveError::ZeroWindow);
     }
     if window < period {
         return Err(RateResolveError::WindowShorterThanPeriod);
     }
-    let bucket = bucket.unwrap_or(window);
-    if bucket.is_zero() {
+    let period_millis = duration_to_millis(period).max(1);
+    let bucket_millis = duration_to_millis(bucket.unwrap_or(window));
+    if bucket_millis == 0 {
         return Err(RateResolveError::ZeroBucket);
     }
-    let window_millis = duration_to_millis(window);
-    let period_millis = duration_to_millis(period).max(1);
-    let bucket_millis = duration_to_millis(bucket);
+    // Epochs are `u32` and compared by serial-number arithmetic, which holds
+    // while a window spans fewer than 2^31 buckets.
+    if window_millis > u64::from(u32::MAX) || window_millis / bucket_millis >= 1 << 31 {
+        return Err(RateResolveError::WindowTooLong);
+    }
     let limit = rate_count
         .get()
         .checked_mul(window_millis)
         .ok_or(RateResolveError::LimitOverflow)?
         / period_millis;
-    // Only a window under 1 ms floors to a zero limit: from 1 ms up, the
-    // window is at least the period, so the limit is at least `rate_count`.
+    // From 1 ms up the window is at least the period, so the limit is at
+    // least `rate_count`.
     let limit = NonZeroU64::new(limit).ok_or(RateResolveError::ZeroWindow)?;
     Ok(ResolvedRate {
         limit,

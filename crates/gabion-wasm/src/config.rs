@@ -1,17 +1,20 @@
 //! Session configuration handed to [`crate::engine::run_engine`].
 //!
-//! v1 models **one rule, many keys**: a single `(fingerprint, limit, window,
-//! bucket)` rule the user drives with requests for arbitrary keys. A
-//! multi-rule mix is a future extension (it becomes a `Vec` here).
+//! v1 models **one rule, many keys**: a single `(limit, window, bucket)` rule
+//! the user drives with requests for arbitrary keys, built as the adapters
+//! build theirs. A multi-rule mix is a future extension (it becomes a `Vec`
+//! here).
+
+use std::time::Duration;
 
 use gabion::crdt::{RuleDescriptor, ValidStorageConfig};
 use gabion::defaults;
 use gabion::gossip::ValidGossipConfig;
+use gabion::rules::{EnforcementMode, RuleDef, RuleError, RuleTable};
 use gabion::settings::{Setting, SettingError, Settings};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::{CLUSTER_ID_HASH, VIZ_MAX_CELLS_PER_TICK};
-use crate::hex::u128_hex;
 
 /// Largest cluster the visualizer constructs. Bounded so a stray config from
 /// the URL or a fuzzed control can't ask the engine to build an unbounded
@@ -37,9 +40,6 @@ pub struct SimConfig {
     pub target_err_bps: u32,
     /// Floor between two threshold-fire emissions, in milliseconds.
     pub min_emit_interval_ms: u64,
-    /// The single rule's stable fingerprint (hex across the JS boundary).
-    #[serde(with = "u128_hex")]
-    pub rule_fingerprint: u128,
     /// Admission limit for the rule.
     pub rule_limit: u64,
     /// Rolling window width, in milliseconds.
@@ -62,8 +62,6 @@ impl Default for SimConfig {
             tick_interval_ms: defaults::GOSSIP_TICK_INTERVAL_MILLIS,
             target_err_bps: defaults::GOSSIP_TARGET_ERR_BPS,
             min_emit_interval_ms: defaults::GOSSIP_MIN_EMIT_INTERVAL_MS,
-            // A memorable but arbitrary default fingerprint; the UI overrides it.
-            rule_fingerprint: 0xC0FE_DEAD_BEEF_BABE_F00D,
             // Viz-friendly defaults: a 10 s window of 1 s buckets reads as a
             // legible row of bucket bars (the production 60 s / 1 s default is
             // 60 thin bands), and a limit of 1 000 is low enough that the
@@ -90,18 +88,17 @@ pub enum ConfigError {
     )]
     NodeCountOutOfRange { got: usize },
     #[error(
-        "rule window ({window_ms} ms) and bucket ({bucket_ms} ms) must both be non-zero and the \
-         window must be a whole number of buckets. Adjust `rule_window_ms` / `rule_bucket_ms` in \
-         the controls."
-    )]
-    WindowBucketMismatch { window_ms: u32, bucket_ms: u32 },
-    #[error(
         "packet-loss probability {got} is outside 0.0–1.0. Set `uniform_loss` to a fraction (e.g. \
          0.1 for 10% loss)."
     )]
     LossOutOfRange { got: f64 },
     #[error(transparent)]
     Setting(#[from] SettingError),
+    /// The watched rule, as `RuleDef::build` refuses it for both adapters;
+    /// the controls name it by its fields (`rule_limit`, `rule_window_ms`,
+    /// `rule_bucket_ms`).
+    #[error(transparent)]
+    Rule(#[from] RuleError),
 }
 
 /// A [`SimConfig`] with every node's gossip and storage configs, built only by
@@ -110,26 +107,21 @@ pub struct ValidSimConfig {
     pub(crate) config: SimConfig,
     pub(crate) gossip: ValidGossipConfig,
     pub(crate) storage: ValidStorageConfig,
+    /// The watched rule, which every node interns at construction.
+    pub(crate) rules: RuleTable,
+    /// That rule as the cell store holds it: its fingerprint, limit and
+    /// epoch math.
+    pub(crate) rule: RuleDescriptor,
 }
 
 impl SimConfig {
     /// Validate the user-facing invariants and build every node's gossip and
-    /// storage configs, once. Bucket/window math is checked here because a
-    /// zero bucket silently disables expiry inside the CRDT
-    /// (`RuleDescriptor::default`'s footgun), which would mislead rather than
-    /// inform.
+    /// storage configs and the watched rule, once. The rule goes through
+    /// `RuleDef::build`, as the adapters' rules do, so a zero window or
+    /// bucket fails here instead of silently disabling expiry.
     pub fn validate(self) -> Result<ValidSimConfig, ConfigError> {
         if self.nodes < 1 || self.nodes > MAX_NODES {
             return Err(ConfigError::NodeCountOutOfRange { got: self.nodes });
-        }
-        if self.rule_window_ms == 0
-            || self.rule_bucket_ms == 0
-            || !self.rule_window_ms.is_multiple_of(self.rule_bucket_ms)
-        {
-            return Err(ConfigError::WindowBucketMismatch {
-                window_ms: self.rule_window_ms,
-                bucket_ms: self.rule_bucket_ms,
-            });
         }
         if !(0.0..=1.0).contains(&self.uniform_loss) {
             return Err(ConfigError::LossOutOfRange {
@@ -137,10 +129,24 @@ impl SimConfig {
             });
         }
         let (gossip, storage) = self.settings()?.validate()?;
+        let rule = RuleDef {
+            name: "watched",
+            domain: "viz",
+            patterns: &[("key", "*")],
+            rate: &format!("{}r/{}ms", self.rule_limit, self.rule_window_ms),
+            window: None,
+            bucket: Some(Duration::from_millis(self.rule_bucket_ms.into())),
+            mode: EnforcementMode::Enforce,
+        }
+        .build(&storage.cardinality)?;
+        let descriptor = rule.descriptor();
+        let rules = RuleTable::new(Box::new([rule]), storage.rule_dictionary_capacity())?;
         Ok(ValidSimConfig {
             config: self,
             gossip,
             storage,
+            rules,
+            rule: descriptor,
         })
     }
 

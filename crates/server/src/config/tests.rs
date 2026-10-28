@@ -79,7 +79,7 @@ fn yaml_values_load_when_no_env_overrides() {
     let settings = &cfg.settings;
     assert_eq!(settings.envoy_bind, Some("127.0.0.1:8000".parse().unwrap()));
     assert_eq!(settings.max_cells.get(), 256);
-    assert_eq!(settings.rule_dictionary_capacity.get(), 8);
+    assert_eq!(settings.rule_dictionary_capacity.map(|c| c.get()), Some(8));
     assert_eq!(settings.fanout.get(), 3);
     assert_eq!(settings.target_err_bps, 250);
     assert_eq!(settings.min_emit_interval, ms(7));
@@ -102,7 +102,10 @@ fn env_overrides_yaml_for_scalars() {
     assert_eq!(cfg.settings.fanout.get(), 12);
     assert_eq!(cfg.settings.target_err_bps, 250);
     // Untouched YAML value stays.
-    assert_eq!(cfg.settings.rule_dictionary_capacity.get(), 8);
+    assert_eq!(
+        cfg.settings.rule_dictionary_capacity.map(|c| c.get()),
+        Some(8)
+    );
 }
 
 #[test]
@@ -201,6 +204,8 @@ fn sample(setting: Setting) -> &'static str {
         Setting::StorageMaxDescriptorCount => "8",
         Setting::StorageMaxDescriptorBytes => "256",
         Setting::StorageMaxKeyBytes => "64",
+        Setting::StorageMaxRequestDescriptors => "20",
+        Setting::StorageMaxMatchedRules => "20",
         Setting::RuntimeNodeIdSeed => "pod-7",
         Setting::RuntimeRngSeed => "42",
         Setting::GossipBind => "127.0.0.1:9000",
@@ -338,56 +343,6 @@ fn env_list_replaces_the_yaml_list() {
 }
 
 #[test]
-fn duplicate_rule_names_are_rejected() {
-    let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
-        "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
-         10r/s\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
-         5r/s\n",
-    )
-    .expect("yaml parses");
-    let err = cfg.rule_table().expect_err("duplicate rules must error");
-    assert!(
-        matches!(err, ConfigError::DuplicateRule { ref name } if name == "per_ip"),
-        "expected DuplicateRule, got {err:?}",
-    );
-}
-
-#[test]
-fn zero_rate_is_rejected_in_yaml() {
-    let _env = EnvGuard::lock();
-    for rate in ["0r/s", "10r/500us"] {
-        let cfg = AppConfig::load_with_yaml_str(&format!(
-            "limits:\n  - name: doomed\n    domain: nginx\n    descriptors: [{{ key: ip }}]\n    \
-             rate: {rate}\n",
-        ))
-        .expect("yaml parses");
-        let err = cfg.rule_table().expect_err("zero rate must error");
-        assert!(
-            matches!(err, ConfigError::InvalidRate { ref name, .. } if name == "doomed"),
-            "{rate}: expected InvalidRate, got {err:?}",
-        );
-    }
-}
-
-#[test]
-fn invalid_descriptor_key_rejected_in_yaml() {
-    let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
-        "limits:\n  - name: bad_key\n    domain: nginx\n    descriptors: [{ key: \"with space\" \
-         }]\n    rate: 10r/s\n",
-    )
-    .expect("yaml parses");
-    let err = cfg
-        .rule_table()
-        .expect_err("invalid descriptor key must error");
-    assert!(
-        matches!(err, ConfigError::InvalidDescriptorKey { ref rule, .. } if rule == "bad_key"),
-        "expected InvalidDescriptorKey, got {err:?}",
-    );
-}
-
-#[test]
 fn rate_only_yaml_infers_window_and_bucket() {
     let _env = EnvGuard::lock();
     let cfg = AppConfig::load_with_yaml_str(
@@ -396,7 +351,7 @@ fn rate_only_yaml_infers_window_and_bucket() {
     )
     .expect("yaml parses");
     let table = cfg.rule_table().expect("rule table");
-    let spec = table.iter().next().expect("one rule").spec();
+    let spec = table.rules().first().expect("one rule").spec();
     assert_eq!(spec.limit, 10);
     assert_eq!(spec.window_millis, 60_000);
     assert_eq!(spec.bucket_millis, 60_000);
@@ -412,7 +367,7 @@ fn explicit_window_scales_limit_up() {
     )
     .expect("yaml parses");
     let table = cfg.rule_table().expect("rule table");
-    let spec = table.iter().next().expect("one rule").spec();
+    let spec = table.rules().first().expect("one rule").spec();
     assert_eq!(spec.limit, 10 * 5 * 3600);
     assert_eq!(spec.window_millis, 5 * 3600 * 1_000);
     // bucket defaults to the resolved window: one fixed-window bucket.
@@ -429,7 +384,7 @@ fn explicit_window_and_bucket_set_live_buckets() {
     )
     .expect("yaml parses");
     let table = cfg.rule_table().expect("rule table");
-    let spec = table.iter().next().expect("one rule").spec();
+    let spec = table.rules().first().expect("one rule").spec();
     assert_eq!(spec.limit, 10 * 5 * 3600);
     assert_eq!(spec.bucket_millis, 3600 * 1_000);
     assert_eq!(spec.live_buckets, 5);
@@ -444,7 +399,7 @@ fn bucket_defaults_to_window_when_omitted() {
     )
     .expect("yaml parses");
     let table = cfg.rule_table().expect("rule table");
-    let spec = table.iter().next().expect("one rule").spec();
+    let spec = table.rules().first().expect("one rule").spec();
     assert_eq!(spec.bucket_millis, 60_000);
     assert_eq!(spec.live_buckets, 1);
 }
@@ -458,7 +413,7 @@ fn explicit_bucket_overrides_window() {
     )
     .expect("yaml parses");
     let table = cfg.rule_table().expect("rule table");
-    let spec = table.iter().next().expect("one rule").spec();
+    let spec = table.rules().first().expect("one rule").spec();
     assert_eq!(spec.bucket_millis, 1_000);
     assert_eq!(spec.live_buckets, 60);
 }
@@ -517,38 +472,172 @@ fn cluster_id_hash_from_env_var() {
     assert_eq!(cfg.settings.cluster_id_hash.get(), 0xdeadbeef);
 }
 
-#[test]
-fn bad_rate_string_is_rejected() {
-    let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
-        "limits:\n  - name: bad\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
-         100r/fortnight\n",
-    )
-    .expect("yaml parses");
-    let err = cfg.rule_table().expect_err("bad rate must error");
-    assert!(
-        matches!(err, ConfigError::InvalidRate { ref name, .. } if name == "bad"),
-        "expected InvalidRate, got {err:?}",
-    );
+/// One `limits:` entry named `name`: domain `api`, descriptor `ip`, rate
+/// `10r/s`, with `fields` added or replacing those.
+fn limit(name: &str, fields: &[(&str, &str)]) -> String {
+    let mut entry = vec![
+        ("domain", "api"),
+        ("descriptors", "[{ key: ip }]"),
+        ("rate", "10r/s"),
+    ];
+    for &(field, value) in fields {
+        match entry.iter_mut().find(|(f, _)| *f == field) {
+            Some(slot) => slot.1 = value,
+            None => entry.push((field, value)),
+        }
+    }
+    let fields: String = entry
+        .iter()
+        .map(|(field, value)| format!("    {field}: {value}\n"))
+        .collect();
+    format!("  - name: {name}\n{fields}")
 }
 
+/// Whether a refused rule failed with the expected variant.
+type Refusal = fn(&RuleError) -> bool;
+
+/// Every rule gabiond or NGINX refused on `main` is refused by the one
+/// library constructor, with the variant the operator's message names.
 #[test]
-fn window_shorter_than_period_is_rejected() {
+fn rule_def_rejects_what_both_adapters_rejected() {
+    use gabion::rules::RateResolveError::{
+        WindowShorterThanPeriod, WindowTooLong, ZeroBucket, ZeroWindow,
+    };
     let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
-        "limits:\n  - name: inverted\n    domain: nginx\n    descriptors: [{ key: ip }]\n    \
-         rate: 10r/m\n    window: 500ms\n",
-    )
-    .expect("yaml parses");
-    let err = cfg.rule_table().expect_err("sub-period window must error");
-    assert!(
-        matches!(
-            err,
-            ConfigError::ResolveRate {
-                ref name,
-                source: gabion::rules::RateResolveError::WindowShorterThanPeriod,
-            } if name == "inverted"
+    let many: String = (0..17).map(|i| format!("{{ key: k{i} }},")).collect();
+    let many = format!("[{many}]");
+    let long_key = format!("[{{ key: {} }}]", "k".repeat(129));
+    let rows: [(&str, String, Refusal); 16] = [
+        (
+            "no descriptors",
+            limit("r", &[("descriptors", "[]")]),
+            |e| matches!(e, RuleError::NoDescriptors { .. }),
         ),
-        "expected ResolveRate(WindowShorterThanPeriod), got {err:?}",
-    );
+        (
+            "bad key",
+            limit("r", &[("descriptors", "[{ key: 9x }]")]),
+            |e| matches!(e, RuleError::InvalidKey { .. }),
+        ),
+        ("zero window", limit("r", &[("window", "0s")]), |e| {
+            matches!(
+                e,
+                RuleError::Window {
+                    source: ZeroWindow,
+                    ..
+                }
+            )
+        }),
+        ("zero bucket", limit("r", &[("bucket", "0s")]), |e| {
+            matches!(
+                e,
+                RuleError::Window {
+                    source: ZeroBucket,
+                    ..
+                }
+            )
+        }),
+        ("sub-ms bucket", limit("r", &[("bucket", "500us")]), |e| {
+            matches!(
+                e,
+                RuleError::Window {
+                    source: ZeroBucket,
+                    ..
+                }
+            )
+        }),
+        ("long window", limit("r", &[("window", "60d")]), |e| {
+            matches!(
+                e,
+                RuleError::Window {
+                    source: WindowTooLong,
+                    ..
+                }
+            )
+        }),
+        (
+            "short window",
+            limit("r", &[("rate", "10r/m"), ("window", "500ms")]),
+            |e| {
+                matches!(
+                    e,
+                    RuleError::Window {
+                        source: WindowShorterThanPeriod,
+                        ..
+                    }
+                )
+            },
+        ),
+        ("zero rate", limit("r", &[("rate", "0r/s")]), |e| {
+            matches!(e, RuleError::Rate { .. })
+        }),
+        ("sub-ms rate", limit("r", &[("rate", "10r/500us")]), |e| {
+            matches!(e, RuleError::Rate { .. })
+        }),
+        (
+            "unknown period",
+            limit("r", &[("rate", "10r/fortnight")]),
+            |e| matches!(e, RuleError::Rate { .. }),
+        ),
+        (
+            "too many descriptors",
+            limit("r", &[("descriptors", &many)]),
+            |e| {
+                matches!(
+                    e,
+                    RuleError::TooManyDescriptors {
+                        count: 17,
+                        max: 16,
+                        ..
+                    }
+                )
+            },
+        ),
+        ("long key", limit("r", &[("descriptors", &long_key)]), |e| {
+            matches!(
+                e,
+                RuleError::KeyTooLong {
+                    bytes: 129,
+                    max: 128,
+                    ..
+                }
+            )
+        }),
+        ("bad domain", limit("r", &[("domain", "\"a b\"")]), |e| {
+            matches!(e, RuleError::InvalidDomain { .. })
+        }),
+        (
+            "duplicate name",
+            limit("r", &[]) + &limit("r", &[("rate", "5r/s")]),
+            |e| matches!(e, RuleError::DuplicateRuleName { .. }),
+        ),
+        (
+            "duplicate identity",
+            limit("r", &[]) + &limit("s", &[("rate", "20r/s")]),
+            |e| matches!(e, RuleError::DuplicateRuleIdentity { .. }),
+        ),
+        (
+            "too many rules",
+            limit("r", &[]) + &limit("s", &[("window", "2s")]),
+            |e| {
+                matches!(
+                    e,
+                    RuleError::TooManyRules {
+                        rules: 2,
+                        capacity: 1
+                    }
+                )
+            },
+        ),
+    ];
+    for (row, limits, expected) in rows {
+        let storage = if row == "too many rules" {
+            "storage:\n  rule_dictionary_capacity: 1\n"
+        } else {
+            ""
+        };
+        let cfg = AppConfig::load_with_yaml_str(&format!("{storage}limits:\n{limits}"))
+            .unwrap_or_else(|error| panic!("{row}: {error}"));
+        let error = cfg.rule_table().expect_err(row);
+        assert!(expected(&error), "{row}: {error:?}");
+    }
 }

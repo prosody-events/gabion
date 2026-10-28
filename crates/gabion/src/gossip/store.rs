@@ -2,9 +2,10 @@
 //!
 //! The gossip runtime hands every CRDT-touching event-loop iteration's
 //! [`DeltaSink`] and [`ExpirationSink`] to a caller-supplied store via
-//! [`AggregateStore::apply`]. Production backends (`Arc<DashMapStore>`,
-//! `Arc<ShmStore>`) plug in via this trait; tests use the in-memory backing
-//! store defined in `gossip::tests`.
+//! [`AggregateStore::apply`]. Production backends (`gabiond`'s
+//! `Arc<gabion::aggregate::Aggregate>`, NGINX's `ShmAggregateStore`) plug in
+//! via this trait; tests use the in-memory backing store defined in
+//! `gossip::tests`.
 
 use crate::crdt::{Count, DeltaSink, ExpirationSink};
 
@@ -12,9 +13,9 @@ use crate::crdt::{Count, DeltaSink, ExpirationSink};
 /// iteration with whatever rows the arm produced (each sink may be empty —
 /// the caller-side short-circuit decides whether to read them).
 ///
-/// `&self` so cloneable handles (`Arc<DashMapStore>`, `Arc<ShmStore>`) can be
-/// shared between the runtime (writer) and the read path. Backends use
-/// interior mutability — DashMap, atomics, or `Mutex`.
+/// `&self` so a cloneable handle (`Arc<Aggregate>`) can be shared between the
+/// runtime (writer) and the read path. Backends use interior mutability:
+/// seqlocked atomics.
 ///
 /// Apply order contract: implementations should fold deltas first, then
 /// expirations. The two arms producing rows today cannot produce both in the
@@ -29,8 +30,8 @@ pub trait AggregateStore<C: Count> {
 }
 
 /// `Arc<T>` forwards to its inner store. Lets downstream code share one
-/// `Arc<DashMapStore>` handle between the runtime and the read path without
-/// any wrapper boilerplate.
+/// `Arc<Aggregate>` handle between the runtime and the read path without any
+/// wrapper boilerplate.
 impl<C: Count, T: AggregateStore<C> + ?Sized> AggregateStore<C> for std::sync::Arc<T> {
     #[inline]
     fn apply(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>) {

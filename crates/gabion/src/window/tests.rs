@@ -1,7 +1,7 @@
 use super::*;
 
 /// Build a closure backed by an inline `(bucket, count)` table. Returns
-/// `0` for any bucket not listed — matches the SHM/DashMap "no row" case.
+/// `0` for any bucket not listed — matches the aggregate table's "no row" case.
 fn counts_from(table: &[(BucketEpoch, u64)]) -> impl Fn(BucketEpoch) -> u64 + '_ {
     move |bucket| {
         table

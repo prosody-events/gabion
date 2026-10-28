@@ -11,14 +11,14 @@ use tokio::sync::watch;
 use tokio::task::LocalSet;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use gabion::crdt::{CellStore, RuleDescriptor};
+use gabion::aggregate::Aggregate;
+use gabion::crdt::CellStore;
 use gabion::discovery;
 use gabion::gossip::GossipRuntime;
 
 use gabion_server::admin::{self, AdminState};
 use gabion_server::config::{AppConfig, ConfigError};
 use gabion_server::identity::derive_identity;
-use gabion_server::store::DashMapStore;
 use gabion_server::{RATE_LIMIT_SERVICE_NAME, SharedLimiter, serve};
 
 fn main() -> anyhow::Result<()> {
@@ -62,13 +62,14 @@ async fn run() -> anyhow::Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
 
     let config = load_config()?;
+    let rule_table = Arc::new(config.rule_table()?);
     tracing::info!(
         gossip_bind = ?config.settings.gossip_bind,
         envoy_bind = ?config.settings.envoy_bind,
         admin_bind = ?config.settings.admin_bind,
         rules_loaded = config.limits.len(),
         max_keys = config.settings.max_cells,
-        max_rules = config.settings.rule_dictionary_capacity,
+        max_rules = rule_table.dictionary_capacity(),
         max_peer_instances = config.settings.node_dictionary_capacity,
         "Starting gabion.",
     );
@@ -81,12 +82,8 @@ async fn run() -> anyhow::Result<()> {
          every restart so peers can tell restarts apart from new nodes.",
     );
 
-    let rule_table = Arc::new(config.rule_table()?);
-    let mut cell_store = CellStore::<u32>::new(config.storage, identity);
-    register_rules(&mut cell_store, &rule_table).context("register configured rules")?;
-    let counts = Arc::new(DashMapStore::<u32>::with_capacity(
-        config.settings.max_cells.get() as usize,
-    ));
+    let cell_store = CellStore::<u32>::new(config.storage, identity, &rule_table);
+    let counts = Arc::new(Aggregate::new(&config.storage));
 
     let gossip_bind = config
         .settings
@@ -118,7 +115,7 @@ async fn run() -> anyhow::Result<()> {
         rule_table.clone(),
         gossip_client.clone(),
         counts.clone(),
-        config.storage.cardinality,
+        config.storage,
     );
 
     let peer_events = discovery::peer_events(config.settings.discovery());
@@ -285,30 +282,6 @@ async fn run() -> anyhow::Result<()> {
     tracing::info!("Gabion shut down cleanly.");
 
     early_exit
-}
-
-fn register_rules(
-    cell_store: &mut CellStore<u32>,
-    rule_table: &gabion::rules::RuleTable,
-) -> anyhow::Result<()> {
-    for rule in rule_table.iter() {
-        let descriptor = RuleDescriptor {
-            fingerprint: rule.fingerprint,
-            window_millis: rule.window_millis.min(u32::MAX as u64) as u32,
-            bucket_millis: rule.bucket_millis.min(u32::MAX as u64) as u32,
-            limit: rule.limit,
-            flags: 0,
-            local_rule_id: rule.id,
-        };
-        if cell_store.intern_rule(descriptor).is_none() {
-            anyhow::bail!(
-                "rule dictionary is full while registering rule id {} fingerprint {:032x}",
-                rule.id,
-                rule.fingerprint,
-            );
-        }
-    }
-    Ok(())
 }
 
 fn load_config() -> anyhow::Result<AppConfig> {

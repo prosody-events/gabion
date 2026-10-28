@@ -32,3 +32,32 @@ impl Drop for TestZone {
         drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.ptr, self.words)) });
     }
 }
+
+/// Apply one delta row of `count` hits for `(fingerprint, key_hash, bucket)`
+/// through the leader's writer, as the gossip runtime would.
+pub(crate) fn seed(
+    store: &super::ShmAggregateStore,
+    fingerprint: u128,
+    key_hash: gabion::crdt::KeyHash,
+    bucket: u32,
+    count: u32,
+) {
+    use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink};
+    use gabion::gossip::AggregateStore;
+    let deltas = DeltaSink {
+        handles: vec![CellHandle {
+            index: 0,
+            generation: 0,
+        }],
+        keys: vec![CellIdentity {
+            rule_fingerprint: fingerprint,
+            key_hash,
+            bucket,
+        }],
+        previous: vec![0],
+        current: vec![count],
+        deltas: vec![count],
+        applies_locally: vec![1],
+    };
+    store.apply(&deltas, &ExpirationSink::default());
+}

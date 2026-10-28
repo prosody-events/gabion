@@ -126,10 +126,10 @@ where
     counters: GossipCounters,
 
     // Threshold-triggered anti-entropy state. One column per interned rule
-    // slot; sized to `STORAGE_RULE_DICTIONARY_CAPACITY` at construction and
-    // reused for the runtime's lifetime. Total cost ~1 KiB regardless of
-    // rule churn. Indexed by `RuleSlot` to keep the hot path's single
-    // dictionary lookup (`RuleDictionary::find`) the only identity work.
+    // slot; sized to the rule dictionary's capacity at construction and
+    // reused for the runtime's lifetime, a few KiB regardless of rule churn. Indexed by `RuleSlot`
+    // to keep the hot path's single dictionary lookup (`RuleDictionary::find`) the only
+    // identity work.
     //
     // - `rule_pending[slot]`     — local hits accumulated against rule `slot` since the last
     //   gossip emit. Zeroed when a round settles (`settle`).

@@ -282,10 +282,15 @@ the entries below are `gabiond`'s own.
 | Symptom (verbatim from the error string)                                                                                       | What it means                                                                                          | Fix                                                                                                                          |
 |--------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
 | `` gabiond could not read its configuration: … missing field `name` ``                                                         | A `limits:` entry is missing a required field.                                                         | Supply `name`, `domain`, `descriptors`, and `rate`. `window` and `bucket` are optional.                                       |
-| `` rule `X` is declared more than once; rule names must be unique ``                                                           | Two `limits:` entries share a `name:`.                                                                 | Pick distinct names.                                                                                                          |
-| `` rule `X` has an invalid `rate:` value: …. ``                                                                                | The `rate:` string didn't parse, its count is zero, or its period is under 1 ms.                      | Write a count of at least 1 and a period of at least 1 ms: a unit (`s`, `m`, `h`, `d`) or a duration such as `500ms` or `5m`. A zero rate is refused because it would deny all traffic. |
-| `` rule `X`: the window is shorter than the rate's period, so the rate cannot be spread over it. … for example `100r/500ms` ``   | An explicit `window:` was shorter than the rate's period; a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
-| `` rule `X` descriptor key `Y` must match `[A-Za-z_][A-Za-z0-9_.-]*` ``                                                        | A descriptor key uses an unsupported character.                                                        | Use identifier-like names. Underscore, dot, and dash are allowed inside; the first character must be a letter or underscore.  |
+| `` Two rules are named `X`. ``                                                                                                  | Two `limits:` entries share a `name:`.                                                                 | Pick distinct names.                                                                                                          |
+| `` Rules `X` and `Y` count the same keys with the same domain, descriptors, window and bucket … ``                             | Two rules share an identity (they may differ only in `rate:` count or `mode:`), so their counters could not be told apart. | Give one a different descriptor, `window:` or `bucket:`, or merge them.                                                       |
+| `` Rule `X` has an invalid rate: …. ``                                                                                         | The `rate:` string didn't parse, its count is zero, or its period is under 1 ms.                      | Write a count of at least 1 and a period of at least 1 ms: a unit (`s`, `m`, `h`, `d`) or a duration such as `500ms` or `5m`. A zero rate is refused because it would deny all traffic. |
+| `` Rule `X`: the window is shorter than the rate's period, so the rate cannot be spread over it. … for example `100r/500ms` ``   | An explicit `window:` was shorter than the rate's period; a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
+| `` Rule `X`: the window is longer than gabion tracks … ``                                                                      | The window is 49 days or more, or spans 2,147,483,648 buckets or more.                                 | Use a shorter `window:` or a larger `bucket:`.                                                                                |
+| `` Rule `X` has descriptor key `Y`, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` … ``                                         | A descriptor key uses an unsupported character.                                                        | Use identifier-like names. Underscore, dot, and dash are allowed inside; the first character must be a letter or underscore.  |
+| `` Rule `X` has a domain … ``                                                                                                  | `domain:` is empty, longer than 255 bytes, or holds whitespace or a control character.                 | Use 1 to 255 bytes with no whitespace, the same domain an NGINX twin of the rule names in `domain=`.                          |
+| `` Rule `X` has no descriptors … ``, `` Rule `X` has N descriptors, above … ``, `` Rule `X` has descriptor key `Y` of N bytes, above … `` | The rule has no `descriptors:`, more than `storage.max_descriptor_count`, or a key longer than `storage.max_key_bytes`. | Add a descriptor, or shorten the rule or raise the named setting.                                                             |
+| `` N rate-limit rules are configured, but `storage.rule_dictionary_capacity` … is M. … ``                                      | `storage.rule_dictionary_capacity` is set below the number of rules.                                   | Remove it to use the default (twice the configured rules, at least 256), or raise it.                                         |
 | `` The configuration file sets `X`, which gabiond does not know. … ``                                                            | The YAML sets a key that is not a setting or a field of a `limits:` entry: a typo, or a key this release removed or renamed. | Correct or delete the key; the release notes name each removed key's replacement.                                             |
 | `` The configuration file sets `X` (…) to …, which gabiond cannot read as its value. … ``                                       | A table, a list where one value belongs, or an unquoted integer above 9223372036854775807, which YAML reads as a fraction and rounds. | Fix the indentation or quote the number, or remove the key.                                                                   |
 | `` `X` is 0, but it must be at least 1: … ``                                                                                    | A count, capacity or duration was set to 0, which would disable what it sizes.                         | Remove the setting to use the default the message names, or set a positive value.                                             |
@@ -308,9 +313,9 @@ Message starts: "Rejecting requests that attach too many or too large rate-limit
 
 **Why.** Usually a misbehaving client or an attack trying to exhaust gabion's tracking memory; occasionally a legitimate client whose descriptors outgrew the defaults.
 
-**What to do next.** If the traffic is legitimate, raise the setting in `config_key` and restart: `storage.max_descriptor_count` (at most 16 for now; a larger value fails to load), `storage.max_descriptor_bytes` or `storage.max_key_bytes`. `request_descriptors` has no setting: it is the build-time constant `STORAGE_MAX_DESCRIPTOR_COUNT` (16), so have Envoy send fewer descriptors per request.
+**What to do next.** If the traffic is legitimate, raise the setting in `config_key` and restart: `storage.max_descriptor_count`, `storage.max_descriptor_bytes`, `storage.max_key_bytes` or, for `request_descriptors`, `storage.max_request_descriptors` (each up to 65,535 where it is a count).
 
-**Fields** `domain`, `limit`, `max`, `rejected_total`, `config_key` (absent for `request_descriptors`) · **Knob** `storage.max_descriptor_count` (`GABION_STORAGE_MAX_DESCRIPTOR_COUNT`), `storage.max_descriptor_bytes` (`GABION_STORAGE_MAX_DESCRIPTOR_BYTES`), `storage.max_key_bytes` (`GABION_STORAGE_MAX_KEY_BYTES`)
+**Fields** `domain`, `limit`, `max`, `rejected_total`, `config_key` · **Knob** `storage.max_descriptor_count` (`GABION_STORAGE_MAX_DESCRIPTOR_COUNT`), `storage.max_descriptor_bytes` (`GABION_STORAGE_MAX_DESCRIPTOR_BYTES`), `storage.max_key_bytes` (`GABION_STORAGE_MAX_KEY_BYTES`), `storage.max_request_descriptors` (`GABION_STORAGE_MAX_REQUEST_DESCRIPTORS`, default 16)
 
 ### `gossip_record_failure`
 
@@ -318,7 +323,7 @@ Message starts: "Rejecting requests that attach too many or too large rate-limit
 
 Message starts: "This node can no longer share rate-limit counts with the rest of the cluster."
 
-**What happened.** `gabiond` could not hand a count to the gossip task. The request was allowed and its hits were not recorded. The same task applies peers' counts, so this node's counts stop rising altogether: its limits under-count all traffic and, as windows pass, allow everything.
+**What happened.** `gabiond` could not hand a count to the gossip task because the task is gone. The request was allowed and its hits were not recorded. The same task applies peers' counts, so this node's counts stop rising altogether: its limits under-count all traffic and, as windows pass, allow everything.
 
 **Why.** The gossip background task has stopped, which happens after it surfaces a typed error.
 
@@ -330,15 +335,29 @@ Message starts: "This node can no longer share rate-limit counts with the rest o
 
 **Level** warn, power of two · **Request allowed** yes, only the first `cap` rules counted it · **Emitted by** `gabiond`
 
-Message starts: "A request matched more than 16 rate-limit rules, the most this node counts per request."
+Message starts: "A request matched more than 16 rate-limit rules, the most this node counts per request." (the number is `storage.max_matched_rules`)
 
 **What happened.** One request matched more rules than `gabiond` counts per request. It was allowed; the first `cap` matched rules counted it, and the rest under-count.
 
 **Why.** Usually overlapping rule patterns, for example a wildcard rule alongside several specific ones.
 
-**What to do next.** Merge or narrow the overlapping rules under `limits:`, or split the rule space across `domain:` values. The cap is the build-time constant `STORAGE_MAX_MATCHED_RULES` and cannot be set in config.
+**What to do next.** Merge or narrow the overlapping rules under `limits:`, split the rule space across `domain:` values, or raise `storage.max_matched_rules`. Each extra rule costs 32 bytes per runtime thread, reserved once on the thread's first request.
 
-**Fields** `domain`, `cap`, `overflowed_total` · **Knob** none (build constant `STORAGE_MAX_MATCHED_RULES`)
+**Fields** `domain`, `cap`, `overflowed_total`, `config_key` · **Knob** `storage.max_matched_rules` (`GABION_STORAGE_MAX_MATCHED_RULES`, default 16)
+
+### `request_queue_full`
+
+**Level** warn, power of two · **Request allowed** yes, some hits not counted · **Emitted by** `gabiond`
+
+Message starts: "The gossip request queue was full, so counted hits were dropped"
+
+**What happened.** An allowed request's hits found the gossip task's request queue full, so they were dropped rather than making the request wait. The request was allowed and the cluster's counts are missing those hits, so limits briefly under-count.
+
+**Why.** Usually a burst larger than the queue, or the gossip task starved of CPU.
+
+**What to do next.** Raise `gossip.limit_queue_capacity` (`GABION_GOSSIP_LIMIT_QUEUE_CAPACITY`) or give the pod more CPU.
+
+**Fields** `capacity`, `dropped_total`, `config_key` · **Knob** `gossip.limit_queue_capacity` (`GABION_GOSSIP_LIMIT_QUEUE_CAPACITY`)
 
 ## Fail-open invariant
 
@@ -347,8 +366,8 @@ Every other condition results in `OK`: gossip queue saturation, a
 rule-table inconsistency, and transient internal failures all allow
 the request through. The deliberate exception is `OVER_LIMIT` from
 the cardinality envelope (`storage.max_descriptor_count`,
-`storage.max_descriptor_bytes`, `storage.max_key_bytes`, and more than
-16 descriptors in one request, `STORAGE_MAX_DESCRIPTOR_COUNT`), which
+`storage.max_descriptor_bytes`, `storage.max_key_bytes` and
+`storage.max_request_descriptors`), which
 exists to bound memory consumption against pathological client input.
 
 See the [Fail-open invariant](../../README.md#fail-open-invariant)

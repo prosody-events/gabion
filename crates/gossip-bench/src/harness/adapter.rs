@@ -10,25 +10,26 @@
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::rc::Rc;
+use std::time::Duration;
 
 use ahash::AHashMap;
-use anyhow::{Result, bail};
+use anyhow::Result;
+use gabion::aggregate::Aggregate;
 pub use gabion::crdt::BucketEpoch;
 use gabion::crdt::{
-    CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity, RuleDescriptor,
-    ValidStorageConfig,
+    CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity, ValidStorageConfig,
 };
 pub(super) use gabion::defaults as d;
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipError, GossipRuntime,
     GossipTransport, Ticker, ValidGossipConfig,
 };
-use gabion::rules::{Descriptor, DescriptorPattern, EnforcementMode, Rule, hash_key};
+use gabion::rules::{Descriptor, EnforcementMode, RuleDef, RuleSpec, RuleTable, hash_key};
 use gabion::settings::Settings;
 use tokio::sync::{mpsc, oneshot};
 
 use super::driver::Counters;
-use super::node::{KeySpace, NOT_TRACKED, Sizing, Slot, ring_window_total};
+use super::node::{KeySpace, NOT_TRACKED, Sizing};
 use super::plan::node_addr;
 use super::regime::Regime;
 use super::rng::{Rng, Stream, mix64};
@@ -36,7 +37,6 @@ use super::world::{PeerStream, SimClock, SimSocket, SimTicker, World};
 
 const DOMAIN: &str = "study";
 const DESCRIPTOR_KEY: &str = "site";
-const RULE_ID: u32 = 1;
 
 impl Ticker for SimTicker {
     async fn tick(&mut self) {
@@ -46,33 +46,33 @@ impl Ticker for SimTicker {
 
 /// The library's identity of the regime's one rule and of every key.
 struct Identity {
-    rule: RuleDescriptor,
+    /// The regime's rule, which every node's cell store interns.
+    rules: RuleTable,
+    rule: RuleSpec,
     hashes: Box<[KeyHash]>,
     /// Key hash → key index.
     index: AHashMap<u128, u32>,
 }
 
 impl Identity {
-    fn build(regime: &Regime, keys: usize) -> Self {
-        let rule = Rule::new(
-            RULE_ID,
-            DOMAIN,
-            vec![DescriptorPattern {
-                key: DESCRIPTOR_KEY.into(),
-                value: "*".into(),
-            }],
-            regime.rule.limit,
-            regime.rule.window_ms,
-            regime.rule.bucket_ms,
-            EnforcementMode::Enforce,
-        );
+    fn build(regime: &Regime, keys: usize, cells: &ValidStorageConfig) -> Result<Self> {
+        let rule = RuleDef {
+            name: "study",
+            domain: DOMAIN,
+            patterns: &[(DESCRIPTOR_KEY, "*")],
+            rate: &format!("{}r/{}ms", regime.rule.limit, regime.rule.window_ms),
+            window: None,
+            bucket: Some(Duration::from_millis(regime.rule.bucket_ms)),
+            mode: EnforcementMode::Enforce,
+        }
+        .build(&cells.cardinality)?;
+        let spec = rule.spec();
         let hashes: Box<[KeyHash]> = (0..keys)
             .map(|i| {
                 let value = i.to_string();
                 hash_key(
-                    RULE_ID,
                     DOMAIN,
-                    &[Descriptor {
+                    [Descriptor {
                         key: DESCRIPTOR_KEY,
                         value: &value,
                     }],
@@ -84,30 +84,22 @@ impl Identity {
             .enumerate()
             .map(|(i, h)| (h.0, i as u32))
             .collect();
-        Self {
-            rule: RuleDescriptor {
-                fingerprint: rule.fingerprint,
-                window_millis: rule.window_millis.min(u64::from(u32::MAX)) as u32,
-                bucket_millis: rule.bucket_millis.min(u64::from(u32::MAX)) as u32,
-                limit: rule.limit,
-                flags: 0,
-                local_rule_id: RULE_ID,
-            },
+        Ok(Self {
+            rules: RuleTable::new(Box::new([rule]), cells.rule_dictionary_capacity())?,
+            rule: spec,
             hashes,
             index,
-        }
+        })
     }
 }
 
-/// A node's view of the cluster aggregate: per key, a ring of bucket totals
-/// summed across origins. Semantically the server adapter's `DashMapStore`
-/// (`crates/server/src/store.rs`) — deltas add, expirations subtract the
-/// origin's last count, `window_total` sums the live buckets — laid out as
-/// fixed rings because the key population is known up front.
+/// A node's view of the cluster aggregate: the library's aggregate table,
+/// sized from the node's validated `storage.max_cells` as `gabiond` sizes
+/// it, plus the driver's bookkeeping of which tracked rows changed.
 pub struct NodeStore {
     keys: Rc<KeySpace>,
     identity: Rc<Identity>,
-    ring: RefCell<Box<[Slot]>>,
+    counts: Aggregate,
     /// `(tracked index, bucket)` rows touched since the driver last looked.
     touched: RefCell<Vec<(u32, BucketEpoch)>>,
     /// Rows under the regime's rule for a key the regime never issued. Always
@@ -116,12 +108,11 @@ pub struct NodeStore {
 }
 
 impl NodeStore {
-    fn new(keys: Rc<KeySpace>, identity: Rc<Identity>) -> Self {
-        let slots = keys.len() * keys.ring_len as usize;
+    fn new(keys: Rc<KeySpace>, identity: Rc<Identity>, cells: &ValidStorageConfig) -> Self {
         Self {
             keys,
             identity,
-            ring: RefCell::new(vec![Slot::default(); slots].into_boxed_slice()),
+            counts: Aggregate::new(cells),
             touched: RefCell::new(Vec::new()),
             foreign_rows: Cell::new(0),
         }
@@ -130,16 +121,18 @@ impl NodeStore {
     /// What the adapter's admission check reads: the live-window total for
     /// `key` at `now_millis`.
     pub fn window_total(&self, key: u32, now_millis: u64) -> u64 {
-        ring_window_total(
-            &self.keys,
-            &self.ring.borrow(),
-            key,
-            self.keys.bucket_of(now_millis),
-        )
+        let hash = self.identity.hashes[key as usize];
+        self.counts
+            .table()
+            .window_total(self.identity.rule, hash, now_millis)
     }
 
     pub fn bucket_count(&self, key: u32, bucket: BucketEpoch) -> u32 {
-        self.ring.borrow()[self.keys.slot(key, bucket)].count_for(bucket)
+        let hash = self.identity.hashes[key as usize];
+        self.counts
+            .table()
+            .get(self.identity.rule.fingerprint, hash.0, bucket)
+            .map_or(0, |cell| cell.count.min(u64::from(u32::MAX)) as u32)
     }
 
     pub fn take_touched(&self, into: &mut Vec<(u32, BucketEpoch)>) {
@@ -147,17 +140,16 @@ impl NodeStore {
         std::mem::swap(into, &mut self.touched.borrow_mut());
     }
 
-    fn key_of(&self, fingerprint: u128, key_hash: KeyHash) -> Option<u32> {
+    /// Note a row the node applied: count it as foreign when the regime
+    /// never issued its key, else mark a tracked key's bucket touched.
+    fn note(&self, fingerprint: u128, key_hash: KeyHash, bucket: BucketEpoch) {
         let key = (fingerprint == self.identity.rule.fingerprint)
             .then(|| self.identity.index.get(&key_hash.0).copied())
             .flatten();
-        if key.is_none() {
+        let Some(key) = key else {
             self.foreign_rows.set(self.foreign_rows.get() + 1);
-        }
-        key
-    }
-
-    fn touch(&self, key: u32, bucket: BucketEpoch) {
+            return;
+        };
         let tracked = self.keys.tracked_of[key as usize];
         if tracked != NOT_TRACKED {
             self.touched.borrow_mut().push((tracked, bucket));
@@ -167,31 +159,17 @@ impl NodeStore {
 
 impl AggregateStore<u32> for NodeStore {
     fn apply(&self, deltas: &DeltaSink<u32>, expirations: &ExpirationSink<u32>) {
-        let mut ring = self.ring.borrow_mut();
+        self.counts.apply(deltas, expirations);
         for i in 0..deltas.len() {
-            if deltas.applies_locally[i] == 0 || deltas.deltas[i] == 0 {
-                continue;
-            }
-            let cell = deltas.keys[i];
-            let Some(key) = self.key_of(cell.rule_fingerprint, cell.key_hash) else {
-                continue;
-            };
-            if ring[self.keys.slot(key, cell.bucket)].add(cell.bucket, deltas.deltas[i]) {
-                self.touch(key, cell.bucket);
+            if deltas.applies_locally[i] != 0 && deltas.deltas[i] != 0 {
+                let cell = deltas.keys[i];
+                self.note(cell.rule_fingerprint, cell.key_hash, cell.bucket);
             }
         }
         for i in 0..expirations.len() {
-            if expirations.applies_locally[i] == 0 {
-                continue;
-            }
-            let cell = expirations.keys[i];
-            let Some(key) = self.key_of(cell.rule_fingerprint, cell.key_hash) else {
-                continue;
-            };
-            let slot = &mut ring[self.keys.slot(key, cell.bucket)];
-            if slot.bucket == cell.bucket {
-                slot.count = slot.count.saturating_sub(expirations.last_counts[i]);
-                self.touch(key, cell.bucket);
+            if expirations.applies_locally[i] != 0 {
+                let cell = expirations.keys[i];
+                self.note(cell.rule_fingerprint, cell.key_hash, cell.bucket);
             }
         }
     }
@@ -212,8 +190,8 @@ pub struct Node {
 }
 
 impl Node {
-    /// Record one admitted hit of `key`, as `SharedLimiter::evaluate` does
-    /// after admitting it. Resolves to whether the node took the hit.
+    /// Record one admitted hit of `key`, as `SharedLimiter` does after
+    /// admitting it. Resolves to whether the node took the hit.
     pub fn record(
         &self,
         key: u32,
@@ -303,7 +281,7 @@ impl Launcher {
         Ok(Self {
             world: Rc::clone(world),
             keys: Rc::clone(keys),
-            identity: Rc::new(Identity::build(regime, keys.len())),
+            identity: Rc::new(Identity::build(regime, keys.len(), &cells)?),
             gossip,
             cells,
             seed,
@@ -324,8 +302,8 @@ impl Launcher {
     }
 
     /// Start node `idx` on `transport` exactly as `gabiond` would at boot
-    /// (production gossip settings, the regime's rule interned before the
-    /// runtime starts); a test wraps the node's [`SimSocket`] to observe
+    /// (production gossip settings, the regime's rule interned as the cell
+    /// store is built); a test wraps the node's [`SimSocket`] to observe
     /// what it sends.
     pub fn launch_on<T: GossipTransport>(
         &self,
@@ -336,13 +314,11 @@ impl Launcher {
         let identity = NodeIdentity::new(NodeId(id), 1);
         let mut config = self.gossip.clone();
         config.rng_seed = Rng::stream(self.seed, Stream::Gossip, idx as u64).next_u64();
-        let mut cell_store = CellStore::<u32>::new(self.cells, identity);
-        if cell_store.intern_rule(self.identity.rule).is_none() {
-            bail!("node {idx}: the cell store refused to register the regime's rule");
-        }
+        let cell_store = CellStore::<u32>::new(self.cells, identity, &self.identity.rules);
         let store = Rc::new(NodeStore::new(
             Rc::clone(&self.keys),
             Rc::clone(&self.identity),
+            &self.cells,
         ));
         let (admin, admin_rx) = mpsc::channel(4);
         let (runtime, client) = GossipRuntime::from_parts_with_admin(

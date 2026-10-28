@@ -13,15 +13,17 @@ pub(crate) mod mock;
 pub mod queue;
 pub mod stats;
 
-pub use aggregate::{AggregateSlot, AggregateTable, ShmAggregateStore};
+pub use aggregate::ShmAggregateStore;
 pub use header::{Header, NodeIdentityFields};
 pub use lease::LeaderLease;
 pub use queue::{QueueControl, QueueOverflow, QueueSlot, RequestQueue};
 pub use stats::Stats;
 
-/// Atomics and spin hints for the queue, lease and aggregate table. The
-/// `loom` feature (`make loom`) swaps in loom's model-checked ones for
-/// `tests/loom.rs`.
+use gabion::aggregate::{AggregateSlot, AggregateTable};
+
+/// Atomics and spin hints for the queue and lease. The `loom` feature
+/// (`make loom`) swaps in loom's model-checked ones for `tests/loom.rs`, and
+/// turns on `gabion/loom` for the aggregate table's.
 #[cfg(feature = "loom")]
 use loom::{hint, sync::atomic};
 #[cfg(not(feature = "loom"))]
@@ -76,8 +78,7 @@ impl Layout {
             align_up(queue_control_offset + size_of::<QueueControl>(), CACHELINE);
         let queue_slots_bytes = queue_capacity.checked_mul(size_of::<QueueSlot>())?;
         let aggregate_slots_offset = align_up(queue_slots_offset + queue_slots_bytes, CACHELINE);
-        let aggregate_slots_bytes =
-            aggregate_capacity.checked_mul(size_of::<aggregate::AggregateSlot>())?;
+        let aggregate_slots_bytes = aggregate_capacity.checked_mul(size_of::<AggregateSlot>())?;
         let stats_offset = align_up(aggregate_slots_offset + aggregate_slots_bytes, CACHELINE);
         let total_bytes = align_up(stats_offset + size_of::<Stats>(), CACHELINE);
 
@@ -150,7 +151,7 @@ pub struct ShmRegion {
 // mappings in place. Crucially, every byte inside the region is only
 // accessed through atomics or seqlock-protected slots defined on the contained
 // `#[repr(C)]` types (see `shm/header.rs`, `shm/lease.rs`, `shm/queue.rs`,
-// `shm/aggregate.rs`, `shm/stats.rs`). No code ever materialises a `&mut T`
+// `gabion::aggregate`, `shm/stats.rs`). No code ever materialises a `&mut T`
 // into the mapping after `initialize` returns, so handing the wrapper to
 // another thread (Send) or sharing `&ShmRegion` across threads (Sync) cannot
 // introduce a data race. See the Nomicon chapter "Send and Sync".
@@ -214,8 +215,8 @@ impl ShmRegion {
                 std::ptr::write(slot, QueueSlot::empty(i as u64));
             }
             for i in 0..layout.aggregate_capacity {
-                let slot = region.aggregate_slot_ptr(i) as *mut aggregate::AggregateSlot;
-                std::ptr::write(slot, aggregate::AggregateSlot::empty());
+                let slot = region.aggregate_slot_ptr(i) as *mut AggregateSlot;
+                std::ptr::write(slot, AggregateSlot::empty());
             }
             std::ptr::write(region.stats_ptr() as *mut Stats, Stats::default());
             region
@@ -350,16 +351,6 @@ impl ShmRegion {
         // <= total_bytes` per `Layout::new`.
         unsafe { self.base.add(self.layout.stats_offset) }
     }
-}
-
-/// Read-side cell summary used by the access path.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AggregateCell {
-    pub rule_fingerprint: u128,
-    pub key_hash: u128,
-    pub bucket: u32,
-    pub count: u64,
-    pub last_update_millis: u64,
 }
 
 #[cfg(test)]

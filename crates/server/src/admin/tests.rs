@@ -12,14 +12,14 @@ use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use tower::ServiceExt;
 
+use gabion::aggregate::Aggregate;
 use gabion::crdt::{CellStore, NodeId, NodeIdentity};
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AdminCommand, GossipRuntime, TokioClock};
-use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleTable};
+use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
 use gabion::settings::Settings;
 
 use crate::admin::{AdminState, admin_channel, router};
-use crate::store::DashMapStore;
 
 static TEST_PORT: AtomicU16 = AtomicU16::new(41_500);
 
@@ -38,25 +38,34 @@ fn run_local<F: std::future::Future<Output = T>, T>(f: F) -> T {
     local.block_on(&rt, f)
 }
 
-fn sample_rule() -> Rule {
-    Rule::new(
-        1,
-        "api",
-        vec![DescriptorPattern {
-            key: "tenant".into(),
-            value: "*".into(),
-        }],
-        10,
-        1_000,
-        100,
-        EnforcementMode::Enforce,
-    )
+/// A small node's settings.
+fn settings() -> Settings {
+    Settings {
+        max_cells: 256.try_into().unwrap(),
+        rng_seed: Some(7),
+        ..Settings::default()
+    }
+}
+
+/// One `tenant:*` rule.
+fn sample_rules() -> RuleTable {
+    let rule = RuleDef {
+        name: "tenant",
+        domain: "api",
+        patterns: &[("tenant", "*")],
+        rate: "10r/s",
+        window: None,
+        bucket: Some(std::time::Duration::from_millis(100)),
+        mode: EnforcementMode::Enforce,
+    }
+    .build(&settings().validate().unwrap().1.cardinality)
+    .unwrap();
+    RuleTable::new(Box::new([rule]), None).unwrap()
 }
 
 fn build_router(gossip_admin: mpsc::Sender<AdminCommand>) -> axum::Router {
-    let rule_table = Arc::new(RuleTable::new(vec![sample_rule()]));
-    let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
-    let state = AdminState::new(rule_table, counts, gossip_admin);
+    let counts = Arc::new(Aggregate::new(&settings().validate().unwrap().1));
+    let state = AdminState::new(Arc::new(sample_rules()), counts, gossip_admin);
     router(state)
 }
 
@@ -70,14 +79,10 @@ fn snapshot_json_shape_is_pinned() {
         let bind_addr = next_addr();
         let transport = sim.bind(bind_addr);
         let identity = NodeIdentity::new(NodeId(0xBEEF_CAFE), 11);
-        let settings = Settings {
-            max_cells: 256.try_into().unwrap(),
-            rng_seed: Some(7),
-            ..Settings::default()
-        };
-        let (mut gossip_config, storage) = settings.validate().expect("settings validate");
-        let store = CellStore::<u32>::new(storage, identity);
-        let counts = Arc::new(DashMapStore::<u32>::with_capacity(64));
+        let (mut gossip_config, storage) = settings().validate().expect("settings validate");
+        let rule_table = Arc::new(sample_rules());
+        let store = CellStore::<u32>::new(storage, identity, &rule_table);
+        let counts = Arc::new(Aggregate::new(&storage));
 
         let bootstrap = next_addr();
         gossip_config.bootstrap_peers = vec![bootstrap];
@@ -93,8 +98,7 @@ fn snapshot_json_shape_is_pinned() {
         );
         let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
-        let rule_table = Arc::new(RuleTable::new(vec![sample_rule()]));
-        let state = AdminState::new(rule_table, counts, admin_tx);
+        let state = AdminState::new(rule_table.clone(), counts, admin_tx);
         let app = router(state);
 
         let response = app
@@ -179,6 +183,7 @@ fn snapshot_json_shape_is_pinned() {
                 "limit",
                 "live_buckets",
                 "mode",
+                "name",
                 "window_millis",
             ]
         );
@@ -193,11 +198,11 @@ fn snapshot_json_shape_is_pinned() {
         assert!(body["peers"][0]["node_id"].is_null());
         assert_eq!(
             body["rules"][0]["fingerprint"],
-            format!("{:#034x}", sample_rule().fingerprint)
+            format!("{:#034x}", rule_table.rules()[0].fingerprint)
         );
         assert_eq!(
             body["rules"][0]["domain_hash"],
-            format!("{:#034x}", sample_rule().domain_hash.0)
+            format!("{:#034x}", rule_table.rules()[0].domain_hash.0)
         );
         assert_eq!(body["rules"][0]["mode"], "enforce");
         assert_eq!(body["aggregate_rows"], 0);

@@ -3,8 +3,8 @@
 //! leader thread. All cross-process state lives in the SHM zone allocated by
 //! [`set_zone`] during the master process's config phase.
 
+use std::cell::Cell;
 use std::ffi::{c_char, c_void};
-use std::num::NonZeroU64;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,7 +28,6 @@ use ngx::{http_request_handler, ngx_string};
 use gabion::crdt::ValidStorageConfig;
 use gabion::defaults;
 use gabion::gossip::ValidGossipConfig;
-use gabion::rules::{EnforcementMode, is_descriptor_key, parse_rate, resolve_rate};
 use gabion::settings::{Setting, Settings};
 
 use crate::access::{AccessCtx, AccessOutcome, AllowInfo, RejectInfo, VariableLookup, decide_all};
@@ -37,13 +36,20 @@ use crate::identity::derive_identity;
 use crate::leader::{self, LeaderConfig, LeaderHandle};
 use crate::log;
 use crate::rules::{
-    BindingCompiler, BindingLookup, CompiledRules, DEFAULT_DOMAIN, DescriptorBinding, RuleConfig,
-    is_single_ident, is_zone_name, parse_binding,
+    BindingCompiler, BindingLookup, CompiledRules, RuleConfig, is_zone_name, parse_rule_directive,
 };
 use crate::shm::lease::now_millis;
+use crate::shm::queue::QueueEvent;
 use crate::shm::{Layout, MIN_AGGREGATE_CAPACITY, QueueSlot, ShmRegion};
 
 static LEADER_THREAD: Mutex<Option<LeaderHandle>> = Mutex::new(None);
+
+thread_local! {
+    /// This worker's admission scratch, which `decide_all` reserves on the
+    /// worker's first request and never grows after. The access handler
+    /// takes it for one request and puts it back.
+    static EVENTS: Cell<Vec<QueueEvent>> = const { Cell::new(Vec::new()) };
+}
 
 struct Module;
 
@@ -234,15 +240,10 @@ impl http::HttpModule for Module {
                 return core::Status::NGX_ERROR.into();
             }
             let mut compiler = NgxBindingCompiler { cf };
-            match CompiledRules::compile_with(&main.rules, storage.cardinality, &mut compiler) {
+            match CompiledRules::compile_with(&main.rules, &storage, &mut compiler) {
                 Ok(rules) => main.compiled = Some(Arc::new(rules)),
                 Err(error) => {
-                    ngx::ngx_conf_log_error!(
-                        NGX_LOG_EMERG,
-                        cf,
-                        "gabion: `gabion_limit_rule` {}",
-                        error
-                    );
+                    ngx::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "gabion: {}", error);
                     return core::Status::NGX_ERROR.into();
                 }
             }
@@ -551,13 +552,16 @@ http_request_handler!(gabion_access_handler, |request: &mut http::Request| {
         aggregate: region.aggregate(),
         queue: region.queue(),
         stats: region.stats(),
-        domain: DEFAULT_DOMAIN,
         cardinality: storage.cardinality,
+        max_matched_rules: storage.max_matched_rules(),
     };
     let vars = RequestVariables { request };
     let now = wall_millis();
+    let mut events = EVENTS.take();
+    let outcome = decide_all(ctx, rule_indices, &vars, now, &mut events);
+    EVENTS.set(events);
     // A pass that counted nothing leaves the next limited location to decide.
-    let (status, counted) = match decide_all(ctx, rule_indices, &vars, now) {
+    let (status, counted) = match outcome {
         AccessOutcome::Allow(Some(info)) => {
             apply_admit_headers(request, info);
             (core::Status::NGX_DECLINED, true)
@@ -894,20 +898,13 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
 ///                          rate=Nr/<s|m|h|d|DURATION>
 ///                          [window=W] [bucket=B]
 ///                          [mode=enforce|dry_run|disabled] [dry_run]
-///                          [except_if=$var] [domain=NAME];
+///                          [except_if=$var] [domain=NAME]
+///                          [value=KEY:LITERAL];
 /// ```
 ///
-/// Positional arguments after the rule name are descriptor bindings — `$var`
-/// auto-keyed by the variable name, or `name:$var` with an explicit key.
-/// Named arguments are recognised by their `keyword=` prefix; the bare
-/// `dry_run` flag is an alias for `mode=dry_run`.
-///
-/// `rate=` carries the sustained allowance, `window=` widens the time
-/// horizon (defaults to the rate's period), and `bucket=` controls the
-/// granularity inside the window (defaults to the resolved window, i.e.
-/// one fixed-window bucket). When `window=` is set, the resolved internal
-/// limit scales up to `floor(rate_count * window_millis / period_millis)`
-/// — see the README's "Rate, window, and bucket" section.
+/// [`parse_rule_directive`] reads the arguments, reporting any syntax error
+/// at this line; `postconfiguration` builds the rule once every setting is
+/// read. See the README's "Rate, window, and bucket" section.
 extern "C" fn set_rule(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
@@ -922,221 +919,40 @@ extern "C" fn set_rule(
     unsafe {
         let main = &mut *(conf as *mut MainConfig);
         let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let nelts = (*(*cf).args).nelts;
-        if args.is_null() || nelts < 2 {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` requires at least a rule name"
-            );
-            return core::NGX_CONF_ERROR;
-        }
-        let Ok(name) = (*args.add(1)).to_str() else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` rule name is not valid UTF-8"
-            );
-            return core::NGX_CONF_ERROR;
+        let nelts = if args.is_null() {
+            0
+        } else {
+            (*(*cf).args).nelts
         };
-
-        let mut bucket: Option<Duration> = None;
-        let mut window: Option<Duration> = None;
-        let mut domain = DEFAULT_DOMAIN.to_string();
-        let mut bindings: Vec<DescriptorBinding> = Vec::new();
-        let mut mode = EnforcementMode::Enforce;
-        let mut mode_explicit = false;
-        let mut rate: Option<(NonZeroU64, Duration)> = None;
-        let mut except_if: Option<Box<str>> = None;
-
-        for index in 2..nelts {
-            let Ok(value) = (*args.add(index)).to_str() else {
+        let mut words = Vec::with_capacity(nelts);
+        for index in 1..nelts {
+            let Ok(word) = (*args.add(index)).to_str() else {
                 ngx::ngx_conf_log_error!(
                     NGX_LOG_EMERG,
                     cf,
-                    "gabion: `gabion_limit_rule` argument is not valid UTF-8"
+                    "gabion: `gabion_limit_rule` has an argument that is not valid UTF-8; re-save \
+                     the file as UTF-8, then run `nginx -t`"
                 );
                 return core::NGX_CONF_ERROR;
             };
-            match parse_rule_arg(value) {
-                RuleArg::Rate(count, period) => rate = Some((count, period)),
-                RuleArg::Window(d) => window = Some(d),
-                RuleArg::Bucket(d) => bucket = Some(d),
-                RuleArg::Domain(d) => domain = d,
-                RuleArg::Mode(m) => {
-                    mode = m;
-                    mode_explicit = true;
-                }
-                RuleArg::DryRunFlag => {
-                    if mode_explicit && mode != EnforcementMode::DryRun {
-                        ngx::ngx_conf_log_error!(
-                            NGX_LOG_EMERG,
-                            cf,
-                            "gabion: `gabion_limit_rule` `dry_run` flag conflicts with explicit \
-                             `mode=`"
-                        );
-                        return core::NGX_CONF_ERROR;
-                    }
-                    mode = EnforcementMode::DryRun;
-                    mode_explicit = true;
-                }
-                RuleArg::ExceptIf(var) => except_if = Some(var.into()),
-                RuleArg::Binding(b) => bindings.push(b),
-                RuleArg::Invalid(reason) => {
-                    ngx::ngx_conf_log_error!(
-                        NGX_LOG_EMERG,
-                        cf,
-                        "gabion: `gabion_limit_rule` argument `{}` is invalid: {}",
-                        value,
-                        reason
-                    );
-                    return core::NGX_CONF_ERROR;
-                }
+            words.push(word);
+        }
+        match parse_rule_directive(&words) {
+            Ok(rule) => {
+                main.rules.push(rule);
+                core::NGX_CONF_OK
             }
-        }
-
-        let Some((rate_count, period)) = rate else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` rule `{}` is missing the required `rate=Nr/s` \
-                 argument",
-                name
-            );
-            return core::NGX_CONF_ERROR;
-        };
-        if bindings.is_empty() {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` rule `{}` declares no descriptor bindings; add at \
-                 least one `$variable` (e.g. `$remote_addr`)",
-                name
-            );
-            return core::NGX_CONF_ERROR;
-        }
-        if main.rules.iter().any(|r| r.name.as_ref() == name) {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "gabion: `gabion_limit_rule` rule `{}` is declared more than once; rule names \
-                 must be unique within an http {{}} block",
-                name
-            );
-            return core::NGX_CONF_ERROR;
-        }
-
-        // `window=` defaults to the rate's period (today's behavior);
-        // `bucket=` defaults to the resolved window (one fixed-window
-        // bucket per rule). With an explicit `window=` the rate is
-        // scaled up to a window-sized budget — see the README's
-        // "Rate, window, and bucket" section for the burstable-vs-paced
-        // gotcha when bucket is left at its default. Each
-        // `RateResolveError` already carries the operator-facing
-        // three-question message via `Display`; we forward it verbatim.
-        let resolved = match resolve_rate(rate_count, period, window, bucket) {
-            Ok(r) => r,
-            Err(err) => {
+            Err(error) => {
                 ngx::ngx_conf_log_error!(
                     NGX_LOG_EMERG,
                     cf,
-                    "gabion: `gabion_limit_rule` rule `{}`: {}",
-                    name,
-                    err
+                    "gabion: `gabion_limit_rule` {}",
+                    error
                 );
-                return core::NGX_CONF_ERROR;
+                core::NGX_CONF_ERROR
             }
-        };
-        main.rules.push(RuleConfig {
-            name: name.into(),
-            domain: domain.into(),
-            bindings,
-            limit: resolved.limit,
-            window: Duration::from_millis(resolved.window_millis),
-            bucket: Duration::from_millis(resolved.bucket_millis),
-            mode,
-            except_if,
-        });
-        core::NGX_CONF_OK
-    }
-}
-
-/// Parsed shape of one `gabion_limit_rule` argument.
-enum RuleArg {
-    /// `rate=Nr/<period>` — `(count, period)`. Period comes from the unit
-    /// letter (`s|m|h|d`) or a humantime-parsed duration (`30s`, `5m`).
-    Rate(NonZeroU64, Duration),
-    /// `window=DURATION` — the time horizon the rate is enforced over.
-    /// When set, the resolved `limit` scales from the rate's count up to
-    /// the window-sized budget. Defaults to the rate's period when
-    /// omitted (preserving today's behavior).
-    Window(Duration),
-    Bucket(Duration),
-    Domain(String),
-    Mode(EnforcementMode),
-    DryRunFlag,
-    ExceptIf(String),
-    Binding(DescriptorBinding),
-    Invalid(&'static str),
-}
-
-fn parse_rule_arg(value: &str) -> RuleArg {
-    if value == "dry_run" {
-        return RuleArg::DryRunFlag;
-    }
-    if let Some(rest) = value.strip_prefix("rate=") {
-        return match parse_rate(rest) {
-            Ok((count, period)) => RuleArg::Rate(count, period),
-            Err(reason) => RuleArg::Invalid(reason),
-        };
-    }
-    // `window=` and `bucket=` share the same shape — a humantime duration
-    // string that must parse and be non-zero. Zero is rejected in
-    // `resolve_rate` (so the operator sees the same wording whether it
-    // arrived as `window=0s` or as a window-vs-period mismatch); here we
-    // only reject unparseable values.
-    if let Some(rest) = value.strip_prefix("window=") {
-        return parse_duration_arg(rest, "expected `window=DURATION` (e.g. `window=5h`)")
-            .map_or_else(RuleArg::Invalid, RuleArg::Window);
-    }
-    if let Some(rest) = value.strip_prefix("bucket=") {
-        return parse_duration_arg(rest, "expected `bucket=DURATION` (e.g. `bucket=1s`)")
-            .map_or_else(RuleArg::Invalid, RuleArg::Bucket);
-    }
-    if let Some(rest) = value.strip_prefix("domain=") {
-        if !is_descriptor_key(rest) {
-            return RuleArg::Invalid(
-                "`domain=` must match `[A-Za-z_][A-Za-z0-9_.-]*` (e.g. `domain=api`)",
-            );
         }
-        return RuleArg::Domain(rest.to_string());
     }
-    if let Some(rest) = value.strip_prefix("mode=") {
-        return match rest {
-            "enforce" => RuleArg::Mode(EnforcementMode::Enforce),
-            "dry_run" => RuleArg::Mode(EnforcementMode::DryRun),
-            "disabled" => RuleArg::Mode(EnforcementMode::Disabled),
-            _ => RuleArg::Invalid("expected `mode=enforce|dry_run|disabled`"),
-        };
-    }
-    if let Some(rest) = value.strip_prefix("except_if=") {
-        let var = rest.strip_prefix('$').unwrap_or(rest);
-        if var.is_empty() || !is_single_ident(var) {
-            return RuleArg::Invalid("`except_if=` expects `$variable_name`");
-        }
-        return RuleArg::ExceptIf(var.to_string());
-    }
-    match parse_binding(value) {
-        Ok(b) => RuleArg::Binding(b),
-        Err(reason) => RuleArg::Invalid(reason),
-    }
-}
-
-/// Parse a humantime duration argument and return the original
-/// operator-facing example on a parse error. Zero durations are accepted
-/// here and rejected with a domain-specific message by `resolve_rate`.
-fn parse_duration_arg(rest: &str, unparseable_msg: &'static str) -> Result<Duration, &'static str> {
-    humantime::parse_duration(rest).map_err(|_| unparseable_msg)
 }
 
 /// nginx directive handler for `gabion_limit`. Valid at the http, server,

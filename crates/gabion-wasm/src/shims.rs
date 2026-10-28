@@ -29,7 +29,7 @@ pub type EventLog = Rc<RefCell<Vec<EventKind>>>;
 pub type AddressBook = Rc<RefCell<HashMap<SocketAddr, u32>>>;
 
 /// Downstream aggregate store that doubles as the cluster-aggregate read
-/// surface (like the production `DashMapStore`) and the cell-event source.
+/// surface (like the adapters' aggregate table) and the cell-event source.
 /// Each `apply` folds the rows into a per-key total and emits a
 /// `CellCreated` / `CellUpdated` / `CellExpired` event per row.
 pub struct EventEmittingAggregateStore<C: Count> {

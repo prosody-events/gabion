@@ -255,7 +255,7 @@ pub struct RuleDescriptor {
 }
 ```
 
-`fingerprint` is the canonical 128-bit identity and the key the hash index hashes. The remaining fields describe the rate-limit rule itself.
+`fingerprint` is the canonical 128-bit identity and the key the hash index hashes: a hash of the rule's domain, descriptor patterns, window and bucket (`gabion::rules::RuleDef::build`), so two rules that differ in window or bucket never share a slot. The remaining fields describe the rate-limit rule itself. `CellStore::new` takes the adapter's `RuleTable`, sizes the dictionary from it, and interns and pins every configured rule before any gossip runtime exists.
 
 `local_rule_id` carries a useful sentinel: a value of `u32::MAX` (the `Default`) means the rule is known on the wire only. Cells under such rules are still tracked, replicated, and expired, but `applies_locally()` returns `false` so the local aggregator skips them — which is what happens when a peer is gossiping a rule the local node does not itself enforce.
 
@@ -287,12 +287,9 @@ flowchart TD
     J --> K["len += 1; return Some(slot)"]
 ```
 
-`intern` overwrites the descriptor on a hit, which is how mutable
-metadata like `local_rule_id` updates make their way in. When a rule
-first arrives on the wire (wire-only, `local_rule_id = u32::MAX`)
-and is later registered locally, a re-intern with a real
-`local_rule_id` patches the descriptor in place without disturbing
-the slot. `intern` deliberately does not touch refcounts: a freshly
+`intern` overwrites the descriptor on a hit. Configured rules are
+interned before any gossip can arrive, so a wire-only intern
+(`local_rule_id = u32::MAX`) never lands on a configured rule's slot. `intern` deliberately does not touch refcounts: a freshly
 interned slot starts at `refcount = 0`, and the `CellStore` calls
 `inc_ref` and `dec_ref` as cells reference and release the slot.
 
@@ -804,7 +801,7 @@ The cell store takes a `ValidStorageConfig`, which only `Settings::validate` (`g
 | Knob                                    | Setting                              | `gabion::defaults`                     |
 |-----------------------------------------|--------------------------------------|----------------------------------------|
 | `cell_capacity`                         | `storage.max_cells`                  | `STORAGE_MAX_CELLS` = 131,072          |
-| `rule_dictionary_capacity`              | `storage.rule_dictionary_capacity`   | `STORAGE_RULE_DICTIONARY_CAPACITY` = 64|
+| `rule_dictionary_capacity`              | `storage.rule_dictionary_capacity`   | `max(STORAGE_RULE_DICTIONARY_FLOOR` = 256`, 2 × rules)`, resolved by `RuleTable::new` |
 | `node_dictionary_capacity`              | `storage.node_dictionary_capacity`   | `STORAGE_NODE_DICTIONARY_CAPACITY` = 1,024 |
 | `local_dirty_capacity`                  | `storage.local_dirty_capacity`       | `STORAGE_LOCAL_DIRTY_CAPACITY` = 65,536 |
 | `forwarded_dirty_capacity`              | `storage.forwarded_dirty_capacity`   | `STORAGE_FORWARDED_DIRTY_CAPACITY` = 524,288 |
@@ -860,7 +857,7 @@ The `Observation` row exists because constructing seven positional arguments at 
 
 | Column | Meaning |
 |---|---|
-| `rule_fingerprints: Vec<u128>` | 128-bit hash of the rule definition. Resolved to a `RuleSlot` during ingest by looking up (or interning into) `RuleDictionary`. The fingerprint is produced by `gabion::rules::Descriptor`. |
+| `rule_fingerprints: Vec<u128>` | 128-bit hash of the rule definition. Resolved to a `RuleSlot` during ingest by looking up (or interning into) `RuleDictionary`. The fingerprint is produced by `gabion::rules::RuleDef::build`. |
 | `key_hashes: Vec<KeyHash>`     | 128-bit hash of the application key (account, IP, customer tuple…) — opaque to the CRDT. |
 | `buckets: Vec<BucketEpoch>`    | Which time bucket the observation falls into. |
 | `origin_node_ids: Vec<NodeId>` | The node that originally observed the event. **Ignored** by `ingest_local`, which always stamps `local_node_slot`. Used by `merge_remote` to record per-origin counters. |
@@ -1559,9 +1556,8 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 
 | Method | Role |
 |---|---|
-| `new(config, local_identity)` | Build a store; all allocation happens here. |
+| `new(config, local_identity, rules)` | Build a store and intern every configured rule; all allocation happens here. |
 | `capacity()`, `active_len()`, `is_empty()`, `stats()` | Observability. |
-| `intern_rule` | Dictionary plumbing. |
 | `find(key)` | Hash-index lookup by `CompactCellKey`. |
 | `resolve(handle)`, `get(handle)` | Handle-based reads. |
 | `active_handles()` | Diagnostic full-scan iterator. |

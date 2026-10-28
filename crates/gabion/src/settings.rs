@@ -153,8 +153,9 @@ settings! {
         "gabion could not track any rate-limit key";
     StorageRuleDictionaryCapacity => "storage.rule_dictionary_capacity",
         "GABION_STORAGE_RULE_DICTIONARY_CAPACITY", "gabion_storage_rule_dictionary_capacity";
-        rule_dictionary_capacity: NonZeroU16 = nz!(defaults::STORAGE_RULE_DICTIONARY_CAPACITY),
-        "gabion could not register any rate-limit rule";
+        rule_dictionary_capacity: Option<NonZeroU16> = None,
+        "gabion could not register any rate-limit rule; the default is twice the configured \
+         rules, at least 256";
     StorageNodeDictionaryCapacity => "storage.node_dictionary_capacity",
         "GABION_STORAGE_NODE_DICTIONARY_CAPACITY", "gabion_storage_node_dictionary_capacity";
         node_dictionary_capacity: NonZeroU16 = nz!(defaults::STORAGE_NODE_DICTIONARY_CAPACITY),
@@ -174,7 +175,7 @@ settings! {
         "this node could not track any peer";
     StorageMaxDescriptorCount => "storage.max_descriptor_count",
         "GABION_STORAGE_MAX_DESCRIPTOR_COUNT", "gabion_storage_max_descriptor_count";
-        max_descriptor_count: NonZeroU16 = nz!(defaults::STORAGE_MAX_DESCRIPTOR_COUNT as u16),
+        max_descriptor_count: NonZeroU16 = nz!(defaults::STORAGE_MAX_DESCRIPTOR_COUNT),
         "every rule and every descriptor would have too many entries";
     StorageMaxDescriptorBytes => "storage.max_descriptor_bytes",
         "GABION_STORAGE_MAX_DESCRIPTOR_BYTES", "gabion_storage_max_descriptor_bytes";
@@ -184,6 +185,14 @@ settings! {
         "gabion_storage_max_key_bytes";
         max_key_bytes: NonZeroUsize = nz!(defaults::STORAGE_MAX_KEY_BYTES),
         "no descriptor key would fit";
+    StorageMaxRequestDescriptors => "storage.max_request_descriptors",
+        "GABION_STORAGE_MAX_REQUEST_DESCRIPTORS";
+        max_request_descriptors: NonZeroU16 = nz!(defaults::STORAGE_MAX_REQUEST_DESCRIPTORS),
+        "every Envoy request with a rate-limit descriptor would be rejected";
+    StorageMaxMatchedRules => "storage.max_matched_rules", "GABION_STORAGE_MAX_MATCHED_RULES",
+        "gabion_storage_max_matched_rules";
+        max_matched_rules: NonZeroU16 = nz!(defaults::STORAGE_MAX_MATCHED_RULES),
+        "no request could be counted against any rule";
     RuntimeNodeIdSeed => "runtime.node_id_seed", "GABION_RUNTIME_NODE_ID_SEED",
         "gabion_node_id_seed";
         node_id_seed: Option<Box<str>> = None;
@@ -333,10 +342,12 @@ impl Settings {
             ),
             (
                 Setting::StorageRuleDictionaryCapacity,
-                u64::from(self.rule_dictionary_capacity.get()),
+                self.rule_dictionary_capacity.map_or(1, |c| c.get().into()),
                 1,
                 65_534,
-                dictionary,
+                "Its slots are numbered by a `u16` whose largest value marks an empty slot, so it \
+                 holds at most 65,534 rules. Remove it to use the default, twice the configured \
+                 rules and at least 256.",
             ),
             (
                 Setting::StorageNodeDictionaryCapacity,
@@ -344,15 +355,6 @@ impl Settings {
                 1,
                 65_534,
                 dictionary,
-            ),
-            (
-                Setting::StorageMaxDescriptorCount,
-                u64::from(self.max_descriptor_count.get()),
-                1,
-                defaults::STORAGE_MAX_DESCRIPTOR_COUNT as u64,
-                "Descriptors with more entries than this are rejected with \
-                 `cardinality_rejected`. The maximum is a build-time cap in this release, so \
-                 lower the value or remove it to use the default.",
             ),
         ];
         for (setting, configured, min, max, reason) in capacities {
@@ -388,6 +390,7 @@ impl Settings {
         let storage = ValidStorageConfig {
             cell_capacity: self.max_cells,
             rule_dictionary_capacity: self.rule_dictionary_capacity,
+            max_matched_rules: self.max_matched_rules,
             node_dictionary_capacity: self.node_dictionary_capacity,
             local_dirty_capacity: self.local_dirty_capacity,
             forwarded_dirty_capacity: self.forwarded_dirty_capacity,
@@ -396,6 +399,7 @@ impl Settings {
                 max_descriptor_count: usize::from(self.max_descriptor_count.get()),
                 max_descriptor_bytes: self.max_descriptor_bytes.get(),
                 max_key_bytes: self.max_key_bytes.get(),
+                max_request_descriptors: usize::from(self.max_request_descriptors.get()),
             },
         };
         Ok((gossip, storage))
@@ -480,6 +484,21 @@ macro_rules! optional_field {
 optional_field! {
     SocketAddr => "a socket address", "0.0.0.0:9000";
     u64 => "a whole number from 0 to 18446744073709551615", "42";
+}
+
+/// An override with a derived default: unset until set, and 0 is not
+/// positive, as for the plain count.
+impl Field for Option<NonZeroU16> {
+    fn set(&mut self, text: &str) -> Result<(), Problem> {
+        let mut value = NonZeroU16::MIN;
+        value.set(text)?;
+        *self = Some(value);
+        Ok(())
+    }
+
+    fn show(&self) -> Option<String> {
+        self.map(|value| value.to_string())
+    }
 }
 
 impl Field for Option<Box<str>> {
@@ -613,7 +632,6 @@ pub enum SettingError {
 
 impl fmt::Display for SettingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let default = |setting: Setting| setting.default_text().unwrap_or_default();
         match *self {
             Self::NotPositive { setting } => {
                 write!(
@@ -624,12 +642,13 @@ impl fmt::Display for SettingError {
                 if let Some(reason) = setting.zero_reason() {
                     write!(f, ": {reason}")?;
                 }
-                write!(
-                    f,
-                    ". Remove the setting to use the default, {}, or set a positive value ({}).",
-                    default(setting),
-                    Alternatives(setting)
-                )
+                f.write_str(". Remove the setting to use the default")?;
+                // A derived default has no fixed text; its zero reason gives
+                // it.
+                if let Some(default) = setting.default_text() {
+                    write!(f, ", {default}")?;
+                }
+                write!(f, ", or set a positive value ({}).", Alternatives(setting))
             }
             Self::Malformed {
                 setting,
@@ -678,7 +697,9 @@ impl fmt::Display for SettingError {
                  the heartbeat and limits would be enforced late. Set it below {tick}, or remove \
                  it to use the default of {}.",
                 Setting::GossipMinEmitInterval,
-                default(Setting::GossipMinEmitInterval)
+                Setting::GossipMinEmitInterval
+                    .default_text()
+                    .unwrap_or_default()
             ),
             Self::CapacityOutOfRange {
                 setting,
@@ -686,14 +707,21 @@ impl fmt::Display for SettingError {
                 min,
                 max,
                 reason,
-            } => write!(
-                f,
-                "`{}` is {configured}; gabion supports {min} to {max}. The default is {}. Set it \
-                 inside that range ({}). {reason}",
-                setting.yaml_key(),
-                default(setting),
-                Alternatives(setting)
-            ),
+            } => {
+                write!(
+                    f,
+                    "`{}` is {configured}; gabion supports {min} to {max}.",
+                    setting.yaml_key()
+                )?;
+                if let Some(default) = setting.default_text() {
+                    write!(f, " The default is {default}.")?;
+                }
+                write!(
+                    f,
+                    " Set it inside that range ({}). {reason}",
+                    Alternatives(setting)
+                )
+            }
         }
     }
 }

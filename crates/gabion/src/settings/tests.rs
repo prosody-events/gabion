@@ -29,12 +29,13 @@ fn zero_is_not_positive() {
             let error = applied(setting, zero).expect_err(setting.yaml_key());
             assert_eq!(error, SettingError::NotPositive { setting });
             let text = error.to_string();
+            let default = setting.default_text().unwrap_or_default();
             for part in [
                 setting.yaml_key(),
                 setting.env_var(),
-                setting.nginx_directive().unwrap(),
+                setting.nginx_directive().unwrap_or_default(),
                 reason,
-                &setting.default_text().unwrap(),
+                &default,
             ] {
                 assert!(text.contains(part), "{text:?} lacks {part:?}");
             }
@@ -248,7 +249,6 @@ fn capacity_outside_its_range_fails() {
         ),
         (Setting::StorageRuleDictionaryCapacity, 1, 65_534),
         (Setting::StorageNodeDictionaryCapacity, 1, 65_534),
-        (Setting::StorageMaxDescriptorCount, 1, 16),
     ] {
         assert_eq!(capacity(setting, min), Ok(()), "{setting:?} {min}");
         assert_eq!(capacity(setting, max), Ok(()), "{setting:?} {max}");
@@ -272,6 +272,36 @@ fn capacity_outside_its_range_fails() {
          `gabion_gossip_limit_queue_capacity`). It may be 64 to 1,048,576; each slot is 72 bytes \
          of the NGINX zone (72 MiB at the ceiling), so raise SIZE in `gabion_limit_zone` with it."
     );
+}
+
+/// The per-request bounds have no build-time cap: each takes any value its
+/// `u16` holds, including a descriptor count of 64, above `main`'s cap of 16.
+#[test]
+fn admission_bounds_have_no_build_cap() {
+    for setting in [
+        Setting::StorageMaxDescriptorCount,
+        Setting::StorageMaxMatchedRules,
+        Setting::StorageMaxRequestDescriptors,
+    ] {
+        for value in [1, 64, 65_535] {
+            let (_, storage) = applied(setting, &value.to_string())
+                .and_then(|s| s.validate())
+                .unwrap_or_else(|error| panic!("{setting:?} {value}: {error}"));
+            let validated = match setting {
+                Setting::StorageMaxDescriptorCount => storage.cardinality.max_descriptor_count(),
+                Setting::StorageMaxMatchedRules => storage.max_matched_rules(),
+                _ => storage.cardinality.max_request_descriptors(),
+            };
+            assert_eq!(validated, value, "{setting:?}");
+        }
+        assert!(
+            matches!(
+                applied(setting, "65536"),
+                Err(SettingError::Malformed { .. })
+            ),
+            "{setting:?}"
+        );
+    }
 }
 
 /// Every message's "use the default, …" clause names text that parses back
@@ -334,9 +364,10 @@ fn defaults_validate_to_the_production_values() {
         storage.cell_capacity.get() as usize,
         defaults::STORAGE_MAX_CELLS
     );
+    assert_eq!(storage.rule_dictionary_capacity, None);
     assert_eq!(
-        storage.rule_dictionary_capacity.get(),
-        defaults::STORAGE_RULE_DICTIONARY_CAPACITY
+        storage.max_matched_rules(),
+        usize::from(defaults::STORAGE_MAX_MATCHED_RULES)
     );
     assert_eq!(
         storage.node_dictionary_capacity.get(),
@@ -354,9 +385,10 @@ fn defaults_validate_to_the_production_values() {
     assert_eq!(
         storage.cardinality,
         CardinalityLimits {
-            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT,
+            max_descriptor_count: defaults::STORAGE_MAX_DESCRIPTOR_COUNT.into(),
             max_descriptor_bytes: defaults::STORAGE_MAX_DESCRIPTOR_BYTES,
             max_key_bytes: defaults::STORAGE_MAX_KEY_BYTES,
+            max_request_descriptors: defaults::STORAGE_MAX_REQUEST_DESCRIPTORS.into(),
         }
     );
 }
@@ -378,7 +410,7 @@ fn spellings_follow_the_yaml_key() {
             format!("GABION_{}", snake.to_uppercase())
         );
         let directive = match setting {
-            Setting::EnvoyBind | Setting::AdminBind => None,
+            Setting::EnvoyBind | Setting::AdminBind | Setting::StorageMaxRequestDescriptors => None,
             Setting::GossipClusterIdHash => Some("gabion_gossip_cluster".to_owned()),
             Setting::RuntimeNodeIdSeed => Some("gabion_node_id_seed".to_owned()),
             _ => Some(format!("gabion_{snake}")),

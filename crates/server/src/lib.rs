@@ -2,8 +2,6 @@
 //!
 //! Architectural seams:
 //! - [`admission`] — admission-time types (Decision, RejectReason, ...).
-//! - [`store`] — `DashMapStore<C>`: the gossip aggregate target + the read
-//!   surface used to evaluate window totals.
 //! - [`config`] — YAML config (server-only; the library knows nothing about
 //!   YAML).
 //! - [`identity`] — `NodeIdentity` derivation at startup.
@@ -17,32 +15,25 @@
 //! the gossip runtime. Multi-descriptor requests are not all-or-nothing for
 //! admission.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrayvec::ArrayVec;
-use gabion::crdt::{Count, KeyHash};
-use gabion::defaults;
-use gabion::gossip::GossipClient;
-use gabion::rules::{
-    CardinalityLimit, CardinalityLimits, Descriptor, EnforcementMode, RuleSpec, RuleTable, hash_key,
-};
+use gabion::aggregate::Aggregate;
+use gabion::crdt::{BucketEpoch, Count, ValidStorageConfig};
+use gabion::gossip::{GossipClient, TryRecordError};
+use gabion::rules::{CardinalityLimit, Descriptor, EnforcementMode, RuleTable, hash_key};
 use gabion::settings::Setting;
 use gabion::throttle;
 use thiserror::Error;
 
-use crate::admission::{Decision, LimitRequest, Quota, RejectReason};
-use crate::store::DashMapStore;
-
-const MAX_DESCRIPTORS: usize = defaults::STORAGE_MAX_DESCRIPTOR_COUNT;
-const MAX_MATCHED_RULES: usize = defaults::STORAGE_MAX_MATCHED_RULES;
+use crate::admission::{Decision, Quota, RejectReason};
 
 pub mod admin;
 pub mod admission;
 pub mod config;
 pub mod identity;
-pub mod store;
 
 #[cfg(test)]
 mod tests;
@@ -71,8 +62,8 @@ pub enum ServeError {
 pub struct SharedLimiter<C: Count = u32> {
     rule_table: Arc<RuleTable>,
     gossip_client: GossipClient<C>,
-    counts: Arc<DashMapStore<C>>,
-    cardinality_limits: CardinalityLimits,
+    counts: Arc<Aggregate>,
+    storage: ValidStorageConfig,
     warnings: Arc<WarningCounts>,
 }
 
@@ -83,20 +74,37 @@ struct WarningCounts {
     cardinality_rejects: AtomicU64,
     gossip_record_failures: AtomicU64,
     matched_rule_overflows: AtomicU64,
+    request_queue_full: AtomicU64,
+}
+
+/// One allowed rule's hit, held between deciding a descriptor and handing
+/// its hits to the gossip runtime.
+#[derive(Clone, Copy)]
+struct Planned {
+    fingerprint: u128,
+    bucket: BucketEpoch,
+    limit: u64,
+}
+
+thread_local! {
+    /// This thread's admission scratch: reserved to its bound on the
+    /// thread's first admission and never grown after. Admission takes it
+    /// for one synchronous section and puts it back.
+    static PLANNED: Cell<Vec<Planned>> = const { Cell::new(Vec::new()) };
 }
 
 impl<C: Count> SharedLimiter<C> {
     pub fn new(
         rule_table: Arc<RuleTable>,
         gossip_client: GossipClient<C>,
-        counts: Arc<DashMapStore<C>>,
-        cardinality_limits: CardinalityLimits,
+        counts: Arc<Aggregate>,
+        storage: ValidStorageConfig,
     ) -> Self {
         Self {
             rule_table,
             gossip_client,
             counts,
-            cardinality_limits,
+            storage,
             warnings: Arc::default(),
         }
     }
@@ -104,49 +112,32 @@ impl<C: Count> SharedLimiter<C> {
     /// Evaluate one Envoy rate-limit request at the given wall-clock time.
     /// Each descriptor is admitted independently — rejected descriptors do
     /// not gate the others.
-    pub async fn should_rate_limit_at(
+    pub fn should_rate_limit_at(
         &self,
-        request: RateLimitRequest,
+        request: &RateLimitRequest,
         now_millis: u64,
     ) -> RateLimitResponse {
         let hits = u64::from(request.hits_addend.max(1));
-        let mut statuses = Vec::with_capacity(request.descriptors.len());
-        let max_entries = request
+        let max_descriptors = self.storage.cardinality.max_request_descriptors();
+        let mut over_limit = false;
+        let statuses = request
             .descriptors
             .iter()
-            .map(|descriptor| descriptor.entries.len())
-            .max()
-            .unwrap_or(0)
-            .min(MAX_DESCRIPTORS);
-        let mut mapped = Vec::with_capacity(max_entries);
-        let mut over_limit = false;
-
-        for (idx, envoy_descriptor) in request.descriptors.iter().enumerate() {
-            let decision = if idx >= MAX_DESCRIPTORS {
-                self.note_cardinality_reject(
-                    &request.domain,
-                    CardinalityLimit::RequestDescriptors,
-                    MAX_DESCRIPTORS,
-                )
-            } else if map_envoy_descriptor(envoy_descriptor, &mut mapped) {
-                let core_request = LimitRequest {
-                    domain: request.domain.as_str(),
-                    descriptors: mapped.as_slice(),
-                    hits,
+            .enumerate()
+            .map(|(i, descriptor)| {
+                let decision = if i < max_descriptors {
+                    self.decide(&request.domain, descriptor, hits, now_millis)
+                } else {
+                    self.note_cardinality_reject(
+                        &request.domain,
+                        CardinalityLimit::RequestDescriptors,
+                        max_descriptors,
+                    )
                 };
-                self.evaluate(core_request, now_millis).await
-            } else {
-                self.note_cardinality_reject(
-                    &request.domain,
-                    CardinalityLimit::Count,
-                    self.cardinality_limits.max_descriptor_count(),
-                )
-            };
-
-            over_limit |= decision.is_reject();
-            statuses.push(descriptor_status_for(decision));
-        }
-
+                over_limit |= decision.is_reject();
+                descriptor_status_for(decision)
+            })
+            .collect();
         RateLimitResponse {
             overall_code: if over_limit {
                 rate_limit_response::Code::OverLimit
@@ -158,95 +149,101 @@ impl<C: Count> SharedLimiter<C> {
         }
     }
 
-    async fn evaluate(&self, request: LimitRequest<'_>, now_millis: u64) -> Decision {
-        if let Some((limit, max)) = self
-            .cardinality_limits
-            .exceeded(request.domain, request.descriptors)
-        {
-            return self.note_cardinality_reject(request.domain, limit, max);
+    /// Admit one Envoy descriptor in one synchronous section: read its
+    /// entries in place, walk the matching rules once, and on an allow hand
+    /// each matched rule's hit to the gossip runtime without waiting. Rules
+    /// in `DryRun` mode are evaluated and recorded but never reject.
+    pub fn decide(
+        &self,
+        domain: &str,
+        descriptor: &RateLimitDescriptor,
+        hits: u64,
+        now_millis: u64,
+    ) -> Decision {
+        let entries = descriptor.entries.iter().map(|entry| Descriptor {
+            key: &entry.key,
+            value: &entry.value,
+        });
+        if let Some((limit, max)) = self.storage.cardinality.exceeded(domain, entries.clone()) {
+            return self.note_cardinality_reject(domain, limit, max);
         }
+        let mut planned = PLANNED.take();
+        let decision = self.admit(domain, entries, hits, now_millis, &mut planned);
+        PLANNED.set(planned);
+        decision
+    }
 
-        // Pass 1: decide allow/reject and buffer (spec, key_hash, bucket)
-        // for replay on the gossip-record path. One walk over `matching`,
-        // one `hash_key` per matched rule, O(1) `Rule::spec()`. Early-exit
-        // on the first enforcing reject — no events have been queued yet.
-        // Rules in `DryRun` mode are evaluated and recorded but never
-        // produce a reject verdict.
-        let mut planned: ArrayVec<(RuleSpec, KeyHash, u32), MAX_MATCHED_RULES> = ArrayVec::new();
+    /// Walk the rules matching `entries` once, deciding on each; on an
+    /// allow, hand each matched rule's hit to the gossip runtime without
+    /// waiting. `planned` holds the hits in between.
+    fn admit<'a>(
+        &self,
+        domain: &str,
+        entries: impl ExactSizeIterator<Item = Descriptor<'a>> + Clone,
+        hits: u64,
+        now_millis: u64,
+        planned: &mut Vec<Planned>,
+    ) -> Decision {
+        let max_matched = self.storage.max_matched_rules();
+        let bound = max_matched.min(self.rule_table.rules().len());
+        if planned.capacity() < bound {
+            *planned = Vec::with_capacity(bound);
+        }
+        planned.clear();
+        let table = self.counts.table();
+        // Hashed once, on the first matching rule: every rule matched here
+        // shares the descriptor's domain and entries.
+        let mut key_hash = None;
         let mut tightest: Option<Quota> = None;
-        for rule in self
-            .rule_table
-            .matching(request.domain, request.descriptors)
-        {
+        for rule in self.rule_table.matching(domain, entries.clone()) {
+            let key_hash = *key_hash.get_or_insert_with(|| hash_key(domain, entries.clone()));
             let spec = rule.spec();
-            let key_hash = hash_key(rule.id, request.domain, request.descriptors);
-            let total = self.counts.window_total(
-                spec.fingerprint,
-                key_hash,
-                now_millis,
-                spec.bucket_millis,
-                spec.live_buckets,
-            );
-            if total.saturating_add(request.hits) > spec.limit
-                && rule.mode == EnforcementMode::Enforce
-            {
-                let duration_until_reset_millis = self.counts.time_until_admit_millis(
-                    spec,
-                    key_hash,
-                    now_millis,
-                    total,
-                    request.hits,
-                );
+            let total = table.window_total(spec, key_hash, now_millis);
+            if total.saturating_add(hits) > spec.limit && rule.mode == EnforcementMode::Enforce {
                 return Decision::Reject(RejectReason::GlobalLimit(Quota {
                     remaining: 0,
-                    duration_until_reset_millis,
+                    duration_until_reset_millis: table
+                        .time_until_admit_millis(spec, key_hash, now_millis, total, hits),
                 }));
             }
-            // Saturating: DryRun rule past its limit (which the gate
-            // above lets through) reports `remaining = 0` rather than
-            // underflowing.
-            let remaining = spec
-                .limit
-                .saturating_sub(total)
-                .saturating_sub(request.hits);
-            let duration_until_reset_millis =
-                gabion::window::time_until_next_bucket_boundary_millis(
+            // Saturating: DryRun rule past its limit (which the gate above
+            // lets through) reports `remaining = 0` rather than underflowing.
+            let candidate = Quota {
+                remaining: spec.limit.saturating_sub(total).saturating_sub(hits),
+                duration_until_reset_millis: gabion::window::time_until_next_bucket_boundary_millis(
                     now_millis,
                     spec.bucket_millis,
-                );
-            let candidate = Quota {
-                remaining,
-                duration_until_reset_millis,
+                ),
             };
             tightest = Some(pick_min_remaining(tightest, candidate));
-            let bucket = (now_millis / spec.bucket_millis) as u32;
-            if planned.try_push((spec, key_hash, bucket)).is_err() {
-                // Per the allow-by-default principle (see CLAUDE.md), a
-                // matched-rules overflow is a gabion-internal limit, not a
-                // client cardinality violation: let the request through
-                // with the events we managed to buffer rather than
-                // rejecting because our cap is undersized.
-                self.note_matched_overflow(request.domain);
+            if planned.len() == max_matched {
+                // Allow by default (CLAUDE.md): the bound is gabion's own, so
+                // the request goes through and the rest of its rules
+                // under-count.
+                self.note_matched_overflow(domain);
                 break;
             }
+            planned.push(Planned {
+                fingerprint: spec.fingerprint,
+                bucket: (now_millis / spec.bucket_millis) as BucketEpoch,
+                limit: spec.limit,
+            });
         }
-
-        // Pass 2: gossip-record. Only allowed requests reach here, so a
-        // single drain of the buffer fans out the deltas.
-        for (spec, key_hash, bucket) in &planned {
-            if let Err(err) = self
-                .gossip_client
-                .record(
-                    spec.fingerprint,
-                    *key_hash,
-                    *bucket,
-                    request.hits,
-                    spec.limit,
+        if let Some(key_hash) = key_hash {
+            for hit in planned.iter() {
+                let recorded = self.gossip_client.try_record(
+                    hit.fingerprint,
+                    key_hash,
+                    hit.bucket,
+                    hits,
+                    hit.limit,
                     now_millis,
-                )
-                .await
-            {
-                self.note_gossip_record_failure(&err);
+                );
+                match recorded {
+                    Ok(()) => {}
+                    Err(TryRecordError::Full) => self.note_request_queue_full(),
+                    Err(error @ TryRecordError::ShutDown) => self.note_gossip_record_failure(error),
+                }
             }
         }
         Decision::Allow(tightest)
@@ -263,30 +260,11 @@ fn pick_min_remaining(current: Option<Quota>, candidate: Quota) -> Quota {
     }
 }
 
-/// Borrow an Envoy descriptor's entries into `mapped`. False when it has more
-/// than `MAX_DESCRIPTORS` entries.
-fn map_envoy_descriptor<'a>(
-    envoy_descriptor: &'a RateLimitDescriptor,
-    mapped: &mut Vec<Descriptor<'a>>,
-) -> bool {
-    mapped.clear();
-    for entry in &envoy_descriptor.entries {
-        if mapped.len() == MAX_DESCRIPTORS {
-            return false;
-        }
-        mapped.push(Descriptor {
-            key: entry.key.as_str(),
-            value: entry.value.as_str(),
-        });
-    }
-    true
-}
-
 // -- Rate-limited operator warnings -----------------------------------------
 //
 // These failure modes can all fire at full request rate when something is
-// wrong (mass-cardinality attack; gossip runtime dead; overlapping rules
-// matching past the per-request cap). Each counts through
+// wrong (mass-cardinality attack; gossip runtime dead or starved; overlapping
+// rules matching past the per-request bound). Each counts through
 // `gabion::throttle`, so the log volume is bounded at ~log2(N) regardless of
 // request rate.
 
@@ -306,7 +284,7 @@ impl<C: Count> SharedLimiter<C> {
                 limit = name,
                 max,
                 rejected_total,
-                config_key = setting.map(Setting::yaml_key),
+                config_key = setting.yaml_key(),
                 "Rejecting requests that attach too many or too large rate-limit descriptors. \
                  This is usually a misbehaving client or an attack trying to exhaust gabion's \
                  tracking memory. {limit}",
@@ -315,11 +293,11 @@ impl<C: Count> SharedLimiter<C> {
         Decision::Reject(RejectReason::Cardinality)
     }
 
-    fn note_gossip_record_failure(&self, err: &gabion::gossip::GossipError) {
+    fn note_gossip_record_failure(&self, error: TryRecordError) {
         if let Some(failed_total) = throttle::bump_shared(&self.warnings.gossip_record_failures) {
             tracing::warn!(
                 code = "gossip_record_failure",
-                error = %err,
+                %error,
                 failed_total,
                 "This node can no longer share rate-limit counts with the \
                  rest of the cluster. Its limits have stopped counting: no \
@@ -331,19 +309,39 @@ impl<C: Count> SharedLimiter<C> {
         }
     }
 
+    fn note_request_queue_full(&self) {
+        if let Some(dropped_total) = throttle::bump_shared(&self.warnings.request_queue_full) {
+            tracing::warn!(
+                code = "request_queue_full",
+                capacity = self.gossip_client.capacity(),
+                dropped_total,
+                config_key = Setting::GossipLimitQueueCapacity.yaml_key(),
+                "The gossip request queue was full, so counted hits were dropped: those requests \
+                 were allowed and the cluster's counts are missing them, so limits briefly \
+                 under-count. Usually a burst larger than the queue, or the gossip task starved \
+                 of CPU. Raise {} or give the pod more CPU.",
+                Setting::GossipLimitQueueCapacity,
+            );
+        }
+    }
+
     fn note_matched_overflow(&self, domain: &str) {
         if let Some(overflowed_total) = throttle::bump_shared(&self.warnings.matched_rule_overflows)
         {
+            let cap = self.storage.max_matched_rules();
             tracing::warn!(
                 code = "matched_rule_overflow",
                 domain,
-                cap = MAX_MATCHED_RULES,
+                cap,
                 overflowed_total,
-                "A request matched more than {MAX_MATCHED_RULES} rate-limit rules, the most this \
-                 node counts per request. It was allowed, and only the first {MAX_MATCHED_RULES} \
-                 matched rules counted it, so the rest under-count. Usually overlapping rule \
-                 patterns. Merge or narrow the overlapping rules under `limits:`; the cap is a \
-                 build-time constant (`STORAGE_MAX_MATCHED_RULES`) and cannot be set in config.",
+                config_key = Setting::StorageMaxMatchedRules.yaml_key(),
+                "A request matched more than {cap} rate-limit rules, the most this node counts \
+                 per request. It was allowed, and only the first {cap} matched rules counted it, \
+                 so the rest under-count. Usually overlapping rule patterns. Merge or narrow the \
+                 overlapping rules under `limits:`, or raise {}; each extra rule costs {} bytes \
+                 per runtime thread, reserved once on the thread's first request.",
+                Setting::StorageMaxMatchedRules,
+                size_of::<Planned>(),
             );
         }
     }
@@ -415,8 +413,7 @@ where
     ) -> Result<tonic::Response<RateLimitResponse>, tonic::Status> {
         let response = self
             .limiter
-            .should_rate_limit_at(request.into_inner(), now_millis())
-            .await;
+            .should_rate_limit_at(request.get_ref(), now_millis());
         Ok(tonic::Response::new(response))
     }
 }

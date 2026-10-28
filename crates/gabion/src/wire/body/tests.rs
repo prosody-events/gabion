@@ -1,11 +1,12 @@
 use super::*;
 use crate::crdt::{NodeId, NodeIdentity};
-use crate::settings::mock::storage;
+use crate::settings::mock::{rules, storage};
 
 fn store() -> CellStore<u32> {
     CellStore::<u32>::new(
-        storage(256, 32, 48, 64, 16),
+        storage(256, 48, 64, 16),
         NodeIdentity::new(NodeId(0xABCD), 1),
+        &rules(32),
     )
 }
 

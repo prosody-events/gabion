@@ -13,9 +13,8 @@
 //! `need = total + hits - limit`.
 //!
 //! All math is allocation-free and saturating; the helpers are pure
-//! functions over caller-supplied closures so both the nginx seqlocked SHM
-//! table and the server's DashMap reader can feed them without forcing
-//! materialisation of every bucket's count.
+//! functions over caller-supplied closures so the shared aggregate table can
+//! feed them without materialising every bucket's count.
 
 use crate::crdt::BucketEpoch;
 
@@ -41,31 +40,30 @@ where
     F: FnMut(BucketEpoch) -> u64,
 {
     let bm = bucket_millis.max(1);
-    let live = live_buckets.max(1);
+    let live = u64::from(live_buckets.max(1));
     let need = total.saturating_add(hits).saturating_sub(limit);
     if need == 0 {
         return 0;
     }
-    let current = (now_millis / bm) as u32;
-    let oldest = current.saturating_sub(live - 1);
+    // Walk unwrapped `u64` epochs; a stored epoch is the same number cut to
+    // `u32`, so the walk and the fall-off times hold across the `u32` wrap.
+    let current = now_millis / bm;
+    let fall_off = |bucket: u64| {
+        (bucket + live)
+            .saturating_mul(bm)
+            .saturating_sub(now_millis)
+    };
     let mut aged_off: u64 = 0;
-    let mut bucket = oldest;
-    loop {
-        aged_off = aged_off.saturating_add(count_for(bucket));
+    for bucket in current.saturating_sub(live - 1)..=current {
+        aged_off = aged_off.saturating_add(count_for(bucket as BucketEpoch));
         if aged_off >= need {
-            let fall_off = (bucket as u64 + live as u64).saturating_mul(bm);
-            return fall_off.saturating_sub(now_millis);
+            return fall_off(bucket);
         }
-        if bucket == current {
-            break;
-        }
-        bucket = bucket.saturating_add(1);
     }
     // Newest bucket falls off at (current + live) * bm — full-window
     // fallback covers degenerate cases (limit == 0, sum disagrees with
     // breakdown, etc.).
-    let fall_off = (current as u64 + live as u64).saturating_mul(bm);
-    fall_off.saturating_sub(now_millis)
+    fall_off(current)
 }
 
 /// `Retry-After` per RFC 7231 §7.1.3. Rounds up so a client retrying at

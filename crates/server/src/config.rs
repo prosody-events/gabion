@@ -29,10 +29,7 @@ use thiserror::Error;
 
 use gabion::crdt::ValidStorageConfig;
 use gabion::gossip::ValidGossipConfig;
-use gabion::rules::{
-    DescriptorPattern, EnforcementMode, RateResolveError, Rule, RuleId, RuleTable,
-    is_descriptor_key, parse_rate, resolve_rate,
-};
+use gabion::rules::{EnforcementMode, RuleDef, RuleError, RuleTable};
 use gabion::settings::{Setting, SettingError, Settings};
 
 /// The loaded configuration: every setting, validated once, and the rules.
@@ -116,22 +113,31 @@ impl AppConfig {
         })
     }
 
-    /// Construct the runtime [`RuleTable`]. Rule ids are assigned in
-    /// declaration order starting at 1.
-    pub fn rule_table(&self) -> Result<RuleTable, ConfigError> {
-        let mut rules = Vec::with_capacity(self.limits.len());
-        for (i, limit) in self.limits.iter().enumerate() {
-            if self.limits[..i]
-                .iter()
-                .any(|earlier| earlier.name == limit.name)
-            {
-                return Err(ConfigError::DuplicateRule {
-                    name: limit.name.to_string(),
-                });
-            }
-            rules.push(limit.to_rule(i as RuleId + 1)?);
-        }
-        Ok(RuleTable::new(rules))
+    /// Build every `limits:` entry through the library's one rule
+    /// constructor, in declaration order.
+    pub fn rule_table(&self) -> Result<RuleTable, RuleError> {
+        let rules = self
+            .limits
+            .iter()
+            .map(|limit| {
+                let patterns: Box<[(&str, &str)]> = limit
+                    .descriptors
+                    .iter()
+                    .map(|d| (&*d.key, &*d.value))
+                    .collect();
+                RuleDef {
+                    name: &limit.name,
+                    domain: &limit.domain,
+                    patterns: &patterns,
+                    rate: &limit.rate,
+                    window: limit.window,
+                    bucket: limit.bucket,
+                    mode: limit.mode.into(),
+                }
+                .build(&self.storage.cardinality)
+            })
+            .collect::<Result<_, _>>()?;
+        RuleTable::new(rules, self.storage.rule_dictionary_capacity())
     }
 }
 
@@ -247,51 +253,6 @@ pub struct LimitRuleConfig {
     pub mode: EnforcementModeConfig,
 }
 
-impl LimitRuleConfig {
-    pub fn to_rule(&self, id: RuleId) -> Result<Rule, ConfigError> {
-        if self.descriptors.is_empty() {
-            return Err(ConfigError::EmptyDescriptorSet(self.name.to_string()));
-        }
-        for descriptor in self.descriptors.iter() {
-            if !is_descriptor_key(&descriptor.key) {
-                return Err(ConfigError::InvalidDescriptorKey {
-                    rule: self.name.to_string(),
-                    key: descriptor.key.to_string(),
-                });
-            }
-        }
-        let (rate_count, period) =
-            parse_rate(&self.rate).map_err(|reason| ConfigError::InvalidRate {
-                name: self.name.to_string(),
-                reason,
-            })?;
-        let resolved =
-            resolve_rate(rate_count, period, self.window, self.bucket).map_err(|err| {
-                ConfigError::ResolveRate {
-                    name: self.name.to_string(),
-                    source: err,
-                }
-            })?;
-        let descriptors = self
-            .descriptors
-            .iter()
-            .map(|d| DescriptorPattern {
-                key: d.key.clone(),
-                value: d.value.clone(),
-            })
-            .collect();
-        Ok(Rule::new(
-            id,
-            self.domain.to_string(),
-            descriptors,
-            resolved.limit.get(),
-            resolved.window_millis,
-            resolved.bucket_millis,
-            self.mode.into(),
-        ))
-    }
-}
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct DescriptorConfig {
     pub key: Box<str>,
@@ -349,23 +310,6 @@ pub enum ConfigError {
          layers\" in the gabiond README."
     )]
     Config(#[source] config::ConfigError),
-    #[error(
-        "rule `{0}` has no `descriptors:`, so it could only match an Envoy descriptor with no \
-         entries. Add at least one `- key: …` entry, or remove the rule."
-    )]
-    EmptyDescriptorSet(String),
-    #[error("rule `{name}` is declared more than once; rule names must be unique")]
-    DuplicateRule { name: String },
-    #[error("rule `{name}` has an invalid `rate:` value: {reason}.")]
-    InvalidRate { name: String, reason: &'static str },
-    #[error("rule `{name}`: {source}")]
-    ResolveRate {
-        name: String,
-        #[source]
-        source: RateResolveError,
-    },
-    #[error("rule `{rule}` descriptor key `{key}` must match `[A-Za-z_][A-Za-z0-9_.-]*`")]
-    InvalidDescriptorKey { rule: String, key: String },
     #[error(
         "gabiond cannot start: it has no gossip address to listen on, and other gabion nodes need \
          one to reach it. Set `gossip.bind` in the YAML file (for example `0.0.0.0:9000`) or \
