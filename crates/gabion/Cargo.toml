@@ -10,7 +10,6 @@ license.workspace = true
 # the wasm build entirely.
 ahash = { workspace = true, optional = true }
 async-stream.workspace = true
-educe.workspace = true
 either.workspace = true
 futures.workspace = true
 getrandom.workspace = true

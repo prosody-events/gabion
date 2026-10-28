@@ -49,6 +49,11 @@ fn key_too_long_at_compile() {
 /// The configured `gabion_storage_max_key_bytes` is the only key-length
 /// bound: a key over the default parses and compiles once the zone raises it.
 #[test]
+#[cfg_attr(
+    all(miri, target_arch = "aarch64"),
+    ignore = "hashing a key this long takes twox-hash's NEON path, whose inline assembly Miri \
+              cannot run; the x86_64 Miri job covers it"
+)]
 fn raised_max_key_bytes_admits_long_key() {
     let long_key = "k".repeat(200);
     let bindings = vec![

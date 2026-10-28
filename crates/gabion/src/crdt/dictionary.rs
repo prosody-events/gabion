@@ -96,7 +96,7 @@ pub struct RuleDictionary {
 }
 
 impl RuleDictionary {
-    pub fn with_capacity(capacity: NonZeroU16) -> Self {
+    pub(crate) fn with_capacity(capacity: NonZeroU16) -> Self {
         let index_cap = pow2_index_capacity_for(capacity.into());
         let capacity = capacity.get();
         debug_assert!(
@@ -222,7 +222,7 @@ pub struct NodeDictionary {
 }
 
 impl NodeDictionary {
-    pub fn with_capacity(capacity: NonZeroU16) -> Self {
+    pub(crate) fn with_capacity(capacity: NonZeroU16) -> Self {
         let index_cap = pow2_index_capacity_for(capacity.into());
         let capacity = capacity.get();
         debug_assert!(

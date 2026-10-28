@@ -242,6 +242,10 @@ settings! {
 /// The largest UDP payload over IPv4: 65,535 − 20 (IP header) − 8 (UDP header).
 const MAX_PAYLOAD_BYTES: usize = 65_507;
 
+/// The smallest `gossip.limit_queue_capacity`, and the depth of the runtime's
+/// request queue under [`ValidGossipConfig::with_shallow_limit_queue`].
+pub const MIN_LIMIT_QUEUE_CAPACITY: NonZeroUsize = nz!(64);
+
 /// The largest error budget: 10,000 basis points are the whole limit.
 const MAX_ERROR_BUDGET_BPS: u32 = 10_000;
 
@@ -293,7 +297,7 @@ impl Settings {
             (
                 Setting::GossipLimitQueueCapacity,
                 self.limit_queue_capacity.get() as u64,
-                64,
+                MIN_LIMIT_QUEUE_CAPACITY.get() as u64,
                 1 << 20,
                 "It may be 64 to 1,048,576; each slot is 72 bytes of the NGINX zone (72 MiB at \
                  the ceiling), so raise SIZE in `gabion_limit_zone` with it.",

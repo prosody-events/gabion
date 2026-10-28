@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU128, NonZeroUsize};
 use std::time::Duration;
 
-use crate::settings::Millis;
+use crate::settings::{MIN_LIMIT_QUEUE_CAPACITY, Millis};
 use crate::wire::{self, FrameLimits, HmacKey};
 
 mod admin;
@@ -68,10 +68,8 @@ pub struct ValidGossipConfig {
     /// Outbound send queue capacity. Each slot owns a pre-allocated
     /// [`wire::PacketBuf`].
     pub(crate) send_queue_capacity: NonZeroU8,
-    /// Capacity of the incoming limit-request channel. NGINX's leader sets
-    /// its drain batch here, because there the setting sizes the
-    /// shared-memory queue instead.
-    pub limit_queue_capacity: NonZeroUsize,
+    /// Capacity of the incoming limit-request channel.
+    pub(crate) limit_queue_capacity: NonZeroUsize,
     /// Period between proactive gossip ticks.
     pub(crate) tick_interval: Duration,
     /// Optional HMAC key — when set, every outbound packet is authenticated
@@ -86,6 +84,20 @@ pub struct ValidGossipConfig {
     /// Minimum gap between two threshold-fire emissions. See
     /// [`crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
     pub(crate) min_emit_interval: Millis,
+}
+
+impl ValidGossipConfig {
+    /// Shrink the runtime's request channel to [`MIN_LIMIT_QUEUE_CAPACITY`],
+    /// for an adapter whose `gossip.limit_queue_capacity` sizes a queue of its
+    /// own that it drains into the runtime (NGINX's shared-memory queue). A
+    /// backlog then waits in that queue, and the shallow channel recycles
+    /// tokio's storage instead of allocating.
+    pub fn with_shallow_limit_queue(self) -> Self {
+        Self {
+            limit_queue_capacity: MIN_LIMIT_QUEUE_CAPACITY,
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

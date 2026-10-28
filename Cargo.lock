@@ -676,18 +676,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "educe"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ebdb1f8f8d2815bbe7b369a7da10343c82026a4503b68bd1279ba557611e96d"
-dependencies = [
- "enum-ordinalize",
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
-
-[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -932,7 +920,6 @@ dependencies = [
  "ahash",
  "async-stream",
  "criterion",
- "educe 0.8.1",
  "either",
  "futures",
  "getrandom 0.4.3",
@@ -1617,7 +1604,7 @@ dependencies = [
  "async-broadcast",
  "async-stream",
  "backon",
- "educe 0.6.0",
+ "educe",
  "futures",
  "hashbrown 0.16.1",
  "hostname",

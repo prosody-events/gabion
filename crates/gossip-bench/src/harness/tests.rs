@@ -168,7 +168,7 @@ fn discovery_ends_listing_exactly_the_surviving_pods() {
 /// larger than production's they keep production's ratio of ring to cells.
 #[test]
 fn launcher_scales_the_dirty_rings_with_the_cell_store() {
-    use gabion::defaults as d;
+    use adapter::d;
     for (cells, scale) in [(16_384, 1), (4 * d::STORAGE_MAX_CELLS, 4)] {
         let sizing = node::Sizing {
             cell_capacity: cells as u32,

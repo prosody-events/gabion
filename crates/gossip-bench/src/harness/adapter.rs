@@ -18,7 +18,7 @@ use gabion::crdt::{
     CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity, RuleDescriptor,
     ValidStorageConfig,
 };
-use gabion::defaults as d;
+pub(super) use gabion::defaults as d;
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipError, GossipRuntime,
     GossipTransport, Ticker, ValidGossipConfig,

@@ -43,6 +43,15 @@ pub struct QueueSlot {
     pub now_millis: AtomicU64,
 }
 
+// The `gossip.limit_queue_capacity` range text and the NGINX README quote 72
+// bytes a slot to operators sizing `gabion_limit_zone`. Loom's model atomics
+// are larger, and never reach shared memory.
+#[cfg(not(feature = "loom"))]
+const _: () = assert!(
+    size_of::<QueueSlot>() == 72,
+    "update the 72 bytes a queue slot takes in the settings text and the README"
+);
+
 impl QueueSlot {
     pub fn empty(seq: u64) -> Self {
         Self {

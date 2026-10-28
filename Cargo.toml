@@ -24,7 +24,6 @@ clap = { version = "4", features = ["derive"] }
 config = { version = "0.15", default-features = false, features = ["yaml"] }
 criterion = "0.8"
 dashmap = "6"
-educe = "0.8"
 either = "1"
 envoy-types = "0.7"
 futures = "0.3"
@@ -52,7 +51,6 @@ quickcheck_macros = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-socket2 = "0.6"
 thiserror = "2"
 # Wasm-safe base: every feature here builds on wasm32-unknown-unknown so the
 # library crate compiles for the visualizer. Crates needing host-only drivers

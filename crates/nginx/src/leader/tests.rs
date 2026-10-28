@@ -21,7 +21,7 @@ const DEADLINE: Duration = Duration::from_secs(5);
 /// A region over a leaked allocation, so a leader thread that outlives a
 /// failed assertion never reads freed memory.
 fn leaked_region() -> ShmRegion {
-    let layout = Layout::new(64, 64).expect("layout");
+    let layout = Layout::new(128, 64).expect("layout");
     let words: &'static mut [u64] =
         Box::leak(vec![0_u64; layout.total_bytes.div_ceil(8)].into_boxed_slice());
     // SAFETY: `ShmRegion::initialize`'s preconditions hold: `words` is a
@@ -142,11 +142,10 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
         .expect("queue has room");
     let identity = NodeIdentity::new(gabion::crdt::NodeId(1), 1);
     let applied = Rc::new(AppliedHits::default());
-    let (mut gossip, cell_store) = crate::mock::validated(|_| {});
-    gossip.limit_queue_capacity = DRAIN_BATCH;
+    let (gossip, cell_store) = crate::mock::validated(|_| {});
     let (runtime, client) = GossipRuntime::bind(
         LONE_NODE_BIND,
-        gossip,
+        gossip.with_shallow_limit_queue(),
         CellStore::new(cell_store, identity),
         applied.clone(),
     )

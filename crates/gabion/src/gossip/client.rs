@@ -81,8 +81,9 @@ impl<C: Count> GossipClient<C> {
 
     /// Wait until the runtime's request queue has room for `n` hits, so a
     /// caller can leave its hits where they are until the runtime can take
-    /// them. `n` must not exceed
-    /// [`super::ValidGossipConfig::limit_queue_capacity`].
+    /// them. `n` must not exceed the queue's capacity,
+    /// `gossip.limit_queue_capacity`
+    /// or [`super::ValidGossipConfig::with_shallow_limit_queue`]'s depth.
     pub async fn reserve(
         &self,
         n: usize,

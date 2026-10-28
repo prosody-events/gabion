@@ -24,6 +24,7 @@ use tokio::task::LocalSet;
 use gabion::crdt::{CellStore, KeyHash, NodeIdentity, RuleDescriptor, ValidStorageConfig};
 use gabion::discovery::{self, DiscoveryConfig};
 use gabion::gossip::{GossipClient, GossipRuntime, TokioClock, UdpTransport, ValidGossipConfig};
+use gabion::settings::MIN_LIMIT_QUEUE_CAPACITY;
 
 use crate::identity::fresh_incarnation;
 use crate::rules::CompiledRules;
@@ -31,11 +32,11 @@ use crate::shm::ShmRegion;
 use crate::shm::aggregate::ShmAggregateStore;
 use crate::shm::lease::now_millis;
 
-/// Events the drain hands the runtime per pass, and the depth of the runtime's
-/// request queue. The drain waits for the runtime to take one batch before
-/// popping the next, so a backlog waits in SHM, and a queue this shallow
-/// recycles tokio's storage instead of allocating.
-const DRAIN_BATCH: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+/// Events the drain hands the runtime per pass: the whole depth of the
+/// runtime's request queue under `with_shallow_limit_queue`. The drain waits
+/// for the runtime to take one batch before popping the next, so a backlog
+/// waits in SHM.
+const DRAIN_BATCH: NonZeroUsize = MIN_LIMIT_QUEUE_CAPACITY;
 
 /// How often the drain polls an empty SHM queue.
 const DRAIN_TICK: Duration = Duration::from_millis(5);
@@ -238,10 +239,6 @@ async fn leader_main(
 
     let mut cell_store = CellStore::<u32>::new(config.cell_store, identity);
     register_rules(&mut cell_store, &rules);
-    // The setting sizes the SHM queue; the runtime's own queue only needs
-    // room for one drain batch.
-    let mut gossip_cfg = config.gossip;
-    gossip_cfg.limit_queue_capacity = DRAIN_BATCH;
 
     // A lone node still needs a socket for the runtime; an ephemeral
     // loopback port can't collide with another nginx on the same host, and
@@ -258,7 +255,9 @@ async fn leader_main(
     let (gossip_rt, gossip_client) = GossipRuntime::from_parts(
         transport,
         TokioClock::new(),
-        gossip_cfg,
+        // The setting sizes the SHM queue; the runtime's own queue only needs
+        // room for one drain batch.
+        config.gossip.with_shallow_limit_queue(),
         cell_store,
         Rc::new(ShmAggregateStore::new(shm)),
     );
