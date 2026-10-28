@@ -86,8 +86,8 @@ fn descriptor(tenant: &str) -> RateLimitDescriptor {
 }
 
 /// `rules` rules all matching every request, `storage.max_matched_rules` at
-/// `rules`, and 1,000 requests after warm-up, 95% on existing keys and 5% on
-/// new ones.
+/// `rules`, and 1,000 requests after a warm-up that matches no rule, 95% on
+/// existing keys and 5% on new ones.
 async fn admit_without_allocating(rules: u16) {
     let settings = Settings {
         max_cells: (1 << 16).try_into().unwrap(),
@@ -125,20 +125,40 @@ async fn admit_without_allocating(rules: u16) {
     let limiter = SharedLimiter::new(table.clone(), client.clone(), counts.clone(), storage);
     let settle = || async { drop(client.reserve(client.capacity()).await) };
 
+    // Warm-up requests name a domain no rule has, so the scratch must already
+    // hold its bound from the settings: one that grew to fit the requests
+    // it had seen would allocate on the first counted request. The queue's
+    // blocks are warmed by recording the same hits directly.
+    let unmatched = descriptor("warm-up");
+    let warm = hash_key(
+        "api",
+        [Descriptor {
+            key: "tenant",
+            value: "warm-up",
+        }],
+    );
+    for _ in 0..200 {
+        assert!(matches!(
+            limiter.decide("web", &unmatched, 1, 0),
+            Decision::Allow(None)
+        ));
+        for rule in table.rules() {
+            let spec = rule.spec();
+            client
+                .try_record(spec.fingerprint, warm, 0, 1, spec.limit, 0)
+                .expect("queue room");
+        }
+        settle().await;
+    }
     let hot: Vec<RateLimitDescriptor> = (0..50).map(|i| descriptor(&format!("hot-{i}"))).collect();
-    let requests: Vec<RateLimitDescriptor> = (0..1_200)
+    let requests: Vec<RateLimitDescriptor> = (0..1_000)
         .map(|i| match i % 20 {
             0 => descriptor(&format!("new-{i}")),
             _ => hot[i % hot.len()].clone(),
         })
         .collect();
-    let (warm_up, counted) = requests.split_at(200);
-    for request in warm_up {
-        limiter.decide("api", request, 1, 0);
-        settle().await;
-    }
     let mut total = 0;
-    for request in counted {
+    for request in &requests {
         let (decision, allocated) = allocations(|| limiter.decide("api", request, 1, 0));
         assert!(matches!(decision, Decision::Allow(Some(_))), "{decision:?}");
         total += allocated;

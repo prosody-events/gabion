@@ -96,8 +96,9 @@ fn region(queue: usize) -> ShmRegion {
 }
 
 /// `rules` rules on one location, each keyed on the tenant and all matching,
-/// with `storage.max_matched_rules` at `rules`; 1,000 requests after
-/// warm-up, 95% on keys the aggregate holds and 5% on new ones.
+/// with `storage.max_matched_rules` at `rules`; 1,000 requests after a
+/// warm-up that matches no rule, 95% on keys the aggregate holds and 5% on
+/// new ones.
 fn admit_without_allocating(rules: u16) {
     let settings = Settings {
         max_matched_rules: rules.try_into().unwrap(),
@@ -149,7 +150,7 @@ fn admit_without_allocating(rules: u16) {
     }
     ShmAggregateStore::new(region).apply(&deltas, &ExpirationSink::default());
 
-    let requests: Vec<String> = (0..1_200)
+    let requests: Vec<String> = (0..1_000)
         .map(|i| match i % 20 {
             0 => format!("new-{i}"),
             _ => hot[i % hot.len()].clone(),
@@ -158,13 +159,12 @@ fn admit_without_allocating(rules: u16) {
     let indices: Vec<usize> = (0..usize::from(rules)).collect();
     let mut events = Vec::new();
     let mut drained = vec![QueueEvent::default(); usize::from(rules)];
-    let (warm_up, counted) = requests.split_at(200);
-    for tenant in warm_up {
-        decide_all(ctx, &indices, &Tenant(tenant.as_bytes()), 0, &mut events);
-        region.queue().drain(&mut drained);
-    }
+    // The warm-up request matches no rule, so the scratch must already hold
+    // its bound from the settings: one that grew to fit the requests it had
+    // seen would allocate on the first counted request.
+    decide_all(ctx, &[], &Tenant(b""), 0, &mut events);
     let mut total = 0;
-    for tenant in counted {
+    for tenant in &requests {
         let vars = Tenant(tenant.as_bytes());
         let (outcome, allocated) = allocations(|| decide_all(ctx, &indices, &vars, 0, &mut events));
         assert!(

@@ -11,13 +11,34 @@ fn validated(tune: impl FnOnce(&mut Settings)) -> Result<(), SettingError> {
     settings.validate().map(drop)
 }
 
+/// Every setting that is not a count, capacity or duration, or whose zero
+/// [`Settings::validate`] rejects as out of range. Listed here, not read off
+/// the table, so a count that loses its zero reason fails the test.
+const ZERO_PARSES: &[Setting] = &[
+    Setting::EnvoyBind,
+    Setting::AdminBind,
+    Setting::RuntimeNodeIdSeed,
+    Setting::RuntimeRngSeed,
+    Setting::GossipBind,
+    Setting::GossipMaxPayloadBytes,
+    Setting::GossipClusterIdHash,
+    Setting::GossipTargetErrBps,
+    Setting::DiscoverySelfAddr,
+    Setting::DiscoveryNamespaceAllow,
+    Setting::DiscoveryServiceAllow,
+];
+
 #[test]
 fn zero_is_not_positive() {
     for &setting in Setting::ALL {
         let Some(reason) = setting.zero_reason() else {
             assert!(
-                !matches!(applied(setting, "0"), Err(SettingError::NotPositive { .. })),
+                ZERO_PARSES.contains(&setting),
                 "{setting:?} has no zero reason"
+            );
+            assert!(
+                !matches!(applied(setting, "0"), Err(SettingError::NotPositive { .. })),
+                "{setting:?} rejects 0 without a reason"
             );
             continue;
         };

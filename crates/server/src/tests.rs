@@ -381,7 +381,8 @@ fn matched_rule_bound_is_the_setting() {
     for part in [
         "allowed",
         "under-count",
-        "storage.max_matched_rules",
+        "config_key=\"storage.max_matched_rules\"",
+        "GABION_STORAGE_MAX_MATCHED_RULES",
         "cap=20 ",
     ] {
         assert!(line.contains(part), "{part}: {line}");
@@ -451,38 +452,44 @@ fn cardinality_reject_logs(
     })
 }
 
+/// Each cardinality limit's reject names its own setting and no other's.
 #[test]
 fn cardinality_warning_names_the_exceeded_key() {
     let cases = [
         (
+            Setting::StorageMaxRequestDescriptors,
+            "request_descriptors",
+            limits(16, 512, 64),
+            (0..=16)
+                .map(|i| descriptor([("tenant", format!("t-{i}"))]))
+                .collect(),
+            16,
+        ),
+        (
             Setting::StorageMaxDescriptorCount,
             "count",
             limits(1, 512, 64),
-            descriptor([("tenant", "a"), ("x", "b")]),
+            vec![descriptor([("tenant", "a"), ("x", "b")])],
             1,
         ),
         (
             Setting::StorageMaxDescriptorBytes,
             "bytes",
             limits(16, 8, 64),
-            descriptor([("tenant", "long-value")]),
+            vec![descriptor([("tenant", "long-value")])],
             8,
         ),
         (
             Setting::StorageMaxKeyBytes,
             "key_bytes",
             limits(16, 512, 2),
-            descriptor([("tenant", "a")]),
+            vec![descriptor([("tenant", "a")])],
             2,
         ),
     ];
-    let all = [
-        Setting::StorageMaxDescriptorCount,
-        Setting::StorageMaxDescriptorBytes,
-        Setting::StorageMaxKeyBytes,
-    ];
-    for (setting, limit, limits, descriptor, max) in cases {
-        let (response, logs) = cardinality_reject_logs(limits, vec![descriptor]);
+    let all = cases.each_ref().map(|case| case.0);
+    for (setting, limit, limits, descriptors, max) in cases {
+        let (response, logs) = cardinality_reject_logs(limits, descriptors);
         assert_eq!(
             response.overall_code,
             rate_limit_response::Code::OverLimit as i32
@@ -522,47 +529,6 @@ fn one_cardinality_check_for_both_adapters() {
         })
         .collect();
     assert_eq!(flagged, [false, false, true]);
-}
-
-#[test]
-fn every_cardinality_reject_logs() {
-    let defaults = limits(16, 512, 64);
-    let too_many_descriptors = (0..=16)
-        .map(|i| descriptor([("tenant", format!("t-{i}"))]))
-        .collect();
-    let too_many_entries = descriptor((0..=16).map(|i| (format!("k{i}"), "v")));
-    let too_long = limits(16, 8, 64);
-    let cases = [
-        (
-            "request descriptors",
-            defaults,
-            too_many_descriptors,
-            "storage.max_request_descriptors",
-        ),
-        (
-            "entries",
-            defaults,
-            vec![too_many_entries],
-            "storage.max_descriptor_count",
-        ),
-        (
-            "evaluate",
-            too_long,
-            vec![descriptor([("tenant", "long-value")])],
-            "storage.max_descriptor_bytes",
-        ),
-    ];
-    for (site, limits, descriptors, expected) in cases {
-        let (response, logs) = cardinality_reject_logs(limits, descriptors);
-        let status = response.statuses.last().expect("a status");
-        assert_eq!(
-            status.code,
-            rate_limit_response::Code::OverLimit as i32,
-            "{site}"
-        );
-        let line = line_with(&logs, "cardinality_rejected");
-        assert!(line.contains(expected), "{site}: {line}");
-    }
 }
 
 #[derive(Clone, Debug)]
