@@ -27,7 +27,7 @@ fn lead(store: &ShmAggregateStore, incarnation: u32) -> (CellStore<u32>, u128) {
     }
     .build(&storage.cardinality)
     .expect("rule");
-    let fingerprint = rule.fingerprint;
+    let fingerprint = rule.fingerprint();
     let rules = RuleTable::new(Box::new([rule]), None).expect("table");
     let mut cells = CellStore::new(storage, identity, &rules);
     let mut gossip = ObservationBatch::default();

@@ -133,7 +133,7 @@ fn admit_without_allocating(rules: u16) {
             let key = format!("k{i}");
             deltas.handles.push(CellHandle::default());
             deltas.keys.push(CellIdentity {
-                rule_fingerprint: rule.fingerprint,
+                rule_fingerprint: rule.fingerprint(),
                 key_hash: hash_key(
                     "nginx",
                     [Descriptor {

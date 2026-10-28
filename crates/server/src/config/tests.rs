@@ -353,8 +353,8 @@ fn rate_only_yaml_infers_window_and_bucket() {
     let spec = cfg.rules.rules().first().expect("one rule").spec();
     assert_eq!(spec.limit, 10);
     assert_eq!(spec.window_millis, 60_000);
-    assert_eq!(spec.bucket_millis, 60_000);
-    assert_eq!(spec.live_buckets, 1);
+    assert_eq!(spec.bucket_millis.get(), 60_000);
+    assert_eq!(spec.live_buckets.get(), 1);
 }
 
 #[test]
@@ -369,8 +369,8 @@ fn explicit_window_scales_limit_up() {
     assert_eq!(spec.limit, 10 * 5 * 3600);
     assert_eq!(spec.window_millis, 5 * 3600 * 1_000);
     // bucket defaults to the resolved window: one fixed-window bucket.
-    assert_eq!(spec.bucket_millis, 5 * 3600 * 1_000);
-    assert_eq!(spec.live_buckets, 1);
+    assert_eq!(spec.bucket_millis.get(), 5 * 3600 * 1_000);
+    assert_eq!(spec.live_buckets.get(), 1);
 }
 
 #[test]
@@ -383,8 +383,8 @@ fn explicit_window_and_bucket_set_live_buckets() {
     .expect("yaml parses");
     let spec = cfg.rules.rules().first().expect("one rule").spec();
     assert_eq!(spec.limit, 10 * 5 * 3600);
-    assert_eq!(spec.bucket_millis, 3600 * 1_000);
-    assert_eq!(spec.live_buckets, 5);
+    assert_eq!(spec.bucket_millis.get(), 3600 * 1_000);
+    assert_eq!(spec.live_buckets.get(), 5);
 }
 
 #[test]
@@ -396,8 +396,8 @@ fn bucket_defaults_to_window_when_omitted() {
     )
     .expect("yaml parses");
     let spec = cfg.rules.rules().first().expect("one rule").spec();
-    assert_eq!(spec.bucket_millis, 60_000);
-    assert_eq!(spec.live_buckets, 1);
+    assert_eq!(spec.bucket_millis.get(), 60_000);
+    assert_eq!(spec.live_buckets.get(), 1);
 }
 
 #[test]
@@ -409,8 +409,8 @@ fn explicit_bucket_overrides_window() {
     )
     .expect("yaml parses");
     let spec = cfg.rules.rules().first().expect("one rule").spec();
-    assert_eq!(spec.bucket_millis, 1_000);
-    assert_eq!(spec.live_buckets, 60);
+    assert_eq!(spec.bucket_millis.get(), 1_000);
+    assert_eq!(spec.live_buckets.get(), 60);
 }
 
 #[test]

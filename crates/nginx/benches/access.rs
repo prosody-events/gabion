@@ -74,7 +74,7 @@ impl Worker {
             for tenant in &hot {
                 deltas.handles.push(CellHandle::default());
                 deltas.keys.push(CellIdentity {
-                    rule_fingerprint: rule.fingerprint,
+                    rule_fingerprint: rule.fingerprint(),
                     key_hash: hash_key(
                         "nginx",
                         [Descriptor {

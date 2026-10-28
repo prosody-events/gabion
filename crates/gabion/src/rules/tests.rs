@@ -32,20 +32,20 @@ fn rule_identity_separates_windows_and_survives_reordering() {
     use EnforcementMode::{DryRun, Enforce};
     let base = build("a", "10r/s", 60, 1, Enforce);
     assert_ne!(
-        base.fingerprint,
-        build("a", "10r/s", 120, 1, Enforce).fingerprint
+        base.fingerprint(),
+        build("a", "10r/s", 120, 1, Enforce).fingerprint()
     );
     assert_ne!(
-        base.fingerprint,
-        build("a", "10r/s", 60, 2, Enforce).fingerprint
+        base.fingerprint(),
+        build("a", "10r/s", 60, 2, Enforce).fingerprint()
     );
     assert_eq!(
-        base.fingerprint,
-        build("a", "20r/s", 60, 1, Enforce).fingerprint
+        base.fingerprint(),
+        build("a", "20r/s", 60, 1, Enforce).fingerprint()
     );
     assert_eq!(
-        base.fingerprint,
-        build("a", "10r/s", 60, 1, DryRun).fingerprint
+        base.fingerprint(),
+        build("a", "10r/s", 60, 1, DryRun).fingerprint()
     );
     assert_eq!(
         RuleTable::new(
@@ -66,7 +66,7 @@ fn rule_identity_separates_windows_and_survives_reordering() {
             .iter()
             .find(|r| r.name == rule.name)
             .unwrap();
-        assert_eq!(twin.fingerprint, rule.fingerprint, "{}", rule.name);
+        assert_eq!(twin.fingerprint(), rule.fingerprint(), "{}", rule.name);
     }
 }
 
@@ -155,8 +155,8 @@ fn resolve_rate_window_defaults_to_period() {
         ResolvedRate {
             limit: NonZeroU64::new(10).unwrap(),
             window_millis: 1_000,
-            bucket_millis: 1_000,
-            live_buckets: 1,
+            bucket_millis: NonZeroU64::new(1_000).unwrap(),
+            live_buckets: NonZeroU32::MIN,
         }
     );
 }
@@ -171,7 +171,7 @@ fn resolve_rate_bucket_defaults_to_window() {
     )
     .unwrap();
     assert_eq!(r.window_millis, 60_000);
-    assert_eq!(r.bucket_millis, 60_000);
+    assert_eq!(r.bucket_millis.get(), 60_000);
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn resolve_rate_scales_to_window() {
     .unwrap();
     assert_eq!(r.limit.get(), 180_000);
     assert_eq!(r.window_millis, 5 * 3600 * 1_000);
-    assert_eq!(r.bucket_millis, 3600 * 1_000);
+    assert_eq!(r.bucket_millis.get(), 3600 * 1_000);
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn resolve_rate_window_equal_to_period_keeps_count() {
     )
     .unwrap();
     assert_eq!(r.limit.get(), 10);
-    assert_eq!(r.bucket_millis, 1_000);
+    assert_eq!(r.bucket_millis.get(), 1_000);
 }
 
 #[test]

@@ -45,7 +45,7 @@ Message starts: "The count table had no free slot for a rate-limit key"
 
 **Why.** The table needs a slot per rule × active key × live bucket (window / bucket + 1), and it is too small for the current traffic; lookups stay short only while it is under half full.
 
-**What to do next.** Raise `storage.max_cells` (`GABION_STORAGE_MAX_CELLS`) in `gabiond`, whose table holds that many slots rounded up to a power of two, or SIZE in `gabion_limit_zone zone=NAME:SIZE` in NGINX.
+**What to do next.** Raise `storage.max_cells` (`GABION_STORAGE_MAX_CELLS`) in `gabiond`, whose table holds twice that many slots rounded up to a power of two, or SIZE in `gabion_limit_zone zone=NAME:SIZE` in NGINX.
 
 **Fields** `config_key`, `capacity`, `dropped_total` · **Knob** `storage.max_cells` (`GABION_STORAGE_MAX_CELLS`) / SIZE in `gabion_limit_zone`
 

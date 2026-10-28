@@ -206,7 +206,11 @@ struct RemoteRow {
 fn new_store() -> (CellStore<u32>, Vec<u128>, Vec<RuleSlot>, NodeSlot) {
     let table = rules(NUM_RULES, "1000000r/m", Duration::from_secs(15), &config());
     let store = CellStore::<u32>::new(config(), local_identity(), &table);
-    let rule_fps: Vec<u128> = table.rules().iter().map(|rule| rule.fingerprint).collect();
+    let rule_fps: Vec<u128> = table
+        .rules()
+        .iter()
+        .map(|rule| rule.fingerprint())
+        .collect();
     let rule_slots = rule_fps
         .iter()
         .map(|&fp| store.rule_dictionary().find(fp).expect("rule interned"))
@@ -902,7 +906,10 @@ fn bench_admission_headers(c: &mut Criterion) {
                 .unwrap_or(0);
             let hits: u64 = 1;
             let remaining = RULE_LIMIT.saturating_sub(total).saturating_sub(hits);
-            let delta = gabion::window::time_until_next_bucket_boundary_millis(now, BUCKET_MILLIS);
+            let delta = gabion::window::time_until_next_bucket_boundary_millis(
+                now,
+                BUCKET_MILLIS.try_into().unwrap(),
+            );
             let reset = gabion::window::reset_unix_seconds(now, delta);
             // Format the three header values into a scratch buffer so the
             // bench measures the same Display passes the production
@@ -1078,7 +1085,7 @@ fn bench_expire(c: &mut Criterion) {
         for i in 0..cells {
             let bucket = (i % 11) as BucketEpoch;
             obs.push(obs_row(
-                rule.fingerprint,
+                rule.fingerprint(),
                 KeyHash(i as u128),
                 bucket,
                 LOCAL_NODE,

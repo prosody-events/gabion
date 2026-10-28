@@ -20,7 +20,7 @@ fn compiles_simple_rules() {
     assert_eq!(rules.table().rules().len(), 2);
     let (rule, compiled) = rules.get(0).expect("rule 0");
     assert_eq!(rule.spec().limit, 10);
-    assert_eq!(rule.spec().live_buckets, 60);
+    assert_eq!(rule.spec().live_buckets.get(), 60);
     assert_eq!(compiled.bindings.len(), 1);
 }
 
@@ -38,7 +38,7 @@ fn raised_max_key_bytes_admits_long_key() {
     let (_, storage) = validated(|s| s.max_key_bytes = 256.try_into().unwrap());
     let rules = CompiledRules::compile_with(&[config], &storage, &mut NopBindingCompiler)
         .expect("a 200-byte key fits a 256-byte budget");
-    assert_eq!(rules.table().rules()[0].descriptors[0].key.len(), 200);
+    assert_eq!(rules.table().rules()[0].descriptors()[0].key.len(), 200);
 }
 
 /// The directive's argument errors, reported at its line.
@@ -251,7 +251,7 @@ fn nginx_readme_rules_each_expire_on_their_own_schedule() {
     for rule in table {
         let slot = store
             .rule_dictionary()
-            .find(rule.fingerprint)
+            .find(rule.fingerprint())
             .expect("interned");
         let interned = store.rule_dictionary().descriptor(slot).expect("pinned");
         assert_eq!(
@@ -259,9 +259,9 @@ fn nginx_readme_rules_each_expire_on_their_own_schedule() {
                 u64::from(interned.window_millis),
                 u64::from(interned.bucket_millis)
             ),
-            (rule.window_millis, rule.bucket_millis),
+            (rule.spec().window_millis, rule.spec().bucket_millis.get()),
             "{}",
-            rule.name
+            rule.name()
         );
     }
     assert!(
@@ -269,9 +269,9 @@ fn nginx_readme_rules_each_expire_on_their_own_schedule() {
             .iter()
             .enumerate()
             .any(|(i, a)| table[..i].iter().any(|b| {
-                a.descriptors == b.descriptors
-                    && a.window_millis == b.window_millis
-                    && a.bucket_millis != b.bucket_millis
+                a.descriptors() == b.descriptors()
+                    && a.spec().window_millis == b.spec().window_millis
+                    && a.spec().bucket_millis != b.spec().bucket_millis
             })),
         "the README keeps a pair of rules that differ only in bucket"
     );

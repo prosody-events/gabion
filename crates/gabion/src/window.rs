@@ -16,6 +16,8 @@
 //! functions over caller-supplied closures so the shared aggregate table can
 //! feed them without materialising every bucket's count.
 
+use std::num::{NonZeroU32, NonZeroU64};
+
 use crate::crdt::BucketEpoch;
 
 /// Wall-clock milliseconds until a new request of weight `hits` would
@@ -29,8 +31,8 @@ use crate::crdt::BucketEpoch;
 /// already gate on `total + hits > limit`).
 pub fn time_until_admit_millis<F>(
     now_millis: u64,
-    bucket_millis: u64,
-    live_buckets: u32,
+    bucket_millis: NonZeroU64,
+    live_buckets: NonZeroU32,
     limit: u64,
     total: u64,
     hits: u64,
@@ -39,8 +41,8 @@ pub fn time_until_admit_millis<F>(
 where
     F: FnMut(BucketEpoch) -> u64,
 {
-    let bm = bucket_millis.max(1);
-    let live = u64::from(live_buckets.max(1));
+    let bm = bucket_millis.get();
+    let live = u64::from(live_buckets.get());
     let need = total.saturating_add(hits).saturating_sub(limit);
     if need == 0 {
         return 0;
@@ -93,9 +95,8 @@ pub fn reset_unix_seconds(now_millis: u64, delta_millis: u64) -> u64 {
 /// where it answers a different question ("when can *this* client retry
 /// without being rejected again") that depends on the actual per-bucket
 /// distribution.
-pub fn time_until_next_bucket_boundary_millis(now_millis: u64, bucket_millis: u64) -> u64 {
-    let bm = bucket_millis.max(1);
-    bm - (now_millis % bm)
+pub fn time_until_next_bucket_boundary_millis(now_millis: u64, bucket_millis: NonZeroU64) -> u64 {
+    bucket_millis.get() - now_millis % bucket_millis
 }
 
 #[cfg(test)]

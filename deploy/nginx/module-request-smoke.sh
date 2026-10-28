@@ -50,7 +50,7 @@ printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule tenant_api tenant:$arg_te
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule per_ip_stacked     ip:$remote_addr    rate=2r/m bucket=1s except_if=$trusted_ip;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule per_bot_stacked    class:$bot_class   rate=5r/m bucket=1s;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule shadow_canary      $uri               rate=1r/s bucket=1s dry_run;'
-printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule baseline_rule      $uri               rate=3r/m bucket=1s;'
+printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule baseline_rule      $uri               rate=3r/m bucket=2s;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit baseline_rule;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule window_demo       demo:$arg_demo     rate=2r/m window=2m bucket=30s;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_bind 0.0.0.0:9000;'

@@ -47,12 +47,12 @@ pub use io::{DeltaSink, ExpirationSink, Observation, ObservationBatch};
 pub use peer_frontier::PeerFrontierTable;
 
 pub(crate) use dictionary::MAX_DICTIONARY_CAPACITY;
-use dictionary::pow2_index_capacity_for;
+pub(crate) use dictionary::pow2_index_capacity_for;
 use dirty_ring::ring_entry_at;
 use hash::hash_compact_cell_key;
 use index::CellIndex;
 
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 
 use crate::rules::{CardinalityLimits, RuleTable};
 use crate::settings::Setting;
@@ -286,8 +286,8 @@ impl ValidStorageConfig {
 
     /// `storage.max_matched_rules`: the most rules one request is counted
     /// against, and so the size of each admission scratch.
-    pub fn max_matched_rules(&self) -> usize {
-        self.max_matched_rules.get().into()
+    pub fn max_matched_rules(&self) -> NonZeroUsize {
+        self.max_matched_rules.into()
     }
 }
 

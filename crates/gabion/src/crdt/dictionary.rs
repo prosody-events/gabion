@@ -323,6 +323,6 @@ impl NodeDictionary {
 
 /// Index buckets for `capacity` entries: a power of two at a ~50% load
 /// factor. Cells are capped at 2^30, so the result fits a `u32`.
-pub(super) fn pow2_index_capacity_for(capacity: NonZeroU32) -> u32 {
+pub(crate) fn pow2_index_capacity_for(capacity: NonZeroU32) -> u32 {
     capacity.get().next_power_of_two() * 2
 }

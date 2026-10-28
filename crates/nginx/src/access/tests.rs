@@ -343,7 +343,13 @@ fn decide_all_picks_longest_window() {
     // Pre-populate aggregate so BOTH rules are over their budget.
     let store = ShmAggregateStore::new(region);
     for rule in rules.table().rules() {
-        seed(&store, rule.fingerprint, key_hash("tenant", "alice"), 0, 5);
+        seed(
+            &store,
+            rule.fingerprint(),
+            key_hash("tenant", "alice"),
+            0,
+            5,
+        );
     }
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide(ctx(&rules, &region, |_| {}), &[0, 1], &vars, 0);

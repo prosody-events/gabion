@@ -2417,7 +2417,7 @@ fn wrap_run(t0: u64) -> (u64, u64, usize) {
     for t in (t0..t0 + 10).chain([t0 + 16]) {
         let node = local();
         batch.push(observation(
-            rule.fingerprint,
+            rule.fingerprint(),
             7,
             t as BucketEpoch,
             node.node_id.0,
@@ -2473,15 +2473,15 @@ fn cell_store_interns_every_rule_at_construction() {
     for rule in table.rules() {
         let slot = store
             .rule_dictionary()
-            .find(rule.fingerprint)
+            .find(rule.fingerprint())
             .expect("interned");
-        assert_eq!(store.rule_dictionary().refcount(slot), 1, "{}", rule.name);
+        assert_eq!(store.rule_dictionary().refcount(slot), 1, "{}", rule.name());
         let interned = store.rule_dictionary().descriptor(slot).unwrap();
         assert_eq!(
             (interned.window_millis, interned.bucket_millis),
             (1_000, 250),
             "{}",
-            rule.name
+            rule.name()
         );
     }
 }

@@ -188,7 +188,7 @@ async fn admit_without_allocating(rules: u16) {
             counts.table().window_total(rule.spec(), key, 0),
             expected,
             "{}",
-            rule.name
+            rule.name()
         );
     }
     let _ = client.shutdown().await;

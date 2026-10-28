@@ -7,9 +7,9 @@ fn spec(limit: u64) -> RuleSpec {
         id: 1,
         fingerprint: 0,
         limit,
-        bucket_millis: 1_000,
+        bucket_millis: 1_000.try_into().unwrap(),
         window_millis: 60_000,
-        live_buckets: 60,
+        live_buckets: 60.try_into().unwrap(),
     }
 }
 
@@ -91,7 +91,8 @@ fn allow_reset_matches_next_bucket_boundary() {
         now_millis: 5_000,
     };
     let h = AdmissionHeaders::build_for_allow(info);
-    let expected_delta = gabion::window::time_until_next_bucket_boundary_millis(5_000, 1_000);
+    let expected_delta =
+        gabion::window::time_until_next_bucket_boundary_millis(5_000, 1_000.try_into().unwrap());
     let expected_reset = gabion::window::reset_unix_seconds(5_000, expected_delta);
     assert_eq!(h.reset.as_str(), expected_reset.to_string());
 }

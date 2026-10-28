@@ -5,17 +5,15 @@ use quickcheck_macros::quickcheck;
 use super::*;
 use crate::crdt::{CellHandle, CellIdentity};
 use crate::mock::with_logs;
+use crate::settings::mock::storage;
 
 /// An empty table of `capacity` slots.
 fn aggregate(capacity: usize) -> Aggregate {
     Aggregate::with_capacity(capacity)
 }
 
-fn writer(aggregate: &Aggregate) -> Writer<'_> {
-    Writer {
-        table: aggregate.table(),
-        write_seq: &aggregate.write_seq,
-    }
+fn writer(aggregate: &Aggregate) -> AggregateWriter<'_> {
+    AggregateWriter::new(aggregate.table(), &aggregate.write_seq, &aggregate.dropped)
 }
 
 fn spec(fingerprint: u128, limit: u64, bucket_millis: u64, live_buckets: u32) -> RuleSpec {
@@ -23,9 +21,9 @@ fn spec(fingerprint: u128, limit: u64, bucket_millis: u64, live_buckets: u32) ->
         id: 1,
         fingerprint,
         limit,
-        bucket_millis,
+        bucket_millis: bucket_millis.try_into().unwrap(),
         window_millis: bucket_millis * u64::from(live_buckets),
-        live_buckets,
+        live_buckets: live_buckets.try_into().unwrap(),
     }
 }
 
@@ -160,6 +158,20 @@ fn full_aggregate_allows_and_logs() {
     ] {
         assert!(logs.contains(knob), "{knob}: {logs}");
     }
+}
+
+/// `gabiond`'s table has room for a cell per cell-store cell at most half
+/// full, so a full cell store (one origin per key, as on a lone node) loses
+/// no counts to `aggregate_full`.
+#[test]
+fn gabiond_table_holds_a_full_cell_store() {
+    let cells = 4_096;
+    let aggregate = Aggregate::new(&storage(cells, 64, 64, 8));
+    let writer = writer(&aggregate);
+    let dropped = (0..u128::from(cells))
+        .filter(|&key| !writer.add(1, key, 0, 1))
+        .count();
+    assert_eq!(dropped, 0);
 }
 
 #[test]

@@ -11,7 +11,7 @@
 //! adapter's job — kept out of this module on purpose.
 
 use std::fmt;
-use std::num::{NonZeroU16, NonZeroU64};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -77,41 +77,49 @@ impl DescriptorPattern {
     }
 }
 
-/// One rate-limit rule, built only by [`RuleDef::build`]. `fingerprint` and
-/// `domain_hash` are derived deterministically so two nodes with identical
+/// One rate-limit rule, built only by [`RuleDef::build`] and numbered only
+/// by [`RuleTable::new`]; its fields are private so nothing can change a
+/// rule after its identity is derived from them. Two nodes with identical
 /// rules produce identical fingerprints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Rule {
-    /// Position in its [`RuleTable`], from 1; assigned by [`RuleTable::new`].
-    pub(crate) id: RuleId,
-    pub name: Box<str>,
-    /// Stable, cross-node identity: a hash of the domain, the descriptor
-    /// patterns, the window and the bucket. The limit and the mode stay out,
-    /// so changing either keeps the rule's counters.
-    #[cfg_attr(feature = "serde", serde(serialize_with = "crate::hex"))]
-    pub fingerprint: u128,
-    pub domain: Box<str>,
-    pub domain_hash: KeyHash,
-    pub descriptors: Box<[DescriptorPattern]>,
-    pub limit: u64,
-    pub window_millis: u64,
-    pub bucket_millis: u64,
-    pub live_buckets: u32,
-    pub mode: EnforcementMode,
+    name: Box<str>,
+    domain: Box<str>,
+    domain_hash: KeyHash,
+    descriptors: Box<[DescriptorPattern]>,
+    mode: EnforcementMode,
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    spec: RuleSpec,
 }
 
 impl Rule {
-    /// Hot-path-ready summary. O(1) field copies.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub fn descriptors(&self) -> &[DescriptorPattern] {
+        &self.descriptors
+    }
+
+    pub fn mode(&self) -> EnforcementMode {
+        self.mode
+    }
+
+    /// Stable, cross-node identity: a hash of the domain, the descriptor
+    /// patterns, the window and the bucket. The limit and the mode stay out,
+    /// so changing either keeps the rule's counters.
+    pub fn fingerprint(&self) -> u128 {
+        self.spec.fingerprint
+    }
+
+    /// Hot-path-ready summary. O(1) copy.
     pub fn spec(&self) -> RuleSpec {
-        RuleSpec {
-            id: self.id,
-            fingerprint: self.fingerprint,
-            limit: self.limit,
-            bucket_millis: self.bucket_millis,
-            window_millis: self.window_millis,
-            live_buckets: self.live_buckets,
-        }
+        self.spec
     }
 
     /// The rule as the cell store interns it. [`RuleDef::build`] keeps the
@@ -119,27 +127,31 @@ impl Rule {
     /// casts are lossless.
     pub fn descriptor(&self) -> RuleDescriptor {
         RuleDescriptor {
-            fingerprint: self.fingerprint,
-            window_millis: self.window_millis as u32,
-            bucket_millis: self.bucket_millis as u32,
-            limit: self.limit,
+            fingerprint: self.spec.fingerprint,
+            window_millis: self.spec.window_millis as u32,
+            bucket_millis: self.spec.bucket_millis.get() as u32,
+            limit: self.spec.limit,
             flags: 0,
-            local_rule_id: self.id,
+            local_rule_id: self.spec.id,
         }
     }
 }
 
 /// Hot-path-ready summary of one rule. The per-request decision path holds
 /// this by value (Copy) so neither adapter needs an O(N) lookup back into
-/// the rule table by id.
+/// the rule table by id. The bucket and the bucket count are non-zero by
+/// type, so no summary can divide by a zero bucket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RuleSpec {
+    /// Position in its [`RuleTable`], from 1; assigned by [`RuleTable::new`].
     pub id: RuleId,
+    #[cfg_attr(feature = "serde", serde(serialize_with = "crate::hex"))]
     pub fingerprint: u128,
     pub limit: u64,
-    pub bucket_millis: u64,
+    pub bucket_millis: NonZeroU64,
     pub window_millis: u64,
-    pub live_buckets: u32,
+    pub live_buckets: NonZeroU32,
 }
 
 impl RuleSpec {
@@ -223,22 +235,24 @@ impl RuleDef<'_> {
             })
             .collect();
         Ok(Rule {
-            id: 0,
             name: rule(),
-            fingerprint: rule_fingerprint(
-                self.domain,
-                self.patterns,
-                resolved.window_millis,
-                resolved.bucket_millis,
-            ),
             domain: self.domain.into(),
             domain_hash: hash_domain(self.domain),
             descriptors,
-            limit: resolved.limit.get(),
-            window_millis: resolved.window_millis,
-            bucket_millis: resolved.bucket_millis,
-            live_buckets: resolved.live_buckets,
             mode: self.mode,
+            spec: RuleSpec {
+                id: 0,
+                fingerprint: rule_fingerprint(
+                    self.domain,
+                    self.patterns,
+                    resolved.window_millis,
+                    resolved.bucket_millis.get(),
+                ),
+                limit: resolved.limit.get(),
+                bucket_millis: resolved.bucket_millis,
+                window_millis: resolved.window_millis,
+                live_buckets: resolved.live_buckets,
+            },
         })
     }
 }
@@ -292,7 +306,7 @@ impl RuleTable {
                         name: rule.name.clone(),
                     });
                 }
-                if earlier.fingerprint == rule.fingerprint {
+                if earlier.fingerprint() == rule.fingerprint() {
                     return Err(RuleError::DuplicateRuleIdentity {
                         first: earlier.name.clone(),
                         second: rule.name.clone(),
@@ -301,7 +315,7 @@ impl RuleTable {
             }
         }
         for (i, rule) in rules.iter_mut().enumerate() {
-            rule.id = i as RuleId + 1;
+            rule.spec.id = i as RuleId + 1;
         }
         Ok(Self {
             rules,
@@ -652,8 +666,8 @@ pub fn parse_rate(input: &str) -> Result<(NonZeroU64, Duration), &'static str> {
 struct ResolvedRate {
     limit: NonZeroU64,
     window_millis: u64,
-    bucket_millis: u64,
-    live_buckets: u32,
+    bucket_millis: NonZeroU64,
+    live_buckets: NonZeroU32,
 }
 
 /// Reasons [`RuleDef::build`] can refuse a rule's (rate, window, bucket). Each
@@ -726,14 +740,12 @@ fn resolve_rate(
         return Err(RateResolveError::WindowShorterThanPeriod);
     }
     let period_millis = duration_to_millis(period).max(1);
-    let bucket_millis = duration_to_millis(bucket.unwrap_or(window));
-    if bucket_millis == 0 {
-        return Err(RateResolveError::ZeroBucket);
-    }
-    if bucket_millis > window_millis {
+    let bucket_millis = NonZeroU64::new(duration_to_millis(bucket.unwrap_or(window)))
+        .ok_or(RateResolveError::ZeroBucket)?;
+    if bucket_millis.get() > window_millis {
         return Err(RateResolveError::BucketLongerThanWindow);
     }
-    let live_buckets = window_millis.div_ceil(bucket_millis);
+    let live_buckets = window_millis.div_ceil(bucket_millis.get());
     // Epochs are `u32` and compared by serial-number arithmetic, which holds
     // while a window spans fewer than 2^31 buckets.
     if window_millis > u64::from(u32::MAX) || live_buckets >= 1 << 31 {
@@ -747,11 +759,13 @@ fn resolve_rate(
     // From 1 ms up the window is at least the period, so the limit is at
     // least `rate_count`.
     let limit = NonZeroU64::new(limit).ok_or(RateResolveError::ZeroWindow)?;
+    // A window of at least 1 ms holds at least one bucket.
+    let live_buckets = NonZeroU32::new(live_buckets as u32).ok_or(RateResolveError::ZeroWindow)?;
     Ok(ResolvedRate {
         limit,
         window_millis,
         bucket_millis,
-        live_buckets: live_buckets as u32,
+        live_buckets,
     })
 }
 

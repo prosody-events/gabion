@@ -330,7 +330,7 @@ fn admission_bounds_have_no_build_cap() {
                 .unwrap_or_else(|error| panic!("{setting:?} {value}: {error}"));
             let validated = match setting {
                 Setting::StorageMaxDescriptorCount => storage.cardinality.max_descriptor_count(),
-                Setting::StorageMaxMatchedRules => storage.max_matched_rules(),
+                Setting::StorageMaxMatchedRules => storage.max_matched_rules().get(),
                 _ => storage.cardinality.max_request_descriptors(),
             };
             assert_eq!(validated, value, "{setting:?}");
@@ -407,7 +407,7 @@ fn defaults_validate_to_the_production_values() {
     );
     assert_eq!(storage.rule_dictionary_capacity, None);
     assert_eq!(
-        storage.max_matched_rules(),
+        storage.max_matched_rules().get(),
         usize::from(defaults::STORAGE_MAX_MATCHED_RULES)
     );
     assert_eq!(

@@ -2,8 +2,8 @@
 //! slots in its shared memory, `gabiond` over [`Aggregate`]'s heap slots.
 //!
 //! Keys on the portable cell identity `(rule_fingerprint, key_hash, bucket)`.
-//! The gossip runtime is the only writer (through
-//! [`crate::gossip::AggregateStore::apply`]); every request reads it.
+//! Every request reads through [`AggregateTable`], which cannot write; the
+//! gossip runtime is the only writer, through [`AggregateWriter`].
 //!
 //! The table is linear-probed, and every cell sits within [`MAX_PROBE`]
 //! slots of its home slot: a write that finds no free slot that close is
@@ -27,7 +27,10 @@ use std::sync::atomic as std_atomic;
 #[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
-use crate::crdt::{BucketEpoch, Count, DeltaSink, ExpirationSink, KeyHash, ValidStorageConfig};
+use crate::crdt::{
+    BucketEpoch, Count, DeltaSink, ExpirationSink, KeyHash, ValidStorageConfig,
+    pow2_index_capacity_for,
+};
 use crate::gossip::AggregateStore;
 use crate::rules::RuleSpec;
 use crate::settings::Setting;
@@ -191,9 +194,8 @@ impl<'a> AggregateTable<'a> {
     /// the current one and the `live_buckets - 1` before it. Epochs wrap,
     /// so the walk does too (a window spans fewer than 2^31 buckets).
     pub fn window_total(&self, spec: RuleSpec, key_hash: KeyHash, now_millis: u64) -> u64 {
-        debug_assert!(spec.bucket_millis >= 1 && spec.live_buckets >= 1);
         let current = spec.bucket_at(now_millis);
-        (0..spec.live_buckets)
+        (0..spec.live_buckets.get())
             .filter_map(|offset| {
                 self.get(spec.fingerprint, key_hash.0, current.wrapping_sub(offset))
             })
@@ -233,12 +235,36 @@ impl<'a> AggregateTable<'a> {
             .filter(|slot| slot.seq.load(Ordering::Relaxed) != 0)
             .count()
     }
+}
+
+/// The table's single writer, the gossip runtime (through
+/// [`crate::gossip::AggregateStore::apply`]): the only handle that changes
+/// slots. `write_seq` stamps each write, and `dropped` counts the writes that
+/// found no free slot near their home, which log `aggregate_full`.
+pub struct AggregateWriter<'a> {
+    table: AggregateTable<'a>,
+    write_seq: &'a std_atomic::AtomicU64,
+    dropped: &'a std_atomic::AtomicU64,
+}
+
+impl<'a> AggregateWriter<'a> {
+    pub fn new(
+        table: AggregateTable<'a>,
+        write_seq: &'a std_atomic::AtomicU64,
+        dropped: &'a std_atomic::AtomicU64,
+    ) -> Self {
+        Self {
+            table,
+            write_seq,
+            dropped,
+        }
+    }
 
     /// Empty every slot, returning how many held a cell. Slots already empty
     /// are left untouched, which spares every reader's cached copy of them.
     pub fn clear(&self) -> usize {
         let mut cleared = 0;
-        for slot in self.slots {
+        for slot in self.table.slots {
             if slot.seq.load(Ordering::Relaxed) != 0 {
                 slot.seq.store(0, Ordering::Release);
                 cleared += 1;
@@ -247,28 +273,16 @@ impl<'a> AggregateTable<'a> {
         cleared
     }
 
-    /// Fold one batch of the gossip runtime's rows in, as the table's single
-    /// writer: `write_seq` stamps each write, and `dropped` counts the writes
-    /// that found no free slot near their home, which log `aggregate_full`.
-    pub fn apply<C: Count>(
-        &self,
-        write_seq: &std_atomic::AtomicU64,
-        dropped: &std_atomic::AtomicU64,
-        deltas: &DeltaSink<C>,
-        expirations: &ExpirationSink<C>,
-    ) {
-        let writer = Writer {
-            table: *self,
-            write_seq,
-        };
+    /// Fold one batch of the gossip runtime's rows in.
+    pub fn apply<C: Count>(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>) {
         for i in 0..deltas.len() {
             let delta: u64 = deltas.deltas[i].into();
             if deltas.applies_locally[i] == 0 || delta == 0 {
                 continue;
             }
             let key = &deltas.keys[i];
-            if !writer.add(key.rule_fingerprint, key.key_hash.0, key.bucket, delta) {
-                note_aggregate_full(self.capacity(), dropped);
+            if !self.add(key.rule_fingerprint, key.key_hash.0, key.bucket, delta) {
+                note_aggregate_full(self.table.capacity(), self.dropped);
             }
         }
         for i in 0..expirations.len() {
@@ -276,7 +290,7 @@ impl<'a> AggregateTable<'a> {
                 continue;
             }
             let key = &expirations.keys[i];
-            writer.subtract(
+            self.subtract(
                 key.rule_fingerprint,
                 key.key_hash.0,
                 key.bucket,
@@ -284,15 +298,7 @@ impl<'a> AggregateTable<'a> {
             );
         }
     }
-}
 
-/// The table's single writer for one batch.
-struct Writer<'a> {
-    table: AggregateTable<'a>,
-    write_seq: &'a std_atomic::AtomicU64,
-}
-
-impl Writer<'_> {
     fn write(&self, index: usize, cell: AggregateCell) {
         // Even sequences only; `AggregateSlot::write` publishes `seq - 1`
         // (odd) while the fields change.
@@ -393,8 +399,11 @@ fn mix_index(fp: u128, kh: u128, bucket: BucketEpoch) -> usize {
     (h as u64 ^ (h >> 64) as u64) as usize
 }
 
-/// `gabiond`'s table: `storage.max_cells` slots rounded up to a power of
-/// two, allocated once, with its write sequence and drop counter.
+/// `gabiond`'s table, allocated once with its write sequence and drop
+/// counter. It holds a cell per live `(rule, key, bucket)`, at most one per
+/// cell-store cell, so it is sized as the cell store's index is: twice
+/// `storage.max_cells`, rounded up to a power of two, which keeps it at most
+/// half full.
 pub struct Aggregate {
     slots: Box<[AggregateSlot]>,
     write_seq: std_atomic::AtomicU64,
@@ -403,7 +412,7 @@ pub struct Aggregate {
 
 impl Aggregate {
     pub fn new(storage: &ValidStorageConfig) -> Self {
-        Self::with_capacity(storage.cell_capacity.get().next_power_of_two().max(2) as usize)
+        Self::with_capacity(pow2_index_capacity_for(storage.cell_capacity) as usize)
     }
 
     fn with_capacity(capacity: usize) -> Self {
@@ -421,8 +430,8 @@ impl Aggregate {
 
 impl<C: Count> AggregateStore<C> for Aggregate {
     fn apply(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>) {
-        self.table()
-            .apply(&self.write_seq, &self.dropped, deltas, expirations);
+        AggregateWriter::new(self.table(), &self.write_seq, &self.dropped)
+            .apply(deltas, expirations);
     }
 }
 

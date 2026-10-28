@@ -7,6 +7,8 @@
 //! SHM aggregate is read through `AggregateTable::window_total`, which does
 //! only atomic loads.
 
+use std::num::NonZeroUsize;
+
 use gabion::aggregate::AggregateTable;
 use gabion::rules::{CardinalityLimits, EnforcementMode, KeyHasher, RuleSpec};
 
@@ -76,7 +78,7 @@ pub struct AccessCtx<'a> {
     pub cardinality: CardinalityLimits,
     /// `gabion_storage_max_matched_rules`: the most rules one request is
     /// counted against.
-    pub max_matched_rules: usize,
+    pub max_matched_rules: NonZeroUsize,
 }
 
 /// Per-rule outcome before [`decide_all`] folds it into a single
@@ -134,7 +136,10 @@ pub fn decide_all(
     events: &mut Vec<QueueEvent>,
 ) -> AccessOutcome {
     ctx.stats.record_request();
-    let bound = ctx.max_matched_rules.min(ctx.rules.table().rules().len());
+    let bound = ctx
+        .max_matched_rules
+        .get()
+        .min(ctx.rules.table().rules().len());
     if events.capacity() < bound {
         *events = Vec::with_capacity(bound);
     }
@@ -155,7 +160,7 @@ pub fn decide_all(
                 // Past the bound the rule is allowed but not counted: the
                 // bound is gabion's own, so the request under-counts rather
                 // than over-rejects.
-                if events.len() < ctx.max_matched_rules {
+                if events.len() < bound {
                     events.push(event);
                 } else {
                     overflowed = true;
@@ -226,7 +231,7 @@ fn decide_one(
     let Some((rule, compiled)) = ctx.rules.get(rule_index) else {
         return RuleOutcome::Decline;
     };
-    if rule.mode == EnforcementMode::Disabled {
+    if rule.mode() == EnforcementMode::Disabled {
         return RuleOutcome::Decline;
     }
 
@@ -248,9 +253,9 @@ fn decide_one(
     // the rule's `value=` literal. Count and key length passed the shared
     // cardinality check when the rule was built, so only the byte budget can
     // fail here.
-    let mut hasher = KeyHasher::new(&rule.domain);
-    let mut bytes = rule.domain.len();
-    for (lookup, pattern) in compiled.bindings.iter().zip(&rule.descriptors) {
+    let mut hasher = KeyHasher::new(rule.domain());
+    let mut bytes = rule.domain().len();
+    for (lookup, pattern) in compiled.bindings.iter().zip(rule.descriptors()) {
         let Some(value) = vars.lookup(lookup) else {
             return RuleOutcome::Decline;
         };
@@ -276,7 +281,7 @@ fn decide_one(
     // DryRun rules count and gossip but never reject — they let operators
     // observe what enforcement would do before flipping the switch.
     let hits = 1u64;
-    if total.saturating_add(hits) > spec.limit && rule.mode == EnforcementMode::Enforce {
+    if total.saturating_add(hits) > spec.limit && rule.mode() == EnforcementMode::Enforce {
         let delta_until_admit_millis = ctx
             .aggregate
             .time_until_admit_millis(spec, key_hash, now_millis, total, hits);

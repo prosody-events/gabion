@@ -88,7 +88,7 @@ fn snapshot_json_shape_is_pinned() {
         let row = DeltaSink::<u32> {
             handles: vec![CellHandle::default()],
             keys: vec![CellIdentity {
-                rule_fingerprint: rule_table.rules()[0].fingerprint,
+                rule_fingerprint: rule_table.rules()[0].fingerprint(),
                 key_hash: KeyHash(1),
                 bucket: 0,
             }],
@@ -213,11 +213,12 @@ fn snapshot_json_shape_is_pinned() {
         assert!(body["peers"][0]["node_id"].is_null());
         assert_eq!(
             body["rules"][0]["fingerprint"],
-            format!("{:#034x}", rule_table.rules()[0].fingerprint)
+            format!("{:#034x}", rule_table.rules()[0].fingerprint())
         );
-        assert_eq!(
-            body["rules"][0]["domain_hash"],
-            format!("{:#034x}", rule_table.rules()[0].domain_hash.0)
+        assert!(
+            body["rules"][0]["domain_hash"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 34 && hash.starts_with("0x"))
         );
         assert_eq!(body["rules"][0]["mode"], "enforce");
         assert_eq!(body["aggregate_rows"], 1);

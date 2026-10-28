@@ -183,8 +183,11 @@ impl<C: Count> SharedLimiter<C> {
         now_millis: u64,
         planned: &mut Vec<Planned>,
     ) -> Decision {
-        let max_matched = self.storage.max_matched_rules();
-        let bound = max_matched.min(self.rule_table.rules().len());
+        let bound = self
+            .storage
+            .max_matched_rules()
+            .get()
+            .min(self.rule_table.rules().len());
         if planned.capacity() < bound {
             *planned = Vec::with_capacity(bound);
         }
@@ -199,7 +202,7 @@ impl<C: Count> SharedLimiter<C> {
             let key_hash = *key_hash.get_or_insert_with(|| hash_key(domain, entries.clone()));
             let spec = rule.spec();
             let total = table.window_total(spec, key_hash, now_millis);
-            if total.saturating_add(hits) > spec.limit && rule.mode == EnforcementMode::Enforce {
+            if total.saturating_add(hits) > spec.limit && rule.mode() == EnforcementMode::Enforce {
                 return Decision::Reject(RejectReason::GlobalLimit(Quota {
                     remaining: 0,
                     duration_until_reset_millis: table
@@ -218,7 +221,7 @@ impl<C: Count> SharedLimiter<C> {
             tightest = Some(pick_min_remaining(tightest, candidate));
             // Allow by default (CLAUDE.md): rules past the bound are checked
             // but not counted, as in NGINX.
-            if planned.len() < max_matched {
+            if planned.len() < bound {
                 planned.push(Planned {
                     fingerprint: spec.fingerprint,
                     bucket: spec.bucket_at(now_millis),
@@ -328,7 +331,7 @@ impl<C: Count> SharedLimiter<C> {
     fn note_matched_overflow(&self, domain: &str) {
         if let Some(overflowed_total) = throttle::bump_shared(&self.warnings.matched_rule_overflows)
         {
-            let cap = self.storage.max_matched_rules();
+            let cap = self.storage.max_matched_rules().get();
             tracing::warn!(
                 code = "matched_rule_overflow",
                 domain,

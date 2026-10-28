@@ -182,7 +182,7 @@ fn deltas_and_expirations(
     let mut e: ExpirationSink<u32> = ExpirationSink::with_capacity(expirations.len());
     for &(kh, bucket, delta) in deltas {
         let key = CellIdentity {
-            rule_fingerprint: rule.fingerprint,
+            rule_fingerprint: rule.fingerprint(),
             key_hash: kh,
             bucket,
         };
@@ -195,7 +195,7 @@ fn deltas_and_expirations(
     }
     for &(kh, bucket, last_count) in expirations {
         let key = CellIdentity {
-            rule_fingerprint: rule.fingerprint,
+            rule_fingerprint: rule.fingerprint(),
             key_hash: kh,
             bucket,
         };
@@ -256,7 +256,7 @@ fn leader_stamps_incarnation_and_applies_deltas() {
 
     // Workers should read the new value through the seqlock-protected view.
     let view = region.aggregate();
-    let cell = view.get(rule.fingerprint, key_hash.0, 3).expect("found");
+    let cell = view.get(rule.fingerprint(), key_hash.0, 3).expect("found");
     assert_eq!(cell.count, 5);
 }
 
@@ -272,7 +272,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert_eq!(
         region
             .aggregate()
-            .get(rule.fingerprint, kh.0, 1)
+            .get(rule.fingerprint(), kh.0, 1)
             .unwrap()
             .count,
         7
@@ -284,7 +284,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert_eq!(
         region
             .aggregate()
-            .get(rule.fingerprint, kh.0, 1)
+            .get(rule.fingerprint(), kh.0, 1)
             .unwrap()
             .count,
         4
@@ -293,7 +293,12 @@ fn expiration_subtracts_then_empties_when_zero() {
     // Subtract the rest — should empty the slot.
     let (d_empty, e_full) = deltas_and_expirations(&rule, &[], &[(kh, 1, 4)]);
     store.apply(&d_empty, &e_full);
-    assert!(region.aggregate().get(rule.fingerprint, kh.0, 1).is_none());
+    assert!(
+        region
+            .aggregate()
+            .get(rule.fingerprint(), kh.0, 1)
+            .is_none()
+    );
 }
 
 // -- 3. Access path: full decision logic via SHM views ---------------------
@@ -358,7 +363,7 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
 
     let (_zone, region) = build_zone(8, 16);
     let rule = rule("k", &format!("{}r/s", u64::MAX / 1_000));
-    let fp = rule.fingerprint;
+    let fp = rule.fingerprint();
     let steady = KeyHash(0x777);
     let store = ShmAggregateStore::new(region);
     let (d, e) = deltas_and_expirations(&rule, &[(steady, 0, STEADY)], &[]);
@@ -455,7 +460,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
 
     // Build a rule and its fingerprint+key the same way nginx would.
     let rule = rule("tenant", &format!("{}r/s", TOTAL * 2));
-    let fingerprint = rule.fingerprint;
+    let fingerprint = rule.fingerprint();
     let descriptors = [gabion::rules::Descriptor {
         key: "tenant",
         value: "alice",
@@ -687,7 +692,7 @@ fn decide_all_multi_rule_concurrent() {
         for _ in 0..=1_000 {
             for rule in leader_rules.table().rules() {
                 let descriptors = [gabion::rules::Descriptor {
-                    key: &rule.descriptors[0].key,
+                    key: &rule.descriptors()[0].key,
                     value: "alice",
                 }];
                 let key_hash = hash_key(DEFAULT_DOMAIN, descriptors);

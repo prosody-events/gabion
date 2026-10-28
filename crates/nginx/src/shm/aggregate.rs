@@ -1,10 +1,11 @@
 //! The gossip leader's writer for the shared-memory aggregate table: the
-//! library's [`gabion::aggregate::AggregateTable`] over the zone's slots,
-//! fenced by the leader lease. Every worker reads the same table on the
+//! library's [`AggregateWriter`] over the zone's slots, fenced by the leader
+//! lease. Every worker reads the same table on the
 //! request hot path through [`super::ShmRegion::aggregate`].
 
 use std::sync::atomic::Ordering;
 
+use gabion::aggregate::AggregateWriter;
 use gabion::crdt::{DeltaSink, ExpirationSink};
 use gabion::gossip::AggregateStore;
 
@@ -25,7 +26,7 @@ impl ShmAggregateStore {
     /// counts an earlier leader left behind would be added a second time and
     /// never expire. Readers under-count until gossip refills the table.
     pub fn new(region: ShmRegion) -> Self {
-        let cleared = region.aggregate().clear();
+        let cleared = writer(&region).clear();
         if cleared > 0 {
             tracing::info!(
                 code = "leader_takeover",
@@ -53,13 +54,16 @@ impl AggregateStore<u32> for ShmAggregateStore {
         if self.region.lease().epoch.load(Ordering::Acquire) != self.epoch {
             return;
         }
-        self.region.aggregate().apply(
-            &self.region.header().aggregate_write_seq,
-            &self.region.stats().aggregate_dropped,
-            deltas,
-            expirations,
-        );
+        writer(&self.region).apply(deltas, expirations);
     }
+}
+
+fn writer(region: &ShmRegion) -> AggregateWriter<'_> {
+    AggregateWriter::new(
+        region.aggregate(),
+        &region.header().aggregate_write_seq,
+        &region.stats().aggregate_dropped,
+    )
 }
 
 #[cfg(test)]
