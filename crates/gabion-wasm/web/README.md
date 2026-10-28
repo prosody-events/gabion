@@ -50,7 +50,8 @@ the steps — deterministic, without the scrubber's timed-event driver.
   stage.
 - `src/tokens.css` — the design tokens, the one source of design values. Each
   colour holds its light and dark value in `light-dark()`: the OS preference
-  picks one and `<html data-theme="light|dark">` overrides it. The study
+  picks one and `<html data-theme="light|dark">` overrides it, which sets the
+  browser floor at Chrome 123, Safari 17.5 and Firefox 120. The study
   dashboard keeps a byte-identical copy. `src/app.css` holds only the base
   element rules.
 - `src/lib/theme.ts` — `readTheme` resolves the tokens PixiJS and uPlot need as
@@ -172,11 +173,11 @@ Automated checks, run on every preset with the transport paused:
 
 - A1: no page or console errors, no failed requests, no page-level horizontal overflow.
 - A2: no "NaN", "undefined", "null", "Infinity", "[object" or "e+" in page text.
-- A3: no two visible text boxes overlap by 1 px or more, and no text is clipped by an `overflow: hidden` ancestor; canvas labels, chart marks, tooltips and beam geometry are not yet covered.
+- A3: no two visible text boxes overlap by 1 px or more, in at least one converged preset too, and no text is clipped by an `overflow: hidden` ancestor; canvas labels, chart marks, tooltips and beam geometry are not yet covered.
 - A4: data correctness, recomputed independently from the engine snapshot (not yet automated).
 - A5: fixed order across the grid, table, chart series and inspector rows (not yet automated).
 - A6: interaction, including keyboard navigation and tooltips (not yet automated).
-- A7: contrast from computed styles, text at 4.5:1 and graphics at 3:1 on the surface they sit on, in both themes, with targets of at least 24 px.
+- A7: contrast from computed styles, text at 4.5:1 and graphics at 3:1 on the surface they sit on, translucent marks composited over it first, in both themes, with targets of at least 24 px.
 - A8: the wording scan (rule 1) and the clock-time scan (rule 2).
 - A9: a digit scan outside data-bound elements (not yet automated).
 

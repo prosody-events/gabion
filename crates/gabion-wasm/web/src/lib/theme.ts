@@ -16,7 +16,9 @@ export function readTheme() {
     ctx.clearRect(0, 0, 1, 1);
     ctx.fillStyle = getComputedStyle(probe).color;
     ctx.fillRect(0, 0, 1, 1);
-    const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+    const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
+    // The number has no alpha channel: a translucent token would read as opaque.
+    if (a < 255) console.error(`readTheme: ${token} is translucent; canvas tokens must be opaque`);
     return (r << 16) | (g << 8) | b;
   };
   const theme = {
@@ -34,6 +36,11 @@ export function readTheme() {
 
 /** The tokens the stage and the charts draw with, as packed `0xRRGGBB`. */
 export type Theme = ReturnType<typeof readTheme>;
+
+/** The most opaque a stage beam draws, and the REJECTING band's fill: the
+ *  design audit composites each over its surface before checking contrast. */
+export const BEAM_ALPHA = 0.8;
+export const BAND_ALPHA = 0.15;
 
 /** Call `onChange` when the OS colour scheme or `<html data-theme>` changes;
  *  returns the unsubscribe. */

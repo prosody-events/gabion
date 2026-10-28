@@ -19,7 +19,7 @@
 //     the micro reading is the spread around it.
 
 import uPlot from 'uplot';
-import { cssColor, type Theme } from '../theme';
+import { BAND_ALPHA, cssColor, type Theme } from '../theme';
 
 const FONT = "12px ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
 
@@ -170,7 +170,7 @@ export function aggregateLimitOptions(limit: number, theme: Theme): uPlot.Option
     axes: axes(theme),
     series: [{}, { stroke: fg, fill: cssColor(theme.fg, 0.08), width: 2, points: { show: false } }],
     hooks: {
-      drawClear: [drawRejectBand(limit, cssColor(theme.warn, 0.2), warn)],
+      drawClear: [drawRejectBand(limit, cssColor(theme.warn, BAND_ALPHA), warn)],
       draw: [drawRejectLabels(limit, warn), labelSeriesEnd(1, 'aggregate', fg)],
     },
   };

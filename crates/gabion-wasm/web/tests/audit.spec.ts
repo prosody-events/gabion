@@ -1,6 +1,6 @@
 import { inflateSync } from 'node:zlib';
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import { readTheme, type Theme } from '../src/lib/theme';
+import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
 // A1, A2, A3 (DOM text), A7 and A8. Each audit project fixes a width and a
@@ -35,6 +35,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
   const presets = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button');
   const count = await presets.count();
   expect(count, 'no presets to audit').toBeGreaterThan(0);
+  let converged = 0;
   for (let i = 0; i < count; i++) {
     const preset = presets.nth(i);
     const name = (await preset.innerText()).trim();
@@ -49,6 +50,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
     await expect(
       page.locator('.readout-item', { hasText: 'tick' }).locator('.readout-value'),
     ).toHaveText(String(STEPS));
+    converged += await page.locator('.headline.converged').count();
 
     let unforced: Theme | null = null;
     for (const theme of [null, forced]) {
@@ -69,7 +71,8 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
       });
       if (unforced === null) unforced = colours;
       else expect(colours.bg, `${where}: data-theme did not switch the theme`).not.toBe(unforced.bg);
-      expect(await page.evaluate(audit, colours), where).toEqual({
+      const findings = await page.evaluate(audit, { theme: colours, beam: BEAM_ALPHA, band: BAND_ALPHA });
+      expect(findings, where).toEqual({
         A1: [],
         A2: [],
         A3: [],
@@ -83,6 +86,8 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
         .toBe(colours.bg);
     }
   }
+  // Text shown only once every node agrees (the converged badge) is checked too.
+  expect(converged, 'no preset was audited in a converged state (A3)').toBeGreaterThan(0);
   expect(errors, 'page errors, console errors or failed requests (A1)').toEqual([]);
 });
 
@@ -108,8 +113,9 @@ async function stagePixel(page: Page, stage: Locator): Promise<number> {
 }
 
 /** Runs in the page: findings for A1 (sideways scroll), A2, A3 (DOM text), A7 and
- *  A8, one sentence each. Self-contained: Playwright ships it to the page as source. */
-function audit(theme: Theme): Findings {
+ *  A8, one sentence each, given the canvas colours and the alphas of the
+ *  translucent canvas marks. Self-contained: Playwright ships it to the page as source. */
+function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number }): Findings {
   type Rgba = [number, number, number, number];
   type Box = { left: number; right: number; top: number; bottom: number };
   const found: Findings = { A1: [], A2: [], A3: [], A7: [], A8: [] };
@@ -124,7 +130,7 @@ function audit(theme: Theme): Findings {
     const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
     return [r, g, b, a / 255];
   };
-  const unpack = (rgb: number): Rgba => [(rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff, 1];
+  const unpack = (rgb: number, alpha = 1): Rgba => [(rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff, alpha];
   const pack = ([r, g, b]: Rgba): number => (r << 16) | (g << 8) | b;
   const over = (top: Rgba, under: Rgba): Rgba => {
     const mix = (i: number): number => top[3] * top[i] + (1 - top[3]) * under[i];
@@ -267,30 +273,35 @@ function audit(theme: Theme): Findings {
   if (pack(paint(rootStyle.color)) !== theme.fg) found.A7.push('readTheme().fg is not the page text colour');
 
   // A7 canvas pairs (graphics 3:1, text 4.5:1): the stage draws on `readTheme().bg`
-  // and the charts on the detail rail's panel, so each is checked on its own surface.
-  const check = (surface: Rgba, where: string, pairs: [string, number, number][]): void => {
+  // and the charts on the detail rail's panel, so each is checked on its own
+  // surface, a translucent mark composited over it first.
+  const check = (surface: Rgba, where: string, pairs: [string, Rgba, number][]): void => {
     for (const [token, colour, minimum] of pairs) {
-      const ratio = contrast(unpack(colour), surface);
+      const ratio = contrast(over(colour, surface), surface);
       if (ratio < minimum) {
         found.A7.push(`${token} on the ${where} has ${ratio.toFixed(2)}:1 contrast, below ${minimum}:1`);
       }
     }
   };
   check(unpack(theme.bg), 'stage', [
-    ['--color-fg', theme.fg, 4.5],
-    ['--chart-muted', theme.muted, 3],
-    ['--color-ok', theme.ok, 3],
-    ['--color-warn', theme.warn, 3],
+    ['--color-fg', unpack(theme.fg), 4.5],
+    ['--chart-muted beam', unpack(theme.muted, beam), 3],
+    ['--color-ok', unpack(theme.ok), 3],
+    ['--color-warn', unpack(theme.warn), 3],
   ]);
   const plot = document.querySelector('.plot');
   if (plot === null) found.A7.push('no chart to check the chart colours against');
   else {
-    check(backdrop(plot), 'charts', [
-      ['--color-fg', theme.fg, 4.5],
-      ['--color-fg-muted', theme.fgMuted, 4.5],
-      ['--color-warn', theme.warn, 4.5],
-      ['--chart-muted', theme.muted, 3],
+    const panel = backdrop(plot);
+    check(panel, 'charts', [
+      ['--color-fg', unpack(theme.fg), 4.5],
+      ['--color-fg-muted', unpack(theme.fgMuted), 4.5],
+      ['--color-warn', unpack(theme.warn), 4.5],
+      ['--chart-muted', unpack(theme.muted), 3],
     ]);
+    // "REJECTING" is warn text drawn inside its own translucent warn band.
+    const warnBand = over(unpack(theme.warn, band), panel);
+    check(warnBand, 'REJECTING band', [['--color-warn', unpack(theme.warn), 4.5]]);
   }
 
   // A2 and A8: page-text scans. "CI" is case-sensitive so "ci" in words cannot match.

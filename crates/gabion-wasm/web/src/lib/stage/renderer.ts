@@ -18,7 +18,7 @@
 import { gsap } from 'gsap';
 import { Application, Container, Graphics } from 'pixi.js';
 import type { ClusterState, SimEvent } from '../sim/types';
-import type { Theme } from '../theme';
+import { BEAM_ALPHA, type Theme } from '../theme';
 import {
   DOT_THRESHOLD,
   fitTransform,
@@ -559,7 +559,7 @@ export class StageRenderer {
 
       if (this.#reduceMotion) {
         // No flight: a static edge fading over its lifetime — a diff, not travel.
-        const alpha = (beam.dropped ? 0.3 : 0.8) * (1 - age / duration);
+        const alpha = (beam.dropped ? 0.3 : BEAM_ALPHA) * (1 - age / duration);
         g.moveTo(beam.a.x, beam.a.y)
           .lineTo(beam.b.x, beam.b.y)
           .stroke({ width: beam.width, color, alpha, cap: 'round' });
@@ -580,7 +580,7 @@ export class StageRenderer {
       const fadeIn = clamp01(tip / (end * BEAM_FADE_IN));
       const base = beam.dropped
         ? 0.7 * (1 - tip / end)
-        : 0.8 * clamp01((end - tip) / (end * BEAM_FADE_OUT));
+        : BEAM_ALPHA * clamp01((end - tip) / (end * BEAM_FADE_OUT));
       const alpha = base * fadeIn;
       if (detail) {
         // Full comet, back to front: glow, then soft wake, then the crisp head.
