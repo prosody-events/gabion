@@ -7,8 +7,7 @@
 //! - [`identity`] — `NodeIdentity` derivation at startup.
 //! - [`admin`] — a single admin HTTP endpoint backed by the gossip
 //!   `AdminCommand` channel.
-//! - This module — `SharedLimiter`, the gRPC service trait impl, and Envoy
-//!   descriptor mapping.
+//! - This module — `SharedLimiter`, the gRPC service trait impl, and admission.
 //!
 //! Hit semantics are **read-then-record**: each descriptor is evaluated against
 //! the current aggregate window, and only allowed descriptors record hits into
@@ -195,6 +194,7 @@ impl<C: Count> SharedLimiter<C> {
         // shares the descriptor's domain and entries.
         let mut key_hash = None;
         let mut tightest: Option<Quota> = None;
+        let mut overflowed = false;
         for rule in self.rule_table.matching(domain, entries.clone()) {
             let key_hash = *key_hash.get_or_insert_with(|| hash_key(domain, entries.clone()));
             let spec = rule.spec();
@@ -216,18 +216,20 @@ impl<C: Count> SharedLimiter<C> {
                 ),
             };
             tightest = Some(pick_min_remaining(tightest, candidate));
-            if planned.len() == max_matched {
-                // Allow by default (CLAUDE.md): the bound is gabion's own, so
-                // the request goes through and the rest of its rules
-                // under-count.
-                self.note_matched_overflow(domain);
-                break;
+            // Allow by default (CLAUDE.md): rules past the bound are checked
+            // but not counted, as in NGINX.
+            if planned.len() < max_matched {
+                planned.push(Planned {
+                    fingerprint: spec.fingerprint,
+                    bucket: spec.bucket_at(now_millis),
+                    limit: spec.limit,
+                });
+            } else {
+                overflowed = true;
             }
-            planned.push(Planned {
-                fingerprint: spec.fingerprint,
-                bucket: (now_millis / spec.bucket_millis) as BucketEpoch,
-                limit: spec.limit,
-            });
+        }
+        if overflowed {
+            self.note_matched_overflow(domain);
         }
         if let Some(key_hash) = key_hash {
             for hit in planned.iter() {
@@ -242,7 +244,7 @@ impl<C: Count> SharedLimiter<C> {
                 match recorded {
                     Ok(()) => {}
                     Err(TryRecordError::Full) => self.note_request_queue_full(),
-                    Err(error @ TryRecordError::ShutDown) => self.note_gossip_record_failure(error),
+                    Err(TryRecordError::ShutDown) => self.note_gossip_record_failure(),
                 }
             }
         }
@@ -293,18 +295,16 @@ impl<C: Count> SharedLimiter<C> {
         Decision::Reject(RejectReason::Cardinality)
     }
 
-    fn note_gossip_record_failure(&self, error: TryRecordError) {
+    fn note_gossip_record_failure(&self) {
         if let Some(failed_total) = throttle::bump_shared(&self.warnings.gossip_record_failures) {
             tracing::warn!(
                 code = "gossip_record_failure",
-                %error,
                 failed_total,
-                "This node can no longer share rate-limit counts with the \
-                 rest of the cluster. Its limits have stopped counting: no \
-                 hits from this node or its peers reach the counts it \
-                 checks, so as their windows pass they allow traffic they \
-                 should reject. The gossip background task has stopped — \
-                 look for an earlier error log entry to find out why.",
+                "This node can no longer share rate-limit counts with the rest of the cluster. \
+                 Its limits have stopped counting: no hits from this node or its peers reach the \
+                 counts it checks, so as their windows pass they allow traffic they should \
+                 reject. The gossip background task has stopped — look for an earlier error log \
+                 entry to find out why.",
             );
         }
     }

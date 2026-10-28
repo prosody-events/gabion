@@ -14,8 +14,7 @@ use crate::crdt::{Count, DeltaSink, ExpirationSink};
 /// the caller-side short-circuit decides whether to read them).
 ///
 /// `&self` so a cloneable handle (`Arc<Aggregate>`) can be shared between the
-/// runtime (writer) and the read path. Backends use interior mutability:
-/// seqlocked atomics.
+/// runtime (writer) and the read path.
 ///
 /// Apply order contract: implementations should fold deltas first, then
 /// expirations. The two arms producing rows today cannot produce both in the

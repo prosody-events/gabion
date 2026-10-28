@@ -155,7 +155,7 @@ impl BindingCompiler for NopBindingCompiler {
         compile_inline(source)
             .or_else(|| compile_single_variable(source, 0))
             .ok_or_else(|| RuleConfigError::UnsupportedBinding {
-                spec: source.to_string(),
+                spec: source.into(),
             })
     }
 }
@@ -208,6 +208,10 @@ pub fn is_zone_name(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
+const BINDING_EXPECTED: &str = "expected `$variable`, `name:$variable`, or one of `rate=`, \
+                                `window=`, `bucket=`, `mode=`, `dry_run`, `except_if=`, \
+                                `domain=`, `value=`";
+
 /// Parse a positional descriptor binding argument. Accepts:
 /// - `$uri` → key="uri", source="$uri" (auto-keyed; only when the source is a
 ///   single legal `$identifier`)
@@ -228,16 +232,10 @@ pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
                 value: "*".into(),
             });
         }
-        return Err(
-            "expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, \
-             `mode=`, `dry_run`, `except_if=`, `domain=`",
-        );
+        return Err(BINDING_EXPECTED);
     }
     let Some((key, source)) = rest.split_once(':') else {
-        return Err(
-            "expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, \
-             `mode=`, `dry_run`, `except_if=`, `domain=`",
-        );
+        return Err(BINDING_EXPECTED);
     };
     if source.is_empty() {
         return Err("binding source after `:` is empty; supply a `$variable` or template");
@@ -258,9 +256,10 @@ pub fn parse_binding(rest: &str) -> Result<DescriptorBinding, &'static str> {
 /// `rate=` carries the sustained allowance, `window=` widens the time
 /// horizon (defaults to the rate's period), and `bucket=` controls the
 /// granularity inside the window (defaults to the window). `value=KEY:LITERAL`
-/// makes the binding keyed `KEY` match only `LITERAL`. Every syntax error is
-/// reported here, at the directive's line; the rule itself is validated when
-/// [`CompiledRules::compile_with`] builds it, once every setting is read.
+/// makes the binding keyed `KEY` match only `LITERAL`. Argument syntax is
+/// reported here, at the directive's line; key grammar, durations and
+/// identity when the rule is built by [`CompiledRules::compile_with`], once
+/// every setting is read.
 pub fn parse_rule_directive(args: &[&str]) -> Result<RuleConfig, RuleArgError> {
     let Some((&name, args)) = args.split_first() else {
         return Err(RuleArgError::MissingName);
@@ -275,6 +274,7 @@ pub fn parse_rule_directive(args: &[&str]) -> Result<RuleConfig, RuleArgError> {
     let mut values = Vec::new();
     let mut rate = None;
     let mut mode = None;
+    let mut dry_run = false;
     for &arg in args {
         // `window=` and `bucket=` must parse as durations here; a zero one
         // is refused when the rule is built, in the words gabiond uses too.
@@ -282,10 +282,7 @@ pub fn parse_rule_directive(args: &[&str]) -> Result<RuleConfig, RuleArgError> {
             humantime::parse_duration(rest).map_err(|_| invalid(arg, expected))
         };
         if arg == "dry_run" {
-            if mode.is_some_and(|mode| mode != EnforcementMode::DryRun) {
-                return Err(RuleArgError::DryRunConflict { rule: name.into() });
-            }
-            mode = Some(EnforcementMode::DryRun);
+            dry_run = true;
         } else if let Some(rest) = arg.strip_prefix("rate=") {
             parse_rate(rest).map_err(|reason| invalid(arg, reason))?;
             rate = Some(rest);
@@ -328,6 +325,9 @@ pub fn parse_rule_directive(args: &[&str]) -> Result<RuleConfig, RuleArgError> {
             bindings.push(parse_binding(arg).map_err(|reason| invalid(arg, reason))?);
         }
     }
+    if dry_run && mode.is_some_and(|m| m != EnforcementMode::DryRun) {
+        return Err(RuleArgError::DryRunConflict { rule: name.into() });
+    }
     let Some(rate) = rate else {
         return Err(RuleArgError::MissingRate { rule: name.into() });
     };
@@ -347,7 +347,11 @@ pub fn parse_rule_directive(args: &[&str]) -> Result<RuleConfig, RuleArgError> {
         rate: rate.into(),
         window,
         bucket,
-        mode: mode.unwrap_or_default(),
+        mode: if dry_run {
+            EnforcementMode::DryRun
+        } else {
+            mode.unwrap_or_default()
+        },
         except_if,
     })
 }
@@ -410,7 +414,7 @@ impl CompiledRules {
                 .map_err(|err| RuleConfigError::CompileBinding {
                     rule: rule.into(),
                     spec: source.into(),
-                    message: err.to_string(),
+                    message: err.to_string().into(),
                 })
         };
         let rules = configs
@@ -454,15 +458,15 @@ pub enum RuleConfigError {
          run `nginx -t`."
     )]
     CompileBinding {
-        rule: String,
-        spec: String,
-        message: String,
+        rule: Box<str>,
+        spec: Box<str>,
+        message: Box<str>,
     },
     #[error(
         "binding source `{spec}` is not supported by the test compiler; use a `$identifier` form \
          or build with the `ngx-module` feature"
     )]
-    UnsupportedBinding { spec: String },
+    UnsupportedBinding { spec: Box<str> },
 }
 
 #[cfg(test)]

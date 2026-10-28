@@ -1,4 +1,5 @@
-//! Test-only stand-in for the zone nginx maps.
+//! Test-only stand-in for the zone nginx maps, and a leader-writer seed for
+//! its aggregate.
 
 use super::{Layout, ShmRegion};
 
@@ -45,10 +46,7 @@ pub(crate) fn seed(
     use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink};
     use gabion::gossip::AggregateStore;
     let deltas = DeltaSink {
-        handles: vec![CellHandle {
-            index: 0,
-            generation: 0,
-        }],
+        handles: vec![CellHandle::default()],
         keys: vec![CellIdentity {
             rule_fingerprint: fingerprint,
             key_hash,

@@ -85,3 +85,13 @@ fn a_new_leader_never_reuses_a_sequence() {
     lead(&ShmAggregateStore::new(region), 2);
     assert!(next_seq() > issued);
 }
+
+/// A write the full table drops is counted where operators read it.
+#[test]
+fn a_full_zone_counts_aggregate_dropped() {
+    let (_zone, region, store) = table(2);
+    for key in 0..3 {
+        crate::shm::mock::seed(&store, 1, KeyHash(key), 0, 1);
+    }
+    assert_eq!(region.stats().snapshot().aggregate_dropped, 1);
+}

@@ -8,11 +8,7 @@ use crate::mock::with_logs;
 
 /// An empty table of `capacity` slots.
 fn aggregate(capacity: usize) -> Aggregate {
-    Aggregate {
-        slots: (0..capacity).map(|_| AggregateSlot::empty()).collect(),
-        write_seq: std_atomic::AtomicU64::new(2),
-        dropped: std_atomic::AtomicU64::new(0),
-    }
+    Aggregate::with_capacity(capacity)
 }
 
 fn writer(aggregate: &Aggregate) -> Writer<'_> {
@@ -120,10 +116,7 @@ fn aggregate_table_matches_model(ops: Vec<(u8, u8, bool)>) -> bool {
 /// One delta row of `delta` hits for `(1, 2, bucket)`.
 fn delta(bucket: BucketEpoch, delta: u32) -> DeltaSink<u32> {
     DeltaSink {
-        handles: vec![CellHandle {
-            index: 0,
-            generation: 0,
-        }],
+        handles: vec![CellHandle::default()],
         keys: vec![CellIdentity {
             rule_fingerprint: 1,
             key_hash: KeyHash(2),

@@ -2,7 +2,9 @@
 //! descriptor matching 1, 16 or 64 rules, with `storage.max_matched_rules` at
 //! 64, 95% of keys already counted and 5% new. The gossip runtime drains the
 //! request queue between batches, outside the timed section, as a running
-//! node's does between requests.
+//! node's does between requests; it folds into an aggregate of its own, so the
+//! table the limiter reads holds only the 50 hot tenants' seeded counts and a
+//! new tenant stays a miss.
 //!
 //! * `admission/matched_rules_95_5` — one decision; the cost per matched rule
 //!   stays flat as the bound grows, because the scratch it fills is reserved
@@ -14,10 +16,12 @@ use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use gabion::aggregate::Aggregate;
-use gabion::crdt::{CellStore, NodeId, NodeIdentity};
+use gabion::crdt::{
+    CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, NodeId, NodeIdentity,
+};
 use gabion::gossip::sim::SimRouter;
-use gabion::gossip::{GossipClient, GossipRuntime, TokioClock};
-use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
+use gabion::gossip::{AggregateStore, GossipClient, GossipRuntime, TokioClock};
+use gabion::rules::{Descriptor, EnforcementMode, RuleDef, RuleTable, hash_key};
 use gabion::settings::Settings;
 use gabion_server::{RateLimitDescriptor, SharedLimiter, rate_limit_descriptor};
 use tokio::runtime::Runtime;
@@ -42,6 +46,7 @@ struct Node {
     local: LocalSet,
     limiter: SharedLimiter<u32>,
     client: GossipClient<u32>,
+    hot: Vec<RateLimitDescriptor>,
 }
 
 impl Node {
@@ -69,7 +74,30 @@ impl Node {
             })
             .collect();
         let table = Arc::new(RuleTable::new(built, None).expect("table"));
+        let hot: Vec<String> = (0..50).map(|i| format!("hot-{i}")).collect();
+        let mut deltas = DeltaSink::<u32>::default();
+        for rule in table.rules() {
+            for tenant in &hot {
+                deltas.handles.push(CellHandle::default());
+                deltas.keys.push(CellIdentity {
+                    rule_fingerprint: rule.fingerprint,
+                    key_hash: hash_key(
+                        "api",
+                        [Descriptor {
+                            key: "tenant",
+                            value: tenant,
+                        }],
+                    ),
+                    bucket: 0,
+                });
+                deltas.previous.push(0);
+                deltas.current.push(1);
+                deltas.deltas.push(1);
+                deltas.applies_locally.push(1);
+            }
+        }
         let counts = Arc::new(Aggregate::new(&storage));
+        counts.apply(&deltas, &ExpirationSink::default());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .start_paused(true)
@@ -82,7 +110,7 @@ impl Node {
                 TokioClock::from_millis(0),
                 gossip,
                 CellStore::<u32>::new(storage, NodeIdentity::new(NodeId(1), 1), &table),
-                counts.clone(),
+                Arc::new(Aggregate::new(&storage)),
             )
         });
         local.spawn_local(gossip_rt.run(futures::stream::empty()));
@@ -92,6 +120,7 @@ impl Node {
             local,
             limiter,
             client,
+            hot: hot.into_iter().map(descriptor).collect(),
         }
     }
 
@@ -109,9 +138,7 @@ fn bench_admission(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     for rules in [1_u16, 16, 64] {
         let node = Node::new(rules);
-        let hot: Vec<RateLimitDescriptor> =
-            (0..50).map(|i| descriptor(format!("hot-{i}"))).collect();
-        let mut fresh = 0_u64;
+        let mut seq = 0_u64;
         group.bench_function(BenchmarkId::new("matched_rules_95_5", rules), |b| {
             b.iter_custom(|iters| {
                 let mut elapsed = Duration::ZERO;
@@ -120,12 +147,12 @@ fn bench_admission(c: &mut Criterion) {
                     let batch = left.min((QUEUED_HITS / u64::from(rules)).max(1));
                     // Built outside the timed section: 5% new tenants.
                     let requests: Vec<RateLimitDescriptor> = (0..batch)
-                        .map(|i| {
-                            if i % 20 == 0 {
-                                fresh += 1;
-                                descriptor(format!("new-{fresh}"))
+                        .map(|_| {
+                            seq += 1;
+                            if seq.is_multiple_of(20) {
+                                descriptor(format!("new-{seq}"))
                             } else {
-                                hot[i as usize % hot.len()].clone()
+                                node.hot[seq as usize % node.hot.len()].clone()
                             }
                         })
                         .collect();

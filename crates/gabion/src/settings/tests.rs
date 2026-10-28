@@ -70,6 +70,16 @@ fn zero_is_not_positive() {
          between heartbeats. Remove the setting to use the default, 500ms, or set a positive \
          value (`GABION_GOSSIP_TICK_INTERVAL`; NGINX `gabion_gossip_tick_interval`)."
     );
+    assert_eq!(
+        applied(Setting::StorageRuleDictionaryCapacity, "0")
+            .unwrap_err()
+            .to_string(),
+        "`storage.rule_dictionary_capacity` is 0, but it must be at least 1: gabion could not \
+         register any rate-limit rule; the default is twice the configured rules, at least 256. \
+         Remove the setting to use the default, or set a positive value \
+         (`GABION_STORAGE_RULE_DICTIONARY_CAPACITY`; NGINX \
+         `gabion_storage_rule_dictionary_capacity`)."
+    );
 }
 
 #[test]
@@ -292,6 +302,16 @@ fn capacity_outside_its_range_fails() {
          Set it inside that range (`GABION_GOSSIP_LIMIT_QUEUE_CAPACITY`; NGINX \
          `gabion_gossip_limit_queue_capacity`). It may be 64 to 1,048,576; each slot is 72 bytes \
          of the NGINX zone (72 MiB at the ceiling), so raise SIZE in `gabion_limit_zone` with it."
+    );
+    assert_eq!(
+        capacity(Setting::StorageRuleDictionaryCapacity, 65_535)
+            .unwrap_err()
+            .to_string(),
+        "`storage.rule_dictionary_capacity` is 65535; gabion supports 1 to 65534. Set it inside \
+         that range (`GABION_STORAGE_RULE_DICTIONARY_CAPACITY`; NGINX \
+         `gabion_storage_rule_dictionary_capacity`). Its slots are numbered by a `u16` whose \
+         largest value marks an empty slot, so it holds at most 65,534 rules. Remove it to use \
+         the default, twice the configured rules and at least 256."
     );
 }
 

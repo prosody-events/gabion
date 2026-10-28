@@ -1004,7 +1004,7 @@ sequenceDiagram
     App->>Store: ingest_local(&batch, &mut sink)
     Note over Store: assert_consistent()
     loop i = 0..batch.len()
-        Store->>Store: rule_slot = intern_rule(batch.rule_fingerprints[i])
+        Store->>Store: rule_slot = rule_slot_for(batch.rule_fingerprints[i])
         Store->>Store: upsert(UpsertSpec { rule_slot, key, bucket,
                               origin_slot = local_node_slot,
                               incarnation = local_incarnation,
@@ -1394,10 +1394,10 @@ When a peer has not been interned because the table was full, the runtime falls 
 `expire(current_epoch_by_rule, live_buckets, sink)` sweeps the active set and frees any cell whose bucket has aged out. The keep rule is:
 
 ```
-keep if buckets[slot] + live_buckets[rule] >= current_epoch_by_rule[rule]
+keep if (current_epoch_by_rule[rule] - buckets[slot]) mod 2^32, read as signed, <= live_buckets[rule]
 ```
 
-A cell is kept while its bucket plus the rule's live window covers the current epoch. Cells in older buckets are emitted into the `ExpirationSink` and then freed via `free_cell_at`. Both input slices are indexed by `RuleSlot`, and out-of-range slot indices — a rule whose dictionary slot lies beyond either array — are silently skipped, so the caller's array shape governs which rules participate.
+It holds across the `u32` wrap because `RuleDef::build` keeps a window under 2^31 buckets. A cell is kept while its serial age is at most the rule's live buckets. Cells in older buckets are emitted into the `ExpirationSink` and then freed via `free_cell_at`. Both input slices are indexed by `RuleSlot`, and out-of-range slot indices — a rule whose dictionary slot lies beyond either array — are silently skipped, so the caller's array shape governs which rules participate.
 
 The emission order matters. `expire` calls `emit_expiration(sink, slot)` before `free_cell_at(slot)`, because `emit_expiration` needs the rule descriptor to construct the portable `CellIdentity` (the rule's fingerprint) and to read `applies_locally`, whereas `free_cell_at` decrements the rule's refcount and may drop the descriptor entirely. The emit-then-free order keeps the fingerprint lookup live for the row that needs it.
 
@@ -1434,7 +1434,7 @@ A small concrete sequence that ties the previous sections together.
 
 **Step 3 — bucket 42 expires.**
 
-- `expire_at(now)` computes `current_epoch_by_rule[R1] = 44` and `live_buckets[R1] = 1`. For slot 0, `buckets[0] = 42` and `42 + 1 < 44` → expired.
+- `expire_at(now)` computes `current_epoch_by_rule[R1] = 44` and `live_buckets[R1] = 1`. For slot 0, `buckets[0] = 42` and `44 - 42 = 2 > 1` → expired.
 - `emit_expiration(sink, 0)` pushes one `ExpirationSink` row: `(handle {0,1}, CellIdentity { R1_fingerprint, K, 42 }, last_count=6, last_update_millis=…, applies_locally=true)`. The rule descriptor is still live for the lookup.
 - `free_cell_at(0)` removes from `CellIndex`, decrements rule and node refcounts, calls `free_slot(0)`.
 - `generations[0]` goes from 1 → 2 (inactive, ABA tag now 1).

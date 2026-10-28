@@ -10,10 +10,6 @@ use gabion::gossip::AggregateStore;
 
 use super::ShmRegion;
 
-/// `AggregateStore<u32>` implementation backed by SHM. Only the gossip
-/// leader's thread owns one of these; readers use `AggregateTable`
-/// directly.
-///
 /// Every slot is an atomic, so a second writer could not cause undefined
 /// behaviour, only wrong counts; the gossip leader lease keeps the writer
 /// single across processes.

@@ -17,11 +17,10 @@ pub const STORAGE_MAX_DESCRIPTOR_BYTES: usize = 512;
 pub const STORAGE_MAX_KEY_BYTES: usize = 128;
 
 /// Default of `storage.max_matched_rules`, the most rules one request is
-/// counted against. A request that matches more is **allowed** and the rest
-/// under-count: gabiond checks one rule past the bound, stops, and logs
-/// `matched_rule_overflow`; NGINX still checks every rule but queues counts
-/// for only the first this-many and bumps the SHM `matched_rule_overflows`
-/// counter.
+/// counted against. Past the bound a request is still checked against every
+/// matched rule, and only the first this-many count it; the rest
+/// under-count. gabiond logs `matched_rule_overflow`; NGINX bumps the SHM
+/// `matched_rule_overflows` counter.
 pub const STORAGE_MAX_MATCHED_RULES: u16 = 16;
 
 /// Default of `storage.max_request_descriptors`, the most descriptors of one

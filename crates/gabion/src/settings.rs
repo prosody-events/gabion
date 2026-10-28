@@ -18,7 +18,7 @@ use std::num::{
 };
 use std::time::Duration;
 
-use crate::crdt::ValidStorageConfig;
+use crate::crdt::{MAX_DICTIONARY_CAPACITY, ValidStorageConfig};
 use crate::defaults;
 use crate::discovery::DiscoveryConfig;
 use crate::gossip::ValidGossipConfig;
@@ -344,7 +344,7 @@ impl Settings {
                 Setting::StorageRuleDictionaryCapacity,
                 self.rule_dictionary_capacity.map_or(1, |c| c.get().into()),
                 1,
-                65_534,
+                MAX_DICTIONARY_CAPACITY.into(),
                 "Its slots are numbered by a `u16` whose largest value marks an empty slot, so it \
                  holds at most 65,534 rules. Remove it to use the default, twice the configured \
                  rules and at least 256.",
@@ -353,7 +353,7 @@ impl Settings {
                 Setting::StorageNodeDictionaryCapacity,
                 u64::from(self.node_dictionary_capacity.get()),
                 1,
-                65_534,
+                MAX_DICTIONARY_CAPACITY.into(),
                 dictionary,
             ),
         ];

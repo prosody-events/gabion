@@ -62,12 +62,12 @@ async fn run() -> anyhow::Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
 
     let config = load_config()?;
-    let rule_table = Arc::new(config.rule_table()?);
+    let rule_table = Arc::new(config.rules);
     tracing::info!(
         gossip_bind = ?config.settings.gossip_bind,
         envoy_bind = ?config.settings.envoy_bind,
         admin_bind = ?config.settings.admin_bind,
-        rules_loaded = config.limits.len(),
+        rules_loaded = rule_table.rules().len(),
         max_keys = config.settings.max_cells,
         max_rules = rule_table.dictionary_capacity(),
         max_peer_instances = config.settings.node_dictionary_capacity,

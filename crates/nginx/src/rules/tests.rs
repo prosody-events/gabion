@@ -1,6 +1,7 @@
 use std::num::NonZeroU16;
 
 use gabion::crdt::{CellStore, NodeId, NodeIdentity};
+use gabion::defaults::{STORAGE_MAX_DESCRIPTOR_COUNT, STORAGE_MAX_KEY_BYTES};
 use gabion::rules::RateResolveError::{
     WindowShorterThanPeriod, WindowTooLong, ZeroBucket, ZeroWindow,
 };
@@ -52,10 +53,16 @@ fn parse_rule_directive_reports_argument_errors() {
         parse("r $uri"),
         Err(RuleArgError::MissingRate { rule: "r".into() })
     );
-    assert_eq!(
-        parse("r $uri rate=10r/s mode=enforce dry_run"),
-        Err(RuleArgError::DryRunConflict { rule: "r".into() })
-    );
+    for text in [
+        "r $uri rate=10r/s mode=enforce dry_run",
+        "r $uri rate=10r/s dry_run mode=enforce",
+    ] {
+        assert_eq!(
+            parse(text),
+            Err(RuleArgError::DryRunConflict { rule: "r".into() }),
+            "{text}"
+        );
+    }
     for arg in [
         "rate=0r/s",
         "rate=10r/fortnight",
@@ -113,122 +120,109 @@ fn is_zone_name_matches_nginx_grammar() {
 
 type Tune = fn(&mut Settings);
 
-/// Whether a refused rule failed with the expected variant.
-type Refusal = fn(&RuleError) -> bool;
-
 /// Every rule gabiond or NGINX refused on `main` is refused by the one
-/// library constructor, with the variant the operator's message names.
+/// library constructor, with the error the operator reads.
 #[test]
 fn rule_def_rejects_what_both_adapters_rejected() {
-    let many: String = (0..17).map(|i| format!(" k{i}:$v{i}")).collect();
+    let max_count = usize::from(STORAGE_MAX_DESCRIPTOR_COUNT);
+    let many: String = (0..=max_count).map(|i| format!(" k{i}:$v{i}")).collect();
     let many = format!("r{many} rate=10r/s");
-    let long_key = format!("r {}:$t rate=10r/s", "k".repeat(129));
+    let long = "k".repeat(STORAGE_MAX_KEY_BYTES + 1);
+    let long_key = format!("r {long}:$t rate=10r/s");
     let defaults: Tune = |_| {};
-    let rows: [(&[&str], Tune, Refusal); 13] = [
-        (&["r rate=10r/s"], defaults, |e| {
-            matches!(e, RuleError::NoDescriptors { .. })
-        }),
-        (&["r 9x:$t rate=10r/s"], defaults, |e| {
-            matches!(e, RuleError::InvalidKey { .. })
-        }),
-        (&["r $t rate=10r/s window=0s"], defaults, |e| {
-            matches!(
-                e,
-                RuleError::Window {
-                    source: ZeroWindow,
-                    ..
-                }
-            )
-        }),
-        (&["r $t rate=10r/s bucket=0s"], defaults, |e| {
-            matches!(
-                e,
-                RuleError::Window {
-                    source: ZeroBucket,
-                    ..
-                }
-            )
-        }),
-        (&["r $t rate=10r/s bucket=500us"], defaults, |e| {
-            matches!(
-                e,
-                RuleError::Window {
-                    source: ZeroBucket,
-                    ..
-                }
-            )
-        }),
-        (&["r $t rate=10r/s window=60d"], defaults, |e| {
-            matches!(
-                e,
-                RuleError::Window {
-                    source: WindowTooLong,
-                    ..
-                }
-            )
-        }),
-        (&["r $t rate=10r/m window=500ms"], defaults, |e| {
-            matches!(
-                e,
-                RuleError::Window {
-                    source: WindowShorterThanPeriod,
-                    ..
-                }
-            )
-        }),
-        (&[&many], defaults, |e| {
-            matches!(
-                e,
-                RuleError::TooManyDescriptors {
-                    count: 17,
-                    max: 16,
-                    ..
-                }
-            )
-        }),
-        (&[&long_key], defaults, |e| {
-            matches!(
-                e,
-                RuleError::KeyTooLong {
-                    bytes: 129,
-                    max: 128,
-                    ..
-                }
-            )
-        }),
-        (&["r $t rate=10r/s domain=a\u{7}b"], defaults, |e| {
-            matches!(e, RuleError::InvalidDomain { .. })
-        }),
-        (&["r $t rate=10r/s", "r $u rate=10r/s"], defaults, |e| {
-            matches!(e, RuleError::DuplicateRuleName { .. })
-        }),
+    let rule = || Box::<str>::from("r");
+    let window = |source| RuleError::Window {
+        rule: rule(),
+        source,
+    };
+    let rows: [(&[&str], Tune, RuleError); 13] = [
+        (
+            &["r rate=10r/s"],
+            defaults,
+            RuleError::NoDescriptors { rule: rule() },
+        ),
+        (
+            &["r 9x:$t rate=10r/s"],
+            defaults,
+            RuleError::InvalidKey {
+                rule: rule(),
+                key: "9x".into(),
+            },
+        ),
+        (&["r $t rate=10r/s window=0s"], defaults, window(ZeroWindow)),
+        (&["r $t rate=10r/s bucket=0s"], defaults, window(ZeroBucket)),
+        (
+            &["r $t rate=10r/s bucket=500us"],
+            defaults,
+            window(ZeroBucket),
+        ),
+        (
+            &["r $t rate=10r/s window=60d"],
+            defaults,
+            window(WindowTooLong),
+        ),
+        (
+            &["r $t rate=10r/m window=500ms"],
+            defaults,
+            window(WindowShorterThanPeriod),
+        ),
+        (
+            &[&many],
+            defaults,
+            RuleError::TooManyDescriptors {
+                rule: rule(),
+                count: max_count + 1,
+                max: max_count,
+            },
+        ),
+        (
+            &[&long_key],
+            defaults,
+            RuleError::KeyTooLong {
+                rule: rule(),
+                key: long.as_str().into(),
+                bytes: STORAGE_MAX_KEY_BYTES + 1,
+                max: STORAGE_MAX_KEY_BYTES,
+            },
+        ),
+        (
+            &["r $t rate=10r/s domain=a\u{7}b"],
+            defaults,
+            RuleError::InvalidDomain {
+                rule: rule(),
+                reason: "with whitespace or a control character",
+            },
+        ),
+        (
+            &["r $t rate=10r/s", "r $u rate=10r/s"],
+            defaults,
+            RuleError::DuplicateRuleName { name: rule() },
+        ),
         (
             &["r $t rate=10r/s", "s $t rate=20r/s dry_run"],
             defaults,
-            |e| matches!(e, RuleError::DuplicateRuleIdentity { .. }),
+            RuleError::DuplicateRuleIdentity {
+                first: rule(),
+                second: "s".into(),
+            },
         ),
         (
             &["r $t rate=10r/s", "s $u rate=10r/s"],
             |s| s.rule_dictionary_capacity = NonZeroU16::new(1),
-            |e| {
-                matches!(
-                    e,
-                    RuleError::TooManyRules {
-                        rules: 2,
-                        capacity: 1
-                    }
-                )
+            RuleError::TooManyRules {
+                rules: 2,
+                capacity: 1,
             },
         ),
     ];
     for (directives, tune, expected) in rows {
         let configs: Vec<RuleConfig> = directives.iter().map(|text| directive(text)).collect();
-        match CompiledRules::compile_with(&configs, &validated(tune).1, &mut NopBindingCompiler) {
-            Err(RuleConfigError::Rule(error)) => {
-                assert!(expected(&error), "{directives:?}: {error:?}")
-            }
-            other => panic!("{directives:?}: {other:?}"),
-        }
+        assert_eq!(
+            CompiledRules::compile_with(&configs, &validated(tune).1, &mut NopBindingCompiler)
+                .map(drop),
+            Err(RuleConfigError::Rule(expected)),
+            "{directives:?}"
+        );
     }
 }
 

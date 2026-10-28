@@ -18,7 +18,7 @@ use thiserror::Error;
 use twox_hash::xxhash3_128::{DEFAULT_SECRET_LENGTH, RawHasher, SecretBuffer};
 
 pub use crate::crdt::KeyHash;
-use crate::crdt::RuleDescriptor;
+use crate::crdt::{BucketEpoch, MAX_DICTIONARY_CAPACITY, RuleDescriptor};
 use crate::defaults::STORAGE_RULE_DICTIONARY_FLOOR;
 use crate::settings::Setting;
 
@@ -115,7 +115,8 @@ impl Rule {
     }
 
     /// The rule as the cell store interns it. [`RuleDef::build`] keeps the
-    /// window, and so the bucket, under `u32::MAX` milliseconds.
+    /// window under 2^32 ms and the bucket no longer than the window, so both
+    /// casts are lossless.
     pub fn descriptor(&self) -> RuleDescriptor {
         RuleDescriptor {
             fingerprint: self.fingerprint,
@@ -139,6 +140,14 @@ pub struct RuleSpec {
     pub bucket_millis: u64,
     pub window_millis: u64,
     pub live_buckets: u32,
+}
+
+impl RuleSpec {
+    /// The bucket epoch `now_millis` falls in: the one definition both
+    /// adapters record into and the aggregate reads from.
+    pub fn bucket_at(self, now_millis: u64) -> BucketEpoch {
+        (now_millis / self.bucket_millis) as BucketEpoch
+    }
 }
 
 /// One rule as an adapter writes it, before validation: the one input to
@@ -228,7 +237,7 @@ impl RuleDef<'_> {
             limit: resolved.limit.get(),
             window_millis: resolved.window_millis,
             bucket_millis: resolved.bucket_millis,
-            live_buckets: resolved.window_millis.div_ceil(resolved.bucket_millis) as u32,
+            live_buckets: resolved.live_buckets,
             mode: self.mode,
         })
     }
@@ -267,7 +276,7 @@ impl RuleTable {
     pub fn new(mut rules: Box<[Rule]>, capacity: Option<NonZeroU16>) -> Result<Self, RuleError> {
         let floor = const { NonZeroU16::new(STORAGE_RULE_DICTIONARY_FLOOR).unwrap() };
         let dictionary_capacity = capacity.unwrap_or_else(|| {
-            NonZeroU16::new((2 * rules.len()).min(MAX_RULES) as u16)
+            NonZeroU16::new((2 * rules.len()).min(usize::from(MAX_DICTIONARY_CAPACITY)) as u16)
                 .map_or(floor, |derived| derived.max(floor))
         });
         if rules.len() > usize::from(dictionary_capacity.get()) {
@@ -339,10 +348,6 @@ impl RuleTable {
     }
 }
 
-/// The most entries a rule dictionary holds: its slots are numbered by a
-/// `u16` whose largest value marks an empty slot.
-const MAX_RULES: usize = 65_534;
-
 /// Match a descriptor key against `[A-Za-z_][A-Za-z0-9_.-]*`, the grammar
 /// both adapters accept, so equal rules produce equal identifiers.
 fn is_descriptor_key(s: &str) -> bool {
@@ -369,7 +374,7 @@ pub enum RuleError {
          rolls out. Remove the setting to use the default (twice the configured rules, at least \
          256), or raise it to at least {wanted}.",
         setting = Setting::StorageRuleDictionaryCapacity,
-        wanted = (2 * rules).min(MAX_RULES)
+        wanted = (2 * rules).min(usize::from(MAX_DICTIONARY_CAPACITY))
     )]
     TooManyRules { rules: usize, capacity: u16 },
     #[error(
@@ -516,7 +521,7 @@ impl fmt::Display for CardinalityLimit {
 
 // -- hashing ----------------------------------------------------------------
 
-pub fn hash_domain(domain: &str) -> KeyHash {
+fn hash_domain(domain: &str) -> KeyHash {
     let mut hasher = stable_hasher();
     hasher.write(b"gabion.domain.v1");
     hasher.write(&[0]);
@@ -648,6 +653,7 @@ struct ResolvedRate {
     limit: NonZeroU64,
     window_millis: u64,
     bucket_millis: u64,
+    live_buckets: u32,
 }
 
 /// Reasons [`RuleDef::build`] can refuse a rule's (rate, window, bucket). Each
@@ -670,6 +676,12 @@ pub enum RateResolveError {
          `window`; omit it for one bucket per window"
     )]
     ZeroBucket,
+    #[error(
+        "the bucket is longer than the window, so a counted hit would outlive the window it \
+         counts toward. Use a bucket no longer than the window, or omit `bucket` for one bucket \
+         per window"
+    )]
+    BucketLongerThanWindow,
     #[error(
         "the window is longer than gabion tracks: under 49 days and fewer than 2,147,483,648 \
          buckets. Use a shorter window or a larger bucket"
@@ -718,9 +730,13 @@ fn resolve_rate(
     if bucket_millis == 0 {
         return Err(RateResolveError::ZeroBucket);
     }
+    if bucket_millis > window_millis {
+        return Err(RateResolveError::BucketLongerThanWindow);
+    }
+    let live_buckets = window_millis.div_ceil(bucket_millis);
     // Epochs are `u32` and compared by serial-number arithmetic, which holds
     // while a window spans fewer than 2^31 buckets.
-    if window_millis > u64::from(u32::MAX) || window_millis / bucket_millis >= 1 << 31 {
+    if window_millis > u64::from(u32::MAX) || live_buckets >= 1 << 31 {
         return Err(RateResolveError::WindowTooLong);
     }
     let limit = rate_count
@@ -735,6 +751,7 @@ fn resolve_rate(
         limit,
         window_millis,
         bucket_millis,
+        live_buckets: live_buckets as u32,
     })
 }
 

@@ -44,3 +44,33 @@ fn controls_fail_as_the_settings_table_fails() {
         }
     }
 }
+
+/// The watched rule goes through `RuleDef::build`, so a zero limit, window
+/// or bucket fails as an adapter's rule would.
+#[test]
+fn controls_fail_as_the_rule_constructor_fails() {
+    for config in [
+        SimConfig {
+            rule_limit: 0,
+            ..SimConfig::default()
+        },
+        SimConfig {
+            rule_window_ms: 0,
+            ..SimConfig::default()
+        },
+        SimConfig {
+            rule_bucket_ms: 0,
+            ..SimConfig::default()
+        },
+    ] {
+        let fields = (
+            config.rule_limit,
+            config.rule_window_ms,
+            config.rule_bucket_ms,
+        );
+        assert!(
+            matches!(config.validate(), Err(ConfigError::Rule(_))),
+            "{fields:?}"
+        );
+    }
+}

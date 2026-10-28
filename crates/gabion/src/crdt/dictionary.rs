@@ -8,6 +8,10 @@ use super::{BucketEpoch, Incarnation, NodeId, NodeSlot, RuleSlot};
 
 const EMPTY_DICT_SLOT: u16 = u16::MAX;
 
+/// The most entries a dictionary holds: its slots are numbered by a `u16`
+/// whose largest value marks an empty slot.
+pub(crate) const MAX_DICTIONARY_CAPACITY: u16 = EMPTY_DICT_SLOT - 1;
+
 /// Descriptor stored per interned rule slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuleDescriptor {
@@ -30,9 +34,8 @@ impl Default for RuleDescriptor {
         Self {
             fingerprint: 0,
             // Unknown wire-only rules still need a bounded lifetime. A zero
-            // bucket/window disables expiration in CellStore::expire_at, which
-            // lets stale peer cells accumulate forever when a node has not
-            // registered the rule locally.
+            // bucket has no epoch, so `expire_at` could not age the rule's
+            // cells.
             window_millis: 60_000,
             bucket_millis: 1_000,
             limit: 0,
@@ -49,9 +52,9 @@ impl RuleDescriptor {
 
     /// The bucket epoch `now_millis` falls in: `now_millis / bucket_millis`.
     /// The single source of truth for this floor used by both
-    /// [`super::CellStore::expire_at`] and the visualizer. Returns `0` for
-    /// a wire-only rule (`bucket_millis == 0`), matching the "never expire"
-    /// path in `expire_at`.
+    /// [`super::CellStore::expire_at`] and the visualizer. `0` for a zero
+    /// bucket, which no built rule has; only the visualizer's sizing reads it
+    /// before validation.
     pub fn current_epoch(&self, now_millis: u64) -> BucketEpoch {
         if self.bucket_millis == 0 {
             0
@@ -61,26 +64,14 @@ impl RuleDescriptor {
     }
 
     /// Number of live buckets in the window: `ceil(window_millis /
-    /// bucket_millis)`, at least 1. Returns `0` for a wire-only rule
-    /// (`bucket_millis == 0`); paired with [`Self::current_epoch`]'s `0`,
-    /// `expire_at` then reads `bucket + 0 >= 0` as "never expire" — so here
-    /// `0` means *unbounded*, not *none*.
+    /// bucket_millis)`, at least 1. `0` for a zero bucket, which no built
+    /// rule has; only the visualizer's sizing reads it before validation.
     pub fn live_buckets(&self) -> u32 {
         if self.bucket_millis == 0 {
             0
         } else {
             self.window_millis.div_ceil(self.bucket_millis).max(1)
         }
-    }
-
-    /// Oldest epoch still retained at `now_millis`:
-    /// `current_epoch(now) - live_buckets()`. A cell is kept while
-    /// `bucket >= oldest_live_epoch`, matching `expire_at`'s keep set. The
-    /// `saturating_sub(0)` for a wire-only rule yields `current`, i.e. retains
-    /// everything from epoch `current` downward — the unbounded behavior.
-    pub fn oldest_live_epoch(&self, now_millis: u64) -> BucketEpoch {
-        self.current_epoch(now_millis)
-            .saturating_sub(self.live_buckets())
     }
 }
 

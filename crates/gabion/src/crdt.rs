@@ -46,6 +46,7 @@ pub use dirty_ring::{DirtyEntry, DirtyRing};
 pub use io::{DeltaSink, ExpirationSink, Observation, ObservationBatch};
 pub use peer_frontier::PeerFrontierTable;
 
+pub(crate) use dictionary::MAX_DICTIONARY_CAPACITY;
 use dictionary::pow2_index_capacity_for;
 use dirty_ring::ring_entry_at;
 use hash::hash_compact_cell_key;
@@ -259,9 +260,10 @@ pub enum Expiry {
 // CellStore
 // ---------------------------------------------------------------------------
 
-/// The storage half of the validated settings: the cell store's capacities
-/// and the cardinality limits both adapters' admission enforces. Built only
-/// by [`crate::settings::Settings::validate`].
+/// The storage half of the validated settings: the cell store's capacities,
+/// the rule-dictionary override, the matched-rule bound, and the cardinality
+/// limits both adapters' admission enforces. Built only by
+/// [`crate::settings::Settings::validate`].
 #[derive(Clone, Copy, Debug)]
 pub struct ValidStorageConfig {
     pub(crate) cell_capacity: NonZeroU32,
@@ -525,35 +527,18 @@ impl<C: Count> CellStore<C> {
 
     // -- Rule registration --
 
-    /// Register a configured rule and **pin** it: the first registration holds
-    /// one persistent reference so the slot survives cell churn. Without the
-    /// pin, a configured rule's descriptor was released the moment its last
-    /// cell aged out (cell refs were the only refs), and the next hit
-    /// re-interned the [`RuleDescriptor::default()`] fallback — a 60 s window
-    /// with `applies_locally = false` — so the rule silently stopped expiring
-    /// on its real window and stopped counting locally. Cells interned via
-    /// gossip/local fallback (an *unconfigured*, wire-only rule) are not pinned
-    /// and still free when their cells expire, so stale peer rules can't
-    /// accumulate. Re-registering an already-known rule refreshes its
-    /// descriptor without adding a second pin.
-    ///
-    /// [`Self::new`] interns every configured rule before any runtime exists,
-    /// so the pin always lands on a fresh slot.
+    /// Intern and pin a configured rule: the pin keeps its slot, real window
+    /// and `applies_locally` through cell churn, where a wire-only rule's slot
+    /// frees with its last cell. Only [`Self::new`] calls it, on a fresh
+    /// dictionary.
     pub(crate) fn intern_rule(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
-        let already_known = self.rule_dictionary.find(descriptor.fingerprint).is_some();
-        let result = self.rule_dictionary.intern(descriptor);
-        match result {
-            Some(slot) => {
-                if !already_known {
-                    self.rule_dictionary.inc_ref(slot);
-                }
-                Some(slot)
-            }
-            None => {
-                self.note_rule_dictionary_full(descriptor.fingerprint);
-                None
-            }
-        }
+        debug_assert!(
+            self.rule_dictionary.find(descriptor.fingerprint).is_none(),
+            "a configured rule is interned once"
+        );
+        let slot = self.rule_dictionary.intern(descriptor)?;
+        self.rule_dictionary.inc_ref(slot);
+        Some(slot)
     }
 
     // -- Capacity-pressure warnings -----------------------------------------
@@ -587,9 +572,10 @@ impl<C: Count> CellStore<C> {
                 in_use = self.rule_dictionary.len(),
                 rule_fingerprint = %format!("{:032x}", rule_fingerprint),
                 config_key = Setting::StorageRuleDictionaryCapacity.yaml_key(),
-                "Too many distinct rate-limit rules are in flight. New rules cannot be \
-                 registered on this node, so requests they match are allowed and their limits \
-                 under-count here. Usually more rules are live across the cluster than the \
+                "A rate-limit rule this node does not configure, gossiped by a peer or \
+                 recorded by a worker still on an earlier configuration, found the rule \
+                 dictionary full, so this node drops its hits and that rule under-counts across \
+                 the cluster. Usually more rules are live across the cluster than the \
                  dictionary holds, for example during a configuration rollout. The default is \
                  twice the configured rules, at least 256; set {} only above that.",
                 Setting::StorageRuleDictionaryCapacity,

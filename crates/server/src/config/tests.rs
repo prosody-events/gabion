@@ -62,7 +62,7 @@ fn defaults_apply_when_neither_yaml_nor_env_set_a_value() {
     let cfg = AppConfig::load(None).expect("load with neither yaml nor env");
 
     assert_eq!(cfg.settings, Settings::default());
-    assert!(cfg.limits.is_empty());
+    assert!(cfg.rules.rules().is_empty());
 }
 
 #[test]
@@ -350,8 +350,7 @@ fn rate_only_yaml_infers_window_and_bucket() {
          10r/m\n",
     )
     .expect("yaml parses");
-    let table = cfg.rule_table().expect("rule table");
-    let spec = table.rules().first().expect("one rule").spec();
+    let spec = cfg.rules.rules().first().expect("one rule").spec();
     assert_eq!(spec.limit, 10);
     assert_eq!(spec.window_millis, 60_000);
     assert_eq!(spec.bucket_millis, 60_000);
@@ -366,8 +365,7 @@ fn explicit_window_scales_limit_up() {
          10r/s\n    window: 5h\n",
     )
     .expect("yaml parses");
-    let table = cfg.rule_table().expect("rule table");
-    let spec = table.rules().first().expect("one rule").spec();
+    let spec = cfg.rules.rules().first().expect("one rule").spec();
     assert_eq!(spec.limit, 10 * 5 * 3600);
     assert_eq!(spec.window_millis, 5 * 3600 * 1_000);
     // bucket defaults to the resolved window: one fixed-window bucket.
@@ -383,8 +381,7 @@ fn explicit_window_and_bucket_set_live_buckets() {
          10r/s\n    window: 5h\n    bucket: 1h\n",
     )
     .expect("yaml parses");
-    let table = cfg.rule_table().expect("rule table");
-    let spec = table.rules().first().expect("one rule").spec();
+    let spec = cfg.rules.rules().first().expect("one rule").spec();
     assert_eq!(spec.limit, 10 * 5 * 3600);
     assert_eq!(spec.bucket_millis, 3600 * 1_000);
     assert_eq!(spec.live_buckets, 5);
@@ -398,8 +395,7 @@ fn bucket_defaults_to_window_when_omitted() {
          10r/m\n",
     )
     .expect("yaml parses");
-    let table = cfg.rule_table().expect("rule table");
-    let spec = table.rules().first().expect("one rule").spec();
+    let spec = cfg.rules.rules().first().expect("one rule").spec();
     assert_eq!(spec.bucket_millis, 60_000);
     assert_eq!(spec.live_buckets, 1);
 }
@@ -412,8 +408,7 @@ fn explicit_bucket_overrides_window() {
          10r/m\n    bucket: 1s\n",
     )
     .expect("yaml parses");
-    let table = cfg.rule_table().expect("rule table");
-    let spec = table.rules().first().expect("one rule").spec();
+    let spec = cfg.rules.rules().first().expect("one rule").spec();
     assert_eq!(spec.bucket_millis, 1_000);
     assert_eq!(spec.live_buckets, 60);
 }
@@ -493,151 +488,113 @@ fn limit(name: &str, fields: &[(&str, &str)]) -> String {
     format!("  - name: {name}\n{fields}")
 }
 
-/// Whether a refused rule failed with the expected variant.
-type Refusal = fn(&RuleError) -> bool;
-
 /// Every rule gabiond or NGINX refused on `main` is refused by the one
-/// library constructor, with the variant the operator's message names.
+/// library constructor, with the error the operator reads.
 #[test]
 fn rule_def_rejects_what_both_adapters_rejected() {
+    use gabion::defaults::{STORAGE_MAX_DESCRIPTOR_COUNT, STORAGE_MAX_KEY_BYTES};
     use gabion::rules::RateResolveError::{
         WindowShorterThanPeriod, WindowTooLong, ZeroBucket, ZeroWindow,
     };
+    use gabion::rules::parse_rate;
     let _env = EnvGuard::lock();
-    let many: String = (0..17).map(|i| format!("{{ key: k{i} }},")).collect();
+    let max_count = usize::from(STORAGE_MAX_DESCRIPTOR_COUNT);
+    let many: String = (0..=max_count)
+        .map(|i| format!("{{ key: k{i} }},"))
+        .collect();
     let many = format!("[{many}]");
-    let long_key = format!("[{{ key: {} }}]", "k".repeat(129));
-    let rows: [(&str, String, Refusal); 16] = [
+    let long = "k".repeat(STORAGE_MAX_KEY_BYTES + 1);
+    let long_key = format!("[{{ key: {long} }}]");
+    let rule = || Box::<str>::from("r");
+    let window = |source| RuleError::Window {
+        rule: rule(),
+        source,
+    };
+    let rate = |text| RuleError::Rate {
+        rule: rule(),
+        reason: parse_rate(text).unwrap_err(),
+    };
+    let yaml = |entries: String| format!("limits:\n{entries}");
+    let rows: [(String, RuleError); 16] = [
         (
-            "no descriptors",
-            limit("r", &[("descriptors", "[]")]),
-            |e| matches!(e, RuleError::NoDescriptors { .. }),
+            yaml(limit("r", &[("descriptors", "[]")])),
+            RuleError::NoDescriptors { rule: rule() },
         ),
         (
-            "bad key",
-            limit("r", &[("descriptors", "[{ key: 9x }]")]),
-            |e| matches!(e, RuleError::InvalidKey { .. }),
-        ),
-        ("zero window", limit("r", &[("window", "0s")]), |e| {
-            matches!(
-                e,
-                RuleError::Window {
-                    source: ZeroWindow,
-                    ..
-                }
-            )
-        }),
-        ("zero bucket", limit("r", &[("bucket", "0s")]), |e| {
-            matches!(
-                e,
-                RuleError::Window {
-                    source: ZeroBucket,
-                    ..
-                }
-            )
-        }),
-        ("sub-ms bucket", limit("r", &[("bucket", "500us")]), |e| {
-            matches!(
-                e,
-                RuleError::Window {
-                    source: ZeroBucket,
-                    ..
-                }
-            )
-        }),
-        ("long window", limit("r", &[("window", "60d")]), |e| {
-            matches!(
-                e,
-                RuleError::Window {
-                    source: WindowTooLong,
-                    ..
-                }
-            )
-        }),
-        (
-            "short window",
-            limit("r", &[("rate", "10r/m"), ("window", "500ms")]),
-            |e| {
-                matches!(
-                    e,
-                    RuleError::Window {
-                        source: WindowShorterThanPeriod,
-                        ..
-                    }
-                )
+            yaml(limit("r", &[("descriptors", "[{ key: 9x }]")])),
+            RuleError::InvalidKey {
+                rule: rule(),
+                key: "9x".into(),
             },
         ),
-        ("zero rate", limit("r", &[("rate", "0r/s")]), |e| {
-            matches!(e, RuleError::Rate { .. })
-        }),
-        ("sub-ms rate", limit("r", &[("rate", "10r/500us")]), |e| {
-            matches!(e, RuleError::Rate { .. })
-        }),
+        (yaml(limit("r", &[("window", "0s")])), window(ZeroWindow)),
+        (yaml(limit("r", &[("bucket", "0s")])), window(ZeroBucket)),
+        (yaml(limit("r", &[("bucket", "500us")])), window(ZeroBucket)),
         (
-            "unknown period",
-            limit("r", &[("rate", "10r/fortnight")]),
-            |e| matches!(e, RuleError::Rate { .. }),
+            yaml(limit("r", &[("window", "60d")])),
+            window(WindowTooLong),
         ),
         (
-            "too many descriptors",
-            limit("r", &[("descriptors", &many)]),
-            |e| {
-                matches!(
-                    e,
-                    RuleError::TooManyDescriptors {
-                        count: 17,
-                        max: 16,
-                        ..
-                    }
-                )
+            yaml(limit("r", &[("rate", "10r/m"), ("window", "500ms")])),
+            window(WindowShorterThanPeriod),
+        ),
+        (yaml(limit("r", &[("rate", "0r/s")])), rate("0r/s")),
+        (
+            yaml(limit("r", &[("rate", "10r/500us")])),
+            rate("10r/500us"),
+        ),
+        (
+            yaml(limit("r", &[("rate", "10r/fortnight")])),
+            rate("10r/fortnight"),
+        ),
+        (
+            yaml(limit("r", &[("descriptors", &many)])),
+            RuleError::TooManyDescriptors {
+                rule: rule(),
+                count: max_count + 1,
+                max: max_count,
             },
         ),
-        ("long key", limit("r", &[("descriptors", &long_key)]), |e| {
-            matches!(
-                e,
-                RuleError::KeyTooLong {
-                    bytes: 129,
-                    max: 128,
-                    ..
-                }
-            )
-        }),
-        ("bad domain", limit("r", &[("domain", "\"a b\"")]), |e| {
-            matches!(e, RuleError::InvalidDomain { .. })
-        }),
         (
-            "duplicate name",
-            limit("r", &[]) + &limit("r", &[("rate", "5r/s")]),
-            |e| matches!(e, RuleError::DuplicateRuleName { .. }),
+            yaml(limit("r", &[("descriptors", &long_key)])),
+            RuleError::KeyTooLong {
+                rule: rule(),
+                key: long.as_str().into(),
+                bytes: STORAGE_MAX_KEY_BYTES + 1,
+                max: STORAGE_MAX_KEY_BYTES,
+            },
         ),
         (
-            "duplicate identity",
-            limit("r", &[]) + &limit("s", &[("rate", "20r/s")]),
-            |e| matches!(e, RuleError::DuplicateRuleIdentity { .. }),
+            yaml(limit("r", &[("domain", "\"a b\"")])),
+            RuleError::InvalidDomain {
+                rule: rule(),
+                reason: "with whitespace or a control character",
+            },
         ),
         (
-            "too many rules",
-            limit("r", &[]) + &limit("s", &[("window", "2s")]),
-            |e| {
-                matches!(
-                    e,
-                    RuleError::TooManyRules {
-                        rules: 2,
-                        capacity: 1
-                    }
-                )
+            yaml(limit("r", &[]) + &limit("r", &[("rate", "5r/s")])),
+            RuleError::DuplicateRuleName { name: rule() },
+        ),
+        (
+            yaml(limit("r", &[]) + &limit("s", &[("rate", "20r/s")])),
+            RuleError::DuplicateRuleIdentity {
+                first: rule(),
+                second: "s".into(),
+            },
+        ),
+        (
+            "storage:\n  rule_dictionary_capacity: 1\n".to_owned()
+                + &yaml(limit("r", &[]) + &limit("s", &[("window", "2s")])),
+            RuleError::TooManyRules {
+                rules: 2,
+                capacity: 1,
             },
         ),
     ];
-    for (row, limits, expected) in rows {
-        let storage = if row == "too many rules" {
-            "storage:\n  rule_dictionary_capacity: 1\n"
-        } else {
-            ""
-        };
-        let cfg = AppConfig::load_with_yaml_str(&format!("{storage}limits:\n{limits}"))
-            .unwrap_or_else(|error| panic!("{row}: {error}"));
-        let error = cfg.rule_table().expect_err(row);
-        assert!(expected(&error), "{row}: {error:?}");
+    for (yaml, expected) in rows {
+        match AppConfig::load_with_yaml_str(&yaml) {
+            Err(ConfigError::Rule(error)) => assert_eq!(error, expected, "{yaml}"),
+            other => panic!("{yaml}: {other:?}"),
+        }
     }
 }

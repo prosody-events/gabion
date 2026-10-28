@@ -194,9 +194,9 @@ The concept is defined in the
 * `window:` (optional) — the time horizon. Defaults to the rate's
   period. Set it longer to scale the limit up to
   `floor(rate_count * window / period)`.
-* `bucket:` (optional) — granularity inside the window. Defaults to
-  the resolved window (one fixed-window bucket). Set smaller for
-  sliding-window-style enforcement.
+* `bucket:` (optional) — granularity inside the window, no longer than
+  the window. Defaults to the resolved window (one fixed-window bucket).
+  Set smaller for sliding-window-style enforcement.
 
 Worked example:
 
@@ -287,6 +287,7 @@ the entries below are `gabiond`'s own.
 | `` Rule `X` has an invalid rate: …. ``                                                                                         | The `rate:` string didn't parse, its count is zero, or its period is under 1 ms.                      | Write a count of at least 1 and a period of at least 1 ms: a unit (`s`, `m`, `h`, `d`) or a duration such as `500ms` or `5m`. A zero rate is refused because it would deny all traffic. |
 | `` Rule `X`: the window is shorter than the rate's period, so the rate cannot be spread over it. … for example `100r/500ms` ``   | An explicit `window:` was shorter than the rate's period; a window shorter than the rate's period has nothing to scale the rate over. | Move the period into the rate itself (`rate: 100r/500ms`) instead of pairing a short `window:` with a longer period.          |
 | `` Rule `X`: the window is longer than gabion tracks … ``                                                                      | The window is 49 days or more, or spans 2,147,483,648 buckets or more.                                 | Use a shorter `window:` or a larger `bucket:`.                                                                                |
+| `` Rule `X`: the bucket is longer than the window … ``                                                                         | `bucket:` is longer than the resolved window, so a counted hit would outlive the window it counts toward. | Use a `bucket:` no longer than the window, or omit it for one bucket per window.                                              |
 | `` Rule `X` has descriptor key `Y`, but keys must match `[A-Za-z_][A-Za-z0-9_.-]*` … ``                                         | A descriptor key uses an unsupported character.                                                        | Use identifier-like names. Underscore, dot, and dash are allowed inside; the first character must be a letter or underscore.  |
 | `` Rule `X` has a domain … ``                                                                                                  | `domain:` is empty, longer than 255 bytes, or holds whitespace or a control character.                 | Use 1 to 255 bytes with no whitespace, the same domain an NGINX twin of the rule names in `domain=`.                          |
 | `` Rule `X` has no descriptors … ``, `` Rule `X` has N descriptors, above … ``, `` Rule `X` has descriptor key `Y` of N bytes, above … `` | The rule has no `descriptors:`, more than `storage.max_descriptor_count`, or a key longer than `storage.max_key_bytes`. | Add a descriptor, or shorten the rule or raise the named setting.                                                             |
@@ -329,7 +330,7 @@ Message starts: "This node can no longer share rate-limit counts with the rest o
 
 **What to do next.** Look for an earlier error log entry that says why gossip stopped, fix that, and restart the pod.
 
-**Fields** `error`, `failed_total` · **Knob** none
+**Fields** `failed_total` · **Knob** none
 
 ### `matched_rule_overflow`
 

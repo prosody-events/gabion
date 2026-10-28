@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Stats {
     pub requests: AtomicU64,
     pub allowed: AtomicU64,
@@ -19,24 +19,6 @@ pub struct Stats {
     pub queue_drained: AtomicU64,
     pub queue_dropped: AtomicU64,
     pub aggregate_dropped: AtomicU64,
-}
-
-impl Default for Stats {
-    fn default() -> Self {
-        Self {
-            requests: AtomicU64::new(0),
-            allowed: AtomicU64::new(0),
-            rejected: AtomicU64::new(0),
-            rejected_cardinality: AtomicU64::new(0),
-            declines_invalid_descriptor: AtomicU64::new(0),
-            matched_rule_overflows: AtomicU64::new(0),
-            exempted: AtomicU64::new(0),
-            queue_pushed: AtomicU64::new(0),
-            queue_drained: AtomicU64::new(0),
-            queue_dropped: AtomicU64::new(0),
-            aggregate_dropped: AtomicU64::new(0),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,7 +76,7 @@ impl Stats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One per request that matched more rules than
+    /// One per allowed request whose allowed rules outnumbered
     /// `gabion_storage_max_matched_rules`; the request was still allowed and
     /// the rules past the bound under-count.
     pub fn record_matched_rule_overflow(&self) {

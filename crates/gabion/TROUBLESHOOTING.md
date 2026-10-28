@@ -25,9 +25,9 @@ Message starts: "Too many distinct rate-limit keys are being tracked at once."
 
 **Level** warn, power of two · **Request allowed** yes, the rule does not enforce on this node · **Emitted by** library (both adapters)
 
-Message starts: "Too many distinct rate-limit rules are in flight."
+Message starts: "A rate-limit rule this node does not configure, gossiped by a peer or recorded by a worker still on an earlier configuration, found the rule dictionary full."
 
-**What happened.** The rule dictionary had no free slot for a rule. The rule cannot be registered on this node, so requests it matches are allowed and its limit under-counts here.
+**What happened.** A rate-limit rule this node does not configure, gossiped by a peer or recorded by a worker still on an earlier configuration, found the rule dictionary full, so this node drops its hits and that rule under-counts across the cluster.
 
 **Why.** Usually more rules are live across the cluster than the dictionary holds, for example during a configuration rollout that briefly runs old and new rule sets together.
 

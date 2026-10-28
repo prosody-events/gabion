@@ -161,7 +161,6 @@ fn cell(id: u64) -> AggregateCell {
         key_hash: wide(id),
         bucket: id as u32,
         count: id,
-        last_update_millis: id,
     }
 }
 

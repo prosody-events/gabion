@@ -82,9 +82,7 @@ impl<C: Count> GossipClient<C> {
     }
 
     /// Hand one hit to the runtime without waiting: no reply channel, and a
-    /// full queue refuses the hit rather than block the caller. The path
-    /// `gabiond`'s admission takes; [`Self::record`] remains for the wasm
-    /// engine.
+    /// full queue refuses the hit rather than block the caller.
     pub fn try_record(
         &self,
         rule_fingerprint: u128,

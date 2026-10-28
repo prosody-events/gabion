@@ -2,8 +2,10 @@
 //!
 //! One `MAP_SHARED | MAP_ANONYMOUS` region is mmap'd by the nginx master in
 //! the config phase; every worker inherits the mapping at fork. Every
-//! cross-process structure lives in this module, communicates via atomics,
-//! and uses `#[repr(C)]` so the offsets are stable across worker processes.
+//! cross-process structure is mapped here, communicates via atomics, and uses
+//! `#[repr(C)]` so the offsets are stable across worker processes: the
+//! header, lease, queue and statistics from this module, the aggregate slot
+//! from `gabion::aggregate`.
 
 pub mod aggregate;
 pub mod header;
@@ -22,8 +24,7 @@ pub use stats::Stats;
 use gabion::aggregate::{AggregateSlot, AggregateTable};
 
 /// Atomics and spin hints for the queue and lease. The `loom` feature
-/// (`make loom`) swaps in loom's model-checked ones for `tests/loom.rs`, and
-/// turns on `gabion/loom` for the aggregate table's.
+/// (`make loom`) swaps in loom's model-checked ones for `tests/loom.rs`.
 #[cfg(feature = "loom")]
 use loom::{hint, sync::atomic};
 #[cfg(not(feature = "loom"))]
@@ -168,9 +169,9 @@ impl ShmRegion {
     /// * `base` is non-null and points at a fresh, writable mapping of at least
     ///   `layout.total_bytes` bytes. In practice this is a block of the nginx
     ///   shared zone the master maps before any worker is forked.
-    /// * `base` is aligned at least to `CACHELINE` (64). The zone's slab
-    ///   allocator returns page-aligned blocks, which satisfies the alignment
-    ///   requirements of every `#[repr(C)]` sub-structure stored in the region.
+    /// * `base` is aligned to 8 bytes, the largest alignment of any stored
+    ///   type. nginx's slab allocator hands out page-aligned blocks, which also
+    ///   cacheline-aligns each region.
     /// * `layout` is the value computed by `Layout::new`, and its offsets/sizes
     ///   describe the actual mapping.
     /// * The caller has *exclusive* access to the mapping for the duration of

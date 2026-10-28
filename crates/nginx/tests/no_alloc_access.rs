@@ -13,6 +13,7 @@
 
 use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
 use std::cell::Cell;
+use std::hint::black_box;
 
 use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink};
 use gabion::gossip::AggregateStore;
@@ -163,6 +164,10 @@ fn admit_without_allocating(rules: u16) {
     // its bound from the settings: one that grew to fit the requests it had
     // seen would allocate on the first counted request.
     decide_all(ctx, &[], &Tenant(b""), 0, &mut events);
+    assert!(
+        allocations(|| black_box(Vec::<u8>::with_capacity(8))).1 > 0,
+        "the counting allocator is live"
+    );
     let mut total = 0;
     for tenant in &requests {
         let vars = Tenant(tenant.as_bytes());

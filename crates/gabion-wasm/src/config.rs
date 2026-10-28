@@ -94,9 +94,7 @@ pub enum ConfigError {
     LossOutOfRange { got: f64 },
     #[error(transparent)]
     Setting(#[from] SettingError),
-    /// The watched rule, as `RuleDef::build` refuses it for both adapters;
-    /// the controls name it by its fields (`rule_limit`, `rule_window_ms`,
-    /// `rule_bucket_ms`).
+    /// The watched rule, as `RuleDef::build` refuses it for both adapters.
     #[error(transparent)]
     Rule(#[from] RuleError),
 }

@@ -42,24 +42,24 @@ pub const MAX_PROBE: usize = 128;
 #[repr(C)]
 #[derive(Debug)]
 pub struct AggregateSlot {
-    pub seq: AtomicU64,
-    pub rule_fingerprint_lo: AtomicU64,
-    pub rule_fingerprint_hi: AtomicU64,
-    pub key_hash_lo: AtomicU64,
-    pub key_hash_hi: AtomicU64,
-    pub bucket: AtomicU64, // u32 logically, stored as u64 for alignment+clarity
-    pub count: AtomicU64,
-    pub last_update_millis: AtomicU64,
+    seq: AtomicU64,
+    rule_fingerprint_lo: AtomicU64,
+    rule_fingerprint_hi: AtomicU64,
+    key_hash_lo: AtomicU64,
+    key_hash_hi: AtomicU64,
+    bucket: AtomicU64, // u32 logically, stored as u64 for alignment+clarity
+    count: AtomicU64,
+    /// Keeps a slot one 64-byte line; the slot layout is NGINX's SHM format.
+    _reserved: AtomicU64,
 }
 
 /// What one slot holds.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateCell {
     pub rule_fingerprint: u128,
     pub key_hash: u128,
     pub bucket: BucketEpoch,
     pub count: u64,
-    pub last_update_millis: u64,
 }
 
 impl AggregateSlot {
@@ -72,7 +72,7 @@ impl AggregateSlot {
             key_hash_hi: AtomicU64::new(0),
             bucket: AtomicU64::new(0),
             count: AtomicU64::new(0),
-            last_update_millis: AtomicU64::new(0),
+            _reserved: AtomicU64::new(0),
         }
     }
 
@@ -89,7 +89,6 @@ impl AggregateSlot {
                 | self.key_hash_lo.load(Ordering::Relaxed) as u128,
             bucket: self.bucket.load(Ordering::Relaxed) as BucketEpoch,
             count: self.count.load(Ordering::Relaxed),
-            last_update_millis: self.last_update_millis.load(Ordering::Relaxed),
         };
         // Order the field loads before the re-check of `seq`.
         fence(Ordering::Acquire);
@@ -115,8 +114,6 @@ impl AggregateSlot {
         self.key_hash_hi.store((kh >> 64) as u64, Ordering::Relaxed);
         self.bucket.store(cell.bucket as u64, Ordering::Relaxed);
         self.count.store(cell.count, Ordering::Relaxed);
-        self.last_update_millis
-            .store(cell.last_update_millis, Ordering::Relaxed);
         self.seq.store(seq, Ordering::Release);
     }
 }
@@ -195,7 +192,7 @@ impl<'a> AggregateTable<'a> {
     /// so the walk does too (a window spans fewer than 2^31 buckets).
     pub fn window_total(&self, spec: RuleSpec, key_hash: KeyHash, now_millis: u64) -> u64 {
         debug_assert!(spec.bucket_millis >= 1 && spec.live_buckets >= 1);
-        let current = (now_millis / spec.bucket_millis) as BucketEpoch;
+        let current = spec.bucket_at(now_millis);
         (0..spec.live_buckets)
             .filter_map(|offset| {
                 self.get(spec.fingerprint, key_hash.0, current.wrapping_sub(offset))
@@ -315,7 +312,6 @@ impl Writer<'_> {
             key_hash: kh,
             bucket,
             count,
-            last_update_millis: 0,
         };
         self.write(index, cell);
         true
@@ -407,7 +403,10 @@ pub struct Aggregate {
 
 impl Aggregate {
     pub fn new(storage: &ValidStorageConfig) -> Self {
-        let capacity = storage.cell_capacity.get().next_power_of_two().max(2);
+        Self::with_capacity(storage.cell_capacity.get().next_power_of_two().max(2) as usize)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
         Self {
             slots: (0..capacity).map(|_| AggregateSlot::empty()).collect(),
             write_seq: std_atomic::AtomicU64::new(2),

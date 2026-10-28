@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use quickcheck_macros::quickcheck;
-
 use super::*;
 use crate::settings::Settings;
 
@@ -33,22 +31,21 @@ fn build(
 fn rule_identity_separates_windows_and_survives_reordering() {
     use EnforcementMode::{DryRun, Enforce};
     let base = build("a", "10r/s", 60, 1, Enforce);
-    let fingerprint = |rule: Rule| rule.fingerprint;
     assert_ne!(
         base.fingerprint,
-        fingerprint(build("a", "10r/s", 120, 1, Enforce))
+        build("a", "10r/s", 120, 1, Enforce).fingerprint
     );
     assert_ne!(
         base.fingerprint,
-        fingerprint(build("a", "10r/s", 60, 2, Enforce))
+        build("a", "10r/s", 60, 2, Enforce).fingerprint
     );
     assert_eq!(
         base.fingerprint,
-        fingerprint(build("a", "20r/s", 60, 1, Enforce))
+        build("a", "20r/s", 60, 1, Enforce).fingerprint
     );
     assert_eq!(
         base.fingerprint,
-        fingerprint(build("a", "10r/s", 60, 1, DryRun))
+        build("a", "10r/s", 60, 1, DryRun).fingerprint
     );
     assert_eq!(
         RuleTable::new(
@@ -73,18 +70,7 @@ fn rule_identity_separates_windows_and_survives_reordering() {
     }
 }
 
-/// Feeding descriptors one at a time hashes as the whole request does, and
-/// the separators keep pairs that run together apart.
-#[quickcheck]
-fn key_hasher_equals_hash_key(domain: String, pairs: Vec<(String, String)>) -> bool {
-    let mut hasher = KeyHasher::new(&domain);
-    for (key, value) in &pairs {
-        hasher.push(key, value);
-    }
-    let descriptors = pairs.iter().map(|(key, value)| Descriptor { key, value });
-    hasher.finish() == hash_key(&domain, descriptors)
-}
-
+/// The separators keep pairs that run together apart.
 #[test]
 fn key_hash_separates_pairs_that_run_together() {
     let hash = |pairs: &[(&'static str, &'static str)]| {
@@ -170,6 +156,7 @@ fn resolve_rate_window_defaults_to_period() {
             limit: NonZeroU64::new(10).unwrap(),
             window_millis: 1_000,
             bucket_millis: 1_000,
+            live_buckets: 1,
         }
     );
 }
@@ -283,6 +270,40 @@ fn resolve_rate_rejects_zero_bucket() {
 }
 
 #[test]
+fn resolve_rate_rejects_bucket_longer_than_window() {
+    let second = Some(Duration::from_secs(1));
+    assert_eq!(
+        resolve(
+            10,
+            Duration::from_secs(1),
+            second,
+            Some(Duration::from_secs(2))
+        )
+        .unwrap_err(),
+        RateResolveError::BucketLongerThanWindow
+    );
+    assert!(resolve(10, Duration::from_secs(1), second, second).is_ok());
+}
+
+/// A window of 2^31 buckets or more is refused, counting a partial last
+/// bucket as the rule's `live_buckets` does.
+#[test]
+fn resolve_rate_rejects_2_31_buckets() {
+    let millis = |ms| Some(Duration::from_millis(ms));
+    let day = Duration::from_secs(86_400);
+    assert_eq!(
+        resolve(1, day, Some(30 * day), millis(1)).unwrap_err(),
+        RateResolveError::WindowTooLong
+    );
+    let period = Duration::from_millis(1);
+    assert_eq!(
+        resolve(1, period, millis(4_294_967_295), millis(2)).unwrap_err(),
+        RateResolveError::WindowTooLong
+    );
+    assert!(resolve(1, period, millis(4_294_967_294), millis(2)).is_ok());
+}
+
+#[test]
 fn resolve_rate_rejects_overflow() {
     // rate=u64::MAX, window=2s, period=1s → u64::MAX * 2000 overflows u64.
     let err = resolve(
@@ -303,8 +324,8 @@ fn resolve_rate_rejects_overflow() {
 #[test]
 fn stable_hash_values_are_pinned() {
     assert_eq!(
-        rule_fingerprint("api.requests", &[("tenant", "acme")], 1_000, 1_000),
-        0x7ccb_f8ab_a069_fd05_6d24_463a_bad1_bc35,
+        rule_fingerprint("api.requests", &[("tenant", "acme")], 60_000, 1_000),
+        0x928b_2f28_849a_da90_aa48_c704_2b6e_aa38,
     );
     assert_eq!(
         hash_key(
@@ -321,6 +342,31 @@ fn stable_hash_values_are_pinned() {
         hash_domain("api.requests").0,
         0xec42_b938_8905_54a6_8a84_ad23_b6e1_13ba,
     );
+}
+
+/// A rule at exactly the default descriptor-count and key-length bounds
+/// builds: the bounds are inclusive.
+#[test]
+fn rule_at_the_cardinality_bounds_builds() {
+    use crate::defaults::{STORAGE_MAX_DESCRIPTOR_COUNT, STORAGE_MAX_KEY_BYTES};
+    let limits = Settings::default().validate().unwrap().1.cardinality;
+    let keys: Vec<String> = (0..STORAGE_MAX_DESCRIPTOR_COUNT)
+        .map(|i| format!("k{i}"))
+        .collect();
+    let long_key = "k".repeat(STORAGE_MAX_KEY_BYTES);
+    let full: Vec<(&str, &str)> = keys.iter().map(|key| (key.as_str(), "*")).collect();
+    for patterns in [&full[..], &[(long_key.as_str(), "*")]] {
+        let def = RuleDef {
+            name: "r",
+            domain: "api",
+            patterns,
+            rate: "10r/s",
+            window: None,
+            bucket: None,
+            mode: EnforcementMode::Enforce,
+        };
+        assert!(def.build(&limits).is_ok(), "{} patterns", patterns.len());
+    }
 }
 
 #[test]

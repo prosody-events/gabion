@@ -356,7 +356,7 @@ since they only pay for what they use.
 |-------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
 | `rate=Nr/<unit>`        | **Required.** `N` requests per the period named by `<unit>`. `<unit>` is `s\|m\|h\|d` or any humantime duration like `30s`, `5m`, `2h30m`. |
 | `window=DURATION`       | Time horizon the rate is enforced over (default: the rate's period). When set, the resolved limit scales to `floor(rate_count * window / period)`. |
-| `bucket=DURATION`       | Bucket granularity inside the window (default: the resolved window — one fixed-window bucket).                                             |
+| `bucket=DURATION`       | Bucket granularity inside the window, no longer than the window (default: the resolved window — one fixed-window bucket).                  |
 | `mode=enforce`          | Default. Evaluate and reject on overflow.                                                                                                  |
 | `mode=dry_run`          | Evaluate and record the hit; never reject.                                                                                                 |
 | `mode=disabled`         | Skip the rule entirely.                                                                                                                    |
@@ -374,9 +374,9 @@ three directive-level knobs that are evaluated in order:
 * `window=DURATION` (optional) — widens the time horizon. The resolved
   limit is `floor(rate_count * window_millis / period_millis)`.
   Omitted, the window equals the rate's period.
-* `bucket=DURATION` (optional) — granularity inside the window.
-  Omitted, the bucket equals the resolved window, which gives a
-  single fixed-window bucket.
+* `bucket=DURATION` (optional) — granularity inside the window, no
+  longer than the window. Omitted, the bucket equals the resolved
+  window, which gives a single fixed-window bucket.
 
 Worked example:
 
@@ -799,7 +799,7 @@ Examples (verbatim, all from the current source):
 gabion: `gabion_limit_zone` argument must start with `zone=` (e.g. `zone=api:128m`)
 gabion: `gabion_limit_zone` zone name `nope!` must match `[A-Za-z0-9_]+` (matches nginx core's `limit_req_zone` grammar)
 gabion: `gabion_limit_rule` rule `per_ip` has no `rate=`, so it has no limit to enforce. Add one (for example `rate=10r/s`), then run `nginx -t`
-gabion: `gabion_limit_rule` argument `key=$uri` is invalid: expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, `mode=`, `dry_run`, `except_if=`, `domain=`
+gabion: `gabion_limit_rule` argument `key=$uri` is invalid: expected `$variable`, `name:$variable`, or one of `rate=`, `window=`, `bucket=`, `mode=`, `dry_run`, `except_if=`, `domain=`, `value=`
 gabion: `gabion_limit_rule` argument `rate=100r/fortnight` is invalid: rate period must be `s`, `m`, `h`, `d`, or a duration like `30s`, `5m`
 gabion: Rule `inverted`: the window is shorter than the rate's period, so the rate cannot be spread over it. To enforce N requests in a shorter span, put the period in the rate itself (for example `100r/500ms`).
 gabion: Two rules are named `per_ip`. Rule names must be unique; rename one.

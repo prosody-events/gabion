@@ -250,9 +250,8 @@ struct EngineState {
     storage: ValidStorageConfig,
     /// The watched rule, which every node interns at construction.
     rules: RuleTable,
-    /// That rule as the cell store holds it. The one source of the rule the
-    /// nodes intern, the bucket epoch the submission path stamps, and the
-    /// window the snapshot reports, so they never drift apart.
+    /// That rule's descriptor: the bucket epoch the submission path stamps
+    /// and the window the snapshot reports.
     rule: RuleDescriptor,
     router: SimRouter,
     nodes: Vec<NodeHandle>,
@@ -345,8 +344,6 @@ impl EngineState {
         let addr = addr_of_id(id);
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
 
-        // The store interns the watched rule, with its window and bucket,
-        // before any request.
         let store = CellStore::<Count>::new(self.storage, identity, &self.rules);
 
         let bootstrap_peers: Vec<SocketAddr> =

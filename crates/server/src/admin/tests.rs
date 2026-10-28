@@ -13,9 +13,11 @@ use tokio::task::LocalSet;
 use tower::ServiceExt;
 
 use gabion::aggregate::Aggregate;
-use gabion::crdt::{CellStore, NodeId, NodeIdentity};
+use gabion::crdt::{
+    CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
+};
 use gabion::gossip::sim::SimRouter;
-use gabion::gossip::{AdminCommand, GossipRuntime, TokioClock};
+use gabion::gossip::{AdminCommand, AggregateStore, GossipRuntime, TokioClock};
 use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
 use gabion::settings::Settings;
 
@@ -83,6 +85,19 @@ fn snapshot_json_shape_is_pinned() {
         let rule_table = Arc::new(sample_rules());
         let store = CellStore::<u32>::new(storage, identity, &rule_table);
         let counts = Arc::new(Aggregate::new(&storage));
+        let row = DeltaSink::<u32> {
+            handles: vec![CellHandle::default()],
+            keys: vec![CellIdentity {
+                rule_fingerprint: rule_table.rules()[0].fingerprint,
+                key_hash: KeyHash(1),
+                bucket: 0,
+            }],
+            previous: vec![0],
+            current: vec![1],
+            deltas: vec![1],
+            applies_locally: vec![1],
+        };
+        counts.apply(&row, &ExpirationSink::default());
 
         let bootstrap = next_addr();
         gossip_config.bootstrap_peers = vec![bootstrap];
@@ -205,7 +220,7 @@ fn snapshot_json_shape_is_pinned() {
             format!("{:#034x}", rule_table.rules()[0].domain_hash.0)
         );
         assert_eq!(body["rules"][0]["mode"], "enforce");
-        assert_eq!(body["aggregate_rows"], 0);
+        assert_eq!(body["aggregate_rows"], 1);
 
         client.shutdown().await.unwrap();
         let _ = handle.await;

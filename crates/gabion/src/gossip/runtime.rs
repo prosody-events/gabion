@@ -125,11 +125,10 @@ where
     decode_reject_count: u64,
     counters: GossipCounters,
 
-    // Threshold-triggered anti-entropy state. One column per interned rule
-    // slot; sized to the rule dictionary's capacity at construction and
-    // reused for the runtime's lifetime, a few KiB regardless of rule churn. Indexed by `RuleSlot`
-    // to keep the hot path's single dictionary lookup (`RuleDictionary::find`) the only
-    // identity work.
+    // Threshold-triggered anti-entropy state. One column per interned rule slot; sized to the
+    // rule dictionary's capacity at construction and reused for the runtime's lifetime, 12 bytes
+    // per rule-dictionary slot. Indexed by `RuleSlot` to keep the hot path's single dictionary
+    // lookup (`RuleDictionary::find`) the only identity work.
     //
     // - `rule_pending[slot]`     — local hits accumulated against rule `slot` since the last
     //   gossip emit. Zeroed when a round settles (`settle`).

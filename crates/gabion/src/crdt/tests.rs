@@ -1599,11 +1599,8 @@ fn descriptor_epoch_helpers_pin_window_math() {
     };
     assert_eq!(rd.current_epoch(12_345), 12);
     assert_eq!(rd.live_buckets(), 10);
-    assert_eq!(rd.oldest_live_epoch(12_345), 2);
 
-    // Wire-only rule (bucket_millis == 0): the never-expire sentinel. Both
-    // current and live collapse to 0, so the oldest live epoch stays 0 and
-    // every stored bucket is retained.
+    // A zero bucket has no epoch: both helpers return 0.
     let wire_only = RuleDescriptor {
         window_millis: 0,
         bucket_millis: 0,
@@ -1611,7 +1608,6 @@ fn descriptor_epoch_helpers_pin_window_math() {
     };
     assert_eq!(wire_only.current_epoch(12_345), 0);
     assert_eq!(wire_only.live_buckets(), 0);
-    assert_eq!(wire_only.oldest_live_epoch(12_345), 0);
 }
 
 #[test]
@@ -2407,17 +2403,18 @@ fn configured(n: usize, rate: &str, bucket: Duration) -> RuleTable {
     RuleTable::new(rules, None).unwrap()
 }
 
-/// One key hit once a millisecond from `t0` for 10 ms under a 10 ms window of
-/// 1 ms buckets: its window total at `t0 + 9`, and how many of its cells
-/// `expire_at(t0 + 15)` frees.
-fn wrap_run(t0: u64) -> (u64, usize) {
+/// One key hit once a millisecond from `t0` for 10 ms, and once more at
+/// `t0 + 16`, under a 10 ms window of 1 ms buckets: its window total at
+/// `t0 + 9`, how long until one more hit admits there, and how many of its
+/// cells `expire_at(t0 + 15)` frees (the cell ahead of that epoch stays).
+fn wrap_run(t0: u64) -> (u64, u64, usize) {
     let table = configured(1, "10r/10ms", Duration::from_millis(1));
     let rule = &table.rules()[0];
     let config = storage(64, 8, 64, 4);
     let mut store = CellStore::<u32>::new(config, local(), &table);
     let aggregate = Aggregate::new(&config);
-    let mut batch = ObservationBatch::with_capacity(10);
-    for t in t0..t0 + 10 {
+    let mut batch = ObservationBatch::with_capacity(11);
+    for t in (t0..t0 + 10).chain([t0 + 16]) {
         let node = local();
         batch.push(observation(
             rule.fingerprint,
@@ -2429,23 +2426,23 @@ fn wrap_run(t0: u64) -> (u64, usize) {
             t,
         ));
     }
-    let mut deltas = DeltaSink::with_capacity(10);
+    let mut deltas = DeltaSink::with_capacity(11);
     store.ingest_local(&batch, &mut deltas);
     aggregate.apply(&deltas, &ExpirationSink::default());
-    let total = aggregate
-        .table()
-        .window_total(rule.spec(), KeyHash(7), t0 + 9);
+    let table = aggregate.table();
+    let total = table.window_total(rule.spec(), KeyHash(7), t0 + 9);
+    let until = table.time_until_admit_millis(rule.spec(), KeyHash(7), t0 + 9, total, 1);
     let mut expired = ExpirationSink::with_capacity(64);
     assert_eq!(store.expire_at(t0 + 15, &mut expired), Expiry::Done);
-    (total, expired.len())
+    (total, until, expired.len())
 }
 
 /// The window total and expiry give the same answers when the `u32` epoch
 /// wraps inside the window as when it does not.
 #[test]
 fn epoch_comparisons_survive_wrap() {
-    assert_eq!(wrap_run(1_000), (10, 5));
-    assert_eq!(wrap_run((1 << 32) - 4), (10, 5));
+    assert_eq!(wrap_run(1_000), (10, 1, 5));
+    assert_eq!(wrap_run((1 << 32) - 4), (10, 1, 5));
 }
 
 /// With no override, the rule dictionary holds twice the configured rules,
@@ -2454,6 +2451,12 @@ fn epoch_comparisons_survive_wrap() {
 fn rule_dictionary_default_grows_with_rules() {
     let table = configured(300, "10r/s", Duration::from_secs(1));
     assert_eq!(table.dictionary_capacity().get(), 600);
+    assert_eq!(
+        configured(3, "10r/s", Duration::from_secs(1))
+            .dictionary_capacity()
+            .get(),
+        256
+    );
     let stats = CellStore::<u32>::new(storage(16, 8, 16, 4), local(), &table).stats();
     assert_eq!(
         (stats.rule_slots_capacity, stats.rule_slots_used),

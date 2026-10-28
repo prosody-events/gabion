@@ -93,8 +93,9 @@ enum RuleOutcome {
     /// `Enforce` mode.
     Reject(RejectInfo),
     /// Rule had no opinion on this request — a binding variable was
-    /// missing or not UTF-8, or the rule is disabled. Fail-open: the request
-    /// still allows for this rule.
+    /// missing or not UTF-8, or the value differs from the rule's `value=`
+    /// literal, or the rule is disabled. Fail-open: the request still allows
+    /// for this rule.
     Decline,
     /// Rule was over the per-request byte budget. The sibling rules may
     /// still evaluate independently; if *every* configured rule
@@ -165,7 +166,6 @@ pub fn decide_all(
                 worst_reject = Some(pick_longest_window(worst_reject, info));
             }
             RuleOutcome::Decline => {
-                // Rule had no opinion (missing variable, no match, etc.).
                 // Siblings still get to evaluate.
             }
             RuleOutcome::Cardinality => {
@@ -290,7 +290,7 @@ fn decide_one(
     let event = QueueEvent {
         rule_fingerprint: spec.fingerprint,
         key_hash: key_hash.0,
-        bucket: (now_millis / spec.bucket_millis) as u32,
+        bucket: spec.bucket_at(now_millis),
         hits,
         rule_limit: spec.limit,
         now_millis,

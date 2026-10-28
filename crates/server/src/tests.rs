@@ -390,6 +390,37 @@ fn matched_rule_bound_is_the_setting() {
     assert!(!line.contains("rejected"), "{line}");
 }
 
+/// Rules past `storage.max_matched_rules` are still checked, as in NGINX; they
+/// only go uncounted, so a third rule over its limit rejects at a bound of 1.
+#[test]
+fn rules_past_the_matched_bound_still_reject() {
+    run_local(async {
+        let rules = [("a", "1000r/s"), ("b", "1000r/2s"), ("c", "1r/3s")].map(|(name, rate)| {
+            rule(
+                name,
+                &[("tenant", "*")],
+                rate,
+                100,
+                EnforcementMode::Enforce,
+            )
+        });
+        let harness = harness_with(rules.into(), |s| {
+            s.max_matched_rules = 1.try_into().unwrap();
+        })
+        .await;
+        let request = RateLimitRequest {
+            hits_addend: 2,
+            ..tenant_request("a")
+        };
+        let response = harness.check(request, 0).await;
+        assert_eq!(
+            response.overall_code,
+            rate_limit_response::Code::OverLimit as i32
+        );
+        let _ = harness.client.shutdown().await;
+    });
+}
+
 /// A full gossip request queue never makes a request wait or fail: the hits
 /// that do not fit are dropped and counted, and the warning logs at powers
 /// of two.
@@ -614,6 +645,14 @@ fn gossip_record_failure_does_not_reject_request() {
             response.overall_code,
             rate_limit_response::Code::Ok as i32,
             "a dead gossip runtime must not reject — see CLAUDE.md (allow-by-default)",
+        );
+        let warnings = &harness.limiter.warnings;
+        assert_eq!(
+            (
+                warnings.gossip_record_failures.load(Ordering::Relaxed),
+                warnings.request_queue_full.load(Ordering::Relaxed)
+            ),
+            (1, 0)
         );
     });
 }

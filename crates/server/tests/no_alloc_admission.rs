@@ -14,6 +14,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::hint::black_box;
 use std::sync::Arc;
 
 use gabion::aggregate::Aggregate;
@@ -157,6 +158,10 @@ async fn admit_without_allocating(rules: u16) {
             _ => hot[i % hot.len()].clone(),
         })
         .collect();
+    assert!(
+        allocations(|| black_box(Vec::<u8>::with_capacity(8))).1 > 0,
+        "the counting allocator is live"
+    );
     let mut total = 0;
     for request in &requests {
         let (decision, allocated) = allocations(|| limiter.decide("api", request, 1, 0));
@@ -197,10 +202,10 @@ fn admission_never_allocates_at_the_largest_bound() {
         .start_paused(true)
         .build()
         .expect("runtime");
-    // Up to 64 rules: tokio's request channel keeps at most three spare
-    // 32-slot blocks, so a request that queues more than 96 hits makes
-    // `try_record` allocate a block, a cost of the channel, not of the
-    // admission scratch this test measures.
+    // tokio's request channel keeps at most three spare 32-slot blocks, so
+    // once more than about 96 hits are queued undrained (across all
+    // in-flight requests) a `try_record` allocates a block; this test drains
+    // between requests and measures the admission scratch, not the channel.
     for rules in [1, 16, 64] {
         LocalSet::new().block_on(&runtime, admit_without_allocating(rules));
     }

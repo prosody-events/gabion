@@ -40,7 +40,9 @@ pub struct AppConfig {
     pub settings: Settings,
     pub gossip: ValidGossipConfig,
     pub storage: ValidStorageConfig,
-    pub limits: Vec<LimitRuleConfig>,
+    /// The `limits:` entries, each built through the library's one rule
+    /// constructor, in declaration order.
+    pub rules: RuleTable,
 }
 
 /// The fields of one `limits:` entry, and of one of its descriptors.
@@ -77,7 +79,7 @@ impl AppConfig {
 
     fn from_yaml(yaml: Config) -> Result<Self, ConfigError> {
         let mut root = yaml.cache.into_table().map_err(ConfigError::Config)?;
-        let limits = match root.remove("limits") {
+        let limits: Vec<LimitRuleConfig> = match root.remove("limits") {
             None => Vec::new(),
             Some(limits) => {
                 if let ValueKind::Array(entries) = &limits.kind
@@ -105,19 +107,7 @@ impl AppConfig {
             }
         }
         let (gossip, storage) = settings.validate()?;
-        Ok(Self {
-            settings,
-            gossip,
-            storage,
-            limits,
-        })
-    }
-
-    /// Build every `limits:` entry through the library's one rule
-    /// constructor, in declaration order.
-    pub fn rule_table(&self) -> Result<RuleTable, RuleError> {
-        let rules = self
-            .limits
+        let rules = limits
             .iter()
             .map(|limit| {
                 let patterns: Box<[(&str, &str)]> = limit
@@ -134,10 +124,15 @@ impl AppConfig {
                     bucket: limit.bucket,
                     mode: limit.mode.into(),
                 }
-                .build(&self.storage.cardinality)
+                .build(&storage.cardinality)
             })
             .collect::<Result<_, _>>()?;
-        RuleTable::new(rules, self.storage.rule_dictionary_capacity())
+        Ok(Self {
+            settings,
+            gossip,
+            storage,
+            rules: RuleTable::new(rules, storage.rule_dictionary_capacity())?,
+        })
     }
 }
 
@@ -230,34 +225,34 @@ fn read_env(name: &'static str) -> Result<Option<String>, ConfigError> {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct LimitRuleConfig {
-    pub name: Box<str>,
-    pub domain: Box<str>,
-    pub descriptors: Box<[DescriptorConfig]>,
+#[derive(Debug, Deserialize)]
+struct LimitRuleConfig {
+    name: Box<str>,
+    domain: Box<str>,
+    descriptors: Box<[DescriptorConfig]>,
     /// Operator-facing rate: `N` requests per period, e.g. `10r/s`,
     /// `100r/5m`, `1000r/h`. Mandatory. See `gabion::rules::parse_rate`.
-    pub rate: Box<str>,
+    rate: Box<str>,
     /// Optional window the rate is enforced over. Defaults to the rate's
     /// period when omitted. When set, the resolved internal limit scales
     /// up to `floor(rate_count * window_millis / period_millis)` — see
     /// the README's "Rate, window, and bucket" section.
     #[serde(default, with = "humantime_serde::option")]
-    pub window: Option<Duration>,
+    window: Option<Duration>,
     /// `bucket:` defaults to `window:` when omitted — one fixed-window
     /// bucket per rule. Set explicitly for finer sliding-window
     /// enforcement (e.g. `bucket: 1s` inside a `window: 60s` rule).
     #[serde(default, with = "humantime_serde::option")]
-    pub bucket: Option<Duration>,
+    bucket: Option<Duration>,
     #[serde(default)]
-    pub mode: EnforcementModeConfig,
+    mode: EnforcementModeConfig,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct DescriptorConfig {
-    pub key: Box<str>,
+#[derive(Debug, Deserialize)]
+struct DescriptorConfig {
+    key: Box<str>,
     #[serde(default = "any_value")]
-    pub value: Box<str>,
+    value: Box<str>,
 }
 
 fn any_value() -> Box<str> {
@@ -266,7 +261,7 @@ fn any_value() -> Box<str> {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum EnforcementModeConfig {
+enum EnforcementModeConfig {
     #[default]
     Enforce,
     DryRun,
@@ -287,6 +282,8 @@ impl From<EnforcementModeConfig> for EnforcementMode {
 pub enum ConfigError {
     #[error(transparent)]
     Setting(#[from] SettingError),
+    #[error(transparent)]
+    Rule(#[from] RuleError),
     #[error(
         "The configuration file sets `{0}`, which gabiond does not know. This key was removed or \
          renamed in this release, or it is misspelled; see the release notes for its replacement."

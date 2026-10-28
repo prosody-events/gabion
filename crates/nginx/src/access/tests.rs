@@ -649,23 +649,32 @@ fn nginx_rule_domain_hashes_its_keys() {
 }
 
 /// `storage.max_matched_rules` is how many of a request's allowed rules
-/// count it: at 20, a location with 21 matching rules queues 20 hits and
-/// counts one overflowing request.
+/// count it: at 20, a location with 20 matching rules queues 20 hits and
+/// overflows nothing, and one with 22 queues 20 and counts one overflowing
+/// request, not one per uncounted rule.
 #[test]
 fn matched_rule_bound_is_the_setting() {
-    let directives: Vec<String> = (1..=21)
-        .map(|i| format!("r{i} tenant:$http_x_tenant rate=100r/{i}s"))
-        .collect();
-    let directives: Vec<&str> = directives.iter().map(String::as_str).collect();
-    let rules = rules(&directives);
-    let (_buf, region) = TestZone::new(32, 64);
-    let ctx = ctx(&rules, &region, |s| {
-        s.max_matched_rules = 20.try_into().unwrap();
-    });
-    let vars = MockVars::new().set("http_x_tenant", "alice");
-    let indices: Vec<usize> = (0..21).collect();
-    let outcome = decide(ctx, &indices, &vars, 0);
-    assert!(matches!(outcome, AccessOutcome::Allow(Some(_))));
-    assert_eq!(queued(&region), 20);
-    assert_eq!(region.stats().snapshot().matched_rule_overflows, 1);
+    for (matched, expected_queued, overflows) in [(20, 20, 0), (22, 20, 1)] {
+        let directives: Vec<String> = (1..=matched)
+            .map(|i| format!("r{i} tenant:$http_x_tenant rate=100r/{i}s"))
+            .collect();
+        let directives: Vec<&str> = directives.iter().map(String::as_str).collect();
+        let rules = rules(&directives);
+        let (_buf, region) = TestZone::new(32, 64);
+        let ctx = ctx(&rules, &region, |s| {
+            s.max_matched_rules = 20.try_into().unwrap();
+        });
+        let vars = MockVars::new().set("http_x_tenant", "alice");
+        let indices: Vec<usize> = (0..matched).collect();
+        let outcome = decide(ctx, &indices, &vars, 0);
+        assert!(matches!(outcome, AccessOutcome::Allow(Some(_))));
+        assert_eq!(
+            (
+                queued(&region),
+                region.stats().snapshot().matched_rule_overflows
+            ),
+            (expected_queued, overflows),
+            "{matched} rules"
+        );
+    }
 }

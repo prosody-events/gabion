@@ -52,8 +52,7 @@ export class Sim {
 
   /** The Rust-side production-aligned `SimConfig` defaults — the single source
    *  the control sliders open from (no hand-maintained TS mirror, so changing
-   *  `gabion::defaults` is the only edit). u128 fields arrive as hex strings,
-   *  matching the `SimConfig` contract in `types.ts`. */
+   *  `gabion::defaults` is the only edit). */
   static async defaultConfig(): Promise<SimConfig> {
     await ensureInit();
     return default_config() as SimConfig;

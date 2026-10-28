@@ -9,7 +9,8 @@ pub(crate) fn directive(text: &str) -> RuleConfig {
     parse_rule_directive(&args).unwrap_or_else(|error| panic!("{text}: {error}"))
 }
 
-/// Compile `configs` with the default settings and [`NopBindingCompiler`].
+/// Compile `configs` with [`crate::mock::validated`]'s test settings and
+/// [`NopBindingCompiler`].
 pub(crate) fn compile(configs: &[RuleConfig]) -> Result<CompiledRules, RuleConfigError> {
     CompiledRules::compile_with(configs, &validated(|_| {}).1, &mut NopBindingCompiler)
 }
