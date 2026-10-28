@@ -215,7 +215,9 @@ miri-all: miri-lib miri-safety miri-safety-tb miri-ffi-alignment miri-ffi-alignm
 	MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-disable-isolation" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
 
 # Operator-message catalogue: every `code` field has an entry, and every
-# library entry names a code some library message still emits.
+# library entry names a code some library message still emits. The
+# visualizer's design rules (web/README.md "Design rules"): no colour literal
+# outside tokens.css, no pixel font-size, and every token named is defined.
 CATALOGUES := crates/gabion/TROUBLESHOOTING.md crates/server/README.md crates/nginx/README.md
 
 .PHONY: hygiene
@@ -227,6 +229,11 @@ hygiene:
 	done
 	@for code in $$(rg -oNI '^### `([a-z_]+)`$$' -r '$$1' crates/gabion/TROUBLESHOOTING.md); do \
 		rg -q "code = \"$$code\"" crates/gabion/src || { echo "crates/gabion/TROUBLESHOOTING.md documents \`$$code\`, which no library message emits"; exit 1; }; \
+	done
+	! rg -n '#[0-9a-fA-F]{3,8}\b|0x[0-9a-fA-F]{6}|rgba?\(|hsla?\(' $(WEB_DIR)/src --glob '!tokens.css'
+	! rg -n 'font-size:\s*[0-9.]+px' $(WEB_DIR)/src
+	@for token in $$(rg -oNI "(var\(|')(--[a-z][a-z0-9-]*)" -r '$$2' $(WEB_DIR)/src | sort -u); do \
+		rg -q -- "^\s*$$token:" $(WEB_DIR)/src/tokens.css || { echo "design token \`$$token\` is not defined in $(WEB_DIR)/src/tokens.css, so it resolves to nothing; use a token defined there (web/README.md \"Design rules\") or define it:"; rg -nF -- "$$token" $(WEB_DIR)/src; exit 1; }; \
 	done
 
 .PHONY: test

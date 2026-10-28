@@ -164,10 +164,9 @@ study dashboard. A rule that assumes the study's data model says "N/A" and why.
 27. Accessibility: focusable, tooltips on hover, focus and tap, targets of at least 24 px, contrast (A3, A6, A7).
 28. Automated checks carried over (CI).
 
-The grep gates, which print nothing: no colour literal outside `tokens.css`
-(`rg -n '#[0-9a-fA-F]{3,8}\b|0x[0-9a-fA-F]{6}|rgba?\(|hsla?\(' src --glob '!tokens.css'`),
-no pixel `font-size` (`rg -n 'font-size:\s*[0-9.]+px' src`), and no pre-token
-name (`rg -n 'var\(--(ink|signal|chrome|stage|space|text)-' src`).
+The grep gates, which `make hygiene` runs: no colour literal outside
+`tokens.css`, no pixel `font-size`, and no token a component names that
+`tokens.css` does not define (so no pre-token name such as `--ink` survives).
 
 Automated checks, run on every preset with the transport paused:
 
