@@ -1,20 +1,21 @@
-use std::net::Ipv6Addr;
-
 use quickcheck_macros::quickcheck;
 
 use super::*;
 use crate::crdt::NodeId;
 
-/// Twice the capacity: inserts collide, removes hit and the table fills.
+/// Twice the capacity: inserts hit Present and Full, and removes hit and miss.
 const POOL: u8 = 16;
-const CAPACITY: usize = 8;
+const CAPACITY: NonZeroU16 = NonZeroU16::new(8).unwrap();
 
-/// Both families, so both arms of `addr_hash` run.
+/// Both families, so both arms of `addr_hash` run. Each odd address is the
+/// IPv4-mapped twin of the even one before it, so the two hash equal but are
+/// distinct peers.
 fn addr(i: u8) -> SocketAddr {
+    let ip = Ipv4Addr::new(10, 0, 0, i & !1);
     if i.is_multiple_of(2) {
-        SocketAddr::from(([10, 0, 0, i], 9000))
+        SocketAddr::from((ip, 9000))
     } else {
-        SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, u16::from(i)), 9000))
+        SocketAddr::from((ip.to_ipv6_mapped(), 9000))
     }
 }
 
@@ -23,8 +24,7 @@ fn addr(i: u8) -> SocketAddr {
 /// model's peers with their identities.
 #[quickcheck]
 fn peer_table_index_matches_linear_scan(ops: Vec<(u8, u8, u8)>) {
-    let capacity = NonZeroU16::new(CAPACITY as u16).unwrap();
-    let mut table = PeerTable::with_capacity(capacity);
+    let mut table = PeerTable::with_capacity(CAPACITY);
     let mut model: Vec<(SocketAddr, Option<NodeIdentity>)> = Vec::new();
     for (op, x, y) in ops {
         let a = addr(x % POOL);
@@ -32,7 +32,7 @@ fn peer_table_index_matches_linear_scan(ops: Vec<(u8, u8, u8)>) {
             0 => {
                 let expected = if model.iter().any(|p| p.0 == a) {
                     Insert::Present
-                } else if model.len() == CAPACITY {
+                } else if model.len() == usize::from(CAPACITY.get()) {
                     Insert::Full
                 } else {
                     model.push((a, None));

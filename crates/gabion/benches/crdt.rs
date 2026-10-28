@@ -39,8 +39,9 @@
 //! * `aggregate/apply_one_second`  — the table's writer for one second of that
 //!   traffic: 650 inserts plus 650 expiries.
 //!
-//! * `inbound/peer_lookup`         — a node with 300 peers takes a 2-cell
-//!   packet from each in turn, through the public runtime.
+//! * `inbound/peer_lookup`         — a node with 300 peers takes the same
+//!   2-cell packet from each in turn, through the public runtime: decode plus
+//!   the address lookup, with no merge growth.
 
 use std::cell::Cell;
 use std::hint::black_box;
@@ -1475,7 +1476,11 @@ fn bench_inbound(c: &mut Criterion) {
             },
             // Holding the client keeps the request arm pending, so `run`
             // serves every packet instead of shutting down.
-            |(runtime, _client)| tokio.block_on(runtime.run(futures::stream::empty())),
+            |(runtime, _client)| {
+                tokio
+                    .block_on(runtime.run(futures::stream::empty()))
+                    .expect_err("only the replay's end stops the run")
+            },
             BatchSize::LargeInput,
         )
     });

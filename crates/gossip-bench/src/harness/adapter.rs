@@ -239,10 +239,10 @@ impl HealthReply {
 }
 
 /// The production settings with the store sized for the regime and the peer
-/// table for every node it starts, which the
-/// launcher validates once as `gabiond` validates them. The dirty rings never
-/// drop below production; above it they keep the production ratio of ring to
-/// cell store (`STORAGE_*_DIRTY_CAPACITY` over `STORAGE_MAX_CELLS`).
+/// table for every node it starts, which the launcher validates once as
+/// `gabiond` validates them. The dirty rings never drop below production; above
+/// it they keep the production ratio of ring to cell store
+/// (`STORAGE_*_DIRTY_CAPACITY` over `STORAGE_MAX_CELLS`).
 pub(super) fn settings(sizing: &Sizing) -> Result<Settings> {
     let ring = |production: usize| {
         production.max((sizing.cell_capacity as usize * production).div_ceil(d::STORAGE_MAX_CELLS))

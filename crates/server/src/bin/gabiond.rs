@@ -70,6 +70,7 @@ async fn run() -> anyhow::Result<()> {
         rules_loaded = rule_table.rules().len(),
         max_keys = config.settings.max_cells,
         max_rules = rule_table.dictionary_capacity(),
+        max_peers = config.settings.peer_capacity,
         max_peer_instances = config.storage.node_dictionary_capacity(),
         "Starting gabion.",
     );

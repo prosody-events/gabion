@@ -44,7 +44,7 @@ impl PeerTable {
         self.addr[row]
     }
 
-    pub(super) fn find(&self, addr: SocketAddr) -> Option<usize> {
+    fn find(&self, addr: SocketAddr) -> Option<usize> {
         self.lookup(addr_hash(addr), addr).map(|row| row as usize)
     }
 

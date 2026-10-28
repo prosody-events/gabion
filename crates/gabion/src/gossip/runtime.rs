@@ -710,7 +710,7 @@ where
         // break Demers' O(log N) convergence bound — selecting the same peer
         // twice in one tick encodes and sends the same frame twice.
         // Rows have no order, and `PeerTable::swap` keeps the address index
-        // exact, so shuffling them is free.
+        // exact, so the table is shuffled in place.
         //
         // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
         // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`

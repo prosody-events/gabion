@@ -673,7 +673,11 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
         ..SimConfig::default()
     };
     let full = ceiling.settings().expect("full settings");
-    ceiling.validate().expect("ceiling-sized config validates");
+    let node_dictionary_capacity = ceiling
+        .validate()
+        .expect("ceiling-sized config validates")
+        .storage
+        .node_dictionary_capacity();
     assert_eq!(small.max_cells, full.max_cells);
     assert_eq!(
         small.forwarded_dirty_capacity,
@@ -681,30 +685,22 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
     );
     assert_eq!(small.peer_capacity, full.peer_capacity);
 
-    let node_dictionary_capacity = full
-        .validate()
-        .expect("full settings validate")
-        .1
-        .node_dictionary_capacity();
-    let caps = full;
     // Each origin holds its live buckets plus the one emerging, and every node
     // holds a replica of every origin's set — so the cell store must cover
     // `MAX_NODES × (live_buckets + 1)`.
     assert!(
-        caps.max_cells.get() as usize >= MAX_NODES * (live_buckets + 1),
+        full.max_cells.get() as usize >= MAX_NODES * (live_buckets + 1),
         "max_cells {} under the cross-node working set",
-        caps.max_cells,
+        full.max_cells,
     );
     // The forwarded-dirty ring carries replicas of every *other* origin's live
     // buckets — the cap the design analysis pins.
     assert!(
-        caps.forwarded_dirty_capacity.get() as usize >= (MAX_NODES - 1) * live_buckets,
+        full.forwarded_dirty_capacity.get() as usize >= (MAX_NODES - 1) * live_buckets,
         "forwarded_dirty_capacity {} under the replica working set",
-        caps.forwarded_dirty_capacity,
+        full.forwarded_dirty_capacity,
     );
-    // The node dictionary must intern every origin (this is the tightest cap —
-    // the slack is only a couple of slots) without truncating to a u16 below
-    // it.
+    // The node dictionary must intern every origin.
     assert!(
         usize::from(node_dictionary_capacity.get()) >= MAX_NODES,
         "node_dictionary_capacity {node_dictionary_capacity} cannot hold {MAX_NODES} origins",
@@ -715,12 +711,12 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
     // (`gabion::defaults::STORAGE_*`) — `STORAGE_FORWARDED_DIRTY_CAPACITY`
     // alone is 524 288.
     assert!(
-        (caps.forwarded_dirty_capacity.get() as usize)
+        (full.forwarded_dirty_capacity.get() as usize)
             < gabion::defaults::STORAGE_FORWARDED_DIRTY_CAPACITY / 50
     );
-    assert!((caps.max_cells.get() as usize) < gabion::defaults::STORAGE_MAX_CELLS / 20);
+    assert!((full.max_cells.get() as usize) < gabion::defaults::STORAGE_MAX_CELLS / 20);
     assert!(
-        (caps.local_dirty_capacity.get() as usize)
+        (full.local_dirty_capacity.get() as usize)
             < gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY / 1_000
     );
 }
