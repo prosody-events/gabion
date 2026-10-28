@@ -236,8 +236,16 @@ fn capacity_outside_its_range_fails() {
     for (setting, min, max) in [
         (Setting::StorageMaxCells, 1, 1 << 30),
         (Setting::GossipLimitQueueCapacity, 64, 1 << 20),
-        (Setting::GossipRecvBufferBytes, 65_536, (1 << 30) - 1),
-        (Setting::GossipSendBufferBytes, 65_536, (1 << 30) - 1),
+        (
+            Setting::GossipRecvBufferBytes,
+            u64::from(MIN_SOCKET_BUFFER_BYTES.get()),
+            MAX_SOCKET_BUFFER_BYTES,
+        ),
+        (
+            Setting::GossipSendBufferBytes,
+            u64::from(MIN_SOCKET_BUFFER_BYTES.get()),
+            MAX_SOCKET_BUFFER_BYTES,
+        ),
         (Setting::StorageRuleDictionaryCapacity, 1, 65_534),
         (Setting::StorageNodeDictionaryCapacity, 1, 65_534),
         (Setting::StorageMaxDescriptorCount, 1, 16),

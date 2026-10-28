@@ -977,7 +977,10 @@ impl<C: Count> CellStore<C> {
         live_buckets: &[u32],
         sink: &mut ExpirationSink<C>,
     ) -> Expiry {
-        debug_assert!(sink.capacity() > 0, "a zero-capacity sink takes no row");
+        debug_assert!(
+            sink.handles.capacity() > 0,
+            "a zero-capacity sink takes no row"
+        );
         for slot in self.expire_cursor..self.capacity {
             if !self.is_active(slot) {
                 continue;

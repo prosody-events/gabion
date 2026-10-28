@@ -4,7 +4,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -143,10 +142,6 @@ impl LoggingSimTransport {
 impl GossipTransport for LoggingSimTransport {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
-    }
-
-    fn writable<'a>(&'a self) -> impl Future<Output = io::Result<()>> + 'a {
-        self.inner.writable()
     }
 
     fn try_send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {

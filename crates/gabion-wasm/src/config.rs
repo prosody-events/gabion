@@ -203,8 +203,6 @@ impl SimConfig {
                 format!("{}ms", self.min_emit_interval_ms),
             ),
             (Setting::GossipClusterIdHash, CLUSTER_ID_HASH.to_string()),
-            // The per-tick frame is capped (see `VIZ_MAX_CELLS_PER_TICK`) so
-            // one tick's packet output stays inside the router's queues.
             (
                 Setting::GossipMaxCellsPerTick,
                 VIZ_MAX_CELLS_PER_TICK.min(cross_node as usize).to_string(),

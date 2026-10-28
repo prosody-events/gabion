@@ -2,8 +2,7 @@
 //!
 //! Production uses [`UdpTransport`] over a `tokio::net::UdpSocket`; tests and
 //! simulators use [`crate::gossip::sim::SimTransport`] over in-process mpsc
-//! channels. The API mirrors `tokio::net::UdpSocket` so the production
-//! wrapper is a thin newtype.
+//! channels.
 
 use std::future::Future;
 use std::io;
@@ -31,10 +30,11 @@ use crate::settings::Setting;
 pub trait GossipTransport {
     fn local_addr(&self) -> io::Result<SocketAddr>;
 
-    /// Resolves when the transport has room to send. The runtime does not
-    /// poll it (a refused packet waits for the next round); it stays part of
-    /// the trait the study harness implements.
-    fn writable<'a>(&'a self) -> impl Future<Output = io::Result<()>> + 'a;
+    /// Resolves at once unless overridden. The runtime never polls it; it
+    /// stays so the study harness's transports build against every arm.
+    fn writable<'a>(&'a self) -> impl Future<Output = io::Result<()>> + 'a {
+        async { Ok(()) }
+    }
 
     /// Non-blocking send. Returns `io::ErrorKind::WouldBlock` when the kernel
     /// refuses the datagram for lack of buffer space; [`UdpTransport`]
@@ -56,8 +56,8 @@ pub trait GossipTransport {
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a;
 }
 
-/// Thin newtype over [`UdpSocket`]. Every method delegates to the inner
-/// socket — zero overhead in production.
+/// Newtype over [`UdpSocket`]: `bind` sizes its kernel buffers, and
+/// `try_send_to` reports `ENOBUFS` as `WouldBlock`.
 #[cfg(feature = "transport-udp")]
 #[derive(Debug)]
 pub struct UdpTransport(pub(crate) UdpSocket);
@@ -94,7 +94,7 @@ impl UdpTransport {
 /// Warn that the kernel granted a socket buffer smaller than `setting` asked
 /// for.
 #[cfg(feature = "transport-udp")]
-pub(crate) fn warn_if_capped(
+pub(super) fn warn_if_capped(
     buffer: &'static str,
     sysctl: &'static str,
     setting: Setting,
@@ -125,7 +125,7 @@ pub(crate) fn warn_if_capped(
 /// A full interface queue refuses a datagram just as a full socket buffer
 /// does, so `ENOBUFS` becomes `WouldBlock`.
 #[cfg(feature = "transport-udp")]
-pub(crate) fn refusal(error: io::Error) -> io::Error {
+pub(super) fn refusal(error: io::Error) -> io::Error {
     if error.raw_os_error() == Some(libc::ENOBUFS) {
         io::ErrorKind::WouldBlock.into()
     } else {
@@ -138,11 +138,6 @@ impl GossipTransport for UdpTransport {
     #[inline]
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.0.local_addr()
-    }
-
-    #[inline]
-    async fn writable(&self) -> io::Result<()> {
-        self.0.writable().await
     }
 
     #[inline]

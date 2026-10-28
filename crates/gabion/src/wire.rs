@@ -171,7 +171,7 @@ const fn min_payload_bytes(count_size: usize, auth_overhead: usize) -> usize {
 /// Synchronous iterator over outbound packets. Not `std::iter::Iterator` —
 /// `next_into` takes a caller-owned buffer; `Iterator::next` cannot. A caller
 /// may stop early: handles it never encodes are simply not sent.
-#[must_use = "Packets encodes nothing until drained with next_into"]
+#[must_use = "Packets encodes nothing until next_into is called"]
 pub struct Packets<'a, C: Count> {
     header: Header,
     store: &'a CellStore<C>,
@@ -233,11 +233,6 @@ impl<'a, C: Count> Packets<'a, C> {
             limits,
             cursor: 0,
         })
-    }
-
-    /// Handles still to be encoded into a packet.
-    pub fn remaining(&self) -> usize {
-        self.handles.len() - self.cursor
     }
 
     /// Encode the next packet into `buf`. The encoder clears `buf` first.

@@ -241,15 +241,24 @@ async fn leader_main(
     register_rules(&mut cell_store, &rules);
 
     // A lone node still needs a socket for the runtime; an ephemeral
-    // loopback port can't collide with another nginx on the same host, and
-    // there is no one to discover.
-    let (bind, peers) = match config.gossip_bind {
-        Some(bind) => (bind, discovery::peer_events(config.discovery).left_stream()),
-        None => (LONE_NODE_BIND, futures::stream::empty().right_stream()),
+    // loopback port can't collide with another nginx on the same host, there
+    // is no one to discover, and it asks for the smallest buffers, since it
+    // sends nothing.
+    let (bind, peers, gossip) = match config.gossip_bind {
+        Some(bind) => (
+            bind,
+            discovery::peer_events(config.discovery).left_stream(),
+            config.gossip,
+        ),
+        None => (
+            LONE_NODE_BIND,
+            futures::stream::empty().right_stream(),
+            config.gossip.with_minimal_socket_buffers(),
+        ),
     };
     // Bind before the store empties the count table: a term that cannot
     // start leaves the last counts in force, with no leader to refill them.
-    let transport = UdpTransport::bind(bind, &config.gossip)
+    let transport = UdpTransport::bind(bind, &gossip)
         .await
         .context("bind the gossip socket")?;
     let (gossip_rt, gossip_client) = GossipRuntime::from_parts(
@@ -257,7 +266,7 @@ async fn leader_main(
         TokioClock::new(),
         // The setting sizes the SHM queue; the runtime's own queue only needs
         // room for one drain batch.
-        config.gossip.with_shallow_limit_queue(),
+        gossip.with_shallow_limit_queue(),
         cell_store,
         Rc::new(ShmAggregateStore::new(shm)),
     );

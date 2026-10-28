@@ -401,9 +401,10 @@ default 4 MiB) absorbs bursts and pauses such as CPU throttling;
 `gabion_gossip_send_buffer_bytes`, default 1 MiB) holds one round's packets.
 Linux grants at most `net.core.rmem_max` and `net.core.wmem_max` (212,992 bytes
 by default) and reports double what it grants. When it grants less than asked,
-gabion logs `socket_buffer_capped` once per buffer at start. Raise the host
-settings in the node's bootstrap; in Kubernetes they are node settings, not pod
-sysctls:
+gabion logs `socket_buffer_capped` once per buffer at start; an NGINX node with
+no `gabion_gossip_bind` asks for the smallest buffers and never logs it. Raise
+the host settings in the node's bootstrap; in Kubernetes they are node settings,
+not pod sysctls:
 
 ```sh
 sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=1048576

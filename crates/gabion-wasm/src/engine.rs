@@ -54,10 +54,10 @@ pub(crate) const VIZ_MAX_CELLS_PER_TICK: usize = 160;
 
 /// Each node's inbound queue, sized for the densest round the visualizer can
 /// build: every node in one zone, each of the other `MAX_NODES − 1` nodes
-/// handing a node one data packet and one control packet, 510 at 256 nodes.
-/// Today's random fanout hands a node about nine a round. A round that would
-/// overflow a node's queue drops the excess, which the logging transport
-/// reports as dropped.
+/// handing a node one packet on each of its two streams (own and relay), 510
+/// at 256 nodes. Today about nine senders pick a node each round, each sending
+/// up to eight packets. A stepped round that would overflow a node's queue
+/// drops the excess, which the logging transport reports as dropped.
 pub(crate) const VIZ_ROUTER_CAPACITY: usize = 2 * (MAX_NODES - 1);
 
 /// The count width every node uses. `u32` matches the bench and is plenty for

@@ -20,8 +20,9 @@ use tokio::task::{JoinHandle, LocalSet};
 
 use crate::crdt::{
     BucketEpoch, CellStore, Count, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
-    RuleDescriptor,
+    Observation, ObservationBatch, RuleDescriptor,
 };
+use crate::defaults::GOSSIP_EXPIRATION_BATCH;
 use crate::discovery::{Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
@@ -1018,6 +1019,56 @@ async fn gossip_tick_drives_expiration() {
         .await;
 }
 
+/// A boundary that ages out more cells than one expiration batch applies each
+/// full batch before taking the next, all in the round that crosses it.
+#[test]
+fn expiry_applies_each_full_batch_before_the_next() {
+    let cells = GOSSIP_EXPIRATION_BATCH + 1;
+    let mut store =
+        CellStore::<u32>::new(storage(cells as u32, 32, 32, cells as u32, 16), node(0xA));
+    store
+        .intern_rule(RuleDescriptor {
+            fingerprint: 0xFEED,
+            window_millis: 100,
+            bucket_millis: 100,
+            limit: 10,
+            flags: 0,
+            local_rule_id: 1,
+        })
+        .unwrap();
+    let mut batch = ObservationBatch::<u32>::with_capacity(cells);
+    for key in 0..cells as u128 {
+        batch.push(Observation {
+            rule_fingerprint: 0xFEED,
+            key_hash: KeyHash(key),
+            bucket: 0,
+            origin: NodeId(0),
+            incarnation: 0,
+            count: 1,
+            last_update_millis: 0,
+        });
+    }
+    store.ingest_local(&batch, &mut DeltaSink::with_capacity(cells));
+    run_paused(async {
+        let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
+        let (rt, _client) = GossipRuntime::from_parts(
+            MockTransport(Rc::default()),
+            TokioClock::from_millis(0),
+            sim_config(vec![], 1),
+            store,
+            agg.clone(),
+        );
+        tokio::task::spawn_local(rt.run(futures::stream::empty()));
+        heartbeats(1).await;
+        assert_eq!(agg.apply_call_lens(), []);
+        heartbeats(1).await;
+        assert_eq!(
+            agg.apply_call_lens(),
+            [(0, GOSSIP_EXPIRATION_BATCH), (0, 1)]
+        );
+    });
+}
+
 /// A configured rule that goes idle long enough for every cell to expire must
 /// still age out on its *configured* window when traffic resumes — not silently
 /// fall back to the 60 s default. Exercises the `GossipRuntime` both adapters
@@ -1505,10 +1556,6 @@ async fn coverage_fanout_tracks_ln_n_plus_c() {
 /// records `last_effective_fanout` from the computed pick *before* any send,
 /// so the addresses serve only to set `self.peers.len()`.
 async fn observe_coverage_fanout(peers: usize, base: usize) -> usize {
-    use tokio::sync::mpsc;
-
-    use crate::gossip::AdminCommand;
-
     let router = SimRouter::new();
     let local_addr = sock(41_000);
     let transport = router.bind(local_addr);
@@ -1631,9 +1678,7 @@ async fn admin_snapshot_reflects_runtime_state() {
     let local = LocalSet::new();
     local
         .run_until(async {
-            use tokio::sync::{mpsc, oneshot};
-
-            use crate::gossip::{AdminCommand, AdminSnapshot};
+            use tokio::sync::oneshot;
 
             let router = SimRouter::new();
             let addr = sock(40_300);
@@ -1685,10 +1730,7 @@ async fn admin_snapshot_reflects_runtime_state() {
 
 // -- shared helpers for coverage-gap tests ----------------------------------
 
-async fn admin_snapshot(
-    admin_tx: &tokio::sync::mpsc::Sender<crate::gossip::AdminCommand>,
-) -> crate::gossip::AdminSnapshot {
-    use crate::gossip::AdminCommand;
+async fn admin_snapshot(admin_tx: &mpsc::Sender<AdminCommand>) -> AdminSnapshot {
     use tokio::sync::oneshot;
     let (reply_tx, reply_rx) = oneshot::channel();
     admin_tx
@@ -1740,9 +1782,6 @@ impl Arbitrary for PairingCase {
 /// with `record()` and snapshots after each step.
 #[quickcheck]
 fn quickcheck_peer_slot_pairing_holds_across_lifecycle(case: PairingCase) -> TestResult {
-    use crate::discovery::{Peer, PeerEvent};
-    use tokio::sync::mpsc;
-
     run_paused(async move {
         const NODE_COUNT: usize = 3;
         let router = SimRouter::new();
@@ -1953,8 +1992,6 @@ fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
 /// the counter.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn decode_rejects_increment_on_wrong_auth() {
-    use tokio::sync::mpsc;
-
     let local = LocalSet::new();
     local
         .run_until(async {
@@ -2016,6 +2053,9 @@ async fn decode_rejects_increment_on_wrong_auth() {
                 snap.decode_reject_count,
                 TICKS
             );
+            // Every packet B received was counted before its decode failed.
+            assert_eq!(snap.counters.packets_received, snap.decode_reject_count);
+            assert!(snap.counters.bytes_received > snap.counters.packets_received);
 
             client_a.shutdown().await.unwrap();
             client_b.shutdown().await.unwrap();
@@ -2070,10 +2110,17 @@ async fn heartbeats(n: u32) {
     sim_advance_ticks(Duration::from_millis(100), n).await;
 }
 
-/// The log lines whose `code` field is `code`.
-fn coded<'a>(logs: &'a str, code: &str) -> Vec<&'a str> {
-    let field = format!("code=\"{code}\"");
-    logs.lines().filter(|line| line.contains(&field)).collect()
+/// Exactly `count` log lines carry `code`, and each holds every one of
+/// `fields`.
+fn assert_logged(logs: &str, code: &str, count: usize, fields: &[&str]) {
+    let code = format!("code=\"{code}\"");
+    let lines: Vec<&str> = logs.lines().filter(|line| line.contains(&code)).collect();
+    assert_eq!(lines.len(), count, "{logs}");
+    for line in lines {
+        for field in fields {
+            assert!(line.contains(field), "{field} missing from {line}");
+        }
+    }
 }
 
 /// Twelve requests at one instant against a rule whose error budget is one
@@ -2093,7 +2140,7 @@ async fn threshold_rounds_in_a_burst(peers: Vec<SocketAddr>, refuse: bool) -> Ad
     admin_snapshot(&admin).await
 }
 
-/// U15. A lone node settles the error budget although it has no one to send
+/// A lone node settles the error budget although it has no one to send
 /// to, so a burst runs one threshold round, not one per request.
 #[test]
 fn lone_node_settles_the_error_budget() {
@@ -2111,7 +2158,7 @@ fn blocked_socket_does_not_fire_a_threshold_round_per_request() {
     assert_eq!(snapshot.counters.send_blocked, 1);
 }
 
-/// U24. A refused packet is held and retried first on every later round,
+/// A refused packet is held and retried first on every later round,
 /// unchanged although newer counts arrived; nothing encodes over it, and the
 /// round that finally sends it goes on to gossip. One `u32` cell fills a
 /// packet, so the refusal cuts a two-packet frame after its first packet.
@@ -2155,11 +2202,13 @@ fn refused_send_holds_one_packet() {
         );
         let counters = admin_snapshot(&admin).await.counters;
         assert_eq!((counters.send_blocked, counters.packets_sent), (3, 5));
+        let sent: u64 = accepted.iter().map(|a| a.bytes.len() as u64).sum();
+        assert_eq!(counters.bytes_sent, sent);
     });
 }
 
-/// E-Z5 logs the 1st, 2nd and 4th of five refusals, each naming the sysctl
-/// and the size gabion asked for.
+/// `send_blocked` logs the 1st, 2nd and 4th of five refusals, each naming the
+/// sysctl and the size gabion asked for.
 #[test]
 fn send_blocked_warns_at_powers_of_two_naming_wmem_max() {
     let ((), logs) = with_logs(|| {
@@ -2173,20 +2222,20 @@ fn send_blocked_warns_at_powers_of_two_naming_wmem_max() {
             assert_eq!(admin_snapshot(&admin).await.counters.send_blocked, 5);
         })
     });
-    let lines = coded(&logs, "send_blocked");
-    assert_eq!(lines.len(), 3, "{logs}");
-    for line in lines {
-        for field in [
+    assert_logged(
+        &logs,
+        "send_blocked",
+        3,
+        &[
             "sysctl=\"net.core.wmem_max\"",
             "send_blocked_total=",
             "requested_send_buffer_bytes=1048576",
-        ] {
-            assert!(line.contains(field), "{field} missing from {line}");
-        }
-    }
+            "granted_send_buffer_bytes=212992",
+        ],
+    );
 }
 
-/// U25 (C4). A send error drops that one packet: the runtime keeps running
+/// A send error drops that one packet: the runtime keeps running
 /// and keeps gossiping with the other peer.
 #[test]
 fn send_error_to_one_peer_keeps_gossiping() {
@@ -2205,15 +2254,11 @@ fn send_error_to_one_peer_keeps_gossiping() {
             assert_eq!((counters.send_errors, counters.packets_sent), (3, 3));
         })
     });
-    let lines = coded(&logs, "send_error");
-    assert_eq!(lines.len(), 2, "{logs}");
-    for line in lines {
-        assert!(line.contains(&format!("peer={}", sock(2))), "{line}");
-        assert!(line.contains("send_errors_total="), "{line}");
-    }
+    let peer = format!("peer={}", sock(2));
+    assert_logged(&logs, "send_error", 2, &[&peer, "send_errors_total="]);
 }
 
-/// U26 (C5, E4). A packet that cannot be encoded is counted and logged. A
+/// A packet that cannot be encoded is counted and logged. A
 /// `u64` cell needs 156 bytes, more than the 152 validation allows.
 #[test]
 fn encode_failure_is_counted_and_logged() {
@@ -2231,16 +2276,13 @@ fn encode_failure_is_counted_and_logged() {
             assert_eq!(admin_snapshot(&admin).await.counters.encode_failures, 3);
         })
     });
-    let lines = coded(&logs, "encode_failed");
-    assert_eq!(lines.len(), 2, "{logs}");
-    for line in lines {
-        assert!(line.contains(&format!("peer={}", sock(2))), "{line}");
-    }
+    assert_logged(&logs, "encode_failed", 2, &[&format!("peer={}", sock(2))]);
 }
 
-/// U29. E-Z8 fires when the kernel grants less than the setting asked for,
-/// naming the setting in every spelling and the sysctl; a real socket gets
-/// the configured request, not the default.
+/// `socket_buffer_capped` fires when the kernel grants less than the setting
+/// asked for, naming the setting in every spelling and the sysctl; a real
+/// socket gets the configured request, not the default, and the minimal
+/// buffers a lone node asks for never warn.
 #[cfg(feature = "transport-udp")]
 #[test]
 fn socket_buffer_warning_when_granted_is_smaller() {
@@ -2253,26 +2295,25 @@ fn socket_buffer_warning_when_granted_is_smaller() {
             let setting = Setting::GossipRecvBufferBytes;
             warn_if_capped("receive", "net.core.rmem_max", setting, requested, granted);
         });
-        let lines = coded(&logs, "socket_buffer_capped");
-        assert_eq!(lines.len(), warnings, "{granted}: {logs}");
-        for line in lines {
-            for text in [
+        assert_logged(
+            &logs,
+            "socket_buffer_capped",
+            warnings,
+            &[
                 "gossip.recv_buffer_bytes",
                 "GABION_GOSSIP_RECV_BUFFER_BYTES",
                 "gabion_gossip_recv_buffer_bytes",
                 "sysctl=\"net.core.rmem_max\"",
-            ] {
-                assert!(line.contains(text), "{text} missing from {line}");
-            }
-        }
+            ],
+        );
     }
 
+    let config = tuned_config(vec![], 0, |s| {
+        s.recv_buffer_bytes = 65_536.try_into().unwrap();
+        s.send_buffer_bytes = ((1 << 30) - 1).try_into().unwrap();
+    });
     let (receive, logs) = with_logs(|| {
         run_paused(async {
-            let config = tuned_config(vec![], 0, |s| {
-                s.recv_buffer_bytes = 65_536.try_into().unwrap();
-                s.send_buffer_bytes = ((1 << 30) - 1).try_into().unwrap();
-            });
             let transport = UdpTransport::bind(sock(0), &config).await.unwrap();
             socket2::SockRef::from(&transport.0)
                 .recv_buffer_size()
@@ -2281,10 +2322,25 @@ fn socket_buffer_warning_when_granted_is_smaller() {
     });
     // Linux reports double the grant.
     assert!(receive <= 131_072, "receive buffer {receive}");
-    let lines = coded(&logs, "socket_buffer_capped");
-    assert_eq!(lines.len(), 1, "{logs}");
-    assert!(lines[0].contains("buffer=\"send\""), "{logs}");
-    assert!(lines[0].contains("requested_bytes=1073741823"), "{logs}");
+    assert_logged(
+        &logs,
+        "socket_buffer_capped",
+        1,
+        &[
+            "buffer=\"send\"",
+            "requested_bytes=1073741823",
+            "sysctl=\"net.core.wmem_max\"",
+            "gossip.send_buffer_bytes",
+        ],
+    );
+
+    let minimal = config.with_minimal_socket_buffers();
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            UdpTransport::bind(sock(0), &minimal).await.unwrap();
+        })
+    });
+    assert_logged(&logs, "socket_buffer_capped", 0, &[]);
 }
 
 #[cfg(feature = "transport-udp")]
@@ -2453,9 +2509,6 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
 /// length transitions are `1 → 1 → 0 → 0 → 1`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn peer_event_lifecycle_is_idempotent_and_tolerant() {
-    use crate::discovery::{Peer, PeerEvent};
-    use tokio::sync::mpsc;
-
     let local = LocalSet::new();
     local
         .run_until(async {

@@ -452,7 +452,6 @@ fn flag_more_unset_on_only_packet() {
         let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
         assert_eq!(pkt.flags & FLAG_MORE, 0);
         assert_eq!(pkt.cells_emitted, handles.len() as u32);
-        assert_eq!(packets.remaining(), 0);
     }
 }
 
@@ -498,8 +497,8 @@ fn decoder_rejects_bad_slot() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
+        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
     let mut frame = buf.as_bytes().to_vec();
 
@@ -539,8 +538,8 @@ fn decoder_rejects_truncated_dict() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
+        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
     let mut frame = buf.as_bytes().to_vec();
     // Drop one byte from the dict region — header.body_len now disagrees
@@ -612,8 +611,8 @@ fn count_width_mismatch_is_rejected() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
+        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
     let mut obs = ObservationBatch::<u64>::with_capacity(1);
     let err = decode_unauth::<u64>(buf.as_bytes(), limits, &mut obs).unwrap_err();
@@ -641,7 +640,6 @@ fn visitor_accept_header_short_circuit() {
                 .expect("ctor");
         let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
         assert_eq!(pkt.cells_emitted, 1);
-        assert_eq!(packets.remaining(), 0);
     }
     let mut visited = 0_usize;
     let _summary: DecodedSummary =
@@ -688,8 +686,8 @@ fn body_len_mismatch_reported() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
+        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
     let mut frame = buf.as_bytes().to_vec();
     frame.pop();
@@ -732,7 +730,6 @@ fn header_flags_track_auth() {
         let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
         assert_eq!(pkt.flags & FLAG_AUTHENTICATED, FLAG_AUTHENTICATED);
         assert_eq!(pkt.flags & FLAG_MORE, 0);
-        assert_eq!(packets.remaining(), 0);
     }
 
     let mut obs = ObservationBatch::<u32>::with_capacity(2);
@@ -772,8 +769,8 @@ fn auth_visit_works() {
             limits,
         )
         .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
+        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
 
     let mut count = 0_usize;
@@ -805,8 +802,8 @@ fn visitor_matches_allocating_for_curated_rows() {
         let mut packets =
             Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
                 .expect("ctor");
-        packets.next_into(&mut buf).expect("encode").expect("some");
-        assert_eq!(packets.remaining(), 0);
+        let pkt = packets.next_into(&mut buf).expect("encode").expect("some");
+        assert_eq!(pkt.flags & FLAG_MORE, 0);
     }
 
     let mut visited: Vec<WireCell<u32>> = Vec::new();

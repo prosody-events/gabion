@@ -70,7 +70,8 @@ pub const GOSSIP_LIMIT_QUEUE_CAPACITY: usize = 8192;
 pub const GOSSIP_RECV_BUFFER_BYTES: u32 = 4 << 20;
 
 /// Send buffer, in bytes, the gossip socket asks the kernel for: 1 MiB.
-/// `send_blocked` warns when a round fills it.
+/// `socket_buffer_capped` warns when `net.core.wmem_max` grants less;
+/// `send_blocked` when a round fills it.
 pub const GOSSIP_SEND_BUFFER_BYTES: u32 = 1 << 20;
 
 /// The most expired cells one expiry call frees before the runtime applies

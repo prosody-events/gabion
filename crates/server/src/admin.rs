@@ -31,7 +31,7 @@ use gabion::crdt::Count;
 
 /// Adapter state for the admin endpoint. Holds:
 /// - the rule table for `/snapshot` to surface rules
-/// - the DashMap aggregate (for size + sampling)
+/// - the DashMap aggregate (for its row count)
 /// - the gossip admin channel (for runtime/peer/store stats)
 pub struct AdminState<C: Count> {
     rule_table: Arc<RuleTable>,

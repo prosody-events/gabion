@@ -87,7 +87,7 @@ Message starts: "The kernel's send buffer for the gossip socket was full"
 
 **Why.** Usually the send buffer is smaller than gabion asked for (look for an earlier `socket_buffer_capped` naming `net.core.wmem_max`), or the host's network is saturated.
 
-**What to do next.** Raise `net.core.wmem_max` on the host to at least `requested_send_buffer_bytes` (see "Socket buffers" in the [gabion README](README.md#socket-buffers)), and keep `gossip.send_buffer_bytes` at or above what one round sends.
+**What to do next.** Raise `net.core.wmem_max` on the host to at least `requested_send_buffer_bytes` (see "Socket buffers" in the [gabion README](README.md#socket-buffers)), and keep `gossip.send_buffer_bytes` at or above what one round sends, raising both together when `granted_send_buffer_bytes` already matches the request.
 
 **Fields** `send_blocked_total`, `requested_send_buffer_bytes`, `granted_send_buffer_bytes`, `sysctl`, `config_key` · **Knob** `gossip.send_buffer_bytes` (`GABION_GOSSIP_SEND_BUFFER_BYTES`) / `gabion_gossip_send_buffer_bytes`
 

@@ -1,9 +1,9 @@
 //! Admin snapshot channel for observability.
 //!
-//! Lives outside the hot path: the runtime services [`AdminCommand`] as a
-//! fifth `select!` arm only when the constructor was handed a receiver, so the
-//! production loop without admin is unchanged. The reply is built inside the
-//! gossip task — callers never get a `Sync` borrow of the runtime's internals.
+//! Lives outside the hot path: the runtime services [`AdminCommand`] on its
+//! admin arm; without a receiver the admin arm never fires. The reply is built
+//! inside the gossip task — callers never get a `Sync` borrow of the runtime's
+//! internals.
 
 use std::net::SocketAddr;
 
@@ -78,9 +78,8 @@ pub struct AdminSnapshot {
     pub last_error_budget: u64,
 }
 
-/// What the runtime has sent, received and failed to send since startup. Each
-/// field is a plain add on the path that handles its event.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// What the runtime has sent, received and failed to send since startup.
+#[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct GossipCounters {
     /// Datagrams the socket accepted.

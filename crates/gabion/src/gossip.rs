@@ -72,7 +72,8 @@ pub struct ValidGossipConfig {
     /// Receive buffer, in bytes, the UDP socket asks the kernel for.
     #[cfg(feature = "transport-udp")]
     pub(crate) recv_buffer_bytes: NonZeroU32,
-    /// Send buffer, in bytes, the UDP socket asks the kernel for.
+    /// Send buffer, in bytes, the UDP socket asks the kernel for; the
+    /// `send_blocked` warning also names it, so it exists in every build.
     pub(crate) send_buffer_bytes: NonZeroU32,
     /// Period between proactive gossip ticks.
     pub(crate) tick_interval: Duration,
@@ -99,6 +100,17 @@ impl ValidGossipConfig {
     pub fn with_shallow_limit_queue(self) -> Self {
         Self {
             limit_queue_capacity: MIN_LIMIT_QUEUE_CAPACITY,
+            ..self
+        }
+    }
+
+    /// Ask for the smallest socket buffers, for a node with no peers: its
+    /// socket carries no gossip, so a host cap is no reason to warn.
+    #[cfg(feature = "transport-udp")]
+    pub fn with_minimal_socket_buffers(self) -> Self {
+        Self {
+            recv_buffer_bytes: crate::settings::MIN_SOCKET_BUFFER_BYTES,
+            send_buffer_bytes: crate::settings::MIN_SOCKET_BUFFER_BYTES,
             ..self
         }
     }

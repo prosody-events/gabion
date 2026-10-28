@@ -1221,12 +1221,12 @@ fn bench_wire(c: &mut Criterion) {
             limits,
         )
         .expect("preflight ctor");
-        packets
+        let packet = packets
             .next_into(&mut preflight_buf)
             .expect("preflight encode")
             .expect("at least one packet");
         // 128 cells fits in the default 256 KiB budget, so it's one packet.
-        assert_eq!(packets.remaining(), 0);
+        assert_eq!(packet.cells_emitted, 128);
     }
     let frame_buf: Vec<u8> = preflight_buf.as_bytes().to_vec();
     group.bench_function("decode_128", |b| {

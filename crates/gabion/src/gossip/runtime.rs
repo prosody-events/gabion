@@ -95,9 +95,8 @@ where
     clock: K,
     requests_rx: mpsc::Receiver<Request>,
     /// Optional admin command channel. `None` in embedded / test setups where
-    /// no observability surface is wired up — the matching `select!` arm is
-    /// guarded so the production hot path is byte-identical to the no-admin
-    /// case.
+    /// no observability surface is wired up; without a receiver the admin arm
+    /// never fires.
     admin_rx: Option<mpsc::Receiver<AdminCommand>>,
 
     // Downstream count store (write-only).
@@ -240,9 +239,8 @@ where
         Self::from_parts_with_admin(transport, clock, config, store, aggregates, None)
     }
 
-    /// Generic entry point with an optional admin command channel. The
-    /// runtime polls the admin arm only when `admin_rx.is_some()`, so the
-    /// no-admin case keeps the original five-arm `select!` shape.
+    /// Generic entry point with an optional admin command channel; without a
+    /// receiver the admin arm never fires.
     pub fn from_parts_with_admin(
         transport: T,
         clock: K,
@@ -324,8 +322,8 @@ where
         self.transport.local_addr()
     }
 
-    /// Run the event loop until shutdown is requested. `peer_events` is the
-    /// fourth select arm; pass `futures::stream::empty()` if discovery is
+    /// Run the event loop until shutdown is requested. `peer_events` feeds
+    /// the peer-event arm; pass `futures::stream::empty()` if discovery is
     /// not yet wired up.
     pub async fn run<St>(mut self, peer_events: St) -> Result<(), GossipError>
     where
@@ -686,14 +684,13 @@ where
         self.expire_cells();
         self.settle();
         if let Some(dst) = self.held {
-            let Self {
-                transport,
-                packet,
-                counters,
-                config,
-                ..
-            } = self;
-            if !send_packet(transport, packet, dst, counters, config.send_buffer_bytes) {
+            if !send_packet(
+                &self.transport,
+                &self.packet,
+                dst,
+                &mut self.counters,
+                self.config.send_buffer_bytes,
+            ) {
                 return;
             }
             self.held = None;
@@ -706,7 +703,7 @@ where
     fn expire_cells(&mut self) {
         let now_millis = self.clock.now_millis();
         while self.store.expire_at(now_millis, &mut self.expiration_buf) == Expiry::More {
-            // `sink_buf` is empty: the previous iteration's apply cleared it.
+            debug_assert!(self.sink_buf.is_empty());
             self.aggregates.apply(&self.sink_buf, &self.expiration_buf);
             self.expiration_buf.clear();
         }
@@ -928,7 +925,8 @@ fn send_packet<T: GossipTransport>(
                      requests over the limit. Usually the send buffer is smaller than gabion \
                      asked for (look for an earlier warning naming `net.core.wmem_max`), or the \
                      host's network is saturated. Raise `net.core.wmem_max` on the host to at \
-                     least {} bytes, the size {} asks for.",
+                     least {0} bytes, the size {1} asks for. If the host already grants that \
+                     much, raise {1} and `net.core.wmem_max` together.",
                     send_buffer,
                     Setting::GossipSendBufferBytes,
                 );

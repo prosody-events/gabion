@@ -249,6 +249,13 @@ const MAX_PAYLOAD_BYTES: usize = 65_507;
 /// request queue under [`ValidGossipConfig::with_shallow_limit_queue`].
 pub const MIN_LIMIT_QUEUE_CAPACITY: NonZeroUsize = nz!(64);
 
+/// The smallest socket buffer either `gossip.*_buffer_bytes` setting may ask
+/// for.
+pub const MIN_SOCKET_BUFFER_BYTES: NonZeroU32 = nz!(65_536);
+
+/// The largest: the kernel doubles the request and keeps it in a C `int`.
+const MAX_SOCKET_BUFFER_BYTES: u64 = (1 << 30) - 1;
+
 /// The largest error budget: 10,000 basis points are the whole limit.
 const MAX_ERROR_BUDGET_BPS: u32 = 10_000;
 
@@ -313,15 +320,15 @@ impl Settings {
             (
                 Setting::GossipRecvBufferBytes,
                 u64::from(self.recv_buffer_bytes.get()),
-                65_536,
-                (1 << 30) - 1,
+                u64::from(MIN_SOCKET_BUFFER_BYTES.get()),
+                MAX_SOCKET_BUFFER_BYTES,
                 socket,
             ),
             (
                 Setting::GossipSendBufferBytes,
                 u64::from(self.send_buffer_bytes.get()),
-                65_536,
-                (1 << 30) - 1,
+                u64::from(MIN_SOCKET_BUFFER_BYTES.get()),
+                MAX_SOCKET_BUFFER_BYTES,
                 socket,
             ),
             (

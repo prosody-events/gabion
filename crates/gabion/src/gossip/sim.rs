@@ -56,7 +56,8 @@ struct SimRouterInner {
     /// decides the packet is delivered. Used by property tests that check
     /// peer-sampling distribution.
     received_counts: RefCell<HashMap<SocketAddr, u64>>,
-    /// Per-receiver send-channel capacity. Bounded queue applies backpressure.
+    /// Each receiver's inbound queue capacity. A full queue refuses an
+    /// immediate send with `WouldBlock` and drops a deferred one.
     channel_capacity: usize,
     /// When set, `try_send_to` buffers outbound packets in `held` instead of
     /// delivering them to the destination's inbound channel immediately. The
@@ -263,10 +264,6 @@ impl SimTransport {
 impl GossipTransport for SimTransport {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.addr)
-    }
-
-    async fn writable(&self) -> io::Result<()> {
-        Ok(())
     }
 
     fn try_send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {

@@ -41,8 +41,8 @@ impl GossipTransport for MockTransport {
         Ok(SocketAddr::from(([127, 0, 0, 1], 1)))
     }
 
-    async fn writable(&self) -> io::Result<()> {
-        Ok(())
+    fn send_buffer_bytes(&self) -> Option<usize> {
+        Some(212_992)
     }
 
     fn try_send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {

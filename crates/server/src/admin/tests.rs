@@ -60,8 +60,9 @@ fn build_router(gossip_admin: mpsc::Sender<AdminCommand>) -> axum::Router {
     router(state)
 }
 
-/// The `/snapshot` JSON is the library's snapshot serialised as is, so a
-/// renamed field or an id written in decimal changes this shape.
+/// The `/snapshot` JSON is the library's snapshot flattened, with the rules
+/// and the aggregate row count, so a renamed field or an id written in decimal
+/// changes this shape.
 #[test]
 fn snapshot_json_shape_is_pinned() {
     run_local(async {
@@ -193,6 +194,10 @@ fn snapshot_json_shape_is_pinned() {
         assert_eq!(
             body["rules"][0]["fingerprint"],
             format!("{:#034x}", sample_rule().fingerprint)
+        );
+        assert_eq!(
+            body["rules"][0]["domain_hash"],
+            format!("{:#034x}", sample_rule().domain_hash.0)
         );
         assert_eq!(body["rules"][0]["mode"], "enforce");
         assert_eq!(body["aggregate_rows"], 0);

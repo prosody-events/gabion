@@ -1,10 +1,9 @@
 use super::*;
+use crate::mock::with_logs;
 use crate::settings::mock::storage;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::{BTreeMap, BTreeSet};
-
-use crate::mock::with_logs;
 
 fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
@@ -445,7 +444,11 @@ fn quickcheck_delta_sink_rows_are_exact_remote_raises(rows: RemoteRows) -> bool 
 }
 
 #[quickcheck]
-fn quickcheck_expire_frees_exactly_aged_out_cells(rows: RemoteRows, current_seed: u8) -> bool {
+fn quickcheck_expire_frees_exactly_aged_out_cells(
+    rows: RemoteRows,
+    current_seed: u8,
+    cap_seed: u8,
+) -> bool {
     let mut store = quickcheck_store();
     apply_remote_rows(&mut store, &rows.0);
     let before: Vec<CellRow<u32>> = store
@@ -470,16 +473,27 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(rows: RemoteRows, current_seed
         .map(|row| row.handle.index)
         .collect();
 
-    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
-    assert_eq!(store.expire(&current, &live, &mut exp), Expiry::Done);
-    let expired: BTreeSet<u32> = exp.handles.iter().map(|h| h.index).collect();
-    if expired != expected_expired || exp.len() != expected_expired.len() {
-        return false;
-    }
-    for handle in &exp.handles {
-        if store.get(*handle).is_some() {
-            return false;
+    let cap = cap_seed as usize % 8 + 1;
+    let mut exp = ExpirationSink::<u32>::with_capacity(cap);
+    let mut expired = BTreeSet::new();
+    let (mut emitted, mut calls) = (0, 0);
+    loop {
+        let expiry = store.expire(&current, &live, &mut exp);
+        calls += 1;
+        emitted += exp.len();
+        expired.extend(exp.handles.iter().map(|h| h.index));
+        match expiry {
+            Expiry::More if exp.len() != cap || store.expire_cursor == 0 => return false,
+            Expiry::More => exp.clear(),
+            Expiry::Done if store.expire_cursor != 0 => return false,
+            Expiry::Done => break,
         }
+    }
+    if expired != expected_expired
+        || emitted != expected_expired.len()
+        || calls != expected_expired.len().div_ceil(cap).max(1)
+    {
+        return false;
     }
     for row in before {
         let should_survive = !expected_expired.contains(&row.handle.index);
@@ -675,7 +689,7 @@ fn capacity_is_enforced_without_growing() {
     assert_eq!(store.capacity(), 1);
 }
 
-/// U16 (C12). A bucket boundary that expires more cells than the sink holds
+/// A bucket boundary that expires more cells than the sink holds
 /// frees them in batches: each call stops when the sink is full, the next
 /// resumes where it stopped, and the sink never grows.
 #[test]
