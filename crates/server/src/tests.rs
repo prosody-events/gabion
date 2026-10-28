@@ -229,6 +229,17 @@ fn maps_descriptors_and_returns_ok_or_over_limit() {
         // 10-hit limit.
         assert_eq!(second.overall_code, rate_limit_response::Code::Ok as i32);
         assert_eq!(second.statuses.len(), 1);
+        // Both requests, at 0 ms and 1 ms, count in the 100 ms bucket 0.
+        let key = hash_key(
+            "api",
+            [Descriptor {
+                key: "tenant",
+                value: "a",
+            }],
+        );
+        let fingerprint = harness.limiter.rule_table.rules()[0].spec().fingerprint;
+        let cell = harness.limiter.counts.table().get(fingerprint, key.0, 0);
+        assert_eq!(cell.map(|cell| cell.count), Some(4));
 
         // Pump until we exceed the limit.
         for tick in 2..10 {

@@ -62,7 +62,20 @@ fn allow_on_empty_aggregate() {
         }
         other => panic!("expected Allow(Some), got {other:?}"),
     }
-    assert_eq!(queued(&region), 1);
+    // The queued hit lands in the 250 ms bucket holding now=1000ms: bucket 4.
+    let mut events = [QueueEvent::default(); 2];
+    assert_eq!(region.queue().drain(&mut events), 1);
+    assert_eq!(
+        events[0],
+        QueueEvent {
+            rule_fingerprint: rules.table().rules()[0].spec().fingerprint,
+            key_hash: key_hash("tenant", "alice").0,
+            bucket: 4,
+            hits: 1,
+            rule_limit: 2,
+            now_millis: 1_000,
+        }
+    );
 }
 
 #[test]
