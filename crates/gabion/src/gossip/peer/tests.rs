@@ -19,7 +19,7 @@ fn addr(i: u8) -> SocketAddr {
     }
 }
 
-/// After any mix of inserts, removes, swaps and identity updates, `find`
+/// After any mix of inserts, removes, shuffles and identity updates, `find`
 /// returns exactly the row a linear scan finds, and the rows hold exactly the
 /// model's peers with their identities.
 #[quickcheck]
@@ -45,9 +45,7 @@ fn peer_table_index_matches_linear_scan(ops: Vec<(u8, u8, u8)>) {
                 model.retain(|p| p.0 != a);
                 assert_eq!(table.remove(a), had);
             }
-            2 if table.len() > 0 => {
-                table.swap(usize::from(x) % table.len(), usize::from(y) % table.len())
-            }
+            2 => table.shuffle_front(usize::from(x), || u64::from(y)),
             3 => {
                 let identity = NodeIdentity::new(NodeId(u128::from(y)), 1);
                 table.set_identity(a, identity);

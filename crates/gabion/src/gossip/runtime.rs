@@ -705,12 +705,10 @@ where
         // have local_dirty>0) always count.
         self.dirty_ticks = self.dirty_ticks.saturating_add(1);
 
-        // Pick `fanout` distinct peers via a partial Fisher-Yates shuffle of
-        // `self.peers` in place. With-replacement sampling would silently
-        // break Demers' O(log N) convergence bound — selecting the same peer
-        // twice in one tick encodes and sends the same frame twice.
-        // Rows have no order, and `PeerTable::swap` keeps the address index
-        // exact, so the table is shuffled in place.
+        // Pick `fanout` distinct peers by shuffling them to the table's front
+        // rows. With-replacement sampling would silently break Demers'
+        // O(log N) convergence bound — selecting the same peer twice in one
+        // tick encodes and sends the same frame twice.
         //
         // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
         // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`
@@ -736,10 +734,7 @@ where
         // recent tick that actually gossiped.
         self.last_effective_fanout = pick_count;
         self.peak_effective_fanout = self.peak_effective_fanout.max(pick_count);
-        for i in 0..pick_count {
-            let j = i + (self.rng.next_u64() as usize) % (n - i);
-            self.peers.swap(i, j);
-        }
+        self.peers.shuffle_front(pick_count, || self.rng.next_u64());
 
         for peer_idx in 0..pick_count {
             let peer_addr = self.peers.addr(peer_idx);

@@ -40,8 +40,9 @@ impl PeerTable {
         self.len
     }
 
+    /// A live row's address; a row at or past `len` is out of bounds.
     pub(super) fn addr(&self, row: usize) -> SocketAddr {
-        self.addr[row]
+        self.addr[..self.len][row]
     }
 
     fn find(&self, addr: SocketAddr) -> Option<usize> {
@@ -82,9 +83,18 @@ impl PeerTable {
         true
     }
 
-    /// Exchange two rows; the index follows both. The round's peer pick uses
-    /// it.
-    pub(super) fn swap(&mut self, a: usize, b: usize) {
+    /// Move `count` distinct peers, drawn with `draw`, to rows
+    /// `0..count`: a partial Fisher-Yates shuffle, which never picks a peer
+    /// twice.
+    pub(super) fn shuffle_front(&mut self, count: usize, mut draw: impl FnMut() -> u64) {
+        for i in 0..count.min(self.len) {
+            let j = i + draw() as usize % (self.len - i);
+            self.swap(i, j);
+        }
+    }
+
+    /// Exchange two live rows; the index follows both.
+    fn swap(&mut self, a: usize, b: usize) {
         self.reindex(a, b);
         self.reindex(b, a);
         self.addr.swap(a, b);
