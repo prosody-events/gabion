@@ -187,23 +187,6 @@ fn bad_scalar_env_value_returns_error_not_panic() {
     );
 }
 
-#[test]
-fn send_queue_capacity_above_255_fails_to_load() {
-    let _env = EnvGuard::lock();
-    let err = AppConfig::load_with_yaml_str("gossip:\n  send_queue_capacity: 256\n")
-        .expect_err("256 send slots overflow the slot numbers");
-    assert!(
-        matches!(
-            err,
-            ConfigError::Setting(SettingError::Malformed {
-                setting: Setting::GossipSendQueueCapacity,
-                ..
-            })
-        ),
-        "{err:?}"
-    );
-}
-
 /// A valid value for `setting`, different from its default.
 fn sample(setting: Setting) -> &'static str {
     match setting {
@@ -226,8 +209,9 @@ fn sample(setting: Setting) -> &'static str {
         Setting::GossipMaxPayloadBytes => "1200",
         Setting::GossipMaxCellsPerFrame => "1024",
         Setting::GossipMaxCellsPerTick => "2048",
-        Setting::GossipSendQueueCapacity => "64",
         Setting::GossipLimitQueueCapacity => "1024",
+        Setting::GossipRecvBufferBytes => "65536",
+        Setting::GossipSendBufferBytes => "2097152",
         Setting::GossipClusterIdHash => "0xc0ffee",
         Setting::GossipTargetErrBps => "250",
         Setting::GossipMinEmitInterval => "10ms",

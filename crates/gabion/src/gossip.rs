@@ -4,9 +4,9 @@
 //! [`crate::crdt::CellStore`], a datagram [`GossipTransport`], a
 //! [`Clock`] for bucket arithmetic and tick scheduling, and a downstream
 //! [`AggregateStore`] that absorbs the resulting delta and expiration rows.
-//! A single `tokio::select!` drives five arms (limit request, inbound,
-//! writable, peer event, tick) and calls `aggregates.apply(...)` once per
-//! CRDT-touching iteration.
+//! A single `tokio::select!` drives four arms (limit request, inbound, peer
+//! event, tick), plus admin commands when wired, and calls
+//! `aggregates.apply(...)` once per CRDT-touching iteration.
 //!
 //! All polymorphic boundaries are monomorphized generics — no `dyn`, no
 //! `Box`. The production hot path is branch-free; tests and simulators
@@ -15,15 +15,17 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::num::{NonZeroU8, NonZeroU32, NonZeroU128, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU128, NonZeroUsize};
 use std::time::Duration;
 
 use crate::settings::{MIN_LIMIT_QUEUE_CAPACITY, Millis};
-use crate::wire::{self, FrameLimits, HmacKey};
+use crate::wire::{FrameLimits, HmacKey};
 
 mod admin;
 mod client;
 mod clock;
+#[cfg(test)]
+mod mock;
 mod runtime;
 pub mod sim;
 mod store;
@@ -32,7 +34,7 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
-pub use admin::{AdminCommand, AdminSnapshot, PeerEntry};
+pub use admin::{AdminCommand, AdminSnapshot, GossipCounters, PeerEntry};
 #[cfg(feature = "cell-dump")]
 pub use admin::{CellDumpEntry, CellDumpSnapshot};
 pub use client::{GossipClient, RecordPermit};
@@ -65,11 +67,13 @@ pub struct ValidGossipConfig {
     pub(crate) max_cells_per_tick: NonZeroUsize,
     /// Per-packet UDP budget + decoder safety limits.
     pub(crate) wire_limits: FrameLimits,
-    /// Outbound send queue capacity. Each slot owns a pre-allocated
-    /// [`wire::PacketBuf`].
-    pub(crate) send_queue_capacity: NonZeroU8,
     /// Capacity of the incoming limit-request channel.
     pub(crate) limit_queue_capacity: NonZeroUsize,
+    /// Receive buffer, in bytes, the UDP socket asks the kernel for.
+    #[cfg(feature = "transport-udp")]
+    pub(crate) recv_buffer_bytes: NonZeroU32,
+    /// Send buffer, in bytes, the UDP socket asks the kernel for.
+    pub(crate) send_buffer_bytes: NonZeroU32,
     /// Period between proactive gossip ticks.
     pub(crate) tick_interval: Duration,
     /// Optional HMAC key — when set, every outbound packet is authenticated
@@ -106,6 +110,4 @@ pub enum GossipError {
     RuntimeShutDown,
     #[error("io: {0}")]
     Io(#[from] io::Error),
-    #[error("wire: {0}")]
-    Encode(#[from] wire::EncodeError),
 }

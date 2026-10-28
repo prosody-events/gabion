@@ -12,7 +12,7 @@ config.workspace = true
 dashmap.workspace = true
 envoy-types.workspace = true
 futures.workspace = true
-gabion.workspace = true
+gabion = { workspace = true, features = ["serde"] }
 humantime-serde.workspace = true
 serde.workspace = true
 thiserror.workspace = true

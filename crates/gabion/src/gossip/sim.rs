@@ -65,9 +65,10 @@ struct SimRouterInner {
     /// packet lands, then `release_deferred` delivers them all. Default
     /// `false`; only the wasm step driver arms it.
     deferring: Cell<bool>,
-    /// Packets buffered while `deferring` is set, in push (send) order. Drained
+    /// Packets buffered while `deferring` is set, in push (send) order, each
+    /// with the receiver's queue slot reserved when it was sent. Drained
     /// deterministically by `release_deferred`.
-    held: RefCell<Vec<(SocketAddr, SimPacket)>>,
+    held: RefCell<Vec<(mpsc::OwnedPermit<SimPacket>, SimPacket)>>,
 }
 
 /// In-memory packet router shared by all sim runtimes in one process.
@@ -123,7 +124,6 @@ impl SimRouter {
             addr,
             router: self.clone(),
             inbound_rx: Mutex::new(rx),
-            blocked: RefCell::new(false),
         }
     }
 
@@ -214,24 +214,14 @@ impl SimRouter {
     }
 
     /// Deliver every packet buffered since [`SimRouter::begin_deferred`], in
-    /// push (send) order, then stop deferring. Each held packet was already
-    /// counted delivered (via `record_delivery`) at buffer time, so the
-    /// `received_count` diff the wasm logging shim reads is unaffected.
+    /// push (send) order, then stop deferring. Each packet goes into the
+    /// queue slot reserved when it was sent, so none can overflow here, and
+    /// each was already counted delivered then, so the `received_count` diff
+    /// the wasm logging shim reads is unaffected.
     pub fn release_deferred(&self) {
         self.inner.deferring.set(false);
-        let held = std::mem::take(&mut *self.inner.held.borrow_mut());
-        for (dst, packet) in held {
-            if let Some(sender) = self.sender_for(dst) {
-                // The packet was counted delivered at buffer time. A full
-                // channel here would drop a packet already counted as
-                // delivered — impossible at the one-rule, small-round sizes
-                // the step driver uses (a single round buffers far fewer
-                // packets than the channel's capacity), but noted rather than
-                // silent.
-                let _ = sender.try_send(packet);
-            }
-            // No receiver bound (a departed peer) ⇒ the packet hits the UDP
-            // floor, exactly as the immediate path treats a missing sender.
+        for (permit, packet) in self.inner.held.take() {
+            permit.send(packet);
         }
     }
 
@@ -239,8 +229,8 @@ impl SimRouter {
         self.inner.deferring.get()
     }
 
-    fn push_held(&self, dst: SocketAddr, packet: SimPacket) {
-        self.inner.held.borrow_mut().push((dst, packet));
+    fn push_held(&self, permit: mpsc::OwnedPermit<SimPacket>, packet: SimPacket) {
+        self.inner.held.borrow_mut().push((permit, packet));
     }
 }
 
@@ -262,12 +252,6 @@ pub struct SimTransport {
     addr: SocketAddr,
     router: SimRouter,
     inbound_rx: Mutex<mpsc::Receiver<SimPacket>>,
-    /// Set whenever `try_send_to` returns `WouldBlock`; cleared on the next
-    /// successful send. Used by `writable` to insert a yield only while the
-    /// loop would otherwise hot-spin retrying a blocked send, so other
-    /// `select!` arms (notably `tick`) get a chance to run. Models the
-    /// realtime UDP behavior where `writable` waits on socket state.
-    blocked: RefCell<bool>,
 }
 
 impl SimTransport {
@@ -282,14 +266,6 @@ impl GossipTransport for SimTransport {
     }
 
     async fn writable(&self) -> io::Result<()> {
-        // Only yield when the last `try_send_to` returned `WouldBlock`. The
-        // normal case (no backpressure) resolves immediately — preserves the
-        // timing characteristics existing sim tests were written against.
-        // The yield only matters under saturation, where without it the
-        // writable arm hot-spins and starves `tick`.
-        if *self.blocked.borrow() {
-            tokio::task::yield_now().await;
-        }
         Ok(())
     }
 
@@ -311,28 +287,25 @@ impl GossipTransport for SimTransport {
             // Hold this round's packet until every node has made its gossip
             // decision; `release_deferred` delivers it. `should_drop` was
             // already evaluated above (so Block / DropFirst / partition still
-            // increment their counters at send time), and we count the
-            // delivery now so the wasm logging shim's `received_count` diff
-            // still sees the send land at buffer time.
-            self.router.push_held(dst, packet);
-            self.router.record_delivery(dst);
-            *self.blocked.borrow_mut() = false;
+            // increment their counters at send time). A receiver whose queue
+            // this round already filled drops the packet, as a full UDP
+            // receive buffer does; it is not counted delivered, so the wasm
+            // logging shim reports it as dropped.
+            if let Ok(permit) = sender.try_reserve_owned() {
+                self.router.push_held(permit, packet);
+                self.router.record_delivery(dst);
+            }
             return Ok(buf.len());
         }
         match sender.try_send(packet) {
             Ok(()) => {
                 self.router.record_delivery(dst);
-                *self.blocked.borrow_mut() = false;
                 Ok(buf.len())
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                *self.blocked.borrow_mut() = true;
                 Err(io::Error::from(io::ErrorKind::WouldBlock))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                *self.blocked.borrow_mut() = false;
-                Ok(buf.len())
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Ok(buf.len()),
         }
     }
 

@@ -1404,6 +1404,8 @@ A cell is kept while its bucket plus the rule's live window covers the current e
 
 The emission order matters. `expire` calls `emit_expiration(sink, slot)` before `free_cell_at(slot)`, because `emit_expiration` needs the rule descriptor to construct the portable `CellIdentity` (the rule's fingerprint) and to read `applies_locally`, whereas `free_cell_at` decrements the rule's refcount and may drop the descriptor entirely. The emit-then-free order keeps the fingerprint lookup live for the row that needs it.
 
+The sink never grows. When it is full and another cell has expired, `expire` stops and returns `Expiry::More`, remembering the slot; the next call resumes there, and the call that reaches the last slot returns `Expiry::Done`. The gossip runtime applies each full batch to the aggregate store, clears the sink and calls again, so one bucket boundary at any traffic level costs `⌈expired / GOSSIP_EXPIRATION_BATCH⌉` applies and no allocation.
+
 The convenience entry point `expire_at(now_millis, sink)` derives the two arrays from each rule's `RuleDescriptor` (its `window_millis` and `bucket_millis`) using pre-allocated scratch storage held in the cell store, then delegates to `expire`. It is the allocation-free entry point for "expire whatever has aged out as of now," while the lower-level `expire` exists for callers — tests, alternative time sources — that want to drive the epochs explicitly.
 
 ---
@@ -1565,7 +1567,7 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `active_handles()` | Diagnostic full-scan iterator. |
 | `ingest_local(obs, sink)` | Apply locally observed hits (saturating add). |
 | `merge_remote(obs, sink)` | Merge peer observations (max-merge). |
-| `expire(current_epoch_by_rule, live_buckets, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell. |
+| `expire(current_epoch_by_rule, live_buckets, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell, stopping with `Expiry::More` when the sink is full. |
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
 | `clear_dirty()` | Drop the dirty rings; stored cells untouched. |
 | `visit_forwarded_dirty` | Stream the forwarded dirty lane (no dedup). |

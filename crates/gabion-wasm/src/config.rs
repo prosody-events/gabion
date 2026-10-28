@@ -10,7 +10,7 @@ use gabion::gossip::ValidGossipConfig;
 use gabion::settings::{Setting, SettingError, Settings};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{CLUSTER_ID_HASH, VIZ_MAX_CELLS_PER_TICK, VIZ_SEND_QUEUE_CAPACITY};
+use crate::engine::{CLUSTER_ID_HASH, VIZ_MAX_CELLS_PER_TICK};
 use crate::hex::u128_hex;
 
 /// Largest cluster the visualizer constructs. Bounded so a stray config from
@@ -204,16 +204,12 @@ impl SimConfig {
             ),
             (Setting::GossipClusterIdHash, CLUSTER_ID_HASH.to_string()),
             // The per-tick frame is capped (see `VIZ_MAX_CELLS_PER_TICK`) so
-            // one tick's packet output stays inside the send pool.
+            // one tick's packet output stays inside the router's queues.
             (
                 Setting::GossipMaxCellsPerTick,
                 VIZ_MAX_CELLS_PER_TICK.min(cross_node as usize).to_string(),
             ),
             (Setting::GossipMaxCellsPerFrame, cross_node.to_string()),
-            (
-                Setting::GossipSendQueueCapacity,
-                VIZ_SEND_QUEUE_CAPACITY.to_string(),
-            ),
             (Setting::StorageMaxCells, cross_node.to_string()),
             // One watched rule; headroom for an interned default / wire-only
             // rule.

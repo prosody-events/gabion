@@ -249,7 +249,7 @@ async fn leader_main(
     };
     // Bind before the store empties the count table: a term that cannot
     // start leaves the last counts in force, with no leader to refill them.
-    let transport = UdpTransport::bind(bind)
+    let transport = UdpTransport::bind(bind, &config.gossip)
         .await
         .context("bind the gossip socket")?;
     let (gossip_rt, gossip_client) = GossipRuntime::from_parts(

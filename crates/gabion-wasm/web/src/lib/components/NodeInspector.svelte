@@ -63,14 +63,6 @@
   const knownPeers = $derived(node.peers.filter((p) => p.node_id != null).length);
   const pendingPeers = $derived(node.peers.length - knownPeers);
 
-  // §5 — the send queue has no static capacity; its high-water mark is the only
-  // honest denominator. When the mark is 0 the queue never backed up.
-  const sendPct = $derived(
-    node.max_send_pending_depth > 0
-      ? (node.send_pending_depth / node.max_send_pending_depth) * 100
-      : 0,
-  );
-
   /** Shorten a 32-nibble hex id for display; full value stays available on hover
    *  and in the identity footer. Mirrors the Strata's key shortening. */
   function shortHex(hex: string): string {
@@ -143,31 +135,6 @@
   <section class="section">
     <h3 class="section-head">Gossip I/O &amp; queues</h3>
     <div class="io">
-      <div class="io-row">
-        <span class="io-label">
-          <InfoTip text="Outbound packets queued behind the transport, scaled to the high-water mark since startup — the only honest denominator, since there is no fixed send capacity. At the peak it reads full by definition.">
-            send queue
-          </InfoTip>
-        </span>
-        {#if node.max_send_pending_depth > 0}
-          <div
-            class="meter"
-            role="meter"
-            aria-label="send queue depth"
-            aria-valuemin={0}
-            aria-valuemax={node.max_send_pending_depth}
-            aria-valuenow={node.send_pending_depth}
-            aria-valuetext="{node.send_pending_depth} of {node.max_send_pending_depth} peak"
-          >
-            <div class="meter-fill" style="width: {sendPct}%"></div>
-          </div>
-          <span class="io-value numeric">{node.send_pending_depth}<span class="sep"> / </span>{node.max_send_pending_depth}</span>
-        {:else}
-          <span class="io-idle">queue idle</span>
-          <span class="io-value numeric">0</span>
-        {/if}
-      </div>
-
       <div class="io-row">
         <span class="io-label">
           <InfoTip text="Locally-originated cells waiting in the dirty ring to be gossiped out, and cells received from peers waiting to be re-gossiped (forwarded).">
@@ -469,40 +436,6 @@
   }
 
   .io-label {
-    color: var(--color-fg-muted);
-  }
-
-  .meter {
-    height: 8px;
-    border-radius: 4px;
-    background: var(--color-bg);
-    overflow: hidden;
-  }
-
-  .meter-fill {
-    height: 100%;
-    border-radius: 4px;
-    background: var(--chart-muted);
-    transition: width 220ms ease;
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .meter-fill {
-      transition: none;
-    }
-  }
-
-  .io-idle {
-    color: var(--color-fg-muted);
-    font-style: italic;
-  }
-
-  .io-value {
-    color: var(--color-fg);
-    text-align: right;
-  }
-
-  .io-value .sep {
     color: var(--color-fg-muted);
   }
 

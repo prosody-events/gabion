@@ -169,12 +169,9 @@ const fn min_payload_bytes(count_size: usize, auth_overhead: usize) -> usize {
 }
 
 /// Synchronous iterator over outbound packets. Not `std::iter::Iterator` —
-/// `next_into` takes a caller-owned buffer; `Iterator::next` cannot.
-///
-/// `#[must_use]` so undrained iterators warn at compile time. The `Drop`
-/// impl additionally debug-asserts that the iterator was drained, so silent
-/// data-loss bugs trip a panic in tests and debug builds.
-#[must_use = "drain Packets to send every cell — undrained handles are lost"]
+/// `next_into` takes a caller-owned buffer; `Iterator::next` cannot. A caller
+/// may stop early: handles it never encodes are simply not sent.
+#[must_use = "Packets encodes nothing until drained with next_into"]
 pub struct Packets<'a, C: Count> {
     header: Header,
     store: &'a CellStore<C>,
@@ -183,19 +180,6 @@ pub struct Packets<'a, C: Count> {
     scratch: &'a mut WireScratch,
     limits: FrameLimits,
     cursor: usize,
-}
-
-impl<C: Count> Drop for Packets<'_, C> {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            debug_assert_eq!(
-                self.remaining(),
-                0,
-                "Packets dropped with {} handles undrained",
-                self.remaining(),
-            );
-        }
-    }
 }
 
 impl<'a, C: Count> Packets<'a, C> {

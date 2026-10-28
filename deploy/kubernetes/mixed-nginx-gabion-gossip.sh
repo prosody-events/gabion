@@ -136,7 +136,6 @@ data:
       max_payload_bytes: 1400
       max_cells_per_frame: 1024
       max_cells_per_tick: 1024
-      send_queue_capacity: 32
       limit_queue_capacity: 1024
       cluster_id_hash: 1
       target_err_bps: 100
@@ -317,7 +316,7 @@ gossip_settled() {
         | python3 -c '
 import json, sys
 s = json.load(sys.stdin)
-sys.exit(len(s["peers"]) < int(sys.argv[1]) or s["store"]["aggregate_rows"] == 0)
+sys.exit(len(s["peers"]) < int(sys.argv[1]) or s["aggregate_rows"] == 0)
 ' "$1" 2>/dev/null
 }
 

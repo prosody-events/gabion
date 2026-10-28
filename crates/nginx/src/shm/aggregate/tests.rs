@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use gabion::crdt::{
-    CellStore, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch, RuleDescriptor,
+    CellStore, Expiry, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch, RuleDescriptor,
 };
 
 use super::*;
@@ -136,8 +136,8 @@ fn lead(store: &ShmAggregateStore, incarnation: u32) -> CellStore<u32> {
 }
 
 fn expire(store: &ShmAggregateStore, cells: &mut CellStore<u32>) {
-    let mut expired = ExpirationSink::default();
-    cells.expire_at(100_000, &mut expired);
+    let mut expired = ExpirationSink::with_capacity(cells.capacity() as usize);
+    assert_eq!(cells.expire_at(100_000, &mut expired), Expiry::Done);
     store.apply(&DeltaSink::default(), &expired);
 }
 

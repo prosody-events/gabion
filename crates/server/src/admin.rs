@@ -18,13 +18,13 @@ use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
-use gabion::crdt::CellStoreStats;
 use gabion::gossip::{AdminCommand, AdminSnapshot};
-use gabion::rules::{DescriptorPattern, EnforcementMode, Rule, RuleId, RuleTable};
+use gabion::rules::RuleTable;
 
 use crate::store::DashMapStore;
 use gabion::crdt::Count;
@@ -53,114 +53,14 @@ impl<C: Count> AdminState<C> {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct Snapshot {
-    pub identity: IdentitySnapshot,
-    pub peers: Vec<PeerSnapshot>,
-    pub store: StoreSnapshot,
-    pub rules: Vec<RuleSnapshot>,
-    pub gossip: GossipSnapshot,
-}
-
-#[derive(Debug, Serialize)]
-pub struct IdentitySnapshot {
-    pub node_id: String,
-    pub incarnation: u32,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PeerSnapshot {
-    pub addr: String,
-    pub node_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StoreSnapshot {
-    pub aggregate_rows: usize,
-    pub cell_store: CellStoreStatsSnapshot,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CellStoreStatsSnapshot {
-    pub active_cells: u32,
-    pub cell_capacity: u32,
-    pub rule_slots_used: u16,
-    pub rule_slots_capacity: u16,
-    pub node_slots_used: u16,
-    pub node_slots_capacity: u16,
-    pub cell_store_full_rejects: u64,
-    pub rule_dictionary_full_rejects: u64,
-    pub node_dictionary_full_rejects: u64,
-}
-
-impl From<CellStoreStats> for CellStoreStatsSnapshot {
-    fn from(stats: CellStoreStats) -> Self {
-        Self {
-            active_cells: stats.active_cells,
-            cell_capacity: stats.cell_capacity,
-            rule_slots_used: stats.rule_slots_used,
-            rule_slots_capacity: stats.rule_slots_capacity,
-            node_slots_used: stats.node_slots_used,
-            node_slots_capacity: stats.node_slots_capacity,
-            cell_store_full_rejects: stats.cell_store_full_rejects,
-            rule_dictionary_full_rejects: stats.rule_dictionary_full_rejects,
-            node_dictionary_full_rejects: stats.node_dictionary_full_rejects,
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct RuleSnapshot {
-    pub id: RuleId,
-    pub fingerprint: String,
-    pub domain: Box<str>,
-    pub descriptors: Box<[DescriptorPatternSnapshot]>,
-    pub limit: u64,
-    pub window_millis: u64,
-    pub bucket_millis: u64,
-    /// One of `"enforce"`, `"dry_run"`, `"disabled"`.
-    pub mode: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DescriptorPatternSnapshot {
-    pub key: Box<str>,
-    pub value: Box<str>,
-}
-
-impl From<&DescriptorPattern> for DescriptorPatternSnapshot {
-    fn from(p: &DescriptorPattern) -> Self {
-        Self {
-            key: p.key.clone(),
-            value: p.value.clone(),
-        }
-    }
-}
-
-impl From<&Rule> for RuleSnapshot {
-    fn from(rule: &Rule) -> Self {
-        Self {
-            id: rule.id,
-            fingerprint: format!("{:032x}", rule.fingerprint),
-            domain: rule.domain.clone(),
-            descriptors: rule.descriptors.iter().map(Into::into).collect(),
-            limit: rule.limit,
-            window_millis: rule.window_millis,
-            bucket_millis: rule.bucket_millis,
-            mode: match rule.mode {
-                EnforcementMode::Enforce => "enforce",
-                EnforcementMode::DryRun => "dry_run",
-                EnforcementMode::Disabled => "disabled",
-            },
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct GossipSnapshot {
-    pub local_dirty_len: u32,
-    pub forwarded_dirty_len: u32,
-    pub send_pending_depth: usize,
+/// What `/snapshot` serves: the runtime's snapshot, flattened, plus what only
+/// this adapter knows.
+#[derive(Serialize)]
+struct SnapshotJson<'a> {
+    #[serde(flatten)]
+    runtime: AdminSnapshot,
+    rules: &'a RuleTable,
+    aggregate_rows: usize,
 }
 
 /// Build an axum router exposing the admin endpoints. See the module
@@ -198,35 +98,13 @@ where
 
 async fn snapshot_handler<C: Count + 'static>(
     State(state): State<Arc<AdminState<C>>>,
-) -> Result<Json<Snapshot>, (StatusCode, String)> {
-    let gossip = admin_snapshot(&state.gossip_admin).await?;
-
-    let rules = state.rule_table.iter().map(Into::into).collect();
-    let snapshot = Snapshot {
-        identity: IdentitySnapshot {
-            node_id: format!("{:032x}", gossip.local_identity.node_id.0),
-            incarnation: gossip.local_identity.incarnation,
-        },
-        peers: gossip
-            .peers
-            .into_iter()
-            .map(|p| PeerSnapshot {
-                addr: p.addr.to_string(),
-                node_id: p.node_id.map(|id| format!("{:032x}", id.0)),
-            })
-            .collect(),
-        store: StoreSnapshot {
-            aggregate_rows: state.counts.len(),
-            cell_store: gossip.store_stats.into(),
-        },
-        rules,
-        gossip: GossipSnapshot {
-            local_dirty_len: gossip.local_dirty_len,
-            forwarded_dirty_len: gossip.forwarded_dirty_len,
-            send_pending_depth: gossip.send_pending_depth,
-        },
+) -> Result<Response, (StatusCode, String)> {
+    let snapshot = SnapshotJson {
+        runtime: admin_snapshot(&state.gossip_admin).await?,
+        rules: &state.rule_table,
+        aggregate_rows: state.counts.len(),
     };
-    Ok(Json(snapshot))
+    Ok(Json(snapshot).into_response())
 }
 
 /// Readiness probe. The mere fact that the admin router is serving HTTP

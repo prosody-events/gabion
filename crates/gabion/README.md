@@ -155,10 +155,12 @@ independently decodable.
 ### The anti-entropy loop
 
 The runtime (`GossipRuntime`, in `src/gossip/runtime.rs`) is a
-single-threaded event loop driven by one `tokio::select!` with six
-arms: limit requests from the adapter, inbound packets, outbound
-writability, peer membership churn, admin commands, and the heartbeat
-tick. After every iteration that produced delta or expiration rows, the
+single-threaded event loop driven by one `tokio::select!` with five
+arms: limit requests from the adapter, inbound packets, peer membership
+churn, admin commands, and the heartbeat tick. A round hands each packet
+to the socket as it is encoded; a packet the kernel refuses is held and
+retried first on the next round (see [Socket buffers](#socket-buffers)).
+After every iteration that produced delta or expiration rows, the
 runtime calls `aggregates.apply(...)` exactly once — that is the
 contract with the downstream rate-limit decision path. Empty iterations
 (an idle tick, a peer event with no CRDT effect) short-circuit the
@@ -237,8 +239,8 @@ let pick_count = config.fanout.max(coverage.ceil() as usize).min(n);
 
 A partial Fisher-Yates shuffle then picks `pick_count` distinct peers
 from `self.peers`. The peers must be distinct rather than sampled with
-replacement, because sampling the same peer twice in one tick would burn
-a send-pool slot encoding the same frame twice. `config.fanout` is a
+replacement, because sampling the same peer twice in one tick would
+encode and send the same frame twice. `config.fanout` is a
 hard floor; `.min(n)` makes small clusters full-mesh (coverage demands
 it there and the bandwidth is trivial). Some example pick counts at
 `fanout = 3`, `c = 3`:
@@ -291,9 +293,10 @@ where `L_R` is the rule's limit and `N` is the peer count. When
 `rule_pending` for that rule crosses `ε_R`, the runtime sets
 `want_immediate_flush = true`. On the next loop iteration the top of
 the run loop reads that flag (instead of waiting on `tick.tick()`) and
-dispatches a synthetic gossip tick straight away. The post-emit sweep
-inside `handle_gossip_tick` zeroes the rule's pending column and stamps
-its `last_emit_ms`.
+dispatches a synthetic gossip tick straight away. Every round, heartbeat
+or threshold, first settles the budget: it zeroes each rule's pending
+column and stamps its `last_emit_ms`, even with no peers or a blocked
+socket, so neither turns each later request into another round.
 
 The constant `target_err_bps` is in basis points of each rule's own
 limit, default 100 = 1 %. The cluster-wide unreplicated error per rule
@@ -361,7 +364,8 @@ debug the CRDT.
 Most deployments leave the defaults alone, because they are chosen to
 keep convergence well under a second at typical cluster sizes
 (≤ 256). The table below is for the days when you do need to tune, and
-it splits into the two adaptive halves of the protocol.
+it splits into the two adaptive halves of the protocol, then the socket
+buffers that carry it.
 
 ### Heartbeat cadence and fanout (coverage fanout)
 
@@ -387,6 +391,28 @@ move together, and a bad value fails configuration load with the same
 message in both. See [`crates/server/README.md`](../server/README.md)
 for the YAML keys and [`crates/nginx/README.md`](../nginx/README.md) for
 the directives.
+
+### Socket buffers
+
+The kernel's socket buffers are gossip's queues. `gossip.recv_buffer_bytes`
+(`GABION_GOSSIP_RECV_BUFFER_BYTES`; NGINX `gabion_gossip_recv_buffer_bytes`,
+default 4 MiB) absorbs bursts and pauses such as CPU throttling;
+`gossip.send_buffer_bytes` (`GABION_GOSSIP_SEND_BUFFER_BYTES`; NGINX
+`gabion_gossip_send_buffer_bytes`, default 1 MiB) holds one round's packets.
+Linux grants at most `net.core.rmem_max` and `net.core.wmem_max` (212,992 bytes
+by default) and reports double what it grants. When it grants less than asked,
+gabion logs `socket_buffer_capped` once per buffer at start. Raise the host
+settings in the node's bootstrap; in Kubernetes they are node settings, not pod
+sysctls:
+
+```sh
+sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=1048576
+```
+
+A host that cannot change sets the two settings to the granted sizes, which
+silences the warning. `send_blocked` means the send buffer filled during a
+round: the round stopped there, and the next round sends the refused packet
+first, then the rest.
 
 ## What we measured
 

@@ -194,6 +194,15 @@ impl<C: Count> ExpirationSink<C> {
         self.len() == 0
     }
 
+    /// Rows the sink holds without growing; every column was given it.
+    pub(super) fn capacity(&self) -> usize {
+        self.handles.capacity()
+    }
+
+    pub(super) fn is_full(&self) -> bool {
+        self.len() == self.capacity()
+    }
+
     pub fn clear(&mut self) {
         self.handles.clear();
         self.keys.clear();

@@ -14,8 +14,7 @@ use std::ffi::CStr;
 use std::fmt;
 use std::net::SocketAddr;
 use std::num::{
-    IntErrorKind, NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize,
-    ParseIntError,
+    IntErrorKind, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize, ParseIntError,
 };
 use std::time::Duration;
 
@@ -210,14 +209,18 @@ settings! {
         "gabion_gossip_max_cells_per_tick";
         max_cells_per_tick: NonZeroUsize = nz!(defaults::GOSSIP_MAX_CELLS_PER_TICK),
         "no gossip round could send a counter";
-    GossipSendQueueCapacity => "gossip.send_queue_capacity",
-        "GABION_GOSSIP_SEND_QUEUE_CAPACITY", "gabion_gossip_send_queue_capacity";
-        send_queue_capacity: NonZeroU8 = nz!(defaults::GOSSIP_SEND_QUEUE_CAPACITY as u8),
-        "this node could not send any packet";
     GossipLimitQueueCapacity => "gossip.limit_queue_capacity",
         "GABION_GOSSIP_LIMIT_QUEUE_CAPACITY", "gabion_gossip_limit_queue_capacity";
         limit_queue_capacity: NonZeroUsize = nz!(defaults::GOSSIP_LIMIT_QUEUE_CAPACITY),
         "no counted hit could reach the gossip runtime";
+    GossipRecvBufferBytes => "gossip.recv_buffer_bytes", "GABION_GOSSIP_RECV_BUFFER_BYTES",
+        "gabion_gossip_recv_buffer_bytes";
+        recv_buffer_bytes: NonZeroU32 = nz!(defaults::GOSSIP_RECV_BUFFER_BYTES),
+        "the gossip socket could not hold any packet it receives";
+    GossipSendBufferBytes => "gossip.send_buffer_bytes", "GABION_GOSSIP_SEND_BUFFER_BYTES",
+        "gabion_gossip_send_buffer_bytes";
+        send_buffer_bytes: NonZeroU32 = nz!(defaults::GOSSIP_SEND_BUFFER_BYTES),
+        "the gossip socket could not queue any packet it sends";
     GossipClusterIdHash => "gossip.cluster_id_hash", "GABION_GOSSIP_CLUSTER_ID_HASH",
         "gabion_gossip_cluster";
         cluster_id_hash: NonZeroU128 = nz!(defaults::GOSSIP_CLUSTER_ID_HASH);
@@ -285,6 +288,11 @@ impl Settings {
         }
         let dictionary = "Its slots are numbered by a `u16` whose largest value marks an empty \
                           slot, so it holds at most 65,534 entries.";
+        let socket = "The kernel doubles the request and keeps it in a C `int`, so it grants at \
+                      most 1,073,741,823 bytes; below 64 KiB one burst of gossip packets \
+                      overflows it. The host's `net.core.rmem_max` (receive) and \
+                      `net.core.wmem_max` (send) cap what it grants; see \"Socket buffers\" in \
+                      the gabion README.";
         let capacities = [
             (
                 Setting::StorageMaxCells,
@@ -301,6 +309,20 @@ impl Settings {
                 1 << 20,
                 "It may be 64 to 1,048,576; each slot is 72 bytes of the NGINX zone (72 MiB at \
                  the ceiling), so raise SIZE in `gabion_limit_zone` with it.",
+            ),
+            (
+                Setting::GossipRecvBufferBytes,
+                u64::from(self.recv_buffer_bytes.get()),
+                65_536,
+                (1 << 30) - 1,
+                socket,
+            ),
+            (
+                Setting::GossipSendBufferBytes,
+                u64::from(self.send_buffer_bytes.get()),
+                65_536,
+                (1 << 30) - 1,
+                socket,
             ),
             (
                 Setting::StorageRuleDictionaryCapacity,
@@ -346,8 +368,10 @@ impl Settings {
                 max_payload_bytes: self.max_payload_bytes,
                 max_cells: self.max_cells_per_frame.get(),
             },
-            send_queue_capacity: self.send_queue_capacity,
             limit_queue_capacity: self.limit_queue_capacity,
+            #[cfg(feature = "transport-udp")]
+            recv_buffer_bytes: self.recv_buffer_bytes,
+            send_buffer_bytes: self.send_buffer_bytes,
             tick_interval: self.tick_interval.duration(),
             auth_key: None,
             rng_seed: self.rng_seed.unwrap_or_default(),
@@ -424,7 +448,6 @@ macro_rules! int_field {
 }
 
 int_field! {
-    NonZeroU8 => "a whole number from 1 to 255", "100";
     NonZeroU16 => "a whole number from 1 to 65535", "100";
     NonZeroU32 => "a whole number from 1 to 4294967295", "100";
     NonZeroUsize => "a positive whole number", "100";

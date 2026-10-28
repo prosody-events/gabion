@@ -14,8 +14,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Notify;
-use tokio::task::LocalSet;
+use futures::FutureExt;
+use tokio::sync::{Notify, mpsc};
+use tokio::task::{JoinHandle, LocalSet};
 
 use crate::crdt::{
     BucketEpoch, CellStore, Count, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
@@ -24,11 +25,16 @@ use crate::crdt::{
 use crate::discovery::{Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
+use crate::gossip::mock::{MockTransport, Wire};
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
-use crate::gossip::{AggregateStore, GossipRuntime, TokioClock, ValidGossipConfig};
+use crate::gossip::{
+    AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipError, GossipRuntime,
+    GossipTransport, TokioClock, ValidGossipConfig,
+};
+use crate::mock::with_logs;
 use crate::settings::mock::storage;
 use crate::settings::{Millis, Settings};
-use crate::wire::HmacKey;
+use crate::wire::{HmacKey, MIN_PAYLOAD_BYTES};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 
@@ -124,7 +130,6 @@ fn tuned_config(
         tick_interval: ms(100),
         max_cells_per_tick: 1024.try_into().unwrap(),
         max_payload_bytes: 65_507,
-        send_queue_capacity: 32.try_into().unwrap(),
         limit_queue_capacity: 1024.try_into().unwrap(),
         ..Settings::default()
     };
@@ -384,7 +389,6 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
                 .try_into()
                 .unwrap();
             s.max_cells_per_tick = 128.try_into().unwrap();
-            s.send_queue_capacity = 128.try_into().unwrap();
         });
         let agg = Rc::new(InMemoryAggregateStore::<u32>::new());
         let (rt, client) = GossipRuntime::from_parts(
@@ -2021,85 +2025,298 @@ async fn decode_rejects_increment_on_wrong_auth() {
         .await;
 }
 
-// -- Gap 4: send queue backpressure (WouldBlock re-queue) -------------------
+// -- Encode and send ----------------------------------------------------------
 
-/// When the recipient's inbound channel is saturated, `try_send_to` returns
-/// `WouldBlock` and the runtime re-queues the slot at the front of
-/// `send_pending` (runtime.rs `drain_one_send`). Without re-queue, the slot
-/// would either be lost or shuffled to the back, breaking the high-water
-/// mark this test reads via `max_send_pending_depth`. Working case: queue
-/// fills toward `send_queue_capacity`. Broken case: max stays at 1.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn send_queue_drains_after_recipient_backpressure() {
-    use tokio::sync::mpsc;
+fn node(id: u128) -> NodeIdentity {
+    NodeIdentity::new(NodeId(id), 1)
+}
 
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            // Channel cap 1 — recipient mpsc holds at most one buffered
-            // packet, so the second outbound from the sender hits WouldBlock
-            // until the recipient drains.
-            let router = SimRouter::with_channel_capacity(1);
-            let addr_a = sock(51_000);
-            let addr_b = sock(51_001);
-            let id_a = NodeIdentity::new(NodeId(0xBA), 1);
+/// A runtime on a scripted transport with an admin channel, after it has spent
+/// its immediate first tick with nothing to send. Heartbeats then fire at
+/// t = 100, 200, … ms.
+async fn mocked<C: Count>(
+    wire: &Rc<Wire>,
+    peers: Vec<SocketAddr>,
+    store: CellStore<C>,
+    tune: impl FnOnce(&mut Settings),
+) -> (
+    GossipClient<C>,
+    mpsc::Sender<AdminCommand>,
+    JoinHandle<Result<(), GossipError>>,
+) {
+    let (admin_tx, admin_rx) = mpsc::channel(4);
+    let (rt, client) = GossipRuntime::from_parts_with_admin(
+        MockTransport(wire.clone()),
+        TokioClock::from_millis(0),
+        tuned_config(peers, 1, tune),
+        store,
+        Rc::new(InMemoryAggregateStore::<C>::new()),
+        Some(admin_rx),
+    );
+    let runtime = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+    sim_advance_ticks(Duration::from_millis(10), 1).await;
+    (client, admin_tx, runtime)
+}
 
-            let cfg_a = tuned_config(vec![addr_b], 1, |s| {
-                s.send_queue_capacity = 8.try_into().unwrap();
-            });
+/// One hit on `key` with a limit so high that no threshold round runs.
+async fn hit<C: Count>(client: &GossipClient<C>, key: u128) {
+    client
+        .record(0xBEE, KeyHash(key), 0, 1, 1_000_000, 0)
+        .await
+        .unwrap();
+}
 
-            let (admin_tx, admin_rx) = mpsc::channel(4);
+async fn heartbeats(n: u32) {
+    sim_advance_ticks(Duration::from_millis(100), n).await;
+}
 
-            let (rt_a, client_a) = GossipRuntime::from_parts_with_admin(
-                router.bind(addr_a),
-                TokioClock::from_millis(0),
-                cfg_a,
-                store_for(id_a),
-                Rc::new(InMemoryAggregateStore::<u32>::new()),
-                Some(admin_rx),
-            );
-            // Bind the recipient address but do NOT spawn its runtime. The
-            // mpsc receiver lives on `transport_b` so the channel stays
-            // open with cap 1 and the sender's outbound `try_send_to`
-            // returns `WouldBlock` after the first buffered packet.
-            let transport_b = router.bind(addr_b);
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
+/// The log lines whose `code` field is `code`.
+fn coded<'a>(logs: &'a str, code: &str) -> Vec<&'a str> {
+    let field = format!("code=\"{code}\"");
+    logs.lines().filter(|line| line.contains(&field)).collect()
+}
 
-            for i in 0..6_u128 {
-                client_a
-                    .record(0xBA5, KeyHash(i), 0, 1, 0, 0)
-                    .await
-                    .unwrap();
-            }
-            sim_advance_ticks(Duration::from_millis(100), 12).await;
+/// Twelve requests at one instant against a rule whose error budget is one
+/// hit (limit 100), then the snapshot. The third request crosses the budget
+/// with no emit yet; if that round settles, every later crossing falls inside
+/// the 5 ms emit floor, so one threshold round runs.
+async fn threshold_rounds_in_a_burst(peers: Vec<SocketAddr>, refuse: bool) -> AdminSnapshot {
+    let wire = Rc::new(Wire::default());
+    wire.refuse.set(refuse);
+    let (client, admin, _runtime) = mocked(&wire, peers, store_for(node(0xA)), |_| {}).await;
+    for _ in 0..12 {
+        client
+            .record(0xC0DE, KeyHash(9), 0, 1, 100, 10)
+            .await
+            .unwrap();
+    }
+    admin_snapshot(&admin).await
+}
 
-            let snap_saturated = admin_snapshot(&admin_tx).await;
-            assert!(
-                snap_saturated.max_send_pending_depth >= 2,
-                "expected backpressure re-queue to grow send_pending past 1, got max={} \
-                 (snapshot={:?})",
-                snap_saturated.max_send_pending_depth,
-                snap_saturated,
-            );
+/// U15. A lone node settles the error budget although it has no one to send
+/// to, so a burst runs one threshold round, not one per request.
+#[test]
+fn lone_node_settles_the_error_budget() {
+    let snapshot = run_paused(threshold_rounds_in_a_burst(vec![], false));
+    assert_eq!(snapshot.threshold_fires, 1);
+}
 
-            // Drain the recipient by dropping its transport. The mpsc
-            // receiver is freed and subsequent `try_send` returns `Closed`
-            // (which the sim treats as "delivered to the floor"), letting
-            // the sender's pending queue empty.
-            drop(transport_b);
-            sim_advance_ticks(Duration::from_millis(100), 6).await;
+/// A round cut by a refused send still settles and stamps the emit floor, so
+/// a blocked socket does not turn every later request into another threshold
+/// round (and another refused retry).
+#[test]
+fn blocked_socket_does_not_fire_a_threshold_round_per_request() {
+    let snapshot = run_paused(threshold_rounds_in_a_burst(vec![sock(2)], true));
+    assert_eq!(snapshot.threshold_fires, 1);
+    assert_eq!(snapshot.counters.send_blocked, 1);
+}
 
-            let snap_drained = admin_snapshot(&admin_tx).await;
-            assert_eq!(
-                snap_drained.send_pending_depth, 0,
-                "send_pending should drain after recipient released: {:?}",
-                snap_drained,
-            );
-
-            client_a.shutdown().await.unwrap();
-            let _ = h_a.await;
+/// U24. A refused packet is held and retried first on every later round,
+/// unchanged although newer counts arrived; nothing encodes over it, and the
+/// round that finally sends it goes on to gossip. One `u32` cell fills a
+/// packet, so the refusal cuts a two-packet frame after its first packet.
+#[test]
+fn refused_send_holds_one_packet() {
+    run_paused(async {
+        let wire = Rc::new(Wire::default());
+        wire.refuse.set(true);
+        let peers = vec![sock(2), sock(3)];
+        let (client, admin, _runtime) = mocked(&wire, peers, store_for(node(0xA)), |s| {
+            s.max_payload_bytes = MIN_PAYLOAD_BYTES;
         })
         .await;
+        hit(&client, 1).await;
+        hit(&client, 2).await;
+        heartbeats(1).await;
+        let refused = wire.attempts.borrow()[0].clone();
+        assert!(!refused.accepted);
+        assert_eq!(wire.attempts.borrow().len(), 1);
+
+        // Both cells change, so any re-encode would differ from the held one.
+        hit(&client, 1).await;
+        hit(&client, 2).await;
+        heartbeats(2).await;
+        assert_eq!(*wire.attempts.borrow(), vec![refused.clone(); 3]);
+        let counters = admin_snapshot(&admin).await.counters;
+        assert_eq!((counters.send_blocked, counters.packets_sent), (3, 0));
+
+        wire.refuse.set(false);
+        heartbeats(1).await;
+        let accepted = wire.accepted();
+        // The held packet first, then two packets for each peer.
+        assert_eq!(accepted.len(), 5, "{accepted:?}");
+        assert_eq!(
+            (accepted[0].dst, &accepted[0].bytes),
+            (refused.dst, &refused.bytes)
+        );
+        assert_eq!(
+            accepted.iter().filter(|a| a.bytes == refused.bytes).count(),
+            1
+        );
+        let counters = admin_snapshot(&admin).await.counters;
+        assert_eq!((counters.send_blocked, counters.packets_sent), (3, 5));
+    });
+}
+
+/// E-Z5 logs the 1st, 2nd and 4th of five refusals, each naming the sysctl
+/// and the size gabion asked for.
+#[test]
+fn send_blocked_warns_at_powers_of_two_naming_wmem_max() {
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let wire = Rc::new(Wire::default());
+            wire.refuse.set(true);
+            let (client, admin, _runtime) =
+                mocked(&wire, vec![sock(2)], store_for(node(0xA)), |_| {}).await;
+            hit(&client, 1).await;
+            heartbeats(5).await;
+            assert_eq!(admin_snapshot(&admin).await.counters.send_blocked, 5);
+        })
+    });
+    let lines = coded(&logs, "send_blocked");
+    assert_eq!(lines.len(), 3, "{logs}");
+    for line in lines {
+        for field in [
+            "sysctl=\"net.core.wmem_max\"",
+            "send_blocked_total=",
+            "requested_send_buffer_bytes=1048576",
+        ] {
+            assert!(line.contains(field), "{field} missing from {line}");
+        }
+    }
+}
+
+/// U25 (C4). A send error drops that one packet: the runtime keeps running
+/// and keeps gossiping with the other peer.
+#[test]
+fn send_error_to_one_peer_keeps_gossiping() {
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let wire = Rc::new(Wire::default());
+            wire.forbidden.set(Some(sock(2)));
+            let peers = vec![sock(2), sock(3)];
+            let (client, admin, _runtime) =
+                mocked(&wire, peers, store_for(node(0xA)), |_| {}).await;
+            hit(&client, 1).await;
+            heartbeats(3).await;
+            let to_other = wire.accepted().iter().filter(|a| a.dst == sock(3)).count();
+            assert_eq!(to_other, 3);
+            let counters = admin_snapshot(&admin).await.counters;
+            assert_eq!((counters.send_errors, counters.packets_sent), (3, 3));
+        })
+    });
+    let lines = coded(&logs, "send_error");
+    assert_eq!(lines.len(), 2, "{logs}");
+    for line in lines {
+        assert!(line.contains(&format!("peer={}", sock(2))), "{line}");
+        assert!(line.contains("send_errors_total="), "{line}");
+    }
+}
+
+/// U26 (C5, E4). A packet that cannot be encoded is counted and logged. A
+/// `u64` cell needs 156 bytes, more than the 152 validation allows.
+#[test]
+fn encode_failure_is_counted_and_logged() {
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let wire = Rc::new(Wire::default());
+            let store = CellStore::<u64>::new(storage(256, 32, 32, 64, 16), node(0xA));
+            let (client, admin, _runtime) = mocked(&wire, vec![sock(2)], store, |s| {
+                s.max_payload_bytes = MIN_PAYLOAD_BYTES;
+            })
+            .await;
+            hit(&client, 1).await;
+            heartbeats(3).await;
+            assert!(wire.attempts.borrow().is_empty());
+            assert_eq!(admin_snapshot(&admin).await.counters.encode_failures, 3);
+        })
+    });
+    let lines = coded(&logs, "encode_failed");
+    assert_eq!(lines.len(), 2, "{logs}");
+    for line in lines {
+        assert!(line.contains(&format!("peer={}", sock(2))), "{line}");
+    }
+}
+
+/// U29. E-Z8 fires when the kernel grants less than the setting asked for,
+/// naming the setting in every spelling and the sysctl; a real socket gets
+/// the configured request, not the default.
+#[cfg(feature = "transport-udp")]
+#[test]
+fn socket_buffer_warning_when_granted_is_smaller() {
+    use super::transport::warn_if_capped;
+    use crate::settings::Setting;
+
+    let requested = 65_536.try_into().unwrap();
+    for (granted, warnings) in [(65_535, 1), (65_536, 0), (131_072, 0)] {
+        let ((), logs) = with_logs(|| {
+            let setting = Setting::GossipRecvBufferBytes;
+            warn_if_capped("receive", "net.core.rmem_max", setting, requested, granted);
+        });
+        let lines = coded(&logs, "socket_buffer_capped");
+        assert_eq!(lines.len(), warnings, "{granted}: {logs}");
+        for line in lines {
+            for text in [
+                "gossip.recv_buffer_bytes",
+                "GABION_GOSSIP_RECV_BUFFER_BYTES",
+                "gabion_gossip_recv_buffer_bytes",
+                "sysctl=\"net.core.rmem_max\"",
+            ] {
+                assert!(line.contains(text), "{text} missing from {line}");
+            }
+        }
+    }
+
+    let (receive, logs) = with_logs(|| {
+        run_paused(async {
+            let config = tuned_config(vec![], 0, |s| {
+                s.recv_buffer_bytes = 65_536.try_into().unwrap();
+                s.send_buffer_bytes = ((1 << 30) - 1).try_into().unwrap();
+            });
+            let transport = UdpTransport::bind(sock(0), &config).await.unwrap();
+            socket2::SockRef::from(&transport.0)
+                .recv_buffer_size()
+                .unwrap()
+        })
+    });
+    // Linux reports double the grant.
+    assert!(receive <= 131_072, "receive buffer {receive}");
+    let lines = coded(&logs, "socket_buffer_capped");
+    assert_eq!(lines.len(), 1, "{logs}");
+    assert!(lines[0].contains("buffer=\"send\""), "{logs}");
+    assert!(lines[0].contains("requested_bytes=1073741823"), "{logs}");
+}
+
+#[cfg(feature = "transport-udp")]
+#[test]
+fn enobufs_is_held_like_a_full_buffer() {
+    use std::io;
+
+    use super::transport::refusal;
+
+    let enobufs = io::Error::from_raw_os_error(libc::ENOBUFS);
+    assert_eq!(refusal(enobufs).kind(), io::ErrorKind::WouldBlock);
+    let denied = io::ErrorKind::PermissionDenied.into();
+    assert_eq!(refusal(denied).kind(), io::ErrorKind::PermissionDenied);
+}
+
+/// A deferred round that overflows a receiver's queue drops the excess and
+/// says so: the packet is not counted delivered, so the visualiser's logging
+/// transport reports it as dropped, and the receiver gets only what fit.
+#[test]
+fn router_overflow_is_reported_as_a_drop() {
+    let router = SimRouter::with_channel_capacity(1);
+    let (src, dst) = (router.bind(sock(1)), router.bind(sock(2)));
+    router.begin_deferred();
+    for _ in 0..2 {
+        assert_eq!(src.try_send_to(b"gossip", dst.addr()).unwrap(), 6);
+    }
+    assert_eq!(router.received_count(dst.addr()), 1);
+    router.release_deferred();
+    let mut buf = [0; 16];
+    let first = dst.recv_from(&mut buf).now_or_never();
+    assert_eq!(first.map(Result::unwrap), Some((6, src.addr())));
+    assert!(dst.recv_from(&mut buf).now_or_never().is_none());
 }
 
 // -- Gap 5: DropProb i.i.d. packet loss -------------------------------------

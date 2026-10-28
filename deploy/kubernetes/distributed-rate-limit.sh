@@ -445,10 +445,9 @@ import json
 import sys
 with open(sys.argv[1]) as f:
     snap = json.load(f)
-store = snap.get("store", {})
-cell_store = store.get("cell_store", {})
+cell_store = snap.get("store_stats", {})
 print(f"  known_peers                {len(snap.get('peers') or [])}")
-print(f"  aggregate_rows             {store.get('aggregate_rows', '?')}")
+print(f"  aggregate_rows             {snap.get('aggregate_rows', '?')}")
 print(f"  active_cells               {cell_store.get('active_cells', '?')}")
 print(f"  cell_capacity              {cell_store.get('cell_capacity', '?')}")
 print(f"  cell_store_full_rejects    {cell_store.get('cell_store_full_rejects', '?')}")

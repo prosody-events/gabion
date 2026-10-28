@@ -63,8 +63,19 @@ pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
 pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;
-pub const GOSSIP_SEND_QUEUE_CAPACITY: usize = 128;
 pub const GOSSIP_LIMIT_QUEUE_CAPACITY: usize = 8192;
+
+/// Receive buffer, in bytes, the gossip socket asks the kernel for: 4 MiB.
+/// `socket_buffer_capped` warns when `net.core.rmem_max` grants less.
+pub const GOSSIP_RECV_BUFFER_BYTES: u32 = 4 << 20;
+
+/// Send buffer, in bytes, the gossip socket asks the kernel for: 1 MiB.
+/// `send_blocked` warns when a round fills it.
+pub const GOSSIP_SEND_BUFFER_BYTES: u32 = 1 << 20;
+
+/// The most expired cells one expiry call frees before the runtime applies
+/// them and calls again; sizes the runtime's expiration sink.
+pub const GOSSIP_EXPIRATION_BATCH: usize = 4_096;
 pub const GOSSIP_CLUSTER_ID_HASH: u128 = 1;
 
 /// Per-rule error budget for threshold-triggered anti-entropy, expressed in

@@ -635,9 +635,9 @@ test('the node inspector renders every detail section', async ({ page }) => {
   await expect(inspector.locator('.cadence .fanout-foot')).toContainText('floor');
   await expect(inspector.locator('.cadence .budget')).toContainText('error budget');
 
-  // §6 — three occupancy gauges + the §5 send-queue meter + the §4 fanout meter
-  // = five meters; the calm "holding" badge at zero rejects.
-  await expect(inspector.locator('[role="meter"]')).toHaveCount(5);
+  // §6 — three occupancy gauges + the §4 fanout meter = four meters; the calm
+  // "holding" badge at zero rejects.
+  await expect(inspector.locator('[role="meter"]')).toHaveCount(4);
   await expect(inspector.locator('.holding')).toContainText('All capacities holding');
 
   // §7 — the peer table summary and a resolved peer row.

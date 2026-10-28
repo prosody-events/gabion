@@ -147,11 +147,6 @@ pub struct NodeState {
     pub local_dirty_len: u32,
     /// Rows in the forwarded (received-then-re-gossiped) dirty ring.
     pub forwarded_dirty_len: u32,
-    /// Outbound packets queued behind the transport right now.
-    pub send_pending_depth: u64,
-    /// High-water mark of `send_pending_depth` since startup — the only honest
-    /// denominator for the send-queue meter (no static capacity exists).
-    pub max_send_pending_depth: u64,
     /// Inbound packets rejected by the wire decoder (bad HMAC, truncated, or
     /// otherwise undecodable).
     pub decode_reject_count: u64,

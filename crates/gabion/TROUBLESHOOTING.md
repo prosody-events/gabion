@@ -77,6 +77,62 @@ Message starts: "Could not understand a gossip message from this peer, so it was
 
 **Fields** `peer`, `error`, `rejected_total` · **Knob** `gossip.max_payload_bytes` (`GABION_GOSSIP_MAX_PAYLOAD_BYTES`) / `gabion_gossip_max_payload_bytes`; `gossip.max_cells_per_frame` (`GABION_GOSSIP_MAX_CELLS_PER_FRAME`) / `gabion_gossip_max_cells_per_frame`
 
+### `send_blocked`
+
+**Level** warn, power of two · **Request allowed** yes, counts reach peers late · **Emitted by** library (both adapters)
+
+Message starts: "The kernel's send buffer for the gossip socket was full"
+
+**What happened.** The kernel refused a gossip packet (`EAGAIN`, or `ENOBUFS`), so the round stopped there. The next round sends that packet first, then the rest. Until then, limits on other nodes under-count and may allow requests over the limit.
+
+**Why.** Usually the send buffer is smaller than gabion asked for (look for an earlier `socket_buffer_capped` naming `net.core.wmem_max`), or the host's network is saturated.
+
+**What to do next.** Raise `net.core.wmem_max` on the host to at least `requested_send_buffer_bytes` (see "Socket buffers" in the [gabion README](README.md#socket-buffers)), and keep `gossip.send_buffer_bytes` at or above what one round sends.
+
+**Fields** `send_blocked_total`, `requested_send_buffer_bytes`, `granted_send_buffer_bytes`, `sysctl`, `config_key` · **Knob** `gossip.send_buffer_bytes` (`GABION_GOSSIP_SEND_BUFFER_BYTES`) / `gabion_gossip_send_buffer_bytes`
+
+### `socket_buffer_capped`
+
+**Level** warn, once per buffer at start · **Request allowed** yes · **Emitted by** library (both adapters)
+
+Message starts: "The kernel gave the gossip socket a"
+
+**What happened.** The kernel granted the gossip socket a smaller receive or send buffer than gabion asked for. gabion keeps running; if the node pauses or a burst arrives, packets that do not fit are dropped and their counts arrive a round or more late.
+
+**Why.** The host setting named in `sysctl` (`net.core.rmem_max` or `net.core.wmem_max`, 212,992 bytes by default on Linux) caps every socket's buffer.
+
+**What to do next.** Raise the sysctl on the host to at least `requested_bytes` (in Kubernetes a node setting, not a pod sysctl). If the host cannot change, set the setting named in `config_key` to `granted_bytes` to accept the smaller buffer and silence the warning.
+
+**Fields** `buffer`, `requested_bytes`, `granted_bytes` (Linux reports double the grant), `sysctl`, `config_key` · **Knob** `gossip.recv_buffer_bytes` (`GABION_GOSSIP_RECV_BUFFER_BYTES`) / `gabion_gossip_recv_buffer_bytes`; `gossip.send_buffer_bytes` (`GABION_GOSSIP_SEND_BUFFER_BYTES`) / `gabion_gossip_send_buffer_bytes`
+
+### `send_error`
+
+**Level** warn, power of two · **Request allowed** yes, that peer under-counts · **Emitted by** library (both adapters)
+
+Message starts: "Could not send a gossip packet to this peer"
+
+**What happened.** A send to one peer failed with an error other than a full buffer. gabion dropped that packet and kept gossiping with every other peer; the peer gets the same counts on a later round once sends succeed, and until then its limits under-count.
+
+**Why.** Usually the peer has just left the cluster (a stale address), or a firewall or NetworkPolicy blocks UDP from this node to it.
+
+**What to do next.** If it repeats for a peer that is running, check the policy and the route between the two nodes.
+
+**Fields** `peer`, `error`, `send_errors_total` · **Knob** none
+
+### `encode_failed`
+
+**Level** error, power of two · **Request allowed** yes, that peer under-counts this round · **Emitted by** library (both adapters)
+
+Message starts: "gabion could not build a gossip packet"
+
+**What happened.** A gossip packet could not be encoded, so nothing more went to that peer this round, and limits there under-count until a later round succeeds.
+
+**Why.** Startup validation should make this impossible, so it is a gabion bug.
+
+**What to do next.** Report it with the `error` and `peer` fields and the gabion version.
+
+**Fields** `peer`, `error`, `encode_failures_total` · **Knob** none
+
 ### `kubernetes_forbidden`
 
 **Level** error, once per watch · **Request allowed** yes, discovery stops · **Emitted by** library (both adapters)

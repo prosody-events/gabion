@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
 use crate::clock::{ManualClock, SharedNow};
-use crate::config::{SimConfig, ValidSimConfig};
+use crate::config::{MAX_NODES, SimConfig, ValidSimConfig};
 use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView};
 use crate::shims::{AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport};
 
@@ -47,51 +47,18 @@ pub(crate) const CLUSTER_ID_HASH: u128 = 0xC1;
 /// the aggregate (see `RuleDescriptor::applies_locally`).
 const LOCAL_RULE_ID: u32 = 0;
 
-/// The visualizer's per-node gossip buffer sizing. **Not** the library
-/// production defaults (`GOSSIP_SEND_QUEUE_CAPACITY` = 128, tuned for a
-/// deployment whose per-tick output is small): the visualizer drives a far
-/// denser regime — up to `MAX_NODES` runtimes on one thread under a 100-node
-/// sustained-overload peak — so it sizes its own pool to that regime.
-///
-/// The invariant that fixes the high-node gossip freeze: **the send pool must
-/// hold one tick's worst-case packet output, with headroom for any cross-tick
-/// backlog.** Send-pool slots recycle only on the runtime's separate `Writable`
-/// select arm, never within `handle_gossip_tick`, so all `pick_count` peers'
-/// frames for one tick must fit in the free slots at once. If a frame can't
-/// finish, [`gabion::wire::Packets::next_into`] runs out of slots mid-frame and
-/// the iterator's drain contract trips its `debug_assert` (an `unreachable`
-/// freeze in dev wasm; a silent re-send next tick in release, since the dirty
-/// rings are persistent — no data loss, just slower flush).
-///
-/// 255 is the largest value `gossip.send_queue_capacity` admits, so the pool is
-/// pinned there and the per-tick frame is capped so one tick stays well inside
-/// it:
-///
-/// One tick emits at most `pick_count × packets_per_frame` packets, where
-/// `pick_count = ⌈ln(peers)+c⌉` (the coverage fanout, `c` =
-/// `GOSSIP_COVERAGE_MARGIN` = 3), capped at the peer count. The widest cluster
-/// the visualizer builds is `MAX_NODES` = 256, so `peers ≤ 255` and
-/// `pick_count ≤ ⌈ln(255)+3⌉ = 9`; at the 100-node overload point it is
-/// `⌈ln(99)+3⌉ = 8`. `packets_per_frame = ceil(VIZ_MAX_CELLS_PER_TICK /
-/// cells_per_packet)`, with `cells_per_packet ≈ 21` at a 1400-byte payload in
-/// the worst case (every cell a distinct origin, so the node dictionary costs
-/// 16 B/cell on top of the 46 B row) — so `ceil(160 / 21) = 8`. The worst case
-/// at 100 nodes is therefore ≈ `8 × 8 = 64` packets/tick, which the 255-slot
-/// pool clears ~4×, leaving the rest of the pool for packets still draining
-/// from the previous tick. A native 100-node Sustained-overload run (40 s of
-/// virtual time, debug build with the drain `debug_assert` live) measured an
-/// actual `max_send_pending_depth` peak of **64** — no trap, ~4× under the
-/// pool. (The coverage fanout is stable for a cluster size, so this peak does
-/// not climb with burst volume the way the old dirty-set widening did.)
-///
-/// Capping the per-tick frame is what keeps one tick inside the fixed pool. The
-/// cap is inert at the default 12-node scenarios — their cross-node working set
-/// (≈ 132 cells) never reaches 160 — so it changes nothing user-visible there;
-/// a large cluster's burst simply flushes over a few ticks instead of one (the
-/// dirty rings are persistent, so the residual rides the next tick rather than
-/// dropping). Pool memory is `255 × 1400 B × live_nodes` ≈ 36 MB at 100 nodes.
+/// Caps one round's frame at 160 cells, about eight 1,400-byte packets, so
+/// one round's packets to a node stay well inside [`VIZ_ROUTER_CAPACITY`]; a
+/// larger burst flushes over a few rounds while the dirty rings keep the rest.
 pub(crate) const VIZ_MAX_CELLS_PER_TICK: usize = 160;
-pub(crate) const VIZ_SEND_QUEUE_CAPACITY: usize = 255;
+
+/// Each node's inbound queue, sized for the densest round the visualizer can
+/// build: every node in one zone, each of the other `MAX_NODES − 1` nodes
+/// handing a node one data packet and one control packet, 510 at 256 nodes.
+/// Today's random fanout hands a node about nine a round. A round that would
+/// overflow a node's queue drops the excess, which the logging transport
+/// reports as dropped.
+pub(crate) const VIZ_ROUTER_CAPACITY: usize = 2 * (MAX_NODES - 1);
 
 /// The count width every node uses. `u32` matches the bench and is plenty for
 /// the visualizer's hit volumes.
@@ -323,12 +290,7 @@ impl EngineState {
             config,
             gossip,
             storage,
-            // The inbound channel is kept in lockstep with the send pool: if a
-            // receiver's queue fills, `try_send_to` returns `WouldBlock`, the
-            // sender re-queues the packet, and the slot never frees between
-            // ticks — a second backpressure source that would re-create the
-            // freeze. Sized ≥ the send pool so it is never the bottleneck.
-            router: SimRouter::with_channel_capacity(VIZ_SEND_QUEUE_CAPACITY),
+            router: SimRouter::with_channel_capacity(VIZ_ROUTER_CAPACITY),
             nodes: Vec::with_capacity(initial_nodes),
             addresses,
             node_id_index: HashMap::with_capacity(initial_nodes),
@@ -773,10 +735,6 @@ impl EngineState {
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
                 local_dirty_len: snap.as_ref().map_or(0, |s| s.local_dirty_len),
                 forwarded_dirty_len: snap.as_ref().map_or(0, |s| s.forwarded_dirty_len),
-                send_pending_depth: snap.as_ref().map_or(0, |s| s.send_pending_depth as u64),
-                max_send_pending_depth: snap
-                    .as_ref()
-                    .map_or(0, |s| s.max_send_pending_depth as u64),
                 decode_reject_count: snap.as_ref().map_or(0, |s| s.decode_reject_count),
                 store_stats: snap
                     .as_ref()

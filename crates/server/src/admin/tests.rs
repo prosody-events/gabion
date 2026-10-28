@@ -60,8 +60,10 @@ fn build_router(gossip_admin: mpsc::Sender<AdminCommand>) -> axum::Router {
     router(state)
 }
 
+/// The `/snapshot` JSON is the library's snapshot serialised as is, so a
+/// renamed field or an id written in decimal changes this shape.
 #[test]
-fn snapshot_returns_full_state_via_axum_route() {
+fn snapshot_json_shape_is_pinned() {
     run_local(async {
         let sim = SimRouter::new();
         let bind_addr = next_addr();
@@ -110,42 +112,90 @@ fn snapshot_returns_full_state_via_axum_route() {
             .expect("body");
         let body: Value = serde_json::from_slice(&bytes).expect("json");
 
-        let node_id = body["identity"]["node_id"].as_str().expect("node_id");
-        assert!(!node_id.is_empty());
-        assert!(
-            node_id.chars().all(|c| c.is_ascii_hexdigit()),
-            "node_id should be hex: {node_id:?}",
+        let keys = |value: &Value| {
+            let mut keys: Vec<String> =
+                value.as_object().expect("object").keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys(&body),
+            [
+                "aggregate_rows",
+                "counters",
+                "decode_reject_count",
+                "dirty_ticks",
+                "forwarded_dirty_len",
+                "last_effective_fanout",
+                "last_error_budget",
+                "local_dirty_len",
+                "local_identity",
+                "peak_effective_fanout",
+                "peers",
+                "rules",
+                "store_stats",
+                "threshold_fires",
+                "ticks_total",
+            ]
         );
-        assert_eq!(body["identity"]["incarnation"], 11);
+        assert_eq!(keys(&body["local_identity"]), ["incarnation", "node_id"]);
+        assert_eq!(
+            keys(&body["counters"]),
+            [
+                "bytes_received",
+                "bytes_sent",
+                "encode_failures",
+                "packets_received",
+                "packets_sent",
+                "send_blocked",
+                "send_errors",
+            ]
+        );
+        assert_eq!(
+            keys(&body["store_stats"]),
+            [
+                "active_cells",
+                "cell_capacity",
+                "cell_store_full_rejects",
+                "node_dictionary_full_rejects",
+                "node_slots_capacity",
+                "node_slots_used",
+                "rule_dictionary_full_rejects",
+                "rule_slots_capacity",
+                "rule_slots_used",
+            ]
+        );
+        assert_eq!(keys(&body["peers"][0]), ["addr", "node_id", "peer_slot"]);
+        assert_eq!(
+            keys(&body["rules"][0]),
+            [
+                "bucket_millis",
+                "descriptors",
+                "domain",
+                "domain_hash",
+                "fingerprint",
+                "id",
+                "limit",
+                "live_buckets",
+                "mode",
+                "window_millis",
+            ]
+        );
+        assert_eq!(keys(&body["rules"][0]["descriptors"][0]), ["key", "value"]);
 
-        let peers = body["peers"].as_array().expect("peers");
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0]["addr"], bootstrap.to_string());
-
-        // Full CellStoreStats projection — these are the regression
-        // targets for a serde rename or removed field.
-        let stats = &body["store"]["cell_store"];
-        for field in [
-            "active_cells",
-            "cell_capacity",
-            "rule_slots_used",
-            "rule_slots_capacity",
-            "node_slots_used",
-            "node_slots_capacity",
-            "cell_store_full_rejects",
-            "rule_dictionary_full_rejects",
-            "node_dictionary_full_rejects",
-        ] {
-            assert!(
-                stats.get(field).is_some(),
-                "missing store.cell_store.{field} in snapshot",
-            );
-        }
-
-        assert!(body["rules"].is_array(), "rules array missing");
-        assert!(body["gossip"]["local_dirty_len"].is_u64());
-        assert!(body["gossip"]["forwarded_dirty_len"].is_u64());
-        assert!(body["gossip"]["send_pending_depth"].is_u64());
+        assert_eq!(
+            body["local_identity"]["node_id"],
+            format!("{:#034x}", 0xBEEF_CAFE_u128)
+        );
+        assert_eq!(body["local_identity"]["incarnation"], 11);
+        assert_eq!(body["peers"][0]["addr"], bootstrap.to_string());
+        assert!(body["peers"][0]["node_id"].is_null());
+        assert_eq!(
+            body["rules"][0]["fingerprint"],
+            format!("{:#034x}", sample_rule().fingerprint)
+        );
+        assert_eq!(body["rules"][0]["mode"], "enforce");
+        assert_eq!(body["aggregate_rows"], 0);
 
         client.shutdown().await.unwrap();
         let _ = handle.await;

@@ -37,6 +37,11 @@ pub type RuleId = u32;
 /// same rule shape but different enforcement settings must still share a
 /// cluster-wide counter identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "snake_case")
+)]
 pub enum EnforcementMode {
     #[default]
     Enforce,
@@ -52,6 +57,7 @@ pub struct Descriptor<'a> {
 
 /// One descriptor pattern in a rule. `value == "*"` matches any value.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct DescriptorPattern {
     pub key: Box<str>,
     pub value: Box<str>,
@@ -67,9 +73,11 @@ impl DescriptorPattern {
 /// `fingerprint` and `domain_hash` are derived deterministically so two nodes
 /// with identical rules produce identical fingerprints.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Rule {
     pub id: RuleId,
     /// Stable, cross-node identity. Hashed from `(domain, descriptors)`.
+    #[cfg_attr(feature = "serde", serde(serialize_with = "crate::hex"))]
     pub fingerprint: u128,
     pub domain: Box<str>,
     pub domain_hash: KeyHash,
@@ -144,6 +152,7 @@ pub struct RuleSpec {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize), serde(transparent))]
 pub struct RuleTable {
     rules: Box<[Rule]>,
 }

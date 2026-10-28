@@ -3,8 +3,8 @@ use crate::settings::mock::storage;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
-use std::sync::{Arc, Mutex};
+
+use crate::mock::with_logs;
 
 fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
@@ -470,8 +470,8 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(rows: RemoteRows, current_seed
         .map(|row| row.handle.index)
         .collect();
 
-    let mut exp = ExpirationSink::<u32>::with_capacity(before.len());
-    store.expire(&current, &live, &mut exp);
+    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    assert_eq!(store.expire(&current, &live, &mut exp), Expiry::Done);
     let expired: BTreeSet<u32> = exp.handles.iter().map(|h| h.index).collect();
     if expired != expected_expired || exp.len() != expected_expired.len() {
         return false;
@@ -675,31 +675,44 @@ fn capacity_is_enforced_without_growing() {
     assert_eq!(store.capacity(), 1);
 }
 
-/// Collects `tracing` output so a test can read the line it asserts on.
-#[derive(Clone, Default)]
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for LogBuffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
+/// U16 (C12). A bucket boundary that expires more cells than the sink holds
+/// frees them in batches: each call stops when the sink is full, the next
+/// resumes where it stopped, and the sink never grows.
+#[test]
+fn bucket_boundary_expires_in_batches_without_growth() {
+    let mut store = small_store(64, 64);
+    store.intern_rule(rule_descriptor(0x11, 1)).unwrap();
+    let mut batch = ObservationBatch::with_capacity(20);
+    for key in 0..20 {
+        batch.push(observation(0x11, key, 0, 1, 1, 1_u32, 0));
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+    store.ingest_local(&batch, &mut DeltaSink::with_capacity(20));
+    let mut sink = ExpirationSink::with_capacity(8);
+    let capacities = |sink: &ExpirationSink<u32>| {
+        [
+            sink.handles.capacity(),
+            sink.keys.capacity(),
+            sink.last_counts.capacity(),
+            sink.last_update_millis.capacity(),
+            sink.applies_locally.capacity(),
+        ]
+    };
+    let before = capacities(&sink);
+    let mut calls = Vec::new();
+    loop {
+        let expiry = store.expire_at(2_000, &mut sink);
+        assert_eq!(capacities(&sink), before);
+        calls.push((expiry, sink.len()));
+        sink.clear();
+        if expiry == Expiry::Done {
+            break;
+        }
     }
-}
-
-fn with_logs<T>(body: impl FnOnce() -> T) -> (T, String) {
-    let buffer = LogBuffer::default();
-    let writer = buffer.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .finish();
-    let value = tracing::subscriber::with_default(subscriber, body);
-    let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
-    (value, logs)
+    assert_eq!(
+        calls,
+        [(Expiry::More, 8), (Expiry::More, 8), (Expiry::Done, 4)]
+    );
+    assert_eq!(store.active_len(), 0);
 }
 
 #[test]
@@ -949,8 +962,8 @@ fn unknown_rule_cells_round_trip() {
     let mut live = vec![0_u32; cur.len()];
     cur[row.key.rule as usize] = 5;
     live[row.key.rule as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(1);
-    store.expire(&cur, &live, &mut exp);
+    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
 }
 
@@ -960,8 +973,8 @@ fn unknown_rule_cells_expire_at_default_window() {
     let handle = remote_merge_one(&mut store, 0x44, 5, 1, 10, 0);
     assert!(store.get(handle).is_some());
 
-    let mut exp = ExpirationSink::<u32>::with_capacity(1);
-    store.expire_at(61_000, &mut exp);
+    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    assert_eq!(store.expire_at(61_000, &mut exp), Expiry::Done);
 
     assert!(store.get(handle).is_none());
     assert_eq!(exp.len(), 1);
@@ -1000,8 +1013,8 @@ fn dictionary_refcount_frees_unreferenced_slots() {
     let mut live = vec![0_u32; cur.len()];
     cur[rule_slot as usize] = 5;
     live[rule_slot as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(1);
-    store.expire(&cur, &live, &mut exp);
+    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
     // The unpinned remote-origin node slot frees: refcount 0, descriptor None.
     assert_eq!(store.node_dictionary().refcount(node_slot), 0);
@@ -1044,8 +1057,8 @@ fn configured_rule_pinned_survives_cell_expiry() {
     let mut live = vec![0_u32; cur.len()];
     cur[slot as usize] = 20;
     live[slot as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(1);
-    store.expire(&cur, &live, &mut exp);
+    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert!(store.get(h).is_none());
     assert_eq!(store.active_len(), 0);
 
@@ -1103,8 +1116,8 @@ fn wire_only_rule_frees_when_cells_expire() {
     let mut live = vec![0_u32; cur.len()];
     cur[slot as usize] = 20;
     live[slot as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(1);
-    store.expire(&cur, &live, &mut exp);
+    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
 
     // Slot freed: no lingering descriptor for a rule nobody configured.
@@ -1251,8 +1264,8 @@ fn node_slot_reuse_clears_frontier_rows() {
     let mut live = vec![0_u32; cur.len()];
     cur[row.key.rule as usize] = 5;
     live[row.key.rule as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(1);
-    store.expire(&cur, &live, &mut exp);
+    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
 
     // The slot is now free. Frontier rows must be zeroed.
     assert_eq!(
@@ -1420,7 +1433,7 @@ fn expire_emits_one_row_per_freed_cell() {
     live[rule_local as usize] = 1000;
 
     let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
-    store.expire(&cur, &live, &mut exp);
+    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
 
     assert_eq!(store.active_len(), 1);
     assert_eq!(exp.len(), 2);
@@ -1466,8 +1479,8 @@ fn expire_frees_slots_and_dictionary_refs() {
     let mut live = vec![0_u32; cur.len()];
     cur[rule_slot as usize] = 5;
     live[rule_slot as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(1);
-    store.expire(&cur, &live, &mut exp);
+    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
     // Node dictionary no longer holds the (NodeId(100), 1) entry.
     assert!(store.node_dictionary().find(NodeId(100), 1).is_none());
@@ -1538,8 +1551,8 @@ fn expire_at_and_expire_agree_for_same_now() {
     let live = rule.live_buckets();
 
     let mut a = mk();
-    let mut sink_a = ExpirationSink::<u32>::with_capacity(8);
-    a.expire_at(now_millis, &mut sink_a);
+    let mut sink_a = ExpirationSink::<u32>::with_capacity(a.capacity() as usize);
+    assert_eq!(a.expire_at(now_millis, &mut sink_a), Expiry::Done);
 
     let mut b = mk();
     let dict_cap = b.rule_dictionary().capacity() as usize;
@@ -1548,8 +1561,8 @@ fn expire_at_and_expire_agree_for_same_now() {
     let rule_slot = b.rule_dictionary.find(0x11).unwrap();
     cur[rule_slot as usize] = current;
     lv[rule_slot as usize] = live;
-    let mut sink_b = ExpirationSink::<u32>::with_capacity(8);
-    b.expire(&cur, &lv, &mut sink_b);
+    let mut sink_b = ExpirationSink::<u32>::with_capacity(b.capacity() as usize);
+    assert_eq!(b.expire(&cur, &lv, &mut sink_b), Expiry::Done);
 
     assert_eq!(sink_a.len(), sink_b.len());
     assert_eq!(a.active_len(), b.active_len());
@@ -1601,8 +1614,8 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
     obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
     store.merge_remote(&obs, &mut deltas);
 
-    let mut expirations = ExpirationSink::<u32>::with_capacity(1);
-    store.expire_at(150, &mut expirations);
+    let mut expirations = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    assert_eq!(store.expire_at(150, &mut expirations), Expiry::Done);
 
     // now=150ms -> current bucket 3. A 101ms window spans ceil(101/50)=3
     // buckets, so bucket 0 is still live. Floor division would use 2 live
@@ -1925,7 +1938,7 @@ fn apply_mixed_op_with_sinks(
                     live[slot as usize] = tick.live_by_fp[fp_idx] as u32;
                 }
             }
-            store.expire(&cur, &live, exp_sink);
+            assert_eq!(store.expire(&cur, &live, exp_sink), Expiry::Done);
         }
     }
 }
@@ -1988,7 +2001,7 @@ fn quickcheck_mixed_ops_match_model(ops: MixedOps) -> bool {
 
     for op in &ops.0 {
         let mut sink = DeltaSink::with_capacity(1);
-        let mut exp_sink = ExpirationSink::<u32>::with_capacity(8);
+        let mut exp_sink = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
         apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
         apply_mixed_op_to_model(&mut model, op);
 
@@ -2242,7 +2255,7 @@ fn quickcheck_gossip_frame_order_matches_lane_model(ops: MixedOps, max_seed: u8)
     let mut store = quickcheck_store_with_pinned_rules();
     for op in &ops.0 {
         let mut sink = DeltaSink::with_capacity(1);
-        let mut exp_sink = ExpirationSink::<u32>::with_capacity(8);
+        let mut exp_sink = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
         apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
     }
     if store.is_empty() {
@@ -2327,7 +2340,7 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
 
     let mut store_a = base.clone();
     let mut sink_a = ExpirationSink::<u32>::with_capacity(base.capacity() as usize);
-    store_a.expire_at(now_millis, &mut sink_a);
+    assert_eq!(store_a.expire_at(now_millis, &mut sink_a), Expiry::Done);
 
     let mut store_b = base.clone();
     let dict_cap = store_b.rule_dictionary().capacity() as usize;
@@ -2342,7 +2355,7 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
         }
     }
     let mut sink_b = ExpirationSink::<u32>::with_capacity(base.capacity() as usize);
-    store_b.expire(&cur, &live, &mut sink_b);
+    assert_eq!(store_b.expire(&cur, &live, &mut sink_b), Expiry::Done);
 
     let handles_a: BTreeSet<u32> = sink_a.handles.iter().map(|h| h.index).collect();
     let handles_b: BTreeSet<u32> = sink_b.handles.iter().map(|h| h.index).collect();

@@ -1,31 +1,32 @@
 //! Single-threaded gossip event loop.
 //!
-//! One `tokio::select!` drives five arms — limit/shutdown requests, inbound
-//! UDP, outbound writable, peer membership churn, gossip tick. After each
-//! iteration the runtime calls [`AggregateStore::apply`] once with whatever
-//! rows the arm produced. The runtime owns the [`CellStore`], pre-allocated
-//! scratch buffers, the outbound send pool, and the peer table; the request
-//! and packet arms reuse those buffers; peer churn and admin commands may
-//! allocate.
+//! One `tokio::select!` drives four arms — limit/shutdown requests, inbound
+//! UDP, peer membership churn, gossip tick — plus admin commands when wired.
+//! After each iteration the runtime calls [`AggregateStore::apply`] once with
+//! whatever rows the arm produced, and once more per full expiry batch. The
+//! runtime owns the [`CellStore`], pre-allocated scratch buffers, one packet
+//! buffer, and the peer table; the request and packet arms reuse those
+//! buffers; peer churn and admin commands may allocate.
 
-use std::collections::VecDeque;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Incarnation, NodeId, Observation,
-    ObservationBatch,
+    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Expiry, Incarnation, NodeId,
+    Observation, ObservationBatch,
 };
+use crate::defaults;
 use crate::discovery::PeerEvent;
 use crate::settings::Setting;
 use crate::throttle;
 use crate::wire::{self, PacketBuf, Packets, WireScratch};
 
-use super::admin::{AdminCommand, AdminSnapshot, PeerEntry};
+use super::admin::{AdminCommand, AdminSnapshot, GossipCounters, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
@@ -110,11 +111,11 @@ where
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
-
-    // Outbound send pool.
-    send_pool: Vec<PacketBuf>,
-    send_pending: VecDeque<(SocketAddr, u8)>,
-    send_free: Vec<u8>,
+    /// The one send buffer. While `held` is set it holds the packet the
+    /// kernel refused, and nothing encodes.
+    packet: PacketBuf,
+    /// Where the packet in `packet` goes, while the kernel refuses it.
+    held: Option<SocketAddr>,
 
     peers: Vec<Peer>,
     rng: SplitMix64,
@@ -128,12 +129,7 @@ where
     // Inbound packets that failed to decode. Throttles `decode_rejected` and
     // is reported in `AdminSnapshot`.
     decode_reject_count: u64,
-
-    // High-water mark of `send_pending.len()`. Strictly observability — the
-    // `WouldBlock` re-queue path in `drain_one_send` is otherwise invisible
-    // to external testers, so this field lets the property test for that
-    // path verify the queue actually grew under saturation.
-    max_send_pending_depth: usize,
+    counters: GossipCounters,
 
     // Threshold-triggered anti-entropy state. One column per interned rule
     // slot; sized to `STORAGE_RULE_DICTIONARY_CAPACITY` at construction and
@@ -142,9 +138,9 @@ where
     // dictionary lookup (`RuleDictionary::find`) the only identity work.
     //
     // - `rule_pending[slot]`     — local hits accumulated against rule `slot` since the last
-    //   gossip emit. Zeroed by the post-emit sweep in `handle_gossip_tick`.
+    //   gossip emit. Zeroed when a round settles (`settle`).
     // - `rule_last_emit_ms[slot]` — wall-clock stamp of the last emit that included this rule
-    //   (also stamped post-emit).
+    //   (stamped when a round settles).
     rule_pending: Box<[u32]>,
     rule_last_emit_ms: Box<[u64]>,
 
@@ -194,7 +190,7 @@ where
         store: CellStore<C>,
         aggregates: S,
     ) -> Result<(Self, GossipClient<C>), GossipError> {
-        let transport = UdpTransport::bind(bind_addr).await?;
+        let transport = UdpTransport::bind(bind_addr, &config).await?;
         Ok(Self::from_parts(
             transport,
             TokioClock::new(),
@@ -213,7 +209,7 @@ where
         aggregates: S,
         admin_rx: mpsc::Receiver<AdminCommand>,
     ) -> Result<(Self, GossipClient<C>), GossipError> {
-        let transport = UdpTransport::bind(bind_addr).await?;
+        let transport = UdpTransport::bind(bind_addr, &config).await?;
         Ok(Self::from_parts_with_admin(
             transport,
             TokioClock::new(),
@@ -259,19 +255,15 @@ where
 
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
-        let cells_per_tick = config.max_cells_per_tick.get();
-        let obs_buf = ObservationBatch::<C>::with_capacity(cells_per_tick);
-        let ack_buf = AckColumns::with_capacity(config.wire_limits.max_cells as usize);
-        let sink_buf = DeltaSink::<C>::with_capacity(cells_per_tick);
-        let frame_handles = Vec::with_capacity(cells_per_tick);
-        let expiration_buf = ExpirationSink::<C>::with_capacity(cells_per_tick);
-
-        let send_pool_size = config.send_queue_capacity.get();
-        let send_pool: Vec<PacketBuf> = (0..send_pool_size)
-            .map(|_| PacketBuf::for_limits(config.wire_limits))
-            .collect();
-        let send_free: Vec<u8> = (0..send_pool_size).rev().collect();
-        let send_pending = VecDeque::with_capacity(send_pool_size.into());
+        // An inbound packet, or one limit request, carries at most the
+        // decoder's per-packet cell bound.
+        let packet_cells = config.wire_limits.max_cells as usize;
+        let obs_buf = ObservationBatch::<C>::with_capacity(packet_cells);
+        let ack_buf = AckColumns::with_capacity(packet_cells);
+        let sink_buf = DeltaSink::<C>::with_capacity(packet_cells);
+        let frame_handles = Vec::with_capacity(config.max_cells_per_tick.get());
+        let expiration_buf = ExpirationSink::<C>::with_capacity(defaults::GOSSIP_EXPIRATION_BATCH);
+        let packet = PacketBuf::for_limits(config.wire_limits);
 
         let peers: Vec<Peer> = config
             .bootstrap_peers
@@ -304,14 +296,13 @@ where
             sink_buf,
             expiration_buf,
             frame_handles,
-            send_pool,
-            send_pending,
-            send_free,
+            packet,
+            held: None,
             peers,
             rng,
             pending_reply: None,
             decode_reject_count: 0,
-            max_send_pending_depth: 0,
+            counters: GossipCounters::default(),
             rule_pending,
             rule_last_emit_ms,
             want_immediate_flush: false,
@@ -348,11 +339,6 @@ where
         let mut peer_events_done = false;
 
         loop {
-            // Decide outside the `select!` whether the send arm has work to do.
-            // Reading `self.send_pending.is_empty()` inside the `if` guard
-            // would re-borrow `self` after we've already
-            // split-borrowed for the I/O futures below.
-            let have_send = !self.send_pending.is_empty();
             let watch_peers = !peer_events_done;
 
             let outcome = if self.want_immediate_flush {
@@ -387,7 +373,6 @@ where
 
                     req = requests_rx.recv() => ArmOutcome::Request(req),
                     recv = transport.recv_from(recv_buf) => ArmOutcome::Inbound(recv),
-                    _ = transport.writable(), if have_send => ArmOutcome::Writable,
                     evt = peer_events.next(), if watch_peers => ArmOutcome::PeerEvent(evt),
                     cmd = recv_admin(admin_rx) => ArmOutcome::Admin(cmd),
                     _ = tick.tick() => ArmOutcome::Tick,
@@ -401,7 +386,6 @@ where
                 ArmOutcome::Request(Some(Request::Limit(r))) => self.handle_limit_request(r),
                 ArmOutcome::Inbound(Ok((n, src))) => self.handle_inbound(n, src),
                 ArmOutcome::Inbound(Err(e)) => return Err(e.into()),
-                ArmOutcome::Writable => self.drain_one_send()?,
                 ArmOutcome::PeerEvent(Some(evt)) => self.handle_peer_event(evt),
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
@@ -410,16 +394,12 @@ where
             }
 
             // One apply per iteration covering both row sources. CRDT-free
-            // arms (peer event, drain, idle ticks) leave both empty; the
-            // branch short-circuits then.
+            // arms (peer event, idle ticks) leave both empty; the branch
+            // short-circuits then.
             if !self.sink_buf.is_empty() || !self.expiration_buf.is_empty() {
                 self.aggregates.apply(&self.sink_buf, &self.expiration_buf);
                 self.sink_buf.clear();
                 self.expiration_buf.clear();
-            }
-
-            if self.send_pending.len() > self.max_send_pending_depth {
-                self.max_send_pending_depth = self.send_pending.len();
             }
 
             // Ack any pending limit-request AFTER the apply ran — callers
@@ -441,8 +421,8 @@ where
         // budget: ε_R = max(1, L × target_err_bps / (10_000 × N)). Total
         // cluster-wide unreplicated error per rule is bounded by N × ε_R.
         // `saturating_add` keeps the column monotone across the gap between
-        // crossing and reset; the post-emit sweep in `handle_gossip_tick`
-        // zeroes the slot once a frame is queued.
+        // crossing and reset; `settle` zeroes the slot at the start of the
+        // next round.
         //
         // Falls through silently when the rule isn't interned yet (first
         // hit for that fingerprint) — the next heartbeat picks it up.
@@ -462,13 +442,12 @@ where
                 // `req.now_millis`. Adapter-supplied wall clock and
                 // `self.clock.now_millis()` may live on different epochs
                 // (wall vs paused-virtual time in tests), and only the
-                // runtime-local clock is monotone with the post-emit
-                // stamp written by `handle_gossip_tick`. Subtraction is
-                // still well-defined in monotonic-rate terms — both fire
-                // and reset use the same clock — so the floor is correct.
-                // `last == 0` is the "never emitted" sentinel so the very
-                // first crossing always fires; the post-emit sweep stamps
-                // `max(1)` so the sentinel is not re-introduced.
+                // runtime-local clock is monotone with the stamp `settle`
+                // writes. Subtraction is still well-defined in monotonic-rate
+                // terms — both fire and reset use the same clock — so the
+                // floor is correct. `last == 0` is the "never emitted"
+                // sentinel so the very first crossing always fires; `settle`
+                // stamps `max(1)` so the sentinel is not re-introduced.
                 let now = self.clock.now_millis();
                 let last = self.rule_last_emit_ms[idx];
                 let floor = self.config.min_emit_interval.0.get();
@@ -498,6 +477,8 @@ where
     }
 
     fn handle_inbound(&mut self, n: usize, src: SocketAddr) {
+        self.counters.packets_received += 1;
+        self.counters.bytes_received += n as u64;
         self.obs_buf.clear();
         self.ack_buf.clear();
         self.sink_buf.clear();
@@ -578,31 +559,13 @@ where
             }
             // Cache the peer_slot on the matching peer entry so future ticks
             // can prune without re-interning. `node_id` and `peer_slot` are
-            // always set together — see `handle_gossip_tick`, which relies
-            // on this invariant.
+            // always set together — see `gossip`, which relies on this
+            // invariant.
             if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
                 peer.node_id = Some(sender_id);
                 peer.peer_slot = Some(peer_slot);
             }
         }
-    }
-
-    fn drain_one_send(&mut self) -> Result<(), GossipError> {
-        let Some((dst, slot)) = self.send_pending.pop_front() else {
-            return Ok(());
-        };
-        let buf = &self.send_pool[slot as usize];
-        match self.transport.try_send_to(buf.as_bytes(), dst) {
-            Ok(_) => self.send_free.push(slot),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.send_pending.push_front((dst, slot));
-            }
-            Err(e) => {
-                self.send_free.push(slot);
-                return Err(e.into());
-            }
-        }
-        Ok(())
     }
 
     fn handle_admin_command(&mut self, cmd: AdminCommand) {
@@ -622,9 +585,8 @@ where
                     store_stats: self.store.stats(),
                     local_dirty_len: self.store.local_dirty().len(),
                     forwarded_dirty_len: self.store.forwarded_dirty().len(),
-                    send_pending_depth: self.send_pending.len(),
                     decode_reject_count: self.decode_reject_count,
-                    max_send_pending_depth: self.max_send_pending_depth,
+                    counters: self.counters,
                     ticks_total: self.ticks_total,
                     threshold_fires: self.threshold_fires,
                     dirty_ticks: self.dirty_ticks,
@@ -714,18 +676,60 @@ where
         }
     }
 
+    /// A heartbeat or threshold round. The work that needs no socket comes
+    /// first, so a round with no peers or a held packet still does it.
     fn handle_gossip_tick(&mut self) {
-        // Step 0: bump the total-ticks counter. Tracked unconditionally
-        // (even for empty / no-peer ticks) so observers can split the
-        // run's wall time into heartbeat ticks vs threshold fires.
+        // Tracked unconditionally (even for empty / no-peer ticks) so
+        // observers can split the run's wall time into heartbeat ticks vs
+        // threshold fires.
         self.ticks_total = self.ticks_total.saturating_add(1);
+        self.expire_cells();
+        self.settle();
+        if let Some(dst) = self.held {
+            let Self {
+                transport,
+                packet,
+                counters,
+                config,
+                ..
+            } = self;
+            if !send_packet(transport, packet, dst, counters, config.send_buffer_bytes) {
+                return;
+            }
+            self.held = None;
+        }
+        self.gossip();
+    }
 
-        // Step 1: expire aged-out cells so we don't gossip them.
+    /// Free aged-out cells so we don't gossip them. Each full batch is applied
+    /// before the next; the last one goes with the iteration's other rows.
+    fn expire_cells(&mut self) {
         let now_millis = self.clock.now_millis();
-        self.expiration_buf.clear();
-        self.store.expire_at(now_millis, &mut self.expiration_buf);
+        while self.store.expire_at(now_millis, &mut self.expiration_buf) == Expiry::More {
+            // `sink_buf` is empty: the previous iteration's apply cleared it.
+            self.aggregates.apply(&self.sink_buf, &self.expiration_buf);
+            self.expiration_buf.clear();
+        }
+    }
 
-        if self.store.is_empty() || self.peers.is_empty() || self.send_free.is_empty() {
+    /// Settle the error budget: reset each rule's unsent local hits and stamp
+    /// its emit floor. Every round does it before it can return early, so a
+    /// lone node or a blocked socket does not run a threshold round per
+    /// request. The hits ride this round's frames or wait in the dirty rings.
+    fn settle(&mut self) {
+        let stamp = self.clock.now_millis().max(1);
+        for slot in 0..self.rule_pending.len() {
+            if self.rule_pending[slot] != 0 {
+                self.rule_pending[slot] = 0;
+                self.rule_last_emit_ms[slot] = stamp;
+            }
+        }
+    }
+
+    /// Send this round's frames, stopping at the first packet the kernel
+    /// refuses.
+    fn gossip(&mut self) {
+        if self.store.is_empty() || self.peers.is_empty() {
             return;
         }
 
@@ -736,12 +740,12 @@ where
         // have local_dirty>0) always count.
         self.dirty_ticks = self.dirty_ticks.saturating_add(1);
 
-        // Step 2: pick `fanout` distinct peers via a partial Fisher-Yates
-        // shuffle of `self.peers` in place. With-replacement sampling would
-        // silently break Demers' O(log N) convergence bound — selecting the
-        // same peer twice in one tick burns a send-pool slot encoding the
-        // same frame for the same peer. `self.peers` has no ordering
-        // contract elsewhere (lookups are by `addr`), so shuffling is free.
+        // Pick `fanout` distinct peers via a partial Fisher-Yates shuffle of
+        // `self.peers` in place. With-replacement sampling would silently
+        // break Demers' O(log N) convergence bound — selecting the same peer
+        // twice in one tick encodes and sends the same frame twice.
+        // `self.peers` has no ordering contract elsewhere (lookups are by
+        // `addr`), so shuffling is free.
         //
         // Coverage fanout (Kermarrec, Massoulié & Ganesh, IEEE TPDS 2003,
         // Theorem 1): a directed gossip round with mean fanout `ln(n) + c`
@@ -759,7 +763,7 @@ where
         // above guarantees n ≥ 1, so `ln` is never called on 0 and `.min(n)`
         // never clamps below 1.
         let n = self.peers.len();
-        let coverage = ((n as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
+        let coverage = ((n as f64).ln() + defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
         let pick_count = self.config.fanout.get().max(coverage).min(n);
         // Record the coverage-fanout decision so observers can read the pick
         // directly instead of reconstructing the formula. Only dirty ticks
@@ -773,9 +777,6 @@ where
         }
 
         for peer_idx in 0..pick_count {
-            if self.send_free.is_empty() {
-                break;
-            }
             let peer_addr = self.peers[peer_idx].addr;
             // `handle_inbound` writes `node_id` and `peer_slot` together —
             // when one is `Some`, the other is too. So a single read of
@@ -804,29 +805,37 @@ where
             if self.frame_handles.is_empty() {
                 continue;
             }
-            self.encode_packets_for(peer_addr);
-        }
-
-        // Reset per-rule pending. The sweep treats every rule with
-        // non-zero pending as "touched in expectation by the tick" — the
-        // dirty-ring drain in `fill_gossip_frame*` doesn't tell us which
-        // rule slots actually made it onto the wire, but mass conservation
-        // (Kempe, Dobra, Gehrke — FOCS 2003) says every pending hit either
-        // rode out in this frame or sits in the dirty ring awaiting the
-        // next one. Under UDP loss the residual is repaired by the next
-        // round; the N × ε_R bound holds in expectation. A strict bound
-        // would require ack-aware reset against `peer_frontiers`,
-        // deferred until measurements show drift.
-        let stamp = now_millis.max(1);
-        for slot in 0..self.rule_pending.len() {
-            if self.rule_pending[slot] != 0 {
-                self.rule_pending[slot] = 0;
-                self.rule_last_emit_ms[slot] = stamp;
+            if let Err(error) = self.send_frame(peer_addr)
+                && let Some(encode_failures_total) =
+                    throttle::bump(&mut self.counters.encode_failures)
+            {
+                tracing::error!(
+                    code = "encode_failed",
+                    peer = %peer_addr,
+                    error = %error,
+                    encode_failures_total,
+                    "gabion could not build a gossip packet for this peer, so it sent nothing \
+                     more to that peer this round, and limits there under-count until a later \
+                     round succeeds. Startup validation should make this impossible, so it is a \
+                     gabion bug. Report it with the `error` and `peer` fields and the gabion \
+                     version.",
+                );
+            }
+            if self.held.is_some() {
+                return;
             }
         }
     }
 
-    fn encode_packets_for(&mut self, dst: SocketAddr) {
+    /// Encode the frame in `frame_handles` for `dst` and hand each packet to
+    /// the socket as it is encoded. A packet the kernel refuses stays in
+    /// `packet`, `held` names its destination, and the rest of the frame waits
+    /// in the dirty rings and the repair lane.
+    fn send_frame(&mut self, dst: SocketAddr) -> Result<(), wire::EncodeError> {
+        debug_assert!(
+            self.held.is_none(),
+            "encoding would overwrite the held packet"
+        );
         let header = wire::Header {
             cluster_id_hash: self.config.cluster_id_hash.get(),
             sender_node_id: self.store.local_identity().node_id.0,
@@ -839,50 +848,41 @@ where
             flags: 0,
         };
 
-        let packets_result = match self.config.auth_key.as_ref() {
+        let Self {
+            config,
+            store,
+            frame_handles,
+            scratch,
+            transport,
+            packet,
+            held,
+            counters,
+            ..
+        } = self;
+        let mut packets = match config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
                 header,
-                &self.store,
-                &self.frame_handles,
+                store,
+                frame_handles,
                 key,
-                &mut self.scratch,
-                self.config.wire_limits,
+                scratch,
+                config.wire_limits,
             ),
-            None => Packets::<C>::unauth(
-                header,
-                &self.store,
-                &self.frame_handles,
-                &mut self.scratch,
-                self.config.wire_limits,
-            ),
-        };
-        let mut packets = match packets_result {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        while let Some(slot) = self.send_free.pop() {
-            let buf = &mut self.send_pool[slot as usize];
-            match packets.next_into(buf) {
-                Ok(Some(_)) => self.send_pending.push_back((dst, slot)),
-                Ok(None) => {
-                    self.send_free.push(slot);
-                    break;
-                }
-                Err(_) => {
-                    self.send_free.push(slot);
-                    break;
-                }
+            None => Packets::<C>::unauth(header, store, frame_handles, scratch, config.wire_limits),
+        }?;
+        while packets.next_into(packet)?.is_some() {
+            if !send_packet(transport, packet, dst, counters, config.send_buffer_bytes) {
+                *held = Some(dst);
+                break;
             }
         }
-        drop(packets);
+        Ok(())
     }
 }
 
 enum ArmOutcome {
     Request(Option<Request>),
     Inbound(io::Result<(usize, SocketAddr)>),
-    Writable,
     PeerEvent(Option<PeerEvent>),
     Admin(Option<AdminCommand>),
     Tick,
@@ -893,6 +893,66 @@ async fn recv_admin(rx: &mut Option<mpsc::Receiver<AdminCommand>>) -> Option<Adm
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Hand one encoded packet to the socket. Returns `false` when the kernel
+/// refused it for lack of buffer space, so the caller holds it; any other
+/// error drops the packet, and gossip goes on.
+fn send_packet<T: GossipTransport>(
+    transport: &T,
+    packet: &PacketBuf,
+    dst: SocketAddr,
+    counters: &mut GossipCounters,
+    send_buffer: NonZeroU32,
+) -> bool {
+    match transport.try_send_to(packet.as_bytes(), dst) {
+        Ok(bytes) => {
+            counters.packets_sent += 1;
+            counters.bytes_sent += bytes as u64;
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            if let Some(send_blocked_total) = throttle::bump(&mut counters.send_blocked) {
+                tracing::warn!(
+                    code = "send_blocked",
+                    send_blocked_total,
+                    requested_send_buffer_bytes = send_buffer.get(),
+                    granted_send_buffer_bytes = transport.send_buffer_bytes(),
+                    sysctl = "net.core.wmem_max",
+                    config_key = Setting::GossipSendBufferBytes.yaml_key(),
+                    "The kernel's send buffer for the gossip socket was full, so this node \
+                     stopped its gossip round early; it retries the refused packet first on each \
+                     later round and sends the rest once the kernel accepts sends again. Counts \
+                     reach some peers late, so limits there briefly under-count and allow \
+                     requests over the limit. Usually the send buffer is smaller than gabion \
+                     asked for (look for an earlier warning naming `net.core.wmem_max`), or the \
+                     host's network is saturated. Raise `net.core.wmem_max` on the host to at \
+                     least {} bytes, the size {} asks for.",
+                    send_buffer,
+                    Setting::GossipSendBufferBytes,
+                );
+            }
+            false
+        }
+        Err(error) => {
+            if let Some(send_errors_total) = throttle::bump(&mut counters.send_errors) {
+                tracing::warn!(
+                    code = "send_error",
+                    peer = %dst,
+                    error = %error,
+                    send_errors_total,
+                    "Could not send a gossip packet to this peer, so gabion dropped that packet \
+                     and kept gossiping with every other peer. The peer gets the same counts on a \
+                     later round once sends succeed; until then, limits enforced there \
+                     under-count. Usually the peer has just left the cluster (a stale address), \
+                     or a firewall or NetworkPolicy blocks UDP from this node to it. If it \
+                     repeats for a peer that is running, check the policy and the route between \
+                     the two.",
+                );
+            }
+            true
+        }
     }
 }
 

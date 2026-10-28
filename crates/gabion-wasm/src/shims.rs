@@ -152,8 +152,8 @@ impl GossipTransport for LoggingSimTransport {
     fn try_send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
         let before = self.router.received_count(dst);
         let result = self.inner.try_send_to(buf, dst);
-        // Only a successful (non-`WouldBlock`) send is a network event; the
-        // re-queued `WouldBlock` path is backpressure, not a packet.
+        // Only a successful send is a network event; a refused
+        // (`WouldBlock`) send is held by the runtime and retried, not a packet.
         if let Ok(n) = result
             && let Some(&dst_id) = self.addresses.borrow().get(&dst)
         {

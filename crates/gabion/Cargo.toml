@@ -17,7 +17,10 @@ hmac.workspace = true
 humantime.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 sha2.workspace = true
+socket2 = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -39,8 +42,12 @@ default = ["discovery-kubernetes", "transport-udp"]
 # which transitively need `hyper`/`rustls`/`tower-http` — host-only.
 discovery-kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:ahash"]
 # The production UDP datagram transport (`UdpTransport`) and the
-# socket-binding runtime constructors. Needs `tokio/net`.
-transport-udp = ["tokio/net"]
+# socket-binding runtime constructors. Needs `tokio/net`; `socket2` sizes the
+# socket's kernel buffers and `libc` names `ENOBUFS`.
+transport-udp = ["tokio/net", "dep:libc", "dep:socket2"]
+# `Serialize` for the admin snapshot and the rules, for an adapter that serves
+# them as JSON. The library never deserialises.
+serde = ["dep:serde"]
 # Per-cell admin dump (`AdminCommand::CellDump`). Built inside the gossip
 # task and used by the visualizer to render every node's CRDT cells. Off by
 # default so the production runtime never compiles the cell-iteration path.

@@ -557,29 +557,6 @@ fn decoder_rejects_truncated_dict() {
     assert_eq!(err, DecodeError::BodyLenMismatch);
 }
 
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Packets dropped with")]
-fn packets_drop_undrained_panics_in_debug() {
-    let rows: Vec<RawRow> = (0..4)
-        .map(|i| RawRow {
-            rule_fingerprint: 0xAA,
-            key_hash: i as u128,
-            bucket: 0,
-            origin_node_id: 0xBB,
-            origin_incarnation: 1,
-            count: 1,
-            last_update_millis: 0,
-        })
-        .collect();
-    let (store, handles) = seed_store::<u32>(&rows, |c| c);
-    let limits = FrameLimits::default();
-    let mut scratch = WireScratch::for_store(&store);
-    let _packets = Packets::<u32>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
-        .expect("ctor");
-    // Drop without calling next_into — Drop's debug-assert must fire.
-}
-
 // -- Outer guardrails -------------------------------------------------------
 
 #[test]

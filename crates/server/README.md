@@ -257,11 +257,12 @@ emissions). The math and tradeoffs live in
 
 ### Verify convergence
 
-`/snapshot` returns peer list, rule list, and CRDT stats:
+`/snapshot` returns the peer list, CRDT stats (`store_stats`), gossip counters
+(`counters`), the rule list and the aggregate row count:
 
 ```bash
 curl -s "$ADMIN_HOST:9090/snapshot" | jq '.peers | length'
-curl -s "$ADMIN_HOST:9090/snapshot" | jq '.store.cell_store.active_cells'
+curl -s "$ADMIN_HOST:9090/snapshot" | jq '.store_stats.active_cells'
 ```
 
 A cluster has converged when every node's `peers | length` reflects

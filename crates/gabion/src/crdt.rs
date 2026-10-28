@@ -74,14 +74,17 @@ pub type NodeSlot = u16;
 
 /// Application-level key identity, hashed to 128 bits.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct KeyHash(pub u128);
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct KeyHash(#[cfg_attr(feature = "serde", serde(serialize_with = "crate::hex"))] pub u128);
 
 /// A peer's stable identity.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct NodeId(pub u128);
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct NodeId(#[cfg_attr(feature = "serde", serde(serialize_with = "crate::hex"))] pub u128);
 
 /// Stable owner identity for cells created by one node incarnation.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct NodeIdentity {
     pub node_id: NodeId,
     pub incarnation: Incarnation,
@@ -229,6 +232,7 @@ pub struct CellRow<C: Count> {
 
 /// Counters surfaced for observability.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct CellStoreStats {
     pub active_cells: u32,
     pub cell_capacity: u32,
@@ -239,6 +243,16 @@ pub struct CellStoreStats {
     pub cell_store_full_rejects: u64,
     pub rule_dictionary_full_rejects: u64,
     pub node_dictionary_full_rejects: u64,
+}
+
+/// Where an expiry pass stands after one call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum Expiry {
+    /// Every slot has been checked; the next call starts a new pass.
+    Done,
+    /// The sink is full: apply and clear it, then call again to resume.
+    More,
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +303,8 @@ pub struct CellStore<C: Count = u32> {
     local_dirty: DirtyRing,
     forwarded_dirty: DirtyRing,
     repair_cursor: u32,
+    /// Slot where the next `expire` call resumes; 0 starts a pass.
+    expire_cursor: u32,
 
     // Frame-level dedup.
     selection_marks: Box<[u32]>,
@@ -384,6 +400,7 @@ impl<C: Count> CellStore<C> {
             local_dirty: DirtyRing::with_capacity(config.local_dirty_capacity),
             forwarded_dirty: DirtyRing::with_capacity(config.forwarded_dirty_capacity),
             repair_cursor: 0,
+            expire_cursor: 0,
 
             selection_marks: vec![0_u32; cap as usize].into_boxed_slice(),
             selection_epoch: 0,
@@ -951,13 +968,17 @@ impl<C: Count> CellStore<C> {
     /// `buckets[slot] + live_buckets[r] >= current_epoch_by_rule[r]`. Each
     /// freed cell is emitted into `sink` *before* its slot is released, so
     /// external aggregators see one row per active-set departure.
+    ///
+    /// The sink never grows: when it is full the call stops with
+    /// [`Expiry::More`], and the next call resumes at the same slot.
     pub fn expire(
         &mut self,
         current_epoch_by_rule: &[BucketEpoch],
         live_buckets: &[u32],
         sink: &mut ExpirationSink<C>,
-    ) {
-        for slot in 0..self.capacity {
+    ) -> Expiry {
+        debug_assert!(sink.capacity() > 0, "a zero-capacity sink takes no row");
+        for slot in self.expire_cursor..self.capacity {
             if !self.is_active(slot) {
                 continue;
             }
@@ -970,10 +991,16 @@ impl<C: Count> CellStore<C> {
             let bucket = self.buckets[slot as usize];
             let expired = (bucket as u64) + (live as u64) < (current as u64);
             if expired {
+                if sink.is_full() {
+                    self.expire_cursor = slot;
+                    return Expiry::More;
+                }
                 self.emit_expiration(sink, slot);
                 self.free_cell_at(slot);
             }
         }
+        self.expire_cursor = 0;
+        Expiry::Done
     }
 
     /// Drop dirty records. Stored cells are untouched.
@@ -1111,7 +1138,7 @@ impl<C: Count> CellStore<C> {
     /// epoch and live-bucket arrays from the current wall-clock time and each
     /// rule's descriptor. Uses scratch storage allocated at construction time
     /// so the call is allocation-free.
-    pub fn expire_at(&mut self, now_millis: u64, sink: &mut ExpirationSink<C>) {
+    pub fn expire_at(&mut self, now_millis: u64, sink: &mut ExpirationSink<C>) -> Expiry {
         let dict_cap = self.rule_dictionary.capacity() as usize;
         debug_assert_eq!(self.expire_current_epoch_scratch.len(), dict_cap);
         debug_assert_eq!(self.expire_live_buckets_scratch.len(), dict_cap);
@@ -1131,9 +1158,10 @@ impl<C: Count> CellStore<C> {
         // not allocate.
         let current = std::mem::take(&mut self.expire_current_epoch_scratch);
         let live = std::mem::take(&mut self.expire_live_buckets_scratch);
-        self.expire(&current, &live, sink);
+        let expiry = self.expire(&current, &live, sink);
         self.expire_current_epoch_scratch = current;
         self.expire_live_buckets_scratch = live;
+        expiry
     }
 
     /// Peer-aware sibling of [`Self::fill_gossip_frame`]. Walks the same

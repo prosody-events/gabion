@@ -1,7 +1,7 @@
 //! Admin snapshot channel for observability.
 //!
 //! Lives outside the hot path: the runtime services [`AdminCommand`] as a
-//! sixth `select!` arm only when the constructor was handed a receiver, so the
+//! fifth `select!` arm only when the constructor was handed a receiver, so the
 //! production loop without admin is unchanged. The reply is built inside the
 //! gossip task — callers never get a `Sync` borrow of the runtime's internals.
 
@@ -35,19 +35,16 @@ pub enum AdminCommand {
 /// internal state crosses a thread boundary by reference. Cheap to produce —
 /// every field is a small scalar copy.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct AdminSnapshot {
     pub local_identity: NodeIdentity,
     pub peers: Vec<PeerEntry>,
     pub store_stats: CellStoreStats,
     pub local_dirty_len: u32,
     pub forwarded_dirty_len: u32,
-    pub send_pending_depth: usize,
     pub decode_reject_count: u64,
-    /// High-water mark of `send_pending_depth` since startup. Useful for
-    /// verifying that the `try_send` `WouldBlock` re-queue path was
-    /// exercised under saturation — without re-queue, the depth never
-    /// rises above 1.
-    pub max_send_pending_depth: usize,
+    /// Event counts since startup.
+    pub counters: GossipCounters,
     /// Cumulative ticks the runtime has processed. Includes both
     /// heartbeat ticks (the proactive timer) and synthetic ticks
     /// triggered by `handle_limit_request` crossing a per-rule error
@@ -81,12 +78,35 @@ pub struct AdminSnapshot {
     pub last_error_budget: u64,
 }
 
+/// What the runtime has sent, received and failed to send since startup. Each
+/// field is a plain add on the path that handles its event.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct GossipCounters {
+    /// Datagrams the socket accepted.
+    pub packets_sent: u64,
+    /// Bytes in those datagrams.
+    pub bytes_sent: u64,
+    /// Datagrams received, whether they decoded or not.
+    pub packets_received: u64,
+    /// Bytes in those datagrams.
+    pub bytes_received: u64,
+    /// Sends the kernel refused for lack of buffer space; logged as
+    /// `send_blocked`.
+    pub send_blocked: u64,
+    /// Sends that failed for any other reason; logged as `send_error`.
+    pub send_errors: u64,
+    /// Packets that could not be encoded; logged as `encode_failed`.
+    pub encode_failures: u64,
+}
+
 /// One peer known to the runtime. `node_id` is `None` until the runtime has
 /// received an inbound packet from this peer; `peer_slot` is `None` until the
 /// peer has been interned in the `PeerFrontierTable`. The two fields are set
 /// together — see the invariant tested in
 /// `quickcheck_peer_slot_pairing_holds_across_lifecycle`.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct PeerEntry {
     pub addr: SocketAddr,
     pub node_id: Option<NodeId>,

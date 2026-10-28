@@ -58,7 +58,6 @@ fn malformed_names_the_setting_and_an_example() {
         (Setting::GossipBind, "nope"),
         (Setting::GossipClusterIdHash, "0"),
         (Setting::StorageMaxCells, "-1"),
-        (Setting::GossipSendQueueCapacity, "256"),
         (Setting::DiscoveryNamespaceAllow, "Not_A_Label"),
         (Setting::RuntimeNodeIdSeed, ""),
     ] {
@@ -237,6 +236,8 @@ fn capacity_outside_its_range_fails() {
     for (setting, min, max) in [
         (Setting::StorageMaxCells, 1, 1 << 30),
         (Setting::GossipLimitQueueCapacity, 64, 1 << 20),
+        (Setting::GossipRecvBufferBytes, 65_536, (1 << 30) - 1),
+        (Setting::GossipSendBufferBytes, 65_536, (1 << 30) - 1),
         (Setting::StorageRuleDictionaryCapacity, 1, 65_534),
         (Setting::StorageNodeDictionaryCapacity, 1, 65_534),
         (Setting::StorageMaxDescriptorCount, 1, 16),
@@ -303,9 +304,14 @@ fn defaults_validate_to_the_production_values() {
         gossip.max_cells_per_tick.get(),
         defaults::GOSSIP_MAX_CELLS_PER_TICK
     );
+    #[cfg(feature = "transport-udp")]
     assert_eq!(
-        usize::from(gossip.send_queue_capacity.get()),
-        defaults::GOSSIP_SEND_QUEUE_CAPACITY
+        gossip.recv_buffer_bytes.get(),
+        defaults::GOSSIP_RECV_BUFFER_BYTES
+    );
+    assert_eq!(
+        gossip.send_buffer_bytes.get(),
+        defaults::GOSSIP_SEND_BUFFER_BYTES
     );
     assert_eq!(
         gossip.limit_queue_capacity.get(),

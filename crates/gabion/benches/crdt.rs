@@ -30,16 +30,19 @@
 //! * `expire/window_turnover`     — one bucket out of four ages out per call;
 //!   the steady-state expiry pattern.
 //! * `expire/no_expirations`      — scan-only cost, no frees.
+//! * `expire/bucket_boundary`     — a production-sized bucket ages out and is
+//!   freed in the runtime's batches.
 
 use std::hint::black_box;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use gabion::crdt::{
-    BucketEpoch, CellHandle, CellStore, CompactCellKey, DeltaSink, ExpirationSink, Incarnation,
-    KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch, RuleDescriptor,
-    RuleSlot, ValidStorageConfig,
+    BucketEpoch, CellHandle, CellStore, CompactCellKey, DeltaSink, ExpirationSink, Expiry,
+    Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
+    RuleDescriptor, RuleSlot, ValidStorageConfig,
 };
+use gabion::defaults::GOSSIP_EXPIRATION_BATCH;
 use gabion::settings::Settings;
 
 /// Build an `Observation` row with positional args. Used by the bench
@@ -1018,7 +1021,7 @@ fn bench_expire(c: &mut Criterion) {
                     black_box(&current_epoch),
                     black_box(&live_buckets),
                     black_box(&mut sink),
-                );
+                )
             },
             BatchSize::SmallInput,
         );
@@ -1042,11 +1045,56 @@ fn bench_expire(c: &mut Criterion) {
                     black_box(&current_epoch),
                     black_box(&live_buckets),
                     black_box(&mut sink),
-                );
+                )
             },
             BatchSize::SmallInput,
         );
     });
+
+    // ─── bucket_boundary ────────────────────────────────────────────────
+    // What the runtime does when a bucket ages out under load: a
+    // production-sized store holding 11 live one-second buckets of one rule,
+    // the oldest of which expires, freed in batches of the runtime's sink
+    // until `Done`. `prod_peak` frees 1,825 cells (one batch), `prod_4x`
+    // 7,222 (two).
+    for (name, cells) in [("prod_peak", 20_075_usize), ("prod_4x", 79_442)] {
+        let (_, storage) = Settings::default().validate().expect("defaults validate");
+        let mut store = CellStore::<u32>::new(storage, local_identity());
+        let rule = RuleDescriptor {
+            window_millis: 10_000,
+            bucket_millis: 1_000,
+            ..rule_descriptor(rule_fingerprint(0), 0)
+        };
+        store.intern_rule(rule).expect("rule interned");
+        let mut obs = ObservationBatch::<u32>::with_capacity(cells);
+        for i in 0..cells {
+            let bucket = (i % 11) as BucketEpoch;
+            obs.push(obs_row(
+                rule.fingerprint,
+                KeyHash(i as u128),
+                bucket,
+                LOCAL_NODE,
+                LOCAL_INCARNATION,
+                1,
+                0,
+            ));
+        }
+        store.ingest_local(&obs, &mut DeltaSink::with_capacity(cells));
+        let mut sink = ExpirationSink::<u32>::with_capacity(GOSSIP_EXPIRATION_BATCH);
+        group.throughput(Throughput::Elements(cells.div_ceil(11) as u64));
+        group.bench_function(BenchmarkId::new("bucket_boundary", name), |b| {
+            b.iter_batched_ref(
+                || store.clone(),
+                |store| {
+                    while store.expire_at(black_box(11_000), &mut sink) == Expiry::More {
+                        sink.clear();
+                    }
+                    sink.clear();
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
 
     group.finish();
 }
