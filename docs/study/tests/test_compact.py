@@ -21,7 +21,7 @@ from export_posterior import read_summary  # noqa: E402
 
 
 class CompactTest(unittest.TestCase):
-    def test_the_raw_posterior_compacts_to_the_committed_one_within_5e7(self):
+    def test_the_raw_posterior_compacts_to_the_committed_one(self):
         keep = {m["metric"] for m in json.loads((DATA / "metrics.json").read_text())}
         raw = read_summary(DATA / "judge" / "summary.csv", keep)
         compacted = compact(json.dumps(raw))

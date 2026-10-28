@@ -160,7 +160,7 @@ SI = {'k': 1e3, 'M': 1e6, 'G': 1e9, 'T': 1e12, 'P': 1e15, 'm': 1e-3, 'µ': 1e-6,
 def parse_num(s):
     m = re.fullmatch(r'(−|-)?([\d,]*\.?\d+)([kMGTPmµμn]?)', s.strip())
     if not m: return None
-    return ((-1 if m.group(1) else 1) * float(m.group(2).replace(',', '')) * SI[m.group(3)],)
+    return (-1 if m.group(1) else 1) * float(m.group(2).replace(',', '')) * SI[m.group(3)]
 
 def val_ok(shown, true, unit):
     """Check a formatted metric value ('1.23 GB', '12.3k s', '4.5 %') against `true`."""
@@ -195,7 +195,7 @@ def dec_ok(shown, true, factor=1.0):
     t = shown.replace(',', '').replace('−', '-'); d = len(t.split('.')[1]) if '.' in t else 0
     return abs(float(t) * factor - true) <= 0.5 * 10 ** (-d) * factor * (1 + 1e-7) + 1e-12 * abs(true)
 def sig_ok(shown, true, s):
-    return sig_tol(parse_num(shown)[0], true, s) if parse_num(shown) else False
+    return (p := parse_num(shown)) is not None and sig_tol(p, true, s)
 SCALES = {'bytes': [(1e12, 'TB'), (1e9, 'GB'), (1e6, 'MB'), (1e3, 'kB'), (1, 'B')], 'ms': [(1000, 's'), (1, 'ms')]}
 def unit_scale(unit, ref):
     """(factor, suffix text exactly as printed) for a unit and the value that picks its scale."""
@@ -240,7 +240,6 @@ def check_abs(txt, mean, cri, cens, zero, unit, n=None, tot=None):
     return check_triple(t, mean, cri[0], cri[1], unit)
 
 def check_diff(txt, v, unit):
-    ref = v['dmean'] or v['dhi'] or 0
     return check_triple(txt, v['dmean'], v['dlo'], v['dhi'], unit, pre='difference ')
 
 def check_full(txt, v, unit):
@@ -667,7 +666,7 @@ def check_scorecard(S, scope):
                 else:
                     for g_, tv in ((m.group(1), med), (m.group(2), rs[0]), (m.group(3), rs[-1])):
                         p = parse_num(g_)
-                        if p is None or not sig_tol(p[0], tv, 2 if tv >= 1000 else 3 if tv >= 1 else 2): bad_bytes.append(f'{arm}@{rope}: {g_} vs {tv:.6g}')
+                        if p is None or not sig_tol(p, tv, 2 if tv >= 1000 else 3 if tv >= 1 else 2): bad_bytes.append(f'{arm}@{rope}: {g_} vs {tv:.6g}')
                     if int(m.group(4)) != n: bad_bytes.append(f'{arm}@{rope}: {m.group(4)} regimes vs {n}')
             for f, td in zip(FAMS, tds[1:1 + len(FAMS)]):
                 t = family_tally(arm, f, rope)
