@@ -51,13 +51,15 @@ const BEAM_WAKE = 0.26;
 const BEAM_HEAD_R = 1.4;
 const BEAM_GLOW_R = 3.0;
 const BEAM_GLOW_ALPHA = 0.2;
-// Soft beam edges: a beam ramps in over the first slice of its flight and (when
-// delivered) back out over the last slice as it reaches the target, so it
-// neither snaps on at the source nor vanishes abruptly on arrival — the
-// target's pulse takes over the "news landed" beat. Fractions of the flight.
+// Soft beam edges: a beam ramps in over the first slice of its flight and back
+// out over the last, so it neither snaps on at the source nor vanishes abruptly
+// where it ends — on arrival the target's pulse takes over the "news landed"
+// beat. Fractions of the flight.
 const BEAM_FADE_IN = 0.1;
 const BEAM_FADE_OUT = 0.12;
-// A dropped packet dies partway across instead of landing.
+// A dropped packet dies partway across instead of landing. The drop is told by
+// shape, never by a fainter alpha: every beam peaks at `BEAM_ALPHA`, the alpha
+// the design audit checks.
 const DROP_FRACTION = 0.5;
 // A last-resort sanity ceiling against a pathological event-batch dump — *not* a
 // render-cost cap. Every beam is a few primitives redrawn by a single ticker
@@ -527,8 +529,8 @@ export class StageRenderer {
    *  dot (the full comet); above it the comet goes all-stroke (wake + a short
    *  head streak) so dense gossip stays fast. Every beam is the muted chart
    *  colour. A delivered beam reaches the target and hands the "news landed"
-   *  beat to its pulse; a dropped beam dies at `DROP_FRACTION` and fades as it
-   *  goes — the partition / packet-loss cue. */
+   *  beat to its pulse; a dropped beam fades out at `DROP_FRACTION`, short of
+   *  its target — the partition / packet-loss cue. */
   #stepBeams(): void {
     if (this.#packetGfx.destroyed) return;
     if (this.#beams.size === 0) {
@@ -557,31 +559,28 @@ export class StageRenderer {
         continue;
       }
 
+      // A dropped beam only crosses to `DROP_FRACTION`; a delivered one reaches
+      // the target.
+      const end = beam.dropped ? DROP_FRACTION : 1;
       if (this.#reduceMotion) {
         // No flight: a static edge fading over its lifetime — a diff, not travel.
-        const alpha = (beam.dropped ? 0.3 : BEAM_ALPHA) * (1 - age / duration);
+        const stop = lerp(beam.a, beam.b, end);
+        const alpha = BEAM_ALPHA * (1 - age / duration);
         g.moveTo(beam.a.x, beam.a.y)
-          .lineTo(beam.b.x, beam.b.y)
+          .lineTo(stop.x, stop.y)
           .stroke({ width: beam.width, color, alpha, cap: 'round' });
         continue;
       }
 
-      // Eased flight. A dropped beam only crosses to `DROP_FRACTION`; a delivered
-      // one reaches the target. The head leads at `tip`; the wake trails it.
-      const end = beam.dropped ? DROP_FRACTION : 1;
+      // Eased flight: the head leads at `tip`; the wake trails it.
       const tip = easeInOutQuad(age / duration) * end;
       const wakeStart = Math.max(0, tip - BEAM_WAKE);
       const headPt = lerp(beam.a, beam.b, tip);
       const wakePt = lerp(beam.a, beam.b, wakeStart);
-      // Soft edges multiply the base alpha: ramp in over the first slice; a
-      // delivered beam ramps back out over the last slice into the target, while
-      // a dropped one carries its own mid-flight dim so it reads as fading *out*
-      // partway across, distinct from a delivery.
+      // Soft edges: ramp in over the first slice and back out over the last.
       const fadeIn = clamp01(tip / (end * BEAM_FADE_IN));
-      const base = beam.dropped
-        ? 0.7 * (1 - tip / end)
-        : BEAM_ALPHA * clamp01((end - tip) / (end * BEAM_FADE_OUT));
-      const alpha = base * fadeIn;
+      const fadeOut = clamp01((end - tip) / (end * BEAM_FADE_OUT));
+      const alpha = BEAM_ALPHA * fadeIn * fadeOut;
       if (detail) {
         // Full comet, back to front: glow, then soft wake, then the crisp head.
         g.circle(headPt.x, headPt.y, beam.width * BEAM_GLOW_R).fill({

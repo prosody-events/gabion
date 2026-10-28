@@ -37,8 +37,9 @@ export function readTheme() {
 /** The tokens the stage and the charts draw with, as packed `0xRRGGBB`. */
 export type Theme = ReturnType<typeof readTheme>;
 
-/** The most opaque a stage beam draws, and the REJECTING band's fill: the
- *  design audit composites each over its surface before checking contrast. */
+/** The peak alpha of every stage beam, delivered or dropped, and the REJECTING
+ *  band's fill: the design audit composites each over its surface before
+ *  checking contrast. */
 export const BEAM_ALPHA = 0.8;
 export const BAND_ALPHA = 0.15;
 
