@@ -1,0 +1,60 @@
+name: study
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel in-flight runs of this workflow on the same ref (PR head, branch).
+# Push to main is never cancelled — main coverage is load-bearing.
+concurrency:
+  group: study-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      required-work: ${{ steps.rail.outputs.required-work }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: loadingalias/cargo-rail-action@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
+        id: rail
+        with:
+          all: true
+
+  # The study dashboard's data check and browser audit
+  # (docs/study/README.md, "Testing").
+  test:
+    needs: plan
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'study') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'ci')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: install Playwright
+        run: pip install -r docs/study/tests/requirements.txt
+      # requirements.txt pins playwright, and so the chromium build it
+      # downloads. It changes only when that pin moves, so unlike wasm.yml's
+      # lockfile-keyed cache this needs no main-only save step.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-python-${{ runner.os }}-${{ hashFiles('docs/study/tests/requirements.txt') }}
+      # Skips the download when the cache restored the browser; the OS
+      # packages always install, since they are not cacheable.
+      - name: install Playwright chromium
+        run: python -m playwright install --with-deps chromium
+      - name: study tests
+        run: make study-test
+      - name: upload audit screenshots
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: study-shots
+          path: docs/study/tests/shots-test
+          if-no-files-found: warn

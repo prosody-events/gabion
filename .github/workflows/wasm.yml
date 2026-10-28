@@ -136,13 +136,18 @@ jobs:
       # Rebuild with VITE_BASE=/gabion/ so the deployed `index.html` and
       # the wasm bundle's asset URLs resolve under the project-pages
       # subpath. Cheap: the wasm-pack output and the Svelte bundle are
-      # already in cache from the smoke build.
+      # already in cache from the smoke build. The study dashboard and its
+      # data join the site under `study/`, in their repo layout
+      # (`study/dashboard/` fetches `../data/`); its tests are not published.
       - name: build visualizer for Pages
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         env:
           VITE_BASE: /gabion/
         working-directory: crates/gabion-wasm/web
-        run: pnpm run build
+        run: |
+          pnpm run build
+          mkdir dist/study
+          cp -R "$GITHUB_WORKSPACE/docs/study/dashboard" "$GITHUB_WORKSPACE/docs/study/data" dist/study/
 
       # Hand the built site to the deploy-pages job on main pushes.
       - uses: actions/upload-artifact@v7

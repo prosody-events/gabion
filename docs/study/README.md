@@ -21,10 +21,12 @@ intervals and posterior probabilities.
 python3 -m http.server -d docs/study 8000
 ```
 
-Then open `http://localhost:8000/dashboard/`. GitHub Pages publishes the same
-layout (`study/dashboard/` fetching `../data/`). Every view has a link: the
-selected metric, regime, arm and tie band live in the URL hash, for example
-`#metric=conv_p99_incl_never_ms&regime=az-partition`.
+Then open `http://localhost:8000/dashboard/`. On every push to `main`,
+`.github/workflows/wasm.yml` publishes `dashboard/` and `data/` beside the
+visualizer on GitHub Pages, in the same layout:
+<https://prosody-events.github.io/gabion/study/dashboard/> fetches `../data/`.
+Every view has a link: the selected metric, regime, arm and tie band live in the
+URL hash, for example `#metric=conv_p99_incl_never_ms&regime=az-partition`.
 
 ## How the page runs
 
@@ -83,6 +85,11 @@ from the data in Python and never reuse the page's code. It exits 1 on any FAIL.
 `--shots DIR` also writes a full-page PNG of each named view (`bytes`, `p99`,
 `stale`, `drops`, `heal`, `cell`) at every viewport and theme into
 `DIR/<view>/w<width>-<theme>.png`, checking each renders without errors.
+
+CI runs the same three commands in `.github/workflows/study.yml` when
+`docs/study/` or `crates/gabion-wasm/web/src/tokens.css` changes (`rail.toml`'s
+`study` work) and uploads `tests/shots-test/` when they fail; `make ci-full`
+runs `make study-test` too.
 
 ## Refreshing the data
 
