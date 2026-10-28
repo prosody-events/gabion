@@ -84,17 +84,18 @@ fn allow_emits_triplet_without_retry_after() {
 
 #[test]
 fn allow_reset_matches_next_bucket_boundary() {
-    // now is exactly on a bucket boundary -> full bucket until the next.
+    // 2 s buckets at 4.999 s: the boundary is 1.001 s away, which rounds up
+    // to 2 s, so Reset is 4 + 2. A millisecond late, it would read 5.
     let info = AllowInfo {
-        spec: spec(10),
+        spec: RuleSpec {
+            bucket_millis: 2_000.try_into().unwrap(),
+            ..spec(10)
+        },
         remaining: 9,
-        now_millis: 5_000,
+        now_millis: 4_999,
     };
     let h = AdmissionHeaders::build_for_allow(info);
-    let expected_delta =
-        gabion::window::time_until_next_bucket_boundary_millis(5_000, 1_000.try_into().unwrap());
-    let expected_reset = gabion::window::reset_unix_seconds(5_000, expected_delta);
-    assert_eq!(h.reset.as_str(), expected_reset.to_string());
+    assert_eq!(h.reset.as_str(), "6");
 }
 
 #[test]

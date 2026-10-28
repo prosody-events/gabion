@@ -2403,10 +2403,11 @@ fn configured(n: usize, rate: &str, bucket: Duration) -> RuleTable {
     RuleTable::new(rules, None).unwrap()
 }
 
-/// One key hit once a millisecond from `t0` for 10 ms, and once more at
-/// `t0 + 16`, under a 10 ms window of 1 ms buckets: its window total at
-/// `t0 + 9`, how long until one more hit admits there, and how many of its
-/// cells `expire_at(t0 + 15)` frees (the cell ahead of that epoch stays).
+/// One key hit once a millisecond from `t0` for 10 ms (twice at `t0`, so a
+/// walk that stops at epoch 0 instead of wrapping misses a hit), and once
+/// more at `t0 + 16`, under a 10 ms window of 1 ms buckets: its window total
+/// at `t0 + 9`, how long until one more hit admits there, and how many of
+/// its cells `expire_at(t0 + 15)` frees (the cell ahead of that epoch stays).
 fn wrap_run(t0: u64) -> (u64, u64, usize) {
     let table = configured(1, "10r/10ms", Duration::from_millis(1));
     let rule = &table.rules()[0];
@@ -2422,7 +2423,7 @@ fn wrap_run(t0: u64) -> (u64, u64, usize) {
             t as BucketEpoch,
             node.node_id.0,
             node.incarnation,
-            1,
+            1 + u32::from(t == t0),
             t,
         ));
     }
@@ -2441,8 +2442,8 @@ fn wrap_run(t0: u64) -> (u64, u64, usize) {
 /// wraps inside the window as when it does not.
 #[test]
 fn epoch_comparisons_survive_wrap() {
-    assert_eq!(wrap_run(1_000), (10, 1, 5));
-    assert_eq!(wrap_run((1 << 32) - 4), (10, 1, 5));
+    assert_eq!(wrap_run(1_000), (11, 1, 5));
+    assert_eq!(wrap_run((1 << 32) - 4), (11, 1, 5));
 }
 
 /// With no override, the rule dictionary holds twice the configured rules,

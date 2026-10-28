@@ -178,8 +178,10 @@ fn gabiond_table_holds_a_full_cell_store() {
 fn time_until_admit_millis_uses_oldest_non_empty_bucket() {
     // Window = [6..10], bm=1000. Bucket 6 holds 15 hits — total=15,
     // limit=10, hits=1 → need=6. Bucket 6 alone covers it; delta =
-    // (6+5)*1000 - 10000 = 1000ms.
+    // (6+5)*1000 - 10000 = 1000ms. Bucket 5 has left the window but not yet
+    // the table (expiry runs on the gossip tick), so the walk must skip it.
     let table = aggregate(16);
+    writer(&table).add(0xaa, 0xbb, 5, 100);
     writer(&table).add(0xaa, 0xbb, 6, 15);
     let delta = table.table().time_until_admit_millis(
         spec(0xaa, 10, 1_000, 5),

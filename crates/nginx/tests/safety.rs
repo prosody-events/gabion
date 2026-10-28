@@ -708,6 +708,8 @@ fn decide_all_multi_rule_concurrent() {
     worker.join().expect("worker joined");
     leader.join().expect("leader joined");
 
+    // The leader wrote each rule's cell, so the reads raced real writes.
+    assert_eq!(region.aggregate().occupied(), 2);
     // Every allowed request queued one event per rule, up to the capacity.
     let mut drained = [QueueEvent::default(); 32];
     assert_eq!(region.queue().drain(&mut drained), (2 * ITERATIONS).min(32));

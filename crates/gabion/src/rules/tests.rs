@@ -176,17 +176,19 @@ fn resolve_rate_bucket_defaults_to_window() {
 
 #[test]
 fn resolve_rate_scales_to_window() {
-    // 10 r/s over 5h → 180_000 over 5h.
+    // 10 r/s over 5h → 180_000 over 5h, in three 2h buckets: the partial
+    // last one counts.
     let r = resolve(
         10,
         Duration::from_secs(1),
         Some(Duration::from_secs(5 * 3600)),
-        Some(Duration::from_secs(3600)),
+        Some(Duration::from_secs(2 * 3600)),
     )
     .unwrap();
     assert_eq!(r.limit.get(), 180_000);
     assert_eq!(r.window_millis, 5 * 3600 * 1_000);
-    assert_eq!(r.bucket_millis.get(), 3600 * 1_000);
+    assert_eq!(r.bucket_millis.get(), 2 * 3600 * 1_000);
+    assert_eq!(r.live_buckets.get(), 3);
 }
 
 #[test]
