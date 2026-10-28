@@ -1847,8 +1847,18 @@ fn assert_logged(logs: &str, code: &str, count: usize, fields: &[&str]) {
     assert_eq!(lines.len(), count, "{logs}");
     for line in lines {
         for field in fields {
-            assert!(line.contains(field), "{field} missing from {line}");
+            assert!(holds(line, field), "{field} missing from {line}");
         }
+    }
+}
+
+/// `line` holds `field`. A `key=value` field must be a whole token, so
+/// `cluster_id_hash=1` does not pass on `cluster_id_hash=193`; a bare `key=`
+/// or any other text may appear anywhere.
+fn holds(line: &str, field: &str) -> bool {
+    match field.split_once('=') {
+        Some((_, value)) if !value.is_empty() => line.split(' ').any(|token| token == field),
+        _ => line.contains(field),
     }
 }
 
@@ -2053,7 +2063,7 @@ fn each_decode_cause_has_its_own_throttle() {
     assert_eq!(counters.decode_rejects(), 7);
     let lines = |fields: &[&str]| {
         logs.lines()
-            .filter(|line| fields.iter().all(|field| line.contains(field)))
+            .filter(|line| fields.iter().all(|field| holds(line, field)))
             .count()
     };
     assert_eq!(lines(&["reason=\"framing\""]), 3, "{logs}");
