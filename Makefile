@@ -127,6 +127,7 @@ help:
 	@printf '%s\n' '  make sim-smoke       Run the study harness judge tests and one small regime; fails on an unhealthy run'
 	@printf '%s\n' '  make sim-baselines   Run the main and imp-az-hier-nopk baseline arms of the regression gate (H1=<sha>)'
 	@printf '%s\n' '  make sim-gate        Run this checkout as the zone arm and apply the regression gate pass rules'
+	@printf '%s\n' '  make study-test      Check the study data compaction and run the study dashboard browser audit (Playwright)'
 	@printf '%s\n' '  make wasm-check      Cross-compile gabion-wasm, run its native tests, and build the web frontend'
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
 	@printf '%s\n' '  make nginx-module    Build and load-test the Gabion NGINX module config'
@@ -235,6 +236,7 @@ hygiene:
 	@for token in $$(rg -oNI "(var\(|')(--[a-z][a-z0-9-]*)" -r '$$2' $(WEB_DIR)/src | sort -u); do \
 		rg -q -- "^\s*$$token:" $(WEB_DIR)/src/tokens.css || { echo "design token \`$$token\` is not defined in $(WEB_DIR)/src/tokens.css, so it resolves to nothing; use a token defined there (web/README.md \"Design rules\") or define it:"; rg -nF -- "$$token" $(WEB_DIR)/src; exit 1; }; \
 	done
+	cmp $(WEB_DIR)/src/tokens.css docs/study/dashboard/tokens.css
 
 .PHONY: test
 test: fmt clippy unit safety hygiene
@@ -283,6 +285,11 @@ sim-baselines:
 sim-gate:
 	python3 $(SIM)/judge/matrix.py --solution zone --seeds 3 --jobs $(SIM_JOBS) --out $(SIM_OUT)/results
 	python3 $(SIM)/judge/gate.py $(SIM_OUT)/results --out $(SIM_OUT)/gate
+
+.PHONY: study-test
+study-test:
+	python3 docs/study/tests/test_compact.py
+	python3 docs/study/tests/test_ui.py
 
 .PHONY: bench-check
 bench-check:

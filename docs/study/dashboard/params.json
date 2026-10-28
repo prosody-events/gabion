@@ -1,0 +1,10 @@
+{
+  "metric": "bytes_total",
+  "regime": "",
+  "arm": "",
+  "rope": "0.05",
+  "y": "conv_p99_incl_never_ms",
+  "plane": "one",
+  "fam": "Cost",
+  "variant": "baseline"
+}

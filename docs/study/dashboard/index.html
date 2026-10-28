@@ -1,0 +1,1693 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gossip Study Results</title>
+<link rel="stylesheet" href="tokens.css">
+<style>
+  html, body { background: var(--color-bg); color: var(--color-fg); }
+  body { margin: 0; }
+  #dash-root { padding: 24px clamp(16px, 4%, 40px); }
+  :where(#dash-root *, #dash-root ::before, #dash-root ::after) { box-sizing: border-box; border: 0 solid; margin: 0; padding: 0; }
+  :where(#dash-root :is(h1, h2, h3, h4, h5, h6)) { font-size: inherit; font-weight: inherit; }
+  :where(#dash-root a) { color: inherit; }
+</style>
+<script src="vendor/d3-7.9.0.min.js"></script>
+<script src="dash.js"></script>
+</head>
+<body>
+<div id="dash-root">
+<style>
+  .g3 { --g3-sub: var(--color-fg-muted); position: relative; display: grid; gap: var(--gap-xl); font-family: var(--font-sans); color: var(--color-fg); max-width: 1480px; margin-inline: auto; min-width: 0; }
+  .g3 .t-title { font-family: var(--font-serif); font-weight: 400; font-size: var(--font-size-title); margin: 0; text-wrap: balance; }
+  .g3 h2 { font-size: var(--font-size-heading); font-weight: var(--font-weight-medium); margin: 0; text-wrap: balance; }
+  .g3 h3 { font-size: var(--font-size-body); font-weight: var(--font-weight-medium); margin: 0; }
+  .g3 .t-body { font-size: var(--font-size-body); }
+  .g3 .t-cap { font-size: var(--font-size-caption); }
+  .g3 .t-note { font-size: var(--font-size-caption-sm); }
+  .g3 .t-head { font-size: var(--font-size-caption-sm); letter-spacing: .06em; text-transform: uppercase; color: var(--g3-sub); font-weight: 400; }
+  .g3 b { font-weight: var(--font-weight-medium); }
+  .g3 .note { font-size: var(--font-size-body); line-height: 1.5; margin: 0; max-width: 86ch; opacity: .8; }
+  .g3 .note b { font-weight: var(--font-weight-medium); }
+  .g3 .note.t-cap { font-size: var(--font-size-caption); }
+  .g3 .muted { color: var(--g3-sub); }
+  .g3 .sec { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--gap-sm); align-content: start; min-width: 0; }
+  .g3 .scroll { overflow-x: auto; overscroll-behavior-x: contain; min-width: 0; }
+  .g3 .measure { position: absolute; width: 0; height: 0; overflow: hidden; visibility: hidden; }
+  /* header */
+  .g3 .hd { display: grid; gap: var(--gap-sm); }
+  .g3 .status { font-size: var(--font-size-body); line-height: 1.5; margin: 0; max-width: 86ch; }
+  .g3 .prog { display: flex; flex-wrap: wrap; gap: var(--gap-xs) var(--gap-lg); }
+  .g3 .prog .grp { display: grid; gap: 4px; align-content: start; }
+  .g3 .prog .items { display: flex; flex-wrap: wrap; gap: 4px; }
+  .g3 .prog button { font: inherit; font-size: var(--font-size-caption); color: var(--color-fg); background: none; border: 0; border-radius: 4px; padding: 4px 4px 2px; min-height: 28px; cursor: pointer; display: grid; gap: 3px; min-width: 64px; text-align: left; }
+  .g3 .prog button:hover { background: var(--color-panel); }
+  .g3 .prog button[aria-pressed=true] { background: var(--color-fg); color: var(--color-bg); }
+  .g3 .prog button[aria-pressed=true] .n { color: inherit; opacity: .75; }
+  .g3 .prog .bar { height: 4px; background: var(--color-border-line); border-radius: 2px; overflow: hidden; display: flex; }
+  .g3 .prog .bar i { display: block; background: var(--color-fg-muted); }
+  .g3 .prog .bar i.full { background: currentColor; }
+  .g3 .prog .n { color: var(--g3-sub); font-variant-numeric: tabular-nums; }
+  /* pickers */
+  .g3 .ctl { display: flex; flex-wrap: wrap; gap: var(--gap-xs) var(--gap-lg); align-items: center; }
+  .g3 .pills { display: flex; flex-wrap: wrap; gap: 4px var(--gap-md); align-items: center; }
+  .g3 .pgrp { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .g3 .pgrp > .t-head { margin-right: 2px; }
+  .g3 .pill { font: inherit; font-size: var(--font-size-caption); min-height: 28px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--color-border-line); background: none; color: var(--color-fg); cursor: pointer; white-space: nowrap; }
+  .g3 .pill:hover { border-color: var(--color-fg-muted); }
+  .g3 .pill[aria-pressed=true] { background: var(--color-fg); color: var(--color-bg); border-color: var(--color-fg); }
+  .g3 button:focus-visible, .g3 select:focus-visible, .g3 tr:focus-visible, .g3 summary:focus-visible { outline: 2px solid var(--color-fg); outline-offset: 2px; }
+  .g3 label.sel { display: inline-flex; gap: 6px; align-items: center; font-size: var(--font-size-caption); }
+  .g3 select { font: inherit; color: var(--color-fg); background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: 999px; padding: 0 10px; min-height: 28px; }
+  .g3 .key { display: flex; flex-wrap: wrap; gap: 4px var(--gap-md); font-size: var(--font-size-caption); align-items: center; }
+  .g3 .key > span { display: inline-flex; gap: 5px; align-items: center; }
+  .g3 .key svg { overflow: visible; display: block; }
+  /* scorecard */
+  .g3 table.score { border-collapse: collapse; font-size: var(--font-size-body); font-variant-numeric: tabular-nums; min-width: 100%; }
+  .g3 .score th, .g3 .score td { text-align: left; padding: 6px 10px 6px 0; vertical-align: middle; white-space: nowrap; }
+  .g3 .score thead th { font-weight: 400; font-size: var(--font-size-caption); color: var(--g3-sub); border-bottom: 1px solid var(--color-border-line); vertical-align: bottom; }
+  .g3 .score tbody tr.arm { cursor: pointer; border-bottom: 1px solid var(--color-border-line); }
+  .g3 .score tbody tr.arm:hover { background: color-mix(in srgb, var(--chart-grid) 50%, transparent); }
+  .g3 .score tbody tr.arm[aria-selected=true] { background: var(--color-panel); }
+  .g3 .score tbody tr.arm[aria-selected=true] th { box-shadow: inset 2px 0 0 var(--color-fg); }
+  .g3 .score tr.fam th { padding: 12px 0 2px; }
+  .g3 .score .name { font-weight: var(--font-weight-medium); padding-left: 8px; position: sticky; left: 0; background: var(--color-bg); z-index: 1; }
+  .g3 .score tr.arm:hover .name, .g3 .score tr.arm[aria-selected=true] .name { background: transparent; }
+  .g3 .tag { font-weight: 400; font-size: var(--font-size-caption); color: var(--g3-sub); }
+  .g3 .score .tag, .g3 .card .name .tag { display: block; }
+  .g3 .score tr.ref td, .g3 .score tr.ref .name { color: var(--g3-sub); }
+  .g3 .score td.wrap { white-space: normal; min-width: 20ch; }
+  .g3 .stack { display: flex; height: 8px; width: 88px; border-radius: 2px; overflow: hidden; background: var(--color-border-line); margin-bottom: 3px; }
+  .g3 .stack i { display: block; height: 100%; }
+  .g3 .counts { font-size: var(--font-size-caption); white-space: nowrap; }
+  .g3 .one-only { display: inline-flex; gap: 3px; align-items: center; }
+  .g3 .c-better { color: var(--color-ok); } .g3 .c-worse { color: var(--color-bad); }
+  .g3 .s-better { background: var(--color-ok); } .g3 .s-worse { background: var(--color-bad); } .g3 .s-tie { background: var(--color-fg-muted); } .g3 .s-open { background: var(--chart-muted); }
+  .g3 .s-one { background: repeating-linear-gradient(135deg, var(--color-fg-muted) 0 1px, transparent 1px 4px); }
+  .g3 .swatch { display: inline-block; width: 18px; height: 8px; border-radius: 2px; }
+  .g3 .cards { display: grid; gap: var(--gap-xs) var(--gap-sm); grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr)); align-items: start; }
+  .g3 .cards > .t-head { grid-column: 1 / -1; padding-top: 6px; }
+  .g3 .card { border: 1px solid var(--color-border-line); border-radius: var(--radius); padding: var(--gap-sm); display: grid; gap: 6px; font-size: var(--font-size-body); font-variant-numeric: tabular-nums; cursor: pointer; }
+  .g3 .card[aria-pressed=true] { background: var(--color-panel); box-shadow: inset 2px 0 0 var(--color-fg); }
+  .g3 .card:focus-visible { outline: 2px solid var(--color-fg); outline-offset: 2px; }
+  .g3 .card .name { font-weight: var(--font-weight-medium); }
+  .g3 .card.ref { color: var(--g3-sub); }
+  .g3 .card .k { color: var(--g3-sub); font-size: var(--font-size-caption); }
+  .g3 .cfam { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px var(--gap-sm); margin: 0; align-items: center; font-size: var(--font-size-caption); }
+  .g3 .cfam dt { color: var(--g3-sub); } .g3 .cfam dd { margin: 0; display: flex; gap: 8px; align-items: center; } .g3 .cfam .stack { margin: 0; }
+  /* hub */
+  .g3 .hubbody { display: grid; gap: var(--gap-lg); align-items: start; min-width: 0; }
+  .g3 .hubmain { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--gap-sm); min-width: 0; }
+  .g3 .frame { display: grid; grid-template-columns: max-content minmax(0, 1fr); min-width: 0; }
+  .g3 .frame svg { display: block; }
+  .g3 .pane { border: 1px solid var(--color-border-line); border-radius: var(--radius); padding: var(--gap-md); display: grid; gap: var(--gap-sm); background: var(--color-panel); min-width: 0; }
+  .g3 .pane.rail { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow: auto; }
+  .g3 .zoom { display: grid; gap: 0; }
+  .g3 #g3-hub-plot.more { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 40px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 40px), transparent); }
+  .g3 .more-cue { margin: 0; text-align: right; font-size: var(--font-size-caption); color: var(--g3-sub); }
+  .g3 .pane .verdict { font-size: var(--font-size-body); line-height: 1.45; margin: 0; }
+  .g3 .read { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px var(--gap-md); font-size: var(--font-size-caption); font-variant-numeric: tabular-nums; margin: 0; }
+  .g3 .read dt { color: var(--g3-sub); } .g3 .read dd { margin: 0; }
+  .g3 .read.stacked { grid-template-columns: minmax(0, 1fr); gap: 0; } .g3 .read.stacked dd { margin-bottom: 4px; }
+  .g3 .pane svg { display: block; overflow: visible; }
+  .g3 details > summary { min-height: 24px; line-height: 24px; cursor: pointer; font-size: var(--font-size-caption); color: var(--g3-sub); width: max-content; max-width: 100%; }
+  .g3 table.tbl { border-collapse: collapse; font-size: var(--font-size-caption); font-variant-numeric: tabular-nums; margin-top: var(--gap-xs); }
+  .g3 .tbl th, .g3 .tbl td { padding: 3px 12px 3px 0; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--color-border-line); }
+  .g3 .tbl caption { text-align: left; color: var(--g3-sub); padding-bottom: 4px; }
+  .g3 .tbl thead th { font-weight: 400; color: var(--g3-sub); }
+  .g3 .tbl tbody th { font-weight: var(--font-weight-medium); }
+  /* svg */
+  .g3 svg text { fill: var(--color-fg); font-family: var(--font-sans); font-variant-numeric: tabular-nums; }
+  .g3 svg text.mut { fill: var(--g3-sub); }
+  .g3 svg text.t-head { fill: var(--g3-sub); text-transform: none; }
+  .g3 svg text.sub { fill: var(--color-fg); fill-opacity: .8; }
+  .g3 svg .grid { stroke: var(--chart-grid); }
+  .g3 svg .ref { stroke: var(--chart-reference); }
+  .g3 svg .axis { stroke: var(--chart-axis); }
+  .g3 svg .band { fill: var(--chart-grid); }
+  .g3 svg .hl { fill: var(--chart-grid); fill-opacity: .55; }
+  .g3 svg.small .gl.one { stroke-dasharray: none; }
+  .g3 svg .rule { stroke: var(--color-border-line); }
+  .g3 svg text.halo { paint-order: stroke; stroke: var(--color-bg); stroke-width: 3px; stroke-linejoin: round; }
+  .g3 .gl.better { fill: var(--color-ok); } .g3 .gl.worse { fill: var(--color-bad); }
+  .g3 .gl.tie { fill: none; stroke: var(--color-fg); stroke-width: 1.5; }
+  .g3 .gl.open { fill: var(--color-bg); stroke: var(--color-fg-muted); stroke-width: 1.25; }
+  .g3 .gl.one { fill: var(--color-bg); stroke: var(--color-fg-muted); stroke-width: 1.25; stroke-dasharray: 1.6 1.2; }
+  .g3 .ivl { stroke-width: 2; stroke-opacity: .85; fill: none; }
+  .g3 .cap { stroke-width: 1.5; fill: none; }
+  .g3 .mt { stroke-width: 2; }
+  .g3 .gh { fill: var(--color-bg); stroke: var(--color-bg); stroke-width: 3; stroke-linejoin: round; }
+  .g3 .ivl.better, .g3 .cap.better, .g3 .mt.better { stroke: var(--color-ok); } .g3 .ivl.worse, .g3 .cap.worse, .g3 .mt.worse { stroke: var(--color-bad); }
+  .g3 .ivl.tie, .g3 .cap.tie, .g3 .mt.tie { stroke: var(--color-fg); } .g3 .ivl.open, .g3 .ivl.one, .g3 .cap.open, .g3 .cap.one, .g3 .mt.open, .g3 .mt.one { stroke: var(--g3-sub); stroke-opacity: 1; }
+  .g3 .seed { stroke: var(--color-fg-muted); stroke-width: 1; }
+  .g3 .pk { fill: none; stroke: var(--color-fg); stroke-width: 1.25; }
+  .g3 .pf.better { fill: var(--color-ok); stroke: var(--color-ok); } .g3 .pf.worse { fill: var(--color-bad); stroke: var(--color-bad); }
+  .g3 .pf.tie { fill: var(--color-fg); stroke: var(--color-fg); }
+  .g3 .pf.open, .g3 .pf.one { fill: var(--color-bg); stroke: var(--color-fg-muted); stroke-width: 1.25; } .g3 .pf.one { stroke-dasharray: 1.6 1.2; }
+  .g3 .ring { fill: none; stroke: var(--color-fg); stroke-width: 1.25; }
+  .g3 .leader { stroke: var(--color-fg-muted); stroke-width: .75; }
+  .g3 .cell, .g3 .hdr { outline: none; cursor: pointer; }
+  .g3 .cell .focus, .g3 .hdr .focus { fill: transparent; stroke: none; }
+  .g3 .cell:hover .focus, .g3 .hdr:hover .focus { fill: var(--chart-grid); }
+  .g3 .cell.sel .focus { stroke: var(--color-fg); stroke-width: 1; }
+  .g3 .cell:focus-visible .focus, .g3 .hdr:focus-visible .focus { stroke: var(--color-fg); stroke-width: 2; }
+  .g3 .dim { opacity: .25; }
+  /* plane */
+  .g3 .planebox { position: relative; min-width: 0; }
+  .g3 .mult { display: grid; gap: var(--gap-md) var(--gap-lg); }
+  .g3 .mult figure { margin: 0; display: grid; gap: 2px; min-width: 0; }
+  .g3 .mult figcaption button { font: inherit; font-size: var(--font-size-caption); font-weight: var(--font-weight-medium); background: none; border: 0; padding: 4px 0; min-height: 28px; color: var(--color-fg); cursor: pointer; text-align: left; }
+  .g3 .mult figcaption button[aria-pressed=true] { text-decoration: underline; text-underline-offset: 3px; }
+  .g3 .mult figcaption .t-head { margin-left: 6px; }
+  /* tooltip */
+  .g3 .tip { position: absolute; z-index: 5; pointer-events: none; background: var(--surface-popover); border: 1px solid var(--color-border-line); border-radius: var(--radius); box-shadow: var(--shadow-popover); padding: var(--pad-xs) var(--pad-sm); max-width: min(22rem, 90%); line-height: 1.45; font-variant-numeric: tabular-nums; }
+  .g3 .tip .k { color: var(--color-fg-muted); }
+  .g3 .tip .h { font-weight: var(--font-weight-medium); }
+  /* method + definitions */
+  .g3 .method-body { display: grid; gap: var(--gap-xs); padding-top: var(--gap-xs); }
+  .g3 .gloss { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 26rem), 1fr)); gap: var(--gap-xl); }
+  .g3 .gloss dl { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr); gap: 4px var(--gap-md); font-size: var(--font-size-caption); margin: 0; align-content: start; line-height: 1.45; }
+  .g3 .gloss dt { font-weight: var(--font-weight-medium); } .g3 .gloss dd { margin: 0; opacity: .8; }
+  .g3 .gloss dt.fam { grid-column: 1 / -1; padding-top: 6px; }
+  .g3 .tbl td.num { text-align: right; } .g3 .tbl thead th.num { text-align: right; }
+  .g3 .tbl tr.grp th { padding-top: 12px; font-weight: var(--font-weight-medium); border-bottom: 0; white-space: normal; }
+  .g3 .tbl.scale thead th { white-space: normal; vertical-align: bottom; min-width: 7ch; }
+  .g3 .tbl.scale tbody th .tag { display: block; white-space: normal; max-width: 30ch; }
+  .g3 .tbl.scale td .tag { display: block; }
+  .g3 .tbl.scale tr.grp th span { display: block; position: sticky; left: 0; max-width: min(86ch, calc(100vw - 48px)); }
+  @media (max-width: 640px) { .g3 .tbl.scale tbody th .tag { display: none; } }
+  .g3 .fail { color: var(--g3-sub); font-size: var(--font-size-caption); }
+</style>
+
+<div class="g3" id="g3">
+  <header class="hd">
+    <h1 class="t-title">Gossip study results</h1>
+    <nav class="pills" id="g3-variant" aria-label="Which variant of each design the page shows"></nav>
+    <p class="note" id="g3-variant-note"></p>
+    <p class="status" id="g3-status" data-source="progress study"></p>
+    <div class="prog" id="g3-prog" role="group" aria-label="Runs completed per regime; choose one to select it" data-source="regime_progress"></div>
+  </header>
+
+  <section class="sec" aria-labelledby="g3-score-title">
+    <h2 id="g3-score-title">Where each arm stands against main</h2>
+    <p class="note" id="g3-score-note"></p>
+    <div class="key" id="g3-score-key"></div>
+    <div id="g3-score" data-source="scorecard family_tally"></div>
+  </section>
+
+  <section class="sec" id="g3-hub-sec" aria-labelledby="g3-hub-title">
+    <h2 id="g3-hub-title"></h2>
+    <p class="note" id="g3-hub-note" data-source="metric_tally"></p>
+    <p class="note" id="g3-hub-iv" data-source="interval_width"></p>
+    <div class="ctl">
+      <nav class="pills" id="g3-metric" aria-label="Metric"></nav>
+      <label class="sel">Count as a tie within <select id="g3-rope" data-fk="rope"></select></label>
+    </div>
+    <div class="key" id="g3-key"></div>
+    <div class="hubbody" id="g3-hubbody">
+      <div class="hubmain">
+        <p class="more-cue" id="g3-hub-more" hidden>More regimes to the right: scroll the chart sideways →</p>
+        <div class="frame"><div id="g3-hub-labels"></div><div class="scroll" id="g3-hub-plot" data-source="verdicts seed_ratios posterior"></div></div>
+        <p class="note t-cap" id="g3-hub-missing"></p>
+        <details><summary>Show as table</summary><div class="scroll" id="g3-hub-table" data-source="verdicts"></div></details>
+      </div>
+      <aside class="pane" id="g3-pane" aria-live="polite" data-source="verdicts seeds"></aside>
+    </div>
+  </section>
+
+  <section class="sec" aria-labelledby="g3-super-title">
+    <h2 id="g3-super-title">Every arm, every metric, every regime</h2>
+    <p class="note" id="g3-super-note"></p>
+    <nav class="pills" id="g3-fam" aria-label="Metric family"></nav>
+    <div class="key" id="g3-super-key"></div>
+    <div id="g3-super" data-source="verdicts main_range"></div>
+    <p class="note t-cap" id="g3-super-none"></p>
+  </section>
+
+  <section class="sec" aria-labelledby="g3-plane-title">
+    <h2 id="g3-plane-title"></h2>
+    <p class="note" id="g3-plane-note"></p>
+    <div class="ctl" id="g3-plane-ctl"></div>
+    <div class="key" id="g3-plane-key"></div>
+    <div class="planebox" id="g3-plane" data-source="verdicts"></div>
+    <p class="note t-cap" id="g3-plane-edge"></p>
+  </section>
+
+  <section class="sec" aria-labelledby="g3-scale-title">
+    <h2 id="g3-scale-title">Beyond the autoscaler maximum</h2>
+    <p class="note" id="g3-scale-note" data-source="scale"></p>
+    <div class="scroll" id="g3-scale" data-source="scale"></div>
+    <p class="note t-cap" id="g3-scale-foot"></p>
+  </section>
+
+  <details class="sec" id="g3-method">
+    <summary>How to read this page, and how the verdicts are made</summary>
+    <div class="method-body" id="g3-method-body" data-source="study"></div>
+  </details>
+
+  <div class="gloss">
+    <section class="sec"><h2>Arms</h2><dl id="g3-arms" data-source="arms"></dl></section>
+    <section class="sec"><h2>Regimes</h2><dl id="g3-regs" data-source="regimes"></dl></section>
+  </div>
+</div>
+
+<script>
+(() => {
+  /* ---------- Study constants (the calcs close over these) ---------- */
+  const BASELINE_ARM = 'main';
+  const REFERENCE_ARM = 'local-only';            // sends nothing: shown, never counted
+  const BYTES_METRIC = 'bytes_total';
+  const NEVER_METRIC = 'conv_never_frac';
+  const CREDIBLE_LEVEL = 0.95;                    // level of every interval the judge reports
+  const MIN_SEEDS = 2;                            // valid seeds needed on both sides to settle
+  const DEFAULT_SEEDS = 3;                        // seeds planned per arm and regime
+  const ROPES = [0.01, 0.05, 0.10, 0.25];         // tie-band choices
+  const DEFAULT_ROPE = 0.05;
+  // Compact intervals print ±x % while the half-width is at most this, beyond it the two ends; both to 2 significant figures.
+  const COMPACT_PM_MAX = 0.5;
+  // Convergence quantiles that count never-converged hits as their remaining life.
+  const CENSOR_QUANTILE = { conv_p50_incl_never_ms: 0.5, conv_p99_incl_never_ms: 0.99 };
+
+  // Every design comes in up to three variants; arms.json names each variant's solution in a column of that name.
+  const VARIANTS = ['baseline', 'improved', 'improved_nopk'];
+  const BASELINE_VARIANT = VARIANTS[0];
+  const SELF_COMPARISON = 'vs_own_baseline', PERKEY_COMPARISON = 'perkey_effect';   // the self_posterior comparisons
+  const ropeKey = (r) => 'v' + Math.round(r * 100);
+  const toNum = (x) => (x === null || x === undefined || x === '' ? null : Number(x));
+  const isValid = (v) => v === true || v === 'true';
+
+  /* ---------- Calcs ---------- */
+  dash.calc('study', {
+    title: 'Study constants',
+    description: 'The credible level of every interval the judge reports, the widest half-width written as ±x % in compact text (wider intervals print their ends), the valid seeds a comparison needs on both sides before it can settle, and the seeds planned per arm and regime (the most seen so far, at least the design\'s three).',
+    inputs: ['runs'],
+    fn: (runs) => [{ credible_level: CREDIBLE_LEVEL, min_seeds: MIN_SEEDS, compact_pm_max: COMPACT_PM_MAX, seeds: Math.max(DEFAULT_SEEDS, d3.max(runs, (r) => toNum(r.seed)) ?? 0) }],
+  });
+
+  dash.calc('solutions', {
+    title: 'Solutions per arm and variant',
+    description: 'Every simulated solution: the arm (row) it belongs to and its variant: baseline (the arm itself), improved, or improved_nopk, from the columns of those names in the arm table. A variant an arm does not have is simply absent.',
+    inputs: ['arms'],
+    fn: (arms) => arms.flatMap((a) => VARIANTS.map((v) => ({ solution: v === BASELINE_VARIANT ? a.arm : a[v], arm: a.arm, variant: v })).filter((r) => r.solution)),
+  });
+
+  dash.calc('progress', {
+    title: 'Runs completed',
+    description: 'Runs written so far and how many are invalid, in total and for the baseline and improved stages; runs planned (solutions × regimes × seeds); regimes in which every solution has at least the minimum valid seeds; regimes with no runs; and when the newest run finished.',
+    inputs: ['runs', 'solutions', 'regimes', 'study'],
+    fn: (runs, solutions, regimes, study) => {
+      const { seeds, min_seeds: need } = study[0];
+      const variantOf = new Map(solutions.map((r) => [r.solution, r.variant]));
+      const isBase = (sol) => variantOf.get(sol) === BASELINE_VARIANT;
+      const valid = runs.filter((r) => isValid(r.valid));
+      const per = d3.rollup(valid, (v) => v.length, (r) => r.regime, (r) => r.arm);
+      const any = new Set(runs.map((r) => r.regime));
+      const stamps = runs.map((r) => r.run_at).filter(Boolean).sort();
+      const baseSols = solutions.filter((r) => r.variant === BASELINE_VARIANT).length;
+      return [{
+        done: runs.length, invalid: runs.length - valid.length, planned: solutions.length * regimes.length * seeds,
+        baseline_done: runs.filter((r) => isBase(r.arm)).length, baseline_planned: baseSols * regimes.length * seeds,
+        improved_done: runs.filter((r) => !isBase(r.arm)).length, improved_planned: (solutions.length - baseSols) * regimes.length * seeds,
+        regimes: regimes.length, empty: regimes.filter((g) => !any.has(g.regime)).length,
+        settled: regimes.filter((g) => solutions.every((r) => (per.get(g.regime)?.get(r.solution) ?? 0) >= need)).length,
+        run_at: stamps.length ? stamps[stamps.length - 1] : null,
+      }];
+    },
+  });
+
+  dash.calc('regime_progress', {
+    title: 'Runs per regime',
+    description: 'Runs written and planned (solutions × seeds) for each regime, every variant included.',
+    inputs: ['runs', 'solutions', 'regimes', 'study'],
+    fn: (runs, solutions, regimes, study) => {
+      const done = d3.rollup(runs, (v) => v.length, (r) => r.regime);
+      return regimes.map((g) => ({ regime: g.regime, done: done.get(g.regime) ?? 0, planned: solutions.length * study[0].seeds }));
+    },
+  });
+
+  // Classifies posterior rows against their baseline rows: `baseOf(r)` names the baseline solution of row r, looked up in
+  // `posterior` for the same regime and metric. The baseline side keeps the main_* field names.
+  const judge = (rows, posterior, baseOf) => {
+    const byKey = new Map(posterior.map((r) => [r.solution + '|' + r.regime + '|' + r.metric, r]));
+    const never = new Map(posterior.filter((r) => r.metric === NEVER_METRIC).map((r) => [r.regime + '|' + r.solution, toNum(r.mean)]));
+    const censored = (regime, sol, metric) => {
+      const q = CENSOR_QUANTILE[metric], f = never.get(regime + '|' + sol);
+      return q !== undefined && f !== null && f !== undefined && f > 1 - q;
+    };
+    const floor0 = (x) => (x === null ? null : Math.max(0, x));
+    return rows.map((r) => {
+      const base = baseOf(r), m = byKey.get(base + '|' + r.regime + '|' + r.metric);
+      const mean = toNum(r.mean), mm = m ? toNum(m.mean) : null;
+      const n = toNum(r.n_valid) ?? 0, mn = m ? toNum(m.n_valid) ?? 0 : 0;
+      const kind = mean === null || mm === null ? 'na' : mean === 0 && mm === 0 ? 'same' : mean === 0 ? 'zero' : mm === 0 ? 'mainzero' : 'ratio';
+      const ratio = kind === 'ratio' ? toNum(r.ratio) ?? mean / mm : kind === 'same' ? 1 : kind === 'zero' ? 0 : null;
+      const paired = n >= MIN_SEEDS && mn >= MIN_SEEDS;
+      const exact = paired && r.scale === 'log' && toNum(r.ratio_lo) === null && ratio !== null;
+      const lo = exact ? ratio : toNum(r.ratio_lo), hi = exact ? ratio : toNum(r.ratio_hi);
+      const dlo = toNum(r.diff_lo), dhi = toNum(r.diff_hi);
+      const verdictAt = (rope) => {
+        if (kind === 'na') return 'na';
+        if (!paired) return 'one';
+        if (kind === 'same') return 'tie';
+        if (r.scale === 'log' && lo !== null) {
+          const a = 1 / (1 + rope), b = 1 + rope;
+          return hi < a ? 'better' : lo > b ? 'worse' : lo >= a && hi <= b ? 'tie' : 'open';
+        }
+        if (r.scale === 'diff' && dlo !== null) return dhi < 0 ? 'better' : dlo > 0 ? 'worse' : 'open';
+        return 'open';
+      };
+      const row = {
+        regime: r.regime, arm: r.solution, against: base, metric: r.metric, kind, scale: r.scale || null, paired, exact, n, main_n: mn, n_total: toNum(r.n_total) ?? n,
+        mean, cri_lo: floor0(toNum(r.cri_lo)), cri_hi: toNum(r.cri_hi), zero_all: toNum(r.max) === 0,
+        main_mean: mm, main_lo: m ? floor0(toNum(m.cri_lo)) : null, main_hi: m ? toNum(m.cri_hi) : null, main_zero_all: m ? toNum(m.max) === 0 : false,
+        main_missing: mean !== null && mm === null, main_runs: m ? toNum(m.n_total) ?? 0 : 0,
+        ratio, ratio_lo: r.scale === 'log' ? lo : null, ratio_hi: r.scale === 'log' ? hi : null,
+        diff_mean: toNum(r.diff_mean), diff_lo: dlo, diff_hi: dhi, p_better: toNum(r.p_better),
+        censored: censored(r.regime, r.solution, r.metric), main_censored: censored(r.regime, base, r.metric),
+        never_frac: CENSOR_QUANTILE[r.metric] !== undefined ? never.get(r.regime + '|' + r.solution) ?? null : null,
+      };
+      for (const rope of ROPES) row[ropeKey(rope)] = verdictAt(rope);
+      return row;
+    });
+  };
+
+  dash.calc('verdicts', {
+    title: 'Each arm against main, classified',
+    description: 'Joins each arm\'s posterior row to main\'s for the same regime and metric. kind: ratio (both positive), zero (arm 0, main > 0), mainzero (main 0, arm > 0), same (both 0), na (either side unmeasured). Columns v1, v5, v10 and v25 give the verdict for a tie band r of 1, 5, 10 and 25 %: fewer than two valid seeds on either side is "one"; on the log scale better when the whole ratio interval is below 1/(1+r), worse when above 1+r, tie when inside [1/(1+r), 1+r], open otherwise; on the difference scale better when the difference interval is below 0, worse when above 0, open otherwise; both zero is a tie. When every paired seed gives the same ratio the interval collapses to it. main_missing marks an arm with a value where main has none in its runs (for example, no main seed healed). Credible intervals of the means are clamped at 0 (every metric is non-negative); zero_all marks a side that is 0 in every seed. censored marks a convergence quantile that falls on a never-converged hit (more than 1 − q of hits never converged), so its value is a lower bound.',
+    inputs: ['posterior'],
+    fn: (posterior) => judge(posterior.filter((r) => r.solution !== BASELINE_ARM), posterior, () => BASELINE_ARM),
+  });
+
+  dash.calc('self_verdicts', {
+    title: 'Each improved solution against its own baseline, classified',
+    description: 'The same classification as the verdicts table, for the judge\'s second set of paired posteriors: comparison vs_own_baseline pairs each improved solution with its own design\'s baseline (against), and perkey_effect pairs the improved solution with its no-per-key twin, isolating the per-key fix. The baseline side (main_* columns) is the against solution\'s own posterior row.',
+    inputs: ['self_posterior', 'posterior'],
+    fn: (self, posterior) => {
+      const cmp = new Map(self.map((r) => [r.solution + '|' + r.regime + '|' + r.metric + '|' + r.against, r.comparison]));
+      return judge(self, posterior, (r) => r.against).map((row) => ({ ...row, comparison: cmp.get(row.arm + '|' + row.regime + '|' + row.metric + '|' + row.against) }));
+    },
+  });
+
+  dash.calc('self_scorecard', {
+    title: 'Each improved solution against its own baseline, summarised',
+    description: 'For each improved solution and tie band, against its own design\'s baseline: the median bytes ratio over regimes whose comparison has an interval (with how many), and how many error-metric comparisons are better or worse.',
+    inputs: ['self_verdicts', 'metrics'],
+    fn: (self, metrics) => {
+      const isError = new Set(metrics.filter((x) => isValid(x.error)).map((x) => x.metric));
+      return d3.groups(self.filter((c) => c.comparison === SELF_COMPARISON), (c) => c.arm).flatMap(([arm, cells]) => {
+        const bytes = cells.filter((c) => c.metric === BYTES_METRIC && c.paired && c.ratio_lo !== null);
+        return ROPES.map((rope) => {
+          const err = cells.filter((c) => isError.has(c.metric) && c.kind !== 'na');
+          return { arm, rope, bytes_ratio: bytes.length ? d3.median(bytes, (c) => c.ratio) : null, bytes_regimes: bytes.length,
+            better: err.filter((c) => c[ropeKey(rope)] === 'better').length, worse: err.filter((c) => c[ropeKey(rope)] === 'worse').length };
+        });
+      });
+    },
+  });
+
+  dash.calc('seed_ratios', {
+    title: 'Per-seed ratio to main',
+    description: 'For each arm, regime, metric and seed where both values are valid and positive, the arm value divided by main\'s on the same seed: the pairing the judge uses.',
+    inputs: ['seeds'],
+    fn: (seeds) => {
+      const main = new Map(seeds.filter((s) => s.arm === BASELINE_ARM && isValid(s.valid)).map((s) => [s.regime + '|' + s.metric + '|' + s.seed, toNum(s.value)]));
+      return seeds.filter((s) => s.arm !== BASELINE_ARM && isValid(s.valid)).flatMap((s) => {
+        const mv = main.get(s.regime + '|' + s.metric + '|' + s.seed), v = toNum(s.value);
+        return mv > 0 && v > 0 ? [{ regime: s.regime, arm: s.arm, metric: s.metric, seed: s.seed, ratio: v / mv }] : [];
+      });
+    },
+  });
+
+  const tallyBy = (verdicts, keyOf, base) => {
+    const out = new Map();
+    for (const c of verdicts) {
+      if (c.arm === REFERENCE_ARM || c.kind === 'na') continue;
+      const k0 = keyOf(c); if (k0 === null) continue;
+      for (const rope of ROPES) {
+        const k = k0 + '|' + rope;
+        const t = out.get(k) || { ...base(c), rope, better: 0, tie: 0, worse: 0, open: 0, one: 0 };
+        t[c[ropeKey(rope)]] += 1;
+        out.set(k, t);
+      }
+    }
+    return [...out.values()];
+  };
+
+  dash.calc('family_tally', {
+    title: 'Verdicts per arm and metric family',
+    description: 'For each arm (local only excluded), metric family other than cost, and tie band: how many regime × metric cells are better, tie, worse, open, or have one seed.',
+    inputs: ['verdicts', 'metrics'],
+    fn: (verdicts, metrics) => {
+      const fam = new Map(metrics.map((m) => [m.metric, m.group]));
+      const cost = fam.get(BYTES_METRIC);
+      return tallyBy(verdicts, (c) => (fam.get(c.metric) === cost ? null : c.arm + '|' + fam.get(c.metric)), (c) => ({ arm: c.arm, family: fam.get(c.metric) }));
+    },
+  });
+
+  dash.calc('metric_tally', {
+    title: 'Verdicts per metric and variant',
+    description: 'For each variant, metric and tie band: how many arm × regime comparisons with baseline main (local only excluded) are better, tie, worse, open, or have one seed.',
+    inputs: ['verdicts', 'solutions'],
+    fn: (verdicts, solutions) => {
+      const variantOf = new Map(solutions.map((r) => [r.solution, r.variant]));
+      return tallyBy(verdicts, (c) => (variantOf.has(c.arm) ? variantOf.get(c.arm) + '|' + c.metric : null), (c) => ({ variant: variantOf.get(c.arm), metric: c.metric }));
+    },
+  });
+
+  dash.calc('interval_width', {
+    title: 'Typical interval width per metric and variant',
+    description: 'For each variant and metric, the median half-width of the paired ratio interval (ratio_hi ÷ ratio − 1; the interval is symmetric on the log scale) over every arm-regime comparison with an interval, local only excluded.',
+    inputs: ['verdicts', 'solutions'],
+    fn: (verdicts, solutions) => {
+      const variantOf = new Map(solutions.map((r) => [r.solution, r.variant]));
+      return d3.rollups(verdicts.filter((c) => c.arm !== REFERENCE_ARM && variantOf.has(c.arm) && c.ratio_lo !== null && !c.exact && c.ratio > 0), (v) => ({ median_half_width: d3.median(v, (c) => c.ratio_hi / c.ratio - 1), intervals: v.length }), (c) => variantOf.get(c.arm), (c) => c.metric)
+        .flatMap(([variant, ms]) => ms.map(([metric, o]) => ({ variant, metric, ...o })));
+    },
+  });
+
+  dash.calc('scorecard', {
+    title: 'Bytes and worst loss per arm',
+    description: 'For each arm (local only excluded) and tie band: the median, smallest and largest bytes ratio to main over regimes where that comparison has an interval; the number of settled losses over all metrics; and the worst settled loss (a loss against main at 0 ranks first, then the largest ratio), with its interval.',
+    inputs: ['verdicts'],
+    fn: (verdicts) => {
+      const byArm = d3.group(verdicts.filter((c) => c.arm !== REFERENCE_ARM), (c) => c.arm);
+      const out = [];
+      for (const [arm, cells] of byArm) {
+        const bytes = cells.filter((c) => c.metric === BYTES_METRIC && c.paired && c.ratio_lo !== null);
+        for (const rope of ROPES) {
+          const lost = cells.filter((c) => c[ropeKey(rope)] === 'worse');
+          const worst = d3.greatest(lost, (c) => (c.kind === 'mainzero' ? Infinity : c.ratio));
+          out.push({
+            arm, rope, losses: lost.length,
+            bytes_ratio: bytes.length ? d3.median(bytes, (c) => c.ratio) : null, bytes_min: d3.min(bytes, (c) => c.ratio) ?? null,
+            bytes_max: d3.max(bytes, (c) => c.ratio) ?? null, bytes_regimes: bytes.length,
+            worst_metric: worst?.metric ?? null, worst_regime: worst?.regime ?? null, worst_kind: worst?.kind ?? null,
+            worst_ratio: worst?.ratio ?? null, worst_lo: worst?.ratio_lo ?? null, worst_hi: worst?.ratio_hi ?? null, worst_mean: worst?.mean ?? null,
+          });
+        }
+      }
+      return out;
+    },
+  });
+
+  dash.calc('main_range', {
+    title: 'Main\'s range per metric',
+    description: 'Smallest and largest posterior mean of main across the regimes that measure each metric.',
+    inputs: ['posterior'],
+    fn: (posterior) => d3.rollups(posterior.filter((r) => r.solution === BASELINE_ARM && toNum(r.mean) !== null), (v) => ({ lo: d3.min(v, (r) => toNum(r.mean)), hi: d3.max(v, (r) => toNum(r.mean)), regimes: v.length }), (r) => r.metric).map(([metric, o]) => ({ metric, ...o })),
+  });
+
+  /* ---------- View ---------- */
+  const root = document.getElementById('g3');
+  const $ = (id) => document.getElementById(id);
+
+  // Geometry, px. Font sizes come from the cds tokens through the t-* classes.
+  const PHONE_MAX = 640;            // narrower: the hub draws the glyph-only verdict matrix
+  const PANE_SIDE_MIN = 1200;       // wider: the detail pane sits beside the hub graphic
+  const PANE_W = 340;
+  const MIN_TARGET = 24;              // smallest pointer target, px
+  const SCORE_CARDS_BELOW = 960;
+  const HUB_GAP = 20;
+  const SUB_NAME_DY = -1, SUB_DY = 10;   // a row name over its variant sub-label
+  const ROW_H = 28, FAM_H = 20, GROUP_H = 18, LINE_H = 16, LABEL_PAD = 12;
+  const STRIP_PITCH = 11, STRIP_GLYPH = 26, KEY_GLYPH = 40, TIE_MIN_W = 5, TIE_MIN_GAP = 2;
+  const FOREST_COL_MIN = 128, FOREST_COL_MAX = 240, COL_PAD = 10, LANE_W = 16, LANE_GAP = 4, TICK_GAP = 6, NOT_RUN_CLEAR = 10;
+  // A forest cell, top to bottom: verdict mark, interval (line, caps) with the mean tick, seed rail.
+  const MARKER = 20, MARK_HALF = 3, MARK_DY = -8, TICK_H = 9, CAP_LEN = 6, SEED_DY = 7, SEED_LEN = 4, NARROW_PX = 6, NOTE_MARGIN = 3, NOTE_DY = 3, NOTE2_DY = [-2, 9];
+  const MATRIX_COL_MIN = 24, MATRIX_COL_MAX = 30, MATRIX_GLYPH = 56;
+  const DEC_MIN = -4, DEC_MAX = 3;
+  const FIT_Q = 0.05, FIT_REACH = 0.15, FIT_PAD = 0.08, FIT_MIN_SPAN = 0.04, RATIO_TICKS = 4;   // forest axis fit, in decades
+  const ST_SLOT = 8, ST_GROUP_GAP = 6, ST_PAD = 4, ST_H = 44, ST_DEC = 2, ST_COL_GAP = 14, ST_ROW_GAP = 6, ST_FAM_H = 16, ST_GLYPH = 20, ST_KEY_SCALE = 1.3;
+  const PLANE_MIN_SPAN = 0.6, PLANE_PAD = 0.08;     // decades
+  const MAIN_LABEL = 'main (×1, ×1)';
+  const PLANE_MAX_W = 1040, PLANE_ASPECT = 0.56, PLANE_MIN_H = 320, PLANE_MAX_H = 540, PLANE_GLYPH = 64;
+  const PANEL_MIN_W = 240, PANEL_H = 210, PANEL_GAP = 20, HOVER_R = 28, LEADER_GUTTER = 18, GUTTER_MAX_FRAC = 0.3, TINT_MAX_FRAC = 0.5, LABEL_NEAR = 9, LABEL_FAR = 26, LABEL_SPACE = 4;
+  const PANE_BELOW_MAX = 640;
+  const ZOOM_H = 40, ZOOM_BAR_Y = 12, ZOOM_INSET = 6, ZOOM_PAD = 0.35, ZOOM_MIN_REL = 0.01, ZOOM_TICKS = 4;
+  const INTEGER_UNITS = new Set(['datagrams', 'slots']);
+  const RESIZE_DEBOUNCE_MS = 120, AGE_REFRESH_MS = 60000;
+
+  const STATES = ['better', 'tie', 'worse', 'open', 'one'];
+  const VARIANT_LABEL = { baseline: 'Baseline', improved: 'Improved', improved_nopk: 'Improved, no per-key fix' };
+  const VARIANT_SUB = { improved: 'improved', improved_nopk: 'improved, no per-key' };
+  const VARIANT_PHRASE = { baseline: 'the baseline designs', improved: 'the improved designs', improved_nopk: 'the improved designs without the per-key fix' };
+  const VARIANT_NOTE = {
+    baseline: 'Each design as first built, against baseline main.',
+    improved: 'Each design with every stage-4 fix, the per-key threshold fix included, still against baseline main; so Main is a row here: improved main against baseline main.',
+    improved_nopk: 'The same stage-4 fixes without the per-key threshold fix, still against baseline main; so Main is a row here: improved main against baseline main.',
+  };
+  const WORD = { better: 'better than main', worse: 'worse than main', tie: 'a tie with main', open: 'not settled', one: 'one seed: cannot settle', none: 'not run yet', na: 'not measured' };
+  const KEY_WORD = { better: 'better', tie: 'tie', worse: 'worse', open: 'not settled', one: 'one seed, no interval yet' };
+
+  /* formatting */
+  const NBSP = '\u00a0';
+  const gen = (v) => (Math.abs(v) >= 1e4 ? d3.format('.3~s')(v) : d3.format(',.3~r')(v));
+  const fmtBytes = (v) => { for (const [k, s] of [[1e12, 'TB'], [1e9, 'GB'], [1e6, 'MB'], [1e3, 'kB']]) if (Math.abs(v) >= k) return d3.format('.3~r')(v / k) + ' ' + s; return d3.format('.3~r')(v) + ' B'; };
+  const fmtVal = (unit) => (v) => {
+    if (v === null || v === undefined || !isFinite(v)) return '—';
+    if (unit === 'bytes') return fmtBytes(v);
+    if (unit === 'ms') return Math.abs(v) >= 1000 ? gen(v / 1000) + ' s' : gen(v) + ' ms';
+    if (unit === 'fraction') return d3.format('.2~r')(v * 100) + NBSP + '%';
+    if (unit === '% of limit') return gen(v) + NBSP + '%';
+    return gen(v) + ' ' + unit;
+  };
+  // Both ends of a range. Units whose formatter picks a suffix per value keep it on both ends; the rest carry it once.
+  const PER_VALUE_SUFFIX = new Set(['bytes', 'ms', 'fraction']);
+  const fmtRange = (unit, lo, hi) => (PER_VALUE_SUFFIX.has(unit) ? [fmtVal(unit)(lo), fmtVal(unit)(hi)] : [gen(lo), fmtVal(unit)(hi)]);
+  const fmtR = (r) => (r === null || r === undefined || !isFinite(r) ? '—' : r === 0 ? '0' : r >= 1000 ? d3.format('.2~s')(r) : d3.format(r >= 1 ? '.3~r' : '.2~r')(r));
+  const fmtRatio = (r) => (r === null || r === undefined || !isFinite(r) ? '—' : '×' + fmtR(r));
+  const fmtP = (p) => (p === null ? '—' : p > 0.999 ? '> 0.999' : p < 0.001 ? '< 0.001' : d3.format('.3f')(p));
+  const SUP = { '-': '⁻', 0: '⁰', 1: '¹', 2: '²', 3: '³', 4: '⁴', 5: '⁵', 6: '⁶', 7: '⁷', 8: '⁸', 9: '⁹' };
+  const fmtDec = (e) => (Math.abs(e) <= 2 ? '×' + +(10 ** e).toPrecision(1) : '×10' + String(e).split('').map((ch) => SUP[ch]).join(''));
+  const fmtAge = (ms) => { const min = Math.floor(ms / 60000); if (min < 1) return 'less than a minute ago'; if (min < 90) return `${min} min ago`; const h = Math.round(min / 60); return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`; };
+  const plural = (n, one, many) => (n === 1 ? one : many);
+  // Half-width of a paired ratio interval as a fraction of the ratio (symmetric on the log scale).
+  const halfWidth = (c) => (c.ratio_lo !== null && c.ratio_hi !== null && c.ratio > 0 ? c.ratio_hi / c.ratio - 1 : null);
+
+  /* dom */
+  const el = (tag, attrs = {}, ...kids) => {
+    const e = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (v === null || v === undefined || v === false) continue;
+      if (k === 'class') e.className = v; else if (k.startsWith('on')) e.addEventListener(k.slice(2), v); else e.setAttribute(k, v);
+    }
+    e.append(...kids.filter((k) => k !== null && k !== undefined && k !== false));
+    return e;
+  };
+  const where = (o) => Object.entries(o).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+  const val = (text, source, field, w) => el('span', { 'data-source': source, 'data-field': field, 'data-where': w }, text);
+  const mk = (sel, source, field, w) => sel.attr('data-source', source).attr('data-field', field).attr('data-where', w ?? null);
+  const cellWhere = (c) => where({ arm: c.arm, regime: c.regime, metric: c.metric });
+  const pill = (label, pressed, fk, onclick, title) => el('button', { type: 'button', class: 'pill', 'aria-pressed': String(pressed), 'data-fk': fk, title, onclick }, label);
+  const pillGroup = (name, kids) => el('span', { class: 'pgrp', role: 'group', 'aria-label': name }, el('span', { class: 't-head' }, name), ...kids);
+
+  /* Intervals are written two ways, one per context:
+     full    (pane, tooltips, table, aria): mean [lo, hi] unit, all three at one scale and one precision;
+     compact (forest, scorecard, notes):    ×r ±x %, the half-width of the log-symmetric ratio interval to 2 significant figures. */
+  const SCALES = { bytes: [[1e12, 'TB'], [1e9, 'GB'], [1e6, 'MB'], [1e3, 'kB'], [1, 'B']], ms: [[1000, 's'], [1, 'ms']] };
+  const unitScale = (unit, v) => {
+    if (SCALES[unit]) return SCALES[unit].find(([k]) => Math.abs(v) >= k) || SCALES[unit][SCALES[unit].length - 1];
+    if (unit === 'fraction') return [0.01, '%'];
+    if (unit === '% of limit') return [1, '%'];
+    return [1, unit];
+  };
+  const SIG = 3, MAX_DECIMALS = 6;
+  // Mean, lo and hi at one scale and one precision: SIG significant figures on the mean, more only where lo and hi would print alike.
+  const triple = (unit, mean, lo, hi) => {
+    const [k, suffix] = unitScale(unit, mean || hi || lo || 0);
+    const dec = (x) => (x ? Math.max(0, SIG - 1 - Math.floor(Math.log10(Math.abs(x / k)))) : 0);
+    let d = Math.min(MAX_DECIMALS, dec(mean || hi || lo));
+    const f = (x) => (x === null || x === undefined ? '—' : d3.format(`,.${d}f`)(x / k));
+    while (lo !== null && hi !== null && lo !== hi && d < MAX_DECIMALS && f(lo) === f(hi)) d += 1;
+    return { m: f(mean), l: f(lo), h: f(hi), f, unit: suffix ? (suffix === '%' ? NBSP + '%' : ' ' + suffix) : '' };
+  };
+  const fmt2 = (x) => d3.format(x >= 1000 ? '.2~s' : '.2~r')(x);
+  const pm = (hw) => '±' + d3.format(',.2~r')(hw * 100) + NBSP + '%';
+  // Why a side has no interval: one seed so far, or (once its runs are in) too few of them with a value.
+  const sideCounts = (c, main) => (main ? [c.main_n, c.main_runs, 'main_n', 'main_runs'] : [c.n, c.n_total, 'n', 'n_total']);
+  const noInterval = (c, main) => { const [n, tot] = sideCounts(c, main); return tot > n ? `${n} of ${tot} seeds with a value: no interval` : `${n} seed: no interval yet`; };
+  const seedsShort = (c) => (c.n < MIN_SEEDS ? noInterval(c, false) : `main has ${noInterval(c, true)}`);
+  const hasDiff = (c) => c.scale === 'diff' && c.diff_lo !== null;
+  // Full form, as parts: strings or [text, field] marked against the cell.
+  const fullParts = (c, unit) => {
+    const diff = () => { const t = triple(unit, c.diff_mean, c.diff_lo, c.diff_hi); return ['difference ', [t.m, 'diff_mean'], ' [', [t.l, 'diff_lo'], ', ', [t.h, 'diff_hi'], ']' + t.unit]; };
+    if (c.kind === 'same') return ['0 in every seed, as is main'];
+    if (c.kind === 'zero' || c.kind === 'mainzero') {
+      const t = triple(unit, c.mean, c.mean, c.mean);
+      const head = c.kind === 'zero' ? [c.zero_all ? '0 in every seed' : ['×0', 'ratio']] : ['main 0, arm ', [t.m + t.unit, 'mean']];
+      return hasDiff(c) ? [...head, '; ', ...diff()] : [...head, ` (${seedsShort(c)})`];
+    }
+    if (c.exact) return [[fmtRatio(c.ratio), 'ratio'], ' on every paired seed'];
+    if (c.ratio_lo === null) return hasDiff(c) ? [[fmtRatio(c.ratio), 'ratio'], ' (ratio of means); ', ...diff()] : [[fmtRatio(c.ratio), 'ratio'], ` (${seedsShort(c)})`];
+    const t = triple('', c.ratio, c.ratio_lo, c.ratio_hi);
+    return [['×' + t.m, 'ratio'], ' [', [t.l, 'ratio_lo'], ', ', [t.h, 'ratio_hi'], ']'];
+  };
+  // Compact form, one string; `tight` drops the explanation of a missing interval to its seed count.
+  // A difference, scaled like its unit (MB, s, %), to 2 significant figures; counts stay bare.
+  const compactDiff = (c, unit) => {
+    const [k, suffix] = unitScale(unit, c.diff_mean || c.diff_hi), half = (c.diff_hi - c.diff_lo) / 2;
+    const f = (v) => d3.format(Math.abs(v / k) >= 1e4 ? '.2~s' : '.2~r')(v / k);
+    const tail = suffix === '%' ? NBSP + '%' : SCALES[unit] ? ' ' + suffix : '';
+    return `Δ ${f(c.diff_mean)} ±${f(half)}${tail}`;
+  };
+  // The interval part of the compact form on its own: ±x %, [lo, hi], or the seed count when there is none.
+  const compactInterval = (c, tight) => {
+    if (c.ratio_lo === null || c.exact) return c.paired || c.exact ? '' : tight ? `${Math.min(c.n, c.main_n)} seed` : seedsShort(c);
+    const hw = halfWidth(c);
+    return hw <= COMPACT_PM_MAX ? pm(hw) : `[${fmt2(c.ratio_lo)}, ${fmt2(c.ratio_hi)}]`;
+  };
+  const compactText = (c, unit, tight) => {
+    if (c.kind === 'same') return '0, as is main';
+    if (hasDiff(c)) return compactDiff(c, unit);
+    const iv = compactInterval(c, tight);
+    return !iv ? fmtRatio(c.ratio) : c.ratio_lo === null ? `${fmtRatio(c.ratio)}, ${iv}` : `${fmtRatio(c.ratio)} ${iv}`;
+  };
+  const partsText = (parts) => parts.map((p) => (typeof p === 'string' ? p : p[0])).join('');
+  const partsNodes = (parts, c, source = 'verdicts', w = cellWhere(c)) => parts.map((p) => (typeof p === 'string' ? p : val(p[0], source, p[1], w)));
+
+  /* svg glyphs: shape carries the verdict everywhere; a background halo keeps reference lines from cutting through */
+  const SYMBOL = { better: d3.symbolTriangle, worse: d3.symbolTriangle, open: d3.symbolCircle, one: d3.symbolDiamond };
+  const PLANE_SHAPE = { better: d3.symbolTriangle, worse: d3.symbolTriangle, tie: d3.symbolSquare, open: d3.symbolCircle, one: d3.symbolDiamond };
+  const tieSize = (area) => ({ w: Math.max(TIE_MIN_W, Math.sqrt(area) * 1.1), g: Math.max(TIE_MIN_GAP / 2, Math.sqrt(area) * 0.2) });
+  const glyphPath = (state, area) => {
+    if (state !== 'tie') return d3.symbol(SYMBOL[state], area)();
+    const { w, g } = tieSize(area);
+    return `M${-w / 2},${-g}H${w / 2}M${-w / 2},${g}H${w / 2}`;
+  };
+  const haloPath = (state, area) => {
+    if (state !== 'tie') return glyphPath(state, area);
+    const { w, g } = tieSize(area);
+    return `M${-w / 2},${-g - 1}H${w / 2}V${g + 1}H${-w / 2}Z`;
+  };
+  const glyph = (sel, state, x, y, area) => {
+    const at = `translate(${x},${y})${state === 'better' ? ' rotate(180)' : ''}`;
+    sel.append('path').attr('class', 'gh').attr('d', haloPath(state, area)).attr('transform', at);
+    return sel.append('path').attr('class', 'gl ' + state).attr('d', glyphPath(state, area)).attr('transform', at);
+  };
+  const cap = (sel, state, x, y) => sel.append('line').attr('class', 'cap ' + state).attr('x1', x).attr('x2', x).attr('y1', y - CAP_LEN / 2).attr('y2', y + CAP_LEN / 2);
+  const keySvg = (draw, w = 14, h = 14) => { const s = d3.create('svg').attr('width', w).attr('height', h).attr('aria-hidden', 'true'); draw(s); return s.node(); };
+
+  /* measurement */
+  const meas = d3.select(root).append('svg').attr('class', 'measure').attr('aria-hidden', 'true');
+  const widths = new Map();
+  const textW = (s, cls, weight) => {
+    const k = cls + '|' + (weight || '') + '|' + s;
+    if (!widths.has(k)) { const t = meas.append('text').attr('class', cls).attr('font-weight', weight || null).text(s); widths.set(k, t.node().getComputedTextLength()); t.remove(); }
+    return widths.get(k);
+  };
+  const wrap = (text, width, cls) => {
+    const lines = []; let line = '';
+    for (const w of text.split(' ')) { const t = line ? line + ' ' + w : w; if (line && textW(t, cls) > width) { lines.push(line); line = w; } else line = t; }
+    if (line) lines.push(line);
+    return lines;
+  };
+  // "— reason": an arm with no value, one text wrapped to the width its svg leaves, centred on yMid
+  const lackingNote = (svg, reason, x, yMid, width) => {
+    const ls = wrap(`— ${reason}`, width, 't-cap sub');
+    const t = svg.append('text').attr('class', 't-cap sub').attr('y', yMid + 4 - (ls.length - 1) * LINE_H / 2);
+    ls.forEach((l, i) => t.append('tspan').attr('x', x).attr('dy', i ? LINE_H : 0).text(i < ls.length - 1 ? l + ' ' : l));
+  };
+
+  /* tooltip */
+  const tip = el('div', { class: 'tip t-cap', role: 'tooltip' }); tip.hidden = true; root.append(tip);
+  const showTip = (rect, title, lines) => {
+    tip.replaceChildren(el('div', { class: 'h' }, title), ...lines.map(([k, ...v]) => el('div', {}, el('span', { class: 'k' }, k + ' '), ...v)));
+    tip.hidden = false;
+    const rr = root.getBoundingClientRect();
+    let x = rect.right - rr.left + 10;
+    if (x + tip.offsetWidth > rr.width) x = Math.max(0, rect.left - rr.left - tip.offsetWidth - 10);
+    tip.style.left = x + 'px'; tip.style.top = Math.max(0, rect.top - rr.top - 4) + 'px';
+  };
+  const hideTip = () => { tip.hidden = true; };
+  root.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideTip(); });
+
+  /* keyboard grid with a roving tab stop */
+  const rovingGrid = (host, activate) => {
+    host.onkeydown = (e) => {
+      const cur = e.target.closest?.('[data-rc]'); if (!cur || !host.contains(cur)) return;
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate(cur); return; }
+      const step = { ArrowRight: [0, 1], ArrowLeft: [0, -1], ArrowDown: [1, 0], ArrowUp: [-1, 0] }[e.key]; if (!step) return;
+      const [r, c] = cur.dataset.rc.split(',').map(Number);
+      const next = host.querySelector(`[data-rc="${r + step[0]},${c + step[1]}"]`); if (!next) return;
+      e.preventDefault(); cur.setAttribute('tabindex', '-1'); next.setAttribute('tabindex', '0'); next.focus();
+    };
+  };
+
+  /* rows in fixed arm order, each family under a small label */
+  const rowLayout = (arms, top, rowH, famH) => {
+    const ys = new Map(), fams = []; let y = top, prev = null;
+    for (const a of arms) { if (a.family !== prev) { fams.push({ family: a.family, y }); y += famH; prev = a.family; } ys.set(a.arm, y); y += rowH; }
+    return { ys, fams, bottom: y };
+  };
+  // The forest's log10 axis: the bulk of the interval ends (FIT_Q to 1 − FIT_Q), always holding ×1 and the tie band.
+  // `near` are further ends (the reference arm's) that may be taken in when they only just miss, but never drive the fit.
+  const fitForest = (logs, band, near) => {
+    const v = logs.filter((x) => isFinite(x)).sort(d3.ascending), all = [...v, ...near.filter((x) => isFinite(x))];
+    let lo = Math.min(-band, d3.quantileSorted(v, FIT_Q) ?? 0), hi = Math.max(band, d3.quantileSorted(v, 1 - FIT_Q) ?? 0);
+    const grow = Math.max(0, FIT_MIN_SPAN - (hi - lo)) / 2; lo -= grow; hi += grow;
+    // ends that only just miss the bulk are taken in, so nothing is pinned to an edge it nearly reaches
+    const reach = (hi - lo) * FIT_REACH;
+    lo = Math.min(lo, d3.min(all.filter((x) => x >= lo - reach)) ?? lo); hi = Math.max(hi, d3.max(all.filter((x) => x <= hi + reach)) ?? hi);
+    const pad = (hi - lo) * FIT_PAD;
+    return [Math.max(DEC_MIN, lo - pad), Math.min(DEC_MAX, hi + pad)];
+  };
+  // Tick positions (log10) for a ratio axis: 1-2-5 per decade on wide axes, round ratios on narrow ones.
+  const ratioTicks = (lo, hi) => (hi - lo >= 1
+    ? d3.range(Math.floor(lo), Math.ceil(hi) + 1).flatMap((e) => [1, 2, 5].map((k) => e + Math.log10(k)))
+    : d3.ticks(10 ** lo, 10 ** hi, RATIO_TICKS).map(Math.log10)).filter((t) => t >= lo && t <= hi);
+  // A log10 domain fitted to the values and ×1, with ticks at decades, or at 1-2-5 steps when it spans less than two.
+  const fitLog = (logs) => {
+    const v = [0, ...logs.filter((x) => isFinite(x))];
+    let lo = Math.max(DEC_MIN, d3.min(v)), hi = Math.min(DEC_MAX, d3.max(v));
+    const grow = Math.max(0, PLANE_MIN_SPAN - (hi - lo)) / 2; lo -= grow; hi += grow;
+    const pad = (hi - lo) * PLANE_PAD; lo -= pad; hi += pad;
+    const steps = hi - lo < 2 ? [1, 2, 5] : [1];
+    const ticks = d3.range(Math.floor(lo), Math.ceil(hi) + 1).flatMap((e) => steps.map((k) => e + Math.log10(k))).filter((t) => t >= lo && t <= hi);
+    return { domain: [lo, hi], ticks };
+  };
+  const fmtLogTick = (t) => (Number.isInteger(t) ? fmtDec(t) : fmtRatio(+(10 ** t).toPrecision(1)));
+  const ratioLogs = (c) => (c && c.kind === 'ratio' ? [c.ratio, c.ratio_lo, c.ratio_hi].filter((x) => x > 0).map(Math.log10) : []);
+
+  /* ---------- Model: everything a draw needs, derived once ---------- */
+  const model = () => {
+    const params = dash.params();
+    const get = (id) => dash.data(id).data;
+    const byOrder = (a, b) => toNum(a.order) - toNum(b.order);
+    const raw = get('regimes').slice().sort(byOrder);
+    const groupRank = new Map(); for (const g of raw) if (!groupRank.has(g.group)) groupRank.set(g.group, groupRank.size);
+    const regimes = raw.sort((a, b) => groupRank.get(a.group) - groupRank.get(b.group) || byOrder(a, b));
+    const metrics = get('metrics').slice().sort(byOrder);
+    const arms = get('arms').slice().sort(byOrder);
+    // the variant picks which solution each row reads; rows themselves never change
+    const variant = VARIANTS.includes(params.variant) ? params.variant : BASELINE_VARIANT;
+    const solOf = new Map(get('solutions').filter((r) => r.variant === variant).map((r) => [r.arm, r.solution]));
+    if (variant === BASELINE_VARIANT) solOf.delete(BASELINE_ARM);   // baseline main is what every ratio is against
+    const sol = (a) => solOf.get(a.arm) ?? null;
+    const reason = (a) => (variant === BASELINE_VARIANT ? 'the baseline: every ratio is measured against it'
+      : a[VARIANTS[1]] ? 'no per-key trigger in this design' : 'reference, not improved');
+    const contenders = arms.filter((a) => sol(a));
+    const metric = metrics.find((x) => x.metric === params.metric) || metrics[0];
+    const rope = ROPES.find((r) => String(r) === String(params.rope)) ?? DEFAULT_ROPE;
+    const cells = new Map(get('verdicts').map((c) => [c.arm + '|' + c.regime + '|' + c.metric, c]));
+    const cellOf = (arm, regime, met) => (solOf.has(arm) ? cells.get(solOf.get(arm) + '|' + regime + '|' + met) : undefined);
+    const hasData = (regime, met) => contenders.some((a) => { const c = cellOf(a.arm, regime, met); return c && c.kind !== 'na'; });
+    const regime = regimes.find((g) => g.regime === params.regime) || regimes.find((g) => hasData(g.regime, metric.metric)) || regimes[0];
+    const arm = arms.find((a) => a.arm === params.arm) || contenders.find((a) => cellOf(a.arm, regime.regime, metric.metric)) || contenders[0];
+    return {
+      params, get, regimes, groups: [...groupRank.keys()], metrics, families: [...new Set(metrics.map((x) => x.group))], arms, contenders, variant, sol, reason,
+      cell: (solution, regime, met) => cells.get(solution + '|' + regime + '|' + met),
+      self: new Map(get('self_verdicts').map((r) => [r.comparison + '|' + r.arm + '|' + r.regime + '|' + r.metric, r])),
+      selfScore: new Map(get('self_scorecard').filter((r) => toNum(r.rope) === rope).map((r) => [r.arm, r])),
+      live: contenders.filter((a) => a.arm !== REFERENCE_ARM), reference: contenders.find((a) => a.arm === REFERENCE_ARM),
+      metric, rope, vk: ropeKey(rope), cellOf, hasData, regime, arm,
+      costFamily: metrics.find((x) => x.metric === BYTES_METRIC)?.group,
+      study: get('study')[0], progress: get('progress')[0],
+      regProg: new Map(get('regime_progress').map((r) => [r.regime, r])),
+      mainRow: new Map(get('posterior').filter((r) => r.solution === BASELINE_ARM).map((r) => [r.regime + '|' + r.metric, r])),
+      seedVals: d3.group(get('seeds').filter((s) => isValid(s.valid)), (s) => s.arm + '|' + s.regime + '|' + s.metric),
+      seedRatios: d3.group(get('seed_ratios'), (s) => s.arm + '|' + s.regime + '|' + s.metric),
+      W: root.clientWidth,
+    };
+  };
+  const stateOf = (m, c) => (c ? c[m.vk] : 'none');
+  const ropeText = (m) => '±' + Math.round(m.rope * 100) + NBSP + '%';
+  const levelText = (m) => Math.round(m.study.credible_level * 100) + NBSP + '%';
+
+  /* ---------- Header ---------- */
+  const ageSpan = () => {
+    const at = m0?.progress.run_at;
+    return at ? val(fmtAge(Date.now() - Date.parse(at)), 'progress', 'run_at') : null;
+  };
+  let m0 = null;
+  const drawHeader = (m) => {
+    const p = m.progress, P = (f) => val(d3.format(',')(p[f]), 'progress', f);
+    const age = ageSpan();
+    $('g3-variant').replaceChildren(pillGroup('Designs as', VARIANTS.map((v) => pill(VARIANT_LABEL[v], v === m.variant, 'variant|' + v, () => dash.setParams({ variant: v })))));
+    $('g3-variant-note').replaceChildren(VARIANT_NOTE[m.variant]);
+    $('g3-status').replaceChildren(
+      el('b', {}, P('done')), ' of ', P('planned'), ' runs in', ...(age ? [', newest run ', el('span', { id: 'g3-age' }, age)] : []), ' (', P('invalid'), ' invalid): ',
+      P('baseline_done'), ' of ', P('baseline_planned'), ' baseline and ', P('improved_done'), ' of ', P('improved_planned'), ' improved. ',
+      P('settled'), ' of ', P('regimes'), ` regimes ${plural(p.settled, 'has', 'have')} every design and variant at `, val(String(m.study.min_seeds), 'study', 'min_seeds'), '+ seeds',
+      ...(p.empty ? ['; ', P('empty'), ` ${plural(p.empty, 'has', 'have')} no runs yet, so nothing below speaks to ${plural(p.empty, 'it', 'them')}.`] : ['.']),
+    );
+    $('g3-prog').replaceChildren(...d3.groups(m.regimes, (g) => g.group).map(([grp, list]) => el('div', { class: 'grp' }, el('span', { class: 't-head' }, grp),
+      el('div', { class: 'items' }, ...list.map((g) => {
+        const rp = m.regProg.get(g.regime), f = rp.planned ? rp.done / rp.planned : 0, w = where({ regime: g.regime });
+        return el('button', { type: 'button', 'aria-pressed': String(g.regime === m.regime.regime), 'data-fk': 'prog|' + g.regime, title: g.description, onclick: () => dash.setParams({ regime: g.regime }) },
+          el('span', {}, g.regime), el('span', { class: 'bar' }, el('i', { class: f >= 1 ? 'full' : null, style: `width:${f * 100}%` })),
+          el('span', { class: 'n' }, val(String(rp.done), 'regime_progress', 'done', w), '/', val(String(rp.planned), 'regime_progress', 'planned', w)));
+      })))));
+  };
+
+  /* ---------- Scorecard ---------- */
+  const STACK = ['better', 'tie', 'worse', 'open', 'one'];
+  const compactNode = (c, unit) => val(compactText(c, unit), 'verdicts', hasDiff(c) ? 'diff_mean diff_lo diff_hi' : 'ratio ratio_lo ratio_hi', cellWhere(c));
+  const stackBar = (t) => {
+    const tot = d3.sum(STACK, (k) => t[k]) || 1;
+    return el('div', { class: 'stack', role: 'img', 'aria-label': `${t.better} better, ${t.tie} tie, ${t.worse} worse, ${t.open} not settled, ${t.one} with one seed` }, ...STACK.map((k) => el('i', { class: 's-' + k, style: `width:${t[k] / tot * 100}%` })));
+  };
+  const countsLine = (t, tw) => el('div', { class: 'counts' },
+    el('span', { class: 'c-better' }, '▼', val(String(t.better), 'family_tally', 'better', tw)), ' =', val(String(t.tie), 'family_tally', 'tie', tw), ' ',
+    el('span', { class: 'c-worse' }, '▲', val(String(t.worse), 'family_tally', 'worse', tw)), ' ○', val(String(t.open), 'family_tally', 'open', tw));
+
+  const drawScore = (m) => {
+    const phone = m.W < SCORE_CARDS_BELOW;   // cards where the full table would need a sideways scroll
+    const fams = m.families.filter((f) => f !== m.costFamily);
+    const T = new Map(m.get('family_tally').filter((t) => toNum(t.rope) === m.rope).map((t) => [t.arm + '|' + t.family, t]));
+    const S = new Map(m.get('scorecard').filter((r) => toNum(r.rope) === m.rope).map((r) => [r.arm, r]));
+    const rows = m.live.map((a) => S.get(m.sol(a))).filter(Boolean);
+    const fewest = d3.min(rows, (r) => r.losses), most = d3.max(rows, (r) => r.losses);
+    const cheapest = d3.min(rows.filter((r) => r.bytes_ratio !== null), (r) => r.bytes_ratio);
+    const metricOf = new Map(m.metrics.map((x) => [x.metric, x]));
+    $('g3-score-note').replaceChildren(el('b', {}, `Showing ${VARIANT_PHRASE[m.variant]}. `), `Counts are regime × metric verdicts against main at the ${ropeText(m)} tie band (change it above the hub). Bytes is the median ratio over regimes whose comparison has an interval, with its range. Rows keep one order, grouped by design family; rank shows only as a note under a name. Local only sends nothing: the floor for cost and the ceiling for error, not a contender. Choose ${phone ? 'a card' : 'a row'} to select that arm everywhere below.`);
+    $('g3-score-key').replaceChildren(...[['better', '▼ better'], ['tie', '= tie'], ['worse', '▲ worse'], ['open', '○ not settled'], ['one', 'one seed so far']]
+      .map(([k, t]) => el('span', {}, el('i', { class: 'swatch s-' + k }), k === 'one' ? keySvg((g) => glyph(g, 'one', 6, 7, KEY_GLYPH), 12, 14) : null, t)),
+      el('span', {}, el('span', {}, 'Losses read ×r ±x % (half-width), or ×r [lo, hi] beyond ±', val(Math.round(m.study.compact_pm_max * 100) + NBSP + '%', 'study', 'compact_pm_max'))));
+    const pick = (a) => () => dash.setParams({ arm: a.arm });
+    const act = (a, selAttr) => ({ tabindex: '0', [selAttr]: String(a.arm === m.arm.arm), 'data-fk': 'score|' + a.arm, title: a.mechanism, onclick: pick(a), onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(a)(); } } });
+    // rank as text, only where one arm holds it alone
+    const alone = (f, v) => rows.filter((r) => f(r) === v).length === 1;
+    const tagsOf = (r) => [r.losses === fewest && most > fewest && alone((x) => x.losses, fewest) ? 'fewest losses' : null, r.bytes_ratio !== null && r.bytes_ratio === cheapest && alone((x) => x.bytes_ratio, cheapest) ? 'lowest median bytes' : null].filter(Boolean);
+    const nameNodes = (a, r) => { const tags = [rowSub(m, a), ...(r ? tagsOf(r) : [])].filter(Boolean); return [rowName(m, a), tags.length ? el('span', { class: 'tag' }, tags.join(' · ')) : null]; };
+    const bytesNodes = (a, r) => {
+      if (r.bytes_ratio === null) return [el('span', { class: 'muted' }, 'no interval yet')];
+      const w = where({ arm: r.arm, rope: m.rope });
+      return [el('b', {}, val(fmtRatio(r.bytes_ratio), 'scorecard', 'bytes_ratio', w)),
+        ' ', el('span', { class: 'tag' }, val(fmtRatio(r.bytes_min), 'scorecard', 'bytes_min', w), '–', val(fmtRatio(r.bytes_max), 'scorecard', 'bytes_max', w), ' · ', val(String(r.bytes_regimes), 'scorecard', 'bytes_regimes', w), ` ${plural(r.bytes_regimes, 'regime', 'regimes')}`)];
+    };
+    const famNodes = (a, f) => {
+      const t = T.get(m.sol(a) + '|' + f), tw = where({ arm: m.sol(a), family: f, rope: m.rope });
+      if (!t) return [el('span', { class: 'muted' }, '—')];
+      if (!(t.better + t.tie + t.worse + t.open)) return [el('span', { class: 'muted counts one-only', title: `${t.one} with one seed so far` }, keySvg((g) => glyph(g, 'one', 6, 7, KEY_GLYPH), 12, 14), val(String(t.one), 'family_tally', 'one', tw))];
+      return [stackBar(t), countsLine(t, tw)];
+    };
+    // improved views: the same arm against its own design's baseline, from the judge's own paired posteriors
+    const selfOn = m.variant !== BASELINE_VARIANT;
+    const selfNodes = (a) => {
+      const r = m.selfScore.get(m.sol(a));
+      if (!r) return [el('span', { class: 'muted' }, '—')];
+      const w = where({ arm: r.arm, rope: m.rope });
+      return [r.bytes_ratio === null ? el('span', { class: 'muted' }, 'bytes: no interval yet') : el('span', {}, el('b', {}, val(fmtRatio(r.bytes_ratio), 'self_scorecard', 'bytes_ratio', w)), ' bytes'),
+        ' ', el('span', { class: 'tag' }, 'errors ', el('span', { class: 'c-better' }, '▼', val(String(r.better), 'self_scorecard', 'better', w)), ' ', el('span', { class: 'c-worse' }, '▲', val(String(r.worse), 'self_scorecard', 'worse', w)))];
+    };
+    const worstNodes = (r) => {
+      if (r.worst_metric === null) return [el('span', { class: 'muted' }, 'none settled')];
+      const c = m.cell(r.arm, r.worst_regime, r.worst_metric);
+      return [el('span', { class: 'c-worse' }, compactNode(c, metricOf.get(r.worst_metric).unit), c.kind === 'mainzero' ? ' vs main 0' : ''), ` ${metricOf.get(r.worst_metric).short} · ${r.worst_regime}`];
+    };
+    const groups = d3.groups(m.arms, (a) => a.family);
+    // a row reads its variant's scorecard; without one it says why, and the reference describes itself
+    const lacking = (a) => (m.sol(a) ? null : `— ${m.reason(a)}`);
+    if (phone) {
+      const card = (a) => {
+        const r = S.get(m.sol(a)), why = lacking(a);
+        return el('div', { class: 'card' + (r ? '' : ' ref'), role: 'button', ...act(a, 'aria-pressed') }, el('div', { class: 'name' }, ...nameNodes(a, r)),
+          ...(r ? [el('div', {}, el('span', { class: 'k' }, 'Bytes vs main '), ...bytesNodes(a, r)),
+            ...(selfOn ? [el('div', {}, el('span', { class: 'k' }, 'vs own baseline '), ...selfNodes(a))] : []),
+            el('dl', { class: 'cfam' }, ...fams.flatMap((f) => [el('dt', {}, f), el('dd', {}, ...famNodes(a, f))])),
+            el('div', {}, el('span', { class: 'k' }, 'Worst settled loss '), ...worstNodes(r))] : [el('div', {}, why ?? a.mechanism)]));
+      };
+      $('g3-score').replaceChildren(el('div', { class: 'cards' }, ...groups.flatMap(([family, list]) => [el('div', { class: 't-head' }, family), ...list.map(card)])));
+      return;
+    }
+    const head = el('tr', {}, el('th', { class: 'name' }, 'Arm'), el('th', {}, 'Bytes vs main'), ...fams.map((f) => el('th', {}, f)), el('th', {}, 'Worst settled loss'), selfOn ? el('th', {}, 'vs own baseline') : null);
+    const body = groups.flatMap(([family, list]) => [el('tr', { class: 'fam' }, el('th', { class: 't-head', colspan: String(fams.length + 3 + (selfOn ? 1 : 0)) }, family)), ...list.map((a) => {
+      const r = S.get(m.sol(a)), why = lacking(a), tr = el('tr', { class: 'arm' + (r ? '' : ' ref'), ...act(a, 'aria-selected') }, el('th', { class: 'name', scope: 'row' }, ...nameNodes(a, r)));
+      const span = fams.length + 2 + (selfOn ? 1 : 0);
+      if (why) tr.append(el('td', { class: 'wrap', colspan: String(span) }, why));
+      else if (!r) tr.append(el('td', {}, 'sends nothing'), el('td', { class: 'wrap', colspan: String(span - 1) }, a.mechanism));
+      else tr.append(el('td', {}, ...bytesNodes(a, r)), ...fams.map((f) => el('td', {}, ...famNodes(a, f))), el('td', { class: 'wrap' }, ...worstNodes(r)), ...(selfOn ? [el('td', { class: 'self' }, ...selfNodes(a))] : []));
+      return tr;
+    })]);
+    $('g3-score').replaceChildren(el('div', { class: 'scroll' }, el('table', { class: 'score' }, el('thead', {}, head), el('tbody', {}, ...body))));
+  };
+
+  /* ---------- Hub: one metric, every arm, every regime ---------- */
+  // Why a regime has no column for this metric.
+  const absentReason = (m, g) => {
+    if (!m.regProg.get(g.regime)?.done) return 'notrun';
+    // an improved view counts a regime as not run until one of its solutions has a row there
+    if (m.variant !== BASELINE_VARIANT && !m.contenders.some((a) => m.cellOf(a.arm, g.regime, m.metric.metric))) return 'notrun';
+    if (m.contenders.some((a) => m.cellOf(a.arm, g.regime, m.metric.metric)?.main_missing)) return 'mainmissing';
+    return toNum(m.mainRow.get(g.regime + '|' + m.metric.metric)?.mean) !== null ? 'mainonly' : 'notmeasured';
+  };
+  // An absolute mean with its interval, one scale and precision for all three.
+  const absParts = (c, unit, f, lo, hi, cens, zero) => {
+    if (zero) return ['0 in every seed'];
+    const t = triple(unit, c[f], c[lo], c[hi]);
+    if (c[lo] !== null && c[hi] !== null) return [cens ? '≥ ' : '', [t.m, f], ' [', [t.l, lo], ', ', [t.h, hi], ']' + t.unit];
+    const [n, tot, fn, ft] = sideCounts(c, f !== 'mean');
+    return [cens ? '≥ ' : '', [t.m, f], t.unit, ...(tot > n ? [' (', [String(n), fn], ' of ', [String(tot), ft], ' seeds with a value: no interval)'] : [' (no interval yet)'])];
+  };
+  const mainMissingNote = (m, g) => {
+    const cs = m.contenders.map((a) => [a, m.cellOf(a.arm, g.regime, m.metric.metric)]).filter(([, c]) => c?.main_missing);
+    return [`Baseline main has no valid ${m.metric.short} in ${g.regime} (none in its `, val(String(cs[0][1].main_runs), 'verdicts', 'main_runs', cellWhere(cs[0][1])), ' runs), so nothing there is a ratio. Arms that have one: ',
+      ...cs.flatMap(([a, c], i) => [i ? '; ' : '', `${armTitle(m, a)}: `, ...partsNodes(absParts(c, m.metric.unit, 'mean', 'cri_lo', 'cri_hi', false, false), c),
+        ...(c.cri_lo !== null && c.cri_hi !== null ? [' (', val(String(c.n), 'verdicts', 'n', cellWhere(c)), ` ${plural(c.n, 'seed', 'seeds')})`] : [])]), '. '];
+  };
+  const missingText = (m, absent) => {
+    const by = d3.group(absent, (g) => absentReason(m, g));
+    const list = (k) => (by.get(k) || []).map((g) => g.regime).join(', ') + '. ';
+    return [
+      ...(by.has('notrun') ? [el('b', {}, `Not run yet for ${m.metric.short}${m.variant === BASELINE_VARIANT ? '' : ` in ${VARIANT_PHRASE[m.variant]}`}: `), list('notrun')] : []),
+      ...(by.get('mainmissing') || []).flatMap((g) => mainMissingNote(m, g)),
+      ...(by.has('mainonly') ? [el('b', {}, 'Only main has run: '), list('mainonly')] : []),
+      ...(by.has('notmeasured') ? [el('b', {}, `${m.metric.label} is not measured in: `), list('notmeasured')] : []),
+    ];
+  };
+
+  const cellLabel = (m, a, g, c) => {
+    if (!c) return `${armTitle(m, a)}, ${g.regime}: not run yet`;
+    if (c.kind === 'na') return `${armTitle(m, a)}, ${g.regime}: not measured`;
+    const ofMain = c.kind === 'ratio' && !hasDiff(c) ? ' of main' : '';
+    return `${armTitle(m, a)}, ${g.regime}: ${partsText(fullParts(c, m.metric.unit))}${ofMain}, ${WORD[stateOf(m, c)]}${c.censored ? ', a lower bound' : ''}`;
+  };
+
+  // The same cell against the arm's own design, in brief, for tooltips and aria-descriptions.
+  const selfCell = (m, c) => (m.variant === BASELINE_VARIANT ? undefined : selfOf(m, SELF_COMPARISON, c.arm, c));
+  const selfLine = (m, c) => { const sc = selfCell(m, c); return sc && sc.kind !== 'na' ? [[`vs own baseline (${sc.against})`, ...partsNodes(fullParts(sc, m.metric.unit), sc, 'self_verdicts', selfWhere(sc)), ' · ' + KEY_WORD[stateOf(m, sc)]]] : []; };
+  const selfText = (m, c) => { const sc = c && c.kind !== 'na' ? selfCell(m, c) : undefined; return sc && sc.kind !== 'na' ? `Against its own baseline (${sc.against}): ${partsText(fullParts(sc, m.metric.unit))}, ${KEY_WORD[stateOf(m, sc)]}` : null; };
+  const cellTip = (m, a, g, c, node) => {
+    const unit = m.metric.unit, title = `${armTitle(m, a)} · ${g.regime}`, w = c ? cellWhere(c) : null;
+    if (!c || c.kind === 'na') return showTip(node.getBoundingClientRect(), title, [['', c ? 'not measured here' : 'not run yet']]);
+    showTip(node.getBoundingClientRect(), title, [
+      ['', el('b', {}, WORD[stateOf(m, c)])],
+      ['vs main', ...partsNodes(fullParts(c, unit), c)],
+      [armShort(m, a), ...partsNodes(absParts(c, unit, 'mean', 'cri_lo', 'cri_hi', c.censored, c.zero_all), c)],
+      ['main', ...partsNodes(absParts(c, unit, 'main_mean', 'main_lo', 'main_hi', c.main_censored, c.main_zero_all), c)],
+      ['P(better)', val(fmtP(c.p_better), 'verdicts', 'p_better', w)],
+      ...selfLine(m, c),
+      ['seeds', val(String(c.n), 'verdicts', 'n', w), ' arm, ', val(String(c.main_n), 'verdicts', 'main_n', w), ' main'],
+    ]);
+  };
+
+  // The forest's marks for one cell: the interval to scale (line and caps), the mean tick, a small verdict mark
+  // above it, seeds below, and a note only where the scale cannot carry the number.
+  const forestCell = (cell, c, st, seeds, f) => {
+    const { xs, lo, hi, x0, colW, cy, xZero, xInf, unit } = f;
+    const l = c.kind === 'ratio' || c.kind === 'same' ? Math.log10(c.ratio) : null;
+    const off = l !== null && (l < lo || l > hi);
+    const gx = c.kind === 'zero' ? xZero : c.kind === 'mainzero' ? xInf : xs(Math.max(lo, Math.min(hi, l)));
+    let left = gx - MARK_HALF, right = gx + MARK_HALF, notes = [], field = null;
+    if (c.kind === 'ratio' && !off && c.ratio_lo !== null && !c.exact) {
+      const l1 = Math.log10(c.ratio_lo), l2 = Math.log10(c.ratio_hi), x1 = xs(Math.max(lo, l1)), x2 = xs(Math.min(hi, l2));
+      cell.append('line').attr('class', 'ivl ' + st).attr('x1', x1).attr('x2', Math.max(x2, x1 + 1)).attr('y1', cy).attr('y2', cy);
+      if (l1 >= lo) cap(cell, st, x1, cy);
+      if (l2 <= hi) cap(cell, st, x2, cy);
+      left = Math.min(left, x1); right = Math.max(right, x2);
+      if (x2 - x1 < NARROW_PX) {
+        // a bracketed interval may break after its comma when one line will not fit
+        const iv = compactInterval(c), [a, z] = iv.split(', ');
+        notes = z ? [[iv], [a + ',', z]] : [[iv]]; field = 'ratio_lo ratio_hi';
+      }
+    }
+    cell.append('line').attr('class', 'mt ' + st).attr('x1', gx).attr('x2', gx).attr('y1', cy - TICK_H / 2).attr('y2', cy + TICK_H / 2);
+    glyph(cell, st, gx, cy + MARK_DY, MARKER);
+    for (const s of seeds) {
+      const ls = Math.log10(s.ratio); if (ls < lo || ls > hi) continue;
+      cell.append('line').attr('class', 'seed').attr('x1', xs(ls)).attr('x2', xs(ls)).attr('y1', cy + SEED_DY).attr('y2', cy + SEED_DY + SEED_LEN);
+    }
+    const lb = c.censored ? '≥ ' : '';
+    // notes are lists of lines; a pinned cell may split its note in two, value over interval
+    if (off) {
+      const head = (l > hi ? '→ ' : '← ') + lb + fmtRatio(c.ratio);
+      notes = [[head + compactText(c, unit).slice(fmtRatio(c.ratio).length)], [head + compactText(c, unit, true).slice(fmtRatio(c.ratio).length)], [head, compactInterval(c)], [head, compactInterval(c, true)]];
+      field = 'ratio ratio_lo ratio_hi';
+    } else if (hasDiff(c) && c.kind !== 'same') { notes = [[compactText(c, unit)]]; field = 'diff_mean diff_lo diff_hi'; }
+    else if (st === 'one' && c.kind !== 'same') {
+      const main = c.n >= MIN_SEEDS, lead = main ? 'main ' : '', [n, tot] = sideCounts(c, main);
+      notes = [[lead + noInterval(c, main)], [tot > n ? `${lead}${n} of ${tot} seeds` : `${lead}${n} seed`]]; field = main ? 'main_n' : 'n';
+    }
+    if (c.censored && !off) { notes = notes.length ? notes.map(([t, ...rest]) => [lb + t, ...rest]) : [['≥ lower bound'], ['≥']]; field = field || 'never_frac'; }
+    notes = notes.map((ls) => ls.filter(Boolean));
+    if (!notes.length) return;
+    // the first form that fits beside the marks inside the cell; a note that fits nowhere is not drawn (the tooltip and aria-label carry it)
+    const roomR = x0 + colW - 2 - NOTE_MARGIN - (right + 4), roomL = left - 4 - NOTE_MARGIN - (x0 + 2);
+    const wide = (ls) => d3.max(ls, (t) => textW(t, 't-note'));
+    const lines = notes.find((ls) => wide(ls) <= Math.max(roomR, roomL));
+    if (!lines) return;
+    const onRight = wide(lines) <= roomR;
+    lines.forEach((t, i) => mk(cell.append('text').attr('class', 't-note sub halo').attr('x', onRight ? right + 4 : left - 4)
+      .attr('y', cy + (lines.length > 1 ? NOTE2_DY[i] : NOTE_DY)).attr('text-anchor', onRight ? 'start' : 'end').text(t), 'verdicts', field, cellWhere(c)));
+  };
+
+  const drawKey = (m) => {
+    const mark = (st) => keySvg((g) => glyph(g, st, 7, 7, KEY_GLYPH));
+    const iv = keySvg((g) => {
+      g.append('line').attr('class', 'ivl better').attr('x1', 3).attr('x2', 33).attr('y1', 11).attr('y2', 11);
+      cap(g, 'better', 3, 11); cap(g, 'better', 33, 11);
+      g.append('line').attr('class', 'mt better').attr('x1', 15).attr('x2', 15).attr('y1', 11 - TICK_H / 2).attr('y2', 11 + TICK_H / 2);
+      glyph(g, 'better', 15, 11 + MARK_DY, MARKER);
+    }, 36, 18);
+    const seeds = keySvg((g) => [3, 8, 11].forEach((x) => g.append('line').attr('class', 'seed').attr('x1', x).attr('x2', x).attr('y1', 5).attr('y2', 5 + SEED_LEN)), 14);
+    $('g3-key').replaceChildren(...STATES.map((st) => el('span', {}, mark(st), KEY_WORD[st])),
+      el('span', {}, iv, val(levelText(m), 'study', 'credible_level'), ' credible interval of the ratio, to scale, with its mean'),
+      el('span', {}, el('span', {}, el('b', {}, '±x %'), ' half-width, printed where the line is too short to see; beyond ±', val(Math.round(m.study.compact_pm_max * 100) + NBSP + '%', 'study', 'compact_pm_max'), ' the ends print as [lo, hi]')),
+      el('span', {}, seeds, 'single seeds'), el('span', {}, el('b', {}, 'Δ'), ' arm − main, where a value is 0'),
+      el('span', {}, '≥ lower bound'), el('span', {}, '– not run yet'));
+  };
+
+  const drawHub = (m, fk) => {
+    const met = m.metric, arms = m.arms;
+    const present = m.regimes.filter((g) => m.hasData(g.regime, met.metric));
+    const absent = m.regimes.filter((g) => !present.includes(g));
+    $('g3-hub-title').textContent = `${met.label}: every arm in every regime`;
+    const T = m.get('metric_tally').find((t) => t.variant === m.variant && t.metric === met.metric && toNum(t.rope) === m.rope);
+    const tw = where({ variant: m.variant, metric: met.metric, rope: m.rope }), tv = (f) => val(String(T[f]), 'metric_tally', f, tw);
+    $('g3-hub-note').replaceChildren(el('b', {}, `Showing ${VARIANT_PHRASE[m.variant]}`), `, each against baseline main. `, met.definition + ' Each column is a regime; position is the ratio to main on one log axis shared by every column and fitted to the bulk of the intervals, so left of ×1 is better and anything beyond the axis is printed at its edge. ',
+      ...(T ? [`At ${ropeText(m)}: `, el('b', {}, tv('better')), ' arm–regime comparisons better than main, ', el('b', {}, tv('worse')), ' worse, ', tv('tie'), ' ties, ', tv('open'), ' not settled, and ', tv('one'), ' with one seed so far (local only not counted).'] : []));
+    const IW = m.get('interval_width').find((r) => r.variant === m.variant && r.metric === met.metric);
+    $('g3-hub-iv').replaceChildren(...(IW ? ['Intervals are usually narrower than the marks: the simulator is deterministic given a seed, so the seed is the only spread, and pairing by seed cancels most of it. The median ', met.short, ' interval is ',
+      el('b', {}, val(pm(IW.median_half_width), 'interval_width', 'median_half_width', where({ variant: m.variant, metric: met.metric }))), '. Where a line is too short to see, its half-width is printed beside the mark; choose a cell to see it to scale in the detail pane.'] : []));
+    $('g3-metric').replaceChildren(...d3.groups(m.metrics, (x) => x.group).map(([f, list]) => pillGroup(f, list.map((x) => pill(x.short, x.metric === met.metric, 'metric|' + x.metric, () => dash.setParams({ metric: x.metric }), x.label)))));
+    const rs = $('g3-rope');
+    rs.replaceChildren(...ROPES.map((r) => el('option', { value: String(r), selected: r === m.rope ? '' : null }, '±' + Math.round(r * 100) + NBSP + '%')));
+    rs.onchange = () => dash.setParams({ rope: rs.value });
+    drawKey(m);
+    $('g3-hub-missing').replaceChildren(...missingText(m, absent));
+
+    const phone = m.W < PHONE_MAX, side = m.W >= PANE_SIDE_MIN;
+    $('g3-hubbody').style.gridTemplateColumns = side ? `minmax(0, 1fr) ${PANE_W}px` : '';
+    const pane = $('g3-pane');
+    pane.classList.toggle('rail', side);
+    pane.style.maxWidth = side ? '' : PANE_BELOW_MAX + 'px';
+    const gw = side ? m.W - PANE_W - HUB_GAP : m.W;
+    const labHost = $('g3-hub-labels'), plotHost = $('g3-hub-plot'), cue = $('g3-hub-more');
+    if (!present.length) {
+      labHost.replaceChildren(); cue.hidden = true;
+      plotHost.replaceChildren(el('p', { class: 'fail' }, `No arm can be compared with main on ${met.short} yet; the note below says why, regime by regime.`));
+      drawPane(m, present); drawHubTable(m, present); return;
+    }
+    const nameCls = phone ? 't-cap' : 't-body';
+    const nameW = Math.ceil(Math.max(d3.max(arms, (a) => textW(rowName(m, a), nameCls, a.arm === m.arm.arm ? 600 : null)), d3.max(arms, (a) => textW(a.family.toUpperCase(), 't-head')))) + LABEL_PAD;
+    const stripW = phone ? 0 : present.length * STRIP_PITCH + LABEL_PAD;
+    const avail = gw - nameW - stripW;
+    const colW = phone ? Math.max(MATRIX_COL_MIN, Math.min(MATRIX_COL_MAX, Math.floor(avail / present.length)))
+      : Math.min(FOREST_COL_MAX, Math.max(FOREST_COL_MIN, Math.floor(avail / present.length)));
+    const plotW = colW * present.length;
+    const regW = d3.max(present, (g) => textW(g.regime, 't-cap', 600));
+    const headH = phone ? GROUP_H + Math.ceil(regW) + 8 : GROUP_H + 3 * LINE_H + 8;
+    const lay = rowLayout(arms, headH, ROW_H, FAM_H), H = lay.bottom + 4;
+
+    // label column: family labels, names, verdict strip
+    labHost.replaceChildren();
+    const ls = d3.select(labHost).append('svg').attr('class', 'small').attr('width', nameW + stripW).attr('height', H).attr('aria-hidden', 'true');
+    for (const f of lay.fams) ls.append('text').attr('class', 't-head').attr('x', 0).attr('y', f.y + FAM_H - 6).text(f.family.toUpperCase());
+    if (!phone) ls.append('text').attr('class', 't-head').attr('x', nameW).attr('y', headH - 8).text('BY REGIME');
+    for (const a of arms) {
+      const y = lay.ys.get(a.arm), cy = y + ROW_H / 2, sel = a.arm === m.arm.arm;
+      if (sel) ls.append('rect').attr('class', 'hl').attr('x', 0).attr('y', y).attr('width', nameW + stripW).attr('height', ROW_H);
+      const sub = rowSub(m, a);
+      ls.append('text').attr('class', nameCls + (a.arm === REFERENCE_ARM ? ' mut' : '')).attr('font-weight', sel ? 600 : null).attr('x', nameW - LABEL_PAD / 2).attr('y', cy + (sub ? SUB_NAME_DY : 4)).attr('text-anchor', 'end').attr('data-arm', a.arm).text(rowName(m, a));
+      if (sub) ls.append('text').attr('class', 't-note sub').attr('x', nameW - LABEL_PAD / 2).attr('y', cy + SUB_DY).attr('text-anchor', 'end').text(sub);
+      if (!phone && m.sol(a)) present.forEach((g, j) => { const st = stateOf(m, m.cellOf(a.arm, g.regime, met.metric)); if (STATES.includes(st)) glyph(ls, st, nameW + j * STRIP_PITCH + STRIP_PITCH / 2, cy, STRIP_GLYPH); });
+    }
+
+    // plot: grid and bands underneath, marks above
+    const scrollLeft = plotHost.scrollLeft;
+    plotHost.replaceChildren();
+    const ps = d3.select(plotHost).append('svg').attr('width', plotW).attr('height', H).attr('role', 'grid').attr('aria-label', `${met.label}: ratio to main for each arm in each regime. Arrow keys move between cells; Enter selects one.`);
+    const under = ps.append('g'), over = ps.append('g');
+    const kinds = new Set(present.flatMap((g) => arms.map((a) => m.cellOf(a.arm, g.regime, met.metric)?.kind)));
+    const zl = kinds.has('zero') ? LANE_W + LANE_GAP : 0, ml = kinds.has('mainzero') ? LANE_W + LANE_GAP : 0;
+    const band = Math.log10(1 + m.rope);
+    const ends = (list) => present.flatMap((g) => list.flatMap((a) => { const c = m.cellOf(a.arm, g.regime, met.metric); return c && c.kind === 'ratio' ? [c.ratio_lo ?? c.ratio, c.ratio_hi ?? c.ratio, c.ratio].filter((x) => x > 0).map(Math.log10) : []; }));
+    const [lo, hi] = fitForest(ends(m.live), band, ends(m.contenders.filter((a) => !m.live.includes(a))));
+    const ticks = ratioTicks(lo, hi);
+    const selArm = m.arm.arm, selReg = m.regime.regime;
+    const activeKey = fk?.startsWith('hub|') ? fk : `hub|${selArm}|${selReg}`;
+    if (lay.ys.has(selArm)) under.append('rect').attr('class', 'hl').attr('x', 0).attr('y', lay.ys.get(selArm)).attr('width', plotW).attr('height', ROW_H);
+    lay.fams.slice(1).forEach((f) => under.append('line').attr('class', 'rule').attr('x1', 0).attr('x2', plotW).attr('y1', f.y + 3).attr('y2', f.y + 3));
+    d3.groups(present.map((g, j) => ({ g, j })), (d) => d.g.group).forEach(([name, list], k, all) => {
+      const x0 = list[0].j * colW, x1 = (list[list.length - 1].j + 1) * colW;
+      over.append('line').attr('class', 'rule').attr('x1', x0 + 3).attr('x2', x1 - 3).attr('y1', GROUP_H - 3).attr('y2', GROUP_H - 3);
+      const room = k + 1 < all.length ? x1 - x0 - 6 : Infinity;
+      if (textW(name.toUpperCase(), 't-head') <= room) over.append('text').attr('class', 't-head').attr('x', x0 + 3).attr('y', GROUP_H - 7).text(name.toUpperCase());
+    });
+    const headRow = over.append('g').attr('role', 'row');
+    const rows = new Map(arms.map((a) => [a.arm, over.append('g').attr('role', 'row')]));
+    present.forEach((g, j) => {
+      const x0 = j * colW, selCol = g.regime === selReg;
+      const xs = d3.scaleLinear().domain([lo, hi]).range([x0 + COL_PAD + zl, x0 + colW - COL_PAD - ml]);
+      const xZero = x0 + COL_PAD + LANE_W / 2, xInf = x0 + colW - COL_PAD - LANE_W / 2;
+      if (selCol) under.insert('rect', ':first-child').attr('class', 'hl').attr('x', x0).attr('y', GROUP_H).attr('width', colW).attr('height', H - GROUP_H);
+      const hd = headRow.append('g').attr('class', 'hdr').attr('role', 'columnheader').attr('tabindex', 0).attr('data-fk', 'hubh|' + g.regime).attr('aria-label', `${g.regime}: select this regime`)
+        .on('click', () => dash.setParams({ regime: g.regime })).on('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); dash.setParams({ regime: g.regime }); } });
+      hd.append('title').text(g.description);
+      if (phone) {
+        hd.append('rect').attr('class', 'focus').attr('x', x0).attr('y', GROUP_H).attr('width', colW).attr('height', headH - GROUP_H).attr('rx', 3);
+        hd.append('text').attr('class', 't-cap').attr('font-weight', selCol ? 600 : 500).attr('transform', `translate(${x0 + colW / 2 + 4},${headH - 6}) rotate(-90)`).text(g.regime);
+      } else {
+        const mainV = toNum(m.mainRow.get(g.regime + '|' + met.metric)?.mean), mw = where({ solution: BASELINE_ARM, regime: g.regime, metric: met.metric });
+        hd.append('rect').attr('class', 'focus').attr('x', x0 + 2).attr('y', GROUP_H).attr('width', colW - 4).attr('height', 2 * LINE_H + 2).attr('rx', 3);
+        hd.append('text').attr('class', 't-cap').attr('font-weight', selCol ? 600 : 500).attr('text-decoration', selCol ? 'underline' : null).attr('x', x0 + COL_PAD).attr('y', GROUP_H + LINE_H - 2).text(g.regime);
+        // main's value, with its unit when that fits the column
+        const mainText = [`main ${fmtVal(met.unit)(mainV)}`, `main ${gen(mainV)}`].find((t) => textW(t, 't-cap') <= colW - COL_PAD - 2) ?? `main ${gen(mainV)}`;
+        if (mainV !== null) mk(hd.append('text').attr('class', 't-cap sub').attr('x', x0 + COL_PAD).attr('y', GROUP_H + 2 * LINE_H - 2).text(mainText), 'posterior', 'mean', mw);
+        // tie band, grid and ×1 under the marks; tick labels centred on their lines: ×1 first, then the outermost
+        under.append('rect').attr('class', 'band').attr('x', xs(-band)).attr('y', headH).attr('width', Math.max(0, xs(band) - xs(-band))).attr('height', H - headH);
+        for (const t of ticks) under.append('line').attr('class', Math.abs(t) < 1e-9 ? 'ref' : 'grid').attr('x1', xs(t)).attr('x2', xs(t)).attr('y1', headH - 4).attr('y2', H);
+        if (!ticks.some((t) => Math.abs(t) < 1e-9)) under.append('line').attr('class', 'ref').attr('x1', xs(0)).attr('x2', xs(0)).attr('y1', headH - 4).attr('y2', H);
+        const ty = GROUP_H + 3 * LINE_H - 2, used = [];
+        const label = (x, text) => {
+          const w = textW(text, 't-cap'), b0 = Math.max(x0 + 2, Math.min(x0 + colW - 2 - w, x - w / 2));
+          if (used.some(([a, b]) => b0 < b + TICK_GAP && b0 + w > a - TICK_GAP)) return;
+          used.push([b0, b0 + w]); over.append('text').attr('class', 't-cap sub').attr('x', b0).attr('y', ty).text(text);
+        };
+        label(xs(0), '×1');
+        if (ticks.length) { label(xs(ticks[0]), '×' + fmtR(10 ** ticks[0])); label(xs(ticks[ticks.length - 1]), '×' + fmtR(10 ** ticks[ticks.length - 1])); }
+        if (zl) label(xZero, '0');
+        if (ml) label(xInf, '∞');
+      }
+      arms.forEach((a) => {
+        if (!m.sol(a)) return;   // the row says why once, below
+        const y = lay.ys.get(a.arm), cy = y + ROW_H / 2, c = m.cellOf(a.arm, g.regime, met.metric), st = stateOf(m, c);
+        const key = `hub|${a.arm}|${g.regime}`, sel = a.arm === selArm && selCol;
+        const cell = rows.get(a.arm).append('g').attr('class', 'cell' + (sel ? ' sel' : '')).attr('role', 'gridcell').attr('data-rc', `${m.contenders.indexOf(a)},${j}`).attr('data-fk', key)
+          .attr('data-arm', a.arm).attr('data-regime', g.regime).attr('aria-selected', String(sel)).attr('aria-label', cellLabel(m, a, g, c)).attr('aria-description', selfText(m, c)).attr('tabindex', key === activeKey ? 0 : -1);
+        const inset = phone ? 0 : 2;   // phone cells use their full width to stay a usable target
+        cell.append('rect').attr('class', 'focus').attr('x', x0 + inset).attr('y', y + 1).attr('width', colW - 2 * inset).attr('height', ROW_H - 2).attr('rx', 3);
+        cell.on('click', () => dash.setParams({ arm: a.arm, regime: g.regime }))
+          .on('mouseenter focus', function () { cellTip(m, a, g, c, this); }).on('mouseleave blur', hideTip);
+        if (!c) {
+          const cx = x0 + colW / 2, clash = !phone && Math.abs(cx - xs(0)) < NOT_RUN_CLEAR;
+          cell.append('text').attr('class', 't-cap sub').attr('x', clash ? xs(0) + NOT_RUN_CLEAR : cx).attr('y', cy + 4).attr('text-anchor', 'middle').text('–');
+          return;
+        }
+        if (c.kind === 'na') return;
+        if (phone) { glyph(cell, st, x0 + colW / 2, cy, MATRIX_GLYPH * Math.min(1, colW / MATRIX_COL_MAX)); return; }
+        forestCell(cell, c, st, m.seedRatios.get(m.sol(a) + '|' + g.regime + '|' + met.metric) || [], { xs, lo, hi, x0, colW, cy, xZero, xInf, unit: met.unit });
+      });
+    });
+    for (const a of arms.filter((x) => !m.sol(x))) lackingNote(over, m.reason(a), COL_PAD, lay.ys.get(a.arm) + ROW_H / 2, plotW - COL_PAD);
+    if (!ps.select('.cell[tabindex="0"]').size()) ps.select('.cell').attr('tabindex', 0);
+    rovingGrid(plotHost, (node) => dash.setParams({ arm: node.dataset.arm, regime: node.dataset.regime }));
+    // when the regimes overflow, say so and fade the cut edge until the end is reached
+    cue.hidden = plotW <= avail;
+    plotHost.scrollLeft = scrollLeft;
+    const edge = () => plotHost.classList.toggle('more', plotHost.scrollLeft + plotHost.clientWidth < plotHost.scrollWidth - 2);
+    plotHost.onscroll = edge; edge();
+    drawPane(m, present);
+    drawHubTable(m, present);
+  };
+
+  const drawHubTable = (m, present) => {
+    const cols = m.regimes.filter((g) => present.includes(g) || absentReason(m, g) === 'mainmissing'), unit = m.metric.unit;
+    $('g3-hub-table').replaceChildren(el('table', { class: 'tbl' },
+      el('caption', {}, `${m.metric.label}: ratio to main with its `, val(levelText(m), 'study', 'credible_level'), ` credible interval, and the verdict at ${ropeText(m)}.`),
+      el('thead', {}, el('tr', {}, el('th', {}, 'Arm'), ...cols.map((g) => el('th', { scope: 'col' }, g.regime)))),
+      el('tbody', {}, ...m.arms.map((a) => el('tr', {}, el('th', { scope: 'row', 'data-arm': a.arm }, rowName(m, a)), ...(!m.sol(a) ? [el('td', { class: 'muted', colspan: String(cols.length) }, `— ${m.reason(a)}`)] : cols.map((g) => {
+        const c = m.cellOf(a.arm, g.regime, m.metric.metric);
+        if (!c) return el('td', { class: 'muted' }, 'not run yet');
+        if (c.main_missing) return el('td', {}, ...partsNodes(absParts(c, unit, 'mean', 'cri_lo', 'cri_hi', c.censored, c.zero_all), c), el('span', { class: 'muted' }, ' · main has no value'));
+        if (c.kind === 'na') return el('td', { class: 'muted' }, 'not measured');
+        const st = stateOf(m, c);
+        return el('td', {}, c.censored ? '≥ ' : '', ...partsNodes(fullParts(c, unit), c), st === 'one' ? null : el('span', { class: 'muted' }, ' · ' + KEY_WORD[st]));
+      })))))));
+  };
+
+  /* detail pane: regime, verdict sentence, the cell zoomed to scale, readout */
+  const drawPane = (m, present) => {
+    const pane = $('g3-pane'), ps = getComputedStyle(pane);
+    const width = Math.floor(pane.clientWidth - parseFloat(ps.paddingLeft) - parseFloat(ps.paddingRight));
+    const g = m.regime, met = m.metric, a = m.arm;
+    const kids = [el('h3', {}, `${armTitle(m, a)} · ${met.short} · ${g.regime}`), el('p', { class: 'note t-cap' }, g.description)];
+    const c = m.cellOf(a.arm, g.regime, met.metric);
+    const say = (t) => el('p', { class: 'verdict' }, t);
+    const why = present.includes(g) ? null : absentReason(m, g);
+    if (!m.sol(a)) kids.push(say(`${rowName(m, a)} has no ${VARIANT_LABEL[m.variant].toLowerCase()} variant: ${m.reason(a)}.`));
+    else if (why === 'notrun') kids.push(say(`No runs of ${VARIANT_PHRASE[m.variant]} in ${g.regime} yet. Nothing in this view speaks to it until they land.`));
+    else if (why === 'mainmissing') kids.push(el('p', { class: 'verdict' }, ...mainMissingNote(m, g)));
+    else if (why === 'mainonly') kids.push(say(`Only main has run in ${g.regime} so far, so there is nothing to compare it with yet.`));
+    else if (why === 'notmeasured') kids.push(say(`${met.label} is not measured in ${g.regime}.`));
+    else if (!c || c.kind === 'na') kids.push(say(`${rowName(m, a)} has no ${met.short} result in ${g.regime} yet. Choose another cell.`));
+    else kids.push(...readout(m, c, width), ...selfBlock(m, c));
+    pane.replaceChildren(...kids);
+  };
+
+  // An improved variant paired against its own design: the judge's posterior against the design's baseline, and the per-key fix alone.
+  const selfOf = (m, cmp, sol, c) => (sol ? m.self.get(cmp + '|' + sol + '|' + c.regime + '|' + c.metric) : undefined);
+  const selfWhere = (sc) => where({ comparison: sc.comparison, arm: sc.arm, regime: sc.regime, metric: sc.metric });
+  const selfBlock = (m, c) => {
+    if (m.variant === BASELINE_VARIANT) return [];
+    const unit = m.metric.unit, dl = el('dl', { class: 'read stacked' });
+    const pairs = [[SELF_COMPARISON, c.arm, (sc) => `Against its own baseline (${sc.against})`, 'P(better than its baseline)'],
+      [PERKEY_COMPARISON, m.arm[VARIANTS[1]], (sc) => `The per-key fix alone (${sc.arm} against ${sc.against})`, 'P(the per-key fix helps)']];
+    for (const [cmp, sol, label, pLabel] of pairs) {
+      const sc = selfOf(m, cmp, sol, c);
+      if (!sc || sc.kind === 'na') continue;
+      const w = selfWhere(sc);
+      dl.append(el('dt', {}, label(sc)), el('dd', {}, ...partsNodes(fullParts(sc, unit), sc, 'self_verdicts', w), ' · ' + KEY_WORD[stateOf(m, sc)]),
+        el('dt', {}, pLabel), el('dd', {}, val(fmtP(sc.p_better), 'self_verdicts', 'p_better', w)));
+    }
+    return [el('h3', { class: 't-cap muted' }, 'Paired against its own design'),
+      dl.children.length ? dl : el('p', { class: 'note t-cap' }, `No paired run of ${m.arm.arm} itself in ${c.regime} yet, so there is nothing to set this against.`)];
+  };
+  // A row's label in the current variant. Outside the baseline view, the baseline arm is no longer "the baseline", so its
+  // name loses that trailing role qualifier; every row that reads a variant carries the variant as a sub-label.
+  const ROLE_QUALIFIER = /\s*\([^)]*\)$/;
+  const rowName = (m, a) => (m.variant !== BASELINE_VARIANT && a.arm === BASELINE_ARM ? a.name.replace(ROLE_QUALIFIER, '') : a.name);
+  const rowSub = (m, a) => (m.variant !== BASELINE_VARIANT && m.sol(a) ? VARIANT_SUB[m.variant] : null);
+  const armTitle = (m, a) => (m.variant === BASELINE_VARIANT || !m.sol(a) ? rowName(m, a) : `${rowName(m, a)}, as ${m.sol(a)}`);
+  const armShort = (m, a) => (m.variant === BASELINE_VARIANT ? a.name : m.sol(a));
+
+  const readout = (m, c, width) => {
+    const unit = m.metric.unit, st = stateOf(m, c), name = armShort(m, m.arm), w = cellWhere(c), lvl = () => val(levelText(m), 'study', 'credible_level'), band = ropeText(m);
+    const diff = hasDiff(c);
+    const sentence = {
+      better: diff ? [`${name} beats main here: the whole `, lvl(), ' interval for the difference lies below zero.'] : [`${name} beats main here: the whole `, lvl(), ` interval for the ratio lies below the ${band} tie band.`],
+      worse: diff ? [`${name} is worse than main here: the whole `, lvl(), ' interval for the difference lies above zero.'] : [`${name} is worse than main here: the whole `, lvl(), ` interval for the ratio lies above the ${band} tie band.`],
+      tie: c.kind === 'same' ? [`${name} and main are both 0 in every seed.`] : c.exact ? [`Every paired seed gives ${name} the same ratio to main, inside the ${band} tie band.`] : [`${name} and main are within ${band} of each other: the whole `, lvl(), ' interval lies inside the tie band.'],
+      open: [diff ? 'The interval for the difference straddles zero' : 'The interval crosses the edge of the tie band', '. More seeds, or a wider band, would settle it.'],
+      one: [`${c.n < MIN_SEEDS ? name : 'Main'} has one seed so far: a point with no interval, so this cannot settle yet.`],
+    }[st];
+    const out = [el('p', { class: 'verdict' }, el('b', { class: 'c-' + st }, KEY_WORD[st][0].toUpperCase() + KEY_WORD[st].slice(1) + '. '), ...sentence)];
+    if (c.censored) out.push(el('p', { class: 'note t-cap' }, `${name}'s value is a lower bound: `, val(fmtVal('fraction')(c.never_frac), 'verdicts', 'never_frac', w), ' of its hits never converged, so this quantile falls on a hit counted as its remaining life.'));
+    out.push(...zooms(m, c, width));
+    const seedList = (arm, mean) => {
+      const ss = (m.seedVals.get(arm + '|' + c.regime + '|' + c.metric) || []).slice().sort((x, y) => x.seed - y.seed);
+      if (!ss.length) return ['—'];
+      const vs = ss.map((s) => toNum(s.value)), t = triple(unit, mean, d3.min(vs), d3.max(vs));
+      return [...ss.flatMap((s, i) => [i ? ', ' : '', val(t.f(toNum(s.value)), 'seeds', 'value', where({ arm, regime: c.regime, metric: c.metric, seed: s.seed }))]), t.unit];
+    };
+    const dl = el('dl', { class: 'read' });
+    const row = (k, ...v) => dl.append(el('dt', {}, k), el('dd', {}, ...v));
+    row(name, ...partsNodes(absParts(c, unit, 'mean', 'cri_lo', 'cri_hi', c.censored, c.zero_all), c));
+    row('Main', ...partsNodes(absParts(c, unit, 'main_mean', 'main_lo', 'main_hi', c.main_censored, c.main_zero_all), c));
+    row(c.kind === 'ratio' && !diff ? 'Paired ratio' : 'Against main', ...partsNodes(fullParts(c, unit), c));
+    row('P(better than main)', val(fmtP(c.p_better), 'verdicts', 'p_better', w));
+    row(`${name} seeds`, ...seedList(c.arm, c.mean));
+    row('Main seeds', ...seedList(BASELINE_ARM, c.main_mean));
+    out.push(dl, el('p', { class: 'note t-cap' }, 'Brackets are ', lvl(), ' credible intervals. Pairing by seed removes the spread the two arms share, so the ratio\'s interval can be much narrower than the two above suggest.'));
+    return out;
+  };
+
+  // One line of the zoom, on its own axis fitted to its interval and seeds so the interval fills a good share of it.
+  const zoomRow = ({ width, label, mean, lo, hi, seeds, cls, unit, band, bandText }) => {
+    const ratio = !unit;
+    const vals = [mean, lo, hi, ...seeds].filter((v) => v !== null && isFinite(v));
+    const [a, b] = d3.extent(vals), pad = b > a ? (b - a) * ZOOM_PAD : Math.abs(mean) * ZOOM_MIN_REL || 1;
+    const x = d3.scaleLinear().domain([ratio ? a - pad : Math.max(0, a - pad), b + pad]).range([ZOOM_INSET, width - ZOOM_INSET]);
+    const [d0, d1] = x.domain(), y = ZOOM_BAR_Y;
+    const svg = d3.create('svg').attr('width', width).attr('height', ZOOM_H).attr('role', 'img').attr('aria-label', `${label}, zoomed`);
+    if (band && band[1] > d0 && band[0] < d1) svg.append('rect').attr('class', 'band').attr('x', x(Math.max(d0, band[0]))).attr('width', x(Math.min(d1, band[1])) - x(Math.max(d0, band[0]))).attr('y', 0).attr('height', y + SEED_DY + SEED_LEN + 2);
+    if (ratio && d0 <= 1 && d1 >= 1) svg.append('line').attr('class', 'ref').attr('x1', x(1)).attr('x2', x(1)).attr('y1', 0).attr('y2', y + SEED_DY + SEED_LEN + 2);
+    if (lo !== null && hi !== null && lo !== hi) { svg.append('line').attr('class', 'ivl ' + cls).attr('x1', x(lo)).attr('x2', x(hi)).attr('y1', y).attr('y2', y); cap(svg, cls, x(lo), y); cap(svg, cls, x(hi), y); }
+    for (const v of seeds) svg.append('line').attr('class', 'seed').attr('x1', x(v)).attr('x2', x(v)).attr('y1', y + SEED_DY).attr('y2', y + SEED_DY + SEED_LEN);
+    svg.append('line').attr('class', 'mt ' + cls).attr('x1', x(mean)).attr('x2', x(mean)).attr('y1', y - TICK_H / 2).attr('y2', y + TICK_H / 2);
+    const [k, suffix] = ratio ? [1, ''] : unitScale(unit, mean || b);
+    const xs = d3.scaleLinear().domain([d0 / k, d1 / k]);
+    let ticks = xs.ticks(ZOOM_TICKS);
+    if (!ratio && k === 1 && INTEGER_UNITS.has(unit)) ticks = ticks.filter(Number.isInteger);
+    const tf = xs.tickFormat(ZOOM_TICKS), used = [], ty = ZOOM_H - 3;
+    ticks.forEach((t, i) => {
+      const s = (ratio ? '×' : '') + tf(t) + (i === ticks.length - 1 && suffix ? (suffix === '%' ? NBSP + '%' : ' ' + suffix) : ''), w = textW(s, 't-cap');
+      const x0 = Math.max(0, Math.min(width - w, x(t * k) - w / 2));
+      if (used.some(([p, q]) => x0 < q + 6 && x0 + w > p - 6)) return;
+      used.push([x0, x0 + w]); svg.append('text').attr('class', 't-cap sub').attr('x', x0).attr('y', ty).text(s);
+    });
+    const caption = !band ? null : band[1] > d0 && band[0] < d1 ? `Shaded: the ${bandText} tie band.` : `×1 and the ${bandText} tie band are off this scale, to the ${band[0] >= d1 ? 'right' : 'left'}.`;
+    return el('div', { class: 'zoom' }, el('div', { class: 't-cap muted' }, label), svg.node(), caption ? el('div', { class: 't-cap muted' }, caption) : null);
+  };
+
+  const zooms = (m, c, width) => {
+    const unit = m.metric.unit, st = stateOf(m, c);
+    const seeds = (arm) => (m.seedVals.get(arm + '|' + c.regime + '|' + c.metric) || []).map((s) => toNum(s.value));
+    const side = (label, mean, lo, hi, arm, cls, zero) => (zero ? el('p', { class: 'note t-cap' }, `${label}: 0 in every seed.`) : zoomRow({ width, label, mean, lo, hi, seeds: seeds(arm), cls, unit }));
+    const out = [el('h3', { class: 't-cap muted' }, 'This cell to scale, each line on its own axis'),
+      side(armShort(m, m.arm), c.mean, c.cri_lo, c.cri_hi, c.arm, st, c.zero_all), side('main', c.main_mean, c.main_lo, c.main_hi, BASELINE_ARM, 'tie', c.main_zero_all)];
+    const sr = (m.seedRatios.get(c.arm + '|' + c.regime + '|' + c.metric) || []).map((s) => s.ratio);
+    if (c.kind === 'ratio' && c.ratio > 0 && ((c.ratio_lo !== null && !c.exact) || sr.length >= MIN_SEEDS)) out.push(zoomRow({ width, label: 'paired ratio, arm ÷ main', mean: c.ratio, lo: c.ratio_lo, hi: c.ratio_hi, seeds: sr, cls: st, band: [1 / (1 + m.rope), 1 + m.rope], bandText: ropeText(m) }));
+    return out;
+  };
+
+  /* ---------- Supertable: every arm, every metric, every regime ---------- */
+  const drawSuper = (m, fk) => {
+    const host = $('g3-super'), arms = m.arms, regimes = m.regimes;
+    const gi = (j) => m.groups.indexOf(regimes[j].group);
+    const gaps = (m.groups.length - 1) * ST_GROUP_GAP;
+    const yOf = (l) => ST_PAD + (ST_DEC - Math.max(-ST_DEC, Math.min(ST_DEC, l))) / (2 * ST_DEC) * (ST_H - 2 * ST_PAD);
+    // metrics with no arm-to-main comparison yet go to one line under the table
+    const measured = m.metrics.filter((x) => m.regimes.some((g) => m.hasData(g.regime, x.metric)));
+    $('g3-super-none').replaceChildren(...(measured.length < m.metrics.length ? [el('b', {}, 'No arm can be compared with main yet on: '), m.metrics.filter((x) => !measured.includes(x)).map((x) => x.short).join(', ') + '.'] : []));
+    const fams = d3.groups(measured, (x) => x.group), widest = d3.max(fams, ([, l]) => l.length);
+    const range = new Map(m.get('main_range').map((r) => [r.metric, r]));
+    const nameW = Math.ceil(d3.max(arms, (a) => textW(rowName(m, a), 't-body', a.arm === m.arm.arm ? 600 : null))) + LABEL_PAD;
+    const keyTicks = [[ST_DEC, fmtDec(ST_DEC)], [0, '×1 = main'], [-ST_DEC, fmtDec(-ST_DEC)]];
+    const keyTickW = d3.max(keyTicks, ([, t]) => textW(t, 't-cap'));
+    // strip geometry for a slot width; the key is scaled until every group's name fits under its slots on one line
+    const geom = (slot) => {
+      const slotX = (j) => ST_PAD + j * slot + gi(j) * ST_GROUP_GAP + slot / 2;
+      const stripW = 2 * ST_PAD + regimes.length * slot + gaps;
+      const spans = m.groups.map((grp) => { const js = regimes.map((r, j) => j).filter((j) => regimes[j].group === grp); return { grp, a: slotX(js[0]) - slot / 2, b: slotX(js[js.length - 1]) + slot / 2 }; });
+      const K = Math.max(ST_KEY_SCALE, d3.max(spans, (sp) => (textW(sp.grp.toLowerCase(), 't-cap') + 4) / (sp.b - sp.a)));
+      const keyW = Math.ceil(stripW * K + 6 + keyTickW);
+      return { slot, slotX, stripW, pitch: stripW + ST_COL_GAP, spans, K, keyW };
+    };
+    const desk = geom(ST_SLOT);
+    const phone = Math.floor((m.W - nameW + ST_COL_GAP) / desk.pitch) < widest;
+    // on the phone the slots grow to share the full width between the widest family's strips
+    const labelW = nameW;
+    const { slotX, stripW, pitch, spans, K, keyW } = phone ? geom(Math.max(ST_SLOT, Math.floor(((m.W + ST_COL_GAP) / widest - ST_COL_GAP - 2 * ST_PAD - gaps) / regimes.length))) : desk;
+    const cap = Math.floor((m.W - labelW + ST_COL_GAP) / pitch);
+    const famPick = $('g3-fam');
+    $('g3-super-note').replaceChildren(el('b', {}, `Showing ${VARIANT_PHRASE[m.variant]}. `), `Each strip holds one arm on one metric across every regime, in fixed slots (${m.groups.join(' · ')}, as the key shows); a blank slot has no runs yet. Height is the ratio to main on a log scale from `, fmtDec(-ST_DEC), ' to ', fmtDec(ST_DEC), ' (clamped beyond); the hairline is main. Same marks as the hub. At this scale an interval shows only where it is taller than its mark, as a vertical line; most are not. Choose a strip to open that metric and arm in the hub, where intervals are drawn to scale.');
+    $('g3-super-key').replaceChildren(...STATES.map((st) => el('span', {}, keySvg((g) => glyph(g, st, 7, 7, KEY_GLYPH)), KEY_WORD[st])));
+    let bands;
+    if (phone) {
+      const fam = fams.find(([f]) => f === m.params.fam) || fams[0];
+      famPick.hidden = false;
+      famPick.replaceChildren(...fams.map(([f]) => pill(f, f === fam[0], 'fam|' + f, () => dash.setParams({ fam: f }))));
+      bands = [fam[1]];
+    } else {
+      famPick.hidden = true; famPick.replaceChildren();
+      // Whole families per band, in order, balanced across as few bands as fit.
+      const count = fams.reduce((acc, [, list]) => { const last = acc[acc.length - 1]; if (last + list.length > cap) acc.push(list.length); else acc[acc.length - 1] = last + list.length; return acc; }, [0]).length;
+      const target = Math.ceil(measured.length / count);
+      bands = [[]];
+      for (const [, list] of fams) { const cur = bands[bands.length - 1]; if (cur.length && (cur.length + list.length > cap || cur.length >= target)) bands.push([]); bands[bands.length - 1].push(...list); }
+    }
+    const lx = phone ? 0 : labelW;
+    // one strip's marks at scale k (1 in the table, K in the key)
+    const stripMarks = (g, cs, k) => {
+      g.append('line').attr('class', 'ref').attr('x1', 0).attr('x2', stripW * k).attr('y1', yOf(0) * k).attr('y2', yOf(0) * k);
+      cs.forEach((c, j) => {
+        const st = stateOf(m, c); if (!STATES.includes(st)) return;
+        const cx = slotX(j) * k, l = c.kind === 'zero' ? -ST_DEC : c.kind === 'mainzero' ? ST_DEC : Math.log10(c.ratio);
+        if (c.ratio_lo !== null && c.ratio_hi !== null && !c.exact && yOf(Math.log10(c.ratio_lo)) - yOf(Math.log10(c.ratio_hi)) > Math.sqrt(ST_GLYPH) * 1.4) g.append('line').attr('class', 'cap ' + st).attr('x1', cx).attr('x2', cx).attr('y1', yOf(Math.log10(c.ratio_lo)) * k).attr('y2', yOf(Math.log10(c.ratio_hi)) * k);
+        glyph(g, st, cx, yOf(l) * k, ST_GLYPH * k);
+      });
+    };
+    const keyH = Math.ceil(ST_H * K) + 2 * LINE_H + 14;
+    // the key is a real strip, the selected arm on the selected metric, enlarged and annotated
+    const drawKeyStrip = (svg, x0, y0) => {
+      const g = svg.append('g').attr('transform', `translate(${x0},${y0})`).attr('aria-hidden', 'true');
+      stripMarks(g, regimes.map((r) => m.cellOf(m.arm.arm, r.regime, m.metric.metric)), K);
+      for (const [l, t] of keyTicks) g.append('text').attr('class', 't-cap mut').attr('x', stripW * K + 4).attr('y', yOf(l) * K + 4).text(t);
+      g.append('text').attr('class', 't-cap mut').attr('x', 0).attr('y', ST_H * K + 3 + 2 * LINE_H).text(`Key: ${armTitle(m, m.arm)}, ${m.metric.short}, enlarged`);
+      for (const sp of spans) {
+        const xa = sp.a * K + 1, xb = sp.b * K - 1;
+        g.append('line').attr('class', 'rule').attr('x1', xa).attr('x2', xb).attr('y1', ST_H * K + 3).attr('y2', ST_H * K + 3);
+        g.append('text').attr('class', 't-cap mut').attr('x', (xa + xb) / 2).attr('y', ST_H * K + 3 + LINE_H).attr('text-anchor', 'middle').text(sp.grp.toLowerCase());
+      }
+    };
+    host.replaceChildren();
+    const activeKey = fk?.startsWith('st|') ? fk : `st|${m.arm.arm}|${m.metric.metric}`;
+    bands.forEach((band, b) => {
+      const colX = (k) => lx + k * pitch;
+      const names = band.map((x) => wrap(x.short, stripW, 't-cap')), ranges = band.map((x) => { const r = range.get(x.metric); if (!r) return []; const f = fmtVal(x.unit); const [a, z] = fmtRange(x.unit, r.lo, r.hi), one = r.regimes > 1 ? `main ${a}–${z}` : `main ${f(r.lo)}`; return textW(one, 't-cap') <= stripW || r.regimes < 2 ? [one] : [`main ${a}–`, z]; });
+      const nl = d3.max(names, (l) => l.length), rl = d3.max(ranges, (l) => l.length) || 0;
+      const headH = GROUP_H + nl * LINE_H + rl * LINE_H + 8;
+      if (b === 0) drawKeyStrip(d3.select(host).append('svg').attr('width', keyW).attr('height', keyH), 0, 2);
+      const rowH = (phone ? LINE_H + 2 : 0) + ST_H + ST_ROW_GAP;
+      const lay = rowLayout(arms, headH, rowH, ST_FAM_H);
+      const W = lx + band.length * pitch - ST_COL_GAP, H = lay.bottom;
+      const svg = d3.select(host).append('div').attr('class', 'scroll').append('svg').attr('class', 'small').attr('width', W).attr('height', H).attr('role', 'grid').attr('aria-label', `Ratio to main per regime for ${band.map((x) => x.short).join(', ')}`).style('margin-top', b ? '18px' : null);
+      // column headers
+      d3.groups(band.map((x, k) => ({ x, k })), (d) => d.x.group).forEach(([f, list]) => {
+        const x0 = colX(list[0].k), x1 = colX(list[list.length - 1].k) + stripW;
+        svg.append('text').attr('class', 't-head').attr('x', x0).attr('y', GROUP_H - 7).text(f.toUpperCase());
+        svg.append('line').attr('class', 'rule').attr('x1', x0).attr('x2', x1).attr('y1', GROUP_H - 3).attr('y2', GROUP_H - 3);
+      });
+      const headRow = svg.append('g').attr('role', 'row');
+      band.forEach((x, k) => {
+        const x0 = colX(k), on = x.metric === m.metric.metric;
+        if (on) svg.insert('rect', ':first-child').attr('class', 'hl').attr('x', x0 - 4).attr('y', GROUP_H).attr('width', stripW + 8).attr('height', H - GROUP_H);
+        const hd = headRow.append('g').attr('class', 'hdr').attr('role', 'columnheader').attr('tabindex', 0).attr('data-fk', 'sth|' + x.metric).attr('aria-label', `${x.label}: open in the hub`)
+          .on('click', () => dash.setParams({ metric: x.metric })).on('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); dash.setParams({ metric: x.metric }); } });
+        hd.append('title').text(x.definition);
+        hd.append('rect').attr('class', 'focus').attr('x', x0 - 3).attr('y', GROUP_H).attr('width', stripW + 6).attr('height', Math.max(MIN_TARGET, nl * LINE_H + 4)).attr('rx', 3);
+        names[k].forEach((t, i) => hd.append('text').attr('class', 't-cap').attr('font-weight', on ? 600 : 500).attr('text-decoration', on ? 'underline' : null).attr('x', x0).attr('y', GROUP_H + (i + 1) * LINE_H - 2).text(t));
+        ranges[k].forEach((t, i) => mk(svg.append('text').attr('class', 't-cap mut').attr('x', x0).attr('y', GROUP_H + (nl + i + 1) * LINE_H).text(t), 'main_range', 'lo hi', where({ metric: x.metric })));
+      });
+      // rows
+      for (const f of lay.fams) svg.append('text').attr('class', 't-head').attr('x', 0).attr('y', f.y + ST_FAM_H - 4).text(f.family.toUpperCase());
+      arms.forEach((a) => {
+        const y0 = lay.ys.get(a.arm), sy = y0 + (phone ? LINE_H + 2 : 0), sel = a.arm === m.arm.arm;
+        if (sel) svg.insert('rect', ':first-child').attr('class', 'hl').attr('x', 0).attr('y', y0 - 2).attr('width', W).attr('height', rowH - ST_ROW_GAP + 4);
+        const nt = svg.append('text').attr('class', 't-body' + (a.arm === REFERENCE_ARM ? ' mut' : '')).attr('font-weight', sel ? 600 : null);
+        const name = rowName(m, a), sub = rowSub(m, a);
+        nt.attr('data-arm', a.arm);
+        if (phone) nt.attr('x', 0).attr('y', y0 + LINE_H - 2).text(name); else nt.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + (sub ? SUB_NAME_DY : 4)).attr('text-anchor', 'end').text(name);
+        if (sub) {
+          const st = svg.append('text').attr('class', 't-note sub').text(sub);
+          if (phone) st.attr('x', textW(name, 't-body', sel ? 600 : null) + 6).attr('y', y0 + LINE_H - 2); else st.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + SUB_DY).attr('text-anchor', 'end');
+        }
+        if (!m.sol(a)) { lackingNote(svg, m.reason(a), lx, sy + ST_H / 2, W - lx); return; }
+        const row = svg.append('g').attr('role', 'row');
+        band.forEach((x, k) => {
+          const x0 = colX(k), key = `st|${a.arm}|${x.metric}`;
+          const cs = regimes.map((g) => m.cellOf(a.arm, g.regime, x.metric));
+          const count = (s) => cs.filter((c) => stateOf(m, c) === s).length, measured = cs.filter((c) => c && c.kind !== 'na').length;
+          const g = row.append('g').attr('class', 'cell').attr('role', 'gridcell').attr('data-rc', `${m.contenders.indexOf(a)},${k}`).attr('data-fk', key).attr('data-arm', a.arm).attr('data-metric', x.metric)
+            .attr('tabindex', key === activeKey ? 0 : -1)
+            .attr('aria-label', `${armTitle(m, a)}, ${x.short}: ${measured ? `better in ${count('better')}, worse in ${count('worse')}, tie in ${count('tie')}, not settled in ${count('open')}, one seed in ${count('one')} of ${measured} regimes` : 'no results yet'}`);
+          g.append('rect').attr('class', 'focus').attr('x', x0 - 3).attr('y', sy - 2).attr('width', stripW + 6).attr('height', ST_H + 4).attr('rx', 3);
+          stripMarks(g.append('g').attr('transform', `translate(${x0},${sy})`), cs, 1);
+          g.on('click', () => { dash.setParams({ metric: x.metric, arm: a.arm }); $('g3-hub-sec').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        });
+      });
+      // one tab stop per band: the active strip if it is here, else the band's first strip
+      if (!svg.select('.cell[tabindex="0"]').size()) svg.select('.cell').attr('tabindex', 0);
+      rovingGrid(svg.node(), (node) => { dash.setParams({ metric: node.dataset.metric, arm: node.dataset.arm }); $('g3-hub-sec').scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+    });
+  };
+
+  /* ---------- Trade-off plane ---------- */
+  const overlaps = (a, b) => a.x0 < b.x1 + LABEL_SPACE && a.x1 + LABEL_SPACE > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+  const planeGeom = (pts, w, h, dom, opts) => {
+    const tickW = d3.max(dom.y.ticks, (t) => textW(fmtLogTick(t), 't-cap')) ?? 0;
+    const lanes = { x0: pts.some((p) => p.bx.kind === 'zero'), xi: pts.some((p) => p.bx.kind === 'mainzero'), y0: pts.some((p) => p.by.kind === 'zero'), yi: pts.some((p) => p.by.kind === 'mainzero') };
+    const L = Math.ceil(tickW) + 8, R = 8 + opts.gutter, T = opts.titles ? LINE_H + 8 : 6, B = LINE_H + (opts.titles ? LINE_H + 8 : 4);
+    const xr = [L + (lanes.x0 ? LANE_W + LANE_GAP : 0), w - R - (lanes.xi ? LANE_W + LANE_GAP : 0)];
+    const yr = [h - B - (lanes.y0 ? LANE_W + LANE_GAP : 0), T + (lanes.yi ? LANE_W + LANE_GAP : 0)];
+    const x = d3.scaleLinear().domain(dom.x.domain).range(xr).clamp(true);
+    const y = d3.scaleLinear().domain(dom.y.domain).range(yr).clamp(true);
+    const px = (c) => (c.kind === 'zero' ? L + LANE_W / 2 : c.kind === 'mainzero' ? w - R - LANE_W / 2 : x(Math.log10(c.ratio)));
+    const py = (c) => (c.kind === 'zero' ? h - B - LANE_W / 2 : c.kind === 'mainzero' ? T + LANE_W / 2 : y(Math.log10(c.ratio)));
+    return { L, R, T, B, w, h, x, y, px, py, lanes, plot: { x0: L, x1: w - R, y0: T, y1: h - B } };
+  };
+
+  // The crosshair's label: right of the vertical line, or left of it when that would leave the plot.
+  const mainBox = (G) => {
+    const lw = textW(MAIN_LABEL, 't-cap'), x0 = G.x(0) + 4 + lw <= G.plot.x1 ? G.x(0) + 4 : G.x(0) - 4 - lw;
+    return { x0, x1: x0 + lw, y0: G.y(0) - LINE_H - 2, y1: G.y(0) - 2 };
+  };
+
+  const drawPlanePanel = (m, host, pts, w, h, dom, opts) => {
+    const xm = opts.xm, ym = opts.ym;
+    let G = planeGeom(pts, w, h, dom, { ...opts, gutter: 0 });
+    const label = (p) => ({ w: textW(rowName(m, p.a), 't-cap', p.a.arm === m.arm.arm ? 600 : null), h: LINE_H });
+    const toLabel = opts.labels ? pts : pts.filter((p) => p.a.arm === m.arm.arm);
+    const place = (G) => {
+      const obstacles = pts.map((p) => ({ x0: G.px(p.bx) - 7, x1: G.px(p.bx) + 7, y0: G.py(p.by) - 7, y1: G.py(p.by) + 7 }));
+      if (opts.titles) obstacles.push({ x0: G.w - textW(opts.xTitle, 't-cap') - G.R, x1: G.w, y0: G.h - LINE_H - 2, y1: G.h }, { x0: 0, x1: textW(opts.yTitle, 't-cap'), y0: 0, y1: LINE_H + 4 });
+      if (opts.tintLabel) obstacles.push(opts.tintLabel(G));
+      // the crosshair, its label and every whisker are obstacles too
+      obstacles.push(mainBox(G),
+        { x0: G.x(0) - 1, x1: G.x(0) + 1, y0: G.plot.y0, y1: G.plot.y1 }, { x0: G.plot.x0, x1: G.plot.x1, y0: G.y(0) - 1, y1: G.y(0) + 1 });
+      for (const p of pts) {
+        const X = G.px(p.bx), Y = G.py(p.by);
+        if (p.bx.ratio_lo !== null && !p.bx.exact) obstacles.push({ x0: G.x(Math.log10(p.bx.ratio_lo)), x1: G.x(Math.log10(p.bx.ratio_hi)), y0: Y - 1, y1: Y + 1 });
+        if (p.by.ratio_lo !== null && !p.by.exact) obstacles.push({ x0: X - 1, x1: X + 1, y0: G.y(Math.log10(p.by.ratio_hi)), y1: G.y(Math.log10(p.by.ratio_lo)) });
+      }
+      const placed = [], miss = [];
+      for (const p of toLabel) {
+        const { w: lw, h: lh } = label(p), X = G.px(p.bx), Y = G.py(p.by);
+        // Eight spots hugging the mark, then eight further out that take a leader line.
+        const ring = (r, leader) => [[r, -lh / 2], [-r - lw, -lh / 2], [-lw / 2, -r - lh], [-lw / 2, r], [r - 3, -r - lh + 3], [r - 3, r - 3], [-r - lw + 3, -r - lh + 3], [-r - lw + 3, r - 3]]
+          .map(([dx, dy]) => ({ x0: X + dx, y0: Y + dy, x1: X + dx + lw, y1: Y + dy + lh, leader }));
+        const box = [...ring(LABEL_NEAR, false), ...ring(LABEL_FAR, true)]
+          .find((bx) => bx.x0 >= G.plot.x0 && bx.x1 <= G.plot.x1 && bx.y0 >= 0 && bx.y1 <= G.plot.y1 && !obstacles.some((o) => overlaps(bx, o)) && !placed.some((q) => overlaps(bx, q.box)));
+        if (box) { placed.push({ p, box }); if (box.leader) obstacles.push(box); } else miss.push(p);
+      }
+      return { placed, miss };
+    };
+    let lab = place(G);
+    // sized for the widest label, since the relaid plot can miss different ones
+    const gutter = lab.miss.length ? Math.ceil(d3.max(toLabel, (p) => label(p).w)) + LEADER_GUTTER : 0;
+    // a gutter for the leftovers only when it leaves the plot most of the width; otherwise they are named below
+    if (gutter && gutter <= w * GUTTER_MAX_FRAC) { G = planeGeom(pts, w, h, dom, { ...opts, gutter }); lab = place(G); }
+    const gutterOn = G.R > 8;
+    const svg = d3.select(host).append('svg').attr('width', w).attr('height', h).attr('role', 'img').attr('aria-label', opts.aria);
+    // quadrant tint only when some arm is cheaper and more accurate
+    const tintArea = Math.max(0, G.x(0) - G.plot.x0) * Math.max(0, G.plot.y1 - G.y(0)), plotArea = (G.plot.x1 - G.plot.x0) * (G.plot.y1 - G.plot.y0);
+    const ll = tintArea <= plotArea * TINT_MAX_FRAC && pts.some((p) => p.bx.ratio !== null && p.by.ratio !== null && p.bx.ratio < 1 && p.by.ratio < 1);
+    if (ll) svg.append('rect').attr('x', G.plot.x0).attr('y', G.y(0)).attr('width', Math.max(0, G.x(0) - G.plot.x0)).attr('height', Math.max(0, G.plot.y1 - G.y(0))).attr('fill', 'var(--color-ok)').attr('fill-opacity', 0.06);
+    if (ll && opts.tintLabel) { const b = opts.tintLabel(G); svg.append('text').attr('class', 't-cap mut').attr('x', b.x0).attr('y', b.y1 - 3).text('cheaper and more accurate than main'); }
+    for (const e of dom.x.ticks) svg.append('line').attr('class', e ? 'grid' : 'ref').attr('x1', G.x(e)).attr('x2', G.x(e)).attr('y1', G.plot.y0).attr('y2', G.plot.y1);
+    for (const e of dom.y.ticks) svg.append('line').attr('class', e ? 'grid' : 'ref').attr('x1', G.plot.x0).attr('x2', G.plot.x1).attr('y1', G.y(e)).attr('y2', G.y(e));
+    svg.append('text').attr('class', 't-cap mut halo').attr('x', mainBox(G).x0).attr('y', G.y(0) - 4).text(MAIN_LABEL);
+    const xt = [], yt = [];
+    for (const e of dom.x.ticks) { const s = fmtLogTick(e), tw = textW(s, 't-cap'), x0 = G.x(e) - tw / 2; if (xt.some(([a, b]) => x0 < b + 6 && x0 + tw > a - 6)) continue; xt.push([x0, x0 + tw]); svg.append('text').attr('class', 't-cap mut').attr('x', G.x(e)).attr('y', G.plot.y1 + LINE_H).attr('text-anchor', 'middle').text(s); }
+    for (const e of dom.y.ticks) { const yy = G.y(e); if (yt.some((v) => Math.abs(v - yy) < LINE_H)) continue; yt.push(yy); svg.append('text').attr('class', 't-cap mut').attr('x', G.L - 6).attr('y', yy + 4).attr('text-anchor', 'end').text(fmtLogTick(e)); }
+    if (G.lanes.x0) svg.append('text').attr('class', 't-cap mut').attr('x', G.L + LANE_W / 2).attr('y', G.plot.y1 + LINE_H).attr('text-anchor', 'middle').text('0');
+    if (G.lanes.xi) svg.append('text').attr('class', 't-cap mut').attr('x', G.w - G.R - LANE_W / 2).attr('y', G.plot.y1 + LINE_H).attr('text-anchor', 'middle').text('∞');
+    if (G.lanes.y0) svg.append('text').attr('class', 't-cap mut').attr('x', G.L - 6).attr('y', G.plot.y1 - LANE_W / 2 + 4).attr('text-anchor', 'end').text('0');
+    if (G.lanes.yi) svg.append('text').attr('class', 't-cap mut').attr('x', G.L - 6).attr('y', G.T + LANE_W / 2 + 4).attr('text-anchor', 'end').text('∞');
+    if (opts.titles) {
+      svg.append('text').attr('class', 't-cap').attr('x', G.w - G.R).attr('y', G.h - 3).attr('text-anchor', 'end').text(opts.xTitle);
+      svg.append('text').attr('class', 't-cap').attr('x', 0).attr('y', LINE_H - 2).text(opts.yTitle);
+    }
+    const nodes = new Map();
+    for (const p of pts) {
+      const X = G.px(p.bx), Y = G.py(p.by), sx = stateOf(m, p.bx), sy = stateOf(m, p.by);
+      const g = svg.append('g').attr('data-arm', p.a.arm);
+      if (p.bx.ratio_lo !== null && !p.bx.exact) g.append('line').attr('class', 'cap ' + sx).attr('x1', G.x(Math.log10(p.bx.ratio_lo))).attr('x2', G.x(Math.log10(p.bx.ratio_hi))).attr('y1', Y).attr('y2', Y);
+      if (p.by.ratio_lo !== null && !p.by.exact) g.append('line').attr('class', 'cap ' + sy).attr('x1', X).attr('x2', X).attr('y1', G.y(Math.log10(p.by.ratio_lo))).attr('y2', G.y(Math.log10(p.by.ratio_hi)));
+      const shape = d3.symbol(PLANE_SHAPE[sx], opts.glyph)(), at = `translate(${X},${Y})${sx === 'better' ? ' rotate(180)' : ''}`;
+      g.append('path').attr('class', 'gh').attr('d', shape).attr('transform', at);
+      g.append('path').attr('class', 'pf ' + sy).attr('d', shape).attr('transform', at);
+      if (p.a.arm === m.arm.arm) g.append('circle').attr('class', 'ring').attr('cx', X).attr('cy', Y).attr('r', Math.sqrt(opts.glyph) * 0.9);
+      nodes.set(p, { X, Y, g });
+    }
+    for (const { p, box } of lab.placed) {
+      const { X, Y, g } = nodes.get(p);
+      if (box.leader) {
+        const tx = Math.max(box.x0, Math.min(box.x1, X)), ty = Math.max(box.y0, Math.min(box.y1, Y)), d = Math.hypot(tx - X, ty - Y) || 1, r0 = Math.sqrt(opts.glyph) * 0.7;
+        g.append('line').attr('class', 'leader').attr('x1', X + (tx - X) / d * r0).attr('y1', Y + (ty - Y) / d * r0).attr('x2', tx).attr('y2', ty);
+      }
+      g.append('text').attr('class', 't-cap halo').attr('font-weight', p.a.arm === m.arm.arm ? 600 : null).attr('x', box.x0).attr('y', box.y0 + LINE_H - 3).text(rowName(m, p.a));
+    }
+    let gy = -Infinity;
+    for (const p of (gutterOn ? lab.miss : []).slice().sort((a, b) => nodes.get(a).Y - nodes.get(b).Y)) {
+      const { X, Y, g } = nodes.get(p), lx = G.plot.x1 + LEADER_GUTTER - 4, ly = Math.max(Y, gy + LINE_H);
+      gy = ly;
+      g.append('line').attr('class', 'leader').attr('x1', X + 6).attr('y1', Y).attr('x2', lx - 3).attr('y2', ly);
+      g.append('text').attr('class', 't-cap halo').attr('font-weight', p.a.arm === m.arm.arm ? 600 : null).attr('x', lx).attr('y', ly + 4).text(rowName(m, p.a));
+    }
+    // hover and tap through a Delaunay of the points
+    const delaunay = d3.Delaunay.from(pts, (p) => nodes.get(p).X, (p) => nodes.get(p).Y);
+    const near = (e) => { const [qx, qy] = d3.pointer(e); const i = delaunay.find(qx, qy); const p = pts[i]; return p && Math.hypot(nodes.get(p).X - qx, nodes.get(p).Y - qy) <= HOVER_R ? p : null; };
+    svg.append('rect').attr('width', w).attr('height', h).attr('fill', 'transparent')
+      .on('pointermove', (e) => {
+        const p = near(e);
+        for (const [q, n] of nodes) n.g.classed('dim', !!p && q !== p);
+        if (!p) return hideTip();
+        const r = svg.node().getBoundingClientRect(), { X, Y } = nodes.get(p);
+        showTip(new DOMRect(r.left + X - 6, r.top + Y - 6, 12, 12), `${armTitle(m, p.a)} · ${p.g.regime}`, [
+          [xm.short, ...partsNodes(fullParts(p.bx, xm.unit), p.bx), ' · ' + KEY_WORD[stateOf(m, p.bx)]],
+          [ym.short, p.by.censored ? '≥ ' : '', ...partsNodes(fullParts(p.by, ym.unit), p.by), ' · ' + KEY_WORD[stateOf(m, p.by)]],
+          ['P(fewer bytes)', val(fmtP(p.bx.p_better), 'verdicts', 'p_better', cellWhere(p.bx))],
+          ['P(lower error)', val(fmtP(p.by.p_better), 'verdicts', 'p_better', cellWhere(p.by))],
+        ]);
+      })
+      .on('pointerleave', () => { hideTip(); for (const n of nodes.values()) n.g.classed('dim', false); })
+      .on('click', (e) => { const p = near(e); if (p) dash.setParams({ arm: p.a.arm, regime: p.g.regime }); });
+    return gutterOn ? [] : lab.miss;
+  };
+
+  const drawPlane = (m) => {
+    const errs = m.metrics.filter((x) => isValid(x.error));
+    const ym = errs.find((x) => x.metric === m.params.y) || errs[0];
+    const xm = m.metrics.find((x) => x.metric === BYTES_METRIC);
+    const all = m.params.plane === 'all';
+    const pairOf = (a, g) => { const bx = m.cellOf(a.arm, g.regime, xm.metric), by = m.cellOf(a.arm, g.regime, ym.metric); return bx && by && bx.kind !== 'na' && by.kind !== 'na' ? { a, g, bx, by } : null; };
+    const withData = m.regimes.filter((g) => m.live.some((a) => pairOf(a, g)));
+    $('g3-plane-title').textContent = all ? `Bytes against ${ym.label.toLowerCase()}, regime by regime` : `Bytes against ${ym.label.toLowerCase()} in ${m.regime.regime}`;
+    $('g3-plane-note').replaceChildren(`${xm.label} (across) against ${ym.label.toLowerCase()} (up), each as a ratio to main on paired seeds, on log scales${all ? ' shared by every panel' : ''}; main sits where the reference lines cross at ×1, and lower left is cheaper and more accurate. Shape gives the bytes verdict, fill the error verdict; thin lines are each axis's `, val(levelText(m), 'study', 'credible_level'), ' credible interval.');
+    $('g3-plane-ctl').replaceChildren(
+      el('nav', { class: 'pills', 'aria-label': 'Error measure' }, pillGroup('Error', errs.map((x) => pill(x.short, x.metric === ym.metric, 'y|' + x.metric, () => dash.setParams({ y: x.metric }), x.label)))),
+      el('nav', { class: 'pills', 'aria-label': 'Regimes shown' }, pillGroup('Show', [pill('one regime', !all, 'plane|one', () => dash.setParams({ plane: 'one' })), pill('every regime', all, 'plane|all', () => dash.setParams({ plane: 'all' }))])),
+      ...(all ? [] : [el('nav', { class: 'pills', 'aria-label': 'Regime' }, ...d3.groups(withData, (g) => g.group).map(([grp, list]) => pillGroup(grp, list.map((g) => pill(g.regime, g.regime === m.regime.regime, 'pr|' + g.regime, () => dash.setParams({ regime: g.regime }), g.description)))))]));
+    const shape = (st) => keySvg((g) => g.append('path').attr('class', 'pk').attr('d', d3.symbol(PLANE_SHAPE[st], PLANE_GLYPH)()).attr('transform', `translate(7,7)${st === 'better' ? ' rotate(180)' : ''}`));
+    const fill = (st) => keySvg((g) => g.append('path').attr('class', 'pf ' + st).attr('d', d3.symbol(d3.symbolCircle, PLANE_GLYPH)()).attr('transform', 'translate(7,7)'));
+    $('g3-plane-key').replaceChildren(el('span', { class: 't-head' }, 'Bytes'), ...[['better', 'fewer'], ['worse', 'more'], ['tie', 'tie'], ['open', 'not settled'], ['one', 'one seed']].map(([st, t]) => el('span', {}, shape(st), t)),
+      el('span', { class: 't-head' }, ym.short), ...[['better', 'lower'], ['worse', 'higher'], ['tie', 'tie'], ['open', 'not settled'], ['one', 'one seed']].map(([st, t]) => el('span', {}, fill(st), t)));
+    const host = $('g3-plane'); host.replaceChildren();
+    let unlabelled = [];
+    const shown = all ? withData : withData.filter((g) => g === m.regime);
+    const pts = shown.flatMap((g) => m.live.map((a) => pairOf(a, g)).filter(Boolean));
+    const dom = { x: fitLog(pts.flatMap((p) => ratioLogs(p.bx))), y: fitLog(pts.flatMap((p) => ratioLogs(p.by))) };
+    const xTitle = `${xm.label}, ratio to main →`, yTitle = `↑ ${ym.label}, ratio to main`;
+    if (!pts.length) host.append(el('p', { class: 'fail' }, `No ${ym.short} comparisons in ${m.regime.regime} yet. ${withData.length ? 'Choose a regime above.' : ''}`));
+    else if (!all) {
+      const w = Math.min(m.W, PLANE_MAX_W), h = Math.round(Math.max(PLANE_MIN_H, Math.min(PLANE_MAX_H, w * PLANE_ASPECT)));
+      const tint = 'cheaper and more accurate than main';
+      unlabelled = drawPlanePanel(m, host, pts, w, h, dom, { xm, ym, labels: true, titles: true, xTitle, yTitle, glyph: PLANE_GLYPH, aria: `${xTitle} against ${yTitle} in ${m.regime.regime}`,
+        tintLabel: (G) => ({ x0: G.plot.x0 + 6, x1: G.plot.x0 + 10 + textW(tint, 't-cap'), y0: G.plot.y1 - LINE_H - 4, y1: G.plot.y1 - 2 }) });
+    } else {
+      const cols = Math.max(1, Math.floor((m.W + PANEL_GAP) / (PANEL_MIN_W + PANEL_GAP))), pw = Math.floor((m.W - (cols - 1) * PANEL_GAP) / cols);
+      const grid = el('div', { class: 'mult', style: `grid-template-columns:repeat(${cols}, minmax(0, 1fr))` });
+      host.append(grid);
+      for (const g of shown) {
+        const fig = el('figure', {}, el('figcaption', {}, el('button', { type: 'button', 'aria-pressed': String(g === m.regime), 'data-fk': 'panel|' + g.regime, onclick: () => dash.setParams({ regime: g.regime, plane: 'one' }) }, g.regime), el('span', { class: 't-head' }, g.group)));
+        grid.append(fig);
+        drawPlanePanel(m, fig, pts.filter((p) => p.g === g), pw, PANEL_H, dom, { xm, ym, labels: false, titles: false, glyph: PLANE_GLYPH * 0.7, aria: `${xm.short} against ${ym.short} in ${g.regime}` });
+      }
+    }
+    // the reference arm sits off the chart, said in words
+    const ref = m.reference && shown.map((g) => pairOf(m.reference, g)).filter(Boolean);
+    const worst = ref && ref.length ? d3.greatest(ref, (p) => p.by.ratio ?? -Infinity) : null;
+    $('g3-plane-edge').replaceChildren(
+      ...(unlabelled.length ? [`Too crowded to label here: ${unlabelled.map((p) => rowName(m, p.a)).join(', ')}; hover or tap a mark to name it. `] : []),
+      ...(worst ? [`${m.reference.name} is left off so it does not squash the others: it sends no bytes, and its ${ym.short} runs to `, compactNode(worst.by, ym.unit), ` of main (${worst.g.regime}).`] : []));
+  };
+
+  /* ---------- Scale beyond the study's regimes ---------- */
+  // Columns of the scale table in fixed order: field in scale.json, header, unit (bytes are per pod per second).
+  const SCALE_COLS = [
+    ['conv_p50_incl_never_ms', 'Convergence p50', 'ms'], ['conv_p99_incl_never_ms', 'Convergence p99', 'ms'],
+    ['over_max_pct', 'Over-admission, worst key', '% of limit'], ['stale_limited_p99_pct', 'Staleness p99', '% of limit'],
+    ['bytes_total', 'Bytes per pod', 'bytes/s'], ['cross_az_bytes', 'Cross-zone bytes per pod', 'bytes/s'], ['drop_rcvbuf_pkts', 'Receive-buffer drops', 'datagrams'],
+  ];
+  const SCALE_KIND = [['full', 'Full runs with a burst on one site (80 s; edge-pop 40 s): mean over seeds, with its credible interval where there are several'], ['probe', '12 s probes without the burst, one seed each: compare within this group']];
+  const scaleFmt = (unit) => (v) => (unit === 'bytes/s' ? fmtBytes(v) + '/s' : fmtVal(unit)(v));
+  const drawScale = (m) => {
+    const rows = [...dash.data('scale').data].sort((a, b) => toNum(a.order) - toNum(b.order));
+    const at = (kind, c) => rows.find((r) => r.kind === kind && r.case === c);
+    const w = (r) => where({ kind: r.kind, case: r.case });
+    const cell = (r, [k, , unit]) => {
+      const v = toNum(r[k]), lo = toNum(r[k + '_lo']), hi = toNum(r[k + '_hi']), f = scaleFmt(unit);
+      if (v === null) return el('td', { class: 'num' }, '—');
+      return el('td', { class: 'num' }, val(f(v), 'scale', k, w(r)), lo !== null && hi !== null ? el('span', { class: 'tag' }, val(`[${f(lo)}, ${f(hi)}]`, 'scale', `${k}_lo ${k}_hi`, w(r))) : null);
+    };
+    const head = el('tr', {}, el('th', {}, 'Regime'), el('th', { class: 'num' }, 'Pods'), el('th', { class: 'num' }, 'Counted req/s'), el('th', { class: 'num' }, 'Req/s per pod'), el('th', { class: 'num' }, 'Seeds'), ...SCALE_COLS.map(([, h]) => el('th', { class: 'num' }, h)));
+    const body = SCALE_KIND.flatMap(([kind, label]) => {
+      const list = rows.filter((r) => r.kind === kind);
+      return list.length ? [el('tr', { class: 'grp' }, el('th', { colspan: String(5 + SCALE_COLS.length), class: 't-cap' }, el('span', {}, label))),
+        ...list.map((r) => el('tr', {}, el('th', { title: r.description }, r.case, el('span', { class: 'tag' }, r.description)),
+          el('td', { class: 'num' }, val(d3.format(',')(r.pods), 'scale', 'pods', w(r))),
+          el('td', { class: 'num' }, val(d3.format(',.0f')(r.counted_rps), 'scale', 'counted_rps', w(r))),
+          el('td', { class: 'num' }, d3.format(',.3~r')(r.counted_rps / r.pods)),
+          el('td', { class: 'num' }, val(String(r.seeds), 'scale', 'seeds', w(r))),
+          ...SCALE_COLS.map((c) => cell(r, c))))] : [];
+    });
+    $('g3-scale').replaceChildren(el('table', { class: 'tbl scale' }, el('thead', {}, head), el('tbody', {}, ...body)));
+    const ms = scaleFmt('ms'), pct = scaleFmt('% of limit');
+    const v = (r, k) => (r && toNum(r[k]) !== null ? val(k.endsWith('_ms') ? ms(r[k]) : k.endsWith('_pct') ? pct(r[k]) : scaleFmt('bytes/s')(r[k]), 'scale', k, w(r)) : '—');
+    const p183 = at('probe', 'pods-183'), p1k = at('probe', 'pods-1k'), p2k = at('probe', 'pods-2k'), fPeak = at('full', 'prod-peak'), f1k = at('full', 'pods-1k');
+    const e208 = at('probe', 'edge-pop'), e8 = at('probe', 'edge-pop-8m'), eFull = at('full', 'edge-pop');
+    const pps = (r) => (r ? d3.format(',.3~s')(r.pkts_per_pod_s).replace('k', 'k') + ' datagrams/s' : '—');
+    $('g3-scale-note').replaceChildren(
+      'The design the study picked (imp-az-hier-nopk) run past the 300-pod autoscaler maximum, with sizes set for each regime. ',
+      el('b', {}, 'More pods, same traffic: '), 'prod-peak\'s cluster load spread over more pods slows convergence (p50 ', v(p183, 'conv_p50_incl_never_ms'), ' at 183 pods, ', v(p1k, 'conv_p50_incl_never_ms'), ' at 1,000, ', v(p2k, 'conv_p50_incl_never_ms'),
+      ' at 2,000) and raises over-admission under the burst (', v(fPeak, 'over_max_pct'), ' of the limit at prod-peak, ', v(f1k, 'over_max_pct'), ' at 1,000 pods). Each pod then sees under two counted requests a second, its flush threshold sits at its floor of one, and a lone hit waits for the next one or for the 500 ms heartbeat. ',
+      'Bytes per pod grow only slowly and cross-zone bytes per pod fall, so the zone hierarchy holds. ',
+      el('b', {}, 'Edge PoP: '), '60 pods taking 60,000 counted req/s is metastable. Each pod receives about ', pps(e8), ', some 60 % of the receive model\'s capacity (about 184k datagrams/s at this datagram size). With 8 MiB receive buffers a 12 s probe stayed accurate (p99 ', v(e8, 'conv_p99_incl_never_ms'), '), but the 40 s run tipped into a drop-and-repair loop: ', pps(eFull), ' per pod, p99 ', v(eFull, 'conv_p99_incl_never_ms'), ', over-admission ', v(eFull, 'over_max_pct'),
+      ' of the limit. With the kernel\'s 208 KiB default even the probe collapsed (p99 ', v(e208, 'conv_p99_incl_never_ms'), '). A bigger buffer delays the collapse, it does not prevent it; whether the burst set it off is not known, since the runs keep no time series.');
+    $('g3-scale-foot').textContent = `In brackets: ${m.study.credible_level * 100} % credible intervals over seeds. Bytes are per pod per second of the measured window. On a phone, scroll the table sideways. Not run: a global edge network (not simulable on one host); 1,000 pods at four times prod-peak\'s load (over 28 GB of memory); the 2,000-pod full run and owner aggregation at these sizes, stopped once the probes and three 1,000-pod seeds had settled the trend.`;
+  };
+
+  /* ---------- Method and definitions ---------- */
+  const drawMethod = (m) => {
+    const lvl = () => val(levelText(m), 'study', 'credible_level'), need = () => val(String(m.study.min_seeds), 'study', 'min_seeds');
+    const p = (...k) => el('p', { class: 'note' }, ...k);
+    $('g3-method-body').replaceChildren(
+      p(el('b', {}, 'Verdicts. '), 'Each arm is compared with main on paired seeds: same seed, same traffic, only the dissemination code differs. The judge gives a ', lvl(), ` credible interval for the geometric-mean ratio arm ÷ main. With tie band r (now ${ropeText(m)}), a cell is better when the whole interval lies below 1/(1 + r), worse when it lies above 1 + r, a tie when it lies inside [1/(1 + r), 1 + r], and not settled otherwise. P(better) is the posterior probability that the arm beats main.`),
+      p(el('b', {}, 'Why the intervals are narrow. '), 'The simulator is deterministic given a seed, so the seed is the only source of spread, and pairing by seed cancels most of what the two arms share.'),
+      p(el('b', {}, 'Zeros. '), 'Where an arm or main is zero on some seed, the judge works on the difference arm − main instead: better when its interval lies below zero, worse when above; both zero on every seed is a tie. These cells sit in a detached 0 lane (arm zero) or ∞ lane (main zero) rather than on the log axis. Every metric is non-negative, so a displayed interval never extends below 0.'),
+      p(el('b', {}, 'Posterior. '), 'Per arm, regime and metric the judge uses a normal likelihood with a Jeffreys prior, cut at the metric\'s rounding noise; when the spread across seeds is above that noise the posterior for the mean is a Student t with n − 1 degrees of freedom. A comparison needs ', need(), ' valid seeds on both sides; with fewer, a cell shows a point and no interval and cannot settle. When every paired seed gives the same ratio, the interval collapses to it.'),
+      p(el('b', {}, 'Lower bounds. '), 'Convergence times count a hit that never converges as its remaining life. When more of an arm\'s hits never converge than lie above the quantile (more than half for p50), the quantile is one of those hits: it is drawn with ≥, and its ratio to main is a lower bound too.'),
+      p(el('b', {}, 'Order. '), `Rows keep one order everywhere, grouped by design family, and never re-sort when the metric, regime or tie band changes; rank appears only as text. ${m.reference?.name ?? 'The reference arm'} sends nothing: it is the floor for cost and the ceiling for error, and is left out of every count.`));
+  };
+  const drawStatic = (m) => {
+    $('g3-arms').replaceChildren(...d3.groups(m.arms, (a) => a.family).flatMap(([f, list]) => [el('dt', { class: 'fam t-head' }, f), ...list.flatMap((a) => [el('dt', {}, a.name), el('dd', {}, a.mechanism)])]));
+    $('g3-regs').replaceChildren(...d3.groups(m.regimes, (g) => g.group).flatMap(([grp, list]) => [el('dt', { class: 'fam t-head' }, grp), ...list.flatMap((g) => [el('dt', {}, g.regime), el('dd', {}, g.description)])]));
+  };
+
+  /* ---------- One coalesced draw ---------- */
+  const IDS = ['scale', 'posterior', 'seeds', 'runs', 'arms', 'regimes', 'metrics', 'study', 'progress', 'regime_progress', 'verdicts', 'seed_ratios', 'family_tally', 'metric_tally', 'interval_width', 'scorecard', 'main_range', 'solutions', 'self_verdicts', 'self_scorecard'];
+  let staticDone = false, raf = 0, lastW = 0, resizeTimer = 0;
+  const draw = () => {
+    raf = 0;
+    const states = IDS.map((id) => dash.data(id).status);
+    if (states.includes('error')) { $('g3-status').replaceChildren(el('span', { class: 'fail' }, 'The study data failed to load, so nothing on this page can be drawn. Reload the page; if it persists, check the dashboard\'s data sources.')); return; }
+    if (states.some((s) => s !== 'ok')) return;
+    const fk = document.activeElement?.closest?.('[data-fk]')?.dataset.fk;
+    const m = model(); m0 = m; lastW = m.W;
+    if (!staticDone) { drawStatic(m); staticDone = true; }
+    drawHeader(m); drawScore(m); drawHub(m, fk); drawSuper(m, fk); drawPlane(m); drawScale(m); drawMethod(m);
+    if (fk) { const n = root.querySelector(`[data-fk="${CSS.escape(fk)}"]`); if (n && n !== document.activeElement) n.focus({ preventScroll: true }); }
+  };
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(draw); };
+  dash.onData(schedule);
+  new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (root.clientWidth !== lastW) schedule(); }, RESIZE_DEBOUNCE_MS); }).observe(root);
+  document.fonts?.ready.then(() => { widths.clear(); schedule(); });
+  setInterval(() => { const n = $('g3-age'), a = ageSpan(); if (n && a) n.replaceChildren(a); }, AGE_REFRESH_MS);
+})();
+</script>
+</div>
+</body>
+</html>
