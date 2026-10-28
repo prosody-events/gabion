@@ -327,8 +327,8 @@ class Session:
             self.pg.goto(self.base + '/dashboard/')
             try:
                 self.pg.wait_for_selector('[data-fk="metric|bytes_total"]', timeout=25000); break
-            except Exception:
-                if attempt == 2: raise
+            except Exception as e:
+                if attempt == 2: raise RuntimeError(f'the page never drew its metric pills; seen={(self.fails + self.logs)[:3]}') from e
         self.pg.wait_for_timeout(700)
         self.pg.evaluate(f"document.documentElement.setAttribute('data-theme','{theme}')"); self.settle(300)
         self.width, self.theme = width, theme
@@ -497,8 +497,8 @@ def run_state_checks(S, vp, theme):
             rec('A1.no-page-horizontal-overflow', scope, o['overflow']['scrollWidth'] <= o['overflow']['innerWidth'], f'selector=documentElement.scrollWidth | seen={o["overflow"]["scrollWidth"]} | expected<={o["overflow"]["innerWidth"]}')
         if want('A2'):
             rec('A2.no-NaN-undefined-null-Infinity-exponent-text', scope, not o['badText'], f'selector=text/aria-label/title ({o["surfaces"]} surfaces) | seen={o["badText"][:4]} | expected=none')
-            rec('A3.no-NaN-in-svg-attributes', scope, not o['nanAttrs'], f'selector=svg * attributes | seen={o["nanAttrCount"]}: {o["nanAttrs"][:3]} | expected=0')
         if want('A3'):
+            rec('A3.no-NaN-in-svg-attributes', scope, not o['nanAttrs'], f'selector=svg * attributes | seen={o["nanAttrCount"]}: {o["nanAttrs"][:3]} | expected=0')
             rec('A3.no-text-overlap', scope, o['overlapCount'] == 0, f'selector=visible text boxes ({o["textItems"]}) | seen={o["overlapCount"]} overlaps: {o["overlaps"][:4]} | expected=0')
             rec('A3.no-clipping-by-svg-or-container', scope, o['clippedCount'] == 0, f'selector=svg marks/text, overflow:hidden ancestors | seen={o["clippedCount"]}: {o["clipped"][:3]} | expected=0')
             rec('A3.no-mark-outside-its-cell', scope, o['strayCount'] == 0, f'selector=#g3-hub-plot .cell, #g3-super .cell | seen={o["strayCount"]}: {o["strays"][:3]} | expected=0')
@@ -506,7 +506,7 @@ def run_state_checks(S, vp, theme):
             rec('A8.bayesian-wording', scope, not o['badWords'], f'selector=all text | seen={o["badWords"][:3]} | expected=none of the banned wording')
         if want('C4'):
             rec('C4.no-negative-lower-bound-in-text', scope, not o['negLower'], f'selector=all text | seen={o["negLower"][:3]} | expected=no "[-x" bound')
-        if want('A3') or want('A8') or want('A2'):
+        if any(want(p) for p in ('A2', 'A3', 'A8', 'C4')):
             tips = []
             cells = S.pg.locator('#g3-hub-plot .cell')
             n = cells.count()
@@ -1364,13 +1364,14 @@ def check_calculations(S, scope):
 def check_link(S, scope):
     """A view's URL hash restores it on load, and a control change rewrites the hash."""
     S.pg.goto(S.base + '/dashboard/#metric=conv_p99_incl_never_ms&regime=az-partition'); S.pg.reload()
-    S.pg.wait_for_selector('[data-fk="metric|conv_p99_incl_never_ms"][aria-pressed="true"]', timeout=25000)
+    S.pg.wait_for_selector('[data-fk="metric|bytes_total"]', timeout=25000)
     p = S.pg.evaluate('dash.params()')
+    pressed = S.pg.locator('[data-fk^="metric|"][aria-pressed="true"]').evaluate_all('ps => ps.map((p) => p.dataset.fk)')
     S.params(metric='bytes_total')
     h = S.pg.evaluate('location.hash')
     rec('A6.view-state-round-trips-through-the-link', scope,
-        p['metric'] == 'conv_p99_incl_never_ms' and p['regime'] == 'az-partition' and 'metric=bytes_total' in h and 'regime=az-partition' in h,
-        f'selector=location.hash | seen=params from link {p["metric"]}/{p["regime"]}, hash after a pill click {h} | expected the link restored, then metric=bytes_total beside regime=az-partition')
+        pressed == ['metric|conv_p99_incl_never_ms'] and p['metric'] == 'conv_p99_incl_never_ms' and p['regime'] == 'az-partition' and 'metric=bytes_total' in h and 'regime=az-partition' in h,
+        f'selector=location.hash | seen=params from link {p["metric"]}/{p["regime"]}, pressed {pressed}, hash after a pill click {h} | expected the link restored, then metric=bytes_total beside regime=az-partition')
 
 def shoot(S, name, params):
     for vp in VIEWPORTS:
@@ -1414,7 +1415,7 @@ def main():
                         S.params(variant=var)
                         if want('A4'):
                             safe(check_verdict_labels, S, sc); step(f'labels {var}'); safe(check_hub_table, S, sc); safe(check_scorecard, S, sc); step(f'scorecard {var}'); safe(check_main_missing, S, sc)
-                            if var == 'baseline': safe(check_progress, S, sc)
+                            if var == 'baseline': safe(check_progress, S, sc); safe(check_calculations, S, sc)
                         if want('A4') or want('C1') or want('C3') or want('C4'): safe(check_panes, S, sc); step(f'panes {var}')
                         if want('C1'): safe(check_label_c1, S, sc)
                         if want('A5'): safe(check_order, S, sc); step(f'order {var}')
@@ -1428,10 +1429,9 @@ def main():
                     step(f'400/dark {var}')
                 use_variant('baseline')
                 if want('A5'): check_rows_identical_across_variants()
-            if any(want(p) for p in ('A6', 'A7', 'A9')):
+            if any(want(p) for p in ('A5', 'A6', 'A7')):
                 S.open(1440, 'light')
                 try:
-                    if want('A4'): safe(check_calculations, S, '1440/light')
                     if want('A6'): safe(check_hover_targets, S, '1440/light')
                     if want('A6'): safe(check_interaction, S, '1440/light'); step('interaction')
                     if want('A7'): safe(check_focus_and_a11y, S, '1440/light'); safe(check_contrast, S, '1440/light'); step('a11y light')
@@ -1502,5 +1502,6 @@ def report():
     return f
 
 if __name__ == '__main__':
-    main()
+    try: main()
+    except Exception as e: rec('harness.main', 'run', False, f'harness error: {type(e).__name__}: {str(e)[:600]}')
     sys.exit(1 if report() else 0)
