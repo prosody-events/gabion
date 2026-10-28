@@ -133,7 +133,7 @@ cluster behaves under load:
   unreplicated error stays inside a per-rule error budget, while a
   cold rule simply rides the heartbeat.
 
-The full protocol, including the dirty rings, the peer frontier, the
+The full protocol, including the dirty rings, the
 math behind the budget, and the operator knobs that control them, is
 documented in
 [`crates/gabion/README.md`](crates/gabion/README.md#how-gossip-works).
@@ -199,9 +199,11 @@ regardless of which adapter they are running:
    both to send and to receive.
 
 2. **Pick a cluster id.** Every gabion process that should share
-   counters declares the same non-zero u128. This release does not
-   check the id on the frames it receives, so clusters that must stay
-   apart need separate gossip ports or networks.
+   counters declares the same non-zero u128, and a node drops gossip
+   carrying any other id, so two clusters on one network stay apart.
+   The id is a label, not a secret: isolate the gossip port with a
+   Kubernetes NetworkPolicy (or a security group outside Kubernetes)
+   that admits UDP only from gabion pods.
 
 3. **Run on Kubernetes** (see the [Kubernetes checklist](#kubernetes-checklist)). Peer discovery is built around Kubernetes
    EndpointSlices, and at present this is the only implementation the

@@ -57,10 +57,6 @@ pub(crate) const VIZ_MAX_CELLS_PER_TICK: usize = 160;
 /// drops the excess, which the logging transport reports as dropped.
 pub(crate) const VIZ_ROUTER_CAPACITY: usize = 2 * (MAX_NODES - 1);
 
-/// The count width every node uses. `u32` matches the bench and is plenty for
-/// the visualizer's hit volumes.
-type Count = u32;
-
 /// Per-(src, dst) link policy in a serde-friendly shape. Maps onto the
 /// simulator's [`LinkPolicy`].
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -225,8 +221,8 @@ struct NodeHandle {
     /// This node's gossip address, `127.0.0.1:(BASE_PORT + id)`. Cached so a
     /// removal can unbind it without recomputing.
     addr: SocketAddr,
-    client: GossipClient<Count>,
-    aggregate: Rc<EventEmittingAggregateStore<Count>>,
+    client: GossipClient,
+    aggregate: Rc<EventEmittingAggregateStore>,
     admin_tx: mpsc::Sender<AdminCommand>,
     /// Fires one gossip tick on this node (its `ManualClock`'s ticker drains
     /// the matching receiver).
@@ -344,7 +340,7 @@ impl EngineState {
         let addr = addr_of_id(id);
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
 
-        let store = CellStore::<Count>::new(self.storage, identity, &self.rules);
+        let store = CellStore::new(self.storage, identity, &self.rules);
 
         let bootstrap_peers: Vec<SocketAddr> =
             bootstrap.iter().copied().filter(|a| *a != addr).collect();
@@ -361,10 +357,7 @@ impl EngineState {
         gossip_cfg.bootstrap_peers = bootstrap_peers;
         gossip_cfg.rng_seed = self.config.rng_seed.wrapping_add(id as u64);
 
-        let aggregate = Rc::new(EventEmittingAggregateStore::<Count>::new(
-            id,
-            self.log.clone(),
-        ));
+        let aggregate = Rc::new(EventEmittingAggregateStore::new(id, self.log.clone()));
         let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
         let (clock, tick_tx) = ManualClock::new(self.now.clone());
         let (runtime, client) = GossipRuntime::from_parts_with_admin(
@@ -719,7 +712,7 @@ impl EngineState {
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
                 local_dirty_len: snap.as_ref().map_or(0, |s| s.local_dirty_len),
                 forwarded_dirty_len: snap.as_ref().map_or(0, |s| s.forwarded_dirty_len),
-                decode_reject_count: snap.as_ref().map_or(0, |s| s.decode_reject_count),
+                decode_reject_count: snap.as_ref().map_or(0, |s| s.counters.decode_rejects()),
                 store_stats: snap
                     .as_ref()
                     .map(|s| s.store_stats.into())

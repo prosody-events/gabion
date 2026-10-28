@@ -82,7 +82,7 @@ async fn run() -> anyhow::Result<()> {
          every restart so peers can tell restarts apart from new nodes.",
     );
 
-    let cell_store = CellStore::<u32>::new(config.storage, identity, &rule_table);
+    let cell_store = CellStore::new(config.storage, identity, &rule_table);
     let counts = Arc::new(Aggregate::new(&config.storage));
 
     let gossip_bind = config
@@ -111,7 +111,7 @@ async fn run() -> anyhow::Result<()> {
         "Listening for gossip from other gabion nodes.",
     );
 
-    let limiter = SharedLimiter::<u32>::new(
+    let limiter = SharedLimiter::new(
         rule_table.clone(),
         gossip_client.clone(),
         counts.clone(),

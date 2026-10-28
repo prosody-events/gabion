@@ -41,9 +41,9 @@ fn next_test_addr() -> SocketAddr {
 }
 
 struct Harness {
-    limiter: SharedLimiter<u32>,
+    limiter: SharedLimiter,
     gossip_handle: tokio::task::JoinHandle<Result<(), gabion::gossip::GossipError>>,
-    client: gabion::gossip::GossipClient<u32>,
+    client: gabion::gossip::GossipClient,
 }
 
 impl Harness {
@@ -103,7 +103,6 @@ fn validated(tune: impl FnOnce(&mut Settings)) -> (ValidGossipConfig, ValidStora
         node_dictionary_capacity: 32.try_into().unwrap(),
         local_dirty_capacity: 64.try_into().unwrap(),
         forwarded_dirty_capacity: 64.try_into().unwrap(),
-        peer_capacity: 16.try_into().unwrap(),
         rng_seed: Some(1),
         ..Settings::default()
     };
@@ -143,7 +142,7 @@ async fn harness_with(rules: Vec<Rule>, tune: impl FnOnce(&mut Settings)) -> Har
     let rule_table = Arc::new(
         RuleTable::new(rules.into_boxed_slice(), storage.rule_dictionary_capacity()).unwrap(),
     );
-    let store = CellStore::<u32>::new(storage, identity, &rule_table);
+    let store = CellStore::new(storage, identity, &rule_table);
     let counts = Arc::new(Aggregate::new(&storage));
 
     let (rt, client) = GossipRuntime::from_parts(
@@ -449,7 +448,7 @@ fn full_request_queue_allows_and_counts() {
                 SimRouter::new().bind(next_test_addr()),
                 TokioClock::from_millis(0),
                 gossip,
-                CellStore::<u32>::new(storage, NodeIdentity::new(NodeId(1), 1), &table),
+                CellStore::new(storage, NodeIdentity::new(NodeId(1), 1), &table),
                 counts.clone(),
             );
             for _ in 0..62 {

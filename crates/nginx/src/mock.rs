@@ -14,7 +14,6 @@ pub(crate) fn validated(
         node_dictionary_capacity: 32.try_into().unwrap(),
         local_dirty_capacity: 64.try_into().unwrap(),
         forwarded_dirty_capacity: 64.try_into().unwrap(),
-        peer_capacity: 16.try_into().unwrap(),
         ..Settings::default()
     };
     tune(&mut settings);

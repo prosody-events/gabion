@@ -147,8 +147,7 @@ pub struct NodeState {
     pub local_dirty_len: u32,
     /// Rows in the forwarded (received-then-re-gossiped) dirty ring.
     pub forwarded_dirty_len: u32,
-    /// Inbound packets rejected by the wire decoder (bad HMAC, truncated, or
-    /// otherwise undecodable).
+    /// Inbound packets the wire decoder dropped, for any cause.
     pub decode_reject_count: u64,
     /// CRDT store occupancy and saturation counters.
     pub store_stats: StoreStats,

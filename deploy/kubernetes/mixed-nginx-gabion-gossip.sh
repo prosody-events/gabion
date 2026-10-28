@@ -119,7 +119,6 @@ data:
       node_dictionary_capacity: 256
       local_dirty_capacity: 2048
       forwarded_dirty_capacity: 8192
-      peer_capacity: 64
       max_descriptor_count: 16
       max_descriptor_bytes: 512
       max_key_bytes: 128
@@ -133,7 +132,6 @@ data:
       tick_interval: 100ms
       fanout: 6
       max_payload_bytes: 1400
-      max_cells_per_frame: 1024
       max_cells_per_tick: 1024
       limit_queue_capacity: 1024
       cluster_id_hash: 1

@@ -127,7 +127,7 @@ fn admit_without_allocating(rules: u16) {
 
     // The hot keys' counts, as the leader would have written them.
     let hot: Vec<String> = (0..50).map(|i| format!("hot-{i}")).collect();
-    let mut deltas = DeltaSink::<u32>::default();
+    let mut deltas = DeltaSink::default();
     for (i, rule) in compiled.table().rules().iter().enumerate() {
         for tenant in &hot {
             let key = format!("k{i}");

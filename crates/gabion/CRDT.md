@@ -19,7 +19,7 @@ Read it end-to-end and you should be able to open `crdt.rs` and recognise every 
    - 4.1 [Structure-of-arrays column layout](#41-structure-of-arrays-column-layout)
    - 4.2 [Slot lifecycle: freelist + generation tagging](#42-slot-lifecycle-freelist--generation-tagging)
    - 4.3 [Handles](#43-handles)
-   - 4.4 [The `Count` trait — width-parametric counters](#44-the-count-trait--width-parametric-counters)
+   - 4.4 [Counts](#44-counts)
    - 4.5 [Defaults and the production tunables](#45-defaults-and-the-production-tunables)
 5. [I/O containers](#5-io-containers)
    - 5.1 [`Observation` and `ObservationBatch` — input](#51-observation-and-observationbatch--input)
@@ -35,8 +35,6 @@ Read it end-to-end and you should be able to open `crdt.rs` and recognise every 
    - 7.1 [The two dirty rings](#71-the-two-dirty-rings)
    - 7.2 [The repair cursor — the third lane](#72-the-repair-cursor--the-third-lane)
    - 7.3 [`fill_gossip_frame` and per-frame dedup](#73-fill_gossip_frame-and-per-frame-dedup)
-   - 7.4 [`peer_frontier` — per-peer × per-origin cursors](#74-peer_frontier--per-peer--per-origin-cursors)
-   - 7.5 [`fill_gossip_frame_for_peer` and `peer_lacks`](#75-fill_gossip_frame_for_peer-and-peer_lacks)
 8. [Expiry](#8-expiry)
 9. [End-to-end traced example](#9-end-to-end-traced-example)
 10. [Invariants reference](#10-invariants-reference)
@@ -94,10 +92,6 @@ flowchart TB
         IO["io — Observation, ObservationBatch, DeltaSink, ExpirationSink"]
     end
 
-    subgraph gossip["Gossip"]
-        PF["peer_frontier — PeerFrontierTable"]
-    end
-
     CS --> D
     CS --> I
     I --> H
@@ -105,7 +99,6 @@ flowchart TB
     D --> I
     CS --> DR
     CS --> IO
-    CS --> PF
 ```
 
 §3 walks the four foundations bottom-up — they have no dependencies on the cell store and compose into it. §4 introduces the store; §5 the I/O containers; §6 traces a write through both; §7 covers gossip frame composition; §8 covers expiry.
@@ -326,7 +319,7 @@ The interned key is the *pair* `(node_id, incarnation)`, not just the node id, a
 The three asymmetries with the rule version are:
 
 1. **`intern` does not overwrite the descriptor on a hit.** There is nothing to overwrite, because the descriptor *is* the key.
-2. **`dec_ref` returns `bool`.** A return value of `true` means this call dropped the refcount to zero and freed the slot, which the caller uses to decide whether to also tear down per-origin auxiliary state — the per-origin sequence allocator and the per-peer frontier rows.
+2. **`dec_ref` returns `bool`.** A return value of `true` means this call dropped the refcount to zero and freed the slot, which the caller uses to decide whether to also tear down per-origin auxiliary state — the per-origin sequence allocator.
 3. **Different incarnations get different slots.** A node that bumps its incarnation never shares a `NodeSlot` with its previous identity.
 
 #### Capacity sizing — `pow2_index_capacity_for`
@@ -649,7 +642,7 @@ flowchart LR
       I[incarnations: u32]
     end
     subgraph hot[Hot value columns]
-      C[counts: C]
+      C[counts: u32]
       L[last_update_millis: u64]
       Q[origin_sequences: u64]
     end
@@ -727,7 +720,7 @@ When a cell is freed (e.g. expired), `free_cell_at` does the bookkeeping the slo
 1. Reconstruct `CompactCellKey` from the columns.
 2. Remove the corresponding entry from `CellIndex`.
 3. Decrement the rule dictionary refcount; the rule slot is released if nothing else references it.
-4. Decrement the node dictionary refcount; if that frees the node slot, also clear the `PeerFrontierTable` column for it (§7.4) and reset its `next_sequence_by_origin` counter.
+4. Decrement the node dictionary refcount; if that frees the node slot, reset its `next_sequence_by_origin` counter.
 5. Call `free_slot` to flip the generation and push onto the freelist.
 
 Dictionary refcounts are why each `upsert` insert path calls `rule_dictionary.inc_ref(...)` and `node_dictionary.inc_ref(...)`: the cell *holds* a reference and releases it here.
@@ -775,22 +768,9 @@ A single `u32` equality check makes the stale-handle bug disappear without ever 
 
 ---
 
-### 4.4 The `Count` trait — width-parametric counters
+### 4.4 Counts
 
-```rust
-pub trait Count: Copy + Eq + Ord + Default + Into<u64> + 'static {
-    const MAX: Self;
-    fn saturating_from_u64(value: u64) -> Self;
-    fn saturating_add_hits(self, hits: u64) -> Self;
-    fn saturating_delta(new: Self, old: Self) -> Self;
-}
-```
-
-`CellStore<C: Count>` is generic over the count column's integer width. Implementations are provided for `u16`, `u32`, and `u64`. The width is fixed per `CellStore` instance via monomorphisation — narrow for high-throughput tables, wide for large limits.
-
-All arithmetic is saturating, so incrementing a `u16` past 65,535 clamps at `u16::MAX` rather than wrapping; `saturating_delta(new, old)` is `new.saturating_sub(old)`, used to compute the delta emitted into the `DeltaSink` on every change.
-
-This trait is the only place width matters, and everywhere else the store is column-agnostic.
+Every count is a `u32`. A local hit saturating-adds, so a count clamps at `u32::MAX` rather than wrapping; a remote observation max-merges. The delta emitted into the `DeltaSink` on every change is `new - old`, which cannot underflow because both updates only ever raise the count.
 
 ---
 
@@ -805,7 +785,6 @@ The cell store takes a `ValidStorageConfig`, which only `Settings::validate` (`g
 | `node_dictionary_capacity`              | `storage.node_dictionary_capacity`   | `STORAGE_NODE_DICTIONARY_CAPACITY` = 1,024 |
 | `local_dirty_capacity`                  | `storage.local_dirty_capacity`       | `STORAGE_LOCAL_DIRTY_CAPACITY` = 65,536 |
 | `forwarded_dirty_capacity`              | `storage.forwarded_dirty_capacity`   | `STORAGE_FORWARDED_DIRTY_CAPACITY` = 524,288 |
-| `peer_capacity`                         | `storage.peer_capacity`              | `STORAGE_PEER_CAPACITY` = 256          |
 
 `gabion::defaults` is the canonical home for the production tunables, and `gabion::settings` the one table both adapters (`gabion-server`, `gabion-nginx`) parse and validate them through. Each is an operator-visible setting — touching any of them is an operator decision, not a library-level one.
 
@@ -815,11 +794,11 @@ The cell store takes a `ValidStorageConfig`, which only `Settings::validate` (`g
 
 File: `crates/gabion/src/crdt/io.rs`.
 
-`io.rs` defines three SoA value types that carry data into and out of the store: `ObservationBatch<C>` for input, `DeltaSink<C>` for the output of rising counts, and `ExpirationSink<C>` for aged-out cells. All three are themselves SoA, because the same shape choice that paid off inside the store extends to the I/O buffers.
+`io.rs` defines three SoA value types that carry data into and out of the store: `ObservationBatch` for input, `DeltaSink` for the output of rising counts, and `ExpirationSink` for aged-out cells. All three are themselves SoA, because the same shape choice that paid off inside the store extends to the I/O buffers.
 
 ### Why SoA in the I/O containers
 
-The aggregator's job — folding a column of deltas by key and rule into a running window — is exactly what SoA lets you stream a single column through. With a `Vec<CellDelta>` the count is interleaved with `CellHandle`, `CellIdentity`, two other counts, and a bool, so the CPU pulls a full cache line per element and discards most of it. With SoA, the `deltas` column is a contiguous `Vec<C>`, which for `C = u32` packs sixteen counts per cache line.
+The aggregator's job — folding a column of deltas by key and rule into a running window — is exactly what SoA lets you stream a single column through. With a `Vec<CellDelta>` the count is interleaved with `CellHandle`, `CellIdentity`, two other counts, and a bool, so the CPU pulls a full cache line per element and discards most of it. With SoA, the `deltas` column is a contiguous `Vec<u32>`, which packs sixteen counts per cache line.
 
 Three further reasons matter. Every row has the same shape, so there is no enum discriminant and no per-row match dispatch. Each column is a packed array of a single primitive, so the rows are smaller and free of struct padding. And every column is a single `Vec<T>`, sized at `with_capacity` and reused via `clear()` between frames, which makes it easy to audit against the no-allocation-after-construction rule.
 
@@ -827,28 +806,28 @@ The trade-off is that cross-column invariants are not enforced by the type syste
 
 ### 5.1 `Observation` and `ObservationBatch` — input
 
-The input shape has two layers. Callers build rows as a `Observation<C>` struct and push them into `ObservationBatch<C>`, which keeps the SoA columns:
+The input shape has two layers. Callers build rows as an `Observation` struct and push them into `ObservationBatch`, which keeps the SoA columns:
 
 ```rust
 #[derive(Clone, Copy, Debug)]
-pub struct Observation<C: Count> {
+pub struct Observation {
     pub rule_fingerprint: u128,
     pub key_hash: KeyHash,
     pub bucket: BucketEpoch,
     pub origin: NodeId,
     pub incarnation: Incarnation,
-    pub count: C,
+    pub count: u32,
     pub last_update_millis: u64,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct ObservationBatch<C: Count> {
+pub struct ObservationBatch {
     pub rule_fingerprints: Vec<u128>,
     pub key_hashes: Vec<KeyHash>,
     pub buckets: Vec<BucketEpoch>,
     pub origin_node_ids: Vec<NodeId>,
     pub incarnations: Vec<Incarnation>,
-    pub counts: Vec<C>,
+    pub counts: Vec<u32>,
     pub last_update_millis: Vec<u64>,
 }
 ```
@@ -862,7 +841,7 @@ The `Observation` row exists because constructing seven positional arguments at 
 | `buckets: Vec<BucketEpoch>`    | Which time bucket the observation falls into. |
 | `origin_node_ids: Vec<NodeId>` | The node that originally observed the event. **Ignored** by `ingest_local`, which always stamps `local_node_slot`. Used by `merge_remote` to record per-origin counters. |
 | `incarnations: Vec<Incarnation>` | The origin's incarnation. Same ignore-for-local rule as `origin_node_ids`. |
-| `counts: Vec<C>`               | Load-bearing; meaning depends on entry point. See below. |
+| `counts: Vec<u32>`               | Load-bearing; meaning depends on entry point. See below. |
 | `last_update_millis: Vec<u64>` | Wall-clock timestamp to stamp onto the cell on apply. |
 
 #### The dual meaning of `counts`
@@ -881,7 +860,7 @@ Mixing the two semantics in one batch is not supported; pick the entry point and
 | Method | Purpose |
 |---|---|
 | `with_capacity(cap)`  | Allocate every column with `Vec::with_capacity(cap)` so no reallocation happens for the first `cap` rows. |
-| `push(row: Observation<C>)` | Append one row across all seven columns in lockstep. |
+| `push(row: Observation)` | Append one row across all seven columns in lockstep. |
 | `len()` / `is_empty()`| Number of rows; defined as the length of `rule_fingerprints`. |
 | `clear()`             | `.clear()` each column. Capacity preserved. |
 | `assert_consistent()` | `debug_assert_eq!` each column's length to `rule_fingerprints.len()`. Called by `ingest_local` and `merge_remote` before iteration. |
@@ -892,12 +871,12 @@ Mixing the two semantics in one batch is not supported; pick the entry point and
 
 ```rust
 #[derive(Clone, Debug, Default)]
-pub struct DeltaSink<C: Count> {
+pub struct DeltaSink {
     pub handles: Vec<CellHandle>,
     pub keys: Vec<CellIdentity>,
-    pub previous: Vec<C>,
-    pub current: Vec<C>,
-    pub deltas: Vec<C>,
+    pub previous: Vec<u32>,
+    pub current: Vec<u32>,
+    pub deltas: Vec<u32>,
     pub applies_locally: Vec<u8>, // byte flags, not Vec<bool>
 }
 ```
@@ -919,7 +898,7 @@ pub struct DeltaSink<C: Count> {
 
 `DeltaSink` does not actually expose a "drain"; instead the caller passes `&mut sink` to `ingest_local` or `merge_remote`, the call returns with zero or more new rows appended, the caller iterates `0..sink.len()` and folds each row into its aggregator state, then calls `sink.clear()` before the next submission.
 
-`clear()` is idempotent and preserves capacity, so the next frame refills the same buffer. The convenience method `row(i)` materialises one delta as an AoS `CellDelta<C>` for callers that prefer the struct shape — typically logging and tests — but there is no iterator that yields `CellDelta`s, because production code walks the columns directly to keep the SoA benefits.
+`clear()` is idempotent and preserves capacity, so the next frame refills the same buffer. The convenience method `row(i)` materialises one delta as an AoS `CellDelta` for callers that prefer the struct shape — typically logging and tests — but there is no iterator that yields `CellDelta`s, because production code walks the columns directly to keep the SoA benefits.
 
 ### 5.3 `ExpirationSink` — output for aged-out cells
 
@@ -927,10 +906,10 @@ pub struct DeltaSink<C: Count> {
 
 ```rust
 #[derive(Clone, Debug, Default)]
-pub struct ExpirationSink<C: Count> {
+pub struct ExpirationSink {
     pub handles: Vec<CellHandle>,
     pub keys: Vec<CellIdentity>,
-    pub last_counts: Vec<C>,
+    pub last_counts: Vec<u32>,
     pub last_update_millis: Vec<u64>,
     pub applies_locally: Vec<u8>,
 }
@@ -946,7 +925,7 @@ pub struct ExpirationSink<C: Count> {
 
 `ExpirationSink::push` is `pub(super)` so that only `CellStore::expire` and its convenience wrapper `expire_at` (§8) append to it, and the same read-then-`clear()` pattern as `DeltaSink` applies.
 
-`CellExpiration<C>` is the AoS row type — the same shape as `CellDelta<C>` but with the columns described above — returned by `ExpirationSink::row(i)` for the same logging-and-tests convenience.
+`CellExpiration` is the AoS row type — the same shape as `CellDelta` but with the columns described above — returned by `ExpirationSink::row(i)` for the same logging-and-tests convenience.
 
 ### 5.4 `CompactCellKey` vs `CellIdentity`
 
@@ -993,9 +972,9 @@ With the store, the I/O containers, and the four foundations defined, the trace 
 ```mermaid
 sequenceDiagram
     participant App as Application
-    participant Batch as ObservationBatch<C>
+    participant Batch as ObservationBatch
     participant Store as CellStore
-    participant Sink as DeltaSink<C>
+    participant Sink as DeltaSink
 
     App->>Batch: with_capacity(N)   (once, at startup)
     loop per observation
@@ -1031,25 +1010,25 @@ The origin and incarnation columns of the batch are ignored on the local path be
 `upsert` is the worker that both entry points call. Its signature is designed to make the two modes mutually exclusive at the type level:
 
 ```rust
-fn upsert(&mut self, spec: UpsertSpec<C>, sink: &mut DeltaSink<C>);
+fn upsert(&mut self, spec: UpsertSpec, sink: &mut DeltaSink);
 
-struct UpsertSpec<C: Count> {
+struct UpsertSpec {
     rule_slot: RuleSlot,
     key_hash: KeyHash,
     bucket: BucketEpoch,
     origin_slot: NodeSlot,
     incarnation: Incarnation,
     now_millis: u64,
-    mode: UpsertMode<C>,
+    mode: UpsertMode,
 }
 
-enum UpsertMode<C: Count> {
-    Accumulate { hits: u64 },
-    MaxMerge   { observed: C },
+enum UpsertMode {
+    Accumulate { hits: u32 },
+    MaxMerge   { observed: u32 },
 }
 ```
 
-The tagged-union `UpsertMode` is the point of the design. Previously, `upsert` took a positional `accumulate: bool` flag along with both a `hits: u64` and an `observed: C` argument, and nothing stopped a caller from setting the bool one way and filling the count the other. The struct-plus-enum shape prevents that miscall at compile time: an `UpsertMode::Accumulate` carries `hits` and only `hits`, while an `UpsertMode::MaxMerge` carries `observed` and only `observed`. It is the "make invalid states unrepresentable" axiom turned into a type signature.
+The tagged-union `UpsertMode` is the point of the design. Previously, `upsert` took a positional `accumulate: bool` flag along with both a `hits` and an `observed` argument, and nothing stopped a caller from setting the bool one way and filling the count the other. The struct-plus-enum shape prevents that miscall at compile time: an `UpsertMode::Accumulate` carries `hits` and only `hits`, while an `UpsertMode::MaxMerge` carries `observed` and only `observed`. It is the "make invalid states unrepresentable" axiom turned into a type signature.
 
 The branch on existence:
 
@@ -1130,7 +1109,7 @@ The `local_dirty` lane is what gets gossiped first, since it carries changes thi
 
 `next_sequence_by_origin` is sized to `node_dictionary_capacity`. Each origin gets its own monotonic counter, and `next_origin_sequence` saturating-adds one before returning, so the first sequence ever minted is 1; a `0` read back from a never-allocated origin slot means "nothing here yet."
 
-The sequence has two jobs. It disambiguates ring entries for the same cell, since only the latest entry survives validation, and it supplies ordering metadata for `PeerFrontierTable` so that peers can advance their per-origin acknowledgement cursors. When a node slot is freed by refcount, the counter for that slot is reset.
+The sequence disambiguates ring entries for the same cell, since only the latest entry survives validation. When a node slot is freed by refcount, the counter for that slot is reset.
 
 #### The `local_node_slot` pin
 
@@ -1146,10 +1125,10 @@ All read primitives are lock-free.
 |---|---|
 | `find(key) -> Option<CellHandle>` | Hashes the key, walks `CellIndex` until a probe hit matches all five cold columns. Returns the generation-tagged handle. |
 | `resolve(handle) -> Option<u32>` | Bounds-checks, then `generations[handle.index] == handle.generation && (handle.generation & 1) == 1`. |
-| `get(handle) -> Option<CellRow<C>>` | Reads every column for a slot and assembles a snapshot. |
+| `get(handle) -> Option<CellRow>` | Reads every column for a slot and assembles a snapshot. |
 | `active_handles()` | Diagnostic helper that walks `0..capacity` and yields handles only for slots with odd generation. Scans the full capacity, not just `active_len`; not for hot paths. |
 
-There is no atomic "snapshot the whole store" operation. The structure is single-threaded, so a snapshot is logically the iterator `active_handles().map(|h| store.get(h).unwrap())`; higher layers persist via the `DeltaSink`/`ExpirationSink` streams and the `peer_frontier` checkpoints.
+There is no atomic "snapshot the whole store" operation. The structure is single-threaded, so a snapshot is logically the iterator `active_handles().map(|h| store.get(h).unwrap())`; higher layers persist via the `DeltaSink`/`ExpirationSink` streams.
 
 ---
 
@@ -1221,172 +1200,6 @@ sequenceDiagram
 ```
 
 The `selection_epoch` is a `u32` that wraps. On wrap to zero, `bump_selection_epoch` does a one-shot scrub of `selection_marks` and resets the epoch to 1 so the new epoch is unambiguous. Since `u32` epochs cover billions of frames, the wraparound branch exists as cheap insurance rather than a real hot path.
-
-### 7.4 `peer_frontier` — per-peer × per-origin cursors
-
-File: `crates/gabion/src/crdt/peer_frontier.rs`.
-
-`PeerFrontierTable` is a small bookkeeping table that lets the outbound gossip layer skip cells a given peer has already acknowledged. It is a latency optimisation rather than a convergence mechanism, as the module's own docstring makes explicit:
-
-> Latency optimization only — convergence is guaranteed by the repair
-> lane, not by this table.
-
-It is not indexed per `(rule, key, bucket)` and it is not consulted from the CRDT's write path. If gossip is dropped or reordered, the repair cursor in `CellStore` eventually rotates over every active cell and reconciles; the frontier just lets the happy path avoid resending what each peer already has.
-
-#### What it tracks
-
-For every `(peer, origin-node)` pair this process tracks, the table remembers two monotonic cursors: `last_sent_seq` is the highest origin-sequence number we have transmitted to that peer for cells owned by that origin, and `last_acked_seq` is the highest origin-sequence number the peer has acknowledged receiving. Together these answer one question: *which of my active cells does peer X still need to hear about from origin O?*
-
-#### Layout
-
-```rust
-pub struct PeerFrontierTable {
-    peer_ids:        Box<[Option<NodeId>]>, // length = peer_capacity
-    last_acked_seq:  Box<[u64]>,            // length = peer_capacity * node_capacity
-    last_sent_seq:   Box<[u64]>,            // length = peer_capacity * node_capacity
-    peer_capacity:   u16,
-    node_capacity:   u16,
-    full_rejects:    u64,
-}
-```
-
-`last_acked_seq` and `last_sent_seq` are conceptually a `peer_capacity × node_capacity` matrix flattened in **peer-major** order: one row per peer, with all that peer's per-origin cursors contiguous in memory.
-
-```mermaid
-flowchart TB
-  subgraph last_acked["last_acked_seq (peer_capacity × node_capacity, flattened peer-major)"]
-    direction TB
-    P0["peer 0:  [n=0]  [n=1]  [n=2]  …  [n=node_capacity-1]"]
-    P1["peer 1:  [n=0]  [n=1]  [n=2]  …  [n=node_capacity-1]"]
-    P2["peer 2:  [n=0]  [n=1]  [n=2]  …  [n=node_capacity-1]"]
-    DOTS["…"]
-    P0 --> P1 --> P2 --> DOTS
-  end
-  IDX["flat_index = peer_slot * node_capacity + node_slot"] --> P1
-```
-
-Two of the three hot operations — `remove_peer`, which clears one peer's row, and `lacks_indices`, which scans one peer's row against the origin column — touch one peer at a time, so peer-major matches the access pattern.
-
-`peer_ids` is a tiny linear-probe interning table of `Option<NodeId>` slots scanned via `position`. `intern_peer` is meant to be a once-per-peer-handshake operation, not a per-message one.
-
-`full_rejects` counts the times `intern_peer` had to refuse because every peer slot was occupied. The same field drives a power-of-two rate-limited `tracing::warn!` that names `storage.peer_capacity` as the config key an operator should raise. Convergence still holds when this happens, because gossip to the unregistered peer simply pays the cost of not having the per-peer frontier and falls back on full-frame compose plus repair.
-
-#### Primitives
-
-| Operation | Purpose |
-|---|---|
-| `intern_peer(peer)` / `find_peer(peer)` / `remove_peer(peer)` | Manage peer slot allocation. `intern_peer` scans for an existing entry first, then claims a free slot. Table full returns `None` and bumps `full_rejects`. |
-| `last_sent(peer, origin)` / `last_acked(peer, origin)` | Plain indexed `u64` reads. Zero means "no information." |
-| `record_sent(peer, origin, seq)` / `record_acked(peer, origin, seq)` | "Raise the high-water mark" operations — guarded by `<`, so stale or duplicate calls are no-ops. |
-| `clear_node_slot(node_slot)` | Wipes one origin column when its slot is recycled by the cell store. |
-| `lacks_indices(peer, active_origins, origin_sequences, active_indices, out)` | Brute-force "which cells does this peer lack" scan — used in tests. The hot per-frame consumer is `peer_lacks`, inlined into `fill_gossip_frame_for_peer` (§7.5). |
-
-**Idempotence.** The `<` guards on `record_*` make every update a max-merge, so a late or duplicate `record_*` carrying a stale sequence is silently ignored. If two callers race, both succeed and the one carrying the smaller sequence is a no-op; if an ack arrives twice, the second call is a no-op.
-
-#### Why per-`(peer, origin)`, and not a single cursor?
-
-Imagine origin **O** emits sequences `1, 2, 3`. Peer **A** received `1` and `2`, while peer **B** received `1` and `3` because frame `2` was dropped on the wire to B. With a single global "highest sequence sent to anyone" cursor, the next gossip round cannot distinguish whose frontier is lagging, so it either re-broadcasts everything (wasteful) or under-delivers (incorrect). Per-`(peer, origin)` state captures exactly which peer is behind on which origin's stream.
-
-#### Reordered acks: the canonical scenario
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Tx as gossip transport
-    participant F as PeerFrontierTable
-    Note over F: last_acked[A,O] = 0, last_acked[B,O] = 0
-
-    Tx->>F: record_acked(A, O, 1)
-    Note over F: 0 < 1 → last_acked[A,O] = 1
-
-    Tx->>F: record_acked(A, O, 2)
-    Note over F: 1 < 2 → last_acked[A,O] = 2
-
-    Tx->>F: record_acked(B, O, 1)
-    Note over F: 0 < 1 → last_acked[B,O] = 1
-
-    Tx->>F: record_acked(A, O, 1)   (delayed duplicate)
-    Note over F: 2 < 1 is false → NO-OP
-
-    Note over F: state: last_acked[A,O] = 2, last_acked[B,O] = 1
-
-    Note over F: a later fill_gossip_frame_for_peer(B) will see B lacks 2 and 3
-```
-
-The duplicate `record_acked(A, O, 1)` is silently dropped because A's
-frontier is already at 2; without that guard we would rewind A's
-cursor and uselessly retransmit sequence 2 to A. B's frontier sits
-at 1 independently of A's, and a subsequent peer-aware frame compose
-for B correctly identifies that B is missing sequences 2 and 3 — a
-distinction that a single-cursor design would have lost.
-
-#### `lacks_indices` — the test helper
-
-`lacks_indices(peer, active_origins, origin_sequences, active_indices, out)` walks a caller-supplied list of `active_indices`, joins each index against the peer's row, and writes back the indices the peer hasn't acked yet:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Repair as Repair driver (tests)
-    participant Front as PeerFrontierTable
-    participant Cells as CellStore arrays
-
-    Repair->>Cells: borrow active_indices, active_origins, origin_sequences
-    Repair->>Front: lacks_indices(peer_slot, ..., out=&mut Vec)
-    loop for each idx in active_indices
-        Front->>Front: origin := active_origins[idx]
-        Front->>Front: last := last_acked_seq[flat_index(peer_slot, origin)]
-        alt origin_sequences[idx] > last
-            Front-->>Repair: push idx into out
-        else
-            Front-->>Repair: skip (peer already has this)
-        end
-    end
-    Repair->>Repair: gossip cells named by out to this peer
-```
-
-This is the brute-force form: it builds the whole "needs to be sent" list up front and is the right tool when something has gone wrong, such as a digest mismatch or a manual repair test. The production hot path does not buy that list; it makes the same decision one cell at a time inside the frame composer (§7.5).
-
-#### Interaction with the cell store
-
-The only call to a `peer_frontier` mutator from inside `crdt.rs` is `clear_node_slot`, invoked from `free_cell_at` when the node dictionary frees a `NodeSlot` because the last cell owned by that origin was evicted. Two things must reset together: the origin-sequence allocator, so the next user of the slot starts at sequence 1 again, and every peer's frontier into this slot, so old acks from a long-departed origin do not silently suppress retransmission of the new origin's cells. Every other call to `record_sent`, `record_acked`, or `intern_peer` is driven from the gossip transport layer outside this module.
-
-#### Frontier invariants
-
-1. **Monotonic non-decreasing per cell.** For any fixed `(peer_slot, node_slot)`, both `last_sent_seq` and `last_acked_seq` only ever stay the same or increase. Enforced by the `<` guards.
-2. **Idempotent updates.** Repeated `record_sent` / `record_acked` with the same arguments leave state unchanged.
-3. **Order-independence.** Applying any permutation of `record_*` calls produces the same final state.
-4. **Zero is "no information."** A freshly-constructed table, a freshly-cleared row (via `remove_peer`), and a freshly-cleared column (via `clear_node_slot`) all read as 0 on every cell.
-5. **No allocation after construction.** All three arrays are `Box<[T]>` of fixed length set in `new`.
-6. **No stale state across slot reuse.** When the parent `CellStore` recycles a `NodeSlot`, it calls `clear_node_slot` before the slot can be re-handed-out to a new `(NodeId, Incarnation)`.
-7. **Convergence is someone else's job.** Lose every byte of this table and the CRDT still converges — the repair cursor takes over.
-
-### 7.5 `fill_gossip_frame_for_peer` and `peer_lacks`
-
-The peer-aware sibling of `fill_gossip_frame` is `fill_gossip_frame_for_peer(max_cells, peer_slot, out)`. It walks the same three lanes in the same order, with the same `selection_marks` dedup. The two **dirty** lanes add one filter per cell — skip it if the peer already has it — but the **repair** lane (lane 3) does *not*: it sweeps the rotating active-set slice unconditionally. That asymmetry is load-bearing for correctness, not just bandwidth (see below).
-
-That filter is a tiny inlined helper:
-
-```rust
-#[inline]
-fn peer_lacks(&self, peer_slot: u16, cell_index: usize) -> bool {
-    let origin = self.origins[cell_index];
-    let last   = self.peer_frontiers.last_acked(peer_slot, origin);
-    self.origin_sequences[cell_index] > last
-}
-```
-
-`peer_lacks` is the hot per-frame consumer of the frontier table. Per candidate cell, it reads two contiguous slices — `origins[cell_index]` and `origin_sequences[cell_index]` — and one `u64` out of the peer-major `last_acked_seq` array, with no allocation and no branch other than the comparison itself.
-
-`fill_gossip_frame_for_peer` chains its checks per candidate cell in the order they fail fastest. The dirty lanes run `dirty_entry_current`, then `peer_lacks(peer_slot, cell_index)` to skip cells the peer is already current on, then `mark_selected(slot)` to deduplicate across lanes within this frame; otherwise the handle is pushed. The repair lane runs only `is_active` and `mark_selected` — it deliberately omits `peer_lacks`.
-
-The gossip runtime calls `fill_gossip_frame_for_peer` once per peer-target per tick, so the per-tick UDP fanout is peer-shaped: the dirty lanes hand each peer the fresh cells it has not yet acknowledged, capped at the frame budget, while the repair lane rotates the rest of the active set past it over successive ticks. Two peers receiving from the same compositor therefore see overlapping but not identical content.
-
-The repair lane omits `peer_lacks` for **correctness**, not bandwidth. `last_acked` is a per-`(peer, origin)` high-watermark, and `merge_remote` re-stamps a remote cell with the *merging* node's local origin counter rather than carrying the origin's sequence on the wire — so a replica's stored `origin_sequence` and a peer's `last_acked` live in different per-node sequence spaces, and a single watermark cannot represent a gap (a peer holding sequence 5 but not 4). If every lane pruned on it, a cell the watermark wrongly believes the peer holds would be suppressed on *every* holder forever and the cluster would never converge. Gating only the dirty lanes keeps `peer_lacks` as the latency optimization it is; the repair lane's unconditional sweep — re-merged idempotently via the max-merge in `merge_remote` — is the convergence guarantee the `PeerFrontierTable` doc comment delegates to it. (This was a real bug: a rare partition-heal counterexample stranded one cell on one node forever until the repair lane was ungated.)
-
-When a peer has not been interned because the table was full, the runtime falls back to plain `fill_gossip_frame`; the wasted bandwidth shows up as redundant retransmission, and the `full_rejects` log line points the operator at the relevant config key.
-
----
 
 <a id="expiry"></a>
 ## 8. Expiry
@@ -1525,16 +1338,6 @@ The whole structure relies on the following properties. They are grouped by subm
 5. `applies_locally` is canonical 0/1.
 6. `DeltaSink::keys` and `ExpirationSink::keys` carry `CellIdentity` — the portable identity that omits the node-local slot.
 
-### Peer frontier
-
-1. Monotonic non-decreasing per cell.
-2. Idempotent updates.
-3. Order-independence.
-4. Zero is "no information."
-5. No allocation after construction.
-6. No stale state across slot reuse.
-7. Convergence is someone else's job (the repair cursor).
-
 ---
 
 ## 11. Cross-module map
@@ -1550,7 +1353,6 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `hash_compact_cell_key`, `hash_fingerprint`, `hash_node_identity`, `mix64` | `hash` | SplitMix / MurmurHash-style mixers. |
 | `CellIndex` | `index` | Robin Hood open-addressing hash table, backshift deletion, power-of-two capacity. |
 | `Observation`, `ObservationBatch`, `DeltaSink`, `ExpirationSink` | `io` | SoA input row + input/output buffers. |
-| `PeerFrontierTable` | `peer_frontier` | Per-peer × per-origin send/ack cursors — latency hint only; convergence is the repair lane's job. |
 
 #### Public entry points on `CellStore`, at a glance
 
@@ -1568,8 +1370,6 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `clear_dirty()` | Drop the dirty rings; stored cells untouched. |
 | `visit_forwarded_dirty` | Stream the forwarded dirty lane (no dedup). |
 | `fill_gossip_frame(max, out)` | Compose a frame: local dirty + forwarded dirty + repair slice, deduped. |
-| `fill_gossip_frame_for_peer(max, peer_slot, out)` | Peer-aware variant; the two dirty lanes add a `peer_lacks` filter, the repair lane sweeps unconditionally (convergence backstop). |
-| `peer_frontiers()`, `peer_frontiers_mut()` | Per-peer send/ack frontier access. |
 | `repair_cursor()` | Read the current cursor position. |
 
 ---
@@ -1592,7 +1392,6 @@ CRDT-internal terms first; a couple of cluster-wide terms repeated here for self
 - **Dictionary / interning.** Giving every distinct value a single canonical home in a fixed-size array, handing out a small integer slot in exchange.
 - **Dirty ring.** Bounded ring of "this cell just changed" entries.
 - **Fingerprint.** A canonical 128-bit hash of a rule's shape and parameters. Same on every node by construction; produced by `gabion::rules::Descriptor`.
-- **Frontier / high-water mark.** Watermark up to which something is known true; max-merged over time.
 - **G-counter.** Grow-only counter — a CRDT where each replica only ever increases its own component, and merge is element-wise max.
 - **Generation.** A `u32` per slot; low bit is the active flag, high 31 bits are the ABA tag.
 - **Handle.** `(index, generation)` pair that points at a cell and detects recycling.

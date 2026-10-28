@@ -10,7 +10,6 @@ pub const STORAGE_RULE_DICTIONARY_FLOOR: u16 = 256;
 pub const STORAGE_NODE_DICTIONARY_CAPACITY: u16 = 1024;
 pub const STORAGE_LOCAL_DIRTY_CAPACITY: usize = 65_536;
 pub const STORAGE_FORWARDED_DIRTY_CAPACITY: usize = 524_288;
-pub const STORAGE_PEER_CAPACITY: u16 = 256;
 
 pub const STORAGE_MAX_DESCRIPTOR_COUNT: u16 = 16;
 pub const STORAGE_MAX_DESCRIPTOR_BYTES: usize = 512;
@@ -54,21 +53,20 @@ pub const GOSSIP_FANOUT: usize = 3;
 /// **These are single-round figures, and the single round is the wrong unit
 /// for gabion.** KMG's theorem bounds one *one-shot* dissemination; gabion
 /// instead runs continuous anti-entropy — it re-gossips every dirty cell each
-/// tick until the peer frontier shows it acked, with the repair lane behind
-/// that. So a node missed in one round is overwhelmingly likely to be reached
-/// by the next, and the per-round coverage *compounds*: at `c = 3` the 4.9 %
-/// per-round miss falls to ≈ 0.24 % after two rounds and ≈ 0.012 % after three.
-/// We therefore size to the leaner `c = 3` threshold and let anti-entropy close
-/// the gap, rather than paying KMG's one-shot `c ≈ 4` (their validated sims —
-/// fanout 13 @ 10 000 nodes, 15 @ 50 000 — measure single-shot reach, which a
-/// re-gossiping system does not need to match). `c = 3` costs ≈ 1 fewer peer
-/// per tick at every cluster size (≈ 10 % less gossip bandwidth). Kept a
-/// `const`; promote to a setting in `gabion::settings` if an operator ever
-/// needs to trade bandwidth for coverage at runtime.
+/// tick, with the repair lane behind that. So a node missed in one round is
+/// overwhelmingly likely to be reached by the next, and the per-round coverage
+/// *compounds*: at `c = 3` the 4.9 % per-round miss falls to ≈ 0.24 % after two
+/// rounds and ≈ 0.012 % after three. We therefore size to the leaner `c = 3`
+/// threshold and let anti-entropy close the gap, rather than paying KMG's
+/// one-shot `c ≈ 4` (their validated sims — fanout 13 @ 10 000 nodes, 15 @ 50
+/// 000 — measure single-shot reach, which a re-gossiping system does not need
+/// to match). `c = 3` costs ≈ 1 fewer peer per tick at every cluster size (≈ 10
+/// % less gossip bandwidth). Kept a `const`; promote to a setting in
+/// `gabion::settings` if an operator ever needs to trade bandwidth for coverage
+/// at runtime.
 pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
 
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
-pub const GOSSIP_MAX_CELLS_PER_FRAME: u32 = 4096;
 pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;
 pub const GOSSIP_LIMIT_QUEUE_CAPACITY: usize = 8192;
 

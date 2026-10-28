@@ -68,7 +68,7 @@ impl Worker {
         // the leak keeps it alive for the whole bench.
         let region = unsafe { ShmRegion::initialize(zone.as_mut_ptr().cast(), layout) };
         let hot: Vec<String> = (0..50).map(|i| format!("hot-{i}")).collect();
-        let mut deltas = DeltaSink::<u32>::default();
+        let mut deltas = DeltaSink::default();
         for (i, rule) in rules.table().rules().iter().enumerate() {
             let key = format!("k{i}");
             for tenant in &hot {

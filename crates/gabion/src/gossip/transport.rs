@@ -15,7 +15,6 @@ use tokio::net::UdpSocket;
 
 use super::ValidGossipConfig;
 use super::admin::GossipCounters;
-use crate::crdt::Count;
 use crate::settings::Setting;
 use crate::throttle;
 use crate::wire::{PacketBuf, Packets};
@@ -83,9 +82,9 @@ impl Outbox {
     /// Encode `packets` for `dst`, handing each packet to the socket as it
     /// is encoded and stopping at the first the kernel refuses. The cells
     /// left unsent wait in the dirty rings and the repair lane.
-    pub(super) fn send_frame<C: Count, T: GossipTransport>(
+    pub(super) fn send_frame<T: GossipTransport>(
         &mut self,
-        mut packets: Packets<'_, C>,
+        mut packets: Packets<'_>,
         dst: SocketAddr,
         transport: &T,
         counters: &mut GossipCounters,

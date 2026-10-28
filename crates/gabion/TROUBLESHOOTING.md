@@ -63,33 +63,59 @@ Message starts: "Too many gabion peer instances are being tracked"
 
 **Fields** `config_key`, `capacity`, `in_use`, `peer_node_id`, `peer_incarnation`, `rejected_total` · **Knob** `storage.node_dictionary_capacity` (`GABION_STORAGE_NODE_DICTIONARY_CAPACITY`) / `gabion_storage_node_dictionary_capacity`
 
-### `peer_frontier_full`
-
-**Level** warn, power of two · **Request allowed** yes, gossip to that peer uses more bandwidth · **Emitted by** library (both adapters)
-
-Message starts: "Too many gabion peers to optimize gossip with."
-
-**What happened.** The peer frontier, which remembers what each peer already has so gossip can skip it, had no free slot for a peer. Counts still converge; gossip with that peer resends rows it already holds.
-
-**Why.** Usually the cluster has more peers than `storage.peer_capacity`, for example after scaling out.
-
-**What to do next.** Raise `storage.peer_capacity` (`GABION_STORAGE_PEER_CAPACITY`) in `gabiond`, or `gabion_storage_peer_capacity` in NGINX, above the number of peers in the cluster.
-
-**Fields** `config_key`, `capacity`, `peer_node_id`, `rejected_total` (packets from peers without a slot, not peers) · **Knob** `storage.peer_capacity` (`GABION_STORAGE_PEER_CAPACITY`) / `gabion_storage_peer_capacity`
-
 ### `decode_rejected`
 
-**Level** warn, power of two · **Request allowed** yes, the peer's counts are lost · **Emitted by** library (both adapters)
+**Level** warn, power of two of each `reason` · **Request allowed** yes, the packet's counts are lost · **Emitted by** library (both adapters)
 
-Message starts: "Could not understand a gossip message from this peer, so it was dropped"
+Each `reason` has its own counter in `/snapshot` (`counters.decode_rejects_framing`, `decode_rejects_peer_limits`, `decode_rejects_cluster`) and its own power-of-two throttle, so a flood of one cause cannot hide another. Another protocol version is [`peer_version_mismatch`](#peer_version_mismatch).
 
-**What happened.** A gossip packet could not be decoded and was dropped, so limits here under-count the traffic that peer handled. The `error` field says what was wrong with the packet.
+`reason = "framing"`. Message starts: "Dropped a packet from this peer that is not valid gabion gossip."
 
-**Why.** Usually the peer runs a different gabion version, or its payload or cells-per-frame size is larger than this node's. Otherwise another program is sending UDP to this node's gossip port.
+- **What happened.** A packet on the gossip port was not a valid gossip packet (the `error` field says why) and was dropped. Counts from healthy peers are not affected.
+- **Why.** Usually another program is sending UDP to this node's gossip port, or something on the path truncates packets.
+- **What to do next.** If `peer` is a gabion node, check the path MTU between the two: gossip packets are at most `max_payload_bytes` bytes.
 
-**What to do next.** Check the peer's gabion version, and set `gossip.max_payload_bytes` and `gossip.max_cells_per_frame` (NGINX `gabion_gossip_max_payload_bytes`, `gabion_gossip_max_cells_per_frame`) to the same values on every node.
+`reason = "peer_limits"`. Message starts: "Dropped a packet from this peer larger than this node accepts."
 
-**Fields** `peer`, `error`, `rejected_total` · **Knob** `gossip.max_payload_bytes` (`GABION_GOSSIP_MAX_PAYLOAD_BYTES`) / `gabion_gossip_max_payload_bytes`; `gossip.max_cells_per_frame` (`GABION_GOSSIP_MAX_CELLS_PER_FRAME`) / `gabion_gossip_max_cells_per_frame`
+- **What happened.** A packet of `length` bytes arrived, more than this node's `max_payload_bytes`, and was dropped, so limits here under-count the traffic that peer handled.
+- **Why.** The peer has a higher `gossip.max_payload_bytes`, or something on the path changes packet sizes. A non-gabion sender of large UDP packets also lands here, since the size is checked first.
+- **What to do next.** Set `gossip.max_payload_bytes` to the same value on every node.
+
+`reason = "cluster"`. Message starts: "Ignored gossip from this peer: it belongs to another gabion cluster"
+
+- **What happened.** The packet carried another cluster id (`peer_cluster`) than this node's (`local_cluster`), so this node dropped it before reading its counts.
+- **Why.** Two gabion clusters share a network and gossip port.
+- **What to do next.** If they are one cluster, set the same `gossip.cluster_id_hash` on every node. If they are separate, also give them different gossip ports or networks.
+
+**Fields** `peer`, `error`, `reason`, `rejected_total` (per reason); `max_payload_bytes` and `config_key` (framing, peer_limits); `length` (peer_limits); `peer_cluster`, `local_cluster`, `config_key` (cluster) · **Knob** `gossip.max_payload_bytes` (`GABION_GOSSIP_MAX_PAYLOAD_BYTES`) / `gabion_gossip_max_payload_bytes`; `gossip.cluster_id_hash` (`GABION_GOSSIP_CLUSTER_ID_HASH`) / `gabion_gossip_cluster`
+
+### `peer_version_mismatch`
+
+**Level** warn, power of two · **Request allowed** yes, the two versions do not share counts · **Emitted by** library (both adapters)
+
+Message starts: "Ignoring gossip from this peer: it speaks another gossip protocol version"
+
+**What happened.** A peer sent gossip in another protocol version (`peer_version`) than this node's (`local_version`). Neither merges the other's counts, so each version enforces limits on its own share of the traffic, and the cluster can admit up to about twice a key's limit per window. Requests are allowed.
+
+**Why.** During a rolling upgrade between those versions this is expected and stops once every pod runs the same release. If it continues after the rollout ends, a pod is still on the other release.
+
+**What to do next.** Finish the rollout quickly, or roll back. Otherwise find the pod by the `peer` field and upgrade or restart it. `counters.decode_rejects_version` in `/snapshot` counts the dropped packets.
+
+**Fields** `peer`, `peer_version`, `local_version`, `reason` (`version`), `rejected_total` · **Knob** none
+
+### `default_cluster_id`
+
+**Level** info, once at start · **Request allowed** yes · **Emitted by** library (both adapters)
+
+Message starts: "This node uses the default gossip cluster id, 1."
+
+**What happened.** `gossip.cluster_id_hash` is left at its default. Nothing is wrong yet.
+
+**Why.** Any other gabion cluster left at the default on the same network and gossip port would merge counts with this one.
+
+**What to do next.** Set `gossip.cluster_id_hash` to a value unique to this cluster, the same on every node of it.
+
+**Fields** `cluster_id_hash`, `config_key` · **Knob** `gossip.cluster_id_hash` (`GABION_GOSSIP_CLUSTER_ID_HASH`) / `gabion_gossip_cluster`
 
 ### `send_blocked`
 

@@ -115,7 +115,7 @@ fn aggregate_table_matches_model(ops: Vec<(u8, u8, bool)>) -> bool {
 }
 
 /// One delta row of `delta` hits for `(1, 2, bucket)`.
-fn delta(bucket: BucketEpoch, delta: u32) -> DeltaSink<u32> {
+fn delta(bucket: BucketEpoch, delta: u32) -> DeltaSink {
     DeltaSink {
         handles: vec![CellHandle::default()],
         keys: vec![CellIdentity {
@@ -169,7 +169,7 @@ fn full_aggregate_allows_and_logs() {
 #[test]
 fn gabiond_table_holds_a_full_cell_store() {
     let cells = 4_096;
-    let aggregate = Aggregate::new(&storage(cells, 64, 64, 8));
+    let aggregate = Aggregate::new(&storage(cells, 64, 64));
     let writer = writer(&aggregate);
     let dropped = (0..u128::from(cells))
         .filter(|&key| !writer.add(1, key, 0, 1))

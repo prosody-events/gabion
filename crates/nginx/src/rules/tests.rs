@@ -242,7 +242,7 @@ fn nginx_readme_rules_each_expire_on_their_own_schedule() {
         .map(|line| directive(line.trim_end_matches(';')))
         .collect();
     let rules = compile(&configs).expect("no two README rules share an identity");
-    let store = CellStore::<u32>::new(
+    let store = CellStore::new(
         validated(|_| {}).1,
         NodeIdentity::new(NodeId(1), 1),
         rules.table(),

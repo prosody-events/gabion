@@ -1,64 +1,63 @@
-//! On-the-wire codec for per-origin counter CRDT gossip frames.
+//! On-the-wire codec for gossip packets, version 2.
 //!
-//! Each UDP packet is self-describing: the body carries its own small
-//! `(rule_fp, origin_node_id)` mini-dictionaries followed by per-cell slot
-//! indices. A receiver can decode any packet in isolation regardless of
-//! whether earlier or later packets in the same batch arrived — the only
-//! cross-packet signal is the advisory [`FLAG_MORE`] hint, which receivers
-//! may use to defer downstream work until a batch settles.
+//! Each UDP packet is an 86-byte [`Header`] and a body of cells. The body
+//! carries its own small `(rule_fp, origin_node_id)` dictionaries followed by
+//! per-cell slot indices, so a receiver decodes any packet alone, whether or
+//! not the packets around it arrived. The header's kind byte, flags and
+//! stream range decode into one [`Payload`], so no decoded packet is two kinds
+//! at once.
 //!
 //! Invariants:
-//! - Frames are little-endian.
-//! - Headers are exactly [`HEADER_LEN`] bytes.
+//! - Frames are little-endian, with no padding and no authentication tag.
 //! - The encoder never writes past `FrameLimits::max_payload_bytes`.
-//! - Decoders enforce `cell_count <= FrameLimits::max_cells` before any work.
-//! - Authenticated frames reject any header / body / tag mutation before
-//!   decoding the body.
-//! - `count_width` is strict: the decoder's `C: Count` must match the sender's
-//!   exactly.
-//! - Each packet is independently useful — losing packet `k` of a batch does
-//!   not invalidate packet `k+1` or any earlier packet.
+//! - [`decode`] checks the payload limit, then the header's length, magic,
+//!   version, kind, flags and range, then the cluster id, and only then the
+//!   body, so a packet from another version or cluster is dropped before any of
+//!   its cells is read.
+//! - No cell bound is configured: the body's exact-length check runs before any
+//!   cell is visited, so a packet within `max_payload_bytes` cannot deliver
+//!   more cells than `FrameLimits::max_cells`.
 //!
 //! Socket I/O, peer selection, and tick scheduling live outside this module.
 
-mod auth;
 mod body;
 mod header;
 
 #[cfg(test)]
 mod tests;
 
-pub use auth::HmacKey;
-pub use body::{WireCell, WireScratch};
-pub use header::{FLAG_AUTHENTICATED, FLAG_MORE, HEADER_LEN, Header, MAGIC, VERSION};
+pub use body::WireScratch;
+pub use header::{AckInfo, HEADER_LEN, Header, MAGIC, OwnAck, Payload, StreamRange, VERSION};
 
-use auth::AUTH_TAG_LEN;
-use body::{DICT_LEN_BYTES, PER_CELL_IDENT_BYTES, decode_body_visit, encode_packet_body};
-use header::{patch_header, read_header};
+pub(crate) use header::write_header;
 
-use crate::crdt::{CellHandle, CellStore, Count, Observation, ObservationBatch};
+use body::{CELL_BYTES, DICT_LEN_BYTES, decode_body, encode_packet_body};
+use header::read_header;
+
+use crate::crdt::{CellHandle, CellStore, Observation};
 
 use thiserror::Error;
 
-/// The smallest `max_payload_bytes` that holds one `u32` counter without
-/// HMAC: 152 bytes. HMAC adds 32 bytes, and a `u64` count 4 more.
-pub const MIN_PAYLOAD_BYTES: usize = min_payload_bytes(size_of::<u32>(), 0);
+/// The smallest `max_payload_bytes`: the header, the two dictionary lengths
+/// with one 16-byte entry each, and one cell. 158 bytes.
+pub const MIN_PAYLOAD_BYTES: usize = HEADER_LEN + DICT_LEN_BYTES + 16 + 16 + CELL_BYTES;
+
+/// The largest UDP payload over IPv4: 65,535 − 20 (IP header) − 8 (UDP header).
+pub const MAX_PAYLOAD_BYTES: usize = 65_507;
 
 /// Limits applied at frame boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameLimits {
     pub max_payload_bytes: usize,
-    pub max_cells: u32,
 }
 
 impl FrameLimits {
-    /// The most cells one packet within these limits carries with a `C`
-    /// count: what its bytes hold, at most `max_cells`.
-    pub(crate) fn packet_cells<C: Count>(self) -> usize {
-        let per_cell = PER_CELL_IDENT_BYTES + size_of::<C>();
-        let fixed = min_payload_bytes(size_of::<C>(), 0) - per_cell;
-        let fit = self.max_payload_bytes.saturating_sub(fixed) / per_cell;
-        fit.min(self.max_cells as usize)
+    /// The most cells one packet within these limits holds: one rule, one
+    /// origin, and every other byte spent on cells.
+    pub(crate) fn max_cells(self) -> usize {
+        self.max_payload_bytes
+            .saturating_sub(MIN_PAYLOAD_BYTES - CELL_BYTES)
+            / CELL_BYTES
     }
 }
 
@@ -66,63 +65,39 @@ impl Default for FrameLimits {
     fn default() -> Self {
         Self {
             max_payload_bytes: 256 * 1024,
-            max_cells: 4096,
         }
     }
 }
 
-/// Outcome metadata for one packet emitted by [`Packets::next_into`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PacketWritten {
-    /// Cells encoded into this packet.
-    pub cells_emitted: u32,
-    /// Handles inspected for this packet that did not resolve (stale
-    /// generation or missing dictionary descriptor). Stale handles are
-    /// consumed in the current packet — never carried forward.
-    pub cells_dropped: u32,
-    /// Flags as written to the packet header.
-    pub flags: u16,
-}
-
-/// Outcome of a successful decode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DecodedSummary {
-    pub header: Header,
-    pub cell_count: u32,
-    /// Mirror of `header.flags`. Receivers may inspect [`FLAG_MORE`] to
-    /// decide when a batch is fully delivered. Each packet is decoded and
-    /// applied independently regardless of the bit's value.
-    pub flags: u16,
-}
-
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum EncodeError {
-    #[error("max_payload_bytes is smaller than the fixed framing overhead + one cell")]
+    #[error("max_payload_bytes is smaller than the header and one cell")]
     BudgetTooSmall,
 }
 
+/// Why a packet was dropped, in the order [`decode`] checks.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum DecodeError {
-    #[error("frame is shorter than the fixed framing overhead")]
+    #[error("packet exceeds max_payload_bytes")]
+    PayloadTooLarge,
+    #[error("packet is shorter than the header")]
     TooShort,
     #[error("magic mismatch")]
     BadMagic,
-    #[error("unsupported version")]
-    BadVersion,
-    #[error("count_width does not match local Count width")]
-    BadCountWidth,
-    #[error("frame exceeds max_payload_bytes")]
-    PayloadTooLarge,
-    #[error("cell_count exceeds max_cells")]
-    CapacityExceeded,
-    #[error("body_len does not match frame size")]
-    BodyLenMismatch,
+    #[error("unsupported protocol version {found}")]
+    BadVersion { found: u16 },
+    #[error("unknown packet kind, or cells on a header-only kind")]
+    BadKind,
+    #[error("flag not allowed on this packet kind")]
+    BadFlags,
+    #[error("stream range does not fit the packet kind")]
+    BadRange,
+    #[error("cluster id {found:#x} is not this node's")]
+    ForeignCluster { found: u128 },
+    #[error("body length does not match its dictionaries and cell count")]
+    BodyLength,
     #[error("rule_slot or node_slot index out of range for the packet's dictionary")]
     BadSlot,
-    #[error("HMAC verification failed")]
-    AuthenticationFailed,
-    #[error("trailing bytes after body")]
-    Trailing,
 }
 
 // -- send-side buffer -------------------------------------------------------
@@ -165,108 +140,65 @@ impl AsRef<[u8]> for PacketBuf {
 
 // -- packet iterator --------------------------------------------------------
 
-/// Compute the minimum bytes needed to hold one minimal cell. A minimal
-/// packet has both dict lengths = 1, one rule fingerprint, one node id, and
-/// one cell row. Used by the constructors to reject undersized budgets up
-/// front rather than mid-stream.
-const fn min_payload_bytes(count_size: usize, auth_overhead: usize) -> usize {
-    HEADER_LEN
-        + DICT_LEN_BYTES        // rule_dict_len + node_dict_len
-        + 16                    // one rule fingerprint
-        + 16                    // one node id
-        + PER_CELL_IDENT_BYTES  // one cell's identity columns
-        + count_size            // its count
-        + auth_overhead
-}
-
 /// Synchronous iterator over outbound packets. Not `std::iter::Iterator` —
 /// `next_into` takes a caller-owned buffer; `Iterator::next` cannot. A caller
 /// may stop early: handles it never encodes are simply not sent.
 #[must_use = "Packets encodes nothing until next_into is called"]
-pub struct Packets<'a, C: Count> {
+pub struct Packets<'a> {
     header: Header,
-    store: &'a CellStore<C>,
+    store: &'a CellStore,
     handles: &'a [CellHandle],
-    key: Option<&'a HmacKey>,
     scratch: &'a mut WireScratch,
     limits: FrameLimits,
     cursor: usize,
 }
 
-impl<'a, C: Count> Packets<'a, C> {
-    /// Build an unauthenticated packet iterator. The `cluster_id_hash`,
-    /// `sender_node_id`, `sender_incarnation` fields of `header` are copied
-    /// into every packet; the codec overwrites `count_width`, `cell_count`,
-    /// `body_len`, `flags`, `min/max_origin_sequence` on each packet.
-    pub fn unauth(
+impl<'a> Packets<'a> {
+    /// Build a packet iterator; every packet carries `header` and its own
+    /// cell count.
+    pub fn new(
         header: Header,
-        store: &'a CellStore<C>,
+        store: &'a CellStore,
         handles: &'a [CellHandle],
         scratch: &'a mut WireScratch,
         limits: FrameLimits,
     ) -> Result<Self, EncodeError> {
-        Self::new(header, store, handles, None, scratch, limits)
-    }
-
-    /// Authenticated variant — HMAC-SHA256 over each packet's
-    /// `header || body`. [`FLAG_AUTHENTICATED`] is set on every emitted
-    /// packet.
-    pub fn auth(
-        header: Header,
-        store: &'a CellStore<C>,
-        handles: &'a [CellHandle],
-        key: &'a HmacKey,
-        scratch: &'a mut WireScratch,
-        limits: FrameLimits,
-    ) -> Result<Self, EncodeError> {
-        Self::new(header, store, handles, Some(key), scratch, limits)
-    }
-
-    fn new(
-        header: Header,
-        store: &'a CellStore<C>,
-        handles: &'a [CellHandle],
-        key: Option<&'a HmacKey>,
-        scratch: &'a mut WireScratch,
-        limits: FrameLimits,
-    ) -> Result<Self, EncodeError> {
-        let count_size = std::mem::size_of::<C>();
-        let auth_overhead = if key.is_some() { AUTH_TAG_LEN } else { 0 };
-        if limits.max_payload_bytes < min_payload_bytes(count_size, auth_overhead) {
+        debug_assert!(
+            matches!(
+                header.payload,
+                Payload::Own { .. } | Payload::Relay { .. } | Payload::Sweep
+            ),
+            "only the data kinds carry cells"
+        );
+        if limits.max_payload_bytes < MIN_PAYLOAD_BYTES {
             return Err(EncodeError::BudgetTooSmall);
         }
         Ok(Self {
             header,
             store,
             handles,
-            key,
             scratch,
             limits,
             cursor: 0,
         })
     }
 
-    /// Encode the next packet into `buf`, or return `None` once every handle
-    /// is consumed. The encoder clears `buf` first.
-    pub fn next_into(&mut self, buf: &mut PacketBuf) -> Option<PacketWritten> {
+    /// Encode the next packet into `buf` and return its cell count, or
+    /// return `None` once every handle is consumed. The encoder clears `buf`
+    /// first.
+    pub fn next_into(&mut self, buf: &mut PacketBuf) -> Option<u16> {
         buf.inner.clear();
         if self.cursor >= self.handles.len() {
             return None;
         }
 
-        let auth_overhead = if self.key.is_some() { AUTH_TAG_LEN } else { 0 };
-        let body_budget = self
-            .limits
-            .max_payload_bytes
-            .saturating_sub(HEADER_LEN + auth_overhead);
-
         // Reserve the header slot; encode_packet_body appends the body.
         buf.inner.resize(HEADER_LEN, 0);
-        let encoded = encode_packet_body::<C>(
+        let encoded = encode_packet_body(
             self.store,
             self.handles,
             self.cursor,
-            body_budget,
+            self.limits.max_payload_bytes - HEADER_LEN,
             self.scratch,
             &mut buf.inner,
         );
@@ -280,167 +212,46 @@ impl<'a, C: Count> Packets<'a, C> {
             return None;
         }
 
-        let next_cursor = self.cursor + encoded.handles_consumed;
-        let more = next_cursor < self.handles.len();
-
-        let mut flags = self.header.flags;
-        if more {
-            flags |= FLAG_MORE;
-        } else {
-            flags &= !FLAG_MORE;
-        }
-        if self.key.is_some() {
-            flags |= FLAG_AUTHENTICATED;
-        } else {
-            flags &= !FLAG_AUTHENTICATED;
-        }
-
-        let mut packet_header = self.header;
-        packet_header.flags = flags;
-        packet_header.count_width = std::mem::size_of::<C>() as u32;
-        packet_header.cell_count = encoded.cells_emitted;
-        packet_header.body_len = encoded.body_len as u32;
-        packet_header.min_origin_sequence = encoded.min_origin_sequence;
-        packet_header.max_origin_sequence = encoded.max_origin_sequence;
-
-        patch_header(&mut buf.inner[..HEADER_LEN], &packet_header);
-
-        if let Some(key) = self.key {
-            // Sign header + body (with the final flags already in place) and
-            // append the tag. Total length is guaranteed <= capacity by the
-            // constructor-time check.
-            let tag = auth::sign(key, &buf.inner[..HEADER_LEN + encoded.body_len]);
-            buf.inner.extend_from_slice(&tag);
-        }
-
+        buf.inner[..HEADER_LEN].copy_from_slice(&write_header(&self.header, encoded.cells_emitted));
         debug_assert!(buf.inner.len() <= self.limits.max_payload_bytes);
 
-        self.cursor = next_cursor;
-        Some(PacketWritten {
-            cells_emitted: encoded.cells_emitted,
-            cells_dropped: encoded.cells_dropped,
-            flags,
-        })
+        self.cursor += encoded.handles_consumed;
+        Some(encoded.cells_emitted)
     }
 }
 
 // -- decode -----------------------------------------------------------------
 
-pub fn decode_unauth<C: Count>(
+/// Decode one packet, handing each cell to `on_cell`, and return its header.
+/// A packet from another cluster fails as [`DecodeError::ForeignCluster`]
+/// before its body is read. On any error the cells already handed over must
+/// be discarded.
+pub fn decode(
     bytes: &[u8],
     limits: FrameLimits,
-    obs: &mut ObservationBatch<C>,
-) -> Result<DecodedSummary, DecodeError> {
-    decode_inner(
-        bytes,
-        None,
-        limits,
-        |_| true,
-        |cell| obs.push(observation_from_wire(cell)),
-    )
-}
-
-pub fn decode_auth<C: Count>(
-    bytes: &[u8],
-    key: &HmacKey,
-    limits: FrameLimits,
-    obs: &mut ObservationBatch<C>,
-) -> Result<DecodedSummary, DecodeError> {
-    decode_inner(
-        bytes,
-        Some(key),
-        limits,
-        |_| true,
-        |cell| obs.push(observation_from_wire(cell)),
-    )
-}
-
-#[inline]
-fn observation_from_wire<C: Count>(cell: WireCell<C>) -> Observation<C> {
-    Observation {
-        rule_fingerprint: cell.rule_fingerprint,
-        key_hash: cell.key_hash,
-        bucket: cell.bucket,
-        origin: cell.origin_node_id,
-        incarnation: cell.origin_incarnation,
-        count: cell.count,
-        last_update_millis: cell.last_update_millis,
-    }
-}
-
-pub fn decode_unauth_visit<C: Count>(
-    bytes: &[u8],
-    limits: FrameLimits,
-    accept_header: impl FnOnce(&Header) -> bool,
-    on_cell: impl FnMut(WireCell<C>),
-) -> Result<DecodedSummary, DecodeError> {
-    decode_inner(bytes, None, limits, accept_header, on_cell)
-}
-
-pub fn decode_auth_visit<C: Count>(
-    bytes: &[u8],
-    key: &HmacKey,
-    limits: FrameLimits,
-    accept_header: impl FnOnce(&Header) -> bool,
-    on_cell: impl FnMut(WireCell<C>),
-) -> Result<DecodedSummary, DecodeError> {
-    decode_inner(bytes, Some(key), limits, accept_header, on_cell)
-}
-
-fn decode_inner<C: Count>(
-    bytes: &[u8],
-    key: Option<&HmacKey>,
-    limits: FrameLimits,
-    accept_header: impl FnOnce(&Header) -> bool,
-    on_cell: impl FnMut(WireCell<C>),
-) -> Result<DecodedSummary, DecodeError> {
+    cluster_id_hash: u128,
+    on_cell: impl FnMut(Observation),
+) -> Result<Header, DecodeError> {
     if bytes.len() > limits.max_payload_bytes {
         return Err(DecodeError::PayloadTooLarge);
     }
-    let auth_overhead = if key.is_some() { AUTH_TAG_LEN } else { 0 };
-    if bytes.len() < HEADER_LEN + auth_overhead {
-        return Err(DecodeError::TooShort);
-    }
+    let (header, cell_count) = read_header(bytes, cluster_id_hash)?;
+    decode_body(&bytes[HEADER_LEN..], cell_count, on_cell)?;
+    Ok(header)
+}
 
-    let (frame, _tag) = if let Some(key) = key {
-        let split = bytes.len() - AUTH_TAG_LEN;
-        let (frame, tag) = bytes.split_at(split);
-        auth::verify(key, frame, tag).map_err(|_| DecodeError::AuthenticationFailed)?;
-        (frame, Some(tag))
-    } else {
-        (bytes, None)
-    };
+fn read_u16(src: &[u8]) -> u16 {
+    u16::from_le_bytes(src[..2].try_into().expect("2 bytes"))
+}
 
-    let header = read_header(frame)?;
-    if header.count_width as usize != std::mem::size_of::<C>() {
-        return Err(DecodeError::BadCountWidth);
-    }
-    if header.cell_count > limits.max_cells {
-        return Err(DecodeError::CapacityExceeded);
-    }
-    let body_len = header.body_len as usize;
-    let total_required = HEADER_LEN
-        .checked_add(body_len)
-        .ok_or(DecodeError::BodyLenMismatch)?;
-    if total_required != frame.len() {
-        if total_required > frame.len() {
-            return Err(DecodeError::BodyLenMismatch);
-        }
-        return Err(DecodeError::Trailing);
-    }
+fn read_u32(src: &[u8]) -> u32 {
+    u32::from_le_bytes(src[..4].try_into().expect("4 bytes"))
+}
 
-    let summary = DecodedSummary {
-        header,
-        cell_count: header.cell_count,
-        flags: header.flags,
-    };
+fn read_u64(src: &[u8]) -> u64 {
+    u64::from_le_bytes(src[..8].try_into().expect("8 bytes"))
+}
 
-    if !accept_header(&header) {
-        return Ok(summary);
-    }
-
-    let body_bytes = &frame[HEADER_LEN..HEADER_LEN + body_len];
-    decode_body_visit::<C>(body_bytes, header.cell_count, on_cell)?;
-
-    Ok(summary)
+fn read_u128(src: &[u8]) -> u128 {
+    u128::from_le_bytes(src[..16].try_into().expect("16 bytes"))
 }

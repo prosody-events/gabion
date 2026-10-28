@@ -1,8 +1,7 @@
 //! Build the gossip [`NodeIdentity`] at startup.
 //!
-//! `node_id` is a stable per-host identifier so `PeerFrontierTable` doesn't
-//! burn a peer slot on every restart. `incarnation` bumps on every boot so
-//! peers see a fresh per-origin sequence and don't silently prune our cells.
+//! `node_id` is a stable per-host identifier; `incarnation` bumps on every
+//! boot so peers treat the restarted process as a new origin.
 
 use std::net::UdpSocket;
 use std::process;

@@ -498,8 +498,7 @@ they bound resource use.
 | `gabion_gossip_bind ADDR:PORT`                  | *(none)* | UDP bind for the gossip channel. Required for clustering; without it the node counts alone and runs no peer discovery. |
 | `gabion_gossip_cluster ID`                      | `1`     | Cluster identifier: any non-zero u128, in decimal or `0x`-prefixed hex. |
 | `gabion_gossip_tick_interval DURATION`          | `500ms` | Heartbeat period. Shorter = faster convergence, more UDP traffic.                     |
-| `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet: 152 to 65,507. 152 bytes hold the header and one counter; 65,507 is the largest UDP payload over IPv4. |
-| `gabion_gossip_max_cells_per_frame N`           | `4096`  | Maximum cells encoded into one packet.                                                |
+| `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet: 158 to 65,507. 158 bytes hold the header and one counter; 65,507 is the largest UDP payload over IPv4. |
 | `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells emitted across all packets in one tick.                                 |
 | `gabion_gossip_limit_queue_capacity N`          | `8192`  | Slots in the shared-memory request queue workers push counted hits onto for the leader, 64 to 1,048,576, rounded up to a power of two. Each slot is 72 bytes of the `gabion_limit_zone` SIZE, so raise SIZE with it. The default covers a 1.3 s leader handover at up to 6,300 counted hits a second per pod; raise it when the `queue_dropped` counter rises. A reload that changes it needs a new SIZE or a restart. |
 | `gabion_gossip_recv_buffer_bytes N`            | `4194304` | Receive buffer the gossip socket asks the kernel for, 65,536 to 1,073,741,823 bytes. The host's `net.core.rmem_max` caps it; `socket_buffer_capped` says when. See [Socket buffers](../gabion/README.md#socket-buffers). |
@@ -507,12 +506,12 @@ they bound resource use.
 
 ### Storage — CRDT capacities
 
-The CRDT cell store, dictionaries, dirty rings, and peer frontier
-table allocate exactly once, at leader startup. These knobs size
-that allocation, so raising one also raises the worker's RSS by
-roughly the named slot count times the per-slot byte cost. The
-defaults are sized for production clusters and you should only need
-to touch them if your workload runs into the cap.
+The CRDT cell store, dictionaries, and dirty rings allocate exactly
+once, at leader startup. These knobs size that allocation, so raising
+one also raises the worker's RSS by roughly the named slot count
+times the per-slot byte cost. The defaults are sized for production
+clusters and you should only need to touch them if your workload runs
+into the cap.
 
 | Directive                                       | Default     | Effect                                                                                |
 |-------------------------------------------------|-------------|---------------------------------------------------------------------------------------|
@@ -521,7 +520,6 @@ to touch them if your workload runs into the cap.
 | `gabion_storage_node_dictionary_capacity N`     | `1024`      | Number of distinct (node_id, incarnation) slots.                                      |
 | `gabion_storage_local_dirty_capacity N`         | `65536`     | Local dirty-ring capacity. Sized to absorb a burst between heartbeats.                |
 | `gabion_storage_forwarded_dirty_capacity N`     | `524288`    | Forwarded dirty-ring capacity. Sized larger because it tracks peer-originated edits we still owe other peers. |
-| `gabion_storage_peer_capacity N`                | `256`       | Peer slots in the peer-frontier table (one row per peer × node).                      |
 | `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare, up to 65,535.                           |
 | `gabion_storage_max_descriptor_bytes N`         | `512`       | Per-request budget on `(key + value)` bytes summed across descriptors plus the domain. Exceeded ⇒ 400. |
 | `gabion_storage_max_key_bytes N`                | `128`       | Cap on a single descriptor key's length (validated at config phase).                  |
@@ -832,7 +830,7 @@ below are the module's own.
 | `` gabion: `X` is 0, but it must be at least 1: … ``                           | A count, capacity or duration directive was set to 0, which would disable what it sizes.                                                            | Remove the directive to use the default the message names, or set a positive value.                                              |
 | `` gabion: `X` is `V`, which is not …, for example `E`. … ``                   | The directive's argument does not parse: an integer in range, a duration in whole milliseconds (`500ms`), a socket address, a Kubernetes name, or a non-zero cluster id. | Write it like the example, or remove the directive to use the default.                                                           |
 | `` gabion: `X` is N; gabion supports MIN to MAX. … ``                          | A capacity directive is outside the range gabion can hold; the message gives the reason.                                                            | Set it inside the range, or remove it.                                                                                           |
-| `gabion: The gossip packet size …`, `… error budget …`, or `` … `gossip.min_emit_interval` … must be at least 1ms and shorter than … `` | A settings rule failed once the `http {}` block was read: the packet size outside 152 to 65,507, the error budget outside 1 to 10,000, or the emit floor at or above the heartbeat. | Follow the message; it names the directive and the range.                                                                        |
+| `gabion: The gossip packet size …`, `… error budget …`, or `` … `gossip.min_emit_interval` … must be at least 1ms and shorter than … `` | A settings rule failed once the `http {}` block was read: the packet size outside 158 to 65,507, the error budget outside 1 to 10,000, or the emit floor at or above the heartbeat. | Follow the message; it names the directive and the range.                                                                        |
 | `` gabion: `gabion_limit_zone` size N bytes is too small to hold gabion's request queue … `` | SIZE cannot hold the request queue (`gabion_gossip_limit_queue_capacity` × 72 bytes) and 1,024 counter slots.                              | Raise SIZE to at least the size the message names, or lower `gabion_gossip_limit_queue_capacity`.                               |
 | `rules are declared but gabion_limit_zone is not set`                         | The config declares rules but no zone, so there is nowhere to count hits and every request would be admitted uncounted.                             | Add `gabion_limit_zone zone=gabion:64m;` to the `http {}` block, or check that the include declaring it is loaded.               |
 | Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`      | A client crossed a rule's limit.                                                                                                                    | Expected. `Retry-After` says how long to back off; the rule with the longest window owns the header.                             |

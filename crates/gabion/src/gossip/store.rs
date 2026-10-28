@@ -7,7 +7,7 @@
 //! via this trait; tests use the in-memory backing store defined in
 //! `gossip::tests`.
 
-use crate::crdt::{Count, DeltaSink, ExpirationSink};
+use crate::crdt::{DeltaSink, ExpirationSink};
 
 /// Downstream count store. The runtime calls `apply` once per event-loop
 /// iteration with whatever rows the arm produced (each sink may be empty —
@@ -24,24 +24,24 @@ use crate::crdt::{Count, DeltaSink, ExpirationSink};
 /// `apply` is synchronous and non-blocking by contract — backends must use
 /// lock-free or fine-grained-locked structures so the gossip runtime is not
 /// stalled by a coarse lock acquisition.
-pub trait AggregateStore<C: Count> {
-    fn apply(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>);
+pub trait AggregateStore {
+    fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink);
 }
 
 /// `Arc<T>` forwards to its inner store. Lets downstream code share one
 /// `Arc<Aggregate>` handle between the runtime and the read path without any
 /// wrapper boilerplate.
-impl<C: Count, T: AggregateStore<C> + ?Sized> AggregateStore<C> for std::sync::Arc<T> {
+impl<T: AggregateStore + ?Sized> AggregateStore for std::sync::Arc<T> {
     #[inline]
-    fn apply(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>) {
+    fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink) {
         T::apply(self, deltas, expirations)
     }
 }
 
 /// `Rc<T>` forwards too, for single-threaded sim setups.
-impl<C: Count, T: AggregateStore<C> + ?Sized> AggregateStore<C> for std::rc::Rc<T> {
+impl<T: AggregateStore + ?Sized> AggregateStore for std::rc::Rc<T> {
     #[inline]
-    fn apply(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>) {
+    fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink) {
         T::apply(self, deltas, expirations)
     }
 }

@@ -157,8 +157,8 @@ impl NodeStore {
     }
 }
 
-impl AggregateStore<u32> for NodeStore {
-    fn apply(&self, deltas: &DeltaSink<u32>, expirations: &ExpirationSink<u32>) {
+impl AggregateStore for NodeStore {
+    fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink) {
         self.counts.apply(deltas, expirations);
         for i in 0..deltas.len() {
             if deltas.applies_locally[i] != 0 && deltas.deltas[i] != 0 {
@@ -184,7 +184,7 @@ pub struct Launched<F> {
 
 /// The driver's handle on a running node: its client and admin channel.
 pub struct Node {
-    client: GossipClient<u32>,
+    client: GossipClient,
     admin: mpsc::Sender<AdminCommand>,
     identity: Rc<Identity>,
 }
@@ -233,7 +233,7 @@ impl HealthReply {
             cell_store_full_rejects: stats.cell_store_full_rejects,
             rule_dictionary_full_rejects: stats.rule_dictionary_full_rejects,
             node_dictionary_full_rejects: stats.node_dictionary_full_rejects,
-            decode_rejects: snapshot.decode_reject_count,
+            decode_rejects: snapshot.counters.decode_rejects(),
         })
     }
 }
@@ -254,7 +254,6 @@ pub(super) fn settings(sizing: &Sizing) -> Result<Settings> {
         local_dirty_capacity: u32::try_from(ring(d::STORAGE_LOCAL_DIRTY_CAPACITY))?.try_into()?,
         forwarded_dirty_capacity: u32::try_from(ring(d::STORAGE_FORWARDED_DIRTY_CAPACITY))?
             .try_into()?,
-        peer_capacity: fit(d::STORAGE_PEER_CAPACITY, sizing.max_running_nodes).try_into()?,
         ..Settings::default()
     })
 }
@@ -314,7 +313,7 @@ impl Launcher {
         let identity = NodeIdentity::new(NodeId(id), 1);
         let mut config = self.gossip.clone();
         config.rng_seed = Rng::stream(self.seed, Stream::Gossip, idx as u64).next_u64();
-        let cell_store = CellStore::<u32>::new(self.cells, identity, &self.identity.rules);
+        let cell_store = CellStore::new(self.cells, identity, &self.identity.rules);
         let store = Rc::new(NodeStore::new(
             Rc::clone(&self.keys),
             Rc::clone(&self.identity),

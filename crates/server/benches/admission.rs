@@ -44,8 +44,8 @@ fn descriptor(tenant: String) -> RateLimitDescriptor {
 struct Node {
     runtime: Runtime,
     local: LocalSet,
-    limiter: SharedLimiter<u32>,
-    client: GossipClient<u32>,
+    limiter: SharedLimiter,
+    client: GossipClient,
     hot: Vec<RateLimitDescriptor>,
 }
 
@@ -75,7 +75,7 @@ impl Node {
             .collect();
         let table = Arc::new(RuleTable::new(built, None).expect("table"));
         let hot: Vec<String> = (0..50).map(|i| format!("hot-{i}")).collect();
-        let mut deltas = DeltaSink::<u32>::default();
+        let mut deltas = DeltaSink::default();
         for rule in table.rules() {
             for tenant in &hot {
                 deltas.handles.push(CellHandle::default());
@@ -109,7 +109,7 @@ impl Node {
                 SimRouter::new().bind("127.0.0.1:7000".parse().unwrap()),
                 TokioClock::from_millis(0),
                 gossip,
-                CellStore::<u32>::new(storage, NodeIdentity::new(NodeId(1), 1), &table),
+                CellStore::new(storage, NodeIdentity::new(NodeId(1), 1), &table),
                 Arc::new(Aggregate::new(&storage)),
             )
         });

@@ -93,7 +93,7 @@ impl VariableLookup for Vars<'_> {
 
 /// Fold one hit NGINX queued into the cluster aggregate, as its leader does.
 fn fold(counts: &Aggregate, hit: QueueEvent) {
-    let deltas = DeltaSink::<u32> {
+    let deltas = DeltaSink {
         handles: vec![CellHandle::default()],
         keys: vec![CellIdentity {
             rule_fingerprint: hit.rule_fingerprint,
@@ -132,7 +132,7 @@ fn equal_rules_have_equal_identity_in_both_adapters() {
         SimRouter::new().bind("127.0.0.1:7000".parse().expect("a socket address")),
         FixedClock::default(),
         config.gossip,
-        CellStore::<u32>::new(storage, NodeIdentity::new(NodeId(1), 1), &gabiond),
+        CellStore::new(storage, NodeIdentity::new(NodeId(1), 1), &gabiond),
         counts.clone(),
     );
     let limiter = SharedLimiter::new(gabiond.clone(), client, counts.clone(), storage);

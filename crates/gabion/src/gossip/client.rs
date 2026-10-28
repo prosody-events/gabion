@@ -1,44 +1,24 @@
 //! Client-side handle and the request enum the runtime drains.
 
-use std::marker::PhantomData;
-
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::crdt::{BucketEpoch, Count, KeyHash};
+use crate::crdt::{BucketEpoch, KeyHash};
 
 use super::GossipError;
 
 /// Send-side handle to the gossip runtime. Cheap to clone; safe to share
 /// across threads even though the runtime itself is single-threaded — the
 /// mpsc channel is the boundary.
-///
-/// `C` is carried as a marker so the client and the [`super::GossipRuntime`]
-/// it was created from share the same count width by construction. The
-/// channel itself transports plain `u64` hit deltas and the runtime does
-/// the saturating cast at the boundary.
-#[derive(Debug)]
-pub struct GossipClient<C: Count> {
+#[derive(Clone, Debug)]
+pub struct GossipClient {
     requests: mpsc::Sender<Request>,
-    _marker: PhantomData<fn() -> C>,
 }
 
-impl<C: Count> Clone for GossipClient<C> {
-    fn clone(&self) -> Self {
-        Self {
-            requests: self.requests.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<C: Count> GossipClient<C> {
+impl GossipClient {
     pub(super) fn new(requests: mpsc::Sender<Request>) -> Self {
-        Self {
-            requests,
-            _marker: PhantomData,
-        }
+        Self { requests }
     }
 
     /// Record one or more hits against the local origin. Returns when the

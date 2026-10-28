@@ -13,7 +13,7 @@ fn table(capacity: usize) -> (TestZone, ShmRegion, ShmAggregateStore) {
 
 /// One leader term on node 1: a fresh `CellStore` learns a peer's count
 /// from gossip and `store` applies the resulting delta.
-fn lead(store: &ShmAggregateStore, incarnation: u32) -> (CellStore<u32>, u128) {
+fn lead(store: &ShmAggregateStore, incarnation: u32) -> (CellStore, u128) {
     let identity = NodeIdentity::new(NodeId(1), incarnation);
     let storage = crate::mock::validated(|_| {}).1;
     let rule = RuleDef {
@@ -46,7 +46,7 @@ fn lead(store: &ShmAggregateStore, incarnation: u32) -> (CellStore<u32>, u128) {
     (cells, fingerprint)
 }
 
-fn expire(store: &ShmAggregateStore, cells: &mut CellStore<u32>) {
+fn expire(store: &ShmAggregateStore, cells: &mut CellStore) {
     let mut expired = ExpirationSink::with_capacity(cells.capacity() as usize);
     assert_eq!(cells.expire_at(100_000, &mut expired), Expiry::Done);
     store.apply(&DeltaSink::default(), &expired);

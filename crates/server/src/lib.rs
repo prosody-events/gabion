@@ -20,7 +20,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gabion::aggregate::Aggregate;
-use gabion::crdt::{BucketEpoch, Count, ValidStorageConfig};
+use gabion::crdt::{BucketEpoch, ValidStorageConfig};
 use gabion::gossip::{GossipClient, TryRecordError};
 use gabion::rules::{CardinalityLimit, Descriptor, EnforcementMode, RuleTable, hash_key};
 use gabion::settings::Setting;
@@ -58,9 +58,9 @@ pub enum ServeError {
 /// Cheap to clone (`Arc` + `Clone` handles). The gossip runtime that backs
 /// `gossip_client` is owned by `gabiond` and joined separately.
 #[derive(Clone)]
-pub struct SharedLimiter<C: Count = u32> {
+pub struct SharedLimiter {
     rule_table: Arc<RuleTable>,
-    gossip_client: GossipClient<C>,
+    gossip_client: GossipClient,
     counts: Arc<Aggregate>,
     storage: ValidStorageConfig,
     warnings: Arc<WarningCounts>,
@@ -92,10 +92,10 @@ thread_local! {
     static PLANNED: Cell<Vec<Planned>> = const { Cell::new(Vec::new()) };
 }
 
-impl<C: Count> SharedLimiter<C> {
+impl SharedLimiter {
     pub fn new(
         rule_table: Arc<RuleTable>,
-        gossip_client: GossipClient<C>,
+        gossip_client: GossipClient,
         counts: Arc<Aggregate>,
         storage: ValidStorageConfig,
     ) -> Self {
@@ -273,7 +273,7 @@ fn pick_min_remaining(current: Option<Quota>, candidate: Quota) -> Quota {
 // `gabion::throttle`, so the log volume is bounded at ~log2(N) regardless of
 // request rate.
 
-impl<C: Count> SharedLimiter<C> {
+impl SharedLimiter {
     /// Reject one descriptor that exceeds `limit`, logging at powers of two.
     fn note_cardinality_reject(
         &self,
@@ -352,12 +352,12 @@ impl<C: Count> SharedLimiter<C> {
 
 /// Tonic-mounted gRPC service.
 #[derive(Clone)]
-pub struct EnvoyRateLimitService<C: Count = u32> {
-    limiter: SharedLimiter<C>,
+pub struct EnvoyRateLimitService {
+    limiter: SharedLimiter,
 }
 
-impl<C: Count> EnvoyRateLimitService<C> {
-    pub fn new(limiter: SharedLimiter<C>) -> Self {
+impl EnvoyRateLimitService {
+    pub fn new(limiter: SharedLimiter) -> Self {
         Self { limiter }
     }
 }
@@ -376,14 +376,13 @@ pub const RATE_LIMIT_SERVICE_NAME: &str = "envoy.service.ratelimit.v3.RateLimitS
 ///    being refused.
 /// 3. `grpc.reflection.v1.ServerReflection` — lets `grpcurl list` and similar
 ///    tools enumerate services without ahead-of-time `.proto` files.
-pub async fn serve<C, F, H>(
+pub async fn serve<F, H>(
     bind: std::net::SocketAddr,
-    limiter: SharedLimiter<C>,
+    limiter: SharedLimiter,
     health_server: tonic_health::pb::health_server::HealthServer<H>,
     shutdown: F,
 ) -> Result<(), ServeError>
 where
-    C: Count + Send + Sync + 'static,
     F: std::future::Future<Output = ()>,
     H: tonic_health::pb::health_server::Health,
 {
@@ -405,10 +404,8 @@ where
 }
 
 #[tonic::async_trait]
-impl<C> envoy_types::pb::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService
-    for EnvoyRateLimitService<C>
-where
-    C: Count + Send + Sync + 'static,
+impl envoy_types::pb::envoy::service::ratelimit::v3::rate_limit_service_server::RateLimitService
+    for EnvoyRateLimitService
 {
     async fn should_rate_limit(
         &self,

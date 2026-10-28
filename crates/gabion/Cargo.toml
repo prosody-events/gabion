@@ -13,7 +13,6 @@ async-stream.workspace = true
 either.workspace = true
 futures.workspace = true
 getrandom.workspace = true
-hmac.workspace = true
 humantime.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
@@ -22,7 +21,6 @@ libc = { workspace = true, optional = true }
 # `gabion-nginx`'s `make loom` only.
 loom = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-sha2.workspace = true
 socket2 = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true

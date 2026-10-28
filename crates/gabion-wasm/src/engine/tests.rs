@@ -683,7 +683,6 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
         small.node_dictionary_capacity,
         full.node_dictionary_capacity
     );
-    assert_eq!(small.peer_capacity, full.peer_capacity);
 
     let caps = full;
     // Each origin holds its live buckets plus the one emerging, and every node
@@ -709,7 +708,6 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
         "node_dictionary_capacity {} cannot hold {MAX_NODES} origins",
         caps.node_dictionary_capacity,
     );
-    assert!(usize::from(caps.peer_capacity.get()) >= MAX_NODES);
 
     // …and the shrink is real: even at the ceiling every cap is a few thousand
     // entries, well under the production defaults

@@ -119,7 +119,7 @@ async fn admit_without_allocating(rules: u16) {
         SimRouter::new().bind("127.0.0.1:7000".parse().unwrap()),
         TokioClock::from_millis(0),
         gossip,
-        CellStore::<u32>::new(storage, NodeIdentity::new(NodeId(1), 1), &table),
+        CellStore::new(storage, NodeIdentity::new(NodeId(1), 1), &table),
         counts.clone(),
     );
     let gossip = tokio::task::spawn_local(runtime.run(futures::stream::empty()));

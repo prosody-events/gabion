@@ -31,7 +31,6 @@ gabion-nginx = { path = "crates/nginx" }
 # in gabiond); `sys_rng` selects the OS backend (0.4 made it opt-in). The
 # wasm32 target adds `wasm_js` in gabion's manifest.
 getrandom = { version = "0.4", features = ["std", "sys_rng"] }
-hmac = "0.13"
 humantime = "2"
 humantime-serde = "1"
 # Pin to v1_32 (the floor offered by k8s-openapi 0.28; it dropped v1_31).
@@ -50,7 +49,6 @@ quickcheck = "1"
 quickcheck_macros = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.11"
 socket2 = "0.6"
 thiserror = "2"
 # Wasm-safe base: every feature here builds on wasm32-unknown-unknown so the

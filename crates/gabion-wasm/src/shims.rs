@@ -5,11 +5,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use gabion::crdt::{BucketEpoch, Count, DeltaSink, ExpirationSink, KeyHash};
+use gabion::crdt::{BucketEpoch, DeltaSink, ExpirationSink, KeyHash};
 use gabion::gossip::AggregateStore;
 use gabion::gossip::GossipTransport;
 use gabion::gossip::sim::{SimRouter, SimTransport};
@@ -32,20 +31,18 @@ pub type AddressBook = Rc<RefCell<HashMap<SocketAddr, u32>>>;
 /// surface (like the adapters' aggregate table) and the cell-event source.
 /// Each `apply` folds the rows into a per-key total and emits a
 /// `CellCreated` / `CellUpdated` / `CellExpired` event per row.
-pub struct EventEmittingAggregateStore<C: Count> {
+pub struct EventEmittingAggregateStore {
     node: u32,
     log: EventLog,
     inner: RefCell<HashMap<(u128, KeyHash, BucketEpoch), u64>>,
-    _marker: PhantomData<C>,
 }
 
-impl<C: Count> EventEmittingAggregateStore<C> {
+impl EventEmittingAggregateStore {
     pub fn new(node: u32, log: EventLog) -> Self {
         Self {
             node,
             log,
             inner: RefCell::new(HashMap::new()),
-            _marker: PhantomData,
         }
     }
 
@@ -56,8 +53,8 @@ impl<C: Count> EventEmittingAggregateStore<C> {
     }
 }
 
-impl<C: Count> AggregateStore<C> for EventEmittingAggregateStore<C> {
-    fn apply(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>) {
+impl AggregateStore for EventEmittingAggregateStore {
+    fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink) {
         let mut map = self.inner.borrow_mut();
         let mut log = self.log.borrow_mut();
         for i in 0..deltas.len() {

@@ -23,7 +23,7 @@ use crate::defaults;
 use crate::discovery::DiscoveryConfig;
 use crate::gossip::ValidGossipConfig;
 use crate::rules::CardinalityLimits;
-use crate::wire::{FrameLimits, MIN_PAYLOAD_BYTES};
+use crate::wire::{FrameLimits, MAX_PAYLOAD_BYTES, MIN_PAYLOAD_BYTES};
 
 /// A non-zero default; zero fails to compile.
 macro_rules! nz {
@@ -169,10 +169,6 @@ settings! {
         forwarded_dirty_capacity: NonZeroU32 =
             nz!(defaults::STORAGE_FORWARDED_DIRTY_CAPACITY as u32),
         "this node could not pass its peers' counts on";
-    StoragePeerCapacity => "storage.peer_capacity", "GABION_STORAGE_PEER_CAPACITY",
-        "gabion_storage_peer_capacity";
-        peer_capacity: NonZeroU16 = nz!(defaults::STORAGE_PEER_CAPACITY),
-        "this node could not track any peer";
     StorageMaxDescriptorCount => "storage.max_descriptor_count",
         "GABION_STORAGE_MAX_DESCRIPTOR_COUNT", "gabion_storage_max_descriptor_count";
         max_descriptor_count: NonZeroU16 = nz!(defaults::STORAGE_MAX_DESCRIPTOR_COUNT),
@@ -210,10 +206,6 @@ settings! {
     GossipMaxPayloadBytes => "gossip.max_payload_bytes", "GABION_GOSSIP_MAX_PAYLOAD_BYTES",
         "gabion_gossip_max_payload_bytes";
         max_payload_bytes: usize = defaults::GOSSIP_MAX_PAYLOAD_BYTES;
-    GossipMaxCellsPerFrame => "gossip.max_cells_per_frame", "GABION_GOSSIP_MAX_CELLS_PER_FRAME",
-        "gabion_gossip_max_cells_per_frame";
-        max_cells_per_frame: NonZeroU32 = nz!(defaults::GOSSIP_MAX_CELLS_PER_FRAME),
-        "no gossip packet could carry a counter";
     GossipMaxCellsPerTick => "gossip.max_cells_per_tick", "GABION_GOSSIP_MAX_CELLS_PER_TICK",
         "gabion_gossip_max_cells_per_tick";
         max_cells_per_tick: NonZeroUsize = nz!(defaults::GOSSIP_MAX_CELLS_PER_TICK),
@@ -250,9 +242,6 @@ settings! {
         "gabion_discovery_service_allow";
         service_allow: Box<[Box<str>]> = Box::default();
 }
-
-/// The largest UDP payload over IPv4: 65,535 − 20 (IP header) − 8 (UDP header).
-const MAX_PAYLOAD_BYTES: usize = 65_507;
 
 /// The smallest `gossip.limit_queue_capacity`, and the depth of the runtime's
 /// request queue under [`ValidGossipConfig::with_shallow_limit_queue`].
@@ -375,14 +364,12 @@ impl Settings {
             max_cells_per_tick: self.max_cells_per_tick,
             wire_limits: FrameLimits {
                 max_payload_bytes: self.max_payload_bytes,
-                max_cells: self.max_cells_per_frame.get(),
             },
             limit_queue_capacity: self.limit_queue_capacity,
             #[cfg(feature = "transport-udp")]
             recv_buffer_bytes: self.recv_buffer_bytes,
             send_buffer_bytes: self.send_buffer_bytes,
             tick_interval: self.tick_interval.duration(),
-            auth_key: None,
             rng_seed: self.rng_seed.unwrap_or_default(),
             target_err_bps,
             min_emit_interval: self.min_emit_interval,
@@ -394,7 +381,6 @@ impl Settings {
             node_dictionary_capacity: self.node_dictionary_capacity,
             local_dirty_capacity: self.local_dirty_capacity,
             forwarded_dirty_capacity: self.forwarded_dirty_capacity,
-            peer_capacity: self.peer_capacity,
             cardinality: CardinalityLimits {
                 max_descriptor_count: usize::from(self.max_descriptor_count.get()),
                 max_descriptor_bytes: self.max_descriptor_bytes.get(),

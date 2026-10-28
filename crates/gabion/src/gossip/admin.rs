@@ -42,7 +42,6 @@ pub struct AdminSnapshot {
     pub store_stats: CellStoreStats,
     pub local_dirty_len: u32,
     pub forwarded_dirty_len: u32,
-    pub decode_reject_count: u64,
     /// Event counts since startup.
     pub counters: GossipCounters,
     /// Cumulative ticks the runtime has processed. Includes both
@@ -97,19 +96,37 @@ pub struct GossipCounters {
     pub send_errors: u64,
     /// Packets that could not be encoded; logged as `encode_failed`.
     pub encode_failures: u64,
+    /// Packets dropped as not valid gossip; logged as `decode_rejected` with
+    /// `reason = "framing"`.
+    pub decode_rejects_framing: u64,
+    /// Packets dropped as larger than `gossip.max_payload_bytes`; logged as
+    /// `decode_rejected` with `reason = "peer_limits"`.
+    pub decode_rejects_peer_limits: u64,
+    /// Packets dropped for another protocol version; logged as
+    /// `peer_version_mismatch`.
+    pub decode_rejects_version: u64,
+    /// Packets dropped for another cluster id; logged as `decode_rejected`
+    /// with `reason = "cluster"`.
+    pub decode_rejects_cluster: u64,
+}
+
+impl GossipCounters {
+    /// Packets dropped for any cause.
+    pub fn decode_rejects(&self) -> u64 {
+        self.decode_rejects_framing
+            + self.decode_rejects_peer_limits
+            + self.decode_rejects_version
+            + self.decode_rejects_cluster
+    }
 }
 
 /// One peer known to the runtime. `node_id` is `None` until the runtime has
-/// received an inbound packet from this peer; `peer_slot` is `None` until the
-/// peer has been interned in the `PeerFrontierTable`. The two fields are set
-/// together — see the invariant tested in
-/// `quickcheck_peer_slot_pairing_holds_across_lifecycle`.
+/// received an inbound packet from this peer.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct PeerEntry {
     pub addr: SocketAddr,
     pub node_id: Option<NodeId>,
-    pub peer_slot: Option<u16>,
 }
 
 /// Full per-cell view of one runtime's `CellStore`, built inside the gossip

@@ -16,14 +16,13 @@ use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
-    CellHandle, CellStore, Count, DeltaSink, ExpirationSink, Expiry, Incarnation, NodeId,
-    Observation, ObservationBatch,
+    CellHandle, CellStore, DeltaSink, ExpirationSink, Expiry, NodeId, Observation, ObservationBatch,
 };
 use crate::defaults;
 use crate::discovery::PeerEvent;
 use crate::settings::Setting;
 use crate::throttle;
-use crate::wire::{self, Packets, WireScratch};
+use crate::wire::{self, DecodeError, Packets, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, GossipCounters, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
@@ -37,59 +36,21 @@ use super::transport::{GossipTransport, Outbox};
 use super::{GossipError, ValidGossipConfig};
 
 /// One peer the runtime gossips with. `node_id` is `None` until we receive
-/// our first inbound packet from this peer; `peer_slot` caches the
-/// `PeerFrontierTable` slot once interned.
+/// our first inbound packet from this peer.
 struct Peer {
     addr: SocketAddr,
     node_id: Option<NodeId>,
-    peer_slot: Option<u16>,
-}
-
-/// Data-oriented scratch for per-row frontier acks decoded from one inbound
-/// packet. The columns are allocated once at runtime construction and reused
-/// for every inbound arm.
-struct AckColumns {
-    origin_node_ids: Vec<NodeId>,
-    incarnations: Vec<Incarnation>,
-    origin_sequences: Vec<u64>,
-}
-
-impl AckColumns {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            origin_node_ids: Vec::with_capacity(capacity),
-            incarnations: Vec::with_capacity(capacity),
-            origin_sequences: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.origin_node_ids.clear();
-        self.incarnations.clear();
-        self.origin_sequences.clear();
-    }
-
-    fn push(&mut self, origin_node_id: NodeId, incarnation: Incarnation, origin_sequence: u64) {
-        self.origin_node_ids.push(origin_node_id);
-        self.incarnations.push(incarnation);
-        self.origin_sequences.push(origin_sequence);
-    }
-
-    fn len(&self) -> usize {
-        self.origin_node_ids.len()
-    }
 }
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
-pub struct GossipRuntime<C, S, T, K>
+pub struct GossipRuntime<S, T, K>
 where
-    C: Count,
-    S: AggregateStore<C>,
+    S: AggregateStore,
     T: GossipTransport,
     K: Clock,
 {
     config: ValidGossipConfig,
-    store: CellStore<C>,
+    store: CellStore,
     transport: T,
     clock: K,
     requests_rx: mpsc::Receiver<Request>,
@@ -101,13 +62,13 @@ where
     // Downstream count store (write-only).
     aggregates: S,
 
-    // Pre-allocated reusable buffers.
+    // Pre-allocated reusable buffers. `recv_buf` holds any UDP datagram, so
+    // an oversized packet arrives whole and is reported as one.
     recv_buf: Box<[u8]>,
     scratch: WireScratch,
-    obs_buf: ObservationBatch<C>,
-    ack_buf: AckColumns,
-    sink_buf: DeltaSink<C>,
-    expiration_buf: ExpirationSink<C>,
+    obs_buf: ObservationBatch,
+    sink_buf: DeltaSink,
+    expiration_buf: ExpirationSink,
     frame_handles: Vec<CellHandle>,
     outbox: Outbox,
 
@@ -120,9 +81,6 @@ where
     // iteration is processed.
     pending_reply: Option<oneshot::Sender<()>>,
 
-    // Inbound packets that failed to decode. Throttles `decode_rejected` and
-    // is reported in `AdminSnapshot`.
-    decode_reject_count: u64,
     counters: GossipCounters,
 
     // Threshold-triggered anti-entropy state. One column per interned rule slot; sized to the
@@ -170,19 +128,18 @@ where
 }
 
 #[cfg(feature = "transport-udp")]
-impl<C, S> GossipRuntime<C, S, UdpTransport, TokioClock>
+impl<S> GossipRuntime<S, UdpTransport, TokioClock>
 where
-    C: Count,
-    S: AggregateStore<C>,
+    S: AggregateStore,
 {
     /// Bind a UDP socket on `bind_addr` and assemble the runtime with the
     /// production transport and a wall-clock-anchored `TokioClock`.
     pub async fn bind(
         bind_addr: SocketAddr,
         config: ValidGossipConfig,
-        store: CellStore<C>,
+        store: CellStore,
         aggregates: S,
-    ) -> Result<(Self, GossipClient<C>), GossipError> {
+    ) -> Result<(Self, GossipClient), GossipError> {
         let transport = UdpTransport::bind(bind_addr, &config).await?;
         Ok(Self::from_parts(
             transport,
@@ -198,10 +155,10 @@ where
     pub async fn bind_with_admin(
         bind_addr: SocketAddr,
         config: ValidGossipConfig,
-        store: CellStore<C>,
+        store: CellStore,
         aggregates: S,
         admin_rx: mpsc::Receiver<AdminCommand>,
-    ) -> Result<(Self, GossipClient<C>), GossipError> {
+    ) -> Result<(Self, GossipClient), GossipError> {
         let transport = UdpTransport::bind(bind_addr, &config).await?;
         Ok(Self::from_parts_with_admin(
             transport,
@@ -214,10 +171,9 @@ where
     }
 }
 
-impl<C, S, T, K> GossipRuntime<C, S, T, K>
+impl<S, T, K> GossipRuntime<S, T, K>
 where
-    C: Count,
-    S: AggregateStore<C>,
+    S: AggregateStore,
     T: GossipTransport,
     K: Clock,
 {
@@ -227,9 +183,9 @@ where
         transport: T,
         clock: K,
         config: ValidGossipConfig,
-        store: CellStore<C>,
+        store: CellStore,
         aggregates: S,
-    ) -> (Self, GossipClient<C>) {
+    ) -> (Self, GossipClient) {
         Self::from_parts_with_admin(transport, clock, config, store, aggregates, None)
     }
 
@@ -239,22 +195,21 @@ where
         transport: T,
         clock: K,
         config: ValidGossipConfig,
-        store: CellStore<C>,
+        store: CellStore,
         aggregates: S,
         admin_rx: Option<mpsc::Receiver<AdminCommand>>,
-    ) -> (Self, GossipClient<C>) {
+    ) -> (Self, GossipClient) {
         let (req_tx, req_rx) = mpsc::channel(config.limit_queue_capacity.get());
 
-        let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
+        let recv_buf = vec![0u8; wire::MAX_PAYLOAD_BYTES].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
         // Sized to the most cells one inbound packet carries, and at least the
         // one a limit request carries.
-        let packet_cells = config.wire_limits.packet_cells::<C>().max(1);
-        let obs_buf = ObservationBatch::<C>::with_capacity(packet_cells);
-        let ack_buf = AckColumns::with_capacity(packet_cells);
-        let sink_buf = DeltaSink::<C>::with_capacity(packet_cells);
+        let packet_cells = config.wire_limits.max_cells().max(1);
+        let obs_buf = ObservationBatch::with_capacity(packet_cells);
+        let sink_buf = DeltaSink::with_capacity(packet_cells);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick.get());
-        let expiration_buf = ExpirationSink::<C>::with_capacity(defaults::GOSSIP_EXPIRATION_BATCH);
+        let expiration_buf = ExpirationSink::with_capacity(defaults::GOSSIP_EXPIRATION_BATCH);
         let outbox = Outbox::new(&config);
 
         let peers: Vec<Peer> = config
@@ -264,7 +219,6 @@ where
             .map(|addr| Peer {
                 addr,
                 node_id: None,
-                peer_slot: None,
             })
             .collect();
         let rng = SplitMix64::new(config.rng_seed);
@@ -284,7 +238,6 @@ where
             recv_buf,
             scratch,
             obs_buf,
-            ack_buf,
             sink_buf,
             expiration_buf,
             frame_handles,
@@ -292,7 +245,6 @@ where
             peers,
             rng,
             pending_reply: None,
-            decode_reject_count: 0,
             counters: GossipCounters::default(),
             rule_pending,
             rule_last_emit_ms,
@@ -322,6 +274,17 @@ where
     where
         St: Stream<Item = PeerEvent>,
     {
+        if self.config.cluster_id_hash.get() == defaults::GOSSIP_CLUSTER_ID_HASH {
+            tracing::info!(
+                code = "default_cluster_id",
+                cluster_id_hash = self.config.cluster_id_hash,
+                config_key = Setting::GossipClusterIdHash.yaml_key(),
+                "This node uses the default gossip cluster id, 1. Any other gabion cluster left \
+                 at the default on the same network and gossip port would merge counts with this \
+                 one. Set {} to a value unique to this cluster.",
+                Setting::GossipClusterIdHash,
+            );
+        }
         let mut peer_events = std::pin::pin!(peer_events);
         let mut tick = self.clock.ticker(self.config.tick_interval);
         // Once the peer-event stream returns `None` (e.g. `stream::empty()`),
@@ -417,10 +380,10 @@ where
         //
         // Falls through silently when the rule isn't interned yet (first
         // hit for that fingerprint) — the next heartbeat picks it up.
+        let hits = u32::try_from(req.hits).unwrap_or(u32::MAX);
         if let Some(slot) = self.store.rule_dictionary().find(req.rule_fingerprint) {
             let idx = slot as usize;
-            let pending =
-                self.rule_pending[idx].saturating_add(req.hits.min(u32::MAX as u64) as u32);
+            let pending = self.rule_pending[idx].saturating_add(hits);
             self.rule_pending[idx] = pending;
             let peers = self.peers.len().max(1) as u64;
             let bps = u64::from(self.config.target_err_bps.get());
@@ -457,7 +420,7 @@ where
             // ingest_local ignores origin/incarnation and forces local identity.
             origin: NodeId(0),
             incarnation: 0,
-            count: C::saturating_from_u64(req.hits),
+            count: hits,
             last_update_millis: req.now_millis,
         });
         self.store.ingest_local(&self.obs_buf, &mut self.sink_buf);
@@ -471,90 +434,123 @@ where
         self.counters.packets_received += 1;
         self.counters.bytes_received += n as u64;
         self.obs_buf.clear();
-        self.ack_buf.clear();
         self.sink_buf.clear();
-        let bytes = &self.recv_buf[..n];
-        let decoded = {
-            let obs_buf = &mut self.obs_buf;
-            let ack_buf = &mut self.ack_buf;
-            let mut on_cell = |cell: wire::WireCell<C>| {
-                ack_buf.push(
-                    cell.origin_node_id,
-                    cell.origin_incarnation,
-                    cell.origin_sequence,
-                );
-                obs_buf.push(Observation {
-                    rule_fingerprint: cell.rule_fingerprint,
-                    key_hash: cell.key_hash,
-                    bucket: cell.bucket,
-                    origin: cell.origin_node_id,
-                    incarnation: cell.origin_incarnation,
-                    count: cell.count,
-                    last_update_millis: cell.last_update_millis,
-                });
-            };
-            match self.config.auth_key.as_ref() {
-                Some(key) => wire::decode_auth_visit::<C>(
-                    bytes,
-                    key,
-                    self.config.wire_limits,
-                    |_| true,
-                    &mut on_cell,
-                ),
-                None => wire::decode_unauth_visit::<C>(
-                    bytes,
-                    self.config.wire_limits,
-                    |_| true,
-                    &mut on_cell,
-                ),
-            }
+        let obs_buf = &mut self.obs_buf;
+        let decoded = wire::decode(
+            &self.recv_buf[..n],
+            self.config.wire_limits,
+            self.config.cluster_id_hash.get(),
+            |cell| obs_buf.push(cell),
+        );
+        let header = match decoded {
+            Ok(header) => header,
+            Err(error) => return self.note_decode_reject(error, src, n),
         };
-        let summary = match decoded {
-            Ok(s) => s,
-            Err(err) => {
-                if let Some(rejected_total) = throttle::bump(&mut self.decode_reject_count) {
+        // Every data kind merges the same way; header-only kinds carry no
+        // cells.
+        self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
+        if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
+            peer.node_id = Some(header.sender.node_id);
+        }
+    }
+
+    /// Count a dropped packet against its cause, and log at powers of two of
+    /// that cause's count, so a flood of one cause cannot hide another.
+    fn note_decode_reject(&mut self, error: DecodeError, peer: SocketAddr, length: usize) {
+        let max_payload_bytes = self.config.wire_limits.max_payload_bytes;
+        match error {
+            DecodeError::BadVersion { found } => {
+                if let Some(rejected_total) =
+                    throttle::bump(&mut self.counters.decode_rejects_version)
+                {
                     tracing::warn!(
-                        code = "decode_rejected",
-                        peer = %src,
-                        error = %err,
+                        code = "peer_version_mismatch",
+                        peer = %peer,
+                        peer_version = found,
+                        local_version = wire::VERSION,
+                        reason = "version",
                         rejected_total,
-                        "Could not understand a gossip message from this peer, so it was dropped \
-                         and limits here under-count the traffic that peer handled. Usually the \
-                         peer runs a different gabion version, or its {} or {} is larger than \
-                         this node's; otherwise another program is sending UDP to this node's \
-                         gossip port. Check the peer's gabion version, and set both settings to \
-                         the same value on every node.",
-                        Setting::GossipMaxPayloadBytes,
-                        Setting::GossipMaxCellsPerFrame,
+                        "Ignoring gossip from this peer: it speaks another gossip protocol version \
+                         (`peer_version`) than this node (`local_version`), so the two do not \
+                         share counts. During a rolling upgrade between those versions this is \
+                         expected and stops once every pod runs the same release; until then each \
+                         version enforces limits on its own share of the traffic, so the cluster \
+                         can admit up to about twice a key's limit per window, and requests are \
+                         allowed. Finish the rollout quickly, or roll back. If it continues after \
+                         the rollout ends, a pod is still on the other release: find it by the \
+                         `peer` field and upgrade or restart it.",
                     );
                 }
-                return;
             }
-        };
-
-        self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
-
-        // Frontier update — latency optimization. Best-effort: missing slot
-        // or missing node entry just means we don't get the skip.
-        let sender_id = NodeId(summary.header.sender_node_id);
-        if let Some(peer_slot) = self.store.peer_frontiers_mut().intern_peer(sender_id) {
-            for i in 0..self.ack_buf.len() {
-                let origin_id = self.ack_buf.origin_node_ids[i];
-                let incarnation = self.ack_buf.incarnations[i];
-                let sequence = self.ack_buf.origin_sequences[i];
-                if let Some(node_slot) = self.store.node_dictionary().find(origin_id, incarnation) {
-                    self.store
-                        .peer_frontiers_mut()
-                        .record_acked(peer_slot, node_slot, sequence);
+            DecodeError::ForeignCluster { found } => {
+                if let Some(rejected_total) =
+                    throttle::bump(&mut self.counters.decode_rejects_cluster)
+                {
+                    tracing::warn!(
+                        code = "decode_rejected",
+                        peer = %peer,
+                        error = %error,
+                        reason = "cluster",
+                        rejected_total,
+                        peer_cluster = %format_args!("{found:#x}"),
+                        local_cluster = %format_args!("{:#x}", self.config.cluster_id_hash),
+                        config_key = Setting::GossipClusterIdHash.yaml_key(),
+                        "Ignored gossip from this peer: it belongs to another gabion cluster \
+                         (`peer_cluster`) than this node (`local_cluster`), so this node does not \
+                         merge its counts. Two gabion clusters share a network and gossip port. \
+                         If they are one cluster, set the same {} on every node. If they are \
+                         separate, also give them different gossip ports or networks.",
+                        Setting::GossipClusterIdHash,
+                    );
                 }
             }
-            // Cache the peer_slot on the matching peer entry so future ticks
-            // can prune without re-interning. `node_id` and `peer_slot` are
-            // always set together — see `gossip`, which relies on this
-            // invariant.
-            if let Some(peer) = self.peers.iter_mut().find(|p| p.addr == src) {
-                peer.node_id = Some(sender_id);
-                peer.peer_slot = Some(peer_slot);
+            DecodeError::PayloadTooLarge => {
+                if let Some(rejected_total) =
+                    throttle::bump(&mut self.counters.decode_rejects_peer_limits)
+                {
+                    tracing::warn!(
+                        code = "decode_rejected",
+                        peer = %peer,
+                        error = %error,
+                        reason = "peer_limits",
+                        rejected_total,
+                        length,
+                        max_payload_bytes,
+                        config_key = Setting::GossipMaxPayloadBytes.yaml_key(),
+                        "Dropped a packet from this peer larger than this node accepts. The peer \
+                         has a higher {} than this node, or something on the path between them \
+                         changes packet sizes. Set it to the same value on every node. Until \
+                         then, limits here under-count the traffic that peer handled.",
+                        Setting::GossipMaxPayloadBytes,
+                    );
+                }
+            }
+            DecodeError::TooShort
+            | DecodeError::BadMagic
+            | DecodeError::BadKind
+            | DecodeError::BadFlags
+            | DecodeError::BadRange
+            | DecodeError::BodyLength
+            | DecodeError::BadSlot => {
+                if let Some(rejected_total) =
+                    throttle::bump(&mut self.counters.decode_rejects_framing)
+                {
+                    tracing::warn!(
+                        code = "decode_rejected",
+                        peer = %peer,
+                        error = %error,
+                        reason = "framing",
+                        rejected_total,
+                        max_payload_bytes,
+                        config_key = Setting::GossipMaxPayloadBytes.yaml_key(),
+                        "Dropped a packet from this peer that is not valid gabion gossip. Usually \
+                         another program is sending UDP to this node's gossip port, or something \
+                         on the path truncates packets. If the peer is a gabion node, check the \
+                         path MTU between the two: gossip packets are at most {} bytes. Counts \
+                         from healthy peers are not affected.",
+                        Setting::GossipMaxPayloadBytes,
+                    );
+                }
             }
         }
     }
@@ -570,13 +566,11 @@ where
                         .map(|p| PeerEntry {
                             addr: p.addr,
                             node_id: p.node_id,
-                            peer_slot: p.peer_slot,
                         })
                         .collect(),
                     store_stats: self.store.stats(),
                     local_dirty_len: self.store.local_dirty().len(),
                     forwarded_dirty_len: self.store.forwarded_dirty().len(),
-                    decode_reject_count: self.decode_reject_count,
                     counters: self.counters,
                     ticks_total: self.ticks_total,
                     threshold_fires: self.threshold_fires,
@@ -642,7 +636,6 @@ where
                     self.peers.push(Peer {
                         addr: p.addr,
                         node_id: None,
-                        peer_slot: None,
                     });
                     tracing::info!(
                         peer = %p.addr,
@@ -653,10 +646,7 @@ where
             }
             PeerEvent::Removed(p) => {
                 if let Some(pos) = self.peers.iter().position(|x| x.addr == p.addr) {
-                    let removed = self.peers.remove(pos);
-                    if let Some(node_id) = removed.node_id {
-                        self.store.peer_frontiers_mut().remove_peer(node_id);
-                    }
+                    self.peers.remove(pos);
                     tracing::info!(
                         peer = %p.addr,
                         cluster_size = self.peers.len(),
@@ -757,30 +747,10 @@ where
 
         for peer_idx in 0..pick_count {
             let peer_addr = self.peers[peer_idx].addr;
-            // `handle_inbound` writes `node_id` and `peer_slot` together —
-            // when one is `Some`, the other is too. So a single read of
-            // `peer_slot` is the full pruning decision.
-            let peer_slot = self.peers[peer_idx].peer_slot;
-
-            self.frame_handles.clear();
-            match peer_slot {
-                Some(slot) => {
-                    self.store.fill_gossip_frame_for_peer(
-                        self.config.max_cells_per_tick.get(),
-                        slot,
-                        &mut self.frame_handles,
-                    );
-                }
-                None => {
-                    // Bootstrap fallback: we haven't heard from this peer
-                    // yet, so we don't know what to prune. Send an unpruned
-                    // frame; the next inbound from them caches the slot.
-                    self.store.fill_gossip_frame(
-                        self.config.max_cells_per_tick.get(),
-                        &mut self.frame_handles,
-                    );
-                }
-            }
+            self.store.fill_gossip_frame(
+                self.config.max_cells_per_tick.get(),
+                &mut self.frame_handles,
+            );
             if self.frame_handles.is_empty() {
                 continue;
             }
@@ -808,16 +778,13 @@ where
 
     /// Encode the frame in `frame_handles` for `dst` and send it.
     fn send_frame(&mut self, dst: SocketAddr) -> Result<(), wire::EncodeError> {
+        // Every packet is a sweep: cells outside any stream.
         let header = wire::Header {
             cluster_id_hash: self.config.cluster_id_hash.get(),
-            sender_node_id: self.store.local_identity().node_id.0,
-            sender_incarnation: self.store.local_identity().incarnation,
-            count_width: 0,
-            cell_count: 0,
-            body_len: 0,
-            min_origin_sequence: 0,
-            max_origin_sequence: 0,
-            flags: 0,
+            sender: self.store.local_identity(),
+            sender_zone: 0,
+            acks: wire::AckInfo::default(),
+            payload: wire::Payload::Sweep,
         };
 
         let Self {
@@ -830,17 +797,7 @@ where
             counters,
             ..
         } = self;
-        let packets = match config.auth_key.as_ref() {
-            Some(key) => Packets::<C>::auth(
-                header,
-                store,
-                frame_handles,
-                key,
-                scratch,
-                config.wire_limits,
-            ),
-            None => Packets::<C>::unauth(header, store, frame_handles, scratch, config.wire_limits),
-        }?;
+        let packets = Packets::new(header, store, frame_handles, scratch, config.wire_limits)?;
         outbox.send_frame(packets, dst, transport, counters);
         Ok(())
     }

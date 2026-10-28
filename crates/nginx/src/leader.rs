@@ -237,7 +237,7 @@ async fn leader_main(
     let node_id = shm.header().identity.load_node_id();
     let identity = NodeIdentity::new(gabion::crdt::NodeId(node_id), new_incarnation);
 
-    let cell_store = CellStore::<u32>::new(config.cell_store, identity, rules.table());
+    let cell_store = CellStore::new(config.cell_store, identity, rules.table());
 
     // A lone node still needs a socket for the runtime; an ephemeral
     // loopback port can't collide with another nginx on the same host, there
@@ -281,7 +281,7 @@ async fn leader_main(
     }
 }
 
-async fn drain_loop(client: GossipClient<u32>, shm: ShmRegion, worker_id: u32) -> anyhow::Error {
+async fn drain_loop(client: GossipClient, shm: ShmRegion, worker_id: u32) -> anyhow::Error {
     let lease = shm.lease();
     let queue = shm.queue();
     let stats = shm.stats();

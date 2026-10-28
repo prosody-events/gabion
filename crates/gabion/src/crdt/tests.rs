@@ -25,26 +25,26 @@ fn descriptor_for(fingerprint: u128, local_id: u32) -> RuleDescriptor {
     }
 }
 
-fn store_u32() -> CellStore<u32> {
-    CellStore::new(storage(16, 8, 16, 4), local(), &rules(8))
+fn store_u32() -> CellStore {
+    CellStore::new(storage(16, 8, 16), local(), &rules(8))
 }
 
-fn small_store(cell_cap: u32, dirty_cap: u32) -> CellStore<u32> {
-    CellStore::new(storage(cell_cap, 8, dirty_cap, 4), local(), &rules(8))
+fn small_store(cell_cap: u32, dirty_cap: u32) -> CellStore {
+    CellStore::new(storage(cell_cap, 8, dirty_cap), local(), &rules(8))
 }
 
 /// Build an `Observation` row with positional args. Test convenience for the
 /// many fixture rows in this file — production code constructs `Observation`
 /// directly with field names.
-fn observation<C: Count>(
+fn observation(
     rule_fp: u128,
     key: u128,
     bucket: BucketEpoch,
     origin: u128,
     inc: Incarnation,
-    count: C,
+    count: u32,
     ts: u64,
-) -> Observation<C> {
+) -> Observation {
     Observation {
         rule_fingerprint: rule_fp,
         key_hash: KeyHash(key),
@@ -57,7 +57,7 @@ fn observation<C: Count>(
 }
 
 fn remote_merge_one(
-    store: &mut CellStore<u32>,
+    store: &mut CellStore,
     rule_fp: u128,
     origin: u128,
     inc: Incarnation,
@@ -90,7 +90,7 @@ fn remote_merge_one(
 }
 
 fn local_increment_one(
-    store: &mut CellStore<u32>,
+    store: &mut CellStore,
     rule_fp: u128,
     key: u128,
     bucket: BucketEpoch,
@@ -129,8 +129,8 @@ fn local_increment_one(
         .expect("cell present after ingest")
 }
 
-fn quickcheck_store() -> CellStore<u32> {
-    CellStore::new(storage(256, 16, 512, 8), local(), &rules(16))
+fn quickcheck_store() -> CellStore {
+    CellStore::new(storage(256, 16, 512), local(), &rules(16))
 }
 
 #[derive(Clone, Debug)]
@@ -203,7 +203,7 @@ impl Arbitrary for LocalRows {
     }
 }
 
-fn remote_observation(row: &RemoteRow) -> Observation<u32> {
+fn remote_observation(row: &RemoteRow) -> Observation {
     observation(
         0x100 + row.rule as u128,
         0x200 + row.key as u128,
@@ -215,7 +215,7 @@ fn remote_observation(row: &RemoteRow) -> Observation<u32> {
     )
 }
 
-fn apply_remote_rows(store: &mut CellStore<u32>, rows: &[RemoteRow]) -> DeltaSink<u32> {
+fn apply_remote_rows(store: &mut CellStore, rows: &[RemoteRow]) -> DeltaSink {
     let mut sink = DeltaSink::with_capacity(rows.len());
     for row in rows {
         let mut obs = ObservationBatch::with_capacity(1);
@@ -225,7 +225,7 @@ fn apply_remote_rows(store: &mut CellStore<u32>, rows: &[RemoteRow]) -> DeltaSin
     sink
 }
 
-fn apply_local_rows(store: &mut CellStore<u32>, rows: &[LocalRow]) -> DeltaSink<u32> {
+fn apply_local_rows(store: &mut CellStore, rows: &[LocalRow]) -> DeltaSink {
     let mut sink = DeltaSink::with_capacity(rows.len());
     for row in rows {
         let mut obs = ObservationBatch::with_capacity(1);
@@ -281,7 +281,7 @@ fn local_model(rows: &[LocalRow]) -> BTreeMap<PortableKey, u32> {
     model
 }
 
-fn portable_snapshot(store: &CellStore<u32>) -> BTreeMap<PortableKey, u32> {
+fn portable_snapshot(store: &CellStore) -> BTreeMap<PortableKey, u32> {
     let mut rows = BTreeMap::new();
     for handle in store.active_handles() {
         let row = store.get(handle).unwrap();
@@ -301,7 +301,7 @@ fn portable_snapshot(store: &CellStore<u32>) -> BTreeMap<PortableKey, u32> {
     rows
 }
 
-fn assert_structural_invariants(store: &CellStore<u32>) -> bool {
+fn assert_structural_invariants(store: &CellStore) -> bool {
     let mut active = 0_u32;
     let mut rules = BTreeMap::<RuleSlot, u32>::new();
     let mut nodes = BTreeMap::<NodeSlot, u32>::new();
@@ -456,7 +456,7 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(
 ) -> bool {
     let mut store = quickcheck_store();
     apply_remote_rows(&mut store, &rows.0);
-    let before: Vec<CellRow<u32>> = store
+    let before: Vec<CellRow> = store
         .active_handles()
         .map(|h| store.get(h).unwrap())
         .collect();
@@ -479,7 +479,7 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(
         .collect();
 
     let cap = cap_seed as usize % 8 + 1;
-    let mut exp = ExpirationSink::<u32>::with_capacity(cap);
+    let mut exp = ExpirationSink::with_capacity(cap);
     let mut expired = BTreeSet::new();
     let (mut emitted, mut calls) = (0, 0);
     loop {
@@ -550,49 +550,6 @@ fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
         }
     }
     TestResult::from_bool(seen == expected)
-}
-
-#[quickcheck]
-fn quickcheck_repair_lane_sweeps_active_despite_acked_frontier(
-    rows: RemoteRows,
-    ack_seed: u8,
-) -> bool {
-    let mut store = quickcheck_store();
-    apply_remote_rows(&mut store, &rows.0);
-    // Drop the dirty rings so the frame is composed purely by the repair lane.
-    store.clear_dirty();
-    let peer_slot = store
-        .peer_frontiers_mut()
-        .intern_peer(NodeId(0x999))
-        .unwrap();
-
-    let active: Vec<CellRow<u32>> = store
-        .active_handles()
-        .map(|h| store.get(h).unwrap())
-        .collect();
-    // Ack roughly half the origins through their current sequence.
-    for row in &active {
-        if ((row.key.origin as u8).wrapping_add(ack_seed) & 1) == 0 {
-            store
-                .peer_frontiers_mut()
-                .record_acked(peer_slot, row.key.origin, row.origin_sequence);
-        }
-    }
-
-    // The repair lane is the convergence backstop: it ignores the frontier, so
-    // a full-capacity sweep re-sends *every* active cell, acked or not. Pruning
-    // it by `last_acked` is exactly what stranded a cell forever in the
-    // partition-heal flake.
-    let expected: BTreeSet<u32> = active.iter().map(|row| row.handle.index).collect();
-
-    let mut out = Vec::with_capacity(store.capacity() as usize);
-    store.fill_gossip_frame_for_peer(store.capacity() as usize, peer_slot, &mut out);
-    let got: BTreeSet<u32> = out.iter().map(|h| h.index).collect();
-
-    got == expected
-        && out.len() == got.len()
-        && out.iter().all(|h| store.get(*h).is_some())
-        && assert_structural_invariants(&store)
 }
 
 #[test]
@@ -707,7 +664,7 @@ fn bucket_boundary_expires_in_batches_without_growth() {
     }
     store.ingest_local(&batch, &mut DeltaSink::with_capacity(20));
     let mut sink = ExpirationSink::with_capacity(8);
-    let capacities = |sink: &ExpirationSink<u32>| {
+    let capacities = |sink: &ExpirationSink| {
         [
             sink.handles.capacity(),
             sink.keys.capacity(),
@@ -981,7 +938,7 @@ fn unknown_rule_cells_round_trip() {
     let mut live = vec![0_u32; cur.len()];
     cur[row.key.rule as usize] = 5;
     live[row.key.rule as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
 }
@@ -992,7 +949,7 @@ fn unknown_rule_cells_expire_at_default_window() {
     let handle = remote_merge_one(&mut store, 0x44, 5, 1, 10, 0);
     assert!(store.get(handle).is_some());
 
-    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire_at(61_000, &mut exp), Expiry::Done);
 
     assert!(store.get(handle).is_none());
@@ -1032,7 +989,7 @@ fn dictionary_refcount_frees_unreferenced_slots() {
     let mut live = vec![0_u32; cur.len()];
     cur[rule_slot as usize] = 5;
     live[rule_slot as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
     // The unpinned remote-origin node slot frees: refcount 0, descriptor None.
@@ -1076,7 +1033,7 @@ fn configured_rule_pinned_survives_cell_expiry() {
     let mut live = vec![0_u32; cur.len()];
     cur[slot as usize] = 20;
     live[slot as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert!(store.get(h).is_none());
     assert_eq!(store.active_len(), 0);
@@ -1135,7 +1092,7 @@ fn wire_only_rule_frees_when_cells_expire() {
     let mut live = vec![0_u32; cur.len()];
     cur[slot as usize] = 20;
     live[slot as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
 
@@ -1146,7 +1103,7 @@ fn wire_only_rule_frees_when_cells_expire() {
 
 #[test]
 fn dictionary_full_rejects_with_counter() {
-    let mut store = CellStore::<u32>::new(storage(16, 4, 4, 4), local(), &rules(1));
+    let mut store = CellStore::new(storage(16, 4, 4), local(), &rules(1));
     // First merge interns a rule. Second merge with a distinct fingerprint
     // must fail.
     let h1 = remote_merge_one(&mut store, 0x10, 2, 1, 1, 0);
@@ -1215,97 +1172,6 @@ fn repair_cursor_skips_freed_slots() {
 }
 
 #[test]
-fn peer_frontier_lacks_matches_scan() {
-    let mut store = small_store(8, 16);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    let h1 = remote_merge_one(&mut store, 0x11, 1, 1, 1, 0);
-    let _h2 = remote_merge_one(&mut store, 0x11, 2, 1, 1, 0);
-    let row1 = store.get(h1).unwrap();
-    let peer_slot = store.peer_frontiers_mut().intern_peer(NodeId(7)).unwrap();
-    // Mark origin slot of h1 as fully acked.
-    store
-        .peer_frontiers_mut()
-        .record_acked(peer_slot, row1.key.origin, row1.origin_sequence);
-
-    // Build active arrays.
-    let mut active_indices = Vec::new();
-    let mut active_origins = Vec::new();
-    for slot in 0..store.capacity() {
-        if (store.generations[slot as usize] & 1) == 1 {
-            active_indices.push(slot);
-            active_origins.push(store.origins[slot as usize]);
-        }
-    }
-    // origin_sequences for active slots.
-    let origin_sequences: Vec<u64> = (0..store.capacity())
-        .map(|s| store.origin_sequences[s as usize])
-        .collect();
-    let active_origins_full: Vec<NodeSlot> = (0..store.capacity())
-        .map(|s| store.origins[s as usize])
-        .collect();
-
-    let mut lacks = Vec::new();
-    store.peer_frontiers().lacks_indices(
-        peer_slot,
-        &active_origins_full,
-        &origin_sequences,
-        &active_indices,
-        &mut lacks,
-    );
-    // Brute-force expected: everything but h1 (which is at last_acked).
-    let mut expected: Vec<u32> = active_indices
-        .iter()
-        .copied()
-        .filter(|i| *i != h1.index)
-        .collect();
-    expected.sort();
-    lacks.sort();
-    assert_eq!(lacks, expected);
-}
-
-#[test]
-fn node_slot_reuse_clears_frontier_rows() {
-    let mut store = CellStore::<u32>::new(storage(4, 4, 4, 2), local(), &rules(4));
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    let h = remote_merge_one(&mut store, 0x11, 42, 1, 5, 0);
-    let row = store.get(h).unwrap();
-    let original_slot = row.key.origin;
-    let peer_slot = store.peer_frontiers_mut().intern_peer(NodeId(7)).unwrap();
-    store
-        .peer_frontiers_mut()
-        .record_acked(peer_slot, original_slot, 99);
-    store
-        .peer_frontiers_mut()
-        .record_sent(peer_slot, original_slot, 88);
-
-    // Expire the cell — node slot freed (rule was pre-interned, stays).
-    let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
-    let mut live = vec![0_u32; cur.len()];
-    cur[row.key.rule as usize] = 5;
-    live[row.key.rule as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
-    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
-
-    // The slot is now free. Frontier rows must be zeroed.
-    assert_eq!(
-        store.peer_frontiers().last_acked(peer_slot, original_slot),
-        0
-    );
-    assert_eq!(
-        store.peer_frontiers().last_sent(peer_slot, original_slot),
-        0
-    );
-
-    // Reassign to a different (node_id, incarnation). Since dict allocates
-    // from freelist head, this should reuse the same slot.
-    let _h2 = remote_merge_one(&mut store, 0x11, 99, 9, 1, 0);
-    let reused_slot = store.node_dictionary().find(NodeId(99), 9).unwrap();
-    assert_eq!(reused_slot, original_slot);
-    // Frontier state must still be zero for the reused slot.
-    assert_eq!(store.peer_frontiers().last_acked(peer_slot, reused_slot), 0);
-}
-
-#[test]
 fn dirty_lanes_separate() {
     let mut store = small_store(4, 8);
     store.intern_rule(descriptor_for(0x11, 1)).unwrap();
@@ -1313,57 +1179,6 @@ fn dirty_lanes_separate() {
     remote_merge_one(&mut store, 0x11, 99, 1, 1, 0);
     assert_eq!(store.local_dirty().len(), 1);
     assert_eq!(store.forwarded_dirty().len(), 1);
-}
-
-#[test]
-fn count_widths_compile_and_saturate() {
-    // u16 saturation.
-    let mut s16 = CellStore::<u16>::new(storage(4, 4, 4, 2), local(), &rules(4));
-    s16.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    let mut obs = ObservationBatch::<u16>::with_capacity(1);
-    let mut sink = DeltaSink::<u16>::with_capacity(1);
-    obs.push(Observation {
-        rule_fingerprint: 0x11,
-        key_hash: KeyHash(1),
-        bucket: 0,
-        origin: NodeId(1),
-        incarnation: 1,
-        count: u16::MAX,
-        last_update_millis: 0,
-    });
-    s16.ingest_local(&obs, &mut sink);
-    // Add more hits — should saturate at u16::MAX, no overflow.
-    let mut obs2 = ObservationBatch::<u16>::with_capacity(1);
-    let mut sink2 = DeltaSink::<u16>::with_capacity(1);
-    obs2.push(Observation {
-        rule_fingerprint: 0x11,
-        key_hash: KeyHash(1),
-        bucket: 0,
-        origin: NodeId(1),
-        incarnation: 1,
-        count: 1,
-        last_update_millis: 0,
-    });
-    s16.ingest_local(&obs2, &mut sink2);
-    // No raise because already at MAX.
-    assert_eq!(sink2.len(), 0);
-
-    // u64 stores big counts.
-    let mut s64 = CellStore::<u64>::new(storage(4, 4, 4, 2), local(), &rules(4));
-    s64.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    let mut obs64 = ObservationBatch::<u64>::with_capacity(1);
-    let mut sink64 = DeltaSink::<u64>::with_capacity(1);
-    obs64.push(Observation {
-        rule_fingerprint: 0x11,
-        key_hash: KeyHash(1),
-        bucket: 0,
-        origin: NodeId(7),
-        incarnation: 1,
-        count: 1_000_000_000_000,
-        last_update_millis: 0,
-    });
-    s64.merge_remote(&obs64, &mut sink64);
-    assert_eq!(sink64.current[0], 1_000_000_000_000);
 }
 
 #[test]
@@ -1451,7 +1266,7 @@ fn expire_emits_one_row_per_freed_cell() {
     cur[rule_local as usize] = 0;
     live[rule_local as usize] = 1000;
 
-    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
 
     assert_eq!(store.active_len(), 1);
@@ -1464,7 +1279,7 @@ fn expire_emits_one_row_per_freed_cell() {
     assert_eq!(store.rule_dictionary().refcount(rule_doomed), 1);
     assert!(store.rule_dictionary().descriptor(rule_doomed).is_some());
 
-    let mut rows: Vec<CellExpiration<u32>> = (0..exp.len()).map(|i| exp.row(i).unwrap()).collect();
+    let mut rows: Vec<CellExpiration> = (0..exp.len()).map(|i| exp.row(i).unwrap()).collect();
     rows.sort_by_key(|r| r.handle.index);
     let mut expected = [snap_a, snap_b];
     expected.sort_by_key(|r| r.handle.index);
@@ -1498,7 +1313,7 @@ fn expire_frees_slots_and_dictionary_refs() {
     let mut live = vec![0_u32; cur.len()];
     cur[rule_slot as usize] = 5;
     live[rule_slot as usize] = 0;
-    let mut exp = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
     // Node dictionary no longer holds the (NodeId(100), 1) entry.
@@ -1570,7 +1385,7 @@ fn expire_at_and_expire_agree_for_same_now() {
     let live = rule.live_buckets();
 
     let mut a = mk();
-    let mut sink_a = ExpirationSink::<u32>::with_capacity(a.capacity() as usize);
+    let mut sink_a = ExpirationSink::with_capacity(a.capacity() as usize);
     assert_eq!(a.expire_at(now_millis, &mut sink_a), Expiry::Done);
 
     let mut b = mk();
@@ -1580,7 +1395,7 @@ fn expire_at_and_expire_agree_for_same_now() {
     let rule_slot = b.rule_dictionary.find(0x11).unwrap();
     cur[rule_slot as usize] = current;
     lv[rule_slot as usize] = live;
-    let mut sink_b = ExpirationSink::<u32>::with_capacity(b.capacity() as usize);
+    let mut sink_b = ExpirationSink::with_capacity(b.capacity() as usize);
     assert_eq!(b.expire(&cur, &lv, &mut sink_b), Expiry::Done);
 
     assert_eq!(sink_a.len(), sink_b.len());
@@ -1629,7 +1444,7 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
     obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
     store.merge_remote(&obs, &mut deltas);
 
-    let mut expirations = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+    let mut expirations = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire_at(150, &mut expirations), Expiry::Done);
 
     // now=150ms -> current bucket 3. A 101ms window spans ceil(101/50)=3
@@ -1637,54 +1452,6 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
     // buckets and expire this cell.
     assert_eq!(expirations.len(), 0);
     assert_eq!(store.active_len(), 1);
-}
-
-#[test]
-fn fill_gossip_frame_for_peer_prunes_dirty_but_repairs_acked() {
-    let mut store = small_store(8, 8);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-
-    // Seed three cells (three distinct origins).
-    let h1 = remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
-    let h2 = remote_merge_one(&mut store, 0x11, 2, 1, 5, 0);
-    let h3 = remote_merge_one(&mut store, 0x11, 3, 1, 5, 0);
-
-    let row1 = store.get(h1).unwrap();
-    let row2 = store.get(h2).unwrap();
-
-    // Intern a peer and ack the first two origins through their current
-    // sequences. The third remains unacked.
-    let peer_slot = store.peer_frontiers_mut().intern_peer(NodeId(99)).unwrap();
-    store
-        .peer_frontiers_mut()
-        .record_acked(peer_slot, row1.key.origin, row1.origin_sequence);
-    store
-        .peer_frontiers_mut()
-        .record_acked(peer_slot, row2.key.origin, row2.origin_sequence);
-
-    // A single-cell budget never reaches the repair lane, so the frame is
-    // composed purely from the dirty lanes — which prune the two acked cells,
-    // leaving only the unacked one. This is the latency optimization.
-    let mut dirty_only = Vec::with_capacity(8);
-    store.fill_gossip_frame_for_peer(1, peer_slot, &mut dirty_only);
-    assert_eq!(dirty_only.len(), 1);
-    assert_eq!(dirty_only[0].index, h3.index);
-
-    // With budget to spare, the repair lane sweeps the whole active set
-    // regardless of the frontier and backfills the acked cells too — the
-    // convergence backstop the frontier doc comment delegates to it. All three
-    // cells ride out. (Pre-fix, the repair lane also pruned by `last_acked`,
-    // so the acked cells were suppressed forever — the partition-heal flake.)
-    let mut full = Vec::with_capacity(8);
-    store.fill_gossip_frame_for_peer(8, peer_slot, &mut full);
-    let mut got: Vec<u32> = full.iter().map(|h| h.index).collect();
-    got.sort_unstable();
-    let mut want = [h1.index, h2.index, h3.index];
-    want.sort_unstable();
-    assert_eq!(
-        got, want,
-        "repair lane must backfill cells the frontier marks acked"
-    );
 }
 
 // --- Coverage extensions (Gaps 1-6) -----------------------------------
@@ -1695,7 +1462,7 @@ fn fill_gossip_frame_for_peer_prunes_dirty_but_repairs_acked() {
 /// `applies_locally`) survive even when every cell on the rule expires.
 /// Fingerprints `0x102` and `0x103` remain auto-interned wire-only on first
 /// use with `applies_locally = false`.
-fn quickcheck_store_with_pinned_rules() -> CellStore<u32> {
+fn quickcheck_store_with_pinned_rules() -> CellStore {
     let mut store = quickcheck_store();
     store
         .intern_rule(RuleDescriptor {
@@ -1723,10 +1490,7 @@ fn quickcheck_store_with_pinned_rules() -> CellStore<u32> {
 /// Variant of `assert_structural_invariants` that allows one extra refcount
 /// on each slot in `pinned_rule_slots` — those carry the registration pin
 /// `intern_rule` holds for a configured rule, on top of their cell refs.
-fn assert_invariants_with_pinned_rules(
-    store: &CellStore<u32>,
-    pinned_rule_slots: &[RuleSlot],
-) -> bool {
+fn assert_invariants_with_pinned_rules(store: &CellStore, pinned_rule_slots: &[RuleSlot]) -> bool {
     let mut active = 0_u32;
     let mut rules = BTreeMap::<RuleSlot, u32>::new();
     let mut nodes = BTreeMap::<NodeSlot, u32>::new();
@@ -1787,7 +1551,7 @@ fn assert_invariants_with_pinned_rules(
 /// Predict the exact ordered handle sequence `fill_gossip_frame` will emit
 /// for the current store state, mirroring the lane priority (local dirty →
 /// forwarded dirty → repair) and the dedup / staleness filters.
-fn predict_gossip_order(store: &CellStore<u32>, max_cells: usize) -> Vec<CellHandle> {
+fn predict_gossip_order(store: &CellStore, max_cells: usize) -> Vec<CellHandle> {
     let mut out: Vec<CellHandle> = Vec::with_capacity(max_cells);
     if max_cells == 0 {
         return out;
@@ -1917,10 +1681,10 @@ impl Arbitrary for MixedOps {
 }
 
 fn apply_mixed_op_with_sinks(
-    store: &mut CellStore<u32>,
+    store: &mut CellStore,
     op: &MixedOp,
-    sink: &mut DeltaSink<u32>,
-    exp_sink: &mut ExpirationSink<u32>,
+    sink: &mut DeltaSink,
+    exp_sink: &mut ExpirationSink,
 ) {
     match op {
         MixedOp::Remote(row) => {
@@ -2016,7 +1780,7 @@ fn quickcheck_mixed_ops_match_model(ops: MixedOps) -> bool {
 
     for op in &ops.0 {
         let mut sink = DeltaSink::with_capacity(1);
-        let mut exp_sink = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+        let mut exp_sink = ExpirationSink::with_capacity(store.capacity() as usize);
         apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
         apply_mixed_op_to_model(&mut model, op);
 
@@ -2080,8 +1844,8 @@ impl Arbitrary for TightRemoteRows {
     }
 }
 
-fn quickcheck_store_tight() -> CellStore<u32> {
-    CellStore::new(storage(4, 3, 16, 4), local(), &rules(2))
+fn quickcheck_store_tight() -> CellStore {
+    CellStore::new(storage(4, 3, 16), local(), &rules(2))
 }
 
 #[quickcheck]
@@ -2171,36 +1935,36 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
 }
 
 #[derive(Clone, Debug)]
-struct U16HitRow {
-    hits: u16,
+struct HitRow {
+    hits: u32,
 }
 
-impl Arbitrary for U16HitRow {
+impl Arbitrary for HitRow {
     fn arbitrary(g: &mut Gen) -> Self {
-        // Draw near u16::MAX so a small number of accumulations saturate.
-        let base = (u16::MAX - 16) as u32;
+        // Draw near u32::MAX so a small number of accumulations saturate.
         let jitter = u32::arbitrary(g) % 32;
-        let hits = (base + jitter).min(u16::MAX as u32) as u16;
-        Self { hits }
+        Self {
+            hits: (u32::MAX - 16).saturating_add(jitter),
+        }
     }
 }
 
 #[derive(Clone, Debug)]
-struct U16HitRows(Vec<U16HitRow>);
+struct HitRows(Vec<HitRow>);
 
-impl Arbitrary for U16HitRows {
+impl Arbitrary for HitRows {
     fn arbitrary(g: &mut Gen) -> Self {
         let len = (usize::arbitrary(g) % 16) + 1;
-        Self((0..len).map(|_| U16HitRow::arbitrary(g)).collect())
+        Self((0..len).map(|_| HitRow::arbitrary(g)).collect())
     }
 }
 
 #[quickcheck]
-fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
-    let mut store = CellStore::<u16>::new(storage(4, 4, 32, 4), local(), &rules(4));
+fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
+    let mut store = CellStore::new(storage(4, 4, 32), local(), &rules(4));
     let mut model_sum: u64 = 0;
     for row in &rows.0 {
-        let mut obs = ObservationBatch::<u16>::with_capacity(1);
+        let mut obs = ObservationBatch::with_capacity(1);
         obs.push(Observation {
             rule_fingerprint: 0x100,
             key_hash: KeyHash(0xabc),
@@ -2210,57 +1974,16 @@ fn quickcheck_count_saturates_without_overflow(rows: U16HitRows) -> bool {
             count: row.hits,
             last_update_millis: 0,
         });
-        let mut sink = DeltaSink::<u16>::with_capacity(1);
+        let mut sink = DeltaSink::with_capacity(1);
         store.ingest_local(&obs, &mut sink);
-        model_sum = model_sum.saturating_add(row.hits as u64);
+        model_sum += u64::from(row.hits);
     }
     let stored = store
         .active_handles()
         .next()
         .and_then(|h| store.get(h).map(|r| r.count))
         .unwrap_or(0);
-    let expected = model_sum.min(u16::MAX as u64) as u16;
-    stored == expected
-}
-
-// --- Gap 4: peer-aware frame across all three lanes ----------------------
-
-#[quickcheck]
-fn quickcheck_gossip_frame_for_peer_across_all_lanes(rows: RemoteRows, ack_seed: u8) -> bool {
-    let mut store = quickcheck_store();
-    apply_remote_rows(&mut store, &rows.0);
-    // No `clear_dirty` here — exercise the union across local, forwarded,
-    // and repair lanes simultaneously.
-    let peer_slot = store
-        .peer_frontiers_mut()
-        .intern_peer(NodeId(0x999))
-        .unwrap();
-
-    let active: Vec<CellRow<u32>> = store
-        .active_handles()
-        .map(|h| store.get(h).unwrap())
-        .collect();
-    for row in &active {
-        if ((row.key.origin as u8).wrapping_add(ack_seed) & 1) == 0 {
-            store
-                .peer_frontiers_mut()
-                .record_acked(peer_slot, row.key.origin, row.origin_sequence);
-        }
-    }
-
-    // Dirty lanes prune by the frontier, but the repair lane backfills
-    // unconditionally, so a full-capacity sweep across all three lanes is every
-    // active cell regardless of which origins were acked.
-    let expected: BTreeSet<u32> = active.iter().map(|row| row.handle.index).collect();
-
-    let mut out = Vec::with_capacity(store.capacity() as usize);
-    store.fill_gossip_frame_for_peer(store.capacity() as usize, peer_slot, &mut out);
-    let got: BTreeSet<u32> = out.iter().map(|h| h.index).collect();
-
-    got == expected
-        && out.len() == got.len()
-        && out.iter().all(|h| store.get(*h).is_some())
-        && assert_structural_invariants(&store)
+    stored == model_sum.min(u64::from(u32::MAX)) as u32
 }
 
 // --- Gap 5: lane priority as ordered prediction --------------------------
@@ -2270,7 +1993,7 @@ fn quickcheck_gossip_frame_order_matches_lane_model(ops: MixedOps, max_seed: u8)
     let mut store = quickcheck_store_with_pinned_rules();
     for op in &ops.0 {
         let mut sink = DeltaSink::with_capacity(1);
-        let mut exp_sink = ExpirationSink::<u32>::with_capacity(store.capacity() as usize);
+        let mut exp_sink = ExpirationSink::with_capacity(store.capacity() as usize);
         apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
     }
     if store.is_empty() {
@@ -2354,7 +2077,7 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
     let now_millis: u64 = (now_seed as u64) % 4000;
 
     let mut store_a = base.clone();
-    let mut sink_a = ExpirationSink::<u32>::with_capacity(base.capacity() as usize);
+    let mut sink_a = ExpirationSink::with_capacity(base.capacity() as usize);
     assert_eq!(store_a.expire_at(now_millis, &mut sink_a), Expiry::Done);
 
     let mut store_b = base.clone();
@@ -2369,7 +2092,7 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
             live[slot] = (d.window_millis / d.bucket_millis).max(1);
         }
     }
-    let mut sink_b = ExpirationSink::<u32>::with_capacity(base.capacity() as usize);
+    let mut sink_b = ExpirationSink::with_capacity(base.capacity() as usize);
     assert_eq!(store_b.expire(&cur, &live, &mut sink_b), Expiry::Done);
 
     let handles_a: BTreeSet<u32> = sink_a.handles.iter().map(|h| h.index).collect();
@@ -2382,7 +2105,7 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
 
 /// `n` rules on distinct keys, each `rate` over its own period and `bucket`.
 fn configured(n: usize, rate: &str, bucket: Duration) -> RuleTable {
-    let limits = storage(16, 8, 16, 4).cardinality;
+    let limits = storage(16, 8, 16).cardinality;
     let keys: Vec<String> = (0..n).map(|i| format!("tenant{i}")).collect();
     let rules = keys
         .iter()
@@ -2411,8 +2134,8 @@ fn configured(n: usize, rate: &str, bucket: Duration) -> RuleTable {
 fn wrap_run(t0: u64) -> (u64, u64, usize) {
     let table = configured(1, "10r/10ms", Duration::from_millis(1));
     let rule = &table.rules()[0];
-    let config = storage(64, 8, 64, 4);
-    let mut store = CellStore::<u32>::new(config, local(), &table);
+    let config = storage(64, 8, 64);
+    let mut store = CellStore::new(config, local(), &table);
     let aggregate = Aggregate::new(&config);
     let mut batch = ObservationBatch::with_capacity(11);
     for t in (t0..t0 + 10).chain([t0 + 16]) {
@@ -2458,7 +2181,7 @@ fn rule_dictionary_default_grows_with_rules() {
             .get(),
         256
     );
-    let stats = CellStore::<u32>::new(storage(16, 8, 16, 4), local(), &table).stats();
+    let stats = CellStore::new(storage(16, 8, 16), local(), &table).stats();
     assert_eq!(
         (stats.rule_slots_capacity, stats.rule_slots_used),
         (600, 300)
@@ -2470,7 +2193,7 @@ fn rule_dictionary_default_grows_with_rules() {
 #[test]
 fn cell_store_interns_every_rule_at_construction() {
     let table = configured(3, "10r/s", Duration::from_millis(250));
-    let store = CellStore::<u32>::new(storage(16, 8, 16, 4), local(), &table);
+    let store = CellStore::new(storage(16, 8, 16), local(), &table);
     for rule in table.rules() {
         let slot = store
             .rule_dictionary()

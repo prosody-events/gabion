@@ -2,9 +2,9 @@ use super::*;
 use crate::crdt::{NodeId, NodeIdentity};
 use crate::settings::mock::{rules, storage};
 
-fn store() -> CellStore<u32> {
-    CellStore::<u32>::new(
-        storage(256, 48, 64, 16),
+fn store() -> CellStore {
+    CellStore::new(
+        storage(256, 48, 64),
         NodeIdentity::new(NodeId(0xABCD), 1),
         &rules(32),
     )
@@ -12,19 +12,19 @@ fn store() -> CellStore<u32> {
 
 #[test]
 fn empty_body_round_trips() {
-    decode_body_visit::<u32>(&[], 0, |_| panic!("no cells")).expect("ok");
+    decode_body(&[], 0, |_| panic!("no cells")).expect("ok");
 }
 
 #[test]
 fn empty_cell_count_with_trailing_bytes_rejected() {
-    let err = decode_body_visit::<u32>(&[0u8; 4], 0, |_| {}).unwrap_err();
-    assert_eq!(err, DecodeError::BodyLenMismatch);
+    let err = decode_body(&[0u8; 4], 0, |_| {}).unwrap_err();
+    assert_eq!(err, DecodeError::BodyLength);
 }
 
 #[test]
 fn truncated_body_rejected() {
-    let err = decode_body_visit::<u32>(&[0u8; 0], 1, |_| {}).unwrap_err();
-    assert_eq!(err, DecodeError::BodyLenMismatch);
+    let err = decode_body(&[0u8; 0], 1, |_| {}).unwrap_err();
+    assert_eq!(err, DecodeError::BodyLength);
 }
 
 #[test]

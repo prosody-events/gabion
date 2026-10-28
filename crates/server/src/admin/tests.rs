@@ -83,9 +83,9 @@ fn snapshot_json_shape_is_pinned() {
         let identity = NodeIdentity::new(NodeId(0xBEEF_CAFE), 11);
         let (mut gossip_config, storage) = settings().validate().expect("settings validate");
         let rule_table = Arc::new(sample_rules());
-        let store = CellStore::<u32>::new(storage, identity, &rule_table);
+        let store = CellStore::new(storage, identity, &rule_table);
         let counts = Arc::new(Aggregate::new(&storage));
-        let row = DeltaSink::<u32> {
+        let row = DeltaSink {
             handles: vec![CellHandle::default()],
             keys: vec![CellIdentity {
                 rule_fingerprint: rule_table.rules()[0].fingerprint(),
@@ -143,7 +143,6 @@ fn snapshot_json_shape_is_pinned() {
             [
                 "aggregate_rows",
                 "counters",
-                "decode_reject_count",
                 "dirty_ticks",
                 "forwarded_dirty_len",
                 "last_effective_fanout",
@@ -164,6 +163,10 @@ fn snapshot_json_shape_is_pinned() {
             [
                 "bytes_received",
                 "bytes_sent",
+                "decode_rejects_cluster",
+                "decode_rejects_framing",
+                "decode_rejects_peer_limits",
+                "decode_rejects_version",
                 "encode_failures",
                 "packets_received",
                 "packets_sent",
@@ -185,7 +188,7 @@ fn snapshot_json_shape_is_pinned() {
                 "rule_slots_used",
             ]
         );
-        assert_eq!(keys(&body["peers"][0]), ["addr", "node_id", "peer_slot"]);
+        assert_eq!(keys(&body["peers"][0]), ["addr", "node_id"]);
         assert_eq!(
             keys(&body["rules"][0]),
             [

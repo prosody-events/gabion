@@ -14,8 +14,8 @@
 //!
 //! These tests run under `cargo +nightly miri test --test safety` and exercise
 //! every memory-unsafe entry point on the production hot paths. Networking
-//! and tokio are not invoked — we manufacture `DeltaSink<u32>` /
-//! `ExpirationSink<u32>` rows directly and feed them through
+//! and tokio are not invoked — we manufacture `DeltaSink` /
+//! `ExpirationSink` rows directly and feed them through
 //! `AggregateStore::apply`.
 //!
 //! Exempt: `module.rs`'s nginx FFI, which needs nginx itself and so can't run
@@ -177,9 +177,9 @@ fn deltas_and_expirations(
     rule: &Rule,
     deltas: &[(KeyHash, u32, u32)],
     expirations: &[(KeyHash, u32, u32)],
-) -> (DeltaSink<u32>, ExpirationSink<u32>) {
-    let mut d: DeltaSink<u32> = DeltaSink::with_capacity(deltas.len());
-    let mut e: ExpirationSink<u32> = ExpirationSink::with_capacity(expirations.len());
+) -> (DeltaSink, ExpirationSink) {
+    let mut d: DeltaSink = DeltaSink::with_capacity(deltas.len());
+    let mut e: ExpirationSink = ExpirationSink::with_capacity(expirations.len());
     for &(kh, bucket, delta) in deltas {
         let key = CellIdentity {
             rule_fingerprint: rule.fingerprint(),

@@ -160,8 +160,8 @@ impl SimConfig {
     /// [`gabion::crdt::CellStore`] allocates once and never resizes, and the
     /// visualizer grows the live cluster by live joins up to `MAX_NODES` with
     /// no rebuild (the `live-node-membership-requirement`). Sizing from
-    /// `self.nodes` would overflow the node dictionary, peer table, and
-    /// cell store the moment a user joined past `config.nodes`, so every
+    /// `self.nodes` would overflow the node dictionary and cell store
+    /// the moment a user joined past `config.nodes`, so every
     /// cluster is sized for the ceiling it can grow to.
     ///
     /// Unlike the adapters' production defaults (`Settings::default`), these
@@ -211,7 +211,6 @@ impl SimConfig {
                 Setting::GossipMaxCellsPerTick,
                 VIZ_MAX_CELLS_PER_TICK.min(cross_node as usize).to_string(),
             ),
-            (Setting::GossipMaxCellsPerFrame, cross_node.to_string()),
             (Setting::StorageMaxCells, cross_node.to_string()),
             // One watched rule; headroom for an interned default / wire-only
             // rule.
@@ -230,7 +229,6 @@ impl SimConfig {
                 Setting::StorageForwardedDirtyCapacity,
                 cross_node.to_string(),
             ),
-            (Setting::StoragePeerCapacity, (ceiling + SLACK).to_string()),
         ] {
             settings.apply(setting, &value)?;
         }

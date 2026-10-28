@@ -19,7 +19,7 @@ use std::num::{NonZeroU32, NonZeroU128, NonZeroUsize};
 use std::time::Duration;
 
 use crate::settings::{MIN_LIMIT_QUEUE_CAPACITY, Millis};
-use crate::wire::{FrameLimits, HmacKey};
+use crate::wire::FrameLimits;
 
 mod admin;
 mod client;
@@ -51,7 +51,8 @@ pub use transport::UdpTransport;
 /// are generic on the runtime. The public fields are the adapter's to set.
 #[derive(Clone, Debug)]
 pub struct ValidGossipConfig {
-    /// Cluster identifier mixed into every outbound packet header.
+    /// Cluster identifier written into every outbound packet header; a
+    /// packet carrying any other is dropped.
     pub(crate) cluster_id_hash: NonZeroU128,
     /// Peers seeded at startup (in addition to any later peer events).
     pub bootstrap_peers: Vec<SocketAddr>,
@@ -62,10 +63,10 @@ pub struct ValidGossipConfig {
     /// see `handle_gossip_tick` in `runtime.rs`. This value only binds as a
     /// hard minimum when that threshold falls below it.
     pub(crate) fanout: NonZeroUsize,
-    /// Frame composition: how many cells `fill_gossip_frame*` may emit per
+    /// Frame composition: how many cells `fill_gossip_frame` may emit per
     /// tick. The wire codec splits this into multiple packets if needed.
     pub(crate) max_cells_per_tick: NonZeroUsize,
-    /// Per-packet UDP budget + decoder safety limits.
+    /// The packet size limit.
     pub(crate) wire_limits: FrameLimits,
     /// Capacity of the incoming limit-request channel.
     pub(crate) limit_queue_capacity: NonZeroUsize,
@@ -77,9 +78,6 @@ pub struct ValidGossipConfig {
     pub(crate) send_buffer_bytes: NonZeroU32,
     /// Period between proactive gossip ticks.
     pub(crate) tick_interval: Duration,
-    /// Optional HMAC key — when set, every outbound packet is authenticated
-    /// and inbound packets must verify.
-    pub auth_key: Option<HmacKey>,
     /// Deterministic RNG seed for peer sampling.
     pub rng_seed: u64,
     /// Per-rule error budget in basis points of the rule's own limit, used

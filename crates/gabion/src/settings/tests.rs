@@ -187,23 +187,23 @@ fn namespace_allow_takes_dns_labels_one_per_apply() {
 }
 
 #[test]
-fn payload_outside_152_to_65507_fails_validation() {
+fn payload_outside_158_to_65507_fails_validation() {
     let payload = |bytes| validated(|s| s.max_payload_bytes = bytes);
-    let error = payload(151).unwrap_err();
+    let error = payload(157).unwrap_err();
     assert_eq!(
         error,
         SettingError::PayloadOutOfRange {
-            configured: 151,
-            min: 152,
+            configured: 157,
+            min: 158,
             max: 65_507
         }
     );
-    assert_eq!(payload(152), Ok(()));
+    assert_eq!(payload(158), Ok(()));
     assert_eq!(payload(65_507), Ok(()));
     assert!(payload(65_508).is_err());
     assert_eq!(
         error.to_string(),
-        "The gossip packet size is 151 bytes, but gabion needs between 152 and 65507: 152 bytes \
+        "The gossip packet size is 157 bytes, but gabion needs between 158 and 65507: 158 bytes \
          hold the packet header and one counter, and 65507 is the largest UDP payload over IPv4. \
          Set `gossip.max_payload_bytes` (`GABION_GOSSIP_MAX_PAYLOAD_BYTES`; NGINX \
          `gabion_gossip_max_payload_bytes`) inside that range, and to the same value on every \
@@ -376,7 +376,6 @@ fn defaults_validate_to_the_production_values() {
         gossip.wire_limits,
         FrameLimits {
             max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
-            max_cells: defaults::GOSSIP_MAX_CELLS_PER_FRAME,
         }
     );
     assert_eq!(
@@ -422,7 +421,6 @@ fn defaults_validate_to_the_production_values() {
         storage.forwarded_dirty_capacity.get() as usize,
         defaults::STORAGE_FORWARDED_DIRTY_CAPACITY
     );
-    assert_eq!(storage.peer_capacity.get(), defaults::STORAGE_PEER_CAPACITY);
     assert_eq!(
         storage.cardinality,
         CardinalityLimits {

@@ -106,8 +106,8 @@ fn stopping_the_leader_releases_the_lease_to_a_follower() {
 #[derive(Default)]
 struct AppliedHits(Cell<usize>);
 
-impl AggregateStore<u32> for AppliedHits {
-    fn apply(&self, deltas: &DeltaSink<u32>, _: &ExpirationSink<u32>) {
+impl AggregateStore for AppliedHits {
+    fn apply(&self, deltas: &DeltaSink, _: &ExpirationSink) {
         self.0.set(self.0.get() + deltas.len());
     }
 }

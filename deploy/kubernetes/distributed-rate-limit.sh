@@ -453,7 +453,8 @@ print(f"  cell_capacity              {cell_store.get('cell_capacity', '?')}")
 print(f"  cell_store_full_rejects    {cell_store.get('cell_store_full_rejects', '?')}")
 print(f"  rule_dict_full_rejects     {cell_store.get('rule_dictionary_full_rejects', '?')}")
 print(f"  node_dict_full_rejects     {cell_store.get('node_dictionary_full_rejects', '?')}")
-print(f"  decode_reject_count        {snap.get('decode_reject_count', '?')}")
+counters = snap.get("counters", {})
+print(f"  decode_rejects             {sum(v for k, v in counters.items() if k.startswith('decode_rejects_'))}")
 PY
         printf '\n  -- full snapshot --\n'
         sed 's/^/    /' "$snapshot_path" | head -n 60

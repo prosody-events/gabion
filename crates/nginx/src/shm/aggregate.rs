@@ -47,8 +47,8 @@ impl ShmAggregateStore {
     }
 }
 
-impl AggregateStore<u32> for ShmAggregateStore {
-    fn apply(&self, deltas: &DeltaSink<u32>, expirations: &ExpirationSink<u32>) {
+impl AggregateStore for ShmAggregateStore {
+    fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink) {
         // A leader that stalled past its lease may still be applying gossip
         // after its successor emptied the table, which would count it twice.
         if self.region.lease().epoch.load(Ordering::Acquire) != self.epoch {

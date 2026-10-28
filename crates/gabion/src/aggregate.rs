@@ -28,8 +28,7 @@ use std::sync::atomic as std_atomic;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crate::crdt::{
-    BucketEpoch, Count, DeltaSink, ExpirationSink, KeyHash, ValidStorageConfig,
-    pow2_index_capacity_for,
+    BucketEpoch, DeltaSink, ExpirationSink, KeyHash, ValidStorageConfig, pow2_index_capacity_for,
 };
 use crate::gossip::AggregateStore;
 use crate::rules::RuleSpec;
@@ -274,9 +273,9 @@ impl<'a> AggregateWriter<'a> {
     }
 
     /// Fold one batch of the gossip runtime's rows in.
-    pub fn apply<C: Count>(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>) {
+    pub fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink) {
         for i in 0..deltas.len() {
-            let delta: u64 = deltas.deltas[i].into();
+            let delta = u64::from(deltas.deltas[i]);
             if deltas.applies_locally[i] == 0 || delta == 0 {
                 continue;
             }
@@ -428,8 +427,8 @@ impl Aggregate {
     }
 }
 
-impl<C: Count> AggregateStore<C> for Aggregate {
-    fn apply(&self, deltas: &DeltaSink<C>, expirations: &ExpirationSink<C>) {
+impl AggregateStore for Aggregate {
+    fn apply(&self, deltas: &DeltaSink, expirations: &ExpirationSink) {
         AggregateWriter::new(self.table(), &self.write_seq, &self.dropped)
             .apply(deltas, expirations);
     }

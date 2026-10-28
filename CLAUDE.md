@@ -18,13 +18,13 @@ SHM (nginx) or one `DashMap` lookup (server), no syscalls, no allocations.
 The workspace lives under `crates/`:
 
 - **`gabion`** — the library. Pure Rust, no transport bindings. Modules:
-  - `crdt` — per-origin counter store, dirty rings, peer frontier,
+  - `crdt` — per-origin counter store, dirty rings,
     delta/expiration sinks. Bounded; zero allocation after construction.
   - `gossip` — anti-entropy runtime (`GossipRuntime`), `GossipClient`,
     `Clock`, `GossipTransport`, the deterministic `sim::SimTransport`
     used in tests, and the admin/peer interface.
-  - `wire` — the on-the-wire codec for gossip frames (header, body,
-    HMAC auth). Each UDP packet is self-describing and independently
+  - `wire` — the on-the-wire codec for gossip frames (header and
+    body). Each UDP packet is self-describing and independently
     decodable.
   - `rules` — `Rule` / `RuleTable` / `Descriptor` / stable fingerprint
     hashing. Shared by both adapters so two nodes with identical rules
@@ -36,8 +36,8 @@ The workspace lives under `crates/`:
 - **`server`** (`gabion-server`) — the `gabiond` binary. Tonic gRPC
   rate-limit service speaking Envoy's
   `envoy.service.ratelimit.v3` protocol, plus a small admin HTTP
-  endpoint. `SharedLimiter<C>` is the admission entry point;
-  `DashMapStore<C>` is the cluster-aggregate read surface.
+  endpoint. `SharedLimiter` is the admission entry point;
+  `gabion::aggregate::Aggregate` is the cluster-aggregate read surface.
 
 - **`nginx`** (`gabion-nginx`) — the NGINX module. Two execution
   contexts share one `mmap`'d SHM zone: every worker runs the access
