@@ -293,7 +293,7 @@ impl<'a> AggregateWriter<'a> {
                 key.rule_fingerprint,
                 key.key_hash.0,
                 key.bucket,
-                expirations.last_counts[i].into(),
+                u64::from(expirations.last_counts[i]),
             );
         }
     }

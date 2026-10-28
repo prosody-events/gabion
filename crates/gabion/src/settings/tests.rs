@@ -373,10 +373,8 @@ fn defaults_validate_to_the_production_values() {
     );
     assert_eq!(gossip.fanout.get(), defaults::GOSSIP_FANOUT);
     assert_eq!(
-        gossip.wire_limits,
-        FrameLimits {
-            max_payload_bytes: defaults::GOSSIP_MAX_PAYLOAD_BYTES,
-        }
+        Some(gossip.wire_limits),
+        FrameLimits::new(defaults::GOSSIP_MAX_PAYLOAD_BYTES)
     );
     assert_eq!(
         gossip.max_cells_per_tick.get(),

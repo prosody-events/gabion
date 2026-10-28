@@ -161,12 +161,11 @@ packet from another protocol version or another cluster is dropped
 before any cell is read, and logged (`peer_version_mismatch`,
 `decode_rejected`; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
 
-The codec lives in `src/wire/{header,body}.rs`. The library's own
-`FrameLimits::default()` is 256 KB — useful for the codec's own tests —
-but the runtime takes its limits from the validated settings, whose
-`gossip.max_payload_bytes` defaults to 1400 bytes (the safe IPv4 MSS
-floor) and must lie between 158 and 65,507, so frames stay
-well below the path MTU and avoid IP fragmentation. A 1,400-byte packet
+The codec lives in `src/wire/{header,body}.rs`. Its `FrameLimits` can
+only be built with a payload between 158 and 65,507 bytes, and the
+runtime takes it from the validated `gossip.max_payload_bytes`, which
+defaults to 1400 bytes (the safe IPv4 MSS floor), so frames stay well
+below the path MTU and avoid IP fragmentation. A 1,400-byte packet
 holds 33 cells of one rule and one origin; that same bound caps what a
 received packet may carry, so no cell count is configured. Frames larger
 than the cap split into multiple packets at the sender, and each packet

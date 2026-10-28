@@ -178,8 +178,8 @@ fn deltas_and_expirations(
     deltas: &[(KeyHash, u32, u32)],
     expirations: &[(KeyHash, u32, u32)],
 ) -> (DeltaSink, ExpirationSink) {
-    let mut d: DeltaSink = DeltaSink::with_capacity(deltas.len());
-    let mut e: ExpirationSink = ExpirationSink::with_capacity(expirations.len());
+    let mut d = DeltaSink::with_capacity(deltas.len());
+    let mut e = ExpirationSink::with_capacity(expirations.len());
     for &(kh, bucket, delta) in deltas {
         let key = CellIdentity {
             rule_fingerprint: rule.fingerprint(),

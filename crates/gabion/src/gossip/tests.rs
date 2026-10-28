@@ -35,7 +35,7 @@ use crate::gossip::{
 use crate::mock::with_logs;
 use crate::settings::mock::{rules, storage};
 use crate::settings::{Millis, Settings};
-use crate::wire::{self, AckInfo, FrameLimits, Header, MIN_PAYLOAD_BYTES, Payload};
+use crate::wire::{self, AckInfo, Header, MIN_PAYLOAD_BYTES, Payload};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 
@@ -584,10 +584,8 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
     overcount.or(divergence)
 }
 
-/// Deterministic regression for the partition-heal stuck-cell flake. These
-/// records are a captured `PartitionCase` counterexample: node 3's
-/// `(rule 0, key 0)` cell never reached node 1 because the since-deleted peer
-/// frontier pruned it from every send lane, repair included. Pinned so the
+/// Deterministic partition-heal regression: a captured `PartitionCase` in
+/// which node 3's `(rule 0, key 0)` cell once never reached node 1. Pinned so
 /// convergence cannot regress behind the ~1-in-100k random trigger.
 #[test]
 fn sim_partition_heal_converges_on_captured_stuck_cell() {
@@ -627,7 +625,7 @@ fn sim_partition_heal_converges_on_captured_stuck_cell() {
     assert_eq!(
         run_paused(partition_heal_violation(case, 120)),
         None,
-        "captured partition counterexample must converge after the repair-lane fix",
+        "captured partition counterexample must converge",
     );
 }
 
@@ -686,7 +684,8 @@ fn foreign_cluster_packet_changes_nothing(case: ClusterCase) -> TestResult {
         let held = if case.same_cluster {
             agg_a.total() == a + b && agg_b.total() == a + b && counters.decode_rejects_cluster == 0
         } else {
-            agg_b.total() == b
+            agg_a.total() == a
+                && agg_b.total() == b
                 && snapshot.store_stats.active_cells == 1
                 && counters.decode_rejects_cluster >= 1
         };
@@ -1990,28 +1989,6 @@ fn send_error_to_one_peer_keeps_gossiping() {
     assert_logged(&logs, "send_error", 2, &[&peer, "send_errors_total="]);
 }
 
-/// A packet that cannot be encoded is counted and logged. Validation keeps
-/// the packet size at one cell or more, so the test sets it a byte below, as
-/// only a gabion bug could.
-#[test]
-fn encode_failure_is_counted_and_logged() {
-    let ((), logs) = with_logs(|| {
-        run_paused(async {
-            let wire = Rc::new(Wire::default());
-            let mut config = sim_config(vec![sock(2)], 1);
-            config.wire_limits = FrameLimits {
-                max_payload_bytes: MIN_PAYLOAD_BYTES - 1,
-            };
-            let (client, admin, _runtime) = mocked(&wire, store_for(node(0xA)), config).await;
-            hit(&client, 1).await;
-            heartbeats(3).await;
-            assert!(wire.attempts.borrow().is_empty());
-            assert_eq!(admin_snapshot(&admin).await.counters.encode_failures, 3);
-        })
-    });
-    assert_logged(&logs, "encode_failed", 2, &[&format!("peer={}", sock(2))]);
-}
-
 /// A version 1 header: magic, version 1, and zeros.
 fn v1_packet() -> Vec<u8> {
     let mut bytes = vec![0; wire::HEADER_LEN];
@@ -2113,19 +2090,16 @@ fn bad_version_reports_the_peer_version() {
     );
 }
 
-/// A node on the default cluster id says so once, at start; a node on its
-/// own id says nothing.
+/// A node on the default cluster id says so; a node on its own id says
+/// nothing.
 #[test]
-fn default_cluster_id_is_logged_once_at_start() {
+fn default_cluster_id_is_logged_only_on_the_default() {
     let ((), logs) = with_logs(|| {
-        run_paused(async {
-            let default = tuned_config(vec![], 1, |s| {
-                s.cluster_id_hash = Settings::default().cluster_id_hash;
-            });
-            let _default = mocked(&Rc::default(), store_for(node(0xA)), default).await;
-            let _own = mocked(&Rc::default(), store_for(node(0xB)), sim_config(vec![], 1)).await;
-            heartbeats(3).await;
+        tuned_config(vec![], 1, |s| {
+            s.cluster_id_hash = Settings::default().cluster_id_hash;
         })
+        .note_default_cluster_id();
+        sim_config(vec![], 1).note_default_cluster_id();
     });
     assert_logged(
         &logs,

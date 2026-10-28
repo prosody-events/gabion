@@ -108,6 +108,23 @@ fn header_v2_layout_is_pinned() {
         Ok((header, 0)),
         "a closing `Own` packet decodes"
     );
+
+    // Each ack flag owns its bit.
+    let sweep = Header {
+        acks: AckInfo::default(),
+        payload: Payload::Sweep,
+        ..header
+    };
+    let flags = |set: fn(&mut AckInfo)| {
+        let mut sweep = sweep;
+        set(&mut sweep.acks);
+        write_header(&sweep, 0)[7]
+    };
+    assert_eq!(flags(|acks| acks.gap_own = true), 0x02);
+    assert_eq!(flags(|acks| acks.gap_relay = true), 0x04);
+    assert_eq!(flags(|acks| acks.cannot_relay = true), 0x08);
+    assert_eq!(flags(|acks| acks.own = OwnAck::Flagged(0)), 0x10);
+    assert_eq!(flags(|acks| acks.probe_reply = true), 0x20);
 }
 
 /// The rules of the kind, flag and range table, transcribed in its order.

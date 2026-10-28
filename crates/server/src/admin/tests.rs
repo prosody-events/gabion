@@ -167,7 +167,6 @@ fn snapshot_json_shape_is_pinned() {
                 "decode_rejects_framing",
                 "decode_rejects_peer_limits",
                 "decode_rejects_version",
-                "encode_failures",
                 "packets_received",
                 "packets_sent",
                 "send_blocked",

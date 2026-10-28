@@ -24,7 +24,7 @@ pub struct RuleDescriptor {
     pub flags: u32,
     /// `u32::MAX` means the rule is known on the wire only — cells are stored,
     /// dirty-tracked, and expired the same way, but
-    /// [`super::CellDelta::applies_locally`] is `false` so the local
+    /// [`super::DeltaSink::applies_locally`] is `false` so the local
     /// rate-limit aggregator ignores them.
     pub local_rule_id: u32,
 }

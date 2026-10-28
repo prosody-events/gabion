@@ -1,7 +1,8 @@
 //! Build the gossip [`NodeIdentity`] at startup.
 //!
-//! `node_id` is a stable per-host identifier; `incarnation` bumps on every
-//! boot so peers treat the restarted process as a new origin.
+//! `node_id` is a stable per-host identifier; `incarnation` is the boot time
+//! in seconds, so peers treat a process restarted a second or more later as a
+//! new origin.
 
 use std::net::UdpSocket;
 use std::process;

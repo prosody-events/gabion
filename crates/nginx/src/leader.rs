@@ -244,11 +244,14 @@ async fn leader_main(
     // is no one to discover, and it asks for the smallest buffers, since it
     // sends nothing.
     let (bind, peers, gossip) = match config.gossip_bind {
-        Some(bind) => (
-            bind,
-            discovery::peer_events(config.discovery).left_stream(),
-            config.gossip,
-        ),
+        Some(bind) => {
+            config.gossip.note_default_cluster_id();
+            (
+                bind,
+                discovery::peer_events(config.discovery).left_stream(),
+                config.gossip,
+            )
+        }
         None => (
             LONE_NODE_BIND,
             futures::stream::empty().right_stream(),

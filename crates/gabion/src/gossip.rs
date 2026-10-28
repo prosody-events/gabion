@@ -18,7 +18,8 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU128, NonZeroUsize};
 use std::time::Duration;
 
-use crate::settings::{MIN_LIMIT_QUEUE_CAPACITY, Millis};
+use crate::defaults;
+use crate::settings::{MIN_LIMIT_QUEUE_CAPACITY, Millis, Setting};
 use crate::wire::FrameLimits;
 
 mod admin;
@@ -110,6 +111,22 @@ impl ValidGossipConfig {
             recv_buffer_bytes: crate::settings::MIN_SOCKET_BUFFER_BYTES,
             send_buffer_bytes: crate::settings::MIN_SOCKET_BUFFER_BYTES,
             ..self
+        }
+    }
+
+    /// Log `default_cluster_id` when this node uses the built-in cluster id.
+    /// Each adapter calls it once, when the node starts gossiping.
+    pub fn note_default_cluster_id(&self) {
+        if self.cluster_id_hash.get() == defaults::GOSSIP_CLUSTER_ID_HASH {
+            tracing::info!(
+                code = "default_cluster_id",
+                cluster_id_hash = self.cluster_id_hash,
+                config_key = Setting::GossipClusterIdHash.yaml_key(),
+                "This node uses the default gossip cluster id, 1. Any other gabion cluster left \
+                 at the default on the same network and gossip port would merge counts with this \
+                 one. Set {} to a value unique to this cluster.",
+                Setting::GossipClusterIdHash,
+            );
         }
     }
 }

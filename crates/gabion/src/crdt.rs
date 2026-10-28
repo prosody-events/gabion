@@ -135,30 +135,6 @@ pub struct CellHandle {
     pub generation: u32,
 }
 
-/// One row appended to [`DeltaSink`] when a stored count rose. The `key`
-/// carries the portable [`CellIdentity`] — downstream aggregate stores key on
-/// `(rule_fingerprint, key_hash, bucket)` without ever seeing a node-local
-/// slot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CellDelta {
-    pub handle: CellHandle,
-    pub key: CellIdentity,
-    pub previous_count: u32,
-    pub current_count: u32,
-    pub delta: u32,
-    pub applies_locally: bool,
-}
-
-/// One row appended to [`ExpirationSink`] when a cell ages out.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CellExpiration {
-    pub handle: CellHandle,
-    pub key: CellIdentity,
-    pub last_count: u32,
-    pub last_update_millis: u64,
-    pub applies_locally: bool,
-}
-
 /// Snapshot of one stored cell.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CellRow {

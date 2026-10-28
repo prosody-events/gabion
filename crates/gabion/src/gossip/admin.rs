@@ -94,8 +94,6 @@ pub struct GossipCounters {
     pub send_blocked: u64,
     /// Sends that failed for any other reason; logged as `send_error`.
     pub send_errors: u64,
-    /// Packets that could not be encoded; logged as `encode_failed`.
-    pub encode_failures: u64,
     /// Packets dropped as not valid gossip; logged as `decode_rejected` with
     /// `reason = "framing"`.
     pub decode_rejects_framing: u64,
@@ -120,8 +118,8 @@ impl GossipCounters {
     }
 }
 
-/// One peer known to the runtime. `node_id` is `None` until the runtime has
-/// received an inbound packet from this peer.
+/// One peer known to the runtime. `node_id` is `None` until a packet from
+/// this peer has decoded.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct PeerEntry {

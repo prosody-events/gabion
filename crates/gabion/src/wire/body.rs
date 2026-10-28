@@ -24,7 +24,7 @@
 //! When `cell_count == 0` the body is empty (no dict section). All integers
 //! are little-endian; no alignment requirement.
 
-use crate::crdt::{CellHandle, CellStore, KeyHash, NodeId, Observation};
+use crate::crdt::{CellHandle, CellRow, CellStore, KeyHash, NodeId, Observation};
 
 use super::{DecodeError, read_u32, read_u64, read_u128};
 
@@ -93,23 +93,13 @@ impl WireScratch {
     }
 }
 
-/// Outcome of encoding one packet's body.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct EncodedBody {
-    /// Cells emitted into this packet.
-    pub cells_emitted: u16,
+/// What one packet's body holds: the handles it consumes, the cells it
+/// emits, and its dictionary sizes and length.
+pub(crate) struct Plan {
     /// Handles consumed from `handles[start..]`: the cells emitted and the
     /// stale handles skipped, which never carry over to the next packet.
-    pub handles_consumed: usize,
-}
-
-/// Pre-flight pass: project how many handles fit in this packet without
-/// writing anything. Returns the chosen handle range and the dictionary
-/// sizes used.
-struct Plan {
-    /// Handles consumed: the cells emitted and the stale handles skipped.
-    consumed: usize,
-    cells_emitted: u16,
+    pub(crate) handles_consumed: usize,
+    pub(crate) cells_emitted: u16,
     /// `R` — distinct rule fingerprints required by the emitted cells.
     rule_count: u8,
     /// `D` — distinct origin node ids required by the emitted cells.
@@ -119,8 +109,7 @@ struct Plan {
 }
 
 /// Encode the next packet's body into `out` starting at `out.len()`. Returns
-/// `EncodedBody` describing what was written; the caller patches the header
-/// using these values.
+/// the [`Plan`] it wrote; the caller patches the header from it.
 ///
 /// `body_budget` is the bytes available for the body (the header is the
 /// caller's concern). The encoder will not exceed it.
@@ -133,7 +122,7 @@ pub(crate) fn encode_packet_body(
     body_budget: usize,
     scratch: &mut WireScratch,
     out: &mut Vec<u8>,
-) -> EncodedBody {
+) -> Plan {
     debug_assert!(start_at <= handles.len());
     scratch.reset();
 
@@ -141,10 +130,16 @@ pub(crate) fn encode_packet_body(
     if plan.cells_emitted > 0 {
         write_body(store, handles, start_at, &plan, scratch, out);
     }
-    EncodedBody {
-        cells_emitted: plan.cells_emitted,
-        handles_consumed: plan.consumed,
-    }
+    plan
+}
+
+/// The row behind `handle` with its rule fingerprint and origin node id,
+/// or `None` for a stale handle, which both passes skip alike.
+fn resolve(store: &CellStore, handle: CellHandle) -> Option<(CellRow, u128, u128)> {
+    let row = store.get(handle)?;
+    let rule = store.rule_dictionary().descriptor(row.key.rule)?;
+    let node = store.node_dictionary().descriptor(row.key.origin)?;
+    Some((row, rule.fingerprint, node.node_id.0))
 }
 
 fn plan_packet(
@@ -160,16 +155,7 @@ fn plan_packet(
     let mut d: u8 = 0;
 
     while cursor < handles.len() {
-        let handle = handles[cursor];
-        let Some(row) = store.get(handle) else {
-            cursor += 1;
-            continue;
-        };
-        let Some(rule_desc) = store.rule_dictionary().descriptor(row.key.rule) else {
-            cursor += 1;
-            continue;
-        };
-        let Some(node_desc) = store.node_dictionary().descriptor(row.key.origin) else {
+        let Some((row, rule_fp, node_id)) = resolve(store, handles[cursor]) else {
             cursor += 1;
             continue;
         };
@@ -184,24 +170,23 @@ fn plan_packet(
             break;
         }
 
-        // The `u16` cell count caps a packet too.
         let projected_body = DICT_LEN_BYTES
             + 16 * new_r
             + 16 * new_d
             + (usize::from(cells_emitted) + 1) * CELL_BYTES;
-        if projected_body > body_budget || cells_emitted == u16::MAX {
+        if projected_body > body_budget {
             break;
         }
 
         // Admit: assign per-packet slots if unseen.
         if rule_unseen {
             scratch.rule_remap[row.key.rule as usize] = r;
-            scratch.rule_fps.push(rule_desc.fingerprint);
+            scratch.rule_fps.push(rule_fp);
             r += 1;
         }
         if node_unseen {
             scratch.node_remap[row.key.origin as usize] = d;
-            scratch.node_ids.push(node_desc.node_id.0);
+            scratch.node_ids.push(node_id);
             d += 1;
         }
 
@@ -216,7 +201,7 @@ fn plan_packet(
     };
 
     Plan {
-        consumed: cursor - start_at,
+        handles_consumed: cursor - start_at,
         cells_emitted,
         rule_count: r,
         node_count: d,
@@ -267,20 +252,12 @@ fn write_body(
     debug_assert_eq!(count_off + 4 * n, plan.len);
 
     // Pass 2 — walk the same handle range we planned over and fill slabs.
-    // The staleness checks are identical to plan_packet so the two cell
-    // counts agree.
     let mut i = 0_usize;
     let mut consumed = 0_usize;
-    while consumed < plan.consumed && i < n {
+    while consumed < plan.handles_consumed && i < n {
         let handle = handles[start_at + consumed];
         consumed += 1;
-        let Some(row) = store.get(handle) else {
-            continue;
-        };
-        let Some(_rule_desc) = store.rule_dictionary().descriptor(row.key.rule) else {
-            continue;
-        };
-        let Some(_node_desc) = store.node_dictionary().descriptor(row.key.origin) else {
+        let Some((row, ..)) = resolve(store, handle) else {
             continue;
         };
 
@@ -319,19 +296,12 @@ pub(crate) fn decode_body(
         return Err(DecodeError::BodyLength);
     }
     let rule_dict_len = bytes[0] as usize;
-    if rule_dict_len == 0 {
-        // Cells require at least one rule slot.
-        return Err(DecodeError::BodyLength);
-    }
     let rule_dict_start = 1;
     let rule_dict_end = rule_dict_start + 16 * rule_dict_len;
     if bytes.len() < rule_dict_end + 1 {
         return Err(DecodeError::BodyLength);
     }
     let node_dict_len = bytes[rule_dict_end] as usize;
-    if node_dict_len == 0 {
-        return Err(DecodeError::BodyLength);
-    }
     let node_dict_start = rule_dict_end + 1;
     let node_dict_end = node_dict_start + 16 * node_dict_len;
 
@@ -362,15 +332,17 @@ pub(crate) fn decode_body(
     let count_slab = &bytes[cursor..cursor + 4 * n];
     debug_assert_eq!(cursor + 4 * n, bytes.len());
 
+    // Every slot is checked before any cell is handed over, so a dropped
+    // packet hands over none.
+    if rule_slot.iter().any(|&s| usize::from(s) >= rule_dict_len)
+        || node_slot.iter().any(|&s| usize::from(s) >= node_dict_len)
+    {
+        return Err(DecodeError::BadSlot);
+    }
+
     for i in 0..n {
-        let rs = rule_slot[i] as usize;
-        if rs >= rule_dict_len {
-            return Err(DecodeError::BadSlot);
-        }
-        let ns = node_slot[i] as usize;
-        if ns >= node_dict_len {
-            return Err(DecodeError::BadSlot);
-        }
+        let rs = usize::from(rule_slot[i]);
+        let ns = usize::from(node_slot[i]);
         on_cell(Observation {
             rule_fingerprint: read_u128(&rule_dict_bytes[rs * 16..]),
             key_hash: KeyHash(read_u128(&key_hash_slab[i * 16..])),

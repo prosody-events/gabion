@@ -1,9 +1,7 @@
 //! Column-oriented IO containers: [`ObservationBatch`], [`DeltaSink`], and
 //! [`ExpirationSink`].
 
-use super::{
-    BucketEpoch, CellDelta, CellExpiration, CellHandle, CellIdentity, Incarnation, KeyHash, NodeId,
-};
+use super::{BucketEpoch, CellHandle, CellIdentity, Incarnation, KeyHash, NodeId};
 
 /// One row to push into an [`ObservationBatch`]. Bundled so callers can
 /// construct an observation in one expression rather than passing seven
@@ -129,20 +127,6 @@ impl DeltaSink {
         self.applies_locally.clear();
     }
 
-    pub fn row(&self, i: usize) -> Option<CellDelta> {
-        if i >= self.len() {
-            return None;
-        }
-        Some(CellDelta {
-            handle: self.handles[i],
-            key: self.keys[i],
-            previous_count: self.previous[i],
-            current_count: self.current[i],
-            delta: self.deltas[i],
-            applies_locally: self.applies_locally[i] != 0,
-        })
-    }
-
     pub(super) fn push(
         &mut self,
         handle: CellHandle,
@@ -205,19 +189,6 @@ impl ExpirationSink {
         self.last_counts.clear();
         self.last_update_millis.clear();
         self.applies_locally.clear();
-    }
-
-    pub fn row(&self, i: usize) -> Option<CellExpiration> {
-        if i >= self.len() {
-            return None;
-        }
-        Some(CellExpiration {
-            handle: self.handles[i],
-            key: self.keys[i],
-            last_count: self.last_counts[i],
-            last_update_millis: self.last_update_millis[i],
-            applies_locally: self.applies_locally[i] != 0,
-        })
     }
 
     pub(super) fn push(

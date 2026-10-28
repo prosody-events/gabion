@@ -50,7 +50,7 @@ use gabion::crdt::{
     Expiry, Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
     RuleSlot, ValidStorageConfig,
 };
-use gabion::defaults::GOSSIP_EXPIRATION_BATCH;
+use gabion::defaults::{GOSSIP_EXPIRATION_BATCH, GOSSIP_MAX_PAYLOAD_BYTES};
 use gabion::gossip::AggregateStore;
 use gabion::rules::{EnforcementMode, RuleDef, RuleSpec, RuleTable};
 use gabion::settings::Settings;
@@ -1146,8 +1146,7 @@ fn bench_wire(c: &mut Criterion) {
                 black_box(&handles),
                 &mut scratch,
                 limits,
-            )
-            .expect("ctor");
+            );
             while let Some(pkt) = packets.next_into(&mut buf) {
                 black_box(pkt);
                 black_box(buf.as_bytes());
@@ -1156,16 +1155,14 @@ fn bench_wire(c: &mut Criterion) {
     });
 
     // ─── encode_multi_packet_4096 ─────────────────────────────────────
-    // 4096-cell fixture under a 64 KiB UDP-style budget. Measures the
-    // steady-state multi-packet emission rate — drains the full handle
-    // list across however many packets it takes (target ~9–10).
+    // 4096-cell fixture under the production 1,400-byte budget, at most 33
+    // cells a packet. Measures the steady-state multi-packet emission rate —
+    // drains the full handle list across however many packets it takes.
     let mut multi_store = fixture.store.clone();
     let mut multi_handles = Vec::<CellHandle>::with_capacity(4096);
     multi_store.fill_gossip_frame(4096, &mut multi_handles);
     let multi_handles = multi_handles;
-    let multi_limits = FrameLimits {
-        max_payload_bytes: 64 * 1024,
-    };
+    let multi_limits = FrameLimits::new(GOSSIP_MAX_PAYLOAD_BYTES).unwrap();
     // Sanity-check the bench actually exercises the multi-packet path.
     {
         let mut scratch = WireScratch::for_store(&multi_store);
@@ -1176,8 +1173,7 @@ fn bench_wire(c: &mut Criterion) {
             &multi_handles,
             &mut scratch,
             multi_limits,
-        )
-        .expect("ctor");
+        );
         let mut n_packets = 0;
         while packets.next_into(&mut buf).is_some() {
             n_packets += 1;
@@ -1199,8 +1195,7 @@ fn bench_wire(c: &mut Criterion) {
                 black_box(&multi_handles),
                 &mut scratch,
                 multi_limits,
-            )
-            .expect("ctor");
+            );
             while let Some(pkt) = packets.next_into(&mut buf) {
                 black_box(pkt);
                 black_box(buf.as_bytes());
@@ -1223,13 +1218,12 @@ fn bench_wire(c: &mut Criterion) {
             &handles,
             &mut preflight_scratch,
             limits,
-        )
-        .expect("preflight ctor");
-        let packet = packets
+        );
+        let cells = packets
             .next_into(&mut preflight_buf)
             .expect("at least one packet");
-        // 128 cells fits in the default 256 KiB budget, so it's one packet.
-        assert_eq!(packet, 128);
+        // 128 cells fits one packet at the default limits.
+        assert_eq!(cells, 128);
     }
     let frame_buf: Vec<u8> = preflight_buf.as_bytes().to_vec();
     let cluster = wire_header().cluster_id_hash;

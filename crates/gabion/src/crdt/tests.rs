@@ -25,7 +25,7 @@ fn descriptor_for(fingerprint: u128, local_id: u32) -> RuleDescriptor {
     }
 }
 
-fn store_u32() -> CellStore {
+fn store() -> CellStore {
     CellStore::new(storage(16, 8, 16), local(), &rules(8))
 }
 
@@ -554,7 +554,7 @@ fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
 
 #[test]
 fn merge_remote_is_monotonic() {
-    let mut store = store_u32();
+    let mut store = store();
     store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(4);
 
@@ -588,7 +588,7 @@ fn merge_remote_is_monotonic() {
 
 #[test]
 fn different_origins_are_independent() {
-    let mut store = store_u32();
+    let mut store = store();
     store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let _a = remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
     let _b = remote_merge_one(&mut store, 0x11, 2, 1, 7, 0);
@@ -598,7 +598,7 @@ fn different_origins_are_independent() {
 #[test]
 fn merge_order_does_not_matter() {
     let make = |order: &[(u128, u32)]| {
-        let mut store = store_u32();
+        let mut store = store();
         store.intern_rule(descriptor_for(0x11, 1)).unwrap();
         for (origin, count) in order {
             remote_merge_one(&mut store, 0x11, *origin, 1, *count, 0);
@@ -624,7 +624,7 @@ fn merge_order_does_not_matter() {
 
 #[test]
 fn increment_local_accumulates() {
-    let mut store = store_u32();
+    let mut store = store();
     store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let handle = local_increment_one(&mut store, 0x11, 0xabc, 0, 3, 10);
     let _ = local_increment_one(&mut store, 0x11, 0xabc, 0, 4, 20);
@@ -959,7 +959,7 @@ fn unknown_rule_cells_expire_at_default_window() {
 
 #[test]
 fn compact_id_round_trip() {
-    let mut store = store_u32();
+    let mut store = store();
     store.intern_rule(descriptor_for(0xAA, 1)).unwrap();
     let rule_slot = store.rule_dictionary.find(0xAA).unwrap();
     let _ = remote_merge_one(&mut store, 0xAA, 99, 7, 1, 0);
@@ -1183,7 +1183,7 @@ fn dirty_lanes_separate() {
 
 #[test]
 fn incarnation_change_isolates() {
-    let mut store = store_u32();
+    let mut store = store();
     store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let h1 = remote_merge_one(&mut store, 0x11, 42, 1, 5, 0);
     let h2 = remote_merge_one(&mut store, 0x11, 42, 2, 5, 0);
@@ -1279,20 +1279,20 @@ fn expire_emits_one_row_per_freed_cell() {
     assert_eq!(store.rule_dictionary().refcount(rule_doomed), 1);
     assert!(store.rule_dictionary().descriptor(rule_doomed).is_some());
 
-    let mut rows: Vec<CellExpiration> = (0..exp.len()).map(|i| exp.row(i).unwrap()).collect();
-    rows.sort_by_key(|r| r.handle.index);
+    let mut rows: Vec<usize> = (0..exp.len()).collect();
+    rows.sort_by_key(|&i| exp.handles[i].index);
     let mut expected = [snap_a, snap_b];
     expected.sort_by_key(|r| r.handle.index);
-    for (got, snap) in rows.iter().zip(expected.iter()) {
-        assert_eq!(got.handle, snap.handle);
+    for (&i, snap) in rows.iter().zip(expected.iter()) {
+        assert_eq!(exp.handles[i], snap.handle);
         // The exported identity carries the rule fingerprint, not the
         // node-local rule slot — translate via the dictionary snapshot.
-        assert_eq!(got.key.rule_fingerprint, 0x22);
-        assert_eq!(got.key.key_hash, snap.key.key_hash);
-        assert_eq!(got.key.bucket, snap.key.bucket);
-        assert_eq!(got.last_count, snap.count);
-        assert_eq!(got.last_update_millis, snap.last_update_millis);
-        assert!(got.applies_locally);
+        assert_eq!(exp.keys[i].rule_fingerprint, 0x22);
+        assert_eq!(exp.keys[i].key_hash, snap.key.key_hash);
+        assert_eq!(exp.keys[i].bucket, snap.key.bucket);
+        assert_eq!(exp.last_counts[i], snap.count);
+        assert_eq!(exp.last_update_millis[i], snap.last_update_millis);
+        assert_eq!(exp.applies_locally[i], 1);
     }
 }
 
@@ -1963,6 +1963,7 @@ impl Arbitrary for HitRows {
 fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
     let mut store = CellStore::new(storage(4, 4, 32), local(), &rules(4));
     let mut model_sum: u64 = 0;
+    let mut delta_sum: u64 = 0;
     for row in &rows.0 {
         let mut obs = ObservationBatch::with_capacity(1);
         obs.push(Observation {
@@ -1976,6 +1977,7 @@ fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
         });
         let mut sink = DeltaSink::with_capacity(1);
         store.ingest_local(&obs, &mut sink);
+        delta_sum += sink.deltas.iter().map(|&d| u64::from(d)).sum::<u64>();
         model_sum += u64::from(row.hits);
     }
     let stored = store
@@ -1983,7 +1985,8 @@ fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
         .next()
         .and_then(|h| store.get(h).map(|r| r.count))
         .unwrap_or(0);
-    stored == model_sum.min(u64::from(u32::MAX)) as u32
+    let expected = model_sum.min(u64::from(u32::MAX)) as u32;
+    stored == expected && delta_sum == u64::from(stored)
 }
 
 // --- Gap 5: lane priority as ordered prediction --------------------------

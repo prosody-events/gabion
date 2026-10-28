@@ -149,7 +149,7 @@
 
       <div class="io-row">
         <span class="io-label">
-          <InfoTip text="Inbound packets the wire decoder rejected — bad HMAC, truncated, or otherwise undecodable. Zero is the calm, expected state.">
+          <InfoTip text="Inbound packets the wire decoder dropped: malformed or truncated, larger than this node accepts, another protocol version, or another cluster's. Zero is the calm, expected state.">
             decode rejects
           </InfoTip>
         </span>

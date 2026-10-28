@@ -203,9 +203,9 @@ where
 
         let recv_buf = vec![0u8; wire::MAX_PAYLOAD_BYTES].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
-        // Sized to the most cells one inbound packet carries, and at least the
-        // one a limit request carries.
-        let packet_cells = config.wire_limits.max_cells().max(1);
+        // Sized to the most cells one inbound packet carries; a limit request
+        // carries one.
+        let packet_cells = config.wire_limits.cell_bound();
         let obs_buf = ObservationBatch::with_capacity(packet_cells);
         let sink_buf = DeltaSink::with_capacity(packet_cells);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick.get());
@@ -274,17 +274,6 @@ where
     where
         St: Stream<Item = PeerEvent>,
     {
-        if self.config.cluster_id_hash.get() == defaults::GOSSIP_CLUSTER_ID_HASH {
-            tracing::info!(
-                code = "default_cluster_id",
-                cluster_id_hash = self.config.cluster_id_hash,
-                config_key = Setting::GossipClusterIdHash.yaml_key(),
-                "This node uses the default gossip cluster id, 1. Any other gabion cluster left \
-                 at the default on the same network and gossip port would merge counts with this \
-                 one. Set {} to a value unique to this cluster.",
-                Setting::GossipClusterIdHash,
-            );
-        }
         let mut peer_events = std::pin::pin!(peer_events);
         let mut tick = self.clock.ticker(self.config.tick_interval);
         // Once the peer-event stream returns `None` (e.g. `stream::empty()`),
@@ -457,7 +446,7 @@ where
     /// Count a dropped packet against its cause, and log at powers of two of
     /// that cause's count, so a flood of one cause cannot hide another.
     fn note_decode_reject(&mut self, error: DecodeError, peer: SocketAddr, length: usize) {
-        let max_payload_bytes = self.config.wire_limits.max_payload_bytes;
+        let max_payload_bytes = self.config.wire_limits.max_payload_bytes();
         match error {
             DecodeError::BadVersion { found } => {
                 if let Some(rejected_total) =
@@ -754,22 +743,7 @@ where
             if self.frame_handles.is_empty() {
                 continue;
             }
-            if let Err(error) = self.send_frame(peer_addr)
-                && let Some(encode_failures_total) =
-                    throttle::bump(&mut self.counters.encode_failures)
-            {
-                tracing::error!(
-                    code = "encode_failed",
-                    peer = %peer_addr,
-                    error = %error,
-                    encode_failures_total,
-                    "gabion could not build a gossip packet for this peer, so it sent nothing \
-                     more to that peer this round, and limits there under-count until a later \
-                     round succeeds. Startup validation should make this impossible, so it is a \
-                     gabion bug. Report it with the `error` and `peer` fields and the gabion \
-                     version.",
-                );
-            }
+            self.send_frame(peer_addr);
             if self.outbox.is_held() {
                 return;
             }
@@ -777,7 +751,7 @@ where
     }
 
     /// Encode the frame in `frame_handles` for `dst` and send it.
-    fn send_frame(&mut self, dst: SocketAddr) -> Result<(), wire::EncodeError> {
+    fn send_frame(&mut self, dst: SocketAddr) {
         // Every packet is a sweep: cells outside any stream.
         let header = wire::Header {
             cluster_id_hash: self.config.cluster_id_hash.get(),
@@ -797,9 +771,8 @@ where
             counters,
             ..
         } = self;
-        let packets = Packets::new(header, store, frame_handles, scratch, config.wire_limits)?;
+        let packets = Packets::new(header, store, frame_handles, scratch, config.wire_limits);
         outbox.send_frame(packets, dst, transport, counters);
-        Ok(())
     }
 }
 

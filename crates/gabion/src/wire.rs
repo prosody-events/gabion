@@ -14,9 +14,9 @@
 //!   version, kind, flags and range, then the cluster id, and only then the
 //!   body, so a packet from another version or cluster is dropped before any of
 //!   its cells is read.
-//! - No cell bound is configured: the body's exact-length check runs before any
-//!   cell is visited, so a packet within `max_payload_bytes` cannot deliver
-//!   more cells than `FrameLimits::max_cells`.
+//! - No cell bound is configured: the body's exact length and every slot are
+//!   checked before any cell is visited, so a packet within `max_payload_bytes`
+//!   cannot deliver more cells than `FrameLimits::cell_bound`.
 //!
 //! Socket I/O, peer selection, and tick scheduling live outside this module.
 
@@ -45,34 +45,41 @@ pub const MIN_PAYLOAD_BYTES: usize = HEADER_LEN + DICT_LEN_BYTES + 16 + 16 + CEL
 /// The largest UDP payload over IPv4: 65,535 − 20 (IP header) − 8 (UDP header).
 pub const MAX_PAYLOAD_BYTES: usize = 65_507;
 
-/// Limits applied at frame boundaries.
+// The `u16` cell count holds every cell the largest payload carries.
+const _: () = assert!(MAX_PAYLOAD_BYTES / CELL_BYTES <= u16::MAX as usize);
+
+/// A payload size within `MIN_PAYLOAD_BYTES..=MAX_PAYLOAD_BYTES`, so every
+/// packet holds at least one cell and fits one UDP datagram.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameLimits {
-    pub max_payload_bytes: usize,
+    max_payload_bytes: usize,
 }
 
 impl FrameLimits {
+    /// `None` outside `MIN_PAYLOAD_BYTES..=MAX_PAYLOAD_BYTES`.
+    pub fn new(max_payload_bytes: usize) -> Option<Self> {
+        (MIN_PAYLOAD_BYTES..=MAX_PAYLOAD_BYTES)
+            .contains(&max_payload_bytes)
+            .then_some(Self { max_payload_bytes })
+    }
+
+    pub(crate) fn max_payload_bytes(self) -> usize {
+        self.max_payload_bytes
+    }
+
     /// The most cells one packet within these limits holds: one rule, one
     /// origin, and every other byte spent on cells.
-    pub(crate) fn max_cells(self) -> usize {
-        self.max_payload_bytes
-            .saturating_sub(MIN_PAYLOAD_BYTES - CELL_BYTES)
-            / CELL_BYTES
+    pub(crate) fn cell_bound(self) -> usize {
+        (self.max_payload_bytes - (MIN_PAYLOAD_BYTES - CELL_BYTES)) / CELL_BYTES
     }
 }
 
 impl Default for FrameLimits {
     fn default() -> Self {
         Self {
-            max_payload_bytes: 256 * 1024,
+            max_payload_bytes: MAX_PAYLOAD_BYTES,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum EncodeError {
-    #[error("max_payload_bytes is smaller than the header and one cell")]
-    BudgetTooSmall,
 }
 
 /// Why a packet was dropped, in the order [`decode`] checks.
@@ -162,7 +169,7 @@ impl<'a> Packets<'a> {
         handles: &'a [CellHandle],
         scratch: &'a mut WireScratch,
         limits: FrameLimits,
-    ) -> Result<Self, EncodeError> {
+    ) -> Self {
         debug_assert!(
             matches!(
                 header.payload,
@@ -170,17 +177,14 @@ impl<'a> Packets<'a> {
             ),
             "only the data kinds carry cells"
         );
-        if limits.max_payload_bytes < MIN_PAYLOAD_BYTES {
-            return Err(EncodeError::BudgetTooSmall);
-        }
-        Ok(Self {
+        Self {
             header,
             store,
             handles,
             scratch,
             limits,
             cursor: 0,
-        })
+        }
     }
 
     /// Encode the next packet into `buf` and return its cell count, or
@@ -194,7 +198,7 @@ impl<'a> Packets<'a> {
 
         // Reserve the header slot; encode_packet_body appends the body.
         buf.inner.resize(HEADER_LEN, 0);
-        let encoded = encode_packet_body(
+        let plan = encode_packet_body(
             self.store,
             self.handles,
             self.cursor,
@@ -204,19 +208,19 @@ impl<'a> Packets<'a> {
         );
 
         // A stale-only run with no emitted cells advances the cursor and
-        // emits an empty packet. The constructor checked that one cell fits
-        // an empty packet, so every call consumes a handle; stop rather than
+        // emits an empty packet. The limits fit one cell in an empty packet,
+        // so every call consumes a handle; stop rather than
         // spin if that ever breaks.
-        debug_assert!(encoded.handles_consumed > 0);
-        if encoded.handles_consumed == 0 {
+        debug_assert!(plan.handles_consumed > 0);
+        if plan.handles_consumed == 0 {
             return None;
         }
 
-        buf.inner[..HEADER_LEN].copy_from_slice(&write_header(&self.header, encoded.cells_emitted));
+        buf.inner[..HEADER_LEN].copy_from_slice(&write_header(&self.header, plan.cells_emitted));
         debug_assert!(buf.inner.len() <= self.limits.max_payload_bytes);
 
-        self.cursor += encoded.handles_consumed;
-        Some(encoded.cells_emitted)
+        self.cursor += plan.handles_consumed;
+        Some(plan.cells_emitted)
     }
 }
 
@@ -224,8 +228,7 @@ impl<'a> Packets<'a> {
 
 /// Decode one packet, handing each cell to `on_cell`, and return its header.
 /// A packet from another cluster fails as [`DecodeError::ForeignCluster`]
-/// before its body is read. On any error the cells already handed over must
-/// be discarded.
+/// before its body is read. On any error no cell was handed over.
 pub fn decode(
     bytes: &[u8],
     limits: FrameLimits,

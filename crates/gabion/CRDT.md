@@ -798,7 +798,7 @@ File: `crates/gabion/src/crdt/io.rs`.
 
 ### Why SoA in the I/O containers
 
-The aggregator's job — folding a column of deltas by key and rule into a running window — is exactly what SoA lets you stream a single column through. With a `Vec<CellDelta>` the count is interleaved with `CellHandle`, `CellIdentity`, two other counts, and a bool, so the CPU pulls a full cache line per element and discards most of it. With SoA, the `deltas` column is a contiguous `Vec<u32>`, which packs sixteen counts per cache line.
+The aggregator's job — folding a column of deltas by key and rule into a running window — is exactly what SoA lets you stream a single column through. With an array of row structs the count is interleaved with `CellHandle`, `CellIdentity`, two other counts, and a bool, so the CPU pulls a full cache line per element and discards most of it. With SoA, the `deltas` column is a contiguous `Vec<u32>`, which packs sixteen counts per cache line.
 
 Three further reasons matter. Every row has the same shape, so there is no enum discriminant and no per-row match dispatch. Each column is a packed array of a single primitive, so the rows are smaller and free of struct padding. And every column is a single `Vec<T>`, sized at `with_capacity` and reused via `clear()` between frames, which makes it easy to audit against the no-allocation-after-construction rule.
 
@@ -898,7 +898,7 @@ pub struct DeltaSink {
 
 `DeltaSink` does not actually expose a "drain"; instead the caller passes `&mut sink` to `ingest_local` or `merge_remote`, the call returns with zero or more new rows appended, the caller iterates `0..sink.len()` and folds each row into its aggregator state, then calls `sink.clear()` before the next submission.
 
-`clear()` is idempotent and preserves capacity, so the next frame refills the same buffer. The convenience method `row(i)` materialises one delta as an AoS `CellDelta` for callers that prefer the struct shape — typically logging and tests — but there is no iterator that yields `CellDelta`s, because production code walks the columns directly to keep the SoA benefits.
+`clear()` is idempotent and preserves capacity, so the next frame refills the same buffer. There is no row-struct view: production code walks the columns directly to keep the SoA benefits.
 
 ### 5.3 `ExpirationSink` — output for aged-out cells
 
@@ -924,8 +924,6 @@ pub struct ExpirationSink {
 | `applies_locally`    | Byte flag, same semantics as `DeltaSink`. |
 
 `ExpirationSink::push` is `pub(super)` so that only `CellStore::expire` and its convenience wrapper `expire_at` (§8) append to it, and the same read-then-`clear()` pattern as `DeltaSink` applies.
-
-`CellExpiration` is the AoS row type — the same shape as `CellDelta` but with the columns described above — returned by `ExpirationSink::row(i)` for the same logging-and-tests convenience.
 
 ### 5.4 `CompactCellKey` vs `CellIdentity`
 

@@ -11,7 +11,7 @@ fn store() -> CellStore {
 }
 
 #[test]
-fn empty_body_round_trips() {
+fn empty_body_decodes_to_no_cells() {
     decode_body(&[], 0, |_| panic!("no cells")).expect("ok");
 }
 

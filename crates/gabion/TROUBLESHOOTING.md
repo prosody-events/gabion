@@ -105,7 +105,7 @@ Message starts: "Ignoring gossip from this peer: it speaks another gossip protoc
 
 ### `default_cluster_id`
 
-**Level** info, once at start · **Request allowed** yes · **Emitted by** library (both adapters)
+**Level** info, once at start (NGINX: when a worker starts leading gossip on `gabion_gossip_bind`) · **Request allowed** yes · **Emitted by** library (both adapters)
 
 Message starts: "This node uses the default gossip cluster id, 1."
 
@@ -158,20 +158,6 @@ Message starts: "Could not send a gossip packet to this peer"
 **What to do next.** If it repeats for a peer that is running, check the policy and the route between the two nodes.
 
 **Fields** `peer`, `error`, `send_errors_total` · **Knob** none
-
-### `encode_failed`
-
-**Level** error, power of two · **Request allowed** yes, that peer under-counts this round · **Emitted by** library (both adapters)
-
-Message starts: "gabion could not build a gossip packet"
-
-**What happened.** A gossip packet could not be encoded, so nothing more went to that peer this round, and limits there under-count until a later round succeeds.
-
-**Why.** Startup validation should make this impossible, so it is a gabion bug.
-
-**What to do next.** Report it with the `error` and `peer` fields and the gabion version.
-
-**Fields** `peer`, `error`, `encode_failures_total` · **Knob** none
 
 ### `kubernetes_forbidden`
 

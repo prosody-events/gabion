@@ -11,8 +11,8 @@ use crate::crdt::{
 use crate::settings::mock::{rules, storage};
 
 use super::{
-    AckInfo, DecodeError, EncodeError, FrameLimits, HEADER_LEN, Header, MAGIC, MIN_PAYLOAD_BYTES,
-    PacketBuf, Packets, Payload, WireScratch, decode, write_header,
+    AckInfo, DecodeError, FrameLimits, HEADER_LEN, Header, MAGIC, MIN_PAYLOAD_BYTES, PacketBuf,
+    Packets, Payload, WireScratch, decode, write_header,
 };
 
 const MAX_ROWS: usize = 32;
@@ -164,8 +164,7 @@ impl CellKey {
 fn encode(store: &CellStore, handles: &[CellHandle], limits: FrameLimits) -> Vec<Vec<u8>> {
     let mut scratch = WireScratch::for_store(store);
     let mut buf = PacketBuf::for_limits(limits);
-    let mut packets =
-        Packets::new(sample_header(), store, handles, &mut scratch, limits).expect("ctor");
+    let mut packets = Packets::new(sample_header(), store, handles, &mut scratch, limits);
     let mut out = Vec::new();
     while packets.next_into(&mut buf).is_some() {
         out.push(buf.as_bytes().to_vec());
@@ -216,6 +215,34 @@ fn packets_round_trip(rows: Rows) -> Result<(), String> {
     Ok(())
 }
 
+/// Each body column sits where the wire format puts it.
+#[test]
+fn body_layout_is_pinned() {
+    let row = RawRow {
+        rule_fingerprint: 0xA1,
+        key_hash: 0xB2,
+        bucket: 0xC3,
+        origin_node_id: 0xD4,
+        origin_incarnation: 0xE5,
+        count: 0xF6,
+        last_update_millis: 0x17,
+    };
+    let (store, handles) = seed_store(&[row]);
+    let packet = encode(&store, &handles, FrameLimits::default()).remove(0);
+    let mut body = vec![1];
+    body.extend(0xA1_u128.to_le_bytes());
+    body.push(1);
+    body.extend(0xD4_u128.to_le_bytes());
+    body.push(0);
+    body.extend(0xB2_u128.to_le_bytes());
+    body.extend(0xC3_u32.to_le_bytes());
+    body.push(0);
+    body.extend(0xE5_u32.to_le_bytes());
+    body.extend(0x17_u64.to_le_bytes());
+    body.extend(0xF6_u32.to_le_bytes());
+    assert_eq!(packet[HEADER_LEN..], body);
+}
+
 // -- Multi-packet boundaries -------------------------------------------------
 
 /// Build a store with `n` distinct origin nodes (one cell each) so the
@@ -250,9 +277,7 @@ fn packets_split_on_intern_cap() {
     let (store, handles) = build_many_origins(n);
     assert_eq!(handles.len() as u32, n);
 
-    let limits = FrameLimits {
-        max_payload_bytes: 256 * 1024,
-    };
+    let limits = FrameLimits::default();
     let frames = encode(&store, &handles, limits);
     assert!(
         frames.len() >= 2,
@@ -263,13 +288,13 @@ fn packets_split_on_intern_cap() {
     let mut total_cells = 0;
     for frame in &frames {
         total_cells += decode_cells(frame, limits).expect("decode").len();
-        // Each packet declares dictionaries of at most 255 slots.
-        let rule_dict_len = frame[HEADER_LEN] as usize;
-        let node_dict_len = frame[HEADER_LEN + 1 + 16 * rule_dict_len] as usize;
-        assert!(node_dict_len <= 255);
-        assert!(rule_dict_len <= 255);
     }
     assert_eq!(total_cells, n as usize);
+    assert_eq!(
+        frames[0][HEADER_LEN + 17],
+        255,
+        "the origin dictionary's cap split the frame"
+    );
 }
 
 #[test]
@@ -280,9 +305,7 @@ fn packets_split_on_udp_budget() {
 
     // Each cell carries a unique node id here, so it costs its 38 bytes plus
     // 16 of dictionary; a 2 KiB budget splits the frame into many packets.
-    let limits = FrameLimits {
-        max_payload_bytes: 2048,
-    };
+    let limits = FrameLimits::new(2048).unwrap();
     let frames = encode(&store, &handles, limits);
     assert!(
         frames.len() >= 2,
@@ -299,21 +322,21 @@ fn packets_split_on_udp_budget() {
 }
 
 /// A cell costs 38 bytes, so a 1,400-byte packet holds 33 cells of one rule
-/// and one origin, and the derived bound says so. A packet claiming one cell
+/// and one origin, and `cell_bound` says so. A packet claiming one cell
 /// more than its bytes hold fails the exact-length check.
 #[test]
 fn cell_costs_38_bytes_and_packet_holds_33() {
     let (store, handles) = seed_store(&dense_rows(64));
-    let limits = FrameLimits {
-        max_payload_bytes: 1400,
-    };
+    let limits = FrameLimits::new(1400).unwrap();
     let mut scratch = WireScratch::for_store(&store);
     let mut buf = PacketBuf::for_limits(limits);
-    let mut packets =
-        Packets::new(sample_header(), &store, &handles, &mut scratch, limits).expect("ctor");
+    let mut packets = Packets::new(sample_header(), &store, &handles, &mut scratch, limits);
     assert_eq!(packets.next_into(&mut buf), Some(33));
     assert_eq!(buf.as_bytes().len(), 86 + 34 + 33 * 38);
-    assert_eq!(limits.max_cells(), 33);
+    // The bound steps at 120 + 38k bytes: 1,411 holds 33 cells, 1,412 holds 34.
+    for (bytes, cells) in [(1400, 33), (1411, 33), (1412, 34)] {
+        assert_eq!(FrameLimits::new(bytes).unwrap().cell_bound(), cells);
+    }
 
     let one = encode(&store, &handles[..1], limits);
     let two = encode(&store, &handles[..2], limits);
@@ -328,31 +351,29 @@ fn cell_costs_38_bytes_and_packet_holds_33() {
     );
 }
 
-#[test]
-fn mid_batch_packet_decodes_in_isolation() {
-    // Use the high-fanout fixture so the split happens by node-dict cap.
-    let (store, handles) = build_many_origins(300);
-    let limits = FrameLimits::default();
-    let frames = encode(&store, &handles, limits);
-    assert!(frames.len() >= 2);
-
-    // Decode only the second packet — it must be fully usable on its own.
-    let cells = decode_cells(&frames[1], limits).expect("isolated decode ok");
-    assert!(!cells.is_empty());
-}
-
+/// An out-of-range slot drops the packet before any of its cells is handed
+/// over, wherever the slot sits.
 #[test]
 fn decoder_rejects_bad_slot() {
     let (store, handles) = seed_store(&dense_rows(3));
     let limits = FrameLimits::default();
-    let mut frame = encode(&store, &handles, limits).remove(0);
-    // Set the first cell's rule_slot to R (out of range).
+    let frame = encode(&store, &handles, limits).remove(0);
     let offset = rule_slot_offset(&frame);
-    frame[offset] = frame[HEADER_LEN];
-    assert_eq!(
-        decode(&frame, limits, CLUSTER, |_| {}),
-        Err(DecodeError::BadSlot)
-    );
+    let node_dict_len = frame[HEADER_LEN + 1 + 16 * usize::from(frame[HEADER_LEN])];
+    // The first cell's rule_slot set to R; the last cell's node_slot set to D.
+    for (at, slot) in [
+        (offset, frame[HEADER_LEN]),
+        (offset + 21 * 3 + 2, node_dict_len),
+    ] {
+        let mut bad = frame.clone();
+        bad[at] = slot;
+        let mut seen = 0;
+        assert_eq!(
+            decode(&bad, limits, CLUSTER, |_| seen += 1),
+            Err(DecodeError::BadSlot)
+        );
+        assert_eq!(seen, 0, "no cell is handed over before the error");
+    }
 }
 
 #[test]
@@ -397,11 +418,9 @@ fn decode_checks_run_in_order() {
     let limits = FrameLimits::default();
     let rows: [(&str, FrameLimits, Vec<u8>, DecodeError); 9] = [
         (
-            "too large and too short",
-            FrameLimits {
-                max_payload_bytes: 50,
-            },
-            vec![0; 60],
+            "too large and bad magic",
+            FrameLimits::new(MIN_PAYLOAD_BYTES).unwrap(),
+            vec![0; MIN_PAYLOAD_BYTES + 1],
             DecodeError::PayloadTooLarge,
         ),
         (
@@ -488,19 +507,6 @@ fn v1_packet_is_bad_version_not_garbage() {
 }
 
 // -- Outer guardrails -------------------------------------------------------
-
-#[test]
-fn budget_too_small_rejected_at_constructor() {
-    let (store, handles) = seed_store(&dense_rows(1));
-    let mut scratch = WireScratch::for_store(&store);
-    let limits = FrameLimits {
-        max_payload_bytes: MIN_PAYLOAD_BYTES - 1,
-    };
-    assert!(matches!(
-        Packets::new(sample_header(), &store, &handles, &mut scratch, limits),
-        Err(EncodeError::BudgetTooSmall)
-    ));
-}
 
 #[test]
 fn empty_handles_emits_zero_packets() {

@@ -271,13 +271,13 @@ impl Settings {
     /// gossip runtime and the cell store take. Each adapter calls this once,
     /// while loading its configuration.
     pub fn validate(&self) -> Result<(ValidGossipConfig, ValidStorageConfig), SettingError> {
-        if !(MIN_PAYLOAD_BYTES..=MAX_PAYLOAD_BYTES).contains(&self.max_payload_bytes) {
+        let Some(wire_limits) = FrameLimits::new(self.max_payload_bytes) else {
             return Err(SettingError::PayloadOutOfRange {
                 configured: self.max_payload_bytes,
                 min: MIN_PAYLOAD_BYTES,
                 max: MAX_PAYLOAD_BYTES,
             });
-        }
+        };
         let Some(target_err_bps) =
             NonZeroU32::new(self.target_err_bps).filter(|bps| bps.get() <= MAX_ERROR_BUDGET_BPS)
         else {
@@ -362,9 +362,7 @@ impl Settings {
             bootstrap_peers: Vec::new(),
             fanout: self.fanout,
             max_cells_per_tick: self.max_cells_per_tick,
-            wire_limits: FrameLimits {
-                max_payload_bytes: self.max_payload_bytes,
-            },
+            wire_limits,
             limit_queue_capacity: self.limit_queue_capacity,
             #[cfg(feature = "transport-udp")]
             recv_buffer_bytes: self.recv_buffer_bytes,
