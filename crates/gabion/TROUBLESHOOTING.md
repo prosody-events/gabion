@@ -103,7 +103,7 @@ Message starts: "The kernel gave the gossip socket a"
 
 **What to do next.** Raise the sysctl on the host to at least `requested_bytes` (in Kubernetes a node setting, not a pod sysctl). If the host cannot change, set the setting named in `config_key` to `granted_bytes` to accept the smaller buffer and silence the warning.
 
-**Fields** `buffer`, `requested_bytes`, `granted_bytes` (Linux reports double the grant), `sysctl`, `config_key` · **Knob** `gossip.recv_buffer_bytes` (`GABION_GOSSIP_RECV_BUFFER_BYTES`) / `gabion_gossip_recv_buffer_bytes`; `gossip.send_buffer_bytes` (`GABION_GOSSIP_SEND_BUFFER_BYTES`) / `gabion_gossip_send_buffer_bytes`
+**Fields** `buffer`, `requested_bytes`, `granted_bytes` (the grant itself; gabion halves the double Linux reports), `sysctl`, `config_key` · **Knob** `gossip.recv_buffer_bytes` (`GABION_GOSSIP_RECV_BUFFER_BYTES`) / `gabion_gossip_recv_buffer_bytes`; `gossip.send_buffer_bytes` (`GABION_GOSSIP_SEND_BUFFER_BYTES`) / `gabion_gossip_send_buffer_bytes`
 
 ### `send_error`
 

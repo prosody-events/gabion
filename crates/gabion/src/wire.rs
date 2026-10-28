@@ -51,6 +51,17 @@ pub struct FrameLimits {
     pub max_cells: u32,
 }
 
+impl FrameLimits {
+    /// The most cells one packet within these limits carries with a `C`
+    /// count: what its bytes hold, at most `max_cells`.
+    pub(crate) fn packet_cells<C: Count>(self) -> usize {
+        let per_cell = PER_CELL_IDENT_BYTES + size_of::<C>();
+        let fixed = min_payload_bytes(size_of::<C>(), 0) - per_cell;
+        let fit = self.max_payload_bytes.saturating_sub(fixed) / per_cell;
+        fit.min(self.max_cells as usize)
+    }
+}
+
 impl Default for FrameLimits {
     fn default() -> Self {
         Self {

@@ -1,4 +1,5 @@
-//! Bidirectional datagram transport contract.
+//! Bidirectional datagram transport contract, and the `Outbox` the runtime
+//! sends through.
 //!
 //! Production uses [`UdpTransport`] over a `tokio::net::UdpSocket`; tests and
 //! simulators use [`crate::gossip::sim::SimTransport`] over in-process mpsc
@@ -7,17 +8,17 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-
-#[cfg(feature = "transport-udp")]
 use std::num::NonZeroU32;
 
 #[cfg(feature = "transport-udp")]
 use tokio::net::UdpSocket;
 
-#[cfg(feature = "transport-udp")]
 use super::ValidGossipConfig;
-#[cfg(feature = "transport-udp")]
+use super::admin::GossipCounters;
+use crate::crdt::Count;
 use crate::settings::Setting;
+use crate::throttle;
+use crate::wire::{EncodeError, PacketBuf, Packets};
 
 /// Bidirectional datagram transport. The runtime borrows `&self.transport`
 /// (not `&mut`) on every arm so disjoint-field borrows compose cleanly inside
@@ -56,6 +57,115 @@ pub trait GossipTransport {
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a;
 }
 
+/// The one send buffer. A packet the kernel refuses stays in it, with its
+/// destination, until a retry sends it; nothing encodes meanwhile, so the
+/// held packet is never overwritten.
+pub(super) struct Outbox {
+    packet: PacketBuf,
+    held: Option<SocketAddr>,
+    /// The send buffer gabion asked for, named by `send_blocked`.
+    send_buffer: NonZeroU32,
+}
+
+impl Outbox {
+    pub(super) fn new(config: &ValidGossipConfig) -> Self {
+        Self {
+            packet: PacketBuf::for_limits(config.wire_limits),
+            held: None,
+            send_buffer: config.send_buffer_bytes,
+        }
+    }
+
+    pub(super) fn is_held(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Encode `packets` for `dst`, handing each packet to the socket as it
+    /// is encoded and stopping at the first the kernel refuses. The cells
+    /// left unsent wait in the dirty rings and the repair lane.
+    pub(super) fn send_frame<C: Count, T: GossipTransport>(
+        &mut self,
+        mut packets: Packets<'_, C>,
+        dst: SocketAddr,
+        transport: &T,
+        counters: &mut GossipCounters,
+    ) -> Result<(), EncodeError> {
+        while self.held.is_none() && packets.next_into(&mut self.packet)?.is_some() {
+            self.send(dst, transport, counters);
+        }
+        Ok(())
+    }
+
+    /// Send the held packet, if any; a refusal holds it again.
+    pub(super) fn retry<T: GossipTransport>(
+        &mut self,
+        transport: &T,
+        counters: &mut GossipCounters,
+    ) {
+        if let Some(dst) = self.held.take() {
+            self.send(dst, transport, counters);
+        }
+    }
+
+    /// Hand the packet to the socket. A refusal for lack of buffer space
+    /// holds it; any other error drops it, and gossip goes on.
+    fn send<T: GossipTransport>(
+        &mut self,
+        dst: SocketAddr,
+        transport: &T,
+        counters: &mut GossipCounters,
+    ) {
+        match transport.try_send_to(self.packet.as_bytes(), dst) {
+            Ok(bytes) => {
+                counters.packets_sent += 1;
+                counters.bytes_sent += bytes as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(send_blocked_total) = throttle::bump(&mut counters.send_blocked) {
+                    tracing::warn!(
+                        code = "send_blocked",
+                        send_blocked_total,
+                        requested_send_buffer_bytes = self.send_buffer.get(),
+                        granted_send_buffer_bytes = transport.send_buffer_bytes(),
+                        sysctl = "net.core.wmem_max",
+                        config_key = Setting::GossipSendBufferBytes.yaml_key(),
+                        "The kernel's send buffer for the gossip socket was full, so this node \
+                         stopped its gossip round early; it retries the refused packet first on \
+                         each later round and sends the rest once the kernel accepts sends again. \
+                         Counts reach some peers late, so limits there briefly under-count and \
+                         allow requests over the limit. Usually the send buffer is smaller than \
+                         gabion asked for (look for an earlier warning naming \
+                         `net.core.wmem_max`), or the host's network is saturated. Raise \
+                         `net.core.wmem_max` on the host to at least {0} bytes, the size {1} asks \
+                         for. If the host already grants that much, raise {1} and \
+                         `net.core.wmem_max` together.",
+                        self.send_buffer,
+                        Setting::GossipSendBufferBytes,
+                    );
+                }
+                self.held = Some(dst);
+            }
+            Err(error) => {
+                if let Some(send_errors_total) = throttle::bump(&mut counters.send_errors) {
+                    tracing::warn!(
+                        code = "send_error",
+                        peer = %dst,
+                        error = %error,
+                        send_errors_total,
+                        "Could not send a gossip packet to this peer, so gabion dropped that packet \
+                         and kept gossiping with every other peer. The peer gets the same counts on a \
+                         later round once sends succeed; until then, limits enforced there \
+                         under-count. Usually the peer has just left the cluster (a stale address), \
+                         or a firewall or NetworkPolicy blocks UDP from this node to it. If it \
+                         repeats for a peer that is running, check the policy and the route between \
+                         the two.",
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Newtype over [`UdpSocket`]: `bind` sizes its kernel buffers, and
 /// `try_send_to` reports `ENOBUFS` as `WouldBlock`.
 #[cfg(feature = "transport-udp")]
@@ -70,7 +180,7 @@ impl UdpTransport {
         let socket = UdpSocket::bind(addr).await?;
         let buffers = socket2::SockRef::from(&socket);
         // A request above the host's cap is clamped or refused; either way
-        // the size read back is what the kernel granted.
+        // the size read back shows what the kernel granted.
         let _ = buffers.set_recv_buffer_size(config.recv_buffer_bytes.get() as usize);
         let _ = buffers.set_send_buffer_size(config.send_buffer_bytes.get() as usize);
         warn_if_capped(
@@ -78,16 +188,27 @@ impl UdpTransport {
             "net.core.rmem_max",
             Setting::GossipRecvBufferBytes,
             config.recv_buffer_bytes,
-            buffers.recv_buffer_size()?,
+            grant(buffers.recv_buffer_size()?),
         );
         warn_if_capped(
             "send",
             "net.core.wmem_max",
             Setting::GossipSendBufferBytes,
             config.send_buffer_bytes,
-            buffers.send_buffer_size()?,
+            grant(buffers.send_buffer_size()?),
         );
         Ok(Self(socket))
+    }
+}
+
+/// The buffer the kernel granted, from the size it reports: Linux reports
+/// double the grant, the extra covering its own bookkeeping.
+#[cfg(feature = "transport-udp")]
+pub(super) fn grant(reported: usize) -> usize {
+    if cfg!(target_os = "linux") {
+        reported / 2
+    } else {
+        reported
     }
 }
 
@@ -146,7 +267,10 @@ impl GossipTransport for UdpTransport {
     }
 
     fn send_buffer_bytes(&self) -> Option<usize> {
-        socket2::SockRef::from(&self.0).send_buffer_size().ok()
+        socket2::SockRef::from(&self.0)
+            .send_buffer_size()
+            .ok()
+            .map(grant)
     }
 
     #[inline]

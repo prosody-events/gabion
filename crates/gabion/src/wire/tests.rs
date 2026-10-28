@@ -428,6 +428,49 @@ fn packets_split_on_udp_budget() {
     assert_eq!(total_cells, n);
 }
 
+/// `packet_cells` is exactly what the densest packet (one rule, one origin)
+/// carries, so the runtime's inbound buffers never grow, and `max_cells`
+/// caps it.
+#[test]
+fn packet_cells_is_what_one_packet_carries() {
+    fn densest<C: Count>(limits: FrameLimits) -> usize {
+        let rows: Vec<RawRow> = (0..64)
+            .map(|i| RawRow {
+                rule_fingerprint: 0xAA,
+                key_hash: 0xBEEF + i,
+                bucket: 0,
+                origin_node_id: 0x1_0000,
+                origin_incarnation: 1,
+                count: 1,
+                last_update_millis: 1_000,
+            })
+            .collect();
+        let (store, handles) = seed_store::<C>(&rows, |c| C::saturating_from_u64(c.into()));
+        let mut scratch = WireScratch::for_store(&store);
+        let mut buf = PacketBuf::for_limits(limits);
+        let mut packets =
+            Packets::<C>::unauth(sample_header(), &store, &handles, &mut scratch, limits)
+                .expect("ctor");
+        packets
+            .next_into(&mut buf)
+            .expect("encode")
+            .expect("one packet")
+            .cells_emitted as usize
+    }
+
+    let limits = FrameLimits {
+        max_payload_bytes: 1400,
+        max_cells: 4096,
+    };
+    assert_eq!(limits.packet_cells::<u32>(), densest::<u32>(limits));
+    assert_eq!(limits.packet_cells::<u64>(), densest::<u64>(limits));
+    let capped = FrameLimits {
+        max_cells: 4,
+        ..limits
+    };
+    assert_eq!(capped.packet_cells::<u32>(), 4);
+}
+
 #[test]
 fn flag_more_unset_on_only_packet() {
     let rows: Vec<RawRow> = (0..2)

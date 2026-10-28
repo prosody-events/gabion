@@ -11,7 +11,6 @@
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
 
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
@@ -24,7 +23,7 @@ use crate::defaults;
 use crate::discovery::PeerEvent;
 use crate::settings::Setting;
 use crate::throttle;
-use crate::wire::{self, PacketBuf, Packets, WireScratch};
+use crate::wire::{self, Packets, WireScratch};
 
 use super::admin::{AdminCommand, AdminSnapshot, GossipCounters, PeerEntry};
 use super::client::{GossipClient, LimitRequest, Request};
@@ -32,9 +31,9 @@ use super::client::{GossipClient, LimitRequest, Request};
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
 use super::store::AggregateStore;
-use super::transport::GossipTransport;
 #[cfg(feature = "transport-udp")]
 use super::transport::UdpTransport;
+use super::transport::{GossipTransport, Outbox};
 use super::{GossipError, ValidGossipConfig};
 
 /// One peer the runtime gossips with. `node_id` is `None` until we receive
@@ -110,11 +109,7 @@ where
     sink_buf: DeltaSink<C>,
     expiration_buf: ExpirationSink<C>,
     frame_handles: Vec<CellHandle>,
-    /// The one send buffer. While `held` is set it holds the packet the
-    /// kernel refused, and nothing encodes.
-    packet: PacketBuf,
-    /// Where the packet in `packet` goes, while the kernel refuses it.
-    held: Option<SocketAddr>,
+    outbox: Outbox,
 
     peers: Vec<Peer>,
     rng: SplitMix64,
@@ -253,15 +248,15 @@ where
 
         let recv_buf = vec![0u8; config.wire_limits.max_payload_bytes].into_boxed_slice();
         let scratch = WireScratch::for_store(&store);
-        // An inbound packet, or one limit request, carries at most the
-        // decoder's per-packet cell bound.
-        let packet_cells = config.wire_limits.max_cells as usize;
+        // Sized to the most cells one inbound packet carries, and at least the
+        // one a limit request carries.
+        let packet_cells = config.wire_limits.packet_cells::<C>().max(1);
         let obs_buf = ObservationBatch::<C>::with_capacity(packet_cells);
         let ack_buf = AckColumns::with_capacity(packet_cells);
         let sink_buf = DeltaSink::<C>::with_capacity(packet_cells);
         let frame_handles = Vec::with_capacity(config.max_cells_per_tick.get());
         let expiration_buf = ExpirationSink::<C>::with_capacity(defaults::GOSSIP_EXPIRATION_BATCH);
-        let packet = PacketBuf::for_limits(config.wire_limits);
+        let outbox = Outbox::new(&config);
 
         let peers: Vec<Peer> = config
             .bootstrap_peers
@@ -294,8 +289,7 @@ where
             sink_buf,
             expiration_buf,
             frame_handles,
-            packet,
-            held: None,
+            outbox,
             peers,
             rng,
             pending_reply: None,
@@ -683,18 +677,7 @@ where
         self.ticks_total = self.ticks_total.saturating_add(1);
         self.expire_cells();
         self.settle();
-        if let Some(dst) = self.held {
-            if !send_packet(
-                &self.transport,
-                &self.packet,
-                dst,
-                &mut self.counters,
-                self.config.send_buffer_bytes,
-            ) {
-                return;
-            }
-            self.held = None;
-        }
+        self.outbox.retry(&self.transport, &mut self.counters);
         self.gossip();
     }
 
@@ -724,9 +707,9 @@ where
     }
 
     /// Send this round's frames, stopping at the first packet the kernel
-    /// refuses.
+    /// refuses. A round that falls due while a packet is held sends nothing.
     fn gossip(&mut self) {
-        if self.store.is_empty() || self.peers.is_empty() {
+        if self.outbox.is_held() || self.store.is_empty() || self.peers.is_empty() {
             return;
         }
 
@@ -818,21 +801,14 @@ where
                      version.",
                 );
             }
-            if self.held.is_some() {
+            if self.outbox.is_held() {
                 return;
             }
         }
     }
 
-    /// Encode the frame in `frame_handles` for `dst` and hand each packet to
-    /// the socket as it is encoded. A packet the kernel refuses stays in
-    /// `packet`, `held` names its destination, and the rest of the frame waits
-    /// in the dirty rings and the repair lane.
+    /// Encode the frame in `frame_handles` for `dst` and send it.
     fn send_frame(&mut self, dst: SocketAddr) -> Result<(), wire::EncodeError> {
-        debug_assert!(
-            self.held.is_none(),
-            "encoding would overwrite the held packet"
-        );
         let header = wire::Header {
             cluster_id_hash: self.config.cluster_id_hash.get(),
             sender_node_id: self.store.local_identity().node_id.0,
@@ -851,12 +827,11 @@ where
             frame_handles,
             scratch,
             transport,
-            packet,
-            held,
+            outbox,
             counters,
             ..
         } = self;
-        let mut packets = match config.auth_key.as_ref() {
+        let packets = match config.auth_key.as_ref() {
             Some(key) => Packets::<C>::auth(
                 header,
                 store,
@@ -867,13 +842,7 @@ where
             ),
             None => Packets::<C>::unauth(header, store, frame_handles, scratch, config.wire_limits),
         }?;
-        while packets.next_into(packet)?.is_some() {
-            if !send_packet(transport, packet, dst, counters, config.send_buffer_bytes) {
-                *held = Some(dst);
-                break;
-            }
-        }
-        Ok(())
+        outbox.send_frame(packets, dst, transport, counters)
     }
 }
 
@@ -890,67 +859,6 @@ async fn recv_admin(rx: &mut Option<mpsc::Receiver<AdminCommand>>) -> Option<Adm
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
-    }
-}
-
-/// Hand one encoded packet to the socket. Returns `false` when the kernel
-/// refused it for lack of buffer space, so the caller holds it; any other
-/// error drops the packet, and gossip goes on.
-fn send_packet<T: GossipTransport>(
-    transport: &T,
-    packet: &PacketBuf,
-    dst: SocketAddr,
-    counters: &mut GossipCounters,
-    send_buffer: NonZeroU32,
-) -> bool {
-    match transport.try_send_to(packet.as_bytes(), dst) {
-        Ok(bytes) => {
-            counters.packets_sent += 1;
-            counters.bytes_sent += bytes as u64;
-            true
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            if let Some(send_blocked_total) = throttle::bump(&mut counters.send_blocked) {
-                tracing::warn!(
-                    code = "send_blocked",
-                    send_blocked_total,
-                    requested_send_buffer_bytes = send_buffer.get(),
-                    granted_send_buffer_bytes = transport.send_buffer_bytes(),
-                    sysctl = "net.core.wmem_max",
-                    config_key = Setting::GossipSendBufferBytes.yaml_key(),
-                    "The kernel's send buffer for the gossip socket was full, so this node \
-                     stopped its gossip round early; it retries the refused packet first on each \
-                     later round and sends the rest once the kernel accepts sends again. Counts \
-                     reach some peers late, so limits there briefly under-count and allow \
-                     requests over the limit. Usually the send buffer is smaller than gabion \
-                     asked for (look for an earlier warning naming `net.core.wmem_max`), or the \
-                     host's network is saturated. Raise `net.core.wmem_max` on the host to at \
-                     least {0} bytes, the size {1} asks for. If the host already grants that \
-                     much, raise {1} and `net.core.wmem_max` together.",
-                    send_buffer,
-                    Setting::GossipSendBufferBytes,
-                );
-            }
-            false
-        }
-        Err(error) => {
-            if let Some(send_errors_total) = throttle::bump(&mut counters.send_errors) {
-                tracing::warn!(
-                    code = "send_error",
-                    peer = %dst,
-                    error = %error,
-                    send_errors_total,
-                    "Could not send a gossip packet to this peer, so gabion dropped that packet \
-                     and kept gossiping with every other peer. The peer gets the same counts on a \
-                     later round once sends succeed; until then, limits enforced there \
-                     under-count. Usually the peer has just left the cluster (a stale address), \
-                     or a firewall or NetworkPolicy blocks UDP from this node to it. If it \
-                     repeats for a peer that is running, check the policy and the route between \
-                     the two.",
-                );
-            }
-            true
-        }
     }
 }
 

@@ -2281,12 +2281,13 @@ fn encode_failure_is_counted_and_logged() {
 
 /// `socket_buffer_capped` fires when the kernel grants less than the setting
 /// asked for, naming the setting in every spelling and the sysctl; a real
-/// socket gets the configured request, not the default, and the minimal
-/// buffers a lone node asks for never warn.
+/// socket gets the configured request, not the default, read back as granted
+/// rather than as Linux reports it, and the minimal buffers a lone node asks
+/// for never warn.
 #[cfg(feature = "transport-udp")]
 #[test]
 fn socket_buffer_warning_when_granted_is_smaller() {
-    use super::transport::warn_if_capped;
+    use super::transport::{grant, warn_if_capped};
     use crate::settings::Setting;
 
     let requested = 65_536.try_into().unwrap();
@@ -2320,8 +2321,7 @@ fn socket_buffer_warning_when_granted_is_smaller() {
                 .unwrap()
         })
     });
-    // Linux reports double the grant.
-    assert!(receive <= 131_072, "receive buffer {receive}");
+    assert_eq!(grant(receive), 65_536);
     assert_logged(
         &logs,
         "socket_buffer_capped",
