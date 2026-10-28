@@ -66,12 +66,12 @@
   }
 
   figcaption {
-    font-size: var(--text-xs);
+    font-size: var(--font-size-caption-sm);
     font-weight: 650;
     letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: var(--ink-soft);
-    margin-bottom: var(--space-1);
+    color: var(--color-fg-muted);
+    margin-bottom: var(--gap-xs);
   }
 
   /* uPlot draws axis ticks on the canvas, but the plot area inherits tabular

@@ -1,23 +1,35 @@
-import { defineConfig, devices } from '@playwright/test';
+import { defineConfig } from '@playwright/test';
 
-// A minimal harness for self-evaluating layout and visual quality (and for the
-// in-browser regression check the R2 note flagged: confirm the real wasm core
-// boots and gossips in a browser). It serves the production build via
-// `vite preview`, so run `pnpm run build` first.
+// Two suites against the production build, served by `vite preview` (run
+// `pnpm run build` first). `screenshot.spec.ts` is the functional smoke, run
+// once at 1440 px in the light theme, and also confirms the real wasm core
+// boots and gossips in a browser. `audit.spec.ts` is the automated design audit
+// (README "Design rules"), run at five widths in each theme with motion reduced.
+const audits = [1440, 1280, 1100, 768, 400].flatMap((width) =>
+  (['light', 'dark'] as const).map((colorScheme) => ({
+    name: `audit-${width}-${colorScheme}`,
+    testMatch: /audit\.spec\.ts$/,
+    use: { viewport: { width, height: 900 }, colorScheme, reducedMotion: 'reduce' as const },
+  })),
+);
+
 export default defineConfig({
   testDir: './tests',
   outputDir: './test-results',
   fullyParallel: false,
-  use: {
-    baseURL: 'http://localhost:4173',
-    viewport: { width: 1440, height: 900 },
-    deviceScaleFactor: 2,
-  },
+  use: { baseURL: 'http://localhost:4173' },
   webServer: {
     command: 'pnpm run preview -- --port 4173 --strictPort',
     url: 'http://localhost:4173',
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  projects: [
+    {
+      name: 'chromium',
+      testMatch: /screenshot\.spec\.ts$/,
+      use: { viewport: { width: 1440, height: 900 } },
+    },
+    ...audits,
+  ],
 });

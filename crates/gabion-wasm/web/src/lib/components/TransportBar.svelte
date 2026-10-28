@@ -56,27 +56,28 @@
 <style>
   .transport {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: var(--space-3);
-    padding: var(--space-2) var(--space-3);
-    background: var(--chrome-panel);
-    border-top: 1px solid var(--chrome-border);
+    gap: var(--gap-md);
+    padding: var(--gap-sm) var(--gap-md);
+    background: var(--color-panel);
+    border-top: 1px solid var(--color-border-line);
   }
 
   button {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-1);
-    padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--chrome-border);
+    gap: var(--gap-xs);
+    padding: var(--gap-sm) var(--gap-md);
+    border: 1px solid var(--color-border-line);
     border-radius: var(--radius);
-    background: var(--chrome-panel);
-    font-size: var(--text-sm);
+    background: var(--color-panel);
+    font-size: var(--font-size-caption);
     transition: background 120ms ease;
   }
 
   button:hover:not(:disabled) {
-    background: var(--chrome-bg);
+    background: var(--color-bg);
   }
 
   button:disabled {
@@ -85,23 +86,23 @@
   }
 
   .primary {
-    background: var(--ink);
-    color: var(--chrome-panel);
-    border-color: var(--ink);
+    background: var(--color-fg);
+    color: var(--color-panel);
+    border-color: var(--color-fg);
     min-width: 6.5rem;
     justify-content: center;
   }
 
   .primary:hover:not(:disabled) {
-    background: var(--ink-hover);
+    background: var(--color-fg-muted);
   }
 
   .speed {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-sm);
-    color: var(--ink-soft);
+    gap: var(--gap-sm);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   .speed-value {
@@ -111,7 +112,7 @@
   .readout {
     margin-left: auto;
     display: flex;
-    gap: var(--space-4);
+    gap: var(--gap-lg);
   }
 
   .readout-item {
@@ -122,14 +123,14 @@
   }
 
   .readout-label {
-    font-size: var(--text-xs);
+    font-size: var(--font-size-caption-sm);
     text-transform: uppercase;
     letter-spacing: 0.06em;
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   .readout-value {
-    font-size: var(--text-lg);
-    color: var(--ink);
+    font-size: var(--font-size-heading);
+    color: var(--color-fg);
   }
 </style>

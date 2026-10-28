@@ -36,7 +36,7 @@
     margin: 0;
     padding: 0;
     border: none;
-    border-bottom: 1px dotted var(--ink-faint);
+    border-bottom: 1px dotted var(--color-fg-muted);
     background: none;
     font: inherit;
     color: inherit;
@@ -47,20 +47,21 @@
   .bubble {
     position: absolute;
     left: 0;
-    top: calc(100% + var(--space-1));
+    top: calc(100% + var(--gap-xs));
     z-index: 10;
     width: max-content;
     max-width: 15rem;
-    padding: var(--space-2);
+    padding: var(--gap-sm);
     border-radius: var(--radius);
-    background: var(--ink);
-    color: var(--on-disc);
-    font-size: var(--text-xs);
+    background: var(--surface-popover);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border-line);
+    font-size: var(--font-size-caption-sm);
     font-weight: 400;
     line-height: 1.4;
     letter-spacing: 0;
     text-transform: none;
-    box-shadow: 0 2px 8px rgb(27 35 48 / 18%);
+    box-shadow: var(--shadow-popover);
     /* Hidden but kept in the DOM so `aria-describedby` can still reach it. */
     opacity: 0;
     visibility: hidden;

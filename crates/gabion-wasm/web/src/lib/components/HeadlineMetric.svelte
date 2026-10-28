@@ -54,16 +54,16 @@
     grid-template-columns: auto 1fr;
     grid-template-areas: 'label badge' 'value badge';
     align-items: baseline;
-    column-gap: var(--space-2);
+    column-gap: var(--gap-sm);
   }
 
   .headline-label {
     grid-area: label;
-    font-size: var(--text-xs);
+    font-size: var(--font-size-caption-sm);
     font-weight: 650;
     letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .headline-value {
@@ -71,29 +71,29 @@
     font-size: 2.75rem;
     font-weight: 350;
     line-height: 1;
-    color: var(--signal-dirty);
+    color: var(--color-warn);
     transition: color 0.4s ease;
   }
 
   .headline.converged .headline-value {
-    color: var(--signal-converged);
+    color: var(--color-ok);
   }
 
   .badge {
     grid-area: badge;
     align-self: center;
     justify-self: end;
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
     font-weight: 600;
-    color: var(--signal-converged);
-    background: color-mix(in srgb, var(--signal-converged) 12%, transparent);
-    padding: var(--space-1) var(--space-2);
+    color: var(--color-ok);
+    background: color-mix(in srgb, var(--color-ok) 12%, transparent);
+    padding: var(--gap-xs) var(--gap-sm);
     border-radius: var(--radius);
   }
 
   .badge.muted {
-    color: var(--ink-soft);
-    background: var(--chrome-bg);
+    color: var(--color-fg-muted);
+    background: var(--color-bg);
     font-weight: 500;
   }
 </style>

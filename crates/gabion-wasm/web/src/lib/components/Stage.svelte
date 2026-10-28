@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import type { ClusterState, SimEvent } from '../sim/types';
   import { StageRenderer } from '../stage/renderer';
+  import type { Theme } from '../theme';
   import {
     DOT_THRESHOLD,
     fitTransform,
@@ -35,6 +36,7 @@
     onSelect,
     onDeselect,
     onDeleteNode,
+    theme,
   }: {
     cluster: ClusterState | null;
     events: SimEvent[];
@@ -42,6 +44,7 @@
     onSelect?: (node: number) => void;
     onDeselect?: () => void;
     onDeleteNode?: (id: number) => void;
+    theme: Theme;
   } = $props();
 
   let container: HTMLDivElement;
@@ -79,6 +82,10 @@
     if (ready && renderer !== null) renderer.setSelected(selectedId);
   });
 
+  $effect(() => {
+    if (ready && renderer !== null) renderer.setTheme(theme);
+  });
+
   /** Resolve a pointer event to the node under it (or null), in the container's
    *  own pixel space. The label overlay is `pointer-events: none`, so a pointer
    *  over a disc reaches this handler whether it is over the canvas or a label. */
@@ -106,7 +113,7 @@
     let observer: ResizeObserver | null = null;
 
     void (async () => {
-      const r = await StageRenderer.create(container);
+      const r = await StageRenderer.create(container, theme);
       if (disposed) {
         r.destroy();
         return;
@@ -180,7 +187,6 @@
     width: 100%;
     height: 100%;
     overflow: hidden;
-    background: var(--stage-bg);
   }
 
   /* The ring reads as interactive only over a disc — the cursor is the
@@ -223,8 +229,8 @@
   /* The per-node "×": a pointer-only affordance that removes this node live.
      `pointer-events: auto` lifts it out of the pass-through overlay so it can
      be clicked, while the rest of the label stays click-through for the burst
-     hit-test. A small white chip with a hairline border so it reads on the
-     light stage; subtle until hovered, so twelve of them don't clutter it. */
+     hit-test. A panel-coloured chip with a hairline border; subtle until
+     hovered, so twelve of them don't clutter it. */
   .node-delete {
     pointer-events: auto;
     position: absolute;
@@ -236,10 +242,10 @@
     width: 1.15em;
     height: 1.15em;
     padding: 0;
-    border: 1px solid var(--chrome-border);
+    border: 1px solid var(--color-border-line);
     border-radius: 50%;
-    background: var(--chrome-panel);
-    color: var(--ink-faint);
+    background: var(--color-panel);
+    color: var(--color-fg-muted);
     font-size: 0.8em;
     line-height: 1;
     cursor: pointer;
@@ -253,19 +259,20 @@
   .node-delete:hover,
   .node-delete:focus-visible {
     opacity: 1;
-    color: var(--signal-reject);
-    border-color: var(--signal-reject);
+    color: var(--color-bad);
+    border-color: var(--color-bad);
   }
 
   .node-id {
-    color: var(--on-disc-soft);
+    color: var(--color-bg);
     font-size: 0.7em;
     margin-bottom: 0.15em;
   }
 
-  /* Light text reads against the dark slate disc the node is drawn with. */
+  /* Labels take the background colour on the `--color-fg` disc: the body-text
+     pair inverted. */
   .node-count {
-    color: var(--on-disc);
+    color: var(--color-bg);
     font-weight: 650;
   }
 </style>

@@ -131,13 +131,13 @@
   .storage {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   .gauges {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   /* Label · bar · numerals on one baseline; the bar takes the slack so all three
@@ -146,18 +146,18 @@
     display: grid;
     grid-template-columns: 5.5rem 1fr auto;
     align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-sm);
+    gap: var(--gap-sm);
+    font-size: var(--font-size-caption);
   }
 
   .gauge-label {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .track {
     height: 8px;
     border-radius: 4px;
-    background: var(--chrome-bg);
+    background: var(--color-bg);
     overflow: hidden;
   }
 
@@ -168,15 +168,15 @@
   }
 
   .fill.ok {
-    background: var(--node-fill);
+    background: var(--chart-muted);
   }
 
   .fill.warn {
-    background: var(--signal-dirty);
+    background: var(--color-warn);
   }
 
   .fill.full {
-    background: var(--signal-reject);
+    background: var(--color-bad);
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -186,20 +186,20 @@
   }
 
   .gauge-value {
-    color: var(--ink);
+    color: var(--color-fg);
     font-variant-numeric: tabular-nums lining-nums;
   }
 
   .gauge-value .sep {
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   /* Calm zero state — capacity is a non-event until it isn't. Mirrors the
      headline's converged badge. */
   .holding {
     margin: 0;
-    font-size: var(--text-sm);
-    color: var(--signal-converged);
+    font-size: var(--font-size-caption);
+    color: var(--color-ok);
   }
 
   .ok-glyph {
@@ -214,16 +214,16 @@
     list-style: none;
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
-    font-size: var(--text-sm);
-    color: var(--signal-reject);
+    gap: var(--gap-xs);
+    font-size: var(--font-size-caption);
+    color: var(--color-bad);
   }
 
   .warn-glyph {
-    margin-right: var(--space-1);
+    margin-right: var(--gap-xs);
   }
 
   .drops-why {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 </style>

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Sim } from './lib/sim/sim';
+  import { readTheme, watchTheme } from './lib/theme';
   import type { ClusterState, EventBatch, SimConfig, SimEvent } from './lib/sim/types';
   import { ChartHistory } from './lib/charts/history';
   import {
@@ -81,6 +82,13 @@
   let virtualMs = $state(0);
   let error: string | null = $state(null);
   let loading = $state(true);
+  // The canvas colours, re-read on an OS scheme or data-theme change; the stage
+  // and charts re-tint from it. `raw`: replaced whole, never deep-proxied.
+  let theme = $state.raw(readTheme());
+  // Below 640 px the rail folds into a "Controls" disclosure above the stage; at
+  // and above it the rail is always open (its summary is hidden).
+  const wide = window.matchMedia('(width >= 640px)');
+  let controlsOpen = $state(wide.matches);
 
   // The live stable ids, in rank order — what the rail's remove/send controls
   // pick from and the count the Cluster controls gate on. Ids have gaps under
@@ -389,7 +397,16 @@
 
   onMount(() => {
     void bootstrap();
-    return () => pause();
+    const unwatch = watchTheme(() => (theme = readTheme()));
+    const onWide = (event: MediaQueryListEvent): void => {
+      controlsOpen = event.matches;
+    };
+    wide.addEventListener('change', onWide);
+    return () => {
+      pause();
+      unwatch();
+      wide.removeEventListener('change', onWide);
+    };
   });
 </script>
 
@@ -415,24 +432,27 @@
       <div class="overlay" aria-live="polite">Loading the gossip engine…</div>
     {:else}
       <div class="workspace">
-        <ControlRail
-          presets={PRESETS}
-          activeId={activePreset.id}
-          {nodeIds}
-          canAdd={nodeIds.length < MAX_LIVE_NODES}
-          bind:burstHits
-          {knobs}
-          {appliedKnobs}
-          bucketMs={defaults.rule_bucket_ms}
-          {tuneOpen}
-          onToggleTune={(open) => (tuneOpen = open)}
-          onSelectPreset={selectPreset}
-          onApplyKnobs={() => void bootstrap()}
-          onSend={(node) => void sendBurst(node)}
-          onHeal={() => void heal()}
-          onAddNode={() => void addNode()}
-          onRemoveNode={(id) => void removeNode(id)}
-        />
+        <details class="controls" bind:open={controlsOpen}>
+          <summary>Controls</summary>
+          <ControlRail
+            presets={PRESETS}
+            activeId={activePreset.id}
+            {nodeIds}
+            canAdd={nodeIds.length < MAX_LIVE_NODES}
+            bind:burstHits
+            {knobs}
+            {appliedKnobs}
+            bucketMs={defaults.rule_bucket_ms}
+            {tuneOpen}
+            onToggleTune={(open) => (tuneOpen = open)}
+            onSelectPreset={selectPreset}
+            onApplyKnobs={() => void bootstrap()}
+            onSend={(node) => void sendBurst(node)}
+            onHeal={() => void heal()}
+            onAddNode={() => void addNode()}
+            onRemoveNode={(id) => void removeNode(id)}
+          />
+        </details>
         <div class="stage-pane">
           <Stage
             {cluster}
@@ -441,6 +461,7 @@
             onSelect={(node) => (selectedId = node)}
             onDeselect={() => (selectedId = null)}
             onDeleteNode={(id) => void removeNode(id)}
+            {theme}
           />
         </div>
         <div class="detail-rail">
@@ -474,6 +495,7 @@
                 version={chartVersion}
                 limit={appliedKnobs.rule_limit}
                 showLimit={activePreset.showsLimitChart === true}
+                {theme}
               />
             {/if}
           </div>
@@ -503,48 +525,72 @@
   }
 
   header {
-    padding: var(--space-3) var(--space-4);
-    background: var(--chrome-bg);
-    border-bottom: 1px solid var(--chrome-border);
+    padding: var(--gap-md) var(--gap-lg);
+    border-bottom: 1px solid var(--color-border-line);
   }
 
   h1 {
     margin: 0;
-    font-size: var(--text-xl);
+    font-size: var(--font-size-title);
     font-weight: 650;
     letter-spacing: -0.01em;
   }
 
   .subtitle {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
     font-weight: 400;
   }
 
   .lede {
-    margin: var(--space-1) 0 0;
+    margin: var(--gap-xs) 0 0;
     max-width: 66ch;
-    font-size: var(--text-sm);
-    color: var(--ink-soft);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   main {
     position: relative;
     min-height: 0;
-    background: var(--stage-bg);
   }
 
   /* The three-pane chassis: quiet controls rail, the dominant stage (the single
      focal point — kept ≥ 55% so the rails never out-weigh it), and the charts
      dashboard rail. The rail widths sum to ~44% at typical desktop widths and
-     cap on wide screens, so the stage only grows. Stacks vertically when narrow. */
+     cap on wide screens, so the stage only grows. Three layouts: three columns
+     from 1100 px; two from 640 px (stage over the detail rail on the left,
+     controls on the right); one scrolling column below. */
   .workspace {
     display: grid;
     grid-template-columns: clamp(200px, 16%, 260px) minmax(0, 1fr) clamp(300px, 28%, 380px);
+    grid-template-areas: 'rail stage detail';
     height: 100%;
     min-height: 0;
   }
 
+  /* A flex column so the open rail fills the row: a percentage height does not
+     resolve through the disclosure's content box, a flex item's size does. */
+  .controls {
+    grid-area: rail;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .controls::details-content {
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* Phone: the disclosure's bar above the stage. */
+  .controls > summary {
+    padding: var(--gap-sm) var(--gap-md);
+    background: var(--color-panel);
+    border-bottom: 1px solid var(--color-border-line);
+    font-weight: 650;
+  }
+
   .stage-pane {
+    grid-area: stage;
     position: relative;
     min-width: 0;
     min-height: 0;
@@ -554,16 +600,16 @@
      charts dashboard by default, the node inspector when a node is selected.
      Owns the panel chrome (the Dashboard/Inspector inside are borderless). */
   .detail-rail {
+    grid-area: detail;
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--gap-md);
     min-width: 0;
     min-height: 0;
     height: 100%;
-    padding: var(--space-3);
-    background: var(--chrome-panel);
-    border-left: 1px solid var(--chrome-border);
-    overflow: hidden;
+    padding: var(--gap-md);
+    background: var(--color-panel);
+    border-left: 1px solid var(--color-border-line);
   }
 
   .rail-body {
@@ -571,10 +617,62 @@
     min-height: 0;
   }
 
-  @media (max-width: 880px) {
+  @media (width >= 640px) {
+    .controls > summary {
+      display: none;
+    }
+
+    .detail-rail {
+      overflow: hidden;
+    }
+  }
+
+  /* The charts and the inspector share one slot, so the detail rail sits under
+     the stage on the left and the controls take the right column. The rail is
+     too short to fit the charts at a legible height, so it scrolls instead. */
+  @media (640px <= width < 1100px) {
     .workspace {
-      grid-template-columns: 1fr;
-      grid-template-rows: auto minmax(0, 1.2fr) minmax(0, 1fr);
+      grid-template-columns: minmax(0, 1fr) clamp(220px, 32%, 280px);
+      grid-template-areas:
+        'stage rail'
+        'detail rail';
+      grid-template-rows: minmax(0, 2fr) minmax(0, 3fr);
+    }
+
+    .detail-rail {
+      overflow: auto;
+    }
+  }
+
+  /* Below 1100 px the rail body gets a definite height, because the dashboard
+     sizes its charts from `height: 100%` rows, which collapse under an
+     auto-height parent. */
+  @media (width < 1100px) {
+    .rail-body {
+      flex: none;
+      height: 32rem;
+    }
+  }
+
+  /* One scrolling column. `main` keeps a height so the absolutely positioned
+     loading and error overlay stays visible; the square stage keeps the ring
+     the same shape at every width. */
+  @media (width < 640px) {
+    main {
+      min-height: 50vh;
+    }
+
+    .workspace {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas:
+        'rail'
+        'stage'
+        'detail';
+      height: auto;
+    }
+
+    .stage-pane {
+      aspect-ratio: 1;
     }
   }
 
@@ -585,18 +683,18 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: var(--space-2);
-    color: var(--ink-soft);
-    font-size: var(--text-sm);
+    gap: var(--gap-sm);
+    color: var(--color-fg-muted);
+    font-size: var(--font-size-caption);
   }
 
   .overlay.error {
-    color: var(--signal-reject);
-    padding: var(--space-4);
+    color: var(--color-bad);
+    padding: var(--gap-lg);
     text-align: center;
   }
 
   .overlay.error strong {
-    color: var(--ink);
+    color: var(--color-fg);
   }
 </style>

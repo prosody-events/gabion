@@ -3,6 +3,7 @@
   import type { ChartHistory } from '../charts/history';
   import Chart from '../charts/Chart.svelte';
   import { aggregateLimitOptions, disagreementOptions, fanOptions } from '../charts/options';
+  import type { Theme } from '../theme';
 
   // The abstract rung: the convergence story as charts. Fed the rolling
   // `history` and a `version` counter that ticks on every new sample — the
@@ -15,11 +16,13 @@
     version,
     limit,
     showLimit,
+    theme,
   }: {
     history: ChartHistory;
     version: number;
     limit: number;
     showLimit: boolean;
+    theme: Theme;
   } = $props();
 
   // The fan has one line per retained column — live nodes plus any departed one
@@ -34,10 +37,10 @@
   });
 
   // Option shapes rebuild only when their structural input changes (the fan's
-  // series count, the limit line's height) — not per sample.
-  const fanOpts = $derived(fanOptions(fanSeriesCount));
-  const disagreementOpts = disagreementOptions();
-  const aggregateOpts = $derived(showLimit ? aggregateLimitOptions(limit) : null);
+  // series count, the limit line's height, the theme) — not per sample.
+  const fanOpts = $derived(fanOptions(fanSeriesCount, theme));
+  const disagreementOpts = $derived(disagreementOptions(theme));
+  const aggregateOpts = $derived(showLimit ? aggregateLimitOptions(limit, theme) : null);
 
   // Column-major data, re-wrapped each sample. The inner arrays are the same
   // references `ChartHistory` mutates; `version` is what makes the charts read.
@@ -75,7 +78,7 @@
   .dashboard {
     display: grid;
     grid-template-rows: 2fr 1fr;
-    gap: var(--space-3);
+    gap: var(--gap-md);
     height: 100%;
     min-height: 0;
     overflow: hidden;

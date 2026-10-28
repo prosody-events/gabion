@@ -282,7 +282,7 @@
   .inspector {
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--gap-md);
     height: 100%;
     min-height: 0;
     overflow-y: auto;
@@ -292,31 +292,31 @@
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   h2 {
     margin: 0;
-    font-size: var(--text-lg);
+    font-size: var(--font-size-heading);
     font-weight: 650;
     letter-spacing: -0.01em;
   }
 
   .close {
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid var(--chrome-border);
+    padding: var(--gap-xs) var(--gap-sm);
+    border: 1px solid var(--color-border-line);
     border-radius: var(--radius);
-    background: var(--chrome-bg);
-    font-size: var(--text-sm);
-    color: var(--ink-soft);
+    background: var(--color-bg);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
     transition:
       background 120ms ease,
       border-color 120ms ease;
   }
 
   .close:hover {
-    background: var(--chrome-panel);
-    border-color: var(--ink-faint);
+    background: var(--color-panel);
+    border-color: var(--color-fg-muted);
   }
 
   /* §2 — the headline. One step quieter than the cluster hero in HeadlineMetric
@@ -325,7 +325,7 @@
     display: grid;
     grid-template-columns: 1fr auto;
     align-items: end;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   .headline {
@@ -335,104 +335,104 @@
   }
 
   .hl-label {
-    font-size: var(--text-xs);
+    font-size: var(--font-size-caption-sm);
     font-weight: 650;
     letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .hl-value {
     font-size: 2.25rem;
     font-weight: 350;
     line-height: 1;
-    color: var(--ink);
+    color: var(--color-fg);
     transition: color 0.4s ease;
   }
 
   .hl-value.over {
-    color: var(--signal-reject);
+    color: var(--color-bad);
   }
 
   .hl-refs {
-    font-size: var(--text-sm);
-    color: var(--ink-faint);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   .dot-sep {
-    color: var(--chrome-border);
+    color: var(--color-fg-muted);
   }
 
   .badges {
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: var(--space-1);
+    gap: var(--gap-xs);
   }
 
   .badge {
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
     font-weight: 600;
-    padding: var(--space-1) var(--space-2);
+    padding: var(--gap-xs) var(--gap-sm);
     border-radius: var(--radius);
     white-space: nowrap;
   }
 
   .badge.ok {
-    color: var(--signal-converged);
-    background: color-mix(in srgb, var(--signal-converged) 12%, transparent);
+    color: var(--color-ok);
+    background: color-mix(in srgb, var(--color-ok) 12%, transparent);
   }
 
   .badge.dirty {
-    color: var(--signal-dirty);
-    background: color-mix(in srgb, var(--signal-dirty) 14%, transparent);
+    color: var(--color-warn);
+    background: color-mix(in srgb, var(--color-warn) 14%, transparent);
   }
 
   .badge.muted {
-    color: var(--ink-soft);
-    background: var(--chrome-bg);
+    color: var(--color-fg-muted);
+    background: var(--color-bg);
     font-weight: 500;
   }
 
   .badge.inline {
-    margin-left: var(--space-1);
-    padding: 0 var(--space-1);
-    font-size: var(--text-xs);
+    margin-left: var(--gap-xs);
+    padding: 0 var(--gap-xs);
+    font-size: var(--font-size-caption-sm);
   }
 
   /* The over-limit pill reuses the reject vocabulary — word + colour, paired. */
   .pill {
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
     font-weight: 600;
-    color: var(--signal-reject);
-    background: color-mix(in srgb, var(--signal-reject) 12%, transparent);
-    padding: var(--space-1) var(--space-2);
+    color: var(--color-bad);
+    background: color-mix(in srgb, var(--color-bad) 12%, transparent);
+    padding: var(--gap-xs) var(--gap-sm);
     border-radius: var(--radius);
   }
 
   .actions {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   .send {
-    padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--ink);
+    padding: var(--gap-sm) var(--gap-md);
+    border: 1px solid var(--color-fg);
     border-radius: var(--radius);
-    background: var(--ink);
-    color: var(--chrome-panel);
-    font-size: var(--text-sm);
+    background: var(--color-fg);
+    color: var(--color-panel);
+    font-size: var(--font-size-caption);
     transition: background 120ms ease;
   }
 
   .send:hover {
-    background: var(--ink-hover);
+    background: var(--color-fg-muted);
   }
 
   .hint {
-    font-size: var(--text-sm);
-    color: var(--ink-faint);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   /* The shared section idiom: a quiet small-caps heading over a hairline rule.
@@ -440,49 +440,49 @@
   .section {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   .section-head {
     margin: 0;
-    padding-bottom: var(--space-1);
-    border-bottom: 1px solid var(--chrome-border);
-    font-size: var(--text-sm);
+    padding-bottom: var(--gap-xs);
+    border-bottom: 1px solid var(--color-border-line);
+    font-size: var(--font-size-caption);
     font-weight: 650;
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   /* §5 — I/O rows: label · meter/value, aligned. */
   .io {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   .io-row {
     display: grid;
     grid-template-columns: 7rem 1fr auto;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
     min-height: 1.5rem;
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
   }
 
   .io-label {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .meter {
     height: 8px;
     border-radius: 4px;
-    background: var(--chrome-bg);
+    background: var(--color-bg);
     overflow: hidden;
   }
 
   .meter-fill {
     height: 100%;
     border-radius: 4px;
-    background: var(--node-fill);
+    background: var(--chart-muted);
     transition: width 220ms ease;
   }
 
@@ -493,31 +493,31 @@
   }
 
   .io-idle {
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
     font-style: italic;
   }
 
   .io-value {
-    color: var(--ink);
+    color: var(--color-fg);
     text-align: right;
   }
 
   .io-value .sep {
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   .rings {
     grid-column: 2 / -1;
     display: flex;
-    gap: var(--space-3);
+    gap: var(--gap-md);
   }
 
   .ring {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .ring .numeric {
-    color: var(--ink);
+    color: var(--color-fg);
     font-weight: 600;
   }
 
@@ -526,36 +526,36 @@
   }
 
   .rejects.calm {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .rejects.bad {
-    color: var(--signal-reject);
+    color: var(--color-bad);
     font-weight: 600;
   }
 
   .warn-glyph {
-    margin-right: var(--space-1);
+    margin-right: var(--gap-xs);
   }
 
   /* §7 — peer table: low-chrome, capped inner scroll with a sticky header so a
      large membership never pushes §8 off-screen. */
   .peer-summary {
     margin: 0;
-    font-size: var(--text-sm);
-    color: var(--ink-soft);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   .peer-summary .numeric {
-    color: var(--ink);
+    color: var(--color-fg);
     font-weight: 600;
   }
 
   .peer-empty {
     margin: 0;
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
     font-style: italic;
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   .peer-scroll {
@@ -566,81 +566,81 @@
   .peers {
     width: 100%;
     border-collapse: collapse;
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
   }
 
   .peers th {
     position: sticky;
     top: 0;
-    background: var(--chrome-panel);
+    background: var(--color-panel);
     text-align: left;
     font-weight: 600;
-    color: var(--ink-faint);
-    padding: var(--space-1) var(--space-2);
-    border-bottom: 1px solid var(--chrome-border);
+    color: var(--color-fg-muted);
+    padding: var(--gap-xs) var(--gap-sm);
+    border-bottom: 1px solid var(--color-border-line);
   }
 
   .peers td {
-    padding: var(--space-1) var(--space-2);
-    border-bottom: 1px solid var(--chrome-bg);
-    color: var(--ink);
+    padding: var(--gap-xs) var(--gap-sm);
+    border-bottom: 1px solid var(--color-bg);
+    color: var(--color-fg);
   }
 
   .peers td.unresolved {
     font-style: italic;
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   .gossip-id {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .state.known {
-    color: var(--signal-converged);
+    color: var(--color-ok);
   }
 
   .state.pending {
-    color: var(--signal-dirty);
+    color: var(--color-warn);
   }
 
   /* §8 — identity footer: the quietest element, collapsed by default. */
   .identity {
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
   }
 
   .identity summary {
     cursor: pointer;
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
     font-weight: 600;
   }
 
   .id-preview {
-    margin-left: var(--space-1);
+    margin-left: var(--gap-xs);
     font-weight: 400;
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   .id-list {
-    margin: var(--space-2) 0 0;
+    margin: var(--gap-sm) 0 0;
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--gap-xs);
   }
 
   .id-row {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   .id-row dt {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .id-row dd {
     margin: 0;
-    color: var(--ink);
+    color: var(--color-fg);
     word-break: break-all;
     text-align: right;
   }

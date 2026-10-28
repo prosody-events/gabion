@@ -234,59 +234,59 @@
   .strata {
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--gap-md);
   }
 
   .no-traffic {
-    margin: var(--space-2) 0 0;
-    font-size: var(--text-sm);
-    color: var(--ink-faint);
+    margin: var(--gap-sm) 0 0;
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
     font-style: italic;
   }
 
   .strip {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--gap-xs);
   }
 
   .strip-head {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
   }
 
   .head-left {
     display: flex;
     align-items: baseline;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
     min-width: 0;
   }
 
   .key {
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   /* The time-to-expiry countdown for the oldest live bucket: amber (the
      "transient / on the clock" hue, matching the `.expiring` bar it points at),
      tabular figures so the ticking number doesn't jitter its width. */
   .tte {
-    color: var(--signal-dirty);
+    color: var(--color-warn);
     font-variant-numeric: tabular-nums;
   }
 
   .sigma {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .sigma-value {
     font-weight: 650;
-    color: var(--ink);
+    color: var(--color-fg);
   }
 
   .sigma-sep {
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   /* Over the cap: the Σ readout turns red — the honest "this window is rejecting"
@@ -294,7 +294,7 @@
      range, but the readout always tells the truth). Paired with the word "Σ" and
      position, never color alone. */
   .sigma.over .sigma-value {
-    color: var(--signal-reject);
+    color: var(--color-bad);
   }
 
   /* The scroll window: a fixed-height viewport that clips the track's emerging
@@ -304,7 +304,7 @@
     position: relative;
     height: 96px;
     overflow: hidden;
-    border-bottom: 1.5px solid var(--chrome-border);
+    border-bottom: 1.5px solid var(--color-border-line);
   }
 
   /* The conveyor belt: a row of fixed-width columns, one wider than the viewport,
@@ -329,13 +329,13 @@
     justify-content: center;
   }
 
-  /* Slate data-ink bars (the disc colour) — clears 3:1 on the white panel as a
-     graphical mark. Height encodes count; the auto-scale keeps them legible at
+  /* Muted data-ink bars (`--chart-muted`) — 3:1 or more on the panel in both
+     themes, as a graphical mark. Height encodes count; the auto-scale keeps them legible at
      any limit. */
   .bar {
     width: 70%;
     min-height: 0;
-    background: var(--node-fill);
+    background: var(--chart-muted);
     border-radius: 3px 3px 0 0;
   }
 
@@ -358,7 +358,7 @@
      of equal-height bars has a clear anchor for "this is what ages out in
      N.Ns". */
   .bar.expiring {
-    background: var(--signal-dirty);
+    background: var(--color-warn);
   }
 
   /* The shared time axis: quiet end-labels orienting the scroll. "now" on the
@@ -367,10 +367,10 @@
   .axis {
     display: flex;
     justify-content: space-between;
-    margin-top: calc(-1 * var(--space-2));
-    font-size: var(--text-xs);
+    margin-top: calc(-1 * var(--gap-sm));
+    font-size: var(--font-size-caption-sm);
     letter-spacing: 0.04em;
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   /* The rule limit as a dashed threshold across the viewport — fixed (it does not
@@ -379,7 +379,7 @@
     position: absolute;
     left: 0;
     right: 0;
-    border-top: 1.5px dashed var(--signal-reject);
+    border-top: 1.5px dashed var(--color-bad);
     pointer-events: none;
     z-index: 1;
   }

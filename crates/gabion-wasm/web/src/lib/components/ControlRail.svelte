@@ -246,47 +246,48 @@
   .rail {
     display: flex;
     flex-direction: column;
-    gap: var(--space-3);
+    gap: var(--gap-md);
+    height: 100%;
     min-height: 0;
     overflow-y: auto;
-    padding: var(--space-3);
-    background: var(--chrome-panel);
-    border-right: 1px solid var(--chrome-border);
+    padding: var(--gap-md);
+    background: var(--color-panel);
+    border-right: 1px solid var(--color-border-line);
   }
 
   .group {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   h2 {
     margin: 0;
-    font-size: var(--text-xs);
+    font-size: var(--font-size-caption-sm);
     font-weight: 650;
     letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .hint {
-    margin: 0 0 var(--space-1);
-    font-size: var(--text-sm);
-    color: var(--ink-faint);
+    margin: 0 0 var(--gap-xs);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   .presets {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--gap-xs);
   }
 
   .preset {
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid var(--chrome-border);
+    padding: var(--gap-xs) var(--gap-sm);
+    border: 1px solid var(--color-border-line);
     border-radius: var(--radius);
-    background: var(--chrome-bg);
-    font-size: var(--text-sm);
+    background: var(--color-bg);
+    font-size: var(--font-size-caption);
     text-align: left;
     transition:
       background 120ms ease,
@@ -294,44 +295,44 @@
   }
 
   .preset:hover {
-    background: var(--chrome-panel);
-    border-color: var(--ink-faint);
+    background: var(--color-panel);
+    border-color: var(--color-fg-muted);
   }
 
   /* Active scenario marked by fill + weight, not color alone. */
   .preset.active {
-    background: var(--ink);
-    border-color: var(--ink);
-    color: var(--chrome-panel);
+    background: var(--color-fg);
+    border-color: var(--color-fg);
+    color: var(--color-panel);
     font-weight: 600;
   }
 
   .blurb {
-    margin: var(--space-1) 0 0;
-    font-size: var(--text-sm);
+    margin: var(--gap-xs) 0 0;
+    font-size: var(--font-size-caption);
     line-height: 1.45;
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .field {
     display: grid;
     grid-template-columns: 3.5rem 1fr;
     align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-sm);
-    color: var(--ink-soft);
+    gap: var(--gap-sm);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   input.numeric,
   select.numeric {
     width: 100%;
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid var(--chrome-border);
+    padding: var(--gap-xs) var(--gap-sm);
+    border: 1px solid var(--color-border-line);
     border-radius: var(--radius);
-    background: var(--chrome-bg);
+    background: var(--color-bg);
     font-family: inherit;
-    font-size: var(--text-sm);
-    color: var(--ink);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg);
   }
 
   select.numeric:disabled {
@@ -346,29 +347,29 @@
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    padding: var(--space-1) var(--space-2);
-    border: 1px solid var(--chrome-border);
+    padding: var(--gap-xs) var(--gap-sm);
+    border: 1px solid var(--color-border-line);
     border-radius: var(--radius);
-    background: var(--chrome-bg);
+    background: var(--color-bg);
   }
 
   .members-label {
-    font-size: var(--text-sm);
-    color: var(--ink-soft);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   .members-value {
-    font-size: var(--text-lg);
+    font-size: var(--font-size-heading);
     font-weight: 600;
     line-height: 1;
-    color: var(--ink);
+    color: var(--color-fg);
   }
 
   /* Add and Remove on one 8-pt row, equal halves — the inverse-pair reading. */
   .cluster-actions {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   .cluster-btn {
@@ -376,19 +377,19 @@
     align-items: center;
     justify-content: center;
     gap: 0.4em;
-    padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--chrome-border);
+    padding: var(--gap-sm) var(--gap-md);
+    border: 1px solid var(--color-border-line);
     border-radius: var(--radius);
-    background: var(--chrome-bg);
-    font-size: var(--text-sm);
+    background: var(--color-bg);
+    font-size: var(--font-size-caption);
     transition:
       background 120ms ease,
       border-color 120ms ease;
   }
 
   .cluster-btn:hover:not(:disabled) {
-    background: var(--chrome-panel);
-    border-color: var(--ink-faint);
+    background: var(--color-panel);
+    border-color: var(--color-fg-muted);
   }
 
   .cluster-btn:disabled {
@@ -401,70 +402,70 @@
   .cluster-btn .sign {
     font-size: 1.15em;
     line-height: 1;
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   /* Rebuild knobs — collapsed by default so the rail stays compact (Hick's law:
      fewer simultaneous choices), and so the network/burst controls stay near the
      top. */
   .tune {
-    border-top: 1px solid var(--chrome-border);
-    padding-top: var(--space-2);
+    border-top: 1px solid var(--color-border-line);
+    padding-top: var(--gap-sm);
   }
 
   .tune summary {
     cursor: pointer;
-    font-size: var(--text-xs);
+    font-size: var(--font-size-caption-sm);
     font-weight: 650;
     letter-spacing: 0.04em;
     text-transform: uppercase;
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .tune .hint {
-    margin: var(--space-2) 0 0;
+    margin: var(--gap-sm) 0 0;
   }
 
   .knob {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
-    margin-top: var(--space-2);
+    gap: var(--gap-xs);
+    margin-top: var(--gap-sm);
   }
 
   .knob label {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    font-size: var(--text-sm);
-    color: var(--ink-soft);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   .knob .val {
-    color: var(--ink);
+    color: var(--color-fg);
   }
 
   /* A staged (changed-but-not-applied) knob: its readout turns dirty-hued and a
      marker rides the label, so the pending state reads in text + colour + a
      glyph, never colour alone. */
   .knob.changed .val {
-    color: var(--signal-dirty);
+    color: var(--color-warn);
     font-weight: 600;
   }
 
   .knob.changed label::before {
     content: '•';
     margin-right: 0.3em;
-    color: var(--signal-dirty);
+    color: var(--color-warn);
   }
 
   .knob.changed input[type='number'] {
-    border-color: var(--signal-dirty);
+    border-color: var(--color-warn);
   }
 
   input[type='range'] {
     width: 100%;
-    accent-color: var(--ink);
+    accent-color: var(--color-fg);
     cursor: pointer;
   }
 
@@ -473,8 +474,8 @@
   .tune-apply {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
-    margin-top: var(--space-3);
+    gap: var(--gap-sm);
+    margin-top: var(--gap-md);
   }
 
   .tune-status {
@@ -482,31 +483,31 @@
     align-items: center;
     gap: 0.4em;
     margin: 0;
-    font-size: var(--text-sm);
-    color: var(--ink-faint);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg-muted);
   }
 
   .staged-dot {
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: var(--signal-dirty);
+    background: var(--color-warn);
     flex: none;
   }
 
   .rebuild {
     align-self: flex-start;
-    padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--ink);
+    padding: var(--gap-sm) var(--gap-md);
+    border: 1px solid var(--color-fg);
     border-radius: var(--radius);
-    background: var(--ink);
-    color: var(--chrome-panel);
-    font-size: var(--text-sm);
+    background: var(--color-fg);
+    color: var(--color-panel);
+    font-size: var(--font-size-caption);
     transition: background 120ms ease;
   }
 
   .rebuild:hover:not(:disabled) {
-    background: var(--ink-hover);
+    background: var(--color-fg-muted);
   }
 
   .rebuild:disabled {
@@ -515,18 +516,18 @@
   }
 
   .send {
-    margin-top: var(--space-1);
-    padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--ink);
+    margin-top: var(--gap-xs);
+    padding: var(--gap-sm) var(--gap-md);
+    border: 1px solid var(--color-fg);
     border-radius: var(--radius);
-    background: var(--ink);
-    color: var(--chrome-panel);
-    font-size: var(--text-sm);
+    background: var(--color-fg);
+    color: var(--color-panel);
+    font-size: var(--font-size-caption);
     transition: background 120ms ease;
   }
 
   .send:hover:not(:disabled) {
-    background: var(--ink-hover);
+    background: var(--color-fg-muted);
   }
 
   .send:disabled {
@@ -536,17 +537,17 @@
 
   .secondary {
     align-self: flex-start;
-    padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--chrome-border);
+    padding: var(--gap-sm) var(--gap-md);
+    border: 1px solid var(--color-border-line);
     border-radius: var(--radius);
-    background: var(--chrome-bg);
-    font-size: var(--text-sm);
+    background: var(--color-bg);
+    font-size: var(--font-size-caption);
     transition: background 120ms ease;
   }
 
   .secondary:hover:not(:disabled) {
-    background: var(--chrome-panel);
-    border-color: var(--ink-faint);
+    background: var(--color-panel);
+    border-color: var(--color-fg-muted);
   }
 
   .secondary:disabled {

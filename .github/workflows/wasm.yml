@@ -120,6 +120,18 @@ jobs:
       - name: in-browser screenshot smoke
         working-directory: crates/gabion-wasm/web
         run: pnpm run screenshot
+      - name: design audit
+        working-directory: crates/gabion-wasm/web
+        run: pnpm run audit
+      # The full-page audit PNGs, for the visual review the README's
+      # "Design rules" asks of every UI change.
+      - name: upload audit screenshots
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: audit-shots
+          path: crates/gabion-wasm/web/audit-shots
+          if-no-files-found: warn
 
       # Rebuild with VITE_BASE=/gabion/ so the deployed `index.html` and
       # the wasm bundle's asset URLs resolve under the project-pages

@@ -233,14 +233,14 @@
   .cadence {
     display: flex;
     flex-direction: column;
-    gap: var(--space-2);
+    gap: var(--gap-sm);
   }
 
   .status {
     display: flex;
     align-items: baseline;
-    gap: var(--space-2);
-    font-size: var(--text-sm);
+    gap: var(--gap-sm);
+    font-size: var(--font-size-caption);
   }
 
   .dot {
@@ -248,13 +248,13 @@
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: var(--ink-faint);
+    background: var(--color-fg-muted);
     flex: none;
   }
 
   /* Alive-and-gossiping pulse; gated so reduced motion shows a steady dot. */
   .dot.live {
-    background: var(--signal-dirty);
+    background: var(--color-warn);
   }
 
   @media (prefers-reduced-motion: no-preference) {
@@ -275,12 +275,12 @@
 
   .status-word {
     font-weight: 600;
-    color: var(--ink);
+    color: var(--color-fg);
   }
 
   .ticks {
     margin-left: auto;
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
   }
 
   /* The liveness trace: a quiet dirty-hued line proving the heartbeat fires. */
@@ -292,7 +292,7 @@
 
   .spark polyline {
     fill: none;
-    stroke: var(--signal-dirty);
+    stroke: var(--color-warn);
     stroke-width: 1.5;
     stroke-linejoin: round;
     stroke-linecap: round;
@@ -300,7 +300,7 @@
   }
 
   .spark line {
-    stroke: var(--chrome-border);
+    stroke: var(--color-border-line);
     stroke-width: 1.5;
     vector-effect: non-scaling-stroke;
   }
@@ -309,27 +309,27 @@
   .fanout {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--gap-xs);
   }
 
   .fanout-head {
     display: flex;
     align-items: baseline;
     justify-content: space-between;
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
   }
 
   .fanout-now {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .fanout-now.above-floor {
-    color: var(--signal-converged);
+    color: var(--color-ok);
     font-weight: 600;
   }
 
   .fanout-now .unit {
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
     font-weight: 400;
   }
 
@@ -339,18 +339,18 @@
     height: 8px;
     border-radius: 4px;
     overflow: hidden;
-    background: var(--chrome-bg);
+    background: var(--color-bg);
   }
 
   .fanout-foot {
     display: flex;
-    gap: var(--space-3);
-    font-size: var(--text-xs);
-    color: var(--ink-faint);
+    gap: var(--gap-md);
+    font-size: var(--font-size-caption-sm);
+    color: var(--color-fg-muted);
   }
 
   .coverage-note.on {
-    color: var(--signal-converged);
+    color: var(--color-ok);
   }
 
   /* The peak high-water mark: a 2px tick standing above the fill. */
@@ -359,7 +359,7 @@
     top: -2px;
     bottom: -2px;
     width: 2px;
-    background: var(--ink-soft);
+    background: var(--color-fg-muted);
     transform: translateX(-1px);
   }
 
@@ -367,12 +367,12 @@
     display: grid;
     grid-template-columns: 9rem 1fr;
     align-items: center;
-    gap: var(--space-2);
-    font-size: var(--text-sm);
+    gap: var(--gap-sm);
+    font-size: var(--font-size-caption);
   }
 
   .bar-label {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 
   .bar {
@@ -380,7 +380,7 @@
     height: 8px;
     border-radius: 4px;
     overflow: hidden;
-    background: var(--chrome-bg);
+    background: var(--color-bg);
   }
 
   .seg {
@@ -397,17 +397,17 @@
   .seg.heartbeat,
   .seg.worked,
   .seg.fan-base {
-    background: var(--node-fill);
+    background: var(--chart-muted);
   }
 
   .seg.threshold {
-    background: var(--signal-dirty);
+    background: var(--color-warn);
   }
 
   /* Coverage margin reads as "reach", not burst — a converged-green tone,
      distinct from the amber threshold/eager-flush share below. */
   .seg.fan-coverage {
-    background: var(--signal-converged);
+    background: var(--color-ok);
   }
 
   .seg.idle {
@@ -419,17 +419,17 @@
     display: flex;
     align-items: center;
     height: 8px;
-    color: var(--ink-faint);
+    color: var(--color-fg-muted);
     font-style: italic;
-    font-size: var(--text-sm);
+    font-size: var(--font-size-caption);
   }
 
   .budget {
-    font-size: var(--text-xs);
-    color: var(--ink-faint);
+    font-size: var(--font-size-caption-sm);
+    color: var(--color-fg-muted);
   }
 
   .budget-val {
-    color: var(--ink-soft);
+    color: var(--color-fg-muted);
   }
 </style>

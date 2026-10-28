@@ -18,6 +18,7 @@
 import { gsap } from 'gsap';
 import { Application, Container, Graphics } from 'pixi.js';
 import type { ClusterState, SimEvent } from '../sim/types';
+import type { Theme } from '../theme';
 import {
   DOT_THRESHOLD,
   fitTransform,
@@ -28,32 +29,6 @@ import {
   type Point,
   type StageTransform,
 } from './layout';
-
-// Palette mirrors the CSS design tokens in `app.css` (Pixi wants numbers, not
-// hex strings). A paper-bright stage with dark slate discs as the solid
-// figures. Two distinct color families, never mixed:
-//   - Three **state** signal hues — amber for "in flight / not yet agreed",
-//     green for "converged", red for a rejected request — each always paired
-//     with a shape cue (arc length, the pulse), never color alone.
-//   - One **ambient traffic** accent — a muted steel-blue for the gossip beams.
-//     Gossip is structural, not a state signal, so it gets its own cool hue
-//     (analogous to the cool paper bg) and never borrows amber/green/red. A
-//     *dropped* beam desaturates toward a neutral cool grey as it dies mid-flight
-//     (loss = chroma drained, paired with its visible death + fade), so it reads
-//     as "lost" without the alarm of red.
-// Every mark clears 3:1 on the stage.
-const COLOR_STAGE_BG = 0xe8edf2;
-const COLOR_GRID = 0xd2d9e1;
-const COLOR_NODE_FILL = 0x39424f;
-const COLOR_DIRTY = 0xb3720d; // in flight / still climbing
-const COLOR_CONVERGED = 0x137a52; // settled / agreed
-const COLOR_BEAM = 0x3f6090; // gossip traffic — ambient steel-blue accent
-const COLOR_BEAM_LOST = 0x8b94a1; // dropped beam's terminal color — cool grey
-// The selection ring (the inspected node). Drawn in the dark ink — chrome, not
-// a signal — so it never reads as amber/green convergence state, and it is
-// paired with the inspector opening, so selection is signified by more than the
-// ring alone.
-const COLOR_SELECT = 0x1b2330;
 
 // A node counts as caught up when its view is within this fraction of the
 // cluster's true total — the threshold that flips its arc from amber to green.
@@ -71,7 +46,7 @@ const REDUCE_FADE_MS = 400;
 // length as a fraction of the edge; the head is a filled dot of radius
 // `width · BEAM_HEAD_R`, set in a faint glow of radius `width · BEAM_GLOW_R` at
 // `BEAM_GLOW_ALPHA` of the beam's alpha (plain layered alpha, not additive —
-// additive washes toward white on the paper-bright stage).
+// additive washes toward white on a light stage).
 const BEAM_WAKE = 0.26;
 const BEAM_HEAD_R = 1.4;
 const BEAM_GLOW_R = 3.0;
@@ -120,6 +95,9 @@ interface NodeGfx {
   /** Radius the disc geometry was last drawn at; redrawn only when a join or
    *  leave re-spaces the ring and changes it. */
   radius: number;
+  /** The view / true-total fraction the arc was last drawn at, so a theme
+   *  change can redraw it. */
+  fraction: number;
   /** Live tweens (enter / exit / glide), killed on destroy so a stale tween
    *  can never touch a freed display object. */
   tweens: Set<gsap.core.Tween>;
@@ -150,6 +128,8 @@ export class StageRenderer {
   // One persistent Graphics holding every live beam's strokes, redrawn each
   // frame by `#stepBeams` on the app ticker (N beams, one draw call).
   readonly #packetGfx: Graphics;
+  readonly #guide: Graphics;
+  #theme: Theme;
 
   #nodes = new Map<number, NodeGfx>();
   #beams = new Set<Beam>();
@@ -169,8 +149,9 @@ export class StageRenderer {
   #pendingFlash = new Set<number>();
   #flashRaf = 0;
 
-  private constructor(app: Application) {
+  private constructor(app: Application, theme: Theme) {
     this.#app = app;
+    this.#theme = theme;
     this.#reduceMotion =
       typeof window !== 'undefined' &&
       window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -182,10 +163,9 @@ export class StageRenderer {
     this.#root.addChild(this.#guideLayer, this.#packetLayer, this.#nodeLayer);
     this.#app.stage.addChild(this.#root);
 
-    const guide = new Graphics()
-      .circle(stageCenter.x, stageCenter.y, guideRadius)
-      .stroke({ width: 1.5, color: COLOR_GRID });
-    this.#guideLayer.addChild(guide);
+    this.#guide = new Graphics();
+    this.#drawGuide();
+    this.#guideLayer.addChild(this.#guide);
 
     // Parent the shared beam Graphics before registering the ticker, so the
     // first tick never fires against an orphaned object.
@@ -196,10 +176,10 @@ export class StageRenderer {
 
   /** Build the renderer and attach its canvas to `container`. Async because
    *  Pixi's WebGL/WebGPU context init is async. */
-  static async create(container: HTMLElement): Promise<StageRenderer> {
+  static async create(container: HTMLElement, theme: Theme): Promise<StageRenderer> {
     const app = new Application();
     await app.init({
-      background: COLOR_STAGE_BG,
+      background: theme.bg,
       antialias: true,
       // Force WebGL: in headless chromium the WebGPU autodetect can land in a
       // half-fallback that renders nothing, which would blind the screenshot
@@ -214,7 +194,7 @@ export class StageRenderer {
     app.canvas.style.width = '100%';
     app.canvas.style.height = '100%';
     container.appendChild(app.canvas);
-    return new StageRenderer(app);
+    return new StageRenderer(app, theme);
   }
 
   /** Resize the canvas to `width × height` (CSS pixels) and rescale the logical
@@ -329,6 +309,19 @@ export class StageRenderer {
     }
   }
 
+  /** Re-tint every mark from `theme` (an OS scheme or `data-theme` change),
+   *  immediately, including while paused. Beams read the theme each frame. */
+  setTheme(theme: Theme): void {
+    this.#theme = theme;
+    this.#app.renderer.background.color = theme.bg;
+    this.#drawGuide();
+    for (const [id, gfx] of this.#nodes) {
+      this.#drawDisc(gfx.disc, gfx.radius);
+      this.#drawArc(gfx, gfx.fraction, this.#nodes.size);
+      this.#drawSelection(gfx, id === this.#selectedId);
+    }
+  }
+
   /** Tear the renderer down: kill every tween (node and beam), free every GPU
    *  resource, drop the canvas. Safe to call once; the owner must not reuse the
    *  instance after. */
@@ -356,7 +349,7 @@ export class StageRenderer {
     root.addChild(disc, arc, selectRing);
     this.#drawDisc(disc, radius);
     this.#nodeLayer.addChild(root);
-    const gfx: NodeGfx = { root, disc, arc, selectRing, center, radius, tweens: new Set() };
+    const gfx: NodeGfx = { root, disc, arc, selectRing, center, radius, fraction: 0, tweens: new Set() };
     this.#nodes.set(id, gfx);
     if (id === this.#selectedId) this.#drawSelection(gfx, true);
 
@@ -440,11 +433,19 @@ export class StageRenderer {
     return tween;
   }
 
-  /** Draw a node's disc at `radius` (clearing any prior geometry). A flat slate
-   *  fill — on the light stage the disc edge is defined by fill-vs-canvas
-   *  contrast, so a stroke would only add invisible ink. */
+  /** Draw the guide ring the nodes sit on. */
+  #drawGuide(): void {
+    this.#guide
+      .clear()
+      .circle(stageCenter.x, stageCenter.y, guideRadius)
+      .stroke({ width: 1.5, color: this.#theme.grid });
+  }
+
+  /** Draw a node's disc at `radius` (clearing any prior geometry). A flat fill
+   *  — the disc edge is defined by fill-vs-canvas contrast, so a stroke would
+   *  only add invisible ink. */
   #drawDisc(disc: Graphics, radius: number): void {
-    disc.clear().circle(0, 0, radius).fill(COLOR_NODE_FILL);
+    disc.clear().circle(0, 0, radius).fill(this.#theme.fg);
   }
 
   /** Draw a node's cell arc: an annulus around the disc whose sweep is the
@@ -454,27 +455,24 @@ export class StageRenderer {
   #drawArc(node: NodeGfx, fraction: number, n: number): void {
     const f = Math.max(0, Math.min(1, fraction));
     const converged = f >= 1 - CONVERGED_EPSILON;
-    const color = converged ? COLOR_CONVERGED : COLOR_DIRTY;
+    const color = converged ? this.#theme.ok : this.#theme.warn;
+    node.fraction = fraction;
     node.arc.clear();
 
     if (n > DOT_THRESHOLD) {
       // Intensity dot: there is no room for an arc, so the disc *fill* itself
-      // carries how caught up the node is — lerped from the cold slate base
-      // toward the signal hue. (Pixi `tint` multiplies, so tinting the dark
-      // base would only ever darken it; we redraw the fill instead.) Position
-      // on the ring still encodes identity.
-      node.disc.tint = 0xffffff;
+      // carries how caught up the node is — lerped from the disc colour toward
+      // the signal hue. Position on the ring still encodes identity.
       node.disc.alpha = 1;
-      const fill = f <= 0 ? COLOR_NODE_FILL : lerpColor(COLOR_NODE_FILL, color, 0.35 + 0.65 * f);
+      const fill = f <= 0 ? this.#theme.fg : lerpColor(this.#theme.fg, color, 0.35 + 0.65 * f);
       node.disc.clear().circle(0, 0, node.radius).fill(fill);
       return;
     }
 
-    // Arc mode: the disc keeps its slate base fill (crossing the dot threshold
+    // Arc mode: the disc keeps its base fill (crossing the dot threshold
     // changes the node count, hence the radius, so the glide loop's radius-change
     // redraw already restored it from any dot-mode recolour). The arc carries
     // the fraction.
-    node.disc.tint = 0xffffff;
     node.disc.alpha = 1;
     if (f <= 0) return;
     const radius = node.radius + 4;
@@ -484,15 +482,15 @@ export class StageRenderer {
       .stroke({ width: 3, color, cap: 'round' });
   }
 
-  /** Draw or clear the selection ring around a node — a static dark ring just
-   *  outside the cell arc, distinct from the expanding convergence pulse and the
-   *  amber/green arc. */
+  /** Draw or clear the selection ring around a node — a static ring in the text
+   *  colour just outside the cell arc, distinct from the expanding convergence
+   *  pulse and the warn/ok arc. */
   #drawSelection(node: NodeGfx, selected: boolean): void {
     node.selectRing.clear();
     if (!selected) return;
     node.selectRing
       .circle(0, 0, node.radius + 9)
-      .stroke({ width: 2.5, color: COLOR_SELECT, alpha: 0.9 });
+      .stroke({ width: 2.5, color: this.#theme.fg, alpha: 0.9 });
   }
 
   /** Record one gossip packet as a beam. No Graphics, no tween — just a data
@@ -527,10 +525,10 @@ export class StageRenderer {
    *  along the eased flight, so it reads as a particle traveling its edge. Below
    *  `BEAM_DETAIL_CAP` live beams the head sits in a faint glow and is a filled
    *  dot (the full comet); above it the comet goes all-stroke (wake + a short
-   *  head streak) so dense gossip stays fast. A delivered beam is the steel-blue
-   *  gossip accent, reaches the target, and hands the "news landed" beat to its
-   *  pulse; a dropped beam dies at `DROP_FRACTION`, draining to grey as it goes —
-   *  the partition / packet-loss cue. */
+   *  head streak) so dense gossip stays fast. Every beam is the muted chart
+   *  colour. A delivered beam reaches the target and hands the "news landed"
+   *  beat to its pulse; a dropped beam dies at `DROP_FRACTION` and fades as it
+   *  goes — the partition / packet-loss cue. */
   #stepBeams(): void {
     if (this.#packetGfx.destroyed) return;
     if (this.#beams.size === 0) {
@@ -545,6 +543,7 @@ export class StageRenderer {
     const now = performance.now();
     const duration = this.#reduceMotion ? REDUCE_FADE_MS : BEAM_FLIGHT_MS;
     const detail = this.#beams.size <= BEAM_DETAIL_CAP;
+    const color = this.#theme.muted;
 
     // Deleting from a Set during its own for…of is well-defined: the deleted
     // entry simply won't be revisited.
@@ -560,8 +559,6 @@ export class StageRenderer {
 
       if (this.#reduceMotion) {
         // No flight: a static edge fading over its lifetime — a diff, not travel.
-        // Delivered stays steel-blue; dropped reads as the terminal grey.
-        const color = beam.dropped ? COLOR_BEAM_LOST : COLOR_BEAM;
         const alpha = (beam.dropped ? 0.3 : 0.8) * (1 - age / duration);
         g.moveTo(beam.a.x, beam.a.y)
           .lineTo(beam.b.x, beam.b.y)
@@ -585,12 +582,6 @@ export class StageRenderer {
         ? 0.7 * (1 - tip / end)
         : 0.8 * clamp01((end - tip) / (end * BEAM_FADE_OUT));
       const alpha = base * fadeIn;
-      // Delivered: the steel-blue accent. Dropped: drain chroma toward grey as it
-      // dies, so loss reads as color leaving rather than an alarm hue.
-      const color = beam.dropped
-        ? lerpColor(COLOR_BEAM, COLOR_BEAM_LOST, tip / end)
-        : COLOR_BEAM;
-
       if (detail) {
         // Full comet, back to front: glow, then soft wake, then the crisp head.
         g.circle(headPt.x, headPt.y, beam.width * BEAM_GLOW_R).fill({
@@ -672,8 +663,7 @@ export class StageRenderer {
     for (const node of this.#nodes.values()) {
       const ring = new Graphics();
       node.root.addChild(ring);
-      // The deep converged green carries strong contrast on the light stage, so
-      // a bold ring (3px, near-opaque at the outset) reads as a deliberate
+      // A bold ring (3px, near-opaque at the outset) reads as a deliberate
       // "agrees now" beat rather than an ambient halo as it expands and fades.
       const state = { r: baseRadius, alpha: 0.85 };
       gsap.to(state, {
@@ -688,7 +678,7 @@ export class StageRenderer {
           ring
             .clear()
             .circle(0, 0, state.r)
-            .stroke({ width: 3, color: COLOR_CONVERGED, alpha: state.alpha });
+            .stroke({ width: 3, color: this.#theme.ok, alpha: state.alpha });
         },
         onComplete: () => {
           if (!ring.destroyed) ring.destroy();
@@ -730,7 +720,7 @@ function clamp01(t: number): number {
 }
 
 /** Blend two packed `0xRRGGBB` colours channel-wise — the dot-mode disc fill
- *  ramps from the slate base toward a signal hue as a node catches up. */
+ *  ramps from the disc colour toward a signal hue as a node catches up. */
 function lerpColor(a: number, b: number, t: number): number {
   const k = Math.max(0, Math.min(1, t));
   const ar = (a >> 16) & 0xff;

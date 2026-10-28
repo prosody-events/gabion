@@ -1,0 +1,50 @@
+/* Design tokens: the one source of design values for the visualizer and the
+ * study dashboard, which keeps a byte-identical copy. Components and the canvas
+ * theme (`lib/theme.ts`) use these names, never raw values. Each colour holds
+ * its light and dark value in `light-dark()`: the OS preference picks one, and
+ * `<html data-theme="light|dark">` overrides it. Text colours clear 4.5:1 and
+ * graphics colours 3:1 on --color-bg, --color-panel and --surface-popover in
+ * both themes; `tests/audit.spec.ts` (A7) checks them. */
+:root {
+  color-scheme: light dark;
+  --color-fg: light-dark(#1b2330, #e6e9ee);
+  --color-fg-muted: light-dark(#555e6d, #a3acb9);
+  --color-bg: light-dark(#e7eaee, #14181e);
+  --color-panel: light-dark(#ffffff, #1c222a);
+  --color-border-line: light-dark(#d6dbe1, #323a45);
+  --color-ok: light-dark(#11704b, #3fb984);
+  --color-warn: light-dark(#8a5a00, #e0a03a);
+  --color-bad: light-dark(#b3261e, #f07167);
+  --chart-grid: light-dark(#d2d9e1, #2c343e);
+  --chart-axis: light-dark(#78818f, #7d8796);
+  --chart-reference: light-dark(#78818f, #7d8796);
+  --chart-muted: light-dark(#636d7b, #8691a0);
+  --surface-popover: light-dark(#ffffff, #262d37);
+  --shadow-popover: 0 2px 8px light-dark(rgb(27 35 48 / 18%), rgb(0 0 0 / 50%));
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-serif: ui-serif, Georgia, 'Times New Roman', serif;
+  --font-size-caption-sm: 0.64rem;
+  --font-size-caption: 0.8rem;
+  --font-size-body: 1rem;
+  --font-size-heading: 1.25rem;
+  --font-size-title: 1.563rem;
+  --font-weight-medium: 500;
+  --gap-xs: 4px;
+  --gap-sm: 8px;
+  --gap-md: 16px;
+  --gap-lg: 24px;
+  --gap-xl: 32px;
+  --pad-xs: 4px;
+  --pad-sm: 8px;
+  --radius: 8px;
+  --dur-slow: 0.45s;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
