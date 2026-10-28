@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::num::{NonZeroU16, NonZeroUsize};
+use std::num::NonZeroU16;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,17 +27,19 @@ use crate::discovery::{Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
 use crate::gossip::mock::{MockTransport, Wire};
-use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance_ticks};
+use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance, sim_advance_ticks};
 use crate::gossip::{
     AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipCounters, GossipError,
-    GossipRuntime, GossipTransport, TokioClock, ValidGossipConfig,
+    GossipRuntime, GossipTransport, Role, TokioClock, ValidGossipConfig,
 };
 use crate::mock::with_logs;
 use crate::settings::mock::{rules, storage};
 use crate::settings::{Millis, Settings};
-use crate::wire::{self, AckInfo, CellPayload, Header, MIN_PAYLOAD_BYTES};
+use crate::wire::{self, AckInfo, CellPayload, Header, MIN_PAYLOAD_BYTES, Payload};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
+
+mod rounds;
 
 // -- in-memory aggregate store ----------------------------------------------
 
@@ -106,29 +108,23 @@ impl AggregateStore for InMemoryAggregateStore {
 // -- helpers ----------------------------------------------------------------
 
 fn store_for(identity: NodeIdentity) -> CellStore {
-    CellStore::new(storage(256, 32, 64), identity, &rules(32))
+    CellStore::new(storage(256, 32), identity, &rules(32))
 }
 
 fn sock(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-fn sim_config(peers: Vec<SocketAddr>, seed: u64) -> ValidGossipConfig {
-    tuned_config(peers, seed, |_| {})
+fn sim_config(peers: Vec<SocketAddr>) -> ValidGossipConfig {
+    tuned_config(peers, |_| {})
 }
 
 /// The tests' gossip settings, then `tune`, built through
 /// `Settings::validate` as production builds them.
-fn tuned_config(
-    peers: Vec<SocketAddr>,
-    seed: u64,
-    tune: impl FnOnce(&mut Settings),
-) -> ValidGossipConfig {
+fn tuned_config(peers: Vec<SocketAddr>, tune: impl FnOnce(&mut Settings)) -> ValidGossipConfig {
     let mut settings = Settings {
         cluster_id_hash: 0xC1.try_into().unwrap(),
-        fanout: NonZeroUsize::MIN,
         tick_interval: ms(100),
-        max_cells_per_tick: 1024.try_into().unwrap(),
         max_payload_bytes: 65_507,
         limit_queue_capacity: 1024.try_into().unwrap(),
         ..Settings::default()
@@ -136,7 +132,6 @@ fn tuned_config(
     tune(&mut settings);
     let (mut config, _) = settings.validate().expect("test gossip settings validate");
     config.bootstrap_peers = peers;
-    config.rng_seed = seed;
     config
 }
 
@@ -187,8 +182,6 @@ impl Arbitrary for SimRecord {
 #[derive(Clone, Debug)]
 struct ConnectedClusterCase {
     nodes: u16,
-    fanout: u16,
-    peer_degree: u16,
     records: Vec<SimRecord>,
     drop_first: u8,
 }
@@ -201,12 +194,6 @@ impl Arbitrary for ConnectedClusterCase {
         let len = usize::arbitrary(g) % max_records;
         Self {
             nodes,
-            fanout: if nodes == 1 {
-                0
-            } else {
-                (u16::arbitrary(g) % (nodes - 1)) + 1
-            },
-            peer_degree: (u16::arbitrary(g) % 7) + 4,
             records: (0..len).map(|_| SimRecord::arbitrary(g)).collect(),
             drop_first: u8::arbitrary(g) % 4,
         }
@@ -315,7 +302,7 @@ fn store_for_expiring_rule(identity: NodeIdentity) -> CellStore {
 }
 
 fn store_for_property_rules(identity: NodeIdentity, node_capacity: u16) -> CellStore {
-    let mut store = CellStore::new(storage(512, node_capacity.max(8), 512), identity, &rules(8));
+    let mut store = CellStore::new(storage(512, node_capacity.max(8)), identity, &rules(8));
     for rule in 0..3 {
         store
             .intern_rule(RuleDescriptor {
@@ -329,24 +316,6 @@ fn store_for_property_rules(identity: NodeIdentity, node_capacity: u16) -> CellS
             .unwrap();
     }
     store
-}
-
-fn overlay_peers(addrs: &[SocketAddr], index: usize, degree: usize) -> Vec<SocketAddr> {
-    let nodes = addrs.len();
-    if nodes <= 1 {
-        return Vec::new();
-    }
-    let degree = degree.min((nodes - 1).ilog2() as usize + 1).max(1);
-    let mut peers = Vec::with_capacity(degree * 2);
-    let mut offset = 1_usize;
-    for _ in 0..degree {
-        peers.push(addrs[(index + offset) % nodes]);
-        peers.push(addrs[(index + nodes - (offset % nodes)) % nodes]);
-        offset = (offset * 2).min(nodes - 1);
-    }
-    peers.sort_unstable();
-    peers.dedup();
-    peers
 }
 
 async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
@@ -376,20 +345,14 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
     let mut clients = Vec::with_capacity(nodes);
     let mut handles = Vec::with_capacity(nodes);
     let mut aggregates = Vec::with_capacity(nodes);
-    let peer_degree = case.peer_degree as usize;
     let node_capacity =
         ((case.records.len() + 1).next_power_of_two().max(8)).min(u16::MAX as usize) as u16;
     for i in 0..nodes {
         let identity = NodeIdentity::new(NodeId(0xA000 + i as u128), 1);
-        let peers = overlay_peers(&addrs, i, peer_degree);
-        let cfg = tuned_config(peers, 0xBAD5_EED0 + i as u64, |s| {
-            s.fanout = (case.fanout as usize)
-                .min(nodes.saturating_sub(1))
-                .max(1)
-                .try_into()
-                .unwrap();
-            s.max_cells_per_tick = 128.try_into().unwrap();
-        });
+        // Every node knows every other: with direct mail, a cell reaches a
+        // node only from its origin.
+        let peers = addrs.iter().copied().filter(|&a| a != addrs[i]).collect();
+        let cfg = sim_config(peers);
         let agg = Rc::new(InMemoryAggregateStore::new());
         let (rt, client) = GossipRuntime::from_parts(
             router.bind(addrs[i]),
@@ -507,10 +470,7 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
             .copied()
             .filter(|addr| *addr != addrs[i])
             .collect();
-        let cfg = tuned_config(peers, 0xC0FF_EE00 + i as u64, |s| {
-            s.fanout = 4.try_into().unwrap();
-            s.max_cells_per_tick = 32.try_into().unwrap();
-        });
+        let cfg = sim_config(peers);
         let agg = Rc::new(InMemoryAggregateStore::new());
         let (rt, client) = GossipRuntime::from_parts(
             router.bind(addrs[i]),
@@ -639,7 +599,7 @@ fn foreign_cluster_packet_changes_nothing(case: ClusterCase) -> TestResult {
         let addr_a = sock(43_000);
         let addr_b = sock(43_001);
         let cluster_b = if case.same_cluster { 0xC1 } else { 0xC2 };
-        let cfg_b = tuned_config(vec![addr_a], 2, |s| {
+        let cfg_b = tuned_config(vec![addr_a], |s| {
             s.cluster_id_hash = cluster_b.try_into().unwrap();
         });
         let agg_a = Rc::new(InMemoryAggregateStore::new());
@@ -648,7 +608,7 @@ fn foreign_cluster_packet_changes_nothing(case: ClusterCase) -> TestResult {
         let (rt_a, client_a) = GossipRuntime::from_parts(
             router.bind(addr_a),
             TokioClock::from_millis(0),
-            sim_config(vec![addr_b], 1),
+            sim_config(vec![addr_b]),
             store_for(NodeIdentity::new(NodeId(0xCA), 1)),
             agg_a.clone(),
         );
@@ -716,10 +676,7 @@ fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) 
                 .copied()
                 .filter(|addr| *addr != addrs[i])
                 .collect();
-            let cfg = tuned_config(peers, 0xEED0 + i as u64, |s| {
-                s.fanout = nodes.saturating_sub(1).clamp(1, 8).try_into().unwrap();
-                s.max_cells_per_tick = 32.try_into().unwrap();
-            });
+            let cfg = sim_config(peers);
             let agg = Rc::new(InMemoryAggregateStore::new());
             let (rt, client) = GossipRuntime::from_parts(
                 router.bind(addrs[i]),
@@ -784,14 +741,14 @@ fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> Tes
         let (rt_a, client_a) = GossipRuntime::from_parts(
             router.bind(addr_a),
             TokioClock::from_millis(0),
-            sim_config(Vec::new(), 1),
+            sim_config(Vec::new()),
             store_for(id_a),
             agg_a.clone(),
         );
         let (rt_b, client_b) = GossipRuntime::from_parts(
             router.bind(addr_b),
             TokioClock::from_millis(0),
-            sim_config(Vec::new(), 2),
+            sim_config(Vec::new()),
             store_for(id_b),
             agg_b.clone(),
         );
@@ -839,7 +796,7 @@ async fn record_acks_after_apply() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 clock,
-                sim_config(Vec::new(), 1),
+                sim_config(Vec::new()),
                 store,
                 agg.clone(),
             );
@@ -887,14 +844,14 @@ async fn two_runtimes_converge_on_cluster_aggregate() {
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 t_a,
                 TokioClock::from_millis(0),
-                sim_config(vec![addr_b], 1),
+                sim_config(vec![addr_b]),
                 store_for(id_a),
                 agg_a.clone(),
             );
             let (rt_b, client_b) = GossipRuntime::from_parts(
                 t_b,
                 TokioClock::from_millis(0),
-                sim_config(vec![addr_a], 2),
+                sim_config(vec![addr_a]),
                 store_for(id_b),
                 agg_b.clone(),
             );
@@ -942,7 +899,7 @@ async fn apply_called_once_per_crdt_iteration() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(Vec::new(), 1),
+                sim_config(Vec::new()),
                 store,
                 agg.clone(),
             );
@@ -991,7 +948,7 @@ async fn gossip_tick_drives_expiration() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(Vec::new(), 1),
+                sim_config(Vec::new()),
                 store,
                 agg.clone(),
             );
@@ -1020,11 +977,7 @@ async fn gossip_tick_drives_expiration() {
 #[test]
 fn expiry_applies_each_full_batch_before_the_next() {
     let cells = GOSSIP_EXPIRATION_BATCH + 1;
-    let mut store = CellStore::new(
-        storage(cells as u32, 32, cells as u32),
-        node(0xA),
-        &rules(32),
-    );
+    let mut store = CellStore::new(storage(cells as u32, 32), node(0xA), &rules(32));
     store
         .intern_rule(RuleDescriptor {
             fingerprint: 0xFEED,
@@ -1053,7 +1006,7 @@ fn expiry_applies_each_full_batch_before_the_next() {
         let (rt, _client) = GossipRuntime::from_parts(
             MockTransport(Rc::default()),
             TokioClock::from_millis(0),
-            sim_config(vec![], 1),
+            sim_config(vec![]),
             store,
             agg.clone(),
         );
@@ -1103,7 +1056,7 @@ async fn configured_rule_reexpires_after_idle_window() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(Vec::new(), 1),
+                sim_config(Vec::new()),
                 store,
                 agg.clone(),
             );
@@ -1193,7 +1146,7 @@ async fn record_returns_after_apply_completes() {
             let (rt, client) = GossipRuntime::from_parts(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(Vec::new(), 1),
+                sim_config(Vec::new()),
                 store,
                 agg.clone(),
             );
@@ -1222,7 +1175,9 @@ async fn dropped_packet_is_repaired() {
             let addr_b = sock(40_061);
             let t_a = router.bind(addr_a);
             let t_b = router.bind(addr_b);
-            // Drop the first packet on A->B; subsequent ticks heal via repair.
+            // Drop the first packet on A->B: A resends it a heartbeat later,
+            // and that retry is the first packet B hears from A, so no join
+            // sweep can carry the cell before the stream does.
             router.set_link_policy(addr_a, addr_b, LinkPolicy::DropFirst { count: 1 });
 
             let id_a = NodeIdentity::new(NodeId(0xAA00), 1);
@@ -1234,14 +1189,14 @@ async fn dropped_packet_is_repaired() {
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 t_a,
                 TokioClock::from_millis(0),
-                sim_config(vec![addr_b], 1),
+                sim_config(vec![addr_b]),
                 store_for(id_a),
                 agg_a.clone(),
             );
             let (rt_b, _client_b) = GossipRuntime::from_parts(
                 t_b,
                 TokioClock::from_millis(0),
-                sim_config(vec![addr_a], 2),
+                sim_config(vec![addr_a]),
                 store_for(id_b),
                 agg_b.clone(),
             );
@@ -1253,7 +1208,7 @@ async fn dropped_packet_is_repaired() {
                 .record(0xDEAD, KeyHash(1), 0, 7, 0, 0)
                 .await
                 .unwrap();
-            // Many ticks to allow the repair lane to retry.
+            // Time for the retransmission timeout to fire.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
 
             let sum_b = agg_b.total();
@@ -1265,268 +1220,6 @@ async fn dropped_packet_is_repaired() {
             let _ = h_b.await;
         })
         .await;
-}
-
-// -- partition then heal ----------------------------------------------------
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn partition_then_heal() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr_a = sock(40_070);
-            let addr_b = sock(40_071);
-            let addr_c = sock(40_072);
-            let t_a = router.bind(addr_a);
-            let t_b = router.bind(addr_b);
-            let t_c = router.bind(addr_c);
-
-            // Partition A <-> C in both directions.
-            router.set_link_policy(addr_a, addr_c, LinkPolicy::Block);
-            router.set_link_policy(addr_c, addr_a, LinkPolicy::Block);
-
-            let id_a = NodeIdentity::new(NodeId(0xA), 1);
-            let id_b = NodeIdentity::new(NodeId(0xB), 1);
-            let id_c = NodeIdentity::new(NodeId(0xC), 1);
-
-            let agg_a = Rc::new(InMemoryAggregateStore::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::new());
-            let agg_c = Rc::new(InMemoryAggregateStore::new());
-
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                t_a,
-                TokioClock::from_millis(0),
-                sim_config(vec![addr_b, addr_c], 1),
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            let (rt_b, client_b) = GossipRuntime::from_parts(
-                t_b,
-                TokioClock::from_millis(0),
-                sim_config(vec![addr_a, addr_c], 2),
-                store_for(id_b),
-                agg_b.clone(),
-            );
-            let (rt_c, client_c) = GossipRuntime::from_parts(
-                t_c,
-                TokioClock::from_millis(0),
-                sim_config(vec![addr_a, addr_b], 3),
-                store_for(id_c),
-                agg_c.clone(),
-            );
-
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
-            let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
-
-            client_a
-                .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
-                .await
-                .unwrap();
-            client_b
-                .record(0xDEAD, KeyHash(1), 0, 2, 0, 0)
-                .await
-                .unwrap();
-            client_c
-                .record(0xDEAD, KeyHash(1), 0, 4, 0, 0)
-                .await
-                .unwrap();
-
-            // Drive ticks under partition.
-            sim_advance_ticks(Duration::from_millis(100), 10).await;
-
-            // Heal the partition.
-            router.set_link_policy(addr_a, addr_c, LinkPolicy::Pass);
-            router.set_link_policy(addr_c, addr_a, LinkPolicy::Pass);
-
-            sim_advance_ticks(Duration::from_millis(100), 30).await;
-
-            let sum_a = agg_a.total();
-            let sum_b = agg_b.total();
-            let sum_c = agg_c.total();
-            assert_eq!(sum_a, 7, "A converges after heal");
-            assert_eq!(sum_b, 7, "B converges");
-            assert_eq!(sum_c, 7, "C converges after heal");
-
-            client_a.shutdown().await.unwrap();
-            client_b.shutdown().await.unwrap();
-            client_c.shutdown().await.unwrap();
-            let _ = h_a.await;
-            let _ = h_b.await;
-            let _ = h_c.await;
-        })
-        .await;
-}
-
-// -- peer sampling without replacement -------------------------------------
-
-/// Three peers, `fanout = 3` ⇒ a single tick must hit every peer exactly
-/// once. Without-replacement sampling is required for Demers' O(log N)
-/// convergence bound; with-replacement would let a tick visit some peer
-/// twice and skip another entirely.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn gossip_tick_picks_peers_without_replacement() {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            let router = SimRouter::new();
-            let addr_a = sock(40_090);
-            let addr_b = sock(40_091);
-            let addr_c = sock(40_092);
-            let addr_d = sock(40_093);
-            let t_a = router.bind(addr_a);
-            let t_b = router.bind(addr_b);
-            let t_c = router.bind(addr_c);
-            let t_d = router.bind(addr_d);
-
-            let id_a = NodeIdentity::new(NodeId(0xA), 1);
-            let id_b = NodeIdentity::new(NodeId(0xB), 1);
-            let id_c = NodeIdentity::new(NodeId(0xC), 1);
-            let id_d = NodeIdentity::new(NodeId(0xD), 1);
-
-            let agg_a = Rc::new(InMemoryAggregateStore::new());
-            let agg_b = Rc::new(InMemoryAggregateStore::new());
-            let agg_c = Rc::new(InMemoryAggregateStore::new());
-            let agg_d = Rc::new(InMemoryAggregateStore::new());
-
-            // A talks to B, C, D with fanout=3 — every tick must hit each.
-            let cfg_a = tuned_config(vec![addr_b, addr_c, addr_d], 0xBAD_5EED, |s| {
-                s.fanout = 3.try_into().unwrap();
-            });
-            let (rt_a, client_a) = GossipRuntime::from_parts(
-                t_a,
-                TokioClock::from_millis(0),
-                cfg_a,
-                store_for(id_a),
-                agg_a.clone(),
-            );
-            // B/C/D are silent — they only receive. We hang on to their
-            // clients so the mpsc senders stay alive; dropping the client
-            // closes the channel which would cause the runtime to exit.
-            let cfg_b = sim_config(Vec::new(), 2);
-            let cfg_c = sim_config(Vec::new(), 3);
-            let cfg_d = sim_config(Vec::new(), 4);
-            let (rt_b, _client_b) = GossipRuntime::from_parts(
-                t_b,
-                TokioClock::from_millis(0),
-                cfg_b,
-                store_for(id_b),
-                agg_b.clone(),
-            );
-            let (rt_c, _client_c) = GossipRuntime::from_parts(
-                t_c,
-                TokioClock::from_millis(0),
-                cfg_c,
-                store_for(id_c),
-                agg_c.clone(),
-            );
-            let (rt_d, _client_d) = GossipRuntime::from_parts(
-                t_d,
-                TokioClock::from_millis(0),
-                cfg_d,
-                store_for(id_d),
-                agg_d.clone(),
-            );
-
-            let h_a = tokio::task::spawn_local(rt_a.run(futures::stream::empty()));
-            let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
-            let h_c = tokio::task::spawn_local(rt_c.run(futures::stream::empty()));
-            let h_d = tokio::task::spawn_local(rt_d.run(futures::stream::empty()));
-
-            client_a
-                .record(0xDEAD, KeyHash(1), 0, 1, 0, 0)
-                .await
-                .unwrap();
-            // With fanout = peer_count, every peer must receive the cell on
-            // the first tick that fires after the record. Without-replacement
-            // sampling is the invariant under test; with-replacement would
-            // leave at least one peer empty whenever the tick double-picks.
-            sim_advance_ticks(Duration::from_millis(100), 20).await;
-
-            let got_b = agg_b.total();
-            let got_c = agg_c.total();
-            let got_d = agg_d.total();
-            assert_eq!((got_b, got_c, got_d), (1, 1, 1));
-
-            client_a.shutdown().await.unwrap();
-            let _ = h_a.await;
-            h_b.abort();
-            h_c.abort();
-            h_d.abort();
-            let _ = h_b.await;
-            let _ = h_c.await;
-            let _ = h_d.await;
-        })
-        .await;
-}
-
-// -- coverage fanout: ⌈ln(n)+c⌉, scaled by cluster size --------------------
-
-/// Drive a single node against a sweep of bootstrap-peer counts and read
-/// the chosen per-tick fanout back through the admin snapshot. The pick is
-/// the coverage threshold `config.fanout.max(⌈ln(peers) + c⌉).min(peers)`
-/// (Kermarrec, Massoulié & Ganesh, TPDS 2003, Thm 1) — a function of the
-/// peer count, *not* the dirty set. Covers the `n=1` floor-clip edge
-/// (`⌈0+c⌉` clamped to 1) and a 255-peer large cluster.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn coverage_fanout_tracks_ln_n_plus_c() {
-    use crate::defaults::{GOSSIP_COVERAGE_MARGIN, GOSSIP_FANOUT};
-
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            for peers in [1usize, 8, 31, 99, 255] {
-                let coverage = ((peers as f64).ln() + GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-                let expected = GOSSIP_FANOUT.max(coverage).min(peers);
-                let observed = observe_coverage_fanout(peers, GOSSIP_FANOUT).await;
-                assert_eq!(
-                    observed, expected,
-                    "coverage fanout for {peers} peers: expected max({GOSSIP_FANOUT}, \
-                     ⌈ln({peers})+{GOSSIP_COVERAGE_MARGIN}⌉={coverage}).min({peers}) = \
-                     {expected}, got {observed}",
-                );
-            }
-        })
-        .await;
-}
-
-/// Build one node with `peers` unbound bootstrap addresses, give it a cell
-/// to gossip, and return the `last_effective_fanout` it records on the next
-/// dirty tick. The peers need not run: the sim transport treats a send to an
-/// unbound address as delivered on the floor (UDP semantics), and the runtime
-/// records `last_effective_fanout` from the computed pick *before* any send,
-/// so the addresses serve only to set `self.peers.len()`.
-async fn observe_coverage_fanout(peers: usize, base: usize) -> usize {
-    let router = SimRouter::new();
-    let local_addr = sock(41_000);
-    let transport = router.bind(local_addr);
-
-    let bootstrap: Vec<SocketAddr> = (0..peers).map(|i| sock(41_001 + i as u16)).collect();
-    let identity = NodeIdentity::new(NodeId(0x5EED), 1);
-    let cfg = tuned_config(bootstrap, 1, |s| s.fanout = base.try_into().unwrap());
-
-    let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(4);
-    let (rt, client) = GossipRuntime::from_parts_with_admin(
-        transport,
-        TokioClock::from_millis(0),
-        cfg,
-        store_for(identity),
-        Rc::new(InMemoryAggregateStore::new()),
-        Some(admin_rx),
-    );
-    let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
-
-    client
-        .record(0xC0FFEE, KeyHash(1), 0, 1, 0, 0)
-        .await
-        .unwrap();
-    sim_advance_ticks(Duration::from_millis(100), 3).await;
-
-    let snap = admin_snapshot(&admin_tx).await;
-    client.shutdown().await.unwrap();
-    let _ = handle.await;
-    snap.last_effective_fanout
 }
 
 // -- UDP smoke --------------------------------------------------------------
@@ -1554,8 +1247,8 @@ async fn udp_round_trip_smoke() {
             let agg_a = Rc::new(InMemoryAggregateStore::new());
             let agg_b = Rc::new(InMemoryAggregateStore::new());
 
-            let config_a = tuned_config(vec![addr_b], 1, |s| s.tick_interval = ms(20));
-            let config_b = tuned_config(vec![addr_a], 2, |s| s.tick_interval = ms(20));
+            let config_a = tuned_config(vec![addr_b], |s| s.tick_interval = ms(20));
+            let config_b = tuned_config(vec![addr_a], |s| s.tick_interval = ms(20));
 
             let (rt_a, client_a) = GossipRuntime::from_parts(
                 UdpTransport(sock_a),
@@ -1635,7 +1328,7 @@ async fn admin_snapshot_reflects_runtime_state() {
             let (rt, client) = GossipRuntime::from_parts_with_admin(
                 transport,
                 TokioClock::from_millis(0),
-                sim_config(vec![sock(40_301)], 1),
+                sim_config(vec![sock(40_301)]),
                 store,
                 agg.clone(),
                 Some(admin_rx),
@@ -1647,6 +1340,7 @@ async fn admin_snapshot_reflects_runtime_state() {
                 .record(0xFEED, KeyHash(0x42), 0, 4, 0, 100)
                 .await
                 .unwrap();
+            heartbeats(1).await;
 
             let (reply_tx, reply_rx) = oneshot::channel::<AdminSnapshot>();
             admin_tx
@@ -1662,7 +1356,9 @@ async fn admin_snapshot_reflects_runtime_state() {
             assert_eq!(snapshot.peers[0].addr, sock(40_301));
             assert!(snapshot.peers[0].node_id.is_none());
             assert!(snapshot.store_stats.active_cells >= 1);
-            assert!(snapshot.local_dirty_len >= 1);
+            // The peer never answers, so the one cell sent stays unacked.
+            assert_eq!(snapshot.peers[0].role, Role::Zone);
+            assert_eq!(snapshot.peers[0].own_unacked, 1);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;
@@ -1683,117 +1379,6 @@ async fn admin_snapshot(admin_tx: &mpsc::Sender<AdminCommand>) -> AdminSnapshot 
 }
 
 // -- Gap 2: without-replacement sampling distribution -----------------------
-
-#[derive(Clone, Debug)]
-struct SamplingCase {
-    seed: u64,
-}
-
-impl Arbitrary for SamplingCase {
-    fn arbitrary(g: &mut Gen) -> Self {
-        Self {
-            seed: u64::arbitrary(g),
-        }
-    }
-}
-
-/// Per-peer delivery counts under strict-fanout sampling should be roughly
-/// uniform. The existing `gossip_tick_picks_peers_without_replacement` uses
-/// `fanout == peer_count` so even a degenerate sampler (always picks peer 0)
-/// passes — every peer ends up picked at least once per tick anyway. This
-/// case keeps the effective pick strictly below the peer count so a broken
-/// sampler concentrates all deliveries on a few peers and starves the rest.
-/// The effective pick is the coverage fanout `⌈ln(8) + c⌉ = 7` (which
-/// overrides the lower configured floor), still 7 of 8 peers per tick.
-#[quickcheck]
-fn quickcheck_sampling_distribution_is_uniform_under_strict_fanout(
-    case: SamplingCase,
-) -> TestResult {
-    run_paused(async move {
-        const PEERS: usize = 8;
-        const FANOUT: usize = 4;
-        const TICKS: u32 = 100;
-        let router = SimRouter::with_channel_capacity(128);
-        let sender_addr = sock(49_000);
-        let peer_addrs: Vec<SocketAddr> = (0..PEERS).map(|i| sock(49_001 + i as u16)).collect();
-
-        let id_sender = NodeIdentity::new(NodeId(0xB000), 1);
-        let cfg_sender = tuned_config(peer_addrs.clone(), case.seed, |s| {
-            s.fanout = FANOUT.try_into().unwrap();
-        });
-        let agg_sender = Rc::new(InMemoryAggregateStore::new());
-        let (rt_sender, client_sender) = GossipRuntime::from_parts(
-            router.bind(sender_addr),
-            TokioClock::from_millis(0),
-            cfg_sender,
-            store_for(id_sender),
-            agg_sender,
-        );
-        let h_sender = tokio::task::spawn_local(rt_sender.run(futures::stream::empty()));
-
-        // Silent recipients — they receive but don't emit gossip themselves
-        // (their stores are empty, so `handle_gossip_tick` early-returns).
-        // We hold the clients to keep their request channels alive.
-        let mut peer_clients = Vec::with_capacity(PEERS);
-        let mut peer_handles = Vec::with_capacity(PEERS);
-        for (i, addr) in peer_addrs.iter().enumerate() {
-            let id = NodeIdentity::new(NodeId(0xB100 + i as u128), 1);
-            let cfg = sim_config(Vec::new(), 1000 + i as u64);
-            let (rt, client) = GossipRuntime::from_parts(
-                router.bind(*addr),
-                TokioClock::from_millis(0),
-                cfg,
-                store_for(id),
-                Rc::new(InMemoryAggregateStore::new()),
-            );
-            peer_handles.push(tokio::task::spawn_local(rt.run(futures::stream::empty())));
-            peer_clients.push(client);
-        }
-
-        // One record so the sender has dirty data to gossip every tick.
-        client_sender
-            .record(0xB055, KeyHash(1), 0, 1, 0, 0)
-            .await
-            .unwrap();
-
-        sim_advance_ticks(Duration::from_millis(100), TICKS).await;
-
-        let counts: Vec<u64> = peer_addrs
-            .iter()
-            .map(|addr| router.received_count(*addr))
-            .collect();
-        let total: u64 = counts.iter().sum();
-        // The runtime scales the per-tick pick to the coverage fanout
-        // `⌈ln(PEERS) + c⌉`, which exceeds the configured `FANOUT` floor —
-        // so the expected per-peer mean is driven by the effective pick, not
-        // by `FANOUT`. Still strictly below `PEERS`, so a broken sampler
-        // starves the unpicked peers.
-        let coverage =
-            ((PEERS as f64).ln() + crate::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as usize;
-        let effective = FANOUT.max(coverage).min(PEERS);
-        let expected = (TICKS as u64) * (effective as u64) / (PEERS as u64);
-        let lower = expected / 2;
-        let upper = expected * 2;
-        let uniform = counts.iter().all(|&c| c >= lower && c <= upper);
-        if !uniform {
-            eprintln!(
-                "non-uniform sampling distribution: seed={}, counts={:?}, total={}, \
-                 expected_per_peer={}, bound=[{},{}]",
-                case.seed, counts, total, expected, lower, upper
-            );
-        }
-
-        client_sender.shutdown().await.unwrap();
-        for client in peer_clients {
-            let _ = client.shutdown().await;
-        }
-        let _ = h_sender.await;
-        for handle in peer_handles {
-            let _ = handle.await;
-        }
-        TestResult::from_bool(uniform)
-    })
-}
 
 // -- Encode and send ----------------------------------------------------------
 
@@ -1825,6 +1410,51 @@ async fn mocked(
     let runtime = tokio::task::spawn_local(rt.run(futures::stream::empty()));
     sim_advance_ticks(Duration::from_millis(10), 1).await;
     (client, admin_tx, runtime)
+}
+
+/// A header-only packet from the peer `sender`, queued for the runtime.
+fn inject(wire: &Wire, from: SocketAddr, sender: NodeIdentity, acks: AckInfo, payload: Payload) {
+    let header = Header {
+        cluster_id_hash: 0xC1.try_into().unwrap(),
+        sender,
+        sender_zone: 0,
+        acks,
+        payload,
+    };
+    wire.inbound
+        .borrow_mut()
+        .push_back((wire::write_header(&header, 0).to_vec(), from));
+}
+
+/// End the runtime's join sweep: an empty sweep page from each of `peers`
+/// makes each heard and answered, so no sweep request interleaves with the
+/// packets under test. The pages are read on the next round.
+fn end_want(wire: &Wire, peers: &[(SocketAddr, NodeIdentity)]) {
+    for &(addr, identity) in peers {
+        inject(
+            wire,
+            addr,
+            identity,
+            AckInfo::default(),
+            CellPayload::Sweep.into(),
+        );
+    }
+}
+
+/// The payload of a packet the runtime sent.
+fn payload_of(bytes: &[u8]) -> Payload {
+    let limits = wire::FrameLimits::new(wire::MAX_PAYLOAD_BYTES).unwrap();
+    wire::decode(bytes, limits, 0xC1.try_into().unwrap(), |_| {})
+        .expect("the runtime sends valid packets")
+        .payload
+}
+
+/// Each attempt from `from` on, decoded: destination and payload.
+fn sent_payloads(wire: &Wire, from: usize) -> Vec<(SocketAddr, Payload)> {
+    wire.attempts.borrow()[from..]
+        .iter()
+        .map(|a| (a.dst, payload_of(&a.bytes)))
+        .collect()
 }
 
 /// One hit on `key` with a limit so high that no threshold round runs.
@@ -1870,7 +1500,7 @@ fn holds(line: &str, field: &str) -> bool {
 async fn threshold_rounds_in_a_burst(peers: Vec<SocketAddr>, refuse: bool) -> AdminSnapshot {
     let wire = Rc::new(Wire::default());
     wire.refuse.set(refuse);
-    let (client, admin, _runtime) = mocked(&wire, store_for(node(0xA)), sim_config(peers, 1)).await;
+    let (client, admin, _runtime) = mocked(&wire, store_for(node(0xA)), sim_config(peers)).await;
     hit(&client, 1).await;
     heartbeats(1).await;
     for _ in 0..12 {
@@ -1887,7 +1517,7 @@ async fn threshold_rounds_in_a_burst(peers: Vec<SocketAddr>, refuse: bool) -> Ad
 #[test]
 fn lone_node_settles_the_error_budget() {
     let snapshot = run_paused(threshold_rounds_in_a_burst(vec![], false));
-    assert_eq!(snapshot.threshold_fires, 1);
+    assert_eq!(snapshot.counters.rounds_threshold, 1);
 }
 
 /// A round that falls due while a packet is held still settles and stamps
@@ -1896,37 +1526,40 @@ fn lone_node_settles_the_error_budget() {
 #[test]
 fn blocked_socket_does_not_fire_a_threshold_round_per_request() {
     let snapshot = run_paused(threshold_rounds_in_a_burst(vec![sock(2)], true));
-    assert_eq!(snapshot.threshold_fires, 1);
-    // The heartbeat's refusal, then the threshold round's refused retry.
-    assert_eq!(snapshot.counters.send_blocked, 2);
+    assert_eq!(snapshot.counters.rounds_threshold, 1);
+    // The heartbeat's refusal, the prompt round's retry it scheduled, then
+    // the threshold round's.
+    assert_eq!(snapshot.counters.send_blocked, 3);
 }
 
-/// A refused packet is held and retried first on every later round,
-/// unchanged although newer counts arrived; nothing encodes over it, and the
-/// round that finally sends it goes on to gossip. One `u32` cell fills a
-/// packet, so the refusal cuts a two-packet frame after its first packet.
+/// A refused packet is held and retried first on every later round, the
+/// prompt rounds it schedules included, unchanged although newer counts
+/// arrived; nothing encodes over it, and the round that finally sends it goes
+/// on to gossip. One `u32` cell fills a packet, so the refusal cuts a
+/// two-packet frame after its first packet.
 #[test]
 fn refused_send_holds_one_packet() {
     run_paused(async {
         let wire = Rc::new(Wire::default());
         wire.refuse.set(true);
         let peers = vec![sock(2), sock(3)];
-        let config = tuned_config(peers, 1, |s| s.max_payload_bytes = MIN_PAYLOAD_BYTES);
+        let config = tuned_config(peers, |s| s.max_payload_bytes = MIN_PAYLOAD_BYTES);
         let (client, admin, _runtime) = mocked(&wire, store_for(node(0xA)), config).await;
         hit(&client, 1).await;
         hit(&client, 2).await;
         heartbeats(1).await;
         let refused = wire.attempts.borrow()[0].clone();
         assert!(!refused.accepted);
-        assert_eq!(wire.attempts.borrow().len(), 1);
+        // The heartbeat's refusal and one prompt round's retry.
+        assert_eq!(*wire.attempts.borrow(), vec![refused.clone(); 2]);
 
         // Both cells change, so any re-encode would differ from the held one.
         hit(&client, 1).await;
         hit(&client, 2).await;
         heartbeats(2).await;
-        assert_eq!(*wire.attempts.borrow(), vec![refused.clone(); 3]);
+        assert_eq!(*wire.attempts.borrow(), vec![refused.clone(); 6]);
         let counters = admin_snapshot(&admin).await.counters;
-        assert_eq!((counters.send_blocked, counters.packets_sent), (3, 0));
+        assert_eq!((counters.send_blocked, counters.packets_sent), (6, 0));
 
         wire.refuse.set(false);
         heartbeats(1).await;
@@ -1942,14 +1575,15 @@ fn refused_send_holds_one_packet() {
             1
         );
         let counters = admin_snapshot(&admin).await.counters;
-        assert_eq!((counters.send_blocked, counters.packets_sent), (3, 5));
+        assert_eq!((counters.send_blocked, counters.packets_sent), (6, 5));
         let sent: u64 = accepted.iter().map(|a| a.bytes.len() as u64).sum();
         assert_eq!(counters.bytes_sent, sent);
     });
 }
 
-/// `send_blocked` logs the 1st, 2nd and 4th of five refusals, each naming the
-/// sysctl and the size gabion asked for.
+/// `send_blocked` logs the 1st, 2nd, 4th and 8th of ten refusals (each
+/// heartbeat's and the prompt round's retry after it), each naming the sysctl
+/// and the size gabion asked for.
 #[test]
 fn send_blocked_warns_at_powers_of_two_naming_wmem_max() {
     let ((), logs) = with_logs(|| {
@@ -1957,16 +1591,16 @@ fn send_blocked_warns_at_powers_of_two_naming_wmem_max() {
             let wire = Rc::new(Wire::default());
             wire.refuse.set(true);
             let (client, admin, _runtime) =
-                mocked(&wire, store_for(node(0xA)), sim_config(vec![sock(2)], 1)).await;
+                mocked(&wire, store_for(node(0xA)), sim_config(vec![sock(2)])).await;
             hit(&client, 1).await;
             heartbeats(5).await;
-            assert_eq!(admin_snapshot(&admin).await.counters.send_blocked, 5);
+            assert_eq!(admin_snapshot(&admin).await.counters.send_blocked, 10);
         })
     });
     assert_logged(
         &logs,
         "send_blocked",
-        3,
+        4,
         &[
             "sysctl=\"net.core.wmem_max\"",
             "send_blocked_total=",
@@ -1986,7 +1620,7 @@ fn send_error_to_one_peer_keeps_gossiping() {
             wire.forbidden.set(Some(sock(2)));
             let peers = vec![sock(2), sock(3)];
             let (client, admin, _runtime) =
-                mocked(&wire, store_for(node(0xA)), sim_config(peers, 1)).await;
+                mocked(&wire, store_for(node(0xA)), sim_config(peers)).await;
             hit(&client, 1).await;
             heartbeats(3).await;
             let to_other = wire.accepted().iter().filter(|a| a.dst == sock(3)).count();
@@ -2017,7 +1651,7 @@ async fn send_raw(packets: &[Vec<u8>]) -> GossipCounters {
     let (rt, client) = GossipRuntime::from_parts_with_admin(
         router.bind(target),
         TokioClock::from_millis(0),
-        tuned_config(vec![], 1, |s| s.max_payload_bytes = 1400),
+        tuned_config(vec![], |s| s.max_payload_bytes = 1400),
         store_for(node(0xA)),
         Rc::new(InMemoryAggregateStore::new()),
         Some(admin_rx),
@@ -2095,7 +1729,7 @@ fn full_table_declines_and_still_merges() {
             let (rt_a, client_a) = GossipRuntime::from_parts_with_admin(
                 router.bind(a),
                 TokioClock::from_millis(0),
-                tuned_config(vec![], 1, |s| s.peer_capacity = NonZeroU16::MIN),
+                tuned_config(vec![], |s| s.peer_capacity = NonZeroU16::MIN),
                 store_for(node(0xA)),
                 agg_a.clone(),
                 Some(admin_rx),
@@ -2108,7 +1742,7 @@ fn full_table_declines_and_still_merges() {
             let (rt_c, client_c) = GossipRuntime::from_parts(
                 router.bind(c),
                 TokioClock::from_millis(0),
-                sim_config(vec![a], 2),
+                sim_config(vec![a]),
                 store_for(node(0xC)),
                 Rc::new(InMemoryAggregateStore::new()),
             );
@@ -2171,11 +1805,11 @@ fn bad_version_reports_the_peer_version() {
 #[test]
 fn default_cluster_id_is_logged_only_on_the_default() {
     let ((), logs) = with_logs(|| {
-        tuned_config(vec![], 1, |s| {
+        tuned_config(vec![], |s| {
             s.cluster_id_hash = Settings::default().cluster_id_hash;
         })
         .note_default_cluster_id();
-        sim_config(vec![], 1).note_default_cluster_id();
+        sim_config(vec![]).note_default_cluster_id();
     });
     assert_logged(
         &logs,
@@ -2215,7 +1849,7 @@ fn socket_buffer_warning_when_granted_is_smaller() {
         );
     }
 
-    let config = tuned_config(vec![], 0, |s| {
+    let config = tuned_config(vec![], |s| {
         s.recv_buffer_bytes = 65_536.try_into().unwrap();
         s.send_buffer_bytes = ((1 << 30) - 1).try_into().unwrap();
     });
@@ -2341,10 +1975,7 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
                 .copied()
                 .filter(|addr| *addr != addrs[i])
                 .collect();
-            let cfg = tuned_config(peers, 0xD0D0 + i as u64, |s| {
-                s.fanout = nodes.saturating_sub(1).clamp(1, 4).try_into().unwrap();
-                s.max_cells_per_tick = 32.try_into().unwrap();
-            });
+            let cfg = sim_config(peers);
             let agg = Rc::new(InMemoryAggregateStore::new());
             let (rt, client) = GossipRuntime::from_parts(
                 router.bind(addrs[i]),
@@ -2430,7 +2061,7 @@ async fn peer_event_lifecycle_is_idempotent_and_tolerant() {
             let (rt, client) = GossipRuntime::from_parts_with_admin(
                 router.bind(addr_local),
                 TokioClock::from_millis(0),
-                sim_config(Vec::new(), 1),
+                sim_config(Vec::new()),
                 store_for(id_local),
                 Rc::new(InMemoryAggregateStore::new()),
                 Some(admin_rx),
@@ -2492,11 +2123,11 @@ async fn threshold_trigger_fires_before_heartbeat() {
 
             // Heartbeat is far in the future; only the threshold trigger
             // could possibly deliver in the short window we sample.
-            let cfg_a = tuned_config(vec![addr_b], 1, |s| {
+            let cfg_a = tuned_config(vec![addr_b], |s| {
                 s.tick_interval = ms(1_000);
                 s.target_err_bps = 100;
             });
-            let cfg_b = tuned_config(vec![addr_a], 2, |s| s.tick_interval = ms(1_000));
+            let cfg_b = tuned_config(vec![addr_a], |s| s.tick_interval = ms(1_000));
 
             let agg_a = Rc::new(InMemoryAggregateStore::new());
             let agg_b = Rc::new(InMemoryAggregateStore::new());
@@ -2570,11 +2201,11 @@ async fn min_emit_interval_clamps_adversarial_rate() {
 
             // ε saturates to 1 (limit=1). Heartbeat is far in the future
             // so the only emissions are threshold-triggered.
-            let cfg_a = tuned_config(vec![addr_b], 1, |s| {
+            let cfg_a = tuned_config(vec![addr_b], |s| {
                 s.tick_interval = ms(10_000);
                 s.min_emit_interval = ms(5);
             });
-            let cfg_b = tuned_config(vec![addr_a], 2, |s| s.tick_interval = ms(10_000));
+            let cfg_b = tuned_config(vec![addr_a], |s| s.tick_interval = ms(10_000));
 
             let agg_a = Rc::new(InMemoryAggregateStore::new());
             let agg_b = Rc::new(InMemoryAggregateStore::new());
@@ -2649,8 +2280,8 @@ async fn heartbeat_still_drains_cold_rules() {
             let id_b = NodeIdentity::new(NodeId(0xB3), 1);
 
             // High budget so the single hit cannot cross ε.
-            let cfg_a = tuned_config(vec![addr_b], 1, |s| s.target_err_bps = 100);
-            let cfg_b = sim_config(vec![addr_a], 2);
+            let cfg_a = tuned_config(vec![addr_b], |s| s.target_err_bps = 100);
+            let cfg_b = sim_config(vec![addr_a]);
 
             let agg_a = Rc::new(InMemoryAggregateStore::new());
             let agg_b = Rc::new(InMemoryAggregateStore::new());
@@ -2717,11 +2348,9 @@ async fn error_bound_holds_under_load() {
             for i in 0..NODES {
                 let identity = NodeIdentity::new(NodeId(0xC000 + i as u128), 1);
                 let peers: Vec<_> = addrs.iter().copied().filter(|a| *a != addrs[i]).collect();
-                let cfg = tuned_config(peers, 0xBEEF + i as u64, |s| {
-                    s.fanout = (NODES - 1).try_into().unwrap();
+                let cfg = tuned_config(peers, |s| {
                     s.target_err_bps = TARGET_BPS;
                     s.min_emit_interval = ms(1);
-                    s.max_cells_per_tick = 64.try_into().unwrap();
                 });
                 let agg = Rc::new(InMemoryAggregateStore::new());
                 let (rt, client) = GossipRuntime::from_parts(
@@ -2780,4 +2409,116 @@ async fn error_bound_holds_under_load() {
             }
         })
         .await;
+}
+
+/// A tick resolves to the instant it was scheduled for, not when it was
+/// polled, and the next is one interval after it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn tick_returns_the_scheduled_instant() {
+    use crate::gossip::{Clock, Ticker};
+    let clock = TokioClock::from_millis(0);
+    let mut ticker = clock.ticker(Duration::from_millis(100));
+    assert_eq!(ticker.tick().await, 0);
+    tokio::time::advance(Duration::from_millis(103)).await;
+    assert_eq!(ticker.tick().await, 100);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert_eq!(ticker.tick().await, 200);
+}
+
+/// A prompt round cut by a refused send resumes as the heartbeat that came
+/// due while the packet was held: once the held probe answer leaves, the
+/// standalone ack only a heartbeat sends goes out at once, not a heartbeat
+/// later.
+#[test]
+fn cut_round_resumes_as_the_strongest_round() {
+    run_paused(async {
+        let (p1, p2) = (sock(2), sock(3));
+        let (id1, id2) = (node(0xB1), node(0xB2));
+        let wire = Rc::new(Wire::default());
+        let (_client, admin, _runtime) =
+            mocked(&wire, store_for(node(0xA)), sim_config(vec![p1, p2])).await;
+        end_want(&wire, &[(p1, id1), (p2, id2)]);
+        heartbeats(1).await;
+        assert!(wire.attempts.borrow().is_empty());
+
+        // P1 probes, so a prompt round owes it an answer; P2 sends stream
+        // data, which only a heartbeat acknowledges alone.
+        wire.refuse.set(true);
+        inject(
+            &wire,
+            p1,
+            id1,
+            AckInfo::default(),
+            Payload::Ack { probe: true },
+        );
+        let range = wire::StreamRange::new(0, 1).unwrap();
+        let own = CellPayload::Own {
+            range,
+            relay_into_zone: false,
+            probe: false,
+        };
+        inject(&wire, p2, id2, AckInfo::default(), own.into());
+        admin_snapshot(&admin).await;
+        let held = wire.attempts.borrow()[0].clone();
+        assert_eq!(held.dst, p1);
+
+        heartbeats(1).await;
+        assert!(wire.attempts.borrow().iter().all(|a| *a == held));
+        let attempts = wire.attempts.borrow().len();
+
+        wire.refuse.set(false);
+        sim_advance(Duration::from_millis(5)).await;
+        let sent = sent_payloads(&wire, attempts);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(wire.attempts.borrow()[attempts].bytes, held.bytes);
+        assert_eq!(sent[1], (p2, Payload::Ack { probe: false }));
+    });
+}
+
+/// An ack written for another incarnation of this node credits nothing: the
+/// stream still times out and is resent with `PROBE`. The same ack naming
+/// this incarnation stops the resend.
+#[test]
+fn ack_for_another_incarnation_is_ignored() {
+    run_paused(async {
+        let p = sock(2);
+        let peer = node(0xB);
+        let wire = Rc::new(Wire::default());
+        let local = NodeIdentity::new(NodeId(0xA), 7);
+        let (client, _admin, _runtime) = mocked(&wire, store_for(local), sim_config(vec![p])).await;
+        end_want(&wire, &[(p, peer)]);
+        for key in 1..=3 {
+            hit(&client, key).await;
+        }
+        heartbeats(1).await;
+        let own_sends = |from| {
+            sent_payloads(&wire, from)
+                .into_iter()
+                .filter_map(|(_, payload)| match payload {
+                    Payload::Cells(CellPayload::Own { range, probe, .. }) => Some((range, probe)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = own_sends(0);
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].0.lower(), first[0].0.upper()), (0, 3));
+
+        let ack = |incarnation| AckInfo {
+            incarnation,
+            own: wire::OwnAck::Plain(3),
+            ..AckInfo::default()
+        };
+        let mark = wire.attempts.borrow().len();
+        inject(&wire, p, peer, ack(6), Payload::Ack { probe: false });
+        heartbeats(1).await;
+        let retry = own_sends(mark);
+        assert_eq!(retry.len(), 1, "{retry:?}");
+        assert_eq!((retry[0].0.lower(), retry[0].1), (0, true));
+
+        let mark = wire.attempts.borrow().len();
+        inject(&wire, p, peer, ack(7), Payload::Ack { probe: false });
+        heartbeats(2).await;
+        assert_eq!(own_sends(mark), vec![]);
+    });
 }

@@ -9,6 +9,8 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 
 #[cfg(feature = "transport-udp")]
 use tokio::net::UdpSocket;
@@ -17,7 +19,7 @@ use super::ValidGossipConfig;
 use super::admin::GossipCounters;
 use crate::settings::Setting;
 use crate::throttle;
-use crate::wire::{PacketBuf, Packets};
+use crate::wire::{Header, PacketBuf, Packets, Payload};
 
 /// Bidirectional datagram transport. The runtime borrows `&self.transport`
 /// (not `&mut`) on every arm so disjoint-field borrows compose cleanly inside
@@ -54,6 +56,23 @@ pub trait GossipTransport {
         &'a self,
         buf: &'a mut [u8],
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a;
+
+    /// Take one datagram already waiting, or fail with `WouldBlock`. The
+    /// default polls [`Self::recv_from`] once; a round reads the waiting
+    /// datagrams this way before it services its timers.
+    fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match pin!(self.recv_from(buf)).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(result) => result,
+            Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+        }
+    }
+
+    /// The receive buffer the kernel granted, in bytes, which bounds the
+    /// datagrams one round reads; `None` for a transport whose finite queue a
+    /// round may read to empty.
+    fn recv_buffer_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The one send buffer. A packet the kernel refuses stays in it, with its
@@ -80,18 +99,33 @@ impl Outbox {
     }
 
     /// Encode `packets` for `dst`, handing each packet to the socket as it
-    /// is encoded and stopping at the first the kernel refuses. The cells
-    /// left unsent wait in the dirty rings and the repair lane.
+    /// is encoded and stopping at the first the kernel refuses. Returns the
+    /// stream position the packets that left (or are held) close through;
+    /// the cells above it stay above the peer's `sent` and go next round.
     pub(super) fn send_frame<T: GossipTransport>(
         &mut self,
         mut packets: Packets<'_>,
         dst: SocketAddr,
         transport: &T,
         counters: &mut GossipCounters,
-    ) {
+    ) -> u64 {
         while self.held.is_none() && packets.next_into(&mut self.packet).is_some() {
             self.send(dst, transport, counters);
         }
+        packets.closed_through()
+    }
+
+    /// Send a packet of `header` alone. Call it only while nothing is held.
+    pub(super) fn send_header<T: GossipTransport, P: Copy + Into<Payload>>(
+        &mut self,
+        header: &Header<P>,
+        dst: SocketAddr,
+        transport: &T,
+        counters: &mut GossipCounters,
+    ) {
+        debug_assert!(self.held.is_none(), "a held packet is never overwritten");
+        self.packet.header_only(header);
+        self.send(dst, transport, counters);
     }
 
     /// Send the held packet, if any; a refusal holds it again.
@@ -274,5 +308,17 @@ impl GossipTransport for UdpTransport {
     #[inline]
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.0.recv_from(buf).await
+    }
+
+    #[inline]
+    fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.try_recv_from(buf)
+    }
+
+    fn recv_buffer_bytes(&self) -> Option<usize> {
+        socket2::SockRef::from(&self.0)
+            .recv_buffer_size()
+            .ok()
+            .map(grant)
     }
 }

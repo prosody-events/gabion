@@ -54,7 +54,6 @@ impl Node {
         let settings = Settings {
             max_matched_rules: 64.try_into().unwrap(),
             limit_queue_capacity: (1 << 20).try_into().unwrap(),
-            rng_seed: Some(1),
             ..Settings::default()
         };
         let (gossip, storage) = settings.validate().expect("settings validate");

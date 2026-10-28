@@ -71,7 +71,7 @@ fn yaml_values_load_when_no_env_overrides() {
 
     let cfg = AppConfig::load_with_yaml_str(
         "envoy_bind: \"127.0.0.1:8000\"\nstorage:\n  max_cells: 256\n  rule_dictionary_capacity: \
-         8\ngossip:\n  bind: \"127.0.0.1:9000\"\n  fanout: 3\n  target_err_bps: 250\n  \
+         8\ngossip:\n  bind: \"127.0.0.1:9000\"\n  peer_capacity: 300\n  target_err_bps: 250\n  \
          min_emit_interval: 7ms\n",
     )
     .expect("load yaml");
@@ -80,7 +80,7 @@ fn yaml_values_load_when_no_env_overrides() {
     assert_eq!(settings.envoy_bind, Some("127.0.0.1:8000".parse().unwrap()));
     assert_eq!(settings.max_cells.get(), 256);
     assert_eq!(settings.rule_dictionary_capacity.map(|c| c.get()), Some(8));
-    assert_eq!(settings.fanout.get(), 3);
+    assert_eq!(settings.peer_capacity.get(), 300);
     assert_eq!(settings.target_err_bps, 250);
     assert_eq!(settings.min_emit_interval, ms(7));
 }
@@ -89,17 +89,17 @@ fn yaml_values_load_when_no_env_overrides() {
 fn env_overrides_yaml_for_scalars() {
     let _env = EnvGuard::lock();
     set_env("GABION_STORAGE_MAX_CELLS", "9999");
-    set_env("GABION_GOSSIP_FANOUT", "12");
+    set_env("GABION_GOSSIP_PEER_CAPACITY", "400");
     set_env("GABION_GOSSIP_TARGET_ERR_BPS", "250");
 
     let cfg = AppConfig::load_with_yaml_str(
-        "storage:\n  max_cells: 256\n  rule_dictionary_capacity: 8\ngossip:\n  fanout: 3\n  \
-         target_err_bps: 100\n",
+        "storage:\n  max_cells: 256\n  rule_dictionary_capacity: 8\ngossip:\n  peer_capacity: \
+         300\n  target_err_bps: 100\n",
     )
     .expect("load yaml + env");
 
     assert_eq!(cfg.settings.max_cells.get(), 9999);
-    assert_eq!(cfg.settings.fanout.get(), 12);
+    assert_eq!(cfg.settings.peer_capacity.get(), 400);
     assert_eq!(cfg.settings.target_err_bps, 250);
     // Untouched YAML value stays.
     assert_eq!(
@@ -113,7 +113,7 @@ fn env_only_with_no_yaml_file() {
     let _env = EnvGuard::lock();
     set_env("GABION_STORAGE_MAX_CELLS", "5555");
     set_env("GABION_ENVOY_BIND", "0.0.0.0:8081");
-    set_env("GABION_RUNTIME_RNG_SEED", "42");
+    set_env("GABION_GOSSIP_SWEEP_CONCURRENCY", "6");
 
     let cfg = AppConfig::load(None).expect("load env-only");
 
@@ -122,7 +122,7 @@ fn env_only_with_no_yaml_file() {
         cfg.settings.envoy_bind,
         Some("0.0.0.0:8081".parse().unwrap())
     );
-    assert_eq!(cfg.settings.rng_seed, Some(42));
+    assert_eq!(cfg.settings.sweep_concurrency.get(), 6);
 }
 
 #[test]
@@ -198,27 +198,23 @@ fn sample(setting: Setting) -> &'static str {
         Setting::StorageMaxCells => "4096",
         Setting::StorageRuleDictionaryCapacity => "8",
         Setting::StorageNodeDictionaryCapacity => "2048",
-        Setting::StorageLocalDirtyCapacity => "128",
-        Setting::StorageForwardedDirtyCapacity => "256",
         Setting::StorageMaxDescriptorCount => "8",
         Setting::StorageMaxDescriptorBytes => "256",
         Setting::StorageMaxKeyBytes => "64",
         Setting::StorageMaxRequestDescriptors => "20",
         Setting::StorageMaxMatchedRules => "20",
         Setting::RuntimeNodeIdSeed => "pod-7",
-        Setting::RuntimeRngSeed => "42",
         Setting::GossipBind => "127.0.0.1:9000",
         Setting::GossipTickInterval => "250ms",
-        Setting::GossipFanout => "5",
         Setting::GossipPeerCapacity => "300",
         Setting::GossipMaxPayloadBytes => "1200",
-        Setting::GossipMaxCellsPerTick => "2048",
         Setting::GossipLimitQueueCapacity => "1024",
         Setting::GossipRecvBufferBytes => "65536",
         Setting::GossipSendBufferBytes => "2097152",
         Setting::GossipClusterIdHash => "0xc0ffee",
         Setting::GossipTargetErrBps => "250",
         Setting::GossipMinEmitInterval => "10ms",
+        Setting::GossipSweepConcurrency => "8",
         Setting::DiscoverySelfAddr => "10.0.0.1:9000",
         Setting::DiscoveryNamespaceAllow => "team-a",
         Setting::DiscoveryServiceAllow => "gabion",
@@ -274,7 +270,10 @@ fn unknown_yaml_key_fails_naming_it() {
         ),
         ("gosip:\n  bind: 0.0.0.0:9000\n".to_owned(), "gosip.bind"),
         ("gosip:\n".to_owned(), "gosip"),
-        ("gossip:\n  fanoutt:\n".to_owned(), "gossip.fanoutt"),
+        (
+            "gossip:\n  peer_capacty:\n".to_owned(),
+            "gossip.peer_capacty",
+        ),
         (
             format!("{rule}    descriptors: [{{ key: ip }}]\n    ratee: 5r/s\n"),
             "limits[0].ratee",
@@ -314,7 +313,10 @@ fn yaml_value_shapes_load_or_fail_typed() {
         "gossip:\n  cluster_id_hash: 18446744073709551615\n",
         Setting::GossipClusterIdHash,
     );
-    wrong_shape("gossip:\n  fanout: [1]\n", Setting::GossipFanout);
+    wrong_shape(
+        "gossip:\n  peer_capacity: [1]\n",
+        Setting::GossipPeerCapacity,
+    );
     let quoted = loaded("gossip:\n  cluster_id_hash: \"18446744073709551615\"\n").expect("quoted");
     assert_eq!(quoted.cluster_id_hash.get(), u128::from(u64::MAX));
     let bind = loaded("gossip:\n  bind:\n").expect("null bind");

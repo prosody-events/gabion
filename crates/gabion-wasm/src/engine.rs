@@ -20,6 +20,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor, ValidStorageConfig};
@@ -34,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
-use crate::clock::{ManualClock, SharedNow};
+use crate::clock::{ManualClock, SharedNow, Tickers};
 use crate::config::{MAX_NODES, SimConfig, ValidSimConfig};
 use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView};
 use crate::shims::{AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport};
@@ -44,17 +45,13 @@ const BASE_PORT: u16 = 40_000;
 /// Cluster id mixed into every packet header (matches the bench).
 pub(crate) const CLUSTER_ID_HASH: u128 = 0xC1;
 
-/// Caps one round's frame at 160 cells, about eight 1,400-byte packets, so
-/// one round's packets to a node stay well inside [`VIZ_ROUTER_CAPACITY`]; a
-/// larger burst flushes over a few rounds while the dirty rings keep the rest.
-pub(crate) const VIZ_MAX_CELLS_PER_TICK: usize = 160;
-
 /// Each node's inbound queue, sized for the densest round the visualizer can
 /// build: every node in one zone, each of the other `MAX_NODES − 1` nodes
-/// handing a node one packet on each of its two streams (own and relay), 510
-/// at 256 nodes. Today about nine senders pick a node each round, each sending
-/// up to eight packets. A stepped round that would overflow a node's queue
-/// drops the excess, which the logging transport reports as dropped.
+/// handing a node two packets a heartbeat (its own stream, two packets when a
+/// burst passes one packet's cells; one each on the own and relay streams
+/// once relays exist), 510 at 256 nodes. A stepped round that would overflow
+/// a node's queue drops the excess, which the logging transport reports as
+/// dropped.
 pub(crate) const VIZ_ROUTER_CAPACITY: usize = 2 * (MAX_NODES - 1);
 
 /// Per-(src, dst) link policy in a serde-friendly shape. Maps onto the
@@ -224,9 +221,9 @@ struct NodeHandle {
     client: GossipClient,
     aggregate: Rc<EventEmittingAggregateStore>,
     admin_tx: mpsc::Sender<AdminCommand>,
-    /// Fires one gossip tick on this node (its `ManualClock`'s ticker drains
-    /// the matching receiver).
-    tick_tx: mpsc::Sender<()>,
+    /// Fires this node's heartbeat and prompt tickers, and shows whether the
+    /// prompt ticker is armed.
+    tickers: Tickers,
     /// The discovery stream this node's runtime watches. The engine pushes
     /// `PeerEvent::Added`/`Removed` here as other nodes join and leave, so
     /// membership is dynamic rather than the static `stream::empty()` the bench
@@ -240,7 +237,7 @@ struct NodeHandle {
 /// wrapper — the task owns it outright).
 struct EngineState {
     config: SimConfig,
-    /// Every node's gossip config, before its bootstrap peers and seed.
+    /// Every node's gossip config, before its bootstrap peers.
     gossip: ValidGossipConfig,
     /// Every node's storage, sized by [`SimConfig::settings`].
     storage: ValidStorageConfig,
@@ -267,6 +264,8 @@ struct EngineState {
     now: SharedNow,
     /// Virtual time elapsed since the session began, in milliseconds.
     virtual_ms: u64,
+    /// Sub-steps `step` has taken: one per heartbeat in a quiet cluster.
+    substeps: u64,
 }
 
 impl EngineState {
@@ -300,6 +299,7 @@ impl EngineState {
             log,
             now,
             virtual_ms: 0,
+            substeps: 0,
         };
 
         // The initial members are ids 0..N, so the address of id `i` is
@@ -355,11 +355,11 @@ impl EngineState {
 
         let mut gossip_cfg = self.gossip.clone();
         gossip_cfg.bootstrap_peers = bootstrap_peers;
-        gossip_cfg.rng_seed = self.config.rng_seed.wrapping_add(id as u64);
 
         let aggregate = Rc::new(EventEmittingAggregateStore::new(id, self.log.clone()));
         let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
-        let (clock, tick_tx) = ManualClock::new(self.now.clone());
+        let heartbeat = Duration::from_millis(self.config.tick_interval_ms);
+        let (clock, tickers) = ManualClock::new(self.now.clone(), heartbeat);
         let (runtime, client) = GossipRuntime::from_parts_with_admin(
             transport,
             clock,
@@ -383,7 +383,7 @@ impl EngineState {
             client,
             aggregate,
             admin_tx,
-            tick_tx,
+            tickers,
             peer_tx,
             join,
             identity,
@@ -548,36 +548,43 @@ impl EngineState {
 
     async fn step(&mut self, delta_ms: u64) -> EventBatch {
         let tick_ms = self.config.tick_interval_ms;
+        let floor_ms = self.config.min_emit_interval_ms;
         let target = self.virtual_ms.saturating_add(delta_ms);
         let mut events = Vec::new();
         let mut prev = self.admin_counters().await;
 
-        // Advance one whole gossip tick at a time. Each boundary moves the
-        // bucket clock and fires exactly one tick on every runtime — the manual
-        // analogue of a single `tokio::time::advance` firing every node's
-        // interval — then drains so the tick and any gossip it triggers fully
-        // propagate before the next.
+        // Advance event by event: to the next heartbeat, or one relay floor
+        // when any node's prompt ticker is armed (it has resends, gap
+        // reports, probe answers or sweeps waiting), whichever is sooner. At
+        // each sub-step the bucket clock moves, the heartbeat fires on every
+        // node if it is due, and the prompt ticker fires on every node armed
+        // before the step, so a relay leaves one floor after it is owed, as in
+        // production, and a quiet cluster costs one sub-step per heartbeat.
         //
-        // Delivery is deferred across the round: a sim send buffers its packet
-        // (the source flushes its outbound queue within its own poll, so no
-        // engine-side drain order can otherwise separate "every node has
-        // gossiped" from "packets delivered"). The first drain lets every node
-        // consume its tick and buffer its sends with nothing yet delivered;
-        // `release_deferred` then delivers this round's packets; the second
-        // drain lets receivers merge them. Their ticks are already consumed, so
-        // a freshly-merged count cannot re-gossip in the same step — one step
-        // is one epidemic round, capped at `fanout` new peers. This is the
-        // physically correct model and keeps `submit`/churn paths (which never
-        // arm deferral) unchanged.
+        // Delivery is deferred across the sub-step: a sim send buffers its
+        // packet, the first drain lets every fired node run its round with
+        // nothing yet delivered, `release_deferred` delivers the sub-step's
+        // packets and the second drain lets receivers merge them. Their
+        // ticks are already consumed, so a freshly merged count goes out no
+        // earlier than the next sub-step. `submit` and churn paths never arm
+        // deferral.
         loop {
-            let next_tick = (self.virtual_ms / tick_ms + 1).saturating_mul(tick_ms);
-            if next_tick > target {
+            let t = self.virtual_ms;
+            let heartbeat = (t / tick_ms + 1).saturating_mul(tick_ms);
+            let armed: Vec<bool> = self.nodes.iter().map(|n| n.tickers.armed.get()).collect();
+            let next = if armed.contains(&true) {
+                heartbeat.min(t + floor_ms)
+            } else {
+                heartbeat
+            };
+            if next > target {
                 break;
             }
-            self.virtual_ms = next_tick;
-            self.now.set(next_tick);
+            self.virtual_ms = next;
+            self.now.set(next);
+            self.substeps += 1;
             self.router.begin_deferred();
-            self.fire_tick().await;
+            self.fire(next, next == heartbeat, &armed).await;
             self.drain_pending().await;
             self.router.release_deferred();
             self.drain_pending().await;
@@ -587,8 +594,9 @@ impl EngineState {
             prev = now;
         }
 
-        // A sub-tick remainder moves the clock without firing a heartbeat, so
-        // `virtual_ms` and the bucket clock still reach exactly `target`.
+        // A remainder short of the next event moves the clock without firing
+        // anything, so `virtual_ms` and the bucket clock still reach exactly
+        // `target`.
         if self.virtual_ms < target {
             self.virtual_ms = target;
             self.now.set(target);
@@ -602,13 +610,19 @@ impl EngineState {
         }
     }
 
-    /// Fire one gossip tick on every runtime, in node order. Each send queues
-    /// in that node's bounded tick channel, so a busy runtime still consumes
-    /// the tick on its next idle poll rather than dropping it. A closed channel
-    /// (the runtime stopped) is ignored — the tick simply has nowhere to land.
-    async fn fire_tick(&self) {
-        for node in &self.nodes {
-            let _ = node.tick_tx.send(()).await;
+    /// Fire, in node order, every heartbeat when `heartbeat` is set and the
+    /// prompt ticker of every node `armed` marks, each for the instant `at`.
+    /// Each send queues in that node's bounded inbox, so a busy runtime still
+    /// consumes the tick on its next idle poll rather than dropping it. A
+    /// closed inbox (the runtime stopped) is ignored.
+    async fn fire(&self, at: u64, heartbeat: bool, armed: &[bool]) {
+        for (node, &armed) in self.nodes.iter().zip(armed) {
+            if heartbeat {
+                let _ = node.tickers.heartbeat.send(at).await;
+            }
+            if armed {
+                let _ = node.tickers.prompt.send(at).await;
+            }
         }
     }
 
@@ -637,22 +651,24 @@ impl EngineState {
         }
     }
 
-    /// Pull `(ticks_total, threshold_fires)` from every runtime via its admin
-    /// channel. One `oneshot` round-trip per node, done sequentially.
+    /// Pull `(rounds_heartbeat, rounds_threshold)` from every runtime via its
+    /// admin channel. One `oneshot` round-trip per node, done sequentially.
     async fn admin_counters(&self) -> Vec<(u64, u64)> {
         let mut out = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             match admin_snapshot(&node.admin_tx).await {
-                Some(snap) => out.push((snap.ticks_total, snap.threshold_fires)),
+                Some(snap) => out.push((
+                    snap.counters.rounds_heartbeat,
+                    snap.counters.rounds_threshold,
+                )),
                 None => out.push((0, 0)),
             }
         }
         out
     }
 
-    /// Emit one `Tick`/`ThresholdFire` event per tick each node fired this
-    /// sub-step. `threshold_fires` is a subset of `ticks_total`, so the
-    /// difference of the two is the heartbeat count.
+    /// Emit one `Tick` per heartbeat round and one `ThresholdFire` per
+    /// threshold round each node ran this sub-step.
     fn push_tick_events(&self, prev: &[(u64, u64)], now: &[(u64, u64)], events: &mut Vec<Event>) {
         let tick = self.current_tick();
         let virtual_ms = self.virtual_ms;
@@ -661,9 +677,8 @@ impl EngineState {
         // that node's stable id for the emitted event.
         for (index, (before, after)) in prev.iter().zip(now.iter()).enumerate() {
             let node = self.nodes[index].id;
-            let total_delta = after.0.saturating_sub(before.0);
+            let heartbeat_delta = after.0.saturating_sub(before.0);
             let threshold_delta = after.1.saturating_sub(before.1);
-            let heartbeat_delta = total_delta.saturating_sub(threshold_delta);
             for _ in 0..heartbeat_delta {
                 events.push(Event {
                     tick,
@@ -704,14 +719,9 @@ impl EngineState {
                 node_id: handle.identity.node_id.0,
                 incarnation: handle.identity.incarnation,
                 aggregate_total: handle.aggregate.total(),
-                ticks_total: snap.as_ref().map_or(0, |s| s.ticks_total),
-                threshold_fires: snap.as_ref().map_or(0, |s| s.threshold_fires),
-                dirty_ticks: snap.as_ref().map_or(0, |s| s.dirty_ticks),
-                effective_fanout: snap.as_ref().map_or(0, |s| s.last_effective_fanout as u32),
-                peak_fanout: snap.as_ref().map_or(0, |s| s.peak_effective_fanout as u32),
+                rounds_heartbeat: snap.as_ref().map_or(0, |s| s.counters.rounds_heartbeat),
+                rounds_threshold: snap.as_ref().map_or(0, |s| s.counters.rounds_threshold),
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
-                local_dirty_len: snap.as_ref().map_or(0, |s| s.local_dirty_len),
-                forwarded_dirty_len: snap.as_ref().map_or(0, |s| s.forwarded_dirty_len),
                 decode_reject_count: snap.as_ref().map_or(0, |s| s.counters.decode_rejects()),
                 store_stats: snap
                     .as_ref()

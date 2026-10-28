@@ -3,7 +3,7 @@
 const wasm = require("./pkg/gabion_wasm.js");
 
 async function main() {
-  const config = { nodes: 3, rng_seed: 7, tick_interval_ms: 100 };
+  const config = { nodes: 3, tick_interval_ms: 100 };
   console.log("constructing Sim...");
   const sim = new wasm.Sim(config);
   console.log("Sim constructed");

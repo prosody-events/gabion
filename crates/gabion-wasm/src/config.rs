@@ -14,15 +14,15 @@ use gabion::rules::{EnforcementMode, RuleDef, RuleError, RuleTable};
 use gabion::settings::{Setting, SettingError, Settings};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{CLUSTER_ID_HASH, VIZ_MAX_CELLS_PER_TICK};
+use crate::engine::CLUSTER_ID_HASH;
 
 /// Largest cluster the visualizer constructs. Bounded so a stray config from
 /// the URL or a fuzzed control can't ask the engine to build an unbounded
 /// number of runtimes; every node's peer table is sized to it.
 pub const MAX_NODES: usize = 256;
 
-/// Deterministic given `(rng_seed, SimConfig, command-script)` — the same
-/// triple the shareable URL encodes. Every field has a production-aligned
+/// Deterministic given `(SimConfig, command-script)` — the pair the
+/// shareable URL encodes. Every field has a production-aligned
 /// default drawn from [`gabion::defaults`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -30,10 +30,6 @@ pub struct SimConfig {
     /// Number of cluster members. Must be in `1..=MAX_NODES`;
     /// [`SimConfig::validate`] rejects anything else.
     pub nodes: usize,
-    /// Floor on peers contacted per gossip tick; the runtime scales the
-    /// actual fanout to the `⌈ln(n)+c⌉` coverage threshold (`n` = peer count).
-    /// See `gossip.fanout` in [`gabion::settings`].
-    pub fanout: usize,
     /// Period between proactive gossip ticks, in milliseconds.
     pub tick_interval_ms: u64,
     /// Per-rule threshold-anti-entropy error budget, in basis points.
@@ -46,9 +42,6 @@ pub struct SimConfig {
     pub rule_window_ms: u32,
     /// Bucket width within the window, in milliseconds.
     pub rule_bucket_ms: u32,
-    /// Seed for every node's peer-sampling RNG (each node offsets it by its
-    /// index, matching the bench).
-    pub rng_seed: u64,
     /// i.i.d. per-link packet drop probability applied to every directed
     /// link at startup. `0.0` is a lossless network.
     pub uniform_loss: f64,
@@ -58,7 +51,6 @@ impl Default for SimConfig {
     fn default() -> Self {
         Self {
             nodes: 12,
-            fanout: defaults::GOSSIP_FANOUT,
             tick_interval_ms: defaults::GOSSIP_TICK_INTERVAL_MILLIS,
             target_err_bps: defaults::GOSSIP_TARGET_ERR_BPS,
             min_emit_interval_ms: defaults::GOSSIP_MIN_EMIT_INTERVAL_MS,
@@ -71,7 +63,6 @@ impl Default for SimConfig {
             rule_limit: 1_000,
             rule_window_ms: 10_000,
             rule_bucket_ms: 1_000,
-            rng_seed: 0,
             uniform_loss: 0.0,
         }
     }
@@ -170,7 +161,7 @@ impl SimConfig {
     /// cross-node replica set — `MAX_NODES × live_buckets` cells — a few
     /// thousand entries, not the hundreds of thousands a real deployment
     /// sizes for. A small constant `SLACK` keeps the largest cluster clear of
-    /// eviction; if a probe ever overflows a ring, raise `SLACK` here — the
+    /// eviction; if a probe ever fills the store, raise `SLACK` here — the
     /// one place — not a scattered floor.
     pub fn settings(&self) -> Result<Settings, ConfigError> {
         // Headroom over the exact working set, absorbing churn and the bucket
@@ -181,8 +172,7 @@ impl SimConfig {
         let ceiling = MAX_NODES as u32;
         // Each origin contributes its `live_buckets` cells plus the one
         // emerging. A node holds a replica of every origin's set, so the cell
-        // store and forwarded-dirty ring both scale with `ceiling ×
-        // per_origin`.
+        // store scales with `ceiling × per_origin`.
         let live_buckets = RuleDescriptor {
             window_millis: self.rule_window_ms,
             bucket_millis: self.rule_bucket_ms,
@@ -196,7 +186,6 @@ impl SimConfig {
             .max(SLACK);
         let mut settings = Settings::default();
         for (setting, value) in [
-            (Setting::GossipFanout, self.fanout.to_string()),
             (
                 Setting::GossipTickInterval,
                 format!("{}ms", self.tick_interval_ms),
@@ -207,25 +196,11 @@ impl SimConfig {
                 format!("{}ms", self.min_emit_interval_ms),
             ),
             (Setting::GossipClusterIdHash, CLUSTER_ID_HASH.to_string()),
-            (
-                Setting::GossipMaxCellsPerTick,
-                VIZ_MAX_CELLS_PER_TICK.min(cross_node as usize).to_string(),
-            ),
             (Setting::StorageMaxCells, cross_node.to_string()),
             // One watched rule; headroom for an interned default / wire-only
             // rule.
             (Setting::StorageRuleDictionaryCapacity, "4".to_owned()),
             (Setting::GossipPeerCapacity, ceiling.to_string()),
-            // Local-origin dirty cells are this node's *own* live buckets —
-            // independent of cluster size, so this stays small at any ceiling.
-            (
-                Setting::StorageLocalDirtyCapacity,
-                (per_origin * SLACK).to_string(),
-            ),
-            (
-                Setting::StorageForwardedDirtyCapacity,
-                cross_node.to_string(),
-            ),
         ] {
             settings.apply(setting, &value)?;
         }

@@ -20,12 +20,10 @@ const WATCHED_KEY: u128 = 0x1;
 fn test_config(nodes: usize) -> SimConfig {
     SimConfig {
         nodes,
-        fanout: 3,
         tick_interval_ms: 100,
         rule_window_ms: 60_000,
         rule_bucket_ms: 1_000,
         rule_limit: 1_000_000,
-        rng_seed: 42,
         uniform_loss: 0.0,
         ..SimConfig::default()
     }
@@ -112,7 +110,7 @@ fn node_ids(state: &ClusterState) -> Vec<u32> {
 }
 
 /// Phase 0.5: a spawned engine survives many `step` commands, with the gossip
-/// tick index and per-node `ticks_total` accumulating monotonically.
+/// tick index and per-node `rounds_heartbeat` accumulating monotonically.
 #[test]
 fn engine_accumulates_ticks_across_many_steps() {
     with_engine(test_config(2), |tx| async move {
@@ -128,7 +126,7 @@ fn engine_accumulates_ticks_across_many_steps() {
         assert_eq!(state.nodes.len(), 2);
         assert_eq!(state.virtual_ms, 2_500);
         assert!(
-            state.nodes.iter().all(|n| n.ticks_total > 0),
+            state.nodes.iter().all(|n| n.rounds_heartbeat > 0),
             "every runtime should have fired heartbeat ticks"
         );
     });
@@ -202,50 +200,26 @@ fn submit_creates_and_gossips_a_cell() {
     });
 }
 
-/// The adaptive-decision outputs reach the snapshot. The runtime sizes its
-/// per-tick fanout by the coverage threshold `⌈ln(peers) + c⌉` — driven by
-/// cluster size, not the dirty set — so a node in a 12-member cluster (11
-/// peers) fans out above the configured floor of 2, and the effective/peak
-/// fanout and the error budget all surface on the node: the metrics whose
-/// absence made the adaptation invisible in the inspector.
+/// The error budget the most recent request computed reaches the snapshot,
+/// so the inspector shows the threshold a burst must cross.
 #[test]
-fn coverage_fanout_and_budget_surface_in_snapshot() {
+fn error_budget_surfaces_in_snapshot() {
     let config = SimConfig {
-        fanout: 2,
         rule_limit: 1_000,
         target_err_bps: 100,
         ..test_config(12)
     };
-    // 12 members → 11 peers per node → coverage `⌈ln(11) + c⌉`, well above
-    // the configured floor of 2. The dirty set does not move it.
-    let expected = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
     with_engine(config, |tx| async move {
-        // A 16-key burst makes the dirty set large; the coverage fanout
-        // ignores it — the burst rides one fat frame, not a wider peer pick.
         for key in 0..16u128 {
             submit(&tx, 0, key, 7).await;
         }
-        for _ in 0..3 {
-            step(&tx, 100).await;
-        }
+        step(&tx, 300).await;
         let origin = snapshot(&tx)
             .await
             .nodes
             .into_iter()
             .find(|n| n.id == 0)
             .expect("node 0 present");
-        assert_eq!(
-            origin.effective_fanout, expected,
-            "a 12-member cluster fans out to the coverage threshold ⌈ln(11)+c⌉={expected}, \
-             independent of the dirty set; got {}",
-            origin.effective_fanout,
-        );
-        assert!(
-            origin.peak_fanout >= origin.effective_fanout,
-            "peak fanout must be a high-water mark; peak {} < last {}",
-            origin.peak_fanout,
-            origin.effective_fanout,
-        );
         assert!(
             origin.error_budget > 0,
             "the error budget must be recorded once a request is seen",
@@ -349,10 +323,10 @@ fn partition_blocks_then_heal_converges() {
     });
 }
 
-/// Determinism: the same `(seed, config, command-script)` produces an
-/// identical event log — the invariant the shareable-URL replay relies on.
+/// Determinism: the same `(config, command-script)` produces an identical
+/// event log — the invariant the shareable-URL replay relies on.
 #[test]
-fn same_seed_and_script_produce_identical_events() {
+fn same_script_produces_identical_events() {
     fn run() -> Vec<EventBatch> {
         let mut batches = Vec::new();
         // N=16 so the determinism check exercises ticks arriving *while*
@@ -384,9 +358,10 @@ fn same_seed_and_script_produce_identical_events() {
 }
 
 /// At a larger cluster the per-node tick channel must deliver *every* fired
-/// tick — no coalescing — so each runtime's `ticks_total` equals the number of
-/// whole ticks stepped, identically across nodes and across runs. (A `watch`
-/// tick source failed exactly here: a busy runtime silently dropped ticks.)
+/// tick — no coalescing — so each runtime's `rounds_heartbeat` equals the
+/// number of whole ticks stepped, identically across nodes and across runs. (A
+/// `watch` tick source failed exactly here: a busy runtime silently dropped
+/// ticks.)
 #[test]
 fn many_nodes_receive_every_tick_deterministically() {
     fn run() -> Vec<u64> {
@@ -395,10 +370,11 @@ fn many_nodes_receive_every_tick_deterministically() {
             let totals = &mut totals;
             async move {
                 // 1000 ms at 100 ms/tick = 10 whole ticks, and no requests (so
-                // no threshold fires): every node's ticks_total must be 10.
+                // no threshold rounds): every node's rounds_heartbeat must be
+                // 10.
                 step(&tx, 1_000).await;
                 let state = snapshot(&tx).await;
-                *totals = state.nodes.iter().map(|n| n.ticks_total).collect();
+                *totals = state.nodes.iter().map(|n| n.rounds_heartbeat).collect();
             }
         });
         totals
@@ -550,75 +526,95 @@ fn churn_script_is_deterministic() {
     );
 }
 
-/// A single `step` is a single gossip round: a brand-new count must not reach
-/// more than `fanout` other nodes in one step. Before the delivery-barrier fix
-/// the step driver interleaved tick-consumption with packet delivery, so a peer
-/// that received the burst could re-gossip it within the *same* step — a
-/// hop-by-hop cascade that lit up far more than `fanout + 1` nodes per click.
-///
-/// `nodes = 12`, `fanout = 6`: 11 peers ⇒ coverage `⌈ln(11) + c⌉ = 6`, so the
-/// effective fanout is 6 and at most `6 + 1 = 7` nodes may know after one step.
-/// `hits` stays well under the eager-flush budget
+/// One heartbeat sends a new count straight to every peer, and the submit
+/// alone sends nothing. `hits` stays well under the eager-flush budget
 /// (`epsilon = rule_limit × bps / (10_000 × peers) = 1_000_000 / 1_100 ≈ 909`)
-/// so the submit itself does not gossip — the baseline below proves it.
+/// so no threshold round runs.
 #[test]
-fn one_step_propagates_a_new_count_to_at_most_fanout_peers() {
-    let config = SimConfig {
-        fanout: 6,
-        rule_limit: 1_000_000,
-        ..test_config(12)
-    };
-    let effective_fanout = (11.0_f64.ln() + gabion::defaults::GOSSIP_COVERAGE_MARGIN).ceil() as u32;
-    assert_eq!(effective_fanout, 6, "11 peers ⇒ coverage ⌈ln(11)+3⌉ = 6");
-
+fn one_heartbeat_reaches_every_peer_directly() {
     // A node "knows" the count if it holds the cell (a nonzero aggregate, since
     // the single key is the only traffic).
     fn known(state: &ClusterState) -> usize {
         state.nodes.iter().filter(|n| n.aggregate_total > 0).count()
     }
 
-    with_engine(config, |tx| async move {
+    with_engine(test_config(12), |tx| async move {
         submit(&tx, 0, WATCHED_KEY, 5).await;
-        let baseline = snapshot(&tx).await;
         assert_eq!(
-            known(&baseline),
+            known(&snapshot(&tx).await),
             1,
-            "submit alone must not gossip; only the origin knows (if this is 7 the eager-flush \
-             threshold assumption broke — tune hits/rule_limit)"
+            "the submit alone gossips nothing"
         );
-
-        // One gossip round (one tick at the configured 100 ms interval). The
-        // origin fans out to `effective_fanout` peers and nobody re-forwards
-        // within the same step.
         step(&tx, 100).await;
-        let after_one = snapshot(&tx).await;
-        assert!(
-            known(&after_one) <= effective_fanout as usize + 1,
-            "one step is one round: at most fanout+1 = {} nodes may know, got {}",
-            effective_fanout + 1,
-            known(&after_one),
-        );
-        assert!(
-            known(&after_one) > 1,
-            "one step must still propagate to at least one peer"
-        );
+        assert_eq!(known(&snapshot(&tx).await), 12);
+    });
+}
 
-        // Further steps must eventually inform every node — the fix one-hops
-        // propagation, it does not freeze it.
-        for _ in 0..20 {
-            step(&tx, 100).await;
-        }
-        let converged = snapshot(&tx).await;
-        assert_eq!(
-            known(&converged),
-            12,
-            "enough rounds inform all 12 nodes: {:?}",
-            converged
-                .nodes
-                .iter()
-                .map(|n| (n.id, n.aggregate_total))
-                .collect::<Vec<_>>(),
+/// Run `body` on an engine state built from `config` on a paused runtime, so
+/// a test reads the state's own fields.
+fn with_state<F, Fut>(config: SimConfig, body: F)
+where
+    F: FnOnce(super::EngineState) -> Fut,
+    Fut: Future<Output = super::EngineState>,
+{
+    let rt = Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("build paused current-thread runtime");
+    LocalSet::new().block_on(&rt, async move {
+        let state = super::EngineState::build(config.validate().expect("config validates"));
+        let mut state = body(state).await;
+        state.shutdown().await;
+    });
+}
+
+/// A quiet cluster costs one sub-step per heartbeat: once the acks and join
+/// sweeps a count set off are done, no prompt ticker stays armed.
+#[test]
+fn quiet_cluster_takes_one_substep_per_heartbeat() {
+    with_state(test_config(12), |mut state| async move {
+        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        state.step(500).await;
+        assert!(
+            state.substeps > 5,
+            "the count armed prompt rounds: {}",
+            state.substeps
         );
+        state.substeps = 0;
+        state.step(1_000).await;
+        assert_eq!(state.substeps, 10);
+        state
+    });
+}
+
+/// A full heartbeat at `MAX_NODES`, every node sending every peer two own
+/// packets (34 cells at 33 a packet), fits every node's inbound queue: no
+/// packet is dropped.
+#[test]
+fn full_round_at_max_nodes_drops_nothing_under_pass() {
+    let config = SimConfig {
+        rule_limit: 1_000_000_000_000,
+        ..test_config(MAX_NODES)
+    };
+    with_state(config, |mut state| async move {
+        let ids: Vec<u32> = state.nodes.iter().map(|n| n.id).collect();
+        for &node in &ids {
+            for key in 0..34 {
+                state
+                    .submit_request(node, u128::from(node) << 8 | key, 1)
+                    .await
+                    .unwrap();
+            }
+        }
+        let batch = state.step(100).await;
+        let dropped = batch
+            .events
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::PacketDropped { .. }))
+            .count();
+        assert_eq!(dropped, 0);
+        state
     });
 }
 
@@ -679,10 +675,6 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
         .storage
         .node_dictionary_capacity();
     assert_eq!(small.max_cells, full.max_cells);
-    assert_eq!(
-        small.forwarded_dirty_capacity,
-        full.forwarded_dirty_capacity
-    );
     assert_eq!(small.peer_capacity, full.peer_capacity);
 
     // Each origin holds its live buckets plus the one emerging, and every node
@@ -693,32 +685,15 @@ fn settings_are_ceiling_sized_and_hold_the_working_set() {
         "max_cells {} under the cross-node working set",
         full.max_cells,
     );
-    // The forwarded-dirty ring carries replicas of every *other* origin's live
-    // buckets — the cap the design analysis pins.
-    assert!(
-        full.forwarded_dirty_capacity.get() as usize >= (MAX_NODES - 1) * live_buckets,
-        "forwarded_dirty_capacity {} under the replica working set",
-        full.forwarded_dirty_capacity,
-    );
     // The node dictionary must intern every origin.
     assert!(
         usize::from(node_dictionary_capacity.get()) >= MAX_NODES,
         "node_dictionary_capacity {node_dictionary_capacity} cannot hold {MAX_NODES} origins",
     );
 
-    // …and the shrink is real: even at the ceiling every cap is a few thousand
-    // entries, well under the production defaults
-    // (`gabion::defaults::STORAGE_*`) — `STORAGE_FORWARDED_DIRTY_CAPACITY`
-    // alone is 524 288.
-    assert!(
-        (full.forwarded_dirty_capacity.get() as usize)
-            < gabion::defaults::STORAGE_FORWARDED_DIRTY_CAPACITY / 50
-    );
+    // …and the shrink is real: even at the ceiling the store is a few
+    // thousand cells, well under the production default.
     assert!((full.max_cells.get() as usize) < gabion::defaults::STORAGE_MAX_CELLS / 20);
-    assert!(
-        (full.local_dirty_capacity.get() as usize)
-            < gabion::defaults::STORAGE_LOCAL_DIRTY_CAPACITY / 1_000
-    );
 }
 
 /// The live runtime honors the shrunk, derived sizing: a cluster the size of

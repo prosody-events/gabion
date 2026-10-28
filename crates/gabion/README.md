@@ -20,9 +20,8 @@ the [repo root README](../../README.md#glossary).
 - [How gossip works](#how-gossip-works)
   - [The wire frame](#the-wire-frame)
   - [The anti-entropy loop](#the-anti-entropy-loop)
-  - [Coverage fanout](#coverage-fanout)
+  - [Streams, acks and join sweeps](#streams-acks-and-join-sweeps)
   - [Adaptive emit rate](#adaptive-emit-rate)
-  - [Dirty rings](#dirty-rings)
 - [Writing the same rule for NGINX and gabiond](#writing-the-same-rule-for-nginx-and-gabiond)
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
@@ -36,15 +35,16 @@ a DAG, so no module imports from a module that imports it.
 
 | Module       | Path                          | What it owns                                                                                                                              |
 |--------------|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
-| `crdt`       | `src/crdt/*`                  | The per-origin counter store. Robin Hood hash index, structure-of-arrays columns, bounded dirty rings. Allocates only at construction. See [`CRDT.md`](CRDT.md). |
+| `crdt`       | `src/crdt/*`                  | The per-origin counter store. Robin Hood hash index, structure-of-arrays columns, the ordered own-stream list. Allocates only at construction. See [`CRDT.md`](CRDT.md). |
 | `rules`      | `src/rules/*`                 | `RuleDef::build` and `RuleTable::new`, the one way both adapters build rules; `Descriptor`, fingerprint and key hashing. Two nodes with the same rules produce identical `rule_fingerprint` values and key hashes, whatever order they list them in, which is what makes the CRDT addressable across the cluster. |
 | `aggregate`  | `src/aggregate.rs`            | The cluster-aggregate table both adapters read on admission: seqlocked slots, linear probing within 128 slots of home, backward-shift removal. NGINX lays it over shared memory; `gabiond` owns one as `Aggregate`, sized from `storage.max_cells`. |
 | `gossip`     | `src/gossip/*`                | `GossipRuntime`, `GossipClient`, `GossipTransport`, `Clock`, the `sim::SimTransport` used in tests, the pre-sized peer table, and the `AdminCommand` / `AdminSnapshot` observability surface. |
 | `wire`       | `src/wire/*`                  | The on-the-wire codec. One UDP packet = header + rule dictionary + node dictionary + cell rows. Each packet decodes independently. |
 | `discovery`  | `src/discovery/*`             | `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation. Adapters consume `PeerEvent` streams; the gossip runtime treats peer add/remove as a normal `select!` arm. |
-| `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, fanout floor, payload caps, the per-rule error budget, and the min-emit floor. |
+| `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, payload caps, the per-rule error budget, the min-emit floor, and the stream and sweep constants (gap reports, sweep sources, the backlog that sizes the per-round quantum). |
 | `settings`   | `src/settings.rs`             | Every operator setting named once: `gabiond` YAML key, environment variable and NGINX directive. Messages interpolate from it so each names both adapters' spellings. |
 | `throttle`   | `src/throttle.rs`             | The one power-of-two log throttle every repeating warning counts through. |
+| `identity`   | `src/identity.rs`             | This host's stable node id, and an incarnation that differs on every start (wall-clock milliseconds, stepped past the previous one). Behind `transport-udp`. |
 
 `gossip` sits at the top of that graph and depends on every other
 module, whereas `wire` and `crdt` are independent of each other.
@@ -60,16 +60,16 @@ Gossip is the protocol that turns N independent counter stores into one
 against its local view of the cluster aggregate, and gossip is what
 keeps that view fresh. From the adapter's side it shows up as a single
 call: admission writes a row through `GossipClient::record`, and a
-later runtime tick turns those rows into outbound frames.
+later runtime round turns those rows into outbound frames.
 
-The protocol has two adaptive aspects, and they are the reason gabion
-holds up under load that a textbook anti-entropy loop would not:
+The protocol has two parts, and they are the reason gabion holds up under
+load that a textbook anti-entropy loop would not:
 
-1. **Coverage fanout** — the per-tick peer count is sized to the
-   *coverage threshold* `⌈ln(n)+c⌉` (`n` = peer count), the fanout that
-   provably reaches every node. It scales with cluster size, not the
-   dirty set: a burst rides one fat frame instead of widening the pick.
-   `fanout` is the floor; small clusters go full-mesh.
+1. **Acknowledged streams** — each node sends the cells it originated
+   straight to every peer, as a per-peer stream the peer acknowledges
+   cumulatively. A gap report or a heartbeat without an ack brings a
+   resend, so a lost packet costs one round, not a lifetime. A node that
+   starts asks two peers for a *join sweep* of every live cell.
 2. **Adaptive emit rate** — the gossip cadence adapts to per-rule
    pressure. Heartbeats fire every `tick_interval` unconditionally, but
    the runtime also fires a synthetic *threshold* tick between
@@ -79,15 +79,13 @@ holds up under load that a textbook anti-entropy loop would not:
    matter the request rate. A floor `min_emit_interval` caps the worst
    case so an adversarial workload cannot pin the gossip socket.
 
-The rest of this section walks through each in turn, then closes with
-the dirty rings — the data structures that decide which cells go out.
+The rest of this section walks through each in turn.
 
 ### The wire frame
 
-Every gossip frame is one self-describing UDP packet, with no session
-state on either side: each frame decodes independently, even if its
-predecessor was dropped. Loss of a packet costs you a few cells until
-the next tick refills them.
+Every gossip packet is self-describing: each decodes independently, even
+if its predecessor was dropped. Loss of a packet costs you a few cells until a
+gap report or the retransmission timeout resends them.
 
 The header is fixed at 86 bytes, version 2. Every multi-byte field is
 encoded little-endian; the first four bytes on the wire are `0x32 0x47
@@ -125,9 +123,10 @@ byte  field                  width
 | `SweepRequest` | 4 | header only |
 
 The decoder turns kind, flags and range into one typed payload and
-drops any combination the format forbids. Every packet this release
-sends is a `Sweep`, and every data kind it receives merges the same way;
-the acks, the zone and the range are written as zero.
+drops any combination the format forbids. A node sends its own stream as
+`Own` packets that tile the frame's range, acks and gap reports alone as
+`Ack`, and join sweeps as `SweepRequest` and `Sweep`; every data kind it
+receives merges the same way. The zone is written as zero.
 
 The body follows immediately. When `cell_count > 0` it carries a
 *per-frame* rule dictionary, a per-frame node dictionary, and the cell
@@ -174,11 +173,15 @@ is independently decodable.
 ### The anti-entropy loop
 
 The runtime (`GossipRuntime`, in `src/gossip/runtime.rs`) is a
-single-threaded event loop driven by one `tokio::select!` with five
-arms: limit requests from the adapter, inbound packets, peer membership
-churn, admin commands, and the heartbeat tick. A round hands each packet
-to the socket as it is encoded; a packet the kernel refuses is held and
-retried first on the next round (see [Socket buffers](#socket-buffers)).
+single-threaded event loop driven by one `tokio::select!` with six arms:
+limit requests from the adapter, the heartbeat, the prompt-round pacer
+(polled only while a resend, gap report, probe answer or sweep waits),
+inbound packets, peer membership churn, and admin commands. A round
+first reads the datagrams already waiting, then serves every peer in one
+send loop, handing each packet to the socket as it is encoded; a packet
+the kernel refuses is held and retried first on the next round, and the
+cut round resumes from the peer it stopped at (see
+[Socket buffers](#socket-buffers)).
 After every iteration that produced delta or expiration rows, the
 runtime calls `aggregates.apply(...)` exactly once — that is the
 contract with the downstream rate-limit decision path. Empty iterations
@@ -198,16 +201,16 @@ sequenceDiagram
     Adapter->>Runtime: record(rule, key, hits, limit, now)
     Runtime->>Runtime: handle_limit_request
     Runtime->>Store: ingest_local(observation)
-    Store-->>Runtime: delta row + dirty mark
+    Store-->>Runtime: delta row + own-list relink
     Note over Runtime: set want_immediate_flush<br/>if pending > ε_R
     Runtime->>Adapter: aggregates.apply(deltas, expirations)
 
-    loop every tick (heartbeat OR synthetic threshold)
-        Runtime->>Runtime: handle_gossip_tick
-        Runtime->>Store: expire_at(now)
-        Runtime->>Store: fill_gossip_frame
-        Store-->>Runtime: cell list
-        Runtime->>Tx: encode + try_send_to(peer)
+    loop every round (heartbeat, threshold or prompt)
+        Runtime->>Runtime: round
+        Runtime->>Store: expire_at(now), heartbeats only
+        Runtime->>Store: stream_after(peer's sent)
+        Store-->>Runtime: cells above it
+        Runtime->>Tx: encode + try_send_to(each peer)
         Tx->>Peer: UDP frame
         Runtime->>Adapter: aggregates.apply(expirations)
     end
@@ -222,71 +225,33 @@ sequenceDiagram
 `CellStore::merge_remote` performs the CRDT join: max-merge per
 `(origin, key, bucket)`, sum across origins.
 
-### Coverage fanout
+### Streams, acks and join sweeps
 
-Three separate concerns pull on the gossip plane, and it is tempting to
-fold them all into the fanout knob. They are governed by three different
-variables, and gabion keeps them apart:
+Each node's own stream is its own cells in the order they last changed,
+numbered by `origin_sequence`; the cell store keeps them on one ordered
+list, so `stream_after(sent)` reads what a peer has not been sent without
+a scan. For each peer the runtime keeps `sent` and the peer's last ack,
+`acked`. Heartbeat and threshold rounds send each peer the cells above its
+`sent`, at most `q` a round, where `q` is `⌈storage.max_cells / 128⌉` or one
+packet, whichever is larger; a stream with more waiting goes on in the next
+prompt round. A frame holding every live cell up to the head closes the
+range through the head, so cells that expired unsent are not owed.
 
-| Concern | Governed by | Mechanism |
-|---|---|---|
-| **Coverage** — reach every node reliably | cluster size `n` | **fanout** = `⌈ln(n)+c⌉` |
-| **Volume** — a big burst of dirty cells | dirty-set size | frame fill: `max_cells_per_tick` + packet-splitting |
-| **Urgency** — a fresh delta matters *now* | per-rule error budget | threshold-fire emissions (`target_err_bps`) |
+The receiver keeps `have`, the highest position it holds contiguously, and
+returns it on every packet it sends back, or alone at its next heartbeat.
+A packet above `have` opens a gap: after one relay floor
+(`min_emit_interval`) the receiver reports it, and the sender rewinds to
+the report's ack and resends on a prompt round. A stream unacknowledged for
+one heartbeat times out and is resent with `PROBE`, which the peer answers
+on a prompt round. Acks name the incarnation they answer, so an ack written
+for a restarted process credits nothing; a peer's new incarnation resets
+both directions of its stream.
 
-Only the first is a fanout question. Kermarrec, Massoulié & Ganesh (IEEE
-TPDS 2003, *Probabilistic Reliable Dissemination in Large-Scale
-Systems*, Theorem 1) prove that a directed gossip round with mean fanout
-`ln(n)+c` reaches **every** node with probability → `e^(−e^(−c))`:
-*"there is a sharp threshold in the required fanout at log n."* The
-fanout needs to grow by only 1 each time `n` rises by a factor of e, and
-a single round *"can easily be modified … to send several notifications
-per gossip message"* — which is exactly what gabion does: the whole
-dirty set rides one fat frame, so burst **volume** never widens the peer
-pick — many cells share one packet, so a burst does not translate into
-proportionally more rounds.
-
-The pick lives in `GossipRuntime::handle_gossip_tick`:
-
-```rust
-let n = peers.len();
-let coverage = (n as f64).ln() + GOSSIP_COVERAGE_MARGIN;   // c = 3.0
-let pick_count = config.fanout.max(coverage.ceil() as usize).min(n);
-```
-
-A partial Fisher-Yates shuffle then picks `pick_count` distinct peers
-from `self.peers`. The peers must be distinct rather than sampled with
-replacement, because sampling the same peer twice in one tick would
-encode and send the same frame twice. `config.fanout` is a
-hard floor; `.min(n)` makes small clusters full-mesh (coverage demands
-it there and the bandwidth is trivial). Some example pick counts at
-`fanout = 3`, `c = 3`:
-
-| peers `n` | `⌈ln(n)+c⌉` | `pick_count`               |
-|-----------|-------------|----------------------------|
-| 1         | 3           | 1 (capped at peers)        |
-| 4         | 5           | 4 (capped at peers)        |
-| 15        | 6           | 6                          |
-| 31        | 7           | 7                          |
-| 63        | 8           | 8                          |
-| 255       | 9           | 9                          |
-| 9 999     | 13          | 13                         |
-
-Fanout trades **bandwidth** (linear in the pick: the cluster ships
-`n·pick·frame` per tick) against **coverage-failure probability**
-(`≈ e^(−e^(−c))` per round) and **latency** (`≈ log_{1+pick} n` rounds,
-with diminishing return above the threshold). `⌈ln(n)+c⌉` is the
-provably-minimal fanout for reliable coverage of a *single* round, so it
-is the natural operating point. We size to `c = 3` — a 95.1 % per-round
-reach — rather than a higher margin, because gabion is not a one-shot
-disseminator: anti-entropy re-gossips every dirty cell every tick, with
-the repair lane behind that, so a node missed in one round is caught by
-the next and the per-round miss compounds away (4.9 % → ≈ 0.24 % after
-two rounds). KMG's validated single-shot threshold sits near `c ≈ 4`
-(fanout 13 @ 10 000, 15 @ 50 000); a re-gossiping system does not need to
-match it, and `c = 3` saves ≈ 1 peer per tick at every scale. The
-bandwidth floor on quiet ticks is unchanged from a fixed fanout — the
-pick is stable for a given cluster size, not pulsing with load.
+A node that starts asks its two highest-weight peers it has heard from for
+a join sweep, retrying each heartbeat until a page arrives, and each source
+pages its live cells to at most `gossip.sweep_concurrency` requesters at a
+time. The sweep brings back the node's own previous-incarnation cells, which
+no stream carries.
 
 ### Adaptive emit rate
 
@@ -349,26 +314,7 @@ saturates and every hit would otherwise emit, `min_emit_interval` caps
 the worst-case emit rate; convergence still happens, but the cluster
 absorbs the burst at a different bandwidth budget.
 
-### Dirty rings
-
-Two bounded rings and a repair cursor decide which cells the current
-tick sends:
-
-1. **`local_dirty`** — every locally-observed hit pushes onto this
-   bounded ring. Drained by every tick (heartbeat and threshold).
-2. **`forwarded_dirty`** — every cell merged from a peer pushes onto a
-   separate ring, so the runtime can forward a remote delta even if
-   its local origin column is quiet. Larger than `local_dirty` because
-   forwarded cells fan out N-to-many.
-
-Together they keep `fill_gossip_frame` allocation-free and strictly
-bounded: the runtime walks at most `max_cells_per_tick` cells through
-the three lanes (local dirty → forwarded dirty → repair) and stops when
-the budget is exhausted. The rings are pre-sized at construction; pushes
-that hit the cap bump an overflow counter and silently drop, and the
-next repair-lane sweep picks the dropped cell back up.
-
-`CRDT.md` documents these structures end-to-end with traces, slot
+`CRDT.md` documents the cell store end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
 debug the CRDT.
 
@@ -454,13 +400,12 @@ keep convergence well under a second at typical cluster sizes
 it splits into the two adaptive halves of the protocol, then the socket
 buffers that carry it.
 
-### Heartbeat cadence and fanout (coverage fanout)
+### Heartbeat cadence and streams
 
 | Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
-| `fanout`             | 3           | Fanout floor. The runtime scales the actual pick to the coverage threshold `⌈ln(n)+c⌉` (`c` = `GOSSIP_COVERAGE_MARGIN`, 3), capped at the peer count. | Rarely tune — the floor binds only if you lower `GOSSIP_COVERAGE_MARGIN`. To trade bandwidth for coverage, change the margin, not this floor. |
-| `max_cells_per_tick` | 4 096       | Cap on cells `fill_gossip_frame` will emit in one tick. Cells over the cap roll forward to the next tick via the repair lane. | Raise if you run many rules and the dirty ring backlogs visibly under burst.                                  |
+| `sweep_concurrency`  | 4           | Join sweeps this node answers at once; each pages `q / sweep_concurrency` cells per prompt round.                                      | Raise only if `sweep_declined` fires outside rollouts; each sweep then runs slower.                           |
 | `max_payload_bytes`  | 1 400       | UDP datagram budget, 158 to 65 507 bytes. The codec splits a tick's frame across multiple packets when the cell list overflows.        | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 
 ### Per-rule error budget (adaptive emit rate)
@@ -523,9 +468,10 @@ them is [`crates/gossip-bench`](../gossip-bench/README.md).
 In-tree primary sources:
 
 - `src/gossip/runtime.rs` — the event loop. `GossipRuntime::run` is the
-  outer `select!`; `handle_gossip_tick` carries the coverage-fanout
-  pick; `handle_limit_request` carries the per-site safe zone and the
-  threshold-fire flag.
+  outer `select!`; `round` and `serve_row` carry the per-peer streams;
+  `handle_limit_request` carries the per-site safe zone and the
+  threshold-fire flag. `src/gossip/peer.rs` holds the stream state and its
+  rules; `src/gossip/sweep.rs` the join sweeps.
 - `src/wire.rs` and `src/wire/` — packet shape, encoders, decoder.
-- `src/crdt.rs` and `src/crdt/` — counter store, dirty rings, expiry. The structures here are documented in depth in
+- `src/crdt.rs` and `src/crdt/` — counter store, the own-stream list, expiry. The structures here are documented in depth in
   [`CRDT.md`](CRDT.md).

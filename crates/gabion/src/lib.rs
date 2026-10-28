@@ -3,6 +3,8 @@ pub mod crdt;
 pub mod defaults;
 pub mod discovery;
 pub mod gossip;
+#[cfg(feature = "transport-udp")]
+pub mod identity;
 pub mod rules;
 pub mod settings;
 pub mod throttle;

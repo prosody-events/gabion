@@ -141,6 +141,13 @@ impl PacketBuf {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Encode a packet of `header` alone: an ack, a sweep request, a closing
+    /// packet or an empty sweep page.
+    pub(crate) fn header_only<P: Copy + Into<Payload>>(&mut self, header: &Header<P>) {
+        self.inner.clear();
+        self.inner.extend_from_slice(&write_header(header, 0));
+    }
 }
 
 impl AsRef<[u8]> for PacketBuf {
@@ -154,6 +161,10 @@ impl AsRef<[u8]> for PacketBuf {
 /// Synchronous iterator over outbound packets. Not `std::iter::Iterator` —
 /// `next_into` takes a caller-owned buffer; `Iterator::next` cannot. A caller
 /// may stop early: handles it never encodes are simply not sent.
+///
+/// A stream frame's header names the frame's range; its packets tile that
+/// range, each closing the positions up to its last cell's sequence and the
+/// last closing the rest, so a lost packet opens a gap no later one hides.
 #[must_use = "Packets encodes nothing until next_into is called"]
 pub struct Packets<'a> {
     header: Header<CellPayload>,
@@ -162,6 +173,8 @@ pub struct Packets<'a> {
     scratch: &'a mut WireScratch,
     limits: FrameLimits,
     cursor: usize,
+    /// The stream position the next packet's range starts at.
+    lower: u64,
 }
 
 impl<'a> Packets<'a> {
@@ -174,6 +187,10 @@ impl<'a> Packets<'a> {
         scratch: &'a mut WireScratch,
         limits: FrameLimits,
     ) -> Self {
+        let lower = match header.payload {
+            CellPayload::Own { range, .. } | CellPayload::Relay { range, .. } => range.lower(),
+            CellPayload::Sweep => 0,
+        };
         Self {
             header,
             store,
@@ -181,7 +198,13 @@ impl<'a> Packets<'a> {
             scratch,
             limits,
             cursor: 0,
+            lower,
         }
+    }
+
+    /// The stream position the packets encoded so far close through.
+    pub(crate) fn closed_through(&self) -> u64 {
+        self.lower
     }
 
     /// Encode the next packet into `buf` and return its cell count, or
@@ -213,11 +236,49 @@ impl<'a> Packets<'a> {
             return None;
         }
 
-        buf.inner[..HEADER_LEN].copy_from_slice(&write_header(&self.header, plan.cells_emitted));
-        debug_assert!(buf.inner.len() <= self.limits.max_payload_bytes);
-
         self.cursor += plan.handles_consumed;
+        let header = Header {
+            payload: self.packet_payload(),
+            ..self.header
+        };
+        buf.inner[..HEADER_LEN].copy_from_slice(&write_header(&header, plan.cells_emitted));
+        debug_assert!(buf.inner.len() <= self.limits.max_payload_bytes);
         Some(plan.cells_emitted)
+    }
+
+    /// The payload of the packet ending at `cursor`: a stream packet closes
+    /// up to its last cell's sequence, or to the frame's upper end when it is
+    /// the last. Advances `lower` past it.
+    fn packet_payload(&mut self) -> CellPayload {
+        let close = |range: StreamRange, lower: &mut u64| {
+            let upper = match self.handles.get(self.cursor - 1) {
+                Some(&last) if self.cursor < self.handles.len() => self
+                    .store
+                    .get(last)
+                    .map_or(range.upper(), |row| row.origin_sequence),
+                _ => range.upper(),
+            };
+            let packet = StreamRange::new(*lower, upper);
+            debug_assert!(packet.is_some(), "a frame's packets tile its range");
+            *lower = upper;
+            packet.unwrap_or(range)
+        };
+        match self.header.payload {
+            CellPayload::Own {
+                range,
+                relay_into_zone,
+                probe,
+            } => CellPayload::Own {
+                range: close(range, &mut self.lower),
+                relay_into_zone,
+                probe,
+            },
+            CellPayload::Relay { range, probe } => CellPayload::Relay {
+                range: close(range, &mut self.lower),
+                probe,
+            },
+            CellPayload::Sweep => CellPayload::Sweep,
+        }
     }
 }
 

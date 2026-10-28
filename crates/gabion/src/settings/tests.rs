@@ -18,7 +18,6 @@ const ZERO_PARSES: &[Setting] = &[
     Setting::EnvoyBind,
     Setting::AdminBind,
     Setting::RuntimeNodeIdSeed,
-    Setting::RuntimeRngSeed,
     Setting::GossipBind,
     Setting::GossipMaxPayloadBytes,
     Setting::GossipClusterIdHash,
@@ -397,14 +396,15 @@ fn defaults_validate_to_the_production_values() {
         gossip.min_emit_interval.0.get(),
         defaults::GOSSIP_MIN_EMIT_INTERVAL_MS
     );
-    assert_eq!(gossip.fanout.get(), defaults::GOSSIP_FANOUT);
     assert_eq!(
         Some(gossip.wire_limits),
         FrameLimits::new(defaults::GOSSIP_MAX_PAYLOAD_BYTES)
     );
+    // ⌈131,072 / 128⌉ cells, above the 33 a 1,400-byte packet holds.
+    assert_eq!(gossip.quantum.get(), 1024);
     assert_eq!(
-        gossip.max_cells_per_tick.get(),
-        defaults::GOSSIP_MAX_CELLS_PER_TICK
+        gossip.sweep_concurrency.get(),
+        defaults::GOSSIP_SWEEP_CONCURRENCY
     );
     #[cfg(feature = "transport-udp")]
     assert_eq!(
@@ -437,14 +437,6 @@ fn defaults_validate_to_the_production_values() {
     assert_eq!(
         storage.node_dictionary_capacity.get(),
         2 * defaults::GOSSIP_PEER_CAPACITY
-    );
-    assert_eq!(
-        storage.local_dirty_capacity.get() as usize,
-        defaults::STORAGE_LOCAL_DIRTY_CAPACITY
-    );
-    assert_eq!(
-        storage.forwarded_dirty_capacity.get() as usize,
-        defaults::STORAGE_FORWARDED_DIRTY_CAPACITY
     );
     assert_eq!(
         storage.cardinality,
@@ -486,5 +478,19 @@ fn spellings_follow_the_yaml_key() {
                 .map(|name| name.to_str().unwrap()),
             setting.nginx_directive(),
         );
+    }
+}
+
+/// The per-round quantum drains a full store in 128 rounds, and never sends
+/// less than one full packet.
+#[test]
+fn quantum_is_a_128th_of_the_store_and_at_least_one_packet() {
+    for (max_cells, quantum) in [(262_144, 2048), (131_073, 1025), (1_000, 33)] {
+        let settings = Settings {
+            max_cells: NonZeroU32::new(max_cells).unwrap(),
+            ..Settings::default()
+        };
+        let (gossip, _) = settings.validate().expect("validates");
+        assert_eq!(gossip.quantum.get(), quantum, "{max_cells} cells");
     }
 }

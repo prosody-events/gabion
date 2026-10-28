@@ -73,9 +73,37 @@ Message starts: "This node's peer table is full"
 
 **Why.** The cluster has more pods than `gossip.peer_capacity`.
 
-**What to do next.** Raise `gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`) in `gabiond`, or `gabion_gossip_peer_capacity` in NGINX, above the cluster's pod count. Each slot costs about 100 bytes.
+**What to do next.** Raise `gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`) in `gabiond`, or `gabion_gossip_peer_capacity` in NGINX, above the cluster's pod count. Each slot costs about 200 bytes.
 
 **Fields** `config_key`, `capacity`, `peer`, `declined_total` · **Knob** `gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`) / `gabion_gossip_peer_capacity`
+
+### `gap_abandoned`
+
+**Level** warn, power of two · **Request allowed** yes, under-counted until the missing changes arrive · **Emitted by** library (both adapters)
+
+Message starts: "Stopped asking"
+
+**What happened.** A peer's stream to this node skipped some changes, and this node asked the peer to resend them `reports` times over `waited_ms` without receiving them, so it stopped asking. If the peer still sends the stream, its retransmission timer resends the missing changes on its own; until they arrive, limits here under-count the traffic that peer handled. Counted in `/snapshot` as `counters.gaps_abandoned`.
+
+**Why.** Usually UDP from that peer to this node is blocked or lossy in one direction, so the peer never hears the reports or its resends never arrive.
+
+**What to do next.** If it repeats for a peer that is running, check the NetworkPolicies and security groups between the two nodes for UDP on the gossip port, in both directions.
+
+**Fields** `peer`, `stream`, `missing`, `reports`, `waited_ms`, `abandoned_total`
+
+### `sweep_declined`
+
+**Level** warn, power of two · **Request allowed** yes, the new node under-counts until it catches up · **Emitted by** library (both adapters)
+
+Message starts: "Declined a catch-up request from"
+
+**What happened.** A newly started peer asked this node for its live counts (a join sweep) while this node was already sending them to `gossip.sweep_concurrency` other new nodes, so it declined. The peer asks again at its next heartbeat and then asks another peer, so it most likely still catches up. Counted in `/snapshot` as `counters.sweeps_refused`.
+
+**Why.** Many pods started at once: a rollout or a scale-out.
+
+**What to do next.** Nothing, unless new pods keep under-counting for longer than one rate-limit window; then slow the rollout. Raising `gossip.sweep_concurrency` (`GABION_GOSSIP_SWEEP_CONCURRENCY`) in `gabiond`, or `gabion_gossip_sweep_concurrency` in NGINX, reduces these refusals, but each sweep then runs slower, so it does not speed the rollout.
+
+**Fields** `config_key`, `peer`, `active`, `limit`, `refused_total` · **Knob** `gossip.sweep_concurrency` (`GABION_GOSSIP_SWEEP_CONCURRENCY`) / `gabion_gossip_sweep_concurrency`
 
 ### `decode_rejected`
 

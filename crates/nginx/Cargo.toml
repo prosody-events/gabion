@@ -21,8 +21,6 @@ ngx = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-twox-hash.workspace = true
-whoami.workspace = true
 
 [features]
 default = []

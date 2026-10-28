@@ -44,7 +44,6 @@ fn run_local<F: std::future::Future<Output = T>, T>(f: F) -> T {
 fn settings() -> Settings {
     Settings {
         max_cells: 256.try_into().unwrap(),
-        rng_seed: Some(7),
         ..Settings::default()
     }
 }
@@ -143,18 +142,11 @@ fn snapshot_json_shape_is_pinned() {
             [
                 "aggregate_rows",
                 "counters",
-                "dirty_ticks",
-                "forwarded_dirty_len",
-                "last_effective_fanout",
                 "last_error_budget",
-                "local_dirty_len",
                 "local_identity",
-                "peak_effective_fanout",
                 "peers",
                 "rules",
                 "store_stats",
-                "threshold_fires",
-                "ticks_total",
             ]
         );
         assert_eq!(keys(&body["local_identity"]), ["incarnation", "node_id"]);
@@ -163,15 +155,27 @@ fn snapshot_json_shape_is_pinned() {
             [
                 "bytes_received",
                 "bytes_sent",
+                "cells_merged",
                 "decode_rejects_cluster",
                 "decode_rejects_framing",
                 "decode_rejects_peer_limits",
                 "decode_rejects_version",
+                "gap_reports_sent",
+                "gaps_abandoned",
                 "packets_received",
                 "packets_sent",
                 "peers_declined",
+                "rounds_heartbeat",
+                "rounds_prompt",
+                "rounds_threshold",
+                "rto_rewinds_own",
                 "send_blocked",
                 "send_errors",
+                "sweep_cells_sent",
+                "sweeps_ignored",
+                "sweeps_refused",
+                "sweeps_requested",
+                "sweeps_served",
             ]
         );
         assert_eq!(
@@ -188,7 +192,11 @@ fn snapshot_json_shape_is_pinned() {
                 "rule_slots_used",
             ]
         );
-        assert_eq!(keys(&body["peers"][0]), ["addr", "node_id"]);
+        assert_eq!(
+            keys(&body["peers"][0]),
+            ["addr", "node_id", "own_unacked", "role"]
+        );
+        assert_eq!(body["peers"][0]["role"], "zone");
         assert_eq!(
             keys(&body["rules"][0]),
             [

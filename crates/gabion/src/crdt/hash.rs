@@ -3,7 +3,7 @@
 use super::{CompactCellKey, Incarnation, NodeId};
 
 #[inline(always)]
-pub(super) fn mix64(mut h: u64) -> u64 {
+pub(crate) fn mix64(mut h: u64) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h >> 33;

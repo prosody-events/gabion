@@ -116,22 +116,16 @@ data:
     admin_bind: 0.0.0.0:9090
     storage:
       max_cells: 4096
-      local_dirty_capacity: 2048
-      forwarded_dirty_capacity: 8192
       max_descriptor_count: 16
       max_descriptor_bytes: 512
       max_key_bytes: 128
-    runtime:
-      rng_seed: 12345
     discovery:
       namespace_allow: ["$namespace"]
       service_allow: ["gabiond", "gabion-nginx"]
     gossip:
       bind: 0.0.0.0:9000
       tick_interval: 100ms
-      fanout: 6
       max_payload_bytes: 1400
-      max_cells_per_tick: 1024
       limit_queue_capacity: 1024
       cluster_id_hash: 1
       target_err_bps: 100
@@ -182,7 +176,6 @@ data:
         gabion_limit_rule acme_only tenant:\$arg_t rate=2r/m bucket=1s value=tenant:acme;
         gabion_gossip_bind 0.0.0.0:9000;
         gabion_gossip_cluster 1;
-        gabion_gossip_fanout 6;
         gabion_discovery_namespace_allow $namespace;
 
         server {

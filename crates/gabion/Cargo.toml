@@ -12,7 +12,6 @@ ahash = { workspace = true, optional = true }
 async-stream.workspace = true
 either.workspace = true
 futures.workspace = true
-getrandom.workspace = true
 humantime.workspace = true
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, optional = true }
@@ -26,12 +25,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 twox-hash.workspace = true
-
-# On wasm32 the `getrandom` backend is the browser's, selected by the
-# `wasm_js` feature (getrandom 0.4 needs no RUSTFLAGS cfg for this). Scoped to
-# the wasm target so native builds keep the OS (`sys_rng`) backend.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { workspace = true, features = ["wasm_js"] }
+whoami = { workspace = true, optional = true }
 
 [features]
 # Default features keep the production adapters (gabiond, nginx) building
@@ -42,10 +36,11 @@ default = ["discovery-kubernetes", "transport-udp"]
 # Kubernetes EndpointSlice peer discovery. Pulls `kube` + `k8s-openapi`,
 # which transitively need `hyper`/`rustls`/`tower-http` — host-only.
 discovery-kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:ahash"]
-# The production UDP datagram transport (`UdpTransport`) and the
-# socket-binding runtime constructors. Needs `tokio/net`; `socket2` sizes the
-# socket's kernel buffers and `libc` names `ENOBUFS`.
-transport-udp = ["tokio/net", "dep:libc", "dep:socket2"]
+# The production UDP datagram transport (`UdpTransport`), the socket-binding
+# runtime constructors and the host identity (`gabion::identity`). Needs
+# `tokio/net`; `socket2` sizes the socket's kernel buffers, `libc` names
+# `ENOBUFS` and `whoami` reads the hostname.
+transport-udp = ["tokio/net", "dep:libc", "dep:socket2", "dep:whoami"]
 # `Serialize` for the admin snapshot and the rules, for an adapter that serves
 # them as JSON. The library never deserialises.
 serde = ["dep:serde"]

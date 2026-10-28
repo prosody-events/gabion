@@ -32,15 +32,15 @@ use super::driver::Counters;
 use super::node::{KeySpace, NOT_TRACKED, Sizing};
 use super::plan::node_addr;
 use super::regime::Regime;
-use super::rng::{Rng, Stream, mix64};
+use super::rng::{Rng, Stream};
 use super::world::{PeerStream, SimClock, SimSocket, SimTicker, World};
 
 const DOMAIN: &str = "study";
 const DESCRIPTOR_KEY: &str = "site";
 
 impl Ticker for SimTicker {
-    async fn tick(&mut self) {
-        self.next_tick().await;
+    async fn tick(&mut self) -> u64 {
+        self.next_tick().await
     }
 }
 
@@ -240,20 +240,12 @@ impl HealthReply {
 
 /// The production settings with the store sized for the regime and the peer
 /// table for every node it starts, which the launcher validates once as
-/// `gabiond` validates them. The dirty rings never drop below production; above
-/// it they keep the production ratio of ring to cell store
-/// (`STORAGE_*_DIRTY_CAPACITY` over `STORAGE_MAX_CELLS`).
+/// `gabiond` validates them.
 pub(super) fn settings(sizing: &Sizing) -> Result<Settings> {
-    let ring = |production: usize| {
-        production.max((sizing.cell_capacity as usize * production).div_ceil(d::STORAGE_MAX_CELLS))
-    };
     Ok(Settings {
         max_cells: sizing.cell_capacity.try_into()?,
         peer_capacity: u16::try_from(sizing.total_nodes)?
             .max(d::GOSSIP_PEER_CAPACITY)
-            .try_into()?,
-        local_dirty_capacity: u32::try_from(ring(d::STORAGE_LOCAL_DIRTY_CAPACITY))?.try_into()?,
-        forwarded_dirty_capacity: u32::try_from(ring(d::STORAGE_FORWARDED_DIRTY_CAPACITY))?
             .try_into()?,
         ..Settings::default()
     })
@@ -310,10 +302,13 @@ impl Launcher {
         transport: T,
         idx: usize,
     ) -> Result<Launched<impl Future<Output = Result<(), GossipError>> + use<T>>> {
-        let id = (u128::from(mix64(idx as u64 ^ 0x6761_6269_6f6e)) << 64) | idx as u128 | 1 << 63;
+        // The node id's hash ranks each node's join-sweep sources, the only
+        // per-node gossip randomness this library has: draw it from the run's
+        // gossip stream.
+        let draw = Rng::stream(self.seed, Stream::Gossip, idx as u64).next_u64();
+        let id = (u128::from(draw) << 64) | idx as u128 | 1 << 63;
         let identity = NodeIdentity::new(NodeId(id), 1);
-        let mut config = self.gossip.clone();
-        config.rng_seed = Rng::stream(self.seed, Stream::Gossip, idx as u64).next_u64();
+        let config = self.gossip.clone();
         let cell_store = CellStore::new(self.cells, identity, &self.identity.rules);
         let store = Rc::new(NodeStore::new(
             Rc::clone(&self.keys),

@@ -20,15 +20,6 @@ fn controls_fail_as_the_settings_table_fails() {
         ),
         (
             SimConfig {
-                fanout: 0,
-                ..SimConfig::default()
-            },
-            SettingError::NotPositive {
-                setting: Setting::GossipFanout,
-            },
-        ),
-        (
-            SimConfig {
                 min_emit_interval_ms: tick,
                 ..SimConfig::default()
             },

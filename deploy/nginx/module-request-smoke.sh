@@ -55,7 +55,6 @@ printf '%s\n' "$rendered" | grep -F 'gabion_limit baseline_rule;'
 printf '%s\n' "$rendered" | grep -F 'gabion_limit_rule window_demo       demo:$arg_demo     rate=2r/m window=2m bucket=30s;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_bind 0.0.0.0:9000;'
 printf '%s\n' "$rendered" | grep -F 'gabion_gossip_cluster 0xc0ffee;'
-printf '%s\n' "$rendered" | grep -F 'gabion_gossip_fanout 8;'
 printf '%s\n' "$rendered" | grep -F 'gabion off;'
 
 nginx -c "$SHIM_CONF"

@@ -169,7 +169,7 @@ fn full_aggregate_allows_and_logs() {
 #[test]
 fn gabiond_table_holds_a_full_cell_store() {
     let cells = 4_096;
-    let aggregate = Aggregate::new(&storage(cells, 64, 64));
+    let aggregate = Aggregate::new(&storage(cells, 64));
     let writer = writer(&aggregate);
     let dropped = (0..u128::from(cells))
         .filter(|&key| !writer.add(1, key, 0, 1))

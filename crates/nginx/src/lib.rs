@@ -10,14 +10,13 @@
 //!     SHM queue, drives the `GossipRuntime`, and writes deltas back into the
 //!     SHM aggregate table via `ShmAggregateStore`.
 //!
-//! The library half (this file plus the `access`, `headers`, `identity`,
+//! The library half (this file plus the `access`, `headers`,
 //! `leader`, `rules`, `shm` modules) builds and tests without the
 //! `ngx-module` feature. The `module` submodule pulls in `ngx` for the FFI
 //! glue when that feature is on.
 
 pub mod access;
 pub mod headers;
-pub mod identity;
 pub mod leader;
 pub mod rules;
 pub mod shm;

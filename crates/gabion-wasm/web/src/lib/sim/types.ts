@@ -26,14 +26,12 @@ export type Hex = string;
  *  defaults baked into the Rust side. */
 export interface SimConfig {
   nodes: number;
-  fanout: number;
   tick_interval_ms: number;
   target_err_bps: number;
   min_emit_interval_ms: number;
   rule_limit: number;
   rule_window_ms: number;
   rule_bucket_ms: number;
-  rng_seed: number;
   uniform_loss: number;
 }
 
@@ -118,24 +116,13 @@ export interface NodeState {
   /** Incarnation — bumped on restart; always 1 in the sim. */
   incarnation: number;
   aggregate_total: number;
-  ticks_total: number;
-  threshold_fires: number;
-  /** Subset of `ticks_total` that actually carried gossip work (a cell was
-   *  dirty at the peer pick). */
-  dirty_ticks: number;
-  /** The coverage fanout the most recent dirty tick chose — `⌈ln(peers)+c⌉`,
-   *  ≥ the base `fanout` floor, scaled by cluster size not the dirty set.
-   *  0 before the first emit. */
-  effective_fanout: number;
-  /** High-water mark of `effective_fanout` since startup. */
-  peak_fanout: number;
+  /** Heartbeat rounds the runtime has run. */
+  rounds_heartbeat: number;
+  /** Threshold rounds: an eager flush crossing the error budget. */
+  rounds_threshold: number;
   /** Per-rule error budget ε at the most recent request; pending crossing it
    *  triggers an eager (threshold) flush. 0 until a request is seen. */
   error_budget: number;
-  /** Rows in the local-origin dirty ring awaiting gossip out. */
-  local_dirty_len: number;
-  /** Rows in the forwarded (received-then-re-gossiped) dirty ring. */
-  forwarded_dirty_len: number;
   /** Inbound packets the wire decoder rejected. */
   decode_reject_count: number;
   store_stats: StoreStats;

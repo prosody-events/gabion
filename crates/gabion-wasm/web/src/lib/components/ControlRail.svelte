@@ -1,7 +1,6 @@
 <script lang="ts">
   import { type Knobs, type Preset } from '../presets';
   import { visibleBuckets } from '../buckets';
-  import InfoTip from './InfoTip.svelte';
 
   // The left control rail (the chassis's controls region): scenario presets, the
   // rebuild knobs (a collapsed disclosure, so the rail stays compact), the
@@ -59,7 +58,6 @@
   // Which rebuild knobs have been moved since the last build — staged, awaiting
   // a Rebuild. The set drives the per-row "changed" cue and gates the button.
   const KNOB_FIELDS = [
-    'fanout',
     'target_err_bps',
     'uniform_loss',
     'rule_limit',
@@ -71,10 +69,8 @@
 
   const activePreset = $derived(presets.find((p) => p.id === activeId));
   const activeBlurb = $derived(activePreset?.blurb ?? '');
-  // Packet loss reads as a percentage; the engine wants the fraction. Fanout
-  // can't exceed the peer count of the cluster the knobs will build.
+  // Packet loss reads as a percentage; the engine wants the fraction.
   const lossPct = $derived(Math.round(knobs.uniform_loss * 100));
-  const maxFanout = $derived(Math.max(knobs.nodes - 1, 1));
   // Heal only does something after a partition or isolation, so the rail shows
   // it only for those scenarios (progressive disclosure — fewer idle controls).
   const showNetwork = $derived(activePreset?.usesNetwork ?? false);
@@ -134,10 +130,6 @@
   <details class="tune" open={tuneOpen} ontoggle={(e) => onToggleTune(e.currentTarget.open)}>
     <summary>Tune the cluster</summary>
     <p class="hint">Edit freely — changes stage until you rebuild.</p>
-    <div class="knob" class:changed={changed.has('fanout')}>
-      <label for="knob-fanout"><InfoTip text="The fanout floor — the minimum peers contacted per gossip tick. The runtime scales the actual fanout up to the coverage threshold ⌈ln(peers)+c⌉, the fanout that reliably reaches every node, so this floor binds only at small clusters.">Fanout</InfoTip><span class="val numeric">{knobs.fanout}</span></label>
-      <input id="knob-fanout" type="range" min="1" max={maxFanout} step="1" bind:value={knobs.fanout} />
-    </div>
     <div class="knob" class:changed={changed.has('target_err_bps')}>
       <label for="knob-bps">Error budget<span class="val numeric">{knobs.target_err_bps} bps</span></label>
       <input id="knob-bps" type="range" min="50" max="2000" step="50" bind:value={knobs.target_err_bps} />

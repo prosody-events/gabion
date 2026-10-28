@@ -7,11 +7,14 @@
 //! this instead.
 //!
 //! Time is one shared `Rc<Cell<u64>>` every node reads through
-//! [`Clock::now_millis`]. Ticks are a **per-node bounded `mpsc`**: the engine
-//! sets the clock then sends one `()` per node per gossip tick. An `mpsc`
-//! queues (unlike a `watch`, which coalesces and would silently drop a tick a
-//! busy runtime hadn't polled yet), so every fired tick is delivered exactly
-//! once — the determinism the shareable-URL replay relies on.
+//! [`Clock::now_millis`]. The runtime asks for two tickers, the heartbeat and
+//! the prompt-round pacer, and each gets its own **bounded `mpsc`** inbox of
+//! the instants the engine fires it for. An `mpsc` queues (unlike a `watch`,
+//! which coalesces and would silently drop a tick a busy runtime hadn't polled
+//! yet), so every fired tick is delivered exactly once — the determinism the
+//! shareable-URL replay relies on. The prompt ticker sets the node's `armed`
+//! flag while the runtime awaits it, which the runtime does only while it has
+//! prompt work, so the engine fires it only then.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -25,26 +28,51 @@ use tokio::sync::mpsc;
 /// cluster's bucket clock at once.
 pub type SharedNow = Rc<Cell<u64>>;
 
-/// One node's clock: shared time plus that node's own tick inbox. Built per
-/// node by the engine; not `Clone` (the `mpsc::Receiver` is single-consumer).
+/// Ticks one node's tickers can queue; the engine fires each at most once
+/// per sub-step and the runtime drains them as it goes.
+const INBOX: usize = 256;
+
+/// The engine's ends of one node's tickers.
+pub struct Tickers {
+    pub heartbeat: mpsc::Sender<u64>,
+    pub prompt: mpsc::Sender<u64>,
+    /// Set while the runtime awaits its prompt ticker: it has prompt work.
+    pub armed: Rc<Cell<bool>>,
+}
+
+/// One node's clock: shared time plus that node's two tick inboxes. Built per
+/// node by the engine; not `Clone` (each `mpsc::Receiver` is single-consumer).
 pub struct ManualClock {
     now: SharedNow,
-    /// Taken once by [`Clock::ticker`]; `RefCell<Option<_>>` so the `&self`
-    /// trait method can move the receiver out.
-    tick_rx: RefCell<Option<mpsc::Receiver<()>>>,
+    /// The heartbeat interval; a ticker of any other interval is the prompt
+    /// pacer.
+    heartbeat: Duration,
+    /// Each taken once by [`Clock::ticker`]; `RefCell<Option<_>>` so the
+    /// `&self` trait method can move the receiver out.
+    heartbeat_rx: RefCell<Option<mpsc::Receiver<u64>>>,
+    prompt_rx: RefCell<Option<mpsc::Receiver<u64>>>,
+    armed: Rc<Cell<bool>>,
 }
 
 impl ManualClock {
-    /// Pair this node's clock with the tick sender the engine keeps.
-    pub fn new(now: SharedNow) -> (Self, mpsc::Sender<()>) {
-        // Capacity well above the at-most-one-unconsumed-tick-per-drain the
-        // engine produces; sized so a fire never blocks.
-        let (tick_tx, tick_rx) = mpsc::channel(256);
+    /// Pair this node's clock with the ticker senders the engine keeps.
+    pub fn new(now: SharedNow, heartbeat: Duration) -> (Self, Tickers) {
+        let (heartbeat_tx, heartbeat_rx) = mpsc::channel(INBOX);
+        let (prompt_tx, prompt_rx) = mpsc::channel(INBOX);
+        let armed = Rc::new(Cell::new(false));
         let clock = Self {
             now,
-            tick_rx: RefCell::new(Some(tick_rx)),
+            heartbeat,
+            heartbeat_rx: RefCell::new(Some(heartbeat_rx)),
+            prompt_rx: RefCell::new(Some(prompt_rx)),
+            armed: Rc::clone(&armed),
         };
-        (clock, tick_tx)
+        let tickers = Tickers {
+            heartbeat: heartbeat_tx,
+            prompt: prompt_tx,
+            armed,
+        };
+        (clock, tickers)
     }
 }
 
@@ -55,25 +83,55 @@ impl Clock for ManualClock {
         self.now.get()
     }
 
-    fn ticker(&self, _interval: Duration) -> ManualTicker {
-        let rx = self
-            .tick_rx
-            .borrow_mut()
-            .take()
-            .expect("ManualClock::ticker called more than once");
-        ManualTicker(rx)
+    /// The heartbeat inbox for the heartbeat interval, else the prompt inbox
+    /// with the `armed` flag. An inbox already taken yields a ticker that
+    /// never fires.
+    fn ticker(&self, interval: Duration) -> ManualTicker {
+        if interval == self.heartbeat {
+            ManualTicker {
+                rx: self.heartbeat_rx.borrow_mut().take(),
+                armed: None,
+            }
+        } else {
+            ManualTicker {
+                rx: self.prompt_rx.borrow_mut().take(),
+                armed: Some(Rc::clone(&self.armed)),
+            }
+        }
     }
 }
 
-/// Resolves once per queued tick. After the engine drops the sender, parks
-/// forever rather than spinning the select loop on a closed channel.
-pub struct ManualTicker(mpsc::Receiver<()>);
+/// Resolves once per queued tick, to the instant it was fired for. Without an
+/// inbox, or after the engine drops the sender, parks forever rather than
+/// spinning the select loop on a closed channel.
+pub struct ManualTicker {
+    rx: Option<mpsc::Receiver<u64>>,
+    armed: Option<Rc<Cell<bool>>>,
+}
+
+/// Holds a ticker's `armed` flag set while its tick future is polled.
+struct Armed<'a>(&'a Cell<bool>);
+
+impl Drop for Armed<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
 
 impl Ticker for ManualTicker {
     // `async fn` in the impl satisfies the trait's `-> impl Future` signature.
-    async fn tick(&mut self) {
-        if self.0.recv().await.is_none() {
-            std::future::pending::<()>().await;
+    async fn tick(&mut self) -> u64 {
+        // Created in the body, so only a polled future arms the flag.
+        let _armed = self.armed.as_deref().map(|armed| {
+            armed.set(true);
+            Armed(armed)
+        });
+        match self.rx.as_mut() {
+            Some(rx) => match rx.recv().await {
+                Some(at) => at,
+                None => std::future::pending().await,
+            },
+            None => std::future::pending().await,
         }
     }
 }

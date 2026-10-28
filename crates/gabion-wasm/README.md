@@ -17,9 +17,12 @@ run in the browser. The fix is the injectable tick source on
 associated `Ticker`, so production keeps its `tokio::time::interval` ticker
 (behaviour unchanged) while this crate injects [`ManualClock`](src/clock.rs),
 which advances virtual time and fires gossip ticks from the engine — touching no
-`tokio::time`. Ticks ride a per-node bounded `mpsc` (not a `watch`, which
+`tokio::time`. The runtime asks for two tickers, the heartbeat and the
+prompt-round pacer; each rides its own bounded `mpsc` (not a `watch`, which
 coalesces) so every fired tick is delivered exactly once and replay stays
-deterministic.
+deterministic. The engine steps to the next heartbeat, or one relay floor when
+a node's prompt ticker is armed (it has resends, gap reports or sweeps
+waiting), so a quiet cluster costs one step per heartbeat.
 
 ## Layout
 

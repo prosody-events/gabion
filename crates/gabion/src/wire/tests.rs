@@ -13,7 +13,7 @@ use crate::settings::mock::{rules, storage};
 
 use super::{
     AckInfo, CellPayload, DecodeError, FrameLimits, HEADER_LEN, Header, MAGIC, MIN_PAYLOAD_BYTES,
-    PacketBuf, Packets, Payload, WireScratch, decode, write_header,
+    PacketBuf, Packets, Payload, StreamRange, WireScratch, decode, write_header,
 };
 
 const MAX_ROWS: usize = 32;
@@ -86,7 +86,7 @@ fn sample_header<P: From<CellPayload>>() -> Header<P> {
 }
 
 fn store_with_cap(cells: u32, dicts: u16) -> CellStore {
-    CellStore::new(storage(cells, dicts, 128), local_identity(), &rules(dicts))
+    CellStore::new(storage(cells, dicts), local_identity(), &rules(dicts))
 }
 
 /// Build a store, ingest the rows as merge_remote observations (so each
@@ -111,7 +111,7 @@ fn seed_store(rows: &[RawRow]) -> (CellStore, Vec<CellHandle>) {
         });
     }
     store.merge_remote(&obs, &mut sink);
-    let handles = store.active_handles().collect();
+    let handles = store.active_handles(0).collect();
     (store, handles)
 }
 
@@ -250,11 +250,7 @@ fn body_layout_is_pinned() {
 /// Build a store with `n` distinct origin nodes (one cell each) so the
 /// 255-slot node-dict cap forces a packet split.
 fn build_many_origins(n: u32) -> (CellStore, Vec<CellHandle>) {
-    let mut store = CellStore::new(
-        storage(n * 2, n as u16 + 8, 256),
-        local_identity(),
-        &rules(4),
-    );
+    let mut store = CellStore::new(storage(n * 2, n as u16 + 8), local_identity(), &rules(4));
     let mut obs = ObservationBatch::with_capacity(n as usize);
     let mut sink = DeltaSink::with_capacity(n as usize);
     for i in 0..n {
@@ -269,7 +265,7 @@ fn build_many_origins(n: u32) -> (CellStore, Vec<CellHandle>) {
         });
     }
     store.merge_remote(&obs, &mut sink);
-    let handles: Vec<CellHandle> = store.active_handles().collect();
+    let handles: Vec<CellHandle> = store.active_handles(0).collect();
     (store, handles)
 }
 
@@ -516,4 +512,60 @@ fn v1_packet_is_bad_version_not_garbage() {
 fn empty_handles_emits_zero_packets() {
     let store = store_with_cap(8, 8);
     assert!(encode(&store, &[], FrameLimits::default()).is_empty());
+}
+
+/// An own-stream frame's packets tile its range: the first starts at the
+/// frame's lower end, each starts where the one before ended and ends at its
+/// last cell's sequence, and the last ends at the frame's upper end, so a
+/// lost packet leaves a gap the receiver sees.
+#[test]
+fn own_frame_packets_tile_its_range() {
+    let mut store = store_with_cap(128, 8);
+    let mut obs = ObservationBatch::with_capacity(70);
+    for key in 0..70 {
+        obs.push(Observation {
+            rule_fingerprint: 0xAA,
+            key_hash: KeyHash(key),
+            bucket: 0,
+            origin: NodeId(0),
+            incarnation: 0,
+            count: 1,
+            last_update_millis: 1_000,
+        });
+    }
+    store.ingest_local(&obs, &mut DeltaSink::with_capacity(70));
+    let mut handles = Vec::with_capacity(70);
+    store.stream_after(0, 70, &mut handles);
+    // Four cells a packet: the header, both dictionaries and four cells.
+    let limits = FrameLimits::new(HEADER_LEN + 2 + 32 + 4 * 38).unwrap();
+    let header = Header {
+        payload: CellPayload::Own {
+            range: StreamRange::new(0, 80).unwrap(),
+            relay_into_zone: false,
+            probe: false,
+        },
+        ..sample_header::<CellPayload>()
+    };
+    let mut scratch = WireScratch::for_store(&store);
+    let mut packets = Packets::new(header, &store, &handles, &mut scratch, limits);
+    let mut buf = PacketBuf::for_limits(limits);
+    let mut lower = 0;
+    let mut sent = 0;
+    while packets.next_into(&mut buf).is_some() {
+        let mut last_key = 0;
+        let decoded = decode(buf.as_bytes(), limits, CLUSTER, |cell| {
+            last_key = cell.key_hash.0 as u64;
+            sent += 1;
+        })
+        .unwrap();
+        let Payload::Cells(CellPayload::Own { range, .. }) = decoded.payload else {
+            panic!("an own frame sends own packets");
+        };
+        assert_eq!(range.lower(), lower);
+        // Key `k` was the (k + 1)th cell issued.
+        let expected = if sent == 70 { 80 } else { last_key + 1 };
+        assert_eq!(range.upper(), expected);
+        lower = range.upper();
+    }
+    assert_eq!((sent, lower, packets.closed_through()), (70, 80, 80));
 }

@@ -198,7 +198,7 @@ test('the pinned headline stays visible in both rail modes', async ({ page }) =>
 // The Sandbox preset is the user-driven complement to the continuous-feed
 // presets: a blank cluster with no background traffic. It is the one scenario
 // that shows the full state-driven lifecycle honestly — inject a cell by hand,
-// Step it out round by round to convergence, then watch it age back to quiet
+// Step it out to convergence, then watch it age back to quiet
 // once the window slides past it (nothing replenishes it). It also carries the
 // Strata honesty invariant (Σ over the rendered slots equals the node's
 // aggregate) in a deterministic, feed-free setting.
@@ -230,8 +230,8 @@ test('Sandbox: inject, Step it out to convergence, then age out to quiet', async
   // It has not spread yet — a different node is still empty.
   await expect(page.locator('.node-label[data-id="6"] .node-count')).toHaveText('0');
 
-  // Step gossips the cell out round by round; within a handful of ticks every
-  // node agrees on the injected total.
+  // Step gossips the cell out: the next heartbeat sends it straight to every
+  // peer, so within a handful of ticks every node agrees on the injected total.
   for (let i = 0; i < 12; i++) {
     await page.getByRole('button', { name: 'Step forward one tick' }).click();
   }
@@ -627,17 +627,14 @@ test('the node inspector renders every detail section', async ({ page }) => {
   await expect(inspector.locator('.section-head', { hasText: 'Storage' })).toBeVisible();
   await expect(inspector.locator('.section-head', { hasText: 'Peers' })).toBeVisible();
 
-  // §4 — the cadence status word, live tick sparkline, the adaptive-fanout meter
-  // (floor → peak with a coverage badge), and the surfaced error budget.
+  // §4 — the cadence status word, live tick sparkline, and the surfaced error
+  // budget.
   await expect(inspector.locator('.cadence .status-word')).toBeVisible();
   await expect(inspector.locator('.cadence .spark')).toBeVisible();
-  await expect(inspector.locator('.cadence .fanout-now')).toContainText('peers');
-  await expect(inspector.locator('.cadence .fanout-foot')).toContainText('floor');
   await expect(inspector.locator('.cadence .budget')).toContainText('error budget');
 
-  // §6 — three occupancy gauges + the §4 fanout meter = four meters; the calm
-  // "holding" badge at zero rejects.
-  await expect(inspector.locator('[role="meter"]')).toHaveCount(4);
+  // §6 — three occupancy gauges; the calm "holding" badge at zero rejects.
+  await expect(inspector.locator('[role="meter"]')).toHaveCount(3);
   await expect(inspector.locator('.holding')).toContainText('All capacities holding');
 
   // §7 — the peer table summary and a resolved peer row.
@@ -726,14 +723,11 @@ test('the inspector shows convergence lag and the over-limit state', async ({ pa
   );
 });
 
-// The adaptive-decision metrics must be *visible and responsive* — the whole
-// point of §4. The coverage fanout (`config.fanout.max(⌈ln(peers)+c⌉).min(peers)`)
-// sits above the configured floor and is stable for the cluster size; the
-// eager-flush share was a frozen lifetime ratio. So §4 shows two things: the
-// fanout meter fills past its floor for coverage, and a concentrated burst
-// crosses the (now tiny) error budget, raising the windowed threshold share —
-// the genuinely burst-driven knob — off zero.
-test('the node inspector shows the coverage fanout and a responsive eager-flush share', async ({
+// The adaptive decision must be *visible and responsive* — the whole point of
+// §4. The eager-flush share was a frozen lifetime ratio; now a concentrated
+// burst crosses the (tiny) error budget and raises the windowed threshold share
+// off zero.
+test('the node inspector shows a responsive eager-flush share', async ({
   page,
 }) => {
   const pageErrors: string[] = [];
@@ -757,21 +751,6 @@ test('the node inspector shows the coverage fanout and a responsive eager-flush 
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
   const inspector = page.locator('.inspector');
   await expect(inspector).toBeVisible();
-
-  // The coverage fanout sits above the configured floor: the coverage segment
-  // carries width, and the foot says so. (`⌈ln(peers)+c⌉` exceeds the floor at
-  // this cluster size, independent of load.)
-  await expect
-    .poll(
-      async () =>
-        Number(
-          ((await inspector.locator('.cadence .seg.fan-coverage').getAttribute('style')) ?? '')
-            .replace(/[^0-9.]/g, '') || '0',
-        ),
-      { timeout: 10_000 },
-    )
-    .toBeGreaterThan(0);
-  await expect(inspector.locator('.cadence .coverage-note')).toContainText('sized for coverage');
 
   // The eager-flush (threshold) share is windowed, so a concentrated burst on
   // this node — many hits at once across the ε=1 budget — moves it off zero.

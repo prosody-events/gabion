@@ -1,6 +1,6 @@
 # The `crdt` module
 
-A guide to `crates/gabion/src/crdt/*` for somebody who has never opened this code before. The deep-dive companion to [`README.md`](README.md#how-gossip-works) — which documents the gossip runtime that sits on top of the structures described here. Anti-entropy, coverage fanout, threshold emissions, and peer selection all live there; this file is the data structures and the writes that flow through them.
+A guide to `crates/gabion/src/crdt/*` for somebody who has never opened this code before. The deep-dive companion to [`README.md`](README.md#how-gossip-works) — which documents the gossip runtime that sits on top of the structures described here. Streams, acks, threshold emissions, and join sweeps all live there; this file is the data structures and the writes that flow through them.
 
 Read it end-to-end and you should be able to open `crdt.rs` and recognise every type, every column, and every method named below.
 
@@ -14,7 +14,6 @@ Read it end-to-end and you should be able to open `crdt.rs` and recognise every 
    - 3.1 [`hash` — deterministic mixers](#31-hash--deterministic-mixers)
    - 3.2 [`dictionary` — identity interning](#32-dictionary--identity-interning)
    - 3.3 [`index` — the Robin Hood hash table](#33-index--the-robin-hood-hash-table)
-   - 3.4 [`dirty_ring` — the bounded change log](#34-dirty_ring--the-bounded-change-log)
 4. [The cell store](#4-the-cell-store)
    - 4.1 [Structure-of-arrays column layout](#41-structure-of-arrays-column-layout)
    - 4.2 [Slot lifecycle: freelist + generation tagging](#42-slot-lifecycle-freelist--generation-tagging)
@@ -31,10 +30,7 @@ Read it end-to-end and you should be able to open `crdt.rs` and recognise every 
    - 6.2 [Write: `merge_remote`](#62-write-merge_remote)
    - 6.3 [The shared `upsert` core](#63-the-shared-upsert-core)
    - 6.4 [Read: `find`, `resolve`, `get`](#64-read-find-resolve-get)
-7. [Gossip and convergence](#7-gossip-and-convergence)
-   - 7.1 [The two dirty rings](#71-the-two-dirty-rings)
-   - 7.2 [The repair cursor — the third lane](#72-the-repair-cursor--the-third-lane)
-   - 7.3 [`fill_gossip_frame` and per-frame dedup](#73-fill_gossip_frame-and-per-frame-dedup)
+7. [The own-stream list](#7-the-own-stream-list)
 8. [Expiry](#8-expiry)
 9. [End-to-end traced example](#9-end-to-end-traced-example)
 10. [Invariants reference](#10-invariants-reference)
@@ -62,13 +58,12 @@ The `crdt` module is responsible for:
 1. **Storing** these counters compactly and at bounded capacity (no allocation after construction).
 2. **Observing** local hits and **merging** observations heard from peers.
 3. **Emitting deltas** when a stored count rises and **emitting expirations** when an aged-out cell is freed, so an external aggregate store stays consistent with the active set.
-4. **Marking dirty** any cell that just changed, so the gossip layer knows what to send next.
-5. **Repairing** silently by rotating over the active set, so anti-entropy still converges when dirty tracking overflows.
-6. **Expiring** cells whose bucket has aged out of the live window.
+4. **Ordering** this node's own cells by when they last changed, so the gossip layer reads what each peer has not been sent.
+5. **Expiring** cells whose bucket has aged out of the live window.
 
 Everything in the module is single-threaded and bounded, with all capacities picked at `CellStore::new` time and never grown thereafter. The module-level comment says it plainly: *"Nothing in this module allocates after construction."* Two storage conventions enforce this. The store's own columns are `Box<[T]>` — slices that cannot grow, sized once at construction — while the caller-owned I/O containers (§5) are `Vec<T>` so that the caller can `clear()` them between frames and reuse the same capacity, calling `with_capacity` once at startup so they never reallocate in steady state.
 
-For the cluster-level protocol — anti-entropy, coverage fanout, threshold-fire emissions, peer selection — see [`README.md`](README.md#how-gossip-works). This document does not describe those; it describes the data structures the runtime drives.
+For the cluster-level protocol — streams, acks, threshold-fire emissions, join sweeps — see [`README.md`](README.md#how-gossip-works). This document does not describe those; it describes the data structures the runtime drives.
 
 ---
 
@@ -85,7 +80,6 @@ flowchart TB
         H["hash — mixers (mix64, hash_compact_cell_key, ...)"]
         D["dictionary — RuleDictionary, NodeDictionary"]
         I["index — Robin Hood hash table CellIndex"]
-        DR["dirty_ring — bounded ring DirtyRing"]
     end
 
     subgraph iolayer["IO containers"]
@@ -97,17 +91,16 @@ flowchart TB
     I --> H
     D --> H
     D --> I
-    CS --> DR
     CS --> IO
 ```
 
-§3 walks the four foundations bottom-up — they have no dependencies on the cell store and compose into it. §4 introduces the store; §5 the I/O containers; §6 traces a write through both; §7 covers gossip frame composition; §8 covers expiry.
+§3 walks the three foundations bottom-up — they have no dependencies on the cell store and compose into it. §4 introduces the store; §5 the I/O containers; §6 traces a write through both; §7 covers the own-stream list; §8 covers expiry.
 
 ---
 
 ## 3. Foundations
 
-These four submodules are the load-bearing primitives. They have no dependencies on the cell store itself, so it is easiest to understand them first; the cell store then composes them.
+These three submodules are the load-bearing primitives. They have no dependencies on the cell store itself, so it is easiest to understand them first; the cell store then composes them.
 
 ### 3.1 `hash` — deterministic mixers
 
@@ -119,7 +112,7 @@ File: `crates/gabion/src/crdt/hash.rs`.
 
 ```rust
 #[inline(always)]
-pub(super) fn mix64(mut h: u64) -> u64 {
+pub(crate) fn mix64(mut h: u64) -> u64 {
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h >> 33;
@@ -502,126 +495,6 @@ Each shifted entry's probe distance drops by exactly one.
 
 ---
 
-### 3.4 `dirty_ring` — the bounded change log
-
-File: `crates/gabion/src/crdt/dirty_ring.rs`.
-
-A `DirtyRing` is a fixed-capacity ring buffer of "this cell just changed" entries. The cell store keeps two of them: `local_dirty` for changes whose origin is this node, and `forwarded_dirty` for changes learned from peers.
-
-#### The entry
-
-```rust
-pub struct DirtyEntry {
-    pub handle: CellHandle,
-    pub origin_sequence: u64,
-}
-```
-
-The two fields play different roles. `handle` identifies which cell was touched; it is itself an `(index, generation)` pair, and the generation detects that a slot has been recycled to a different cell since the entry was written (§4.3). `origin_sequence` is the cell's per-origin sequence number at the moment of stamping, and it is what makes the ring safe to be lossy.
-
-When the gossip path drains the ring, it does not blindly trust every entry. `dirty_entry_current` checks three things: that the slot index is in range, that the slot's `generations[i]` still matches `handle.generation` (so the slot has not been recycled), and that the slot's `origin_sequences[i]` still equals the entry's `origin_sequence`.
-
-That last check is the point. If a later mutation on the same cell stamped a new sequence after this entry was pushed, the cell is already represented by the newer ring entry, and re-emitting the older one would only send stale state, so the check silently skips superseded entries. Duplicate entries for the same cell are therefore harmless, since only the most recent one ever passes validation, and the ring does not need to deduplicate on push.
-
-#### The ring
-
-```rust
-pub struct DirtyRing {
-    entries: Box<[DirtyEntry]>,
-    head:    u32,
-    len:     u32,
-}
-```
-
-| Field | Meaning |
-|-------|---------|
-| `entries`     | Heap-allocated fixed-size slot array. Sized once at construction. |
-| `head`        | Index where the **next** push will write. Always `0 <= head < capacity` when capacity > 0. |
-| `len`         | How many slots currently hold valid data. Grows up to `capacity` then saturates. |
-
-```mermaid
-flowchart LR
-    subgraph Ring["entries: Box&lt;[DirtyEntry; capacity]&gt;"]
-        direction LR
-        S0["0"] --> S1["1"] --> S2["2"] --> S3["3"] --> S4["..."] --> SN["cap-1"]
-        SN -.wraps.-> S0
-    end
-    HEAD(("head = next write")) -.points to.-> S2
-```
-
-`head` is the write cursor rather than a pointer to the newest entry — it is the address of the slot the next push will fill. The newest entry sits at `(head - 1) mod cap`, and the oldest is at `head` once the ring is full or at index `0` while it is still filling. There is no separate `tail`; that information is reconstructed on demand from `head` and `len`.
-
-While `len < capacity` the ring is *filling*: the oldest entry is at index `0`, the newest is at `head - 1`, and `head == len`. Once `len == capacity` the ring is *full*: the oldest entry is at `head`, and every push overwrites that slot.
-
-#### Push
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant App as Caller (CRDT mutation path)
-    participant Push as DirtyRing::push
-    participant Buf as entries[]
-    App->>Push: push(DirtyEntry { handle, origin_sequence })
-    alt capacity == 0
-        Push-->>App: (entry dropped)
-    else len < capacity
-        Push->>Push: len += 1
-        Push->>Buf: entries[head] = entry
-        Push->>Push: head = (head + 1) % cap
-        Push-->>App: ok
-    else len == capacity (full)
-        Push->>Buf: entries[head] = entry  (overwrites oldest)
-        Push->>Push: head = (head + 1) % cap
-        Push-->>App: ok (oldest entry lost)
-    end
-```
-
-Each push runs in constant time. `push` does not deduplicate, because deduplication would be `O(len)` or require an auxiliary set; redundant entries are filtered cheaply at read time by the `origin_sequence` check instead.
-
-#### Read
-
-`iter` yields entries in insertion order, oldest first. `ring_entry_at(ring, offset)` is the same arithmetic exposed as a single-shot read, and it exists for the hot `fill_gossip_frame` path, which calls mutating methods on `self` between successive entry reads. An iterator over `&self.local_dirty` would hold a shared borrow of `self` for the whole loop and forbid those mutations, whereas `ring_entry_at` takes a `&DirtyRing` only for the duration of one call, returns a copy, and lets go.
-
-There is no `pop` and no `drain`. The send path reads the ring non-destructively. Nothing in production clears it, so once full it holds the last `capacity` changes; `clear()` (reached through `CellStore::clear_dirty`, which benches and tests call) resets `head` and `len`.
-
-#### Overflow — bounded loss is fine
-
-If a burst of writes overflows the ring, the oldest entries are dropped and gone, and on its own that would be a correctness bug. The CRDT compensates by composing the dirty rings with a third lane — the repair cursor (§7.2) — that rotates over every active cell so that whatever the rings lose, the repair sweep rediscovers within one full rotation.
-
-```mermaid
-flowchart TB
-    subgraph Before["Before overflow (len == cap == 4)"]
-        direction LR
-        B0["A (oldest)"]:::filled --> B1["B"]:::filled --> B2["C"]:::filled --> B3["D (newest)"]:::filled
-    end
-    Before -.push E.-> After
-    subgraph After["After push(E): A is gone"]
-        direction LR
-        A0["E (newest)"]:::new --> A1["B (oldest)"]:::filled --> A2["C"]:::filled --> A3["D"]:::filled
-    end
-    classDef filled fill:#bfdbfe,stroke:#1e3a8a
-    classDef new fill:#fecaca,stroke:#7f1d1d
-```
-
-The dirty rings are the optimistic fast path, while the repair sweep
-([§7.2](#72-the-repair-cursor--the-third-lane)) is the
-eventual-consistency backstop that re-emits every active cell on a
-rotating schedule. Together they tolerate ring overflow: the lost
-entries are gone, but the repair sweep picks their cells up on the next
-rotation.
-
-#### Dirty ring invariants
-
-1. **Capacity is immutable.** `entries.len()` never changes after `with_capacity`.
-2. **Head bounds.** If `capacity() > 0`, then `0 <= head < capacity()`.
-3. **Length bounds.** `0 <= len <= capacity()`.
-4. **Logical contents.** The `len` valid entries, oldest to newest, are `entries[0..len]` if `len < capacity()`, otherwise the wrap-around slice starting at `entries[head]`.
-5. **No-op on zero capacity.** Every push is a no-op.
-6. **`clear` is total.** After `clear()`: `head == 0`, `len == 0`.
-7. **`ring_entry_at` is a partial function.** Out-of-bounds offsets panic via the slice index; callers in `crdt.rs` bound `offset < ring.len()` themselves.
-
----
-
 ## 4. The cell store
 
 With the foundations in hand, the store itself can be described. It is defined in the top-level `crates/gabion/src/crdt.rs`.
@@ -650,8 +523,9 @@ flowchart LR
       G[generations: u32]
       F[free_next: u32]
     end
-    subgraph dedup[Frame dedup]
-      M[selection_marks: u32]
+    subgraph stream[Own-stream list]
+      P[stream_prev: SlotLink u32]
+      N[stream_next: SlotLink u32]
     end
   end
 ```
@@ -783,8 +657,6 @@ The cell store takes a `ValidStorageConfig`, which only `Settings::validate` (`g
 | `cell_capacity`                         | `storage.max_cells`                  | `STORAGE_MAX_CELLS` = 131,072          |
 | `rule_dictionary_capacity`              | `storage.rule_dictionary_capacity`   | `max(STORAGE_RULE_DICTIONARY_FLOOR` = 256`, 2 × rules)`, resolved by `RuleTable::new` |
 | `node_dictionary_capacity`              | `storage.node_dictionary_capacity`   | twice `gossip.peer_capacity` (`GOSSIP_PEER_CAPACITY` = 512), 1,024 |
-| `local_dirty_capacity`                  | `storage.local_dirty_capacity`       | `STORAGE_LOCAL_DIRTY_CAPACITY` = 65,536 |
-| `forwarded_dirty_capacity`              | `storage.forwarded_dirty_capacity`   | `STORAGE_FORWARDED_DIRTY_CAPACITY` = 524,288 |
 
 `gabion::defaults` is the canonical home for the production tunables, and `gabion::settings` the one table both adapters (`gabion-server`, `gabion-nginx`) parse and validate them through. Each is an operator-visible setting — touching any of them is an operator decision, not a library-level one.
 
@@ -963,7 +835,7 @@ pub struct CellIdentity {       // portable
 
 ## 6. Data flow
 
-With the store, the I/O containers, and the four foundations defined, the trace through the system is direct.
+With the store, the I/O containers, and the three foundations defined, the trace through the system is direct.
 
 ### 6.1 Write: `ingest_local`
 
@@ -1037,7 +909,7 @@ sequenceDiagram
     participant Idx as CellIndex
     participant Cols as columns
     participant Seq as next_sequence_by_origin
-    participant DR as DirtyRing
+    participant OL as Own list
     participant Sink as DeltaSink
 
     Cl->>CS: upsert(UpsertSpec { …, mode }, sink)
@@ -1056,7 +928,7 @@ sequenceDiagram
             CS->>Cols: counts[slot] = current; last_update_millis[slot] = now
             CS->>Seq: seq = ++next_sequence_by_origin[origin_slot]
             CS->>Cols: origin_sequences[slot] = seq
-            CS->>DR: push_dirty(origin_slot, handle, seq)
+            CS->>OL: own cell: unlink_own(slot); link_own_tail(slot)
             CS->>Sink: emit_delta(slot, previous, current, delta, rule_slot)
             CS-->>Cl: return (delta in sink)
         end
@@ -1071,43 +943,23 @@ sequenceDiagram
             CS->>Cols: origin_sequences[slot] = seq
             CS->>CS: rule_dictionary.inc_ref(); node_dictionary.inc_ref()
             CS->>Idx: insert_unchecked(hash, slot)
-            CS->>DR: push_dirty(origin_slot, handle, seq)
+            CS->>OL: own cell: link_own_tail(slot)
             CS->>Sink: emit_delta(slot, 0, initial, initial, rule_slot)
             CS-->>Cl: return (delta in sink)
         end
     end
 ```
 
-The dirty-ring stamp is `seq`, not the new count. A subsequent update
-on the same cell allocates a fresh `seq` and pushes a new
-`DirtyEntry`, so the old entry — if it is still in the ring — is
-invalidated by the mismatch: `dirty_entry_current` checks the entry's
-`origin_sequence` against the cell's current
-`origin_sequences[slot]`, and stale ring entries quietly skip
-themselves on consumption. The delta row carries both `previous` and
-`current` so that a higher-level aggregator can fold without
-re-reading the store.
-
-#### Dirty stamping — which ring receives the entry?
-
-The routing decision is one comparison made inside `push_dirty`:
-
-```mermaid
-flowchart LR
-  U[upsert raised count] --> S{origin_slot == local_node_slot?}
-  S -- yes --> LD["local_dirty.push(DirtyEntry { handle, seq })"]
-  S -- no --> FD["forwarded_dirty.push(DirtyEntry { handle, seq })"]
-```
-
-The `local_dirty` lane is what gets gossiped first, since it carries changes this node originated; the `forwarded_dirty` lane is what we re-broadcast on behalf of peers as anti-entropy via forwarding.
-
-`ingest_local` hard-codes `origin_slot: self.local_node_slot`, so its writes always land in `local_dirty`. `merge_remote` passes through the peer's interned slot, which falls through into `forwarded_dirty` for remote-origin observations or, if the peer happens to be relaying something our local node originated, back into `local_dirty`.
+Every raise draws a fresh `seq`, so an own cell raised again moves to the
+tail of the own list, behind every cell that changed before it. The delta
+row carries both `previous` and `current` so that a higher-level
+aggregator can fold without re-reading the store.
 
 #### The per-origin sequence allocator
 
 `next_sequence_by_origin` is sized to `node_dictionary_capacity`. Each origin gets its own monotonic counter, and `next_origin_sequence` saturating-adds one before returning, so the first sequence ever minted is 1; a `0` read back from a never-allocated origin slot means "nothing here yet."
 
-The sequence disambiguates ring entries for the same cell, since only the latest entry survives validation. When a node slot is freed by refcount, the counter for that slot is reset.
+For this node's own slot the counter is the own stream's head (`own_head()`); the slot is pinned (below), so the head never resets. When any other node slot is freed by refcount, its counter is reset.
 
 #### The `local_node_slot` pin
 
@@ -1124,80 +976,39 @@ All read primitives are lock-free.
 | `find(key) -> Option<CellHandle>` | Hashes the key, walks `CellIndex` until a probe hit matches all five cold columns. Returns the generation-tagged handle. |
 | `resolve(handle) -> Option<u32>` | Bounds-checks, then `generations[handle.index] == handle.generation && (handle.generation & 1) == 1`. |
 | `get(handle) -> Option<CellRow>` | Reads every column for a slot and assembles a snapshot. |
-| `active_handles()` | Diagnostic helper that walks `0..capacity` and yields handles only for slots with odd generation. Scans the full capacity, not just `active_len`; not for hot paths. |
+| `active_handles(from)` | Walks `from..capacity` and yields handles only for slots with odd generation. Scans the slots, not just `active_len`: a join sweep takes one page of it per round, resuming at `from`; otherwise for diagnostics and tests. |
 
-There is no atomic "snapshot the whole store" operation. The structure is single-threaded, so a snapshot is logically the iterator `active_handles().map(|h| store.get(h).unwrap())`; higher layers persist via the `DeltaSink`/`ExpirationSink` streams.
+There is no atomic "snapshot the whole store" operation. The structure is single-threaded, so a snapshot is logically the iterator `active_handles(0).map(|h| store.get(h).unwrap())`; higher layers persist via the `DeltaSink`/`ExpirationSink` streams.
 
 ---
 
 <a id="gossip-and-convergence"></a>
-## 7. Gossip and convergence
+## 7. The own-stream list
 
-A node converges with its peers through three lanes that the cell store composes into each gossip frame.
+The gossip runtime sends each peer this node's own cells that changed
+since it last sent that peer anything: its *own stream*, numbered by
+`origin_sequence` (README, "Streams, acks and join sweeps"). The store
+keeps those cells on one intrusive doubly linked list threaded through
+two columns, `stream_prev` and `stream_next`, with its ends in
+`own_list`. A `SlotLink` is a slot index or `NONE` (`u32::MAX`, never a
+slot, since the capacity is at most 2^30); readers see `get() ->
+Option<u32>`.
 
-### 7.1 The two dirty rings
+**Invariant.** The own list holds exactly the live cells whose origin is
+`local_node_slot`, in strictly ascending `origin_sequences`; a free or
+remote slot is in no list.
 
-The store keeps two `DirtyRing`s (see §3.4 for the ring buffer itself) side by side:
+**Maintenance**, `O(1)` per cell: `upsert` appends an inserted own cell at
+the tail, and unlinks then re-appends a raised one (its new sequence is the
+largest); `free_cell_at` unlinks a freed own cell.
 
-| Field            | Origin of entries                                                   | Gossip lane |
-|------------------|---------------------------------------------------------------------|-------------|
-| `local_dirty`    | Updates whose origin is **this** node (`origin == local_node_slot`).| Lane 1 — emitted first in `fill_gossip_frame`. |
-| `forwarded_dirty`| Updates received from **other** nodes that this node is relaying.   | Lane 2 — emitted after the local ring fills its share of the frame. |
-
-The `DirtyRing` type itself does not care which lane it is — both instances are identical implementations. The split is a policy decision: locally-originated updates ship before forwarded ones so that a hot local writer does not starve on relayed chatter, and each ring has its own configurable capacity.
-
-`visit_forwarded_dirty` streams the ring entries through a caller closure, validating each entry with `dirty_entry_current` and silently skipping stale entries. It does not deduplicate, so a multi-lane composer must dedup itself (§7.3).
-
-### 7.2 The repair cursor — the third lane
-
-The dirty rings have finite capacity. If a burst of writes overflows the ring, the oldest entries are dropped and gone, and on their own the dirty rings can lose information.
-
-The repair cursor is the safety net. It is a `u32` that rotates over `0..capacity` and, on each gossip frame, sweeps forward a small slice and emits handles for any active slot it lands on. The cursor only advances on slots it actually visited, so a partial sweep resumes where it left off on the next frame. Over many frames every active cell is therefore guaranteed to be retransmitted at least once per full rotation, which is the convergence property dirty-only gossip cannot give you on its own.
-
-### 7.3 `fill_gossip_frame` and per-frame dedup
-
-`fill_gossip_frame(max_cells, out)` stitches the three lanes together in priority order — local dirty, then forwarded dirty, then a rotating repair slice — into a single output buffer of cell handles capped at `max_cells`. The gossip runtime calls this once per outgoing frame.
-
-Per-frame deduplication is O(1) and allocation-free. Every frame, `bump_selection_epoch` increments `selection_epoch`, and `mark_selected(slot)` writes the current epoch into `selection_marks[slot]`; if the slot was already marked this epoch, the caller skips it. Lane 3 therefore naturally cannot re-emit a cell that lanes 1 or 2 already pushed.
-
-```mermaid
-sequenceDiagram
-    participant App as Gossip layer
-    participant CS as CellStore::fill_gossip_frame
-    participant LD as local_dirty
-    participant FD as forwarded_dirty
-    participant SM as selection_marks
-    participant RC as repair_cursor
-
-    App->>CS: fill_gossip_frame(max_cells=N, out)
-    CS->>CS: out.clear(); bump_selection_epoch()
-    loop over local_dirty (oldest first)
-        CS->>LD: ring_entry_at(offset)
-        CS->>CS: dirty_entry_current(entry)?
-        CS->>SM: mark_selected(slot)?
-        alt fresh & not yet marked
-            CS->>App: out.push(handle)
-        end
-    end
-    loop over forwarded_dirty
-        CS->>FD: ring_entry_at(offset)
-        CS->>CS: dirty_entry_current(entry)?
-        CS->>SM: mark_selected(slot)?
-        alt fresh & not yet marked
-            CS->>App: out.push(handle)
-        end
-    end
-    loop rotating from repair_cursor until budget filled or full sweep
-        CS->>CS: is_active(slot)?
-        CS->>SM: mark_selected(slot)?
-        alt active & not yet marked
-            CS->>App: out.push(handle)
-        end
-    end
-    CS->>RC: repair_cursor = next_cursor
-```
-
-The `selection_epoch` is a `u32` that wraps. On wrap to zero, `bump_selection_epoch` does a one-shot scrub of `selection_marks` and resets the epoch to 1 so the new epoch is unambiguous. Since `u32` epochs cover billions of frames, the wraparound branch exists as cheap insurance rather than a real hot path.
+**Reading.** `stream_after(sent, max, out)` fills `out` with the live own
+cells above `sent`, ascending, at most `max`. It starts from the head when
+`sent` is below the head's sequence (a new peer, or a stream rewound to
+0), else walks back from the tail to the first cell above `sent`, then
+iterates forward: `O(returned + cells walked)`, so a steady-state round
+reads only the few cells that changed. The `stream/after` bench pins both
+walks.
 
 <a id="expiry"></a>
 ## 8. Expiry
@@ -1232,7 +1043,7 @@ A small concrete sequence that ties the previous sections together.
 - `next_sequence_by_origin[local_node_slot]` advances to 1; `origin_sequences[0] = 1`.
 - Dictionary refs incremented for both rule and node.
 - `CellIndex` inserts `(hash, 0)`.
-- `local_dirty` pushes `DirtyEntry { handle: { 0, 1 }, origin_sequence: 1 }`.
+- Slot 0 is appended to the own list, now `[0]`.
 - `DeltaSink` row appended: `(handle {0,1}, CellIdentity { R1_fingerprint, K, 42 }, previous=0, current=1, delta=1, applies_locally=true)`.
 
 **Step 2 — another local hit on the same cell, count 5.**
@@ -1240,7 +1051,7 @@ A small concrete sequence that ties the previous sections together.
 - `lookup_index` finds slot 0.
 - `mode = Accumulate { hits: 5 }`, `previous = 1`, `next = previous.saturating_add_hits(5) = 6`.
 - `counts[0] = 6`, sequence advances to 2, `origin_sequences[0] = 2`.
-- `local_dirty` pushes a *new* entry for slot 0 with sequence 2. The earlier entry with sequence 1 is now stale — `dirty_entry_current` next frame sees `origin_sequences[0] = 2 ≠ 1` and skips it.
+- Slot 0 is unlinked and re-appended at the own list's tail; `stream_after(1, …)` now returns it, where `stream_after(2, …)` does not.
 - `DeltaSink` row appended: `(handle, identity, 1, 6, 5, ...)`.
 
 **Step 3 — bucket 42 expires.**
@@ -1278,12 +1089,11 @@ The whole structure relies on the following properties. They are grouped by subm
 5. **Dictionary refcounts cover exactly the live cells.** Insert path calls `inc_ref` on both dictionaries; `free_cell_at` calls `dec_ref`. The local node slot has one extra permanent refcount (pin).
 6. **`active_len` equals the number of slots with odd generation.** Maintained by `alloc_slot` (`+= 1`) and `free_slot` (`-= 1`).
 7. **`origin_sequences[slot]` is monotonically non-decreasing while a slot is active.** `next_origin_sequence` allocates before each write.
-8. **A `DirtyEntry` is consumable iff `generations[idx] == entry.handle.generation` and `origin_sequences[idx] == entry.origin_sequence`.** Both checks inside `dirty_entry_current`.
+8. **The own list holds exactly the live own cells, in strictly ascending `origin_sequences`.** `upsert` relinks; `free_cell_at` unlinks.
 9. **`CellHandle` is resolvable iff in-range, generation matches, low bit is set.**
-10. **`selection_marks[slot] == selection_epoch`** means the slot has been emitted in the current frame composition; per-frame dedup relies on this.
-11. **`next_sequence_by_origin[node_slot]` is reset to 0 only when the node slot is fully freed** (refcount drops to zero in `free_cell_at`).
-12. **`expire` emits each freed cell into the `ExpirationSink` before calling `free_cell_at`.** The descriptor lookup for the portable `CellIdentity` would otherwise see a dropped refcount.
-13. **No allocation after construction.**
+10. **`next_sequence_by_origin[node_slot]` is reset to 0 only when the node slot is fully freed** (refcount drops to zero in `free_cell_at`); the pinned local slot never is.
+11. **`expire` emits each freed cell into the `ExpirationSink` before calling `free_cell_at`.** The descriptor lookup for the portable `CellIdentity` would otherwise see a dropped refcount.
+12. **No allocation after construction.**
 
 ### Dictionaries
 
@@ -1317,16 +1127,6 @@ The whole structure relies on the following properties. They are grouped by subm
 6. No reserved values other than `u32::MAX` in `slot_indexes`.
 7. Allocation-free after construction.
 
-### Dirty ring
-
-1. Capacity is immutable.
-2. `0 <= head < capacity()`.
-3. `0 <= len <= capacity()`.
-4. Logical contents are `entries[0..len]` while filling, else the wrap-around slice starting at `head`.
-5. Zero capacity is a no-op.
-6. `clear` is total.
-7. `ring_entry_at` panics on out-of-bounds; callers bound the offset.
-
 ### I/O containers
 
 1. Parallel column lengths.
@@ -1347,7 +1147,6 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `RuleDictionary`, `NodeDictionary` | `dictionary` | Bounded interners with refcounts and their own free-list lifecycle. |
 | `RuleDescriptor`, `NodeDescriptor` | `dictionary` | Per-slot payload for each dictionary. |
 | `pow2_index_capacity_for` | `dictionary` | Power-of-two sizing helper for `CellIndex`. |
-| `DirtyRing`, `DirtyEntry`, `ring_entry_at` | `dirty_ring` | Bounded ring of recent changes; when full, a push overwrites the oldest. |
 | `hash_compact_cell_key`, `hash_fingerprint`, `hash_node_identity`, `mix64` | `hash` | SplitMix / MurmurHash-style mixers. |
 | `CellIndex` | `index` | Robin Hood open-addressing hash table, backshift deletion, power-of-two capacity. |
 | `Observation`, `ObservationBatch`, `DeltaSink`, `ExpirationSink` | `io` | SoA input row + input/output buffers. |
@@ -1360,15 +1159,12 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `capacity()`, `active_len()`, `is_empty()`, `stats()` | Observability. |
 | `find(key)` | Hash-index lookup by `CompactCellKey`. |
 | `resolve(handle)`, `get(handle)` | Handle-based reads. |
-| `active_handles()` | Diagnostic full-scan iterator. |
+| `active_handles(from)` | Slot-order iterator from `from`: sweep pages, diagnostics. |
+| `own_head()`, `stream_after(sent, max, out)` | The own stream's head, and its live cells above `sent` (§7). |
 | `ingest_local(obs, sink)` | Apply locally observed hits (saturating add). |
 | `merge_remote(obs, sink)` | Merge peer observations (max-merge). |
 | `expire(current_epoch_by_rule, live_buckets, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell, stopping with `Expiry::More` when the sink is full. |
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
-| `clear_dirty()` | Drop the dirty rings; stored cells untouched. |
-| `visit_forwarded_dirty` | Stream the forwarded dirty lane (no dedup). |
-| `fill_gossip_frame(max, out)` | Compose a frame: local dirty + forwarded dirty + repair slice, deduped. |
-| `repair_cursor()` | Read the current cursor position. |
 
 ---
 
@@ -1399,10 +1195,9 @@ CRDT-internal terms first; a couple of cluster-wide terms repeated here for self
 - **Origin.** Node that originally produced a write. Origin tags do not change when peers forward an update.
 - **Origin sequence.** Per-origin monotonic `u64` counter, allocated on every write.
 - **Probe distance.** How far an entry sits from its ideal slot, measured along the probe sequence.
-- **Repair cursor.** A `u32` that rotates over every active slot to retransmit cells the dirty rings missed.
 - **Robin Hood hashing.** Linear probing with displacement-equalising swaps on insert.
 - **Saturating arithmetic.** Operations that clamp at the type's max instead of overflowing. The whole module uses saturating adds so a hot counter can never wrap to zero.
 - **Slot.** Index in `0..capacity` into the SoA columns.
-- **Stamping.** Writing a `DirtyEntry` after mutating a cell.
+- **Own stream.** This node's own cells in the order they last changed; the own list holds it (§7).
 - **`UpsertSpec` / `UpsertMode`.** The struct/enum pair that makes "local hits" and "remote observed counts" mutually exclusive at the type level inside the shared `upsert` core (§6.3).
 - **Tombstone.** Deleted-but-don't-skip marker in some open-addressed tables. Not used here.

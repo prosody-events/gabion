@@ -4,7 +4,8 @@
 //! rather than abstract "warm vs cold" knobs:
 //!
 //! * `ingest_local/steady_state`  — 95% updates on existing cells + 5% inserts;
-//!   traffic Pareto-distributed across 8 rules and 4 active buckets.
+//!   traffic Pareto-distributed across 8 rules and 4 active buckets. Each raise
+//!   also moves the cell to the own list's tail.
 //! * `ingest_local/traffic_burst` — 99% updates on a tight hot subset; a
 //!   Slashdot/spike pattern under one rule.
 //! * `ingest_local/cold_start`    — empty store filling under realistic key
@@ -22,10 +23,11 @@
 //! * `find/miss`                  — pure miss path, for the Robin Hood
 //!   early-exit baseline.
 //!
-//! * `fill_gossip_frame/steady_state` — moderately loaded node: some dirty
-//!   entries + repair lane filling the rest of a 128-cell frame budget.
-//! * `fill_gossip_frame/repair_only`  — dirty rings empty (gossip went idle);
-//!   pure repair sweep.
+//! * `stream/after`               — reading one peer's own-stream frame from
+//!   the own list in a production-sized store holding `prod-peak`'s 20,070 and
+//!   `prod-4x`'s 79,440 own cells: the steady state (`sent` two below the head,
+//!   the walk back from the tail) and a stream rewound to 0 (the walk from the
+//!   head, one quantum of 1,024 cells).
 //!
 //! * `expire/window_turnover`     — one bucket out of four ages out per call;
 //!   the steady-state expiry pattern.
@@ -89,7 +91,7 @@ use gabion::wire::{
 };
 
 // ---------------------------------------------------------------------------
-// SplitMix64 RNG. Deterministic so iteration order is reproducible.
+// A splitmix RNG. Deterministic so iteration order is reproducible.
 // ---------------------------------------------------------------------------
 
 struct Rng(u64);
@@ -120,7 +122,6 @@ impl Rng {
 const CELL_CAPACITY: u32 = 16_384;
 const RULE_CAPACITY: u16 = 64;
 const NODE_CAPACITY: u16 = 64; // 1 local + ~63 peers
-const DIRTY_CAPACITY: u32 = 256;
 
 /// Distinct rate-limit rules a node enforces. Production fleets typically
 /// have anywhere from a handful to a few hundred; 8 is enough to exercise
@@ -153,8 +154,6 @@ fn config() -> ValidStorageConfig {
         rule_dictionary_capacity: Some(RULE_CAPACITY.try_into().expect(nz)),
         node_dictionary_capacity: Some(NODE_CAPACITY.try_into().expect(nz)),
         peer_capacity: (NODE_CAPACITY - 1).try_into().expect(nz),
-        local_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
-        forwarded_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
         ..Settings::default()
     };
     settings.validate().expect("bench settings validate").1
@@ -953,61 +952,46 @@ impl std::fmt::Write for SliceWriter<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// fill_gossip_frame — outbound gossip composition.
+// stream/after — one peer's own-stream frame.
 // ---------------------------------------------------------------------------
 
-fn bench_fill_gossip_frame(c: &mut Criterion) {
-    let mut group = c.benchmark_group("crdt/fill_gossip_frame");
-    group.throughput(Throughput::Elements(128));
+/// The quantum at the default `storage.max_cells`: ⌈131,072 / 128⌉ cells.
+const QUANTUM: usize = 1_024;
 
-    let fixture = build_fixture();
-
-    // ─── steady_state ───────────────────────────────────────────────────
-    // Moderately loaded node: dirty rings contain ~64 recent updates;
-    // repair lane fills the remaining 64 slots of a 128-handle frame.
-    let mut steady = fixture.store.clone();
-    {
-        // Generate ~64 recent local updates so local_dirty has entries.
-        let mut rng = Rng::new(0xD1_D1_D1);
-        let mut obs = ObservationBatch::with_capacity(64);
-        let mut sink = DeltaSink::with_capacity(64);
-        for _ in 0..64 {
-            let key = pareto_key(&mut rng, &fixture.hot_keys, &fixture.warm_keys);
-            let rule_idx = pick_rule(&mut rng) as usize;
+fn bench_stream_after(c: &mut Criterion) {
+    let mut group = c.benchmark_group("stream/after");
+    let settings = Settings::default();
+    let (_, storage) = settings.validate().expect("default settings validate");
+    let rules = rules(1, "100r/s", Duration::from_secs(1), &storage);
+    let fingerprint = rules.rules()[0].fingerprint();
+    for own_cells in [20_070_u32, 79_440] {
+        let mut store = CellStore::new(storage, local_identity(), &rules);
+        let mut obs = ObservationBatch::with_capacity(1);
+        let mut sink = DeltaSink::with_capacity(1);
+        for key in 0..own_cells {
+            obs.clear();
+            sink.clear();
             obs.push(obs_row(
-                fixture.rule_fps[rule_idx],
-                KeyHash(key),
+                fingerprint,
+                KeyHash(u128::from(key)),
                 0,
                 LOCAL_NODE,
                 LOCAL_INCARNATION,
                 1,
                 0,
             ));
+            store.ingest_local(&obs, &mut sink);
         }
-        steady.ingest_local(&obs, &mut sink);
+        let head = store.own_head();
+        let mut out = Vec::<CellHandle>::with_capacity(QUANTUM);
+        for (case, sent) in [("steady", head - 2), ("rewound", 0)] {
+            store.stream_after(sent, QUANTUM, &mut out);
+            group.throughput(Throughput::Elements(out.len() as u64));
+            group.bench_function(BenchmarkId::new(case, own_cells), |b| {
+                b.iter(|| store.stream_after(black_box(sent), QUANTUM, black_box(&mut out)));
+            });
+        }
     }
-    group.bench_function("steady_state", |b| {
-        // fill_gossip_frame only mutates selection_marks (per-frame
-        // ephemeral) and repair_cursor (advances round-robin); over many
-        // iterations the repair cursor wraps but no identity changes ⇒
-        // iter without cloning.
-        let mut out = Vec::<CellHandle>::with_capacity(128);
-        b.iter(|| {
-            steady.fill_gossip_frame(black_box(128), black_box(&mut out));
-        });
-    });
-
-    // ─── repair_only ────────────────────────────────────────────────────
-    // Dirty rings drained; frame composition is entirely the repair scan.
-    let mut repair = fixture.store.clone();
-    repair.clear_dirty();
-    group.bench_function("repair_only", |b| {
-        let mut out = Vec::<CellHandle>::with_capacity(128);
-        b.iter(|| {
-            repair.fill_gossip_frame(black_box(128), black_box(&mut out));
-        });
-    });
-
     group.finish();
 }
 
@@ -1142,10 +1126,8 @@ fn bench_wire(c: &mut Criterion) {
     // ─── encode_128 ────────────────────────────────────────────────────
     // Compose a 128-cell frame from the fixture, then encode into a
     // pre-allocated buffer. Resembles the runtime's per-tick send path.
-    let mut encode_store = fixture.store.clone();
-    let mut handles = Vec::<CellHandle>::with_capacity(128);
-    encode_store.fill_gossip_frame(128, &mut handles);
-    let handles = handles; // freeze for the closure
+    let encode_store = fixture.store.clone();
+    let handles: Vec<CellHandle> = encode_store.active_handles(0).take(128).collect();
     group.bench_function("encode_128", |b| {
         let mut scratch = WireScratch::for_store(&encode_store);
         let mut buf = PacketBuf::for_limits(limits);
@@ -1168,10 +1150,8 @@ fn bench_wire(c: &mut Criterion) {
     // 4096-cell fixture under the production 1,400-byte budget, at most 33
     // cells a packet. Measures the steady-state multi-packet emission rate —
     // drains the full handle list across however many packets it takes.
-    let mut multi_store = fixture.store.clone();
-    let mut multi_handles = Vec::<CellHandle>::with_capacity(4096);
-    multi_store.fill_gossip_frame(4096, &mut multi_handles);
-    let multi_handles = multi_handles;
+    let multi_store = fixture.store.clone();
+    let multi_handles: Vec<CellHandle> = multi_store.active_handles(0).take(4096).collect();
     let multi_limits = FrameLimits::new(GOSSIP_MAX_PAYLOAD_BYTES).unwrap();
     // Sanity-check the bench actually exercises the multi-packet path.
     {
@@ -1421,8 +1401,6 @@ fn bench_inbound(c: &mut Criterion) {
     let nz = "bench capacities are non-zero";
     let settings = Settings {
         max_cells: CELL_CAPACITY.try_into().expect(nz),
-        local_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
-        forwarded_dirty_capacity: DIRTY_CAPACITY.try_into().expect(nz),
         cluster_id_hash: wire_header().cluster_id_hash,
         ..Settings::default()
     };
@@ -1447,7 +1425,7 @@ fn bench_inbound(c: &mut Criterion) {
     }
     sender.ingest_local(&obs, &mut DeltaSink::with_capacity(2));
     let mut handles = Vec::with_capacity(2);
-    sender.fill_gossip_frame(2, &mut handles);
+    sender.stream_after(0, 2, &mut handles);
     let limits = FrameLimits::new(GOSSIP_MAX_PAYLOAD_BYTES).expect("default payload");
     let mut buf = PacketBuf::for_limits(limits);
     let mut scratch = WireScratch::for_store(&sender);
@@ -1496,7 +1474,7 @@ criterion_group!(
     bench_merge_remote,
     bench_find,
     bench_admission_headers,
-    bench_fill_gossip_frame,
+    bench_stream_after,
     bench_expire,
     bench_wire,
     bench_aggregate,

@@ -7,8 +7,6 @@ pub const STORAGE_MAX_CELLS: usize = 131_072;
 /// Floor of the rule dictionary's default capacity, `max(256, 2 × rules)`;
 /// `storage.rule_dictionary_capacity` overrides it.
 pub const STORAGE_RULE_DICTIONARY_FLOOR: u16 = 256;
-pub const STORAGE_LOCAL_DIRTY_CAPACITY: usize = 65_536;
-pub const STORAGE_FORWARDED_DIRTY_CAPACITY: usize = 524_288;
 
 pub const STORAGE_MAX_DESCRIPTOR_COUNT: u16 = 16;
 pub const STORAGE_MAX_DESCRIPTOR_BYTES: usize = 512;
@@ -28,49 +26,11 @@ pub const STORAGE_MAX_REQUEST_DESCRIPTORS: u16 = 16;
 
 pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 
-/// Floor on the number of peers contacted per gossip tick. The runtime does
-/// **not** treat this as the operating fanout — it scales the actual per-tick
-/// fanout up to the coverage threshold `⌈ln(n) + GOSSIP_COVERAGE_MARGIN⌉`
-/// (`n` = live peer count), capped at the peer count. This floor is a hard
-/// minimum: it binds only if `GOSSIP_COVERAGE_MARGIN` is lowered far enough
-/// that the coverage threshold drops below it. At the shipped margin it never
-/// binds. See `handle_gossip_tick` in `gossip/runtime.rs`.
-pub const GOSSIP_FANOUT: usize = 3;
-
 /// Default of `gossip.peer_capacity`, the most peers one node gossips with:
 /// 300 pods with 1.7x headroom. The node dictionary's default is twice it.
 pub const GOSSIP_PEER_CAPACITY: u16 = 512;
 
-/// Coverage margin `c` in the gossip fanout law `⌈ln(n) + c⌉` (`n` = live peer
-/// count). Per Kermarrec, Massoulié & Ganesh (IEEE TPDS 2003, "Probabilistic
-/// Reliable Dissemination in Large-Scale Systems", Theorem 1), a directed
-/// gossip round with mean fanout `ln(n) + c` reaches every node with
-/// probability → `e^(−e^(−c))`:
-///
-/// | `c`   | per-round coverage `e^(−e^(−c))` |
-/// |-------|----------------------------------|
-/// | **3** | **95.1 %**                       |
-/// | 4     | 98.2 %                           |
-/// | 5     | 99.3 %                           |
-///
-/// **These are single-round figures, and the single round is the wrong unit
-/// for gabion.** KMG's theorem bounds one *one-shot* dissemination; gabion
-/// instead runs continuous anti-entropy — it re-gossips every dirty cell each
-/// tick, with the repair lane behind that. So a node missed in one round is
-/// overwhelmingly likely to be reached by the next, and the per-round coverage
-/// *compounds*: at `c = 3` the 4.9 % per-round miss falls to ≈ 0.24 % after two
-/// rounds and ≈ 0.012 % after three. We therefore size to the leaner `c = 3`
-/// threshold and let anti-entropy close the gap, rather than paying KMG's
-/// one-shot `c ≈ 4` (their validated sims — fanout 13 @ 10 000 nodes, 15 @ 50
-/// 000 — measure single-shot reach, which a re-gossiping system does not need
-/// to match). `c = 3` costs ≈ 1 fewer peer per tick at every cluster size (≈ 10
-/// % less gossip bandwidth). Kept a `const`; promote to a setting in
-/// `gabion::settings` if an operator ever needs to trade bandwidth for coverage
-/// at runtime.
-pub const GOSSIP_COVERAGE_MARGIN: f64 = 3.0;
-
 pub const GOSSIP_MAX_PAYLOAD_BYTES: usize = 1400;
-pub const GOSSIP_MAX_CELLS_PER_TICK: usize = 4096;
 pub const GOSSIP_LIMIT_QUEUE_CAPACITY: usize = 8192;
 
 /// Receive buffer, in bytes, the gossip socket asks the kernel for: 4 MiB.
@@ -104,8 +64,25 @@ pub const GOSSIP_TARGET_ERR_BPS: u32 = 100;
 /// `GOSSIP_TICK_INTERVAL_MILLIS`).
 pub const GOSSIP_MIN_EMIT_INTERVAL_MS: u64 = 5;
 
-pub fn random_rng_seed() -> Result<u64, getrandom::Error> {
-    let mut bytes = [0_u8; 8];
-    getrandom::fill(&mut bytes)?;
-    Ok(u64::from_ne_bytes(bytes))
-}
+/// Gap reports a receiver sends for one gap without progress before it
+/// abandons the gap and logs `gap_abandoned`; also the requests a join sweep
+/// sends one source before it asks the next.
+pub const GOSSIP_GAP_REPORTS: u8 = 4;
+
+/// Sources a starting node asks for a join sweep: its highest-weight heard
+/// peers, fewer when it has heard fewer.
+pub const GOSSIP_SWEEP_PEERS: usize = 2;
+
+/// Default of `gossip.sweep_concurrency`, the most join sweeps one node
+/// answers at once.
+pub const GOSSIP_SWEEP_CONCURRENCY: u8 = 4;
+
+/// A lower bound on the receive-buffer bytes the kernel charges one queued
+/// datagram. A round reads at most the granted receive bytes over this many
+/// waiting datagrams, so an inbound flood cannot hold it.
+pub const GOSSIP_MIN_DATAGRAM_CHARGE: usize = 512;
+
+/// The prompt rounds in which a full store's backlog drains to one peer: the
+/// per-round quantum of cells per stream per peer is
+/// `max(⌈storage.max_cells / this⌉, cells in one packet)`.
+pub const GOSSIP_BACKLOG_ROUNDS: usize = 128;

@@ -53,9 +53,8 @@ import type { SimConfig } from './sim/types';
  *  counter and the convergence story stays about one number. */
 export const WATCHED_KEY = 1;
 
-/** The cluster size the presets build. A ring of 12 reads cleanly and gabion's
- *  gossip still saturates it in a couple of rounds (coverage fanout ⌈ln(11)+c⌉
- *  reaches most peers each tick). */
+/** The cluster size the presets build. A ring of 12 reads cleanly, and each
+ *  heartbeat sends a node's new counts straight to every peer. */
 const NODES = 12;
 
 /** The rule limit the narrative presets pin (burst, steady, partition, loss,
@@ -79,7 +78,6 @@ const OVERLOAD_RATE_PER_SEC = 80;
 /** The subset of `SimConfig` the rebuild sliders own. */
 export interface Knobs {
   nodes: number;
-  fanout: number;
   target_err_bps: number;
   uniform_loss: number;
   rule_limit: number;
@@ -98,7 +96,6 @@ export interface Knobs {
 export function knobsFromPreset(preset: Preset, defaults: SimConfig): Knobs {
   return {
     nodes: preset.config.nodes ?? NODES,
-    fanout: preset.config.fanout ?? defaults.fanout,
     target_err_bps: preset.config.target_err_bps ?? defaults.target_err_bps,
     uniform_loss: preset.config.uniform_loss ?? defaults.uniform_loss,
     rule_limit: preset.config.rule_limit ?? defaults.rule_limit,
@@ -154,7 +151,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Traffic burst',
     blurb:
       'One node takes a 50-hit burst on top of a faint background hum. Play to watch the burst gossip out — and the cluster keep gossiping long after it ages out.',
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
+    config: { nodes: NODES, rule_limit: NARRATIVE_LIMIT },
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
     async seed(sim) {
       await sim.submitRequest(0, WATCHED_KEY, 50);
@@ -164,7 +161,7 @@ export const PRESETS: readonly Preset[] = [
     id: 'steady',
     label: 'Steady state',
     blurb: 'Light traffic, scattered across the cluster. It converges at once — the calm baseline.',
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
+    config: { nodes: NODES, rule_limit: NARRATIVE_LIMIT },
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
     async seed(sim) {
       for (const node of [0, 3, 6, 9]) {
@@ -181,7 +178,7 @@ export const PRESETS: readonly Preset[] = [
     // budget then keeps ε well under 1, so eager flushing tracks the climb
     // tightly. The uncapped feed plateaus at ≈ rate·window ≈ 800 — twice the
     // limit — once expiry balances injection, so it sits in the band perpetually.
-    config: { nodes: NODES, rng_seed: 1, rule_limit: 400 },
+    config: { nodes: NODES, rule_limit: 400 },
     traffic: { rate_per_sec: OVERLOAD_RATE_PER_SEC },
     showsLimitChart: true,
     async seed() {
@@ -193,7 +190,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Network partition',
     blurb:
       'The cluster splits in two; one half bursts. The severed half never hears the burst — heal the network to watch the halves reconcile.',
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
+    config: { nodes: NODES, rule_limit: NARRATIVE_LIMIT },
     usesNetwork: true,
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
     async seed(sim) {
@@ -206,7 +203,7 @@ export const PRESETS: readonly Preset[] = [
     id: 'loss',
     label: 'Packet loss',
     blurb: 'Every link drops 30% of packets. Convergence still arrives — just over more rounds.',
-    config: { nodes: NODES, rng_seed: 1, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
+    config: { nodes: NODES, uniform_loss: 0.3, rule_limit: NARRATIVE_LIMIT },
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
     async seed(sim) {
       await sim.submitRequest(0, WATCHED_KEY, 50);
@@ -217,7 +214,7 @@ export const PRESETS: readonly Preset[] = [
     label: 'Node isolation & heal',
     blurb:
       'One node is cut off while a burst spreads. Heal it and it re-syncs by gossip catch-up — it kept its state, so no counts are lost.',
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
+    config: { nodes: NODES, rule_limit: NARRATIVE_LIMIT },
     usesNetwork: true,
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
     async seed(sim) {
@@ -231,15 +228,15 @@ export const PRESETS: readonly Preset[] = [
     id: 'sandbox',
     label: 'Sandbox',
     blurb:
-      'A blank, quiet cluster — no background traffic. Click a node (or Send a burst), then Step to gossip the cell out one round at a time: watch it spread hop by hop, converge, and age back to quiet once the window slides past it. You drive every tick.',
+      'A blank, quiet cluster — no background traffic. Click a node (or Send a burst), then Step to gossip the cell out one round at a time: one heartbeat sends it straight to every peer, then it ages back to quiet once the window slides past it. You drive every tick.',
     // No traffic feed and an empty seed: the cluster starts silent and the user
     // drives every hit by hand, advancing one gossip tick at a time with Step.
     // The narrative limit (not the low default) so the eager threshold flush
-    // never fires — a single burst then spreads *only* on Step, one lazy
-    // heartbeat round per tick, which is the whole point of this scenario. (The
+    // never fires — a single burst then spreads *only* on Step, at the next
+    // heartbeat, which is the whole point of this scenario. (The
     // limit-crossing / rejection story is the `overload` preset's job, where the
     // aggregate genuinely climbs past a low limit.)
-    config: { nodes: NODES, rng_seed: 1, rule_limit: NARRATIVE_LIMIT },
+    config: { nodes: NODES, rule_limit: NARRATIVE_LIMIT },
     async seed() {
       // Deliberately empty — the user injects the first hit.
     },

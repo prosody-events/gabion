@@ -26,7 +26,6 @@ use gabion::discovery::{self, DiscoveryConfig};
 use gabion::gossip::{GossipClient, GossipRuntime, TokioClock, UdpTransport, ValidGossipConfig};
 use gabion::settings::MIN_LIMIT_QUEUE_CAPACITY;
 
-use crate::identity::fresh_incarnation;
 use crate::rules::CompiledRules;
 use crate::shm::ShmRegion;
 use crate::shm::aggregate::ShmAggregateStore;
@@ -227,12 +226,12 @@ async fn leader_main(
     mut stopped: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     // Stamp a fresh incarnation into the SHM header so peers see a new
-    // `(node_id, incarnation)` for this takeover. `fresh_incarnation` has
-    // one-second resolution, so step past the previous leader's in case it
-    // led within the same second; reusing its identity with an empty
-    // `CellStore` would have peers max-merge away this leader's counts.
+    // `(node_id, incarnation)` for this takeover. It comes from wall-clock
+    // milliseconds and steps past the previous leader's, so a takeover
+    // never reuses it: peers would max-merge away this leader's counts into
+    // the old incarnation's cells, and credit acks written for the old one.
     let new_incarnation =
-        fresh_incarnation().max(shm.header().identity.load_incarnation().saturating_add(1));
+        gabion::identity::incarnation(Some(shm.header().identity.load_incarnation()));
     shm.header().identity.store_incarnation(new_incarnation);
     let node_id = shm.header().identity.load_node_id();
     let identity = NodeIdentity::new(gabion::crdt::NodeId(node_id), new_incarnation);

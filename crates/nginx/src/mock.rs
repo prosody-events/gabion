@@ -11,8 +11,6 @@ pub(crate) fn validated(
 ) -> (ValidGossipConfig, ValidStorageConfig) {
     let mut settings = Settings {
         max_cells: 256.try_into().unwrap(),
-        local_dirty_capacity: 64.try_into().unwrap(),
-        forwarded_dirty_capacity: 64.try_into().unwrap(),
         ..Settings::default()
     };
     tune(&mut settings);

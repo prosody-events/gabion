@@ -4,7 +4,6 @@
 //! - [`admission`] — admission-time types (Decision, RejectReason, ...).
 //! - [`config`] — YAML config (server-only; the library knows nothing about
 //!   YAML).
-//! - [`identity`] — `NodeIdentity` derivation at startup.
 //! - [`admin`] — a single admin HTTP endpoint backed by the gossip
 //!   `AdminCommand` channel.
 //! - This module — `SharedLimiter`, the gRPC service trait impl, and admission.
@@ -32,7 +31,6 @@ use crate::admission::{Decision, Quota, RejectReason};
 pub mod admin;
 pub mod admission;
 pub mod config;
-pub mod identity;
 
 #[cfg(test)]
 mod tests;

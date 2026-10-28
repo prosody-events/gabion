@@ -842,7 +842,6 @@ dependencies = [
  "criterion",
  "either",
  "futures",
- "getrandom 0.4.3",
  "humantime",
  "k8s-openapi",
  "kube",
@@ -857,6 +856,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "twox-hash",
+ "whoami",
 ]
 
 [[package]]
@@ -887,8 +887,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "twox-hash",
- "whoami",
 ]
 
 [[package]]
@@ -916,8 +914,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
- "twox-hash",
- "whoami",
 ]
 
 [[package]]
@@ -926,7 +922,6 @@ version = "0.3.2"
 dependencies = [
  "futures",
  "gabion",
- "getrandom 0.4.3",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
@@ -983,11 +978,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core",
- "wasm-bindgen",
 ]
 
 [[package]]

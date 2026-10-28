@@ -26,11 +26,11 @@ fn descriptor_for(fingerprint: u128, local_id: u32) -> RuleDescriptor {
 }
 
 fn store() -> CellStore {
-    CellStore::new(storage(16, 8, 16), local(), &rules(8))
+    CellStore::new(storage(16, 8), local(), &rules(8))
 }
 
-fn small_store(cell_cap: u32, dirty_cap: u32) -> CellStore {
-    CellStore::new(storage(cell_cap, 8, dirty_cap), local(), &rules(8))
+fn small_store(cell_cap: u32) -> CellStore {
+    CellStore::new(storage(cell_cap, 8), local(), &rules(8))
 }
 
 /// Build an `Observation` row with positional args. Test convenience for the
@@ -130,7 +130,7 @@ fn local_increment_one(
 }
 
 fn quickcheck_store() -> CellStore {
-    CellStore::new(storage(256, 16, 512), local(), &rules(16))
+    CellStore::new(storage(256, 16), local(), &rules(16))
 }
 
 #[derive(Clone, Debug)]
@@ -283,7 +283,7 @@ fn local_model(rows: &[LocalRow]) -> BTreeMap<PortableKey, u32> {
 
 fn portable_snapshot(store: &CellStore) -> BTreeMap<PortableKey, u32> {
     let mut rows = BTreeMap::new();
-    for handle in store.active_handles() {
+    for handle in store.active_handles(0) {
         let row = store.get(handle).unwrap();
         let rule = store.rule_dictionary().descriptor(row.key.rule).unwrap();
         let origin = store.node_dictionary().descriptor(row.key.origin).unwrap();
@@ -307,7 +307,7 @@ fn assert_structural_invariants(store: &CellStore) -> bool {
     let mut nodes = BTreeMap::<NodeSlot, u32>::new();
     let mut identities = BTreeSet::<(RuleSlot, u128, BucketEpoch, NodeSlot, Incarnation)>::new();
 
-    for handle in store.active_handles() {
+    for handle in store.active_handles(0) {
         active += 1;
         let Some(row) = store.get(handle) else {
             return false;
@@ -398,7 +398,7 @@ fn quickcheck_local_ingest_accumulates_saturating_and_ignores_batch_origin(
     portable_snapshot(&store) == model
         && deltas_are_exact
         && assert_structural_invariants(&store)
-        && store.active_handles().all(|h| {
+        && store.active_handles(0).all(|h| {
             let row = store.get(h).unwrap();
             row.key.origin == store.local_node_slot()
                 && row.key.incarnation == store.local_identity().incarnation
@@ -457,7 +457,7 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(
     let mut store = quickcheck_store();
     apply_remote_rows(&mut store, &rows.0);
     let before: Vec<CellRow> = store
-        .active_handles()
+        .active_handles(0)
         .map(|h| store.get(h).unwrap())
         .collect();
 
@@ -507,49 +507,6 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(
         }
     }
     assert_structural_invariants(&store)
-}
-
-#[quickcheck]
-fn quickcheck_gossip_frames_are_bounded_current_unique_and_repair_covers_all(
-    rows: RemoteRows,
-    max_seed: u8,
-) -> TestResult {
-    let mut store = quickcheck_store();
-    apply_remote_rows(&mut store, &rows.0);
-    if store.is_empty() {
-        return TestResult::discard();
-    }
-
-    let max_cells = (max_seed as usize % 32) + 1;
-    let mut out = Vec::with_capacity(max_cells);
-    let emitted = store.fill_gossip_frame(max_cells, &mut out);
-    if emitted != out.len() || out.len() > max_cells {
-        return TestResult::failed();
-    }
-    let mut unique = BTreeSet::new();
-    for handle in &out {
-        if store.get(*handle).is_none() || !unique.insert(handle.index) {
-            return TestResult::failed();
-        }
-    }
-
-    store.clear_dirty();
-    let expected: BTreeSet<u32> = store.active_handles().map(|h| h.index).collect();
-    let mut seen = BTreeSet::new();
-    let mut one = Vec::with_capacity(1);
-    for _ in 0..(store.capacity() * 2) {
-        store.fill_gossip_frame(1, &mut one);
-        if let Some(handle) = one.first() {
-            if store.get(*handle).is_none() {
-                return TestResult::failed();
-            }
-            seen.insert(handle.index);
-        }
-        if seen == expected {
-            return TestResult::passed();
-        }
-    }
-    TestResult::from_bool(seen == expected)
 }
 
 #[test]
@@ -604,7 +561,7 @@ fn merge_order_does_not_matter() {
             remote_merge_one(&mut store, 0x11, *origin, 1, *count, 0);
         }
         let mut out: Vec<(u128, u32)> = store
-            .active_handles()
+            .active_handles(0)
             .map(|h| store.get(h).unwrap())
             .map(|row| {
                 let node = store.node_dictionary().descriptor(row.key.origin).unwrap();
@@ -635,7 +592,7 @@ fn increment_local_accumulates() {
 
 #[test]
 fn capacity_is_enforced_without_growing() {
-    let mut store = small_store(1, 4);
+    let mut store = small_store(1);
     store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(2);
     let mut a = ObservationBatch::with_capacity(1);
@@ -656,7 +613,7 @@ fn capacity_is_enforced_without_growing() {
 /// resumes where it stopped, and the sink never grows.
 #[test]
 fn bucket_boundary_expires_in_batches_without_growth() {
-    let mut store = small_store(64, 64);
+    let mut store = small_store(64);
     store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut batch = ObservationBatch::with_capacity(20);
     for key in 0..20 {
@@ -694,7 +651,7 @@ fn bucket_boundary_expires_in_batches_without_growth() {
 #[test]
 fn library_warning_names_both_spellings() {
     let ((), logs) = with_logs(|| {
-        let mut store = small_store(1, 4);
+        let mut store = small_store(1);
         store.intern_rule(descriptor_for(0x11, 1)).unwrap();
         let mut sink = DeltaSink::with_capacity(2);
         for origin in [1, 2] {
@@ -717,27 +674,6 @@ fn library_warning_names_both_spellings() {
     }
 }
 
-#[test]
-fn dirty_ring_yields_each_changed_cell_once() {
-    let mut store = small_store(4, 16);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    // Non-local origins so both cells route through forwarded_dirty.
-    remote_merge_one(&mut store, 0x11, 10, 1, 5, 0);
-    remote_merge_one(&mut store, 0x11, 10, 1, 9, 0);
-    remote_merge_one(&mut store, 0x11, 20, 1, 3, 0);
-
-    // The ring holds three entries; the first cell's 5 was superseded by 9,
-    // so the staleness filter must skip it.
-    let mut seen: Vec<u32> = Vec::new();
-    store.visit_forwarded_dirty(|h, _| {
-        seen.push(h.index);
-        true
-    });
-    assert_eq!(store.forwarded_dirty().len(), 3);
-    assert_eq!(seen.len(), 2);
-    assert_ne!(seen[0], seen[1]);
-}
-
 /// An index stays at most half full: a power of two with at least twice the
 /// buckets of the entries it holds, up to the 2^30 cell cap.
 #[test]
@@ -751,138 +687,11 @@ fn index_capacity_keeps_half_the_buckets_free() {
     }
 }
 
-#[test]
-fn full_dirty_ring_overwrites_oldest() {
-    let mut store = small_store(8, 2);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    let handles: Vec<CellHandle> = (1..=4)
-        .map(|origin| remote_merge_one(&mut store, 0x11, origin, 1, 1, 0))
-        .collect();
-    let ring: Vec<CellHandle> = store.forwarded_dirty().iter().map(|e| e.handle).collect();
-    assert_eq!(ring, handles[2..]);
-}
-
-#[test]
-fn clear_dirty_keeps_cells_but_drops_change_record() {
-    let mut store = small_store(2, 4);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
-    store.clear_dirty();
-    assert_eq!(store.active_len(), 1);
-    assert_eq!(store.forwarded_dirty().len(), 0);
-    assert_eq!(store.local_dirty().len(), 0);
-}
-
-#[test]
-fn gossip_frame_prioritizes_local_then_forwarded_then_repair() {
-    let mut store = small_store(8, 8);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-
-    remote_merge_one(&mut store, 0x11, 3, 1, 30, 0);
-    local_increment_one(&mut store, 0x11, 0xabc, 0, 10, 0);
-    remote_merge_one(&mut store, 0x11, 2, 1, 20, 0);
-    store.clear_dirty();
-
-    // Update everything: local rises and forwarded rises.
-    remote_merge_one(&mut store, 0x11, 2, 1, 21, 1);
-    local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 1);
-
-    let mut out = Vec::with_capacity(3);
-    store.fill_gossip_frame(3, &mut out);
-    let origins: Vec<u128> = out
-        .iter()
-        .map(|h| {
-            let row = store.get(*h).unwrap();
-            store
-                .node_dictionary()
-                .descriptor(row.key.origin)
-                .unwrap()
-                .node_id
-                .0
-        })
-        .collect();
-
-    // First two are dirty (local then forwarded), third is repair.
-    assert_eq!(origins[0], 1);
-    assert_eq!(origins[1], 2);
-    assert_eq!(origins[2], 3);
-}
-
-#[test]
-fn gossip_frame_forwards_remote_dirty_cells_without_local_dirty() {
-    let mut store = small_store(4, 8);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    remote_merge_one(&mut store, 0x11, 2, 1, 20, 0);
-    remote_merge_one(&mut store, 0x11, 3, 1, 30, 0);
-
-    let mut out = Vec::with_capacity(2);
-    store.fill_gossip_frame(2, &mut out);
-    let mut origins: Vec<u128> = out
-        .iter()
-        .map(|h| {
-            store
-                .node_dictionary()
-                .descriptor(store.get(*h).unwrap().key.origin)
-                .unwrap()
-                .node_id
-                .0
-        })
-        .collect();
-    origins.sort();
-    assert_eq!(origins, vec![2, 3]);
-}
-
-#[test]
-fn repair_slice_rotates_across_active_cells() {
-    let mut store = small_store(4, 8);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    for origin in 1..=3 {
-        remote_merge_one(&mut store, 0x11, origin, 1, origin as u32, 0);
-    }
-    store.clear_dirty();
-
-    let mut out = Vec::with_capacity(1);
-    store.fill_gossip_frame(1, &mut out);
-    let first = store
-        .node_dictionary()
-        .descriptor(store.get(out[0]).unwrap().key.origin)
-        .unwrap()
-        .node_id
-        .0;
-    store.fill_gossip_frame(1, &mut out);
-    let second = store
-        .node_dictionary()
-        .descriptor(store.get(out[0]).unwrap().key.origin)
-        .unwrap()
-        .node_id
-        .0;
-    store.fill_gossip_frame(1, &mut out);
-    let third = store
-        .node_dictionary()
-        .descriptor(store.get(out[0]).unwrap().key.origin)
-        .unwrap()
-        .node_id
-        .0;
-    store.fill_gossip_frame(1, &mut out);
-    let fourth = store
-        .node_dictionary()
-        .descriptor(store.get(out[0]).unwrap().key.origin)
-        .unwrap()
-        .node_id
-        .0;
-
-    let mut seen = vec![first, second, third];
-    seen.sort();
-    assert_eq!(seen, vec![1, 2, 3]);
-    // Fourth wrap returns to one of the previously seen origins.
-    assert!([1_u128, 2, 3].contains(&fourth));
-}
-
 // --- New tests required by the plan -----------------------------------
 
 #[test]
 fn delta_sink_records_exact_raises() {
-    let mut store = small_store(4, 4);
+    let mut store = small_store(4);
     store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let mut sink = DeltaSink::with_capacity(4);
     let mut obs = ObservationBatch::with_capacity(2);
@@ -902,7 +711,7 @@ fn delta_sink_records_exact_raises() {
 
 #[test]
 fn delta_applies_locally_reflects_rule_dictionary() {
-    let mut store = small_store(4, 4);
+    let mut store = small_store(4);
     store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     // 0x22 fingerprint unknown locally.
     let mut sink = DeltaSink::with_capacity(2);
@@ -917,7 +726,7 @@ fn delta_applies_locally_reflects_rule_dictionary() {
 
 #[test]
 fn unknown_rule_cells_round_trip() {
-    let mut store = small_store(4, 8);
+    let mut store = small_store(4);
     // No descriptor registered for 0x33.
     remote_merge_one(&mut store, 0x33, 5, 1, 10, 0);
     let handle = remote_merge_one(&mut store, 0x33, 5, 1, 20, 1);
@@ -945,7 +754,7 @@ fn unknown_rule_cells_round_trip() {
 
 #[test]
 fn unknown_rule_cells_expire_at_default_window() {
-    let mut store = small_store(4, 8);
+    let mut store = small_store(4);
     let handle = remote_merge_one(&mut store, 0x44, 5, 1, 10, 0);
     assert!(store.get(handle).is_some());
 
@@ -974,7 +783,7 @@ fn compact_id_round_trip() {
 
 #[test]
 fn dictionary_refcount_frees_unreferenced_slots() {
-    let mut store = small_store(4, 4);
+    let mut store = small_store(4);
     store.intern_rule(descriptor_for(0xBB, 1)).unwrap();
     let h = remote_merge_one(&mut store, 0xBB, 100, 1, 1, 0);
     let row = store.get(h).unwrap();
@@ -1010,7 +819,7 @@ fn dictionary_refcount_frees_unreferenced_slots() {
 /// rule-dictionary release bug.
 #[test]
 fn configured_rule_pinned_survives_cell_expiry() {
-    let mut store = small_store(4, 8);
+    let mut store = small_store(4);
     let configured = RuleDescriptor {
         fingerprint: 0xCAFE,
         window_millis: 10_000,
@@ -1074,7 +883,7 @@ fn configured_rule_pinned_survives_cell_expiry() {
 /// rules immortal.
 #[test]
 fn wire_only_rule_frees_when_cells_expire() {
-    let mut store = small_store(4, 8);
+    let mut store = small_store(4);
     let h = remote_merge_one(&mut store, 0xBEEF, 100, 1, 3, 0);
     let slot = store.get(h).unwrap().key.rule;
     // No pin: the cell is the only reference.
@@ -1103,7 +912,7 @@ fn wire_only_rule_frees_when_cells_expire() {
 
 #[test]
 fn dictionary_full_rejects_with_counter() {
-    let mut store = CellStore::new(storage(16, 4, 4), local(), &rules(1));
+    let mut store = CellStore::new(storage(16, 4), local(), &rules(1));
     // First merge interns a rule. Second merge with a distinct fingerprint
     // must fail.
     let h1 = remote_merge_one(&mut store, 0x10, 2, 1, 1, 0);
@@ -1118,67 +927,6 @@ fn dictionary_full_rejects_with_counter() {
     store.ingest_local(&obs, &mut sink);
     assert_eq!(sink.len(), 2);
     assert_eq!(store.stats().rule_dictionary_full_rejects, 2);
-}
-
-#[test]
-fn selection_epoch_dedupes_within_frame() {
-    let mut store = small_store(4, 8);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    // Same handle dirty as both local and forwarded paths? Forwarded
-    // dirty entries with handle equal to a local-dirty handle should not
-    // be re-emitted.  We construct two updates against the same handle
-    // (both local-origin) — the dirty ring will hold two entries, only
-    // the latest is current, and the gossip frame must emit exactly one.
-    local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 0);
-    local_increment_one(&mut store, 0x11, 0xabc, 0, 2, 0);
-    let mut out = Vec::with_capacity(8);
-    store.fill_gossip_frame(8, &mut out);
-    let mut indices: Vec<u32> = out.iter().map(|h| h.index).collect();
-    indices.sort();
-    indices.dedup();
-    assert_eq!(out.len(), indices.len());
-}
-
-#[test]
-fn repair_cursor_skips_freed_slots() {
-    let mut store = small_store(8, 16);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    // Insert 4 cells at known origins.
-    let h1 = remote_merge_one(&mut store, 0x11, 1, 1, 1, 0);
-    let _h2 = remote_merge_one(&mut store, 0x11, 2, 1, 1, 0);
-    let h3 = remote_merge_one(&mut store, 0x11, 3, 1, 1, 0);
-    let _h4 = remote_merge_one(&mut store, 0x11, 4, 1, 1, 0);
-    store.clear_dirty();
-
-    // Free h1 and h3 directly.
-    store.free_cell_at(h1.index);
-    store.free_cell_at(h3.index);
-    assert_eq!(store.active_len(), 2);
-
-    // Repair visits exactly the active 2.
-    let mut seen = Vec::with_capacity(4);
-    let mut out = Vec::with_capacity(4);
-    for _ in 0..4 {
-        store.fill_gossip_frame(1, &mut out);
-        if let Some(h) = out.first() {
-            seen.push(h.index);
-        }
-    }
-    // Across 4 calls, only the 2 active slots are returned (each twice).
-    let mut unique = seen.clone();
-    unique.sort();
-    unique.dedup();
-    assert_eq!(unique.len(), 2);
-}
-
-#[test]
-fn dirty_lanes_separate() {
-    let mut store = small_store(4, 8);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    local_increment_one(&mut store, 0x11, 0xabc, 0, 1, 0);
-    remote_merge_one(&mut store, 0x11, 99, 1, 1, 0);
-    assert_eq!(store.local_dirty().len(), 1);
-    assert_eq!(store.forwarded_dirty().len(), 1);
 }
 
 #[test]
@@ -1203,7 +951,7 @@ fn expire_emits_one_row_per_freed_cell() {
     // released the slot mid-expiry and a post-free descriptor() lookup would
     // have degraded applies_locally to false. The pin removes that hazard;
     // emission still runs before free_cell_at for the cell rows.)
-    let mut store = small_store(8, 16);
+    let mut store = small_store(8);
     let rule_local = store.intern_rule(descriptor_for(0x11, 1)).unwrap();
     let rule_doomed = store
         .intern_rule(RuleDescriptor {
@@ -1298,7 +1046,7 @@ fn expire_emits_one_row_per_freed_cell() {
 
 #[test]
 fn expire_frees_slots_and_dictionary_refs() {
-    let mut store = small_store(4, 4);
+    let mut store = small_store(4);
     let rule_slot = store.intern_rule(descriptor_for(0xCC, 1)).unwrap();
     let _h = remote_merge_one(&mut store, 0xCC, 100, 1, 5, 0);
     assert_eq!(store.active_len(), 1);
@@ -1322,7 +1070,7 @@ fn expire_frees_slots_and_dictionary_refs() {
 
 #[test]
 fn handle_generation_is_aba_safe() {
-    let mut store = small_store(2, 4);
+    let mut store = small_store(2);
     store.intern_rule(descriptor_for(0xDD, 1)).unwrap();
     let h1 = remote_merge_one(&mut store, 0xDD, 1, 1, 1, 0);
     // Free the slot directly.
@@ -1338,24 +1086,6 @@ fn handle_generation_is_aba_safe() {
 }
 
 #[test]
-fn selection_epoch_wraparound_resets_marks() {
-    let mut store = small_store(4, 4);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
-    // Seed the store with a real cell so mark_selected has something to act on.
-    remote_merge_one(&mut store, 0x11, 1, 1, 1, 0);
-    // Force the epoch close to wraparound and seed a stale mark.
-    store.selection_epoch = u32::MAX;
-    store.selection_marks[0] = u32::MAX;
-    store.bump_selection_epoch();
-    // Wraparound branch must reset marks and set epoch to 1.
-    assert_eq!(store.selection_epoch, 1);
-    assert!(store.selection_marks.iter().all(|m| *m == 0));
-    // mark_selected on a freshly-zeroed slot succeeds against epoch 1.
-    assert!(store.mark_selected(0));
-    assert_eq!(store.selection_marks[0], 1);
-}
-
-#[test]
 fn expire_at_and_expire_agree_for_same_now() {
     let rule = RuleDescriptor {
         fingerprint: 0x11,
@@ -1366,7 +1096,7 @@ fn expire_at_and_expire_agree_for_same_now() {
         local_rule_id: 1,
     };
     let mk = || {
-        let mut s = small_store(8, 8);
+        let mut s = small_store(8);
         s.intern_rule(rule).unwrap();
         // Seed two cells: one at bucket 0 (will expire), one at bucket 5
         // (still inside the live window for now=300 -> current=6, live=2).
@@ -1427,7 +1157,7 @@ fn descriptor_epoch_helpers_pin_window_math() {
 
 #[test]
 fn expire_at_uses_ceil_for_partial_bucket_windows() {
-    let mut store = small_store(8, 8);
+    let mut store = small_store(8);
     store
         .intern_rule(RuleDescriptor {
             fingerprint: 0x11,
@@ -1496,7 +1226,7 @@ fn assert_invariants_with_pinned_rules(store: &CellStore, pinned_rule_slots: &[R
     let mut nodes = BTreeMap::<NodeSlot, u32>::new();
     let mut identities = BTreeSet::<(RuleSlot, u128, BucketEpoch, NodeSlot, Incarnation)>::new();
 
-    for handle in store.active_handles() {
+    for handle in store.active_handles(0) {
         active += 1;
         let Some(row) = store.get(handle) else {
             return false;
@@ -1546,84 +1276,6 @@ fn assert_invariants_with_pinned_rules(store: &CellStore, pinned_rule_slots: &[R
         }
     }
     true
-}
-
-/// Predict the exact ordered handle sequence `fill_gossip_frame` will emit
-/// for the current store state, mirroring the lane priority (local dirty →
-/// forwarded dirty → repair) and the dedup / staleness filters.
-fn predict_gossip_order(store: &CellStore, max_cells: usize) -> Vec<CellHandle> {
-    let mut out: Vec<CellHandle> = Vec::with_capacity(max_cells);
-    if max_cells == 0 {
-        return out;
-    }
-    let cap = store.capacity();
-    let mut marks: BTreeSet<u32> = BTreeSet::new();
-
-    let entry_current = |entry: DirtyEntry| -> bool {
-        let i = entry.handle.index as usize;
-        if (entry.handle.index) >= cap {
-            return false;
-        }
-        if store.generations[i] != entry.handle.generation {
-            return false;
-        }
-        if store.origin_sequences[i] != entry.origin_sequence {
-            return false;
-        }
-        true
-    };
-
-    // Lane 1: local dirty.
-    for entry in store.local_dirty().iter() {
-        if out.len() >= max_cells {
-            break;
-        }
-        if !entry_current(entry) {
-            continue;
-        }
-        if !marks.insert(entry.handle.index) {
-            continue;
-        }
-        out.push(entry.handle);
-    }
-    if out.len() >= max_cells {
-        return out;
-    }
-
-    // Lane 2: forwarded dirty.
-    for entry in store.forwarded_dirty().iter() {
-        if out.len() >= max_cells {
-            break;
-        }
-        if !entry_current(entry) {
-            continue;
-        }
-        if !marks.insert(entry.handle.index) {
-            continue;
-        }
-        out.push(entry.handle);
-    }
-    if out.len() >= max_cells {
-        return out;
-    }
-
-    // Lane 3: rotating repair slice.
-    let mut visited = 0_u32;
-    while visited < cap && out.len() < max_cells {
-        let slot = (store.repair_cursor() + visited) % cap;
-        visited += 1;
-        if (store.generations[slot as usize] & 1) != 1 {
-            continue;
-        }
-        if !marks.insert(slot) {
-            continue;
-        }
-        out.push(CellHandle {
-            index: slot,
-            generation: store.generations[slot as usize],
-        });
-    }
-    out
 }
 
 // --- Shared scaffolding for mixed-ops properties (Gaps 1, 2, 5) ----------
@@ -1807,6 +1459,68 @@ fn quickcheck_mixed_ops_match_model(ops: MixedOps) -> bool {
     true
 }
 
+/// The model of the own list: the live cells this node originated, by
+/// ascending sequence.
+fn own_cells(store: &CellStore) -> Vec<(u64, CellHandle)> {
+    let mut own: Vec<_> = store
+        .active_handles(0)
+        .filter_map(|handle| store.get(handle))
+        .filter(|row| row.key.origin == store.local_node_slot())
+        .map(|row| (row.origin_sequence, row.handle))
+        .collect();
+    own.sort_by_key(|&(seq, _)| seq);
+    own
+}
+
+/// After every insert, raise, merge and expiry, the own list holds exactly
+/// the live own cells in ascending sequence: a raised cell moves to the tail,
+/// a freed one leaves, and nothing repeats or cycles (the walk is capped one
+/// past the capacity).
+#[quickcheck]
+fn stream_lists_match_model(ops: MixedOps) -> bool {
+    let mut store = quickcheck_store();
+    let mut out = Vec::with_capacity(store.capacity() as usize + 1);
+    for op in &ops.0 {
+        let mut sink = DeltaSink::with_capacity(1);
+        let mut exp_sink = ExpirationSink::with_capacity(store.capacity() as usize);
+        apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
+        store.stream_after(0, store.capacity() as usize + 1, &mut out);
+        let model: Vec<_> = own_cells(&store).into_iter().map(|(_, h)| h).collect();
+        if out != model || out.iter().any(|&h| store.get(h).is_none()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `stream_after(sent, max)` returns exactly the live own cells above
+/// `sent`, ascending, at most `max`, whichever end its walk starts from.
+/// Half the draws put `sent` on a live cell's sequence, the boundary case.
+#[quickcheck]
+fn stream_after_returns_exactly_the_cells_above_sent(ops: MixedOps, pick: u8, max: u8) -> bool {
+    let mut store = quickcheck_store();
+    for op in &ops.0 {
+        let mut sink = DeltaSink::with_capacity(1);
+        let mut exp_sink = ExpirationSink::with_capacity(store.capacity() as usize);
+        apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
+    }
+    let own = own_cells(&store);
+    let sent = match own.len() {
+        len if len > 0 && pick.is_multiple_of(2) => own[usize::from(pick / 2) % len].0,
+        _ => u64::from(pick) % (store.own_head() + 3),
+    };
+    let max = usize::from(max % 8) + 1;
+    let mut out = Vec::with_capacity(max);
+    store.stream_after(sent, max, &mut out);
+    let expected: Vec<_> = own
+        .iter()
+        .filter(|&&(seq, _)| seq > sent)
+        .take(max)
+        .map(|&(_, h)| h)
+        .collect();
+    out == expected
+}
+
 // --- Gap 3: saturation and dictionary-full paths -------------------------
 
 #[derive(Clone, Debug)]
@@ -1845,7 +1559,7 @@ impl Arbitrary for TightRemoteRows {
 }
 
 fn quickcheck_store_tight() -> CellStore {
-    CellStore::new(storage(4, 3, 16), local(), &rules(2))
+    CellStore::new(storage(4, 3), local(), &rules(2))
 }
 
 #[quickcheck]
@@ -1961,7 +1675,7 @@ impl Arbitrary for HitRows {
 
 #[quickcheck]
 fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
-    let mut store = CellStore::new(storage(4, 4, 32), local(), &rules(4));
+    let mut store = CellStore::new(storage(4, 4), local(), &rules(4));
     let mut model_sum: u64 = 0;
     let mut delta_sum: u64 = 0;
     for row in &rows.0 {
@@ -1981,7 +1695,7 @@ fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
         model_sum += u64::from(row.hits);
     }
     let stored = store
-        .active_handles()
+        .active_handles(0)
         .next()
         .and_then(|h| store.get(h).map(|r| r.count))
         .unwrap_or(0);
@@ -1990,24 +1704,6 @@ fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
 }
 
 // --- Gap 5: lane priority as ordered prediction --------------------------
-
-#[quickcheck]
-fn quickcheck_gossip_frame_order_matches_lane_model(ops: MixedOps, max_seed: u8) -> TestResult {
-    let mut store = quickcheck_store_with_pinned_rules();
-    for op in &ops.0 {
-        let mut sink = DeltaSink::with_capacity(1);
-        let mut exp_sink = ExpirationSink::with_capacity(store.capacity() as usize);
-        apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
-    }
-    if store.is_empty() {
-        return TestResult::discard();
-    }
-    let max_cells = (max_seed as usize % 32) + 1;
-    let predicted = predict_gossip_order(&store, max_cells);
-    let mut got = Vec::with_capacity(max_cells);
-    store.fill_gossip_frame(max_cells, &mut got);
-    TestResult::from_bool(predicted == got)
-}
 
 // --- Gap 6: expire_at vs expire for varied rule windows ------------------
 
@@ -2108,7 +1804,7 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
 
 /// `n` rules on distinct keys, each `rate` over its own period and `bucket`.
 fn configured(n: usize, rate: &str, bucket: Duration) -> RuleTable {
-    let limits = storage(16, 8, 16).cardinality;
+    let limits = storage(16, 8).cardinality;
     let keys: Vec<String> = (0..n).map(|i| format!("tenant{i}")).collect();
     let rules = keys
         .iter()
@@ -2137,7 +1833,7 @@ fn configured(n: usize, rate: &str, bucket: Duration) -> RuleTable {
 fn wrap_run(t0: u64) -> (u64, u64, usize) {
     let table = configured(1, "10r/10ms", Duration::from_millis(1));
     let rule = &table.rules()[0];
-    let config = storage(64, 8, 64);
+    let config = storage(64, 8);
     let mut store = CellStore::new(config, local(), &table);
     let aggregate = Aggregate::new(&config);
     let mut batch = ObservationBatch::with_capacity(11);
@@ -2184,7 +1880,7 @@ fn rule_dictionary_default_grows_with_rules() {
             .get(),
         256
     );
-    let stats = CellStore::new(storage(16, 8, 16), local(), &table).stats();
+    let stats = CellStore::new(storage(16, 8), local(), &table).stats();
     assert_eq!(
         (stats.rule_slots_capacity, stats.rule_slots_used),
         (600, 300)
@@ -2196,7 +1892,7 @@ fn rule_dictionary_default_grows_with_rules() {
 #[test]
 fn cell_store_interns_every_rule_at_construction() {
     let table = configured(3, "10r/s", Duration::from_millis(250));
-    let store = CellStore::new(storage(16, 8, 16), local(), &table);
+    let store = CellStore::new(storage(16, 8), local(), &table);
     for rule in table.rules() {
         let slot = store
             .rule_dictionary()

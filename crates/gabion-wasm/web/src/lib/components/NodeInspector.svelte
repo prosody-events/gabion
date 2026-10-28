@@ -15,7 +15,6 @@
     node,
     oracleTotal,
     ruleLimit,
-    baseFanout,
     burstHits,
     version,
     onSend,
@@ -27,9 +26,6 @@
      *  is racing toward. */
     oracleTotal: number;
     ruleLimit: number;
-    /** The configured base fanout knob — the floor the coverage fanout
-     *  (`⌈ln(peers)+c⌉`) sits above. */
-    baseFanout: number;
     burstHits: number;
     /** The per-snapshot counter (drives GossipCadence's tick ring buffer). */
     version: number;
@@ -125,28 +121,16 @@
     </section>
   {/if}
 
-  <!-- §4 Gossip cadence & coverage fanout. -->
+  <!-- §4 Gossip cadence. -->
   <section class="section">
-    <h3 class="section-head">Gossip cadence &amp; fanout</h3>
-    <GossipCadence {node} {version} {baseFanout} />
+    <h3 class="section-head">Gossip cadence</h3>
+    <GossipCadence {node} {version} />
   </section>
 
   <!-- §5 Gossip I/O & queues. -->
   <section class="section">
     <h3 class="section-head">Gossip I/O &amp; queues</h3>
     <div class="io">
-      <div class="io-row">
-        <span class="io-label">
-          <InfoTip text="Locally-originated cells waiting in the dirty ring to be gossiped out, and cells received from peers waiting to be re-gossiped (forwarded).">
-            dirty rings
-          </InfoTip>
-        </span>
-        <span class="rings">
-          <span class="ring">local <span class="numeric">{node.local_dirty_len}</span></span>
-          <span class="ring">forwarded <span class="numeric">{node.forwarded_dirty_len}</span></span>
-        </span>
-      </div>
-
       <div class="io-row">
         <span class="io-label">
           <InfoTip text="Inbound packets the wire decoder dropped: malformed or truncated, larger than this node accepts, another protocol version, or another cluster's. Zero is the calm, expected state.">
@@ -437,21 +421,6 @@
 
   .io-label {
     color: var(--color-fg-muted);
-  }
-
-  .rings {
-    grid-column: 2 / -1;
-    display: flex;
-    gap: var(--gap-md);
-  }
-
-  .ring {
-    color: var(--color-fg-muted);
-  }
-
-  .ring .numeric {
-    color: var(--color-fg);
-    font-weight: 600;
   }
 
   .rejects {

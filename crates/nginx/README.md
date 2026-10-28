@@ -459,16 +459,13 @@ maintain.
 
 Each name must be a Kubernetes DNS label (`[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?`).
 
-### Gossip — the two adaptive aspects
+### Gossip — streams and the adaptive emit rate
 
-Gabion's gossip protocol has **two adaptive aspects** that distinguish
-it from a textbook anti-entropy loop. Both are operator-tunable; the
-defaults are sized for production loads.
+Each node sends its changed counts straight to every peer as a stream the
+peer acknowledges; a gap report or a heartbeat without an ack brings a
+resend, and a starting node asks two peers for a join sweep of their live
+counts. The defaults are sized for production loads.
 
-- **Coverage fanout** — per-tick peer count is sized to the coverage
-  threshold `⌈ln(peers)+c⌉`, the fanout that reliably reaches every
-  node, capped at the peer-set size. It scales with cluster size, not
-  the dirty set. `gabion_gossip_fanout` sets the **floor**.
 - **Adaptive emit rate** — the gossip cadence adapts to per-rule
   pressure. Heartbeats fire every `gabion_gossip_tick_interval`;
   between heartbeats, the runtime fires a synthetic "threshold" tick
@@ -476,17 +473,16 @@ defaults are sized for production loads.
   per-site error budget. `gabion_gossip_target_err_bps` sets the
   budget; `gabion_gossip_min_emit_interval` caps the emit rate.
 
-The math behind both lives in
+The math behind it lives in
 [`crates/gabion/README.md#how-gossip-works`](../gabion/README.md#how-gossip-works).
 Defaults come from `gabion::defaults` and apply identically to both
 adapters; the canonical knob table lives in
 [`crates/gabion/README.md#operator-knobs`](../gabion/README.md#operator-knobs).
 
-**Gossip directives controlling the two adaptive aspects.**
+**Gossip directives controlling the adaptive emit rate.**
 
 | Directive                                   | Default | Adapts                                                       |
 |---------------------------------------------|---------|--------------------------------------------------------------|
-| `gabion_gossip_fanout N`                    | `3`     | **Coverage fanout** — floor on peers selected per tick; the runtime scales the pick to `⌈ln(peers)+c⌉`. |
 | `gabion_gossip_target_err_bps N`            | `100`   | **Adaptive emit rate** — per-rule unreplicated-error budget in basis points of the rule's limit (`100` = 1%). Lower = tighter accuracy, more emissions. |
 | `gabion_gossip_min_emit_interval DURATION`  | `5ms`   | **Adaptive emit rate** — floor between threshold-fire emissions. Raise when the gossip channel itself is the bottleneck. |
 
@@ -499,16 +495,16 @@ they bound resource use.
 | `gabion_gossip_cluster ID`                      | `1`     | Cluster identifier: any non-zero u128, in decimal or `0x`-prefixed hex. |
 | `gabion_gossip_tick_interval DURATION`          | `500ms` | Heartbeat period. Shorter = faster convergence, more UDP traffic.                     |
 | `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet: 158 to 65,507. 158 bytes hold the header and one counter; 65,507 is the largest UDP payload over IPv4. |
-| `gabion_gossip_max_cells_per_tick N`            | `4096`  | Maximum cells emitted across all packets in one tick.                                 |
-| `gabion_gossip_peer_capacity N`                 | `512`   | The most peers this node gossips with, 1 to 32,767, sized once at start, about 100 bytes a peer. Past it, a new peer is declined (`peer_table_full`) and its counts still merged. Also sets the node dictionary's default, twice it. |
+| `gabion_gossip_sweep_concurrency N`             | `4`     | Join sweeps this node answers at once, 1 to 255; each pages its live counts to one newly started peer. Past it a request is declined (`sweep_declined`) and the peer asks another. |
+| `gabion_gossip_peer_capacity N`                 | `512`   | The most peers this node gossips with, 1 to 32,767, sized once at start, about 200 bytes a peer. Past it, a new peer is declined (`peer_table_full`) and its counts still merged. Also sets the node dictionary's default, twice it. |
 | `gabion_gossip_limit_queue_capacity N`          | `8192`  | Slots in the shared-memory request queue workers push counted hits onto for the leader, 64 to 1,048,576, rounded up to a power of two. Each slot is 72 bytes of the `gabion_limit_zone` SIZE, so raise SIZE with it. The default covers a 1.3 s leader handover at up to 6,300 counted hits a second per pod; raise it when the `queue_dropped` counter rises. A reload that changes it needs a new SIZE or a restart. |
 | `gabion_gossip_recv_buffer_bytes N`            | `4194304` | Receive buffer the gossip socket asks the kernel for, 65,536 to 1,073,741,823 bytes. The host's `net.core.rmem_max` caps it; `socket_buffer_capped` says when. See [Socket buffers](../gabion/README.md#socket-buffers). |
 | `gabion_gossip_send_buffer_bytes N`            | `1048576` | Send buffer the gossip socket asks the kernel for, 65,536 to 1,073,741,823 bytes. The host's `net.core.wmem_max` caps it; `send_blocked` warns when a round fills it. |
 
 ### Storage — CRDT capacities
 
-The CRDT cell store, dictionaries, and dirty rings allocate exactly
-once, at leader startup. These knobs size that allocation, so raising
+The CRDT cell store and dictionaries allocate exactly once, at leader
+startup. These knobs size that allocation, so raising
 one also raises the worker's RSS by roughly the named slot count
 times the per-slot byte cost. The defaults are sized for production
 clusters and you should only need to touch them if your workload runs
@@ -519,8 +515,6 @@ into the cap.
 | `gabion_storage_max_cells N`                    | `131072`    | Total cell capacity in the CRDT.                                                      |
 | `gabion_storage_rule_dictionary_capacity N`     | twice the rules, at least `256` | Number of distinct rule slots (each unique `rule_fingerprint` interns into one slot). Set it only on `rule_dictionary_full`; below the number of rules fails `nginx -t`. |
 | `gabion_storage_node_dictionary_capacity N`     | twice `gabion_gossip_peer_capacity` (`1024`) | Number of distinct (node_id, incarnation) slots; must exceed `gabion_gossip_peer_capacity`. |
-| `gabion_storage_local_dirty_capacity N`         | `65536`     | Local dirty-ring capacity. Sized to absorb a burst between heartbeats.                |
-| `gabion_storage_forwarded_dirty_capacity N`     | `524288`    | Forwarded dirty-ring capacity. Sized larger because it tracks peer-originated edits we still owe other peers. |
 | `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare, up to 65,535.                           |
 | `gabion_storage_max_descriptor_bytes N`         | `512`       | Per-request budget on `(key + value)` bytes summed across descriptors plus the domain. Exceeded ⇒ 400. |
 | `gabion_storage_max_key_bytes N`                | `128`       | Cap on a single descriptor key's length (validated at config phase).                  |
@@ -530,7 +524,6 @@ into the cap.
 
 | Directive                          | Effect                                                                                                                                              |
 |------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
-| `gabion_runtime_rng_seed SEED`     | u64 seed for deterministic peer sampling. Omitted, gabion draws a cryptographic seed at boot. Use only when reproducing a bench scenario.            |
 | `gabion_node_id_seed STRING`       | Non-empty string used to derive this node's stable identity (typically the pod name). Omitted, the identity is drawn fresh on each process start.    |
 
 ## Composition: rule layering
@@ -784,7 +777,7 @@ Every `gabion_*` directive emits an operator-readable error at
 `nginx -t` time when something is wrong, naming the file and line, with
 the offending value quoted and the fix named. Every setting directive
 (`gabion_gossip_*`, `gabion_storage_*`, `gabion_discovery_*`,
-`gabion_node_id_seed`, `gabion_runtime_rng_seed`) is parsed and
+`gabion_node_id_seed`) is parsed and
 validated by the gabion library's settings table, the same one
 `gabiond` uses, so its errors name the setting in both adapters'
 spellings: a zero count or duration, a value that does not parse, or a
@@ -841,7 +834,6 @@ below are the module's own.
 | `gabion: this worker stopped leading gossip` (error) in the error log         | The leader's gossip runtime or queue drain failed or panicked, or it lost the lease. The worker released the lease and campaigns again after `retry_in` (doubling, up to 30s); another worker may take over first. Admission keeps running against the shared aggregate. | Read the `error` field. A bind error means `gabion_gossip_bind` is already in use; a lost lease means the worker was starved long enough to miss its renewals. |
 | `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside a leadership term, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
 | `Peer discovery hit an error and skipped an update` (warn) in the error log   | `discovery_error`, a library message: see [`../gabion/TROUBLESHOOTING.md`](../gabion/TROUBLESHOOTING.md#discovery_error).                           | Usually transient. If it keeps repeating, check pod RBAC and network reachability to the API.                                    |
-| `gabion: failed to draw gossip RNG seed` (error) in the error log             | `getrandom` failed at worker startup. This worker keeps serving requests but never drives gossip; another worker can still lead.                              | Inspect the wrapped `error` field. Usually a sandboxed environment denying `/dev/urandom`; either lift the restriction or supply `gabion_runtime_rng_seed N` to bypass the entropy draw. |
 
 ### `leader_takeover`
 

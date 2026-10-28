@@ -113,27 +113,19 @@ recorded into a local queue.
 
 Everything else happens asynchronously, driven by those recorded hits.
 A background gossip task on each member folds them into a CRDT,
-exchanges dirty rows with peers over UDP roughly every 500 ms, applies
-inbound deltas back into the local aggregate, and expires bucket rows
-as time advances. The wire codec is self-describing and tolerant of
-loss, so a dropped UDP frame costs the cluster one tick of staleness
-rather than a missed update.
+sends its changed counts to every peer over UDP at each 500 ms heartbeat
+or sooner, resends what a peer has not acknowledged, applies inbound
+deltas back into the local aggregate, and expires bucket rows as time
+advances. Each packet decodes on its own, so a dropped UDP packet costs
+the cluster at most one heartbeat of staleness rather than a missed
+update.
 
-Two adaptive aspects of the gossip protocol are worth naming together,
-because operators who only learn one half tend to misjudge how the
-cluster behaves under load:
+The gossip cadence adapts to per-rule pressure (the **adaptive emit
+rate**): a hot rule can fire a threshold round between heartbeats so that
+each rule's contribution to cluster-wide unreplicated error stays inside a
+per-rule error budget, while a cold rule simply rides the heartbeat.
 
-- **Coverage fanout** — the per-tick peer count is sized to the
-  coverage threshold `⌈ln(n)+c⌉` (`n` = peer count), the fanout that
-  reliably reaches every node. It scales with cluster size, not the
-  dirty set; a burst rides one fat frame instead of widening the pick.
-- **Adaptive emit rate** — the gossip cadence itself adapts to
-  per-rule pressure. A hot rule can fire a synthetic tick between
-  heartbeats so that each rule's contribution to cluster-wide
-  unreplicated error stays inside a per-rule error budget, while a
-  cold rule simply rides the heartbeat.
-
-The full protocol, including the dirty rings, the
+The full protocol, including the streams and acks, the
 math behind the budget, and the operator knobs that control them, is
 documented in
 [`crates/gabion/README.md`](crates/gabion/README.md#how-gossip-works).

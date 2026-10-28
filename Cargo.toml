@@ -27,10 +27,6 @@ envoy-types = "0.7"
 futures = "0.3"
 gabion = { path = "crates/gabion" }
 gabion-nginx = { path = "crates/nginx" }
-# `std` so `getrandom::Error` implements `std::error::Error` (anyhow `.context`
-# in gabiond); `sys_rng` selects the OS backend (0.4 made it opt-in). The
-# wasm32 target adds `wasm_js` in gabion's manifest.
-getrandom = { version = "0.4", features = ["std", "sys_rng"] }
 humantime = "2"
 humantime-serde = "1"
 # Pin to v1_32 (the floor offered by k8s-openapi 0.28; it dropped v1_31).

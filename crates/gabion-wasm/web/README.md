@@ -74,8 +74,8 @@ the steps — deterministic, without the scrubber's timed-event driver.
 - `src/lib/components/` — `Stage.svelte` (the thin Svelte wrapper around the
   renderer plus the DOM label overlay), `Dashboard.svelte` (the headline metric
   + charts), `ControlRail.svelte` (the left rail: scenario presets, a
-  collapsible "Tune the cluster" disclosure with rebuild sliders for fanout /
-  error budget / packet loss, the keyboard-accessible "send a burst to node N"
+  collapsible "Tune the cluster" disclosure with rebuild sliders for error
+  budget / packet loss, the keyboard-accessible "send a burst to node N"
   control, and a Heal action shown only for the partition / isolation
   scenarios), and `TransportBar.svelte`.
 - `src/lib/presets.ts` — the scenario presets. A preset is a config plus an

@@ -26,13 +26,11 @@ use ngx::http::{
 use ngx::{http_request_handler, ngx_string};
 
 use gabion::crdt::ValidStorageConfig;
-use gabion::defaults;
 use gabion::gossip::ValidGossipConfig;
 use gabion::settings::{Setting, Settings};
 
 use crate::access::{AccessCtx, AccessOutcome, AllowInfo, RejectInfo, VariableLookup, decide_all};
 use crate::headers::AdmissionHeaders;
-use crate::identity::derive_identity;
 use crate::leader::{self, LeaderConfig, LeaderHandle};
 use crate::log;
 use crate::rules::{
@@ -876,8 +874,8 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
     // Stamp the identity on every config load so a changed
     // `gabion_node_id_seed` takes effect, and anchor the lease clock, both
     // before fork.
-    let identity = derive_identity(main.settings.node_id_seed.as_deref());
-    region.header().identity.store_node_id(identity.node_id.0);
+    let node_id = gabion::identity::node_id(main.settings.node_id_seed.as_deref());
+    region.header().identity.store_node_id(node_id.0);
     now_millis();
     main.region = Some(region);
     tracing::info!(
@@ -1294,33 +1292,10 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     };
 
     let worker_id = std::process::id();
-    let mut gossip = gossip.clone();
-    gossip.rng_seed = match main.settings.rng_seed {
-        Some(seed) => seed,
-        None => match defaults::random_rng_seed() {
-            Ok(seed) => seed,
-            Err(error) => {
-                // Not NGX_ERROR: nginx never respawns a worker whose
-                // `init_process` fails, and every worker runs this, so
-                // failing here would take down the whole server.
-                tracing::error!(
-                    worker_id,
-                    %error,
-                    "gabion: failed to draw gossip RNG seed, so this worker \
-                     will never drive gossip. It is still serving requests \
-                     against the shared SHM aggregate. Usually a sandbox is \
-                     denying `/dev/urandom`; lift the restriction or set \
-                     `gabion_runtime_rng_seed N`, then restart nginx.",
-                );
-                return core::Status::NGX_OK.into();
-            }
-        },
-    };
-
     let cfg = LeaderConfig {
         worker_id,
         gossip_bind: main.settings.gossip_bind,
-        gossip,
+        gossip: gossip.clone(),
         discovery: main.settings.discovery(),
         cell_store: *storage,
         lease_tick: leader::DEFAULT_LEASE_TICK,

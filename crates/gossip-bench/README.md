@@ -107,7 +107,7 @@ with:
 python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "crates/gossip-bench/judge"); import judge; print(judge.core_hash(sys.argv[1], Path(".")))' "$(git rev-parse HEAD:crates/gossip-bench)"
 ```
 
-Core hash: `62133791b0512275df5f6369850442ebb7fa3025`. A new or
+Core hash: `8da709492af3be63268c21bf72896fcc77a97ba4`. A new or
 changed regime, or any other edit to the core, changes it, requires rerunning
 `make sim-baselines`, and updates this line.
 
@@ -200,7 +200,7 @@ order that depends on hashing. Randomness comes from SplitMix64 streams
 separated per concern: each key's arrival process and load-balancer picks
 (traffic), latency and loss (network), pod start offsets, discovery jitter
 and crash victims (churn), the tracked-key sample (oracle), and per-node
-gossip RNG seeds. A solution that sends more datagrams consumes more of the
+gossip draws (the zone arm draws each node's id from it). A solution that sends more datagrams consumes more of the
 network stream and nothing else, so the offered-load trace and membership
 timeline are identical across solutions (tested).
 
@@ -291,10 +291,7 @@ living one window plus two buckets, and a key holds at most one cell per pod
 per bucket), at least 16,384, rounded up to 1,024; any design that expires
 cells within two buckets of their leaving the window fits. Because the
 capacity decides whether a run is valid, it is part of the core. The adapter
-derives the rest from the library's own defaults: dirty rings at the
-production sizes (`STORAGE_LOCAL_DIRTY_CAPACITY`,
-`STORAGE_FORWARDED_DIRTY_CAPACITY`), or, where the cell store is above
-`STORAGE_MAX_CELLS`, the production ratio to it, never less; node and peer
+derives the rest from the library's own defaults: node and peer
 dictionaries at the production defaults or the regime's pod count + 16,
 whichever is larger. Gossip settings are the production defaults
 (`Settings::default()` in `gabion::settings`); the adapter validates them
@@ -611,7 +608,7 @@ behaviour, which is what each arm measures. Beyond the names, the contract is:
   threads, because no Tokio runtime is driving it.
 - Saturation is logged through `tracing` at WARN or ERROR with a `*_total`
   field carrying the running count.
-- Given its `rng_seed`, a node behaves identically run to run (no
+- Given its configuration, a node behaves identically run to run (no
   `RandomState` iteration, no wall clock). `identical_inputs_give_bit_identical_results`
   checks it.
 

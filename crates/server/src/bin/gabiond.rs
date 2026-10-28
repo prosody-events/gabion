@@ -12,13 +12,12 @@ use tokio::task::LocalSet;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use gabion::aggregate::Aggregate;
-use gabion::crdt::CellStore;
-use gabion::discovery;
+use gabion::crdt::{CellStore, NodeIdentity};
 use gabion::gossip::GossipRuntime;
+use gabion::{discovery, identity};
 
 use gabion_server::admin::{self, AdminState};
 use gabion_server::config::{AppConfig, ConfigError};
-use gabion_server::identity::derive_identity;
 use gabion_server::{RATE_LIMIT_SERVICE_NAME, SharedLimiter, serve};
 
 fn main() -> anyhow::Result<()> {
@@ -75,7 +74,10 @@ async fn run() -> anyhow::Result<()> {
         "Starting gabion.",
     );
 
-    let identity = derive_identity(config.settings.node_id_seed.as_deref());
+    let identity = NodeIdentity::new(
+        identity::node_id(config.settings.node_id_seed.as_deref()),
+        identity::incarnation(None),
+    );
     tracing::info!(
         node_id = %format!("{:032x}", identity.node_id.0),
         incarnation = identity.incarnation,
@@ -90,11 +92,7 @@ async fn run() -> anyhow::Result<()> {
         .settings
         .gossip_bind
         .ok_or(ConfigError::MissingGossipBind)?;
-    let mut gossip_runtime_config = config.gossip;
-    if config.settings.rng_seed.is_none() {
-        gossip_runtime_config.rng_seed =
-            gabion::defaults::random_rng_seed().context("draw gossip RNG seed")?;
-    }
+    let gossip_runtime_config = config.gossip;
 
     let (admin_tx, admin_rx) = admin::admin_channel();
 

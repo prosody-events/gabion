@@ -2,6 +2,7 @@
 //! answers it from the test's script.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -14,6 +15,8 @@ pub(super) struct Attempt {
     pub dst: SocketAddr,
     pub bytes: Vec<u8>,
     pub accepted: bool,
+    /// Datagrams still waiting in the inbound queue at this send.
+    pub inbound_left: usize,
 }
 
 /// The script, and what the runtime tried.
@@ -24,6 +27,10 @@ pub(super) struct Wire {
     pub refuse: Cell<bool>,
     /// Sends to this address fail with `PermissionDenied`.
     pub forbidden: Cell<Option<SocketAddr>>,
+    /// Datagrams the runtime receives, oldest first.
+    pub inbound: RefCell<VecDeque<(Vec<u8>, SocketAddr)>>,
+    /// The receive buffer the transport reports, which bounds a round's read.
+    pub recv_buffer: Cell<Option<usize>>,
 }
 
 impl Wire {
@@ -57,11 +64,22 @@ impl GossipTransport for MockTransport {
             dst,
             bytes: buf.to_vec(),
             accepted: result.is_ok(),
+            inbound_left: self.0.inbound.borrow().len(),
         });
         result
     }
 
-    async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        std::future::pending().await
+    fn recv_buffer_bytes(&self) -> Option<usize> {
+        self.0.recv_buffer.get()
+    }
+
+    /// Pops the oldest queued datagram; with none, waits forever.
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let next = self.0.inbound.borrow_mut().pop_front();
+        let Some((bytes, src)) = next else {
+            return std::future::pending().await;
+        };
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        Ok((bytes.len(), src))
     }
 }

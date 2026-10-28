@@ -2,91 +2,74 @@
   import type { NodeState } from '../sim/types';
   import InfoTip from './InfoTip.svelte';
 
-  // §4 of the node inspector: how this node gossips — how *alive* it is, how
-  // *often* it flushes, and how *wide* it fans out. The flush *rate* adapts to
-  // load; the fanout is sized for cluster-wide coverage. This section makes both
-  // visible:
+  // §4 of the node inspector: how this node gossips — how *alive* it is and
+  // how *often* it flushes. The flush *rate* adapts to load. This section makes
+  // it visible:
   //
-  //   (a) a tick sparkline + status word — the heartbeat keeps firing even when
-  //       the cluster is quiet (the "still ticking, not dead" story);
-  //   (b) coverage fanout — the effective peer count the most recent emit chose.
-  //       The runtime sizes it to the coverage threshold ⌈ln(peers)+c⌉, scaled by
-  //       cluster size (not the dirty set), so it is stable for a given cluster
-  //       rather than pulsing with load; it sits above the configured floor.
-  //   (c) heartbeat vs threshold — what share of *recent* ticks were eager
-  //       flushes (a burst crossing the error budget ε) rather than the timer;
-  //   (d) working vs idle — what share of *recent* ticks actually carried gossip
-  //       work (idle is calm, not an error).
+  //   (a) a round sparkline + status word — the heartbeat keeps firing even
+  //       when the cluster is quiet (the "still ticking, not dead" story);
+  //   (b) heartbeat vs threshold — what share of *recent* rounds were eager
+  //       flushes (a burst crossing the error budget ε) rather than the timer.
   //
-  // Why "recent": (c) and (d) are ratios of cumulative counters. As `ticks_total`
-  // climbs into the thousands, a lifetime ratio freezes — a whole burst barely
-  // moves it. So both are computed over a rolling window fed by a component-local
+  // Why "recent": (b) is a ratio of cumulative counters. As the round counts
+  // climb into the thousands, a lifetime ratio freezes — a whole burst barely
+  // moves it. So it is computed over a rolling window fed by a component-local
   // ring buffer (no per-node history exists in `ChartHistory`): each snapshot
-  // (driven by the `version` prop) accumulates the tick / threshold / dirty
-  // deltas since the last sample, committing a paired sample every `STRIDE`
+  // (driven by the `version` prop) accumulates the round / threshold deltas
+  // since the last sample, committing a paired sample every `STRIDE`
   // snapshots — at 60 fps a raw per-frame delta is mostly 0/1 and reads as noise.
-  let {
-    node,
-    version,
-    baseFanout,
-  }: { node: NodeState; version: number; baseFanout: number } = $props();
+  let { node, version }: { node: NodeState; version: number } = $props();
 
   const RING_CAP = 48;
   const STRIDE = 4;
 
-  // Rolling window of recent per-stride samples; each entry sums the tick,
-  // threshold-fire, and dirty-tick deltas over `STRIDE` snapshots. One ring (not
-  // three) so the counts can never desync across a stride boundary. `$state` so
-  // the derived sparkline and gauges re-render on push.
-  let samples = $state<{ ticks: number; threshold: number; dirty: number }[]>([]);
+  // Rolling window of recent per-stride samples; each entry sums the round and
+  // threshold-round deltas over `STRIDE` snapshots. One ring (not two) so the
+  // counts can never desync across a stride boundary. `$state` so the derived
+  // sparkline and gauge re-render on push.
+  let samples = $state<{ ticks: number; threshold: number }[]>([]);
   // Plain `let` cursors — they persist across runs without joining reactivity, so
   // writing the ring never re-triggers the effect (no loop).
   let prevTicks = 0;
   let prevThreshold = 0;
-  let prevDirty = 0;
   let prevNodeId = -1;
   let accTicks = 0;
   let accThreshold = 0;
-  let accDirty = 0;
   let sinceCommit = 0;
+
+  const rounds = $derived(node.rounds_heartbeat + node.rounds_threshold);
 
   $effect(() => {
     void version; // the per-snapshot trigger
     const id = node.id;
-    const ticks = node.ticks_total;
-    const threshold = node.threshold_fires;
-    const dirty = node.dirty_ticks;
+    const ticks = rounds;
+    const threshold = node.rounds_threshold;
     if (id !== prevNodeId) {
       // Selection switched — start the trace fresh for the new node.
       samples = [];
       prevTicks = ticks;
       prevThreshold = threshold;
-      prevDirty = dirty;
       prevNodeId = id;
       accTicks = 0;
       accThreshold = 0;
-      accDirty = 0;
       sinceCommit = 0;
       return;
     }
     accTicks += Math.max(0, ticks - prevTicks);
     accThreshold += Math.max(0, threshold - prevThreshold);
-    accDirty += Math.max(0, dirty - prevDirty);
     prevTicks = ticks;
     prevThreshold = threshold;
-    prevDirty = dirty;
     sinceCommit += 1;
     if (sinceCommit >= STRIDE) {
-      samples.push({ ticks: accTicks, threshold: accThreshold, dirty: accDirty });
+      samples.push({ ticks: accTicks, threshold: accThreshold });
       if (samples.length > RING_CAP) samples.shift();
       accTicks = 0;
       accThreshold = 0;
-      accDirty = 0;
       sinceCommit = 0;
     }
   });
 
-  // Inline-SVG polyline over recent tick deltas, auto-scaled to its own peak.
+  // Inline-SVG polyline over recent round deltas, auto-scaled to its own peak.
   // Drawn on a 100×24 viewBox with 2px headroom; a flat baseline when empty.
   const sparkPoints = $derived.by(() => {
     if (samples.length < 2) return '';
@@ -101,47 +84,23 @@
       .join(' ');
   });
 
-  // Windowed shares. `recentTicks === 0` means nothing ticked recently (paused,
+  // Windowed share. `recentTicks === 0` means nothing ticked recently (paused,
   // or just switched node) — an honest empty state, not a phantom 0/100 split.
   const recentTicks = $derived(samples.reduce((sum, s) => sum + s.ticks, 0));
   const recentThreshold = $derived(samples.reduce((sum, s) => sum + s.threshold, 0));
-  const recentDirty = $derived(samples.reduce((sum, s) => sum + s.dirty, 0));
   const hasRecent = $derived(recentTicks > 0);
   const thresholdPct = $derived(hasRecent ? (recentThreshold / recentTicks) * 100 : 0);
-  const workedPct = $derived(hasRecent ? (recentDirty / recentTicks) * 100 : 0);
 
-  // Coverage fanout. The runtime sizes the per-tick fanout to the coverage
-  // threshold ⌈ln(peers)+c⌉, floored at the configured base and capped at the
-  // peer count (`config.fanout.max(⌈ln(peers)+c⌉).min(peers)`). It scales with
-  // cluster size, not the dirty set, so it holds steady for a given cluster.
-  // The meter scale is 0…peers; the base segment is the floor, and the fill
-  // past it is the coverage margin the threshold adds over that floor.
-  const peerCap = $derived(node.peers.length);
-  const base = $derived(Math.min(baseFanout, peerCap));
-  const effective = $derived(Math.min(node.effective_fanout, peerCap));
-  const peak = $derived(Math.min(node.peak_fanout, peerCap));
-  const hasPeers = $derived(peerCap > 0);
-  const aboveFloor = $derived(effective > base);
-  const basePct = $derived(hasPeers ? (Math.min(base, effective) / peerCap) * 100 : 0);
-  const coveragePct = $derived(hasPeers ? (Math.max(effective - base, 0) / peerCap) * 100 : 0);
-  const peakPct = $derived(hasPeers ? (peak / peerCap) * 100 : 0);
-
-  // The direct status word. Dirty rows queued now → there is news to push;
-  // otherwise recent ticks mean the heartbeat is alive but idle; no recent ticks
-  // means quiet (paused or settled with nothing ticking through). This "right
-  // now" tri-state pairs with the "recent window" bars — the micro/macro reading.
-  const hasDirty = $derived(node.local_dirty_len + node.forwarded_dirty_len > 0);
-  const recentlyTicking = $derived(samples.some((s) => s.ticks > 0));
-  const status = $derived(
-    hasDirty ? 'Gossiping' : recentlyTicking ? 'Idle — heartbeat only' : 'Quiet',
-  );
+  // The direct status word: recent rounds mean the heartbeat is alive; none
+  // means quiet (paused, or settled with nothing ticking through).
+  const status = $derived(samples.some((s) => s.ticks > 0) ? 'Ticking' : 'Quiet');
 </script>
 
 <div class="cadence">
   <div class="status" role="status">
-    <span class="dot" class:live={status === 'Gossiping'} aria-hidden="true"></span>
+    <span class="dot" class:live={status === 'Ticking'} aria-hidden="true"></span>
     <span class="status-word">{status}</span>
-    <span class="ticks numeric" title="cumulative gossip ticks">{node.ticks_total.toLocaleString()} ticks</span>
+    <span class="ticks numeric" title="cumulative gossip rounds">{rounds.toLocaleString()} ticks</span>
   </div>
 
   <svg class="spark" viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true">
@@ -152,45 +111,9 @@
     {/if}
   </svg>
 
-  <!-- Coverage fanout: floor → effective coverage → peak, on a 0…peers scale. -->
-  <div class="fanout">
-    <div class="fanout-head">
-      <span class="bar-label">
-        <InfoTip text="How many peers this node gossiped to on its most recent emit. The runtime sizes fanout to the coverage threshold ⌈ln(peers)+c⌉ — the fanout that reliably reaches every node — floored at the configured base and capped at the peer count. It scales with cluster size, not the dirty set, so it holds steady for a given cluster instead of pulsing with bursts.">
-          coverage fanout
-        </InfoTip>
-      </span>
-      <span class="fanout-now numeric" class:above-floor={aboveFloor}>
-        {effective}<span class="sep"> / </span>{peerCap}
-        <span class="unit">peers</span>
-      </span>
-    </div>
-    {#if hasPeers}
-      <div
-        class="meter"
-        role="meter"
-        aria-valuemin="0"
-        aria-valuemax={peerCap}
-        aria-valuenow={effective}
-        aria-valuetext="{effective} of {peerCap} peers reached for coverage; floor {base}, peak {peak}"
-      >
-        <div class="seg fan-base" style="width: {basePct}%"></div>
-        <div class="seg fan-coverage" style="width: {coveragePct}%"></div>
-        <span class="peak-tick" style="left: {peakPct}%" aria-hidden="true"></span>
-      </div>
-      <div class="fanout-foot">
-        <span>floor {base}</span>
-        <span>peak {peak}</span>
-        <span class="coverage-note" class:on={aboveFloor}>{aboveFloor ? 'sized for coverage' : 'at floor'}</span>
-      </div>
-    {:else}
-      <span class="bar-empty">no peers — nothing to fan out to</span>
-    {/if}
-  </div>
-
   <div class="bar-row">
     <span class="bar-label">
-      <InfoTip text="Of recent gossip ticks (a rolling window of the last several seconds), the share triggered eagerly by a burst whose accumulated hits crossed the per-rule error budget ε, rather than by the proactive heartbeat timer. This is the burst-driven knob — a busy node shows a higher threshold share. (The fanout above does not respond to bursts; it is sized for coverage.)">
+      <InfoTip text="Of recent gossip ticks (a rolling window of the last several seconds), the share triggered eagerly by a burst whose accumulated hits crossed the per-rule error budget ε, rather than by the proactive heartbeat timer. This is the burst-driven knob — a busy node shows a higher threshold share.">
         heartbeat vs threshold
       </InfoTip>
     </span>
@@ -198,22 +121,6 @@
       <div class="bar" role="img" aria-label="{Math.round(thresholdPct)}% of recent ticks were threshold-triggered (error budget {node.error_budget})">
         <div class="seg heartbeat" style="width: {100 - thresholdPct}%"></div>
         <div class="seg threshold" style="width: {thresholdPct}%"></div>
-      </div>
-    {:else}
-      <span class="bar-empty">no recent ticks</span>
-    {/if}
-  </div>
-
-  <div class="bar-row">
-    <span class="bar-label">
-      <InfoTip text="Of recent gossip ticks (the same rolling window), the share during which at least one cell was dirty and actually gossiped out. Idle ticks are heartbeats with nothing to send — expected, not an error.">
-        working vs idle
-      </InfoTip>
-    </span>
-    {#if hasRecent}
-      <div class="bar" role="img" aria-label="{Math.round(workedPct)}% of recent ticks carried gossip work">
-        <div class="seg worked" style="width: {workedPct}%"></div>
-        <div class="seg idle" style="width: {100 - workedPct}%"></div>
       </div>
     {:else}
       <span class="bar-empty">no recent ticks</span>
@@ -283,7 +190,7 @@
     color: var(--color-fg-muted);
   }
 
-  /* The liveness trace: a quiet dirty-hued line proving the heartbeat fires. */
+  /* The liveness trace: a quiet amber line proving the heartbeat fires. */
   .spark {
     width: 100%;
     height: 24px;
@@ -303,64 +210,6 @@
     stroke: var(--color-border-line);
     stroke-width: 1.5;
     vector-effect: non-scaling-stroke;
-  }
-
-  /* Coverage fanout block. */
-  .fanout {
-    display: flex;
-    flex-direction: column;
-    gap: var(--gap-xs);
-  }
-
-  .fanout-head {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    font-size: var(--font-size-caption);
-  }
-
-  .fanout-now {
-    color: var(--color-fg-muted);
-  }
-
-  .fanout-now.above-floor {
-    color: var(--color-ok);
-    font-weight: 600;
-  }
-
-  .fanout-now .unit {
-    color: var(--color-fg-muted);
-    font-weight: 400;
-  }
-
-  .meter {
-    position: relative;
-    display: flex;
-    height: 8px;
-    border-radius: 4px;
-    overflow: hidden;
-    background: var(--color-bg);
-  }
-
-  .fanout-foot {
-    display: flex;
-    gap: var(--gap-md);
-    font-size: var(--font-size-caption-sm);
-    color: var(--color-fg-muted);
-  }
-
-  .coverage-note.on {
-    color: var(--color-ok);
-  }
-
-  /* The peak high-water mark: a 2px tick standing above the fill. */
-  .peak-tick {
-    position: absolute;
-    top: -2px;
-    bottom: -2px;
-    width: 2px;
-    background: var(--color-fg-muted);
-    transform: translateX(-1px);
   }
 
   .bar-row {
@@ -394,24 +243,12 @@
     }
   }
 
-  .seg.heartbeat,
-  .seg.worked,
-  .seg.fan-base {
+  .seg.heartbeat {
     background: var(--chart-muted);
   }
 
   .seg.threshold {
     background: var(--color-warn);
-  }
-
-  /* Coverage margin reads as "reach", not burst — a converged-green tone,
-     distinct from the amber threshold/eager-flush share below. */
-  .seg.fan-coverage {
-    background: var(--color-ok);
-  }
-
-  .seg.idle {
-    background: transparent;
   }
 
   /* Honest empty state — reserves the row height so the layout never jumps. */

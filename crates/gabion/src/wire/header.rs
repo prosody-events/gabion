@@ -54,6 +54,14 @@ impl StreamRange {
     pub fn new(lower: u64, upper: u64) -> Option<Self> {
         (lower < upper).then_some(Self { lower, upper })
     }
+
+    pub fn lower(self) -> u64 {
+        self.lower
+    }
+
+    pub fn upper(self) -> u64 {
+        self.upper
+    }
 }
 
 /// What a packet carries. `PROBE` rides only on `Ack`, `Own` and `Relay`, and

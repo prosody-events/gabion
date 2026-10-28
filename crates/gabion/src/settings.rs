@@ -14,7 +14,8 @@ use std::ffi::CStr;
 use std::fmt;
 use std::net::SocketAddr;
 use std::num::{
-    IntErrorKind, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize, ParseIntError,
+    IntErrorKind, NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64, NonZeroU128, NonZeroUsize,
+    ParseIntError,
 };
 use std::time::Duration;
 
@@ -161,15 +162,6 @@ settings! {
         node_dictionary_capacity: Option<NonZeroU16> = None,
         "gabion could not count the hits of any node, not even this one; the default is twice \
          `gossip.peer_capacity`";
-    StorageLocalDirtyCapacity => "storage.local_dirty_capacity",
-        "GABION_STORAGE_LOCAL_DIRTY_CAPACITY", "gabion_storage_local_dirty_capacity";
-        local_dirty_capacity: NonZeroU32 = nz!(defaults::STORAGE_LOCAL_DIRTY_CAPACITY as u32),
-        "this node could not queue its own counts for gossip";
-    StorageForwardedDirtyCapacity => "storage.forwarded_dirty_capacity",
-        "GABION_STORAGE_FORWARDED_DIRTY_CAPACITY", "gabion_storage_forwarded_dirty_capacity";
-        forwarded_dirty_capacity: NonZeroU32 =
-            nz!(defaults::STORAGE_FORWARDED_DIRTY_CAPACITY as u32),
-        "this node could not pass its peers' counts on";
     StorageMaxDescriptorCount => "storage.max_descriptor_count",
         "GABION_STORAGE_MAX_DESCRIPTOR_COUNT", "gabion_storage_max_descriptor_count";
         max_descriptor_count: NonZeroU16 = nz!(defaults::STORAGE_MAX_DESCRIPTOR_COUNT),
@@ -193,17 +185,12 @@ settings! {
     RuntimeNodeIdSeed => "runtime.node_id_seed", "GABION_RUNTIME_NODE_ID_SEED",
         "gabion_node_id_seed";
         node_id_seed: Option<Box<str>> = None;
-    RuntimeRngSeed => "runtime.rng_seed", "GABION_RUNTIME_RNG_SEED", "gabion_runtime_rng_seed";
-        rng_seed: Option<u64> = None;
     GossipBind => "gossip.bind", "GABION_GOSSIP_BIND", "gabion_gossip_bind";
         gossip_bind: Option<SocketAddr> = None;
     GossipTickInterval => "gossip.tick_interval", "GABION_GOSSIP_TICK_INTERVAL",
         "gabion_gossip_tick_interval";
         tick_interval: Millis = Millis(nz!(defaults::GOSSIP_TICK_INTERVAL_MILLIS)),
         "gossip needs a positive interval between heartbeats";
-    GossipFanout => "gossip.fanout", "GABION_GOSSIP_FANOUT", "gabion_gossip_fanout";
-        fanout: NonZeroUsize = nz!(defaults::GOSSIP_FANOUT),
-        "each gossip round needs at least one peer to send to";
     GossipPeerCapacity => "gossip.peer_capacity", "GABION_GOSSIP_PEER_CAPACITY",
         "gabion_gossip_peer_capacity";
         peer_capacity: NonZeroU16 = nz!(defaults::GOSSIP_PEER_CAPACITY),
@@ -211,10 +198,6 @@ settings! {
     GossipMaxPayloadBytes => "gossip.max_payload_bytes", "GABION_GOSSIP_MAX_PAYLOAD_BYTES",
         "gabion_gossip_max_payload_bytes";
         max_payload_bytes: usize = defaults::GOSSIP_MAX_PAYLOAD_BYTES;
-    GossipMaxCellsPerTick => "gossip.max_cells_per_tick", "GABION_GOSSIP_MAX_CELLS_PER_TICK",
-        "gabion_gossip_max_cells_per_tick";
-        max_cells_per_tick: NonZeroUsize = nz!(defaults::GOSSIP_MAX_CELLS_PER_TICK),
-        "no gossip round could send a counter";
     GossipLimitQueueCapacity => "gossip.limit_queue_capacity",
         "GABION_GOSSIP_LIMIT_QUEUE_CAPACITY", "gabion_gossip_limit_queue_capacity";
         limit_queue_capacity: NonZeroUsize = nz!(defaults::GOSSIP_LIMIT_QUEUE_CAPACITY),
@@ -237,6 +220,10 @@ settings! {
         "gabion_gossip_min_emit_interval";
         min_emit_interval: Millis = Millis(nz!(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS)),
         "gossip needs a positive gap between two sends";
+    GossipSweepConcurrency => "gossip.sweep_concurrency", "GABION_GOSSIP_SWEEP_CONCURRENCY",
+        "gabion_gossip_sweep_concurrency";
+        sweep_concurrency: NonZeroU8 = nz!(defaults::GOSSIP_SWEEP_CONCURRENCY),
+        "this node could not send any newly started peer its live counts";
     DiscoverySelfAddr => "discovery.self_addr", "GABION_DISCOVERY_SELF_ADDR",
         "gabion_discovery_self_addr";
         self_addr: Option<SocketAddr> = None;
@@ -379,15 +366,14 @@ impl Settings {
             cluster_id_hash: self.cluster_id_hash,
             bootstrap_peers: Vec::new(),
             peer_capacity: self.peer_capacity,
-            fanout: self.fanout,
-            max_cells_per_tick: self.max_cells_per_tick,
+            quantum: quantum(self.max_cells, wire_limits),
+            sweep_concurrency: self.sweep_concurrency,
             wire_limits,
             limit_queue_capacity: self.limit_queue_capacity,
             #[cfg(feature = "transport-udp")]
             recv_buffer_bytes: self.recv_buffer_bytes,
             send_buffer_bytes: self.send_buffer_bytes,
             tick_interval: self.tick_interval.duration(),
-            rng_seed: self.rng_seed.unwrap_or_default(),
             target_err_bps,
             min_emit_interval: self.min_emit_interval,
         };
@@ -396,8 +382,6 @@ impl Settings {
             rule_dictionary_capacity: self.rule_dictionary_capacity,
             max_matched_rules: self.max_matched_rules,
             node_dictionary_capacity,
-            local_dirty_capacity: self.local_dirty_capacity,
-            forwarded_dirty_capacity: self.forwarded_dirty_capacity,
             cardinality: CardinalityLimits {
                 max_descriptor_count: usize::from(self.max_descriptor_count.get()),
                 max_descriptor_bytes: self.max_descriptor_bytes.get(),
@@ -407,6 +391,14 @@ impl Settings {
         };
         Ok((gossip, storage))
     }
+}
+
+/// The per-round quantum `q`: the most cells one stream sends one peer in one
+/// round, so a full store's backlog drains in
+/// [`defaults::GOSSIP_BACKLOG_ROUNDS`] rounds, and never less than one packet.
+fn quantum(max_cells: NonZeroU32, wire_limits: FrameLimits) -> NonZeroUsize {
+    let backlog = (max_cells.get() as usize).div_ceil(defaults::GOSSIP_BACKLOG_ROUNDS);
+    NonZeroUsize::new(backlog.max(wire_limits.cell_bound())).unwrap_or(NonZeroUsize::MIN)
 }
 
 /// A positive duration in whole milliseconds, the resolution of the timers
@@ -462,6 +454,7 @@ macro_rules! int_field {
 }
 
 int_field! {
+    NonZeroU8 => "a whole number from 1 to 255", "4";
     NonZeroU16 => "a whole number from 1 to 65535", "100";
     NonZeroU32 => "a whole number from 1 to 4294967295", "100";
     NonZeroUsize => "a positive whole number", "100";
@@ -486,7 +479,6 @@ macro_rules! optional_field {
 
 optional_field! {
     SocketAddr => "a socket address", "0.0.0.0:9000";
-    u64 => "a whole number from 0 to 18446744073709551615", "42";
 }
 
 /// An override with a derived default: unset until set, and 0 is not

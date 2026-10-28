@@ -35,7 +35,7 @@
   // is never rendered), then every knob default and the bucket width read from
   // it. Changing `gabion::defaults` is the only edit; the sliders follow.
   let defaults = $state<SimConfig | null>(null);
-  // The rebuild knobs (cluster size, fanout, error budget, packet loss). Seated
+  // The rebuild knobs (cluster size, error budget, packet loss). Seated
   // from the active preset and merged over its config on each (re)build, so a
   // slider tweak followed by a rebuild explores the parameter space without
   // leaving the scenario. They take effect only on rebuild — a live engine can't
@@ -140,18 +140,14 @@
   let stepping = false;
 
   /** The preset's config with the live knob values layered on top. The preset's
-   *  other pinned fields (e.g. the rng seed) survive; the rule + gossip knobs
-   *  seated from the preset (its limit, the shared window/tick defaults) win on
-   *  drag, exactly like fanout/loss. Fanout is clamped to the peer count so a
-   *  small cluster can't ask for more peers than it has; the bucket width is
-   *  fixed so every window the slider picks stays a whole number of buckets. */
+   *  other pinned fields survive; the rule + gossip knobs seated from the preset
+   *  (its limit, the shared window/tick defaults) win on drag, exactly like
+   *  loss. The bucket width is fixed so every window the slider picks stays a
+   *  whole number of buckets. */
   function effectiveConfig(preset: Preset, k: Knobs, d: SimConfig): Partial<SimConfig> {
-    const nodes = k.nodes;
-    const fanout = Math.min(Math.max(k.fanout, 1), Math.max(nodes - 1, 1));
     return {
       ...preset.config,
-      nodes,
-      fanout,
+      nodes: k.nodes,
       target_err_bps: k.target_err_bps,
       uniform_loss: k.uniform_loss,
       rule_limit: k.rule_limit,
@@ -472,7 +468,6 @@
                 node={selectedNode}
                 oracleTotal={cluster?.oracle_total ?? 0}
                 ruleLimit={appliedKnobs.rule_limit}
-                baseFanout={appliedKnobs.fanout}
                 {burstHits}
                 version={chartVersion}
                 onSend={(id) => void sendBurst(id)}

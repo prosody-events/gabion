@@ -4,7 +4,7 @@ use crate::settings::mock::{rules, storage};
 
 fn store() -> CellStore {
     CellStore::new(
-        storage(256, 48, 64),
+        storage(256, 48),
         NodeIdentity::new(NodeId(0xABCD), 1),
         &rules(32),
     )
