@@ -35,7 +35,7 @@ use crate::gossip::{
 use crate::mock::with_logs;
 use crate::settings::mock::{rules, storage};
 use crate::settings::{Millis, Settings};
-use crate::wire::{self, AckInfo, Header, MIN_PAYLOAD_BYTES, Payload};
+use crate::wire::{self, AckInfo, CellPayload, Header, MIN_PAYLOAD_BYTES};
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 
@@ -2040,11 +2040,11 @@ async fn send_raw(packets: &[Vec<u8>]) -> GossipCounters {
 fn each_decode_cause_has_its_own_throttle() {
     let foreign = wire::write_header(
         &Header {
-            cluster_id_hash: 0xC2,
+            cluster_id_hash: 0xC2.try_into().unwrap(),
             sender: node(0xB),
             sender_zone: 0,
             acks: AckInfo::default(),
-            payload: Payload::Sweep,
+            payload: CellPayload::Sweep,
         },
         0,
     );
@@ -2066,7 +2066,8 @@ fn each_decode_cause_has_its_own_throttle() {
             .filter(|line| fields.iter().all(|field| holds(line, field)))
             .count()
     };
-    assert_eq!(lines(&["reason=\"framing\""]), 3, "{logs}");
+    let framing = ["reason=\"framing\"", "packets are at most 1400 bytes"];
+    assert_eq!(lines(&framing), 3, "{logs}");
     assert_eq!(lines(&["code=\"peer_version_mismatch\""]), 1, "{logs}");
     let cluster = [
         "reason=\"cluster\"",

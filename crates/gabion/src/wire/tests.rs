@@ -1,6 +1,7 @@
 //! End-to-end wire codec tests.
 
 use std::collections::HashSet;
+use std::num::NonZeroU128;
 
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
@@ -11,13 +12,13 @@ use crate::crdt::{
 use crate::settings::mock::{rules, storage};
 
 use super::{
-    AckInfo, DecodeError, FrameLimits, HEADER_LEN, Header, MAGIC, MIN_PAYLOAD_BYTES, PacketBuf,
-    Packets, Payload, WireScratch, decode, write_header,
+    AckInfo, CellPayload, DecodeError, FrameLimits, HEADER_LEN, Header, MAGIC, MIN_PAYLOAD_BYTES,
+    PacketBuf, Packets, Payload, WireScratch, decode, write_header,
 };
 
 const MAX_ROWS: usize = 32;
-const CLUSTER: u128 = 0x1234_5678_9ABC_DEF0_1122_3344_5566_7788;
-const FOREIGN: u128 = 0xC2;
+const CLUSTER: NonZeroU128 = NonZeroU128::new(0x1234_5678_9ABC_DEF0_1122_3344_5566_7788).unwrap();
+const FOREIGN: NonZeroU128 = NonZeroU128::new(0xC2).unwrap();
 
 #[derive(Clone, Debug)]
 struct RawRow {
@@ -73,13 +74,14 @@ fn local_identity() -> NodeIdentity {
     NodeIdentity::new(NodeId(0x4242), 1)
 }
 
-fn sample_header() -> Header {
+/// The header every test packet carries, as sent or as decoded.
+fn sample_header<P: From<CellPayload>>() -> Header<P> {
     Header {
         cluster_id_hash: CLUSTER,
         sender: NodeIdentity::new(NodeId(0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0011_2233), 17),
         sender_zone: 0,
         acks: AckInfo::default(),
-        payload: Payload::Sweep,
+        payload: CellPayload::Sweep.into(),
     }
 }
 
@@ -175,7 +177,7 @@ fn encode(store: &CellStore, handles: &[CellHandle], limits: FrameLimits) -> Vec
 fn decode_cells(frame: &[u8], limits: FrameLimits) -> Result<Vec<Observation>, DecodeError> {
     let mut cells = Vec::new();
     let header = decode(frame, limits, CLUSTER, |cell| cells.push(cell))?;
-    assert_eq!(header, sample_header());
+    assert_eq!(header, sample_header::<Payload>());
     Ok(cells)
 }
 
@@ -398,7 +400,7 @@ fn decode_checks_run_in_order() {
         write_header(
             &Header {
                 cluster_id_hash: FOREIGN,
-                ..sample_header()
+                ..sample_header::<CellPayload>()
             },
             cells,
         )
@@ -463,7 +465,9 @@ fn decode_checks_run_in_order() {
             "foreign cluster and a missing body",
             limits,
             foreign(1),
-            DecodeError::ForeignCluster { found: FOREIGN },
+            DecodeError::ForeignCluster {
+                found: FOREIGN.get(),
+            },
         ),
         (
             "trailing byte and bad slot",
@@ -488,7 +492,7 @@ fn v1_packet_is_bad_version_not_garbage() {
     packet.extend_from_slice(&MAGIC.to_le_bytes());
     packet.extend_from_slice(&1_u16.to_le_bytes()); // version
     packet.extend_from_slice(&0_u16.to_le_bytes()); // flags
-    packet.extend_from_slice(&CLUSTER.to_le_bytes());
+    packet.extend_from_slice(&CLUSTER.get().to_le_bytes());
     packet.extend_from_slice(&0xAAAA_u128.to_le_bytes()); // sender node id
     packet.extend_from_slice(&7_u32.to_le_bytes()); // sender incarnation
     packet.extend_from_slice(&4_u32.to_le_bytes()); // count width

@@ -27,9 +27,13 @@ mod header;
 mod tests;
 
 pub use body::WireScratch;
-pub use header::{AckInfo, HEADER_LEN, Header, MAGIC, OwnAck, Payload, StreamRange, VERSION};
+pub use header::{
+    AckInfo, CellPayload, HEADER_LEN, Header, MAGIC, OwnAck, Payload, StreamRange, VERSION,
+};
 
 pub(crate) use header::write_header;
+
+use std::num::NonZeroU128;
 
 use body::{CELL_BYTES, DICT_LEN_BYTES, decode_body, encode_packet_body};
 use header::read_header;
@@ -152,7 +156,7 @@ impl AsRef<[u8]> for PacketBuf {
 /// may stop early: handles it never encodes are simply not sent.
 #[must_use = "Packets encodes nothing until next_into is called"]
 pub struct Packets<'a> {
-    header: Header,
+    header: Header<CellPayload>,
     store: &'a CellStore,
     handles: &'a [CellHandle],
     scratch: &'a mut WireScratch,
@@ -164,19 +168,12 @@ impl<'a> Packets<'a> {
     /// Build a packet iterator; every packet carries `header` and its own
     /// cell count.
     pub fn new(
-        header: Header,
+        header: Header<CellPayload>,
         store: &'a CellStore,
         handles: &'a [CellHandle],
         scratch: &'a mut WireScratch,
         limits: FrameLimits,
     ) -> Self {
-        debug_assert!(
-            matches!(
-                header.payload,
-                Payload::Own { .. } | Payload::Relay { .. } | Payload::Sweep
-            ),
-            "only the data kinds carry cells"
-        );
         Self {
             header,
             store,
@@ -232,7 +229,7 @@ impl<'a> Packets<'a> {
 pub fn decode(
     bytes: &[u8],
     limits: FrameLimits,
-    cluster_id_hash: u128,
+    cluster_id_hash: NonZeroU128,
     on_cell: impl FnMut(Observation),
 ) -> Result<Header, DecodeError> {
     if bytes.len() > limits.max_payload_bytes {

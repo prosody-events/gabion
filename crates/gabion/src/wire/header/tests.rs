@@ -1,10 +1,12 @@
+use std::num::NonZeroU128;
+
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 
 use super::*;
 use crate::wire::{FrameLimits, decode};
 
-const CLUSTER: u128 = 0xC1;
+const CLUSTER: NonZeroU128 = NonZeroU128::new(0xC1).unwrap();
 
 #[derive(Clone, Debug)]
 struct AnyHeader(Header);
@@ -17,18 +19,18 @@ impl Arbitrary for AnyHeader {
         let probe = bool::arbitrary(g);
         let payload = match u8::arbitrary(g) % 5 {
             0 => Payload::Ack { probe },
-            1 => Payload::Own {
+            1 => Payload::Cells(CellPayload::Own {
                 range,
                 relay_into_zone: bool::arbitrary(g),
                 probe,
-            },
-            2 => Payload::Relay { range, probe },
-            3 => Payload::Sweep,
+            }),
+            2 => Payload::Cells(CellPayload::Relay { range, probe }),
+            3 => Payload::Cells(CellPayload::Sweep),
             _ => Payload::SweepRequest,
         };
         let mark = u64::arbitrary(g);
         Self(Header {
-            cluster_id_hash: u128::arbitrary(g),
+            cluster_id_hash: NonZeroU128::new(u128::arbitrary(g)).unwrap_or(CLUSTER),
             sender: NodeIdentity::new(NodeId(u128::arbitrary(g)), u32::arbitrary(g)),
             sender_zone: u32::arbitrary(g),
             acks: AckInfo {
@@ -66,7 +68,7 @@ fn header_v2_round_trips(header: AnyHeader) -> bool {
 #[test]
 fn header_v2_layout_is_pinned() {
     let header = Header {
-        cluster_id_hash: 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
+        cluster_id_hash: NonZeroU128::new(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10).unwrap(),
         sender: NodeIdentity::new(
             NodeId(0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20),
             0x2122_2324,
@@ -81,11 +83,11 @@ fn header_v2_layout_is_pinned() {
             cannot_relay: true,
             probe_reply: true,
         },
-        payload: Payload::Own {
+        payload: Payload::Cells(CellPayload::Own {
             range: StreamRange::new(0x7172_7374_7576_7778, 0x8182_8384_8586_8788).expect("range"),
             relay_into_zone: true,
             probe: true,
-        },
+        }),
     };
     let buf = write_header(&header, 0);
     assert_eq!(HEADER_LEN, 86);
@@ -93,7 +95,7 @@ fn header_v2_layout_is_pinned() {
     assert_eq!(buf[4..6], 2_u16.to_le_bytes());
     assert_eq!(buf[6], 1);
     assert_eq!(buf[7], 0x7F);
-    assert_eq!(buf[8..24], header.cluster_id_hash.to_le_bytes());
+    assert_eq!(buf[8..24], header.cluster_id_hash.get().to_le_bytes());
     assert_eq!(buf[24..40], header.sender.node_id.0.to_le_bytes());
     assert_eq!(buf[40..44], 0x2122_2324_u32.to_le_bytes());
     assert_eq!(buf[44..48], 0x3132_3334_u32.to_le_bytes());
@@ -112,7 +114,7 @@ fn header_v2_layout_is_pinned() {
     // Each ack flag owns its bit.
     let sweep = Header {
         acks: AckInfo::default(),
-        payload: Payload::Sweep,
+        payload: Payload::Cells(CellPayload::Sweep),
         ..header
     };
     let flags = |set: fn(&mut AckInfo)| {
@@ -154,7 +156,7 @@ fn raw_header(kind: u8, flags: u8, cells: u16, lower: u64, upper: u64) -> [u8; H
             sender: NodeIdentity::new(NodeId(0xA), 3),
             sender_zone: 0,
             acks: AckInfo::default(),
-            payload: Payload::Sweep,
+            payload: CellPayload::Sweep,
         },
         cells,
     );

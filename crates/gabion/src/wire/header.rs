@@ -2,6 +2,8 @@
 //! decoded into a typed [`Header`] whose kind, flags and range cannot
 //! disagree.
 
+use std::num::NonZeroU128;
+
 use crate::crdt::{Incarnation, NodeId, NodeIdentity};
 
 use super::{DecodeError, read_u16, read_u32, read_u64, read_u128};
@@ -60,6 +62,16 @@ impl StreamRange {
 pub enum Payload {
     /// Header only: acks and gap flags.
     Ack { probe: bool },
+    /// A kind that carries cells.
+    Cells(CellPayload),
+    /// Header only: "send me your live cells".
+    SweepRequest,
+}
+
+/// The kinds that carry cells, the only ones [`Packets`](super::Packets)
+/// encodes, so no header-only kind is sent with cells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CellPayload {
     /// Cells of the sender's own stream.
     Own {
         range: StreamRange,
@@ -70,8 +82,12 @@ pub enum Payload {
     Relay { range: StreamRange, probe: bool },
     /// Cells outside any stream.
     Sweep,
-    /// Header only: "send me your live cells".
-    SweepRequest,
+}
+
+impl From<CellPayload> for Payload {
+    fn from(cells: CellPayload) -> Self {
+        Self::Cells(cells)
+    }
 }
 
 /// The sender's mark for the addressee's own stream.
@@ -102,27 +118,35 @@ pub struct AckInfo {
     pub probe_reply: bool,
 }
 
+/// A packet header. A decoded one carries any [`Payload`]; one sent with
+/// cells carries a [`CellPayload`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Header {
-    pub cluster_id_hash: u128,
+pub struct Header<P = Payload> {
+    pub cluster_id_hash: NonZeroU128,
     pub sender: NodeIdentity,
     /// The sender's zone hash; 0 = no zone.
     pub sender_zone: u32,
     pub acks: AckInfo,
-    pub payload: Payload,
+    pub payload: P,
 }
 
-/// Encode `header` for a packet of `cell_count` cells.
-pub(crate) fn write_header(header: &Header, cell_count: u16) -> [u8; HEADER_LEN] {
-    let (kind, range, relay_into_zone, probe) = match header.payload {
+/// Encode `header` for a packet of `cell_count` cells; a header-only kind
+/// has none.
+pub(crate) fn write_header<P: Copy + Into<Payload>>(
+    header: &Header<P>,
+    cell_count: u16,
+) -> [u8; HEADER_LEN] {
+    let (kind, range, relay_into_zone, probe) = match header.payload.into() {
         Payload::Ack { probe } => (PacketKind::Ack, None, false, probe),
-        Payload::Own {
+        Payload::Cells(CellPayload::Own {
             range,
             relay_into_zone,
             probe,
-        } => (PacketKind::Own, Some(range), relay_into_zone, probe),
-        Payload::Relay { range, probe } => (PacketKind::Relay, Some(range), false, probe),
-        Payload::Sweep => (PacketKind::Sweep, None, false, false),
+        }) => (PacketKind::Own, Some(range), relay_into_zone, probe),
+        Payload::Cells(CellPayload::Relay { range, probe }) => {
+            (PacketKind::Relay, Some(range), false, probe)
+        }
+        Payload::Cells(CellPayload::Sweep) => (PacketKind::Sweep, None, false, false),
         Payload::SweepRequest => (PacketKind::SweepRequest, None, false, false),
     };
     let acks = header.acks;
@@ -144,7 +168,7 @@ pub(crate) fn write_header(header: &Header, cell_count: u16) -> [u8; HEADER_LEN]
     dst[4..6].copy_from_slice(&VERSION.to_le_bytes());
     dst[6] = kind as u8;
     dst[7] = flags;
-    dst[8..24].copy_from_slice(&header.cluster_id_hash.to_le_bytes());
+    dst[8..24].copy_from_slice(&header.cluster_id_hash.get().to_le_bytes());
     dst[24..40].copy_from_slice(&header.sender.node_id.0.to_le_bytes());
     dst[40..44].copy_from_slice(&header.sender.incarnation.to_le_bytes());
     dst[44..48].copy_from_slice(&header.sender_zone.to_le_bytes());
@@ -165,7 +189,7 @@ fn bit(set: bool, flag: u8) -> u8 {
 /// kind, flags and range, then the cluster id, in that order.
 pub(crate) fn read_header(
     bytes: &[u8],
-    cluster_id_hash: u128,
+    cluster_id_hash: NonZeroU128,
 ) -> Result<(Header, u16), DecodeError> {
     let Some(bytes) = bytes.first_chunk::<HEADER_LEN>() else {
         return Err(DecodeError::TooShort);
@@ -187,7 +211,7 @@ pub(crate) fn read_header(
         read_u64(&bytes[78..]),
     )?;
     let found = read_u128(&bytes[8..]);
-    if found != cluster_id_hash {
+    if found != cluster_id_hash.get() {
         return Err(DecodeError::ForeignCluster { found });
     }
     let ack_own = read_u64(&bytes[54..]);
@@ -236,18 +260,18 @@ fn read_payload(
     }
     let range = StreamRange::new(lower, upper).ok_or(DecodeError::BadRange);
     match kind {
-        PacketKind::Own => Ok(Payload::Own {
+        PacketKind::Own => Ok(Payload::Cells(CellPayload::Own {
             range: range?,
             relay_into_zone,
             probe,
-        }),
-        PacketKind::Relay => Ok(Payload::Relay {
+        })),
+        PacketKind::Relay => Ok(Payload::Cells(CellPayload::Relay {
             range: range?,
             probe,
-        }),
+        })),
         _ if (lower, upper) != (0, 0) => Err(DecodeError::BadRange),
         PacketKind::Ack => Ok(Payload::Ack { probe }),
-        PacketKind::Sweep => Ok(Payload::Sweep),
+        PacketKind::Sweep => Ok(Payload::Cells(CellPayload::Sweep)),
         PacketKind::SweepRequest => Ok(Payload::SweepRequest),
     }
 }

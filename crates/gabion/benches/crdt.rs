@@ -78,7 +78,7 @@ fn obs_row(
     }
 }
 use gabion::wire::{
-    AckInfo, FrameLimits, Header, PacketBuf, Packets, Payload, WireScratch, decode,
+    AckInfo, CellPayload, FrameLimits, Header, PacketBuf, Packets, WireScratch, decode,
 };
 
 // ---------------------------------------------------------------------------
@@ -1112,13 +1112,15 @@ fn bench_expire(c: &mut Criterion) {
 // wire — gossip frame encode / decode.
 // ---------------------------------------------------------------------------
 
-fn wire_header() -> Header {
+fn wire_header() -> Header<CellPayload> {
     Header {
-        cluster_id_hash: 0xC0FE_FACE_DEAD_BEEF_1234_5678_9ABC_DEF0,
+        cluster_id_hash: 0xC0FE_FACE_DEAD_BEEF_1234_5678_9ABC_DEF0_u128
+            .try_into()
+            .expect("non-zero"),
         sender: local_identity(),
         sender_zone: 0,
         acks: AckInfo::default(),
-        payload: Payload::Sweep,
+        payload: CellPayload::Sweep,
     }
 }
 

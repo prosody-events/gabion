@@ -428,7 +428,7 @@ where
         let decoded = wire::decode(
             &self.recv_buf[..n],
             self.config.wire_limits,
-            self.config.cluster_id_hash.get(),
+            self.config.cluster_id_hash,
             |cell| obs_buf.push(cell),
         );
         let header = match decoded {
@@ -535,8 +535,8 @@ where
                         "Dropped a packet from this peer that is not valid gabion gossip. Usually \
                          another program is sending UDP to this node's gossip port, or something \
                          on the path truncates packets. If the peer is a gabion node, check the \
-                         path MTU between the two: gossip packets are at most {} bytes. Counts \
-                         from healthy peers are not affected.",
+                         path MTU between the two: gossip packets are at most {max_payload_bytes} \
+                         bytes, set by {}. Counts from healthy peers are not affected.",
                         Setting::GossipMaxPayloadBytes,
                     );
                 }
@@ -754,11 +754,11 @@ where
     fn send_frame(&mut self, dst: SocketAddr) {
         // Every packet is a sweep: cells outside any stream.
         let header = wire::Header {
-            cluster_id_hash: self.config.cluster_id_hash.get(),
+            cluster_id_hash: self.config.cluster_id_hash,
             sender: self.store.local_identity(),
             sender_zone: 0,
             acks: wire::AckInfo::default(),
-            payload: wire::Payload::Sweep,
+            payload: wire::CellPayload::Sweep,
         };
 
         let Self {
