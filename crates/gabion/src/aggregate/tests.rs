@@ -66,15 +66,18 @@ fn window_total_sums_live_buckets() {
     assert_eq!(total, 4 + 7 + 2);
 }
 
+/// Four cells with one home slot fill a four-slot table, so three of them
+/// are written and found only by walking past their home.
 #[test]
 fn collisions_are_resolved_by_probing() {
     let table = aggregate(4);
-    for i in 0..4_u128 {
-        writer(&table).add(i, i + 1, i as u32, i as u64 + 1);
+    let home = |key| mix_index(1, key, 0) & table.table().mask();
+    let keys: Vec<u128> = (0..).filter(|&key| home(key) == home(0)).take(4).collect();
+    for (count, &key) in (1..).zip(&keys) {
+        assert!(writer(&table).add(1, key, 0, count));
     }
-    for i in 0..4_u128 {
-        let cell = table.table().get(i, i + 1, i as u32).expect("found");
-        assert_eq!(cell.count, i as u64 + 1);
+    for (count, &key) in (1..).zip(&keys) {
+        assert_eq!(table.table().get(1, key, 0).expect("found").count, count);
     }
 }
 

@@ -51,14 +51,14 @@ fn zero_is_not_positive() {
             assert_eq!(error, SettingError::NotPositive { setting });
             let text = error.to_string();
             let default = setting.default_text().unwrap_or_default();
-            for part in [
-                setting.yaml_key(),
-                setting.env_var(),
-                setting.nginx_directive().unwrap_or_default(),
-                reason,
-                &default,
-            ] {
+            for part in [setting.yaml_key(), setting.env_var(), reason, &default] {
                 assert!(text.contains(part), "{text:?} lacks {part:?}");
+            }
+            match setting.nginx_directive() {
+                Some(directive) => {
+                    assert!(text.contains(directive), "{text:?} lacks {directive:?}")
+                }
+                None => assert!(!text.contains("NGINX"), "{text:?} names an NGINX directive"),
             }
         }
     }
