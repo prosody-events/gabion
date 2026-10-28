@@ -4,7 +4,10 @@
 gRPC server that any sidecar or proxy speaking
 `envoy.service.ratelimit.v3` can call. It shares the CRDT and gossip
 machinery with the nginx module, so the two adapters can coexist in a
-single cluster and count against the same totals. If you are not running
+single cluster and count a rule written the same way in both against one
+total; see
+[Writing the same rule for NGINX and gabiond](../gabion/README.md#writing-the-same-rule-for-nginx-and-gabiond).
+If you are not running
 Envoy — or you want enforcement inside nginx itself — see
 [`../nginx/README.md`](../nginx/README.md). For the gossip protocol
 explainer and tuning knobs, see

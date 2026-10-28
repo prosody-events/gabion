@@ -964,6 +964,7 @@ dependencies = [
  "envoy-types",
  "futures",
  "gabion",
+ "gabion-nginx",
  "humantime-serde",
  "quickcheck",
  "quickcheck_macros",

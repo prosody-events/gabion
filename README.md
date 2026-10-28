@@ -35,7 +35,9 @@ ingress (HTTP through nginx, gRPC through `gabiond`) while gossiping
 with every other process about what it has just admitted. The same
 library sits underneath both adapters, so an nginx worker and a
 `gabiond` replica are interchangeable peers as long as they share a
-cluster id.
+cluster id, and they count a rule together when it is written the same way
+in both
+([how](crates/gabion/README.md#writing-the-same-rule-for-nginx-and-gabiond)).
 
 ## Try the simulator in your browser
 

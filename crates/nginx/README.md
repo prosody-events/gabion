@@ -331,6 +331,8 @@ so `nginx -t` refuses them; above, `per_uri`, `shadow`, `slow_path` and
 `smooth` all key on `$uri` but each has its own window or bucket. A
 `gabiond` rule with the same identity shares counts with the NGINX one in a
 mixed cluster, whichever order either configuration lists them in.
+[Writing the same rule for NGINX and gabiond](../gabion/README.md#writing-the-same-rule-for-nginx-and-gabiond)
+gives every field in both spellings.
 
 **Descriptor bindings.** A binding pairs a descriptor key with a
 variable expression evaluated at request time:

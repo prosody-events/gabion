@@ -139,7 +139,22 @@ data:
       cluster_id_hash: 1
       target_err_bps: 100
       min_emit_interval: 5ms
+    # The NGINX config's three rules in the opposite order; each pair counts
+    # as one rule across the two adapters.
     limits:
+      - name: acme_only
+        domain: nginx
+        descriptors:
+          - key: tenant
+            value: acme
+        rate: 2r/m
+        bucket: 1s
+      - name: per_client
+        domain: nginx
+        descriptors:
+          - key: client
+        rate: 3r/m
+        bucket: 1s
       - name: nginx_uri
         domain: nginx
         descriptors:
@@ -166,6 +181,8 @@ data:
     http {
         gabion_limit_zone zone=api:128m;
         gabion_limit_rule uri_api \$uri rate=2r/m bucket=1s;
+        gabion_limit_rule per_client client:\$arg_c rate=3r/m bucket=1s;
+        gabion_limit_rule acme_only tenant:\$arg_t rate=2r/m bucket=1s value=tenant:acme;
         gabion_gossip_bind 0.0.0.0:9000;
         gabion_gossip_cluster 1;
         gabion_gossip_fanout 6;
@@ -182,6 +199,16 @@ data:
             location /off/ {
                 gabion_limit uri_api;
                 gabion off;
+                alias /usr/share/nginx/html/;
+            }
+
+            location /client/ {
+                gabion_limit per_client;
+                alias /usr/share/nginx/html/;
+            }
+
+            location /acme/ {
+                gabion_limit acme_only;
                 alias /usr/share/nginx/html/;
             }
         }
@@ -301,6 +328,69 @@ drive_nginx_traffic() {
     done
 }
 
+# nginx_hit <path>: one request through NGINX; prints its HTTP status.
+nginx_hit() {
+    curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080$1"
+}
+
+# gabiond_hit <domain> <key> <value>: one hit through gabiond's gRPC port;
+# prints the response's overall code, OK or OVER_LIMIT. The request is
+# encoded by hand, so the smoke needs only curl and python3.
+gabiond_hit() {
+    python3 -c '
+import sys
+def field(number, payload):  # length-delimited; every payload here is under 128 bytes
+    return bytes([number << 3 | 2, len(payload)]) + payload
+domain, key, value = (arg.encode() for arg in sys.argv[1:])
+request = field(1, domain) + field(2, field(1, field(1, key) + field(2, value)))
+sys.stdout.buffer.write(bytes(1) + len(request).to_bytes(4, "big") + request)
+' "$@" \
+        | curl -sS --http2-prior-knowledge -H 'content-type: application/grpc' -H 'te: trailers' \
+            --data-binary @- \
+            http://127.0.0.1:18081/envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit \
+        | python3 -c '
+import sys
+reply = sys.stdin.buffer.read()
+print({b"\x08\x01": "OK", b"\x08\x02": "OVER_LIMIT"}.get(reply[5:7], "UNKNOWN"))
+'
+}
+
+# shared_limit <limit> <nginx path> <domain> <key> <value>: alternate hits on
+# one key between NGINX and gabiond, a few gossip rounds apart. The two
+# adapters count one rule, so the first <limit> hits pass and each adapter
+# refuses the next.
+shared_limit() {
+    limit="$1"
+    path="$2"
+    shift 2
+    hit=1
+    while [ "$hit" -le "$limit" ]; do
+        allowed=0
+        if [ $((hit % 2)) -eq 1 ]; then
+            answer="NGINX $(nginx_hit "$path")"
+            [ "$answer" = "NGINX 429" ] || allowed=1
+        else
+            answer="gabiond $(gabiond_hit "$@")"
+            [ "$answer" != "gabiond OK" ] || allowed=1
+        fi
+        if [ "$allowed" = 0 ]; then
+            printf 'FAIL: hit %s of %s on %s was refused (%s) before the shared limit\n' \
+                "$hit" "$limit" "$path" "$answer" >&2
+            exit 1
+        fi
+        hit=$((hit + 1))
+        sleep 3
+    done
+    status="$(nginx_hit "$path")"
+    code="$(gabiond_hit "$@")"
+    if [ "$status" != 429 ] || [ "$code" != OVER_LIMIT ]; then
+        printf 'FAIL: after %s hits split between NGINX and gabiond on %s, NGINX answered %s and gabiond %s; both must refuse, or the two adapters count the rule separately\n' \
+            "$limit" "$path" "$status" "$code" >&2
+        exit 1
+    fi
+    printf 'one limit of %s across NGINX and gabiond on %s\n' "$limit" "$path"
+}
+
 port_forwards_ready() {
     curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot" \
         && curl -fsS -o /dev/null "http://127.0.0.1:18080/off/index.html"
@@ -324,7 +414,7 @@ kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=180s
 wait_for_endpoint_count gabiond 2
 wait_for_endpoint_count gabion-nginx 2
 
-kubectl -n "$namespace" port-forward service/gabiond 19090:9090 \
+kubectl -n "$namespace" port-forward service/gabiond 19090:9090 18081:8081 \
     >/tmp/gabiond-admin-port-forward.log 2>&1 &
 admin_forward_pid="$!"
 kubectl -n "$namespace" port-forward service/gabion-nginx 18080:8080 \
@@ -348,6 +438,12 @@ wait_for_endpoint_count gabion-nginx 3
 
 # gabiond peers with every other pod: 3 before the scale-out, 5 after.
 retry 60 gossip_settled 5
+
+# Each rule is one limit across both adapters. Fresh keys: the traffic above
+# spent /api/index.html's budget.
+shared_limit 2 /api/parity nginx uri /api/parity
+shared_limit 3 '/client/index.html?c=parity' nginx client parity
+shared_limit 2 '/acme/index.html?t=acme' nginx tenant acme
 
 dump_snapshot "after traffic + scale-out"
 

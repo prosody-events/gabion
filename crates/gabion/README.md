@@ -23,6 +23,7 @@ the [repo root README](../../README.md#glossary).
   - [Coverage fanout](#coverage-fanout)
   - [Adaptive emit rate](#adaptive-emit-rate)
   - [Dirty rings and the peer frontier](#dirty-rings-and-the-peer-frontier)
+- [Writing the same rule for NGINX and gabiond](#writing-the-same-rule-for-nginx-and-gabiond)
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
 - [References](#references)
@@ -359,6 +360,78 @@ next repair-lane sweep picks the dropped cell back up.
 `CRDT.md` documents these structures end-to-end with traces, slot
 lifecycles, and invariant proofs. Read it once if you ever need to
 debug the CRDT.
+
+## Writing the same rule for NGINX and gabiond
+
+NGINX nodes and `gabiond` nodes in one cluster count a rule together when
+both adapters write it the same way: the same domain, the same descriptor keys
+and value patterns in the same order, and the same window and bucket. Those
+fields are the rule's identity, hashed into the fingerprint every counter is
+filed under, so neither the rule's name nor its position in either
+configuration matters. The rate and the mode are not part of the identity:
+changing either keeps a rule's counts. Write them the same in both adapters
+too, because each adapter enforces its own rate and mode against the shared
+count.
+
+| Field | `gabiond` YAML (`limits:` entry) | NGINX `gabion_limit_rule` argument | When omitted | Identity |
+|---|---|---|---|---|
+| name | `name: api_tenant` | first argument | required | no; unique within each configuration |
+| domain | `domain: nginx` | `domain=nginx` | `gabiond`: required; NGINX: `nginx` | yes |
+| descriptors, in order | `descriptors: [{key: uri}, {key: tenant}]` | one binding per descriptor: `$uri tenant:$arg_t` (a bare `$uri` is keyed `uri`; `key:$source` names the key) | required, at least one | yes: keys and their order |
+| value pattern | `value: acme` on a descriptor | `value=tenant:acme` | `*`, any value | yes |
+| rate | `rate: 100r/10s` | `rate=100r/10s` | required | no |
+| window | `window: 10s` | `window=10s` | the rate's period | yes |
+| bucket | `bucket: 1s` | `bucket=1s` | the window | yes |
+| mode | `mode: dry_run` (`enforce`, `dry_run`, `disabled`) | `mode=dry_run`, or the flag `dry_run` | `enforce` | no |
+
+Both adapters compute the limit as ⌊rate count × window ÷ rate period⌋.
+These two rules are one rule:
+
+```yaml
+# gabiond
+limits:
+  - name: api_tenant
+    domain: nginx
+    descriptors:
+      - key: uri
+      - key: tenant
+    rate: 100r/10s
+    bucket: 1s
+```
+
+```nginx
+# NGINX
+gabion_limit_rule api_tenant $uri tenant:$arg_t rate=100r/10s bucket=1s;
+```
+
+and so are these, which count only the tenant `acme`:
+
+```yaml
+  - name: acme_only
+    domain: nginx
+    descriptors:
+      - key: tenant
+        value: acme
+    rate: 10r/s
+```
+
+```nginx
+gabion_limit_rule acme_only tenant:$arg_t rate=10r/s value=tenant:acme;
+```
+
+Rules that differ in any identity field, even only in `bucket`, are
+different rules: each adapter counts its own, so a mixed cluster admits up to
+the limit through each. gabion cannot tell such a pair from two unrelated
+rules, so if a mixed cluster admits more than a rule allows, compare the two
+spellings field by field against the table.
+
+**Which requests reach a rule is not part of it.** NGINX selects them with
+the location's `gabion_limit`, `except_if=$var` and the variable each binding
+reads; Envoy with the route's rate-limit actions, which decide the
+descriptors a request carries. Requests share a counter only when both
+adapters hand gabion the same bytes for each value: NGINX's `$uri` is the
+normalized path without the query string, whereas an Envoy action that reads
+the `:path` header sends the raw path with its query.
 
 ## Operator knobs
 

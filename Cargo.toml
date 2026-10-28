@@ -26,6 +26,7 @@ either = "1"
 envoy-types = "0.7"
 futures = "0.3"
 gabion = { path = "crates/gabion" }
+gabion-nginx = { path = "crates/nginx" }
 # `std` so `getrandom::Error` implements `std::error::Error` (anyhow `.context`
 # in gabiond); `sys_rng` selects the OS backend (0.4 made it opt-in). The
 # wasm32 target adds `wasm_js` in gabion's manifest.

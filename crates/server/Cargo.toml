@@ -27,6 +27,7 @@ whoami.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+gabion-nginx.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
 serde_json.workspace = true
