@@ -31,7 +31,7 @@ import {
 } from './layout';
 
 // A node counts as caught up when its view is within this fraction of the
-// cluster's true total — the threshold that flips its arc from amber to green.
+// cluster's true total — the threshold that flips its arc from warn to ok.
 const CONVERGED_EPSILON = 0.001;
 
 // Wall-clock flight time of a gossip packet beam. Eased so the beam accelerates
@@ -656,7 +656,7 @@ export class StageRenderer {
 
   /** The synchronized convergence pulse: one expanding ring from each node,
    *  fired the instant the cluster agrees. Reduced motion skips it — the arcs
-   *  already snapped green. */
+   *  already snapped to ok. */
   #pulse(): void {
     if (this.#reduceMotion) return;
     const baseRadius = nodeRadius(this.#nodes.size);

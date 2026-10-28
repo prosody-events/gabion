@@ -3,20 +3,9 @@
 // and reading the pixel back: no colour string is parsed by hand, whatever form
 // the browser serialises it in.
 
-/** The tokens the stage and the charts draw with, as packed `0xRRGGBB`. */
-export interface Theme {
-  bg: number;
-  fg: number;
-  fgMuted: number;
-  grid: number;
-  muted: number;
-  ok: number;
-  warn: number;
-}
-
 /** Resolve the canvas tokens from the page's current styles. Self-contained (no
  *  module-level references), because the design audit runs it in the page too. */
-export function readTheme(): Theme {
+export function readTheme() {
   const ctx = new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true });
   if (ctx === null) throw new Error('readTheme: no 2D canvas to resolve the theme colours with');
   const probe = document.createElement('span');
@@ -42,6 +31,9 @@ export function readTheme(): Theme {
   probe.remove();
   return theme;
 }
+
+/** The tokens the stage and the charts draw with, as packed `0xRRGGBB`. */
+export type Theme = ReturnType<typeof readTheme>;
 
 /** Call `onChange` when the OS colour scheme or `<html data-theme>` changes;
  *  returns the unsubscribe. */

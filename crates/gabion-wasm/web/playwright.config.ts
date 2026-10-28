@@ -26,7 +26,7 @@ export default defineConfig({
   },
   projects: [
     {
-      name: 'chromium',
+      name: 'screenshot',
       testMatch: /screenshot\.spec\.ts$/,
       use: { viewport: { width: 1440, height: 900 } },
     },
