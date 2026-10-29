@@ -7,6 +7,7 @@ use std::task::{Context, Waker};
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 
 use super::*;
+use crate::defaults::GOSSIP_GAP_REPORTS;
 use crate::gossip::PeerEntry;
 
 /// One runtime on the simulated network, with its admin channel and the
@@ -232,6 +233,46 @@ fn gap_is_reported_and_resent_within_floors() {
     });
 }
 
+/// A gap whose sender never answers is reported `GOSSIP_GAP_REPORTS` times,
+/// then abandoned once with `gap_abandoned`; the round that abandons it sends
+/// nothing, yet the row stops being due and the prompt rounds stop.
+#[test]
+fn abandoned_gap_stops_prompt_rounds() {
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let router = SimRouter::new();
+            let x = sock(43_251);
+            let b = Node::start(
+                &router,
+                sock(43_250),
+                store_for(id(1, 1)),
+                sim_config(vec![x]),
+            );
+            let raw = router.bind(x);
+            let own = CellPayload::Own {
+                range: wire::StreamRange::new(1, 2).unwrap(),
+                relay_into_zone: false,
+                probe: false,
+            };
+            let packet = header_bytes(id(9, 1), AckInfo::default(), Payload::Cells(own));
+            raw.try_send_to(&packet, b.addr).unwrap();
+            // Reports at 5, 25, 45 and 65 ms; abandoned at 85.
+            run_for(100).await;
+            let abandoned = b.counters().await;
+            assert_eq!(abandoned.gap_reports_sent, u64::from(GOSSIP_GAP_REPORTS));
+            assert_eq!(abandoned.gaps_abandoned, 1);
+            run_for(300).await;
+            let rounds = b.counters().await.rounds_prompt;
+            assert_eq!(
+                rounds, abandoned.rounds_prompt,
+                "the abandoned gap stays prompt"
+            );
+            b.stop().await;
+        })
+    });
+    assert_logged(&logs, "gap_abandoned", 1, &["missing=1", "reports=4"]);
+}
+
 /// SIM5: a joiner learns the cells of an origin that left before it joined,
 /// which no stream carries any more, from a join sweep.
 #[test]
@@ -363,14 +404,24 @@ fn other_version_peer_is_muted() {
         assert_eq!(router.received_count(v), received);
         assert_eq!(a.peer(v).await.role, Role::Incompatible);
 
-        let ack = header_bytes(id(1, 1), AckInfo::default(), Payload::Ack { probe: false });
+        // The version packet is read before any round serves the sweep, so
+        // no page may have gone out even before the snapshot above.
+        let limits = wire::FrameLimits::new(wire::MAX_PAYLOAD_BYTES).unwrap();
         let mut buf = vec![0; wire::MAX_PAYLOAD_BYTES];
         let mut cx = Context::from_waker(Waker::noop());
-        while raw.try_recv_from(&mut cx, &mut buf).is_ok() {}
+        while let Ok((n, _)) = raw.try_recv_from(&mut cx, &mut buf) {
+            let header = wire::decode(&buf[..n], limits, 0xC1.try_into().unwrap(), |_| {});
+            let sweep = Payload::Cells(CellPayload::Sweep);
+            assert_ne!(
+                header.unwrap().payload,
+                sweep,
+                "a muted peer was sent a page"
+            );
+        }
+        let ack = header_bytes(id(1, 1), AckInfo::default(), Payload::Ack { probe: false });
         raw.try_send_to(&ack, a.addr).unwrap();
         run_for(100).await;
         assert_eq!(a.peer(v).await.role, Role::Zone);
-        let limits = wire::FrameLimits::new(wire::MAX_PAYLOAD_BYTES).unwrap();
         let mut own_cells = 0;
         while let Ok((n, _)) = raw.try_recv_from(&mut cx, &mut buf) {
             wire::decode(&buf[..n], limits, 0xC1.try_into().unwrap(), |_| {

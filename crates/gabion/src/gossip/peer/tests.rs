@@ -7,7 +7,9 @@ use crate::crdt::NodeId;
 /// Twice the capacity: inserts hit Present and Full, and removes hit and miss.
 const POOL: u8 = 16;
 const CAPACITY: NonZeroU16 = NonZeroU16::new(8).unwrap();
-const RTO: u64 = 100;
+/// A few floors, so data in flight often times out between acks, and a whole
+/// number of them, so `Op::Advance` lands exactly on the timeout.
+const RTO: u64 = 4 * FLOOR;
 const FLOOR: u64 = 5;
 
 /// Both families, so both arms of `addr_hash` run. Each odd address is the
@@ -93,6 +95,8 @@ enum Op {
     Gap(u8),
     /// The round's timeout check, rewinding a timed-out stream.
     Service,
+    /// Time moves this many relay floors. The timeout and the report times
+    /// are whole floors, so time lands exactly on each.
     Advance(u8),
     /// A packet of the peer's own stream closing `(lower, lower + len]`.
     Receive(u8, u8),
@@ -110,7 +114,7 @@ impl Arbitrary for Op {
             2 => Op::Ack(x * 2),
             3 => Op::Gap(x * 2),
             4 => Op::Service,
-            5 => Op::Advance(x * 16),
+            5 => Op::Advance(x),
             6 => Op::Receive(x, y),
             _ => Op::Report,
         }
@@ -208,7 +212,7 @@ fn outbound_matches_model(ops: Vec<Op>) {
                 }
                 model.service(now);
             }
-            Op::Advance(ms) => now += u64::from(ms),
+            Op::Advance(n) => now += u64::from(n) * FLOOR,
             Op::Receive(..) | Op::Report => {}
         }
         let own = table.link[0].own;
@@ -341,7 +345,7 @@ fn inbound_gap_matches_model(ops: Vec<Op>) {
                     assert_eq!(due, GapDue::Nothing);
                 }
             }
-            Op::Advance(ms) => now += u64::from(ms) / 4,
+            Op::Advance(n) => now += u64::from(n) * FLOOR,
             _ => {}
         }
         assert!(inbound.have >= before.have);
@@ -381,7 +385,7 @@ fn deadline_is_min_of_row_timers(ops: Vec<Op>) {
                     table.own_tx(0).rewind(now);
                 }
             }
-            Op::Advance(ms) => now += u64::from(ms),
+            Op::Advance(n) => now += u64::from(n) * FLOOR,
             Op::Receive(lower, len) => {
                 let (lower, upper) = (u64::from(lower), u64::from(lower + len));
                 table.own_in(0).receive(lower, upper, now, FLOOR);
