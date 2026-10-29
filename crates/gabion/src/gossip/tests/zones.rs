@@ -1364,9 +1364,10 @@ fn cannot_relay_from_a_zone_row_is_ignored() {
 /// An idle gateway, `suspect_after` four heartbeats: it answers each
 /// probed retry within a millisecond and anything else at its own heartbeat,
 /// 50 ms after this node's, and the first `withheld` probes to it are lost.
-/// Each heartbeat of this node runs `late(at)` ms after the instant `at` it
-/// was scheduled for. Returns the failovers, and how long after the first
-/// lost probe the first one came.
+/// Each heartbeat of this node, 10 ms past each 100 (`mocked` starts it 10 ms
+/// in), runs `late(at)` ms after the instant `at` it was scheduled for.
+/// Returns the failovers, and how long after the first lost probe the first
+/// one came.
 async fn lost_attempts(withheld: usize, late: impl Fn(u64) -> u64) -> (u64, Option<u64>) {
     let (g1, g2) = (sock(2), sock(3));
     let wire = Rc::new(Wire::default());
@@ -1409,7 +1410,7 @@ async fn lost_attempts(withheld: usize, late: impl Fn(u64) -> u64) -> (u64, Opti
             let at = if probe {
                 t + 1
             } else {
-                t + (150 - t % 100) % 100
+                t + (160 - t % 100) % 100
             };
             due.push((at, a.dst, peer));
         }
@@ -1431,7 +1432,7 @@ async fn lost_attempts(withheld: usize, late: impl Fn(u64) -> u64) -> (u64, Opti
         due.retain(|(at, ..)| *at > t);
         wake(&wire);
         let heartbeat = t + 1;
-        if heartbeat.is_multiple_of(100) && late(heartbeat) > 0 {
+        if heartbeat % 100 == 10 && late(heartbeat) > 0 {
             tokio::task::yield_now().await;
             wire.stall(true);
             resume_at = Some(heartbeat + late(heartbeat));
@@ -1529,7 +1530,8 @@ fn local_stall_suspects_nobody() {
 
 /// A dead gateway behind a socket that refuses every send for twice
 /// `suspect_after` is not judged during the hold, and once sends leave again
-/// it fails over within `suspect_after + T + 2 · F_r`.
+/// it fails over no sooner than `suspect_after − T`, since the hold does not
+/// count, and within `suspect_after + T + 2 · F_r`.
 #[test]
 fn dead_gateway_fails_over_soon_after_backpressure_ends() {
     run_paused(async {
@@ -1559,6 +1561,7 @@ fn dead_gateway_fails_over_soon_after_backpressure_ends() {
             sim_advance(Duration::from_millis(1)).await;
             after += 1;
         }
+        assert!(after >= 400 - 100, "failover {after} ms after the release");
     });
 }
 

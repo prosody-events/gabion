@@ -691,12 +691,12 @@ enum AnswerOp {
         asks: bool,
         left: bool,
     },
-    /// Own data goes out: the stream is owed.
-    Data,
-    /// An ack of everything sent, or a repeat of the stuck one, flagged
-    /// `CANNOT_RELAY` or not.
+    /// Data goes out on one stream: it is owed while the role receives it.
+    Data(Stream),
+    /// Per stream, an ack of everything sent or a repeat of the stuck one,
+    /// flagged `CANNOT_RELAY` or not.
     Ack {
-        progress: bool,
+        progress: PerStream<bool>,
         cannot_relay: bool,
     },
     ProbeReply,
@@ -717,9 +717,12 @@ impl Arbitrary for AnswerOp {
                 asks: bool::arbitrary(g),
                 left: bool::arbitrary(g),
             },
-            1 => Self::Data,
+            1 => Self::Data(*g.choose(&[Stream::Own, Stream::Relay]).unwrap()),
             2 | 3 => Self::Ack {
-                progress: bool::arbitrary(g),
+                progress: PerStream {
+                    own: bool::arbitrary(g),
+                    relay: bool::arbitrary(g),
+                },
                 cannot_relay: bool::arbitrary(g),
             },
             4 => Self::ProbeReply,
@@ -744,7 +747,7 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
         table.insert(addr(0));
         let mut identity = NodeIdentity::new(NodeId(9), 1);
         table.contact(0, identity, None);
-        let (mut model, mut now, mut head) = (Answer::Settled, 1_000_u64, 0_u64);
+        let (mut model, mut now, mut head) = (Answer::Settled, 1_000_u64, PerStream::default());
         for op in &ops {
             let suspect = |answer: Answer, judged| match answer {
                 Answer::Settled => false,
@@ -752,18 +755,38 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                 Answer::CannotRelay { since_ms } => since_ms <= judged,
             };
             let was = suspect(model, table.judged_ms);
-            let owed = |table: &mut PeerTable| table.owed(0).any();
-            let acks = |table: &PeerTable, ack, probe_reply, cannot_relay| AckInfo {
-                incarnation: 7,
-                own: if table.role(0) == Role::Gateway {
-                    OwnAck::Flagged(ack)
+            // Per stream the role receives, whether data is in flight.
+            let in_flight = |table: &PeerTable| {
+                let (role, link) = (table.role(0), &table.link[0]);
+                PerStream {
+                    own: role.gets_own() && link.own.acked < table.own_sent[0],
+                    relay: role == Role::Zone && link.relay.acked < table.relay_sent[0],
+                }
+            };
+            let owed = |table: &PeerTable| in_flight(table).any();
+            let acks = |table: &PeerTable, progress: PerStream<bool>, probe_reply, cannot_relay| {
+                let link = &table.link[0];
+                let own = if progress.own {
+                    table.own_sent[0]
                 } else {
-                    OwnAck::Plain(ack)
-                },
-                relay: table.relay_sent[0],
-                probe_reply,
-                cannot_relay,
-                ..AckInfo::default()
+                    link.own.acked
+                };
+                AckInfo {
+                    incarnation: 7,
+                    own: if table.role(0) == Role::Gateway {
+                        OwnAck::Flagged(own)
+                    } else {
+                        OwnAck::Plain(own)
+                    },
+                    relay: if progress.relay {
+                        table.relay_sent[0]
+                    } else {
+                        link.relay.acked
+                    },
+                    probe_reply,
+                    cannot_relay,
+                    ..AckInfo::default()
+                }
             };
             match *op {
                 AnswerOp::Send { asks, left } => {
@@ -772,9 +795,9 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                         model = Answer::Owed { since_ms: now };
                     }
                 }
-                AnswerOp::Data => {
-                    head += 1;
-                    table.tx(0, Stream::Own).note_sent(head, now);
+                AnswerOp::Data(stream) => {
+                    head[stream] += 1;
+                    table.tx(0, stream).note_sent(head[stream], now);
                     table.note_send(
                         0,
                         Sent {
@@ -792,22 +815,11 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                     progress,
                     cannot_relay,
                 } => {
-                    let ack = if progress {
-                        table.own_sent[0]
-                    } else {
-                        table.link[0].own.acked
-                    };
-                    let moved =
-                        progress && ack > table.link[0].own.acked && table.role(0).gets_own();
+                    let flight = in_flight(&table);
+                    let moved = (progress.own && flight.own) || (progress.relay && flight.relay);
                     let counts =
                         cannot_relay && matches!(table.role(0), Role::Gateway | Role::Remote);
-                    table.credit(
-                        0,
-                        acks(&table, ack, false, cannot_relay),
-                        7,
-                        heads(head),
-                        now,
-                    );
+                    table.credit(0, acks(&table, progress, false, cannot_relay), 7, head, now);
                     // A counting `CANNOT_RELAY` packet's acks are no progress.
                     if counts {
                         let from = match model {
@@ -819,7 +831,7 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                             since_ms: from.min(now),
                         };
                     } else if moved {
-                        model = if owed(&mut table) {
+                        model = if owed(&table) {
                             Answer::Owed { since_ms: now }
                         } else {
                             Answer::Settled
@@ -827,14 +839,15 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                     }
                 }
                 AnswerOp::ProbeReply => {
-                    let owed_before = owed(&mut table);
-                    let ack = table.link[0].own.acked;
-                    table.credit(0, acks(&table, ack, true, false), 7, heads(head), now);
+                    let owed_before = owed(&table);
+                    let reply = acks(&table, PerStream::default(), true, false);
+                    table.credit(0, reply, 7, head, now);
                     if !owed_before {
                         model = Answer::Settled;
                     } else if was {
-                        // A suspect's answer rewinds; it is not progress.
-                        assert_eq!(table.own_sent[0], table.link[0].own.acked);
+                        // A suspect's answer rewinds each owed stream; it is
+                        // not progress.
+                        assert!(!owed(&table), "after {op:?}");
                     }
                 }
                 AnswerOp::Role(role) => {
@@ -855,7 +868,7 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                     identity.incarnation += 1;
                     table.contact(0, identity, None);
                     model = Answer::Settled;
-                    head = 0;
+                    head = PerStream::default();
                 }
                 AnswerOp::Shift(held) => {
                     let held = u64::from(held) * FLOOR;
