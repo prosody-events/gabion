@@ -443,7 +443,8 @@ fn restart_within_one_second_ends_exact() {
 }
 
 /// SIM23: after a restart, an ack the peer wrote for the old process credits
-/// nothing in the new one's stream, and every node ends exact.
+/// nothing in the new one's stream, so R's resend starts from 0, P never sees
+/// a hole to report, and every node ends exact.
 #[test]
 fn stale_ack_after_restart_is_ignored() {
     run_paused(async {
@@ -455,6 +456,7 @@ fn stale_ack_after_restart_is_ignored() {
         run_for(300).await;
         // P has acknowledged R's old stream through 10.
         assert_eq!(r.peer(p.addr).await.own_unacked, 0);
+        let reports = p.counters().await.gap_reports_sent;
 
         router.set_link_policy(r.addr, p.addr, LinkPolicy::DropFirst { count: 2 });
         let r = restart(&router, r, id(0, 2), sim_config(vec![p.addr])).await;
@@ -462,6 +464,7 @@ fn stale_ack_after_restart_is_ignored() {
         p.hits(50..51).await;
         run_for(300).await;
         assert_totals(&[&r, &p], 10 + 12 + 1);
+        assert_eq!(p.counters().await.gap_reports_sent, reports);
         r.stop().await;
         p.stop().await;
     });
@@ -615,6 +618,7 @@ fn takeover_retry_during_a_paged_sweep_is_a_no_op() {
         let store = |identity| CellStore::new(storage(2048, 32), identity, &rules(32));
         let t = takeover(44_200, 1, 1_000, tune, store, |_, _| {}).await;
         let (n, s) = (&t.n, &t.sources[0]);
+        let paged = s.counters().await.sweep_cells_sent;
         // The source's hit cannot go out yet: give it a 34-cell burst, so its
         // stream to N runs a prompt round after the heartbeat and the first
         // page waits one relay floor behind N's request.
@@ -634,6 +638,12 @@ fn takeover_retry_during_a_paged_sweep_is_a_no_op() {
             "N retried while S paged"
         );
         assert_eq!(t.served().await, [1]);
+        let snapshot = s.snapshot().await;
+        assert_eq!(
+            snapshot.counters.sweep_cells_sent - paged,
+            snapshot.store_stats.active_cells as u64,
+            "S paged its store once"
+        );
         let total = n.agg.total();
         assert!(
             total < 1_000 + 34,
@@ -716,8 +726,9 @@ fn want_waits_for_a_first_peer() {
 }
 
 /// SIM37: a resend whose cells all expired in flight is one closing packet
-/// without cells; the receiver acks across the range, so nothing stays in
-/// flight and no gap is abandoned.
+/// without cells, in flight through the head like any other: lost, it times
+/// out and goes again with `PROBE`. The receiver acks across the range, so
+/// nothing stays in flight, the stream goes quiet and no gap is abandoned.
 #[test]
 fn expired_cells_are_closed_not_abandoned() {
     let ((), logs) = with_logs(|| {
@@ -737,23 +748,26 @@ fn expired_cells_are_closed_not_abandoned() {
                 sim_config(vec![addrs[0]]),
             );
             run_for(50).await;
-            router.set_link_policy(o.addr, z.addr, LinkPolicy::DropFirst { count: 1 });
+            router.set_link_policy(o.addr, z.addr, LinkPolicy::DropFirst { count: 2 });
             // Two hits in bucket 0 of a 100 ms window, sent at the heartbeat
-            // at 100 and expired by the retry at 200.
+            // at 100 and expired by the retry at 200, whose closing packet is
+            // lost too; the retry at 300 delivers it.
             for key in 1..3 {
                 o.client
                     .record(rule_fp(0), KeyHash(key), 0, 1, 1_000, 50)
                     .await
                     .unwrap();
             }
-            // Just past the retry heartbeat; the cells are gone.
             run_for(151).await;
             assert_eq!(o.snapshot().await.store_stats.active_cells, 0);
-            run_for(5).await;
+            run_for(105).await;
             assert_eq!(o.peer(z.addr).await.own_unacked, 0);
-            let sent = o.counters().await.packets_sent;
+            let counters = o.counters().await;
+            assert_eq!(counters.rto_rewinds_own, 2);
             run_for(500).await;
-            assert_eq!(o.counters().await.packets_sent, sent);
+            let quiet = o.counters().await;
+            assert_eq!(quiet.packets_sent, counters.packets_sent);
+            assert_eq!(quiet.rounds_prompt, counters.rounds_prompt);
             o.stop().await;
             z.stop().await;
         })

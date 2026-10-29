@@ -2462,16 +2462,25 @@ fn cut_round_resumes_as_the_strongest_round() {
         let held = wire.attempts.borrow()[0].clone();
         assert_eq!(held.dst, p1);
 
+        // P1 probes again while its answer is held: the rounds until the
+        // packet leaves serve no row, so this answer waits behind it.
+        inject(
+            &wire,
+            p1,
+            id1,
+            AckInfo::default(),
+            Payload::Ack { probe: true },
+        );
         heartbeats(1).await;
         assert!(wire.attempts.borrow().iter().all(|a| *a == held));
         let attempts = wire.attempts.borrow().len();
 
         wire.refuse.set(false);
         sim_advance(Duration::from_millis(5)).await;
+        let answer = Payload::Ack { probe: false };
         let sent = sent_payloads(&wire, attempts);
-        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent, [(p1, answer), (p1, answer), (p2, answer)]);
         assert_eq!(wire.attempts.borrow()[attempts].bytes, held.bytes);
-        assert_eq!(sent[1], (p2, Payload::Ack { probe: false }));
     });
 }
 
