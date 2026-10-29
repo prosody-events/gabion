@@ -65,9 +65,9 @@ pub struct ValidGossipConfig {
     /// Rows of the runtime's peer table, `gossip.peer_capacity`; a peer
     /// discovery reports past it is declined and logged as `peer_table_full`.
     pub(crate) peer_capacity: NonZeroU16,
-    /// The per-round quantum `q`: the most cells one stream sends one peer
-    /// in one round, `max(⌈storage.max_cells / 128⌉, cells in one packet)`.
-    /// A stream with more waiting goes on in the next prompt round.
+    /// The per-round quantum `q`, from `storage.max_cells` and the packet
+    /// size (see [`defaults::GOSSIP_BACKLOG_ROUNDS`]); a stream with more
+    /// waiting goes on in the next prompt round.
     pub(crate) quantum: NonZeroUsize,
     /// `gossip.sweep_concurrency`: the most join sweeps this node answers at
     /// once.

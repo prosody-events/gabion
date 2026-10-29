@@ -14,6 +14,7 @@
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::task::{Context, Poll};
 
 use futures::{Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot};
@@ -354,10 +355,18 @@ where
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),
                 ArmOutcome::Admin(None) => self.admin_rx = None,
-                ArmOutcome::Round(kind, scheduled) => self.round(kind, scheduled),
+                // A round reads the socket with this task's context, so a
+                // transport that arms a wake-up there wakes this loop.
+                ArmOutcome::Round(kind, scheduled) => {
+                    std::future::poll_fn(|cx| {
+                        self.round(kind, scheduled, cx);
+                        Poll::Ready(())
+                    })
+                    .await
+                }
             }
 
-            self.flush();
+            self.apply_rows();
 
             // Ack any pending limit-request AFTER the apply ran — callers
             // observe "ack ⇒ AggregateStore reflects the increment".
@@ -369,7 +378,7 @@ where
     }
 
     /// Apply the rows the last step produced, if any.
-    fn flush(&mut self) {
+    fn apply_rows(&mut self) {
         if !self.sink_buf.is_empty() || !self.expiration_buf.is_empty() {
             self.aggregates.apply(&self.sink_buf, &self.expiration_buf);
             self.sink_buf.clear();
@@ -471,7 +480,8 @@ where
         match self.peers.contact(row, header.sender) {
             Contact::Late => return,
             Contact::First => self.sweep_due |= self.sweep_want.is_some(),
-            Contact::Current | Contact::Restarted => {}
+            Contact::Restarted => self.sweeps.end(src),
+            Contact::Current => {}
         }
         self.prompt_work |= self.peers.restore(row);
 
@@ -741,11 +751,11 @@ where
     /// was scheduled for, or `F_r` before the clock after a stall. The work
     /// that needs no socket comes first, so a round with no peers or a held
     /// packet still does it.
-    fn round(&mut self, kind: Round, scheduled: Option<u64>) {
+    fn round(&mut self, kind: Round, scheduled: Option<u64>, cx: &mut Context<'_>) {
         let clock = self.clock.now_millis();
         let floor = self.config.min_emit_interval.0.get();
         let now = scheduled.map_or(clock, |at| at.max(clock.saturating_sub(floor)));
-        self.read_waiting();
+        self.read_waiting(cx);
         match kind {
             Round::Heartbeat => {
                 self.counters.rounds_heartbeat += 1;
@@ -792,13 +802,13 @@ where
     /// the newest acks and an inbound flood cannot hold it. Each datagram's
     /// rows are applied before the next is read. Any error ends the read; a
     /// fatal one surfaces again on the inbound arm.
-    fn read_waiting(&mut self) {
+    fn read_waiting(&mut self, cx: &mut Context<'_>) {
         for _ in 0..self.inbound_budget {
-            let Ok((n, src)) = self.transport.try_recv_from(&mut self.recv_buf) else {
+            let Ok((n, src)) = self.transport.try_recv_from(cx, &mut self.recv_buf) else {
                 return;
             };
             self.handle_inbound(n, src);
-            self.flush();
+            self.apply_rows();
         }
     }
 
@@ -810,8 +820,7 @@ where
             return;
         }
         let due = self.peers.due(row, now);
-        let rto_ms = self.config.tick_interval.as_millis() as u64;
-        let retry = due && self.peers.own_tx(row).timed_out(now, rto_ms);
+        let retry = due && self.peers.own_tx(row).timed_out(now);
         if retry {
             self.peers.own_tx(row).rewind(now);
             self.counters.rto_rewinds_own += 1;
@@ -856,7 +865,9 @@ where
         if gap_own {
             self.counters.gap_reports_sent += 1;
         }
-        self.peers.refresh_deadline(row);
+        if due || sent_any {
+            self.peers.refresh_deadline(row);
+        }
         self.prompt_work |= self.peers.flags(row).has(PeerFlags::PROMPT);
     }
 
@@ -955,7 +966,7 @@ where
 
     /// Ask for the join sweep this node wants: at every heartbeat, and on any
     /// round once a peer is first heard. Each source asked is sent a
-    /// `SweepRequest` once at once and again at each heartbeat until a page
+    /// `SweepRequest` at once and again at each heartbeat until a page
     /// arrives.
     fn ask_sweeps(&mut self, kind: Round) {
         if kind != Round::Heartbeat && !self.sweep_due {
@@ -965,7 +976,7 @@ where
         let Some(mut want) = self.sweep_want.take() else {
             return;
         };
-        if want.settle(|| self.peers.sweep_candidates()) {
+        if want.advance(|| self.peers.sweep_candidates()) {
             return;
         }
         for ask in want.asks() {
@@ -1019,8 +1030,9 @@ where
         }
     }
 
-    /// Send each running sweep its next page of live cells in slot order. A
-    /// page cut by a held packet is sent again whole: pages are max-merges.
+    /// Send each running sweep its next page of live cells in slot order; a
+    /// requester that left or speaks another version is dropped. A page cut
+    /// by a held packet is sent again whole: pages are max-merges.
     fn serve_sweeps(&mut self) {
         for i in 0..self.sweeps.limit() {
             let Some(Sweep { dst, next_slot }) = self.sweeps.slots()[i] else {
@@ -1029,7 +1041,8 @@ where
             if self.outbox.is_held() {
                 return;
             }
-            let Some(row) = self.peers.find(dst) else {
+            let live = self.peers.find(dst);
+            let Some(row) = live.filter(|&row| self.peers.role(row) != Role::Incompatible) else {
                 self.sweeps.slots()[i] = None;
                 continue;
             };
@@ -1069,7 +1082,6 @@ where
                 _ => None,
             };
         }
-        self.frame_from = None;
     }
 
     /// Log `gap_abandoned` for `row`'s own stream at powers of two.

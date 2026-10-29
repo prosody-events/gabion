@@ -24,6 +24,7 @@ pub const STORAGE_MAX_MATCHED_RULES: u16 = 16;
 /// `cardinality_rejected`.
 pub const STORAGE_MAX_REQUEST_DESCRIPTORS: u16 = 16;
 
+/// The heartbeat period `T`, also the retransmission timeout.
 pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 
 /// Default of `gossip.peer_capacity`, the most peers one node gossips with:

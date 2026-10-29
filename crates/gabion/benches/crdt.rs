@@ -984,7 +984,14 @@ fn bench_stream_after(c: &mut Criterion) {
         }
         let head = store.own_head();
         let mut out = Vec::<CellHandle>::with_capacity(QUANTUM);
-        for (case, sent) in [("steady", head - 2), ("rewound", 0)] {
+        // Cell `k` carries sequence `k`, so `draining` is a drain's second
+        // round: one quantum already sent above a rewind to 0.
+        let cases = [
+            ("steady", head - 2),
+            ("rewound", 0),
+            ("draining", QUANTUM as u64),
+        ];
+        for (case, sent) in cases {
             store.stream_after(sent, QUANTUM, &mut out);
             group.throughput(Throughput::Elements(out.len() as u64));
             group.bench_function(BenchmarkId::new(case, own_cells), |b| {

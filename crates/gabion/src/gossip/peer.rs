@@ -49,7 +49,7 @@ impl PeerFlags {
     /// The peer's own stream has a gap open, whose report is prompt work.
     pub(super) const GAP_OPEN: Self = Self(0x08);
     /// The bits that make a row prompt work.
-    pub(super) const PROMPT: Self = Self(0x02 | 0x04 | 0x08);
+    pub(super) const PROMPT: Self = Self(Self::RESEND_OWN.0 | Self::REPLY_DUE.0 | Self::GAP_OPEN.0);
     /// The peer sent `PROBE`; the next packet to it carries `PROBE_REPLY`.
     pub(super) const REPLY_DUE: Self = Self(0x04);
     /// The own stream has cells above `sent` that a prompt round sends.
@@ -90,6 +90,7 @@ pub(super) struct Outbound {
 pub(super) struct StreamTx<'a> {
     sent: &'a mut u64,
     state: &'a mut Outbound,
+    rto_ms: u64,
 }
 
 impl StreamTx<'_> {
@@ -129,8 +130,8 @@ impl StreamTx<'_> {
     }
 
     /// Data has been in flight for a whole timeout without an ack.
-    pub(super) fn timed_out(&self, now: u64, rto_ms: u64) -> bool {
-        self.state.acked < *self.sent && now.saturating_sub(self.state.timer_ms) >= rto_ms
+    pub(super) fn timed_out(&self, now: u64) -> bool {
+        self.state.acked < *self.sent && now.saturating_sub(self.state.timer_ms) >= self.rto_ms
     }
 
     /// Resend everything above `acked`.
@@ -296,8 +297,9 @@ pub(super) struct PeerLink {
     pub(super) own_in: Inbound,
 }
 
-// 128 bytes: `Option<NodeIdentity>` takes 48 for `u128` alignment, and the
-// gap 40. E-Z10 states the per-row cost from it.
+// 128 bytes: the fields take 120 (`Option<NodeIdentity>` 48 at `u128`
+// alignment, the inbound mark 40) and pad to 128. E-Z10 states the per-row
+// cost from it.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<PeerLink>() == 128);
 
@@ -479,6 +481,7 @@ impl PeerTable {
         StreamTx {
             sent: &mut self.own_sent[row],
             state: &mut self.link[row].own,
+            rto_ms: self.rto_ms,
         }
     }
 
@@ -502,7 +505,11 @@ impl PeerTable {
         let timeout = (link.own.acked < self.own_sent[row])
             .then(|| link.own.timer_ms.saturating_add(self.rto_ms));
         let report = link.own_in.report_at();
-        self.deadline[row] = Deadline(timeout.into_iter().chain(report).min().unwrap_or(u64::MAX));
+        self.deadline[row] = timeout
+            .into_iter()
+            .chain(report)
+            .min()
+            .map_or(Deadline::NEVER, Deadline);
         let open = matches!(link.own_in.gap, Gap::Open { .. });
         self.flags[row].set(PeerFlags::GAP_OPEN, open);
     }

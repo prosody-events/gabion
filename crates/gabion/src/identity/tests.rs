@@ -6,7 +6,6 @@ use super::*;
 fn explicit_override_is_stable_and_pins_hash() {
     // Pinning the xxhash output guards against an upstream algorithm
     // change silently re-bucketing every peer's identity.
-    assert_eq!(node_id(Some("test-node")), node_id(Some("test-node")));
     assert_eq!(
         node_id(Some("test-node")).0,
         0xa412461da00c7f583da3d8ea39d95ad2
@@ -40,7 +39,7 @@ fn random_seed_includes_pid_and_nanos() {
     assert_eq!(seed.matches('-').count(), 2, "{seed:?}");
 }
 
-/// Two starts within one wall-clock second get different incarnations, a
+/// Two starts one millisecond apart get different incarnations, a
 /// start that would repeat the previous one steps past it, and 0 never
 /// appears, even where the step wraps.
 #[test]
@@ -48,7 +47,8 @@ fn incarnation_differs_on_every_start() {
     let t = 1_700_000_000_000;
     assert_ne!(incarnation_at(t, None), incarnation_at(t + 1, None));
     let first = incarnation_at(t, None);
-    assert_ne!(incarnation_at(t, Some(first)), first);
+    assert_eq!(incarnation_at(t, Some(first)), first + 1);
+    assert_eq!(incarnation_at(t, Some(first + 7)), first);
     assert_eq!(incarnation_at(1 << 32, None), 1);
     assert_eq!(incarnation_at(u64::from(u32::MAX), Some(u32::MAX)), 1);
     assert_eq!(incarnation_at(1 << 32, Some(1)), 2);

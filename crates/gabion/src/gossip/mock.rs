@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::task::{Poll, Waker};
 
 use super::transport::GossipTransport;
 
@@ -31,6 +32,8 @@ pub(super) struct Wire {
     pub inbound: RefCell<VecDeque<(Vec<u8>, SocketAddr)>>,
     /// The receive buffer the transport reports, which bounds a round's read.
     pub recv_buffer: Cell<Option<usize>>,
+    /// The waker the last read of an empty queue armed.
+    pub armed: RefCell<Option<Waker>>,
 }
 
 impl Wire {
@@ -73,13 +76,19 @@ impl GossipTransport for MockTransport {
         self.0.recv_buffer.get()
     }
 
-    /// Pops the oldest queued datagram; with none, waits forever.
+    /// Pops the oldest queued datagram; with none, it arms the waker once
+    /// until a datagram is read. Nothing but a test wakes it.
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let next = self.0.inbound.borrow_mut().pop_front();
-        let Some((bytes, src)) = next else {
-            return std::future::pending().await;
-        };
-        buf[..bytes.len()].copy_from_slice(&bytes);
-        Ok((bytes.len(), src))
+        std::future::poll_fn(|cx| {
+            let next = self.0.inbound.borrow_mut().pop_front();
+            let Some((bytes, src)) = next else {
+                (self.0.armed.borrow_mut()).get_or_insert_with(|| cx.waker().clone());
+                return Poll::Pending;
+            };
+            self.0.armed.take();
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Poll::Ready(Ok((bytes.len(), src)))
+        })
+        .await
     }
 }

@@ -227,9 +227,10 @@ async fn leader_main(
 ) -> anyhow::Result<()> {
     // Stamp a fresh incarnation into the SHM header so peers see a new
     // `(node_id, incarnation)` for this takeover. It comes from wall-clock
-    // milliseconds and steps past the previous leader's, so a takeover
-    // never reuses it: peers would max-merge away this leader's counts into
-    // the old incarnation's cells, and credit acks written for the old one.
+    // milliseconds and steps past the previous leader's, so peers see a
+    // restart; reusing it would have peers max-merge this leader's counts
+    // into the old incarnation's cells, and this node credit acks written for
+    // the old one.
     let new_incarnation =
         gabion::identity::incarnation(Some(shm.header().identity.load_incarnation()));
     shm.header().identity.store_incarnation(new_incarnation);

@@ -30,7 +30,7 @@ pub struct SimConfig {
     /// Number of cluster members. Must be in `1..=MAX_NODES`;
     /// [`SimConfig::validate`] rejects anything else.
     pub nodes: usize,
-    /// Period between proactive gossip ticks, in milliseconds.
+    /// Heartbeat interval, in milliseconds.
     pub tick_interval_ms: u64,
     /// Per-rule threshold-anti-entropy error budget, in basis points.
     pub target_err_bps: u32,

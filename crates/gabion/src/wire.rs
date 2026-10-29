@@ -163,8 +163,9 @@ impl AsRef<[u8]> for PacketBuf {
 /// may stop early: handles it never encodes are simply not sent.
 ///
 /// A stream frame's header names the frame's range; its packets tile that
-/// range, each closing the positions up to its last cell's sequence and the
-/// last closing the rest, so a lost packet opens a gap no later one hides.
+/// range, each closing the positions up to just below the next packet's first
+/// cell and the last closing the rest, so a lost packet opens a gap no later
+/// one hides.
 #[must_use = "Packets encodes nothing until next_into is called"]
 pub struct Packets<'a> {
     header: Header<CellPayload>,
@@ -178,8 +179,9 @@ pub struct Packets<'a> {
 }
 
 impl<'a> Packets<'a> {
-    /// Build a packet iterator; every packet carries `header` and its own
-    /// cell count.
+    /// Build a packet iterator; each packet carries `header` with its own
+    /// cell count and, on a stream frame, its own sub-range of the frame's
+    /// range.
     pub fn new(
         header: Header<CellPayload>,
         store: &'a CellStore,
@@ -247,16 +249,16 @@ impl<'a> Packets<'a> {
     }
 
     /// The payload of the packet ending at `cursor`: a stream packet closes
-    /// up to its last cell's sequence, or to the frame's upper end when it is
-    /// the last. Advances `lower` past it.
+    /// up to just below the next packet's first cell, or to the frame's upper
+    /// end when it is the last. Advances `lower` past it.
     fn packet_payload(&mut self) -> CellPayload {
         let close = |range: StreamRange, lower: &mut u64| {
-            let upper = match self.handles.get(self.cursor - 1) {
-                Some(&last) if self.cursor < self.handles.len() => self
+            let upper = match self.handles.get(self.cursor) {
+                Some(&next) => self
                     .store
-                    .get(last)
-                    .map_or(range.upper(), |row| row.origin_sequence),
-                _ => range.upper(),
+                    .get(next)
+                    .map_or(range.upper(), |row| row.origin_sequence - 1),
+                None => range.upper(),
             };
             let packet = StreamRange::new(*lower, upper);
             debug_assert!(packet.is_some(), "a frame's packets tile its range");

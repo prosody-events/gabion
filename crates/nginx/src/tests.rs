@@ -6,7 +6,6 @@ use gabion::settings::{Setting, SettingError, Settings};
 #[test]
 fn nginx_zero_is_rejected_not_clamped() {
     for directive in [
-        "gabion_gossip_sweep_concurrency",
         "gabion_gossip_max_payload_bytes",
         "gabion_storage_max_cells",
         "gabion_storage_rule_dictionary_capacity",

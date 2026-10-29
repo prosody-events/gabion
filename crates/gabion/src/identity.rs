@@ -4,7 +4,6 @@
 //! nothing in the new one.
 
 use std::net::UdpSocket;
-use std::num::NonZeroU32;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,10 +39,9 @@ pub fn incarnation(previous: Option<Incarnation>) -> Incarnation {
 
 /// [`incarnation`] at `now_millis`.
 pub(crate) fn incarnation_at(now_millis: u64, previous: Option<Incarnation>) -> Incarnation {
-    let step = |x: u32| if x == u32::MAX { 1 } else { x + 1 };
-    let now = NonZeroU32::new(now_millis as u32).map_or(1, NonZeroU32::get);
+    let now = (now_millis as u32).max(1);
     if previous == Some(now) {
-        step(now)
+        now.checked_add(1).unwrap_or(1)
     } else {
         now
     }

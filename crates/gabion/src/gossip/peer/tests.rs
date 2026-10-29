@@ -117,7 +117,8 @@ impl Arbitrary for Op {
     }
 }
 
-/// The sender rules of §3.6, written out on plain fields.
+/// The sender rules the `peer` module documents on `StreamTx`, written out
+/// on plain fields.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TxModel {
     sent: u64,
@@ -202,7 +203,7 @@ fn outbound_matches_model(ops: Vec<Op>) {
                 }
             }
             Op::Service => {
-                if table.own_tx(0).timed_out(now, RTO) {
+                if table.own_tx(0).timed_out(now) {
                     table.own_tx(0).rewind(now);
                 }
                 model.service(now);
@@ -221,7 +222,8 @@ fn outbound_matches_model(ops: Vec<Op>) {
     }
 }
 
-/// The receiver's gap rules of §3.6, written out.
+/// The receiver's gap rules the `peer` module documents on `Inbound`,
+/// written out.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RxModel {
     have: u64,
@@ -375,7 +377,7 @@ fn deadline_is_min_of_row_timers(ops: Vec<Op>) {
                 table.own_tx(0).gap_report(u64::from(a), head, now);
             }
             Op::Service => {
-                if table.own_tx(0).timed_out(now, RTO) {
+                if table.own_tx(0).timed_out(now) {
                     table.own_tx(0).rewind(now);
                 }
             }
@@ -440,4 +442,18 @@ fn incarnation_change_resets_the_whole_row() {
     assert_eq!(table.contact(0, old), Contact::Late);
     assert_eq!((table.own_sent(0), table.link(0).identity), (2, Some(new)));
     assert_eq!(table.contact(0, new), Contact::Current);
+}
+
+/// Each node ranks the same peers by its own key: the top-weighted of the
+/// distinct-hash addresses differs between local keys 1 and 2 (two keys
+/// checked to disagree), so a weight that ignores the key or the address
+/// ranks them alike.
+#[test]
+fn rendezvous_ranking_depends_on_the_local_key() {
+    let top = |local_key| {
+        (0..8)
+            .map(|i| addr(2 * i))
+            .max_by_key(|&peer| rendezvous_weight(local_key, peer))
+    };
+    assert_ne!(top(1), top(2));
 }

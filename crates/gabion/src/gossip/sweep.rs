@@ -25,12 +25,12 @@ pub(super) struct Ask {
 }
 
 impl SweepWant {
-    /// Settle the want against the current candidates, ranked by weight:
+    /// Advance the want against the current candidates, ranked by weight:
     /// `true` once pages have come from `min(GOSSIP_SWEEP_PEERS, k)` sources
     /// with `k > 0`. Otherwise drop the sources asked
     /// [`GOSSIP_GAP_REPORTS`] times or no longer candidates, and ask the next
     /// ones down the ranking, wrapping to the top.
-    pub(super) fn settle<I>(&mut self, candidates: impl Fn() -> I) -> bool
+    pub(super) fn advance<I>(&mut self, candidates: impl Fn() -> I) -> bool
     where
         I: Iterator<Item = (u64, SocketAddr)>,
     {
@@ -68,7 +68,7 @@ impl SweepWant {
         false
     }
 
-    /// The sources to ask now, counting the try.
+    /// The sources being asked; the caller counts each try it sends.
     pub(super) fn asks(&mut self) -> impl Iterator<Item = &mut Ask> {
         self.asking.iter_mut().flatten()
     }
@@ -134,6 +134,15 @@ impl Sweeps {
                 Accept::Started
             }
             None => Accept::Full,
+        }
+    }
+
+    /// Forget `dst`'s sweep: a restarted requester is swept from the start.
+    pub(super) fn end(&mut self, dst: SocketAddr) {
+        for slot in &mut self.0 {
+            if slot.is_some_and(|sweep| sweep.dst == dst) {
+                *slot = None;
+            }
         }
     }
 

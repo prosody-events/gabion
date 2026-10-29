@@ -482,12 +482,21 @@ fn spellings_follow_the_yaml_key() {
 }
 
 /// The per-round quantum drains a full store in 128 rounds, and never sends
-/// less than one full packet.
+/// less than one full packet of the configured size: 33 cells fit 1,400
+/// bytes and 233 fit 9,000.
 #[test]
 fn quantum_is_a_128th_of_the_store_and_at_least_one_packet() {
-    for (max_cells, quantum) in [(262_144, 2048), (131_073, 1025), (1_000, 33)] {
+    for (max_cells, max_payload_bytes, quantum) in [
+        (262_144, 1_400, 2048),
+        (131_073, 1_400, 1025),
+        (4_224, 1_400, 33),
+        (4_225, 1_400, 34),
+        (1_000, 1_400, 33),
+        (1_000, 9_000, 233),
+    ] {
         let settings = Settings {
             max_cells: NonZeroU32::new(max_cells).unwrap(),
+            max_payload_bytes,
             ..Settings::default()
         };
         let (gossip, _) = settings.validate().expect("validates");

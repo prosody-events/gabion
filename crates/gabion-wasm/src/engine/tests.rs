@@ -11,7 +11,7 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 
-use super::{Command, LinkPolicyKind, run_engine};
+use super::{Command, LinkPolicyKind, VIZ_ROUTER_CAPACITY, run_engine};
 use crate::config::{MAX_NODES, SimConfig};
 use crate::event::{ClusterState, EventBatch, EventKind};
 
@@ -210,10 +210,7 @@ fn error_budget_surfaces_in_snapshot() {
         ..test_config(12)
     };
     with_engine(config, |tx| async move {
-        for key in 0..16u128 {
-            submit(&tx, 0, key, 7).await;
-        }
-        step(&tx, 300).await;
+        submit(&tx, 0, 0, 7).await;
         let origin = snapshot(&tx)
             .await
             .nodes
@@ -349,7 +346,7 @@ fn same_script_produces_identical_events() {
     let second = run();
     assert_eq!(
         first, second,
-        "identical seed + script must yield identical event batches"
+        "identical script must yield identical event batches"
     );
     assert!(
         first.iter().any(|b| !b.events.is_empty()),
@@ -608,12 +605,16 @@ fn full_round_at_max_nodes_drops_nothing_under_pass() {
             }
         }
         let batch = state.step(100).await;
-        let dropped = batch
-            .events
-            .iter()
-            .filter(|e| matches!(e.kind, EventKind::PacketDropped { .. }))
-            .count();
+        let count =
+            |pick: fn(&EventKind) -> bool| batch.events.iter().filter(|e| pick(&e.kind)).count();
+        let dropped = count(|kind| matches!(kind, EventKind::PacketDropped { .. }));
+        let delivered = count(|kind| matches!(kind, EventKind::PacketDelivered { .. }));
         assert_eq!(dropped, 0);
+        assert_eq!(
+            delivered,
+            MAX_NODES * VIZ_ROUTER_CAPACITY,
+            "every node received two packets from every peer"
+        );
         state
     });
 }
@@ -650,10 +651,7 @@ fn events_serialize_with_hex_identifiers() {
 /// without overflow while staying far below the production defaults, and the
 /// ceiling-sized settings must validate. The runtime path is exercised by
 /// [`moderate_cluster_runtime_honors_the_shrunk_sizing`] and the growth path by
-/// [`grown_cluster_holds_every_origin_without_overflow`]. (A `MAX_NODES`
-/// *functional* run is intentionally not attempted — 256 nodes gossiping at
-/// once saturates the deterministic `SimRouter`'s inbound queues and trips a
-/// debug-only wire backpressure assert unrelated to cell-store sizing.)
+/// [`grown_cluster_holds_every_origin_without_overflow`].
 #[test]
 fn settings_are_ceiling_sized_and_hold_the_working_set() {
     let defaults = SimConfig::default();

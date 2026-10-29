@@ -150,7 +150,7 @@ impl Arbitrary for RemoteRow {
             rule: u8::arbitrary(g) % 4,
             key: u8::arbitrary(g) % 4,
             bucket: u8::arbitrary(g) % 4,
-            origin: (u8::arbitrary(g) % 4) + 2,
+            origin: u8::arbitrary(g) % 5 + 1,
             incarnation: (u8::arbitrary(g) % 2) + 1,
             count: u32::arbitrary(g) % 10_000,
             ts: u16::arbitrary(g),
@@ -1473,20 +1473,40 @@ fn own_cells(store: &CellStore) -> Vec<(u64, CellHandle)> {
 }
 
 /// After every insert, raise, merge and expiry, the own list holds exactly
-/// the live own cells in ascending sequence: a raised cell moves to the tail,
-/// a freed one leaves, and nothing repeats or cycles (the walk is capped one
-/// past the capacity).
+/// the live own cells in ascending sequence, read forward and backward: a
+/// raised cell moves to the tail as the newest, a freed one leaves, and
+/// nothing repeats or cycles (each walk is capped one past the capacity).
 #[quickcheck]
 fn stream_lists_match_model(ops: MixedOps) -> bool {
     let mut store = quickcheck_store();
-    let mut out = Vec::with_capacity(store.capacity() as usize + 1);
+    let cap = store.capacity() as usize + 1;
+    let mut out = Vec::with_capacity(cap);
     for op in &ops.0 {
         let mut sink = DeltaSink::with_capacity(1);
         let mut exp_sink = ExpirationSink::with_capacity(store.capacity() as usize);
         apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
-        store.stream_after(0, store.capacity() as usize + 1, &mut out);
+        store.stream_after(0, cap, &mut out);
         let model: Vec<_> = own_cells(&store).into_iter().map(|(_, h)| h).collect();
         if out != model || out.iter().any(|&h| store.get(h).is_none()) {
+            return false;
+        }
+        if let MixedOp::Local(_) = op
+            && let Some(&changed) = sink.handles.first()
+            && (out.last() != Some(&changed)
+                || store.get(changed).map(|row| row.origin_sequence) != Some(store.own_head()))
+        {
+            return false;
+        }
+        let mut backward = Vec::with_capacity(cap);
+        let mut cursor = store.own_list.tail;
+        while let Some(slot) = cursor.get()
+            && backward.len() < cap
+        {
+            backward.push(store.handle_for(slot));
+            cursor = store.stream_prev[slot as usize];
+        }
+        backward.reverse();
+        if backward != model {
             return false;
         }
     }
@@ -1702,8 +1722,6 @@ fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
     let expected = model_sum.min(u64::from(u32::MAX)) as u32;
     stored == expected && delta_sum == u64::from(stored)
 }
-
-// --- Gap 5: lane priority as ordered prediction --------------------------
 
 // --- Gap 6: expire_at vs expire for varied rule windows ------------------
 

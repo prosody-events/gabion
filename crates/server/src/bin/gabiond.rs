@@ -92,14 +92,13 @@ async fn run() -> anyhow::Result<()> {
         .settings
         .gossip_bind
         .ok_or(ConfigError::MissingGossipBind)?;
-    let gossip_runtime_config = config.gossip;
 
     let (admin_tx, admin_rx) = admin::admin_channel();
 
-    gossip_runtime_config.note_default_cluster_id();
+    config.gossip.note_default_cluster_id();
     let (gossip_rt, gossip_client) = GossipRuntime::bind_with_admin(
         gossip_bind,
-        gossip_runtime_config,
+        config.gossip,
         cell_store,
         counts.clone(),
         admin_rx,

@@ -30,9 +30,9 @@ pub struct Event {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum EventKind {
-    /// A gossip tick fired on `node` (heartbeat or threshold).
+    /// A heartbeat round ran on `node`.
     Tick { node: u32 },
-    /// A threshold-triggered (not heartbeat) tick fired on `node`.
+    /// A threshold round ran on `node`.
     ThresholdFire { node: u32 },
     /// `src` enqueued a packet bound for `dst`; it will be delivered.
     PacketSent { src: u32, dst: u32, bytes: u32 },

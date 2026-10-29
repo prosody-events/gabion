@@ -61,7 +61,7 @@ pub struct GossipCounters {
     /// Threshold rounds: a rule's unsent local hits crossed its error budget.
     pub rounds_threshold: u64,
     /// Prompt rounds, run at most every `gossip.min_emit_interval` while a
-    /// resend, gap report, probe answer or sweep is waiting.
+    /// resend, gap report, probe answer, sweep or a held packet is waiting.
     pub rounds_prompt: u64,
     /// Datagrams the socket accepted.
     pub packets_sent: u64,
@@ -94,7 +94,8 @@ pub struct GossipCounters {
     /// Received cells that raised a stored count.
     pub cells_merged: u64,
     /// Own-stream timeouts: a heartbeat passed without an ack, so the stream
-    /// was resent from the last ack with `PROBE` set.
+    /// was resent from the last ack with `PROBE` set, or closed if nothing
+    /// above the ack is still live.
     pub rto_rewinds_own: u64,
     /// Gap reports sent: a peer's stream skipped positions.
     pub gap_reports_sent: u64,

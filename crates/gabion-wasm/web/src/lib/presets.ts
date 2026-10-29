@@ -11,8 +11,8 @@
 // Most presets pin the rule limit high (`NARRATIVE_LIMIT`, 1 000 000) on
 // purpose — well above the seeded volumes. A burst then stays well under
 // gabion's threshold anti-entropy budget (ε ≈ limit·bps/(10⁴·N), ~833 at this
-// limit with N=12), so it spreads by lazy heartbeat over several rounds: the
-// multi-hop propagation these views exist to show. The viz-friendly default
+// limit with N=12), so it waits for the next heartbeat, which sends it
+// straight to every peer. The viz-friendly default
 // limit (1 000, see `SimConfig::default` in `config.rs`) gives ε ≈ 0.83, so
 // every hit would eager-flush and a burst would flood at t=0 — which is why the
 // narrative presets override it back up. The default limit's limit-crossing
@@ -20,9 +20,9 @@
 //
 // A real rate limiter is never idle, and neither is the demo: every narrative
 // preset carries a low, *uncapped* background `traffic` feed (a few hits/sec,
-// spread round-robin). It keeps ≥1 bucket live at all times, so the gossip
-// runtime never hits its empty-store guard and beams flow perpetually — instead
-// of the cluster falling silent once the opening burst ages out of the window.
+// spread round-robin). It keeps ≥1 bucket live at all times, so new counts
+// keep arriving and beams flow perpetually — instead of the cluster falling
+// silent once the opening burst ages out of the window.
 // The feed is a faint hum the preset's distinctive event (the burst spike, the
 // partition, the isolation) layers on top of. Because the convergence oracle is
 // now windowed (sum of live local cells, `engine.rs`), the feed plateaus at

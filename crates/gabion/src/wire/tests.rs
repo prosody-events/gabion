@@ -515,9 +515,11 @@ fn empty_handles_emits_zero_packets() {
 }
 
 /// An own-stream frame's packets tile its range: the first starts at the
-/// frame's lower end, each starts where the one before ended and ends at its
-/// last cell's sequence, and the last ends at the frame's upper end, so a
-/// lost packet leaves a gap the receiver sees.
+/// frame's lower end, each starts where the one before ended and ends just
+/// below the next packet's first cell, and the last ends at the frame's upper
+/// end, so a lost packet leaves a gap the receiver sees. A stale handle at a
+/// packet's end closes nothing past the packet, and every packet carries the
+/// frame's flags.
 #[test]
 fn own_frame_packets_tile_its_range() {
     let mut store = store_with_cap(128, 8);
@@ -534,15 +536,23 @@ fn own_frame_packets_tile_its_range() {
         });
     }
     store.ingest_local(&obs, &mut DeltaSink::with_capacity(70));
-    let mut handles = Vec::with_capacity(70);
+    let mut handles = Vec::with_capacity(71);
     store.stream_after(0, 70, &mut handles);
+    // A stale twin of the fifth cell, just after the first packet's four.
+    handles.insert(
+        4,
+        CellHandle {
+            generation: handles[4].generation.wrapping_add(1),
+            ..handles[4]
+        },
+    );
     // Four cells a packet: the header, both dictionaries and four cells.
     let limits = FrameLimits::new(HEADER_LEN + 2 + 32 + 4 * 38).unwrap();
     let header = Header {
         payload: CellPayload::Own {
             range: StreamRange::new(0, 80).unwrap(),
-            relay_into_zone: false,
-            probe: false,
+            relay_into_zone: true,
+            probe: true,
         },
         ..sample_header::<CellPayload>()
     };
@@ -558,8 +568,13 @@ fn own_frame_packets_tile_its_range() {
             sent += 1;
         })
         .unwrap();
-        let Payload::Cells(CellPayload::Own { range, .. }) = decoded.payload else {
-            panic!("an own frame sends own packets");
+        let Payload::Cells(CellPayload::Own {
+            range,
+            relay_into_zone: true,
+            probe: true,
+        }) = decoded.payload
+        else {
+            panic!("an own frame's packets carry its flags: {decoded:?}");
         };
         assert_eq!(range.lower(), lower);
         // Key `k` was the (k + 1)th cell issued.

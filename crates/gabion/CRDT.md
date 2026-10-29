@@ -1003,12 +1003,13 @@ the tail, and unlinks then re-appends a raised one (its new sequence is the
 largest); `free_cell_at` unlinks a freed own cell.
 
 **Reading.** `stream_after(sent, max, out)` fills `out` with the live own
-cells above `sent`, ascending, at most `max`. It starts from the head when
-`sent` is below the head's sequence (a new peer, or a stream rewound to
-0), else walks back from the tail to the first cell above `sent`, then
-iterates forward: `O(returned + cells walked)`, so a steady-state round
-reads only the few cells that changed. The `stream/after` bench pins both
-walks.
+cells above `sent`, ascending, at most `max`. The walk to the first cell
+above `sent` starts from whichever end of the list is nearer by sequence,
+so it costs at most the smaller of `sent − first` and `last − sent` steps
+before it iterates forward: a new peer, a rewound stream and a draining
+backlog walk from the head, and a steady-state round walks back from the
+tail over only the few cells that changed. The `stream/after` bench pins
+the steady, rewound and draining walks.
 
 <a id="expiry"></a>
 ## 8. Expiry
@@ -1184,7 +1185,6 @@ CRDT-internal terms first; a couple of cluster-wide terms repeated here for self
 - **`CellIdentity`.** The portable cell identity: `(rule_fingerprint, key_hash, bucket)`. The boundary type for the sinks (§5.4).
 - **`CompactCellKey`.** The node-local cell identity using interned `RuleSlot` and `NodeSlot` indices. Lives only inside one process (§5.4).
 - **Dictionary / interning.** Giving every distinct value a single canonical home in a fixed-size array, handing out a small integer slot in exchange.
-- **Dirty ring.** Bounded ring of "this cell just changed" entries.
 - **Fingerprint.** A canonical 128-bit hash of a rule's shape and parameters. Same on every node by construction; produced by `gabion::rules::Descriptor`.
 - **G-counter.** Grow-only counter — a CRDT where each replica only ever increases its own component, and merge is element-wise max.
 - **Generation.** A `u32` per slot; low bit is the active flag, high 31 bits are the ABA tag.

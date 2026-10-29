@@ -1,8 +1,9 @@
 //! N1: steady-state gossip allocates nothing. Two runtimes on one paused
 //! current-thread runtime exchange own-stream packets, acks, threshold and
 //! heartbeat rounds and a batched expiry of more than one sink's worth of
-//! cells, and a counting global allocator, armed on this thread for the whole
-//! window, counts every allocation either makes.
+//! cells; every tenth datagram A sends B is lost, so gap reports, timeout
+//! resends and prompt rounds run too. A counting global allocator, armed on
+//! this thread for the whole window, counts every allocation either makes.
 //!
 //! The runtimes talk through `RingTransport`: fixed per-address rings of
 //! pre-sized slots that copy each datagram once, as the kernel would. The
@@ -24,7 +25,7 @@ use std::time::Duration;
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity};
-use gabion::gossip::sim::sim_advance;
+use gabion::gossip::sim::sim_advance_ticks;
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, GossipClient, GossipRuntime, GossipTransport, TokioClock,
 };
@@ -74,6 +75,9 @@ fn note() {
 }
 
 const PAYLOAD: usize = 1400;
+
+// The warm-up's 5,000 cells expire in more than one batch.
+const _: () = assert!(5_000 > gabion::defaults::GOSSIP_EXPIRATION_BATCH);
 const SLOTS: usize = 512;
 
 /// One address's inbound ring: datagrams copied into fixed slots, oldest
@@ -106,6 +110,8 @@ impl Ring {
 struct Net {
     addrs: [SocketAddr; 2],
     rings: [RefCell<Ring>; 2],
+    /// Datagrams A sent B in the counted window; every tenth is lost.
+    a_to_b: Cell<u32>,
 }
 
 struct RingTransport {
@@ -122,6 +128,13 @@ impl GossipTransport for RingTransport {
         let Some(to) = self.net.addrs.iter().position(|&a| a == dst) else {
             return Ok(buf.len());
         };
+        if self.me == 0 && COUNTING.get() {
+            let sent = self.net.a_to_b.get() + 1;
+            self.net.a_to_b.set(sent);
+            if sent.is_multiple_of(10) {
+                return Ok(buf.len());
+            }
+        }
         let mut ring = self.net.rings[to].borrow_mut();
         if ring.len == SLOTS {
             return Err(io::ErrorKind::WouldBlock.into());
@@ -219,6 +232,7 @@ fn steady_state_gossip_never_allocates() {
                 SocketAddr::from(([127, 0, 0, 1], 2)),
             ],
             rings: [Ring::new(), Ring::new()],
+            a_to_b: Cell::new(0),
         });
         let start = |me: usize| {
             let mut config = gossip.clone();
@@ -248,11 +262,8 @@ fn steady_state_gossip_never_allocates() {
             record(&a, fingerprint, key, 1, 0).await;
         }
         record(&b, fingerprint, 1 << 40, 1, 0).await;
-        let mut now = 0;
-        while now < 500 {
-            sim_advance(Duration::from_millis(1)).await;
-            now += 1;
-        }
+        let mut now = 500;
+        sim_advance_ticks(Duration::from_millis(1), 500).await;
         let (a_before, b_before) = (snapshot(&a_admin).await, snapshot(&b_admin).await);
         assert_eq!(
             b_before.store_stats.active_cells, 5_001,
@@ -271,26 +282,24 @@ fn steady_state_gossip_never_allocates() {
                 i * 7 % 5_000
             };
             record(&a, fingerprint, key, 2, now).await;
-            for _ in 0..6 {
-                sim_advance(Duration::from_millis(1)).await;
-                now += 1;
-            }
+            sim_advance_ticks(Duration::from_millis(1), 6).await;
+            now += 6;
         }
         COUNTING.set(false);
 
         // The window did what it claims: a threshold round per hit, B
-        // receiving and A receiving acks, and bucket 0's cells expired.
+        // receiving all but the lost tenth and A receiving acks, B reporting
+        // the gaps the losses open and A resending in prompt rounds, and
+        // bucket 0's cells expired.
         let (a_after, b_after) = (snapshot(&a_admin).await, snapshot(&b_admin).await);
         let delta = |after: u64, before: u64| after - before;
         let (a_c, a_b) = (a_after.counters, a_before.counters);
         assert!(delta(a_c.rounds_threshold, a_b.rounds_threshold) >= 990);
         assert!(delta(a_c.rounds_heartbeat, a_b.rounds_heartbeat) >= 59);
-        assert!(
-            delta(
-                b_after.counters.packets_received,
-                b_before.counters.packets_received
-            ) >= 1_000
-        );
+        assert!(delta(a_c.rounds_prompt, a_b.rounds_prompt) > 0);
+        let (b_c, b_b) = (b_after.counters, b_before.counters);
+        assert!(delta(b_c.packets_received, b_b.packets_received) >= 900);
+        assert!(delta(b_c.gap_reports_sent, b_b.gap_reports_sent) > 0);
         assert!(delta(a_c.packets_received, a_b.packets_received) >= 50);
         assert!(a_after.store_stats.active_cells < 1_000);
         drop((a, b));

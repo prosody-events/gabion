@@ -1,7 +1,8 @@
 //! Streams, acks, gaps, timeouts and join sweeps across simulated clusters
-//! (§3 with every node in one zone). Heartbeats are 100 ms and the relay floor
-//! 5 ms; time moves 1 ms at a time so every prompt round runs when it falls
-//! due.
+//! of one zone. Heartbeats are 100 ms and the relay floor 5 ms; time moves
+//! 1 ms at a time so every prompt round runs when it falls due.
+
+use std::task::{Context, Waker};
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 
@@ -80,10 +81,6 @@ impl Node {
 
 fn addrs(base: u16, n: usize) -> Vec<SocketAddr> {
     (0..n).map(|i| sock(base + i as u16)).collect()
-}
-
-fn others(addrs: &[SocketAddr], me: SocketAddr) -> Vec<SocketAddr> {
-    addrs.iter().copied().filter(|&a| a != me).collect()
 }
 
 /// Node `i` of a test cluster, incarnation `incarnation`.
@@ -308,15 +305,8 @@ fn sweep_request_from_unknown_address_is_ignored() {
         a.hits(1..4).await;
         let x = sock(43_501);
         let raw = router.bind(x);
-        let request = Header {
-            cluster_id_hash: 0xC1.try_into().unwrap(),
-            sender: id(9, 1),
-            sender_zone: 0,
-            acks: AckInfo::default(),
-            payload: Payload::SweepRequest,
-        };
-        raw.try_send_to(&wire::write_header(&request, 0), a.addr)
-            .unwrap();
+        let request = header_bytes(id(9, 1), AckInfo::default(), Payload::SweepRequest);
+        raw.try_send_to(&request, a.addr).unwrap();
         run_for(200).await;
         assert_eq!(router.received_count(x), 0);
         assert_eq!(a.counters().await.sweeps_ignored, 1);
@@ -348,8 +338,9 @@ fn restart_resets_streams_and_requests_a_sweep() {
     });
 }
 
-/// SIM9: a peer speaking another wire version is sent nothing; its first
-/// packet of this version makes it a recipient again, rewound to 0.
+/// SIM9: a peer speaking another wire version is sent nothing, not even the
+/// rest of a sweep it asked for; its first packet of this version makes it a
+/// recipient again, rewound to 0.
 #[test]
 fn other_version_peer_is_muted() {
     run_paused(async {
@@ -362,7 +353,9 @@ fn other_version_peer_is_muted() {
             sim_config(vec![v]),
         );
         let raw = router.bind(v);
-        a.hits(1..4).await;
+        a.hits(1..40).await;
+        let request = header_bytes(id(1, 1), AckInfo::default(), Payload::SweepRequest);
+        raw.try_send_to(&request, a.addr).unwrap();
         raw.try_send_to(&v1_packet(), a.addr).unwrap();
         run_for(1).await;
         let received = router.received_count(v);
@@ -370,28 +363,22 @@ fn other_version_peer_is_muted() {
         assert_eq!(router.received_count(v), received);
         assert_eq!(a.peer(v).await.role, Role::Incompatible);
 
-        let ack = Header {
-            cluster_id_hash: 0xC1.try_into().unwrap(),
-            sender: id(1, 1),
-            sender_zone: 0,
-            acks: AckInfo::default(),
-            payload: Payload::Ack { probe: false },
-        };
+        let ack = header_bytes(id(1, 1), AckInfo::default(), Payload::Ack { probe: false });
         let mut buf = vec![0; wire::MAX_PAYLOAD_BYTES];
-        while raw.try_recv_from(&mut buf).is_ok() {}
-        raw.try_send_to(&wire::write_header(&ack, 0), a.addr)
-            .unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        while raw.try_recv_from(&mut cx, &mut buf).is_ok() {}
+        raw.try_send_to(&ack, a.addr).unwrap();
         run_for(100).await;
         assert_eq!(a.peer(v).await.role, Role::Zone);
         let limits = wire::FrameLimits::new(wire::MAX_PAYLOAD_BYTES).unwrap();
         let mut own_cells = 0;
-        while let Ok((n, _)) = raw.try_recv_from(&mut buf) {
+        while let Ok((n, _)) = raw.try_recv_from(&mut cx, &mut buf) {
             wire::decode(&buf[..n], limits, 0xC1.try_into().unwrap(), |_| {
                 own_cells += 1
             })
             .unwrap();
         }
-        assert_eq!(own_cells, 3);
+        assert_eq!(own_cells, 39);
         a.stop().await;
     });
 }
@@ -649,6 +636,46 @@ fn takeover_retry_during_a_paged_sweep_is_a_no_op() {
             total < 1_000 + 34,
             "the lost pages came from nowhere else: {total}"
         );
+        t.stop().await;
+    });
+}
+
+/// SIM34, case 6: N restarts again while its source pages the sweep the
+/// previous incarnation asked for. A threshold round sends the source's next
+/// hit at once, so the new incarnation hears the source and asks before a
+/// tail page reaches it; that request starts the sweep over, so N gets its
+/// old cells from the first page on.
+#[test]
+fn takeover_restarted_mid_sweep_is_swept_from_the_start() {
+    run_paused(async {
+        let tune = |s: &mut Settings| {
+            s.max_payload_bytes = 1400;
+            s.max_cells = 2048.try_into().unwrap();
+        };
+        let store = |identity| CellStore::new(storage(2048, 32), identity, &rules(32));
+        let t = takeover(44_900, 1, 1_000, tune, store, |_, _| {}).await;
+        while t.served().await == [0] {
+            run_for(1).await;
+        }
+        run_for(10).await;
+        let (addr, s) = (t.n.addr, t.sources[0].addr);
+        t.n.stop().await;
+        let n = Node::start(
+            &t.router,
+            addr,
+            store(id(0, 3)),
+            tuned_config(vec![s], tune),
+        );
+        let t = Takeover { n, ..t };
+        // Two hits against a limit of 1 cross the error budget.
+        let source = &t.sources[0].client;
+        source
+            .record(0xBEE, KeyHash(3_000_000), 0, 2, 1, 0)
+            .await
+            .unwrap();
+        run_for(600).await;
+        assert_eq!(t.served().await, [2]);
+        assert_eq!(t.n.agg.total(), 1_000 + 1 + 2);
         t.stop().await;
     });
 }

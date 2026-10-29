@@ -45,13 +45,15 @@ const BASE_PORT: u16 = 40_000;
 /// Cluster id mixed into every packet header (matches the bench).
 pub(crate) const CLUSTER_ID_HASH: u128 = 0xC1;
 
-/// Each node's inbound queue, sized for the densest round the visualizer can
-/// build: every node in one zone, each of the other `MAX_NODES − 1` nodes
-/// handing a node two packets a heartbeat (its own stream, two packets when a
-/// burst passes one packet's cells; one each on the own and relay streams
-/// once relays exist), 510 at 256 nodes. A stepped round that would overflow
-/// a node's queue drops the excess, which the logging transport reports as
-/// dropped.
+/// Each node's inbound queue: two packets from each of the other
+/// `MAX_NODES − 1` nodes, 510 at 256 nodes, for every node in one zone. A
+/// heartbeat sends each peer one own-stream frame, 33 cells to a packet at the
+/// default payload, so two packets carry a frame of up to 66 cells; the
+/// visualizer's one watched key leaves each node at most `live_buckets + 1`
+/// own cells (11 at the default window). A step that hands a node more (a
+/// window over 65 buckets, or many keys through the engine API) overflows the
+/// queue: the logging transport reports the excess as `PacketDropped`, and
+/// each stream resends it after one heartbeat.
 pub(crate) const VIZ_ROUTER_CAPACITY: usize = 2 * (MAX_NODES - 1);
 
 /// Per-(src, dst) link policy in a serde-friendly shape. Maps onto the

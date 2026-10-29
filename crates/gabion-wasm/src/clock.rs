@@ -84,20 +84,17 @@ impl Clock for ManualClock {
     }
 
     /// The heartbeat inbox for the heartbeat interval, else the prompt inbox
-    /// with the `armed` flag. An inbox already taken yields a ticker that
-    /// never fires.
+    /// with the `armed` flag. An inbox already taken yields a ticker without
+    /// an inbox, which never fires.
     fn ticker(&self, interval: Duration) -> ManualTicker {
-        if interval == self.heartbeat {
-            ManualTicker {
-                rx: self.heartbeat_rx.borrow_mut().take(),
-                armed: None,
-            }
+        let (inbox, armed) = if interval == self.heartbeat {
+            (&self.heartbeat_rx, None)
         } else {
-            ManualTicker {
-                rx: self.prompt_rx.borrow_mut().take(),
-                armed: Some(Rc::clone(&self.armed)),
-            }
-        }
+            (&self.prompt_rx, Some(Rc::clone(&self.armed)))
+        };
+        let rx = inbox.borrow_mut().take();
+        debug_assert!(rx.is_some(), "the runtime asks for each ticker once");
+        ManualTicker { rx, armed }
     }
 }
 
@@ -126,12 +123,11 @@ impl Ticker for ManualTicker {
             armed.set(true);
             Armed(armed)
         });
-        match self.rx.as_mut() {
-            Some(rx) => match rx.recv().await {
-                Some(at) => at,
-                None => std::future::pending().await,
-            },
-            None => std::future::pending().await,
+        if let Some(rx) = self.rx.as_mut()
+            && let Some(at) = rx.recv().await
+        {
+            return at;
         }
+        std::future::pending().await
     }
 }

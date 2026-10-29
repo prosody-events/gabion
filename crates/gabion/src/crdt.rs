@@ -674,29 +674,41 @@ impl CellStore {
 
     /// Clear `out`, then fill it with the live own cells whose sequence is
     /// above `sent`, ascending, at most `max`. The walk to the first such cell
-    /// starts from whichever end of the list is nearer: from the head when
-    /// `sent` is below the first cell's sequence (a new peer, or a stream
-    /// rewound to 0), else back from the tail. `O(returned + cells walked)`.
+    /// starts from whichever end is nearer by sequence, so it costs at most
+    /// the smaller of `sent − first` and `last − sent` steps: a new peer, a
+    /// rewound stream and a draining backlog walk from the head, steady state
+    /// from the tail. `out` must hold `max` handles, so nothing allocates.
     pub fn stream_after(&self, sent: u64, max: usize, out: &mut Vec<CellHandle>) {
+        debug_assert!(
+            out.capacity() >= max,
+            "stream_after fills a pre-sized buffer"
+        );
         out.clear();
         let seq = |slot: u32| self.origin_sequences[slot as usize];
-        let mut first = self.own_list.head;
-        if first.get().is_some_and(|head| seq(head) <= sent) {
-            first = SlotLink::NONE;
-            let mut cursor = self.own_list.tail;
-            while let Some(slot) = cursor.get() {
-                if seq(slot) <= sent {
-                    break;
-                }
+        let (Some(head), Some(tail)) = (self.own_list.head.get(), self.own_list.tail.get()) else {
+            return;
+        };
+        let mut cursor = if sent.saturating_sub(seq(head)) <= seq(tail).saturating_sub(sent) {
+            let mut cursor = SlotLink(head);
+            while let Some(slot) = cursor.get()
+                && seq(slot) <= sent
+            {
+                cursor = self.stream_next[slot as usize];
+            }
+            cursor
+        } else {
+            let (mut first, mut cursor) = (SlotLink::NONE, SlotLink(tail));
+            while let Some(slot) = cursor.get()
+                && seq(slot) > sent
+            {
                 first = cursor;
                 cursor = self.stream_prev[slot as usize];
             }
-        }
-        let mut cursor = first;
-        while let Some(slot) = cursor.get() {
-            if out.len() == max {
-                return;
-            }
+            first
+        };
+        while let Some(slot) = cursor.get()
+            && out.len() < max
+        {
             out.push(self.handle_for(slot));
             cursor = self.stream_next[slot as usize];
         }

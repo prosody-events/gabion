@@ -10,7 +10,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::pin::pin;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 #[cfg(feature = "transport-udp")]
 use tokio::net::UdpSocket;
@@ -58,10 +58,16 @@ pub trait GossipTransport {
     ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + 'a;
 
     /// Take one datagram already waiting, or fail with `WouldBlock`. The
-    /// default polls [`Self::recv_from`] once; a round reads the waiting
-    /// datagrams this way before it services its timers.
-    fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        match pin!(self.recv_from(buf)).poll(&mut Context::from_waker(Waker::noop())) {
+    /// default polls [`Self::recv_from`] once with the runtime task's
+    /// context, so a transport that arms a wake-up there wakes the runtime; a
+    /// round reads the waiting datagrams this way before it services its
+    /// timers.
+    fn try_recv_from(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr)> {
+        match pin!(self.recv_from(buf)).poll(cx) {
             Poll::Ready(result) => result,
             Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
         }
@@ -311,7 +317,11 @@ impl GossipTransport for UdpTransport {
     }
 
     #[inline]
-    fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    fn try_recv_from(
+        &self,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr)> {
         self.0.try_recv_from(buf)
     }
 

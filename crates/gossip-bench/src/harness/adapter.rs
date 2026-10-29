@@ -308,7 +308,6 @@ impl Launcher {
         let draw = Rng::stream(self.seed, Stream::Gossip, idx as u64).next_u64();
         let id = (u128::from(draw) << 64) | idx as u128 | 1 << 63;
         let identity = NodeIdentity::new(NodeId(id), 1);
-        let config = self.gossip.clone();
         let cell_store = CellStore::new(self.cells, identity, &self.identity.rules);
         let store = Rc::new(NodeStore::new(
             Rc::clone(&self.keys),
@@ -321,7 +320,7 @@ impl Launcher {
             SimClock {
                 world: Rc::clone(&self.world),
             },
-            config,
+            self.gossip.clone(),
             cell_store,
             Rc::clone(&store),
             Some(admin_rx),
