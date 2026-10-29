@@ -97,8 +97,13 @@ pub struct Plan {
     pub max_running: usize,
 }
 
+/// The zone node `index` runs in: nodes go round the zones in turn.
+pub fn node_az(index: usize) -> u8 {
+    (index % usize::from(AVAILABILITY_ZONES)) as u8
+}
+
 pub fn node_addr(index: usize) -> SocketAddr {
-    let az = (index % AVAILABILITY_ZONES as usize) as u8;
+    let az = node_az(index);
     let ip = Ipv4Addr::new(10, az, (index >> 8) as u8, (index & 0xFF) as u8);
     SocketAddr::V4(SocketAddrV4::new(ip, GOSSIP_PORT))
 }
@@ -110,7 +115,7 @@ impl Plan {
             .map(|i| NodePlan {
                 start_ns: rng.below(START_SPREAD_NS),
                 stop: None,
-                az: (i % AVAILABILITY_ZONES as usize) as u8,
+                az: node_az(i),
                 initial: true,
             })
             .collect();
@@ -124,7 +129,7 @@ impl Plan {
                 nodes.push(NodePlan {
                     start_ns,
                     stop: None,
-                    az: (index % AVAILABILITY_ZONES as usize) as u8,
+                    az: node_az(index),
                     initial: false,
                 });
                 if let Some(victim) = nodes.iter_mut().find(|n| n.initial && n.stop.is_none()) {

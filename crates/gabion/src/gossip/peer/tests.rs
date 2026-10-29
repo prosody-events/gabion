@@ -28,7 +28,12 @@ fn addr(i: u8) -> SocketAddr {
 }
 
 fn table() -> PeerTable {
-    PeerTable::with_capacity(CAPACITY, 7, RTO, SUSPECT_AFTER)
+    PeerTable::with_capacity(CAPACITY, 7, None, RTO, SUSPECT_AFTER)
+}
+
+/// The heads of an own stream at `own` and an empty relay stream.
+fn heads(own: u64) -> PerStream<u64> {
+    PerStream { own, relay: 0 }
 }
 
 /// The stream range `(lower, upper]`; every caller passes `lower < upper`.
@@ -505,8 +510,8 @@ fn rendezvous_ranking_depends_on_the_local_key() {
 /// in zone 1 whose id hashes to `local_key`, roles refreshed.
 fn zoned_table(local_key: u64, members: u8, capacity: u16) -> PeerTable {
     let capacity = NonZeroU16::new(capacity).unwrap();
-    let mut table = PeerTable::with_capacity(capacity, local_key, RTO, SUSPECT_AFTER);
-    table.set_local_zone(zone(1));
+    let mut table =
+        PeerTable::with_capacity(capacity, local_key, Some(zone(1)), RTO, SUSPECT_AFTER);
     for i in 1..=members {
         assert_eq!(table.insert(addr(2 * i)), Insert::Added);
         let row = table.find(addr(2 * i)).unwrap();
@@ -570,7 +575,7 @@ fn rendezvous_moves_only_the_removed_members_origins(members: u8, removed: u8) {
             probe_reply: true,
             ..AckInfo::default()
         };
-        table.credit(row, answer, 7, [0, 0], SUSPECT_AFTER);
+        table.credit(row, answer, 7, heads(0), SUSPECT_AFTER);
     }
     table.refresh(SUSPECT_AFTER, |_| {});
     assert_eq!(gateway(&table), Some(first));
@@ -626,10 +631,8 @@ fn role_refresh_equals_brute_force(case: RefreshCase) {
     const NOW: u64 = SUSPECT_AFTER + 40;
     let n = case.rows.len();
     let capacity = NonZeroU16::new(n as u16).unwrap();
-    let mut table = PeerTable::with_capacity(capacity, 3, RTO, SUSPECT_AFTER);
-    if case.local > 0 {
-        table.set_local_zone(zone(case.local));
-    }
+    let local = ZoneHash::from_wire(case.local);
+    let mut table = PeerTable::with_capacity(capacity, 3, local, RTO, SUSPECT_AFTER);
     let addr_of = |row: usize| SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 1000 + row as u16));
     for (i, &(z, muted, answer)) in case.rows.iter().enumerate() {
         table.insert(addr_of(i));
@@ -729,15 +732,15 @@ impl Arbitrary for AnswerOp {
     }
 }
 
-/// A row's answer state follows the transition table of the design (§3.7)
-/// through any mix of sends, acks, probe answers, role changes, restarts and
+/// A row's answer state follows the transitions [`Answer`] lists through
+/// any mix of sends, acks, probe answers, role changes, restarts and
 /// held time, and it is suspect exactly when `suspect_after` has passed since
 /// its oldest unanswered packet or it said it cannot relay; for two
 /// `suspect_after` values.
 #[quickcheck]
 fn answer_matches_its_model(ops: Vec<AnswerOp>) {
     for suspect_after in [4 * RTO, 3 * RTO] {
-        let mut table = PeerTable::with_capacity(CAPACITY, 7, RTO, suspect_after);
+        let mut table = PeerTable::with_capacity(CAPACITY, 7, None, RTO, suspect_after);
         table.insert(addr(0));
         let mut identity = NodeIdentity::new(NodeId(9), 1);
         table.contact(0, identity, None);
@@ -749,7 +752,7 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                 Answer::CannotRelay { since_ms } => since_ms <= judged,
             };
             let was = suspect(model, table.judged_ms);
-            let owed = |table: &mut PeerTable| table.owed(0) != [false; 2];
+            let owed = |table: &mut PeerTable| table.owed(0).any();
             let acks = |table: &PeerTable, ack, probe_reply, cannot_relay| AckInfo {
                 incarnation: 7,
                 own: if table.role(0) == Role::Gateway {
@@ -798,7 +801,13 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                         progress && ack > table.link[0].own.acked && table.role(0).gets_own();
                     let counts =
                         cannot_relay && matches!(table.role(0), Role::Gateway | Role::Remote);
-                    table.credit(0, acks(&table, ack, false, cannot_relay), 7, [head, 0], now);
+                    table.credit(
+                        0,
+                        acks(&table, ack, false, cannot_relay),
+                        7,
+                        heads(head),
+                        now,
+                    );
                     // A counting `CANNOT_RELAY` packet's acks are no progress.
                     if counts {
                         let from = match model {
@@ -820,7 +829,7 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                 AnswerOp::ProbeReply => {
                     let owed_before = owed(&mut table);
                     let ack = table.link[0].own.acked;
-                    table.credit(0, acks(&table, ack, true, false), 7, [head, 0], now);
+                    table.credit(0, acks(&table, ack, true, false), 7, heads(head), now);
                     if !owed_before {
                         model = Answer::Settled;
                     } else if was {
@@ -891,18 +900,18 @@ fn own_acks_count_only_in_the_kind_the_role_receives() {
             gap_own,
             ..AckInfo::default()
         };
-        table.credit(0, acks(ignored, false), 7, [5, 0], 1_000);
+        table.credit(0, acks(ignored, false), 7, heads(5), 1_000);
         assert_eq!(table.link[0].own.acked, 0, "{role:?}");
-        table.credit(0, acks(counted, false), 7, [5, 0], 1_000);
+        table.credit(0, acks(counted, false), 7, heads(5), 1_000);
         assert_eq!(table.link[0].own.acked, 3, "{role:?}");
         // A forgotten stream: a gap report below `acked`.
         let below = |own: OwnAck| match own {
             OwnAck::Plain(_) => OwnAck::Plain(1),
             OwnAck::Flagged(_) => OwnAck::Flagged(1),
         };
-        table.credit(0, acks(below(ignored), true), 7, [5, 0], 1_000);
+        table.credit(0, acks(below(ignored), true), 7, heads(5), 1_000);
         assert_eq!(table.link[0].own.acked, 3, "{role:?}");
-        table.credit(0, acks(below(counted), true), 7, [5, 0], 1_000);
+        table.credit(0, acks(below(counted), true), 7, heads(5), 1_000);
         assert_eq!((table.link[0].own.acked, table.own_sent[0]), (1, 1));
     }
     let mut table = one_row();
@@ -912,6 +921,11 @@ fn own_acks_count_only_in_the_kind_the_role_receives() {
     assert_eq!((table.link[0].own.acked, table.own_sent[0]), (0, 0));
     assert!(table.flags(0).has(PeerFlags::RESEND_OWN));
 }
+
+const OWN_GAP: PerStream<GapDue> = PerStream {
+    own: GapDue::Report,
+    relay: GapDue::Nothing,
+};
 
 /// Flagged own ranges move their own mark: a lost first flagged packet opens
 /// a flagged gap although the plain mark is past it, freshness is judged
@@ -927,7 +941,7 @@ fn flagged_ranges_keep_their_own_mark() {
     assert_eq!(link.own_ack(), OwnAck::Flagged(0));
     assert!(table.flags(0).has(PeerFlags::GAP_OPEN));
     let reports = table.take_reports(0, 1_000 + FLOOR, FLOOR);
-    assert_eq!(reports, [GapDue::Report, GapDue::Nothing]);
+    assert_eq!(reports, OWN_GAP);
     // The lost packet arrives late: fresh, as it lies above the flagged mark.
     assert!(table.receive_own(0, range(0, 3), true, 1_010, FLOOR));
     assert_eq!(table.link[0].flagged_in.have, 6);
@@ -936,7 +950,7 @@ fn flagged_ranges_keep_their_own_mark() {
     table.receive_own(0, range(12, 14), false, 1_010, FLOOR);
     assert_eq!(table.link[0].own_ack(), OwnAck::Plain(10));
     let reports = table.take_reports(0, 1_010 + FLOOR, FLOOR);
-    assert_eq!(reports, [GapDue::Report, GapDue::Nothing]);
+    assert_eq!(reports, OWN_GAP);
 }
 
 /// A row's deadline also holds the relay stream's timeout, the relay gap's
@@ -970,4 +984,53 @@ fn deadline_holds_the_relay_and_suspicion_timers() {
     assert!(table.suspect(0));
     // Only the suspect's next probe remains.
     assert_eq!(table.deadline[0], Deadline(1_000 + SUSPECT_AFTER + RTO));
+}
+
+/// A heartbeat stamped before the last judgment (`F_r` behind the clock,
+/// after a threshold round) leaves a row judged suspect still suspect, and the
+/// next round does not judge its crossing, and its stalled relay, again.
+#[test]
+fn late_heartbeat_judges_no_row_twice() {
+    let mut table = one_row();
+    table.tx(0, Stream::Relay).note_sent(2, 1_000);
+    let sent = Sent {
+        bytes: 1,
+        left: true,
+    };
+    table.note_send(0, sent, true, 1_000);
+    let mut stalls = 0;
+    for now in [
+        1_001 + SUSPECT_AFTER,
+        1_000 + SUSPECT_AFTER - 1,
+        1_005 + SUSPECT_AFTER,
+    ] {
+        table.judge(now, |_| stalls += 1);
+        assert!(table.suspect(0), "{now}");
+    }
+    assert_eq!(stalls, 1);
+}
+
+/// A repeated `CANNOT_RELAY` from a suspect gateway, or a repeated packet of
+/// another version from a muted peer, changes no rank, so the roles stay
+/// fresh and no refresh runs for it.
+#[test]
+fn repeated_signals_leave_the_roles_fresh() {
+    let mut table = zoned_table(1, 2, 16);
+    let row = table.find(gateway(&table).unwrap()).unwrap();
+    let cannot_relay = AckInfo {
+        incarnation: 7,
+        cannot_relay: true,
+        ..AckInfo::default()
+    };
+    table.credit(row, cannot_relay, 7, heads(0), 1_000);
+    assert!(table.stale());
+    table.judge(1_000, |_| {});
+    table.refresh(1_000, |_| {});
+    table.credit(row, cannot_relay, 7, heads(0), 1_100);
+    assert!(!table.stale());
+
+    table.mute(row);
+    table.refresh(1_100, |_| {});
+    table.mute(row);
+    assert!(!table.stale());
 }

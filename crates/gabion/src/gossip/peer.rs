@@ -14,6 +14,7 @@
 use std::cmp::Reverse;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU16;
+use std::ops::{Index, IndexMut};
 
 use crate::crdt::{
     CellIndex, Incarnation, NodeIdentity, Stream, hash_fingerprint, mix64, pow2_index_capacity_for,
@@ -31,6 +32,40 @@ pub(super) enum Insert {
     Added,
     Present,
     Full,
+}
+
+/// One value for each stream, so the own and relay values cannot trade
+/// places.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PerStream<T> {
+    pub(super) own: T,
+    pub(super) relay: T,
+}
+
+impl PerStream<bool> {
+    pub(super) fn any(self) -> bool {
+        self.own || self.relay
+    }
+}
+
+impl<T> Index<Stream> for PerStream<T> {
+    type Output = T;
+
+    fn index(&self, stream: Stream) -> &T {
+        match stream {
+            Stream::Own => &self.own,
+            Stream::Relay => &self.relay,
+        }
+    }
+}
+
+impl<T> IndexMut<Stream> for PerStream<T> {
+    fn index_mut(&mut self, stream: Stream) -> &mut T {
+        match stream {
+            Stream::Own => &mut self.own,
+            Stream::Relay => &mut self.relay,
+        }
+    }
 }
 
 /// What a peer is to this node.
@@ -316,10 +351,12 @@ fn keep(stash: (u64, u64), range: (u64, u64)) -> (u64, u64) {
     }
 }
 
-/// What this node waits for from a peer. Only the transitions §3.7 of the
-/// design lists change it: a send that asks for an answer starts `Owed`,
-/// progress settles it or restarts it, and `CANNOT_RELAY` from a remote zone
-/// replaces it.
+/// What this node waits for from a peer. Only these transitions change it: a
+/// send that asks for an answer starts `Owed`; progress, or a probe answer
+/// when nothing is in flight, settles it, or restarts it while data is owed;
+/// a held packet's release shifts it; `CANNOT_RELAY` from a remote zone
+/// replaces it; a role that receives nothing settles it unless suspect; and
+/// a restart or another wire version clears it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum Answer {
     /// Nothing sent waits for an answer.
@@ -436,7 +473,7 @@ pub(super) struct Credit {
     /// The relay stream was rewound: prompt work.
     pub(super) resend_relay: bool,
     /// A suspect's probe answer rewound these streams.
-    pub(super) answer_rewound: [bool; 2],
+    pub(super) answer_rewound: PerStream<bool>,
 }
 
 /// A zone row with relay data in flight turned suspect.
@@ -510,6 +547,7 @@ impl PeerTable {
     pub(super) fn with_capacity(
         capacity: NonZeroU16,
         local_key: u64,
+        local_zone: Option<ZoneHash>,
         rto_ms: u64,
         suspect_after_ms: u64,
     ) -> Self {
@@ -523,7 +561,7 @@ impl PeerTable {
             rto_ms,
             suspect_after_ms,
             local_key,
-            local_zone: None,
+            local_zone,
             stale: false,
             judged_ms: 0,
             role: vec![Role::Zone; rows].into_boxed_slice(),
@@ -658,7 +696,7 @@ impl PeerTable {
         self.role[row] = Role::Incompatible;
         self.flags[row] = PeerFlags::default();
         self.link[row].answer = Answer::Settled;
-        self.stale = true;
+        self.stale |= changed;
         self.refresh_deadline(row);
         changed
     }
@@ -675,10 +713,20 @@ impl PeerTable {
         true
     }
 
-    /// This node's zone became known.
-    pub(super) fn set_local_zone(&mut self, zone: ZoneHash) {
-        self.local_zone = Some(zone);
-        self.stale = true;
+    /// This node's zone, which every header announces.
+    pub(super) fn local_zone(&self) -> Option<ZoneHash> {
+        self.local_zone
+    }
+
+    /// Learn this node's zone, unless it is already known (configured or
+    /// learned): returns whether it was adopted.
+    pub(super) fn adopt_zone(&mut self, zone: ZoneHash) -> bool {
+        let adopted = self.local_zone.is_none();
+        if adopted {
+            self.local_zone = Some(zone);
+            self.stale = true;
+        }
+        adopted
     }
 
     /// Whether roles need a refresh: prompt work.
@@ -765,12 +813,17 @@ impl PeerTable {
 
     /// Take the gap reports due at `now`: the selected own mark's and the
     /// relay stream's.
-    pub(super) fn take_reports(&mut self, row: usize, now: u64, floor_ms: u64) -> [GapDue; 2] {
+    pub(super) fn take_reports(
+        &mut self,
+        row: usize,
+        now: u64,
+        floor_ms: u64,
+    ) -> PerStream<GapDue> {
         let link = &mut self.link[row];
-        [
-            link.own_mark().take_report(now, floor_ms),
-            link.relay_in.take_report(now, floor_ms),
-        ]
+        PerStream {
+            own: link.own_mark().take_report(now, floor_ms),
+            relay: link.relay_in.take_report(now, floor_ms),
+        }
     }
 
     /// Credit a packet's acks against `heads`, the own and relay heads. The
@@ -785,7 +838,7 @@ impl PeerTable {
         row: usize,
         acks: AckInfo,
         incarnation: Incarnation,
-        heads: [u64; 2],
+        heads: PerStream<u64>,
         now: u64,
     ) -> Credit {
         let role = self.role[row];
@@ -799,56 +852,57 @@ impl PeerTable {
         };
         if let Some(ack) = own_ack.filter(|_| current) {
             let mut own = self.tx(row, Stream::Own);
-            progress |= own.note_ack(ack, heads[0], now);
-            if acks.gap_own && own.gap_report(ack, heads[0], now) {
+            progress |= own.note_ack(ack, heads.own, now);
+            if acks.gap_own && own.gap_report(ack, heads.own, now) {
                 self.flags[row].set(PeerFlags::RESEND_OWN, true);
             }
         }
         if current && role == Role::Zone {
             let mut relay = self.tx(row, Stream::Relay);
-            progress |= relay.note_ack(acks.relay, heads[1], now);
-            credit.resend_relay = acks.gap_relay && relay.gap_report(acks.relay, heads[1], now);
+            progress |= relay.note_ack(acks.relay, heads.relay, now);
+            credit.resend_relay = acks.gap_relay && relay.gap_report(acks.relay, heads.relay, now);
         }
         let owed = self.owed(row);
         let counts = acks.cannot_relay && matches!(role, Role::Gateway | Role::Remote);
         let answer = &mut self.link[row].answer;
         if counts {
             let from = answer.suspect_from(self.suspect_after_ms).unwrap_or(now);
-            *answer = Answer::CannotRelay {
+            let cannot = Answer::CannotRelay {
                 since_ms: from.min(now),
             };
-            self.stale = true;
-        } else if current && (progress || (acks.probe_reply && owed == [false; 2])) {
-            *answer = if owed == [false; 2] {
+            // A repeat changes no rank, so it refreshes no role.
+            self.stale |= std::mem::replace(answer, cannot) != cannot;
+        } else if current && (progress || (acks.probe_reply && !owed.any())) {
+            *answer = if !owed.any() {
                 Answer::Settled
             } else {
                 Answer::Owed { since_ms: now }
             };
         }
         if current && !counts && acks.probe_reply && was {
-            for (stream, owed) in [Stream::Own, Stream::Relay].into_iter().zip(owed) {
-                if owed {
+            for stream in [Stream::Own, Stream::Relay] {
+                if owed[stream] {
                     self.tx(row, stream).rewind(now);
-                    credit.answer_rewound[stream as usize] = true;
                 }
             }
-            if credit.answer_rewound[0] {
+            credit.answer_rewound = owed;
+            if owed.own {
                 self.flags[row].set(PeerFlags::RESEND_OWN, true);
             }
-            credit.resend_relay |= credit.answer_rewound[1];
+            credit.resend_relay |= owed.relay;
         }
         self.stale |= was != self.suspect(row);
         self.refresh_deadline(row);
         credit
     }
 
-    /// The streams `row` receives that have data in flight: own, relay.
-    fn owed(&mut self, row: usize) -> [bool; 2] {
+    /// The streams `row` receives that have data in flight.
+    fn owed(&mut self, row: usize) -> PerStream<bool> {
         let role = self.role[row];
-        [
-            role.gets_own() && self.tx(row, Stream::Own).in_flight(),
-            role == Role::Zone && self.tx(row, Stream::Relay).in_flight(),
-        ]
+        PerStream {
+            own: role.gets_own() && self.tx(row, Stream::Own).in_flight(),
+            relay: role == Role::Zone && self.tx(row, Stream::Relay).in_flight(),
+        }
     }
 
     /// A packet to `row` went to the socket. One that asks for an answer and
@@ -877,8 +931,10 @@ impl PeerTable {
     /// Judge suspicion as of `now`, the start of a round that read its
     /// waiting datagrams and holds no packet. Each row whose suspicion began
     /// since the last judgment makes the roles stale; a zone row among them
-    /// with relay data in flight is a stalled relay.
+    /// with relay data in flight is a stalled relay. A heartbeat stamped
+    /// before the last judgment judges nothing again.
     pub(super) fn judge(&mut self, now: u64, mut on_stall: impl FnMut(Stall)) {
+        let now = now.max(self.judged_ms);
         let last = std::mem::replace(&mut self.judged_ms, now);
         for row in 0..self.len {
             // Only a due row can have crossed: the hot column first.

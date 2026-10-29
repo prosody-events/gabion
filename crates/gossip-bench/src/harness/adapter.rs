@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::driver::Counters;
 use super::node::{KeySpace, NOT_TRACKED, Sizing};
-use super::plan::{AVAILABILITY_ZONES, node_addr};
+use super::plan::{node_addr, node_az};
 use super::regime::Regime;
 use super::rng::{Rng, Stream};
 use super::world::{PeerStream, SimClock, SimSocket, SimTicker, World};
@@ -317,8 +317,7 @@ impl Launcher {
         ));
         // Each node announces the zone the plan places it in.
         let mut gossip = self.gossip.clone();
-        let az = idx % usize::from(AVAILABILITY_ZONES);
-        gossip.zone = Some(ZoneName::parse(&format!("az-{az}"))?);
+        gossip.zone = Some(ZoneName::parse(&format!("az-{}", node_az(idx)))?);
         let (admin, admin_rx) = mpsc::channel(4);
         let (runtime, client) = GossipRuntime::from_parts_with_admin(
             transport,

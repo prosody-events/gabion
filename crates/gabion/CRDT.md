@@ -909,7 +909,7 @@ sequenceDiagram
     participant Idx as CellIndex
     participant Cols as columns
     participant Seq as next_sequence_by_origin
-    participant OL as Own list
+    participant OL as Own and relay lists
     participant Sink as DeltaSink
 
     Cl->>CS: upsert(UpsertSpec { …, mode }, sink)
@@ -923,12 +923,14 @@ sequenceDiagram
             CS->>CS: current = if observed > previous { observed } else { previous }
         end
         alt current == previous
+            CS->>OL: remote cell, mark All: mark_relay(slot)
             CS-->>Cl: return (no delta)
         else current > previous
             CS->>Cols: counts[slot] = current; last_update_millis[slot] = now
             CS->>Seq: seq = ++next_sequence_by_origin[origin_slot]
             CS->>Cols: origin_sequences[slot] = seq
-            CS->>OL: own cell: unlink_own(slot); link_own_tail(slot)
+            CS->>OL: own cell: unlink(slot); link_tail(Own, slot)
+            CS->>OL: remote cell: Clear → unlink(slot), else mark_relay(slot)
             CS->>Sink: emit_delta(slot, previous, current, delta, rule_slot)
             CS-->>Cl: return (delta in sink)
         end
@@ -943,7 +945,8 @@ sequenceDiagram
             CS->>Cols: origin_sequences[slot] = seq
             CS->>CS: rule_dictionary.inc_ref(); node_dictionary.inc_ref()
             CS->>Idx: insert_unchecked(hash, slot)
-            CS->>OL: own cell: link_own_tail(slot)
+            CS->>OL: own cell: link_tail(Own, slot)
+            CS->>OL: remote cell, unless Clear: mark_relay(slot)
             CS->>Sink: emit_delta(slot, 0, initial, initial, rule_slot)
             CS-->>Cl: return (delta in sink)
         end

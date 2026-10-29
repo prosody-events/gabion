@@ -26,7 +26,7 @@ use crate::defaults::GOSSIP_EXPIRATION_BATCH;
 use crate::discovery::{Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
-use crate::gossip::mock::{MockTransport, Wire};
+use crate::gossip::mock::{MockTransport, Wire, gated};
 use crate::gossip::sim::{LinkPolicy, SimRouter, sim_advance, sim_advance_ticks};
 use crate::gossip::{
     AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipCounters, GossipError,
@@ -1343,7 +1343,8 @@ async fn mocked(
         Rc::new(InMemoryAggregateStore::new()),
         Some(admin_rx),
     );
-    let runtime = tokio::task::spawn_local(rt.run(futures::stream::empty()));
+    let run = rt.run(futures::stream::empty());
+    let runtime = tokio::task::spawn_local(gated(wire.clone(), run));
     sim_advance_ticks(Duration::from_millis(10), 1).await;
     wire.attempts.borrow_mut().clear();
     (client, admin_tx, runtime)

@@ -100,6 +100,7 @@ fn snapshot_json_shape_is_pinned() {
 
         let bootstrap = next_addr();
         gossip_config.bootstrap_peers = vec![bootstrap];
+        let tick = settings().tick_interval.duration();
 
         let (admin_tx, admin_rx) = admin_channel();
         let (rt, client) = GossipRuntime::from_parts_with_admin(
@@ -114,22 +115,17 @@ fn snapshot_json_shape_is_pinned() {
 
         let state = AdminState::new(rule_table.clone(), counts, admin_tx);
         let app = router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/snapshot")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("router responded");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let bytes = to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("body");
-        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        let snapshot = async || {
+            let request = Request::builder().uri("/snapshot").body(Body::empty());
+            let response =
+                (app.clone().oneshot(request.expect("request")).await).expect("router responded");
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            serde_json::from_slice::<Value>(&bytes).expect("json")
+        };
+        let body = snapshot().await;
 
         let keys = |value: &Value| {
             let mut keys: Vec<String> =
@@ -218,9 +214,19 @@ fn snapshot_json_shape_is_pinned() {
         );
         assert_eq!(body["peers"][0]["role"], "zone");
         assert_eq!(body["peers"][0]["zone"], "unknown");
-        // A wait is shown exactly while an answer is awaited.
-        let peer = &body["peers"][0];
-        assert_eq!(peer["unanswered_ms"].is_null(), peer["answer"] == "settled");
+        // A wait is shown exactly while an answer is awaited: none before
+        // the first send, and from the heartbeat that sends a hit.
+        assert_eq!(body["peers"][0]["answer"], "settled");
+        assert!(body["peers"][0]["unanswered_ms"].is_null());
+        let fingerprint = rule_table.rules()[0].fingerprint();
+        (client
+            .record(fingerprint, KeyHash(2), 0, 1, 1_000_000, 0)
+            .await)
+            .expect("recorded");
+        tokio::time::sleep(tick + tick / 2).await;
+        let peer = &snapshot().await["peers"][0];
+        assert_eq!(peer["answer"], "owed");
+        assert_eq!(peer["unanswered_ms"], tick.as_millis() as u64 / 2);
         assert_eq!(
             keys(&body["rules"][0]),
             [

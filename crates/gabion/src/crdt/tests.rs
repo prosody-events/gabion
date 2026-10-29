@@ -1986,3 +1986,31 @@ fn cell_store_interns_every_rule_at_construction() {
         );
     }
 }
+
+/// This node's own cell that comes back from a flagged packet, raised or not,
+/// stays on the own list and never joins the relay list: no cell is on both.
+#[test]
+fn own_cell_marked_all_is_never_relayed() {
+    let mut store = quickcheck_store();
+    let fingerprint = 0x100;
+    let mut sink = DeltaSink::with_capacity(1);
+    let mut obs = ObservationBatch::with_capacity(1);
+    let (origin, incarnation) = (local().node_id.0, local().incarnation);
+    for count in [1, 3, 3] {
+        obs.clear();
+        obs.push(observation(
+            fingerprint,
+            7,
+            0,
+            origin,
+            incarnation,
+            count,
+            0,
+        ));
+        store.merge_remote(&obs, &mut sink, RelayMark::All);
+        sink.clear();
+        assert_eq!(store.head(Stream::Relay), 0, "{count}");
+        assert_eq!(backward(&store, Stream::Relay, 4), []);
+        assert_eq!(backward(&store, Stream::Own, 4).len(), 1);
+    }
+}

@@ -5,6 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::pin;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
@@ -34,6 +35,9 @@ pub(super) struct Wire {
     pub recv_buffer: Cell<Option<usize>>,
     /// The waker the last read of an empty queue armed.
     pub armed: RefCell<Option<Waker>>,
+    /// The runtime's waker while [`Wire::stall`] keeps it from being polled.
+    stalled: RefCell<Option<Waker>>,
+    stalling: Cell<bool>,
 }
 
 impl Wire {
@@ -42,6 +46,28 @@ impl Wire {
         let attempts = self.attempts.borrow();
         attempts.iter().filter(|a| a.accepted).cloned().collect()
     }
+
+    /// Stop polling the runtime, as a stalled thread would, or resume it.
+    /// Time, peers and the socket go on meanwhile.
+    pub fn stall(&self, on: bool) {
+        self.stalling.set(on);
+        if !on && let Some(waker) = self.stalled.take() {
+            waker.wake();
+        }
+    }
+}
+
+/// Run `runtime`, except while `wire` is stalled.
+pub(super) async fn gated<F: Future>(wire: Rc<Wire>, runtime: F) -> F::Output {
+    let mut runtime = pin!(runtime);
+    std::future::poll_fn(|cx| {
+        if wire.stalling.get() {
+            wire.stalled.replace(Some(cx.waker().clone()));
+            return Poll::Pending;
+        }
+        runtime.as_mut().poll(cx)
+    })
+    .await
 }
 
 pub(super) struct MockTransport(pub Rc<Wire>);

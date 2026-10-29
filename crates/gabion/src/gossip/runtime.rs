@@ -33,14 +33,16 @@ use crate::throttle;
 use crate::wire::{
     self, AckInfo, CellPayload, DecodeError, Header, Packets, Payload, StreamRange, WireScratch,
 };
-use crate::zone::{ZoneHash, ZoneName};
+use crate::zone::ZoneName;
 
 use super::admin::{AdminCommand, AdminSnapshot, GossipCounters};
 use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
-use super::peer::{Contact, Failover, GapDue, Insert, PeerFlags, PeerTable, Role, Stall};
+use super::peer::{
+    Contact, Failover, GapDue, Insert, PeerFlags, PeerTable, PerStream, Role, Stall,
+};
 use super::store::AggregateStore;
 use super::sweep::{Accept, Sweep, SweepWant, Sweeps};
 #[cfg(feature = "transport-udp")]
@@ -95,12 +97,9 @@ where
     obs_buf: ObservationBatch,
     sink_buf: DeltaSink,
     expiration_buf: ExpirationSink,
-    /// One frame per stream, indexed by [`Stream`]; a sweep page uses the
-    /// own stream's.
-    frames: [Frame; 2],
+    /// One frame per stream; a sweep page uses the own stream's.
+    frames: PerStream<Frame>,
     outbox: Outbox,
-    /// This node's zone, announced in every header.
-    zone: Option<ZoneHash>,
     /// Most of the zone peers this node has heard are suspect: every packet
     /// says it cannot relay. Judged at each heartbeat.
     cannot_relay: bool,
@@ -244,7 +243,10 @@ where
             handles: Vec::with_capacity(config.quantum.get()),
             from: None,
         };
-        let frames = [frame(), frame()];
+        let frames = PerStream {
+            own: frame(),
+            relay: frame(),
+        };
         let expiration_buf = ExpirationSink::with_capacity(defaults::GOSSIP_EXPIRATION_BATCH);
         let outbox = Outbox::new(&config);
 
@@ -252,12 +254,9 @@ where
         let local_key = hash_fingerprint(store.local_identity().node_id.0);
         let rto_ms = config.tick_interval.as_millis() as u64;
         let suspect_after = config.suspect_after.0.get();
-        let mut peers =
-            PeerTable::with_capacity(config.peer_capacity, local_key, rto_ms, suspect_after);
         let zone = config.zone.as_ref().map(ZoneName::hash);
-        if let Some(zone) = zone {
-            peers.set_local_zone(zone);
-        }
+        let peers =
+            PeerTable::with_capacity(config.peer_capacity, local_key, zone, rto_ms, suspect_after);
         let inbound_budget = transport.recv_buffer_bytes().map_or(usize::MAX, |bytes| {
             (bytes / GOSSIP_MIN_DATAGRAM_CHARGE).max(1)
         });
@@ -284,7 +283,6 @@ where
             expiration_buf,
             frames,
             outbox,
-            zone,
             cannot_relay: false,
             peers,
             inbound_budget,
@@ -557,15 +555,15 @@ where
         };
         let relay_head = self.store.head(Stream::Relay);
         self.merge(mark);
-        let heads = [self.store.head(Stream::Own), self.store.head(Stream::Relay)];
+        let heads = self.heads();
         let incarnation = self.store.local_identity().incarnation;
         let credit = self.peers.credit(row, header.acks, incarnation, heads, now);
-        self.counters.rto_rewinds_own += u64::from(credit.answer_rewound[0]);
-        self.counters.rto_rewinds_relay += u64::from(credit.answer_rewound[1]);
+        self.counters.rto_rewinds_own += u64::from(credit.answer_rewound.own);
+        self.counters.rto_rewinds_relay += u64::from(credit.answer_rewound.relay);
         if probe {
             self.peers.set_flag(row, PeerFlags::REPLY_DUE, true);
         }
-        self.prompt_work |= heads[1] > relay_head
+        self.prompt_work |= heads.relay > relay_head
             || credit.resend_relay
             || self.peers.stale()
             || self.sweep_due()
@@ -768,9 +766,7 @@ where
                 self.prompt_work = true;
             }
             // A configured or already learned zone wins.
-            PeerEvent::OwnEntry { zone } if self.zone.is_none() => {
-                self.zone = Some(zone);
-                self.peers.set_local_zone(zone);
+            PeerEvent::OwnEntry { zone } if self.peers.adopt_zone(zone) => {
                 // Same-zone peers may now differ: sweep again.
                 let mut want = SweepWant::default();
                 want.due = true;
@@ -866,10 +862,9 @@ where
         self.counters.role_changes += changes;
 
         self.prompt_work = false;
-        for frame in &mut self.frames {
-            frame.from = None;
-        }
-        let heads = [self.store.head(Stream::Own), self.store.head(Stream::Relay)];
+        self.frames.own.from = None;
+        self.frames.relay.from = None;
+        let heads = self.heads();
         let len = self.peers.len();
         for step in 0..len {
             let row = (self.next_peer + step) % len;
@@ -905,19 +900,26 @@ where
     /// to a suspect, or to a peer owed nothing), report due gaps, send the
     /// streams its role gets, and send owed acks or probe answers alone when
     /// no data carries them.
-    fn serve_row(&mut self, kind: Round, row: usize, now: u64, heads: [u64; 2]) {
+    fn serve_row(&mut self, kind: Round, row: usize, now: u64, heads: PerStream<u64>) {
         let role = self.peers.role(row);
         if role == Role::Incompatible {
             return;
         }
+        // A row not due has fired no timer: its cold state stays unread.
         let due = self.peers.due(row, now);
-        let fired = |timer: Option<u64>| due && timer.is_some_and(|at| at <= now);
-        let own_retry = fired(self.peers.own_timer(row));
-        let relay_retry = fired(self.peers.relay_timer(row));
-        let own_in_flight = role != Role::Remote && self.peers.tx(row, Stream::Own).in_flight();
-        let suspect = self.peers.suspect(row);
-        let probe_only =
-            (own_retry || relay_retry) && (suspect || (!own_in_flight && !relay_retry));
+        let fired = |timer: Option<u64>| timer.is_some_and(|at| at <= now);
+        let (own_retry, relay_retry) = if due {
+            let peers = &self.peers;
+            (fired(peers.own_timer(row)), fired(peers.relay_timer(row)))
+        } else {
+            (false, false)
+        };
+        let suspect = (own_retry || relay_retry) && self.peers.suspect(row);
+        // A retry with nothing in flight is a liveness probe.
+        let probe_only = suspect
+            || (own_retry
+                && !relay_retry
+                && (role == Role::Remote || !self.peers.tx(row, Stream::Own).in_flight()));
         for (stream, retry, counter) in [
             (Stream::Own, own_retry, &mut self.counters.rto_rewinds_own),
             (
@@ -941,14 +943,20 @@ where
         let reports = if due {
             self.peers.take_reports(row, now, floor)
         } else {
-            [GapDue::Nothing; 2]
+            PerStream {
+                own: GapDue::Nothing,
+                relay: GapDue::Nothing,
+            }
         };
-        for (stream, report) in [Stream::Own, Stream::Relay].into_iter().zip(reports) {
-            if let GapDue::Abandoned { missing } = report {
+        for stream in [Stream::Own, Stream::Relay] {
+            if let GapDue::Abandoned { missing } = reports[stream] {
                 self.note_gap_abandoned(row, stream, missing);
             }
         }
-        let gaps = reports.map(|report| report == GapDue::Report);
+        let gaps = PerStream {
+            own: reports.own == GapDue::Report,
+            relay: reports.relay == GapDue::Report,
+        };
 
         let flags = self.peers.flags(row);
         let resend_own = own_retry && !probe_only;
@@ -956,25 +964,25 @@ where
         if role != Role::Remote
             && (kind != Round::Prompt || resend_own || flags.has(PeerFlags::RESEND_OWN))
         {
-            let closed = self.send_stream(Stream::Own, row, heads[0], gaps, resend_own, now);
+            let closed = self.send_stream(Stream::Own, row, heads.own, gaps, resend_own, now);
             // A stream capped by the quantum goes on in the next prompt round.
             self.peers.set_flag(
                 row,
                 PeerFlags::RESEND_OWN,
-                closed.is_some_and(|c| c < heads[0]),
+                closed.is_some_and(|c| c < heads.own),
             );
             sent_any |= closed.is_some();
         }
         if role == Role::Zone {
             let resend = relay_retry && !probe_only;
-            let closed = self.send_stream(Stream::Relay, row, heads[1], gaps, resend, now);
-            self.prompt_work |= closed.is_some_and(|c| c < heads[1]);
+            let closed = self.send_stream(Stream::Relay, row, heads.relay, gaps, resend, now);
+            self.prompt_work |= closed.is_some_and(|c| c < heads.relay);
             sent_any |= closed.is_some();
         }
         // Data asks for an answer too, so only a suspect is probed beside it.
         let probe = probe_only && (suspect || !sent_any);
         let ack_due = kind == Round::Heartbeat && flags.has(PeerFlags::ACK_DUE);
-        let owed = gaps.contains(&true) || ack_due || flags.has(PeerFlags::REPLY_DUE);
+        let owed = gaps.any() || ack_due || flags.has(PeerFlags::REPLY_DUE);
         if probe || (!sent_any && owed) {
             let header = self.header_for(row, gaps, Payload::Ack { probe });
             let dst = self.peers.addr(row);
@@ -988,7 +996,7 @@ where
             self.peers.set_flag(row, PeerFlags::ACK_DUE, false);
             self.peers.set_flag(row, PeerFlags::REPLY_DUE, false);
         }
-        self.counters.gap_reports_sent += gaps.iter().filter(|&&gap| gap).count() as u64;
+        self.counters.gap_reports_sent += u64::from(gaps.own) + u64::from(gaps.relay);
         if due || sent_any {
             self.peers.refresh_deadline(row);
         }
@@ -1006,7 +1014,7 @@ where
         stream: Stream,
         row: usize,
         head: u64,
-        gaps: [bool; 2],
+        gaps: PerStream<bool>,
         probe: bool,
         now: u64,
     ) -> Option<u64> {
@@ -1015,7 +1023,7 @@ where
             return None;
         }
         let quantum = self.config.quantum.get();
-        let frame = &mut self.frames[stream as usize];
+        let frame = &mut self.frames[stream];
         if frame.from != Some(sent) {
             self.store
                 .stream_after(stream, sent, quantum, &mut frame.handles);
@@ -1038,7 +1046,7 @@ where
         };
         let header = self.header_for(row, gaps, payload);
         let dst = self.peers.addr(row);
-        let handles = &self.frames[stream as usize].handles;
+        let handles = &self.frames[stream].handles;
         let (closed, sent) = if handles.is_empty() {
             let sent =
                 (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
@@ -1058,6 +1066,14 @@ where
         Some(closed)
     }
 
+    /// Both streams' heads.
+    fn heads(&self) -> PerStream<u64> {
+        PerStream {
+            own: self.store.head(Stream::Own),
+            relay: self.store.head(Stream::Relay),
+        }
+    }
+
     /// Count a send to `row`: its bytes when the peer is in another known
     /// zone, and the wait for an answer it may start.
     fn account(&mut self, row: usize, sent: Sent, asks: bool, now: u64) {
@@ -1069,18 +1085,18 @@ where
 
     /// A header to `row`, carrying this node's zone, its acks for the peer's
     /// streams as of the peer's incarnation this node knows, and its signals.
-    fn header_for<P>(&self, row: usize, gaps: [bool; 2], payload: P) -> Header<P> {
+    fn header_for<P>(&self, row: usize, gaps: PerStream<bool>, payload: P) -> Header<P> {
         let link = self.peers.link(row);
         Header {
             cluster_id_hash: self.config.cluster_id_hash,
             sender: self.store.local_identity(),
-            sender_zone: self.zone,
+            sender_zone: self.peers.local_zone(),
             acks: AckInfo {
                 incarnation: link.identity.map_or(0, |identity| identity.incarnation),
                 own: link.own_ack(),
                 relay: link.relay_ack(),
-                gap_own: gaps[0],
-                gap_relay: gaps[1],
+                gap_own: gaps.own,
+                gap_relay: gaps.relay,
                 cannot_relay: self.cannot_relay,
                 probe_reply: self.peers.flags(row).has(PeerFlags::REPLY_DUE),
             },
@@ -1146,9 +1162,15 @@ where
             let Some(row) = self.peers.find(ask.addr) else {
                 continue;
             };
-            let header = self.header_for(row, [false; 2], Payload::SweepRequest);
-            self.outbox
-                .send_header(&header, ask.addr, now, &self.transport, &mut self.counters);
+            let header = self.header_for(row, PerStream::default(), Payload::SweepRequest);
+            let sent = (self.outbox).send_header(
+                &header,
+                ask.addr,
+                now,
+                &self.transport,
+                &mut self.counters,
+            );
+            self.account(row, sent, false, now);
             ask.tries += 1;
             self.counters.sweeps_requested += 1;
         }
@@ -1195,8 +1217,7 @@ where
     /// by a held packet is sent again whole: pages are max-merges.
     fn serve_sweeps(&mut self, now: u64) {
         // Pages overwrite the own frame: none survives them.
-        let frame = &mut self.frames[Stream::Own as usize];
-        frame.from = None;
+        self.frames.own.from = None;
         for i in 0..self.sweeps.limit() {
             let Some(Sweep { dst, next_slot }) = self.sweeps.get(i) else {
                 continue;
@@ -1209,7 +1230,7 @@ where
                 self.sweeps.advance(i, None);
                 continue;
             };
-            let handles = &mut self.frames[Stream::Own as usize].handles;
+            let handles = &mut self.frames.own.handles;
             handles.clear();
             handles.extend(self.store.active_handles(next_slot).take(self.sweep_page));
             let cells = handles.len();
@@ -1218,11 +1239,11 @@ where
                 continue;
             }
             // A store with no live cell still answers with one empty page.
-            let header = self.header_for(row, [false; 2], CellPayload::Sweep);
-            let handles = &self.frames[Stream::Own as usize].handles;
-            if cells == 0 {
+            let header = self.header_for(row, PerStream::default(), CellPayload::Sweep);
+            let handles = &self.frames.own.handles;
+            let sent = if cells == 0 {
                 self.outbox
-                    .send_header(&header, dst, now, &self.transport, &mut self.counters);
+                    .send_header(&header, dst, now, &self.transport, &mut self.counters)
             } else {
                 let packets = Packets::new(
                     header,
@@ -1231,14 +1252,16 @@ where
                     &mut self.scratch,
                     self.config.wire_limits,
                 );
-                self.outbox
-                    .send_frame(packets, dst, now, &self.transport, &mut self.counters);
-            }
+                (self.outbox)
+                    .send_frame(packets, dst, now, &self.transport, &mut self.counters)
+                    .1
+            };
+            self.account(row, sent, false, now);
             if self.outbox.is_held() {
                 return;
             }
             self.counters.sweep_cells_sent += cells as u64;
-            let next = match self.frames[Stream::Own as usize].handles.last() {
+            let next = match self.frames.own.handles.last() {
                 Some(last) if cells == self.sweep_page => Some(last.index + 1),
                 _ => None,
             };

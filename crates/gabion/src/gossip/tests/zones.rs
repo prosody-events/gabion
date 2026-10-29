@@ -151,7 +151,7 @@ fn own_packets(packets: &[(SocketAddr, Header)]) -> Vec<(SocketAddr, u64, bool)>
 /// Twelve nodes in three zones of four, all on one address prefix (as a
 /// wildcard bind gives; zones come from the setting, never the address): an
 /// origin sends its own stream directly to its three zone peers and, flagged,
-/// to one gateway in each other zone, which relays it. This is also SIM11.
+/// to one gateway in each other zone, which relays it.
 #[test]
 fn three_zones_send_direct_in_zone_and_one_gateway_each() {
     run_paused(async {
@@ -690,6 +690,41 @@ fn first_member_of_a_new_zone_sweeps_from_any_zone() {
         nodes.push(x);
         stop_all(nodes).await;
     });
+}
+
+/// A gateway that forgot its origin's stream (discovery removed and re-added
+/// the origin, with no restart) reports a flagged gap from 0: the origin
+/// rewinds below its `acked` and resends flagged, the gap closes instead of
+/// being abandoned, and the zone ends exact.
+#[test]
+fn gateway_that_forgot_the_stream_is_resynced() {
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let router = SimRouter::new();
+            let addrs = addrs(48_900, 3);
+            let zones = ["a", "b", "b"];
+            let nodes: Vec<_> = (0..3)
+                .map(|i| zoned_node(&router, &addrs, &zones, i))
+                .collect();
+            nodes[0].hits(1..4).await;
+            run_for(300).await;
+            let gateway = gateway_of(&nodes[0], "b").await;
+            let g = nodes.iter().find(|node| node.addr == gateway).unwrap();
+            let reports = g.counters().await.gap_reports_sent;
+            g.tell(PeerEvent::Removed(Peer::new(addrs[0])));
+            g.tell(PeerEvent::Added(Peer::new(addrs[0])));
+            run_for(1).await;
+            nodes[0].hits(4..6).await;
+            run_for(300).await;
+            let counters = g.counters().await;
+            assert_eq!(counters.gaps_abandoned, 0);
+            assert!(counters.gap_reports_sent > reports);
+            assert_eq!(nodes[0].peer(gateway).await.own_unacked, 0);
+            assert_totals(&[&nodes[0], &nodes[1], &nodes[2]], 5);
+            stop_all(nodes).await;
+        })
+    });
+    assert_logged(&logs, "gap_abandoned", 0, &[]);
 }
 
 /// O cannot reach its gateway G, which still reaches O: G's packets repeat
@@ -1326,83 +1361,237 @@ fn cannot_relay_from_a_zone_row_is_ignored() {
     }
 }
 
-/// A gateway that answers each probed retry within a millisecond and anything
-/// else at its own heartbeat, 50 ms after this node's: three lost attempts in
-/// a row never fail it over, and a fourth fails it over exactly once, at the
-/// heartbeat `suspect_after` after the first.
+/// An idle gateway, `suspect_after` four heartbeats: it answers each
+/// probed retry within a millisecond and anything else at its own heartbeat,
+/// 50 ms after this node's, and the first `withheld` probes to it are lost.
+/// Each heartbeat of this node runs `late(at)` ms after the instant `at` it
+/// was scheduled for. Returns the failovers, and how long after the first
+/// lost probe the first one came.
+async fn lost_attempts(withheld: usize, late: impl Fn(u64) -> u64) -> (u64, Option<u64>) {
+    let (g1, g2) = (sock(2), sock(3));
+    let wire = Rc::new(Wire::default());
+    let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
+    let (_client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+    introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
+    // Which member ranks first is known once they are heard; until then
+    // nothing is probed.
+    let (mut seen, mut lost) = (0, 0);
+    let mut gateway = None;
+    let mut due: Vec<(u64, SocketAddr, NodeIdentity)> = Vec::new();
+    let (mut first_lost, mut failed_over_at) = (None, None);
+    let mut resume_at = None;
+    for t in 10..1_500_u64 {
+        if resume_at == Some(t) {
+            resume_at = None;
+            wire.stall(false);
+            tokio::task::yield_now().await;
+        }
+        // A stalled runtime answers no snapshot.
+        let running = resume_at.is_none();
+        if gateway.is_none() && running {
+            let peers = admin_snapshot(&admin).await.peers;
+            gateway = peers
+                .iter()
+                .find(|p| p.role == Role::Gateway)
+                .map(|p| p.addr);
+        }
+        let attempts = wire.attempts.borrow()[seen..].to_vec();
+        seen += attempts.len();
+        for a in attempts {
+            let header = header_of(&a.bytes);
+            let probe = header.payload == Payload::Ack { probe: true };
+            let peer = if a.dst == g1 { node(0xB) } else { node(0xC) };
+            if Some(a.dst) == gateway && probe && lost < withheld {
+                first_lost.get_or_insert(t);
+                lost += 1;
+                continue;
+            }
+            let at = if probe {
+                t + 1
+            } else {
+                t + (150 - t % 100) % 100
+            };
+            due.push((at, a.dst, peer));
+        }
+        for &(_, dst, peer) in due.iter().filter(|(at, ..)| *at == t) {
+            let acks = AckInfo {
+                incarnation: 1,
+                probe_reply: true,
+                ..AckInfo::default()
+            };
+            inject_zoned(
+                &wire,
+                dst,
+                peer,
+                Some(zone("b")),
+                acks,
+                Payload::Ack { probe: false },
+            );
+        }
+        due.retain(|(at, ..)| *at > t);
+        wake(&wire);
+        let heartbeat = t + 1;
+        if heartbeat.is_multiple_of(100) && late(heartbeat) > 0 {
+            tokio::task::yield_now().await;
+            wire.stall(true);
+            resume_at = Some(heartbeat + late(heartbeat));
+        }
+        sim_advance(Duration::from_millis(1)).await;
+        if failed_over_at.is_none() && resume_at.is_none() {
+            let counters = admin_snapshot(&admin).await.counters;
+            if counters.gateway_failovers > 0 {
+                failed_over_at = Some(t + 1);
+            }
+        }
+    }
+    wire.stall(false);
+    let counters = admin_snapshot(&admin).await.counters;
+    let after = failed_over_at.zip(first_lost).map(|(at, since)| at - since);
+    (counters.gateway_failovers, after)
+}
+
+/// Three lost attempts in a row never fail the gateway over, and a fourth
+/// fails it over exactly once, at the heartbeat `suspect_after` after the
+/// first: seen within the millisecond it left, judged exactly then.
 #[test]
 fn three_lost_attempts_never_suspect() {
     for (withheld, failovers) in [(3, 0), (4, 1)] {
-        run_paused(async {
-            let (g1, g2) = (sock(2), sock(3));
-            let wire = Rc::new(Wire::default());
-            let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
-            let (_client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
-            introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
-            // Which member ranks first is known once they are heard; until
-            // then nothing is probed.
-            let (mut seen, mut lost) = (0, 0);
-            let mut gateway = None;
-            let mut due: Vec<(u64, SocketAddr, NodeIdentity)> = Vec::new();
-            let (mut first_lost, mut failed_over_at) = (None, None);
-            for t in 10..1_500_u64 {
-                if gateway.is_none() {
-                    let peers = admin_snapshot(&admin).await.peers;
-                    gateway = peers
-                        .iter()
-                        .find(|p| p.role == Role::Gateway)
-                        .map(|p| p.addr);
-                }
-                let attempts = wire.attempts.borrow()[seen..].to_vec();
-                seen += attempts.len();
-                for a in attempts {
-                    let header = header_of(&a.bytes);
-                    let probe = header.payload == Payload::Ack { probe: true };
-                    let peer = if a.dst == g1 { node(0xB) } else { node(0xC) };
-                    if Some(a.dst) == gateway && probe && lost < withheld {
-                        first_lost.get_or_insert(t);
-                        lost += 1;
-                        continue;
-                    }
-                    let at = if probe {
-                        t + 1
-                    } else {
-                        t + (150 - t % 100) % 100
-                    };
-                    due.push((at, a.dst, peer));
-                }
-                for &(_, dst, peer) in due.iter().filter(|(at, ..)| *at == t) {
-                    let acks = AckInfo {
-                        incarnation: 1,
-                        probe_reply: true,
-                        ..AckInfo::default()
-                    };
-                    inject_zoned(
-                        &wire,
-                        dst,
-                        peer,
-                        Some(zone("b")),
-                        acks,
-                        Payload::Ack { probe: false },
-                    );
-                }
-                due.retain(|(at, ..)| *at > t);
-                wake(&wire);
-                sim_advance(Duration::from_millis(1)).await;
-                let counters = admin_snapshot(&admin).await.counters;
-                if failed_over_at.is_none() && counters.gateway_failovers > 0 {
-                    failed_over_at = Some(t + 1);
-                }
-            }
-            let counters = admin_snapshot(&admin).await.counters;
-            assert_eq!(counters.gateway_failovers, failovers, "{withheld}");
-            if failovers == 1 {
-                // Seen within the millisecond it left, judged exactly then.
-                let since = first_lost.unwrap();
-                assert!((since - 1..=since).contains(&(failed_over_at.unwrap() - 400)));
-            }
-        });
+        let (failed_over, after) = run_paused(lost_attempts(withheld, |_| 0));
+        assert_eq!(failed_over, failovers, "{withheld}");
+        if failovers == 1 {
+            assert!(after.is_some_and(|after| (399..=400).contains(&after)));
+        }
     }
+}
+
+/// As [`three_lost_attempts_never_suspect`], with every heartbeat of this
+/// node 0 to 4 ms late, within `F_r`: each is still stamped with its
+/// scheduled instant, so no retry slips to the next heartbeat and the counts
+/// hold.
+#[test]
+fn late_heartbeats_keep_one_retry_per_heartbeat() {
+    let late = |at: u64| [3, 0, 4, 1, 2][(at / 100 % 5) as usize];
+    for (withheld, failovers) in [(3, 0), (4, 1)] {
+        let (failed_over, _) = run_paused(lost_attempts(withheld, late));
+        assert_eq!(failed_over, failovers, "{withheld}");
+    }
+}
+
+/// A node whose runtime is not polled for three `suspect_after` while its
+/// peers answer reads those answers before it judges anyone: on resume no
+/// peer is suspect, no gateway failed over, and the relay to its zone peer is
+/// not reported stalled.
+#[test]
+fn local_stall_suspects_nobody() {
+    run_paused(async {
+        let (z, o, p) = (sock(2), sock(3), sock(4));
+        let origin = NodeIdentity::new(NodeId(0xD), 1);
+        let wire = Rc::new(Wire::default());
+        let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
+        let (_client, admin) = scripted(&wire, vec![z, o, p], "a", tune).await;
+        introduce(
+            &wire,
+            &[(z, node(0xB), "a"), (o, origin, "b"), (p, node(0xC), "b")],
+        );
+        // At 100 the zone-b gateway is probed; O's flagged cells then go on
+        // to Z, both owed an answer when the runtime stalls.
+        heartbeats(1).await;
+        for packet in cell_packets(origin, 0, 3, true) {
+            wire.inbound.borrow_mut().push_back((packet, o));
+        }
+        wake(&wire);
+        sim_advance_ticks(Duration::from_millis(1), 10).await;
+        assert_eq!(relayed_cells(&wire, z, 0), 3);
+        wire.stall(true);
+        let answer = |relay| AckInfo {
+            incarnation: 1,
+            relay,
+            probe_reply: true,
+            ..AckInfo::default()
+        };
+        let ack = Payload::Ack { probe: false };
+        inject_zoned(&wire, z, node(0xB), Some(zone("a")), answer(3), ack);
+        inject_zoned(&wire, o, origin, Some(zone("b")), answer(0), ack);
+        inject_zoned(&wire, p, node(0xC), Some(zone("b")), answer(0), ack);
+        heartbeats(12).await;
+        wire.stall(false);
+        sim_advance_ticks(Duration::from_millis(1), 10).await;
+        let snapshot = admin_snapshot(&admin).await;
+        let peers = &snapshot.peers;
+        assert!(
+            peers.iter().all(|peer| peer.answer != AnswerState::Suspect),
+            "{peers:?}"
+        );
+        let counters = snapshot.counters;
+        assert_eq!((counters.gateway_failovers, counters.relay_stalls), (0, 0));
+    });
+}
+
+/// A dead gateway behind a socket that refuses every send for twice
+/// `suspect_after` is not judged during the hold, and once sends leave again
+/// it fails over within `suspect_after + T + 2 · F_r`.
+#[test]
+fn dead_gateway_fails_over_soon_after_backpressure_ends() {
+    run_paused(async {
+        let (g1, g2) = (sock(2), sock(3));
+        let wire = Rc::new(Wire::default());
+        let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
+        let (_client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+        introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
+        // The idle gateway's probe at 100 is never answered.
+        heartbeats(1).await;
+        wire.refuse.set(true);
+        heartbeats(8).await;
+        let snapshot = admin_snapshot(&admin).await;
+        assert_eq!(snapshot.counters.gateway_failovers, 0);
+        let peers = &snapshot.peers;
+        assert!(
+            peers.iter().all(|peer| peer.answer != AnswerState::Suspect),
+            "{peers:?}"
+        );
+        wire.refuse.set(false);
+        let mut after = 0;
+        while admin_snapshot(&admin).await.counters.gateway_failovers == 0 {
+            assert!(
+                after < 400 + 100 + 2 * 5,
+                "no failover {after} ms after the release"
+            );
+            sim_advance(Duration::from_millis(1)).await;
+            after += 1;
+        }
+    });
+}
+
+/// A join sweep's request and its pages to a peer of another zone count as
+/// cross-zone bytes, like every other packet to it.
+#[test]
+fn sweeps_to_another_zone_count_as_cross_zone_bytes() {
+    run_paused(async {
+        let s = sock(2);
+        let wire = Rc::new(Wire::default());
+        let (client, admin) = scripted(&wire, vec![s], "a", |_| {}).await;
+        hit(&client, 1).await;
+        // S is heard, in zone b, and asks for a sweep; alone in its zone,
+        // this node asks S for one too.
+        for payload in [Payload::Ack { probe: false }, Payload::SweepRequest] {
+            inject_zoned(
+                &wire,
+                s,
+                node(0xB),
+                Some(zone("b")),
+                AckInfo::default(),
+                payload,
+            );
+        }
+        heartbeats(1).await;
+        sim_advance_ticks(Duration::from_millis(1), 10).await;
+        let sent = sent_payloads(&wire, 0);
+        assert!(sent.contains(&(s, Payload::SweepRequest)), "{sent:?}");
+        assert!(sent.contains(&(s, CellPayload::Sweep.into())), "{sent:?}");
+        let bytes: u64 = wire.accepted().iter().map(|a| a.bytes.len() as u64).sum();
+        let counters = admin_snapshot(&admin).await.counters;
+        assert_eq!(counters.bytes_sent_cross_zone, bytes);
+    });
 }
 
 /// A gateway whose `suspect_after` ends between heartbeats, when no retry is
