@@ -607,9 +607,13 @@
     border-left: 1px solid var(--color-border-line);
   }
 
+  /* A size container, so the dashboard can tell when its charts no longer
+     fit together; then the body scrolls under the pinned headline. */
   .rail-body {
     flex: 1;
     min-height: 0;
+    overflow-y: auto;
+    container-type: size;
   }
 
   @media (width >= 640px) {
@@ -625,7 +629,7 @@
   /* The charts and the inspector share one slot, so the detail rail sits under
      the stage on the left and the controls take the right column. The stage
      keeps the larger row, since its ring scales with its height; the rail is
-     too short to fit the charts at a legible height either way, so it scrolls. */
+     too short for both charts, so the first fills it and the rest scroll. */
   @media (640px <= width < 1100px) {
     .workspace {
       grid-template-columns: minmax(0, 1fr) clamp(220px, 32%, 280px);
@@ -634,28 +638,21 @@
         'detail rail';
       grid-template-rows: minmax(0, 3fr) minmax(0, 2fr);
     }
-
-    .detail-rail {
-      overflow: auto;
-    }
-  }
-
-  /* Below 1100 px the rail body gets a definite height, because the dashboard
-     sizes its charts from `height: 100%` rows, which collapse under an
-     auto-height parent. */
-  @media (width < 1100px) {
-    .rail-body {
-      flex: none;
-      height: 32rem;
-    }
   }
 
   /* One scrolling column. `main` keeps a height so the absolutely positioned
      loading and error overlay stays visible; the square stage keeps the ring
-     the same shape at every width. */
+     the same shape at every width. The rail body gets a definite height,
+     because the dashboard sizes its charts from `height: 100%` rows, which
+     collapse under an auto-height parent. */
   @media (width < 640px) {
     main {
       min-height: 50vh;
+    }
+
+    .rail-body {
+      flex: none;
+      height: 32rem;
     }
 
     .workspace {

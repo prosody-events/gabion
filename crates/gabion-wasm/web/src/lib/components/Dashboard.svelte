@@ -91,6 +91,17 @@
     grid-template-rows: 1.6fr 1fr 1fr;
   }
 
+  /* Too short for every chart at a legible height: each chart fills the body
+     and the next follows below it, reached by scrolling the body. */
+  @container (height < 20rem) {
+    .dashboard,
+    .dashboard.with-limit {
+      grid-template-rows: none;
+      grid-auto-rows: 100%;
+      overflow: visible;
+    }
+  }
+
   .panel {
     min-height: 0;
     display: flex;

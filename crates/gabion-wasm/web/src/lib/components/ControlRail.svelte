@@ -357,10 +357,12 @@
     color: var(--color-fg);
   }
 
-  /* Add and Remove on one 8-pt row, equal halves — the inverse-pair reading. */
+  /* Add and Remove on one 8-pt row, equal halves — the inverse-pair reading.
+     `minmax(0, 1fr)` keeps the halves inside the rail at its narrowest, where
+     the 8-px padding still fits each label. */
   .cluster-actions {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: var(--gap-sm);
   }
 
@@ -369,7 +371,7 @@
     align-items: center;
     justify-content: center;
     gap: 0.4em;
-    padding: var(--gap-sm) var(--gap-md);
+    padding: var(--gap-sm);
     border: 1px solid var(--color-border-line);
     border-radius: var(--radius);
     background: var(--color-bg);

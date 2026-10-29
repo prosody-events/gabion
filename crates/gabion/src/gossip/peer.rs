@@ -305,8 +305,8 @@ pub(super) struct PeerLink {
 }
 
 // 128 bytes: the fields take 120 (`Option<NodeIdentity>` 48 at `u128`
-// alignment, the inbound mark 40) and pad to 128, the per-row cost the
-// `gossip.peer_capacity` warning quotes.
+// alignment, the inbound mark 40) and pad to 128: the peer row's share of
+// the about-200-byte per-slot cost the `gossip.peer_capacity` warning quotes.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<PeerLink>() == 128);
 
