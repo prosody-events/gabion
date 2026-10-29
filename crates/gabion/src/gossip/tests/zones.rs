@@ -337,9 +337,9 @@ fn gateway_cut_from_its_zone_is_replaced() {
 }
 
 /// A gateway that cannot reach one member of three keeps the role; its relay
-/// to that member is resent every heartbeat until the member is suspect,
-/// then probed with one header-only packet per heartbeat, logged once as
-/// stalled, and the member catches up as soon as the path heals.
+/// to that member is resent with `PROBE` every heartbeat until the member is
+/// suspect, then probed with one header-only packet per heartbeat, logged once
+/// as stalled, and the member catches up as soon as the path heals.
 #[test]
 fn minority_cut_heals_and_warns() {
     let (member, logs) = with_logs(|| {
@@ -371,12 +371,14 @@ fn minority_cut_heals_and_warns() {
                 .position(|header| header.payload == Payload::Ack { probe: true })
                 .expect("probes once suspect");
             assert!(probes >= 3, "{to_m:?}");
-            assert!(
-                to_m[..probes].iter().all(|header| matches!(
+            // The relay frame, then its resends, each with `PROBE`.
+            for (i, header) in to_m[..probes].iter().enumerate() {
+                let relay = matches!(
                     header.payload,
-                    Payload::Cells(CellPayload::Relay { .. })
-                ))
-            );
+                    Payload::Cells(CellPayload::Relay { probe, .. }) if probe == (i > 0)
+                );
+                assert!(relay, "{to_m:?}");
+            }
             assert!(
                 to_m[probes..]
                     .iter()
@@ -401,32 +403,31 @@ fn minority_cut_heals_and_warns() {
 }
 
 /// Both sides of a zone partition keep counting; on heal every node holds
-/// every hit.
+/// every hit. Zone b's one member is every origin's suspect gateway with no
+/// other member to fail over to, so only its probe answer's rewind brings
+/// zone a's hits.
 #[test]
 fn zone_partition_heals_to_exact_counts() {
     run_paused(async {
         let router = SimRouter::new();
         let addrs = addrs(47_500, 6);
-        let zones = ["a", "a", "a", "b", "b", "b"];
+        let zones = ["a", "a", "a", "a", "a", "b"];
         let nodes: Vec<_> = (0..6)
             .map(|i| zoned_node(&router, &addrs, &zones, i))
             .collect();
         run_for(1_000).await;
-        for a in 0..3 {
-            for b in 3..6 {
-                cut(&router, addrs[a], addrs[b], true);
+        let cut_all = |blocked| {
+            for a in 0..5 {
+                cut(&router, addrs[a], addrs[5], blocked);
             }
-        }
+        };
+        cut_all(true);
         for (i, node) in nodes.iter().enumerate() {
             node.hits(0..i as u128 + 1).await;
             run_for(500).await;
         }
         run_for(1_000).await;
-        for a in 0..3 {
-            for b in 3..6 {
-                cut(&router, addrs[a], addrs[b], false);
-            }
-        }
+        cut_all(false);
         run_for(1_500).await;
         assert_totals(&nodes.iter().collect::<Vec<_>>(), 21);
         stop_all(nodes).await;
@@ -465,8 +466,9 @@ fn late_zone_rewinds_the_new_recipient() {
 }
 
 /// A joiner that outranks the gateway is sent the origin's whole live own
-/// stream flagged once its zone is heard, although it already holds the
-/// cells directly, and relays them to members that never got them.
+/// stream flagged once its zone is heard, although it already holds and has
+/// acked the cells, sent directly while its zone was unknown, and relays them
+/// to members that never got them.
 #[test]
 fn joiner_that_outranks_the_gateway_relays_lost_cells() {
     run_paused(async {
@@ -485,11 +487,15 @@ fn joiner_that_outranks_the_gateway_relays_lost_cells() {
         run_for(150).await;
         let mut all = addrs.clone();
         all.push(joiner);
-        let config = zoned_config(others(&all, joiner), "b", |_| {});
+        let config = zoned_config(others(&all, joiner), "", |_| {});
         nodes.push(Node::start(&router, joiner, store_for(id(3, 1)), config));
         for node in &nodes[..3] {
             node.tell(PeerEvent::Added(Peer::new(joiner)));
         }
+        run_for(300).await;
+        assert_eq!(nodes[3].agg.total(), 10);
+        assert_eq!(nodes[0].peer(joiner).await.own_unacked, 0);
+        nodes[3].tell(PeerEvent::OwnEntry { zone: zone("b") });
         run_for(300).await;
         assert_eq!(gateway_of(&nodes[0], "b").await, joiner);
         run_for(700).await;
@@ -503,7 +509,9 @@ fn joiner_that_outranks_the_gateway_relays_lost_cells() {
 /// A gateway suspected only because it had not yet discovered the origin
 /// answers a probe once it does and is the gateway again at once, sent the
 /// origin's stream from 0 on that same round; when it dies, the other member
-/// takes over again.
+/// takes over again. When it heals, its first probe answer clears it
+/// although its old own stream is still unacked (it gets no own stream as a
+/// `Remote` row), so it is the gateway again within a heartbeat.
 #[test]
 fn transient_suspicion_clears() {
     run_paused(async {
@@ -522,28 +530,35 @@ fn transient_suspicion_clears() {
         run_for(1_500).await;
         assert_eq!(gateway_of(&origin, "b").await, addrs[2]);
         assert_eq!(origin.peer(addrs[1]).await.answer, AnswerState::Suspect);
+        let g1_restored_within = async |ms| {
+            for _ in 0..ms {
+                run_for(1).await;
+                if gateway_of(&origin, "b").await == addrs[1] {
+                    return true;
+                }
+            }
+            false
+        };
 
         let mark = taps.borrow().len();
         g1.tell(PeerEvent::Added(Peer::new(addrs[0])));
-        let mut restored = None;
-        for t in 0..2 * 100 {
-            run_for(1).await;
-            if gateway_of(&origin, "b").await == addrs[1] {
-                restored = Some(t);
-                break;
-            }
-        }
-        assert!(restored.is_some(), "G1 not restored within 2T");
+        assert!(g1_restored_within(2 * 100).await, "not within 2T");
         assert_eq!(origin.peer(addrs[1]).await.answer, AnswerState::Owed);
         run_for(2 * 5).await;
         let own = own_packets(&tapped(&taps, mark));
         assert!(own.contains(&(addrs[1], 0, true)), "{own:?}");
 
         cut(&router, addrs[0], addrs[1], true);
+        origin.hits(5..8).await;
         run_for(400 + 100 + 2 * 5 + 100).await;
         assert_eq!(gateway_of(&origin, "b").await, addrs[2]);
-        assert_eq!(g2.agg.total(), 5);
-        assert_eq!(g1.agg.total(), 5);
+        assert!(origin.peer(addrs[1]).await.own_unacked > 0);
+        cut(&router, addrs[0], addrs[1], false);
+        // The next probe, at most a heartbeat away, answered within `F_r`.
+        assert!(g1_restored_within(100 + 2 * 5).await, "not within T");
+        run_for(100).await;
+        assert_eq!(g2.agg.total(), 8);
+        assert_eq!(g1.agg.total(), 8);
         stop_all(vec![origin, g1, g2]).await;
     });
 }
@@ -678,8 +693,8 @@ fn first_member_of_a_new_zone_sweeps_from_any_zone() {
 }
 
 /// O cannot reach its gateway G, which still reaches O: G's packets repeat
-/// the stuck acks, so O fails over once and stays failed over while the cut
-/// lasts, and the other member holds O's hits.
+/// the stuck flagged ack of O's hit before the cut, so O fails over once and
+/// stays failed over while the cut lasts, and the other member holds O's hits.
 #[test]
 fn one_way_cut_to_gateway_fails_over_once() {
     run_paused(async {
@@ -693,6 +708,9 @@ fn one_way_cut_to_gateway_fails_over_once() {
         run_for(1_000).await;
         let gateway = gateway_of(&nodes[0], "b").await;
         let (g, m) = if gateway == addrs[1] { (1, 2) } else { (2, 1) };
+        nodes[0].hits(3..4).await;
+        run_for(200).await;
+        assert_eq!(nodes[0].peer(gateway).await.own_unacked, 0);
         router.set_link_policy(addrs[0], gateway, LinkPolicy::Block);
         nodes[0].hits(0..3).await;
         for t in 0..5 * 400 {
@@ -882,7 +900,7 @@ fn healed_gateway_clears_cannot_relay() {
 }
 
 /// A failover rewinds the origin's whole live stream to the new gateway,
-/// which drains on prompt rounds, a quantum each.
+/// which holds every cell after at most 21 prompt rounds, a quantum each.
 #[test]
 fn failover_drains_a_full_store_on_prompt_rounds() {
     run_paused(async {
@@ -903,26 +921,26 @@ fn failover_drains_a_full_store_on_prompt_rounds() {
             })
             .collect();
         run_for(1_000).await;
+        let gateway = gateway_of(&nodes[0], "b").await;
+        let next = if gateway == addrs[1] { 2 } else { 1 };
+        // The gateway's relay never reaches the next member, so only the
+        // failover's rewind brings O's cells there.
+        router.set_link_policy(gateway, addrs[next], LinkPolicy::Block);
         nodes[0].hits(0..CELLS).await;
         run_for(1_000).await;
-        let gateway = gateway_of(&nodes[0], "b").await;
-        let next = if gateway == addrs[1] {
-            addrs[2]
-        } else {
-            addrs[1]
-        };
         cut(&router, addrs[0], gateway, true);
         let mut before = None;
         for _ in 0..3_000 {
             run_for(1).await;
-            if before.is_none() && gateway_of(&nodes[0], "b").await == next {
+            if before.is_none() && gateway_of(&nodes[0], "b").await == addrs[next] {
                 before = Some(nodes[0].counters().await.rounds_prompt);
             }
-            if before.is_some() && nodes[0].peer(next).await.own_unacked == 0 {
+            if before.is_some() && nodes[next].agg.total() == CELLS as u64 {
                 break;
             }
         }
         let before = before.expect("a failover");
+        assert_eq!(nodes[next].agg.total(), CELLS as u64);
         let rounds = nodes[0].counters().await.rounds_prompt - before;
         assert!(rounds <= 21, "{rounds} prompt rounds");
         stop_all(nodes).await;
@@ -930,7 +948,8 @@ fn failover_drains_a_full_store_on_prompt_rounds() {
 }
 
 /// A node whose zone becomes known under 20 % loss on every link still ends
-/// with every hit everywhere.
+/// with every hit everywhere, although its direct mail into zone b reached
+/// only the member that becomes its gateway.
 #[test]
 fn late_own_zone_under_loss_ends_exact() {
     run_paused(async {
@@ -944,6 +963,9 @@ fn late_own_zone_under_loss_ends_exact() {
                 router.set_link_policy(src, dst, LinkPolicy::DropProb { p: 0.2 });
             }
         }
+        for &blocked in &b[1..] {
+            router.set_link_policy(addrs[0], blocked, LinkPolicy::Block);
+        }
         let zones = ["", "a", "b", "b", "b"];
         let nodes: Vec<_> = (0..5)
             .map(|i| zoned_node(&router, &addrs, &zones, i))
@@ -951,6 +973,8 @@ fn late_own_zone_under_loss_ends_exact() {
         run_for(500).await;
         nodes[0].hits(0..50).await;
         run_for(300).await;
+        assert_eq!(nodes[2].agg.total(), 50);
+        assert_eq!(nodes[0].peer(b[0]).await.own_unacked, 0);
         nodes[0].tell(PeerEvent::OwnEntry { zone: zone("a") });
         run_for(5_000).await;
         assert_totals(&nodes.iter().collect::<Vec<_>>(), 50);
@@ -1063,9 +1087,9 @@ fn relayed_cells(wire: &Wire, to: SocketAddr, from: usize) -> usize {
 
 /// A zone peer Z and a gateway G that never answer: each heartbeat resends
 /// the window with `PROBE` until they are suspect, then sends each one 86-byte
-/// probe and no old cell. A new cell still goes to a suspect at once, and a
-/// probe answer from this incarnation brings the window back on the next
-/// prompt round, without `PROBE`.
+/// probe and no old cell. A new cell still goes to a suspect at once, beside
+/// that heartbeat's probe, and a probe answer from this incarnation brings the
+/// window back on the next prompt round, without `PROBE`.
 #[test]
 fn suspect_retries_are_header_only_probes() {
     run_paused(async {
@@ -1114,7 +1138,13 @@ fn suspect_retries_are_header_only_probes() {
             relay_into_zone: false,
             probe: false,
         });
-        assert!(sent_payloads(&wire, mark).contains(&(z, new_cell)));
+        let sent = sent_payloads(&wire, mark);
+        assert!(sent.contains(&(z, new_cell)), "{sent:?}");
+        // The cell asks for an answer, but only the probe for a prompt one.
+        assert!(
+            sent.contains(&(z, Payload::Ack { probe: true })),
+            "{sent:?}"
+        );
 
         let answer = |incarnation| AckInfo {
             incarnation,
@@ -1375,6 +1405,42 @@ fn three_lost_attempts_never_suspect() {
     }
 }
 
+/// A gateway whose `suspect_after` ends between heartbeats, when no retry is
+/// due, is judged suspect by the prompt round at that instant and replaced
+/// then: the row's deadline holds the instant, so the crossing is not lost.
+#[test]
+fn suspicion_between_heartbeats_is_judged_at_its_instant() {
+    run_paused(async {
+        let (g1, g2) = (sock(2), sock(3));
+        let wire = Rc::new(Wire::default());
+        let tune = |s: &mut Settings| s.suspect_after = Some(ms(446));
+        let (_client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+        introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
+        // The idle gateway's probe at 100 goes unanswered: suspect at 546,
+        // with its next retry due at 600.
+        heartbeats(1).await;
+        let peers = admin_snapshot(&admin).await.peers;
+        let other = peers.iter().find(|p| p.role == Role::Remote).unwrap().addr;
+        let id = if other == g1 { node(0xB) } else { node(0xC) };
+        let mut failed_over_at = None;
+        for t in 101..=600 {
+            // The other member's probes from 500 on run a prompt round every
+            // `F_r` from 501, one of them at 546.
+            if t > 500 {
+                let probe = Payload::Ack { probe: true };
+                inject_zoned(&wire, other, id, Some(zone("b")), AckInfo::default(), probe);
+                wake(&wire);
+            }
+            sim_advance(Duration::from_millis(1)).await;
+            let counters = admin_snapshot(&admin).await.counters;
+            if failed_over_at.is_none() && counters.gateway_failovers > 0 {
+                failed_over_at = Some(t);
+            }
+        }
+        assert_eq!(failed_over_at, Some(546));
+    });
+}
+
 /// A gateway every send to which fails is replaced as if its packets were
 /// lost, and the next member is sent the stream from 0, flagged.
 #[test]
@@ -1389,7 +1455,24 @@ fn gateway_behind_send_errors_fails_over() {
             heartbeats(1).await;
             let peers = admin_snapshot(&admin).await.peers;
             let gateway = peers.iter().find(|p| p.role == Role::Gateway).unwrap().addr;
-            let next = if gateway == g1 { g2 } else { g1 };
+            let (next, id) = if gateway == g1 {
+                (g2, node(0xB))
+            } else {
+                (g1, node(0xC))
+            };
+            // The idle probe at 100 is answered: only failed sends are owed.
+            let answer = AckInfo {
+                incarnation: 1,
+                probe_reply: true,
+                ..AckInfo::default()
+            };
+            let ack = Payload::Ack { probe: false };
+            inject_zoned(&wire, gateway, id, Some(zone("b")), answer, ack);
+            wake(&wire);
+            sim_advance_ticks(Duration::from_millis(1), 2).await;
+            let peers = admin_snapshot(&admin).await.peers;
+            let peer = peers.iter().find(|p| p.addr == gateway).unwrap();
+            assert_eq!(peer.answer, AnswerState::Settled);
             wire.forbidden.set(Some(gateway));
             hit(&client, 1).await;
             let mark = wire.attempts.borrow().len();
@@ -1478,7 +1561,8 @@ fn handoff_with_first_rewound_packet_lost_ends_exact() {
 }
 
 /// A node alone in its zone asks one peer of any zone for a join sweep, the
-/// highest-weight one, and once that page arrives runs only heartbeats.
+/// highest-weight one, and runs only heartbeats, both while it waits for that
+/// page and once it arrives.
 #[test]
 fn node_alone_in_its_zone_asks_one_peer_of_any_zone() {
     run_paused(async {
@@ -1503,17 +1587,16 @@ fn node_alone_in_its_zone_asks_one_peer_of_any_zone() {
             .max_by_key(|&addr| rendezvous_weight(key, addr))
             .unwrap();
         assert_eq!(requests(0), [top]);
+        let before = admin_snapshot(&admin).await.counters;
+        heartbeats(3).await;
         let id = if top == a { node(0xB) } else { node(0xC) };
         let page = CellPayload::Sweep.into();
         inject_zoned(&wire, top, id, Some(zone("a")), AckInfo::default(), page);
         heartbeats(1).await;
-        let (before, mark) = (
-            admin_snapshot(&admin).await.counters,
-            wire.attempts.borrow().len(),
-        );
+        let mark = wire.attempts.borrow().len();
         heartbeats(15).await;
         let after = admin_snapshot(&admin).await.counters;
-        assert_eq!(after.rounds_heartbeat - before.rounds_heartbeat, 15);
+        assert_eq!(after.rounds_heartbeat - before.rounds_heartbeat, 19);
         assert_eq!(after.rounds_prompt, before.rounds_prompt);
         assert!(requests(mark).is_empty());
     });

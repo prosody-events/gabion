@@ -615,20 +615,24 @@ impl Arbitrary for RefreshCase {
 
 /// The two-pass refresh gives each row the role an O(n²) reference gives:
 /// a row of a known remote zone is its gateway iff no other row of that
-/// zone that speaks this version outranks it. The zone table is sized to the
-/// rows, so the one-zone-per-peer case fills it exactly.
+/// zone that speaks this version outranks it, by the reference's own rank:
+/// live members by weight, then suspects by the earliest suspicion, then the
+/// address. The zone table is sized to the rows, so the one-zone-per-peer
+/// case fills it exactly.
 #[quickcheck]
 fn role_refresh_equals_brute_force(case: RefreshCase) {
-    const NOW: u64 = 60;
+    // At `NOW` an `Owed` answer from 40 ms or earlier is suspect, and every
+    // `CannotRelay` is.
+    const NOW: u64 = SUSPECT_AFTER + 40;
     let n = case.rows.len();
     let capacity = NonZeroU16::new(n as u16).unwrap();
-    let mut table = PeerTable::with_capacity(capacity, 3, RTO, 20);
+    let mut table = PeerTable::with_capacity(capacity, 3, RTO, SUSPECT_AFTER);
     if case.local > 0 {
         table.set_local_zone(zone(case.local));
     }
+    let addr_of = |row: usize| SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 1000 + row as u16));
     for (i, &(z, muted, answer)) in case.rows.iter().enumerate() {
-        let a = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 1000 + i as u16));
-        table.insert(a);
+        table.insert(addr_of(i));
         table.contact(
             i,
             NodeIdentity::new(NodeId(i as u128), 1),
@@ -646,6 +650,17 @@ fn role_refresh_equals_brute_force(case: RefreshCase) {
         let z = case.rows[row].0;
         !case.rows[row].1 && z != 0 && case.local != 0 && z != case.local
     };
+    let rank = |row: usize| {
+        let suspect_from = match case.rows[row].2 {
+            Answer::Settled => None,
+            Answer::Owed { since_ms } => Some(since_ms + SUSPECT_AFTER),
+            Answer::CannotRelay { since_ms } => Some(since_ms),
+        };
+        match suspect_from.filter(|&from| from <= NOW) {
+            Some(from) => (false, u64::MAX - from, addr_of(row)),
+            None => (true, rendezvous_weight(3, addr_of(row)), addr_of(row)),
+        }
+    };
     for row in 0..n {
         let expected = if case.rows[row].1 {
             Role::Incompatible
@@ -655,7 +670,7 @@ fn role_refresh_equals_brute_force(case: RefreshCase) {
             other != row
                 && eligible(other)
                 && case.rows[other].0 == case.rows[row].0
-                && table.rank(other) > table.rank(row)
+                && rank(other) > rank(row)
         }) {
             Role::Remote
         } else {
@@ -675,15 +690,19 @@ enum AnswerOp {
     },
     /// Own data goes out: the stream is owed.
     Data,
-    /// An ack of everything sent, or a repeat of the stuck one.
+    /// An ack of everything sent, or a repeat of the stuck one, flagged
+    /// `CANNOT_RELAY` or not.
     Ack {
         progress: bool,
+        cannot_relay: bool,
     },
-    CannotRelay,
     ProbeReply,
     Role(u8),
     Mute,
     Restart,
+    /// A held packet leaves after this many floors, on a round whose `now`
+    /// may trail the round that held it by up to a floor (a late heartbeat),
+    /// so the shift can reach past `now`.
     Shift(u8),
     Advance(u8),
 }
@@ -696,10 +715,10 @@ impl Arbitrary for AnswerOp {
                 left: bool::arbitrary(g),
             },
             1 => Self::Data,
-            2 => Self::Ack {
+            2 | 3 => Self::Ack {
                 progress: bool::arbitrary(g),
+                cannot_relay: bool::arbitrary(g),
             },
-            3 => Self::CannotRelay,
             4 => Self::ProbeReply,
             5 => Self::Role(u8::arbitrary(g) % 3),
             6 if u8::arbitrary(g) % 4 == 0 => Self::Mute,
@@ -766,7 +785,10 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                         model = Answer::Owed { since_ms: now };
                     }
                 }
-                AnswerOp::Ack { progress } => {
+                AnswerOp::Ack {
+                    progress,
+                    cannot_relay,
+                } => {
                     let ack = if progress {
                         table.own_sent[0]
                     } else {
@@ -774,19 +796,10 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                     };
                     let moved =
                         progress && ack > table.link[0].own.acked && table.role(0).gets_own();
-                    table.credit(0, acks(&table, ack, false, false), 7, [head, 0], now);
-                    if moved {
-                        model = if owed(&mut table) {
-                            Answer::Owed { since_ms: now }
-                        } else {
-                            Answer::Settled
-                        };
-                    }
-                }
-                AnswerOp::CannotRelay => {
-                    let counts = matches!(table.role(0), Role::Gateway | Role::Remote);
-                    let ack = table.link[0].own.acked;
-                    table.credit(0, acks(&table, ack, false, true), 7, [head, 0], now);
+                    let counts =
+                        cannot_relay && matches!(table.role(0), Role::Gateway | Role::Remote);
+                    table.credit(0, acks(&table, ack, false, cannot_relay), 7, [head, 0], now);
+                    // A counting `CANNOT_RELAY` packet's acks are no progress.
                     if counts {
                         let from = match model {
                             Answer::Settled => now,
@@ -795,6 +808,12 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                         };
                         model = Answer::CannotRelay {
                             since_ms: from.min(now),
+                        };
+                    } else if moved {
+                        model = if owed(&mut table) {
+                            Answer::Owed { since_ms: now }
+                        } else {
+                            Answer::Settled
                         };
                     }
                 }
@@ -831,7 +850,7 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                 }
                 AnswerOp::Shift(held) => {
                     let held = u64::from(held) * FLOOR;
-                    now += held;
+                    now += held.saturating_sub(FLOOR);
                     table.shift_owed(held, now);
                     if let Answer::Owed { since_ms } = &mut model {
                         *since_ms = (*since_ms + held).min(now);

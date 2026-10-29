@@ -1766,8 +1766,8 @@ fn bad_version_reports_the_peer_version() {
 }
 
 /// Each rule keeps its own unsent hits: a burst on a rule with a large error
-/// budget fires nothing, and two crossings of a small budget fire two
-/// threshold rounds.
+/// budget fires nothing, not even with one hit on a rule whose budget is one
+/// hit, and two crossings of that small budget fire two threshold rounds.
 #[test]
 fn two_rules_flush_independently() {
     run_paused(async {
@@ -1788,6 +1788,7 @@ fn two_rules_flush_independently() {
                 .await
                 .unwrap();
         }
+        client.record(0xA, KeyHash(1), 0, 1, 100, 0).await.unwrap();
         sim_advance(Duration::from_millis(1)).await;
         assert_eq!(
             admin_snapshot(&admin).await.counters.rounds_threshold,

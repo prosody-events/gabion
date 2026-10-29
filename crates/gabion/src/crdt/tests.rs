@@ -1332,9 +1332,19 @@ impl Arbitrary for MixedOp {
 struct MixedOps(Vec<MixedOp>);
 
 impl Arbitrary for MixedOps {
+    /// A quarter of the ops repeat an earlier one, so cells are raised and
+    /// remarked again, not just inserted.
     fn arbitrary(g: &mut Gen) -> Self {
         let len = usize::arbitrary(g) % 32;
-        Self((0..len).map(|_| MixedOp::arbitrary(g)).collect())
+        let mut ops: Vec<MixedOp> = Vec::with_capacity(len);
+        for _ in 0..len {
+            let op = match g.choose(&ops) {
+                Some(earlier) if u8::arbitrary(g) % 4 == 0 => earlier.clone(),
+                _ => MixedOp::arbitrary(g),
+            };
+            ops.push(op);
+        }
+        Self(ops)
     }
 }
 
