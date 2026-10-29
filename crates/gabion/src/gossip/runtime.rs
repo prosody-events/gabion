@@ -95,8 +95,9 @@ where
     peers: PeerTable,
     /// `B_r`: the most waiting datagrams one round reads, fixed after bind.
     inbound_budget: usize,
-    /// Whether a resend, gap report, probe answer, sweep or held packet waits
-    /// for a prompt round; the prompt ticker is polled only while it does.
+    /// Whether a resend, gap report, probe answer or sweep waits for a prompt
+    /// round; the prompt ticker is polled only while one does or a packet is
+    /// held.
     prompt_work: bool,
     /// The strongest round cut short by a held packet, resumed from
     /// `next_peer` once the packet leaves.
@@ -323,9 +324,10 @@ where
                     requests_rx,
                     admin_rx,
                     prompt_work,
+                    outbox,
                     ..
                 } = &mut self;
-                let prompt_work = *prompt_work;
+                let prompt_work = *prompt_work || outbox.is_held();
 
                 // The tickers come before the inbound arm, so a flood of
                 // datagrams cannot starve rounds; rounds read the socket
@@ -774,7 +776,6 @@ where
         self.outbox.retry(&self.transport, &mut self.counters);
         if self.outbox.is_held() {
             self.cut = Some(kind);
-            self.prompt_work = true;
             return;
         }
 
@@ -788,7 +789,6 @@ where
             if self.outbox.is_held() {
                 self.next_peer = row;
                 self.cut = Some(kind);
-                self.prompt_work = true;
                 return;
             }
         }
@@ -796,7 +796,7 @@ where
         if kind == Round::Prompt {
             self.serve_sweeps();
         }
-        self.prompt_work |= self.sweep_due() || self.sweeps.active() > 0 || self.outbox.is_held();
+        self.prompt_work |= self.sweep_due() || self.sweeps.active() > 0;
     }
 
     /// Read the datagrams already waiting, at most `B_r`, so the round sees

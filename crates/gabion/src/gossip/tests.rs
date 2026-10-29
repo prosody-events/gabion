@@ -1473,11 +1473,12 @@ fn blocked_socket_does_not_fire_a_threshold_round_per_request() {
     assert_eq!(snapshot.counters.send_blocked, 3);
 }
 
-/// A refused packet is held and retried first on every later round, the
-/// prompt rounds it schedules included, unchanged although newer counts
-/// arrived; nothing encodes over it, and the round that finally sends it goes
-/// on to gossip. One `u32` cell fills a packet, so the refusal cuts a
-/// two-packet frame after its first packet.
+/// A refused packet is held and retried first on every later round, prompt
+/// rounds included, unchanged although newer counts arrived; nothing encodes
+/// over it, and the round that finally sends it goes on to gossip. One `u32`
+/// cell fills a packet, so the refusal cuts a two-packet frame after its
+/// first packet, and the cut frame alone keeps prompt rounds coming; the
+/// one-peer tests around this one pin that a held packet alone does.
 #[test]
 fn refused_send_holds_one_packet() {
     run_paused(async {
