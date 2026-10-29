@@ -1,9 +1,12 @@
-//! Steady-state gossip allocates nothing. Two runtimes on one paused
-//! current-thread runtime exchange own-stream packets, acks, threshold and
-//! heartbeat rounds and a batched expiry of more than one sink's worth of
-//! cells; every tenth datagram A sends B is lost, so gap reports, timeout
-//! resends and prompt rounds run too. A counting global allocator, armed on
-//! this thread for the whole window, counts every allocation either makes.
+//! Steady-state gossip allocates nothing. Three runtimes on one paused
+//! current-thread runtime, A in one zone and B and C in another, exchange
+//! own-stream packets, acks, threshold and heartbeat rounds and a batched
+//! expiry of more than one sink's worth of cells; A's gateway G relays A's
+//! cells to the other member M. Every tenth datagram A sends G is lost, so
+//! gap reports, timeout resends and prompt rounds run too; a quiet spell
+//! brings liveness probes, and a cut from A to G fails A over to M and back.
+//! A counting global allocator, armed on this thread for the whole window,
+//! counts every allocation any of them makes.
 //!
 //! The runtimes talk through `RingTransport`: fixed per-address rings of
 //! pre-sized slots that copy each datagram once, as the kernel would. The
@@ -25,12 +28,14 @@ use std::time::Duration;
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity};
+use gabion::gossip::Role;
 use gabion::gossip::sim::sim_advance_ticks;
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, GossipClient, GossipRuntime, GossipTransport, TokioClock,
 };
 use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
 use gabion::settings::Settings;
+use gabion::zone::ZoneName;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 
@@ -106,12 +111,15 @@ impl Ring {
     }
 }
 
-/// The two nodes' addresses and inbound rings.
+/// The nodes' addresses and inbound rings.
 struct Net {
-    addrs: [SocketAddr; 2],
-    rings: [RefCell<Ring>; 2],
-    /// Datagrams A sent B in the counted window; every tenth is lost.
-    a_to_b: Cell<u32>,
+    addrs: [SocketAddr; 3],
+    rings: [RefCell<Ring>; 3],
+    /// A's gateway, once known: in the counted window every tenth datagram
+    /// A sends it is lost, and while `cut` is set every one.
+    gateway: Cell<Option<usize>>,
+    cut: Cell<bool>,
+    a_to_g: Cell<u32>,
 }
 
 struct RingTransport {
@@ -128,10 +136,10 @@ impl GossipTransport for RingTransport {
         let Some(to) = self.net.addrs.iter().position(|&a| a == dst) else {
             return Ok(buf.len());
         };
-        if self.me == 0 && COUNTING.get() {
-            let sent = self.net.a_to_b.get() + 1;
-            self.net.a_to_b.set(sent);
-            if sent.is_multiple_of(10) {
+        if self.me == 0 && Some(to) == self.net.gateway.get() && COUNTING.get() {
+            let sent = self.net.a_to_g.get() + 1;
+            self.net.a_to_g.set(sent);
+            if sent.is_multiple_of(10) || self.net.cut.get() {
                 return Ok(buf.len());
             }
         }
@@ -227,16 +235,17 @@ fn steady_state_gossip_never_allocates() {
         .expect("rules fit");
         let fingerprint = rules.rules()[0].fingerprint();
         let net = Rc::new(Net {
-            addrs: [
-                SocketAddr::from(([127, 0, 0, 1], 1)),
-                SocketAddr::from(([127, 0, 0, 1], 2)),
-            ],
-            rings: [Ring::new(), Ring::new()],
-            a_to_b: Cell::new(0),
+            addrs: [1, 2, 3].map(|port| SocketAddr::from(([127, 0, 0, 1], port))),
+            rings: [Ring::new(), Ring::new(), Ring::new()],
+            gateway: Cell::new(None),
+            cut: Cell::new(false),
+            a_to_g: Cell::new(0),
         });
         let start = |me: usize| {
             let mut config = gossip.clone();
-            config.bootstrap_peers = vec![net.addrs[1 - me]];
+            config.bootstrap_peers = (0..3).filter(|&i| i != me).map(|i| net.addrs[i]).collect();
+            let zone = if me == 0 { "a" } else { "b" };
+            config.zone = Some(ZoneName::parse(zone).unwrap());
             let identity = NodeIdentity::new(NodeId(0xA0 + me as u128), 1);
             let (admin, admin_rx) = mpsc::channel(1);
             let (runtime, client) = GossipRuntime::from_parts_with_admin(
@@ -255,25 +264,49 @@ fn steady_state_gossip_never_allocates() {
         };
         let (a, a_admin) = start(0);
         let (b, b_admin) = start(1);
+        let (c, c_admin) = start(2);
 
-        // Warm-up: 5,000 cells at A in bucket 0, B's own cell (so A hears B),
-        // and time for every stream, ack and join sweep to settle.
+        // Warm-up: 5,000 cells at A in bucket 0, B's own cell, and time for
+        // every zone to be heard and every stream, relay, ack and join sweep
+        // to settle.
         for key in 0..5_000 {
             record(&a, fingerprint, key, 1, 0).await;
         }
         record(&b, fingerprint, 1 << 40, 1, 0).await;
-        let mut now = 500;
-        sim_advance_ticks(Duration::from_millis(1), 500).await;
-        let (a_before, b_before) = (snapshot(&a_admin).await, snapshot(&b_admin).await);
-        assert_eq!(
-            b_before.store_stats.active_cells, 5_001,
-            "B holds A's cells"
-        );
+        let mut now = 1_000;
+        sim_advance_ticks(Duration::from_millis(1), 1_000).await;
+        let a_before = snapshot(&a_admin).await;
+        let gateway = a_before
+            .peers
+            .iter()
+            .find(|p| p.role == Role::Gateway)
+            .unwrap();
+        let g = net
+            .addrs
+            .iter()
+            .position(|&addr| addr == gateway.addr)
+            .unwrap();
+        net.gateway.set(Some(g));
+        let (g_admin, m_admin) = if g == 1 {
+            (&b_admin, &c_admin)
+        } else {
+            (&c_admin, &b_admin)
+        };
+        let (g_before, m_before) = (snapshot(g_admin).await, snapshot(m_admin).await);
+        for zone_b in [&g_before, &m_before] {
+            assert_eq!(
+                zone_b.store_stats.active_cells, 5_001,
+                "B and C hold A's cells"
+            );
+        }
 
         // Counted: 1,000 hits, 95 % on live keys and 5 % on new ones, each
         // crossing the error budget past the emit floor, so each runs a
-        // threshold round whose packet B acks; ten heartbeats a second; and,
-        // at 1,100 ms, the expiry of bucket 0's 5,000 cells.
+        // threshold round whose flagged packet G acks and relays to M; ten
+        // heartbeats a second; at 1,100 ms, the expiry of bucket 0's 5,000
+        // cells; from hit 400 to hit 800 A cannot reach G, so A fails over
+        // to M with a full rewind and back once G answers; then a quiet
+        // spell of liveness probes.
         COUNTING.set(true);
         for i in 0..1_000_u128 {
             let key = if i % 20 == 0 {
@@ -281,28 +314,41 @@ fn steady_state_gossip_never_allocates() {
             } else {
                 i * 7 % 5_000
             };
+            if i == 399 {
+                // Only G's relay reaches M, which is `Remote` at A.
+                COUNTING.set(false);
+                let m_now = snapshot(m_admin).await;
+                let merged = m_now.counters.cells_merged - m_before.counters.cells_merged;
+                assert!(merged >= 300, "{merged} cells relayed");
+                COUNTING.set(true);
+            }
+            net.cut.set((400..800).contains(&i));
             record(&a, fingerprint, key, 2, now).await;
             sim_advance_ticks(Duration::from_millis(1), 6).await;
             now += 6;
         }
+        sim_advance_ticks(Duration::from_millis(1), 300).await;
         COUNTING.set(false);
 
-        // The window did what it claims: a threshold round per hit, B
-        // receiving all but the lost tenth and A receiving acks, B reporting
-        // the gaps the losses open and A resending in prompt rounds, and
-        // bucket 0's cells expired.
-        let (a_after, b_after) = (snapshot(&a_admin).await, snapshot(&b_admin).await);
+        // The window did what it claims: a threshold round per hit, G
+        // receiving all but the lost tenth and A receiving acks, G reporting
+        // the gaps the losses open and A resending in prompt rounds, a
+        // failover and its way back, probes, and bucket 0's cells expired.
+        let (a_after, g_after) = (snapshot(&a_admin).await, snapshot(g_admin).await);
         let delta = |after: u64, before: u64| after - before;
         let (a_c, a_b) = (a_after.counters, a_before.counters);
         assert!(delta(a_c.rounds_threshold, a_b.rounds_threshold) >= 990);
         assert!(delta(a_c.rounds_heartbeat, a_b.rounds_heartbeat) >= 59);
         assert!(delta(a_c.rounds_prompt, a_b.rounds_prompt) > 0);
-        let (b_c, b_b) = (b_after.counters, b_before.counters);
-        assert!(delta(b_c.packets_received, b_b.packets_received) >= 900);
-        assert!(delta(b_c.gap_reports_sent, b_b.gap_reports_sent) > 0);
+        let (g_c, g_b) = (g_after.counters, g_before.counters);
+        assert!(delta(g_c.packets_received, g_b.packets_received) >= 500);
+        assert!(delta(g_c.gap_reports_sent, g_b.gap_reports_sent) > 0);
         assert!(delta(a_c.packets_received, a_b.packets_received) >= 50);
+        assert!(a_c.gateway_failovers >= 1);
+        assert!(delta(a_c.liveness_probes, a_b.liveness_probes) > 0);
+        assert!(delta(a_c.role_changes, a_b.role_changes) >= 2);
         assert!(a_after.store_stats.active_cells < 1_000);
-        drop((a, b));
+        drop((a, b, c));
         ALLOCATIONS.get()
     }));
     assert_eq!(allocations, 0);

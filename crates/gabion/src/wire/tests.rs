@@ -8,6 +8,7 @@ use quickcheck_macros::quickcheck;
 
 use crate::crdt::{
     CellHandle, CellStore, DeltaSink, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch,
+    RelayMark, Stream,
 };
 use crate::settings::mock::{rules, storage};
 
@@ -79,7 +80,7 @@ fn sample_header<P: From<CellPayload>>() -> Header<P> {
     Header {
         cluster_id_hash: CLUSTER,
         sender: NodeIdentity::new(NodeId(0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0011_2233), 17),
-        sender_zone: 0,
+        sender_zone: None,
         acks: AckInfo::default(),
         payload: CellPayload::Sweep.into(),
     }
@@ -110,7 +111,7 @@ fn seed_store(rows: &[RawRow]) -> (CellStore, Vec<CellHandle>) {
             last_update_millis: r.last_update_millis,
         });
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     let handles = store.active_handles(0).collect();
     (store, handles)
 }
@@ -264,7 +265,7 @@ fn build_many_origins(n: u32) -> (CellStore, Vec<CellHandle>) {
             last_update_millis: 1_000 + i as u64,
         });
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     let handles: Vec<CellHandle> = store.active_handles(0).collect();
     (store, handles)
 }
@@ -537,7 +538,7 @@ fn own_frame_packets_tile_its_range() {
     }
     store.ingest_local(&obs, &mut DeltaSink::with_capacity(70));
     let mut handles = Vec::with_capacity(71);
-    store.stream_after(0, 70, &mut handles);
+    store.stream_after(Stream::Own, 0, 70, &mut handles);
     // A stale twin of the fifth cell, just after the first packet's four.
     handles.insert(
         4,

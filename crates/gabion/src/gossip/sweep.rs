@@ -28,17 +28,17 @@ pub(super) struct Ask {
 
 impl SweepWant {
     /// Advance the want against the current candidates, ranked by weight:
-    /// `true` once pages have come from `min(GOSSIP_SWEEP_PEERS, k)` sources
-    /// with `k > 0`. Otherwise drop the sources asked
-    /// [`GOSSIP_GAP_REPORTS`] times or no longer candidates, and ask the next
-    /// ones down the ranking, wrapping to the top.
-    pub(super) fn advance<I>(&mut self, candidates: impl Fn() -> I) -> bool
+    /// `true` once pages have come from `min(sources, k)` sources with
+    /// `k > 0`, `sources` at most [`GOSSIP_SWEEP_PEERS`]. Otherwise drop the
+    /// sources asked [`GOSSIP_GAP_REPORTS`] times or no longer candidates,
+    /// and ask the next ones down the ranking, wrapping to the top.
+    pub(super) fn advance<I>(&mut self, candidates: impl Fn() -> I, sources: usize) -> bool
     where
         I: Iterator<Item = (u64, SocketAddr)>,
     {
         let k = candidates().count();
         let answered = self.answered.iter().flatten().count();
-        let need = k.min(GOSSIP_SWEEP_PEERS);
+        let need = k.min(sources);
         if k > 0 && answered >= need {
             return true;
         }

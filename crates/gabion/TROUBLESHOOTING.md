@@ -73,7 +73,7 @@ Message starts: "This node's peer table is full"
 
 **Why.** The cluster has more pods than `gossip.peer_capacity`.
 
-**What to do next.** Raise `gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`) in `gabiond`, or `gabion_gossip_peer_capacity` in NGINX, above the cluster's pod count. Each slot costs about 200 bytes.
+**What to do next.** Raise `gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`) in `gabiond`, or `gabion_gossip_peer_capacity` in NGINX, above the cluster's pod count. Each slot costs about 330 bytes.
 
 **Fields** `config_key`, `capacity`, `peer`, `declined_total` · **Knob** `gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`) / `gabion_gossip_peer_capacity`
 
@@ -83,7 +83,7 @@ Message starts: "This node's peer table is full"
 
 Message starts: "Stopped asking"
 
-**What happened.** A peer's stream to this node skipped some changes, and this node asked the peer to resend them `reports` times over `waited_ms` without receiving them, so it stopped asking. If the peer still sends the stream, its retransmission timer resends the missing changes on its own; until they arrive, limits here under-count the traffic that peer handled. Counted in `/snapshot` as `counters.gaps_abandoned`.
+**What happened.** A peer's own or relay stream (`stream`) to this node skipped some changes, and this node asked the peer to resend them `reports` times over `waited_ms` without receiving them, so it stopped asking. If the peer still sends the stream, its retransmission timer resends the missing changes on its own; until they arrive, limits here under-count the traffic that peer handled. Counted in `/snapshot` as `counters.gaps_abandoned`.
 
 **Why.** Usually UDP from that peer to this node is blocked or lossy in one direction, so the peer never hears the reports or its resends never arrive.
 
@@ -143,7 +143,7 @@ Message starts: "Ignoring gossip from this peer: it speaks another gossip protoc
 
 **What to do next.** Finish the rollout quickly, or roll back. Otherwise find the pod by the `peer` field and upgrade or restart it. `counters.decode_rejects_version` in `/snapshot` counts the dropped packets.
 
-**Fields** `peer`, `peer_version`, `local_version`, `reason` (`version`), `rejected_total` · **Knob** none
+**Fields** `peer`, `peer_version`, `local_version`, `reason` (`version`), `rejected_total`, `incompatible_peers` (peers on another version now; it falls to zero as the rollout ends) · **Knob** none
 
 ### `default_cluster_id`
 
@@ -197,9 +197,51 @@ Message starts: "Could not send a gossip packet to this peer"
 
 **Why.** Usually the peer has just left the cluster (a stale address), or a firewall or NetworkPolicy blocks UDP from this node to it.
 
-**What to do next.** If it repeats for a peer that is running, check the policy and the route between the two nodes.
+**What to do next.** If it repeats for a peer that is running, check the policy and the route between the two nodes. If the peer is this node's gateway into its zone and sends to it keep failing, another member of that zone takes over after `gossip.suspect_after`, as for a peer that does not answer.
 
 **Fields** `peer`, `error`, `send_errors_total` · **Knob** none
+
+### `gateway_failover`
+
+**Level** info for the first, then warn at powers of two · **Request allowed** yes, under-counted in that zone for a few seconds · **Emitted by** library (both adapters)
+
+Message starts: "Switched this node's gateway for zone" (info), "This node has switched gateways" (warn)
+
+**What happened.** This node sends its changes into each other zone through one member of it, its gateway there. That gateway answered none of this node's packets or liveness checks for `gossip.suspect_after` (`reason = "unanswered"`), or said it cannot reach most of its own zone (`reason = "cannot_relay"`), so the next member of that zone took over and was sent every live change this node holds; nothing is lost. Until it relays them, limits in that zone under-count this node's traffic, for up to `gossip.suspect_after` plus three heartbeats.
+
+**Why.** The gateway restarted or left the cluster, or UDP between this node and that zone drops packets; with `cannot_relay`, the gateway's path into its own zone is broken. Repeated switches mean pods in that zone keep restarting or the network between the zones is lossy.
+
+**What to do next.** Nothing for a single switch after a restart. If the warning repeats, check restarts in the zone named by `zone_hash`, then the network path and any NetworkPolicy or security group between the zones; with `cannot_relay`, read the old gateway's `relay_stalled` lines. If the pods are healthy and the network between zones loses packets, raise `gossip.suspect_after` to make switches rarer at the cost of slower failover.
+
+**Fields** `zone_hash`, `old_gateway`, `new_gateway`, `reason`, `unanswered_ms`, `suspect_after_ms`, `failover_total`, `config_key` · **Knob** `gossip.suspect_after` (`GABION_GOSSIP_SUSPECT_AFTER`) / `gabion_gossip_suspect_after`
+
+### `relay_stalled`
+
+**Level** warn, power of two · **Request allowed** yes, under-counted at that peer · **Emitted by** library (both adapters)
+
+Message starts: the peer's address, then "a peer in this node's zone, has not acknowledged the changes this node relays"
+
+**What happened.** This node relays other zones' changes into its own zone, and one peer of its zone has acknowledged none of them for `stalled_ms`, so it is missing those counts and limits enforced there under-count and allow requests over the limit. gabion keeps resending (once the peer is suspect, as one small probe per heartbeat whose answer brings the resend), and the counts arrive as soon as the path works.
+
+**Why.** Usually UDP from this node to that peer is blocked in one direction, or the peer is overloaded. When most of the zone stalls, this node also tells the nodes it relays for that it cannot relay, and they switch gateways (`gateway_failover` with `reason = "cannot_relay"`).
+
+**What to do next.** Check the NetworkPolicies and security groups between the two pods, and the peer's CPU.
+
+**Fields** `peer`, `stalled_ms`, `relay_unacked`, `stall_total` · **Knob** none
+
+### `setting_warning`
+
+**Level** warn, once at start · **Request allowed** yes · **Emitted by** library (both adapters)
+
+Message starts: "`gossip.tick_interval` (`GABION_GOSSIP_TICK_INTERVAL`; NGINX `gabion_gossip_tick_interval`) is"
+
+**What happened.** A setting is legal but probably not what was meant. `cause = "tick_near_round_trip"`: the heartbeat (`tick_ms`) is under 20 ms, so a resend can leave before the answer to the first copy arrives. That costs bytes, not counts: suspicion waits for `gossip.suspect_after`, whose default stays at least 2 s however short the heartbeat.
+
+**Why.** `gossip.tick_interval` was set very short, usually to speed convergence in a test.
+
+**What to do next.** If `/snapshot` shows `unanswered_ms` regularly above `tick_ms` for healthy peers, raise `gossip.tick_interval` to at least four times the round trip between your zones.
+
+**Fields** `cause`, `tick_ms`, `config_key` · **Knob** `gossip.tick_interval` (`GABION_GOSSIP_TICK_INTERVAL`) / `gabion_gossip_tick_interval`
 
 ### `kubernetes_forbidden`
 

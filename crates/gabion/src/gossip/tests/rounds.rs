@@ -12,18 +12,28 @@ use crate::gossip::PeerEntry;
 
 /// One runtime on the simulated network, with its admin channel and the
 /// discovery stream the test drives.
-struct Node {
-    addr: SocketAddr,
-    client: GossipClient,
+pub(super) struct Node {
+    pub(super) addr: SocketAddr,
+    pub(super) client: GossipClient,
     admin: mpsc::Sender<AdminCommand>,
-    agg: Rc<InMemoryAggregateStore>,
+    pub(super) agg: Rc<InMemoryAggregateStore>,
     events: UnboundedSender<PeerEvent>,
     handle: JoinHandle<Result<(), GossipError>>,
 }
 
 impl Node {
-    fn start(
+    pub(super) fn start(
         router: &SimRouter,
+        addr: SocketAddr,
+        store: CellStore,
+        config: ValidGossipConfig,
+    ) -> Self {
+        Self::start_on(router.bind(addr), addr, store, config)
+    }
+
+    /// A node on any transport bound to `addr`.
+    pub(super) fn start_on<T: GossipTransport + 'static>(
+        transport: T,
         addr: SocketAddr,
         store: CellStore,
         config: ValidGossipConfig,
@@ -32,7 +42,7 @@ impl Node {
         let (events, events_rx) = unbounded();
         let agg = Rc::new(InMemoryAggregateStore::new());
         let (rt, client) = GossipRuntime::from_parts_with_admin(
-            router.bind(addr),
+            transport,
             TokioClock::from_millis(0),
             config,
             store,
@@ -50,42 +60,42 @@ impl Node {
         }
     }
 
-    async fn snapshot(&self) -> AdminSnapshot {
+    pub(super) async fn snapshot(&self) -> AdminSnapshot {
         admin_snapshot(&self.admin).await
     }
 
-    async fn counters(&self) -> GossipCounters {
+    pub(super) async fn counters(&self) -> GossipCounters {
         self.snapshot().await.counters
     }
 
     /// This node's view of the peer at `addr`.
-    async fn peer(&self, addr: SocketAddr) -> PeerEntry {
+    pub(super) async fn peer(&self, addr: SocketAddr) -> PeerEntry {
         let peers = self.snapshot().await.peers;
         *peers.iter().find(|p| p.addr == addr).expect("a peer")
     }
 
-    fn tell(&self, event: PeerEvent) {
+    pub(super) fn tell(&self, event: PeerEvent) {
         self.events.unbounded_send(event).expect("the runtime runs");
     }
 
-    async fn hits(&self, keys: std::ops::Range<u128>) {
+    pub(super) async fn hits(&self, keys: std::ops::Range<u128>) {
         for key in keys {
             hit(&self.client, key).await;
         }
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         let _ = self.client.shutdown().await;
         let _ = self.handle.await;
     }
 }
 
-fn addrs(base: u16, n: usize) -> Vec<SocketAddr> {
+pub(super) fn addrs(base: u16, n: usize) -> Vec<SocketAddr> {
     (0..n).map(|i| sock(base + i as u16)).collect()
 }
 
 /// Node `i` of a test cluster, incarnation `incarnation`.
-fn id(i: usize, incarnation: u32) -> NodeIdentity {
+pub(super) fn id(i: usize, incarnation: u32) -> NodeIdentity {
     NodeIdentity::new(NodeId(0xD000 + i as u128), incarnation)
 }
 
@@ -99,7 +109,7 @@ fn member(router: &SimRouter, addrs: &[SocketAddr], i: usize) -> Node {
     )
 }
 
-async fn run_for(ms: u64) {
+pub(super) async fn run_for(ms: u64) {
     sim_advance_ticks(Duration::from_millis(1), ms as u32).await;
 }
 
@@ -117,7 +127,7 @@ async fn restart(
 }
 
 /// Every node's aggregate holds `total` hits.
-fn assert_totals(nodes: &[&Node], total: u64) {
+pub(super) fn assert_totals(nodes: &[&Node], total: u64) {
     for node in nodes {
         assert_eq!(node.agg.total(), total, "{}", node.addr);
     }
@@ -254,7 +264,7 @@ fn abandoned_gap_stops_prompt_rounds() {
                 relay_into_zone: false,
                 probe: false,
             };
-            let packet = header_bytes(id(9, 1), AckInfo::default(), Payload::Cells(own));
+            let packet = header_bytes(id(9, 1), None, AckInfo::default(), Payload::Cells(own));
             raw.try_send_to(&packet, b.addr).unwrap();
             // Reports at 5, 25, 45 and 65 ms; abandoned at 85.
             run_for(100).await;
@@ -346,7 +356,7 @@ fn sweep_request_from_unknown_address_is_ignored() {
         a.hits(1..4).await;
         let x = sock(43_501);
         let raw = router.bind(x);
-        let request = header_bytes(id(9, 1), AckInfo::default(), Payload::SweepRequest);
+        let request = header_bytes(id(9, 1), None, AckInfo::default(), Payload::SweepRequest);
         raw.try_send_to(&request, a.addr).unwrap();
         run_for(200).await;
         assert_eq!(router.received_count(x), 0);
@@ -379,6 +389,42 @@ fn restart_resets_streams_and_requests_a_sweep() {
     });
 }
 
+/// A node restarted into an idle cluster, at a new address or its old one,
+/// hears every peer through the one standalone ack each sends a new row or a
+/// restarted peer, so it asks them for a join sweep and gets its previous
+/// incarnation's cells back, although no peer has anything to send.
+#[test]
+fn restarted_node_sweeps_from_idle_peers() {
+    for same_address in [false, true] {
+        run_paused(async {
+            let router = SimRouter::new();
+            let addrs = addrs(43_650, 4);
+            let r = member(&router, &addrs[..3], 0);
+            let peers: Vec<_> = (1..3).map(|i| member(&router, &addrs[..3], i)).collect();
+            r.hits(1..6).await;
+            run_for(500).await;
+            assert_totals(&[&peers[0], &peers[1]], 5);
+            let new_addr = if same_address { addrs[0] } else { addrs[3] };
+            r.stop().await;
+            if !same_address {
+                for peer in &peers {
+                    peer.tell(PeerEvent::Removed(Peer::new(addrs[0])));
+                    peer.tell(PeerEvent::Added(Peer::new(new_addr)));
+                }
+            }
+            run_for(1_000).await;
+            let config = sim_config(addrs[1..3].to_vec());
+            let r = Node::start(&router, new_addr, store_for(id(0, 2)), config);
+            run_for(1_000).await;
+            assert_eq!(r.agg.total(), 5);
+            r.stop().await;
+            for peer in peers {
+                peer.stop().await;
+            }
+        });
+    }
+}
+
 /// A peer speaking another wire version is sent nothing, not even the rest of a
 /// sweep it asked for; its first packet of this version makes it a recipient
 /// again, rewound to 0.
@@ -395,7 +441,7 @@ fn other_version_peer_is_muted() {
         );
         let raw = router.bind(v);
         a.hits(1..40).await;
-        let request = header_bytes(id(1, 1), AckInfo::default(), Payload::SweepRequest);
+        let request = header_bytes(id(1, 1), None, AckInfo::default(), Payload::SweepRequest);
         raw.try_send_to(&request, a.addr).unwrap();
         raw.try_send_to(&v1_packet(), a.addr).unwrap();
         run_for(1).await;
@@ -418,7 +464,12 @@ fn other_version_peer_is_muted() {
                 "a muted peer was sent a page"
             );
         }
-        let ack = header_bytes(id(1, 1), AckInfo::default(), Payload::Ack { probe: false });
+        let ack = header_bytes(
+            id(1, 1),
+            None,
+            AckInfo::default(),
+            Payload::Ack { probe: false },
+        );
         raw.try_send_to(&ack, a.addr).unwrap();
         run_for(100).await;
         assert_eq!(a.peer(v).await.role, Role::Zone);
@@ -873,8 +924,9 @@ fn full_store_rewind_drains_on_prompt_rounds(max_cells: u32, max_rounds: u64) {
         a.hits(0..CELLS).await;
         drop(raw);
 
-        // B's join sweep ends on C before B hears A, so only A's stream can
-        // bring A's cells.
+        // B's join sweep ends on C before A hears B (its hello ack to A is
+        // lost), so only A's stream can bring A's cells.
+        router.set_link_policy(b_addr, a_addr, LinkPolicy::Block);
         let c = Node::start(
             &router,
             c_addr,
@@ -894,6 +946,7 @@ fn full_store_rewind_drains_on_prompt_rounds(max_cells: u32, max_rounds: u64) {
         run_for(110).await;
         // t = 511; B's heartbeat at 601 is its first packet to A, and A's
         // next heartbeat is at 1,000.
+        router.set_link_policy(b_addr, a_addr, LinkPolicy::Pass);
         hit(&b.client, 1_000_001).await;
         let before = a.counters().await;
         run_for(480).await;

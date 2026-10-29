@@ -8,6 +8,8 @@ use std::net::SocketAddr;
 
 use futures::Stream;
 
+use crate::zone::ZoneHash;
+
 #[cfg(feature = "discovery-kubernetes")]
 pub mod kubernetes;
 
@@ -32,6 +34,12 @@ impl Peer {
 pub enum PeerEvent {
     Added(Peer),
     Removed(Peer),
+    /// This node's own entry names its zone. The runtime adopts it only
+    /// while it knows no zone, then recomputes every peer's role and asks for
+    /// a join sweep.
+    OwnEntry {
+        zone: ZoneHash,
+    },
 }
 
 /// Peer discovery settings used by gossip, filled from the settings table

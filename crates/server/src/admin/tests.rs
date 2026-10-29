@@ -145,9 +145,14 @@ fn snapshot_json_shape_is_pinned() {
                 "last_error_budget",
                 "local_identity",
                 "peers",
+                "peers_by_role",
                 "rules",
                 "store_stats",
             ]
+        );
+        assert_eq!(
+            body["peers_by_role"],
+            serde_json::json!({ "zone": 1, "gateway": 0, "remote": 0, "incompatible": 0 })
         );
         assert_eq!(keys(&body["local_identity"]), ["incarnation", "node_id"]);
         assert_eq!(
@@ -155,6 +160,7 @@ fn snapshot_json_shape_is_pinned() {
             [
                 "bytes_received",
                 "bytes_sent",
+                "bytes_sent_cross_zone",
                 "cells_merged",
                 "decode_rejects_cluster",
                 "decode_rejects_framing",
@@ -162,13 +168,18 @@ fn snapshot_json_shape_is_pinned() {
                 "decode_rejects_version",
                 "gap_reports_sent",
                 "gaps_abandoned",
+                "gateway_failovers",
+                "liveness_probes",
                 "packets_received",
                 "packets_sent",
                 "peers_declined",
+                "relay_stalls",
+                "role_changes",
                 "rounds_heartbeat",
                 "rounds_prompt",
                 "rounds_threshold",
                 "rto_rewinds_own",
+                "rto_rewinds_relay",
                 "send_blocked",
                 "send_errors",
                 "sweep_cells_sent",
@@ -194,9 +205,22 @@ fn snapshot_json_shape_is_pinned() {
         );
         assert_eq!(
             keys(&body["peers"][0]),
-            ["addr", "node_id", "own_unacked", "role"]
+            [
+                "addr",
+                "answer",
+                "node_id",
+                "own_unacked",
+                "relay_unacked",
+                "role",
+                "unanswered_ms",
+                "zone"
+            ]
         );
         assert_eq!(body["peers"][0]["role"], "zone");
+        assert_eq!(body["peers"][0]["zone"], "unknown");
+        // A wait is shown exactly while an answer is awaited.
+        let peer = &body["peers"][0];
+        assert_eq!(peer["unanswered_ms"].is_null(), peer["answer"] == "settled");
         assert_eq!(
             keys(&body["rules"][0]),
             [

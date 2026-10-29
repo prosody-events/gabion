@@ -15,10 +15,13 @@
 //! per freed cell — so an external aggregate store can keep its summary
 //! consistent with the CRDT's active set.
 //!
-//! The own list threads this node's own live cells through two link columns
-//! in ascending `origin_sequence`, so the gossip runtime reads the cells a
-//! peer has not been sent ([`CellStore::stream_after`]) without a scan. A
-//! cell raised again moves to the tail; a freed cell leaves the list.
+//! Two stream lists thread live cells through two link columns: the own list
+//! holds this node's cells in ascending `origin_sequence`, the relay list the
+//! remote cells [`CellStore::merge_remote`] marked for relay, in ascending
+//! relay sequence. The gossip runtime reads the cells a peer has not been
+//! sent ([`CellStore::stream_after`]) without a scan. A cell raised (own) or
+//! marked again (relay) moves to its list's tail; a freed cell leaves it. No
+//! cell is in both: own cells are never marked.
 //!
 //! Slot lifecycle uses an intrusive freelist (`free_next` linking inactive
 //! slots) and a generation counter per slot (low bit = active flag, high
@@ -48,7 +51,7 @@ use hash::hash_compact_cell_key;
 pub(crate) use hash::{hash_fingerprint, mix64};
 pub(crate) use index::CellIndex;
 
-use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use crate::rules::{CardinalityLimits, RuleTable};
 use crate::settings::Setting;
@@ -234,11 +237,17 @@ pub struct CellStore {
     /// Slot where the next `expire` call resumes; 0 starts a pass.
     expire_cursor: u32,
 
-    // The own list: this node's live cells in ascending `origin_sequences`.
-    // A free or remote slot is in no list and links to `SlotLink::NONE`.
+    // The stream lists: this node's live cells in ascending
+    // `origin_sequences`, and the remote cells marked for relay in ascending
+    // `relay_seq` (`None`: not on the relay list). A slot in no list links to
+    // `SlotLink::NONE`.
     stream_prev: Box<[SlotLink]>,
     stream_next: Box<[SlotLink]>,
+    relay_seq: Box<[Option<NonZeroU64>]>,
     own_list: ListEnds,
+    relay_list: ListEnds,
+    /// The last relay sequence issued: the relay stream's head.
+    relay_head: u64,
 
     // Per-origin sequence allocator (indexed by NodeSlot).
     next_sequence_by_origin: Box<[u64]>,
@@ -284,6 +293,35 @@ struct ListEnds {
     tail: SlotLink,
 }
 
+impl ListEnds {
+    const EMPTY: Self = Self {
+        head: SlotLink::NONE,
+        tail: SlotLink::NONE,
+    };
+}
+
+/// One of the two streams a node sends each peer: the cells it originated,
+/// and the remote cells it relays into its zone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stream {
+    Own,
+    Relay,
+}
+
+/// How [`CellStore::merge_remote`] treats the relay list for a packet's
+/// remote cells.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelayMark {
+    /// The cells arrived another way (a zone peer, a relay, a sweep): a cell
+    /// the merge raised leaves the relay list, its sender being responsible
+    /// for it here.
+    Clear,
+    /// A flagged packet that is not fresh: mark the cells the merge raised.
+    Changed,
+    /// A fresh flagged packet: mark every cell, raised or not.
+    All,
+}
+
 /// Internal arguments for [`CellStore::upsert`]. The mode discriminates the
 /// two valid update shapes; sharing a struct prevents callers from passing a
 /// remote `observed` count alongside a local `hits` delta or vice versa.
@@ -301,8 +339,9 @@ enum UpsertMode {
     /// Local hit. The stored count rises by saturating-adding `hits`.
     Accumulate { hits: u32 },
     /// Remote observation. The stored count rises to `observed` if and only
-    /// if `observed` is strictly greater (CRDT max-merge).
-    MaxMerge { observed: u32 },
+    /// if `observed` is strictly greater (CRDT max-merge); `mark` says how the
+    /// cell's relay-list place follows.
+    MaxMerge { observed: u32, mark: RelayMark },
 }
 
 impl CellStore {
@@ -354,10 +393,10 @@ impl CellStore {
 
             stream_prev: vec![SlotLink::NONE; cap as usize].into_boxed_slice(),
             stream_next: vec![SlotLink::NONE; cap as usize].into_boxed_slice(),
-            own_list: ListEnds {
-                head: SlotLink::NONE,
-                tail: SlotLink::NONE,
-            },
+            relay_seq: vec![None; cap as usize].into_boxed_slice(),
+            own_list: ListEnds::EMPTY,
+            relay_list: ListEnds::EMPTY,
+            relay_head: 0,
 
             next_sequence_by_origin: vec![0_u64; usize::from(node_capacity)].into_boxed_slice(),
 
@@ -627,9 +666,7 @@ impl CellStore {
         };
         let h = hash_compact_cell_key(&key);
         self.index.remove(h, slot);
-        if origin == self.local_node_slot {
-            self.unlink_own(slot);
-        }
+        self.unlink(slot);
         self.rule_dictionary.dec_ref(rule);
         let freed_node = self.node_dictionary.dec_ref(origin);
         if freed_node {
@@ -638,54 +675,110 @@ impl CellStore {
         self.free_slot(slot);
     }
 
-    // -- The own list -------------------------------------------------------
+    // -- The stream lists ---------------------------------------------------
 
-    /// Append `slot`, which holds the newest own sequence, at the list's tail.
-    fn link_own_tail(&mut self, slot: u32) {
-        let tail = self.own_list.tail;
+    /// The list `slot` is on, if any: an own cell is on the own list, a
+    /// marked remote cell on the relay list.
+    fn list_of(&self, slot: u32) -> Option<Stream> {
+        if self.origins[slot as usize] == self.local_node_slot {
+            Some(Stream::Own)
+        } else {
+            self.relay_seq[slot as usize].map(|_| Stream::Relay)
+        }
+    }
+
+    fn ends(&self, stream: Stream) -> ListEnds {
+        match stream {
+            Stream::Own => self.own_list,
+            Stream::Relay => self.relay_list,
+        }
+    }
+
+    fn ends_mut(&mut self, stream: Stream) -> &mut ListEnds {
+        match stream {
+            Stream::Own => &mut self.own_list,
+            Stream::Relay => &mut self.relay_list,
+        }
+    }
+
+    /// `slot`'s position on `stream`.
+    fn seq(&self, stream: Stream, slot: u32) -> u64 {
+        match stream {
+            Stream::Own => self.origin_sequences[slot as usize],
+            Stream::Relay => self.relay_seq[slot as usize].map_or(0, NonZeroU64::get),
+        }
+    }
+
+    /// Append `slot`, which holds `stream`'s newest position, at its tail.
+    fn link_tail(&mut self, stream: Stream, slot: u32) {
+        let tail = self.ends(stream).tail;
         self.stream_prev[slot as usize] = tail;
         self.stream_next[slot as usize] = SlotLink::NONE;
         match tail.get() {
             Some(tail) => self.stream_next[tail as usize] = SlotLink(slot),
-            None => self.own_list.head = SlotLink(slot),
+            None => self.ends_mut(stream).head = SlotLink(slot),
         }
-        self.own_list.tail = SlotLink(slot);
+        self.ends_mut(stream).tail = SlotLink(slot);
     }
 
-    /// Take `slot`, an own cell, out of the list.
-    fn unlink_own(&mut self, slot: u32) {
+    /// Take `slot` out of its list, if it is on one; a relay cell leaves the
+    /// relay stream.
+    fn unlink(&mut self, slot: u32) {
+        let Some(stream) = self.list_of(slot) else {
+            return;
+        };
+        self.relay_seq[slot as usize] = None;
         let prev = std::mem::replace(&mut self.stream_prev[slot as usize], SlotLink::NONE);
         let next = std::mem::replace(&mut self.stream_next[slot as usize], SlotLink::NONE);
         match prev.get() {
             Some(prev) => self.stream_next[prev as usize] = next,
-            None => self.own_list.head = next,
+            None => self.ends_mut(stream).head = next,
         }
         match next.get() {
             Some(next) => self.stream_prev[next as usize] = prev,
-            None => self.own_list.tail = prev,
+            None => self.ends_mut(stream).tail = prev,
         }
     }
 
-    /// The own stream's head: the last sequence issued to this node's own
-    /// cells. It never decreases, since the local node slot is pinned.
-    pub fn own_head(&self) -> u64 {
-        self.next_sequence_by_origin[self.local_node_slot as usize]
+    /// Put remote `slot` at the relay tail with the next relay sequence.
+    fn mark_relay(&mut self, slot: u32) {
+        self.unlink(slot);
+        self.relay_head += 1;
+        self.relay_seq[slot as usize] = NonZeroU64::new(self.relay_head);
+        self.link_tail(Stream::Relay, slot);
     }
 
-    /// Clear `out`, then fill it with the live own cells whose sequence is
-    /// above `sent`, ascending, at most `max`. The walk to the first such cell
-    /// starts from whichever end is nearer by sequence, so it costs at most
-    /// the smaller of `sent − first` and `last − sent` steps: a new peer, a
-    /// rewound stream and a draining backlog walk from the head, steady state
-    /// from the tail. `out` must hold `max` handles, so nothing allocates.
-    pub fn stream_after(&self, sent: u64, max: usize, out: &mut Vec<CellHandle>) {
+    /// `stream`'s head: the last position issued on it. Neither head ever
+    /// decreases: the local node slot is pinned, and relay sequences are
+    /// never reused.
+    pub fn head(&self, stream: Stream) -> u64 {
+        match stream {
+            Stream::Own => self.next_sequence_by_origin[self.local_node_slot as usize],
+            Stream::Relay => self.relay_head,
+        }
+    }
+
+    /// `handle`'s position on `stream`, while it is live.
+    pub fn sequence(&self, stream: Stream, handle: CellHandle) -> Option<u64> {
+        self.resolve(handle).map(|slot| self.seq(stream, slot))
+    }
+
+    /// Clear `out`, then fill it with the live cells of `stream` whose
+    /// position is above `sent`, ascending, at most `max`. The walk to the
+    /// first such cell starts from whichever end is nearer by position, so it
+    /// costs at most the smaller of `sent − first` and `last − sent` steps: a
+    /// new peer, a rewound stream and a draining backlog walk from the head,
+    /// steady state from the tail. `out` must hold `max` handles, so nothing
+    /// allocates.
+    pub fn stream_after(&self, stream: Stream, sent: u64, max: usize, out: &mut Vec<CellHandle>) {
         debug_assert!(
             out.capacity() >= max,
             "stream_after fills a pre-sized buffer"
         );
         out.clear();
-        let seq = |slot: u32| self.origin_sequences[slot as usize];
-        let (Some(head), Some(tail)) = (self.own_list.head.get(), self.own_list.tail.get()) else {
+        let seq = |slot: u32| self.seq(stream, slot);
+        let ends = self.ends(stream);
+        let (Some(head), Some(tail)) = (ends.head.get(), ends.tail.get()) else {
             return;
         };
         let mut cursor = if sent.saturating_sub(seq(head)) <= seq(tail).saturating_sub(sent) {
@@ -794,13 +887,21 @@ impl CellStore {
             origin: origin_slot,
             incarnation,
         };
+        let mark = match mode {
+            // Own cells are never relayed, so no cell is on both lists.
+            UpsertMode::MaxMerge { mark, .. } if origin_slot != self.local_node_slot => mark,
+            _ => RelayMark::Clear,
+        };
         if let Some(slot) = self.lookup_index(key) {
             let previous = self.counts[slot as usize];
             let next = match mode {
                 UpsertMode::Accumulate { hits } => previous.saturating_add(hits),
-                UpsertMode::MaxMerge { observed } => observed.max(previous),
+                UpsertMode::MaxMerge { observed, .. } => observed.max(previous),
             };
             if next == previous {
+                if mark == RelayMark::All {
+                    self.mark_relay(slot);
+                }
                 return;
             }
             self.counts[slot as usize] = next;
@@ -808,8 +909,12 @@ impl CellStore {
             let seq = self.next_origin_sequence(origin_slot);
             self.origin_sequences[slot as usize] = seq;
             if origin_slot == self.local_node_slot {
-                self.unlink_own(slot);
-                self.link_own_tail(slot);
+                self.unlink(slot);
+                self.link_tail(Stream::Own, slot);
+            } else if mark == RelayMark::Clear {
+                self.unlink(slot);
+            } else {
+                self.mark_relay(slot);
             }
             self.emit_delta(sink, slot, previous, next, rule_slot);
             return;
@@ -822,7 +927,7 @@ impl CellStore {
         };
         let initial = match mode {
             UpsertMode::Accumulate { hits } => hits,
-            UpsertMode::MaxMerge { observed } => observed,
+            UpsertMode::MaxMerge { observed, .. } => observed,
         };
         self.rules[slot as usize] = rule_slot;
         self.key_hashes[slot as usize] = key_hash;
@@ -842,7 +947,9 @@ impl CellStore {
             .insert_unchecked(hash_compact_cell_key(&key), slot);
 
         if origin_slot == self.local_node_slot {
-            self.link_own_tail(slot);
+            self.link_tail(Stream::Own, slot);
+        } else if mark != RelayMark::Clear {
+            self.mark_relay(slot);
         }
         self.emit_delta(sink, slot, 0, initial, rule_slot);
     }
@@ -919,8 +1026,9 @@ impl CellStore {
 
     /// Merge observations received from a peer. Each row is max-merged into
     /// the stored count; the resulting deltas (when the stored count rose)
-    /// are appended to `sink`.
-    pub fn merge_remote(&mut self, obs: &ObservationBatch, sink: &mut DeltaSink) {
+    /// are appended to `sink`. `mark` moves remote cells onto or off the
+    /// relay list; own cells are never marked.
+    pub fn merge_remote(&mut self, obs: &ObservationBatch, sink: &mut DeltaSink, mark: RelayMark) {
         obs.assert_consistent();
         for i in 0..obs.len() {
             let Some((rule_slot, node_slot)) = self.translate_identity(
@@ -940,6 +1048,7 @@ impl CellStore {
                     now_millis: obs.last_update_millis[i],
                     mode: UpsertMode::MaxMerge {
                         observed: obs.counts[i],
+                        mark,
                     },
                 },
                 sink,

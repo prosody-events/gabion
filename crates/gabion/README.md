@@ -65,11 +65,15 @@ later runtime round turns those rows into outbound frames.
 The protocol has two parts, and they are the reason gabion holds up under
 load that a textbook anti-entropy loop would not:
 
-1. **Acknowledged streams** — each node sends the cells it originated
-   straight to every peer, as a per-peer stream the peer acknowledges
-   cumulatively. A gap report or a heartbeat without an ack brings a
-   resend, so a lost packet costs one round, not a lifetime. A node that
-   starts asks two peers for a *join sweep* of every live cell.
+1. **Acknowledged streams in two tiers** — each node sends the cells it
+   originated straight to every peer of its zone, and, flagged
+   `RELAY_INTO_ZONE`, to one *gateway* in each other zone, chosen by
+   rendezvous hashing so origins spread over a zone's members. The gateway
+   relays them to the rest of its zone on a second stream. Every stream is
+   per peer and acknowledged cumulatively; a gap report or a heartbeat
+   without an ack brings a resend, so a lost packet costs one round, not a
+   lifetime. A peer whose zone is unknown or none gets everything directly.
+   A node that starts asks two peers for a *join sweep* of every live cell.
 2. **Adaptive emit rate** — the gossip cadence adapts to per-rule
    pressure. Heartbeats fire every `tick_interval` unconditionally, but
    the runtime also fires a synthetic *threshold* tick between
@@ -126,7 +130,10 @@ The decoder turns kind, flags and range into one typed payload and
 drops any combination the format forbids. A node sends its own stream as
 `Own` packets that tile the frame's range, acks and gap reports alone as
 `Ack`, and join sweeps as `SweepRequest` and `Sweep`; every data kind it
-receives merges the same way. The zone is written as zero.
+receives merges the same way. `sender_zone` is the low 32 bits of the
+stable hash of the sender's zone name (`gabion::zone::ZoneName`), never 0;
+0 means the sender has no zone. A node learns each peer's zone only from
+that peer's headers.
 
 The body follows immediately. When `cell_count > 0` it carries a
 *per-frame* rule dictionary, a per-frame node dictionary, and the cell
@@ -208,7 +215,7 @@ sequenceDiagram
     loop every round (heartbeat, threshold or prompt)
         Runtime->>Runtime: round
         Runtime->>Store: expire_at(now), heartbeats only
-        Runtime->>Store: stream_after(peer's sent)
+        Runtime->>Store: stream_after(stream, peer's sent)
         Store-->>Runtime: cells above it
         Runtime->>Tx: encode + try_send_to(each peer)
         Tx->>Peer: UDP frame
@@ -217,7 +224,7 @@ sequenceDiagram
 
     Peer->>Tx: UDP frame
     Tx->>Runtime: recv_from
-    Runtime->>Store: merge_remote(observations)
+    Runtime->>Store: merge_remote(observations, relay mark)
     Store-->>Runtime: delta rows
     Runtime->>Adapter: aggregates.apply(deltas, expirations)
 ```
@@ -228,9 +235,16 @@ sequenceDiagram
 ### Streams, acks and join sweeps
 
 Each node's own stream is its own cells in the order they last changed,
-numbered by `origin_sequence`; the cell store keeps them on one ordered
-list, so `stream_after(sent)` reads what a peer has not been sent without
-a scan. For each peer the runtime keeps `sent` and the peer's last ack,
+numbered by `origin_sequence`; its relay stream is the remote cells it was
+asked to relay, numbered by a relay sequence drawn when each is marked. The
+cell store keeps each on one ordered list, so `stream_after(stream, sent)`
+reads what a peer has not been sent without a scan. Zone peers get both
+streams, a gateway the own stream flagged, other members of a remote zone
+neither. A flagged packet marks its cells for relay: all of them when its
+range ends above the receiver's *flagged* mark (so a new gateway relays what
+it held directly), else those the merge raised; an unflagged packet takes
+the cells it raised off the relay list, since its sender is responsible for
+them. For each peer the runtime keeps `sent` and the peer's last ack,
 `acked`. Heartbeat and threshold rounds send each peer the cells above its
 `sent`, at most `q` a round, where `q` is `⌈storage.max_cells / 128⌉` or one
 packet, whichever is larger; a stream with more waiting goes on in the next
@@ -245,10 +259,28 @@ the report's ack and resends on a prompt round. A stream unacknowledged for
 one heartbeat times out and is resent with `PROBE`, which the peer answers
 on a prompt round. Acks name the incarnation they answer, so an ack written
 for a restarted process credits nothing; a peer's new incarnation resets
-both directions of its stream.
+both directions of its stream. The receiver keeps flagged own ranges on a
+mark of their own and says which mark an ack carries (`ACK_FLAGGED`); a
+gateway's acks count only flagged, a zone peer's only plain. A peer whose
+role changes so that it gains a stream is resent that stream from 0.
 
-A node that starts asks its two highest-weight peers it has heard from for
-a join sweep, retrying each heartbeat until a page arrives, and each source
+A peer is *suspect* once a packet that asks for an answer (data, or a
+probe) has gone unanswered for `gossip.suspect_after` (by default four
+heartbeats and at least 2 s), judged after each round reads its waiting
+datagrams and never while the kernel holds a refused packet, whose held time
+does not count. A suspect ranks last for the gateway role, so its zone's
+next member takes over with the origin's whole live stream; its retries
+shrink to one 86-byte header-only probe per heartbeat, and its first probe
+answer brings the resend at once. An idle gateway is probed every heartbeat,
+so an origin that went quiet still notices its gateway die. A gateway that
+cannot reach most of the zone peers it has heard sets `CANNOT_RELAY` on
+every packet, and origins fail over at once. A packet from an address
+outside the peer table is merged and nothing more: never acked or relayed.
+
+A node that starts asks its two highest-weight peers it has heard from in
+its zone (or, alone in its zone, one peer of any zone) for a join sweep, and
+asks again when its zone becomes known, retrying each heartbeat until a page
+arrives, and each source
 pages its live cells to at most `gossip.sweep_concurrency` requesters at a
 time. The sweep brings back the node's own previous-incarnation cells, which
 no stream carries.
@@ -405,6 +437,7 @@ buffers that carry it.
 | Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
 |----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
 | `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
+| `suspect_after`      | `max(4 × tick_interval, 2 s)` | How long a packet to a peer may go unanswered before the peer is suspect: routed around as a gateway and sent only probes. At least two heartbeats. | Raise on a lossy network or with long pauses when `gateway_failover` warns often; lower for faster failover. |
 | `sweep_concurrency`  | 4           | Join sweeps this node answers at once; each pages `q / sweep_concurrency` cells per prompt round.                                      | Raise only if `sweep_declined` fires outside rollouts; each sweep then runs slower.                           |
 | `max_payload_bytes`  | 1 400       | UDP datagram budget, 158 to 65 507 bytes. The codec splits a tick's frame across multiple packets when the cell list overflows.        | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
 

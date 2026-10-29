@@ -607,7 +607,7 @@ fn write_pair(hasher: &mut RawHasher<[u8; DEFAULT_SECRET_LENGTH]>, key: &str, va
     hasher.write(&[0xff]);
 }
 
-fn stable_hasher() -> RawHasher<[u8; DEFAULT_SECRET_LENGTH]> {
+pub(crate) fn stable_hasher() -> RawHasher<[u8; DEFAULT_SECRET_LENGTH]> {
     let secret =
         SecretBuffer::new(0, [0x9d; DEFAULT_SECRET_LENGTH]).expect("valid XXH3 secret length");
     RawHasher::new(secret)

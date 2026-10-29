@@ -67,7 +67,7 @@ fn remote_merge_one(
     let mut obs = ObservationBatch::with_capacity(1);
     let mut sink = DeltaSink::with_capacity(1);
     obs.push(observation(rule_fp, 0xabc, 0, origin, inc, count, ts));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     // A no-op merge (count <= stored) leaves the sink empty; recover the
     // handle via key lookup instead.
     if let Some(handle) = sink.handles.first().copied() {
@@ -220,7 +220,7 @@ fn apply_remote_rows(store: &mut CellStore, rows: &[RemoteRow]) -> DeltaSink {
     for row in rows {
         let mut obs = ObservationBatch::with_capacity(1);
         obs.push(remote_observation(row));
-        store.merge_remote(&obs, &mut sink);
+        store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     }
     sink
 }
@@ -281,21 +281,26 @@ fn local_model(rows: &[LocalRow]) -> BTreeMap<PortableKey, u32> {
     model
 }
 
+/// A live cell's identity in portable values.
+fn portable_key(store: &CellStore, handle: CellHandle) -> PortableKey {
+    let row = store.get(handle).unwrap();
+    let rule = store.rule_dictionary().descriptor(row.key.rule).unwrap();
+    let origin = store.node_dictionary().descriptor(row.key.origin).unwrap();
+    (
+        rule.fingerprint,
+        row.key.key_hash.0,
+        row.key.bucket,
+        origin.node_id.0,
+        origin.incarnation,
+    )
+}
+
 fn portable_snapshot(store: &CellStore) -> BTreeMap<PortableKey, u32> {
     let mut rows = BTreeMap::new();
     for handle in store.active_handles(0) {
-        let row = store.get(handle).unwrap();
-        let rule = store.rule_dictionary().descriptor(row.key.rule).unwrap();
-        let origin = store.node_dictionary().descriptor(row.key.origin).unwrap();
         rows.insert(
-            (
-                rule.fingerprint,
-                row.key.key_hash.0,
-                row.key.bucket,
-                origin.node_id.0,
-                origin.incarnation,
-            ),
-            row.count,
+            portable_key(store, handle),
+            store.get(handle).unwrap().count,
         );
     }
     rows
@@ -423,7 +428,7 @@ fn quickcheck_delta_sink_rows_are_exact_remote_raises(rows: RemoteRows) -> bool 
         let mut obs = ObservationBatch::with_capacity(1);
         obs.push(remote_observation(row));
         let before = sink.len();
-        store.merge_remote(&obs, &mut sink);
+        store.merge_remote(&obs, &mut sink, RelayMark::Clear);
         if row.count > previous || !model.contains_key(&key) {
             let after = sink.len();
             if after != before + 1 {
@@ -517,7 +522,7 @@ fn merge_remote_is_monotonic() {
 
     let mut obs = ObservationBatch::with_capacity(1);
     obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 100));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 1);
     let handle = sink.handles[0];
     assert_eq!(sink.previous[0], 0);
@@ -527,14 +532,14 @@ fn merge_remote_is_monotonic() {
     sink.clear();
     let mut obs2 = ObservationBatch::with_capacity(1);
     obs2.push(observation(0x11, 0xabc, 0, 7, 1, 3, 200));
-    store.merge_remote(&obs2, &mut sink);
+    store.merge_remote(&obs2, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 0);
 
     // Higher (8 > 5) — delta of 3.
     sink.clear();
     let mut obs3 = ObservationBatch::with_capacity(1);
     obs3.push(observation(0x11, 0xabc, 0, 7, 1, 8, 300));
-    store.merge_remote(&obs3, &mut sink);
+    store.merge_remote(&obs3, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 1);
     assert_eq!(sink.previous[0], 5);
     assert_eq!(sink.current[0], 8);
@@ -597,11 +602,11 @@ fn capacity_is_enforced_without_growing() {
     let mut sink = DeltaSink::with_capacity(2);
     let mut a = ObservationBatch::with_capacity(1);
     a.push(observation(0x11, 0xabc, 0, 1, 1, 1, 0));
-    store.merge_remote(&a, &mut sink);
+    store.merge_remote(&a, &mut sink, RelayMark::Clear);
     let mut b = ObservationBatch::with_capacity(1);
     b.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
     sink.clear();
-    store.merge_remote(&b, &mut sink);
+    store.merge_remote(&b, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 0); // second insert was rejected
     assert_eq!(store.active_len(), 1);
     assert_eq!(store.stats().cell_store_full_rejects, 1);
@@ -657,7 +662,7 @@ fn library_warning_names_both_spellings() {
         for origin in [1, 2] {
             let mut batch = ObservationBatch::with_capacity(1);
             batch.push(observation(0x11, 0xabc, 0, origin, 1, 1, 0));
-            store.merge_remote(&batch, &mut sink);
+            store.merge_remote(&batch, &mut sink, RelayMark::Clear);
         }
     });
     let line = logs
@@ -697,7 +702,7 @@ fn delta_sink_records_exact_raises() {
     let mut obs = ObservationBatch::with_capacity(2);
     obs.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
     obs.push(observation(0x11, 0xabc, 0, 2, 1, 7, 0));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 2);
 
     sink.clear();
@@ -705,7 +710,7 @@ fn delta_sink_records_exact_raises() {
     let mut obs2 = ObservationBatch::with_capacity(2);
     obs2.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
     obs2.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
-    store.merge_remote(&obs2, &mut sink);
+    store.merge_remote(&obs2, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 0);
 }
 
@@ -718,7 +723,7 @@ fn delta_applies_locally_reflects_rule_dictionary() {
     let mut obs = ObservationBatch::with_capacity(2);
     obs.push(observation(0x11, 0xabc, 0, 9, 1, 1, 0));
     obs.push(observation(0x22, 0xabc, 0, 9, 1, 1, 0));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 2);
     assert_eq!(sink.applies_locally[0], 1);
     assert_eq!(sink.applies_locally[1], 0);
@@ -739,7 +744,7 @@ fn unknown_rule_cells_round_trip() {
     let mut sink = DeltaSink::with_capacity(1);
     let mut obs = ObservationBatch::with_capacity(1);
     obs.push(observation(0x33, 0xabc, 0, 5, 1, 30, 2));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.applies_locally[0], 0);
 
     // Expire: bucket 0, live = 0, current = 5 -> expired.
@@ -922,7 +927,7 @@ fn dictionary_full_rejects_with_counter() {
     let mut obs = ObservationBatch::with_capacity(2);
     obs.push(observation(0x20, 0xabc, 0, 3, 1, 1, 0));
     obs.push(observation(0x10, 0xabd, 0, 3, 1, 1, 0));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 1);
     store.ingest_local(&obs, &mut sink);
     assert_eq!(sink.len(), 2);
@@ -973,7 +978,7 @@ fn expire_emits_one_row_per_freed_cell() {
     let mut sink = DeltaSink::with_capacity(2);
     obs.push(observation(0x22, 0xabc, 0, 5, 1, 7, 100));
     obs.push(observation(0x22, 0xdef, 0, 6, 1, 11, 200));
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
 
     let rule_local_slot = store.rule_dictionary.find(0x11).unwrap();
     let rule_doomed_slot = store.rule_dictionary.find(0x22).unwrap();
@@ -1104,7 +1109,7 @@ fn expire_at_and_expire_agree_for_same_now() {
         let mut sink = DeltaSink::with_capacity(2);
         obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
         obs.push(observation(0x11, 0xdef, 5, 8, 1, 5, 250));
-        s.merge_remote(&obs, &mut sink);
+        s.merge_remote(&obs, &mut sink, RelayMark::Clear);
         s
     };
 
@@ -1172,7 +1177,7 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
     let mut obs = ObservationBatch::with_capacity(1);
     let mut deltas = DeltaSink::with_capacity(1);
     obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
-    store.merge_remote(&obs, &mut deltas);
+    store.merge_remote(&obs, &mut deltas, RelayMark::Clear);
 
     let mut expirations = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire_at(150, &mut expirations), Expiry::Done);
@@ -1303,7 +1308,7 @@ impl Arbitrary for ExpireTick {
 
 #[derive(Clone, Debug)]
 enum MixedOp {
-    Remote(RemoteRow),
+    Remote(RemoteRow, RelayMark),
     Local(LocalRow),
     Expire(ExpireTick),
 }
@@ -1313,7 +1318,8 @@ impl Arbitrary for MixedOp {
         // ~40% Remote, ~40% Local, ~20% Expire.
         let pick = u8::arbitrary(g) % 10;
         if pick < 4 {
-            MixedOp::Remote(RemoteRow::arbitrary(g))
+            let marks = [RelayMark::Clear, RelayMark::Changed, RelayMark::All];
+            MixedOp::Remote(RemoteRow::arbitrary(g), *g.choose(&marks).unwrap())
         } else if pick < 8 {
             MixedOp::Local(LocalRow::arbitrary(g))
         } else {
@@ -1339,10 +1345,10 @@ fn apply_mixed_op_with_sinks(
     exp_sink: &mut ExpirationSink,
 ) {
     match op {
-        MixedOp::Remote(row) => {
+        MixedOp::Remote(row, mark) => {
             let mut obs = ObservationBatch::with_capacity(1);
             obs.push(remote_observation(row));
-            store.merge_remote(&obs, sink);
+            store.merge_remote(&obs, sink, *mark);
         }
         MixedOp::Local(row) => {
             let mut obs = ObservationBatch::with_capacity(1);
@@ -1376,7 +1382,7 @@ fn apply_mixed_op_with_sinks(
 
 fn apply_mixed_op_to_model(model: &mut BTreeMap<PortableKey, u32>, op: &MixedOp) {
     match op {
-        MixedOp::Remote(row) => {
+        MixedOp::Remote(row, _) => {
             let key = (
                 0x100 + row.rule as u128,
                 0x200 + row.key as u128,
@@ -1472,20 +1478,70 @@ fn own_cells(store: &CellStore) -> Vec<(u64, CellHandle)> {
     own
 }
 
+/// Read `stream`'s list from its tail back to its head, at most `cap`
+/// slots, so a cycle cannot loop.
+fn backward(store: &CellStore, stream: Stream, cap: usize) -> Vec<CellHandle> {
+    let mut backward = Vec::with_capacity(cap);
+    let mut cursor = store.ends(stream).tail;
+    while let Some(slot) = cursor.get()
+        && backward.len() < cap
+    {
+        backward.push(store.handle_for(slot));
+        cursor = store.stream_prev[slot as usize];
+    }
+    backward.reverse();
+    backward
+}
+
 /// After every insert, raise, merge and expiry, the own list holds exactly
-/// the live own cells in ascending sequence, read forward and backward: a
-/// raised cell moves to the tail as the newest, a freed one leaves, and
-/// nothing repeats or cycles (each walk is capped one past the capacity).
+/// the live own cells in ascending sequence, and the relay list exactly the
+/// remote cells marked for relay in the order they were marked, each read
+/// forward and backward: a raised own cell or a remarked remote one moves to
+/// the tail, a freed one or one raised by an unflagged packet leaves, no cell
+/// is on both lists, and nothing repeats or cycles (each walk is capped one
+/// past the capacity).
 #[quickcheck]
 fn stream_lists_match_model(ops: MixedOps) -> bool {
     let mut store = quickcheck_store();
     let cap = store.capacity() as usize + 1;
     let mut out = Vec::with_capacity(cap);
+    let mut relay: Vec<PortableKey> = Vec::new();
     for op in &ops.0 {
         let mut sink = DeltaSink::with_capacity(1);
         let mut exp_sink = ExpirationSink::with_capacity(store.capacity() as usize);
+        let before = portable_snapshot(&store);
         apply_mixed_op_with_sinks(&mut store, op, &mut sink, &mut exp_sink);
-        store.stream_after(0, cap, &mut out);
+        let after = portable_snapshot(&store);
+        if let MixedOp::Remote(row, mark) = op {
+            let key = (
+                0x100 + row.rule as u128,
+                0x200 + row.key as u128,
+                row.bucket as BucketEpoch,
+                row.origin as u128,
+                row.incarnation as Incarnation,
+            );
+            let rose = after.get(&key) > before.get(&key);
+            let own = (key.3, key.4) == (local().node_id.0, local().incarnation);
+            let marked = match mark {
+                RelayMark::All => true,
+                RelayMark::Changed => rose,
+                RelayMark::Clear => false,
+            };
+            if !own && (marked || rose) {
+                relay.retain(|k| *k != key);
+            }
+            if !own && marked && after.contains_key(&key) {
+                relay.push(key);
+            }
+        }
+        relay.retain(|key| after.contains_key(key));
+        store.stream_after(Stream::Relay, 0, cap, &mut out);
+        let relayed: Vec<_> = out.iter().map(|&h| portable_key(&store, h)).collect();
+        if relayed != relay || backward(&store, Stream::Relay, cap) != out {
+            return false;
+        }
+        let on_relay = out.clone();
+        store.stream_after(Stream::Own, 0, cap, &mut out);
         let model: Vec<_> = own_cells(&store).into_iter().map(|(_, h)| h).collect();
         if out != model || out.iter().any(|&h| store.get(h).is_none()) {
             return false;
@@ -1493,20 +1549,14 @@ fn stream_lists_match_model(ops: MixedOps) -> bool {
         if let MixedOp::Local(_) = op
             && let Some(&changed) = sink.handles.first()
             && (out.last() != Some(&changed)
-                || store.get(changed).map(|row| row.origin_sequence) != Some(store.own_head()))
+                || store.get(changed).map(|row| row.origin_sequence)
+                    != Some(store.head(Stream::Own)))
         {
             return false;
         }
-        let mut backward = Vec::with_capacity(cap);
-        let mut cursor = store.own_list.tail;
-        while let Some(slot) = cursor.get()
-            && backward.len() < cap
+        if backward(&store, Stream::Own, cap) != model
+            || on_relay.iter().any(|handle| model.contains(handle))
         {
-            backward.push(store.handle_for(slot));
-            cursor = store.stream_prev[slot as usize];
-        }
-        backward.reverse();
-        if backward != model {
             return false;
         }
     }
@@ -1527,11 +1577,11 @@ fn stream_after_returns_exactly_the_cells_above_sent(ops: MixedOps, pick: u8, ma
     let own = own_cells(&store);
     let sent = match own.len() {
         len if len > 0 && pick.is_multiple_of(2) => own[usize::from(pick / 2) % len].0,
-        _ => u64::from(pick) % (store.own_head() + 3),
+        _ => u64::from(pick) % (store.head(Stream::Own) + 3),
     };
     let max = usize::from(max % 8) + 1;
     let mut out = Vec::with_capacity(max);
-    store.stream_after(sent, max, &mut out);
+    store.stream_after(Stream::Own, sent, max, &mut out);
     let expected: Vec<_> = own
         .iter()
         .filter(|&&(seq, _)| seq > sent)
@@ -1613,7 +1663,7 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
             row.ts as u64,
         ));
         let mut sink = DeltaSink::with_capacity(1);
-        store.merge_remote(&obs, &mut sink);
+        store.merge_remote(&obs, &mut sink, RelayMark::Clear);
 
         if !interned_rules.contains(&fp) {
             if interned_rules.len() >= 2 {

@@ -38,7 +38,7 @@ use std::num::NonZeroU128;
 use body::{CELL_BYTES, DICT_LEN_BYTES, decode_body, encode_packet_body};
 use header::read_header;
 
-use crate::crdt::{CellHandle, CellStore, Observation};
+use crate::crdt::{CellHandle, CellStore, Observation, Stream};
 
 use thiserror::Error;
 
@@ -252,12 +252,12 @@ impl<'a> Packets<'a> {
     /// up to just below the next packet's first cell, or to the frame's upper
     /// end when it is the last. Advances `lower` past it.
     fn packet_payload(&mut self) -> CellPayload {
-        let close = |range: StreamRange, lower: &mut u64| {
+        let close = |stream, range: StreamRange, lower: &mut u64| {
             let upper = match self.handles.get(self.cursor) {
                 Some(&next) => self
                     .store
-                    .get(next)
-                    .map_or(range.upper(), |row| row.origin_sequence - 1),
+                    .sequence(stream, next)
+                    .map_or(range.upper(), |seq| seq - 1),
                 None => range.upper(),
             };
             let packet = StreamRange::new(*lower, upper);
@@ -271,12 +271,12 @@ impl<'a> Packets<'a> {
                 relay_into_zone,
                 probe,
             } => CellPayload::Own {
-                range: close(range, &mut self.lower),
+                range: close(Stream::Own, range, &mut self.lower),
                 relay_into_zone,
                 probe,
             },
             CellPayload::Relay { range, probe } => CellPayload::Relay {
-                range: close(range, &mut self.lower),
+                range: close(Stream::Relay, range, &mut self.lower),
                 probe,
             },
             CellPayload::Sweep => CellPayload::Sweep,

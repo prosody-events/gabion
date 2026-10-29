@@ -214,6 +214,7 @@ fn sample(setting: Setting) -> &'static str {
         Setting::GossipClusterIdHash => "0xc0ffee",
         Setting::GossipTargetErrBps => "250",
         Setting::GossipMinEmitInterval => "10ms",
+        Setting::GossipSuspectAfter => "3s",
         Setting::GossipSweepConcurrency => "8",
         Setting::DiscoverySelfAddr => "10.0.0.1:9000",
         Setting::DiscoveryNamespaceAllow => "team-a",

@@ -30,7 +30,7 @@ Read it end-to-end and you should be able to open `crdt.rs` and recognise every 
    - 6.2 [Write: `merge_remote`](#62-write-merge_remote)
    - 6.3 [The shared `upsert` core](#63-the-shared-upsert-core)
    - 6.4 [Read: `find`, `resolve`, `get`](#64-read-find-resolve-get)
-7. [The own-stream list](#7-the-own-stream-list)
+7. [The stream lists](#7-the-stream-lists)
 8. [Expiry](#8-expiry)
 9. [End-to-end traced example](#9-end-to-end-traced-example)
 10. [Invariants reference](#10-invariants-reference)
@@ -94,7 +94,7 @@ flowchart TB
     CS --> IO
 ```
 
-§3 walks the three foundations bottom-up — they have no dependencies on the cell store and compose into it. §4 introduces the store; §5 the I/O containers; §6 traces a write through both; §7 covers the own-stream list; §8 covers expiry.
+§3 walks the three foundations bottom-up — they have no dependencies on the cell store and compose into it. §4 introduces the store; §5 the I/O containers; §6 traces a write through both; §7 covers the stream lists; §8 covers expiry.
 
 ---
 
@@ -873,7 +873,7 @@ The origin and incarnation columns of the batch are ignored on the local path be
 
 ### 6.2 Write: `merge_remote`
 
-`merge_remote(obs, sink)` is symmetric with `ingest_local` apart from three differences. The origin and incarnation come from the batch — that is, from the peer that attributed the hit. `obs.counts[i]` is an *absolute* observed count rather than a delta, so the store max-merges by keeping `max(stored, observed)`. And `translate_identity` interns both the rule fingerprint and the `(node_id, incarnation)` pair into dictionary slots, admitting unknown rules with a default descriptor. The call is then `upsert(UpsertSpec { …, mode: MaxMerge { observed } }, sink)`.
+`merge_remote(obs, sink, mark)` is symmetric with `ingest_local` apart from three differences, and it keeps the relay list as the `RelayMark` says (section 7). The origin and incarnation come from the batch — that is, from the peer that attributed the hit. `obs.counts[i]` is an *absolute* observed count rather than a delta, so the store max-merges by keeping `max(stored, observed)`. And `translate_identity` interns both the rule fingerprint and the `(node_id, incarnation)` pair into dictionary slots, admitting unknown rules with a default descriptor. The call is then `upsert(UpsertSpec { …, mode: MaxMerge { observed } }, sink)`.
 
 ### 6.3 The shared `upsert` core
 
@@ -959,7 +959,7 @@ aggregator can fold without re-reading the store.
 
 `next_sequence_by_origin` is sized to `node_dictionary_capacity`. Each origin gets its own monotonic counter, and `next_origin_sequence` saturating-adds one before returning, so the first sequence ever minted is 1; a `0` read back from a never-allocated origin slot means "nothing here yet."
 
-For this node's own slot the counter is the own stream's head (`own_head()`); the slot is pinned (below), so the head never resets. When any other node slot is freed by refcount, its counter is reset.
+For this node's own slot the counter is the own stream's head (`head(Stream::Own)`); the slot is pinned (below), so the head never resets. When any other node slot is freed by refcount, its counter is reset.
 
 #### The `local_node_slot` pin
 
@@ -983,7 +983,7 @@ There is no atomic "snapshot the whole store" operation. The structure is single
 ---
 
 <a id="gossip-and-convergence"></a>
-## 7. The own-stream list
+## 7. The stream lists
 
 The gossip runtime sends each peer this node's own cells that changed
 since it last sent that peer anything: its *own stream*, numbered by
@@ -994,16 +994,36 @@ two columns, `stream_prev` and `stream_next`, with its ends in
 slot, since the capacity is at most 2^30); readers see `get() ->
 Option<u32>`.
 
-**Invariant.** The own list holds exactly the live cells whose origin is
-`local_node_slot`, in strictly ascending `origin_sequences`; a free or
-remote slot is in no list.
+A second list on the same two link columns, with its ends in
+`relay_list`, holds the *relay stream*: remote cells this node was asked to
+relay into its zone, numbered by `relay_seq: Box<[Option<NonZeroU64>]>`
+(`None`: not on the list) drawn from `relay_head`, the stream's head.
+`head(Stream::Own)` is `next_sequence_by_origin[local_node_slot]` and
+`head(Stream::Relay)` is `relay_head`; neither ever decreases.
 
-**Maintenance**, `O(1)` per cell: `upsert` appends an inserted own cell at
-the tail, and unlinks then re-appends a raised one (its new sequence is the
-largest); `free_cell_at` unlinks a freed own cell.
+**Invariants.** The own list holds exactly the live cells whose origin is
+`local_node_slot`, in strictly ascending `origin_sequences`; the relay list
+exactly the live remote cells whose `relay_seq` is `Some`, in strictly
+ascending `relay_seq`. A slot is in at most one list (own cells are never
+marked), and a free slot is in none.
 
-**Reading.** `stream_after(sent, max, out)` fills `out` with the live own
-cells above `sent`, ascending, at most `max`. The walk to the first cell
+**Maintenance**, `O(1)` per cell:
+
+| Event | List operation |
+|---|---|
+| an own cell is inserted or raised (`upsert`) | unlink if linked; append at the own tail |
+| a remote cell merges with `RelayMark::All` | `relay_seq = ++relay_head`; move to the relay tail, raised or not |
+| … with `RelayMark::Changed` and the count rose | the same |
+| … with `RelayMark::Clear` and the count rose | unlink; `relay_seq = None` |
+| a cell is freed (`free_cell_at`) | unlink from whichever list holds it |
+
+The runtime picks the mark from the packet: `All` for a flagged packet
+whose range ends above the sender's flagged mark, `Changed` for another
+flagged one, `Clear` for everything else.
+
+**Reading.** `stream_after(stream, sent, max, out)` fills `out` with the
+live cells of `stream` above `sent`, ascending, at most `max`;
+`sequence(stream, handle)` is one cell's position. The walk to the first cell
 above `sent` starts from whichever end of the list is nearer by sequence,
 so it costs at most the smaller of `sent − first` and `last − sent` steps
 before it iterates forward: a new peer, a rewound stream and a draining
@@ -1052,7 +1072,7 @@ A small concrete sequence that ties the previous sections together.
 - `lookup_index` finds slot 0.
 - `mode = Accumulate { hits: 5 }`, `previous = 1`, `next = previous.saturating_add_hits(5) = 6`.
 - `counts[0] = 6`, sequence advances to 2, `origin_sequences[0] = 2`.
-- Slot 0 is unlinked and re-appended at the own list's tail; `stream_after(1, …)` now returns it, where `stream_after(2, …)` does not.
+- Slot 0 is unlinked and re-appended at the own list's tail; `stream_after(Stream::Own, 1, …)` now returns it, where `stream_after(Stream::Own, 2, …)` does not.
 - `DeltaSink` row appended: `(handle, identity, 1, 6, 5, ...)`.
 
 **Step 3 — bucket 42 expires.**
@@ -1161,9 +1181,9 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `find(key)` | Hash-index lookup by `CompactCellKey`. |
 | `resolve(handle)`, `get(handle)` | Handle-based reads. |
 | `active_handles(from)` | Slot-order iterator from `from`: sweep pages, diagnostics. |
-| `own_head()`, `stream_after(sent, max, out)` | The own stream's head, and its live cells above `sent` (§7). |
+| `head(stream)`, `stream_after(stream, sent, max, out)`, `sequence(stream, handle)` | A stream's head, its live cells above `sent`, and one cell's position (§7). |
 | `ingest_local(obs, sink)` | Apply locally observed hits (saturating add). |
-| `merge_remote(obs, sink)` | Merge peer observations (max-merge). |
+| `merge_remote(obs, sink, mark)` | Merge peer observations (max-merge), keeping the relay list by `mark` (§7). |
 | `expire(current_epoch_by_rule, live_buckets, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell, stopping with `Expiry::More` when the sink is full. |
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
 

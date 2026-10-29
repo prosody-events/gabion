@@ -1,19 +1,29 @@
 //! The runtime's peer table: one dense row per discovered peer, sized once to
 //! `gossip.peer_capacity` and indexed by address. The columns every round
-//! scans (role, flags, the own stream's `sent`, the earliest timer) are hot;
-//! the stream state read only when a packet goes to or comes from one peer is
-//! cold, in [`PeerLink`].
+//! scans (role, flags, each stream's `sent`, the earliest timer) are hot; the
+//! stream, zone and answer state read only when a packet goes to or comes
+//! from one peer is cold, in [`PeerLink`].
+//!
+//! Each row's role follows from the zones its peer's headers announce: a peer
+//! of this node's zone (or of an unknown or no zone) gets both streams
+//! directly, and in each other zone the member that ranks first for this node
+//! (rendezvous weight, suspects last) is the gateway that gets the own stream
+//! flagged for relay. A peer is suspect once a packet that asks for an answer
+//! has gone unanswered for `gossip.suspect_after`, or it said it cannot relay.
 
+use std::cmp::Reverse;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU16;
 
 use crate::crdt::{
-    CellIndex, Incarnation, NodeIdentity, hash_fingerprint, mix64, pow2_index_capacity_for,
+    CellIndex, Incarnation, NodeIdentity, Stream, hash_fingerprint, mix64, pow2_index_capacity_for,
 };
 use crate::defaults::GOSSIP_GAP_REPORTS;
-use crate::wire::StreamRange;
+use crate::wire::{AckInfo, OwnAck, StreamRange};
+use crate::zone::ZoneHash;
 
-use super::admin::PeerEntry;
+use super::admin::{AnswerState, PeerEntry, PeerZone, RoleCounts};
+use super::transport::Sent;
 
 /// What [`PeerTable::insert`] did with an address.
 #[derive(Debug, Eq, PartialEq)]
@@ -32,11 +42,24 @@ pub(super) enum Insert {
     serde(rename_all = "snake_case")
 )]
 pub enum Role {
-    /// A peer this node sends its own stream to directly.
+    /// A peer of this node's zone, or of an unknown or no zone: it gets the
+    /// own and relay streams directly.
     Zone,
+    /// The member of a remote zone this node sends its own stream to,
+    /// flagged for relay into that zone.
+    Gateway,
+    /// Any other member of a remote zone: it is sent only acks.
+    Remote,
     /// A peer that speaks another wire version: it is sent nothing until a
     /// packet of this version arrives from it.
     Incompatible,
+}
+
+impl Role {
+    /// Whether the row gets this node's own stream.
+    fn gets_own(self) -> bool {
+        matches!(self, Self::Zone | Self::Gateway)
+    }
 }
 
 /// The row's owed work, one bit each.
@@ -47,7 +70,8 @@ impl PeerFlags {
     /// The peer sent stream data since this node last sent it a packet; a
     /// heartbeat sends a standalone ack.
     pub(super) const ACK_DUE: Self = Self(0x01);
-    /// The peer's own stream has a gap open, whose report is prompt work.
+    /// A gap open on the peer's own stream (the mark `OwnMode` selects) or
+    /// relay stream, whose report is prompt work.
     pub(super) const GAP_OPEN: Self = Self(0x08);
     /// The bits that make a row prompt work.
     pub(super) const PROMPT: Self = Self(Self::RESEND_OWN.0 | Self::REPLY_DUE.0 | Self::GAP_OPEN.0);
@@ -91,7 +115,6 @@ pub(super) struct Outbound {
 pub(super) struct StreamTx<'a> {
     sent: &'a mut u64,
     state: &'a mut Outbound,
-    rto_ms: u64,
 }
 
 impl StreamTx<'_> {
@@ -104,17 +127,19 @@ impl StreamTx<'_> {
         *self.sent = (*self.sent).max(upper);
     }
 
-    /// Credit an ack. One above the head, or not above `acked`, changes
-    /// nothing; progress that leaves data in flight restarts the timer.
-    pub(super) fn note_ack(&mut self, ack: u64, head: u64, now: u64) {
+    /// Credit an ack; returns whether it was progress. One above the head,
+    /// or not above `acked`, changes nothing; progress that leaves data in
+    /// flight restarts the timer.
+    pub(super) fn note_ack(&mut self, ack: u64, head: u64, now: u64) -> bool {
         if ack > head || ack <= self.state.acked {
-            return;
+            return false;
         }
         self.state.acked = ack;
         *self.sent = (*self.sent).max(ack);
         if ack < *self.sent {
             self.state.timer_ms = now;
         }
+        true
     }
 
     /// A gap report says "I hold through `ack`": resend from there, even
@@ -130,14 +155,18 @@ impl StreamTx<'_> {
         ack < head
     }
 
-    /// Data has been in flight for a whole timeout without an ack.
-    pub(super) fn timed_out(&self, now: u64) -> bool {
-        self.state.acked < *self.sent && now.saturating_sub(self.state.timer_ms) >= self.rto_ms
+    pub(super) fn in_flight(&self) -> bool {
+        self.state.acked < *self.sent
     }
 
     /// Resend everything above `acked`.
     pub(super) fn rewind(&mut self, now: u64) {
         *self.sent = self.state.acked;
+        self.restart(now);
+    }
+
+    /// Time the next retry one timeout from `now`, resending nothing.
+    pub(super) fn restart(&mut self, now: u64) {
         self.state.timer_ms = now;
     }
 
@@ -184,9 +213,8 @@ pub(super) struct Inbound {
 }
 
 impl Inbound {
-    /// The highest position held contiguously from 0: the ack to send.
-    pub(super) fn have(&self) -> u64 {
-        self.have
+    fn is_open(&self) -> bool {
+        matches!(self.gap, Gap::Open { .. })
     }
 
     /// A packet closing `range` arrived. `have` moves only over contiguous
@@ -288,27 +316,107 @@ fn keep(stash: (u64, u64), range: (u64, u64)) -> (u64, u64) {
     }
 }
 
+/// What this node waits for from a peer. Only the transitions §3.7 of the
+/// design lists change it: a send that asks for an answer starts `Owed`,
+/// progress settles it or restarts it, and `CANNOT_RELAY` from a remote zone
+/// replaces it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum Answer {
+    /// Nothing sent waits for an answer.
+    #[default]
+    Settled,
+    /// The oldest unanswered packet that asked for an answer left at
+    /// `since_ms`.
+    Owed { since_ms: u64 },
+    /// The peer said it cannot reach most of its zone; suspect from
+    /// `since_ms`.
+    CannotRelay { since_ms: u64 },
+}
+
+impl Answer {
+    /// When the peer is or becomes suspect: `suspect_after_ms` after the
+    /// oldest unanswered packet, or at once for `CannotRelay`.
+    fn suspect_from(self, suspect_after_ms: u64) -> Option<u64> {
+        match self {
+            Self::Settled => None,
+            Self::Owed { since_ms } => Some(since_ms.saturating_add(suspect_after_ms)),
+            Self::CannotRelay { since_ms } => Some(since_ms),
+        }
+    }
+
+    fn since_ms(self) -> Option<u64> {
+        match self {
+            Self::Settled => None,
+            Self::Owed { since_ms } | Self::CannotRelay { since_ms } => Some(since_ms),
+        }
+    }
+}
+
+/// Which kind of own-stream packet the peer sent last: it picks the mark this
+/// node acks, the `ACK_FLAGGED` bit, and the gap it reports.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum OwnMode {
+    #[default]
+    Plain,
+    /// The last own packet carried `RELAY_INTO_ZONE`.
+    Flagged,
+}
+
 /// A row's cold state.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct PeerLink {
-    /// The peer's rendezvous weight for this node; join sweeps ask the
-    /// highest.
+    /// The peer's rendezvous weight for this node: join sweeps ask, and
+    /// gateways are chosen, highest first.
     weight: u64,
+    /// The zone the peer's headers announce: it moves only from unknown to
+    /// known, or on a new incarnation.
+    zone: Option<ZoneHash>,
     /// From the peer's latest current packet; `None` until its first.
     pub(super) identity: Option<NodeIdentity>,
     /// The incarnation before the last restart; a late packet carrying it
     /// changes no stream state.
     prev_incarnation: Option<Incarnation>,
+    answer: Answer,
     own: Outbound,
-    /// The peer's own stream as this node receives it.
-    pub(super) own_in: Inbound,
+    relay: Outbound,
+    /// The peer's own stream as this node receives it: unflagged ranges, and
+    /// the ranges flagged `RELAY_INTO_ZONE`, each with its own mark.
+    own_in: Inbound,
+    flagged_in: Inbound,
+    own_mode: OwnMode,
+    /// The peer's relay stream.
+    relay_in: Inbound,
 }
 
-// 128 bytes: the fields take 120 (`Option<NodeIdentity>` 48 at `u128`
-// alignment, the inbound mark 40) and pad to 128: the peer row's share of
-// the about-200-byte per-slot cost the `gossip.peer_capacity` warning quotes.
+impl PeerLink {
+    /// This node's ack of the peer's own stream: the mark of the kind of
+    /// packet it sent last.
+    pub(super) fn own_ack(&self) -> OwnAck {
+        match self.own_mode {
+            OwnMode::Plain => OwnAck::Plain(self.own_in.have),
+            OwnMode::Flagged => OwnAck::Flagged(self.flagged_in.have),
+        }
+    }
+
+    pub(super) fn relay_ack(&self) -> u64 {
+        self.relay_in.have
+    }
+
+    /// The own-stream mark whose gap is reported; the other is inert.
+    fn own_mark(&mut self) -> &mut Inbound {
+        match self.own_mode {
+            OwnMode::Plain => &mut self.own_in,
+            OwnMode::Flagged => &mut self.flagged_in,
+        }
+    }
+}
+
+// 240 bytes (`Option<NodeIdentity>` 48 at `u128` alignment, each of the
+// three inbound marks 40, the answer and each outbound 16): with the 26 hot
+// bytes, the 32-byte address and the index, the about-330-byte per-slot cost
+// the `gossip.peer_capacity` warning quotes.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<PeerLink>() == 128);
+const _: () = assert!(size_of::<PeerLink>() == 240);
 
 /// What a packet's sender identity means for its row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,41 +430,111 @@ pub(super) enum Contact {
     Late,
 }
 
+/// What [`PeerTable::credit`] asks of the runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct Credit {
+    /// The relay stream was rewound: prompt work.
+    pub(super) resend_relay: bool,
+    /// A suspect's probe answer rewound these streams.
+    pub(super) answer_rewound: [bool; 2],
+}
+
+/// A zone row with relay data in flight turned suspect.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Stall {
+    pub(super) peer: SocketAddr,
+    pub(super) stalled_ms: u64,
+    pub(super) relay_unacked: u64,
+}
+
+/// A suspect gateway lost the role.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Failover {
+    pub(super) zone: ZoneHash,
+    pub(super) old: SocketAddr,
+    pub(super) new: SocketAddr,
+    /// Whether the old gateway said it cannot relay.
+    pub(super) cannot_relay: bool,
+    pub(super) unanswered_ms: u64,
+}
+
+/// The best gateway candidate of one remote zone seen so far in a refresh.
+#[derive(Clone, Copy, Debug)]
+struct ZoneBest {
+    zone: ZoneHash,
+    row: u32,
+}
+
+/// A gateway candidate's rank, highest wins: every live member above every
+/// suspect, live members by weight, suspects by the earliest suspicion, and
+/// the address last.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Rank {
+    Suspect(Reverse<u64>, SocketAddr),
+    Live(u64, SocketAddr),
+}
+
 /// Rows `0..len` hold the peers in no particular order: a removed row is
 /// filled by the last. Every column is sized at construction and never grows.
 pub(super) struct PeerTable {
     len: usize,
     /// The retransmission timeout: one heartbeat.
     rto_ms: u64,
+    /// `gossip.suspect_after`.
+    suspect_after_ms: u64,
     /// This node's id hashed, for the rendezvous weights.
     local_key: u64,
+    local_zone: Option<ZoneHash>,
+    /// A zone, a suspicion or the membership changed: roles need a refresh.
+    stale: bool,
+    /// When suspicion was last judged; a row is suspect as of then.
+    judged_ms: u64,
     // Hot: every round's scan.
     role: Box<[Role]>,
     flags: Box<[PeerFlags]>,
-    /// The highest own-stream position sent to the peer.
+    /// The highest own- and relay-stream positions sent to the peer.
     own_sent: Box<[u64]>,
+    relay_sent: Box<[u64]>,
     deadline: Box<[Deadline]>,
     // Cold: one packet to or from this peer.
     addr: Box<[SocketAddr]>,
     link: Box<[PeerLink]>,
     /// Address hash to row; `addr[row]` confirms a match.
     by_addr: CellIndex,
+    /// The refresh's best member per remote zone: there are never more zones
+    /// than peers.
+    zones: Box<[ZoneBest]>,
 }
 
 impl PeerTable {
-    pub(super) fn with_capacity(capacity: NonZeroU16, local_key: u64, rto_ms: u64) -> Self {
+    pub(super) fn with_capacity(
+        capacity: NonZeroU16,
+        local_key: u64,
+        rto_ms: u64,
+        suspect_after_ms: u64,
+    ) -> Self {
         let rows = usize::from(capacity.get());
+        let unused = ZoneBest {
+            zone: ZoneHash::MIN,
+            row: 0,
+        };
         Self {
             len: 0,
             rto_ms,
+            suspect_after_ms,
             local_key,
+            local_zone: None,
+            stale: false,
+            judged_ms: 0,
             role: vec![Role::Zone; rows].into_boxed_slice(),
             flags: vec![PeerFlags::default(); rows].into_boxed_slice(),
             own_sent: vec![0; rows].into_boxed_slice(),
+            relay_sent: vec![0; rows].into_boxed_slice(),
             deadline: vec![Deadline::NEVER; rows].into_boxed_slice(),
             addr: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)); rows].into_boxed_slice(),
             link: vec![PeerLink::default(); rows].into_boxed_slice(),
             by_addr: CellIndex::with_capacity(pow2_index_capacity_for(capacity.into())),
+            zones: vec![unused; rows].into_boxed_slice(),
         }
     }
 
@@ -374,7 +552,9 @@ impl PeerTable {
     }
 
     /// A known address is `Present` even when the table is full, so
-    /// re-announcing a peer is never a decline.
+    /// re-announcing a peer is never a decline. A new row owes the peer one
+    /// standalone ack, so a peer that restarted into an idle cluster hears
+    /// from it and can ask it for a join sweep.
     pub(super) fn insert(&mut self, addr: SocketAddr) -> Insert {
         let hash = addr_hash(addr);
         if self.lookup(hash, addr).is_some() {
@@ -385,8 +565,9 @@ impl PeerTable {
             return Insert::Full;
         }
         self.role[row] = Role::Zone;
-        self.flags[row] = PeerFlags::default();
+        self.flags[row] = PeerFlags::ACK_DUE;
         self.own_sent[row] = 0;
+        self.relay_sent[row] = 0;
         self.deadline[row] = Deadline::NEVER;
         self.addr[row] = addr;
         self.link[row] = PeerLink {
@@ -405,6 +586,7 @@ impl PeerTable {
         let row = self.lookup(hash, addr)?;
         self.by_addr.remove(hash, row);
         self.len -= 1;
+        self.stale = true;
         let (row, last) = (row as usize, self.len);
         let removed = self.link[row];
         if row != last {
@@ -414,6 +596,7 @@ impl PeerTable {
             self.role[row] = self.role[last];
             self.flags[row] = self.flags[last];
             self.own_sent[row] = self.own_sent[last];
+            self.relay_sent[row] = self.relay_sent[last];
             self.deadline[row] = self.deadline[last];
             self.addr[row] = self.addr[last];
             self.link[row] = self.link[last];
@@ -421,13 +604,24 @@ impl PeerTable {
         Some(removed)
     }
 
-    /// Note the sender identity of a packet from `row`. A new incarnation
-    /// resets the whole row: both directions of the stream start over.
-    pub(super) fn contact(&mut self, row: usize, sender: NodeIdentity) -> Contact {
+    /// Note the sender identity and zone of a packet from `row`. A known zone
+    /// changes only with the incarnation, so a zone-0 header never clears it.
+    /// A peer heard for the first time, or in a new incarnation (which resets
+    /// the whole row), is owed one ack, so a node that started into an idle
+    /// cluster hears every peer it greets.
+    pub(super) fn contact(
+        &mut self,
+        row: usize,
+        sender: NodeIdentity,
+        zone: Option<ZoneHash>,
+    ) -> Contact {
         let link = &mut self.link[row];
         let contact = match link.identity {
-            None => Contact::First,
-            Some(known) if known == sender => return Contact::Current,
+            None => {
+                self.flags[row].set(PeerFlags::ACK_DUE, true);
+                Contact::First
+            }
+            Some(known) if known == sender => Contact::Current,
             Some(known)
                 if known.node_id == sender.node_id
                     && link.prev_incarnation == Some(sender.incarnation) =>
@@ -435,37 +629,61 @@ impl PeerTable {
                 return Contact::Late;
             }
             Some(known) => {
-                link.prev_incarnation = Some(known.incarnation);
-                link.own = Outbound::default();
-                link.own_in = Inbound::default();
+                *link = PeerLink {
+                    weight: link.weight,
+                    prev_incarnation: Some(known.incarnation),
+                    ..PeerLink::default()
+                };
                 self.own_sent[row] = 0;
-                self.flags[row] = PeerFlags::default();
+                self.relay_sent[row] = 0;
+                self.flags[row] = PeerFlags::ACK_DUE;
+                self.stale = true;
                 Contact::Restarted
             }
         };
-        self.link[row].identity = Some(sender);
+        let link = &mut self.link[row];
+        link.identity = Some(sender);
+        if link.zone.is_none() && zone.is_some() {
+            link.zone = zone;
+            self.stale = true;
+        }
         self.refresh_deadline(row);
         contact
     }
 
-    /// The peer speaks another wire version: send it nothing.
-    pub(super) fn mute(&mut self, row: usize) {
+    /// The peer speaks another wire version: send it nothing, and wait for
+    /// nothing from it. Returns whether the role changed.
+    pub(super) fn mute(&mut self, row: usize) -> bool {
+        let changed = self.role[row] != Role::Incompatible;
         self.role[row] = Role::Incompatible;
         self.flags[row] = PeerFlags::default();
+        self.link[row].answer = Answer::Settled;
+        self.stale = true;
+        self.refresh_deadline(row);
+        changed
     }
 
     /// A packet of this version arrived from `row`. A muted row becomes a
-    /// recipient again, its stream rewound to 0 as prompt work; returns
-    /// whether it was muted.
+    /// zone peer until the next refresh, both streams rewound to 0 as prompt
+    /// work; returns whether it was muted.
     pub(super) fn restore(&mut self, row: usize) -> bool {
         if self.role[row] != Role::Incompatible {
             return false;
         }
-        self.role[row] = Role::Zone;
-        self.own_tx(row).reset();
-        self.flags[row].set(PeerFlags::RESEND_OWN, true);
-        self.refresh_deadline(row);
+        self.apply_role(row, Role::Zone);
+        self.stale = true;
         true
+    }
+
+    /// This node's zone became known.
+    pub(super) fn set_local_zone(&mut self, zone: ZoneHash) {
+        self.local_zone = Some(zone);
+        self.stale = true;
+    }
+
+    /// Whether roles need a refresh: prompt work.
+    pub(super) fn stale(&self) -> bool {
+        self.stale
     }
 
     pub(super) fn role(&self, row: usize) -> Role {
@@ -480,24 +698,328 @@ impl PeerTable {
         self.flags[row].set(bits, on);
     }
 
-    pub(super) fn own_sent(&self, row: usize) -> u64 {
-        self.own_sent[row]
+    pub(super) fn sent(&self, row: usize, stream: Stream) -> u64 {
+        match stream {
+            Stream::Own => self.own_sent[row],
+            Stream::Relay => self.relay_sent[row],
+        }
     }
 
-    pub(super) fn own_tx(&mut self, row: usize) -> StreamTx<'_> {
-        StreamTx {
-            sent: &mut self.own_sent[row],
-            state: &mut self.link[row].own,
-            rto_ms: self.rto_ms,
-        }
+    pub(super) fn tx(&mut self, row: usize, stream: Stream) -> StreamTx<'_> {
+        let link = &mut self.link[row];
+        let (sent, state) = match stream {
+            Stream::Own => (&mut self.own_sent[row], &mut link.own),
+            Stream::Relay => (&mut self.relay_sent[row], &mut link.relay),
+        };
+        StreamTx { sent, state }
     }
 
     pub(super) fn link(&self, row: usize) -> &PeerLink {
         &self.link[row]
     }
 
-    pub(super) fn own_in(&mut self, row: usize) -> &mut Inbound {
-        &mut self.link[row].own_in
+    /// Whether `row` is suspect, as of the last judgment.
+    pub(super) fn suspect(&self, row: usize) -> bool {
+        let answer = self.link[row].answer;
+        answer
+            .suspect_from(self.suspect_after_ms)
+            .is_some_and(|at| at <= self.judged_ms)
+    }
+
+    /// A packet of the peer's own stream closing `range` arrived, flagged or
+    /// not; returns whether a flagged one is fresh, above the flagged mark
+    /// as it was. The kind picks the mark it moves and the ack sent back.
+    pub(super) fn receive_own(
+        &mut self,
+        row: usize,
+        range: StreamRange,
+        flagged: bool,
+        now: u64,
+        floor_ms: u64,
+    ) -> bool {
+        let link = &mut self.link[row];
+        let fresh = flagged && range.upper() > link.flagged_in.have;
+        link.own_mode = if flagged {
+            OwnMode::Flagged
+        } else {
+            OwnMode::Plain
+        };
+        link.own_mark().receive(range, now, floor_ms);
+        self.flags[row].set(PeerFlags::ACK_DUE, true);
+        self.refresh_deadline(row);
+        fresh
+    }
+
+    /// A packet of the peer's relay stream closing `range` arrived.
+    pub(super) fn receive_relay(
+        &mut self,
+        row: usize,
+        range: StreamRange,
+        now: u64,
+        floor_ms: u64,
+    ) {
+        self.link[row].relay_in.receive(range, now, floor_ms);
+        self.flags[row].set(PeerFlags::ACK_DUE, true);
+        self.refresh_deadline(row);
+    }
+
+    /// Take the gap reports due at `now`: the selected own mark's and the
+    /// relay stream's.
+    pub(super) fn take_reports(&mut self, row: usize, now: u64, floor_ms: u64) -> [GapDue; 2] {
+        let link = &mut self.link[row];
+        [
+            link.own_mark().take_report(now, floor_ms),
+            link.relay_in.take_report(now, floor_ms),
+        ]
+    }
+
+    /// Credit a packet's acks against `heads`, the own and relay heads. The
+    /// own-stream ack counts on a `Gateway` row only flagged and on a `Zone`
+    /// row only plain; the relay ack only on a `Zone` row; and only for this
+    /// node's current incarnation. `CANNOT_RELAY` from a remote zone makes the
+    /// row suspect at once and its acks no progress; other progress settles
+    /// the row, or restarts its wait while data is owed, and a suspect's
+    /// probe answer rewinds each stream it is owed.
+    pub(super) fn credit(
+        &mut self,
+        row: usize,
+        acks: AckInfo,
+        incarnation: Incarnation,
+        heads: [u64; 2],
+        now: u64,
+    ) -> Credit {
+        let role = self.role[row];
+        let was = self.suspect(row);
+        let current = acks.incarnation == incarnation;
+        let mut credit = Credit::default();
+        let mut progress = false;
+        let own_ack = match (role, acks.own) {
+            (Role::Zone, OwnAck::Plain(ack)) | (Role::Gateway, OwnAck::Flagged(ack)) => Some(ack),
+            _ => None,
+        };
+        if let Some(ack) = own_ack.filter(|_| current) {
+            let mut own = self.tx(row, Stream::Own);
+            progress |= own.note_ack(ack, heads[0], now);
+            if acks.gap_own && own.gap_report(ack, heads[0], now) {
+                self.flags[row].set(PeerFlags::RESEND_OWN, true);
+            }
+        }
+        if current && role == Role::Zone {
+            let mut relay = self.tx(row, Stream::Relay);
+            progress |= relay.note_ack(acks.relay, heads[1], now);
+            credit.resend_relay = acks.gap_relay && relay.gap_report(acks.relay, heads[1], now);
+        }
+        let owed = self.owed(row);
+        let counts = acks.cannot_relay && matches!(role, Role::Gateway | Role::Remote);
+        let answer = &mut self.link[row].answer;
+        if counts {
+            let from = answer.suspect_from(self.suspect_after_ms).unwrap_or(now);
+            *answer = Answer::CannotRelay {
+                since_ms: from.min(now),
+            };
+            self.stale = true;
+        } else if current && (progress || (acks.probe_reply && owed == [false; 2])) {
+            *answer = if owed == [false; 2] {
+                Answer::Settled
+            } else {
+                Answer::Owed { since_ms: now }
+            };
+        }
+        if current && !counts && acks.probe_reply && was {
+            for (stream, owed) in [Stream::Own, Stream::Relay].into_iter().zip(owed) {
+                if owed {
+                    self.tx(row, stream).rewind(now);
+                    credit.answer_rewound[stream as usize] = true;
+                }
+            }
+            if credit.answer_rewound[0] {
+                self.flags[row].set(PeerFlags::RESEND_OWN, true);
+            }
+            credit.resend_relay |= credit.answer_rewound[1];
+        }
+        self.stale |= was != self.suspect(row);
+        self.refresh_deadline(row);
+        credit
+    }
+
+    /// The streams `row` receives that have data in flight: own, relay.
+    fn owed(&mut self, row: usize) -> [bool; 2] {
+        let role = self.role[row];
+        [
+            role.gets_own() && self.tx(row, Stream::Own).in_flight(),
+            role == Role::Zone && self.tx(row, Stream::Relay).in_flight(),
+        ]
+    }
+
+    /// A packet to `row` went to the socket. One that asks for an answer and
+    /// left this node starts the wait, unless one is running; a held packet
+    /// starts nothing until it leaves.
+    pub(super) fn note_send(&mut self, row: usize, sent: Sent, asks: bool, now: u64) {
+        let answer = &mut self.link[row].answer;
+        if asks && sent.left && *answer == Answer::Settled {
+            *answer = Answer::Owed { since_ms: now };
+            self.refresh_deadline(row);
+        }
+    }
+
+    /// A held packet left after `held_ms`: no peer could answer meanwhile, so
+    /// every wait moves forward by that much, never past `now`.
+    pub(super) fn shift_owed(&mut self, held_ms: u64, now: u64) {
+        for row in 0..self.len {
+            if let Answer::Owed { since_ms } = &mut self.link[row].answer {
+                *since_ms = since_ms.saturating_add(held_ms).min(now);
+                self.refresh_deadline(row);
+            }
+        }
+        self.stale = true;
+    }
+
+    /// Judge suspicion as of `now`, the start of a round that read its
+    /// waiting datagrams and holds no packet. Each row whose suspicion began
+    /// since the last judgment makes the roles stale; a zone row among them
+    /// with relay data in flight is a stalled relay.
+    pub(super) fn judge(&mut self, now: u64, mut on_stall: impl FnMut(Stall)) {
+        let last = std::mem::replace(&mut self.judged_ms, now);
+        for row in 0..self.len {
+            // Only a due row can have crossed: the hot column first.
+            if self.deadline[row].0 > now {
+                continue;
+            }
+            let answer = self.link[row].answer;
+            let crossed = (answer.suspect_from(self.suspect_after_ms))
+                .is_some_and(|at| last < at && at <= now);
+            if !crossed {
+                continue;
+            }
+            self.stale = true;
+            let relay = self.link[row].relay;
+            if self.role[row] == Role::Zone && relay.acked < self.relay_sent[row] {
+                on_stall(Stall {
+                    peer: self.addr[row],
+                    stalled_ms: answer
+                        .since_ms()
+                        .map_or(0, |since| now.saturating_sub(since)),
+                    relay_unacked: self.relay_sent[row] - relay.acked,
+                });
+            }
+            self.refresh_deadline(row);
+        }
+    }
+
+    /// Whether this node cannot reach most of its zone: more than half of the
+    /// zone peers it has heard are suspect.
+    pub(super) fn impaired(&self) -> bool {
+        let (mut heard, mut stuck) = (0_usize, 0_usize);
+        for row in 0..self.len {
+            if self.role[row] == Role::Zone && self.link[row].identity.is_some() {
+                heard += 1;
+                stuck += usize::from(self.suspect(row));
+            }
+        }
+        heard > 0 && 2 * stuck > heard
+    }
+
+    fn rank(&self, row: usize) -> Rank {
+        let link = &self.link[row];
+        match link.answer.suspect_from(self.suspect_after_ms) {
+            Some(from) if from <= self.judged_ms => Rank::Suspect(Reverse(from), self.addr[row]),
+            _ => Rank::Live(link.weight, self.addr[row]),
+        }
+    }
+
+    /// Recompute every role when stale: one pass keeps the best member of
+    /// each remote zone, a second sets each row's role. Returns how many
+    /// rows changed role; `on_failover` hears of each suspect gateway
+    /// replaced.
+    pub(super) fn refresh(&mut self, now: u64, mut on_failover: impl FnMut(Failover)) -> u64 {
+        if !std::mem::take(&mut self.stale) {
+            return 0;
+        }
+        let mut used = 0;
+        for row in 0..self.len {
+            let Some(zone) = self.remote_zone(row) else {
+                continue;
+            };
+            match self.zones[..used].iter().position(|best| best.zone == zone) {
+                Some(i) if self.rank(row) > self.rank(self.zones[i].row as usize) => {
+                    self.zones[i].row = row as u32;
+                }
+                Some(_) => {}
+                None => {
+                    self.zones[used] = ZoneBest {
+                        zone,
+                        row: row as u32,
+                    };
+                    used += 1;
+                }
+            }
+        }
+        let mut changes = 0;
+        for row in 0..self.len {
+            let old = self.role[row];
+            let new = match self.remote_zone(row) {
+                None if old == Role::Incompatible => continue,
+                None => Role::Zone,
+                Some(zone) => {
+                    let best = self.zones[..used].iter().find(|best| best.zone == zone);
+                    match best {
+                        Some(best) if best.row as usize == row => Role::Gateway,
+                        _ => Role::Remote,
+                    }
+                }
+            };
+            if old == Role::Gateway && new != Role::Gateway && self.suspect(row) {
+                let answer = self.link[row].answer;
+                let zone = self.link[row].zone;
+                let best = self.zones[..used]
+                    .iter()
+                    .find(|best| Some(best.zone) == zone);
+                if let (Some(zone), Some(best)) = (zone, best) {
+                    on_failover(Failover {
+                        zone,
+                        old: self.addr[row],
+                        new: self.addr[best.row as usize],
+                        cannot_relay: matches!(answer, Answer::CannotRelay { .. }),
+                        unanswered_ms: answer
+                            .since_ms()
+                            .map_or(0, |since| now.saturating_sub(since)),
+                    });
+                }
+            }
+            changes += u64::from(self.apply_role(row, new));
+        }
+        changes
+    }
+
+    /// `row`'s zone when it is a remote zone this node chooses a gateway in:
+    /// both zones known and different, and the peer speaks this version.
+    fn remote_zone(&self, row: usize) -> Option<ZoneHash> {
+        let zone = self.link[row].zone?;
+        let remote = self.local_zone.is_some_and(|local| local != zone);
+        (remote && self.role[row] != Role::Incompatible).then_some(zone)
+    }
+
+    /// Give `row` role `new`; returns whether it changed. A stream the row
+    /// starts receiving, or receives with a new kind of ack, rewinds to 0 as
+    /// prompt work; a row left receiving nothing has nothing to wait for
+    /// unless it is suspect.
+    fn apply_role(&mut self, row: usize, new: Role) -> bool {
+        let old = std::mem::replace(&mut self.role[row], new);
+        if old == new {
+            return false;
+        }
+        if new.gets_own() {
+            self.tx(row, Stream::Own).reset();
+        }
+        if new == Role::Zone {
+            self.tx(row, Stream::Relay).reset();
+        }
+        self.flags[row].set(PeerFlags::RESEND_OWN, new.gets_own());
+        if !new.gets_own() && !self.suspect(row) {
+            self.link[row].answer = Answer::Settled;
+        }
+        self.refresh_deadline(row);
+        true
     }
 
     /// Whether any of `row`'s timers has fallen due at `now`.
@@ -505,37 +1027,106 @@ impl PeerTable {
         self.deadline[row].0 <= now
     }
 
-    /// Recompute `row`'s deadline after its timers changed: the own stream's
-    /// timeout while data is in flight, and the open gap's next report.
-    pub(super) fn refresh_deadline(&mut self, row: usize) {
+    /// When `row`'s own-stream timer falls due: while own data is in flight,
+    /// on a gateway (its liveness probe), and while an answer is awaited with
+    /// no relay data in flight, whose own timer retries (a probe for a row
+    /// that receives no stream).
+    pub(super) fn own_timer(&self, row: usize) -> Option<u64> {
         let link = &self.link[row];
-        let timeout = (link.own.acked < self.own_sent[row])
-            .then(|| link.own.timer_ms.saturating_add(self.rto_ms));
-        let report = link.own_in.report_at();
-        self.deadline[row] = timeout
-            .into_iter()
-            .chain(report)
-            .min()
-            .map_or(Deadline::NEVER, Deadline);
-        let open = matches!(link.own_in.gap, Gap::Open { .. });
+        let role = self.role[row];
+        let runs = (role.gets_own() && link.own.acked < self.own_sent[row])
+            || role == Role::Gateway
+            || (link.answer != Answer::Settled && self.relay_timer(row).is_none());
+        (runs && role != Role::Incompatible).then(|| link.own.timer_ms.saturating_add(self.rto_ms))
+    }
+
+    /// When `row`'s relay stream times out, while relay data is in flight.
+    pub(super) fn relay_timer(&self, row: usize) -> Option<u64> {
+        let link = &self.link[row];
+        (self.role[row] == Role::Zone && link.relay.acked < self.relay_sent[row])
+            .then(|| link.relay.timer_ms.saturating_add(self.rto_ms))
+    }
+
+    /// Recompute `row`'s deadline after its timers changed: the stream
+    /// timers, the reported marks' next gap reports, and when an awaited
+    /// answer turns the row suspect.
+    pub(super) fn refresh_deadline(&mut self, row: usize) {
+        let suspect_at = (self.link[row].answer)
+            .suspect_from(self.suspect_after_ms)
+            .filter(|&at| at > self.judged_ms);
+        let link = &mut self.link[row];
+        let (own, relay) = (link.own_mark().report_at(), link.relay_in.report_at());
+        let open = link.own_mark().is_open() || link.relay_in.is_open();
+        self.deadline[row] = [
+            self.own_timer(row),
+            self.relay_timer(row),
+            own,
+            relay,
+            suspect_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or(Deadline::NEVER, Deadline);
         self.flags[row].set(PeerFlags::GAP_OPEN, open);
     }
 
-    /// The admin view of every row.
-    pub(super) fn entries(&self) -> impl Iterator<Item = PeerEntry> + '_ {
-        (0..self.len).map(|row| PeerEntry {
-            addr: self.addr[row],
-            node_id: self.link[row].identity.map(|identity| identity.node_id),
-            role: self.role[row],
-            own_unacked: self.own_sent[row] - self.link[row].own.acked,
+    /// The admin view of every row at `now`.
+    pub(super) fn entries(&self, now: u64) -> impl Iterator<Item = PeerEntry> + '_ {
+        (0..self.len).map(move |row| {
+            let link = &self.link[row];
+            let answer = match link.answer {
+                Answer::Settled => AnswerState::Settled,
+                Answer::CannotRelay { .. } => AnswerState::CannotRelay,
+                Answer::Owed { .. } if self.suspect(row) => AnswerState::Suspect,
+                Answer::Owed { .. } => AnswerState::Owed,
+            };
+            let zone = match link.zone {
+                None => PeerZone::Unknown,
+                Some(zone) if Some(zone) == self.local_zone => PeerZone::Same,
+                Some(zone) => PeerZone::Other(zone),
+            };
+            PeerEntry {
+                addr: self.addr[row],
+                node_id: link.identity.map(|identity| identity.node_id),
+                zone,
+                role: self.role[row],
+                answer,
+                unanswered_ms: (link.answer.since_ms())
+                    .map(|since| u32::try_from(now.saturating_sub(since)).unwrap_or(u32::MAX)),
+                own_unacked: self.own_sent[row] - link.own.acked,
+                relay_unacked: self.relay_sent[row] - link.relay.acked,
+            }
         })
     }
 
-    /// The peers a join sweep may ask, with their weights: every peer heard
-    /// from that speaks this version.
-    pub(super) fn sweep_candidates(&self) -> impl Iterator<Item = (u64, SocketAddr)> + '_ {
+    /// How many rows hold each role.
+    pub(super) fn role_counts(&self) -> RoleCounts {
+        let mut counts = RoleCounts::default();
+        for &role in &self.role[..self.len] {
+            *match role {
+                Role::Zone => &mut counts.zone,
+                Role::Gateway => &mut counts.gateway,
+                Role::Remote => &mut counts.remote,
+                Role::Incompatible => &mut counts.incompatible,
+            } += 1;
+        }
+        counts
+    }
+
+    /// The peers a join sweep may ask, with their weights: the heard peers of
+    /// this node's zone, or with `any_zone` every heard peer that speaks this
+    /// version.
+    pub(super) fn sweep_candidates(
+        &self,
+        any_zone: bool,
+    ) -> impl Iterator<Item = (u64, SocketAddr)> + '_ {
         (0..self.len)
-            .filter(|&row| self.role[row] == Role::Zone && self.link[row].identity.is_some())
+            .filter(move |&row| {
+                let role = self.role[row];
+                self.link[row].identity.is_some()
+                    && (role == Role::Zone || (any_zone && role != Role::Incompatible))
+            })
             .map(|row| (self.link[row].weight, self.addr[row]))
     }
 
@@ -557,8 +1148,8 @@ fn addr_hash(addr: SocketAddr) -> u64 {
 
 /// The rendezvous (highest-random-weight) weight of peer `addr` for the node
 /// whose id hashes to `local_key`: each node ranks its peers differently, so
-/// join sweeps spread over the cluster.
-fn rendezvous_weight(local_key: u64, addr: SocketAddr) -> u64 {
+/// join sweeps and gateway roles spread over the cluster.
+pub(super) fn rendezvous_weight(local_key: u64, addr: SocketAddr) -> u64 {
     mix64(local_key ^ addr_hash(addr).rotate_left(21))
 }
 

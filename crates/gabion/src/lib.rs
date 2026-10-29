@@ -10,6 +10,7 @@ pub mod settings;
 pub mod throttle;
 pub mod window;
 pub mod wire;
+pub mod zone;
 
 #[cfg(test)]
 mod mock;

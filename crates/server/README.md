@@ -237,6 +237,10 @@ the root README's
 The `gabiond` YAML keys are `gossip.bind` (UDP `host:port`),
 `gossip.cluster_id_hash` (non-zero u128 shared across peers),
 `gossip.peer_capacity` (the most peers a node tracks, default 512),
+`gossip.suspect_after` (how long a packet to a peer may go unanswered
+before the peer is routed around; by default four heartbeats and at least
+2 s, and at least two heartbeats when set, else startup fails with
+`setting_invalid`),
 `discovery.namespace_allow` / `discovery.service_allow` (Kubernetes
 EndpointSlice filters), and `discovery.self_addr` (this pod's own
 `host:port` from `POD_IP`, excluded from the peer set). Discovery needs
@@ -261,7 +265,12 @@ at once. The math and tradeoffs live in
 ### Verify convergence
 
 `/snapshot` returns the peer list, CRDT stats (`store_stats`), gossip counters
-(`counters`), the rule list and the aggregate row count:
+(`counters`), the rule list and the aggregate row count. Each peer shows its
+`zone` (`"same"`, `"unknown"` or the remote zone's hash), its `role`
+(`zone`, `gateway`, `remote` or `incompatible`), its `answer` state
+(`settled`, `owed`, `suspect` or `cannot_relay`) and `unanswered_ms`, how
+long its oldest packet has waited for an answer; `peers_by_role` counts the
+roles:
 
 ```bash
 curl -s "$ADMIN_HOST:9090/snapshot" | jq '.peers | length'

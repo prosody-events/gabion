@@ -95,7 +95,7 @@ async fn run() -> anyhow::Result<()> {
 
     let (admin_tx, admin_rx) = admin::admin_channel();
 
-    config.gossip.note_default_cluster_id();
+    config.gossip.note_startup();
     let (gossip_rt, gossip_client) = GossipRuntime::bind_with_admin(
         gossip_bind,
         config.gossip,

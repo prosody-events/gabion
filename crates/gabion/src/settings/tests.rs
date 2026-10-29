@@ -42,7 +42,9 @@ fn zero_is_not_positive() {
             continue;
         };
         let zeros: &[&str] = match setting {
-            Setting::GossipTickInterval | Setting::GossipMinEmitInterval => &["0", "0ms"],
+            Setting::GossipTickInterval
+            | Setting::GossipMinEmitInterval
+            | Setting::GossipSuspectAfter => &["0", "0ms"],
             _ => &["0"],
         };
         for zero in zeros {
@@ -229,9 +231,12 @@ fn error_budget_outside_1_to_10000_fails() {
     );
 }
 
+fn ms(millis: u64) -> Millis {
+    Millis(millis.try_into().unwrap())
+}
+
 #[test]
 fn emit_interval_at_or_above_the_heartbeat_fails() {
-    let ms = |millis: u64| Millis(millis.try_into().unwrap());
     let emit = |millis| {
         validated(|s| {
             s.tick_interval = ms(100);
@@ -502,4 +507,53 @@ fn quantum_is_a_128th_of_the_store_and_at_least_one_packet() {
         let (gossip, _) = settings.validate().expect("validates");
         assert_eq!(gossip.quantum.get(), quantum, "{max_cells} cells");
     }
+}
+
+/// A configured `gossip.suspect_after` must cover two heartbeats; the text
+/// names every spelling and the bound.
+#[test]
+fn suspect_after_too_short_fails_and_two_heartbeats_pass() {
+    let suspect = |millis| {
+        validated(|s| {
+            s.tick_interval = ms(100);
+            s.suspect_after = Some(ms(millis));
+        })
+    };
+    let error = suspect(199).unwrap_err();
+    assert_eq!(
+        error,
+        SettingError::SuspectAfterTooShort {
+            configured: ms(199),
+            min: ms(200)
+        }
+    );
+    let text = error.to_string();
+    for part in [
+        "`gossip.suspect_after`",
+        "GABION_GOSSIP_SUSPECT_AFTER",
+        "gabion_gossip_suspect_after",
+        "200ms",
+    ] {
+        assert!(text.contains(part), "{text:?} lacks {part:?}");
+    }
+    assert_eq!(suspect(200), Ok(()));
+}
+
+/// Unset, `gossip.suspect_after` is four heartbeats and at least 2 s; a
+/// configured value wins.
+#[test]
+fn suspect_after_defaults_to_four_heartbeats_and_at_least_2_s() {
+    let suspect_after = |tick, configured: Option<u64>| {
+        let mut settings = Settings {
+            tick_interval: ms(tick),
+            suspect_after: configured.map(ms),
+            ..Settings::default()
+        };
+        settings.min_emit_interval = ms(1);
+        settings.validate().unwrap().0.suspect_after
+    };
+    assert_eq!(suspect_after(100, None), ms(2_000));
+    assert_eq!(suspect_after(500, None), ms(2_000));
+    assert_eq!(suspect_after(1_000, None), ms(4_000));
+    assert_eq!(suspect_after(100, Some(300)), ms(300));
 }

@@ -81,12 +81,31 @@ pub trait GossipTransport {
     }
 }
 
+/// A packet the kernel refused: where it goes, when it was refused, and
+/// whether it asks its addressee for an answer.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Held {
+    pub(super) dst: SocketAddr,
+    pub(super) since_ms: u64,
+    pub(super) asks: bool,
+}
+
+/// What a send did: the bytes the socket accepted, and whether any packet
+/// left this node, accepted or failed with an error other than
+/// back-pressure; the addressee can answer neither a refused packet nor,
+/// until it is retried, a held one.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Sent {
+    pub(super) bytes: u64,
+    pub(super) left: bool,
+}
+
 /// The one send buffer. A packet the kernel refuses stays in it, with its
 /// destination, until a retry sends it; nothing encodes meanwhile, so the
 /// held packet is never overwritten.
 pub(super) struct Outbox {
     packet: PacketBuf,
-    held: Option<SocketAddr>,
+    held: Option<Held>,
     /// The send buffer gabion asked for, named by `send_blocked`.
     send_buffer: NonZeroU32,
 }
@@ -108,17 +127,24 @@ impl Outbox {
     /// is encoded and stopping at the first the kernel refuses. Returns the
     /// stream position the packets that left (or are held) close through;
     /// the cells above it stay above the peer's `sent` and go next round.
+    /// Stream packets ask for an answer.
     pub(super) fn send_frame<T: GossipTransport>(
         &mut self,
         mut packets: Packets<'_>,
         dst: SocketAddr,
+        now: u64,
         transport: &T,
         counters: &mut GossipCounters,
-    ) -> u64 {
+    ) -> (u64, Sent) {
+        let mut total = Sent::default();
         while self.held.is_none() && packets.next_into(&mut self.packet).is_some() {
-            self.send(dst, transport, counters);
+            let sent = self.send(dst, now, true, transport, counters);
+            total = Sent {
+                bytes: total.bytes + sent.bytes,
+                left: total.left || sent.left,
+            };
         }
-        packets.closed_through()
+        (packets.closed_through(), total)
     }
 
     /// Send a packet of `header` alone. Call it only while nothing is held.
@@ -126,23 +152,26 @@ impl Outbox {
         &mut self,
         header: &Header<P>,
         dst: SocketAddr,
+        now: u64,
         transport: &T,
         counters: &mut GossipCounters,
-    ) {
+    ) -> Sent {
         debug_assert!(self.held.is_none(), "a held packet is never overwritten");
         self.packet.header_only(header);
-        self.send(dst, transport, counters);
+        let asks = header.payload.into().asks_answer();
+        self.send(dst, now, asks, transport, counters)
     }
 
-    /// Send the held packet, if any; a refusal holds it again.
+    /// Send the held packet, if any; a refusal holds it again, still dated
+    /// from the first refusal. Returns the packet once it is no longer held.
     pub(super) fn retry<T: GossipTransport>(
         &mut self,
         transport: &T,
         counters: &mut GossipCounters,
-    ) {
-        if let Some(dst) = self.held.take() {
-            self.send(dst, transport, counters);
-        }
+    ) -> Option<(Held, Sent)> {
+        let held = self.held.take()?;
+        let sent = self.send(held.dst, held.since_ms, held.asks, transport, counters);
+        self.held.is_none().then_some((held, sent))
     }
 
     /// Hand the packet to the socket. A refusal for lack of buffer space
@@ -150,13 +179,19 @@ impl Outbox {
     fn send<T: GossipTransport>(
         &mut self,
         dst: SocketAddr,
+        now: u64,
+        asks: bool,
         transport: &T,
         counters: &mut GossipCounters,
-    ) {
+    ) -> Sent {
         match transport.try_send_to(self.packet.as_bytes(), dst) {
             Ok(bytes) => {
                 counters.packets_sent += 1;
                 counters.bytes_sent += bytes as u64;
+                Sent {
+                    bytes: bytes as u64,
+                    left: true,
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if let Some(send_blocked_total) = throttle::bump(&mut counters.send_blocked) {
@@ -181,7 +216,12 @@ impl Outbox {
                         Setting::GossipSendBufferBytes,
                     );
                 }
-                self.held = Some(dst);
+                self.held = Some(Held {
+                    dst,
+                    since_ms: now,
+                    asks,
+                });
+                Sent::default()
             }
             Err(error) => {
                 if let Some(send_errors_total) = throttle::bump(&mut counters.send_errors) {
@@ -193,11 +233,17 @@ impl Outbox {
                         "Could not send a gossip packet to this peer, so gabion dropped that packet \
                          and kept gossiping with every other peer. The peer gets the same counts on a \
                          later round once sends succeed; until then, limits enforced there \
-                         under-count. Usually the peer has just left the cluster (a stale address), \
-                         or a firewall or NetworkPolicy blocks UDP from this node to it. If it \
-                         repeats for a peer that is running, check the policy and the route between \
-                         the two.",
+                         under-count. If the peer is this node's gateway into its zone and sends \
+                         to it keep failing, another member of that zone takes over after \
+                         `gossip.suspect_after`. Usually the peer has just left the cluster (a \
+                         stale address), or a firewall or NetworkPolicy blocks UDP from this node \
+                         to it. If it repeats for a peer that is running, check the policy and the \
+                         route between the two.",
                     );
+                }
+                Sent {
+                    bytes: 0,
+                    left: true,
                 }
             }
         }

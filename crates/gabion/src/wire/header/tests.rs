@@ -32,7 +32,7 @@ impl Arbitrary for AnyHeader {
         Self(Header {
             cluster_id_hash: NonZeroU128::new(u128::arbitrary(g)).unwrap_or(CLUSTER),
             sender: NodeIdentity::new(NodeId(u128::arbitrary(g)), u32::arbitrary(g)),
-            sender_zone: u32::arbitrary(g),
+            sender_zone: ZoneHash::from_wire(u32::arbitrary(g)),
             acks: AckInfo {
                 incarnation: u32::arbitrary(g),
                 own: if bool::arbitrary(g) {
@@ -73,7 +73,7 @@ fn header_v2_layout_is_pinned() {
             NodeId(0x1112_1314_1516_1718_191A_1B1C_1D1E_1F20),
             0x2122_2324,
         ),
-        sender_zone: 0x3132_3334,
+        sender_zone: ZoneHash::from_wire(0x3132_3334),
         acks: AckInfo {
             incarnation: 0x4142_4344,
             own: OwnAck::Flagged(0x5152_5354_5556_5758),
@@ -154,7 +154,7 @@ fn raw_header(kind: u8, flags: u8, cells: u16, lower: u64, upper: u64) -> [u8; H
         &Header {
             cluster_id_hash: CLUSTER,
             sender: NodeIdentity::new(NodeId(0xA), 3),
-            sender_zone: 0,
+            sender_zone: None,
             acks: AckInfo::default(),
             payload: CellPayload::Sweep,
         },
@@ -203,5 +203,38 @@ fn forbidden_kind_flag_range_combinations_are_rejected() {
             read_header(&raw_header(kind, 0, 0, 4, 9), CLUSTER).is_ok(),
             "a closing packet of kind {kind} is accepted"
         );
+    }
+}
+
+/// Stream data and probes ask for an answer; standalone acks, gap reports,
+/// probe answers and sweep packets do not.
+#[test]
+fn asks_answer_follows_kind_and_probe() {
+    let range = StreamRange::new(0, 1).expect("range");
+    let cases = [
+        (Payload::Ack { probe: true }, true),
+        (Payload::Ack { probe: false }, false),
+        (
+            CellPayload::Own {
+                range,
+                relay_into_zone: false,
+                probe: false,
+            }
+            .into(),
+            true,
+        ),
+        (
+            CellPayload::Relay {
+                range,
+                probe: false,
+            }
+            .into(),
+            true,
+        ),
+        (CellPayload::Sweep.into(), false),
+        (Payload::SweepRequest, false),
+    ];
+    for (payload, asks) in cases {
+        assert_eq!(payload.asks_answer(), asks, "{payload:?}");
     }
 }

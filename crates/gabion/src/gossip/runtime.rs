@@ -3,9 +3,12 @@
 //! One `tokio::select!` drives five arms — limit/shutdown requests, the
 //! heartbeat, the prompt-round pacer (polled only while there is prompt
 //! work), inbound UDP and peer membership churn — plus admin commands when
-//! wired. Every round reads at most `B_r` waiting datagrams, then serves each
-//! peer in one send loop: its own-stream cells above what it was sent, a
-//! resend with `PROBE` when a heartbeat passed without an ack, and owed acks,
+//! wired. Every round reads at most `B_r` waiting datagrams, then judges
+//! which peers are suspect (never while a refused packet is held), refreshes
+//! the roles, and serves each peer in one send loop: its own-stream cells
+//! (to zone peers, and flagged for relay to one gateway per remote zone),
+//! the relay stream to zone peers, a resend with `PROBE` when a heartbeat
+//! passed without an ack (a header-only probe to a suspect), and owed acks,
 //! gap reports and probe answers. After each iteration the runtime calls
 //! [`AggregateStore::apply`] once with the rows the arm produced, and once
 //! more per full expiry batch or drained datagram. Nothing on a request,
@@ -16,33 +19,33 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::task::{Context, Poll};
 
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::crdt::{
     CellHandle, CellStore, DeltaSink, ExpirationSink, Expiry, NodeId, Observation,
-    ObservationBatch, hash_fingerprint,
+    ObservationBatch, RelayMark, Stream, hash_fingerprint,
 };
-use crate::defaults::{self, GOSSIP_GAP_REPORTS, GOSSIP_MIN_DATAGRAM_CHARGE};
+use crate::defaults::{self, GOSSIP_GAP_REPORTS, GOSSIP_MIN_DATAGRAM_CHARGE, GOSSIP_SWEEP_PEERS};
 use crate::discovery::PeerEvent;
 use crate::settings::Setting;
 use crate::throttle;
 use crate::wire::{
-    self, AckInfo, CellPayload, DecodeError, Header, OwnAck, Packets, Payload, StreamRange,
-    WireScratch,
+    self, AckInfo, CellPayload, DecodeError, Header, Packets, Payload, StreamRange, WireScratch,
 };
+use crate::zone::{ZoneHash, ZoneName};
 
 use super::admin::{AdminCommand, AdminSnapshot, GossipCounters};
 use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
-use super::peer::{Contact, GapDue, Insert, PeerFlags, PeerTable, Role};
+use super::peer::{Contact, Failover, GapDue, Insert, PeerFlags, PeerTable, Role, Stall};
 use super::store::AggregateStore;
 use super::sweep::{Accept, Sweep, SweepWant, Sweeps};
 #[cfg(feature = "transport-udp")]
 use super::transport::UdpTransport;
-use super::transport::{GossipTransport, Outbox};
+use super::transport::{GossipTransport, Outbox, Sent};
 use super::{GossipError, ValidGossipConfig};
 
 /// A round's kind, ordered by strength: a cut round resumes as the strongest
@@ -56,6 +59,13 @@ enum Round {
     Threshold,
     /// Every `gossip.tick_interval`: expiry, standalone acks, sweep retries.
     Heartbeat,
+}
+
+/// One stream's frame: its handles, and the `sent` value they were read
+/// above this round, so peers at one position share one walk of the list.
+struct Frame {
+    handles: Vec<CellHandle>,
+    from: Option<u64>,
 }
 
 /// Single-threaded gossip event loop. `!Send + !Sync`.
@@ -85,12 +95,15 @@ where
     obs_buf: ObservationBatch,
     sink_buf: DeltaSink,
     expiration_buf: ExpirationSink,
-    /// One stream frame or sweep page, at most `config.quantum` cells.
-    frame_handles: Vec<CellHandle>,
-    /// The `sent` value whose own-stream frame `frame_handles` holds this
-    /// round, so peers at one position share one walk of the own list.
-    frame_from: Option<u64>,
+    /// One frame per stream, indexed by [`Stream`]; a sweep page uses the
+    /// own stream's.
+    frames: [Frame; 2],
     outbox: Outbox,
+    /// This node's zone, announced in every header.
+    zone: Option<ZoneHash>,
+    /// Most of the zone peers this node has heard are suspect: every packet
+    /// says it cannot relay. Judged at each heartbeat.
+    cannot_relay: bool,
 
     peers: PeerTable,
     /// `B_r`: the most waiting datagrams one round reads, fixed after bind.
@@ -227,14 +240,24 @@ where
         let packet_cells = config.wire_limits.cell_bound();
         let obs_buf = ObservationBatch::with_capacity(packet_cells);
         let sink_buf = DeltaSink::with_capacity(packet_cells);
-        let frame_handles = Vec::with_capacity(config.quantum.get());
+        let frame = || Frame {
+            handles: Vec::with_capacity(config.quantum.get()),
+            from: None,
+        };
+        let frames = [frame(), frame()];
         let expiration_buf = ExpirationSink::with_capacity(defaults::GOSSIP_EXPIRATION_BATCH);
         let outbox = Outbox::new(&config);
 
         let bootstrap = std::mem::take(&mut config.bootstrap_peers);
         let local_key = hash_fingerprint(store.local_identity().node_id.0);
         let rto_ms = config.tick_interval.as_millis() as u64;
-        let peers = PeerTable::with_capacity(config.peer_capacity, local_key, rto_ms);
+        let suspect_after = config.suspect_after.0.get();
+        let mut peers =
+            PeerTable::with_capacity(config.peer_capacity, local_key, rto_ms, suspect_after);
+        let zone = config.zone.as_ref().map(ZoneName::hash);
+        if let Some(zone) = zone {
+            peers.set_local_zone(zone);
+        }
         let inbound_budget = transport.recv_buffer_bytes().map_or(usize::MAX, |bytes| {
             (bytes / GOSSIP_MIN_DATAGRAM_CHARGE).max(1)
         });
@@ -259,9 +282,10 @@ where
             obs_buf,
             sink_buf,
             expiration_buf,
-            frame_handles,
-            frame_from: None,
+            frames,
             outbox,
+            zone,
+            cannot_relay: false,
             peers,
             inbound_budget,
             prompt_work: false,
@@ -296,7 +320,7 @@ where
     /// not yet wired up.
     pub async fn run<St>(mut self, peer_events: St) -> Result<(), GossipError>
     where
-        St: Stream<Item = PeerEvent>,
+        St: futures::Stream<Item = PeerEvent>,
     {
         let mut peer_events = std::pin::pin!(peer_events);
         let mut heartbeat = self.clock.ticker(self.config.tick_interval);
@@ -468,18 +492,25 @@ where
             Ok(header) => header,
             Err(error) => return self.note_decode_reject(error, src, n),
         };
-        // Every sender's cells merge, a peer's or not; header-only kinds
-        // carry none.
-        self.store.merge_remote(&self.obs_buf, &mut self.sink_buf);
-        self.counters.cells_merged += self.sink_buf.len() as u64;
+        let flagged = matches!(
+            header.payload,
+            Payload::Cells(CellPayload::Own {
+                relay_into_zone: true,
+                ..
+            })
+        );
+        // A sender outside the table is merge-only: merged, never acked,
+        // never relayed.
         let Some(row) = self.peers.find(src) else {
             if header.payload == Payload::SweepRequest {
                 self.counters.sweeps_ignored += 1;
             }
-            return;
+            return self.merge(RelayMark::Clear);
         };
-        match self.peers.contact(row, header.sender) {
-            Contact::Late => return,
+        match self.peers.contact(row, header.sender, header.sender_zone) {
+            // Its freshness cannot be judged, but what it raised is relayed.
+            Contact::Late if flagged => return self.merge(RelayMark::Changed),
+            Contact::Late => return self.merge(RelayMark::Clear),
             Contact::First => {
                 if let Some(want) = &mut self.sweep_want {
                     want.due = true;
@@ -488,45 +519,65 @@ where
             Contact::Restarted => self.sweeps.end(src),
             Contact::Current => {}
         }
-        self.prompt_work |= self.peers.restore(row);
+        self.counters.role_changes += u64::from(self.peers.restore(row));
 
         let now = self.clock.now_millis();
-        let head = self.store.own_head();
-        // Acks written for another incarnation of this node, or for the
-        // flagged mark a `Zone` row does not use, credit nothing.
-        if header.acks.incarnation == self.store.local_identity().incarnation
-            && let OwnAck::Plain(ack) = header.acks.own
-        {
-            let mut own = self.peers.own_tx(row);
-            own.note_ack(ack, head, now);
-            if header.acks.gap_own && own.gap_report(ack, head, now) {
-                self.peers.set_flag(row, PeerFlags::RESEND_OWN, true);
+        let floor = self.config.min_emit_interval.0.get();
+        let (mark, probe) = match header.payload {
+            Payload::Cells(CellPayload::Own {
+                range,
+                relay_into_zone,
+                probe,
+            }) => {
+                let fresh = self
+                    .peers
+                    .receive_own(row, range, relay_into_zone, now, floor);
+                let mark = match (relay_into_zone, fresh) {
+                    (false, _) => RelayMark::Clear,
+                    (true, false) => RelayMark::Changed,
+                    (true, true) => RelayMark::All,
+                };
+                (mark, probe)
             }
-        }
-        let probe = match header.payload {
-            Payload::Cells(CellPayload::Own { range, probe, .. }) => {
-                let floor = self.config.min_emit_interval.0.get();
-                self.peers.own_in(row).receive(range, now, floor);
-                self.peers.set_flag(row, PeerFlags::ACK_DUE, true);
-                probe
+            Payload::Cells(CellPayload::Relay { range, probe }) => {
+                self.peers.receive_relay(row, range, now, floor);
+                (RelayMark::Clear, probe)
             }
-            Payload::Cells(CellPayload::Relay { probe, .. }) | Payload::Ack { probe } => probe,
+            Payload::Ack { probe } => (RelayMark::Clear, probe),
             Payload::Cells(CellPayload::Sweep) => {
                 if let Some(want) = &mut self.sweep_want {
                     want.answered_by(src);
                 }
-                false
+                (RelayMark::Clear, false)
             }
             Payload::SweepRequest => {
                 self.accept_sweep(src);
-                false
+                (RelayMark::Clear, false)
             }
         };
+        let relay_head = self.store.head(Stream::Relay);
+        self.merge(mark);
+        let heads = [self.store.head(Stream::Own), self.store.head(Stream::Relay)];
+        let incarnation = self.store.local_identity().incarnation;
+        let credit = self.peers.credit(row, header.acks, incarnation, heads, now);
+        self.counters.rto_rewinds_own += u64::from(credit.answer_rewound[0]);
+        self.counters.rto_rewinds_relay += u64::from(credit.answer_rewound[1]);
         if probe {
             self.peers.set_flag(row, PeerFlags::REPLY_DUE, true);
         }
-        self.peers.refresh_deadline(row);
-        self.prompt_work |= self.sweep_due() || self.peers.flags(row).has(PeerFlags::PROMPT);
+        self.prompt_work |= heads[1] > relay_head
+            || credit.resend_relay
+            || self.peers.stale()
+            || self.sweep_due()
+            || self.peers.flags(row).has(PeerFlags::PROMPT);
+    }
+
+    /// Merge the decoded cells, moving remote ones on or off the relay list
+    /// by `mark`.
+    fn merge(&mut self, mark: RelayMark) {
+        self.store
+            .merge_remote(&self.obs_buf, &mut self.sink_buf, mark);
+        self.counters.cells_merged += self.sink_buf.len() as u64;
     }
 
     /// Count a dropped packet against its cause, and log at powers of two of
@@ -538,7 +589,7 @@ where
                 // A peer on another version is sent nothing until it speaks
                 // this one.
                 if let Some(row) = self.peers.find(peer) {
-                    self.peers.mute(row);
+                    self.counters.role_changes += u64::from(self.peers.mute(row));
                 }
                 if let Some(rejected_total) =
                     throttle::bump(&mut self.counters.decode_rejects_version)
@@ -550,6 +601,7 @@ where
                         local_version = wire::VERSION,
                         reason = "version",
                         rejected_total,
+                        incompatible_peers = self.peers.role_counts().incompatible,
                         "Ignoring gossip from this peer: it speaks another gossip protocol version \
                          (`peer_version`) than this node (`local_version`), so the two do not \
                          share counts. During a rolling upgrade between those versions this is \
@@ -640,7 +692,8 @@ where
             AdminCommand::Snapshot { reply } => {
                 let snapshot = AdminSnapshot {
                     local_identity: self.store.local_identity(),
-                    peers: self.peers.entries().collect(),
+                    peers_by_role: self.peers.role_counts(),
+                    peers: self.peers.entries(self.clock.now_millis()).collect(),
                     store_stats: self.store.stats(),
                     counters: self.counters,
                     last_error_budget: self.last_error_budget,
@@ -712,7 +765,19 @@ where
                 if link.identity.is_none() {
                     self.sweep_want.get_or_insert_default();
                 }
+                self.prompt_work = true;
             }
+            // A configured or already learned zone wins.
+            PeerEvent::OwnEntry { zone } if self.zone.is_none() => {
+                self.zone = Some(zone);
+                self.peers.set_local_zone(zone);
+                // Same-zone peers may now differ: sweep again.
+                let mut want = SweepWant::default();
+                want.due = true;
+                self.sweep_want = Some(want);
+                self.prompt_work = true;
+            }
+            PeerEvent::OwnEntry { .. } => {}
         }
     }
 
@@ -740,7 +805,7 @@ where
                          to {addr}, so limits enforced at {addr} under-count this node's traffic \
                          and allow requests over the limit; counts {addr} sends here are still \
                          merged. The cluster has grown past the table. Raise {} above the \
-                         cluster's pod count; each slot costs about 200 bytes.",
+                         cluster's pod count; each slot costs about 330 bytes.",
                         Setting::GossipPeerCapacity,
                     );
                 }
@@ -773,28 +838,51 @@ where
         }
 
         let kind = self.cut.take().map_or(kind, |cut| cut.max(kind));
-        self.outbox.retry(&self.transport, &mut self.counters);
+        if let Some((held, sent)) = self.outbox.retry(&self.transport, &mut self.counters) {
+            // No peer could answer while the packet was held.
+            self.peers
+                .shift_owed(now.saturating_sub(held.since_ms), now);
+            if let Some(row) = self.peers.find(held.dst) {
+                self.account(row, sent, held.asks, now);
+            }
+        }
         if self.outbox.is_held() {
             self.cut = Some(kind);
             return;
         }
 
+        // Judged after the read and before any timer, never while held.
+        let counters = &mut self.counters;
+        self.peers
+            .judge(now, |stall| note_relay_stall(counters, stall));
+        if kind == Round::Heartbeat {
+            self.cannot_relay = self.peers.impaired();
+        }
+        let suspect_after_ms = self.config.suspect_after.0.get();
+        let counters = &mut self.counters;
+        let changes = self.peers.refresh(now, |failover| {
+            note_failover(counters, failover, suspect_after_ms)
+        });
+        self.counters.role_changes += changes;
+
         self.prompt_work = false;
-        self.frame_from = None;
-        let head = self.store.own_head();
+        for frame in &mut self.frames {
+            frame.from = None;
+        }
+        let heads = [self.store.head(Stream::Own), self.store.head(Stream::Relay)];
         let len = self.peers.len();
         for step in 0..len {
             let row = (self.next_peer + step) % len;
-            self.serve_row(kind, row, now, head);
+            self.serve_row(kind, row, now, heads);
             if self.outbox.is_held() {
                 self.next_peer = row;
                 self.cut = Some(kind);
                 return;
             }
         }
-        self.ask_sweeps(kind);
+        self.ask_sweeps(kind, now);
         if kind == Round::Prompt {
-            self.serve_sweeps();
+            self.serve_sweeps(now);
         }
         self.prompt_work |= self.sweep_due() || self.sweeps.active() > 0;
     }
@@ -813,124 +901,187 @@ where
         }
     }
 
-    /// Service one peer row: time out its stream, report a due gap, send it
-    /// its own-stream cells, and send owed acks or probe answers alone when no
-    /// data carries them.
-    fn serve_row(&mut self, kind: Round, row: usize, now: u64, head: u64) {
-        if self.peers.role(row) == Role::Incompatible {
+    /// Service one peer row: retry a timed-out stream (a header-only probe
+    /// to a suspect, or to a peer owed nothing), report due gaps, send the
+    /// streams its role gets, and send owed acks or probe answers alone when
+    /// no data carries them.
+    fn serve_row(&mut self, kind: Round, row: usize, now: u64, heads: [u64; 2]) {
+        let role = self.peers.role(row);
+        if role == Role::Incompatible {
             return;
         }
         let due = self.peers.due(row, now);
-        let retry = due && self.peers.own_tx(row).timed_out(now);
-        if retry {
-            self.peers.own_tx(row).rewind(now);
-            self.counters.rto_rewinds_own += 1;
+        let fired = |timer: Option<u64>| due && timer.is_some_and(|at| at <= now);
+        let own_retry = fired(self.peers.own_timer(row));
+        let relay_retry = fired(self.peers.relay_timer(row));
+        let own_in_flight = role != Role::Remote && self.peers.tx(row, Stream::Own).in_flight();
+        let suspect = self.peers.suspect(row);
+        let probe_only =
+            (own_retry || relay_retry) && (suspect || (!own_in_flight && !relay_retry));
+        for (stream, retry, counter) in [
+            (Stream::Own, own_retry, &mut self.counters.rto_rewinds_own),
+            (
+                Stream::Relay,
+                relay_retry,
+                &mut self.counters.rto_rewinds_relay,
+            ),
+        ] {
+            if !retry {
+                continue;
+            }
+            let mut tx = self.peers.tx(row, stream);
+            if probe_only {
+                tx.restart(now);
+            } else {
+                *counter += u64::from(tx.in_flight());
+                tx.rewind(now);
+            }
         }
         let floor = self.config.min_emit_interval.0.get();
-        let gap = if due {
-            self.peers.own_in(row).take_report(now, floor)
+        let reports = if due {
+            self.peers.take_reports(row, now, floor)
         } else {
-            GapDue::Nothing
+            [GapDue::Nothing; 2]
         };
-        if let GapDue::Abandoned { missing } = gap {
-            self.note_gap_abandoned(row, missing);
+        for (stream, report) in [Stream::Own, Stream::Relay].into_iter().zip(reports) {
+            if let GapDue::Abandoned { missing } = report {
+                self.note_gap_abandoned(row, stream, missing);
+            }
         }
-        let gap_own = gap == GapDue::Report;
+        let gaps = reports.map(|report| report == GapDue::Report);
 
         let flags = self.peers.flags(row);
-        let own_due = kind != Round::Prompt || retry || flags.has(PeerFlags::RESEND_OWN);
-        let sent = self.peers.own_sent(row);
+        let resend_own = own_retry && !probe_only;
         let mut sent_any = false;
-        if own_due && sent < head {
-            let closed = self.send_own(row, sent, head, gap_own, retry);
-            self.peers.own_tx(row).note_sent(closed, now);
+        if role != Role::Remote
+            && (kind != Round::Prompt || resend_own || flags.has(PeerFlags::RESEND_OWN))
+        {
+            let closed = self.send_stream(Stream::Own, row, heads[0], gaps, resend_own, now);
             // A stream capped by the quantum goes on in the next prompt round.
-            self.peers
-                .set_flag(row, PeerFlags::RESEND_OWN, closed < head);
-            sent_any = true;
-        } else if own_due {
-            self.peers.set_flag(row, PeerFlags::RESEND_OWN, false);
+            self.peers.set_flag(
+                row,
+                PeerFlags::RESEND_OWN,
+                closed.is_some_and(|c| c < heads[0]),
+            );
+            sent_any |= closed.is_some();
         }
+        if role == Role::Zone {
+            let resend = relay_retry && !probe_only;
+            let closed = self.send_stream(Stream::Relay, row, heads[1], gaps, resend, now);
+            self.prompt_work |= closed.is_some_and(|c| c < heads[1]);
+            sent_any |= closed.is_some();
+        }
+        // Data asks for an answer too, so only a suspect is probed beside it.
+        let probe = probe_only && (suspect || !sent_any);
         let ack_due = kind == Round::Heartbeat && flags.has(PeerFlags::ACK_DUE);
-        if !sent_any && (gap_own || ack_due || flags.has(PeerFlags::REPLY_DUE)) {
-            let header = self.header_for(row, gap_own, Payload::Ack { probe: false });
+        let owed = gaps.contains(&true) || ack_due || flags.has(PeerFlags::REPLY_DUE);
+        if probe || (!sent_any && owed) {
+            let header = self.header_for(row, gaps, Payload::Ack { probe });
             let dst = self.peers.addr(row);
-            self.outbox
-                .send_header(&header, dst, &self.transport, &mut self.counters);
+            let sent =
+                (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
+            self.account(row, sent, probe, now);
+            self.counters.liveness_probes += u64::from(probe);
             sent_any = true;
         }
         if sent_any {
             self.peers.set_flag(row, PeerFlags::ACK_DUE, false);
             self.peers.set_flag(row, PeerFlags::REPLY_DUE, false);
         }
-        if gap_own {
-            self.counters.gap_reports_sent += 1;
-        }
+        self.counters.gap_reports_sent += gaps.iter().filter(|&&gap| gap).count() as u64;
         if due || sent_any {
             self.peers.refresh_deadline(row);
         }
         self.prompt_work |= self.peers.flags(row).has(PeerFlags::PROMPT);
     }
 
-    /// Send `row` the own-stream frame above `sent` and return the position
-    /// it closes through. A frame that holds every live cell up to the head
-    /// closes through the head, so cells that expired unsent are closed, not
-    /// owed; with no live cell left it is one closing packet without cells.
-    fn send_own(&mut self, row: usize, sent: u64, head: u64, gap_own: bool, probe: bool) -> u64 {
-        let quantum = self.config.quantum.get();
-        if self.frame_from != Some(sent) {
-            self.store
-                .stream_after(sent, quantum, &mut self.frame_handles);
-            self.frame_from = Some(sent);
+    /// Send `row` the frame of `stream` above its `sent`, if any, and note
+    /// it; returns the position it closes through. A frame that holds every
+    /// live cell up to the head closes through the head, so cells that
+    /// expired unsent are closed, not owed; with no live cell left it is one
+    /// closing packet without cells. Own frames to a gateway are flagged for
+    /// relay.
+    fn send_stream(
+        &mut self,
+        stream: Stream,
+        row: usize,
+        head: u64,
+        gaps: [bool; 2],
+        probe: bool,
+        now: u64,
+    ) -> Option<u64> {
+        let sent = self.peers.sent(row, stream);
+        if sent >= head {
+            return None;
         }
-        let upper = match self.frame_handles.last() {
-            Some(&last) if self.frame_handles.len() == quantum => self
-                .store
-                .get(last)
-                .map_or(head, |cell| cell.origin_sequence),
+        let quantum = self.config.quantum.get();
+        let frame = &mut self.frames[stream as usize];
+        if frame.from != Some(sent) {
+            self.store
+                .stream_after(stream, sent, quantum, &mut frame.handles);
+            frame.from = Some(sent);
+        }
+        let upper = match frame.handles.last() {
+            Some(&last) if frame.handles.len() == quantum => {
+                self.store.sequence(stream, last).unwrap_or(head)
+            }
             _ => head,
         };
-        let Some(range) = StreamRange::new(sent, upper) else {
-            return sent;
+        let range = StreamRange::new(sent, upper)?;
+        let payload = match stream {
+            Stream::Own => CellPayload::Own {
+                range,
+                relay_into_zone: self.peers.role(row) == Role::Gateway,
+                probe,
+            },
+            Stream::Relay => CellPayload::Relay { range, probe },
         };
-        let payload = CellPayload::Own {
-            range,
-            relay_into_zone: false,
-            probe,
-        };
-        let header = self.header_for(row, gap_own, payload);
+        let header = self.header_for(row, gaps, payload);
         let dst = self.peers.addr(row);
-        if self.frame_handles.is_empty() {
-            self.outbox
-                .send_header(&header, dst, &self.transport, &mut self.counters);
-            return upper;
-        }
-        let packets = Packets::new(
-            header,
-            &self.store,
-            &self.frame_handles,
-            &mut self.scratch,
-            self.config.wire_limits,
-        );
-        self.outbox
-            .send_frame(packets, dst, &self.transport, &mut self.counters)
+        let handles = &self.frames[stream as usize].handles;
+        let (closed, sent) = if handles.is_empty() {
+            let sent =
+                (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
+            (upper, sent)
+        } else {
+            let packets = Packets::new(
+                header,
+                &self.store,
+                handles,
+                &mut self.scratch,
+                self.config.wire_limits,
+            );
+            (self.outbox).send_frame(packets, dst, now, &self.transport, &mut self.counters)
+        };
+        self.peers.tx(row, stream).note_sent(closed, now);
+        self.account(row, sent, true, now);
+        Some(closed)
     }
 
-    /// A header to `row`, carrying this node's acks for the peer's stream as
-    /// of the peer's incarnation this node knows.
-    fn header_for<P>(&self, row: usize, gap_own: bool, payload: P) -> Header<P> {
+    /// Count a send to `row`: its bytes when the peer is in another known
+    /// zone, and the wait for an answer it may start.
+    fn account(&mut self, row: usize, sent: Sent, asks: bool, now: u64) {
+        if matches!(self.peers.role(row), Role::Gateway | Role::Remote) {
+            self.counters.bytes_sent_cross_zone += sent.bytes;
+        }
+        self.peers.note_send(row, sent, asks, now);
+    }
+
+    /// A header to `row`, carrying this node's zone, its acks for the peer's
+    /// streams as of the peer's incarnation this node knows, and its signals.
+    fn header_for<P>(&self, row: usize, gaps: [bool; 2], payload: P) -> Header<P> {
         let link = self.peers.link(row);
         Header {
             cluster_id_hash: self.config.cluster_id_hash,
             sender: self.store.local_identity(),
-            sender_zone: 0,
+            sender_zone: self.zone,
             acks: AckInfo {
                 incarnation: link.identity.map_or(0, |identity| identity.incarnation),
-                own: OwnAck::Plain(link.own_in.have()),
-                relay: 0,
-                gap_own,
-                gap_relay: false,
-                cannot_relay: false,
+                own: link.own_ack(),
+                relay: link.relay_ack(),
+                gap_own: gaps[0],
+                gap_relay: gaps[1],
+                cannot_relay: self.cannot_relay,
                 probe_reply: self.peers.flags(row).has(PeerFlags::REPLY_DUE),
             },
             payload,
@@ -973,8 +1124,9 @@ where
     /// Ask for the join sweep this node wants: at every heartbeat, and on any
     /// round once a peer is first heard. Each source asked is sent a
     /// `SweepRequest` at once and again at each heartbeat until a page
-    /// arrives.
-    fn ask_sweeps(&mut self, kind: Round) {
+    /// arrives. A node that has heard no peer of its zone asks one peer of
+    /// any zone.
+    fn ask_sweeps(&mut self, kind: Round, now: u64) {
         let Some(mut want) = self
             .sweep_want
             .take_if(|want| kind == Round::Heartbeat || want.due)
@@ -982,7 +1134,9 @@ where
             return;
         };
         want.due = false;
-        if want.advance(|| self.peers.sweep_candidates()) {
+        let any_zone = self.peers.sweep_candidates(false).next().is_none();
+        let sources = if any_zone { 1 } else { GOSSIP_SWEEP_PEERS };
+        if want.advance(|| self.peers.sweep_candidates(any_zone), sources) {
             return;
         }
         for ask in want.asks() {
@@ -992,9 +1146,9 @@ where
             let Some(row) = self.peers.find(ask.addr) else {
                 continue;
             };
-            let header = self.header_for(row, false, Payload::SweepRequest);
+            let header = self.header_for(row, [false; 2], Payload::SweepRequest);
             self.outbox
-                .send_header(&header, ask.addr, &self.transport, &mut self.counters);
+                .send_header(&header, ask.addr, now, &self.transport, &mut self.counters);
             ask.tries += 1;
             self.counters.sweeps_requested += 1;
         }
@@ -1039,9 +1193,10 @@ where
     /// Send each running sweep its next page of live cells in slot order; a
     /// requester that left or speaks another version is dropped. A page cut
     /// by a held packet is sent again whole: pages are max-merges.
-    fn serve_sweeps(&mut self) {
-        // Pages overwrite `frame_handles`: no own frame survives them.
-        self.frame_from = None;
+    fn serve_sweeps(&mut self, now: u64) {
+        // Pages overwrite the own frame: none survives them.
+        let frame = &mut self.frames[Stream::Own as usize];
+        frame.from = None;
         for i in 0..self.sweeps.limit() {
             let Some(Sweep { dst, next_slot }) = self.sweeps.get(i) else {
                 continue;
@@ -1054,35 +1209,36 @@ where
                 self.sweeps.advance(i, None);
                 continue;
             };
-            self.frame_handles.clear();
-            self.frame_handles
-                .extend(self.store.active_handles(next_slot).take(self.sweep_page));
-            let cells = self.frame_handles.len();
+            let handles = &mut self.frames[Stream::Own as usize].handles;
+            handles.clear();
+            handles.extend(self.store.active_handles(next_slot).take(self.sweep_page));
+            let cells = handles.len();
             if cells == 0 && next_slot != 0 {
                 self.sweeps.advance(i, None);
                 continue;
             }
             // A store with no live cell still answers with one empty page.
-            let header = self.header_for(row, false, CellPayload::Sweep);
+            let header = self.header_for(row, [false; 2], CellPayload::Sweep);
+            let handles = &self.frames[Stream::Own as usize].handles;
             if cells == 0 {
                 self.outbox
-                    .send_header(&header, dst, &self.transport, &mut self.counters);
+                    .send_header(&header, dst, now, &self.transport, &mut self.counters);
             } else {
                 let packets = Packets::new(
                     header,
                     &self.store,
-                    &self.frame_handles,
+                    handles,
                     &mut self.scratch,
                     self.config.wire_limits,
                 );
                 self.outbox
-                    .send_frame(packets, dst, &self.transport, &mut self.counters);
+                    .send_frame(packets, dst, now, &self.transport, &mut self.counters);
             }
             if self.outbox.is_held() {
                 return;
             }
             self.counters.sweep_cells_sent += cells as u64;
-            let next = match self.frame_handles.last() {
+            let next = match self.frames[Stream::Own as usize].handles.last() {
                 Some(last) if cells == self.sweep_page => Some(last.index + 1),
                 _ => None,
             };
@@ -1090,8 +1246,8 @@ where
         }
     }
 
-    /// Log `gap_abandoned` for `row`'s own stream at powers of two.
-    fn note_gap_abandoned(&mut self, row: usize, missing: u64) {
+    /// Log `gap_abandoned` for `row`'s `stream` at powers of two.
+    fn note_gap_abandoned(&mut self, row: usize, stream: Stream, missing: u64) {
         let Some(abandoned_total) = throttle::bump(&mut self.counters.gaps_abandoned) else {
             return;
         };
@@ -1099,15 +1255,19 @@ where
         let reports = GOSSIP_GAP_REPORTS;
         // Reports go out `F_r` after the gap opens and `4 · F_r` apart.
         let waited_ms = self.config.min_emit_interval.0.get() * (1 + 4 * u64::from(reports));
+        let stream = match stream {
+            Stream::Own => "own",
+            Stream::Relay => "relay",
+        };
         tracing::warn!(
             code = "gap_abandoned",
             peer = %peer,
-            stream = "own",
+            stream,
             missing,
             reports,
             waited_ms,
             abandoned_total,
-            "Stopped asking {peer} to resend {missing} changes missing from its own stream: it did \
+            "Stopped asking {peer} to resend {missing} changes missing from its {stream} stream: it did \
              not answer {reports} requests over {waited_ms} ms. If {peer} still sends this \
              stream, its retransmission timer resends the missing changes; if its gateway role \
              moved or it restarted, they arrive from the new sender. Until they arrive, limits \
@@ -1115,6 +1275,107 @@ where
              running, UDP from {peer} to this node is usually blocked or lossy in one direction: \
              check NetworkPolicies and security groups between the two.",
         );
+    }
+}
+
+/// Count a zone peer's stalled relay, and log `relay_stalled` at powers of
+/// two.
+fn note_relay_stall(counters: &mut GossipCounters, stall: Stall) {
+    let Some(stall_total) = throttle::bump(&mut counters.relay_stalls) else {
+        return;
+    };
+    let Stall {
+        peer,
+        stalled_ms,
+        relay_unacked,
+    } = stall;
+    tracing::warn!(
+        code = "relay_stalled",
+        peer = %peer,
+        stalled_ms,
+        relay_unacked,
+        stall_total,
+        "{peer}, a peer in this node's zone, has not acknowledged the changes this node relays \
+         into the zone for {stalled_ms} ms, while this node keeps receiving them from other \
+         zones. {peer} is missing those counts, so limits enforced there under-count and allow \
+         requests over the limit. gabion keeps resending, and the counts arrive as soon as the \
+         path works. Usually UDP from this node to {peer} is blocked in one direction, or {peer} \
+         is overloaded. Check NetworkPolicies and security groups between the two pods, and the \
+         peer's CPU.",
+    );
+}
+
+/// Count a gateway failover. The first logs at info, with its reason; later
+/// ones warn at powers of two, since repeated failovers delay counts.
+fn note_failover(counters: &mut GossipCounters, failover: Failover, suspect_after_ms: u64) {
+    let Some(failover_total) = throttle::bump(&mut counters.gateway_failovers) else {
+        return;
+    };
+    let Failover {
+        zone,
+        old,
+        new,
+        cannot_relay,
+        unanswered_ms,
+    } = failover;
+    let reason = if cannot_relay {
+        "cannot_relay"
+    } else {
+        "unanswered"
+    };
+    let config_key = Setting::GossipSuspectAfter.yaml_key();
+    match (failover_total, cannot_relay) {
+        (1, false) => tracing::info!(
+            code = "gateway_failover",
+            zone_hash = %zone,
+            old_gateway = %old,
+            new_gateway = %new,
+            reason,
+            unanswered_ms,
+            suspect_after_ms,
+            failover_total,
+            config_key,
+            "Switched this node's gateway for zone {zone} from {old} to {new}, because {old} \
+             answered none of this node's packets or liveness checks for {unanswered_ms} ms \
+             (`gossip.suspect_after` is {suspect_after_ms} ms). {new} now receives every live \
+             change from this node that it has not acknowledged, so nothing is lost. Nothing to \
+             do if {old} restarted or left the cluster.",
+        ),
+        (1, true) => tracing::info!(
+            code = "gateway_failover",
+            zone_hash = %zone,
+            old_gateway = %old,
+            new_gateway = %new,
+            reason,
+            unanswered_ms,
+            suspect_after_ms,
+            failover_total,
+            config_key,
+            "Switched this node's gateway for zone {zone} from {old} to {new}, because {old} \
+             reported that it cannot reach most of its own zone. {new} now receives and relays \
+             every live change from this node, so nothing is lost. {old} logs which peers it \
+             cannot reach; start there.",
+        ),
+        _ => tracing::warn!(
+            code = "gateway_failover",
+            zone_hash = %zone,
+            old_gateway = %old,
+            new_gateway = %new,
+            reason,
+            unanswered_ms,
+            suspect_after_ms,
+            failover_total,
+            config_key,
+            "This node has switched gateways {failover_total} times since it started. Each switch \
+             delays this node's counts in the affected zone by up to `gossip.suspect_after` plus \
+             three heartbeats, so limits there briefly under-count and allow requests over the \
+             limit. Usually pods in that zone keep restarting, or UDP between this node and that \
+             zone drops packets. Check restarts in zone {zone}, then the network path and any \
+             NetworkPolicy or security group between the zones. If the pods are healthy and the \
+             network between zones loses packets, raising {} makes switches rarer at the cost of \
+             slower failover.",
+            Setting::GossipSuspectAfter,
+        ),
     }
 }
 

@@ -57,7 +57,7 @@ use gabion::aggregate::Aggregate;
 use gabion::crdt::{
     BucketEpoch, CellHandle, CellIdentity, CellStore, CompactCellKey, DeltaSink, ExpirationSink,
     Expiry, Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
-    RuleSlot, ValidStorageConfig,
+    RelayMark, RuleSlot, Stream, ValidStorageConfig,
 };
 use gabion::defaults::{GOSSIP_EXPIRATION_BATCH, GOSSIP_MAX_PAYLOAD_BYTES};
 use gabion::gossip::{AggregateStore, FixedClock, GossipRuntime, GossipTransport};
@@ -87,8 +87,9 @@ fn obs_row(
     }
 }
 use gabion::wire::{
-    AckInfo, CellPayload, FrameLimits, Header, PacketBuf, Packets, WireScratch, decode,
+    AckInfo, CellPayload, FrameLimits, Header, PacketBuf, Packets, StreamRange, WireScratch, decode,
 };
+use gabion::zone::ZoneName;
 
 // ---------------------------------------------------------------------------
 // A splitmix RNG. Deterministic so iteration order is reproducible.
@@ -288,7 +289,7 @@ fn seed_remote(
             0,
         ));
     }
-    store.merge_remote(&obs, &mut sink);
+    store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     rows
 }
 
@@ -679,7 +680,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                             0,
                         ));
                     }
-                    store.merge_remote(black_box(obs), black_box(sink));
+                    store.merge_remote(black_box(obs), black_box(sink), RelayMark::Clear);
                 },
                 BatchSize::SmallInput,
             );
@@ -719,7 +720,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                     ));
                 }
                 counter = counter.wrapping_add(1).max(200);
-                store.merge_remote(black_box(&obs), black_box(&mut sink));
+                store.merge_remote(black_box(&obs), black_box(&mut sink), RelayMark::Clear);
             });
         });
     }
@@ -749,7 +750,7 @@ fn bench_merge_remote(c: &mut Criterion) {
                     0,
                 ));
             }
-            store.merge_remote(black_box(&obs), black_box(&mut sink));
+            store.merge_remote(black_box(&obs), black_box(&mut sink), RelayMark::Clear);
         });
     });
 
@@ -983,7 +984,7 @@ fn bench_stream_after(c: &mut Criterion) {
             ));
             store.ingest_local(&obs, &mut sink);
         }
-        let head = store.own_head();
+        let head = store.head(Stream::Own);
         let mut out = Vec::<CellHandle>::with_capacity(QUANTUM);
         // Cell `k` carries sequence `k`, so `draining` is a drain's second
         // round: one quantum already sent above a rewind to 0.
@@ -993,13 +994,73 @@ fn bench_stream_after(c: &mut Criterion) {
             ("draining", QUANTUM as u64),
         ];
         for (case, sent) in cases {
-            store.stream_after(sent, QUANTUM, &mut out);
+            store.stream_after(Stream::Own, sent, QUANTUM, &mut out);
             group.throughput(Throughput::Elements(out.len() as u64));
             group.bench_function(BenchmarkId::new(case, own_cells), |b| {
-                b.iter(|| store.stream_after(black_box(sent), QUANTUM, black_box(&mut out)));
+                b.iter(|| {
+                    store.stream_after(Stream::Own, black_box(sent), QUANTUM, black_box(&mut out))
+                });
             });
         }
     }
+    group.finish();
+}
+
+/// `stream/merge_relay`: a gateway at `prod-peak` occupancy (20,070 live
+/// cells) merging a two-cell flagged packet from a cross-zone origin. `fresh`
+/// raises both counts and marks both cells for relay; `resend` repeats the
+/// counts, so the changed-only mark touches nothing.
+fn bench_merge_relay(c: &mut Criterion) {
+    let mut group = c.benchmark_group("stream/merge_relay");
+    let (_, storage) = Settings::default()
+        .validate()
+        .expect("default settings validate");
+    let rules = rules(1, "100r/s", Duration::from_secs(1), &storage);
+    let fingerprint = rules.rules()[0].fingerprint();
+    let mut store = CellStore::new(storage, NodeIdentity::new(peer_node(1), 1), &rules);
+    let mut obs = ObservationBatch::with_capacity(2);
+    let mut sink = DeltaSink::with_capacity(2);
+    for key in 0..20_070_u128 {
+        obs.clear();
+        sink.clear();
+        obs.push(obs_row(
+            fingerprint,
+            KeyHash(key),
+            0,
+            peer_node(2 + key as usize % 60),
+            1,
+            1,
+            0,
+        ));
+        store.merge_remote(&obs, &mut sink, RelayMark::Clear);
+    }
+    group.throughput(Throughput::Elements(2));
+    let mut count = 1;
+    group.bench_function("fresh", |b| {
+        b.iter(|| {
+            count += 1;
+            obs.clear();
+            sink.clear();
+            for key in [1, 2] {
+                obs.push(obs_row(
+                    fingerprint,
+                    KeyHash(key),
+                    0,
+                    LOCAL_NODE,
+                    1,
+                    count,
+                    0,
+                ));
+            }
+            store.merge_remote(black_box(&obs), black_box(&mut sink), RelayMark::All);
+        })
+    });
+    group.bench_function("resend", |b| {
+        b.iter(|| {
+            sink.clear();
+            store.merge_remote(black_box(&obs), black_box(&mut sink), RelayMark::Changed);
+        })
+    });
     group.finish();
 }
 
@@ -1118,7 +1179,7 @@ fn wire_header() -> Header<CellPayload> {
             .try_into()
             .expect("non-zero"),
         sender: local_identity(),
-        sender_zone: 0,
+        sender_zone: None,
         acks: AckInfo::default(),
         payload: CellPayload::Sweep,
     }
@@ -1405,6 +1466,10 @@ fn peer_addr(i: u16) -> SocketAddr {
     SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 9000))
 }
 
+/// `inbound`: a node with 300 peers reading 3,000 two-cell packets.
+/// `peer_lookup` takes sweep pages; `relay_flagged` takes the own stream of a
+/// cross-zone origin flagged for relay, so each merge also marks the relay
+/// list.
 fn bench_inbound(c: &mut Criterion) {
     let nz = "bench capacities are non-zero";
     let settings = Settings {
@@ -1414,9 +1479,10 @@ fn bench_inbound(c: &mut Criterion) {
     };
     let (mut gossip, storage) = settings.validate().expect("bench settings validate");
     gossip.bootstrap_peers = (0..PEERS).map(peer_addr).collect();
+    gossip.zone = Some(ZoneName::parse("b").expect("a zone name"));
     let rules = rules(1, "100r/s", Duration::from_secs(1), &storage);
 
-    // The packet: two cells of the bench rule, sent by `local_identity()`.
+    // The packets: two cells of the bench rule, sent by `local_identity()`.
     let mut sender = CellStore::new(storage, local_identity(), &rules);
     let fingerprint = rules.rules()[0].fingerprint();
     let mut obs = ObservationBatch::with_capacity(2);
@@ -1433,46 +1499,64 @@ fn bench_inbound(c: &mut Criterion) {
     }
     sender.ingest_local(&obs, &mut DeltaSink::with_capacity(2));
     let mut handles = Vec::with_capacity(2);
-    sender.stream_after(0, 2, &mut handles);
+    sender.stream_after(Stream::Own, 0, 2, &mut handles);
     let limits = FrameLimits::new(GOSSIP_MAX_PAYLOAD_BYTES).expect("default payload");
     let mut buf = PacketBuf::for_limits(limits);
     let mut scratch = WireScratch::for_store(&sender);
-    let mut packets = Packets::new(wire_header(), &sender, &handles, &mut scratch, limits);
-    assert_eq!(packets.next_into(&mut buf), Some(2));
-    let packet: Box<[u8]> = buf.as_bytes().into();
-    // A packet the runtime rejects would time the reject path, not the lookup.
-    decode(&packet, limits, settings.cluster_id_hash, |_| {})
-        .expect("the runtime accepts the packet");
+    let flagged = Header {
+        sender_zone: Some(ZoneName::parse("a").expect("a zone name").hash()),
+        payload: CellPayload::Own {
+            range: StreamRange::new(0, 2).expect("a range"),
+            relay_into_zone: true,
+            probe: false,
+        },
+        ..wire_header()
+    };
+    let mut encode = |header| {
+        let mut packets = Packets::new(header, &sender, &handles, &mut scratch, limits);
+        assert_eq!(packets.next_into(&mut buf), Some(2));
+        let packet: Box<[u8]> = buf.as_bytes().into();
+        // A packet the runtime rejects would time the reject path.
+        decode(&packet, limits, settings.cluster_id_hash, |_| {})
+            .expect("the runtime accepts the packet");
+        packet
+    };
+    let cases = [
+        ("peer_lookup", encode(wire_header())),
+        ("relay_flagged", encode(flagged)),
+    ];
 
     let tokio = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("tokio runtime");
     let mut group = c.benchmark_group("inbound");
     group.throughput(Throughput::Elements(INBOUND_PACKETS as u64));
-    group.bench_function(BenchmarkId::new("peer_lookup", PEERS), |b| {
-        b.iter_batched(
-            || {
-                GossipRuntime::from_parts(
-                    Replay {
-                        packet: packet.clone(),
-                        left: Cell::new(INBOUND_PACKETS),
-                    },
-                    FixedClock::new(1),
-                    gossip.clone(),
-                    CellStore::new(storage, NodeIdentity::new(peer_node(0), 1), &rules),
-                    Aggregate::new(&storage),
-                )
-            },
-            // Holding the client keeps the request arm pending, so `run`
-            // serves every packet instead of shutting down.
-            |(runtime, _client)| {
-                tokio
-                    .block_on(runtime.run(futures::stream::empty()))
-                    .expect_err("only the replay's end stops the run")
-            },
-            BatchSize::LargeInput,
-        )
-    });
+    for (case, packet) in cases {
+        group.bench_function(BenchmarkId::new(case, PEERS), |b| {
+            b.iter_batched(
+                || {
+                    GossipRuntime::from_parts(
+                        Replay {
+                            packet: packet.clone(),
+                            left: Cell::new(INBOUND_PACKETS),
+                        },
+                        FixedClock::new(1),
+                        gossip.clone(),
+                        CellStore::new(storage, NodeIdentity::new(peer_node(0), 1), &rules),
+                        Aggregate::new(&storage),
+                    )
+                },
+                // Holding the client keeps the request arm pending, so `run`
+                // serves every packet instead of shutting down.
+                |(runtime, _client)| {
+                    tokio
+                        .block_on(runtime.run(futures::stream::empty()))
+                        .expect_err("only the replay's end stops the run")
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
     group.finish();
 }
 
@@ -1483,6 +1567,7 @@ criterion_group!(
     bench_find,
     bench_admission_headers,
     bench_stream_after,
+    bench_merge_relay,
     bench_expire,
     bench_wire,
     bench_aggregate,

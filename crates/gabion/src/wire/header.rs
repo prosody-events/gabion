@@ -5,6 +5,7 @@
 use std::num::NonZeroU128;
 
 use crate::crdt::{Incarnation, NodeId, NodeIdentity};
+use crate::zone::ZoneHash;
 
 use super::{DecodeError, read_u16, read_u32, read_u64, read_u128};
 
@@ -92,6 +93,19 @@ pub enum CellPayload {
     Sweep,
 }
 
+impl Payload {
+    /// Whether the packet asks its addressee for an answer: stream data and
+    /// probes do; standalone acks, gap reports, probe answers and sweep
+    /// packets do not.
+    pub fn asks_answer(self) -> bool {
+        match self {
+            Self::Ack { probe } => probe,
+            Self::Cells(CellPayload::Own { .. } | CellPayload::Relay { .. }) => true,
+            Self::Cells(CellPayload::Sweep) | Self::SweepRequest => false,
+        }
+    }
+}
+
 impl From<CellPayload> for Payload {
     fn from(cells: CellPayload) -> Self {
         Self::Cells(cells)
@@ -132,8 +146,8 @@ pub struct AckInfo {
 pub struct Header<P = Payload> {
     pub cluster_id_hash: NonZeroU128,
     pub sender: NodeIdentity,
-    /// The sender's zone hash; 0 = no zone.
-    pub sender_zone: u32,
+    /// The sender's zone; `None` is written as 0.
+    pub sender_zone: Option<ZoneHash>,
     pub acks: AckInfo,
     pub payload: P,
 }
@@ -179,7 +193,7 @@ pub(crate) fn write_header<P: Copy + Into<Payload>>(
     dst[8..24].copy_from_slice(&header.cluster_id_hash.get().to_le_bytes());
     dst[24..40].copy_from_slice(&header.sender.node_id.0.to_le_bytes());
     dst[40..44].copy_from_slice(&header.sender.incarnation.to_le_bytes());
-    dst[44..48].copy_from_slice(&header.sender_zone.to_le_bytes());
+    dst[44..48].copy_from_slice(&header.sender_zone.map_or(0, ZoneHash::get).to_le_bytes());
     dst[48..50].copy_from_slice(&cell_count.to_le_bytes());
     dst[50..54].copy_from_slice(&acks.incarnation.to_le_bytes());
     dst[54..62].copy_from_slice(&ack_own.to_le_bytes());
@@ -226,7 +240,7 @@ pub(crate) fn read_header(
     let header = Header {
         cluster_id_hash,
         sender: NodeIdentity::new(NodeId(read_u128(&bytes[24..])), read_u32(&bytes[40..])),
-        sender_zone: read_u32(&bytes[44..]),
+        sender_zone: ZoneHash::from_wire(read_u32(&bytes[44..])),
         acks: AckInfo {
             incarnation: read_u32(&bytes[50..]),
             own: if flags & ACK_FLAGGED == 0 {

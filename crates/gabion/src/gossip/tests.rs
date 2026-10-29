@@ -36,10 +36,12 @@ use crate::mock::with_logs;
 use crate::settings::mock::{rules, storage};
 use crate::settings::{Millis, Settings};
 use crate::wire::{self, AckInfo, CellPayload, Header, MIN_PAYLOAD_BYTES, Payload};
+use crate::zone::ZoneHash;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 
 mod rounds;
+mod zones;
 
 // -- in-memory aggregate store ----------------------------------------------
 
@@ -1320,7 +1322,8 @@ fn node(id: u128) -> NodeIdentity {
 }
 
 /// A runtime on a scripted transport with an admin channel, after it has spent
-/// its immediate first tick with nothing to send. Heartbeats then fire at
+/// its immediate first tick, whose only packets, the hello acks to its
+/// bootstrap peers, are dropped from the record. Heartbeats then fire at
 /// t = 100, 200, … ms.
 async fn mocked(
     wire: &Rc<Wire>,
@@ -1342,15 +1345,21 @@ async fn mocked(
     );
     let runtime = tokio::task::spawn_local(rt.run(futures::stream::empty()));
     sim_advance_ticks(Duration::from_millis(10), 1).await;
+    wire.attempts.borrow_mut().clear();
     (client, admin_tx, runtime)
 }
 
 /// A header-only packet from the peer `sender` in the test cluster.
-fn header_bytes(sender: NodeIdentity, acks: AckInfo, payload: Payload) -> [u8; wire::HEADER_LEN] {
+fn header_bytes(
+    sender: NodeIdentity,
+    zone: Option<ZoneHash>,
+    acks: AckInfo,
+    payload: Payload,
+) -> [u8; wire::HEADER_LEN] {
     let header = Header {
         cluster_id_hash: 0xC1.try_into().unwrap(),
         sender,
-        sender_zone: 0,
+        sender_zone: zone,
         acks,
         payload,
     };
@@ -1359,7 +1368,19 @@ fn header_bytes(sender: NodeIdentity, acks: AckInfo, payload: Payload) -> [u8; w
 
 /// A header-only packet from the peer `sender`, queued for the runtime.
 fn inject(wire: &Wire, from: SocketAddr, sender: NodeIdentity, acks: AckInfo, payload: Payload) {
-    let bytes = header_bytes(sender, acks, payload).to_vec();
+    inject_zoned(wire, from, sender, None, acks, payload);
+}
+
+/// [`inject`] from a peer announcing `zone`.
+fn inject_zoned(
+    wire: &Wire,
+    from: SocketAddr,
+    sender: NodeIdentity,
+    zone: Option<ZoneHash>,
+    acks: AckInfo,
+    payload: Payload,
+) {
+    let bytes = header_bytes(sender, zone, acks, payload).to_vec();
     wire.inbound.borrow_mut().push_back((bytes, from));
 }
 
@@ -1440,8 +1461,8 @@ fn holds(line: &str, field: &str) -> bool {
 /// the 5 ms emit floor, so one threshold round runs.
 async fn threshold_rounds_in_a_burst(peers: Vec<SocketAddr>, refuse: bool) -> AdminSnapshot {
     let wire = Rc::new(Wire::default());
-    wire.refuse.set(refuse);
     let (client, admin, _runtime) = mocked(&wire, store_for(node(0xA)), sim_config(peers)).await;
+    wire.refuse.set(refuse);
     hit(&client, 1).await;
     heartbeats(1).await;
     for _ in 0..12 {
@@ -1483,10 +1504,10 @@ fn blocked_socket_does_not_fire_a_threshold_round_per_request() {
 fn refused_send_holds_one_packet() {
     run_paused(async {
         let wire = Rc::new(Wire::default());
-        wire.refuse.set(true);
         let peers = vec![sock(2), sock(3)];
         let config = tuned_config(peers, |s| s.max_payload_bytes = MIN_PAYLOAD_BYTES);
         let (client, admin, _runtime) = mocked(&wire, store_for(node(0xA)), config).await;
+        wire.refuse.set(true);
         hit(&client, 1).await;
         hit(&client, 2).await;
         heartbeats(1).await;
@@ -1500,8 +1521,9 @@ fn refused_send_holds_one_packet() {
         hit(&client, 2).await;
         heartbeats(2).await;
         assert_eq!(*wire.attempts.borrow(), vec![refused.clone(); 6]);
+        // The first tick's two hello acks left before the refusals.
         let counters = admin_snapshot(&admin).await.counters;
-        assert_eq!((counters.send_blocked, counters.packets_sent), (6, 0));
+        assert_eq!((counters.send_blocked, counters.packets_sent), (6, 2));
 
         wire.refuse.set(false);
         heartbeats(1).await;
@@ -1517,9 +1539,9 @@ fn refused_send_holds_one_packet() {
             1
         );
         let counters = admin_snapshot(&admin).await.counters;
-        assert_eq!((counters.send_blocked, counters.packets_sent), (6, 5));
+        assert_eq!((counters.send_blocked, counters.packets_sent), (6, 7));
         let sent: u64 = accepted.iter().map(|a| a.bytes.len() as u64).sum();
-        assert_eq!(counters.bytes_sent, sent);
+        assert_eq!(counters.bytes_sent, sent + 2 * wire::HEADER_LEN as u64);
     });
 }
 
@@ -1531,9 +1553,9 @@ fn send_blocked_warns_at_powers_of_two_naming_wmem_max() {
     let ((), logs) = with_logs(|| {
         run_paused(async {
             let wire = Rc::new(Wire::default());
-            wire.refuse.set(true);
             let (client, admin, _runtime) =
                 mocked(&wire, store_for(node(0xA)), sim_config(vec![sock(2)])).await;
+            wire.refuse.set(true);
             hit(&client, 1).await;
             heartbeats(5).await;
             assert_eq!(admin_snapshot(&admin).await.counters.send_blocked, 10);
@@ -1559,16 +1581,17 @@ fn send_error_to_one_peer_keeps_gossiping() {
     let ((), logs) = with_logs(|| {
         run_paused(async {
             let wire = Rc::new(Wire::default());
-            wire.forbidden.set(Some(sock(2)));
             let peers = vec![sock(2), sock(3)];
             let (client, admin, _runtime) =
                 mocked(&wire, store_for(node(0xA)), sim_config(peers)).await;
+            wire.forbidden.set(Some(sock(2)));
             hit(&client, 1).await;
             heartbeats(3).await;
             let to_other = wire.accepted().iter().filter(|a| a.dst == sock(3)).count();
             assert_eq!(to_other, 3);
+            // The two hello acks of the first tick left too.
             let counters = admin_snapshot(&admin).await.counters;
-            assert_eq!((counters.send_errors, counters.packets_sent), (3, 3));
+            assert_eq!((counters.send_errors, counters.packets_sent), (3, 5));
         })
     });
     let peer = format!("peer={}", sock(2));
@@ -1618,7 +1641,7 @@ fn each_decode_cause_has_its_own_throttle() {
         &Header {
             cluster_id_hash: 0xC2.try_into().unwrap(),
             sender: node(0xB),
-            sender_zone: 0,
+            sender_zone: None,
             acks: AckInfo::default(),
             payload: CellPayload::Sweep,
         },
@@ -1742,6 +1765,71 @@ fn bad_version_reports_the_peer_version() {
     );
 }
 
+/// Each rule keeps its own unsent hits: a burst on a rule with a large error
+/// budget fires nothing, and two crossings of a small budget fire two
+/// threshold rounds.
+#[test]
+fn two_rules_flush_independently() {
+    run_paused(async {
+        let wire = Rc::new(Wire::default());
+        let config = sim_config(vec![sock(2)]);
+        let (client, admin, _runtime) = mocked(&wire, store_for(node(0xA)), config).await;
+        // Intern both rules; a heartbeat settles them.
+        client.record(0xA, KeyHash(0), 0, 1, 100, 0).await.unwrap();
+        client
+            .record(0xB, KeyHash(0), 0, 1, 1_000_000, 0)
+            .await
+            .unwrap();
+        heartbeats(1).await;
+        let before = admin_snapshot(&admin).await.counters.rounds_threshold;
+        for key in 1..=500 {
+            client
+                .record(0xB, KeyHash(key), 0, 1, 1_000_000, 0)
+                .await
+                .unwrap();
+        }
+        sim_advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            admin_snapshot(&admin).await.counters.rounds_threshold,
+            before
+        );
+        for _ in 0..2 {
+            for key in 1..=2 {
+                client
+                    .record(0xA, KeyHash(key), 0, 1, 100, 0)
+                    .await
+                    .unwrap();
+            }
+            sim_advance_ticks(Duration::from_millis(1), 10).await;
+        }
+        assert_eq!(
+            admin_snapshot(&admin).await.counters.rounds_threshold,
+            before + 2
+        );
+    });
+}
+
+/// A heartbeat under 20 ms warns once at startup that resends may beat
+/// answers; 20 ms does not.
+#[test]
+fn short_tick_warns_near_round_trip() {
+    let ((), logs) = with_logs(|| {
+        for tick in [19, 20] {
+            tuned_config(vec![], |s| s.tick_interval = ms(tick)).note_startup();
+        }
+    });
+    assert_logged(
+        &logs,
+        "setting_warning",
+        1,
+        &[
+            "cause=\"tick_near_round_trip\"",
+            "tick_ms=19",
+            "config_key=\"gossip.tick_interval\"",
+        ],
+    );
+}
+
 /// A node on the default cluster id says so; a node on its own id says
 /// nothing.
 #[test]
@@ -1750,8 +1838,8 @@ fn default_cluster_id_is_logged_only_on_the_default() {
         tuned_config(vec![], |s| {
             s.cluster_id_hash = Settings::default().cluster_id_hash;
         })
-        .note_default_cluster_id();
-        sim_config(vec![]).note_default_cluster_id();
+        .note_startup();
+        sim_config(vec![]).note_startup();
     });
     assert_logged(
         &logs,
@@ -2402,7 +2490,16 @@ fn cut_round_resumes_as_the_strongest_round() {
             mocked(&wire, store_for(node(0xA)), sim_config(vec![p1, p2])).await;
         end_want(&wire, &[(p1, id1), (p2, id2)]);
         heartbeats(1).await;
-        assert!(wire.attempts.borrow().is_empty());
+        // Only the acks owed to peers heard for the first time.
+        let acks = sent_payloads(&wire, 0);
+        assert_eq!(
+            acks,
+            [
+                (p1, Payload::Ack { probe: false }),
+                (p2, Payload::Ack { probe: false })
+            ]
+        );
+        wire.attempts.borrow_mut().clear();
 
         // P1 probes, so a prompt round owes it an answer; P2 sends stream
         // data, which only a heartbeat acknowledges alone.

@@ -1,5 +1,6 @@
 use gabion::crdt::{
     CellStore, DeltaSink, Expiry, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch,
+    RelayMark,
 };
 use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
 
@@ -41,7 +42,7 @@ fn lead(store: &ShmAggregateStore, incarnation: u32) -> (CellStore, u128) {
         last_update_millis: 7_000,
     });
     let mut deltas = DeltaSink::default();
-    cells.merge_remote(&gossip, &mut deltas);
+    cells.merge_remote(&gossip, &mut deltas, RelayMark::Clear);
     store.apply(&deltas, &ExpirationSink::default());
     (cells, fingerprint)
 }

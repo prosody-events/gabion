@@ -245,7 +245,7 @@ async fn leader_main(
     // sends nothing.
     let (bind, peers, gossip) = match config.gossip_bind {
         Some(bind) => {
-            config.gossip.note_default_cluster_id();
+            config.gossip.note_startup();
             (
                 bind,
                 discovery::peer_events(config.discovery).left_stream(),

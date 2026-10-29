@@ -13,6 +13,7 @@ use super::peer::Role;
 #[cfg(feature = "cell-dump")]
 use crate::crdt::{BucketEpoch, Incarnation};
 use crate::crdt::{CellStoreStats, NodeId, NodeIdentity};
+use crate::zone::ZoneHash;
 
 /// Request sent into the gossip runtime over the admin channel. New shapes
 /// (e.g. a forced sweep) can be added without changing the `select!` arm.
@@ -39,6 +40,9 @@ pub enum AdminCommand {
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct AdminSnapshot {
     pub local_identity: NodeIdentity,
+    /// How many peers hold each role; during a rolling upgrade the
+    /// `incompatible` count falls to zero.
+    pub peers_by_role: RoleCounts,
     pub peers: Vec<PeerEntry>,
     pub store_stats: CellStoreStats,
     /// Event counts since startup.
@@ -95,8 +99,24 @@ pub struct GossipCounters {
     pub cells_merged: u64,
     /// Own-stream timeouts: a heartbeat passed without an ack, so the stream
     /// was resent from the last ack with `PROBE` set, or closed if nothing
-    /// above the ack is still live.
+    /// above the ack is still live; and a suspect's probe answer that rewound
+    /// it.
     pub rto_rewinds_own: u64,
+    /// The same for the relay stream.
+    pub rto_rewinds_relay: u64,
+    /// Datagrams' bytes sent to a peer in a different known zone.
+    pub bytes_sent_cross_zone: u64,
+    /// Gateways replaced because they left a packet unanswered for
+    /// `gossip.suspect_after` or said they cannot relay; logged as
+    /// `gateway_failover`.
+    pub gateway_failovers: u64,
+    /// Zone peers with relay data in flight that turned suspect; logged as
+    /// `relay_stalled`.
+    pub relay_stalls: u64,
+    /// Rows whose role changed.
+    pub role_changes: u64,
+    /// Header-only probes sent: to an idle gateway, or as a suspect's retry.
+    pub liveness_probes: u64,
     /// Gap reports sent: a peer's stream skipped positions.
     pub gap_reports_sent: u64,
     /// Gaps given up after their reports went unanswered; logged as
@@ -133,9 +153,58 @@ impl GossipCounters {
 pub struct PeerEntry {
     pub addr: SocketAddr,
     pub node_id: Option<NodeId>,
+    pub zone: PeerZone,
     pub role: Role,
+    pub answer: AnswerState,
+    /// How long the oldest packet waiting for this peer's answer has waited:
+    /// how close the peer is to being routed around.
+    pub unanswered_ms: Option<u32>,
     /// Own-stream positions sent to the peer and not yet acknowledged.
     pub own_unacked: u64,
+    /// The same for the relay stream.
+    pub relay_unacked: u64,
+}
+
+/// A peer's zone as its headers announce it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum PeerZone {
+    /// Not heard yet, or the peer announces no zone.
+    Unknown,
+    /// This node's zone.
+    Same,
+    #[cfg_attr(feature = "serde", serde(untagged))]
+    Other(ZoneHash),
+}
+
+/// Whether this node waits for a peer's answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum AnswerState {
+    Settled,
+    Owed,
+    /// Owed for `gossip.suspect_after` or longer.
+    Suspect,
+    /// The peer said it cannot reach most of its zone.
+    CannotRelay,
+}
+
+/// How many peers hold each role.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct RoleCounts {
+    pub zone: u32,
+    pub gateway: u32,
+    pub remote: u32,
+    pub incompatible: u32,
 }
 
 /// Full per-cell view of one runtime's `CellStore`, built inside the gossip

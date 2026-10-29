@@ -220,6 +220,11 @@ settings! {
         "gabion_gossip_min_emit_interval";
         min_emit_interval: Millis = Millis(nz!(defaults::GOSSIP_MIN_EMIT_INTERVAL_MS)),
         "gossip needs a positive gap between two sends";
+    GossipSuspectAfter => "gossip.suspect_after", "GABION_GOSSIP_SUSPECT_AFTER",
+        "gabion_gossip_suspect_after";
+        suspect_after: Option<Millis> = None,
+        "a peer would be routed around the moment one packet to it went unanswered; the default \
+         is four heartbeats and at least 2 s";
     GossipSweepConcurrency => "gossip.sweep_concurrency", "GABION_GOSSIP_SWEEP_CONCURRENCY",
         "gabion_gossip_sweep_concurrency";
         sweep_concurrency: NonZeroU8 = nz!(defaults::GOSSIP_SWEEP_CONCURRENCY),
@@ -283,6 +288,17 @@ impl Settings {
                 tick: self.tick_interval,
             });
         }
+        let two_ticks = Millis(self.tick_interval.0.saturating_mul(nz!(2)));
+        if let Some(configured) = self.suspect_after.filter(|&after| after < two_ticks) {
+            return Err(SettingError::SuspectAfterTooShort {
+                configured,
+                min: two_ticks,
+            });
+        }
+        let heartbeats = (self.tick_interval.0)
+            .saturating_mul(nz!(defaults::GOSSIP_SUSPECT_AFTER_TICKS))
+            .max(nz!(defaults::GOSSIP_SUSPECT_AFTER_FLOOR_MS));
+        let suspect_after = self.suspect_after.unwrap_or(Millis(heartbeats));
         let socket = "The kernel doubles the request and keeps it in a C `int`, so it grants at \
                       most 1,073,741,823 bytes; below 64 KiB one burst of gossip packets \
                       overflows it. The host's `net.core.rmem_max` (receive) and \
@@ -376,6 +392,8 @@ impl Settings {
             tick_interval: self.tick_interval.duration(),
             target_err_bps,
             min_emit_interval: self.min_emit_interval,
+            suspect_after,
+            zone: None,
         };
         let storage = ValidStorageConfig {
             cell_capacity: self.max_cells,
@@ -482,18 +500,27 @@ optional_field! {
 }
 
 /// An override with a derived default: unset until set, and 0 is not
-/// positive, as for the plain count.
-impl Field for Option<NonZeroU16> {
-    fn set(&mut self, text: &str) -> Result<(), Problem> {
-        let mut value = NonZeroU16::MIN;
-        value.set(text)?;
-        *self = Some(value);
-        Ok(())
-    }
+/// positive, as for the plain value.
+macro_rules! override_field {
+    ($($ty:ty = $seed:expr;)*) => {$(
+        impl Field for Option<$ty> {
+            fn set(&mut self, text: &str) -> Result<(), Problem> {
+                let mut value = $seed;
+                value.set(text)?;
+                *self = Some(value);
+                Ok(())
+            }
 
-    fn show(&self) -> Option<String> {
-        self.map(|value| value.to_string())
-    }
+            fn show(&self) -> Option<String> {
+                self.map(|value| value.to_string())
+            }
+        }
+    )*};
+}
+
+override_field! {
+    NonZeroU16 = NonZeroU16::MIN;
+    Millis = Millis(NonZeroU64::MIN);
 }
 
 impl Field for Option<Box<str>> {
@@ -615,6 +642,11 @@ pub enum SettingError {
         configured: Millis,
         tick: Millis,
     },
+    SuspectAfterTooShort {
+        configured: Millis,
+        /// Two heartbeats.
+        min: Millis,
+    },
     CapacityOutOfRange {
         setting: Setting,
         configured: u64,
@@ -695,6 +727,14 @@ impl fmt::Display for SettingError {
                 Setting::GossipMinEmitInterval
                     .default_text()
                     .unwrap_or_default()
+            ),
+            Self::SuspectAfterTooShort { configured, min } => write!(
+                f,
+                "{} is {configured}, shorter than two heartbeats ({min}, twice \
+                 `gossip.tick_interval`). A single lost packet would then move this node's \
+                 traffic off a healthy peer. Set it to at least {min}, or remove it to use the \
+                 default, four heartbeats and at least 2 s.",
+                Setting::GossipSuspectAfter,
             ),
             Self::CapacityOutOfRange {
                 setting,

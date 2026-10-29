@@ -113,8 +113,9 @@ recorded into a local queue.
 
 Everything else happens asynchronously, driven by those recorded hits.
 A background gossip task on each member folds them into a CRDT,
-sends its changed counts to every peer over UDP at each 500 ms heartbeat
-or sooner, resends what a peer has not acknowledged, applies inbound
+sends its changed counts over UDP at each 500 ms heartbeat or sooner,
+directly to the peers of its zone and to one gateway per remote zone that
+relays them, resends what a peer has not acknowledged, applies inbound
 deltas back into the local aggregate, and expires bucket rows as time
 advances. Each packet decodes on its own, so a dropped UDP packet costs
 the cluster at most one heartbeat of staleness rather than a missed

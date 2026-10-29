@@ -27,6 +27,16 @@ pub const STORAGE_MAX_REQUEST_DESCRIPTORS: u16 = 16;
 /// The heartbeat period `T`, also the retransmission timeout.
 pub const GOSSIP_TICK_INTERVAL_MILLIS: u64 = 500;
 
+/// Heartbeats a peer may leave a packet unanswered before it is suspect:
+/// `gossip.suspect_after` defaults to
+/// `max(this × tick_interval, GOSSIP_SUSPECT_AFTER_FLOOR_MS)`, four answer
+/// attempts.
+pub const GOSSIP_SUSPECT_AFTER_TICKS: u64 = 4;
+
+/// The floor of `gossip.suspect_after`'s default, so a shorter heartbeat buys
+/// more answer attempts, not a shorter suspicion time.
+pub const GOSSIP_SUSPECT_AFTER_FLOOR_MS: u64 = 2_000;
+
 /// Default of `gossip.peer_capacity`, the most peers one node gossips with:
 /// 300 pods with 1.7x headroom. The node dictionary's default is twice it.
 pub const GOSSIP_PEER_CAPACITY: u16 = 512;

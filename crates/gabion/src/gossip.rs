@@ -7,8 +7,13 @@
 //! A single `tokio::select!` drives five arms (limit request, heartbeat,
 //! prompt round, inbound, peer event), plus admin commands when wired, and
 //! calls `aggregates.apply(...)` once per CRDT-touching iteration. Each node
-//! sends its own changed cells to every peer as a per-peer stream the peer
-//! acknowledges; a gap report or a heartbeat without an ack brings a resend.
+//! sends its own changed cells as a per-peer stream the peer acknowledges,
+//! directly to every peer of its zone and, flagged `RELAY_INTO_ZONE`, to one
+//! rendezvous-chosen gateway in each other zone, which relays them into its
+//! zone on a second stream; a gap report or a heartbeat without an ack brings
+//! a resend. A peer that leaves a packet unanswered for
+//! `gossip.suspect_after` is suspect: it loses the gateway role and is sent
+//! only header-only probes until it answers.
 //!
 //! All polymorphic boundaries are monomorphized generics — no `dyn`, no
 //! `Box`. The production hot path is branch-free; tests and simulators
@@ -23,6 +28,7 @@ use std::time::Duration;
 use crate::defaults;
 use crate::settings::{MIN_LIMIT_QUEUE_CAPACITY, Millis, Setting};
 use crate::wire::FrameLimits;
+use crate::zone::ZoneName;
 
 mod admin;
 mod client;
@@ -39,7 +45,9 @@ mod transport;
 #[cfg(test)]
 mod tests;
 
-pub use admin::{AdminCommand, AdminSnapshot, GossipCounters, PeerEntry};
+pub use admin::{
+    AdminCommand, AdminSnapshot, AnswerState, GossipCounters, PeerEntry, PeerZone, RoleCounts,
+};
 #[cfg(feature = "cell-dump")]
 pub use admin::{CellDumpEntry, CellDumpSnapshot};
 pub use client::{GossipClient, RecordPermit, TryRecordError};
@@ -91,7 +99,18 @@ pub struct ValidGossipConfig {
     /// Minimum gap between two threshold-fire emissions. See
     /// [`crate::defaults::GOSSIP_MIN_EMIT_INTERVAL_MS`].
     pub(crate) min_emit_interval: Millis,
+    /// `gossip.suspect_after`: how long a packet may go unanswered before its
+    /// peer is suspect.
+    pub(crate) suspect_after: Millis,
+    /// This node's zone, announced in every header; `None` runs the node as
+    /// one zone with every peer.
+    pub zone: Option<ZoneName>,
 }
+
+/// A heartbeat shorter than this many milliseconds may resend before the
+/// answer to the first copy arrives: four times a generous cross-zone round
+/// trip.
+const TICK_NEAR_ROUND_TRIP_MS: u128 = 20;
 
 impl ValidGossipConfig {
     /// Shrink the runtime's request channel to [`MIN_LIMIT_QUEUE_CAPACITY`],
@@ -117,9 +136,28 @@ impl ValidGossipConfig {
         }
     }
 
-    /// Log `default_cluster_id` when this node uses the built-in cluster id.
-    /// Each adapter calls it once, when the node starts gossiping.
-    pub fn note_default_cluster_id(&self) {
+    /// Log what the settings say at startup: `default_cluster_id` when this
+    /// node uses the built-in cluster id, and `setting_warning` for a
+    /// heartbeat near a round trip. Each adapter calls it once, when the node
+    /// starts gossiping.
+    pub fn note_startup(&self) {
+        let tick_ms = self.tick_interval.as_millis();
+        if tick_ms < TICK_NEAR_ROUND_TRIP_MS {
+            tracing::warn!(
+                code = "setting_warning",
+                cause = "tick_near_round_trip",
+                tick_ms,
+                config_key = Setting::GossipTickInterval.yaml_key(),
+                "{} is {tick_ms} ms. gabion resends any packet left unanswered for one heartbeat, \
+                 so with a heartbeat this short a resend can leave before the answer to the first \
+                 copy arrives (a round trip between zones takes a few milliseconds). That costs \
+                 bytes, not counts: suspicion waits for `gossip.suspect_after`, whose default \
+                 stays at least 2 s however short the heartbeat. If `/snapshot` shows \
+                 `unanswered_ms` regularly above {tick_ms} for healthy peers, raise the heartbeat \
+                 to at least four times the round trip between your zones.",
+                Setting::GossipTickInterval,
+            );
+        }
         if self.cluster_id_hash.get() == defaults::GOSSIP_CLUSTER_ID_HASH {
             tracing::info!(
                 code = "default_cluster_id",

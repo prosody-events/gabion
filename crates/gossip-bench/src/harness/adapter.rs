@@ -26,11 +26,12 @@ use gabion::gossip::{
 };
 use gabion::rules::{Descriptor, EnforcementMode, RuleDef, RuleSpec, RuleTable, hash_key};
 use gabion::settings::Settings;
+use gabion::zone::ZoneName;
 use tokio::sync::{mpsc, oneshot};
 
 use super::driver::Counters;
 use super::node::{KeySpace, NOT_TRACKED, Sizing};
-use super::plan::node_addr;
+use super::plan::{AVAILABILITY_ZONES, node_addr};
 use super::regime::Regime;
 use super::rng::{Rng, Stream};
 use super::world::{PeerStream, SimClock, SimSocket, SimTicker, World};
@@ -314,13 +315,17 @@ impl Launcher {
             Rc::clone(&self.identity),
             &self.cells,
         ));
+        // Each node announces the zone the plan places it in.
+        let mut gossip = self.gossip.clone();
+        let az = idx % usize::from(AVAILABILITY_ZONES);
+        gossip.zone = Some(ZoneName::parse(&format!("az-{az}"))?);
         let (admin, admin_rx) = mpsc::channel(4);
         let (runtime, client) = GossipRuntime::from_parts_with_admin(
             transport,
             SimClock {
                 world: Rc::clone(&self.world),
             },
-            self.gossip.clone(),
+            gossip,
             cell_store,
             Rc::clone(&store),
             Some(admin_rx),
