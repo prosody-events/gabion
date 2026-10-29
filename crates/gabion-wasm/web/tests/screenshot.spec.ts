@@ -592,7 +592,7 @@ test('network partition splits the cluster until healed', async ({ page }) => {
 // The redesigned node-detail panel surfaces the full AdminSnapshot in grouped,
 // labeled sections. This asserts each section renders with live values: the
 // §2 convergence headline (honestly "This node's view", not "Cluster total"),
-// §4 cadence, §5 I/O & queues, §6 storage gauges, §7 peer table, §8 identity.
+// §4 cadence, §5 I/O, §6 storage gauges, §7 peer table, §8 identity.
 test('the node inspector renders every detail section', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));

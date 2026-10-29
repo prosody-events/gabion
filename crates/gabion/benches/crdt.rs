@@ -11,9 +11,9 @@
 //! * `ingest_local/cold_start`    — empty store filling under realistic key
 //!   distribution (per-window startup).
 //!
-//! * `merge_remote/digest_repair` — what a digest-driven repair frame looks
-//!   like: 50% no-op (we are ahead) + 40% real update + 10% insert, across 8
-//!   peers.
+//! * `merge_remote/mixed_frame`   — a frame that partly repeats what this node
+//!   holds (a resend after a lost ack, a sweep page over the streams): 50%
+//!   no-op (we are ahead) + 40% real update + 10% insert, across 8 peers.
 //! * `merge_remote/bulk_fan_in`   — multiple peers gossiping overlapping cells
 //!   (max-merge collapses duplicates).
 //! * `merge_remote/all_noop`      — peer is behind us on every row.
@@ -628,13 +628,14 @@ fn bench_merge_remote(c: &mut Criterion) {
 
     let fixture = build_fixture();
 
-    // ─── digest_repair ──────────────────────────────────────────────────
-    // What an incoming digest-repair frame looks like: 50% no-op (we are
-    // ahead), 40% real update (peer is ahead), 10% insert (cell new to
-    // us). Multi-peer, multi-rule.
+    // ─── mixed_frame ────────────────────────────────────────────────────
+    // A frame that partly repeats what we hold, as a resend after a lost ack
+    // or a sweep page over the streams does: 50% no-op (we are ahead), 40%
+    // real update (peer is ahead), 10% insert (cell new to us). Multi-peer,
+    // multi-rule.
     for &batch in &[64usize, 128] {
         group.throughput(Throughput::Elements(batch as u64));
-        group.bench_function(BenchmarkId::new("digest_repair", batch), |b| {
+        group.bench_function(BenchmarkId::new("mixed_frame", batch), |b| {
             b.iter_batched_ref(
                 || {
                     (

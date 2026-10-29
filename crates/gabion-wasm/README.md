@@ -54,9 +54,7 @@ wasm-pack build --target nodejs --dev
 node smoke.cjs           # submit → gossip → converge → snapshot, prints DONE OK
 ```
 
-`getrandom` 0.4 selects its browser backend from the `wasm_js` feature in
-`Cargo.toml` (no `RUSTFLAGS` cfg needed); `wasm-pack` downloads the
-`wasm-bindgen` that matches `Cargo.lock`.
+`wasm-pack` downloads the `wasm-bindgen` that matches `Cargo.lock`.
 
 ## Frontend
 

@@ -127,9 +127,9 @@
     <GossipCadence {node} {version} />
   </section>
 
-  <!-- §5 Gossip I/O & queues. -->
+  <!-- §5 Gossip I/O. -->
   <section class="section">
-    <h3 class="section-head">Gossip I/O &amp; queues</h3>
+    <h3 class="section-head">Gossip I/O</h3>
     <div class="io">
       <div class="io-row">
         <span class="io-label">

@@ -11,6 +11,7 @@ use crate::crdt::{
     CellIndex, Incarnation, NodeIdentity, hash_fingerprint, mix64, pow2_index_capacity_for,
 };
 use crate::defaults::GOSSIP_GAP_REPORTS;
+use crate::wire::StreamRange;
 
 use super::admin::PeerEntry;
 
@@ -178,14 +179,20 @@ pub(super) enum GapDue {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct Inbound {
     /// The highest position held contiguously from 0.
-    pub(super) have: u64,
-    pub(super) gap: Gap,
+    have: u64,
+    gap: Gap,
 }
 
 impl Inbound {
-    /// A packet closing `(lower, upper]` arrived. `have` moves only over
-    /// contiguous ranges; a range above it is stashed and opens a gap.
-    pub(super) fn receive(&mut self, lower: u64, upper: u64, now: u64, floor_ms: u64) {
+    /// The highest position held contiguously from 0: the ack to send.
+    pub(super) fn have(&self) -> u64 {
+        self.have
+    }
+
+    /// A packet closing `range` arrived. `have` moves only over contiguous
+    /// ranges; a range above it is stashed and opens a gap.
+    pub(super) fn receive(&mut self, range: StreamRange, now: u64, floor_ms: u64) {
+        let (lower, upper) = (range.lower(), range.upper());
         if lower > self.have {
             self.gap = match self.gap {
                 Gap::Closed => Gap::Open {
@@ -298,8 +305,8 @@ pub(super) struct PeerLink {
 }
 
 // 128 bytes: the fields take 120 (`Option<NodeIdentity>` 48 at `u128`
-// alignment, the inbound mark 40) and pad to 128. E-Z10 states the per-row
-// cost from it.
+// alignment, the inbound mark 40) and pad to 128, the per-row cost the
+// `gossip.peer_capacity` warning quotes.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<PeerLink>() == 128);
 

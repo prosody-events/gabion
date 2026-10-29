@@ -53,8 +53,8 @@ gabiond /etc/gabion/config.yaml
 Point Envoy's rate-limit filter at `gabiond.<namespace>.svc:8081` (or
 wherever you bound `envoy_bind`). Envoy emits one RPC per request, and
 gabiond evaluates every descriptor in that RPC against the rules its
-`(domain, key)` matches, records the allowed ones into the gossip ring,
-and replies. The reply's `overall_code` is `OVER_LIMIT` if any
+`(domain, key)` matches, records the allowed ones for gossip to send to
+its peers, and replies. The reply's `overall_code` is `OVER_LIMIT` if any
 descriptor was rejected, while the per-descriptor codes ride in
 `statuses[]` so a partial reject does not fail the whole batch.
 

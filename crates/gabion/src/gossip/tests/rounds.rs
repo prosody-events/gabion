@@ -123,7 +123,7 @@ fn assert_totals(nodes: &[&Node], total: u64) {
     }
 }
 
-/// SIM1: one heartbeat sends a new count straight to every peer.
+/// One heartbeat sends a new count straight to every peer.
 #[test]
 fn one_zone_direct_mail_converges() {
     run_paused(async {
@@ -141,9 +141,9 @@ fn one_zone_direct_mail_converges() {
     });
 }
 
-/// SIM2: a partition heals through the streams' retransmission timeouts:
-/// every join sweep ended while the partition stood, and none runs after the
-/// heal, so no sweep carried the counts across it.
+/// A partition heals through the streams' retransmission timeouts: every join
+/// sweep ended while the partition stood, and none runs after the heal, so no
+/// sweep carried the counts across it.
 #[test]
 fn partition_then_heal() {
     run_paused(async {
@@ -173,9 +173,9 @@ fn partition_then_heal() {
     });
 }
 
-/// SIM3: the last packet of a burst, lost with nothing after it to open a
-/// gap, is resent one heartbeat later with `PROBE`, and the peer answers it
-/// at once rather than at its own heartbeat half a heartbeat later.
+/// The last packet of a burst, lost with nothing after it to open a gap, is
+/// resent one heartbeat later with `PROBE`, and the peer answers it at once
+/// rather than at its own heartbeat half a heartbeat later.
 #[test]
 fn last_packet_of_a_burst_is_repaired_by_rto() {
     run_paused(async {
@@ -203,9 +203,9 @@ fn last_packet_of_a_burst_is_repaired_by_rto() {
     });
 }
 
-/// SIM4: a lost packet followed by a delivered one opens a gap; the receiver
-/// reports it after one relay floor and the sender resends at once, well
-/// before its timeout. One cell fills a packet.
+/// A lost packet followed by a delivered one opens a gap; the receiver reports
+/// it after one relay floor and the sender resends at once, well before its
+/// timeout. One cell fills a packet.
 #[test]
 fn gap_is_reported_and_resent_within_floors() {
     run_paused(async {
@@ -273,8 +273,8 @@ fn abandoned_gap_stops_prompt_rounds() {
     assert_logged(&logs, "gap_abandoned", 1, &["missing=1", "reports=4"]);
 }
 
-/// SIM5: a joiner learns the cells of an origin that left before it joined,
-/// which no stream carries any more, from a join sweep.
+/// A joiner learns the cells of an origin that left before it joined, which no
+/// stream carries any more, from a join sweep.
 #[test]
 fn joiner_learns_a_departed_origins_cells_by_sweep() {
     run_paused(async {
@@ -311,8 +311,8 @@ fn joiner_learns_a_departed_origins_cells_by_sweep() {
     });
 }
 
-/// SIM6: a node with no peers runs heartbeats and nothing else; its join
-/// sweep waits without keeping the prompt ticker running.
+/// A node with no peers runs heartbeats and nothing else; its join sweep waits
+/// without keeping the prompt ticker running.
 #[test]
 fn lone_node_runs_only_heartbeats() {
     run_paused(async {
@@ -331,8 +331,8 @@ fn lone_node_runs_only_heartbeats() {
     });
 }
 
-/// SIM7: a sweep request from an address outside the peer table is counted
-/// and answered with nothing, so a forged request cannot reflect the store.
+/// A sweep request from an address outside the peer table is counted and
+/// answered with nothing, so a forged request cannot reflect the store.
 #[test]
 fn sweep_request_from_unknown_address_is_ignored() {
     run_paused(async {
@@ -355,8 +355,8 @@ fn sweep_request_from_unknown_address_is_ignored() {
     });
 }
 
-/// SIM8: a restarted node starts new streams with its peers and gets its
-/// previous incarnation's cells back from a join sweep.
+/// A restarted node starts new streams with its peers and gets its previous
+/// incarnation's cells back from a join sweep.
 #[test]
 fn restart_resets_streams_and_requests_a_sweep() {
     run_paused(async {
@@ -379,9 +379,9 @@ fn restart_resets_streams_and_requests_a_sweep() {
     });
 }
 
-/// SIM9: a peer speaking another wire version is sent nothing, not even the
-/// rest of a sweep it asked for; its first packet of this version makes it a
-/// recipient again, rewound to 0.
+/// A peer speaking another wire version is sent nothing, not even the rest of a
+/// sweep it asked for; its first packet of this version makes it a recipient
+/// again, rewound to 0.
 #[test]
 fn other_version_peer_is_muted() {
     run_paused(async {
@@ -434,10 +434,9 @@ fn other_version_peer_is_muted() {
     });
 }
 
-/// SIM22: two restarts within one wall-clock second get distinct
-/// incarnations, so no peer merges a new process's counts into the old
-/// one's: every node ends exact although each restart's first packet to
-/// every peer is lost.
+/// Two restarts within one wall-clock second get distinct incarnations, so no
+/// peer merges a new process's counts into the old one's: every node ends exact
+/// although each restart's first packet to every peer is lost.
 #[cfg(feature = "transport-udp")]
 #[test]
 fn restart_within_one_second_ends_exact() {
@@ -480,9 +479,9 @@ fn restart_within_one_second_ends_exact() {
     });
 }
 
-/// SIM23: after a restart, an ack the peer wrote for the old process credits
-/// nothing in the new one's stream, so R's resend starts from 0, P never sees
-/// a hole to report, and every node ends exact.
+/// After a restart, an ack the peer wrote for the old process credits nothing
+/// in the new one's stream, so R's resend starts from 0, P never sees a hole to
+/// report, and every node ends exact.
 #[test]
 fn stale_ack_after_restart_is_ignored() {
     run_paused(async {
@@ -508,10 +507,9 @@ fn stale_ack_after_restart_is_ignored() {
     });
 }
 
-/// SIM30: a receiver that forgot a sender's stream (discovery removed and
-/// re-added it, with no restart) reports a gap from 0; the sender rewinds
-/// below its `acked` and resends, so the gap closes instead of being
-/// abandoned.
+/// A receiver that forgot a sender's stream (discovery removed and re-added it,
+/// with no restart) reports a gap from 0; the sender rewinds below its `acked`
+/// and resends, so the gap closes instead of being abandoned.
 #[test]
 fn receiver_that_forgot_the_stream_is_resynced() {
     let ((), logs) = with_logs(|| {
@@ -612,8 +610,8 @@ impl Takeover {
     }
 }
 
-/// SIM34, case 1: N's first sweep request is lost; it asks again at its
-/// next heartbeat and gets its old cells.
+/// N's first sweep request is lost; it asks again at its next heartbeat and
+/// gets its old cells.
 #[test]
 fn takeover_with_lost_sweep_request_ends_exact() {
     run_paused(async {
@@ -641,9 +639,9 @@ fn takeover_with_lost_sweep_request_ends_exact() {
     });
 }
 
-/// SIM34, case 2: a retry that reaches the source while it is still paging
-/// N's sweep neither starts a second sweep nor restarts the pages, so pages
-/// lost in between stay lost (sweep pages are never acked).
+/// A retry that reaches the source while it is still paging N's sweep neither
+/// starts a second sweep nor restarts the pages, so pages lost in between stay
+/// lost (sweep pages are never acked).
 #[test]
 fn takeover_retry_during_a_paged_sweep_is_a_no_op() {
     run_paused(async {
@@ -691,11 +689,11 @@ fn takeover_retry_during_a_paged_sweep_is_a_no_op() {
     });
 }
 
-/// SIM34, case 6: N restarts again while its source pages the sweep the
-/// previous incarnation asked for. A threshold round sends the source's next
-/// hit at once, so the new incarnation hears the source and asks before a
-/// tail page reaches it; that request starts the sweep over, so N gets its
-/// old cells from the first page on.
+/// N restarts again while its source pages the sweep the previous incarnation
+/// asked for. A threshold round sends the source's next hit at once, so the new
+/// incarnation hears the source and asks before a tail page reaches it; that
+/// request starts the sweep over, so N gets its old cells from the first page
+/// on.
 #[test]
 fn takeover_restarted_mid_sweep_is_swept_from_the_start() {
     run_paused(async {
@@ -731,9 +729,9 @@ fn takeover_restarted_mid_sweep_is_swept_from_the_start() {
     });
 }
 
-/// SIM34, case 3: when every candidate is unreachable, N keeps rotating
-/// through them, wrapping past the last, and ends with pages from two
-/// sources once two answer; then it stops asking.
+/// When every candidate is unreachable, N keeps rotating through them, wrapping
+/// past the last, and ends with pages from two sources once two answer; then it
+/// stops asking.
 #[test]
 fn takeover_with_every_source_unreachable_wraps_and_ends() {
     run_paused(async {
@@ -765,8 +763,8 @@ fn takeover_with_every_source_unreachable_wraps_and_ends() {
     });
 }
 
-/// SIM34, case 4: in a zone of two, N takes exactly one sweep from its one
-/// peer and then stops asking.
+/// In a zone of two, N takes exactly one sweep from its one peer and then stops
+/// asking.
 #[test]
 fn takeover_in_a_zone_of_two_takes_one_sweep() {
     run_paused(async {
@@ -781,8 +779,8 @@ fn takeover_in_a_zone_of_two_takes_one_sweep() {
     });
 }
 
-/// SIM34, case 5: a node that starts with no peers keeps its want until one
-/// is added and heard, then takes one sweep.
+/// A node that starts with no peers keeps its want until one is added and
+/// heard, then takes one sweep.
 #[test]
 fn want_waits_for_a_first_peer() {
     run_paused(async {
@@ -803,10 +801,10 @@ fn want_waits_for_a_first_peer() {
     });
 }
 
-/// SIM37: a resend whose cells all expired in flight is one closing packet
-/// without cells, in flight through the head like any other: lost, it times
-/// out and goes again with `PROBE`. The receiver acks across the range, so
-/// nothing stays in flight, the stream goes quiet and no gap is abandoned.
+/// A resend whose cells all expired in flight is one closing packet without
+/// cells, in flight through the head like any other: lost, it times out and
+/// goes again with `PROBE`. The receiver acks across the range, so nothing
+/// stays in flight, the stream goes quiet and no gap is abandoned.
 #[test]
 fn expired_cells_are_closed_not_abandoned() {
     let ((), logs) = with_logs(|| {
@@ -853,9 +851,9 @@ fn expired_cells_are_closed_not_abandoned() {
     assert_logged(&logs, "gap_abandoned", 0, &[]);
 }
 
-/// SIM42: a peer that becomes a recipient with the whole store owed drains
-/// it on prompt rounds, a quantum each, long before the next heartbeat, and
-/// not through a sweep.
+/// A peer that becomes a recipient with the whole store owed drains it on
+/// prompt rounds, a quantum each, long before the next heartbeat, and not
+/// through a sweep.
 fn full_store_rewind_drains_on_prompt_rounds(max_cells: u32, max_rounds: u64) {
     run_paused(async {
         const CELLS: u128 = 20_000;
@@ -923,8 +921,8 @@ fn full_store_rewind_drains_on_prompt_rounds_at_twice_the_store() {
     full_store_rewind_drains_on_prompt_rounds(262_144, 10);
 }
 
-/// SIM44: a round reads at most `B_r` waiting datagrams, so a flood queued
-/// before the first round neither delays it nor stops later heartbeats.
+/// A round reads at most `B_r` waiting datagrams, so a flood queued before the
+/// first round neither delays it nor stops later heartbeats.
 #[test]
 fn inbound_flood_does_not_starve_rounds() {
     run_paused(async {

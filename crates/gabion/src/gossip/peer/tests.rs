@@ -28,6 +28,11 @@ fn table() -> PeerTable {
     PeerTable::with_capacity(CAPACITY, 7, RTO)
 }
 
+/// The stream range `(lower, upper]`; every caller passes `lower < upper`.
+fn range(lower: u64, upper: u64) -> StreamRange {
+    StreamRange::new(lower, upper).expect("lower < upper")
+}
+
 /// A table holding one peer, at row 0.
 fn one_row() -> PeerTable {
     let mut table = table();
@@ -327,7 +332,7 @@ fn inbound_gap_matches_model(ops: Vec<Op>) {
         match op {
             Op::Receive(lower, len) => {
                 let (lower, upper) = (u64::from(lower), u64::from(lower + len));
-                inbound.receive(lower, upper, now, FLOOR);
+                inbound.receive(range(lower, upper), now, FLOOR);
                 model.receive(lower, upper, now);
                 if lower > before.have {
                     assert_eq!(inbound.have, before.have, "jumped a hole");
@@ -388,7 +393,7 @@ fn deadline_is_min_of_row_timers(ops: Vec<Op>) {
             Op::Advance(n) => now += u64::from(n) * FLOOR,
             Op::Receive(lower, len) => {
                 let (lower, upper) = (u64::from(lower), u64::from(lower + len));
-                table.own_in(0).receive(lower, upper, now, FLOOR);
+                table.own_in(0).receive(range(lower, upper), now, FLOOR);
             }
             Op::Report => {
                 table.own_in(0).take_report(now, FLOOR);
@@ -421,8 +426,8 @@ fn incarnation_change_resets_the_whole_row() {
     assert_eq!(table.contact(0, old), Contact::First);
     table.own_tx(0).note_sent(5, 1_000);
     table.own_tx(0).note_ack(3, 5, 1_000);
-    table.own_in(0).receive(0, 4, 1_000, FLOOR);
-    table.own_in(0).receive(6, 7, 1_000, FLOOR);
+    table.own_in(0).receive(range(0, 4), 1_000, FLOOR);
+    table.own_in(0).receive(range(6, 7), 1_000, FLOOR);
     for bits in [
         PeerFlags::ACK_DUE,
         PeerFlags::REPLY_DUE,

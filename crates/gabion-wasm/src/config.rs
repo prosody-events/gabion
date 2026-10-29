@@ -59,7 +59,8 @@ impl Default for SimConfig {
             // 60 thin bands), and a limit of 1 000 is low enough that the
             // no-preset "Tune the cluster" path can cross it within a window.
             // The narrative presets override the limit back to 1 000 000 so a
-            // burst still spreads lazily by heartbeat (see `web/.../presets.ts`).
+            // burst still spreads lazily by heartbeat (see
+            // `web/.../presets.ts`).
             rule_limit: 1_000,
             rule_window_ms: 10_000,
             rule_bucket_ms: 1_000,

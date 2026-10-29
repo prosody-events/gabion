@@ -578,9 +578,13 @@ fn quiet_cluster_takes_one_substep_per_heartbeat() {
             "the count armed prompt rounds: {}",
             state.substeps
         );
+        // One heartbeat per step: a ticker left armed adds a sub-step per floor
+        // and fails the count before its full inbox can block `step`.
         state.substeps = 0;
-        state.step(1_000).await;
-        assert_eq!(state.substeps, 10);
+        for heartbeats in 1..=10 {
+            state.step(100).await;
+            assert_eq!(state.substeps, heartbeats);
+        }
         state
     });
 }

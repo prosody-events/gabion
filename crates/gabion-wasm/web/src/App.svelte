@@ -623,15 +623,16 @@
   }
 
   /* The charts and the inspector share one slot, so the detail rail sits under
-     the stage on the left and the controls take the right column. The rail is
-     too short to fit the charts at a legible height, so it scrolls instead. */
+     the stage on the left and the controls take the right column. The stage
+     keeps the larger row, since its ring scales with its height; the rail is
+     too short to fit the charts at a legible height either way, so it scrolls. */
   @media (640px <= width < 1100px) {
     .workspace {
       grid-template-columns: minmax(0, 1fr) clamp(220px, 32%, 280px);
       grid-template-areas:
         'stage rail'
         'detail rail';
-      grid-template-rows: minmax(0, 2fr) minmax(0, 3fr);
+      grid-template-rows: minmax(0, 3fr) minmax(0, 2fr);
     }
 
     .detail-rail {

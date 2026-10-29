@@ -1,4 +1,4 @@
-//! N1: steady-state gossip allocates nothing. Two runtimes on one paused
+//! Steady-state gossip allocates nothing. Two runtimes on one paused
 //! current-thread runtime exchange own-stream packets, acks, threshold and
 //! heartbeat rounds and a batched expiry of more than one sink's worth of
 //! cells; every tenth datagram A sends B is lost, so gap reports, timeout

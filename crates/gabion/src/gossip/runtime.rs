@@ -104,8 +104,6 @@ where
     next_peer: usize,
     /// This node's join sweep, from start until enough sources answered.
     sweep_want: Option<SweepWant>,
-    /// A peer was first heard while the want waits: ask on the next round.
-    sweep_due: bool,
     sweeps: Sweeps,
     /// Cells per sweep page: `max(q / gossip.sweep_concurrency, cells in one
     /// packet)`.
@@ -119,15 +117,16 @@ where
 
     counters: GossipCounters,
 
-    // Threshold-triggered anti-entropy state. One column per interned rule slot; sized to the
-    // rule dictionary's capacity at construction and reused for the runtime's lifetime, 12 bytes
-    // per rule-dictionary slot. Indexed by `RuleSlot` to keep the hot path's single dictionary
+    // Threshold-triggered anti-entropy state. One column per interned rule
+    // slot; sized to the rule dictionary's capacity at construction and reused
+    // for the runtime's lifetime, 12 bytes per rule-dictionary slot. Indexed by
+    // `RuleSlot` to keep the hot path's single dictionary
     // lookup (`RuleDictionary::find`) the only identity work.
     //
-    // - `rule_pending[slot]`     — local hits accumulated against rule `slot` since the last
-    //   gossip emit. Zeroed when a round settles (`settle`).
-    // - `rule_last_emit_ms[slot]` — wall-clock stamp of the last emit that included this rule
-    //   (stamped when a round settles).
+    // - `rule_pending[slot]`     — local hits accumulated against rule `slot`
+    //   since the last gossip emit. Zeroed when a round settles (`settle`).
+    // - `rule_last_emit_ms[slot]` — wall-clock stamp of the last emit that
+    //   included this rule (stamped when a round settles).
     rule_pending: Box<[u32]>,
     rule_last_emit_ms: Box<[u64]>,
 
@@ -268,7 +267,6 @@ where
             cut: None,
             next_peer: 0,
             sweep_want: Some(SweepWant::default()),
-            sweep_due: false,
             sweeps,
             sweep_page,
             pending_reply: None,
@@ -438,7 +436,8 @@ where
             rule_fingerprint: req.rule_fingerprint,
             key_hash: req.key_hash,
             bucket: req.bucket,
-            // ingest_local ignores origin/incarnation and forces local identity.
+            // ingest_local ignores origin/incarnation and forces local
+            // identity.
             origin: NodeId(0),
             incarnation: 0,
             count: hits,
@@ -479,7 +478,11 @@ where
         };
         match self.peers.contact(row, header.sender) {
             Contact::Late => return,
-            Contact::First => self.sweep_due |= self.sweep_want.is_some(),
+            Contact::First => {
+                if let Some(want) = &mut self.sweep_want {
+                    want.due = true;
+                }
+            }
             Contact::Restarted => self.sweeps.end(src),
             Contact::Current => {}
         }
@@ -501,9 +504,7 @@ where
         let probe = match header.payload {
             Payload::Cells(CellPayload::Own { range, probe, .. }) => {
                 let floor = self.config.min_emit_interval.0.get();
-                self.peers
-                    .own_in(row)
-                    .receive(range.lower(), range.upper(), now, floor);
+                self.peers.own_in(row).receive(range, now, floor);
                 self.peers.set_flag(row, PeerFlags::ACK_DUE, true);
                 probe
             }
@@ -523,7 +524,7 @@ where
             self.peers.set_flag(row, PeerFlags::REPLY_DUE, true);
         }
         self.peers.refresh_deadline(row);
-        self.prompt_work |= self.sweep_due || self.peers.flags(row).has(PeerFlags::PROMPT);
+        self.prompt_work |= self.sweep_due() || self.peers.flags(row).has(PeerFlags::PROMPT);
     }
 
     /// Count a dropped packet against its cause, and log at powers of two of
@@ -795,7 +796,7 @@ where
         if kind == Round::Prompt {
             self.serve_sweeps();
         }
-        self.prompt_work |= self.sweep_due || self.sweeps.active() > 0 || self.outbox.is_held();
+        self.prompt_work |= self.sweep_due() || self.sweeps.active() > 0 || self.outbox.is_held();
     }
 
     /// Read the datagrams already waiting, at most `B_r`, so the round sees
@@ -925,7 +926,7 @@ where
             sender_zone: 0,
             acks: AckInfo {
                 incarnation: link.identity.map_or(0, |identity| identity.incarnation),
-                own: OwnAck::Plain(link.own_in.have),
+                own: OwnAck::Plain(link.own_in.have()),
                 relay: 0,
                 gap_own,
                 gap_relay: false,
@@ -964,18 +965,23 @@ where
 
     // -- join sweeps --------------------------------------------------------
 
+    /// Whether a peer was first heard while the want waits.
+    fn sweep_due(&self) -> bool {
+        self.sweep_want.as_ref().is_some_and(|want| want.due)
+    }
+
     /// Ask for the join sweep this node wants: at every heartbeat, and on any
     /// round once a peer is first heard. Each source asked is sent a
     /// `SweepRequest` at once and again at each heartbeat until a page
     /// arrives.
     fn ask_sweeps(&mut self, kind: Round) {
-        if kind != Round::Heartbeat && !self.sweep_due {
-            return;
-        }
-        self.sweep_due = false;
-        let Some(mut want) = self.sweep_want.take() else {
+        let Some(mut want) = self
+            .sweep_want
+            .take_if(|want| kind == Round::Heartbeat || want.due)
+        else {
             return;
         };
+        want.due = false;
         if want.advance(|| self.peers.sweep_candidates()) {
             return;
         }
@@ -1034,8 +1040,10 @@ where
     /// requester that left or speaks another version is dropped. A page cut
     /// by a held packet is sent again whole: pages are max-merges.
     fn serve_sweeps(&mut self) {
+        // Pages overwrite `frame_handles`: no own frame survives them.
+        self.frame_from = None;
         for i in 0..self.sweeps.limit() {
-            let Some(Sweep { dst, next_slot }) = self.sweeps.slots()[i] else {
+            let Some(Sweep { dst, next_slot }) = self.sweeps.get(i) else {
                 continue;
             };
             if self.outbox.is_held() {
@@ -1043,7 +1051,7 @@ where
             }
             let live = self.peers.find(dst);
             let Some(row) = live.filter(|&row| self.peers.role(row) != Role::Incompatible) else {
-                self.sweeps.slots()[i] = None;
+                self.sweeps.advance(i, None);
                 continue;
             };
             self.frame_handles.clear();
@@ -1051,7 +1059,7 @@ where
                 .extend(self.store.active_handles(next_slot).take(self.sweep_page));
             let cells = self.frame_handles.len();
             if cells == 0 && next_slot != 0 {
-                self.sweeps.slots()[i] = None;
+                self.sweeps.advance(i, None);
                 continue;
             }
             // A store with no live cell still answers with one empty page.
@@ -1074,13 +1082,11 @@ where
                 return;
             }
             self.counters.sweep_cells_sent += cells as u64;
-            self.sweeps.slots()[i] = match self.frame_handles.last() {
-                Some(last) if cells == self.sweep_page => Some(Sweep {
-                    dst,
-                    next_slot: last.index + 1,
-                }),
+            let next = match self.frame_handles.last() {
+                Some(last) if cells == self.sweep_page => Some(last.index + 1),
                 _ => None,
             };
+            self.sweeps.advance(i, next);
         }
     }
 

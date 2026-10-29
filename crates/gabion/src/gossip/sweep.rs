@@ -15,6 +15,8 @@ pub(super) struct SweepWant {
     answered: [Option<SocketAddr>; GOSSIP_SWEEP_PEERS],
     /// The last source picked, so the next pick goes down the ranking.
     last_pick: Option<(u64, SocketAddr)>,
+    /// A peer was first heard while the want waits: ask on the next round.
+    pub(super) due: bool,
 }
 
 /// A source asked `tries` times without a page.
@@ -154,7 +156,17 @@ impl Sweeps {
         self.0.len()
     }
 
-    pub(super) fn slots(&mut self) -> &mut [Option<Sweep>] {
-        &mut self.0
+    pub(super) fn get(&self, i: usize) -> Option<Sweep> {
+        self.0.get(i).copied().flatten()
+    }
+
+    /// Move slot `i`'s sweep on to `next_slot`, or end it with `None`. The
+    /// requester stays, so no requester holds two slots.
+    pub(super) fn advance(&mut self, i: usize, next_slot: Option<u32>) {
+        if let Some(slot) = self.0.get_mut(i) {
+            *slot = slot
+                .zip(next_slot)
+                .map(|(sweep, next_slot)| Sweep { next_slot, ..sweep });
+        }
     }
 }
