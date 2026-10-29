@@ -59,3 +59,7 @@ tracing-subscriber.workspace = true
 [[bench]]
 name = "crdt"
 harness = false
+
+[[bench]]
+name = "gossip"
+harness = false

@@ -144,7 +144,7 @@ impl PacketBuf {
 
     /// Encode a packet of `header` alone: an ack, a sweep request, a closing
     /// packet or an empty sweep page.
-    pub(crate) fn header_only<P: Copy + Into<Payload>>(&mut self, header: &Header<P>) {
+    pub fn header_only<P: Copy + Into<Payload>>(&mut self, header: &Header<P>) {
         self.inner.clear();
         self.inner.extend_from_slice(&write_header(header, 0));
     }
