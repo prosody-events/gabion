@@ -24,12 +24,19 @@ fn warnings_capture_counts_power_of_two_lines() {
         tracing::info!("Ignored.");
     });
     let report = warnings.report();
-    assert_eq!((report.warn_events, report.error_events), (4, 2));
+    assert_eq!(
+        (
+            report.warn_events,
+            report.error_events,
+            report.unparsed_lines
+        ),
+        (4, 2, 0)
+    );
     assert_eq!(report.kinds.len(), 2);
     let error = &report.kinds[0];
     assert_eq!(
-        (error.level.as_str(), error.nodes, error.max_total),
-        ("ERROR", 0, Some(2))
+        (error.level, error.nodes, error.max_total),
+        (Severity::Error, 0, Some(2))
     );
     let dropped = &report.kinds[1];
     assert_eq!(dropped.message, "Dropped a packet. Raise `x`.");
@@ -37,5 +44,26 @@ fn warnings_capture_counts_power_of_two_lines() {
     assert_eq!(
         (dropped.max_total, dropped.sum_node_max_total),
         (Some(4), 5)
+    );
+}
+
+/// A line that does not read as a WARN or ERROR event with a target and a
+/// message (here an event without a message, and bytes that are not JSON)
+/// is counted rather than dropped.
+#[test]
+fn unreadable_lines_are_counted() {
+    let warnings = Warnings::new();
+    tracing::subscriber::with_default(warnings.subscriber(), || {
+        tracing::warn!(rejected_total = 1_u64);
+    });
+    warnings.tally(b"not json");
+    let report = warnings.report();
+    assert_eq!(
+        (
+            report.unparsed_lines,
+            report.warn_events,
+            report.kinds.len()
+        ),
+        (2, 0, 0)
     );
 }

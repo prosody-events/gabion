@@ -4,23 +4,47 @@
 //! thresholds of a running `*_total` counter. The run's subscriber is
 //! `tracing_subscriber::fmt` writing JSON lines into [`Warnings`], which
 //! tallies every line per `(level, target, message)` and per node, keeping
-//! the largest `*_total` field each node reported. The driver names the
-//! node it is polling; lines outside a node poll are attributed to
-//! [`NO_NODE`].
+//! the largest `*_total` field each node reported, and counts any line it
+//! cannot read as such an event. The driver names the node it is polling;
+//! lines outside a node poll are attributed to [`NO_NODE`].
 
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use tracing::{Level, Subscriber};
 use tracing_subscriber::fmt::MakeWriter;
 
 pub const NO_NODE: usize = usize::MAX;
 
-type Kind = (String, String, String);
+/// The levels the subscriber passes. `Error` sorts first, as the level
+/// strings did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Severity {
+    Error,
+    Warn,
+}
+
+/// One JSON line as `tracing_subscriber::fmt().json()` writes it.
+#[derive(Deserialize)]
+struct Event {
+    level: Severity,
+    target: String,
+    fields: Fields,
+}
+
+#[derive(Deserialize)]
+struct Fields {
+    message: String,
+    #[serde(flatten)]
+    rest: Map<String, Value>,
+}
+
+type Kind = (Severity, String, String);
 
 #[derive(Default)]
 struct Tally {
@@ -29,9 +53,16 @@ struct Tally {
     nodes: BTreeMap<usize, u64>,
 }
 
+#[derive(Default)]
+struct Tallies {
+    kinds: BTreeMap<Kind, Tally>,
+    /// Lines that did not parse as an [`Event`].
+    unparsed: u64,
+}
+
 struct Inner {
     node: AtomicUsize,
-    tallies: Mutex<BTreeMap<Kind, Tally>>,
+    tallies: Mutex<Tallies>,
 }
 
 /// Handle shared by the driver (which names the polled node) and the
@@ -63,31 +94,29 @@ impl Warnings {
 
     /// Tally one formatted event.
     fn tally(&self, line: &[u8]) {
-        let Ok(event) = serde_json::from_slice::<Value>(line) else {
-            return;
-        };
-        let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
-        let fields = &event["fields"];
-        let total = fields
-            .as_object()
-            .into_iter()
-            .flatten()
-            .filter(|(name, _)| name.ends_with("_total"))
-            .filter_map(|(_, v)| v.as_u64())
-            .max()
-            .unwrap_or(0);
-        let kind = (
-            text(&event["level"]),
-            text(&event["target"]),
-            text(&fields["message"]),
-        );
+        let event = serde_json::from_slice::<Event>(line);
         let node = self.0.node.load(Ordering::Relaxed);
         let mut tallies = self
             .0
             .tallies
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let tally = tallies.entry(kind).or_default();
+        let Ok(Event {
+            level,
+            target,
+            fields: Fields { message, rest },
+        }) = event
+        else {
+            tallies.unparsed += 1;
+            return;
+        };
+        let total = rest
+            .iter()
+            .filter(|(name, _)| name.ends_with("_total"))
+            .filter_map(|(_, v)| v.as_u64())
+            .max()
+            .unwrap_or(0);
+        let tally = tallies.kinds.entry((level, target, message)).or_default();
         tally.events += 1;
         let max = tally.nodes.entry(node).or_default();
         *max = (*max).max(total);
@@ -100,11 +129,12 @@ impl Warnings {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let kinds: Vec<WarningKind> = tallies
+            .kinds
             .iter()
             .map(|((level, target, message), tally)| {
                 let totals = tally.nodes.values().filter(|&&t| t > 0);
                 WarningKind {
-                    level: level.clone(),
+                    level: *level,
                     target: target.clone(),
                     message: message.clone(),
                     events: tally.events,
@@ -114,7 +144,7 @@ impl Warnings {
                 }
             })
             .collect();
-        let events = |level: &str| {
+        let events = |level| {
             kinds
                 .iter()
                 .filter(|k| k.level == level)
@@ -122,8 +152,9 @@ impl Warnings {
                 .sum()
         };
         WarningReport {
-            warn_events: events("WARN"),
-            error_events: events("ERROR"),
+            warn_events: events(Severity::Warn),
+            error_events: events(Severity::Error),
+            unparsed_lines: tallies.unparsed,
             kinds,
         }
     }
@@ -168,12 +199,15 @@ impl Drop for Line<'_> {
 pub struct WarningReport {
     pub warn_events: u64,
     pub error_events: u64,
+    /// Captured lines that did not read as a WARN or ERROR event with a
+    /// target and a message, so they are in no kind below.
+    pub unparsed_lines: u64,
     pub kinds: Vec<WarningKind>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct WarningKind {
-    pub level: String,
+    pub level: Severity,
     pub target: String,
     pub message: String,
     /// Events logged (gabion rate-limits most of these to power-of-two

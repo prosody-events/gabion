@@ -576,12 +576,12 @@ impl Oracle {
     }
 
     /// The bucket clock ticked over to `current`.
-    pub fn bucket_boundary(
+    pub fn bucket_boundary<'s>(
         &mut self,
         now_ns: u64,
         now_millis: u64,
         current: BucketEpoch,
-        stores: &[Option<Rc<NodeStore>>],
+        stores: impl IntoIterator<Item = (usize, &'s NodeStore)>,
     ) {
         let live = self.keys.live_buckets;
         let in_window = now_ns >= self.measure_from_ns;
@@ -620,8 +620,7 @@ impl Oracle {
             self.truth_window[t] = self.truth_window_total(key, current) as i64;
             self.sum_truth += self.truth_window[t];
         }
-        for (v, store) in stores.iter().enumerate() {
-            let Some(store) = store else { continue };
+        for (v, store) in stores {
             if !self.alive[v] {
                 continue;
             }

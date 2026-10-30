@@ -107,7 +107,7 @@ with:
 python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "crates/gossip-bench/judge"); import judge; print(judge.core_hash(sys.argv[1], Path(".")))' "$(git rev-parse HEAD:crates/gossip-bench)"
 ```
 
-Core hash: `8da709492af3be63268c21bf72896fcc77a97ba4`. A new or
+Core hash: `cc4b2980f4e4e1d0b6958ea0f106f96b3c4b621c`. A new or
 changed regime, or any other edit to the core, changes it, requires rerunning
 `make sim-baselines`, and updates this line.
 
@@ -380,8 +380,10 @@ All metrics except the whole-run byte totals cover the measurement window
   per `(level, target, message)` and per node (the node being polled), with
   the largest `*_total` field each node reported. gabion logs most
   saturation only on power-of-two totals, so these are lower bounds (within
-  2×). Any ERROR event **flags** the run without invalidating it. The judge
-  shows the counts and lists every flag in `flags.md`.
+  2×). Any ERROR event **flags** the run without invalidating it, and so
+  does any captured line that does not read as a WARN or ERROR event with a
+  target and a message (`unparsed_lines`). The judge shows the counts and
+  lists every flag in `flags.md`.
 
 ## Regimes
 
@@ -592,11 +594,10 @@ line about gabion in `src/harness/adapter.rs`:
 - the `Ticker` impl for the core's `SimTicker`, whose inherent
   `next_tick` returns the instant each tick was scheduled for.
 
-The boundary is checked mechanically; this prints nothing:
-
-```sh
-rg -n 'gabion(_server)?::' crates/gossip-bench/src --glob '!**/adapter.rs'     | rg -v 'gabion::gossip::\{?(Clock|GossipTransport|Ticker)|gabion::discovery::\{?(Peer|PeerEvent)'
-```
+`make hygiene` (run by `make test` and CI) checks the boundary: outside
+`adapter.rs`, every line that names the `gabion` crate must be one `use` of
+those traits, so an alias (`use gabion as g`), an `extern crate`, an inline
+path or a brace list with any other name fails it.
 
 A change to a library API the adapter uses edits `adapter.rs` in the same
 commit. The baselines are built with `H1`'s adapter and manifest, so the

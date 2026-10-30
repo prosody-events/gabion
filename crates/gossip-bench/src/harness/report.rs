@@ -323,8 +323,8 @@ pub struct ObserverStaleness {
 /// `rule_dictionary_full_rejects`, `node_dictionary_full_rejects`,
 /// `oversize_packets`, `decode_rejects`, `runtime_exits`, `record_failures`,
 /// `foreign_rows`, `snapshot_failures`, or `nodes_never_snapshotted` being
-/// non-zero makes the run invalid. gabion ERROR events are flagged instead
-/// (see [`Health::flags`]).
+/// non-zero makes the run invalid. gabion ERROR events and captured lines
+/// that did not parse are flagged instead (see [`Health::flags`]).
 #[derive(Debug, Default, Serialize)]
 pub struct Health {
     pub cell_store_full_rejects: u64,
@@ -398,6 +398,9 @@ impl Health {
         let mut flags = Vec::new();
         if w.error_events > 0 {
             flags.push(format!("gabion_error_events = {}", w.error_events));
+        }
+        if w.unparsed_lines > 0 {
+            flags.push(format!("gabion_unparsed_lines = {}", w.unparsed_lines));
         }
         flags
     }

@@ -148,7 +148,7 @@ fn a_hit_that_expires_unrepaired_is_not_a_heal() {
 
     assert!(!oracle.heal_sample(20 * S, millis(500)));
     // The 3 s window slides past bucket B, 1.5 s after the heal.
-    oracle.bucket_boundary(20 * S + 1_500 * MS, millis(2_000), B + 3, &[]);
+    oracle.bucket_boundary(20 * S + 1_500 * MS, millis(2_000), B + 3, []);
     assert!(
         oracle.heal_sample(20 * S + 1_500 * MS, millis(2_000)),
         "nothing left in the window to wait for"
@@ -171,7 +171,7 @@ fn a_repaired_heal_reports_nothing_lost_to_expiry() {
     assert!(oracle.heal_sample(20 * S + 200 * MS, millis(700)));
     // The solution ages the bucket out a moment before the oracle does.
     oracle.view_changed(1, 0, B, 0, 0, 20 * S + 1_400 * MS);
-    oracle.bucket_boundary(20 * S + 1_500 * MS, millis(2_000), B + 3, &[]);
+    oracle.bucket_boundary(20 * S + 1_500 * MS, millis(2_000), B + 3, []);
     oracle.finish(30 * S);
 
     let report = oracle.partition_report(10).expect("partition");
@@ -192,11 +192,11 @@ fn a_bucket_expiring_at_the_heal_is_not_owed_repair() {
     oracle.view_changed(0, 0, B, 1, 1, 12 * S);
 
     assert!(!oracle.heal_sample(20 * S, millis(0)));
-    oracle.bucket_boundary(20 * S, millis(0), B + 1, &[]);
+    oracle.bucket_boundary(20 * S, millis(0), B + 1, []);
     oracle.view_changed(1, 0, B, 1, 1, 20 * S + 200 * MS);
     assert!(oracle.heal_sample(20 * S + 200 * MS, millis(200)));
-    oracle.bucket_boundary(21 * S, millis(1_000), B + 2, &[]);
-    oracle.bucket_boundary(22 * S, millis(2_000), B + 3, &[]);
+    oracle.bucket_boundary(21 * S, millis(1_000), B + 2, []);
+    oracle.bucket_boundary(22 * S, millis(2_000), B + 3, []);
     oracle.finish(30 * S);
 
     let report = oracle.partition_report(10).expect("partition");

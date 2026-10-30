@@ -220,6 +220,13 @@ miri-all: miri-lib miri-safety miri-safety-tb miri-ffi-alignment miri-ffi-alignm
 # visualizer's design rules (web/README.md "Design rules"): no colour literal
 # outside tokens.css, no pixel font-size, and every token named is defined.
 CATALOGUES := crates/gabion/TROUBLESHOOTING.md crates/server/README.md crates/nginx/README.md
+# The study harness's adapter boundary (crates/gossip-bench/README.md, "The
+# adapter contract"): outside adapter.rs, every line that names the gabion
+# crate is one `use` of the stable trait surface. Aliases, `extern crate`,
+# brace lists with any other name and inline paths all fail.
+SIM_TRAITS := Clock|GossipTransport|Ticker
+SIM_DISCOVERY := Peer|PeerEvent
+SIM_BOUNDARY := ^[^:]+:[0-9]+:use gabion::(gossip::($(SIM_TRAITS)|\{($(SIM_TRAITS))(, ($(SIM_TRAITS)))*\})|discovery::($(SIM_DISCOVERY)|\{($(SIM_DISCOVERY))(, ($(SIM_DISCOVERY)))*\}));$$
 
 .PHONY: hygiene
 hygiene:
@@ -237,6 +244,8 @@ hygiene:
 		rg -q -- "^\s*$$token:" $(WEB_DIR)/src/tokens.css || { echo "design token \`$$token\` is not defined in $(WEB_DIR)/src/tokens.css, so it resolves to nothing; use a token defined there (web/README.md \"Design rules\") or define it:"; rg -nF -- "$$token" $(WEB_DIR)/src; exit 1; }; \
 	done
 	cmp $(WEB_DIR)/src/tokens.css docs/study/dashboard/tokens.css
+	@bad=$$(rg -n '\bgabion(_server)?\s*(::|as\b|;)|\bcrate\s+gabion' $(SIM)/src --glob '!**/harness/adapter.rs' | rg -v '$(SIM_BOUNDARY)'); \
+	test -z "$$bad" || { printf '%s\n' "$$bad" "these lines in $(SIM) name gabion outside src/harness/adapter.rs, so the regression gate's arms would no longer share one core; outside it import only gabion::gossip::{Clock, GossipTransport, Ticker} and gabion::discovery::{Peer, PeerEvent}, one use line each, and reach anything else through a re-export from adapter.rs (crates/gossip-bench/README.md, \"The adapter contract\")"; exit 1; }
 
 .PHONY: test
 test: fmt clippy unit safety hygiene

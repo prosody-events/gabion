@@ -187,7 +187,9 @@ fn starved_run() -> StudyResult {
 #[test]
 fn library_warnings_are_tallied_per_node() {
     let result = starved_run();
-    let kinds = &result.health.gabion_warnings.kinds;
+    let warnings = &result.health.gabion_warnings;
+    assert_eq!(warnings.unparsed_lines, 0);
+    let kinds = &warnings.kinds;
     assert!(!kinds.is_empty(), "no warning captured");
     for kind in kinds {
         assert!(kind.target.starts_with("gabion"), "{kind:?}");

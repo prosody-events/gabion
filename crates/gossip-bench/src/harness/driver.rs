@@ -43,14 +43,38 @@ pub struct Counters {
     pub decode_rejects: u64,
 }
 
-/// One node's latest answered snapshot.
+/// Where one node stands on health snapshots.
 #[derive(Clone, Copy, Default)]
-struct NodeHealth {
-    /// The node started, so it owes at least one answered snapshot.
-    started: bool,
-    /// The node answered at least one snapshot.
-    answered: bool,
-    counters: Counters,
+enum NodeHealth {
+    /// Not started, so it owes no snapshot.
+    #[default]
+    Idle,
+    /// Started, and has not answered a snapshot yet.
+    Owed,
+    /// Its latest answered snapshot.
+    Answered(Counters),
+}
+
+/// A started node and its aggregate store, which live and die together.
+struct Running {
+    node: Node,
+    store: Rc<NodeStore>,
+}
+
+/// One pod's place in the run. A pod starts once and stops for good.
+enum Pod {
+    Pending,
+    Running(Running),
+    Stopped,
+}
+
+impl Pod {
+    fn running(&self) -> Option<&Running> {
+        match self {
+            Pod::Running(running) => Some(running),
+            Pod::Pending | Pod::Stopped => None,
+        }
+    }
 }
 
 pub struct Driver<'r, F, L> {
@@ -62,9 +86,7 @@ pub struct Driver<'r, F, L> {
     world: Rc<World>,
     launch: L,
     tasks: Tasks<F>,
-    nodes: Vec<Option<Node>>,
-    stores: Vec<Option<Rc<NodeStore>>>,
-    stopped: Vec<bool>,
+    pods: Vec<Pod>,
     /// Running pods in index order: the load balancer's rotation.
     rotation: Vec<usize>,
     processes: Vec<KeyProcess>,
@@ -118,9 +140,7 @@ where
             world,
             launch,
             tasks: Tasks::new(n),
-            nodes: (0..n).map(|_| None).collect(),
-            stores: vec![None; n],
-            stopped: vec![false; n],
+            pods: (0..n).map(|_| Pod::Pending).collect(),
             rotation: Vec::new(),
             processes,
             oracle,
@@ -202,7 +222,7 @@ where
             Event::Plan(PlanEvent::Start(v)) => self.start(v)?,
             Event::Plan(PlanEvent::Stop(v, _)) => self.stop(v),
             Event::Plan(PlanEvent::Discover { to, about, added }) => {
-                if !self.stopped[to] {
+                if !matches!(self.pods[to], Pod::Stopped) {
                     let waker = self.world.discover(to, peer_event(node_addr(about), added));
                     if let Some(waker) = waker {
                         waker.wake();
@@ -213,8 +233,13 @@ where
             Event::BucketBoundary => {
                 let now_millis = self.world.now_millis();
                 let current = self.keys.bucket_of(now_millis);
+                let stores = self
+                    .pods
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(v, pod)| pod.running().map(|running| (v, &*running.store)));
                 self.oracle
-                    .bucket_boundary(now, now_millis, current, &self.stores);
+                    .bucket_boundary(now, now_millis, current, stores);
                 self.world
                     .schedule(now + self.keys.bucket_ms * NS_PER_MS, Event::BucketBoundary);
             }
@@ -263,7 +288,7 @@ where
     }
 
     fn absorb(&mut self, v: usize) {
-        let Some(store) = self.stores[v].as_ref() else {
+        let Some(Running { store, .. }) = self.pods[v].running() else {
             return;
         };
         store.take_touched(&mut self.touched);
@@ -292,9 +317,11 @@ where
         self.warnings.set_node(NO_NODE);
         let launched = launched?;
         self.tasks.spawn(v, launched.future);
-        self.nodes[v] = Some(launched.node);
-        self.node_health[v].started = true;
-        self.stores[v] = Some(launched.store);
+        self.pods[v] = Pod::Running(Running {
+            node: launched.node,
+            store: launched.store,
+        });
+        self.node_health[v] = NodeHealth::Owed;
         self.world.net.borrow_mut().set_running(now, v, true);
         if let Err(pos) = self.rotation.binary_search(&v) {
             self.rotation.insert(pos, v);
@@ -305,18 +332,16 @@ where
     }
 
     fn stop(&mut self, v: usize) {
-        if self.stopped[v] {
+        if matches!(self.pods[v], Pod::Stopped) {
             return;
         }
         let now = self.world.now_ns();
         if self.tasks.is_running(v) {
             self.snapshot(v);
         }
-        self.stopped[v] = true;
         self.tasks.remove(v);
-        self.nodes[v] = None;
-        if let Some(store) = self.stores[v].take() {
-            self.health.foreign_rows += store.foreign_rows.get();
+        if let Pod::Running(running) = std::mem::replace(&mut self.pods[v], Pod::Stopped) {
+            self.health.foreign_rows += running.store.foreign_rows.get();
         }
         self.world.net.borrow_mut().set_running(now, v, false);
         self.world.clear_discovery(v);
@@ -335,7 +360,7 @@ where
     }
 
     fn snapshot(&mut self, v: usize) {
-        let Some(node) = self.nodes[v].as_ref() else {
+        let Some(Running { node, .. }) = self.pods[v].running() else {
             return;
         };
         let Some(reply) = node.ask_health() else {
@@ -348,11 +373,7 @@ where
             return;
         };
         self.health.peak_active_cells = self.health.peak_active_cells.max(counters.active_cells);
-        self.node_health[v] = NodeHealth {
-            started: true,
-            answered: true,
-            counters,
-        };
+        self.node_health[v] = NodeHealth::Answered(counters);
     }
 
     /// One request arrives: the load balancer picks a running pod, the pod
@@ -370,23 +391,29 @@ where
             self.world.schedule(next, Event::Request(key));
         }
         self.count(k, measuring, |c| c.offered += 1);
-        let Some((v, store)) = picked.and_then(|v| Some((v, self.stores[v].clone()?))) else {
+        let Some((v, running)) = picked.and_then(|v| Some((v, self.pods[v].running()?))) else {
             self.count(k, measuring, |c| c.unrouted += 1);
             return;
         };
         let now_millis = self.world.now_millis();
         let bucket = self.keys.bucket_of(now_millis);
         let limit = self.keys.limit;
-        if store.window_total(key, now_millis).saturating_add(1) > limit {
+        if running
+            .store
+            .window_total(key, now_millis)
+            .saturating_add(1)
+            > limit
+        {
             self.count(k, measuring, |c| c.rejected += 1);
             if self.oracle.truth_window_total(key, bucket) < limit {
                 self.count(k, measuring, |c| c.false_rejects += 1);
             }
             return;
         }
+        let record = running.node.record(key, bucket, now_millis);
         self.count(k, measuring, |c| c.admitted += 1);
         self.oracle.admitted(key, bucket, now, v);
-        self.record(v, key, bucket, now_millis);
+        self.record(record);
     }
 
     fn count(&mut self, key: usize, measuring: bool, f: impl Fn(&mut TrafficCounts)) {
@@ -397,11 +424,9 @@ where
         }
     }
 
-    fn record(&mut self, v: usize, key: u32, bucket: BucketEpoch, now_millis: u64) {
-        let Some(node) = self.nodes[v].as_ref() else {
-            return;
-        };
-        let mut record = pin!(node.record(key, bucket, now_millis));
+    /// Drive one admitted hit's record to the node's acknowledgement.
+    fn record(&mut self, record: impl Future<Output = bool>) {
+        let mut record = pin!(record);
         let mut cx = Context::from_waker(Waker::noop());
         for _ in 0..RECORD_ATTEMPTS {
             match record.as_mut().poll(&mut cx) {
@@ -416,16 +441,20 @@ where
     fn finish(mut self) -> StudyResult {
         let end = self.end_ns;
         self.oracle.finish(end);
-        for store in self.stores.iter().flatten() {
-            self.health.foreign_rows += store.foreign_rows.get();
+        for running in self.pods.iter().filter_map(Pod::running) {
+            self.health.foreign_rows += running.store.foreign_rows.get();
         }
-        for h in &self.node_health {
-            let c = h.counters;
-            self.health.cell_store_full_rejects += c.cell_store_full_rejects;
-            self.health.rule_dictionary_full_rejects += c.rule_dictionary_full_rejects;
-            self.health.node_dictionary_full_rejects += c.node_dictionary_full_rejects;
-            self.health.decode_rejects += c.decode_rejects;
-            self.health.nodes_never_snapshotted += u64::from(h.started && !h.answered);
+        for &h in &self.node_health {
+            match h {
+                NodeHealth::Idle => {}
+                NodeHealth::Owed => self.health.nodes_never_snapshotted += 1,
+                NodeHealth::Answered(c) => {
+                    self.health.cell_store_full_rejects += c.cell_store_full_rejects;
+                    self.health.rule_dictionary_full_rejects += c.rule_dictionary_full_rejects;
+                    self.health.node_dictionary_full_rejects += c.node_dictionary_full_rejects;
+                    self.health.decode_rejects += c.decode_rejects;
+                }
+            }
         }
         self.health.gabion_warnings = self.warnings.report();
         let net = self.world.net.borrow();

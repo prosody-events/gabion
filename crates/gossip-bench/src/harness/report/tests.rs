@@ -32,3 +32,22 @@ fn convergence_ranks_never_converged_hits_at_their_censoring_time() {
     let mean = (98.0 * 99.0 / 2.0 + 9_000.0) / 100.0;
     assert_eq!(report.mean_incl_never_ms, Some(mean));
 }
+
+/// gabion ERROR events and captured lines that did not parse are flagged,
+/// and neither makes the run invalid.
+#[test]
+fn error_events_and_unparsed_lines_are_flagged_not_invalid() {
+    let health = Health {
+        gabion_warnings: WarningReport {
+            error_events: 3,
+            unparsed_lines: 2,
+            ..WarningReport::default()
+        },
+        ..Health::default()
+    };
+    assert_eq!(
+        health.flags(),
+        ["gabion_error_events = 3", "gabion_unparsed_lines = 2"]
+    );
+    assert!(health.invalid_reasons().is_empty());
+}

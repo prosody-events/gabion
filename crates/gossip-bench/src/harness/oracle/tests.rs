@@ -78,7 +78,7 @@ fn a_hit_whose_bucket_leaves_the_window_unseen_never_converges() {
     oracle.admitted(0, B, NS_PER_S, 0);
     oracle.view_changed(0, 0, B, 1, 1, NS_PER_S);
     assert_eq!(oracle.pending(), 1);
-    oracle.bucket_boundary(5 * NS_PER_S, 0, B + live, &[None, None]);
+    oracle.bucket_boundary(5 * NS_PER_S, 0, B + live, []);
     // Censored at the boundary that retired its bucket, 4 s after admission.
     assert_eq!(
         (oracle.censored_ns.clone(), oracle.pending()),
@@ -170,7 +170,7 @@ fn over_admission_samples_the_trailing_window_of_limited_keys() {
     for _ in 0..limit + 3 {
         oracle.admitted(hot, B, NS_PER_S, 0);
     }
-    oracle.bucket_boundary(2 * NS_PER_S, 0, B + 1, &[None]);
+    oracle.bucket_boundary(2 * NS_PER_S, 0, B + 1, []);
     let samples = oracle.over_admission[t];
     assert_eq!(samples.windows, 1);
     assert_eq!(samples.over_windows, 1);
