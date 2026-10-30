@@ -127,14 +127,17 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
     let identity = NodeIdentity::new(gabion::crdt::NodeId(1), 1);
     let applied = Rc::new(AppliedHits::default());
     let (gossip, cell_store) = crate::mock::validated(|_| {});
-    let (runtime, client) = GossipRuntime::bind(
-        LONE_NODE_BIND,
-        gossip.with_shallow_limit_queue(),
+    let gossip = gossip.with_shallow_limit_queue();
+    let transport = UdpTransport::bind(LONE_NODE_BIND, &gossip)
+        .await
+        .expect("bind the gossip socket");
+    let (runtime, client) = GossipRuntime::from_parts(
+        transport,
+        TokioClock::new(),
+        gossip,
         CellStore::new(cell_store, identity, rules(&[]).table()),
         applied.clone(),
-    )
-    .await
-    .expect("bind gossip runtime");
+    );
     let drained = || region.stats().snapshot().queue_drained as usize;
     let mut drain = std::pin::pin!(drain_loop(client, region, 1));
     assert!(timeout(DEADLINE, drain.as_mut()).await.is_err());

@@ -50,7 +50,7 @@ use gabion::aggregate::Aggregate;
 use gabion::crdt::{
     BucketEpoch, CellHandle, CellIdentity, CellStore, CompactCellKey, DeltaSink, ExpirationSink,
     Expiry, Incarnation, KeyHash, NodeId, NodeIdentity, NodeSlot, Observation, ObservationBatch,
-    RelayMark, RuleSlot, Stream, ValidStorageConfig,
+    RelayMark, RuleAge, RuleSlot, Stream, ValidStorageConfig,
 };
 use gabion::defaults::{GOSSIP_EXPIRATION_BATCH, GOSSIP_MAX_PAYLOAD_BYTES};
 use gabion::gossip::AggregateStore;
@@ -1072,22 +1072,17 @@ fn bench_expire(c: &mut Criterion) {
     group.bench_function("window_turnover", |b| {
         // Build current_epoch / live_buckets such that bucket 3 is just
         // past the live window (it ages out), buckets 0..3 remain.
-        let mut current_epoch = vec![0_u32; RULE_CAPACITY as usize];
-        let mut live_buckets = vec![0_u32; RULE_CAPACITY as usize];
-        for i in 0..NUM_RULES {
-            current_epoch[i] = NUM_BUCKETS as u32; // 4
-            live_buckets[i] = (NUM_BUCKETS as u32) - 1; // 3
-        }
+        let mut ages = vec![RuleAge::Unused; RULE_CAPACITY as usize];
+        ages[..NUM_RULES].fill(RuleAge::Epoch {
+            current: NUM_BUCKETS as u32,    // 4
+            live: (NUM_BUCKETS as u32) - 1, // 3
+        });
         let mut sink = ExpirationSink::with_capacity(fixture.store.capacity() as usize);
         b.iter_batched_ref(
             || fixture.store.clone(),
             |store| {
                 sink.clear();
-                store.expire(
-                    black_box(&current_epoch),
-                    black_box(&live_buckets),
-                    black_box(&mut sink),
-                )
+                store.expire(black_box(&ages), black_box(&mut sink))
             },
             BatchSize::SmallInput,
         );
@@ -1096,22 +1091,17 @@ fn bench_expire(c: &mut Criterion) {
     // ─── no_expirations ─────────────────────────────────────────────────
     // Live window covers every bucket. Pure scan cost.
     group.bench_function("no_expirations", |b| {
-        let mut current_epoch = vec![0_u32; RULE_CAPACITY as usize];
-        let mut live_buckets = vec![0_u32; RULE_CAPACITY as usize];
-        for i in 0..NUM_RULES {
-            current_epoch[i] = 0;
-            live_buckets[i] = 1000;
-        }
+        let mut ages = vec![RuleAge::Unused; RULE_CAPACITY as usize];
+        ages[..NUM_RULES].fill(RuleAge::Epoch {
+            current: 0,
+            live: 1000,
+        });
         let mut sink = ExpirationSink::with_capacity(fixture.store.capacity() as usize);
         b.iter_batched_ref(
             || fixture.store.clone(),
             |store| {
                 sink.clear();
-                store.expire(
-                    black_box(&current_epoch),
-                    black_box(&live_buckets),
-                    black_box(&mut sink),
-                )
+                store.expire(black_box(&ages), black_box(&mut sink))
             },
             BatchSize::SmallInput,
         );

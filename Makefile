@@ -247,8 +247,6 @@ test: fmt clippy unit safety hygiene
 SIM := crates/gossip-bench
 SIM_OUT ?= target/sim
 SIM_JOBS ?= 2
-SIM_REGIMES ?= all
-SIM_SEEDS ?= 3
 # The commit that landed the harness: its adapter and manifest build every baseline.
 H1 ?= $(shell git log --diff-filter=A --format=%H -- $(SIM)/src/harness/adapter.rs | tail -n 1)
 # The measured branch, sim/imp-az-hier-nopk.
@@ -277,8 +275,7 @@ sim-baselines:
 			git -C $$wt -c user.name=sim-baselines -c user.email=sim-baselines@localhost \
 			commit -q -m "sim: $$label with the current harness core"; \
 		CARGO_TARGET_DIR=$(abspath $(SIM_OUT))/target/$$label python3 $(SIM)/judge/matrix.py \
-			--repo $$wt --solution $$label --regimes $(SIM_REGIMES) --seeds $(SIM_SEEDS) \
-			--jobs $(SIM_JOBS) --out $(SIM_OUT)/results; \
+			--repo $$wt --solution $$label --seeds 3 --jobs $(SIM_JOBS) --out $(SIM_OUT)/results; \
 	done
 
 .PHONY: sim-gate

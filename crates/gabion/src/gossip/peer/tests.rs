@@ -185,17 +185,17 @@ fn outbound_matches_model(ops: Vec<Op>) {
     let (mut head, mut now) = (0_u64, 1_000_u64);
     let mut model = TxModel::default();
     for op in ops {
-        let before = (table.own_sent[0], table.link[0].own);
+        let before = (table.sent.own[0], table.link[0].out.own);
         match op {
             Op::Issue(n) => head += u64::from(n),
             Op::Send(n) => {
-                let upper = (table.own_sent[0] + u64::from(n)).min(head);
-                if upper > table.own_sent[0] {
+                let upper = (table.sent.own[0] + u64::from(n)).min(head);
+                if upper > table.sent.own[0] {
                     let in_flight = model.acked < model.sent;
                     table.tx(0, Stream::Own).note_sent(upper, now);
                     model.send(upper, now);
                     if in_flight {
-                        assert_eq!(table.link[0].own.timer_ms, before.1.timer_ms);
+                        assert_eq!(table.link[0].out.own.timer_ms, before.1.timer_ms);
                     }
                 }
             }
@@ -204,10 +204,10 @@ fn outbound_matches_model(ops: Vec<Op>) {
                 table.tx(0, Stream::Own).note_ack(ack, head, now);
                 model.ack(ack, head, now);
                 if ack > head {
-                    assert_eq!((table.own_sent[0], table.link[0].own), before);
+                    assert_eq!((table.sent.own[0], table.link[0].out.own), before);
                 }
-                if ack > before.1.acked && ack <= head && ack < table.own_sent[0] {
-                    assert_eq!(table.link[0].own.timer_ms, now);
+                if ack > before.1.acked && ack <= head && ack < table.sent.own[0] {
+                    assert_eq!(table.link[0].out.own.timer_ms, now);
                 }
             }
             Op::Gap(a) => {
@@ -215,7 +215,7 @@ fn outbound_matches_model(ops: Vec<Op>) {
                 let owed = table.tx(0, Stream::Own).gap_report(ack, head, now);
                 model.gap(ack, head, now);
                 if ack <= head {
-                    assert_eq!((table.link[0].own.acked, table.own_sent[0]), (ack, ack));
+                    assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (ack, ack));
                     assert_eq!(owed, ack < head);
                 }
             }
@@ -228,10 +228,10 @@ fn outbound_matches_model(ops: Vec<Op>) {
             Op::Advance(n) => now += u64::from(n) * FLOOR,
             Op::Receive(..) | Op::Report => {}
         }
-        let own = table.link[0].own;
-        assert!(own.acked <= table.own_sent[0] && table.own_sent[0] <= head);
+        let own = table.link[0].out.own;
+        assert!(own.acked <= table.sent.own[0] && table.sent.own[0] <= head);
         let row = TxModel {
-            sent: table.own_sent[0],
+            sent: table.sent.own[0],
             acked: own.acked,
             timer: own.timer_ms,
         };
@@ -386,7 +386,7 @@ fn deadline_is_min_of_row_timers(ops: Vec<Op>) {
         match op {
             Op::Issue(n) => head += u64::from(n),
             Op::Send(n) => {
-                let upper = (table.own_sent[0] + u64::from(n)).min(head);
+                let upper = (table.sent.own[0] + u64::from(n)).min(head);
                 table.tx(0, Stream::Own).note_sent(upper, now);
             }
             Op::Ack(a) => {
@@ -413,7 +413,8 @@ fn deadline_is_min_of_row_timers(ops: Vec<Op>) {
         }
         table.refresh_deadline(0);
         let link = table.link[0];
-        let timeout = (link.own.acked < table.own_sent[0]).then_some(link.own.timer_ms + RTO);
+        let timeout =
+            (link.out.own.acked < table.sent.own[0]).then_some(link.out.own.timer_ms + RTO);
         let report = match link.own_in.gap {
             Gap::Open { report_at_ms, .. } => Some(report_at_ms),
             _ => None,
@@ -470,8 +471,11 @@ fn incarnation_change_resets_the_whole_row() {
 
     assert_eq!(table.contact(0, new, Some(zone(2))), Contact::Restarted);
     let link = *table.link(0);
-    assert_eq!((link.own, table.own_sent[0]), (Outbound::default(), 0));
-    assert_eq!((link.relay, table.relay_sent[0]), (Outbound::default(), 0));
+    assert_eq!((link.out.own, table.sent.own[0]), (Outbound::default(), 0));
+    assert_eq!(
+        (link.out.relay, table.sent.relay[0]),
+        (Outbound::default(), 0)
+    );
     for mark in [link.own_in, link.flagged_in, link.relay_in] {
         assert_eq!(mark, Inbound::default());
     }
@@ -487,7 +491,7 @@ fn incarnation_change_resets_the_whole_row() {
 
     table.tx(0, Stream::Own).note_sent(2, 2_000);
     assert_eq!(table.contact(0, old, Some(zone(3))), Contact::Late);
-    assert_eq!((table.own_sent[0], table.link(0).identity), (2, Some(new)));
+    assert_eq!((table.sent.own[0], table.link(0).identity), (2, Some(new)));
     assert_eq!(table.link(0).zone, Some(zone(2)));
     assert_eq!(table.contact(0, new, None), Contact::Current);
 }
@@ -759,17 +763,17 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
             let in_flight = |table: &PeerTable| {
                 let (role, link) = (table.role(0), &table.link[0]);
                 PerStream {
-                    own: role.gets_own() && link.own.acked < table.own_sent[0],
-                    relay: role == Role::Zone && link.relay.acked < table.relay_sent[0],
+                    own: role.gets_own() && link.out.own.acked < table.sent.own[0],
+                    relay: role == Role::Zone && link.out.relay.acked < table.sent.relay[0],
                 }
             };
             let owed = |table: &PeerTable| in_flight(table).any();
             let acks = |table: &PeerTable, progress: PerStream<bool>, probe_reply, cannot_relay| {
                 let link = &table.link[0];
                 let own = if progress.own {
-                    table.own_sent[0]
+                    table.sent.own[0]
                 } else {
-                    link.own.acked
+                    link.out.own.acked
                 };
                 AckInfo {
                     incarnation: 7,
@@ -779,9 +783,9 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                         OwnAck::Plain(own)
                     },
                     relay: if progress.relay {
-                        table.relay_sent[0]
+                        table.sent.relay[0]
                     } else {
-                        link.relay.acked
+                        link.out.relay.acked
                     },
                     probe_reply,
                     cannot_relay,
@@ -914,24 +918,24 @@ fn own_acks_count_only_in_the_kind_the_role_receives() {
             ..AckInfo::default()
         };
         table.credit(0, acks(ignored, false), 7, heads(5), 1_000);
-        assert_eq!(table.link[0].own.acked, 0, "{role:?}");
+        assert_eq!(table.link[0].out.own.acked, 0, "{role:?}");
         table.credit(0, acks(counted, false), 7, heads(5), 1_000);
-        assert_eq!(table.link[0].own.acked, 3, "{role:?}");
+        assert_eq!(table.link[0].out.own.acked, 3, "{role:?}");
         // A forgotten stream: a gap report below `acked`.
         let below = |own: OwnAck| match own {
             OwnAck::Plain(_) => OwnAck::Plain(1),
             OwnAck::Flagged(_) => OwnAck::Flagged(1),
         };
         table.credit(0, acks(below(ignored), true), 7, heads(5), 1_000);
-        assert_eq!(table.link[0].own.acked, 3, "{role:?}");
+        assert_eq!(table.link[0].out.own.acked, 3, "{role:?}");
         table.credit(0, acks(below(counted), true), 7, heads(5), 1_000);
-        assert_eq!((table.link[0].own.acked, table.own_sent[0]), (1, 1));
+        assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (1, 1));
     }
     let mut table = one_row();
     table.tx(0, Stream::Own).note_sent(5, 1_000);
     table.tx(0, Stream::Own).note_ack(5, 5, 1_000);
     assert!(table.apply_role(0, Role::Gateway));
-    assert_eq!((table.link[0].own.acked, table.own_sent[0]), (0, 0));
+    assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (0, 0));
     assert!(table.flags(0).has(PeerFlags::RESEND_OWN));
 }
 

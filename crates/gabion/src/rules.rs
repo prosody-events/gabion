@@ -131,8 +131,7 @@ impl Rule {
             window_millis: self.spec.window_millis as u32,
             bucket_millis: self.spec.bucket_millis.get() as u32,
             limit: self.spec.limit,
-            flags: 0,
-            local_rule_id: self.spec.id,
+            applies_locally: true,
         }
     }
 }

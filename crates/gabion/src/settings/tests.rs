@@ -394,8 +394,8 @@ fn every_printed_default_parses_back_to_the_default() {
 fn defaults_validate_to_the_production_values() {
     let (gossip, storage) = Settings::default().validate().expect("defaults validate");
     assert_eq!(
-        gossip.tick_interval,
-        Duration::from_millis(defaults::GOSSIP_TICK_INTERVAL_MILLIS)
+        gossip.tick_interval.0.get(),
+        defaults::GOSSIP_TICK_INTERVAL_MILLIS
     );
     assert_eq!(
         gossip.min_emit_interval.0.get(),

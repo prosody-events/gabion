@@ -171,6 +171,21 @@ pub enum Expiry {
     More,
 }
 
+/// How [`CellStore::expire`] ages the cells of one rule slot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuleAge {
+    /// No rule holds the slot, so no cell refers to it.
+    #[default]
+    Unused,
+    /// A cell is kept while its bucket is at most `live` buckets older than
+    /// the `current` bucket.
+    Epoch { current: BucketEpoch, live: u32 },
+    /// A rule this node does not configure. The wire carries a cell's bucket
+    /// but not the bucket's width, so a cell is kept while it was updated at
+    /// or after `since_ms`: long enough to relay it, and bounded.
+    Idle { since_ms: u64 },
+}
+
 // ---------------------------------------------------------------------------
 // CellStore
 // ---------------------------------------------------------------------------
@@ -252,10 +267,9 @@ pub struct CellStore {
     // Per-origin sequence allocator (indexed by NodeSlot).
     next_sequence_by_origin: Box<[u64]>,
 
-    // Scratch arrays for `expire_at` — sized to rule_dictionary capacity.
+    // Scratch for `expire_at` — sized to rule_dictionary capacity.
     // Reused across every call; never allocated past `new()`.
-    expire_current_epoch_scratch: Box<[BucketEpoch]>,
-    expire_live_buckets_scratch: Box<[u32]>,
+    expire_ages_scratch: Box<[RuleAge]>,
 
     // Identity dictionaries.
     rule_dictionary: RuleDictionary,
@@ -400,8 +414,7 @@ impl CellStore {
 
             next_sequence_by_origin: vec![0_u64; usize::from(node_capacity)].into_boxed_slice(),
 
-            expire_current_epoch_scratch: vec![0_u32; rule_capacity].into_boxed_slice(),
-            expire_live_buckets_scratch: vec![0_u32; rule_capacity].into_boxed_slice(),
+            expire_ages_scratch: vec![RuleAge::Unused; rule_capacity].into_boxed_slice(),
 
             rule_dictionary: RuleDictionary::with_capacity(rules.dictionary_capacity()),
             node_dictionary,
@@ -841,7 +854,7 @@ impl CellStore {
             current,
             // Both updates only raise a count, so this cannot underflow.
             current - previous,
-            descriptor.applies_locally(),
+            descriptor.applies_locally,
         );
     }
 
@@ -865,7 +878,7 @@ impl CellStore {
             key,
             self.counts[slot as usize],
             self.last_update_millis[slot as usize],
-            descriptor.applies_locally(),
+            descriptor.applies_locally,
         );
     }
 
@@ -956,9 +969,8 @@ impl CellStore {
 
     /// The slot for `rule_fingerprint`. An unknown rule is interned with the
     /// default descriptor so its cells are still stored, forwarded and
-    /// expired; `applies_locally` is `false` because `local_rule_id ==
-    /// u32::MAX`. `None` (with the rejection counter bumped) when the rule
-    /// dictionary is full.
+    /// expired; `applies_locally` is `false`. `None` (with the rejection
+    /// counter bumped) when the rule dictionary is full.
     fn rule_slot_for(&mut self, rule_fingerprint: u128) -> Option<RuleSlot> {
         if let Some(slot) = self.rule_dictionary.find(rule_fingerprint) {
             return Some(slot);
@@ -1056,22 +1068,14 @@ impl CellStore {
         }
     }
 
-    /// Free cells whose bucket has aged out of the per-rule live window.
-    ///
-    /// For each rule slot `r`, the cell is kept iff its age,
-    /// `current_epoch_by_rule[r] - buckets[slot]` in serial-number
-    /// arithmetic, is at most `live_buckets[r]`. Each
-    /// freed cell is emitted into `sink` *before* its slot is released, so
-    /// external aggregators see one row per active-set departure.
+    /// Free the cells that have aged out, each by `ages[r]` of its rule slot
+    /// `r`. Each freed cell is emitted into `sink` *before* its slot is
+    /// released, so external aggregators see one row per active-set
+    /// departure.
     ///
     /// The sink never grows: when it is full the call stops with
     /// [`Expiry::More`], and the next call resumes at the same slot.
-    pub fn expire(
-        &mut self,
-        current_epoch_by_rule: &[BucketEpoch],
-        live_buckets: &[u32],
-        sink: &mut ExpirationSink,
-    ) -> Expiry {
+    pub fn expire(&mut self, ages: &[RuleAge], sink: &mut ExpirationSink) -> Expiry {
         debug_assert!(
             sink.handles.capacity() > 0,
             "a zero-capacity sink takes no row"
@@ -1080,16 +1084,17 @@ impl CellStore {
             if !self.is_active(slot) {
                 continue;
             }
-            let rule = self.rules[slot as usize] as usize;
-            if rule >= current_epoch_by_rule.len() || rule >= live_buckets.len() {
-                continue;
-            }
-            let current = current_epoch_by_rule[rule];
-            let live = live_buckets[rule];
-            let bucket = self.buckets[slot as usize];
-            // Serial-number age, so the comparison holds across the `u32`
-            // epoch wrap; a window spans fewer than 2^31 buckets.
-            let expired = current.wrapping_sub(bucket) as i32 > live as i32;
+            let expired = match ages.get(self.rules[slot as usize] as usize) {
+                // Serial-number age, so the comparison holds across the `u32`
+                // epoch wrap; a window spans fewer than 2^31 buckets.
+                Some(&RuleAge::Epoch { current, live }) => {
+                    current.wrapping_sub(self.buckets[slot as usize]) as i32 > live as i32
+                }
+                Some(&RuleAge::Idle { since_ms }) => {
+                    self.last_update_millis[slot as usize] < since_ms
+                }
+                Some(RuleAge::Unused) | None => false,
+            };
             if expired {
                 if sink.is_full() {
                     self.expire_cursor = slot;
@@ -1103,33 +1108,37 @@ impl CellStore {
         Expiry::Done
     }
 
-    /// Convenience wrapper around [`Self::expire`] that derives the per-rule
-    /// epoch and live-bucket arrays from the current wall-clock time and each
-    /// rule's descriptor. Uses scratch storage allocated at construction time
+    /// Convenience wrapper around [`Self::expire`] that derives each rule's
+    /// [`RuleAge`] from the current wall-clock time and its descriptor; a
+    /// wire-only rule's cells live for the default descriptor's window past
+    /// their last update. Uses scratch storage allocated at construction time
     /// so the call is allocation-free.
     pub fn expire_at(&mut self, now_millis: u64, sink: &mut ExpirationSink) -> Expiry {
-        let dict_cap = self.rule_dictionary.capacity() as usize;
-        debug_assert_eq!(self.expire_current_epoch_scratch.len(), dict_cap);
-        debug_assert_eq!(self.expire_live_buckets_scratch.len(), dict_cap);
-
-        for slot in 0..dict_cap {
-            let (current, live) = match self.rule_dictionary.descriptor(slot as RuleSlot) {
-                Some(d) => (d.current_epoch(now_millis), d.live_buckets()),
-                None => (0, 0),
+        debug_assert_eq!(
+            self.expire_ages_scratch.len(),
+            self.rule_dictionary.capacity() as usize
+        );
+        let idle_ms = u64::from(RuleDescriptor::default().window_millis);
+        for (slot, age) in self.expire_ages_scratch.iter_mut().enumerate() {
+            *age = match self.rule_dictionary.descriptor(slot as RuleSlot) {
+                Some(d) if d.applies_locally => RuleAge::Epoch {
+                    current: d.current_epoch(now_millis),
+                    live: d.live_buckets(),
+                },
+                Some(_) => RuleAge::Idle {
+                    since_ms: now_millis.saturating_sub(idle_ms),
+                },
+                None => RuleAge::Unused,
             };
-            self.expire_current_epoch_scratch[slot] = current;
-            self.expire_live_buckets_scratch[slot] = live;
         }
 
-        // Swap the scratch slices out so we can pass them as `&[T]` borrows
+        // Swap the scratch slice out so we can pass it as a `&[T]` borrow
         // to `self.expire(...)` (which needs `&mut self`).
         // `Box::<[T]>::default` returns an empty boxed slice that does
         // not allocate.
-        let current = std::mem::take(&mut self.expire_current_epoch_scratch);
-        let live = std::mem::take(&mut self.expire_live_buckets_scratch);
-        let expiry = self.expire(&current, &live, sink);
-        self.expire_current_epoch_scratch = current;
-        self.expire_live_buckets_scratch = live;
+        let ages = std::mem::take(&mut self.expire_ages_scratch);
+        let expiry = self.expire(&ages, sink);
+        self.expire_ages_scratch = ages;
         expiry
     }
 }

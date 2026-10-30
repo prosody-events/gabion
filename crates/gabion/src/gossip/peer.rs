@@ -228,15 +228,14 @@ pub(super) enum Gap {
 }
 
 /// What [`Inbound::take_report`] found due.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum GapDue {
+    #[default]
     Nothing,
     /// Send a gap report now.
     Report,
     /// The gap is abandoned; `missing` stream positions never arrived.
-    Abandoned {
-        missing: u64,
-    },
+    Abandoned { missing: u64 },
 }
 
 /// One stream's receiver state.
@@ -414,8 +413,7 @@ pub(super) struct PeerLink {
     /// changes no stream state.
     prev_incarnation: Option<Incarnation>,
     answer: Answer,
-    own: Outbound,
-    relay: Outbound,
+    out: PerStream<Outbound>,
     /// The peer's own stream as this node receives it: unflagged ranges, and
     /// the ranges flagged `RELAY_INTO_ZONE`, each with its own mark.
     own_in: Inbound,
@@ -450,8 +448,8 @@ impl PeerLink {
 
 // 240 bytes (`Option<NodeIdentity>` 48 at `u128` alignment, each of the
 // three inbound marks 40, the answer and each outbound 16): with the 26 hot
-// bytes, the 32-byte address and the index, the about-330-byte per-slot cost
-// the `gossip.peer_capacity` warning quotes.
+// bytes, the 32-byte address, the 8-byte `zones` entry and the index, the
+// about-330-byte per-slot cost the `gossip.peer_capacity` warning quotes.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<PeerLink>() == 240);
 
@@ -529,9 +527,8 @@ pub(super) struct PeerTable {
     // Hot: every round's scan.
     role: Box<[Role]>,
     flags: Box<[PeerFlags]>,
-    /// The highest own- and relay-stream positions sent to the peer.
-    own_sent: Box<[u64]>,
-    relay_sent: Box<[u64]>,
+    /// The highest position of each stream sent to the peer.
+    sent: PerStream<Box<[u64]>>,
     deadline: Box<[Deadline]>,
     // Cold: one packet to or from this peer.
     addr: Box<[SocketAddr]>,
@@ -566,8 +563,10 @@ impl PeerTable {
             judged_ms: 0,
             role: vec![Role::Zone; rows].into_boxed_slice(),
             flags: vec![PeerFlags::default(); rows].into_boxed_slice(),
-            own_sent: vec![0; rows].into_boxed_slice(),
-            relay_sent: vec![0; rows].into_boxed_slice(),
+            sent: PerStream {
+                own: vec![0; rows].into_boxed_slice(),
+                relay: vec![0; rows].into_boxed_slice(),
+            },
             deadline: vec![Deadline::NEVER; rows].into_boxed_slice(),
             addr: vec![SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)); rows].into_boxed_slice(),
             link: vec![PeerLink::default(); rows].into_boxed_slice(),
@@ -604,8 +603,8 @@ impl PeerTable {
         }
         self.role[row] = Role::Zone;
         self.flags[row] = PeerFlags::ACK_DUE;
-        self.own_sent[row] = 0;
-        self.relay_sent[row] = 0;
+        self.sent.own[row] = 0;
+        self.sent.relay[row] = 0;
         self.deadline[row] = Deadline::NEVER;
         self.addr[row] = addr;
         self.link[row] = PeerLink {
@@ -633,8 +632,8 @@ impl PeerTable {
             self.by_addr.insert_unchecked(moved, row as u32);
             self.role[row] = self.role[last];
             self.flags[row] = self.flags[last];
-            self.own_sent[row] = self.own_sent[last];
-            self.relay_sent[row] = self.relay_sent[last];
+            self.sent.own[row] = self.sent.own[last];
+            self.sent.relay[row] = self.sent.relay[last];
             self.deadline[row] = self.deadline[last];
             self.addr[row] = self.addr[last];
             self.link[row] = self.link[last];
@@ -672,8 +671,8 @@ impl PeerTable {
                     prev_incarnation: Some(known.incarnation),
                     ..PeerLink::default()
                 };
-                self.own_sent[row] = 0;
-                self.relay_sent[row] = 0;
+                self.sent.own[row] = 0;
+                self.sent.relay[row] = 0;
                 self.flags[row] = PeerFlags::ACK_DUE;
                 self.stale = true;
                 Contact::Restarted
@@ -747,19 +746,14 @@ impl PeerTable {
     }
 
     pub(super) fn sent(&self, row: usize, stream: Stream) -> u64 {
-        match stream {
-            Stream::Own => self.own_sent[row],
-            Stream::Relay => self.relay_sent[row],
-        }
+        self.sent[stream][row]
     }
 
     pub(super) fn tx(&mut self, row: usize, stream: Stream) -> StreamTx<'_> {
-        let link = &mut self.link[row];
-        let (sent, state) = match stream {
-            Stream::Own => (&mut self.own_sent[row], &mut link.own),
-            Stream::Relay => (&mut self.relay_sent[row], &mut link.relay),
-        };
-        StreamTx { sent, state }
+        StreamTx {
+            sent: &mut self.sent[stream][row],
+            state: &mut self.link[row].out[stream],
+        }
     }
 
     pub(super) fn link(&self, row: usize) -> &PeerLink {
@@ -948,14 +942,14 @@ impl PeerTable {
                 continue;
             }
             self.stale = true;
-            let relay = self.link[row].relay;
-            if self.role[row] == Role::Zone && relay.acked < self.relay_sent[row] {
+            let relay = self.link[row].out.relay;
+            if self.role[row] == Role::Zone && relay.acked < self.sent.relay[row] {
                 on_stall(Stall {
                     peer: self.addr[row],
                     stalled_ms: answer
                         .since_ms()
                         .map_or(0, |since| now.saturating_sub(since)),
-                    relay_unacked: self.relay_sent[row] - relay.acked,
+                    relay_unacked: self.sent.relay[row] - relay.acked,
                 });
             }
             self.refresh_deadline(row);
@@ -1090,17 +1084,18 @@ impl PeerTable {
     pub(super) fn own_timer(&self, row: usize) -> Option<u64> {
         let link = &self.link[row];
         let role = self.role[row];
-        let runs = (role.gets_own() && link.own.acked < self.own_sent[row])
+        let runs = (role.gets_own() && link.out.own.acked < self.sent.own[row])
             || role == Role::Gateway
             || (link.answer != Answer::Settled && self.relay_timer(row).is_none());
-        (runs && role != Role::Incompatible).then(|| link.own.timer_ms.saturating_add(self.rto_ms))
+        (runs && role != Role::Incompatible)
+            .then(|| link.out.own.timer_ms.saturating_add(self.rto_ms))
     }
 
     /// When `row`'s relay stream times out, while relay data is in flight.
     pub(super) fn relay_timer(&self, row: usize) -> Option<u64> {
         let link = &self.link[row];
-        (self.role[row] == Role::Zone && link.relay.acked < self.relay_sent[row])
-            .then(|| link.relay.timer_ms.saturating_add(self.rto_ms))
+        (self.role[row] == Role::Zone && link.out.relay.acked < self.sent.relay[row])
+            .then(|| link.out.relay.timer_ms.saturating_add(self.rto_ms))
     }
 
     /// Recompute `row`'s deadline after its timers changed: the stream
@@ -1150,8 +1145,8 @@ impl PeerTable {
                 answer,
                 unanswered_ms: (link.answer.since_ms())
                     .map(|since| u32::try_from(now.saturating_sub(since)).unwrap_or(u32::MAX)),
-                own_unacked: self.own_sent[row] - link.own.acked,
-                relay_unacked: self.relay_sent[row] - link.relay.acked,
+                own_unacked: self.sent.own[row] - link.out.own.acked,
+                relay_unacked: self.sent.relay[row] - link.out.relay.acked,
             }
         })
     }

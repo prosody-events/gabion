@@ -29,7 +29,7 @@ Message starts: "A rate-limit rule this node does not configure, gossiped by a p
 
 **What happened.** A rate-limit rule this node does not configure, gossiped by a peer or recorded by a worker still on an earlier configuration, found the rule dictionary full, so this node drops its hits and that rule under-counts across the cluster.
 
-**Why.** Usually more rules are live across the cluster than the dictionary holds, for example during a configuration rollout that briefly runs old and new rule sets together.
+**Why.** Usually more rules are live across the cluster than the dictionary holds, for example during a configuration rollout that briefly runs old and new rule sets together. A rule this node does not configure holds its slot until its last cell expires, 60 s after that cell's last update.
 
 **What to do next.** The default is twice the configured rules, at least 256. Set `storage.rule_dictionary_capacity` (`GABION_STORAGE_RULE_DICTIONARY_CAPACITY`) in `gabiond`, or `gabion_storage_rule_dictionary_capacity` in NGINX, above the number of distinct rules alive in the cluster at once, and only above that default.
 

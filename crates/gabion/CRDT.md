@@ -236,14 +236,13 @@ pub struct RuleDescriptor {
     pub window_millis: u32,
     pub bucket_millis: u32,
     pub limit: u64,
-    pub flags: u32,
-    pub local_rule_id: u32, // u32::MAX => wire-only
+    pub applies_locally: bool, // false => wire-only
 }
 ```
 
 `fingerprint` is the canonical 128-bit identity and the key the hash index hashes: a hash of the rule's domain, descriptor patterns, window and bucket (`gabion::rules::RuleDef::build`), so two rules that differ in window or bucket never share a slot. The remaining fields describe the rate-limit rule itself. `CellStore::new` takes the adapter's `RuleTable`, sizes the dictionary from it, and interns and pins every configured rule before any gossip runtime exists.
 
-`local_rule_id` carries a useful sentinel: a value of `u32::MAX` (the `Default`) means the rule is known on the wire only. Cells under such rules are still tracked, replicated, and expired, but `applies_locally()` returns `false` so the local aggregator skips them — which is what happens when a peer is gossiping a rule the local node does not itself enforce.
+`applies_locally` is `false` (the `Default`) for a rule known on the wire only. Cells under such rules are still tracked, replicated, and expired, but the local aggregator skips them — which is what happens when a peer is gossiping a rule the local node does not itself enforce.
 
 **Read path.** `descriptor(slot)` bounds-checks and verifies `refcount > 0` before returning. A free slot returns `None` even though the backing array still holds a default value at that index. `find(fingerprint)` hashes via `hash_fingerprint`, asks `CellIndex` for candidate slots, and confirms a match with `fingerprint == fingerprint`.
 
@@ -275,7 +274,7 @@ flowchart TD
 
 `intern` overwrites the descriptor on a hit. Configured rules are
 interned before any gossip can arrive, so a wire-only intern
-(`local_rule_id = u32::MAX`) never lands on a configured rule's slot. `intern` deliberately does not touch refcounts: a freshly
+(`applies_locally = false`) never lands on a configured rule's slot. `intern` deliberately does not touch refcounts: a freshly
 interned slot starts at `refcount = 0`, and the `CellStore` calls
 `inc_ref` and `dec_ref` as cells reference and release the slot.
 
@@ -865,7 +864,7 @@ sequenceDiagram
 
 `ingest_local(obs, sink)` loops over the observation batch and, for each row:
 
-1. Finds the rule slot by fingerprint. If the rule is unknown, it is interned with a default descriptor; since the rule is unknown locally, `applies_locally()` will return `false`, but cells are still stored, forwarded, and expired.
+1. Finds the rule slot by fingerprint. If the rule is unknown, it is interned with a default descriptor; since the rule is unknown locally, `applies_locally` is `false`, but cells are still stored, forwarded, and expired.
 2. Reads `hits = obs.counts[i].into()` — the *delta* of hits to add, not an absolute count.
 3. Calls `upsert(UpsertSpec { …, mode: Accumulate { hits } }, sink)`.
 
@@ -1037,13 +1036,13 @@ the steady, rewound and draining walks.
 <a id="expiry"></a>
 ## 8. Expiry
 
-`expire(current_epoch_by_rule, live_buckets, sink)` sweeps the active set and frees any cell whose bucket has aged out. The keep rule is:
+`expire(ages, sink)` sweeps the active set and frees any cell that has aged out. `ages` is indexed by `RuleSlot`, and each `RuleAge` says how its rule's cells age. For a configured rule (`RuleAge::Epoch { current, live }`) the keep rule is:
 
 ```
-keep if (current_epoch_by_rule[rule] - buckets[slot]) mod 2^32, read as signed, <= live_buckets[rule]
+keep if (current - buckets[slot]) mod 2^32, read as signed, <= live
 ```
 
-It holds across the `u32` wrap because `RuleDef::build` keeps a window under 2^31 buckets. A cell is kept while its serial age is at most the rule's live buckets. Cells in older buckets are emitted into the `ExpirationSink` and then freed via `free_cell_at`. Both input slices are indexed by `RuleSlot`, and out-of-range slot indices — a rule whose dictionary slot lies beyond either array — are silently skipped, so the caller's array shape governs which rules participate.
+It holds across the `u32` wrap because `RuleDef::build` keeps a window under 2^31 buckets. A cell is kept while its serial age is at most the rule's live buckets. The wire carries a cell's bucket but not the bucket's width, so `expire_at` ages a wire-only rule's cells by their last update instead (`RuleAge::Idle`): each lives the default descriptor's 60 s window past it, long enough to relay and bounded. Expired cells are emitted into the `ExpirationSink` and then freed via `free_cell_at`. A slot that is `RuleAge::Unused` or beyond the slice is skipped, so the caller's slice governs which rules participate.
 
 The emission order matters. `expire` calls `emit_expiration(sink, slot)` before `free_cell_at(slot)`, because `emit_expiration` needs the rule descriptor to construct the portable `CellIdentity` (the rule's fingerprint) and to read `applies_locally`, whereas `free_cell_at` decrements the rule's refcount and may drop the descriptor entirely. The emit-then-free order keeps the fingerprint lookup live for the row that needs it.
 
@@ -1080,7 +1079,7 @@ A small concrete sequence that ties the previous sections together.
 
 **Step 3 — bucket 42 expires.**
 
-- `expire_at(now)` computes `current_epoch_by_rule[R1] = 44` and `live_buckets[R1] = 1`. For slot 0, `buckets[0] = 42` and `44 - 42 = 2 > 1` → expired.
+- `expire_at(now)` computes `ages[R1] = Epoch { current: 44, live: 1 }`. For slot 0, `buckets[0] = 42` and `44 - 42 = 2 > 1` → expired.
 - `emit_expiration(sink, 0)` pushes one `ExpirationSink` row: `(handle {0,1}, CellIdentity { R1_fingerprint, K, 42 }, last_count=6, last_update_millis=…, applies_locally=true)`. The rule descriptor is still live for the lookup.
 - `free_cell_at(0)` removes from `CellIndex`, decrements rule and node refcounts, calls `free_slot(0)`.
 - `generations[0]` goes from 1 → 2 (inactive, ABA tag now 1).
@@ -1187,7 +1186,7 @@ A reverse lookup of the submodule names that appear in `crdt.rs`:
 | `head(stream)`, `stream_after(stream, sent, max, out)`, `sequence(stream, handle)` | A stream's head, its live cells above `sent`, and one cell's position (§7). |
 | `ingest_local(obs, sink)` | Apply locally observed hits (saturating add). |
 | `merge_remote(obs, sink, mark)` | Merge peer observations (max-merge), keeping the relay list by `mark` (§7). |
-| `expire(current_epoch_by_rule, live_buckets, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell, stopping with `Expiry::More` when the sink is full. |
+| `expire(ages, sink)` | Free aged-out cells; emit one `ExpirationSink` row per freed cell, stopping with `Expiry::More` when the sink is full. |
 | `expire_at(now_millis, sink)` | Allocation-free convenience wrapper around `expire`. |
 
 ---

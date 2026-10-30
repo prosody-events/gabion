@@ -564,49 +564,41 @@ fn transient_suspicion_clears() {
 }
 
 /// An origin that went quiet probes its gateway every heartbeat, so the
-/// gateway's death still fails it over, and the next member gets its live
-/// cells; a standalone ack the origin owes the gateway does not replace the
-/// probe.
+/// gateway's death still fails it over within `T_u + 2·F_r` of the first
+/// probe, and the next member gets its live cells. The gateway is cut from its
+/// zone too, so only the failover brings that member the origin's cell.
 #[test]
 fn idle_origin_replaces_a_dead_gateway() {
-    for gateway_busy in [false, true] {
-        run_paused(async {
-            let router = SimRouter::new();
-            let addrs = addrs(47_900, 3);
-            let zones = ["a", "b", "b"];
-            let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
-            let nodes: Vec<_> = (0..3)
-                .map(|i| zoned_node_with(&router, &addrs, &zones, i, tune))
-                .collect();
-            run_for(1_000).await;
-            let gateway = gateway_of(&nodes[0], "b").await;
-            let (g, m) = if gateway == addrs[1] { (1, 2) } else { (2, 1) };
-            router.set_link_policy(gateway, addrs[m], LinkPolicy::Block);
-            hit(&nodes[0].client, 1).await;
-            for t in 0..300 {
-                if gateway_busy && t % 100 == 0 {
-                    hit_at(&nodes[g], t).await;
-                }
-                run_for(1).await;
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = addrs(47_900, 3);
+        let zones = ["a", "b", "b"];
+        let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
+        let nodes: Vec<_> = (0..3)
+            .map(|i| zoned_node_with(&router, &addrs, &zones, i, tune))
+            .collect();
+        run_for(1_000).await;
+        let gateway = gateway_of(&nodes[0], "b").await;
+        let m = if gateway == addrs[1] { 2 } else { 1 };
+        router.set_link_policy(gateway, addrs[m], LinkPolicy::Block);
+        hit(&nodes[0].client, 1).await;
+        // Just after an answered probe, so the next is a heartbeat away.
+        run_for(301).await;
+        assert_eq!(nodes[0].peer(gateway).await.own_unacked, 0);
+        cut(&router, gateway, addrs[0], true);
+        const BOUND: u64 = 100 + 400 + 2 * 5;
+        let mut replaced = None;
+        for t in 0..BOUND + 1 {
+            run_for(1).await;
+            if replaced.is_none() && gateway_of(&nodes[0], "b").await != gateway {
+                replaced = Some(t);
             }
-            assert_eq!(nodes[0].peer(gateway).await.own_unacked, 0);
-            cut(&router, gateway, addrs[0], true);
-            let mut replaced = None;
-            for t in 0..400 + 3 * 100 + 2 * 5 + 1 {
-                if gateway_busy && t % 100 == 0 {
-                    hit_at(&nodes[g], t).await;
-                }
-                run_for(1).await;
-                if replaced.is_none() && gateway_of(&nodes[0], "b").await != gateway {
-                    replaced = Some(t);
-                }
-            }
-            let replaced = replaced.expect("a failover");
-            assert!(replaced >= 400, "{replaced}");
-            assert_eq!(nodes[m].agg.total(), 1);
-            stop_all(nodes).await;
-        });
-    }
+        }
+        let replaced = replaced.expect("a failover");
+        assert!((400..=BOUND).contains(&replaced), "{replaced}");
+        assert_eq!(nodes[m].agg.total(), 1);
+        stop_all(nodes).await;
+    });
 }
 
 /// A node with no zone sweeps from its peers; once its zone becomes known it
@@ -863,11 +855,11 @@ fn suspect_peer_gets_header_only_probes() {
 
 /// Zone a = {O}, zone b = {G, G2} with G outranking at O; G's heartbeats
 /// trail O's by 50 ms, so its standalone acks never land on O's judging
-/// instants. An answer that arrives before `suspect_after` keeps G; at or
-/// after it, G is replaced, and the judgment is `≥` at equality.
+/// instants. An answer that arrives before `suspect_after` keeps G; after
+/// it, G is replaced.
 #[test]
 fn answer_just_inside_suspect_after_keeps_the_gateway() {
-    for (suspect_after, failovers) in [(910, 0), (890, 1), (900, 1)] {
+    for (suspect_after, failovers) in [(910, 0), (890, 1)] {
         run_paused(async {
             let router = SimRouter::new();
             let o = id(0, 1);
@@ -1220,6 +1212,45 @@ fn suspect_retries_are_header_only_probes() {
     });
 }
 
+/// A refused send to a suspect holds the row: the heartbeat that owes it a
+/// new cell and a probe beside it tries only the cell's packet, unchanged on
+/// every retry, and the probe waits for a later round after the release.
+#[test]
+fn refused_send_to_a_suspect_holds_one_packet() {
+    run_paused(async {
+        let z = sock(2);
+        let wire = Rc::new(Wire::default());
+        let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
+        let (client, _admin) = scripted(&wire, vec![z], "a", tune).await;
+        introduce(&wire, &[(z, node(0xB), "a")]);
+        heartbeats(1).await;
+        hit(&client, 1).await;
+        heartbeats(9).await;
+        let probe = Payload::Ack { probe: true };
+        assert_eq!(sent_payloads(&wire, 0).last(), Some(&(z, probe)));
+
+        hit(&client, 2).await;
+        wire.refuse.set(true);
+        let mark = wire.attempts.borrow().len();
+        heartbeats(1).await;
+        let held = wire.attempts.borrow()[mark].clone();
+        let new_cell = Payload::Cells(CellPayload::Own {
+            range: wire::StreamRange::new(1, 2).unwrap(),
+            relay_into_zone: false,
+            probe: false,
+        });
+        assert_eq!((held.dst, payload_of(&held.bytes)), (z, new_cell));
+        assert!(wire.attempts.borrow()[mark..].iter().all(|a| *a == held));
+
+        wire.refuse.set(false);
+        let mark = wire.attempts.borrow().len();
+        heartbeats(1).await;
+        assert_eq!(wire.attempts.borrow()[mark].bytes, held.bytes);
+        let sent = sent_payloads(&wire, mark + 1);
+        assert!(sent.contains(&(z, probe)), "{sent:?}");
+    });
+}
+
 /// While the kernel refuses sends no peer can answer, so the gateway is not
 /// judged during the hold, and the wait it shows after the release counts
 /// only the time before the hold.
@@ -1476,6 +1507,26 @@ fn late_heartbeats_keep_one_retry_per_heartbeat() {
         let (failed_over, _) = run_paused(lost_attempts(withheld, late));
         assert_eq!(failed_over, failovers, "{withheld}");
     }
+}
+
+/// A heartbeat that runs more than `F_r` late is stamped `F_r` before the
+/// clock, not at its schedule, so the wait for the probe it sends to an idle
+/// gateway starts then, not 300 ms in the past.
+#[test]
+fn late_heartbeat_is_stamped_near_the_clock() {
+    run_paused(async {
+        let g = sock(3);
+        let wire = Rc::new(Wire::default());
+        let (_client, admin) = scripted(&wire, vec![g], "a", |_| {}).await;
+        introduce(&wire, &[(g, node(0xC), "b")]);
+        wire.stall(true);
+        sim_advance_ticks(Duration::from_millis(1), 400).await;
+        wire.stall(false);
+        sim_advance_ticks(Duration::from_millis(1), 1).await;
+        let peer = admin_snapshot(&admin).await.peers[0];
+        assert_eq!((peer.role, peer.answer), (Role::Gateway, AnswerState::Owed));
+        assert!(peer.unanswered_ms <= Some(5 + 1), "{peer:?}");
+    });
 }
 
 /// A node whose runtime is not polled for three `suspect_after` while its

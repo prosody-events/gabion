@@ -14,15 +14,20 @@ fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
 }
 
-fn descriptor_for(fingerprint: u128, local_id: u32) -> RuleDescriptor {
+fn descriptor_for(fingerprint: u128) -> RuleDescriptor {
     RuleDescriptor {
         fingerprint,
         window_millis: 1000,
         bucket_millis: 1000,
         limit: 1000,
-        flags: 0,
-        local_rule_id: local_id,
+        applies_locally: true,
     }
+}
+
+/// Epoch ages from per-slot `current` and `live` columns.
+fn ages(current: &[BucketEpoch], live: &[u32]) -> Vec<RuleAge> {
+    let epoch = |(&current, &live)| RuleAge::Epoch { current, live };
+    current.iter().zip(live).map(epoch).collect()
 }
 
 fn store() -> CellStore {
@@ -488,7 +493,7 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(
     let mut expired = BTreeSet::new();
     let (mut emitted, mut calls) = (0, 0);
     loop {
-        let expiry = store.expire(&current, &live, &mut exp);
+        let expiry = store.expire(&ages(&current, &live), &mut exp);
         calls += 1;
         emitted += exp.len();
         expired.extend(exp.handles.iter().map(|h| h.index));
@@ -517,7 +522,7 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(
 #[test]
 fn merge_remote_is_monotonic() {
     let mut store = store();
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11)).unwrap();
     let mut sink = DeltaSink::with_capacity(4);
 
     let mut obs = ObservationBatch::with_capacity(1);
@@ -551,7 +556,7 @@ fn merge_remote_is_monotonic() {
 #[test]
 fn different_origins_are_independent() {
     let mut store = store();
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11)).unwrap();
     let _a = remote_merge_one(&mut store, 0x11, 1, 1, 5, 0);
     let _b = remote_merge_one(&mut store, 0x11, 2, 1, 7, 0);
     assert_eq!(store.active_len(), 2);
@@ -561,7 +566,7 @@ fn different_origins_are_independent() {
 fn merge_order_does_not_matter() {
     let make = |order: &[(u128, u32)]| {
         let mut store = store();
-        store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+        store.intern_rule(descriptor_for(0x11)).unwrap();
         for (origin, count) in order {
             remote_merge_one(&mut store, 0x11, *origin, 1, *count, 0);
         }
@@ -587,7 +592,7 @@ fn merge_order_does_not_matter() {
 #[test]
 fn increment_local_accumulates() {
     let mut store = store();
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11)).unwrap();
     let handle = local_increment_one(&mut store, 0x11, 0xabc, 0, 3, 10);
     let _ = local_increment_one(&mut store, 0x11, 0xabc, 0, 4, 20);
     let row = store.get(handle).unwrap();
@@ -598,7 +603,7 @@ fn increment_local_accumulates() {
 #[test]
 fn capacity_is_enforced_without_growing() {
     let mut store = small_store(1);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11)).unwrap();
     let mut sink = DeltaSink::with_capacity(2);
     let mut a = ObservationBatch::with_capacity(1);
     a.push(observation(0x11, 0xabc, 0, 1, 1, 1, 0));
@@ -619,7 +624,7 @@ fn capacity_is_enforced_without_growing() {
 #[test]
 fn bucket_boundary_expires_in_batches_without_growth() {
     let mut store = small_store(64);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11)).unwrap();
     let mut batch = ObservationBatch::with_capacity(20);
     for key in 0..20 {
         batch.push(observation(0x11, key, 0, 1, 1, 1_u32, 0));
@@ -657,7 +662,7 @@ fn bucket_boundary_expires_in_batches_without_growth() {
 fn library_warning_names_both_spellings() {
     let ((), logs) = with_logs(|| {
         let mut store = small_store(1);
-        store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+        store.intern_rule(descriptor_for(0x11)).unwrap();
         let mut sink = DeltaSink::with_capacity(2);
         for origin in [1, 2] {
             let mut batch = ObservationBatch::with_capacity(1);
@@ -692,12 +697,12 @@ fn index_capacity_keeps_half_the_buckets_free() {
     }
 }
 
-// --- New tests required by the plan -----------------------------------
+// --- Sinks, wire-only rules, dictionaries and expiry ------------------
 
 #[test]
 fn delta_sink_records_exact_raises() {
     let mut store = small_store(4);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11)).unwrap();
     let mut sink = DeltaSink::with_capacity(4);
     let mut obs = ObservationBatch::with_capacity(2);
     obs.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
@@ -717,7 +722,7 @@ fn delta_sink_records_exact_raises() {
 #[test]
 fn delta_applies_locally_reflects_rule_dictionary() {
     let mut store = small_store(4);
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11)).unwrap();
     // 0x22 fingerprint unknown locally.
     let mut sink = DeltaSink::with_capacity(2);
     let mut obs = ObservationBatch::with_capacity(2);
@@ -739,7 +744,7 @@ fn unknown_rule_cells_round_trip() {
     assert_eq!(row.count, 20);
     // The rule slot still has a descriptor, but applies_locally is false.
     let rule_desc = store.rule_dictionary().descriptor(row.key.rule).unwrap();
-    assert!(!rule_desc.applies_locally());
+    assert!(!rule_desc.applies_locally);
 
     let mut sink = DeltaSink::with_capacity(1);
     let mut obs = ObservationBatch::with_capacity(1);
@@ -753,28 +758,41 @@ fn unknown_rule_cells_round_trip() {
     cur[row.key.rule as usize] = 5;
     live[row.key.rule as usize] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
-    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
+    assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
 }
 
+/// The wire carries a wire-only cell's bucket but not its width, so the cell
+/// lives the default window past its last update. Its bucket here is from a
+/// 100 ms rule, whose epoch is ahead of the default 1 s one: aged by bucket,
+/// it would never expire.
 #[test]
-fn unknown_rule_cells_expire_at_default_window() {
+fn unconfigured_rule_cells_expire_by_last_update() {
     let mut store = small_store(4);
-    let handle = remote_merge_one(&mut store, 0x44, 5, 1, 10, 0);
-    assert!(store.get(handle).is_some());
-
-    let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
-    assert_eq!(store.expire_at(61_000, &mut exp), Expiry::Done);
-
-    assert!(store.get(handle).is_none());
-    assert_eq!(exp.len(), 1);
+    let t = 1_000_000;
+    let mut obs = ObservationBatch::with_capacity(1);
+    obs.push(observation(
+        0xBEEF,
+        0xabc,
+        (t / 100) as BucketEpoch,
+        100,
+        1,
+        3,
+        t,
+    ));
+    store.merge_remote(&obs, &mut DeltaSink::with_capacity(1), RelayMark::Clear);
+    let mut exp = ExpirationSink::with_capacity(1);
+    assert_eq!(store.expire_at(t + 60_000, &mut exp), Expiry::Done);
+    assert_eq!((store.active_len(), exp.len()), (1, 0));
+    assert_eq!(store.expire_at(t + 60_001, &mut exp), Expiry::Done);
+    assert_eq!((store.active_len(), exp.len()), (0, 1));
     assert_eq!(exp.applies_locally[0], 0);
 }
 
 #[test]
 fn compact_id_round_trip() {
     let mut store = store();
-    store.intern_rule(descriptor_for(0xAA, 1)).unwrap();
+    store.intern_rule(descriptor_for(0xAA)).unwrap();
     let rule_slot = store.rule_dictionary.find(0xAA).unwrap();
     let _ = remote_merge_one(&mut store, 0xAA, 99, 7, 1, 0);
     let node_slot = store.node_dictionary.find(NodeId(99), 7).unwrap();
@@ -789,7 +807,7 @@ fn compact_id_round_trip() {
 #[test]
 fn dictionary_refcount_frees_unreferenced_slots() {
     let mut store = small_store(4);
-    store.intern_rule(descriptor_for(0xBB, 1)).unwrap();
+    store.intern_rule(descriptor_for(0xBB)).unwrap();
     let h = remote_merge_one(&mut store, 0xBB, 100, 1, 1, 0);
     let row = store.get(h).unwrap();
     let node_slot = row.key.origin;
@@ -804,7 +822,7 @@ fn dictionary_refcount_frees_unreferenced_slots() {
     cur[rule_slot as usize] = 5;
     live[rule_slot as usize] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
-    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
+    assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
     // The unpinned remote-origin node slot frees: refcount 0, descriptor None.
     assert_eq!(store.node_dictionary().refcount(node_slot), 0);
@@ -830,8 +848,7 @@ fn configured_rule_pinned_survives_cell_expiry() {
         window_millis: 10_000,
         bucket_millis: 1_000,
         limit: 5,
-        flags: 0,
-        local_rule_id: 7,
+        applies_locally: true,
     };
     let slot = store.intern_rule(configured).unwrap();
     // The registration pin alone holds the slot — no cells yet.
@@ -848,12 +865,12 @@ fn configured_rule_pinned_survives_cell_expiry() {
     cur[slot as usize] = 20;
     live[slot as usize] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
-    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
+    assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert!(store.get(h).is_none());
     assert_eq!(store.active_len(), 0);
 
     // The pin survives: refcount back to 1, descriptor unchanged (the real 10 s
-    // window and local_rule_id 7 — NOT the 60 s default).
+    // window and `applies_locally` — NOT the 60 s default).
     assert_eq!(store.rule_dictionary().refcount(slot), 1);
     assert_eq!(store.rule_dictionary().descriptor(slot), Some(&configured));
 
@@ -898,7 +915,7 @@ fn wire_only_rule_frees_when_cells_expire() {
             .rule_dictionary()
             .descriptor(slot)
             .unwrap()
-            .applies_locally(),
+            .applies_locally,
         "an unregistered rule is wire-only"
     );
 
@@ -907,7 +924,7 @@ fn wire_only_rule_frees_when_cells_expire() {
     cur[slot as usize] = 20;
     live[slot as usize] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
-    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
+    assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
 
     // Slot freed: no lingering descriptor for a rule nobody configured.
@@ -937,7 +954,7 @@ fn dictionary_full_rejects_with_counter() {
 #[test]
 fn incarnation_change_isolates() {
     let mut store = store();
-    store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+    store.intern_rule(descriptor_for(0x11)).unwrap();
     let h1 = remote_merge_one(&mut store, 0x11, 42, 1, 5, 0);
     let h2 = remote_merge_one(&mut store, 0x11, 42, 2, 5, 0);
     let r1 = store.get(h1).unwrap();
@@ -957,15 +974,14 @@ fn expire_emits_one_row_per_freed_cell() {
     // have degraded applies_locally to false. The pin removes that hazard;
     // emission still runs before free_cell_at for the cell rows.)
     let mut store = small_store(8);
-    let rule_local = store.intern_rule(descriptor_for(0x11, 1)).unwrap();
+    let rule_local = store.intern_rule(descriptor_for(0x11)).unwrap();
     let rule_doomed = store
         .intern_rule(RuleDescriptor {
             fingerprint: 0x22,
             window_millis: 1000,
             bucket_millis: 1000,
             limit: 1000,
-            flags: 0,
-            local_rule_id: 1,
+            applies_locally: true,
         })
         .unwrap();
 
@@ -1020,7 +1036,7 @@ fn expire_emits_one_row_per_freed_cell() {
     live[rule_local as usize] = 1000;
 
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
-    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
+    assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
 
     assert_eq!(store.active_len(), 1);
     assert_eq!(exp.len(), 2);
@@ -1052,7 +1068,7 @@ fn expire_emits_one_row_per_freed_cell() {
 #[test]
 fn expire_frees_slots_and_dictionary_refs() {
     let mut store = small_store(4);
-    let rule_slot = store.intern_rule(descriptor_for(0xCC, 1)).unwrap();
+    let rule_slot = store.intern_rule(descriptor_for(0xCC)).unwrap();
     let _h = remote_merge_one(&mut store, 0xCC, 100, 1, 5, 0);
     assert_eq!(store.active_len(), 1);
     assert_eq!(
@@ -1067,7 +1083,7 @@ fn expire_frees_slots_and_dictionary_refs() {
     cur[rule_slot as usize] = 5;
     live[rule_slot as usize] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
-    assert_eq!(store.expire(&cur, &live, &mut exp), Expiry::Done);
+    assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
     // Node dictionary no longer holds the (NodeId(100), 1) entry.
     assert!(store.node_dictionary().find(NodeId(100), 1).is_none());
@@ -1076,7 +1092,7 @@ fn expire_frees_slots_and_dictionary_refs() {
 #[test]
 fn handle_generation_is_aba_safe() {
     let mut store = small_store(2);
-    store.intern_rule(descriptor_for(0xDD, 1)).unwrap();
+    store.intern_rule(descriptor_for(0xDD)).unwrap();
     let h1 = remote_merge_one(&mut store, 0xDD, 1, 1, 1, 0);
     // Free the slot directly.
     store.free_cell_at(h1.index);
@@ -1097,8 +1113,7 @@ fn expire_at_and_expire_agree_for_same_now() {
         window_millis: 100,
         bucket_millis: 50,
         limit: 10,
-        flags: 0,
-        local_rule_id: 1,
+        applies_locally: true,
     };
     let mk = || {
         let mut s = small_store(8);
@@ -1131,7 +1146,7 @@ fn expire_at_and_expire_agree_for_same_now() {
     cur[rule_slot as usize] = current;
     lv[rule_slot as usize] = live;
     let mut sink_b = ExpirationSink::with_capacity(b.capacity() as usize);
-    assert_eq!(b.expire(&cur, &lv, &mut sink_b), Expiry::Done);
+    assert_eq!(b.expire(&ages(&cur, &lv), &mut sink_b), Expiry::Done);
 
     assert_eq!(sink_a.len(), sink_b.len());
     assert_eq!(a.active_len(), b.active_len());
@@ -1144,8 +1159,7 @@ fn descriptor_epoch_helpers_pin_window_math() {
         window_millis: 10_000,
         bucket_millis: 1_000,
         limit: 100,
-        flags: 0,
-        local_rule_id: 1,
+        applies_locally: true,
     };
     assert_eq!(rd.current_epoch(12_345), 12);
     assert_eq!(rd.live_buckets(), 10);
@@ -1169,8 +1183,7 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
             window_millis: 101,
             bucket_millis: 50,
             limit: 10,
-            flags: 0,
-            local_rule_id: 1,
+            applies_locally: true,
         })
         .unwrap();
 
@@ -1189,10 +1202,10 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
     assert_eq!(store.active_len(), 1);
 }
 
-// --- Coverage extensions (Gaps 1-6) -----------------------------------
+// --- Properties over configured rules ----------------------------------
 
 /// Like `quickcheck_store()` but pre-registers configured rules for
-/// fingerprints `0x100` and `0x101` (`local_rule_id != u32::MAX`).
+/// fingerprints `0x100` and `0x101` (`applies_locally`).
 /// `intern_rule` pins each on registration, so their descriptors (and thus
 /// `applies_locally`) survive even when every cell on the rule expires.
 /// Fingerprints `0x102` and `0x103` remain auto-interned wire-only on first
@@ -1205,8 +1218,7 @@ fn quickcheck_store_with_pinned_rules() -> CellStore {
             window_millis: 1000,
             bucket_millis: 1000,
             limit: 1000,
-            flags: 0,
-            local_rule_id: 1,
+            applies_locally: true,
         })
         .unwrap();
     store
@@ -1215,8 +1227,7 @@ fn quickcheck_store_with_pinned_rules() -> CellStore {
             window_millis: 1000,
             bucket_millis: 1000,
             limit: 1000,
-            flags: 0,
-            local_rule_id: 1,
+            applies_locally: true,
         })
         .unwrap();
     store
@@ -1283,7 +1294,7 @@ fn assert_invariants_with_pinned_rules(store: &CellStore, pinned_rule_slots: &[R
     true
 }
 
-// --- Shared scaffolding for mixed-ops properties (Gaps 1, 2, 5) ----------
+// --- Shared scaffolding for mixed-ops properties -------------------------
 
 #[derive(Clone, Debug)]
 struct ExpireTick {
@@ -1385,7 +1396,7 @@ fn apply_mixed_op_with_sinks(
                     live[slot as usize] = tick.live_by_fp[fp_idx] as u32;
                 }
             }
-            assert_eq!(store.expire(&cur, &live, exp_sink), Expiry::Done);
+            assert_eq!(store.expire(&ages(&cur, &live), exp_sink), Expiry::Done);
         }
     }
 }
@@ -1433,7 +1444,7 @@ fn apply_mixed_op_to_model(model: &mut BTreeMap<PortableKey, u32>, op: &MixedOp)
     }
 }
 
-// Gap 1 + Gap 2: mixed local+remote+expire ops, with `applies_locally`
+// Mixed local+remote+expire ops, with `applies_locally`
 // driven by the pinned-fingerprint set so the flag is no longer uniformly
 // false across the QC suite.
 #[quickcheck]
@@ -1601,7 +1612,7 @@ fn stream_after_returns_exactly_the_cells_above_sent(ops: MixedOps, pick: u8, ma
     out == expected
 }
 
-// --- Gap 3: saturation and dictionary-full paths -------------------------
+// --- Saturation and dictionary-full paths --------------------------------
 
 #[derive(Clone, Debug)]
 struct TightRemoteRow {
@@ -1783,7 +1794,7 @@ fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
     stored == expected && delta_sum == u64::from(stored)
 }
 
-// --- Gap 6: expire_at vs expire for varied rule windows ------------------
+// --- expire_at vs expire for varied rule windows -------------------------
 
 #[derive(Clone, Debug)]
 struct RuleParams {
@@ -1820,8 +1831,7 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
         window_millis: rule_a.window,
         bucket_millis: rule_a.bucket,
         limit: 1000,
-        flags: 0,
-        local_rule_id: 1,
+        applies_locally: true,
     })
     .unwrap();
     base.intern_rule(RuleDescriptor {
@@ -1829,8 +1839,7 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
         window_millis: rule_b.window,
         bucket_millis: rule_b.bucket,
         limit: 1000,
-        flags: 0,
-        local_rule_id: 1,
+        applies_locally: true,
     })
     .unwrap();
 
@@ -1870,7 +1879,10 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
         }
     }
     let mut sink_b = ExpirationSink::with_capacity(base.capacity() as usize);
-    assert_eq!(store_b.expire(&cur, &live, &mut sink_b), Expiry::Done);
+    assert_eq!(
+        store_b.expire(&ages(&cur, &live), &mut sink_b),
+        Expiry::Done
+    );
 
     let handles_a: BTreeSet<u32> = sink_a.handles.iter().map(|h| h.index).collect();
     let handles_b: BTreeSet<u32> = sink_b.handles.iter().map(|h| h.index).collect();

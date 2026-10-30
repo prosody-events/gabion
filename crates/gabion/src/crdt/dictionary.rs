@@ -21,35 +21,27 @@ pub struct RuleDescriptor {
     pub window_millis: u32,
     pub bucket_millis: u32,
     pub limit: u64,
-    pub flags: u32,
-    /// `u32::MAX` means the rule is known on the wire only — cells are stored,
-    /// dirty-tracked, and expired the same way, but
-    /// [`super::DeltaSink::applies_locally`] is `false` so the local
-    /// rate-limit aggregator ignores them.
-    pub local_rule_id: u32,
+    /// `false` for a rule known on the wire only: its cells are stored,
+    /// forwarded and expired, but [`super::DeltaSink::applies_locally`] is
+    /// `false` so the local rate-limit aggregator ignores them.
+    pub applies_locally: bool,
 }
 
 impl Default for RuleDescriptor {
     fn default() -> Self {
         Self {
             fingerprint: 0,
-            // Unknown wire-only rules still need a bounded lifetime. A zero
-            // bucket has no epoch, so `expire_at` could not age the rule's
-            // cells.
+            // How long a wire-only rule's cell lives past its last update
+            // (`RuleAge::Idle`).
             window_millis: 60_000,
             bucket_millis: 1_000,
             limit: 0,
-            flags: 0,
-            local_rule_id: u32::MAX,
+            applies_locally: false,
         }
     }
 }
 
 impl RuleDescriptor {
-    pub fn applies_locally(&self) -> bool {
-        self.local_rule_id != u32::MAX
-    }
-
     /// The bucket epoch `now_millis` falls in: `now_millis / bucket_millis`.
     /// The single source of truth for this floor used by both
     /// [`super::CellStore::expire_at`] and the visualizer. `0` for a zero
@@ -153,7 +145,7 @@ impl RuleDictionary {
     /// through [`super::CellStore`].
     pub(super) fn intern(&mut self, descriptor: RuleDescriptor) -> Option<RuleSlot> {
         if let Some(slot) = self.find(descriptor.fingerprint) {
-            // Replace descriptor metadata (e.g. local_rule_id may have
+            // Replace descriptor metadata (e.g. `applies_locally` may have
             // changed).
             self.descriptors[slot as usize] = descriptor;
             return Some(slot);

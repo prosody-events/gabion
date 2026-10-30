@@ -300,8 +300,7 @@ fn store_for_expiring_rule(identity: NodeIdentity) -> CellStore {
                 window_millis: 100,
                 bucket_millis: 100,
                 limit: 1_000,
-                flags: 0,
-                local_rule_id: rule as u32,
+                applies_locally: true,
             })
             .unwrap();
     }
@@ -317,8 +316,7 @@ fn store_for_property_rules(identity: NodeIdentity, node_capacity: u16) -> CellS
                 window_millis: 3_600_000,
                 bucket_millis: 100,
                 limit: 1_000_000,
-                flags: 0,
-                local_rule_id: rule as u32,
+                applies_locally: true,
             })
             .unwrap();
     }
@@ -773,7 +771,7 @@ fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> Tes
     })
 }
 
-// -- migrated tests ---------------------------------------------------------
+// -- apply before ack, and convergence --------------------------------------
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn record_acks_after_apply() {
@@ -934,8 +932,7 @@ async fn gossip_tick_drives_expiration() {
                     window_millis: 100,
                     bucket_millis: 100,
                     limit: 10,
-                    flags: 0,
-                    local_rule_id: 1,
+                    applies_locally: true,
                 })
                 .unwrap();
 
@@ -980,8 +977,7 @@ fn expiry_applies_each_full_batch_before_the_next() {
             window_millis: 100,
             bucket_millis: 100,
             limit: 10,
-            flags: 0,
-            local_rule_id: 1,
+            applies_locally: true,
         })
         .unwrap();
     let mut batch = ObservationBatch::with_capacity(cells);
@@ -1042,8 +1038,7 @@ async fn configured_rule_reexpires_after_idle_window() {
                     window_millis: 100,
                     bucket_millis: 100,
                     limit: 10,
-                    flags: 0,
-                    local_rule_id: 1,
+                    applies_locally: true,
                 })
                 .unwrap();
 
@@ -1303,7 +1298,7 @@ async fn admin_snapshot_reflects_runtime_state() {
         .await;
 }
 
-// -- shared helpers for coverage-gap tests ----------------------------------
+// -- shared helpers ---------------------------------------------------------
 
 async fn admin_snapshot(admin_tx: &mpsc::Sender<AdminCommand>) -> AdminSnapshot {
     use tokio::sync::oneshot;
@@ -1947,7 +1942,7 @@ fn router_overflow_is_reported_as_a_drop() {
     assert!(dst.recv_from(&mut buf).now_or_never().is_none());
 }
 
-// -- Gap 5: DropProb i.i.d. packet loss -------------------------------------
+// -- DropProb i.i.d. packet loss --------------------------------------------
 
 #[derive(Clone, Debug)]
 struct DropProbCase {
@@ -2063,7 +2058,7 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
     })
 }
 
-// -- Gap 6: peer event lifecycle idempotence --------------------------------
+// -- peer event lifecycle idempotence ---------------------------------------
 
 /// The peer table ignores an `Added` for a peer it already holds and a
 /// `Removed` for one it does not. This case walks the sequence

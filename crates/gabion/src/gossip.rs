@@ -16,14 +16,13 @@
 //! only header-only probes until it answers.
 //!
 //! All polymorphic boundaries are monomorphized generics — no `dyn`, no
-//! `Box`. The production hot path is branch-free; tests and simulators
-//! parameterize the same code paths with [`sim::SimTransport`] and a
-//! `TokioClock::from_millis(0)` anchored under `tokio::time::pause()`.
+//! `Box`. Tests and simulators parameterize the same code paths with
+//! [`sim::SimTransport`] and a `TokioClock::from_millis(0)` anchored under
+//! `tokio::time::pause()`.
 
 use std::io;
 use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU128, NonZeroUsize};
-use std::time::Duration;
 
 use crate::defaults;
 use crate::settings::{MIN_LIMIT_QUEUE_CAPACITY, Millis, Setting};
@@ -91,7 +90,7 @@ pub struct ValidGossipConfig {
     /// `send_blocked` warning also names it, so it exists in every build.
     pub(crate) send_buffer_bytes: NonZeroU32,
     /// Period between proactive gossip ticks.
-    pub(crate) tick_interval: Duration,
+    pub(crate) tick_interval: Millis,
     /// Per-rule error budget in basis points of the rule's own limit, used
     /// for threshold-triggered anti-entropy. See
     /// [`crate::defaults::GOSSIP_TARGET_ERR_BPS`].
@@ -110,7 +109,7 @@ pub struct ValidGossipConfig {
 /// A heartbeat shorter than this many milliseconds may resend before the
 /// answer to the first copy arrives: four times a generous cross-zone round
 /// trip.
-const TICK_NEAR_ROUND_TRIP_MS: u128 = 20;
+const TICK_NEAR_ROUND_TRIP_MS: u64 = 20;
 
 impl ValidGossipConfig {
     /// Shrink the runtime's request channel to [`MIN_LIMIT_QUEUE_CAPACITY`],
@@ -141,7 +140,7 @@ impl ValidGossipConfig {
     /// heartbeat near a round trip. Each adapter calls it once, when the node
     /// starts gossiping.
     pub fn note_startup(&self) {
-        let tick_ms = self.tick_interval.as_millis();
+        let tick_ms = self.tick_interval.0.get();
         if tick_ms < TICK_NEAR_ROUND_TRIP_MS {
             tracing::warn!(
                 code = "setting_warning",

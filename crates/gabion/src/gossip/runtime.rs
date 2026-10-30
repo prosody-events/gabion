@@ -163,26 +163,9 @@ where
     S: AggregateStore,
 {
     /// Bind a UDP socket on `bind_addr` and assemble the runtime with the
-    /// production transport and a wall-clock-anchored `TokioClock`.
+    /// production transport, a wall-clock-anchored `TokioClock` and the
+    /// admin command channel `admin_rx`.
     pub async fn bind(
-        bind_addr: SocketAddr,
-        config: ValidGossipConfig,
-        store: CellStore,
-        aggregates: S,
-    ) -> Result<(Self, GossipClient), GossipError> {
-        let transport = UdpTransport::bind(bind_addr, &config).await?;
-        Ok(Self::from_parts(
-            transport,
-            TokioClock::new(),
-            config,
-            store,
-            aggregates,
-        ))
-    }
-
-    /// Like [`Self::bind`] but threads in an admin command channel. The
-    /// admin select arm is only polled when this constructor is used.
-    pub async fn bind_with_admin(
         bind_addr: SocketAddr,
         config: ValidGossipConfig,
         store: CellStore,
@@ -252,7 +235,7 @@ where
 
         let bootstrap = std::mem::take(&mut config.bootstrap_peers);
         let local_key = hash_fingerprint(store.local_identity().node_id.0);
-        let rto_ms = config.tick_interval.as_millis() as u64;
+        let rto_ms = config.tick_interval.0.get();
         let suspect_after = config.suspect_after.0.get();
         let zone = config.zone.as_ref().map(ZoneName::hash);
         let peers =
@@ -321,7 +304,7 @@ where
         St: futures::Stream<Item = PeerEvent>,
     {
         let mut peer_events = std::pin::pin!(peer_events);
-        let mut heartbeat = self.clock.ticker(self.config.tick_interval);
+        let mut heartbeat = self.clock.ticker(self.config.tick_interval.duration());
         let mut prompt = self.clock.ticker(self.config.min_emit_interval.duration());
         // Once the peer-event stream returns `None` (e.g. `stream::empty()`),
         // never poll it again — otherwise it returns `Ready(None)` on every
@@ -431,8 +414,6 @@ where
             let peers = self.peers.len().max(1) as u64;
             let bps = u64::from(self.config.target_err_bps.get());
             let epsilon = (req.rule_limit.saturating_mul(bps) / (10_000 * peers)).max(1);
-            // Surface the budget so observers can see the threshold a burst's
-            // accumulated `pending` must cross to trigger an eager flush.
             self.last_error_budget = epsilon;
             if (pending as u64) > epsilon {
                 // The runtime's clock is the canonical floor reference, not
@@ -737,7 +718,7 @@ where
                 rule_window_millis: rule.map_or(0, |r| r.window_millis),
                 rule_bucket_millis: rule.map_or(0, |r| r.bucket_millis),
                 rule_limit: rule.map_or(0, |r| r.limit),
-                applies_locally: rule.is_some_and(|r| r.applies_locally()),
+                applies_locally: rule.is_some_and(|r| r.applies_locally),
             });
         }
         CellDumpSnapshot {
@@ -943,10 +924,7 @@ where
         let reports = if due {
             self.peers.take_reports(row, now, floor)
         } else {
-            PerStream {
-                own: GapDue::Nothing,
-                relay: GapDue::Nothing,
-            }
+            PerStream::default()
         };
         for stream in [Stream::Own, Stream::Relay] {
             if let GapDue::Abandoned { missing } = reports[stream] {
@@ -973,7 +951,8 @@ where
             );
             sent_any |= closed.is_some();
         }
-        if role == Role::Zone {
+        // A held packet holds the row: nothing more is sent to it this round.
+        if role == Role::Zone && !self.outbox.is_held() {
             let resend = relay_retry && !probe_only;
             let closed = self.send_stream(Stream::Relay, row, heads.relay, gaps, resend, now);
             self.prompt_work |= closed.is_some_and(|c| c < heads.relay);
@@ -983,7 +962,7 @@ where
         let probe = probe_only && (suspect || !sent_any);
         let ack_due = kind == Round::Heartbeat && flags.has(PeerFlags::ACK_DUE);
         let owed = gaps.any() || ack_due || flags.has(PeerFlags::REPLY_DUE);
-        if probe || (!sent_any && owed) {
+        if !self.outbox.is_held() && (probe || (!sent_any && owed)) {
             let header = self.header_for(row, gaps, Payload::Ack { probe });
             let dst = self.peers.addr(row);
             let sent =
@@ -1045,25 +1024,39 @@ where
             Stream::Relay => CellPayload::Relay { range, probe },
         };
         let header = self.header_for(row, gaps, payload);
-        let dst = self.peers.addr(row);
-        let handles = &self.frames[stream].handles;
-        let (closed, sent) = if handles.is_empty() {
-            let sent =
-                (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
-            (upper, sent)
-        } else {
-            let packets = Packets::new(
-                header,
-                &self.store,
-                handles,
-                &mut self.scratch,
-                self.config.wire_limits,
-            );
-            (self.outbox).send_frame(packets, dst, now, &self.transport, &mut self.counters)
-        };
+        let (closed, sent) = self.send_cells(stream, header, self.peers.addr(row), now);
+        let closed = closed.unwrap_or(upper);
         self.peers.tx(row, stream).note_sent(closed, now);
         self.account(row, sent, true, now);
         Some(closed)
+    }
+
+    /// Send `header` to `dst` with the cells of `stream`'s frame, or alone
+    /// when the frame holds none. Returns the position the cells close
+    /// through, `None` for the header alone.
+    fn send_cells(
+        &mut self,
+        stream: Stream,
+        header: Header<CellPayload>,
+        dst: SocketAddr,
+        now: u64,
+    ) -> (Option<u64>, Sent) {
+        let handles = &self.frames[stream].handles;
+        if handles.is_empty() {
+            let sent =
+                (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
+            return (None, sent);
+        }
+        let packets = Packets::new(
+            header,
+            &self.store,
+            handles,
+            &mut self.scratch,
+            self.config.wire_limits,
+        );
+        let (closed, sent) =
+            (self.outbox).send_frame(packets, dst, now, &self.transport, &mut self.counters);
+        (Some(closed), sent)
     }
 
     /// Both streams' heads.
@@ -1240,22 +1233,7 @@ where
             }
             // A store with no live cell still answers with one empty page.
             let header = self.header_for(row, PerStream::default(), CellPayload::Sweep);
-            let handles = &self.frames.own.handles;
-            let sent = if cells == 0 {
-                self.outbox
-                    .send_header(&header, dst, now, &self.transport, &mut self.counters)
-            } else {
-                let packets = Packets::new(
-                    header,
-                    &self.store,
-                    handles,
-                    &mut self.scratch,
-                    self.config.wire_limits,
-                );
-                (self.outbox)
-                    .send_frame(packets, dst, now, &self.transport, &mut self.counters)
-                    .1
-            };
+            let (_, sent) = self.send_cells(Stream::Own, header, dst, now);
             self.account(row, sent, false, now);
             if self.outbox.is_held() {
                 return;

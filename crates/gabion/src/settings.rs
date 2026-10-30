@@ -389,7 +389,7 @@ impl Settings {
             #[cfg(feature = "transport-udp")]
             recv_buffer_bytes: self.recv_buffer_bytes,
             send_buffer_bytes: self.send_buffer_bytes,
-            tick_interval: self.tick_interval.duration(),
+            tick_interval: self.tick_interval,
             target_err_bps,
             min_emit_interval: self.min_emit_interval,
             suspect_after,
