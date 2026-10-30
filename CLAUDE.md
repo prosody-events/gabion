@@ -10,16 +10,19 @@ service, and an in-process NGINX module. Both share the same admission
 hot path, the same CRDT, the same wire codec, the same rule machinery.
 
 Cluster-wide counts are eventually consistent. Admission is local and
-allocation-free; an operator under heavy load pays for one atomic read of
-SHM (nginx) or one `DashMap` lookup (server), no syscalls, no allocations.
+allocation-free; an operator under heavy load pays for a short probe of
+the seqlocked aggregate table (in SHM for nginx, on the heap for
+`gabiond`), no syscalls, no allocations.
 
 ## Crate layout
 
 The workspace lives under `crates/`:
 
 - **`gabion`** — the library. Pure Rust, no transport bindings. Modules:
-  - `crdt` — per-origin counter store, dirty rings,
-    delta/expiration sinks. Bounded; zero allocation after construction.
+  - `crdt` — per-origin counter store and its delta/expiration sinks.
+    Bounded; zero allocation after construction.
+  - `aggregate` — the cluster-aggregate table admission reads; the
+    gossip runtime is its only writer.
   - `gossip` — anti-entropy runtime (`GossipRuntime`), `GossipClient`,
     `Clock`, `GossipTransport`, the deterministic `sim::SimTransport`
     used in tests, and the admin/peer interface.
@@ -31,6 +34,10 @@ The workspace lives under `crates/`:
     emit identical identifiers.
   - `discovery` — `PeerDiscovery` trait and the Kubernetes EndpointSlice
     implementation.
+  - `identity` — this process's node id and per-start incarnation.
+  - `zone` — zone names and the zone hash every gossip header carries.
+  - `settings` — every scalar operator setting, named, parsed and
+    validated once for both adapters.
   - `defaults` — the production tunables both adapters consume.
 
 - **`server`** (`gabion-server`) — the `gabiond` binary. Tonic gRPC
@@ -44,8 +51,8 @@ The workspace lives under `crates/`:
   phase (read aggregate, decide, push to SHM queue), and every worker
   runs a leader thread that campaigns for the SHM lease; the holder
   drains the queue, drives `GossipRuntime`, and writes deltas back into
-  the SHM aggregate. The library half (`access`, `headers`, `identity`,
-  `leader`, `rules`, `shm`) builds and tests without the `ngx-module`
+  the SHM aggregate. The library half (`access`, `headers`, `leader`,
+  `rules`, `shm`) builds and tests without the `ngx-module`
   feature; FFI glue is gated behind it.
 
 - **`loader`** — a load generator. Drives the gRPC service (or an HTTP
@@ -75,9 +82,10 @@ live in `crates/gabion/README.md`; the CRDT design deep-dive lives in
    `(rule_fingerprint, key_hash, bucket, hits, now_millis)` record into
    the local SHM queue (nginx) or hand it to `GossipClient::record`
    (server).
-4. The gossip runtime folds local records into its `CellStore`, gossips
-   dirty rows to peers every tick, applies inbound deltas to the local
-   aggregate, and ages out expired buckets.
+4. The gossip runtime folds local records into its `CellStore`, streams
+   its changed cells to every peer in its zone and to one gateway in each
+   other zone, applies inbound deltas to the local aggregate, and ages out
+   expired buckets.
 
 The library knows nothing about YAML, gRPC, or nginx. Adapters bridge
 their own config to library types and own their own transport.
@@ -115,20 +123,20 @@ in the same commit that touches the surrounding code.
 ## No allocation on the hot path
 
 The per-request decision path and the CRDT mutation path must not allocate.
-Pre-size everything up front; carry stack-resident bounded collections
-(`arrayvec::ArrayVec`) through the request; iterate `RuleTable::matching`
-without `collect`ing; read SHM aggregates through atomic loads only.
+Pre-size everything up front; iterate `RuleTable::matching` without
+`collect`ing; read aggregates through atomic loads only.
 
-- A `Vec` that occasionally grows is acceptable for caller-owned buffers
-  that the hot path reuses across requests (e.g. the gRPC `mapped`
-  descriptor scratch) — but pre-allocate with `with_capacity` from the
-  call site so steady state is allocation-free.
-- Hard caps on per-request work live in `gabion::defaults` and feed both
-  adapters' `ArrayVec` sizings. Touching one without the other is a bug.
+- Per-request scratch is a caller-owned buffer the hot path reuses across
+  requests (each nginx worker's and each `gabiond` runtime thread's
+  admission events), reserved once with `with_capacity` for the most
+  rules a request can count, so steady state is allocation-free.
+- The per-request caps are settings in `gabion::settings`, with their
+  defaults in `gabion::defaults`; both adapters read them from there.
+  Giving one adapter a cap the other lacks is a bug.
 - The CRDT `CellStore` allocates only at construction. Every later
-  mutation reuses pre-sized columns, dictionaries, dirty rings, and the
-  freelist; if you find yourself adding a `push` that may grow, redesign
-  around a bounded structure.
+  mutation reuses pre-sized columns, dictionaries, and the freelist; if
+  you find yourself adding a `push` that may grow, redesign around a
+  bounded structure.
 
 ## Minimize copies
 
@@ -184,7 +192,7 @@ yes, do that instead of adding a flag.
 
 Public functions that can fail return `Result<_, E>` with a `thiserror`
 enum tailored to the call site (`ServeError`, `ConfigError`,
-`GossipError`, `EncodeError`, etc.). Errors carry context, not a
+`GossipError`, `DecodeError`, etc.). Errors carry context, not a
 stringified original. Internal infallible code returns plain values —
 don't wrap success-only paths in `Result` for symmetry.
 
