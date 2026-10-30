@@ -1458,6 +1458,45 @@ fn held_time_does_not_count_toward_suspicion() {
     });
 }
 
+/// A probe the kernel refused again and again still asks for an answer once
+/// it leaves: a gateway that acked everything during the hold is awaited
+/// again from the release.
+#[test]
+fn held_probe_starts_its_wait_when_it_leaves() {
+    run_paused(async {
+        let g = sock(3);
+        let wire = Rc::new(Wire::default());
+        let (client, admin) = scripted(&wire, vec![g], "a", |_| {}).await;
+        introduce(&wire, &[(g, node(0xC), "b")]);
+        heartbeats(1).await;
+        hit(&client, 1).await;
+        heartbeats(1).await;
+        wire.refuse.set(true);
+        let mark = wire.attempts.borrow().len();
+        heartbeats(4).await;
+        let probe = (g, Payload::Ack { probe: true });
+        let tries = sent_payloads(&wire, mark);
+        assert!(
+            tries.len() > 1 && tries.iter().all(|t| *t == probe),
+            "{tries:?}"
+        );
+        let acks = AckInfo {
+            incarnation: 1,
+            own: wire::OwnAck::Flagged(1),
+            ..AckInfo::default()
+        };
+        let ack = Payload::Ack { probe: false };
+        inject_zoned(&wire, g, node(0xC), Some(zone("b")), acks, ack);
+        wake(&wire);
+        sim_advance_ticks(Duration::from_millis(1), 6).await;
+        let gateway = async |admin| *admin_snapshot(admin).await.peers.first().unwrap();
+        assert_eq!(gateway(&admin).await.answer, AnswerState::Settled);
+        wire.refuse.set(false);
+        heartbeats(2).await;
+        assert_eq!(gateway(&admin).await.answer, AnswerState::Owed);
+    });
+}
+
 /// A suspect that receives no stream, the gateway it replaced after a
 /// failover, is settled by a probe answer only for this node's incarnation,
 /// and is then the gateway again.
@@ -1975,7 +2014,8 @@ fn handoff_with_first_rewound_packet_lost_ends_exact() {
 
 /// A node alone in its zone asks one peer of any zone for a join sweep, the
 /// highest-weight one, and runs only heartbeats, both while it waits for that
-/// page and once it arrives.
+/// page and once it arrives. The request starts no wait, even held by a
+/// refusal and sent later, so a peer slow to page is never awaited.
 #[test]
 fn node_alone_in_its_zone_asks_one_peer_of_any_zone() {
     run_paused(async {
@@ -1986,7 +2026,9 @@ fn node_alone_in_its_zone_asks_one_peer_of_any_zone() {
         for (addr, id) in [(a, node(0xB)), (b, node(0xC))] {
             inject_zoned(&wire, addr, id, Some(zone("a")), AckInfo::default(), ack);
         }
+        wire.refuse.set(true);
         heartbeats(1).await;
+        wire.refuse.set(false);
         let requests = |from| {
             sent_payloads(&wire, from)
                 .into_iter()
@@ -1999,9 +2041,19 @@ fn node_alone_in_its_zone_asks_one_peer_of_any_zone() {
             .into_iter()
             .max_by_key(|&addr| rendezvous_weight(key, addr))
             .unwrap();
-        assert_eq!(requests(0), [top]);
+        // The one request, held by the refusal and tried again each round.
+        let held = requests(0);
+        assert!(
+            held.len() > 1 && held.iter().all(|&dst| dst == top),
+            "{held:?}"
+        );
         let before = admin_snapshot(&admin).await.counters;
         heartbeats(3).await;
+        let peers = admin_snapshot(&admin).await.peers;
+        assert!(
+            peers.iter().all(|p| p.answer == AnswerState::Settled),
+            "{peers:?}"
+        );
         let id = if top == a { node(0xB) } else { node(0xC) };
         let page = CellPayload::Sweep.into();
         inject_zoned(&wire, top, id, Some(zone("a")), AckInfo::default(), page);
