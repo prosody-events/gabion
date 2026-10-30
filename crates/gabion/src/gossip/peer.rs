@@ -927,12 +927,12 @@ impl PeerTable {
         }
     }
 
-    /// A packet to `row` went to the socket. One that asks for an answer and
-    /// left this node starts the wait, unless one is running; a held packet
-    /// starts nothing until it leaves.
-    pub(super) fn note_send(&mut self, row: usize, sent: Sent, asks: bool, now: u64) {
+    /// A packet to `row` went to the socket. One that starts a wait and left
+    /// this node starts it, unless one is running; a held packet starts
+    /// nothing until it leaves.
+    pub(super) fn note_send(&mut self, row: usize, sent: Sent, now: u64) {
         let answer = &mut self.link[row].answer;
-        if asks && sent.left && *answer == Answer::Settled {
+        if sent.waits && *answer == Answer::Settled {
             *answer = Answer::Owed { since_ms: now };
             self.refresh_deadline(row);
         }

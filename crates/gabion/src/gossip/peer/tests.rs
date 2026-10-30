@@ -460,9 +460,8 @@ fn incarnation_change_resets_the_whole_row() {
         0,
         Sent {
             bytes: 1,
-            left: true,
+            waits: true,
         },
-        true,
         1_000,
     );
     for bits in [PeerFlags::REPLY_DUE, PeerFlags::RESEND_OWN] {
@@ -697,10 +696,10 @@ fn role_refresh_equals_brute_force(case: RefreshCase) {
 /// One event on a row's answer state.
 #[derive(Clone, Copy, Debug)]
 enum AnswerOp {
-    /// A send that asks or not, left or held.
+    /// A send that starts a wait or not: one that asks for no answer, or
+    /// is held, starts none.
     Send {
-        asks: bool,
-        left: bool,
+        waits: bool,
     },
     /// Data goes out on one stream: it is owed while the role receives it.
     Data(Stream),
@@ -725,8 +724,7 @@ impl Arbitrary for AnswerOp {
     fn arbitrary(g: &mut Gen) -> Self {
         match u8::arbitrary(g) % 10 {
             0 => Self::Send {
-                asks: bool::arbitrary(g),
-                left: bool::arbitrary(g),
+                waits: bool::arbitrary(g),
             },
             1 => Self::Data(*g.choose(&[Stream::Own, Stream::Relay]).unwrap()),
             2 | 3 => Self::Ack {
@@ -800,9 +798,9 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                 }
             };
             match *op {
-                AnswerOp::Send { asks, left } => {
-                    table.note_send(0, Sent { bytes: 0, left }, asks, now);
-                    if asks && left && model == Answer::Settled {
+                AnswerOp::Send { waits } => {
+                    table.note_send(0, Sent { bytes: 0, waits }, now);
+                    if waits && model == Answer::Settled {
                         model = Answer::Owed { since_ms: now };
                     }
                 }
@@ -813,9 +811,8 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                         0,
                         Sent {
                             bytes: 1,
-                            left: true,
+                            waits: true,
                         },
-                        true,
                         now,
                     );
                     if model == Answer::Settled {
@@ -904,19 +901,23 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
     }
 }
 
-/// An own-stream ack counts on a `Zone` row only plain and on a `Gateway`
-/// row only flagged, and a `GAP_OWN` report rewinds a forgotten stream only
-/// when its kind matches the role; becoming the gateway rewinds the own
-/// stream to 0.
+/// An own-stream ack counts on an `Unheard` or `Zone` row only plain and on
+/// a `Gateway` row only flagged, and a `GAP_OWN` report rewinds a forgotten
+/// stream only when its kind matches the role; becoming the gateway rewinds
+/// the own stream to 0. A peer's first packet is credited before the roles
+/// refresh, so its row is still `Unheard` then.
 #[test]
 fn own_acks_count_only_in_the_kind_the_role_receives() {
     for (role, counted, ignored) in [
+        (Role::Unheard, OwnAck::Plain(3), OwnAck::Flagged(3)),
         (Role::Zone, OwnAck::Plain(3), OwnAck::Flagged(3)),
         (Role::Gateway, OwnAck::Flagged(3), OwnAck::Plain(3)),
     ] {
-        let mut table = one_row();
+        let mut table = table();
+        table.insert(addr(0), 0);
         table.contact(0, NodeIdentity::new(NodeId(9), 1), None);
         table.apply_role(0, role);
+        assert_eq!(table.role(0), role);
         table.tx(0, Stream::Own).note_sent(5, 1_000);
         let acks = |own, gap_own| AckInfo {
             incarnation: 7,
@@ -1014,9 +1015,8 @@ fn deadline_holds_the_relay_and_suspicion_timers() {
         0,
         Sent {
             bytes: 1,
-            left: true,
+            waits: true,
         },
-        true,
         1_000,
     );
     table.tx(0, Stream::Own).restart(1_000 + SUSPECT_AFTER);
@@ -1037,9 +1037,9 @@ fn late_heartbeat_judges_no_row_twice() {
     table.tx(0, Stream::Relay).note_sent(2, 1_000);
     let sent = Sent {
         bytes: 1,
-        left: true,
+        waits: true,
     };
-    table.note_send(0, sent, true, 1_000);
+    table.note_send(0, sent, 1_000);
     let mut stalls = 0;
     for now in [
         1_001 + SUSPECT_AFTER,

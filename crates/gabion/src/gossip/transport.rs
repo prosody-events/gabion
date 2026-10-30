@@ -19,7 +19,7 @@ use super::ValidGossipConfig;
 use super::admin::GossipCounters;
 use crate::settings::Setting;
 use crate::throttle;
-use crate::wire::{Header, PacketBuf, Packets, Payload};
+use crate::wire::{CellPayload, Header, PacketBuf, Packets, Payload};
 
 /// Bidirectional datagram transport. The runtime borrows `&self.transport`
 /// (not `&mut`) on every arm so disjoint-field borrows compose cleanly inside
@@ -81,23 +81,52 @@ pub trait GossipTransport {
     }
 }
 
+/// A payload this node sends, and whether its packet starts a wait for an
+/// answer once it leaves: by default exactly when it asks for one.
+pub(super) trait Outgoing: Copy + Into<Payload> {
+    fn starts_wait(self) -> bool {
+        self.into().asks_answer()
+    }
+}
+
+impl Outgoing for Payload {}
+
+impl Outgoing for CellPayload {}
+
+/// The `PROBE` a peer not yet heard from is greeted with: its answer names
+/// the peer's zone at once, but nothing waits on it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Greeting;
+
+impl From<Greeting> for Payload {
+    fn from(_: Greeting) -> Self {
+        Self::Ack { probe: true }
+    }
+}
+
+impl Outgoing for Greeting {
+    fn starts_wait(self) -> bool {
+        false
+    }
+}
+
 /// A packet the kernel refused: where it goes, when it was refused, and
 /// whether it starts a wait for an answer once it leaves.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Held {
     pub(super) dst: SocketAddr,
     pub(super) since_ms: u64,
-    pub(super) asks: bool,
+    asks: bool,
 }
 
-/// What a send did: the bytes the socket accepted, and whether any packet
-/// left this node, accepted or failed with an error other than
+/// What a send did: the bytes the socket accepted, and whether a packet that
+/// starts a wait left this node, accepted or failed with an error other than
 /// back-pressure; the addressee can answer neither a refused packet nor,
 /// until it is retried, a held one.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Sent {
     pub(super) bytes: u64,
-    pub(super) left: bool,
+    pub(super) waits: bool,
 }
 
 /// The one send buffer. A packet the kernel refuses stays in it, with its
@@ -127,7 +156,6 @@ impl Outbox {
     /// is encoded and stopping at the first the kernel refuses. Returns the
     /// stream position the packets that left (or are held) close through;
     /// the cells above it stay above the peer's `sent` and go next round.
-    /// Stream packets ask for an answer.
     pub(super) fn send_frame<T: GossipTransport>(
         &mut self,
         mut packets: Packets<'_>,
@@ -137,30 +165,29 @@ impl Outbox {
         counters: &mut GossipCounters,
     ) -> (u64, Sent) {
         let mut total = Sent::default();
+        let asks = packets.payload().starts_wait();
         while self.held.is_none() && packets.next_into(&mut self.packet).is_some() {
-            let sent = self.send(dst, now, true, transport, counters);
+            let sent = self.send(dst, now, asks, transport, counters);
             total = Sent {
                 bytes: total.bytes + sent.bytes,
-                left: total.left || sent.left,
+                waits: total.waits || sent.waits,
             };
         }
         (packets.closed_through(), total)
     }
 
-    /// Send a packet of `header` alone, which starts a wait for an answer
-    /// once it leaves iff `asks`. Call it only while nothing is held.
-    pub(super) fn send_header<T: GossipTransport, P: Copy + Into<Payload>>(
+    /// Send a packet of `header` alone. Call it only while nothing is held.
+    pub(super) fn send_header<T: GossipTransport, P: Outgoing>(
         &mut self,
         header: &Header<P>,
         dst: SocketAddr,
         now: u64,
-        asks: bool,
         transport: &T,
         counters: &mut GossipCounters,
     ) -> Sent {
         debug_assert!(self.held.is_none(), "a held packet is never overwritten");
         self.packet.header_only(header);
-        self.send(dst, now, asks, transport, counters)
+        self.send(dst, now, header.payload.starts_wait(), transport, counters)
     }
 
     /// Send the held packet, if any; a refusal holds it again, still dated
@@ -191,7 +218,7 @@ impl Outbox {
                 counters.bytes_sent += bytes as u64;
                 Sent {
                     bytes: bytes as u64,
-                    left: true,
+                    waits: asks,
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -244,7 +271,7 @@ impl Outbox {
                 }
                 Sent {
                     bytes: 0,
-                    left: true,
+                    waits: asks,
                 }
             }
         }

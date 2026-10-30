@@ -1420,6 +1420,61 @@ fn greeting_starts_no_wait() {
     });
 }
 
+/// A sweep page held by a refusal and sent later starts no wait, empty or
+/// not, just as one sent at once does: no requester answers a page.
+#[test]
+fn held_sweep_page_starts_no_wait() {
+    run_paused(async {
+        let (g1, g2) = (sock(2), sock(3));
+        let wire = Rc::new(Wire::default());
+        let (client, admin) = scripted(&wire, vec![g1, g2], "a", |_| {}).await;
+        introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
+        heartbeats(1).await;
+        let peers = admin_snapshot(&admin).await.peers;
+        let remote = peers.iter().find(|p| p.role == Role::Remote).unwrap().addr;
+        let (gateway, gateway_id, remote_id) = if remote == g1 {
+            (g2, node(0xC), node(0xB))
+        } else {
+            (g1, node(0xB), node(0xC))
+        };
+        for cells in [0, 1] {
+            if cells > 0 {
+                hit(&client, 1).await;
+                heartbeats(1).await;
+                let acked = AckInfo {
+                    incarnation: 1,
+                    own: wire::OwnAck::Flagged(1),
+                    ..AckInfo::default()
+                };
+                let ack = Payload::Ack { probe: false };
+                inject_zoned(&wire, gateway, gateway_id, Some(zone("b")), acked, ack);
+                heartbeats(1).await;
+            }
+            let request = Payload::SweepRequest;
+            inject_zoned(
+                &wire,
+                remote,
+                remote_id,
+                Some(zone("b")),
+                AckInfo::default(),
+                request,
+            );
+            wire.refuse.set(true);
+            let mark = wire.attempts.borrow().len();
+            wake(&wire);
+            sim_advance_ticks(Duration::from_millis(1), 50).await;
+            let held = sent_payloads(&wire, mark);
+            let page = Payload::Cells(CellPayload::Sweep);
+            assert_eq!(held.first(), Some(&(remote, page)), "{cells}: {held:?}");
+            wire.refuse.set(false);
+            heartbeats(3).await;
+            let peers = admin_snapshot(&admin).await.peers;
+            let peer = peers.iter().find(|p| p.addr == remote).unwrap();
+            assert_eq!(peer.answer, AnswerState::Settled, "{cells}");
+        }
+    });
+}
+
 /// While the kernel refuses sends no peer can answer, so the gateway is not
 /// judged during the hold, and the wait it shows after the release counts
 /// only the time before the hold.
@@ -1923,7 +1978,10 @@ fn gateway_behind_send_errors_fails_over() {
             introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
             heartbeats(1).await;
             let peers = admin_snapshot(&admin).await.peers;
-            let gateway = peers.iter().find(|p| p.role == Role::Gateway).unwrap().addr;
+            let gateway = peers.iter().find(|p| p.role == Role::Gateway).unwrap();
+            // Nothing awaits it yet: only the failed sends below are owed.
+            assert_eq!(gateway.answer, AnswerState::Settled);
+            let gateway = gateway.addr;
             let next = if gateway == g1 { g2 } else { g1 };
             wire.forbidden.set(Some(gateway));
             hit(&client, 1).await;

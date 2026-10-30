@@ -48,7 +48,7 @@ use super::store::AggregateStore;
 use super::sweep::{Accept, Sweep, SweepWant, Sweeps};
 #[cfg(feature = "transport-udp")]
 use super::transport::UdpTransport;
-use super::transport::{GossipTransport, Outbox, Sent};
+use super::transport::{GossipTransport, Greeting, Outbox, Outgoing, Sent};
 use super::{GossipError, ValidGossipConfig};
 
 /// A round's kind, ordered by strength: a cut round resumes as the strongest
@@ -815,7 +815,7 @@ where
             self.peers
                 .shift_owed(now.saturating_sub(held.since_ms), now);
             if let Some(row) = self.peers.find(held.dst) {
-                self.account(row, sent, held.asks, now);
+                self.account(row, sent, now);
             }
         }
         if self.outbox.is_held() {
@@ -961,23 +961,17 @@ where
         }
         // Data asks for an answer too, so only a probing row is probed beside
         // it, and a greeting rides it.
-        let asks = probe_only && (probing || !sent_any);
-        let probe = asks || (hello && !sent_any);
+        let probe = probe_only && (probing || !sent_any);
+        let greet = hello && !sent_any && !probe;
         let ack_due = kind == Round::Heartbeat && flags.has(PeerFlags::ACK_DUE);
         let owed = gaps.any() || ack_due || flags.has(PeerFlags::REPLY_DUE);
-        if !self.outbox.is_held() && (probe || (!sent_any && owed)) {
-            let header = self.header_for(row, gaps, Payload::Ack { probe });
-            let dst = self.peers.addr(row);
-            let sent = (self.outbox).send_header(
-                &header,
-                dst,
-                now,
-                asks,
-                &self.transport,
-                &mut self.counters,
-            );
-            self.account(row, sent, asks, now);
-            self.counters.liveness_probes += u64::from(probe);
+        if !self.outbox.is_held() && (probe || greet || (!sent_any && owed)) {
+            if greet {
+                self.send_alone(row, gaps, Greeting, now);
+            } else {
+                self.send_alone(row, gaps, Payload::Ack { probe }, now);
+            }
+            self.counters.liveness_probes += u64::from(probe || greet);
             sent_any = true;
         }
         if sent_any {
@@ -1036,7 +1030,7 @@ where
         let (closed, sent) = self.send_cells(stream, header, self.peers.addr(row), now);
         let closed = closed.unwrap_or(upper);
         self.peers.tx(row, stream).note_sent(closed, now);
-        self.account(row, sent, true, now);
+        self.account(row, sent, now);
         Some(closed)
     }
 
@@ -1052,14 +1046,8 @@ where
     ) -> (Option<u64>, Sent) {
         let handles = &self.frames[stream].handles;
         if handles.is_empty() {
-            let sent = (self.outbox).send_header(
-                &header,
-                dst,
-                now,
-                true,
-                &self.transport,
-                &mut self.counters,
-            );
+            let sent =
+                (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
             return (None, sent);
         }
         let packets = Packets::new(
@@ -1082,13 +1070,22 @@ where
         }
     }
 
+    /// Send `row` a packet of `payload` alone, and count it.
+    fn send_alone<P: Outgoing>(&mut self, row: usize, gaps: PerStream<bool>, payload: P, now: u64) {
+        let header = self.header_for(row, gaps, payload);
+        let dst = self.peers.addr(row);
+        let sent =
+            (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
+        self.account(row, sent, now);
+    }
+
     /// Count a send to `row`: its bytes when the peer is in another known
     /// zone, and the wait for an answer it may start.
-    fn account(&mut self, row: usize, sent: Sent, asks: bool, now: u64) {
+    fn account(&mut self, row: usize, sent: Sent, now: u64) {
         if matches!(self.peers.role(row), Role::Gateway | Role::Remote) {
             self.counters.bytes_sent_cross_zone += sent.bytes;
         }
-        self.peers.note_send(row, sent, asks, now);
+        self.peers.note_send(row, sent, now);
     }
 
     /// A header to `row`, carrying this node's zone, its acks for the peer's
@@ -1170,16 +1167,7 @@ where
             let Some(row) = self.peers.find(ask.addr) else {
                 continue;
             };
-            let header = self.header_for(row, PerStream::default(), Payload::SweepRequest);
-            let sent = (self.outbox).send_header(
-                &header,
-                ask.addr,
-                now,
-                false,
-                &self.transport,
-                &mut self.counters,
-            );
-            self.account(row, sent, false, now);
+            self.send_alone(row, PerStream::default(), Payload::SweepRequest, now);
             ask.tries += 1;
             self.counters.sweeps_requested += 1;
         }
@@ -1251,7 +1239,7 @@ where
             // A store with no live cell still answers with one empty page.
             let header = self.header_for(row, PerStream::default(), CellPayload::Sweep);
             let (_, sent) = self.send_cells(Stream::Own, header, dst, now);
-            self.account(row, sent, false, now);
+            self.account(row, sent, now);
             if self.outbox.is_held() {
                 return;
             }

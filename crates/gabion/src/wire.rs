@@ -204,6 +204,11 @@ impl<'a> Packets<'a> {
         }
     }
 
+    /// The payload every packet carries, its range aside.
+    pub(crate) fn payload(&self) -> CellPayload {
+        self.header.payload
+    }
+
     /// The stream position the packets encoded so far close through.
     pub(crate) fn closed_through(&self) -> u64 {
         self.lower
