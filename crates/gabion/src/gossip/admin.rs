@@ -115,7 +115,9 @@ pub struct GossipCounters {
     pub relay_stalls: u64,
     /// Rows whose role changed.
     pub role_changes: u64,
-    /// Header-only probes sent: to an idle gateway, or as a suspect's retry.
+    /// Header-only probes sent: retries to a suspect or to a gateway that has
+    /// acked nothing yet, and greetings to peers not yet heard from that no
+    /// data carries.
     pub liveness_probes: u64,
     /// Gap reports sent: a peer's stream skipped positions.
     pub gap_reports_sent: u64,
@@ -201,6 +203,7 @@ pub enum AnswerState {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RoleCounts {
+    pub unheard: u32,
     pub zone: u32,
     pub gateway: u32,
     pub remote: u32,

@@ -18,7 +18,8 @@
 //!   cannot relay, then recovers: each prompt round re-ranks every row and
 //!   changes no role.
 //! * `sweep/page`             — a prompt round sending a running join sweep its
-//!   next 256-cell page; the requester asks again once it ends.
+//!   next page of `q` cells (1,024 at the default store); the requester asks
+//!   again once it ends.
 //! * `inbound/zone_peer`      — a fresh 2-cell own-stream packet from each zone
 //!   peer in turn, from bytes to delta rows.
 //! * `inbound/relay_fresh`    — the same from each cross-zone peer, flagged for

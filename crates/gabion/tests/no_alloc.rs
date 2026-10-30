@@ -3,8 +3,8 @@
 //! own-stream packets, acks, threshold and heartbeat rounds and a batched
 //! expiry of more than one sink's worth of cells; A's gateway G relays A's
 //! cells to the other member M. Every tenth datagram A sends G is lost, so
-//! gap reports, timeout resends and prompt rounds run too; a quiet spell
-//! brings liveness probes, and a cut from A to G fails A over to M and back.
+//! gap reports, timeout resends and prompt rounds run too, and a cut from A
+//! to G brings header-only probes and fails A over to M and back.
 //! A counting global allocator, armed on this thread for the whole window,
 //! counts every allocation any of them makes.
 //!
@@ -305,8 +305,7 @@ fn steady_state_gossip_never_allocates() {
         // threshold round whose flagged packet G acks and relays to M; ten
         // heartbeats a second; at 1,100 ms, the expiry of bucket 0's 5,000
         // cells; from hit 400 to hit 800 A cannot reach G, so A fails over
-        // to M with a full rewind and back once G answers; then a quiet
-        // spell of liveness probes.
+        // to M with a full rewind and back once G answers.
         COUNTING.set(true);
         for i in 0..1_000_u128 {
             let key = if i % 20 == 0 {

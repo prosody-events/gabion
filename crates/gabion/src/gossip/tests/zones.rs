@@ -165,6 +165,7 @@ fn three_zones_send_direct_in_zone_and_one_gateway_each() {
         run_for(1_000).await;
         let roles = nodes[0].snapshot().await.peers_by_role;
         let expected = RoleCounts {
+            unheard: 0,
             zone: 3,
             gateway: 2,
             remote: 6,
@@ -189,32 +190,6 @@ fn three_zones_send_direct_in_zone_and_one_gateway_each() {
             assert!(own.iter().any(|(to, ..)| to == dst), "nothing to {dst}");
         }
         stop_all(nodes).await;
-    });
-}
-
-/// A peer whose zone this node has not heard is sent everything directly.
-#[test]
-fn peer_with_unknown_zone_gets_direct_mail() {
-    run_paused(async {
-        let router = SimRouter::new();
-        let addrs = addrs(47_100, 2);
-        router.set_link_policy(addrs[1], addrs[0], LinkPolicy::Block);
-        let zones = ["a", "b"];
-        let (origin, taps) = tapped_node(&router, &addrs, &zones, 0, |_| {});
-        let peer = zoned_node(&router, &addrs, &zones, 1);
-        run_for(300).await;
-        let mark = taps.borrow().len();
-        hit(&origin.client, 1).await;
-        run_for(200).await;
-        assert_eq!(origin.peer(addrs[1]).await.zone, PeerZone::Unknown);
-        let own = own_packets(&tapped(&taps, mark));
-        assert!(!own.is_empty());
-        assert!(
-            own.iter().all(|&packet| packet == (addrs[1], 0, false)),
-            "{own:?}"
-        );
-        assert_eq!(peer.agg.total(), 1);
-        stop_all(vec![origin, peer]).await;
     });
 }
 
@@ -466,9 +441,10 @@ fn late_zone_rewinds_the_new_recipient() {
 }
 
 /// A joiner that outranks the gateway is sent the origin's whole live own
-/// stream flagged once its zone is heard, although it already holds and has
-/// acked the cells, sent directly while its zone was unknown, and relays them
-/// to members that never got them.
+/// stream flagged once its zone is heard, on its first packet after it learns
+/// it, although it already holds and has acked the cells, sent directly
+/// while its zone was unknown, and relays them to members that never got
+/// them.
 #[test]
 fn joiner_that_outranks_the_gateway_relays_lost_cells() {
     run_paused(async {
@@ -496,11 +472,13 @@ fn joiner_that_outranks_the_gateway_relays_lost_cells() {
         assert_eq!(nodes[3].agg.total(), 10);
         assert_eq!(nodes[0].peer(joiner).await.own_unacked, 0);
         nodes[3].tell(PeerEvent::OwnEntry { zone: zone("b") });
+        run_for(1).await;
+        nodes[3].hits(10..11).await;
         run_for(300).await;
         assert_eq!(gateway_of(&nodes[0], "b").await, joiner);
         run_for(700).await;
         for node in &nodes[1..] {
-            assert_eq!(node.agg.total(), 10, "{}", node.addr);
+            assert_eq!(node.agg.total(), 11, "{}", node.addr);
         }
         stop_all(nodes).await;
     });
@@ -563,10 +541,12 @@ fn transient_suspicion_clears() {
     });
 }
 
-/// An origin that went quiet probes its gateway every heartbeat, so the
-/// gateway's death still fails it over within `T_u + 2·F_r` of the first
-/// probe, and the next member gets its live cells. The gateway is cut from its
-/// zone too, so only the failover brings that member the origin's cell.
+/// An idle origin sends its gateway nothing, not even a probe, so a gateway
+/// that dies while it is idle goes unnoticed until the origin's next change.
+/// That change fails it over within `suspect_after` plus a heartbeat and two
+/// relay floors, and the next member gets every live cell. The gateway is cut
+/// from its zone too, so only the failover brings that member the origin's
+/// cells.
 #[test]
 fn idle_origin_replaces_a_dead_gateway() {
     run_paused(async {
@@ -574,29 +554,36 @@ fn idle_origin_replaces_a_dead_gateway() {
         let addrs = addrs(47_900, 3);
         let zones = ["a", "b", "b"];
         let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
-        let nodes: Vec<_> = (0..3)
-            .map(|i| zoned_node_with(&router, &addrs, &zones, i, tune))
-            .collect();
+        let (origin, taps) = tapped_node(&router, &addrs, &zones, 0, tune);
+        let mut nodes = vec![origin];
+        nodes.extend((1..3).map(|i| zoned_node_with(&router, &addrs, &zones, i, tune)));
         run_for(1_000).await;
         let gateway = gateway_of(&nodes[0], "b").await;
         let m = if gateway == addrs[1] { 2 } else { 1 };
         router.set_link_policy(gateway, addrs[m], LinkPolicy::Block);
         hit(&nodes[0].client, 1).await;
-        // Just after an answered probe, so the next is a heartbeat away.
-        run_for(301).await;
+        run_for(300).await;
         assert_eq!(nodes[0].peer(gateway).await.own_unacked, 0);
         cut(&router, gateway, addrs[0], true);
+        let mark = taps.borrow().len();
+        run_for(2 * 400).await;
+        // Every peer of the origin is in zone b.
+        let idle = tapped(&taps, mark);
+        assert!(idle.is_empty(), "{idle:?}");
+        assert_eq!(gateway_of(&nodes[0], "b").await, gateway);
+        hit(&nodes[0].client, 2).await;
         const BOUND: u64 = 100 + 400 + 2 * 5;
         let mut replaced = None;
-        for t in 0..BOUND + 1 {
+        for t in 1..=BOUND {
             run_for(1).await;
             if replaced.is_none() && gateway_of(&nodes[0], "b").await != gateway {
                 replaced = Some(t);
             }
         }
         let replaced = replaced.expect("a failover");
-        assert!((400..=BOUND).contains(&replaced), "{replaced}");
-        assert_eq!(nodes[m].agg.total(), 1);
+        assert!(replaced >= 400, "{replaced}");
+        run_for(2 * 5).await;
+        assert_eq!(nodes[m].agg.total(), 2);
         stop_all(nodes).await;
     });
 }
@@ -720,73 +707,63 @@ fn gateway_that_forgot_the_stream_is_resynced() {
 }
 
 /// O cannot reach its gateway G, which still reaches O: G's packets repeat
-/// the stuck flagged ack of O's hit before the cut, so O fails over once and
-/// stays failed over while the cut lasts, and the other member holds O's hits.
+/// the stuck flagged ack of O's hit before the cut. O fails over once, on its
+/// first change after the cut, within `suspect_after` plus a heartbeat and two
+/// relay floors, and stays failed over while the cut lasts; the other member
+/// holds O's hits. An idle O asks G nothing while the cut lasts (it still
+/// acks G's cells), so it keeps G until that change.
 #[test]
 fn one_way_cut_to_gateway_fails_over_once() {
-    run_paused(async {
-        let router = SimRouter::new();
-        let addrs = addrs(48_200, 3);
-        let zones = ["a", "b", "b"];
-        let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
-        let nodes: Vec<_> = (0..3)
-            .map(|i| zoned_node_with(&router, &addrs, &zones, i, tune))
-            .collect();
-        run_for(1_000).await;
-        let gateway = gateway_of(&nodes[0], "b").await;
-        let (g, m) = if gateway == addrs[1] { (1, 2) } else { (2, 1) };
-        nodes[0].hits(3..4).await;
-        run_for(200).await;
-        assert_eq!(nodes[0].peer(gateway).await.own_unacked, 0);
-        router.set_link_policy(addrs[0], gateway, LinkPolicy::Block);
-        nodes[0].hits(0..3).await;
-        for t in 0..5 * 400 {
-            if t % 100 == 0 {
-                hit_at(&nodes[g], t).await;
+    for idle in [false, true] {
+        run_paused(async {
+            let router = SimRouter::new();
+            let addrs = addrs(48_200, 3);
+            let zones = ["a", "b", "b"];
+            let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
+            let (origin, taps) = tapped_node(&router, &addrs, &zones, 0, tune);
+            let mut nodes = vec![origin];
+            nodes.extend((1..3).map(|i| zoned_node_with(&router, &addrs, &zones, i, tune)));
+            run_for(1_000).await;
+            let gateway = gateway_of(&nodes[0], "b").await;
+            let (g, m) = if gateway == addrs[1] { (1, 2) } else { (2, 1) };
+            nodes[0].hits(3..4).await;
+            run_for(200).await;
+            assert_eq!(nodes[0].peer(gateway).await.own_unacked, 0);
+            router.set_link_policy(addrs[0], gateway, LinkPolicy::Block);
+            if idle {
+                let mark = taps.borrow().len();
+                for t in 0..2 * 400 {
+                    if t % 100 == 0 {
+                        hit_at(&nodes[g], t).await;
+                    }
+                    run_for(1).await;
+                }
+                let asked = tapped(&taps, mark)
+                    .iter()
+                    .any(|(dst, header)| *dst == gateway && header.payload.asks_answer());
+                assert!(!asked, "the idle origin asked its gateway for an answer");
+                assert_eq!(nodes[0].counters().await.gateway_failovers, 0);
             }
-            run_for(1).await;
-        }
-        assert_eq!(nodes[0].counters().await.gateway_failovers, 1);
-        assert_eq!(gateway_of(&nodes[0], "b").await, addrs[m]);
-        // O's three hits and G's, which reach both directly.
-        assert_eq!(nodes[m].agg.total(), nodes[0].agg.total());
-        stop_all(nodes).await;
-    });
-}
-
-/// A peer answers each `PROBE` within a relay floor, not at its next
-/// heartbeat a whole phase later; one lost answer fails nothing over.
-#[test]
-fn probe_answers_are_prompt() {
-    run_paused(async {
-        let router = SimRouter::new();
-        let addrs = addrs(48_300, 2);
-        let zones = ["a", "b"];
-        let (origin, o_taps) = tapped_node(&router, &addrs, &zones, 0, |_| {});
-        run_for(99).await;
-        let (gateway, g_taps) = tapped_node(&router, &addrs, &zones, 1, |_| {});
-        run_for(3_000).await;
-        router.set_link_policy(addrs[1], addrs[0], LinkPolicy::DropFirst { count: 1 });
-        run_for(3_000).await;
-        let times = |taps: &Taps, to: SocketAddr, pick: fn(&Header) -> bool| {
-            taps.borrow()
-                .iter()
-                .filter(|(_, dst, bytes)| *dst == to && pick(&header_of(bytes)))
-                .map(|(at, ..)| *at)
-                .collect::<Vec<_>>()
-        };
-        let probes = times(&o_taps, addrs[1], |h| {
-            h.payload == Payload::Ack { probe: true }
+            nodes[0].hits(0..3).await;
+            let mut switched = None;
+            for t in 0..5 * 400 {
+                if t % 100 == 0 {
+                    hit_at(&nodes[g], t).await;
+                }
+                run_for(1).await;
+                if switched.is_none() && gateway_of(&nodes[0], "b").await != gateway {
+                    switched = Some(t);
+                }
+            }
+            let switched = switched.expect("a failover");
+            assert!(switched <= 100 + 400 + 2 * 5, "{switched}");
+            assert_eq!(nodes[0].counters().await.gateway_failovers, 1);
+            assert_eq!(gateway_of(&nodes[0], "b").await, addrs[m]);
+            // O's three hits and G's, which reach both directly.
+            assert_eq!(nodes[m].agg.total(), nodes[0].agg.total());
+            stop_all(nodes).await;
         });
-        let answers = times(&g_taps, addrs[0], |h| h.acks.probe_reply);
-        assert!(probes.len() >= 50, "{}", probes.len());
-        assert_eq!(probes.len(), answers.len());
-        for (probe, answer) in probes.iter().zip(&answers) {
-            assert!(*answer - *probe <= Duration::from_millis(5 + 1));
-        }
-        assert_eq!(origin.counters().await.gateway_failovers, 0);
-        stop_all(vec![origin, gateway]).await;
-    });
+    }
 }
 
 /// Before suspicion a silent peer is resent the window with `PROBE` each
@@ -813,6 +790,10 @@ fn suspect_peer_gets_header_only_probes() {
                 .map(|i| zoned_node_with(&router, &addrs, &zones, i, tune))
                 .collect();
             run_for(1_000).await;
+            // A gateway that has acked a cell is resent, not probed, until
+            // it is suspect.
+            origin.hits(9..10).await;
+            run_for(300).await;
             let silent = addrs[1];
             cut(&router, addrs[0], silent, true);
             let mark = taps.borrow().len();
@@ -821,7 +802,7 @@ fn suspect_peer_gets_header_only_probes() {
             let before = tapped(&taps, mark);
             let retries = own_packets(&before)
                 .into_iter()
-                .filter(|&(dst, lower, _)| dst == silent && lower == 0)
+                .filter(|&(dst, lower, _)| dst == silent && lower == 1)
                 .count();
             assert!(retries >= 4, "{retries}");
             if gateway {
@@ -844,7 +825,7 @@ fn suspect_peer_gets_header_only_probes() {
             if gateway {
                 assert_eq!(gateway_of(&origin, "b").await, silent);
             } else {
-                assert_eq!(others[0].agg.total(), 3);
+                assert_eq!(others[0].agg.total(), 4);
             }
             let mut nodes = others;
             nodes.push(origin);
@@ -886,8 +867,8 @@ fn answer_just_inside_suspect_after_keeps_the_gateway() {
     }
 }
 
-/// A gateway cut from its zone says so until the cut heals, then stops, and
-/// the origin makes it its gateway again.
+/// A gateway cut from its zone says so to an origin that sends to it until
+/// the cut heals, then stops, and the origin makes it its gateway again.
 #[test]
 fn healed_gateway_clears_cannot_relay() {
     run_paused(async {
@@ -905,8 +886,12 @@ fn healed_gateway_clears_cannot_relay() {
         for &m in &members {
             router.set_link_policy(gateway, addrs[m], LinkPolicy::Block);
         }
-        nodes[0].hits(0..3).await;
-        run_for(2_500).await;
+        for t in 0..2_500 {
+            if t % 100 == 0 {
+                hit_at(&nodes[0], t).await;
+            }
+            run_for(1).await;
+        }
         assert_ne!(gateway_of(&nodes[0], "b").await, gateway);
         let flags: Vec<bool> = tapped(&taps[g], 0)
             .into_iter()
@@ -920,14 +905,15 @@ fn healed_gateway_clears_cannot_relay() {
         run_for(400 + 4 * 100 + 5).await;
         assert_eq!(gateway_of(&nodes[0], "b").await, gateway);
         for &m in &members {
-            assert_eq!(nodes[m].agg.total(), 3);
+            assert_eq!(nodes[m].agg.total(), 25);
         }
         stop_all(nodes).await;
     });
 }
 
-/// A failover rewinds the origin's whole live stream to the new gateway,
-/// which holds every cell after at most 21 prompt rounds, a quantum each.
+/// A failover, on the origin's first change after its gateway dies, rewinds
+/// the origin's whole live stream to the new gateway, which holds every cell
+/// after at most 21 prompt rounds, a quantum each.
 #[test]
 fn failover_drains_a_full_store_on_prompt_rounds() {
     run_paused(async {
@@ -956,18 +942,19 @@ fn failover_drains_a_full_store_on_prompt_rounds() {
         nodes[0].hits(0..CELLS).await;
         run_for(1_000).await;
         cut(&router, addrs[0], gateway, true);
+        hit(&nodes[0].client, CELLS).await;
         let mut before = None;
         for _ in 0..3_000 {
             run_for(1).await;
             if before.is_none() && gateway_of(&nodes[0], "b").await == addrs[next] {
                 before = Some(nodes[0].counters().await.rounds_prompt);
             }
-            if before.is_some() && nodes[next].agg.total() == CELLS as u64 {
+            if before.is_some() && nodes[next].agg.total() == CELLS as u64 + 1 {
                 break;
             }
         }
         let before = before.expect("a failover");
-        assert_eq!(nodes[next].agg.total(), CELLS as u64);
+        assert_eq!(nodes[next].agg.total(), CELLS as u64 + 1);
         let rounds = nodes[0].counters().await.rounds_prompt - before;
         assert!(rounds <= 21, "{rounds} prompt rounds");
         stop_all(nodes).await;
@@ -1007,6 +994,121 @@ fn late_own_zone_under_loss_ends_exact() {
         assert_totals(&nodes.iter().collect::<Vec<_>>(), 50);
         stop_all(nodes).await;
     });
+}
+
+/// A peer this node has not heard from is greeted with `PROBE` at once and
+/// then each heartbeat, on the new cells that heartbeat sends it or alone, and
+/// sent only the own cells raised since it was added: no relay stream and no
+/// rewind to 0. Once its packets name its zone,
+/// here this node's, it is a zone peer, sent both streams from 0.
+#[test]
+fn unheard_peer_gets_new_own_cells_and_greetings() {
+    run_paused(async {
+        let router = SimRouter::new();
+        // G, in zone b, ranks O above Z, so O relays G's cells into zone a.
+        let at_g = ranked(id(2, 1), 49_210, 2);
+        let (n, addrs) = (sock(49_200), vec![at_g[0], at_g[1], sock(49_201)]);
+        let zones = ["a", "a", "b"];
+        let (origin, taps) = tapped_node(&router, &addrs, &zones, 0, |_| {});
+        let mut nodes = vec![origin];
+        nodes.extend((1..3).map(|i| zoned_node(&router, &addrs, &zones, i)));
+        nodes[0].hits(0..3).await;
+        nodes[2].hits(10..13).await;
+        run_for(1_000).await;
+        let to = |dst: SocketAddr, from: usize| -> Vec<Payload> {
+            let sent = tapped(&taps, from).into_iter();
+            sent.filter(|(to, _)| *to == dst)
+                .map(|(_, h)| h.payload)
+                .collect()
+        };
+        let relay = |p: &Payload| matches!(p, Payload::Cells(CellPayload::Relay { .. }));
+        assert!(to(addrs[1], 0).iter().any(relay), "O relays G's cells");
+        let hello = Payload::Ack { probe: true };
+
+        let mark = taps.borrow().len();
+        let before = nodes[0].counters().await.rounds_heartbeat;
+        nodes[0].tell(PeerEvent::Added(Peer::new(n)));
+        run_for(300).await;
+        let beats = nodes[0].counters().await.rounds_heartbeat - before;
+        let sent = to(n, mark);
+        // The first greeting goes on the first round of any kind.
+        let greeted = sent.len() as u64;
+        let only_greetings = sent.iter().all(|p| *p == hello);
+        assert!(
+            only_greetings && (beats..=beats + 1).contains(&greeted),
+            "{sent:?}"
+        );
+
+        let mark = taps.borrow().len();
+        let before = nodes[0].counters().await.rounds_heartbeat;
+        nodes[0].hits(3..5).await;
+        nodes[2].hits(13..15).await;
+        run_for(150).await;
+        let beats = nodes[0].counters().await.rounds_heartbeat - before;
+        let sent = to(n, mark);
+        let new_own = |p: &Payload| {
+            matches!(p, Payload::Cells(CellPayload::Own { range, relay_into_zone: false, .. })
+                if range.lower() == 3)
+        };
+        let greets = |p: &&Payload| {
+            **p == hello || matches!(p, Payload::Cells(CellPayload::Own { probe: true, .. }))
+        };
+        assert_eq!(sent.iter().filter(greets).count() as u64, beats, "{sent:?}");
+        let only_new = sent.iter().all(|p| *p == hello || new_own(p));
+        assert!(sent.iter().any(new_own) && only_new, "{sent:?}");
+
+        let mark = taps.borrow().len();
+        let config = zoned_config(addrs.clone(), "a", |_| {});
+        nodes.push(Node::start(&router, n, store_for(id(3, 1)), config));
+        run_for(300).await;
+        let sent = to(n, mark);
+        let from_0 = |own: bool| {
+            sent.iter().any(|p| match p {
+                Payload::Cells(CellPayload::Own { range, .. }) => own && range.lower() == 0,
+                Payload::Cells(CellPayload::Relay { range, .. }) => !own && range.lower() == 0,
+                _ => false,
+            })
+        };
+        assert!(from_0(true) && from_0(false), "{sent:?}");
+        assert_totals(&nodes.iter().collect::<Vec<_>>(), 10);
+        stop_all(nodes).await;
+    });
+}
+
+/// A peer of another zone that the origin discovers late is first sent the
+/// origin's new cells unflagged, above the stream's start; it merges them but
+/// opens no gap, since the origin stops once it hears that peer's zone, so a
+/// healthy start abandons none.
+#[test]
+fn late_peer_of_another_zone_opens_no_gap() {
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let router = SimRouter::new();
+            let b = ranked(id(0, 1), 49_110, 2);
+            let addrs = [sock(49_100), b[0], b[1]];
+            let zones = ["a", "b", "b"];
+            let o_config = zoned_config(vec![b[0]], "a", |_| {});
+            let mut nodes = vec![Node::start(
+                &router,
+                addrs[0],
+                store_for(id(0, 1)),
+                o_config,
+            )];
+            nodes.extend((1..3).map(|i| zoned_node(&router, &addrs, &zones, i)));
+            nodes[0].hits(0..3).await;
+            run_for(500).await;
+            nodes[0].tell(PeerEvent::Added(Peer::new(b[1])));
+            run_for(1).await;
+            nodes[0].hits(3..5).await;
+            run_for(1_000).await;
+            for node in &nodes {
+                assert_eq!(node.counters().await.gaps_abandoned, 0, "{}", node.addr);
+            }
+            assert_totals(&nodes.iter().collect::<Vec<_>>(), 5);
+            stop_all(nodes).await;
+        })
+    });
+    assert_logged(&logs, "gap_abandoned", 0, &[]);
 }
 
 // -- scripted peers -----------------------------------------------------------
@@ -1112,9 +1214,10 @@ fn relayed_cells(wire: &Wire, to: SocketAddr, from: usize) -> usize {
         .sum()
 }
 
-/// A zone peer Z and a gateway G that never answer: each heartbeat resends
-/// the window with `PROBE` until they are suspect, then sends each one 86-byte
-/// probe and no old cell. A new cell still goes to a suspect at once, beside
+/// A zone peer Z and a gateway G that never answer: each heartbeat resends Z
+/// the window with `PROBE` until it is suspect, while G, a gateway that has
+/// acked nothing, gets only probes; once suspect, one 86-byte probe and no old
+/// cell. A new cell still goes to a suspect at once, beside
 /// that heartbeat's probe, and a probe answer from this incarnation brings the
 /// window back on the next prompt round, without `PROBE`.
 #[test]
@@ -1130,9 +1233,10 @@ fn suspect_retries_are_header_only_probes() {
             hit(&client, key).await;
         }
         let mark = wire.attempts.borrow().len();
-        // The frame at 200, then one packet a heartbeat through 1,000: the
-        // window resent with `PROBE` until suspect (G, probed idle at 100,
-        // turns suspect a heartbeat before Z), then probes alone.
+        // The frame at 200, then one packet a heartbeat through 1,000: Z is
+        // resent the window with `PROBE` until it turns suspect at 600, then
+        // probed alone; G, which has acked nothing since it became the
+        // gateway, is probed alone from its first retry.
         heartbeats(9).await;
         for (dst, flagged) in [(z, false), (g, true)] {
             let sent: Vec<_> = wire.attempts.borrow()[mark..]
@@ -1145,7 +1249,7 @@ fn suspect_retries_are_header_only_probes() {
                 .iter()
                 .position(|(_, p)| *p == Payload::Ack { probe: true })
                 .expect("probes");
-            assert!(probes >= 3, "{dst}: {sent:?}");
+            assert_eq!(probes, if flagged { 1 } else { 4 }, "{dst}: {sent:?}");
             for (i, (_, payload)) in sent[..probes].iter().enumerate() {
                 let resend = Payload::Cells(CellPayload::Own {
                     range: wire::StreamRange::new(0, 3).unwrap(),
@@ -1212,6 +1316,45 @@ fn suspect_retries_are_header_only_probes() {
     });
 }
 
+/// A gateway that has acked nothing since it took the role is retried with
+/// header-only probes from its first retry, not resent the window, and its
+/// first answer brings the window back on the next prompt round.
+#[test]
+fn new_gateway_is_probed_until_it_answers() {
+    run_paused(async {
+        let g = sock(3);
+        let wire = Rc::new(Wire::default());
+        let (client, _admin) = scripted(&wire, vec![g], "a", |_| {}).await;
+        introduce(&wire, &[(g, node(0xC), "b")]);
+        heartbeats(1).await;
+        hit(&client, 1).await;
+        let mark = wire.attempts.borrow().len();
+        heartbeats(3).await;
+        let window = Payload::Cells(CellPayload::Own {
+            range: wire::StreamRange::new(0, 1).unwrap(),
+            relay_into_zone: true,
+            probe: false,
+        });
+        let probe = Payload::Ack { probe: true };
+        assert_eq!(
+            sent_payloads(&wire, mark),
+            [(g, window), (g, probe), (g, probe)]
+        );
+        let mark = wire.attempts.borrow().len();
+        let answer = AckInfo {
+            incarnation: 1,
+            own: wire::OwnAck::Flagged(0),
+            probe_reply: true,
+            ..AckInfo::default()
+        };
+        let ack = Payload::Ack { probe: false };
+        inject_zoned(&wire, g, node(0xC), Some(zone("b")), answer, ack);
+        wake(&wire);
+        sim_advance_ticks(Duration::from_millis(1), 6).await;
+        assert_eq!(sent_payloads(&wire, mark), [(g, window)]);
+    });
+}
+
 /// A refused send to a suspect holds the row: the heartbeat that owes it a
 /// new cell and a probe beside it tries only the cell's packet, unchanged on
 /// every retry, and the probe waits for a later round after the release.
@@ -1264,7 +1407,7 @@ fn held_time_does_not_count_toward_suspicion() {
         introduce(&wire, &[(g, node(0xC), "b")]);
         heartbeats(1).await;
         hit(&client, 1).await;
-        // Owed since a probe or the flagged frame; the retry at 400 is held.
+        // Owed since the flagged frame at 200; the retry at 400 is held.
         heartbeats(1).await;
         sim_advance_ticks(Duration::from_millis(1), 150).await;
         wire.refuse.set(true);
@@ -1289,35 +1432,36 @@ fn held_time_does_not_count_toward_suspicion() {
     });
 }
 
-/// An idle gateway made `Owed` by a liveness probe is settled by a probe
-/// answer only for this node's incarnation.
+/// A suspect that receives no stream, the gateway it replaced after a
+/// failover, is settled by a probe answer only for this node's incarnation,
+/// and is then the gateway again.
 #[test]
 fn probe_answer_counts_only_for_this_incarnation() {
     run_paused(async {
-        let g = sock(3);
+        let (g1, g2) = (sock(2), sock(3));
         let wire = Rc::new(Wire::default());
-        let (_client, admin) = scripted(&wire, vec![g], "a", |_| {}).await;
-        introduce(&wire, &[(g, node(0xC), "b")]);
-        heartbeats(2).await;
-        let peer = admin_snapshot(&admin).await.peers[0];
-        assert_eq!((peer.role, peer.answer), (Role::Gateway, AnswerState::Owed));
-        for (incarnation, answer) in [(6, AnswerState::Owed), (1, AnswerState::Settled)] {
+        let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
+        let (client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+        hit(&client, 1).await;
+        introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
+        heartbeats(6).await;
+        let peers = admin_snapshot(&admin).await.peers;
+        let old = *peers.iter().find(|p| p.role == Role::Remote).unwrap();
+        assert_eq!(old.answer, AnswerState::Suspect);
+        let id = if old.addr == g1 { node(0xB) } else { node(0xC) };
+        for (incarnation, role) in [(6, Role::Remote), (1, Role::Gateway)] {
             let acks = AckInfo {
                 incarnation,
                 probe_reply: true,
                 ..AckInfo::default()
             };
-            inject_zoned(
-                &wire,
-                g,
-                node(0xC),
-                Some(zone("b")),
-                acks,
-                Payload::Ack { probe: false },
-            );
+            let ack = Payload::Ack { probe: false };
+            inject_zoned(&wire, old.addr, id, Some(zone("b")), acks, ack);
             wake(&wire);
-            sim_advance_ticks(Duration::from_millis(1), 2).await;
-            assert_eq!(admin_snapshot(&admin).await.peers[0].answer, answer);
+            sim_advance_ticks(Duration::from_millis(1), 6).await;
+            let peers = admin_snapshot(&admin).await.peers;
+            let now = peers.iter().find(|p| p.addr == old.addr).unwrap();
+            assert_eq!(now.role, role, "{incarnation}");
         }
     });
 }
@@ -1392,9 +1536,10 @@ fn cannot_relay_from_a_zone_row_is_ignored() {
     }
 }
 
-/// An idle gateway, `suspect_after` four heartbeats: it answers each
-/// probed retry within a millisecond and anything else at its own heartbeat,
-/// 50 ms after this node's, and the first `withheld` probes to it are lost.
+/// A gateway owed one cell, `suspect_after` four heartbeats: it answers each
+/// probe within a millisecond and data at its own heartbeat, 50 ms after this
+/// node's, acking that cell, and the first `withheld` packets to it that ask
+/// for an answer, the frame and its retries, are lost.
 /// Each heartbeat of this node, 10 ms past each 100 (`mocked` starts it 10 ms
 /// in), runs `late(at)` ms after the instant `at` it was scheduled for.
 /// Returns the failovers, and how long after the first lost probe the first
@@ -1403,10 +1548,11 @@ async fn lost_attempts(withheld: usize, late: impl Fn(u64) -> u64) -> (u64, Opti
     let (g1, g2) = (sock(2), sock(3));
     let wire = Rc::new(Wire::default());
     let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
-    let (_client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+    let (client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+    hit(&client, 1).await;
     introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
-    // Which member ranks first is known once they are heard; until then
-    // nothing is probed.
+    // Which member ranks first is known once they are heard; the frame goes
+    // at the first heartbeat after.
     let (mut seen, mut lost) = (0, 0);
     let mut gateway = None;
     let mut due: Vec<(u64, SocketAddr, NodeIdentity)> = Vec::new();
@@ -1433,7 +1579,7 @@ async fn lost_attempts(withheld: usize, late: impl Fn(u64) -> u64) -> (u64, Opti
             let header = header_of(&a.bytes);
             let probe = header.payload == Payload::Ack { probe: true };
             let peer = if a.dst == g1 { node(0xB) } else { node(0xC) };
-            if Some(a.dst) == gateway && probe && lost < withheld {
+            if Some(a.dst) == gateway && header.payload.asks_answer() && lost < withheld {
                 first_lost.get_or_insert(t);
                 lost += 1;
                 continue;
@@ -1448,6 +1594,7 @@ async fn lost_attempts(withheld: usize, late: impl Fn(u64) -> u64) -> (u64, Opti
         for &(_, dst, peer) in due.iter().filter(|(at, ..)| *at == t) {
             let acks = AckInfo {
                 incarnation: 1,
+                own: wire::OwnAck::Flagged(1),
                 probe_reply: true,
                 ..AckInfo::default()
             };
@@ -1510,14 +1657,15 @@ fn late_heartbeats_keep_one_retry_per_heartbeat() {
 }
 
 /// A heartbeat that runs more than `F_r` late is stamped `F_r` before the
-/// clock, not at its schedule, so the wait for the probe it sends to an idle
+/// clock, not at its schedule, so the wait for the frame it then sends its
 /// gateway starts then, not 300 ms in the past.
 #[test]
 fn late_heartbeat_is_stamped_near_the_clock() {
     run_paused(async {
         let g = sock(3);
         let wire = Rc::new(Wire::default());
-        let (_client, admin) = scripted(&wire, vec![g], "a", |_| {}).await;
+        let (client, admin) = scripted(&wire, vec![g], "a", |_| {}).await;
+        hit(&client, 1).await;
         introduce(&wire, &[(g, node(0xC), "b")]);
         wire.stall(true);
         sim_advance_ticks(Duration::from_millis(1), 400).await;
@@ -1540,13 +1688,15 @@ fn local_stall_suspects_nobody() {
         let origin = NodeIdentity::new(NodeId(0xD), 1);
         let wire = Rc::new(Wire::default());
         let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
-        let (_client, admin) = scripted(&wire, vec![z, o, p], "a", tune).await;
+        let (client, admin) = scripted(&wire, vec![z, o, p], "a", tune).await;
+        hit(&client, 1).await;
         introduce(
             &wire,
             &[(z, node(0xB), "a"), (o, origin, "b"), (p, node(0xC), "b")],
         );
-        // At 100 the zone-b gateway is probed; O's flagged cells then go on
-        // to Z, both owed an answer when the runtime stalls.
+        // At 100 this node's one cell goes to Z and, flagged, to its zone-b
+        // gateway; O's flagged cells then go on to Z: all owed an answer when
+        // the runtime stalls.
         heartbeats(1).await;
         for packet in cell_packets(origin, 0, 3, true) {
             wire.inbound.borrow_mut().push_back((packet, o));
@@ -1555,16 +1705,25 @@ fn local_stall_suspects_nobody() {
         sim_advance_ticks(Duration::from_millis(1), 10).await;
         assert_eq!(relayed_cells(&wire, z, 0), 3);
         wire.stall(true);
-        let answer = |relay| AckInfo {
+        let answer = |own, relay| AckInfo {
             incarnation: 1,
+            own,
             relay,
             probe_reply: true,
             ..AckInfo::default()
         };
         let ack = Payload::Ack { probe: false };
-        inject_zoned(&wire, z, node(0xB), Some(zone("a")), answer(3), ack);
-        inject_zoned(&wire, o, origin, Some(zone("b")), answer(0), ack);
-        inject_zoned(&wire, p, node(0xC), Some(zone("b")), answer(0), ack);
+        let (plain, flagged) = (wire::OwnAck::Plain(1), wire::OwnAck::Flagged(1));
+        inject_zoned(&wire, z, node(0xB), Some(zone("a")), answer(plain, 3), ack);
+        inject_zoned(&wire, o, origin, Some(zone("b")), answer(flagged, 0), ack);
+        inject_zoned(
+            &wire,
+            p,
+            node(0xC),
+            Some(zone("b")),
+            answer(flagged, 0),
+            ack,
+        );
         heartbeats(12).await;
         wire.stall(false);
         sim_advance_ticks(Duration::from_millis(1), 10).await;
@@ -1589,9 +1748,10 @@ fn dead_gateway_fails_over_soon_after_backpressure_ends() {
         let (g1, g2) = (sock(2), sock(3));
         let wire = Rc::new(Wire::default());
         let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
-        let (_client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+        let (client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+        hit(&client, 1).await;
         introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
-        // The idle gateway's probe at 100 is never answered.
+        // The gateway's frame at 100 is never answered.
         heartbeats(1).await;
         wire.refuse.set(true);
         heartbeats(8).await;
@@ -1657,10 +1817,11 @@ fn suspicion_between_heartbeats_is_judged_at_its_instant() {
         let (g1, g2) = (sock(2), sock(3));
         let wire = Rc::new(Wire::default());
         let tune = |s: &mut Settings| s.suspect_after = Some(ms(446));
-        let (_client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+        let (client, admin) = scripted(&wire, vec![g1, g2], "a", tune).await;
+        hit(&client, 1).await;
         introduce(&wire, &[(g1, node(0xB), "b"), (g2, node(0xC), "b")]);
-        // The idle gateway's probe at 100 goes unanswered: suspect at 546,
-        // with its next retry due at 600.
+        // The gateway's frame at 100 goes unanswered: suspect at 546, with
+        // its next retry due at 600.
         heartbeats(1).await;
         let peers = admin_snapshot(&admin).await.peers;
         let other = peers.iter().find(|p| p.role == Role::Remote).unwrap().addr;
@@ -1698,24 +1859,7 @@ fn gateway_behind_send_errors_fails_over() {
             heartbeats(1).await;
             let peers = admin_snapshot(&admin).await.peers;
             let gateway = peers.iter().find(|p| p.role == Role::Gateway).unwrap().addr;
-            let (next, id) = if gateway == g1 {
-                (g2, node(0xB))
-            } else {
-                (g1, node(0xC))
-            };
-            // The idle probe at 100 is answered: only failed sends are owed.
-            let answer = AckInfo {
-                incarnation: 1,
-                probe_reply: true,
-                ..AckInfo::default()
-            };
-            let ack = Payload::Ack { probe: false };
-            inject_zoned(&wire, gateway, id, Some(zone("b")), answer, ack);
-            wake(&wire);
-            sim_advance_ticks(Duration::from_millis(1), 2).await;
-            let peers = admin_snapshot(&admin).await.peers;
-            let peer = peers.iter().find(|p| p.addr == gateway).unwrap();
-            assert_eq!(peer.answer, AnswerState::Settled);
+            let next = if gateway == g1 { g2 } else { g1 };
             wire.forbidden.set(Some(gateway));
             hit(&client, 1).await;
             let mark = wire.attempts.borrow().len();
@@ -1842,5 +1986,45 @@ fn node_alone_in_its_zone_asks_one_peer_of_any_zone() {
         assert_eq!(after.rounds_heartbeat - before.rounds_heartbeat, 19);
         assert_eq!(after.rounds_prompt, before.rounds_prompt);
         assert!(requests(mark).is_empty());
+    });
+}
+
+/// A node that has heard only a peer of another zone does not ask it for a
+/// join sweep while a discovered peer is unheard, since that one may be of its
+/// own zone; once that peer is heard in its zone, it asks it.
+#[test]
+fn join_sweep_waits_for_every_peer_before_asking_across_zones() {
+    run_paused(async {
+        let (r, u) = (sock(2), sock(3));
+        let wire = Rc::new(Wire::default());
+        let (_client, _admin) = scripted(&wire, vec![r, u], "c", |_| {}).await;
+        let requests = |from| {
+            let sent = sent_payloads(&wire, from).into_iter();
+            sent.filter(|(_, payload)| *payload == Payload::SweepRequest)
+                .map(|(dst, _)| dst)
+                .collect::<Vec<_>>()
+        };
+        let ack = Payload::Ack { probe: false };
+        inject_zoned(
+            &wire,
+            r,
+            node(0xB),
+            Some(zone("a")),
+            AckInfo::default(),
+            ack,
+        );
+        heartbeats(3).await;
+        assert!(requests(0).is_empty(), "{:?}", requests(0));
+        let mark = wire.attempts.borrow().len();
+        inject_zoned(
+            &wire,
+            u,
+            node(0xC),
+            Some(zone("c")),
+            AckInfo::default(),
+            ack,
+        );
+        heartbeats(1).await;
+        assert_eq!(requests(mark), [u]);
     });
 }

@@ -390,9 +390,10 @@ fn restart_resets_streams_and_requests_a_sweep() {
 }
 
 /// A node restarted into an idle cluster, at a new address or its old one,
-/// hears every peer through the one standalone ack each sends a new row or a
-/// restarted peer, so it asks them for a join sweep and gets its previous
-/// incarnation's cells back, although no peer has anything to send.
+/// hears every peer through the answers to its greetings, and the greeting or
+/// ack each peer sends a new row or a restarted peer, so it asks them for a
+/// join sweep and gets its previous incarnation's cells back, although no peer
+/// has anything to send.
 #[test]
 fn restarted_node_sweeps_from_idle_peers() {
     for same_address in [false, true] {
@@ -716,8 +717,10 @@ fn takeover_retry_during_a_paged_sweep_is_a_no_op() {
             waited += 1;
             assert!(waited < 200, "N never asked S for a sweep");
         }
+        // Every packet to N for over a heartbeat, a page each prompt round
+        // among them: N asks again at its next heartbeat while S still pages.
         t.router
-            .set_link_policy(s.addr, n.addr, LinkPolicy::DropFirst { count: 21 });
+            .set_link_policy(s.addr, n.addr, LinkPolicy::DropFirst { count: 25 });
         run_for(400).await;
         assert_eq!(
             n.counters().await.sweeps_requested,
@@ -736,6 +739,30 @@ fn takeover_retry_during_a_paged_sweep_is_a_no_op() {
             total < 1_000 + 34,
             "the lost pages came from nowhere else: {total}"
         );
+        t.stop().await;
+    });
+}
+
+/// A join sweep pages a quantum `q` of cells per prompt round, as a
+/// full-store rewind drains, not a share of one per concurrent sweep.
+#[test]
+fn a_sweep_sends_a_quantum_per_prompt_round() {
+    run_paused(async {
+        // `q` is 1,024 at the default `max_cells`, 33 cells to a packet.
+        let tune = |s: &mut Settings| s.max_payload_bytes = 1400;
+        let store = |identity| CellStore::new(storage(32_768, 32), identity, &rules(32));
+        let t = takeover(45_100, 1, 1_500, tune, store, |_, _| {}).await;
+        let s = &t.sources[0];
+        let before = s.counters().await.sweep_cells_sent;
+        let mut paged = 0;
+        for _ in 0..1_000 {
+            run_for(1).await;
+            paged = s.counters().await.sweep_cells_sent - before;
+            if paged > 0 {
+                break;
+            }
+        }
+        assert_eq!(paged, 1_024);
         t.stop().await;
     });
 }
@@ -924,7 +951,7 @@ fn full_store_rewind_drains_on_prompt_rounds(max_cells: u32, max_rounds: u64) {
         a.hits(0..CELLS).await;
         drop(raw);
 
-        // B's join sweep ends on C before A hears B (its hello ack to A is
+        // B's join sweep ends on C before A hears B (its greetings to A are
         // lost), so only A's stream can bring A's cells.
         router.set_link_policy(b_addr, a_addr, LinkPolicy::Block);
         let c = Node::start(

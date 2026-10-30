@@ -8,8 +8,9 @@
 //! the roles, and serves each peer in one send loop: its own-stream cells
 //! (to zone peers, and flagged for relay to one gateway per remote zone),
 //! the relay stream to zone peers, a resend with `PROBE` when a heartbeat
-//! passed without an ack (a header-only probe to a suspect), and owed acks,
-//! gap reports and probe answers. After each iteration the runtime calls
+//! passed without an ack (a header-only probe to a suspect or to a gateway
+//! that has acked nothing), a greeting to a peer not yet heard from, and owed
+//! acks, gap reports and probe answers. After each iteration the runtime calls
 //! [`AggregateStore::apply`] once with the rows the arm produced, and once
 //! more per full expiry batch or drained datagram. Nothing on a request,
 //! packet or round path allocates; admin commands may.
@@ -118,9 +119,6 @@ where
     /// This node's join sweep, from start until enough sources answered.
     sweep_want: Option<SweepWant>,
     sweeps: Sweeps,
-    /// Cells per sweep page: `max(q / gossip.sweep_concurrency, cells in one
-    /// packet)`.
-    sweep_page: usize,
 
     // Pending reply for the in-flight limit request. Sent after the
     // bottom-of-loop apply so callers observe "ack ⇒ AggregateStore reflects
@@ -244,8 +242,6 @@ where
             (bytes / GOSSIP_MIN_DATAGRAM_CHARGE).max(1)
         });
         let sweeps = Sweeps::new(config.sweep_concurrency);
-        let sweep_page =
-            (config.quantum.get() / usize::from(config.sweep_concurrency.get())).max(packet_cells);
 
         let rule_capacity = store.rule_dictionary().capacity() as usize;
         let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
@@ -274,7 +270,6 @@ where
             next_peer: 0,
             sweep_want: Some(SweepWant::default()),
             sweeps,
-            sweep_page,
             pending_reply: None,
             counters: GossipCounters::default(),
             rule_pending,
@@ -761,7 +756,7 @@ where
     /// Add a peer to the table: a known one is ignored, and past
     /// `gossip.peer_capacity` it is declined, its packets still merged.
     fn add_peer(&mut self, addr: SocketAddr) {
-        match self.peers.insert(addr) {
+        match self.peers.insert(addr, self.store.head(Stream::Own)) {
             Insert::Added => tracing::info!(
                 peer = %addr,
                 cluster_size = self.peers.len(),
@@ -878,9 +873,10 @@ where
     }
 
     /// Service one peer row: retry a timed-out stream (a header-only probe
-    /// to a suspect, or to a peer owed nothing), report due gaps, send the
-    /// streams its role gets, and send owed acks or probe answers alone when
-    /// no data carries them.
+    /// to a suspect, to a gateway that has acked nothing, or to a peer owed
+    /// nothing), report due gaps, send the streams its role gets, greet a
+    /// peer not yet heard from, and send owed acks or probe answers alone
+    /// when no data carries them.
     fn serve_row(&mut self, kind: Round, row: usize, now: u64, heads: PerStream<u64>) {
         let role = self.peers.role(row);
         if role == Role::Incompatible {
@@ -895,9 +891,9 @@ where
         } else {
             (false, false)
         };
-        let suspect = (own_retry || relay_retry) && self.peers.suspect(row);
-        // A retry with nothing in flight is a liveness probe.
-        let probe_only = suspect
+        let probing = (own_retry || relay_retry) && self.peers.probes_only(row);
+        // A retry with nothing in flight is a probe.
+        let probe_only = probing
             || (own_retry
                 && !relay_retry
                 && (role == Role::Remote || !self.peers.tx(row, Stream::Own).in_flight()));
@@ -938,11 +934,16 @@ where
 
         let flags = self.peers.flags(row);
         let resend_own = own_retry && !probe_only;
+        // A peer not yet heard from is greeted with `PROBE`, at once and then
+        // each heartbeat, so its answer names its zone; nothing waits on it.
+        let hello =
+            role == Role::Unheard && (kind == Round::Heartbeat || flags.has(PeerFlags::ACK_DUE));
         let mut sent_any = false;
         if role != Role::Remote
             && (kind != Round::Prompt || resend_own || flags.has(PeerFlags::RESEND_OWN))
         {
-            let closed = self.send_stream(Stream::Own, row, heads.own, gaps, resend_own, now);
+            let probe = resend_own || hello;
+            let closed = self.send_stream(Stream::Own, row, heads.own, gaps, probe, now);
             // A stream capped by the quantum goes on in the next prompt round.
             self.peers.set_flag(
                 row,
@@ -958,8 +959,10 @@ where
             self.prompt_work |= closed.is_some_and(|c| c < heads.relay);
             sent_any |= closed.is_some();
         }
-        // Data asks for an answer too, so only a suspect is probed beside it.
-        let probe = probe_only && (suspect || !sent_any);
+        // Data asks for an answer too, so only a probing row is probed beside
+        // it, and a greeting rides it.
+        let asks = probe_only && (probing || !sent_any);
+        let probe = asks || (hello && !sent_any);
         let ack_due = kind == Round::Heartbeat && flags.has(PeerFlags::ACK_DUE);
         let owed = gaps.any() || ack_due || flags.has(PeerFlags::REPLY_DUE);
         if !self.outbox.is_held() && (probe || (!sent_any && owed)) {
@@ -967,7 +970,7 @@ where
             let dst = self.peers.addr(row);
             let sent =
                 (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
-            self.account(row, sent, probe, now);
+            self.account(row, sent, asks, now);
             self.counters.liveness_probes += u64::from(probe);
             sent_any = true;
         }
@@ -1133,8 +1136,8 @@ where
     /// Ask for the join sweep this node wants: at every heartbeat, and on any
     /// round once a peer is first heard. Each source asked is sent a
     /// `SweepRequest` at once and again at each heartbeat until a page
-    /// arrives. A node that has heard no peer of its zone asks one peer of
-    /// any zone.
+    /// arrives. A node that has heard every peer, none of its zone, asks one
+    /// peer of any zone.
     fn ask_sweeps(&mut self, kind: Round, now: u64) {
         let Some(mut want) = self
             .sweep_want
@@ -1196,8 +1199,8 @@ where
                          up. Many of these together mean many pods started at once (a rollout or \
                          scale-out). No action is needed unless new pods keep under-counting for \
                          longer than one rate-limit window; then slow the rollout. Raising {} \
-                         reduces these refusals, but each sweep then runs slower, so it does not \
-                         speed the rollout.",
+                         reduces these refusals; each extra sweep adds its own burst of packets \
+                         to every prompt round while it runs.",
                         Setting::GossipSweepConcurrency,
                     );
                 }
@@ -1205,10 +1208,11 @@ where
         }
     }
 
-    /// Send each running sweep its next page of live cells in slot order; a
-    /// requester that left or speaks another version is dropped. A page cut
+    /// Send each running sweep its next page of `q` live cells in slot order;
+    /// a requester that left or speaks another version is dropped. A page cut
     /// by a held packet is sent again whole: pages are max-merges.
     fn serve_sweeps(&mut self, now: u64) {
+        let page = self.config.quantum.get();
         // Pages overwrite the own frame: none survives them.
         self.frames.own.from = None;
         for i in 0..self.sweeps.limit() {
@@ -1225,7 +1229,7 @@ where
             };
             let handles = &mut self.frames.own.handles;
             handles.clear();
-            handles.extend(self.store.active_handles(next_slot).take(self.sweep_page));
+            handles.extend(self.store.active_handles(next_slot).take(page));
             let cells = handles.len();
             if cells == 0 && next_slot != 0 {
                 self.sweeps.advance(i, None);
@@ -1240,7 +1244,7 @@ where
             }
             self.counters.sweep_cells_sent += cells as u64;
             let next = match self.frames.own.handles.last() {
-                Some(last) if cells == self.sweep_page => Some(last.index + 1),
+                Some(last) if cells == page => Some(last.index + 1),
                 _ => None,
             };
             self.sweeps.advance(i, next);

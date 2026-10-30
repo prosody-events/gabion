@@ -148,7 +148,13 @@ fn snapshot_json_shape_is_pinned() {
         );
         assert_eq!(
             body["peers_by_role"],
-            serde_json::json!({ "zone": 1, "gateway": 0, "remote": 0, "incompatible": 0 })
+            serde_json::json!({
+                "unheard": 1,
+                "zone": 0,
+                "gateway": 0,
+                "remote": 0,
+                "incompatible": 0
+            })
         );
         assert_eq!(keys(&body["local_identity"]), ["incarnation", "node_id"]);
         assert_eq!(
@@ -212,7 +218,7 @@ fn snapshot_json_shape_is_pinned() {
                 "zone"
             ]
         );
-        assert_eq!(body["peers"][0]["role"], "zone");
+        assert_eq!(body["peers"][0]["role"], "unheard");
         assert_eq!(body["peers"][0]["zone"], "unknown");
         // A wait is shown exactly while an answer is awaited: none before
         // the first send, and from the heartbeat that sends a hit.

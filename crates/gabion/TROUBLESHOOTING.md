@@ -83,7 +83,7 @@ Message starts: "This node's peer table is full"
 
 Message starts: "Stopped asking"
 
-**What happened.** A peer's own or relay stream (`stream`) to this node skipped some changes, and this node asked the peer to resend them `reports` times over `waited_ms` without receiving them, so it stopped asking. If the peer still sends the stream, its retransmission timer resends the missing changes on its own; until they arrive, limits here under-count the traffic that peer handled. Counted in `/snapshot` as `counters.gaps_abandoned`.
+**What happened.** A peer's own or relay stream (`stream`) to this node skipped some changes, and this node asked the peer to resend them `reports` times over `waited_ms` without receiving them, so it stopped asking. If the peer still sends the stream, its next packet makes this node ask again, and its retransmission timer resends the missing changes on its own; until they arrive, limits here under-count the traffic that peer handled. Counted in `/snapshot` as `counters.gaps_abandoned`.
 
 **Why.** Usually UDP from that peer to this node is blocked or lossy in one direction, so the peer never hears the reports or its resends never arrive.
 
@@ -101,7 +101,7 @@ Message starts: "Declined a catch-up request from"
 
 **Why.** Many pods started at once: a rollout or a scale-out.
 
-**What to do next.** Nothing, unless new pods keep under-counting for longer than one rate-limit window; then slow the rollout. Raising `gossip.sweep_concurrency` (`GABION_GOSSIP_SWEEP_CONCURRENCY`) in `gabiond`, or `gabion_gossip_sweep_concurrency` in NGINX, reduces these refusals, but each sweep then runs slower, so it does not speed the rollout.
+**What to do next.** Nothing, unless new pods keep under-counting for longer than one rate-limit window; then slow the rollout. Raising `gossip.sweep_concurrency` (`GABION_GOSSIP_SWEEP_CONCURRENCY`) in `gabiond`, or `gabion_gossip_sweep_concurrency` in NGINX, reduces these refusals; each extra sweep adds its own burst of packets to every prompt round while it runs.
 
 **Fields** `config_key`, `peer`, `active`, `limit`, `refused_total` · **Knob** `gossip.sweep_concurrency` (`GABION_GOSSIP_SWEEP_CONCURRENCY`) / `gabion_gossip_sweep_concurrency`
 

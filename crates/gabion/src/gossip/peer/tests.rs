@@ -41,10 +41,11 @@ fn range(lower: u64, upper: u64) -> StreamRange {
     StreamRange::new(lower, upper).expect("lower < upper")
 }
 
-/// A table holding one peer, at row 0.
+/// A table holding one zone peer, at row 0.
 fn one_row() -> PeerTable {
     let mut table = table();
-    assert_eq!(table.insert(addr(0)), Insert::Added);
+    assert_eq!(table.insert(addr(0), 0), Insert::Added);
+    table.apply_role(0, Role::Zone);
     table
 }
 
@@ -67,7 +68,7 @@ fn peer_table_index_matches_linear_scan(ops: Vec<(u8, u8, u8)>) {
                     model.push((a, None));
                     Insert::Added
                 };
-                assert_eq!(table.insert(a), expected);
+                assert_eq!(table.insert(a, 0), expected);
             }
             1 => {
                 let had = model.iter().any(|p| p.0 == a);
@@ -264,11 +265,6 @@ impl RxModel {
                 }
             });
             self.gap = match self.gap {
-                Gap::Closed => Gap::Open {
-                    stash,
-                    report_at_ms: now + FLOOR,
-                    reports: 0,
-                },
                 Gap::Open {
                     report_at_ms,
                     reports,
@@ -278,7 +274,11 @@ impl RxModel {
                     report_at_ms,
                     reports,
                 },
-                Gap::Abandoned { .. } => Gap::Abandoned { stash },
+                Gap::Closed | Gap::Abandoned { .. } => Gap::Open {
+                    stash,
+                    report_at_ms: now + FLOOR,
+                    reports: 0,
+                },
             };
         } else if upper > self.have {
             self.have = upper;
@@ -329,7 +329,8 @@ impl RxModel {
 
 /// The own stream's receiver follows the model through any mix of ranges,
 /// reports and time: `have` never decreases and never jumps a hole, an
-/// abandoned gap never reports, and progress resets the report count.
+/// abandoned gap never reports until a range above `have` reopens it, and
+/// progress resets the report count.
 #[quickcheck]
 fn inbound_gap_matches_model(ops: Vec<Op>) {
     let mut inbound = Inbound::default();
@@ -517,7 +518,7 @@ fn zoned_table(local_key: u64, members: u8, capacity: u16) -> PeerTable {
     let mut table =
         PeerTable::with_capacity(capacity, local_key, Some(zone(1)), RTO, SUSPECT_AFTER);
     for i in 1..=members {
-        assert_eq!(table.insert(addr(2 * i)), Insert::Added);
+        assert_eq!(table.insert(addr(2 * i), 0), Insert::Added);
         let row = table.find(addr(2 * i)).unwrap();
         table.contact(
             row,
@@ -560,6 +561,7 @@ fn rendezvous_moves_only_the_removed_members_origins(members: u8, removed: u8) {
     let first = gateway(&table).unwrap();
     let row = table.find(first).unwrap();
     table.link[row].answer = Answer::Owed { since_ms: 0 };
+    table.refresh_deadline(row);
     table.judge(SUSPECT_AFTER, |_| {});
     table.refresh(SUSPECT_AFTER, |_| {});
     assert_ne!(gateway(&table), Some(first));
@@ -586,11 +588,11 @@ fn rendezvous_moves_only_the_removed_members_origins(members: u8, removed: u8) {
 }
 
 /// One row of a refresh case: its zone (0 = none), whether it speaks another
-/// version, and its answer.
+/// version, its answer, and whether it has been heard.
 #[derive(Clone, Debug)]
 struct RefreshCase {
     local: u32,
-    rows: Vec<(u32, bool, Answer)>,
+    rows: Vec<(u32, bool, Answer, bool)>,
 }
 
 impl Arbitrary for RefreshCase {
@@ -615,6 +617,7 @@ impl Arbitrary for RefreshCase {
                         u32::arbitrary(g) % (zones + 1),
                         bool::arbitrary(g) && bool::arbitrary(g),
                         answer(g),
+                        bool::arbitrary(g) || bool::arbitrary(g),
                     )
                 })
                 .collect(),
@@ -627,7 +630,7 @@ impl Arbitrary for RefreshCase {
 /// zone that speaks this version outranks it, by the reference's own rank:
 /// live members by weight, then suspects by the earliest suspicion, then the
 /// address. The zone table is sized to the rows, so the one-zone-per-peer
-/// case fills it exactly.
+/// case fills it exactly, and a row never heard keeps `Unheard`.
 #[quickcheck]
 fn role_refresh_equals_brute_force(case: RefreshCase) {
     // At `NOW` an `Owed` answer from 40 ms or earlier is suspect, and every
@@ -638,13 +641,15 @@ fn role_refresh_equals_brute_force(case: RefreshCase) {
     let local = ZoneHash::from_wire(case.local);
     let mut table = PeerTable::with_capacity(capacity, 3, local, RTO, SUSPECT_AFTER);
     let addr_of = |row: usize| SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 1000 + row as u16));
-    for (i, &(z, muted, answer)) in case.rows.iter().enumerate() {
-        table.insert(addr_of(i));
-        table.contact(
-            i,
-            NodeIdentity::new(NodeId(i as u128), 1),
-            ZoneHash::from_wire(z),
-        );
+    for (i, &(z, muted, answer, heard)) in case.rows.iter().enumerate() {
+        table.insert(addr_of(i), 0);
+        if heard {
+            table.contact(
+                i,
+                NodeIdentity::new(NodeId(i as u128), 1),
+                ZoneHash::from_wire(z),
+            );
+        }
         if muted {
             table.mute(i);
         }
@@ -654,8 +659,8 @@ fn role_refresh_equals_brute_force(case: RefreshCase) {
     table.stale = true;
     table.refresh(NOW, |_| {});
     let eligible = |row: usize| {
-        let z = case.rows[row].0;
-        !case.rows[row].1 && z != 0 && case.local != 0 && z != case.local
+        let (z, muted, _, heard) = case.rows[row];
+        heard && !muted && z != 0 && case.local != 0 && z != case.local
     };
     let rank = |row: usize| {
         let suspect_from = match case.rows[row].2 {
@@ -671,6 +676,8 @@ fn role_refresh_equals_brute_force(case: RefreshCase) {
     for row in 0..n {
         let expected = if case.rows[row].1 {
             Role::Incompatible
+        } else if !case.rows[row].3 {
+            Role::Unheard
         } else if !eligible(row) {
             Role::Zone
         } else if (0..n).any(|other| {
@@ -748,7 +755,7 @@ impl Arbitrary for AnswerOp {
 fn answer_matches_its_model(ops: Vec<AnswerOp>) {
     for suspect_after in [4 * RTO, 3 * RTO] {
         let mut table = PeerTable::with_capacity(CAPACITY, 7, None, RTO, suspect_after);
-        table.insert(addr(0));
+        table.insert(addr(0), 0);
         let mut identity = NodeIdentity::new(NodeId(9), 1);
         table.contact(0, identity, None);
         let (mut model, mut now, mut head) = (Answer::Settled, 1_000_u64, PerStream::default());
@@ -1050,4 +1057,24 @@ fn repeated_signals_leave_the_roles_fresh() {
     table.refresh(1_100, |_| {});
     table.mute(row);
     assert!(!table.stale());
+}
+
+/// An abandoned gap reopens on the next range above `have`: reported again
+/// a relay floor later, so a sender that still sends is asked again, not
+/// waited out until its timeout.
+#[test]
+fn abandoned_gap_reopens_on_the_next_range() {
+    let mut inbound = Inbound::default();
+    inbound.receive(range(1, 2), 0, FLOOR);
+    let mut now = FLOOR;
+    for _ in 0..GOSSIP_GAP_REPORTS {
+        assert_eq!(inbound.take_report(now, FLOOR), GapDue::Report);
+        now += 4 * FLOOR;
+    }
+    assert_eq!(
+        inbound.take_report(now, FLOOR),
+        GapDue::Abandoned { missing: 1 }
+    );
+    inbound.receive(range(2, 3), now, FLOOR);
+    assert_eq!(inbound.take_report(now + FLOOR, FLOOR), GapDue::Report);
 }

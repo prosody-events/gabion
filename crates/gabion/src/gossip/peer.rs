@@ -5,8 +5,9 @@
 //! from one peer is cold, in [`PeerLink`].
 //!
 //! Each row's role follows from the zones its peer's headers announce: a peer
-//! of this node's zone (or of an unknown or no zone) gets both streams
-//! directly, and in each other zone the member that ranks first for this node
+//! not yet heard from gets only the own cells raised since it was added, a
+//! peer of this node's zone (or of no zone) gets both streams directly, and in
+//! each other zone the member that ranks first for this node
 //! (rendezvous weight, suspects last) is the gateway that gets the own stream
 //! flagged for relay. A peer is suspect once a packet that asks for an answer
 //! has gone unanswered for `gossip.suspect_after`, or it said it cannot relay.
@@ -77,8 +78,12 @@ impl<T> IndexMut<Stream> for PerStream<T> {
     serde(rename_all = "snake_case")
 )]
 pub enum Role {
-    /// A peer of this node's zone, or of an unknown or no zone: it gets the
-    /// own and relay streams directly.
+    /// A peer not heard from yet: it is sent the own cells raised since it
+    /// was added and a greeting probe each heartbeat, but no relay stream,
+    /// until its first packet names its zone.
+    Unheard,
+    /// A peer of this node's zone, or of no zone: it gets the own and relay
+    /// streams directly.
     Zone,
     /// The member of a remote zone this node sends its own stream to,
     /// flagged for relay into that zone.
@@ -93,7 +98,7 @@ pub enum Role {
 impl Role {
     /// Whether the row gets this node's own stream.
     fn gets_own(self) -> bool {
-        matches!(self, Self::Zone | Self::Gateway)
+        matches!(self, Self::Unheard | Self::Zone | Self::Gateway)
     }
 }
 
@@ -102,8 +107,9 @@ impl Role {
 pub(super) struct PeerFlags(u8);
 
 impl PeerFlags {
-    /// The peer sent stream data since this node last sent it a packet; a
-    /// heartbeat sends a standalone ack.
+    /// The peer is owed a header-only packet: at a heartbeat a standalone
+    /// ack, since it sent stream data after this node's last packet to it;
+    /// on a new row, its first greeting, on the next round of any kind.
     pub(super) const ACK_DUE: Self = Self(0x01);
     /// A gap open on the peer's own stream (the mark `OwnMode` selects) or
     /// relay stream, whose report is prompt work.
@@ -223,7 +229,8 @@ pub(super) enum Gap {
         report_at_ms: u64,
         reports: u8,
     },
-    /// Reported [`GOSSIP_GAP_REPORTS`] times without progress; reports stop.
+    /// Reported [`GOSSIP_GAP_REPORTS`] times without progress; reports stop
+    /// until the next range above `have` reopens it.
     Abandoned { stash: (u64, u64) },
 }
 
@@ -252,7 +259,8 @@ impl Inbound {
     }
 
     /// A packet closing `range` arrived. `have` moves only over contiguous
-    /// ranges; a range above it is stashed and opens a gap.
+    /// ranges; a range above it is stashed and opens a gap, or reopens an
+    /// abandoned one.
     pub(super) fn receive(&mut self, range: StreamRange, now: u64, floor_ms: u64) {
         let (lower, upper) = (range.lower(), range.upper());
         if lower > self.have {
@@ -271,8 +279,11 @@ impl Inbound {
                     report_at_ms,
                     reports,
                 },
-                Gap::Abandoned { stash } => Gap::Abandoned {
+                // Its sender still sends: ask again.
+                Gap::Abandoned { stash } => Gap::Open {
                     stash: keep(stash, (lower, upper)),
+                    report_at_ms: now.saturating_add(floor_ms),
+                    reports: 0,
                 },
             };
             return;
@@ -589,10 +600,10 @@ impl PeerTable {
     }
 
     /// A known address is `Present` even when the table is full, so
-    /// re-announcing a peer is never a decline. A new row owes the peer one
-    /// standalone ack, so a peer that restarted into an idle cluster hears
-    /// from it and can ask it for a join sweep.
-    pub(super) fn insert(&mut self, addr: SocketAddr) -> Insert {
+    /// re-announcing a peer is never a decline. A new row is `Unheard`: it
+    /// owes the peer a greeting, and its own stream starts at `own_head`, so
+    /// until its first packet it is sent only the cells raised from now on.
+    pub(super) fn insert(&mut self, addr: SocketAddr, own_head: u64) -> Insert {
         let hash = addr_hash(addr);
         if self.lookup(hash, addr).is_some() {
             return Insert::Present;
@@ -601,9 +612,9 @@ impl PeerTable {
         if row == self.addr.len() {
             return Insert::Full;
         }
-        self.role[row] = Role::Zone;
+        self.role[row] = Role::Unheard;
         self.flags[row] = PeerFlags::ACK_DUE;
-        self.sent.own[row] = 0;
+        self.sent.own[row] = own_head;
         self.sent.relay[row] = 0;
         self.deadline[row] = Deadline::NEVER;
         self.addr[row] = addr;
@@ -611,6 +622,7 @@ impl PeerTable {
             weight: rendezvous_weight(self.local_key, addr),
             ..PeerLink::default()
         };
+        self.link[row].out.own.acked = own_head;
         self.by_addr.insert_unchecked(hash, row as u32);
         self.len += 1;
         Insert::Added
@@ -645,7 +657,8 @@ impl PeerTable {
     /// changes only with the incarnation, so a zone-0 header never clears it.
     /// A peer heard for the first time, or in a new incarnation (which resets
     /// the whole row), is owed one ack, so a node that started into an idle
-    /// cluster hears every peer it greets.
+    /// cluster hears every peer it greets; a first packet also refreshes the
+    /// roles, so an unheard row takes its role.
     pub(super) fn contact(
         &mut self,
         row: usize,
@@ -656,6 +669,8 @@ impl PeerTable {
         let contact = match link.identity {
             None => {
                 self.flags[row].set(PeerFlags::ACK_DUE, true);
+                // Its role follows at the next refresh.
+                self.stale = true;
                 Contact::First
             }
             Some(known) if known == sender => Contact::Current,
@@ -768,9 +783,16 @@ impl PeerTable {
             .is_some_and(|at| at <= self.judged_ms)
     }
 
+    /// Whether `row`'s retries are header-only probes: it is suspect, or a
+    /// gateway that has acked nothing of the stream it was sent from 0.
+    pub(super) fn probes_only(&self, row: usize) -> bool {
+        self.suspect(row) || (self.role[row] == Role::Gateway && self.link[row].out.own.acked == 0)
+    }
+
     /// A packet of the peer's own stream closing `range` arrived, flagged or
     /// not; returns whether a flagged one is fresh, above the flagged mark
-    /// as it was. The kind picks the mark it moves and the ack sent back.
+    /// as it was. The kind picks the mark it moves and the ack sent back. A
+    /// plain range from a peer of another known zone is not tracked.
     pub(super) fn receive_own(
         &mut self,
         row: usize,
@@ -779,6 +801,12 @@ impl PeerTable {
         now: u64,
         floor_ms: u64,
     ) -> bool {
+        // A peer of another zone sends its own stream unflagged only until it
+        // hears this node's zone, then stops: merged, not tracked, so no gap
+        // opens on a stream that stops.
+        if !flagged && self.remote_zone(row).is_some() {
+            return false;
+        }
         let link = &mut self.link[row];
         let fresh = flagged && range.upper() > link.flagged_in.have;
         link.own_mode = if flagged {
@@ -822,11 +850,12 @@ impl PeerTable {
 
     /// Credit a packet's acks against `heads`, the own and relay heads. The
     /// own-stream ack counts on a `Gateway` row only flagged and on a `Zone`
-    /// row only plain; the relay ack only on a `Zone` row; and only for this
-    /// node's current incarnation. `CANNOT_RELAY` from a remote zone makes the
-    /// row suspect at once and its acks no progress; other progress settles
-    /// the row, or restarts its wait while data is owed, and a suspect's
-    /// probe answer rewinds each stream it is owed.
+    /// or `Unheard` row only plain; the relay ack only on a `Zone` row; and
+    /// only for this node's current incarnation. `CANNOT_RELAY` from a remote
+    /// zone makes the row suspect at once and its acks no progress; other
+    /// progress settles the row, or restarts its wait while data is owed, and
+    /// a probe answer from a suspect, or from a gateway that has acked
+    /// nothing, rewinds each stream it is owed.
     pub(super) fn credit(
         &mut self,
         row: usize,
@@ -837,11 +866,13 @@ impl PeerTable {
     ) -> Credit {
         let role = self.role[row];
         let was = self.suspect(row);
+        let probed = self.probes_only(row);
         let current = acks.incarnation == incarnation;
         let mut credit = Credit::default();
         let mut progress = false;
         let own_ack = match (role, acks.own) {
-            (Role::Zone, OwnAck::Plain(ack)) | (Role::Gateway, OwnAck::Flagged(ack)) => Some(ack),
+            (Role::Zone | Role::Unheard, OwnAck::Plain(ack))
+            | (Role::Gateway, OwnAck::Flagged(ack)) => Some(ack),
             _ => None,
         };
         if let Some(ack) = own_ack.filter(|_| current) {
@@ -873,7 +904,7 @@ impl PeerTable {
                 Answer::Owed { since_ms: now }
             };
         }
-        if current && !counts && acks.probe_reply && was {
+        if current && !counts && acks.probe_reply && probed {
             for stream in [Stream::Own, Stream::Relay] {
                 if owed[stream] {
                     self.tx(row, stream).rewind(now);
@@ -961,7 +992,7 @@ impl PeerTable {
     pub(super) fn impaired(&self) -> bool {
         let (mut heard, mut stuck) = (0_usize, 0_usize);
         for row in 0..self.len {
-            if self.role[row] == Role::Zone && self.link[row].identity.is_some() {
+            if self.role[row] == Role::Zone {
                 heard += 1;
                 stuck += usize::from(self.suspect(row));
             }
@@ -980,7 +1011,7 @@ impl PeerTable {
     /// Recompute every role when stale: one pass keeps the best member of
     /// each remote zone, a second sets each row's role. Returns how many
     /// rows changed role; `on_failover` hears of each suspect gateway
-    /// replaced.
+    /// replaced. An unheard row keeps `Unheard` until its first packet.
     pub(super) fn refresh(&mut self, now: u64, mut on_failover: impl FnMut(Failover)) -> u64 {
         if !std::mem::take(&mut self.stale) {
             return 0;
@@ -1008,7 +1039,7 @@ impl PeerTable {
         for row in 0..self.len {
             let old = self.role[row];
             let new = match self.remote_zone(row) {
-                None if old == Role::Incompatible => continue,
+                None if old == Role::Incompatible || self.link[row].identity.is_none() => continue,
                 None => Role::Zone,
                 Some(zone) => {
                     let best = self.zones[..used].iter().find(|best| best.zone == zone);
@@ -1051,8 +1082,8 @@ impl PeerTable {
 
     /// Give `row` role `new`; returns whether it changed. A stream the row
     /// starts receiving, or receives with a new kind of ack, rewinds to 0 as
-    /// prompt work; a row left receiving nothing has nothing to wait for
-    /// unless it is suspect.
+    /// prompt work (an unheard row first heard included); a row left receiving
+    /// nothing has nothing to wait for unless it is suspect.
     fn apply_role(&mut self, row: usize, new: Role) -> bool {
         let old = std::mem::replace(&mut self.role[row], new);
         if old == new {
@@ -1078,14 +1109,12 @@ impl PeerTable {
     }
 
     /// When `row`'s own-stream timer falls due: while own data is in flight,
-    /// on a gateway (its liveness probe), and while an answer is awaited with
-    /// no relay data in flight, whose own timer retries (a probe for a row
-    /// that receives no stream).
+    /// and while an answer is awaited with no relay data in flight, whose own
+    /// timer retries (a probe for a row that receives no stream).
     pub(super) fn own_timer(&self, row: usize) -> Option<u64> {
         let link = &self.link[row];
         let role = self.role[row];
         let runs = (role.gets_own() && link.out.own.acked < self.sent.own[row])
-            || role == Role::Gateway
             || (link.answer != Answer::Settled && self.relay_timer(row).is_none());
         (runs && role != Role::Incompatible)
             .then(|| link.out.own.timer_ms.saturating_add(self.rto_ms))
@@ -1156,6 +1185,7 @@ impl PeerTable {
         let mut counts = RoleCounts::default();
         for &role in &self.role[..self.len] {
             *match role {
+                Role::Unheard => &mut counts.unheard,
                 Role::Zone => &mut counts.zone,
                 Role::Gateway => &mut counts.gateway,
                 Role::Remote => &mut counts.remote,
@@ -1165,18 +1195,20 @@ impl PeerTable {
         counts
     }
 
-    /// The peers a join sweep may ask, with their weights: the heard peers of
-    /// this node's zone, or with `any_zone` every heard peer that speaks this
-    /// version.
+    /// The peers a join sweep may ask, with their weights: the peers of this
+    /// node's zone, or with `any_zone` every peer that speaks this version,
+    /// but only once every peer has been heard, since an unheard one may be
+    /// of this zone.
     pub(super) fn sweep_candidates(
         &self,
         any_zone: bool,
     ) -> impl Iterator<Item = (u64, SocketAddr)> + '_ {
+        let any_zone = any_zone && !self.role[..self.len].contains(&Role::Unheard);
         (0..self.len)
-            .filter(move |&row| {
-                let role = self.role[row];
-                self.link[row].identity.is_some()
-                    && (role == Role::Zone || (any_zone && role != Role::Incompatible))
+            .filter(move |&row| match self.role[row] {
+                Role::Zone => true,
+                Role::Gateway | Role::Remote => any_zone,
+                Role::Unheard | Role::Incompatible => false,
             })
             .map(|row| (self.link[row].weight, self.addr[row]))
     }

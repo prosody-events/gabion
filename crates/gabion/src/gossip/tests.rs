@@ -1288,8 +1288,9 @@ async fn admin_snapshot_reflects_runtime_state() {
             assert_eq!(snapshot.peers[0].addr, sock(40_301));
             assert!(snapshot.peers[0].node_id.is_none());
             assert!(snapshot.store_stats.active_cells >= 1);
-            // The peer never answers, so the one cell sent stays unacked.
-            assert_eq!(snapshot.peers[0].role, Role::Zone);
+            // The peer never answers, so it stays unheard and the one cell
+            // sent stays unacked.
+            assert_eq!(snapshot.peers[0].role, Role::Unheard);
             assert_eq!(snapshot.peers[0].own_unacked, 1);
 
             client.shutdown().await.unwrap();
@@ -1317,7 +1318,7 @@ fn node(id: u128) -> NodeIdentity {
 }
 
 /// A runtime on a scripted transport with an admin channel, after it has spent
-/// its immediate first tick, whose only packets, the hello acks to its
+/// its immediate first tick, whose only packets, the greetings to its
 /// bootstrap peers, are dropped from the record. Heartbeats then fire at
 /// t = 100, 200, … ms.
 async fn mocked(
@@ -1517,7 +1518,7 @@ fn refused_send_holds_one_packet() {
         hit(&client, 2).await;
         heartbeats(2).await;
         assert_eq!(*wire.attempts.borrow(), vec![refused.clone(); 6]);
-        // The first tick's two hello acks left before the refusals.
+        // The first tick's two greetings left before the refusals.
         let counters = admin_snapshot(&admin).await.counters;
         assert_eq!((counters.send_blocked, counters.packets_sent), (6, 2));
 
@@ -1585,7 +1586,7 @@ fn send_error_to_one_peer_keeps_gossiping() {
             heartbeats(3).await;
             let to_other = wire.accepted().iter().filter(|a| a.dst == sock(3)).count();
             assert_eq!(to_other, 3);
-            // The two hello acks of the first tick left too.
+            // The two greetings of the first tick left too.
             let counters = admin_snapshot(&admin).await.counters;
             assert_eq!((counters.send_errors, counters.packets_sent), (3, 5));
         })
@@ -2557,10 +2558,11 @@ fn ack_for_another_incarnation_is_ignored() {
         let wire = Rc::new(Wire::default());
         let local = NodeIdentity::new(NodeId(0xA), 7);
         let (client, _admin, _runtime) = mocked(&wire, store_for(local), sim_config(vec![p])).await;
-        end_want(&wire, &[(p, peer)]);
         for key in 1..=3 {
             hit(&client, key).await;
         }
+        // Heard at the heartbeat, which sends the zone peer its window from 0.
+        end_want(&wire, &[(p, peer)]);
         heartbeats(1).await;
         let own_sends = |from| {
             sent_payloads(&wire, from)
