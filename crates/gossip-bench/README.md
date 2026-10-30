@@ -107,7 +107,7 @@ with:
 python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "crates/gossip-bench/judge"); import judge; print(judge.core_hash(sys.argv[1], Path(".")))' "$(git rev-parse HEAD:crates/gossip-bench)"
 ```
 
-Core hash: `cc4b2980f4e4e1d0b6958ea0f106f96b3c4b621c`. A new or
+Core hash: `1ed9ff8c988cbd895bff19992388818703495b41`. A new or
 changed regime, or any other edit to the core, changes it, requires rerunning
 `make sim-baselines`, and updates this line.
 
@@ -583,7 +583,8 @@ Ticker}` and `gabion::discovery::{Peer, PeerEvent}`. It implements those traits
 for the simulated network, clock and discovery stream, and keeps every other
 line about gabion in `src/harness/adapter.rs`:
 
-- `Launcher::new(regime, sizing, world, keys, seed)` and
+- `Launcher::new(regime, sizing, world, keys, seed)` (returning the
+  `Launcher`, or since H1 a `Result` of it) and
   `Launcher::launch(idx) -> Launched`: build one node (identity, gossip
   configuration, `CellStore`, runtime) and its aggregate store;
 - `Node::record(key, bucket, now_millis)` (a hit, resolving once it is visible
