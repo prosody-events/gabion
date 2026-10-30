@@ -946,6 +946,24 @@ fn own_acks_count_only_in_the_kind_the_role_receives() {
     assert!(table.flags(0).has(PeerFlags::RESEND_OWN));
 }
 
+/// An unheard row starts its own stream at the head it was added at; the
+/// first packet that gives it a role receiving that stream rewinds it to 0 as
+/// prompt work, so the peer gets the whole window at once rather than after a
+/// gap report of its own.
+#[test]
+fn first_heard_row_rewinds_its_own_stream() {
+    for (peer_zone, role) in [(zone(1), Role::Zone), (zone(2), Role::Gateway)] {
+        let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+        table.insert(addr(0), 5);
+        assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (5, 5));
+        table.contact(0, NodeIdentity::new(NodeId(9), 1), Some(peer_zone));
+        table.refresh(1_000, |_| {});
+        assert_eq!(table.role(0), role);
+        assert_eq!((table.link[0].out.own.acked, table.sent.own[0]), (0, 0));
+        assert!(table.flags(0).has(PeerFlags::RESEND_OWN), "{role:?}");
+    }
+}
+
 const OWN_GAP: PerStream<GapDue> = PerStream {
     own: GapDue::Report,
     relay: GapDue::Nothing,
