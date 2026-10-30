@@ -1088,12 +1088,12 @@ fn late_peer_of_another_zone_opens_no_gap() {
             let addrs = [sock(49_100), b[0], b[1]];
             let zones = ["a", "b", "b"];
             let o_config = zoned_config(vec![b[0]], "a", |_| {});
-            let mut nodes = vec![Node::start(
-                &router,
-                addrs[0],
-                store_for(id(0, 1)),
-                o_config,
-            )];
+            let taps = Taps::default();
+            let tap = Tap {
+                inner: router.bind(addrs[0]),
+                sent: taps.clone(),
+            };
+            let mut nodes = vec![Node::start_on(tap, addrs[0], store_for(id(0, 1)), o_config)];
             nodes.extend((1..3).map(|i| zoned_node(&router, &addrs, &zones, i)));
             nodes[0].hits(0..3).await;
             run_for(500).await;
@@ -1101,6 +1101,11 @@ fn late_peer_of_another_zone_opens_no_gap() {
             run_for(1).await;
             nodes[0].hits(3..5).await;
             run_for(1_000).await;
+            let own = own_packets(&tapped(&taps, 0));
+            assert!(
+                own.contains(&(b[1], 3, false)),
+                "b[1] got O's new cells unflagged"
+            );
             for node in &nodes {
                 assert_eq!(node.counters().await.gaps_abandoned, 0, "{}", node.addr);
             }
@@ -1238,7 +1243,7 @@ fn suspect_retries_are_header_only_probes() {
         // probed alone; G, which has acked nothing since it became the
         // gateway, is probed alone from its first retry.
         heartbeats(9).await;
-        for (dst, flagged) in [(z, false), (g, true)] {
+        for (dst, gateway) in [(z, false), (g, true)] {
             let sent: Vec<_> = wire.attempts.borrow()[mark..]
                 .iter()
                 .filter(|a| a.dst == dst)
@@ -1249,11 +1254,11 @@ fn suspect_retries_are_header_only_probes() {
                 .iter()
                 .position(|(_, p)| *p == Payload::Ack { probe: true })
                 .expect("probes");
-            assert_eq!(probes, if flagged { 1 } else { 4 }, "{dst}: {sent:?}");
+            assert_eq!(probes, if gateway { 1 } else { 4 }, "{dst}: {sent:?}");
             for (i, (_, payload)) in sent[..probes].iter().enumerate() {
                 let resend = Payload::Cells(CellPayload::Own {
                     range: wire::StreamRange::new(0, 3).unwrap(),
-                    relay_into_zone: flagged,
+                    relay_into_zone: gateway,
                     probe: i > 0,
                 });
                 assert_eq!(*payload, resend, "{dst}");
@@ -1391,6 +1396,27 @@ fn refused_send_to_a_suspect_holds_one_packet() {
         assert_eq!(wire.attempts.borrow()[mark].bytes, held.bytes);
         let sent = sent_payloads(&wire, mark + 1);
         assert!(sent.contains(&(z, probe)), "{sent:?}");
+    });
+}
+
+/// A greeting starts no wait, sent at once or held by a refusal and sent
+/// later, so a discovered peer that never answers is never awaited.
+#[test]
+fn greeting_starts_no_wait() {
+    run_paused(async {
+        let u = sock(4);
+        let wire = Rc::new(Wire::default());
+        wire.refuse.set(true);
+        let (_client, admin) = scripted(&wire, vec![u], "a", |_| {}).await;
+        heartbeats(1).await;
+        assert!(!wire.attempts.borrow().is_empty(), "the greeting was tried");
+        wire.refuse.set(false);
+        heartbeats(3).await;
+        let peer = *admin_snapshot(&admin).await.peers.first().unwrap();
+        assert_eq!(
+            (peer.role, peer.answer),
+            (Role::Unheard, AnswerState::Settled)
+        );
     });
 }
 
@@ -1542,7 +1568,7 @@ fn cannot_relay_from_a_zone_row_is_ignored() {
 /// for an answer, the frame and its retries, are lost.
 /// Each heartbeat of this node, 10 ms past each 100 (`mocked` starts it 10 ms
 /// in), runs `late(at)` ms after the instant `at` it was scheduled for.
-/// Returns the failovers, and how long after the first lost probe the first
+/// Returns the failovers, and how long after the first lost packet the first
 /// one came.
 async fn lost_attempts(withheld: usize, late: impl Fn(u64) -> u64) -> (u64, Option<u64>) {
     let (g1, g2) = (sock(2), sock(3));

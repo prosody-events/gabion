@@ -444,7 +444,9 @@ fn incarnation_change_resets_the_whole_row() {
     let mut table = one_row();
     let old = NodeIdentity::new(NodeId(9), 1);
     let new = NodeIdentity::new(NodeId(9), 2);
+    table.set_flag(0, PeerFlags::ACK_DUE, false);
     assert_eq!(table.contact(0, old, Some(zone(1))), Contact::First);
+    assert!(!table.flags(0).has(PeerFlags::ACK_DUE));
     assert_eq!(table.contact(0, old, None), Contact::Current);
     assert_eq!(table.link(0).zone, Some(zone(1)));
     for stream in [Stream::Own, Stream::Relay] {
@@ -485,7 +487,7 @@ fn incarnation_change_resets_the_whole_row() {
         (OwnMode::Plain, Answer::Settled)
     );
     assert_eq!(link.zone, Some(zone(2)));
-    assert_eq!(table.flags(0), PeerFlags::ACK_DUE);
+    assert_eq!(table.flags(0), PeerFlags::default());
     assert_eq!(link.prev_incarnation, Some(1));
     assert_eq!(link.identity, Some(new));
     assert_eq!(table.deadline[0], Deadline::NEVER);
@@ -674,17 +676,15 @@ fn role_refresh_equals_brute_force(case: RefreshCase) {
         }
     };
     for row in 0..n {
-        let expected = if case.rows[row].1 {
+        let (z, muted, _, heard) = case.rows[row];
+        let expected = if muted {
             Role::Incompatible
-        } else if !case.rows[row].3 {
+        } else if !heard {
             Role::Unheard
         } else if !eligible(row) {
             Role::Zone
         } else if (0..n).any(|other| {
-            other != row
-                && eligible(other)
-                && case.rows[other].0 == case.rows[row].0
-                && rank(other) > rank(row)
+            other != row && eligible(other) && case.rows[other].0 == z && rank(other) > rank(row)
         }) {
             Role::Remote
         } else {

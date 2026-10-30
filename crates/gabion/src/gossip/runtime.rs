@@ -942,8 +942,8 @@ where
         if role != Role::Remote
             && (kind != Round::Prompt || resend_own || flags.has(PeerFlags::RESEND_OWN))
         {
-            let probe = resend_own || hello;
-            let closed = self.send_stream(Stream::Own, row, heads.own, gaps, probe, now);
+            let own_probe = resend_own || hello;
+            let closed = self.send_stream(Stream::Own, row, heads.own, gaps, own_probe, now);
             // A stream capped by the quantum goes on in the next prompt round.
             self.peers.set_flag(
                 row,
@@ -968,8 +968,14 @@ where
         if !self.outbox.is_held() && (probe || (!sent_any && owed)) {
             let header = self.header_for(row, gaps, Payload::Ack { probe });
             let dst = self.peers.addr(row);
-            let sent =
-                (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
+            let sent = (self.outbox).send_header(
+                &header,
+                dst,
+                now,
+                asks,
+                &self.transport,
+                &mut self.counters,
+            );
             self.account(row, sent, asks, now);
             self.counters.liveness_probes += u64::from(probe);
             sent_any = true;
@@ -1046,8 +1052,14 @@ where
     ) -> (Option<u64>, Sent) {
         let handles = &self.frames[stream].handles;
         if handles.is_empty() {
-            let sent =
-                (self.outbox).send_header(&header, dst, now, &self.transport, &mut self.counters);
+            let sent = (self.outbox).send_header(
+                &header,
+                dst,
+                now,
+                true,
+                &self.transport,
+                &mut self.counters,
+            );
             return (None, sent);
         }
         let packets = Packets::new(
@@ -1163,6 +1175,7 @@ where
                 &header,
                 ask.addr,
                 now,
+                false,
                 &self.transport,
                 &mut self.counters,
             );
@@ -1274,11 +1287,12 @@ where
             abandoned_total,
             "Stopped asking {peer} to resend {missing} changes missing from its {stream} stream: it did \
              not answer {reports} requests over {waited_ms} ms. If {peer} still sends this \
-             stream, its retransmission timer resends the missing changes; if its gateway role \
-             moved or it restarted, they arrive from the new sender. Until they arrive, limits \
-             here under-count the traffic {peer} handled. If this repeats for a peer that is \
-             running, UDP from {peer} to this node is usually blocked or lossy in one direction: \
-             check NetworkPolicies and security groups between the two.",
+             stream, its next packet makes this node ask again and its retransmission timer \
+             resends the missing changes; if its gateway role moved or it restarted, they arrive \
+             from the new sender. Until they arrive, limits here under-count the traffic {peer} \
+             handled. If this repeats for a peer that is running, UDP from {peer} to this node \
+             is usually blocked or lossy in one direction: check NetworkPolicies and security \
+             groups between the two.",
         );
     }
 }
@@ -1341,10 +1355,10 @@ fn note_failover(counters: &mut GossipCounters, failover: Failover, suspect_afte
             failover_total,
             config_key,
             "Switched this node's gateway for zone {zone} from {old} to {new}, because {old} \
-             answered none of this node's packets or liveness checks for {unanswered_ms} ms \
-             (`gossip.suspect_after` is {suspect_after_ms} ms). {new} now receives every live \
-             change from this node that it has not acknowledged, so nothing is lost. Nothing to \
-             do if {old} restarted or left the cluster.",
+             answered none of this node's packets for {unanswered_ms} ms (`gossip.suspect_after` \
+             is {suspect_after_ms} ms). {new} now receives every live change from this node that \
+             it has not acknowledged, so nothing is lost. Nothing to do if {old} restarted or \
+             left the cluster.",
         ),
         (1, true) => tracing::info!(
             code = "gateway_failover",

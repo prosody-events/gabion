@@ -207,7 +207,7 @@ Message starts: "Could not send a gossip packet to this peer"
 
 Message starts: "Switched this node's gateway for zone" (info), "This node has switched gateways" (warn)
 
-**What happened.** This node sends its changes into each other zone through one member of it, its gateway there. That gateway answered none of this node's packets or liveness checks for `gossip.suspect_after` (`reason = "unanswered"`), or said it cannot reach most of its own zone (`reason = "cannot_relay"`), so the next member of that zone took over and was sent every live change this node holds; nothing is lost. Until it relays them, limits in that zone under-count this node's traffic, for up to `gossip.suspect_after` plus three heartbeats.
+**What happened.** This node sends its changes into each other zone through one member of it, its gateway there. That gateway answered none of this node's packets for `gossip.suspect_after` (`reason = "unanswered"`), or said it cannot reach most of its own zone (`reason = "cannot_relay"`), so the next member of that zone took over and was sent every live change this node holds; nothing is lost. Until it relays them, limits in that zone under-count this node's traffic, for up to `gossip.suspect_after` plus three heartbeats.
 
 **Why.** The gateway restarted or left the cluster, or UDP between this node and that zone drops packets; with `cannot_relay`, the gateway's path into its own zone is broken. Repeated switches mean pods in that zone keep restarting or the network between the zones is lossy.
 

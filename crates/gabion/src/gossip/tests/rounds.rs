@@ -390,10 +390,9 @@ fn restart_resets_streams_and_requests_a_sweep() {
 }
 
 /// A node restarted into an idle cluster, at a new address or its old one,
-/// hears every peer through the answers to its greetings, and the greeting or
-/// ack each peer sends a new row or a restarted peer, so it asks them for a
-/// join sweep and gets its previous incarnation's cells back, although no peer
-/// has anything to send.
+/// hears every peer through the answers to its greetings, so it asks them for
+/// a join sweep and gets its previous incarnation's cells back, although no
+/// peer has anything to send.
 #[test]
 fn restarted_node_sweeps_from_idle_peers() {
     for same_address in [false, true] {

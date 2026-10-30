@@ -79,8 +79,8 @@ impl<T> IndexMut<Stream> for PerStream<T> {
 )]
 pub enum Role {
     /// A peer not heard from yet: it is sent the own cells raised since it
-    /// was added and a greeting probe each heartbeat, but no relay stream,
-    /// until its first packet names its zone.
+    /// was added and a greeting probe at once and each heartbeat, but no
+    /// relay stream, until its first packet arrives.
     Unheard,
     /// A peer of this node's zone, or of no zone: it gets the own and relay
     /// streams directly.
@@ -655,10 +655,8 @@ impl PeerTable {
 
     /// Note the sender identity and zone of a packet from `row`. A known zone
     /// changes only with the incarnation, so a zone-0 header never clears it.
-    /// A peer heard for the first time, or in a new incarnation (which resets
-    /// the whole row), is owed one ack, so a node that started into an idle
-    /// cluster hears every peer it greets; a first packet also refreshes the
-    /// roles, so an unheard row takes its role.
+    /// A first packet refreshes the roles, so an unheard row takes its role;
+    /// a new incarnation resets the whole row.
     pub(super) fn contact(
         &mut self,
         row: usize,
@@ -668,7 +666,6 @@ impl PeerTable {
         let link = &mut self.link[row];
         let contact = match link.identity {
             None => {
-                self.flags[row].set(PeerFlags::ACK_DUE, true);
                 // Its role follows at the next refresh.
                 self.stale = true;
                 Contact::First
@@ -688,7 +685,7 @@ impl PeerTable {
                 };
                 self.sent.own[row] = 0;
                 self.sent.relay[row] = 0;
-                self.flags[row] = PeerFlags::ACK_DUE;
+                self.flags[row] = PeerFlags::default();
                 self.stale = true;
                 Contact::Restarted
             }

@@ -82,7 +82,7 @@ pub trait GossipTransport {
 }
 
 /// A packet the kernel refused: where it goes, when it was refused, and
-/// whether it asks its addressee for an answer.
+/// whether it starts a wait for an answer once it leaves.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Held {
     pub(super) dst: SocketAddr,
@@ -147,18 +147,19 @@ impl Outbox {
         (packets.closed_through(), total)
     }
 
-    /// Send a packet of `header` alone. Call it only while nothing is held.
+    /// Send a packet of `header` alone, which starts a wait for an answer
+    /// once it leaves iff `asks`. Call it only while nothing is held.
     pub(super) fn send_header<T: GossipTransport, P: Copy + Into<Payload>>(
         &mut self,
         header: &Header<P>,
         dst: SocketAddr,
         now: u64,
+        asks: bool,
         transport: &T,
         counters: &mut GossipCounters,
     ) -> Sent {
         debug_assert!(self.held.is_none(), "a held packet is never overwritten");
         self.packet.header_only(header);
-        let asks = header.payload.into().asks_answer();
         self.send(dst, now, asks, transport, counters)
     }
 

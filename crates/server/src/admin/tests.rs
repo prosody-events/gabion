@@ -220,8 +220,9 @@ fn snapshot_json_shape_is_pinned() {
         );
         assert_eq!(body["peers"][0]["role"], "unheard");
         assert_eq!(body["peers"][0]["zone"], "unknown");
-        // A wait is shown exactly while an answer is awaited: none before
-        // the first send, and from the heartbeat that sends a hit.
+        // A wait is shown exactly while an answer is awaited: none while only
+        // greetings have gone out (a greeting waits on nothing), and from the
+        // heartbeat that sends a hit.
         assert_eq!(body["peers"][0]["answer"], "settled");
         assert!(body["peers"][0]["unanswered_ms"].is_null());
         let fingerprint = rule_table.rules()[0].fingerprint();

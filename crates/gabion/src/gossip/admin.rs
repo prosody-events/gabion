@@ -115,9 +115,9 @@ pub struct GossipCounters {
     pub relay_stalls: u64,
     /// Rows whose role changed.
     pub role_changes: u64,
-    /// Header-only probes sent: retries to a suspect or to a gateway that has
-    /// acked nothing yet, and greetings to peers not yet heard from that no
-    /// data carries.
+    /// Header-only probes sent: retries with nothing to resend (to a suspect,
+    /// to a gateway that has acked nothing yet, or to a peer owed nothing),
+    /// and greetings to peers not yet heard from that no data carries.
     pub liveness_probes: u64,
     /// Gap reports sent: a peer's stream skipped positions.
     pub gap_reports_sent: u64,

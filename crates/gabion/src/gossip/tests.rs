@@ -2488,16 +2488,8 @@ fn cut_round_resumes_as_the_strongest_round() {
             mocked(&wire, store_for(node(0xA)), sim_config(vec![p1, p2])).await;
         end_want(&wire, &[(p1, id1), (p2, id2)]);
         heartbeats(1).await;
-        // Only the acks owed to peers heard for the first time.
-        let acks = sent_payloads(&wire, 0);
-        assert_eq!(
-            acks,
-            [
-                (p1, Payload::Ack { probe: false }),
-                (p2, Payload::Ack { probe: false })
-            ]
-        );
-        wire.attempts.borrow_mut().clear();
+        // Peers heard for the first time are owed no ack.
+        assert_eq!(sent_payloads(&wire, 0), []);
 
         // P1 probes, so a prompt round owes it an answer; P2 sends stream
         // data, which only a heartbeat acknowledges alone.
