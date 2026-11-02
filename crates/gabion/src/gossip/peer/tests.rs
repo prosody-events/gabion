@@ -993,9 +993,9 @@ fn first_heard_row_rewinds_its_own_stream() {
 /// A peer discovery placed in a zone is routed by it before it is heard: in
 /// this node's zone it is a zone peer, sent both streams from 0 and owed a
 /// greeting, and in another it is that zone's gateway when it outranks the
-/// heard members, owed none. Its header then wins: the same zone changes
-/// nothing, another zone re-roles it, and discovery re-reporting a zone moves
-/// only a peer not yet heard.
+/// heard members, owed none; one placed in no zone stays unheard. Its header
+/// then wins: the same zone changes nothing, another zone re-roles it, and
+/// discovery re-reporting a zone moves only a peer not yet heard.
 #[test]
 fn discovered_zone_routes_a_peer_until_its_header_wins() {
     let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
@@ -1017,10 +1017,11 @@ fn discovered_zone_routes_a_peer_until_its_header_wins() {
     table.insert(placed(same, 1), 5);
     table.insert(placed(hi, 2), 5);
     table.insert(Peer::new(lo), 5);
+    table.insert(Peer::new(late), 5);
     table.contact(2, heard(1), Some(zone(2)));
     table.refresh(0, |_| {});
-    let expected = [Role::Zone, Role::Gateway, Role::Remote];
-    assert_eq!(roles(&table, &[same, hi, lo]), expected);
+    let expected = [Role::Zone, Role::Gateway, Role::Remote, Role::Unheard];
+    assert_eq!(roles(&table, &[same, hi, lo, late]), expected);
     for (row, greeted) in [(0, true), (1, false)] {
         let flags = table.flags(row);
         assert_eq!((table.sent.own[row], table.link[row].out.own.acked), (0, 0));
@@ -1041,7 +1042,6 @@ fn discovered_zone_routes_a_peer_until_its_header_wins() {
     table.refresh(10, |_| {});
     assert_eq!(roles(&table, &[hi, lo]), [Role::Zone, Role::Gateway]);
 
-    table.insert(Peer::new(late), 5);
     assert_eq!(table.insert(placed(late, 3), 5), Insert::Present);
     assert_eq!(table.insert(placed(lo, 3), 5), Insert::Present);
     table.refresh(10, |_| {});
