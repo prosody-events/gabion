@@ -74,8 +74,9 @@ load that a textbook anti-entropy loop would not:
    without an ack brings a resend, so a lost packet costs one round, not a
    lifetime. A peer whose zone is none gets everything directly. A peer not
    yet heard from is routed by the zone discovery reports for it (a
-   Kubernetes EndpointSlice endpoint's `zone`) until its own headers name
-   one, which wins; one with neither gets only the cells raised since it was
+   Kubernetes EndpointSlice endpoint's `zone`) until it is first heard;
+   from then on its headers' zone wins, even none; one with neither gets
+   only the cells raised since it was
    added, greeted with `PROBE` each heartbeat until it answers with its zone.
    A node that starts asks two peers for a *join sweep* of every live cell.
 2. **Adaptive emit rate** — the gossip cadence adapts to per-rule
@@ -291,7 +292,8 @@ outside the peer table is merged and nothing more: never acked or relayed.
 
 A node that starts asks its two highest-weight peers it has heard from in
 its zone (or, once no peer is or may be of its zone, one heard peer of any
-zone) for a join sweep, greeting the unheard peers of its zone meanwhile,
+zone) for a join sweep, greeting meanwhile the unheard peers of its zone
+and its unheard gateways,
 and asks again when its zone becomes known,
 retrying each heartbeat until a page arrives, and each source pages its live
 cells, `q` per prompt round, to at most `gossip.sweep_concurrency`

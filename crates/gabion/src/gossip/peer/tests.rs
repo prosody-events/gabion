@@ -995,7 +995,8 @@ fn first_heard_row_rewinds_its_own_stream() {
 /// greeting, and in another it is that zone's gateway when it outranks the
 /// heard members, owed none; one placed in no zone stays unheard. Its header
 /// then wins: the same zone changes nothing, another zone re-roles it, and
-/// discovery re-reporting a zone moves only a peer not yet heard.
+/// discovery re-reporting a zone, or another one, moves only a peer not yet
+/// heard, and an unheard one routed to another zone owes no greeting.
 #[test]
 fn discovered_zone_routes_a_peer_until_its_header_wins() {
     let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
@@ -1046,6 +1047,14 @@ fn discovered_zone_routes_a_peer_until_its_header_wins() {
     assert_eq!(table.insert(placed(lo, 3), 5), Insert::Present);
     table.refresh(10, |_| {});
     assert_eq!(roles(&table, &[late, lo]), [Role::Gateway, Role::Gateway]);
+    assert!(
+        !table.flags(3).has(PeerFlags::ACK_DUE),
+        "late is routed to zone 3 unheard"
+    );
+
+    assert_eq!(table.insert(placed(late, 1), 5), Insert::Present);
+    table.refresh(10, |_| {});
+    assert_eq!(roles(&table, &[late]), [Role::Zone]);
 }
 
 /// A zone row's suspicion is a stalled relay, and counts toward

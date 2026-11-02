@@ -2,6 +2,7 @@
 mod tests;
 
 use crate::discovery::{DiscoveryConfig, Peer, PeerDiscovery, PeerEvent};
+use crate::zone::ZoneHash;
 use ahash::AHashMap;
 use async_stream::stream;
 use futures::stream::{SelectAll, Stream, StreamExt, select_all};
@@ -13,8 +14,6 @@ use kube::{Api, Client};
 use std::collections::hash_map::Entry;
 use std::net::{IpAddr, SocketAddr};
 use tokio::sync::oneshot;
-
-use crate::zone::ZoneHash;
 
 const DEFAULT_GABION_SERVICE_NAME: &str = "gabion";
 
@@ -435,14 +434,12 @@ fn watch_target(
     }
 }
 
-/// Per-slice peer accounting for one `Service` target. `watch_target`
-/// drives one of these for the lifetime of its EndpointSlice watch; the
-/// inner map is keyed by EndpointSlice `metadata.name` so that
-/// successive `Apply` events for the same slice replace the old peer
-/// set in place, and each slice's peers by address, so a peer
-/// re-reported with another zone is one `Added`, not a removal and an
-/// add. Lifted out of `watch_target` as its own type so the
-/// snapshot/diff semantics are unit-testable without spinning up a kube
+/// Per-slice peer accounting for one `Service` target, driven by
+/// `watch_target` for the lifetime of its EndpointSlice watch: keyed by
+/// EndpointSlice `metadata.name`, so an `Apply` replaces that slice's set in
+/// place, and each slice's peers by address, so a zone change is one `Added`.
+/// An address another slice still lists is not removed. Lifted out of
+/// `watch_target` so the diff semantics are unit-testable without a kube
 /// client.
 #[derive(Default)]
 pub(super) struct EndpointSlicePeerSet {
@@ -461,9 +458,9 @@ pub(super) struct PeerSetDiff {
 
 impl EndpointSlicePeerSet {
     /// Replace the cached peer set for `slice.metadata.name` with the
-    /// parsed peers of `slice`. Returns the addresses gone as `removed`
-    /// and the peers new or changed as `added`. A slice with no name is
-    /// silently dropped.
+    /// parsed peers of `slice`. Returns the addresses gone from every slice
+    /// as `removed` and the peers new or changed as `added`. A slice with no
+    /// name is silently dropped.
     pub(super) fn apply(
         &mut self,
         slice: &EndpointSlice,
@@ -480,7 +477,7 @@ impl EndpointSlicePeerSet {
                 .copied()
                 .collect(),
             removed: (old.values())
-                .filter(|peer| !new.contains_key(&peer.addr))
+                .filter(|peer| !new.contains_key(&peer.addr) && !self.lists(&peer.addr))
                 .copied()
                 .collect(),
         };
@@ -488,17 +485,25 @@ impl EndpointSlicePeerSet {
         diff
     }
 
-    /// Forget the cached peer set for `slice`; returns the peers the
-    /// caller now needs to emit `Removed` for. Unknown slice names are
-    /// a no-op.
+    /// Forget the cached peer set for `slice`; returns the peers gone from
+    /// every slice, which the caller now needs to emit `Removed` for. Unknown
+    /// slice names are a no-op.
     pub(super) fn delete(&mut self, slice: &EndpointSlice) -> Vec<Peer> {
-        let Some(name) = slice.metadata.name.as_deref() else {
+        let Some(peers) =
+            (slice.metadata.name.as_deref()).and_then(|name| self.by_slice.remove(name))
+        else {
             return Vec::new();
         };
-        self.by_slice
-            .remove(name)
-            .map(|peers| peers.into_values().collect())
-            .unwrap_or_default()
+        peers
+            .into_values()
+            .filter(|peer| !self.lists(&peer.addr))
+            .collect()
+    }
+
+    /// Whether a cached slice lists `addr`: Kubernetes may list an endpoint in
+    /// two slices at once while it moves between them.
+    fn lists(&self, addr: &SocketAddr) -> bool {
+        self.by_slice.values().any(|peers| peers.contains_key(addr))
     }
 
     /// Empty the map and yield every peer it contained — used at

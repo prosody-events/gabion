@@ -1250,9 +1250,9 @@ fn departed_unheard_peer_of_another_zone_asks_no_sweep() {
 }
 
 /// A joiner asks for its join sweep only peers it has heard: not a zone peer
-/// that has not discovered it yet, and, while that one may still answer, not
-/// the heard peer of another zone either. Once the zone peer discovers it, it
-/// asks that one and ends exact.
+/// that has not discovered it yet, and, while a zone peer discovery placed is
+/// still unheard, not the heard peer of another zone either. Once the zone peer
+/// discovers it, it asks that one and ends exact.
 #[test]
 fn joiner_sweeps_only_from_heard_peers_of_its_zone() {
     run_paused(async {
@@ -1310,40 +1310,42 @@ fn joiner_sweeps_only_from_heard_peers_of_its_zone() {
     });
 }
 
-/// A node restarted into an idle cluster, whose peers discovery places in its
-/// zone, greets them while its join sweep waits, so it hears them, asks them,
-/// and gets its previous incarnation's cells back although no peer has
-/// anything to send.
+/// A node restarted into an idle cluster greets the peers discovery places in
+/// its zone or, alone in it, its gateway in another, while its join sweep
+/// waits, so it hears them, asks one, and gets its previous incarnation's
+/// cells back although no peer has anything to send.
 #[test]
-fn restarted_node_greets_discovered_zone_peers_for_its_sweep() {
-    run_paused(async {
-        let router = SimRouter::new();
-        let addrs = addrs(49_800, 4);
-        let zones = ["a"; 3];
-        let mut nodes: Vec<_> = (0..3)
-            .map(|i| zoned_node(&router, &addrs[..3], &zones, i))
-            .collect();
-        nodes[0].hits(1..6).await;
-        run_for(500).await;
-        let peers = nodes.split_off(1);
-        assert_totals(&peers.iter().collect::<Vec<_>>(), 5);
-        nodes.pop().unwrap().stop().await;
-        for peer in &peers {
-            peer.tell(PeerEvent::Removed(Peer::new(addrs[0])));
-            peer.tell(placed(addrs[3], "a"));
-        }
-        run_for(1_000).await;
-        let config = zoned_config(vec![], "a", |_| {});
-        let restarted = Node::start(&router, addrs[3], store_for(id(0, 2)), config);
-        for &addr in &addrs[1..3] {
-            restarted.tell(placed(addr, "a"));
-        }
-        run_for(1_000).await;
-        assert_eq!(restarted.agg.total(), 5);
-        let mut nodes = peers;
-        nodes.push(restarted);
-        stop_all(nodes).await;
-    });
+fn restarted_node_greets_discovered_peers_for_its_sweep() {
+    for name in ["a", "b"] {
+        run_paused(async {
+            let router = SimRouter::new();
+            let addrs = addrs(49_800, 4);
+            let zones = ["a", name, name];
+            let mut nodes: Vec<_> = (0..3)
+                .map(|i| zoned_node(&router, &addrs[..3], &zones, i))
+                .collect();
+            nodes[0].hits(1..6).await;
+            run_for(500).await;
+            let peers = nodes.split_off(1);
+            assert_totals(&peers.iter().collect::<Vec<_>>(), 5);
+            nodes.pop().unwrap().stop().await;
+            for peer in &peers {
+                peer.tell(PeerEvent::Removed(Peer::new(addrs[0])));
+                peer.tell(placed(addrs[3], "a"));
+            }
+            run_for(1_000).await;
+            let config = zoned_config(vec![], "a", |_| {});
+            let restarted = Node::start(&router, addrs[3], store_for(id(0, 2)), config);
+            for &addr in &addrs[1..3] {
+                restarted.tell(placed(addr, name));
+            }
+            run_for(1_000).await;
+            assert_eq!(restarted.agg.total(), 5, "{name}");
+            let mut nodes = peers;
+            nodes.push(restarted);
+            stop_all(nodes).await;
+        });
+    }
 }
 
 // -- scripted peers -----------------------------------------------------------

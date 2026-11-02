@@ -9,8 +9,9 @@
 //! (to zone peers, and flagged for relay to one gateway per remote zone),
 //! the relay stream to zone peers, a resend with `PROBE` when a heartbeat
 //! passed without an ack (a header-only probe to a suspect or to a gateway
-//! that has acked nothing), a greeting to a peer not yet heard from (of this
-//! zone only while a join sweep waits), and owed acks, gap reports and probe
+//! that has acked nothing), a greeting to a peer not yet heard from whose
+//! zone is unknown, or, while a join sweep waits, to one discovery placed in
+//! this zone or as a gateway, and owed acks, gap reports and probe
 //! answers. After each iteration the runtime calls [`AggregateStore::apply`]
 //! once with the rows the arm produced, and once more per full expiry batch
 //! or drained datagram. Nothing on a request, packet or round path
@@ -739,11 +740,7 @@ where
                 // sending this node anything may have held cells no stream
                 // will bring: sweep again. Another zone's members reach this
                 // zone through its gateway's relay.
-                if link.identity().is_none()
-                    && !link
-                        .zone()
-                        .is_some_and(|zone| self.peers.is_other_zone(zone))
-                {
+                if link.identity().is_none() && !self.peers.is_other_zone(link.zone()) {
                     self.sweep_want.get_or_insert_default();
                 }
                 self.prompt_work = true;
@@ -887,8 +884,9 @@ where
     /// Service one peer row: retry a timed-out stream (a header-only probe
     /// to a suspect, to a gateway that has acked nothing, or to a peer owed
     /// nothing), report due gaps, send the streams its role gets, greet a
-    /// peer not yet heard from (of this zone, while a join sweep waits), and
-    /// send owed acks or probe answers alone when no data carries them.
+    /// peer not yet heard from whose zone is unknown, or, while a join sweep
+    /// waits, to one discovery placed in this zone or as a gateway, and send
+    /// owed acks or probe answers alone when no data carries them.
     fn serve_row(&mut self, kind: Round, row: usize, now: u64, heads: PerStream<u64>) {
         let role = self.peers.role(row);
         if role == Role::Incompatible {
@@ -948,15 +946,16 @@ where
         let resend_own = own_retry && !probe_only;
         // A peer not yet heard from is greeted with `PROBE`, at once and then
         // each heartbeat, so its answer names its zone; one discovery placed
-        // in this zone is greeted so only while a join sweep waits, since
-        // only a heard peer is asked. Nothing waits on a greeting.
+        // in this zone, or as a gateway, is greeted so only while a join
+        // sweep waits, since only a heard peer is asked (a gateway answers
+        // the sweep of a node alone in its zone). Nothing waits on a greeting.
         let hello = (kind == Round::Heartbeat || flags.has(PeerFlags::ACK_DUE))
             && match role {
                 Role::Unheard => true,
-                Role::Zone => {
+                Role::Zone | Role::Gateway => {
                     self.sweep_want.is_some() && self.peers.link(row).identity().is_none()
                 }
-                Role::Gateway | Role::Remote | Role::Incompatible => false,
+                Role::Remote | Role::Incompatible => false,
             };
         let mut sent_any = false;
         if role != Role::Remote

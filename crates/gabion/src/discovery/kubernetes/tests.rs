@@ -3,7 +3,7 @@ use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 impl EndpointSlicePeerSet {
     /// Replace the entire peer map with `other`'s, as a relist does.
@@ -185,23 +185,33 @@ fn endpoint_slice_peer_set_apply_emits_added_and_removed_diff() {
     );
 }
 
+/// Both the cached peer set and the peers its emitted events add and remove,
+/// folded in the order `watch_target` yields them, match the union of the live
+/// slices, so an address two slices list survives either one going.
 #[quickcheck]
 fn quickcheck_endpoint_slice_events_match_live_slice_model(
     case: EndpointSliceEventsCase,
 ) -> TestResult {
     let mut peer_set = EndpointSlicePeerSet::default();
     let mut live = BTreeMap::new();
+    let mut emitted = BTreeSet::new();
 
     for event in case.events {
         let name = format!("slice-{}", event.slice);
         if event.delete {
-            peer_set.delete(&slice(&name, &["10.0.0.9"], Some(true)));
+            for peer in peer_set.delete(&slice(&name, &["10.0.0.9"], Some(true))) {
+                emitted.remove(&peer.addr);
+            }
             live.remove(&name);
         } else {
             let first = format!("10.0.0.{}", event.first);
             let second = format!("10.0.0.{}", event.second);
             let current = slice(&name, &[&first, &second], Some(event.ready));
-            peer_set.apply(&current, self_addr());
+            let diff = peer_set.apply(&current, self_addr());
+            for peer in &diff.removed {
+                emitted.remove(&peer.addr);
+            }
+            emitted.extend(diff.added.iter().map(|peer| peer.addr));
 
             let mut peers = if event.ready {
                 vec![
@@ -222,6 +232,13 @@ fn quickcheck_endpoint_slice_events_match_live_slice_model(
         if peer_set.snapshot_peers() != expected {
             return TestResult::error("EndpointSlice peer set diverged from live slice model");
         }
+        if !emitted
+            .iter()
+            .copied()
+            .eq(expected.iter().map(|peer| peer.addr))
+        {
+            return TestResult::error("emitted peer events diverged from the live slice model");
+        }
     }
     TestResult::passed()
 }
@@ -239,7 +256,7 @@ fn endpoint_zone_rides_on_its_peers() {
     let addr = "10.0.0.2:18080".parse().expect("addr");
     let east = Peer {
         addr,
-        zone: Some(crate::zone::ZoneName::parse("us-east-1a").unwrap().hash()),
+        zone: crate::zone::ZoneHash::parse("us-east-1a").ok(),
     };
     for (zone, peer) in [
         (Some("us-east-1a"), east),

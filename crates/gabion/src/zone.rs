@@ -42,8 +42,8 @@ impl ZoneHash {
     /// A placeholder for tables sized before any zone is known.
     pub(crate) const MIN: Self = Self(NonZeroU32::MIN);
 
-    /// The hash of zone name `text`, validated as [`ZoneName::parse`]
-    /// validates it, without keeping the name.
+    /// The hash of zone name `text`, validated against the grammar
+    /// [`ZoneName`] states, without keeping the name.
     pub(crate) fn parse(text: &str) -> Result<Self, ZoneError> {
         let len = text.chars().count();
         let edge = |c: Option<char>| c.filter(|c| !c.is_ascii_alphanumeric());

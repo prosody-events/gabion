@@ -168,7 +168,7 @@ pub struct PeerEntry {
     pub relay_unacked: u64,
 }
 
-/// A peer's zone: its headers' once heard, before that discovery's.
+/// A peer's zone: its headers' once it is heard, discovery's before that.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(
     feature = "serde",
@@ -176,8 +176,8 @@ pub struct PeerEntry {
     serde(rename_all = "snake_case")
 )]
 pub enum PeerZone {
-    /// Neither heard with a zone nor placed in one by discovery, or the peer
-    /// announces no zone.
+    /// No zone known: not heard and not placed by discovery, or heard
+    /// announcing none.
     Unknown,
     /// This node's zone.
     Same,

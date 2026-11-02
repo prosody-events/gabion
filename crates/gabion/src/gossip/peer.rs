@@ -112,8 +112,8 @@ pub(super) struct PeerFlags(u8);
 impl PeerFlags {
     /// The peer is owed a header-only packet: at a heartbeat a standalone
     /// ack, since it sent stream data after this node's last packet to it;
-    /// on a new row not placed in another zone, its first greeting, on the
-    /// next round of any kind.
+    /// on a new row, its first greeting, on the next round of any kind; an
+    /// unheard row routed to another zone owes none.
     pub(super) const ACK_DUE: Self = Self(0x01);
     /// A gap open on the peer's own stream (the mark `OwnMode` selects) or
     /// relay stream, whose report is prompt work.
@@ -642,7 +642,7 @@ impl PeerTable {
     /// own stream starting at `own_head`, so until its first packet it is
     /// sent only the cells raised from now on; one whose zone discovery
     /// named takes that zone's role at the next refresh. Each owes the peer
-    /// a greeting, unless discovery placed it in another zone.
+    /// a greeting.
     pub(super) fn insert(&mut self, peer: Peer, own_head: u64) -> Insert {
         let hash = addr_hash(peer.addr);
         if let Some(row) = self.lookup(hash, peer.addr) {
@@ -660,11 +660,7 @@ impl PeerTable {
             return Insert::Full;
         }
         self.role[row] = Role::Unheard;
-        self.flags[row] = if peer.zone.is_some_and(|zone| self.is_other_zone(zone)) {
-            PeerFlags::default()
-        } else {
-            PeerFlags::ACK_DUE
-        };
+        self.flags[row] = PeerFlags::ACK_DUE;
         self.sent.own[row] = own_head;
         self.sent.relay[row] = 0;
         self.deadline[row] = Deadline::NEVER;
@@ -1138,22 +1134,28 @@ impl PeerTable {
     /// both zones known and different, and the peer speaks this version.
     fn remote_zone(&self, row: usize) -> Option<ZoneHash> {
         let zone = self.link[row].zone()?;
-        (self.is_other_zone(zone) && self.role[row] != Role::Incompatible).then_some(zone)
+        (self.is_other_zone(Some(zone)) && self.role[row] != Role::Incompatible).then_some(zone)
     }
 
     /// Whether `zone` is known to differ from this node's.
-    pub(super) fn is_other_zone(&self, zone: ZoneHash) -> bool {
-        self.local_zone.is_some_and(|local| local != zone)
+    pub(super) fn is_other_zone(&self, zone: Option<ZoneHash>) -> bool {
+        self.local_zone
+            .zip(zone)
+            .is_some_and(|(local, zone)| local != zone)
     }
 
     /// Give `row` role `new`; returns whether it changed. A stream the row
     /// starts receiving, or receives with a new kind of ack, rewinds to 0 as
     /// prompt work (an unheard row first heard included); a row left receiving
-    /// nothing has nothing to wait for unless it is suspect.
+    /// nothing has nothing to wait for unless it is suspect; an unheard row
+    /// routed to another zone owes no greeting.
     fn apply_role(&mut self, row: usize, new: Role) -> bool {
         let old = std::mem::replace(&mut self.role[row], new);
         if old == new {
             return false;
+        }
+        if matches!(new, Role::Gateway | Role::Remote) && self.link[row].identity().is_none() {
+            self.flags[row].set(PeerFlags::ACK_DUE, false);
         }
         if new.gets_own() {
             self.tx(row, Stream::Own).reset();

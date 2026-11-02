@@ -19,12 +19,13 @@ pub trait PeerDiscovery {
     fn peer_events(self) -> impl Stream<Item = Result<PeerEvent, Self::Error>> + Send;
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Peer {
     pub addr: SocketAddr,
     /// The zone discovery saw for the peer (a Kubernetes EndpointSlice
     /// endpoint's `zone`), if any. The runtime routes a peer by it only until
-    /// the peer's own headers announce its zone.
+    /// it first hears from the peer; from then on the peer's headers' zone,
+    /// even none, wins.
     pub zone: Option<ZoneHash>,
 }
 
