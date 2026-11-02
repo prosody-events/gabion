@@ -141,27 +141,35 @@ fn endpoint_slice_peer_set_updates_and_deletes_snapshots() {
 
 /// A relist forgets each slice it did not list, since the watcher reports no
 /// `Delete` for one deleted while it was disconnected: a peer only such a
-/// slice listed goes when the relist ends, and one a listed slice took over
-/// goes once that slice drops it.
+/// slice listed goes when the relist ends, one a listed slice took over goes
+/// once that slice drops it, and a slice the relist listed again is kept.
 #[test]
 fn endpoint_slice_peer_set_relist_forgets_unlisted_slices() {
     let peer = |addr: &str| Peer::new(format!("{addr}:18080").parse().expect("addr"));
     let mut peer_set = EndpointSlicePeerSet::default();
     let slice_a = slice("slice-a", &["10.0.0.2", "10.0.0.3"], Some(true));
     peer_set.apply(&slice_a, self_addr());
-    peer_set.apply(&slice("slice-b", &["10.0.0.4"], Some(true)), self_addr());
+    let slice_b = slice("slice-b", &["10.0.0.4", "10.0.0.5"], Some(true));
+    peer_set.apply(&slice_b, self_addr());
 
     peer_set.relist();
-    let moved = slice("slice-c", &["10.0.0.2", "10.0.0.3"], Some(true));
-    assert_eq!(peer_set.apply(&moved, self_addr()).removed, []);
-    assert_eq!(peer_set.relisted(), [peer("10.0.0.4")]);
-
-    let shrunk = slice("slice-c", &["10.0.0.3"], Some(true));
     assert_eq!(
-        peer_set.apply(&shrunk, self_addr()).removed,
-        [peer("10.0.0.2")]
+        peer_set.apply(&slice_a, self_addr()),
+        PeerSetDiff::default()
     );
-    assert_eq!(peer_set.snapshot_peers(), [peer("10.0.0.3")]);
+    let moved = slice("slice-c", &["10.0.0.4"], Some(true));
+    assert_eq!(peer_set.apply(&moved, self_addr()).removed, []);
+    assert_eq!(peer_set.relisted(), [peer("10.0.0.5")]);
+
+    let emptied = slice("slice-c", &[], Some(true));
+    assert_eq!(
+        peer_set.apply(&emptied, self_addr()).removed,
+        [peer("10.0.0.4")]
+    );
+    assert_eq!(
+        peer_set.snapshot_peers(),
+        [peer("10.0.0.2"), peer("10.0.0.3")]
+    );
 }
 
 #[test]
