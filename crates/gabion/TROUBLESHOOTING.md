@@ -209,7 +209,7 @@ Message starts: "Switched this node's gateway for zone" (info), "This node has s
 
 **What happened.** This node sends its changes into each other zone through one member of it, its gateway there. That gateway answered none of this node's packets for `gossip.suspect_after` (`reason = "unanswered"`), or said it cannot reach most of its own zone (`reason = "cannot_relay"`), so the next member of that zone took over and was sent every live change this node holds; nothing is lost. Until it relays them, limits in that zone under-count this node's traffic, for up to `gossip.suspect_after` plus three heartbeats.
 
-**Why.** The gateway restarted or left the cluster, or UDP between this node and that zone drops packets; with `cannot_relay`, the gateway's path into its own zone is broken. Repeated switches mean pods in that zone keep restarting or the network between the zones is lossy.
+**Why.** The gateway restarted or left the cluster, or UDP between this node and that zone drops packets; with `cannot_relay`, the gateway's path into its own zone is broken. A pod that discovery has just placed in that zone can become the gateway before it has spoken; if it has not discovered this node within `gossip.suspect_after`, the next member takes over the same way. Repeated switches mean pods in that zone keep restarting or the network between the zones is lossy.
 
 **What to do next.** Nothing for a single switch after a restart. If the warning repeats, check restarts in the zone named by `zone_hash`, then the network path and any NetworkPolicy or security group between the zones; with `cannot_relay`, read the old gateway's `relay_stalled` lines. If the pods are healthy and the network between zones loses packets, raise `gossip.suspect_after` to make switches rarer at the cost of slower failover.
 
@@ -223,7 +223,7 @@ Message starts: the peer's address, then "a peer in this node's zone, has not ac
 
 **What happened.** This node relays other zones' changes into its own zone, and one peer of its zone has acknowledged none of them for `stalled_ms`, so it is missing those counts and limits enforced there under-count and allow requests over the limit. gabion keeps resending (once the peer is suspect, as one small probe per heartbeat whose answer brings the resend), and the counts arrive as soon as the path works.
 
-**Why.** Usually UDP from this node to that peer is blocked in one direction, or the peer is overloaded. When most of the zone stalls, this node also tells the nodes it relays for that it cannot relay, and they switch gateways (`gateway_failover` with `reason = "cannot_relay"`).
+**Why.** Usually UDP from this node to that peer is blocked in one direction, or the peer is overloaded. Only a peer this node has heard from is reported: one that discovery placed in the zone and that has not answered yet may simply not have discovered this node. When most of the zone stalls, this node also tells the nodes it relays for that it cannot relay, and they switch gateways (`gateway_failover` with `reason = "cannot_relay"`).
 
 **What to do next.** Check the NetworkPolicies and security groups between the two pods, and the peer's CPU.
 

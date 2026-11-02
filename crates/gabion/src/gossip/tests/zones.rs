@@ -1116,6 +1116,236 @@ fn late_peer_of_another_zone_opens_no_gap() {
     assert_logged(&logs, "gap_abandoned", 0, &[]);
 }
 
+/// A peer discovery places in zone `name`.
+fn placed(addr: SocketAddr, name: &str) -> PeerEvent {
+    PeerEvent::Added(Peer {
+        addr,
+        zone: Some(zone(name)),
+    })
+}
+
+/// A joiner that discovery places in zone b is routed before it sends a
+/// packet: the origin it outranks there makes it its gateway and sends it its
+/// whole own stream flagged, the origin it does not outrank sends it nothing,
+/// and its zone peer sends it both streams from 0 within a floor of
+/// discovering it. Once it runs, every node ends exact.
+#[test]
+fn discovered_zone_routes_a_joiner_before_it_speaks() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let weight = |o: NodeIdentity, a| rendezvous_weight(hash_fingerprint(o.node_id.0), a);
+        let (o1, o2) = (id(0, 1), id(1, 1));
+        let pool: Vec<_> = (49_510..49_540).map(sock).collect();
+        let (j, b) = (pool.iter())
+            .flat_map(|&j| pool.iter().map(move |&b| (j, b)))
+            .find(|&(j, b)| {
+                j != b && weight(o1, j) > weight(o1, b) && weight(o2, b) > weight(o2, j)
+            })
+            .expect("a joiner O1 ranks above B and O2 below");
+        let addrs = [sock(49_500), sock(49_501), b];
+        let zones = ["a", "a", "b"];
+        let (nodes, taps): (Vec<_>, Vec<_>) = (0..3)
+            .map(|i| tapped_node(&router, &addrs, &zones, i, |_| {}))
+            .unzip();
+        for (node, keys) in nodes.iter().zip([0..3, 10..13, 20..23]) {
+            node.hits(keys).await;
+        }
+        run_for(1_000).await;
+        // Just past B's heartbeat, so its next is a heartbeat away.
+        let beats = nodes[2].counters().await.rounds_heartbeat;
+        while nodes[2].counters().await.rounds_heartbeat == beats {
+            run_for(1).await;
+        }
+        let marks: Vec<_> = taps.iter().map(|tap| tap.borrow().len()).collect();
+        let at = tokio::time::Instant::now();
+        let received = nodes[2].counters().await.packets_received;
+        for node in &nodes {
+            node.tell(placed(j, "b"));
+        }
+        run_for(20).await;
+        // Nothing B heard set off a round: only adding `j` did.
+        assert_eq!(nodes[2].counters().await.packets_received, received);
+        run_for(280).await;
+        let to_j = |i: usize| -> Vec<_> {
+            taps[i].borrow()[marks[i]..]
+                .iter()
+                .filter(|(_, dst, _)| *dst == j)
+                .map(|(sent, _, bytes)| (*sent - at, header_of(bytes).payload))
+                .collect()
+        };
+        assert_eq!(to_j(1), [], "O2 ranks B above j");
+        let from_o1 = to_j(0);
+        assert!(
+            matches!(from_o1.first(), Some((_, Payload::Cells(CellPayload::Own {
+                range,
+                relay_into_zone: true,
+                ..
+            }))) if range.lower() == 0),
+            "{from_o1:?}"
+        );
+        let relay = |p: &Payload| matches!(p, Payload::Cells(CellPayload::Relay { .. }));
+        assert!(!from_o1.iter().any(|(_, p)| relay(p)), "{from_o1:?}");
+        let from_b = to_j(2);
+        let first_from_0 = |relay: bool| {
+            from_b.iter().find_map(|(after, p)| match p {
+                Payload::Cells(CellPayload::Own {
+                    range,
+                    relay_into_zone: false,
+                    ..
+                }) if !relay && range.lower() == 0 => Some(*after),
+                Payload::Cells(CellPayload::Relay { range, .. }) if relay && range.lower() == 0 => {
+                    Some(*after)
+                }
+                _ => None,
+            })
+        };
+        for relay in [false, true] {
+            let after = first_from_0(relay).unwrap_or_else(|| panic!("{from_b:?}"));
+            assert!(after <= Duration::from_millis(20), "{after:?}");
+        }
+        for (node, role) in nodes.iter().zip([Role::Gateway, Role::Remote, Role::Zone]) {
+            let peer = node.peer(j).await;
+            assert_eq!((peer.role, peer.node_id), (role, None), "{}", node.addr);
+        }
+
+        let config = zoned_config(vec![], "b", |_| {});
+        let joiner = Node::start(&router, j, store_for(id(3, 1)), config);
+        for (&addr, name) in addrs.iter().zip(zones) {
+            joiner.tell(placed(addr, name));
+        }
+        let mut nodes = nodes;
+        nodes.push(joiner);
+        run_for(2_000).await;
+        assert_totals(&nodes.iter().collect::<Vec<_>>(), 9);
+        assert_eq!(nodes[0].counters().await.gateway_failovers, 0);
+        stop_all(nodes).await;
+    });
+}
+
+/// A peer that leaves before this node heard from it may have held cells no
+/// stream brings, so its departure asks for a join sweep again; one that
+/// discovery placed in another zone does not, since that zone's gateway here
+/// relays its cells.
+#[test]
+fn departed_unheard_peer_of_another_zone_asks_no_sweep() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = [sock(49_600), sock(49_601)];
+        let nodes: Vec<_> = (0..2)
+            .map(|i| zoned_node(&router, &addrs, &["a", "a"], i))
+            .collect();
+        nodes[1].hits(0..3).await;
+        run_for(1_000).await;
+        let requested = || async { nodes[0].counters().await.sweeps_requested };
+        let before = requested().await;
+        for (gone, name) in [(sock(49_610), "b"), (sock(49_611), "a")] {
+            nodes[0].tell(placed(gone, name));
+            run_for(200).await;
+            nodes[0].tell(PeerEvent::Removed(Peer::new(gone)));
+            run_for(300).await;
+            assert_eq!(requested().await > before, name == "a", "{name}");
+        }
+        stop_all(nodes).await;
+    });
+}
+
+/// A joiner asks for its join sweep only peers it has heard: not a zone peer
+/// that has not discovered it yet, and, while that one may still answer, not
+/// the heard peer of another zone either. Once the zone peer discovers it, it
+/// asks that one and ends exact.
+#[test]
+fn joiner_sweeps_only_from_heard_peers_of_its_zone() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let rb = id(2, 1);
+        let [j, za] = ranked(rb, 49_710, 2)[..] else {
+            unreachable!("two addresses")
+        };
+        let rb_addr = sock(49_700);
+        let za_node = Node::start(
+            &router,
+            za,
+            store_for(id(0, 1)),
+            zoned_config(vec![rb_addr], "a", |_| {}),
+        );
+        let rb_node = Node::start(
+            &router,
+            rb_addr,
+            store_for(rb),
+            zoned_config(vec![za], "b", |_| {}),
+        );
+        rb_node.hits(0..3).await;
+        run_for(1_000).await;
+        let taps = Taps::default();
+        let tap = Tap {
+            inner: router.bind(j),
+            sent: taps.clone(),
+        };
+        let config = zoned_config(vec![], "a", |_| {});
+        let joiner = Node::start_on(tap, j, store_for(id(3, 1)), config);
+        joiner.tell(placed(za, "a"));
+        joiner.tell(placed(rb_addr, "b"));
+        rb_node.tell(placed(j, "a"));
+        run_for(1_000).await;
+        let asked = || {
+            let sent = tapped(&taps, 0).into_iter();
+            sent.filter(|(_, header)| header.payload == Payload::SweepRequest)
+                .map(|(dst, _)| dst)
+                .collect::<Vec<_>>()
+        };
+        assert!(joiner.peer(rb_addr).await.node_id.is_some(), "j heard Rb");
+        assert_eq!(asked(), []);
+        assert_eq!(za_node.counters().await.sweeps_ignored, 0);
+
+        za_node.tell(placed(j, "a"));
+        run_for(1_000).await;
+        let asked = asked();
+        assert!(
+            !asked.is_empty() && asked.iter().all(|&dst| dst == za),
+            "{asked:?}"
+        );
+        let nodes = vec![za_node, rb_node, joiner];
+        assert_totals(&nodes.iter().collect::<Vec<_>>(), 3);
+        stop_all(nodes).await;
+    });
+}
+
+/// A node restarted into an idle cluster, whose peers discovery places in its
+/// zone, greets them while its join sweep waits, so it hears them, asks them,
+/// and gets its previous incarnation's cells back although no peer has
+/// anything to send.
+#[test]
+fn restarted_node_greets_discovered_zone_peers_for_its_sweep() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = addrs(49_800, 4);
+        let zones = ["a"; 3];
+        let mut nodes: Vec<_> = (0..3)
+            .map(|i| zoned_node(&router, &addrs[..3], &zones, i))
+            .collect();
+        nodes[0].hits(1..6).await;
+        run_for(500).await;
+        let peers = nodes.split_off(1);
+        assert_totals(&peers.iter().collect::<Vec<_>>(), 5);
+        nodes.pop().unwrap().stop().await;
+        for peer in &peers {
+            peer.tell(PeerEvent::Removed(Peer::new(addrs[0])));
+            peer.tell(placed(addrs[3], "a"));
+        }
+        run_for(1_000).await;
+        let config = zoned_config(vec![], "a", |_| {});
+        let restarted = Node::start(&router, addrs[3], store_for(id(0, 2)), config);
+        for &addr in &addrs[1..3] {
+            restarted.tell(placed(addr, "a"));
+        }
+        run_for(1_000).await;
+        assert_eq!(restarted.agg.total(), 5);
+        let mut nodes = peers;
+        nodes.push(restarted);
+        stop_all(nodes).await;
+    });
+}
+
 // -- scripted peers -----------------------------------------------------------
 
 /// Wake the scripted runtime to read what was just queued.

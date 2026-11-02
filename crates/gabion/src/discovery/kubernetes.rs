@@ -2,17 +2,19 @@
 mod tests;
 
 use crate::discovery::{DiscoveryConfig, Peer, PeerDiscovery, PeerEvent};
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use async_stream::stream;
 use futures::stream::{SelectAll, Stream, StreamExt, select_all};
 use k8s_openapi::api::core::v1::Service;
-use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::discovery::v1::{Endpoint, EndpointSlice};
 use kube::config::Config;
 use kube::runtime::watcher::{Config as WatcherConfig, Error as WatcherError, Event, watcher};
 use kube::{Api, Client};
 use std::collections::hash_map::Entry;
 use std::net::{IpAddr, SocketAddr};
 use tokio::sync::oneshot;
+
+use crate::zone::ZoneHash;
 
 const DEFAULT_GABION_SERVICE_NAME: &str = "gabion";
 
@@ -437,12 +439,14 @@ fn watch_target(
 /// drives one of these for the lifetime of its EndpointSlice watch; the
 /// inner map is keyed by EndpointSlice `metadata.name` so that
 /// successive `Apply` events for the same slice replace the old peer
-/// set in place. Lifted out of `watch_target` as its own type so the
+/// set in place, and each slice's peers by address, so a peer
+/// re-reported with another zone is one `Added`, not a removal and an
+/// add. Lifted out of `watch_target` as its own type so the
 /// snapshot/diff semantics are unit-testable without spinning up a kube
 /// client.
 #[derive(Default)]
 pub(super) struct EndpointSlicePeerSet {
-    by_slice: AHashMap<String, AHashSet<Peer>>,
+    by_slice: AHashMap<String, AHashMap<SocketAddr, Peer>>,
 }
 
 /// What `apply` changed relative to the previous snapshot for that
@@ -457,8 +461,9 @@ pub(super) struct PeerSetDiff {
 
 impl EndpointSlicePeerSet {
     /// Replace the cached peer set for `slice.metadata.name` with the
-    /// parsed peers of `slice`. Returns the symmetric difference. A
-    /// slice with no name is silently dropped.
+    /// parsed peers of `slice`. Returns the addresses gone as `removed`
+    /// and the peers new or changed as `added`. A slice with no name is
+    /// silently dropped.
     pub(super) fn apply(
         &mut self,
         slice: &EndpointSlice,
@@ -467,15 +472,18 @@ impl EndpointSlicePeerSet {
         let Some(name) = slice.metadata.name.as_deref() else {
             return PeerSetDiff::default();
         };
-        let new: AHashSet<Peer> = peers_from_endpoint_slice(slice, self_addr);
+        let new = peers_from_endpoint_slice(slice, self_addr);
         let old = self.by_slice.remove(name).unwrap_or_default();
-        let mut diff = PeerSetDiff::default();
-        for &peer in old.difference(&new) {
-            diff.removed.push(peer);
-        }
-        for &peer in new.difference(&old) {
-            diff.added.push(peer);
-        }
+        let diff = PeerSetDiff {
+            added: (new.values())
+                .filter(|&peer| old.get(&peer.addr) != Some(peer))
+                .copied()
+                .collect(),
+            removed: (old.values())
+                .filter(|peer| !new.contains_key(&peer.addr))
+                .copied()
+                .collect(),
+        };
         self.by_slice.insert(name.to_owned(), new);
         diff
     }
@@ -489,37 +497,50 @@ impl EndpointSlicePeerSet {
         };
         self.by_slice
             .remove(name)
-            .map(|set| set.into_iter().collect())
+            .map(|peers| peers.into_values().collect())
             .unwrap_or_default()
     }
 
     /// Empty the map and yield every peer it contained — used at
     /// watcher shutdown to emit `Removed` for everything still live.
     pub(super) fn drain_peers(&mut self) -> impl Iterator<Item = Peer> + '_ {
-        std::mem::take(&mut self.by_slice).into_values().flatten()
+        std::mem::take(&mut self.by_slice)
+            .into_values()
+            .flat_map(AHashMap::into_values)
     }
 }
 
 /// Parse an EndpointSlice into the (deduplicated, self-filtered, ready-
-/// only) peer set. Exposed to `tests` rather than kept private to the
-/// runtime so the parser invariants are pinned by unit tests.
+/// only) peer set, each with the zone its endpoint names. Exposed to `tests`
+/// rather than kept private to the runtime so the parser invariants are pinned
+/// by unit tests.
 pub(super) fn peers_from_endpoint_slice(
     slice: &EndpointSlice,
     self_addr: Option<SocketAddr>,
-) -> AHashSet<Peer> {
+) -> AHashMap<SocketAddr, Peer> {
     let Some(port) = select_gabion_udp_port(slice) else {
-        return AHashSet::new();
+        return AHashMap::new();
     };
     slice
         .endpoints
         .iter()
         .filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
-        .flat_map(|e| &e.addresses)
-        .filter_map(|addr| {
-            let sock = SocketAddr::new(addr.parse::<IpAddr>().ok()?, port);
-            (Some(sock) != self_addr).then_some(Peer::new(sock))
+        .flat_map(|e| {
+            let zone = endpoint_zone(e);
+            e.addresses.iter().map(move |addr| (addr, zone))
+        })
+        .filter_map(|(addr, zone)| {
+            let addr = SocketAddr::new(addr.parse::<IpAddr>().ok()?, port);
+            (Some(addr) != self_addr).then_some((addr, Peer { addr, zone }))
         })
         .collect()
+}
+
+/// The zone an endpoint names (`endpoints[].zone`, which Kubernetes copies
+/// from its node's `topology.kubernetes.io/zone` label); one missing, empty
+/// or not a zone name is none.
+fn endpoint_zone(endpoint: &Endpoint) -> Option<ZoneHash> {
+    ZoneHash::parse(endpoint.zone.as_deref()?).ok()
 }
 
 fn select_gabion_udp_port(slice: &EndpointSlice) -> Option<u16> {

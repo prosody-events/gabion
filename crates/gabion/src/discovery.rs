@@ -22,24 +22,29 @@ pub trait PeerDiscovery {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Peer {
     pub addr: SocketAddr,
+    /// The zone discovery saw for the peer (a Kubernetes EndpointSlice
+    /// endpoint's `zone`), if any. The runtime routes a peer by it only until
+    /// the peer's own headers announce its zone.
+    pub zone: Option<ZoneHash>,
 }
 
 impl Peer {
+    /// A peer whose zone discovery does not know, such as a static one.
     pub fn new(addr: SocketAddr) -> Self {
-        Self { addr }
+        Self { addr, zone: None }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerEvent {
+    /// A peer joined, or discovery now names a zone for one already known.
     Added(Peer),
+    /// A peer left; its `zone` is ignored.
     Removed(Peer),
     /// This node's own entry names its zone. The runtime adopts it only
     /// while it knows no zone, then recomputes every peer's role and asks for
     /// a join sweep.
-    OwnEntry {
-        zone: ZoneHash,
-    },
+    OwnEntry { zone: ZoneHash },
 }
 
 /// Peer discovery settings used by gossip, filled from the settings table

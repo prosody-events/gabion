@@ -266,8 +266,11 @@ at once. The math and tradeoffs live in
 
 `/snapshot` returns the peer list, CRDT stats (`store_stats`), gossip counters
 (`counters`), the rule list and the aggregate row count. Each peer shows its
-`zone` (`"same"`, `"unknown"` or the remote zone's hash), its `role`
-(`unheard`, `zone`, `gateway`, `remote` or `incompatible`), its `answer` state
+`zone` (`"same"`, `"unknown"` or the remote zone's hash: from the peer's
+headers once heard; before that, while `node_id` is null, the zone discovery
+reported for it), its `role` (`unheard` for a peer neither heard from nor
+placed in a zone by discovery, `zone`, `gateway`, `remote` or
+`incompatible`), its `answer` state
 (`settled`, `owed`, `suspect` or `cannot_relay`) and `unanswered_ms`, how
 long its oldest packet has waited for an answer; `peers_by_role` counts the
 roles:

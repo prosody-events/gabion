@@ -13,7 +13,12 @@ impl EndpointSlicePeerSet {
 
     /// Sorted, deduplicated union of every cached slice's peer set.
     fn snapshot_peers(&self) -> Vec<Peer> {
-        let mut peers: Vec<Peer> = self.by_slice.values().flatten().copied().collect();
+        let mut peers: Vec<Peer> = self
+            .by_slice
+            .values()
+            .flat_map(|peers| peers.values())
+            .copied()
+            .collect();
         peers.sort();
         peers.dedup();
         peers
@@ -100,7 +105,7 @@ fn endpoint_slice_parser_deduplicates_and_ignores_self() {
         self_addr(),
     );
 
-    let peers: Vec<Peer> = peers.into_iter().collect();
+    let peers: Vec<Peer> = peers.into_values().collect();
     assert_eq!(
         peers,
         vec![Peer::new("10.0.0.2:18080".parse().expect("addr"))]
@@ -219,6 +224,39 @@ fn quickcheck_endpoint_slice_events_match_live_slice_model(
         }
     }
     TestResult::passed()
+}
+
+/// An endpoint's `zone` rides on each of its peers as that zone name's hash;
+/// one without a zone, or with an empty one, gives none; and a peer
+/// re-reported with a zone it lacked is one `Added` and no `Removed`.
+#[test]
+fn endpoint_zone_rides_on_its_peers() {
+    let zoned = |zone: Option<&str>| {
+        let mut slice = slice("slice-a", &["10.0.0.2"], Some(true));
+        slice.endpoints[0].zone = zone.map(str::to_owned);
+        slice
+    };
+    let addr = "10.0.0.2:18080".parse().expect("addr");
+    let east = Peer {
+        addr,
+        zone: Some(crate::zone::ZoneName::parse("us-east-1a").unwrap().hash()),
+    };
+    for (zone, peer) in [
+        (Some("us-east-1a"), east),
+        (None, Peer::new(addr)),
+        (Some(""), Peer::new(addr)),
+    ] {
+        let peers = peers_from_endpoint_slice(&zoned(zone), self_addr());
+        assert_eq!(peers.into_values().collect::<Vec<_>>(), [peer], "{zone:?}");
+    }
+    let mut peer_set = EndpointSlicePeerSet::default();
+    peer_set.apply(&zoned(None), self_addr());
+    let diff = peer_set.apply(&zoned(Some("us-east-1a")), self_addr());
+    let expected = PeerSetDiff {
+        added: vec![east],
+        removed: vec![],
+    };
+    assert_eq!(diff, expected);
 }
 
 // -- service_change ---------------------------------------------------------

@@ -149,7 +149,8 @@ impl GossipCounters {
 }
 
 /// One peer known to the runtime. `node_id` is `None` until a packet from
-/// this peer has decoded.
+/// this peer has decoded; until then a `zone` other than `Unknown` is the one
+/// discovery reported, provisional.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct PeerEntry {
@@ -167,7 +168,7 @@ pub struct PeerEntry {
     pub relay_unacked: u64,
 }
 
-/// A peer's zone as its headers announce it.
+/// A peer's zone: its headers' once heard, before that discovery's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(
     feature = "serde",
@@ -175,7 +176,8 @@ pub struct PeerEntry {
     serde(rename_all = "snake_case")
 )]
 pub enum PeerZone {
-    /// Not heard yet, or the peer announces no zone.
+    /// Neither heard with a zone nor placed in one by discovery, or the peer
+    /// announces no zone.
     Unknown,
     /// This node's zone.
     Same,

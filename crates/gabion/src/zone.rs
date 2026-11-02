@@ -18,29 +18,9 @@ pub struct ZoneName {
 impl ZoneName {
     /// The only constructor; an empty name is an error, not "unset".
     pub fn parse(text: &str) -> Result<Self, ZoneError> {
-        let len = text.chars().count();
-        let edge = |c: Option<char>| c.filter(|c| !c.is_ascii_alphanumeric());
-        if len == 0 {
-            return Err(ZoneError::Empty);
-        }
-        if len > 63 {
-            return Err(ZoneError::TooLong { len });
-        }
-        if let Some(char) = text
-            .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-        {
-            return Err(ZoneError::BadChar { char });
-        }
-        if let Some(char) = edge(text.chars().next()).or(edge(text.chars().last())) {
-            return Err(ZoneError::BadEdge { char });
-        }
-        let mut hasher = stable_hasher();
-        hasher.write(text.as_bytes());
-        let hash = ZoneHash(from_low32(hasher.finish_128() as u32));
         Ok(Self {
+            hash: ZoneHash::parse(text)?,
             name: text.into(),
-            hash,
         })
     }
 
@@ -61,6 +41,31 @@ pub struct ZoneHash(NonZeroU32);
 impl ZoneHash {
     /// A placeholder for tables sized before any zone is known.
     pub(crate) const MIN: Self = Self(NonZeroU32::MIN);
+
+    /// The hash of zone name `text`, validated as [`ZoneName::parse`]
+    /// validates it, without keeping the name.
+    pub(crate) fn parse(text: &str) -> Result<Self, ZoneError> {
+        let len = text.chars().count();
+        let edge = |c: Option<char>| c.filter(|c| !c.is_ascii_alphanumeric());
+        if len == 0 {
+            return Err(ZoneError::Empty);
+        }
+        if len > 63 {
+            return Err(ZoneError::TooLong { len });
+        }
+        if let Some(char) = text
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        {
+            return Err(ZoneError::BadChar { char });
+        }
+        if let Some(char) = edge(text.chars().next()).or(edge(text.chars().last())) {
+            return Err(ZoneError::BadEdge { char });
+        }
+        let mut hasher = stable_hasher();
+        hasher.write(text.as_bytes());
+        Ok(Self(from_low32(hasher.finish_128() as u32)))
+    }
 
     /// A header's zone field: 0 is no zone.
     pub(crate) fn from_wire(raw: u32) -> Option<Self> {

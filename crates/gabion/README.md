@@ -72,9 +72,11 @@ load that a textbook anti-entropy loop would not:
    relays them to the rest of its zone on a second stream. Every stream is
    per peer and acknowledged cumulatively; a gap report or a heartbeat
    without an ack brings a resend, so a lost packet costs one round, not a
-   lifetime. A peer whose zone is none gets everything directly; one not yet
-   heard from gets only the cells raised since it was added, greeted with
-   `PROBE` each heartbeat until it answers with its zone.
+   lifetime. A peer whose zone is none gets everything directly. A peer not
+   yet heard from is routed by the zone discovery reports for it (a
+   Kubernetes EndpointSlice endpoint's `zone`) until its own headers name
+   one, which wins; one with neither gets only the cells raised since it was
+   added, greeted with `PROBE` each heartbeat until it answers with its zone.
    A node that starts asks two peers for a *join sweep* of every live cell.
 2. **Adaptive emit rate** — the gossip cadence adapts to per-rule
    pressure. Heartbeats fire every `tick_interval` unconditionally, but
@@ -134,8 +136,9 @@ drops any combination the format forbids. A node sends its own stream as
 `Ack`, and join sweeps as `SweepRequest` and `Sweep`; every data kind it
 receives merges the same way. `sender_zone` is the low 32 bits of the
 stable hash of the sender's zone name (`gabion::zone::ZoneName`), never 0;
-0 means the sender has no zone. A node learns each peer's zone only from
-that peer's headers.
+0 means the sender has no zone. A node takes each peer's zone from that
+peer's headers; until it has heard the peer, it uses the zone discovery
+reports for it, if any.
 
 The body follows immediately. When `cell_count > 0` it carries a
 *per-frame* rule dictionary, a per-frame node dictionary, and the cell
@@ -242,8 +245,8 @@ asked to relay, numbered by a relay sequence drawn when each is marked. The
 cell store keeps each on one ordered list, so `stream_after(stream, sent)`
 reads what a peer has not been sent without a scan. Zone peers get both
 streams, a gateway the own stream flagged, other members of a remote zone
-neither, and a peer not yet heard from only the own cells raised since it
-was added. A flagged packet marks its cells for relay: all of them when its
+neither, and a peer not yet heard from, of no zone discovery named, only the
+own cells raised since it was added. A flagged packet marks its cells for relay: all of them when its
 range ends above the receiver's *flagged* mark (so a new gateway relays what
 it held directly), else those the merge raised; an unflagged packet takes
 the cells it raised off the relay list, since its sender is responsible for
@@ -287,8 +290,9 @@ once. A packet from an address
 outside the peer table is merged and nothing more: never acked or relayed.
 
 A node that starts asks its two highest-weight peers it has heard from in
-its zone (or, once it has heard every peer and none is in its zone, one peer
-of any zone) for a join sweep, and asks again when its zone becomes known,
+its zone (or, once no peer is or may be of its zone, one heard peer of any
+zone) for a join sweep, greeting the unheard peers of its zone meanwhile,
+and asks again when its zone becomes known,
 retrying each heartbeat until a page arrives, and each source pages its live
 cells, `q` per prompt round, to at most `gossip.sweep_concurrency`
 requesters at a time. The sweep brings back the node's own previous-incarnation cells, which

@@ -1,32 +1,36 @@
 //! The one place the harness names the library under test beyond the
 //! stable trait surface (`gabion::gossip::{Clock, GossipTransport, Ticker}`,
 //! `gabion::discovery::{Peer, PeerEvent}`). It builds each node the way
-//! `gabiond` does at boot, records hits through its client, reads its admin
-//! snapshot, and keeps the aggregate the node writes through. The judge
+//! `gabiond` does at boot, gives its discovery stream each added peer's zone,
+//! as Kubernetes EndpointSlices do, records hits through its client, reads its
+//! admin snapshot, and keeps the aggregate the node writes through. The judge
 //! exempts this file from the harness identity check: a baseline arm builds
 //! with H1's copy against its own library, and a phase that changes an API
 //! used here changes this file in the same commit.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
 use ahash::AHashMap;
 use anyhow::Result;
+use futures::StreamExt;
 use gabion::aggregate::Aggregate;
 pub use gabion::crdt::BucketEpoch;
 use gabion::crdt::{
     CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity, ValidStorageConfig,
 };
 pub(super) use gabion::defaults as d;
+use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, AggregateStore, GossipClient, GossipError, GossipRuntime,
     GossipTransport, Ticker, ValidGossipConfig,
 };
 use gabion::rules::{Descriptor, EnforcementMode, RuleDef, RuleSpec, RuleTable, hash_key};
 use gabion::settings::Settings;
-use gabion::zone::ZoneName;
+use gabion::zone::{ZoneHash, ZoneName};
 use tokio::sync::{mpsc, oneshot};
 
 use super::driver::Counters;
@@ -259,7 +263,14 @@ pub struct Launcher {
     identity: Rc<Identity>,
     gossip: ValidGossipConfig,
     cells: ValidStorageConfig,
+    /// Each node's zone by address, as discovery reports it.
+    zones: Rc<AHashMap<SocketAddr, ZoneHash>>,
     seed: u64,
+}
+
+/// The zone the plan places node `idx` in.
+fn zone_name(idx: usize) -> Result<ZoneName> {
+    Ok(ZoneName::parse(&format!("az-{}", node_az(idx)))?)
 }
 
 impl Launcher {
@@ -271,12 +282,16 @@ impl Launcher {
         seed: u64,
     ) -> Result<Self> {
         let (gossip, cells) = settings(sizing)?.validate()?;
+        let zones = (0..sizing.total_nodes)
+            .map(|idx| Ok((node_addr(idx), zone_name(idx)?.hash())))
+            .collect::<Result<_>>()?;
         Ok(Self {
             world: Rc::clone(world),
             keys: Rc::clone(keys),
             identity: Rc::new(Identity::build(regime, keys.len(), &cells)?),
             gossip,
             cells,
+            zones: Rc::new(zones),
             seed,
         })
     }
@@ -317,7 +332,7 @@ impl Launcher {
         ));
         // Each node announces the zone the plan places it in.
         let mut gossip = self.gossip.clone();
-        gossip.zone = Some(ZoneName::parse(&format!("az-{}", node_az(idx)))?);
+        gossip.zone = Some(zone_name(idx)?);
         let (admin, admin_rx) = mpsc::channel(4);
         let (runtime, client) = GossipRuntime::from_parts_with_admin(
             transport,
@@ -329,10 +344,21 @@ impl Launcher {
             Rc::clone(&store),
             Some(admin_rx),
         );
-        let future = runtime.run(PeerStream {
+        // Discovery names each added peer's zone, as an EndpointSlice
+        // endpoint's `zone` does.
+        let zones = Rc::clone(&self.zones);
+        let peers = PeerStream {
             world: Rc::clone(&self.world),
             idx,
+        }
+        .map(move |event| match event {
+            PeerEvent::Added(peer) => PeerEvent::Added(Peer {
+                zone: zones.get(&peer.addr).copied(),
+                ..peer
+            }),
+            other => other,
         });
+        let future = runtime.run(peers);
         Ok(Launched {
             future,
             node: Node {

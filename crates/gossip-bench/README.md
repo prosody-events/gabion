@@ -593,7 +593,11 @@ line about gabion in `src/harness/adapter.rs`:
 - `NodeStore`, the per-node `AggregateStore`, and `BucketEpoch`, re-exported for
   the driver and oracle;
 - the `Ticker` impl for the core's `SimTicker`, whose inherent
-  `next_tick` returns the instant each tick was scheduled for.
+  `next_tick` returns the instant each tick was scheduled for;
+- the discovery stream: the core's `PeerStream` events carry addresses
+  only, and the adapter maps each `Added` peer to carry the zone the plan
+  places that node in (`plan::node_az`), as a Kubernetes EndpointSlice
+  endpoint's `zone` does.
 
 `make hygiene` (run by `make test` and CI) checks the boundary: outside
 `adapter.rs`, every line that names the `gabion` crate must be one `use` of

@@ -9,11 +9,12 @@
 //! (to zone peers, and flagged for relay to one gateway per remote zone),
 //! the relay stream to zone peers, a resend with `PROBE` when a heartbeat
 //! passed without an ack (a header-only probe to a suspect or to a gateway
-//! that has acked nothing), a greeting to a peer not yet heard from, and owed
-//! acks, gap reports and probe answers. After each iteration the runtime calls
-//! [`AggregateStore::apply`] once with the rows the arm produced, and once
-//! more per full expiry batch or drained datagram. Nothing on a request,
-//! packet or round path allocates; admin commands may.
+//! that has acked nothing), a greeting to a peer not yet heard from (of this
+//! zone only while a join sweep waits), and owed acks, gap reports and probe
+//! answers. After each iteration the runtime calls [`AggregateStore::apply`]
+//! once with the rows the arm produced, and once more per full expiry batch
+//! or drained datagram. Nothing on a request, packet or round path
+//! allocates; admin commands may.
 
 use std::io;
 use std::marker::PhantomData;
@@ -28,7 +29,7 @@ use crate::crdt::{
     ObservationBatch, RelayMark, Stream, hash_fingerprint,
 };
 use crate::defaults::{self, GOSSIP_GAP_REPORTS, GOSSIP_MIN_DATAGRAM_CHARGE, GOSSIP_SWEEP_PEERS};
-use crate::discovery::PeerEvent;
+use crate::discovery::{Peer, PeerEvent};
 use crate::settings::Setting;
 use crate::throttle;
 use crate::wire::{
@@ -279,7 +280,7 @@ where
             _not_send: PhantomData,
         };
         for addr in bootstrap {
-            runtime.add_peer(addr);
+            runtime.add_peer(Peer::new(addr));
         }
         let client = GossipClient::new(req_tx);
         (runtime, client)
@@ -724,7 +725,7 @@ where
 
     fn handle_peer_event(&mut self, evt: PeerEvent) {
         match evt {
-            PeerEvent::Added(p) => self.add_peer(p.addr),
+            PeerEvent::Added(peer) => self.add_peer(peer),
             PeerEvent::Removed(p) => {
                 let Some(link) = self.peers.remove(p.addr) else {
                     return;
@@ -734,9 +735,15 @@ where
                     cluster_size = self.peers.len(),
                     "Peer left the cluster.",
                 );
-                // A member that left before sending this node anything may
-                // have held cells no stream will bring: sweep again.
-                if link.identity.is_none() {
+                // A member of this zone, or of none known, that left before
+                // sending this node anything may have held cells no stream
+                // will bring: sweep again. Another zone's members reach this
+                // zone through its gateway's relay.
+                if link.identity().is_none()
+                    && !link
+                        .zone()
+                        .is_some_and(|zone| self.peers.is_other_zone(zone))
+                {
                     self.sweep_want.get_or_insert_default();
                 }
                 self.prompt_work = true;
@@ -753,10 +760,12 @@ where
         }
     }
 
-    /// Add a peer to the table: a known one is ignored, and past
-    /// `gossip.peer_capacity` it is declined, its packets still merged.
-    fn add_peer(&mut self, addr: SocketAddr) {
-        match self.peers.insert(addr, self.store.head(Stream::Own)) {
+    /// Add a peer to the table: a known one only takes a zone discovery now
+    /// names for it, and past `gossip.peer_capacity` it is declined, its
+    /// packets still merged.
+    fn add_peer(&mut self, peer: Peer) {
+        let addr = peer.addr;
+        match self.peers.insert(peer, self.store.head(Stream::Own)) {
             Insert::Added => tracing::info!(
                 peer = %addr,
                 cluster_size = self.peers.len(),
@@ -783,6 +792,9 @@ where
                 }
             }
         }
+        // A peer discovery placed in a zone takes its role, and a zone peer
+        // its windows, on the next prompt round.
+        self.prompt_work |= self.peers.stale();
     }
 
     // -- rounds -------------------------------------------------------------
@@ -875,8 +887,8 @@ where
     /// Service one peer row: retry a timed-out stream (a header-only probe
     /// to a suspect, to a gateway that has acked nothing, or to a peer owed
     /// nothing), report due gaps, send the streams its role gets, greet a
-    /// peer not yet heard from, and send owed acks or probe answers alone
-    /// when no data carries them.
+    /// peer not yet heard from (of this zone, while a join sweep waits), and
+    /// send owed acks or probe answers alone when no data carries them.
     fn serve_row(&mut self, kind: Round, row: usize, now: u64, heads: PerStream<u64>) {
         let role = self.peers.role(row);
         if role == Role::Incompatible {
@@ -935,9 +947,17 @@ where
         let flags = self.peers.flags(row);
         let resend_own = own_retry && !probe_only;
         // A peer not yet heard from is greeted with `PROBE`, at once and then
-        // each heartbeat, so its answer names its zone; nothing waits on it.
-        let hello =
-            role == Role::Unheard && (kind == Round::Heartbeat || flags.has(PeerFlags::ACK_DUE));
+        // each heartbeat, so its answer names its zone; one discovery placed
+        // in this zone is greeted so only while a join sweep waits, since
+        // only a heard peer is asked. Nothing waits on a greeting.
+        let hello = (kind == Round::Heartbeat || flags.has(PeerFlags::ACK_DUE))
+            && match role {
+                Role::Unheard => true,
+                Role::Zone => {
+                    self.sweep_want.is_some() && self.peers.link(row).identity().is_none()
+                }
+                Role::Gateway | Role::Remote | Role::Incompatible => false,
+            };
         let mut sent_any = false;
         if role != Role::Remote
             && (kind != Round::Prompt || resend_own || flags.has(PeerFlags::RESEND_OWN))
@@ -1097,7 +1117,7 @@ where
             sender: self.store.local_identity(),
             sender_zone: self.peers.local_zone(),
             acks: AckInfo {
-                incarnation: link.identity.map_or(0, |identity| identity.incarnation),
+                incarnation: link.identity().map_or(0, |identity| identity.incarnation),
                 own: link.own_ack(),
                 relay: link.relay_ack(),
                 gap_own: gaps.own,
@@ -1145,8 +1165,8 @@ where
     /// Ask for the join sweep this node wants: at every heartbeat, and on any
     /// round once a peer is first heard. Each source asked is sent a
     /// `SweepRequest` at once and again at each heartbeat until a page
-    /// arrives. A node that has heard every peer, none of its zone, asks one
-    /// peer of any zone.
+    /// arrives. A node with no peer that is or may be of its zone asks one
+    /// heard peer of any zone.
     fn ask_sweeps(&mut self, kind: Round, now: u64) {
         let Some(mut want) = self
             .sweep_want

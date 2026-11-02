@@ -4,10 +4,11 @@
 //! stream, zone and answer state read only when a packet goes to or comes
 //! from one peer is cold, in [`PeerLink`].
 //!
-//! Each row's role follows from the zones its peer's headers announce: a peer
-//! not yet heard from gets only the own cells raised since it was added, a
-//! peer of this node's zone (or of no zone) gets both streams directly, and in
-//! each other zone the member that ranks first for this node
+//! Each row's role follows from its peer's zone: the zone its headers announce
+//! once heard, and before that the zone discovery named, if any. A peer
+//! neither heard nor placed by discovery gets only the own cells raised since
+//! it was added, a peer of this node's zone (or of no zone) gets both streams
+//! directly, and in each other zone the member that ranks first for this node
 //! (rendezvous weight, suspects last) is the gateway that gets the own stream
 //! flagged for relay. A peer is suspect once a packet that asks for an answer
 //! has gone unanswered for `gossip.suspect_after`, or it said it cannot relay.
@@ -21,6 +22,7 @@ use crate::crdt::{
     CellIndex, Incarnation, NodeIdentity, Stream, hash_fingerprint, mix64, pow2_index_capacity_for,
 };
 use crate::defaults::GOSSIP_GAP_REPORTS;
+use crate::discovery::Peer;
 use crate::wire::{AckInfo, OwnAck, StreamRange};
 use crate::zone::ZoneHash;
 
@@ -78,9 +80,10 @@ impl<T> IndexMut<Stream> for PerStream<T> {
     serde(rename_all = "snake_case")
 )]
 pub enum Role {
-    /// A peer not heard from yet: it is sent the own cells raised since it
-    /// was added and a greeting probe at once and each heartbeat, but no
-    /// relay stream, until its first packet arrives.
+    /// A peer not heard from yet whose zone discovery did not name: it is
+    /// sent the own cells raised since it was added and a greeting probe at
+    /// once and each heartbeat, but no relay stream, until its first packet
+    /// arrives.
     Unheard,
     /// A peer of this node's zone, or of no zone: it gets the own and relay
     /// streams directly.
@@ -109,7 +112,8 @@ pub(super) struct PeerFlags(u8);
 impl PeerFlags {
     /// The peer is owed a header-only packet: at a heartbeat a standalone
     /// ack, since it sent stream data after this node's last packet to it;
-    /// on a new row, its first greeting, on the next round of any kind.
+    /// on a new row not placed in another zone, its first greeting, on the
+    /// next round of any kind.
     pub(super) const ACK_DUE: Self = Self(0x01);
     /// A gap open on the peer's own stream (the mark `OwnMode` selects) or
     /// relay stream, whose report is prompt work.
@@ -409,17 +413,35 @@ pub(super) enum OwnMode {
     Flagged,
 }
 
+/// What this node has learned of a peer. Before its first packet, the zone
+/// discovery named for it, if any, is provisional and routes it; once heard,
+/// the zone its headers announce wins, even none, and moves only from none to
+/// known, or with a new incarnation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Known {
+    Unheard {
+        zone: Option<ZoneHash>,
+    },
+    Heard {
+        identity: NodeIdentity,
+        zone: Option<ZoneHash>,
+    },
+}
+
+impl Default for Known {
+    fn default() -> Self {
+        Self::Unheard { zone: None }
+    }
+}
+
 /// A row's cold state.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct PeerLink {
     /// The peer's rendezvous weight for this node: join sweeps ask, and
     /// gateways are chosen, highest first.
     weight: u64,
-    /// The zone the peer's headers announce: it moves only from unknown to
-    /// known, or on a new incarnation.
-    zone: Option<ZoneHash>,
-    /// From the peer's latest current packet; `None` until its first.
-    pub(super) identity: Option<NodeIdentity>,
+    /// The peer's identity once heard, and its zone.
+    known: Known,
     /// The incarnation before the last restart; a late packet carrying it
     /// changes no stream state.
     prev_incarnation: Option<Incarnation>,
@@ -435,6 +457,21 @@ pub(super) struct PeerLink {
 }
 
 impl PeerLink {
+    /// From the peer's latest current packet; `None` until its first.
+    pub(super) fn identity(&self) -> Option<NodeIdentity> {
+        match self.known {
+            Known::Heard { identity, .. } => Some(identity),
+            Known::Unheard { .. } => None,
+        }
+    }
+
+    /// Its headers' zone once heard, else the one discovery named.
+    pub(super) fn zone(&self) -> Option<ZoneHash> {
+        match self.known {
+            Known::Unheard { zone } | Known::Heard { zone, .. } => zone,
+        }
+    }
+
     /// This node's ack of the peer's own stream: the mark of the kind of
     /// packet it sent last.
     pub(super) fn own_ack(&self) -> OwnAck {
@@ -457,7 +494,7 @@ impl PeerLink {
     }
 }
 
-// 240 bytes (`Option<NodeIdentity>` 48 at `u128` alignment, each of the
+// 240 bytes (`Known`, identity and zone, 48 at `u128` alignment, each of the
 // three inbound marks 40, the answer and each outbound 16): with the 26 hot
 // bytes, the 32-byte address, the 8-byte `zones` entry and the index, the
 // about-330-byte per-slot cost the `gossip.peer_capacity` warning quotes.
@@ -600,12 +637,22 @@ impl PeerTable {
     }
 
     /// A known address is `Present` even when the table is full, so
-    /// re-announcing a peer is never a decline. A new row is `Unheard`: it
-    /// owes the peer a greeting, and its own stream starts at `own_head`, so
-    /// until its first packet it is sent only the cells raised from now on.
-    pub(super) fn insert(&mut self, addr: SocketAddr, own_head: u64) -> Insert {
-        let hash = addr_hash(addr);
-        if self.lookup(hash, addr).is_some() {
+    /// re-announcing a peer is never a decline; discovery re-reporting a peer
+    /// not yet heard with a zone moves it there. A new row is `Unheard`, its
+    /// own stream starting at `own_head`, so until its first packet it is
+    /// sent only the cells raised from now on; one whose zone discovery
+    /// named takes that zone's role at the next refresh. Each owes the peer
+    /// a greeting, unless discovery placed it in another zone.
+    pub(super) fn insert(&mut self, peer: Peer, own_head: u64) -> Insert {
+        let hash = addr_hash(peer.addr);
+        if let Some(row) = self.lookup(hash, peer.addr) {
+            if let Known::Unheard { zone } = &mut self.link[row as usize].known
+                && peer.zone.is_some()
+                && *zone != peer.zone
+            {
+                *zone = peer.zone;
+                self.stale = true;
+            }
             return Insert::Present;
         }
         let row = self.len;
@@ -613,15 +660,21 @@ impl PeerTable {
             return Insert::Full;
         }
         self.role[row] = Role::Unheard;
-        self.flags[row] = PeerFlags::ACK_DUE;
+        self.flags[row] = if peer.zone.is_some_and(|zone| self.is_other_zone(zone)) {
+            PeerFlags::default()
+        } else {
+            PeerFlags::ACK_DUE
+        };
         self.sent.own[row] = own_head;
         self.sent.relay[row] = 0;
         self.deadline[row] = Deadline::NEVER;
-        self.addr[row] = addr;
+        self.addr[row] = peer.addr;
         self.link[row] = PeerLink {
-            weight: rendezvous_weight(self.local_key, addr),
+            weight: rendezvous_weight(self.local_key, peer.addr),
+            known: Known::Unheard { zone: peer.zone },
             ..PeerLink::default()
         };
+        self.stale |= peer.zone.is_some();
         self.link[row].out.own.acked = own_head;
         self.by_addr.insert_unchecked(hash, row as u32);
         self.len += 1;
@@ -653,10 +706,11 @@ impl PeerTable {
         Some(removed)
     }
 
-    /// Note the sender identity and zone of a packet from `row`. A known zone
-    /// changes only with the incarnation, so a zone-0 header never clears it.
-    /// A first packet refreshes the roles, so an unheard row takes its role;
-    /// a new incarnation resets the whole row.
+    /// Note the sender identity and zone of a packet from `row`. The first
+    /// packet's zone replaces one discovery named, even when it is none; a
+    /// heard zone changes only with the incarnation, so a zone-0 header never
+    /// clears it. A first packet refreshes the roles, so an unheard row takes
+    /// its role; a new incarnation resets the whole row.
     pub(super) fn contact(
         &mut self,
         row: usize,
@@ -664,38 +718,40 @@ impl PeerTable {
         zone: Option<ZoneHash>,
     ) -> Contact {
         let link = &mut self.link[row];
-        let contact = match link.identity {
-            None => {
+        let (contact, heard) = match link.known {
+            Known::Unheard { .. } => {
                 // Its role follows at the next refresh.
                 self.stale = true;
-                Contact::First
+                (Contact::First, None)
             }
-            Some(known) if known == sender => Contact::Current,
-            Some(known)
-                if known.node_id == sender.node_id
+            Known::Heard {
+                identity,
+                zone: heard,
+            } if identity == sender => (Contact::Current, heard),
+            Known::Heard { identity, .. }
+                if identity.node_id == sender.node_id
                     && link.prev_incarnation == Some(sender.incarnation) =>
             {
                 return Contact::Late;
             }
-            Some(known) => {
+            Known::Heard { identity, .. } => {
                 *link = PeerLink {
                     weight: link.weight,
-                    prev_incarnation: Some(known.incarnation),
+                    prev_incarnation: Some(identity.incarnation),
                     ..PeerLink::default()
                 };
                 self.sent.own[row] = 0;
                 self.sent.relay[row] = 0;
                 self.flags[row] = PeerFlags::default();
                 self.stale = true;
-                Contact::Restarted
+                (Contact::Restarted, None)
             }
         };
-        let link = &mut self.link[row];
-        link.identity = Some(sender);
-        if link.zone.is_none() && zone.is_some() {
-            link.zone = zone;
-            self.stale = true;
-        }
+        self.stale |= heard.is_none() && zone.is_some();
+        self.link[row].known = Known::Heard {
+            identity: sender,
+            zone: heard.or(zone),
+        };
         self.refresh_deadline(row);
         contact
     }
@@ -952,8 +1008,9 @@ impl PeerTable {
 
     /// Judge suspicion as of `now`, the start of a round that read its
     /// waiting datagrams and holds no packet. Each row whose suspicion began
-    /// since the last judgment makes the roles stale; a zone row among them
-    /// with relay data in flight is a stalled relay. A heartbeat stamped
+    /// since the last judgment makes the roles stale; a heard zone row among
+    /// them with relay data in flight is a stalled relay (one not heard may
+    /// not have discovered this node yet). A heartbeat stamped
     /// before the last judgment judges nothing again.
     pub(super) fn judge(&mut self, now: u64, mut on_stall: impl FnMut(Stall)) {
         let now = now.max(self.judged_ms);
@@ -971,7 +1028,8 @@ impl PeerTable {
             }
             self.stale = true;
             let relay = self.link[row].out.relay;
-            if self.role[row] == Role::Zone && relay.acked < self.sent.relay[row] {
+            let heard = self.link[row].identity().is_some();
+            if self.role[row] == Role::Zone && relay.acked < self.sent.relay[row] && heard {
                 on_stall(Stall {
                     peer: self.addr[row],
                     stalled_ms: answer
@@ -985,11 +1043,12 @@ impl PeerTable {
     }
 
     /// Whether this node cannot reach most of its zone: more than half of the
-    /// zone peers it has heard are suspect.
+    /// zone peers it has heard are suspect. One discovery placed in this zone
+    /// that has not answered may not have discovered this node yet.
     pub(super) fn impaired(&self) -> bool {
         let (mut heard, mut stuck) = (0_usize, 0_usize);
         for row in 0..self.len {
-            if self.role[row] == Role::Zone {
+            if self.role[row] == Role::Zone && self.link[row].identity().is_some() {
                 heard += 1;
                 stuck += usize::from(self.suspect(row));
             }
@@ -1008,7 +1067,9 @@ impl PeerTable {
     /// Recompute every role when stale: one pass keeps the best member of
     /// each remote zone, a second sets each row's role. Returns how many
     /// rows changed role; `on_failover` hears of each suspect gateway
-    /// replaced. An unheard row keeps `Unheard` until its first packet.
+    /// replaced. A row neither heard nor placed by discovery keeps `Unheard`
+    /// until its first packet; a provisional zone counts as a heard one,
+    /// gateway choice included.
     pub(super) fn refresh(&mut self, now: u64, mut on_failover: impl FnMut(Failover)) -> u64 {
         if !std::mem::take(&mut self.stale) {
             return 0;
@@ -1036,7 +1097,11 @@ impl PeerTable {
         for row in 0..self.len {
             let old = self.role[row];
             let new = match self.remote_zone(row) {
-                None if old == Role::Incompatible || self.link[row].identity.is_none() => continue,
+                None if old == Role::Incompatible
+                    || self.link[row].known == Known::Unheard { zone: None } =>
+                {
+                    continue;
+                }
                 None => Role::Zone,
                 Some(zone) => {
                     let best = self.zones[..used].iter().find(|best| best.zone == zone);
@@ -1048,7 +1113,7 @@ impl PeerTable {
             };
             if old == Role::Gateway && new != Role::Gateway && self.suspect(row) {
                 let answer = self.link[row].answer;
-                let zone = self.link[row].zone;
+                let zone = self.link[row].zone();
                 let best = self.zones[..used]
                     .iter()
                     .find(|best| Some(best.zone) == zone);
@@ -1072,9 +1137,13 @@ impl PeerTable {
     /// `row`'s zone when it is a remote zone this node chooses a gateway in:
     /// both zones known and different, and the peer speaks this version.
     fn remote_zone(&self, row: usize) -> Option<ZoneHash> {
-        let zone = self.link[row].zone?;
-        let remote = self.local_zone.is_some_and(|local| local != zone);
-        (remote && self.role[row] != Role::Incompatible).then_some(zone)
+        let zone = self.link[row].zone()?;
+        (self.is_other_zone(zone) && self.role[row] != Role::Incompatible).then_some(zone)
+    }
+
+    /// Whether `zone` is known to differ from this node's.
+    pub(super) fn is_other_zone(&self, zone: ZoneHash) -> bool {
+        self.local_zone.is_some_and(|local| local != zone)
     }
 
     /// Give `row` role `new`; returns whether it changed. A stream the row
@@ -1158,14 +1227,14 @@ impl PeerTable {
                 Answer::Owed { .. } if self.suspect(row) => AnswerState::Suspect,
                 Answer::Owed { .. } => AnswerState::Owed,
             };
-            let zone = match link.zone {
+            let zone = match link.zone() {
                 None => PeerZone::Unknown,
                 Some(zone) if Some(zone) == self.local_zone => PeerZone::Same,
                 Some(zone) => PeerZone::Other(zone),
             };
             PeerEntry {
                 addr: self.addr[row],
-                node_id: link.identity.map(|identity| identity.node_id),
+                node_id: link.identity().map(|identity| identity.node_id),
                 zone,
                 role: self.role[row],
                 answer,
@@ -1192,20 +1261,26 @@ impl PeerTable {
         counts
     }
 
-    /// The peers a join sweep may ask, with their weights: the peers of this
-    /// node's zone, or with `any_zone` every peer that speaks this version,
-    /// but only once every peer has been heard, since an unheard one may be
-    /// of this zone.
+    /// The heard peers a join sweep may ask, with their weights: those of
+    /// this node's zone, or with `any_zone` every one that speaks this
+    /// version, but only while no peer is or may be of this zone: none unheard
+    /// of unknown zone, and none, heard or not, of this zone. An unheard peer
+    /// may not know this node yet, and would ignore the request.
     pub(super) fn sweep_candidates(
         &self,
         any_zone: bool,
     ) -> impl Iterator<Item = (u64, SocketAddr)> + '_ {
-        let any_zone = any_zone && !self.role[..self.len].contains(&Role::Unheard);
+        let any_zone = any_zone
+            && !(self.role[..self.len].iter())
+                .any(|role| matches!(role, Role::Unheard | Role::Zone));
         (0..self.len)
-            .filter(move |&row| match self.role[row] {
-                Role::Zone => true,
-                Role::Gateway | Role::Remote => any_zone,
-                Role::Unheard | Role::Incompatible => false,
+            .filter(move |&row| {
+                let asks = match self.role[row] {
+                    Role::Zone => true,
+                    Role::Gateway | Role::Remote => any_zone,
+                    Role::Unheard | Role::Incompatible => false,
+                };
+                asks && self.link[row].identity().is_some()
             })
             .map(|row| (self.link[row].weight, self.addr[row]))
     }
