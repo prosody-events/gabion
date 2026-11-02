@@ -6,11 +6,6 @@ use quickcheck_macros::quickcheck;
 use std::collections::{BTreeMap, BTreeSet};
 
 impl EndpointSlicePeerSet {
-    /// Replace the entire peer map with `other`'s, as a relist does.
-    fn replace(&mut self, other: EndpointSlicePeerSet) {
-        self.by_slice = other.by_slice;
-    }
-
     /// Sorted, deduplicated union of every cached slice's peer set.
     fn snapshot_peers(&self) -> Vec<Peer> {
         let mut peers: Vec<Peer> = self
@@ -37,6 +32,8 @@ struct EndpointSliceEvent {
     second: u8,
     ready: bool,
     delete: bool,
+    /// A `delete` the watch missed while disconnected, so a relist follows.
+    lost: bool,
 }
 
 impl Arbitrary for EndpointSliceEventsCase {
@@ -55,6 +52,7 @@ impl Arbitrary for EndpointSliceEvent {
             second: (u8::arbitrary(g) % 8) + 2,
             ready: bool::arbitrary(g),
             delete: bool::arbitrary(g),
+            lost: bool::arbitrary(g),
         }
     }
 }
@@ -141,24 +139,29 @@ fn endpoint_slice_peer_set_updates_and_deletes_snapshots() {
     );
 }
 
+/// A relist forgets each slice it did not list, since the watcher reports no
+/// `Delete` for one deleted while it was disconnected: a peer only such a
+/// slice listed goes when the relist ends, and one a listed slice took over
+/// goes once that slice drops it.
 #[test]
-fn endpoint_slice_peer_set_relist_replaces_missing_slices() {
+fn endpoint_slice_peer_set_relist_forgets_unlisted_slices() {
+    let peer = |addr: &str| Peer::new(format!("{addr}:18080").parse().expect("addr"));
     let mut peer_set = EndpointSlicePeerSet::default();
-    let slice_a = slice("slice-a", &["10.0.0.2"], Some(true));
-    let slice_b = slice("slice-b", &["10.0.0.3"], Some(true));
-    let slice_c = slice("slice-c", &["10.0.0.4"], Some(true));
-
+    let slice_a = slice("slice-a", &["10.0.0.2", "10.0.0.3"], Some(true));
     peer_set.apply(&slice_a, self_addr());
-    peer_set.apply(&slice_b, self_addr());
+    peer_set.apply(&slice("slice-b", &["10.0.0.4"], Some(true)), self_addr());
 
-    let mut relist = EndpointSlicePeerSet::default();
-    relist.apply(&slice_c, self_addr());
-    peer_set.replace(relist);
+    peer_set.relist();
+    let moved = slice("slice-c", &["10.0.0.2", "10.0.0.3"], Some(true));
+    assert_eq!(peer_set.apply(&moved, self_addr()).removed, []);
+    assert_eq!(peer_set.relisted(), [peer("10.0.0.4")]);
 
+    let shrunk = slice("slice-c", &["10.0.0.3"], Some(true));
     assert_eq!(
-        peer_set.snapshot_peers(),
-        vec![Peer::new("10.0.0.4:18080".parse().expect("addr"))]
+        peer_set.apply(&shrunk, self_addr()).removed,
+        [peer("10.0.0.2")]
     );
+    assert_eq!(peer_set.snapshot_peers(), [peer("10.0.0.3")]);
 }
 
 #[test]
@@ -187,31 +190,43 @@ fn endpoint_slice_peer_set_apply_emits_added_and_removed_diff() {
 
 /// Both the cached peer set and the peers its emitted events add and remove,
 /// folded in the order `watch_target` yields them, match the union of the live
-/// slices, so an address two slices list survives either one going.
+/// slices, so an address two slices list survives either one going, and a
+/// relist after a missed `Delete` removes what only that slice listed.
 #[quickcheck]
 fn quickcheck_endpoint_slice_events_match_live_slice_model(
     case: EndpointSliceEventsCase,
 ) -> TestResult {
     let mut peer_set = EndpointSlicePeerSet::default();
-    let mut live = BTreeMap::new();
+    let mut live: BTreeMap<String, (EndpointSlice, Vec<Peer>)> = BTreeMap::new();
     let mut emitted = BTreeSet::new();
+    let fold = |emitted: &mut BTreeSet<SocketAddr>, diff: PeerSetDiff| {
+        for peer in diff.removed {
+            emitted.remove(&peer.addr);
+        }
+        emitted.extend(diff.added.iter().map(|peer| peer.addr));
+    };
 
     for event in case.events {
         let name = format!("slice-{}", event.slice);
         if event.delete {
-            for peer in peer_set.delete(&slice(&name, &["10.0.0.9"], Some(true))) {
+            live.remove(&name);
+            let removed = if event.lost {
+                peer_set.relist();
+                for (current, _) in live.values() {
+                    fold(&mut emitted, peer_set.apply(current, self_addr()));
+                }
+                peer_set.relisted()
+            } else {
+                peer_set.delete(&slice(&name, &["10.0.0.9"], Some(true)))
+            };
+            for peer in removed {
                 emitted.remove(&peer.addr);
             }
-            live.remove(&name);
         } else {
             let first = format!("10.0.0.{}", event.first);
             let second = format!("10.0.0.{}", event.second);
             let current = slice(&name, &[&first, &second], Some(event.ready));
-            let diff = peer_set.apply(&current, self_addr());
-            for peer in &diff.removed {
-                emitted.remove(&peer.addr);
-            }
-            emitted.extend(diff.added.iter().map(|peer| peer.addr));
+            fold(&mut emitted, peer_set.apply(&current, self_addr()));
 
             let mut peers = if event.ready {
                 vec![
@@ -223,10 +238,13 @@ fn quickcheck_endpoint_slice_events_match_live_slice_model(
             };
             peers.sort();
             peers.dedup();
-            live.insert(name, peers);
+            live.insert(name, (current, peers));
         }
 
-        let mut expected = live.values().flatten().copied().collect::<Vec<_>>();
+        let mut expected = (live.values())
+            .flat_map(|(_, peers)| peers)
+            .copied()
+            .collect::<Vec<_>>();
         expected.sort();
         expected.dedup();
         if peer_set.snapshot_peers() != expected {

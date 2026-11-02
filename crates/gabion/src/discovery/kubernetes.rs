@@ -3,7 +3,7 @@ mod tests;
 
 use crate::discovery::{DiscoveryConfig, Peer, PeerDiscovery, PeerEvent};
 use crate::zone::ZoneHash;
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use async_stream::stream;
 use futures::stream::{SelectAll, Stream, StreamExt, select_all};
 use k8s_openapi::api::core::v1::Service;
@@ -413,7 +413,12 @@ fn watch_target(
                         }
                         yield Err(err.into());
                     }
-                    Some(Ok(Event::Init | Event::InitDone)) => {}
+                    Some(Ok(Event::Init)) => peer_set.relist(),
+                    Some(Ok(Event::InitDone)) => {
+                        for peer in peer_set.relisted() {
+                            yield Ok(PeerEvent::Removed(peer));
+                        }
+                    }
                     Some(Ok(Event::Apply(slice) | Event::InitApply(slice))) => {
                         let diff = peer_set.apply(&slice, self_addr);
                         for peer in diff.removed {
@@ -438,12 +443,15 @@ fn watch_target(
 /// `watch_target` for the lifetime of its EndpointSlice watch: keyed by
 /// EndpointSlice `metadata.name`, so an `Apply` replaces that slice's set in
 /// place, and each slice's peers by address, so a zone change is one `Added`.
-/// An address another slice still lists is not removed. Lifted out of
-/// `watch_target` so the diff semantics are unit-testable without a kube
-/// client.
+/// An address another slice still lists is not removed, and a relist forgets
+/// each slice it does not list, since the watcher reports no `Delete` for a
+/// slice deleted while it was disconnected. Lifted out of `watch_target` so
+/// the diff semantics are unit-testable without a kube client.
 #[derive(Default)]
 pub(super) struct EndpointSlicePeerSet {
     by_slice: AHashMap<String, AHashMap<SocketAddr, Peer>>,
+    /// The cached slices a relist in progress has not listed yet.
+    unlisted: AHashSet<String>,
 }
 
 /// What `apply` changed relative to the previous snapshot for that
@@ -470,6 +478,7 @@ impl EndpointSlicePeerSet {
             return PeerSetDiff::default();
         };
         let new = peers_from_endpoint_slice(slice, self_addr);
+        self.unlisted.remove(name);
         let old = self.by_slice.remove(name).unwrap_or_default();
         let diff = PeerSetDiff {
             added: (new.values())
@@ -496,6 +505,23 @@ impl EndpointSlicePeerSet {
         };
         peers
             .into_values()
+            .filter(|peer| !self.lists(&peer.addr))
+            .collect()
+    }
+
+    /// A relist starts: every cached slice is unlisted until it lists it.
+    pub(super) fn relist(&mut self) {
+        self.unlisted = self.by_slice.keys().cloned().collect();
+    }
+
+    /// A relist ends: forget each slice it did not list; returns the peers
+    /// gone from every slice, which the caller emits `Removed` for.
+    pub(super) fn relisted(&mut self) -> Vec<Peer> {
+        let mut gone = AHashMap::new();
+        for name in std::mem::take(&mut self.unlisted) {
+            gone.extend(self.by_slice.remove(&name).into_iter().flatten());
+        }
+        gone.into_values()
             .filter(|peer| !self.lists(&peer.addr))
             .collect()
     }
