@@ -1,4 +1,4 @@
-"""The study's verdict on one paired comparison (study report §4.6).
+"""The study's verdict on one paired comparison.
 
 `row` is one `summary.csv` row of the judge with its numbers parsed: `scale`
 (`log` or `diff`), `p_better` (the posterior probability the solution is

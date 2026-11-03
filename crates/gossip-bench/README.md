@@ -99,8 +99,8 @@ the diff is where a change to what the adapter does shows. Between the cost
 ratios and the diff sits the cost-model section below. It exits 1 when a rule
 fails.
 
-**§6.5's cost model (not gating).** The zone gossip design sizes its
-defaults in its §6.5 with the equations below, for a steady cluster of `N`
+**The cost model (not gating).** gabion's gossip defaults are sized with
+the equations below, for a steady cluster of `N`
 nodes in `Z` zones at `Λ` admitted hits per second (`λ = Λ / N` per node),
 heartbeat `T`, and a rule of limit `L`, window `W` and bucket `b`:
 
@@ -110,7 +110,7 @@ R_own = λ / (ε + 1) + (1 − e^(−2λT)) / (4T)   (ε = 1)   (6.2) own rounds
 D = R_own · (N − 1) + a                                 (6.3) packets per node-second
 e^(−λt) · (1 − t/T) = 0.02                              (6.5) t: convergence p99
 A ≈ Λ · (W + b)                                         (6.10) live cells, an upper bound
-p_a^n_a, p_a = 1 − (1 − p)², n_a = ⌊T_u / T⌋            (§6.5.8) false suspicion per late answer
+p_a^n_a, p_a = 1 − (1 − p)², n_a = ⌊T_u / T⌋            (6.5.8) false suspicion per late answer
 ```
 
 `a` is the acknowledgements sent alone, for which the design gives no
@@ -139,7 +139,7 @@ never counted as misses. Cross-zone bytes per node per second is the judge's
 integral, as `bytes_per_node_s` divides. Peak live cells is the judge's
 `peak_cells`, the most active cells any node reported in the core's health
 snapshots, taken every 5 s. `gateway_failovers` reads `missing`: the result is
-the core's and does not carry it. Beside it stands §6.5.8's chance that an
+the core's and does not carry it. Beside it stands (6.5.8)'s chance that an
 episode ends in a false suspicion, at `n_a` attempts and at its floor
 `n_a − 1`, which `gossip.suspect_after` sizes. A missing value is never a
 pass. The section never changes the exit code; `gate.py` prints how many

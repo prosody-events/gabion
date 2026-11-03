@@ -19,9 +19,9 @@ data:
 
     http {
         # Every directive is in crates/nginx/README.md, "Directive reference".
-        # 2m holds 16,384 counters; size it from the notes under
-        # `gabion_limit_zone`.
-        gabion_limit_zone zone=api:2m;
+        # 32m holds 262,144 counters, the table gabiond.yaml's node builds by
+        # default; size it from the notes under `gabion_limit_zone`.
+        gabion_limit_zone zone=api:32m;
         gabion_limit_rule per_ip $remote_addr rate=100r/s;
 
         gabion_gossip_bind 0.0.0.0:9000;

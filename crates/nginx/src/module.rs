@@ -42,16 +42,20 @@ use crate::shm::{Layout, MIN_AGGREGATE_CAPACITY, QueueSlot, ShmRegion};
 
 /// Report an `nginx -t` error at the line nginx is reading. The message ends
 /// with ` code=<code>`, the key of its entry in the NGINX README's
-/// configuration errors, as `tracing` lines end with their fields.
+/// configuration errors, as `tracing` lines end with their fields; `code`
+/// must be a string literal, so hygiene's catalogue gate sees every one.
+/// The expansion dereferences `cf`, so it belongs only in a function whose
+/// safety contract makes `cf` the live `ngx_conf_t` nginx passed it.
 macro_rules! conf_error {
-    ($cf:expr, code = $code:literal, $fmt:literal $(, $arg:expr)* $(,)?) => {
+    ($cf:expr, code = $code:literal, $fmt:literal $(, $arg:expr)* $(,)?) => {{
+        const _: &str = $code;
         ngx::ngx_conf_log_error!(
             NGX_LOG_EMERG,
             $cf,
             concat!("gabion: ", $fmt, " code=", $code)
             $(, $arg)*
-        )
-    };
+        );
+    }};
 }
 
 static LEADER_THREAD: Mutex<Option<LeaderHandle>> = Mutex::new(None);
@@ -246,7 +250,9 @@ impl http::HttpModule for Module {
                     code = "rules_without_limit_zone",
                     "rules are declared but `gabion_limit_zone` is not set, so no request would \
                      ever be counted or limited: the zone is the shared memory that holds the \
-                     counts. Add `gabion_limit_zone zone=gabion:2m;` to the http {{}} block.",
+                     counts. Add `gabion_limit_zone zone=gabion:32m;` to the http {{}} block: \
+                     262,144 counters, the table `gabiond` builds by default (the zone-sizing \
+                     notes in the gabion NGINX README).",
                 );
                 return core::Status::NGX_ERROR.into();
             }
@@ -724,7 +730,15 @@ fn find_query_arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 /// master process during the config phase. nginx guarantees `cf` points to a
 /// valid `ngx_conf_t` and `conf` points to the `MainConfig` slot it
 /// allocated via `create_main_conf`.
-extern "C" fn set_zone(
+///
+/// # Safety
+///
+/// Only nginx calls this, as the directive's `set` handler during the
+/// single-threaded config phase: `cf` is non-null and points at a valid
+/// `ngx_conf_t` whose `args` and `log` nginx populated, and `conf` points at
+/// this module's configuration slot for the directive's level. Every
+/// directive handler below has the same contract.
+unsafe extern "C" fn set_zone(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
     conf: *mut c_void,
@@ -736,7 +750,8 @@ extern "C" fn set_zone(
     // `ngx_str_t` populated by nginx's tokenizer; the pointer arithmetic
     // below is bounded by the `nelts` check, and each `ngx_str_t` is a
     // valid borrowed view of the config file's token storage which outlives
-    // this call. See the nomicon chapters on FFI and raw pointers.
+    // this call. `cf` is the valid `ngx_conf_t` that `single_arg` and
+    // `conf_error!` read. See the nomicon chapters on FFI and raw pointers.
     unsafe {
         let main = &mut *(conf as *mut MainConfig);
         if main.zone_bytes.is_some() {
@@ -921,7 +936,7 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
 /// [`parse_rule_directive`] reads the arguments, reporting any syntax error
 /// at this line; `postconfiguration` builds the rule once every setting is
 /// read. See the README's "Rate, window, and bucket" section.
-extern "C" fn set_rule(
+unsafe extern "C" fn set_rule(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
     conf: *mut c_void,
@@ -978,7 +993,7 @@ extern "C" fn set_rule(
 /// declaring `gabion_limit` at a child level replaces the parent's set
 /// rather than appending to it. Multiple `gabion_limit` directives within
 /// the same level accumulate (dedup on duplicates).
-extern "C" fn set_limit(
+unsafe extern "C" fn set_limit(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
     conf: *mut c_void,
@@ -1072,7 +1087,7 @@ extern "C" fn set_limit(
 /// disables the access handler entirely for this scope (no rules evaluated,
 /// no access-phase work). `on` re-enables it where a parent had it off.
 /// Valid at the http, server, and location levels.
-extern "C" fn set_gabion(
+unsafe extern "C" fn set_gabion(
     cf: *mut ngx_conf_t,
     _command: *mut ngx_command_t,
     conf: *mut c_void,
@@ -1118,7 +1133,7 @@ extern "C" fn set_gabion(
 /// argument into the setting `commands` pointed `post` at. Invoked once per
 /// occurrence from the master process during the config phase; nginx has
 /// already checked that there is exactly one argument.
-extern "C" fn set_setting(
+unsafe extern "C" fn set_setting(
     cf: *mut ngx_conf_t,
     command: *mut ngx_command_t,
     conf: *mut c_void,
@@ -1128,7 +1143,8 @@ extern "C" fn set_setting(
     // `post` `commands` pointed at an element of the `'static`
     // `Setting::ALL`, and `conf` at the `MainConfig` slot `create_main_conf`
     // allocated (HttpModuleMainConf contract), so the read is valid and the
-    // `&mut` borrow unique. `cf` satisfies `single_arg`'s contract.
+    // `&mut` borrow unique. `cf` satisfies `single_arg`'s contract, and
+    // `arg_not_utf8`'s and `conf_error!`'s below.
     let (setting, main, value) = unsafe {
         (
             *(*command).post.cast::<Setting>(),
@@ -1137,7 +1153,10 @@ extern "C" fn set_setting(
         )
     };
     let Some(value) = value else {
-        return arg_not_utf8(cf, setting.nginx_directive().unwrap_or(setting.yaml_key()));
+        // SAFETY: as above.
+        return unsafe {
+            arg_not_utf8(cf, setting.nginx_directive().unwrap_or(setting.yaml_key()))
+        };
     };
     match main.settings.apply(setting, value) {
         Ok(()) => core::NGX_CONF_OK,
@@ -1149,7 +1168,12 @@ extern "C" fn set_setting(
 }
 
 /// Fails a directive whose argument is not UTF-8 (`directive_arg_not_utf8`).
-fn arg_not_utf8(cf: *mut ngx_conf_t, directive: &str) -> *mut c_char {
+///
+/// # Safety
+///
+/// `cf` must be the non-null, valid `ngx_conf_t`, with its `log` set, that
+/// nginx passed the calling directive handler: `conf_error!` dereferences it.
+unsafe fn arg_not_utf8(cf: *mut ngx_conf_t, directive: &str) -> *mut c_char {
     conf_error!(
         cf,
         code = "directive_arg_not_utf8",

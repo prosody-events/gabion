@@ -9,7 +9,7 @@ RESULTS holds one directory per arm, as `matrix.py --solution <arm>` writes
 them: `main` and `imp-az-hier-nopk` (`make sim-baselines`) and `zone` (the
 checkout under test). Runs `judge.py` over the three once per comparator, into
 OUT/<comparator>/, classifies every comparison with `verdict()`, writes
-OUT/gate.md and exits 1 when a rule fails. gate.md also checks §6.5's cost
+OUT/gate.md and exits 1 when a rule fails. gate.md also checks the cost
 model against the zone arm (crate README, "The regression gate"); that check
 never changes the exit code.
 
@@ -32,7 +32,7 @@ from verdict import verdict
 HERE = Path(__file__).resolve().parent
 MAIN, NOPK, ZONE = "main", "imp-az-hier-nopk", "zone"
 SEEDS = 3
-# The study's error metrics (study report §4.3): the 78 (regime, metric)
+# The study's error metrics: the 78 (regime, metric)
 # comparisons every regime has, plus those only some regimes have.
 ERROR_METRICS = {"conv_p50_incl_never_ms", "conv_p99_incl_never_ms", "conv_never_frac",
                  "stale_limited_p99_pct", "over_max_pct", "over_mean_pct",
@@ -43,7 +43,7 @@ PROD = ("prod-typical", "prod-peak", "prod-4x")
 PREDICTED_COST_RATIO = 0.93
 NUMBERS = ("mean", "ratio", "ratio_lo", "ratio_hi", "diff_mean", "diff_lo", "diff_hi",
            "p_better", "cri_lo", "cri_hi")
-# §6.5's cost model reads the defaults and wire sizes it was derived with;
+# The cost model reads the defaults and wire sizes it was derived with;
 # test_gate.py checks each against its Rust source, except `DICT_ENTRY_BYTES`,
 # the width of a u128.
 TICK_MS = 500                                 # defaults::GOSSIP_TICK_INTERVAL_MILLIS, T
@@ -57,7 +57,7 @@ TICK_S = TICK_MS / 1000
 # A data packet with one rule and one origin in its dictionaries, before its cells.
 DATA_BYTES = IP_UDP_BYTES + HEADER_BYTES + DICT_LEN_BYTES + 2 * DICT_ENTRY_BYTES
 MODEL_BAND_PCT = 5.0
-# §6.5 derives its equations for a steady cluster: no loss, no churn, no partition.
+# The cost model derives its equations for a steady cluster: no loss, no churn, no partition.
 UNSTEADY = ("network", "churn")
 STREAM_SIZES = "the quantum `q` (from `storage.max_cells`) or `gossip.tick_interval`"
 # (summary.csv metric, equation, the setting the equation sizes, whether the
@@ -69,11 +69,11 @@ MODEL = (("packets_per_node_s", "(6.3)", STREAM_SIZES, False),
          ("peak_cells", "(6.10)", "`STORAGE_MAX_CELLS` (`storage.max_cells`)", True))
 MODEL_INTRO = (
     "Never changes the exit code. The equations are restated in "
-    "`crates/gossip-bench/README.md` (\"§6.5's cost model\"). Each prediction uses the "
+    "`crates/gossip-bench/README.md` (\"The cost model\"). Each prediction uses the "
     "zone arm's measured admitted rate, the regime and the defaults; measured is the mean "
     "over valid seeds [95 % credible interval]. A metric more than 5 % off its prediction "
     "(above it, for (6.10)'s upper bound) is named below its table, in a regime without "
-    "loss, churn or a partition, which §6.5's equations leave out. (6.3)'s `a`, the "
+    "loss, churn or a partition, which the cost model leaves out. (6.3)'s `a`, the "
     "acknowledgements sent alone, has no equation, so the predictions leave it out and "
     "put λ / R_own cells in each data packet. `missing` means no value: no valid seed, "
     "no admitted hits, a regime outside (6.2)'s ε = 1, or a metric the run's result "
@@ -144,7 +144,7 @@ def p99_ms(rate: float) -> float:
 
 
 def predict(regime: dict, admitted: float | None) -> dict:
-    """§6.5's prediction of each `MODEL` metric for `regime` at the zone arm's
+    """The cost model's prediction of each `MODEL` metric for `regime` at the zone arm's
     mean admitted hits in the measurement window. Empty, so every metric reads
     missing, without traffic or where (3.2) gives ε ≠ 1, outside (6.2)."""
     if not admitted:
@@ -165,7 +165,7 @@ def predict(regime: dict, admitted: float | None) -> dict:
 
 
 def false_suspicion(regime: dict) -> str:
-    """§6.5.8's chance that an episode ends in a false suspicion here, at
+    """(6.5.8)'s chance that an episode ends in a false suspicion here, at
     n_a = ⌊T_u / T⌋ answer attempts and at its floor, one fewer."""
     attempts = max(SUSPECT_TICKS * TICK_MS, SUSPECT_FLOOR_MS) // TICK_MS     # n_a
     network = regime.get("network", {})
@@ -180,21 +180,21 @@ def false_suspicion(regime: dict) -> str:
 
 
 def model_check(regimes: dict, rows: dict) -> tuple[list[str], int]:
-    """gate.md's not-gating section: per regime, §6.5's predictions beside the
+    """gate.md's not-gating section: per regime, the cost model's predictions beside the
     zone arm's measured mean [credible interval], and how many miss by more
     than `MODEL_BAND_PCT` as printed, to one decimal."""
-    lines, misses = ["", "## §6.5's cost model against the zone arm (not gating)", "",
+    lines, misses = ["", "## The cost model against the zone arm (not gating)", "",
                      MODEL_INTRO], 0
     for r, regime in regimes.items():
         predicted = predict(regime, (rows.get((r, ZONE, "admitted")) or {}).get("mean"))
         lines += ["", f"### {r}", "", "| Metric | Equation | Predicted | Measured | Off by |",
                   "|---|---|---|---|---|"]
-        notes = [f"- `gateway_failovers`: missing. §6.5.8 predicts a false suspicion in "
+        notes = [f"- `gateway_failovers`: missing. (6.5.8) predicts a false suspicion in "
                  f"{false_suspicion(regime)}; `gossip.suspect_after` sizes it."]
         steady = not any(key in regime for key in UNSTEADY)
         if predicted and not steady:
             notes.append("- Shown, never counted as a miss: this regime has loss, churn or "
-                         "a partition, which §6.5's equations leave out.")
+                         "a partition, which the cost model leaves out.")
         for metric, equation, sizes, upper_bound in MODEL:
             row = rows.get((r, ZONE, metric)) or {}
             p, m = predicted.get(metric), row.get("mean")
@@ -204,7 +204,7 @@ def model_check(regimes: dict, rows: dict) -> tuple[list[str], int]:
                 off = f"{pct:+.1f} %"
                 if steady and (pct if upper_bound else abs(pct)) > MODEL_BAND_PCT:
                     misses += 1
-                    notes.append(f"- `{metric}`: §6's defaults rest on a model that "
+                    notes.append(f"- `{metric}`: the defaults rest on a cost model that "
                                  f"misses here by {abs(pct):.1f}%; the owner decides. "
                                  f"{equation} sizes {sizes}.")
             shown = ("missing" if m is None
@@ -266,7 +266,7 @@ def main() -> None:
     (args.out / "gate.md").write_text("\n".join(lines) + "\n")
     print("\n".join(fails) or "Every rule passes.",
           f"Cost model (not gating): {misses} comparison{'' if misses == 1 else 's'} "
-          f"miss{'es' if misses == 1 else ''} §6.5 by more than 5 %; gate.md "
+          f"miss{'es' if misses == 1 else ''} the cost model by more than 5 %; gate.md "
           "names the setting each sizes, and the owner decides.",
           f"Wrote {args.out}/gate.md", sep="\n")
     sys.exit(1 if fails else 0)

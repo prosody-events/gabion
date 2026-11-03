@@ -298,7 +298,8 @@ SIZE sets how many `(rule, key, bucket)` counters the limit zone holds: after
 the request queue (`gabion_gossip_limit_queue_capacity` × 72 bytes,
 rounded up to a power of two: 576 KiB at the default) and nginx's slab
 bookkeeping (under 1%), the rest becomes a power-of-two table of 64-byte slots, so each doubling of
-SIZE doubles the slots (`2m` holds 16,384, `64m` holds 524,288; the
+SIZE doubles the slots (`2m` holds 16,384, `32m` holds 262,144, the table
+`gabiond` builds by default, and `64m` holds 524,288; the
 `gabion: limit zone ready` log line reports `slots`). A rule needs about
 *active keys × (window / bucket + 1)* slots, and lookups stay short
 while the table is under half full. For example, 650 keys a second under
@@ -530,7 +531,7 @@ into the cap.
 | `gabion_storage_rule_dictionary_capacity N`     | twice the rules, at least `256` | Number of distinct rule slots (each unique `rule_fingerprint` interns into one slot). Advanced: set it only on [`rule_dictionary_full`](../gabion/TROUBLESHOOTING.md#rule_dictionary_full); below the number of rules fails `nginx -t`. |
 | `gabion_storage_node_dictionary_capacity N`     | twice `gabion_gossip_peer_capacity` (`1024`) | Number of distinct (node_id, incarnation) slots; must exceed `gabion_gossip_peer_capacity`. Advanced: set it only on [`node_dictionary_full`](../gabion/TROUBLESHOOTING.md#node_dictionary_full). |
 | `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare, up to 65,535.                           |
-| `gabion_storage_max_descriptor_bytes N`         | `512`       | Per-request budget on `(key + value)` bytes summed across descriptors plus the domain. Exceeded ⇒ 400. |
+| `gabion_storage_max_descriptor_bytes N`         | `512`       | Budget on each matched rule's descriptor: its domain plus every binding's key and value, in bytes. A request matching two rules gets two budgets. Exceeded ⇒ 400, with the exceptions [`cardinality_rejected`](#cardinality_rejected) lists. |
 | `gabion_storage_max_key_bytes N`                | `128`       | Cap on a single descriptor key's length (validated at config phase).                  |
 | `gabion_storage_max_matched_rules N`            | `16`        | Most rules one request is counted against; past it the request is allowed and the rest under-count (logged as [`matched_rule_overflow`](#matched_rule_overflow)). Each worker reserves 64 bytes per rule once, on its first request. |
 
@@ -1110,7 +1111,7 @@ Message starts: "gabion: rules are declared but `gabion_limit_zone` is not set"
 
 **Why.** The `gabion_limit_zone` line was left out, or the file declaring it is not included.
 
-**What to do next.** Add `gabion_limit_zone zone=gabion:2m;` to the `http {}` block (see its sizing notes), or include the file that declares it.
+**What to do next.** Add `gabion_limit_zone zone=gabion:32m;` to the `http {}` block, 262,144 counters, the table `gabiond` builds by default (size it from its sizing notes), or include the file that declares it.
 
 **Fields** none · **Knob** `gabion_limit_zone`
 

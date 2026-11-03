@@ -216,11 +216,13 @@ miri-lib:
 miri-all: miri-lib miri-safety miri-safety-tb miri-ffi-alignment miri-ffi-alignment-tb
 	MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-disable-isolation" $(CARGO_ENV) $(MIRI) -p gabion-nginx --lib
 
-# Operator-message catalogue: every `code` field has an entry, and every
-# library entry names a code some library message still emits. The
+# Operator-message catalogue: every `code` field has an entry, and every entry
+# for a log line (a code heading over a **Level** line) names a code its
+# crate's sources still emit; each catalogue is paired with those sources. The
 # visualizer's design rules (web/README.md "Design rules"): no colour literal
 # outside tokens.css, no pixel font-size, and every token named is defined.
-CATALOGUES := crates/gabion/TROUBLESHOOTING.md crates/server/README.md crates/nginx/README.md
+CATALOGUE_SOURCES := crates/gabion/TROUBLESHOOTING.md=crates/gabion/src crates/server/README.md=crates/server/src crates/nginx/README.md=crates/nginx/src
+CATALOGUES := $(foreach pair,$(CATALOGUE_SOURCES),$(firstword $(subst =, ,$(pair))))
 # The study harness's adapter boundary (crates/gossip-bench/README.md, "The
 # adapter contract"): outside adapter.rs, every line that names the gabion
 # crate is one `use` of the stable trait surface. Aliases, `extern crate`,
@@ -236,8 +238,11 @@ hygiene:
 	@for code in $$(rg -oNI 'code = "([^"]+)"' -r '$$1' crates/*/src -g '!**/tests.rs' -g '!**/tests/**' | sort -u); do \
 		rg -qFx "### \`$$code\`" $(CATALOGUES) || { echo "operator message code \`$$code\` has no entry in $(CATALOGUES)"; exit 1; }; \
 	done
-	@for code in $$(rg -oNI '^### `([^`]+)`$$' -r '$$1' crates/gabion/TROUBLESHOOTING.md); do \
-		rg -qF "code = \"$$code\"" crates/gabion/src || { echo "crates/gabion/TROUBLESHOOTING.md documents \`$$code\`, which no library message emits"; exit 1; }; \
+	@for pair in $(CATALOGUE_SOURCES); do \
+		doc=$${pair%%=*}; src=$${pair#*=}; \
+		for code in $$(rg -oNIU '^### `([^`]+)`\n\n\*\*Level\*\* (.*)' -r '$$1 $$2' $$doc | awk '!/not a log line/ { print $$1 }'); do \
+			rg -qF "code = \"$$code\"" $$src -g '!**/tests.rs' -g '!**/tests/**' || { echo "$$doc documents \`$$code\`, which no message in $$src emits; delete the entry, or rename it to the code that replaced it"; exit 1; }; \
+		done; \
 	done
 	rg -n '#[0-9a-fA-F]{3,8}\b|0x[0-9a-fA-F]{6}|rgba?\(|hsla?\(' $(WEB_DIR)/src --glob '!tokens.css'; test $$? -eq 1
 	rg -n 'font-size:\s*[0-9.]+px' $(WEB_DIR)/src; test $$? -eq 1

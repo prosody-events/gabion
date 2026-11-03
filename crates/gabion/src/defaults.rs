@@ -21,8 +21,10 @@ pub const STORAGE_RULE_DICTIONARY_FLOOR: u16 = 256;
 /// most 65,535); a longer rule fails to load (`TooManyDescriptors`).
 pub const STORAGE_MAX_DESCRIPTOR_COUNT: u16 = 16;
 
-/// Default of `storage.max_descriptor_bytes`, in bytes per request (domain,
-/// keys and values); past it the request is rejected (`cardinality_rejected`).
+/// Default of `storage.max_descriptor_bytes`, in bytes per descriptor: the
+/// domain plus the keys and values of one Envoy descriptor, or of one NGINX
+/// rule's bindings; past it that descriptor is rejected
+/// (`cardinality_rejected`).
 pub const STORAGE_MAX_DESCRIPTOR_BYTES: usize = 512;
 
 /// Default of `storage.max_key_bytes`, in bytes per descriptor key: a longer

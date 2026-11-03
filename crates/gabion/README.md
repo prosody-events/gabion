@@ -394,7 +394,7 @@ syntax.
 | `gossip.tick_interval` | `GABION_GOSSIP_TICK_INTERVAL` | `gabion_gossip_tick_interval` | `500ms` | — | The heartbeat, also the retransmission timeout. It sets the convergence tail of a quiet rule; `setting_warning` warns below 20 ms, near a cross-zone round trip. |
 | `gossip.target_err_bps` | `GABION_GOSSIP_TARGET_ERR_BPS` | `gabion_gossip_target_err_bps` | `100` | — | Per-rule error budget in basis points of the rule's limit, 1 to 10,000: 100 bounds the cluster's unreplicated hits per rule at 1 % of its limit. Lower for tighter limits, higher to send less. |
 | `storage.max_descriptor_count` | `GABION_STORAGE_MAX_DESCRIPTOR_COUNT` | `gabion_storage_max_descriptor_count` | `16` | — | Descriptors one rule may declare, up to 65,535; a longer rule fails to load. |
-| `storage.max_descriptor_bytes` | `GABION_STORAGE_MAX_DESCRIPTOR_BYTES` | `gabion_storage_max_descriptor_bytes` | `512` | — | Bytes of domain, keys and values one request's descriptor may carry; past it the request is rejected as `cardinality_rejected` (NGINX answers 400). |
+| `storage.max_descriptor_bytes` | `GABION_STORAGE_MAX_DESCRIPTOR_BYTES` | `gabion_storage_max_descriptor_bytes` | `512` | — | Bytes of domain, keys and values one descriptor may carry (in NGINX, one matched rule's bindings); past it that descriptor is rejected as `cardinality_rejected` (NGINX answers 400). |
 | `storage.max_key_bytes` | `GABION_STORAGE_MAX_KEY_BYTES` | `gabion_storage_max_key_bytes` | `128` | — | Bytes in one descriptor key: a longer key fails to load, or rejects the request (`cardinality_rejected`). |
 | `storage.max_request_descriptors` | `GABION_STORAGE_MAX_REQUEST_DESCRIPTORS` | none | `16` | — | Descriptors of one Envoy request `gabiond` evaluates; the rest are rejected as `cardinality_rejected`. |
 
@@ -564,8 +564,10 @@ its own, and the cluster admits up to its limit through each.
 
 ### Removed settings
 
-These settings are gone. A YAML file, environment or `nginx.conf` that still
-sets one fails to load naming it; delete the line.
+These settings are gone. A YAML file or `nginx.conf` that still sets one fails
+to load naming it; delete the line. `gabiond` reads only the environment
+variables of current settings, so it ignores a removed one without a word:
+delete those from the Deployment too, or they will mislead the next reader.
 
 | Removed (YAML key / environment variable / NGINX directive) | What replaces it |
 |---|---|

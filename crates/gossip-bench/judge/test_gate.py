@@ -158,9 +158,9 @@ class ExitTest(unittest.TestCase):
                 gate.main()
             text = (out / "gate.md").read_text()
         self.assertEqual(exit_.exception.code, 0)
-        self.assertIn("Cost model (not gating): 1 comparison misses §6.5", stdout.getvalue())
+        self.assertIn("Cost model (not gating): 1 comparison misses the cost model", stdout.getvalue())
         self.assertIn("Every rule passes.", text)
-        self.assertIn("`peak_cells`: §6's defaults rest on a model that misses here", text)
+        self.assertIn("`peak_cells`: the defaults rest on a cost model that misses here", text)
 
 
 class ModelTest(unittest.TestCase):
@@ -190,7 +190,7 @@ class ModelTest(unittest.TestCase):
                 self.assertEqual((misses, "misses here by" in text), (flagged, bool(flagged)),
                                  (metric, scale))
         for metric, equation, sizes, _ in gate.MODEL:
-            self.assertIn(f"- `{metric}`: §6's defaults rest on a model that misses here by "
+            self.assertIn(f"- `{metric}`: the defaults rest on a cost model that misses here by "
                           f"5.1%; the owner decides. {equation} sizes {sizes}.",
                           self.check(1.051, metric)[0])
         self.assertEqual({m: bound for m, *_, bound in gate.MODEL},
@@ -215,7 +215,7 @@ class ModelTest(unittest.TestCase):
             self.assertEqual(misses, 0, name)
             self.assertNotIn("misses here by", text, name)
             self.assertIn("- Shown, never counted as a miss: this regime has loss, churn or a "
-                          "partition, which §6.5's equations leave out.", text, name)
+                          "partition, which the cost model leaves out.", text, name)
             self.assertIn("| +200.0 % |", text, name)
         for name in ("prod-peak", "low-3", "long-window", "idle", "hot-key"):
             text, misses = self.check(3.0, "packets_per_node_s", name)
@@ -225,7 +225,7 @@ class ModelTest(unittest.TestCase):
     def test_a_missing_metric_reads_missing_not_a_pass(self):
         # Red if a missing mean is read as 0 or as within the band, if
         # predictions are made without an admitted count or outside ε = 1, or
-        # if `gateway_failovers` is left out, or shown without §6.5.8's odds or
+        # if `gateway_failovers` is left out, or shown without (6.5.8)'s odds or
         # `gossip.suspect_after`, instead of shown missing.
         peak = {"prod-peak": regime("prod-peak")}
         rows = {("prod-peak", ZONE, "admitted"): {"mean": self.ADMITTED},
@@ -241,19 +241,19 @@ class ModelTest(unittest.TestCase):
         self.assertTrue(all(line.endswith("| missing | missing | missing |") for line in table),
                         table)
         self.assertEqual(misses, 0)
-        self.assertIn(f"- `gateway_failovers`: missing. §6.5.8 predicts a false suspicion in "
+        self.assertIn(f"- `gateway_failovers`: missing. (6.5.8) predicts a false suspicion in "
                       f"{gate.false_suspicion(peak['prod-peak'])}; `gossip.suspect_after` "
                       "sizes it.", lines)
         wide = peak["prod-peak"] | {"rule": peak["prod-peak"]["rule"] | {"limit": 10**7}}
         self.assertEqual(gate.predict(wide, self.ADMITTED), {})  # ε = 549
 
-    def test_the_model_gives_section_6_5s_numbers(self):
-        # Red if (6.2), (6.3), (6.5), (6.10), the packet size or §6.5.8's
+    def test_the_model_gives_the_designs_numbers(self):
+        # Red if (6.2), (6.3), (6.5), (6.10), the packet size or (6.5.8)'s
         # false-suspicion odds are mistyped, or if `a`, which has no equation,
-        # is guessed at: the expected values are §6.3's and §6.5's own figures
+        # is guessed at: the expected values are the design's own figures
         # (R_own 5.49 and 12.54, so D − a = 999 and 3,749, p99 300 and 148 ms,
-        # A = Λ · 11 s, the §6.5.8 tables).
-        peak = gate.predict(regime("prod-peak"), 1_825 * 60)  # Λ = 1,825 (§6.3)
+        # A = Λ · 11 s, the (6.5.8) tables).
+        peak = gate.predict(regime("prod-peak"), 1_825 * 60)  # Λ = 1,825
         x4 = gate.predict(regime("prod-4x"), 7_222 * 60)      # Λ = 7,222
         self.assertAlmostEqual(peak["packets_per_node_s"], 5.49 * 182, delta=1)
         self.assertAlmostEqual(x4["packets_per_node_s"], 12.54 * 299, delta=2)
