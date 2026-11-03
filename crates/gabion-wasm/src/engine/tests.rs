@@ -930,12 +930,18 @@ fn one_way_cut_is_repaired_by_the_backstop() {
 }
 
 /// A zone cut off from the rest for longer than `suspect_after` turns every
-/// row across the cut suspect; after the heal, every node holds every bucket's
-/// exact count, and every byte sent or dropped is accounted by tier.
+/// row across the cut that is owed data suspect; after the heal, every node
+/// holds every bucket's exact count, and every byte sent or dropped is
+/// accounted by tier. Zone c has one member, so the gateway into it cannot
+/// fail over: a replaced gateway that wins the role back at the heal gets its
+/// stream from 0, but this one keeps its role, so only the rewind its probe
+/// answer brings resends what the cut swallowed.
 #[test]
 fn zone_partition_heals_to_exact_counts() {
-    with_state(zoned(12, 3), |mut state| async move {
+    with_state(zoned(5, 3), |mut state| async move {
         let mut all = warm(&mut state).await;
+        let lone = state.snapshot().await.zones[2].live;
+        assert_eq!(lone, 1, "zone c's gateway has no replacement");
         let cut: Vec<u32> = state
             .nodes
             .iter()
@@ -1101,7 +1107,9 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
         let names: Vec<_> = snap.zones.iter().map(|z| z.name).collect();
         assert_eq!(names, ["zone-a", "zone-b", "zone-c"]);
 
-        for (ask, lands) in [(None, 2), (None, 0), (Some(1), 1)] {
+        // The last ask is for the largest zone, so only honouring it lands
+        // there.
+        for (ask, lands) in [(None, 2), (None, 0), (Some(0), 0)] {
             state.add_node(ask).await.expect("the node joins");
             let snap = state.snapshot().await;
             let joiner = snap.nodes.last().expect("a joiner");
