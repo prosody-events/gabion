@@ -284,3 +284,45 @@ Message starts: "Peer discovery hit an error and skipped an update"
 **What to do next.** If it repeats, check API access (the Role in the [Kubernetes checklist](../../README.md#kubernetes-checklist)) and the discovery settings: `discovery.namespace_allow`, `discovery.service_allow`, `discovery.self_addr` in `gabiond`, `gabion_discovery_*` in NGINX.
 
 **Fields** `error`, `errors_total` · **Knob** `discovery.*` / `gabion_discovery_*`
+
+### `zone_known`
+
+**Level** info, once when the zone becomes known (NGINX: each time a worker starts leading gossip) · **Request allowed** yes, counts unaffected · **Emitted by** library (both adapters)
+
+Message starts: "This node is in zone"
+
+**What happened.** This node knows its availability zone, from the zone setting (`zone_source = "config"`) or from its own Kubernetes EndpointSlice entry (`zone_source = "endpoint_slice"`). It now sends each change directly to the peers of its zone and through one gateway in each other zone. Nothing is wrong.
+
+**Why.** Logged at start for a configured zone, or when discovery first finds the node's own entry with a zone. A `zone_unknown` line before it only meant discovery was slow. The first node of a new zone asks a peer of another zone for its catch-up sweep once every discovered peer has answered, or once it has waited `gossip.zone_grace`.
+
+**What to do next.** Nothing. If the zone is wrong, set `gossip.zone`, or correct the node's `topology.kubernetes.io/zone` label and restart the pod. `/snapshot`'s `zone` object shows the same name and source.
+
+**Fields** `zone`, `zone_hash`, `zone_source` · **Knob** `gossip.zone` (`GABION_GOSSIP_ZONE`) / `gabion_gossip_zone`
+
+### `zone_unknown`
+
+**Level** warn, once (NGINX: once per leadership term) · **Request allowed** yes, counts unaffected · **Emitted by** library (both adapters)
+
+Message starts: "gabion does not know which availability zone this node runs in"
+
+**What happened.** This node knows no zone, so it treats the whole cluster as one zone and sends every change to every peer directly. Counts stay correct, but none of the cross-zone traffic that zone-aware gossip saves is saved. `reason` says why.
+
+**Why.** `not_configured`: the node uses a static peer list (`gossip.bootstrap_peers`) and has no zone setting, the only place it can learn one; logged at start. `own_entry_not_found`: Kubernetes discovery runs, but after `gossip.zone_grace` none of the EndpointSlice entries it watches is this pod's, usually because the pod's host name differs from its pod name (`hostNetwork: true`, `spec.hostname`) or the pod is outside the watched Services. `own_entry_has_no_zone`: the pod's entry has no zone, because its node (`node_name`) has no `topology.kubernetes.io/zone` label. A node with no peers never logs it.
+
+**What to do next.** `not_configured`: set `gossip.zone` on each node, for example from one of the cloud-metadata commands in the [zones section](README.md#outside-kubernetes). `own_entry_not_found`: set `discovery.self_addr` (`GABION_DISCOVERY_SELF_ADDR`; NGINX `gabion_discovery_self_addr`) to the pod's IP and gossip port, or set `gossip.zone`; if a `zone_known` line follows soon after, discovery was only slow: raise `gossip.zone_grace` above that delay. `own_entry_has_no_zone`: `kubectl label node <node_name> topology.kubernetes.io/zone=<zone>` and restart the pod, or set `gossip.zone`. In a cluster that runs in one zone, set `gossip.zone` to any name to silence it.
+
+**Fields** `zone_source` (`none`), `reason`, `membership`, `config_key`, and by reason `self_match` (`self_addr`, `pod_name` or `none`), `hostname` or `self_addr`, `node_name`, `grace_ms` · **Knob** `gossip.zone` (`GABION_GOSSIP_ZONE`) / `gabion_gossip_zone`; `gossip.zone_grace` (`GABION_GOSSIP_ZONE_GRACE`) / `gabion_gossip_zone_grace`
+
+### `zone_conflict`
+
+**Level** warn, once (NGINX: once per leadership term) · **Request allowed** yes, counts unaffected · **Emitted by** library (both adapters)
+
+Message starts: "The zone setting says this node is in zone"
+
+**What happened.** The zone setting (`configured_zone`) differs from the zone of this node's own Kubernetes EndpointSlice entry (`discovered_zone`). The setting takes precedence, and every peer sees that value, so counts stay correct.
+
+**Why.** Usually a templated `gossip.zone` that does not match the node the pod landed on, or a mislabelled node. If the node really runs in `discovered_zone`, its traffic is grouped with the wrong zone and the cross-zone savings for this node are lost.
+
+**What to do next.** Correct `gossip.zone`, or remove it so the node uses the Kubernetes value.
+
+**Fields** `configured_zone`, `discovered_zone`, `zone_source` (`config`), `config_key` · **Knob** `gossip.zone` (`GABION_GOSSIP_ZONE`) / `gabion_gossip_zone`

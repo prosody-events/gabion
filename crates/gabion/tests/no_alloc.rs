@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity};
+use gabion::discovery::Membership;
 use gabion::gossip::Role;
 use gabion::gossip::sim::sim_advance_ticks;
 use gabion::gossip::{
@@ -243,7 +244,8 @@ fn steady_state_gossip_never_allocates() {
         });
         let start = |me: usize| {
             let mut config = gossip.clone();
-            config.bootstrap_peers = (0..3).filter(|&i| i != me).map(|i| net.addrs[i]).collect();
+            let peers = (0..3).filter(|&i| i != me).map(|i| net.addrs[i]);
+            config.membership = Membership::Static(peers.collect());
             let zone = if me == 0 { "a" } else { "b" };
             config.zone = Some(ZoneName::parse(zone).unwrap());
             let identity = NodeIdentity::new(NodeId(0xA0 + me as u128), 1);

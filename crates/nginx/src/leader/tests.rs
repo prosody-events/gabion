@@ -35,7 +35,6 @@ fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
         worker_id,
         gossip_bind: Some("127.0.0.1:0".parse().expect("addr")),
         gossip,
-        discovery: DiscoveryConfig::default(),
         cell_store,
         lease_tick: LEASE_TICK,
     };

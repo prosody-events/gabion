@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests;
 
-use crate::discovery::{DiscoveryConfig, Peer, PeerDiscovery, PeerEvent};
-use crate::zone::ZoneHash;
+use crate::discovery::{DiscoveryConfig, Peer, PeerDiscovery, PeerEvent, SelfMatch};
+use crate::zone::{ZoneHash, ZoneName};
 use ahash::{AHashMap, AHashSet};
 use async_stream::stream;
 use futures::stream::{SelectAll, Stream, StreamExt, select_all};
@@ -20,7 +20,10 @@ const DEFAULT_GABION_SERVICE_NAME: &str = "gabion";
 /// Watches every Service in the configured namespaces and, for each Service
 /// exposing a UDP `gabion` port, watches its EndpointSlices. New services are
 /// picked up live; deletions and disappearing ports emit `Removed` for every
-/// peer the Service had contributed before its watcher is shut down.
+/// peer only that Service listed. One peer set spans every watched Service,
+/// so an address another Service or slice still lists is never removed. The
+/// node's own entry, found by [`SelfMatch`], is never a peer: its zone is
+/// reported as [`PeerEvent::OwnEntry`].
 ///
 /// The kube `Client` is built lazily when `peer_events` is first polled. If
 /// the in-cluster environment is missing, a warning is logged and
@@ -72,7 +75,11 @@ impl PeerDiscovery for EndpointSliceDiscovery {
             };
             let (mut services, namespace_count) = watch_services(&client, &self.config.namespace_allow);
             let mut endpoints = SelectAll::new();
-            let mut watched: AHashMap<Target, oneshot::Sender<()>> = AHashMap::new();
+            // Each watched Service's id and the sender whose drop ends its
+            // EndpointSlice watch.
+            let mut watched: AHashMap<Target, (TargetId, oneshot::Sender<()>)> = AHashMap::new();
+            let mut next_target = 0_u64;
+            let mut peer_set = EndpointSlicePeerSet::default();
             // True once every watched namespace has finished its initial
             // Service list without producing a single Track. The first time
             // that happens we emit a one-shot operator warning (see
@@ -127,17 +134,21 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                          watching it for new peers.",
                                     );
                                     let (cancel_tx, cancel_rx) = oneshot::channel();
+                                    let id = TargetId(next_target);
+                                    next_target += 1;
                                     endpoints.push(Box::pin(watch_target(
                                         client.clone(),
                                         slot.key().clone(),
-                                        self.config.self_addr,
+                                        id,
                                         cancel_rx,
                                     )));
-                                    slot.insert(cancel_tx);
+                                    slot.insert((id, cancel_tx));
                                 }
                             }
                             ServiceChange::Untrack(target) => {
-                                if watched.remove(&target).is_some() {
+                                // Dropping the sender ends the watch at its
+                                // next poll, before it yields another event.
+                                if let Some((id, _cancel)) = watched.remove(&target) {
                                     tracing::info!(
                                         namespace = %target.namespace,
                                         service = %target.service_name,
@@ -145,6 +156,9 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                          (deleted or missing its UDP port); \
                                          stopping peer discovery for it.",
                                     );
+                                    for peer in peer_set.forget(id) {
+                                        yield Ok(PeerEvent::Removed(peer));
+                                    }
                                 }
                             }
                             ServiceChange::InitDone => {
@@ -182,7 +196,35 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                             ServiceChange::Ignore => {}
                         },
                     },
-                    Some(peer_event) = endpoints.next() => yield peer_event,
+                    Some((id, event)) = endpoints.next() => match event {
+                        Err(err) => yield Err(err.into()),
+                        Ok(Event::Init) => peer_set.relist(id),
+                        Ok(Event::InitDone) => {
+                            for peer in peer_set.relisted(id) {
+                                yield Ok(PeerEvent::Removed(peer));
+                            }
+                        }
+                        Ok(Event::Apply(slice) | Event::InitApply(slice)) => {
+                            let self_match = self.config.self_match.as_ref();
+                            let diff = peer_set.apply(id, &slice, self_match);
+                            // The own zone first, so the roles the peers
+                            // below take already see it.
+                            if let Some(own) = diff.own {
+                                yield Ok(own.into());
+                            }
+                            for peer in diff.removed {
+                                yield Ok(PeerEvent::Removed(peer));
+                            }
+                            for peer in diff.added {
+                                yield Ok(PeerEvent::Added(peer));
+                            }
+                        }
+                        Ok(Event::Delete(slice)) => {
+                            for peer in peer_set.delete(id, &slice) {
+                                yield Ok(PeerEvent::Removed(peer));
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -363,28 +405,25 @@ fn is_gabion_udp(name: Option<&str>, protocol: Option<&str>) -> bool {
     name == Some(DEFAULT_GABION_SERVICE_NAME) && protocol == Some("UDP")
 }
 
+/// One watched Service's EndpointSlice events, tagged with its id, until
+/// `cancel` fires or its sender drops; a fatal error is logged and ends the
+/// watch.
 fn watch_target(
     client: Client,
     target: Target,
-    self_addr: Option<SocketAddr>,
+    id: TargetId,
     mut cancel: oneshot::Receiver<()>,
-) -> impl Stream<Item = Result<PeerEvent, DiscoveryError>> + Send {
+) -> impl Stream<Item = (TargetId, Result<Event<EndpointSlice>, WatcherError>)> + Send {
     stream! {
         let api: Api<EndpointSlice> = Api::namespaced(client, &target.namespace);
         let labels = format!("kubernetes.io/service-name={}", target.service_name);
         let events = watcher(api, WatcherConfig::default().labels(&labels));
         futures::pin_mut!(events);
-        let mut peer_set = EndpointSlicePeerSet::default();
 
         loop {
             tokio::select! {
                 biased;
-                _ = &mut cancel => {
-                    for peer in peer_set.drain_peers() {
-                        yield Ok(PeerEvent::Removed(peer));
-                    }
-                    return;
-                }
+                _ = &mut cancel => return,
                 event = events.next() => match event {
                     None => return,
                     Some(Err(err)) => {
@@ -411,160 +450,227 @@ fn watch_target(
                             );
                             return;
                         }
-                        yield Err(err.into());
+                        yield (id, Err(err));
                     }
-                    Some(Ok(Event::Init)) => peer_set.relist(),
-                    Some(Ok(Event::InitDone)) => {
-                        for peer in peer_set.relisted() {
-                            yield Ok(PeerEvent::Removed(peer));
-                        }
-                    }
-                    Some(Ok(Event::Apply(slice) | Event::InitApply(slice))) => {
-                        let diff = peer_set.apply(&slice, self_addr);
-                        for peer in diff.removed {
-                            yield Ok(PeerEvent::Removed(peer));
-                        }
-                        for peer in diff.added {
-                            yield Ok(PeerEvent::Added(peer));
-                        }
-                    }
-                    Some(Ok(Event::Delete(slice))) => {
-                        for peer in peer_set.delete(&slice) {
-                            yield Ok(PeerEvent::Removed(peer));
-                        }
-                    }
+                    Some(Ok(event)) => yield (id, Ok(event)),
                 },
             }
         }
     }
 }
 
-/// Per-slice peer accounting for one `Service` target, driven by
-/// `watch_target` for the lifetime of its EndpointSlice watch: keyed by
+/// One watched Service, numbered in the order discovery found it; a Service
+/// found again gets a new id.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct TargetId(pub(super) u64);
+
+/// Peer accounting across every watched Service, driven by the discovery
+/// stream for the lifetime of its watches: each Service's slices keyed by
 /// EndpointSlice `metadata.name`, so an `Apply` replaces that slice's set in
 /// place, and each slice's peers by address, so a zone change is one `Added`.
-/// An address another slice still lists is not removed, and a relist forgets
-/// each slice it does not list, since the watcher reports no `Delete` for a
-/// slice deleted while it was disconnected. Lifted out of `watch_target` so
-/// the diff semantics are unit-testable without a kube client.
+/// An address any slice of any Service still lists is not removed, and a
+/// relist forgets each slice it does not list, since the watcher reports no
+/// `Delete` for a slice deleted while it was disconnected. Lifted out of the
+/// stream so the diff semantics are unit-testable without a kube client.
 #[derive(Default)]
 pub(super) struct EndpointSlicePeerSet {
+    /// Each watched Service's slices.
+    targets: AHashMap<TargetId, Slices>,
+    /// The own entry's zone as last reported; `None` until first seen. An
+    /// entry that goes missing or not ready never clears it.
+    own: Option<Option<ZoneHash>>,
+}
+
+/// One Service's cached slices.
+#[derive(Default)]
+struct Slices {
     by_slice: AHashMap<String, AHashMap<SocketAddr, Peer>>,
     /// The cached slices a relist in progress has not listed yet.
     unlisted: AHashSet<String>,
 }
 
+/// This node's own entry, as discovery reports it.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct OwnEntry {
+    pub(super) zone: Option<ZoneName>,
+    pub(super) node_name: Option<Box<str>>,
+}
+
+impl From<OwnEntry> for PeerEvent {
+    fn from(own: OwnEntry) -> Self {
+        PeerEvent::OwnEntry {
+            zone: own.zone,
+            node_name: own.node_name,
+        }
+    }
+}
+
 /// What `apply` changed relative to the previous snapshot for that
-/// slice — separated so the caller can emit `Removed` before `Added`
-/// (matching how the kube-rs watcher reports an Apply that both adds
-/// and removes addresses within one slice).
+/// slice — separated so the caller can emit the own zone first and
+/// `Removed` before `Added` (matching how the kube-rs watcher reports an
+/// Apply that both adds and removes addresses within one slice).
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(super) struct PeerSetDiff {
+    /// The own entry, when this slice holds it and its zone is new.
+    pub(super) own: Option<OwnEntry>,
     pub(super) added: Vec<Peer>,
     pub(super) removed: Vec<Peer>,
 }
 
 impl EndpointSlicePeerSet {
-    /// Replace the cached peer set for `slice.metadata.name` with the
-    /// parsed peers of `slice`. Returns the addresses gone from every slice
-    /// as `removed` and the peers new or changed as `added`. A slice with no
-    /// name is silently dropped.
+    /// Replace Service `id`'s cached peer set for `slice.metadata.name` with
+    /// the parsed peers of `slice`. Returns the own entry when its zone is
+    /// new, the addresses gone from every slice as `removed` and the peers
+    /// new or changed as `added`. A slice with no name is silently dropped.
     pub(super) fn apply(
         &mut self,
+        id: TargetId,
         slice: &EndpointSlice,
-        self_addr: Option<SocketAddr>,
+        self_match: Option<&SelfMatch>,
     ) -> PeerSetDiff {
         let Some(name) = slice.metadata.name.as_deref() else {
             return PeerSetDiff::default();
         };
-        let new = peers_from_endpoint_slice(slice, self_addr);
-        self.unlisted.remove(name);
-        let old = self.by_slice.remove(name).unwrap_or_default();
-        let diff = PeerSetDiff {
-            added: (new.values())
-                .filter(|&peer| old.get(&peer.addr) != Some(peer))
-                .copied()
-                .collect(),
-            removed: (old.values())
-                .filter(|peer| !new.contains_key(&peer.addr) && !self.lists(&peer.addr))
-                .copied()
-                .collect(),
-        };
-        self.by_slice.insert(name.to_owned(), new);
-        diff
-    }
-
-    /// Forget the cached peer set for `slice`; returns the peers gone from
-    /// every slice, which the caller now needs to emit `Removed` for. Unknown
-    /// slice names are a no-op.
-    pub(super) fn delete(&mut self, slice: &EndpointSlice) -> Vec<Peer> {
-        let Some(peers) =
-            (slice.metadata.name.as_deref()).and_then(|name| self.by_slice.remove(name))
-        else {
-            return Vec::new();
-        };
-        peers
-            .into_values()
-            .filter(|peer| !self.lists(&peer.addr))
-            .collect()
-    }
-
-    /// A relist starts: every cached slice is unlisted until it lists it.
-    pub(super) fn relist(&mut self) {
-        self.unlisted = self.by_slice.keys().cloned().collect();
-    }
-
-    /// A relist ends: forget each slice it did not list; returns the peers
-    /// gone from every slice, which the caller emits `Removed` for.
-    pub(super) fn relisted(&mut self) -> Vec<Peer> {
-        let mut gone = AHashMap::new();
-        for name in std::mem::take(&mut self.unlisted) {
-            gone.extend(self.by_slice.remove(&name).into_iter().flatten());
+        let (new, own) = peers_from_endpoint_slice(slice, self_match);
+        let own = own.and_then(|endpoint| self.own_entry(endpoint));
+        let slices = self.targets.entry(id).or_default();
+        slices.unlisted.remove(name);
+        let old = slices.by_slice.remove(name).unwrap_or_default();
+        let added = (new.values())
+            .filter(|&peer| old.get(&peer.addr) != Some(peer))
+            .copied()
+            .collect();
+        slices.by_slice.insert(name.to_owned(), new);
+        PeerSetDiff {
+            own,
+            added,
+            removed: self.unlisted_peers(old),
         }
+    }
+
+    /// Forget Service `id`'s cached peer set for `slice`; returns the peers
+    /// gone from every slice, which the caller now needs to emit `Removed`
+    /// for. Unknown slice names are a no-op.
+    pub(super) fn delete(&mut self, id: TargetId, slice: &EndpointSlice) -> Vec<Peer> {
+        let peers = (slice.metadata.name.as_deref())
+            .zip(self.targets.get_mut(&id))
+            .and_then(|(name, slices)| slices.by_slice.remove(name));
+        self.unlisted_peers(peers.unwrap_or_default())
+    }
+
+    /// A relist of Service `id` starts: each of its cached slices is unlisted
+    /// until it lists it.
+    pub(super) fn relist(&mut self, id: TargetId) {
+        let slices = self.targets.entry(id).or_default();
+        slices.unlisted = slices.by_slice.keys().cloned().collect();
+    }
+
+    /// A relist of Service `id` ends: forget each of its slices it did not
+    /// list; returns the peers gone from every slice, which the caller emits
+    /// `Removed` for.
+    pub(super) fn relisted(&mut self, id: TargetId) -> Vec<Peer> {
+        let mut gone = AHashMap::new();
+        if let Some(slices) = self.targets.get_mut(&id) {
+            for name in std::mem::take(&mut slices.unlisted) {
+                gone.extend(slices.by_slice.remove(&name).into_iter().flatten());
+            }
+        }
+        self.unlisted_peers(gone)
+    }
+
+    /// Discovery stopped watching Service `id`: forget its slices; returns
+    /// the peers no other Service lists, which the caller emits `Removed`
+    /// for.
+    pub(super) fn forget(&mut self, id: TargetId) -> Vec<Peer> {
+        let gone = (self.targets.remove(&id).into_iter())
+            .flat_map(|slices| slices.by_slice.into_values().flatten())
+            .collect();
+        self.unlisted_peers(gone)
+    }
+
+    /// The peers of `gone` no cached slice of any Service lists.
+    fn unlisted_peers(&self, gone: AHashMap<SocketAddr, Peer>) -> Vec<Peer> {
         gone.into_values()
             .filter(|peer| !self.lists(&peer.addr))
             .collect()
     }
 
-    /// Whether a cached slice lists `addr`: Kubernetes may list an endpoint in
-    /// two slices at once while it moves between them.
+    /// Whether a cached slice of any Service lists `addr`: Kubernetes may
+    /// list an endpoint in two slices at once while it moves between them,
+    /// and two Services may select the same pod.
     fn lists(&self, addr: &SocketAddr) -> bool {
-        self.by_slice.values().any(|peers| peers.contains_key(addr))
+        (self.targets.values())
+            .flat_map(|slices| slices.by_slice.values())
+            .any(|peers| peers.contains_key(addr))
     }
 
-    /// Empty the map and yield every peer it contained — used at
-    /// watcher shutdown to emit `Removed` for everything still live.
-    pub(super) fn drain_peers(&mut self) -> impl Iterator<Item = Peer> + '_ {
-        std::mem::take(&mut self.by_slice)
-            .into_values()
-            .flat_map(AHashMap::into_values)
+    /// The own entry to report for `endpoint`, if its zone changed since the
+    /// last report. A name that is missing, empty or not a zone name is no
+    /// zone.
+    fn own_entry(&mut self, endpoint: &Endpoint) -> Option<OwnEntry> {
+        let zone = (endpoint.zone.as_deref()).and_then(|zone| ZoneName::parse(zone).ok());
+        let hash = zone.as_ref().map(ZoneName::hash);
+        if self.own == Some(hash) {
+            return None;
+        }
+        self.own = Some(hash);
+        Some(OwnEntry {
+            zone,
+            node_name: endpoint.node_name.as_deref().map(Box::from),
+        })
     }
 }
 
-/// Parse an EndpointSlice into the (deduplicated, self-filtered, ready-
-/// only) peer set, each with the zone its endpoint names. Exposed to `tests`
-/// rather than kept private to the runtime so the parser invariants are pinned
-/// by unit tests.
-pub(super) fn peers_from_endpoint_slice(
-    slice: &EndpointSlice,
-    self_addr: Option<SocketAddr>,
-) -> AHashMap<SocketAddr, Peer> {
+/// Parse an EndpointSlice into the (deduplicated, ready-only) peer set, each
+/// with the zone its endpoint names, and this node's own endpoint, which is
+/// matched before the readiness filter (a starting pod is often not ready,
+/// and its zone is valid anyway) and is never a peer. Exposed to `tests`
+/// rather than kept private to the runtime so the parser invariants are
+/// pinned by unit tests.
+pub(super) fn peers_from_endpoint_slice<'s>(
+    slice: &'s EndpointSlice,
+    self_match: Option<&SelfMatch>,
+) -> (AHashMap<SocketAddr, Peer>, Option<&'s Endpoint>) {
+    let mut peers = AHashMap::new();
     let Some(port) = select_gabion_udp_port(slice) else {
-        return AHashMap::new();
+        return (peers, None);
     };
-    slice
-        .endpoints
-        .iter()
-        .filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
-        .flat_map(|e| {
-            let zone = endpoint_zone(e);
-            e.addresses.iter().map(move |addr| (addr, zone))
-        })
-        .filter_map(|(addr, zone)| {
-            let addr = SocketAddr::new(addr.parse::<IpAddr>().ok()?, port);
-            (Some(addr) != self_addr).then_some((addr, Peer { addr, zone }))
-        })
-        .collect()
+    let mut own = None;
+    for endpoint in &slice.endpoints {
+        if self_match.is_some_and(|self_match| is_own(endpoint, port, self_match)) {
+            own = Some(endpoint);
+            continue;
+        }
+        if !(endpoint.conditions.as_ref())
+            .and_then(|c| c.ready)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let zone = endpoint_zone(endpoint);
+        for addr in &endpoint.addresses {
+            if let Ok(ip) = addr.parse::<IpAddr>() {
+                let addr = SocketAddr::new(ip, port);
+                peers.insert(addr, Peer { addr, zone });
+            }
+        }
+    }
+    (peers, own)
+}
+
+/// Whether `endpoint` is this node's: one of its addresses with the gabion
+/// `port` is `discovery.self_addr`, or its `targetRef` is the Pod named like
+/// this host.
+fn is_own(endpoint: &Endpoint, port: u16, self_match: &SelfMatch) -> bool {
+    match self_match {
+        SelfMatch::Addr(self_addr) => endpoint.addresses.iter().any(|addr| {
+            addr.parse::<IpAddr>()
+                .is_ok_and(|ip| SocketAddr::new(ip, port) == *self_addr)
+        }),
+        SelfMatch::PodName(pod) => endpoint.target_ref.as_ref().is_some_and(|target| {
+            target.kind.as_deref() == Some("Pod") && target.name.as_deref() == Some(&**pod)
+        }),
+    }
 }
 
 /// The zone an endpoint names (`endpoints[].zone`, which Kubernetes copies

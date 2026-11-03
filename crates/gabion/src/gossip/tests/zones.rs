@@ -8,9 +8,11 @@ use std::cell::RefCell;
 use super::rounds::{Node, addrs, assert_totals, id, run_for};
 use super::*;
 use crate::crdt::hash_fingerprint;
+use crate::defaults::GOSSIP_GAP_REPORTS;
+use crate::discovery::{DiscoveryConfig, SelfMatch};
 use crate::gossip::peer::rendezvous_weight;
 use crate::gossip::{AnswerState, PeerZone, RoleCounts};
-use crate::zone::{ZoneHash, ZoneName};
+use crate::zone::{UnknownZone, ZoneHash, ZoneName, ZoneSource, ZoneStatus};
 
 /// A transport that records every packet its node hands it, with when.
 struct Tap<T> {
@@ -431,7 +433,7 @@ fn late_zone_rewinds_the_new_recipient() {
         nodes[0].hits(0..10).await;
         run_for(500).await;
         assert_eq!(nodes[2].agg.total(), 10);
-        nodes[0].tell(PeerEvent::OwnEntry { zone: zone("a") });
+        nodes[0].tell(own_entry("a"));
         run_for(50).await;
         assert_eq!(gateway_of(&nodes[0], "b").await, b[0]);
         run_for(2_000).await;
@@ -471,7 +473,7 @@ fn joiner_that_outranks_the_gateway_relays_lost_cells() {
         run_for(300).await;
         assert_eq!(nodes[3].agg.total(), 10);
         assert_eq!(nodes[0].peer(joiner).await.own_unacked, 0);
-        nodes[3].tell(PeerEvent::OwnEntry { zone: zone("b") });
+        nodes[3].tell(own_entry("b"));
         run_for(1).await;
         nodes[3].hits(10..11).await;
         run_for(300).await;
@@ -626,7 +628,7 @@ fn node_with_late_zone_gets_a_sweep() {
         let first = requests(0);
         assert!(!first.is_empty() && first.iter().all(Option::is_none));
         let mark = taps.borrow().len();
-        x.tell(PeerEvent::OwnEntry { zone: zone("a") });
+        x.tell(own_entry("a"));
         run_for(100).await;
         assert_eq!(requests(mark).first(), Some(&Some(zone("a"))));
         nodes.push(x);
@@ -989,7 +991,7 @@ fn late_own_zone_under_loss_ends_exact() {
         run_for(300).await;
         assert_eq!(nodes[2].agg.total(), 50);
         assert_eq!(nodes[0].peer(b[0]).await.own_unacked, 0);
-        nodes[0].tell(PeerEvent::OwnEntry { zone: zone("a") });
+        nodes[0].tell(own_entry("a"));
         run_for(5_000).await;
         assert_totals(&nodes.iter().collect::<Vec<_>>(), 50);
         stop_all(nodes).await;
@@ -1114,6 +1116,14 @@ fn late_peer_of_another_zone_opens_no_gap() {
         })
     });
     assert_logged(&logs, "gap_abandoned", 0, &[]);
+}
+
+/// Discovery found this node's own entry, in zone `name`.
+fn own_entry(name: &str) -> PeerEvent {
+    PeerEvent::OwnEntry {
+        zone: ZoneName::parse(name).ok(),
+        node_name: None,
+    }
 }
 
 /// A peer discovery places in zone `name`.
@@ -2418,5 +2428,290 @@ fn join_sweep_waits_for_every_peer_before_asking_across_zones() {
         );
         heartbeats(1).await;
         assert_eq!(requests(mark), [u]);
+    });
+}
+
+// -- own zone -----------------------------------------------------------------
+
+/// A config whose membership is Kubernetes discovery matching its own entry
+/// by the pod name `gabion-0`, with `tune`.
+fn kubernetes_config(tune: impl FnOnce(&mut Settings)) -> ValidGossipConfig {
+    let mut config = tuned_config(vec![], tune);
+    config.membership = Membership::Kubernetes(DiscoveryConfig {
+        self_match: Some(SelfMatch::PodName("gabion-0".into())),
+        ..DiscoveryConfig::default()
+    });
+    config
+}
+
+/// SIM21: a node with a static list and no zone setting says at start, once,
+/// that it runs as one zone, without waiting for `gossip.zone_grace`, and
+/// treats its peer as a zone peer.
+#[test]
+fn static_list_without_zone_warns_at_start() {
+    for horizon in [1, 15_000] {
+        let (zone, logs) = with_logs(|| {
+            run_paused(async {
+                let router = SimRouter::new();
+                let addrs = addrs(46_000, 2);
+                let nodes: Vec<_> = (0..2)
+                    .map(|i| {
+                        let config = static_config(addrs[i], &addrs);
+                        Node::start(&router, addrs[i], store_for(id(i, 1)), config)
+                    })
+                    .collect();
+                run_for(horizon).await;
+                let zone = nodes[0].snapshot().await.zone;
+                if horizon > 1 {
+                    assert_eq!(nodes[0].peer(addrs[1]).await.role, Role::Zone);
+                }
+                stop_all(nodes).await;
+                zone
+            })
+        });
+        assert_eq!(zone, ZoneStatus::Unknown(UnknownZone::NotConfigured));
+        assert_logged(
+            &logs,
+            "zone_unknown",
+            2,
+            &[
+                "reason=\"not_configured\"",
+                "membership=\"static\"",
+                "zone_source=\"none\"",
+                "config_key=\"gossip.zone\"",
+            ],
+        );
+    }
+}
+
+/// `gossip.zone_grace` times the warning that a Kubernetes node found no own
+/// entry: at 3 s it fires 3 s after the first peer event, and not before.
+#[test]
+fn zone_grace_setting_times_the_warning() {
+    for (horizon, warnings) in [(2_999, 0), (3_200, 1)] {
+        let ((), logs) = with_logs(|| {
+            run_paused(async {
+                let router = SimRouter::new();
+                let config = kubernetes_config(|s| s.zone_grace = ms(3_000));
+                let node = Node::start(&router, sock(46_100), store_for(id(0, 1)), config);
+                run_for(500).await;
+                node.tell(PeerEvent::Added(Peer::new(sock(46_101))));
+                run_for(horizon).await;
+                node.stop().await;
+            })
+        });
+        assert_logged(
+            &logs,
+            "zone_unknown",
+            warnings,
+            &[
+                "reason=\"own_entry_not_found\"",
+                "grace_ms=3000",
+                "self_match=\"pod_name\"",
+                "hostname=\"gabion-0\"",
+                "membership=\"kubernetes\"",
+            ],
+        );
+    }
+}
+
+/// An own entry without a zone leaves the zone unknown and, after the grace,
+/// names the node to label; a later entry with a zone is learned once, and
+/// neither a zoneless entry nor another zone changes it after that.
+#[test]
+fn own_entry_without_a_zone_warns_with_its_node_then_learns_once() {
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let router = SimRouter::new();
+            let config = kubernetes_config(|s| s.zone_grace = ms(1_000));
+            let node = Node::start(&router, sock(46_200), store_for(id(0, 1)), config);
+            node.tell(PeerEvent::OwnEntry {
+                zone: None,
+                node_name: Some("kind-worker".into()),
+            });
+            run_for(10).await;
+            let unknown = ZoneStatus::Unknown(UnknownZone::OwnEntryHasNoZone);
+            assert_eq!(node.snapshot().await.zone, unknown);
+            run_for(1_200).await;
+            node.tell(own_entry("a"));
+            run_for(10).await;
+            let known = ZoneStatus::Known {
+                name: ZoneName::parse("a").unwrap(),
+                source: ZoneSource::EndpointSlice,
+            };
+            assert_eq!(node.snapshot().await.zone, known);
+            node.tell(PeerEvent::OwnEntry {
+                zone: None,
+                node_name: Some("kind-worker".into()),
+            });
+            node.tell(own_entry("b"));
+            run_for(10).await;
+            assert_eq!(node.snapshot().await.zone, known);
+            node.stop().await;
+        })
+    });
+    assert_logged(
+        &logs,
+        "zone_unknown",
+        1,
+        &[
+            "reason=\"own_entry_has_no_zone\"",
+            "node_name=\"kind-worker\"",
+        ],
+    );
+    assert_logged(
+        &logs,
+        "zone_known",
+        1,
+        &["zone=\"a\"", "zone_source=\"endpoint_slice\""],
+    );
+}
+
+/// U23: the zone setting wins over the own entry's, which every peer then
+/// sees, and the disagreement is logged once.
+#[test]
+fn configured_zone_wins_and_conflict_logs_once() {
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let router = SimRouter::new();
+            let addrs = addrs(46_300, 2);
+            let nodes: Vec<_> = (0..2)
+                .map(|i| zoned_node(&router, &addrs, &["a", "a"], i))
+                .collect();
+            for name in ["b", "b", "c"] {
+                nodes[0].tell(own_entry(name));
+            }
+            run_for(300).await;
+            let configured = ZoneStatus::Known {
+                name: ZoneName::parse("a").unwrap(),
+                source: ZoneSource::Config,
+            };
+            assert_eq!(nodes[0].snapshot().await.zone, configured);
+            assert_eq!(nodes[1].peer(addrs[0]).await.zone, PeerZone::Same);
+            stop_all(nodes).await;
+        })
+    });
+    assert_logged(
+        &logs,
+        "zone_conflict",
+        1,
+        &[
+            "configured_zone=\"a\"",
+            "discovered_zone=\"b\"",
+            "zone_source=\"config\"",
+        ],
+    );
+    assert_logged(&logs, "zone_known", 2, &["zone_source=\"config\""]);
+}
+
+/// SIM20: a gateway that abandoned a gap in an origin's flagged stream
+/// relays the origin's whole RTO resend into its zone, the cell it already
+/// held by direct receipt included, since the resend reaches above
+/// `gateway_have`; the same resend again relays only what it changed, which
+/// is nothing.
+#[test]
+fn resend_after_abandoned_gap_is_fresh_only_above_gateway_have() {
+    run_paused(async {
+        let (o, z) = (sock(2), sock(3));
+        let origin = node(0xD);
+        let wire = Rc::new(Wire::default());
+        let (_client, admin) = scripted(&wire, vec![o, z], "b", |_| {}).await;
+        introduce(&wire, &[(o, origin, "a"), (z, node(0xB), "b")]);
+        heartbeats(1).await;
+        let push = |packets: Vec<Vec<u8>>| {
+            for bytes in packets {
+                wire.inbound.borrow_mut().push_back((bytes, o));
+            }
+            wake(&wire);
+        };
+        let mark = wire.attempts.borrow().len();
+        // Cells 1 and 2 flagged; cell 3 direct (merged, not relayed, not
+        // tracked); the flagged packet of cell 4 is lost; 5 and 6 flagged.
+        push(cell_packets(origin, 0, 2, true));
+        push(cell_packets(origin, 2, 3, false));
+        push(cell_packets(origin, 4, 6, true));
+        sim_advance_ticks(Duration::from_millis(1), 10).await;
+        assert_eq!(relayed_cells(&wire, z, mark), 4);
+        // One report a heartbeat, until the one after the last abandons it.
+        heartbeats(GOSSIP_GAP_REPORTS.into()).await;
+        let counters = admin_snapshot(&admin).await.counters;
+        assert_eq!(counters.gap_reports_sent, u64::from(GOSSIP_GAP_REPORTS));
+        assert_eq!(counters.gaps_abandoned, 1);
+        heartbeats(1).await;
+        let mark = wire.attempts.borrow().len();
+        push(cell_packets(origin, 2, 6, true));
+        sim_advance_ticks(Duration::from_millis(1), 10).await;
+        assert_eq!(relayed_cells(&wire, z, mark), 4);
+        heartbeats(1).await;
+        let mark = wire.attempts.borrow().len();
+        push(cell_packets(origin, 2, 6, true));
+        sim_advance_ticks(Duration::from_millis(1), 10).await;
+        assert_eq!(relayed_cells(&wire, z, mark), 0);
+    });
+}
+
+/// The first node of a new zone, with one heard peer in another zone and one
+/// discovered peer that never answers, asks the heard one for its join sweep
+/// once the want has waited `gossip.zone_grace`, and not before.
+#[test]
+fn lone_node_of_a_new_zone_sweeps_across_zones_after_zone_grace() {
+    run_paused(async {
+        let (r, u) = (sock(2), sock(3));
+        let wire = Rc::new(Wire::default());
+        let (_client, _admin) =
+            scripted(&wire, vec![r, u], "c", |s| s.zone_grace = ms(1_000)).await;
+        let requests = |from| {
+            let sent = sent_payloads(&wire, from).into_iter();
+            let mut asked: Vec<_> = sent
+                .filter(|(_, payload)| *payload == Payload::SweepRequest)
+                .map(|(dst, _)| dst)
+                .collect();
+            asked.dedup();
+            asked
+        };
+        let ack = Payload::Ack { probe: false };
+        inject_zoned(
+            &wire,
+            r,
+            node(0xB),
+            Some(zone("a")),
+            AckInfo::default(),
+            ack,
+        );
+        heartbeats(9).await;
+        assert!(requests(0).is_empty(), "{:?}", requests(0));
+        heartbeats(2).await;
+        assert_eq!(requests(0), [r]);
+    });
+}
+
+/// A peer discovery placed in this node's zone that never answers stops
+/// blocking a sweep from a heard peer of another zone once the want has
+/// waited `gossip.zone_grace`.
+#[test]
+fn silent_zone_peer_stops_blocking_the_cross_zone_sweep_after_zone_grace() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let (r, x, u) = (sock(46_400), sock(46_401), sock(46_402));
+        let tune = |s: &mut Settings| s.zone_grace = ms(1_000);
+        let rn = Node::start(
+            &router,
+            r,
+            store_for(id(0, 1)),
+            zoned_config(vec![x], "a", tune),
+        );
+        let xn = Node::start(
+            &router,
+            x,
+            store_for(id(1, 1)),
+            zoned_config(vec![], "c", tune),
+        );
+        xn.tell(placed(r, "a"));
+        xn.tell(placed(u, "c"));
+        run_for(900).await;
+        assert_eq!(xn.counters().await.sweeps_requested, 0);
+        run_for(300).await;
+        assert!(xn.counters().await.sweeps_requested >= 1);
+        stop_all(vec![rn, xn]).await;
     });
 }

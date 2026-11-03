@@ -1296,7 +1296,6 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         worker_id,
         gossip_bind: main.settings.gossip_bind,
         gossip: gossip.clone(),
-        discovery: main.settings.discovery(),
         cell_store: *storage,
         lease_tick: leader::DEFAULT_LEASE_TICK,
     };

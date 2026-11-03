@@ -33,6 +33,81 @@ impl ZoneName {
     }
 }
 
+/// What this node knows of its own zone: one value, so no state outside it
+/// can exist. Once `Known`, it never changes for the life of the process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ZoneStatus {
+    Known { name: ZoneName, source: ZoneSource },
+    Unknown(UnknownZone),
+}
+
+/// Where a known zone came from, in order of precedence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZoneSource {
+    /// `gossip.zone`.
+    Config,
+    /// The node's own Kubernetes EndpointSlice entry.
+    EndpointSlice,
+}
+
+/// Why this node knows no zone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnknownZone {
+    /// No `gossip.zone`, and no Kubernetes discovery to learn it from.
+    NotConfigured,
+    /// Kubernetes discovery has not found this node's own entry yet.
+    OwnEntryNotFound,
+    /// The own entry names no zone: its node has no
+    /// `topology.kubernetes.io/zone` label.
+    OwnEntryHasNoZone,
+}
+
+impl ZoneSource {
+    /// The `zone_source` log field and `/snapshot`'s `zone.source`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::EndpointSlice => "endpoint_slice",
+        }
+    }
+}
+
+impl UnknownZone {
+    /// The `reason` log field and `/snapshot`'s `zone.reason`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::OwnEntryNotFound => "own_entry_not_found",
+            Self::OwnEntryHasNoZone => "own_entry_has_no_zone",
+        }
+    }
+}
+
+/// `{"name": "use1-az2", "source": "endpoint_slice"}`, or for an unknown
+/// zone `{"name": null, "source": "none", "reason": "own_entry_not_found"}`.
+#[cfg(feature = "serde")]
+impl serde::Serialize for ZoneStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        match self {
+            Self::Known { name, source } => {
+                let mut zone = serializer.serialize_struct("ZoneStatus", 2)?;
+                zone.serialize_field("name", name.as_str())?;
+                zone.serialize_field("source", source.as_str())?;
+                zone.end()
+            }
+            Self::Unknown(reason) => {
+                let mut zone = serializer.serialize_struct("ZoneStatus", 3)?;
+                zone.serialize_field("name", &None::<&str>)?;
+                zone.serialize_field("source", "none")?;
+                zone.serialize_field("reason", reason.as_str())?;
+                zone.end()
+            }
+        }
+    }
+}
+
 /// The low 32 bits of a zone name's stable 128-bit hash; 0 means "no zone"
 /// on the wire, so it never occurs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

@@ -22,6 +22,8 @@ const ZERO_PARSES: &[Setting] = &[
     Setting::GossipMaxPayloadBytes,
     Setting::GossipClusterIdHash,
     Setting::GossipTargetErrBps,
+    Setting::GossipZone,
+    Setting::GossipBootstrapPeers,
     Setting::DiscoverySelfAddr,
     Setting::DiscoveryNamespaceAllow,
     Setting::DiscoveryServiceAllow,
@@ -44,7 +46,8 @@ fn zero_is_not_positive() {
         let zeros: &[&str] = match setting {
             Setting::GossipTickInterval
             | Setting::GossipMinEmitInterval
-            | Setting::GossipSuspectAfter => &["0", "0ms"],
+            | Setting::GossipSuspectAfter
+            | Setting::GossipZoneGrace => &["0", "0ms"],
             _ => &["0"],
         };
         for zero in zeros {
@@ -452,6 +455,120 @@ fn defaults_validate_to_the_production_values() {
             max_request_descriptors: defaults::STORAGE_MAX_REQUEST_DESCRIPTORS.into(),
         }
     );
+    assert_eq!(gossip.zone_grace.0.get(), defaults::GOSSIP_ZONE_GRACE_MS);
+    assert_eq!(gossip.zone, None);
+    assert_eq!(gossip.membership, Membership::Alone);
+}
+
+/// U17: a zone setting that is not a zone name fails to load, an empty one
+/// included, naming the reason and every spelling; a valid one loads.
+#[test]
+fn invalid_zone_names_the_reason_and_both_spellings() {
+    let invalid = |text: &str, reason| {
+        let error = applied(Setting::GossipZone, text).expect_err(text);
+        assert_eq!(
+            error,
+            SettingError::InvalidZone {
+                value: text.into(),
+                reason
+            }
+        );
+        error.to_string()
+    };
+    let text = invalid("", ZoneError::Empty);
+    for part in [
+        "gossip.zone",
+        "GABION_GOSSIP_ZONE",
+        "gabion_gossip_zone",
+        "it is empty",
+        "use1-az2",
+    ] {
+        assert!(text.contains(part), "{text:?} lacks {part:?}");
+    }
+    invalid("bad zone", ZoneError::BadChar { char: ' ' });
+    invalid(&"a".repeat(64), ZoneError::TooLong { len: 64 });
+    let valid = applied(Setting::GossipZone, "use1-az2").expect("a zone name");
+    assert_eq!(valid.zone, ZoneName::parse("use1-az2").ok());
+}
+
+/// U17: a static list longer than the peer table fails validation, naming
+/// both settings; one that fits validates.
+#[test]
+fn too_many_bootstrap_peers_fails_validation() {
+    let peers = |n: u8| -> Box<[SocketAddr]> {
+        (1..=n)
+            .map(|i| SocketAddr::from(([192, 0, 2, i], 9000)))
+            .collect()
+    };
+    let tune = |n| {
+        move |s: &mut Settings| {
+            s.peer_capacity = NonZeroU16::new(2).unwrap();
+            s.bootstrap_peers = peers(n);
+        }
+    };
+    let error = validated(tune(3)).expect_err("three peers");
+    assert_eq!(
+        error,
+        SettingError::TooManyBootstrapPeers {
+            listed: 3,
+            capacity: NonZeroU16::new(2).unwrap()
+        }
+    );
+    let text = error.to_string();
+    for part in [
+        "gossip.bootstrap_peers",
+        "gossip.peer_capacity",
+        "GABION_GOSSIP_PEER_CAPACITY",
+        "at least 3",
+    ] {
+        assert!(text.contains(part), "{text:?} lacks {part:?}");
+    }
+    assert_eq!(validated(tune(2)), Ok(()));
+}
+
+/// Without a gossip bind a node is alone, even with a static list; with one,
+/// a static list makes the membership static and an empty one Kubernetes,
+/// whose own entry `discovery.self_addr` matches when set. The zone settings
+/// reach the runtime's config.
+#[test]
+fn membership_follows_bind_and_bootstrap_peers() {
+    let bind = SocketAddr::from(([10, 0, 0, 1], 9000));
+    let peer = SocketAddr::from(([10, 0, 0, 2], 9000));
+    fn membership(tune: impl FnOnce(&mut Settings)) -> Membership {
+        let mut settings = Settings::default();
+        tune(&mut settings);
+        settings.validate().expect("validates").0.membership
+    }
+    let alone = membership(|s| s.bootstrap_peers = [peer].into());
+    assert_eq!(alone, Membership::Alone);
+    let kubernetes = membership(|s| {
+        s.gossip_bind = Some(bind);
+        s.self_addr = Some(bind);
+        s.namespace_allow = ["team-a".into()].into();
+        s.service_allow = ["gabion".into()].into();
+    });
+    let expected = DiscoveryConfig {
+        self_match: Some(SelfMatch::Addr(bind)),
+        namespace_allow: ["team-a".into()].into(),
+        service_allow: ["gabion".into()].into(),
+    };
+    assert_eq!(kubernetes, Membership::Kubernetes(expected));
+    let listed = membership(|s| {
+        s.gossip_bind = Some(bind);
+        s.bootstrap_peers = [bind, peer].into();
+    });
+    assert_eq!(listed, Membership::Static([bind, peer].into()));
+
+    let mut settings = Settings::default();
+    settings
+        .apply(Setting::GossipZone, "use1-az2")
+        .expect("zone");
+    settings
+        .apply(Setting::GossipZoneGrace, "3s")
+        .expect("grace");
+    let (gossip, _) = settings.validate().expect("validates");
+    assert_eq!(gossip.zone, ZoneName::parse("use1-az2").ok());
+    assert_eq!(gossip.zone_grace, ms(3_000));
 }
 
 /// Derives each environment variable and NGINX directive from the YAML key,

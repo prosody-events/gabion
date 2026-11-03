@@ -35,8 +35,8 @@ use gabion::settings::{Setting, SettingError, Settings};
 /// The loaded configuration: every setting, validated once, and the rules.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
-    /// The values as loaded, for the adapter-level settings (binds, seeds,
-    /// discovery) the validated configs do not carry.
+    /// The values as loaded, for the adapter-level settings (binds, seeds)
+    /// the validated configs do not carry.
     pub settings: Settings,
     pub gossip: ValidGossipConfig,
     pub storage: ValidStorageConfig,

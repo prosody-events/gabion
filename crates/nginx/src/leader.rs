@@ -17,12 +17,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use futures::StreamExt;
 use tokio::sync::watch;
 use tokio::task::LocalSet;
 
 use gabion::crdt::{CellStore, KeyHash, NodeIdentity, ValidStorageConfig};
-use gabion::discovery::{self, DiscoveryConfig};
 use gabion::gossip::{GossipClient, GossipRuntime, TokioClock, UdpTransport, ValidGossipConfig};
 use gabion::settings::MIN_LIMIT_QUEUE_CAPACITY;
 
@@ -64,7 +62,6 @@ pub struct LeaderConfig {
     /// the shared counts, but nothing can reach it to gossip.
     pub gossip_bind: Option<SocketAddr>,
     pub gossip: ValidGossipConfig,
-    pub discovery: DiscoveryConfig,
     pub cell_store: ValidStorageConfig,
     pub lease_tick: Duration,
 }
@@ -243,21 +240,14 @@ async fn leader_main(
     // loopback port can't collide with another nginx on the same host, there
     // is no one to discover, and it asks for the smallest buffers, since it
     // sends nothing.
-    let (bind, peers, gossip) = match config.gossip_bind {
+    let (bind, gossip) = match config.gossip_bind {
         Some(bind) => {
             config.gossip.note_startup();
-            (
-                bind,
-                discovery::peer_events(config.discovery).left_stream(),
-                config.gossip,
-            )
+            (bind, config.gossip)
         }
-        None => (
-            LONE_NODE_BIND,
-            futures::stream::empty().right_stream(),
-            config.gossip.with_minimal_socket_buffers(),
-        ),
+        None => (LONE_NODE_BIND, config.gossip.with_minimal_socket_buffers()),
     };
+    let peers = gossip.membership.peer_events();
     // Bind before the store empties the count table: a term that cannot
     // start leaves the last counts in force, with no leader to refill them.
     let transport = UdpTransport::bind(bind, &gossip)

@@ -23,6 +23,9 @@ the [repo root README](../../README.md#glossary).
   - [Streams, acks and join sweeps](#streams-acks-and-join-sweeps)
   - [Adaptive emit rate](#adaptive-emit-rate)
 - [Writing the same rule for NGINX and gabiond](#writing-the-same-rule-for-nginx-and-gabiond)
+- [Zones](#zones)
+  - [Outside Kubernetes](#outside-kubernetes)
+  - [Testing zones in kind](#testing-zones-in-kind)
 - [Operator knobs](#operator-knobs)
 - [What we measured](#what-we-measured)
 - [References](#references)
@@ -40,7 +43,8 @@ a DAG, so no module imports from a module that imports it.
 | `aggregate`  | `src/aggregate.rs`            | The cluster-aggregate table both adapters read on admission: seqlocked slots, linear probing within 128 slots of home, backward-shift removal. NGINX lays it over shared memory; `gabiond` owns one as `Aggregate`, sized from `storage.max_cells`. |
 | `gossip`     | `src/gossip/*`                | `GossipRuntime`, `GossipClient`, `GossipTransport`, `Clock`, the `sim::SimTransport` used in tests, the pre-sized peer table, and the `AdminCommand` / `AdminSnapshot` observability surface. |
 | `wire`       | `src/wire/*`                  | The on-the-wire codec. One UDP packet = header + rule dictionary + node dictionary + cell rows. Each packet decodes independently. |
-| `discovery`  | `src/discovery/*`             | `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation. Adapters consume `PeerEvent` streams; the gossip runtime treats peer add/remove as a normal `select!` arm. |
+| `discovery`  | `src/discovery/*`             | `Membership` (Kubernetes, a static list, or alone), whose `peer_events` both adapters feed the runtime; the `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation, which finds the node's own entry by `SelfMatch` and reports its zone as `PeerEvent::OwnEntry`. The gossip runtime treats peer events as a normal `select!` arm. |
+| `zone`       | `src/zone.rs`                 | `ZoneName` and the 4-byte `ZoneHash` every header carries, and `ZoneStatus`: the node's zone and its source, or why none is known. |
 | `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, payload caps, the per-rule error budget, the min-emit floor, and the stream and sweep constants (gap reports, sweep sources, the backlog that sizes the per-round quantum). |
 | `settings`   | `src/settings.rs`             | Every operator setting named once: `gabiond` YAML key, environment variable and NGINX directive. Messages interpolate from it so each names both adapters' spellings. |
 | `throttle`   | `src/throttle.rs`             | The one power-of-two log throttle every repeating warning counts through. |
@@ -294,7 +298,9 @@ reach a zone whose gateway has not yet discovered it.
 
 A node that starts asks its two highest-weight peers it has heard from in
 its zone (or, once no peer is or may be of its zone, one heard peer of any
-zone) for a join sweep, greeting meanwhile the unheard peers of its zone
+zone; after `gossip.zone_grace` a peer not yet heard no longer counts, so a
+silent peer cannot keep a new zone's first node from sweeping) for a join
+sweep, greeting meanwhile the unheard peers of its zone
 and its unheard gateways,
 and asks again when its zone becomes known,
 retrying each heartbeat until a page arrives, and each source pages its live
@@ -440,6 +446,131 @@ descriptors a request carries. Requests share a counter only when both
 adapters hand gabion the same bytes for each value: NGINX's `$uri` is the
 normalized path without the query string, whereas an Envoy action that reads
 the `:path` header sends the raw path with its query.
+
+## Zones
+
+A node learns its own zone from, in order:
+
+1. **The zone setting**, `gossip.zone` (`GABION_GOSSIP_ZONE`; NGINX
+   `gabion_gossip_zone`): 1 to 63 letters, digits, `-`, `_` or `.`,
+   starting and ending with a letter or digit, like a Kubernetes label
+   value. An empty value fails to load rather than meaning "unset".
+2. **Its own Kubernetes EndpointSlice entry.** Kubernetes copies each
+   node's `topology.kubernetes.io/zone` label into the `zone` of every
+   endpoint on it. Discovery finds the node's own entry by the pod name,
+   which Kubernetes makes the pod's host name, or by `discovery.self_addr`
+   when that is set. A `hostNetwork: true` pod's host name is its node's,
+   so set `discovery.self_addr` to the pod's IP and gossip port there (for
+   gabiond, `GABION_DISCOVERY_SELF_ADDR: "$(POD_IP):9000"` with `POD_IP`
+   from the downward API). The own entry is read before the readiness
+   filter, since a starting pod is often not ready yet, and it is never a
+   peer, so pods do not gossip with themselves.
+3. **None.** The node treats every peer as a zone peer and sends every
+   change directly: counts stay correct, but none of the cross-zone traffic
+   the gateways save is saved.
+
+Once known, the zone does not change for the life of the process; a later
+entry naming another zone is ignored. A zone learned from the entry after
+start makes peers recompute their roles and the node ask for a join sweep.
+When the setting and the entry disagree, the setting wins and the node logs
+`zone_conflict` once.
+
+Each node says what it found: `zone_known` once its zone is known, with its
+source, and `zone_unknown` when it is not. On Kubernetes `zone_unknown`
+waits `gossip.zone_grace` (`GABION_GOSSIP_ZONE_GRACE`; NGINX
+`gabion_gossip_zone_grace`, default 10 s) after the first peer event, since
+the EndpointSlice controller usually writes a starting pod's entry a moment
+after it starts; the kind smokes print that wait, and the default stays at
+least five times it. With a static peer list and no zone setting it fires at
+start; a node with no peers never logs it. The same grace bounds how long a
+join sweep waits for unheard peers before a new zone's first node asks a
+peer of another zone. Each code has an entry in
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
+
+`gabiond`'s `/snapshot` serves the node's zone as
+`"zone": {"name": "use1-az2", "source": "endpoint_slice"}` (`source` is
+`config` or `endpoint_slice`), or for an unknown zone
+`"zone": {"name": null, "source": "none", "reason": "own_entry_not_found"}`,
+where `reason` is `not_configured`, `own_entry_not_found` or
+`own_entry_has_no_zone`. To check a Kubernetes cluster's zones:
+
+```sh
+kubectl get nodes -L topology.kubernetes.io/zone
+kubectl get endpointslices -n <namespace> -l kubernetes.io/service-name=<service> \
+  -o jsonpath='{range .items[*].endpoints[*]}{.targetRef.name}{"\t"}{.zone}{"\n"}{end}'
+```
+
+### Outside Kubernetes
+
+A cluster outside Kubernetes needs `gossip.bind`, `gossip.bootstrap_peers`
+and `gossip.zone` on every node. `gossip.bootstrap_peers`
+(`GABION_GOSSIP_BOOTSTRAP_PEERS`, comma-separated; a YAML list; NGINX
+`gabion_gossip_bootstrap_peers`, repeated once per peer) lists IP addresses
+and ports; host names are not resolved. A non-empty list replaces
+Kubernetes discovery, so the watcher never starts. One list may name every
+node, the node itself included: a node drops the entry its own first packet
+comes back from. That relies on the kernel delivering the node's packet to
+itself from the listed address; a list that names a node by another of its
+addresses (behind NAT, say) leaves that entry unanswered. Static peers are
+never removed: a listed node that is down is resent to on the usual
+schedule, and the list may hold no more peers than `gossip.peer_capacity`.
+
+```sh
+export GABION_GOSSIP_BIND=0.0.0.0:9090
+export GABION_GOSSIP_BOOTSTRAP_PEERS=192.0.2.11:9090,198.51.100.12:9090,203.0.113.13:9090
+export GABION_GOSSIP_ZONE="$ZONE"   # from one of the recipes below
+exec gabiond /etc/gabion/gabiond.yaml
+```
+
+NGINX cannot read environment variables in directives, so the container's
+entrypoint writes a file the `http {}` block includes:
+
+```sh
+printf 'gabion_gossip_zone %s;\n' "$ZONE" > /etc/nginx/gabion-zone.conf
+```
+
+```nginx
+http {
+    gabion_gossip_bind 0.0.0.0:9000;
+    gabion_gossip_bootstrap_peers 192.0.2.11:9000;
+    gabion_gossip_bootstrap_peers 198.51.100.12:9000;
+    gabion_gossip_bootstrap_peers 203.0.113.13:9000;
+    include /etc/nginx/gabion-zone.conf;
+    # ...
+}
+```
+
+These commands read the zone from cloud metadata; gabion does not run them
+itself. Each prints one zone identifier. Skip the export when it prints
+nothing, because an empty zone fails to load.
+
+| Platform | Command | Note |
+|---|---|---|
+| AWS EC2 (IMDSv2) | `T=$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60'); curl -sH "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/placement/availability-zone-id` | Use the zone **ID** (`use1-az2`), not the zone name: AWS maps names to physical zones differently in each account. A container needs an IMDS hop limit of 2. |
+| Google Cloud | `Z=$(curl -sH 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/zone); echo "${Z##*/}"` | The endpoint returns `projects/<n>/zones/<zone>`; keep the last segment. |
+| Azure | `curl -sH Metadata:true 'http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text'` | Prints `1`, `2` or `3`, or nothing for a VM outside zones. Zone numbers are consistent within one subscription only. |
+| AWS ECS | `curl -s "$ECS_CONTAINER_METADATA_URI_V4/task" \| jq -r .AvailabilityZone` | Prints the zone **name**, consistent within one account. On EC2 capacity, the IMDS recipe above gives the zone ID instead. |
+
+### Testing zones in kind
+
+`make kubernetes-zones-test` runs `deploy/kubernetes/zones-gossip.sh`
+against a kind cluster of three zones, `kind-a`, `kind-b` and `kind-c`, one
+worker each. Create it with a kubeconfig of its own, so your current
+context is left alone, and point the target at it:
+
+```sh
+kind create cluster --name gabion-zones --config deploy/kubernetes/kind-zones.yaml \
+  --kubeconfig /tmp/gabion-zones.kubeconfig
+KUBECONFIG=/tmp/gabion-zones.kubeconfig make kubernetes-zones-test
+```
+
+It runs six `gabiond` replicas, two per zone, and checks through each pod's
+`/snapshot` that every pod learned its zone from its EndpointSlice entry,
+that each has one zone peer and one gateway in each other zone, that hits
+through a `kind-a` pod reject at the shared limit through a `kind-c` pod,
+and that both still hold after one pod per zone is replaced and after a
+gateway is deleted. [`deploy/kubernetes/README.md`](../../deploy/kubernetes/README.md)
+lists every smoke.
 
 ## Operator knobs
 

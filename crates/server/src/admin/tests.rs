@@ -16,10 +16,12 @@ use gabion::aggregate::Aggregate;
 use gabion::crdt::{
     CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
 };
+use gabion::discovery::Membership;
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AdminCommand, AggregateStore, GossipRuntime, TokioClock};
 use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
 use gabion::settings::Settings;
+use gabion::zone::{ZoneName, ZoneSource, ZoneStatus};
 
 use crate::admin::{AdminState, admin_channel, router};
 
@@ -99,7 +101,7 @@ fn snapshot_json_shape_is_pinned() {
         counts.apply(&row, &ExpirationSink::default());
 
         let bootstrap = next_addr();
-        gossip_config.bootstrap_peers = vec![bootstrap];
+        gossip_config.membership = Membership::Static([bootstrap].into());
         let tick = settings().tick_interval.duration();
 
         let (admin_tx, admin_rx) = admin_channel();
@@ -144,7 +146,20 @@ fn snapshot_json_shape_is_pinned() {
                 "peers_by_role",
                 "rules",
                 "store_stats",
+                "zone",
             ]
+        );
+        assert_eq!(
+            body["zone"],
+            serde_json::json!({"name": null, "source": "none", "reason": "not_configured"})
+        );
+        let known = ZoneStatus::Known {
+            name: ZoneName::parse("use1-az2").expect("a zone name"),
+            source: ZoneSource::EndpointSlice,
+        };
+        assert_eq!(
+            serde_json::to_value(known).expect("serialises"),
+            serde_json::json!({"name": "use1-az2", "source": "endpoint_slice"})
         );
         assert_eq!(
             body["peers_by_role"],

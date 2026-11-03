@@ -9,7 +9,7 @@ use crate::defaults::{GOSSIP_GAP_REPORTS, GOSSIP_SWEEP_PEERS};
 
 /// The requester's one want: the sources asked and not yet answered, and
 /// those that answered. A source that answered is not asked again.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct SweepWant {
     asking: [Option<Ask>; GOSSIP_SWEEP_PEERS],
     answered: [Option<SocketAddr>; GOSSIP_SWEEP_PEERS],
@@ -17,6 +17,9 @@ pub(super) struct SweepWant {
     last_pick: Option<(u64, SocketAddr)>,
     /// A peer was first heard while the want waits: ask on the next round.
     pub(super) due: bool,
+    /// When the want started waiting; after `gossip.zone_grace`, peers not
+    /// yet heard count as absent.
+    pub(super) since_ms: u64,
 }
 
 /// A source asked `tries` times without a page.
@@ -27,6 +30,17 @@ pub(super) struct Ask {
 }
 
 impl SweepWant {
+    /// A want that started waiting at `since_ms`, with nothing asked.
+    pub(super) fn new(since_ms: u64) -> Self {
+        Self {
+            asking: [None; GOSSIP_SWEEP_PEERS],
+            answered: [None; GOSSIP_SWEEP_PEERS],
+            last_pick: None,
+            due: false,
+            since_ms,
+        }
+    }
+
     /// Advance the want against the current candidates, ranked by weight:
     /// `true` once pages have come from `min(sources, k)` sources with
     /// `k > 0`, `sources` at most [`GOSSIP_SWEEP_PEERS`]. Otherwise drop the

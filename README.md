@@ -104,7 +104,7 @@ to be both cheap and bounded. Each cluster member matches the request
 against its rule table and then, for each matched rule, reads the
 cluster-wide aggregate for that rule's live buckets — through atomic
 loads against one aggregate table, which nginx keeps in a shared-memory
-zone and `gabiond` on its heap, in either case one probe per live
+limit zone and `gabiond` on its heap, in either case one probe per live
 bucket. The decision is taken without issuing any system calls
 or allocating on the heap. If the aggregate plus the hits attributed
 to the current request would cross the rule's configured limit the
@@ -167,7 +167,8 @@ or a YAML field — and the precise syntax is documented in
 | Term            | Definition                                                                                                                                |
 |-----------------|-------------------------------------------------------------------------------------------------------------------------------------------|
 | **rule**        | One rate-limit policy (e.g. `per_ip`, `per_tenant`).                                                                                      |
-| **zone**        | The shared-memory area where counters live (nginx only).                                                                                  |
+| **zone**        | An availability zone, from `gossip.zone` or the node's own Kubernetes EndpointSlice entry.                                                |
+| **limit zone**  | The shared-memory area where counters live (nginx only, `gabion_limit_zone`).                                                             |
 | **descriptor**  | A `key=value` pair like `tenant=acme` that names what the rule is counting.                                                               |
 | **binding**     | The recipe for building a descriptor from request data — e.g. `tenant:$arg_tenant` (nginx) or an Envoy descriptor action (`gabiond`).     |
 | **predicate**   | An `except_if=$var` condition that exempts a request from a rule when the variable is truthy (nginx only).                                |
@@ -198,20 +199,21 @@ regardless of which adapter they are running:
    Kubernetes NetworkPolicy (or a security group outside Kubernetes)
    that admits UDP only from gabion pods.
 
-3. **Run on Kubernetes** (see the [Kubernetes checklist](#kubernetes-checklist)). Peer discovery is built around Kubernetes
-   EndpointSlices, and at present this is the only implementation the
-   library ships. A member is configured with the namespaces and
-   Service names it should watch, and from there it picks peer pods
-   up and lets them go as the corresponding EndpointSlice changes;
-   there is no static peer list in the configuration, and no restart
-   is needed when the topology shifts. The `PeerDiscovery` trait is a
-   single-method extension point, so an operator who wanted to run
-   gabion against a different control plane could plug their own
-   implementation in, but nobody has done so in tree. In practice,
-   gabion is a Kubernetes workload.
+3. **Find the peers and the zone.** On Kubernetes (see the
+   [Kubernetes checklist](#kubernetes-checklist)) a member watches the
+   EndpointSlices of the namespaces and Services it is configured with,
+   picks peer pods up and lets them go as those slices change, with no
+   restart when the topology shifts. It also finds its own entry there by
+   pod name and reads its zone from it, so zones need no configuration.
+   Outside Kubernetes, list the peers in `gossip.bootstrap_peers` (one
+   list may name every node, the node itself included) and set each
+   node's `gossip.zone`; static peers are never removed. See
+   [Zones](crates/gabion/README.md#zones), which also gives commands that
+   read the zone from cloud metadata.
 
-The directive names differ between adapters (`gabion_gossip_*` for
-nginx, the `gossip:` and `discovery:` blocks in `gabiond` YAML), but
+The directive names differ between adapters (`gabion_gossip_*` and
+`gabion_discovery_*` for nginx, the `gossip:` and `discovery:` blocks in
+`gabiond` YAML), but
 the shape is identical. The precise syntax for each is documented in
 [`crates/nginx/README.md#running-across-a-cluster`](crates/nginx/README.md#running-across-a-cluster)
 and
@@ -258,6 +260,13 @@ entry in [`crates/gabion/TROUBLESHOOTING.md`](crates/gabion/TROUBLESHOOTING.md).
 - **A RoleBinding** from that Role to the pods' ServiceAccount, in the same
   namespace. A complete set, with the ServiceAccount, is in
   [`deploy/kubernetes/gabion-discovery-rbac.yaml`](deploy/kubernetes/gabion-discovery-rbac.yaml).
+
+- **A `topology.kubernetes.io/zone` label on every node.** Kubernetes copies
+  it into each pod's EndpointSlice entry, where gabion reads its zone. EKS,
+  GKE and AKS set it; on a self-managed cluster run
+  `kubectl label node <node> topology.kubernetes.io/zone=<zone>`. Without it
+  the pod logs `zone_unknown` and runs as one zone: counts stay correct, but
+  cross-zone traffic is not reduced.
 
 Tuning the gossip cadence is rarely necessary, since the defaults
 converge in well under a second at production scale. The

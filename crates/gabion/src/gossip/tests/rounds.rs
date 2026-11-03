@@ -425,6 +425,97 @@ fn restarted_node_sweeps_from_idle_peers() {
     }
 }
 
+/// One static list, naming every node and so each node itself, serves every
+/// node: each drops its own address on its own first packet and keeps the
+/// other two, every one heard.
+#[test]
+fn static_list_shared_by_every_node_drops_self() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = addrs(45_000, 3);
+        let nodes: Vec<_> = (0..3)
+            .map(|i| {
+                let config = static_config(addrs[i], &addrs);
+                Node::start(&router, addrs[i], store_for(id(i, 1)), config)
+            })
+            .collect();
+        nodes[0].hits(1..2).await;
+        run_for(300).await;
+        for node in &nodes {
+            let snapshot = node.snapshot().await;
+            assert_eq!(
+                snapshot.peers.len(),
+                2,
+                "{}: {:?}",
+                node.addr,
+                snapshot.peers
+            );
+            assert!(snapshot.peers.iter().all(|p| p.addr != node.addr));
+            assert_eq!(snapshot.peers_by_role.unheard, 0, "{}", node.addr);
+        }
+        assert_totals(&nodes.iter().collect::<Vec<_>>(), 1);
+        for node in nodes {
+            node.stop().await;
+        }
+    });
+}
+
+/// I3 with a static list: a node that joins at an address the list named
+/// all along, into peers with no cells of their own, is answered, asks them
+/// for a join sweep and gets its previous incarnation's cells back.
+#[test]
+fn static_joiner_at_a_listed_address_sweeps_from_idle_peers() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = addrs(45_100, 4);
+        let start = |i: usize, at: usize, incarnation| {
+            let config = static_config(addrs[at], &addrs);
+            Node::start(&router, addrs[at], store_for(id(i, incarnation)), config)
+        };
+        let r = start(0, 0, 1);
+        let peers = [start(1, 1, 1), start(2, 2, 1)];
+        r.hits(1..6).await;
+        run_for(500).await;
+        assert_totals(&[&peers[0], &peers[1]], 5);
+        r.stop().await;
+        run_for(1_000).await;
+        let r = start(0, 3, 2);
+        run_for(1_000).await;
+        assert_eq!(r.agg.total(), 5);
+        r.stop().await;
+        for peer in peers {
+            peer.stop().await;
+        }
+    });
+}
+
+/// I3 with a static list: a node restarted at its own address, a new
+/// incarnation in rows its idle peers already hold, gets its previous
+/// incarnation's cells back by a join sweep.
+#[test]
+fn static_node_restarted_at_its_address_sweeps_from_idle_peers() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = addrs(45_200, 3);
+        let start = |i: usize| {
+            let config = static_config(addrs[i], &addrs);
+            Node::start(&router, addrs[i], store_for(id(i, 1)), config)
+        };
+        let r = start(0);
+        let peers = [start(1), start(2)];
+        r.hits(1..6).await;
+        run_for(500).await;
+        assert_totals(&[&peers[0], &peers[1]], 5);
+        let r = restart(&router, r, id(0, 2), static_config(addrs[0], &addrs)).await;
+        run_for(1_000).await;
+        assert_eq!(r.agg.total(), 5);
+        r.stop().await;
+        for peer in peers {
+            peer.stop().await;
+        }
+    });
+}
+
 /// A peer speaking another wire version is sent nothing, not even the rest of a
 /// sweep it asked for; its first packet of this version makes it a recipient
 /// again, rewound to 0.

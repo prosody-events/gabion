@@ -88,6 +88,14 @@ pub const GOSSIP_SWEEP_PEERS: usize = 2;
 /// answers at once.
 pub const GOSSIP_SWEEP_CONCURRENCY: u8 = 4;
 
+/// Default of `gossip.zone_grace`, in milliseconds: how long after its first
+/// peer event a Kubernetes node waits for its own EndpointSlice entry before
+/// it logs `zone_unknown`, and how long a join sweep waits for unheard peers
+/// before a lone node of a new zone asks a peer of another zone. One
+/// `prod-peak` window; it must stay at least five times the own-entry wait the
+/// kind smokes print.
+pub const GOSSIP_ZONE_GRACE_MS: u64 = 10_000;
+
 /// A lower bound on the receive-buffer bytes the kernel charges one queued
 /// datagram. A round reads at most the granted receive bytes over this many
 /// waiting datagrams, so an inbound flood cannot hold it.

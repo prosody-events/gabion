@@ -241,9 +241,23 @@ The `gabiond` YAML keys are `gossip.bind` (UDP `host:port`),
 before the peer is routed around; by default four heartbeats and at least
 2 s, and at least two heartbeats when set, else startup fails with
 `setting_invalid`),
+`gossip.zone` (this node's availability zone; leave it unset on
+Kubernetes, where the node reads it from its own EndpointSlice entry, and
+set it outside, where nothing else can; an empty or malformed value fails
+startup with `setting_invalid`),
+`gossip.zone_grace` (how long, after the first peer event, the node waits
+for its own EndpointSlice entry before it logs `zone_unknown`, and a join
+sweep waits for unheard peers; default 10s),
+`gossip.bootstrap_peers` (a static peer list of `ip:port` entries, a YAML
+list or a comma-separated `GABION_GOSSIP_BOOTSTRAP_PEERS`; it replaces
+Kubernetes discovery, may name this node too, and may hold no more than
+`gossip.peer_capacity` entries),
 `discovery.namespace_allow` / `discovery.service_allow` (Kubernetes
 EndpointSlice filters), and `discovery.self_addr` (this pod's own
-`host:port` from `POD_IP`, excluded from the peer set). Discovery needs
+`host:port`, only for `hostNetwork` pods; otherwise the pod-name match finds
+the node's own entry, which is never a peer). Running outside Kubernetes and
+the zone sources are in
+[`../gabion/README.md#zones`](../gabion/README.md#zones). Discovery needs
 the Role in the root README's
 [Kubernetes checklist](../../README.md#kubernetes-checklist): `get` on
 Pods and `get`/`list`/`watch` on Services and EndpointSlices, bound to the
@@ -264,8 +278,10 @@ at once. The math and tradeoffs live in
 
 ### Verify convergence
 
-`/snapshot` returns the peer list, CRDT stats (`store_stats`), gossip counters
-(`counters`), the rule list and the aggregate row count. Each peer shows its
+`/snapshot` returns the node's own zone (`zone`: its `name` and `source`,
+`config` or `endpoint_slice`, or for an unknown zone a null `name`, `source`
+`none` and the `reason`), the peer list, CRDT stats (`store_stats`), gossip
+counters (`counters`), the rule list and the aggregate row count. Each peer shows its
 `zone` (`"same"`, `"unknown"` or the remote zone's hash: from the peer's
 headers once heard; before that, while `node_id` is null, the zone discovery
 reported for it), its `role` (`unheard` for a peer neither heard from nor
@@ -313,6 +329,8 @@ the entries below are `gabiond`'s own.
 | `` `X` is `V`, which is not …, for example `E`. … ``                                                                            | The value does not parse as the setting's type (an integer in range, a duration in whole milliseconds such as `500ms`, a socket address, a Kubernetes name). | Write it like the example, or remove it to use the default.                                                                   |
 | `` `X` is N; gabion supports MIN to MAX. … ``                                                                                   | A capacity is outside the range gabion can hold; the message gives the reason.                         | Set it inside the range, or remove it to use the default.                                                                     |
 | `The gossip packet size is N bytes, but gabion needs between 158 and 65507 …`                                                  | `gossip.max_payload_bytes` is too small for one counter or larger than the largest UDP payload.        | Set it inside that range, and to the same value on every node.                                                                |
+| `` `gossip.bootstrap_peers` (…) lists N peers, but the peer table holds M. … ``                                                | The static peer list is longer than the peer table.                                                    | Raise `gossip.peer_capacity` to at least N, or shorten the list.                                                              |
+| `` The zone setting `V` is not a valid zone name: … ``                                                                         | `gossip.zone` is empty, longer than 63 characters, or holds a character a Kubernetes label value cannot. | Use the cloud's zone identifier (for example `use1-az2`), or remove it to learn the zone from Kubernetes.                    |
 | `The gossip error budget is N basis points, outside 1 to 10000 …`                                                               | `gossip.target_err_bps` is 0 or above 100 % of a rule's limit.                                         | Set it between 1 and 10000; the default, 100, is 1 % of each rule's limit.                                                    |
 | `` `gossip.min_emit_interval` … must be at least 1ms and shorter than `gossip.tick_interval` … ``                               | The gap between two sends is at or above the heartbeat, so every change would wait for the heartbeat.  | Set it below `gossip.tick_interval`, or remove it to use the default of 5ms.                                                  |
 | `gabiond cannot start: it has no gossip address to listen on …`                                                                | No bind address was supplied.                                                                          | Set `gossip.bind` in YAML or `GABION_GOSSIP_BIND` in env.                                                                     |

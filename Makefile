@@ -138,6 +138,7 @@ help:
 	@printf '%s\n' '  make kubernetes-test Run guarded local kind EndpointSlice convergence tests'
 	@printf '%s\n' '  make kubernetes-nginx-test Run guarded local kind NGINX scale rate-limit tests'
 	@printf '%s\n' '  make kubernetes-mixed-test Run guarded local kind NGINX plus Gabion server gossip test'
+	@printf '%s\n' '  make kubernetes-zones-test Run guarded three-zone gabiond gossip test (needs a cluster from deploy/kubernetes/kind-zones.yaml)'
 	@printf '%s\n' '  make kubernetes-clean Delete local Kubernetes test namespaces'
 	@printf '%s\n' '  make ci              Fast contributor pre-merge: test, loom, miri-safety, bench-check, wasm-check, nginx-config, nginx-module, nginx-test'
 	@printf '%s\n' '  make ci-full         Mirror GitHub Actions end-to-end: ci + nginx-asan + miri-all + study-test + every kubernetes-* target'
@@ -355,6 +356,10 @@ kubernetes-nginx-test:
 kubernetes-mixed-test:
 	sh deploy/kubernetes/mixed-nginx-gabion-gossip.sh
 
+.PHONY: kubernetes-zones-test
+kubernetes-zones-test:
+	sh deploy/kubernetes/zones-gossip.sh
+
 .PHONY: kubernetes-clean
 kubernetes-clean:
 	sh deploy/kubernetes/local-clean.sh
@@ -369,4 +374,4 @@ kubernetes-clean:
 ci: test loom miri-safety bench-check wasm-check nginx-config nginx-module nginx-test
 
 .PHONY: ci-full
-ci-full: ci nginx-asan miri-all study-test kubernetes-test kubernetes-nginx-test kubernetes-mixed-test
+ci-full: ci nginx-asan miri-all study-test kubernetes-test kubernetes-nginx-test kubernetes-mixed-test kubernetes-zones-test

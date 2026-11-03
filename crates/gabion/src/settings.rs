@@ -21,10 +21,11 @@ use std::time::Duration;
 
 use crate::crdt::{MAX_DICTIONARY_CAPACITY, ValidStorageConfig};
 use crate::defaults;
-use crate::discovery::DiscoveryConfig;
+use crate::discovery::{DiscoveryConfig, Membership, SelfMatch};
 use crate::gossip::ValidGossipConfig;
 use crate::rules::CardinalityLimits;
 use crate::wire::{FrameLimits, MAX_PAYLOAD_BYTES, MIN_PAYLOAD_BYTES};
+use crate::zone::{ZoneError, ZoneName};
 
 /// A non-zero default; zero fails to compile.
 macro_rules! nz {
@@ -137,6 +138,10 @@ macro_rules! settings {
                         expected,
                         example,
                     },
+                    Problem::Zone(reason) => SettingError::InvalidZone {
+                        value: text.into(),
+                        reason,
+                    },
                 })
             }
         }
@@ -229,6 +234,17 @@ settings! {
         "gabion_gossip_sweep_concurrency";
         sweep_concurrency: NonZeroU8 = nz!(defaults::GOSSIP_SWEEP_CONCURRENCY),
         "this node could not send any newly started peer its live counts";
+    GossipZone => "gossip.zone", "GABION_GOSSIP_ZONE", "gabion_gossip_zone";
+        zone: Option<ZoneName> = None;
+    GossipZoneGrace => "gossip.zone_grace", "GABION_GOSSIP_ZONE_GRACE",
+        "gabion_gossip_zone_grace";
+        zone_grace: Millis = Millis(nz!(defaults::GOSSIP_ZONE_GRACE_MS)),
+        "a new zone's first node would ask another zone for its catch-up sweep at once, and the \
+         warning that this node knows no zone would fire before Kubernetes discovery could find \
+         its own entry";
+    GossipBootstrapPeers => "gossip.bootstrap_peers", "GABION_GOSSIP_BOOTSTRAP_PEERS",
+        "gabion_gossip_bootstrap_peers";
+        bootstrap_peers: Box<[SocketAddr]> = Box::default();
     DiscoverySelfAddr => "discovery.self_addr", "GABION_DISCOVERY_SELF_ADDR",
         "gabion_discovery_self_addr";
         self_addr: Option<SocketAddr> = None;
@@ -255,12 +271,19 @@ const MAX_SOCKET_BUFFER_BYTES: u64 = (1 << 30) - 1;
 const MAX_ERROR_BUDGET_BPS: u32 = 10_000;
 
 impl Settings {
-    /// The discovery settings, for the adapter's discovery stream.
-    pub fn discovery(&self) -> DiscoveryConfig {
-        DiscoveryConfig {
-            self_addr: self.self_addr,
-            namespace_allow: self.namespace_allow.clone(),
-            service_allow: self.service_allow.clone(),
+    /// How this node finds its peers: alone without a gossip bind, else from
+    /// `gossip.bootstrap_peers` when it lists any, else from Kubernetes.
+    fn membership(&self) -> Membership {
+        if self.gossip_bind.is_none() {
+            Membership::Alone
+        } else if self.bootstrap_peers.is_empty() {
+            Membership::Kubernetes(DiscoveryConfig {
+                self_match: SelfMatch::resolve(self.self_addr),
+                namespace_allow: self.namespace_allow.clone(),
+                service_allow: self.service_allow.clone(),
+            })
+        } else {
+            Membership::Static(self.bootstrap_peers.clone())
         }
     }
 
@@ -378,9 +401,15 @@ impl Settings {
                 });
             }
         }
+        if self.bootstrap_peers.len() > usize::from(self.peer_capacity.get()) {
+            return Err(SettingError::TooManyBootstrapPeers {
+                listed: self.bootstrap_peers.len(),
+                capacity: self.peer_capacity,
+            });
+        }
         let gossip = ValidGossipConfig {
             cluster_id_hash: self.cluster_id_hash,
-            bootstrap_peers: Vec::new(),
+            membership: self.membership(),
             peer_capacity: self.peer_capacity,
             quantum: quantum(self.max_cells, wire_limits),
             sweep_concurrency: self.sweep_concurrency,
@@ -393,7 +422,8 @@ impl Settings {
             target_err_bps,
             min_emit_interval: self.min_emit_interval,
             suspect_after,
-            zone: None,
+            zone: self.zone.clone(),
+            zone_grace: self.zone_grace,
         };
         let storage = ValidStorageConfig {
             cell_capacity: self.max_cells,
@@ -441,6 +471,7 @@ enum Problem {
     Zero,
     /// What the text must be, and an example.
     Malformed(&'static str, &'static str),
+    Zone(ZoneError),
 }
 
 /// How a field's type parses and prints its setting's text.
@@ -584,9 +615,49 @@ impl Field for NonZeroU128 {
     }
 }
 
-/// The Kubernetes allow-lists, the only list settings: each value appends one
-/// RFC 1123 DNS label, `[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?`, so a typo fails
-/// to load instead of silently matching nothing.
+/// An empty zone is an error, not unset, so a broken template is loud.
+impl Field for Option<ZoneName> {
+    fn set(&mut self, text: &str) -> Result<(), Problem> {
+        *self = Some(ZoneName::parse(text).map_err(Problem::Zone)?);
+        Ok(())
+    }
+
+    fn show(&self) -> Option<String> {
+        self.as_ref().map(|zone| zone.as_str().to_owned())
+    }
+}
+
+/// `gossip.bootstrap_peers`: each value appends one address and port; host
+/// names are not resolved.
+impl Field for Box<[SocketAddr]> {
+    const LIST: bool = true;
+
+    fn set(&mut self, text: &str) -> Result<(), Problem> {
+        let addr = text
+            .parse()
+            .map_err(|_| Problem::Malformed("a socket address", "192.0.2.11:9000"))?;
+        append(self, addr);
+        Ok(())
+    }
+
+    fn show(&self) -> Option<String> {
+        (!self.is_empty()).then(|| {
+            let addrs: Vec<String> = self.iter().map(ToString::to_string).collect();
+            addrs.join(",")
+        })
+    }
+}
+
+/// Append `item` to a list setting, at load only.
+fn append<T>(list: &mut Box<[T]>, item: T) {
+    let mut items = std::mem::take(list).into_vec();
+    items.push(item);
+    *list = items.into_boxed_slice();
+}
+
+/// The Kubernetes allow-lists: each value appends one RFC 1123 DNS label,
+/// `[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?`, so a typo fails to load instead of
+/// silently matching nothing.
 impl Field for Box<[Box<str>]> {
     const LIST: bool = true;
 
@@ -606,9 +677,7 @@ impl Field for Box<[Box<str>]> {
                 "gabion",
             ));
         }
-        let mut list = std::mem::take(self).into_vec();
-        list.push(text.into());
-        *self = list.into_boxed_slice();
+        append(self, text.into());
         Ok(())
     }
 
@@ -654,6 +723,15 @@ pub enum SettingError {
         max: u64,
         /// Why the range is what it is, and what to do.
         reason: &'static str,
+    },
+    /// `gossip.bootstrap_peers` lists more peers than the peer table holds.
+    TooManyBootstrapPeers {
+        listed: usize,
+        capacity: NonZeroU16,
+    },
+    InvalidZone {
+        value: Box<str>,
+        reason: ZoneError,
     },
 }
 
@@ -757,6 +835,21 @@ impl fmt::Display for SettingError {
                     Alternatives(setting)
                 )
             }
+            Self::TooManyBootstrapPeers { listed, capacity } => write!(
+                f,
+                "{} lists {listed} peers, but the peer table holds {capacity}. Raise {} to at \
+                 least {listed}, or shorten the list.",
+                Setting::GossipBootstrapPeers,
+                Setting::GossipPeerCapacity,
+            ),
+            Self::InvalidZone { ref value, reason } => write!(
+                f,
+                "The zone setting `{value}` is not a valid zone name: {reason}. A zone name has 1 \
+                 to 63 letters, digits, `-`, `_` or `.`, and starts and ends with a letter or \
+                 digit, like a Kubernetes label value. Use your cloud's zone identifier (for \
+                 example `use1-az2` on AWS), or remove {} to learn the zone from Kubernetes.",
+                Setting::GossipZone,
+            ),
         }
     }
 }

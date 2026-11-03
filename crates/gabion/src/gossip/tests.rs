@@ -23,7 +23,7 @@ use crate::crdt::{
     ObservationBatch, RuleDescriptor,
 };
 use crate::defaults::GOSSIP_EXPIRATION_BATCH;
-use crate::discovery::{Peer, PeerEvent};
+use crate::discovery::{Membership, Peer, PeerEvent};
 #[cfg(feature = "transport-udp")]
 use crate::gossip::UdpTransport;
 use crate::gossip::mock::{MockTransport, Wire, gated};
@@ -138,8 +138,19 @@ fn tuned_config(peers: Vec<SocketAddr>, tune: impl FnOnce(&mut Settings)) -> Val
     };
     tune(&mut settings);
     let (mut config, _) = settings.validate().expect("test gossip settings validate");
-    config.bootstrap_peers = peers;
+    if !peers.is_empty() {
+        config.membership = Membership::Static(peers.into());
+    }
     config
+}
+
+/// A node bound at `me` whose `gossip.bootstrap_peers` is `list`, the one
+/// list every node shares, `me` included.
+fn static_config(me: SocketAddr, list: &[SocketAddr]) -> ValidGossipConfig {
+    tuned_config(vec![], |s| {
+        s.gossip_bind = Some(me);
+        s.bootstrap_peers = list.into();
+    })
 }
 
 fn ms(millis: u64) -> Millis {

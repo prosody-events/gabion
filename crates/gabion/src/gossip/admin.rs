@@ -13,7 +13,7 @@ use super::peer::Role;
 #[cfg(feature = "cell-dump")]
 use crate::crdt::{BucketEpoch, Incarnation};
 use crate::crdt::{CellStoreStats, NodeId, NodeIdentity};
-use crate::zone::ZoneHash;
+use crate::zone::{ZoneHash, ZoneStatus};
 
 /// Request sent into the gossip runtime over the admin channel. New shapes
 /// (e.g. a forced sweep) can be added without changing the `select!` arm.
@@ -40,6 +40,10 @@ pub enum AdminCommand {
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct AdminSnapshot {
     pub local_identity: NodeIdentity,
+    /// This node's zone and where it came from, or why none is known;
+    /// `/snapshot` serialises it as `{"name", "source"}`, with a `reason`
+    /// for an unknown zone.
+    pub zone: ZoneStatus,
     /// How many peers hold each role; during a rolling upgrade the
     /// `incompatible` count falls to zero.
     pub peers_by_role: RoleCounts,

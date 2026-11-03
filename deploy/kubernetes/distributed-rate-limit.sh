@@ -110,14 +110,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-build_images() {
-    if [ "$BACKEND" = "nginx" ]; then
-        docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
-    fi
-    docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
-    docker build -f deploy/kubernetes/loader.Dockerfile -t gabion-loader:local .
-}
-
 create_configmaps() {
     if [ "$BACKEND" = "nginx" ]; then
         awk \
@@ -489,7 +481,11 @@ show_cluster_overview() {
     fi
 }
 
-build_images
+if [ "$BACKEND" = "nginx" ]; then
+    build_and_load_images nginx-nginx-module-request-smoke:latest gabiond:local gabion-loader:local
+else
+    build_and_load_images gabiond:local gabion-loader:local
+fi
 kubectl create namespace "$namespace"
 create_configmaps
 apply_common_rbac
@@ -498,11 +494,14 @@ if [ "$BACKEND" = "nginx" ]; then
     printf '\nwaiting for %s nginx pods + gabiond to roll out...\n' "$POD_COUNT"
     kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=300s
     kubectl -n "$namespace" rollout status deployment/gabiond --timeout=180s
+    assert_pods_run_image app=gabion-nginx nginx-nginx-module-request-smoke:latest
+    assert_pods_run_image app=gabiond gabiond:local
     wait_for_endpoint_count gabion-nginx "$POD_COUNT"
 else
     apply_gabiond_backend
     printf '\nwaiting for %s gabiond pods to roll out...\n' "$POD_COUNT"
     kubectl -n "$namespace" rollout status deployment/gabiond --timeout=180s
+    assert_pods_run_image app=gabiond gabiond:local
     wait_for_endpoint_count gabiond "$POD_COUNT"
 fi
 
@@ -519,6 +518,7 @@ loader_timeout=$((WARMUP_S + DURATION_S + 180))
 printf 'waiting up to %ss for the loader Job to complete...\n' "$loader_timeout"
 wait_status=0
 kubectl -n "$namespace" wait --for=condition=complete --timeout="${loader_timeout}s" job/loader 2>/dev/null || wait_status=$?
+assert_pods_run_image job-name=loader gabion-loader:local
 if [ "$wait_status" -ne 0 ]; then
     printf '\nloader Job did not reach Complete; current state:\n'
     kubectl -n "$namespace" get job/loader -o wide || true

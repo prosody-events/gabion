@@ -558,6 +558,18 @@ enum Rank {
     Live(u64, SocketAddr),
 }
 
+/// Which heard peers a join sweep may ask.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SweepScope {
+    /// Those of this node's zone.
+    Zone,
+    /// Any zone's, once every peer is heard and none is of this zone.
+    AnyZone,
+    /// Any zone's, once no heard peer is of this zone: the want waited
+    /// `gossip.zone_grace`, so a peer not yet heard counts as absent.
+    AnyZoneAfterGrace,
+}
+
 /// Rows `0..len` hold the peers in no particular order: a removed row is
 /// filled by the last. Every column is sized at construction and never grows.
 pub(super) struct PeerTable {
@@ -782,15 +794,12 @@ impl PeerTable {
         self.local_zone
     }
 
-    /// Learn this node's zone, unless it is already known (configured or
-    /// learned): returns whether it was adopted.
-    pub(super) fn adopt_zone(&mut self, zone: ZoneHash) -> bool {
-        let adopted = self.local_zone.is_none();
-        if adopted {
-            self.local_zone = Some(zone);
-            self.stale = true;
-        }
-        adopted
+    /// Learn this node's zone; the runtime's own-zone state adopts one only
+    /// while none is known.
+    pub(super) fn adopt_zone(&mut self, zone: ZoneHash) {
+        debug_assert!(self.local_zone.is_none(), "a known zone never changes");
+        self.local_zone = Some(zone);
+        self.stale = true;
     }
 
     /// Whether roles need a refresh: prompt work.
@@ -1265,17 +1274,21 @@ impl PeerTable {
     }
 
     /// The heard peers a join sweep may ask, with their weights: those of
-    /// this node's zone, or with `any_zone` every one that speaks this
+    /// this node's zone, or in an any-zone scope every one that speaks this
     /// version, but only while no peer is or may be of this zone: none unheard
-    /// of unknown zone, and none, heard or not, of this zone. An unheard peer
-    /// may not know this node yet, and would ignore the request.
+    /// of unknown zone, and none, heard or not, of this zone. After
+    /// `gossip.zone_grace` a peer not yet heard no longer counts. An unheard
+    /// peer may not know this node yet, and would ignore the request.
     pub(super) fn sweep_candidates(
         &self,
-        any_zone: bool,
+        scope: SweepScope,
     ) -> impl Iterator<Item = (u64, SocketAddr)> + '_ {
-        let any_zone = any_zone
-            && !(self.role[..self.len].iter())
-                .any(|role| matches!(role, Role::Unheard | Role::Zone));
+        let any_zone = scope != SweepScope::Zone
+            && !(0..self.len).any(|row| {
+                matches!(self.role[row], Role::Unheard | Role::Zone)
+                    && !(scope == SweepScope::AnyZoneAfterGrace
+                        && self.link[row].identity().is_none())
+            });
         (0..self.len)
             .filter(move |&row| {
                 let asks = match self.role[row] {

@@ -21,10 +21,10 @@
 //! `tokio::time::pause()`.
 
 use std::io;
-use std::net::SocketAddr;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU128, NonZeroUsize};
 
 use crate::defaults;
+use crate::discovery::Membership;
 use crate::settings::{MIN_LIMIT_QUEUE_CAPACITY, Millis, Setting};
 use crate::wire::FrameLimits;
 use crate::zone::ZoneName;
@@ -34,6 +34,7 @@ mod client;
 mod clock;
 #[cfg(test)]
 mod mock;
+mod own_zone;
 mod peer;
 mod runtime;
 pub mod sim;
@@ -67,8 +68,9 @@ pub struct ValidGossipConfig {
     /// Cluster identifier written into every outbound packet header; a
     /// packet carrying any other is dropped.
     pub(crate) cluster_id_hash: NonZeroU128,
-    /// Peers seeded at startup (in addition to any later peer events).
-    pub bootstrap_peers: Vec<SocketAddr>,
+    /// How this node finds its peers; a `Static` list is seeded into the
+    /// peer table at construction.
+    pub membership: Membership,
     /// Rows of the runtime's peer table, `gossip.peer_capacity`; a peer
     /// discovery reports past it is declined and logged as `peer_table_full`.
     pub(crate) peer_capacity: NonZeroU16,
@@ -101,9 +103,14 @@ pub struct ValidGossipConfig {
     /// `gossip.suspect_after`: how long a packet may go unanswered before its
     /// peer is suspect.
     pub(crate) suspect_after: Millis,
-    /// This node's zone, announced in every header; `None` runs the node as
-    /// one zone with every peer.
+    /// `gossip.zone`: this node's zone, announced in every header. `None`
+    /// leaves it to the node's own Kubernetes EndpointSlice entry, and
+    /// without one runs the node as one zone with every peer.
     pub zone: Option<ZoneName>,
+    /// `gossip.zone_grace`: how long after the first peer event `zone_unknown`
+    /// waits for the own entry, and a join sweep for unheard peers before a
+    /// lone node of a new zone asks another zone.
+    pub(crate) zone_grace: Millis,
 }
 
 /// A heartbeat shorter than this many milliseconds may resend before the

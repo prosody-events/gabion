@@ -14,7 +14,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{CellStore, NodeIdentity};
 use gabion::gossip::GossipRuntime;
-use gabion::{discovery, identity};
+use gabion::identity;
+use gabion::zone::ZoneName;
 
 use gabion_server::admin::{self, AdminState};
 use gabion_server::config::{AppConfig, ConfigError};
@@ -71,6 +72,8 @@ async fn run() -> anyhow::Result<()> {
         max_rules = rule_table.dictionary_capacity(),
         max_peers = config.settings.peer_capacity,
         max_peer_instances = config.storage.node_dictionary_capacity(),
+        zone_setting = config.settings.zone.as_ref().map(ZoneName::as_str),
+        membership = config.gossip.membership.name(),
         "Starting gabion.",
     );
 
@@ -96,6 +99,7 @@ async fn run() -> anyhow::Result<()> {
     let (admin_tx, admin_rx) = admin::admin_channel();
 
     config.gossip.note_startup();
+    let peer_events = config.gossip.membership.peer_events();
     let (gossip_rt, gossip_client) = GossipRuntime::bind(
         gossip_bind,
         config.gossip,
@@ -116,8 +120,6 @@ async fn run() -> anyhow::Result<()> {
         counts.clone(),
         config.storage,
     );
-
-    let peer_events = discovery::peer_events(config.settings.discovery());
 
     let gossip_task = tokio::task::spawn_local(async move { gossip_rt.run(peer_events).await });
 

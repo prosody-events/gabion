@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor, ValidStorageConfig};
-use gabion::discovery::{Peer, PeerEvent};
+use gabion::discovery::{Membership, Peer, PeerEvent};
 use gabion::gossip::sim::{LinkPolicy, SimRouter};
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipError, GossipRuntime,
@@ -344,9 +344,6 @@ impl EngineState {
 
         let store = CellStore::new(self.storage, identity, &self.rules);
 
-        let bootstrap_peers: Vec<SocketAddr> =
-            bootstrap.iter().copied().filter(|a| *a != addr).collect();
-
         let transport = LoggingSimTransport::new(
             self.router.bind(addr),
             self.router.clone(),
@@ -356,7 +353,8 @@ impl EngineState {
         );
 
         let mut gossip_cfg = self.gossip.clone();
-        gossip_cfg.bootstrap_peers = bootstrap_peers;
+        gossip_cfg.membership =
+            Membership::Static(bootstrap.iter().copied().filter(|a| *a != addr).collect());
 
         let aggregate = Rc::new(EventEmittingAggregateStore::new(id, self.log.clone()));
         let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
@@ -488,7 +486,7 @@ impl EngineState {
         let joined = PeerEvent::Added(Peer::new(newcomer_addr));
         for handle in &self.nodes {
             if handle.id != id {
-                let _ = handle.peer_tx.unbounded_send(joined);
+                let _ = handle.peer_tx.unbounded_send(joined.clone());
             }
         }
 
@@ -520,7 +518,7 @@ impl EngineState {
         let left = PeerEvent::Removed(Peer::new(addr));
         for (i, handle) in self.nodes.iter().enumerate() {
             if i != pos {
-                let _ = handle.peer_tx.unbounded_send(left);
+                let _ = handle.peer_tx.unbounded_send(left.clone());
             }
         }
 

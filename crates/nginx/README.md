@@ -198,7 +198,7 @@ flowchart TD
     UTF8{descriptor\nUTF-8 OK?}
     Mode{rule.mode}
 
-    subgraph SHM[" SHM zone (cross-process) "]
+    subgraph SHM[" SHM limit zone (cross-process) "]
         direction LR
         Read[(Read window_total\nfrom AggregateTable)]
         Push[(Push QueueEvent\nto RequestQueue)]
@@ -263,12 +263,12 @@ with a concrete next step, please open an issue.
 
 #### `gabion_limit_zone zone=NAME:SIZE` *(http)*
 
-Allocates the shared-memory zone that holds the local-aggregate
-counters, the SHM queue, and the per-zone `Stats`. Required exactly
+Allocates the shared-memory limit zone that holds the local-aggregate
+counters, the SHM queue, and its `Stats`. Required exactly
 once per `http {}` block that declares rules; `nginx -t` refuses rules
 without one. Mirrors nginx core's `limit_req_zone zone=name:size`.
 
-Like nginx's own zones, a zone survives `nginx -s reload` when its
+Like nginx's own shared-memory zones, a limit zone survives `nginx -s reload` when its
 name and size are unchanged: the node identity and any queued hits
 carry over, and the log line `gabion: zone ready` says `reused=true`.
 The counts do not: whenever a worker takes over gossip (after a reload,
@@ -278,9 +278,9 @@ cluster tracks many thousands of keys. Until then this node under-counts
 and may admit requests over the limit. A node with no peers has nothing
 to rebuild from, so a reload or leader change resets its limits as if
 every window had just started. Changing the name or size starts an
-empty zone, and the master releases the old one once no configuration
+empty limit zone, and the master releases the old one once no configuration
 uses it. A reload that changes only `gabion_gossip_limit_queue_capacity`
-cannot resize a reused zone's queue, so nginx refuses it and keeps the
+cannot resize a reused limit zone's queue, so nginx refuses it and keeps the
 previous configuration (`limit_queue_resized_on_reload`); change SIZE
 with it, or restart nginx.
 
@@ -288,7 +288,7 @@ with it, or restart nginx.
 gabion_limit_zone zone=api:128m;
 ```
 
-SIZE sets how many `(rule, key, bucket)` counters the zone holds: after
+SIZE sets how many `(rule, key, bucket)` counters the limit zone holds: after
 the request queue (`gabion_gossip_limit_queue_capacity` × 72 bytes,
 rounded up to a power of two: 576 KiB at the default) and nginx's slab
 bookkeeping (under 1%), the rest becomes a power-of-two table of 64-byte slots, so each doubling of
@@ -297,7 +297,7 @@ SIZE doubles the slots (`2m` holds 16,384, `64m` holds 524,288; the
 *active keys × (window / bucket + 1)* slots, and lookups stay short
 while the table is under half full. For example, 650 keys a second under
 `rate=20r/s window=10s bucket=1s` keep about 650 × 11 ≈ 7,200 cells
-live, so choose 16,384 slots: `zone=api:2m`. A zone too small for the
+live, so choose 16,384 slots: `zone=api:2m`. A limit zone too small for the
 queue and 1,024 slots fails `nginx -t` naming the smallest SIZE that fits;
 `1m` fits the default queue capacity. When the table runs out of room, gabion allows the request,
 under-counts that key, increments `aggregate_dropped` and logs
@@ -445,17 +445,18 @@ is in scope for gabion but has no active rules at this level".
 
 ### Discovery
 
-Without discovery, every node has to be told the address of every
-peer at startup, and a rolling deploy breaks the list. The
-EndpointSlice watch makes membership self-healing: gabion picks up
-peer pods as they come and go, and there is no static list to
-maintain.
+On Kubernetes the EndpointSlice watch makes membership self-healing:
+gabion picks up peer pods as they come and go, and finds the node's own
+entry by pod name, which gives the node its zone and keeps it out of its
+own peers. Outside Kubernetes, `gabion_gossip_bootstrap_peers` lists the
+peers instead, and the watcher never starts; see
+[Zones](../gabion/README.md#zones).
 
 | Directive                                     | Description                                                                                  |
 |-----------------------------------------------|----------------------------------------------------------------------------------------------|
 | `gabion_discovery_namespace_allow NAMESPACE`  | Restrict Kubernetes EndpointSlice discovery to the listed namespace. Repeat for several. Empty = the pod's own namespace. |
 | `gabion_discovery_service_allow SERVICE`      | Restrict discovery to the listed Service name. Repeat for several. Empty = all services in the allowed namespaces. |
-| `gabion_discovery_self_addr ADDR`             | Local gossip address that should be excluded from discovered peers (avoid talking to yourself). |
+| `gabion_discovery_self_addr ADDR`             | This pod's IP and gossip port, only for `hostNetwork` pods, whose host name is not their pod name; otherwise the pod-name match finds the node's own entry. The own entry gives the zone and is never a peer. |
 
 Each name must be a Kubernetes DNS label (`[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?`).
 
@@ -499,6 +500,9 @@ they bound resource use.
 | `gabion_gossip_max_payload_bytes N`             | `1400`  | Cap on UDP payload size per gossip packet: 158 to 65,507. 158 bytes hold the header and one counter; 65,507 is the largest UDP payload over IPv4. |
 | `gabion_gossip_suspect_after DURATION`          | `max(4 × tick, 2s)` | How long a packet to a peer may go unanswered before the peer is suspect: routed around as a gateway and sent only probes. At least two heartbeats. |
 | `gabion_gossip_sweep_concurrency N`             | `4`     | Join sweeps this node answers at once, 1 to 255; each pages its live counts to one newly started peer. Past it a request is declined (`sweep_declined`) and the peer asks another. |
+| `gabion_gossip_zone ZONE`                       | *(none)* | This node's availability zone: 1 to 63 letters, digits, `-`, `_` or `.`, starting and ending with a letter or digit. Leave it unset on Kubernetes, where the node reads its zone from its own EndpointSlice entry; set it outside, where nothing else can. An empty or malformed value fails `nginx -t`. |
+| `gabion_gossip_zone_grace DURATION`             | `10s`   | How long after the first peer event the node waits for its own EndpointSlice entry before it logs `zone_unknown`, and a join sweep waits for unheard peers before a new zone's first node asks another zone. |
+| `gabion_gossip_bootstrap_peers ADDR:PORT`       | *(none)* | A static peer, repeated once per peer; the list may name this node too. A non-empty list replaces Kubernetes discovery, and its peers are never removed. It may hold no more entries than `gabion_gossip_peer_capacity`. Needs `gabion_gossip_bind`. |
 | `gabion_gossip_peer_capacity N`                 | `512`   | The most peers this node gossips with, 1 to 32,767, sized once at start, about 330 bytes a peer. Past it, a new peer is declined (`peer_table_full`) and its counts still merged. Also sets the node dictionary's default, twice it. |
 | `gabion_gossip_limit_queue_capacity N`          | `8192`  | Slots in the shared-memory request queue workers push counted hits onto for the leader, 64 to 1,048,576, rounded up to a power of two. Each slot is 72 bytes of the `gabion_limit_zone` SIZE, so raise SIZE with it. The default covers a 1.3 s leader handover at up to 6,300 counted hits a second per pod; raise it when the `queue_dropped` counter rises. A reload that changes it needs a new SIZE or a restart. |
 | `gabion_gossip_recv_buffer_bytes N`            | `4194304` | Receive buffer the gossip socket asks the kernel for, 65,536 to 1,073,741,823 bytes. The host's `net.core.rmem_max` caps it; `socket_buffer_capped` says when. See [Socket buffers](../gabion/README.md#socket-buffers). |
@@ -716,6 +720,8 @@ narrative. The nginx directives that bind each piece are:
 | Gossip socket          | `gabion_gossip_bind ADDR:PORT`                               |
 | Cluster identifier     | `gabion_gossip_cluster ID` (non-zero u128, decimal or `0x` hex) |
 | Discovery filter       | `gabion_discovery_namespace_allow`, `gabion_discovery_service_allow`, `gabion_discovery_self_addr` |
+| Static peers (outside Kubernetes) | `gabion_gossip_bootstrap_peers ADDR:PORT`, repeated     |
+| Zone (outside Kubernetes)         | `gabion_gossip_zone ZONE`                               |
 
 On Kubernetes, discovery also needs a Service port named `gabion` and a Role;
 see the root README's
@@ -805,6 +811,7 @@ gabion: `gossip.cluster_id_hash` is `0`, which is not a non-zero cluster id in d
 gabion: rules are declared but `gabion_limit_zone` is not set, so no request would ever be counted or limited: the zone is the shared memory that holds the counts. Add `gabion_limit_zone zone=gabion:64m;` to the http {} block.
 gabion: `gossip.tick_interval` is `notaduration`, which is not a duration in whole milliseconds, for example `500ms`. Correct it (`GABION_GOSSIP_TICK_INTERVAL`; NGINX `gabion_gossip_tick_interval`) or remove it to use the default, 500ms.
 gabion: `storage.max_cells` is 0, but it must be at least 1: gabion could not track any rate-limit key. Remove the setting to use the default, 131072, or set a positive value (`GABION_STORAGE_MAX_CELLS`; NGINX `gabion_storage_max_cells`).
+gabion: The zone setting `us east` is not a valid zone name: it contains ` `. A zone name has 1 to 63 letters, digits, `-`, `_` or `.`, and starts and ends with a letter or digit, like a Kubernetes label value. Use your cloud's zone identifier (for example `use1-az2` on AWS), or remove `gossip.zone` (`GABION_GOSSIP_ZONE`; NGINX `gabion_gossip_zone`) to learn the zone from Kubernetes.
 ```
 
 ## Troubleshooting
@@ -829,11 +836,13 @@ below are the module's own.
 | `` gabion: `X` is N; gabion supports MIN to MAX. … ``                          | A capacity directive is outside the range gabion can hold; the message gives the reason.                                                            | Set it inside the range, or remove it.                                                                                           |
 | `gabion: The gossip packet size …`, `… error budget …`, or `` … `gossip.min_emit_interval` … must be at least 1ms and shorter than … `` | A settings rule failed once the `http {}` block was read: the packet size outside 158 to 65,507, the error budget outside 1 to 10,000, or the emit floor at or above the heartbeat. | Follow the message; it names the directive and the range.                                                                        |
 | `` gabion: `gabion_limit_zone` size N bytes is too small to hold gabion's request queue … `` | SIZE cannot hold the request queue (`gabion_gossip_limit_queue_capacity` × 72 bytes) and 1,024 counter slots.                              | Raise SIZE to at least the size the message names, or lower `gabion_gossip_limit_queue_capacity`.                               |
-| `rules are declared but gabion_limit_zone is not set`                         | The config declares rules but no zone, so there is nowhere to count hits and every request would be admitted uncounted.                             | Add `gabion_limit_zone zone=gabion:64m;` to the `http {}` block, or check that the include declaring it is loaded.               |
+| `` gabion: The zone setting `V` is not a valid zone name: … ``                 | `gabion_gossip_zone` is empty, longer than 63 characters, or holds a character a Kubernetes label value cannot.                                    | Use the cloud's zone identifier (for example `use1-az2`), or remove the directive to learn the zone from Kubernetes.            |
+| `` gabion: `gossip.bootstrap_peers` (…) lists N peers, but the peer table holds M. … `` | More `gabion_gossip_bootstrap_peers` than `gabion_gossip_peer_capacity`.                                                                 | Raise `gabion_gossip_peer_capacity` to at least N, or list fewer peers.                                                          |
+| `rules are declared but gabion_limit_zone is not set`                         | The config declares rules but no limit zone, so there is nowhere to count hits and every request would be admitted uncounted.                             | Add `gabion_limit_zone zone=gabion:64m;` to the `http {}` block, or check that the include declaring it is loaded.               |
 | Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`      | A client crossed a rule's limit.                                                                                                                    | Expected. `Retry-After` says how long to back off; the rule with the longest window owns the header.                             |
 | `400 Bad Request` from gabion                                                 | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits (`512` by default).                  | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
 | SHM `matched_rule_overflows` counter rising                                   | Requests matched more allowed rules than `gabion_storage_max_matched_rules` (`16` by default). **The request was allowed** (allow-by-default); the rules past the bound under-count. *No log line — observed only via the SHM stats counters.* | Reduce the number of rules applied at this location, split the location, or raise `gabion_storage_max_matched_rules`.            |
-| `The count table had no free slot for a rate-limit key` (warn, `aggregate_full`) | The zone holds too few slots for the live `(rule, key, bucket)` cells. **The request was allowed** and that key under-counted. Logged at powers of two of `aggregate_dropped`; see [`aggregate_full`](../gabion/TROUBLESHOOTING.md#aggregate_full). | Raise SIZE in `gabion_limit_zone` (see its sizing notes); each doubling doubles the slots.                                         |
+| `The count table had no free slot for a rate-limit key` (warn, `aggregate_full`) | The limit zone holds too few slots for the live `(rule, key, bucket)` cells. **The request was allowed** and that key under-counted. Logged at powers of two of `aggregate_dropped`; see [`aggregate_full`](../gabion/TROUBLESHOOTING.md#aggregate_full). | Raise SIZE in `gabion_limit_zone` (see its sizing notes); each doubling doubles the slots.                                         |
 | `gabion: this worker stopped leading gossip` (error) in the error log         | The leader's gossip runtime or queue drain failed or panicked, or it lost the lease. The worker released the lease and campaigns again after `retry_in` (doubling, up to 30s); another worker may take over first. Admission keeps running against the shared aggregate. | Read the `error` field. A bind error means `gabion_gossip_bind` is already in use; a lost lease means the worker was starved long enough to miss its renewals. |
 | `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside a leadership term, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
 | `Peer discovery hit an error and skipped an update` (warn) in the error log   | `discovery_error`, a library message: see [`../gabion/TROUBLESHOOTING.md`](../gabion/TROUBLESHOOTING.md#discovery_error).                           | Usually transient. If it keeps repeating, check pod RBAC and network reachability to the API.                                    |
@@ -858,11 +867,11 @@ Message starts: "gabion: this worker took over gossip and emptied the previous l
 
 Message starts: "gabion: this reload changes `gabion_gossip_limit_queue_capacity`"
 
-**What happened.** nginx refused the reload and kept the previous configuration, including its rules. The reload changed the queue capacity, but the `gabion_limit_zone` name and size stayed the same, so nginx reused the running zone, whose queue the running workers still use and cannot resize.
+**What happened.** nginx refused the reload and kept the previous configuration, including its rules. The reload changed the queue capacity, but the `gabion_limit_zone` name and size stayed the same, so nginx reused the running limit zone, whose queue the running workers still use and cannot resize.
 
-**Why.** nginx maps a fresh shared-memory zone only when a zone's name or size changes.
+**Why.** nginx maps a fresh limit zone only when its name or size changes.
 
-**What to do next.** Change SIZE in `gabion_limit_zone` along with `gabion_gossip_limit_queue_capacity` (a larger queue needs a larger SIZE anyway, 72 bytes a slot), so nginx maps a fresh zone, or restart nginx.
+**What to do next.** Change SIZE in `gabion_limit_zone` along with `gabion_gossip_limit_queue_capacity` (a larger queue needs a larger SIZE anyway, 72 bytes a slot), so nginx maps a fresh limit zone, or restart nginx.
 
 **Fields** `running`, `configured` · **Knob** `gabion_gossip_limit_queue_capacity`, `gabion_limit_zone`
 

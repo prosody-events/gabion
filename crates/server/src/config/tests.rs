@@ -3,7 +3,10 @@
 //! one test see another's env state and fail in non-obvious ways.
 
 use super::*;
+use gabion::discovery::Membership;
 use gabion::settings::Millis;
+use gabion::zone::ZoneError;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 
 /// Held for the duration of any test that mutates the env. Guarantees
@@ -216,6 +219,9 @@ fn sample(setting: Setting) -> &'static str {
         Setting::GossipMinEmitInterval => "10ms",
         Setting::GossipSuspectAfter => "3s",
         Setting::GossipSweepConcurrency => "8",
+        Setting::GossipZone => "use1-az2",
+        Setting::GossipZoneGrace => "3s",
+        Setting::GossipBootstrapPeers => "10.0.0.2:9000",
         Setting::DiscoverySelfAddr => "10.0.0.1:9000",
         Setting::DiscoveryNamespaceAllow => "team-a",
         Setting::DiscoveryServiceAllow => "gabion",
@@ -258,6 +264,60 @@ fn setting_table_spellings_parse() {
             AppConfig::load_with_yaml_str(&yaml).unwrap_or_else(|error| panic!("{yaml}: {error}"));
         assert_eq!(from_yaml.settings, expected, "{yaml}");
     }
+}
+
+/// `gossip.bootstrap_peers` splits a comma-separated environment variable
+/// and reads a YAML list, each making the membership static (the NGINX half
+/// is in the module's tests).
+#[test]
+fn bootstrap_peers_parse_in_both_adapters() {
+    let _env = EnvGuard::lock();
+    let peers: [SocketAddr; 2] = ["10.0.0.2:9000", "10.0.0.3:9000"].map(|a| a.parse().unwrap());
+    let check = |config: AppConfig| {
+        assert_eq!(&*config.settings.bootstrap_peers, peers);
+        assert_eq!(config.gossip.membership, Membership::Static(peers.into()));
+    };
+    set_env("GABION_GOSSIP_BIND", "0.0.0.0:9000");
+    set_env(
+        "GABION_GOSSIP_BOOTSTRAP_PEERS",
+        "10.0.0.2:9000, 10.0.0.3:9000",
+    );
+    check(AppConfig::load(None).expect("env loads"));
+    clear_all_env();
+    let yaml = "gossip:\n  bind: 0.0.0.0:9000\n  bootstrap_peers: [\"10.0.0.2:9000\", \
+                \"10.0.0.3:9000\"]\n";
+    check(AppConfig::load_with_yaml_str(yaml).expect("yaml loads"));
+}
+
+/// U17 through gabiond: an empty or invalid zone fails to load.
+#[test]
+fn invalid_zone_fails_load_in_gabiond() {
+    let _env = EnvGuard::lock();
+    set_env("GABION_GOSSIP_ZONE", "");
+    let err = AppConfig::load(None).expect_err("an empty zone");
+    assert!(
+        matches!(
+            err,
+            ConfigError::Setting(SettingError::InvalidZone {
+                reason: ZoneError::Empty,
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    clear_all_env();
+    let err =
+        AppConfig::load_with_yaml_str("gossip:\n  zone: \"bad zone\"\n").expect_err("a space");
+    assert!(
+        matches!(
+            err,
+            ConfigError::Setting(SettingError::InvalidZone {
+                reason: ZoneError::BadChar { char: ' ' },
+                ..
+            })
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]

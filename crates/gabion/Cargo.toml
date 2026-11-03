@@ -34,8 +34,9 @@ whoami = { workspace = true, optional = true }
 # UDP transport, neither of which compiles for wasm32.
 default = ["discovery-kubernetes", "transport-udp"]
 # Kubernetes EndpointSlice peer discovery. Pulls `kube` + `k8s-openapi`,
-# which transitively need `hyper`/`rustls`/`tower-http` — host-only.
-discovery-kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:ahash"]
+# which transitively need `hyper`/`rustls`/`tower-http` — host-only;
+# `whoami` reads the host name that finds the node's own EndpointSlice entry.
+discovery-kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:ahash", "dep:whoami"]
 # The production UDP datagram transport (`UdpTransport`), the socket-binding
 # runtime constructors and the host identity (`gabion::identity`). Needs
 # `tokio/net`; `socket2` sizes the socket's kernel buffers, `libc` names

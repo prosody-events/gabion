@@ -30,7 +30,7 @@ use crate::crdt::{
     ObservationBatch, RelayMark, Stream, hash_fingerprint,
 };
 use crate::defaults::{self, GOSSIP_GAP_REPORTS, GOSSIP_MIN_DATAGRAM_CHARGE, GOSSIP_SWEEP_PEERS};
-use crate::discovery::{Peer, PeerEvent};
+use crate::discovery::{Membership, Peer, PeerEvent};
 use crate::settings::Setting;
 use crate::throttle;
 use crate::wire::{
@@ -43,8 +43,9 @@ use super::client::{GossipClient, LimitRequest, Request};
 #[cfg(feature = "transport-udp")]
 use super::clock::TokioClock;
 use super::clock::{Clock, Ticker};
+use super::own_zone::OwnZone;
 use super::peer::{
-    Contact, Failover, GapDue, Insert, PeerFlags, PeerTable, PerStream, Role, Stall,
+    Contact, Failover, GapDue, Insert, PeerFlags, PeerTable, PerStream, Role, Stall, SweepScope,
 };
 use super::store::AggregateStore;
 use super::sweep::{Accept, Sweep, SweepWant, Sweeps};
@@ -121,6 +122,8 @@ where
     /// This node's join sweep, from start until enough sources answered.
     sweep_want: Option<SweepWant>,
     sweeps: Sweeps,
+    /// This node's zone and what has been logged about it.
+    own_zone: OwnZone,
 
     // Pending reply for the in-flight limit request. Sent after the
     // bottom-of-loop apply so callers observe "ack ⇒ AggregateStore reflects
@@ -208,7 +211,7 @@ where
     pub fn from_parts_with_admin(
         transport: T,
         clock: K,
-        mut config: ValidGossipConfig,
+        config: ValidGossipConfig,
         store: CellStore,
         aggregates: S,
         admin_rx: Option<mpsc::Receiver<AdminCommand>>,
@@ -233,7 +236,11 @@ where
         let expiration_buf = ExpirationSink::with_capacity(defaults::GOSSIP_EXPIRATION_BATCH);
         let outbox = Outbox::new(&config);
 
-        let bootstrap = std::mem::take(&mut config.bootstrap_peers);
+        let bootstrap = match &config.membership {
+            Membership::Static(peers) => peers.clone(),
+            Membership::Kubernetes(_) | Membership::Alone => Box::default(),
+        };
+        let own_zone = OwnZone::new(&config);
         let local_key = hash_fingerprint(store.local_identity().node_id.0);
         let rto_ms = config.tick_interval.0.get();
         let suspect_after = config.suspect_after.0.get();
@@ -245,6 +252,7 @@ where
         });
         let sweeps = Sweeps::new(config.sweep_concurrency);
 
+        let clock_now = clock.now_millis();
         let rule_capacity = store.rule_dictionary().capacity() as usize;
         let rule_pending = vec![0_u32; rule_capacity].into_boxed_slice();
         let rule_last_emit_ms = vec![0_u64; rule_capacity].into_boxed_slice();
@@ -270,8 +278,9 @@ where
             prompt_work: false,
             cut: None,
             next_peer: 0,
-            sweep_want: Some(SweepWant::default()),
+            sweep_want: Some(SweepWant::new(clock_now)),
             sweeps,
+            own_zone,
             pending_reply: None,
             counters: GossipCounters::default(),
             rule_pending,
@@ -280,7 +289,7 @@ where
             last_error_budget: 0,
             _not_send: PhantomData,
         };
-        for addr in bootstrap {
+        for &addr in &bootstrap {
             runtime.add_peer(Peer::new(addr));
         }
         let client = GossipClient::new(req_tx);
@@ -307,6 +316,7 @@ where
         // never poll it again — otherwise it returns `Ready(None)` on every
         // iteration and the loop spins.
         let mut peer_events_done = false;
+        self.own_zone.start(&self.config);
 
         loop {
             let watch_peers = !peer_events_done;
@@ -468,6 +478,19 @@ where
             Ok(header) => header,
             Err(error) => return self.note_decode_reject(error, src, n),
         };
+        // This node's own packet: one static list names every node, this one
+        // too. The row it came from is this node's, unless a peer was heard
+        // there, so a forged copy cannot remove a live peer.
+        let local = self.store.local_identity();
+        if header.sender == local {
+            if let Some(row) = self.peers.find(src)
+                && (self.peers.link(row).identity()).is_none_or(|id| id.node_id == local.node_id)
+            {
+                self.peers.remove(src);
+                self.prompt_work |= self.peers.stale();
+            }
+            return;
+        }
         // A sender outside the table, or a late incarnation, is never acked
         // and its freshness cannot be judged, but what a flagged packet raised
         // is relayed promptly: an origin's gateway relays its hits before
@@ -668,6 +691,7 @@ where
             AdminCommand::Snapshot { reply } => {
                 let snapshot = AdminSnapshot {
                     local_identity: self.store.local_identity(),
+                    zone: self.own_zone.status().clone(),
                     peers_by_role: self.peers.role_counts(),
                     peers: self.peers.entries(self.clock.now_millis()).collect(),
                     store_stats: self.store.stats(),
@@ -725,6 +749,8 @@ where
     }
 
     fn handle_peer_event(&mut self, evt: PeerEvent) {
+        let now = self.clock.now_millis();
+        self.own_zone.note_peer_event(now, &self.config);
         match evt {
             PeerEvent::Added(peer) => self.add_peer(peer),
             PeerEvent::Removed(p) => {
@@ -741,19 +767,20 @@ where
                 // will bring: sweep again. Another zone's members reach this
                 // zone through its gateway's relay.
                 if link.identity().is_none() && !self.peers.is_other_zone(link.zone()) {
-                    self.sweep_want.get_or_insert_default();
+                    self.sweep_want.get_or_insert_with(|| SweepWant::new(now));
                 }
                 self.prompt_work = true;
             }
-            // A configured or already learned zone wins.
-            PeerEvent::OwnEntry { zone } if self.peers.adopt_zone(zone) => {
-                // Same-zone peers may now differ: sweep again.
-                let mut want = SweepWant::default();
-                want.due = true;
-                self.sweep_want = Some(want);
-                self.prompt_work = true;
+            PeerEvent::OwnEntry { zone, node_name } => {
+                if let Some(zone) = self.own_zone.own_entry(zone, node_name) {
+                    self.peers.adopt_zone(zone);
+                    // Same-zone peers may now differ: sweep again.
+                    let mut want = SweepWant::new(now);
+                    want.due = true;
+                    self.sweep_want = Some(want);
+                    self.prompt_work = true;
+                }
             }
-            PeerEvent::OwnEntry { .. } => {}
         }
     }
 
@@ -810,6 +837,7 @@ where
                 self.counters.rounds_heartbeat += 1;
                 self.expire_cells();
                 self.settle();
+                self.own_zone.check(now, &self.config);
             }
             Round::Threshold => {
                 self.counters.rounds_threshold += 1;
@@ -1164,8 +1192,10 @@ where
     /// Ask for the join sweep this node wants: at every heartbeat, and on any
     /// round once a peer is first heard. Each source asked is sent a
     /// `SweepRequest` at once and again at each heartbeat until a page
-    /// arrives. A node with no peer that is or may be of its zone asks one
-    /// heard peer of any zone.
+    /// arrives. A node with no heard peer of its zone asks one heard peer of
+    /// any zone, once no other peer is or may be of its zone; after the want
+    /// has waited `gossip.zone_grace`, a peer not yet heard no longer counts,
+    /// so a silent peer cannot keep a new zone's first node from sweeping.
     fn ask_sweeps(&mut self, kind: Round, now: u64) {
         let Some(mut want) = self
             .sweep_want
@@ -1174,9 +1204,25 @@ where
             return;
         };
         want.due = false;
-        let any_zone = self.peers.sweep_candidates(false).next().is_none();
-        let sources = if any_zone { 1 } else { GOSSIP_SWEEP_PEERS };
-        if want.advance(|| self.peers.sweep_candidates(any_zone), sources) {
+        let waited = now.saturating_sub(want.since_ms) >= self.config.zone_grace.0.get();
+        let scope = if self
+            .peers
+            .sweep_candidates(SweepScope::Zone)
+            .next()
+            .is_some()
+        {
+            SweepScope::Zone
+        } else if waited {
+            SweepScope::AnyZoneAfterGrace
+        } else {
+            SweepScope::AnyZone
+        };
+        let sources = if scope == SweepScope::Zone {
+            GOSSIP_SWEEP_PEERS
+        } else {
+            1
+        };
+        if want.advance(|| self.peers.sweep_candidates(scope), sources) {
             return;
         }
         for ask in want.asks() {

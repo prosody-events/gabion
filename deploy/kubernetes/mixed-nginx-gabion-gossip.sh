@@ -66,44 +66,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# CI has already built both images and loaded them into kind.
-if [ "${GABION_SKIP_IMAGE_BUILD:-0}" != 1 ]; then
-    docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
-    docker build -f deploy/gabiond/Dockerfile -t gabiond:local .
-fi
+build_and_load_images nginx-nginx-module-request-smoke:latest gabiond:local
+
+# kind's node carries no zone label; the EndpointSlice controller copies it
+# into each pod's entry, where both adapters read their zone.
+label_unzoned_nodes kind-a
 
 kubectl create namespace "$namespace"
+apply_gabion_rbac
 
 kubectl -n "$namespace" apply -f - <<YAML
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: gabion
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: gabion-endpointslice-reader
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "services"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gabion-endpointslice-reader
-subjects:
-  - kind: ServiceAccount
-    name: gabion
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: gabion-endpointslice-reader
----
 # gabiond server config in the new \`AppConfig\` schema. Admin HTTP at :9090,
 # envoy gRPC at :8081, gossip UDP at :9000.
 apiVersion: v1
@@ -323,28 +295,6 @@ nginx_hit() {
     curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080$1"
 }
 
-# gabiond_hit <domain> <key> <value>: one hit through gabiond's gRPC port;
-# prints the response's overall code, OK or OVER_LIMIT. The request is
-# encoded by hand, so the smoke needs only curl and python3.
-gabiond_hit() {
-    python3 -c '
-import sys
-def field(number, payload):  # length-delimited; every payload here is under 128 bytes
-    return bytes([number << 3 | 2, len(payload)]) + payload
-domain, key, value = (arg.encode() for arg in sys.argv[1:])
-request = field(1, domain) + field(2, field(1, field(1, key) + field(2, value)))
-sys.stdout.buffer.write(bytes(1) + len(request).to_bytes(4, "big") + request)
-' "$@" \
-        | curl -sS --http2-prior-knowledge -H 'content-type: application/grpc' -H 'te: trailers' \
-            --data-binary @- \
-            http://127.0.0.1:18081/envoy.service.ratelimit.v3.RateLimitService/ShouldRateLimit \
-        | python3 -c '
-import sys
-reply = sys.stdin.buffer.read()
-print({b"\x08\x01": "OK", b"\x08\x02": "OVER_LIMIT"}.get(reply[5:7], "UNKNOWN"))
-'
-}
-
 # shared_limit <limit> <nginx path> <domain> <key> <value>: alternate hits on
 # one key between NGINX and gabiond, a few gossip rounds apart. The two
 # adapters count one rule, so the first <limit> hits pass and each adapter
@@ -360,7 +310,7 @@ shared_limit() {
             answer="NGINX $(nginx_hit "$path")"
             [ "$answer" = "NGINX 429" ] || allowed=1
         else
-            answer="gabiond $(gabiond_hit "$@")"
+            answer="gabiond $(gabiond_hit 18081 "$@")"
             [ "$answer" != "gabiond OK" ] || allowed=1
         fi
         if [ "$allowed" = 0 ]; then
@@ -372,7 +322,7 @@ shared_limit() {
         sleep 3
     done
     status="$(nginx_hit "$path")"
-    code="$(gabiond_hit "$@")"
+    code="$(gabiond_hit 18081 "$@")"
     if [ "$status" != 429 ] || [ "$code" != OVER_LIMIT ]; then
         printf 'FAIL: after %s hits split between NGINX and gabiond on %s, NGINX answered %s and gabiond %s; both must refuse, or the two adapters count the rule separately\n' \
             "$limit" "$path" "$status" "$code" >&2
@@ -399,8 +349,19 @@ sys.exit(len(s["peers"]) < int(sys.argv[1]) or s["aggregate_rows"] == 0)
 ' "$1" 2>/dev/null
 }
 
+# nginx_zones_known: every live NGINX pod logged learning its zone from its
+# EndpointSlice entry.
+nginx_zones_known() {
+    live_pods gabion-nginx | while read -r pod _ _; do
+        kubectl -n "$namespace" logs "$pod" \
+            | grep -E 'code="?zone_known' | grep -q 'endpoint_slice' || return 1
+    done
+}
+
 kubectl -n "$namespace" rollout status deployment/gabiond --timeout=180s
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=180s
+assert_pods_run_image app=gabiond gabiond:local
+assert_pods_run_image app=gabion-nginx nginx-nginx-module-request-smoke:latest
 wait_for_endpoint_count gabiond 2
 wait_for_endpoint_count gabion-nginx 2
 
@@ -417,6 +378,10 @@ retry 60 port_forwards_ready
 dump_snapshot "before traffic"
 
 retry 60 gossip_settled 1
+assert_zone_from_endpoint_slice gabiond
+retry 60 nginx_zones_known
+printf 'every gabion-nginx pod learned its zone from its EndpointSlice entry\n'
+print_own_entry_wait gabiond
 
 # Now scale both deployments and confirm discovery + gossip still convergent.
 kubectl -n "$namespace" scale deployment/gabiond --replicas=3
@@ -426,7 +391,8 @@ kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=180s
 wait_for_endpoint_count gabiond 3
 wait_for_endpoint_count gabion-nginx 3
 
-# gabiond peers with every other pod: 3 before the scale-out, 5 after.
+# gabiond peers with every other pod, never itself: 3 before the scale-out,
+# 5 after.
 retry 60 gossip_settled 5
 
 # Each rule is one limit across both adapters. Fresh keys: the traffic above

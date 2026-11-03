@@ -60,10 +60,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# CI has already built the image and loaded it into kind.
-if [ "${GABION_SKIP_IMAGE_BUILD:-0}" != 1 ]; then
-    docker compose --profile module -f deploy/nginx/docker-compose.yml build nginx-module-request-smoke
-fi
+build_and_load_images nginx-nginx-module-request-smoke:latest
 
 kubectl create namespace "$namespace"
 
@@ -435,6 +432,7 @@ summarize_pod() {
 }
 
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
+assert_pods_run_image app=gabion-nginx nginx-nginx-module-request-smoke:latest
 wait_for_endpoint_count gabion-nginx 1
 pods="$(wait_for_pods 1)"
 for pod in $pods; do
@@ -448,6 +446,7 @@ wait_for_endpoint_count gabion-nginx 0
 
 kubectl -n "$namespace" scale deployment/gabion-nginx --replicas=3
 kubectl -n "$namespace" rollout status deployment/gabion-nginx --timeout=120s
+assert_pods_run_image app=gabion-nginx nginx-nginx-module-request-smoke:latest
 wait_for_endpoint_count gabion-nginx 3
 pods="$(wait_for_pods 3)"
 
