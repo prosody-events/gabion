@@ -891,30 +891,31 @@ impl EngineState {
     /// row per node pair each frame.
     async fn snapshot(&self, inspect: Option<u32>) -> ClusterState {
         let fingerprint = self.rule.fingerprint;
-        let mut dumps = Vec::with_capacity(self.nodes.len());
-        for handle in &self.nodes {
-            dumps.push(cell_dump(&handle.admin_tx).await);
-        }
-        // Every origin's own live cells of the watched rule, sorted by (key,
-        // bucket, origin): what every node's replicas are held against. Each
-        // hit is recorded once at its origin (`merge_remote` preserves the wire
-        // origin, so a forwarded replica is never local on a non-origin
+        // Every origin's own live cells of the watched rule, indexed by
+        // (origin, bucket, key): what every node's replicas are held against.
+        // Each hit is recorded once at its origin (`merge_remote` preserves the
+        // wire origin, so a forwarded replica is never local on a non-origin
         // holder), so their sum, the ground-truth windowed total, counts each
         // hit exactly once, and it decays with the window as cells age out.
+        // Each dump is dropped before the next is taken, and the node loop
+        // below takes its own: a node's store holds a replica of every
+        // origin's cells, so keeping every dump would hold N stores at once.
+        // No virtual time passes between the two passes.
         let mut origins: Vec<OriginCell> = Vec::new();
-        for (handle, dump) in self.nodes.iter().zip(&dumps) {
+        let mut index: HashMap<(u128, BucketEpoch, u128), usize> = HashMap::new();
+        for handle in &self.nodes {
             let own = handle.identity.node_id.0;
+            let dump = cell_dump(&handle.admin_tx).await;
             for cell in dump.iter().flat_map(|d| &d.cells) {
                 if cell.origin_node_id == Some(own) && cell.rule_fingerprint == fingerprint {
+                    index.insert((own, cell.bucket, cell.key_hash), origins.len());
                     origins.push(OriginCell {
-                        at: (cell.key_hash, cell.bucket, own),
                         count: cell.count,
                         updated_ms: cell.last_update_millis,
                     });
                 }
             }
         }
-        origins.sort_unstable_by_key(|cell| cell.at);
         let oracle_total = origins.iter().map(|cell| cell.count).sum();
         // Which origin cells the node being read holds at their origin's count.
         let mut held = vec![false; origins.len()];
@@ -931,7 +932,8 @@ impl EngineState {
             }
         }
         // Ascending id order, the order the page lays the nodes out in.
-        for (pos, (handle, dump)) in self.nodes.iter().zip(&dumps).enumerate() {
+        for (pos, handle) in self.nodes.iter().enumerate() {
+            let dump = cell_dump(&handle.admin_tx).await;
             held.fill(false);
             for cell in dump.iter().flat_map(|d| &d.cells) {
                 if cell.rule_fingerprint != fingerprint {
@@ -940,9 +942,7 @@ impl EngineState {
                 let Some(origin) = cell.origin_node_id else {
                     continue;
                 };
-                if let Ok(i) =
-                    origins.binary_search_by_key(&(cell.key_hash, cell.bucket, origin), |o| o.at)
-                {
+                if let Some(&i) = index.get(&(origin, cell.bucket, cell.key_hash)) {
                     held[i] = cell.count >= origins[i].count;
                 }
             }
@@ -1082,8 +1082,6 @@ fn addr_of_id(id: u32) -> SocketAddr {
 
 /// One origin's own cell of the watched rule, as the snapshot reads it.
 struct OriginCell {
-    /// The cell's (key, bucket, origin node id).
-    at: (u128, BucketEpoch, u128),
     count: u64,
     /// When the origin last recorded into it, in virtual ms.
     updated_ms: u64,

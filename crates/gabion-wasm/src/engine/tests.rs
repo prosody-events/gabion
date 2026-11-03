@@ -3,7 +3,7 @@
 //! These exercise the exact `run_engine` the wasm `Sim` spawns: the engine is
 //! spawned as a `spawn_local` task on a paused current-thread runtime and
 //! driven over the command channel, validating "spawn once, drive forever"
-//! (Phase 0.5) and the `CellDump` + logging shims (Phase 1).
+//! and the `CellDump` + logging shims.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -145,7 +145,7 @@ fn node_ids(state: &ClusterState) -> Vec<u32> {
     state.nodes.iter().map(|n| n.id).collect()
 }
 
-/// Phase 0.5: a spawned engine survives many `step` commands, with the gossip
+/// A spawned engine survives many `step` commands, with the gossip
 /// tick index and per-node `rounds_heartbeat` accumulating monotonically.
 #[test]
 fn engine_accumulates_ticks_across_many_steps() {
@@ -168,7 +168,7 @@ fn engine_accumulates_ticks_across_many_steps() {
     });
 }
 
-/// Phase 1: submitting a request creates a cell on the local node (visible
+/// Submitting a request creates a cell on the local node (visible
 /// both as a `CellCreated` event and via the `CellDump` snapshot) and the hit
 /// gossips to the other node, where the aggregate converges to the oracle.
 #[test]
@@ -353,7 +353,7 @@ fn oracle_total_is_windowed_and_counts_each_origin_once() {
     });
 }
 
-/// Phase 1: a blocked link stops propagation (the logging transport records
+/// A blocked link stops propagation (the logging transport records
 /// drops), and healing the link lets the cluster converge.
 #[test]
 fn partition_blocks_then_heal_converges() {

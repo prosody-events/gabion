@@ -245,7 +245,7 @@ fully usable phone layout.
 
 ## Tests
 
-`pnpm run screenshot` is the functional smoke (twenty tests, one project at
+`pnpm run screenshot` is the functional smoke (twenty-one tests, one project at
 1440 px in the light theme): it boots the real core, gossips a burst to every
 node, selects, adds and removes nodes, drives every control and checks the
 inspector, reading numbers from the node table. `pnpm run audit` is the design
@@ -258,8 +258,7 @@ rule window, with unequal zones over a window that opens at a kept mark, and
 with one node, the share window at any snapshot rate, the stage geometry for
 every zone count (at the widest and the narrowest stage, with facing discs of
 neighbouring rings kept apart), that every drawn beam matches a packet of every
-kind, that a
-paused stage's labels are not rebuilt per snapshot, and the interactions, with
+kind, that a paused stage's labels are not rebuilt per snapshot, and the interactions, with
 touch. Full-page PNGs land in `audit-shots/`, which is gitignored; CI uploads it
 as a workflow artifact. All of it downloads a browser, so, like the node
 `smoke.cjs`, it is an on-demand and CI run, not part of `make wasm-check`. On the
@@ -267,11 +266,10 @@ machine that wrote this the whole audit takes about four and a half minutes with
 
 ## Why no `vite-plugin-wasm`
 
-The plan named `vite-plugin-wasm`, but the wasm package is built with
+The app needs no `vite-plugin-wasm`: the wasm package is built with
 `wasm-pack --target web` (see `build:wasm` in `package.json`), whose glue loads
-the module via `new URL('…_bg.wasm', import.meta.url)`. Vite resolves and emits
-that natively, so no plugin is needed — one fewer dependency and no
-top-level-await shim. `--target web` also keeps its output isolated in
+the module via `new URL('…_bg.wasm', import.meta.url)`, which Vite resolves and
+emits natively: one fewer dependency and no top-level-await shim. `--target web` also keeps its output isolated in
 `src/wasm/`, leaving the node-target `../pkg/` (used by `smoke.cjs`) untouched.
 
 ## Numeric boundary
