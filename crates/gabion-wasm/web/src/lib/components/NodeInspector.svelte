@@ -13,6 +13,7 @@
   // slot the Strata fills (§3, the per-bucket window view).
   let {
     node,
+    peers,
     oracleTotal,
     ruleLimit,
     burstHits,
@@ -22,6 +23,8 @@
     children,
   }: {
     node: NodeState;
+    /** The node's peer table, as the snapshot inspecting it reports it. */
+    peers: PeerView[];
     /** The windowed ground-truth cluster total — the reference this node's view
      *  is racing toward. */
     oracleTotal: number;
@@ -49,15 +52,15 @@
   // fields cross the wasm boundary as `undefined` (not `null`) when None, so the
   // checks here are the loose `!= null` that catches both.
   const sortedPeers = $derived(
-    [...node.peers].sort((a, b) => {
+    [...peers].sort((a, b) => {
       const aKnown = a.node_id != null;
       const bKnown = b.node_id != null;
       if (aKnown !== bKnown) return aKnown ? -1 : 1;
       return (a.id ?? Number.MAX_SAFE_INTEGER) - (b.id ?? Number.MAX_SAFE_INTEGER);
     }),
   );
-  const knownPeers = $derived(node.peers.filter((p) => p.node_id != null).length);
-  const pendingPeers = $derived(node.peers.length - knownPeers);
+  const knownPeers = $derived(peers.filter((p) => p.node_id != null).length);
+  const pendingPeers = $derived(peers.length - knownPeers);
 
   /** Shorten a 32-nibble hex id for display; full value stays available on hover
    *  and in the identity footer. Mirrors the Strata's key shortening. */
@@ -159,16 +162,16 @@
   <section class="section">
     <h3 class="section-head">Peers</h3>
     <p class="peer-summary">
-      <span class="numeric">{node.peers.length}</span> tracked
+      <span class="numeric">{peers.length}</span> tracked
       <span class="dot-sep">·</span>
       <span class="numeric">{knownPeers}</span> known
       <span class="dot-sep">·</span>
       <span class="numeric">{pendingPeers}</span> pending
-      {#if node.peers.length > 0 && pendingPeers === 0}
+      {#if peers.length > 0 && pendingPeers === 0}
         <span class="badge ok inline" role="status">✓ all known</span>
       {/if}
     </p>
-    {#if node.peers.length === 0}
+    {#if peers.length === 0}
       <p class="peer-empty">No peers yet — this node is alone.</p>
     {:else}
       <div class="peer-scroll">

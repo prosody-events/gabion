@@ -110,8 +110,9 @@ pub enum PacketKind {
 }
 
 impl PacketKind {
-    /// Whether the packet carries cells (data) rather than only a header
-    /// (control).
+    /// Whether the kind streams cells (data) rather than controlling the
+    /// streams (control). Classed by kind alone, so a closing packet or an
+    /// empty sweep page counts as data even when it holds no cell.
     fn carries_cells(self) -> bool {
         matches!(self, Self::Own | Self::Relay | Self::Sweep)
     }
@@ -158,13 +159,17 @@ pub struct EventBatch {
     pub tick: u64,
 }
 
-/// Full per-node cluster state, pulled on seek / re-render. Bounded by
-/// `nodes × cell_capacity`.
+/// Per-node cluster state, pulled every frame. Only the inspected node's cells
+/// and peer rows are included, so the frame costs one row per node rather than
+/// one per node pair.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ClusterState {
     pub virtual_ms: u64,
     pub tick: u64,
     pub nodes: Vec<NodeState>,
+    /// The inspected node's rows; `None` when no node is inspected or the
+    /// inspected id is not live.
+    pub inspected: Option<Inspected>,
     /// Every zone in index order, with its live members.
     pub zones: Vec<ZoneView>,
     /// Bytes every sender put on the wire since the session began, delivered
@@ -183,6 +188,16 @@ pub struct ClusterState {
     pub bucket_epoch_now: u32,
 }
 
+/// The rows of the one node the page inspects, read at the same instant as
+/// the rest of the snapshot.
+#[derive(Clone, Debug, Serialize)]
+pub struct Inspected {
+    /// The inspected node's stable id.
+    pub id: u32,
+    pub cells: Vec<CellView>,
+    pub peers: Vec<PeerView>,
+}
+
 /// One zone and how many live nodes are placed in it.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct ZoneView {
@@ -197,8 +212,9 @@ pub struct BytesByTier {
     pub cross_zone: ClassBytes,
 }
 
-/// Bytes sent, by class. Data is `Own`, `Relay` and `Sweep` packets; control
-/// is acks, probes and their answers, gap reports and sweep requests.
+/// Bytes sent, by class, classed by packet kind. Data is `Own`, `Relay` and
+/// `Sweep` packets; control is acks, probes and their answers, gap reports and
+/// sweep requests.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct ClassBytes {
     pub data: u64,
@@ -265,8 +281,6 @@ pub struct NodeState {
     pub decode_reject_count: u64,
     /// CRDT store occupancy and saturation counters.
     pub store_stats: StoreStats,
-    pub cells: Vec<CellView>,
-    pub peers: Vec<PeerView>,
 }
 
 /// Mirror of [`gabion::crdt::CellStoreStats`] — the CRDT store's occupancy and

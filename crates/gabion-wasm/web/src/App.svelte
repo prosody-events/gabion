@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { Sim } from './lib/sim/sim';
   import { readTheme, watchTheme } from './lib/theme';
-  import type { ClusterState, EventBatch, SimConfig, SimEvent } from './lib/sim/types';
+  import type { ClusterState, EventBatch, Inspected, SimConfig, SimEvent } from './lib/sim/types';
   import { ChartHistory } from './lib/charts/history';
   import {
     DEFAULT_PRESET,
@@ -115,6 +115,13 @@
   $effect(() => {
     if (selectedId !== null && !nodeIds.includes(selectedId)) selectedId = null;
   });
+  // The selected node's cells and peer rows. A snapshot carries them for the
+  // node it was taken inspecting alone, so `inspected` keeps the last rows for
+  // the selection, and `select` fetches them before the selection moves.
+  let inspected = $state<Inspected | null>(null);
+  const selectedRows = $derived(
+    inspected !== null && inspected.id === selectedId ? inspected : null,
+  );
 
   // The rolling chart history is a plain (non-reactive) structure — 600 samples
   // under a deep `$state` proxy would cost on every frame. `chartVersion` is the
@@ -218,7 +225,7 @@
 
   async function refresh(): Promise<void> {
     if (sim === null) return;
-    applySnapshot(await sim.snapshot());
+    applySnapshot(await sim.snapshot(selectedId));
   }
 
   /** Adopt a fresh snapshot as the current state and append it to the chart
@@ -226,6 +233,7 @@
    *  step. */
   function applySnapshot(snap: ClusterState): void {
     cluster = snap;
+    if (snap.inspected != null && snap.inspected.id === selectedId) inspected = snap.inspected;
     tick = snap.tick;
     virtualMs = snap.virtual_ms;
     history.push(snap);
@@ -288,7 +296,7 @@
     try {
       await injectTraffic(deltaMs);
       showEvents(await sim.step(deltaMs));
-      applySnapshot(await sim.snapshot());
+      applySnapshot(await sim.snapshot(selectedId));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -303,7 +311,22 @@
     if (sim === null) return;
     try {
       showEvents(await sim.submitRequest(node, WATCHED_KEY, burstHits));
-      if (!playing) applySnapshot(await sim.snapshot());
+      if (!playing) applySnapshot(await sim.snapshot(selectedId));
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      pause();
+    }
+  }
+
+  /** Select node `id`, once a snapshot inspecting it has its rows, so the
+   *  inspector opens on them rather than on nothing. */
+  async function select(id: number): Promise<void> {
+    if (sim === null) return;
+    try {
+      const snap = await sim.snapshot(id);
+      selectedId = id;
+      inspected = snap.inspected ?? null;
+      cluster = snap;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -331,7 +354,7 @@
     if (sim === null) return;
     try {
       await sim.addNode();
-      applySnapshot(await sim.snapshot());
+      applySnapshot(await sim.snapshot(selectedId));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -345,7 +368,7 @@
     if (sim === null) return;
     try {
       await sim.removeNode(id);
-      applySnapshot(await sim.snapshot());
+      applySnapshot(await sim.snapshot(selectedId));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       pause();
@@ -454,7 +477,7 @@
             {cluster}
             {events}
             {selectedId}
-            onSelect={(node) => (selectedId = node)}
+            onSelect={(node) => void select(node)}
             onDeselect={() => (selectedId = null)}
             onDeleteNode={(id) => void removeNode(id)}
             {theme}
@@ -463,9 +486,10 @@
         <div class="detail-rail">
           <HeadlineMetric {cluster} {history} version={chartVersion} />
           <div class="rail-body">
-            {#if selectedNode !== null}
+            {#if selectedNode !== null && selectedRows !== null}
               <NodeInspector
                 node={selectedNode}
+                peers={selectedRows.peers}
                 oracleTotal={cluster?.oracle_total ?? 0}
                 ruleLimit={appliedKnobs.rule_limit}
                 {burstHits}
@@ -474,7 +498,7 @@
                 onClose={() => (selectedId = null)}
               >
                 <BucketStrata
-                  cells={selectedNode.cells}
+                  cells={selectedRows.cells}
                   currentEpoch={cluster?.bucket_epoch_now ?? 0}
                   epochFraction={((cluster?.virtual_ms ?? 0) % defaults.rule_bucket_ms) /
                     defaults.rule_bucket_ms}

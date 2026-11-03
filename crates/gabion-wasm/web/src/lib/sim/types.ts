@@ -168,6 +168,12 @@ export interface NodeState {
   /** Inbound packets the wire decoder rejected. */
   decode_reject_count: number;
   store_stats: StoreStats;
+}
+
+/** Mirror of `crate::event::Inspected`: the inspected node's cells and peer
+ *  rows, read at the same instant as the rest of the snapshot. */
+export interface Inspected {
+  id: number;
   cells: CellView[];
   peers: PeerView[];
 }
@@ -191,12 +197,16 @@ export interface BytesByTier {
   cross_zone: ClassBytes;
 }
 
-/** Mirror of `crate::event::ClusterState` — the full per-node dump pulled on
- *  seek / re-render. `oracle_total` is the simulator-only ground truth. */
+/** Mirror of `crate::event::ClusterState` — every node's state, pulled each
+ *  frame, with one inspected node's rows. `oracle_total` is the simulator-only
+ *  ground truth. */
 export interface ClusterState {
   virtual_ms: number;
   tick: number;
   nodes: NodeState[];
+  /** The rows of the node the snapshot was taken inspecting; absent when none
+   *  was, or it is not live. */
+  inspected?: Inspected;
   /** Every zone in index order, with its live members. */
   zones: ZoneView[];
   bytes_by_tier: BytesByTier;

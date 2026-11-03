@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::num::NonZeroU8;
 
 use gabion::defaults;
 use gabion::gossip::{AnswerState, Role};
@@ -17,7 +16,9 @@ use tokio::task::LocalSet;
 
 use super::{Command, EngineError, EngineState, LinkPolicyKind, VIZ_ROUTER_CAPACITY, run_engine};
 use crate::config::{MAX_NODES, SimConfig, ZoneMode};
-use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, PacketKind, Tier};
+use crate::event::{
+    CellView, ClusterState, Event, EventBatch, EventKind, Inspected, PacketKind, PeerView, Tier,
+};
 
 const WATCHED_KEY: u128 = 0x1;
 
@@ -94,9 +95,21 @@ async fn submit(tx: &mpsc::Sender<Command>, node: u32, key: u128, hits: u64) -> 
 }
 
 async fn snapshot(tx: &mpsc::Sender<Command>) -> ClusterState {
+    snapshot_inspecting(tx, None).await
+}
+
+async fn snapshot_inspecting(tx: &mpsc::Sender<Command>, inspect: Option<u32>) -> ClusterState {
     let (reply, rx) = oneshot::channel();
-    tx.send(Command::Snapshot { reply }).await.unwrap();
+    tx.send(Command::Snapshot { inspect, reply }).await.unwrap();
     rx.await.unwrap()
+}
+
+/// Node `id`'s cells and peer rows, as the snapshot inspecting it reports them.
+async fn inspect(tx: &mpsc::Sender<Command>, id: u32) -> Inspected {
+    snapshot_inspecting(tx, Some(id))
+        .await
+        .inspected
+        .expect("a live node")
 }
 
 async fn set_link(tx: &mpsc::Sender<Command>, src: u32, dst: u32, policy: LinkPolicyKind) {
@@ -174,7 +187,8 @@ fn submit_creates_and_gossips_a_cell() {
         assert_eq!(before.oracle_total, 5);
         assert_eq!(before.nodes[0].aggregate_total, 5);
         assert!(
-            before.nodes[0]
+            inspect(&tx, 0)
+                .await
                 .cells
                 .iter()
                 .any(|c| c.key == WATCHED_KEY && c.count == 5 && c.is_local),
@@ -212,7 +226,8 @@ fn submit_creates_and_gossips_a_cell() {
         );
         // Node 1's copy is a remote (non-local) cell.
         assert!(
-            after.nodes[1]
+            inspect(&tx, 1)
+                .await
                 .cells
                 .iter()
                 .any(|c| c.key == WATCHED_KEY && c.count == 5 && !c.is_local),
@@ -233,7 +248,7 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
     };
     with_state(config, |mut state| async move {
         state.submit_request(0, 0, 7).await.unwrap();
-        let origin = state.snapshot().await.nodes.swap_remove(0);
+        let origin = state.snapshot(None).await.nodes.swap_remove(0);
         assert_eq!(origin.id, 0);
         assert!(
             origin.error_budget > 0,
@@ -248,11 +263,11 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
 
         // Checkpoint A, the peer mirror: the rows the page shows are the rows
         // the runtime reports, read at the same virtual instant.
-        let snap = state.snapshot().await;
+        let snap = state.snapshot(Some(0)).await;
         let direct = super::admin_snapshot(&state.nodes[0].admin_tx)
             .await
             .expect("node 0 runs");
-        let rows = &snap.nodes[0].peers;
+        let rows = &snap.inspected.expect("node 0 is live").peers;
         assert_eq!(rows.len(), direct.peers.len());
         for (row, entry) in rows.iter().zip(&direct.peers) {
             assert_eq!(row.role, entry.role);
@@ -271,7 +286,7 @@ fn error_budget_and_gateway_counters_surface_in_snapshot() {
         // Checkpoint B, the counter mirror: each node's counters are the
         // library's own fields.
         state.step(T_U + 3 * T).await;
-        let snap = state.snapshot().await;
+        let snap = state.snapshot(None).await;
         for (node, handle) in snap.nodes.iter().zip(&state.nodes) {
             let c = super::counters(&handle.admin_tx).await.expect("runs");
             assert_eq!(node.gateway_failovers, c.gateway_failovers);
@@ -619,18 +634,18 @@ fn one_heartbeat_reaches_the_zone_and_one_gateway_per_remote_zone() {
         warm(&mut state).await;
         state.submit_request(0, WATCHED_KEY, 5).await.unwrap();
         assert_eq!(
-            known(&state.snapshot().await),
+            known(&state.snapshot(None).await),
             [0],
             "the submit alone gossips nothing"
         );
         state.step(T).await;
         assert_eq!(
-            known(&state.snapshot().await),
+            known(&state.snapshot(None).await),
             [0, 0, 0, 0, 1, 2],
             "the zone's four nodes and one gateway in each other zone"
         );
         state.step(T).await;
-        assert_eq!(known(&state.snapshot().await).len(), 12, "the relays");
+        assert_eq!(known(&state.snapshot(None).await).len(), 12, "the relays");
         state
     });
 }
@@ -656,9 +671,9 @@ where
 }
 
 /// `test_config` with its nodes placed in `zones` zones.
-fn zoned(nodes: usize, zones: u8) -> SimConfig {
+fn zoned(nodes: usize, zones: usize) -> SimConfig {
     SimConfig {
-        zones: NonZeroU8::new(zones).unwrap(),
+        zones,
         ..test_config(nodes)
     }
 }
@@ -681,13 +696,30 @@ fn zone_of(state: &ClusterState, id: u32) -> u8 {
 
 /// `origin`'s gateway into `zone`, as its runtime reports it.
 async fn gateway_of(state: &EngineState, origin: u32, zone: u8) -> u32 {
-    let snap = state.snapshot().await;
-    let node = snap.nodes.iter().find(|n| n.id == origin).expect("origin");
-    node.peers
+    peers_of(state, origin)
+        .await
         .iter()
         .find(|p| p.role == Role::Gateway && p.zone == Some(zone))
         .and_then(|p| p.id)
         .expect("a gateway")
+}
+
+/// Node `id`'s cells, as the snapshot inspecting it reports them.
+async fn cells_of(state: &EngineState, id: u32) -> Vec<CellView> {
+    inspected(state, id).await.cells
+}
+
+/// Node `id`'s peer rows, as the snapshot inspecting it reports them.
+async fn peers_of(state: &EngineState, id: u32) -> Vec<PeerView> {
+    inspected(state, id).await.peers
+}
+
+async fn inspected(state: &EngineState, id: u32) -> Inspected {
+    state
+        .snapshot(Some(id))
+        .await
+        .inspected
+        .expect("a live node")
 }
 
 /// Cut `g` off from every other live node, in both directions.
@@ -783,7 +815,7 @@ fn zones_come_from_config_not_address() {
         warm(&mut state).await;
         state.submit_request(0, WATCHED_KEY, 5).await.unwrap();
         let events = state.step(T).await.events;
-        let snap = state.snapshot().await;
+        let snap = state.snapshot(None).await;
 
         let own = sent(&events, 0, PacketKind::Own);
         assert_eq!(
@@ -837,7 +869,7 @@ fn relay_follows_one_prompt_interval_after_the_gateway_hears() {
                 _ => None,
             })
             .expect("the gateway receives it");
-        let snap = state.snapshot().await;
+        let snap = state.snapshot(None).await;
         let relays = sent(&events, g, PacketKind::Relay);
         assert_eq!(relays.len(), 3, "to the gateway's three zone peers");
         for (dst, _, at) in relays {
@@ -871,7 +903,7 @@ fn silent_gateway_fails_over_within_suspect_after() {
         assert_ne!(to, g);
 
         state.step(3 * T).await;
-        let snap = state.snapshot().await;
+        let snap = state.snapshot(None).await;
         for node in snap.nodes.iter().filter(|n| n.zone == 1 && n.id != g) {
             assert_eq!(node.aggregate_total, snap.oracle_total, "node {}", node.id);
         }
@@ -927,7 +959,7 @@ fn one_way_cut_is_repaired_by_the_backstop() {
         assert!(failed_over, "the origin left the gateway that cannot relay");
         let t1 = t1.expect("the cut swallowed a relay, but none was dropped");
         assert_eq!(state.virtual_ms, t1 + T_U + 3 * T + 2 * F_R);
-        let snap = state.snapshot().await;
+        let snap = state.snapshot(None).await;
         for node in snap.nodes.iter().filter(|n| n.zone == 1) {
             assert_eq!(node.aggregate_total, snap.oracle_total, "node {}", node.id);
         }
@@ -946,7 +978,7 @@ fn one_way_cut_is_repaired_by_the_backstop() {
 fn zone_partition_heals_to_exact_counts() {
     with_state(zoned(5, 3), |mut state| async move {
         let mut all = warm(&mut state).await;
-        let lone = state.snapshot().await.zones[2].live;
+        let lone = state.snapshot(None).await.zones[2].live;
         assert_eq!(lone, 1, "zone c's gateway has no replacement");
         let cut: Vec<u32> = state
             .nodes
@@ -981,7 +1013,7 @@ fn zone_partition_heals_to_exact_counts() {
                 .events,
         );
         all.extend(state.step(3_000).await.events);
-        for node in &state.snapshot().await.nodes {
+        for node in &state.snapshot(None).await.nodes {
             let side = if node.zone == 2 { 4 } else { 3 };
             assert_eq!(
                 node.aggregate_total, side,
@@ -991,32 +1023,34 @@ fn zone_partition_heals_to_exact_counts() {
         }
         state.heal();
         all.extend(state.step(3 * T).await.events);
-        let snap = state.snapshot().await;
+        let snap = state.snapshot(None).await;
+        let mut cells = Vec::new();
+        for node in &snap.nodes {
+            cells.push((node.id, cells_of(&state, node.id).await));
+        }
 
         let rule = state.rule.fingerprint;
-        let buckets: BTreeSet<u32> = snap
-            .nodes
+        let buckets: BTreeSet<u32> = cells
             .iter()
-            .flat_map(|n| &n.cells)
+            .flat_map(|(_, cells)| cells)
             .filter(|c| c.rule == rule)
             .map(|c| c.bucket)
             .collect();
         assert!(!buckets.is_empty(), "the hits left cells");
         for bucket in buckets {
             let oracle = bucket_count(
-                snap.nodes
+                cells
                     .iter()
-                    .flat_map(|n| &n.cells)
+                    .flat_map(|(_, cells)| cells)
                     .filter(|c| c.is_local),
                 rule,
                 bucket,
             );
-            for node in &snap.nodes {
+            for (id, cells) in &cells {
                 assert_eq!(
-                    bucket_count(node.cells.iter(), rule, bucket),
+                    bucket_count(cells.iter(), rule, bucket),
                     oracle,
-                    "node {} bucket {bucket}",
-                    node.id
+                    "node {id} bucket {bucket}"
                 );
             }
         }
@@ -1057,14 +1091,16 @@ fn unset_zone_mode_runs_as_one_zone() {
             let cross = own.iter().filter(|p| p.1 == Tier::CrossZone).count();
             assert_eq!(cross, 8, "node {node}: eight peers are in other zones");
         }
-        let snap = state.snapshot().await;
-        assert!(
-            snap.nodes
-                .iter()
-                .flat_map(|n| &n.peers)
-                .all(|p| p.zone.is_none()),
-            "nodes told no zone report none"
-        );
+        let snap = state.snapshot(None).await;
+        for node in 0..12 {
+            assert!(
+                peers_of(&state, node)
+                    .await
+                    .iter()
+                    .all(|p| p.zone.is_none()),
+                "node {node}, told no zone, reports none"
+            );
+        }
         assert_bytes_by_tier(&all, &snap);
         state
     });
@@ -1116,7 +1152,7 @@ fn gateway_events_fetch_snapshots_only_on_role_change() {
 fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
     with_state(zoned(5, 3), |mut state| async move {
         let live = |snap: &ClusterState| snap.zones.iter().map(|z| z.live).collect::<Vec<_>>();
-        let snap = state.snapshot().await;
+        let snap = state.snapshot(None).await;
         assert_eq!(live(&snap), [2, 2, 1], "placement is node i mod 3");
         let names: Vec<_> = snap.zones.iter().map(|z| z.name).collect();
         assert_eq!(names, ["zone-a", "zone-b", "zone-c"]);
@@ -1125,7 +1161,7 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
         // there.
         for (ask, lands) in [(None, 2), (None, 0), (Some(0), 0)] {
             state.add_node(ask).await.expect("the node joins");
-            let snap = state.snapshot().await;
+            let snap = state.snapshot(None).await;
             let joiner = snap.nodes.last().expect("a joiner");
             assert_eq!(joiner.zone, lands, "asked for {ask:?}");
         }
@@ -1148,7 +1184,7 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
             refused.err()
         );
         state.add_node(None).await.expect("the node joins");
-        let snap = state.snapshot().await;
+        let snap = state.snapshot(None).await;
         assert_eq!(
             snap.nodes.last().map(|n| n.id),
             Some(8),
@@ -1158,8 +1194,25 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
     });
 }
 
+/// The `(origin, from, to)` of every `GatewayChanged` into `zone`.
+fn gateway_moves(events: &[Event], zone: u8) -> Vec<(u32, Option<u32>, Option<u32>)> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::GatewayChanged {
+                origin,
+                zone: z,
+                from,
+                to,
+            } if z == zone => Some((origin, from, to)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A zone's last member leaving moves no role, yet every origin hears its
-/// gateway into that zone go, once, at the removal.
+/// gateway into that zone go, once, at the removal: a later role change
+/// diffs those origins again and reports nothing more for that zone.
 #[test]
 fn last_member_leaving_a_zone_reports_its_gateway_gone() {
     with_state(zoned(5, 3), |mut state| async move {
@@ -1168,29 +1221,22 @@ fn last_member_leaving_a_zone_reports_its_gateway_gone() {
         for origin in [0, 1, 3, 4] {
             assert_eq!(gateway_of(&state, origin, 2).await, 2, "origin {origin}");
         }
-        let gone = |events: &[Event]| -> Vec<(u32, Option<u32>, Option<u32>)> {
-            events
-                .iter()
-                .filter_map(|e| match e.kind {
-                    EventKind::GatewayChanged {
-                        origin,
-                        zone: 2,
-                        from,
-                        to,
-                    } => Some((origin, from, to)),
-                    _ => None,
-                })
-                .collect()
-        };
         let removal = state.remove_node(2).await.unwrap().events;
         assert_eq!(
-            gone(&removal),
+            gateway_moves(&removal, 2),
             [0, 1, 3, 4].map(|o| (o, Some(2), None)),
             "one report per origin"
         );
-        let later = state.step(3 * T).await.events;
+
+        // Silencing origin 0's gateway into zone b fails it over, which moves
+        // its roles and diffs it again.
+        let g = gateway_of(&state, 0, 1).await;
+        silence(&mut state, g);
+        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        let later = state.step(T_U + 3 * T + 2 * F_R + T).await.events;
+        assert!(failover(&later, 0, 1, g).is_some(), "origin 0 fails over");
         assert_eq!(
-            gone(&later),
+            gateway_moves(&later, 2),
             [],
             "reported once, not again at the next role change"
         );
@@ -1499,5 +1545,89 @@ fn second_burst_after_expiry_still_ages_out() {
                 .map(|n| n.aggregate_total)
                 .collect::<Vec<_>>(),
         );
+    });
+}
+
+/// A departed gateway whose zone still has members is reported gone too,
+/// though no row left in that zone can replace it: node 0 has never heard
+/// node 3, so node 1 was its only gateway into zone b. Only the origins that
+/// used node 1 report it.
+#[test]
+fn a_departed_gateway_is_reported_gone_while_its_zone_lives_on() {
+    with_state(zoned(4, 2), |mut state| async move {
+        state.set_link_policy(0, 3, LinkPolicyKind::Block).unwrap();
+        state.set_link_policy(3, 0, LinkPolicyKind::Block).unwrap();
+        warm(&mut state).await;
+        assert_eq!(gateway_of(&state, 0, 1).await, 1);
+        let mut users = Vec::new();
+        for origin in [0, 2] {
+            if gateway_of(&state, origin, 1).await == 1 {
+                users.push((origin, Some(1), None));
+            }
+        }
+        let removal = state.remove_node(1).await.unwrap().events;
+        assert_eq!(gateway_moves(&removal, 1), users);
+        assert!(
+            gateway_moves(&removal, 0).is_empty(),
+            "no gateway into zone a moved"
+        );
+        state
+    });
+}
+
+/// The snapshot carries the inspected node's rows alone, read from that
+/// node's runtime, and none when no live node is inspected.
+#[test]
+fn snapshot_carries_only_the_inspected_nodes_rows() {
+    with_state(zoned(6, 3), |mut state| async move {
+        state.submit_request(4, WATCHED_KEY, 3).await.unwrap();
+        warm(&mut state).await;
+        let snap = state.snapshot(Some(4)).await;
+        let rows = snap.inspected.expect("node 4 is live");
+        assert_eq!(rows.id, 4);
+        let peers: BTreeSet<_> = rows.peers.iter().filter_map(|p| p.id).collect();
+        assert_eq!(peers, BTreeSet::from([0, 1, 2, 3, 5]), "node 4's peers");
+        assert!(
+            rows.cells.iter().any(|c| c.is_local && c.count == 3),
+            "node 4's own cell"
+        );
+        let replica = cells_of(&state, 0).await;
+        assert!(
+            !replica.is_empty() && replica.iter().all(|c| !c.is_local && c.origin == Some(4)),
+            "node 0 holds node 4's cell as a replica: {replica:?}"
+        );
+        assert!(state.snapshot(None).await.inspected.is_none());
+        state.remove_node(4).await.unwrap();
+        assert!(
+            state.snapshot(Some(4)).await.inspected.is_none(),
+            "a departed node has no rows"
+        );
+        state
+    });
+}
+
+/// A join past `MAX_NODES` live nodes, or past the last id with a port, is
+/// refused before it spends an id.
+#[test]
+fn a_join_past_the_node_or_id_ceiling_is_refused() {
+    with_state(test_config(MAX_NODES), |mut state| async move {
+        let refused = state.add_node(None).await;
+        assert!(
+            matches!(refused, Err(EngineError::ClusterFull)),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(state.next_id, MAX_NODES as u32, "the refusal spent no id");
+        state.remove_node(0).await.unwrap();
+        state.next_id = super::MAX_ID + 1;
+        let refused = state.add_node(None).await;
+        assert!(
+            matches!(refused, Err(EngineError::IdsExhausted)),
+            "{:?}",
+            refused.err()
+        );
+        state.next_id = super::MAX_ID;
+        state.add_node(None).await.expect("the last id joins");
+        state
     });
 }

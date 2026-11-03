@@ -41,8 +41,8 @@ use tokio::task::{JoinHandle, LocalSet};
 use crate::clock::{ManualClock, SharedNow, Tickers};
 use crate::config::{MAX_NODES, MAX_ZONES, SimConfig, ValidSimConfig, ZONE_NAMES, ZoneMode};
 use crate::event::{
-    BytesByTier, CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView,
-    ZoneView,
+    BytesByTier, CellView, ClusterState, Event, EventBatch, EventKind, Inspected, NodeState,
+    PeerView, ZoneView,
 };
 use crate::shims::{
     AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport, Member,
@@ -50,6 +50,8 @@ use crate::shims::{
 
 /// First UDP port the engine assigns; node `i` binds `BASE_PORT + i`.
 const BASE_PORT: u16 = 40_000;
+/// The last stable id with a port of its own, `BASE_PORT + MAX_ID = 65535`.
+const MAX_ID: u32 = (u16::MAX - BASE_PORT) as u32;
 /// Cluster id mixed into every packet header (matches the bench). Non-zero,
 /// checked when the constant is evaluated.
 pub(crate) const CLUSTER_ID_HASH: NonZeroU128 = NonZeroU128::new(0xC1).unwrap();
@@ -102,6 +104,18 @@ pub enum EngineError {
     )]
     UnknownZone { zone: u32, zones: u8 },
     #[error(
+        "no node can join: the cluster already has {MAX_NODES} live nodes, the most the \
+         visualizer simulates, and every node's peer table and cell store is sized for that many. \
+         Remove a node first."
+    )]
+    ClusterFull,
+    #[error(
+        "no node can join: this session has handed out all {count} node ids, and ids are never \
+         reused, so every join spends one. Reset or reload the page to start a new session.",
+        count = MAX_ID + 1
+    )]
+    IdsExhausted,
+    #[error(
         "the gossip runtime for node {node} has stopped, so the request could not be recorded. \
          The simulation has ended; reload to start over."
     )]
@@ -141,12 +155,15 @@ pub enum Command {
     /// Spawn a fresh cold-start member that bootstraps knowing every current
     /// node. The newcomer takes the next never-reused id; survivors are told it
     /// joined so they gossip to it. Replies with the events the join produced,
-    /// [`EngineError::UnknownZone`] for a zone the cluster does not have, or
-    /// [`EngineError::Setting`] if the newcomer's settings fail to validate.
+    /// [`EngineError::UnknownZone`] for a zone the cluster does not have,
+    /// [`EngineError::ClusterFull`] or [`EngineError::IdsExhausted`] when no
+    /// node can join, or [`EngineError::Setting`] if the newcomer's settings
+    /// fail to validate.
     AddNode {
         /// The zone to join; `None` joins the zone with the fewest live
-        /// members, the lowest index on a tie. A `u32`, so that a JS number
-        /// past 255 is refused rather than wrapped.
+        /// members, the lowest index on a tie. A `u32`, so that an index past
+        /// 255 is refused rather than wrapped onto a zone; wasm-bindgen still
+        /// truncates a JS number to 32 bits on the way in.
         zone: Option<u32>,
         reply: oneshot::Sender<Result<EventBatch, EngineError>>,
     },
@@ -167,8 +184,10 @@ pub enum Command {
         virtual_ms: u64,
         reply: oneshot::Sender<EventBatch>,
     },
-    /// Full per-node cluster snapshot, for seek / re-render.
+    /// Per-node cluster snapshot, with the cells and peer rows of node
+    /// `inspect` alone.
     Snapshot {
+        inspect: Option<u32>,
         reply: oneshot::Sender<ClusterState>,
     },
     /// End the session and shut every runtime down.
@@ -225,8 +244,8 @@ async fn engine_loop(
                 let delta = virtual_ms.saturating_sub(state.virtual_ms);
                 let _ = reply.send(state.step(delta).await);
             }
-            Command::Snapshot { reply } => {
-                let _ = reply.send(state.snapshot().await);
+            Command::Snapshot { inspect, reply } => {
+                let _ = reply.send(state.snapshot(inspect).await);
             }
             Command::Shutdown => break,
         }
@@ -545,6 +564,12 @@ impl EngineState {
     /// newcomer starts with an empty store and catches up by anti-entropy. It
     /// joins `zone`, or the zone with the fewest live members.
     async fn add_node(&mut self, zone: Option<u32>) -> Result<EventBatch, EngineError> {
+        if self.nodes.len() >= MAX_NODES {
+            return Err(EngineError::ClusterFull);
+        }
+        if self.next_id > MAX_ID {
+            return Err(EngineError::IdsExhausted);
+        }
         let zones = self.zone_names.len();
         let zone = match zone {
             None => self.smallest_zone(),
@@ -588,12 +613,12 @@ impl EngineState {
     /// [`EngineState::add_node`]: tell every survivor it left, stop its
     /// runtime, unbind its transport, and drop every trace of it. Its id is
     /// never reused, so survivors keep their own ids and addresses unchanged.
-    /// The removal also reports any gateway into a zone it empties.
+    /// Every survivor whose gateway it was reports that gateway's zone anew.
     async fn remove_node(&mut self, id: u32) -> Result<EventBatch, EngineError> {
         let pos = self
             .position_of(id)
             .ok_or(EngineError::UnknownNode { id })?;
-        let (addr, zone) = (self.nodes[pos].addr, self.nodes[pos].zone);
+        let addr = self.nodes[pos].addr;
         let node_id = self.nodes[pos].identity.node_id.0;
 
         // Tell every *other* node it left first, so they drop it from their
@@ -622,23 +647,12 @@ impl EngineState {
         self.drain_pending().await;
         let mut events = Vec::new();
         self.drain_log(&mut events);
-        // Removing a row moves no role, so the role-count diff never sees a
-        // zone lose its last member: report each origin's gateway into it gone.
-        if self.live_by_zone()[usize::from(zone)] == 0 {
-            let (tick, virtual_ms) = (self.current_tick(), self.virtual_ms);
-            for node in &mut self.nodes {
-                if let Some(from) = node.gateways[usize::from(zone)].take() {
-                    events.push(Event {
-                        tick,
-                        virtual_ms,
-                        kind: EventKind::GatewayChanged {
-                            origin: node.id,
-                            zone,
-                            from: Some(from),
-                            to: None,
-                        },
-                    });
-                }
+        // Removing a row moves no role, so the role-count diff misses the
+        // departed gateway whenever no row left in its zone can replace it
+        // (none there, or none heard yet): diff every survivor that used it.
+        for pos in 0..self.nodes.len() {
+            if self.nodes[pos].gateways.contains(&Some(id)) {
+                self.diff_gateways(pos, &mut events).await;
             }
         }
         Ok(EventBatch {
@@ -869,24 +883,51 @@ impl EngineState {
             .map(|index| index as u8)
     }
 
-    async fn snapshot(&self) -> ClusterState {
+    /// Every node's scalar state, plus the cells and peer rows of `inspect`
+    /// alone: the page shows one node's rows, and every node's would cost a
+    /// row per node pair each frame.
+    async fn snapshot(&self, inspect: Option<u32>) -> ClusterState {
+        let fingerprint = self.rule.fingerprint;
         let mut nodes = Vec::with_capacity(self.nodes.len());
+        let mut inspected = None;
+        let mut oracle_total = 0;
         // Insertion order, so a node's position in `nodes` is its rank — the
         // frontend turns that into a ring slot, while `id` stays its identity.
         for handle in &self.nodes {
-            let cells = match cell_dump(&handle.admin_tx).await {
-                Some(dump) => self.cells_from_dump(handle.identity, &dump),
-                None => Vec::new(),
-            };
+            let dump = cell_dump(&handle.admin_tx).await;
+            // The ground-truth windowed total, derived from the live CRDT
+            // cells rather than a monotonic accumulator: sum every node's
+            // locally-originated cells for the watched rule. Each hit is
+            // recorded once at its origin (`merge_remote` preserves the wire
+            // origin, so a forwarded replica is never local on a non-origin
+            // holder), so the sum counts each hit exactly once — and it decays
+            // with the window as cells age out. This is the honest target the
+            // convergence fan races toward.
+            let own = Some(handle.identity.node_id.0);
+            oracle_total += dump
+                .iter()
+                .flat_map(|d| &d.cells)
+                .filter(|cell| cell.origin_node_id == own && cell.rule_fingerprint == fingerprint)
+                .map(|cell| cell.count)
+                .sum::<u64>();
             // `node_id` / `incarnation` come from the engine's own record of
             // the node, so they survive even if the runtime has
             // already stopped and the admin round-trip returns
             // `None` (defaults for the rest).
             let snap = admin_snapshot(&handle.admin_tx).await;
-            let peers = snap
-                .as_ref()
-                .map(|s| self.peers_from_snapshot(handle.zone, s))
-                .unwrap_or_default();
+            if inspect == Some(handle.id) {
+                inspected = Some(Inspected {
+                    id: handle.id,
+                    cells: dump
+                        .as_ref()
+                        .map(|d| self.cells_from_dump(handle.identity, d))
+                        .unwrap_or_default(),
+                    peers: snap
+                        .as_ref()
+                        .map(|s| self.peers_from_snapshot(handle.zone, s))
+                        .unwrap_or_default(),
+                });
+            }
             let counters = snap.as_ref().map(|s| s.counters).unwrap_or_default();
             nodes.push(NodeState {
                 id: handle.id,
@@ -907,25 +948,8 @@ impl EngineState {
                     .as_ref()
                     .map(|s| s.store_stats.into())
                     .unwrap_or_default(),
-                cells,
-                peers,
             });
         }
-        // The ground-truth windowed total, derived from the live CRDT cells
-        // rather than a monotonic accumulator: sum every node's
-        // locally-originated cells for the watched rule. Each hit is recorded
-        // once at its origin (`merge_remote` preserves the wire origin, so a
-        // forwarded replica is never `is_local` on a non-origin holder), so the
-        // sum counts each hit exactly once — and it decays with the window as
-        // cells age out, which a monotonic counter never did. This is the
-        // honest target the convergence fan races toward.
-        let fingerprint = self.rule.fingerprint;
-        let oracle_total: u64 = nodes
-            .iter()
-            .flat_map(|node| &node.cells)
-            .filter(|cell| cell.is_local && cell.rule == fingerprint)
-            .map(|cell| cell.count)
-            .sum();
         let live = self.live_by_zone();
         let zones = ZONE_NAMES[..self.zone_names.len()]
             .iter()
@@ -936,6 +960,7 @@ impl EngineState {
             virtual_ms: self.virtual_ms,
             tick: self.current_tick(),
             nodes,
+            inspected,
             zones,
             bytes_by_tier: self.bytes_by_tier,
             oracle_total,
@@ -1004,6 +1029,7 @@ impl EngineState {
 /// It is therefore also the address a newcomer bootstraps against and the one a
 /// removal unbinds, with no lookup needed.
 fn addr_of_id(id: u32) -> SocketAddr {
+    debug_assert!(id <= MAX_ID, "add_node spends no id past MAX_ID");
     SocketAddr::from(([127, 0, 0, 1], BASE_PORT + id as u16))
 }
 

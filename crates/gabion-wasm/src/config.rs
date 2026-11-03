@@ -5,7 +5,6 @@
 //! build theirs. A multi-rule mix is a future extension (it becomes a `Vec`
 //! here).
 
-use std::num::NonZeroU8;
 use std::time::Duration;
 
 use gabion::crdt::{RuleDescriptor, ValidStorageConfig};
@@ -63,9 +62,10 @@ pub struct SimConfig {
     /// i.i.d. per-link packet drop probability applied to every directed
     /// link at startup. `0.0` is a lossless network.
     pub uniform_loss: f64,
-    /// Zones nodes are placed in, `1..=MAX_ZONES`: node `i` at build in zone
-    /// `i mod zones`.
-    pub zones: NonZeroU8,
+    /// Zones nodes are placed in: node `i` at build in zone `i mod zones`.
+    /// Must be in `1..=MAX_ZONES`; [`SimConfig::validate`] rejects anything
+    /// else, so a zero from a shared URL gets the same message as a seven.
+    pub zones: usize,
     pub zone_mode: ZoneMode,
 }
 
@@ -87,7 +87,7 @@ impl Default for SimConfig {
             rule_window_ms: 10_000,
             rule_bucket_ms: 1_000,
             uniform_loss: 0.0,
-            zones: NonZeroU8::MIN,
+            zones: 1,
             zone_mode: ZoneMode::Configured,
         }
     }
@@ -110,9 +110,9 @@ pub enum ConfigError {
     LossOutOfRange { got: f64 },
     #[error(
         "zone count {got} is out of range: the visualizer places nodes in 1 to {MAX_ZONES} zones. \
-         Lower `zones` in the controls or shared URL."
+         Set `zones` in the controls or shared URL to a count in that range."
     )]
-    ZonesOutOfRange { got: u8 },
+    ZonesOutOfRange { got: usize },
     #[error(transparent)]
     Setting(#[from] SettingError),
     /// The watched rule, as `RuleDef::build` refuses it for both adapters.
@@ -150,11 +150,8 @@ impl SimConfig {
                 got: self.uniform_loss,
             });
         }
-        let zones = usize::from(self.zones.get());
-        if zones > MAX_ZONES {
-            return Err(ConfigError::ZonesOutOfRange {
-                got: self.zones.get(),
-            });
+        if !(1..=MAX_ZONES).contains(&self.zones) {
+            return Err(ConfigError::ZonesOutOfRange { got: self.zones });
         }
         let settings = self.settings()?;
         let (_, storage) = settings.validate()?;
@@ -173,7 +170,7 @@ impl SimConfig {
         // The input is the compile-time `ZONE_NAMES` table, the
         // constant-input exception CLAUDE.md allows (as for `stable_hasher`'s
         // secret); `built_in_zone_names_are_valid_and_hash_apart` pins it.
-        let zone_names = ZONE_NAMES[..zones]
+        let zone_names = ZONE_NAMES[..self.zones]
             .iter()
             .map(|name| ZoneName::parse(name).expect("a built-in zone name is a valid zone name"))
             .collect();

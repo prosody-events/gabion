@@ -1,5 +1,3 @@
-use std::num::NonZeroU8;
-
 use gabion::settings::Millis;
 
 use super::*;
@@ -68,21 +66,39 @@ fn controls_fail_as_the_rule_constructor_fails() {
     }
 }
 
-/// The zone count is bounded by the built-in name table.
+/// The zone count is bounded by the built-in name table, and a count the
+/// table cannot name, zero included, fails with the same message.
 #[test]
 fn zone_count_is_bounded() {
-    let zones = |count: usize| SimConfig {
-        zones: NonZeroU8::new(count as u8).unwrap(),
+    let zones = |zones: usize| SimConfig {
+        zones,
         ..SimConfig::default()
     };
     for count in 1..=MAX_ZONES {
         let valid = zones(count).validate().expect("in range");
         assert_eq!(valid.zone_names.len(), count, "{count} zones");
     }
-    assert!(matches!(
-        zones(MAX_ZONES + 1).validate(),
-        Err(ConfigError::ZonesOutOfRange { got }) if usize::from(got) == MAX_ZONES + 1
-    ));
+    for count in [0, MAX_ZONES + 1, 300] {
+        assert!(
+            matches!(
+                zones(count).validate(),
+                Err(ConfigError::ZonesOutOfRange { got }) if got == count
+            ),
+            "{count} zones"
+        );
+    }
+}
+
+/// A shared URL's zone count reaches `validate` as it was written, so zero
+/// gets the operator message rather than a deserializer's.
+#[test]
+fn zone_count_from_json_is_refused_by_validate() {
+    let config: SimConfig = serde_json::from_str(r#"{ "zones": 0 }"#).expect("any count parses");
+    let error = config.validate().err().expect("zero zones").to_string();
+    assert!(
+        error.contains(&format!("1 to {MAX_ZONES} zones")),
+        "{error}"
+    );
 }
 
 /// Every built-in zone name parses and hashes to its own value, which

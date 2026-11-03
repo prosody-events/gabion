@@ -79,9 +79,10 @@ export class Sim {
     return batch;
   }
 
-  /** Pull the full per-node cluster state for a re-render. */
-  async snapshot(): Promise<ClusterState> {
-    return (await this.#inner.snapshot()) as ClusterState;
+  /** Pull every node's state for a re-render, with the cells and peer rows of
+   *  node `inspect` alone. */
+  async snapshot(inspect: number | null): Promise<ClusterState> {
+    return (await this.#inner.snapshot(inspect)) as ClusterState;
   }
 
   /** Install a directed link policy between two nodes. */

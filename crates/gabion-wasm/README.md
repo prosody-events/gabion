@@ -35,27 +35,29 @@ waiting), so a quiet cluster costs one step per heartbeat.
   address.
 - Each sent packet is tagged with its kind, read with `gabion::wire::read_header`,
   and its tier, by placement, which is what keeps the no-zone view honest.
-- `bytes_by_tier` is cumulative by tier and class: data is own, relay and sweep
-  packets; control is acks, probes and their answers, gap reports and sweep
-  requests.
+- `bytes_by_tier` is cumulative by tier and class, classed by packet kind: data
+  is own, relay and sweep packets; control is acks, probes and their answers,
+  gap reports and sweep requests.
 - `GatewayChanged` comes from each runtime's own gateway rows: the engine reads
   every node's counters each sub-step and fetches a snapshot only for a node
-  whose role count moved. When a zone's last member leaves, which moves no
-  role, the removal itself reports each origin's gateway into that zone as
-  gone.
+  whose role count moved. A removal moves no role, so the removal itself
+  re-reads every survivor whose gateway the departed node was, and reports the
+  gateway gone, or replaced, as that survivor's runtime now has it.
 
 ## Node ceiling
 
 The page caps live nodes at `MAX_LIVE_NODES` = 100 in `web/src/App.svelte`. A
-183-node cluster (the `prod-peak` pod count, in 3 zones) does not measure within
-the 250 ms budget for one virtual second, so the cap stays.
+183-node cluster (the `prod-peak` pod count, in 3 zones) plays a warm virtual
+second in about 205 ms, inside the 250 ms budget, but its first second, which
+includes cold start, takes about 380 ms, and the warm margin of about 45 ms on
+the machine below is too thin to assume for slower ones, so the cap stays.
 
 To reproduce, build the release wasm (`cd web && pnpm run build:wasm`), serve
 `web/src` (`python3 -m http.server 8000 --directory web/src`), open it in
 Chromium, and run this in the console. It seeds the steady workload (10 hits on
 one key at each of nodes 0, 3, 6 and 9, then 3 hits a second round-robin) and
-plays each virtual second as the page does, 60 frames of `step_to` plus
-`snapshot`:
+plays each virtual second as the page does with node 0 inspected, 60 frames of
+`step_to` plus `snapshot`:
 
 ```js
 const m = await import('/wasm/gabion_wasm.js'); await m.default();
@@ -68,7 +70,7 @@ for (let s = 0; s < 5; s++) {
     const v = s * 1000 + Math.round((f * 1000) / 60);
     while (hit < Math.floor((v * 3) / 1000)) await sim.submit_request(hit++ % 183, 1n, 1n);
     let t = performance.now(); await sim.step_to(BigInt(v)); step += performance.now() - t;
-    t = performance.now(); await sim.snapshot(); snap += performance.now() - t;
+    t = performance.now(); await sim.snapshot(0); snap += performance.now() - t;
   }
   out.push({ second: s, step, snap, total: step + snap });
 }
@@ -81,17 +83,17 @@ first second includes cold start.
 
 | second | steps (run 1) | snapshots (run 1) | total (run 1) | total (run 2) |
 |---|---|---|---|---|
-| 0 | 172 | 1,622 | 1,794 | 1,799 |
-| 1 | 15 | 2,001 | 2,016 | 2,012 |
-| 2 | 16 | 2,129 | 2,145 | 2,028 |
-| 3 | 18 | 2,149 | 2,167 | 2,075 |
-| 4 | 15 | 2,118 | 2,133 | 2,142 |
+| 0 | 183 | 211 | 394 | 382 |
+| 1 | 13 | 199 | 212 | 208 |
+| 2 | 14 | 199 | 212 | 206 |
+| 3 | 13 | 191 | 204 | 204 |
+| 4 | 12 | 190 | 204 | 204 |
 
-Stepping stays under the budget (about 15 ms once warm). The snapshots do not:
-each takes about 35 ms at 183 nodes, because it serialises every node's cells and
-all 183 × 182 peer rows, and the page takes one per frame. The same script
-against the build before the zone snapshot fields measured about 21 ms per
-snapshot and 54 ms of stepping per second.
+A snapshot takes about 3 ms at 183 nodes, because it carries every node's
+scalar state but the cells and peer rows of the inspected node alone; with no
+node inspected (`snapshot()`) a warm second totals about 193 ms. Carrying every
+node's cells and all 183 × 182 peer rows instead took about 35 ms a snapshot,
+2,000 ms a second.
 
 ## Layout
 

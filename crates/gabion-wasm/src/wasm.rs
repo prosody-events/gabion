@@ -174,10 +174,11 @@ impl Sim {
         to_js(&batch)
     }
 
-    /// Pull the full per-node cluster state for a seek / re-render.
-    pub async fn snapshot(&self) -> Result<JsValue, JsValue> {
+    /// Pull every node's state for a re-render, with the cells and peer rows
+    /// of the node with stable id `inspect` alone.
+    pub async fn snapshot(&self, inspect: Option<u32>) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::Snapshot { reply }).await?;
+        self.send(Command::Snapshot { inspect, reply }).await?;
         let state = rx.await.map_err(|_| engine_gone())?;
         to_js(&state)
     }
