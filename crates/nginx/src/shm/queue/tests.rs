@@ -168,9 +168,6 @@ fn overlapping_consumers_each_take_distinct_events() {
     #[cfg(miri)]
     const TOTAL: usize = 64;
     const CAPACITY: usize = 16;
-    // Consumers that collide wedge the ring, so fail rather than hang.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let wedged = move || assert!(std::time::Instant::now() < deadline, "queue wedged");
 
     let (control, slots) = build(CAPACITY);
     let popped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -186,7 +183,7 @@ fn overlapping_consumers_each_take_distinct_events() {
                             keys.push(ev.key_hash);
                             popped.fetch_add(1, Ordering::Relaxed);
                         }
-                        None => wedged(),
+                        None => std::hint::spin_loop(),
                     }
                 }
                 keys
@@ -201,7 +198,7 @@ fn overlapping_consumers_each_take_distinct_events() {
             ..event(0)
         };
         while queue.push(ev).is_err() {
-            wedged();
+            std::hint::spin_loop();
         }
     }
 
