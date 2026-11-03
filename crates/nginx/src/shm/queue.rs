@@ -80,25 +80,13 @@ pub struct QueueEvent {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct QueueControl {
-    pub capacity_mask: AtomicU64,
     /// Claimed by every push; on its own line, so the leader's pops never
     /// take it from the workers.
     pub enqueue_pos: CachePadded<AtomicU64>,
     /// Claimed by every pop.
     pub dequeue_pos: CachePadded<AtomicU64>,
-}
-
-impl QueueControl {
-    pub fn new(capacity: usize) -> Self {
-        debug_assert!(capacity.is_power_of_two() && capacity >= 2);
-        Self {
-            capacity_mask: AtomicU64::new((capacity - 1) as u64),
-            enqueue_pos: CachePadded(AtomicU64::new(0)),
-            dequeue_pos: CachePadded(AtomicU64::new(0)),
-        }
-    }
 }
 
 /// Borrowed view of the ring shared between producers and the consumer. All
@@ -111,6 +99,7 @@ pub struct RequestQueue<'a> {
 
 impl<'a> RequestQueue<'a> {
     pub fn from_parts(control: &'a QueueControl, slots: &'a [QueueSlot]) -> Self {
+        debug_assert!(slots.len().is_power_of_two() && slots.len() >= 2);
         Self { control, slots }
     }
 
@@ -124,7 +113,7 @@ impl<'a> RequestQueue<'a> {
     /// slot's seq store. Returns `QueueOverflow` when the slot's seq says
     /// the ring is full; the caller counts the drop.
     pub fn push(&self, event: QueueEvent) -> Result<(), QueueOverflow> {
-        let mask = self.control.capacity_mask.load(Ordering::Relaxed);
+        let mask = self.slots.len() as u64 - 1;
         loop {
             let pos = self.control.enqueue_pos.load(Ordering::Relaxed);
             let slot = &self.slots[(pos & mask) as usize];
@@ -151,8 +140,8 @@ impl<'a> RequestQueue<'a> {
     /// Consumer entry point. Each event goes to exactly one caller, even
     /// when two leaders briefly overlap.
     pub fn pop(&self) -> Option<QueueEvent> {
-        let mask = self.control.capacity_mask.load(Ordering::Relaxed);
         let capacity = self.slots.len() as u64;
+        let mask = capacity - 1;
         loop {
             let pos = self.control.dequeue_pos.load(Ordering::Relaxed);
             let slot = &self.slots[(pos & mask) as usize];

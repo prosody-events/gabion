@@ -179,6 +179,7 @@ fn leader_logs_shm_counters_at_powers_of_two() {
     let (_zone, region) = TestZone::new(8, 16);
     let (_, storage) = crate::mock::validated(|_| {});
     let stats = region.stats();
+    let handover = LEASE_TTL + DEFAULT_LEASE_TICK;
     let ((), logs) = with_logs(|| {
         for _ in 0..9 {
             stats.record_matched_rule_overflow();
@@ -187,9 +188,9 @@ fn leader_logs_shm_counters_at_powers_of_two() {
                 .declines_invalid_descriptor
                 .fetch_add(3, Ordering::Relaxed);
             stats.rejected_cardinality.fetch_add(5, Ordering::Relaxed);
-            log_bypasses(region, &storage);
+            log_bypasses(region, &storage, handover);
         }
-        log_bypasses(region, &storage);
+        log_bypasses(region, &storage, handover);
     });
     let totals = |code, field| logged_totals(&logs, code, field);
     assert_eq!(

@@ -30,14 +30,20 @@ use loom::{hint, sync::atomic};
 #[cfg(not(feature = "loom"))]
 use std::{hint, sync::atomic};
 
-/// Bytes of padding between regions; rounded up to the cacheline boundary.
-pub const CACHELINE: usize = 64;
+/// The span the zone keeps apart values that different paths write, and the
+/// boundary every region starts on: 128 bytes, the coherence line on Apple
+/// silicon and the line pair x86's adjacent-line prefetcher fetches together
+/// (crossbeam's `CachePadded` uses the same). Parts with 64-byte lines pay a
+/// few hundred bytes of zone for it, and nothing per request.
+pub const CACHELINE: usize = 128;
 
-/// A value alone on its cache line, for values different parties write: the
-/// queue's producer and consumer positions. Values one party writes together
-/// belong on one line instead (`Stats`).
-#[repr(C, align(64))]
-#[derive(Debug)]
+/// A value alone on its `CACHELINE`, for one path's writes beside another
+/// path's: the queue's producer and consumer positions, and the start of the
+/// leader's statistics. Values written together on one path share a line
+/// instead (the workers' counters in `Stats`): padding them apart only adds
+/// line transfers.
+#[repr(C, align(128))]
+#[derive(Debug, Default)]
 pub struct CachePadded<T>(pub T);
 
 const _: () = assert!(align_of::<CachePadded<u8>>() == CACHELINE);
@@ -231,7 +237,7 @@ impl ShmRegion {
             );
             std::ptr::write(
                 region.queue_control_ptr() as *mut QueueControl,
-                QueueControl::new(layout.queue_capacity),
+                QueueControl::default(),
             );
             for i in 0..layout.queue_capacity {
                 let slot = region.queue_slot_ptr(i) as *mut QueueSlot;

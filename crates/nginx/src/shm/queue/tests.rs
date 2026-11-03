@@ -16,7 +16,7 @@ fn event(value: u8) -> QueueEvent {
 }
 
 fn build(capacity: usize) -> (Arc<QueueControl>, Arc<Vec<QueueSlot>>) {
-    let control = Arc::new(QueueControl::new(capacity));
+    let control = Arc::new(QueueControl::default());
     let slots: Vec<QueueSlot> = (0..capacity).map(|i| QueueSlot::empty(i as u64)).collect();
     (control, Arc::new(slots))
 }
@@ -51,6 +51,13 @@ fn fifo_in_one_thread(case: QueueCase) -> TestResult {
             expected.push(ev);
         }
     }
+    if expected.len() != case.events.len().min(capacity) {
+        return TestResult::error(format!(
+            "accepted {} of {} pushes into {capacity} slots",
+            expected.len(),
+            case.events.len()
+        ));
+    }
 
     let mut out = vec![QueueEvent::default(); expected.len() + 4];
     let drained = queue.drain(&mut out);
@@ -84,16 +91,6 @@ fn wraparound_preserves_fifo() {
     assert_eq!(tail[1].now_millis, 3);
     assert_eq!(tail[2].now_millis, 4);
     assert_eq!(tail[3].now_millis, 5);
-}
-
-#[test]
-fn overflow_returns_err() {
-    let (control, slots) = build(2);
-    let queue = RequestQueue::from_parts(&control, &slots);
-    assert!(queue.push(event(1)).is_ok());
-    assert!(queue.push(event(2)).is_ok());
-    assert!(queue.push(event(3)).is_err());
-    assert!(queue.push(event(4)).is_err());
 }
 
 #[test]

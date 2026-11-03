@@ -31,7 +31,7 @@ struct Ring {
 impl Ring {
     fn new(capacity: u64) -> Arc<Self> {
         Arc::new(Self {
-            control: QueueControl::new(capacity as usize),
+            control: QueueControl::default(),
             slots: (0..capacity).map(QueueSlot::empty).collect(),
         })
     }

@@ -3,8 +3,8 @@
 
 use super::{CACHELINE, CachePadded, Layout, ShmRegion};
 
-/// One cache line of a test zone: whole lines give the zone the `CACHELINE`
-/// alignment `ShmRegion::initialize` requires.
+/// One cache line of a test zone; `CachePadded` makes a slice of them
+/// `CACHELINE`-aligned, as `ShmRegion::initialize` requires.
 type Line = CachePadded<[u64; CACHELINE / 8]>;
 
 /// Heap block backing a test `ShmRegion`, freed on drop. Holding the raw

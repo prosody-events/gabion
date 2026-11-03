@@ -137,7 +137,7 @@ fn equal_rules_have_equal_identity_in_both_adapters() {
     );
     let limiter = SharedLimiter::new(gabiond.clone(), client, counts.clone(), storage);
     let (control, slots) = (
-        QueueControl::new(2),
+        QueueControl::default(),
         [QueueSlot::empty(0), QueueSlot::empty(1)],
     );
     let queue = RequestQueue::from_parts(&control, &slots);

@@ -222,7 +222,7 @@ async fn campaign(
 /// Lead gossip until `stopped` fires (`Ok`) or the gossip runtime or the
 /// drain loop ends on its own (`Err`). Both are dropped before this
 /// returns, so the gossip socket is closed and nothing renews the lease
-/// once the caller releases it. Meanwhile it logs the bypass counters.
+/// once the caller releases it.
 async fn leader_main(
     shm: ShmRegion,
     rules: Arc<CompiledRules>,
@@ -325,18 +325,19 @@ async fn log_bypasses_every(
     shm: ShmRegion,
     storage: ValidStorageConfig,
 ) -> Infallible {
+    let handover = LEASE_TTL + tick;
     let mut tick = tokio::time::interval(tick);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tick.tick().await;
-        log_bypasses(shm, &storage);
+        log_bypasses(shm, &storage, handover);
     }
 }
 
 /// Log each counter workers bump on a bypass or a descriptor-limit rejection
 /// whose total passed a power of two since a leader last logged it
 /// (`throttle::catch_up` on the zone's `Stats::logged` marks).
-fn log_bypasses(shm: ShmRegion, storage: &ValidStorageConfig) {
+fn log_bypasses(shm: ShmRegion, storage: &ValidStorageConfig, handover: Duration) {
     let stats = shm.stats();
     let logged = &stats.logged;
     let overflowed = stats.matched_rule_overflows.load(Ordering::Relaxed);
@@ -367,10 +368,10 @@ fn log_bypasses(shm: ShmRegion, storage: &ValidStorageConfig) {
              were dropped: their requests were allowed, and limits under-count them. Either the \
              gossip leader stopped draining it (look for a recent `gabion: this worker stopped \
              leading gossip` error) or this node admits more counted hits than the queue holds \
-             across a leader handover (about {:?}). Raise `gabion_gossip_limit_queue_capacity`; \
-             each slot uses {} bytes of the `gabion_limit_zone` SIZE, so raise SIZE by the same \
-             amount to keep the count table's size.",
-            LEASE_TTL + DEFAULT_LEASE_TICK,
+             across a leader handover (about {handover:?}). Raise \
+             `gabion_gossip_limit_queue_capacity`; each slot uses {} bytes of the \
+             `gabion_limit_zone` SIZE, so raise SIZE by the same amount to keep the count table's \
+             size.",
             size_of::<QueueSlot>(),
         );
     }

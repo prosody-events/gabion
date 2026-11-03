@@ -100,12 +100,14 @@ fn region(queue: usize) -> ShmRegion {
 }
 
 /// `rules` rules on one location, each keyed on the tenant and all matching,
-/// with `storage.max_matched_rules` at `rules`; 1,000 requests after a
-/// warm-up that matches no rule, 95% on keys the aggregate holds and 5% on
-/// new ones.
-fn admit_without_allocating(rules: u16) {
+/// with `storage.max_matched_rules` at `max_matched_rules` and a request
+/// queue of `queue` slots; 1,000 requests after a warm-up that matches no
+/// rule, 95% on keys the aggregate holds and 5% on new ones. A bound below
+/// `rules` and a queue below the bound take the bypass branches: each
+/// request overflows the bound and drops the events the queue cannot hold.
+fn admit_without_allocating(rules: u16, max_matched_rules: u16, queue: usize) {
     let settings = Settings {
-        max_matched_rules: rules.try_into().unwrap(),
+        max_matched_rules: max_matched_rules.try_into().unwrap(),
         ..Settings::default()
     };
     let (_, storage) = settings.validate().expect("settings validate");
@@ -118,7 +120,7 @@ fn admit_without_allocating(rules: u16) {
         .collect();
     let compiled =
         CompiledRules::compile_with(&configs, &storage, &mut NopBindingCompiler).expect("compile");
-    let region = region(usize::from(rules).next_power_of_two().max(2));
+    let region = region(queue);
     let ctx = AccessCtx {
         rules: &compiled,
         aggregate: region.aggregate(),
@@ -171,6 +173,7 @@ fn admit_without_allocating(rules: u16) {
         allocations(|| black_box(Vec::<u8>::with_capacity(8))).1 > 0,
         "the counting allocator is live"
     );
+    let counted = usize::from(max_matched_rules).min(queue);
     let mut total = 0;
     for tenant in &requests {
         let vars = Tenant(tenant.as_bytes());
@@ -180,16 +183,26 @@ fn admit_without_allocating(rules: u16) {
             "{outcome:?}"
         );
         total += allocated;
-        assert_eq!(region.queue().drain(&mut drained), usize::from(rules));
+        assert_eq!(region.queue().drain(&mut drained), counted);
     }
     assert_eq!(total, 0, "{rules} rules: admission allocated");
     let stats = region.stats().snapshot();
-    assert_eq!((stats.matched_rule_overflows, stats.queue_dropped), (0, 0));
+    let overflows = if max_matched_rules < rules { 1_000 } else { 0 };
+    let dropped = 1_000 * (usize::from(max_matched_rules) - counted) as u64;
+    assert_eq!(
+        (stats.matched_rule_overflows, stats.queue_dropped),
+        (overflows, dropped)
+    );
 }
 
 #[test]
 fn admission_never_allocates_at_the_largest_bound() {
     for rules in [1, 16, 64, 256] {
-        admit_without_allocating(rules);
+        admit_without_allocating(rules, rules, usize::from(rules).next_power_of_two().max(2));
     }
+}
+
+#[test]
+fn the_bypass_branches_never_allocate() {
+    admit_without_allocating(16, 8, 4);
 }
