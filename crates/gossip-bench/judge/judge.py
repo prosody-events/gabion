@@ -256,10 +256,10 @@ def rss_mib(result: dict):
 
 
 def cross_az_per_node_s(result: dict):
-    """Cross-AZ bytes per node per second of the measurement window, divided
-    by the running-pod integral as the core divides `bytes_per_node_s`."""
-    sent, node_s = (dig(result, "network.measure.cross_az_bytes"),
-                    dig(result, "windows.node_seconds_measure"))
+    """Cross-AZ bytes per running node-second of the measurement window, the
+    divisor the core uses for `measure_bytes_per_node_per_s`."""
+    sent = dig(result, "network.measure.cross_az_bytes")
+    node_s = dig(result, "windows.node_seconds_measure")
     return sent / node_s if sent is not None and node_s else None
 
 

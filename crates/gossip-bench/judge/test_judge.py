@@ -233,12 +233,15 @@ class FloorTest(unittest.TestCase):
         self.assertEqual(judge_module.resolution("conv_p99_ms", result), 0.0)
 
     def test_cross_zone_bytes_are_per_running_node_second(self):
-        # Red if the metric divides by the window length or not at all.
+        # Red if the metric divides by the window length or not at all, or
+        # divides by a zero node-second count.
         extract = next(e for k, _, e in judge_module.METRICS if k == "cross_az_bytes_per_node_s")
         self.assertEqual(extract({"network": {"measure": {"cross_az_bytes": 600}},
                                   "windows": {"node_seconds_measure": 300.0, "measure_s": 60}}),
                          2.0)
         self.assertIsNone(extract({"windows": {"node_seconds_measure": 300.0}}))
+        self.assertIsNone(extract({"network": {"measure": {"cross_az_bytes": 600}},
+                                   "windows": {"node_seconds_measure": 0.0}}))
 
 
 class ComparisonTest(unittest.TestCase):

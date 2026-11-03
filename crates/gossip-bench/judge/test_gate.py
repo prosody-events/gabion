@@ -123,7 +123,8 @@ class ExitTest(unittest.TestCase):
         self.assertIn("judge.py refused", self.gate(MAIN, NOPK, ZONE))
 
     def test_a_model_miss_never_changes_the_exit_code(self):
-        # Red if a model miss feeds the exit code. Runs the real `main()` with
+        # Red if a model miss feeds the exit code or the printed miss count is
+        # wrong. Runs the real `main()` with
         # only judge.py, git and the core hash faked, every rule passing and
         # one miss far outside any band.
         rows = passing(sorted(p.stem for p in REGIME_DIR.glob("*.json")))
@@ -149,14 +150,16 @@ class ExitTest(unittest.TestCase):
                                          for (r, s, m), row in rows.items())
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
+            stdout = io.StringIO()
             with (mock.patch.object(gate.subprocess, "run", run),
                   mock.patch.object(gate, "core_hash", lambda *_: "0" * 40),
                   mock.patch.object(sys, "argv", ["gate.py", str(results), "--out", str(out)]),
-                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stdout(stdout),
                   self.assertRaises(SystemExit) as exit_):
                 gate.main()
             text = (out / "gate.md").read_text()
         self.assertEqual(exit_.exception.code, 0)
+        self.assertIn("Cost model (not gating): 1 comparisons miss", stdout.getvalue())
         self.assertIn("Every rule passes.", text)
         self.assertIn("`peak_cells`: §6's defaults rest on a model that misses here", text)
 
@@ -193,7 +196,8 @@ class ModelTest(unittest.TestCase):
     def test_a_missing_metric_reads_missing_not_a_pass(self):
         # Red if a missing mean is read as 0 or as within the band, if
         # predictions are made without an admitted count or outside ε = 1, or
-        # if `gateway_failovers` is left out instead of shown missing.
+        # if `gateway_failovers` is left out, or shown without §6.5.8's odds or
+        # `gossip.suspect_after`, instead of shown missing.
         peak = {"prod-peak": regime("prod-peak")}
         rows = {("prod-peak", ZONE, "admitted"): {"mean": self.ADMITTED},
                 **{("prod-peak", ZONE, m): {"mean": p}
@@ -208,8 +212,9 @@ class ModelTest(unittest.TestCase):
         self.assertTrue(all(line.endswith("| missing | missing | missing |") for line in table),
                         table)
         self.assertEqual(misses, 0)
-        self.assertTrue(any(line.startswith("- `gateway_failovers`: missing") for line in lines),
-                        lines)
+        self.assertIn(f"- `gateway_failovers`: missing. §6.5.8 predicts a false suspicion in "
+                      f"{gate.false_suspicion(peak['prod-peak'])}; `gossip.suspect_after` "
+                      "sizes it.", lines)
         wide = peak["prod-peak"] | {"rule": peak["prod-peak"]["rule"] | {"limit": 10**7}}
         self.assertEqual(gate.predict(wide, self.ADMITTED), {})  # ε = 549
 

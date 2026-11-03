@@ -44,16 +44,18 @@ PREDICTED_COST_RATIO = 0.93
 NUMBERS = ("mean", "ratio", "ratio_lo", "ratio_hi", "diff_mean", "diff_lo", "diff_hi",
            "p_better", "cri_lo", "cri_hi")
 # §6.5's cost model reads the defaults and wire sizes it was derived with;
-# test_gate.py checks each against its Rust source.
+# test_gate.py checks each against its Rust source but `DICT_ENTRY_BYTES`, the
+# width of a u128.
 TICK_MS = 500                                 # defaults::GOSSIP_TICK_INTERVAL_MILLIS, T
 ERR_BPS = 100                                 # defaults::GOSSIP_TARGET_ERR_BPS, β
 SUSPECT_TICKS, SUSPECT_FLOOR_MS = 4, 2_000    # defaults::GOSSIP_SUSPECT_AFTER_{TICKS,FLOOR_MS}
 ZONES = 3                                     # harness plan::AVAILABILITY_ZONES, Z
 IP_UDP_BYTES, HEADER_BYTES = 28, 86           # harness net::IP_UDP_HEADER_BYTES, wire HEADER_LEN
 DICT_LEN_BYTES, CELL_BYTES = 2, 38            # wire body DICT_LEN_BYTES, CELL_BYTES
+DICT_ENTRY_BYTES = 16                         # a u128 rule fingerprint or origin id
 TICK_S = TICK_MS / 1000
-ACK_BYTES = IP_UDP_BYTES + HEADER_BYTES             # a datagram with no cells
-DATA_BYTES = ACK_BYTES + DICT_LEN_BYTES + 16 + 16   # plus one rule and one origin
+ACK_BYTES = IP_UDP_BYTES + HEADER_BYTES                   # a datagram with no cells
+DATA_BYTES = ACK_BYTES + DICT_LEN_BYTES + 2 * DICT_ENTRY_BYTES  # one rule, one origin
 MODEL_BAND = 0.05
 STREAM_SIZES = "the quantum `q` (from `storage.max_cells`) or `gossip.tick_interval`"
 # (summary.csv metric, equation, the setting the equation sizes)
@@ -70,7 +72,7 @@ MODEL_INTRO = (
     "predictions count only its cross-zone part, (Z − 1) / T · (1 − e^(−λT)), and put "
     "λ / R_own cells in each data packet. `missing` means no value: no valid seed, no "
     "admitted hits, a regime outside (6.2)'s ε = 1, or a metric the run's result does "
-    "not carry.")
+    "not carry: `gateway_failovers` needs a harness-core field.")
 
 
 def read(summary: Path) -> dict:
@@ -186,8 +188,7 @@ def model_check(regimes: dict, rows: dict) -> tuple[list[str], int]:
         predicted = predict(regime, (rows.get((r, ZONE, "admitted")) or {}).get("mean"))
         lines += ["", f"### {r}", "", "| Metric | Equation | Predicted | Measured | Off by |",
                   "|---|---|---|---|---|"]
-        notes = [f"- `gateway_failovers`: missing, the run's result does not carry it (that "
-                 f"needs a harness-core field). §6.5.8 predicts a false suspicion in "
+        notes = [f"- `gateway_failovers`: missing. §6.5.8 predicts a false suspicion in "
                  f"{false_suspicion(regime)}; `gossip.suspect_after` sizes it."]
         for metric, equation, sizes in MODEL:
             row = rows.get((r, ZONE, metric)) or {}
