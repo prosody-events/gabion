@@ -178,7 +178,7 @@ class ModelTest(unittest.TestCase):
 
     def test_a_miss_is_flagged_past_five_percent_either_way(self):
         # Red if the band is not 5 %, is one-sided for an estimate or
-        # two-sided for (6.10)'s upper bound, measures the miss against the
+        # two-sided for the live cells equation's upper bound, measures the miss against the
         # measured value instead of the prediction, flags a miss its line
         # prints as 5.0 %, or names the wrong setting.
         for metric, cases in (
@@ -191,7 +191,7 @@ class ModelTest(unittest.TestCase):
                                  (metric, scale))
         for metric, equation, sizes, _ in gate.MODEL:
             self.assertIn(f"- `{metric}`: the defaults rest on a cost model that misses here by "
-                          f"5.1%; the owner decides. {equation} sizes {sizes}.",
+                          f"5.1%; the owner decides. The {equation} equation sizes {sizes}.",
                           self.check(1.051, metric)[0])
         self.assertEqual({m: bound for m, *_, bound in gate.MODEL},
                          {**dict.fromkeys(("packets_per_node_s", "bytes_per_node_s",
@@ -225,7 +225,7 @@ class ModelTest(unittest.TestCase):
     def test_a_missing_metric_reads_missing_not_a_pass(self):
         # Red if a missing mean is read as 0 or as within the band, if
         # predictions are made without an admitted count or outside ε = 1, or
-        # if `gateway_failovers` is left out, or shown without (6.5.8)'s odds or
+        # if `gateway_failovers` is left out, or shown without the false suspicion odds or
         # `gossip.suspect_after`, instead of shown missing.
         peak = {"prod-peak": regime("prod-peak")}
         rows = {("prod-peak", ZONE, "admitted"): {"mean": self.ADMITTED},
@@ -233,7 +233,7 @@ class ModelTest(unittest.TestCase):
                    for m, p in gate.predict(peak["prod-peak"], self.ADMITTED).items()}}
         rows[("prod-peak", ZONE, "peak_cells")] = {"mean": None}
         lines, misses = gate.model_check(peak, rows)
-        self.assertIn("| `peak_cells` | (6.10) | 20,070 | missing | missing |", lines)
+        self.assertIn("| `peak_cells` | live cells | 20,070 | missing | missing |", lines)
         self.assertEqual(misses, 0)
         lines, misses = gate.model_check(peak, {})
         table = [line for line in lines if line.startswith("| `")]
@@ -241,18 +241,18 @@ class ModelTest(unittest.TestCase):
         self.assertTrue(all(line.endswith("| missing | missing | missing |") for line in table),
                         table)
         self.assertEqual(misses, 0)
-        self.assertIn(f"- `gateway_failovers`: missing. (6.5.8) predicts a false suspicion in "
-                      f"{gate.false_suspicion(peak['prod-peak'])}; `gossip.suspect_after` "
-                      "sizes it.", lines)
+        self.assertIn("- `gateway_failovers`: missing. The false suspicion equation predicts "
+                      f"one in {gate.false_suspicion(peak['prod-peak'])}; "
+                      "`gossip.suspect_after` sizes it.", lines)
         wide = peak["prod-peak"] | {"rule": peak["prod-peak"]["rule"] | {"limit": 10**7}}
         self.assertEqual(gate.predict(wide, self.ADMITTED), {})  # ε = 549
 
-    def test_the_model_gives_the_designs_numbers(self):
-        # Red if (6.2), (6.3), (6.5), (6.10), the packet size or (6.5.8)'s
-        # false-suspicion odds are mistyped, or if `a`, which has no equation,
-        # is guessed at: the expected values are the design's own figures
-        # (R_own 5.49 and 12.54, so D − a = 999 and 3,749, p99 300 and 148 ms,
-        # A = Λ · 11 s, the (6.5.8) tables).
+    def test_the_model_gives_its_own_numbers(self):
+        # Red if the own rounds, packets, p99 or live cells equation, the
+        # packet size or the false suspicion odds are mistyped, or if `a`,
+        # which has no equation, is guessed at: the expected values are the
+        # cost model's own figures (R_own 5.49 and 12.54, so D − a = 999 and
+        # 3,749, p99 300 and 148 ms, A = Λ · 11 s, the false suspicion tables).
         peak = gate.predict(regime("prod-peak"), 1_825 * 60)  # Λ = 1,825
         x4 = gate.predict(regime("prod-4x"), 7_222 * 60)      # Λ = 7,222
         self.assertAlmostEqual(peak["packets_per_node_s"], 5.49 * 182, delta=1)

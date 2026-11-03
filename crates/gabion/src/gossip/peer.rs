@@ -444,7 +444,10 @@ pub(super) struct PeerLink {
     /// The peer's identity once heard, and its zone.
     known: Known,
     /// The incarnation before the last restart; a late packet carrying it
-    /// changes no stream state.
+    /// changes no stream state. A packet from two incarnations back resets
+    /// the row to it, and the live incarnation's packets then read as late
+    /// (merged, never acked) until either side restarts or the row is
+    /// removed.
     prev_incarnation: Option<Incarnation>,
     answer: Answer,
     out: PerStream<Outbound>,

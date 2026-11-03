@@ -299,9 +299,6 @@ entry in [`crates/gabion/TROUBLESHOOTING.md`](crates/gabion/TROUBLESHOOTING.md).
     name: gabion-endpointslice-reader
   rules:
     - apiGroups: [""]
-      resources: ["pods"]
-      verbs: ["get"]
-    - apiGroups: [""]
       resources: ["services"]
       verbs: ["get", "list", "watch"]
     - apiGroups: ["discovery.k8s.io"]

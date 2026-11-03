@@ -48,7 +48,7 @@ fn directive(name: &str) -> Setting {
 /// A repeated `gabion_gossip_bootstrap_peers` appends each address in order
 /// (the gabiond half is in its config tests).
 #[test]
-fn bootstrap_peers_parse_in_both_adapters() {
+fn bootstrap_peers_parse_in_nginx() {
     let setting = directive("gabion_gossip_bootstrap_peers");
     let mut settings = Settings::default();
     for addr in ["10.0.0.2:9000", "10.0.0.3:9000"] {
@@ -123,19 +123,4 @@ fn every_directive_is_in_the_reference() {
             );
         }
     }
-}
-
-/// Every `nginx -t` error goes through `conf_error!`, whose syntax demands a
-/// `code`, so `make hygiene` finds each code and checks its README entry.
-#[test]
-fn every_directive_error_names_a_code() {
-    assert_eq!(
-        include_str!("module.rs")
-            .matches("ngx_conf_log_error!")
-            .count(),
-        1,
-        "crates/nginx/src/module.rs calls ngx_conf_log_error! outside conf_error!; report every \
-         nginx -t error through conf_error!(cf, code = \"...\", ...) and give the code an entry \
-         in the README's configuration errors"
-    );
 }

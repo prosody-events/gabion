@@ -159,34 +159,6 @@ limits:
 YAML
 }
 
-apply_common_rbac() {
-    kubectl -n "$namespace" apply -f - <<YAML
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: gabion-endpointslice-reader
-rules:
-  - apiGroups: [""]
-    resources: ["services"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gabion-endpointslice-reader
-subjects:
-  - kind: ServiceAccount
-    name: default
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: gabion-endpointslice-reader
-YAML
-}
-
 apply_nginx_backend() {
     kubectl -n "$namespace" apply -f - <<YAML
 apiVersion: apps/v1
@@ -203,6 +175,7 @@ spec:
       labels:
         app: gabion-nginx
     spec:
+      serviceAccountName: gabion
       containers:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest
@@ -287,6 +260,7 @@ spec:
       labels:
         app: gabiond
     spec:
+      serviceAccountName: gabion
       containers:
         - name: gabiond
           image: gabiond:local
@@ -419,14 +393,29 @@ show_loader_log() {
     fi
 }
 
-show_snapshot() {
-    printf '\n=== gabiond /snapshot ===\n'
+# open_admin: forward 127.0.0.1:19090 to the first gabiond pod's admin port,
+# once; cleanup closes it.
+open_admin() {
+    if [ -n "$admin_pf_pid" ]; then
+        return
+    fi
     gabiond_pod="$(kubectl -n "$namespace" get pods -l app=gabiond -o 'jsonpath={.items[0].metadata.name}')"
     kubectl -n "$namespace" port-forward "pod/$gabiond_pod" 19090:9090 >"$admin_pf_log" 2>&1 &
     admin_pf_pid=$!
-
     retry 30 curl -fsS -o /dev/null "http://127.0.0.1:19090/snapshot" 2>/dev/null || true
+}
 
+# peers_listed <count>: gabiond's /snapshot lists at least <count> peers.
+peers_listed() {
+    curl -fsS "http://127.0.0.1:19090/snapshot" 2>/dev/null | python3 -c '
+import json, sys
+sys.exit(len(json.load(sys.stdin).get("peers") or []) < int(sys.argv[1]))
+' "$1"
+}
+
+show_snapshot() {
+    printf '\n=== gabiond /snapshot ===\n'
+    open_admin
     if curl -fsS "http://127.0.0.1:19090/snapshot" >"$snapshot_path" 2>/dev/null; then
         python3 - "$snapshot_path" <<'PY'
 import json
@@ -450,10 +439,6 @@ PY
         printf '  FAIL: could not reach gabiond admin endpoint\n' >&2
         cat "$admin_pf_log" >&2 || true
     fi
-
-    kill "$admin_pf_pid" 2>/dev/null || true
-    wait "$admin_pf_pid" 2>/dev/null || true
-    admin_pf_pid=""
 }
 
 show_cluster_overview() {
@@ -488,7 +473,7 @@ else
 fi
 kubectl create namespace "$namespace"
 create_configmaps
-apply_common_rbac
+apply_gabion_rbac
 if [ "$BACKEND" = "nginx" ]; then
     apply_nginx_backend
     printf '\nwaiting for %s nginx pods + gabiond to roll out...\n' "$POD_COUNT"
@@ -505,8 +490,17 @@ else
     wait_for_endpoint_count gabiond "$POD_COUNT"
 fi
 
-printf '\nletting gossip converge for 15s...\n'
-sleep 15
+# The gabiond observer lists every NGINX pod; a gabiond pod, every other one.
+if [ "$BACKEND" = "nginx" ]; then
+    expected_peers="$POD_COUNT"
+else
+    expected_peers=$((POD_COUNT - 1))
+fi
+printf '\nwaiting for gabiond to list %s peers...\n' "$expected_peers"
+open_admin
+converge_start_ms="$(now_ms)"
+retry 60 peers_listed "$expected_peers"
+printf 'gabiond listed %s peers after %s ms\n' "$expected_peers" "$(($(now_ms) - converge_start_ms))"
 
 printf '\nconfigured tenant rule: rate=%sr/%s window=%s bucket=%s\n' \
     "$BUDGET_PER_TENANT" "$RATE_LIMIT_PERIOD" "$RATE_LIMIT_WINDOW" "$RATE_LIMIT_BUCKET"

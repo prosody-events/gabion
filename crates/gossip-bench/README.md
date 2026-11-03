@@ -93,7 +93,7 @@ comparator's mean). The rules, with the study's ten error metrics
 
 `gate.py` writes `gate.md` into its `--out`: the core hash, the broken rules
 or "Every rule passes.", the measured cost ratios of G-a3 beside the 0.93 the
-design predicted, and the `git diff` of `adapter.rs` and `Cargo.toml` from the
+cost model predicted, and the `git diff` of `adapter.rs` and `Cargo.toml` from the
 baselines (both carry H1's copy) to zone. Read that diff: the adapter is outside the core hash, so
 the diff is where a change to what the adapter does shows. Between the cost
 ratios and the diff sits the cost-model section below. It exits 1 when a rule
@@ -105,42 +105,42 @@ nodes in `Z` zones at `Λ` admitted hits per second (`λ = Λ / N` per node),
 heartbeat `T`, and a rule of limit `L`, window `W` and bucket `b`:
 
 ```
-ε = max(1, ⌊L · β / (10⁴ · (N − 1))⌋)                   (3.2) per-rule error budget
-R_own = λ / (ε + 1) + (1 − e^(−2λT)) / (4T)   (ε = 1)   (6.2) own rounds per node-second
-D = R_own · (N − 1) + a                                 (6.3) packets per node-second
-e^(−λt) · (1 − t/T) = 0.02                              (6.5) t: convergence p99
-A ≈ Λ · (W + b)                                         (6.10) live cells, an upper bound
-p_a^n_a, p_a = 1 − (1 − p)², n_a = ⌊T_u / T⌋            (6.5.8) false suspicion per late answer
+error budget     ε = max(1, ⌊L · β / (10⁴ · (N − 1))⌋)                per rule
+own rounds       R_own = λ / (ε + 1) + (1 − e^(−2λT)) / (4T)  (ε = 1)  per node-second
+packets          D = R_own · (N − 1) + a                              per node-second
+p99              e^(−λt) · (1 − t/T) = 0.02                           t: convergence p99
+live cells       A ≈ Λ · (W + b)                                      an upper bound
+false suspicion  p_a^n_a, p_a = 1 − (1 − p)², n_a = ⌊T_u / T⌋         per late answer
 ```
 
-`a` is the acknowledgements sent alone, for which the design gives no
+`a` is the acknowledgements sent alone, for which the cost model gives no
 equation; `β` is `gossip.target_err_bps`, `p` the packet loss and `T_u`
 `gossip.suspect_after`. Under burst loss the false-suspicion chance is
 `(1 − p_bad_to_good)^(n_a − 1)` per loss burst.
 
 Per regime, `gate.md` sets the zone arm's measured mean and credible interval
 beside what these predict: packets, bytes and cross-zone bytes per node per
-second against (6.3), convergence p99 against (6.5) and peak live cells
-against (6.10). Each prediction reads the regime's JSON, the zone arm's
+second against the packets equation, convergence p99 against the p99
+equation and peak live cells against the live cells equation. Each prediction reads the regime's JSON, the zone arm's
 measured admitted rate, and the defaults and wire sizes named at the top of
 `gate.py`; `test_gate.py` checks each against its Rust source, except the
 16-byte width of a u128. The predictions leave out `a`, so a measured packet
-rate somewhat above (6.3)'s data term is expected; bytes count `R_own · (N − 1)`
-data packets, each one header, one rule and one origin plus `λ / R_own` cells,
+rate somewhat above the packets equation's data term is expected; bytes count
+`R_own · (N − 1)` data packets, each one header, one rule and one origin plus `λ / R_own` cells,
 and cross-zone bytes the `R_own · (Z − 1)` of them sent to gateways. A metric
 more than 5 % off its prediction, as printed to one decimal, is named under
 its table with the setting the equation sizes (the quantum or
-`gossip.tick_interval` for (6.3), the tick for (6.5), `STORAGE_MAX_CELLS` for
-(6.10)), and the owner decides whether the default or the model is wrong.
-(6.10) is an upper bound, so only a measurement above it misses. A regime with
-loss, churn or a partition is outside the equations: its numbers are shown and
+`gossip.tick_interval` for the packets equation, the tick for the p99 equation,
+`STORAGE_MAX_CELLS` for the live cells equation), and the owner decides whether
+the default or the model is wrong. The live cells equation is an upper bound, so
+only a measurement above it misses. A regime with loss, churn or a partition is outside the equations: its numbers are shown and
 never counted as misses. Cross-zone bytes per node per second is the judge's
 `cross_az_bytes_per_node_s`, the window's cross-AZ bytes over the running-pod
 integral, as `bytes_per_node_s` divides. Peak live cells is the judge's
 `peak_cells`, the most active cells any node reported in the core's health
 snapshots, taken every 5 s. `gateway_failovers` reads `missing`: the result is
-the core's and does not carry it. Beside it stands (6.5.8)'s chance that an
-episode ends in a false suspicion, at `n_a` attempts and at its floor
+the core's and does not carry it. Beside it stands the false suspicion
+equation's chance that an episode ends in one, at `n_a` attempts and at its floor
 `n_a − 1`, which `gossip.suspect_after` sizes. A missing value is never a
 pass. The section never changes the exit code; `gate.py` prints how many
 comparisons miss.

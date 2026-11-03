@@ -449,7 +449,7 @@ first, then the rest.
 
 ## Sizing
 
-These equations are the design's model of a node. The packet equation
+These equations are gabion's cost model of a node. The packet equation
 predicts the study's measured packets and bytes within 1.3 % at 80, 183 and
 300 pods; the rest size the defaults with the headroom shown. `N` is the
 pods in the cluster, `Z` the zones, `T` the heartbeat (`gossip.tick_interval`)
@@ -621,7 +621,7 @@ that never arrived counted at the end of the run; over-admission is how far
 the cluster admits past a limit, on keys that reach it, as a share of the
 limit. These were measured
 on the measured branch's version 1 wire; this release's version 2 header and
-cells are smaller (the design predicts about 7 % fewer bytes), which
+cells are smaller (the cost model predicts about 7 % fewer bytes), which
 `make sim-gate` measures for any checkout. The method, every regime and the
 full results are in [`docs/study/README.md`](../../docs/study/README.md); the
 harness that produced them is [`crates/gossip-bench`](../gossip-bench/README.md).

@@ -62,22 +62,23 @@ UNSTEADY = ("network", "churn")
 STREAM_SIZES = "the quantum `q` (from `storage.max_cells`) or `gossip.tick_interval`"
 # (summary.csv metric, equation, the setting the equation sizes, whether the
 # equation is an upper bound, which only a measurement above it misses)
-MODEL = (("packets_per_node_s", "(6.3)", STREAM_SIZES, False),
-         ("bytes_per_node_s", "(6.3)", STREAM_SIZES, False),
-         ("cross_az_bytes_per_node_s", "(6.3)", STREAM_SIZES, False),
-         ("conv_p99_incl_never_ms", "(6.5)", "`gossip.tick_interval`", False),
-         ("peak_cells", "(6.10)", "`STORAGE_MAX_CELLS` (`storage.max_cells`)", True))
+MODEL = (("packets_per_node_s", "packets", STREAM_SIZES, False),
+         ("bytes_per_node_s", "packets", STREAM_SIZES, False),
+         ("cross_az_bytes_per_node_s", "packets", STREAM_SIZES, False),
+         ("conv_p99_incl_never_ms", "p99", "`gossip.tick_interval`", False),
+         ("peak_cells", "live cells", "`STORAGE_MAX_CELLS` (`storage.max_cells`)", True))
 MODEL_INTRO = (
     "Never changes the exit code. The equations are restated in "
     "`crates/gossip-bench/README.md` (\"The cost model\"). Each prediction uses the "
     "zone arm's measured admitted rate, the regime and the defaults; measured is the mean "
     "over valid seeds [95 % credible interval]. A metric more than 5 % off its prediction "
-    "(above it, for (6.10)'s upper bound) is named below its table, in a regime without "
-    "loss, churn or a partition, which the cost model leaves out. (6.3)'s `a`, the "
-    "acknowledgements sent alone, has no equation, so the predictions leave it out and "
-    "put λ / R_own cells in each data packet. `missing` means no value: no valid seed, "
-    "no admitted hits, a regime outside (6.2)'s ε = 1, or a metric the run's result "
-    "does not carry: `gateway_failovers` needs a harness-core field.")
+    "(above it, for the live cells equation's upper bound) is named below its table, in a "
+    "regime without loss, churn or a partition, which the cost model leaves out. The "
+    "packets equation's `a`, the acknowledgements sent alone, has no equation, so the "
+    "predictions leave it out and put λ / R_own cells in each data packet. `missing` means "
+    "no value: no valid seed, no admitted hits, a regime outside the own rounds equation's "
+    "ε = 1, or a metric the run's result does not carry: `gateway_failovers` needs a "
+    "harness-core field.")
 
 
 def read(summary: Path) -> dict:
@@ -134,7 +135,7 @@ def failures(regimes: list[str], rows: dict, nopk_rows: dict) -> list[str]:
 
 
 def p99_ms(rate: float) -> float:
-    """The root of (6.5), e^(−λt)(1 − t/T) = 0.02, by bisection on [0, T],
+    """The root of the p99 equation, e^(−λt)(1 − t/T) = 0.02, by bisection on [0, T],
     where the left side falls from 1 to 0."""
     lo, hi = 0.0, TICK_S
     for _ in range(60):
@@ -146,26 +147,27 @@ def p99_ms(rate: float) -> float:
 def predict(regime: dict, admitted: float | None) -> dict:
     """The cost model's prediction of each `MODEL` metric for `regime` at the zone arm's
     mean admitted hits in the measurement window. Empty, so every metric reads
-    missing, without traffic or where (3.2) gives ε ≠ 1, outside (6.2)."""
+    missing, without traffic or where the error budget gives ε ≠ 1, outside the own rounds
+    equation."""
     if not admitted:
         return {}
     n, rule = regime["nodes"], regime["rule"]
     total = admitted / (regime["duration_s"] - regime["warmup_s"])           # Λ
     rate = total / n                                                          # λ
-    if max(1, rule["limit"] * ERR_BPS // (10_000 * (n - 1))) != 1:           # (3.2)
+    if max(1, rule["limit"] * ERR_BPS // (10_000 * (n - 1))) != 1:           # error budget
         return {}
-    own = rate / 2 + (1 - math.exp(-2 * rate * TICK_S)) / (4 * TICK_S)       # (6.2), R_own
-    data = own * (n - 1)                                                      # (6.3) without `a`
+    own = rate / 2 + (1 - math.exp(-2 * rate * TICK_S)) / (4 * TICK_S)       # own rounds, R_own
+    data = own * (n - 1)                                                      # packets without `a`
     packet = DATA_BYTES + CELL_BYTES * rate / own                             # c_p = λ / R_own
     return {"packets_per_node_s": data,
             "bytes_per_node_s": data * packet,
             "cross_az_bytes_per_node_s": own * (ZONES - 1) * packet,         # to Z − 1 gateways
             "conv_p99_incl_never_ms": p99_ms(rate),
-            "peak_cells": total * (rule["window_ms"] + rule["bucket_ms"]) / 1000}  # (6.10)
+            "peak_cells": total * (rule["window_ms"] + rule["bucket_ms"]) / 1000}  # live cells
 
 
 def false_suspicion(regime: dict) -> str:
-    """(6.5.8)'s chance that an episode ends in a false suspicion here, at
+    """The false suspicion equation's chance that an episode ends in one here, at
     n_a = ⌊T_u / T⌋ answer attempts and at its floor, one fewer."""
     attempts = max(SUSPECT_TICKS * TICK_MS, SUSPECT_FLOOR_MS) // TICK_MS     # n_a
     network = regime.get("network", {})
@@ -189,7 +191,7 @@ def model_check(regimes: dict, rows: dict) -> tuple[list[str], int]:
         predicted = predict(regime, (rows.get((r, ZONE, "admitted")) or {}).get("mean"))
         lines += ["", f"### {r}", "", "| Metric | Equation | Predicted | Measured | Off by |",
                   "|---|---|---|---|---|"]
-        notes = [f"- `gateway_failovers`: missing. (6.5.8) predicts a false suspicion in "
+        notes = [f"- `gateway_failovers`: missing. The false suspicion equation predicts one in "
                  f"{false_suspicion(regime)}; `gossip.suspect_after` sizes it."]
         steady = not any(key in regime for key in UNSTEADY)
         if predicted and not steady:
@@ -206,7 +208,7 @@ def model_check(regimes: dict, rows: dict) -> tuple[list[str], int]:
                     misses += 1
                     notes.append(f"- `{metric}`: the defaults rest on a cost model that "
                                  f"misses here by {abs(pct):.1f}%; the owner decides. "
-                                 f"{equation} sizes {sizes}.")
+                                 f"The {equation} equation sizes {sizes}.")
             shown = ("missing" if m is None
                      else f"{fmt(m)} [{fmt(row.get('cri_lo'))}, {fmt(row.get('cri_hi'))}]")
             lines.append(f"| `{metric}` | {equation} | {'missing' if p is None else fmt(p)} | "

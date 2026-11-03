@@ -461,8 +461,8 @@ fn static_list_shared_by_every_node_drops_self() {
 }
 
 /// With a static list, a node that joins at an address the list named
-/// all along, into peers with no cells of their own, is answered, asks them
-/// for a join sweep and gets its previous incarnation's cells back.
+/// all along, into peers with no cells of their own, gets its previous
+/// incarnation's cells back.
 #[test]
 fn static_joiner_at_a_listed_address_sweeps_from_idle_peers() {
     run_paused(async {
@@ -491,7 +491,7 @@ fn static_joiner_at_a_listed_address_sweeps_from_idle_peers() {
 
 /// With a static list, a node restarted at its own address, a new
 /// incarnation in rows its idle peers already hold, gets its previous
-/// incarnation's cells back by a join sweep.
+/// incarnation's cells back.
 #[test]
 fn static_node_restarted_at_its_address_sweeps_from_idle_peers() {
     run_paused(async {

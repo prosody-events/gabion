@@ -10,25 +10,18 @@
 //! way out (see [`crate::hex`]); request keys come in as small dense `u64`
 //! ids, widened to `u128`.
 //!
-//! # Runtime on wasm32 (plan risk R2 — resolved)
+//! # Runtime on wasm32
 //!
-//! `spawn_local` composes fine under the browser/node microtask queue; the one
-//! thing that could not run on `wasm32-unknown-unknown` was tokio's *time*
-//! machinery — `tokio::time::clock::now` calls `std::time::Instant::now`,
-//! which is unimplemented on this target and panics. So neither
-//! `GossipRuntime`'s `tokio::time::interval` tick nor `tokio::time::advance`
-//! works here.
-//!
-//! The fix made the tick source injectable through the existing
-//! [`gabion::gossip::Clock`] trait (it gained an associated
-//! [`gabion::gossip::Ticker`]): production keeps a `tokio::time::interval`
-//! ticker (byte-identical), while [`crate::clock::ManualClock`] drives ticks
-//! and the bucket clock from engine-owned virtual time, touching no
-//! `tokio::time`. A node smoke test against the real wasm artifact now runs
-//! the full submit → gossip → converge → snapshot loop (see `smoke.cjs`). The
-//! code path has no browser-specific dependency — node and the browser share
-//! the same single-threaded wasm executor — but an in-browser check is still
-//! worth doing before the frontend phase relies on it.
+//! `spawn_local` runs on the browser's and node's microtask queue, but
+//! tokio's time machinery cannot: `tokio::time::clock::now` calls
+//! `std::time::Instant::now`, which panics on `wasm32-unknown-unknown`. So
+//! the tick source comes from the [`gabion::gossip::Clock`] trait, whose
+//! associated [`gabion::gossip::Ticker`] production fills with a
+//! `tokio::time::interval`, while [`crate::clock::ManualClock`] drives ticks
+//! and the bucket clock from the engine's virtual time, touching no
+//! `tokio::time`. `smoke.cjs` runs the full submit, gossip, converge and
+//! snapshot loop against the real wasm artifact; node and the browser share
+//! the same single-threaded wasm executor.
 
 use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;

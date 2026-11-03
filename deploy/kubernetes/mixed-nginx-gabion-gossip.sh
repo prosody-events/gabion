@@ -295,10 +295,39 @@ nginx_hit() {
     curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080$1"
 }
 
+# counter <name>: one of the forwarded gabiond's /snapshot counters.
+counter() {
+    curl -fsS "http://127.0.0.1:19090/snapshot" | python3 -c '
+import json, sys
+print(json.load(sys.stdin)["counters"][sys.argv[1]])
+' "$1"
+}
+
+# merged_past <count>: gabiond has merged more than <count> cells, so it holds
+# the NGINX hit sent after it read <count>; nothing else changes a cell here.
+merged_past() {
+    curl -fsS "http://127.0.0.1:19090/snapshot" | python3 -c '
+import json, sys
+sys.exit(json.load(sys.stdin)["counters"]["cells_merged"] <= int(sys.argv[1]))
+' "$1" 2>/dev/null
+}
+
+# acked_after <heartbeats>: gabiond has run a heartbeat round since it had run
+# <heartbeats>, which sends its hit, and every peer has acked its own stream,
+# so the NGINX leader holds the hit.
+acked_after() {
+    curl -fsS "http://127.0.0.1:19090/snapshot" | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+sent = s["counters"]["rounds_heartbeat"] > int(sys.argv[1])
+sys.exit(not (sent and all(p["own_unacked"] == 0 for p in s["peers"])))
+' "$1" 2>/dev/null
+}
+
 # shared_limit <limit> <nginx path> <domain> <key> <value>: alternate hits on
-# one key between NGINX and gabiond, a few gossip rounds apart. The two
-# adapters count one rule, so the first <limit> hits pass and each adapter
-# refuses the next.
+# one key between NGINX and gabiond, each held by the other adapter before the
+# next. The two adapters count one rule, so the first <limit> hits pass and
+# each adapter refuses the next.
 shared_limit() {
     limit="$1"
     path="$2"
@@ -306,20 +335,26 @@ shared_limit() {
     hit=1
     while [ "$hit" -le "$limit" ]; do
         allowed=0
+        hit_ms="$(now_ms)"
         if [ $((hit % 2)) -eq 1 ]; then
+            merged="$(counter cells_merged)"
             answer="NGINX $(nginx_hit "$path")"
             [ "$answer" = "NGINX 429" ] || allowed=1
+            held=merged_past floor="$merged"
         else
             answer="gabiond $(gabiond_hit 18081 "$@")"
             [ "$answer" != "gabiond OK" ] || allowed=1
+            held=acked_after floor="$(counter rounds_heartbeat)"
         fi
         if [ "$allowed" = 0 ]; then
             printf 'FAIL: hit %s of %s on %s was refused (%s) before the shared limit\n' \
                 "$hit" "$limit" "$path" "$answer" >&2
             exit 1
         fi
+        retry 30 "$held" "$floor"
+        printf '%s hit %s held by the other adapter after %s ms\n' \
+            "${answer% *}" "$hit" "$(($(now_ms) - hit_ms))"
         hit=$((hit + 1))
-        sleep 3
     done
     status="$(nginx_hit "$path")"
     code="$(gabiond_hit 18081 "$@")"

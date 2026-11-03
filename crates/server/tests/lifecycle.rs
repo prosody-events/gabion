@@ -216,4 +216,13 @@ fn sigterm_drains_and_exits_with_status_zero() {
     );
     assert!(!log.contains(" ERROR "), "no error line, log:\n{log}");
     assert!(stderr.is_empty(), "stderr: {stderr}");
+    // Each listener logs the port the OS chose for its port-0 bind.
+    let listening: Vec<&str> = log
+        .split_whitespace()
+        .filter_map(|field| field.strip_prefix("listen_addr="))
+        .collect();
+    assert_eq!(listening.len(), 3, "three listeners, log:\n{log}");
+    for addr in listening {
+        assert!(!addr.ends_with(":0"), "{addr} is the configured port 0");
+    }
 }

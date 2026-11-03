@@ -65,9 +65,9 @@ const LONE_NODE_BIND: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LO
 #[derive(Clone, Debug)]
 pub struct LeaderConfig {
     pub worker_id: u32,
-    /// Its membership's bind; with none, this node runs alone: the leader
-    /// still folds its hits into the shared counts, but nothing can reach it
-    /// to gossip.
+    /// The gossip config. Without a bind in its membership this node runs
+    /// alone: the leader still folds its hits into the shared counts, but
+    /// nothing can reach it to gossip.
     pub gossip: ValidGossipConfig,
     pub cell_store: ValidStorageConfig,
     pub lease_tick: Duration,

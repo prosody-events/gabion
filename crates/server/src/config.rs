@@ -99,8 +99,15 @@ impl AppConfig {
                 continue;
             };
             if setting.is_list() {
+                let mut applied = false;
                 for item in raw.split(',').filter(|item| !item.trim().is_empty()) {
                     settings.apply(setting, item)?;
+                    applied = true;
+                }
+                // A list variable set but empty fails to load, as a scalar
+                // does, instead of silently dropping the YAML list.
+                if !applied {
+                    settings.apply(setting, &raw)?;
                 }
             } else {
                 settings.apply(setting, &raw)?;

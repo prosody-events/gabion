@@ -64,41 +64,8 @@ build_and_load_images nginx-nginx-module-request-smoke:latest
 
 kubectl create namespace "$namespace"
 
+apply_gabion_rbac
 kubectl -n "$namespace" apply -f - <<'YAML'
-# Bind watch permissions to the namespace's `default` ServiceAccount.
-# kubelet always mounts the default SA's token into pods that don't set
-# `serviceAccountName`, so no custom SA is needed — but the API server
-# still authenticates each request as `system:serviceaccount:<ns>:default`,
-# and that identity has zero permissions out of the box. The Role +
-# RoleBinding below grants exactly the verbs `EndpointSliceDiscovery`
-# uses (`crates/gabion/src/discovery/kubernetes.rs::watch_services` and
-# `watch_target`). Discovery itself falls through env→DNS bootstrap so
-# no `serviceAccountName` line, no `env` directive in nginx.smoke.conf,
-# and no kubeconfig is needed inside the pod.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: gabion-endpointslice-reader
-rules:
-  - apiGroups: [""]
-    resources: ["services"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gabion-endpointslice-reader
-subjects:
-  - kind: ServiceAccount
-    name: default
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: gabion-endpointslice-reader
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -113,6 +80,7 @@ spec:
       labels:
         app: gabion-nginx
     spec:
+      serviceAccountName: gabion
       containers:
         - name: nginx
           image: nginx-nginx-module-request-smoke:latest

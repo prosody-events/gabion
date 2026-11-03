@@ -40,7 +40,7 @@ enum State {
         warning: Warning,
     },
     /// A static list or no peers, and no setting: no Kubernetes discovery
-    /// runs to name the zone, so nothing waits for it.
+    /// runs to name the zone, so nothing waits for it and it stays unknown.
     Unconfigured,
 }
 
@@ -143,16 +143,17 @@ impl OwnZone {
         }
     }
 
-    /// Discovery reported the own entry: its zone is adopted only while none
-    /// is known, and returned for the peer table; one that differs from the
-    /// setting is reported once. A zoneless entry never retracts a known zone.
+    /// Discovery reported the own entry: its zone is adopted only while
+    /// discovery awaits it, and returned for the peer table; one that differs
+    /// from the setting is reported once. A zoneless entry never retracts a
+    /// known zone.
     pub(super) fn own_entry(
         &mut self,
         zone: Option<ZoneName>,
         node_name: Option<Box<str>>,
     ) -> Option<LearnedZone> {
         match (&mut self.0, zone) {
-            (State::Awaiting { .. } | State::Unconfigured, Some(name)) => {
+            (State::Awaiting { .. }, Some(name)) => {
                 log_known(&name, ZoneSource::EndpointSlice);
                 let learned = LearnedZone(name.hash());
                 self.0 = State::Learned(name);
@@ -263,10 +264,12 @@ impl OwnZone {
                      the EndpointSlice entries it watches belongs to this pod. gabion looks for \
                      the entry whose pod name is this host's name (`{}`), or whose address is \
                      `discovery.self_addr` when that is set. The usual cause is a pod whose host \
-                     name differs from its pod name (`hostNetwork: true`, or `spec.hostname` \
-                     set), or a pod outside the watched Services. Set {} to this pod's IP and \
-                     gossip port, or set {} directly. If this cluster only writes EndpointSlices \
-                     slowly, raise {} above the time the entry takes to appear. {SINGLE_ZONE}",
+                     name differs from its pod name (`hostNetwork: true`, `spec.hostname` set, or \
+                     a pod name longer than 63 characters, which Kubernetes truncates for the \
+                     host name), or a pod outside the watched Services. Set {} to this pod's IP \
+                     and gossip port, or set {} directly. If this cluster only writes \
+                     EndpointSlices slowly, raise {} above the time the entry takes to appear. \
+                     {SINGLE_ZONE}",
                     host_name_text,
                     Setting::DiscoverySelfAddr,
                     Setting::GossipZone,

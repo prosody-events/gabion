@@ -99,7 +99,8 @@ settings table both adapters share (`Setting` in `gabion::settings`,
 which also gives each setting's NGINX directive). Comma-separated values
 feed list settings, as in `GABION_DISCOVERY_NAMESPACE_ALLOW=ns-a,ns-b`;
 in YAML a list setting is a sequence (`namespace_allow: ["ns-a"]`) or
-one name. Structured lists such as the `limits:` block, along with
+one name. A list variable that is set but empty fails to load rather
+than silently replacing the YAML list with nothing. Structured lists such as the `limits:` block, along with
 anything that contains nested durations, live in YAML only because flat
 env vars cannot express them.
 

@@ -283,7 +283,7 @@ fn setting_table_spellings_parse() {
 /// and reads a YAML list, each making the membership static (the NGINX half
 /// is in the module's tests).
 #[test]
-fn bootstrap_peers_parse_in_both_adapters() {
+fn bootstrap_peers_parse_in_gabiond() {
     let _env = EnvGuard::lock();
     let peers: [SocketAddr; 2] = ["10.0.0.2:9000", "10.0.0.3:9000"].map(|a| a.parse().unwrap());
     let check = |config: AppConfig| {
@@ -408,6 +408,40 @@ fn yaml_value_shapes_load_or_fail_typed() {
         ),
         "load validates the settings"
     );
+}
+
+/// A list variable that is set but holds no item fails to load, rather than
+/// silently dropping the YAML list: a static cluster would become a
+/// Kubernetes one, and an allow-list would widen to everything.
+#[test]
+fn empty_env_list_fails_load_over_a_yaml_list() {
+    let _env = EnvGuard::lock();
+    let yaml = "gossip:\n  bind: 0.0.0.0:9000\n  bootstrap_peers: [\"10.0.0.2:9000\", \
+                \"10.0.0.3:9000\"]\ndiscovery:\n  namespace_allow: [a]\n";
+    for (var, expected) in [
+        (
+            "GABION_GOSSIP_BOOTSTRAP_PEERS",
+            Setting::GossipBootstrapPeers,
+        ),
+        (
+            "GABION_DISCOVERY_NAMESPACE_ALLOW",
+            Setting::DiscoveryNamespaceAllow,
+        ),
+    ] {
+        for empty in ["", " , "] {
+            clear_all_env();
+            set_env(var, empty);
+            let err = AppConfig::load_with_yaml_str(yaml).expect_err(var);
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Setting(SettingError::Malformed { setting, .. })
+                        if setting == expected
+                ),
+                "{var}={empty:?}: {err:?}",
+            );
+        }
+    }
 }
 
 #[test]

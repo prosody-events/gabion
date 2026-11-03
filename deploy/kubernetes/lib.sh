@@ -88,38 +88,12 @@ unset so the script builds and loads this checkout." >&2
     done
 }
 
-# apply_gabion_rbac: the ServiceAccount `gabion` and the Role discovery needs.
+# apply_gabion_rbac: the shipped ServiceAccount `gabion` and the Role
+# discovery needs, from deploy/kubernetes/gabion-discovery-rbac.yaml, in
+# this namespace, so every smoke proves the shipped rules suffice.
 apply_gabion_rbac() {
-    kubectl -n "$namespace" apply -f - <<YAML
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: gabion
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: gabion-endpointslice-reader
-rules:
-  - apiGroups: [""]
-    resources: ["pods", "services"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gabion-endpointslice-reader
-subjects:
-  - kind: ServiceAccount
-    name: gabion
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: gabion-endpointslice-reader
-YAML
+    sed "s/namespace: default/namespace: $namespace/" deploy/kubernetes/gabion-discovery-rbac.yaml \
+        | kubectl apply -f -
 }
 
 # live_pods <app>: one `name ip zone` line per running, ready pod of the app

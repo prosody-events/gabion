@@ -1027,22 +1027,13 @@ unsafe extern "C" fn set_limit(
             return core::NGX_CONF_ERROR;
         }
 
-        // Detect `gabion_limit off`. Must be the only argument when used.
+        // `gabion_limit off;` alone means "no rules" at this level: record an
+        // empty set so it overrides parent inheritance. An `off` among rule
+        // names is refused in the loop below.
         let Ok(first) = (*args.add(1)).to_str() else {
             return arg_not_utf8(cf, "gabion_limit");
         };
-        if first == "off" {
-            if nelts != 2 {
-                conf_error!(
-                    cf,
-                    code = "limit_off_mixed",
-                    "`gabion_limit off` turns off every rule at this level, so it takes no rule \
-                     names. Write `gabion_limit off;` alone, or list only rule names.",
-                );
-                return core::NGX_CONF_ERROR;
-            }
-            // `off` at this level means "no rules"; record an empty set so
-            // it overrides parent inheritance.
+        if first == "off" && nelts == 2 {
             location.rule_indices = Some(Vec::new());
             return core::NGX_CONF_OK;
         }

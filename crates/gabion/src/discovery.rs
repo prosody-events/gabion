@@ -50,7 +50,7 @@ pub enum PeerEvent {
 
 /// This node's own entry, the first time discovery sees it and whenever its
 /// zone changes: the zone it names, if any, and the Kubernetes node it runs
-/// on. The runtime adopts the zone only while it knows none, then recomputes
+/// on. The runtime adopts the zone only while it awaits one, then recomputes
 /// every peer's role and asks for a join sweep.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnEntry {
@@ -58,9 +58,10 @@ pub struct OwnEntry {
     pub node_name: Option<Box<str>>,
 }
 
-/// How a node finds its peers, and where it listens for them: built only by
+/// How a node finds its peers, and where it listens for them. Every
+/// `Membership` a runtime holds comes from
 /// [`crate::settings::Settings::validate`], so a node with peers always has a
-/// gossip bind and a static list is never empty.
+/// gossip bind and its static list is never empty.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Membership {
     /// Kubernetes EndpointSlice discovery: `gossip.bootstrap_peers` is empty.

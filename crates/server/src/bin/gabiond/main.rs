@@ -117,7 +117,7 @@ async fn run() -> Result<(), Reported> {
     let admin_listener = bind(Server::Admin, config.settings.admin_bind).await?;
     tracing::info!(
         code = "gossip_listening",
-        listen_addr = %gossip_bind,
+        listen_addr = %gossip_rt.local_addr().unwrap_or(gossip_bind),
         "Listening for gossip from other gabion nodes.",
     );
 
@@ -240,7 +240,8 @@ async fn run() -> Result<(), Reported> {
 }
 
 /// Bind `server`'s address when it is configured, before anything claims
-/// to serve it, so a taken port fails startup.
+/// to serve it, so a taken port fails startup. Returns the bound address, so
+/// a port-0 bind reports the port the OS chose.
 async fn bind(
     server: Server,
     addr: Option<SocketAddr>,
@@ -249,7 +250,7 @@ async fn bind(
         return Ok(None);
     };
     match TcpListener::bind(addr).await {
-        Ok(listener) => Ok(Some((addr, listener))),
+        Ok(listener) => Ok(Some((listener.local_addr().unwrap_or(addr), listener))),
         Err(error) => Err(Exit::Bind(server.into(), addr, error.into())),
     }
 }

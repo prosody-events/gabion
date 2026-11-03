@@ -850,8 +850,10 @@ impl fmt::Display for SettingError {
             }
             Self::TooManyBootstrapPeers { listed, capacity } => write!(
                 f,
-                "{} lists {listed} peers, but the peer table holds {capacity}. Raise {} to at \
-                 least {listed}, or shorten the list.",
+                "{} lists {listed} peers, but the peer table holds {capacity}. Every listed \
+                 address takes a row of the peer table, this node's own entry too, until its \
+                 first packet identifies it, so a list shared by every node needs a table at \
+                 least as long. Raise {} to at least {listed}, or shorten the list.",
                 Setting::GossipBootstrapPeers,
                 Setting::GossipPeerCapacity,
             ),

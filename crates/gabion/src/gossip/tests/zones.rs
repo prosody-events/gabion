@@ -12,6 +12,7 @@ use crate::defaults::GOSSIP_GAP_REPORTS;
 use crate::discovery::{DiscoveryConfig, OwnEntry, SelfMatch};
 use crate::gossip::peer::rendezvous_weight;
 use crate::gossip::{AnswerState, PeerZone, RoleCounts};
+use crate::wire::OwnAck;
 use crate::zone::{UnknownZone, ZoneHash, ZoneName, ZoneSource, ZoneStatus};
 
 /// A transport that records every packet its node hands it, with when.
@@ -97,6 +98,27 @@ fn tapped_node(
     let config = zoned_config(others(addrs, addrs[i]), zones[i], tune);
     let node = Node::start_on(tap, addrs[i], store_for(id(i, 1)), config);
     (node, taps)
+}
+
+/// Node `id` at `addr` on `transport`, run by Kubernetes discovery that has
+/// reported `peers` but not yet this node's own entry, so it has no zone until
+/// an [`own_entry`] names one.
+fn kubernetes_node<T: GossipTransport + 'static>(
+    transport: T,
+    addr: SocketAddr,
+    id: NodeIdentity,
+    peers: &[SocketAddr],
+) -> Node {
+    let node = Node::start_on(
+        transport,
+        addr,
+        store_for(id),
+        kubernetes_config(None, |_| {}),
+    );
+    for &peer in peers {
+        node.tell(PeerEvent::Added(Peer::new(peer)));
+    }
+    node
 }
 
 /// `n` addresses from ports `base..base + 64`, in descending rendezvous
@@ -423,9 +445,14 @@ fn late_zone_rewinds_the_new_recipient() {
         let mut addrs = vec![sock(47_600), sock(47_601)];
         addrs.extend(&b);
         let zones = ["", "a", "b", "b", "b"];
-        let nodes: Vec<_> = (0..5)
-            .map(|i| zoned_node(&router, &addrs, &zones, i))
-            .collect();
+        let o_peers = others(&addrs, addrs[0]);
+        let mut nodes = vec![kubernetes_node(
+            router.bind(addrs[0]),
+            addrs[0],
+            o,
+            &o_peers,
+        )];
+        nodes.extend((1..5).map(|i| zoned_node(&router, &addrs, &zones, i)));
         for &blocked in &b[1..] {
             router.set_link_policy(addrs[0], blocked, LinkPolicy::Block);
         }
@@ -465,8 +492,13 @@ fn joiner_that_outranks_the_gateway_relays_lost_cells() {
         run_for(150).await;
         let mut all = addrs.clone();
         all.push(joiner);
-        let config = zoned_config(others(&all, joiner), "", |_| {});
-        nodes.push(Node::start(&router, joiner, store_for(id(3, 1)), config));
+        let joiner_peers = others(&all, joiner);
+        nodes.push(kubernetes_node(
+            router.bind(joiner),
+            joiner,
+            id(3, 1),
+            &joiner_peers,
+        ));
         for node in &nodes[..3] {
             node.tell(PeerEvent::Added(Peer::new(joiner)));
         }
@@ -614,8 +646,7 @@ fn node_with_late_zone_gets_a_sweep() {
             inner: router.bind(addrs[3]),
             sent: taps.clone(),
         };
-        let config = zoned_config(addrs[..2].to_vec(), "", |_| {});
-        let x = Node::start_on(tap, addrs[3], store_for(id(3, 1)), config);
+        let x = kubernetes_node(tap, addrs[3], id(3, 1), &addrs[..2]);
         run_for(500).await;
         assert_eq!(x.agg.total(), 4);
         let requests = |from| {
@@ -983,9 +1014,14 @@ fn late_own_zone_under_loss_ends_exact() {
             router.set_link_policy(addrs[0], blocked, LinkPolicy::Block);
         }
         let zones = ["", "a", "b", "b", "b"];
-        let nodes: Vec<_> = (0..5)
-            .map(|i| zoned_node(&router, &addrs, &zones, i))
-            .collect();
+        let o_peers = others(&addrs, addrs[0]);
+        let mut nodes = vec![kubernetes_node(
+            router.bind(addrs[0]),
+            addrs[0],
+            o,
+            &o_peers,
+        )];
+        nodes.extend((1..5).map(|i| zoned_node(&router, &addrs, &zones, i)));
         run_for(500).await;
         nodes[0].hits(0..50).await;
         run_for(300).await;
@@ -1875,6 +1911,61 @@ fn unknown_sender_is_never_acked() {
             let snapshot = admin_snapshot(&admin).await;
             assert_eq!(snapshot.counters.cells_merged, 3, "{flagged}");
             assert_eq!(snapshot.peers.len(), 1, "{flagged}");
+        });
+    }
+}
+
+/// A late packet from a known peer's previous incarnation is merged, and what
+/// a flagged one raised is relayed promptly, but the row stays on the live
+/// incarnation and nothing of the late one is ever acked.
+#[test]
+fn late_incarnation_is_merged_and_never_acked() {
+    for flagged in [true, false] {
+        run_paused(async {
+            let (m, b) = (sock(2), sock(3));
+            let wire = Rc::new(Wire::default());
+            let (client, admin) = scripted(&wire, vec![m, b], "b", |_| {}).await;
+            introduce(&wire, &[(m, node(0xB), "b"), (b, node(0xC), "a")]);
+            heartbeats(1).await;
+            // b restarts: its row resets to incarnation 2, keeping 1 as late.
+            let restarted = NodeIdentity::new(NodeId(0xC), 2);
+            let page = CellPayload::Sweep.into();
+            inject_zoned(
+                &wire,
+                b,
+                restarted,
+                Some(zone("a")),
+                AckInfo::default(),
+                page,
+            );
+            heartbeats(1).await;
+            let mark = wire.attempts.borrow().len();
+            for packet in cell_packets(node(0xC), 0, 3, flagged) {
+                wire.inbound.borrow_mut().push_back((packet, b));
+            }
+            // Read and relayed promptly, well before the next heartbeat.
+            wake(&wire);
+            sim_advance_ticks(Duration::from_millis(1), 10).await;
+            let relayed = if flagged { 3 } else { 0 };
+            assert_eq!(relayed_cells(&wire, m, mark), relayed, "{flagged}");
+            // A hit streamed to b carries this node's acks to it.
+            hit(&client, 1).await;
+            heartbeats(2).await;
+            let to_b: Vec<AckInfo> = wire.attempts.borrow()[mark..]
+                .iter()
+                .filter(|a| a.dst == b)
+                .map(|a| header_of(&a.bytes).acks)
+                .collect();
+            assert!(!to_b.is_empty(), "{flagged}");
+            for acks in to_b {
+                assert_eq!(acks.incarnation, 2, "{flagged}");
+                assert!(
+                    matches!(acks.own, OwnAck::Direct(0) | OwnAck::AsGateway(0)),
+                    "{flagged}: {acks:?}",
+                );
+            }
+            let snapshot = admin_snapshot(&admin).await;
+            assert_eq!(snapshot.counters.cells_merged, 3, "{flagged}");
         });
     }
 }

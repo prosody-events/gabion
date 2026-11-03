@@ -244,6 +244,7 @@ hygiene:
 			rg -qF "code = \"$$code\"" $$src -g '!**/tests.rs' -g '!**/tests/**' || { echo "$$doc documents \`$$code\`, which no message in $$src emits; delete the entry, or rename it to the code that replaced it"; exit 1; }; \
 		done; \
 	done
+	@test "$$(rg --count-matches 'ngx_conf_log_error!' crates/nginx/src/module.rs)" = 1 || { echo "crates/nginx/src/module.rs calls ngx_conf_log_error! outside conf_error!; report every nginx -t error through conf_error!(cf, code = \"...\", ...) and give the code an entry in the README's configuration errors"; exit 1; }
 	rg -n '#[0-9a-fA-F]{3,8}\b|0x[0-9a-fA-F]{6}|rgba?\(|hsla?\(' $(WEB_DIR)/src --glob '!tokens.css'; test $$? -eq 1
 	rg -n 'font-size:\s*[0-9.]+px' $(WEB_DIR)/src; test $$? -eq 1
 	@for token in $$(rg -oNI "(var\(|')(--[a-z][a-z0-9-]*)" -r '$$2' $(WEB_DIR)/src | sort -u); do \

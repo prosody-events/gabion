@@ -87,6 +87,11 @@ trap cleanup EXIT
 build_and_load_images gabiond:local
 kubectl create namespace "$namespace"
 apply_gabion_rbac
+# The shipped manifests pass the API server's schema and admission checks.
+for manifest in gabiond gabion-nginx; do
+    sed "s/namespace: default/namespace: $namespace/" "deploy/kubernetes/$manifest.yaml" \
+        | kubectl apply --dry-run=server -f -
+done
 
 kubectl -n "$namespace" apply -f - <<YAML
 apiVersion: v1

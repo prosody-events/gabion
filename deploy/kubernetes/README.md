@@ -7,7 +7,7 @@ Kubernetes, and the smoke tests that run gabion on a local kind cluster.
 
 | File | What it holds |
 |---|---|
-| [`gabion-discovery-rbac.yaml`](gabion-discovery-rbac.yaml) | The `gabion` ServiceAccount, and the Role and RoleBinding that let discovery read Pods, Services and EndpointSlices. Both adapters need it. |
+| [`gabion-discovery-rbac.yaml`](gabion-discovery-rbac.yaml) | The `gabion` ServiceAccount, and the Role and RoleBinding that let discovery read Services and EndpointSlices. Both adapters need it. |
 | [`gabiond.yaml`](gabiond.yaml) | `gabiond`: a ConfigMap with its YAML, a Deployment of three replicas with a `/readyz` readiness probe, and a Service exposing Envoy's gRPC port and the UDP port named `gabion`. |
 | [`gabion-nginx.yaml`](gabion-nginx.yaml) | NGINX with the module: a ConfigMap with `nginx.conf`, a Deployment of three replicas on the published image, and a Service exposing HTTP and the UDP port named `gabion`. |
 | [`gabion-networkpolicy.yaml`](gabion-networkpolicy.yaml) | A NetworkPolicy that admits gossip only from gabion pods, since gossip carries no authentication. |
@@ -43,8 +43,10 @@ The root README's [Kubernetes checklist](../../README.md#kubernetes-checklist)
 says why each object is needed. A pod that finds no peers logs why; each
 message has its entry in
 [`crates/gabion/TROUBLESHOOTING.md`](../../crates/gabion/TROUBLESHOOTING.md).
-The smokes below build their own manifests inline and do not apply these
-files.
+The smokes below build their own workloads inline, but every smoke that
+runs gabion pods applies `gabion-discovery-rbac.yaml` in its namespace, so
+they prove its rules suffice; the three-zone smoke also checks `gabiond.yaml` and
+`gabion-nginx.yaml` against the API server with a server-side dry run.
 
 ## Smokes
 
