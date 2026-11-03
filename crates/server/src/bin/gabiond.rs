@@ -254,9 +254,9 @@ impl Exit {
                     %addr,
                     error = %format_args!("{error:#}"),
                     config_key = setting.yaml_key(),
-                    "gabiond could not serve {} on {addr}: {error:#}. Usually another process \
-                     already uses the port. Change {setting} or stop the other process. gabiond \
-                     is exiting with status 1.",
+                    "gabiond could not serve {} on {addr}; the `error` field says why. Usually \
+                     another process already uses the port. Change {setting} or stop the other \
+                     process. gabiond is exiting with status 1.",
                     listener.name(),
                 );
             }

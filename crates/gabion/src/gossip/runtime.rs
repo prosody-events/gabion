@@ -362,7 +362,7 @@ where
                 }
                 ArmOutcome::Request(Some(Request::Limit(r))) => self.handle_limit_request(r),
                 ArmOutcome::Inbound(Ok((n, src))) => self.handle_inbound(n, src),
-                ArmOutcome::Inbound(Err(e)) => return Err(e.into()),
+                ArmOutcome::Inbound(Err(e)) => return Err(GossipError::Recv(e)),
                 ArmOutcome::PeerEvent(Some(evt)) => self.handle_peer_event(evt),
                 ArmOutcome::PeerEvent(None) => peer_events_done = true,
                 ArmOutcome::Admin(Some(cmd)) => self.handle_admin_command(cmd),

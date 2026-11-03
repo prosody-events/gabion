@@ -189,4 +189,6 @@ pub enum GossipError {
     RuntimeShutDown,
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error("could not receive on the gossip socket: {0}")]
+    Recv(io::Error),
 }

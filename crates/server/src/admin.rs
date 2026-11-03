@@ -6,9 +6,9 @@
 //! - `GET /readyz`             — readiness probe: 200 whenever the admin HTTP
 //!   server answers, and nothing more.
 //!
-//! All responses are built inside the gossip task in response to an
-//! `AdminCommand` round-trip, so the caller never gets a `Sync` borrow
-//! of the runtime's internals.
+//! `/snapshot`'s runtime part is built inside the gossip task in response
+//! to an `AdminCommand` round-trip, so the handler never gets a `Sync`
+//! borrow of the runtime's internals.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

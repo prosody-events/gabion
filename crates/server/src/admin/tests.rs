@@ -326,10 +326,13 @@ fn readyz_returns_200_with_static_body() {
 fn admin_answers_503_with_one_body_when_gossip_stopped() {
     run_local(async {
         let snapshot = async |admin_tx| {
-            let request = Request::builder().uri("/snapshot").body(Body::empty());
-            let response = (build_router(admin_tx)
-                .oneshot(request.expect("request"))
-                .await)
+            let request = Request::builder()
+                .uri("/snapshot")
+                .body(Body::empty())
+                .expect("request");
+            let response = build_router(admin_tx)
+                .oneshot(request)
+                .await
                 .expect("router responded");
             let status = response.status();
             let bytes = to_bytes(response.into_body(), 4 * 1024)
