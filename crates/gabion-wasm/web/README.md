@@ -123,7 +123,7 @@ their origin selected.
 (`sim.snapshot(id)`); each chart's plot element carries its uPlot instance as
 `uplot`, which the audit reads to check every mark lies inside its plot; and
 the stage canvas carries `beams`, the renderer's in-flight beam pool, which the
-geometry check reads.
+geometry check reads and the beam check wraps to count every beam drawn.
 
 ## Layout
 
@@ -257,8 +257,9 @@ A4 and A5 from the engine's snapshot, then repeats the page checks with
 rule window, with unequal zones over a window that opens at a kept mark, and
 with one node, the share window at any snapshot rate, the stage geometry for
 every zone count (at the widest and the narrowest stage, with facing discs of
-neighbouring rings kept apart), that every drawn beam matches a packet of every
-kind, that a paused stage's labels are not rebuilt per snapshot, and the interactions, with
+neighbouring rings kept apart), that the beams a Step draws are its packets, one
+each with its packet's kind, tier and fate, over packets of every kind, that a
+paused stage's labels are not rebuilt per snapshot, and the interactions, with
 touch. Full-page PNGs land in `audit-shots/`, which is gitignored; CI uploads it
 as a workflow artifact. All of it downloads a browser, so, like the node
 `smoke.cjs`, it is an on-demand and CI run, not part of `make wasm-check`. On the

@@ -467,6 +467,23 @@ fn missing_for_dates_the_oldest_change_a_node_lacks() {
             [None, None],
             "node 1 caught up after the heal"
         );
+
+        // At 2500 ms, into a new bucket, with node 1 holding every older one:
+        // a cell it lacks outright is its only missing change, read after
+        // node 0, which holds that cell.
+        set_link(&tx, 0, 1, LinkPolicyKind::Block).await;
+        set_link(&tx, 1, 0, LinkPolicyKind::Block).await;
+        submit(&tx, 0, WATCHED_KEY, 4).await;
+        for _ in 0..3 {
+            step(&tx, T).await;
+        }
+        let only_absent = snapshot(&tx).await;
+        assert_eq!(only_absent.virtual_ms, 2_800);
+        assert_eq!(
+            missing(&only_absent),
+            [None, Some(300)],
+            "node 1 lacks only the cell made at 2500 ms"
+        );
     });
 }
 

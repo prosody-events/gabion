@@ -183,10 +183,12 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
     }
 
     // A4 and A5 read the table, which shrinks the stage: they run after the
-    // audit and the screenshots, which record the table closed.
+    // audit and the screenshots, which record the table closed. A5 runs first:
+    // A4 reads a row per node and the chart panels in the order A5 checks, so a
+    // missing row or a misplaced panel is reported as what it is.
     await setTable(page, true);
-    await checkData(page, name, series);
     await checkOrder(page, name);
+    await checkData(page, name, series);
     await setTable(page, false);
   }
   // Text shown only once every node agrees (the converged badge) is checked too.
@@ -1090,82 +1092,70 @@ test("every drawn beam carries its packet's kind, tier and fate", async ({ page 
   const DROPPED = 8;
   const KIND: Record<PacketKind, number> = { Ack: CONTROL, SweepRequest: CONTROL, Own: 0, Relay: RELAY, Sweep: 0 };
   type Packet = { src: number; dst: number; kind: PacketKind; tier: Tier; dropped: boolean };
+  type Beam = { src: number; dst: number; flags: number };
+  type Log = { packets: Packet[]; beams: Beam[] };
 
-  // Record the packets of every Step the page takes, as the engine reports them.
+  // Record the packets of every Step the page takes, as the engine reports them,
+  // and every beam the stage draws, as it enters the beam pool, so a beam that
+  // has already landed and gone is still counted.
   await page.evaluate(() => {
+    const log = window as unknown as Log;
+    log.packets = [];
+    log.beams = [];
     const sim = window.sim!;
     const step = sim.step.bind(sim);
-    const w = window as unknown as { packets: Packet[] };
-    w.packets = [];
     sim.step = async (ms: number) => {
       const batch = await step(ms);
       for (const { kind } of batch.events) {
         if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
           const { src, dst, tier } = kind;
-          w.packets.push({ src, dst, kind: kind.kind, tier, dropped: kind.type === 'PacketDropped' });
+          log.packets.push({ src, dst, kind: kind.kind, tier, dropped: kind.type === 'PacketDropped' });
         }
       }
       return batch;
     };
+    type Push = (path: unknown, start: number, src: number, dst: number, flags: number) => void;
+    const pool = document.querySelector<HTMLCanvasElement & { beams?: { push: Push } }>('.stage canvas')?.beams;
+    if (pool === undefined) throw new Error('the stage publishes no beam pool');
+    const push = pool.push.bind(pool);
+    pool.push = (path, start, src, dst, flags) => {
+      log.beams.push({ src, dst, flags });
+      push(path, start, src, dst, flags);
+    };
   });
 
-  // One Step: every beam it drew must be one of its packets' with that packet's
-  // flags, each packet used once. A beam may already have landed and gone, so
-  // the beams are a sub-multiset of the packets; the kinds matched are returned.
-  const checkStep = async (): Promise<Set<PacketKind>> => {
-    const since = await page.evaluate(() => {
-      (window as unknown as { packets: Packet[] }).packets = [];
-      return performance.now();
+  // One Step: the beams it drew are its packets, one beam each, each with its
+  // packet's flags. Returns the kinds of the packets drawn.
+  const checkStep = async (): Promise<PacketKind[]> => {
+    await page.evaluate(() => {
+      const log = window as unknown as Log;
+      log.packets = [];
+      log.beams = [];
     });
     await step(page);
-    const { beams, packets } = await page.locator('.stage canvas').evaluate(
-      (
-        c: HTMLCanvasElement & {
-          beams?: { len: number; start: Float64Array; src: Int32Array; dst: Int32Array; flags: Uint8Array };
-        },
-        since: number,
-      ) => {
-        const pool = c.beams;
-        if (pool === undefined) throw new Error('the stage publishes no beam pool');
-        const beams = Array.from({ length: pool.len }, (_, i) => ({
-          start: pool.start[i],
-          src: pool.src[i],
-          dst: pool.dst[i],
-          flags: pool.flags[i],
-        })).filter((b) => b.start >= since);
-        return { beams, packets: (window as unknown as { packets: Packet[] }).packets };
-      },
-      since,
+    const { packets, beams } = await page.evaluate(() => {
+      const { packets, beams } = window as unknown as Log;
+      return { packets, beams };
+    });
+    const route = ({ src, dst, flags }: Beam): string => `node ${src} to node ${dst} with flags ${flags}`;
+    const sent = packets.map((p) =>
+      route({
+        src: p.src,
+        dst: p.dst,
+        flags: KIND[p.kind] | (p.tier === 'CrossZone' ? CROSS : 0) | (p.dropped ? DROPPED : 0),
+      }),
     );
-    const unused = packets.map((p) => ({
-      ...p,
-      flags: KIND[p.kind] | (p.tier === 'CrossZone' ? CROSS : 0) | (p.dropped ? DROPPED : 0),
-    }));
-    const matched = new Set<PacketKind>();
-    for (const b of beams) {
-      const i = unused.findIndex((p) => p.src === b.src && p.dst === b.dst && p.flags === b.flags);
-      const sent = JSON.stringify(packets.filter((p) => p.src === b.src && p.dst === b.dst));
-      const where = `the beam from node ${b.src} to node ${b.dst} with flags ${b.flags}`;
-      expect(i, `${where} is none of ${sent}`).toBeGreaterThanOrEqual(0);
-      matched.add(unused[i].kind);
-      unused.splice(i, 1);
-    }
-    return matched;
+    expect(beams.map(route).sort(), 'the beams drawn are the packets sent, one each').toEqual(sent.sort());
+    return packets.map((p) => p.kind);
   };
 
-  // Steady state sends own streams, relays and acknowledgements every Step; a
-  // node that joins asks for a sweep and is sent one.
+  // Steady state sends own streams, relays and acknowledgements every Step, and
+  // its freshly built nodes each ask for a join sweep and are sent one.
   const seen = new Set<PacketKind>();
-  const until = async (kinds: PacketKind[]): Promise<void> => {
-    for (let i = 0; i < 10 && !kinds.every((k) => seen.has(k)); i++) {
-      for (const kind of await checkStep()) seen.add(kind);
-    }
-  };
-  await until(['Own', 'Relay', 'Ack']);
-  await page.getByRole('button', { name: 'Add node' }).click();
-  await expect(page.locator('[data-field="status-nodes"]')).toHaveText('13');
-  await until(['SweepRequest', 'Sweep']);
-  expect([...seen].sort(), 'a drawn beam of every packet kind').toEqual([
+  for (let i = 0; i < 10 && seen.size < Object.keys(KIND).length; i++) {
+    for (const kind of await checkStep()) seen.add(kind);
+  }
+  expect([...seen].sort(), 'every packet kind was sent and drawn').toEqual([
     'Ack',
     'Own',
     'Relay',
