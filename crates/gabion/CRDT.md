@@ -1020,7 +1020,7 @@ marked), and a free slot is in none.
 | a cell is freed (`free_cell_at`) | unlink from whichever list holds it |
 
 The runtime picks the mark from the packet: `All` for a flagged packet
-whose range ends above the sender's flagged mark, `Changed` for another
+whose range ends above the sender's gateway mark, `Changed` for another
 flagged one, `Clear` for everything else.
 
 **Reading.** `stream_after(stream, sent, max, out)` fills `out` with the

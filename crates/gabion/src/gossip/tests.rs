@@ -2571,7 +2571,7 @@ fn ack_for_another_incarnation_is_ignored() {
 
         let ack = |incarnation| AckInfo {
             incarnation,
-            own: wire::OwnAck::Plain(3),
+            own: wire::OwnAck::Direct(3),
             ..AckInfo::default()
         };
         let mark = wire.attempts.borrow().len();

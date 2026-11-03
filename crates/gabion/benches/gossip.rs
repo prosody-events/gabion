@@ -269,9 +269,9 @@ impl World {
                 }) => {
                     self.peers[p].own = if relay_into_zone {
                         self.gateways[zone(p)] = Some(p);
-                        OwnAck::Flagged(range.upper())
+                        OwnAck::AsGateway(range.upper())
                     } else {
-                        OwnAck::Plain(range.upper())
+                        OwnAck::Direct(range.upper())
                     };
                     probe
                 }
@@ -370,7 +370,7 @@ impl Bench {
                 .map(|p| Peer {
                     identity: NodeIdentity::new(NodeId(0xBEEF << 64 | p as u128), INCARNATION),
                     zone: zone_name(zone(p)).hash(),
-                    own: OwnAck::Plain(0),
+                    own: OwnAck::Direct(0),
                     relay: 0,
                     next: 0,
                     cannot_relay: false,

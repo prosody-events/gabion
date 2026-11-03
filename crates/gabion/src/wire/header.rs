@@ -17,7 +17,7 @@ const RELAY_INTO_ZONE: u8 = 0x01;
 const GAP_OWN: u8 = 0x02;
 const GAP_RELAY: u8 = 0x04;
 const CANNOT_RELAY: u8 = 0x08;
-const ACK_FLAGGED: u8 = 0x10;
+const ACK_AS_GATEWAY: u8 = 0x10;
 const PROBE_REPLY: u8 = 0x20;
 const PROBE: u8 = 0x40;
 const RESERVED: u8 = 0x80;
@@ -115,14 +115,16 @@ impl From<CellPayload> for Payload {
 /// The sender's mark for the addressee's own stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnAck {
-    Plain(u64),
-    /// The mark of the addressee's flagged ranges (`ACK_FLAGGED`).
-    Flagged(u64),
+    /// The mark of the addressee's ranges received directly.
+    Direct(u64),
+    /// The mark of the addressee's ranges received as its gateway
+    /// (`ACK_AS_GATEWAY`).
+    AsGateway(u64),
 }
 
 impl Default for OwnAck {
     fn default() -> Self {
-        Self::Plain(0)
+        Self::Direct(0)
     }
 }
 
@@ -172,15 +174,15 @@ pub(crate) fn write_header<P: Copy + Into<Payload>>(
         Payload::SweepRequest => (PacketKind::SweepRequest, None, false, false),
     };
     let acks = header.acks;
-    let (ack_own, ack_flagged) = match acks.own {
-        OwnAck::Plain(mark) => (mark, false),
-        OwnAck::Flagged(mark) => (mark, true),
+    let (ack_own, ack_as_gateway) = match acks.own {
+        OwnAck::Direct(mark) => (mark, false),
+        OwnAck::AsGateway(mark) => (mark, true),
     };
     let flags = bit(relay_into_zone, RELAY_INTO_ZONE)
         | bit(acks.gap_own, GAP_OWN)
         | bit(acks.gap_relay, GAP_RELAY)
         | bit(acks.cannot_relay, CANNOT_RELAY)
-        | bit(ack_flagged, ACK_FLAGGED)
+        | bit(ack_as_gateway, ACK_AS_GATEWAY)
         | bit(acks.probe_reply, PROBE_REPLY)
         | bit(probe, PROBE);
     let (lower, upper) = range.map_or((0, 0), |r| (r.lower, r.upper));
@@ -243,10 +245,10 @@ pub(crate) fn read_header(
         sender_zone: ZoneHash::from_wire(read_u32(&bytes[44..])),
         acks: AckInfo {
             incarnation: read_u32(&bytes[50..]),
-            own: if flags & ACK_FLAGGED == 0 {
-                OwnAck::Plain(ack_own)
+            own: if flags & ACK_AS_GATEWAY == 0 {
+                OwnAck::Direct(ack_own)
             } else {
-                OwnAck::Flagged(ack_own)
+                OwnAck::AsGateway(ack_own)
             },
             relay: read_u64(&bytes[62..]),
             gap_own: flags & GAP_OWN != 0,

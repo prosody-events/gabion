@@ -672,7 +672,7 @@ fn first_member_of_a_new_zone_sweeps_from_any_zone() {
 }
 
 /// A gateway that forgot its origin's stream (discovery removed and re-added
-/// the origin, with no restart) reports a flagged gap from 0: the origin
+/// the origin, with no restart) reports a gateway gap from 0: the origin
 /// rewinds below its `acked` and resends flagged, the gap closes instead of
 /// being abandoned, and the zone ends exact.
 #[test]
@@ -707,7 +707,7 @@ fn gateway_that_forgot_the_stream_is_resynced() {
 }
 
 /// O cannot reach its gateway G, which still reaches O: G's packets repeat
-/// the stuck flagged ack of O's hit before the cut. O fails over once, on its
+/// the stuck gateway ack of O's hit before the cut. O fails over once, on its
 /// first change after the cut, within `suspect_after` plus a heartbeat and two
 /// relay floors, and stays failed over while the cut lasts; the other member
 /// holds O's hits. An idle O asks G nothing while the cut lasts (it still
@@ -1076,7 +1076,7 @@ fn unheard_peer_gets_new_own_cells_and_greetings() {
 }
 
 /// A peer of another zone that the origin discovers late is first sent the
-/// origin's new cells unflagged, above the stream's start; it merges them but
+/// origin's new cells directly, above the stream's start; it merges them but
 /// opens no gap, since the origin stops once it hears that peer's zone, so a
 /// healthy start abandons none.
 #[test]
@@ -1104,7 +1104,7 @@ fn late_peer_of_another_zone_opens_no_gap() {
             let own = own_packets(&tapped(&taps, 0));
             assert!(
                 own.contains(&(b[1], 3, false)),
-                "b[1] got O's new cells unflagged"
+                "b[1] got O's new cells directly"
             );
             for node in &nodes {
                 assert_eq!(node.counters().await.gaps_abandoned, 0, "{}", node.addr);
@@ -1580,7 +1580,7 @@ fn new_gateway_is_probed_until_it_answers() {
         let mark = wire.attempts.borrow().len();
         let answer = AckInfo {
             incarnation: 1,
-            own: wire::OwnAck::Flagged(0),
+            own: wire::OwnAck::AsGateway(0),
             probe_reply: true,
             ..AckInfo::default()
         };
@@ -1675,7 +1675,7 @@ fn held_sweep_page_starts_no_wait() {
                 heartbeats(1).await;
                 let acked = AckInfo {
                     incarnation: 1,
-                    own: wire::OwnAck::Flagged(1),
+                    own: wire::OwnAck::AsGateway(1),
                     ..AckInfo::default()
                 };
                 let ack = Payload::Ack { probe: false };
@@ -1769,7 +1769,7 @@ fn held_probe_starts_its_wait_when_it_leaves() {
         );
         let acks = AckInfo {
             incarnation: 1,
-            own: wire::OwnAck::Flagged(1),
+            own: wire::OwnAck::AsGateway(1),
             ..AckInfo::default()
         };
         let ack = Payload::Ack { probe: false };
@@ -1819,9 +1819,9 @@ fn probe_answer_counts_only_for_this_incarnation() {
 }
 
 /// A packet from an address outside the peer table is merged and never acked:
-/// the sender gets no row and no packet. Flagged, the cells it raised are
-/// relayed into the zone, since it may be an origin this gateway has not yet
-/// discovered; unflagged, they are not.
+/// the sender gets no row and no packet. If the packet is flagged, the cells
+/// it raised are relayed into the zone, since it may be an origin this gateway
+/// has not yet discovered; if not, they are not.
 #[test]
 fn unknown_sender_is_never_acked() {
     for flagged in [true, false] {
@@ -1963,7 +1963,7 @@ async fn lost_attempts(withheld: usize, late: impl Fn(u64) -> u64) -> (u64, Opti
         for &(_, dst, peer) in due.iter().filter(|(at, ..)| *at == t) {
             let acks = AckInfo {
                 incarnation: 1,
-                own: wire::OwnAck::Flagged(1),
+                own: wire::OwnAck::AsGateway(1),
                 probe_reply: true,
                 ..AckInfo::default()
             };
@@ -2082,15 +2082,22 @@ fn local_stall_suspects_nobody() {
             ..AckInfo::default()
         };
         let ack = Payload::Ack { probe: false };
-        let (plain, flagged) = (wire::OwnAck::Plain(1), wire::OwnAck::Flagged(1));
-        inject_zoned(&wire, z, node(0xB), Some(zone("a")), answer(plain, 3), ack);
-        inject_zoned(&wire, o, origin, Some(zone("b")), answer(flagged, 0), ack);
+        let (direct, as_gateway) = (wire::OwnAck::Direct(1), wire::OwnAck::AsGateway(1));
+        inject_zoned(&wire, z, node(0xB), Some(zone("a")), answer(direct, 3), ack);
+        inject_zoned(
+            &wire,
+            o,
+            origin,
+            Some(zone("b")),
+            answer(as_gateway, 0),
+            ack,
+        );
         inject_zoned(
             &wire,
             p,
             node(0xC),
             Some(zone("b")),
-            answer(flagged, 0),
+            answer(as_gateway, 0),
             ack,
         );
         heartbeats(12).await;
@@ -2266,7 +2273,7 @@ fn gateway_behind_send_errors_fails_over() {
 
 /// A new gateway that held an origin's cells directly relays every one when
 /// the origin's rewound flagged packets arrive: a lost first packet opens a
-/// flagged gap, reported with `ACK_FLAGGED`, and a reordered one is still
+/// gateway gap, reported with `ACK_AS_GATEWAY`, and a reordered one is still
 /// fresh, so each cell is relayed exactly once in total.
 #[test]
 fn handoff_with_first_rewound_packet_lost_ends_exact() {
@@ -2286,10 +2293,10 @@ fn handoff_with_first_rewound_packet_lost_ends_exact() {
                     wire.inbound.borrow_mut().push_back((packet.clone(), o));
                 }
             };
-            let plain: Vec<_> = (0..4)
+            let direct: Vec<_> = (0..4)
                 .flat_map(|i| cell_packets(origin, 25 * i, 25 * (i + 1), false))
                 .collect();
-            inject_all(&plain);
+            inject_all(&direct);
             heartbeats(1).await;
             let mark = wire.attempts.borrow().len();
             let flagged: Vec<_> = (0..4)
@@ -2303,8 +2310,8 @@ fn handoff_with_first_rewound_packet_lost_ends_exact() {
                     .iter()
                     .map(|a| header_of(&a.bytes))
                     .find(|h| h.acks.gap_own)
-                    .expect("a flagged gap report");
-                assert_eq!(report.acks.own, wire::OwnAck::Flagged(0));
+                    .expect("a gateway gap report");
+                assert_eq!(report.acks.own, wire::OwnAck::AsGateway(0));
                 inject_all(&flagged[..1]);
             } else {
                 inject_all(&[flagged[1].clone(), flagged[0].clone()]);

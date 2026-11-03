@@ -404,13 +404,13 @@ impl Answer {
 }
 
 /// Which kind of own-stream packet the peer sent last: it picks the mark this
-/// node acks, the `ACK_FLAGGED` bit, and the gap it reports.
+/// node acks, the `ACK_AS_GATEWAY` bit, and the gap it reports.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) enum OwnMode {
     #[default]
-    Plain,
+    Direct,
     /// The last own packet carried `RELAY_INTO_ZONE`.
-    Flagged,
+    AsGateway,
 }
 
 /// What this node has learned of a peer. Before its first packet, the zone
@@ -447,10 +447,11 @@ pub(super) struct PeerLink {
     prev_incarnation: Option<Incarnation>,
     answer: Answer,
     out: PerStream<Outbound>,
-    /// The peer's own stream as this node receives it: unflagged ranges, and
-    /// the ranges flagged `RELAY_INTO_ZONE`, each with its own mark.
+    /// The peer's own stream as this node receives it: directly, and as the
+    /// peer's gateway (ranges flagged `RELAY_INTO_ZONE`), each with its own
+    /// mark.
     own_in: Inbound,
-    flagged_in: Inbound,
+    gateway_in: Inbound,
     own_mode: OwnMode,
     /// The peer's relay stream.
     relay_in: Inbound,
@@ -476,8 +477,8 @@ impl PeerLink {
     /// packet it sent last.
     pub(super) fn own_ack(&self) -> OwnAck {
         match self.own_mode {
-            OwnMode::Plain => OwnAck::Plain(self.own_in.have),
-            OwnMode::Flagged => OwnAck::Flagged(self.flagged_in.have),
+            OwnMode::Direct => OwnAck::Direct(self.own_in.have),
+            OwnMode::AsGateway => OwnAck::AsGateway(self.gateway_in.have),
         }
     }
 
@@ -488,8 +489,8 @@ impl PeerLink {
     /// The own-stream mark whose gap is reported; the other is inert.
     fn own_mark(&mut self) -> &mut Inbound {
         match self.own_mode {
-            OwnMode::Plain => &mut self.own_in,
-            OwnMode::Flagged => &mut self.flagged_in,
+            OwnMode::Direct => &mut self.own_in,
+            OwnMode::AsGateway => &mut self.gateway_in,
         }
     }
 }
@@ -839,9 +840,9 @@ impl PeerTable {
     }
 
     /// A packet of the peer's own stream closing `range` arrived, flagged or
-    /// not; returns whether a flagged one is fresh, above the flagged mark
+    /// not; returns whether a flagged one is fresh, above the gateway mark
     /// as it was. The kind picks the mark it moves and the ack sent back. A
-    /// plain range from a peer of another known zone is not tracked.
+    /// direct range from a peer of another known zone is not tracked.
     pub(super) fn receive_own(
         &mut self,
         row: usize,
@@ -850,18 +851,18 @@ impl PeerTable {
         now: u64,
         floor_ms: u64,
     ) -> bool {
-        // A peer of another zone sends its own stream unflagged only until it
+        // A peer of another zone sends its own stream directly only until it
         // hears this node's zone, then stops: merged, not tracked, so no gap
         // opens on a stream that stops.
         if !flagged && self.remote_zone(row).is_some() {
             return false;
         }
         let link = &mut self.link[row];
-        let fresh = flagged && range.upper() > link.flagged_in.have;
+        let fresh = flagged && range.upper() > link.gateway_in.have;
         link.own_mode = if flagged {
-            OwnMode::Flagged
+            OwnMode::AsGateway
         } else {
-            OwnMode::Plain
+            OwnMode::Direct
         };
         link.own_mark().receive(range, now, floor_ms);
         self.flags[row].set(PeerFlags::ACK_DUE, true);
@@ -898,13 +899,13 @@ impl PeerTable {
     }
 
     /// Credit a packet's acks against `heads`, the own and relay heads. The
-    /// own-stream ack counts on a `Gateway` row only flagged and on a `Zone`
-    /// or `Unheard` row only plain; the relay ack only on a `Zone` row; and
-    /// only for this node's current incarnation. `CANNOT_RELAY` from a remote
-    /// zone makes the row suspect at once and its acks no progress; other
-    /// progress settles the row, or restarts its wait while data is owed, and
-    /// a probe answer from a suspect, or from a gateway that has acked
-    /// nothing, rewinds each stream it is owed.
+    /// own-stream ack counts on a `Gateway` row only as a gateway ack and on a
+    /// `Zone` or `Unheard` row only as a direct ack; the relay ack only on a
+    /// `Zone` row; and only for this node's current incarnation. `CANNOT_RELAY`
+    /// from a remote zone makes the row suspect at once and its acks no
+    /// progress; other progress settles the row, or restarts its wait while
+    /// data is owed, and a probe answer from a suspect, or from a gateway that
+    /// has acked nothing, rewinds each stream it is owed.
     pub(super) fn credit(
         &mut self,
         row: usize,
@@ -920,8 +921,8 @@ impl PeerTable {
         let mut credit = Credit::default();
         let mut progress = false;
         let own_ack = match (role, acks.own) {
-            (Role::Zone | Role::Unheard, OwnAck::Plain(ack))
-            | (Role::Gateway, OwnAck::Flagged(ack)) => Some(ack),
+            (Role::Zone | Role::Unheard, OwnAck::Direct(ack))
+            | (Role::Gateway, OwnAck::AsGateway(ack)) => Some(ack),
             _ => None,
         };
         if let Some(ack) = own_ack.filter(|_| current) {

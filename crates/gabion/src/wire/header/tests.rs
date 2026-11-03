@@ -36,9 +36,9 @@ impl Arbitrary for AnyHeader {
             acks: AckInfo {
                 incarnation: u32::arbitrary(g),
                 own: if bool::arbitrary(g) {
-                    OwnAck::Flagged(mark)
+                    OwnAck::AsGateway(mark)
                 } else {
-                    OwnAck::Plain(mark)
+                    OwnAck::Direct(mark)
                 },
                 relay: u64::arbitrary(g),
                 gap_own: bool::arbitrary(g),
@@ -76,7 +76,7 @@ fn header_v2_layout_is_pinned() {
         sender_zone: ZoneHash::from_wire(0x3132_3334),
         acks: AckInfo {
             incarnation: 0x4142_4344,
-            own: OwnAck::Flagged(0x5152_5354_5556_5758),
+            own: OwnAck::AsGateway(0x5152_5354_5556_5758),
             relay: 0x6162_6364_6566_6768,
             gap_own: true,
             gap_relay: true,
@@ -125,7 +125,7 @@ fn header_v2_layout_is_pinned() {
     assert_eq!(flags(|acks| acks.gap_own = true), 0x02);
     assert_eq!(flags(|acks| acks.gap_relay = true), 0x04);
     assert_eq!(flags(|acks| acks.cannot_relay = true), 0x08);
-    assert_eq!(flags(|acks| acks.own = OwnAck::Flagged(0)), 0x10);
+    assert_eq!(flags(|acks| acks.own = OwnAck::AsGateway(0)), 0x10);
     assert_eq!(flags(|acks| acks.probe_reply = true), 0x20);
 }
 

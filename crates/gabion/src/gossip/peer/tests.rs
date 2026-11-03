@@ -478,12 +478,12 @@ fn incarnation_change_resets_the_whole_row() {
         (link.out.relay, table.sent.relay[0]),
         (Outbound::default(), 0)
     );
-    for mark in [link.own_in, link.flagged_in, link.relay_in] {
+    for mark in [link.own_in, link.gateway_in, link.relay_in] {
         assert_eq!(mark, Inbound::default());
     }
     assert_eq!(
         (link.own_mode, link.answer),
-        (OwnMode::Plain, Answer::Settled)
+        (OwnMode::Direct, Answer::Settled)
     );
     assert_eq!(link.zone(), Some(zone(2)));
     assert_eq!(table.flags(0), PeerFlags::default());
@@ -808,9 +808,9 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
                 AckInfo {
                     incarnation: 7,
                     own: if table.role(0) == Role::Gateway {
-                        OwnAck::Flagged(own)
+                        OwnAck::AsGateway(own)
                     } else {
-                        OwnAck::Plain(own)
+                        OwnAck::Direct(own)
                     },
                     relay: if progress.relay {
                         table.sent.relay[0]
@@ -926,17 +926,17 @@ fn answer_matches_its_model(ops: Vec<AnswerOp>) {
     }
 }
 
-/// An own-stream ack counts on an `Unheard` or `Zone` row only plain and on
-/// a `Gateway` row only flagged, and a `GAP_OWN` report rewinds a forgotten
-/// stream only when its kind matches the role; becoming the gateway rewinds
-/// the own stream to 0. A peer's first packet is credited before the roles
-/// refresh, so its row is still `Unheard` then.
+/// An own-stream ack counts on an `Unheard` or `Zone` row only as a direct
+/// ack and on a `Gateway` row only as a gateway ack, and a `GAP_OWN` report
+/// rewinds a forgotten stream only when its kind matches the role; becoming
+/// the gateway rewinds the own stream to 0. A peer's first packet is credited
+/// before the roles refresh, so its row is still `Unheard` then.
 #[test]
 fn own_acks_count_only_in_the_kind_the_role_receives() {
     for (role, counted, ignored) in [
-        (Role::Unheard, OwnAck::Plain(3), OwnAck::Flagged(3)),
-        (Role::Zone, OwnAck::Plain(3), OwnAck::Flagged(3)),
-        (Role::Gateway, OwnAck::Flagged(3), OwnAck::Plain(3)),
+        (Role::Unheard, OwnAck::Direct(3), OwnAck::AsGateway(3)),
+        (Role::Zone, OwnAck::Direct(3), OwnAck::AsGateway(3)),
+        (Role::Gateway, OwnAck::AsGateway(3), OwnAck::Direct(3)),
     ] {
         let mut table = table();
         table.insert(Peer::new(addr(0)), 0);
@@ -956,8 +956,8 @@ fn own_acks_count_only_in_the_kind_the_role_receives() {
         assert_eq!(table.link[0].out.own.acked, 3, "{role:?}");
         // A forgotten stream: a gap report below `acked`.
         let below = |own: OwnAck| match own {
-            OwnAck::Plain(_) => OwnAck::Plain(1),
-            OwnAck::Flagged(_) => OwnAck::Flagged(1),
+            OwnAck::Direct(_) => OwnAck::Direct(1),
+            OwnAck::AsGateway(_) => OwnAck::AsGateway(1),
         };
         table.credit(0, acks(below(ignored), true), 7, heads(5), 1_000);
         assert_eq!(table.link[0].out.own.acked, 3, "{role:?}");
@@ -1095,28 +1095,28 @@ const OWN_GAP: PerStream<GapDue> = PerStream {
     relay: GapDue::Nothing,
 };
 
-/// Flagged own ranges move their own mark: a lost first flagged packet opens
-/// a flagged gap although the plain mark is past it, freshness is judged
-/// against the flagged mark, and only the gap of the kind received last is
+/// Gateway ranges move their own mark: a lost first flagged packet opens a
+/// gateway gap although the direct mark is past it, freshness is judged
+/// against the gateway mark, and only the gap of the kind received last is
 /// reported, with the ack of that kind.
 #[test]
-fn flagged_ranges_keep_their_own_mark() {
+fn gateway_ranges_keep_their_own_mark() {
     let mut table = one_row();
     assert!(!table.receive_own(0, range(0, 10), false, 1_000, FLOOR));
     assert!(table.receive_own(0, range(3, 6), true, 1_000, FLOOR));
     let link = table.link[0];
-    assert_eq!((link.own_in.have, link.flagged_in.have), (10, 0));
-    assert_eq!(link.own_ack(), OwnAck::Flagged(0));
+    assert_eq!((link.own_in.have, link.gateway_in.have), (10, 0));
+    assert_eq!(link.own_ack(), OwnAck::AsGateway(0));
     assert!(table.flags(0).has(PeerFlags::GAP_OPEN));
     let reports = table.take_reports(0, 1_000 + FLOOR, FLOOR);
     assert_eq!(reports, OWN_GAP);
-    // The lost packet arrives late: fresh, as it lies above the flagged mark.
+    // The lost packet arrives late: fresh, as it lies above the gateway mark.
     assert!(table.receive_own(0, range(0, 3), true, 1_010, FLOOR));
-    assert_eq!(table.link[0].flagged_in.have, 6);
+    assert_eq!(table.link[0].gateway_in.have, 6);
     assert!(!table.receive_own(0, range(2, 6), true, 1_010, FLOOR));
-    // A plain packet makes the plain mark the one acked and reported.
+    // A direct packet makes the direct mark the one acked and reported.
     table.receive_own(0, range(12, 14), false, 1_010, FLOOR);
-    assert_eq!(table.link[0].own_ack(), OwnAck::Plain(10));
+    assert_eq!(table.link[0].own_ack(), OwnAck::Direct(10));
     let reports = table.take_reports(0, 1_010 + FLOOR, FLOOR);
     assert_eq!(reports, OWN_GAP);
 }

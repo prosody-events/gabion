@@ -247,11 +247,11 @@ cell store keeps each on one ordered list, so `stream_after(stream, sent)`
 reads what a peer has not been sent without a scan. Zone peers get both
 streams, a gateway the own stream flagged, other members of a remote zone
 neither, and a peer not yet heard from, of no zone discovery named, only the
-own cells raised since it was added. A flagged packet marks its cells for relay: all of them when its
-range ends above the receiver's *flagged* mark (so a new gateway relays what
-it held directly), else those the merge raised; an unflagged packet takes
-the cells it raised off the relay list, since its sender is responsible for
-them. For each peer the runtime keeps `sent` and the peer's last ack,
+own cells raised since it was added. A flagged packet marks its cells for
+relay: all of them when its range ends above the receiver's *gateway* mark
+(so a new gateway relays what it held directly), else those the merge
+raised; any other packet takes the cells it raised off the relay list, since
+its sender is responsible for them. For each peer the runtime keeps `sent` and the peer's last ack,
 `acked`. Heartbeat and threshold rounds send each peer the cells above its
 `sent`, at most `q` a round, where `q` is `⌈storage.max_cells / 128⌉` or one
 packet, whichever is larger; a stream with more waiting goes on in the next
@@ -260,7 +260,7 @@ range through the head, so cells that expired unsent are not owed.
 
 The receiver keeps `have`, the highest position it holds contiguously, and
 returns it on every packet it sends back, or alone at its next heartbeat.
-A packet above `have` opens a gap (an unflagged one from a peer of another
+A packet above `have` opens a gap (a direct one from a peer of another
 zone, sent before it heard this node's zone, is merged but opens none):
 after one relay floor (`min_emit_interval`) the receiver reports it, and the
 sender rewinds to the report's ack and resends on a prompt round. A gap
@@ -269,10 +269,11 @@ above `have` reopens it. A stream unacknowledged for
 one heartbeat times out and is resent with `PROBE`, which the peer answers
 on a prompt round. Acks name the incarnation they answer, so an ack written
 for a restarted process credits nothing; a peer's new incarnation resets
-both directions of its stream. The receiver keeps flagged own ranges on a
-mark of their own and says which mark an ack carries (`ACK_FLAGGED`); a
-gateway's acks count only flagged, a zone peer's only plain. A peer whose
-role changes so that it gains a stream is resent that stream from 0.
+both directions of its stream. The receiver keeps the own ranges it gets as
+the origin's gateway on a mark of their own, the gateway mark, and says which
+mark an ack carries (`ACK_AS_GATEWAY`); a gateway's acks count only as
+gateway acks, a zone peer's only as direct acks. A peer whose role changes so
+that it gains a stream is resent that stream from 0.
 
 A peer is *suspect* once a packet that asks for an answer (data, or a
 probe that retries it) has gone unanswered for `gossip.suspect_after` (by default four
