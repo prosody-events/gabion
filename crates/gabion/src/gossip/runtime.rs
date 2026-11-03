@@ -30,7 +30,7 @@ use crate::crdt::{
     ObservationBatch, RelayMark, Stream, hash_fingerprint,
 };
 use crate::defaults::{self, GOSSIP_GAP_REPORTS, GOSSIP_MIN_DATAGRAM_CHARGE, GOSSIP_SWEEP_PEERS};
-use crate::discovery::{Membership, Peer, PeerEvent};
+use crate::discovery::{Membership, OwnEntry, Peer, PeerEvent};
 use crate::settings::Setting;
 use crate::throttle;
 use crate::wire::{
@@ -487,7 +487,13 @@ where
                 && (self.peers.link(row).identity()).is_none_or(|id| id.node_id == local.node_id)
             {
                 self.peers.remove(src);
-                self.prompt_work |= self.peers.stale();
+                self.prompt_work = true;
+                tracing::debug!(
+                    peer = %src,
+                    cluster_size = self.peers.len(),
+                    "This node's own address is in its static peer list; it dropped that entry \
+                     and gossips only with the others.",
+                );
             }
             return;
         }
@@ -771,7 +777,7 @@ where
                 }
                 self.prompt_work = true;
             }
-            PeerEvent::OwnEntry { zone, node_name } => {
+            PeerEvent::OwnEntry(OwnEntry { zone, node_name }) => {
                 if let Some(zone) = self.own_zone.own_entry(zone, node_name) {
                     self.peers.adopt_zone(zone);
                     // Same-zone peers may now differ: sweep again.

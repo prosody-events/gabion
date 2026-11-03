@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests;
 
-use crate::discovery::{DiscoveryConfig, Peer, PeerDiscovery, PeerEvent, SelfMatch};
+use crate::discovery::{DiscoveryConfig, OwnEntry, Peer, PeerDiscovery, PeerEvent, SelfMatch};
 use crate::zone::{ZoneHash, ZoneName};
 use ahash::{AHashMap, AHashSet};
 use async_stream::stream;
@@ -206,17 +206,8 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                         }
                         Ok(Event::Apply(slice) | Event::InitApply(slice)) => {
                             let self_match = self.config.self_match.as_ref();
-                            let diff = peer_set.apply(id, &slice, self_match);
-                            // The own zone first, so the roles the peers
-                            // below take already see it.
-                            if let Some(own) = diff.own {
-                                yield Ok(own.into());
-                            }
-                            for peer in diff.removed {
-                                yield Ok(PeerEvent::Removed(peer));
-                            }
-                            for peer in diff.added {
-                                yield Ok(PeerEvent::Added(peer));
+                            for event in peer_set.apply(id, &slice, self_match).into_events() {
+                                yield Ok(event);
                             }
                         }
                         Ok(Event::Delete(slice)) => {
@@ -489,22 +480,6 @@ struct Slices {
     unlisted: AHashSet<String>,
 }
 
-/// This node's own entry, as discovery reports it.
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct OwnEntry {
-    pub(super) zone: Option<ZoneName>,
-    pub(super) node_name: Option<Box<str>>,
-}
-
-impl From<OwnEntry> for PeerEvent {
-    fn from(own: OwnEntry) -> Self {
-        PeerEvent::OwnEntry {
-            zone: own.zone,
-            node_name: own.node_name,
-        }
-    }
-}
-
 /// What `apply` changed relative to the previous snapshot for that
 /// slice — separated so the caller can emit the own zone first and
 /// `Removed` before `Added` (matching how the kube-rs watcher reports an
@@ -515,6 +490,17 @@ pub(super) struct PeerSetDiff {
     pub(super) own: Option<OwnEntry>,
     pub(super) added: Vec<Peer>,
     pub(super) removed: Vec<Peer>,
+}
+
+impl PeerSetDiff {
+    /// The diff as peer events: the own entry first, so the roles the peers
+    /// after it take already see its zone, then `Removed` before `Added`.
+    pub(super) fn into_events(self) -> impl Iterator<Item = PeerEvent> {
+        let own = self.own.map(PeerEvent::OwnEntry);
+        own.into_iter()
+            .chain(self.removed.into_iter().map(PeerEvent::Removed))
+            .chain(self.added.into_iter().map(PeerEvent::Added))
+    }
 }
 
 impl EndpointSlicePeerSet {

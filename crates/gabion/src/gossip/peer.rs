@@ -563,10 +563,11 @@ enum Rank {
 pub(super) enum SweepScope {
     /// Those of this node's zone.
     Zone,
-    /// Any zone's, once every peer is heard and none is of this zone.
+    /// Any zone's, once no peer is unheard of unknown zone and none, heard or
+    /// not, is of this zone.
     AnyZone,
-    /// Any zone's, once no heard peer is of this zone: the want waited
-    /// `gossip.zone_grace`, so a peer not yet heard counts as absent.
+    /// Any zone's: the want waited `gossip.zone_grace`, so a peer not yet
+    /// heard counts as absent. Passed only when no heard peer is of this zone.
     AnyZoneAfterGrace,
 }
 
@@ -1276,19 +1277,21 @@ impl PeerTable {
     /// The heard peers a join sweep may ask, with their weights: those of
     /// this node's zone, or in an any-zone scope every one that speaks this
     /// version, but only while no peer is or may be of this zone: none unheard
-    /// of unknown zone, and none, heard or not, of this zone. After
-    /// `gossip.zone_grace` a peer not yet heard no longer counts. An unheard
-    /// peer may not know this node yet, and would ignore the request.
+    /// of unknown zone, and none, heard or not, of this zone.
+    /// `AnyZoneAfterGrace` asks across zones unconditionally; its caller has
+    /// found no heard peer of this zone. An unheard peer may not know this
+    /// node yet, and would ignore the request.
     pub(super) fn sweep_candidates(
         &self,
         scope: SweepScope,
     ) -> impl Iterator<Item = (u64, SocketAddr)> + '_ {
-        let any_zone = scope != SweepScope::Zone
-            && !(0..self.len).any(|row| {
-                matches!(self.role[row], Role::Unheard | Role::Zone)
-                    && !(scope == SweepScope::AnyZoneAfterGrace
-                        && self.link[row].identity().is_none())
-            });
+        let any_zone = match scope {
+            SweepScope::Zone => false,
+            SweepScope::AnyZone => !self.role[..self.len]
+                .iter()
+                .any(|role| matches!(role, Role::Unheard | Role::Zone)),
+            SweepScope::AnyZoneAfterGrace => true,
+        };
         (0..self.len)
             .filter(move |&row| {
                 let asks = match self.role[row] {

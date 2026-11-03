@@ -44,14 +44,18 @@ pub enum PeerEvent {
     Added(Peer),
     /// A peer left; its `zone` is ignored.
     Removed(Peer),
-    /// This node's own entry, the first time discovery sees it and whenever
-    /// its zone changes: the zone it names, if any, and the Kubernetes node
-    /// it runs on. The runtime adopts the zone only while it knows none, then
-    /// recomputes every peer's role and asks for a join sweep.
-    OwnEntry {
-        zone: Option<ZoneName>,
-        node_name: Option<Box<str>>,
-    },
+    /// This node's own entry.
+    OwnEntry(OwnEntry),
+}
+
+/// This node's own entry, the first time discovery sees it and whenever its
+/// zone changes: the zone it names, if any, and the Kubernetes node it runs
+/// on. The runtime adopts the zone only while it knows none, then recomputes
+/// every peer's role and asks for a join sweep.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnEntry {
+    pub zone: Option<ZoneName>,
+    pub node_name: Option<Box<str>>,
 }
 
 /// How a node finds its peers, built once by
@@ -61,8 +65,8 @@ pub enum Membership {
     /// Kubernetes EndpointSlice discovery: `gossip.bootstrap_peers` is empty.
     Kubernetes(DiscoveryConfig),
     /// `gossip.bootstrap_peers`: the runtime seeds its peer table with them
-    /// at construction and never removes one, and the Kubernetes watcher
-    /// never starts.
+    /// at construction and removes none but the row this node's own packets
+    /// come from, and the Kubernetes watcher never starts.
     Static(Box<[SocketAddr]>),
     /// No gossip bind (NGINX without `gabion_gossip_bind`): no peers.
     Alone,
@@ -160,7 +164,7 @@ fn host_name() -> Option<Box<str>> {
 }
 
 /// Kubernetes discovery's settings, filled from the settings table.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveryConfig {
     /// How the own entry is matched, which is then left out of the peers;
     /// `None` when neither `discovery.self_addr` nor the host name is known.

@@ -21,7 +21,7 @@ use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AdminCommand, AggregateStore, GossipRuntime, TokioClock};
 use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
 use gabion::settings::Settings;
-use gabion::zone::{ZoneName, ZoneSource, ZoneStatus};
+use gabion::zone::{UnknownZone, ZoneName, ZoneStatus};
 
 use crate::admin::{AdminState, admin_channel, router};
 
@@ -102,6 +102,7 @@ fn snapshot_json_shape_is_pinned() {
 
         let bootstrap = next_addr();
         gossip_config.membership = Membership::Static([bootstrap].into());
+        gossip_config.zone = Some(ZoneName::parse("use1-az2").expect("a zone name"));
         let tick = settings().tick_interval.duration();
 
         let (admin_tx, admin_rx) = admin_channel();
@@ -151,15 +152,12 @@ fn snapshot_json_shape_is_pinned() {
         );
         assert_eq!(
             body["zone"],
-            serde_json::json!({"name": null, "source": "none", "reason": "not_configured"})
+            serde_json::json!({"name": "use1-az2", "source": "config"})
         );
-        let known = ZoneStatus::Known {
-            name: ZoneName::parse("use1-az2").expect("a zone name"),
-            source: ZoneSource::EndpointSlice,
-        };
+        let unknown = ZoneStatus::Unknown(UnknownZone::OwnEntryNotFound);
         assert_eq!(
-            serde_json::to_value(known).expect("serialises"),
-            serde_json::json!({"name": "use1-az2", "source": "endpoint_slice"})
+            serde_json::to_value(unknown).expect("serialises"),
+            serde_json::json!({"name": null, "source": "none", "reason": "own_entry_not_found"})
         );
         assert_eq!(
             body["peers_by_role"],

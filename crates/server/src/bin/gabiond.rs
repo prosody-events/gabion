@@ -62,6 +62,10 @@ async fn run() -> anyhow::Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
 
     let config = load_config()?;
+    let gossip_bind = config
+        .settings
+        .gossip_bind
+        .ok_or(ConfigError::MissingGossipBind)?;
     let rule_table = Arc::new(config.rules);
     tracing::info!(
         gossip_bind = ?config.settings.gossip_bind,
@@ -90,11 +94,6 @@ async fn run() -> anyhow::Result<()> {
 
     let cell_store = CellStore::new(config.storage, identity, &rule_table);
     let counts = Arc::new(Aggregate::new(&config.storage));
-
-    let gossip_bind = config
-        .settings
-        .gossip_bind
-        .ok_or(ConfigError::MissingGossipBind)?;
 
     let (admin_tx, admin_rx) = admin::admin_channel();
 

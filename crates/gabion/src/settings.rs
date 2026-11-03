@@ -407,6 +407,11 @@ impl Settings {
                 capacity: self.peer_capacity,
             });
         }
+        if self.gossip_bind.is_none() && !self.bootstrap_peers.is_empty() {
+            return Err(SettingError::BootstrapPeersWithoutBind {
+                listed: self.bootstrap_peers.len(),
+            });
+        }
         let gossip = ValidGossipConfig {
             cluster_id_hash: self.cluster_id_hash,
             membership: self.membership(),
@@ -729,6 +734,10 @@ pub enum SettingError {
         listed: usize,
         capacity: NonZeroU16,
     },
+    /// `gossip.bootstrap_peers` lists peers, but no gossip bind is set.
+    BootstrapPeersWithoutBind {
+        listed: usize,
+    },
     InvalidZone {
         value: Box<str>,
         reason: ZoneError,
@@ -841,6 +850,16 @@ impl fmt::Display for SettingError {
                  least {listed}, or shorten the list.",
                 Setting::GossipBootstrapPeers,
                 Setting::GossipPeerCapacity,
+            ),
+            Self::BootstrapPeersWithoutBind { listed } => write!(
+                f,
+                "{} lists {listed} peers, but {} is not set, so this node would gossip with none \
+                 of them and enforce its limits on its own counts alone. Usually the bind line is \
+                 missing from this node's configuration. Set {} to the address this node gossips \
+                 on, or remove the list.",
+                Setting::GossipBootstrapPeers,
+                Setting::GossipBind,
+                Setting::GossipBind,
             ),
             Self::InvalidZone { ref value, reason } => write!(
                 f,

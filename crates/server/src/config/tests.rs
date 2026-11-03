@@ -229,11 +229,16 @@ fn sample(setting: Setting) -> &'static str {
 }
 
 /// Every setting's documented environment variable and YAML key reaches
-/// `Settings::apply`.
+/// `Settings::apply`. A static list comes with the gossip bind it needs.
 #[test]
 fn setting_table_spellings_parse() {
     for &setting in Setting::ALL {
+        let needs_bind = setting == Setting::GossipBootstrapPeers;
         let mut expected = Settings::default();
+        if needs_bind {
+            let bind = sample(Setting::GossipBind);
+            expected.apply(Setting::GossipBind, bind).expect("bind");
+        }
         expected
             .apply(setting, sample(setting))
             .expect("valid sample");
@@ -245,6 +250,9 @@ fn setting_table_spellings_parse() {
             setting.yaml_key().replace('.', "_").to_uppercase()
         );
         let _env = EnvGuard::lock();
+        if needs_bind {
+            set_env("GABION_GOSSIP_BIND", sample(Setting::GossipBind));
+        }
         set_env(&env_var, sample(setting));
         let from_env = AppConfig::load(None).unwrap_or_else(|error| panic!("{env_var}: {error}"));
         assert_eq!(from_env.settings, expected, "{env_var}");
@@ -256,8 +264,13 @@ fn setting_table_spellings_parse() {
         } else {
             value
         };
+        let bind = if needs_bind {
+            format!("  bind: \"{}\"\n", sample(Setting::GossipBind))
+        } else {
+            String::new()
+        };
         let yaml = match setting.yaml_key().split_once('.') {
-            Some((block, key)) => format!("{block}:\n  {key}: {value}\n"),
+            Some((block, key)) => format!("{block}:\n{bind}  {key}: {value}\n"),
             None => format!("{}: {value}\n", setting.yaml_key()),
         };
         let from_yaml =

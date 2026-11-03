@@ -9,7 +9,7 @@ use super::rounds::{Node, addrs, assert_totals, id, run_for};
 use super::*;
 use crate::crdt::hash_fingerprint;
 use crate::defaults::GOSSIP_GAP_REPORTS;
-use crate::discovery::{DiscoveryConfig, SelfMatch};
+use crate::discovery::{DiscoveryConfig, OwnEntry, SelfMatch};
 use crate::gossip::peer::rendezvous_weight;
 use crate::gossip::{AnswerState, PeerZone, RoleCounts};
 use crate::zone::{UnknownZone, ZoneHash, ZoneName, ZoneSource, ZoneStatus};
@@ -1120,10 +1120,10 @@ fn late_peer_of_another_zone_opens_no_gap() {
 
 /// Discovery found this node's own entry, in zone `name`.
 fn own_entry(name: &str) -> PeerEvent {
-    PeerEvent::OwnEntry {
+    PeerEvent::OwnEntry(OwnEntry {
         zone: ZoneName::parse(name).ok(),
         node_name: None,
-    }
+    })
 }
 
 /// A peer discovery places in zone `name`.
@@ -1442,6 +1442,15 @@ fn cell_packets(sender: NodeIdentity, lower: u64, upper: u64, flagged: bool) -> 
         out.push(buf.as_bytes().to_vec());
     }
     out
+}
+
+/// The destinations of the sweep requests sent from attempt `from` on.
+fn sweep_requests(wire: &Wire, from: usize) -> Vec<SocketAddr> {
+    sent_payloads(wire, from)
+        .into_iter()
+        .filter(|(_, payload)| *payload == Payload::SweepRequest)
+        .map(|(dst, _)| dst)
+        .collect()
 }
 
 /// Cells in the relay frames sent to `to` from attempt `from` on.
@@ -2353,13 +2362,7 @@ fn node_alone_in_its_zone_asks_one_peer_of_any_zone() {
         wire.refuse.set(true);
         heartbeats(1).await;
         wire.refuse.set(false);
-        let requests = |from| {
-            sent_payloads(&wire, from)
-                .into_iter()
-                .filter(|(_, payload)| *payload == Payload::SweepRequest)
-                .map(|(dst, _)| dst)
-                .collect::<Vec<_>>()
-        };
+        let requests = |from| sweep_requests(&wire, from);
         let key = hash_fingerprint(node(0xA).node_id.0);
         let top = [a, b]
             .into_iter()
@@ -2400,12 +2403,7 @@ fn join_sweep_waits_for_every_peer_before_asking_across_zones() {
         let (r, u) = (sock(2), sock(3));
         let wire = Rc::new(Wire::default());
         let (_client, _admin) = scripted(&wire, vec![r, u], "c", |_| {}).await;
-        let requests = |from| {
-            let sent = sent_payloads(&wire, from).into_iter();
-            sent.filter(|(_, payload)| *payload == Payload::SweepRequest)
-                .map(|(dst, _)| dst)
-                .collect::<Vec<_>>()
-        };
+        let requests = |from| sweep_requests(&wire, from);
         let ack = Payload::Ack { probe: false };
         inject_zoned(
             &wire,
@@ -2431,17 +2429,61 @@ fn join_sweep_waits_for_every_peer_before_asking_across_zones() {
     });
 }
 
+/// A packet carrying this node's own identity removes the row it came from
+/// only when that row is unheard or was heard with this node's id: a forged
+/// copy from a live peer's address removes nothing.
+#[test]
+fn own_identity_removes_only_its_own_row() {
+    run_paused(async {
+        let (a, s) = (sock(2), sock(3));
+        let local = node(0xA);
+        let wire = Rc::new(Wire::default());
+        let (_client, admin) = scripted(&wire, vec![a, s], "c", |_| {}).await;
+        introduce(&wire, &[(a, node(0xB), "c")]);
+        heartbeats(1).await;
+        let ack = Payload::Ack { probe: false };
+        inject(&wire, a, local, AckInfo::default(), ack);
+        heartbeats(1).await;
+        let peers = admin_snapshot(&admin).await.peers;
+        assert!(peers.iter().any(|p| p.addr == a), "{peers:?}");
+        let stale = NodeIdentity::new(local.node_id, local.incarnation + 1);
+        inject(&wire, s, stale, AckInfo::default(), ack);
+        heartbeats(1).await;
+        assert!(
+            admin_snapshot(&admin)
+                .await
+                .peers
+                .iter()
+                .any(|p| p.addr == s)
+        );
+        inject(&wire, s, local, AckInfo::default(), ack);
+        heartbeats(1).await;
+        let peers = admin_snapshot(&admin).await.peers;
+        assert!(peers.iter().all(|p| p.addr != s), "{peers:?}");
+        assert!(peers.iter().any(|p| p.addr == a), "{peers:?}");
+    });
+}
+
 // -- own zone -----------------------------------------------------------------
 
 /// A config whose membership is Kubernetes discovery matching its own entry
-/// by the pod name `gabion-0`, with `tune`.
-fn kubernetes_config(tune: impl FnOnce(&mut Settings)) -> ValidGossipConfig {
+/// by `self_match`, with `tune`.
+fn kubernetes_config(
+    self_match: Option<SelfMatch>,
+    tune: impl FnOnce(&mut Settings),
+) -> ValidGossipConfig {
     let mut config = tuned_config(vec![], tune);
     config.membership = Membership::Kubernetes(DiscoveryConfig {
-        self_match: Some(SelfMatch::PodName("gabion-0".into())),
-        ..DiscoveryConfig::default()
+        self_match,
+        namespace_allow: Box::default(),
+        service_allow: Box::default(),
     });
     config
+}
+
+/// This node matched by the pod name `gabion-0`.
+fn pod_name() -> Option<SelfMatch> {
+    Some(SelfMatch::PodName("gabion-0".into()))
 }
 
 /// SIM21: a node with a static list and no zone setting says at start, once,
@@ -2492,7 +2534,7 @@ fn zone_grace_setting_times_the_warning() {
         let ((), logs) = with_logs(|| {
             run_paused(async {
                 let router = SimRouter::new();
-                let config = kubernetes_config(|s| s.zone_grace = ms(3_000));
+                let config = kubernetes_config(pod_name(), |s| s.zone_grace = ms(3_000));
                 let node = Node::start(&router, sock(46_100), store_for(id(0, 1)), config);
                 run_for(500).await;
                 node.tell(PeerEvent::Added(Peer::new(sock(46_101))));
@@ -2515,6 +2557,80 @@ fn zone_grace_setting_times_the_warning() {
     }
 }
 
+/// A Kubernetes node that found no own entry and matches it by
+/// `discovery.self_addr`, or by nothing since its host name could not be
+/// read, says which in the warning and never claims the other.
+#[test]
+fn zone_unknown_names_how_the_own_entry_is_matched() {
+    let cases = [
+        (
+            Some(SelfMatch::Addr(sock(46_150))),
+            "self_match=\"self_addr\"",
+            "not read, since discovery.self_addr is set",
+        ),
+        (
+            None,
+            "self_match=\"none\"",
+            "could not be read, so set discovery.self_addr",
+        ),
+    ];
+    for (self_match, field, parenthetical) in cases {
+        let ((), logs) = with_logs(|| {
+            run_paused(async {
+                let router = SimRouter::new();
+                let config = kubernetes_config(self_match, |s| s.zone_grace = ms(1_000));
+                let node = Node::start(&router, sock(46_151), store_for(id(0, 1)), config);
+                node.tell(PeerEvent::Added(Peer::new(sock(46_152))));
+                run_for(1_200).await;
+                node.stop().await;
+            })
+        });
+        assert_logged(
+            &logs,
+            "zone_unknown",
+            1,
+            &["reason=\"own_entry_not_found\"", field],
+        );
+        assert!(logs.contains(parenthetical), "{logs}");
+        assert!(!logs.contains("`discovery.self_addr` is set"), "{logs}");
+        assert_eq!(
+            logs.contains("self_addr=127.0.0.1:46150"),
+            field.contains("self_addr"),
+            "{logs}"
+        );
+    }
+}
+
+/// A Kubernetes node whose own entry arrives within `gossip.zone_grace`,
+/// and a node alone, which has no own entry to wait for, never warn that
+/// the zone is unknown.
+#[test]
+fn own_entry_in_time_or_no_membership_never_warns() {
+    let ((), logs) = with_logs(|| {
+        run_paused(async {
+            let router = SimRouter::new();
+            let tune = |s: &mut Settings| s.zone_grace = ms(1_000);
+            let config = kubernetes_config(pod_name(), tune);
+            let found = Node::start(&router, sock(46_160), store_for(id(0, 1)), config);
+            found.tell(PeerEvent::Added(Peer::new(sock(46_161))));
+            run_for(500).await;
+            found.tell(own_entry("a"));
+            run_for(2_000).await;
+            let alone = Node::start(
+                &router,
+                sock(46_162),
+                store_for(id(1, 1)),
+                tuned_config(vec![], tune),
+            );
+            alone.tell(PeerEvent::Added(Peer::new(sock(46_163))));
+            run_for(2_000).await;
+            stop_all(vec![found, alone]).await;
+        })
+    });
+    assert_logged(&logs, "zone_unknown", 0, &[]);
+    assert_logged(&logs, "zone_known", 1, &["zone_source=\"endpoint_slice\""]);
+}
+
 /// An own entry without a zone leaves the zone unknown and, after the grace,
 /// names the node to label; a later entry with a zone is learned once, and
 /// neither a zoneless entry nor another zone changes it after that.
@@ -2523,12 +2639,12 @@ fn own_entry_without_a_zone_warns_with_its_node_then_learns_once() {
     let ((), logs) = with_logs(|| {
         run_paused(async {
             let router = SimRouter::new();
-            let config = kubernetes_config(|s| s.zone_grace = ms(1_000));
+            let config = kubernetes_config(pod_name(), |s| s.zone_grace = ms(1_000));
             let node = Node::start(&router, sock(46_200), store_for(id(0, 1)), config);
-            node.tell(PeerEvent::OwnEntry {
+            node.tell(PeerEvent::OwnEntry(OwnEntry {
                 zone: None,
                 node_name: Some("kind-worker".into()),
-            });
+            }));
             run_for(10).await;
             let unknown = ZoneStatus::Unknown(UnknownZone::OwnEntryHasNoZone);
             assert_eq!(node.snapshot().await.zone, unknown);
@@ -2540,10 +2656,10 @@ fn own_entry_without_a_zone_warns_with_its_node_then_learns_once() {
                 source: ZoneSource::EndpointSlice,
             };
             assert_eq!(node.snapshot().await.zone, known);
-            node.tell(PeerEvent::OwnEntry {
+            node.tell(PeerEvent::OwnEntry(OwnEntry {
                 zone: None,
                 node_name: Some("kind-worker".into()),
-            });
+            }));
             node.tell(own_entry("b"));
             run_for(10).await;
             assert_eq!(node.snapshot().await.zone, known);
@@ -2559,6 +2675,7 @@ fn own_entry_without_a_zone_warns_with_its_node_then_learns_once() {
             "node_name=\"kind-worker\"",
         ],
     );
+    assert_logged(&logs, "zone_conflict", 0, &[]);
     assert_logged(
         &logs,
         "zone_known",
@@ -2661,11 +2778,7 @@ fn lone_node_of_a_new_zone_sweeps_across_zones_after_zone_grace() {
         let (_client, _admin) =
             scripted(&wire, vec![r, u], "c", |s| s.zone_grace = ms(1_000)).await;
         let requests = |from| {
-            let sent = sent_payloads(&wire, from).into_iter();
-            let mut asked: Vec<_> = sent
-                .filter(|(_, payload)| *payload == Payload::SweepRequest)
-                .map(|(dst, _)| dst)
-                .collect();
+            let mut asked = sweep_requests(&wire, from);
             asked.dedup();
             asked
         };

@@ -169,14 +169,8 @@ fn endpoint_slice_peer_set_updates_and_deletes_snapshots() {
     assert_eq!(peer_set.snapshot_peers().len(), 2);
 
     let removed = peer_set.delete(T, &slice_a);
-    assert_eq!(
-        removed,
-        vec![Peer::new("10.0.0.2:18080".parse().expect("addr"))]
-    );
-    assert_eq!(
-        peer_set.snapshot_peers(),
-        vec![Peer::new("10.0.0.3:18080".parse().expect("addr"))]
-    );
+    assert_eq!(removed, [peer("10.0.0.2")]);
+    assert_eq!(peer_set.snapshot_peers(), [peer("10.0.0.3")]);
 }
 
 /// A relist forgets each slice it did not list, since the watcher reports no
@@ -185,7 +179,6 @@ fn endpoint_slice_peer_set_updates_and_deletes_snapshots() {
 /// once that slice drops it, and a slice the relist listed again is kept.
 #[test]
 fn endpoint_slice_peer_set_relist_forgets_unlisted_slices() {
-    let peer = |addr: &str| Peer::new(format!("{addr}:18080").parse().expect("addr"));
     let mut peer_set = EndpointSlicePeerSet::default();
     let slice_a = slice("slice-a", &["10.0.0.2", "10.0.0.3"], Some(true));
     peer_set.apply(T, &slice_a, by_addr().as_ref());
@@ -219,20 +212,40 @@ fn endpoint_slice_peer_set_apply_emits_added_and_removed_diff() {
     let updated = slice("slice-a", &["10.0.0.3"], Some(true));
 
     let first = peer_set.apply(T, &initial, by_addr().as_ref());
-    assert_eq!(
-        first.added,
-        vec![Peer::new("10.0.0.2:18080".parse().expect("addr"))]
-    );
+    assert_eq!(first.added, [peer("10.0.0.2")]);
     assert!(first.removed.is_empty());
 
     let second = peer_set.apply(T, &updated, by_addr().as_ref());
-    assert_eq!(
-        second.removed,
-        vec![Peer::new("10.0.0.2:18080".parse().expect("addr"))]
+    assert_eq!(second.removed, [peer("10.0.0.2")]);
+    assert_eq!(second.added, [peer("10.0.0.3")]);
+}
+
+/// A diff yields the own entry first, so the peers after it take their roles
+/// against its zone, then `Removed` before `Added`.
+#[test]
+fn diff_events_yield_own_entry_then_removed_then_added() {
+    let mut peer_set = EndpointSlicePeerSet::default();
+    peer_set.apply(
+        T,
+        &slice("slice-a", &["10.0.0.2"], Some(true)),
+        by_addr().as_ref(),
     );
+    let endpoints = vec![
+        endpoint("10.0.0.1", Some(true), Some("us-east-1a"), None, None),
+        endpoint("10.0.0.3", Some(true), None, None, None),
+    ];
+    let diff = peer_set.apply(T, &slice_of("slice-a", endpoints), by_addr().as_ref());
+    let own = OwnEntry {
+        zone: ZoneName::parse("us-east-1a").ok(),
+        node_name: None,
+    };
     assert_eq!(
-        second.added,
-        vec![Peer::new("10.0.0.3:18080".parse().expect("addr"))]
+        diff.into_events().collect::<Vec<_>>(),
+        [
+            PeerEvent::OwnEntry(own),
+            PeerEvent::Removed(peer("10.0.0.2")),
+            PeerEvent::Added(peer("10.0.0.3")),
+        ]
     );
 }
 
@@ -249,10 +262,13 @@ fn quickcheck_endpoint_slice_events_match_live_slice_model(
     let mut live: BTreeMap<(u8, String), (EndpointSlice, Vec<Peer>)> = BTreeMap::new();
     let mut emitted = BTreeSet::new();
     let fold = |emitted: &mut BTreeSet<SocketAddr>, diff: PeerSetDiff| {
-        for peer in diff.removed {
-            emitted.remove(&peer.addr);
+        for event in diff.into_events() {
+            match event {
+                PeerEvent::Added(peer) => emitted.insert(peer.addr),
+                PeerEvent::Removed(peer) => emitted.remove(&peer.addr),
+                PeerEvent::OwnEntry(_) => false,
+            };
         }
-        emitted.extend(diff.added.iter().map(|peer| peer.addr));
     };
 
     for event in case.events {
@@ -321,8 +337,8 @@ fn quickcheck_endpoint_slice_events_match_live_slice_model(
 
 /// U21: the own entry is found by `discovery.self_addr` or by its Pod name,
 /// its zone read before the readiness filter, and it is never a peer. It is
-/// reported the first time and on each zone change only; a slice without it,
-/// or with it zoneless again at the same zone, retracts nothing.
+/// reported the first time, zoneless too, and on each zone change only; a
+/// slice without it retracts nothing.
 #[test]
 fn own_entry_found_by_addr_or_pod_name() {
     let own = |ready, zone| {
@@ -384,6 +400,18 @@ fn own_entry_found_by_addr_or_pod_name() {
         assert_eq!(back.own, None, "{self_match:?}");
         let moved = peer_set.apply(T, &zoned(true, Some("us-east-1c")), self_match);
         assert_eq!(moved.own, east("us-east-1c"), "{self_match:?}");
+
+        let mut peer_set = EndpointSlicePeerSet::default();
+        let zoneless = Some(OwnEntry {
+            zone: None,
+            node_name: Some("node-a".into()),
+        });
+        let first = peer_set.apply(T, &zoned(true, None), self_match);
+        assert_eq!(first.own, zoneless, "{self_match:?}");
+        let again = peer_set.apply(T, &zoned(true, None), self_match);
+        assert_eq!(again.own, None, "{self_match:?}");
+        let labelled = peer_set.apply(T, &zoned(true, Some("us-east-1a")), self_match);
+        assert_eq!(labelled.own, east("us-east-1a"), "{self_match:?}");
     }
 
     let stranger = Some(SelfMatch::PodName("other".into()));
@@ -393,13 +421,21 @@ fn own_entry_found_by_addr_or_pod_name() {
     assert!(peers.contains_key(&peer("10.0.0.1").addr));
 }
 
-/// U22: an address two Services list is removed only when the last of them
-/// lets go, whichever lets go first.
+/// U22: an address moving between slices, or listed by two Services, is
+/// removed only when the last lister lets go, whichever lets go first.
 #[test]
 fn address_moving_between_slices_is_never_removed() {
     let (one, two) = (TargetId(1), TargetId(2));
     let listed = slice("slice-a", &["10.0.0.2"], Some(true));
     let dropped = slice("slice-a", &[], Some(true));
+    let mut peer_set = EndpointSlicePeerSet::default();
+    peer_set.apply(one, &listed, by_addr().as_ref());
+    let moved = slice("slice-b", &["10.0.0.2"], Some(true));
+    peer_set.apply(one, &moved, by_addr().as_ref());
+    assert_eq!(
+        peer_set.apply(one, &dropped, by_addr().as_ref()).removed,
+        []
+    );
     for (first, other) in [(one, two), (two, one)] {
         let mut peer_set = EndpointSlicePeerSet::default();
         peer_set.apply(one, &listed, by_addr().as_ref());

@@ -504,6 +504,7 @@ fn too_many_bootstrap_peers_fails_validation() {
         move |s: &mut Settings| {
             s.peer_capacity = NonZeroU16::new(2).unwrap();
             s.bootstrap_peers = peers(n);
+            s.gossip_bind = Some(SocketAddr::from(([192, 0, 2, 1], 9000)));
         }
     };
     let error = validated(tune(3)).expect_err("three peers");
@@ -526,10 +527,10 @@ fn too_many_bootstrap_peers_fails_validation() {
     assert_eq!(validated(tune(2)), Ok(()));
 }
 
-/// Without a gossip bind a node is alone, even with a static list; with one,
-/// a static list makes the membership static and an empty one Kubernetes,
-/// whose own entry `discovery.self_addr` matches when set. The zone settings
-/// reach the runtime's config.
+/// Without a gossip bind a node is alone, and a static list fails validation,
+/// naming both settings; with one, a static list makes the membership static
+/// and an empty one Kubernetes, whose own entry `discovery.self_addr` matches
+/// when set. The zone settings reach the runtime's config.
 #[test]
 fn membership_follows_bind_and_bootstrap_peers() {
     let bind = SocketAddr::from(([10, 0, 0, 1], 9000));
@@ -539,8 +540,13 @@ fn membership_follows_bind_and_bootstrap_peers() {
         tune(&mut settings);
         settings.validate().expect("validates").0.membership
     }
-    let alone = membership(|s| s.bootstrap_peers = [peer].into());
-    assert_eq!(alone, Membership::Alone);
+    assert_eq!(membership(|_| {}), Membership::Alone);
+    let error = validated(|s| s.bootstrap_peers = [peer].into()).expect_err("no bind");
+    assert_eq!(error, SettingError::BootstrapPeersWithoutBind { listed: 1 });
+    let text = error.to_string();
+    for part in ["gossip.bind", "GABION_GOSSIP_BIND", "gabion_gossip_bind"] {
+        assert!(text.contains(part), "{text:?} lacks {part:?}");
+    }
     let kubernetes = membership(|s| {
         s.gossip_bind = Some(bind);
         s.self_addr = Some(bind);

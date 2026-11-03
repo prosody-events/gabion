@@ -211,10 +211,14 @@ impl OwnZone {
                     Membership::Kubernetes(discovery) => discovery.self_match.as_ref(),
                     Membership::Static(_) | Membership::Alone => None,
                 };
-                let (hostname, self_addr) = match self_match {
-                    Some(SelfMatch::PodName(name)) => (Some(&**name), None),
-                    Some(SelfMatch::Addr(addr)) => (None, Some(addr)),
-                    None => (None, None),
+                let (hostname, self_addr, host_name_text) = match self_match {
+                    Some(SelfMatch::PodName(name)) => (Some(&**name), None, &**name),
+                    Some(SelfMatch::Addr(addr)) => (
+                        None,
+                        Some(addr),
+                        "not read, since discovery.self_addr is set",
+                    ),
+                    None => (None, None, "could not be read, so set discovery.self_addr"),
                 };
                 tracing::warn!(
                     code = "zone_unknown",
@@ -234,7 +238,7 @@ impl OwnZone {
                      set), or a pod outside the watched Services. Set {} to this pod's IP and \
                      gossip port, or set {} directly. If this cluster only writes EndpointSlices \
                      slowly, raise {} above the time the entry takes to appear. {SINGLE_ZONE}",
-                    hostname.unwrap_or("not read: `discovery.self_addr` is set"),
+                    host_name_text,
                     Setting::DiscoverySelfAddr,
                     Setting::GossipZone,
                     Setting::GossipZoneGrace,
