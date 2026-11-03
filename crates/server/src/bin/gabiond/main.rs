@@ -111,12 +111,12 @@ async fn run() -> Result<(), Reported> {
     )
     .await
     .map_err(|error| Exit::Bind(Listener::Gossip, gossip_bind, error.into()))?;
+    let grpc_listener = bind(Server::Grpc, config.settings.envoy_bind).await?;
+    let admin_listener = bind(Server::Admin, config.settings.admin_bind).await?;
     tracing::info!(
         listen_addr = %gossip_bind,
         "Listening for gossip from other gabion nodes.",
     );
-    let grpc_listener = bind(Server::Grpc, config.settings.envoy_bind).await?;
-    let admin_listener = bind(Server::Admin, config.settings.admin_bind).await?;
 
     let limiter = SharedLimiter::new(
         rule_table.clone(),

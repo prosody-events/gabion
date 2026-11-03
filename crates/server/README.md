@@ -428,7 +428,7 @@ Message starts: "The gossip background task stopped on its own."
 
 Message starts: "gabiond could not serve"
 
-**What happened.** `envoy_bind`, `admin_bind` or `gossip.bind` could not be bound, so `gabiond` exited with status 1 before serving anything rather than run without it. Every address is bound before any "listening" line is logged.
+**What happened.** `envoy_bind`, `admin_bind` or `gossip.bind` could not be bound, so `gabiond` exited with status 1 before serving anything rather than run without it. Every address is bound before `gabiond` logs that it serves any of them.
 
 **Why.** Usually another process holds the port (a second `gabiond` on the host, a sidecar); less often the address is not on this host, or the port is privileged.
 

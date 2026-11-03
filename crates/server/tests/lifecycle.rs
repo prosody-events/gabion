@@ -99,6 +99,8 @@ fn failure_line((status, log, stderr): (Option<i32>, String, String), code: &str
 const GRPC_SERVING: &str = "Accepting rate-limit decisions from Envoy.";
 /// The line the admin server logs once it serves.
 const ADMIN_SERVING: &str = "Admin HTTP endpoint is up.";
+/// The line gabiond logs once every address is bound, before gossip runs.
+const GOSSIP_SERVING: &str = "Listening for gossip from other gabion nodes.";
 
 /// gabiond exited 1 with one `listener_failed` line naming `config_key` and
 /// `addr` and giving the OS cause once, and logged none of `never_serving`:
@@ -142,7 +144,7 @@ fn listener_failure_exits_with_status_one() {
         ],
         None,
     );
-    assert_listener_failed(exit, "envoy_bind", addr, &[GRPC_SERVING]);
+    assert_listener_failed(exit, "envoy_bind", addr, &[GOSSIP_SERVING, GRPC_SERVING]);
 }
 
 #[test]
@@ -159,7 +161,12 @@ fn admin_listener_failure_exits_with_status_one() {
         ],
         None,
     );
-    assert_listener_failed(exit, "admin_bind", addr, &[ADMIN_SERVING, GRPC_SERVING]);
+    assert_listener_failed(
+        exit,
+        "admin_bind",
+        addr,
+        &[GOSSIP_SERVING, ADMIN_SERVING, GRPC_SERVING],
+    );
 }
 
 #[test]
@@ -174,7 +181,7 @@ fn gossip_bind_failure_exits_with_status_one() {
         ],
         None,
     );
-    assert_listener_failed(exit, "gossip.bind", addr, &[]);
+    assert_listener_failed(exit, "gossip.bind", addr, &[GOSSIP_SERVING]);
 }
 
 #[test]
@@ -199,7 +206,7 @@ fn sigterm_drains_and_exits_with_status_zero() {
         ],
         // Logged after the signal handlers are installed, so the signal is
         // never lost.
-        Some("Listening for gossip from other gabion nodes."),
+        Some(GOSSIP_SERVING),
     );
     assert_eq!(status, Some(0), "log:\n{log}");
     assert_eq!(
