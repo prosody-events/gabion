@@ -1,7 +1,18 @@
 import { inflateSync } from 'node:zlib';
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { ChartHistory } from '../src/lib/charts/history';
 import type { ClusterState } from '../src/lib/sim/types';
-import { R_MAX, beamPath, pointOn, type Point, type QuadPath, type Spot } from '../src/lib/stage/layout';
+import {
+  ARC_GAP,
+  ARC_WIDTH,
+  DIAMOND_SCALE,
+  R_MAX,
+  beamPath,
+  pointOn,
+  type Point,
+  type QuadPath,
+  type Spot,
+} from '../src/lib/stage/layout';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
@@ -224,9 +235,16 @@ async function checkTooltips(page: Page, where: string): Promise<void> {
   const bottom = cells.reduce((a, b) => (b.y > a.y ? b : a));
   for (const at of [right, bottom]) {
     await page.mouse.move(at.x, at.y);
-    const tip = await page.locator('.stage-box .tooltip').boundingBox();
+    const tooltip = page.locator('.stage-box .tooltip');
+    const tip = await tooltip.boundingBox();
     expect(tip, `${where}: no tooltip over the node at ${at.x}, ${at.y}`).not.toBeNull();
     if (tip === null) continue;
+    // A4, rule 12: a node that lacks a change says how long, at least.
+    const id = Number(await text(tooltip.locator('[data-field="node"]')));
+    const missing = (await snapshot(page)).nodes.find((n) => n.id === id)?.missing_for_ms;
+    const printed = tooltip.locator('[data-field="missing-for"]');
+    if (missing === undefined) await expect(printed, `${where}: node ${id} lacks nothing`).toHaveCount(0);
+    else await expect(printed, `${where}: node ${id} not caught up`).toHaveText(duration(missing));
     expect(tip.x, `${where}: the tooltip crosses the stage's left edge`).toBeGreaterThanOrEqual(box.x - 1);
     expect(tip.y, `${where}: the tooltip crosses the stage's top edge`).toBeGreaterThanOrEqual(box.y - 1);
     expect(tip.x + tip.width, `${where}: the tooltip crosses the stage's right edge`).toBeLessThanOrEqual(
@@ -319,6 +337,20 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
     );
   }
   await expect(field(page, 'status-total'), where).toHaveText(int(oracle));
+
+  // Rule 12: while the cluster disagrees, the headline gives the longest any
+  // node has lacked a change, at least, as a censored "≥".
+  let longest: number | undefined;
+  for (const node of nodes) {
+    const t = node.missing_for_ms;
+    if (t !== undefined && (longest === undefined || t > longest)) longest = t;
+  }
+  const hero = page.locator('.headline [data-field="missing-for"]');
+  if (oracle > 0 && spread(nodes) > 0 && longest !== undefined) {
+    await expect(hero, `${where}: not caught up`).toHaveText(duration(longest));
+  } else {
+    await expect(hero, `${where}: no node lacks a change`).toHaveCount(0);
+  }
 
   // Each node's behind-by, view and the origins it is a gateway for, from every
   // node's own peer rows inverted.
@@ -633,6 +665,15 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
       if (clipped.cutOff) found.A3.push(`canvas label "${l.text}" is cut off by an overflow: hidden box`);
       if (clipped.box !== null) boxes.push({ key: l, name: `canvas "${l.text}"`, box: clipped.box });
     }
+    // The stage names every node it draws: an id the labeller found no room
+    // for leaves its disc unnamed.
+    if (canvas.closest('.stage') !== null) {
+      const drawn = new Set(labels.map((l) => l.text));
+      for (const c of document.querySelectorAll<HTMLElement>('[role="gridcell"][data-node]')) {
+        const id = c.dataset.node ?? '';
+        if (!drawn.has(id)) found.A3.push(`the stage draws node ${id} with no id label`);
+      }
+    }
   }
 
   // A3 overlaps: two text boxes that share at least 1 px both ways.
@@ -648,10 +689,15 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
     }
   }
 
-  // A3 chart marks: every value of every series lies inside its plot's y range.
+  // A3 chart marks: every value of every series lies inside its plot's y range,
+  // and every y axis shown labels at least two values, so the scale reads.
   for (const host of document.querySelectorAll<HTMLElement & { uplot?: any }>('.plot')) {
     const u = host.uplot;
     if (u === undefined || !host.checkVisibility()) continue;
+    const ticks = (u.axes[1]._splits ?? []).length;
+    if (u.axes[1].show !== false && ticks < 2) {
+      found.A3.push(`a chart's y axis (zone ${host.closest('figure')?.dataset.zone}) labels ${ticks} value(s), not two or more`);
+    }
     const { min, max } = u.scales.y;
     for (let s = 1; s < u.data.length; s++) {
       for (const v of u.data[s] as (number | null)[]) {
@@ -807,6 +853,10 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
     // node just removed.
     await expect(page.locator('[data-field="status-nodes"]')).toHaveText(String(left));
   }
+  // The status sentence counts the zones with members, not the zones built.
+  const left = await snapshot(page);
+  expect(left.zones.filter((z) => z.live > 0).length, 'one node leaves one live zone of three').toBe(1);
+  await expect(field(page, 'status-zones')).toHaveText('1');
   const lone = page.locator('section.block', { hasText: 'Share of data bytes' }).locator('figure');
   await expect(lone).toHaveCount(1);
   await expect(lone).not.toHaveAttribute('data-ref-zones', /.*/);
@@ -814,6 +864,37 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
   const labels = await lone.locator('canvas[data-label-boxes]').getAttribute('data-label-boxes');
   expect(JSON.parse(labels ?? '[]'), 'no reference label with one node').toEqual([]);
   await checkOrder(page, 'Sandbox after remove');
+});
+
+// -- A4: the share window at any snapshot rate ----------------------------------
+
+test('the share window holds at any snapshot rate', async ({}, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'pure arithmetic, checked once');
+  // Twenty seconds at half the data bytes crossing zones, then twenty at a
+  // tenth: a window of the last ten seconds lies wholly in the second phase, so
+  // σ is 10 % however finely play slices virtual time. 17 ms is a 60 Hz frame
+  // at 1x, 67 ms at 4x, and 500 ms a Step.
+  for (const stepMs of [17, 67, 500]) {
+    const history = new ChartHistory();
+    history.reset(WINDOW_MS);
+    let inData = 0;
+    let crossData = 0;
+    for (let t = 0; t <= 40_000; t += stepMs) {
+      const cross = t < 20_000 ? 0.5 : 0.1;
+      inData += stepMs * (1 - cross);
+      crossData += stepMs * cross;
+      history.push({
+        virtual_ms: t,
+        tick: Math.floor(t / 500),
+        nodes: [],
+        zones: [{ name: 'zone-a', live: 0 }],
+        bytes_by_tier: { in_zone: { data: inData, control: 0 }, cross_zone: { data: crossData, control: 0 } },
+        oracle_total: 0,
+        bucket_epoch_now: 0,
+      });
+    }
+    expect(history.share.at(-1), `σ at ${stepMs} ms snapshots`).toBeCloseTo(0.1, 9);
+  }
 });
 
 // -- A3: the stage's geometry for every zone count -----------------------------
@@ -893,6 +974,19 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
       { left: stage.left, top: stage.top },
     );
     expect(spots, where).toHaveLength(12);
+
+    // No two nodes of different rings come within each other's arc or diamond.
+    const extent = (r: number): number => Math.max(r + ARC_GAP + ARC_WIDTH / 2, DIAMOND_SCALE * r);
+    const touching: string[] = [];
+    for (const a of spots) {
+      for (const b of spots) {
+        if (a.zone >= b.zone) continue;
+        const room = Math.hypot(a.x - b.x, a.y - b.y) - extent(stage.rings[a.zone].r) - extent(stage.rings[b.zone].r);
+        if (room < 0) touching.push(`node ${a.id} and node ${b.id} overlap by ${(-room).toFixed(1)} px`);
+      }
+    }
+    expect(touching, `${where}: nodes of neighbouring rings that touch`).toEqual([]);
+
     let nearest = Number.POSITIVE_INFINITY;
     const meets: string[] = [];
     const at: Point = { x: 0, y: 0 };
@@ -966,6 +1060,28 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
     }
     console.log(`${where}: checked the route of ${beams.length} drawn beam(s)`);
   }
+});
+
+// -- The stage's labels, laid out once per layout -------------------------------
+
+test('a paused stage lays its labels out once, not per snapshot', async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', 'a count of layouts, checked once');
+  await open(page);
+  await loadPreset(page, 'Sandbox');
+  // Warm up first, so every gateway is found and the annotation line settles.
+  for (let i = 0; i < 4; i++) await step(page);
+  await settled(page);
+  await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement) => {
+    const w = window as unknown as { labelWrites: number };
+    w.labelWrites = 0;
+    new MutationObserver((records) => {
+      w.labelWrites += records.length;
+    }).observe(c, { attributeFilter: ['data-label-boxes'] });
+  });
+  // Each Step hands the stage a fresh snapshot with the same members and size.
+  for (let i = 0; i < 3; i++) await step(page);
+  const writes = await page.evaluate(() => (window as unknown as { labelWrites: number }).labelWrites);
+  expect(writes, 'the labels were rebuilt for snapshots that moved no node').toBe(0);
 });
 
 // -- A6: interaction -----------------------------------------------------------

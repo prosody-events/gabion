@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { fmtCount, noun, zoneLabel } from '../format';
+  import { fmtCount, fmtDuration, noun, zoneLabel } from '../format';
   import type { Roles } from '../stage/renderer';
   import { HIT_MIN, type StageLayout } from '../stage/layout';
   import type { ClusterState } from '../sim/types';
@@ -48,6 +48,8 @@
     zoneName: string;
     view: number;
     behind: number;
+    /** How long the node has lacked a change, at least; absent once caught up. */
+    missingFor: number | undefined;
     gatewayFor: number;
     role: Role;
     x: number;
@@ -77,6 +79,7 @@
           zoneName: zoneLabel(cluster.zones[spot.zone].name),
           view: node.aggregate_total,
           behind: Math.max(cluster.oracle_total - node.aggregate_total, 0),
+          missingFor: node.missing_for_ms,
           gatewayFor: node.gateway_for,
           role,
           x: spot.x,
@@ -138,7 +141,9 @@
       row.gatewayFor > 0
         ? `, gateway into ${row.zoneName} for ${row.gatewayFor} ${noun(row.gatewayFor, 'origin')}`
         : '';
-    return `${who}, sees ${fmtCount(row.view)} of ${fmtCount(cluster.oracle_total)}, ${fmtCount(row.behind)} behind${tail}`;
+    const missing =
+      row.missingFor === undefined ? '' : `, not caught up for at least ${fmtDuration(row.missingFor)}`;
+    return `${who}, sees ${fmtCount(row.view)} of ${fmtCount(cluster.oracle_total)}, ${fmtCount(row.behind)} behind${missing}${tail}`;
   }
 
   function focusCell(id: number | undefined): void {
@@ -224,7 +229,8 @@
       Node <span data-field="node">{hot.id}</span> · {hot.zoneName} · sees
       <span data-field="view">{fmtCount(hot.view)}</span> of
       <span data-field="true-total">{fmtCount(cluster.oracle_total)}</span>
-      (<span data-field="behind">{fmtCount(hot.behind)}</span> behind){#if hot.gatewayFor > 0}
+      (<span data-field="behind">{fmtCount(hot.behind)}</span> behind){#if hot.missingFor !== undefined}
+        · not caught up (≥ <span data-field="missing-for">{fmtDuration(hot.missingFor)}</span>){/if}{#if hot.gatewayFor > 0}
         · gateway into {hot.zoneName} for
         <span data-field="gateway-for">{fmtCount(hot.gatewayFor)}</span>
         {noun(hot.gatewayFor, 'origin')}{/if}

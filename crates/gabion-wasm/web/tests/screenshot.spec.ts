@@ -654,6 +654,15 @@ test('zone partition splits zone c off until healed', async ({ page }) => {
   await expect.poll(async () => num(await view(page, 1).textContent())).toBeGreaterThanOrEqual(50);
   expect(num(await view(page, 1).textContent()), 'zone b should not have zone c burst').toBeLessThan(100);
   expect(num(await view(page, 5).textContent()), 'zone c should not have zone a burst').toBeLessThan(100);
+  // Rule 12: before Heal the headline says how long a node has lacked the other
+  // side's changes, at least, as a censored "≥": the longest any node reports,
+  // which is more than nothing and no more than the run so far.
+  const cut = await page.evaluate(() => window.sim!.snapshot(null));
+  const longest = Math.max(...cut.nodes.map((n) => n.missing_for_ms ?? -1));
+  expect(longest, 'a node across the cut lacks a change it cannot hear').toBeGreaterThan(0);
+  expect(longest, 'the bound never exceeds the run').toBeLessThanOrEqual(cut.virtual_ms);
+  const printed = longest < 999.5 ? `${Math.round(longest)} ms` : `${(longest / 1000).toFixed(1)} s`;
+  await expect(page.locator('.headline .badge')).toHaveText(`not caught up (≥ ${printed})`);
   await page.screenshot({ path: 'screenshots/ring-partition.png' });
 
   // Heal the links: the cut-off zone kept its CRDT state, so the sides reconcile
@@ -667,6 +676,11 @@ test('zone partition splits zone c off until healed', async ({ page }) => {
   await expect
     .poll(async () => num(await view(page, 5).textContent()), { message: 'zone c did not reconcile' })
     .toBeGreaterThanOrEqual(100);
+  // Healed, a node lacks at most the feed's latest hits, which are younger than
+  // anything the cut held back.
+  const healed = await page.evaluate(() => window.sim!.snapshot(null));
+  const after = Math.max(...healed.nodes.map((n) => n.missing_for_ms ?? -1));
+  expect(after, 'the heal delivered what the cut held back').toBeLessThan(longest);
   await page.screenshot({ path: 'screenshots/ring-healed.png' });
 });
 

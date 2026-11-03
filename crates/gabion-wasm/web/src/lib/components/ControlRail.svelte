@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { type Blurb, type Knobs, type Preset } from '../presets';
+  import { type Knobs, type Preset } from '../presets';
   import { visibleBuckets } from '../buckets';
-  import { fmtCount, zoneLabel } from '../format';
+  import { fmtCount, zoneLabel, type Blurb } from '../format';
   import type { Roles } from '../stage/renderer';
   import type { SimConfig, ZoneView } from '../sim/types';
 

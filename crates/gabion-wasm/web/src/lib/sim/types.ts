@@ -8,6 +8,8 @@
 //
 //   • u128 ids — `rule`, `key`, `node_id` — cross as
 //     **hex strings** ("0x…"), serialized by `crate::hex`.
+//   • `Option::None` crosses as `undefined` (serde-wasm-bindgen's default), so
+//     every Option field is typed `T | undefined`, never `T | null`.
 //   • u64 counts and timestamps — `virtual_ms`, `tick`, `count`,
 //     `aggregate_total`, `oracle_total`, … — cross as JS **numbers**.
 //     serde-wasm-bindgen's `serialize_large_number_types_as_bigints` defaults
@@ -64,7 +66,7 @@ export type EventKind =
   | { type: 'PacketSent'; src: number; dst: number; bytes: number; kind: PacketKind; tier: Tier }
   | { type: 'PacketDelivered'; src: number; dst: number; bytes: number }
   | { type: 'PacketDropped'; src: number; dst: number; bytes: number; kind: PacketKind; tier: Tier }
-  | { type: 'GatewayChanged'; origin: number; zone: number; from: number | null; to: number | null }
+  | { type: 'GatewayChanged'; origin: number; zone: number; from: number | undefined; to: number | undefined }
   | { type: 'CellCreated'; node: number; rule: Hex; key: Hex; bucket: number; count: number }
   | { type: 'CellUpdated'; node: number; rule: Hex; key: Hex; bucket: number; count: number }
   | { type: 'CellExpired'; node: number; rule: Hex; key: Hex; bucket: number };
@@ -92,7 +94,7 @@ export interface CellView {
   bucket: number;
   count: number;
   age_ms: number;
-  origin: number | null;
+  origin: number | undefined;
   is_local: boolean;
 }
 
@@ -102,22 +104,31 @@ export type Role = 'unheard' | 'zone' | 'gateway' | 'remote' | 'incompatible';
 /** Whether a node waits for a peer's answer (`gabion::gossip::AnswerState`). */
 export type AnswerState = 'settled' | 'owed' | 'suspect' | 'cannot_relay';
 
+/** Each answer state as the page shows it: whether the gateway is suspected
+ *  (a hollow ◇ rather than a filled ◆) and the word the targets table prints. */
+export const ANSWER: Record<AnswerState, { readonly suspect: boolean; readonly label: string }> = {
+  settled: { suspect: false, label: 'ok' },
+  owed: { suspect: false, label: 'ok' },
+  suspect: { suspect: true, label: 'suspected' },
+  cannot_relay: { suspect: true, label: 'cannot relay' },
+};
+
 /** Mirror of `crate::event::PeerView`. */
 export interface PeerView {
   /** The peer's stable id, if the engine can resolve its address. */
-  id: number | null;
-  /** The zone the peer reports, by index; null while unknown or with no zone. */
-  zone: number | null;
+  id: number | undefined;
+  /** The zone the peer reports, by index; absent while unknown or with no zone. */
+  zone: number | undefined;
   role: Role;
   answer: AnswerState;
   /** How long the oldest packet waiting for the peer's answer has waited. */
-  unanswered_ms: number | null;
+  unanswered_ms: number | undefined;
   /** Own-stream positions sent to the peer and not yet acknowledged. */
   own_unacked: number;
   /** The same for the relay stream. */
   relay_unacked: number;
   /** The peer's gossip node id once an inbound packet has revealed it. */
-  node_id: Hex | null;
+  node_id: Hex | undefined;
 }
 
 /** Mirror of `crate::event::StoreStats` — the CRDT store's occupancy and
@@ -137,8 +148,8 @@ export interface StoreStats {
 /** Mirror of `crate::event::NodeState`. `id` is the node's stable identity (see
  *  the Rust module note): assigned once, never reused, so it survives other
  *  nodes joining and leaving and has gaps once a member has been removed. The
- *  counters mirror the runtime's `AdminSnapshot`; `gateway_for` and
- *  `own_data_bytes` the engine counts; and `store_stats` mirrors its
+ *  counters mirror the runtime's `AdminSnapshot`; `gateway_for`,
+ *  `own_data_bytes` and `missing_for_ms` the engine counts; and `store_stats` mirrors its
  *  `CellStoreStats`. */
 export interface NodeState {
   id: number;
@@ -168,6 +179,10 @@ export interface NodeState {
   /** Bytes of the node's own-stream packets it has sent since it joined,
    *  delivered or lost. */
   own_data_bytes: number;
+  /** How long ago the origin of the oldest change the node lacks last updated
+   *  that change's cell: a lower bound on how long it has been behind.
+   *  Absent while it holds every change. */
+  missing_for_ms: number | undefined;
   /** Per-rule error budget ε at the most recent request; pending crossing it
    *  triggers an eager (threshold) flush. 0 until a request is seen. */
   error_budget: number;

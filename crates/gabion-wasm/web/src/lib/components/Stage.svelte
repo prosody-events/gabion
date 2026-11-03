@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import { zoneLabel } from '../format';
+  import { blurb, zoneLabel, type Blurb } from '../format';
   import type { ClusterState, SimEvent } from '../sim/types';
   import { StageRenderer, labelExtent, type Roles } from '../stage/renderer';
   import {
@@ -106,10 +106,10 @@
   });
 
   // The latest gateway change or join-sweep request, in a sentence.
-  let annotation = $state<{ text: string; numbers: number[] } | null>(null);
+  let annotation = $state.raw<Blurb>([]);
   $effect(() => {
     if (events.length === 0) {
-      annotation = null;
+      annotation = [];
       return;
     }
     // Read once per batch: the cluster moves every frame, the annotation doesn't.
@@ -121,43 +121,33 @@
       if (kind.type === 'GatewayChanged') {
         const { origin, to, from } = kind;
         annotation =
-          to == null
-            ? { text: `node # has no gateway into ${zone(kind.zone)}`, numbers: [origin] }
-            : from == null
-              ? { text: `node # now reaches ${zone(kind.zone)} through node #`, numbers: [origin, to] }
-              : {
-                  text: `node # now reaches ${zone(kind.zone)} through node #, after node #`,
-                  numbers: [origin, to, from],
-                };
+          to === undefined
+            ? blurb`node ${origin} has no gateway into ${zone(kind.zone)}`
+            : from === undefined
+              ? blurb`node ${origin} now reaches ${zone(kind.zone)} through node ${to}`
+              : blurb`node ${origin} now reaches ${zone(kind.zone)} through node ${to}, after node ${from}`;
         return;
       }
       if (kind.type === 'PacketSent' && kind.kind === 'SweepRequest') {
+        // A request to a node that has since left names no zone: skip it.
         const dst = nodes.find((n) => n.id === kind.dst);
-        annotation = {
-          text: `node # asked ${zone(dst?.zone ?? 0)} for missed changes`,
-          numbers: [kind.src],
-        };
+        if (dst === undefined) continue;
+        annotation = blurb`node ${kind.src} asked ${zone(dst.zone)} for missed changes`;
         return;
       }
     }
-  });
-  // The annotation's text with each `#` as its number, in a data-bound element.
-  const noteParts = $derived.by(() => {
-    if (annotation === null) return [];
-    const { text, numbers } = annotation;
-    return text.split('#').flatMap((part, i) => (i < numbers.length ? [part, numbers[i]] : [part]));
   });
 
   $effect(() => {
     if (ready && renderer !== null) renderer.resize(size.w, size.h);
   });
 
+  // Runs only when the memoised layout changes, never per snapshot: the zone
+  // names are a function of the zone count, which the layout already follows,
+  // so they are read untracked.
   $effect(() => {
-    if (ready && renderer !== null && layout !== null && cluster !== null) {
-      renderer.setLayout(
-        layout,
-        cluster.zones.map((z) => z.name),
-      );
+    if (ready && renderer !== null && layout !== null) {
+      renderer.setLayout(layout, untrack(() => cluster?.zones.map((z) => z.name) ?? []));
     }
   });
 
@@ -287,7 +277,7 @@
   </ul>
 
   <p class="annotation" aria-live="polite">
-    {#each noteParts as part}{#if typeof part === 'number'}<span data-field="annotation">{part}</span>{:else}{part}{/if}{/each}
+    {#each annotation as part}{#if typeof part === 'number'}<span data-field="annotation">{part}</span>{:else}{part}{/if}{/each}
   </p>
 
   {#if cluster !== null && layout !== null}

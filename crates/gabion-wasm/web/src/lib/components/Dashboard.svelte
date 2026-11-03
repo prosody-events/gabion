@@ -7,6 +7,7 @@
     agreementPanel,
     shareOptions,
     spreadPanel,
+    X_AXIS_ROOM,
     type References,
     type YRange,
   } from '../charts/options';
@@ -41,11 +42,12 @@
   } = $props();
 
   // Fixed plot heights, px: charts never reflow as data arrives, and the rail
-  // body scrolls. The last panel of a stack is taller by its x axis.
+  // body scrolls. The last panel of a stack is taller by its x axis, so its
+  // plot is as tall as the others'. Chart 4's plot is at least 60 px, where its
+  // 0 to 2 × limit axis always labels two values.
   const SHARE_HEIGHT = 232;
-  const LIMIT_HEIGHT = 150;
+  const LIMIT_HEIGHT = 180;
   const PANEL_HEIGHT = 84;
-  const X_AXIS = 38;
 
   // Which zones have members, as a string so the panels rebuild only when that
   // changes and not with every sample.
@@ -65,13 +67,12 @@
     const n = c.nodes.length;
     if (n < 2) return null;
     const zones = c.zones.filter((z) => z.live > 0).length;
-    const before = new Map(start.nodes.map((node) => [node.id, node.own_data_bytes]));
     let weight = 0;
     let weighted = 0;
     let plain = 0;
     for (const node of c.nodes) {
       const across = (n - c.zones[node.zone].live) / (n - 1);
-      const bytes = node.own_data_bytes - (before.get(node.id) ?? 0);
+      const bytes = node.own_data_bytes - (start.own.get(node.id) ?? 0);
       weight += bytes;
       weighted += bytes * across;
       plain += across;
@@ -102,7 +103,14 @@
   // shows, with headroom; rewritten with each sample before the charts read it.
   const agreeRange: YRange = { max: 1 };
   const spreadRange: YRange = { max: 1 };
-  const top = (peak: number): number => Math.max(peak, 1) * 1.1;
+  /** The axis top for `peak`: 10 % headroom, rounded up to 1, 2, 2.5 or 5 times
+   *  a power of ten, uPlot's own tick steps, so the top is itself a step and
+   *  even a short panel labels at least two values. */
+  function top(peak: number): number {
+    const raw = Math.max(peak, 1) * 1.1;
+    const power = 10 ** Math.floor(Math.log10(raw));
+    return power * ([1, 2, 2.5, 5].find((m) => m * power >= raw) ?? 10);
+  }
   /** The largest non-null value in any of `columns`. */
   function peak(columns: readonly (readonly (number | null)[])[]): number {
     let max = 0;
@@ -215,7 +223,7 @@
         data={data.agreement[i]}
         {stamp}
         {zone}
-        height={PANEL_HEIGHT + (i === lastZone ? X_AXIS : 0)}
+        height={PANEL_HEIGHT + (i === lastZone ? X_AXIS_ROOM : 0)}
       >
         {#snippet caption()}{names[zone]}{/snippet}
       </Chart>
@@ -243,7 +251,7 @@
       opts={spreadOpts[panels.length]}
       data={data.spread[panels.length]}
       {stamp}
-      height={PANEL_HEIGHT + X_AXIS}
+      height={PANEL_HEIGHT + X_AXIS_ROOM}
     >
       {#snippet caption()}whole cluster · <span data-field="spread">{fmtCount(spreadNow.cluster)}</span>{/snippet}
     </Chart>

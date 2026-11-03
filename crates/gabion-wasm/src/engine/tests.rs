@@ -399,6 +399,77 @@ fn partition_blocks_then_heal_converges() {
     });
 }
 
+/// `missing_for_ms` dates the oldest change a node lacks from its origin
+/// cell's last update: a lower count in a cell it holds counts as missing,
+/// a cell it never received counts too, and the older of the two wins.
+#[test]
+fn missing_for_dates_the_oldest_change_a_node_lacks() {
+    with_engine(test_config(2), |tx| async move {
+        let missing = |state: &ClusterState| -> Vec<Option<u64>> {
+            state.nodes.iter().map(|n| n.missing_for_ms).collect()
+        };
+        submit(&tx, 0, WATCHED_KEY, 7).await;
+        for _ in 0..5 {
+            step(&tx, T).await;
+        }
+        let caught_up = snapshot(&tx).await;
+        assert!(caught_up.nodes.iter().all(|n| n.aggregate_total == 7));
+        assert_eq!(
+            missing(&caught_up),
+            [None, None],
+            "both nodes hold the 7 hits"
+        );
+
+        set_link(&tx, 0, 1, LinkPolicyKind::Block).await;
+        set_link(&tx, 1, 0, LinkPolicyKind::Block).await;
+        // At 500 ms, into the bucket node 1 already holds at a count of 7.
+        submit(&tx, 0, WATCHED_KEY, 3).await;
+        for _ in 0..4 {
+            step(&tx, T).await;
+        }
+        let lower = snapshot(&tx).await;
+        assert_eq!(lower.virtual_ms, 900);
+        assert_eq!(
+            lower.nodes[1].aggregate_total, 7,
+            "node 1 holds the cell at 7 of 10"
+        );
+        assert_eq!(
+            missing(&lower),
+            [None, Some(400)],
+            "the cell was last updated at 500 ms"
+        );
+
+        // At 1200 ms, into a bucket node 1 has never received.
+        for _ in 0..3 {
+            step(&tx, T).await;
+        }
+        submit(&tx, 0, WATCHED_KEY, 2).await;
+        for _ in 0..3 {
+            step(&tx, T).await;
+        }
+        let absent = snapshot(&tx).await;
+        assert_eq!(absent.virtual_ms, 1_500);
+        assert_eq!(
+            missing(&absent),
+            [None, Some(1_000)],
+            "the change at 500 ms is the oldest"
+        );
+
+        set_link(&tx, 0, 1, LinkPolicyKind::Pass).await;
+        set_link(&tx, 1, 0, LinkPolicyKind::Pass).await;
+        for _ in 0..10 {
+            step(&tx, T).await;
+        }
+        let healed = snapshot(&tx).await;
+        assert!(healed.nodes.iter().all(|n| n.aggregate_total == 12));
+        assert_eq!(
+            missing(&healed),
+            [None, None],
+            "node 1 caught up after the heal"
+        );
+    });
+}
+
 /// Determinism: the same `(config, command-script)` produces an identical
 /// event log, tier tags and gateway events included — the invariant the
 /// shareable-URL replay relies on.

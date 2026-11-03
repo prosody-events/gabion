@@ -251,18 +251,29 @@
     gap: var(--gap-xs);
   }
 
+  /* The header's readouts wrap whole, onto a line of their own when the rail
+     is narrow, with a gap between them however they fall; none breaks inside. */
   .strip-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
     justify-content: space-between;
+    gap: 0 var(--gap-sm);
     font-size: var(--font-size-caption);
   }
 
   .head-left {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
-    gap: var(--gap-sm);
+    gap: 0 var(--gap-sm);
     min-width: 0;
+  }
+
+  .key,
+  .tte,
+  .sigma {
+    white-space: nowrap;
   }
 
   .key {

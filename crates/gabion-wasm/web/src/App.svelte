@@ -3,13 +3,14 @@
   import { fmtCount, noun } from './lib/format';
   import { Sim } from './lib/sim/sim';
   import { readTheme, watchTheme } from './lib/theme';
-  import type {
-    ClusterState,
-    EventBatch,
-    Inspected,
-    PeerView,
-    SimConfig,
-    SimEvent,
+  import {
+    ANSWER,
+    type ClusterState,
+    type EventBatch,
+    type Inspected,
+    type PeerView,
+    type SimConfig,
+    type SimEvent,
   } from './lib/sim/types';
   import type { Roles } from './lib/stage/renderer';
   import { ChartHistory } from './lib/charts/history';
@@ -151,9 +152,8 @@
     if (origin === null || peers === undefined) return null;
     const gateways = new Map<number, { zone: number; suspect: boolean }>();
     for (const p of peers) {
-      // Option fields cross the wasm boundary as `undefined`, hence `!= null`.
-      if (p.role === 'gateway' && p.id != null && p.zone != null) {
-        gateways.set(p.id, { zone: p.zone, suspect: p.answer === 'suspect' || p.answer === 'cannot_relay' });
+      if (p.role === 'gateway' && p.id !== undefined && p.zone !== undefined) {
+        gateways.set(p.id, { zone: p.zone, suspect: ANSWER[p.answer].suspect });
       }
     }
     return { origin, gateways };
@@ -298,7 +298,7 @@
    *  step. */
   function applySnapshot(snap: ClusterState): void {
     cluster = snap;
-    if (snap.inspected != null && snap.inspected.id === selectedId) inspected = snap.inspected;
+    if (snap.inspected !== undefined && snap.inspected.id === selectedId) inspected = snap.inspected;
     tick = snap.tick;
     virtualMs = snap.virtual_ms;
     cutLinks = sim?.cutLinks() ?? 0;
@@ -744,8 +744,8 @@
      focal point — kept ≥ 55% so the rails never out-weigh it), and the charts
      dashboard rail. The rail widths sum to ~44% at typical desktop widths and
      cap on wide screens, so the stage only grows. Three layouts: three columns
-     from 1100 px; two from 640 px (stage over the detail rail on the left,
-     controls on the right); one scrolling column below. */
+     from 1100 px; two from 640 px (stage over the controls on the left, the
+     detail rail the full height on the right); one scrolling column below. */
   .workspace {
     display: grid;
     grid-template-columns: clamp(200px, 16%, 260px) minmax(0, 1fr) clamp(300px, 28%, 380px);
@@ -818,16 +818,16 @@
     }
   }
 
-  /* The charts and the inspector share one slot, so the detail rail sits under
-     the stage on the left and the controls take the right column. The stage
-     keeps the larger row, since its ring scales with its height; the rail is
-     too short for both charts, so the first fills it and the rest scroll. */
+  /* The detail rail takes the right column at full height, so the headline and
+     the whole of chart 1 are in the first view and the rest scroll; the
+     controls sit under the stage and scroll in their own row. The stage keeps
+     the larger row, since its ring scales with its height. */
   @media (640px <= width < 1100px) {
     .workspace {
       grid-template-columns: minmax(0, 1fr) clamp(220px, 32%, 280px);
       grid-template-areas:
-        'stage rail'
-        'detail rail';
+        'stage detail'
+        'rail detail';
       grid-template-rows: minmax(0, 7fr) minmax(0, 4fr);
     }
   }

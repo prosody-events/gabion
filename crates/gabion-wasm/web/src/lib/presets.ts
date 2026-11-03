@@ -42,7 +42,7 @@
 // a timed script: the total injected by virtual time T is exactly ⌊rate·T⌋
 // regardless of how play chunked the steps, so it stays deterministic.
 
-import { noun } from './format';
+import { blurb, noun, type Blurb } from './format';
 import type { Sim } from './sim/sim';
 import type { SimConfig, ZoneMode } from './sim/types';
 
@@ -135,15 +135,6 @@ export interface SustainedTraffic {
   readonly rate_per_sec: number;
 }
 
-/** A blurb as the page prints it: text, and the numbers that are drawn from the
- *  preset's own config, each in its own data-bound element. */
-export type Blurb = readonly (string | number)[];
-
-/** Build a blurb from a template: a number interpolation becomes a data-bound
- *  part and a string one plain text. */
-const blurb = (parts: TemplateStringsArray, ...values: (number | string)[]): Blurb =>
-  parts.flatMap((text, i) => (i < values.length ? [text, values[i]] : [text]));
-
 export interface Preset {
   readonly id: string;
   readonly label: string;
@@ -169,6 +160,16 @@ export interface Preset {
 /** The nodes the build places in zone `z`: node `i` is in zone `i mod zones`. */
 function members(c: SimConfig, z: number): number[] {
   return Array.from({ length: c.nodes }, (_, i) => i).filter((i) => i % c.zones === z);
+}
+
+/** How many of an origin's N − 1 data packets cross a zone with no zone set,
+ *  averaged over the build's origins: N − n_z for an origin in a zone of n_z,
+ *  so N − Σ n_z² / N, the unweighted mean chart 1's no-zone reference starts
+ *  from. Two decimals at most. */
+function acrossNoZone(c: SimConfig): number {
+  let squares = 0;
+  for (let z = 0; z < c.zones; z++) squares += members(c, z).length ** 2;
+  return Math.round((c.nodes - squares / c.nodes) * 100) / 100;
 }
 
 /** Every build node not in `group`. */
@@ -197,7 +198,7 @@ async function warmUntilGateway(
     await sim.step(tickMs);
     const peers = (await sim.snapshot(origin)).inspected?.peers ?? [];
     const gateway = peers.find((p) => p.role === 'gateway' && p.zone === zone)?.id;
-    if (gateway != null) return gateway;
+    if (gateway !== undefined) return gateway;
   }
   throw new Error(
     `the origin found no gateway into zone ${String.fromCharCode(97 + zone)} within ${WARM_TICKS_MAX} heartbeats, ` +
@@ -300,7 +301,7 @@ export const PRESETS: readonly Preset[] = [
     id: 'no-zone',
     label: 'No zone configured',
     blurb: (c) =>
-      blurb`Nodes are placed in ${c.zones} zones but told nothing, so every node sends to every peer directly: ${c.nodes - Math.round(c.nodes / c.zones)} of ${c.nodes - 1} data packets cross a zone.`,
+      blurb`Nodes are placed in ${c.zones} zones but told nothing, so every node sends to every peer directly: on average ${acrossNoZone(c)} of ${c.nodes - 1} data packets cross a zone.`,
     config: { nodes: NODES, zones: ZONES, zone_mode: 'Unset', rule_limit: NARRATIVE_LIMIT },
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
     async seed(sim, c) {

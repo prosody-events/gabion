@@ -114,7 +114,10 @@ impl PacketKind {
     /// streams (control). Classed by kind alone, so a closing packet or an
     /// empty sweep page counts as data even when it holds no cell.
     fn carries_cells(self) -> bool {
-        matches!(self, Self::Own | Self::Relay | Self::Sweep)
+        match self {
+            Self::Own | Self::Relay | Self::Sweep => true,
+            Self::Ack | Self::SweepRequest => false,
+        }
     }
 }
 
@@ -237,11 +240,11 @@ impl BytesByTier {
 }
 
 /// One node's view at snapshot time. The counters mirror the runtime's
-/// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); `gateway_for` and
-/// `own_data_bytes` the engine counts; and `store_stats` mirrors its
-/// [`CellStoreStats`](gabion::crdt::CellStoreStats). The node inspector renders
-/// them directly: see `GossipTargets.svelte` and `NodeInspector.svelte` in
-/// `web/src/lib/components`.
+/// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); `gateway_for`,
+/// `own_data_bytes` and `missing_for_ms` the engine counts; and `store_stats`
+/// mirrors its [`CellStoreStats`](gabion::crdt::CellStoreStats). The node
+/// inspector renders them directly: see `GossipTargets.svelte` and
+/// `NodeInspector.svelte` in `web/src/lib/components`.
 #[derive(Clone, Debug, Serialize)]
 pub struct NodeState {
     /// The node's stable id (see the module note). Distinct from `node_id`
@@ -279,6 +282,10 @@ pub struct NodeState {
     /// Bytes of the node's own-stream (`Own`) packets it has sent since it
     /// joined, delivered or lost.
     pub own_data_bytes: u64,
+    /// How long ago the origin of the oldest change this node does not yet
+    /// hold last updated that change's cell: a lower bound on how long the
+    /// node has been behind. `None` while it holds every change.
+    pub missing_for_ms: Option<u64>,
     /// The per-rule error budget ε at the most recent request: a rule's pending
     /// hits crossing it triggers an eager (threshold) flush. `0` until seen.
     pub error_budget: u64,

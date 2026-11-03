@@ -1,14 +1,13 @@
 <script lang="ts">
   import { fmtCount, fmtDuration, noun, zoneLabel } from '../format';
-  import type { NodeState, PeerView, ZoneMode, ZoneView } from '../sim/types';
+  import { ANSWER, type NodeState, type PeerView, type ZoneMode, type ZoneView } from '../sim/types';
   import InfoTip from './InfoTip.svelte';
 
   // Who the selected node sends its changes to, and how that is going: its own
   // zone, the peers in it, one row per remote zone naming the gateway the node's
   // runtime chose, the counters of its failovers and resends, and the error
   // budget. Every figure is the runtime's own (the admin snapshot the engine
-  // reads); the page chooses nothing. Option fields cross the wasm boundary as
-  // `undefined` when None, so the checks here are the loose `!= null`.
+  // reads); the page chooses nothing.
   let {
     node,
     peers,
@@ -34,8 +33,6 @@
         : [],
     ),
   );
-
-  const STATE = { settled: 'ok', owed: 'ok', suspect: 'suspected', cannot_relay: 'cannot relay' } as const;
 </script>
 
 <table class="targets">
@@ -68,16 +65,16 @@
             <td>no gateway yet</td>
           {:else}
             <td>
-              <span aria-hidden="true">{gateway.answer === 'suspect' || gateway.answer === 'cannot_relay' ? '◇' : '◆'}</span>
+              <span aria-hidden="true">{ANSWER[gateway.answer].suspect ? '◇' : '◆'}</span>
               gateway node <span data-field="gateway">{gateway.id ?? '—'}</span> ·
               <span data-field="unacked">{fmtCount(gateway.own_unacked)}</span>
               {noun(gateway.own_unacked, 'change')} not yet acknowledged ·
-              {#if gateway.unanswered_ms != null}
+              {#if gateway.unanswered_ms !== undefined}
                 waiting <span data-field="waiting">{fmtDuration(gateway.unanswered_ms)}</span>
               {:else}
                 answered
               {/if}
-              · {STATE[gateway.answer]}
+              · {ANSWER[gateway.answer].label}
             </td>
           {/if}
         </tr>

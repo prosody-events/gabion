@@ -22,10 +22,13 @@ width of a label, measured) and `Z` the zone count, the rings sit at distance
 `r_z = R·K_Z·sin(π/Z)` from the ring's centre, with `K_Z = 0.75`; with one zone
 `R = 0` and `r_z = min(w, h)/2 − m`. A node's angle in its ring depends only on
 its rank by id within the zone, so order never depends on a value. A disc's
-radius is the least of `R_MAX`, the room on its ring (`2π·r_z / (S_D·n_z)`) and
-`BEAM_CLEARANCE·r_z − CROSS_WIDTH/2`. The last term is what keeps a cross-zone
-beam clear of a third ring's discs: the curves come within 0.386·`r_z` of a
-third ring at six zones, so a disc and half a stroke must fit in 0.35·`r_z`.
+radius is the least of `R_MAX`, the room on its ring (`2π·r_z / (S_D·n_z)`),
+`BEAM_CLEARANCE·r_z − CROSS_WIDTH/2`, and what the nearest node of another ring
+leaves: half that distance less `NEIGHBOUR_GAP`, minus the arc (or divided by
+`DIAMOND_SCALE` for a gateway's diamond), so two facing nodes never touch. The
+third term is what keeps a cross-zone beam clear of a third ring's discs: the
+curves come within 0.386·`r_z` of a third ring at six zones, so a disc and half
+a stroke must fit in 0.35·`r_z`.
 Everything is in CSS pixels of the stage box, so labels are screen-size at every
 width and nothing is letterboxed.
 
@@ -42,13 +45,19 @@ contrast audit exempts. The renderer keeps every beam in a pre-sized pool and
 draws a frame into one `Graphics` per mark style, so a frame allocates nothing
 of its own.
 
+**Arcs.** A node's arc sweeps its view as a share of the true total, with butt
+caps, and stays at least a twelfth of a ring open (`ARC_NOTCH`) until the node
+has caught up, so a node one hit behind still shows a notch without colour.
+Every arc closes into a full ring exactly when the cluster converges.
+
 **Roles.** Selecting a node marks it with a thick ring (the origin) and the
 gateway the runtime reports for each remote zone with a diamond: filled ◆, or
 hollow ◇ once the runtime suspects it. A key under the stage names every mark
 and a one-line annotation reports the latest gateway change or join-sweep
 request.
 
-**Labels.** Zone titles sit at the ring centres and node ids outside the disc.
+**Labels.** Zone titles sit at the ring centres and node ids outside the disc,
+else inside it, else along the ring.
 Labels are placed greedily (zone titles first, then ids in (zone, id) order). A
 zone title is drawn only if its measured box, halo included, lies inside the
 stage and overlaps no label; a node id must also clear every disc and its marks.
@@ -62,13 +71,15 @@ text.
 tech and to test tooling. `NodeGrid` lays every node over its disc as a
 focusable cell of a `role="grid"` (one row per zone, a roving tabindex), named by
 a sentence ("Node 7, zone b, sees 412 of 430, 18 behind, gateway into zone b for
-9 origins"; only the focused cell carries the live sentence). Left and Right
+9 origins"; only the focused cell carries the live sentence, and a node that
+lacks a change adds how long, at least). Left and Right
 move within a zone, Up and Down to the same rank in the adjacent zone, Home and
 End to the zone's ends, Enter or Space selects and Escape deselects. The cells
 take no pointer events: the stage's hit test (`nodeAt`, the nearest disc within
 its radius or a 24 px target) picks the node, so a mouse, a touch and a test all
 reach the same code. Hover, focus and tap show one tooltip ("Node 7 · zone b ·
-sees 412 of 430 (18 behind) · gateway into zone b for 9 origins"), and "Show as
+sees 412 of 430 (18 behind) · not caught up (≥ 1.5 s) · gateway into zone b for
+9 origins"), and "Show as
 table" lists the same rows as a table; both are in (zone, id) order, never
 re-sorted. Every printed number is a `[data-field]` element, which is the DOM
 source the functional tests read.
@@ -192,7 +203,7 @@ study dashboard. A rule that assumes the study's data model says "N/A" and why.
 9. One notation per context, fixed significant figures, singular units (A2).
 10. Honest scale, axes fitted to the data (visual audit).
 11. Zero gets its own treatment, never symlog (visual audit).
-12. Censored values marked "≥": not yet met. A node that has not caught up needs the age of the oldest change it is missing, which the snapshot does not carry.
+12. Censored values marked "≥": a node that lacks a change reads "not caught up (≥ t)" in its tooltip, and the headline's badge gives the largest t, where t is the time since the oldest missing change's cell was last updated at its origin (the engine's `missing_for_ms`). That update is no earlier than the change itself, so t never overstates how long the node has been behind (A4).
 13. Tie band: N/A, the UI makes no comparisons.
 14. Status sentence and specific empty states (A4).
 15. The reference is drawn first, muted and labelled (visual audit).
@@ -218,8 +229,8 @@ Automated checks, run on every preset with the transport paused:
 
 - A1: no page or console errors, no failed requests, no page-level horizontal overflow.
 - A2: no "NaN", "undefined", "null", "Infinity", "[object" or "e+" in page text.
-- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; every chart value lies inside its plot; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every beam in flight bends through the centre exactly when its nodes' zones differ.
-- A4: data correctness, recomputed independently from the engine snapshot in the test's own code: the status counts, each node's behind-by and gateway-for count, each chart-3 spread, the windowed share, both chart-1 predictions (with unequal zones, and absent with one node) and, for a selected origin, its Gossip targets.
+- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; every chart value lies inside its plot and every y axis labels at least two values; the stage draws every node's id; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it, no two nodes of different rings touch, and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every beam in flight bends through the centre exactly when its nodes' zones differ.
+- A4: data correctness, recomputed independently from the engine snapshot in the test's own code: the status counts, each node's behind-by and gateway-for count, the headline's censored "not caught up (≥ t)", each chart-3 spread, the windowed share, both chart-1 predictions (with unequal zones, and absent with one node) and, for a selected origin, its Gossip targets.
 - A5: fixed order across the grid, table, chart panels and inspector rows.
 - A6: interaction: the zone stepper and Rebuild, each network action and heal, keyboard navigation with focus kept across a rebuild, a tooltip on hover, focus and tap, and the study link's form (`study/` joins the site only in the Pages build, so its href is checked, not followed).
 - A7: contrast from computed styles, text at 4.5:1 and graphics at 3:1 on the surface they sit on, translucent marks composited over it first, in both themes, with targets of at least 24 px.
@@ -243,8 +254,10 @@ with motion reduced). Its main test walks every preset to a fixed virtual time
 with the transport paused, runs A1 to A9, checks the stage tooltips, and recomputes
 A4 and A5 from the engine's snapshot, then repeats the page checks with
 `data-theme` forcing the other theme. Further tests check chart 1 across the
-rule window and with unequal zones and one node, the stage geometry for every
-zone count (at the widest and the narrowest stage) and the interactions, with
+rule window and with unequal zones and one node, the share window at any
+snapshot rate, the stage geometry for every zone count (at the widest and the
+narrowest stage, with facing discs of neighbouring rings kept apart), that a
+paused stage's labels are not rebuilt per snapshot, and the interactions, with
 touch. Full-page PNGs land in `audit-shots/`, which is gitignored; CI uploads it
 as a workflow artifact. All of it downloads a browser, so, like the node
 `smoke.cjs`, it is an on-demand and CI run, not part of `make wasm-check`. On the

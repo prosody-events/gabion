@@ -24,6 +24,15 @@ export function noun(n: number, word: string): string {
   return n === 1 ? word : `${word}s`;
 }
 
+/** A sentence as the page prints it: text, and numbers, each of which the page
+ *  puts in its own data-bound element. */
+export type Blurb = readonly (string | number)[];
+
+/** Build a `Blurb` from a template: a number interpolation becomes a data-bound
+ *  part and a string one plain text, so no number can lose its place. */
+export const blurb = (parts: TemplateStringsArray, ...values: (number | string)[]): Blurb =>
+  parts.flatMap((text, i) => (i < values.length ? [text, values[i]] : [text]));
+
 /** An engine zone name as it reads in a sentence: `zone-b` is `zone b`. */
 export function zoneLabel(name: string): string {
   return name.replace('-', ' ');

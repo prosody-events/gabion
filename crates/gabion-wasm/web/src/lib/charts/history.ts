@@ -9,7 +9,7 @@
 // mutates the columns here and bumps a single `$state` counter to trigger the
 // charts' redraw effect (see `App.svelte` / `Dashboard.svelte`).
 
-import type { ClusterState, NodeState } from '../sim/types';
+import type { ClusterState } from '../sim/types';
 
 /** Rolling-window depth: at the visualizer's tick rate, 600 samples is
  *  comfortably past convergence. */
@@ -30,17 +30,17 @@ interface NodeColumn {
   samples: number;
 }
 
-/** The cumulative data bytes, and every node's own-stream bytes, at one instant:
- *  what a window's start is measured against. */
+/** The cumulative data bytes, and every node's own-stream bytes by id, at one
+ *  instant: what a window's start is measured against. */
 export interface Mark {
   t: number;
   inData: number;
   crossData: number;
-  nodes: readonly NodeState[];
+  own: ReadonlyMap<number, number>;
 }
 
 /** The session's start: nothing sent yet. */
-const SESSION_START: Mark = { t: 0, inData: 0, crossData: 0, nodes: [] };
+const SESSION_START: Mark = { t: 0, inData: 0, crossData: 0, own: new Map() };
 
 export class ChartHistory {
   /** x-axis: virtual milliseconds since the session began. */
@@ -64,9 +64,11 @@ export class ChartHistory {
    *  instead of restarting it: a join appends a back-filled column, a leave
    *  stops feeding one (its line gaps), and the shared time axis never resets. */
   readonly #columns = new Map<number, NodeColumn>();
-  // The cumulative marks the share window is measured from: at most one per
-  // `windowMs / MARKS_PER_WINDOW`, from the newest mark at or before the window's
-  // start up to now, so at most 129 whatever the play speed.
+  // The cumulative marks the share window is measured from: a snapshot is kept
+  // once `windowMs / MARKS_PER_WINDOW` has passed since the newest kept one,
+  // from the newest mark at or before the window's start up to now, so at most
+  // 129 whatever the play speed, and a window starts within that spacing (plus
+  // one snapshot) of where it should.
   #marks: Mark[] = [];
   #windowMs = 0;
   #blank: null[] = [];
@@ -192,22 +194,24 @@ export class ChartHistory {
     return total > 0 ? cross / total : null;
   }
 
-  /** Keep `snap`'s cumulative bytes as a mark: a new one once `windowMs / 128`
-   *  of virtual time has passed since the last, else replacing it; and drop the
-   *  marks no window can start from any more. */
+  /** Keep `snap`'s cumulative bytes as a mark once `windowMs / 128` of virtual
+   *  time has passed since the newest kept mark (measured from that kept mark,
+   *  never from the snapshot before, so a fast frame rate cannot hold the ring
+   *  at one mark), and drop the marks no window can start from any more. */
   #commit(snap: ClusterState): void {
-    const mark: Mark = {
-      t: snap.virtual_ms,
-      inData: snap.bytes_by_tier.in_zone.data,
-      crossData: snap.bytes_by_tier.cross_zone.data,
-      nodes: snap.nodes,
-    };
     const marks = this.#marks;
-    const last = marks.length - 1;
-    if (last >= 0 && mark.t - marks[last].t < this.#windowMs / MARKS_PER_WINDOW) marks[last] = mark;
-    else marks.push(mark);
+    const t = snap.virtual_ms;
+    const last = marks.at(-1);
+    if (last === undefined || t - last.t >= this.#windowMs / MARKS_PER_WINDOW) {
+      marks.push({
+        t,
+        inData: snap.bytes_by_tier.in_zone.data,
+        crossData: snap.bytes_by_tier.cross_zone.data,
+        own: new Map(snap.nodes.map((n) => [n.id, n.own_data_bytes])),
+      });
+    }
     // The second mark at or before `t − W` means the first can never be a start.
-    while (marks.length > 1 && marks[1].t <= mark.t - this.#windowMs) marks.shift();
+    while (marks.length > 1 && marks[1].t <= t - this.#windowMs) marks.shift();
   }
 
   #dropOldest(): void {

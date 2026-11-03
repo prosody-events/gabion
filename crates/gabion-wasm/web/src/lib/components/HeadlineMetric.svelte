@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { fmtCount, noun } from '../format';
+  import { fmtCount, fmtDuration, noun } from '../format';
   import type { ClusterState } from '../sim/types';
   import type { ChartHistory } from '../charts/history';
 
@@ -31,6 +31,17 @@
   });
   const hasTotal = $derived(cluster !== null && cluster.oracle_total > 0);
   const converged = $derived(hasTotal && disagreement === 0);
+  // How long the node behind longest has lacked a change, at least: the largest
+  // lower bound the engine reports, or `undefined` while every node holds every
+  // change. A censored value, so it prints as "≥" (design rule 12).
+  const missingFor = $derived.by(() => {
+    let longest: number | undefined;
+    for (const node of cluster?.nodes ?? []) {
+      const t = node.missing_for_ms;
+      if (t !== undefined && (longest === undefined || t > longest)) longest = t;
+    }
+    return longest;
+  });
   const convergedRound = $derived.by(() => {
     void version;
     return history.convergedRound();
@@ -44,6 +55,10 @@
     <span class="badge" role="status">
       ✓ converged in <span data-field="rounds">{convergedRound}</span>
       {noun(convergedRound, 'round')}
+    </span>
+  {:else if hasTotal && missingFor !== undefined}
+    <span class="badge muted" role="status">
+      not caught up (≥ <span data-field="missing-for">{fmtDuration(missingFor)}</span>)
     </span>
   {:else if hasTotal}
     <span class="badge muted" role="status">spreading…</span>

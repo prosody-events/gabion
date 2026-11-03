@@ -30,9 +30,14 @@ const HALO = 2;
 const LINE = 1.25;
 // Gap between a plot and the label beside it, px.
 const LABEL_GAP = 4;
-// The room an x axis with a title takes below the plot, and without, px.
+// The room an x axis's ticks take below the plot, with a title and without,
+// and the title's own row, px.
 const X_AXIS_SIZE = 38;
 const X_AXIS_BARE = 28;
+const X_TITLE_SIZE = 30;
+/** All the room a titled x axis takes below its plot, px: what a stacked
+ *  panel that shows one must add to its height to keep its plot's. */
+export const X_AXIS_ROOM = X_AXIS_SIZE + X_TITLE_SIZE;
 const Y_AXIS_SIZE = 44;
 
 /** One label's box in CSS px of the chart canvas, halo included. */
@@ -180,6 +185,7 @@ function axes(
       show: showX,
       label: xTitle,
       labelGap: 4,
+      labelSize: X_TITLE_SIZE,
       size: xTitle === undefined ? X_AXIS_BARE : X_AXIS_SIZE,
       // x is virtual milliseconds; the axis reads seconds.
       values: (_u, ticks) => ticks.map((t) => t / 1000),

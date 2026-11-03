@@ -19,10 +19,13 @@
 import { gsap } from 'gsap';
 import { Application, CanvasTextMetrics, Container, Graphics, Text, TextStyle } from 'pixi.js';
 import { zoneLabel } from '../format';
-import type { ClusterState, SimEvent } from '../sim/types';
+import type { ClusterState, PacketKind, SimEvent } from '../sim/types';
 import { BEAM_ALPHA, FADED_ALPHA, type Theme } from '../theme';
 import {
+  ARC_GAP,
+  ARC_WIDTH,
   CROSS_WIDTH,
+  DIAMOND_SCALE,
   IN_WIDTH,
   LABEL_GAP,
   beamPath,
@@ -34,8 +37,12 @@ import {
 } from './layout';
 
 // A node counts as caught up when its view is within this fraction of the
-// cluster's true total: the threshold that flips its arc from warn to ok.
+// cluster's true total: the threshold that closes its arc and flips it from
+// warn to ok.
 const CONVERGED_EPSILON = 0.001;
+// The least share of a ring an arc leaves open while its node is behind, so
+// one hit short of the total still shows a notch (design rule 17).
+const ARC_NOTCH = 1 / 12;
 
 // Wall-clock flight time of a gossip packet beam. Eased so the beam accelerates
 // off the source and decelerates into the target: motion that reads as cause
@@ -61,14 +68,12 @@ const DOT_R = 2;
 // not reached in normal operation. Excess is dropped rather than grown.
 const BEAM_CAPACITY = 32768;
 
-// Role glyphs and rings, in px: the origin's thick ring, a gateway diamond's
-// half-diagonal as a multiple of the disc radius, the focus ring's gap.
+// Role glyphs and rings, in px: the origin's thick ring and the focus ring's gap.
 const ORIGIN_GAP = 8;
 const ORIGIN_WIDTH = 4;
 // How far a disc's marks reach beyond its radius: the origin ring's outer edge,
 // which a label keeps clear of.
 const MARK_REACH = ORIGIN_GAP + ORIGIN_WIDTH / 2;
-const DIAMOND_SCALE = 1.35;
 const FOCUS_GAP = 7;
 // A label's halo, px each side.
 const HALO = 2;
@@ -86,6 +91,17 @@ const CROSS = 1;
 const CONTROL = 2;
 const RELAY = 4;
 const DROPPED = 8;
+
+/** Each packet kind's flags: a control packet is a dot, a relay is the
+ *  origin's own when its gateway sends it. Exhaustive, so a new kind is a type
+ *  error until it is classed here, as `PacketKind::carries_cells` is in Rust. */
+const KIND_FLAGS: Record<PacketKind, number> = {
+  Ack: CONTROL,
+  SweepRequest: CONTROL,
+  Own: 0,
+  Relay: RELAY,
+  Sweep: 0,
+};
 
 // Beam mark styles; each has a full and a faded Graphics (`style * 2 + faded`).
 const IN_ZONE = 0;
@@ -385,9 +401,7 @@ export class StageRenderer {
     for (const event of events) {
       const kind = event.kind;
       if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
-        let flags = kind.tier === 'CrossZone' ? CROSS : 0;
-        if (kind.kind === 'Ack' || kind.kind === 'SweepRequest') flags |= CONTROL;
-        if (kind.kind === 'Relay') flags |= RELAY;
+        let flags = KIND_FLAGS[kind.kind] | (kind.tier === 'CrossZone' ? CROSS : 0);
         if (kind.type === 'PacketDropped') flags |= DROPPED;
         this.#beam(kind.src, kind.dst, flags);
       }
@@ -557,19 +571,24 @@ export class StageRenderer {
   }
 
   /** Draw a node's cell arc: an annulus around the disc whose sweep is the
-   *  node's view as a fraction of the true total, so every arc fills to a full
-   *  ring exactly when the cluster converges. The sweep carries the state and
-   *  the colour only repeats it (design rule 17). */
+   *  node's view as a fraction of the true total, held at least `ARC_NOTCH`
+   *  short of a ring until the node is caught up, so every arc closes exactly
+   *  when the cluster converges. Butt caps, so no cap closes the notch. The
+   *  sweep carries the state and the colour only repeats it (design rule 17). */
   #drawArc(node: NodeGfx, fraction: number): void {
     const f = Math.max(0, Math.min(1, fraction));
-    const color = f >= 1 - CONVERGED_EPSILON ? this.#theme.ok : this.#theme.warn;
     node.fraction = fraction;
     node.arc.clear();
     if (f <= 0) return;
+    const reach = node.radius + ARC_GAP;
+    if (f >= 1 - CONVERGED_EPSILON) {
+      node.arc.circle(0, 0, reach).stroke({ width: ARC_WIDTH, color: this.#theme.ok });
+      return;
+    }
     const start = -Math.PI / 2;
     node.arc
-      .arc(0, 0, node.radius + 4, start, start + f * 2 * Math.PI)
-      .stroke({ width: 3, color, cap: 'round' });
+      .arc(0, 0, reach, start, start + Math.min(f, 1 - ARC_NOTCH) * 2 * Math.PI)
+      .stroke({ width: ARC_WIDTH, color: this.#theme.warn, cap: 'butt' });
   }
 
   #drawArcs(state: ClusterState): void {
@@ -611,7 +630,7 @@ export class StageRenderer {
 
   /** Lay the labels out and publish their boxes. Zone titles go first, at their
    *  ring centres; node ids follow in (zone, id) order, radially outside the
-   *  disc, or inside it when a neighbour's disc is in the way. A zone title is
+   *  disc, else inside it, else along the ring. A zone title is
    *  drawn only if its measured box lies inside the stage and overlaps no label
    *  already placed; a node id must also clear every disc and its marks. So the
    *  audit's no-overlap rule holds at every width by construction. */
@@ -674,9 +693,16 @@ export class StageRenderer {
       const dy = dist === 0 ? -1 : (spot.y - ring.y) / dist;
       const reach = spot.r + LABEL_GAP;
       const text = String(spot.id);
-      // Outside the ring first, then inside it.
-      if (!place(text, spot.x + dx * reach, spot.y + dy * reach, dx, dy, true)) {
-        place(text, spot.x - dx * reach, spot.y - dy * reach, -dx, -dy, true);
+      // Outside the ring first, then inside it, then along it either way: a
+      // node facing a neighbouring ring has no room outside, and the zone title
+      // may fill the inside.
+      for (const [ux, uy] of [
+        [dx, dy],
+        [-dx, -dy],
+        [-dy, dx],
+        [dy, -dx],
+      ]) {
+        if (place(text, spot.x + ux * reach, spot.y + uy * reach, ux, uy, true)) break;
       }
     }
     this.#app.canvas.dataset.labelBoxes = JSON.stringify(boxes);

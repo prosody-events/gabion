@@ -24,7 +24,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor, ValidStorageConfig};
+use gabion::crdt::{
+    BucketEpoch, CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor, ValidStorageConfig,
+};
 use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::sim::{LinkPolicy, SimRouter};
 use gabion::gossip::{
@@ -889,9 +891,35 @@ impl EngineState {
     /// row per node pair each frame.
     async fn snapshot(&self, inspect: Option<u32>) -> ClusterState {
         let fingerprint = self.rule.fingerprint;
+        let mut dumps = Vec::with_capacity(self.nodes.len());
+        for handle in &self.nodes {
+            dumps.push(cell_dump(&handle.admin_tx).await);
+        }
+        // Every origin's own live cells of the watched rule, sorted by (key,
+        // bucket, origin): what every node's replicas are held against. Each
+        // hit is recorded once at its origin (`merge_remote` preserves the wire
+        // origin, so a forwarded replica is never local on a non-origin
+        // holder), so their sum, the ground-truth windowed total, counts each
+        // hit exactly once, and it decays with the window as cells age out.
+        let mut origins: Vec<OriginCell> = Vec::new();
+        for (handle, dump) in self.nodes.iter().zip(&dumps) {
+            let own = handle.identity.node_id.0;
+            for cell in dump.iter().flat_map(|d| &d.cells) {
+                if cell.origin_node_id == Some(own) && cell.rule_fingerprint == fingerprint {
+                    origins.push(OriginCell {
+                        at: (cell.key_hash, cell.bucket, own),
+                        count: cell.count,
+                        updated_ms: cell.last_update_millis,
+                    });
+                }
+            }
+        }
+        origins.sort_unstable_by_key(|cell| cell.at);
+        let oracle_total = origins.iter().map(|cell| cell.count).sum();
+        // Which origin cells the node being read holds at their origin's count.
+        let mut held = vec![false; origins.len()];
         let mut nodes = Vec::with_capacity(self.nodes.len());
         let mut inspected = None;
-        let mut oracle_total = 0;
         // Each origin's gateways, inverted: how many origins route through
         // each node.
         let mut gateway_for = vec![0u32; self.nodes.len()];
@@ -903,23 +931,31 @@ impl EngineState {
             }
         }
         // Ascending id order, the order the page lays the nodes out in.
-        for (pos, handle) in self.nodes.iter().enumerate() {
-            let dump = cell_dump(&handle.admin_tx).await;
-            // The ground-truth windowed total, derived from the live CRDT
-            // cells rather than a monotonic accumulator: sum every node's
-            // locally-originated cells for the watched rule. Each hit is
-            // recorded once at its origin (`merge_remote` preserves the wire
-            // origin, so a forwarded replica is never local on a non-origin
-            // holder), so the sum counts each hit exactly once — and it decays
-            // with the window as cells age out. This is the honest target the
-            // convergence fan races toward.
-            let own = Some(handle.identity.node_id.0);
-            oracle_total += dump
+        for (pos, (handle, dump)) in self.nodes.iter().zip(&dumps).enumerate() {
+            held.fill(false);
+            for cell in dump.iter().flat_map(|d| &d.cells) {
+                if cell.rule_fingerprint != fingerprint {
+                    continue;
+                }
+                let Some(origin) = cell.origin_node_id else {
+                    continue;
+                };
+                if let Ok(i) =
+                    origins.binary_search_by_key(&(cell.key_hash, cell.bucket, origin), |o| o.at)
+                {
+                    held[i] = cell.count >= origins[i].count;
+                }
+            }
+            // The oldest change the node lacks was made no later than its
+            // cell's last update at the origin, so the time since that update
+            // never overstates how long the node has been behind.
+            let missing_for_ms = origins
                 .iter()
-                .flat_map(|d| &d.cells)
-                .filter(|cell| cell.origin_node_id == own && cell.rule_fingerprint == fingerprint)
-                .map(|cell| cell.count)
-                .sum::<u64>();
+                .zip(&held)
+                .filter(|(_, held)| !**held)
+                .map(|(cell, _)| cell.updated_ms)
+                .min()
+                .map(|updated| self.virtual_ms.saturating_sub(updated));
             // `node_id` / `incarnation` come from the engine's own record of
             // the node, so they survive even if the runtime has
             // already stopped and the admin round-trip returns
@@ -953,6 +989,7 @@ impl EngineState {
                 sweeps_served: counters.sweeps_served,
                 gateway_for: gateway_for[pos],
                 own_data_bytes: handle.own_data_bytes,
+                missing_for_ms,
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
                 store_stats: snap
                     .as_ref()
@@ -1041,6 +1078,15 @@ impl EngineState {
 fn addr_of_id(id: u32) -> SocketAddr {
     debug_assert!(id <= MAX_ID, "add_node spends no id past MAX_ID");
     SocketAddr::from(([127, 0, 0, 1], BASE_PORT + id as u16))
+}
+
+/// One origin's own cell of the watched rule, as the snapshot reads it.
+struct OriginCell {
+    /// The cell's (key, bucket, origin node id).
+    at: (u128, BucketEpoch, u128),
+    count: u64,
+    /// When the origin last recorded into it, in virtual ms.
+    updated_ms: u64,
 }
 
 /// Position in `nodes` of the live node with stable id `id`, or `None` if no
