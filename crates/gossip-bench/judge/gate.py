@@ -44,8 +44,8 @@ PREDICTED_COST_RATIO = 0.93
 NUMBERS = ("mean", "ratio", "ratio_lo", "ratio_hi", "diff_mean", "diff_lo", "diff_hi",
            "p_better", "cri_lo", "cri_hi")
 # §6.5's cost model reads the defaults and wire sizes it was derived with;
-# test_gate.py checks each against its Rust source but `DICT_ENTRY_BYTES`, the
-# width of a u128.
+# test_gate.py checks each against its Rust source, except `DICT_ENTRY_BYTES`,
+# the width of a u128.
 TICK_MS = 500                                 # defaults::GOSSIP_TICK_INTERVAL_MILLIS, T
 ERR_BPS = 100                                 # defaults::GOSSIP_TARGET_ERR_BPS, β
 SUSPECT_TICKS, SUSPECT_FLOOR_MS = 4, 2_000    # defaults::GOSSIP_SUSPECT_AFTER_{TICKS,FLOOR_MS}
@@ -54,25 +54,30 @@ IP_UDP_BYTES, HEADER_BYTES = 28, 86           # harness net::IP_UDP_HEADER_BYTES
 DICT_LEN_BYTES, CELL_BYTES = 2, 38            # wire body DICT_LEN_BYTES, CELL_BYTES
 DICT_ENTRY_BYTES = 16                         # a u128 rule fingerprint or origin id
 TICK_S = TICK_MS / 1000
-ACK_BYTES = IP_UDP_BYTES + HEADER_BYTES                   # a datagram with no cells
-DATA_BYTES = ACK_BYTES + DICT_LEN_BYTES + 2 * DICT_ENTRY_BYTES  # one rule, one origin
-MODEL_BAND = 0.05
+# A data packet with one rule and one origin in its dictionaries, before its cells.
+DATA_BYTES = IP_UDP_BYTES + HEADER_BYTES + DICT_LEN_BYTES + 2 * DICT_ENTRY_BYTES
+MODEL_BAND_PCT = 5.0
+# §6.5 derives its equations for a steady cluster: no loss, no churn, no partition.
+UNSTEADY = ("network", "churn")
 STREAM_SIZES = "the quantum `q` (from `storage.max_cells`) or `gossip.tick_interval`"
-# (summary.csv metric, equation, the setting the equation sizes)
-MODEL = (("packets_per_node_s", "(6.3)", STREAM_SIZES),
-         ("bytes_per_node_s", "(6.3)", STREAM_SIZES),
-         ("cross_az_bytes_per_node_s", "(6.3)", STREAM_SIZES),
-         ("conv_p99_incl_never_ms", "(6.5)", "`gossip.tick_interval`"),
-         ("peak_cells", "(6.10)", "`STORAGE_MAX_CELLS` (`storage.max_cells`)"))
+# (summary.csv metric, equation, the setting the equation sizes, whether the
+# equation is an upper bound, which only a measurement above it misses)
+MODEL = (("packets_per_node_s", "(6.3)", STREAM_SIZES, False),
+         ("bytes_per_node_s", "(6.3)", STREAM_SIZES, False),
+         ("cross_az_bytes_per_node_s", "(6.3)", STREAM_SIZES, False),
+         ("conv_p99_incl_never_ms", "(6.5)", "`gossip.tick_interval`", False),
+         ("peak_cells", "(6.10)", "`STORAGE_MAX_CELLS` (`storage.max_cells`)", True))
 MODEL_INTRO = (
-    "Never changes the exit code. Each prediction uses the zone arm's measured admitted "
-    "rate, the regime and the defaults; measured is the mean over valid seeds [95 % "
-    "credible interval]. A metric more than 5 % off its prediction is named below its "
-    "table. (6.3)'s `a`, the acknowledgements sent alone, has no equation in §6.5: the "
-    "predictions count only its cross-zone part, (Z − 1) / T · (1 − e^(−λT)), and put "
-    "λ / R_own cells in each data packet. `missing` means no value: no valid seed, no "
-    "admitted hits, a regime outside (6.2)'s ε = 1, or a metric the run's result does "
-    "not carry: `gateway_failovers` needs a harness-core field.")
+    "Never changes the exit code. The equations are restated in "
+    "`crates/gossip-bench/README.md` (\"§6.5's cost model\"). Each prediction uses the "
+    "zone arm's measured admitted rate, the regime and the defaults; measured is the mean "
+    "over valid seeds [95 % credible interval]. A metric more than 5 % off its prediction "
+    "(above it, for (6.10)'s upper bound) is named below its table, in a regime without "
+    "loss, churn or a partition, which §6.5's equations leave out. (6.3)'s `a`, the "
+    "acknowledgements sent alone, has no equation, so the predictions leave it out and "
+    "put λ / R_own cells in each data packet. `missing` means no value: no valid seed, "
+    "no admitted hits, a regime outside (6.2)'s ε = 1, or a metric the run's result "
+    "does not carry: `gateway_failovers` needs a harness-core field.")
 
 
 def read(summary: Path) -> dict:
@@ -150,15 +155,11 @@ def predict(regime: dict, admitted: float | None) -> dict:
     if max(1, rule["limit"] * ERR_BPS // (10_000 * (n - 1))) != 1:           # (3.2)
         return {}
     own = rate / 2 + (1 - math.exp(-2 * rate * TICK_S)) / (4 * TICK_S)       # (6.2), R_own
-    data = own * (n - 1)                                                      # (6.3) data
-    # (6.3)'s `a` has no equation; only its cross-zone part is predicted: each
-    # node gateways Z − 1 remote origins and acks each at its heartbeat (§6.5.2)
-    # when the origin admitted a hit in the interval.
-    acks = (ZONES - 1) / TICK_S * (1 - math.exp(-rate * TICK_S))
+    data = own * (n - 1)                                                      # (6.3) without `a`
     packet = DATA_BYTES + CELL_BYTES * rate / own                             # c_p = λ / R_own
-    return {"packets_per_node_s": data + acks,
-            "bytes_per_node_s": data * packet + acks * ACK_BYTES,
-            "cross_az_bytes_per_node_s": own * (ZONES - 1) * packet + acks * ACK_BYTES,
+    return {"packets_per_node_s": data,
+            "bytes_per_node_s": data * packet,
+            "cross_az_bytes_per_node_s": own * (ZONES - 1) * packet,         # to Z − 1 gateways
             "conv_p99_incl_never_ms": p99_ms(rate),
             "peak_cells": total * (rule["window_ms"] + rule["bucket_ms"]) / 1000}  # (6.10)
 
@@ -181,7 +182,7 @@ def false_suspicion(regime: dict) -> str:
 def model_check(regimes: dict, rows: dict) -> tuple[list[str], int]:
     """gate.md's not-gating section: per regime, §6.5's predictions beside the
     zone arm's measured mean [credible interval], and how many miss by more
-    than `MODEL_BAND`."""
+    than `MODEL_BAND_PCT` as printed, to one decimal."""
     lines, misses = ["", "## §6.5's cost model against the zone arm (not gating)", "",
                      MODEL_INTRO], 0
     for r, regime in regimes.items():
@@ -190,17 +191,21 @@ def model_check(regimes: dict, rows: dict) -> tuple[list[str], int]:
                   "|---|---|---|---|---|"]
         notes = [f"- `gateway_failovers`: missing. §6.5.8 predicts a false suspicion in "
                  f"{false_suspicion(regime)}; `gossip.suspect_after` sizes it."]
-        for metric, equation, sizes in MODEL:
+        steady = not any(key in regime for key in UNSTEADY)
+        if predicted and not steady:
+            notes.append("- Shown, never counted as a miss: this regime has loss, churn or "
+                         "a partition, which §6.5's equations leave out.")
+        for metric, equation, sizes, upper_bound in MODEL:
             row = rows.get((r, ZONE, metric)) or {}
             p, m = predicted.get(metric), row.get("mean")
             off = "missing"
             if p is not None and m is not None:
-                miss = (m - p) / p
-                off = f"{100 * miss:+.1f} %"
-                if abs(miss) > MODEL_BAND:
+                pct = round(100 * (m - p) / p, 1)
+                off = f"{pct:+.1f} %"
+                if steady and (pct if upper_bound else abs(pct)) > MODEL_BAND_PCT:
                     misses += 1
                     notes.append(f"- `{metric}`: §6's defaults rest on a model that "
-                                 f"misses here by {100 * abs(miss):.1f}%; the owner decides. "
+                                 f"misses here by {abs(pct):.1f}%; the owner decides. "
                                  f"{equation} sizes {sizes}.")
             shown = ("missing" if m is None
                      else f"{fmt(m)} [{fmt(row.get('cri_lo'))}, {fmt(row.get('cri_hi'))}]")
@@ -260,7 +265,8 @@ def main() -> None:
                       f"{stamps[ZONE]['solution_commit']}:{path}").rstrip(), "```"]
     (args.out / "gate.md").write_text("\n".join(lines) + "\n")
     print("\n".join(fails) or "Every rule passes.",
-          f"Cost model (not gating): {misses} comparisons miss §6.5 by more than 5 %; gate.md "
+          f"Cost model (not gating): {misses} comparison{'' if misses == 1 else 's'} "
+          f"miss{'es' if misses == 1 else ''} §6.5 by more than 5 %; gate.md "
           "names the setting each sizes, and the owner decides.",
           f"Wrote {args.out}/gate.md", sep="\n")
     sys.exit(1 if fails else 0)

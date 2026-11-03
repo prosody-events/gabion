@@ -124,9 +124,8 @@ class ExitTest(unittest.TestCase):
 
     def test_a_model_miss_never_changes_the_exit_code(self):
         # Red if a model miss feeds the exit code or the printed miss count is
-        # wrong. Runs the real `main()` with
-        # only judge.py, git and the core hash faked, every rule passing and
-        # one miss far outside any band.
+        # wrong. Runs the real `main()` with only judge.py, git and the core
+        # hash faked, every rule passing and one miss far outside any band.
         rows = passing(sorted(p.stem for p in REGIME_DIR.glob("*.json")))
         rows[("prod-peak", ZONE, "admitted")] = {"mean": 1.0}
         rows[("prod-peak", ZONE, "peak_cells")] = {"mean": 1e6}  # predicted 0.18
@@ -159,7 +158,7 @@ class ExitTest(unittest.TestCase):
                 gate.main()
             text = (out / "gate.md").read_text()
         self.assertEqual(exit_.exception.code, 0)
-        self.assertIn("Cost model (not gating): 1 comparisons miss", stdout.getvalue())
+        self.assertIn("Cost model (not gating): 1 comparison misses §6.5", stdout.getvalue())
         self.assertIn("Every rule passes.", text)
         self.assertIn("`peak_cells`: §6's defaults rest on a model that misses here", text)
 
@@ -167,31 +166,61 @@ class ExitTest(unittest.TestCase):
 class ModelTest(unittest.TestCase):
     ADMITTED = 109_474.0  # prod-peak's zone arm, about Λ = 1,825 over 60 s
 
-    def check(self, scale: float, metric: str) -> str:
-        """The model section for prod-peak with the zone arm measuring `scale`
-        times the prediction of `metric` and exactly the prediction elsewhere."""
-        rows = {("prod-peak", ZONE, "admitted"): {"mean": self.ADMITTED}}
-        for m, p in gate.predict(regime("prod-peak"), self.ADMITTED).items():
-            rows[("prod-peak", ZONE, m)] = {"mean": p * (scale if m == metric else 1.0)}
-        return "\n".join(gate.model_check({"prod-peak": regime("prod-peak")}, rows)[0])
+    def check(self, scale: float, metric: str, name: str = "prod-peak") -> tuple[str, int]:
+        """The model section for `name` and its miss count, with the zone arm
+        measuring `scale` times the prediction of `metric` and exactly the
+        prediction elsewhere."""
+        rows = {(name, ZONE, "admitted"): {"mean": self.ADMITTED}}
+        for m, p in gate.predict(regime(name), self.ADMITTED).items():
+            rows[(name, ZONE, m)] = {"mean": p * (scale if m == metric else 1.0)}
+        lines, misses = gate.model_check({name: regime(name)}, rows)
+        return "\n".join(lines), misses
 
     def test_a_miss_is_flagged_past_five_percent_either_way(self):
-        # Red if the band is not 5 %, is one-sided, measures the miss against
-        # the measured value instead of the prediction, or names the wrong
-        # setting.
-        for scale, flagged in ((1.051, True), (0.949, True), (1.049, False), (0.951, False)):
-            self.assertEqual("misses here by" in self.check(scale, "peak_cells"), flagged, scale)
-        for metric, equation, sizes in gate.MODEL:
+        # Red if the band is not 5 %, is one-sided for an estimate or
+        # two-sided for (6.10)'s upper bound, measures the miss against the
+        # measured value instead of the prediction, flags a miss its line
+        # prints as 5.0 %, or names the wrong setting.
+        for metric, cases in (
+                ("packets_per_node_s", ((1.051, 1), (0.949, 1), (1.049, 0), (0.951, 0),
+                                        (1.0504, 0), (1.0506, 1))),
+                ("peak_cells", ((1.051, 1), (0.949, 0), (1.049, 0), (0.5, 0)))):
+            for scale, flagged in cases:
+                text, misses = self.check(scale, metric)
+                self.assertEqual((misses, "misses here by" in text), (flagged, bool(flagged)),
+                                 (metric, scale))
+        for metric, equation, sizes, _ in gate.MODEL:
             self.assertIn(f"- `{metric}`: §6's defaults rest on a model that misses here by "
                           f"5.1%; the owner decides. {equation} sizes {sizes}.",
-                          self.check(1.051, metric))
-        self.assertEqual(dict((m, s) for m, _, s in gate.MODEL),
+                          self.check(1.051, metric)[0])
+        self.assertEqual({m: bound for m, *_, bound in gate.MODEL},
+                         {**dict.fromkeys(("packets_per_node_s", "bytes_per_node_s",
+                                           "cross_az_bytes_per_node_s",
+                                           "conv_p99_incl_never_ms"), False),
+                          "peak_cells": True})
+        self.assertEqual(dict((m, s) for m, _, s, _ in gate.MODEL),
                          {**dict.fromkeys(("packets_per_node_s", "bytes_per_node_s",
                                            "cross_az_bytes_per_node_s"), gate.STREAM_SIZES),
                           "conv_p99_incl_never_ms": "`gossip.tick_interval`",
                           "peak_cells": "`STORAGE_MAX_CELLS` (`storage.max_cells`)"})
         self.assertIn("quantum", gate.STREAM_SIZES)
         self.assertIn("`gossip.tick_interval`", gate.STREAM_SIZES)
+
+    def test_a_regime_outside_the_model_is_shown_never_missed(self):
+        # Red if a regime with loss, churn or a partition counts a miss, drops
+        # its predictions, or lacks the note that says why; or if a steady
+        # regime stops counting one.
+        for name in ("loss-5", "loss-burst", "az-partition", "churn-rollout"):
+            text, misses = self.check(3.0, "packets_per_node_s", name)
+            self.assertEqual(misses, 0, name)
+            self.assertNotIn("misses here by", text, name)
+            self.assertIn("- Shown, never counted as a miss: this regime has loss, churn or a "
+                          "partition, which §6.5's equations leave out.", text, name)
+            self.assertIn("| +200.0 % |", text, name)
+        for name in ("prod-peak", "low-3", "long-window", "idle", "hot-key"):
+            text, misses = self.check(3.0, "packets_per_node_s", name)
+            self.assertEqual(misses, 1, name)
+            self.assertNotIn("never counted", text, name)
 
     def test_a_missing_metric_reads_missing_not_a_pass(self):
         # Red if a missing mean is read as 0 or as within the band, if
@@ -220,19 +249,18 @@ class ModelTest(unittest.TestCase):
 
     def test_the_model_gives_section_6_5s_numbers(self):
         # Red if (6.2), (6.3), (6.5), (6.10), the packet size or §6.5.8's
-        # false-suspicion odds are mistyped: the expected values are §6.3's and
-        # §6.5's own figures (R_own 5.49 and 12.54, p99 300 and 148 ms,
-        # A = Λ · 11 s, the §6.5.8 tables), plus the cross-zone acks,
-        # 4 · (1 − e^(−λT)).
+        # false-suspicion odds are mistyped, or if `a`, which has no equation,
+        # is guessed at: the expected values are §6.3's and §6.5's own figures
+        # (R_own 5.49 and 12.54, so D − a = 999 and 3,749, p99 300 and 148 ms,
+        # A = Λ · 11 s, the §6.5.8 tables).
         peak = gate.predict(regime("prod-peak"), 1_825 * 60)  # Λ = 1,825 (§6.3)
         x4 = gate.predict(regime("prod-4x"), 7_222 * 60)      # Λ = 7,222
-        self.assertAlmostEqual(peak["packets_per_node_s"], 5.49 * 182 + 3.97, delta=2)
-        self.assertAlmostEqual(x4["packets_per_node_s"], 12.54 * 299 + 4.0, delta=4)
-        # 998 data packets of 1.82 cells at 148 + 38 c bytes, plus 4 acks of 114 B
-        self.assertAlmostEqual(peak["bytes_per_node_s"],
-                               998 * (148 + 38 * 1.82) + 3.97 * 114, delta=300)
+        self.assertAlmostEqual(peak["packets_per_node_s"], 5.49 * 182, delta=1)
+        self.assertAlmostEqual(x4["packets_per_node_s"], 12.54 * 299, delta=2)
+        # 999 data packets of 1.82 cells at 148 + 38 c bytes
+        self.assertAlmostEqual(peak["bytes_per_node_s"], 999 * (148 + 38 * 1.82), delta=200)
         self.assertAlmostEqual(peak["cross_az_bytes_per_node_s"],
-                               5.49 * 2 * (148 + 38 * 1.82) + 3.97 * 114, delta=10)
+                               5.49 * 2 * (148 + 38 * 1.82), delta=5)
         self.assertAlmostEqual(peak["conv_p99_incl_never_ms"], 300, delta=1)
         self.assertAlmostEqual(x4["conv_p99_incl_never_ms"], 148, delta=1)
         self.assertAlmostEqual(peak["peak_cells"], 1_825 * 11, delta=1)
