@@ -1216,7 +1216,7 @@ Message starts: "gabion: failed to spawn the leader thread"
 
 ### `leader_standby`
 
-**Level** info, once per worker until it leads · **Request allowed** yes · **Emitted by** NGINX module only
+**Level** info, once per worker, and again after each of that worker's `leader_stopped` lines · **Request allowed** yes · **Emitted by** NGINX module only
 
 Message starts: "gabion: worker did not win leader lease"
 

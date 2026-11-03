@@ -549,7 +549,7 @@ Message starts: "Starting gabion."
 
 **Why.** The process started.
 
-**What to do next.** Check the fields against what you meant to configure: `rules_loaded`, the binds, `membership` (`kubernetes`, `static` or `alone`) and the capacities.
+**What to do next.** Check the fields against what you meant to configure: `rules_loaded`, the binds, `membership` (`kubernetes` or `static`) and the capacities.
 
 **Fields** `gossip_bind`, `envoy_bind`, `admin_bind`, `rules_loaded`, `max_keys`, `max_rules`, `max_peers`, `max_peer_instances`, `zone_setting`, `membership` · **Knob** none
 
@@ -657,11 +657,11 @@ Message starts: "A request matched more than 16 rate-limit rules, the most this 
 
 Message starts: "Marked the rate-limit service as NOT_SERVING in the health protocol."
 
-**What happened.** After a signal, `gabiond` set the gRPC health status to NOT_SERVING so load balancers route new requests elsewhere, then drains its listeners.
+**What happened.** After a signal, or after a `gossip_stopped` or `server_stopped` error, `gabiond` set the gRPC health status to NOT_SERVING so load balancers route new requests elsewhere, then drains its listeners.
 
-**Why.** A `shutdown_signal` line came first.
+**Why.** A `shutdown_signal` line came first. If a `gossip_stopped` or `server_stopped` error came first instead, `gabiond` exits with status 1 once its listeners drain.
 
-**What to do next.** Nothing.
+**What to do next.** Nothing after a signal. After an error, follow that error's entry.
 
 **Fields** none · **Knob** none
 

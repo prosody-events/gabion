@@ -84,6 +84,13 @@ struct Planned {
     limit: u64,
 }
 
+// The READMEs and `gabion::defaults` quote 32 bytes a matched rule per
+// runtime thread; `matched_rule_overflow` prints the live size.
+const _: () = assert!(
+    size_of::<Planned>() == 32,
+    "update the 32 bytes a rule the READMEs and gabion::defaults quote"
+);
+
 thread_local! {
     /// This thread's admission scratch: reserved to its bound on the
     /// thread's first admission and never grown after. Admission takes it

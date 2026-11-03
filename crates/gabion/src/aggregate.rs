@@ -55,6 +55,14 @@ pub struct AggregateSlot {
     _reserved: AtomicU64,
 }
 
+// One 64-byte line a slot: the probe reads one line, and the READMEs and
+// `gabion::defaults` quote 64 bytes a slot. Loom's model atomics are larger.
+#[cfg(not(feature = "loom"))]
+const _: () = assert!(
+    size_of::<AggregateSlot>() == 64,
+    "update the 64 bytes a slot the READMEs and gabion::defaults quote"
+);
+
 /// What one slot holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateCell {

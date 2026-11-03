@@ -87,8 +87,8 @@ fn readme_example() {
     }));
 }
 
-/// Each non-blank line of the README's `rust,ignore` fence appears, in order,
-/// in `readme_example`.
+/// The README's `rust,ignore` fence is a run of `readme_example`'s lines: every
+/// non-blank line, trimmed, in order, with no line between.
 #[test]
 fn readme_example_matches_source() {
     let source = include_str!("readme.rs");
@@ -103,24 +103,46 @@ fn readme_example_matches_source() {
         "the README has one `rust,ignore` fence"
     );
     let fence = &fence[..fence.find("```").expect("the fence closes")];
-    let mut lines = body.lines().map(str::trim);
-    for line in fence.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        assert!(
-            lines.any(|candidate| candidate == line),
-            "README line `{line}` is not in readme_example, in order"
-        );
-    }
+    let non_blank = |text: &'static str| -> Vec<&'static str> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect()
+    };
+    let fence = non_blank(fence);
+    assert!(
+        non_blank(body).windows(fence.len()).any(|run| run == fence),
+        "the README's `rust,ignore` fence is not, line for line, a run of readme_example's lines: \
+         copy the example's body into the fence"
+    );
 }
 
-/// Every fence in the README names its language, so rustdoc compiles none.
+/// The words rustdoc reads as Rust in a fence's info string; a fence is Rust
+/// when one word is `rust` or every word is one of these.
+const RUSTDOC_WORDS: [&str; 7] = [
+    "",
+    "rust",
+    "ignore",
+    "no_run",
+    "should_panic",
+    "compile_fail",
+    "test_harness",
+];
+
+/// Every fence but the example's `rust,ignore` names a language rustdoc does
+/// not compile, so rustdoc compiles no README block.
 #[test]
 fn readme_fences_name_their_language() {
     let mut open = false;
     for (number, line) in README.lines().enumerate() {
         if let Some(info) = line.trim_start().strip_prefix("```") {
+            let mut words = info.split([',', ' ', '\t']);
+            let rust = words.clone().any(|word| word == "rust")
+                || words.all(|word| RUSTDOC_WORDS.contains(&word) || word.starts_with("edition"));
             assert!(
-                open || !info.is_empty(),
-                "README line {}: a bare fence",
+                open || info == "rust,ignore" || !rust,
+                "README line {}: fence `{info}` is Rust to rustdoc; label it `text` or the \
+                 language it shows",
                 number + 1
             );
             open = !open;

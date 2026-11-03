@@ -2,8 +2,8 @@
 //!
 //! The low-level library types may keep smaller construction defaults for
 //! tests and examples. Server-facing binaries should use these values.
-//! Each constant's doc gives its unit, the memory it sizes, and the message
-//! that names it.
+//! Each constant's doc gives its unit and, where it has them, the memory it
+//! sizes and the message that names it.
 
 #![warn(missing_docs)]
 
@@ -91,21 +91,17 @@ pub const GOSSIP_EXPIRATION_BATCH: usize = 4_096;
 /// node runs with this one.
 pub const GOSSIP_CLUSTER_ID_HASH: u128 = 1;
 
-/// Per-rule error budget for threshold-triggered anti-entropy, expressed in
-/// basis points of the rule's own limit. A node emits the moment its locally
-/// unreplicated delta for some rule R would cross `target_err_bps / 10_000 ×
-/// L_R / N` (per-site safe zone of Sharfman, Schuster, Keren, SIGMOD 2006,
-/// calibrated by the Olston/Jiang/Widom SIGMOD 2003 error budget). The
-/// cluster-wide unreplicated error per rule is then bounded by
-/// `target_err_bps / 10_000 × L_R`, independent of request rate; default
-/// 100 bps = 1 % of the rule's limit.
+/// Default of `gossip.target_err_bps`, in basis points of each rule's limit
+/// (1 to 10,000): a node sends a rule's unsent hits once they pass `max(1,
+/// limit × target_err_bps / (10,000 × peers))`, so the cluster's unreplicated
+/// hits per rule stay under this share of its limit whatever the request rate
+/// (`crates/gabion/GOSSIP.md`, Adaptive emit rate).
 pub const GOSSIP_TARGET_ERR_BPS: u32 = 100;
 
-/// Floor on the gap between two threshold-fire emissions, in milliseconds.
-/// When the budget saturates to 1 hit under adversarial high-RPS traffic,
-/// this clamps worst-case bandwidth so a bad client cannot pin the gossip
-/// plane. Independent of the steady-state heartbeat (which still fires at
-/// `GOSSIP_TICK_INTERVAL_MILLIS`).
+/// Default of `gossip.min_emit_interval`, in milliseconds: the floor between
+/// two threshold or prompt rounds, below `gossip.tick_interval`, which caps a
+/// node's packet rate under a flood of hits; `/snapshot`'s `rounds_threshold`
+/// and `packets_sent` show when it binds.
 pub const GOSSIP_MIN_EMIT_INTERVAL_MS: u64 = 5;
 
 /// In reports: gap reports a receiver sends for one gap without progress before

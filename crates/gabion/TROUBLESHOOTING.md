@@ -85,7 +85,7 @@ Message starts: "Peer joined the cluster."
 
 **What happened.** Discovery, or the static peer list at start, reported a new peer, and this node added it to its peer table. It now gossips with it and shares its counts.
 
-**Why.** A pod started, or discovery saw its EndpointSlice entry become ready. During a rollout every new pod logs one line on every node.
+**Why.** A pod started, or discovery saw its EndpointSlice entry become ready. During a rollout every new pod logs one line on every node. With a static list that names this node too, one line names this node's own address; the node drops that row, at debug level and with no `peer_left`, when its first own packet arrives, so `cluster_size` reads one high until then.
 
 **What to do next.** Nothing. `cluster_size` is the peer table's size after the change; compare it with your pod count less one to check that discovery sees every pod.
 
@@ -325,7 +325,7 @@ Message starts: "Could not connect to the Kubernetes API, so gabion cannot disco
 
 **What to do next.** Outside Kubernetes, list the peers in `gossip.bootstrap_peers` (`GABION_GOSSIP_BOOTSTRAP_PEERS`; NGINX `gabion_gossip_bootstrap_peers`), see [Outside Kubernetes](README.md#outside-kubernetes); a single node needs nothing. In a pod, mount the ServiceAccount token and grant the Role in the [Kubernetes checklist](../../README.md#kubernetes-checklist), then restart the pod.
 
-**Fields** `error` · **Knob** `gossip.bootstrap_peers` (`GABION_GOSSIP_BOOTSTRAP_PEERS`) / `gabion_gossip_bootstrap_peers`
+**Fields** `config_key`, `error` · **Knob** `gossip.bootstrap_peers` (`GABION_GOSSIP_BOOTSTRAP_PEERS`) / `gabion_gossip_bootstrap_peers`
 
 ### `gabion_service_found`
 

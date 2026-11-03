@@ -943,13 +943,7 @@ extern "C" fn set_rule(
         let mut words = Vec::with_capacity(nelts);
         for index in 1..nelts {
             let Ok(word) = (*args.add(index)).to_str() else {
-                conf_error!(
-                    cf,
-                    code = "directive_arg_not_utf8",
-                    "an argument of `gabion_limit_rule` is not valid UTF-8, which gabion cannot \
-                     read. Re-save the file as UTF-8, then run `nginx -t`.",
-                );
-                return core::NGX_CONF_ERROR;
+                return arg_not_utf8(cf, "gabion_limit_rule");
             };
             words.push(word);
         }
@@ -1019,17 +1013,8 @@ extern "C" fn set_limit(
         }
 
         // Detect `gabion_limit off`. Must be the only argument when used.
-        let first = match (*args.add(1)).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                conf_error!(
-                    cf,
-                    code = "directive_arg_not_utf8",
-                    "an argument of `gabion_limit` is not valid UTF-8, which gabion cannot read. \
-                     Re-save the file as UTF-8, then run `nginx -t`.",
-                );
-                return core::NGX_CONF_ERROR;
-            }
+        let Ok(first) = (*args.add(1)).to_str() else {
+            return arg_not_utf8(cf, "gabion_limit");
         };
         if first == "off" {
             if nelts != 2 {
@@ -1053,13 +1038,7 @@ extern "C" fn set_limit(
         let indices = location.rule_indices.get_or_insert_with(Vec::new);
         for i in 1..nelts {
             let Ok(rule_name) = (*args.add(i)).to_str() else {
-                conf_error!(
-                    cf,
-                    code = "directive_arg_not_utf8",
-                    "an argument of `gabion_limit` is not valid UTF-8, which gabion cannot read. \
-                     Re-save the file as UTF-8, then run `nginx -t`.",
-                );
-                return core::NGX_CONF_ERROR;
+                return arg_not_utf8(cf, "gabion_limit");
             };
             if rule_name == "off" {
                 conf_error!(
@@ -1114,13 +1093,7 @@ extern "C" fn set_gabion(
             return core::NGX_CONF_ERROR;
         }
         let Ok(value) = (*args.add(1)).to_str() else {
-            conf_error!(
-                cf,
-                code = "directive_arg_not_utf8",
-                "an argument of `gabion` is not valid UTF-8, which gabion cannot read. Re-save \
-                 the file as UTF-8, then run `nginx -t`.",
-            );
-            return core::NGX_CONF_ERROR;
+            return arg_not_utf8(cf, "gabion");
         };
         match value {
             "on" => location.off = Some(false),
@@ -1129,7 +1102,9 @@ extern "C" fn set_gabion(
                 conf_error!(
                     cf,
                     code = "gabion_bad_value",
-                    "`gabion {}` is not a valid value; use `on` or `off`",
+                    "`gabion {}` is not a valid value: `gabion` only switches gabion on or off \
+                     here, so a rule name belongs in `gabion_limit`. Write `gabion on;` or \
+                     `gabion off;`, then run `nginx -t`.",
                     other,
                 );
                 return core::NGX_CONF_ERROR;
@@ -1162,14 +1137,7 @@ extern "C" fn set_setting(
         )
     };
     let Some(value) = value else {
-        conf_error!(
-            cf,
-            code = "directive_arg_not_utf8",
-            "an argument of `{}` is not valid UTF-8, which gabion cannot read. Re-save the file \
-             as UTF-8, then run `nginx -t`.",
-            setting.nginx_directive().unwrap_or(setting.yaml_key()),
-        );
-        return core::NGX_CONF_ERROR;
+        return arg_not_utf8(cf, setting.nginx_directive().unwrap_or(setting.yaml_key()));
     };
     match main.settings.apply(setting, value) {
         Ok(()) => core::NGX_CONF_OK,
@@ -1178,6 +1146,18 @@ extern "C" fn set_setting(
             core::NGX_CONF_ERROR
         }
     }
+}
+
+/// Fails a directive whose argument is not UTF-8 (`directive_arg_not_utf8`).
+fn arg_not_utf8(cf: *mut ngx_conf_t, directive: &str) -> *mut c_char {
+    conf_error!(
+        cf,
+        code = "directive_arg_not_utf8",
+        "an argument of `{}` is not valid UTF-8, which gabion cannot read. Re-save the file as \
+         UTF-8, then run `nginx -t`.",
+        directive,
+    );
+    core::NGX_CONF_ERROR
 }
 
 /// Internal helper invoked only from the directive handlers above; marked

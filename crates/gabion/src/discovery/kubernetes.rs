@@ -2,6 +2,7 @@
 mod tests;
 
 use crate::discovery::{DiscoveryConfig, OwnEntry, Peer, PeerDiscovery, PeerEvent, SelfMatch};
+use crate::settings::Setting;
 use crate::zone::{ZoneHash, ZoneName};
 use ahash::{AHashMap, AHashSet};
 use async_stream::stream;
@@ -60,15 +61,17 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                         tracing::warn!(
                             code = "kubernetes_unreachable",
                             error = %err,
+                            config_key = Setting::GossipBootstrapPeers.yaml_key(),
                             "Could not connect to the Kubernetes API, so gabion \
                              cannot discover peers and this node's counts stay \
                              local to it. That is expected for a single node \
-                             outside Kubernetes. In a pod, check that it has the \
-                             auto-mounted \
-                             ServiceAccount secrets at \
-                             /var/run/secrets/kubernetes.io/serviceaccount/ \
-                             and an RBAC binding granting watch on Services \
-                             and EndpointSlices.",
+                             outside Kubernetes; for several nodes outside \
+                             Kubernetes, list the others in {}. In a pod, the \
+                             ServiceAccount token is usually not mounted: check \
+                             /var/run/secrets/kubernetes.io/serviceaccount/ and \
+                             `automountServiceAccountToken`, then restart the \
+                             pod. The `error` field says why.",
+                            Setting::GossipBootstrapPeers,
                         );
                         return;
                     }
