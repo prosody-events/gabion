@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import type { AnswerState } from '../src/lib/sim/types';
 
 const SEED_TOTAL = '50';
 const NODES = 12;
@@ -865,13 +866,48 @@ test('gateway failure fails over and the zone catches up', async ({ page }) => {
   const gateway = inspector.locator('tr.remote[data-zone="1"] [data-field="gateway"]');
   const g = Number(await gateway.textContent());
 
-  // Step until the stage names a zone b failover and the origin has moved off g.
+  // Step until the stage names a failover off g into zone b and the origin has
+  // moved off g. The sentence names the new gateway first, then g.
   const annotation = page.locator('.annotation');
+  const failover = /^node (\d+) now reaches zone b through node (\d+), after node (\d+)$/;
+  const sentence = async (): Promise<RegExpExecArray | null> =>
+    failover.exec(((await annotation.textContent()) ?? '').replace(/\s+/g, ' ').trim());
   const moved = async (): Promise<boolean> =>
-    ((await annotation.textContent()) ?? '').includes('zone b') &&
-    Number(await gateway.textContent()) !== g;
-  for (let i = 0; i < 12 && !(await moved()); i++) await step(page);
-  await expect(annotation).toContainText('zone b');
+    Number((await sentence())?.[3]) === g && Number(await gateway.textContent()) !== g;
+  // Each Step, the zone b row wears the glyph and word of the answer state the
+  // origin's runtime reports for its gateway: ◆ "ok" while settled or owed, ◇
+  // "suspected" or "cannot relay" otherwise.
+  const shown: Record<AnswerState, readonly [string, string]> = {
+    settled: ['◆', 'ok'],
+    owed: ['◆', 'ok'],
+    suspect: ['◇', 'suspected'],
+    cannot_relay: ['◇', 'cannot relay'],
+  };
+  const row = inspector.locator('tr.remote[data-zone="1"] td');
+  const answers = new Set<AnswerState>();
+  const checkRow = async (): Promise<void> => {
+    const answer = await page.evaluate(async () => {
+      const snap = await window.sim!.snapshot(0);
+      return snap.inspected?.peers.find((p) => p.role === 'gateway' && p.zone === 1)?.answer;
+    });
+    if (answer === undefined) return;
+    const [glyph, label] = shown[answer];
+    const text = ((await row.textContent()) ?? '').replace(/\s+/g, ' ').trim();
+    expect(text.startsWith(`${glyph} gateway node `), `a ${answer} gateway's glyph in "${text}"`).toBe(true);
+    expect(text.endsWith(` · ${label}`), `a ${answer} gateway's word in "${text}"`).toBe(true);
+    answers.add(answer);
+  };
+  await checkRow();
+  for (let i = 0; i < 12 && !(await moved()); i++) {
+    await step(page);
+    await checkRow();
+  }
+  expect([...answers].sort(), 'the zone b row was checked settled, then owed').toEqual(['owed', 'settled']);
+  const [, origin, to, from] = (await sentence()) ?? [];
+  expect(Number(from), `the annotation names g = ${g} as the gateway it left`).toBe(g);
+  expect([1, 4, 7, 10], `the annotation's new gateway, node ${to}, is in zone b`).toContain(Number(to));
+  expect(Number(to), 'the annotation names a new gateway').not.toBe(g);
+  expect([1, 4, 7, 10], `the annotation's origin, node ${origin}, is outside zone b`).not.toContain(Number(origin));
   await expect(gateway).not.toHaveText(String(g));
 
   // Six more Steps: every zone b node but the silenced one is caught up, and the

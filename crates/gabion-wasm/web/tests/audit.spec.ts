@@ -1,7 +1,7 @@
 import { inflateSync } from 'node:zlib';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { ChartHistory } from '../src/lib/charts/history';
-import type { ClusterState } from '../src/lib/sim/types';
+import type { ClusterState, PacketKind, Tier } from '../src/lib/sim/types';
 import {
   ARC_GAP,
   ARC_WIDTH,
@@ -818,22 +818,33 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
   expect(Math.abs(Number(await figure.getAttribute('data-ref-nozone')) - refs.nozone)).toBeLessThan(1e-9);
 
   // Sandbox with unequal zones: Add node in zone a (5, 4, 4), bursts at nodes 0
-  // and 1, four Steps. Both references follow the placement and the bytes each
-  // origin sent.
+  // and 1, then 26 Steps (13 s, past one window) with another burst at node 0
+  // four Steps from the end. Both references follow the placement and the bytes
+  // each origin sent in the window, which opens at a kept mark, not the session
+  // start, so the mark's per-origin bytes count.
   await loadPreset(page, 'Sandbox');
   await page.getByRole('button', { name: 'Add node' }).click();
   await expect(page.locator('[data-field="status-nodes"]')).toHaveText('13');
   const rail = page.locator('.rail');
-  for (const node of ['0', '1']) {
+  const burst = async (node: string): Promise<void> => {
     await page.getByLabel('Node', { exact: true }).selectOption(node);
     await rail.getByRole('button', { name: 'Send burst' }).click();
-  }
+  };
+  await burst('0');
+  await burst('1');
   const sandbox: ClusterState[] = [await snapshot(page)];
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 26; i++) {
+    if (i === 22) await burst('0');
     await step(page);
     sandbox.push(await snapshot(page));
   }
   expect(sandbox[0].zones.map((z) => z.live), 'zones of 5, 4 and 4').toEqual([5, 4, 4]);
+  const opened = windowStart(sandbox);
+  expect(opened.t, 'the window opens at a kept mark').toBeGreaterThan(0);
+  expect(
+    Math.max(...opened.own.values()),
+    "the window's opening mark holds own bytes already sent, so its per-origin bytes count",
+  ).toBeGreaterThan(0);
   const unequal = predictions(sandbox)!;
   const chart = page.locator('figure[data-ref-zones]');
   expect(Math.abs(Number(await chart.getAttribute('data-ref-zones')) - unequal.zones)).toBeLessThan(1e-9);
@@ -1060,6 +1071,107 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
     }
     console.log(`${where}: checked the route of ${beams.length} drawn beam(s)`);
   }
+});
+
+// -- The stage's beams, one per packet, styled by its kind ---------------------
+
+test("every drawn beam carries its packet's kind, tier and fate", async ({ page }, info) => {
+  test.skip(info.project.name !== 'audit-1440-light', "the renderer's beam flags, checked once");
+  await open(page);
+  await loadPreset(page, 'Steady state');
+
+  // The flag bits the stage's beam pool packs, and what each packet should
+  // wear, written out here from the packet kinds rather than read from the
+  // renderer: an acknowledgement or a sweep request is a dot, a relay is
+  // marked so its gateway's beams stay the selected origin's.
+  const CROSS = 1;
+  const CONTROL = 2;
+  const RELAY = 4;
+  const DROPPED = 8;
+  const KIND: Record<PacketKind, number> = { Ack: CONTROL, SweepRequest: CONTROL, Own: 0, Relay: RELAY, Sweep: 0 };
+  type Packet = { src: number; dst: number; kind: PacketKind; tier: Tier; dropped: boolean };
+
+  // Record the packets of every Step the page takes, as the engine reports them.
+  await page.evaluate(() => {
+    const sim = window.sim!;
+    const step = sim.step.bind(sim);
+    const w = window as unknown as { packets: Packet[] };
+    w.packets = [];
+    sim.step = async (ms: number) => {
+      const batch = await step(ms);
+      for (const { kind } of batch.events) {
+        if (kind.type === 'PacketSent' || kind.type === 'PacketDropped') {
+          const { src, dst, tier } = kind;
+          w.packets.push({ src, dst, kind: kind.kind, tier, dropped: kind.type === 'PacketDropped' });
+        }
+      }
+      return batch;
+    };
+  });
+
+  // One Step: every beam it drew must be one of its packets' with that packet's
+  // flags, each packet used once. A beam may already have landed and gone, so
+  // the beams are a sub-multiset of the packets; the kinds matched are returned.
+  const checkStep = async (): Promise<Set<PacketKind>> => {
+    const since = await page.evaluate(() => {
+      (window as unknown as { packets: Packet[] }).packets = [];
+      return performance.now();
+    });
+    await step(page);
+    const { beams, packets } = await page.locator('.stage canvas').evaluate(
+      (
+        c: HTMLCanvasElement & {
+          beams?: { len: number; start: Float64Array; src: Int32Array; dst: Int32Array; flags: Uint8Array };
+        },
+        since: number,
+      ) => {
+        const pool = c.beams;
+        if (pool === undefined) throw new Error('the stage publishes no beam pool');
+        const beams = Array.from({ length: pool.len }, (_, i) => ({
+          start: pool.start[i],
+          src: pool.src[i],
+          dst: pool.dst[i],
+          flags: pool.flags[i],
+        })).filter((b) => b.start >= since);
+        return { beams, packets: (window as unknown as { packets: Packet[] }).packets };
+      },
+      since,
+    );
+    const unused = packets.map((p) => ({
+      ...p,
+      flags: KIND[p.kind] | (p.tier === 'CrossZone' ? CROSS : 0) | (p.dropped ? DROPPED : 0),
+    }));
+    const matched = new Set<PacketKind>();
+    for (const b of beams) {
+      const i = unused.findIndex((p) => p.src === b.src && p.dst === b.dst && p.flags === b.flags);
+      const sent = JSON.stringify(packets.filter((p) => p.src === b.src && p.dst === b.dst));
+      const where = `the beam from node ${b.src} to node ${b.dst} with flags ${b.flags}`;
+      expect(i, `${where} is none of ${sent}`).toBeGreaterThanOrEqual(0);
+      matched.add(unused[i].kind);
+      unused.splice(i, 1);
+    }
+    return matched;
+  };
+
+  // Steady state sends own streams, relays and acknowledgements every Step; a
+  // node that joins asks for a sweep and is sent one.
+  const seen = new Set<PacketKind>();
+  const until = async (kinds: PacketKind[]): Promise<void> => {
+    for (let i = 0; i < 10 && !kinds.every((k) => seen.has(k)); i++) {
+      for (const kind of await checkStep()) seen.add(kind);
+    }
+  };
+  await until(['Own', 'Relay', 'Ack']);
+  await page.getByRole('button', { name: 'Add node' }).click();
+  await expect(page.locator('[data-field="status-nodes"]')).toHaveText('13');
+  await until(['SweepRequest', 'Sweep']);
+  expect([...seen].sort(), 'a drawn beam of every packet kind').toEqual([
+    'Ack',
+    'Own',
+    'Relay',
+    'Sweep',
+    'SweepRequest',
+  ]);
 });
 
 // -- The stage's labels, laid out once per layout -------------------------------

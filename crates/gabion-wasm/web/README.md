@@ -229,7 +229,7 @@ Automated checks, run on every preset with the transport paused:
 
 - A1: no page or console errors, no failed requests, no page-level horizontal overflow.
 - A2: no "NaN", "undefined", "null", "Infinity", "[object" or "e+" in page text.
-- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; every chart value lies inside its plot and every y axis labels at least two values; the stage draws every node's id; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it, no two nodes of different rings touch, and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every beam in flight bends through the centre exactly when its nodes' zones differ.
+- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; every chart value lies inside its plot and every y axis labels at least two values; the stage draws every node's id; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it, no two nodes of different rings touch, and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every beam in flight bends through the centre exactly when its nodes' zones differ and wears its packet's kind, tier and fate (a dot for an acknowledgement or a sweep request, a relay marked as one), one beam per packet.
 - A4: data correctness, recomputed independently from the engine snapshot in the test's own code: the status counts, each node's behind-by and gateway-for count, the headline's censored "not caught up (≥ t)", each chart-3 spread, the windowed share, both chart-1 predictions (with unequal zones, and absent with one node) and, for a selected origin, its Gossip targets.
 - A5: fixed order across the grid, table, chart panels and inspector rows.
 - A6: interaction: the zone stepper and Rebuild, each network action and heal, keyboard navigation with focus kept across a rebuild, a tooltip on hover, focus and tap, and the study link's form (`study/` joins the site only in the Pages build, so its href is checked, not followed).
@@ -254,9 +254,11 @@ with motion reduced). Its main test walks every preset to a fixed virtual time
 with the transport paused, runs A1 to A9, checks the stage tooltips, and recomputes
 A4 and A5 from the engine's snapshot, then repeats the page checks with
 `data-theme` forcing the other theme. Further tests check chart 1 across the
-rule window and with unequal zones and one node, the share window at any
-snapshot rate, the stage geometry for every zone count (at the widest and the
-narrowest stage, with facing discs of neighbouring rings kept apart), that a
+rule window, with unequal zones over a window that opens at a kept mark, and
+with one node, the share window at any snapshot rate, the stage geometry for
+every zone count (at the widest and the narrowest stage, with facing discs of
+neighbouring rings kept apart), that every drawn beam matches a packet of every
+kind, that a
 paused stage's labels are not rebuilt per snapshot, and the interactions, with
 touch. Full-page PNGs land in `audit-shots/`, which is gitignored; CI uploads it
 as a workflow artifact. All of it downloads a browser, so, like the node
