@@ -40,7 +40,7 @@ use crate::throttle;
 pub const MAX_PROBE: usize = 128;
 
 /// One slot. The layout is NGINX's shared-memory format: each logical `u128`
-/// is two `u64`s, because the mapping only guarantees 8-byte alignment.
+/// is two `u64`s, because stable Rust has no 128-bit atomic.
 #[repr(C)]
 #[derive(Debug)]
 pub struct AggregateSlot {

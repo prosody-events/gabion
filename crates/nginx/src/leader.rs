@@ -8,12 +8,16 @@
 //!
 //! `GossipRuntime` is `!Send`, so each leadership term is a `spawn_local`
 //! task on a `LocalSet` that polls the gossip runtime and the queue drain
-//! in one `select!`, sharing plain `Rc<...>` handles.
+//! in one `select!`, sharing plain `Rc<...>` handles. While it leads, it also
+//! logs the zone's bypass counters every lease tick (`log_bypasses`); workers
+//! never log them.
 
+use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -22,12 +26,15 @@ use tokio::task::LocalSet;
 
 use gabion::crdt::{CellStore, KeyHash, NodeIdentity, ValidStorageConfig};
 use gabion::gossip::{GossipClient, GossipRuntime, TokioClock, UdpTransport, ValidGossipConfig};
-use gabion::settings::MIN_LIMIT_QUEUE_CAPACITY;
+use gabion::rules::CardinalityLimit;
+use gabion::settings::{MIN_LIMIT_QUEUE_CAPACITY, Setting};
+use gabion::throttle;
 
 use crate::rules::CompiledRules;
 use crate::shm::ShmRegion;
 use crate::shm::aggregate::ShmAggregateStore;
 use crate::shm::lease::now_millis;
+use crate::shm::queue::{QueueEvent, QueueSlot};
 
 /// Events the drain hands the runtime per pass: the whole depth of the
 /// runtime's request queue under `with_shallow_limit_queue`. The drain waits
@@ -215,7 +222,7 @@ async fn campaign(
 /// Lead gossip until `stopped` fires (`Ok`) or the gossip runtime or the
 /// drain loop ends on its own (`Err`). Both are dropped before this
 /// returns, so the gossip socket is closed and nothing renews the lease
-/// once the caller releases it.
+/// once the caller releases it. Meanwhile it logs the bypass counters.
 async fn leader_main(
     shm: ShmRegion,
     rules: Arc<CompiledRules>,
@@ -263,6 +270,7 @@ async fn leader_main(
         Rc::new(ShmAggregateStore::new(shm)),
     );
     let drain = drain_loop(gossip_client, shm, config.worker_id);
+    let bypasses = log_bypasses_every(config.lease_tick, shm, config.cell_store);
 
     tokio::select! {
         _ = stopped.wait_for(|stop| *stop) => Ok(()),
@@ -271,6 +279,7 @@ async fn leader_main(
             Err(error) => anyhow::Error::new(error).context("the gossip runtime failed"),
         }),
         error = drain => Err(error.context("the drain loop failed")),
+        never = bypasses => match never {},
     }
 }
 
@@ -305,5 +314,94 @@ async fn drain_loop(client: GossipClient, shm: ShmRegion, worker_id: u32) -> any
         if drained == 0 {
             tokio::time::sleep(DRAIN_TICK).await;
         }
+    }
+}
+
+/// Log the bypass counters every `tick` while this worker leads. It is an arm
+/// of its own rather than a step of the drain, so a queue the drain has
+/// stopped emptying still reaches the log.
+async fn log_bypasses_every(
+    tick: Duration,
+    shm: ShmRegion,
+    storage: ValidStorageConfig,
+) -> Infallible {
+    let mut tick = tokio::time::interval(tick);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        log_bypasses(shm, &storage);
+    }
+}
+
+/// Log each counter workers bump on a bypass or a descriptor-limit rejection
+/// whose total passed a power of two since a leader last logged it
+/// (`throttle::catch_up` on the zone's `Stats::logged` marks).
+fn log_bypasses(shm: ShmRegion, storage: &ValidStorageConfig) {
+    let stats = shm.stats();
+    let logged = &stats.logged;
+    let overflowed = stats.matched_rule_overflows.load(Ordering::Relaxed);
+    if let Some(overflowed_total) = throttle::catch_up(&logged.matched_rule_overflows, overflowed) {
+        let cap = storage.max_matched_rules().get();
+        tracing::warn!(
+            code = "matched_rule_overflow",
+            cap,
+            overflowed_total,
+            config_key = Setting::StorageMaxMatchedRules.yaml_key(),
+            "gabion: a request matched more than {cap} rate-limit rules, the most this node \
+             counts per request. It was allowed, and only the first {cap} matched rules counted \
+             it, so the rest under-count. Usually overlapping rules on one location. Remove or \
+             narrow rules on that location, or raise `gabion_storage_max_matched_rules`; each \
+             extra rule costs {} bytes per worker, reserved once on the worker's first request.",
+            size_of::<QueueEvent>(),
+        );
+    }
+    let dropped = stats.queue_dropped.load(Ordering::Relaxed);
+    if let Some(dropped_total) = throttle::catch_up(&logged.queue_dropped, dropped) {
+        let capacity = shm.layout().queue_capacity;
+        tracing::warn!(
+            code = "queue_dropped",
+            dropped_total,
+            capacity,
+            config_key = Setting::GossipLimitQueueCapacity.yaml_key(),
+            "gabion: the shared-memory request queue was full ({capacity} hits), so counted hits \
+             were dropped: their requests were allowed, and limits under-count them. Either the \
+             gossip leader stopped draining it (look for a recent `gabion: this worker stopped \
+             leading gossip` error) or this node admits more counted hits than the queue holds \
+             across a leader handover (about {:?}). Raise `gabion_gossip_limit_queue_capacity`; \
+             each slot uses {} bytes of the `gabion_limit_zone` SIZE, so raise SIZE by the same \
+             amount to keep the count table's size.",
+            LEASE_TTL + DEFAULT_LEASE_TICK,
+            size_of::<QueueSlot>(),
+        );
+    }
+    let declined = stats.declines_invalid_descriptor.load(Ordering::Relaxed);
+    if let Some(declined_total) = throttle::catch_up(&logged.declines_invalid_descriptor, declined)
+    {
+        tracing::warn!(
+            code = "invalid_descriptor_declined",
+            declined_total,
+            "gabion: a rate-limit rule read a key value that is not valid UTF-8, so that rule let \
+             the request through without counting it, and its limit under-counts. Usually a \
+             client sends binary data in a header a rule keys on. Key the rule on a different \
+             variable, or normalise the value with `map`.",
+        );
+    }
+    let rejected = stats.rejected_cardinality.load(Ordering::Relaxed);
+    if let Some(rejected_total) = throttle::catch_up(&logged.rejected_cardinality, rejected) {
+        let (limit, setting) = CardinalityLimit::Bytes.describe();
+        let max = storage.cardinality.max_descriptor_bytes();
+        tracing::warn!(
+            code = "cardinality_rejected",
+            limit,
+            max,
+            rejected_total,
+            config_key = setting.yaml_key(),
+            "gabion: a request's rate-limit descriptor took more than {max} bytes, the most \
+             `gabion_storage_max_descriptor_bytes` allows, so that rule did not count it. If no \
+             other rule on the location allowed or rejected the request, nginx rejected it with \
+             400; if another allowed it, this rule under-counts it. Usually a misbehaving client \
+             or an attack trying to exhaust gabion's tracking memory. If the traffic is \
+             legitimate, raise `gabion_storage_max_descriptor_bytes`.",
+        );
     }
 }

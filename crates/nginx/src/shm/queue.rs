@@ -7,6 +7,7 @@
 //! that doubles as occupancy and ordering. Capacity is a power of two so the
 //! modulo collapses to a mask.
 
+use super::CachePadded;
 use super::atomic::{AtomicU32, AtomicU64, Ordering};
 use super::hint::spin_loop;
 
@@ -22,12 +23,10 @@ pub struct QueueOverflow;
 /// the SHM byte image is unchanged.
 ///
 /// `rule_fingerprint` and `key_hash` are logically `u128`s, split into
-/// paired `(lo, hi)` `AtomicU64`s on the same alignment-workaround
-/// principle that drives `shm/header.rs::NodeIdentityFields` and
-/// `Module::create_main_conf`'s `Box::new`: the SHM mapping only
-/// guarantees 8-byte alignment, and a 16-aligned `u128` placed
-/// directly here would be UB on amd64 (LLVM lowers u128 access to
-/// aligned SSE on that target). Don't "simplify" these back to `u128`.
+/// paired `(lo, hi)` `AtomicU64`s as `shm/header.rs::NodeIdentityFields`
+/// does: stable Rust has no 128-bit atomic, and the pairs keep the slot at
+/// the 72 bytes the settings text quotes (a `u128` would align it to 16 and
+/// pad it to 80).
 #[repr(C)]
 #[derive(Debug)]
 pub struct QueueSlot {
@@ -83,20 +82,21 @@ pub struct QueueEvent {
 #[repr(C)]
 #[derive(Debug)]
 pub struct QueueControl {
-    pub enqueue_pos: AtomicU64,
-    pub dequeue_pos: AtomicU64,
     pub capacity_mask: AtomicU64,
-    pub dropped: AtomicU64,
+    /// Claimed by every push; on its own line, so the leader's pops never
+    /// take it from the workers.
+    pub enqueue_pos: CachePadded<AtomicU64>,
+    /// Claimed by every pop.
+    pub dequeue_pos: CachePadded<AtomicU64>,
 }
 
 impl QueueControl {
     pub fn new(capacity: usize) -> Self {
         debug_assert!(capacity.is_power_of_two() && capacity >= 2);
         Self {
-            enqueue_pos: AtomicU64::new(0),
-            dequeue_pos: AtomicU64::new(0),
             capacity_mask: AtomicU64::new((capacity - 1) as u64),
-            dropped: AtomicU64::new(0),
+            enqueue_pos: CachePadded(AtomicU64::new(0)),
+            dequeue_pos: CachePadded(AtomicU64::new(0)),
         }
     }
 }
@@ -118,15 +118,11 @@ impl<'a> RequestQueue<'a> {
         self.slots.len()
     }
 
-    pub fn dropped(&self) -> u64 {
-        self.control.dropped.load(Ordering::Relaxed)
-    }
-
     /// Producer entry point. Canonical Vyukov bounded MPMC enqueue: read
     /// `enqueue_pos`, inspect the slot's sequence to decide whether it's
     /// claimable, CAS the position, then write payload + publish via the
     /// slot's seq store. Returns `QueueOverflow` when the slot's seq says
-    /// the ring is full and bumps the dropped counter.
+    /// the ring is full; the caller counts the drop.
     pub fn push(&self, event: QueueEvent) -> Result<(), QueueOverflow> {
         let mask = self.control.capacity_mask.load(Ordering::Relaxed);
         loop {
@@ -146,7 +142,6 @@ impl<'a> RequestQueue<'a> {
                     return Ok(());
                 }
             } else if diff < 0 {
-                self.control.dropped.fetch_add(1, Ordering::Relaxed);
                 return Err(QueueOverflow);
             }
             spin_loop();

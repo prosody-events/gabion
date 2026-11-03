@@ -114,7 +114,6 @@ fn full_ring_drops_exactly_the_overflow() {
         let ring = Ring::new(2);
         let pushed = joined(spawn_producers(&ring, 1..4));
         assert_eq!(pushed.len(), 2);
-        assert_eq!(ring.queue().dropped(), 1);
         assert_eq!(sorted(ring.rest().collect()), sorted(pushed));
     });
 }

@@ -504,7 +504,7 @@ they bound resource use.
 | `gabion_gossip_zone_grace DURATION`             | `10s`   | How long after the first peer event the node waits for its own EndpointSlice entry before it logs `zone_unknown`, and a join sweep waits for unheard peers before a new zone's first node asks another zone. |
 | `gabion_gossip_bootstrap_peers ADDR:PORT`       | *(none)* | A static peer, repeated once per peer; the list may name this node too. A non-empty list replaces Kubernetes discovery, and its peers are never removed. It may hold no more entries than `gabion_gossip_peer_capacity`. Without `gabion_gossip_bind`, `nginx -t` fails. |
 | `gabion_gossip_peer_capacity N`                 | `512`   | The most peers this node gossips with, 1 to 32,767, sized once at start, about 330 bytes a peer. Past it, a new peer is declined (`peer_table_full`) and its counts still merged. Also sets the node dictionary's default, twice it. |
-| `gabion_gossip_limit_queue_capacity N`          | `8192`  | Slots in the shared-memory request queue workers push counted hits onto for the leader, 64 to 1,048,576, rounded up to a power of two. Each slot is 72 bytes of the `gabion_limit_zone` SIZE, so raise SIZE with it. The default covers a 1.3 s leader handover at up to 6,300 counted hits a second per pod; raise it when the `queue_dropped` counter rises. A reload that changes it needs a new SIZE or a restart. |
+| `gabion_gossip_limit_queue_capacity N`          | `8192`  | Slots in the shared-memory request queue workers push counted hits onto for the leader, 64 to 1,048,576, rounded up to a power of two. Each slot is 72 bytes of the `gabion_limit_zone` SIZE, so raise SIZE with it. The default covers a 1.3 s leader handover at up to 6,300 counted hits a second per pod; raise it when the error log shows [`queue_dropped`](#queue_dropped). A reload that changes it needs a new SIZE or a restart. |
 | `gabion_gossip_recv_buffer_bytes N`            | `4194304` | Receive buffer the gossip socket asks the kernel for, 65,536 to 1,073,741,823 bytes. The host's `net.core.rmem_max` caps it; `socket_buffer_capped` says when. See [Socket buffers](../gabion/README.md#socket-buffers). |
 | `gabion_gossip_send_buffer_bytes N`            | `1048576` | Send buffer the gossip socket asks the kernel for, 65,536 to 1,073,741,823 bytes. The host's `net.core.wmem_max` caps it; `send_blocked` warns when a round fills it. |
 
@@ -525,7 +525,7 @@ into the cap.
 | `gabion_storage_max_descriptor_count N`         | `16`        | Cap on descriptors a single rule may declare, up to 65,535.                           |
 | `gabion_storage_max_descriptor_bytes N`         | `512`       | Per-request budget on `(key + value)` bytes summed across descriptors plus the domain. Exceeded ⇒ 400. |
 | `gabion_storage_max_key_bytes N`                | `128`       | Cap on a single descriptor key's length (validated at config phase).                  |
-| `gabion_storage_max_matched_rules N`            | `16`        | Most rules one request is counted against; past it the request is allowed and the rest under-count (`matched_rule_overflows`). Each worker reserves 64 bytes per rule once, on its first request. |
+| `gabion_storage_max_matched_rules N`            | `16`        | Most rules one request is counted against; past it the request is allowed and the rest under-count (logged as [`matched_rule_overflow`](#matched_rule_overflow)). Each worker reserves 64 bytes per rule once, on its first request. |
 
 ### Runtime / identity
 
@@ -772,13 +772,29 @@ counters on every other replica rise within a tick or two. If they
 don't, the gossip channel is partitioned — typical causes are a UDP
 firewall or `gabion_gossip_bind` being unreachable between pods.
 
-The nginx adapter does not currently expose an admin HTTP endpoint; its
-SHM `Stats` counters (`requests`, `allowed`, `rejected`,
-`rejected_cardinality`, `declines_invalid_descriptor`,
-`matched_rule_overflows`, `exempted`, `queue_pushed`, `queue_drained`,
-`queue_dropped`, `aggregate_dropped`) are read by the module's tests, and
-the counters with a warning surface in the log. The server adapter exposes
-its state via `/snapshot` (see [`../server/README.md`](../server/README.md)).
+### Observing gabion
+
+The nginx adapter has no admin HTTP endpoint; the error log is its readout.
+Workers count every request in the limit zone (`requests`, `allowed`,
+`rejected`, `exempted`, `queue_pushed`, `queue_drained` and the counters
+below), and the worker leading gossip reads them every lease tick (300 ms).
+It logs each counter that records a bypass or a rejection when its total
+passes a power of two (1, 2, 4, 8, …), so a steady fault writes about one
+line per doubling instead of one per request. The limit zone remembers what
+was logged, so after a reload or a leader change the next leader carries on
+rather than repeating. The request path never logs.
+
+| Counter | Logged as | What it counts |
+|---|---|---|
+| `matched_rule_overflows` | [`matched_rule_overflow`](#matched_rule_overflow) | allowed requests that matched more rules than `gabion_storage_max_matched_rules` |
+| `queue_dropped` | [`queue_dropped`](#queue_dropped) | counted hits the full request queue dropped |
+| `declines_invalid_descriptor` | [`invalid_descriptor_declined`](#invalid_descriptor_declined) | rule checks that read a key value that is not UTF-8 |
+| `rejected_cardinality` | [`cardinality_rejected`](#cardinality_rejected) | rule checks whose descriptor ran past `gabion_storage_max_descriptor_bytes` |
+| `aggregate_dropped` | [`aggregate_full`](../gabion/TROUBLESHOOTING.md#aggregate_full) | counts the full count table could not hold |
+
+The totals count from the moment the limit zone was created; a reload that
+reuses it keeps them. The server adapter exposes its state via `/snapshot`
+(see [`../server/README.md`](../server/README.md)).
 
 ## Configuration error messages
 
@@ -841,12 +857,40 @@ below are the module's own.
 | `` gabion: `gossip.bootstrap_peers` (…) lists N peers, but `gossip.bind` (…) is not set. … `` | `gabion_gossip_bootstrap_peers` with no `gabion_gossip_bind`.                                                                            | Set `gabion_gossip_bind`, or remove the list.                                                                                    |
 | `rules are declared but gabion_limit_zone is not set`                         | The config declares rules but no limit zone, so there is nowhere to count hits and every request would be admitted uncounted.                             | Add `gabion_limit_zone zone=gabion:64m;` to the `http {}` block, or check that the include declaring it is loaded.               |
 | Responses include `X-RateLimit-Remaining: 0` and `429 Too Many Requests`      | A client crossed a rule's limit.                                                                                                                    | Expected. `Retry-After` says how long to back off; the rule with the longest window owns the header.                             |
-| `400 Bad Request` from gabion                                                 | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits (`512` by default).                  | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
-| SHM `matched_rule_overflows` counter rising                                   | Requests matched more allowed rules than `gabion_storage_max_matched_rules` (`16` by default). **The request was allowed** (allow-by-default); the rules past the bound under-count. *No log line — observed only via the SHM stats counters.* | Reduce the number of rules applied at this location, split the location, or raise `gabion_storage_max_matched_rules`.            |
+| `400 Bad Request` from gabion                                                 | Pathological request: client supplied more descriptor bytes than `gabion_storage_max_descriptor_bytes` permits (`512` by default). Logged as [`cardinality_rejected`](#cardinality_rejected). | Either tighten the upstream client or raise `gabion_storage_max_descriptor_bytes` after sanity-checking why it's that large.     |
+| A `matched_rule_overflow`, `queue_dropped`, `invalid_descriptor_declined` or `cardinality_rejected` warning | The gossip leader saw a bypass or rejection counter pass a power of two ([Observing gabion](#observing-gabion)). | Follow the entry for its code below. |
 | `The count table had no free slot for a rate-limit key` (warn, `aggregate_full`) | The limit zone holds too few slots for the live `(rule, key, bucket)` cells. **The request was allowed** and that key under-counted. Logged at powers of two of `aggregate_dropped`; see [`aggregate_full`](../gabion/TROUBLESHOOTING.md#aggregate_full). | Raise SIZE in `gabion_limit_zone` (see its sizing notes); each doubling doubles the slots.                                         |
 | `gabion: this worker stopped leading gossip` (error) in the error log         | The leader's gossip runtime or queue drain failed or panicked, or it lost the lease. The worker released the lease and campaigns again after `retry_in` (doubling, up to 30s); another worker may take over first. Admission keeps running against the shared aggregate. | Read the `error` field. A bind error means `gabion_gossip_bind` is already in use; a lost lease means the worker was starved long enough to miss its renewals. |
 | `gabion: leader thread panicked` in the error log                             | Logged as a worker exits: its leader thread panicked outside a leadership term, so the worker stopped campaigning. Other workers still campaign and take over gossip. | The `panic` field holds the panic message. Report it as a gabion bug, with earlier log lines.                                                                                |
 | `Peer discovery hit an error and skipped an update` (warn) in the error log   | `discovery_error`, a library message: see [`../gabion/TROUBLESHOOTING.md`](../gabion/TROUBLESHOOTING.md#discovery_error).                           | Usually transient. If it keeps repeating, check pod RBAC and network reachability to the API.                                    |
+
+### `cardinality_rejected`
+
+**Level** warn, power of two, logged by the gossip leader · **Request allowed** no when no other rule on the location allowed or rejected it (400); if another allowed it, yes, and this rule under-counts · **Emitted by** NGINX module (`gabiond`'s is in its README)
+
+Message starts: "gabion: a request's rate-limit descriptor took more than 512 bytes" (the number is `gabion_storage_max_descriptor_bytes`)
+
+**What happened.** A rule's descriptor (its domain, keys and values) ran past the byte budget, so that rule did not count the request. With no other rule deciding the request, nginx answered 400.
+
+**Why.** Usually a misbehaving client or an attack trying to exhaust gabion's tracking memory; sometimes a legitimately long value, such as a whole URI.
+
+**What to do next.** If the traffic is legitimate, raise `gabion_storage_max_descriptor_bytes`.
+
+**Fields** `limit` (`bytes`), `max`, `rejected_total` (rule checks past the budget since the limit zone was created; a request two such rules check counts twice), `config_key` · **Knob** `gabion_storage_max_descriptor_bytes` (default 512)
+
+### `invalid_descriptor_declined`
+
+**Level** warn, power of two, logged by the gossip leader · **Request allowed** by this rule, without counting it · **Emitted by** NGINX module only
+
+Message starts: "gabion: a rate-limit rule read a key value that is not valid UTF-8"
+
+**What happened.** A rule keys on a variable whose value was not valid UTF-8, so that rule let the request through without counting it, and its limit under-counts. Other rules on the request still decide.
+
+**Why.** Usually a client sends binary data in a header a rule keys on.
+
+**What to do next.** Key the rule on a different variable, or normalise the value with `map`.
+
+**Fields** `declined_total` (rule checks since the limit zone was created) · **Knob** none
 
 ### `leader_takeover`
 
@@ -889,6 +933,34 @@ Message starts: "gabion: limit zone ready"
 **What to do next.** Nothing. To size the limit zone, compare `slots` with the live cells your rules need (the `gabion_limit_zone` sizing notes above). `reused=true` means a reload kept the queued hits and node identity.
 
 **Fields** `limit_zone`, `bytes`, `slots`, `queue`, `reused` · **Knob** `gabion_limit_zone`
+
+### `matched_rule_overflow`
+
+**Level** warn, power of two, logged by the gossip leader · **Request allowed** yes, only the first `cap` rules counted it · **Emitted by** NGINX module (`gabiond`'s is in its README)
+
+Message starts: "gabion: a request matched more than 16 rate-limit rules" (the number is `gabion_storage_max_matched_rules`)
+
+**What happened.** A request matched more allowed rules than this node counts per request. It was allowed; the first `cap` matched rules counted it, and the rest under-count.
+
+**Why.** Usually overlapping rules on one location, for example a broad rule stacked with several narrow ones.
+
+**What to do next.** Remove or narrow rules on that location, or raise `gabion_storage_max_matched_rules`. Each extra rule costs 64 bytes per worker, reserved once on the worker's first request.
+
+**Fields** `cap`, `overflowed_total` (requests since the limit zone was created), `config_key` · **Knob** `gabion_storage_max_matched_rules` (default 16)
+
+### `queue_dropped`
+
+**Level** warn, power of two, logged by the gossip leader · **Request allowed** yes, its hits not counted · **Emitted by** NGINX module only
+
+Message starts: "gabion: the shared-memory request queue was full"
+
+**What happened.** Workers push every counted hit onto the limit zone's request queue for the gossip leader. The queue was full, so hits were dropped: their requests were allowed, and the limits under-count them.
+
+**Why.** Either no worker drained the queue (look for a recent `gabion: this worker stopped leading gossip` error) or this node admitted more counted hits than the queue holds across a leader handover (about 1.3 s).
+
+**What to do next.** Raise `gabion_gossip_limit_queue_capacity`. Each slot takes 72 bytes of SIZE in `gabion_limit_zone`, so raise SIZE by the same amount to keep the count table's size.
+
+**Fields** `dropped_total` (hits since the limit zone was created), `capacity`, `config_key` · **Knob** `gabion_gossip_limit_queue_capacity` (default 8192)
 
 Operator-facing errors are written to answer three questions: *what
 happened*, *why it likely happened*, and *what to do next*. If you

@@ -33,6 +33,23 @@ use std::{hint, sync::atomic};
 /// Bytes of padding between regions; rounded up to the cacheline boundary.
 pub const CACHELINE: usize = 64;
 
+/// A value alone on its cache line, for values different parties write: the
+/// queue's producer and consumer positions. Values one party writes together
+/// belong on one line instead (`Stats`).
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct CachePadded<T>(pub T);
+
+const _: () = assert!(align_of::<CachePadded<u8>>() == CACHELINE);
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 pub fn align_up(value: usize, align: usize) -> usize {
     let mask = align - 1;
     (value + mask) & !mask
@@ -169,9 +186,9 @@ impl ShmRegion {
     /// * `base` is non-null and points at a fresh, writable mapping of at least
     ///   `layout.total_bytes` bytes. In practice this is a block of the nginx
     ///   shared zone the master maps before any worker is forked.
-    /// * `base` is aligned to 8 bytes, the largest alignment of any stored
-    ///   type. nginx's slab allocator hands out page-aligned blocks, which also
-    ///   cacheline-aligns each region.
+    /// * `base` is aligned to `CACHELINE` bytes, the alignment of `Stats` and
+    ///   of the queue positions (`CachePadded`), the largest of any stored
+    ///   type. nginx's slab allocator hands out page-aligned blocks.
     /// * `layout` is the value computed by `Layout::new`, and its offsets/sizes
     ///   describe the actual mapping.
     /// * The caller has *exclusive* access to the mapping for the duration of
@@ -179,6 +196,10 @@ impl ShmRegion {
     ///   subsequent `write_bytes` and `ptr::write`s cannot race.
     /// * The mapping must outlive every copy of the returned `ShmRegion`.
     pub unsafe fn initialize(base: *mut u8, layout: Layout) -> Self {
+        debug_assert!(
+            base.addr().is_multiple_of(CACHELINE),
+            "the zone must start on a cache line"
+        );
         // SAFETY: The caller of this `unsafe fn` upholds the preconditions
         // above. Specifically:
         // * `write_bytes(base, 0, total_bytes)` is valid because `base` is
@@ -188,11 +209,12 @@ impl ShmRegion {
         //   `#[repr(C)]` composites of atomics / integers / arrays of bytes).
         // * Each `ptr::write(p, value)` overwrites a `#[repr(C)]` POD at the
         //   offset computed by `Layout::new`; `Layout::new` rounds every offset
-        //   up to `CACHELINE`, which exceeds the alignment of every stored
-        //   type, so the destination pointer is properly aligned. `Layout::new`
-        //   also guarantees `offset + size_of::<T>() <= total_bytes`, so each
-        //   write stays in-bounds of the one mapping (Nomicon: "Working with
-        //   raw pointers" / `pointer::add` rules).
+        //   up to `CACHELINE`, which is at least the alignment of every stored
+        //   type, and `base` is `CACHELINE`-aligned (caller precondition), so
+        //   the destination pointer is properly aligned. `Layout::new` also
+        //   guarantees `offset + size_of::<T>() <= total_bytes`, so each write
+        //   stays in-bounds of the one mapping (Nomicon: "Working with raw
+        //   pointers" / `pointer::add` rules).
         // * The queue/aggregate loops only index `0..capacity`, matching the
         //   per-slot bounds checked by the private `*_slot_ptr` helpers.
         // * No `&mut T` to any region byte escapes this function, so the

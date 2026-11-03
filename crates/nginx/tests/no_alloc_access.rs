@@ -24,7 +24,7 @@ use gabion_nginx::rules::{
     BindingLookup, CompiledRules, NopBindingCompiler, RuleConfig, parse_rule_directive,
 };
 use gabion_nginx::shm::queue::QueueEvent;
-use gabion_nginx::shm::{Layout, ShmAggregateStore, ShmRegion};
+use gabion_nginx::shm::{CACHELINE, CachePadded, Layout, ShmAggregateStore, ShmRegion};
 
 thread_local! {
     /// Set on this thread while a counted section runs.
@@ -88,10 +88,13 @@ impl VariableLookup for Tenant<'_> {
 /// A region over a leaked allocation, built before counting.
 fn region(queue: usize) -> ShmRegion {
     let layout = Layout::new(queue, 1 << 14).expect("layout");
-    let zone: &'static mut [u64] =
-        Box::leak(vec![0_u64; layout.total_bytes.div_ceil(8)].into_boxed_slice());
-    // SAFETY: `zone` is a fresh, writable, 8-byte-aligned allocation of at
-    // least `layout.total_bytes`, `initialize` is its first user, and the
+    let zone: &'static mut [CachePadded<[u64; CACHELINE / 8]>] = Box::leak(
+        (0..layout.total_bytes.div_ceil(CACHELINE))
+            .map(|_| CachePadded([0; CACHELINE / 8]))
+            .collect(),
+    );
+    // SAFETY: `zone` is a fresh, writable, cache-line-aligned allocation of
+    // at least `layout.total_bytes`, `initialize` is its first user, and the
     // leak keeps it alive for the whole test.
     unsafe { ShmRegion::initialize(zone.as_mut_ptr().cast(), layout) }
 }

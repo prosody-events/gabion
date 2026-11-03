@@ -7,8 +7,14 @@
 //! * `admission/matched_rules_95_5` — one `decide_all`; the cost per matched
 //!   rule stays flat as the bound grows, because the scratch it fills is
 //!   reserved once per worker.
+//! * `admission/workers_contended` — 2 or 4 workers admitting at once on a
+//!   location whose 16 rules all match, while a leader thread drains the queue:
+//!   the time per request across the node, including what the workers' shared
+//!   counters and the queue's positions cost in cache-line transfers.
 
 use std::hint::black_box;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
@@ -21,7 +27,7 @@ use gabion_nginx::rules::{
     BindingLookup, CompiledRules, NopBindingCompiler, RuleConfig, parse_rule_directive,
 };
 use gabion_nginx::shm::queue::QueueEvent;
-use gabion_nginx::shm::{Layout, ShmAggregateStore, ShmRegion};
+use gabion_nginx::shm::{CACHELINE, CachePadded, Layout, ShmAggregateStore, ShmRegion};
 
 /// Requests between drains.
 const BATCH: u64 = 64;
@@ -62,10 +68,14 @@ impl Worker {
         let rules = CompiledRules::compile_with(&configs, &storage, &mut NopBindingCompiler)
             .expect("compile");
         let layout = Layout::new(1 << 13, 1 << 14).expect("layout");
-        let zone = Box::leak(vec![0_u64; layout.total_bytes.div_ceil(8)].into_boxed_slice());
-        // SAFETY: `zone` is a fresh, writable, 8-byte-aligned allocation of
-        // at least `layout.total_bytes`, `initialize` is its first user, and
-        // the leak keeps it alive for the whole bench.
+        let zone: &mut [CachePadded<[u64; CACHELINE / 8]>] = Box::leak(
+            (0..layout.total_bytes.div_ceil(CACHELINE))
+                .map(|_| CachePadded([0; CACHELINE / 8]))
+                .collect(),
+        );
+        // SAFETY: `zone` is a fresh, writable, cache-line-aligned allocation
+        // of at least `layout.total_bytes`, `initialize` is its first user,
+        // and the leak keeps it alive for the whole bench.
         let region = unsafe { ShmRegion::initialize(zone.as_mut_ptr().cast(), layout) };
         let hot: Vec<String> = (0..50).map(|i| format!("hot-{i}")).collect();
         let mut deltas = DeltaSink::default();
@@ -153,5 +163,58 @@ fn bench_admission(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_admission);
+fn bench_contended(c: &mut Criterion) {
+    let mut group = c.benchmark_group("admission");
+    group.throughput(Throughput::Elements(1));
+    let worker = Worker::new(16);
+    let indices: Vec<usize> = (0..16).collect();
+    // 19 counted tenants and one the aggregate never holds: a 5% miss.
+    let tenants: Vec<&[u8]> = worker.hot[..19]
+        .iter()
+        .map(|tenant| tenant.as_bytes())
+        .chain([b"new".as_slice()])
+        .collect();
+    for workers in [2_u64, 4] {
+        group.bench_function(BenchmarkId::new("workers_contended", workers), |b| {
+            b.iter_custom(|iters| {
+                let stop = AtomicBool::new(false);
+                thread::scope(|scope| {
+                    scope.spawn(|| {
+                        let mut drained = vec![QueueEvent::default(); 1 << 13];
+                        while !stop.load(Ordering::Relaxed) {
+                            worker.region.queue().drain(&mut drained);
+                        }
+                    });
+                    let start = Instant::now();
+                    let admitting: Vec<_> = (0..workers)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                let mut events = Vec::new();
+                                for i in 0..iters.div_ceil(workers) {
+                                    let vars = Tenant(tenants[i as usize % tenants.len()]);
+                                    black_box(decide_all(
+                                        worker.ctx(),
+                                        &indices,
+                                        &vars,
+                                        0,
+                                        &mut events,
+                                    ));
+                                }
+                            })
+                        })
+                        .collect();
+                    for thread in admitting {
+                        thread.join().expect("worker joined");
+                    }
+                    let elapsed = start.elapsed();
+                    stop.store(true, Ordering::Relaxed);
+                    elapsed
+                })
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_admission, bench_contended);
 criterion_main!(benches);

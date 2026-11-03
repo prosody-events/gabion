@@ -189,12 +189,16 @@ pub fn decide_all(
         return AccessOutcome::Reject(info);
     }
     if had_non_exempt_outcome {
+        // One shared write per counter per request, not one per event.
+        let (mut pushed, mut dropped) = (0, 0);
         for &event in events.iter() {
             match ctx.queue.push(event) {
-                Ok(()) => ctx.stats.record_queue_push(),
-                Err(_) => ctx.stats.record_queue_drop(),
+                Ok(()) => pushed += 1,
+                Err(_) => dropped += 1,
             }
         }
+        ctx.stats.record_queue_push(pushed);
+        ctx.stats.record_queue_drop(dropped);
         if overflowed {
             ctx.stats.record_matched_rule_overflow();
         }

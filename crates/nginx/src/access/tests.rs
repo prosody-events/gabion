@@ -697,3 +697,25 @@ fn matched_rule_bound_is_the_setting() {
         );
     }
 }
+
+/// A full request queue drops the hits of an allowed request: the request is
+/// still allowed, and `queue_dropped`, the count the leader logs, rises once
+/// per dropped hit.
+#[test]
+fn a_full_queue_allows_the_request_and_counts_each_dropped_hit() {
+    let (_buf, region) = TestZone::new(2, 16);
+    let rules = build_two_rules_varied("a_key", "b_key");
+    let ctx = ctx(&rules, &region, |_| {});
+    let vars = MockVars::new().set("http_x_tenant", "alice");
+    for _ in 0..2 {
+        assert!(matches!(
+            decide(ctx, &[0, 1], &vars, 0),
+            AccessOutcome::Allow(_)
+        ));
+    }
+    let snap = region.stats().snapshot();
+    assert_eq!(
+        (snap.allowed, snap.queue_pushed, snap.queue_dropped),
+        (2, 2, 2)
+    );
+}

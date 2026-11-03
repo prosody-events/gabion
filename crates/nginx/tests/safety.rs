@@ -26,7 +26,7 @@
 //! `r->variables` array nginx allocates per request.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -45,43 +45,49 @@ use gabion_nginx::rules::{
 use gabion_nginx::shm::aggregate::ShmAggregateStore;
 use gabion_nginx::shm::header::{SHM_MAGIC, SHM_VERSION};
 use gabion_nginx::shm::queue::QueueEvent;
-use gabion_nginx::shm::{Layout, ShmRegion};
+use gabion_nginx::shm::{CACHELINE, CachePadded, Layout, ShmRegion};
 
 const DEFAULT_DOMAIN: &str = "nginx";
 
 /// Aligned heap allocation that mimics the `mmap` mapping nginx hands the
-/// adapter in production. `Box<[u64]>` gives us 8-byte alignment — enough
-/// for every atomic field in the region. `Box::into_raw` puts the pointer
-/// at a stable address so Stacked-/Tree-Borrows reborrow rules aren't
-/// violated when the test moves the wrapper.
+/// adapter in production. A slice of cache lines gives the region the
+/// `CACHELINE` alignment `ShmRegion::initialize` requires, as nginx's
+/// page-aligned slab block does. `Box::into_raw` puts the pointer at a
+/// stable address so Stacked-/Tree-Borrows reborrow rules aren't violated
+/// when the test moves the wrapper.
 pub struct TestZone {
-    ptr: *mut u8,
-    words: usize,
+    ptr: *mut Line,
+    lines: usize,
 }
 
+/// One cache line of a test zone.
+type Line = CachePadded<[u64; CACHELINE / 8]>;
+
 impl TestZone {
-    pub fn allocate(words: usize) -> Self {
-        let buf: Box<[u64]> = vec![0_u64; words].into_boxed_slice();
-        let raw = Box::into_raw(buf);
+    pub fn allocate(bytes: usize) -> Self {
+        let lines = bytes.div_ceil(CACHELINE);
+        let block: Box<[Line]> = (0..lines)
+            .map(|_| CachePadded([0; CACHELINE / 8]))
+            .collect();
         Self {
-            ptr: raw as *mut u8,
-            words,
+            ptr: Box::into_raw(block).cast(),
+            lines,
         }
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
-        self.ptr
+        self.ptr.cast()
     }
 }
 
 impl Drop for TestZone {
     fn drop(&mut self) {
-        // SAFETY: `self.ptr` came from `Box::into_raw` of a `Box<[u64]>`
-        // with length `self.words`. The caller pairs the `TestZone` with
+        // SAFETY: `self.ptr` came from `Box::into_raw` of a `Box<[Line]>`
+        // with length `self.lines`. The caller pairs the `TestZone` with
         // its `ShmRegion` such that the region is dropped first; no live
         // references remain when this Drop runs.
         unsafe {
-            let slice = std::ptr::slice_from_raw_parts_mut(self.ptr as *mut u64, self.words);
+            let slice = std::ptr::slice_from_raw_parts_mut(self.ptr, self.lines);
             let _ = Box::from_raw(slice);
         }
     }
@@ -96,10 +102,9 @@ unsafe impl Sync for TestZone {}
 
 fn build_zone(queue_cap: usize, agg_cap: usize) -> (TestZone, ShmRegion) {
     let layout = Layout::new(queue_cap, agg_cap).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = TestZone::allocate(words);
-    // SAFETY: zone.as_ptr() is 8-byte aligned, fresh, exclusive, and lives
-    // until TestZone drops. layout matches the allocation size.
+    let zone = TestZone::allocate(layout.total_bytes);
+    // SAFETY: zone.as_ptr() is cache-line aligned, fresh, exclusive, and
+    // lives until TestZone drops. layout matches the allocation size.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
     (zone, region)
 }
@@ -453,8 +458,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
     const TOTAL: u64 = (PER_WORKER * WORKER_COUNT) as u64;
 
     let layout = Layout::new(32, 32).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = Arc::new(TestZone::allocate(words));
+    let zone = Arc::new(TestZone::allocate(layout.total_bytes));
     // SAFETY: see build_zone.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
 
@@ -569,9 +573,8 @@ fn decide_all_and_leader_apply_concurrent() {
     const ITERATIONS: usize = 8;
 
     let layout = Layout::new(32, 32).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = Arc::new(TestZone::allocate(words));
-    // SAFETY: zone is fresh, 8-byte aligned, exclusive during init.
+    let zone = Arc::new(TestZone::allocate(layout.total_bytes));
+    // SAFETY: zone is fresh, cache-line aligned, exclusive during init.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
 
     let rules = Arc::new(build_rules());
@@ -657,9 +660,8 @@ fn decide_all_multi_rule_concurrent() {
     const ITERATIONS: usize = 8;
 
     let layout = Layout::new(32, 32).expect("layout");
-    let words = layout.total_bytes.div_ceil(8);
-    let zone = Arc::new(TestZone::allocate(words));
-    // SAFETY: zone is fresh, 8-byte aligned, exclusive during init.
+    let zone = Arc::new(TestZone::allocate(layout.total_bytes));
+    // SAFETY: zone is fresh, cache-line aligned, exclusive during init.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
 
     let rules = Arc::new(compile(&[
@@ -763,7 +765,7 @@ fn custom_queue_capacity_bounds_the_ring() {
     const PER_PRODUCER: u64 = 100;
     let layout = Layout::for_zone(256 * 1024, 4096, 100).expect("layout");
     assert_eq!(layout.queue_capacity, 128);
-    let zone = Arc::new(TestZone::allocate(layout.total_bytes.div_ceil(8)));
+    let zone = Arc::new(TestZone::allocate(layout.total_bytes));
     // SAFETY: see build_zone.
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
     let event = |producer: u64, i: u64| QueueEvent {
@@ -791,11 +793,65 @@ fn custom_queue_capacity_bounds_the_ring() {
         .collect();
     let queue = region.queue();
     assert_eq!(accepted.len(), 128);
-    assert_eq!(queue.dropped(), 2 * PER_PRODUCER - 128);
     let mut popped: Vec<QueueEvent> = std::iter::from_fn(|| queue.pop()).collect();
     let key = |event: &QueueEvent| (event.rule_fingerprint, event.key_hash);
     accepted.sort_by_key(key);
     popped.sort_by_key(key);
     assert_eq!(popped, accepted);
+    drop(zone);
+}
+
+// -- 10. Statistics layout: the workers' line and the leader's -------------
+
+/// Every worker bumps the per-request counters on every request, so they
+/// share one cache line of the zone; what the leader writes each pass or
+/// tick, and the counter only a full queue bumps, sit on the next line. The
+/// region hands the statistics out through a reference Miri checks for
+/// cache-line alignment.
+#[test]
+fn stats_keep_the_leaders_writes_off_the_workers_line() {
+    let (zone, region) = build_zone(8, 16);
+    let stats = region.stats();
+    let line = |counter: &AtomicU64| std::ptr::from_ref(counter).addr() / CACHELINE;
+    assert_eq!(
+        std::ptr::from_ref(stats).addr() % CACHELINE,
+        0,
+        "the statistics start mid-line"
+    );
+    let workers = line(&stats.requests);
+    for counter in [
+        &stats.allowed,
+        &stats.rejected,
+        &stats.rejected_cardinality,
+        &stats.declines_invalid_descriptor,
+        &stats.matched_rule_overflows,
+        &stats.exempted,
+        &stats.queue_pushed,
+    ] {
+        assert_eq!(
+            line(counter),
+            workers,
+            "a per-request counter left the workers' line"
+        );
+    }
+    for counter in [
+        &stats.queue_drained,
+        &stats.queue_dropped,
+        &stats.aggregate_dropped,
+        &stats.logged.matched_rule_overflows,
+        &stats.logged.queue_dropped,
+        &stats.logged.declines_invalid_descriptor,
+        &stats.logged.rejected_cardinality,
+    ] {
+        assert_eq!(
+            line(counter),
+            workers + 1,
+            "the leader writes on the workers' line"
+        );
+    }
+    stats.record_request();
+    stats.record_queue_drain(3);
+    let snapshot = stats.snapshot();
+    assert_eq!((snapshot.requests, snapshot.queue_drained), (1, 3));
     drop(zone);
 }

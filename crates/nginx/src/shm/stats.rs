@@ -1,11 +1,18 @@
-//! Lightweight per-zone counters, read by tests and the leader; only
-//! `aggregate_dropped` reaches a log line today. All
-//! mutation is `Relaxed` — these are best-effort observability values, not
-//! synchronization signals.
+//! Per-zone counters. Workers bump the first eight on requests and share
+//! their cache line, as every worker bumps the same ones; everything the
+//! leader writes (each drain pass, each aggregate overflow, the marks below)
+//! starts on the next line, so it never takes the workers' line from them,
+//! beside `queue_dropped`, which workers bump only when the queue is full.
+//! The leader logs four of them at powers of two (`leader::log_bypasses`),
+//! and `aggregate_dropped` logs as `aggregate_full`. All mutation is
+//! `Relaxed`: observability values, not synchronization.
 
+use std::mem::offset_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[repr(C)]
+use super::CACHELINE;
+
+#[repr(C, align(64))]
 #[derive(Debug, Default)]
 pub struct Stats {
     pub requests: AtomicU64,
@@ -19,7 +26,28 @@ pub struct Stats {
     pub queue_drained: AtomicU64,
     pub queue_dropped: AtomicU64,
     pub aggregate_dropped: AtomicU64,
+    /// The total of each logged counter the leader last read, advanced by
+    /// `gabion::throttle::catch_up`; written by the leader only. It lives in
+    /// the zone so a new leader carries on from the last across a reload.
+    pub logged: Logged,
 }
+
+/// The marks `Stats::logged` holds, one per counter the leader logs.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct Logged {
+    pub matched_rule_overflows: AtomicU64,
+    pub queue_dropped: AtomicU64,
+    pub declines_invalid_descriptor: AtomicU64,
+    pub rejected_cardinality: AtomicU64,
+}
+
+// The leader's writes start on the line after the workers' eight counters.
+const _: () = assert!(
+    offset_of!(Stats, queue_drained) == CACHELINE && align_of::<Stats>() == CACHELINE,
+    "keep the counters workers bump on every request on Stats' first cache line, and the ones the \
+     leader writes after it",
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatsSnapshot {
@@ -89,12 +117,19 @@ impl Stats {
         self.exempted.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_queue_push(&self) {
-        self.queue_pushed.fetch_add(1, Ordering::Relaxed);
+    pub fn record_queue_push(&self, n: u64) {
+        if n > 0 {
+            self.queue_pushed.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
-    pub fn record_queue_drop(&self) {
-        self.queue_dropped.fetch_add(1, Ordering::Relaxed);
+    /// Hits the full request queue dropped: their requests were allowed and
+    /// never counted. Only a drop writes, so a request that drops nothing
+    /// leaves the leader's line alone.
+    pub fn record_queue_drop(&self, n: u64) {
+        if n > 0 {
+            self.queue_dropped.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     pub fn record_queue_drain(&self, n: u64) {
