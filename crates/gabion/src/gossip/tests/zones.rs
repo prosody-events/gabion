@@ -2555,6 +2555,8 @@ fn zone_grace_setting_times_the_warning() {
                 "self_match=\"pod_name\"",
                 "hostname=\"gabion-0\"",
                 "membership=\"kubernetes\"",
+                "zone_source=\"none\"",
+                "config_key=\"gossip.zone\"",
             ],
         );
     }
@@ -2676,6 +2678,10 @@ fn own_entry_without_a_zone_warns_with_its_node_then_learns_once() {
         &[
             "reason=\"own_entry_has_no_zone\"",
             "node_name=\"kind-worker\"",
+            "membership=\"kubernetes\"",
+            "zone_source=\"none\"",
+            "grace_ms=1000",
+            "config_key=\"gossip.zone\"",
         ],
     );
     assert_logged(&logs, "zone_conflict", 0, &[]);
@@ -2719,6 +2725,7 @@ fn configured_zone_wins_and_conflict_logs_once() {
             "configured_zone=\"a\"",
             "discovered_zone=\"b\"",
             "zone_source=\"config\"",
+            "config_key=\"gossip.zone\"",
         ],
     );
     assert_logged(&logs, "zone_known", 2, &["zone_source=\"config\""]);
