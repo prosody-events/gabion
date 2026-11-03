@@ -158,9 +158,10 @@ impl GossipCounters {
 }
 
 /// One peer known to the runtime. `node_id` is `None` until a packet from
-/// this peer has decoded. A `zone` other than `Unknown` is provisional, the one
-/// discovery reported (or, after the peer restarted, the one it had), until a
-/// header from the peer names one.
+/// this peer has decoded. Until a header from the peer names a zone, a `zone`
+/// other than `Unknown` is provisional: the one discovery reported or, after
+/// the peer restarted, the one it had. `node_id` does not say whether a header
+/// has named one yet.
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct PeerEntry {
@@ -178,7 +179,8 @@ pub struct PeerEntry {
     pub relay_unacked: u64,
 }
 
-/// A peer's zone: the one its headers name, discovery's until one does.
+/// A peer's zone: the one its headers name, else the provisional one
+/// [`PeerEntry`] describes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(
     feature = "serde",

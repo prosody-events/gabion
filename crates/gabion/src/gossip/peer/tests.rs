@@ -435,6 +435,14 @@ fn zone(raw: u32) -> ZoneHash {
     ZoneHash::from_wire(raw).expect("not 0")
 }
 
+/// A peer discovery placed in zone `raw`.
+fn placed(addr: SocketAddr, raw: u32) -> Peer {
+    Peer {
+        addr,
+        zone: Some(zone(raw)),
+    }
+}
+
 /// A peer's new incarnation resets its whole row, its zone to the new
 /// header's and its flags to one owed ack; a late packet from the
 /// incarnation before changes nothing, and a zone-0 header never clears a
@@ -1006,10 +1014,6 @@ fn discovered_zone_routes_a_peer_until_its_header_wins() {
     ranked.sort_by_key(|&a| Reverse(rendezvous_weight(7, a)));
     let [hi, lo] = ranked;
     let (same, late) = (addr(6), addr(8));
-    let placed = |addr, raw| Peer {
-        addr,
-        zone: Some(zone(raw)),
-    };
     let heard = |node| NodeIdentity::new(NodeId(node), 1);
     let roles = |table: &PeerTable, addrs: &[SocketAddr]| -> Vec<Role> {
         addrs
@@ -1070,10 +1074,6 @@ fn zoneless_header_keeps_the_discovered_zone() {
     ranked.sort_by_key(|&a| Reverse(rendezvous_weight(7, a)));
     let [hi, lo] = ranked;
     let (same, unplaced) = (addr(6), addr(8));
-    let placed = |addr, raw| Peer {
-        addr,
-        zone: Some(zone(raw)),
-    };
     let roles = |table: &PeerTable| -> Vec<Role> { (0..4).map(|row| table.role(row)).collect() };
     for peer in [
         placed(same, 1),
@@ -1151,11 +1151,7 @@ fn restart_keeps_the_zone_provisionally() {
 #[test]
 fn zoneless_sender_of_another_zone_is_acked() {
     let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
-    let peer = Peer {
-        addr: addr(2),
-        zone: Some(zone(2)),
-    };
-    table.insert(peer, 0);
+    table.insert(placed(addr(2), 2), 0);
     table.refresh(0, |_| {});
     let id = NodeIdentity::new(NodeId(9), 1);
     table.contact(0, id, None);
@@ -1179,11 +1175,7 @@ fn unheard_zone_rows_neither_stall_nor_impair_the_relay() {
     let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
     let id = |row: usize| NodeIdentity::new(NodeId(row as u128 + 1), 1);
     for i in 1..=4 {
-        let peer = Peer {
-            addr: addr(2 * i),
-            zone: Some(zone(1)),
-        };
-        table.insert(peer, 0);
+        table.insert(placed(addr(2 * i), 1), 0);
     }
     for row in [0, 3] {
         table.contact(row, id(row), Some(zone(1)));

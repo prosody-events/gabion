@@ -452,7 +452,8 @@ receives merges the same way. `sender_zone` is the low 32 bits of the
 stable hash of the sender's zone name (`gabion::zone::ZoneName`), never 0;
 0 means the sender knows no zone. A node takes each peer's zone from the
 first of that peer's headers that names one; until then it uses the zone
-discovery reports for it, if any.
+discovery reports for it, if any, or after a restart at the same address the
+zone the peer had.
 
 `ack_incarnation` is the addressee's incarnation as the sender knows it (0
 before it has heard the addressee); the acks apply only when it matches.

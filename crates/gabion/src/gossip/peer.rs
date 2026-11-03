@@ -5,7 +5,8 @@
 //! from one peer is cold, in [`PeerLink`].
 //!
 //! Each row's role follows from its peer's zone: the zone its headers name,
-//! and until one does, the zone discovery named, if any. A peer
+//! and until one does, the provisional one: discovery's, if any, or after a
+//! restart at the same address the zone the previous incarnation had. A peer
 //! neither heard nor placed by discovery gets only the own cells raised since
 //! it was added, a peer of this node's zone (or of no zone) gets both streams
 //! directly, and in each other zone the member that ranks first for this node
@@ -728,14 +729,12 @@ impl PeerTable {
         Some(removed)
     }
 
-    /// Note the sender identity and zone of a packet from `row`. A header
-    /// that names a zone wins over a provisional one and then holds for the
-    /// incarnation; one that names none moves no zone, since its sender does
-    /// not know its own yet. A first packet refreshes the roles, so an unheard
-    /// row takes its role; a new incarnation resets the whole row but keeps
-    /// its zone as the new incarnation's provisional one, since a restart at
-    /// the same address (an NGINX leader takeover, a static peer) is almost
-    /// always in the same zone.
+    /// Note the sender identity and zone of a packet from `row`, by the zone
+    /// rules of `Known`. A first packet refreshes the roles, so an unheard row
+    /// takes its role; a new incarnation resets the whole row but keeps its
+    /// zone as the new incarnation's provisional one, since a restart at the
+    /// same address (an NGINX leader takeover, a static peer) is almost always
+    /// in the same zone.
     pub(super) fn contact(
         &mut self,
         row: usize,

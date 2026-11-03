@@ -1421,8 +1421,7 @@ fn joiner_heard_before_it_knows_its_zone_keeps_its_discovered_zone() {
             joiner.tell(placed(addr, name));
         }
         let (zone_a, zone_b) = (&nodes[..2], &nodes[2..]);
-        let mut waited = 0;
-        loop {
+        for waited in 0.. {
             let mut heard = true;
             for node in zone_b {
                 heard &= node.peer(j).await.node_id.is_some();
@@ -1432,7 +1431,6 @@ fn joiner_heard_before_it_knows_its_zone_keeps_its_discovered_zone() {
             }
             assert!(waited < 100, "zone b heard the joiner within 100 ms");
             run_for(1).await;
-            waited += 1;
         }
         let sent: Vec<_> = tapped(&taps, 0)
             .into_iter()
@@ -1489,9 +1487,9 @@ fn node_that_never_learns_its_zone_is_acked_across_zones() {
         }
         run_for(500).await;
         xn.hits(0..3).await;
-        // Past `gossip.suspect_after` (2 s): an unacked stream would be
-        // suspect.
-        run_for(3_000).await;
+        // Past `gossip.suspect_after`: an unacked stream would be suspect.
+        let suspect_after = kubernetes_config(None, |_| {}).suspect_after.0.get();
+        run_for(suspect_after + 1_000).await;
         for node in &nodes[2..] {
             let held = node.peer(x).await.zone;
             assert_eq!(held, PeerZone::Other(zone("a")), "{}", node.addr);

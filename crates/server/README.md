@@ -225,7 +225,7 @@ fails, so the restarted pod is what a failure looks like.
 |---|---|
 | `zone` | This node's zone: `name` and `source` (`config` or `endpoint_slice`), or for an unknown zone a null `name`, `source` `none` and the `reason`. |
 | `local_identity` | `node_id` and `incarnation`, which changes on every restart. |
-| `peers` | One entry per peer: `addr`, `node_id` (null until heard), `zone` (`"same"`, `"unknown"` or the remote zone's hash), `role` (`unheard`, `zone`, `gateway`, `remote` or `incompatible`), `answer` (`settled`, `owed`, `suspect` or `cannot_relay`), `unanswered_ms` (how long its oldest packet has waited for an answer), `own_unacked` and `relay_unacked`. |
+| `peers` | One entry per peer: `addr`, `node_id` (null until heard), `zone` (`"same"`, `"unknown"` or the remote zone's hash; provisional until the peer's headers name one), `role` (`unheard`, `zone`, `gateway`, `remote` or `incompatible`), `answer` (`settled`, `owed`, `suspect` or `cannot_relay`), `unanswered_ms` (how long its oldest packet has waited for an answer), `own_unacked` and `relay_unacked`. |
 | `peers_by_role` | How many peers hold each role; `incompatible` above 0 means a peer runs another wire version. |
 | `store_stats` | The counter store: `active_cells` of `cell_capacity`, rule and node dictionary use, and the `*_full_rejects` counts behind each "full" warning. |
 | `counters` | Since start: rounds by kind, packets and bytes sent and received, `bytes_sent_cross_zone`, cells merged, rewinds and gap reports, `gateway_failovers`, `relay_stalls`, sweeps, `send_blocked`, `send_errors` and the `decode_rejects_*` counts. |
