@@ -53,38 +53,28 @@ build_and_load_images() {
     done
 }
 
-# image_config_digest <tag>: the hex digest of the image's config, which is
-# how containerd names an image loaded from a Docker image store that keys
-# images by manifest.
-image_config_digest() {
-    docker save "$1" | tar -xOf - manifest.json | python3 -c '
-import json, sys
-config = json.load(sys.stdin)[0]["Config"]
-print(config.rsplit("/", 1)[-1].removesuffix(".json"))
-'
-}
-
 # assert_pods_run_image <selector> <tag>: every started pod the label
-# selector matches runs the image this run built and loaded as <tag>.
+# selector matches runs the image this run built and loaded as <tag>. Each
+# pod's node is asked what <tag> names there: its ID must be this run's build,
+# and the pod's image must be that image. A pod reports the image by a digest
+# containerd recorded when `kind load` imported it, which it lists among the
+# tag's repo digests.
 assert_pods_run_image() {
     want="$(docker image inspect "$2" --format '{{.Id}}')"
-    want="${want#sha256:}"
-    ran="$(kubectl -n "$namespace" get pods -l "$1" \
-        -o 'jsonpath={range .items[*]}{.metadata.name} {.status.containerStatuses[*].imageID}{"\n"}{end}' \
-        | awk 'NF == 2')"
-    if printf '%s\n' "$ran" | grep -q . && ! printf '%s\n' "$ran" | grep -vq "$want"; then
-        return 0
-    fi
-    want="$(image_config_digest "$2")"
-    printf '%s\n' "$ran" | while read -r pod image; do
-        case "$image" in
-            *"$want"*) ;;
-            *)
-                printf '%s\n' "pod $pod runs image $image, but this run built and loaded $2 \
-(ID sha256:$want). The cluster holds an older image: rerun with GABION_SKIP_IMAGE_BUILD \
-unset so the script builds and loads this checkout." >&2
-                return 1 ;;
-        esac
+    kubectl -n "$namespace" get pods -l "$1" \
+        -o 'jsonpath={range .items[*]}{.metadata.name} {.spec.nodeName} {.status.containerStatuses[*].imageID}{"\n"}{end}' \
+        | awk 'NF == 3' | while read -r pod node image; do
+        held="$(docker exec "$node" crictl inspecti -o go-template \
+            --template '{{.status.id}} {{.status.repoDigests}}' "docker.io/library/$2")" \
+            || held="nothing"
+        if [ "${held%% *}" = "$want" ]; then
+            case "$image" in *"${want#sha256:}"*) continue ;; esac
+            case "${held#* }" in *"${image#*@}"*) continue ;; esac
+        fi
+        printf '%s\n' "pod $pod runs image $image, but this run built and loaded $2 \
+(ID $want), and node $node holds $held for it. The cluster runs an older image: \
+rerun with GABION_SKIP_IMAGE_BUILD unset so the script builds and loads this checkout." >&2
+        return 1
     done
 }
 
