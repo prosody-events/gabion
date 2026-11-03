@@ -233,11 +233,11 @@ SIM_BOUNDARY := ^[^:]+:[0-9]+:use gabion::(gossip::($(SIM_TRAITS)|\{($(SIM_TRAIT
 hygiene:
 	rg -n 'Box\s*<\s*dyn|dyn\s+' --glob '!crates/nginx/src/log.rs' Cargo.toml crates deploy; test $$? -eq 1
 	rg -n 'version\s*=\s*"|=\s*\{\s*version' crates/*/Cargo.toml; test $$? -eq 1
-	@for code in $$(rg -oNI 'code = "([a-z_]+)"' -r '$$1' crates/*/src -g '!**/tests.rs' -g '!**/tests/**' | sort -u); do \
-		rg -q "^### \`$$code\`$$" $(CATALOGUES) || { echo "operator message code \`$$code\` has no entry in $(CATALOGUES)"; exit 1; }; \
+	@for code in $$(rg -oNI 'code = "([^"]+)"' -r '$$1' crates/*/src -g '!**/tests.rs' -g '!**/tests/**' | sort -u); do \
+		rg -qFx "### \`$$code\`" $(CATALOGUES) || { echo "operator message code \`$$code\` has no entry in $(CATALOGUES)"; exit 1; }; \
 	done
-	@for code in $$(rg -oNI '^### `([a-z_]+)`$$' -r '$$1' crates/gabion/TROUBLESHOOTING.md); do \
-		rg -q "code = \"$$code\"" crates/gabion/src || { echo "crates/gabion/TROUBLESHOOTING.md documents \`$$code\`, which no library message emits"; exit 1; }; \
+	@for code in $$(rg -oNI '^### `([^`]+)`$$' -r '$$1' crates/gabion/TROUBLESHOOTING.md); do \
+		rg -qF "code = \"$$code\"" crates/gabion/src || { echo "crates/gabion/TROUBLESHOOTING.md documents \`$$code\`, which no library message emits"; exit 1; }; \
 	done
 	rg -n '#[0-9a-fA-F]{3,8}\b|0x[0-9a-fA-F]{6}|rgba?\(|hsla?\(' $(WEB_DIR)/src --glob '!tokens.css'; test $$? -eq 1
 	rg -n 'font-size:\s*[0-9.]+px' $(WEB_DIR)/src; test $$? -eq 1

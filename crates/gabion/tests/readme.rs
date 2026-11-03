@@ -87,15 +87,14 @@ fn readme_example() {
     }));
 }
 
-/// The README's `rust,ignore` fence is a run of `readme_example`'s lines: every
-/// non-blank line, trimmed, in order, with no line between.
+/// The README's `rust,ignore` fence is `readme_example`'s async body: every
+/// non-blank line, trimmed, in order, from the first to the last.
 #[test]
 fn readme_example_matches_source() {
     let source = include_str!("readme.rs");
-    let body = &source[source.find("fn readme_example()").expect("the example")..];
-    let body = &body[..body
-        .find("fn readme_example_matches_source")
-        .expect("this test")];
+    let open = "run_until(async {\n";
+    let body = &source[source.find(open).expect("the example's async body") + open.len()..];
+    let body = &body[..body.find("\n    }));").expect("the async body closes")];
     let mut fences = README.split("```rust,ignore\n").skip(1);
     let fence = fences.next().expect("the README has a `rust,ignore` fence");
     assert!(
@@ -109,11 +108,11 @@ fn readme_example_matches_source() {
             .filter(|line| !line.is_empty())
             .collect()
     };
-    let fence = non_blank(fence);
-    assert!(
-        non_blank(body).windows(fence.len()).any(|run| run == fence),
-        "the README's `rust,ignore` fence is not, line for line, a run of readme_example's lines: \
-         copy the example's body into the fence"
+    assert_eq!(
+        non_blank(fence),
+        non_blank(body),
+        "the README's `rust,ignore` fence is not, line for line, readme_example's async body: \
+         copy the body into the fence"
     );
 }
 
