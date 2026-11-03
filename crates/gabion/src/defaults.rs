@@ -16,7 +16,7 @@ pub const STORAGE_MAX_KEY_BYTES: usize = 128;
 /// counted against. Past the bound a request is still checked against every
 /// matched rule, and only the first this-many count it; the rest
 /// under-count. Both adapters log `matched_rule_overflow`: gabiond on the
-/// request, NGINX from its gossip leader.
+/// request, NGINX from each worker's leader thread.
 pub const STORAGE_MAX_MATCHED_RULES: u16 = 16;
 
 /// Default of `storage.max_request_descriptors`, the most descriptors of one

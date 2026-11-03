@@ -22,10 +22,10 @@ pub fn bump_shared(count: &AtomicU64) -> Option<u64> {
 }
 
 /// For a count others keep and its owner reads now and then, such as an
-/// NGINX shared-memory counter that workers bump and the gossip leader reads
-/// each tick: moves `seen` up to `total` and returns `total` when a power of
-/// two lies in `(seen, total]`, so a count logs at most once per read and
-/// about log₂(N) times in all, however far it moved between reads.
+/// NGINX shared-memory counter that workers bump and every worker's leader
+/// thread reads each tick: moves `seen` up to `total` and returns `total` when
+/// a power of two lies in `(seen, total]`, so a count logs at most once per
+/// read and about log₂(N) times in all, however far it moved between reads.
 pub fn catch_up(seen: &AtomicU64, total: u64) -> Option<u64> {
     let before = seen.fetch_max(total, Ordering::Relaxed);
     // `None` orders below `Some`, so a mark of 0 has passed no power yet.
