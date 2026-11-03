@@ -95,9 +95,27 @@ fn failure_line((status, log, stderr): (Option<i32>, String, String), code: &str
     errors[0].to_owned()
 }
 
+/// The line the gRPC server logs once it serves.
+const GRPC_SERVING: &str = "Accepting rate-limit decisions from Envoy.";
+/// The line the admin server logs once it serves.
+const ADMIN_SERVING: &str = "Admin HTTP endpoint is up.";
+
 /// gabiond exited 1 with one `listener_failed` line naming `config_key` and
-/// `addr` and giving the OS cause once.
-fn assert_listener_failed(exit: (Option<i32>, String, String), config_key: &str, addr: SocketAddr) {
+/// `addr` and giving the OS cause once, and logged none of `never_serving`:
+/// it binds every address before claiming to serve any.
+fn assert_listener_failed(
+    exit: (Option<i32>, String, String),
+    config_key: &str,
+    addr: SocketAddr,
+    never_serving: &[&str],
+) {
+    for serving in never_serving {
+        assert!(
+            !exit.1.contains(serving),
+            "claimed `{serving}`, log:\n{}",
+            exit.1
+        );
+    }
     let line = failure_line(exit, "listener_failed");
     assert!(
         line.contains(&format!("config_key=\"{config_key}\""))
@@ -124,7 +142,7 @@ fn listener_failure_exits_with_status_one() {
         ],
         None,
     );
-    assert_listener_failed(exit, "envoy_bind", addr);
+    assert_listener_failed(exit, "envoy_bind", addr, &[GRPC_SERVING]);
 }
 
 #[test]
@@ -135,12 +153,13 @@ fn admin_listener_failure_exits_with_status_one() {
     let exit = run_gabiond(
         &[
             ("GABION_ADMIN_BIND", addr.to_string()),
+            ("GABION_ENVOY_BIND", "127.0.0.1:0".into()),
             ("GABION_GOSSIP_BIND", "127.0.0.1:0".into()),
             ("GABION_GOSSIP_BOOTSTRAP_PEERS", peer),
         ],
         None,
     );
-    assert_listener_failed(exit, "admin_bind", addr);
+    assert_listener_failed(exit, "admin_bind", addr, &[ADMIN_SERVING, GRPC_SERVING]);
 }
 
 #[test]
@@ -155,7 +174,7 @@ fn gossip_bind_failure_exits_with_status_one() {
         ],
         None,
     );
-    assert_listener_failed(exit, "gossip.bind", addr);
+    assert_listener_failed(exit, "gossip.bind", addr, &[]);
 }
 
 #[test]

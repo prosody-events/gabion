@@ -25,6 +25,7 @@ use gabion::rules::{CardinalityLimit, Descriptor, EnforcementMode, RuleTable, ha
 use gabion::settings::Setting;
 use gabion::throttle;
 use thiserror::Error;
+use tonic::transport::server::TcpIncoming;
 
 use crate::admission::{Decision, Quota, RejectReason};
 
@@ -374,8 +375,11 @@ pub const RATE_LIMIT_SERVICE_NAME: &str = "envoy.service.ratelimit.v3.RateLimitS
 ///    being refused.
 /// 3. `grpc.reflection.v1.ServerReflection` — lets `grpcurl list` and similar
 ///    tools enumerate services without ahead-of-time `.proto` files.
+///
+/// The caller binds `listener`, so a taken port fails before anything claims
+/// to serve; accepted connections keep `TCP_NODELAY`, tonic's default.
 pub async fn serve<F, H>(
-    bind: std::net::SocketAddr,
+    listener: tokio::net::TcpListener,
     limiter: SharedLimiter,
     health_server: tonic_health::pb::health_server::HealthServer<H>,
     shutdown: F,
@@ -395,7 +399,10 @@ where
         .add_service(RateLimitServiceServer::new(EnvoyRateLimitService::new(
             limiter,
         )))
-        .serve_with_shutdown(bind, shutdown)
+        .serve_with_incoming_shutdown(
+            TcpIncoming::from(listener).with_nodelay(Some(true)),
+            shutdown,
+        )
         .await?;
 
     Ok(())

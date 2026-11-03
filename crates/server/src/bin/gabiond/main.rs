@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinHandle, LocalSet};
@@ -16,21 +17,27 @@ use gabion::aggregate::Aggregate;
 use gabion::crdt::{CellStore, NodeIdentity};
 use gabion::gossip::{GossipError, GossipRuntime};
 use gabion::identity;
-use gabion::settings::Setting;
 use gabion::zone::ZoneName;
 
 use gabion_server::admin::{self, AdminState};
 use gabion_server::config::{AppConfig, ConfigError};
 use gabion_server::{RATE_LIMIT_SERVICE_NAME, SharedLimiter, serve};
 
+mod exit;
+use exit::{Exit, Listener, Reported, Server, Stage, startup};
+
 fn main() -> ExitCode {
     init_tracing();
-    tokio::runtime::Builder::new_current_thread()
+    let served = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(startup(Stage::Runtime))
-        .and_then(|runtime| LocalSet::new().block_on(&runtime, run()))
-        .unwrap_or_else(Exit::report)
+        .map_err(Exit::report)
+        .and_then(|runtime| LocalSet::new().block_on(&runtime, run()));
+    match served {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(reported) => reported.into(),
+    }
 }
 
 /// Install a stdout `tracing` subscriber. Verbosity follows `RUST_LOG`
@@ -45,9 +52,9 @@ fn init_tracing() {
         .init();
 }
 
-/// Start gabiond and serve until a signal or a failure. `Err` is a failure
-/// to start; `Ok` is the status to exit with, any failure already logged.
-async fn run() -> Result<ExitCode, Exit> {
+/// Start gabiond and serve until a signal (`Ok`) or a failure, which `Err`
+/// proves was logged.
+async fn run() -> Result<(), Reported> {
     // Install signal handlers **before** any other work so a SIGTERM
     // arriving during config loading, gossip-runtime binding, or task
     // spawning gets caught and translated into a clean shutdown instead of
@@ -103,11 +110,13 @@ async fn run() -> Result<ExitCode, Exit> {
         admin_rx,
     )
     .await
-    .map_err(|error| Exit::Listener(Listener::Gossip, gossip_bind, error.into()))?;
+    .map_err(|error| Exit::Bind(Listener::Gossip, gossip_bind, error.into()))?;
     tracing::info!(
         listen_addr = %gossip_bind,
         "Listening for gossip from other gabion nodes.",
     );
+    let grpc_listener = bind(Server::Grpc, config.settings.envoy_bind).await?;
+    let admin_listener = bind(Server::Admin, config.settings.admin_bind).await?;
 
     let limiter = SharedLimiter::new(
         rule_table.clone(),
@@ -135,7 +144,7 @@ async fn run() -> Result<ExitCode, Exit> {
         )
         .await;
 
-    let mut grpc = config.settings.envoy_bind.map(|bind| {
+    let mut grpc = grpc_listener.map(|(bind, listener)| {
         tracing::info!(
             listen_addr = %bind,
             health_service = "grpc.health.v1.Health",
@@ -146,13 +155,13 @@ async fn run() -> Result<ExitCode, Exit> {
         );
         let drain = drain_requested(shutdown_rx.clone());
         Serving::spawn(
-            Listener::Grpc,
+            Server::Grpc,
             bind,
-            serve(bind, limiter.clone(), health_server.clone(), drain),
+            serve(listener, limiter.clone(), health_server.clone(), drain),
         )
     });
 
-    let mut admin = config.settings.admin_bind.map(|bind| {
+    let mut admin = admin_listener.map(|(bind, listener)| {
         tracing::info!(
             listen_addr = %bind,
             "Admin HTTP endpoint is up. Hit /snapshot for a live view of \
@@ -160,25 +169,25 @@ async fn run() -> Result<ExitCode, Exit> {
         );
         let state = AdminState::new(rule_table.clone(), counts.clone(), admin_tx.clone());
         let drain = drain_requested(shutdown_rx.clone());
-        Serving::spawn(Listener::Admin, bind, admin::serve(bind, state, drain))
+        Serving::spawn(Server::Admin, bind, admin::serve(listener, state, drain))
     });
 
-    // Serving ends at a signal, or at once when the gossip task or a
-    // listener stops: a listener that cannot bind stops at its first poll.
-    let mut status = tokio::select! {
-        result = gossip_task => Exit::GossipStopped(
+    // Serving ends at a signal, or at once when the gossip task or a server
+    // stops.
+    let served = tokio::select! {
+        result = gossip_task => Err(Exit::GossipStopped(
             joined(result).err().unwrap_or(GossipError::RuntimeShutDown),
         )
-        .report(),
-        exit = stopped(&mut grpc) => exit.report(),
-        exit = stopped(&mut admin) => exit.report(),
+        .report()),
+        exit = stopped(&mut grpc) => Err(exit.report()),
+        exit = stopped(&mut admin) => Err(exit.report()),
         _ = sigterm.recv() => {
             tracing::info!(
                 signal = "SIGTERM",
                 "Received shutdown signal; draining in-flight requests and \
                  stopping cleanly.",
             );
-            ExitCode::SUCCESS
+            Ok(())
         }
         _ = sigint.recv() => {
             tracing::info!(
@@ -186,14 +195,14 @@ async fn run() -> Result<ExitCode, Exit> {
                 "Received shutdown signal (Ctrl-C); draining in-flight \
                  requests and stopping cleanly.",
             );
-            ExitCode::SUCCESS
+            Ok(())
         }
     };
 
     // Flip health to NOT_SERVING first so readiness probes (which run
     // independently of in-flight traffic) immediately fail. External load
-    // balancers will stop sending new requests; in-flight requests continue
-    // to be served by `serve_with_shutdown` until they complete.
+    // balancers will stop sending new requests; each server keeps serving
+    // its in-flight requests until they complete.
     health_reporter
         .set_service_status(
             RATE_LIMIT_SERVICE_NAME,
@@ -209,142 +218,59 @@ async fn run() -> Result<ExitCode, Exit> {
     // observes the flip via `wait_for(|drain| *drain)` and drains in-flight
     // requests before returning.
     shutdown_tx.send_replace(true);
+    let mut drained = Ok(());
     for serving in [grpc, admin].into_iter().flatten() {
         if let Err(exit) = serving.drained().await {
-            status = exit.report();
+            drained = Err(exit.report());
         }
     }
-    if status == ExitCode::SUCCESS {
+    let status = served.and(drained);
+    if status.is_ok() {
         tracing::info!("Gabion shut down cleanly.");
     }
-    Ok(status)
+    status
 }
 
-/// Why gabiond exits with status 1; [`Exit::report`] logs it in one line.
-enum Exit {
-    /// A startup step failed (`gabiond_exit`).
-    Startup(Stage, anyhow::Error),
-    /// A listener could not serve, or stopped (`listener_failed`).
-    Listener(Listener, SocketAddr, anyhow::Error),
-    /// The gossip task stopped (`gossip_stopped`).
-    GossipStopped(GossipError),
-}
-
-/// The exit for a failed startup step.
-fn startup<E: Into<anyhow::Error>>(stage: Stage) -> impl FnOnce(E) -> Exit {
-    move |error| Exit::Startup(stage, error.into())
-}
-
-impl Exit {
-    /// Log why gabiond is exiting, once, and return status 1.
-    fn report(self) -> ExitCode {
-        match self {
-            Self::Startup(stage, error) => tracing::error!(
-                code = "gabiond_exit",
-                stage = stage.as_str(),
-                error = %format_args!("{error:#}"),
-                "gabiond is exiting with status 1 because it could not {}. The cause chain is in \
-                 the `error` field; the first cause is usually the one to fix. Fix it and restart.",
-                stage.as_str(),
-            ),
-            Self::Listener(listener, addr, error) => {
-                let setting = listener.setting();
-                tracing::error!(
-                    code = "listener_failed",
-                    %addr,
-                    error = %format_args!("{error:#}"),
-                    config_key = setting.yaml_key(),
-                    "gabiond could not serve {} on {addr}; the `error` field says why. Usually \
-                     another process already uses the port. Change {setting} or stop the other \
-                     process. gabiond is exiting with status 1.",
-                    listener.name(),
-                );
-            }
-            Self::GossipStopped(error) => tracing::error!(
-                code = "gossip_stopped",
-                %error,
-                "The gossip background task stopped on its own. This node can no longer share \
-                 counts, so gabiond is exiting with status 1 to be restarted rather than \
-                 under-count silently. The `error` field says why.",
-            ),
-        }
-        ExitCode::FAILURE
+/// Bind `server`'s address when it is configured, before anything claims
+/// to serve it, so a taken port fails startup.
+async fn bind(
+    server: Server,
+    addr: Option<SocketAddr>,
+) -> Result<Option<(SocketAddr, TcpListener)>, Exit> {
+    let Some(addr) = addr else {
+        return Ok(None);
+    };
+    match TcpListener::bind(addr).await {
+        Ok(listener) => Ok(Some((addr, listener))),
+        Err(error) => Err(Exit::Bind(server.into(), addr, error.into())),
     }
 }
 
-/// A startup step, as `gabiond_exit` names it.
-#[derive(Clone, Copy)]
-enum Stage {
-    Runtime,
-    Signals,
-    Config,
-}
-
-impl Stage {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Runtime => "start its async runtime",
-            Self::Signals => "install its SIGTERM and SIGINT handlers",
-            Self::Config => "load its configuration",
-        }
-    }
-}
-
-/// An address gabiond listens on, as `listener_failed` names it.
-#[derive(Clone, Copy)]
-enum Listener {
-    Grpc,
-    Admin,
-    Gossip,
-}
-
-impl Listener {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Grpc => "Envoy's rate-limit gRPC calls",
-            Self::Admin => "the admin HTTP endpoint",
-            Self::Gossip => "gossip from other gabion nodes",
-        }
-    }
-
-    fn setting(self) -> Setting {
-        match self {
-            Self::Grpc => Setting::EnvoyBind,
-            Self::Admin => Setting::AdminBind,
-            Self::Gossip => Setting::GossipBind,
-        }
-    }
-}
-
-/// A listener's task, with what it serves and where.
+/// A server's task, with what it serves and where.
 struct Serving {
-    listener: Listener,
+    server: Server,
     addr: SocketAddr,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
 impl Serving {
     fn spawn<E: Into<anyhow::Error>>(
-        listener: Listener,
+        server: Server,
         addr: SocketAddr,
         serve: impl Future<Output = Result<(), E>> + 'static,
     ) -> Self {
         let task = tokio::task::spawn_local(async move { serve.await.map_err(Into::into) });
-        Self {
-            listener,
-            addr,
-            task,
-        }
+        Self { server, addr, task }
     }
 
-    /// Wait for a listener told to drain to finish.
+    /// Wait for a server told to drain to finish.
     async fn drained(self) -> Result<(), Exit> {
-        joined(self.task.await).map_err(|error| Exit::Listener(self.listener, self.addr, error))
+        joined(self.task.await).map_err(|error| Exit::Stopped(self.server, self.addr, error))
     }
 }
 
-/// Resolves when `serving`'s listener stops, which before the drain is always
-/// a failure; never, when that listener is not configured.
+/// Resolves when `serving`'s server stops, which before the drain is always a
+/// failure; never, when that server is not configured.
 async fn stopped(serving: &mut Option<Serving>) -> Exit {
     let Some(running) = serving else {
         return std::future::pending().await;
@@ -352,7 +278,7 @@ async fn stopped(serving: &mut Option<Serving>) -> Exit {
     let error = joined((&mut running.task).await)
         .err()
         .unwrap_or_else(|| anyhow::anyhow!("it stopped before gabiond told it to drain"));
-    let exit = Exit::Listener(running.listener, running.addr, error);
+    let exit = Exit::Stopped(running.server, running.addr, error);
     *serving = None;
     exit
 }

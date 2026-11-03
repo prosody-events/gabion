@@ -305,7 +305,7 @@ magnitude on each.
 | Surface | Value | Meaning |
 |---|---|---|
 | gabiond exit | 0 | Clean shutdown after SIGTERM or SIGINT. |
-| gabiond exit | 1 | Startup or runtime failure, said once by one error line: `gabiond_exit` (a startup stage), `listener_failed` (the gRPC, admin or gossip address could not be served) or `gossip_stopped`. |
+| gabiond exit | 1 | Startup or runtime failure, said once by one error line: `gabiond_exit` (a startup stage), `listener_failed` (the gRPC, admin or gossip address could not be bound), `server_stopped` (the gRPC or admin server failed after binding) or `gossip_stopped`. |
 | gabiond exit | 101 | Panic, including one in a gabiond task. The panic message on stderr is a gabion bug report. |
 | `/readyz` | 200 | Always `ready`: it shows only that the admin HTTP server answers. It checks neither gossip nor the gRPC listener; gabiond exits when either fails, so a static probe is enough. |
 | `/snapshot` | 200 / 503 | 503 with the `admin_unavailable` body once the gossip task has stopped. |
@@ -428,7 +428,7 @@ Message starts: "The gossip background task stopped on its own."
 
 Message starts: "gabiond could not serve"
 
-**What happened.** `envoy_bind`, `admin_bind` or `gossip.bind` could not be served, so `gabiond` drains the rest and exits with status 1 instead of running without it.
+**What happened.** `envoy_bind`, `admin_bind` or `gossip.bind` could not be bound, so `gabiond` exited with status 1 before serving anything rather than run without it. Every address is bound before any "listening" line is logged.
 
 **Why.** Usually another process holds the port (a second `gabiond` on the host, a sidecar); less often the address is not on this host, or the port is privileged.
 
@@ -463,6 +463,20 @@ Message starts: "The gossip request queue was full, so counted hits were dropped
 **What to do next.** Raise `gossip.limit_queue_capacity` (`GABION_GOSSIP_LIMIT_QUEUE_CAPACITY`) or give the pod more CPU.
 
 **Fields** `capacity`, `dropped_total`, `config_key` · **Knob** `gossip.limit_queue_capacity` (`GABION_GOSSIP_LIMIT_QUEUE_CAPACITY`)
+
+### `server_stopped`
+
+**Level** error, once · **Request allowed** not applicable, `gabiond` exits · **Emitted by** `gabiond`
+
+Message starts: "gabiond stopped serving"
+
+**What happened.** The gRPC or admin server stopped after its address was bound: on its own before a signal, or with an error while draining. `gabiond` drains the rest and exits with status 1 to be restarted.
+
+**Why.** Not a port clash, since the address was already bound. A bound server that fails, including one whose gRPC reflection service could not be built, is a gabion bug.
+
+**What to do next.** Report it with the whole line, `error` included; the pod restarts on its own.
+
+**Fields** `addr`, `error` · **Knob** none
 
 ## Fail-open invariant
 

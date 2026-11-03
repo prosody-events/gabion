@@ -10,7 +10,6 @@
 //! to an `AdminCommand` round-trip, so the handler never gets a `Sync`
 //! borrow of the runtime's internals.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Json;
@@ -20,6 +19,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use gabion::aggregate::Aggregate;
@@ -69,13 +69,13 @@ pub fn router(state: AdminState) -> Router {
         .with_state(Arc::new(state))
 }
 
-/// Serve the admin endpoints on `bind` until `shutdown` resolves, then drain
-/// in-flight requests.
-pub async fn serve<F>(bind: SocketAddr, state: AdminState, shutdown: F) -> std::io::Result<()>
+/// Serve the admin endpoints on `listener` until `shutdown` resolves, then
+/// drain in-flight requests. The caller binds, so a taken port fails before
+/// anything claims to serve.
+pub async fn serve<F>(listener: TcpListener, state: AdminState, shutdown: F) -> std::io::Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown)
         .await
