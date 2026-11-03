@@ -287,8 +287,9 @@ gateways nothing, so a gateway that dies meanwhile is replaced on the
 origin's next change, within `gossip.suspect_after` and a heartbeat of it. A
 gateway that cannot reach most of the zone peers it has heard sets
 `CANNOT_RELAY` on every packet, and origins that send to it fail over at
-once. A packet from an address
-outside the peer table is merged and nothing more: never acked or relayed.
+once. A packet from an address outside the peer table is merged and never
+acked, but the cells a flagged one raised are relayed, so an origin's hits
+reach a zone whose gateway has not yet discovered it.
 
 A node that starts asks its two highest-weight peers it has heard from in
 its zone (or, once no peer is or may be of its zone, one heard peer of any

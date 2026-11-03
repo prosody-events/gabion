@@ -500,7 +500,7 @@ fn transient_suspicion_clears() {
         let zones = ["a", "b", "b"];
         let tune = |s: &mut Settings| s.suspect_after = Some(ms(400));
         let (origin, taps) = tapped_node(&router, &addrs, &zones, 0, tune);
-        // G1 does not know O: O's packets are merge-only there.
+        // G1 does not know O, so it never acks O's packets.
         let g1_config = zoned_config(vec![addrs[2]], "b", tune);
         let g1 = Node::start(&router, addrs[1], store_for(id(1, 1)), g1_config);
         let g2 = zoned_node_with(&router, &addrs, &zones, 2, tune);
@@ -1818,29 +1818,37 @@ fn probe_answer_counts_only_for_this_incarnation() {
     });
 }
 
-/// A packet from an address outside the peer table is merged and nothing
-/// more: flagged and fresh, it is still neither relayed nor acked.
+/// A packet from an address outside the peer table is merged and never acked:
+/// the sender gets no row and no packet. Flagged, the cells it raised are
+/// relayed into the zone, since it may be an origin this gateway has not yet
+/// discovered; unflagged, they are not.
 #[test]
-fn unknown_sender_is_merge_only() {
-    run_paused(async {
-        let (m, stranger) = (sock(2), sock(9));
-        let wire = Rc::new(Wire::default());
-        let (_client, admin) = scripted(&wire, vec![m], "b", |_| {}).await;
-        introduce(&wire, &[(m, node(0xB), "b")]);
-        heartbeats(1).await;
-        let mark = wire.attempts.borrow().len();
-        for packet in cell_packets(node(0xD), 0, 3, true) {
-            wire.inbound.borrow_mut().push_back((packet, stranger));
-        }
-        heartbeats(3).await;
-        assert_eq!(admin_snapshot(&admin).await.counters.cells_merged, 3);
-        assert_eq!(relayed_cells(&wire, m, mark), 0);
-        assert!(
-            wire.attempts.borrow()[mark..]
+fn unknown_sender_is_never_acked() {
+    for flagged in [true, false] {
+        run_paused(async {
+            let (m, stranger) = (sock(2), sock(9));
+            let wire = Rc::new(Wire::default());
+            let (_client, admin) = scripted(&wire, vec![m], "b", |_| {}).await;
+            introduce(&wire, &[(m, node(0xB), "b")]);
+            heartbeats(1).await;
+            let mark = wire.attempts.borrow().len();
+            for packet in cell_packets(node(0xD), 0, 3, flagged) {
+                wire.inbound.borrow_mut().push_back((packet, stranger));
+            }
+            // Read and relayed on one heartbeat, before any retry.
+            heartbeats(1).await;
+            let relayed = if flagged { 3 } else { 0 };
+            assert_eq!(relayed_cells(&wire, m, mark), relayed, "{flagged}");
+            heartbeats(2).await;
+            let to_stranger = wire.attempts.borrow()[mark..]
                 .iter()
-                .all(|a| a.dst != stranger)
-        );
-    });
+                .any(|a| a.dst == stranger);
+            assert!(!to_stranger, "{flagged}");
+            let snapshot = admin_snapshot(&admin).await;
+            assert_eq!(snapshot.counters.cells_merged, 3, "{flagged}");
+            assert_eq!(snapshot.peers.len(), 1, "{flagged}");
+        });
+    }
 }
 
 /// `CANNOT_RELAY` from a peer of this node's zone (or from any peer of a node

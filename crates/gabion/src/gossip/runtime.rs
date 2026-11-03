@@ -468,25 +468,25 @@ where
             Ok(header) => header,
             Err(error) => return self.note_decode_reject(error, src, n),
         };
-        let flagged = matches!(
-            header.payload,
+        // A sender outside the table, or a late incarnation, is never acked
+        // and its freshness cannot be judged, but what a flagged packet raised
+        // is relayed: an origin's gateway relays its hits before discovery
+        // has reported the origin.
+        let unjudged = match header.payload {
             Payload::Cells(CellPayload::Own {
                 relay_into_zone: true,
                 ..
-            })
-        );
-        // A sender outside the table is merge-only: merged, never acked,
-        // never relayed.
+            }) => RelayMark::Changed,
+            _ => RelayMark::Clear,
+        };
         let Some(row) = self.peers.find(src) else {
             if header.payload == Payload::SweepRequest {
                 self.counters.sweeps_ignored += 1;
             }
-            return self.merge(RelayMark::Clear);
+            return self.merge(unjudged);
         };
         match self.peers.contact(row, header.sender, header.sender_zone) {
-            // Its freshness cannot be judged, but what it raised is relayed.
-            Contact::Late if flagged => return self.merge(RelayMark::Changed),
-            Contact::Late => return self.merge(RelayMark::Clear),
+            Contact::Late => return self.merge(unjudged),
             Contact::First => {
                 if let Some(want) = &mut self.sweep_want {
                     want.due = true;
