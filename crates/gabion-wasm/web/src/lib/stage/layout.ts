@@ -4,8 +4,9 @@
 // node's disc, its label, its keyboard cell and its beams share one address.
 // Everything is screen-size, so labels never scale with the stage.
 
-/** A ring's radius as a share of the gap between neighbouring ring centres: the
- *  largest value that keeps every cross-zone beam clear of a third ring. */
+/** A ring's radius as a share of half the gap between neighbouring ring
+ *  centres: the largest value that keeps every cross-zone beam clear of a third
+ *  ring. */
 export const K_Z = 0.75;
 /** The largest disc, in px. */
 export const R_MAX = 20;
@@ -76,7 +77,7 @@ export function stageLayout(
   const rings = size.map((n, z) => {
     const angle = -Math.PI / 2 + (2 * Math.PI * z) / zones;
     // The disc is capped by the room on the ring and by the clearance a beam
-    // leaves round a third ring (half a cross-zone stroke of it is the stroke's).
+    // leaves round a third ring, less half a cross-zone stroke.
     const r = Math.max(
       Math.min(R_MAX, (2 * Math.PI * rz) / (S_D * Math.max(n, 1)), BEAM_CLEARANCE * rz - CROSS_WIDTH / 2),
       R_FLOOR,
@@ -113,13 +114,8 @@ export interface QuadPath {
 /** The route of a packet from `from` to `to`, which every beam is drawn along:
  *  inside a zone a straight segment (the control point is the midpoint), across
  *  zones a curve bent through the stage's empty `centre`, so it never runs past
- *  a third ring. Written into `out` when given, so the renderer allocates none. */
-export function beamPath(
-  from: Spot,
-  to: Spot,
-  centre: Point,
-  out: QuadPath = { from: { x: 0, y: 0 }, control: { x: 0, y: 0 }, to: { x: 0, y: 0 } },
-): QuadPath {
+ *  a third ring. Written into `out`, so the renderer allocates none. */
+export function beamPath(from: Spot, to: Spot, centre: Point, out: QuadPath): QuadPath {
   out.from.x = from.x;
   out.from.y = from.y;
   out.to.x = to.x;

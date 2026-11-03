@@ -236,8 +236,9 @@ impl BytesByTier {
     }
 }
 
-/// One node's view at snapshot time. The scalar fields mirror the runtime's
-/// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); `store_stats` mirrors its
+/// One node's view at snapshot time. The counters mirror the runtime's
+/// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); `gateway_for` and
+/// `own_data_bytes` the engine counts; and `store_stats` mirrors its
 /// [`CellStoreStats`](gabion::crdt::CellStoreStats). The node inspector renders
 /// them directly: see `GossipTargets.svelte` and `NodeInspector.svelte` in
 /// `web/src/lib/components`.

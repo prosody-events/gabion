@@ -54,7 +54,7 @@ export type Theme = ReturnType<typeof readTheme>;
 export const BEAM_ALPHA = 0.8;
 export const BAND_ALPHA = 0.15;
 /** The share of its alpha a beam keeps when a selection makes it context: the
- *  one named exemption from the graphics contrast rule (§8.7). */
+ *  one named exemption from the graphics contrast rule. */
 export const FADED_ALPHA = 0.25;
 
 /** Call `onChange` when the OS colour scheme or `<html data-theme>` changes;

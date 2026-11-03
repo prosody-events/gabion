@@ -115,9 +115,13 @@ test('boots, gossips the burst out, and keeps gossiping past the window', async 
   await setSpeed(page, 4);
   await page.getByRole('button', { name: 'Play' }).click();
 
-  // Catch the stage mid-gossip: beams in flight, arcs partly filled. Best-effort
-  // — a snapshot for eyeballing, not an assertion.
-  await page.waitForTimeout(250);
+  // Catch the stage mid-gossip once beams are in flight, arcs partly filled.
+  // Best-effort — a snapshot for eyeballing, not an assertion.
+  await expect
+    .poll(() =>
+      page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { beams?: { len: number } }) => c.beams?.len ?? 0),
+    )
+    .toBeGreaterThan(0);
   await page.screenshot({ path: 'screenshots/ring-gossip.png' });
 
   // The burst (and the background hum) reach every node — no node sits at zero.

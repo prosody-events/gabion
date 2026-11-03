@@ -49,9 +49,10 @@ and a one-line annotation reports the latest gateway change or join-sweep
 request.
 
 **Labels.** Zone titles sit at the ring centres and node ids outside the disc.
-Labels are placed greedily (zone titles first, then ids in (zone, id) order) and
-a label is drawn only if its measured box, halo included, lies inside the stage
-and overlaps no label and no disc. The renderer publishes the stage centre
+Labels are placed greedily (zone titles first, then ids in (zone, id) order). A
+zone title is drawn only if its measured box, halo included, lies inside the
+stage and overlaps no label; a node id must also clear every disc and its marks.
+The renderer publishes the stage centre
 (`data-centre`), the rings (`data-rings`), the stroke width (`data-cross-width`)
 and every label's box (`data-label-boxes`) on its canvas, and every chart
 publishes its label boxes the same way, which is how the audit checks canvas
@@ -109,7 +110,9 @@ their origin selected.
 
 `window.sim` is the live engine, the handle the audit and the console use
 (`sim.snapshot(id)`); each chart's plot element carries its uPlot instance as
-`uplot`, which the audit reads to check every mark lies inside its plot.
+`uplot`, which the audit reads to check every mark lies inside its plot; and
+the stage canvas carries `beams`, the renderer's in-flight beam pool, which the
+geometry check reads.
 
 ## Layout
 
@@ -215,7 +218,7 @@ Automated checks, run on every preset with the transport paused:
 
 - A1: no page or console errors, no failed requests, no page-level horizontal overflow.
 - A2: no "NaN", "undefined", "null", "Infinity", "[object" or "e+" in page text.
-- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; every chart value lies inside its plot; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring.
+- A3: no two visible text boxes, DOM or canvas, overlap by 1 px or more, also in a converged state; no text is below the smallest type token (`--font-size-caption-sm`) and none is clipped by an `overflow: hidden` ancestor; every chart value lies inside its plot; tooltips stay inside the stage; and for every zone count the stage's rings (grown by the largest disc) and labels lie inside it and no cross-zone `beamPath` comes within a disc and half a stroke of a third ring, and every beam in flight bends through the centre exactly when its nodes' zones differ.
 - A4: data correctness, recomputed independently from the engine snapshot in the test's own code: the status counts, each node's behind-by and gateway-for count, each chart-3 spread, the windowed share, both chart-1 predictions (with unequal zones, and absent with one node) and, for a selected origin, its Gossip targets.
 - A5: fixed order across the grid, table, chart panels and inspector rows.
 - A6: interaction: the zone stepper and Rebuild, each network action and heal, keyboard navigation with focus kept across a rebuild, a tooltip on hover, focus and tap, and the study link's form (`study/` joins the site only in the Pages build, so its href is checked, not followed).

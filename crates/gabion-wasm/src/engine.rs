@@ -254,11 +254,10 @@ async fn engine_loop(
     Ok(())
 }
 
-/// One node's handles, owned by the engine for the session. The `Vec` of these
-/// stays insertion-ordered (append on add, `remove` on delete), so a handle's
-/// position in the `Vec` is the node's **rank** — what the frontend turns into
-/// a ring slot — while `id` is its stable identity. The two are equal only
-/// until the first removal opens a gap.
+/// One node's handles, owned by the engine for the session. The engine's `Vec`
+/// of these is sorted by ascending `id`: `spawn_node` alone appends, with the
+/// next unused id, and `remove_node` keeps the order, so a lookup by id is a
+/// binary search (`position_of`).
 struct NodeHandle {
     /// Stable id (see [`crate::event`]). Assigned once, never reused.
     id: u32,
@@ -377,10 +376,8 @@ impl EngineState {
         // the set a later newcomer will be handed too.
         let addrs: Vec<SocketAddr> = (0..initial_nodes).map(|i| addr_of_id(i as u32)).collect();
         let zones = state.zone_names.len();
-        for _ in 0..initial_nodes {
-            let id = state.next_id;
-            state.next_id += 1;
-            state.spawn_node(id, (id as usize % zones) as u8, &addrs)?;
+        for i in 0..initial_nodes {
+            state.spawn_node((i % zones) as u8, &addrs)?;
         }
 
         // Apply the uniform i.i.d. loss model to every directed link.
@@ -400,20 +397,17 @@ impl EngineState {
         Ok(state)
     }
 
-    /// Build, spawn, and register one node with stable id `id`, bootstrapped
-    /// against `bootstrap` (its own address is filtered out if present). The
-    /// single node-construction path: both [`EngineState::build`] and
-    /// [`EngineState::add_node`] route through here.
+    /// Build, spawn, and register one node with the next unused stable id,
+    /// bootstrapped against `bootstrap` (its own address is filtered out if
+    /// present), and return that id. The single node-construction path and the
+    /// only push onto `nodes`, so `nodes` stays sorted by id: both
+    /// [`EngineState::build`] and [`EngineState::add_node`] route through here.
     ///
     /// Every node shares the storage config and settings `SimConfig::validate`
     /// built once, so a joiner is sized like the initial members; its gossip
     /// config adds only its bind and peers, through `Settings::validate`.
-    fn spawn_node(
-        &mut self,
-        id: u32,
-        zone: u8,
-        bootstrap: &[SocketAddr],
-    ) -> Result<(), SettingError> {
+    fn spawn_node(&mut self, zone: u8, bootstrap: &[SocketAddr]) -> Result<u32, SettingError> {
+        let id = self.next_id;
         let addr = addr_of_id(id);
         let peers: Box<[SocketAddr]> = bootstrap.iter().copied().filter(|a| *a != addr).collect();
         let (gossip_cfg, _) = Settings {
@@ -464,7 +458,6 @@ impl EngineState {
         self.addresses
             .borrow_mut()
             .insert(addr, Member { id, zone });
-        debug_assert!(self.nodes.last().is_none_or(|h| h.id < id));
         self.nodes.push(NodeHandle {
             id,
             zone,
@@ -480,19 +473,12 @@ impl EngineState {
             gateways: [None; MAX_ZONES],
             own_data_bytes: 0,
         });
-        Ok(())
+        self.next_id += 1;
+        Ok(id)
     }
 
     fn current_tick(&self) -> u64 {
         self.virtual_ms / self.config.tick_interval_ms
-    }
-
-    /// Position in the `nodes` `Vec` of the live node with stable id `id`,
-    /// or `None` if no live node has it. Ids ascend (`next_id` only grows,
-    /// `add_node` appends and `remove_node` keeps the order), so `nodes` is
-    /// sorted by id and the search is binary.
-    fn position_of(&self, id: u32) -> Option<usize> {
-        self.nodes.binary_search_by_key(&id, |h| h.id).ok()
     }
 
     async fn submit_request(
@@ -501,8 +487,7 @@ impl EngineState {
         key: u128,
         hits: u64,
     ) -> Result<EventBatch, EngineError> {
-        let handle = self
-            .position_of(node)
+        let handle = position_of(&self.nodes, node)
             .map(|pos| &self.nodes[pos])
             .ok_or(EngineError::UnknownNode { id: node })?;
         let bucket = self.rule.current_epoch(self.virtual_ms);
@@ -538,7 +523,7 @@ impl EngineState {
         policy: LinkPolicyKind,
     ) -> Result<(), EngineError> {
         for id in [src, dst] {
-            if self.position_of(id).is_none() {
+            if position_of(&self.nodes, id).is_none() {
                 return Err(EngineError::UnknownNode { id });
             }
         }
@@ -584,12 +569,10 @@ impl EngineState {
                     zones: zones as u8,
                 })?,
         };
-        let id = self.next_id;
-        self.next_id += 1;
-        let newcomer_addr = addr_of_id(id);
         // The newcomer bootstraps against everyone currently live.
         let live_addrs: Vec<SocketAddr> = self.nodes.iter().map(|h| h.addr).collect();
-        self.spawn_node(id, zone, &live_addrs)?;
+        let id = self.spawn_node(zone, &live_addrs)?;
+        let newcomer_addr = addr_of_id(id);
 
         // Tell every survivor (everyone but the just-pushed newcomer) the
         // newcomer joined, so they add it to their peer table and gossip to it.
@@ -618,9 +601,7 @@ impl EngineState {
     /// never reused, so survivors keep their own ids and addresses unchanged.
     /// Every survivor whose gateway it was reports that gateway's zone anew.
     async fn remove_node(&mut self, id: u32) -> Result<EventBatch, EngineError> {
-        let pos = self
-            .position_of(id)
-            .ok_or(EngineError::UnknownNode { id })?;
+        let pos = position_of(&self.nodes, id).ok_or(EngineError::UnknownNode { id })?;
         let addr = self.nodes[pos].addr;
         let node_id = self.nodes[pos].identity.node_id.0;
 
@@ -795,7 +776,7 @@ impl EngineState {
                 // A sender removed since (its last packets drain after the
                 // removal) is skipped: the page weights live origins only.
                 if *kind == PacketKind::Own
-                    && let Ok(pos) = nodes.binary_search_by_key(src, |h| h.id)
+                    && let Some(pos) = position_of(nodes, *src)
                 {
                     nodes[pos].own_data_bytes += u64::from(*bytes);
                 }
@@ -916,7 +897,7 @@ impl EngineState {
         let mut gateway_for = vec![0u32; self.nodes.len()];
         for origin in &self.nodes {
             for &g in origin.gateways[..self.zone_names.len()].iter().flatten() {
-                if let Some(pos) = self.position_of(g) {
+                if let Some(pos) = position_of(&self.nodes, g) {
                     gateway_for[pos] += 1;
                 }
             }
@@ -1060,6 +1041,12 @@ impl EngineState {
 fn addr_of_id(id: u32) -> SocketAddr {
     debug_assert!(id <= MAX_ID, "add_node spends no id past MAX_ID");
     SocketAddr::from(([127, 0, 0, 1], BASE_PORT + id as u16))
+}
+
+/// Position in `nodes` of the live node with stable id `id`, or `None` if no
+/// live node has it; `nodes` is sorted by id (see `NodeHandle`).
+fn position_of(nodes: &[NodeHandle], id: u32) -> Option<usize> {
+    nodes.binary_search_by_key(&id, |h| h.id).ok()
 }
 
 /// One `Snapshot` admin round-trip. `None` if the runtime has already stopped.

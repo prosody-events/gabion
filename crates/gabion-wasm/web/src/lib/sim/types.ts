@@ -137,7 +137,9 @@ export interface StoreStats {
 /** Mirror of `crate::event::NodeState`. `id` is the node's stable identity (see
  *  the Rust module note): assigned once, never reused, so it survives other
  *  nodes joining and leaving and has gaps once a member has been removed. The
- *  scalar fields mirror the runtime's `AdminSnapshot`. */
+ *  counters mirror the runtime's `AdminSnapshot`; `gateway_for` and
+ *  `own_data_bytes` the engine counts; and `store_stats` mirrors its
+ *  `CellStoreStats`. */
 export interface NodeState {
   id: number;
   /** The zone the node is placed in. */

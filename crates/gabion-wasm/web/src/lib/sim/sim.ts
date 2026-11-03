@@ -43,6 +43,8 @@ export class Sim {
   // Every directed link blocked since the last heal, keyed `src * 2**20 + dst`,
   // so the page can say how many links are cut: the engine keeps no such count.
   #blocked = new Set<number>();
+  // `cutLinks()`'s answer, kept until the set next changes.
+  #cut: number | null = 0;
 
   private constructor(inner: WasmSim) {
     this.#inner = inner;
@@ -103,6 +105,7 @@ export class Sim {
     const key = src * LINK_KEY + dst;
     if (policy.kind === 'Block') this.#blocked.add(key);
     else this.#blocked.delete(key);
+    this.#cut = null;
   }
 
   /** Cut every link between two node groups, both directions. */
@@ -114,12 +117,14 @@ export class Sim {
         this.#blocked.add(b * LINK_KEY + a);
       }
     }
+    this.#cut = null;
   }
 
   /** Restore every directed link to lossless `Pass`. */
   async heal(): Promise<void> {
     await this.#inner.heal();
     this.#blocked.clear();
+    this.#cut = 0;
   }
 
   /** Cut a zone off: every link between its `members` and the `rest`. */
@@ -142,14 +147,17 @@ export class Sim {
 
   /** Node pairs with at least one direction blocked. */
   cutLinks(): number {
-    let pairs = 0;
-    for (const key of this.#blocked) {
-      const src = Math.floor(key / LINK_KEY);
-      const dst = key % LINK_KEY;
-      // A pair blocked both ways counts once, at its lower-to-higher direction.
-      if (!this.#blocked.has(dst * LINK_KEY + src) || src < dst) pairs += 1;
+    if (this.#cut === null) {
+      let pairs = 0;
+      for (const key of this.#blocked) {
+        const src = Math.floor(key / LINK_KEY);
+        const dst = key % LINK_KEY;
+        // A pair blocked both ways counts once, at its lower-to-higher direction.
+        if (!this.#blocked.has(dst * LINK_KEY + src) || src < dst) pairs += 1;
+      }
+      this.#cut = pairs;
     }
-    return pairs;
+    return this.#cut;
   }
 
   /** Add a fresh cold-start node to the live cluster (no rebuild). Resolves to
@@ -169,6 +177,7 @@ export class Sim {
     for (const key of this.#blocked) {
       if (Math.floor(key / LINK_KEY) === id || key % LINK_KEY === id) this.#blocked.delete(key);
     }
+    this.#cut = null;
     return batch;
   }
 

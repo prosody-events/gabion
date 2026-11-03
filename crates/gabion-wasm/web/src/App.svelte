@@ -256,7 +256,12 @@
       }
       const config = { ...d, ...effectiveConfig(preset, k, d) };
       const fresh = await Sim.create(config);
-      await preset.seed(fresh, config);
+      // A seed that cannot start (a gateway scenario with no gateway to find)
+      // must not strand the engine it was seeding.
+      await preset.seed(fresh, config).catch(async (e: unknown) => {
+        await fresh.shutdown();
+        throw e;
+      });
       sim = fresh;
       window.sim = fresh;
       // The engine now reflects the current knobs — mark them applied so the

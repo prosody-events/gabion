@@ -187,7 +187,7 @@
     border-color: var(--color-fg-muted);
   }
 
-  /* §2 — the headline. One step quieter than the cluster hero in HeadlineMetric
+  /* The headline. One step quieter than the cluster hero in HeadlineMetric
      (2.25rem vs 2.75rem): this is one node's view, not the cluster's. */
   .convergence {
     display: grid;
@@ -327,7 +327,7 @@
     color: var(--color-fg-muted);
   }
 
-  /* §8 — identity footer: the quietest element, collapsed by default. */
+  /* Identity footer: the quietest element, collapsed by default. */
   .identity {
     font-size: var(--font-size-caption);
   }

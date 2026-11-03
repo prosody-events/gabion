@@ -68,8 +68,8 @@ function measure(theme: Theme, text: string): number {
   return measuring.measureText(text).width;
 }
 
-function font(theme: Theme): string {
-  return `${theme.captionSmPx}px ${theme.font}`;
+function font(theme: Theme, scale = 1): string {
+  return `${theme.captionSmPx * scale}px ${theme.font}`;
 }
 
 /** A label's height with its halo, px. */
@@ -98,7 +98,7 @@ function labelSink(theme: Theme) {
       const dpr = pxr(u);
       const ctx = u.ctx;
       ctx.save();
-      ctx.font = `${theme.captionSmPx * dpr}px ${theme.font}`;
+      ctx.font = font(theme, dpr);
       ctx.textAlign = align;
       ctx.textBaseline = 'middle';
       ctx.lineJoin = 'round';
@@ -326,27 +326,25 @@ export function spreadPanel(theme: Theme, last: boolean, y: YRange): uPlot.Optio
 
 /** Paint the REJECTING band (limit → top of plot) and the dashed limit line,
  *  behind the series. Device-pixel coordinates. */
-function drawRejectBand(limit: number, fill: string, stroke: string) {
-  return (u: uPlot): void => {
-    const dpr = pxr(u);
-    const ctx = u.ctx;
-    const x = u.bbox.left;
-    const w = u.bbox.width;
-    const yTop = u.bbox.top;
-    const yLimit = u.valToPos(limit, 'y', true);
-    if (yLimit <= yTop) return;
-    ctx.save();
-    ctx.fillStyle = fill;
-    ctx.fillRect(x, yTop, w, yLimit - yTop);
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = 1.5 * dpr;
-    ctx.setLineDash([6 * dpr, 4 * dpr]);
-    ctx.beginPath();
-    ctx.moveTo(x, yLimit);
-    ctx.lineTo(x + w, yLimit);
-    ctx.stroke();
-    ctx.restore();
-  };
+function drawRejectBand(u: uPlot, limit: number, fill: string, stroke: string): void {
+  const dpr = pxr(u);
+  const ctx = u.ctx;
+  const x = u.bbox.left;
+  const w = u.bbox.width;
+  const yTop = u.bbox.top;
+  const yLimit = u.valToPos(limit, 'y', true);
+  if (yLimit <= yTop) return;
+  ctx.save();
+  ctx.fillStyle = fill;
+  ctx.fillRect(x, yTop, w, yLimit - yTop);
+  ctx.strokeStyle = stroke;
+  ctx.lineWidth = 1.5 * dpr;
+  ctx.setLineDash([6 * dpr, 4 * dpr]);
+  ctx.beginPath();
+  ctx.moveTo(x, yLimit);
+  ctx.lineTo(x + w, yLimit);
+  ctx.stroke();
+  ctx.restore();
 }
 
 /** Chart 4: Aggregate vs Limit. The cluster's true total (the aggregate every
@@ -377,7 +375,7 @@ export function aggregateLimitOptions(limit: number, theme: Theme): uPlot.Option
       drawClear: [
         (u) => {
           sink.reset();
-          drawRejectBand(limit, cssColor(theme.warn, BAND_ALPHA), warn)(u);
+          drawRejectBand(u, limit, cssColor(theme.warn, BAND_ALPHA), warn);
         },
       ],
       // The band's name sits at its top-left corner and the limit's just under

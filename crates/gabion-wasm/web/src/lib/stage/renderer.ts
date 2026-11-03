@@ -264,6 +264,8 @@ export class StageRenderer {
     }
     this.#restyle();
     this.#app.ticker.add(this.#stepBeams, this);
+    // The in-flight beams, read by the design audit as Chart.svelte's `uplot` is: set once, so a frame pays nothing.
+    Object.assign(this.#app.canvas, { beams: this.#pool });
   }
 
   /** Build the renderer and attach its canvas to `container`. Async because
@@ -310,6 +312,7 @@ export class StageRenderer {
         this.#createNode(spot, target);
       } else {
         this.#glide(gfx, target);
+        gfx.zone = spot.zone;
         if (gfx.radius !== spot.r) {
           gfx.radius = spot.r;
           this.#drawNode(spot.id, gfx);
@@ -608,10 +611,10 @@ export class StageRenderer {
 
   /** Lay the labels out and publish their boxes. Zone titles go first, at their
    *  ring centres; node ids follow in (zone, id) order, radially outside the
-   *  disc, or inside it when a neighbour's disc is in the way. A label is drawn
-   *  only if its measured box lies inside the stage and overlaps no label already
-   *  placed and no disc, so the audit's no-overlap rule holds at every width by
-   *  construction. */
+   *  disc, or inside it when a neighbour's disc is in the way. A zone title is
+   *  drawn only if its measured box lies inside the stage and overlaps no label
+   *  already placed; a node id must also clear every disc and its marks. So the
+   *  audit's no-overlap rule holds at every width by construction. */
   #rebuildLabels(): void {
     for (const label of this.#labelLayer.removeChildren()) label.destroy();
     const layout = this.#layout;

@@ -9,7 +9,8 @@ export function fmtPercent(share: number): string {
 /** A span of virtual time: whole milliseconds below one second, else seconds
  *  with one decimal. */
 export function fmtDuration(ms: number): string {
-  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
+  const whole = Math.round(ms);
+  return whole < 1000 ? `${whole} ms` : `${(ms / 1000).toFixed(1)} s`;
 }
 
 /** A count with thousands separators, in a fixed locale. */

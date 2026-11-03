@@ -1,18 +1,16 @@
 // Scenario presets — the canned starting conditions the control rail offers.
 //
 // A preset is a config plus an `async seed(sim, config)` that fires its opening
-// commands against a freshly built, not-yet-advanced cluster (partitions, seed
-// bursts). It is deliberately *not* a timed script: every preset's initial
-// state is "build the cluster, run these t=0 commands"; the partition→heal
-// narrative is a user gesture during play (the rail's Heal button), not a
-// scripted timeline. A timed-event driver only becomes load-bearing for the
-// scrubber's replay-from-zero, so it waits for that phase.
+// commands against a freshly built cluster (partitions, seed bursts); the
+// gateway presets first step heartbeats until the origin has found the gateway
+// they cut. It is deliberately *not* a timed script: the partition→heal
+// narrative is a user gesture during play (the rail's Heal button).
 //
 // Most presets pin the rule limit high (`NARRATIVE_LIMIT`, 1 000 000) on
 // purpose — well above the seeded volumes. A burst then stays well under
 // gabion's threshold anti-entropy budget (ε ≈ limit·bps/(10⁴·N), ~833 at this
-// limit with N=12), so it waits for the next heartbeat, which sends it
-// straight to every peer. The viz-friendly default
+// limit with N=12), so it waits for the next heartbeat, which sends it to the
+// origin's zone and one gateway in each other zone. The viz-friendly default
 // limit (1 000, see `SimConfig::default` in `config.rs`) gives ε ≈ 0.83, so
 // every hit would eager-flush and a burst would flood at t=0 — which is why the
 // narrative presets override it back up. The default limit's limit-crossing
@@ -42,8 +40,7 @@
 //
 // Every feed is folded into the play loop as a carry-save rate (App.svelte), not
 // a timed script: the total injected by virtual time T is exactly ⌊rate·T⌋
-// regardless of how play chunked the steps, so it stays deterministic without
-// the scrubber's driver.
+// regardless of how play chunked the steps, so it stays deterministic.
 
 import { noun } from './format';
 import type { Sim } from './sim/sim';
@@ -131,9 +128,9 @@ export function knobsFromPreset(preset: Preset, defaults: SimConfig): Knobs {
  *  global hit index, so the spread is chunk-independent), targeting the watched
  *  key. App.svelte folds `rate_per_sec` into each advance as a carry-save
  *  accumulator, so ⌊rate·T⌋ hits have landed by virtual time T regardless of
- *  step chunking — deterministic, and it composes with scrub-from-zero. There is
- *  no cap: the windowed oracle (`engine.rs`) decays with expiry, so the
- *  aggregate plateaus at ≈ `rate · window_seconds` on its own. */
+ *  step chunking — deterministic. There is no cap: the windowed oracle
+ *  (`engine.rs`) decays with expiry, so the aggregate plateaus at
+ *  ≈ `rate · window_seconds` on its own. */
 export interface SustainedTraffic {
   readonly rate_per_sec: number;
 }
@@ -155,9 +152,6 @@ export interface Preset {
   readonly config: Partial<SimConfig>;
   /** The node the scenario opens with selected, so its gateways show on load. */
   readonly select?: number;
-  /** Whether the scenario severs links; the rail's network section is always
-   *  there, this marks the presets that open with links already cut. */
-  readonly usesNetwork?: boolean;
   /** A steady background feed the play loop drives. Present on the narrative
    *  presets (a faint hum that keeps gossip perpetual) and the overload preset
    *  (a flood); absent on the user-driven `sandbox` and the gateway presets,
@@ -257,7 +251,6 @@ export const PRESETS: readonly Preset[] = [
     blurb: () =>
       blurb`The last zone is cut off from the rest and ${BURST} hits land on each side. Nodes cannot hear across the cut until you heal the network; the disagreement of every zone then returns to zero.`,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
-    usesNetwork: true,
     traffic: { rate_per_sec: BACKGROUND_RATE_PER_SEC },
     async seed(sim, c) {
       const cut = members(c, c.zones - 1);
@@ -284,7 +277,6 @@ export const PRESETS: readonly Preset[] = [
       blurb`The origin's gateway into the second zone is silenced without telling anyone, then a burst lands at the origin. After the suspect timeout the origin picks another gateway, and the zone catches up.`,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     select: ORIGIN,
-    usesNetwork: true,
     async seed(sim, c) {
       const g = await warmUntilGateway(sim, ORIGIN, 1, c.tick_interval_ms);
       await sim.silence(g, except(c, [g]));
@@ -298,7 +290,6 @@ export const PRESETS: readonly Preset[] = [
       blurb`The origin's gateway into the second zone can hear its zone but not be heard by it. The gateway says it cannot relay, and the origin moves to another gateway.`,
     config: { nodes: NODES, zones: ZONES, rule_limit: NARRATIVE_LIMIT },
     select: ORIGIN,
-    usesNetwork: true,
     async seed(sim, c) {
       const g = await warmUntilGateway(sim, ORIGIN, 1, c.tick_interval_ms);
       await sim.cutFromZone(g, members(c, 1).filter((i) => i !== g));

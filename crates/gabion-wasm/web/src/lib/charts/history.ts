@@ -157,7 +157,7 @@ export class ChartHistory {
     this.ticks.push(snap.tick);
     this.oracle.push(snap.oracle_total);
     this.disagreement.push(high < 0 ? 0 : high - low);
-    this.share.push(this.shareOf(snap));
+    this.share.push(this.#shareOf(snap));
 
     if (this.times.length > HISTORY_CAP) this.#dropOldest();
   }
@@ -185,7 +185,7 @@ export class ChartHistory {
 
   /** σ: the share of the data bytes sent in the window ending at `snap` that
    *  crossed zones, or `null` when none were sent. */
-  shareOf(snap: ClusterState): number | null {
+  #shareOf(snap: ClusterState): number | null {
     const start = this.windowStart(snap.virtual_ms);
     const cross = snap.bytes_by_tier.cross_zone.data - start.crossData;
     const total = cross + snap.bytes_by_tier.in_zone.data - start.inData;

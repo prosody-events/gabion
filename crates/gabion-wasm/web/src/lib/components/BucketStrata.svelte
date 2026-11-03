@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { fmtCount, fmtDuration } from '../format';
   import type { CellView } from '../sim/types';
 
   // The sliding window made literal: one strip per active key, a conveyor belt of
@@ -173,8 +174,8 @@
     const aging =
       strip.oldestActiveEpoch === null
         ? ''
-        : `; oldest bucket ages out in ${tteSeconds(strip.oldestActiveEpoch).toFixed(1)} seconds`;
-    return `Sliding window, key ${shortKey(strip.key)}: total ${strip.sigma} of ${limit}; ${tally}${aging}`;
+        : `; oldest bucket ages out in ${fmtDuration(tteSeconds(strip.oldestActiveEpoch) * 1000)}`;
+    return `Sliding window, key ${shortKey(strip.key)}: total ${fmtCount(strip.sigma)} of ${fmtCount(limit)}; ${tally}${aging}`;
   }
 </script>
 
@@ -188,13 +189,13 @@
           <span class="head-left">
             <span class="key" data-field="key">key {shortKey(strip.key)}</span>
             {#if strip.oldestActiveEpoch !== null}
-              <span class="tte" data-field="tte">ages out in {tteSeconds(strip.oldestActiveEpoch).toFixed(1)}s</span>
+              <span class="tte" data-field="tte">ages out in {fmtDuration(tteSeconds(strip.oldestActiveEpoch) * 1000)}</span>
             {/if}
           </span>
           <span class="sigma" class:over={strip.sigma >= limit}>
-            Σ <span class="sigma-value" data-field="sigma">{strip.sigma}</span>
+            Σ <span class="sigma-value" data-field="sigma">{fmtCount(strip.sigma)}</span>
             <span class="sigma-sep">/</span>
-            <span data-field="limit">{limit.toLocaleString()}</span>
+            <span data-field="limit">{fmtCount(limit)}</span>
           </span>
         </div>
         <div class="viewport" aria-hidden="true">

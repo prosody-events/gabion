@@ -85,7 +85,7 @@
   });
   const share = $derived.by(() => {
     void version;
-    return history.shareOf(cluster);
+    return history.share.at(-1) ?? null;
   });
   const hasShare = $derived.by(() => {
     void version;

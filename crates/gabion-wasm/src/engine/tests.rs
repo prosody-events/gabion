@@ -833,7 +833,10 @@ fn assert_bytes_by_tier_and_sender(events: &[Event], state: &ClusterState) {
 fn gateway_for_counts_the_origins_routing_through_each_node() {
     with_state(zoned(12, 3), |mut state| async move {
         warm(&mut state).await;
-        state.remove_node(4).await.unwrap();
+        // Remove a node that is some origin's gateway, so the count follows the
+        // failover, not a cached row.
+        let g = gateway_of(&state, 0, 1).await;
+        state.remove_node(g).await.unwrap();
         state.step(3 * T).await;
         let snap = state.snapshot(None).await;
         let mut want = BTreeMap::new();

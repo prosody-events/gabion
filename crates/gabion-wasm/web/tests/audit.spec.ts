@@ -1,18 +1,20 @@
 import { inflateSync } from 'node:zlib';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import type { ClusterState } from '../src/lib/sim/types';
-import { R_MAX, beamPath, pointOn, type Point, type Spot } from '../src/lib/stage/layout';
+import { R_MAX, beamPath, pointOn, type Point, type QuadPath, type Spot } from '../src/lib/stage/layout';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
 // A1 to A9. Each audit project fixes a width and a colour scheme; the main test
 // walks every preset to a fixed virtual time with the transport paused, checks
 // it, then checks it again with `data-theme` forcing the other theme. Full-page
-// PNGs land in `audit-shots/` for the visual audit. Two more tests check the
-// stage's geometry for every zone count and the interactions.
+// PNGs land in `audit-shots/` for the visual audit. Three more tests check
+// chart 1's window and placement, the stage's geometry for every zone count, and
+// the interactions.
 //
-// A4 and A5 recompute what the page prints from the engine's own snapshot, in
-// this file's code and with its own formatting, never the page's.
+// A4 recomputes what the page prints from the engine's own snapshot, in this
+// file's code and with its own formatting, never the page's, and A5 checks that
+// the page prints it in (zone, id) order, never sorted by a value.
 
 const STEPS = 10;
 // The rule window every preset runs with (`SimConfig::default`, which no preset
@@ -25,7 +27,10 @@ type Findings = Record<'A1' | 'A2' | 'A3' | 'A7' | 'A8' | 'A9', string[]>;
 
 const int = (n: number): string => n.toLocaleString('en-US');
 const percent = (x: number): string => `${(x * 100).toFixed(1)}%`;
-const duration = (ms: number): string => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+const duration = (ms: number): string => {
+  const whole = Math.round(ms);
+  return whole < 1000 ? `${whole} ms` : `${(ms / 1000).toFixed(1)} s`;
+};
 
 // -- Page helpers --------------------------------------------------------------
 
@@ -110,6 +115,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
   expect(names.length, 'no presets to audit').toBeGreaterThan(0);
   let converged = 0;
   let charted = 0;
+  let inspected = 0;
   for (const name of names) {
     await loadPreset(page, name);
     await expect(canvas).toBeVisible();
@@ -130,6 +136,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
     );
     converged += await page.locator('.headline.converged').count();
     charted += await page.locator('.plot').count();
+    inspected += await page.locator('.inspector').count();
 
     let unforced: Theme | null = null;
     for (const theme of [null, forced]) {
@@ -174,6 +181,7 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
   // Text shown only once every node agrees (the converged badge) is checked too.
   expect(converged, 'no preset was audited in a converged state (A3)').toBeGreaterThan(0);
   expect(charted, 'no preset showed the charts, so none were checked (A3, A7)').toBeGreaterThan(0);
+  expect(inspected, 'no preset opened with its origin selected, so Gossip targets were never checked (A4)').toBeGreaterThan(0);
   expect(errors, 'page errors, console errors or failed requests (A1)').toEqual([]);
 });
 
@@ -304,7 +312,8 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
 
   // The status sentence's counts.
   await expect(field(page, 'status-nodes'), where).toHaveText(String(nodes.length));
-  if ((await field(page, 'status-zones').count()) > 0) {
+  await expect(field(page, 'status-zones'), where).toHaveCount(name === 'No zone configured' ? 0 : 1);
+  if ((await field(page, 'status-zones').count()) === 1) {
     await expect(field(page, 'status-zones'), where).toHaveText(
       String(snap.zones.filter((z) => z.live > 0).length),
     );
@@ -353,6 +362,10 @@ async function checkData(page: Page, name: string, series: ClusterState[]): Prom
     const spreads = page.locator('section.block', { hasText: /^Disagreement by zone/ }).locator('figure');
     const live = snap.zones.flatMap((z, i) => (z.live > 0 ? [i] : []));
     await expect(spreads, where).toHaveCount(live.length + 1);
+    await expect(
+      page.locator('section.block', { hasText: /^Agreement by zone/ }).locator('figure'),
+      `${where}: agreement panels`,
+    ).toHaveCount(live.length);
     for (const [i, zone] of live.entries()) {
       await expect(spreads.nth(i).locator('[data-field="spread"]'), `${where}: zone ${zone} spread`).toHaveText(
         int(spread(nodes.filter((n) => n.zone === zone))),
@@ -617,6 +630,7 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
         top: at.top + l.y,
         bottom: at.top + l.y + l.h,
       });
+      if (clipped.cutOff) found.A3.push(`canvas label "${l.text}" is cut off by an overflow: hidden box`);
       if (clipped.box !== null) boxes.push({ key: l, name: `canvas "${l.text}"`, box: clipped.box });
     }
   }
@@ -672,7 +686,7 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
   // A7 canvas pairs (graphics 3:1, text 4.5:1): the stage draws on `readTheme().bg`
   // and the charts on the detail rail's panel, so each is checked on its own
   // surface, a translucent mark composited over it first. Marks drawn faded as
-  // context for a selection (`FADED_ALPHA`) are exempt by name (§8.7); the ring
+  // context for a selection (`FADED_ALPHA`) are exempt by name (the README's Beams paragraph); the ring
   // guides repeat what position and the ring title say (structure, not data) and
   // are exempt too.
   const check = (surface: Rgba, where: string, pairs: [string, Rgba, number][]): void => {
@@ -859,7 +873,9 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
     if (zones < 2) continue;
 
     // No cross-zone route, drawn with the renderer's own `beamPath`, comes within
-    // a disc and half a stroke of a third ring's nodes.
+    // a disc and half a stroke of a third ring's nodes. This all-pairs check
+    // covers the clearance; the drawn-beam check below pins that the renderer
+    // routes every live beam through `beamPath` with each node's current zone.
     const spots: Spot[] = await page.evaluate(
       ({ left, top }) =>
         Array.from(document.querySelectorAll('[role="grid"] [role="row"]')).flatMap((row) =>
@@ -880,10 +896,11 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
     let nearest = Number.POSITIVE_INFINITY;
     const meets: string[] = [];
     const at: Point = { x: 0, y: 0 };
+    const route: QuadPath = { from: { x: 0, y: 0 }, control: { x: 0, y: 0 }, to: { x: 0, y: 0 } };
     for (const a of spots) {
       for (const b of spots) {
         if (a.zone >= b.zone) continue;
-        const path = beamPath(a, b, stage.centre);
+        const path = beamPath(a, b, stage.centre, route);
         for (let i = 0; i <= 128; i++) {
           pointOn(path, i / 128, at);
           for (const [k, ring] of stage.rings.entries()) {
@@ -898,6 +915,56 @@ test('stage geometry holds for every zone count', async ({ page }, info) => {
     }
     expect(meets, `${where}: cross-zone routes that meet a third ring's discs`).toEqual([]);
     console.log(`${where}: the nearest route clears a third ring's discs by ${nearest.toFixed(1)} px`);
+
+    // Every beam the renderer drew bends through the centre exactly when its
+    // nodes' zones differ. The zones come from the grid rows, the engine's
+    // truth, never from the renderer's own flags. A Step can reflow the page and
+    // move the stage's centre, so only the beams a Step drew are read, against
+    // the centre the renderer published throughout it; a Step that moved the
+    // centre is stepped past.
+    const drawn = (since: number) =>
+      page.locator('.stage canvas').evaluate(
+        (
+          c: HTMLCanvasElement & {
+            beams?: { len: number; start: Float64Array; src: Int32Array; dst: Int32Array; route: Float32Array };
+          },
+          since: number,
+        ) => {
+          const pool = c.beams;
+          if (pool === undefined) throw new Error('the stage publishes no beam pool');
+          const beams = Array.from({ length: pool.len }, (_, i) => ({
+            start: pool.start[i],
+            src: pool.src[i],
+            dst: pool.dst[i],
+            route: Array.from(pool.route.subarray(i * 6, i * 6 + 6)),
+          }));
+          return { centre: c.dataset.centre ?? '', beams: beams.filter((b) => b.start >= since) };
+        },
+        since,
+      );
+    const zoneOf = new Map(spots.map((s) => [s.id, s.zone]));
+    const crosses = (b: { src: number; dst: number }): boolean => zoneOf.get(b.src) !== zoneOf.get(b.dst);
+    let beams: { src: number; dst: number; route: number[] }[] = [];
+    let centre: Point = stage.centre;
+    for (let i = 0; i < 10 && !beams.some(crosses); i++) {
+      const before = await page
+        .locator('.stage canvas')
+        .evaluate((c: HTMLCanvasElement) => ({ centre: c.dataset.centre ?? '', since: performance.now() }));
+      await step(page);
+      const after = await drawn(before.since);
+      beams = after.centre === before.centre ? after.beams : [];
+      centre = JSON.parse(after.centre) as Point;
+    }
+    expect(beams.some(crosses), `${where}: a Step drew a cross-zone beam`).toBe(true);
+    for (const b of beams) {
+      const [fx, fy, cx, cy, tx, ty] = b.route;
+      const want = crosses(b) ? centre : { x: (fx + tx) / 2, y: (fy + ty) / 2 };
+      expect(
+        Math.hypot(cx - want.x, cy - want.y),
+        `${where}: the beam from node ${b.src} to node ${b.dst} bends ${crosses(b) ? 'off the centre' : 'off its own segment'}`,
+      ).toBeLessThan(0.01);
+    }
+    console.log(`${where}: checked the route of ${beams.length} drawn beam(s)`);
   }
 });
 
