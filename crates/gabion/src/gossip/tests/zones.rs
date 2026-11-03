@@ -1394,6 +1394,117 @@ fn restarted_node_greets_discovered_peers_for_its_sweep() {
     }
 }
 
+/// A joiner whose first packets name no zone, since it reads its own
+/// EndpointSlice entry a moment after it starts, keeps at every peer the zone
+/// discovery gave it. Once it knows its zone it sends an idle peer of another
+/// zone nothing more, so that peer must never hold it as a zone peer.
+#[test]
+fn joiner_heard_before_it_knows_its_zone_keeps_its_discovered_zone() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = addrs(49_900, 5);
+        let (zones, j) = (["a", "a", "b", "b"], addrs[4]);
+        let mut nodes: Vec<_> = (0..4)
+            .map(|i| zoned_node(&router, &addrs[..4], &zones, i))
+            .collect();
+        run_for(500).await;
+        for node in &nodes {
+            node.tell(placed(j, "a"));
+        }
+        let taps = Taps::default();
+        let tap = Tap {
+            inner: router.bind(j),
+            sent: taps.clone(),
+        };
+        let joiner = kubernetes_node(tap, j, id(4, 1), &[]);
+        for (&addr, name) in addrs.iter().zip(zones) {
+            joiner.tell(placed(addr, name));
+        }
+        let (zone_a, zone_b) = (&nodes[..2], &nodes[2..]);
+        let mut waited = 0;
+        loop {
+            let mut heard = true;
+            for node in zone_b {
+                heard &= node.peer(j).await.node_id.is_some();
+            }
+            if heard {
+                break;
+            }
+            assert!(waited < 100, "zone b heard the joiner within 100 ms");
+            run_for(1).await;
+            waited += 1;
+        }
+        let sent: Vec<_> = tapped(&taps, 0)
+            .into_iter()
+            .filter(|(dst, _)| addrs[2..4].contains(dst))
+            .map(|(_, header)| header.sender_zone)
+            .collect();
+        assert!(
+            !sent.is_empty() && sent.iter().all(Option::is_none),
+            "{sent:?}"
+        );
+        joiner.tell(own_entry("a"));
+        for _ in 0..100 {
+            for node in zone_b {
+                let peer = node.peer(j).await;
+                assert_eq!(peer.zone, PeerZone::Other(zone("a")), "{}", node.addr);
+                let routed = matches!(peer.role, Role::Gateway | Role::Remote);
+                assert!(routed, "{}: {:?}", node.addr, peer.role);
+            }
+            run_for(10).await;
+        }
+        for node in zone_a {
+            let peer = node.peer(j).await;
+            let held = (peer.zone, peer.role);
+            assert_eq!(held, (PeerZone::Same, Role::Zone), "{}", node.addr);
+        }
+        joiner.hits(0..3).await;
+        nodes[2].hits(10..13).await;
+        run_for(1_000).await;
+        nodes.push(joiner);
+        assert_totals(&nodes.iter().collect::<Vec<_>>(), 6);
+        stop_all(nodes).await;
+    });
+}
+
+/// A node that never learns its zone sends every peer its own stream
+/// directly. A peer of another zone keeps the zone discovery gave the node,
+/// yet acks that stream, so the node never suspects it.
+#[test]
+fn node_that_never_learns_its_zone_is_acked_across_zones() {
+    run_paused(async {
+        let router = SimRouter::new();
+        let addrs = addrs(49_920, 5);
+        let (zones, x) = (["a", "a", "b", "b"], addrs[4]);
+        let mut nodes: Vec<_> = (0..4)
+            .map(|i| zoned_node(&router, &addrs[..4], &zones, i))
+            .collect();
+        run_for(500).await;
+        for node in &nodes {
+            node.tell(placed(x, "a"));
+        }
+        let xn = kubernetes_node(router.bind(x), x, id(4, 1), &[]);
+        for (&addr, name) in addrs.iter().zip(zones) {
+            xn.tell(placed(addr, name));
+        }
+        run_for(500).await;
+        xn.hits(0..3).await;
+        // Past `gossip.suspect_after` (2 s): an unacked stream would be
+        // suspect.
+        run_for(3_000).await;
+        for node in &nodes[2..] {
+            let held = node.peer(x).await.zone;
+            assert_eq!(held, PeerZone::Other(zone("a")), "{}", node.addr);
+            let peer = xn.peer(node.addr).await;
+            let state = (peer.answer, peer.own_unacked);
+            assert_eq!(state, (AnswerState::Settled, 0), "{}", node.addr);
+        }
+        nodes.push(xn);
+        assert_totals(&nodes.iter().collect::<Vec<_>>(), 3);
+        stop_all(nodes).await;
+    });
+}
+
 // -- scripted peers -----------------------------------------------------------
 
 /// Wake the scripted runtime to read what was just queued.

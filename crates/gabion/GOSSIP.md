@@ -111,9 +111,11 @@ a peer's zone or answer state changes (`PeerTable::refresh` in
 | `remote` | Any other member of a remote zone | Acks only. |
 | `incompatible` | A peer that speaks another wire version | Nothing, until a packet of this version arrives from it. |
 
-A peer's zone is the one its headers announce once it is heard, even none;
-until then it is the zone discovery reported for it (a Kubernetes
-EndpointSlice endpoint's `zone`).
+A peer's zone is the one its headers name. Until one does, it is the zone
+discovery reported for it (a Kubernetes EndpointSlice endpoint's `zone`), if
+any, or after the peer restarts at the same address, the zone it had: a header
+naming no zone means the peer does not know its own yet, so it moves nothing.
+A named zone holds until the peer restarts.
 
 ### Choosing a gateway: rendezvous hashing
 
@@ -238,8 +240,10 @@ range through the head, so cells that expired unsent are not owed.
 
 The receiver keeps `have`, the highest position it holds contiguously, and
 returns it on every packet it sends back, or alone at its next heartbeat.
-A packet above `have` opens a gap (a direct one from a peer of another
-zone, sent before it heard this node's zone, is merged but opens none):
+A packet above `have` opens a gap (a direct one from a peer whose header
+names another zone, sent before it heard this node's zone, is merged but
+opens none; one whose header names no zone does not know its own, and is
+tracked and acked like a zone peer's):
 after one relay floor (`min_emit_interval`) the receiver reports it, and the
 sender rewinds to the report's ack and resends on a prompt round. A gap
 reported four times without progress is abandoned until the next packet
@@ -446,9 +450,9 @@ drops any combination the format forbids. A node sends its own stream as
 `Ack`, and join sweeps as `SweepRequest` and `Sweep`; every data kind it
 receives merges the same way. `sender_zone` is the low 32 bits of the
 stable hash of the sender's zone name (`gabion::zone::ZoneName`), never 0;
-0 means the sender has no zone. A node takes each peer's zone from that
-peer's headers; until it has heard the peer, it uses the zone discovery
-reports for it, if any.
+0 means the sender knows no zone. A node takes each peer's zone from the
+first of that peer's headers that names one; until then it uses the zone
+discovery reports for it, if any.
 
 `ack_incarnation` is the addressee's incarnation as the sender knows it (0
 before it has heard the addressee); the acks apply only when it matches.

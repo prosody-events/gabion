@@ -25,9 +25,9 @@ pub trait PeerDiscovery {
 pub struct Peer {
     pub addr: SocketAddr,
     /// The zone discovery saw for the peer (a Kubernetes EndpointSlice
-    /// endpoint's `zone`), if any. The runtime routes a peer by it only until
-    /// it first hears from the peer; from then on the peer's headers' zone,
-    /// even none, wins.
+    /// endpoint's `zone`), if any. The runtime routes a peer by it until one
+    /// of the peer's headers names a zone, which then wins; a header naming
+    /// none moves nothing.
     pub zone: Option<ZoneHash>,
 }
 

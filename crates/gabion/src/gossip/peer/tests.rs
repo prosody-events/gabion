@@ -641,8 +641,8 @@ impl Arbitrary for RefreshCase {
 /// live members by weight, then suspects by the earliest suspicion, then the
 /// address. The zone table is sized to the rows, so the one-zone-per-peer
 /// case fills it exactly; a zone discovery named routes an unheard row as a
-/// heard one's would, a heard header's zone, even none, replaces it, and a row
-/// neither heard nor placed keeps `Unheard`.
+/// heard one's would, a heard header's zone replaces it when the header names
+/// one, and a row neither heard nor placed keeps `Unheard`.
 #[quickcheck]
 fn role_refresh_equals_brute_force(case: RefreshCase) {
     // At `NOW` an `Owed` answer from 40 ms or earlier is suspect, and every
@@ -679,7 +679,8 @@ fn role_refresh_equals_brute_force(case: RefreshCase) {
     table.refresh(NOW, |_| {});
     let zone_of = |row: usize| {
         let (z, _, _, heard, p) = case.rows[row];
-        if heard { z } else { p }
+        // A header naming no zone keeps the one discovery named.
+        if heard && z != 0 { z } else { p }
     };
     let known = |row: usize| case.rows[row].3 || case.rows[row].4 != 0;
     let eligible = |row: usize| {
@@ -995,8 +996,9 @@ fn first_heard_row_rewinds_its_own_stream() {
 /// greeting, and in another it is that zone's gateway when it outranks the
 /// heard members, owed none; one placed in no zone stays unheard. Its header
 /// then wins: the same zone changes nothing, another zone re-roles it, and
-/// discovery re-reporting a zone, or another one, moves only a peer not yet
-/// heard, and an unheard one routed to another zone owes no greeting.
+/// discovery re-reporting a zone, or another one, moves only a peer whose
+/// headers named no zone, and an unheard one routed to another zone owes no
+/// greeting.
 #[test]
 fn discovered_zone_routes_a_peer_until_its_header_wins() {
     let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
@@ -1055,6 +1057,118 @@ fn discovered_zone_routes_a_peer_until_its_header_wins() {
     assert_eq!(table.insert(placed(late, 1), 5), Insert::Present);
     table.refresh(10, |_| {});
     assert_eq!(roles(&table, &[late]), [Role::Zone]);
+}
+
+/// A peer heard before it knows its own zone keeps the zone discovery gave
+/// it: a header naming no zone moves nothing, so each row keeps the role that
+/// zone gives it, and discovery may still move it. A header naming a zone,
+/// on a later packet too, then wins, and holds for the incarnation.
+#[test]
+fn zoneless_header_keeps_the_discovered_zone() {
+    let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+    let mut ranked = [addr(2), addr(4)];
+    ranked.sort_by_key(|&a| Reverse(rendezvous_weight(7, a)));
+    let [hi, lo] = ranked;
+    let (same, unplaced) = (addr(6), addr(8));
+    let placed = |addr, raw| Peer {
+        addr,
+        zone: Some(zone(raw)),
+    };
+    let roles = |table: &PeerTable| -> Vec<Role> { (0..4).map(|row| table.role(row)).collect() };
+    for peer in [
+        placed(same, 1),
+        placed(hi, 2),
+        placed(lo, 2),
+        Peer::new(unplaced),
+    ] {
+        assert_eq!(table.insert(peer, 5), Insert::Added);
+    }
+    table.refresh(0, |_| {});
+    let routed = [Role::Zone, Role::Gateway, Role::Remote, Role::Unheard];
+    assert_eq!(roles(&table), routed);
+    for (row, node) in (0..4).zip(1..) {
+        let first = table.contact(row, NodeIdentity::new(NodeId(node), 1), None);
+        assert_eq!(first, Contact::First);
+    }
+    // Only the row discovery placed in no zone changes: `Unheard` to `Zone`.
+    assert_eq!(table.refresh(0, |_| {}), 1);
+    assert_eq!(
+        roles(&table),
+        [Role::Zone, Role::Gateway, Role::Remote, Role::Zone]
+    );
+    let zones: Vec<_> = (0..4).map(|row| table.link(row).zone()).collect();
+    assert_eq!(zones, [Some(zone(1)), Some(zone(2)), Some(zone(2)), None]);
+
+    // Discovery still moves a row whose headers named no zone.
+    assert_eq!(table.insert(placed(unplaced, 3), 5), Insert::Present);
+    table.refresh(0, |_| {});
+    assert_eq!(table.role(3), Role::Gateway);
+
+    // A later header naming another zone re-roles the row, and that zone holds.
+    let lo_id = NodeIdentity::new(NodeId(3), 1);
+    assert_eq!(table.contact(2, lo_id, Some(zone(1))), Contact::Current);
+    assert_eq!(table.refresh(0, |_| {}), 1);
+    assert_eq!(table.role(2), Role::Zone);
+    assert_eq!(table.contact(2, lo_id, None), Contact::Current);
+    assert_eq!(table.insert(placed(lo, 2), 5), Insert::Present);
+    assert_eq!(table.link(2).zone(), Some(zone(1)));
+    assert!(!table.stale());
+}
+
+/// A new incarnation at the same address resets the row but keeps its zone
+/// as provisional: a first header naming no zone keeps its role, a late
+/// packet from the incarnation before still changes nothing, and a later
+/// header naming another zone re-roles it.
+#[test]
+fn restart_keeps_the_zone_provisionally() {
+    let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+    table.insert(Peer::new(addr(2)), 0);
+    let old = NodeIdentity::new(NodeId(9), 1);
+    let new = NodeIdentity::new(NodeId(9), 2);
+    table.contact(0, old, Some(zone(2)));
+    table.refresh(0, |_| {});
+    assert_eq!(table.role(0), Role::Gateway);
+
+    assert_eq!(table.contact(0, new, None), Contact::Restarted);
+    let link = *table.link(0);
+    assert_eq!((link.identity(), link.zone()), (Some(new), Some(zone(2))));
+    assert_eq!(link.prev_incarnation, Some(1));
+    assert_eq!(table.refresh(0, |_| {}), 0);
+    assert_eq!(table.role(0), Role::Gateway);
+
+    assert_eq!(table.contact(0, old, Some(zone(1))), Contact::Late);
+    assert_eq!(table.link(0).zone(), Some(zone(2)));
+    assert_eq!(table.contact(0, new, Some(zone(1))), Contact::Current);
+    assert_eq!(table.refresh(0, |_| {}), 1);
+    assert_eq!(table.role(0), Role::Zone);
+}
+
+/// A direct own range from a peer whose header named another zone is merged
+/// but not tracked, since that peer stops once it hears this node's zone; one
+/// from a peer discovery placed in another zone whose header named none is
+/// tracked and owes an ack, since that peer does not know its zone and keeps
+/// sending every peer its own stream directly.
+#[test]
+fn zoneless_sender_of_another_zone_is_acked() {
+    let mut table = PeerTable::with_capacity(CAPACITY, 7, Some(zone(1)), RTO, SUSPECT_AFTER);
+    let peer = Peer {
+        addr: addr(2),
+        zone: Some(zone(2)),
+    };
+    table.insert(peer, 0);
+    table.refresh(0, |_| {});
+    let id = NodeIdentity::new(NodeId(9), 1);
+    table.contact(0, id, None);
+    table.set_flag(0, PeerFlags::ACK_DUE, false);
+    table.receive_own(0, range(0, 3), false, 1_000, FLOOR);
+    assert_eq!(table.link(0).own_ack(), OwnAck::Direct(3));
+    assert!(table.flags(0).has(PeerFlags::ACK_DUE));
+
+    table.set_flag(0, PeerFlags::ACK_DUE, false);
+    table.contact(0, id, Some(zone(2)));
+    table.receive_own(0, range(3, 5), false, 1_000, FLOOR);
+    assert_eq!(table.link(0).own_ack(), OwnAck::Direct(3));
+    assert!(!table.flags(0).has(PeerFlags::ACK_DUE));
 }
 
 /// A zone row's suspicion is a stalled relay, and counts toward
