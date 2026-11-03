@@ -95,8 +95,32 @@ comparator's mean). The rules, with the study's ten error metrics
 or "Every rule passes.", the measured cost ratios of G-a3 beside the 0.93 the
 design predicted, and the `git diff` of `adapter.rs` and `Cargo.toml` from the
 baselines (both carry H1's copy) to zone. Read that diff: the adapter is outside the core hash, so
-the diff is where a change to what the adapter does shows. It exits 1 when a
-rule fails.
+the diff is where a change to what the adapter does shows. Between the cost
+ratios and the diff sits the cost-model section below. It exits 1 when a rule
+fails.
+
+**§6.5's cost model (not gating).** Per regime, `gate.md` sets the zone arm's
+measured mean and credible interval beside what the zone gossip design doc's
+§6.5 predicts: packets, bytes and cross-zone bytes per node per second against
+equation (6.3), convergence p99 against (6.5) and peak live cells against
+(6.10). Each prediction reads the regime's JSON, the zone arm's measured
+admitted rate, and the defaults and wire sizes named at the top of `gate.py`;
+`test_gate.py` checks those constants against their Rust sources. A metric
+more than 5 % off its prediction is named under its table with the setting the
+equation sizes (the quantum or `gossip.tick_interval` for (6.3), the tick for
+(6.5), `STORAGE_MAX_CELLS` for (6.10)), and the owner decides whether the
+default or the model is wrong. (6.3)'s `a`, the acknowledgements sent alone,
+has no equation: the prediction counts only its cross-zone part, each node
+acking its `Z − 1` remote origins at its heartbeat. Cross-zone bytes per node
+per second is the judge's `cross_az_bytes_per_node_s`, the window's cross-AZ
+bytes over the running-pod integral, as `bytes_per_node_s` divides. Peak live
+cells is the judge's `peak_cells`, the most active cells any node reported in
+the core's health snapshots, taken every 5 s.
+`gateway_failovers` reads `missing`: the result is the core's and does not
+carry it. Beside it stands §6.5.8's chance that an episode ends in a false
+suspicion, at `n_a` attempts and at its floor `n_a − 1`, which
+`gossip.suspect_after` sizes. A missing value is never a pass. The section
+never changes the exit code; `gate.py` prints how many comparisons miss.
 
 The core hash is `judge.core_hash(tree, repo)`: SHA-1 over the harness tree's
 entries without the paths the judge exempts. It is unchanged by edits to

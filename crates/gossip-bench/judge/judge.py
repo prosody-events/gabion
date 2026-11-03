@@ -255,6 +255,14 @@ def rss_mib(result: dict):
     return p["max_rss_bytes"] / 2**20 if "max_rss_bytes" in p else None
 
 
+def cross_az_per_node_s(result: dict):
+    """Cross-AZ bytes per node per second of the measurement window, divided
+    by the running-pod integral as the core divides `bytes_per_node_s`."""
+    sent, node_s = (dig(result, "network.measure.cross_az_bytes"),
+                    dig(result, "windows.node_seconds_measure"))
+    return sent / node_s if sent is not None and node_s else None
+
+
 # (key, label, extractor). Lower is better for every metric except those in
 # HIGHER_IS_BETTER.
 METRICS = [
@@ -270,6 +278,7 @@ METRICS = [
      lambda r: dig(r, "network.measure_bytes_per_admitted")),
     ("cross_az_bytes", "Cross-AZ bytes, measurement window",
      lambda r: dig(r, "network.measure.cross_az_bytes")),
+    ("cross_az_bytes_per_node_s", "Cross-AZ bytes per node per second", cross_az_per_node_s),
     ("stale_limited_mean", "Staleness, limited keys: signed mean, truth - view (hits)",
      lambda r: dig(r, "staleness.limited.mean")),
     ("stale_limited_p99", "Staleness, limited keys: p99 (hits)",
@@ -424,6 +433,7 @@ RESOLUTION = {
         1.0),
     "bytes_per_node_s": one_count_per("windows.node_seconds_measure"),
     "packets_per_node_s": one_count_per("windows.node_seconds_measure"),
+    "cross_az_bytes_per_node_s": one_count_per("windows.node_seconds_measure"),
     "bytes_per_admitted": one_count_per("traffic.measure.admitted"),
     "stale_limited_p99_pct": one_hit_of_limit,
     "over_max_pct": one_hit_of_limit,
