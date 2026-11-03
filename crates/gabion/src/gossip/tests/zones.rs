@@ -1870,12 +1870,12 @@ fn cannot_relay_from_a_zone_row_is_ignored() {
             let s = sock(2);
             let wire = Rc::new(Wire::default());
             let (client, admin) = scripted(&wire, vec![s], local, |_| {}).await;
-            let flagged = AckInfo {
+            let cannot_relay = AckInfo {
                 cannot_relay: true,
                 ..AckInfo::default()
             };
             let page = CellPayload::Sweep.into();
-            inject_zoned(&wire, s, node(0xB), Some(zone("a")), flagged, page);
+            inject_zoned(&wire, s, node(0xB), Some(zone("a")), cannot_relay, page);
             heartbeats(1).await;
             hit(&client, 1).await;
             let mark = wire.attempts.borrow().len();
@@ -1885,7 +1885,7 @@ fn cannot_relay_from_a_zone_row_is_ignored() {
                     s,
                     node(0xB),
                     Some(zone("a")),
-                    flagged,
+                    cannot_relay,
                     Payload::Ack { probe: false },
                 );
                 heartbeats(1).await;
