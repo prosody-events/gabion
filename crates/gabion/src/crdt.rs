@@ -60,17 +60,47 @@ use crate::throttle;
 /// Application-level rule identifier — opaque to the CRDT.
 pub type RuleId = u32;
 
-/// Bucket index = `now_millis / rule.bucket_millis`.
-pub type BucketEpoch = u32;
+/// A rule's bucket: `now_millis / bucket_millis`, cut to `u32`. Epochs wrap,
+/// so they carry no order; age one against another with serial-number
+/// arithmetic (`wrapping_sub` on the inner value, read as `i32`).
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct BucketEpoch(pub u32);
+
+impl BucketEpoch {
+    /// The epoch of the unwrapped bucket number `bucket`: the cut to `u32`
+    /// is the wrap.
+    pub fn wrap(bucket: u64) -> Self {
+        Self(bucket as u32)
+    }
+}
 
 /// Node incarnation counter — distinguishes successive instances of one node.
 pub type Incarnation = u32;
 
-/// Interned rule slot. Index into [`RuleDictionary`].
-pub type RuleSlot = u16;
+/// Interned rule slot: an index into [`RuleDictionary`], which alone hands
+/// one out.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RuleSlot(u16);
 
-/// Interned `(node_id, incarnation)` slot. Index into [`NodeDictionary`].
-pub type NodeSlot = u16;
+impl RuleSlot {
+    /// The slot's row in its dictionary's columns.
+    pub fn index(self) -> usize {
+        usize::from(self.0)
+    }
+}
+
+/// Interned `(node_id, incarnation)` slot: an index into [`NodeDictionary`],
+/// which alone hands one out.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NodeSlot(u16);
+
+impl NodeSlot {
+    /// The slot's row in its dictionary's columns.
+    pub fn index(self) -> usize {
+        usize::from(self.0)
+    }
+}
 
 /// Application-level key identity, hashed to 128 bits.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -385,10 +415,10 @@ impl CellStore {
         node_dictionary.inc_ref(local_node_slot);
 
         let mut store = Self {
-            rules: vec![0_u16; cap as usize].into_boxed_slice(),
+            rules: vec![RuleSlot(0); cap as usize].into_boxed_slice(),
             key_hashes: vec![KeyHash(0); cap as usize].into_boxed_slice(),
-            buckets: vec![0_u32; cap as usize].into_boxed_slice(),
-            origins: vec![0_u16; cap as usize].into_boxed_slice(),
+            buckets: vec![BucketEpoch(0); cap as usize].into_boxed_slice(),
+            origins: vec![NodeSlot(0); cap as usize].into_boxed_slice(),
             incarnations: vec![0_u32; cap as usize].into_boxed_slice(),
 
             counts: vec![0_u32; cap as usize].into_boxed_slice(),
@@ -465,11 +495,6 @@ impl CellStore {
 
     pub fn node_dictionary(&self) -> &NodeDictionary {
         &self.node_dictionary
-    }
-
-    #[cfg(test)]
-    pub(crate) fn index(&self) -> &CellIndex {
-        &self.index
     }
 
     pub fn stats(&self) -> CellStoreStats {
@@ -683,7 +708,7 @@ impl CellStore {
         self.rule_dictionary.dec_ref(rule);
         let freed_node = self.node_dictionary.dec_ref(origin);
         if freed_node {
-            self.next_sequence_by_origin[origin as usize] = 0;
+            self.next_sequence_by_origin[origin.index()] = 0;
         }
         self.free_slot(slot);
     }
@@ -766,7 +791,7 @@ impl CellStore {
     /// never reused.
     pub fn head(&self, stream: Stream) -> u64 {
         match stream {
-            Stream::Own => self.next_sequence_by_origin[self.local_node_slot as usize],
+            Stream::Own => self.next_sequence_by_origin[self.local_node_slot.index()],
             Stream::Relay => self.relay_head,
         }
     }
@@ -823,7 +848,7 @@ impl CellStore {
     // -- Update primitives --------------------------------------------------
 
     fn next_origin_sequence(&mut self, origin: NodeSlot) -> u64 {
-        let seq = &mut self.next_sequence_by_origin[origin as usize];
+        let seq = &mut self.next_sequence_by_origin[origin.index()];
         *seq = seq.saturating_add(1);
         *seq
     }
@@ -1084,11 +1109,11 @@ impl CellStore {
             if !self.is_active(slot) {
                 continue;
             }
-            let expired = match ages.get(self.rules[slot as usize] as usize) {
+            let expired = match ages.get(self.rules[slot as usize].index()) {
                 // Serial-number age, so the comparison holds across the `u32`
                 // epoch wrap; a window spans fewer than 2^31 buckets.
                 Some(&RuleAge::Epoch { current, live }) => {
-                    current.wrapping_sub(self.buckets[slot as usize]) as i32 > live as i32
+                    current.0.wrapping_sub(self.buckets[slot as usize].0) as i32 > live as i32
                 }
                 Some(&RuleAge::Idle { since_ms }) => {
                     self.last_update_millis[slot as usize] < since_ms
@@ -1120,7 +1145,7 @@ impl CellStore {
         );
         let idle_ms = u64::from(RuleDescriptor::default().window_millis);
         for (slot, age) in self.expire_ages_scratch.iter_mut().enumerate() {
-            *age = match self.rule_dictionary.descriptor(slot as RuleSlot) {
+            *age = match self.rule_dictionary.descriptor(RuleSlot(slot as u16)) {
                 Some(d) if d.applies_locally => RuleAge::Epoch {
                     current: d.current_epoch(now_millis),
                     live: d.live_buckets(),

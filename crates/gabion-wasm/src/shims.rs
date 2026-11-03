@@ -81,7 +81,7 @@ impl AggregateStore for EventEmittingAggregateStore {
                     node: self.node,
                     rule: key.rule_fingerprint,
                     key: key.key_hash.0,
-                    bucket: key.bucket,
+                    bucket: key.bucket.0,
                     count: current,
                 }
             } else {
@@ -89,7 +89,7 @@ impl AggregateStore for EventEmittingAggregateStore {
                     node: self.node,
                     rule: key.rule_fingerprint,
                     key: key.key_hash.0,
-                    bucket: key.bucket,
+                    bucket: key.bucket.0,
                     count: current,
                 }
             };
@@ -109,7 +109,7 @@ impl AggregateStore for EventEmittingAggregateStore {
                 node: self.node,
                 rule: key.rule_fingerprint,
                 key: key.key_hash.0,
-                bucket: key.bucket,
+                bucket: key.bucket.0,
             });
         }
     }

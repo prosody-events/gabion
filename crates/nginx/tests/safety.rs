@@ -31,7 +31,7 @@ use std::thread;
 use std::time::Duration;
 
 use gabion::crdt::ValidStorageConfig;
-use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
+use gabion::crdt::{BucketEpoch, CellHandle, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
 use gabion::gossip::AggregateStore;
 use gabion::rules::{EnforcementMode, Rule, RuleDef, hash_key};
 use gabion::settings::Settings;
@@ -189,7 +189,7 @@ fn deltas_and_expirations(
         let key = CellIdentity {
             rule_fingerprint: rule.fingerprint(),
             key_hash: kh,
-            bucket,
+            bucket: BucketEpoch(bucket),
         };
         d.handles.push(CellHandle::default());
         d.keys.push(key);
@@ -202,7 +202,7 @@ fn deltas_and_expirations(
         let key = CellIdentity {
             rule_fingerprint: rule.fingerprint(),
             key_hash: kh,
-            bucket,
+            bucket: BucketEpoch(bucket),
         };
         e.handles.push(CellHandle::default());
         e.keys.push(key);
@@ -261,7 +261,9 @@ fn leader_stamps_incarnation_and_applies_deltas() {
 
     // Workers should read the new value through the seqlock-protected view.
     let view = region.aggregate();
-    let cell = view.get(rule.fingerprint(), key_hash.0, 3).expect("found");
+    let cell = view
+        .get(rule.fingerprint(), key_hash.0, BucketEpoch(3))
+        .expect("found");
     assert_eq!(cell.count, 5);
 }
 
@@ -277,7 +279,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert_eq!(
         region
             .aggregate()
-            .get(rule.fingerprint(), kh.0, 1)
+            .get(rule.fingerprint(), kh.0, BucketEpoch(1))
             .unwrap()
             .count,
         7
@@ -289,7 +291,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert_eq!(
         region
             .aggregate()
-            .get(rule.fingerprint(), kh.0, 1)
+            .get(rule.fingerprint(), kh.0, BucketEpoch(1))
             .unwrap()
             .count,
         4
@@ -301,7 +303,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert!(
         region
             .aggregate()
-            .get(rule.fingerprint(), kh.0, 1)
+            .get(rule.fingerprint(), kh.0, BucketEpoch(1))
             .is_none()
     );
 }
@@ -381,11 +383,11 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
             thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     let view = region.aggregate();
-                    if let Some(cell) = view.get(fp, steady.0, 0) {
+                    if let Some(cell) = view.get(fp, steady.0, BucketEpoch(0)) {
                         assert_eq!(cell.count, u64::from(STEADY));
                     }
                     for bucket in 1..=8 {
-                        if let Some(cell) = view.get(fp, steady.0, bucket) {
+                        if let Some(cell) = view.get(fp, steady.0, BucketEpoch(bucket)) {
                             assert_eq!(cell.count, u64::from(bucket));
                         }
                     }
@@ -408,10 +410,12 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
 
     let view = region.aggregate();
     assert_eq!(
-        view.get(fp, steady.0, 0).expect("steady").count,
+        view.get(fp, steady.0, BucketEpoch(0))
+            .expect("steady")
+            .count,
         u64::from(STEADY)
     );
-    assert!((1..=8).all(|bucket| view.get(fp, steady.0, bucket).is_none()));
+    assert!((1..=8).all(|bucket| view.get(fp, steady.0, BucketEpoch(bucket)).is_none()));
 }
 
 // -- 5. Lease takeover under contention ------------------------------------
@@ -539,7 +543,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
             let r = region;
             let view = r.aggregate();
             while !reader_stop.load(Ordering::Acquire) {
-                let _ = view.get(fingerprint, key_hash.0, bucket);
+                let _ = view.get(fingerprint, key_hash.0, BucketEpoch(bucket));
             }
         }));
     }
@@ -557,7 +561,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
 
     let final_view = region.aggregate();
     let cell = final_view
-        .get(fingerprint, key_hash.0, bucket)
+        .get(fingerprint, key_hash.0, BucketEpoch(bucket))
         .expect("aggregate cell present");
     assert_eq!(cell.count, TOTAL);
 }
@@ -641,7 +645,7 @@ fn decide_all_and_leader_apply_concurrent() {
     assert!(
         region
             .aggregate()
-            .get(spec.fingerprint, key_hash.0, 0)
+            .get(spec.fingerprint, key_hash.0, BucketEpoch(0))
             .is_none()
     );
 }

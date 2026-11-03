@@ -18,9 +18,9 @@ use ahash::AHashMap;
 use anyhow::Result;
 use futures::StreamExt;
 use gabion::aggregate::Aggregate;
-pub use gabion::crdt::BucketEpoch;
 use gabion::crdt::{
-    CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity, ValidStorageConfig,
+    BucketEpoch, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
+    ValidStorageConfig,
 };
 pub(super) use gabion::defaults as d;
 use gabion::discovery::{Peer, PeerEvent};
@@ -106,7 +106,7 @@ pub struct NodeStore {
     identity: Rc<Identity>,
     counts: Aggregate,
     /// `(tracked index, bucket)` rows touched since the driver last looked.
-    touched: RefCell<Vec<(u32, BucketEpoch)>>,
+    touched: RefCell<Vec<(u32, u32)>>,
     /// Rows under the regime's rule for a key the regime never issued. Always
     /// zero for a correct solution.
     pub foreign_rows: Cell<u64>,
@@ -132,15 +132,15 @@ impl NodeStore {
             .window_total(self.identity.rule, hash, now_millis)
     }
 
-    pub fn bucket_count(&self, key: u32, bucket: BucketEpoch) -> u32 {
+    pub fn bucket_count(&self, key: u32, bucket: u32) -> u32 {
         let hash = self.identity.hashes[key as usize];
         self.counts
             .table()
-            .get(self.identity.rule.fingerprint, hash.0, bucket)
+            .get(self.identity.rule.fingerprint, hash.0, BucketEpoch(bucket))
             .map_or(0, |cell| cell.count.min(u64::from(u32::MAX)) as u32)
     }
 
-    pub fn take_touched(&self, into: &mut Vec<(u32, BucketEpoch)>) {
+    pub fn take_touched(&self, into: &mut Vec<(u32, u32)>) {
         into.clear();
         std::mem::swap(into, &mut self.touched.borrow_mut());
     }
@@ -157,7 +157,7 @@ impl NodeStore {
         };
         let tracked = self.keys.tracked_of[key as usize];
         if tracked != NOT_TRACKED {
-            self.touched.borrow_mut().push((tracked, bucket));
+            self.touched.borrow_mut().push((tracked, bucket.0));
         }
     }
 }
@@ -200,7 +200,7 @@ impl Node {
     pub fn record(
         &self,
         key: u32,
-        bucket: BucketEpoch,
+        bucket: u32,
         now_millis: u64,
     ) -> impl Future<Output = bool> + use<> {
         let client = self.client.clone();
@@ -208,7 +208,14 @@ impl Node {
         let hash = self.identity.hashes[key as usize];
         async move {
             client
-                .record(rule.fingerprint, hash, bucket, 1, rule.limit, now_millis)
+                .record(
+                    rule.fingerprint,
+                    hash,
+                    BucketEpoch(bucket),
+                    1,
+                    rule.limit,
+                    now_millis,
+                )
                 .await
                 .is_ok()
         }

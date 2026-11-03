@@ -9,7 +9,7 @@ use std::task::{Context, Poll, Waker};
 
 use anyhow::Result;
 
-use super::adapter::{BucketEpoch, Launched, Node, NodeStore};
+use super::adapter::{Launched, Node, NodeStore};
 use super::net::Network;
 use super::node::{KeyKind, KeySpace, Sizing};
 use super::oracle::{Class, Oracle};
@@ -99,7 +99,7 @@ pub struct Driver<'r, F, L> {
     key_traffic: Vec<TrafficCounts>,
     node_health: Vec<NodeHealth>,
     health: Health,
-    touched: Vec<(u32, BucketEpoch)>,
+    touched: Vec<(u32, u32)>,
     warnings: Warnings,
     events: u64,
     polls: u64,

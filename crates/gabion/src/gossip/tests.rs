@@ -70,11 +70,11 @@ impl InMemoryAggregateStore {
         self.apply_calls.borrow().clone()
     }
 
-    pub fn snapshot(&self) -> BTreeMap<(u128, u128, BucketEpoch), u64> {
+    pub fn snapshot(&self) -> BTreeMap<(u128, u128, u32), u64> {
         self.inner
             .borrow()
             .iter()
-            .map(|((rule, key, bucket), count)| ((*rule, key.0, *bucket), *count))
+            .map(|((rule, key, bucket), count)| ((*rule, key.0, bucket.0), *count))
             .collect()
     }
 }
@@ -298,7 +298,7 @@ fn key_hash(key: u8) -> KeyHash {
     KeyHash(0x1000 + key as u128)
 }
 
-fn expected_model(records: &[SimRecord], nodes: usize) -> BTreeMap<(u128, u128, BucketEpoch), u64> {
+fn expected_model(records: &[SimRecord], nodes: usize) -> BTreeMap<(u128, u128, u32), u64> {
     let mut model = BTreeMap::new();
     for record in records {
         let node = record.node as usize % nodes;
@@ -394,7 +394,7 @@ async fn run_connected_case(case: ConnectedClusterCase) -> TestResult {
             .record(
                 rule_fp(record.rule),
                 key_hash(record.key),
-                0,
+                BucketEpoch(0),
                 record.hits as u64,
                 0,
                 0,
@@ -507,7 +507,7 @@ async fn partition_heal_violation(mut case: PartitionCase, heal_ticks: u32) -> O
             .record(
                 rule_fp(record.rule),
                 key_hash(record.key),
-                0,
+                BucketEpoch(0),
                 record.hits as u64,
                 0,
                 0,
@@ -641,11 +641,11 @@ fn foreign_cluster_packet_changes_nothing(case: ClusterCase) -> TestResult {
         let h_b = tokio::task::spawn_local(rt_b.run(futures::stream::empty()));
 
         client_a
-            .record(0xD00D, KeyHash(1), 0, case.a_hits as u64, 0, 0)
+            .record(0xD00D, KeyHash(1), BucketEpoch(0), case.a_hits as u64, 0, 0)
             .await
             .unwrap();
         client_b
-            .record(0xD00D, KeyHash(1), 0, case.b_hits as u64, 0, 0)
+            .record(0xD00D, KeyHash(1), BucketEpoch(0), case.b_hits as u64, 0, 0)
             .await
             .unwrap();
         sim_advance_ticks(Duration::from_millis(100), 20).await;
@@ -708,7 +708,7 @@ fn quickcheck_sim_tick_expiration_removes_converged_cells(case: ExpirationCase) 
                 .record(
                     rule_fp(record.rule),
                     key_hash(record.key),
-                    0,
+                    BucketEpoch(0),
                     record.hits as u64,
                     0,
                     0,
@@ -769,7 +769,7 @@ fn quickcheck_sim_peer_membership_controls_delivery(case: MembershipCase) -> Tes
 
         tokio::task::yield_now().await;
         client_a
-            .record(0xFACE, KeyHash(1), 0, case.hits as u64, 0, 0)
+            .record(0xFACE, KeyHash(1), BucketEpoch(0), case.hits as u64, 0, 0)
             .await
             .unwrap();
         sim_advance_ticks(Duration::from_millis(100), 20).await;
@@ -816,7 +816,10 @@ async fn record_acks_after_apply() {
 
             let rule_fp: u128 = 0xDEAD_BEEF;
             let key = KeyHash(0x1234);
-            client.record(rule_fp, key, 0, 5, 0, 1_000).await.unwrap();
+            client
+                .record(rule_fp, key, BucketEpoch(0), 5, 0, 1_000)
+                .await
+                .unwrap();
 
             // Read the count back from the store handle the test holds —
             // requires looking up the rule_slot.
@@ -826,7 +829,10 @@ async fn record_acks_after_apply() {
             let totals = agg.total();
             assert_eq!(totals, 5);
 
-            client.record(rule_fp, key, 0, 3, 0, 1_000).await.unwrap();
+            client
+                .record(rule_fp, key, BucketEpoch(0), 3, 0, 1_000)
+                .await
+                .unwrap();
             let totals = agg.total();
             assert_eq!(totals, 8);
 
@@ -874,8 +880,14 @@ async fn two_runtimes_converge_on_cluster_aggregate() {
             let rule_fp: u128 = 0xC0FE;
             let key = KeyHash(0xABCD);
 
-            client_a.record(rule_fp, key, 0, 3, 0, 1_000).await.unwrap();
-            client_b.record(rule_fp, key, 0, 5, 0, 1_000).await.unwrap();
+            client_a
+                .record(rule_fp, key, BucketEpoch(0), 3, 0, 1_000)
+                .await
+                .unwrap();
+            client_b
+                .record(rule_fp, key, BucketEpoch(0), 5, 0, 1_000)
+                .await
+                .unwrap();
 
             // Drive enough virtual ticks for both directions to drain.
             sim_advance_ticks(Duration::from_millis(100), 10).await;
@@ -918,7 +930,10 @@ async fn apply_called_once_per_crdt_iteration() {
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
             // One record => one apply with deltas.len()==1.
-            client.record(0x11, KeyHash(1), 0, 4, 0, 100).await.unwrap();
+            client
+                .record(0x11, KeyHash(1), BucketEpoch(0), 4, 0, 100)
+                .await
+                .unwrap();
             let calls = agg.apply_call_lens();
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].0, 1);
@@ -966,7 +981,10 @@ async fn gossip_tick_drives_expiration() {
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
             // Hit at virtual time 0 — bucket 0.
-            client.record(0xFEED, KeyHash(7), 0, 2, 0, 0).await.unwrap();
+            client
+                .record(0xFEED, KeyHash(7), BucketEpoch(0), 2, 0, 0)
+                .await
+                .unwrap();
             assert_eq!(agg.total(), 2);
 
             // Advance past one tick + past the live window.
@@ -1003,7 +1021,7 @@ fn expiry_applies_each_full_batch_before_the_next() {
         batch.push(Observation {
             rule_fingerprint: 0xFEED,
             key_hash: KeyHash(key),
-            bucket: 0,
+            bucket: BucketEpoch(0),
             origin: NodeId(0),
             incarnation: 0,
             count: 1,
@@ -1074,7 +1092,7 @@ async fn configured_rule_reexpires_after_idle_window() {
             // First burst at bucket 0, then advance past the live window so the
             // cell ages out and (pre-fix) the rule slot is released.
             client
-                .record(0xFEED, KeyHash(7), 0, 2, 10, 0)
+                .record(0xFEED, KeyHash(7), BucketEpoch(0), 2, 10, 0)
                 .await
                 .unwrap();
             assert_eq!(agg.total(), 2);
@@ -1086,7 +1104,7 @@ async fn configured_rule_reexpires_after_idle_window() {
             // released-then-default bug it lands on a 60 s
             // descriptor and stays here forever.
             client
-                .record(0xFEED, KeyHash(7), 3, 2, 10, 300)
+                .record(0xFEED, KeyHash(7), BucketEpoch(3), 2, 10, 300)
                 .await
                 .unwrap();
             assert_eq!(agg.total(), 2);
@@ -1161,7 +1179,10 @@ async fn record_returns_after_apply_completes() {
             );
             let handle = tokio::task::spawn_local(rt.run(futures::stream::empty()));
 
-            client.record(0xABC, KeyHash(1), 0, 3, 0, 0).await.unwrap();
+            client
+                .record(0xABC, KeyHash(1), BucketEpoch(0), 3, 0, 0)
+                .await
+                .unwrap();
             // After the ack returns, apply must have completed at least once.
             let totals = agg.inner.total();
             assert_eq!(totals, 3);
@@ -1222,7 +1243,7 @@ async fn udp_round_trip_smoke() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
-            let bucket = (now_millis / 1_000) as BucketEpoch;
+            let bucket = BucketEpoch::wrap(now_millis / 1_000);
             client_a
                 .record(0xC0FE, KeyHash(0xABCD), bucket, 3, 0, now_millis)
                 .await
@@ -1287,7 +1308,7 @@ async fn admin_snapshot_reflects_runtime_state() {
 
             // One record so the cell store is non-empty when we sample.
             client
-                .record(0xFEED, KeyHash(0x42), 0, 4, 0, 100)
+                .record(0xFEED, KeyHash(0x42), BucketEpoch(0), 4, 0, 100)
                 .await
                 .unwrap();
             heartbeats(1).await;
@@ -1447,7 +1468,7 @@ fn sent_payloads(wire: &Wire, from: usize) -> Vec<(SocketAddr, Payload)> {
 /// One hit on `key` with a limit so high that no threshold round runs.
 async fn hit(client: &GossipClient, key: u128) {
     client
-        .record(0xBEE, KeyHash(key), 0, 1, 1_000_000, 0)
+        .record(0xBEE, KeyHash(key), BucketEpoch(0), 1, 1_000_000, 0)
         .await
         .unwrap();
 }
@@ -1492,7 +1513,7 @@ async fn threshold_rounds_in_a_burst(peers: Vec<SocketAddr>, refuse: bool) -> Ad
     heartbeats(1).await;
     for _ in 0..12 {
         client
-            .record(0xC0DE, KeyHash(9), 0, 1, 100, 10)
+            .record(0xC0DE, KeyHash(9), BucketEpoch(0), 1, 100, 10)
             .await
             .unwrap();
     }
@@ -1800,20 +1821,26 @@ fn two_rules_flush_independently() {
         let config = sim_config(vec![sock(2)]);
         let (client, admin, _runtime) = mocked(&wire, store_for(node(0xA)), config).await;
         // Intern both rules; a heartbeat settles them.
-        client.record(0xA, KeyHash(0), 0, 1, 100, 0).await.unwrap();
         client
-            .record(0xB, KeyHash(0), 0, 1, 1_000_000, 0)
+            .record(0xA, KeyHash(0), BucketEpoch(0), 1, 100, 0)
+            .await
+            .unwrap();
+        client
+            .record(0xB, KeyHash(0), BucketEpoch(0), 1, 1_000_000, 0)
             .await
             .unwrap();
         heartbeats(1).await;
         let before = admin_snapshot(&admin).await.counters.rounds_threshold;
         for key in 1..=500 {
             client
-                .record(0xB, KeyHash(key), 0, 1, 1_000_000, 0)
+                .record(0xB, KeyHash(key), BucketEpoch(0), 1, 1_000_000, 0)
                 .await
                 .unwrap();
         }
-        client.record(0xA, KeyHash(1), 0, 1, 100, 0).await.unwrap();
+        client
+            .record(0xA, KeyHash(1), BucketEpoch(0), 1, 100, 0)
+            .await
+            .unwrap();
         sim_advance(Duration::from_millis(1)).await;
         assert_eq!(
             admin_snapshot(&admin).await.counters.rounds_threshold,
@@ -1822,7 +1849,7 @@ fn two_rules_flush_independently() {
         for _ in 0..2 {
             for key in 1..=2 {
                 client
-                    .record(0xA, KeyHash(key), 0, 1, 100, 0)
+                    .record(0xA, KeyHash(key), BucketEpoch(0), 1, 100, 0)
                     .await
                     .unwrap();
             }
@@ -2046,7 +2073,7 @@ fn quickcheck_sim_converges_under_iid_packet_loss(case: DropProbCase) -> TestRes
                 .record(
                     rule_fp(record.rule),
                     key_hash(record.key),
-                    0,
+                    BucketEpoch(0),
                     record.hits as u64,
                     0,
                     0,
@@ -2212,9 +2239,18 @@ async fn threshold_trigger_fires_before_heartbeat() {
             // skipped on the very first hit; the local ingest interns it.
             let rule_fp: u128 = 0xC0DE;
             let key = KeyHash(0x99);
-            client_a.record(rule_fp, key, 0, 1, 100, 0).await.unwrap();
-            client_a.record(rule_fp, key, 0, 1, 100, 0).await.unwrap();
-            client_a.record(rule_fp, key, 0, 1, 100, 0).await.unwrap();
+            client_a
+                .record(rule_fp, key, BucketEpoch(0), 1, 100, 0)
+                .await
+                .unwrap();
+            client_a
+                .record(rule_fp, key, BucketEpoch(0), 1, 100, 0)
+                .await
+                .unwrap();
+            client_a
+                .record(rule_fp, key, BucketEpoch(0), 1, 100, 0)
+                .await
+                .unwrap();
 
             // Advance well under the heartbeat. The threshold trigger
             // should have already pumped the gossip frame through.
@@ -2283,7 +2319,10 @@ async fn min_emit_interval_clamps_adversarial_rate() {
 
             // Prime the rule so the threshold path takes effect on the
             // first burst-loop iteration.
-            client_a.record(rule_fp, key, 0, 1, 1, 0).await.unwrap();
+            client_a
+                .record(rule_fp, key, BucketEpoch(0), 1, 1, 0)
+                .await
+                .unwrap();
 
             // 1000 hits across ~10 ms of virtual time; now_millis
             // advances by 1 ms per 100 hits. The clamp applies through
@@ -2291,7 +2330,7 @@ async fn min_emit_interval_clamps_adversarial_rate() {
             for i in 0..1000_u64 {
                 let now_ms = i / 100;
                 client_a
-                    .record(rule_fp, key, 0, 1, 1, now_ms)
+                    .record(rule_fp, key, BucketEpoch(0), 1, 1, now_ms)
                     .await
                     .unwrap();
             }
@@ -2359,7 +2398,7 @@ async fn heartbeat_still_drains_cold_rules() {
             // One hit is far below ε, so the threshold never fires.
             let rule_fp: u128 = 0xC01D;
             client_a
-                .record(rule_fp, KeyHash(1), 0, 1, 1_000_000, 0)
+                .record(rule_fp, KeyHash(1), BucketEpoch(0), 1, 1_000_000, 0)
                 .await
                 .unwrap();
 
@@ -2424,7 +2463,7 @@ async fn error_bound_holds_under_load() {
             for batch in 0..batches {
                 for client in clients.iter().take(NODES) {
                     client
-                        .record(rule_fp, key, 0, per_batch, LIMIT, batch as u64)
+                        .record(rule_fp, key, BucketEpoch(0), per_batch, LIMIT, batch as u64)
                         .await
                         .unwrap();
                     real_total += per_batch;

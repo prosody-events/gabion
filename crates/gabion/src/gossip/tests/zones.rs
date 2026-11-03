@@ -1551,7 +1551,7 @@ fn cell_packets(sender: NodeIdentity, lower: u64, upper: u64, flagged: bool) -> 
         obs.push(Observation {
             rule_fingerprint: 0xBEE,
             key_hash: KeyHash(u128::from(key)),
-            bucket: 0,
+            bucket: BucketEpoch(0),
             origin: sender.node_id,
             incarnation: sender.incarnation,
             count: 1,

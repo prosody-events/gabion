@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{
-    CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, NodeId, NodeIdentity,
+    BucketEpoch, CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, NodeId,
+    NodeIdentity,
 };
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AggregateStore, GossipClient, GossipRuntime, TokioClock};
@@ -87,7 +88,7 @@ impl Node {
                             value: tenant,
                         }],
                     ),
-                    bucket: 0,
+                    bucket: BucketEpoch(0),
                 });
                 deltas.previous.push(0);
                 deltas.current.push(1);

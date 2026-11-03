@@ -27,7 +27,7 @@ use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use gabion::aggregate::Aggregate;
-use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity};
+use gabion::crdt::{BucketEpoch, CellStore, KeyHash, NodeId, NodeIdentity};
 use gabion::gossip::Role;
 use gabion::gossip::sim::sim_advance_ticks;
 use gabion::gossip::{
@@ -185,7 +185,7 @@ async fn record(client: &GossipClient, fingerprint: u128, key: u128, hits: u64, 
         .try_record(
             fingerprint,
             KeyHash(key),
-            (now / 100) as u32,
+            BucketEpoch::wrap(now / 100),
             hits,
             100,
             now,

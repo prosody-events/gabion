@@ -1014,7 +1014,7 @@ impl EngineState {
             // The CRDT's own window position at this instant — the Strata
             // right-anchors its fixed-width grid on this epoch instead of
             // recomputing the boundary in TypeScript.
-            bucket_epoch_now: self.rule.current_epoch(self.virtual_ms),
+            bucket_epoch_now: self.rule.current_epoch(self.virtual_ms).0,
         }
     }
 
@@ -1024,7 +1024,7 @@ impl EngineState {
             .map(|cell| CellView {
                 rule: cell.rule_fingerprint,
                 key: cell.key_hash,
-                bucket: cell.bucket,
+                bucket: cell.bucket.0,
                 count: cell.count,
                 age_ms: self.virtual_ms.saturating_sub(cell.last_update_millis),
                 origin: cell

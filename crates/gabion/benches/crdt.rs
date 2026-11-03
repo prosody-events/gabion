@@ -299,11 +299,11 @@ fn pick_rule(rng: &mut Rng) -> u32 {
 fn pick_bucket(rng: &mut Rng) -> BucketEpoch {
     let r = rng.range(100);
     if r < 90 {
-        0
+        BucketEpoch(0)
     } else if r < 98 {
-        1
+        BucketEpoch(1)
     } else {
-        rng.range(NUM_BUCKETS as u32)
+        BucketEpoch(rng.range(NUM_BUCKETS as u32))
     }
 }
 
@@ -448,7 +448,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                     obs.push(obs_row(
                         fixture.rule_fps[0],
                         KeyHash(key),
-                        0,
+                        BucketEpoch(0),
                         LOCAL_NODE,
                         LOCAL_INCARNATION,
                         1,
@@ -501,7 +501,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                             // compare's side effects are observed via
                             // `black_box`.
                             if let Some(slot) = store.rule_dictionary().find(fp) {
-                                let idx = slot as usize;
+                                let idx = slot.index();
                                 let p = pending[idx].saturating_add(1);
                                 pending[idx] = p;
                                 let epsilon = (1_000_000_u64 * 100) / (10_000 * 8);
@@ -547,7 +547,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                 let key = burst_keys[rng.range(burst_keys.len() as u32) as usize];
                 let fp = fixture.rule_fps[0];
                 if let Some(slot) = store.rule_dictionary().find(fp) {
-                    let idx = slot as usize;
+                    let idx = slot.index();
                     let p = pending[idx].saturating_add(1);
                     pending[idx] = p;
                     let epsilon = 1_u64; // saturated case
@@ -556,7 +556,7 @@ fn bench_ingest_local(c: &mut Criterion) {
                 obs.push(obs_row(
                     fp,
                     KeyHash(key),
-                    0,
+                    BucketEpoch(0),
                     LOCAL_NODE,
                     LOCAL_INCARNATION,
                     1,
@@ -779,7 +779,7 @@ fn bench_find(c: &mut Criterion) {
                 let bucket = pick_bucket(&mut rng);
                 (key, rule_idx, bucket)
             } else {
-                (fresh_key(&mut rng), 0, 0)
+                (fresh_key(&mut rng), 0, BucketEpoch(0))
             };
             let rule_slot = fixture.rule_slots[rule_idx];
             let h = fixture.store.find(black_box(CompactCellKey {
@@ -802,7 +802,7 @@ fn bench_find(c: &mut Criterion) {
             let h = fixture.store.find(black_box(CompactCellKey {
                 rule: rule_slot,
                 key_hash: KeyHash(fresh_key(&mut rng)),
-                bucket: 0,
+                bucket: BucketEpoch(0),
                 origin: fixture.local_node_slot,
                 incarnation: LOCAL_INCARNATION,
             }));
@@ -851,7 +851,7 @@ fn bench_admission_headers(c: &mut Criterion) {
                 let bucket = pick_bucket(&mut rng);
                 (key, rule_idx, bucket)
             } else {
-                (fresh_key(&mut rng), 0, 0)
+                (fresh_key(&mut rng), 0, BucketEpoch(0))
             };
             let rule_slot = fixture.rule_slots[rule_idx];
             let h = fixture.store.find(black_box(CompactCellKey {
@@ -882,7 +882,7 @@ fn bench_admission_headers(c: &mut Criterion) {
                 let bucket = pick_bucket(&mut rng);
                 (key, rule_idx, bucket)
             } else {
-                (fresh_key(&mut rng), 0, 0)
+                (fresh_key(&mut rng), 0, BucketEpoch(0))
             };
             let rule_slot = fixture.rule_slots[rule_idx];
             let handle = fixture.store.find(black_box(CompactCellKey {
@@ -968,7 +968,7 @@ fn bench_stream_after(c: &mut Criterion) {
             obs.push(obs_row(
                 fingerprint,
                 KeyHash(u128::from(key)),
-                0,
+                BucketEpoch(0),
                 LOCAL_NODE,
                 LOCAL_INCARNATION,
                 1,
@@ -1018,7 +1018,7 @@ fn bench_merge_relay(c: &mut Criterion) {
         obs.push(obs_row(
             fingerprint,
             KeyHash(key),
-            0,
+            BucketEpoch(0),
             peer_node(2 + key as usize % 60),
             1,
             1,
@@ -1037,7 +1037,7 @@ fn bench_merge_relay(c: &mut Criterion) {
                 obs.push(obs_row(
                     fingerprint,
                     KeyHash(key),
-                    0,
+                    BucketEpoch(0),
                     LOCAL_NODE,
                     1,
                     count,
@@ -1074,8 +1074,8 @@ fn bench_expire(c: &mut Criterion) {
         // past the live window (it ages out), buckets 0..3 remain.
         let mut ages = vec![RuleAge::Unused; RULE_CAPACITY as usize];
         ages[..NUM_RULES].fill(RuleAge::Epoch {
-            current: NUM_BUCKETS as u32,    // 4
-            live: (NUM_BUCKETS as u32) - 1, // 3
+            current: BucketEpoch(NUM_BUCKETS as u32), // 4
+            live: (NUM_BUCKETS as u32) - 1,           // 3
         });
         let mut sink = ExpirationSink::with_capacity(fixture.store.capacity() as usize);
         b.iter_batched_ref(
@@ -1093,7 +1093,7 @@ fn bench_expire(c: &mut Criterion) {
     group.bench_function("no_expirations", |b| {
         let mut ages = vec![RuleAge::Unused; RULE_CAPACITY as usize];
         ages[..NUM_RULES].fill(RuleAge::Epoch {
-            current: 0,
+            current: BucketEpoch(0),
             live: 1000,
         });
         let mut sink = ExpirationSink::with_capacity(fixture.store.capacity() as usize);
@@ -1120,7 +1120,7 @@ fn bench_expire(c: &mut Criterion) {
         let rule = &table.rules()[0];
         let mut obs = ObservationBatch::with_capacity(cells);
         for i in 0..cells {
-            let bucket = (i % 11) as BucketEpoch;
+            let bucket = BucketEpoch((i % 11) as u32);
             obs.push(obs_row(
                 rule.fingerprint(),
                 KeyHash(i as u128),
@@ -1358,7 +1358,7 @@ impl Traffic {
         self.deltas.clear();
         self.expirations.clear();
         for &key_hash in &keys {
-            let key = self.cell(key_hash, expired);
+            let key = self.cell(key_hash, BucketEpoch(expired));
             self.expirations.handles.push(CellHandle::default());
             self.expirations.keys.push(key);
             self.expirations.last_counts.push(1);
@@ -1369,7 +1369,7 @@ impl Traffic {
         for _ in 0..KEYS_PER_SECOND {
             let key_hash = self.active_key();
             keys.push(key_hash);
-            let key = self.cell(key_hash, self.second);
+            let key = self.cell(key_hash, BucketEpoch(self.second));
             self.deltas.handles.push(CellHandle::default());
             self.deltas.keys.push(key);
             self.deltas.previous.push(0);

@@ -1,6 +1,6 @@
 use gabion::crdt::{
-    CellStore, DeltaSink, Expiry, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch,
-    RelayMark,
+    BucketEpoch, CellStore, DeltaSink, Expiry, KeyHash, NodeId, NodeIdentity, Observation,
+    ObservationBatch, RelayMark,
 };
 use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
 
@@ -35,7 +35,7 @@ fn lead(store: &ShmAggregateStore, incarnation: u32) -> (CellStore, u128) {
     gossip.push(Observation {
         rule_fingerprint: fingerprint,
         key_hash: KeyHash(0x99),
-        bucket: 7,
+        bucket: BucketEpoch(7),
         origin: NodeId(2),
         incarnation: 1,
         count: 5,
@@ -66,7 +66,12 @@ fn a_new_leader_counts_regossiped_cells_once() {
     let (mut cells, fingerprint) = lead(&store, 2);
     lead(&previous, 1);
     let view = region.aggregate();
-    assert_eq!(view.get(fingerprint, 0x99, 7).expect("found").count, 5);
+    assert_eq!(
+        view.get(fingerprint, 0x99, BucketEpoch(7))
+            .expect("found")
+            .count,
+        5
+    );
 
     expire(&store, &mut cells);
     assert_eq!(view.occupied(), 0);

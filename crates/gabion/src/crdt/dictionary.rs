@@ -49,9 +49,9 @@ impl RuleDescriptor {
     /// before validation.
     pub fn current_epoch(&self, now_millis: u64) -> BucketEpoch {
         if self.bucket_millis == 0 {
-            0
+            BucketEpoch(0)
         } else {
-            (now_millis / (self.bucket_millis as u64)) as BucketEpoch
+            BucketEpoch::wrap(now_millis / u64::from(self.bucket_millis))
         }
     }
 
@@ -119,15 +119,15 @@ impl RuleDictionary {
     }
 
     pub fn descriptor(&self, slot: RuleSlot) -> Option<&RuleDescriptor> {
-        if (slot as u32) < self.capacity as u32 && self.refcounts[slot as usize] > 0 {
-            Some(&self.descriptors[slot as usize])
+        if slot.index() < usize::from(self.capacity) && self.refcounts[slot.index()] > 0 {
+            Some(&self.descriptors[slot.index()])
         } else {
             None
         }
     }
 
     pub fn refcount(&self, slot: RuleSlot) -> u32 {
-        self.refcounts.get(slot as usize).copied().unwrap_or(0)
+        self.refcounts.get(slot.index()).copied().unwrap_or(0)
     }
 
     /// Look up an existing rule by fingerprint, without inserting.
@@ -138,7 +138,7 @@ impl RuleDictionary {
             .find(h, |slot| {
                 descriptors[slot as usize].fingerprint == fingerprint
             })
-            .map(|s| s as RuleSlot)
+            .map(|s| RuleSlot(s as u16))
     }
 
     /// Find or create a rule slot. Refcount is unchanged — callers manage it
@@ -147,7 +147,7 @@ impl RuleDictionary {
         if let Some(slot) = self.find(descriptor.fingerprint) {
             // Replace descriptor metadata (e.g. `applies_locally` may have
             // changed).
-            self.descriptors[slot as usize] = descriptor;
+            self.descriptors[slot.index()] = descriptor;
             return Some(slot);
         }
         if self.free_head == EMPTY_DICT_SLOT {
@@ -160,26 +160,26 @@ impl RuleDictionary {
         self.index
             .insert_unchecked(hash_fingerprint(descriptor.fingerprint), slot as u32);
         self.len += 1;
-        Some(slot)
+        Some(RuleSlot(slot))
     }
 
     pub(super) fn inc_ref(&mut self, slot: RuleSlot) {
-        self.refcounts[slot as usize] = self.refcounts[slot as usize].saturating_add(1);
+        self.refcounts[slot.index()] = self.refcounts[slot.index()].saturating_add(1);
     }
 
     pub(super) fn dec_ref(&mut self, slot: RuleSlot) {
-        let rc = &mut self.refcounts[slot as usize];
+        let rc = &mut self.refcounts[slot.index()];
         if *rc == 0 {
             return;
         }
         *rc -= 1;
         if *rc == 0 {
-            let fingerprint = self.descriptors[slot as usize].fingerprint;
+            let fingerprint = self.descriptors[slot.index()].fingerprint;
             self.index
-                .remove(hash_fingerprint(fingerprint), slot as u32);
-            self.descriptors[slot as usize] = RuleDescriptor::default();
-            self.free_next[slot as usize] = self.free_head;
-            self.free_head = slot;
+                .remove(hash_fingerprint(fingerprint), u32::from(slot.0));
+            self.descriptors[slot.index()] = RuleDescriptor::default();
+            self.free_next[slot.index()] = self.free_head;
+            self.free_head = slot.0;
             self.len -= 1;
         }
     }
@@ -245,15 +245,15 @@ impl NodeDictionary {
     }
 
     pub fn descriptor(&self, slot: NodeSlot) -> Option<&NodeDescriptor> {
-        if (slot as u32) < self.capacity as u32 && self.refcounts[slot as usize] > 0 {
-            Some(&self.descriptors[slot as usize])
+        if slot.index() < usize::from(self.capacity) && self.refcounts[slot.index()] > 0 {
+            Some(&self.descriptors[slot.index()])
         } else {
             None
         }
     }
 
     pub fn refcount(&self, slot: NodeSlot) -> u32 {
-        self.refcounts.get(slot as usize).copied().unwrap_or(0)
+        self.refcounts.get(slot.index()).copied().unwrap_or(0)
     }
 
     pub fn find(&self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
@@ -264,7 +264,7 @@ impl NodeDictionary {
                 let d = &descriptors[slot as usize];
                 d.node_id == node_id && d.incarnation == incarnation
             })
-            .map(|s| s as NodeSlot)
+            .map(|s| NodeSlot(s as u16))
     }
 
     pub(super) fn intern(&mut self, node_id: NodeId, incarnation: Incarnation) -> Option<NodeSlot> {
@@ -284,27 +284,29 @@ impl NodeDictionary {
         self.index
             .insert_unchecked(hash_node_identity(node_id, incarnation), slot as u32);
         self.len += 1;
-        Some(slot)
+        Some(NodeSlot(slot))
     }
 
     pub(super) fn inc_ref(&mut self, slot: NodeSlot) {
-        self.refcounts[slot as usize] = self.refcounts[slot as usize].saturating_add(1);
+        self.refcounts[slot.index()] = self.refcounts[slot.index()].saturating_add(1);
     }
 
     /// Decrement refcount. Returns `true` if the slot was freed.
     pub(super) fn dec_ref(&mut self, slot: NodeSlot) -> bool {
-        let rc = &mut self.refcounts[slot as usize];
+        let rc = &mut self.refcounts[slot.index()];
         if *rc == 0 {
             return false;
         }
         *rc -= 1;
         if *rc == 0 {
-            let d = self.descriptors[slot as usize];
-            self.index
-                .remove(hash_node_identity(d.node_id, d.incarnation), slot as u32);
-            self.descriptors[slot as usize] = NodeDescriptor::default();
-            self.free_next[slot as usize] = self.free_head;
-            self.free_head = slot;
+            let d = self.descriptors[slot.index()];
+            self.index.remove(
+                hash_node_identity(d.node_id, d.incarnation),
+                u32::from(slot.0),
+            );
+            self.descriptors[slot.index()] = NodeDescriptor::default();
+            self.free_next[slot.index()] = self.free_head;
+            self.free_head = slot.0;
             self.len -= 1;
             true
         } else {

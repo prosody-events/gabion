@@ -8,11 +8,11 @@ fn live(buckets: u32) -> NonZeroU32 {
 
 /// Build a closure backed by an inline `(bucket, count)` table. Returns
 /// `0` for any bucket not listed — matches the aggregate table's "no row" case.
-fn counts_from(table: &[(BucketEpoch, u64)]) -> impl Fn(BucketEpoch) -> u64 + '_ {
+fn counts_from(table: &[(u32, u64)]) -> impl Fn(BucketEpoch) -> u64 + '_ {
     move |bucket| {
         table
             .iter()
-            .find_map(|(b, c)| if *b == bucket { Some(*c) } else { None })
+            .find_map(|(b, c)| if *b == bucket.0 { Some(*c) } else { None })
             .unwrap_or(0)
     }
 }

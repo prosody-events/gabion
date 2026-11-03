@@ -39,8 +39,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{
-    CellHandle, CellStore, DeltaSink, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch,
-    RelayMark, Stream,
+    BucketEpoch, CellHandle, CellStore, DeltaSink, KeyHash, NodeId, NodeIdentity, Observation,
+    ObservationBatch, RelayMark, Stream,
 };
 use gabion::defaults::{GOSSIP_MIN_EMIT_INTERVAL_MS, GOSSIP_TICK_INTERVAL_MILLIS};
 use gabion::gossip::sim::sim_advance;
@@ -234,7 +234,14 @@ impl World {
         self.net.inbox.borrow_mut().extend(self.staged.drain(..));
         for key in self.raises.drain(..) {
             self.client
-                .try_record(self.fingerprint, KeyHash(key), 0, 1, u64::MAX, 0)
+                .try_record(
+                    self.fingerprint,
+                    KeyHash(key),
+                    BucketEpoch(0),
+                    1,
+                    u64::MAX,
+                    0,
+                )
                 .expect("the request queue has room");
         }
         if let Some(waker) = self.net.waker.take() {
@@ -300,7 +307,7 @@ fn cell(rule_fingerprint: u128, key: u128, origin: NodeId) -> Observation {
     Observation {
         rule_fingerprint,
         key_hash: KeyHash(key),
-        bucket: 0,
+        bucket: BucketEpoch(0),
         origin,
         incarnation: INCARNATION,
         count: 1,

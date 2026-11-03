@@ -157,7 +157,7 @@ impl RuleSpec {
     /// The bucket epoch `now_millis` falls in: the one definition both
     /// adapters record into and the aggregate reads from.
     pub fn bucket_at(self, now_millis: u64) -> BucketEpoch {
-        (now_millis / self.bucket_millis) as BucketEpoch
+        BucketEpoch::wrap(now_millis / self.bucket_millis)
     }
 }
 

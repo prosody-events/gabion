@@ -25,6 +25,29 @@ pub trait VariableLookup {
     fn lookup(&self, binding: &BindingLookup) -> Option<&[u8]>;
 }
 
+/// The value of the first `name=value` pair in the query string `args`: what
+/// a `$arg_name` binding reads.
+pub fn find_query_arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut rest = args;
+    while !rest.is_empty() {
+        let next = rest
+            .iter()
+            .position(|byte| *byte == b'&')
+            .unwrap_or(rest.len());
+        let pair = &rest[..next];
+        if let Some(eq) = pair.iter().position(|byte| *byte == b'=')
+            && &pair[..eq] == name
+        {
+            return Some(&pair[eq + 1..]);
+        }
+        if next == rest.len() {
+            break;
+        }
+        rest = &rest[next + 1..];
+    }
+    None
+}
+
 /// Result of the access decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccessOutcome {
@@ -299,7 +322,7 @@ fn decide_one(
     let event = QueueEvent {
         rule_fingerprint: spec.fingerprint,
         key_hash: key_hash.0,
-        bucket: spec.bucket_at(now_millis),
+        bucket: spec.bucket_at(now_millis).0,
         hits,
         rule_limit: spec.limit,
         now_millis,

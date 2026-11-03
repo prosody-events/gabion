@@ -69,14 +69,6 @@ impl AppConfig {
         Self::from_yaml(builder.build().map_err(ConfigError::Config)?)
     }
 
-    /// Test-only loader that takes inline YAML instead of a file path.
-    /// Same environment layering as [`Self::load`].
-    #[cfg(test)]
-    fn load_with_yaml_str(yaml: &str) -> Result<Self, ConfigError> {
-        let builder = Config::builder().add_source(File::from_str(yaml, FileFormat::Yaml));
-        Self::from_yaml(builder.build().map_err(ConfigError::Config)?)
-    }
-
     fn from_yaml(yaml: Config) -> Result<Self, ConfigError> {
         let mut root = yaml.cache.into_table().map_err(ConfigError::Config)?;
         let limits: Vec<LimitRuleConfig> = match root.remove("limits") {

@@ -16,7 +16,8 @@ pub(crate) fn mix64(mut h: u64) -> u64 {
 pub(super) fn hash_compact_cell_key(key: &CompactCellKey) -> u64 {
     let lo = key.key_hash.0 as u64;
     let hi = (key.key_hash.0 >> 64) as u64;
-    let pack_a = (key.rule as u64) | ((key.origin as u64) << 16) | ((key.bucket as u64) << 32);
+    let pack_a =
+        u64::from(key.rule.0) | (u64::from(key.origin.0) << 16) | (u64::from(key.bucket.0) << 32);
     let pack_b = key.incarnation as u64;
     mix64(lo ^ pack_a) ^ mix64(hi.wrapping_add(pack_b).wrapping_add(0x9E37_79B9_7F4A_7C15))
 }

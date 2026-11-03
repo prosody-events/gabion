@@ -35,11 +35,6 @@ impl CellIndex {
         }
     }
 
-    #[cfg(test)]
-    pub fn len(&self) -> u32 {
-        self.len
-    }
-
     #[inline(always)]
     fn probe_distance(&self, slot: u32, hash: u64) -> u32 {
         let ideal = (hash as u32) & self.mask;
@@ -159,5 +154,7 @@ impl CellIndex {
     }
 }
 
+#[cfg(test)]
+mod mock;
 #[cfg(test)]
 mod tests;

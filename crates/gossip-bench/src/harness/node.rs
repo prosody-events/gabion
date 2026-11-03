@@ -4,7 +4,6 @@
 
 use serde::Serialize;
 
-use super::adapter::BucketEpoch;
 use super::plan::Plan;
 use super::regime::Regime;
 use super::rng::{Rng, Stream};
@@ -80,11 +79,11 @@ impl KeySpace {
         self.kinds.is_empty()
     }
 
-    pub fn bucket_of(&self, now_millis: u64) -> BucketEpoch {
-        (now_millis / self.bucket_ms) as BucketEpoch
+    pub fn bucket_of(&self, now_millis: u64) -> u32 {
+        (now_millis / self.bucket_ms) as u32
     }
 
-    pub fn slot(&self, key: u32, bucket: BucketEpoch) -> usize {
+    pub fn slot(&self, key: u32, bucket: u32) -> usize {
         key as usize * self.ring_len as usize + (bucket % self.ring_len) as usize
     }
 }
@@ -92,7 +91,7 @@ impl KeySpace {
 /// One `(bucket, count)` cell of a per-key ring.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Slot {
-    pub bucket: BucketEpoch,
+    pub bucket: u32,
     pub count: u32,
 }
 
@@ -100,7 +99,7 @@ impl Slot {
     /// Add `v` to bucket `bucket`, recycling the slot when it held an older
     /// bucket. Returns `false` when `bucket` is older than the slot's and so
     /// already outside every live window.
-    pub fn add(&mut self, bucket: BucketEpoch, v: u32) -> bool {
+    pub fn add(&mut self, bucket: u32, v: u32) -> bool {
         if self.bucket != bucket {
             if bucket < self.bucket && self.count != 0 {
                 return false;
@@ -111,13 +110,13 @@ impl Slot {
         true
     }
 
-    pub fn count_for(self, bucket: BucketEpoch) -> u32 {
+    pub fn count_for(self, bucket: u32) -> u32 {
         if self.bucket == bucket { self.count } else { 0 }
     }
 }
 
 /// Sum of `ring` over the `live` buckets ending at `current`.
-pub fn ring_window_total(keys: &KeySpace, ring: &[Slot], key: u32, current: BucketEpoch) -> u64 {
+pub fn ring_window_total(keys: &KeySpace, ring: &[Slot], key: u32, current: u32) -> u64 {
     (0..keys.live_buckets)
         .filter_map(|offset| current.checked_sub(offset))
         .map(|b| u64::from(ring[keys.slot(key, b)].count_for(b)))

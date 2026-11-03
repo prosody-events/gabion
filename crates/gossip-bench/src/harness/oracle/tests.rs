@@ -4,7 +4,7 @@ use crate::harness::plan::NS_PER_S;
 
 const MS: u64 = NS_PER_MS;
 /// An arbitrary bucket; the quiet fixture's buckets are 1 s wide.
-const B: BucketEpoch = 100;
+const B: u32 = 100;
 
 fn quiet_keys() -> Rc<KeySpace> {
     Rc::new(KeySpace::build(&fixtures::quiet(2), 1))

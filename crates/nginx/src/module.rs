@@ -29,7 +29,9 @@ use gabion::crdt::ValidStorageConfig;
 use gabion::gossip::ValidGossipConfig;
 use gabion::settings::{Setting, Settings};
 
-use crate::access::{AccessCtx, AccessOutcome, AllowInfo, RejectInfo, VariableLookup, decide_all};
+use crate::access::{
+    AccessCtx, AccessOutcome, AllowInfo, RejectInfo, VariableLookup, decide_all, find_query_arg,
+};
 use crate::headers::AdmissionHeaders;
 use crate::leader::{self, LeaderConfig, LeaderHandle};
 use crate::log;
@@ -699,27 +701,6 @@ impl VariableLookup for RequestVariables<'_> {
             }
         }
     }
-}
-
-fn find_query_arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut rest = args;
-    while !rest.is_empty() {
-        let next = rest
-            .iter()
-            .position(|byte| *byte == b'&')
-            .unwrap_or(rest.len());
-        let pair = &rest[..next];
-        if let Some(eq) = pair.iter().position(|byte| *byte == b'=')
-            && &pair[..eq] == name
-        {
-            return Some(&pair[eq + 1..]);
-        }
-        if next == rest.len() {
-            break;
-        }
-        rest = &rest[next + 1..];
-    }
-    None
 }
 
 // -- directives -------------------------------------------------------------

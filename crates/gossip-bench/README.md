@@ -154,7 +154,7 @@ with:
 python3 -c 'import sys; from pathlib import Path; sys.path.insert(0, "crates/gossip-bench/judge"); import judge; print(judge.core_hash(sys.argv[1], Path(".")))' "$(git rev-parse HEAD:crates/gossip-bench)"
 ```
 
-Core hash: `1ed9ff8c988cbd895bff19992388818703495b41`. A new or
+Core hash: `eb10374f173bc033483c8ee8c0daffc140d40ce7`. A new or
 changed regime, or any other edit to the core, changes it, requires rerunning
 `make sim-baselines`, and updates this line.
 
@@ -637,8 +637,8 @@ line about gabion in `src/harness/adapter.rs`:
 - `Node::record(key, bucket, now_millis)` (a hit, resolving once it is visible
   in the node's aggregate) and `Node::ask_health()` then `HealthReply::take()`
   (the admin snapshot, as the core's `Counters`);
-- `NodeStore`, the per-node `AggregateStore`, and `BucketEpoch`, re-exported for
-  the driver and oracle;
+- `NodeStore`, the per-node `AggregateStore`; the core counts buckets as plain
+  `u32` epochs, which the adapter wraps in the library's `BucketEpoch`;
 - the `Ticker` impl for the core's `SimTicker`, whose inherent
   `next_tick` returns the instant each tick was scheduled for;
 - the discovery stream: the core's `PeerStream` events carry addresses

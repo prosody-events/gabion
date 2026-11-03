@@ -97,7 +97,7 @@ impl AggregateSlot {
                 | self.rule_fingerprint_lo.load(Ordering::Relaxed) as u128,
             key_hash: ((self.key_hash_hi.load(Ordering::Relaxed) as u128) << 64)
                 | self.key_hash_lo.load(Ordering::Relaxed) as u128,
-            bucket: self.bucket.load(Ordering::Relaxed) as BucketEpoch,
+            bucket: BucketEpoch(self.bucket.load(Ordering::Relaxed) as u32),
             count: self.count.load(Ordering::Relaxed),
         };
         // Order the field loads before the re-check of `seq`.
@@ -122,7 +122,8 @@ impl AggregateSlot {
             .store((fp >> 64) as u64, Ordering::Relaxed);
         self.key_hash_lo.store(kh as u64, Ordering::Relaxed);
         self.key_hash_hi.store((kh >> 64) as u64, Ordering::Relaxed);
-        self.bucket.store(cell.bucket as u64, Ordering::Relaxed);
+        self.bucket
+            .store(u64::from(cell.bucket.0), Ordering::Relaxed);
         self.count.store(cell.count, Ordering::Relaxed);
         self.seq.store(seq, Ordering::Release);
     }
@@ -204,7 +205,11 @@ impl<'a> AggregateTable<'a> {
         let current = spec.bucket_at(now_millis);
         (0..spec.live_buckets.get())
             .filter_map(|offset| {
-                self.get(spec.fingerprint, key_hash.0, current.wrapping_sub(offset))
+                self.get(
+                    spec.fingerprint,
+                    key_hash.0,
+                    BucketEpoch(current.0.wrapping_sub(offset)),
+                )
             })
             .fold(0, |total, cell| total.saturating_add(cell.count))
     }
@@ -401,7 +406,7 @@ fn mix_index(fp: u128, kh: u128, bucket: BucketEpoch) -> usize {
     let mut buf = [0_u8; 16 + 16 + 4];
     buf[..16].copy_from_slice(&fp.to_le_bytes());
     buf[16..32].copy_from_slice(&kh.to_le_bytes());
-    buf[32..].copy_from_slice(&bucket.to_le_bytes());
+    buf[32..].copy_from_slice(&bucket.0.to_le_bytes());
     let h = xxhash3_128::Hasher::oneshot(&buf);
     (h as u64 ^ (h >> 64) as u64) as usize
 }

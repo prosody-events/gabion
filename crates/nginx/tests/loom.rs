@@ -9,6 +9,7 @@
 use std::ops::Range;
 
 use gabion::aggregate::{AggregateCell, AggregateSlot, AggregateTable};
+use gabion::crdt::BucketEpoch;
 use gabion_nginx::shm::queue::QueueEvent;
 use gabion_nginx::shm::{LeaderLease, QueueControl, QueueSlot, RequestQueue};
 use loom::sync::Arc;
@@ -158,7 +159,7 @@ fn cell(id: u64) -> AggregateCell {
     AggregateCell {
         rule_fingerprint: wide(id),
         key_hash: wide(id),
-        bucket: id as u32,
+        bucket: BucketEpoch(id as u32),
         count: id,
     }
 }

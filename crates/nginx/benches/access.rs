@@ -18,7 +18,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use gabion::crdt::{CellHandle, CellIdentity, DeltaSink, ExpirationSink, ValidStorageConfig};
+use gabion::crdt::{
+    BucketEpoch, CellHandle, CellIdentity, DeltaSink, ExpirationSink, ValidStorageConfig,
+};
 use gabion::gossip::AggregateStore;
 use gabion::rules::{Descriptor, hash_key};
 use gabion::settings::Settings;
@@ -92,7 +94,7 @@ impl Worker {
                             value: tenant,
                         }],
                     ),
-                    bucket: 0,
+                    bucket: BucketEpoch(0),
                 });
                 deltas.previous.push(0);
                 deltas.current.push(1);

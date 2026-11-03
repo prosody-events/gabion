@@ -14,7 +14,8 @@ use tower::ServiceExt;
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{
-    CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
+    BucketEpoch, CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId,
+    NodeIdentity,
 };
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AdminCommand, AggregateStore, GossipRuntime, TokioClock};
@@ -98,7 +99,7 @@ fn snapshot_json_shape_is_pinned() {
             keys: vec![CellIdentity {
                 rule_fingerprint: rule_table.rules()[0].fingerprint(),
                 key_hash: KeyHash(1),
-                bucket: 0,
+                bucket: BucketEpoch(0),
             }],
             previous: vec![0],
             current: vec![1],
@@ -244,7 +245,7 @@ fn snapshot_json_shape_is_pinned() {
         assert!(body["peers"][0]["unanswered_ms"].is_null());
         let fingerprint = rule_table.rules()[0].fingerprint();
         (client
-            .record(fingerprint, KeyHash(2), 0, 1, 1_000_000, 0)
+            .record(fingerprint, KeyHash(2), BucketEpoch(0), 1, 1_000_000, 0)
             .await)
             .expect("recorded");
         tokio::time::sleep(tick + tick / 2).await;

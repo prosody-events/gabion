@@ -248,6 +248,17 @@ fn is_truthy_matches_documented_falsy_set() {
     }
 }
 
+/// `$arg_name` reads the first pair named exactly `name`, value and all.
+#[test]
+fn find_query_arg_reads_the_first_exact_pair() {
+    let args = b"tt=1&t&t=x=y&t=z&u=";
+    assert_eq!(find_query_arg(args, b"t"), Some(&b"x=y"[..]));
+    assert_eq!(find_query_arg(args, b"tt"), Some(&b"1"[..]));
+    assert_eq!(find_query_arg(args, b"u"), Some(&b""[..]));
+    assert_eq!(find_query_arg(args, b"v"), None);
+    assert_eq!(find_query_arg(b"", b"t"), None);
+}
+
 fn rule_with_predicate() -> CompiledRules {
     rules(&[&format!("{PER_TENANT} except_if=$trusted")])
 }

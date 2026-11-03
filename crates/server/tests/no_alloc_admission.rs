@@ -18,7 +18,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use gabion::aggregate::Aggregate;
-use gabion::crdt::{CellStore, NodeId, NodeIdentity};
+use gabion::crdt::{BucketEpoch, CellStore, NodeId, NodeIdentity};
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{GossipRuntime, TokioClock};
 use gabion::rules::{Descriptor, EnforcementMode, RuleDef, RuleTable, hash_key};
@@ -145,7 +145,7 @@ async fn admit_without_allocating(rules: u16) {
         for rule in table.rules() {
             let spec = rule.spec();
             client
-                .try_record(spec.fingerprint, warm, 0, 1, spec.limit, 0)
+                .try_record(spec.fingerprint, warm, BucketEpoch(0), 1, spec.limit, 0)
                 .expect("queue room");
         }
         settle().await;

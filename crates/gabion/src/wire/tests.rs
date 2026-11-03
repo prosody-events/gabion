@@ -7,8 +7,8 @@ use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 
 use crate::crdt::{
-    CellHandle, CellStore, DeltaSink, KeyHash, NodeId, NodeIdentity, Observation, ObservationBatch,
-    RelayMark, Stream,
+    BucketEpoch, CellHandle, CellStore, DeltaSink, KeyHash, NodeId, NodeIdentity, Observation,
+    ObservationBatch, RelayMark, Stream,
 };
 use crate::settings::mock::{rules, storage};
 
@@ -104,7 +104,7 @@ fn seed_store(rows: &[RawRow]) -> (CellStore, Vec<CellHandle>) {
         obs.push(Observation {
             rule_fingerprint: r.rule_fingerprint,
             key_hash: KeyHash(r.key_hash),
-            bucket: r.bucket,
+            bucket: BucketEpoch(r.bucket),
             origin: NodeId(r.origin_node_id),
             incarnation: r.origin_incarnation,
             count: r.count,
@@ -132,7 +132,7 @@ impl CellKey {
         Self {
             rule_fingerprint: cell.rule_fingerprint,
             key_hash: cell.key_hash.0,
-            bucket: cell.bucket,
+            bucket: cell.bucket.0,
             origin_node_id: cell.origin.0,
             origin_incarnation: cell.incarnation,
             count: cell.count,
@@ -153,7 +153,7 @@ impl CellKey {
         Self {
             rule_fingerprint: rule.fingerprint,
             key_hash: row.key.key_hash.0,
-            bucket: row.key.bucket,
+            bucket: row.key.bucket.0,
             origin_node_id: node.node_id.0,
             origin_incarnation: row.key.incarnation,
             count: row.count,
@@ -258,7 +258,7 @@ fn build_many_origins(n: u32) -> (CellStore, Vec<CellHandle>) {
         obs.push(Observation {
             rule_fingerprint: 0xAA_u128, // single shared rule fingerprint
             key_hash: KeyHash(0xBEEF + i as u128),
-            bucket: 0,
+            bucket: BucketEpoch(0),
             origin: NodeId(0x1_0000 + i as u128), // distinct origin per row
             incarnation: 1,
             count: 1 + i,
@@ -529,7 +529,7 @@ fn own_frame_packets_tile_its_range() {
         obs.push(Observation {
             rule_fingerprint: 0xAA,
             key_hash: KeyHash(key),
-            bucket: 0,
+            bucket: BucketEpoch(0),
             origin: NodeId(0),
             incarnation: 0,
             count: 1,

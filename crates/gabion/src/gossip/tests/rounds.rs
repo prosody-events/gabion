@@ -887,7 +887,7 @@ fn takeover_restarted_mid_sweep_is_swept_from_the_start() {
         // Two hits against a limit of 1 cross the error budget.
         let source = &t.sources[0].client;
         source
-            .record(0xBEE, KeyHash(3_000_000), 0, 2, 1, 0)
+            .record(0xBEE, KeyHash(3_000_000), BucketEpoch(0), 2, 1, 0)
             .await
             .unwrap();
         run_for(600).await;
@@ -998,7 +998,7 @@ fn expired_cells_are_closed_not_abandoned() {
             // lost too; the retry at 300 delivers it.
             for key in 1..3 {
                 o.client
-                    .record(rule_fp(0), KeyHash(key), 0, 1, 1_000, 50)
+                    .record(rule_fp(0), KeyHash(key), BucketEpoch(0), 1, 1_000, 50)
                     .await
                     .unwrap();
             }

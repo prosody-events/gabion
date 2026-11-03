@@ -24,7 +24,7 @@ use anyhow::Context;
 use tokio::sync::watch;
 use tokio::task::LocalSet;
 
-use gabion::crdt::{CellStore, KeyHash, NodeIdentity, ValidStorageConfig};
+use gabion::crdt::{BucketEpoch, CellStore, KeyHash, NodeIdentity, ValidStorageConfig};
 use gabion::gossip::{GossipClient, GossipRuntime, TokioClock, UdpTransport, ValidGossipConfig};
 use gabion::rules::CardinalityLimit;
 use gabion::settings::{MIN_LIMIT_QUEUE_CAPACITY, Setting};
@@ -312,7 +312,7 @@ async fn drain_loop(client: GossipClient, shm: ShmRegion, worker_id: u32) -> any
             permit.record(
                 ev.rule_fingerprint,
                 KeyHash(ev.key_hash),
-                ev.bucket,
+                BucketEpoch(ev.bucket),
                 ev.hits,
                 ev.rule_limit,
                 ev.now_millis,

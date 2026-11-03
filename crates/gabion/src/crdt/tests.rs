@@ -10,6 +10,28 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// C19: no slot or epoch type is another, or the bare integer it wraps, so
+/// one cannot stand in for another.
+#[test]
+fn rule_node_bucket_slots_are_distinct_types() {
+    use std::any::TypeId;
+    let types = [
+        ("RuleSlot", TypeId::of::<RuleSlot>()),
+        ("NodeSlot", TypeId::of::<NodeSlot>()),
+        ("BucketEpoch", TypeId::of::<BucketEpoch>()),
+        ("u16", TypeId::of::<u16>()),
+        ("u32", TypeId::of::<u32>()),
+    ];
+    let same: Vec<_> = types
+        .iter()
+        .enumerate()
+        .flat_map(|(i, a)| types[i + 1..].iter().map(move |b| (a, b)))
+        .filter(|(a, b)| a.1 == b.1)
+        .map(|(a, b)| (a.0, b.0))
+        .collect();
+    assert!(same.is_empty(), "one type under two names: {same:?}");
+}
+
 fn local() -> NodeIdentity {
     NodeIdentity::new(NodeId(1), 1)
 }
@@ -25,8 +47,11 @@ fn descriptor_for(fingerprint: u128) -> RuleDescriptor {
 }
 
 /// Epoch ages from per-slot `current` and `live` columns.
-fn ages(current: &[BucketEpoch], live: &[u32]) -> Vec<RuleAge> {
-    let epoch = |(&current, &live)| RuleAge::Epoch { current, live };
+fn ages(current: &[u32], live: &[u32]) -> Vec<RuleAge> {
+    let epoch = |(&current, &live)| RuleAge::Epoch {
+        current: BucketEpoch(current),
+        live,
+    };
     current.iter().zip(live).map(epoch).collect()
 }
 
@@ -71,7 +96,15 @@ fn remote_merge_one(
 ) -> CellHandle {
     let mut obs = ObservationBatch::with_capacity(1);
     let mut sink = DeltaSink::with_capacity(1);
-    obs.push(observation(rule_fp, 0xabc, 0, origin, inc, count, ts));
+    obs.push(observation(
+        rule_fp,
+        0xabc,
+        BucketEpoch(0),
+        origin,
+        inc,
+        count,
+        ts,
+    ));
     store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     // A no-op merge (count <= stored) leaves the sink empty; recover the
     // handle via key lookup instead.
@@ -87,7 +120,7 @@ fn remote_merge_one(
         .find(CompactCellKey {
             rule: rule_slot,
             key_hash: KeyHash(0xabc),
-            bucket: 0,
+            bucket: BucketEpoch(0),
             origin: node_slot,
             incarnation: inc,
         })
@@ -212,7 +245,7 @@ fn remote_observation(row: &RemoteRow) -> Observation {
     observation(
         0x100 + row.rule as u128,
         0x200 + row.key as u128,
-        row.bucket as BucketEpoch,
+        BucketEpoch(row.bucket as u32),
         row.origin as u128,
         row.incarnation as Incarnation,
         row.count,
@@ -237,7 +270,7 @@ fn apply_local_rows(store: &mut CellStore, rows: &[LocalRow]) -> DeltaSink {
         obs.push(observation(
             0x100 + row.rule as u128,
             0x200 + row.key as u128,
-            row.bucket as BucketEpoch,
+            BucketEpoch(row.bucket as u32),
             row.ignored_origin as u128,
             row.ignored_incarnation as Incarnation,
             row.hits,
@@ -248,7 +281,7 @@ fn apply_local_rows(store: &mut CellStore, rows: &[LocalRow]) -> DeltaSink {
     sink
 }
 
-type PortableKey = (u128, u128, BucketEpoch, u128, Incarnation);
+type PortableKey = (u128, u128, u32, u128, Incarnation);
 
 fn remote_model(rows: &[RemoteRow]) -> BTreeMap<PortableKey, u32> {
     let mut model = BTreeMap::new();
@@ -256,7 +289,7 @@ fn remote_model(rows: &[RemoteRow]) -> BTreeMap<PortableKey, u32> {
         let key = (
             0x100 + row.rule as u128,
             0x200 + row.key as u128,
-            row.bucket as BucketEpoch,
+            row.bucket as u32,
             row.origin as u128,
             row.incarnation as Incarnation,
         );
@@ -274,7 +307,7 @@ fn local_model(rows: &[LocalRow]) -> BTreeMap<PortableKey, u32> {
         let key = (
             0x100 + row.rule as u128,
             0x200 + row.key as u128,
-            row.bucket as BucketEpoch,
+            row.bucket as u32,
             local().node_id.0,
             local().incarnation,
         );
@@ -294,7 +327,7 @@ fn portable_key(store: &CellStore, handle: CellHandle) -> PortableKey {
     (
         rule.fingerprint,
         row.key.key_hash.0,
-        row.key.bucket,
+        row.key.bucket.0,
         origin.node_id.0,
         origin.incarnation,
     )
@@ -315,7 +348,7 @@ fn assert_structural_invariants(store: &CellStore) -> bool {
     let mut active = 0_u32;
     let mut rules = BTreeMap::<RuleSlot, u32>::new();
     let mut nodes = BTreeMap::<NodeSlot, u32>::new();
-    let mut identities = BTreeSet::<(RuleSlot, u128, BucketEpoch, NodeSlot, Incarnation)>::new();
+    let mut identities = BTreeSet::<(RuleSlot, u128, u32, NodeSlot, Incarnation)>::new();
 
     for handle in store.active_handles(0) {
         active += 1;
@@ -331,7 +364,7 @@ fn assert_structural_invariants(store: &CellStore) -> bool {
         if !identities.insert((
             row.key.rule,
             row.key.key_hash.0,
-            row.key.bucket,
+            row.key.bucket.0,
             row.key.origin,
             row.key.incarnation,
         )) {
@@ -343,24 +376,24 @@ fn assert_structural_invariants(store: &CellStore) -> bool {
 
     *nodes.entry(store.local_node_slot()).or_default() += 1;
 
-    if active != store.active_len() || store.index().len() != active {
+    if active != store.active_len() || store.index.len() != active {
         return false;
     }
     for slot in 0..store.rule_dictionary().capacity() {
-        let expected = rules.get(&slot).copied().unwrap_or(0);
-        if store.rule_dictionary().refcount(slot) != expected {
+        let expected = rules.get(&RuleSlot(slot)).copied().unwrap_or(0);
+        if store.rule_dictionary().refcount(RuleSlot(slot)) != expected {
             return false;
         }
-        if (store.rule_dictionary().descriptor(slot).is_some()) != (expected > 0) {
+        if (store.rule_dictionary().descriptor(RuleSlot(slot)).is_some()) != (expected > 0) {
             return false;
         }
     }
     for slot in 0..store.node_dictionary().capacity() {
-        let expected = nodes.get(&slot).copied().unwrap_or(0);
-        if store.node_dictionary().refcount(slot) != expected {
+        let expected = nodes.get(&NodeSlot(slot)).copied().unwrap_or(0);
+        if store.node_dictionary().refcount(NodeSlot(slot)) != expected {
             return false;
         }
-        if (store.node_dictionary().descriptor(slot).is_some()) != (expected > 0) {
+        if (store.node_dictionary().descriptor(NodeSlot(slot)).is_some()) != (expected > 0) {
             return false;
         }
     }
@@ -425,7 +458,7 @@ fn quickcheck_delta_sink_rows_are_exact_remote_raises(rows: RemoteRows) -> bool 
         let key = (
             0x100 + row.rule as u128,
             0x200 + row.key as u128,
-            row.bucket as BucketEpoch,
+            row.bucket as u32,
             row.origin as u128,
             row.incarnation as Incarnation,
         );
@@ -445,7 +478,7 @@ fn quickcheck_delta_sink_rows_are_exact_remote_raises(rows: RemoteRows) -> bool 
                 || sink.deltas[i] != row.count.saturating_sub(previous)
                 || sink.keys[i].rule_fingerprint != key.0
                 || sink.keys[i].key_hash.0 != key.1
-                || sink.keys[i].bucket != key.2
+                || sink.keys[i].bucket.0 != key.2
             {
                 return false;
             }
@@ -482,8 +515,8 @@ fn quickcheck_expire_frees_exactly_aged_out_cells(
     let expected_expired: BTreeSet<u32> = before
         .iter()
         .filter(|row| {
-            (row.key.bucket as u64) + (live[row.key.rule as usize] as u64)
-                < current[row.key.rule as usize] as u64
+            u64::from(row.key.bucket.0) + u64::from(live[row.key.rule.index()])
+                < u64::from(current[row.key.rule.index()])
         })
         .map(|row| row.handle.index)
         .collect();
@@ -526,7 +559,7 @@ fn merge_remote_is_monotonic() {
     let mut sink = DeltaSink::with_capacity(4);
 
     let mut obs = ObservationBatch::with_capacity(1);
-    obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 100));
+    obs.push(observation(0x11, 0xabc, BucketEpoch(0), 7, 1, 5, 100));
     store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 1);
     let handle = sink.handles[0];
@@ -536,14 +569,14 @@ fn merge_remote_is_monotonic() {
     // Stale (3 < 5) — no delta.
     sink.clear();
     let mut obs2 = ObservationBatch::with_capacity(1);
-    obs2.push(observation(0x11, 0xabc, 0, 7, 1, 3, 200));
+    obs2.push(observation(0x11, 0xabc, BucketEpoch(0), 7, 1, 3, 200));
     store.merge_remote(&obs2, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 0);
 
     // Higher (8 > 5) — delta of 3.
     sink.clear();
     let mut obs3 = ObservationBatch::with_capacity(1);
-    obs3.push(observation(0x11, 0xabc, 0, 7, 1, 8, 300));
+    obs3.push(observation(0x11, 0xabc, BucketEpoch(0), 7, 1, 8, 300));
     store.merge_remote(&obs3, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 1);
     assert_eq!(sink.previous[0], 5);
@@ -593,8 +626,8 @@ fn merge_order_does_not_matter() {
 fn increment_local_accumulates() {
     let mut store = store();
     store.intern_rule(descriptor_for(0x11)).unwrap();
-    let handle = local_increment_one(&mut store, 0x11, 0xabc, 0, 3, 10);
-    let _ = local_increment_one(&mut store, 0x11, 0xabc, 0, 4, 20);
+    let handle = local_increment_one(&mut store, 0x11, 0xabc, BucketEpoch(0), 3, 10);
+    let _ = local_increment_one(&mut store, 0x11, 0xabc, BucketEpoch(0), 4, 20);
     let row = store.get(handle).unwrap();
     assert_eq!(row.count, 7);
     assert_eq!(row.last_update_millis, 20);
@@ -606,10 +639,10 @@ fn capacity_is_enforced_without_growing() {
     store.intern_rule(descriptor_for(0x11)).unwrap();
     let mut sink = DeltaSink::with_capacity(2);
     let mut a = ObservationBatch::with_capacity(1);
-    a.push(observation(0x11, 0xabc, 0, 1, 1, 1, 0));
+    a.push(observation(0x11, 0xabc, BucketEpoch(0), 1, 1, 1, 0));
     store.merge_remote(&a, &mut sink, RelayMark::Clear);
     let mut b = ObservationBatch::with_capacity(1);
-    b.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
+    b.push(observation(0x11, 0xabc, BucketEpoch(0), 2, 1, 1, 0));
     sink.clear();
     store.merge_remote(&b, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 0); // second insert was rejected
@@ -627,7 +660,7 @@ fn bucket_boundary_expires_in_batches_without_growth() {
     store.intern_rule(descriptor_for(0x11)).unwrap();
     let mut batch = ObservationBatch::with_capacity(20);
     for key in 0..20 {
-        batch.push(observation(0x11, key, 0, 1, 1, 1_u32, 0));
+        batch.push(observation(0x11, key, BucketEpoch(0), 1, 1, 1_u32, 0));
     }
     store.ingest_local(&batch, &mut DeltaSink::with_capacity(20));
     let mut sink = ExpirationSink::with_capacity(8);
@@ -666,7 +699,7 @@ fn library_warning_names_both_spellings() {
         let mut sink = DeltaSink::with_capacity(2);
         for origin in [1, 2] {
             let mut batch = ObservationBatch::with_capacity(1);
-            batch.push(observation(0x11, 0xabc, 0, origin, 1, 1, 0));
+            batch.push(observation(0x11, 0xabc, BucketEpoch(0), origin, 1, 1, 0));
             store.merge_remote(&batch, &mut sink, RelayMark::Clear);
         }
     });
@@ -705,16 +738,16 @@ fn delta_sink_records_exact_raises() {
     store.intern_rule(descriptor_for(0x11)).unwrap();
     let mut sink = DeltaSink::with_capacity(4);
     let mut obs = ObservationBatch::with_capacity(2);
-    obs.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
-    obs.push(observation(0x11, 0xabc, 0, 2, 1, 7, 0));
+    obs.push(observation(0x11, 0xabc, BucketEpoch(0), 1, 1, 5, 0));
+    obs.push(observation(0x11, 0xabc, BucketEpoch(0), 2, 1, 7, 0));
     store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 2);
 
     sink.clear();
     // No-op merges (count <= stored) produce nothing.
     let mut obs2 = ObservationBatch::with_capacity(2);
-    obs2.push(observation(0x11, 0xabc, 0, 1, 1, 5, 0));
-    obs2.push(observation(0x11, 0xabc, 0, 2, 1, 1, 0));
+    obs2.push(observation(0x11, 0xabc, BucketEpoch(0), 1, 1, 5, 0));
+    obs2.push(observation(0x11, 0xabc, BucketEpoch(0), 2, 1, 1, 0));
     store.merge_remote(&obs2, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 0);
 }
@@ -726,8 +759,8 @@ fn delta_applies_locally_reflects_rule_dictionary() {
     // 0x22 fingerprint unknown locally.
     let mut sink = DeltaSink::with_capacity(2);
     let mut obs = ObservationBatch::with_capacity(2);
-    obs.push(observation(0x11, 0xabc, 0, 9, 1, 1, 0));
-    obs.push(observation(0x22, 0xabc, 0, 9, 1, 1, 0));
+    obs.push(observation(0x11, 0xabc, BucketEpoch(0), 9, 1, 1, 0));
+    obs.push(observation(0x22, 0xabc, BucketEpoch(0), 9, 1, 1, 0));
     store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 2);
     assert_eq!(sink.applies_locally[0], 1);
@@ -748,15 +781,15 @@ fn unknown_rule_cells_round_trip() {
 
     let mut sink = DeltaSink::with_capacity(1);
     let mut obs = ObservationBatch::with_capacity(1);
-    obs.push(observation(0x33, 0xabc, 0, 5, 1, 30, 2));
+    obs.push(observation(0x33, 0xabc, BucketEpoch(0), 5, 1, 30, 2));
     store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.applies_locally[0], 0);
 
     // Expire: bucket 0, live = 0, current = 5 -> expired.
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
     let mut live = vec![0_u32; cur.len()];
-    cur[row.key.rule as usize] = 5;
-    live[row.key.rule as usize] = 0;
+    cur[row.key.rule.index()] = 5;
+    live[row.key.rule.index()] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
@@ -774,7 +807,7 @@ fn unconfigured_rule_cells_expire_by_last_update() {
     obs.push(observation(
         0xBEEF,
         0xabc,
-        (t / 100) as BucketEpoch,
+        BucketEpoch((t / 100) as u32),
         100,
         1,
         3,
@@ -819,8 +852,8 @@ fn dictionary_refcount_frees_unreferenced_slots() {
     // Expire the cell.
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
     let mut live = vec![0_u32; cur.len()];
-    cur[rule_slot as usize] = 5;
-    live[rule_slot as usize] = 0;
+    cur[rule_slot.index()] = 5;
+    live[rule_slot.index()] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
@@ -862,8 +895,8 @@ fn configured_rule_pinned_survives_cell_expiry() {
     // Force the cell to expire (bucket 0, current 20, live 0).
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
     let mut live = vec![0_u32; cur.len()];
-    cur[slot as usize] = 20;
-    live[slot as usize] = 0;
+    cur[slot.index()] = 20;
+    live[slot.index()] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert!(store.get(h).is_none());
@@ -883,7 +916,7 @@ fn configured_rule_pinned_survives_cell_expiry() {
     obs.push(observation(
         0xCAFE,
         0xabc,
-        21,
+        BucketEpoch(21),
         local().node_id.0,
         local().incarnation,
         2,
@@ -921,8 +954,8 @@ fn wire_only_rule_frees_when_cells_expire() {
 
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
     let mut live = vec![0_u32; cur.len()];
-    cur[slot as usize] = 20;
-    live[slot as usize] = 0;
+    cur[slot.index()] = 20;
+    live[slot.index()] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
@@ -942,8 +975,8 @@ fn dictionary_full_rejects_with_counter() {
     // A rejected row must not drop the valid row behind it, on either path.
     let mut sink = DeltaSink::with_capacity(2);
     let mut obs = ObservationBatch::with_capacity(2);
-    obs.push(observation(0x20, 0xabc, 0, 3, 1, 1, 0));
-    obs.push(observation(0x10, 0xabd, 0, 3, 1, 1, 0));
+    obs.push(observation(0x20, 0xabc, BucketEpoch(0), 3, 1, 1, 0));
+    obs.push(observation(0x10, 0xabd, BucketEpoch(0), 3, 1, 1, 0));
     store.merge_remote(&obs, &mut sink, RelayMark::Clear);
     assert_eq!(sink.len(), 1);
     store.ingest_local(&obs, &mut sink);
@@ -992,8 +1025,8 @@ fn expire_emits_one_row_per_freed_cell() {
     // Doomed cells: rule_doomed, two origins, bucket 0.
     let mut obs = ObservationBatch::with_capacity(2);
     let mut sink = DeltaSink::with_capacity(2);
-    obs.push(observation(0x22, 0xabc, 0, 5, 1, 7, 100));
-    obs.push(observation(0x22, 0xdef, 0, 6, 1, 11, 200));
+    obs.push(observation(0x22, 0xabc, BucketEpoch(0), 5, 1, 7, 100));
+    obs.push(observation(0x22, 0xdef, BucketEpoch(0), 6, 1, 11, 200));
     store.merge_remote(&obs, &mut sink, RelayMark::Clear);
 
     let rule_local_slot = store.rule_dictionary.find(0x11).unwrap();
@@ -1006,7 +1039,7 @@ fn expire_emits_one_row_per_freed_cell() {
         .find(CompactCellKey {
             rule: rule_doomed,
             key_hash: KeyHash(0xabc),
-            bucket: 0,
+            bucket: BucketEpoch(0),
             origin: node5,
             incarnation: 1,
         })
@@ -1015,7 +1048,7 @@ fn expire_emits_one_row_per_freed_cell() {
         .find(CompactCellKey {
             rule: rule_doomed,
             key_hash: KeyHash(0xdef),
-            bucket: 0,
+            bucket: BucketEpoch(0),
             origin: node6,
             incarnation: 1,
         })
@@ -1030,10 +1063,10 @@ fn expire_emits_one_row_per_freed_cell() {
     // the keep cell on rule_local stays because its rule lives 1000 buckets.
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
     let mut live = vec![0_u32; cur.len()];
-    cur[rule_doomed as usize] = 5;
-    live[rule_doomed as usize] = 0;
-    cur[rule_local as usize] = 0;
-    live[rule_local as usize] = 1000;
+    cur[rule_doomed.index()] = 5;
+    live[rule_doomed.index()] = 0;
+    cur[rule_local.index()] = 0;
+    live[rule_local.index()] = 1000;
 
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
@@ -1080,8 +1113,8 @@ fn expire_frees_slots_and_dictionary_refs() {
 
     let mut cur = vec![0_u32; store.rule_dictionary().capacity() as usize];
     let mut live = vec![0_u32; cur.len()];
-    cur[rule_slot as usize] = 5;
-    live[rule_slot as usize] = 0;
+    cur[rule_slot.index()] = 5;
+    live[rule_slot.index()] = 0;
     let mut exp = ExpirationSink::with_capacity(store.capacity() as usize);
     assert_eq!(store.expire(&ages(&cur, &live), &mut exp), Expiry::Done);
     assert_eq!(store.active_len(), 0);
@@ -1122,8 +1155,8 @@ fn expire_at_and_expire_agree_for_same_now() {
         // (still inside the live window for now=300 -> current=6, live=2).
         let mut obs = ObservationBatch::with_capacity(2);
         let mut sink = DeltaSink::with_capacity(2);
-        obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
-        obs.push(observation(0x11, 0xdef, 5, 8, 1, 5, 250));
+        obs.push(observation(0x11, 0xabc, BucketEpoch(0), 7, 1, 5, 0));
+        obs.push(observation(0x11, 0xdef, BucketEpoch(5), 8, 1, 5, 250));
         s.merge_remote(&obs, &mut sink, RelayMark::Clear);
         s
     };
@@ -1143,8 +1176,8 @@ fn expire_at_and_expire_agree_for_same_now() {
     let mut cur = vec![0_u32; dict_cap];
     let mut lv = vec![0_u32; dict_cap];
     let rule_slot = b.rule_dictionary.find(0x11).unwrap();
-    cur[rule_slot as usize] = current;
-    lv[rule_slot as usize] = live;
+    cur[rule_slot.index()] = current.0;
+    lv[rule_slot.index()] = live;
     let mut sink_b = ExpirationSink::with_capacity(b.capacity() as usize);
     assert_eq!(b.expire(&ages(&cur, &lv), &mut sink_b), Expiry::Done);
 
@@ -1161,7 +1194,7 @@ fn descriptor_epoch_helpers_pin_window_math() {
         limit: 100,
         applies_locally: true,
     };
-    assert_eq!(rd.current_epoch(12_345), 12);
+    assert_eq!(rd.current_epoch(12_345), BucketEpoch(12));
     assert_eq!(rd.live_buckets(), 10);
 
     // A zero bucket has no epoch: both helpers return 0.
@@ -1170,7 +1203,7 @@ fn descriptor_epoch_helpers_pin_window_math() {
         bucket_millis: 0,
         ..rd
     };
-    assert_eq!(wire_only.current_epoch(12_345), 0);
+    assert_eq!(wire_only.current_epoch(12_345), BucketEpoch(0));
     assert_eq!(wire_only.live_buckets(), 0);
 }
 
@@ -1189,7 +1222,7 @@ fn expire_at_uses_ceil_for_partial_bucket_windows() {
 
     let mut obs = ObservationBatch::with_capacity(1);
     let mut deltas = DeltaSink::with_capacity(1);
-    obs.push(observation(0x11, 0xabc, 0, 7, 1, 5, 0));
+    obs.push(observation(0x11, 0xabc, BucketEpoch(0), 7, 1, 5, 0));
     store.merge_remote(&obs, &mut deltas, RelayMark::Clear);
 
     let mut expirations = ExpirationSink::with_capacity(store.capacity() as usize);
@@ -1240,7 +1273,7 @@ fn assert_invariants_with_pinned_rules(store: &CellStore, pinned_rule_slots: &[R
     let mut active = 0_u32;
     let mut rules = BTreeMap::<RuleSlot, u32>::new();
     let mut nodes = BTreeMap::<NodeSlot, u32>::new();
-    let mut identities = BTreeSet::<(RuleSlot, u128, BucketEpoch, NodeSlot, Incarnation)>::new();
+    let mut identities = BTreeSet::<(RuleSlot, u128, u32, NodeSlot, Incarnation)>::new();
 
     for handle in store.active_handles(0) {
         active += 1;
@@ -1256,7 +1289,7 @@ fn assert_invariants_with_pinned_rules(store: &CellStore, pinned_rule_slots: &[R
         if !identities.insert((
             row.key.rule,
             row.key.key_hash.0,
-            row.key.bucket,
+            row.key.bucket.0,
             row.key.origin,
             row.key.incarnation,
         )) {
@@ -1270,24 +1303,24 @@ fn assert_invariants_with_pinned_rules(store: &CellStore, pinned_rule_slots: &[R
     }
     *nodes.entry(store.local_node_slot()).or_default() += 1;
 
-    if active != store.active_len() || store.index().len() != active {
+    if active != store.active_len() || store.index.len() != active {
         return false;
     }
     for slot in 0..store.rule_dictionary().capacity() {
-        let expected = rules.get(&slot).copied().unwrap_or(0);
-        if store.rule_dictionary().refcount(slot) != expected {
+        let expected = rules.get(&RuleSlot(slot)).copied().unwrap_or(0);
+        if store.rule_dictionary().refcount(RuleSlot(slot)) != expected {
             return false;
         }
-        if (store.rule_dictionary().descriptor(slot).is_some()) != (expected > 0) {
+        if (store.rule_dictionary().descriptor(RuleSlot(slot)).is_some()) != (expected > 0) {
             return false;
         }
     }
     for slot in 0..store.node_dictionary().capacity() {
-        let expected = nodes.get(&slot).copied().unwrap_or(0);
-        if store.node_dictionary().refcount(slot) != expected {
+        let expected = nodes.get(&NodeSlot(slot)).copied().unwrap_or(0);
+        if store.node_dictionary().refcount(NodeSlot(slot)) != expected {
             return false;
         }
-        if (store.node_dictionary().descriptor(slot).is_some()) != (expected > 0) {
+        if (store.node_dictionary().descriptor(NodeSlot(slot)).is_some()) != (expected > 0) {
             return false;
         }
     }
@@ -1376,7 +1409,7 @@ fn apply_mixed_op_with_sinks(
             obs.push(observation(
                 0x100 + row.rule as u128,
                 0x200 + row.key as u128,
-                row.bucket as BucketEpoch,
+                BucketEpoch(row.bucket as u32),
                 row.ignored_origin as u128,
                 row.ignored_incarnation as Incarnation,
                 row.hits,
@@ -1392,8 +1425,8 @@ fn apply_mixed_op_with_sinks(
             for fp_idx in 0..4 {
                 let fp = 0x100 + fp_idx as u128;
                 if let Some(slot) = store.rule_dictionary.find(fp) {
-                    cur[slot as usize] = tick.current_by_fp[fp_idx] as u32;
-                    live[slot as usize] = tick.live_by_fp[fp_idx] as u32;
+                    cur[slot.index()] = tick.current_by_fp[fp_idx] as u32;
+                    live[slot.index()] = tick.live_by_fp[fp_idx] as u32;
                 }
             }
             assert_eq!(store.expire(&ages(&cur, &live), exp_sink), Expiry::Done);
@@ -1407,7 +1440,7 @@ fn apply_mixed_op_to_model(model: &mut BTreeMap<PortableKey, u32>, op: &MixedOp)
             let key = (
                 0x100 + row.rule as u128,
                 0x200 + row.key as u128,
-                row.bucket as BucketEpoch,
+                row.bucket as u32,
                 row.origin as u128,
                 row.incarnation as Incarnation,
             );
@@ -1420,7 +1453,7 @@ fn apply_mixed_op_to_model(model: &mut BTreeMap<PortableKey, u32>, op: &MixedOp)
             let key = (
                 0x100 + row.rule as u128,
                 0x200 + row.key as u128,
-                row.bucket as BucketEpoch,
+                row.bucket as u32,
                 local().node_id.0,
                 local().incarnation,
             );
@@ -1537,7 +1570,7 @@ fn stream_lists_match_model(ops: MixedOps) -> bool {
             let key = (
                 0x100 + row.rule as u128,
                 0x200 + row.key as u128,
-                row.bucket as BucketEpoch,
+                row.bucket as u32,
                 row.origin as u128,
                 row.incarnation as Incarnation,
             );
@@ -1677,7 +1710,7 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
         obs.push(observation(
             fp,
             0x200 + row.key as u128,
-            row.bucket as BucketEpoch,
+            BucketEpoch(row.bucket as u32),
             origin,
             inc,
             row.count,
@@ -1700,13 +1733,7 @@ fn quickcheck_capacity_rejections_are_counted_and_invariants_hold(
             }
             interned_nodes.insert((origin, inc));
         }
-        let key = (
-            fp,
-            0x200 + row.key as u128,
-            row.bucket as BucketEpoch,
-            origin,
-            inc,
-        );
+        let key = (fp, 0x200 + row.key as u128, row.bucket as u32, origin, inc);
         if let Some(stored) = cells.get_mut(&key) {
             *stored = (*stored).max(row.count);
         } else if cells.len() >= 4 {
@@ -1774,7 +1801,7 @@ fn quickcheck_count_saturates_without_overflow(rows: HitRows) -> bool {
         obs.push(Observation {
             rule_fingerprint: 0x100,
             key_hash: KeyHash(0xabc),
-            bucket: 0,
+            bucket: BucketEpoch(0),
             origin: NodeId(1),
             incarnation: 1,
             count: row.hits,
@@ -1871,10 +1898,10 @@ fn quickcheck_expire_at_matches_expire_for_varied_rules(
     let mut cur = vec![0_u32; dict_cap];
     let mut live = vec![0_u32; dict_cap];
     for slot in 0..dict_cap {
-        if let Some(d) = store_b.rule_dictionary().descriptor(slot as RuleSlot)
+        if let Some(d) = store_b.rule_dictionary().descriptor(RuleSlot(slot as u16))
             && d.bucket_millis > 0
         {
-            cur[slot] = (now_millis / d.bucket_millis as u64) as BucketEpoch;
+            cur[slot] = (now_millis / d.bucket_millis as u64) as u32;
             live[slot] = (d.window_millis / d.bucket_millis).max(1);
         }
     }
@@ -1932,7 +1959,7 @@ fn wrap_run(t0: u64) -> (u64, u64, usize) {
         batch.push(observation(
             rule.fingerprint(),
             7,
-            t as BucketEpoch,
+            BucketEpoch(t as u32),
             node.node_id.0,
             node.incarnation,
             1 + u32::from(t == t0),
@@ -2013,7 +2040,7 @@ fn own_cell_marked_all_is_never_relayed() {
         obs.push(observation(
             fingerprint,
             7,
-            0,
+            BucketEpoch(0),
             origin,
             incarnation,
             count,

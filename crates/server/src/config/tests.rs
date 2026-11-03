@@ -9,6 +9,12 @@ use gabion::zone::ZoneError;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
+/// [`AppConfig::load`] with inline YAML in place of the file.
+fn load_with_yaml_str(yaml: &str) -> Result<AppConfig, ConfigError> {
+    let builder = Config::builder().add_source(File::from_str(yaml, FileFormat::Yaml));
+    AppConfig::from_yaml(builder.build().map_err(ConfigError::Config)?)
+}
+
 /// Held for the duration of any test that mutates the env. Guarantees
 /// `set_env` / `clear_all` see a consistent view of the process env.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -72,7 +78,7 @@ fn defaults_apply_when_neither_yaml_nor_env_set_a_value() {
 fn yaml_values_load_when_no_env_overrides() {
     let _env = EnvGuard::lock();
 
-    let cfg = AppConfig::load_with_yaml_str(
+    let cfg = load_with_yaml_str(
         "envoy_bind: \"127.0.0.1:8000\"\nstorage:\n  max_cells: 256\n  rule_dictionary_capacity: \
          8\ngossip:\n  bind: \"127.0.0.1:9000\"\n  peer_capacity: 300\n  target_err_bps: 250\n  \
          min_emit_interval: 7ms\n",
@@ -95,7 +101,7 @@ fn env_overrides_yaml_for_scalars() {
     set_env("GABION_GOSSIP_PEER_CAPACITY", "400");
     set_env("GABION_GOSSIP_TARGET_ERR_BPS", "250");
 
-    let cfg = AppConfig::load_with_yaml_str(
+    let cfg = load_with_yaml_str(
         "storage:\n  max_cells: 256\n  rule_dictionary_capacity: 8\ngossip:\n  peer_capacity: \
          300\n  target_err_bps: 100\n",
     )
@@ -273,8 +279,7 @@ fn setting_table_spellings_parse() {
             Some((block, key)) => format!("{block}:\n{bind}  {key}: {value}\n"),
             None => format!("{}: {value}\n", setting.yaml_key()),
         };
-        let from_yaml =
-            AppConfig::load_with_yaml_str(&yaml).unwrap_or_else(|error| panic!("{yaml}: {error}"));
+        let from_yaml = load_with_yaml_str(&yaml).unwrap_or_else(|error| panic!("{yaml}: {error}"));
         assert_eq!(from_yaml.settings, expected, "{yaml}");
     }
 }
@@ -303,7 +308,7 @@ fn bootstrap_peers_parse_in_gabiond() {
     clear_all_env();
     let yaml = "gossip:\n  bind: 0.0.0.0:9000\n  bootstrap_peers: [\"10.0.0.2:9000\", \
                 \"10.0.0.3:9000\"]\n";
-    check(AppConfig::load_with_yaml_str(yaml).expect("yaml loads"));
+    check(load_with_yaml_str(yaml).expect("yaml loads"));
 }
 
 /// An empty or invalid zone fails gabiond's load.
@@ -323,8 +328,7 @@ fn invalid_zone_fails_load_in_gabiond() {
         "{err:?}"
     );
     clear_all_env();
-    let err =
-        AppConfig::load_with_yaml_str("gossip:\n  zone: \"bad zone\"\n").expect_err("a space");
+    let err = load_with_yaml_str("gossip:\n  zone: \"bad zone\"\n").expect_err("a space");
     assert!(
         matches!(
             err,
@@ -361,13 +365,13 @@ fn unknown_yaml_key_fails_naming_it() {
             "limits[0].descriptors[0].vaule",
         ),
     ] {
-        let err = AppConfig::load_with_yaml_str(&yaml).expect_err(key);
+        let err = load_with_yaml_str(&yaml).expect_err(key);
         assert!(
             matches!(err, ConfigError::UnknownKey(ref unknown) if unknown == key),
             "{yaml}: {err:?}"
         );
     }
-    let err = AppConfig::load_with_yaml_str("gossip:\n  tick_intervl: 1s\n").unwrap_err();
+    let err = load_with_yaml_str("gossip:\n  tick_intervl: 1s\n").unwrap_err();
     assert_eq!(
         err.to_string(),
         "The configuration file sets `gossip.tick_intervl`, which gabiond does not know. This key \
@@ -381,7 +385,7 @@ fn unknown_yaml_key_fails_naming_it() {
 #[test]
 fn yaml_value_shapes_load_or_fail_typed() {
     let _env = EnvGuard::lock();
-    let loaded = |yaml: &str| AppConfig::load_with_yaml_str(yaml).map(|cfg| cfg.settings);
+    let loaded = |yaml: &str| load_with_yaml_str(yaml).map(|cfg| cfg.settings);
     let wrong_shape = |yaml: &str, expected: Setting| match loaded(yaml) {
         Err(ConfigError::WrongShape { setting, .. }) => assert_eq!(setting, expected, "{yaml}"),
         other => panic!("{yaml}: {other:?}"),
@@ -431,7 +435,7 @@ fn empty_env_list_fails_load_over_a_yaml_list() {
         for empty in ["", " , "] {
             clear_all_env();
             set_env(var, empty);
-            let err = AppConfig::load_with_yaml_str(yaml).expect_err(var);
+            let err = load_with_yaml_str(yaml).expect_err(var);
             assert!(
                 matches!(
                     err,
@@ -449,8 +453,8 @@ fn env_list_replaces_the_yaml_list() {
     let _env = EnvGuard::lock();
     set_env("GABION_DISCOVERY_NAMESPACE_ALLOW", "b,c");
 
-    let cfg = AppConfig::load_with_yaml_str("discovery:\n  namespace_allow: [a]\n")
-        .expect("load yaml + env list");
+    let cfg =
+        load_with_yaml_str("discovery:\n  namespace_allow: [a]\n").expect("load yaml + env list");
 
     assert_eq!(&*cfg.settings.namespace_allow, ["b", "c"].map(Box::from));
 }
@@ -458,7 +462,7 @@ fn env_list_replaces_the_yaml_list() {
 #[test]
 fn rate_only_yaml_infers_window_and_bucket() {
     let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
+    let cfg = load_with_yaml_str(
         "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
          10r/m\n",
     )
@@ -473,7 +477,7 @@ fn rate_only_yaml_infers_window_and_bucket() {
 #[test]
 fn explicit_window_scales_limit_up() {
     let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
+    let cfg = load_with_yaml_str(
         "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
          10r/s\n    window: 5h\n",
     )
@@ -489,7 +493,7 @@ fn explicit_window_scales_limit_up() {
 #[test]
 fn explicit_window_and_bucket_set_live_buckets() {
     let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
+    let cfg = load_with_yaml_str(
         "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
          10r/s\n    window: 5h\n    bucket: 1h\n",
     )
@@ -503,7 +507,7 @@ fn explicit_window_and_bucket_set_live_buckets() {
 #[test]
 fn bucket_defaults_to_window_when_omitted() {
     let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
+    let cfg = load_with_yaml_str(
         "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
          10r/m\n",
     )
@@ -516,7 +520,7 @@ fn bucket_defaults_to_window_when_omitted() {
 #[test]
 fn explicit_bucket_overrides_window() {
     let _env = EnvGuard::lock();
-    let cfg = AppConfig::load_with_yaml_str(
+    let cfg = load_with_yaml_str(
         "limits:\n  - name: per_ip\n    domain: nginx\n    descriptors: [{ key: ip }]\n    rate: \
          10r/m\n    bucket: 1s\n",
     )
@@ -532,25 +536,24 @@ fn cluster_id_hash_accepts_integer_decimal_and_hex_strings() {
     // reach the cluster id's parser, so `cluster_id_hash: 1` loads.
     let _env = EnvGuard::lock();
 
-    let integer_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: 1\n")
+    let integer_cfg = load_with_yaml_str("gossip:\n  cluster_id_hash: 1\n")
         .expect("integer cluster_id_hash should load");
     assert_eq!(integer_cfg.settings.cluster_id_hash.get(), 1);
 
-    let decimal_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: \"42\"\n")
+    let decimal_cfg = load_with_yaml_str("gossip:\n  cluster_id_hash: \"42\"\n")
         .expect("decimal-string cluster_id_hash should load");
     assert_eq!(decimal_cfg.settings.cluster_id_hash.get(), 42);
 
-    let hex_cfg = AppConfig::load_with_yaml_str("gossip:\n  cluster_id_hash: \"0xff\"\n")
+    let hex_cfg = load_with_yaml_str("gossip:\n  cluster_id_hash: \"0xff\"\n")
         .expect("hex-string cluster_id_hash should load");
     assert_eq!(hex_cfg.settings.cluster_id_hash.get(), 0xff);
 
     // Above-u64 values must round-trip when expressed as a hex string —
     // YAML's integer scalar can't hold a u128 max anyway, but the env-
     // and string-shaped paths can.
-    let big_cfg = AppConfig::load_with_yaml_str(
-        "gossip:\n  cluster_id_hash: \"0xffffffffffffffffffffffffffffffff\"\n",
-    )
-    .expect("u128 max hex string should load");
+    let big_cfg =
+        load_with_yaml_str("gossip:\n  cluster_id_hash: \"0xffffffffffffffffffffffffffffffff\"\n")
+            .expect("u128 max hex string should load");
     assert_eq!(big_cfg.settings.cluster_id_hash.get(), u128::MAX);
 }
 
@@ -564,7 +567,7 @@ fn cluster_id_hash_rejects_zero() {
         "gossip:\n  cluster_id_hash: \"0x0\"\n",
     ] {
         assert!(
-            AppConfig::load_with_yaml_str(yaml).is_err(),
+            load_with_yaml_str(yaml).is_err(),
             "{yaml:?} should be rejected"
         );
     }
@@ -705,7 +708,7 @@ fn rule_def_rejects_what_both_adapters_rejected() {
         ),
     ];
     for (yaml, expected) in rows {
-        match AppConfig::load_with_yaml_str(&yaml) {
+        match load_with_yaml_str(&yaml) {
             Err(ConfigError::Rule(error)) => assert_eq!(error, expected, "{yaml}"),
             other => panic!("{yaml}: {other:?}"),
         }

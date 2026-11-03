@@ -24,7 +24,7 @@
 //! When `cell_count == 0` the body is empty (no dict section). All integers
 //! are little-endian; no alignment requirement.
 
-use crate::crdt::{CellHandle, CellRow, CellStore, KeyHash, NodeId, Observation};
+use crate::crdt::{BucketEpoch, CellHandle, CellRow, CellStore, KeyHash, NodeId, Observation};
 
 use super::{DecodeError, read_u32, read_u64, read_u128};
 
@@ -160,8 +160,8 @@ fn plan_packet(
             continue;
         };
 
-        let rule_unseen = scratch.rule_remap[row.key.rule as usize] == u8::MAX;
-        let node_unseen = scratch.node_remap[row.key.origin as usize] == u8::MAX;
+        let rule_unseen = scratch.rule_remap[row.key.rule.index()] == u8::MAX;
+        let node_unseen = scratch.node_remap[row.key.origin.index()] == u8::MAX;
         let new_r = r as usize + if rule_unseen { 1 } else { 0 };
         let new_d = d as usize + if node_unseen { 1 } else { 0 };
 
@@ -180,12 +180,12 @@ fn plan_packet(
 
         // Admit: assign per-packet slots if unseen.
         if rule_unseen {
-            scratch.rule_remap[row.key.rule as usize] = r;
+            scratch.rule_remap[row.key.rule.index()] = r;
             scratch.rule_fps.push(rule_fp);
             r += 1;
         }
         if node_unseen {
-            scratch.node_remap[row.key.origin as usize] = d;
+            scratch.node_remap[row.key.origin.index()] = d;
             scratch.node_ids.push(node_id);
             d += 1;
         }
@@ -261,12 +261,12 @@ fn write_body(
             continue;
         };
 
-        body[rule_slot_off + i] = scratch.rule_remap[row.key.rule as usize];
+        body[rule_slot_off + i] = scratch.rule_remap[row.key.rule.index()];
         body[key_hash_off + i * 16..key_hash_off + i * 16 + 16]
             .copy_from_slice(&row.key.key_hash.0.to_le_bytes());
         body[bucket_off + i * 4..bucket_off + i * 4 + 4]
-            .copy_from_slice(&row.key.bucket.to_le_bytes());
-        body[node_slot_off + i] = scratch.node_remap[row.key.origin as usize];
+            .copy_from_slice(&row.key.bucket.0.to_le_bytes());
+        body[node_slot_off + i] = scratch.node_remap[row.key.origin.index()];
         body[origin_inc_off + i * 4..origin_inc_off + i * 4 + 4]
             .copy_from_slice(&row.key.incarnation.to_le_bytes());
         body[last_update_off + i * 8..last_update_off + i * 8 + 8]
@@ -346,7 +346,7 @@ pub(crate) fn decode_body(
         on_cell(Observation {
             rule_fingerprint: read_u128(&rule_dict_bytes[rs * 16..]),
             key_hash: KeyHash(read_u128(&key_hash_slab[i * 16..])),
-            bucket: read_u32(&bucket_slab[i * 4..]),
+            bucket: BucketEpoch(read_u32(&bucket_slab[i * 4..])),
             origin: NodeId(read_u128(&node_dict_bytes[ns * 16..])),
             incarnation: read_u32(&origin_inc_slab[i * 4..]),
             count: read_u32(&count_slab[i * 4..]),

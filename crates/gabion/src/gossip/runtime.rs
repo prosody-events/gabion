@@ -415,7 +415,7 @@ where
         // hit for that fingerprint) — the next heartbeat picks it up.
         let hits = u32::try_from(req.hits).unwrap_or(u32::MAX);
         if let Some(slot) = self.store.rule_dictionary().find(req.rule_fingerprint) {
-            let idx = slot as usize;
+            let idx = slot.index();
             let pending = self.rule_pending[idx].saturating_add(hits);
             self.rule_pending[idx] = pending;
             let peers = self.peers.len().max(1) as u64;

@@ -37,20 +37,41 @@ fn all_empty(aggregate: &Aggregate) -> bool {
 #[test]
 fn write_then_read_one_cell() {
     let table = aggregate(8);
-    assert!(writer(&table).add(0x42, 0x99, 7, 3));
-    assert_eq!(table.table().get(0x42, 0x99, 7).expect("found").count, 3);
-    assert!(writer(&table).add(0x42, 0x99, 7, 5));
-    assert_eq!(table.table().get(0x42, 0x99, 7).expect("found").count, 8);
+    assert!(writer(&table).add(0x42, 0x99, BucketEpoch(7), 3));
+    assert_eq!(
+        table
+            .table()
+            .get(0x42, 0x99, BucketEpoch(7))
+            .expect("found")
+            .count,
+        3
+    );
+    assert!(writer(&table).add(0x42, 0x99, BucketEpoch(7), 5));
+    assert_eq!(
+        table
+            .table()
+            .get(0x42, 0x99, BucketEpoch(7))
+            .expect("found")
+            .count,
+        8
+    );
 }
 
 #[test]
 fn expiration_subtracts_then_empties_the_slot() {
     let table = aggregate(8);
-    writer(&table).add(0x42, 0x99, 7, 5);
-    writer(&table).subtract(0x42, 0x99, 7, 2);
-    assert_eq!(table.table().get(0x42, 0x99, 7).expect("found").count, 3);
-    writer(&table).subtract(0x42, 0x99, 7, 3);
-    assert!(table.table().get(0x42, 0x99, 7).is_none());
+    writer(&table).add(0x42, 0x99, BucketEpoch(7), 5);
+    writer(&table).subtract(0x42, 0x99, BucketEpoch(7), 2);
+    assert_eq!(
+        table
+            .table()
+            .get(0x42, 0x99, BucketEpoch(7))
+            .expect("found")
+            .count,
+        3
+    );
+    writer(&table).subtract(0x42, 0x99, BucketEpoch(7), 3);
+    assert!(table.table().get(0x42, 0x99, BucketEpoch(7)).is_none());
     assert!(all_empty(&table));
 }
 
@@ -58,7 +79,7 @@ fn expiration_subtracts_then_empties_the_slot() {
 fn window_total_sums_live_buckets() {
     let table = aggregate(16);
     for (bucket, count) in [(99, 100), (100, 4), (101, 7), (102, 2)] {
-        writer(&table).add(0xaa, 0xbb, bucket, count);
+        writer(&table).add(0xaa, 0xbb, BucketEpoch(bucket), count);
     }
     let total = table
         .table()
@@ -71,13 +92,20 @@ fn window_total_sums_live_buckets() {
 #[test]
 fn collisions_are_resolved_by_probing() {
     let table = aggregate(4);
-    let home = |key| mix_index(1, key, 0) & table.table().mask();
+    let home = |key| mix_index(1, key, BucketEpoch(0)) & table.table().mask();
     let keys: Vec<u128> = (0..).filter(|&key| home(key) == home(0)).take(4).collect();
     for (count, &key) in (1..).zip(&keys) {
-        assert!(writer(&table).add(1, key, 0, count));
+        assert!(writer(&table).add(1, key, BucketEpoch(0), count));
     }
     for (count, &key) in (1..).zip(&keys) {
-        assert_eq!(table.table().get(1, key, 0).expect("found").count, count);
+        assert_eq!(
+            table
+                .table()
+                .get(1, key, BucketEpoch(0))
+                .expect("found")
+                .count,
+            count
+        );
     }
 }
 
@@ -92,10 +120,13 @@ fn aggregate_table_matches_model(ops: Vec<(u8, u8, bool)>) -> bool {
         let cell = (u128::from(key % 16), u32::from(bucket % 4));
         let count = model.entry(cell).or_default();
         if expire && *count > 0 {
-            writer(&table).subtract(1, cell.0, cell.1, *count);
+            writer(&table).subtract(1, cell.0, BucketEpoch(cell.1), *count);
             *count = 0;
         } else {
-            assert!(writer(&table).add(1, cell.0, cell.1, 1), "dropped a write");
+            assert!(
+                writer(&table).add(1, cell.0, BucketEpoch(cell.1), 1),
+                "dropped a write"
+            );
             *count += 1;
         }
     }
@@ -108,7 +139,7 @@ fn aggregate_table_matches_model(ops: Vec<(u8, u8, bool)>) -> bool {
     });
     for (&(key, bucket), &count) in &model {
         if count > 0 {
-            writer(&table).subtract(1, key, bucket, count);
+            writer(&table).subtract(1, key, BucketEpoch(bucket), count);
         }
     }
     totals_match && table.table().occupied() == 0
@@ -139,20 +170,20 @@ fn full_aggregate_allows_and_logs() {
     let none = ExpirationSink::default();
     let ((), logs) = with_logs(|| {
         for bucket in 0..MAX_PROBE as u32 {
-            table.apply(&delta(bucket, 1), &none);
+            table.apply(&delta(BucketEpoch(bucket), 1), &none);
         }
         assert_eq!(table.dropped.load(std_atomic::Ordering::Relaxed), 0);
-        table.apply(&delta(MAX_PROBE as u32, 1), &none);
-        table.apply(&delta(0, 1), &none);
+        table.apply(&delta(BucketEpoch(MAX_PROBE as u32), 1), &none);
+        table.apply(&delta(BucketEpoch(0), 1), &none);
     });
     assert_eq!(table.dropped.load(std_atomic::Ordering::Relaxed), 1);
     let view = table.table();
-    assert!(view.get(1, 2, MAX_PROBE as u32).is_none());
+    assert!(view.get(1, 2, BucketEpoch(MAX_PROBE as u32)).is_none());
     assert_eq!(
         view.window_total(spec(1, 1, 1, 1), KeyHash(2), u64::from(MAX_PROBE as u32)),
         0
     );
-    assert_eq!(view.get(1, 2, 0).expect("kept").count, 2);
+    assert_eq!(view.get(1, 2, BucketEpoch(0)).expect("kept").count, 2);
     assert_eq!(logs.matches("code=\"aggregate_full\"").count(), 1, "{logs}");
     for knob in [
         "storage.max_cells",
@@ -172,7 +203,7 @@ fn gabiond_table_holds_a_full_cell_store() {
     let aggregate = Aggregate::new(&storage(cells, 64));
     let writer = writer(&aggregate);
     let dropped = (0..u128::from(cells))
-        .filter(|&key| !writer.add(1, key, 0, 1))
+        .filter(|&key| !writer.add(1, key, BucketEpoch(0), 1))
         .count();
     assert_eq!(dropped, 0);
 }
@@ -184,8 +215,8 @@ fn time_until_admit_millis_uses_oldest_non_empty_bucket() {
     // (6+5)*1000 - 10000 = 1000ms. Bucket 5 has left the window but not yet
     // the table (expiry runs on the gossip tick), so the walk must skip it.
     let table = aggregate(16);
-    writer(&table).add(0xaa, 0xbb, 5, 100);
-    writer(&table).add(0xaa, 0xbb, 6, 15);
+    writer(&table).add(0xaa, 0xbb, BucketEpoch(5), 100);
+    writer(&table).add(0xaa, 0xbb, BucketEpoch(6), 15);
     let delta = table.table().time_until_admit_millis(
         spec(0xaa, 10, 1_000, 5),
         KeyHash(0xbb),
@@ -201,9 +232,9 @@ fn time_until_admit_millis_walks_past_expired_buckets() {
     // Window = [6..10]. Bucket 6 expired → reads as None. Bucket 7
     // alone covers need = 15+1-10 = 6.
     let table = aggregate(16);
-    writer(&table).add(0xcc, 0xdd, 6, 4);
-    writer(&table).subtract(0xcc, 0xdd, 6, 4);
-    writer(&table).add(0xcc, 0xdd, 7, 15);
+    writer(&table).add(0xcc, 0xdd, BucketEpoch(6), 4);
+    writer(&table).subtract(0xcc, 0xdd, BucketEpoch(6), 4);
+    writer(&table).add(0xcc, 0xdd, BucketEpoch(7), 15);
     let delta = table.table().time_until_admit_millis(
         spec(0xcc, 10, 1_000, 5),
         KeyHash(0xdd),
@@ -217,7 +248,7 @@ fn time_until_admit_millis_walks_past_expired_buckets() {
 #[test]
 fn time_until_admit_millis_already_admittable_returns_zero() {
     let table = aggregate(8);
-    writer(&table).add(0xee, 0xff, 10, 5);
+    writer(&table).add(0xee, 0xff, BucketEpoch(10), 5);
     let delta = table.table().time_until_admit_millis(
         spec(0xee, 10, 1_000, 5),
         KeyHash(0xff),

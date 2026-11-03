@@ -21,7 +21,7 @@ use std::rc::Rc;
 
 use serde::Serialize;
 
-use super::adapter::{BucketEpoch, NodeStore};
+use super::adapter::NodeStore;
 use super::node::{KeyKind, KeySpace, Slot, ring_window_total};
 use super::phases::{PhaseStats, Schedule};
 use super::plan::NS_PER_MS;
@@ -124,7 +124,7 @@ impl WeightedHist {
 /// own side's hits. A hit has converged once every group in use covers it.
 #[derive(Clone, Debug, Default)]
 struct ConvSlot {
-    bucket: BucketEpoch,
+    bucket: u32,
     /// Admission times by origin side.
     admits: [Vec<u64>; GROUPS],
     covered: [[usize; GROUPS]; GROUPS],
@@ -326,12 +326,12 @@ impl Oracle {
         self
     }
 
-    fn conv_index(&self, t: usize, bucket: BucketEpoch) -> usize {
+    fn conv_index(&self, t: usize, bucket: u32) -> usize {
         t * self.keys.ring_len as usize + (bucket % self.keys.ring_len) as usize
     }
 
     /// Cluster-wide admitted hits for `key` in the window ending at `bucket`.
-    pub fn truth_window_total(&self, key: u32, bucket: BucketEpoch) -> u64 {
+    pub fn truth_window_total(&self, key: u32, bucket: u32) -> u64 {
         ring_window_total(&self.keys, &self.truth, key, bucket)
     }
 
@@ -421,7 +421,7 @@ impl Oracle {
     }
 
     /// A hit for `key` in `bucket` was admitted by pod `origin`.
-    pub fn admitted(&mut self, key: u32, bucket: BucketEpoch, now_ns: u64, origin: usize) {
+    pub fn admitted(&mut self, key: u32, bucket: u32, now_ns: u64, origin: usize) {
         self.truth[self.keys.slot(key, bucket)].add(bucket, 1);
         let t = self.keys.tracked_of[key as usize];
         if t == super::node::NOT_TRACKED {
@@ -466,7 +466,7 @@ impl Oracle {
         &mut self,
         v: usize,
         t: usize,
-        bucket: BucketEpoch,
+        bucket: u32,
         bucket_count: u32,
         window_total: u64,
         now_ns: u64,
@@ -580,7 +580,7 @@ impl Oracle {
         &mut self,
         now_ns: u64,
         now_millis: u64,
-        current: BucketEpoch,
+        current: u32,
         stores: impl IntoIterator<Item = (usize, &'s NodeStore)>,
     ) {
         let live = self.keys.live_buckets;
@@ -642,7 +642,7 @@ impl Oracle {
         };
         let live = self.keys.live_buckets;
         // Buckets in the live window that closed at or before `cutoff`.
-        let closed: Vec<BucketEpoch> = (0..live)
+        let closed: Vec<u32> = (0..live)
             .filter_map(|o| current.checked_sub(o))
             .filter(|&b| (u64::from(b) + 1) * bucket_ms <= cutoff)
             .collect();
@@ -677,7 +677,7 @@ impl Oracle {
         schedule: Schedule,
         now_ns: u64,
         now_millis: u64,
-    ) -> Option<(BucketEpoch, Vec<usize>)> {
+    ) -> Option<(u32, Vec<usize>)> {
         let heal_millis = now_millis - (now_ns - schedule.heal_ns) / NS_PER_MS;
         let last = self.keys.bucket_of(heal_millis).checked_sub(1)?;
         let pods = (0..self.nodes)
@@ -710,7 +710,7 @@ impl Oracle {
 
     /// Hits admitted in slot `c` (holding `bucket`) that `pods` have never
     /// reached.
-    fn missing_in(&self, c: usize, bucket: BucketEpoch, pods: &[usize]) -> u64 {
+    fn missing_in(&self, c: usize, bucket: u32, pods: &[usize]) -> u64 {
         let slot = &self.conv[c];
         if slot.bucket != bucket {
             return 0;
@@ -726,7 +726,7 @@ impl Oracle {
     /// can no longer count as complete. A bucket that leaves the window at
     /// the heal instant itself had no time to be repaired and is owed
     /// nothing (it is outside `heal_deficit`'s window too).
-    fn note_unrepaired_expiry(&mut self, gone: BucketEpoch, now_ns: u64, now_millis: u64) {
+    fn note_unrepaired_expiry(&mut self, gone: u32, now_ns: u64, now_millis: u64) {
         let Some(schedule) = self.phases.as_ref().map(PhaseStats::schedule) else {
             return;
         };

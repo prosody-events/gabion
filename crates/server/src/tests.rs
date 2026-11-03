@@ -233,7 +233,11 @@ fn maps_descriptors_and_returns_ok_or_over_limit() {
             }],
         );
         let fingerprint = harness.limiter.rule_table.rules()[0].spec().fingerprint;
-        let cell = harness.limiter.counts.table().get(fingerprint, key.0, 0);
+        let cell = harness
+            .limiter
+            .counts
+            .table()
+            .get(fingerprint, key.0, BucketEpoch(0));
         assert_eq!(cell.map(|cell| cell.count), Some(4));
 
         // Pump until we exceed the limit.
@@ -448,7 +452,9 @@ fn full_request_queue_allows_and_counts() {
                 counts.clone(),
             );
             for _ in 0..62 {
-                client.try_record(1, KeyHash(1), 0, 1, 1, 0).unwrap();
+                client
+                    .try_record(1, KeyHash(1), BucketEpoch(0), 1, 1, 0)
+                    .unwrap();
             }
             let limiter = SharedLimiter::new(table, client, counts, storage);
             let response = limiter.should_rate_limit_at(&tenant_request("a"), 0);

@@ -57,7 +57,7 @@ where
     };
     let mut aged_off: u64 = 0;
     for bucket in current.saturating_sub(live - 1)..=current {
-        aged_off = aged_off.saturating_add(count_for(bucket as BucketEpoch));
+        aged_off = aged_off.saturating_add(count_for(BucketEpoch::wrap(bucket)));
         if aged_off >= need {
             return fall_off(bucket);
         }
