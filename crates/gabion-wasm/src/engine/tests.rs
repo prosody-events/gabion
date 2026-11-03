@@ -1024,6 +1024,12 @@ fn zone_partition_heals_to_exact_counts() {
         state.heal();
         all.extend(state.step(3 * T).await.events);
         let snap = state.snapshot(None).await;
+        // Pinned to the 3 + 4 hits submitted, not to counts the cells derive,
+        // so a hit lost at its origin or an oracle that sums replicas fails.
+        assert_eq!(snap.oracle_total, 7, "the oracle counts both sides once");
+        for node in &snap.nodes {
+            assert_eq!(node.aggregate_total, 7, "node {} sees both sides", node.id);
+        }
         let mut cells = Vec::new();
         for node in &snap.nodes {
             cells.push((node.id, cells_of(&state, node.id).await));
@@ -1037,6 +1043,7 @@ fn zone_partition_heals_to_exact_counts() {
             .map(|c| c.bucket)
             .collect();
         assert!(!buckets.is_empty(), "the hits left cells");
+        let mut origin_total = 0;
         for bucket in buckets {
             let oracle = bucket_count(
                 cells
@@ -1046,6 +1053,7 @@ fn zone_partition_heals_to_exact_counts() {
                 rule,
                 bucket,
             );
+            origin_total += oracle;
             for (id, cells) in &cells {
                 assert_eq!(
                     bucket_count(cells.iter(), rule, bucket),
@@ -1054,6 +1062,7 @@ fn zone_partition_heals_to_exact_counts() {
                 );
             }
         }
+        assert_eq!(origin_total, 7, "the origins' own cells hold every hit");
         assert_bytes_by_tier(&all, &snap);
         state
     });
