@@ -71,7 +71,8 @@ cleanup() {
     status=$?
     if [ "$status" -ne 0 ]; then
         printf '\n--- cleanup diagnostic dump (namespace=%s) ---\n' "$namespace" >&2
-        kubectl -n "$namespace" get pods,events --sort-by=.lastTimestamp -o wide >&2 || true
+        kubectl -n "$namespace" get pods -o wide >&2 || true
+        kubectl -n "$namespace" get events --sort-by=.metadata.creationTimestamp >&2 || true
         for pod in $(live_pods gabiond 2>/dev/null | awk '{ print $1 }'); do
             printf '\n-- %s /snapshot --\n' "$pod" >&2
             snapshot "$pod" >&2 || true

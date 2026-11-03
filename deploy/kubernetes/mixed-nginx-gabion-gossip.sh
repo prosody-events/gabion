@@ -34,7 +34,8 @@ cleanup() {
     # but a generic "rollout timed out" message.
     if [ "${cleanup_dump:-1}" = "1" ] && [ -n "${namespace:-}" ]; then
         printf '\n--- cleanup diagnostic dump (namespace=%s) ---\n' "$namespace" >&2
-        kubectl -n "$namespace" get pods,events --sort-by=.lastTimestamp -o wide >&2 || true
+        kubectl -n "$namespace" get pods -o wide >&2 || true
+        kubectl -n "$namespace" get events --sort-by=.metadata.creationTimestamp >&2 || true
         kubectl -n "$namespace" describe pods -l app=gabiond >&2 || true
         kubectl -n "$namespace" describe pods -l app=gabion-nginx >&2 || true
         # --tail=1000 because the smoke-with-bt wrapper prints a full
