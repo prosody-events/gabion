@@ -771,16 +771,26 @@ fn bucket_count<'a>(cells: impl Iterator<Item = &'a CellView>, rule: u128, bucke
 }
 
 /// Every sent or dropped packet's bytes, summed by tier and class here, equal
-/// the snapshot's `bytes_by_tier`. The classification is this test's own, so
-/// it checks the engine's rather than reusing it.
-fn assert_bytes_by_tier(events: &[Event], state: &ClusterState) {
+/// the snapshot's `bytes_by_tier`, and each live node's `own_data_bytes` equal
+/// the `Own` bytes it sent. The classification is this test's own, so it
+/// checks the engine's rather than reusing it.
+fn assert_bytes_by_tier_and_sender(events: &[Event], state: &ClusterState) {
     let mut sums = BTreeMap::new();
+    let mut own_by_sender = BTreeMap::new();
     for event in events {
         if let EventKind::PacketSent {
-            bytes, kind, tier, ..
+            src,
+            bytes,
+            kind,
+            tier,
+            ..
         }
         | EventKind::PacketDropped {
-            bytes, kind, tier, ..
+            src,
+            bytes,
+            kind,
+            tier,
+            ..
         } = event.kind
         {
             let data = matches!(
@@ -788,7 +798,18 @@ fn assert_bytes_by_tier(events: &[Event], state: &ClusterState) {
                 PacketKind::Own | PacketKind::Relay | PacketKind::Sweep
             );
             *sums.entry((tier == Tier::InZone, data)).or_insert(0u64) += u64::from(bytes);
+            if kind == PacketKind::Own {
+                *own_by_sender.entry(src).or_insert(0u64) += u64::from(bytes);
+            }
         }
+    }
+    for node in &state.nodes {
+        assert_eq!(
+            node.own_data_bytes,
+            own_by_sender.get(&node.id).copied().unwrap_or(0),
+            "node {} own data bytes",
+            node.id
+        );
     }
     let sum = |in_zone, data| sums.get(&(in_zone, data)).copied().unwrap_or(0);
     let by = &state.bytes_by_tier;
@@ -804,6 +825,42 @@ fn assert_bytes_by_tier(events: &[Event], state: &ClusterState) {
         sums.values().any(|&bytes| bytes > 0),
         "the run sent something"
     );
+}
+
+/// Each node's `gateway_for` counts the origins whose runtime reports it as
+/// their gateway into its zone, read here from the runtimes' own peer rows.
+#[test]
+fn gateway_for_counts_the_origins_routing_through_each_node() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        state.remove_node(4).await.unwrap();
+        state.step(3 * T).await;
+        let snap = state.snapshot(None).await;
+        let mut want = BTreeMap::new();
+        for node in &snap.nodes {
+            for peer in peers_of(&state, node.id).await {
+                if peer.role == Role::Gateway {
+                    *want
+                        .entry(peer.id.expect("a resolved gateway"))
+                        .or_insert(0u32) += 1;
+                }
+            }
+        }
+        for node in &snap.nodes {
+            assert_eq!(
+                node.gateway_for,
+                want.get(&node.id).copied().unwrap_or(0),
+                "node {}",
+                node.id
+            );
+        }
+        assert_eq!(
+            snap.nodes.iter().map(|n| n.gateway_for).sum::<u32>(),
+            11 * 2,
+            "each of the eleven origins has a gateway into both other zones"
+        );
+        state
+    });
 }
 
 /// Zones come from configuration, not from the address: all twelve nodes bind
@@ -1063,7 +1120,7 @@ fn zone_partition_heals_to_exact_counts() {
             }
         }
         assert_eq!(origin_total, 7, "the origins' own cells hold every hit");
-        assert_bytes_by_tier(&all, &snap);
+        assert_bytes_by_tier_and_sender(&all, &snap);
         state
     });
 }
@@ -1110,7 +1167,7 @@ fn unset_zone_mode_runs_as_one_zone() {
                 "node {node}, told no zone, reports none"
             );
         }
-        assert_bytes_by_tier(&all, &snap);
+        assert_bytes_by_tier_and_sender(&all, &snap);
         state
     });
 }

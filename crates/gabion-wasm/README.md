@@ -43,6 +43,11 @@ waiting), so a quiet cluster costs one step per heartbeat.
   whose role count moved. A removal moves no role, so the removal itself
   re-reads every survivor whose gateway the departed node was, and reports the
   gateway gone, or replaced, as that survivor's runtime now has it.
+- `gateway_for` counts, per node, the origins whose runtime routes into its zone
+  through it, inverted from the gateway rows the engine already keeps;
+  `own_data_bytes` counts each node's own-stream bytes, the weights of the share
+  chart's no-zone prediction. `max_zones()` exports the zone ceiling the page's
+  stepper reads.
 
 ## Node ceiling
 

@@ -1,8 +1,17 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { fmtCount, noun } from './lib/format';
   import { Sim } from './lib/sim/sim';
   import { readTheme, watchTheme } from './lib/theme';
-  import type { ClusterState, EventBatch, Inspected, SimConfig, SimEvent } from './lib/sim/types';
+  import type {
+    ClusterState,
+    EventBatch,
+    Inspected,
+    PeerView,
+    SimConfig,
+    SimEvent,
+  } from './lib/sim/types';
+  import type { Roles } from './lib/stage/renderer';
   import { ChartHistory } from './lib/charts/history';
   import {
     DEFAULT_PRESET,
@@ -28,30 +37,35 @@
   // gabion core runs in a browser. Reset re-runs the active preset; selecting
   // another rebuilds. Clicking a node (or the rail's Send) injects more traffic
   // for the watched key on top.
+  //
+  // The workspace stays mounted across rebuilds, with a "Rebuilding" overlay on
+  // top: the rail's open disclosure, the focused control and the grid cell
+  // keyboard focus is on all survive a rebuild without being restored.
   let activePreset = $state<Preset>(DEFAULT_PRESET);
   // The Rust-side production defaults (`Sim.defaultConfig()`), the single source
-  // the sliders open from — no hand-typed TS mirror. Fetched once during the
-  // first load (the workspace is unmounted while `loading`, so the `null` window
-  // is never rendered), then every knob default and the bucket width read from
-  // it. Changing `gabion::defaults` is the only edit; the sliders follow.
+  // the controls open from — no hand-typed TS mirror. Fetched once during the
+  // first load (the first-load overlay covers the workspace until then), then
+  // every knob default and the bucket width read from it. Changing
+  // `gabion::defaults` is the only edit; the controls follow.
   let defaults = $state<SimConfig | null>(null);
-  // The rebuild knobs (cluster size, error budget, packet loss). Seated
+  // The rebuild knobs (cluster size, zones, error budget, packet loss, …). Seated
   // from the active preset and merged over its config on each (re)build, so a
-  // slider tweak followed by a rebuild explores the parameter space without
+  // control tweak followed by a rebuild explores the parameter space without
   // leaving the scenario. They take effect only on rebuild — a live engine can't
   // change its node count — so editing a knob just *stages* it; the rail's
   // explicit "Rebuild" applies the staged set in one build. `null` until the
   // first load seeds them from `defaults` (see `bootstrap`).
   let knobs = $state<Knobs | null>(null);
   // The knob values the *current* engine was built from. `bootstrap` snapshots
-  // `knobs` into this on every (re)build, so the rail can show which sliders have
-  // been moved since — staged but not yet applied — and enable Rebuild only when
-  // there is something to apply.
+  // `knobs` into this on every (re)build, so the rail can show which controls
+  // have been moved since — staged but not yet applied — and enable Rebuild only
+  // when there is something to apply.
   let appliedKnobs = $state<Knobs | null>(null);
-  // The "Tune the cluster" disclosure's open state, lifted here so it survives
-  // the workspace unmount during a rebuild's loading flash — a knob edit (which
-  // no longer rebuilds) keeps it open, and an explicit Rebuild reopens it.
-  let tuneOpen = $state(false);
+  // The most zones the stepper offers, from the engine; `0` until the first load.
+  let maxZones = $state(0);
+  // The full config the live cluster was built with, which the active preset's
+  // blurb is written from.
+  let builtConfig = $state.raw<SimConfig | null>(null);
   // Hits per burst, shared by a stage click and the control rail's Send so the
   // two always agree. Each burst targets the same watched key, growing the same
   // counter the preset seeded. The default sits well under the threshold-AE
@@ -61,8 +75,8 @@
   let burstHits = $state(25);
   // One gossip tick = the active cluster's gossip interval, so a Sandbox Step
   // advances exactly one heartbeat round and the invariant holds at any tick
-  // setting (not just the old hard-coded 100 ms). `0` only before the first
-  // build seeds `appliedKnobs`, when nothing steps. See `appliedKnobs`.
+  // setting. `0` only before the first build seeds `appliedKnobs`, when nothing
+  // steps. See `appliedKnobs`.
   const tickMs = $derived(appliedKnobs?.tick_interval_ms ?? 0);
   // Cap one advance so a backgrounded tab resuming rAF can't leap seconds of
   // virtual time in a single frame.
@@ -72,14 +86,16 @@
   // Not named `state`: `$state(...)` would then parse as store-subscription
   // syntax (`$` + a variable called `state`) and confuse the compiler.
   let cluster: ClusterState | null = $state(null);
-  // The latest step's gossip events, handed to the stage to animate as
-  // light-beam packets. Only ever reassigned to a non-empty batch, so a
-  // sub-tick step that produced nothing doesn't re-trigger the stage.
+  // The latest step's gossip events, handed to the stage to animate as beams.
+  // Only ever reassigned to a non-empty batch, so a sub-tick step that produced
+  // nothing doesn't re-trigger the stage.
   let events: SimEvent[] = $state([]);
   let playing = $state(false);
   let speed = $state(1);
   let tick = $state(0);
   let virtualMs = $state(0);
+  // Node pairs with a link cut, from the sim's own record of its link policies.
+  let cutLinks = $state(0);
   let error: string | null = $state(null);
   let loading = $state(true);
   // The canvas colours, re-read on an OS scheme or data-theme change; the stage
@@ -99,8 +115,10 @@
   // through a closure keeps its declared `ClusterState | null` type (the closure
   // may run after a reassignment) — and is what Svelte's reactivity wants too.
   const nodeIds = $derived.by(() => (cluster?.nodes ?? []).map((n) => n.id));
-  // The visualizer's upper bound on live nodes (the design's 6–100 range); the
-  // rail disables Add here so a held key can't spawn runtimes without limit.
+  // The visualizer's upper bound on live nodes; the rail disables Add here so a
+  // held key can't spawn runtimes without limit. The one-second step of 183
+  // nodes was not measured to fit a frame, so the cap stays at 100 (see the
+  // crate README).
   const MAX_LIVE_NODES = 100;
 
   // The selected node (clicking a disc selects it and opens the inspector in the
@@ -115,6 +133,10 @@
   $effect(() => {
     if (selectedId !== null && !nodeIds.includes(selectedId)) selectedId = null;
   });
+  // The node under the pointer and the node with keyboard focus: each shows the
+  // tooltip, and the dashboard draws the hovered node's own line.
+  let hoveredId = $state<number | null>(null);
+  let focusedId = $state<number | null>(null);
   // The selected node's cells and peer rows. A snapshot carries them for the
   // node it was taken inspecting alone, so `inspected` keeps the last rows for
   // the selection, and `select` fetches them before the selection moves.
@@ -122,6 +144,35 @@
   const selectedRows = $derived(
     inspected !== null && inspected.id === selectedId ? inspected : null,
   );
+
+  /** The selected origin's marks: itself, and the gateway the runtime reports
+   *  for each remote zone, `suspect` once it has left something unanswered. */
+  function rolesOf(origin: number | null, peers: PeerView[] | undefined): Roles | null {
+    if (origin === null || peers === undefined) return null;
+    const gateways = new Map<number, { zone: number; suspect: boolean }>();
+    for (const p of peers) {
+      // Option fields cross the wasm boundary as `undefined`, hence `!= null`.
+      if (p.role === 'gateway' && p.id != null && p.zone != null) {
+        gateways.set(p.id, { zone: p.zone, suspect: p.answer === 'suspect' || p.answer === 'cannot_relay' });
+      }
+    }
+    return { origin, gateways };
+  }
+  // Replaced only when the marks change, not with every snapshot's fresh peer
+  // rows: the stage redraws every node's mark when it is handed new roles.
+  let roles = $state.raw<Roles | null>(null);
+  let rolesKey = '';
+  $effect(() => {
+    const next = rolesOf(selectedId, selectedRows?.peers);
+    const key =
+      next === null
+        ? ''
+        : `${next.origin}:${[...next.gateways].map(([g, r]) => `${g}/${r.zone}/${r.suspect}`).join(',')}`;
+    if (key !== rolesKey) {
+      rolesKey = key;
+      roles = next;
+    }
+  });
 
   // The rolling chart history is a plain (non-reactive) structure — 600 samples
   // under a deep `$state` proxy would cost on every frame. `chartVersion` is the
@@ -155,6 +206,8 @@
     return {
       ...preset.config,
       nodes: k.nodes,
+      zones: k.zones,
+      zone_mode: k.zone_mode,
       target_err_bps: k.target_err_bps,
       uniform_loss: k.uniform_loss,
       rule_limit: k.rule_limit,
@@ -169,43 +222,55 @@
    *  current knobs; the rail's scenario buttons pass a new one (via
    *  `selectPreset`, which re-seats the knobs first). */
   async function bootstrap(preset: Preset = activePreset): Promise<void> {
-    activePreset = preset;
     pause();
     loading = true;
     error = null;
     events = [];
+    hoveredId = null;
     // Restart the sustained feed from a clean slate so a Reset mid-ramp doesn't
     // inherit stale carry or a stale node cursor.
     trafficCarry = 0;
     trafficInjected = 0;
-    // Clear the rolling history so a rebuild starts the charts from a blank
-    // slate (the first sample reshapes the fan for the new cluster). Only a
-    // rebuild clears it — adding or removing a node reshapes in place, so the
-    // shared time axis keeps running across a join or leave.
-    history.reset();
-    chartVersion += 1;
     try {
       // Source the Rust defaults once, then seed the knobs from the active
-      // preset before the (still-unmounted) control rail mounts. After this
-      // first pass both are non-null for the life of the page; Reset and knob
-      // edits keep the current `knobs`, a preset switch re-seats them in
-      // `selectPreset` before calling here.
+      // preset before the control rail first shows. After this first pass both
+      // are non-null for the life of the page; Reset and knob edits keep the
+      // current `knobs`, a preset switch re-seats them in `selectPreset` before
+      // calling here.
       const d = defaults ?? (defaults = await Sim.defaultConfig());
+      if (maxZones === 0) maxZones = await Sim.maxZones();
       const k = knobs ?? (knobs = knobsFromPreset(preset, d));
+      // Clear the rolling history so a rebuild starts the charts from a blank
+      // slate, measuring the share over the new window. Only a rebuild clears
+      // it — adding or removing a node reshapes in place, so the shared time
+      // axis keeps running across a join or leave.
+      history.reset(k.rule_window_ms);
+      chartVersion += 1;
       // Tear the previous engine down first; otherwise its spawned task,
       // runtimes, and tick channels leak for the life of the page (each
       // rebuild would pile up an engine).
       if (sim !== null) {
         await sim.shutdown();
         sim = null;
+        window.sim = undefined;
       }
-      const fresh = await Sim.create(effectiveConfig(preset, k, d));
-      await preset.seed(fresh);
+      const config = { ...d, ...effectiveConfig(preset, k, d) };
+      const fresh = await Sim.create(config);
+      await preset.seed(fresh, config);
       sim = fresh;
+      window.sim = fresh;
       // The engine now reflects the current knobs — mark them applied so the
       // rail's "staged" cue and Rebuild button reset to clean.
       appliedKnobs = { ...k };
-      await refresh();
+      // The selection and the cluster it names arrive together, so the effect
+      // that drops a selection no live node has never sees one without the other.
+      const snap = await fresh.snapshot(preset.select ?? null);
+      selectedId = preset.select ?? null;
+      applySnapshot(snap);
+      // Adopted only once built, so the rail's `aria-current` marks a finished
+      // build.
+      builtConfig = config;
+      activePreset = preset;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -213,19 +278,14 @@
     }
   }
 
-  /** Adopt a scenario: re-seat the knobs from its config (so the sliders mirror
+  /** Adopt a scenario: re-seat the knobs from its config (so the controls mirror
    *  it), then build it. The rail's scenario buttons route here; Reset and knob
    *  changes call `bootstrap()` directly, keeping the current knobs. */
   function selectPreset(preset: Preset): void {
-    // The rail (which routes here) only mounts after the first load seeds
+    // The rail (which routes here) only shows once the first load seeds
     // `defaults`, so it is non-null; re-seat the knobs from the chosen scenario.
     if (defaults !== null) knobs = knobsFromPreset(preset, defaults);
     void bootstrap(preset);
-  }
-
-  async function refresh(): Promise<void> {
-    if (sim === null) return;
-    applySnapshot(await sim.snapshot(selectedId));
   }
 
   /** Adopt a fresh snapshot as the current state and append it to the chart
@@ -236,6 +296,7 @@
     if (snap.inspected != null && snap.inspected.id === selectedId) inspected = snap.inspected;
     tick = snap.tick;
     virtualMs = snap.virtual_ms;
+    cutLinks = sim?.cutLinks() ?? 0;
     history.push(snap);
     chartVersion += 1;
   }
@@ -303,6 +364,20 @@
     }
   }
 
+  /** Run one command against the live sim, then show its effect: a snapshot at
+   *  the current virtual time (a command never advances time), which also
+   *  refreshes the cut-link count. Any failure stops play and surfaces. */
+  async function act(command: (sim: Sim) => Promise<unknown>): Promise<void> {
+    if (sim === null) return;
+    try {
+      await command(sim);
+      applySnapshot(await sim.snapshot(selectedId));
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      pause();
+    }
+  }
+
   /** Inject a burst at `node` for the watched key, at the current virtual time —
    *  a pure inject: it never advances time, so the stage/charts only move on the
    *  next step or play. While playing the loop snapshots every frame, so a click
@@ -333,50 +408,46 @@
     }
   }
 
-  /** Restore every link to lossless `Pass` — undo the active preset's partition
-   *  or isolation. Pure, like a burst: it opens the links but moves no counts
-   *  until the next tick gossips, so the user plays/steps to watch reconcile. */
-  async function heal(): Promise<void> {
-    if (sim === null) return;
-    try {
-      await sim.heal();
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-      pause();
-    }
+  /** The live nodes in zone `zone`, and every other live node. */
+  function split(zone: number): [number[], number[]] {
+    const inside: number[] = [];
+    const rest: number[] = [];
+    for (const n of cluster?.nodes ?? []) (n.zone === zone ? inside : rest).push(n.id);
+    return [inside, rest];
   }
 
-  /** Spawn a fresh cold-start node into the live cluster — no rebuild. It joins
-   *  by gossip and catches up by anti-entropy; the re-snapshot drives the stage
-   *  to fade it in at its ring slot and re-space the survivors. Play (or it is
-   *  already playing) to watch it converge. */
-  async function addNode(): Promise<void> {
-    if (sim === null) return;
-    try {
-      await sim.addNode();
-      applySnapshot(await sim.snapshot(selectedId));
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-      pause();
-    }
-  }
+  /** Cut every link between zone `zone` and the rest of the cluster. */
+  const cutZone = (zone: number): Promise<void> =>
+    act((s) => s.cutZone(...split(zone)));
+
+  /** Silence gateway `g` — the silent crash that triggers a failover — by
+   *  cutting it from every other live node. */
+  const silenceGateway = (g: number): Promise<void> =>
+    act((s) => s.silence(g, nodeIds.filter((id) => id !== g)));
+
+  /** Cut gateway `g` from its zone peers in one direction: it hears them, they
+   *  never hear it. */
+  const cutGatewayFromZone = (g: number, zone: number): Promise<void> =>
+    act((s) => s.cutFromZone(g, split(zone)[0].filter((id) => id !== g)));
+
+  /** Restore every link to lossless `Pass` — undo a cut. Pure, like a burst: it
+   *  opens the links but moves no counts until the next tick gossips, so the
+   *  user plays/steps to watch the cluster reconcile. */
+  const heal = (): Promise<void> => act((s) => s.heal());
+
+  /** Spawn a fresh cold-start node into zone `zone` of the live cluster — no
+   *  rebuild. It joins by gossip and catches up by anti-entropy; the
+   *  re-snapshot drives the stage to fade it in at its ring slot and re-space
+   *  the survivors. */
+  const addNode = (zone: number): Promise<void> => act((s) => s.addNode(zone));
 
   /** Remove the live node with stable `id`. Survivors keep their ids and
    *  re-converge; the re-snapshot drives the stage to scale it out and glide
    *  the survivors into the gap it leaves. */
-  async function removeNode(id: number): Promise<void> {
-    if (sim === null) return;
-    try {
-      await sim.removeNode(id);
-      applySnapshot(await sim.snapshot(selectedId));
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-      pause();
-    }
-  }
+  const removeNode = (id: number): Promise<void> => act((s) => s.removeNode(id));
 
   function play(): void {
-    if (playing || sim === null) return;
+    if (playing || sim === null || loading) return;
     playing = true;
     lastWall = 0;
     rafId = requestAnimationFrame(frame);
@@ -399,7 +470,7 @@
   }
 
   async function stepOnce(): Promise<void> {
-    if (playing) return;
+    if (playing || loading) return;
     await advance(tickMs);
   }
 
@@ -434,11 +505,54 @@
 <div class="layout">
   <header>
     <h1>Gabion · <span class="subtitle">Gossip Visualizer</span></h1>
-    <p class="lede">
-      A cluster of nodes spreading per-origin rate-limit counters by anti-entropy
-      gossip. Pick a scenario and press play to watch every node converge on the
-      cluster-wide total — or click any node (or use the controls) to inject more.
+    {#if cluster !== null && appliedKnobs !== null}
+      <p class="status">
+        <span data-field="status-nodes">{cluster.nodes.length}</span>
+        {noun(cluster.nodes.length, 'node')}
+        {#if appliedKnobs.zone_mode === 'Configured'}
+          in <span data-field="status-zones">{cluster.zones.filter((z) => z.live > 0).length}</span>
+          {noun(cluster.zones.filter((z) => z.live > 0).length, 'zone')}
+        {:else}
+          · no node knows its zone, so every change goes to every peer directly
+        {/if}
+        · <span data-field="status-cut">{fmtCount(cutLinks)}</span>
+        {noun(cutLinks, 'link')} cut · true total
+        <span data-field="status-total">{fmtCount(cluster.oracle_total)}</span>
+      </p>
+    {/if}
+    <p class="once">
+      Everything here is one simulated run on one machine. Measured results, with credible
+      intervals, are in the <a href={`${import.meta.env.BASE_URL}study/dashboard/`}>gossip study</a>.
     </p>
+    <details class="method">
+      <summary>How to read this</summary>
+      <dl>
+        <dt>zone</dt>
+        <dd>An availability zone. A node's zone is whatever the node says it is.</dd>
+        <dt>inside a zone (level 0)</dt>
+        <dd>Delivery between nodes of one zone: a thin line that stays inside its ring.</dd>
+        <dt>across zones (level 1)</dt>
+        <dd>Delivery between zones: a thick arrow that crosses the empty centre.</dd>
+        <dt>origin</dt>
+        <dd>The node whose clients produced a change.</dd>
+        <dt>gateway</dt>
+        <dd>The member of a remote zone that an origin sends its changes to (◆). It relays them into its zone.</dd>
+        <dt>relay</dt>
+        <dd>A gateway forwarding changes it received from an origin to the rest of its zone.</dd>
+        <dt>ack</dt>
+        <dd>I hold every item of your stream so far. One number acknowledges everything below it.</dd>
+        <dt>retransmission timeout (RTO)</dt>
+        <dd>How long a sender waits for an ack before resending: one heartbeat.</dd>
+        <dt>suspect</dt>
+        <dd>A peer that left something unanswered for the suspect timeout, or a remote peer that said it cannot relay (◇). A suspect is not used as a gateway.</dd>
+        <dt>gap report</dt>
+        <dd>A receiver's message "I am missing part of your stream; resend from my ack".</dd>
+        <dt>join sweep</dt>
+        <dd>A one-off copy of a node's whole live store, sent to a zone member that just joined.</dd>
+        <dt>backstop</dt>
+        <dd>A gateway that can reach its origin but not its own zone says it cannot relay, and the origin moves to another gateway.</dd>
+      </dl>
+    </details>
   </header>
 
   <main>
@@ -447,28 +561,33 @@
         <strong>The simulation could not start.</strong>
         <span>{error}</span>
       </div>
-    {:else if loading || knobs === null || appliedKnobs === null || defaults === null}
+    {:else if cluster === null || knobs === null || appliedKnobs === null || defaults === null || builtConfig === null}
       <div class="overlay" aria-live="polite">Loading the gossip engine…</div>
     {:else}
-      <div class="workspace">
+      <div class="workspace" aria-busy={loading}>
         <details class="controls" bind:open={controlsOpen}>
           <summary>Controls</summary>
           <ControlRail
             presets={PRESETS}
             activeId={activePreset.id}
+            blurb={activePreset.blurb(builtConfig)}
             {nodeIds}
+            zones={cluster.zones}
+            {roles}
+            {maxZones}
             canAdd={nodeIds.length < MAX_LIVE_NODES}
             bind:burstHits
             {knobs}
             {appliedKnobs}
             bucketMs={defaults.rule_bucket_ms}
-            {tuneOpen}
-            onToggleTune={(open) => (tuneOpen = open)}
             onSelectPreset={selectPreset}
             onApplyKnobs={() => void bootstrap()}
             onSend={(node) => void sendBurst(node)}
+            onCutZone={(zone) => void cutZone(zone)}
+            onSilence={(g) => void silenceGateway(g)}
+            onCutFromZone={(g, zone) => void cutGatewayFromZone(g, zone)}
             onHeal={() => void heal()}
-            onAddNode={() => void addNode()}
+            onAddNode={(zone) => void addNode(zone)}
             onRemoveNode={(id) => void removeNode(id)}
           />
         </details>
@@ -476,11 +595,14 @@
           <Stage
             {cluster}
             {events}
-            {selectedId}
+            {roles}
+            {hoveredId}
+            {focusedId}
+            {theme}
             onSelect={(node) => void select(node)}
             onDeselect={() => (selectedId = null)}
-            onDeleteNode={(id) => void removeNode(id)}
-            {theme}
+            onHover={(node) => (hoveredId = node)}
+            onFocus={(node) => (focusedId = node)}
           />
         </div>
         <div class="detail-rail">
@@ -490,17 +612,19 @@
               <NodeInspector
                 node={selectedNode}
                 peers={selectedRows.peers}
-                oracleTotal={cluster?.oracle_total ?? 0}
+                zones={cluster.zones}
+                zoneMode={appliedKnobs.zone_mode}
+                oracleTotal={cluster.oracle_total}
                 ruleLimit={appliedKnobs.rule_limit}
                 {burstHits}
-                version={chartVersion}
                 onSend={(id) => void sendBurst(id)}
+                onRemove={(id) => void removeNode(id)}
                 onClose={() => (selectedId = null)}
               >
                 <BucketStrata
                   cells={selectedRows.cells}
-                  currentEpoch={cluster?.bucket_epoch_now ?? 0}
-                  epochFraction={((cluster?.virtual_ms ?? 0) % defaults.rule_bucket_ms) /
+                  currentEpoch={cluster.bucket_epoch_now}
+                  epochFraction={(cluster.virtual_ms % defaults.rule_bucket_ms) /
                     defaults.rule_bucket_ms}
                   liveBuckets={nominalBuckets(appliedKnobs.rule_window_ms, defaults.rule_bucket_ms)}
                   windowMs={appliedKnobs.rule_window_ms}
@@ -510,15 +634,20 @@
               </NodeInspector>
             {:else}
               <Dashboard
+                {cluster}
                 {history}
                 version={chartVersion}
                 limit={appliedKnobs.rule_limit}
                 showLimit={activePreset.showsLimitChart === true}
                 {theme}
+                hotId={hoveredId ?? focusedId}
               />
             {/if}
           </div>
         </div>
+        {#if loading}
+          <div class="overlay rebuilding" aria-live="polite">Rebuilding…</div>
+        {/if}
       </div>
     {/if}
   </main>
@@ -526,6 +655,7 @@
   <footer>
     <TransportBar
       {playing}
+      busy={loading}
       bind:speed
       {tick}
       {virtualMs}
@@ -560,11 +690,44 @@
     font-weight: 400;
   }
 
-  .lede {
+  .status {
     margin: var(--gap-xs) 0 0;
-    max-width: 66ch;
+    font-size: var(--font-size-body);
+    color: var(--color-fg);
+  }
+
+  .once {
+    margin: var(--gap-xs) 0 0;
+    max-width: 80ch;
     font-size: var(--font-size-caption);
-    color: var(--color-fg-muted);
+    color: var(--color-fg);
+  }
+
+  .method {
+    margin-top: var(--gap-xs);
+    font-size: var(--font-size-caption);
+  }
+
+  .method summary {
+    cursor: pointer;
+    font-weight: 600;
+  }
+
+  .method dl {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 80ch);
+    gap: var(--gap-xs) var(--gap-md);
+    max-height: 40vh;
+    margin: var(--gap-sm) 0 0;
+    overflow-y: auto;
+  }
+
+  .method dt {
+    font-weight: 600;
+  }
+
+  .method dd {
+    margin: 0;
   }
 
   main {
@@ -660,7 +823,7 @@
       grid-template-areas:
         'stage rail'
         'detail rail';
-      grid-template-rows: minmax(0, 3fr) minmax(0, 2fr);
+      grid-template-rows: minmax(0, 7fr) minmax(0, 4fr);
     }
   }
 
@@ -688,8 +851,8 @@
       height: auto;
     }
 
-    .stage-pane {
-      aspect-ratio: 1;
+    .method dl {
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 
@@ -703,6 +866,13 @@
     gap: var(--gap-sm);
     color: var(--color-fg-muted);
     font-size: var(--font-size-caption);
+  }
+
+  /* A rebuild covers the workspace without unmounting it, so the rail's open
+     disclosure and the keyboard focus survive it. */
+  .overlay.rebuilding {
+    background: color-mix(in srgb, var(--color-bg) 70%, transparent);
+    color: var(--color-fg);
   }
 
   .overlay.error {

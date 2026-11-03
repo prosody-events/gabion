@@ -1,41 +1,57 @@
 <script lang="ts">
-  import { type Knobs, type Preset } from '../presets';
+  import { type Blurb, type Knobs, type Preset } from '../presets';
   import { visibleBuckets } from '../buckets';
+  import { fmtCount, zoneLabel } from '../format';
+  import type { Roles } from '../stage/renderer';
+  import type { SimConfig, ZoneView } from '../sim/types';
 
   // The left control rail (the chassis's controls region): scenario presets, the
   // rebuild knobs (a collapsed disclosure, so the rail stays compact), the
-  // keyboard/AT-accessible "send a burst" control (the equivalent of clicking a
-  // disc — the same `burstHits` drives both), and the network Heal action that
-  // completes the partition / isolation stories.
+  // network actions that cut a zone or a gateway and heal them, live membership,
+  // and the keyboard/AT-accessible "send a burst" control (the equivalent of
+  // clicking a disc: the same `burstHits` drives both).
   let {
     presets,
     activeId,
+    blurb,
     nodeIds,
+    zones,
+    roles,
+    maxZones,
     canAdd,
     burstHits = $bindable(),
     knobs,
     appliedKnobs,
     bucketMs,
-    tuneOpen,
-    onToggleTune,
     onSelectPreset,
     onApplyKnobs,
     onSend,
+    onCutZone,
+    onSilence,
+    onCutFromZone,
     onHeal,
     onAddNode,
     onRemoveNode,
   }: {
     presets: readonly Preset[];
     activeId: string;
-    // The live stable ids in rank order (with gaps after churn) — what the
-    // send and remove pickers choose from. Authoritative live set, not 0..N.
+    /** The active scenario's blurb, built from the config the cluster runs. */
+    blurb: Blurb;
+    // The live stable ids in rank order (with gaps after churn): what the send
+    // and remove pickers choose from. Authoritative live set, not 0..N.
     nodeIds: number[];
+    /** Every zone with its live members, in zone order. */
+    zones: ZoneView[];
+    /** The selected origin and its gateways, which name the network actions. */
+    roles: Roles | null;
+    /** The zone stepper's ceiling, from the engine. */
+    maxZones: number;
     // Whether the cluster is below the live-node cap (gates the Add button).
     canAdd: boolean;
     burstHits: number;
-    // A live `$state` proxy owned by App: the sliders mutate its fields in place
+    // A live `$state` proxy owned by App: the controls mutate its fields in place
     // (no reassignment, so it need not be `$bindable`). Editing a knob only
-    // *stages* it — nothing rebuilds until `onApplyKnobs`.
+    // *stages* it: nothing rebuilds until `onApplyKnobs`.
     knobs: Knobs;
     // The knobs the current engine was built from. A field that differs from
     // `knobs` is staged-but-not-applied; `onApplyKnobs` (Rebuild) applies them.
@@ -43,62 +59,73 @@
     // The rule's bucket width (`defaults.rule_bucket_ms`, sourced from Rust), so
     // the window readout's bucket count matches the Strata the inspector draws.
     bucketMs: number;
-    // The disclosure's open state, owned by App so it survives a rebuild's
-    // loading flash (the rail unmounts then; native `<details>` state would not).
-    tuneOpen: boolean;
-    onToggleTune: (open: boolean) => void;
     onSelectPreset: (preset: Preset) => void;
     onApplyKnobs: () => void;
     onSend: (node: number) => void;
+    onCutZone: (zone: number) => void;
+    onSilence: (gateway: number) => void;
+    onCutFromZone: (gateway: number, zone: number) => void;
     onHeal: () => void;
-    onAddNode: () => void;
+    onAddNode: (zone: number) => void;
     onRemoveNode: (id: number) => void;
   } = $props();
 
-  // Which rebuild knobs have been moved since the last build — staged, awaiting
-  // a Rebuild. The set drives the per-row "changed" cue and gates the button.
+  // Which rebuild knobs have been moved since the last build: staged, awaiting a
+  // Rebuild. The set drives the per-row "changed" cue and gates the button.
   const KNOB_FIELDS = [
+    'zones',
+    'zone_mode',
     'target_err_bps',
     'uniform_loss',
     'rule_limit',
     'rule_window_ms',
     'tick_interval_ms',
-  ] as const;
+  ] as const satisfies readonly (keyof SimConfig & keyof Knobs)[];
   const changed = $derived(new Set(KNOB_FIELDS.filter((k) => knobs[k] !== appliedKnobs[k])));
   const dirty = $derived(changed.size > 0);
 
-  const activePreset = $derived(presets.find((p) => p.id === activeId));
-  const activeBlurb = $derived(activePreset?.blurb ?? '');
   // Packet loss reads as a percentage; the engine wants the fraction.
   const lossPct = $derived(Math.round(knobs.uniform_loss * 100));
-  // Heal only does something after a partition or isolation, so the rail shows
-  // it only for those scenarios (progressive disclosure — fewer idle controls).
-  const showNetwork = $derived(activePreset?.usesNetwork ?? false);
   const nodeCount = $derived(nodeIds.length);
   // The window reads in whole seconds; its bar count uses the same bucket math
-  // the Strata uses (one source of truth — `buckets.ts`). This readout tracks
-  // the *staged* slider value (what you're dragging), while the inspector strip
-  // reflects the *applied* engine. They diverge only while a window edit is
-  // staged-but-not-rebuilt — the knob's "changed" cue flags exactly that gap —
-  // and match again on Rebuild.
+  // the Strata uses (one source of truth: `buckets.ts`). This readout tracks the
+  // *staged* slider value, while the inspector strip reflects the *applied*
+  // engine; the knob's "changed" cue flags exactly that gap.
   const windowSec = $derived(Math.round(knobs.rule_window_ms / 1000));
   const windowBuckets = $derived(visibleBuckets(knobs.rule_window_ms, bucketMs));
+  const zoneCap = $derived(Math.min(maxZones, knobs.nodes));
 
-  // Send and remove each pick a live id. A bare `$state` can't follow the live
-  // set: before the cluster loads it is null, and a picked node can leave under
-  // churn. A reconciling effect snaps each pick to the first live id whenever it
-  // names no live node — which also *seeds* it once the cluster arrives, so the
-  // `<select>` shows a real target (node 0) instead of a blank until first touch.
-  // It converges in one pass (the snapped value is itself live), so it does not
-  // loop.
+  // The zones a network action can name: those with members.
+  const liveZones = $derived(zones.flatMap((z, i) => (z.live > 0 ? [{ i, name: zoneLabel(z.name) }] : [])));
+  // The zone Add defaults to: the fewest live members, the lowest index on a tie.
+  const fewest = $derived(zones.reduce((best, z, i) => (z.live < zones[best].live ? i : best), 0));
+  // The origin's gateways, one per remote zone, in zone order, named by the
+  // selection.
+  const gateways = $derived(
+    roles === null
+      ? []
+      : [...roles.gateways].map(([id, g]) => ({ id, ...g })).sort((a, b) => a.zone - b.zone),
+  );
+
+  // Send, remove, cut and add each pick from a live set. A bare `$state` can't
+  // follow it: before the cluster loads it is null, and a pick can leave under
+  // churn. A reconciling effect snaps each pick to the first live choice whenever
+  // it names none, which also seeds it once the cluster arrives. It converges in
+  // one pass (the snapped value is itself live), so it does not loop.
   let sendPick = $state<number | null>(null);
   let removePick = $state<number | null>(null);
+  let cutPick = $state<number | null>(null);
+  let addPick = $state<number | null>(null);
   $effect(() => {
     if (sendPick === null || !nodeIds.includes(sendPick)) sendPick = nodeIds[0] ?? null;
   });
   $effect(() => {
     if (removePick === null || !nodeIds.includes(removePick)) removePick = nodeIds[0] ?? null;
   });
+  $effect(() => {
+    if (cutPick === null || !liveZones.some((z) => z.i === cutPick)) cutPick = liveZones[0]?.i ?? null;
+  });
+  const addZone = $derived(addPick ?? fewest);
 
   function send(): void {
     if (sendPick !== null) onSend(sendPick);
@@ -106,6 +133,11 @@
 
   function remove(): void {
     if (removePick !== null) onRemoveNode(removePick);
+  }
+
+  function add(): void {
+    onAddNode(addZone);
+    addPick = null;
   }
 </script>
 
@@ -124,18 +156,29 @@
         </button>
       {/each}
     </div>
-    <p class="blurb">{activeBlurb}</p>
+    <p class="blurb">{#each blurb as part}{#if typeof part === 'number'}<span data-field="blurb">{part}</span>{:else}{part}{/if}{/each}</p>
   </section>
 
-  <details class="tune" open={tuneOpen} ontoggle={(e) => onToggleTune(e.currentTarget.open)}>
+  <details class="tune">
     <summary>Tune the cluster</summary>
     <p class="hint">Edit freely — changes stage until you rebuild.</p>
+    <div class="knob" class:changed={changed.has('zones')}>
+      <label for="knob-zones">Zones</label>
+      <input id="knob-zones" type="number" min="1" max={zoneCap} step="1" bind:value={knobs.zones} />
+    </div>
+    <div class="knob" class:changed={changed.has('zone_mode')}>
+      <label for="knob-zone-mode">Zone mode</label>
+      <select id="knob-zone-mode" bind:value={knobs.zone_mode}>
+        <option value="Configured">Each node knows its zone</option>
+        <option value="Unset">No node knows its zone</option>
+      </select>
+    </div>
     <div class="knob" class:changed={changed.has('target_err_bps')}>
-      <label for="knob-bps">Error budget<span class="val numeric">{knobs.target_err_bps} bps</span></label>
+      <label for="knob-bps">Error budget<span class="val" data-field="error-budget-bps">{knobs.target_err_bps} bps</span></label>
       <input id="knob-bps" type="range" min="50" max="2000" step="50" bind:value={knobs.target_err_bps} />
     </div>
     <div class="knob" class:changed={changed.has('uniform_loss')}>
-      <label for="knob-loss">Packet loss<span class="val numeric">{lossPct}%</span></label>
+      <label for="knob-loss">Packet loss<span class="val" data-field="loss">{lossPct}%</span></label>
       <input id="knob-loss" type="range" min="0" max="0.9" step="0.05" bind:value={knobs.uniform_loss} />
     </div>
     <!-- The rule + gossip knobs. Longer gossip interval = slower propagation;
@@ -143,25 +186,25 @@
          draws); the limit reaches 1 000 000 so a narrative preset's pinned limit
          is editable, not clamped away. -->
     <div class="knob" class:changed={changed.has('tick_interval_ms')}>
-      <label for="knob-gossip">Gossip interval<span class="val numeric">{knobs.tick_interval_ms} ms</span></label>
+      <label for="knob-gossip">Gossip interval<span class="val" data-field="gossip-interval">{knobs.tick_interval_ms} ms</span></label>
       <input id="knob-gossip" type="range" min="50" max="1000" step="50" bind:value={knobs.tick_interval_ms} />
     </div>
     <div class="knob" class:changed={changed.has('rule_window_ms')}>
-      <label for="knob-window">Window<span class="val numeric">{windowSec} s · {windowBuckets} buckets</span></label>
+      <label for="knob-window">Window<span class="val" data-field="window">{windowSec} s · {windowBuckets} buckets</span></label>
       <input id="knob-window" type="range" min="3000" max="30000" step="1000" bind:value={knobs.rule_window_ms} />
     </div>
     <div class="knob" class:changed={changed.has('rule_limit')}>
       <label for="knob-limit">Rule limit</label>
-      <input id="knob-limit" class="numeric" type="number" min="1" max="1000000" step="100" bind:value={knobs.rule_limit} />
+      <input id="knob-limit" type="number" min="1" max="1000000" step="100" bind:value={knobs.rule_limit} />
     </div>
-    <!-- Build-time settings apply only on an explicit rebuild — so editing never
+    <!-- Build-time settings apply only on an explicit rebuild, so editing never
          nukes the running sim or collapses this section. The button is live only
          while there is a staged change. -->
     <div class="tune-apply">
       <p class="tune-status" aria-live="polite">
         {#if dirty}
           <span class="staged-dot" aria-hidden="true"></span>
-          <span class="numeric">{changed.size}</span> staged — rebuild to apply
+          <span data-field="staged">{changed.size}</span> staged — rebuild to apply
         {:else}
           Settings match the running cluster.
         {/if}
@@ -170,13 +213,39 @@
     </div>
   </details>
 
-  {#if showNetwork}
-    <section class="group">
-      <h2>Network</h2>
-      <p class="hint">Restore every link, then play to reconcile.</p>
-      <button class="secondary" onclick={onHeal} disabled={nodeCount === 0}>Heal network</button>
-    </section>
-  {/if}
+  <section class="group">
+    <h2>Network</h2>
+    <p class="hint">Cut links to watch the cluster fall behind, then heal them and play to reconcile.</p>
+    <div class="field wide">
+      <label for="cut-zone">Zone</label>
+      <select id="cut-zone" bind:value={cutPick} disabled={liveZones.length === 0}>
+        {#each liveZones as zone (zone.i)}
+          <option value={zone.i}>{zone.name}</option>
+        {/each}
+      </select>
+    </div>
+    <button
+      class="secondary"
+      onclick={() => cutPick !== null && onCutZone(cutPick)}
+      disabled={cutPick === null || liveZones.length < 2}
+    >
+      Cut {liveZones.find((z) => z.i === cutPick)?.name ?? 'zone'} off
+    </button>
+    {#if gateways.length === 0}
+      <p class="hint">Select a node to see its gateways</p>
+    {:else}
+      {#each gateways as gateway (gateway.zone)}
+        {@const zone = zoneLabel(zones[gateway.zone].name)}
+        <button class="secondary" onclick={() => onSilence(gateway.id)}>
+          Silence node <span data-field="node">{gateway.id}</span>, the gateway into {zone}
+        </button>
+        <button class="secondary" onclick={() => onCutFromZone(gateway.id, gateway.zone)}>
+          Cut node <span data-field="node">{gateway.id}</span> from {zone}
+        </button>
+      {/each}
+    {/if}
+    <button class="secondary" onclick={onHeal} disabled={nodeCount === 0}>Heal network</button>
+  </section>
 
   <section class="group">
     <h2>Cluster</h2>
@@ -185,23 +254,32 @@
          status) without counting discs on the stage. -->
     <div class="members">
       <span class="members-label">Members</span>
-      <span class="members-value numeric">{nodeCount}</span>
+      <span class="members-value" data-field="members">{fmtCount(nodeCount)}</span>
     </div>
-    <!-- Which node "Remove" takes — the AT/keyboard equivalent of the stage "×".
-         Disabled (not hidden) at one node, so the section never changes height. -->
+    <div class="field wide">
+      <label for="add-zone">Add to</label>
+      <select id="add-zone" value={addZone} onchange={(e) => (addPick = Number(e.currentTarget.value))}>
+        {#each liveZones as zone (zone.i)}
+          <option value={zone.i}>{zone.name}</option>
+        {/each}
+      </select>
+    </div>
+    <!-- Which node "Remove" takes: the AT/keyboard path to what the inspector's
+         "Remove this node" does for the selection. Disabled (not hidden) at one
+         node, so the section never changes height. -->
     <div class="field">
       <label for="remove-node">Remove</label>
-      <select id="remove-node" class="numeric" bind:value={removePick} disabled={nodeCount <= 1}>
+      <select id="remove-node" bind:value={removePick} disabled={nodeCount <= 1}>
         {#each nodeIds as id (id)}
-          <option value={id}>node {id}</option>
+          <option value={id} data-field="node">node {id}</option>
         {/each}
       </select>
     </div>
     <!-- Add and Remove as a balanced pair, so they read as the inverse of one
          another. The glyphs are the signifier; the aria-labels carry the action
-         for assistive tech (and keep the stage "×" buttons unambiguous). -->
+         for assistive tech. -->
     <div class="cluster-actions">
-      <button class="cluster-btn" aria-label="Add node" onclick={onAddNode} disabled={!canAdd}>
+      <button class="cluster-btn" aria-label="Add node" onclick={add} disabled={!canAdd}>
         <span class="sign" aria-hidden="true">+</span>Add
       </button>
       <button
@@ -220,15 +298,15 @@
     <p class="hint">Pick a node, or click any disc on the stage.</p>
     <div class="field">
       <label for="burst-node">Node</label>
-      <select id="burst-node" class="numeric" bind:value={sendPick} disabled={nodeCount === 0}>
+      <select id="burst-node" bind:value={sendPick} disabled={nodeCount === 0}>
         {#each nodeIds as id (id)}
-          <option value={id}>node {id}</option>
+          <option value={id} data-field="node">node {id}</option>
         {/each}
       </select>
     </div>
     <div class="field">
       <label for="burst-hits">Hits</label>
-      <input id="burst-hits" class="numeric" type="number" min="1" bind:value={burstHits} />
+      <input id="burst-hits" type="number" min="1" bind:value={burstHits} />
     </div>
     <button class="send" onclick={send} disabled={nodeCount === 0}>Send burst</button>
   </section>
@@ -315,8 +393,12 @@
     color: var(--color-fg-muted);
   }
 
-  input.numeric,
-  select.numeric {
+  .field.wide {
+    grid-template-columns: 4.5rem 1fr;
+  }
+
+  input[type='number'],
+  select {
     width: 100%;
     padding: var(--gap-xs) var(--gap-sm);
     border: 1px solid var(--color-border-line);
@@ -327,7 +409,7 @@
     color: var(--color-fg);
   }
 
-  select.numeric:disabled {
+  select:disabled {
     opacity: 0.5;
     cursor: not-allowed;
   }
@@ -531,6 +613,7 @@
 
   .secondary {
     align-self: flex-start;
+    text-align: left;
     padding: var(--gap-sm) var(--gap-md);
     border: 1px solid var(--color-border-line);
     border-radius: var(--radius);

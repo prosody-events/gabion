@@ -26,8 +26,9 @@ body {
   }
 }
 
-/* Tabular lining figures wherever a changing number is shown. */
-.numeric {
+/* Tabular lining figures wherever a changing number is shown: every printed
+   number is a `data-field` element. */
+[data-field] {
   font-variant-numeric: tabular-nums lining-nums;
   font-feature-settings: 'tnum' 1, 'lnum' 1;
 }

@@ -42,7 +42,7 @@ use crate::clock::{ManualClock, SharedNow, Tickers};
 use crate::config::{MAX_NODES, MAX_ZONES, SimConfig, ValidSimConfig, ZONE_NAMES, ZoneMode};
 use crate::event::{
     BytesByTier, CellView, ClusterState, Event, EventBatch, EventKind, Inspected, NodeState,
-    PeerView, ZoneView,
+    PacketKind, PeerView, ZoneView,
 };
 use crate::shims::{
     AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport, Member,
@@ -284,6 +284,8 @@ struct NodeHandle {
     seen: GossipCounters,
     /// Its gateway into each zone as last read.
     gateways: [Option<u32>; MAX_ZONES],
+    /// Bytes of `Own` packets this node sent, from the log.
+    own_data_bytes: u64,
 }
 
 /// All engine state, owned as a local inside [`engine_loop`] (no `Rc<RefCell>`
@@ -462,6 +464,7 @@ impl EngineState {
         self.addresses
             .borrow_mut()
             .insert(addr, Member { id, zone });
+        debug_assert!(self.nodes.last().is_none_or(|h| h.id < id));
         self.nodes.push(NodeHandle {
             id,
             zone,
@@ -475,6 +478,7 @@ impl EngineState {
             identity,
             seen: GossipCounters::default(),
             gateways: [None; MAX_ZONES],
+            own_data_bytes: 0,
         });
         Ok(())
     }
@@ -484,12 +488,11 @@ impl EngineState {
     }
 
     /// Position in the `nodes` `Vec` of the live node with stable id `id`,
-    /// or `None` if no live node has it. The `Vec` is small (≤ `MAX_NODES`)
-    /// and rarely scanned (only on a targeted command), so a linear search is
-    /// simpler than maintaining a second id→position map that would have to
-    /// stay in sync across every add and remove.
+    /// or `None` if no live node has it. Ids ascend (`next_id` only grows,
+    /// `add_node` appends and `remove_node` keeps the order), so `nodes` is
+    /// sorted by id and the search is binary.
     fn position_of(&self, id: u32) -> Option<usize> {
-        self.nodes.iter().position(|h| h.id == id)
+        self.nodes.binary_search_by_key(&id, |h| h.id).ok()
     }
 
     async fn submit_request(
@@ -765,20 +768,37 @@ impl EngineState {
 
     /// Drain the shims' raw events, stamping each with the current virtual
     /// time and gossip-tick index; every packet sent or dropped also counts
-    /// into `bytes_by_tier`.
+    /// into `bytes_by_tier`, and into its sender's `own_data_bytes` when it
+    /// is an `Own` packet.
     fn drain_log(&mut self, events: &mut Vec<Event>) {
         let tick = self.current_tick();
         let virtual_ms = self.virtual_ms;
+        let nodes = &mut self.nodes;
         let mut log = self.log.borrow_mut();
         events.extend(log.drain(..).map(|kind| {
             if let EventKind::PacketSent {
-                bytes, kind, tier, ..
+                src,
+                bytes,
+                kind,
+                tier,
+                ..
             }
             | EventKind::PacketDropped {
-                bytes, kind, tier, ..
+                src,
+                bytes,
+                kind,
+                tier,
+                ..
             } = &kind
             {
                 self.bytes_by_tier.add(*tier, *kind, *bytes);
+                // A sender removed since (its last packets drain after the
+                // removal) is skipped: the page weights live origins only.
+                if *kind == PacketKind::Own
+                    && let Ok(pos) = nodes.binary_search_by_key(src, |h| h.id)
+                {
+                    nodes[pos].own_data_bytes += u64::from(*bytes);
+                }
             }
             Event {
                 tick,
@@ -891,9 +911,18 @@ impl EngineState {
         let mut nodes = Vec::with_capacity(self.nodes.len());
         let mut inspected = None;
         let mut oracle_total = 0;
-        // Insertion order, so a node's position in `nodes` is its rank — the
-        // frontend turns that into a ring slot, while `id` stays its identity.
-        for handle in &self.nodes {
+        // Each origin's gateways, inverted: how many origins route through
+        // each node.
+        let mut gateway_for = vec![0u32; self.nodes.len()];
+        for origin in &self.nodes {
+            for &g in origin.gateways[..self.zone_names.len()].iter().flatten() {
+                if let Some(pos) = self.position_of(g) {
+                    gateway_for[pos] += 1;
+                }
+            }
+        }
+        // Ascending id order, the order the page lays the nodes out in.
+        for (pos, handle) in self.nodes.iter().enumerate() {
             let dump = cell_dump(&handle.admin_tx).await;
             // The ground-truth windowed total, derived from the live CRDT
             // cells rather than a monotonic accumulator: sum every node's
@@ -936,14 +965,14 @@ impl EngineState {
                 incarnation: handle.identity.incarnation,
                 aggregate_total: handle.aggregate.total(),
                 rounds_heartbeat: counters.rounds_heartbeat,
-                rounds_threshold: counters.rounds_threshold,
                 gateway_failovers: counters.gateway_failovers,
                 gap_reports_sent: counters.gap_reports_sent,
                 rto_rewinds_own: counters.rto_rewinds_own,
                 rto_rewinds_relay: counters.rto_rewinds_relay,
                 sweeps_served: counters.sweeps_served,
+                gateway_for: gateway_for[pos],
+                own_data_bytes: handle.own_data_bytes,
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
-                decode_reject_count: counters.decode_rejects(),
                 store_stats: snap
                     .as_ref()
                     .map(|s| s.store_stats.into())

@@ -150,8 +150,6 @@ export interface NodeState {
   aggregate_total: number;
   /** Heartbeat rounds the runtime has run. */
   rounds_heartbeat: number;
-  /** Threshold rounds: an eager flush crossing the error budget. */
-  rounds_threshold: number;
   /** Gateways replaced because they went unanswered or said they cannot relay. */
   gateway_failovers: number;
   /** Gap reports sent: a peer's stream skipped positions. */
@@ -162,11 +160,15 @@ export interface NodeState {
   rto_rewinds_relay: number;
   /** Join sweeps this node started answering. */
   sweeps_served: number;
+  /** Origins whose runtime sends this node's zone their changes through this
+   *  node: the gateway rows of every node, inverted. */
+  gateway_for: number;
+  /** Bytes of the node's own-stream packets it has sent since it joined,
+   *  delivered or lost. */
+  own_data_bytes: number;
   /** Per-rule error budget ε at the most recent request; pending crossing it
    *  triggers an eager (threshold) flush. 0 until a request is seen. */
   error_budget: number;
-  /** Inbound packets the wire decoder rejected. */
-  decode_reject_count: number;
   store_stats: StoreStats;
 }
 

@@ -33,7 +33,7 @@
 use tokio::sync::{mpsc, oneshot};
 use wasm_bindgen::prelude::*;
 
-use crate::config::SimConfig;
+use crate::config::{MAX_ZONES, SimConfig};
 use crate::engine::{Command, LinkPolicyKind, run_engine};
 
 /// A live simulation the page drives. Holds the sender end of the engine's
@@ -224,6 +224,12 @@ impl Sim {
 #[wasm_bindgen]
 pub fn default_config() -> Result<JsValue, JsValue> {
     to_js(&SimConfig::default())
+}
+
+/// The most zones a session places nodes in: the zone stepper's ceiling.
+#[wasm_bindgen]
+pub fn max_zones() -> u32 {
+    MAX_ZONES as u32
 }
 
 /// Serialize an owned reply into a plain JS object.

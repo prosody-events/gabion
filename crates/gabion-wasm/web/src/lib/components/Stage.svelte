@@ -1,74 +1,165 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
+  import { zoneLabel } from '../format';
   import type { ClusterState, SimEvent } from '../sim/types';
-  import { StageRenderer } from '../stage/renderer';
-  import type { Theme } from '../theme';
+  import { StageRenderer, labelExtent, type Roles } from '../stage/renderer';
   import {
-    DOT_THRESHOLD,
-    fitTransform,
+    CROSS_WIDTH,
+    IN_WIDTH,
+    LABEL_GAP,
+    R_MAX,
     nodeAt,
-    nodePosition,
-    nodeRadius,
-    toScreen,
-    type StageTransform,
+    stageLayout,
+    type Point,
+    type StageLayout,
   } from '../stage/layout';
+  import type { Theme } from '../theme';
+  import NodeGrid from './NodeGrid.svelte';
 
-  // The PixiJS stage. The WebGL canvas (managed imperatively by `StageRenderer`)
-  // draws the discs, cell arcs, light-beam packets, and convergence pulse;
-  // `cluster` feeds steady per-node state and `events` feeds the transient
-  // gossip packets from each step. A DOM overlay sits on top of the canvas with
-  // each node's stable id and total — the canvas is opaque to assistive tech and
-  // to test tooling, so the real numbers live in queryable, tabular-figure text.
+  // The tier view. The WebGL canvas (managed imperatively by `StageRenderer`)
+  // draws one ring per zone, the nodes with their cell arcs and role glyphs, and
+  // the packets in flight; `cluster` feeds steady per-node state and `events`
+  // feeds the transient packets from each step. `NodeGrid` lays the same nodes
+  // over the canvas as focusable cells with a tooltip, and a table, because the
+  // canvas is opaque to assistive tech and to test tooling.
   //
-  // Clicking a disc *selects* that node (opening the inspector); clicking the
-  // bare stage deselects. `selectedId` is fed back in so the renderer draws a
-  // static ring on the selected disc. `onDeleteNode` is the per-node "×" on its
-  // label, which removes that node live. Both clicks are pointer-only power
-  // gestures (the canvas is one opaque image to assistive tech); the
-  // keyboard/AT-accessible equivalents — pick a node to send to or remove — are
-  // explicit controls in the rail. The "×" lives inside the aria-hidden label
-  // overlay and is `tabindex=-1`, so it is not a focusable element hidden from
-  // assistive tech — the rail owns that path.
+  // Clicking or tapping a disc selects that node and shows its tooltip; clicking
+  // the bare stage deselects. The key and the one-line annotation sit under the
+  // canvas, outside it, so nothing overlaps the drawing.
   let {
     cluster,
     events,
-    selectedId,
+    roles,
+    hoveredId,
+    focusedId,
+    theme,
     onSelect,
     onDeselect,
-    onDeleteNode,
-    theme,
+    onHover,
+    onFocus,
   }: {
     cluster: ClusterState | null;
     events: SimEvent[];
-    selectedId: number | null;
-    onSelect?: (node: number) => void;
-    onDeselect?: () => void;
-    onDeleteNode?: (id: number) => void;
+    /** The selected origin's marks, or `null` with no selection. */
+    roles: Roles | null;
+    hoveredId: number | null;
+    focusedId: number | null;
     theme: Theme;
+    onSelect: (node: number) => void;
+    onDeselect: () => void;
+    onHover: (node: number | null) => void;
+    onFocus: (node: number | null) => void;
   } = $props();
+
+  // How long a resize waits for the next one before the layout follows it
+  // (design rule 26).
+  const RESIZE_DEBOUNCE_MS = 100;
 
   let container: HTMLDivElement;
   let renderer: StageRenderer | null = null;
   let ready = $state(false);
-  let transform: StageTransform = $state(fitTransform(0, 0));
-  // The node the pointer is currently over, or null — drives the cursor
-  // affordance so the ring reads as clickable only where a click would land.
-  let hoverNode: number | null = $state(null);
+  let size = $state({ w: 0, h: 0 });
 
-  const nodes = $derived(cluster?.nodes ?? []);
-  const count = $derived(nodes.length);
-  // Labels track the canvas: their size scales with the disc, and they vanish
-  // once the ring is too dense to label (matching the renderer's dot mode).
-  const labelFont = $derived(nodeRadius(count) * transform.scale * 0.62);
-  // Hold the overlay until the stage has a real fitted size (scale > 0),
-  // otherwise the first frame stacks every label at the origin.
-  const showLabels = $derived(count > 0 && count <= DOT_THRESHOLD && transform.scale > 0);
-  const summary = $derived(
-    cluster === null
-      ? 'Gossip cluster: loading.'
-      : `Gossip cluster of ${count} nodes. True total ${cluster.oracle_total}. ` +
-        `Per-node totals: ${nodes.map((n) => n.aggregate_total).join(', ')}.`,
-  );
+  // The room a node needs outside its centre: the largest disc, the gap to its
+  // label and the label's width.
+  const margin = $derived(R_MAX + LABEL_GAP + labelExtent(theme));
+
+  // The layout, recomputed only when the stage's size, the zone count or the
+  // (id, zone) list changes: an O(N) comparison per snapshot and no allocation
+  // while they hold.
+  let memo: {
+    w: number;
+    h: number;
+    zones: number;
+    margin: number;
+    ids: number[];
+    zs: number[];
+    layout: StageLayout;
+  } | null = null;
+  const layout = $derived.by((): StageLayout | null => {
+    if (cluster === null || size.w <= 0 || size.h <= 0) return null;
+    const nodes = cluster.nodes;
+    const zones = cluster.zones.length;
+    const m = memo;
+    if (
+      m !== null &&
+      m.w === size.w &&
+      m.h === size.h &&
+      m.zones === zones &&
+      m.margin === margin &&
+      m.ids.length === nodes.length &&
+      nodes.every((n, i) => n.id === m.ids[i] && n.zone === m.zs[i])
+    ) {
+      return m.layout;
+    }
+    const next = stageLayout(size.w, size.h, zones, nodes, margin);
+    memo = {
+      w: size.w,
+      h: size.h,
+      zones,
+      margin,
+      ids: nodes.map((n) => n.id),
+      zs: nodes.map((n) => n.zone),
+      layout: next,
+    };
+    return next;
+  });
+
+  // The latest gateway change or join-sweep request, in a sentence.
+  let annotation = $state<{ text: string; numbers: number[] } | null>(null);
+  $effect(() => {
+    if (events.length === 0) {
+      annotation = null;
+      return;
+    }
+    // Read once per batch: the cluster moves every frame, the annotation doesn't.
+    const names = untrack(() => cluster?.zones.map((z) => z.name) ?? []);
+    const nodes = untrack(() => cluster?.nodes ?? []);
+    const zone = (z: number): string => zoneLabel(names[z] ?? '');
+    for (let i = events.length - 1; i >= 0; i--) {
+      const kind = events[i].kind;
+      if (kind.type === 'GatewayChanged') {
+        const { origin, to, from } = kind;
+        annotation =
+          to == null
+            ? { text: `node # has no gateway into ${zone(kind.zone)}`, numbers: [origin] }
+            : from == null
+              ? { text: `node # now reaches ${zone(kind.zone)} through node #`, numbers: [origin, to] }
+              : {
+                  text: `node # now reaches ${zone(kind.zone)} through node #, after node #`,
+                  numbers: [origin, to, from],
+                };
+        return;
+      }
+      if (kind.type === 'PacketSent' && kind.kind === 'SweepRequest') {
+        const dst = nodes.find((n) => n.id === kind.dst);
+        annotation = {
+          text: `node # asked ${zone(dst?.zone ?? 0)} for missed changes`,
+          numbers: [kind.src],
+        };
+        return;
+      }
+    }
+  });
+  // The annotation's text with each `#` as its number, in a data-bound element.
+  const noteParts = $derived.by(() => {
+    if (annotation === null) return [];
+    const { text, numbers } = annotation;
+    return text.split('#').flatMap((part, i) => (i < numbers.length ? [part, numbers[i]] : [part]));
+  });
+
+  $effect(() => {
+    if (ready && renderer !== null) renderer.resize(size.w, size.h);
+  });
+
+  $effect(() => {
+    if (ready && renderer !== null && layout !== null && cluster !== null) {
+      renderer.setLayout(
+        layout,
+        cluster.zones.map((z) => z.name),
+      );
+    }
+  });
 
   $effect(() => {
     if (ready && renderer !== null) renderer.setCluster(cluster);
@@ -79,38 +170,50 @@
   });
 
   $effect(() => {
-    if (ready && renderer !== null) renderer.setSelected(selectedId);
+    if (ready && renderer !== null) renderer.setRoles(roles);
+  });
+
+  $effect(() => {
+    if (ready && renderer !== null) renderer.setFocus(focusedId);
   });
 
   $effect(() => {
     if (ready && renderer !== null) renderer.setTheme(theme);
   });
 
-  /** Resolve a pointer event to the node under it (or null), in the container's
-   *  own pixel space. The label overlay is `pointer-events: none`, so a pointer
-   *  over a disc reaches this handler whether it is over the canvas or a label. */
+  /** The node under a pointer event, or null, in the container's own pixels. The
+   *  grid cells are `pointer-events: none`, so a pointer over a disc reaches
+   *  this handler whether it is over the canvas or a cell. */
   function nodeUnder(event: PointerEvent): number | null {
+    if (layout === null) return null;
     const rect = container.getBoundingClientRect();
-    return nodeAt({ x: event.clientX - rect.left, y: event.clientY - rect.top }, nodes, transform);
+    const p: Point = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    return nodeAt(p, layout);
   }
 
   function onPointerMove(event: PointerEvent): void {
-    hoverNode = nodeUnder(event);
+    onHover(nodeUnder(event));
   }
 
-  function onPointerLeave(): void {
-    hoverNode = null;
+  /** A mouse leaving the stage clears the hover. A touch fires `pointerleave` the
+   *  moment the finger lifts, which would hide the tooltip a tap just showed:
+   *  it stays until the next tap. */
+  function onPointerLeave(event: PointerEvent): void {
+    if (event.pointerType === 'mouse') onHover(null);
   }
 
   function onPointerDown(event: PointerEvent): void {
+    // Hovering too, so a tap, which fires no move first, shows the tooltip.
     const node = nodeUnder(event);
-    if (node !== null) onSelect?.(node);
-    else onDeselect?.();
+    onHover(node);
+    if (node !== null) onSelect(node);
+    else onDeselect();
   }
 
   onMount(() => {
     let disposed = false;
     let observer: ResizeObserver | null = null;
+    let timer = 0;
 
     void (async () => {
       const r = await StageRenderer.create(container, theme);
@@ -119,19 +222,29 @@
         return;
       }
       renderer = r;
-      const apply = (): void => {
+      const measure = (): void => {
         const rect = container.getBoundingClientRect();
-        transform = r.resize(rect.width, rect.height);
+        size = { w: rect.width, h: rect.height };
       };
-      apply();
-      observer = new ResizeObserver(apply);
+      measure();
+      let first = true;
+      observer = new ResizeObserver(() => {
+        // The first observation applies at once; later ones are debounced.
+        if (first) {
+          first = false;
+          measure();
+          return;
+        }
+        window.clearTimeout(timer);
+        timer = window.setTimeout(measure, RESIZE_DEBOUNCE_MS);
+      });
       observer.observe(container);
-      if (cluster !== null) r.setCluster(cluster);
       ready = true;
     })();
 
     return () => {
       disposed = true;
+      window.clearTimeout(timer);
       observer?.disconnect();
       renderer?.destroy();
       renderer = null;
@@ -140,139 +253,127 @@
   });
 </script>
 
-<div
-  class="stage"
-  class:actionable={hoverNode !== null}
-  bind:this={container}
-  role="img"
-  aria-label={summary}
-  onpointerdown={onPointerDown}
-  onpointermove={onPointerMove}
-  onpointerleave={onPointerLeave}
->
-  {#if showLabels}
-    <div class="stage-labels" aria-hidden="true">
-      {#each nodes as node, rank (node.id)}
-        {@const s = toScreen(nodePosition(rank, count), transform)}
-        <span
-          class="node-label"
-          data-id={node.id}
-          style="left: {s.x}px; top: {s.y}px; font-size: {labelFont}px;"
-        >
-          <span class="node-id numeric">{node.id}</span>
-          <span class="node-count numeric">{node.aggregate_total}</span>
-          {#if onDeleteNode}
-            <button
-              class="node-delete"
-              type="button"
-              tabindex="-1"
-              aria-hidden="true"
-              title={`Remove node ${node.id}`}
-              onpointerdown={(event) => event.stopPropagation()}
-              onclick={(event) => {
-                event.stopPropagation();
-                onDeleteNode?.(node.id);
-              }}>×</button
-            >
-          {/if}
-        </span>
-      {/each}
-    </div>
+<div class="stage-box">
+  <div
+    class="stage"
+    class:actionable={hoveredId !== null}
+    bind:this={container}
+    role="presentation"
+    onpointerdown={onPointerDown}
+    onpointermove={onPointerMove}
+    onpointerleave={onPointerLeave}
+  ></div>
+
+  <ul class="key" aria-label="Key">
+    <li>
+      <svg width="28" height="10" aria-hidden="true">
+        <line class="in" x1="1" y1="5" x2="27" y2="5" stroke-width={IN_WIDTH} />
+      </svg>
+      inside a zone (a relay starts at a ◆)
+    </li>
+    <li>
+      <svg width="28" height="10" aria-hidden="true">
+        <line class="cross" x1="1" y1="5" x2="20" y2="5" stroke-width={CROSS_WIDTH} />
+        <polygon class="arrow" points="19,1 27,5 19,9" />
+      </svg>
+      across zones
+    </li>
+    <li>
+      <svg width="10" height="10" aria-hidden="true"><circle class="dot" cx="5" cy="5" r="2" /></svg>
+      ack, probe or gap report
+    </li>
+    <li><span aria-hidden="true">◆</span> gateway</li>
+    <li><span aria-hidden="true">◇</span> suspected gateway</li>
+  </ul>
+
+  <p class="annotation" aria-live="polite">
+    {#each noteParts as part}{#if typeof part === 'number'}<span data-field="annotation">{part}</span>{:else}{part}{/if}{/each}
+  </p>
+
+  {#if cluster !== null && layout !== null}
+    <NodeGrid
+      {cluster}
+      {layout}
+      {roles}
+      width={size.w}
+      height={size.h}
+      {hoveredId}
+      {focusedId}
+      {onSelect}
+      {onDeselect}
+      {onFocus}
+    />
   {/if}
 </div>
 
 <style>
+  .stage-box {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+  }
+
   .stage {
     position: relative;
-    width: 100%;
-    height: 100%;
+    flex: 1;
+    min-height: 0;
     overflow: hidden;
   }
 
-  /* The ring reads as interactive only over a disc — the cursor is the
+  /* The ring reads as interactive only over a disc: the cursor is the
      signifier that a click here will land on a node. */
   .stage.actionable {
     cursor: pointer;
   }
 
-  /* The overlay must never intercept pointer events — Phase 6 hit-tests the
-     canvas underneath for click-a-node. */
-  .stage-labels {
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-  }
-
-  .node-label {
-    position: absolute;
-    transform: translate(-50%, -50%);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    line-height: 1;
-  }
-
-  /* When membership changes the ring re-spaces: glide each label's screen
-     address (and its size) in step with the canvas disc's GSAP glide, so the
-     number rides along with its node rather than snapping ahead of it. Only
-     fires when left/top/font-size actually change — steady play leaves them
-     untouched — and is dropped entirely under reduced motion. */
-  @media (prefers-reduced-motion: no-preference) {
-    .node-label {
-      transition:
-        left 520ms ease-in-out,
-        top 520ms ease-in-out,
-        font-size 520ms ease-in-out;
+  /* The phone: the stage is a square, so the rings keep their shape. */
+  @media (width < 640px) {
+    .stage {
+      flex: none;
+      aspect-ratio: 1;
     }
   }
 
-  /* The per-node "×": a pointer-only affordance that removes this node live.
-     `pointer-events: auto` lifts it out of the pass-through overlay so it can
-     be clicked, while the rest of the label stays click-through for the burst
-     hit-test. A panel-coloured chip with a hairline border; subtle until
-     hovered, so twelve of them don't clutter it. */
-  .node-delete {
-    pointer-events: auto;
-    position: absolute;
-    top: -0.85em;
-    right: -1em;
+  .key {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--gap-xs) var(--gap-md);
+    margin: 0;
+    padding: var(--gap-xs) var(--gap-md);
+    list-style: none;
+    font-size: var(--font-size-caption);
+    color: var(--color-fg);
+  }
+
+  .key li {
     display: flex;
     align-items: center;
-    justify-content: center;
-    width: 1.15em;
-    height: 1.15em;
-    padding: 0;
-    border: 1px solid var(--color-border-line);
-    border-radius: 50%;
-    background: var(--color-panel);
-    color: var(--color-fg-muted);
-    font-size: 0.8em;
-    line-height: 1;
-    cursor: pointer;
-    opacity: 0.55;
-    transition:
-      opacity 120ms ease,
-      color 120ms ease,
-      border-color 120ms ease;
+    gap: var(--gap-xs);
   }
 
-  .node-delete:hover,
-  .node-delete:focus-visible {
-    opacity: 1;
-    color: var(--color-bad);
-    border-color: var(--color-bad);
+  .key .in {
+    stroke: var(--chart-muted);
   }
 
-  .node-id {
-    color: var(--color-bg);
-    font-size: 0.7em;
-    margin-bottom: 0.15em;
+  .key .cross {
+    stroke: var(--color-fg);
   }
 
-  /* Labels take the background colour on the `--color-fg` disc: the body-text
-     pair inverted. */
-  .node-count {
-    color: var(--color-bg);
-    font-weight: 650;
+  .key .arrow {
+    fill: var(--color-fg);
+  }
+
+  .key .dot {
+    fill: var(--chart-muted);
+  }
+
+  .annotation {
+    min-height: 1.5em;
+    margin: 0;
+    padding: 0 var(--gap-md) var(--gap-xs);
+    font-size: var(--font-size-caption);
+    color: var(--color-fg);
   }
 </style>

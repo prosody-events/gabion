@@ -1,7 +1,7 @@
-// Canvas colours. PixiJS and uPlot take numbers and strings, not CSS variables,
-// so `readTheme` resolves the design tokens in `tokens.css` by painting each one
-// and reading the pixel back: no colour string is parsed by hand, whatever form
-// the browser serialises it in.
+// Canvas colours and type. PixiJS and uPlot take numbers and strings, not CSS
+// variables, so `readTheme` resolves the design tokens in `tokens.css` by
+// painting each colour and reading the pixel back: no colour string is parsed by
+// hand, whatever form the browser serialises it in.
 
 /** Resolve the canvas tokens from the page's current styles. Self-contained (no
  *  module-level references), because the design audit runs it in the page too. */
@@ -21,20 +21,31 @@ export function readTheme() {
     if (a < 255) console.error(`readTheme: ${token} is translucent; canvas tokens must be opaque`);
     return (r << 16) | (g << 8) | b;
   };
+  const size = (token: string): number => {
+    probe.style.fontSize = `var(${token})`;
+    return Number.parseFloat(getComputedStyle(probe).fontSize);
+  };
   const theme = {
     bg: read('--color-bg'),
     fg: read('--color-fg'),
     fgMuted: read('--color-fg-muted'),
     grid: read('--chart-grid'),
     muted: read('--chart-muted'),
+    reference: read('--chart-reference'),
+    panel: read('--color-panel'),
     ok: read('--color-ok'),
     warn: read('--color-warn'),
+    /** Type: the page's family and the two caption sizes, in px. */
+    font: getComputedStyle(document.documentElement).fontFamily,
+    captionPx: size('--font-size-caption'),
+    captionSmPx: size('--font-size-caption-sm'),
   };
   probe.remove();
   return theme;
 }
 
-/** The tokens the stage and the charts draw with, as packed `0xRRGGBB`. */
+/** The tokens the stage and the charts draw with: colours as packed `0xRRGGBB`,
+ *  and the canvas type. */
 export type Theme = ReturnType<typeof readTheme>;
 
 /** The peak alpha of every stage beam, delivered or dropped, and the REJECTING
@@ -42,6 +53,9 @@ export type Theme = ReturnType<typeof readTheme>;
  *  checking contrast. */
 export const BEAM_ALPHA = 0.8;
 export const BAND_ALPHA = 0.15;
+/** The share of its alpha a beam keeps when a selection makes it context: the
+ *  one named exemption from the graphics contrast rule (§8.7). */
+export const FADED_ALPHA = 0.25;
 
 /** Call `onChange` when the OS colour scheme or `<html data-theme>` changes;
  *  returns the unsubscribe. */

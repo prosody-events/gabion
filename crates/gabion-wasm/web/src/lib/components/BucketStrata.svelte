@@ -186,15 +186,15 @@
       <section class="strip" role="group" aria-label={stripSummary(strip)}>
         <div class="strip-head">
           <span class="head-left">
-            <span class="key numeric">key {shortKey(strip.key)}</span>
+            <span class="key" data-field="key">key {shortKey(strip.key)}</span>
             {#if strip.oldestActiveEpoch !== null}
-              <span class="tte numeric">ages out in {tteSeconds(strip.oldestActiveEpoch).toFixed(1)}s</span>
+              <span class="tte" data-field="tte">ages out in {tteSeconds(strip.oldestActiveEpoch).toFixed(1)}s</span>
             {/if}
           </span>
           <span class="sigma" class:over={strip.sigma >= limit}>
-            Σ <span class="sigma-value numeric">{strip.sigma}</span>
+            Σ <span class="sigma-value" data-field="sigma">{strip.sigma}</span>
             <span class="sigma-sep">/</span>
-            <span class="numeric">{limit.toLocaleString()}</span>
+            <span data-field="limit">{limit.toLocaleString()}</span>
           </span>
         </div>
         <div class="viewport" aria-hidden="true">
@@ -224,7 +224,7 @@
          buckets enter under "now" on the right and age out toward the trailing
          edge on the left. -->
     <div class="axis" aria-hidden="true">
-      <span class="numeric">{windowSeconds}s ago</span>
+      <span data-field="window-ago">{windowSeconds}s ago</span>
       <span>now</span>
     </div>
   {/if}

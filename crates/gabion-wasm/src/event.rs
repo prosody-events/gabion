@@ -239,7 +239,8 @@ impl BytesByTier {
 /// One node's view at snapshot time. The scalar fields mirror the runtime's
 /// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); `store_stats` mirrors its
 /// [`CellStoreStats`](gabion::crdt::CellStoreStats). The node inspector renders
-/// them directly — see the panel sections in `web/src/lib/components`.
+/// them directly: see `GossipTargets.svelte` and `NodeInspector.svelte` in
+/// `web/src/lib/components`.
 #[derive(Clone, Debug, Serialize)]
 pub struct NodeState {
     /// The node's stable id (see the module note). Distinct from `node_id`
@@ -260,9 +261,6 @@ pub struct NodeState {
     pub aggregate_total: u64,
     /// Heartbeat rounds this runtime has run.
     pub rounds_heartbeat: u64,
-    /// Threshold rounds: an eager flush crossing the per-rule error budget,
-    /// not the heartbeat timer.
-    pub rounds_threshold: u64,
     /// Gateways replaced because they went unanswered for `suspect_after` or
     /// said they cannot relay.
     pub gateway_failovers: u64,
@@ -274,11 +272,15 @@ pub struct NodeState {
     pub rto_rewinds_relay: u64,
     /// Join sweeps this node started answering.
     pub sweeps_served: u64,
+    /// Origins whose runtime sends this node's zone their changes through this
+    /// node: the gateway rows of every node, inverted.
+    pub gateway_for: u32,
+    /// Bytes of the node's own-stream (`Own`) packets it has sent since it
+    /// joined, delivered or lost.
+    pub own_data_bytes: u64,
     /// The per-rule error budget ε at the most recent request: a rule's pending
     /// hits crossing it triggers an eager (threshold) flush. `0` until seen.
     pub error_budget: u64,
-    /// Inbound packets the wire decoder dropped, for any cause.
-    pub decode_reject_count: u64,
     /// CRDT store occupancy and saturation counters.
     pub store_stats: StoreStats,
 }

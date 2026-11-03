@@ -1,11 +1,49 @@
 import { expect, test, type Page } from '@playwright/test';
 
-const COUNTS = '.stage-labels .node-count';
 const SEED_TOTAL = '50';
 const NODES = 12;
 // Mirrors `burstHits` in `App.svelte`: the size of a burst the inspector's or
-// the rail's Send injects (a stage click now *selects*, it does not burst).
+// the rail's Send injects (a stage click *selects*, it does not burst).
 const BURST_HITS = '25';
+
+// Every node is read from the page's own DOM: its grid cell (`gridcell`) for
+// geometry and its "Show as table" row for numbers, because the canvas is opaque
+// and the table is the in-DOM numeric source. The table stays open across
+// rebuilds, so a test opens it once, right after the page loads.
+const cell = (page: Page, id: number) => page.locator(`[role="gridcell"][data-node="${id}"]`);
+const view = (page: Page, id: number) =>
+  page.locator(`.node-table tr[data-node="${id}"] [data-field="view"]`);
+const COUNTS = '.node-table [data-field="view"]';
+
+/** Wait until the stage's layout follows its box: the table opening shrinks the
+ *  stage, and the layout (and with it every grid cell) follows after a short
+ *  debounce, so a click before then lands where a node used to be. The renderer
+ *  publishes the centre of the layout it drew. */
+async function settled(page: Page): Promise<void> {
+  await expect
+    .poll(async () => {
+      const at = await page.locator('.stage').evaluate((stage: HTMLElement) => {
+        const canvas = stage.querySelector('canvas');
+        const centre = JSON.parse(canvas?.dataset.centre ?? '{"x":0,"y":0}') as { x: number; y: number };
+        return { x: centre.x * 2 - stage.clientWidth, y: centre.y * 2 - stage.clientHeight };
+      });
+      return Math.abs(at.x) < 1 && Math.abs(at.y) < 1;
+    })
+    .toBe(true);
+}
+
+/** Load the page and open "Show as table". The default preset (Traffic burst)
+ *  opens with node 0 selected. */
+async function boot(page: Page): Promise<void> {
+  await page.goto('/');
+  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await page.getByText('Show as table').click();
+  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  await settled(page);
+}
+
+/** Parse a printed count ("1,234"). */
+const num = (text: string | null): number => Number((text ?? '0').replace(/,/g, ''));
 
 /** Set the playback speed slider (a range input can't be `fill`ed). */
 async function setSpeed(page: Page, value: number): Promise<void> {
@@ -15,35 +53,54 @@ async function setSpeed(page: Page, value: number): Promise<void> {
   }, value);
 }
 
-/** Read the transport bar's virtual-time readout, in seconds. */
+/** The transport bar's virtual-time readout, in seconds ("5.0 s" or "200 ms"). */
 async function virtualSeconds(page: Page): Promise<number> {
-  const text = await page
-    .locator('.readout-item', { hasText: 'virtual time' })
-    .locator('.readout-value')
-    .textContent();
-  return Number.parseFloat((text ?? '0').replace('s', ''));
+  const text = (await page.locator('[data-field="virtual-time"]').textContent()) ?? '0 ms';
+  return text.endsWith(' ms') ? Number.parseFloat(text) / 1000 : Number.parseFloat(text);
 }
 
-/** How many of the on-stage node counts are currently non-zero. */
+/** One Step, returning once its snapshot is on the page (the tick readout moved). */
+async function step(page: Page): Promise<void> {
+  const tick = page.locator('[data-field="tick"]');
+  const before = num(await tick.textContent());
+  await page.getByRole('button', { name: 'Step forward one tick' }).click();
+  await expect(tick).toHaveText(String(before + 1));
+}
+
+/** Click the middle of node `id`'s disc. The grid cell has no pointer events, so
+ *  the click reaches the stage's own hit test, as a user's would. */
+async function clickNode(page: Page, id: number): Promise<void> {
+  const box = await cell(page, id).boundingBox();
+  if (box === null) throw new Error(`node ${id} has no grid cell box to click`);
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+}
+
+/** Click the middle of the stage, which no disc covers, to deselect. */
+async function deselect(page: Page): Promise<void> {
+  const box = await page.locator('.stage').boundingBox();
+  if (box === null) throw new Error('the stage has no box');
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+}
+
+/** How many of the table's node views are currently non-zero. */
 async function nonZeroCount(page: Page): Promise<number> {
   const counts = await page.locator(COUNTS).allTextContents();
-  return counts.filter((t) => Number(t.trim()) > 0).length;
+  return counts.filter((t) => num(t) > 0).length;
 }
 
 // One end-to-end check that doubles as the visual-quality screenshot source:
 // the page boots the real gabion core in the browser, the PixiJS stage renders
-// the ring from a snapshot, and — when played — gossips the seeded burst out to
-// every node as light-beam packets. The narrative presets now carry a faint
-// uncapped background feed, so the cluster never settles on a single clean total
-// and never falls silent — the burst spreads on top of a living hum, and gossip
-// continues indefinitely. The hard assertions read the DOM label overlay (robust
-// regardless of WebGL pixels); the screenshots are for eyeballing the canvas.
+// the rings from a snapshot, and — when played — gossips the seeded burst out to
+// every node as beams. The narrative presets carry a faint uncapped background
+// feed, so the cluster never settles on a single clean total and never falls
+// silent — the burst spreads on top of a living hum, and gossip continues
+// indefinitely. The hard assertions read the table (robust regardless of WebGL
+// pixels); the screenshots are for eyeballing the canvas.
 test('boots, gossips the burst out, and keeps gossiping past the window', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
   await page.screenshot({ path: 'screenshots/ring-initial.png' });
 
   // Before any gossip (paused, so the background feed has not yet run): only the
@@ -100,27 +157,21 @@ test('boots, gossips the burst out, and keeps gossiping past the window', async 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
-// Click-a-node now *selects* it and opens the inspector (the burst gesture moved
-// into the inspector and the rail). The label overlay is `pointer-events: none`,
-// so clicking its center falls through to the stage's hit-test; we read geometry
-// off the same overlay the canvas hides behind.
+// Click-a-node *selects* it and opens the inspector (the burst gesture lives in
+// the inspector and the rail). The grid cell has no pointer events, so clicking
+// its centre falls through to the stage's hit test.
 test('clicking a node selects it; the inspector sends a burst', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
-  // The page boots paused, with only node 0 seeded and the charts in the right
-  // rail. Pick an empty node to inspect.
-  const target = page.locator('.node-label[data-id="3"]');
-  await expect(target.locator('.node-count')).toHaveText('0');
+  // The page boots paused with Traffic burst, which selects its origin, node 0.
+  // Pick an empty node to inspect.
+  await expect(view(page, 3)).toHaveText('0');
+  await clickNode(page, 3);
 
-  const box = await target.boundingBox();
-  if (box === null) throw new Error('node 3 label has no bounding box to click');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-
-  // The click selects node 3: the inspector replaces the charts and names it.
+  // The click selects node 3: the inspector names it.
   const inspector = page.locator('.inspector');
   await expect(inspector).toBeVisible();
   await expect(inspector).toContainText('Node 3');
@@ -129,31 +180,23 @@ test('clicking a node selects it; the inspector sends a burst', async ({ page })
   // (paused) virtual time — a pure inject below the threshold-AE budget, so it
   // does not spread: node 3 carries the burst, node 0 keeps its seed, others 0.
   await inspector.getByRole('button', { name: 'Send burst' }).click();
-  await expect(target.locator('.node-count')).toHaveText(BURST_HITS);
-  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText(SEED_TOTAL);
-  await expect(page.locator('.node-label[data-id="5"] .node-count')).toHaveText('0');
+  await expect(view(page, 3)).toHaveText(BURST_HITS);
+  await expect(view(page, 0)).toHaveText(SEED_TOTAL);
+  await expect(view(page, 5)).toHaveText('0');
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
-// Clicking the bare stage (the ring's empty hub) deselects: the inspector closes
-// and the charts dashboard returns.
+// Clicking the bare stage (the rings' empty centre) deselects: the inspector
+// closes and the charts dashboard returns.
 test('clicking the bare stage deselects and restores the charts', async ({ page }) => {
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
-  const target = page.locator('.node-label[data-id="3"]');
-  const box = await target.boundingBox();
-  if (box === null) throw new Error('node 3 label has no bounding box to click');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-  await expect(page.locator('.inspector')).toBeVisible();
+  await clickNode(page, 3);
+  await expect(page.locator('.inspector')).toContainText('Node 3');
 
-  // The stage's centre sits inside the ring, off every disc — a click there
-  // misses all nodes and deselects.
-  const stage = page.locator('.stage');
-  const sb = await stage.boundingBox();
-  if (sb === null) throw new Error('stage has no bounding box');
-  await page.mouse.click(sb.x + sb.width / 2, sb.y + sb.height / 2);
+  // The stage's centre sits in the hub between the rings, off every disc.
+  await deselect(page);
   await expect(page.locator('.inspector')).toHaveCount(0);
   await expect(page.locator('.dashboard')).toBeVisible();
 });
@@ -161,16 +204,15 @@ test('clicking the bare stage deselects and restores the charts', async ({ page 
 // Removing the selected node closes its inspector — the App clears the selection
 // the moment its id is no longer live, so the inspector can't show a gone node.
 test('removing the selected node closes its inspector', async ({ page }) => {
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
-  const target = page.locator('.node-label[data-id="5"]');
-  const box = await target.boundingBox();
-  if (box === null) throw new Error('node 5 label has no bounding box to click');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await clickNode(page, 5);
   await expect(page.locator('.inspector')).toContainText('Node 5');
 
-  await page.locator('.node-label[data-id="5"] .node-delete').click();
+  // The rail's Remove takes the picked node, which is not the selected one by
+  // default: pick node 5 there.
+  await page.getByLabel('Remove', { exact: true }).selectOption('5');
+  await page.getByRole('button', { name: 'Remove node', exact: true }).click();
   await expect(page.locator('.inspector')).toHaveCount(0);
   await expect(page.locator('.dashboard')).toBeVisible();
 });
@@ -178,20 +220,16 @@ test('removing the selected node closes its inspector', async ({ page }) => {
 // The pinned headline metric stays above whichever the right rail shows — the
 // charts dashboard or the node inspector.
 test('the pinned headline stays visible in both rail modes', async ({ page }) => {
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
-  // Charts mode: node 0 seeded at 50, rest 0, so the headline (max − min) is 50.
-  await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
-  await expect(page.locator('.dashboard')).toBeVisible();
-
-  const target = page.locator('.node-label[data-id="3"]');
-  const box = await target.boundingBox();
-  if (box === null) throw new Error('node 3 label has no bounding box to click');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-
-  // Inspector mode: the headline is still pinned above it.
+  // Inspector mode (Traffic burst selects node 0): node 0 seeded at 50, rest 0,
+  // so the headline (max − min) is 50.
   await expect(page.locator('.inspector')).toBeVisible();
+  await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
+
+  // Charts mode: the headline is still pinned above the dashboard.
+  await deselect(page);
+  await expect(page.locator('.dashboard')).toBeVisible();
   await expect(page.locator('.headline-value')).toHaveText(SEED_TOTAL);
 });
 
@@ -206,21 +244,17 @@ test('Sandbox: inject, Step it out to convergence, then age out to quiet', async
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
   await page.getByRole('button', { name: 'Sandbox' }).click();
   // Starts quiet — no seed, no background feed, every node at zero.
-  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText('0');
-  await expect(page.locator('.node-label[data-id="6"] .node-count')).toHaveText('0');
+  await expect(view(page, 0)).toHaveText('0');
+  await expect(view(page, 6)).toHaveText('0');
 
   // Select node 0 and inject a burst (paused — a pure inject, no spread yet).
-  const target = page.locator('.node-label[data-id="0"]');
-  const box = await target.boundingBox();
-  if (box === null) throw new Error('node 0 label has no bounding box to click');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await clickNode(page, 0);
   await page.locator('.inspector').getByRole('button', { name: 'Send burst' }).click();
-  await expect(target.locator('.node-count')).toHaveText(BURST_HITS);
+  await expect(view(page, 0)).toHaveText(BURST_HITS);
 
   // Honesty invariant: the Strata Σ equals this node's aggregate (the strip
   // shows exactly the cells the node holds).
@@ -228,13 +262,12 @@ test('Sandbox: inject, Step it out to convergence, then age out to quiet', async
   await expect(strata).toBeVisible();
   await expect(strata.locator('.sigma-value')).toHaveText(BURST_HITS);
   // It has not spread yet — a different node is still empty.
-  await expect(page.locator('.node-label[data-id="6"] .node-count')).toHaveText('0');
+  await expect(view(page, 6)).toHaveText('0');
 
-  // Step gossips the cell out: the next heartbeat sends it straight to every
-  // peer, so within a handful of ticks every node agrees on the injected total.
-  for (let i = 0; i < 12; i++) {
-    await page.getByRole('button', { name: 'Step forward one tick' }).click();
-  }
+  // Step gossips the cell out: the next heartbeat sends it to the zone and a
+  // gateway in each other zone, whose relays follow, so within a handful of
+  // ticks every node agrees on the injected total.
+  for (let i = 0; i < 12; i++) await step(page);
   await expect
     .poll(
       async () => {
@@ -251,7 +284,7 @@ test('Sandbox: inject, Step it out to convergence, then age out to quiet', async
   await page.getByRole('button', { name: 'Play' }).click();
   await expect(strata.locator('.no-traffic')).toBeVisible({ timeout: 20_000 });
   await page.getByRole('button', { name: 'Pause' }).click();
-  await expect(target.locator('.node-count')).toHaveText('0');
+  await expect(view(page, 0)).toHaveText('0');
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
@@ -266,13 +299,9 @@ test('Sandbox: inject, Step it out to convergence, then age out to quiet', async
 // the emerging bucket scrolling in under "now"). Select the seeded node, then
 // drive time forward and confirm the column count is pinned throughout.
 test('the Strata keeps a fixed column count as the window scrolls', async ({ page }) => {
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
-  const target = page.locator('.node-label[data-id="0"]');
-  const box = await target.boundingBox();
-  if (box === null) throw new Error('node 0 label has no bounding box to click');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await clickNode(page, 0);
 
   // One key (the watched key) → one strip; its track holds liveBuckets + 2 = 12
   // fixed-width columns from the first render.
@@ -295,29 +324,28 @@ test('the Strata keeps a fixed column count as the window scrolls', async ({ pag
 // churn, so a free-typed number could miss a live node). Drives the labelled
 // control and the button by their accessible names.
 test('the control rail sends a burst to the chosen node', async ({ page }) => {
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
-  const target = page.locator('.node-label[data-id="7"]');
-  await expect(target.locator('.node-count')).toHaveText('0');
+  await expect(view(page, 7)).toHaveText('0');
 
   await page.getByLabel('Node', { exact: true }).selectOption('7');
-  await page.getByRole('button', { name: 'Send burst' }).click();
+  await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
 
-  await expect(target.locator('.node-count')).toHaveText(BURST_HITS);
+  await expect(view(page, 7)).toHaveText(BURST_HITS);
 });
 
 // Live join: "+ Add node" spawns a fresh cold-start member into a converged
-// cluster — no rebuild. It takes the next stable id (12, never reused) and joins
-// by gossip, then catches up to the settled total by anti-entropy. The
-// screenshots are the proof the join *reads* right: the newcomer fades/scales in
-// at its ring slot while the survivors glide to re-space around it.
+// cluster — no rebuild. It takes the next stable id (12, never reused) in the
+// zone the picker offers (the fewest live members, the lowest index on a tie:
+// zone a) and joins by gossip, then catches up to the settled total by
+// anti-entropy. The screenshots are the proof the join *reads* right: the
+// newcomer fades/scales in at its ring slot while the survivors glide to
+// re-space around it.
 test('adding a node joins it live and it catches up by gossip', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
   // Spread the burst across the living cluster first, so the newcomer joins an
   // actively-gossiping cluster — the clearest "catch up by gossip" story.
@@ -330,29 +358,30 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
     })
     .toBe(NODES);
   await page.getByRole('button', { name: 'Pause' }).click();
-  // The dashboard before the join: the fan and disagreement curves over the
-  // elapsed window. Pair with `dash-after-add` to eyeball that the join threads
-  // through this same window — the time axis keeps running, no restart at x = 0.
+  // The dashboard before the join: the share, agreement and disagreement charts
+  // over the elapsed window. Pair with `dash-after-add` to eyeball that the join
+  // threads through this same window — the time axis keeps running, no restart
+  // at x = 0.
+  await deselect(page);
   const dashboard = page.locator('.dashboard');
   await dashboard.screenshot({ path: 'screenshots/dash-before-add.png' });
 
-  // Add a fresh node: it takes id 12 and joins cold (its view starts at zero).
+  // Add a fresh node: it takes id 12, joins zone a and starts cold (view zero).
+  await expect(page.getByLabel('Add to')).toHaveValue('0');
   await page.getByRole('button', { name: 'Add node' }).click();
-  const newcomer = page.locator('.node-label[data-id="12"]');
-  await expect(newcomer.locator('.node-count')).toHaveText('0');
+  await expect(view(page, 12)).toHaveText('0');
   await expect(page.locator(COUNTS)).toHaveCount(NODES + 1);
+  await expect(page.locator('.node-table tr[data-node="12"]')).toHaveAttribute('data-zone', '0');
   await page.screenshot({ path: 'screenshots/ring-node-added.png' });
-  // The same dashboard right after the join: the newcomer adds a fan line that
-  // starts *here* (a gap before it, since it did not exist earlier in the
-  // window) — and crucially the x-axis is unbroken from `dash-before-add`,
-  // proving the join did not reset the charts.
+  // The same dashboard right after the join: the time axis is unbroken from
+  // `dash-before-add`, proving the join did not reset the charts.
   await dashboard.screenshot({ path: 'screenshots/dash-after-add.png' });
 
   // Play on: the newcomer catches up from zero by anti-entropy — the survivors
   // push it their cells until its view climbs to match the living cluster.
   await page.getByRole('button', { name: 'Play' }).click();
   await expect
-    .poll(async () => Number((await newcomer.locator('.node-count').textContent()) ?? '0'), {
+    .poll(async () => num(await view(page, 12).textContent()), {
       timeout: 15_000,
       message: 'the newcomer did not catch up by gossip',
     })
@@ -363,67 +392,68 @@ test('adding a node joins it live and it catches up by gossip', async ({ page })
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
-// Live leave via the stage "×": removing a mid-ring node drops exactly that one.
-// Its stable id leaves a *gap* — neighbours 4 and 6 keep their ids, no renumber —
-// and the survivors re-space to close the ring. The "×" is a pointer-only
-// affordance whose `stopPropagation` keeps the click off the burst hit-test.
-test('removing a node via its stage × leaves a stable-id gap and re-spaces', async ({ page }) => {
+// Live leave through the inspector: removing the selected node drops exactly
+// that one. Its stable id leaves a *gap* — neighbours 4 and 6 keep their ids, no
+// renumber — and the survivors re-space to close the ring.
+test('the inspector removes the selected node', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
-  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  await boot(page);
+  await expect(cell(page, 5)).toHaveCount(1);
 
-  await page.locator('.node-label[data-id="5"] .node-delete').click();
+  await clickNode(page, 5);
+  const inspector = page.locator('.inspector');
+  await expect(inspector).toContainText('Node 5');
+  await inspector.getByRole('button', { name: 'Remove this node' }).click();
 
   // Node 5 is gone, 12 → 11 nodes; 4 and 6 remain (a gap at 5, not a renumber).
-  await expect(page.locator('.node-label[data-id="5"]')).toHaveCount(0);
-  await expect(page.locator('.node-label[data-id="4"]')).toHaveCount(1);
-  await expect(page.locator('.node-label[data-id="6"]')).toHaveCount(1);
-  await expect(page.locator(COUNTS)).toHaveCount(NODES - 1);
+  await expect(cell(page, 5)).toHaveCount(0);
+  await expect(cell(page, 4)).toHaveCount(1);
+  await expect(cell(page, 6)).toHaveCount(1);
+  await expect(page.locator('[role="gridcell"]')).toHaveCount(NODES - 1);
+  await expect(page.locator('.inspector')).toHaveCount(0);
   // Node 5 was empty (only node 0 seeded), so removing it loses no count — node 0
   // still holds the burst.
-  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText(SEED_TOTAL);
+  await expect(view(page, 0)).toHaveText(SEED_TOTAL);
   await page.screenshot({ path: 'screenshots/ring-node-removed.png' });
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
 // The rail's Cluster control is the keyboard/AT-accessible equivalent of the
-// stage "×": pick a live id, press Remove, and that node leaves.
+// inspector's Remove: pick a live id, press Remove, and that node leaves.
 test('the rail Cluster control removes the chosen node', async ({ page }) => {
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
-  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  await boot(page);
 
   await page.getByLabel('Remove', { exact: true }).selectOption('8');
-  // `exact` so this rail button isn't ambiguous with the stage "×" buttons,
-  // whose accessible name is "Remove node 5", "Remove node 6", …
+  // `exact` so this rail button isn't ambiguous with the inspector's "Remove this
+  // node".
   await page.getByRole('button', { name: 'Remove node', exact: true }).click();
 
-  await expect(page.locator('.node-label[data-id="8"]')).toHaveCount(0);
+  await expect(cell(page, 8)).toHaveCount(0);
   await expect(page.locator(COUNTS)).toHaveCount(NODES - 1);
 });
 
 // Scenario presets rebuild the cluster from a fresh config + opening seed.
 // Switching from the default Traffic burst to Steady state should tear down and
-// rebuild with the steady seed (a light burst scattered across four nodes).
+// rebuild with the steady seed (a light burst at one node in each zone).
 test('selecting a scenario preset rebuilds the cluster with its seed', async ({ page }) => {
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
   // Default scenario: node 0 carries the 50-hit burst, the rest start at zero.
-  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText(SEED_TOTAL);
+  await expect(view(page, 0)).toHaveText(SEED_TOTAL);
 
   await page.getByRole('button', { name: 'Steady state' }).click();
 
-  // Steady state seeds 10 on nodes 0, 3, 6, 9 and nothing elsewhere; at t=0
-  // (paused) each carries only its own seed, so the cluster maximally disagrees
-  // before any gossip. node 0's old 50 is gone — this is a fresh cluster.
-  await expect(page.locator('.node-label[data-id="3"] .node-count')).toHaveText('10');
-  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText('10');
-  await expect(page.locator('.node-label[data-id="1"] .node-count')).toHaveText('0');
+  // Steady state seeds 10 on nodes 0, 4 and 8 (one per zone) and nothing
+  // elsewhere; at t=0 (paused) each carries only its own seed, so the cluster
+  // maximally disagrees before any gossip. node 0's old 50 is gone — this is a
+  // fresh cluster.
+  await expect(view(page, 4)).toHaveText('10');
+  await expect(view(page, 0)).toHaveText('10');
+  await expect(view(page, 8)).toHaveText('10');
+  await expect(view(page, 1)).toHaveText('0');
 });
 
 // The rebuild knobs live behind a collapsed disclosure (Hick's law). They are
@@ -435,9 +465,7 @@ test('a rebuild knob stages, keeps the section open, and applies on Rebuild', as
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
-  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  await boot(page);
 
   const details = page.locator('details.tune');
   await page.getByText('Tune the cluster').click();
@@ -454,17 +482,18 @@ test('a rebuild knob stages, keeps the section open, and applies on Rebuild', as
   });
 
   // The readout updated and the knob is marked staged; the section stayed open
-  // and no rebuild fired (no loading overlay, Rebuild now enabled).
+  // and no rebuild fired (no overlay, Rebuild now enabled).
   await expect(page.locator('label[for="knob-loss"] .val')).toHaveText('50%');
   await expect(page.locator('.knob.changed label[for="knob-loss"]')).toBeVisible();
   await expect(page.locator('.tune-status')).toContainText('staged');
-  await expect(page.locator('.overlay', { hasText: 'Loading the gossip engine' })).toHaveCount(0);
+  await expect(page.locator('.overlay')).toHaveCount(0);
   await expect(details).toHaveAttribute('open', '');
   await expect(rebuild).toBeEnabled();
 
   // Rebuild applies the staged set: the cluster rebuilds (same size, no errors),
   // the section is still open, and nothing is staged any more.
   await rebuild.click();
+  await expect(page.locator('.overlay')).toHaveCount(0);
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
   await expect(details).toHaveAttribute('open', '');
   await expect(page.locator('.tune-status')).toContainText('match');
@@ -472,28 +501,29 @@ test('a rebuild knob stages, keeps the section open, and applies on Rebuild', as
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
-// The rule knobs (Slice 2) live in the same disclosure: a gossip-interval and
-// window range plus a limit number input. Moving the window updates its derived
-// bucket-count readout (the same `buckets.ts` math the Strata draws bars from);
-// the explicit Rebuild then applies it — proof the readout and the rebuild are
-// wired and the engine still accepts the new window/bucket pairing (window stays
-// a whole number of 1 s buckets, so `SimConfig::validate` passes).
+// The rule knobs live in the same disclosure: a gossip-interval and window range
+// plus a limit number input. Moving the window updates its derived bucket-count
+// readout (the same `buckets.ts` math the Strata draws bars from); the explicit
+// Rebuild then applies it — proof the readout and the rebuild are wired and the
+// engine still accepts the new window/bucket pairing (window stays a whole
+// number of 1 s buckets, so `SimConfig::validate` passes). The zone stepper
+// stages the same way and stops at the engine's own ceiling.
 test('the window knob updates its bucket-count readout and rebuilds', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
-  await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  await boot(page);
 
   await page.getByText('Tune the cluster').click();
+  // The stepper's ceiling is the engine's `max_zones` (six), below the twelve nodes.
+  await expect(page.locator('#knob-zones')).toHaveAttribute('max', '6');
   // Default window is 10 s → 11 buckets (10 nominal + the partial oldest bucket
   // the engine retains; see `buckets.ts`).
   await expect(page.locator('label[for="knob-window"] .val')).toHaveText('10 s · 11 buckets');
 
   // Move the window to 5 s → 6 buckets. The readout updates immediately (the
   // staged value), before any rebuild.
-  await page.getByLabel('Window').evaluate((el: HTMLInputElement) => {
+  await page.locator('#knob-window').evaluate((el: HTMLInputElement) => {
     el.value = '5000';
     el.dispatchEvent(new Event('input', { bubbles: true }));
   });
@@ -501,6 +531,7 @@ test('the window knob updates its bucket-count readout and rebuilds', async ({ p
 
   // Apply it. The rebuild left a healthy cluster of the same size, no errors.
   await page.getByRole('button', { name: 'Rebuild cluster' }).click();
+  await expect(page.locator('.overlay')).toHaveCount(0);
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
@@ -513,25 +544,21 @@ test('sustained overload climbs the aggregate past the limit', async ({ page }) 
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
   await page.getByRole('button', { name: 'Sustained overload' }).click();
   // The overload preset has no opening burst — the feed is the story — so every
   // node starts at zero until played.
-  await expect(page.locator('.node-label[data-id="0"] .node-count')).toHaveText('0');
+  await expect(view(page, 0)).toHaveText('0');
 
   await page.getByRole('button', { name: 'Play' }).click();
   // The watched node's view (the aggregate it converges on) climbs past the
   // limit of 400 as the steady feed accumulates cluster-wide.
   await expect
-    .poll(
-      async () => {
-        const text = await page.locator('.node-label[data-id="0"] .node-count').textContent();
-        return Number(text ?? '0');
-      },
-      { timeout: 15_000, message: 'aggregate did not climb past the limit under sustained load' },
-    )
+    .poll(async () => num(await view(page, 0).textContent()), {
+      timeout: 15_000,
+      message: 'aggregate did not climb past the limit under sustained load',
+    })
     .toBeGreaterThan(400);
   await page.getByRole('button', { name: 'Pause' }).click();
   await page.screenshot({ path: 'screenshots/ring-overload.png' });
@@ -543,117 +570,94 @@ test('sustained overload climbs the aggregate past the limit', async ({ page }) 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
-// The network-partition scenario severs the cluster in two, bursts one half, and
-// the halves disagree until the user heals the link — the eventual-consistency
-// story end to end. Also confirms Heal is disclosed only for network scenarios.
-test('network partition splits the cluster until healed', async ({ page }) => {
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+// The zone-partition scenario cuts the last zone off from the rest, bursts both
+// sides, and the sides disagree until the user heals the links — the
+// eventual-consistency story end to end. Driven by Step (which still feeds the
+// background hum), so the outcome is exact rather than timed.
+test('zone partition splits zone c off until healed', async ({ page }) => {
+  await boot(page);
 
-  await page.getByRole('button', { name: 'Network partition' }).click();
+  await page.getByRole('button', { name: 'Zone partition' }).click();
   const heal = page.getByRole('button', { name: 'Heal network' });
   await expect(heal).toBeVisible();
+  await expect(page.locator('[data-field="status-cut"]')).toHaveText('32');
 
-  // Group A (nodes 0–5) holds the 50-hit burst; group B (6–11) is severed from
-  // it. Both halves carry their share of the faint background hum, but only A
-  // ever sees the burst — so A sits well above B while the link is cut.
-  const groupACount = page.locator('.node-label[data-id="1"] .node-count');
-  const groupBCount = page.locator('.node-label[data-id="6"] .node-count');
-
-  await page.getByRole('button', { name: 'Play' }).click();
-  // Group A picks up the burst (≥ 50); the severed half never hears it, so it
-  // stays well below — only its sliver of background traffic.
-  await expect
-    .poll(async () => Number((await groupACount.textContent()) ?? '0'), {
-      timeout: 15_000,
-      message: 'group A did not pick up the burst',
-    })
-    .toBeGreaterThanOrEqual(50);
-  expect(
-    Number((await groupBCount.textContent()) ?? '0'),
-    'the severed half should not have the burst',
-  ).toBeLessThan(50);
+  // Node 0 (zone a) burst 50 and node 2 (zone c) burst 50. While the cut holds
+  // node 1 (zone b) hears only node 0's burst and node 5 (zone c) only node 2's,
+  // so both sit well under the 100 the whole cluster holds.
+  for (let i = 0; i < 6; i++) await step(page);
+  await expect.poll(async () => num(await view(page, 1).textContent())).toBeGreaterThanOrEqual(50);
+  expect(num(await view(page, 1).textContent()), 'zone b should not have zone c burst').toBeLessThan(100);
+  expect(num(await view(page, 5).textContent()), 'zone c should not have zone a burst').toBeLessThan(100);
   await page.screenshot({ path: 'screenshots/ring-partition.png' });
 
-  // Heal the link (still playing): the cut-off half catches up by gossip — it
-  // kept its CRDT state, so this reconciles rather than cold-restarts. It now
-  // holds the burst too, climbing past where it sat while severed.
+  // Heal the links: the cut-off zone kept its CRDT state, so the sides reconcile
+  // rather than cold-restart. Both now hold both bursts.
   await heal.click();
+  await expect(page.locator('[data-field="status-cut"]')).toHaveText('0');
+  for (let i = 0; i < 8; i++) await step(page);
   await expect
-    .poll(async () => Number((await groupBCount.textContent()) ?? '0'), {
-      timeout: 15_000,
-      message: 'the healed half did not reconcile',
-    })
-    .toBeGreaterThanOrEqual(50);
-  await page.getByRole('button', { name: 'Pause' }).click();
+    .poll(async () => num(await view(page, 1).textContent()), { message: 'zone b did not reconcile' })
+    .toBeGreaterThanOrEqual(100);
+  await expect
+    .poll(async () => num(await view(page, 5).textContent()), { message: 'zone c did not reconcile' })
+    .toBeGreaterThanOrEqual(100);
   await page.screenshot({ path: 'screenshots/ring-healed.png' });
 });
 
-// The redesigned node-detail panel surfaces the full AdminSnapshot in grouped,
+// The node-detail panel surfaces the runtime's admin snapshot in grouped,
 // labeled sections. This asserts each section renders with live values: the
-// §2 convergence headline (honestly "This node's view", not "Cluster total"),
-// §4 cadence, §5 I/O, §6 storage gauges, §7 peer table, §8 identity.
+// convergence headline (honestly "This node's view", not "Cluster total"), the
+// bucket window, the gossip targets table and the identity footer.
 test('the node inspector renders every detail section', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
-  // Spread some traffic so cadence/peers/storage carry non-trivial values.
+  // Spread some traffic so the targets and counters carry non-trivial values.
   await setSpeed(page, 3);
   await page.getByRole('button', { name: 'Play' }).click();
   await expect.poll(async () => nonZeroCount(page), { timeout: 15_000 }).toBe(NODES);
   await page.getByRole('button', { name: 'Pause' }).click();
 
-  const target = page.locator('.node-label[data-id="0"]');
-  const box = await target.boundingBox();
-  if (box === null) throw new Error('node 0 label has no bounding box to click');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-
+  await clickNode(page, 0);
   const inspector = page.locator('.inspector');
   await expect(inspector).toBeVisible();
 
-  // §2 — the headline is this node's view, with its two references inline.
+  // The headline is this node's view, with its two references inline.
   await expect(inspector).toContainText("This node's view");
   await expect(inspector.locator('.hl-refs')).toContainText('true');
   await expect(inspector.locator('.hl-refs')).toContainText('limit');
   // A convergence badge is always present (one of the three states).
   await expect(inspector.locator('.badge[role="status"]').first()).toBeVisible();
 
-  // §4–§7 section headings.
-  await expect(inspector.locator('.section-head', { hasText: 'Gossip cadence' })).toBeVisible();
-  await expect(inspector.locator('.section-head', { hasText: 'Gossip I/O' })).toBeVisible();
-  await expect(inspector.locator('.section-head', { hasText: 'Storage' })).toBeVisible();
-  await expect(inspector.locator('.section-head', { hasText: 'Peers' })).toBeVisible();
+  // The section headings that remain, and those that were deleted with the
+  // machinery they described.
+  await expect(inspector.locator('.section-head', { hasText: 'Bucket window' })).toBeVisible();
+  await expect(inspector.locator('.section-head', { hasText: 'Gossip targets' })).toBeVisible();
+  await expect(inspector.locator('.section-head')).toHaveCount(2);
 
-  // §4 — the cadence status word, live tick sparkline, and the surfaced error
-  // budget.
-  await expect(inspector.locator('.cadence .status-word')).toBeVisible();
-  await expect(inspector.locator('.cadence .spark')).toBeVisible();
-  await expect(inspector.locator('.cadence .budget')).toContainText('error budget');
+  // Gossip targets: own zone, zone peers, one row per remote zone, counters and
+  // the error budget.
+  await expect(inspector.locator('tr.own-zone')).toContainText('zone a');
+  await expect(inspector.locator('tr.zone-peers')).toBeVisible();
+  await expect(inspector.locator('tr.remote')).toHaveCount(2);
+  await expect(inspector.locator('tr.counters')).toBeVisible();
+  await expect(inspector.locator('tr.budget')).toBeVisible();
 
-  // §6 — three occupancy gauges; the calm "holding" badge at zero rejects.
-  await expect(inspector.locator('[role="meter"]')).toHaveCount(3);
-  await expect(inspector.locator('.holding')).toContainText('All capacities holding');
+  // Identity: the collapsed footer with its hex preview, and the cells held.
+  const identity = inspector.locator('details.identity');
+  await expect(identity.locator('summary')).toContainText('Identity');
+  await identity.locator('summary').click();
+  await expect(identity).toContainText('Cells held');
+  expect(num(await identity.locator('[data-field="cells-held"]').textContent())).toBeGreaterThan(0);
 
-  // §7 — the peer table summary and a resolved peer row.
-  await expect(inspector.locator('.peer-summary')).toContainText('tracked');
-  await expect(inspector.locator('table.peers tbody tr').first()).toContainText('known');
-
-  // §8 — the collapsed identity footer with its hex preview.
-  await expect(inspector.locator('details.identity summary')).toContainText('Identity');
-
-  // Honesty invariant (guards the §2/§3 rewrite): the headline "this node's
+  // Honesty invariant (guards the hero/Strata rewrite): the headline "this node's
   // view" equals the Strata Σ for the single watched key — the strip shows
-  // exactly the cells the node's aggregate counts. (Strip commas from the
-  // localized hero before comparing.)
-  const hero = Number(
-    (await inspector.locator('.hl-value').textContent())?.replace(/,/g, '') ?? '0',
-  );
-  const sigma = Number(
-    (await inspector.locator('.strata .sigma-value').first().textContent()) ?? '0',
-  );
+  // exactly the cells the node's aggregate counts.
+  const hero = num(await inspector.locator('.hl-value').textContent());
+  const sigma = num(await inspector.locator('.strata .sigma-value').first().textContent());
   expect(sigma, "Strata Σ should equal this node's aggregate view").toBe(hero);
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
@@ -665,29 +669,20 @@ test('the node inspector renders every detail section', async ({ page }) => {
 // limit, recoloring the headline and showing the honest "over limit" pill
 // (the visualizer counts past the cap; it never claims to have rejected).
 test('the inspector shows convergence lag and the over-limit state', async ({ page }) => {
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
+  await boot(page);
 
   // --- Convergence channel, on Sandbox ---
   await page.getByRole('button', { name: 'Sandbox' }).click();
   // Inject at node 0 (the origin): its view equals the oracle → caught up.
-  const origin = page.locator('.node-label[data-id="0"]');
-  let box = await origin.boundingBox();
-  if (box === null) throw new Error('node 0 has no bounding box');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await clickNode(page, 0);
   await page.locator('.inspector').getByRole('button', { name: 'Send burst' }).click();
   await expect(page.locator('.inspector .convergence .badge')).toContainText('caught up');
 
   // Switch to an empty node: it has none of the origin's burst yet → lagging.
-  const other = page.locator('.node-label[data-id="6"]');
-  box = await other.boundingBox();
-  if (box === null) throw new Error('node 6 has no bounding box');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await clickNode(page, 6);
   await expect(page.locator('.inspector .convergence .badge')).toContainText('lagging');
   // Step until it catches up by gossip.
-  for (let i = 0; i < 12; i++) {
-    await page.getByRole('button', { name: 'Step forward one tick' }).click();
-  }
+  for (let i = 0; i < 12; i++) await step(page);
   await expect(page.locator('.inspector .convergence .badge')).toContainText('caught up');
 
   // --- Admission channel, on the overload preset ---
@@ -695,15 +690,10 @@ test('the inspector shows convergence lag and the over-limit state', async ({ pa
   await setSpeed(page, 4);
   await page.getByRole('button', { name: 'Play' }).click();
   await expect
-    .poll(
-      async () => Number((await page.locator('.node-label[data-id="0"] .node-count').textContent()) ?? '0'),
-      { timeout: 15_000 },
-    )
+    .poll(async () => num(await view(page, 0).textContent()), { timeout: 15_000 })
     .toBeGreaterThan(400);
   await page.getByRole('button', { name: 'Pause' }).click();
-  box = await page.locator('.node-label[data-id="0"]').boundingBox();
-  if (box === null) throw new Error('node 0 has no bounding box');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await clickNode(page, 0);
   // The headline recolors (the `.over` class) and the over-limit pill appears.
   await expect(page.locator('.inspector .hl-value.over')).toBeVisible();
   await expect(page.locator('.inspector .pill')).toContainText('over limit');
@@ -712,7 +702,6 @@ test('the inspector shows convergence lag and the over-limit state', async ({ pa
   // clip against the inspector's overflow box (it is right-aligned for exactly
   // this reason).
   await page.locator('.inspector .pill .term').hover();
-  await page.waitForTimeout(200);
   const bubble = page.locator('.inspector .pill .bubble');
   await expect(bubble).toBeVisible();
   const bb = await bubble.boundingBox();
@@ -723,101 +712,109 @@ test('the inspector shows convergence lag and the over-limit state', async ({ pa
   );
 });
 
-// The adaptive decision must be *visible and responsive* — the whole point of
-// §4. The eager-flush share was a frozen lifetime ratio; now a concentrated
-// burst crosses the (tiny) error budget and raises the windowed threshold share
-// off zero.
-test('the node inspector shows a responsive eager-flush share', async ({
-  page,
-}) => {
+// The inspector tells a newcomer what the origin's runtime chose: one row per
+// remote zone naming the gateway it sends that zone's copy through, and the
+// error budget it holds before an eager flush. The page reads both from the
+// runtime's own admin rows, so the test compares the named gateway with the
+// engine's, not just its zone.
+test('the inspector shows gateways per remote zone and the error budget', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
-  await page.getByRole('button', { name: 'Sustained overload' }).click();
-  await setSpeed(page, 4);
-  await page.getByRole('button', { name: 'Play' }).click();
-  await expect
-    .poll(
-      async () =>
-        Number((await page.locator('.node-label[data-id="0"] .node-count').textContent()) ?? '0'),
-      { timeout: 15_000 },
-    )
-    .toBeGreaterThan(400);
-
-  const box = await page.locator('.node-label[data-id="0"]').boundingBox();
-  if (box === null) throw new Error('node 0 has no bounding box');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await boot(page);
   const inspector = page.locator('.inspector');
-  await expect(inspector).toBeVisible();
+  await expect(inspector).toContainText('Node 0');
+  const rows = inspector.locator('tr.remote');
 
-  // The eager-flush (threshold) share is windowed, so a concentrated burst on
-  // this node — many hits at once across the ε=1 budget — moves it off zero.
-  const send = inspector.getByRole('button', { name: /send/i }).first();
-  for (let i = 0; i < 10; i++) {
-    await send.click();
-    await page.waitForTimeout(80);
+  // Step until both remote rows name a gateway, at most ten Steps.
+  const named = async (): Promise<boolean> =>
+    (await inspector.locator('tr.remote [data-field="gateway"]').count()) === 2;
+  for (let i = 0; i < 10 && !(await named()); i++) await step(page);
+  await expect(inspector.locator('tr.remote [data-field="gateway"]')).toHaveCount(2);
+
+  await expect(inspector.locator('tr.own-zone')).toContainText('zone a');
+  await expect(inspector.locator('tr.own-zone [data-field="members"]')).toHaveText('4');
+  await expect(inspector.locator('tr.zone-peers [data-field="count"]')).toHaveText('3');
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toHaveAttribute('data-zone', '1');
+  await expect(rows.nth(1)).toHaveAttribute('data-zone', '2');
+
+  // Each row names the runtime's own gateway for that zone, and that node sits
+  // in the zone.
+  const gateways = await page.evaluate(async () => {
+    const snap = await window.sim!.snapshot(0);
+    return (snap.inspected?.peers ?? [])
+      .filter((p) => p.role === 'gateway')
+      .map((p) => ({ zone: p.zone, id: p.id }));
+  });
+  for (const zone of [1, 2]) {
+    const row = inspector.locator(`tr.remote[data-zone="${zone}"]`);
+    const id = Number(await row.locator('[data-field="gateway"]').textContent());
+    expect(gateways, `the runtime's gateway into zone ${zone}`).toContainEqual({ zone, id });
+    await expect(page.locator(`.node-table tr[data-node="${id}"]`)).toHaveAttribute(
+      'data-zone',
+      String(zone),
+    );
   }
-  await expect
-    .poll(
-      async () =>
-        Number(
-          ((await inspector.locator('.bar-row .bar .seg.threshold').getAttribute('style')) ?? '')
-            .replace(/[^0-9.]/g, '') || '0',
-        ),
-      { timeout: 10_000 },
-    )
-    .toBeGreaterThan(0);
+
+  // The error budget the first burst set is a number above zero.
+  const budget = inspector.locator('tr.budget [data-field="error-budget"]');
+  await expect(budget).toHaveCount(1);
+  expect(num(await budget.textContent())).toBeGreaterThan(0);
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });
 
-// Regression for two linked bugs: in isolation/heal mode a cut-off node tracks
-// peers it has never heard from, whose gossip id is None — and Option::None
-// crosses the wasm boundary as `undefined`, not `null`. A strict `!== null`
-// guard let `undefined` through to `shortHex`, throwing during the inspector's
-// render. That surfaced as "clicking a node does nothing" (the inspector never
-// mounted), and — because an uncaught render error wedges Svelte's scheduler —
-// a subsequent Reset then hung forever on "Loading the gossip engine…". The fix
-// is the loose `!= null` peer guards; this guards the whole path.
-test('isolation/heal: nodes stay clickable and Reset still rebuilds', async ({ page }) => {
+// A gateway going silent is the failure the two-tier design exists to survive.
+// The preset silences the origin's gateway into zone b without telling anyone;
+// after the suspect timeout the origin names another gateway, the stage says so,
+// and the zone catches up through it. Bounded Steps, no sleeps: 12 Steps of
+// virtual time outlast the failover, so a green run has headroom and a red one
+// cannot pass by waiting longer. A silent node's peers include ones it never
+// heard from (`Option::None` crosses as `undefined`), the case that once crashed
+// the inspector, so the test opens it too and then checks Reset still rebuilds.
+test('gateway failure fails over and the zone catches up', async ({ page }) => {
   const pageErrors: string[] = [];
   page.on('pageerror', (err) => pageErrors.push(err.message));
 
-  await page.goto('/');
-  await page.waitForSelector('.stage canvas', { timeout: 30_000 });
-  await page.getByRole('button', { name: 'Node isolation & heal' }).click();
-  await setSpeed(page, 4);
-  await page.getByRole('button', { name: 'Play' }).click();
-  await page.waitForTimeout(1000);
-  await page.getByRole('button', { name: 'Pause' }).click();
+  await boot(page);
+  await page.getByRole('button', { name: 'Gateway failure' }).click();
+  const inspector = page.locator('.inspector');
+  await expect(inspector).toContainText('Node 0');
+  await expect(page.locator('[data-field="status-cut"]')).toHaveText('11');
 
-  // The isolated node (highest id) has only pending peers — the exact case that
-  // used to crash. Clicking it must open the inspector, not silently fail.
-  const isolated = page.locator(`.node-label[data-id="${NODES - 1}"]`);
-  let box = await isolated.boundingBox();
-  if (box === null) throw new Error('isolated node has no bounding box');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-  await expect(page.locator('.inspector')).toContainText(`Node ${NODES - 1}`);
-  // It really is the unresolved-peer case (pending rows present).
-  await expect(page.locator('.inspector .state.pending').first()).toBeVisible();
+  const gateway = inspector.locator('tr.remote[data-zone="1"] [data-field="gateway"]');
+  const g = Number(await gateway.textContent());
 
-  // Heal, then the same node is still clickable.
-  await page.getByRole('button', { name: 'Heal network' }).click();
-  await page.waitForTimeout(300);
-  box = await isolated.boundingBox();
-  if (box === null) throw new Error('isolated node has no bounding box after heal');
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-  await expect(page.locator('.inspector')).toContainText(`Node ${NODES - 1}`);
+  // Step until the stage names a zone b failover and the origin has moved off g.
+  const annotation = page.locator('.annotation');
+  const moved = async (): Promise<boolean> =>
+    ((await annotation.textContent()) ?? '').includes('zone b') &&
+    Number(await gateway.textContent()) !== g;
+  for (let i = 0; i < 12 && !(await moved()); i++) await step(page);
+  await expect(annotation).toContainText('zone b');
+  await expect(gateway).not.toHaveText(String(g));
 
-  // With a node selected, Reset must clear the loading overlay and rebuild the
-  // cluster — not wedge on "Loading the gossip engine…".
+  // Six more Steps: every zone b node but the silenced one is caught up, and the
+  // silenced one is not.
+  for (let i = 0; i < 6; i++) await step(page);
+  const behind = (id: number) =>
+    page.locator(`.node-table tr[data-node="${id}"] [data-field="behind"]`);
+  for (const id of [1, 4, 7, 10].filter((id) => id !== g)) {
+    await expect(behind(id), `node ${id} in zone b`).toHaveText('0');
+  }
+  expect(num(await behind(g).textContent()), 'the silenced gateway hears nothing').toBeGreaterThan(0);
+
+  // The silenced node is still inspectable.
+  await clickNode(page, g);
+  await expect(inspector).toContainText(`Node ${g}`);
+
+  // With a node selected, Reset must clear the rebuilding overlay and rebuild the
+  // cluster with a node selected, not wedge.
   await page.getByRole('button', { name: 'Reset' }).click();
-  await expect(page.locator('.overlay', { hasText: 'Loading the gossip engine' })).toHaveCount(0, {
-    timeout: 10_000,
-  });
+  await expect(page.locator('.overlay.rebuilding')).toHaveCount(0, { timeout: 10_000 });
   await expect(page.locator(COUNTS)).toHaveCount(NODES);
+  await expect(page.locator('.inspector')).toBeVisible();
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
 });

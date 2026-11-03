@@ -1,9 +1,11 @@
 <script lang="ts">
   // The time dock: play/pause, single-step, reset, a speed control, and the
-  // current virtual-time readout. The full linear scrubber and the Tide
-  // causality strip layer in here in Phase 6.
+  // current virtual-time readout.
+  import { fmtDuration } from '../format';
+
   let {
     playing,
+    busy,
     speed = $bindable(),
     tick,
     virtualMs,
@@ -12,6 +14,8 @@
     onReset,
   }: {
     playing: boolean;
+    /** A rebuild is running: the controls wait for it. */
+    busy: boolean;
     speed: number;
     tick: number;
     virtualMs: number;
@@ -19,36 +23,35 @@
     onStep: () => void;
     onReset: () => void;
   } = $props();
-
-  const seconds = $derived((virtualMs / 1000).toFixed(1));
 </script>
 
 <div class="transport" role="group" aria-label="Playback controls">
   <button
     class="primary"
     onclick={onToggle}
+    disabled={busy}
     aria-pressed={playing}
     aria-label={playing ? 'Pause' : 'Play'}
   >
     {playing ? '❚❚ Pause' : '▶ Play'}
   </button>
-  <button onclick={onStep} disabled={playing} aria-label="Step forward one tick"> ▸❙ Step </button>
-  <button onclick={onReset} aria-label="Reset to start"> ↺ Reset </button>
+  <button onclick={onStep} disabled={playing || busy} aria-label="Step forward one tick"> ▸❙ Step </button>
+  <button onclick={onReset} disabled={busy} aria-label="Reset to start"> ↺ Reset </button>
 
   <label class="speed">
     <span>Speed</span>
     <input type="range" min="0.1" max="4" step="0.1" bind:value={speed} aria-label="Playback speed" />
-    <span class="numeric speed-value">{speed.toFixed(1)}×</span>
+    <span class="speed-value" data-field="speed">{speed.toFixed(1)}×</span>
   </label>
 
   <div class="readout">
     <span class="readout-item">
       <span class="readout-label">tick</span>
-      <span class="numeric readout-value">{tick}</span>
+      <span class="readout-value" data-field="tick">{tick}</span>
     </span>
     <span class="readout-item">
       <span class="readout-label">virtual time</span>
-      <span class="numeric readout-value">{seconds}s</span>
+      <span class="readout-value" data-field="virtual-time">{fmtDuration(virtualMs)}</span>
     </span>
   </div>
 </div>

@@ -1,19 +1,98 @@
 import { inflateSync } from 'node:zlib';
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import type { ClusterState } from '../src/lib/sim/types';
+import { R_MAX, beamPath, pointOn, type Point, type Spot } from '../src/lib/stage/layout';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
-// A1, A2, A3 (DOM text), A7 and A8. Each audit project fixes a width and a
-// colour scheme; this walks every preset to a fixed virtual time with the
-// transport paused, checks it, then checks it again with `data-theme` forcing
-// the other theme. Full-page PNGs land in `audit-shots/` for the visual audit.
+// A1 to A9. Each audit project fixes a width and a colour scheme; the main test
+// walks every preset to a fixed virtual time with the transport paused, checks
+// it, then checks it again with `data-theme` forcing the other theme. Full-page
+// PNGs land in `audit-shots/` for the visual audit. Two more tests check the
+// stage's geometry for every zone count and the interactions.
+//
+// A4 and A5 recompute what the page prints from the engine's own snapshot, in
+// this file's code and with its own formatting, never the page's.
 
 const STEPS = 10;
+// The rule window every preset runs with (`SimConfig::default`, which no preset
+// overrides).
+const WINDOW_MS = 10_000;
 
-type Findings = Record<'A1' | 'A2' | 'A3' | 'A7' | 'A8', string[]>;
+type Findings = Record<'A1' | 'A2' | 'A3' | 'A7' | 'A8' | 'A9', string[]>;
+
+// -- Formatting, written out here so the page's formatters are not reused --------
+
+const int = (n: number): string => n.toLocaleString('en-US');
+const percent = (x: number): string => `${(x * 100).toFixed(1)}%`;
+const duration = (ms: number): string => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+
+// -- Page helpers --------------------------------------------------------------
+
+const cell = (page: Page, id: number): Locator => page.locator(`[role="gridcell"][data-node="${id}"]`);
+const tick = (page: Page): Locator => page.locator('[data-field="tick"]');
+const field = (page: Page, name: string): Locator => page.locator(`[data-field="${name}"]`);
+
+/** The page's engine, snapshotted: every node's state, or with `inspect` that
+ *  node's rows too. */
+const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
+  page.evaluate((id) => window.sim!.snapshot(id), inspect);
+
+/** One Step, returning once its snapshot is on the page (the tick readout moved). */
+async function step(page: Page): Promise<void> {
+  const before = Number(await tick(page).textContent());
+  await page.getByRole('button', { name: 'Step forward one tick' }).click();
+  await expect(tick(page)).toHaveText(String(before + 1));
+}
+
+/** Load the page, wait for the stage, and open the rail where it folds away. */
+async function open(page: Page): Promise<Locator> {
+  await page.goto('/');
+  const canvas = page.locator('.stage canvas');
+  await expect(canvas).toBeVisible({ timeout: 30_000 });
+  // Below 640 px the rail is a closed "Controls" disclosure; it stays open across rebuilds.
+  const controls = page.locator('.controls > summary');
+  if (await controls.isVisible()) await controls.click();
+  return canvas;
+}
+
+/** Select a scenario by its label and wait for the rebuild to finish. The rail's
+ *  `aria-current` marks the new cluster as live. */
+async function loadPreset(page: Page, name: string): Promise<Locator> {
+  const preset = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name, exact: true });
+  if ((await preset.getAttribute('aria-current')) !== 'true') await preset.click();
+  await expect(preset).toHaveAttribute('aria-current', 'true');
+  await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
+  return preset;
+}
+
+/** Open or close "Show as table" and wait for the stage layout to follow its
+ *  shrinking or growing box, so no geometry is read mid-resize. */
+async function setTable(page: Page, open: boolean): Promise<void> {
+  const details = page.locator('details.node-table');
+  if ((await details.evaluate((el: HTMLDetailsElement) => el.open)) !== open) {
+    await details.locator('summary').click();
+  }
+  await expect(page.locator('.node-table table')).toHaveCount(open ? 1 : 0);
+  await settled(page);
+}
+
+/** Wait until the layout the renderer published is for the stage's current box. */
+async function settled(page: Page): Promise<void> {
+  await expect
+    .poll(() =>
+      page.locator('.stage').evaluate((stage: HTMLElement) => {
+        const centre = JSON.parse(stage.querySelector('canvas')?.dataset.centre ?? '{"x":0,"y":0}');
+        return Math.abs(centre.x * 2 - stage.clientWidth) < 1 && Math.abs(centre.y * 2 - stage.clientHeight) < 1;
+      }),
+    )
+    .toBe(true);
+}
+
+// -- The main audit ------------------------------------------------------------
 
 test('every preset passes the automated design audit', async ({ page }, info) => {
-  test.setTimeout(180_000);
+  test.setTimeout(240_000);
   const errors: string[] = [];
   page.on('pageerror', (error) => errors.push(error.message));
   page.on('console', (message) => {
@@ -24,33 +103,33 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
     if (response.status() >= 400) errors.push(`HTTP ${response.status()}: ${response.url()}`);
   });
 
-  await page.goto('/');
-  const canvas = page.locator('.stage canvas');
-  await expect(canvas).toBeVisible({ timeout: 30_000 });
-  // Below 640 px the rail is a closed "Controls" disclosure; it stays open across rebuilds.
-  const controls = page.locator('.controls > summary');
-  if (await controls.isVisible()) await controls.click();
-
+  const canvas = await open(page);
   const forced = info.project.use.colorScheme === 'dark' ? 'light' : 'dark';
   const presets = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button');
-  const count = await presets.count();
-  expect(count, 'no presets to audit').toBeGreaterThan(0);
+  const names = (await presets.allInnerTexts()).map((name) => name.trim());
+  expect(names.length, 'no presets to audit').toBeGreaterThan(0);
   let converged = 0;
-  for (let i = 0; i < count; i++) {
-    const preset = presets.nth(i);
-    const name = (await preset.innerText()).trim();
-    // The rail remounts only once a rebuild has finished, so its aria-current
-    // marks the new cluster as live (a stale tick readout could not).
-    if ((await preset.getAttribute('aria-current')) !== 'true') await preset.click();
-    await expect(preset).toHaveAttribute('aria-current', 'true');
+  let charted = 0;
+  for (const name of names) {
+    await loadPreset(page, name);
     await expect(canvas).toBeVisible();
+    // The gateway presets warm up before they open, so the tick after load is
+    // read, not assumed.
+    const loaded = Number(await tick(page).textContent());
+    // Sandbox opens empty: a burst by hand at node 0 gives its converged pass
+    // something to converge on, with no feed to make it nondeterministic.
+    if (name === 'Sandbox') await page.locator('.rail').getByRole('button', { name: 'Send burst' }).click();
+    // The engine's own snapshot after every Step, which A4 recomputes from.
+    const series: ClusterState[] = [await snapshot(page)];
     for (let s = 0; s < STEPS; s++) {
-      await page.getByRole('button', { name: 'Step forward one tick' }).click();
+      await step(page);
+      series.push(await snapshot(page));
     }
-    await expect(
-      page.locator('.readout-item', { hasText: 'tick' }).locator('.readout-value'),
-    ).toHaveText(String(STEPS));
+    await expect(tick(page), 'tick advanced by STEPS from its value after load').toHaveText(
+      String(loaded + STEPS),
+    );
     converged += await page.locator('.headline.converged').count();
+    charted += await page.locator('.plot').count();
 
     let unforced: Theme | null = null;
     for (const theme of [null, forced]) {
@@ -71,23 +150,30 @@ test('every preset passes the automated design audit', async ({ page }, info) =>
       });
       if (unforced === null) unforced = colours;
       else expect(colours.bg, `${where}: data-theme did not switch the theme`).not.toBe(unforced.bg);
-      const findings = await page.evaluate(audit, { theme: colours, beam: BEAM_ALPHA, band: BAND_ALPHA });
-      expect(findings, where).toEqual({
-        A1: [],
-        A2: [],
-        A3: [],
-        A7: [],
-        A8: [],
+      const findings = await page.evaluate(audit, {
+        theme: colours,
+        beam: BEAM_ALPHA,
+        band: BAND_ALPHA,
       });
+      expect(findings, where).toEqual({ A1: [], A2: [], A3: [], A7: [], A8: [], A9: [] });
       await expect
         .poll(() => stagePixel(page, canvas), {
           message: `${where}: the stage does not draw readTheme().bg (A7)`,
         })
         .toBe(colours.bg);
+      await checkTooltips(page, where);
     }
+
+    // A4 and A5 read the table, which shrinks the stage: they run after the
+    // audit and the screenshots, which record the table closed.
+    await setTable(page, true);
+    await checkData(page, name, series);
+    await checkOrder(page, name);
+    await setTable(page, false);
   }
   // Text shown only once every node agrees (the converged badge) is checked too.
   expect(converged, 'no preset was audited in a converged state (A3)').toBeGreaterThan(0);
+  expect(charted, 'no preset showed the charts, so none were checked (A3, A7)').toBeGreaterThan(0);
   expect(errors, 'page errors, console errors or failed requests (A1)').toEqual([]);
 });
 
@@ -112,13 +198,273 @@ async function stagePixel(page: Page, stage: Locator): Promise<number> {
   return (r << 16) | (g << 8) | b;
 }
 
-/** Runs in the page: findings for A1 (sideways scroll), A2, A3 (DOM text), A7 and
- *  A8, one sentence each, given the canvas colours and the alphas of the
- *  translucent canvas marks. Self-contained: Playwright ships it to the page as source. */
+/** A3: a tooltip stays inside the stage. Hover the right-most and the
+ *  bottom-most node, where it has the least room, then park the pointer outside
+ *  so none leaks into the next audit. */
+async function checkTooltips(page: Page, where: string): Promise<void> {
+  const stage = page.locator('.stage');
+  await stage.scrollIntoViewIfNeeded();
+  const cells = await page.locator('[role="gridcell"]').evaluateAll((els) =>
+    els.map((el) => {
+      const r = el.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    }),
+  );
+  const box = await stage.boundingBox();
+  if (box === null) throw new Error('the stage has no box');
+  const right = cells.reduce((a, b) => (b.x > a.x ? b : a));
+  const bottom = cells.reduce((a, b) => (b.y > a.y ? b : a));
+  for (const at of [right, bottom]) {
+    await page.mouse.move(at.x, at.y);
+    const tip = await page.locator('.stage-box .tooltip').boundingBox();
+    expect(tip, `${where}: no tooltip over the node at ${at.x}, ${at.y}`).not.toBeNull();
+    if (tip === null) continue;
+    expect(tip.x, `${where}: the tooltip crosses the stage's left edge`).toBeGreaterThanOrEqual(box.x - 1);
+    expect(tip.y, `${where}: the tooltip crosses the stage's top edge`).toBeGreaterThanOrEqual(box.y - 1);
+    expect(tip.x + tip.width, `${where}: the tooltip crosses the stage's right edge`).toBeLessThanOrEqual(
+      box.x + box.width + 1,
+    );
+    expect(tip.y + tip.height, `${where}: the tooltip crosses the stage's bottom edge`).toBeLessThanOrEqual(
+      box.y + box.height + 1,
+    );
+  }
+  await page.mouse.move(0, 0);
+  await expect(page.locator('.stage-box .tooltip')).toHaveCount(0);
+}
+
+// -- A4: the printed numbers, recomputed ---------------------------------------
+
+interface Totals {
+  t: number;
+  inData: number;
+  crossData: number;
+  own: Map<number, number>;
+}
+
+const totals = (s: ClusterState): Totals => ({
+  t: s.virtual_ms,
+  inData: s.bytes_by_tier.in_zone.data,
+  crossData: s.bytes_by_tier.cross_zone.data,
+  own: new Map(s.nodes.map((n) => [n.id, n.own_data_bytes])),
+});
+
+/** The cumulative totals the window ending at the last of `series` starts from:
+ *  the newest snapshot at or before `t − W`, or the session start while the
+ *  window reaches back past it. */
+function windowStart(series: ClusterState[]): Totals {
+  const now = series[series.length - 1].virtual_ms;
+  const start = [...series].reverse().find((s) => s.virtual_ms <= now - WINDOW_MS);
+  return now <= WINDOW_MS || start === undefined
+    ? { t: 0, inData: 0, crossData: 0, own: new Map() }
+    : totals(start);
+}
+
+/** σ, the share of the window's data bytes that crossed zones, or null. */
+function share(series: ClusterState[]): number | null {
+  const now = series[series.length - 1];
+  const from = windowStart(series);
+  const cross = now.bytes_by_tier.cross_zone.data - from.crossData;
+  const all = cross + now.bytes_by_tier.in_zone.data - from.inData;
+  return all > 0 ? cross / all : null;
+}
+
+/** The two predictions of chart 1 from the placement and the window's bytes. */
+function predictions(series: ClusterState[]): { zones: number; nozone: number } | null {
+  const now = series[series.length - 1];
+  const n = now.nodes.length;
+  if (n < 2) return null;
+  const from = windowStart(series);
+  const live = now.zones.filter((z) => z.live > 0).length;
+  let weight = 0;
+  let weighted = 0;
+  let plain = 0;
+  for (const node of now.nodes) {
+    const across = (n - now.zones[node.zone].live) / (n - 1);
+    const bytes = node.own_data_bytes - (from.own.get(node.id) ?? 0);
+    weight += bytes;
+    weighted += bytes * across;
+    plain += across;
+  }
+  return { zones: (live - 1) / (n - 1), nozone: weight > 0 ? weighted / weight : plain / n };
+}
+
+/** The spread of the views of `nodes`: most informed minus least. */
+const spread = (nodes: { aggregate_total: number }[]): number =>
+  Math.max(...nodes.map((n) => n.aggregate_total)) - Math.min(...nodes.map((n) => n.aggregate_total));
+
+const text = async (locator: Locator): Promise<string> => ((await locator.textContent()) ?? '').trim();
+
+/** A4: every number the page prints, against the engine's own snapshot. `series`
+ *  is the snapshot after every Step, so the windowed share can be recomputed. */
+async function checkData(page: Page, name: string, series: ClusterState[]): Promise<void> {
+  const where = `${name} (A4)`;
+  const snap = series[series.length - 1];
+  const nodes = snap.nodes;
+  const oracle = snap.oracle_total;
+
+  // The status sentence's counts.
+  await expect(field(page, 'status-nodes'), where).toHaveText(String(nodes.length));
+  if ((await field(page, 'status-zones').count()) > 0) {
+    await expect(field(page, 'status-zones'), where).toHaveText(
+      String(snap.zones.filter((z) => z.live > 0).length),
+    );
+  }
+  await expect(field(page, 'status-total'), where).toHaveText(int(oracle));
+
+  // Each node's behind-by, view and the origins it is a gateway for, from every
+  // node's own peer rows inverted.
+  const gatewayFor = new Map<number, number>();
+  for (const node of nodes) {
+    const rows = (await snapshot(page, node.id)).inspected?.peers ?? [];
+    for (const peer of rows) {
+      if (peer.role === 'gateway' && peer.id != null) gatewayFor.set(peer.id, (gatewayFor.get(peer.id) ?? 0) + 1);
+    }
+  }
+  for (const node of nodes) {
+    const row = page.locator(`.node-table tr[data-node="${node.id}"]`);
+    await expect(row.locator('[data-field="view"]'), `${where}: node ${node.id} view`).toHaveText(
+      int(node.aggregate_total),
+    );
+    await expect(row.locator('[data-field="behind"]'), `${where}: node ${node.id} behind`).toHaveText(
+      int(Math.max(oracle - node.aggregate_total, 0)),
+    );
+    const want = gatewayFor.get(node.id) ?? 0;
+    const printed = row.locator('[data-field="gateway-for"]');
+    if (want === 0) await expect(printed, `${where}: node ${node.id} is a gateway for nothing`).toHaveCount(0);
+    else await expect(printed, `${where}: node ${node.id} gateway for`).toHaveText(int(want));
+  }
+
+  // The charts (shown while no node is selected).
+  if ((await page.locator('.dashboard').count()) > 0) {
+    await expect(field(page, 'control-share'), where).toHaveText(
+      percent(
+        (() => {
+          const { in_zone: a, cross_zone: b } = snap.bytes_by_tier;
+          const control = a.control + b.control;
+          return control / (control + a.data + b.data);
+        })(),
+      ),
+    );
+    const sigma = share(series);
+    const seen = series.some((_, i) => share(series.slice(0, i + 1)) !== null);
+    if (snap.zones.length > 1 && seen) {
+      await expect(field(page, 'share'), `${where}: σ`).toHaveText(sigma === null ? '—' : percent(sigma));
+    }
+    const spreads = page.locator('section.block', { hasText: /^Disagreement by zone/ }).locator('figure');
+    const live = snap.zones.flatMap((z, i) => (z.live > 0 ? [i] : []));
+    await expect(spreads, where).toHaveCount(live.length + 1);
+    for (const [i, zone] of live.entries()) {
+      await expect(spreads.nth(i).locator('[data-field="spread"]'), `${where}: zone ${zone} spread`).toHaveText(
+        int(spread(nodes.filter((n) => n.zone === zone))),
+      );
+    }
+    await expect(spreads.nth(live.length).locator('[data-field="spread"]'), `${where}: whole cluster`).toHaveText(
+      int(spread(nodes)),
+    );
+  }
+
+  // The selected origin's Gossip targets: each remote zone's gateway, unacked
+  // positions, wait and the counters.
+  if ((await page.locator('.inspector').count()) > 0) {
+    const origin = Number(await text(page.locator('.inspector h2 [data-field="node"]')));
+    const inspected = (await snapshot(page, origin)).inspected;
+    const state = nodes.find((n) => n.id === origin)!;
+    const peers = inspected?.peers ?? [];
+    const remote = snap.zones.flatMap((z, i) => (i !== state.zone && z.live > 0 ? [i] : []));
+    const configured = peers.some((p) => p.zone != null);
+    const rows = page.locator('.inspector tr.remote');
+    await expect(rows, `${where}: remote rows`).toHaveCount(configured || peers.length === 0 ? remote.length : 0);
+    if (configured) {
+      for (const zone of remote) {
+        const row = page.locator(`.inspector tr.remote[data-zone="${zone}"]`);
+        const gateway = peers.find((p) => p.role === 'gateway' && p.zone === zone);
+        if (gateway === undefined) {
+          await expect(row, `${where}: zone ${zone} has no gateway`).toContainText('no gateway yet');
+          continue;
+        }
+        await expect(row.locator('[data-field="gateway"]'), `${where}: zone ${zone} gateway`).toHaveText(
+          String(gateway.id),
+        );
+        await expect(row.locator('[data-field="unacked"]'), `${where}: zone ${zone} unacked`).toHaveText(
+          int(gateway.own_unacked),
+        );
+        const waiting = row.locator('[data-field="waiting"]');
+        if (gateway.unanswered_ms == null) await expect(waiting).toHaveCount(0);
+        else await expect(waiting, `${where}: zone ${zone} waiting`).toHaveText(duration(gateway.unanswered_ms));
+      }
+    }
+    const counters = {
+      failovers: state.gateway_failovers,
+      'gap-reports': state.gap_reports_sent,
+      retransmissions: state.rto_rewinds_own + state.rto_rewinds_relay,
+      sweeps: state.sweeps_served,
+    };
+    for (const [key, want] of Object.entries(counters)) {
+      await expect(page.locator(`.inspector tr.counters [data-field="${key}"]`), `${where}: ${key}`).toHaveText(
+        int(want),
+      );
+    }
+  }
+}
+
+// -- A5: fixed order -----------------------------------------------------------
+
+/** A5: the grid, the table, the chart panels and the Gossip-targets rows are in
+ *  (zone, id) order, never sorted by a value. */
+async function checkOrder(page: Page, name: string): Promise<void> {
+  const where = `${name} (A5)`;
+  const grid = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('[role="grid"] [role="row"]')).map((row) => ({
+      zone: Number((row as HTMLElement).dataset.zone),
+      ids: Array.from(row.querySelectorAll('[role="gridcell"]')).map((c) => Number((c as HTMLElement).dataset.node)),
+    })),
+  );
+  const ascending = (xs: number[]): boolean => xs.every((x, i) => i === 0 || xs[i - 1] < x);
+  expect(ascending(grid.map((r) => r.zone)), `${where}: grid rows by zone`).toBe(true);
+  for (const row of grid) expect(ascending(row.ids), `${where}: zone ${row.zone} cells by id`).toBe(true);
+
+  const table = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('.node-table tr[data-node]')).map((tr) => [
+      Number((tr as HTMLElement).dataset.zone),
+      Number((tr as HTMLElement).dataset.node),
+    ]),
+  );
+  expect(
+    table.every(([z, id], i) => i === 0 || z > table[i - 1][0] || (z === table[i - 1][0] && id > table[i - 1][1])),
+    `${where}: table rows by (zone, id)`,
+  ).toBe(true);
+  expect(table.map(([, id]) => id).sort((a, b) => a - b), `${where}: the table lists the grid's nodes`).toEqual(
+    grid.flatMap((r) => r.ids).sort((a, b) => a - b),
+  );
+
+  for (const title of ['Agreement by zone', 'Disagreement by zone']) {
+    const panels = await page
+      .locator('section.block', { hasText: new RegExp(`^${title}`) })
+      .locator('figure')
+      .evaluateAll((els) => els.map((el) => (el as HTMLElement).dataset.zone ?? null));
+    if (panels.length === 0) continue;
+    const zones = panels.filter((z) => z !== null).map(Number);
+    expect(ascending(zones), `${where}: ${title} panels by zone`).toBe(true);
+    // Chart 3 ends with the whole cluster, which has no zone.
+    if (title.startsWith('Disagreement')) expect(panels.at(-1), `${where}: whole cluster last`).toBeNull();
+  }
+
+  const remote = await page
+    .locator('.inspector tr.remote')
+    .evaluateAll((els) => els.map((el) => Number((el as HTMLElement).dataset.zone)));
+  expect(ascending(remote), `${where}: Gossip targets rows by zone`).toBe(true);
+}
+
+// -- In the page ---------------------------------------------------------------
+
+/** Runs in the page: findings for A1 (sideways scroll), A2, A3 (DOM text, canvas
+ *  labels, legibility and chart marks), A7, A8 and A9, one sentence each, given
+ *  the canvas colours and the alphas of the translucent canvas marks.
+ *  Self-contained: Playwright ships it to the page as source. */
 function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number }): Findings {
   type Rgba = [number, number, number, number];
   type Box = { left: number; right: number; top: number; bottom: number };
-  const found: Findings = { A1: [], A2: [], A3: [], A7: [], A8: [] };
+  const found: Findings = { A1: [], A2: [], A3: [], A7: [], A8: [], A9: [] };
 
   // Colour maths: paint a CSS colour into one pixel, so no colour string is parsed by hand.
   const ctx = new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true });
@@ -165,8 +511,43 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
     found.A1.push(`the page scrolls sideways: ${root.scrollWidth} px wide in a ${innerWidth} px window`);
   }
 
-  // Text walk: A3 clipping, A3 overlaps (boxes collected here) and A7 text contrast.
-  const boxes: { text: Text; box: Box }[] = [];
+  /** Clip `box` through the overflow boxes between `el` and the body, as the
+   *  browser does. A scroller brings content back into view, so only a hidden box
+   *  before the first scroller counts as clipping; content a scroller has scrolled
+   *  away is trimmed. Returns the visible part, or null when none is. */
+  const clip = (el: Element, from: Box): { box: Box | null; cutOff: boolean } => {
+    let box = from;
+    let scrolls = false;
+    let cutOff = false;
+    for (let a: Element | null = el; a !== null && a !== document.body; a = a.parentElement) {
+      const style = getComputedStyle(a);
+      const overflow = `${style.overflowX} ${style.overflowY}`;
+      if (overflow === 'visible visible') continue;
+      const edge = a.getBoundingClientRect();
+      if (
+        !scrolls &&
+        /hidden|clip/.test(overflow) &&
+        (box.left < edge.left - 1 || box.right > edge.right + 1 || box.top < edge.top - 1 || box.bottom > edge.bottom + 1)
+      ) {
+        cutOff = true;
+      }
+      if (/auto|scroll/.test(overflow)) scrolls = true;
+      box = {
+        left: Math.max(box.left, edge.left),
+        right: Math.min(box.right, edge.right),
+        top: Math.max(box.top, edge.top),
+        bottom: Math.min(box.bottom, edge.bottom),
+      };
+    }
+    return { box: box.right - box.left >= 1 && box.bottom - box.top >= 1 ? box : null, cutOff };
+  };
+
+  // The smallest type the page uses: every text node and canvas label is at least this.
+  const floor = theme.captionSmPx;
+
+  // Text walk: A3 clipping, A3 overlaps (boxes collected here), A3 legibility and
+  // A7 text contrast.
+  const boxes: { key: object; name: string; box: Box }[] = [];
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
   for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
     const text = node as Text;
@@ -184,47 +565,23 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
       // A glyph box taller than a `line-height: 1` line box would overlap its
       // neighbours by leading alone, so trim it to the line box.
       const inset = lineHeight > 0 && rect.height > lineHeight ? (rect.height - lineHeight) / 2 : 0;
-      let box: Box = {
+      const clipped = clip(el, {
         left: rect.left,
         right: rect.right,
         top: rect.top + inset,
         bottom: rect.bottom - inset,
-      };
-      // A scroller brings text back into view, so only a hidden box before the
-      // first scroller counts as clipping; text a scroller has scrolled away is
-      // trimmed from the overlap check.
-      let scrolls = false;
-      for (let a: Element | null = el; a !== null && a !== document.body; a = a.parentElement) {
-        const style = getComputedStyle(a);
-        const overflow = `${style.overflowX} ${style.overflowY}`;
-        if (overflow === 'visible visible') continue;
-        const clip = a.getBoundingClientRect();
-        if (
-          !scrolls &&
-          /hidden|clip/.test(overflow) &&
-          (box.left < clip.left - 1 ||
-            box.right > clip.right + 1 ||
-            box.top < clip.top - 1 ||
-            box.bottom > clip.bottom + 1)
-        ) {
-          cutOff = true;
-        }
-        if (/auto|scroll/.test(overflow)) scrolls = true;
-        box = {
-          left: Math.max(box.left, clip.left),
-          right: Math.min(box.right, clip.right),
-          top: Math.max(box.top, clip.top),
-          bottom: Math.min(box.bottom, clip.bottom),
-        };
-      }
-      if (box.right - box.left >= 1 && box.bottom - box.top >= 1) boxes.push({ text, box });
+      });
+      cutOff ||= clipped.cutOff;
+      if (clipped.box !== null) boxes.push({ key: text, name, box: clipped.box });
     }
     if (cutOff) found.A3.push(`"${name}" is cut off by an overflow: hidden box`);
 
-    // A7 text contrast. Disabled controls are exempt (WCAG 2.5.8's own exception);
-    // the stage labels sit on canvas discs and are checked as the `--color-fg on
-    // the stage` pair below.
-    if (el.closest(':disabled, .stage-labels') === null) {
+    // A3 legibility: no text below the smallest type token.
+    const size = parseFloat(getComputedStyle(el).fontSize);
+    if (size < floor - 0.01) found.A3.push(`"${name}" is ${size.toFixed(1)} px, below the ${floor.toFixed(1)} px floor`);
+
+    // A7 text contrast. Disabled controls are exempt (WCAG 2.5.8's own exception).
+    if (el.closest(':disabled') === null) {
       let opacity = 1;
       for (let e: Element | null = el; e !== null; e = e.parentElement) {
         opacity *= Number(getComputedStyle(e).opacity);
@@ -237,26 +594,66 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
     }
   }
 
-  // A3 overlaps: two text nodes whose boxes share at least 1 px both ways.
+  // A3 canvas labels: the boxes the stage and every chart publish join the text
+  // boxes in the overlap check, clipped through their scrollers the same way.
+  for (const canvas of document.querySelectorAll<HTMLCanvasElement>('canvas[data-label-boxes]')) {
+    if (!canvas.checkVisibility()) continue;
+    const at = canvas.getBoundingClientRect();
+    const labels = JSON.parse(canvas.dataset.labelBoxes ?? '[]') as {
+      text: string;
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      size: number;
+    }[];
+    for (const l of labels) {
+      if (l.size < floor - 0.01) {
+        found.A3.push(`canvas label "${l.text}" is ${l.size.toFixed(1)} px, below the ${floor.toFixed(1)} px floor`);
+      }
+      const clipped = clip(canvas, {
+        left: at.left + l.x,
+        right: at.left + l.x + l.w,
+        top: at.top + l.y,
+        bottom: at.top + l.y + l.h,
+      });
+      if (clipped.box !== null) boxes.push({ key: l, name: `canvas "${l.text}"`, box: clipped.box });
+    }
+  }
+
+  // A3 overlaps: two text boxes that share at least 1 px both ways.
   for (let i = 0; i < boxes.length; i++) {
     for (let j = i + 1; j < boxes.length; j++) {
       const [a, b] = [boxes[i], boxes[j]];
-      if (a.text === b.text) continue;
+      if (a.key === b.key) continue;
       const w = Math.min(a.box.right, b.box.right) - Math.max(a.box.left, b.box.left);
       const h = Math.min(a.box.bottom, b.box.bottom) - Math.max(a.box.top, b.box.top);
       if (w >= 1 && h >= 1) {
-        found.A3.push(
-          `"${label(a.text.textContent)}" overlaps "${label(b.text.textContent)}" by ${w.toFixed(1)} × ${h.toFixed(1)} px`,
-        );
+        found.A3.push(`${a.name.startsWith('canvas') ? a.name : `"${a.name}"`} overlaps ${b.name.startsWith('canvas') ? b.name : `"${b.name}"`} by ${w.toFixed(1)} × ${h.toFixed(1)} px`);
+      }
+    }
+  }
+
+  // A3 chart marks: every value of every series lies inside its plot's y range.
+  for (const host of document.querySelectorAll<HTMLElement & { uplot?: any }>('.plot')) {
+    const u = host.uplot;
+    if (u === undefined || !host.checkVisibility()) continue;
+    const { min, max } = u.scales.y;
+    for (let s = 1; s < u.data.length; s++) {
+      for (const v of u.data[s] as (number | null)[]) {
+        if (v !== null && v !== undefined && (v < min - 1e-9 || v > max + 1e-9)) {
+          found.A3.push(`a chart value ${v} (series ${s} of ${u.data.length - 1}, zone ${host.closest('figure')?.dataset.zone}, ${u.data[0].length} samples) lies outside its plot's range ${min} to ${max}`);
+          break;
+        }
       }
     }
   }
 
   // A7 targets: at least 24 × 24 px. The exemptions are WCAG 2.5.8's: targets
-  // inline in a sentence (the `InfoTip` terms), disabled controls, and the stage
-  // `×`, whose function the rail's Remove control repeats at full size.
+  // inline in a sentence (links in prose, and the `InfoTip` terms, which are
+  // buttons the browser lays out as inline blocks) and disabled controls.
   for (const el of document.querySelectorAll('a[href], button, input, select, summary')) {
-    if (!el.checkVisibility() || el.matches(':disabled, .node-delete')) continue;
+    if (!el.checkVisibility() || el.matches(':disabled, .term')) continue;
     if (getComputedStyle(el).display === 'inline') continue;
     const { width, height } = el.getBoundingClientRect();
     if (width < 24 || height < 24) {
@@ -274,7 +671,10 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
 
   // A7 canvas pairs (graphics 3:1, text 4.5:1): the stage draws on `readTheme().bg`
   // and the charts on the detail rail's panel, so each is checked on its own
-  // surface, a translucent mark composited over it first.
+  // surface, a translucent mark composited over it first. Marks drawn faded as
+  // context for a selection (`FADED_ALPHA`) are exempt by name (§8.7); the ring
+  // guides repeat what position and the ring title say (structure, not data) and
+  // are exempt too.
   const check = (surface: Rgba, where: string, pairs: [string, Rgba, number][]): void => {
     for (const [token, colour, minimum] of pairs) {
       const ratio = contrast(over(colour, surface), surface);
@@ -286,22 +686,23 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
   check(unpack(theme.bg), 'stage', [
     ['--color-fg', unpack(theme.fg), 4.5],
     ['--chart-muted beam', unpack(theme.muted, beam), 3],
+    ['--color-fg cross-zone beam', unpack(theme.fg, beam), 3],
     ['--color-ok', unpack(theme.ok), 3],
     ['--color-warn', unpack(theme.warn), 3],
   ]);
   const plot = document.querySelector('.plot');
-  if (plot === null) found.A7.push('no chart to check the chart colours against');
-  else {
+  if (plot !== null) {
     const panel = backdrop(plot);
     check(panel, 'charts', [
       ['--color-fg', unpack(theme.fg), 4.5],
       ['--color-fg-muted', unpack(theme.fgMuted), 4.5],
       ['--color-warn', unpack(theme.warn), 4.5],
       ['--chart-muted', unpack(theme.muted), 3],
+      ['--chart-reference', unpack(theme.reference), 3],
     ]);
-    // "REJECTING" is warn text drawn inside its own translucent warn band.
+    // "REJECTING" is text drawn inside its own translucent warn band.
     const warnBand = over(unpack(theme.warn, band), panel);
-    check(warnBand, 'REJECTING band', [['--color-warn', unpack(theme.warn), 4.5]]);
+    check(warnBand, 'REJECTING band', [['--color-fg', unpack(theme.fg), 4.5]]);
   }
 
   // A2 and A8: page-text scans. "CI" is case-sensitive so "ci" in words cannot match.
@@ -313,5 +714,289 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
   };
   scan(found.A2, [/\bNaN\b|\bundefined\b|\bnull\b|\bInfinity\b|\[object|\de\+\d/g]);
   scan(found.A8, [/confidence|significant|p-value|standard error/gi, /\bCI\b/g, /\b\d{1,2}:\d{2}\b/g]);
+
+  // A9: no digit outside a data-bound element, visible or not. "level 0" and
+  // "level 1" are the glossary's names for the two tiers, not numbers.
+  const all = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  for (let node = all.nextNode(); node !== null; node = all.nextNode()) {
+    const el = node.parentElement;
+    if (el === null || el.closest('script, style, [data-field]') !== null) continue;
+    const bare = (node.textContent ?? '').replace(/\blevel [01]\b/g, '');
+    if (/\d/.test(bare)) found.A9.push(`"${label(node.textContent)}" prints a number outside a data-field element`);
+  }
   return found;
 }
+
+// -- A4: chart 1 across the window, and unequal zones ---------------------------
+
+test('chart 1 prints the windowed share and follows the placement', async ({ page }) => {
+  test.setTimeout(240_000);
+  await open(page);
+
+  // Steady state after exactly one Step: σ is printed, not the empty state.
+  await loadPreset(page, 'Steady state');
+  const series: ClusterState[] = [await snapshot(page)];
+  await step(page);
+  series.push(await snapshot(page));
+  const first = share(series);
+  expect(first, 'one Step of Steady state sends data bytes').not.toBeNull();
+  await expect(field(page, 'share')).toHaveText(percent(first!));
+  await expect(page.getByText('No traffic yet')).toHaveCount(0);
+
+  // Thirty Steps on, the window (ten seconds) has slid past the start: σ is the
+  // share of the last window's bytes, not the whole run's.
+  for (let i = 0; i < 30; i++) {
+    await step(page);
+    series.push(await snapshot(page));
+  }
+  const now = series[series.length - 1];
+  expect(now.virtual_ms, 'the run is past one window').toBeGreaterThan(WINDOW_MS);
+  await expect(field(page, 'share')).toHaveText(percent(share(series)!));
+  const refs = predictions(series)!;
+  const figure = page.locator('figure[data-ref-zones]');
+  expect(Math.abs(Number(await figure.getAttribute('data-ref-zones')) - refs.zones)).toBeLessThan(1e-9);
+  expect(Math.abs(Number(await figure.getAttribute('data-ref-nozone')) - refs.nozone)).toBeLessThan(1e-9);
+
+  // Sandbox with unequal zones: Add node in zone a (5, 4, 4), bursts at nodes 0
+  // and 1, four Steps. Both references follow the placement and the bytes each
+  // origin sent.
+  await loadPreset(page, 'Sandbox');
+  await page.getByRole('button', { name: 'Add node' }).click();
+  await expect(page.locator('[data-field="status-nodes"]')).toHaveText('13');
+  const rail = page.locator('.rail');
+  for (const node of ['0', '1']) {
+    await page.getByLabel('Node', { exact: true }).selectOption(node);
+    await rail.getByRole('button', { name: 'Send burst' }).click();
+  }
+  const sandbox: ClusterState[] = [await snapshot(page)];
+  for (let i = 0; i < 4; i++) {
+    await step(page);
+    sandbox.push(await snapshot(page));
+  }
+  expect(sandbox[0].zones.map((z) => z.live), 'zones of 5, 4 and 4').toEqual([5, 4, 4]);
+  const unequal = predictions(sandbox)!;
+  const chart = page.locator('figure[data-ref-zones]');
+  expect(Math.abs(Number(await chart.getAttribute('data-ref-zones')) - unequal.zones)).toBeLessThan(1e-9);
+  expect(Math.abs(Number(await chart.getAttribute('data-ref-nozone')) - unequal.nozone)).toBeLessThan(1e-9);
+  expect(unequal.nozone, 'unequal zones move the no-zone prediction off (N − N/Z) / (N − 1)').not.toBeCloseTo(
+    (13 - 13 / 3) / 12,
+    6,
+  );
+  await setTable(page, true);
+  await checkOrder(page, 'Sandbox after add');
+
+  // The same run with one node left: no reference line, attribute or label.
+  const remove = page.getByRole('button', { name: 'Remove node', exact: true });
+  for (let left = 12; left >= 1; left--) {
+    await remove.click();
+    // Each removal lands before the next click, which would otherwise pick the
+    // node just removed.
+    await expect(page.locator('[data-field="status-nodes"]')).toHaveText(String(left));
+  }
+  const lone = page.locator('section.block', { hasText: 'Share of data bytes' }).locator('figure');
+  await expect(lone).toHaveCount(1);
+  await expect(lone).not.toHaveAttribute('data-ref-zones', /.*/);
+  await expect(lone).not.toHaveAttribute('data-ref-nozone', /.*/);
+  const labels = await lone.locator('canvas[data-label-boxes]').getAttribute('data-label-boxes');
+  expect(JSON.parse(labels ?? '[]'), 'no reference label with one node').toEqual([]);
+  await checkOrder(page, 'Sandbox after remove');
+});
+
+// -- A3: the stage's geometry for every zone count -----------------------------
+
+test('stage geometry holds for every zone count', async ({ page }, info) => {
+  test.skip(
+    !['audit-1440-light', 'audit-400-light'].includes(info.project.name),
+    'the geometry is checked at the widest and the narrowest stage',
+  );
+  test.setTimeout(240_000);
+  await open(page);
+  await page.getByText('Tune the cluster').click();
+  const stepper = page.locator('#knob-zones');
+  const max = Number(await stepper.getAttribute('max'));
+  expect(max, 'twelve nodes allow the engine ceiling of six zones').toBe(6);
+
+  for (let zones = 1; zones <= max; zones++) {
+    await stepper.fill(String(zones));
+    await page.getByRole('button', { name: 'Rebuild cluster' }).click();
+    await expect
+      .poll(() => page.locator('.stage canvas').evaluate((c: HTMLCanvasElement) => JSON.parse(c.dataset.rings ?? '[]').length))
+      .toBe(zones);
+    await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
+    await settled(page);
+    await page.locator('.stage').scrollIntoViewIfNeeded();
+
+    const stage = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement) => {
+      const at = c.getBoundingClientRect();
+      return {
+        w: at.width,
+        h: at.height,
+        left: at.left,
+        top: at.top,
+        centre: JSON.parse(c.dataset.centre ?? '{}') as Point,
+        rings: JSON.parse(c.dataset.rings ?? '[]') as { x: number; y: number; rz: number; r: number }[],
+        crossWidth: Number(c.dataset.crossWidth),
+        labels: JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string; x: number; y: number; w: number; h: number }[],
+      };
+    });
+    const where = `${zones} zone(s) on a ${stage.w.toFixed(0)} × ${stage.h.toFixed(0)} px stage`;
+
+    // Every ring's node circle, grown by the largest disc, and every label lie
+    // inside the stage.
+    for (const [z, ring] of stage.rings.entries()) {
+      const reach = ring.rz + R_MAX;
+      expect(ring.x - reach, `${where}: zone ${z} crosses the left edge`).toBeGreaterThanOrEqual(-1e-6);
+      expect(ring.y - reach, `${where}: zone ${z} crosses the top edge`).toBeGreaterThanOrEqual(-1e-6);
+      expect(ring.x + reach, `${where}: zone ${z} crosses the right edge`).toBeLessThanOrEqual(stage.w + 1e-6);
+      expect(ring.y + reach, `${where}: zone ${z} crosses the bottom edge`).toBeLessThanOrEqual(stage.h + 1e-6);
+    }
+    for (const l of stage.labels) {
+      expect(l.x, `${where}: label "${l.text}" crosses the left edge`).toBeGreaterThanOrEqual(0);
+      expect(l.y, `${where}: label "${l.text}" crosses the top edge`).toBeGreaterThanOrEqual(0);
+      expect(l.x + l.w, `${where}: label "${l.text}" crosses the right edge`).toBeLessThanOrEqual(stage.w);
+      expect(l.y + l.h, `${where}: label "${l.text}" crosses the bottom edge`).toBeLessThanOrEqual(stage.h);
+    }
+    if (zones < 2) continue;
+
+    // No cross-zone route, drawn with the renderer's own `beamPath`, comes within
+    // a disc and half a stroke of a third ring's nodes.
+    const spots: Spot[] = await page.evaluate(
+      ({ left, top }) =>
+        Array.from(document.querySelectorAll('[role="grid"] [role="row"]')).flatMap((row) =>
+          Array.from(row.querySelectorAll('[role="gridcell"]')).map((c) => {
+            const at = c.getBoundingClientRect();
+            return {
+              id: Number((c as HTMLElement).dataset.node),
+              zone: Number((row as HTMLElement).dataset.zone),
+              x: at.left + at.width / 2 - left,
+              y: at.top + at.height / 2 - top,
+              r: 0,
+            };
+          }),
+        ),
+      { left: stage.left, top: stage.top },
+    );
+    expect(spots, where).toHaveLength(12);
+    let nearest = Number.POSITIVE_INFINITY;
+    const meets: string[] = [];
+    const at: Point = { x: 0, y: 0 };
+    for (const a of spots) {
+      for (const b of spots) {
+        if (a.zone >= b.zone) continue;
+        const path = beamPath(a, b, stage.centre);
+        for (let i = 0; i <= 128; i++) {
+          pointOn(path, i / 128, at);
+          for (const [k, ring] of stage.rings.entries()) {
+            if (k === a.zone || k === b.zone) continue;
+            const gap = Math.abs(Math.hypot(at.x - ring.x, at.y - ring.y) - ring.rz);
+            const clear = gap - (ring.r + stage.crossWidth / 2);
+            nearest = Math.min(nearest, clear);
+            if (clear <= 0) meets.push(`node ${a.id} to node ${b.id} meets zone ${k}'s discs`);
+          }
+        }
+      }
+    }
+    expect(meets, `${where}: cross-zone routes that meet a third ring's discs`).toEqual([]);
+    console.log(`${where}: the nearest route clears a third ring's discs by ${nearest.toFixed(1)} px`);
+  }
+});
+
+// -- A6: interaction -----------------------------------------------------------
+
+test.describe('interaction', () => {
+  test.use({ hasTouch: true });
+
+  test('the controls, the keyboard grid, focus, tooltips and the study link work', async ({ page }) => {
+    test.setTimeout(240_000);
+    const errors: string[] = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    await open(page);
+    const status = (name: string): Locator => field(page, `status-${name}`);
+    const rings = (): Promise<number> =>
+      page.locator('.stage canvas').evaluate((c: HTMLCanvasElement) => JSON.parse(c.dataset.rings ?? '[]').length);
+
+    // The zone stepper and Rebuild: four zones.
+    await page.getByText('Tune the cluster').click();
+    await page.locator('#knob-zones').fill('4');
+    await page.getByRole('button', { name: 'Rebuild cluster' }).click();
+    await expect(status('zones')).toHaveText('4');
+    await expect.poll(rings).toBe(4);
+
+    // Steady state: cut zone c off, then heal.
+    await loadPreset(page, 'Steady state');
+    await page.locator('#cut-zone').selectOption({ label: 'zone c' });
+    await page.getByRole('button', { name: 'Cut zone c off' }).click();
+    await expect(status('cut')).toHaveText('32');
+    await page.getByRole('button', { name: 'Heal network' }).click();
+    await expect(status('cut')).toHaveText('0');
+
+    // Traffic burst, with node 0 selected: silence its gateway, then cut one
+    // direction of another.
+    await loadPreset(page, 'Traffic burst');
+    // The origin has no gateway until its runtime has heard the other zones.
+    const silence = page.getByRole('button', { name: /^Silence node \d+, the gateway into zone b$/ });
+    for (let i = 0; i < 10 && (await silence.count()) === 0; i++) await step(page);
+    await silence.click();
+    await expect(status('cut')).toHaveText('11');
+    await page.getByRole('button', { name: 'Heal network' }).click();
+    await expect(status('cut')).toHaveText('0');
+    await page.getByRole('button', { name: /^Cut node \d+ from zone b$/ }).click();
+    await expect(status('cut')).toHaveText('3');
+    await page.getByRole('button', { name: 'Heal network' }).click();
+    await expect(status('cut')).toHaveText('0');
+
+    // The keyboard: Shift+Tab from "Show as table" lands on the grid's one tab
+    // stop. Right moves within the zone; Down to the same rank in the next zone;
+    // End and Home to the zone's ends; Enter selects; Escape deselects.
+    const focused = (): Promise<string | undefined> => page.evaluate(() => (document.activeElement as HTMLElement).dataset.node);
+    await page.getByText('Show as table').focus();
+    await page.keyboard.press('Shift+Tab');
+    expect(await focused(), 'the first node of the first zone is the tab stop').toBe('0');
+    await page.keyboard.press('ArrowRight');
+    expect(await focused(), 'Right: the next node of zone a').toBe('3');
+    await page.keyboard.press('ArrowDown');
+    expect(await focused(), 'Down: the same rank in zone b').toBe('4');
+    await page.keyboard.press('End');
+    expect(await focused(), 'End: the last node of zone b').toBe('10');
+    await page.keyboard.press('Home');
+    expect(await focused(), 'Home: the first node of zone b').toBe('1');
+    await expect(page.locator('.stage-box .tooltip'), 'focus shows the tooltip').toContainText('Node 1');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.inspector')).toContainText('Node 1');
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.inspector')).toHaveCount(0);
+    await expect(page.locator('.stage-box .tooltip')).toHaveCount(0);
+
+    // Focus survives a rebuild: Reset, clicked without moving focus, leaves it on
+    // the same node.
+    await cell(page, 5).focus();
+    // Mark the engine, so the rebuild is seen as a new one rather than as the
+    // overlay not having appeared yet.
+    await page.evaluate(() => Object.assign(window.sim!, { old: true }));
+    await page.getByRole('button', { name: 'Reset' }).dispatchEvent('click');
+    await expect.poll(() => page.evaluate(() => window.sim !== undefined && !('old' in window.sim))).toBe(true);
+    await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
+    expect(await focused(), 'focus stayed on node 5 through the rebuild').toBe('5');
+
+    // The tooltip on hover and on tap. Focus is released first: a focused node
+    // keeps its tooltip once the pointer leaves.
+    await page.evaluate(() => (document.activeElement as HTMLElement).blur());
+    await cell(page, 7).scrollIntoViewIfNeeded();
+    const box = await cell(page, 7).boundingBox();
+    if (box === null) throw new Error('node 7 has no box');
+    const [x, y] = [box.x + box.width / 2, box.y + box.height / 2];
+    await page.mouse.move(x, y);
+    await expect(page.locator('.stage-box .tooltip')).toContainText('Node 7');
+    await page.mouse.move(0, 0);
+    await expect(page.locator('.stage-box .tooltip')).toHaveCount(0);
+    await page.touchscreen.tap(x, y);
+    await expect(page.locator('.inspector')).toContainText('Node 7');
+    await expect(page.locator('.stage-box .tooltip')).toContainText('Node 7');
+
+    // The study link: the base URL's form, not that it resolves (`study/` joins
+    // the site only in the Pages build).
+    await page.locator('.method summary').click();
+    await expect(page.getByRole('link', { name: 'gossip study' })).toHaveAttribute('href', '/study/dashboard/');
+    expect(errors, 'page errors').toEqual([]);
+  });
+});

@@ -3,7 +3,7 @@
 // `bigint`s wasm-bindgen expects for u64 parameters, and stamps the untyped
 // boundary results with the contracts declared in `types.ts`.
 
-import init, { Sim as WasmSim, default_config } from '../../wasm/gabion_wasm.js';
+import init, { Sim as WasmSim, default_config, max_zones } from '../../wasm/gabion_wasm.js';
 import type { ClusterState, EventBatch, LinkPolicyKind, SimConfig } from './types';
 
 let initPromise: Promise<unknown> | null = null;
@@ -34,9 +34,15 @@ function assertBoundary(batch: EventBatch): void {
   }
 }
 
+/** Stable ids stay below this, so a directed link packs into one number. */
+const LINK_KEY = 2 ** 20;
+
 /** A live simulation. Mirrors the wasm `Sim` surface with idiomatic JS types. */
 export class Sim {
   #inner: WasmSim;
+  // Every directed link blocked since the last heal, keyed `src * 2**20 + dst`,
+  // so the page can say how many links are cut: the engine keeps no such count.
+  #blocked = new Set<number>();
 
   private constructor(inner: WasmSim) {
     this.#inner = inner;
@@ -56,6 +62,12 @@ export class Sim {
   static async defaultConfig(): Promise<SimConfig> {
     await ensureInit();
     return default_config() as SimConfig;
+  }
+
+  /** The most zones a session places nodes in: the zone stepper's ceiling. */
+  static async maxZones(): Promise<number> {
+    await ensureInit();
+    return max_zones();
   }
 
   /** Inject `hits` requests for `key` at `node`, at the current virtual time. */
@@ -88,16 +100,56 @@ export class Sim {
   /** Install a directed link policy between two nodes. */
   async setLinkPolicy(src: number, dst: number, policy: LinkPolicyKind): Promise<void> {
     await this.#inner.set_link_policy(src, dst, policy);
+    const key = src * LINK_KEY + dst;
+    if (policy.kind === 'Block') this.#blocked.add(key);
+    else this.#blocked.delete(key);
   }
 
   /** Cut every link between two node groups, both directions. */
   async partition(groupA: number[], groupB: number[]): Promise<void> {
     await this.#inner.partition(groupA, groupB);
+    for (const a of groupA) {
+      for (const b of groupB) {
+        this.#blocked.add(a * LINK_KEY + b);
+        this.#blocked.add(b * LINK_KEY + a);
+      }
+    }
   }
 
   /** Restore every directed link to lossless `Pass`. */
   async heal(): Promise<void> {
     await this.#inner.heal();
+    this.#blocked.clear();
+  }
+
+  /** Cut a zone off: every link between its `members` and the `rest`. */
+  cutZone(members: number[], rest: number[]): Promise<void> {
+    return this.partition(members, rest);
+  }
+
+  /** Silence gateway `g`: cut it off from every node in `others`, in both
+   *  directions, without telling anyone. The silent crash that triggers a
+   *  failover. */
+  silence(g: number, others: number[]): Promise<void> {
+    return this.partition([g], others);
+  }
+
+  /** Block gateway `g`'s sends to its zone peers, one direction only: it still
+   *  hears them, and they never hear it. */
+  async cutFromZone(g: number, zonePeers: number[]): Promise<void> {
+    for (const peer of zonePeers) await this.setLinkPolicy(g, peer, { kind: 'Block' });
+  }
+
+  /** Node pairs with at least one direction blocked. */
+  cutLinks(): number {
+    let pairs = 0;
+    for (const key of this.#blocked) {
+      const src = Math.floor(key / LINK_KEY);
+      const dst = key % LINK_KEY;
+      // A pair blocked both ways counts once, at its lower-to-higher direction.
+      if (!this.#blocked.has(dst * LINK_KEY + src) || src < dst) pairs += 1;
+    }
+    return pairs;
   }
 
   /** Add a fresh cold-start node to the live cluster (no rebuild). Resolves to
@@ -114,6 +166,9 @@ export class Sim {
   async removeNode(id: number): Promise<EventBatch> {
     const batch = (await this.#inner.remove_node(id)) as EventBatch;
     assertBoundary(batch);
+    for (const key of this.#blocked) {
+      if (Math.floor(key / LINK_KEY) === id || key % LINK_KEY === id) this.#blocked.delete(key);
+    }
     return batch;
   }
 

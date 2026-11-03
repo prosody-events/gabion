@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { fmtCount, noun } from '../format';
   import type { ClusterState } from '../sim/types';
   import type { ChartHistory } from '../charts/history';
 
@@ -37,11 +38,12 @@
 </script>
 
 <div class="headline" class:converged>
-  <span class="headline-label">Disagreement → 0</span>
-  <span class="headline-value numeric">{disagreement}</span>
+  <span class="headline-label">Disagreement</span>
+  <span class="headline-value" data-field="disagreement">{fmtCount(disagreement)}</span>
   {#if converged && convergedRound !== null}
     <span class="badge" role="status">
-      ✓ converged in {convergedRound} {convergedRound === 1 ? 'round' : 'rounds'}
+      ✓ converged in <span data-field="rounds">{convergedRound}</span>
+      {noun(convergedRound, 'round')}
     </span>
   {:else if hasTotal}
     <span class="badge muted" role="status">spreading…</span>
