@@ -3,21 +3,14 @@
 //! Rule fingerprints and key hashes are `u128`. JavaScript numbers are IEEE
 //! doubles and cannot hold 128 bits without loss, and `serde_wasm_bindgen`
 //! has no lossless `u128` representation, so every `u128` is rendered as a
-//! fixed-width lowercase hex string (`"0123…cdef"`, 32 nibbles) and parsed
-//! back the same way. The Rust types keep `u128` fields; only the wire form
-//! is textual.
+//! fixed-width lowercase hex string (`"0123…cdef"`, 32 nibbles). The Rust
+//! types keep `u128` fields; only the wire form is textual.
 
 pub mod u128_hex {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::Serializer;
 
     pub fn serialize<S: Serializer>(value: &u128, ser: S) -> Result<S::Ok, S::Error> {
         ser.serialize_str(&format!("{value:032x}"))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<u128, D::Error> {
-        let raw = String::deserialize(de)?;
-        let trimmed = raw.strip_prefix("0x").unwrap_or(&raw);
-        u128::from_str_radix(trimmed, 16).map_err(serde::de::Error::custom)
     }
 }
 

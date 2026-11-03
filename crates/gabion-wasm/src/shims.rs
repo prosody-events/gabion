@@ -117,11 +117,11 @@ impl AggregateStore for EventEmittingAggregateStore {
 
 /// Transport wrapper that logs one packet event per send/receive. Each sent
 /// packet is tagged with its kind, read with the library's own header reader,
-/// and its tier, by placement. Wraps a
-/// `SimTransport` and consults the shared `SimRouter` to tell a delivered
-/// send (the packet was enqueued at `dst`) from a dropped one — the router's
-/// `received_count` increments only on actual delivery, so a diff of one
-/// across the inner send is exactly "did this packet land".
+/// and its tier, by placement. Wraps a `SimTransport` and consults the shared
+/// `SimRouter` to tell a delivered send (the packet was enqueued at `dst`)
+/// from a dropped one — the router's `received_count` increments only on
+/// actual delivery, so a diff of one across the inner send is exactly "did
+/// this packet land".
 pub struct LoggingSimTransport {
     inner: SimTransport,
     router: SimRouter,

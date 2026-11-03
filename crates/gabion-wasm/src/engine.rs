@@ -97,10 +97,10 @@ pub enum EngineError {
     )]
     UnknownNode { id: u32 },
     #[error(
-        "a node cannot join zone {zone}: this cluster has {zones} zones, numbered 0 to {last}. \
-         Pick a zone shown on the stage, or rebuild with more zones."
+        "a node cannot join zone {zone}: this cluster has {zones} zones, indexed from 0 (zone-a). \
+         Pass an index below {zones}, or rebuild with more zones."
     )]
-    UnknownZone { zone: u8, zones: u8, last: u8 },
+    UnknownZone { zone: u32, zones: u8 },
     #[error(
         "the gossip runtime for node {node} has stopped, so the request could not be recorded. \
          The simulation has ended; reload to start over."
@@ -145,8 +145,9 @@ pub enum Command {
     /// [`EngineError::Setting`] if the newcomer's settings fail to validate.
     AddNode {
         /// The zone to join; `None` joins the zone with the fewest live
-        /// members, the lowest index on a tie.
-        zone: Option<u8>,
+        /// members, the lowest index on a tie. A `u32`, so that a JS number
+        /// past 255 is refused rather than wrapped.
+        zone: Option<u32>,
         reply: oneshot::Sender<Result<EventBatch, EngineError>>,
     },
     /// Remove the node with stable id `id`: tell every survivor it left, stop
@@ -543,19 +544,17 @@ impl EngineState {
     /// (via that survivor's discovery stream) so gossip flows both ways. The
     /// newcomer starts with an empty store and catches up by anti-entropy. It
     /// joins `zone`, or the zone with the fewest live members.
-    async fn add_node(&mut self, zone: Option<u8>) -> Result<EventBatch, EngineError> {
+    async fn add_node(&mut self, zone: Option<u32>) -> Result<EventBatch, EngineError> {
         let zones = self.zone_names.len();
         let zone = match zone {
-            Some(zone) if usize::from(zone) >= zones => {
-                let zones = zones as u8;
-                return Err(EngineError::UnknownZone {
-                    zone,
-                    zones,
-                    last: zones - 1,
-                });
-            }
-            Some(zone) => zone,
             None => self.smallest_zone(),
+            Some(zone) => u8::try_from(zone)
+                .ok()
+                .filter(|&z| usize::from(z) < zones)
+                .ok_or(EngineError::UnknownZone {
+                    zone,
+                    zones: zones as u8,
+                })?,
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -589,11 +588,12 @@ impl EngineState {
     /// [`EngineState::add_node`]: tell every survivor it left, stop its
     /// runtime, unbind its transport, and drop every trace of it. Its id is
     /// never reused, so survivors keep their own ids and addresses unchanged.
+    /// The removal also reports any gateway into a zone it empties.
     async fn remove_node(&mut self, id: u32) -> Result<EventBatch, EngineError> {
         let pos = self
             .position_of(id)
             .ok_or(EngineError::UnknownNode { id })?;
-        let addr = self.nodes[pos].addr;
+        let (addr, zone) = (self.nodes[pos].addr, self.nodes[pos].zone);
         let node_id = self.nodes[pos].identity.node_id.0;
 
         // Tell every *other* node it left first, so they drop it from their
@@ -622,6 +622,25 @@ impl EngineState {
         self.drain_pending().await;
         let mut events = Vec::new();
         self.drain_log(&mut events);
+        // Removing a row moves no role, so the role-count diff never sees a
+        // zone lose its last member: report each origin's gateway into it gone.
+        if self.live_by_zone()[usize::from(zone)] == 0 {
+            let (tick, virtual_ms) = (self.current_tick(), self.virtual_ms);
+            for node in &mut self.nodes {
+                if let Some(from) = node.gateways[usize::from(zone)].take() {
+                    events.push(Event {
+                        tick,
+                        virtual_ms,
+                        kind: EventKind::GatewayChanged {
+                            origin: node.id,
+                            zone,
+                            from: Some(from),
+                            to: None,
+                        },
+                    });
+                }
+            }
+        }
         Ok(EventBatch {
             events,
             virtual_ms: self.virtual_ms,
@@ -731,8 +750,8 @@ impl EngineState {
     }
 
     /// Drain the shims' raw events, stamping each with the current virtual
-    /// time and gossip-tick index.
-    /// Every packet sent or dropped also counts into `bytes_by_tier`.
+    /// time and gossip-tick index; every packet sent or dropped also counts
+    /// into `bytes_by_tier`.
     fn drain_log(&mut self, events: &mut Vec<Event>) {
         let tick = self.current_tick();
         let virtual_ms = self.virtual_ms;
@@ -868,21 +887,22 @@ impl EngineState {
                 .as_ref()
                 .map(|s| self.peers_from_snapshot(handle.zone, s))
                 .unwrap_or_default();
+            let counters = snap.as_ref().map(|s| s.counters).unwrap_or_default();
             nodes.push(NodeState {
                 id: handle.id,
                 zone: handle.zone,
                 node_id: handle.identity.node_id.0,
                 incarnation: handle.identity.incarnation,
                 aggregate_total: handle.aggregate.total(),
-                rounds_heartbeat: snap.as_ref().map_or(0, |s| s.counters.rounds_heartbeat),
-                rounds_threshold: snap.as_ref().map_or(0, |s| s.counters.rounds_threshold),
-                gateway_failovers: snap.as_ref().map_or(0, |s| s.counters.gateway_failovers),
-                gap_reports_sent: snap.as_ref().map_or(0, |s| s.counters.gap_reports_sent),
-                rto_rewinds_own: snap.as_ref().map_or(0, |s| s.counters.rto_rewinds_own),
-                rto_rewinds_relay: snap.as_ref().map_or(0, |s| s.counters.rto_rewinds_relay),
-                sweeps_served: snap.as_ref().map_or(0, |s| s.counters.sweeps_served),
+                rounds_heartbeat: counters.rounds_heartbeat,
+                rounds_threshold: counters.rounds_threshold,
+                gateway_failovers: counters.gateway_failovers,
+                gap_reports_sent: counters.gap_reports_sent,
+                rto_rewinds_own: counters.rto_rewinds_own,
+                rto_rewinds_relay: counters.rto_rewinds_relay,
+                sweeps_served: counters.sweeps_served,
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
-                decode_reject_count: snap.as_ref().map_or(0, |s| s.counters.decode_rejects()),
+                decode_reject_count: counters.decode_rejects(),
                 store_stats: snap
                     .as_ref()
                     .map(|s| s.store_stats.into())
@@ -996,7 +1016,8 @@ async fn admin_snapshot(tx: &mpsc::Sender<AdminCommand>) -> Option<AdminSnapshot
     reply_rx.await.ok()
 }
 
-/// One `Counters` admin round-trip. `None` if the runtime has already stopped.
+/// One `Counters` admin round-trip, which allocates one `oneshot`. `None` if
+/// the runtime has already stopped.
 async fn counters(tx: &mpsc::Sender<AdminCommand>) -> Option<GossipCounters> {
     let (reply_tx, reply_rx) = oneshot::channel();
     tx.send(AdminCommand::Counters { reply: reply_tx })

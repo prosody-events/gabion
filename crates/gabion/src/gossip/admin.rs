@@ -66,7 +66,7 @@ pub struct AdminSnapshot {
 }
 
 /// What the runtime has sent, received and failed to send since startup.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct GossipCounters {
     /// Heartbeat rounds, one per `gossip.tick_interval`.

@@ -134,7 +134,7 @@ impl Sim {
     /// appears in the next [`Sim::snapshot`]. It joins zone `zone`, or the zone
     /// with the fewest live members; an index past the last zone throws
     /// [`crate::engine::EngineError::UnknownZone`].
-    pub async fn add_node(&self, zone: Option<u8>) -> Result<JsValue, JsValue> {
+    pub async fn add_node(&self, zone: Option<u32>) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::AddNode { zone, reply }).await?;
         let batch = rx

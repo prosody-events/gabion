@@ -786,6 +786,11 @@ fn zones_come_from_config_not_address() {
         let snap = state.snapshot().await;
 
         let own = sent(&events, 0, PacketKind::Own);
+        assert_eq!(
+            own.len(),
+            5,
+            "one own packet to each of 3 zone peers and 2 gateways: {own:?}"
+        );
         let in_zone: BTreeSet<u32> = own
             .iter()
             .filter(|p| p.1 == Tier::InZone)
@@ -919,6 +924,7 @@ fn one_way_cut_is_repaired_by_the_backstop() {
                 }
             }
         }
+        assert!(failed_over, "the origin left the gateway that cannot relay");
         let t1 = t1.expect("the cut swallowed a relay, but none was dropped");
         assert_eq!(state.virtual_ms, t1 + T_U + 3 * T + 2 * F_R);
         let snap = state.snapshot().await;
@@ -975,6 +981,14 @@ fn zone_partition_heals_to_exact_counts() {
                 .events,
         );
         all.extend(state.step(3_000).await.events);
+        for node in &state.snapshot().await.nodes {
+            let side = if node.zone == 2 { 4 } else { 3 };
+            assert_eq!(
+                node.aggregate_total, side,
+                "node {} sees only its side of the cut",
+                node.id
+            );
+        }
         state.heal();
         all.extend(state.step(3 * T).await.events);
         let snap = state.snapshot().await;
@@ -1117,12 +1131,17 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
         }
         let refused = state.add_node(Some(3)).await;
         assert!(
+            matches!(refused, Err(EngineError::UnknownZone { zone: 3, zones: 3 })),
+            "{:?}",
+            refused.err()
+        );
+        let refused = state.add_node(Some(256)).await;
+        assert!(
             matches!(
                 refused,
                 Err(EngineError::UnknownZone {
-                    zone: 3,
-                    zones: 3,
-                    last: 2
+                    zone: 256,
+                    zones: 3
                 })
             ),
             "{:?}",
@@ -1134,6 +1153,46 @@ fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
             snap.nodes.last().map(|n| n.id),
             Some(8),
             "the refusal spent no id"
+        );
+        state
+    });
+}
+
+/// A zone's last member leaving moves no role, yet every origin hears its
+/// gateway into that zone go, once, at the removal.
+#[test]
+fn last_member_leaving_a_zone_reports_its_gateway_gone() {
+    with_state(zoned(5, 3), |mut state| async move {
+        warm(&mut state).await;
+        // Node i sits in zone i mod 3, so node 2 is zone c's only member.
+        for origin in [0, 1, 3, 4] {
+            assert_eq!(gateway_of(&state, origin, 2).await, 2, "origin {origin}");
+        }
+        let gone = |events: &[Event]| -> Vec<(u32, Option<u32>, Option<u32>)> {
+            events
+                .iter()
+                .filter_map(|e| match e.kind {
+                    EventKind::GatewayChanged {
+                        origin,
+                        zone: 2,
+                        from,
+                        to,
+                    } => Some((origin, from, to)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let removal = state.remove_node(2).await.unwrap().events;
+        assert_eq!(
+            gone(&removal),
+            [0, 1, 3, 4].map(|o| (o, Some(2), None)),
+            "one report per origin"
+        );
+        let later = state.step(3 * T).await.events;
+        assert_eq!(
+            gone(&later),
+            [],
+            "reported once, not again at the next role change"
         );
         state
     });
@@ -1215,9 +1274,6 @@ fn events_serialize_with_hex_identifiers() {
     assert_eq!(json["kind"]["type"], "CellCreated");
     assert_eq!(json["kind"]["rule"], "000000000000c0fedeadbeefbabef00d");
     assert_eq!(json["kind"]["key"], "00000000000000000000000000000001");
-    // Round-trips back to the same u128.
-    let back: crate::event::Event = serde_json::from_value(json).unwrap();
-    assert_eq!(back, event);
 }
 
 /// The derived per-node sizing (`SimConfig::settings`) is anchored on

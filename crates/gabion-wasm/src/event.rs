@@ -11,13 +11,13 @@
 
 use gabion::gossip::{AnswerState, Role};
 use gabion::wire::{CellPayload, Payload};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::hex::{option_u128_hex, u128_hex};
 
 /// One thing that happened in the simulation, stamped with when. `kind` is a
 /// `{ "type": … }`-tagged payload so the frontend can switch on it directly.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Event {
     /// Gossip-tick index (`virtual_ms / tick_interval_ms`) the event fell in.
     pub tick: u64,
@@ -30,7 +30,7 @@ pub struct Event {
 /// `ExpirationSink` rows; packet events come from the logging transport;
 /// tick, threshold and gateway events come from diffing each runtime's
 /// counters.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum EventKind {
     /// A heartbeat round ran on `node`.
@@ -100,7 +100,7 @@ pub enum EventKind {
 }
 
 /// A packet's kind, read from its header: the kinds of the wire format.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum PacketKind {
     Ack,
     Own,
@@ -112,7 +112,7 @@ pub enum PacketKind {
 impl PacketKind {
     /// Whether the packet carries cells (data) rather than only a header
     /// (control).
-    pub fn carries_cells(self) -> bool {
+    fn carries_cells(self) -> bool {
         matches!(self, Self::Own | Self::Relay | Self::Sweep)
     }
 }
@@ -130,7 +130,7 @@ impl From<Payload> for PacketKind {
 }
 
 /// Whether a packet stayed inside its sender's zone, by placement.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum Tier {
     InZone,
     CrossZone,
@@ -149,7 +149,7 @@ impl Tier {
 
 /// The events produced by one `step` / `submit_request` / `step_to` call,
 /// plus the virtual time the engine reached.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct EventBatch {
     pub events: Vec<Event>,
     /// Virtual time after this batch, in milliseconds.

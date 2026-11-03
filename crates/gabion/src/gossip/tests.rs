@@ -1319,11 +1319,7 @@ async fn admin_snapshot_reflects_runtime_state() {
                 .unwrap();
             let counters = reply_rx.await.unwrap();
             assert!(counters.rounds_heartbeat >= 1);
-            assert_eq!(
-                counters.rounds_heartbeat,
-                snapshot.counters.rounds_heartbeat
-            );
-            assert_eq!(counters.packets_sent, snapshot.counters.packets_sent);
+            assert_eq!(counters, snapshot.counters);
 
             client.shutdown().await.unwrap();
             let _ = handle.await;

@@ -40,8 +40,9 @@ waiting), so a quiet cluster costs one step per heartbeat.
   requests.
 - `GatewayChanged` comes from each runtime's own gateway rows: the engine reads
   every node's counters each sub-step and fetches a snapshot only for a node
-  whose role count moved. A gateway that disappears because its zone's last
-  member left is not reported, since removing a row moves no role.
+  whose role count moved. When a zone's last member leaves, which moves no
+  role, the removal itself reports each origin's gateway into that zone as
+  gone.
 
 ## Node ceiling
 

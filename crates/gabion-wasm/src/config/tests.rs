@@ -75,10 +75,13 @@ fn zone_count_is_bounded() {
         zones: NonZeroU8::new(count as u8).unwrap(),
         ..SimConfig::default()
     };
-    assert!(zones(MAX_ZONES).validate().is_ok());
+    for count in 1..=MAX_ZONES {
+        let valid = zones(count).validate().expect("in range");
+        assert_eq!(valid.zone_names.len(), count, "{count} zones");
+    }
     assert!(matches!(
         zones(MAX_ZONES + 1).validate(),
-        Err(ConfigError::ZonesOutOfRange { got: 7 })
+        Err(ConfigError::ZonesOutOfRange { got }) if usize::from(got) == MAX_ZONES + 1
     ));
 }
 

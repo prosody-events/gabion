@@ -101,9 +101,10 @@ export class Sim {
 
   /** Add a fresh cold-start node to the live cluster (no rebuild). Resolves to
    *  the events the join produced; the new node's id appears in the next
-   *  snapshot. It joins `zone`, or the smallest zone. */
-  async addNode(zone: number | null = null): Promise<EventBatch> {
-    const batch = (await this.#inner.add_node(zone ?? undefined)) as EventBatch;
+   *  snapshot. It joins `zone`, or the zone with the fewest live members,
+   *  the lowest index on a tie. */
+  async addNode(zone?: number): Promise<EventBatch> {
+    const batch = (await this.#inner.add_node(zone)) as EventBatch;
     assertBoundary(batch);
     return batch;
   }
