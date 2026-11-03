@@ -1840,6 +1840,14 @@ fn unknown_sender_is_never_acked() {
             sim_advance_ticks(Duration::from_millis(1), 10).await;
             let relayed = if flagged { 3 } else { 0 };
             assert_eq!(relayed_cells(&wire, m, mark), relayed, "{flagged}");
+            // A replay raises nothing, so nothing more is relayed: only the
+            // cells a stranger's packet raises reach the zone.
+            for packet in cell_packets(node(0xD), 0, 3, flagged) {
+                wire.inbound.borrow_mut().push_back((packet, stranger));
+            }
+            wake(&wire);
+            sim_advance_ticks(Duration::from_millis(1), 10).await;
+            assert_eq!(relayed_cells(&wire, m, mark), relayed, "{flagged}");
             heartbeats(2).await;
             let to_stranger = wire.attempts.borrow()[mark..]
                 .iter()
