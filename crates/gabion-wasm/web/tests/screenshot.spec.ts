@@ -555,6 +555,27 @@ test('sustained overload climbs the aggregate past the limit', async ({ page }) 
   // node starts at zero until played.
   await expect(view(page, 0)).toHaveText('0');
 
+  // The REJECTING band fills the plot from its top down to the limit line and no
+  // further. Read from the drawn pixels of three rows across the plot's right
+  // half, 5 px clear of the top and of the dashed line, where no label (both sit
+  // at the left) and, before Play, no series reaches; the vertical grid lines
+  // cross all three rows alike.
+  const plot = page.locator('section.block', { hasText: 'Aggregate vs. limit' }).locator('.plot');
+  await expect
+    .poll(() =>
+      plot.evaluate((host: HTMLElement & { uplot?: any }, limit) => {
+        const u = host.uplot;
+        if (u === undefined) return null;
+        const gap = 5 * (u.pxRatio ?? devicePixelRatio);
+        const [x, w] = [Math.round(u.bbox.left + u.bbox.width / 2), Math.floor(u.bbox.width / 2)];
+        const line = u.valToPos(limit, 'y', true);
+        const at = (y: number): string => u.ctx.getImageData(x, Math.round(y), w, 1).data.join();
+        const [top, above, below] = [at(u.bbox.top + gap), at(line - gap), at(line + gap)];
+        return { 'one fill from the plot top to the limit': above === top, 'ends at the limit line': below !== above };
+      }, 400),
+    )
+    .toEqual({ 'one fill from the plot top to the limit': true, 'ends at the limit line': true });
+
   await page.getByRole('button', { name: 'Play' }).click();
   // The watched node's view (the aggregate it converges on) climbs past the
   // limit of 400 as the steady feed accumulates cluster-wide.
@@ -572,6 +593,46 @@ test('sustained overload climbs the aggregate past the limit', async ({ page }) 
   await page.locator('.dashboard').screenshot({ path: 'screenshots/dash-overload.png' });
 
   expect(pageErrors, `unexpected page errors: ${pageErrors.join('; ')}`).toEqual([]);
+});
+
+// On a display with 2 device px per CSS px every chart label is still drawn at
+// its CSS size: each published box spans its text, set in the page's font at
+// the box's size in device px and measured back in CSS px, plus a 2 px halo each
+// side. (Measured at the device size, as drawn, because a system font's optical
+// sizes set 2 × 10 px text narrower than twice 10 px text.) Every other project
+// draws at 1 device px, where a label sized in device px looks the same.
+test.describe('on a 2× display', () => {
+  test.use({ deviceScaleFactor: 2 });
+
+  test('chart labels keep their CSS size', async ({ page }) => {
+    await boot(page);
+    await page.getByRole('button', { name: 'Sustained overload' }).click();
+    const canvas = page.locator('section.block', { hasText: 'Aggregate vs. limit' }).locator('canvas[data-label-boxes]');
+    await expect
+      .poll(() =>
+        canvas.evaluate((c: HTMLCanvasElement) => {
+          const ctx = document.createElement('canvas').getContext('2d')!;
+          const family = getComputedStyle(document.documentElement).fontFamily;
+          const dpr = window.devicePixelRatio;
+          const labels = JSON.parse(c.dataset.labelBoxes ?? '[]') as { text: string; w: number; size: number }[];
+          return {
+            dpr,
+            labels: labels.map((l) => {
+              ctx.font = `${l.size * dpr}px ${family}`;
+              const text = ctx.measureText(l.text).width / dpr;
+              return { text: l.text, spansItsText: Math.abs(l.w - text - 4) < 0.5 };
+            }),
+          };
+        }),
+      )
+      .toEqual({
+        dpr: 2,
+        labels: [
+          { text: 'REJECTING', spansItsText: true },
+          { text: 'limit', spansItsText: true },
+        ],
+      });
+  });
 });
 
 // The zone-partition scenario cuts the last zone off from the rest, bursts both

@@ -7,9 +7,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::num::NonZeroU16;
 
 use gabion::defaults;
 use gabion::gossip::{AnswerState, Role};
+use gabion::settings::SettingError;
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
@@ -1697,6 +1699,38 @@ fn a_join_past_the_node_or_id_ceiling_is_refused() {
         );
         state.next_id = super::MAX_ID;
         state.add_node(None).await.expect("the last id joins");
+        state
+    });
+}
+
+/// A join its settings refuse (here, more bootstrap peers than
+/// `gossip.peer_capacity` holds) leaves no trace: no id spent, no member added.
+#[test]
+fn a_join_its_settings_refuse_spends_no_id() {
+    with_state(test_config(3), |mut state| async move {
+        let capacity = state.settings.peer_capacity;
+        state.settings.peer_capacity = NonZeroU16::new(2).unwrap();
+        let refused = state.add_node(None).await;
+        assert!(
+            matches!(
+                refused,
+                Err(EngineError::Setting(SettingError::TooManyBootstrapPeers {
+                    listed: 3,
+                    ..
+                }))
+            ),
+            "{:?}",
+            refused.err()
+        );
+        assert_eq!(state.next_id, 3, "the refusal spent no id");
+        assert_eq!(state.nodes.len(), 3, "the refusal added no member");
+        state.settings.peer_capacity = capacity;
+        state.add_node(None).await.expect("the join succeeds");
+        assert_eq!(
+            state.nodes.last().map(|n| n.id),
+            Some(3),
+            "the joiner takes id 3"
+        );
         state
     });
 }

@@ -1060,6 +1060,17 @@ test.describe('interaction', () => {
     await expect(page.locator('.inspector')).toContainText('Node 7');
     await expect(page.locator('.stage-box .tooltip')).toContainText('Node 7');
 
+    // Removing a cut node takes its cut links with it.
+    const cutFrom = page.getByRole('button', { name: /^Cut node \d+ from zone \w$/ }).first();
+    for (let i = 0; i < 10 && (await cutFrom.count()) === 0; i++) await step(page);
+    const cutNode = (await cutFrom.locator('[data-field="node"]').textContent()) ?? '';
+    await cutFrom.click();
+    await expect(status('cut')).toHaveText('3');
+    await page.locator('#remove-node').selectOption(cutNode);
+    await page.getByRole('button', { name: 'Remove node', exact: true }).click();
+    await expect(status('nodes')).toHaveText('11');
+    await expect(status('cut')).toHaveText('0');
+
     // The study link: the base URL's form, not that it resolves (`study/` joins
     // the site only in the Pages build).
     await page.locator('.method summary').click();
