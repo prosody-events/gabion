@@ -9,11 +9,26 @@ total; see
 [Writing the same rule for NGINX and gabiond](../gabion/README.md#writing-the-same-rule-for-nginx-and-gabiond).
 If you are not running
 Envoy — or you want enforcement inside nginx itself — see
-[`../nginx/README.md`](../nginx/README.md). For the gossip protocol
-explainer and tuning knobs, see
-[`../gabion/README.md#how-gossip-works`](../gabion/README.md#how-gossip-works)
-and
+[`../nginx/README.md`](../nginx/README.md). Every setting is in the
+[Configuration reference](#configuration-reference) below; the gossip
+protocol is explained in [`../gabion/GOSSIP.md`](../gabion/GOSSIP.md), and
+the knobs shared with NGINX in
 [`../gabion/README.md#operator-knobs`](../gabion/README.md#operator-knobs).
+
+## Contents
+
+- [Your first YAML](#your-first-yaml)
+- [How configuration layers](#how-configuration-layers)
+- [Configuration reference](#configuration-reference)
+- [Deploying on Kubernetes](#deploying-on-kubernetes)
+- [Admin endpoint](#admin-endpoint)
+- [Logging](#logging)
+- [Glossary](#glossary)
+- [Common patterns](#common-patterns)
+- [Running across a cluster](#running-across-a-cluster)
+- [Exit codes and HTTP statuses](#exit-codes-and-http-statuses)
+- [Troubleshooting](#troubleshooting)
+- [Fail-open invariant](#fail-open-invariant)
 
 ## Your first YAML
 
@@ -93,6 +108,152 @@ binds a socket: a zero count, a malformed value, an out-of-range value
 or a YAML key the table and the `limits:` fields do not know (a typo, or
 a key a release removed) stops startup with a message that names the
 setting in both spellings. See [Troubleshooting](#troubleshooting).
+
+## Configuration reference
+
+Every setting `gabiond` reads, block by block. The YAML key is also the
+`config_key` field of every message that names the setting; the environment
+variable wins over the file. Durations are written in whole milliseconds or
+larger units (`500ms`, `10s`); lists are YAML sequences, or comma-separated in
+the environment variable. The rules themselves (`limits:`) are YAML only, see
+[Rate, window, and bucket](#rate-window-and-bucket). The same settings in
+NGINX, and which are common and which advanced, are in the
+[library's knob tables](../gabion/README.md#operator-knobs); the memory each
+one sizes is in its [Sizing](../gabion/README.md#sizing) section.
+
+### Listeners
+
+| Key | Environment variable | Default | Meaning | Change it when |
+|---|---|---|---|---|
+| `envoy_bind` | `GABION_ENVOY_BIND` | unset: no gRPC listener | `host:port` Envoy's rate-limit filter calls. | Always set it; without it `gabiond` serves no decisions. |
+| `admin_bind` | `GABION_ADMIN_BIND` | unset: no admin endpoint | `host:port` of the [admin endpoint](#admin-endpoint), `/snapshot` and `/readyz`. | Set it for a readiness probe or to inspect a node. |
+
+### `storage`
+
+| Key | Environment variable | Default | Meaning | Change it when |
+|---|---|---|---|---|
+| `storage.max_cells` | `GABION_STORAGE_MAX_CELLS` | `131072` | Counter cells, one per key, bucket and origin node: about 96 bytes each, plus 128 in the aggregate table. | `cell_store_full` or `aggregate_full`. |
+| `storage.max_descriptor_count` | `GABION_STORAGE_MAX_DESCRIPTOR_COUNT` | `16` | Descriptors one rule may declare, up to 65,535. | A rule fails to load with too many descriptors. |
+| `storage.max_descriptor_bytes` | `GABION_STORAGE_MAX_DESCRIPTOR_BYTES` | `512` | Bytes of domain, keys and values in one descriptor. | `cardinality_rejected` with `limit = "bytes"` for legitimate traffic. |
+| `storage.max_key_bytes` | `GABION_STORAGE_MAX_KEY_BYTES` | `128` | Bytes in one descriptor key. | A rule fails to load with a long key, or `cardinality_rejected` with `limit = "key_bytes"`. |
+| `storage.max_request_descriptors` | `GABION_STORAGE_MAX_REQUEST_DESCRIPTORS` | `16` | Descriptors of one request `gabiond` evaluates. | `cardinality_rejected` with `limit = "request_descriptors"`. |
+| `storage.max_matched_rules` | `GABION_STORAGE_MAX_MATCHED_RULES` | `16` | Rules one request is counted against; 32 bytes a rule per runtime thread. | `matched_rule_overflow` (advanced). |
+| `storage.rule_dictionary_capacity` | `GABION_STORAGE_RULE_DICTIONARY_CAPACITY` | max(256, 2 × configured rules) | Distinct rules the counter store tracks, this node's and those peers gossip. | `rule_dictionary_full` (advanced). |
+| `storage.node_dictionary_capacity` | `GABION_STORAGE_NODE_DICTIONARY_CAPACITY` | twice `gossip.peer_capacity` | Distinct peer instances (a restart is a new one) with live counts. | `node_dictionary_full` (advanced). |
+
+### `gossip`
+
+| Key | Environment variable | Default | Meaning | Change it when |
+|---|---|---|---|---|
+| `gossip.bind` | `GABION_GOSSIP_BIND` | unset; required | UDP `host:port` this node gossips on, even alone. | Always set it. |
+| `gossip.cluster_id_hash` | `GABION_GOSSIP_CLUSTER_ID_HASH` | `1` | Non-zero id, decimal or `0x` hex, every node of one cluster shares. A label, not a secret. | Always set your own; `default_cluster_id` says when a node runs with the default. |
+| `gossip.zone` | `GABION_GOSSIP_ZONE` | unset: from the pod's EndpointSlice entry | This node's availability zone, like a Kubernetes label value. | Outside Kubernetes, or when `zone_unknown` says the entry has none. |
+| `gossip.bootstrap_peers` | `GABION_GOSSIP_BOOTSTRAP_PEERS` | unset: Kubernetes discovery | Static peers, `ip:port`; a non-empty list replaces discovery and may name this node. | Running outside Kubernetes. |
+| `gossip.peer_capacity` | `GABION_GOSSIP_PEER_CAPACITY` | `512` | The most peers a node gossips with, about 330 bytes each. | `peer_table_full`. |
+| `gossip.tick_interval` | `GABION_GOSSIP_TICK_INTERVAL` | `500ms` | The heartbeat, also the retransmission timeout. | Rarely; `setting_warning` warns below 20 ms. |
+| `gossip.target_err_bps` | `GABION_GOSSIP_TARGET_ERR_BPS` | `100` | Per-rule error budget in basis points of the rule's limit, 1 to 10,000. | A hot rule needs a tighter bound, or gossip bytes matter more. |
+| `gossip.limit_queue_capacity` | `GABION_GOSSIP_LIMIT_QUEUE_CAPACITY` | `8192` | Counted hits waiting for the gossip task. | `request_queue_full` (advanced). |
+| `gossip.recv_buffer_bytes` | `GABION_GOSSIP_RECV_BUFFER_BYTES` | `4194304` | Receive buffer the gossip socket asks the kernel for. | `socket_buffer_capped` (advanced). |
+| `gossip.send_buffer_bytes` | `GABION_GOSSIP_SEND_BUFFER_BYTES` | `1048576` | Send buffer the gossip socket asks the kernel for. | `socket_buffer_capped` or `send_blocked` (advanced). |
+| `gossip.suspect_after` | `GABION_GOSSIP_SUSPECT_AFTER` | max(4 × `gossip.tick_interval`, 2s) | How long a packet to a peer may go unanswered before the peer is suspect and routed around; at least two heartbeats. | `gateway_failover` repeats (advanced). |
+| `gossip.sweep_concurrency` | `GABION_GOSSIP_SWEEP_CONCURRENCY` | `4` | Join sweeps this node answers at once, 1 to 255. | `sweep_declined` outside rollouts (advanced). |
+| `gossip.zone_grace` | `GABION_GOSSIP_ZONE_GRACE` | `10s` | How long after the first peer event the node waits for its own EndpointSlice entry before `zone_unknown`. | `zone_unknown` followed soon by `zone_known` (advanced). |
+| `gossip.max_payload_bytes` | `GABION_GOSSIP_MAX_PAYLOAD_BYTES` | `1400` | Largest gossip packet, 158 to 65,507 bytes; the same on every node. | `decode_rejected` with `reason = "peer_limits"` (advanced). |
+| `gossip.min_emit_interval` | `GABION_GOSSIP_MIN_EMIT_INTERVAL` | `5ms` | Floor between two threshold or prompt rounds, at least 1 ms and below `gossip.tick_interval`; it caps a node's packet rate. | `rounds_threshold` and `packets_sent` in `/snapshot` climb far above normal (advanced). |
+
+### `discovery`
+
+| Key | Environment variable | Default | Meaning | Change it when |
+|---|---|---|---|---|
+| `discovery.namespace_allow` | `GABION_DISCOVERY_NAMESPACE_ALLOW` | unset: the pod's own namespace | Namespaces whose Services discovery watches. | Peers run in other namespaces. |
+| `discovery.service_allow` | `GABION_DISCOVERY_SERVICE_ALLOW` | unset: every Service with a UDP port named `gabion` | Services discovery reads peers from. | Several gabion clusters share a namespace. |
+| `discovery.self_addr` | `GABION_DISCOVERY_SELF_ADDR` | unset: found by pod name | This pod's IP and gossip port. | Only for `hostNetwork` pods, as `$(POD_IP):9000`. |
+
+### `runtime`
+
+| Key | Environment variable | Default | Meaning | Change it when |
+|---|---|---|---|---|
+| `runtime.node_id_seed` | `GABION_RUNTIME_NODE_ID_SEED` | unset: the host name | The text this node's stable id is hashed from: the host name, else the outbound IP address. | Two nodes share a host name. |
+
+## Deploying on Kubernetes
+
+[`deploy/kubernetes/gabiond.yaml`](../../deploy/kubernetes/gabiond.yaml) is a
+complete starting point: a ConfigMap holding the YAML, a Deployment, and a
+Service whose UDP port is named `gabion`, which is how discovery finds the
+peers. Apply it with the RBAC that discovery needs and the NetworkPolicy that
+keeps the gossip port private:
+
+```sh
+kubectl apply -f deploy/kubernetes/gabion-discovery-rbac.yaml \
+  -f deploy/kubernetes/gabiond.yaml \
+  -f deploy/kubernetes/gabion-networkpolicy.yaml
+```
+
+- **Readiness.** The Deployment probes `GET /readyz` on `admin_bind`, which
+  is unset by default, so the ConfigMap sets it. `/readyz` answers while the
+  process runs; `gabiond` exits when gossip or a listener fails, so a static
+  probe is enough (see [Admin endpoint](#admin-endpoint)).
+- **Zones** need no setting: each pod reads its zone from its own
+  EndpointSlice entry. `discovery.self_addr` is only for `hostNetwork` pods.
+- **Rollouts.** Every pod of a cluster runs one release; roll a new one fast
+  ([Upgrading](../gabion/README.md#upgrading)).
+
+The root README's [Kubernetes checklist](../../README.md#kubernetes-checklist)
+says what each object is for, and
+[`deploy/kubernetes/README.md`](../../deploy/kubernetes/README.md) what to
+edit in the manifests.
+
+## Admin endpoint
+
+`admin_bind` serves two routes, over plain HTTP; keep the port inside the
+cluster.
+
+| Route | Status | Body |
+|---|---|---|
+| `GET /snapshot` | 200 | The node's state as JSON (below). |
+| `GET /snapshot` | 503 | Once the gossip task has stopped: the `admin_unavailable` text. |
+| `GET /readyz` | 200 | `ready`. |
+
+`/readyz` proves only that the admin server answers. It checks neither gossip
+nor the gRPC listener, because `gabiond` exits with status 1 when either
+fails, so the restarted pod is what a failure looks like.
+
+`/snapshot` holds:
+
+| Field | What it is |
+|---|---|
+| `zone` | This node's zone: `name` and `source` (`config` or `endpoint_slice`), or for an unknown zone a null `name`, `source` `none` and the `reason`. |
+| `local_identity` | `node_id` and `incarnation`, which changes on every restart. |
+| `peers` | One entry per peer: `addr`, `node_id` (null until heard), `zone` (`"same"`, `"unknown"` or the remote zone's hash), `role` (`unheard`, `zone`, `gateway`, `remote` or `incompatible`), `answer` (`settled`, `owed`, `suspect` or `cannot_relay`), `unanswered_ms` (how long its oldest packet has waited for an answer), `own_unacked` and `relay_unacked`. |
+| `peers_by_role` | How many peers hold each role; `incompatible` above 0 means a peer runs another wire version. |
+| `store_stats` | The counter store: `active_cells` of `cell_capacity`, rule and node dictionary use, and the `*_full_rejects` counts behind each "full" warning. |
+| `counters` | Since start: rounds by kind, packets and bytes sent and received, `bytes_sent_cross_zone`, cells merged, rewinds and gap reports, `gateway_failovers`, `relay_stalls`, sweeps, `send_blocked`, `send_errors` and the `decode_rejects_*` counts. |
+| `rules` | The loaded rules, each with its `fingerprint`, `limit`, `window_millis`, `bucket_millis` and `live_buckets`. |
+| `aggregate_rows` | Occupied slots of the aggregate table admission reads. |
+| `last_error_budget` | The error budget, in hits, of the last rule recorded. |
+
+### Verify convergence
+
+```bash
+curl -s "$ADMIN_HOST:9090/snapshot" | jq '.peers | length'
+curl -s "$ADMIN_HOST:9090/snapshot" | jq '.store_stats.active_cells'
+curl -s "$ADMIN_HOST:9090/snapshot" | jq '.peers_by_role'
+```
+
+A cluster has converged when every node's `peers | length` reflects
+the expected topology and `active_cells` is the same order of
+magnitude on each.
+
+## Logging
+
+`gabiond` writes `tracing`'s plain-text format to standard output, one line
+per event: time, level, target, the message, then its fields as `key=value`.
+`RUST_LOG` sets what is written (default `info,gabion=info,gabion_server=info`;
+for example `RUST_LOG=warn` keeps warnings and errors only). Every line an
+operator acts on carries a `code` field, the key of its entry in
+[Troubleshooting](#troubleshooting) or in the
+[library's catalogue](../gabion/TROUBLESHOOTING.md), written as
+`code="gabiond_started"`; filter on it to find one kind of event.
 
 ## Glossary
 
@@ -234,30 +395,11 @@ The cross-cutting plumbing — binding a gossip socket, picking a
 cluster id, telling peers how to find each other — is documented in
 the root README's
 [Running across a cluster](../../README.md#running-across-a-cluster).
-The `gabiond` YAML keys are `gossip.bind` (UDP `host:port`),
-`gossip.cluster_id_hash` (non-zero u128 shared across peers),
-`gossip.peer_capacity` (the most peers a node tracks, default 512),
-`gossip.suspect_after` (how long a packet to a peer may go unanswered
-before the peer is routed around; by default four heartbeats and at least
-2 s, and at least two heartbeats when set, else startup fails with
-`setting_invalid`),
-`gossip.zone` (this node's availability zone; leave it unset on
-Kubernetes, where the node reads it from its own EndpointSlice entry, and
-set it outside, where nothing else can; an empty or malformed value fails
-startup with `setting_invalid`),
-`gossip.zone_grace` (how long, after the first peer event, the node waits
-for its own EndpointSlice entry before it logs `zone_unknown`, and a join
-sweep waits for unheard peers; default 10s),
-`gossip.bootstrap_peers` (a static peer list of `ip:port` entries, a YAML
-list or a comma-separated `GABION_GOSSIP_BOOTSTRAP_PEERS`; it replaces
-Kubernetes discovery, may name this node too, and may hold no more than
-`gossip.peer_capacity` entries),
-`discovery.namespace_allow` / `discovery.service_allow` (Kubernetes
-EndpointSlice filters), and `discovery.self_addr` (this pod's own
-`host:port`, only for `hostNetwork` pods; otherwise the pod-name match finds
-the node's own entry, which is never a peer). Running outside Kubernetes and
-the zone sources are in
-[`../gabion/README.md#zones`](../gabion/README.md#zones). Discovery needs
+The `gabiond` keys for each piece are in the
+[Configuration reference](#configuration-reference): `gossip.bind` and
+`gossip.cluster_id_hash`, then `discovery.*` on Kubernetes or
+`gossip.bootstrap_peers` and `gossip.zone` outside it (see
+[`../gabion/README.md#zones`](../gabion/README.md#zones)). Discovery needs
 the Role in the root README's
 [Kubernetes checklist](../../README.md#kubernetes-checklist): `get` on
 Pods and `get`/`list`/`watch` on Services and EndpointSlices, bound to the
@@ -266,39 +408,13 @@ pod's ServiceAccount
 Without it, discovery logs `kubernetes_forbidden` and the peer set stays
 empty.
 
-Tuning the gossip cadence is rarely necessary, since the defaults
-converge in well under a second at production scale. When you do tune,
+The defaults need no tuning at production sizes: in the study they
+converged with a 99th percentile of 337 ms at 80 pods and 301 ms at 183
+([What we measured](../gabion/README.md#what-we-measured)). When you do tune,
 the **adaptive emit rate** (threshold-triggered emissions between
-heartbeats) is governed by `gossip.target_err_bps` (per-rule error budget
-in basis points of the limit) and `gossip.min_emit_interval` (the floor
-between threshold-fire emissions, which also paces resends and join
-sweeps); `gossip.sweep_concurrency` caps the join sweeps a node answers
-at once. The math and tradeoffs live in
-[`../gabion/README.md#how-gossip-works`](../gabion/README.md#how-gossip-works).
-
-### Verify convergence
-
-`/snapshot` returns the node's own zone (`zone`: its `name` and `source`,
-`config` or `endpoint_slice`, or for an unknown zone a null `name`, `source`
-`none` and the `reason`), the peer list, CRDT stats (`store_stats`), gossip
-counters (`counters`), the rule list and the aggregate row count. Each peer shows its
-`zone` (`"same"`, `"unknown"` or the remote zone's hash: from the peer's
-headers once heard; before that, while `node_id` is null, the zone discovery
-reported for it), its `role` (`unheard` for a peer neither heard from nor
-placed in a zone by discovery, `zone`, `gateway`, `remote` or
-`incompatible`), its `answer` state
-(`settled`, `owed`, `suspect` or `cannot_relay`) and `unanswered_ms`, how
-long its oldest packet has waited for an answer; `peers_by_role` counts the
-roles:
-
-```bash
-curl -s "$ADMIN_HOST:9090/snapshot" | jq '.peers | length'
-curl -s "$ADMIN_HOST:9090/snapshot" | jq '.store_stats.active_cells'
-```
-
-A cluster has converged when every node's `peers | length` reflects
-the expected topology and `active_cells` is the same order of
-magnitude on each.
+heartbeats) is governed by `gossip.target_err_bps` and
+`gossip.min_emit_interval`; the math and tradeoffs live in
+[`../gabion/GOSSIP.md`](../gabion/GOSSIP.md#adaptive-emit-rate).
 
 ## Exit codes and HTTP statuses
 
@@ -350,7 +466,22 @@ every configuration error in the table below, reaches the log as the
 | `` `gossip.min_emit_interval` … must be at least 1ms and shorter than `gossip.tick_interval` … ``                               | The gap between two sends is at or above the heartbeat, so every change would wait for the heartbeat.  | Set it below `gossip.tick_interval`, or remove it to use the default of 5ms.                                                  |
 | `gabiond cannot start: it has no gossip address to listen on …`                                                                | No bind address was supplied.                                                                          | Set `gossip.bind` in YAML or `GABION_GOSSIP_BIND` in env.                                                                     |
 | `` `GABION_X` contains bytes that are not valid UTF-8 ``                                                                       | A non-UTF-8 byte appeared in `GABION_X`.                                                               | Re-export the env var with a valid UTF-8 value.                                                                               |
+| `Config file not found: PATH`                                                                                                  | The path given as `gabiond`'s argument does not exist (reported inside `gabiond_exit`).                 | Pass the right path, or no argument at all: `gabiond` then reads only the environment and the defaults.                       |
 | `OVER_LIMIT` for every descriptor                                                                                              | The configured `rate:` is below sustained load.                                                        | Raise the rate, widen the window, or split the rule. Re-run with `mode: dry_run` while you measure.                           |
+
+### `admin_listening`
+
+**Level** info, once at start · **Request allowed** not applicable · **Emitted by** `gabiond`
+
+Message starts: "Admin HTTP endpoint is up."
+
+**What happened.** `gabiond` bound `admin_bind` and serves `/snapshot` and `/readyz` on it.
+
+**Why.** `admin_bind` is set.
+
+**What to do next.** Nothing. Point the readiness probe at `/readyz` on this address ([Admin endpoint](#admin-endpoint)).
+
+**Fields** `listen_addr` · **Knob** `admin_bind` (`GABION_ADMIN_BIND`)
 
 ### `admin_unavailable`
 
@@ -380,6 +511,20 @@ Message starts: "Rejecting requests that attach too many or too large rate-limit
 
 **Fields** `domain`, `limit`, `max`, `rejected_total`, `config_key` · **Knob** `storage.max_descriptor_count` (`GABION_STORAGE_MAX_DESCRIPTOR_COUNT`), `storage.max_descriptor_bytes` (`GABION_STORAGE_MAX_DESCRIPTOR_BYTES`), `storage.max_key_bytes` (`GABION_STORAGE_MAX_KEY_BYTES`), `storage.max_request_descriptors` (`GABION_STORAGE_MAX_REQUEST_DESCRIPTORS`, default 16)
 
+### `clean_shutdown`
+
+**Level** info, once at exit · **Request allowed** not applicable, `gabiond` has stopped · **Emitted by** `gabiond`
+
+Message starts: "Gabion shut down cleanly."
+
+**What happened.** After a signal, every listener drained its in-flight requests and `gabiond` exits with status 0.
+
+**Why.** A `shutdown_signal` line came first: Kubernetes stopping the pod, or an operator.
+
+**What to do next.** Nothing. A shutdown without this line exited with status 1; its error line says why.
+
+**Fields** none · **Knob** none
+
 ### `gabiond_exit`
 
 **Level** error, once · **Request allowed** not applicable, `gabiond` is not serving · **Emitted by** `gabiond`
@@ -393,6 +538,34 @@ Message starts: "gabiond is exiting with status 1 because it could not"
 **What to do next.** Fix what `error` names and restart.
 
 **Fields** `stage`, `error` · **Knob** none
+
+### `gabiond_started`
+
+**Level** info, once at start · **Request allowed** not applicable · **Emitted by** `gabiond`
+
+Message starts: "Starting gabion."
+
+**What happened.** `gabiond` loaded and validated its configuration and is about to bind its sockets. The fields echo what it will run with.
+
+**Why.** The process started.
+
+**What to do next.** Check the fields against what you meant to configure: `rules_loaded`, the binds, `membership` (`kubernetes`, `static` or `alone`) and the capacities.
+
+**Fields** `gossip_bind`, `envoy_bind`, `admin_bind`, `rules_loaded`, `max_keys`, `max_rules`, `max_peers`, `max_peer_instances`, `zone_setting`, `membership` · **Knob** none
+
+### `gossip_listening`
+
+**Level** info, once at start · **Request allowed** not applicable · **Emitted by** `gabiond`
+
+Message starts: "Listening for gossip from other gabion nodes."
+
+**What happened.** `gabiond` bound `gossip.bind` and gossips on it.
+
+**Why.** The process started.
+
+**What to do next.** Nothing. Peers reach this node on `listen_addr`; on Kubernetes the Service's UDP port named `gabion` must point at it.
+
+**Fields** `listen_addr` · **Knob** `gossip.bind` (`GABION_GOSSIP_BIND`)
 
 ### `gossip_record_failure`
 
@@ -422,6 +595,34 @@ Message starts: "The gossip background task stopped on its own."
 
 **Fields** `error` · **Knob** none
 
+### `grpc_listening`
+
+**Level** info, once at start · **Request allowed** not applicable · **Emitted by** `gabiond`
+
+Message starts: "Accepting rate-limit decisions from Envoy."
+
+**What happened.** `gabiond` bound `envoy_bind` and serves the rate-limit, health and reflection services on it.
+
+**Why.** `envoy_bind` is set.
+
+**What to do next.** Nothing. Point Envoy's rate-limit filter at `listen_addr`.
+
+**Fields** `listen_addr`, `health_service`, `reflection_service`, `rate_limit_service` · **Knob** `envoy_bind` (`GABION_ENVOY_BIND`)
+
+### `identity_generated`
+
+**Level** info, once at start · **Request allowed** not applicable · **Emitted by** `gabiond`
+
+Message starts: "Generated this node's identity."
+
+**What happened.** `gabiond` derived its node id and drew a new incarnation; peers' `/snapshot` shows this node under that id.
+
+**Why.** The node id is hashed from `runtime.node_id_seed`, else the host name, so it stays the same across restarts; the incarnation changes on every start.
+
+**What to do next.** Nothing. If two nodes log the same `node_id`, give each a distinct `runtime.node_id_seed`.
+
+**Fields** `node_id`, `incarnation` · **Knob** `runtime.node_id_seed` (`GABION_RUNTIME_NODE_ID_SEED`)
+
 ### `listener_failed`
 
 **Level** error, once · **Request allowed** not applicable, `gabiond` exits · **Emitted by** `gabiond`
@@ -449,6 +650,20 @@ Message starts: "A request matched more than 16 rate-limit rules, the most this 
 **What to do next.** Merge or narrow the overlapping rules under `limits:`, split the rule space across `domain:` values, or raise `storage.max_matched_rules`. Each extra rule costs 32 bytes per runtime thread, reserved once on the thread's first request.
 
 **Fields** `domain`, `cap`, `overflowed_total`, `config_key` · **Knob** `storage.max_matched_rules` (`GABION_STORAGE_MAX_MATCHED_RULES`, default 16)
+
+### `not_serving`
+
+**Level** info, once at shutdown · **Request allowed** yes, in-flight requests finish · **Emitted by** `gabiond`
+
+Message starts: "Marked the rate-limit service as NOT_SERVING in the health protocol."
+
+**What happened.** After a signal, `gabiond` set the gRPC health status to NOT_SERVING so load balancers route new requests elsewhere, then drains its listeners.
+
+**Why.** A `shutdown_signal` line came first.
+
+**What to do next.** Nothing.
+
+**Fields** none · **Knob** none
 
 ### `request_queue_full`
 
@@ -478,6 +693,20 @@ Message starts: "gabiond stopped serving"
 
 **Fields** `addr`, `error` · **Knob** none
 
+### `shutdown_signal`
+
+**Level** info, once · **Request allowed** yes, in-flight requests finish · **Emitted by** `gabiond`
+
+Message starts: "Received shutdown signal"
+
+**What happened.** `gabiond` received SIGTERM or SIGINT (the `signal` field) and is stopping cleanly: `not_serving`, then `clean_shutdown`.
+
+**Why.** Kubernetes is stopping the pod (a rollout, a scale-down, an eviction), or an operator pressed Ctrl-C.
+
+**What to do next.** Nothing.
+
+**Fields** `signal` · **Knob** none
+
 ## Fail-open invariant
 
 `gabiond` returns `OVER_LIMIT` only on a measured limit overflow.
@@ -491,20 +720,3 @@ exists to bound memory consumption against pathological client input.
 
 See the [Fail-open invariant](../../README.md#fail-open-invariant)
 section of the root README for the policy statement.
-
-## Migration from the pre-1.0 YAML
-
-There is no deprecation cycle: the old `limit:` + `window:` pair has
-been replaced by a mandatory `rate:` string together with optional
-`window:` and `bucket:` durations.
-
-| Before                                       | After                                                                                                            |
-|----------------------------------------------|------------------------------------------------------------------------------------------------------------------|
-| `limit: 100, window: 60s`                    | `rate: 100r/m`                                                                                                   |
-| `limit: 10, window: 1s`                      | `rate: 10r/s`                                                                                                    |
-| `limit: 180000, window: 5h`                  | `rate: 10r/s, window: 5h` (same resolved limit, original intent preserved)                                       |
-| `limit: 100, window: 500ms` (sub-period)     | `rate: 100r/500ms`. A `window:` shorter than the rate's period is refused (it has nothing to scale the rate over). |
-
-Read [Rate, window, and bucket](#rate-window-and-bucket) before
-reaching for `window:`, because long windows with the default
-`bucket:` give you a burstable budget rather than a paced one.

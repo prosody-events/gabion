@@ -1,6 +1,6 @@
 # The `crdt` module
 
-A guide to `crates/gabion/src/crdt/*` for somebody who has never opened this code before. The deep-dive companion to [`README.md`](README.md#how-gossip-works) — which documents the gossip runtime that sits on top of the structures described here. Streams, acks, threshold emissions, and join sweeps all live there; this file is the data structures and the writes that flow through them.
+A guide to `crates/gabion/src/crdt/*` for somebody who has never opened this code before. The deep-dive companion to [`GOSSIP.md`](GOSSIP.md) — which documents the gossip runtime that sits on top of the structures described here. Streams, acks, threshold emissions, and join sweeps all live there; this file is the data structures and the writes that flow through them.
 
 Read it end-to-end and you should be able to open `crdt.rs` and recognise every type, every column, and every method named below.
 
@@ -63,7 +63,7 @@ The `crdt` module is responsible for:
 
 Everything in the module is single-threaded and bounded, with all capacities picked at `CellStore::new` time and never grown thereafter. The module-level comment says it plainly: *"Nothing in this module allocates after construction."* Two storage conventions enforce this. The store's own columns are `Box<[T]>` — slices that cannot grow, sized once at construction — while the caller-owned I/O containers (§5) are `Vec<T>` so that the caller can `clear()` them between frames and reuse the same capacity, calling `with_capacity` once at startup so they never reallocate in steady state.
 
-For the cluster-level protocol — streams, acks, threshold-fire emissions, join sweeps — see [`README.md`](README.md#how-gossip-works). This document does not describe those; it describes the data structures the runtime drives.
+For the cluster-level protocol — streams, acks, threshold-fire emissions, join sweeps — see [`GOSSIP.md`](GOSSIP.md). This document does not describe those; it describes the data structures the runtime drives.
 
 ---
 
@@ -989,7 +989,7 @@ There is no atomic "snapshot the whole store" operation. The structure is single
 
 The gossip runtime sends each peer this node's own cells that changed
 since it last sent that peer anything: its *own stream*, numbered by
-`origin_sequence` (README, "Streams, acks and join sweeps"). The store
+`origin_sequence` (GOSSIP.md, "Streams, acks and join sweeps"). The store
 keeps those cells on one intrusive doubly linked list threaded through
 two columns, `stream_prev` and `stream_next`, with its ends in
 `own_list`. A `SlotLink` is a slot index or `NONE` (`u32::MAX`, never a
@@ -1198,7 +1198,7 @@ CRDT-internal terms first; a couple of cluster-wide terms repeated here for self
 - **ABA problem.** A subtle stale-handle bug: address A points to value X, gets recycled to value Y, then back to X, so a comparison `cur == old` succeeds even though the intervening Y was observable.
 - **ABA tag.** Extra bits in a handle that change on every recycle, so an old handle cannot match a new use of the same slot.
 - **AoS / SoA.** Array-of-Structures vs. Structure-of-Arrays — two memory layouts for tabular data.
-- **Anti-entropy.** Background reconciliation: nodes periodically swap state so anything dropped in transit eventually re-delivers. The protocol lives in [`README.md`](README.md#how-gossip-works); this file just exposes the structures the runtime consumes.
+- **Anti-entropy.** Background reconciliation: nodes periodically swap state so anything dropped in transit eventually re-delivers. The protocol lives in [`GOSSIP.md`](GOSSIP.md); this file just exposes the structures the runtime consumes.
 - **Avalanche.** Property of a hash function: a one-bit change in the input flips, on average, half the output bits.
 - **Backshift deletion.** Deleting from an open-addressed table by walking forward and pulling displaced entries one slot back, until you hit empty or an ideal-slot entry.
 - **Bucket epoch.** `now_millis / rule.bucket_millis` — which time window an observation belongs to.

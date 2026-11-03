@@ -767,6 +767,7 @@ where
                     return;
                 };
                 tracing::info!(
+                    code = "peer_left",
                     peer = %p.addr,
                     cluster_size = self.peers.len(),
                     "Peer left the cluster.",
@@ -800,6 +801,7 @@ where
         let addr = peer.addr;
         match self.peers.insert(peer, self.store.head(Stream::Own)) {
             Insert::Added => tracing::info!(
+                code = "peer_joined",
                 peer = %addr,
                 cluster_size = self.peers.len(),
                 "Peer joined the cluster.",

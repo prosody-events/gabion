@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 pub mod aggregate;
 pub mod crdt;
 pub mod defaults;

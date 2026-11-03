@@ -1,0 +1,121 @@
+# NGINX with the gabion module, as a Deployment of three replicas that share
+# counts through gossip. The published image loads the module itself, so
+# nginx.conf has no `load_module` (deploy/nginx/README.md). Apply it with
+# gabion-discovery-rbac.yaml and gabion-networkpolicy.yaml. Every object lives
+# in `default`; change every `namespace:` together, in the RBAC file too.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gabion-nginx
+  namespace: default
+  labels:
+    app: gabion-nginx
+    app.kubernetes.io/part-of: gabion
+data:
+  nginx.conf: |
+    worker_processes auto;
+    error_log /dev/stderr warn;
+    events {}
+
+    http {
+        # Every directive is in crates/nginx/README.md, "Directive reference".
+        # 2m holds 16,384 counters; size it from the notes under
+        # `gabion_limit_zone`.
+        gabion_limit_zone zone=api:2m;
+        gabion_limit_rule per_ip $remote_addr rate=100r/s;
+
+        gabion_gossip_bind 0.0.0.0:9000;
+        # Any non-zero id, shared by every node of one cluster: a label, not a
+        # secret. gabiond.yaml uses the same one, so the two applied together
+        # form one mixed cluster.
+        gabion_gossip_cluster 0x6761626e;
+
+        server {
+            listen 8080;
+            location = /healthz {
+                gabion off;
+                return 200 "ok\n";
+            }
+            location / {
+                gabion_limit per_ip;
+                root /usr/share/nginx/html;
+            }
+        }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gabion-nginx
+  namespace: default
+  labels:
+    app: gabion-nginx
+    app.kubernetes.io/part-of: gabion
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: gabion-nginx
+  # Every pod of a cluster runs one release: two releases may not share
+  # counts, so roll a new one through quickly (crates/gabion/README.md,
+  # "Upgrading").
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 100%
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: gabion-nginx
+        app.kubernetes.io/part-of: gabion
+    spec:
+      serviceAccountName: gabion
+      containers:
+        - name: nginx
+          # Pin a release tag (for example :0.4) rather than :latest.
+          image: ghcr.io/prosody-events/gabion/nginx:latest
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: gabion
+              containerPort: 9000
+              protocol: UDP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: gabion-nginx
+---
+# Clients reach nginx on `http`; discovery finds the peers through the UDP
+# port named `gabion`, which must keep that name and protocol.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gabion-nginx
+  namespace: default
+  labels:
+    app: gabion-nginx
+    app.kubernetes.io/part-of: gabion
+spec:
+  selector:
+    app: gabion-nginx
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: gabion
+      port: 9000
+      targetPort: gabion
+      protocol: UDP

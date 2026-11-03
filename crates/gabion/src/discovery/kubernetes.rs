@@ -58,6 +58,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                     Ok(client) => client,
                     Err(err) => {
                         tracing::warn!(
+                            code = "kubernetes_unreachable",
                             error = %err,
                             "Could not connect to the Kubernetes API, so gabion \
                              cannot discover peers and this node's counts stay \
@@ -128,6 +129,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                             ServiceChange::Track(target) => {
                                 if let Entry::Vacant(slot) = watched.entry(target) {
                                     tracing::info!(
+                                        code = "gabion_service_found",
                                         namespace = %slot.key().namespace,
                                         service = %slot.key().service_name,
                                         "Found a gabion service in the cluster; \
@@ -150,6 +152,7 @@ impl PeerDiscovery for EndpointSliceDiscovery {
                                 // next poll, before it yields another event.
                                 if let Some((id, _cancel)) = watched.remove(&target) {
                                     tracing::info!(
+                                        code = "gabion_service_gone",
                                         namespace = %target.namespace,
                                         service = %target.service_name,
                                         "Gabion service is no longer reachable \

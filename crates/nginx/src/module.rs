@@ -40,6 +40,20 @@ use crate::shm::lease::now_millis;
 use crate::shm::queue::QueueEvent;
 use crate::shm::{Layout, MIN_AGGREGATE_CAPACITY, QueueSlot, ShmRegion};
 
+/// Report an `nginx -t` error at the line nginx is reading. The message ends
+/// with ` code=<code>`, the key of its entry in the NGINX README's
+/// configuration errors, as `tracing` lines end with their fields.
+macro_rules! conf_error {
+    ($cf:expr, code = $code:literal, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        ngx::ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            $cf,
+            concat!("gabion: ", $fmt, " code=", $code)
+            $(, $arg)*
+        )
+    };
+}
+
 static LEADER_THREAD: Mutex<Option<LeaderHandle>> = Mutex::new(None);
 
 thread_local! {
@@ -89,12 +103,12 @@ impl http::HttpModule for Module {
         let main = Module::main_conf_mut(unsafe { &*cf });
         let (Some(variable), Ok(index), Some(main)) = (variable, usize::try_from(index), main)
         else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: could not register `$gabion_decided`, the variable gabion uses to count \
-                 each request once across internal redirects. Look for an earlier error naming \
-                 it: another module may define `$gabion_decided` too."
+                code = "decided_variable_unregistered",
+                "could not register `$gabion_decided`, the variable gabion uses to count each \
+                 request once across internal redirects. Look for an earlier error naming it: \
+                 another module may define `$gabion_decided` too.",
             );
             return core::Status::NGX_ERROR.into();
         };
@@ -191,7 +205,7 @@ impl http::HttpModule for Module {
         let (gossip, storage) = match main.settings.validate() {
             Ok(valid) => valid,
             Err(error) => {
-                ngx::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "gabion: {}", error);
+                conf_error!(cf, code = "setting_invalid", "{}", error);
                 return core::Status::NGX_ERROR.into();
             }
         };
@@ -204,19 +218,18 @@ impl http::HttpModule for Module {
             match Layout::for_zone(bytes, unsafe { ngx_pagesize }, queue) {
                 Ok(layout) => main.layout = Some(layout),
                 Err(needed) => {
-                    ngx::ngx_conf_log_error!(
-                        NGX_LOG_EMERG,
+                    conf_error!(
                         cf,
-                        "gabion: `gabion_limit_zone` size {} bytes is too small to hold gabion's \
-                         request queue (`gabion_gossip_limit_queue_capacity` × {} bytes, {} \
-                         bytes) and at least {} counter slots. Raise SIZE to at least {}k, or \
-                         lower the queue capacity; the gabion NGINX README's zone-sizing notes \
-                         give the formula.",
+                        code = "limit_zone_too_small",
+                        "`gabion_limit_zone` size {} bytes is too small to hold gabion's request \
+                         queue (`gabion_gossip_limit_queue_capacity` × {} bytes, {} bytes) and at \
+                         least {} counter slots. Raise SIZE to at least {}k, or lower the queue \
+                         capacity; the gabion NGINX README's zone-sizing notes give the formula.",
                         bytes,
                         size_of::<QueueSlot>(),
                         queue.next_power_of_two() * size_of::<QueueSlot>(),
                         MIN_AGGREGATE_CAPACITY,
-                        needed.div_ceil(1024)
+                        needed.div_ceil(1024),
                     );
                     return core::Status::NGX_ERROR.into();
                 }
@@ -228,12 +241,12 @@ impl http::HttpModule for Module {
         // from it read them, and a reload compiles fresh ones.
         if !main.rules.is_empty() {
             if main.zone_bytes.is_none() {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: rules are declared but `gabion_limit_zone` is not set, so no request \
-                     would ever be counted or limited: the zone is the shared memory that holds \
-                     the counts. Add `gabion_limit_zone zone=gabion:64m;` to the http {{}} block."
+                    code = "rules_without_limit_zone",
+                    "rules are declared but `gabion_limit_zone` is not set, so no request would \
+                     ever be counted or limited: the zone is the shared memory that holds the \
+                     counts. Add `gabion_limit_zone zone=gabion:2m;` to the http {{}} block.",
                 );
                 return core::Status::NGX_ERROR.into();
             }
@@ -241,7 +254,7 @@ impl http::HttpModule for Module {
             match CompiledRules::compile_with(&main.rules, &storage, &mut compiler) {
                 Ok(rules) => main.compiled = Some(Arc::new(rules)),
                 Err(error) => {
-                    ngx::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "gabion: {}", error);
+                    conf_error!(cf, code = "rule_compile_failed", "{}", error);
                     return core::Status::NGX_ERROR.into();
                 }
             }
@@ -727,58 +740,60 @@ extern "C" fn set_zone(
     unsafe {
         let main = &mut *(conf as *mut MainConfig);
         if main.zone_bytes.is_some() {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` declared twice; only one zone is supported per http \
-                 {{}} block"
+                code = "limit_zone_declared_twice",
+                "`gabion_limit_zone` is declared twice in this http {{}} block, but gabion keeps \
+                 one limit zone per block. Remove one and size the other for every rule (the \
+                 zone-sizing notes in the gabion NGINX README).",
             );
             return core::NGX_CONF_ERROR;
         }
         let Some(arg) = single_arg(cf) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` requires one argument of the form `zone=NAME:SIZE` \
-                 (e.g. `zone=api:128m`)"
+                code = "limit_zone_arg_count",
+                "`gabion_limit_zone` takes one argument, `zone=NAME:SIZE` (for example \
+                 `zone=api:2m`). Write it in that form, then run `nginx -t`.",
             );
             return core::NGX_CONF_ERROR;
         };
         let Some(rest) = arg.strip_prefix("zone=") else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` argument must start with `zone=` (e.g. \
-                 `zone=api:128m`)"
+                code = "limit_zone_missing_prefix",
+                "`gabion_limit_zone` argument must start with `zone=` (for example \
+                 `zone=api:2m`). Write it as `zone=NAME:SIZE`, then run `nginx -t`.",
             );
             return core::NGX_CONF_ERROR;
         };
         let Some((name, size)) = rest.split_once(':') else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` value `{}` is missing `:SIZE` (e.g. `zone=api:128m`)",
-                rest
+                code = "limit_zone_missing_size",
+                "`gabion_limit_zone` value `{}` is missing `:SIZE` (for example `zone=api:2m`). \
+                 Write it as `zone=NAME:SIZE`, then run `nginx -t`.",
+                rest,
             );
             return core::NGX_CONF_ERROR;
         };
         if !is_zone_name(name) {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` zone name `{}` must match `[A-Za-z0-9_]+` (matches \
-                 nginx core's `limit_req_zone` grammar)",
-                name
+                code = "limit_zone_bad_name",
+                "`gabion_limit_zone` zone name `{}` must match `[A-Za-z0-9_]+` (matches nginx \
+                 core's `limit_req_zone` grammar). Rename the zone, then run `nginx -t`.",
+                name,
             );
             return core::NGX_CONF_ERROR;
         }
         let Ok(bytes) = parse_size_bytes(size) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit_zone` size `{}` is not a valid byte count (use suffix \
-                 k/m/g)",
-                size
+                code = "limit_zone_bad_size",
+                "`gabion_limit_zone` size `{}` is not a valid byte count. Write a number with the \
+                 suffix k, m or g, for example `2m`; then run `nginx -t`.",
+                size,
             );
             return core::NGX_CONF_ERROR;
         };
@@ -841,6 +856,7 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
         None => {
             if LEADER_THREAD.lock().is_ok_and(|slot| slot.is_some()) {
                 tracing::error!(
+                    code = "limit_zone_change_needs_restart",
                     "gabion: this reload changes `gabion_limit_zone`, but with `master_process \
                      off` the running leader thread still uses the old zone, which nginx is about \
                      to free. nginx keeps the previous configuration. Restart nginx to change the \
@@ -855,6 +871,7 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
             let base = unsafe { ngx_slab_alloc(zone.shm.addr.cast(), layout.total_bytes) };
             if base.is_null() {
                 tracing::error!(
+                    code = "limit_zone_no_room",
                     zone_bytes = zone.shm.size,
                     needed_bytes = layout.total_bytes,
                     "gabion: the `gabion_limit_zone` zone had no room for gabion's state, so \
@@ -926,11 +943,11 @@ extern "C" fn set_rule(
         let mut words = Vec::with_capacity(nelts);
         for index in 1..nelts {
             let Ok(word) = (*args.add(index)).to_str() else {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit_rule` has an argument that is not valid UTF-8; re-save \
-                     the file as UTF-8, then run `nginx -t`"
+                    code = "directive_arg_not_utf8",
+                    "an argument of `gabion_limit_rule` is not valid UTF-8, which gabion cannot \
+                     read. Re-save the file as UTF-8, then run `nginx -t`.",
                 );
                 return core::NGX_CONF_ERROR;
             };
@@ -942,11 +959,11 @@ extern "C" fn set_rule(
                 core::NGX_CONF_OK
             }
             Err(error) => {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit_rule` {}",
-                    error
+                    code = "limit_rule_invalid",
+                    "`gabion_limit_rule` {}",
+                    error,
                 );
                 core::NGX_CONF_ERROR
             }
@@ -981,20 +998,22 @@ extern "C" fn set_limit(
     unsafe {
         let location = &mut *(conf as *mut LocationConfig);
         let Some(main) = Module::main_conf(&*cf) else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit` could not access the main config"
+                code = "limit_main_conf_missing",
+                "`gabion_limit` could not read gabion's http-level configuration, which nginx \
+                 always provides. This is a gabion bug: report it with your nginx version.",
             );
             return core::NGX_CONF_ERROR;
         };
         let args = (*(*cf).args).elts as *mut ngx_str_t;
         let nelts = (*(*cf).args).nelts;
         if args.is_null() || nelts < 2 {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion_limit` requires at least one rule name (or `off`)"
+                code = "limit_missing_rule",
+                "`gabion_limit` names no rule. List rules declared with `gabion_limit_rule`, or \
+                 write `gabion_limit off;` to turn them off here.",
             );
             return core::NGX_CONF_ERROR;
         }
@@ -1003,20 +1022,22 @@ extern "C" fn set_limit(
         let first = match (*args.add(1)).to_str() {
             Ok(s) => s,
             Err(_) => {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit` argument is not valid UTF-8"
+                    code = "directive_arg_not_utf8",
+                    "an argument of `gabion_limit` is not valid UTF-8, which gabion cannot read. \
+                     Re-save the file as UTF-8, then run `nginx -t`.",
                 );
                 return core::NGX_CONF_ERROR;
             }
         };
         if first == "off" {
             if nelts != 2 {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit off` does not take additional arguments"
+                    code = "limit_off_mixed",
+                    "`gabion_limit off` turns off every rule at this level, so it takes no rule \
+                     names. Write `gabion_limit off;` alone, or list only rule names.",
                 );
                 return core::NGX_CONF_ERROR;
             }
@@ -1032,28 +1053,31 @@ extern "C" fn set_limit(
         let indices = location.rule_indices.get_or_insert_with(Vec::new);
         for i in 1..nelts {
             let Ok(rule_name) = (*args.add(i)).to_str() else {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit` rule name is not valid UTF-8"
+                    code = "directive_arg_not_utf8",
+                    "an argument of `gabion_limit` is not valid UTF-8, which gabion cannot read. \
+                     Re-save the file as UTF-8, then run `nginx -t`.",
                 );
                 return core::NGX_CONF_ERROR;
             };
             if rule_name == "off" {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit off` cannot be mixed with rule names"
+                    code = "limit_off_mixed",
+                    "`gabion_limit off` turns off every rule at this level, so it takes no rule \
+                     names. Write `gabion_limit off;` alone, or list only rule names.",
                 );
                 return core::NGX_CONF_ERROR;
             }
             let Some(index) = main.rules.iter().position(|r| r.name.as_ref() == rule_name) else {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion_limit` references rule `{}`, which is not declared via \
-                     `gabion_limit_rule`",
-                    rule_name
+                    code = "limit_unknown_rule",
+                    "`gabion_limit` references rule `{}`, which no `gabion_limit_rule` in this \
+                     http {{}} block declares. Usually a typo, or a rule in a file this block \
+                     does not include. Declare it or correct the name.",
+                    rule_name,
                 );
                 return core::NGX_CONF_ERROR;
             };
@@ -1082,18 +1106,19 @@ extern "C" fn set_gabion(
         let location = &mut *(conf as *mut LocationConfig);
         let args = (*(*cf).args).elts as *mut ngx_str_t;
         if args.is_null() || (*(*cf).args).nelts != 2 {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion` requires exactly one argument (`on` or `off`)"
+                code = "gabion_arg_count",
+                "`gabion` takes one argument. Write `gabion on;` or `gabion off;`.",
             );
             return core::NGX_CONF_ERROR;
         }
         let Ok(value) = (*args.add(1)).to_str() else {
-            ngx::ngx_conf_log_error!(
-                NGX_LOG_EMERG,
+            conf_error!(
                 cf,
-                "gabion: `gabion` argument is not valid UTF-8"
+                code = "directive_arg_not_utf8",
+                "an argument of `gabion` is not valid UTF-8, which gabion cannot read. Re-save \
+                 the file as UTF-8, then run `nginx -t`.",
             );
             return core::NGX_CONF_ERROR;
         };
@@ -1101,11 +1126,11 @@ extern "C" fn set_gabion(
             "on" => location.off = Some(false),
             "off" => location.off = Some(true),
             other => {
-                ngx::ngx_conf_log_error!(
-                    NGX_LOG_EMERG,
+                conf_error!(
                     cf,
-                    "gabion: `gabion {}` is not a valid value; use `on` or `off`",
-                    other
+                    code = "gabion_bad_value",
+                    "`gabion {}` is not a valid value; use `on` or `off`",
+                    other,
                 );
                 return core::NGX_CONF_ERROR;
             }
@@ -1137,19 +1162,19 @@ extern "C" fn set_setting(
         )
     };
     let Some(value) = value else {
-        ngx::ngx_conf_log_error!(
-            NGX_LOG_EMERG,
+        conf_error!(
             cf,
-            "gabion: the argument of `{}` is not valid UTF-8, which gabion cannot read. Write it \
-             as plain text, then run `nginx -t`.",
-            setting.nginx_directive().unwrap_or(setting.yaml_key())
+            code = "directive_arg_not_utf8",
+            "an argument of `{}` is not valid UTF-8, which gabion cannot read. Re-save the file \
+             as UTF-8, then run `nginx -t`.",
+            setting.nginx_directive().unwrap_or(setting.yaml_key()),
         );
         return core::NGX_CONF_ERROR;
     };
     match main.settings.apply(setting, value) {
         Ok(()) => core::NGX_CONF_OK,
         Err(error) => {
-            ngx::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "gabion: {}", error);
+            conf_error!(cf, code = "directive_bad_value", "{}", error);
             core::NGX_CONF_ERROR
         }
     }
@@ -1306,6 +1331,7 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
             // Panicking here would unwind into nginx's C frame, so log and
             // leave the worker up without a leader thread.
             tracing::error!(
+                code = "leader_spawn_failed",
                 worker_id,
                 %error,
                 "gabion: failed to spawn the leader thread. Usually the host \
@@ -1323,7 +1349,11 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         *slot = Some(handle);
     }
     watch_for_shutdown();
-    tracing::info!(worker_id, "gabion: leader thread spawned");
+    tracing::info!(
+        code = "leader_thread_spawned",
+        worker_id,
+        "gabion: leader thread spawned"
+    );
     core::Status::NGX_OK.into()
 }
 
@@ -1349,7 +1379,10 @@ fn watch_for_shutdown() {
         if let Ok(slot) = LEADER_THREAD.lock()
             && let Some(handle) = slot.as_ref()
         {
-            tracing::info!("gabion: worker is shutting down; stopping its leader thread");
+            tracing::info!(
+                code = "leader_thread_stopping",
+                "gabion: worker is shutting down; stopping its leader thread"
+            );
             handle.request_stop();
         }
     })
@@ -1379,6 +1412,7 @@ unsafe extern "C" fn gabion_exit_process(cycle: *mut ngx_cycle_t) {
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("panic payload is not a string");
         tracing::error!(
+            code = "leader_panicked",
             panic,
             "gabion: leader thread panicked, so this worker had stopped campaigning for the \
              leader lease before it exited. Other workers still campaign and take over gossip. \

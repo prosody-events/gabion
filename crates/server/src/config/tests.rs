@@ -677,3 +677,31 @@ fn rule_def_rejects_what_both_adapters_rejected() {
         }
     }
 }
+
+/// Every setting has a row in the gabiond configuration reference naming its
+/// key and environment variable, and its default when it has one.
+#[test]
+fn every_setting_is_in_the_reference() {
+    let readme = include_str!("../../README.md");
+    for &setting in Setting::ALL {
+        let key = format!("`{}`", setting.yaml_key());
+        let env = format!("`{}`", setting.env_var());
+        let row: Vec<&str> = readme
+            .lines()
+            .map(|line| line.split('|').map(str::trim).collect::<Vec<_>>())
+            .find(|cells| {
+                cells.get(1) == Some(&key.as_str()) && cells.get(2) == Some(&env.as_str())
+            })
+            .unwrap_or_else(|| {
+                panic!("crates/server/README.md has no reference row for {key} {env}")
+            });
+        if let Some(default) = setting.default_text() {
+            let default = format!("`{default}`");
+            assert_eq!(
+                row.get(3).copied(),
+                Some(default.as_str()),
+                "{key}'s default"
+            );
+        }
+    }
+}

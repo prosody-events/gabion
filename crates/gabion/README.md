@@ -5,30 +5,34 @@ the CRDT, the gossip runtime, the wire codec, the rule machinery, and the
 discovery interface, while knowing nothing about YAML, gRPC, or nginx.
 Both adapters in the workspace (`gabion-server` and `gabion-nginx`) build
 their configuration on top of the same library types and call the same
-hot paths.
+hot paths. This README is also the crate's rustdoc front page.
 
-This README is the canonical guide to the library. If you want to
-understand how the cluster stays consistent, how a packet is shaped, or
-which knob to turn when an operator asks, read it end-to-end. For the
-CRDT data structures behind the gossip protocol, see [`CRDT.md`](CRDT.md).
-For cross-adapter vocabulary (rule, descriptor, bucket, fail-open), see
-the [repo root README](../../README.md#glossary).
+Read this README for what an operator sets and why: the knobs, the sizing,
+zones, writing one rule for both adapters, and upgrading. The protocol
+itself, two tiers of gossip and the wire format byte by byte, is in
+[`GOSSIP.md`](GOSSIP.md); the counter store behind it in
+[`CRDT.md`](CRDT.md); every log message the library writes, and what to do
+about it, in [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md). For cross-adapter
+vocabulary (rule, descriptor, bucket, zone, gateway, fail-open), see the
+[repo root README](../../README.md#glossary).
 
 ## Contents
 
 - [Module map](#module-map)
-- [How gossip works](#how-gossip-works)
-  - [The wire frame](#the-wire-frame)
-  - [The anti-entropy loop](#the-anti-entropy-loop)
-  - [Streams, acks and join sweeps](#streams-acks-and-join-sweeps)
-  - [Adaptive emit rate](#adaptive-emit-rate)
+- [Embedding the runtime](#embedding-the-runtime)
+- [How a change travels](#how-a-change-travels)
 - [Writing the same rule for NGINX and gabiond](#writing-the-same-rule-for-nginx-and-gabiond)
 - [Zones](#zones)
   - [Outside Kubernetes](#outside-kubernetes)
   - [Testing zones in kind](#testing-zones-in-kind)
 - [Operator knobs](#operator-knobs)
+  - [Common](#common)
+  - [Advanced](#advanced)
+  - [Peer table](#peer-table)
+  - [Socket buffers](#socket-buffers)
+- [Sizing](#sizing)
+- [Upgrading](#upgrading)
 - [What we measured](#what-we-measured)
-- [References](#references)
 
 ## Module map
 
@@ -41,11 +45,12 @@ a DAG, so no module imports from a module that imports it.
 | `crdt`       | `src/crdt/*`                  | The per-origin counter store. Robin Hood hash index, structure-of-arrays columns, the ordered own-stream list. Allocates only at construction. See [`CRDT.md`](CRDT.md). |
 | `rules`      | `src/rules/*`                 | `RuleDef::build` and `RuleTable::new`, the one way both adapters build rules; `Descriptor`, fingerprint and key hashing. Two nodes with the same rules produce identical `rule_fingerprint` values and key hashes, whatever order they list them in, which is what makes the CRDT addressable across the cluster. |
 | `aggregate`  | `src/aggregate.rs`            | The cluster-aggregate table both adapters read on admission: seqlocked slots, linear probing within 128 slots of home, backward-shift removal. NGINX lays it over shared memory; `gabiond` owns one as `Aggregate`, sized from `storage.max_cells`. |
-| `gossip`     | `src/gossip/*`                | `GossipRuntime`, `GossipClient`, `GossipTransport`, `Clock`, the `sim::SimTransport` used in tests, the pre-sized peer table, and the `AdminCommand` / `AdminSnapshot` observability surface. |
-| `wire`       | `src/wire/*`                  | The on-the-wire codec. One UDP packet = header + rule dictionary + node dictionary + cell rows. Each packet decodes independently. |
+| `window`     | `src/window.rs`               | The sliding-window header math both adapters share: the time until a request would be admitted, `Retry-After` and the reset seconds. |
+| `gossip`     | `src/gossip/*`                | `GossipRuntime`, `GossipClient`, `GossipTransport`, `Clock`, the `sim::SimTransport` used in tests, the pre-sized peer table, and the `AdminCommand` / `AdminSnapshot` observability surface. See [`GOSSIP.md`](GOSSIP.md). |
+| `wire`       | `src/wire/*`                  | The on-the-wire codec. One UDP packet = header + rule dictionary + node dictionary + cell rows. Each packet decodes independently. See [`GOSSIP.md`](GOSSIP.md#wire-format-version-2). |
 | `discovery`  | `src/discovery/*`             | `Membership` (Kubernetes, a static list, or alone), whose `peer_events` both adapters feed the runtime; the `PeerDiscovery` trait and the Kubernetes EndpointSlice implementation, which finds the node's own entry by `SelfMatch` and reports its zone as `PeerEvent::OwnEntry`. The gossip runtime treats peer events as a normal `select!` arm. |
 | `zone`       | `src/zone.rs`                 | `ZoneName` and the 4-byte `ZoneHash` every header carries, and `ZoneStatus`: the node's zone and its source, or why none is known. |
-| `defaults`   | `src/defaults.rs`             | Constants shared by both adapters: tick interval, payload caps, the per-rule error budget, the min-emit floor, and the stream and sweep constants (gap reports, sweep sources, the backlog that sizes the per-round quantum). |
+| `defaults`   | `src/defaults.rs`             | Constants shared by both adapters, each documented with its unit, the memory it sizes and the message that names it: tick interval, payload caps, the per-rule error budget, the min-emit floor, and the stream and sweep constants (gap reports, sweep sources, the backlog that sizes the per-round quantum). |
 | `settings`   | `src/settings.rs`             | Every operator setting named once: `gabiond` YAML key, environment variable and NGINX directive. Messages interpolate from it so each names both adapters' spellings. |
 | `throttle`   | `src/throttle.rs`             | The one power-of-two log throttle every repeating warning counts through. |
 | `identity`   | `src/identity.rs`             | This host's stable node id, and an incarnation that differs on every start (wall-clock milliseconds, stepped past the previous one). Behind `transport-udp`. |
@@ -57,321 +62,101 @@ them, and they import nothing else in this crate. Adapters consume the public su
 `gossip`, `rules`, and `discovery`, together with the constants in
 `defaults`.
 
-## How gossip works
+## Embedding the runtime
 
-Gossip is the protocol that turns N independent counter stores into one
-*eventually consistent* counter store. Every node admits requests
-against its local view of the cluster aggregate, and gossip is what
-keeps that view fresh. From the adapter's side it shows up as a single
-call: admission writes a row through `GossipClient::record`, and a
-later runtime round turns those rows into outbound frames.
+Both adapters do what this example does: validate the settings once, build
+the rules, the counter store, the aggregate table that admission reads and a
+gossip runtime, then decide each request against the table and record what it
+admits. The example runs two nodes on the in-memory `SimTransport`, as the
+tests do; a production node binds UDP with `GossipRuntime::bind` instead.
+`tests/readme.rs` runs this code, and keeps this copy equal to it.
 
-The protocol has two parts, and they are the reason gabion holds up under
-load that a textbook anti-entropy loop would not:
+```rust,ignore
+let router = SimRouter::new();
+let [a, b]: [SocketAddr; 2] =
+    ["10.0.0.1:9000", "10.0.0.2:9000"].map(|addr| addr.parse().expect("an address"));
+// One node: its settings, its rule, its counter store, the aggregate
+// table admission reads, and its gossip runtime.
+let start = |id: u128, me: SocketAddr, peer: SocketAddr| {
+    let settings = Settings {
+        gossip_bind: Some(me),
+        bootstrap_peers: Box::new([peer]),
+        ..Settings::default()
+    };
+    let (gossip, storage) = settings.validate().expect("valid settings");
+    let rule = RuleDef {
+        name: "per_tenant",
+        domain: "api",
+        patterns: &[("tenant", "*")],
+        rate: "100r/m",
+        window: None,
+        bucket: None,
+        mode: EnforcementMode::Enforce,
+    }
+    .build(&storage.cardinality)
+    .expect("valid rule");
+    let rules = RuleTable::new(Box::new([rule]), storage.rule_dictionary_capacity())
+        .expect("the rules fit");
+    let store = CellStore::new(storage, NodeIdentity::new(NodeId(id), 1), &rules);
+    let counts = Rc::new(Aggregate::new(&storage));
+    let (runtime, client) = GossipRuntime::from_parts(
+        router.bind(me),
+        TokioClock::from_millis(0),
+        gossip,
+        store,
+        Rc::clone(&counts),
+    );
+    tokio::task::spawn_local(runtime.run(futures::stream::empty()));
+    (rules, counts, client)
+};
+let (rules, a_counts, a_client) = start(1, a, b);
+let (_, b_counts, _b_client) = start(2, b, a);
 
-1. **Acknowledged streams in two tiers** — each node sends the cells it
-   originated straight to every peer of its zone, and, flagged
-   `RELAY_INTO_ZONE`, to one *gateway* in each other zone, chosen by
-   rendezvous hashing so origins spread over a zone's members. The gateway
-   relays them to the rest of its zone on a second stream. Every stream is
-   per peer and acknowledged cumulatively; a gap report or a heartbeat
-   without an ack brings a resend, so a lost packet costs one round, not a
-   lifetime. A peer whose zone is none gets everything directly. A peer not
-   yet heard from is routed by the zone discovery reports for it (a
-   Kubernetes EndpointSlice endpoint's `zone`) until it is first heard;
-   from then on its headers' zone wins, even none; one with neither gets
-   only the cells raised since it was
-   added, greeted with `PROBE` each heartbeat until it answers with its zone.
-   A node that starts asks two peers for a *join sweep* of every live cell.
-2. **Adaptive emit rate** — the gossip cadence adapts to per-rule
-   pressure. Heartbeats fire every `tick_interval` unconditionally, but
-   the runtime also fires a synthetic *threshold* tick between
-   heartbeats whenever a hot rule's locally unreplicated hits would
-   exceed its per-site error budget. The budget bounds cluster-wide
-   unreplicated error per rule by 1 % of the rule's limit (default), no
-   matter the request rate. A floor `min_emit_interval` caps the worst
-   case so an adversarial workload cannot pin the gossip socket.
-
-The rest of this section walks through each in turn.
-
-### The wire frame
-
-Every gossip packet is self-describing: each decodes independently, even
-if its predecessor was dropped. Loss of a packet costs you a few cells until a
-gap report or the retransmission timeout resends them.
-
-The header is fixed at 86 bytes, version 2. Every multi-byte field is
-encoded little-endian; the first four bytes on the wire are `0x32 0x47
-0x42 0x47` so a packet capture reads `2GBG`. (The numeric `MAGIC`
-literal `0x4742_4732` spells "GBG2" when written most-significant byte
-first; the LE encoding then writes those bytes in reverse.)
-
-```
-byte  field                  width
-----  ---------------------  -----
-0     MAGIC                  4   (0x4742_4732)
-4     VERSION                2   (= 2)
-6     kind                   1   (see below)
-7     flags                  1   (one meaning per bit; 0x80 must be 0)
-8     cluster_id_hash       16
-24    sender_node_id        16
-40    sender_incarnation     4
-44    sender_zone            4   (0 = no zone)
-48    cell_count             2
-50    ack_incarnation        4
-54    ack_own                8
-62    ack_relay              8
-70    stream_lower           8   (exclusive)
-78    stream_upper           8   (inclusive)
-----                       ----
-                            86
-```
-
-| Kind | Byte | Carries |
-|---|---|---|
-| `Ack` | 0 | header only |
-| `Own` | 1 | the sender's own stream, range `(lower, upper]` |
-| `Relay` | 2 | the sender's relay stream, range `(lower, upper]` |
-| `Sweep` | 3 | cells outside any stream; no range |
-| `SweepRequest` | 4 | header only |
-
-The decoder turns kind, flags and range into one typed payload and
-drops any combination the format forbids. A node sends its own stream as
-`Own` packets that tile the frame's range, acks and gap reports alone as
-`Ack`, and join sweeps as `SweepRequest` and `Sweep`; every data kind it
-receives merges the same way. `sender_zone` is the low 32 bits of the
-stable hash of the sender's zone name (`gabion::zone::ZoneName`), never 0;
-0 means the sender has no zone. A node takes each peer's zone from that
-peer's headers; until it has heard the peer, it uses the zone discovery
-reports for it, if any.
-
-The body follows immediately. When `cell_count > 0` it carries a
-*per-frame* rule dictionary, a per-frame node dictionary, and the cell
-rows. Each cell row references rule and node slots by `u8` index into
-those dictionaries (so the same fingerprint isn't repeated 4096 times),
-plus its `key_hash`, `bucket`, origin incarnation, `last_update_millis`
-and `count`, 38 bytes in all:
-
-```
-[rule_dict_len    : u8     ]    R rules in this frame (1–255)
-[rule_dict        : u128×R ]    rule fingerprints
-[node_dict_len    : u8     ]    D origins in this frame (1–255)
-[node_dict        : u128×D ]    origin node ids
-[rule_slot        : u8 ×N  ]    each < R
-[key_hash         : u128×N ]
-[bucket           : u32 ×N ]
-[node_slot        : u8 ×N  ]    each < D
-[origin_incarn.   : u32 ×N ]
-[last_update_ms   : u64 ×N ]
-[count            : u32 ×N ]
+// Admission on node A: read the cluster total, decide, record the hit.
+let spec = rules.rules()[0].spec();
+let key = hash_key(
+    "api",
+    [Descriptor {
+        key: "tenant",
+        value: "acme",
+    }],
+);
+let now = 0;
+if a_counts.table().window_total(spec, key, now) < spec.limit {
+    let bucket = spec.bucket_at(now);
+    a_client
+        .record(spec.fingerprint, key, bucket, 1, spec.limit, now)
+        .await
+        .expect("the runtime is running");
+}
+// Gossip carries the hit to node B within a heartbeat.
+sim_advance_ticks(Duration::from_millis(10), 100).await;
+assert_eq!(b_counts.table().window_total(spec, key, now), 1);
 ```
 
-An `Ack`, a `SweepRequest`, or an `Own` or `Relay` packet with no cells
-has an empty body. Nothing follows the body: packets are not
-authenticated, so isolate the gossip port with a NetworkPolicy (see the
-[root README](../../README.md#running-across-a-cluster)).
+## How a change travels
 
-The decoder checks the size, the header's length, magic, version, kind,
-flags and range, then the cluster id, and only then the body, so a
-packet from another protocol version or another cluster is dropped
-before any cell is read, and logged (`peer_version_mismatch`,
-`decode_rejected`; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
+A hit admitted on one node changes one counter cell of that node. Gossip
+sends the change in two tiers: straight to every other node of the same
+availability zone, and to one *gateway* in each other zone, which relays it to
+the rest of its zone. So each change crosses each zone boundary once, while a
+flat mesh would send it across once per remote node. Every stream is
+acknowledged: a lost packet is resent on the next round, and a node that
+stops answering is routed around within a few seconds. A node of no zone
+gets every change directly, so counts stay correct without zones; only the
+cross-zone saving is lost.
 
-The codec lives in `src/wire/{header,body}.rs`. Its `FrameLimits` can
-only be built with a payload between 158 and 65,507 bytes, and the
-runtime takes it from the validated `gossip.max_payload_bytes`, which
-defaults to 1400 bytes (the safe IPv4 MSS floor), so frames stay well
-below the path MTU and avoid IP fragmentation. A 1,400-byte packet
-holds 33 cells of one rule and one origin; that same bound caps what a
-received packet may carry, so no cell count is configured. Frames larger
-than the cap split into multiple packets at the sender, and each packet
-is independently decodable.
+What that costs, measured in the study for the design this release ships
+(95 % credible intervals; [What we measured](#what-we-measured)):
 
-### The anti-entropy loop
+| Regime | Bytes sent per node | Of which cross-zone | Convergence p99 |
+|---|---|---|---|
+| `prod-typical`, 80 pods in 3 zones | 88.1 KB/s [87.7, 88.4] | 2.6 KB/s | 337 ms [307, 367] |
+| `prod-peak`, 183 pods in 3 zones | 236.6 KB/s [236.0, 237.1] | 3.0 KB/s | 301 ms [292, 309] |
 
-The runtime (`GossipRuntime`, in `src/gossip/runtime.rs`) is a
-single-threaded event loop driven by one `tokio::select!` with six arms:
-limit requests from the adapter, the heartbeat, the prompt-round pacer
-(polled only while a resend, gap report, probe answer or sweep waits),
-inbound packets, peer membership churn, and admin commands. A round
-first reads the datagrams already waiting, then serves every peer in one
-send loop, handing each packet to the socket as it is encoded; a packet
-the kernel refuses is held and retried first on the next round, and the
-cut round resumes from the peer it stopped at (see
-[Socket buffers](#socket-buffers)).
-After every iteration that produced delta or expiration rows, the
-runtime calls `aggregates.apply(...)` exactly once — that is the
-contract with the downstream rate-limit decision path. Empty iterations
-(an idle tick, a peer event with no CRDT effect) short-circuit the
-apply so the read side of the aggregate is never disturbed for no
-reason.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Adapter as Adapter (nginx / gabiond)
-    participant Runtime as GossipRuntime
-    participant Store as CellStore
-    participant Tx as UDP transport
-    participant Peer as Remote peer
-
-    Adapter->>Runtime: record(rule, key, hits, limit, now)
-    Runtime->>Runtime: handle_limit_request
-    Runtime->>Store: ingest_local(observation)
-    Store-->>Runtime: delta row + own-list relink
-    Note over Runtime: set want_immediate_flush<br/>if pending > ε_R
-    Runtime->>Adapter: aggregates.apply(deltas, expirations)
-
-    loop every round (heartbeat, threshold or prompt)
-        Runtime->>Runtime: round
-        Runtime->>Store: expire_at(now), heartbeats only
-        Runtime->>Store: stream_after(stream, peer's sent)
-        Store-->>Runtime: cells above it
-        Runtime->>Tx: encode + try_send_to(each peer)
-        Tx->>Peer: UDP frame
-        Runtime->>Adapter: aggregates.apply(expirations)
-    end
-
-    Peer->>Tx: UDP frame
-    Tx->>Runtime: recv_from
-    Runtime->>Store: merge_remote(observations, relay mark)
-    Store-->>Runtime: delta rows
-    Runtime->>Adapter: aggregates.apply(deltas, expirations)
-```
-
-`CellStore::merge_remote` performs the CRDT join: max-merge per
-`(origin, key, bucket)`, sum across origins.
-
-### Streams, acks and join sweeps
-
-Each node's own stream is its own cells in the order they last changed,
-numbered by `origin_sequence`; its relay stream is the remote cells it was
-asked to relay, numbered by a relay sequence drawn when each is marked. The
-cell store keeps each on one ordered list, so `stream_after(stream, sent)`
-reads what a peer has not been sent without a scan. Zone peers get both
-streams, a gateway the own stream flagged, other members of a remote zone
-neither, and a peer not yet heard from, of no zone discovery named, only the
-own cells raised since it was added. A flagged packet marks its cells for
-relay: all of them when its range ends above the receiver's *gateway* mark
-(so a new gateway relays what it held directly), else those the merge
-raised; any other packet takes the cells it raised off the relay list, since
-its sender is responsible for them. For each peer the runtime keeps `sent` and the peer's last ack,
-`acked`. Heartbeat and threshold rounds send each peer the cells above its
-`sent`, at most `q` a round, where `q` is `⌈storage.max_cells / 128⌉` or one
-packet, whichever is larger; a stream with more waiting goes on in the next
-prompt round. A frame holding every live cell up to the head closes the
-range through the head, so cells that expired unsent are not owed.
-
-The receiver keeps `have`, the highest position it holds contiguously, and
-returns it on every packet it sends back, or alone at its next heartbeat.
-A packet above `have` opens a gap (a direct one from a peer of another
-zone, sent before it heard this node's zone, is merged but opens none):
-after one relay floor (`min_emit_interval`) the receiver reports it, and the
-sender rewinds to the report's ack and resends on a prompt round. A gap
-reported four times without progress is abandoned until the next packet
-above `have` reopens it. A stream unacknowledged for
-one heartbeat times out and is resent with `PROBE`, which the peer answers
-on a prompt round. Acks name the incarnation they answer, so an ack written
-for a restarted process credits nothing; a peer's new incarnation resets
-both directions of its stream. The receiver keeps the own ranges it gets as
-the origin's gateway on a mark of their own, the gateway mark, and says which
-mark an ack carries (`ACK_AS_GATEWAY`); a gateway's acks count only as
-gateway acks, a zone peer's only as direct acks. A peer whose role changes so
-that it gains a stream is resent that stream from 0.
-
-A peer is *suspect* once a packet that asks for an answer (data, or a
-probe that retries it) has gone unanswered for `gossip.suspect_after` (by default four
-heartbeats and at least 2 s), judged after each round reads its waiting
-datagrams and never while the kernel holds a refused packet, whose held time
-does not count. A suspect ranks last for the gateway role, so its zone's
-next member takes over with the origin's whole live stream; its retries
-shrink to one 86-byte header-only probe per heartbeat, as do those to a
-gateway that has acked nothing since it took the role, and the first probe
-answer brings the resend at once. An origin that goes quiet sends its
-gateways nothing, so a gateway that dies meanwhile is replaced on the
-origin's next change, within `gossip.suspect_after` and a heartbeat of it. A
-gateway that cannot reach most of the zone peers it has heard sets
-`CANNOT_RELAY` on every packet, and origins that send to it fail over at
-once. A packet from an address outside the peer table is merged and never
-acked, but the cells a flagged one raised are relayed, so an origin's hits
-reach a zone whose gateway has not yet discovered it.
-
-A node that starts asks its two highest-weight peers it has heard from in
-its zone (or, once no peer is or may be of its zone, one heard peer of any
-zone; after `gossip.zone_grace` a peer not yet heard no longer counts, so a
-silent peer cannot keep a new zone's first node from sweeping) for a join
-sweep, greeting meanwhile the unheard peers of its zone
-and its unheard gateways,
-and asks again when its zone becomes known,
-retrying each heartbeat until a page arrives, and each source pages its live
-cells, `q` per prompt round, to at most `gossip.sweep_concurrency`
-requesters at a time. The sweep brings back the node's own previous-incarnation cells, which
-no stream carries.
-
-### Adaptive emit rate
-
-The heartbeat tick is bounded below by `tick_interval` (default
-500 ms). That cadence works for cold rules but is pessimistic for hot
-ones, because a saturating burst between two heartbeats could leak many
-admissions past the limit before the next tick. Lowering
-`tick_interval` for everyone is not an answer either: it costs
-bandwidth on every quiet rule in the cluster.
-
-The runtime crosses this trade with a per-rule error budget.
-`GossipRuntime::handle_limit_request` keeps a small `rule_pending`
-column indexed by rule slot; each admission adds its hits. The runtime
-also computes a per-site safe zone:
-
-```
-ε_R = max(1, L_R · target_err_bps / (10_000 · N))
-```
-
-where `L_R` is the rule's limit and `N` is the peer count. When
-`rule_pending` for that rule crosses `ε_R`, the runtime sets
-`want_immediate_flush = true`. On the next loop iteration the top of
-the run loop reads that flag (instead of waiting on `tick.tick()`) and
-dispatches a synthetic gossip tick straight away. Every round, heartbeat
-or threshold, first settles the budget: it zeroes each rule's pending
-column and stamps its `last_emit_ms`, even with no peers or a blocked
-socket, so neither turns each later request into another round.
-
-The constant `target_err_bps` is in basis points of each rule's own
-limit, default 100 = 1 %. The cluster-wide unreplicated error per rule
-is then bounded by `N · ε_R` (Sharfman, Schuster & Keren, SIGMOD 2006)
-— roughly 1 % of the rule's limit, regardless of the request rate.
-
-A floor `min_emit_interval` (default 5 ms) sits in front of the flush:
-the runtime won't set `want_immediate_flush` if the gap since the last
-emit is below the floor. Under adversarial traffic ε saturates to 1 and
-every hit would otherwise emit; the floor caps the worst-case emit rate
-so a bad client cannot pin the gossip socket.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> Accumulating: limit request<br/>adds hits to rule_pending
-    Accumulating --> Accumulating: pending ≤ ε_R
-    Accumulating --> ReadyToFire: pending > ε_R
-    ReadyToFire --> Idle: now − last_emit < min_emit_interval<br/>(floor blocks the emit)
-    ReadyToFire --> Emit: now − last_emit ≥ min_emit_interval
-    Emit --> Idle: synthetic tick dispatched,<br/>rule_pending reset,<br/>last_emit_ms stamped
-    Idle --> Emit: heartbeat tick<br/>(unconditional; drains cold rules)
-```
-
-Three operational properties fall out of this design. The cluster-wide
-unreplicated error per rule is bounded: at the default
-`target_err_bps = 100`, the global error never exceeds 1 % of the
-rule's limit no matter how fast requests come in. Cold rules still
-propagate, because the heartbeat is independent of the threshold path
-and any rule whose pending count never reaches ε_R still replicates
-every `tick_interval`. Finally, under an adversarial workload where ε
-saturates and every hit would otherwise emit, `min_emit_interval` caps
-the worst-case emit rate; convergence still happens, but the cluster
-absorbs the burst at a different bandwidth budget.
-
-`CRDT.md` documents the cell store end-to-end with traces, slot
-lifecycles, and invariant proofs. Read it once if you ever need to
-debug the CRDT.
+The previous design sent 790 KB/s per node across zones at `prod-peak`. How
+gateways are chosen, how failures are detected and the wire format are in
+[`GOSSIP.md`](GOSSIP.md).
 
 ## Writing the same rule for NGINX and gabiond
 
@@ -574,36 +359,60 @@ lists every smoke.
 
 ## Operator knobs
 
-Most deployments leave the defaults alone, because they are chosen to
-keep convergence well under a second at typical cluster sizes
-(≤ 256). The table below is for the days when you do need to tune, and
-it splits into the two adaptive halves of the protocol, then the socket
-buffers that carry it.
+Every setting has a default that works at `prod-peak` (183 pods) with
+headroom. The *common* settings are the ones most deployments set; the
+*advanced* ones are each listed with the log message that calls for them, so
+you reach one from a log line rather than by browsing. Each row gives the
+setting in all three spellings: the `gabiond` YAML key (also the `config_key`
+field of every message), its environment variable, and the NGINX directive
+(`none` for a `gabiond`-only setting). Memory is per node.
 
-### Heartbeat cadence and streams
+`gabion::settings` is the one table both adapters name, parse and validate
+every setting through, and `gabion::defaults` holds the defaults, so a
+changed default or bound moves both adapters together, and a bad value fails
+configuration load with the same message in both. The adapter references,
+[`gabiond`'s](../server/README.md#configuration-reference) and
+[NGINX's](../nginx/README.md#directive-reference), give each adapter's
+syntax.
 
-| Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
-|----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
-| `tick_interval`      | 500 ms      | Heartbeat cadence — period between proactive gossip ticks.                                                                             | Bigger clusters tolerate longer intervals; lower it only if you need sub-100 ms convergence on cold rules.    |
-| `suspect_after`      | `max(4 × tick_interval, 2 s)` | How long a packet to a peer may go unanswered before the peer is suspect: routed around as a gateway and sent only probes. At least two heartbeats. | Raise on a lossy network or with long pauses when `gateway_failover` warns often; lower for faster failover. |
-| `sweep_concurrency`  | 4           | Join sweeps this node answers at once; each pages `q` cells per prompt round.                                                          | Raise only if `sweep_declined` fires outside rollouts; each extra sweep adds a burst of packets to every prompt round while it runs. |
-| `max_payload_bytes`  | 1 400       | UDP datagram budget, 158 to 65 507 bytes. The codec splits a tick's frame across multiple packets when the cell list overflows.        | Lower if your network path has a tighter MTU; never raise past the IPv4 safe floor of 1400.                   |
+### Common
 
-### Per-rule error budget (adaptive emit rate)
+| Setting | Environment variable | NGINX directive | Default | Memory | What it sets; when to change it |
+|---|---|---|---|---|---|
+| `gossip.bind` | `GABION_GOSSIP_BIND` | `gabion_gossip_bind` | unset | — | The UDP address this node gossips on. `gabiond` needs it; an NGINX node without it counts alone. |
+| `gossip.bootstrap_peers` | `GABION_GOSSIP_BOOTSTRAP_PEERS` | `gabion_gossip_bootstrap_peers` | unset: Kubernetes discovery | — | Static peers, `ip:port`, for a cluster outside Kubernetes; a non-empty list replaces discovery ([Outside Kubernetes](#outside-kubernetes)). |
+| `gossip.zone` | `GABION_GOSSIP_ZONE` | `gabion_gossip_zone` | unset: from the node's EndpointSlice entry | — | This node's availability zone. Set it outside Kubernetes, or when `zone_unknown` says the entry has none ([Zones](#zones)). |
+| `discovery.namespace_allow` | `GABION_DISCOVERY_NAMESPACE_ALLOW` | `gabion_discovery_namespace_allow` | unset: the pod's own namespace | — | The namespaces Kubernetes discovery watches. |
+| `discovery.service_allow` | `GABION_DISCOVERY_SERVICE_ALLOW` | `gabion_discovery_service_allow` | unset: every Service with a UDP port named `gabion` | — | The Services discovery reads peers from. |
+| `discovery.self_addr` | `GABION_DISCOVERY_SELF_ADDR` | `gabion_discovery_self_addr` | unset: the entry is found by pod name | — | This pod's IP and gossip port; set it only for `hostNetwork` pods, whose host name is not their pod name. |
+| `envoy_bind` | `GABION_ENVOY_BIND` | none | unset: no gRPC listener | — | Where Envoy reaches `gabiond`'s rate-limit service. |
+| `admin_bind` | `GABION_ADMIN_BIND` | none | unset: no admin endpoint | — | `gabiond`'s `/snapshot` and `/readyz`; set it for a readiness probe. |
+| `gossip.cluster_id_hash` | `GABION_GOSSIP_CLUSTER_ID_HASH` | `gabion_gossip_cluster` | `1` | — | A non-zero id every node of one cluster shares; a node drops gossip carrying another. A label, not a secret. Set your own; `default_cluster_id` says when a node runs with the default. |
+| `runtime.node_id_seed` | `GABION_RUNTIME_NODE_ID_SEED` | `gabion_node_id_seed` | unset: the host name | — | The text this node's stable id is hashed from; the host name, else the outbound IP address, else a per-process seed. |
+| `gossip.peer_capacity` | `GABION_GOSSIP_PEER_CAPACITY` | `gabion_gossip_peer_capacity` | `512` | about 330 B a peer | The most peers a node gossips with, 1 to 32,767. Raise it past your largest pod count; `peer_table_full` names it. |
+| `storage.max_cells` | `GABION_STORAGE_MAX_CELLS` | `gabion_storage_max_cells` | `131072` | about 96 B a cell; `gabiond` adds 128 B for its aggregate table | Counter cells the store holds ([Sizing](#sizing)). Raise it on `cell_store_full` or, in `gabiond`, `aggregate_full`. |
+| `gossip.tick_interval` | `GABION_GOSSIP_TICK_INTERVAL` | `gabion_gossip_tick_interval` | `500ms` | — | The heartbeat, also the retransmission timeout. It sets the convergence tail of a quiet rule; `setting_warning` warns below 20 ms, near a cross-zone round trip. |
+| `gossip.target_err_bps` | `GABION_GOSSIP_TARGET_ERR_BPS` | `gabion_gossip_target_err_bps` | `100` | — | Per-rule error budget in basis points of the rule's limit, 1 to 10,000: 100 bounds the cluster's unreplicated hits per rule at 1 % of its limit. Lower for tighter limits, higher to send less. |
+| `storage.max_descriptor_count` | `GABION_STORAGE_MAX_DESCRIPTOR_COUNT` | `gabion_storage_max_descriptor_count` | `16` | — | Descriptors one rule may declare, up to 65,535; a longer rule fails to load. |
+| `storage.max_descriptor_bytes` | `GABION_STORAGE_MAX_DESCRIPTOR_BYTES` | `gabion_storage_max_descriptor_bytes` | `512` | — | Bytes of domain, keys and values one request's descriptor may carry; past it the request is rejected as `cardinality_rejected` (NGINX answers 400). |
+| `storage.max_key_bytes` | `GABION_STORAGE_MAX_KEY_BYTES` | `gabion_storage_max_key_bytes` | `128` | — | Bytes in one descriptor key: a longer key fails to load, or rejects the request (`cardinality_rejected`). |
+| `storage.max_request_descriptors` | `GABION_STORAGE_MAX_REQUEST_DESCRIPTORS` | none | `16` | — | Descriptors of one Envoy request `gabiond` evaluates; the rest are rejected as `cardinality_rejected`. |
 
-| Knob                 | Default     | What it controls                                                                                                                       | When to tune                                                                                                  |
-|----------------------|-------------|----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
-| `target_err_bps`     | 100 (= 1 %) | Per-rule error budget in basis points of the rule's limit, 1 to 10 000. Tighter = more threshold fires, looser = more local lag.       | Lower if a hot rule needs tighter convergence than 1 %; higher if bandwidth is the bottleneck.                |
-| `min_emit_interval`  | 5 ms        | Floor between two threshold-fire emissions, at least 1 ms and below `tick_interval`. Caps worst-case emit rate when ε saturates under adversarial load. | Raise if a bad client is pinning the gossip socket.                                                            |
+### Advanced
 
-The `gabion::defaults` module holds these defaults, and `gabion::settings`
-is the one table both adapters name, parse and validate every setting
-through: each row gives the YAML key, the environment variable and the
-NGINX directive, so if you change a default or a bound the two adapters
-move together, and a bad value fails configuration load with the same
-message in both. See [`crates/server/README.md`](../server/README.md)
-for the YAML keys and [`crates/nginx/README.md`](../nginx/README.md) for
-the directives.
+| Setting | Environment variable | NGINX directive | Default | Memory | Change it when |
+|---|---|---|---|---|---|
+| `gossip.recv_buffer_bytes` | `GABION_GOSSIP_RECV_BUFFER_BYTES` | `gabion_gossip_recv_buffer_bytes` | `4194304` | kernel memory, up to twice the grant while full | `socket_buffer_capped` says the host granted less: raise `net.core.rmem_max`, or set this to the grant ([Socket buffers](#socket-buffers)). |
+| `gossip.send_buffer_bytes` | `GABION_GOSSIP_SEND_BUFFER_BYTES` | `gabion_gossip_send_buffer_bytes` | `1048576` | kernel memory, up to twice the grant while full | `socket_buffer_capped`, or `send_blocked` repeats. |
+| `gossip.limit_queue_capacity` | `GABION_GOSSIP_LIMIT_QUEUE_CAPACITY` | `gabion_gossip_limit_queue_capacity` | `8192` | NGINX: 72 B a slot of the limit zone, rounded up to a power of two | `queue_dropped` (NGINX) or `request_queue_full` (`gabiond`): counted hits were dropped. |
+| `storage.node_dictionary_capacity` | `GABION_STORAGE_NODE_DICTIONARY_CAPACITY` | `gabion_storage_node_dictionary_capacity` | twice `gossip.peer_capacity` | — | `node_dictionary_full`: more peer instances live at once than it holds, as with long windows and frequent rollouts. |
+| `storage.rule_dictionary_capacity` | `GABION_STORAGE_RULE_DICTIONARY_CAPACITY` | `gabion_storage_rule_dictionary_capacity` | max(256, 2 × configured rules) | — | `rule_dictionary_full`: more distinct rules live across the cluster than it holds. |
+| `storage.max_matched_rules` | `GABION_STORAGE_MAX_MATCHED_RULES` | `gabion_storage_max_matched_rules` | `16` | 32 B a rule per `gabiond` runtime thread, 64 B per NGINX worker | `matched_rule_overflow`: a request matched more rules than are counted. |
+| `gossip.suspect_after` | `GABION_GOSSIP_SUSPECT_AFTER` | `gabion_gossip_suspect_after` | `max(4 × tick_interval, 2s)` | — | `gateway_failover` repeats on a lossy network or with long pauses: raise it. At least two heartbeats. |
+| `gossip.sweep_concurrency` | `GABION_GOSSIP_SWEEP_CONCURRENCY` | `gabion_gossip_sweep_concurrency` | `4` | — | `sweep_declined` outside rollouts. |
+| `gossip.zone_grace` | `GABION_GOSSIP_ZONE_GRACE` | `gabion_gossip_zone_grace` | `10s` | — | `zone_unknown` on Kubernetes while the pod's EndpointSlice entry is merely slow to appear. |
+| `gossip.max_payload_bytes` | `GABION_GOSSIP_MAX_PAYLOAD_BYTES` | `gabion_gossip_max_payload_bytes` | `1400` | — | `decode_rejected` with `reason = "peer_limits"`: nodes disagree on it. Set one value on every node, 158 to 65,507, below your path MTU less 28 bytes. |
+| `gossip.min_emit_interval` | `GABION_GOSSIP_MIN_EMIT_INTERVAL` | `gabion_gossip_min_emit_interval` | `5ms` | — | `/snapshot`'s `rounds_threshold`, `rounds_prompt` and `packets_sent` climb far above normal under a flood of hits: this floor caps a node's packet rate ([Sizing](#sizing)); doubling it halves the ceiling's main terms. |
 
 ### Peer table
 
@@ -638,21 +447,179 @@ silences the warning. `send_blocked` means the send buffer filled during a
 round: the round stopped there, and the next round sends the refused packet
 first, then the rest.
 
+## Sizing
+
+These equations are the design's model of a node. The packet equation
+predicts the study's measured packets and bytes within 1.3 % at 80, 183 and
+300 pods; the rest size the defaults with the headroom shown. `N` is the
+pods in the cluster, `Z` the zones, `T` the heartbeat (`gossip.tick_interval`)
+and `Λ` the hits per second the whole cluster admits.
+
+**Cells.** A cell counts one key's hits in one bucket from one origin node.
+A rule with window `W` and bucket `b` keeps `W / b + 1` buckets live, so
+
+```text
+cells ≈ Σ over rules: keys × nodes that count each key × (W / b + 1)
+      ≤ Λ · (W + b)              (every hit opens a new cell)
+```
+
+`prod-peak` keeps about 20,000 cells live; the default `storage.max_cells`,
+131,072, is 6.5 times that. The NGINX limit zone's count table holds one slot
+per live `(rule, key, bucket)`, origins merged (its sizing notes are under
+[`gabion_limit_zone`](../nginx/README.md#gabion_limit_zone-zonenamesize-http)).
+
+**Memory.** At the defaults a node holds:
+
+| What | Size at the defaults | Scales with |
+|---|---|---|
+| Counter store | about 12 MiB (about 96 B a cell) | `storage.max_cells` |
+| `gabiond`'s aggregate table | 16 MiB (64 B a slot, twice the cells rounded up to a power of two) | `storage.max_cells` |
+| NGINX's count table and request queue | the limit zone's SIZE, in shared memory | `gabion_limit_zone` |
+| Peer table | about 165 KiB (about 330 B a peer) | `gossip.peer_capacity` |
+| Kernel socket buffers | up to 8 MiB receive and 2 MiB send on Linux, only while they hold data | the two buffer settings |
+
+**Packets.** A node runs `R_own` own rounds a second: with the default error
+budget a rule's budget is one hit for any limit below about 36,000 at 183
+pods, so a node flushes at every second hit and the heartbeat flushes a lone
+one. Each own round sends one packet to every other node, directly or through
+a gateway's relay, so a node sends
+
+```text
+D = R_own · (N − 1) + a          packets a second, about Λ / 2
+```
+
+where `a` counts acknowledgements sent alone (15 to 29 a second at
+production sizes). Packets follow the cluster's admitted rate, not the pod
+count. `gossip.min_emit_interval` caps them under any load at
+
+```text
+D_max = (1/F + 1/T)(n_z − 1 + Z − 1) + min(1/F, g/F)(n_z − 1) + (N − 1)/T
+```
+
+with `F` the floor, `n_z` the pods of the node's zone and `g` the origins it
+is a gateway for (about `Z − 1`): 24,900 packets a second per node at 183
+pods and 40,800 at 300. A node reaches the ceiling only when it admits 400
+hits a second, 40 times `prod-peak`; past it packets stop growing and carry
+more cells each.
+
+**Socket buffers.** The kernel's buffers are gossip's queues. For a pause of
+`t_s` (100 ms, the default CFS period a CPU-throttled pod can lose) and the
+kernel's charge `s_q` per queued datagram (about 2 KiB),
+
+```text
+B_rcv = h · D · t_s · s_q
+B_snd = h · Q_round · s_q,       Q_round = 2 (n_z − 1) + (Z − 1) + g + sweep pages
+```
+
+with `h` the headroom. At `prod-peak` the need is about 210 KB to receive and
+254 KB to send; the defaults (4 MiB and 1 MiB requested, twice that granted on
+Linux) give 40 and 8 times that. A bigger cluster raises the settings and the
+host's `net.core.rmem_max` / `net.core.wmem_max` together
+([Socket buffers](#socket-buffers)).
+
+## Upgrading
+
+Run one gabion release on every node of a cluster, both adapters included:
+they share the wire format, the rule identity and the settings table.
+
+### To wire format version 2
+
+This release changes the gossip wire format to version 2 (the header and
+body are in [`GOSSIP.md`](GOSSIP.md#wire-format-version-2)). Version 1 and
+version 2 nodes reject each other's packets and log `peer_version_mismatch`,
+so during a rolling upgrade the cluster splits into two islands that do not
+share counts, and each enforces its limits against its own share of the
+traffic: up to about twice a key's limit per window until the rollout ends.
+Rule fingerprints and key hashes changed in the same release, so no count
+carries across the upgrade either way.
+
+1. Before the rollout, give every node a zone (the Kubernetes
+   `topology.kubernetes.io/zone` label, or `gossip.zone` outside Kubernetes)
+   and raise the hosts' `net.core.rmem_max` and `net.core.wmem_max`
+   ([Socket buffers](#socket-buffers)).
+2. Roll fast: a high `maxSurge` and `maxUnavailable` keep the split short.
+3. Watch `/snapshot`'s `peers_by_role.incompatible` (`gabiond`) or the
+   `incompatible_peers` field of `peer_version_mismatch` fall to 0.
+
+A rollback is the same split in reverse, and as short as you make it.
+
+### Mixed NGINX and gabiond clusters
+
+NGINX and `gabiond` nodes count together when they share:
+
+- **the release**: upgrade both adapters in the same rollout, since they
+  share the wire version;
+- **the cluster id**: `gossip.cluster_id_hash` in `gabiond`, `gabion_gossip_cluster`
+  in NGINX;
+- **the packet size**: the same `gossip.max_payload_bytes` /
+  `gabion_gossip_max_payload_bytes` everywhere;
+- **each rule's identity**: the same domain, descriptor keys and value
+  patterns in order, window and bucket, by the table in
+  [Writing the same rule for NGINX and gabiond](#writing-the-same-rule-for-nginx-and-gabiond).
+  NGINX's default domain is `nginx`, so a `gabiond` twin of an NGINX rule that
+  sets no `domain=` names `domain: nginx`.
+
+A rule written differently in the two adapters is two rules, each counted on
+its own, and the cluster admits up to its limit through each.
+
+### Removed settings
+
+These settings are gone. A YAML file, environment or `nginx.conf` that still
+sets one fails to load naming it; delete the line.
+
+| Removed (YAML key / environment variable / NGINX directive) | What replaces it |
+|---|---|
+| `gossip.send_queue_capacity` / `GABION_GOSSIP_SEND_QUEUE_CAPACITY` / `gabion_gossip_send_queue_capacity` | Nothing: the kernel send buffer queues packets, sized by `gossip.send_buffer_bytes`. |
+| `storage.peer_capacity` / `GABION_STORAGE_PEER_CAPACITY` / `gabion_storage_peer_capacity` | `gossip.peer_capacity` (default 512). |
+| `gossip.max_cells_per_frame` / `GABION_GOSSIP_MAX_CELLS_PER_FRAME` / `gabion_gossip_max_cells_per_frame` | Nothing: derived from `gossip.max_payload_bytes`. |
+| `storage.local_dirty_capacity` / `GABION_STORAGE_LOCAL_DIRTY_CAPACITY` / `gabion_storage_local_dirty_capacity` | Nothing: each peer's stream tracks what it has been sent. |
+| `storage.forwarded_dirty_capacity` / `GABION_STORAGE_FORWARDED_DIRTY_CAPACITY` / `gabion_storage_forwarded_dirty_capacity` | Nothing: the relay stream tracks what each zone peer has been sent. |
+| `runtime.rng_seed` / `GABION_RUNTIME_RNG_SEED` / `gabion_runtime_rng_seed` | Nothing: gateways are chosen by rendezvous hashing, with no randomness. |
+| `gossip.fanout` / `GABION_GOSSIP_FANOUT` / `gabion_gossip_fanout` | Nothing: every zone peer gets each change, and one gateway per remote zone. |
+| `gossip.max_cells_per_tick` / `GABION_GOSSIP_MAX_CELLS_PER_TICK` / `gabion_gossip_max_cells_per_tick` | Nothing: the per-round quantum is derived from `storage.max_cells`. |
+
+### `/snapshot` changes
+
+For scrapers of `gabiond`'s `/snapshot`:
+
+- `identity` is `local_identity`; `store.cell_store` is `store_stats`;
+  `store.aggregate_rows` is `aggregate_rows`.
+- `decode_reject_count` is replaced by `counters.decode_rejects_framing`,
+  `decode_rejects_peer_limits`, `decode_rejects_version` and
+  `decode_rejects_cluster`.
+- Removed: `gossip.send_pending_depth`, `local_dirty_len`,
+  `forwarded_dirty_len`, `ticks_total`, `threshold_fires`, `dirty_ticks`,
+  `last_effective_fanout`, `peak_effective_fanout` and `peers[].peer_slot`.
+- Added: `zone`, `peers_by_role`, the `counters` object (rounds, packets,
+  bytes, cross-zone bytes, merges, rewinds, gap reports, failovers, stalls,
+  sweeps), and on each peer `zone`, `role`, `answer`, `unanswered_ms`,
+  `own_unacked` and `relay_unacked`.
+- `/debug/introspection` is gone; `/snapshot` and `/readyz` remain
+  ([admin endpoint](../server/README.md#admin-endpoint)).
+
 ## What we measured
 
-The comparative study of gossip designs, its method and its results are in
-[`docs/study/README.md`](../../docs/study/README.md); the harness that produced
-them is [`crates/gossip-bench`](../gossip-bench/README.md).
+The study ran each gossip design in a deterministic simulator of a gabion
+cluster under production-shaped load, three seeds per regime, and scored
+every node against the true count over a 60-second measurement window. The
+design this release ships was measured as the study's `imp-az-hier-nopk`
+arm; `main` is the design it replaces. Each figure is the posterior mean with
+its 95 % credible interval; bytes are per node, the cluster's total divided
+by pods and the window.
 
-## References
+| Regime | Design | Convergence p50 | Convergence p99 | Never converged | Bytes sent per node | Cross-zone per node | Mean over-admission |
+|---|---|---|---|---|---|---|---|
+| `prod-typical`, 80 pods | this release | 25 ms [23, 28] | 337 ms [307, 367] | none in 3 seeds | 88.1 KB/s [87.7, 88.4] | 2.6 KB/s [2.6, 2.6] | 1.1 % [0.2, 1.9] |
+| `prod-typical`, 80 pods | `main` | 4.8 s [4.73, 4.82] | 6.2 s [6.03, 6.44] | none in 3 seeds | 1,044 KB/s [1,037, 1,050] | 708 KB/s [697, 718] | 41 % [36, 45] |
+| `prod-peak`, 183 pods | this release | 20 ms [15, 26] | 301 ms [292, 309] | none in 3 seeds | 236.6 KB/s [236.0, 237.1] | 3.0 KB/s [3.0, 3.0] | 1.0 % [0.6, 1.4] |
+| `prod-peak`, 183 pods | `main` | 8.5 s [8.48, 8.56] | 9.7 s [9.63, 9.73] | 10.7 % [10.2, 11.3] | 1,180 KB/s [1,177, 1,182] | 790 KB/s [785, 795] | 86 % [75, 97] |
 
-In-tree primary sources:
-
-- `src/gossip/runtime.rs` — the event loop. `GossipRuntime::run` is the
-  outer `select!`; `round` and `serve_row` carry the per-peer streams;
-  `handle_limit_request` carries the per-site safe zone and the
-  threshold-fire flag. `src/gossip/peer.rs` holds the stream state and its
-  rules; `src/gossip/sweep.rs` the join sweeps.
-- `src/wire.rs` and `src/wire/` — packet shape, encoders, decoder.
-- `src/crdt.rs` and `src/crdt/` — counter store, the own-stream list, expiry. The structures here are documented in depth in
-  [`CRDT.md`](CRDT.md).
+Convergence is how long a hit takes to reach every node's count, with hits
+that never arrived counted at the end of the run; over-admission is how far
+the cluster admits past a limit, on keys that reach it, as a share of the
+limit. These were measured
+on the measured branch's version 1 wire; this release's version 2 header and
+cells are smaller (the design predicts about 7 % fewer bytes), which
+`make sim-gate` measures for any checkout. The method, every regime and the
+full results are in [`docs/study/README.md`](../../docs/study/README.md); the
+harness that produced them is [`crates/gossip-bench`](../gossip-bench/README.md).

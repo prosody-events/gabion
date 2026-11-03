@@ -77,6 +77,34 @@ Message starts: "This node's peer table is full"
 
 **Fields** `config_key`, `capacity`, `peer`, `declined_total` · **Knob** `gossip.peer_capacity` (`GABION_GOSSIP_PEER_CAPACITY`) / `gabion_gossip_peer_capacity`
 
+### `peer_joined`
+
+**Level** info, once per peer added · **Request allowed** yes, counts unaffected · **Emitted by** library (both adapters)
+
+Message starts: "Peer joined the cluster."
+
+**What happened.** Discovery, or the static peer list at start, reported a new peer, and this node added it to its peer table. It now gossips with it and shares its counts.
+
+**Why.** A pod started, or discovery saw its EndpointSlice entry become ready. During a rollout every new pod logs one line on every node.
+
+**What to do next.** Nothing. `cluster_size` is the peer table's size after the change; compare it with your pod count less one to check that discovery sees every pod.
+
+**Fields** `peer`, `cluster_size` · **Knob** none
+
+### `peer_left`
+
+**Level** info, once per peer removed · **Request allowed** yes, counts unaffected · **Emitted by** library (both adapters)
+
+Message starts: "Peer left the cluster."
+
+**What happened.** Discovery reported that a peer is gone, and this node removed it from its peer table. Its counts already merged stay until their buckets expire.
+
+**Why.** A pod stopped or was rescheduled, or its EndpointSlice entry stopped being ready. Normal during rollouts and scale-downs; static peers are never removed.
+
+**What to do next.** Nothing, unless peers leave and rejoin while their pods keep running: then look for `discovery_error` lines and failing readiness probes.
+
+**Fields** `peer`, `cluster_size` · **Knob** none
+
 ### `gap_abandoned`
 
 **Level** warn, power of two · **Request allowed** yes, under-counted until the missing changes arrive · **Emitted by** library (both adapters)
@@ -284,6 +312,48 @@ Message starts: "Peer discovery hit an error and skipped an update"
 **What to do next.** If it repeats, check API access (the Role in the [Kubernetes checklist](../../README.md#kubernetes-checklist)) and the discovery settings: `discovery.namespace_allow`, `discovery.service_allow`, `discovery.self_addr` in `gabiond`, `gabion_discovery_*` in NGINX.
 
 **Fields** `error`, `errors_total` · **Knob** `discovery.*` / `gabion_discovery_*`
+
+### `kubernetes_unreachable`
+
+**Level** warn, once each time discovery starts (NGINX: once per leadership term) · **Request allowed** yes, this node's counts stay local · **Emitted by** library (both adapters)
+
+Message starts: "Could not connect to the Kubernetes API, so gabion cannot discover peers"
+
+**What happened.** Kubernetes discovery could not build its API client, so it stopped and this node found no peers: its limits count only its own traffic.
+
+**Why.** Expected outside Kubernetes, where a node with `gossip.bind` and no `gossip.bootstrap_peers` tries Kubernetes discovery. In a pod, usually the ServiceAccount token is not mounted (`automountServiceAccountToken: false`) or the in-cluster environment variables are missing.
+
+**What to do next.** Outside Kubernetes, list the peers in `gossip.bootstrap_peers` (`GABION_GOSSIP_BOOTSTRAP_PEERS`; NGINX `gabion_gossip_bootstrap_peers`), see [Outside Kubernetes](README.md#outside-kubernetes); a single node needs nothing. In a pod, mount the ServiceAccount token and grant the Role in the [Kubernetes checklist](../../README.md#kubernetes-checklist), then restart the pod.
+
+**Fields** `error` · **Knob** `gossip.bootstrap_peers` (`GABION_GOSSIP_BOOTSTRAP_PEERS`) / `gabion_gossip_bootstrap_peers`
+
+### `gabion_service_found`
+
+**Level** info, once per Service · **Request allowed** yes, counts unaffected · **Emitted by** library (both adapters)
+
+Message starts: "Found a gabion service in the cluster; watching it for new peers."
+
+**What happened.** Discovery found a Service with a UDP port named `gabion` in a watched namespace and started watching its EndpointSlices; its ready pods become peers.
+
+**Why.** The node started, or the Service was created or gained its `gabion` port.
+
+**What to do next.** Nothing. If the Service is not the one you meant, narrow `discovery.service_allow` (`GABION_DISCOVERY_SERVICE_ALLOW`; NGINX `gabion_discovery_service_allow`).
+
+**Fields** `namespace`, `service` · **Knob** `discovery.service_allow` / `gabion_discovery_service_allow`
+
+### `gabion_service_gone`
+
+**Level** info, once per Service · **Request allowed** yes, its peers leave this node's table · **Emitted by** library (both adapters)
+
+Message starts: "Gabion service is no longer reachable"
+
+**What happened.** A Service discovery was watching was deleted or lost its UDP port named `gabion`, so discovery stopped watching it and removed the peers only it listed (each logs `peer_left`).
+
+**Why.** Usually a deployment was removed or its Service rewritten; also a port renamed or switched to TCP by mistake.
+
+**What to do next.** Nothing if the Service was meant to go. Otherwise restore its port as `name: gabion`, `protocol: UDP` (the [Kubernetes checklist](../../README.md#kubernetes-checklist)).
+
+**Fields** `namespace`, `service` · **Knob** the Service's port `name` and `protocol`
 
 ### `zone_known`
 

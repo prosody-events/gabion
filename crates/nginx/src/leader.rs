@@ -133,6 +133,7 @@ fn run_leader(
         Ok(runtime) => runtime,
         Err(error) => {
             tracing::error!(
+                code = "leader_runtime_failed",
                 worker_id = config.worker_id,
                 %error,
                 "gabion: could not start the leader thread's async runtime, so \
@@ -181,6 +182,7 @@ async fn campaign(
         if !lease.try_acquire(config.worker_id, now_millis(), LEASE_TTL_MILLIS) {
             if !announced_follower {
                 tracing::info!(
+                    code = "leader_standby",
                     worker_id = config.worker_id,
                     "gabion: worker did not win leader lease; standing by to take over gossip if \
                      the leader exits",
@@ -191,6 +193,7 @@ async fn campaign(
         }
 
         tracing::info!(
+            code = "leader_won",
             worker_id = config.worker_id,
             "gabion: worker won leader lease"
         );
@@ -209,6 +212,7 @@ async fn campaign(
             retry_delay = LEASE_TTL;
         }
         tracing::error!(
+            code = "leader_stopped",
             worker_id = config.worker_id,
             error = format!("{error:#}"),
             retry_in = ?retry_delay,

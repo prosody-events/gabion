@@ -1,4 +1,52 @@
-# Kubernetes smokes
+# Kubernetes manifests and smokes
+
+This directory holds a starting set of manifests for running gabion on
+Kubernetes, and the smoke tests that run gabion on a local kind cluster.
+
+## Manifests
+
+| File | What it holds |
+|---|---|
+| [`gabion-discovery-rbac.yaml`](gabion-discovery-rbac.yaml) | The `gabion` ServiceAccount, and the Role and RoleBinding that let discovery read Pods, Services and EndpointSlices. Both adapters need it. |
+| [`gabiond.yaml`](gabiond.yaml) | `gabiond`: a ConfigMap with its YAML, a Deployment of three replicas with a `/readyz` readiness probe, and a Service exposing Envoy's gRPC port and the UDP port named `gabion`. |
+| [`gabion-nginx.yaml`](gabion-nginx.yaml) | NGINX with the module: a ConfigMap with `nginx.conf`, a Deployment of three replicas on the published image, and a Service exposing HTTP and the UDP port named `gabion`. |
+| [`gabion-networkpolicy.yaml`](gabion-networkpolicy.yaml) | A NetworkPolicy that admits gossip only from gabion pods, since gossip carries no authentication. |
+
+Apply the RBAC, one adapter or both, and the NetworkPolicy:
+
+```sh
+kubectl apply -f deploy/kubernetes/gabion-discovery-rbac.yaml \
+  -f deploy/kubernetes/gabiond.yaml \
+  -f deploy/kubernetes/gabion-networkpolicy.yaml
+```
+
+Before you do, edit:
+
+- **The image tag.** Pin a release (for example `:0.4`) instead of `:latest`,
+  and run one release on every pod of the cluster.
+- **The namespace.** Every object is in `default`; change every `namespace:`
+  together, including the RoleBinding's subject in the RBAC file. Discovery
+  watches the pods' own namespace unless `discovery.namespace_allow` says
+  otherwise.
+- **The cluster id.** Both adapter manifests set the same
+  `cluster_id_hash`, so applied together they form one mixed cluster. Give
+  each cluster its own id; two clusters in one namespace also need
+  `discovery.service_allow` (`gabion_discovery_service_allow`) so each finds
+  only its own Service.
+- **The rules** in each ConfigMap, and the limit zone's SIZE for NGINX.
+- **The nodes.** Every node needs a `topology.kubernetes.io/zone` label, and
+  its `net.core.rmem_max` and `net.core.wmem_max` sysctls raised for gossip's
+  socket buffers; both are node settings, not pod settings (the gabion
+  README's [Socket buffers](../../crates/gabion/README.md#socket-buffers)).
+
+The root README's [Kubernetes checklist](../../README.md#kubernetes-checklist)
+says why each object is needed. A pod that finds no peers logs why; each
+message has its entry in
+[`crates/gabion/TROUBLESHOOTING.md`](../../crates/gabion/TROUBLESHOOTING.md).
+The smokes below build their own manifests inline and do not apply these
+files.
+
+## Smokes
 
 Each script runs against a local kind cluster. It refuses to run unless the
 current context is `kind-*` and its API server is on localhost, and it works

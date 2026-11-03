@@ -1,0 +1,40 @@
+# Keep the gossip port private. Gossip packets carry no authentication, and
+# the cluster id is a label, not a secret, so only gabion pods may send UDP to
+# the gossip port. The policy selects every pod of gabiond.yaml and
+# gabion-nginx.yaml by `app.kubernetes.io/part-of: gabion`.
+#
+# A policy that selects a pod denies every port it does not list, so the
+# serving ports are listed too, open to any source: narrow them to your
+# ingress or Envoy pods. The cluster's network plugin must enforce
+# NetworkPolicy (Calico, Cilium and most managed CNIs do). `hostNetwork` pods
+# are not covered: protect their gossip port with a security group or host
+# firewall instead.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gabion-gossip
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: gabion
+  policyTypes:
+    - Ingress
+  ingress:
+    # Gossip, from gabion pods only.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: gabion
+      ports:
+        - protocol: UDP
+          port: 9000
+    # nginx's HTTP port, gabiond's gRPC port and its admin port (the kubelet's
+    # readiness probe needs it).
+    - ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 9090

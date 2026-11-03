@@ -71,6 +71,7 @@ async fn run() -> Result<(), Reported> {
         .map_err(startup(Stage::Config))?;
     let rule_table = Arc::new(config.rules);
     tracing::info!(
+        code = "gabiond_started",
         gossip_bind = %gossip_bind,
         envoy_bind = ?config.settings.envoy_bind,
         admin_bind = ?config.settings.admin_bind,
@@ -89,6 +90,7 @@ async fn run() -> Result<(), Reported> {
         identity::incarnation(None),
     );
     tracing::info!(
+        code = "identity_generated",
         node_id = %format!("{:032x}", identity.node_id.0),
         incarnation = identity.incarnation,
         "Generated this node's identity. The incarnation number changes on \
@@ -114,6 +116,7 @@ async fn run() -> Result<(), Reported> {
     let grpc_listener = bind(Server::Grpc, config.settings.envoy_bind).await?;
     let admin_listener = bind(Server::Admin, config.settings.admin_bind).await?;
     tracing::info!(
+        code = "gossip_listening",
         listen_addr = %gossip_bind,
         "Listening for gossip from other gabion nodes.",
     );
@@ -146,6 +149,7 @@ async fn run() -> Result<(), Reported> {
 
     let mut grpc = grpc_listener.map(|(bind, listener)| {
         tracing::info!(
+            code = "grpc_listening",
             listen_addr = %bind,
             health_service = "grpc.health.v1.Health",
             reflection_service = "grpc.reflection.v1.ServerReflection",
@@ -163,6 +167,7 @@ async fn run() -> Result<(), Reported> {
 
     let mut admin = admin_listener.map(|(bind, listener)| {
         tracing::info!(
+            code = "admin_listening",
             listen_addr = %bind,
             "Admin HTTP endpoint is up. Hit /snapshot for a live view of \
              this node's rate-limit state.",
@@ -183,6 +188,7 @@ async fn run() -> Result<(), Reported> {
         exit = stopped(&mut admin) => Err(exit.report()),
         _ = sigterm.recv() => {
             tracing::info!(
+                code = "shutdown_signal",
                 signal = "SIGTERM",
                 "Received shutdown signal; draining in-flight requests and \
                  stopping cleanly.",
@@ -191,6 +197,7 @@ async fn run() -> Result<(), Reported> {
         }
         _ = sigint.recv() => {
             tracing::info!(
+                code = "shutdown_signal",
                 signal = "SIGINT",
                 "Received shutdown signal (Ctrl-C); draining in-flight \
                  requests and stopping cleanly.",
@@ -210,6 +217,7 @@ async fn run() -> Result<(), Reported> {
         )
         .await;
     tracing::info!(
+        code = "not_serving",
         "Marked the rate-limit service as NOT_SERVING in the health protocol. Load balancers \
          should now route traffic elsewhere.",
     );
@@ -226,7 +234,7 @@ async fn run() -> Result<(), Reported> {
     }
     let status = served.and(drained);
     if status.is_ok() {
-        tracing::info!("Gabion shut down cleanly.");
+        tracing::info!(code = "clean_shutdown", "Gabion shut down cleanly.");
     }
     status
 }
