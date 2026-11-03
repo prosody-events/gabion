@@ -68,9 +68,9 @@ pub struct ValidGossipConfig {
     /// Cluster identifier written into every outbound packet header; a
     /// packet carrying any other is dropped.
     pub(crate) cluster_id_hash: NonZeroU128,
-    /// How this node finds its peers; a `Static` list is seeded into the
-    /// peer table at construction.
-    pub membership: Membership,
+    /// How this node finds its peers and where it listens; a `Static` list
+    /// is seeded into the peer table at construction.
+    pub(crate) membership: Membership,
     /// Rows of the runtime's peer table, `gossip.peer_capacity`; a peer
     /// discovery reports past it is declined and logged as `peer_table_full`.
     pub(crate) peer_capacity: NonZeroU16,
@@ -119,6 +119,11 @@ pub struct ValidGossipConfig {
 const TICK_NEAR_ROUND_TRIP_MS: u64 = 20;
 
 impl ValidGossipConfig {
+    /// How this node finds its peers and where it listens.
+    pub fn membership(&self) -> &Membership {
+        &self.membership
+    }
+
     /// Shrink the runtime's request channel to [`MIN_LIMIT_QUEUE_CAPACITY`],
     /// for an adapter whose `gossip.limit_queue_capacity` sizes a queue of its
     /// own that it drains into the runtime (NGINX's shared-memory queue). A

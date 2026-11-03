@@ -879,12 +879,13 @@ unsafe extern "C" fn init_zone(shm_zone: *mut ngx_shm_zone_t, data: *mut c_void)
     now_millis();
     main.region = Some(region);
     tracing::info!(
-        zone = %String::from_utf8_lossy(zone.shm.name.as_bytes()),
+        code = "limit_zone_ready",
+        limit_zone = %String::from_utf8_lossy(zone.shm.name.as_bytes()),
         bytes = zone.shm.size,
         slots = region.layout().aggregate_capacity,
         queue = region.layout().queue_capacity,
         reused = previous.is_some(),
-        "gabion: zone ready",
+        "gabion: limit zone ready",
     );
     core::Status::NGX_OK.into()
 }
@@ -1294,7 +1295,6 @@ unsafe extern "C" fn gabion_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     let worker_id = std::process::id();
     let cfg = LeaderConfig {
         worker_id,
-        gossip_bind: main.settings.gossip_bind,
         gossip: gossip.clone(),
         cell_store: *storage,
         lease_tick: leader::DEFAULT_LEASE_TICK,

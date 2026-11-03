@@ -16,7 +16,6 @@ use gabion::aggregate::Aggregate;
 use gabion::crdt::{
     CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId, NodeIdentity,
 };
-use gabion::discovery::Membership;
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AdminCommand, AggregateStore, GossipRuntime, TokioClock};
 use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
@@ -82,7 +81,15 @@ fn snapshot_json_shape_is_pinned() {
         let bind_addr = next_addr();
         let transport = sim.bind(bind_addr);
         let identity = NodeIdentity::new(NodeId(0xBEEF_CAFE), 11);
-        let (mut gossip_config, storage) = settings().validate().expect("settings validate");
+        let bootstrap = next_addr();
+        let (gossip_config, storage) = Settings {
+            gossip_bind: Some(bind_addr),
+            bootstrap_peers: [bootstrap].into(),
+            zone: Some(ZoneName::parse("use1-az2").expect("a zone name")),
+            ..settings()
+        }
+        .validate()
+        .expect("settings validate");
         let rule_table = Arc::new(sample_rules());
         let store = CellStore::new(storage, identity, &rule_table);
         let counts = Arc::new(Aggregate::new(&storage));
@@ -100,9 +107,6 @@ fn snapshot_json_shape_is_pinned() {
         };
         counts.apply(&row, &ExpirationSink::default());
 
-        let bootstrap = next_addr();
-        gossip_config.membership = Membership::Static([bootstrap].into());
-        gossip_config.zone = Some(ZoneName::parse("use1-az2").expect("a zone name"));
         let tick = settings().tick_interval.duration();
 
         let (admin_tx, admin_rx) = admin_channel();

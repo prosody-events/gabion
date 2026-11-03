@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU16;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -136,13 +136,20 @@ fn tuned_config(peers: Vec<SocketAddr>, tune: impl FnOnce(&mut Settings)) -> Val
         limit_queue_capacity: 1024.try_into().unwrap(),
         ..Settings::default()
     };
-    tune(&mut settings);
-    let (mut config, _) = settings.validate().expect("test gossip settings validate");
     if !peers.is_empty() {
-        config.membership = Membership::Static(peers.into());
+        settings.gossip_bind = Some(TEST_BIND);
+        settings.bootstrap_peers = peers.into();
     }
-    config
+    tune(&mut settings);
+    settings
+        .validate()
+        .expect("test gossip settings validate")
+        .0
 }
+
+/// The `gossip.bind` a test config with peers names: the sim transport, not
+/// the config, decides where a test node listens.
+const TEST_BIND: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
 
 /// A node bound at `me` whose `gossip.bootstrap_peers` is `list`, the one
 /// list every node shares, `me` included.

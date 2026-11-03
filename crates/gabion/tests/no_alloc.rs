@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity};
-use gabion::discovery::Membership;
 use gabion::gossip::Role;
 use gabion::gossip::sim::sim_advance_ticks;
 use gabion::gossip::{
@@ -217,7 +216,7 @@ fn steady_state_gossip_never_allocates() {
             tick_interval: gabion::settings::Millis(100.try_into().unwrap()),
             ..Settings::default()
         };
-        let (gossip, storage) = settings.validate().expect("settings validate");
+        let (_, storage) = settings.validate().expect("settings validate");
         // One rule of a one-second window in 100 ms buckets.
         let rules = RuleTable::new(
             Box::new([RuleDef {
@@ -243,11 +242,15 @@ fn steady_state_gossip_never_allocates() {
             a_to_g: Cell::new(0),
         });
         let start = |me: usize| {
-            let mut config = gossip.clone();
-            let peers = (0..3).filter(|&i| i != me).map(|i| net.addrs[i]);
-            config.membership = Membership::Static(peers.collect());
             let zone = if me == 0 { "a" } else { "b" };
-            config.zone = Some(ZoneName::parse(zone).unwrap());
+            let (config, _) = Settings {
+                gossip_bind: Some(net.addrs[me]),
+                bootstrap_peers: (0..3).filter(|&i| i != me).map(|i| net.addrs[i]).collect(),
+                zone: Some(ZoneName::parse(zone).unwrap()),
+                ..settings.clone()
+            }
+            .validate()
+            .expect("node settings validate");
             let identity = NodeIdentity::new(NodeId(0xA0 + me as u128), 1);
             let (admin, admin_rx) = mpsc::channel(1);
             let (runtime, client) = GossipRuntime::from_parts_with_admin(

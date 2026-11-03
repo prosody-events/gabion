@@ -96,7 +96,7 @@ async fn set_link(tx: &mpsc::Sender<Command>, src: u32, dst: u32, policy: LinkPo
 async fn add_node(tx: &mpsc::Sender<Command>) -> EventBatch {
     let (reply, rx) = oneshot::channel();
     tx.send(Command::AddNode { reply }).await.unwrap();
-    rx.await.unwrap()
+    rx.await.unwrap().expect("the node joins")
 }
 
 async fn remove_node(tx: &mpsc::Sender<Command>, id: u32) -> EventBatch {
@@ -560,7 +560,8 @@ where
         .build()
         .expect("build paused current-thread runtime");
     LocalSet::new().block_on(&rt, async move {
-        let state = super::EngineState::build(config.validate().expect("config validates"));
+        let state = super::EngineState::build(config.validate().expect("config validates"))
+            .expect("every node's settings validate");
         let mut state = body(state).await;
         state.shutdown().await;
     });

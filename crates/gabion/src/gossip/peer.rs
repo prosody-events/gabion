@@ -27,6 +27,7 @@ use crate::wire::{AckInfo, OwnAck, StreamRange};
 use crate::zone::ZoneHash;
 
 use super::admin::{AnswerState, PeerEntry, PeerZone, RoleCounts};
+use super::own_zone::LearnedZone;
 use super::transport::Sent;
 
 /// What [`PeerTable::insert`] did with an address.
@@ -563,12 +564,10 @@ enum Rank {
 pub(super) enum SweepScope {
     /// Those of this node's zone.
     Zone,
-    /// Any zone's, once no peer is unheard of unknown zone and none, heard or
-    /// not, is of this zone.
-    AnyZone,
-    /// Any zone's: the want waited `gossip.zone_grace`, so a peer not yet
-    /// heard counts as absent. Passed only when no heard peer is of this zone.
-    AnyZoneAfterGrace,
+    /// Any zone's, once no peer is or may be of this zone. With `waited`, the
+    /// want has waited `gossip.zone_grace`, and a peer not yet heard counts
+    /// as absent.
+    AnyZone { waited: bool },
 }
 
 /// Rows `0..len` hold the peers in no particular order: a removed row is
@@ -795,11 +794,11 @@ impl PeerTable {
         self.local_zone
     }
 
-    /// Learn this node's zone; the runtime's own-zone state adopts one only
-    /// while none is known.
-    pub(super) fn adopt_zone(&mut self, zone: ZoneHash) {
+    /// Learn this node's zone, which the own-zone state hands over once, and
+    /// only while none is known.
+    pub(super) fn adopt_zone(&mut self, zone: LearnedZone) {
         debug_assert!(self.local_zone.is_none(), "a known zone never changes");
-        self.local_zone = Some(zone);
+        self.local_zone = Some(zone.hash());
         self.stale = true;
     }
 
@@ -1275,22 +1274,22 @@ impl PeerTable {
     }
 
     /// The heard peers a join sweep may ask, with their weights: those of
-    /// this node's zone, or in an any-zone scope every one that speaks this
-    /// version, but only while no peer is or may be of this zone: none unheard
-    /// of unknown zone, and none, heard or not, of this zone.
-    /// `AnyZoneAfterGrace` asks across zones unconditionally; its caller has
-    /// found no heard peer of this zone. An unheard peer may not know this
-    /// node yet, and would ignore the request.
+    /// this node's zone, or in the any-zone scope every one that speaks this
+    /// version, but only while no peer is or may be of this zone: none
+    /// unheard of unknown zone, and none, heard or not, of this zone. Once the
+    /// want has waited, only a heard peer of this zone blocks. An unheard peer
+    /// may not know this node yet, and would ignore the request.
     pub(super) fn sweep_candidates(
         &self,
         scope: SweepScope,
     ) -> impl Iterator<Item = (u64, SocketAddr)> + '_ {
         let any_zone = match scope {
             SweepScope::Zone => false,
-            SweepScope::AnyZone => !self.role[..self.len]
-                .iter()
-                .any(|role| matches!(role, Role::Unheard | Role::Zone)),
-            SweepScope::AnyZoneAfterGrace => true,
+            SweepScope::AnyZone { waited } => !(0..self.len).any(|row| match self.role[row] {
+                Role::Zone => !waited || self.link[row].identity().is_some(),
+                Role::Unheard => !waited,
+                Role::Gateway | Role::Remote | Role::Incompatible => false,
+            }),
         };
         (0..self.len)
             .filter(move |&row| {

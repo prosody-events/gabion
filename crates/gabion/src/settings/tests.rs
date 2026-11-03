@@ -460,7 +460,7 @@ fn defaults_validate_to_the_production_values() {
     assert_eq!(gossip.membership, Membership::Alone);
 }
 
-/// U17: a zone setting that is not a zone name fails to load, an empty one
+/// A zone setting that is not a zone name fails to load, an empty one
 /// included, naming the reason and every spelling; a valid one loads.
 #[test]
 fn invalid_zone_names_the_reason_and_both_spellings() {
@@ -491,7 +491,7 @@ fn invalid_zone_names_the_reason_and_both_spellings() {
     assert_eq!(valid.zone, ZoneName::parse("use1-az2").ok());
 }
 
-/// U17: a static list longer than the peer table fails validation, naming
+/// A static list longer than the peer table fails validation, naming
 /// both settings; one that fits validates.
 #[test]
 fn too_many_bootstrap_peers_fails_validation() {
@@ -558,12 +558,24 @@ fn membership_follows_bind_and_bootstrap_peers() {
         namespace_allow: ["team-a".into()].into(),
         service_allow: ["gabion".into()].into(),
     };
-    assert_eq!(kubernetes, Membership::Kubernetes(expected));
+    assert_eq!(
+        kubernetes,
+        Membership::Kubernetes {
+            bind,
+            discovery: expected
+        }
+    );
     let listed = membership(|s| {
         s.gossip_bind = Some(bind);
         s.bootstrap_peers = [bind, peer].into();
     });
-    assert_eq!(listed, Membership::Static([bind, peer].into()));
+    assert_eq!(
+        listed,
+        Membership::Static {
+            bind,
+            peers: [bind, peer].into()
+        }
+    );
 
     let mut settings = Settings::default();
     settings

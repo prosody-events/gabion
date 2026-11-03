@@ -2473,11 +2473,14 @@ fn kubernetes_config(
     tune: impl FnOnce(&mut Settings),
 ) -> ValidGossipConfig {
     let mut config = tuned_config(vec![], tune);
-    config.membership = Membership::Kubernetes(DiscoveryConfig {
-        self_match,
-        namespace_allow: Box::default(),
-        service_allow: Box::default(),
-    });
+    config.membership = Membership::Kubernetes {
+        bind: TEST_BIND,
+        discovery: DiscoveryConfig {
+            self_match,
+            namespace_allow: Box::default(),
+            service_allow: Box::default(),
+        },
+    };
     config
 }
 
@@ -2486,7 +2489,7 @@ fn pod_name() -> Option<SelfMatch> {
     Some(SelfMatch::PodName("gabion-0".into()))
 }
 
-/// SIM21: a node with a static list and no zone setting says at start, once,
+/// A node with a static list and no zone setting says at start, once,
 /// that it runs as one zone, without waiting for `gossip.zone_grace`, and
 /// treats its peer as a zone peer.
 #[test]
@@ -2684,7 +2687,7 @@ fn own_entry_without_a_zone_warns_with_its_node_then_learns_once() {
     );
 }
 
-/// U23: the zone setting wins over the own entry's, which every peer then
+/// The zone setting wins over the own entry's, which every peer then
 /// sees, and the disagreement is logged once.
 #[test]
 fn configured_zone_wins_and_conflict_logs_once() {
@@ -2721,7 +2724,7 @@ fn configured_zone_wins_and_conflict_logs_once() {
     assert_logged(&logs, "zone_known", 2, &["zone_source=\"config\""]);
 }
 
-/// SIM20: a gateway that abandoned a gap in an origin's flagged stream
+/// A gateway that abandoned a gap in an origin's flagged stream
 /// relays the origin's whole RTO resend into its zone, the cell it already
 /// held by direct receipt included, since the resend reaches above
 /// `gateway_have`; the same resend again relays only what it changed, which

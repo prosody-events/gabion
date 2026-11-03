@@ -237,8 +237,8 @@ where
         let outbox = Outbox::new(&config);
 
         let bootstrap = match &config.membership {
-            Membership::Static(peers) => peers.clone(),
-            Membership::Kubernetes(_) | Membership::Alone => Box::default(),
+            Membership::Static { peers, .. } => peers.clone(),
+            Membership::Kubernetes { .. } | Membership::Alone => Box::default(),
         };
         let own_zone = OwnZone::new(&config);
         let local_key = hash_fingerprint(store.local_identity().node_id.0);
@@ -697,7 +697,7 @@ where
             AdminCommand::Snapshot { reply } => {
                 let snapshot = AdminSnapshot {
                     local_identity: self.store.local_identity(),
-                    zone: self.own_zone.status().clone(),
+                    zone: self.own_zone.status(),
                     peers_by_role: self.peers.role_counts(),
                     peers: self.peers.entries(self.clock.now_millis()).collect(),
                     store_stats: self.store.stats(),
@@ -1210,7 +1210,6 @@ where
             return;
         };
         want.due = false;
-        let waited = now.saturating_sub(want.since_ms) >= self.config.zone_grace.0.get();
         let scope = if self
             .peers
             .sweep_candidates(SweepScope::Zone)
@@ -1218,10 +1217,10 @@ where
             .is_some()
         {
             SweepScope::Zone
-        } else if waited {
-            SweepScope::AnyZoneAfterGrace
         } else {
-            SweepScope::AnyZone
+            SweepScope::AnyZone {
+                waited: now.saturating_sub(want.since_ms) >= self.config.zone_grace.0.get(),
+            }
         };
         let sources = if scope == SweepScope::Zone {
             GOSSIP_SWEEP_PEERS

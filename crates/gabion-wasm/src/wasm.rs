@@ -135,7 +135,10 @@ impl Sim {
     pub async fn add_node(&self) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::AddNode { reply }).await?;
-        let batch = rx.await.map_err(|_| engine_gone())?;
+        let batch = rx
+            .await
+            .map_err(|_| engine_gone())?
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
         to_js(&batch)
     }
 

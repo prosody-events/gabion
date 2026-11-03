@@ -24,13 +24,13 @@ use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor, ValidStorageConfig};
-use gabion::discovery::{Membership, Peer, PeerEvent};
+use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::sim::{LinkPolicy, SimRouter};
 use gabion::gossip::{
     AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipError, GossipRuntime,
-    ValidGossipConfig,
 };
 use gabion::rules::RuleTable;
+use gabion::settings::{SettingError, Settings};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
@@ -96,6 +96,10 @@ pub enum EngineError {
         #[source]
         source: GossipError,
     },
+    /// A node's settings, refused as `Settings::validate` refuses them for
+    /// both adapters: a joiner whose peers overflow `gossip.peer_capacity`.
+    #[error(transparent)]
+    Setting(#[from] SettingError),
 }
 
 /// A command sent into the engine. Each carries a `oneshot` the engine replies
@@ -122,8 +126,11 @@ pub enum Command {
     Heal { reply: oneshot::Sender<()> },
     /// Spawn a fresh cold-start member that bootstraps knowing every current
     /// node. The newcomer takes the next never-reused id; survivors are told it
-    /// joined so they gossip to it. Replies with the events the join produced.
-    AddNode { reply: oneshot::Sender<EventBatch> },
+    /// joined so they gossip to it. Replies with the events the join produced,
+    /// or [`EngineError::Setting`] if the newcomer's settings fail to validate.
+    AddNode {
+        reply: oneshot::Sender<Result<EventBatch, EngineError>>,
+    },
     /// Remove the node with stable id `id`: tell every survivor it left, stop
     /// its runtime, and unbind its transport. Replies with the events the
     /// removal produced, or [`EngineError::UnknownNode`] if no such live node.
@@ -163,7 +170,7 @@ async fn engine_loop(
     valid: ValidSimConfig,
     mut cmd_rx: mpsc::Receiver<Command>,
 ) -> Result<(), EngineError> {
-    let mut state = EngineState::build(valid);
+    let mut state = EngineState::build(valid)?;
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Command::SubmitRequest {
@@ -239,8 +246,8 @@ struct NodeHandle {
 /// wrapper — the task owns it outright).
 struct EngineState {
     config: SimConfig,
-    /// Every node's gossip config, before its bootstrap peers.
-    gossip: ValidGossipConfig,
+    /// Every node's settings, before its gossip bind and static peers.
+    settings: Settings,
     /// Every node's storage, sized by [`SimConfig::settings`].
     storage: ValidStorageConfig,
     /// The watched rule, which every node interns at construction.
@@ -274,12 +281,12 @@ impl EngineState {
     fn build(
         ValidSimConfig {
             config,
-            gossip,
+            settings,
             storage,
             rules,
             rule,
         }: ValidSimConfig,
-    ) -> Self {
+    ) -> Result<Self, EngineError> {
         let log: EventLog = Rc::new(RefCell::new(Vec::new()));
         let addresses: AddressBook = Rc::new(RefCell::new(HashMap::new()));
         // One shared time base for the whole cluster; each node gets its own
@@ -289,7 +296,7 @@ impl EngineState {
         let initial_nodes = config.nodes;
         let mut state = Self {
             config,
-            gossip,
+            settings,
             storage,
             rules,
             rule,
@@ -311,7 +318,7 @@ impl EngineState {
         for _ in 0..initial_nodes {
             let id = state.next_id;
             state.next_id += 1;
-            state.spawn_node(id, &addrs);
+            state.spawn_node(id, &addrs)?;
         }
 
         // Apply the uniform i.i.d. loss model to every directed link.
@@ -328,7 +335,7 @@ impl EngineState {
             }
         }
 
-        state
+        Ok(state)
     }
 
     /// Build, spawn, and register one node with stable id `id`, bootstrapped
@@ -336,10 +343,20 @@ impl EngineState {
     /// single node-construction path: both [`EngineState::build`] and
     /// [`EngineState::add_node`] route through here.
     ///
-    /// Every node shares the storage and gossip configs `SimConfig::validate`
-    /// built once, so a joiner is sized like the initial members.
-    fn spawn_node(&mut self, id: u32, bootstrap: &[SocketAddr]) {
+    /// Every node shares the storage config and settings `SimConfig::validate`
+    /// built once, so a joiner is sized like the initial members; its gossip
+    /// config adds only its bind and peers, through `Settings::validate`.
+    fn spawn_node(&mut self, id: u32, bootstrap: &[SocketAddr]) -> Result<(), SettingError> {
         let addr = addr_of_id(id);
+        let peers: Box<[SocketAddr]> = bootstrap.iter().copied().filter(|a| *a != addr).collect();
+        let (gossip_cfg, _) = Settings {
+            // A bind with no static peers would mean Kubernetes discovery: a
+            // node with no peers yet is alone until the engine reports one.
+            gossip_bind: (!peers.is_empty()).then_some(addr),
+            bootstrap_peers: peers,
+            ..self.settings.clone()
+        }
+        .validate()?;
         let identity = NodeIdentity::new(NodeId((id as u128) * 0x100 + 1), 1);
 
         let store = CellStore::new(self.storage, identity, &self.rules);
@@ -351,10 +368,6 @@ impl EngineState {
             self.addresses.clone(),
             self.log.clone(),
         );
-
-        let mut gossip_cfg = self.gossip.clone();
-        gossip_cfg.membership =
-            Membership::Static(bootstrap.iter().copied().filter(|a| *a != addr).collect());
 
         let aggregate = Rc::new(EventEmittingAggregateStore::new(id, self.log.clone()));
         let (admin_tx, admin_rx) = mpsc::channel::<AdminCommand>(1);
@@ -388,6 +401,7 @@ impl EngineState {
             join,
             identity,
         });
+        Ok(())
     }
 
     fn current_tick(&self) -> u64 {
@@ -473,13 +487,13 @@ impl EngineState {
     /// bootstraps knowing every current node; each survivor is told it joined
     /// (via that survivor's discovery stream) so gossip flows both ways. The
     /// newcomer starts with an empty store and catches up by anti-entropy.
-    async fn add_node(&mut self) -> EventBatch {
+    async fn add_node(&mut self) -> Result<EventBatch, EngineError> {
         let id = self.next_id;
         self.next_id += 1;
         let newcomer_addr = addr_of_id(id);
         // The newcomer bootstraps against everyone currently live.
         let live_addrs: Vec<SocketAddr> = self.nodes.iter().map(|h| h.addr).collect();
-        self.spawn_node(id, &live_addrs);
+        self.spawn_node(id, &live_addrs)?;
 
         // Tell every survivor (everyone but the just-pushed newcomer) the
         // newcomer joined, so they add it to their peer table and gossip to it.
@@ -495,11 +509,11 @@ impl EngineState {
         self.drain_pending().await;
         let mut events = Vec::new();
         self.drain_log(&mut events);
-        EventBatch {
+        Ok(EventBatch {
             events,
             virtual_ms: self.virtual_ms,
             tick: self.current_tick(),
-        }
+        })
     }
 
     /// Remove the live node with stable id `id`. Symmetric with

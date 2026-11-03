@@ -20,121 +20,150 @@ const SINGLE_ZONE: &str = "If this cluster runs in a single zone, set the zone s
                            node's zone, discovery was only slow and this warning no longer \
                            applies.";
 
-/// The node's zone and what has been said about it.
-pub(super) struct OwnZone {
-    status: ZoneStatus,
-    /// The Kubernetes node a zoneless own entry named, for `zone_unknown`'s
-    /// advice.
-    node_name: Option<Box<str>>,
-    warning: Warning,
-    /// `zone_conflict` logs once per process.
-    conflict_logged: bool,
+/// The node's zone and what is left to say about it; only its own methods
+/// move it from state to state.
+pub(super) struct OwnZone(State);
+
+enum State {
+    /// `gossip.zone`; an own entry that names another zone is reported once.
+    Configured {
+        name: ZoneName,
+        conflict_logged: bool,
+    },
+    /// Read from the own EndpointSlice entry; it never changes.
+    Learned(ZoneName),
+    /// Kubernetes discovery runs and has not named the zone yet.
+    Awaiting { entry: Entry, warning: Warning },
+    /// A static list or no peers, and no setting: no Kubernetes discovery
+    /// runs to name the zone, so nothing waits for it.
+    Unconfigured,
+}
+
+/// What discovery has said of the own entry while the zone is awaited.
+enum Entry {
+    NotFound,
+    /// Found, naming no zone; the Kubernetes node it runs on is
+    /// `zone_unknown`'s advice.
+    NoZone {
+        node_name: Option<Box<str>>,
+    },
 }
 
 /// When `zone_unknown` fires.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Warning {
-    /// Not before the first peer event, on Kubernetes.
+    /// Not before the first peer event.
     Unarmed,
     /// At the first heartbeat at or after this instant.
     Due(u64),
-    /// Logged, or never to be.
+    /// Logged.
     Done,
 }
 
+/// A zone the own entry named while none was known, which only
+/// [`OwnZone::own_entry`] makes, once, so the peer table adopts at most one.
+pub(super) struct LearnedZone(ZoneHash);
+
+impl LearnedZone {
+    pub(super) fn hash(self) -> ZoneHash {
+        self.0
+    }
+}
+
 impl OwnZone {
-    /// The setting's zone, or the reason none is known yet.
+    /// The setting's zone, else a wait for the own entry on Kubernetes, else
+    /// none.
     pub(super) fn new(config: &ValidGossipConfig) -> Self {
-        let status = match (&config.zone, &config.membership) {
-            (Some(name), _) => ZoneStatus::Known {
+        Self(match (&config.zone, &config.membership) {
+            (Some(name), _) => State::Configured {
+                name: name.clone(),
+                conflict_logged: false,
+            },
+            (None, Membership::Kubernetes { .. }) => State::Awaiting {
+                entry: Entry::NotFound,
+                warning: Warning::Unarmed,
+            },
+            (None, Membership::Static { .. } | Membership::Alone) => State::Unconfigured,
+        })
+    }
+
+    /// The zone, or why none is known.
+    pub(super) fn status(&self) -> ZoneStatus {
+        match &self.0 {
+            State::Configured { name, .. } => ZoneStatus::Known {
                 name: name.clone(),
                 source: ZoneSource::Config,
             },
-            (None, Membership::Kubernetes(_)) => ZoneStatus::Unknown(UnknownZone::OwnEntryNotFound),
-            (None, _) => ZoneStatus::Unknown(UnknownZone::NotConfigured),
-        };
-        Self {
-            status,
-            node_name: None,
-            warning: Warning::Unarmed,
-            conflict_logged: false,
+            State::Learned(name) => ZoneStatus::Known {
+                name: name.clone(),
+                source: ZoneSource::EndpointSlice,
+            },
+            State::Awaiting { entry, .. } => ZoneStatus::Unknown(entry.reason()),
+            State::Unconfigured => ZoneStatus::Unknown(UnknownZone::NotConfigured),
         }
-    }
-
-    pub(super) fn status(&self) -> &ZoneStatus {
-        &self.status
     }
 
     /// The runtime starts: a configured zone says so, and a static list with
     /// no zone setting warns now, since nothing else can name the zone. A
     /// node with no peers never warns.
-    pub(super) fn start(&mut self, config: &ValidGossipConfig) {
-        match &self.status {
-            ZoneStatus::Known { name, source } => log_known(name, *source),
-            ZoneStatus::Unknown(_) => {
-                if let Membership::Static(peers) = &config.membership
-                    && !peers.is_empty()
-                {
-                    self.warning = Warning::Done;
-                    tracing::warn!(
-                        code = "zone_unknown",
-                        zone_source = "none",
-                        reason = UnknownZone::NotConfigured.as_str(),
-                        membership = config.membership.name(),
-                        config_key = Setting::GossipZone.yaml_key(),
-                        "{ONE_ZONE} This node uses a static peer list, so the zone setting is the \
-                         only place it can learn its zone. Set {} to this node's zone, for \
-                         example the cloud's zone ID; the gabion README lists commands that read \
-                         it from cloud metadata. {SINGLE_ZONE}",
-                        Setting::GossipZone,
-                    );
-                }
+    pub(super) fn start(&self, config: &ValidGossipConfig) {
+        match &self.0 {
+            State::Configured { name, .. } => log_known(name, ZoneSource::Config),
+            State::Unconfigured if matches!(config.membership, Membership::Static { .. }) => {
+                tracing::warn!(
+                    code = "zone_unknown",
+                    zone_source = "none",
+                    reason = UnknownZone::NotConfigured.as_str(),
+                    membership = config.membership.name(),
+                    config_key = Setting::GossipZone.yaml_key(),
+                    "{ONE_ZONE} This node uses a static peer list, so the zone setting is the \
+                     only place it can learn its zone. Set {} to this node's zone, for example \
+                     the cloud's zone ID; the gabion README lists commands that read it from \
+                     cloud metadata. {SINGLE_ZONE}",
+                    Setting::GossipZone,
+                );
             }
+            State::Unconfigured | State::Learned(_) | State::Awaiting { .. } => {}
         }
     }
 
-    /// A peer event arrived at `now`: on Kubernetes, the first one starts
-    /// the wait for the own entry.
+    /// A peer event arrived at `now`: the first one starts the wait for the
+    /// own entry.
     pub(super) fn note_peer_event(&mut self, now: u64, config: &ValidGossipConfig) {
-        if self.warning == Warning::Unarmed
-            && matches!(config.membership, Membership::Kubernetes(_))
-            && matches!(self.status, ZoneStatus::Unknown(_))
+        if let State::Awaiting { warning, .. } = &mut self.0
+            && *warning == Warning::Unarmed
         {
-            self.warning = Warning::Due(now.saturating_add(config.zone_grace.0.get()));
+            *warning = Warning::Due(now.saturating_add(config.zone_grace.0.get()));
         }
     }
 
     /// Discovery reported the own entry: its zone is adopted only while none
-    /// is known, and returned to announce; one that differs from the setting
-    /// is reported once. A zoneless entry never retracts a known zone.
+    /// is known, and returned for the peer table; one that differs from the
+    /// setting is reported once. A zoneless entry never retracts a known zone.
     pub(super) fn own_entry(
         &mut self,
         zone: Option<ZoneName>,
         node_name: Option<Box<str>>,
-    ) -> Option<ZoneHash> {
-        match (&self.status, zone) {
-            (ZoneStatus::Unknown(_), Some(name)) => {
-                let hash = name.hash();
+    ) -> Option<LearnedZone> {
+        match (&mut self.0, zone) {
+            (State::Awaiting { .. } | State::Unconfigured, Some(name)) => {
                 log_known(&name, ZoneSource::EndpointSlice);
-                self.status = ZoneStatus::Known {
-                    name,
-                    source: ZoneSource::EndpointSlice,
-                };
-                Some(hash)
+                let learned = LearnedZone(name.hash());
+                self.0 = State::Learned(name);
+                Some(learned)
             }
-            (ZoneStatus::Unknown(_), None) => {
-                self.status = ZoneStatus::Unknown(UnknownZone::OwnEntryHasNoZone);
-                self.node_name = node_name;
+            (State::Awaiting { entry, .. }, None) => {
+                *entry = Entry::NoZone { node_name };
                 None
             }
             (
-                ZoneStatus::Known {
+                State::Configured {
                     name,
-                    source: ZoneSource::Config,
+                    conflict_logged,
                 },
                 Some(found),
-            ) if found.as_str() != name.as_str() && !self.conflict_logged => {
-                self.conflict_logged = true;
+            ) if found.as_str() != name.as_str() && !*conflict_logged => {
+                *conflict_logged = true;
                 tracing::warn!(
                     code = "zone_conflict",
                     configured_zone = name.as_str(),
@@ -154,13 +183,7 @@ impl OwnZone {
                 );
                 None
             }
-            (
-                ZoneStatus::Known {
-                    name,
-                    source: ZoneSource::EndpointSlice,
-                },
-                Some(found),
-            ) if found.as_str() != name.as_str() => {
+            (State::Learned(name), Some(found)) if found.as_str() != name.as_str() => {
                 tracing::debug!(
                     zone = name.as_str(),
                     discovered_zone = found.as_str(),
@@ -176,26 +199,24 @@ impl OwnZone {
     /// A heartbeat at `now`: once the wait for the own entry has passed with
     /// no zone, say why.
     pub(super) fn check(&mut self, now: u64, config: &ValidGossipConfig) {
-        let Warning::Due(at) = self.warning else {
+        let State::Awaiting { entry, warning } = &mut self.0 else {
             return;
         };
-        if at > now {
-            return;
+        match *warning {
+            Warning::Due(at) if at <= now => *warning = Warning::Done,
+            Warning::Unarmed | Warning::Due(_) | Warning::Done => return,
         }
-        self.warning = Warning::Done;
-        let ZoneStatus::Unknown(reason) = self.status else {
-            return;
-        };
         let grace_ms = config.zone_grace.0.get();
-        match reason {
-            UnknownZone::OwnEntryHasNoZone => {
-                let node = self.node_name.as_deref().unwrap_or("<node>");
+        let reason = entry.reason().as_str();
+        match entry {
+            Entry::NoZone { node_name } => {
+                let node = node_name.as_deref().unwrap_or("<node>");
                 tracing::warn!(
                     code = "zone_unknown",
                     zone_source = "none",
-                    reason = reason.as_str(),
+                    reason,
                     membership = config.membership.name(),
-                    node_name = self.node_name.as_deref(),
+                    node_name = node_name.as_deref(),
                     grace_ms,
                     config_key = Setting::GossipZone.yaml_key(),
                     "{ONE_ZONE} This pod's EndpointSlice entry has no zone. Kubernetes copies it \
@@ -206,10 +227,10 @@ impl OwnZone {
                     Setting::GossipZone,
                 );
             }
-            UnknownZone::OwnEntryNotFound | UnknownZone::NotConfigured => {
+            Entry::NotFound => {
                 let self_match = match &config.membership {
-                    Membership::Kubernetes(discovery) => discovery.self_match.as_ref(),
-                    Membership::Static(_) | Membership::Alone => None,
+                    Membership::Kubernetes { discovery, .. } => discovery.self_match.as_ref(),
+                    Membership::Static { .. } | Membership::Alone => None,
                 };
                 let (hostname, self_addr, host_name_text) = match self_match {
                     Some(SelfMatch::PodName(name)) => (Some(&**name), None, &**name),
@@ -223,7 +244,7 @@ impl OwnZone {
                 tracing::warn!(
                     code = "zone_unknown",
                     zone_source = "none",
-                    reason = reason.as_str(),
+                    reason,
                     membership = config.membership.name(),
                     self_match = self_match.map_or("none", SelfMatch::name),
                     hostname,
@@ -244,6 +265,15 @@ impl OwnZone {
                     Setting::GossipZoneGrace,
                 );
             }
+        }
+    }
+}
+
+impl Entry {
+    fn reason(&self) -> UnknownZone {
+        match self {
+            Self::NotFound => UnknownZone::OwnEntryNotFound,
+            Self::NoZone { .. } => UnknownZone::OwnEntryHasNoZone,
         }
     }
 }

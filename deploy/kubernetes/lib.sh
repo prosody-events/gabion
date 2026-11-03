@@ -179,13 +179,16 @@ assert_zone_from_endpoint_slice() {
 
 # print_own_entry_wait <app>: how long each gabiond pod waited between
 # starting and learning its zone, and the longest wait; `gossip.zone_grace`
-# must stay at least five times that. Printed, never asserted.
+# must stay at least five times that. Printed, never asserted. gabiond's
+# log colours its timestamp and field names, so the colour codes are
+# stripped before parsing.
 print_own_entry_wait() {
     live_pods "$1" | while read -r pod _ _; do
         kubectl -n "$namespace" logs "$pod" | python3 -c '
 import datetime, re, sys
 start = known = None
 for line in sys.stdin:
+    line = re.sub(r"\x1b\[[0-9;]*m", "", line)
     stamp = line.split(" ", 1)[0]
     if start is None and "Starting gabion." in line:
         start = stamp
@@ -197,7 +200,10 @@ if start and known:
 ' | sed "s/^/$pod /"
     done | awk '
         { printf "own EndpointSlice entry wait: %s %s ms\n", $1, $2; if ($2 > max) max = $2 }
-        END { printf "longest own-entry wait: %d ms\n", max }'
+        END {
+            if (NR == 0) print "longest own-entry wait: not measured: no pod logged both the start line and zone_known"
+            else printf "longest own-entry wait: %d ms\n", max
+        }'
 }
 
 # gabiond_hit <port> <domain> <key> <value>: one hit through a gabiond gRPC

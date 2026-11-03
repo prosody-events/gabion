@@ -33,7 +33,6 @@ fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
     let (gossip, cell_store) = crate::mock::validated(|_| {});
     let config = LeaderConfig {
         worker_id,
-        gossip_bind: Some("127.0.0.1:0".parse().expect("addr")),
         gossip,
         cell_store,
         lease_tick: LEASE_TICK,

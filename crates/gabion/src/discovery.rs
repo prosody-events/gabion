@@ -58,16 +58,23 @@ pub struct OwnEntry {
     pub node_name: Option<Box<str>>,
 }
 
-/// How a node finds its peers, built once by
-/// [`crate::settings::Settings::validate`].
+/// How a node finds its peers, and where it listens for them: built only by
+/// [`crate::settings::Settings::validate`], so a node with peers always has a
+/// gossip bind and a static list is never empty.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Membership {
     /// Kubernetes EndpointSlice discovery: `gossip.bootstrap_peers` is empty.
-    Kubernetes(DiscoveryConfig),
+    Kubernetes {
+        bind: SocketAddr,
+        discovery: DiscoveryConfig,
+    },
     /// `gossip.bootstrap_peers`: the runtime seeds its peer table with them
     /// at construction and removes none but the row this node's own packets
     /// come from, and the Kubernetes watcher never starts.
-    Static(Box<[SocketAddr]>),
+    Static {
+        bind: SocketAddr,
+        peers: Box<[SocketAddr]>,
+    },
     /// No gossip bind (NGINX without `gabion_gossip_bind`): no peers.
     Alone,
 }
@@ -76,9 +83,18 @@ impl Membership {
     /// The `membership` log field.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Kubernetes(_) => "kubernetes",
-            Self::Static(_) => "static",
+            Self::Kubernetes { .. } => "kubernetes",
+            Self::Static { .. } => "static",
             Self::Alone => "alone",
+        }
+    }
+
+    /// `gossip.bind`, which every node with peers has; `None` for a node
+    /// alone.
+    pub fn bind(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Kubernetes { bind, .. } | Self::Static { bind, .. } => Some(*bind),
+            Self::Alone => None,
         }
     }
 
@@ -90,11 +106,11 @@ impl Membership {
     pub fn peer_events(&self) -> impl Stream<Item = PeerEvent> + use<> {
         use futures::StreamExt;
 
-        let Self::Kubernetes(config) = self else {
+        let Self::Kubernetes { discovery, .. } = self else {
             return futures::stream::empty().right_stream();
         };
         let mut errors_total = 0_u64;
-        kubernetes::EndpointSliceDiscovery::new(config.clone())
+        kubernetes::EndpointSliceDiscovery::new(discovery.clone())
             .peer_events()
             .filter_map(move |result| {
                 let event = match result {

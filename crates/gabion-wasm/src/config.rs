@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use gabion::crdt::{RuleDescriptor, ValidStorageConfig};
 use gabion::defaults;
-use gabion::gossip::ValidGossipConfig;
 use gabion::rules::{EnforcementMode, RuleDef, RuleError, RuleTable};
 use gabion::settings::{Setting, SettingError, Settings};
 use serde::{Deserialize, Serialize};
@@ -91,11 +90,12 @@ pub enum ConfigError {
     Rule(#[from] RuleError),
 }
 
-/// A [`SimConfig`] with every node's gossip and storage configs, built only by
-/// [`SimConfig::validate`].
+/// A [`SimConfig`] with every node's settings and storage config, built only
+/// by [`SimConfig::validate`].
 pub struct ValidSimConfig {
     pub(crate) config: SimConfig,
-    pub(crate) gossip: ValidGossipConfig,
+    /// Every node's settings, before its gossip bind and static peers.
+    pub(crate) settings: Settings,
     pub(crate) storage: ValidStorageConfig,
     /// The watched rule, which every node interns at construction.
     pub(crate) rules: RuleTable,
@@ -118,7 +118,8 @@ impl SimConfig {
                 got: self.uniform_loss,
             });
         }
-        let (gossip, storage) = self.settings()?.validate()?;
+        let settings = self.settings()?;
+        let (_, storage) = settings.validate()?;
         let rule = RuleDef {
             name: "watched",
             domain: "viz",
@@ -133,7 +134,7 @@ impl SimConfig {
         let rules = RuleTable::new(Box::new([rule]), storage.rule_dictionary_capacity())?;
         Ok(ValidSimConfig {
             config: self,
-            gossip,
+            settings,
             storage,
             rules,
             rule: descriptor,

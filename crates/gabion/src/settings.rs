@@ -274,16 +274,20 @@ impl Settings {
     /// How this node finds its peers: alone without a gossip bind, else from
     /// `gossip.bootstrap_peers` when it lists any, else from Kubernetes.
     fn membership(&self) -> Membership {
-        if self.gossip_bind.is_none() {
-            Membership::Alone
-        } else if self.bootstrap_peers.is_empty() {
-            Membership::Kubernetes(DiscoveryConfig {
-                self_match: SelfMatch::resolve(self.self_addr),
-                namespace_allow: self.namespace_allow.clone(),
-                service_allow: self.service_allow.clone(),
-            })
-        } else {
-            Membership::Static(self.bootstrap_peers.clone())
+        match self.gossip_bind {
+            None => Membership::Alone,
+            Some(bind) if self.bootstrap_peers.is_empty() => Membership::Kubernetes {
+                bind,
+                discovery: DiscoveryConfig {
+                    self_match: SelfMatch::resolve(self.self_addr),
+                    namespace_allow: self.namespace_allow.clone(),
+                    service_allow: self.service_allow.clone(),
+                },
+            },
+            Some(bind) => Membership::Static {
+                bind,
+                peers: self.bootstrap_peers.clone(),
+            },
         }
     }
 

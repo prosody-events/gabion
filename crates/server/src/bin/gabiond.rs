@@ -63,12 +63,13 @@ async fn run() -> anyhow::Result<()> {
 
     let config = load_config()?;
     let gossip_bind = config
-        .settings
-        .gossip_bind
+        .gossip
+        .membership()
+        .bind()
         .ok_or(ConfigError::MissingGossipBind)?;
     let rule_table = Arc::new(config.rules);
     tracing::info!(
-        gossip_bind = ?config.settings.gossip_bind,
+        gossip_bind = %gossip_bind,
         envoy_bind = ?config.settings.envoy_bind,
         admin_bind = ?config.settings.admin_bind,
         rules_loaded = rule_table.rules().len(),
@@ -77,7 +78,7 @@ async fn run() -> anyhow::Result<()> {
         max_peers = config.settings.peer_capacity,
         max_peer_instances = config.storage.node_dictionary_capacity(),
         zone_setting = config.settings.zone.as_ref().map(ZoneName::as_str),
-        membership = config.gossip.membership.name(),
+        membership = config.gossip.membership().name(),
         "Starting gabion.",
     );
 
@@ -98,7 +99,7 @@ async fn run() -> anyhow::Result<()> {
     let (admin_tx, admin_rx) = admin::admin_channel();
 
     config.gossip.note_startup();
-    let peer_events = config.gossip.membership.peer_events();
+    let peer_events = config.gossip.membership().peer_events();
     let (gossip_rt, gossip_client) = GossipRuntime::bind(
         gossip_bind,
         config.gossip,

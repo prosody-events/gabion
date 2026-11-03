@@ -58,9 +58,9 @@ const LONE_NODE_BIND: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LO
 #[derive(Clone, Debug)]
 pub struct LeaderConfig {
     pub worker_id: u32,
-    /// `None` runs this node alone: the leader still folds its hits into
-    /// the shared counts, but nothing can reach it to gossip.
-    pub gossip_bind: Option<SocketAddr>,
+    /// Its membership's bind; with none, this node runs alone: the leader
+    /// still folds its hits into the shared counts, but nothing can reach it
+    /// to gossip.
     pub gossip: ValidGossipConfig,
     pub cell_store: ValidStorageConfig,
     pub lease_tick: Duration,
@@ -240,14 +240,14 @@ async fn leader_main(
     // loopback port can't collide with another nginx on the same host, there
     // is no one to discover, and it asks for the smallest buffers, since it
     // sends nothing.
-    let (bind, gossip) = match config.gossip_bind {
+    let (bind, gossip) = match config.gossip.membership().bind() {
         Some(bind) => {
             config.gossip.note_startup();
             (bind, config.gossip)
         }
         None => (LONE_NODE_BIND, config.gossip.with_minimal_socket_buffers()),
     };
-    let peers = gossip.membership.peer_events();
+    let peers = gossip.membership().peer_events();
     // Bind before the store empties the count table: a term that cannot
     // start leaves the last counts in force, with no leader to refill them.
     let transport = UdpTransport::bind(bind, &gossip)

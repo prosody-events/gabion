@@ -43,7 +43,6 @@ use gabion::crdt::{
     RelayMark, Stream,
 };
 use gabion::defaults::{GOSSIP_MIN_EMIT_INTERVAL_MS, GOSSIP_TICK_INTERVAL_MILLIS};
-use gabion::discovery::Membership;
 use gabion::gossip::sim::sim_advance;
 use gabion::gossip::{GossipClient, GossipRuntime, GossipTransport, TokioClock};
 use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
@@ -325,12 +324,16 @@ impl Bench {
             .build()
             .expect("tokio runtime");
         let context = tokio.enter();
-        let settings = Settings::default();
-        let (mut gossip, storage) = settings.validate().expect("default settings validate");
         let peers = usize::from(peers);
-        gossip.membership = Membership::Static((0..peers).map(addr).collect());
         let zone_name = |zone: usize| ZoneName::parse(&format!("az-{zone}")).expect("a zone name");
-        gossip.zone = Some(zone_name(0));
+        let settings = Settings {
+            // This node's own address, outside the peers' range.
+            gossip_bind: Some(SocketAddr::from(([10, 255, 0, 0], 9000))),
+            bootstrap_peers: (0..peers).map(addr).collect(),
+            zone: Some(zone_name(0)),
+            ..Settings::default()
+        };
+        let (gossip, storage) = settings.validate().expect("the bench settings validate");
         // A month-long window: no cell expires while the bench runs.
         let rules = RuleTable::new(
             Box::new([RuleDef {

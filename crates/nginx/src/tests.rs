@@ -58,8 +58,7 @@ fn bootstrap_peers_parse_in_both_adapters() {
     assert_eq!(&*settings.bootstrap_peers, expected);
 }
 
-/// U17 through NGINX: an empty or invalid `gabion_gossip_zone` fails
-/// `nginx -t`.
+/// An empty or invalid `gabion_gossip_zone` fails `nginx -t`.
 #[test]
 fn nginx_invalid_zone_fails_nginx_t() {
     let setting = directive("gabion_gossip_zone");

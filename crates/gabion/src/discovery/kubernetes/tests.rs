@@ -335,7 +335,7 @@ fn quickcheck_endpoint_slice_events_match_live_slice_model(
     TestResult::passed()
 }
 
-/// U21: the own entry is found by `discovery.self_addr` or by its Pod name,
+/// The own entry is found by `discovery.self_addr` or by its Pod name,
 /// its zone read before the readiness filter, and it is never a peer. It is
 /// reported the first time, zoneless too, and on each zone change only; a
 /// slice without it retracts nothing.
@@ -421,7 +421,7 @@ fn own_entry_found_by_addr_or_pod_name() {
     assert!(peers.contains_key(&peer("10.0.0.1").addr));
 }
 
-/// U22: an address moving between slices, or listed by two Services, is
+/// An address moving between slices, or listed by two Services, is
 /// removed only when the last lister lets go, whichever lets go first.
 #[test]
 fn address_moving_between_slices_is_never_removed() {
@@ -463,7 +463,11 @@ fn static_membership_starts_no_watcher() {
         let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
         let addr = "192.0.2.11:9000".parse().expect("addr");
-        for membership in [Membership::Static([addr].into()), Membership::Alone] {
+        let listed = Membership::Static {
+            bind: addr,
+            peers: [addr].into(),
+        };
+        for membership in [listed, Membership::Alone] {
             let mut events = std::pin::pin!(membership.peer_events());
             let polled = events.poll_next_unpin(&mut cx);
             assert_eq!(polled, std::task::Poll::Ready(None), "{membership:?}");

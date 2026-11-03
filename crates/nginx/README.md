@@ -270,7 +270,7 @@ without one. Mirrors nginx core's `limit_req_zone zone=name:size`.
 
 Like nginx's own shared-memory zones, a limit zone survives `nginx -s reload` when its
 name and size are unchanged: the node identity and any queued hits
-carry over, and the log line `gabion: zone ready` says `reused=true`.
+carry over, and the log line `gabion: limit zone ready` says `reused=true`.
 The counts do not: whenever a worker takes over gossip (after a reload,
 a crash, or a lost lease), it empties the count table and peers gossip
 the counts back, usually within a gossip tick or two, longer when the
@@ -293,7 +293,7 @@ the request queue (`gabion_gossip_limit_queue_capacity` × 72 bytes,
 rounded up to a power of two: 576 KiB at the default) and nginx's slab
 bookkeeping (under 1%), the rest becomes a power-of-two table of 64-byte slots, so each doubling of
 SIZE doubles the slots (`2m` holds 16,384, `64m` holds 524,288; the
-`gabion: zone ready` log line reports `slots`). A rule needs about
+`gabion: limit zone ready` log line reports `slots`). A rule needs about
 *active keys × (window / bucket + 1)* slots, and lookups stay short
 while the table is under half full. For example, 650 keys a second under
 `rate=20r/s window=10s bucket=1s` keep about 650 × 11 ≈ 7,200 cells
@@ -875,6 +875,20 @@ Message starts: "gabion: this reload changes `gabion_gossip_limit_queue_capacity
 **What to do next.** Change SIZE in `gabion_limit_zone` along with `gabion_gossip_limit_queue_capacity` (a larger queue needs a larger SIZE anyway, 72 bytes a slot), so nginx maps a fresh limit zone, or restart nginx.
 
 **Fields** `running`, `configured` · **Knob** `gabion_gossip_limit_queue_capacity`, `gabion_limit_zone`
+
+### `limit_zone_ready`
+
+**Level** info, once per configuration load · **Request allowed** not applicable · **Emitted by** NGINX module only
+
+Message starts: "gabion: limit zone ready"
+
+**What happened.** nginx mapped the `gabion_limit_zone` shared memory, fresh or reused from the previous configuration, and gabion laid out its count table and request queue in it.
+
+**Why.** nginx loaded a configuration that declares rules: at startup, and on every `nginx -s reload`.
+
+**What to do next.** Nothing. To size the limit zone, compare `slots` with the live cells your rules need (the `gabion_limit_zone` sizing notes above). `reused=true` means a reload kept the queued hits and node identity.
+
+**Fields** `limit_zone`, `bytes`, `slots`, `queue`, `reused` · **Knob** `gabion_limit_zone`
 
 Operator-facing errors are written to answer three questions: *what
 happened*, *why it likely happened*, and *what to do next*. If you

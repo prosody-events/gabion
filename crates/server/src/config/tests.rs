@@ -288,7 +288,11 @@ fn bootstrap_peers_parse_in_both_adapters() {
     let peers: [SocketAddr; 2] = ["10.0.0.2:9000", "10.0.0.3:9000"].map(|a| a.parse().unwrap());
     let check = |config: AppConfig| {
         assert_eq!(&*config.settings.bootstrap_peers, peers);
-        assert_eq!(config.gossip.membership, Membership::Static(peers.into()));
+        let static_peers = Membership::Static {
+            bind: "0.0.0.0:9000".parse().unwrap(),
+            peers: peers.into(),
+        };
+        assert_eq!(config.gossip.membership(), &static_peers);
     };
     set_env("GABION_GOSSIP_BIND", "0.0.0.0:9000");
     set_env(
@@ -302,7 +306,7 @@ fn bootstrap_peers_parse_in_both_adapters() {
     check(AppConfig::load_with_yaml_str(yaml).expect("yaml loads"));
 }
 
-/// U17 through gabiond: an empty or invalid zone fails to load.
+/// An empty or invalid zone fails gabiond's load.
 #[test]
 fn invalid_zone_fails_load_in_gabiond() {
     let _env = EnvGuard::lock();
