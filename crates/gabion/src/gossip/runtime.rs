@@ -470,8 +470,8 @@ where
         };
         // A sender outside the table, or a late incarnation, is never acked
         // and its freshness cannot be judged, but what a flagged packet raised
-        // is relayed: an origin's gateway relays its hits before discovery
-        // has reported the origin.
+        // is relayed promptly: an origin's gateway relays its hits before
+        // discovery has reported the origin.
         let unjudged = match header.payload {
             Payload::Cells(CellPayload::Own {
                 relay_into_zone: true,
@@ -531,7 +531,6 @@ where
                 (RelayMark::Clear, false)
             }
         };
-        let relay_head = self.store.head(Stream::Relay);
         self.merge(mark);
         let heads = self.heads();
         let incarnation = self.store.local_identity().incarnation;
@@ -541,19 +540,20 @@ where
         if probe {
             self.peers.set_flag(row, PeerFlags::REPLY_DUE, true);
         }
-        self.prompt_work |= heads.relay > relay_head
-            || credit.resend_relay
+        self.prompt_work |= credit.resend_relay
             || self.peers.stale()
             || self.sweep_due()
             || self.peers.flags(row).has(PeerFlags::PROMPT);
     }
 
     /// Merge the decoded cells, moving remote ones on or off the relay list
-    /// by `mark`.
+    /// by `mark`, and ask for a prompt round if that raised the relay head.
     fn merge(&mut self, mark: RelayMark) {
+        let relay_head = self.store.head(Stream::Relay);
         self.store
             .merge_remote(&self.obs_buf, &mut self.sink_buf, mark);
         self.counters.cells_merged += self.sink_buf.len() as u64;
+        self.prompt_work |= self.store.head(Stream::Relay) > relay_head;
     }
 
     /// Count a dropped packet against its cause, and log at powers of two of

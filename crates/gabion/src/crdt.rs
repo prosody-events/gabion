@@ -330,7 +330,7 @@ pub enum RelayMark {
     /// the merge raised leaves the relay list, its sender being responsible
     /// for it here.
     Clear,
-    /// A flagged packet that is not fresh: mark the cells the merge raised.
+    /// A flagged packet not judged fresh: mark the cells the merge raised.
     Changed,
     /// A fresh flagged packet: mark every cell, raised or not.
     All,

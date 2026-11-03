@@ -1835,8 +1835,9 @@ fn unknown_sender_is_never_acked() {
             for packet in cell_packets(node(0xD), 0, 3, flagged) {
                 wire.inbound.borrow_mut().push_back((packet, stranger));
             }
-            // Read and relayed on one heartbeat, before any retry.
-            heartbeats(1).await;
+            // Read and relayed promptly, well before the next heartbeat.
+            wake(&wire);
+            sim_advance_ticks(Duration::from_millis(1), 10).await;
             let relayed = if flagged { 3 } else { 0 };
             assert_eq!(relayed_cells(&wire, m, mark), relayed, "{flagged}");
             heartbeats(2).await;
