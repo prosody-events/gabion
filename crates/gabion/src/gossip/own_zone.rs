@@ -32,8 +32,13 @@ enum State {
     },
     /// Read from the own EndpointSlice entry; it never changes.
     Learned(ZoneName),
-    /// Kubernetes discovery runs and has not named the zone yet.
-    Awaiting { entry: Entry, warning: Warning },
+    /// Kubernetes discovery runs and has not named the zone yet;
+    /// `self_match` is how it looks for the own entry.
+    Awaiting {
+        self_match: Option<SelfMatch>,
+        entry: Entry,
+        warning: Warning,
+    },
     /// A static list or no peers, and no setting: no Kubernetes discovery
     /// runs to name the zone, so nothing waits for it.
     Unconfigured,
@@ -79,7 +84,8 @@ impl OwnZone {
                 name: name.clone(),
                 conflict_logged: false,
             },
-            (None, Membership::Kubernetes { .. }) => State::Awaiting {
+            (None, Membership::Kubernetes { discovery, .. }) => State::Awaiting {
+                self_match: discovery.self_match.clone(),
                 entry: Entry::NotFound,
                 warning: Warning::Unarmed,
             },
@@ -199,7 +205,12 @@ impl OwnZone {
     /// A heartbeat at `now`: once the wait for the own entry has passed with
     /// no zone, say why.
     pub(super) fn check(&mut self, now: u64, config: &ValidGossipConfig) {
-        let State::Awaiting { entry, warning } = &mut self.0 else {
+        let State::Awaiting {
+            self_match,
+            entry,
+            warning,
+        } = &mut self.0
+        else {
             return;
         };
         match *warning {
@@ -215,7 +226,7 @@ impl OwnZone {
                     code = "zone_unknown",
                     zone_source = "none",
                     reason,
-                    membership = config.membership.name(),
+                    membership = "kubernetes",
                     node_name = node_name.as_deref(),
                     grace_ms,
                     config_key = Setting::GossipZone.yaml_key(),
@@ -228,10 +239,7 @@ impl OwnZone {
                 );
             }
             Entry::NotFound => {
-                let self_match = match &config.membership {
-                    Membership::Kubernetes { discovery, .. } => discovery.self_match.as_ref(),
-                    Membership::Static { .. } | Membership::Alone => None,
-                };
+                let self_match = self_match.as_ref();
                 let (hostname, self_addr, host_name_text) = match self_match {
                     Some(SelfMatch::PodName(name)) => (Some(&**name), None, &**name),
                     Some(SelfMatch::Addr(addr)) => (
@@ -245,7 +253,7 @@ impl OwnZone {
                     code = "zone_unknown",
                     zone_source = "none",
                     reason,
-                    membership = config.membership.name(),
+                    membership = "kubernetes",
                     self_match = self_match.map_or("none", SelfMatch::name),
                     hostname,
                     self_addr = self_addr.map(tracing::field::display),
