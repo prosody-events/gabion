@@ -131,10 +131,12 @@ impl Sim {
     /// Add a fresh cold-start node to the live cluster. It joins by gossip and
     /// catches up by anti-entropy — no rebuild. Resolves to the
     /// [`crate::event::EventBatch`] the join produced; the new node's stable id
-    /// appears in the next [`Sim::snapshot`].
-    pub async fn add_node(&self) -> Result<JsValue, JsValue> {
+    /// appears in the next [`Sim::snapshot`]. It joins zone `zone`, or the zone
+    /// with the fewest live members; an index past the last zone throws
+    /// [`crate::engine::EngineError::UnknownZone`].
+    pub async fn add_node(&self, zone: Option<u8>) -> Result<JsValue, JsValue> {
         let (reply, rx) = oneshot::channel();
-        self.send(Command::AddNode { reply }).await?;
+        self.send(Command::AddNode { zone, reply }).await?;
         let batch = rx
             .await
             .map_err(|_| engine_gone())?

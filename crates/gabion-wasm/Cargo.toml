@@ -16,8 +16,9 @@ crate-type = ["cdylib", "rlib"]
 # and flipping it at the workspace level would break the production adapters.
 # No version key, so the `workspace deps only` hygiene rule still holds. The
 # visualizer drops the Kubernetes client and UDP transport (neither builds for
-# wasm32) and adds the per-cell admin dump it renders from.
-gabion = { path = "../gabion", default-features = false, features = ["cell-dump"] }
+# wasm32) and adds the per-cell admin dump it renders from, and serialises the
+# admin snapshot's role and answer types.
+gabion = { path = "../gabion", default-features = false, features = ["cell-dump", "serde"] }
 futures.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true

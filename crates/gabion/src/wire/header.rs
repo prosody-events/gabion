@@ -210,8 +210,10 @@ fn bit(set: bool, flag: u8) -> u8 {
 }
 
 /// Decode a header and its cell count, checking the length, magic, version,
-/// kind, flags and range, then the cluster id, in that order.
-pub(crate) fn read_header(
+/// kind, flags and range, then the cluster id, in that order. Public so a
+/// simulator can tag the packets it carries; the runtime decodes whole packets
+/// through [`decode`](super::decode).
+pub fn read_header(
     bytes: &[u8],
     cluster_id_hash: NonZeroU128,
 ) -> Result<(Header, u16), DecodeError> {

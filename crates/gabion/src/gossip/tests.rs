@@ -1311,6 +1311,20 @@ async fn admin_snapshot_reflects_runtime_state() {
             assert_eq!(snapshot.peers[0].role, Role::Unheard);
             assert_eq!(snapshot.peers[0].own_unacked, 1);
 
+            // The counters alone read what the snapshot's copy holds.
+            let (reply_tx, reply_rx) = oneshot::channel::<GossipCounters>();
+            admin_tx
+                .send(AdminCommand::Counters { reply: reply_tx })
+                .await
+                .unwrap();
+            let counters = reply_rx.await.unwrap();
+            assert!(counters.rounds_heartbeat >= 1);
+            assert_eq!(
+                counters.rounds_heartbeat,
+                snapshot.counters.rounds_heartbeat
+            );
+            assert_eq!(counters.packets_sent, snapshot.counters.packets_sent);
+
             client.shutdown().await.unwrap();
             let _ = handle.await;
         })

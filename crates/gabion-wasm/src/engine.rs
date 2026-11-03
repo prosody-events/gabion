@@ -19,6 +19,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU128;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -27,23 +28,31 @@ use gabion::crdt::{CellStore, KeyHash, NodeId, NodeIdentity, RuleDescriptor, Val
 use gabion::discovery::{Peer, PeerEvent};
 use gabion::gossip::sim::{LinkPolicy, SimRouter};
 use gabion::gossip::{
-    AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipError, GossipRuntime,
+    AdminCommand, AdminSnapshot, CellDumpSnapshot, GossipClient, GossipCounters, GossipError,
+    GossipRuntime, PeerZone, Role,
 };
 use gabion::rules::RuleTable;
 use gabion::settings::{SettingError, Settings};
+use gabion::zone::{ZoneHash, ZoneName};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, LocalSet};
 
 use crate::clock::{ManualClock, SharedNow, Tickers};
-use crate::config::{MAX_NODES, SimConfig, ValidSimConfig};
-use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView};
-use crate::shims::{AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport};
+use crate::config::{MAX_NODES, MAX_ZONES, SimConfig, ValidSimConfig, ZONE_NAMES, ZoneMode};
+use crate::event::{
+    BytesByTier, CellView, ClusterState, Event, EventBatch, EventKind, NodeState, PeerView,
+    ZoneView,
+};
+use crate::shims::{
+    AddressBook, EventEmittingAggregateStore, EventLog, LoggingSimTransport, Member,
+};
 
 /// First UDP port the engine assigns; node `i` binds `BASE_PORT + i`.
 const BASE_PORT: u16 = 40_000;
-/// Cluster id mixed into every packet header (matches the bench).
-pub(crate) const CLUSTER_ID_HASH: u128 = 0xC1;
+/// Cluster id mixed into every packet header (matches the bench). Non-zero,
+/// checked when the constant is evaluated.
+pub(crate) const CLUSTER_ID_HASH: NonZeroU128 = NonZeroU128::new(0xC1).unwrap();
 
 /// Each node's inbound queue: two packets from each of the other
 /// `MAX_NODES − 1` nodes, 510 at 256 nodes, for every node in one zone. A
@@ -88,6 +97,11 @@ pub enum EngineError {
     )]
     UnknownNode { id: u32 },
     #[error(
+        "a node cannot join zone {zone}: this cluster has {zones} zones, numbered 0 to {last}. \
+         Pick a zone shown on the stage, or rebuild with more zones."
+    )]
+    UnknownZone { zone: u8, zones: u8, last: u8 },
+    #[error(
         "the gossip runtime for node {node} has stopped, so the request could not be recorded. \
          The simulation has ended; reload to start over."
     )]
@@ -127,8 +141,12 @@ pub enum Command {
     /// Spawn a fresh cold-start member that bootstraps knowing every current
     /// node. The newcomer takes the next never-reused id; survivors are told it
     /// joined so they gossip to it. Replies with the events the join produced,
-    /// or [`EngineError::Setting`] if the newcomer's settings fail to validate.
+    /// [`EngineError::UnknownZone`] for a zone the cluster does not have, or
+    /// [`EngineError::Setting`] if the newcomer's settings fail to validate.
     AddNode {
+        /// The zone to join; `None` joins the zone with the fewest live
+        /// members, the lowest index on a tie.
+        zone: Option<u8>,
         reply: oneshot::Sender<Result<EventBatch, EngineError>>,
     },
     /// Remove the node with stable id `id`: tell every survivor it left, stop
@@ -193,8 +211,8 @@ async fn engine_loop(
                 state.heal();
                 let _ = reply.send(());
             }
-            Command::AddNode { reply } => {
-                let _ = reply.send(state.add_node().await);
+            Command::AddNode { zone, reply } => {
+                let _ = reply.send(state.add_node(zone).await);
             }
             Command::RemoveNode { id, reply } => {
                 let _ = reply.send(state.remove_node(id).await);
@@ -224,6 +242,8 @@ async fn engine_loop(
 struct NodeHandle {
     /// Stable id (see [`crate::event`]). Assigned once, never reused.
     id: u32,
+    /// The zone it is placed in.
+    zone: u8,
     /// This node's gossip address, `127.0.0.1:(BASE_PORT + id)`. Cached so a
     /// removal can unbind it without recomputing.
     addr: SocketAddr,
@@ -240,6 +260,10 @@ struct NodeHandle {
     peer_tx: UnboundedSender<PeerEvent>,
     join: JoinHandle<Result<(), GossipError>>,
     identity: NodeIdentity,
+    /// This runtime's counters as last read, for the round and role diffs.
+    seen: GossipCounters,
+    /// Its gateway into each zone as last read.
+    gateways: [Option<u32>; MAX_ZONES],
 }
 
 /// All engine state, owned as a local inside [`engine_loop`] (no `Rc<RefCell>`
@@ -255,6 +279,8 @@ struct EngineState {
     /// That rule's descriptor: the bucket epoch the submission path stamps
     /// and the window the snapshot reports.
     rule: RuleDescriptor,
+    /// Every zone's name, parsed and hashed once.
+    zone_names: Box<[ZoneName]>,
     router: SimRouter,
     nodes: Vec<NodeHandle>,
     addresses: AddressBook,
@@ -275,6 +301,14 @@ struct EngineState {
     virtual_ms: u64,
     /// Sub-steps `step` has taken: one per heartbeat in a quiet cluster.
     substeps: u64,
+    /// Bytes every sender put on the wire, drained from the log.
+    bytes_by_tier: BytesByTier,
+    /// Which nodes' prompt tickers are armed at the start of a sub-step;
+    /// reserved once so no sub-step allocates it.
+    armed: Vec<bool>,
+    /// Admin snapshots the gateway diff has fetched: one per node whose roles
+    /// moved.
+    gateway_fetches: u64,
 }
 
 impl EngineState {
@@ -285,6 +319,7 @@ impl EngineState {
             storage,
             rules,
             rule,
+            zone_names,
         }: ValidSimConfig,
     ) -> Result<Self, EngineError> {
         let log: EventLog = Rc::new(RefCell::new(Vec::new()));
@@ -300,6 +335,7 @@ impl EngineState {
             storage,
             rules,
             rule,
+            zone_names,
             router: SimRouter::with_channel_capacity(VIZ_ROUTER_CAPACITY),
             nodes: Vec::with_capacity(initial_nodes),
             addresses,
@@ -309,16 +345,20 @@ impl EngineState {
             now,
             virtual_ms: 0,
             substeps: 0,
+            bytes_by_tier: BytesByTier::default(),
+            armed: Vec::with_capacity(MAX_NODES),
+            gateway_fetches: 0,
         };
 
         // The initial members are ids 0..N, so the address of id `i` is
         // `BASE_PORT + i` — the same set every member bootstraps against, and
         // the set a later newcomer will be handed too.
         let addrs: Vec<SocketAddr> = (0..initial_nodes).map(|i| addr_of_id(i as u32)).collect();
+        let zones = state.zone_names.len();
         for _ in 0..initial_nodes {
             let id = state.next_id;
             state.next_id += 1;
-            state.spawn_node(id, &addrs)?;
+            state.spawn_node(id, (id as usize % zones) as u8, &addrs)?;
         }
 
         // Apply the uniform i.i.d. loss model to every directed link.
@@ -346,7 +386,12 @@ impl EngineState {
     /// Every node shares the storage config and settings `SimConfig::validate`
     /// built once, so a joiner is sized like the initial members; its gossip
     /// config adds only its bind and peers, through `Settings::validate`.
-    fn spawn_node(&mut self, id: u32, bootstrap: &[SocketAddr]) -> Result<(), SettingError> {
+    fn spawn_node(
+        &mut self,
+        id: u32,
+        zone: u8,
+        bootstrap: &[SocketAddr],
+    ) -> Result<(), SettingError> {
         let addr = addr_of_id(id);
         let peers: Box<[SocketAddr]> = bootstrap.iter().copied().filter(|a| *a != addr).collect();
         let (gossip_cfg, _) = Settings {
@@ -354,6 +399,10 @@ impl EngineState {
             // node with no peers yet is alone until the engine reports one.
             gossip_bind: (!peers.is_empty()).then_some(addr),
             bootstrap_peers: peers,
+            zone: match self.config.zone_mode {
+                ZoneMode::Configured => Some(self.zone_names[usize::from(zone)].clone()),
+                ZoneMode::Unset => None,
+            },
             ..self.settings.clone()
         }
         .validate()?;
@@ -365,6 +414,7 @@ impl EngineState {
             self.router.bind(addr),
             self.router.clone(),
             id,
+            zone,
             self.addresses.clone(),
             self.log.clone(),
         );
@@ -389,9 +439,12 @@ impl EngineState {
         let join = tokio::task::spawn_local(runtime.run(peer_rx));
 
         self.node_id_index.insert(identity.node_id.0, id);
-        self.addresses.borrow_mut().insert(addr, id);
+        self.addresses
+            .borrow_mut()
+            .insert(addr, Member { id, zone });
         self.nodes.push(NodeHandle {
             id,
+            zone,
             addr,
             client,
             aggregate,
@@ -400,6 +453,8 @@ impl EngineState {
             peer_tx,
             join,
             identity,
+            seen: GossipCounters::default(),
+            gateways: [None; MAX_ZONES],
         });
         Ok(())
     }
@@ -486,14 +541,28 @@ impl EngineState {
     /// Spawn a fresh cold-start member. It takes the next never-reused id and
     /// bootstraps knowing every current node; each survivor is told it joined
     /// (via that survivor's discovery stream) so gossip flows both ways. The
-    /// newcomer starts with an empty store and catches up by anti-entropy.
-    async fn add_node(&mut self) -> Result<EventBatch, EngineError> {
+    /// newcomer starts with an empty store and catches up by anti-entropy. It
+    /// joins `zone`, or the zone with the fewest live members.
+    async fn add_node(&mut self, zone: Option<u8>) -> Result<EventBatch, EngineError> {
+        let zones = self.zone_names.len();
+        let zone = match zone {
+            Some(zone) if usize::from(zone) >= zones => {
+                let zones = zones as u8;
+                return Err(EngineError::UnknownZone {
+                    zone,
+                    zones,
+                    last: zones - 1,
+                });
+            }
+            Some(zone) => zone,
+            None => self.smallest_zone(),
+        };
         let id = self.next_id;
         self.next_id += 1;
         let newcomer_addr = addr_of_id(id);
         // The newcomer bootstraps against everyone currently live.
         let live_addrs: Vec<SocketAddr> = self.nodes.iter().map(|h| h.addr).collect();
-        self.spawn_node(id, &live_addrs)?;
+        self.spawn_node(id, zone, &live_addrs)?;
 
         // Tell every survivor (everyone but the just-pushed newcomer) the
         // newcomer joined, so they add it to their peer table and gossip to it.
@@ -560,12 +629,29 @@ impl EngineState {
         })
     }
 
+    /// Live members in each zone, by zone index.
+    fn live_by_zone(&self) -> [u32; MAX_ZONES] {
+        let mut live = [0; MAX_ZONES];
+        for node in &self.nodes {
+            live[usize::from(node.zone)] += 1;
+        }
+        live
+    }
+
+    /// The zone with the fewest live members, the lowest index on a tie.
+    fn smallest_zone(&self) -> u8 {
+        let live = self.live_by_zone();
+        let zones = self.zone_names.len();
+        (0..zones)
+            .min_by_key(|&zone| (live[zone], zone))
+            .map_or(0, |zone| zone as u8)
+    }
+
     async fn step(&mut self, delta_ms: u64) -> EventBatch {
         let tick_ms = self.config.tick_interval_ms;
         let floor_ms = self.config.min_emit_interval_ms;
         let target = self.virtual_ms.saturating_add(delta_ms);
         let mut events = Vec::new();
-        let mut prev = self.admin_counters().await;
 
         // Advance event by event: to the next heartbeat, or one relay floor
         // when any node's prompt ticker is armed (it has resends, gap
@@ -582,11 +668,17 @@ impl EngineState {
         // ticks are already consumed, so a freshly merged count goes out no
         // earlier than the next sub-step. `submit` and churn paths never arm
         // deferral.
+        //
+        // After each sub-step the engine reads every runtime's counters, emits
+        // its rounds, and fetches a node's snapshot only when its role count
+        // moved.
         loop {
             let t = self.virtual_ms;
             let heartbeat = (t / tick_ms + 1).saturating_mul(tick_ms);
-            let armed: Vec<bool> = self.nodes.iter().map(|n| n.tickers.armed.get()).collect();
-            let next = if armed.contains(&true) {
+            self.armed.clear();
+            self.armed
+                .extend(self.nodes.iter().map(|n| n.tickers.armed.get()));
+            let next = if self.armed.contains(&true) {
                 heartbeat.min(t + floor_ms)
             } else {
                 heartbeat
@@ -598,14 +690,12 @@ impl EngineState {
             self.now.set(next);
             self.substeps += 1;
             self.router.begin_deferred();
-            self.fire(next, next == heartbeat, &armed).await;
+            self.fire(next, next == heartbeat).await;
             self.drain_pending().await;
             self.router.release_deferred();
             self.drain_pending().await;
             self.drain_log(&mut events);
-            let now = self.admin_counters().await;
-            self.push_tick_events(&prev, &now, &mut events);
-            prev = now;
+            self.observe(&mut events).await;
         }
 
         // A remainder short of the next event moves the clock without firing
@@ -625,12 +715,12 @@ impl EngineState {
     }
 
     /// Fire, in node order, every heartbeat when `heartbeat` is set and the
-    /// prompt ticker of every node `armed` marks, each for the instant `at`.
-    /// Each send queues in that node's bounded inbox, so a busy runtime still
-    /// consumes the tick on its next idle poll rather than dropping it. A
+    /// prompt ticker of every node `self.armed` marks, each for the instant
+    /// `at`. Each send queues in that node's bounded inbox, so a busy runtime
+    /// still consumes the tick on its next idle poll rather than dropping it. A
     /// closed inbox (the runtime stopped) is ignored.
-    async fn fire(&self, at: u64, heartbeat: bool, armed: &[bool]) {
-        for (node, &armed) in self.nodes.iter().zip(armed) {
+    async fn fire(&self, at: u64, heartbeat: bool) {
+        for (node, &armed) in self.nodes.iter().zip(&self.armed) {
             if heartbeat {
                 let _ = node.tickers.heartbeat.send(at).await;
             }
@@ -642,14 +732,26 @@ impl EngineState {
 
     /// Drain the shims' raw events, stamping each with the current virtual
     /// time and gossip-tick index.
-    fn drain_log(&self, events: &mut Vec<Event>) {
+    /// Every packet sent or dropped also counts into `bytes_by_tier`.
+    fn drain_log(&mut self, events: &mut Vec<Event>) {
         let tick = self.current_tick();
         let virtual_ms = self.virtual_ms;
         let mut log = self.log.borrow_mut();
-        events.extend(log.drain(..).map(|kind| Event {
-            tick,
-            virtual_ms,
-            kind,
+        events.extend(log.drain(..).map(|kind| {
+            if let EventKind::PacketSent {
+                bytes, kind, tier, ..
+            }
+            | EventKind::PacketDropped {
+                bytes, kind, tier, ..
+            } = &kind
+            {
+                self.bytes_by_tier.add(*tier, *kind, *bytes);
+            }
+            Event {
+                tick,
+                virtual_ms,
+                kind,
+            }
         }));
     }
 
@@ -665,49 +767,87 @@ impl EngineState {
         }
     }
 
-    /// Pull `(rounds_heartbeat, rounds_threshold)` from every runtime via its
-    /// admin channel. One `oneshot` round-trip per node, done sequentially.
-    async fn admin_counters(&self) -> Vec<(u64, u64)> {
-        let mut out = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            match admin_snapshot(&node.admin_tx).await {
-                Some(snap) => out.push((
-                    snap.counters.rounds_heartbeat,
-                    snap.counters.rounds_threshold,
-                )),
-                None => out.push((0, 0)),
+    /// After a sub-step: read every runtime's counters, emit one `Tick` /
+    /// `ThresholdFire` per round since the last read, and diff the gateways of
+    /// each node whose role count moved, the only nodes whose snapshot is
+    /// fetched. A node's events come in that order, so the stream is
+    /// deterministic.
+    async fn observe(&mut self, events: &mut Vec<Event>) {
+        for pos in 0..self.nodes.len() {
+            let Some(now) = counters(&self.nodes[pos].admin_tx).await else {
+                continue;
+            };
+            let seen = std::mem::replace(&mut self.nodes[pos].seen, now);
+            let node = self.nodes[pos].id;
+            let tick = self.current_tick();
+            let virtual_ms = self.virtual_ms;
+            let rounds = [
+                (
+                    now.rounds_heartbeat - seen.rounds_heartbeat,
+                    EventKind::Tick { node },
+                ),
+                (
+                    now.rounds_threshold - seen.rounds_threshold,
+                    EventKind::ThresholdFire { node },
+                ),
+            ];
+            for (count, kind) in rounds {
+                events.extend((0..count).map(|_| Event {
+                    tick,
+                    virtual_ms,
+                    kind: kind.clone(),
+                }));
+            }
+            if now.role_changes != seen.role_changes {
+                self.diff_gateways(pos, events).await;
             }
         }
-        out
     }
 
-    /// Emit one `Tick` per heartbeat round and one `ThresholdFire` per
-    /// threshold round each node ran this sub-step.
-    fn push_tick_events(&self, prev: &[(u64, u64)], now: &[(u64, u64)], events: &mut Vec<Event>) {
-        let tick = self.current_tick();
-        let virtual_ms = self.virtual_ms;
-        // `prev`/`now` are aligned to `self.nodes` order (both built by
-        // iterating it), so position `index` is `self.nodes[index]` — map it to
-        // that node's stable id for the emitted event.
-        for (index, (before, after)) in prev.iter().zip(now.iter()).enumerate() {
-            let node = self.nodes[index].id;
-            let heartbeat_delta = after.0.saturating_sub(before.0);
-            let threshold_delta = after.1.saturating_sub(before.1);
-            for _ in 0..heartbeat_delta {
-                events.push(Event {
-                    tick,
-                    virtual_ms,
-                    kind: EventKind::Tick { node },
-                });
+    /// Compare node `pos`'s gateway into each zone, as its runtime reports
+    /// it, with the last read, and emit a `GatewayChanged` for each that moved.
+    async fn diff_gateways(&mut self, pos: usize, events: &mut Vec<Event>) {
+        let Some(snap) = admin_snapshot(&self.nodes[pos].admin_tx).await else {
+            return;
+        };
+        self.gateway_fetches += 1;
+        let mut gateways = [None; MAX_ZONES];
+        {
+            let addresses = self.addresses.borrow();
+            for peer in snap.peers.iter().filter(|p| p.role == Role::Gateway) {
+                if let PeerZone::Other(hash) = peer.zone
+                    && let Some(zone) = self.zone_index(hash)
+                {
+                    gateways[usize::from(zone)] = addresses.get(&peer.addr).map(|m| m.id);
+                }
             }
-            for _ in 0..threshold_delta {
+        }
+        let (tick, virtual_ms) = (self.current_tick(), self.virtual_ms);
+        let node = &mut self.nodes[pos];
+        let before = std::mem::replace(&mut node.gateways, gateways);
+        for zone in 0..self.zone_names.len() {
+            if before[zone] != gateways[zone] {
                 events.push(Event {
                     tick,
                     virtual_ms,
-                    kind: EventKind::ThresholdFire { node },
+                    kind: EventKind::GatewayChanged {
+                        origin: node.id,
+                        zone: zone as u8,
+                        from: before[zone],
+                        to: gateways[zone],
+                    },
                 });
             }
         }
+    }
+
+    /// The index of the zone whose name hashes to `hash`, through the
+    /// library's own zone hash.
+    fn zone_index(&self, hash: ZoneHash) -> Option<u8> {
+        self.zone_names
+            .iter()
+            .position(|zone| zone.hash() == hash)
+            .map(|index| index as u8)
     }
 
     async fn snapshot(&self) -> ClusterState {
@@ -726,15 +866,21 @@ impl EngineState {
             let snap = admin_snapshot(&handle.admin_tx).await;
             let peers = snap
                 .as_ref()
-                .map(|s| self.peers_from_snapshot(s))
+                .map(|s| self.peers_from_snapshot(handle.zone, s))
                 .unwrap_or_default();
             nodes.push(NodeState {
                 id: handle.id,
+                zone: handle.zone,
                 node_id: handle.identity.node_id.0,
                 incarnation: handle.identity.incarnation,
                 aggregate_total: handle.aggregate.total(),
                 rounds_heartbeat: snap.as_ref().map_or(0, |s| s.counters.rounds_heartbeat),
                 rounds_threshold: snap.as_ref().map_or(0, |s| s.counters.rounds_threshold),
+                gateway_failovers: snap.as_ref().map_or(0, |s| s.counters.gateway_failovers),
+                gap_reports_sent: snap.as_ref().map_or(0, |s| s.counters.gap_reports_sent),
+                rto_rewinds_own: snap.as_ref().map_or(0, |s| s.counters.rto_rewinds_own),
+                rto_rewinds_relay: snap.as_ref().map_or(0, |s| s.counters.rto_rewinds_relay),
+                sweeps_served: snap.as_ref().map_or(0, |s| s.counters.sweeps_served),
                 error_budget: snap.as_ref().map_or(0, |s| s.last_error_budget),
                 decode_reject_count: snap.as_ref().map_or(0, |s| s.counters.decode_rejects()),
                 store_stats: snap
@@ -760,10 +906,18 @@ impl EngineState {
             .filter(|cell| cell.is_local && cell.rule == fingerprint)
             .map(|cell| cell.count)
             .sum();
+        let live = self.live_by_zone();
+        let zones = ZONE_NAMES[..self.zone_names.len()]
+            .iter()
+            .zip(live)
+            .map(|(&name, live)| ZoneView { name, live })
+            .collect();
         ClusterState {
             virtual_ms: self.virtual_ms,
             tick: self.current_tick(),
             nodes,
+            zones,
+            bytes_by_tier: self.bytes_by_tier,
             oracle_total,
             // The CRDT's own window position at this instant — the Strata
             // right-anchors its fixed-width grid on this epoch instead of
@@ -789,13 +943,26 @@ impl EngineState {
             .collect()
     }
 
-    fn peers_from_snapshot(&self, snap: &AdminSnapshot) -> Vec<PeerView> {
+    /// Node `own_zone`'s peer rows. `PeerZone::Same` means the observer knows
+    /// its own zone, which happens only in `Configured`, where the reported
+    /// zone is the placement.
+    fn peers_from_snapshot(&self, own_zone: u8, snap: &AdminSnapshot) -> Vec<PeerView> {
         let addresses = self.addresses.borrow();
         snap.peers
             .iter()
             .map(|peer| PeerView {
-                id: addresses.get(&peer.addr).copied(),
+                id: addresses.get(&peer.addr).map(|member| member.id),
+                zone: match peer.zone {
+                    PeerZone::Unknown => None,
+                    PeerZone::Same => Some(own_zone),
+                    PeerZone::Other(hash) => self.zone_index(hash),
+                },
                 node_id: peer.node_id.map(|id| id.0),
+                role: peer.role,
+                answer: peer.answer,
+                unanswered_ms: peer.unanswered_ms,
+                own_unacked: peer.own_unacked,
+                relay_unacked: peer.relay_unacked,
             })
             .collect()
     }
@@ -824,6 +991,15 @@ fn addr_of_id(id: u32) -> SocketAddr {
 async fn admin_snapshot(tx: &mpsc::Sender<AdminCommand>) -> Option<AdminSnapshot> {
     let (reply_tx, reply_rx) = oneshot::channel();
     tx.send(AdminCommand::Snapshot { reply: reply_tx })
+        .await
+        .ok()?;
+    reply_rx.await.ok()
+}
+
+/// One `Counters` admin round-trip. `None` if the runtime has already stopped.
+async fn counters(tx: &mpsc::Sender<AdminCommand>) -> Option<GossipCounters> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(AdminCommand::Counters { reply: reply_tx })
         .await
         .ok()?;
     reply_rx.await.ok()

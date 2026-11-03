@@ -5,22 +5,41 @@
 //! driven over the command channel, validating "spawn once, drive forever"
 //! (Phase 0.5) and the `CellDump` + logging shims (Phase 1).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::num::NonZeroU8;
 
+use gabion::defaults;
+use gabion::gossip::{AnswerState, Role};
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::LocalSet;
 
-use super::{Command, LinkPolicyKind, VIZ_ROUTER_CAPACITY, run_engine};
-use crate::config::{MAX_NODES, SimConfig};
-use crate::event::{ClusterState, EventBatch, EventKind};
+use super::{Command, EngineError, EngineState, LinkPolicyKind, VIZ_ROUTER_CAPACITY, run_engine};
+use crate::config::{MAX_NODES, SimConfig, ZoneMode};
+use crate::event::{CellView, ClusterState, Event, EventBatch, EventKind, PacketKind, Tier};
 
 const WATCHED_KEY: u128 = 0x1;
+
+/// The heartbeat interval of [`test_config`].
+const T: u64 = 100;
+/// The relay floor: how long after a packet is owed its prompt round runs.
+const F_R: u64 = defaults::GOSSIP_MIN_EMIT_INTERVAL_MS;
+/// `gossip.suspect_after`'s default: `max(GOSSIP_SUSPECT_AFTER_TICKS × T,
+/// GOSSIP_SUSPECT_AFTER_FLOOR_MS)`.
+const T_U: u64 = {
+    let ticks = defaults::GOSSIP_SUSPECT_AFTER_TICKS * T;
+    if ticks > defaults::GOSSIP_SUSPECT_AFTER_FLOOR_MS {
+        ticks
+    } else {
+        defaults::GOSSIP_SUSPECT_AFTER_FLOOR_MS
+    }
+};
 
 fn test_config(nodes: usize) -> SimConfig {
     SimConfig {
         nodes,
-        tick_interval_ms: 100,
+        tick_interval_ms: T,
         rule_window_ms: 60_000,
         rule_bucket_ms: 1_000,
         rule_limit: 1_000_000,
@@ -95,7 +114,9 @@ async fn set_link(tx: &mpsc::Sender<Command>, src: u32, dst: u32, policy: LinkPo
 
 async fn add_node(tx: &mpsc::Sender<Command>) -> EventBatch {
     let (reply, rx) = oneshot::channel();
-    tx.send(Command::AddNode { reply }).await.unwrap();
+    tx.send(Command::AddNode { zone: None, reply })
+        .await
+        .unwrap();
     rx.await.unwrap().expect("the node joins")
 }
 
@@ -201,26 +222,67 @@ fn submit_creates_and_gossips_a_cell() {
 }
 
 /// The error budget the most recent request computed reaches the snapshot,
-/// so the inspector shows the threshold a burst must cross.
+/// so the inspector shows the threshold a burst must cross, and each peer row
+/// and gateway counter reaches it as the runtime reports it.
 #[test]
-fn error_budget_surfaces_in_snapshot() {
+fn error_budget_and_gateway_counters_surface_in_snapshot() {
     let config = SimConfig {
         rule_limit: 1_000,
         target_err_bps: 100,
-        ..test_config(12)
+        ..zoned(12, 3)
     };
-    with_engine(config, |tx| async move {
-        submit(&tx, 0, 0, 7).await;
-        let origin = snapshot(&tx)
-            .await
-            .nodes
-            .into_iter()
-            .find(|n| n.id == 0)
-            .expect("node 0 present");
+    with_state(config, |mut state| async move {
+        state.submit_request(0, 0, 7).await.unwrap();
+        let origin = state.snapshot().await.nodes.swap_remove(0);
+        assert_eq!(origin.id, 0);
         assert!(
             origin.error_budget > 0,
             "the error budget must be recorded once a request is seen",
         );
+
+        warm(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        silence(&mut state, g);
+        state.submit_request(0, 0, 1).await.unwrap();
+        state.step(T_U / 2 + T).await;
+
+        // Checkpoint A, the peer mirror: the rows the page shows are the rows
+        // the runtime reports, read at the same virtual instant.
+        let snap = state.snapshot().await;
+        let direct = super::admin_snapshot(&state.nodes[0].admin_tx)
+            .await
+            .expect("node 0 runs");
+        let rows = &snap.nodes[0].peers;
+        assert_eq!(rows.len(), direct.peers.len());
+        for (row, entry) in rows.iter().zip(&direct.peers) {
+            assert_eq!(row.role, entry.role);
+            assert_eq!(row.answer, entry.answer);
+            assert_eq!(row.unanswered_ms, entry.unanswered_ms);
+            assert_eq!(row.own_unacked, entry.own_unacked);
+            assert_eq!(row.relay_unacked, entry.relay_unacked);
+        }
+        let silent = rows
+            .iter()
+            .find(|row| row.id == Some(g))
+            .expect("row for g");
+        assert_eq!(silent.answer, AnswerState::Owed);
+        assert!(silent.own_unacked >= 1);
+
+        // Checkpoint B, the counter mirror: each node's counters are the
+        // library's own fields.
+        state.step(T_U + 3 * T).await;
+        let snap = state.snapshot().await;
+        for (node, handle) in snap.nodes.iter().zip(&state.nodes) {
+            let c = super::counters(&handle.admin_tx).await.expect("runs");
+            assert_eq!(node.gateway_failovers, c.gateway_failovers);
+            assert_eq!(node.gap_reports_sent, c.gap_reports_sent);
+            assert_eq!(node.rto_rewinds_own, c.rto_rewinds_own);
+            assert_eq!(node.rto_rewinds_relay, c.rto_rewinds_relay);
+            assert_eq!(node.sweeps_served, c.sweeps_served);
+        }
+        assert!(snap.nodes[0].gateway_failovers >= 1);
+        assert!(snap.nodes[0].rto_rewinds_own >= 1);
+        state
     });
 }
 
@@ -321,7 +383,8 @@ fn partition_blocks_then_heal_converges() {
 }
 
 /// Determinism: the same `(config, command-script)` produces an identical
-/// event log — the invariant the shareable-URL replay relies on.
+/// event log, tier tags and gateway events included — the invariant the
+/// shareable-URL replay relies on.
 #[test]
 fn same_script_produces_identical_events() {
     fn run() -> Vec<EventBatch> {
@@ -329,7 +392,7 @@ fn same_script_produces_identical_events() {
         // N=16 so the determinism check exercises ticks arriving *while*
         // packets are in flight across a sizeable fan — the combined load
         // under which a coalescing (watch) tick source diverged.
-        with_engine(test_config(16), |tx| {
+        with_engine(zoned(16, 3), |tx| {
             let batches = &mut batches;
             async move {
                 batches.push(submit(&tx, 0, WATCHED_KEY, 3).await);
@@ -351,6 +414,13 @@ fn same_script_produces_identical_events() {
     assert!(
         first.iter().any(|b| !b.events.is_empty()),
         "the script should produce some events"
+    );
+    assert!(
+        first
+            .iter()
+            .flat_map(|b| &b.events)
+            .any(|e| matches!(e.kind, EventKind::GatewayChanged { .. })),
+        "the zones should elect gateways, and the script should report them"
     );
 }
 
@@ -523,27 +593,45 @@ fn churn_script_is_deterministic() {
     );
 }
 
-/// One heartbeat sends a new count straight to every peer, and the submit
-/// alone sends nothing. `hits` stays well under the eager-flush budget
+/// One heartbeat sends a new count to the origin's zone and one gateway in
+/// each remote zone, and the submit alone sends nothing; the gateways relay it
+/// into their zones one relay floor after they hear it, which the next
+/// heartbeat's step covers. `hits` stays well under the eager-flush budget
 /// (`epsilon = rule_limit × bps / (10_000 × peers) = 1_000_000 / 1_100 ≈ 909`)
-/// so no threshold round runs.
+/// so no threshold round runs. The relay floor is far below a heartbeat, so a
+/// step that ends at the heartbeat itself ends before the relay leaves.
 #[test]
-fn one_heartbeat_reaches_every_peer_directly() {
+fn one_heartbeat_reaches_the_zone_and_one_gateway_per_remote_zone() {
     // A node "knows" the count if it holds the cell (a nonzero aggregate, since
     // the single key is the only traffic).
-    fn known(state: &ClusterState) -> usize {
-        state.nodes.iter().filter(|n| n.aggregate_total > 0).count()
+    fn known(state: &ClusterState) -> Vec<u8> {
+        let mut zones: Vec<u8> = state
+            .nodes
+            .iter()
+            .filter(|n| n.aggregate_total > 0)
+            .map(|n| n.zone)
+            .collect();
+        zones.sort_unstable();
+        zones
     }
 
-    with_engine(test_config(12), |tx| async move {
-        submit(&tx, 0, WATCHED_KEY, 5).await;
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        state.submit_request(0, WATCHED_KEY, 5).await.unwrap();
         assert_eq!(
-            known(&snapshot(&tx).await),
-            1,
+            known(&state.snapshot().await),
+            [0],
             "the submit alone gossips nothing"
         );
-        step(&tx, 100).await;
-        assert_eq!(known(&snapshot(&tx).await), 12);
+        state.step(T).await;
+        assert_eq!(
+            known(&state.snapshot().await),
+            [0, 0, 0, 0, 1, 2],
+            "the zone's four nodes and one gateway in each other zone"
+        );
+        state.step(T).await;
+        assert_eq!(known(&state.snapshot().await).len(), 12, "the relays");
+        state
     });
 }
 
@@ -564,6 +652,482 @@ where
             .expect("every node's settings validate");
         let mut state = body(state).await;
         state.shutdown().await;
+    });
+}
+
+/// `test_config` with its nodes placed in `zones` zones.
+fn zoned(nodes: usize, zones: u8) -> SimConfig {
+    SimConfig {
+        zones: NonZeroU8::new(zones).unwrap(),
+        ..test_config(nodes)
+    }
+}
+
+/// One second of heartbeats, enough for every peer to be heard and every role
+/// to settle.
+async fn warm(state: &mut EngineState) -> Vec<Event> {
+    state.step(1_000).await.events
+}
+
+/// The zone node `id` is placed in, as the snapshot reports it.
+fn zone_of(state: &ClusterState, id: u32) -> u8 {
+    state
+        .nodes
+        .iter()
+        .find(|n| n.id == id)
+        .expect("a live node")
+        .zone
+}
+
+/// `origin`'s gateway into `zone`, as its runtime reports it.
+async fn gateway_of(state: &EngineState, origin: u32, zone: u8) -> u32 {
+    let snap = state.snapshot().await;
+    let node = snap.nodes.iter().find(|n| n.id == origin).expect("origin");
+    node.peers
+        .iter()
+        .find(|p| p.role == Role::Gateway && p.zone == Some(zone))
+        .and_then(|p| p.id)
+        .expect("a gateway")
+}
+
+/// Cut `g` off from every other live node, in both directions.
+fn silence(state: &mut EngineState, g: u32) {
+    let ids: Vec<u32> = state.nodes.iter().map(|n| n.id).collect();
+    for x in ids.into_iter().filter(|&x| x != g) {
+        state.set_link_policy(g, x, LinkPolicyKind::Block).unwrap();
+        state.set_link_policy(x, g, LinkPolicyKind::Block).unwrap();
+    }
+}
+
+/// The `(dst, tier, virtual_ms)` of every `kind` packet `src` sent.
+fn sent(events: &[Event], src: u32, kind: PacketKind) -> Vec<(u32, Tier, u64)> {
+    events
+        .iter()
+        .filter_map(|e| match e.kind {
+            EventKind::PacketSent {
+                src: s,
+                dst,
+                kind: k,
+                tier,
+                ..
+            } if s == src && k == kind => Some((dst, tier, e.virtual_ms)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first `GatewayChanged` of `origin`'s gateway into `zone` away from
+/// `from`, with its time and new gateway.
+fn failover(events: &[Event], origin: u32, zone: u8, from: u32) -> Option<(u64, Option<u32>)> {
+    events.iter().find_map(|e| match e.kind {
+        EventKind::GatewayChanged {
+            origin: o,
+            zone: z,
+            from: Some(f),
+            to,
+        } if (o, z, f) == (origin, zone, from) => Some((e.virtual_ms, to)),
+        _ => None,
+    })
+}
+
+/// The summed count of `rule`'s cells at `bucket`.
+fn bucket_count<'a>(cells: impl Iterator<Item = &'a CellView>, rule: u128, bucket: u32) -> u64 {
+    cells
+        .filter(|c| c.rule == rule && c.bucket == bucket)
+        .map(|c| c.count)
+        .sum()
+}
+
+/// Every sent or dropped packet's bytes, summed by tier and class here, equal
+/// the snapshot's `bytes_by_tier`. The classification is this test's own, so
+/// it checks the engine's rather than reusing it.
+fn assert_bytes_by_tier(events: &[Event], state: &ClusterState) {
+    let mut sums = BTreeMap::new();
+    for event in events {
+        if let EventKind::PacketSent {
+            bytes, kind, tier, ..
+        }
+        | EventKind::PacketDropped {
+            bytes, kind, tier, ..
+        } = event.kind
+        {
+            let data = matches!(
+                kind,
+                PacketKind::Own | PacketKind::Relay | PacketKind::Sweep
+            );
+            *sums.entry((tier == Tier::InZone, data)).or_insert(0u64) += u64::from(bytes);
+        }
+    }
+    let sum = |in_zone, data| sums.get(&(in_zone, data)).copied().unwrap_or(0);
+    let by = &state.bytes_by_tier;
+    assert_eq!(by.in_zone.data, sum(true, true), "in-zone data");
+    assert_eq!(by.in_zone.control, sum(true, false), "in-zone control");
+    assert_eq!(by.cross_zone.data, sum(false, true), "cross-zone data");
+    assert_eq!(
+        by.cross_zone.control,
+        sum(false, false),
+        "cross-zone control"
+    );
+    assert!(
+        sums.values().any(|&bytes| bytes > 0),
+        "the run sent something"
+    );
+}
+
+/// Zones come from configuration, not from the address: all twelve nodes bind
+/// 127.0.0.1 (`addr_of_id`), yet the origin's own packets split three in its
+/// zone, two to one node in each other.
+#[test]
+fn zones_come_from_config_not_address() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        state.submit_request(0, WATCHED_KEY, 5).await.unwrap();
+        let events = state.step(T).await.events;
+        let snap = state.snapshot().await;
+
+        let own = sent(&events, 0, PacketKind::Own);
+        let in_zone: BTreeSet<u32> = own
+            .iter()
+            .filter(|p| p.1 == Tier::InZone)
+            .map(|p| p.0)
+            .collect();
+        assert_eq!(in_zone, BTreeSet::from([3, 6, 9]));
+        let cross: BTreeSet<u32> = own
+            .iter()
+            .filter(|p| p.1 == Tier::CrossZone)
+            .map(|p| p.0)
+            .collect();
+        let cross_zones: Vec<u8> = cross.iter().map(|&id| zone_of(&snap, id)).collect();
+        assert_eq!(cross.len(), 2, "one gateway in each other zone: {cross:?}");
+        assert_eq!(
+            cross_zones.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2])
+        );
+        state
+    });
+}
+
+/// A gateway relays into its zone one relay floor after it hears the origin:
+/// the prompt round, not the next heartbeat.
+#[test]
+fn relay_follows_one_prompt_interval_after_the_gateway_hears() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        let events = state.step(2 * T).await.events;
+
+        let t_send = sent(&events, 0, PacketKind::Own)
+            .iter()
+            .find_map(|&(dst, _, at)| (dst == g).then_some(at))
+            .expect("the origin sends its gateway");
+        let t_recv = events
+            .iter()
+            .find_map(|e| match e.kind {
+                EventKind::PacketDelivered { src: 0, dst, .. }
+                    if dst == g && e.virtual_ms >= t_send =>
+                {
+                    Some(e.virtual_ms)
+                }
+                _ => None,
+            })
+            .expect("the gateway receives it");
+        let snap = state.snapshot().await;
+        let relays = sent(&events, g, PacketKind::Relay);
+        assert_eq!(relays.len(), 3, "to the gateway's three zone peers");
+        for (dst, _, at) in relays {
+            assert_eq!(at, t_recv + F_R, "one relay floor after it hears");
+            assert_eq!(zone_of(&snap, dst), 1);
+        }
+        state
+    });
+}
+
+/// A gateway that answers nothing is replaced once a packet to it has gone
+/// unanswered for `suspect_after`, and the replacement relays what it missed.
+#[test]
+fn silent_gateway_fails_over_within_suspect_after() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        let t_s = state.virtual_ms;
+        silence(&mut state, g);
+        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        let mut events = Vec::new();
+        while state.virtual_ms < t_s + T_U + 3 * T + 2 * F_R + T {
+            events.extend(state.step(T).await.events);
+        }
+        let (at, to) = failover(&events, 0, 1, g).expect("a failover");
+        assert!(
+            (t_s + T_U..=t_s + T_U + 3 * T + 2 * F_R).contains(&at),
+            "failed over at {at}, silenced at {t_s}"
+        );
+        let to = to.expect("a replacement gateway");
+        assert_ne!(to, g);
+
+        state.step(3 * T).await;
+        let snap = state.snapshot().await;
+        for node in snap.nodes.iter().filter(|n| n.zone == 1 && n.id != g) {
+            assert_eq!(node.aggregate_total, snap.oracle_total, "node {}", node.id);
+        }
+        assert_eq!(snap.nodes[0].gateway_failovers, 1);
+        assert_eq!(zone_of(&snap, to), 1);
+        state
+    });
+}
+
+/// A gateway cut off from its zone in one direction still answers the origin,
+/// so it is never suspected; the zone is repaired by the gateway telling the
+/// origin it cannot relay. `CANNOT_RELAY` rides only on packets the gateway
+/// sends the origin, which are its answers to the origin's data, so the origin
+/// keeps sending until the repair.
+#[test]
+fn one_way_cut_is_repaired_by_the_backstop() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        let g = gateway_of(&state, 0, 1).await;
+        let members: Vec<u32> = state
+            .nodes
+            .iter()
+            .filter(|n| n.zone == 1 && n.id != g)
+            .map(|n| n.id)
+            .collect();
+        for &m in &members {
+            state.set_link_policy(g, m, LinkPolicyKind::Block).unwrap();
+        }
+        let t_cut = state.virtual_ms;
+        let mut deadline = t_cut + T_U + 10 * T;
+        let mut t1 = None;
+        let mut failed_over = false;
+        while state.virtual_ms < deadline {
+            if !failed_over {
+                state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+            }
+            let events = state.step(T.min(deadline - state.virtual_ms)).await.events;
+            failed_over |= failover(&events, 0, 1, g).is_some();
+            if t1.is_none() {
+                t1 = events.iter().find_map(|e| match e.kind {
+                    EventKind::PacketDropped {
+                        src,
+                        kind: PacketKind::Relay,
+                        ..
+                    } if src == g => Some(e.virtual_ms),
+                    _ => None,
+                });
+                if let Some(t1) = t1 {
+                    deadline = t1 + T_U + 3 * T + 2 * F_R;
+                }
+            }
+        }
+        let t1 = t1.expect("the cut swallowed a relay, but none was dropped");
+        assert_eq!(state.virtual_ms, t1 + T_U + 3 * T + 2 * F_R);
+        let snap = state.snapshot().await;
+        for node in snap.nodes.iter().filter(|n| n.zone == 1) {
+            assert_eq!(node.aggregate_total, snap.oracle_total, "node {}", node.id);
+        }
+        state
+    });
+}
+
+/// A zone cut off from the rest for longer than `suspect_after` turns every
+/// row across the cut suspect; after the heal, every node holds every bucket's
+/// exact count, and every byte sent or dropped is accounted by tier.
+#[test]
+fn zone_partition_heals_to_exact_counts() {
+    with_state(zoned(12, 3), |mut state| async move {
+        let mut all = warm(&mut state).await;
+        let cut: Vec<u32> = state
+            .nodes
+            .iter()
+            .filter(|n| n.zone == 2)
+            .map(|n| n.id)
+            .collect();
+        let rest: Vec<u32> = state
+            .nodes
+            .iter()
+            .filter(|n| n.zone != 2)
+            .map(|n| n.id)
+            .collect();
+        for &a in &cut {
+            for &b in &rest {
+                state.set_link_policy(a, b, LinkPolicyKind::Block).unwrap();
+                state.set_link_policy(b, a, LinkPolicyKind::Block).unwrap();
+            }
+        }
+        all.extend(
+            state
+                .submit_request(0, WATCHED_KEY, 3)
+                .await
+                .unwrap()
+                .events,
+        );
+        all.extend(
+            state
+                .submit_request(2, WATCHED_KEY, 4)
+                .await
+                .unwrap()
+                .events,
+        );
+        all.extend(state.step(3_000).await.events);
+        state.heal();
+        all.extend(state.step(3 * T).await.events);
+        let snap = state.snapshot().await;
+
+        let rule = state.rule.fingerprint;
+        let buckets: BTreeSet<u32> = snap
+            .nodes
+            .iter()
+            .flat_map(|n| &n.cells)
+            .filter(|c| c.rule == rule)
+            .map(|c| c.bucket)
+            .collect();
+        assert!(!buckets.is_empty(), "the hits left cells");
+        for bucket in buckets {
+            let oracle = bucket_count(
+                snap.nodes
+                    .iter()
+                    .flat_map(|n| &n.cells)
+                    .filter(|c| c.is_local),
+                rule,
+                bucket,
+            );
+            for node in &snap.nodes {
+                assert_eq!(
+                    bucket_count(node.cells.iter(), rule, bucket),
+                    oracle,
+                    "node {} bucket {bucket}",
+                    node.id
+                );
+            }
+        }
+        assert_bytes_by_tier(&all, &snap);
+        state
+    });
+}
+
+/// With no zone configured the nodes send to every peer directly, as one zone
+/// would, while each packet's tier still follows placement.
+#[test]
+fn unset_zone_mode_runs_as_one_zone() {
+    let config = SimConfig {
+        zone_mode: ZoneMode::Unset,
+        ..zoned(12, 3)
+    };
+    with_state(config, |mut state| async move {
+        let mut all = warm(&mut state).await;
+        for node in 0..12 {
+            all.extend(
+                state
+                    .submit_request(node, WATCHED_KEY, 1)
+                    .await
+                    .unwrap()
+                    .events,
+            );
+        }
+        let events = state.step(T).await.events;
+        all.extend(events.iter().cloned());
+        for node in 0..12 {
+            let own = sent(&events, node, PacketKind::Own);
+            let dsts: BTreeSet<u32> = own.iter().map(|p| p.0).collect();
+            assert_eq!(
+                (own.len(), dsts.len()),
+                (11, 11),
+                "node {node} sends every peer"
+            );
+            let cross = own.iter().filter(|p| p.1 == Tier::CrossZone).count();
+            assert_eq!(cross, 8, "node {node}: eight peers are in other zones");
+        }
+        let snap = state.snapshot().await;
+        assert!(
+            snap.nodes
+                .iter()
+                .flat_map(|n| &n.peers)
+                .all(|p| p.zone.is_none()),
+            "nodes told no zone report none"
+        );
+        assert_bytes_by_tier(&all, &snap);
+        state
+    });
+}
+
+/// A quiet cluster fetches no snapshot for gateway events; a gateway going
+/// silent moves a role count, and only then is one fetched.
+#[test]
+fn gateway_events_fetch_snapshots_only_on_role_change() {
+    with_state(zoned(12, 3), |mut state| async move {
+        warm(&mut state).await;
+        state.gateway_fetches = 0;
+        let substeps = state.substeps;
+        for _ in 0..10 {
+            state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+            state.step(T).await;
+        }
+        assert_eq!(
+            state.gateway_fetches, 0,
+            "no role moved in a healthy cluster"
+        );
+        let quiet_substeps = state.substeps - substeps;
+
+        let g = gateway_of(&state, 0, 1).await;
+        silence(&mut state, g);
+        state.submit_request(0, WATCHED_KEY, 1).await.unwrap();
+        let t_s = state.virtual_ms;
+        let mut events = Vec::new();
+        while failover(&events, 0, 1, g).is_none() {
+            assert!(
+                state.virtual_ms <= t_s + T_U + 5 * T,
+                "no failover reported"
+            );
+            events.extend(state.step(T).await.events);
+        }
+        assert!(state.gateway_fetches >= 1);
+        eprintln!(
+            "{} snapshot fetches; {quiet_substeps} sub-steps over the ten quiet heartbeats, {} in \
+             all",
+            state.gateway_fetches, state.substeps
+        );
+        state
+    });
+}
+
+/// Joiners go to the zone they ask for, or the smallest; an unknown zone is
+/// refused without spending an id.
+#[test]
+fn joiner_goes_to_the_zone_it_asks_or_the_smallest() {
+    with_state(zoned(5, 3), |mut state| async move {
+        let live = |snap: &ClusterState| snap.zones.iter().map(|z| z.live).collect::<Vec<_>>();
+        let snap = state.snapshot().await;
+        assert_eq!(live(&snap), [2, 2, 1], "placement is node i mod 3");
+        let names: Vec<_> = snap.zones.iter().map(|z| z.name).collect();
+        assert_eq!(names, ["zone-a", "zone-b", "zone-c"]);
+
+        for (ask, lands) in [(None, 2), (None, 0), (Some(1), 1)] {
+            state.add_node(ask).await.expect("the node joins");
+            let snap = state.snapshot().await;
+            let joiner = snap.nodes.last().expect("a joiner");
+            assert_eq!(joiner.zone, lands, "asked for {ask:?}");
+        }
+        let refused = state.add_node(Some(3)).await;
+        assert!(
+            matches!(
+                refused,
+                Err(EngineError::UnknownZone {
+                    zone: 3,
+                    zones: 3,
+                    last: 2
+                })
+            ),
+            "{:?}",
+            refused.err()
+        );
+        state.add_node(None).await.expect("the node joins");
+        let snap = state.snapshot().await;
+        assert_eq!(
+            snap.nodes.last().map(|n| n.id),
+            Some(8),
+            "the refusal spent no id"
+        );
+        state
     });
 }
 

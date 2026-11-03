@@ -707,6 +707,9 @@ where
                 // Caller may have dropped the receiver; not an error.
                 let _ = reply.send(snapshot);
             }
+            AdminCommand::Counters { reply } => {
+                let _ = reply.send(self.counters);
+            }
             #[cfg(feature = "cell-dump")]
             AdminCommand::CellDump { reply } => {
                 let _ = reply.send(self.build_cell_dump());

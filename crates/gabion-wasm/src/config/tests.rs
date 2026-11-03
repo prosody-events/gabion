@@ -1,3 +1,5 @@
+use std::num::NonZeroU8;
+
 use gabion::settings::Millis;
 
 use super::*;
@@ -64,4 +66,31 @@ fn controls_fail_as_the_rule_constructor_fails() {
             "{fields:?}"
         );
     }
+}
+
+/// The zone count is bounded by the built-in name table.
+#[test]
+fn zone_count_is_bounded() {
+    let zones = |count: usize| SimConfig {
+        zones: NonZeroU8::new(count as u8).unwrap(),
+        ..SimConfig::default()
+    };
+    assert!(zones(MAX_ZONES).validate().is_ok());
+    assert!(matches!(
+        zones(MAX_ZONES + 1).validate(),
+        Err(ConfigError::ZonesOutOfRange { got: 7 })
+    ));
+}
+
+/// Every built-in zone name parses and hashes to its own value, which
+/// `zone_index` in the engine relies on to name a peer's zone.
+#[test]
+fn built_in_zone_names_are_valid_and_hash_apart() {
+    let mut hashes: Vec<_> = ZONE_NAMES
+        .iter()
+        .map(|name| ZoneName::parse(name).expect("a valid zone name").hash())
+        .collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    assert_eq!(hashes.len(), MAX_ZONES);
 }

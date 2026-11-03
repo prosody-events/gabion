@@ -9,6 +9,8 @@
 //! on a shared timeline and scrub. `u128` identifiers serialize as hex strings
 //! (see `crate::hex`).
 
+use gabion::gossip::{AnswerState, Role};
+use gabion::wire::{CellPayload, Payload};
 use serde::{Deserialize, Serialize};
 
 use crate::hex::{option_u128_hex, u128_hex};
@@ -26,7 +28,8 @@ pub struct Event {
 
 /// The event payloads. Cell events mirror the CRDT `DeltaSink` /
 /// `ExpirationSink` rows; packet events come from the logging transport;
-/// tick / threshold events come from diffing the admin snapshot.
+/// tick, threshold and gateway events come from diffing each runtime's
+/// counters.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum EventKind {
@@ -34,14 +37,37 @@ pub enum EventKind {
     Tick { node: u32 },
     /// A threshold round ran on `node`.
     ThresholdFire { node: u32 },
-    /// `src` enqueued a packet bound for `dst`; it will be delivered.
-    PacketSent { src: u32, dst: u32, bytes: u32 },
+    /// `src` enqueued a packet of `kind` bound for `dst`; it will be
+    /// delivered. `tier` is by placement, never by the zone either node
+    /// reports.
+    PacketSent {
+        src: u32,
+        dst: u32,
+        bytes: u32,
+        kind: PacketKind,
+        tier: Tier,
+    },
     /// `dst` consumed a packet from `src`.
     PacketDelivered { src: u32, dst: u32, bytes: u32 },
     /// `src`'s packet to `dst` was lost on the link (or `dst` had no
     /// receiver). Distinct from [`EventKind::PacketSent`]: a dropped packet
-    /// never produces a matching delivery.
-    PacketDropped { src: u32, dst: u32, bytes: u32 },
+    /// never produces a matching delivery. `kind` and `tier` are as for
+    /// [`EventKind::PacketSent`].
+    PacketDropped {
+        src: u32,
+        dst: u32,
+        bytes: u32,
+        kind: PacketKind,
+        tier: Tier,
+    },
+    /// `origin`'s gateway into remote zone `zone` changed, as its runtime
+    /// reports it; `None` while it has none there.
+    GatewayChanged {
+        origin: u32,
+        zone: u8,
+        from: Option<u32>,
+        to: Option<u32>,
+    },
     /// A cell appeared on `node` (previous stored count was zero).
     CellCreated {
         node: u32,
@@ -73,6 +99,54 @@ pub enum EventKind {
     },
 }
 
+/// A packet's kind, read from its header: the kinds of the wire format.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PacketKind {
+    Ack,
+    Own,
+    Relay,
+    Sweep,
+    SweepRequest,
+}
+
+impl PacketKind {
+    /// Whether the packet carries cells (data) rather than only a header
+    /// (control).
+    pub fn carries_cells(self) -> bool {
+        matches!(self, Self::Own | Self::Relay | Self::Sweep)
+    }
+}
+
+impl From<Payload> for PacketKind {
+    fn from(payload: Payload) -> Self {
+        match payload {
+            Payload::Ack { .. } => Self::Ack,
+            Payload::Cells(CellPayload::Own { .. }) => Self::Own,
+            Payload::Cells(CellPayload::Relay { .. }) => Self::Relay,
+            Payload::Cells(CellPayload::Sweep) => Self::Sweep,
+            Payload::SweepRequest => Self::SweepRequest,
+        }
+    }
+}
+
+/// Whether a packet stayed inside its sender's zone, by placement.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum Tier {
+    InZone,
+    CrossZone,
+}
+
+impl Tier {
+    /// The tier of a packet from a node placed in zone `src` to one in `dst`.
+    pub fn between(src: u8, dst: u8) -> Self {
+        if src == dst {
+            Self::InZone
+        } else {
+            Self::CrossZone
+        }
+    }
+}
+
 /// The events produced by one `step` / `submit_request` / `step_to` call,
 /// plus the virtual time the engine reached.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -86,11 +160,16 @@ pub struct EventBatch {
 
 /// Full per-node cluster state, pulled on seek / re-render. Bounded by
 /// `nodes × cell_capacity`.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct ClusterState {
     pub virtual_ms: u64,
     pub tick: u64,
     pub nodes: Vec<NodeState>,
+    /// Every zone in index order, with its live members.
+    pub zones: Vec<ZoneView>,
+    /// Bytes every sender put on the wire since the session began, delivered
+    /// or lost, by tier and class.
+    pub bytes_by_tier: BytesByTier,
     /// The ground-truth cluster total for the watched key — the
     /// simulator-only oracle the convergence fan races toward. Summed across
     /// every node's locally-originated *live* cells, so it is independent of
@@ -104,16 +183,55 @@ pub struct ClusterState {
     pub bucket_epoch_now: u32,
 }
 
+/// One zone and how many live nodes are placed in it.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ZoneView {
+    pub name: &'static str,
+    pub live: u32,
+}
+
+/// Bytes sent, by [`Tier`] and class.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct BytesByTier {
+    pub in_zone: ClassBytes,
+    pub cross_zone: ClassBytes,
+}
+
+/// Bytes sent, by class. Data is `Own`, `Relay` and `Sweep` packets; control
+/// is acks, probes and their answers, gap reports and sweep requests.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct ClassBytes {
+    pub data: u64,
+    pub control: u64,
+}
+
+impl BytesByTier {
+    pub(crate) fn add(&mut self, tier: Tier, kind: PacketKind, bytes: u32) {
+        let class = match tier {
+            Tier::InZone => &mut self.in_zone,
+            Tier::CrossZone => &mut self.cross_zone,
+        };
+        let total = if kind.carries_cells() {
+            &mut class.data
+        } else {
+            &mut class.control
+        };
+        *total += u64::from(bytes);
+    }
+}
+
 /// One node's view at snapshot time. The scalar fields mirror the runtime's
 /// [`AdminSnapshot`](gabion::gossip::AdminSnapshot); `store_stats` mirrors its
 /// [`CellStoreStats`](gabion::crdt::CellStoreStats). The node inspector renders
 /// them directly — see the panel sections in `web/src/lib/components`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct NodeState {
     /// The node's stable id (see the module note). Distinct from `node_id`
     /// below: this is the frontend's display/identity handle; `node_id` is the
     /// on-the-wire gossip identity (a pure function of it, `id·256 + 1`).
     pub id: u32,
+    /// The zone it is placed in.
+    pub zone: u8,
     /// The on-the-wire gossip identity this node announces (`NodeIdentity`).
     #[serde(with = "u128_hex")]
     pub node_id: u128,
@@ -129,6 +247,17 @@ pub struct NodeState {
     /// Threshold rounds: an eager flush crossing the per-rule error budget,
     /// not the heartbeat timer.
     pub rounds_threshold: u64,
+    /// Gateways replaced because they went unanswered for `suspect_after` or
+    /// said they cannot relay.
+    pub gateway_failovers: u64,
+    /// Gap reports sent: a peer's stream skipped positions.
+    pub gap_reports_sent: u64,
+    /// Own-stream timeouts that resent from the last ack.
+    pub rto_rewinds_own: u64,
+    /// The same for the relay stream.
+    pub rto_rewinds_relay: u64,
+    /// Join sweeps this node started answering.
+    pub sweeps_served: u64,
     /// The per-rule error budget ε at the most recent request: a rule's pending
     /// hits crossing it triggers an eager (threshold) flush. `0` until seen.
     pub error_budget: u64,
@@ -142,7 +271,7 @@ pub struct NodeState {
 
 /// Mirror of [`gabion::crdt::CellStoreStats`] — the CRDT store's occupancy and
 /// saturation counters, surfaced for the inspector's storage section.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct StoreStats {
     pub active_cells: u32,
     pub cell_capacity: u32,
@@ -172,7 +301,7 @@ impl From<gabion::crdt::CellStoreStats> for StoreStats {
 }
 
 /// One CRDT cell as this node currently holds it.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CellView {
     #[serde(with = "u128_hex")]
     pub rule: u128,
@@ -190,10 +319,23 @@ pub struct CellView {
 }
 
 /// One peer entry from a node's gossip peer table.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PeerView {
     /// The peer's stable id, if the engine can resolve its address.
     pub id: Option<u32>,
+    /// The zone the peer reports, by index; `None` while unknown or with no
+    /// zone.
+    pub zone: Option<u8>,
+    /// What the peer is to this node.
+    pub role: Role,
+    /// Whether this node waits for the peer's answer.
+    pub answer: AnswerState,
+    /// How long the oldest packet waiting for the peer's answer has waited.
+    pub unanswered_ms: Option<u32>,
+    /// Own-stream positions sent to the peer and not yet acknowledged.
+    pub own_unacked: u64,
+    /// The same for the relay stream.
+    pub relay_unacked: u64,
     /// The peer's gossip node id once an inbound packet has revealed it
     /// (distinct from `id`: this is the on-the-wire identity the peer
     /// announced, unknown until the first packet from it arrives).

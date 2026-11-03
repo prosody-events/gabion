@@ -29,6 +29,7 @@ mod tests;
 pub use body::WireScratch;
 pub use header::{
     AckInfo, CellPayload, HEADER_LEN, Header, MAGIC, OwnAck, Payload, StreamRange, VERSION,
+    read_header,
 };
 
 pub(crate) use header::write_header;
@@ -36,7 +37,6 @@ pub(crate) use header::write_header;
 use std::num::NonZeroU128;
 
 use body::{CELL_BYTES, DICT_LEN_BYTES, decode_body, encode_packet_body};
-use header::read_header;
 
 use crate::crdt::{CellHandle, CellStore, Observation, Stream};
 

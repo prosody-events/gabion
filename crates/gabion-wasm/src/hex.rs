@@ -22,21 +22,12 @@ pub mod u128_hex {
 }
 
 pub mod option_u128_hex {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::Serializer;
 
     pub fn serialize<S: Serializer>(value: &Option<u128>, ser: S) -> Result<S::Ok, S::Error> {
         match value {
             Some(v) => ser.serialize_some(&format!("{v:032x}")),
             None => ser.serialize_none(),
         }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<u128>, D::Error> {
-        let raw = Option::<String>::deserialize(de)?;
-        raw.map(|s| {
-            let trimmed = s.strip_prefix("0x").unwrap_or(&s).to_owned();
-            u128::from_str_radix(&trimmed, 16).map_err(serde::de::Error::custom)
-        })
-        .transpose()
     }
 }

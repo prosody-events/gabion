@@ -21,6 +21,11 @@ pub enum AdminCommand {
     Snapshot {
         reply: oneshot::Sender<AdminSnapshot>,
     },
+    /// The counters alone: one `Copy` struct without the peer table a
+    /// snapshot collects, for a caller that polls them every round.
+    Counters {
+        reply: oneshot::Sender<GossipCounters>,
+    },
     /// Full per-cell dump of the runtime's `CellStore`. Built inside the
     /// gossip task — the store is owned there and cannot be aliased from the
     /// driver, so the reply carries owned scalars (the same owned-data-out

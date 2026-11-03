@@ -5,12 +5,14 @@
 //! build theirs. A multi-rule mix is a future extension (it becomes a `Vec`
 //! here).
 
+use std::num::NonZeroU8;
 use std::time::Duration;
 
 use gabion::crdt::{RuleDescriptor, ValidStorageConfig};
 use gabion::defaults;
 use gabion::rules::{EnforcementMode, RuleDef, RuleError, RuleTable};
 use gabion::settings::{Setting, SettingError, Settings};
+use gabion::zone::ZoneName;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::CLUSTER_ID_HASH;
@@ -19,6 +21,23 @@ use crate::engine::CLUSTER_ID_HASH;
 /// the URL or a fuzzed control can't ask the engine to build an unbounded
 /// number of runtimes; every node's peer table is sized to it.
 pub const MAX_NODES: usize = 256;
+
+/// Most zones the visualizer places nodes in; production regions usually have
+/// three to six.
+pub const MAX_ZONES: usize = 6;
+
+/// Zone index `i` is `ZONE_NAMES[i]`.
+pub const ZONE_NAMES: [&str; MAX_ZONES] =
+    ["zone-a", "zone-b", "zone-c", "zone-d", "zone-e", "zone-f"];
+
+/// Whether nodes are told the zone they are placed in. `Unset` places them
+/// but tells them nothing, so every node sends to every peer directly.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ZoneMode {
+    #[default]
+    Configured,
+    Unset,
+}
 
 /// Deterministic given `(SimConfig, command-script)` — the pair the
 /// shareable URL encodes. Every field has a production-aligned
@@ -44,6 +63,10 @@ pub struct SimConfig {
     /// i.i.d. per-link packet drop probability applied to every directed
     /// link at startup. `0.0` is a lossless network.
     pub uniform_loss: f64,
+    /// Zones nodes are placed in, `1..=MAX_ZONES`: node `i` at build in zone
+    /// `i mod zones`.
+    pub zones: NonZeroU8,
+    pub zone_mode: ZoneMode,
 }
 
 impl Default for SimConfig {
@@ -64,6 +87,8 @@ impl Default for SimConfig {
             rule_window_ms: 10_000,
             rule_bucket_ms: 1_000,
             uniform_loss: 0.0,
+            zones: NonZeroU8::MIN,
+            zone_mode: ZoneMode::Configured,
         }
     }
 }
@@ -83,6 +108,11 @@ pub enum ConfigError {
          0.1 for 10% loss)."
     )]
     LossOutOfRange { got: f64 },
+    #[error(
+        "zone count {got} is out of range: the visualizer places nodes in 1 to {MAX_ZONES} zones. \
+         Lower `zones` in the controls or shared URL."
+    )]
+    ZonesOutOfRange { got: u8 },
     #[error(transparent)]
     Setting(#[from] SettingError),
     /// The watched rule, as `RuleDef::build` refuses it for both adapters.
@@ -102,6 +132,8 @@ pub struct ValidSimConfig {
     /// That rule as the cell store holds it: its fingerprint, limit and
     /// epoch math.
     pub(crate) rule: RuleDescriptor,
+    /// Every zone's name, parsed and hashed once.
+    pub(crate) zone_names: Box<[ZoneName]>,
 }
 
 impl SimConfig {
@@ -118,6 +150,12 @@ impl SimConfig {
                 got: self.uniform_loss,
             });
         }
+        let zones = usize::from(self.zones.get());
+        if zones > MAX_ZONES {
+            return Err(ConfigError::ZonesOutOfRange {
+                got: self.zones.get(),
+            });
+        }
         let settings = self.settings()?;
         let (_, storage) = settings.validate()?;
         let rule = RuleDef {
@@ -132,12 +170,20 @@ impl SimConfig {
         .build(&storage.cardinality)?;
         let descriptor = rule.descriptor();
         let rules = RuleTable::new(Box::new([rule]), storage.rule_dictionary_capacity())?;
+        // The input is the compile-time `ZONE_NAMES` table, the
+        // constant-input exception CLAUDE.md allows (as for `stable_hasher`'s
+        // secret); `built_in_zone_names_are_valid_and_hash_apart` pins it.
+        let zone_names = ZONE_NAMES[..zones]
+            .iter()
+            .map(|name| ZoneName::parse(name).expect("a built-in zone name is a valid zone name"))
+            .collect();
         Ok(ValidSimConfig {
             config: self,
             settings,
             storage,
             rules,
             rule: descriptor,
+            zone_names,
         })
     }
 
