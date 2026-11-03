@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use gabion::crdt::{DeltaSink, ExpirationSink};
 use gabion::gossip::AggregateStore;
+use gabion::settings::Settings;
 use tokio::time::timeout;
 
 use crate::mock::with_logs;
@@ -24,9 +25,13 @@ fn leaked_region() -> ShmRegion {
     region
 }
 
-fn spawn_worker(region: ShmRegion, worker_id: u32) -> LeaderHandle {
+fn spawn_worker(
+    region: ShmRegion,
+    worker_id: u32,
+    tune: impl FnOnce(&mut Settings),
+) -> LeaderHandle {
     let rules = rules(&["per_tenant tenant:$http_x_tenant rate=2r/s"]);
-    let (gossip, cell_store) = crate::mock::validated(|_| {});
+    let (gossip, cell_store) = crate::mock::validated(tune);
     let config = LeaderConfig {
         worker_id,
         gossip,
@@ -64,9 +69,9 @@ fn stop_within_deadline(handle: LeaderHandle) {
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
 fn stopping_a_follower_leaves_the_leader_in_place() {
     let region = leaked_region();
-    let leader = spawn_worker(region, 1);
+    let leader = spawn_worker(region, 1, |_| {});
     wait_for_owner(region, 1);
-    let follower = spawn_worker(region, 2);
+    let follower = spawn_worker(region, 2, |_| {});
     std::thread::sleep(LEASE_TICK * 10);
 
     stop_within_deadline(follower);
@@ -78,9 +83,9 @@ fn stopping_a_follower_leaves_the_leader_in_place() {
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
 fn stopping_the_leader_releases_the_lease_to_a_follower() {
     let region = leaked_region();
-    let leader = spawn_worker(region, 1);
+    let leader = spawn_worker(region, 1, |_| {});
     wait_for_owner(region, 1);
-    let follower = spawn_worker(region, 2);
+    let follower = spawn_worker(region, 2, |_| {});
     std::thread::sleep(LEASE_TICK * 10);
     assert_eq!(region.lease().snapshot().owner_worker, 1);
     let leader_incarnation = region.header().identity.load_incarnation();
@@ -166,8 +171,8 @@ fn logged_totals(logs: &str, code: &str, field: &str) -> Vec<u64> {
 }
 
 /// Workers bump the four counters at different rates between ticks; each
-/// tick the leader logs a counter only when its total passed a power of two
-/// since a leader last logged it: a steady one at 1, 2, 4 and 8, a faster one
+/// tick a leader thread logs a counter only when its total passed a power of
+/// two since one last logged it: a steady one at 1, 2, 4 and 8, a faster one
 /// once per tick that passes one or more, and nothing on a tick without a
 /// rise.
 #[test]
@@ -185,9 +190,13 @@ fn leader_logs_shm_counters_at_powers_of_two() {
             stats.record_matched_rule_overflow();
             stats.record_queue_drop(2);
             stats
+                .workers
                 .declines_invalid_descriptor
                 .fetch_add(3, Ordering::Relaxed);
-            stats.rejected_cardinality.fetch_add(5, Ordering::Relaxed);
+            stats
+                .workers
+                .rejected_cardinality
+                .fetch_add(5, Ordering::Relaxed);
             log_bypasses(region, &storage, handover);
         }
         log_bypasses(region, &storage, handover);
@@ -256,22 +265,56 @@ fn leader_logs_shm_counters_at_powers_of_two() {
     }
 }
 
-/// A leadership term reads the bypass counters on its own lease-tick arm: a
-/// drop a worker counted moves the zone's mark within a few ticks.
+/// Count one dropped hit, then wait for a leader thread to log it.
+fn drop_one_and_wait_for_its_log(region: ShmRegion) {
+    region.stats().record_queue_drop(1);
+    let deadline = Instant::now() + DEADLINE;
+    while region
+        .stats()
+        .leader
+        .logged
+        .queue_dropped
+        .load(Ordering::Relaxed)
+        != 1
+    {
+        assert!(
+            Instant::now() < deadline,
+            "no leader thread read the bypass counters"
+        );
+        std::thread::sleep(LEASE_TICK);
+    }
+}
+
+/// The leader thread reads the bypass counters every lease tick while its
+/// term runs: a drop a worker counted moves the zone's mark within a few
+/// ticks.
 #[test]
 #[cfg_attr(miri, ignore = "binds a UDP socket")]
 fn the_leader_logs_the_bypass_counters_every_lease_tick() {
     let region = leaked_region();
-    let leader = spawn_worker(region, 1);
+    let leader = spawn_worker(region, 1, |_| {});
     wait_for_owner(region, 1);
-    region.stats().record_queue_drop(1);
-    let deadline = Instant::now() + DEADLINE;
-    while region.stats().logged.queue_dropped.load(Ordering::Relaxed) != 1 {
-        assert!(
-            Instant::now() < deadline,
-            "the leader never read the bypass counters"
-        );
-        std::thread::sleep(LEASE_TICK);
-    }
+    drop_one_and_wait_for_its_log(region);
     stop_within_deadline(leader);
+}
+
+/// A worker whose every term fails to bind the gossip socket still reads the
+/// bypass counters: the full queue such a node fills is the drop the
+/// `queue_dropped` line diagnoses.
+#[test]
+#[cfg_attr(miri, ignore = "binds a UDP socket")]
+fn a_worker_that_cannot_bind_gossip_still_logs_the_bypass_counters() {
+    let taken = std::net::UdpSocket::bind(LONE_NODE_BIND).expect("bind a socket to take its port");
+    let bind = taken.local_addr().expect("the taken socket's address");
+    assert!(
+        std::net::UdpSocket::bind(bind).is_err(),
+        "{bind} can be bound twice, so the worker's term would start"
+    );
+    let region = leaked_region();
+    let worker = spawn_worker(region, 1, |settings| {
+        settings.gossip_bind = Some(bind);
+        settings.bootstrap_peers = [SocketAddr::from((Ipv4Addr::LOCALHOST, 1))].into();
+    });
+    drop_one_and_wait_for_its_log(region);
+    stop_within_deadline(worker);
 }

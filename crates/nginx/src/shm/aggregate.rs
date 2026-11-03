@@ -62,7 +62,7 @@ fn writer(region: &ShmRegion) -> AggregateWriter<'_> {
     AggregateWriter::new(
         region.aggregate(),
         &region.header().aggregate_write_seq,
-        &region.stats().aggregate_dropped,
+        &region.stats().leader.aggregate_dropped,
     )
 }
 

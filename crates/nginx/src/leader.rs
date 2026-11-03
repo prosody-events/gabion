@@ -8,9 +8,9 @@
 //!
 //! `GossipRuntime` is `!Send`, so each leadership term is a `spawn_local`
 //! task on a `LocalSet` that polls the gossip runtime and the queue drain
-//! in one `select!`, sharing plain `Rc<...>` handles. While it leads, it also
-//! logs the zone's bypass counters every lease tick (`log_bypasses`); workers
-//! never log them.
+//! in one `select!`, sharing plain `Rc<...>` handles. Beside the campaign,
+//! leading or not, the thread logs the zone's bypass counters every lease
+//! tick (`log_bypasses`); the request path never logs them.
 
 use std::convert::Infallible;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -102,7 +102,8 @@ impl LeaderHandle {
 /// `current_thread` tokio runtime + `LocalSet` and campaigns for the SHM
 /// lease every `lease_tick`: whichever worker holds it drives gossip, and
 /// the rest stand by to take over when that worker exits or its leader
-/// fails. Call [`LeaderHandle::stop`] before the worker exits.
+/// fails. Every tick it also logs the zone's bypass counters. Call
+/// [`LeaderHandle::stop`] before the worker exits.
 ///
 /// Returns the OS error if the thread can't be spawned; the caller is an
 /// `extern "C"` hook, so it logs and leaves the worker up without a leader
@@ -144,7 +145,13 @@ fn run_leader(
             return;
         }
     };
-    LocalSet::new().block_on(&runtime, campaign(shm, rules, config, stopped));
+    let bypasses = log_bypasses_every(config.lease_tick, shm, config.cell_store);
+    LocalSet::new().block_on(&runtime, async {
+        tokio::select! {
+            () = campaign(shm, rules, config, stopped) => {}
+            never = bypasses => match never {},
+        }
+    });
     // Dropping the runtime would wait on any `spawn_blocking` DNS lookup the
     // Kubernetes client left behind, holding up the worker's exit.
     runtime.shutdown_background();
@@ -270,7 +277,6 @@ async fn leader_main(
         Rc::new(ShmAggregateStore::new(shm)),
     );
     let drain = drain_loop(gossip_client, shm, config.worker_id);
-    let bypasses = log_bypasses_every(config.lease_tick, shm, config.cell_store);
 
     tokio::select! {
         _ = stopped.wait_for(|stop| *stop) => Ok(()),
@@ -279,7 +285,6 @@ async fn leader_main(
             Err(error) => anyhow::Error::new(error).context("the gossip runtime failed"),
         }),
         error = drain => Err(error.context("the drain loop failed")),
-        never = bypasses => match never {},
     }
 }
 
@@ -317,9 +322,10 @@ async fn drain_loop(client: GossipClient, shm: ShmRegion, worker_id: u32) -> any
     }
 }
 
-/// Log the bypass counters every `tick` while this worker leads. It is an arm
-/// of its own rather than a step of the drain, so a queue the drain has
-/// stopped emptying still reaches the log.
+/// Log the bypass counters every `tick`, whether or not this worker leads. It
+/// runs beside the campaign rather than inside a leadership term, so a node
+/// whose terms fail to start, or whose drain has stopped, still reaches the
+/// log; the zone's marks let the first thread to read a power of two log it.
 async fn log_bypasses_every(
     tick: Duration,
     shm: ShmRegion,
@@ -335,12 +341,12 @@ async fn log_bypasses_every(
 }
 
 /// Log each counter workers bump on a bypass or a descriptor-limit rejection
-/// whose total passed a power of two since a leader last logged it
-/// (`throttle::catch_up` on the zone's `Stats::logged` marks).
+/// whose total passed a power of two since a leader thread last logged it
+/// (`throttle::catch_up` on the zone's `LeaderLine::logged` marks).
 fn log_bypasses(shm: ShmRegion, storage: &ValidStorageConfig, handover: Duration) {
     let stats = shm.stats();
-    let logged = &stats.logged;
-    let overflowed = stats.matched_rule_overflows.load(Ordering::Relaxed);
+    let (workers, logged) = (&stats.workers, &stats.leader.logged);
+    let overflowed = workers.matched_rule_overflows.load(Ordering::Relaxed);
     if let Some(overflowed_total) = throttle::catch_up(&logged.matched_rule_overflows, overflowed) {
         let cap = storage.max_matched_rules().get();
         tracing::warn!(
@@ -356,7 +362,7 @@ fn log_bypasses(shm: ShmRegion, storage: &ValidStorageConfig, handover: Duration
             size_of::<QueueEvent>(),
         );
     }
-    let dropped = stats.queue_dropped.load(Ordering::Relaxed);
+    let dropped = stats.leader.queue_dropped.load(Ordering::Relaxed);
     if let Some(dropped_total) = throttle::catch_up(&logged.queue_dropped, dropped) {
         let capacity = shm.layout().queue_capacity;
         tracing::warn!(
@@ -375,7 +381,7 @@ fn log_bypasses(shm: ShmRegion, storage: &ValidStorageConfig, handover: Duration
             size_of::<QueueSlot>(),
         );
     }
-    let declined = stats.declines_invalid_descriptor.load(Ordering::Relaxed);
+    let declined = workers.declines_invalid_descriptor.load(Ordering::Relaxed);
     if let Some(declined_total) = throttle::catch_up(&logged.declines_invalid_descriptor, declined)
     {
         tracing::warn!(
@@ -387,7 +393,7 @@ fn log_bypasses(shm: ShmRegion, storage: &ValidStorageConfig, handover: Duration
              variable, or normalise the value with `map`.",
         );
     }
-    let rejected = stats.rejected_cardinality.load(Ordering::Relaxed);
+    let rejected = workers.rejected_cardinality.load(Ordering::Relaxed);
     if let Some(rejected_total) = throttle::catch_up(&logged.rejected_cardinality, rejected) {
         let (limit, setting) = CardinalityLimit::Bytes.describe();
         let max = storage.cardinality.max_descriptor_bytes();

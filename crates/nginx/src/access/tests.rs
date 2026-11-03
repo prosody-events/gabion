@@ -699,7 +699,7 @@ fn matched_rule_bound_is_the_setting() {
 }
 
 /// A full request queue drops the hits of an allowed request: the request is
-/// still allowed, and `queue_dropped`, the count the leader logs, rises once
+/// still allowed, and `queue_dropped`, a count leader threads log, rises once
 /// per dropped hit. Three requests make the two counts differ, so swapping
 /// them fails.
 #[test]

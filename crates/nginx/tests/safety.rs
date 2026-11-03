@@ -818,15 +818,15 @@ fn stats_keep_the_leaders_writes_off_the_workers_line() {
         0,
         "the statistics start mid-line"
     );
-    let workers = line(&stats.requests);
+    let workers = line(&stats.workers.requests);
     for counter in [
-        &stats.allowed,
-        &stats.rejected,
-        &stats.rejected_cardinality,
-        &stats.declines_invalid_descriptor,
-        &stats.matched_rule_overflows,
-        &stats.exempted,
-        &stats.queue_pushed,
+        &stats.workers.allowed,
+        &stats.workers.rejected,
+        &stats.workers.rejected_cardinality,
+        &stats.workers.declines_invalid_descriptor,
+        &stats.workers.matched_rule_overflows,
+        &stats.workers.exempted,
+        &stats.workers.queue_pushed,
     ] {
         assert_eq!(
             line(counter),
@@ -835,13 +835,13 @@ fn stats_keep_the_leaders_writes_off_the_workers_line() {
         );
     }
     for counter in [
-        &stats.queue_drained,
-        &stats.queue_dropped,
-        &stats.aggregate_dropped,
-        &stats.logged.matched_rule_overflows,
-        &stats.logged.queue_dropped,
-        &stats.logged.declines_invalid_descriptor,
-        &stats.logged.rejected_cardinality,
+        &stats.leader.queue_drained,
+        &stats.leader.queue_dropped,
+        &stats.leader.aggregate_dropped,
+        &stats.leader.logged.matched_rule_overflows,
+        &stats.leader.logged.queue_dropped,
+        &stats.leader.logged.declines_invalid_descriptor,
+        &stats.leader.logged.rejected_cardinality,
     ] {
         assert_eq!(
             line(counter),
