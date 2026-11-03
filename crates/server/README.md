@@ -300,6 +300,18 @@ A cluster has converged when every node's `peers | length` reflects
 the expected topology and `active_cells` is the same order of
 magnitude on each.
 
+## Exit codes and HTTP statuses
+
+| Surface | Value | Meaning |
+|---|---|---|
+| gabiond exit | 0 | Clean shutdown after SIGTERM or SIGINT. |
+| gabiond exit | 1 | Startup or runtime failure, said once by one error line: `gabiond_exit` (a startup stage), `listener_failed` (the gRPC, admin or gossip address could not be served) or `gossip_stopped`. |
+| gabiond exit | 101 | Panic, including one in a gabiond task. The panic message on stderr is a gabion bug report. |
+| `/readyz` | 200 | Always `ready`: it shows only that the admin HTTP server answers. It checks neither gossip nor the gRPC listener; gabiond exits when either fails, so a static probe is enough. |
+| `/snapshot` | 200 / 503 | 503 with the `admin_unavailable` body once the gossip task has stopped. |
+| gRPC response | `OVER_LIMIT` | A request over a rule's limit; Envoy turns it into its configured status, 429 by default. No log line. |
+| gRPC response, cardinality | `OVER_LIMIT` | A request over `storage.max_descriptor_*` or `storage.max_request_descriptors`; the `cardinality_rejected` line tells it apart. |
+
 ## Troubleshooting
 
 Every operator-facing warning answers three questions: what happened,
@@ -308,7 +320,9 @@ can fire at request rate are throttled, so a misbehaving client at
 high rate produces a handful of log lines rather than a continuous
 flood. Messages from the gabion library (gossip, discovery, the counter
 store) are in [`../gabion/TROUBLESHOOTING.md`](../gabion/TROUBLESHOOTING.md);
-the entries below are `gabiond`'s own.
+the entries below are `gabiond`'s own. A startup failure, including
+every configuration error in the table below, reaches the log as the
+`error` field of one `gabiond_exit` line, and `gabiond` exits with status 1.
 
 | Symptom (verbatim from the error string)                                                                                       | What it means                                                                                          | Fix                                                                                                                          |
 |--------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------|
@@ -338,6 +352,20 @@ the entries below are `gabiond`'s own.
 | `` `GABION_X` contains bytes that are not valid UTF-8 ``                                                                       | A non-UTF-8 byte appeared in `GABION_X`.                                                               | Re-export the env var with a valid UTF-8 value.                                                                               |
 | `OVER_LIMIT` for every descriptor                                                                                              | The configured `rate:` is below sustained load.                                                        | Raise the rate, widen the window, or split the rule. Re-run with `mode: dry_run` while you measure.                           |
 
+### `admin_unavailable`
+
+**Level** HTTP 503 body of `/snapshot`, not a log line · **Request allowed** not applicable · **Emitted by** `gabiond`
+
+Message starts: "The gossip task has stopped, so this node has no live state to report."
+
+**What happened.** `/snapshot` got no answer from the gossip task, so it returned 503 instead of a snapshot.
+
+**Why.** The gossip task has stopped. The `gossip_stopped` line logged just before says why, and `gabiond` exits once its listeners drain.
+
+**What to do next.** Find the `gossip_stopped` line, fix its cause, and let the pod restart.
+
+**Fields** none (an HTTP body) · **Knob** none
+
 ### `cardinality_rejected`
 
 **Level** warn, power of two · **Request allowed** no, rejected (`OVER_LIMIT`) · **Emitted by** `gabiond`
@@ -352,6 +380,20 @@ Message starts: "Rejecting requests that attach too many or too large rate-limit
 
 **Fields** `domain`, `limit`, `max`, `rejected_total`, `config_key` · **Knob** `storage.max_descriptor_count` (`GABION_STORAGE_MAX_DESCRIPTOR_COUNT`), `storage.max_descriptor_bytes` (`GABION_STORAGE_MAX_DESCRIPTOR_BYTES`), `storage.max_key_bytes` (`GABION_STORAGE_MAX_KEY_BYTES`), `storage.max_request_descriptors` (`GABION_STORAGE_MAX_REQUEST_DESCRIPTORS`, default 16)
 
+### `gabiond_exit`
+
+**Level** error, once · **Request allowed** not applicable, `gabiond` is not serving · **Emitted by** `gabiond`
+
+Message starts: "gabiond is exiting with status 1 because it could not"
+
+**What happened.** A startup stage failed, so `gabiond` exited with status 1 without serving. The `stage` field says which: starting its async runtime, installing its signal handlers, or loading its configuration.
+
+**Why.** Almost always the configuration; see the symptom table above for the message in `error`.
+
+**What to do next.** Fix what `error` names and restart.
+
+**Fields** `stage`, `error` · **Knob** none
+
 ### `gossip_record_failure`
 
 **Level** warn, power of two · **Request allowed** yes, hits not recorded · **Emitted by** `gabiond`
@@ -360,11 +402,39 @@ Message starts: "This node can no longer share rate-limit counts with the rest o
 
 **What happened.** `gabiond` could not hand a count to the gossip task because the task is gone. The request was allowed and its hits were not recorded. The same task applies peers' counts, so this node's counts stop rising altogether: its limits under-count all traffic and, as windows pass, allow everything.
 
-**Why.** The gossip background task has stopped, which happens after it surfaces a typed error.
+**Why.** The gossip background task has stopped; the `gossip_stopped` line says why, and `gabiond` exits once its listeners drain.
 
-**What to do next.** Look for an earlier error log entry that says why gossip stopped, fix that, and restart the pod.
+**What to do next.** Fix what `gossip_stopped` names; the pod restarts on its own.
 
 **Fields** `failed_total` · **Knob** none
+
+### `gossip_stopped`
+
+**Level** error, once · **Request allowed** yes until `gabiond` exits, hits not counted (see `gossip_record_failure`) · **Emitted by** `gabiond`
+
+Message starts: "The gossip background task stopped on its own."
+
+**What happened.** The gossip task ended, so this node can no longer share counts. `gabiond` drains its listeners and exits with status 1 to be restarted rather than under-count silently.
+
+**Why.** The gossip socket returned the error in `error`.
+
+**What to do next.** Read `error` and check the pod's network. The restarted pod rebinds and relearns counts from its peers.
+
+**Fields** `error` · **Knob** none
+
+### `listener_failed`
+
+**Level** error, once · **Request allowed** not applicable, `gabiond` exits · **Emitted by** `gabiond`
+
+Message starts: "gabiond could not serve"
+
+**What happened.** `envoy_bind`, `admin_bind` or `gossip.bind` could not be served, so `gabiond` drains the rest and exits with status 1 instead of running without it.
+
+**Why.** Usually another process holds the port (a second `gabiond` on the host, a sidecar); less often the address is not on this host, or the port is privileged.
+
+**What to do next.** Change the setting named in `config_key` (`GABION_ENVOY_BIND`, `GABION_ADMIN_BIND` or `GABION_GOSSIP_BIND`) or stop the other process, then restart.
+
+**Fields** `addr`, `error`, `config_key` · **Knob** `envoy_bind` (`GABION_ENVOY_BIND`), `admin_bind` (`GABION_ADMIN_BIND`), `gossip.bind` (`GABION_GOSSIP_BIND`)
 
 ### `matched_rule_overflow`
 

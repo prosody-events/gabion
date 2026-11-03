@@ -187,6 +187,6 @@ impl ValidGossipConfig {
 pub enum GossipError {
     #[error("gossip runtime is no longer running")]
     RuntimeShutDown,
-    #[error("io: {0}")]
+    #[error(transparent)]
     Io(#[from] io::Error),
 }

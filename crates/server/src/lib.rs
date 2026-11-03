@@ -45,9 +45,9 @@ pub use envoy_types::pb::envoy::service::ratelimit::v3::{
 
 #[derive(Debug, Error)]
 pub enum ServeError {
-    #[error("build gRPC reflection service: {0}")]
+    #[error("could not build the gRPC reflection service")]
     Reflection(#[from] tonic_reflection::server::Error),
-    #[error("serve gRPC transport: {0}")]
+    #[error(transparent)]
     Transport(#[from] tonic::transport::Error),
 }
 

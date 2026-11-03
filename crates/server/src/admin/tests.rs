@@ -22,7 +22,7 @@ use gabion::rules::{EnforcementMode, RuleDef, RuleTable};
 use gabion::settings::Settings;
 use gabion::zone::{UnknownZone, ZoneName, ZoneStatus};
 
-use crate::admin::{AdminState, admin_channel, router};
+use crate::admin::{AdminState, UNAVAILABLE, admin_channel, router};
 
 static TEST_PORT: AtomicU16 = AtomicU16::new(41_500);
 
@@ -319,34 +319,48 @@ fn readyz_returns_200_with_static_body() {
     });
 }
 
+/// Both ways a stopped gossip task shows, a closed command channel and a
+/// dropped reply, answer 503 with the one `admin_unavailable` body, which
+/// sends the operator to the `gossip_stopped` line.
 #[test]
-fn snapshot_returns_service_unavailable_when_gossip_is_down() {
+fn admin_answers_503_with_one_body_when_gossip_stopped() {
     run_local(async {
-        // No runtime ever started — drop the receiver so the admin
-        // sender's first `send` errs, exercising the 503 path.
-        let (admin_tx, admin_rx) = admin_channel();
-        drop(admin_rx);
+        let snapshot = async |admin_tx| {
+            let request = Request::builder().uri("/snapshot").body(Body::empty());
+            let response = (build_router(admin_tx)
+                .oneshot(request.expect("request"))
+                .await)
+                .expect("router responded");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 4 * 1024)
+                .await
+                .expect("body");
+            (status, String::from_utf8(bytes.to_vec()).expect("utf8"))
+        };
 
-        let app = build_router(admin_tx);
+        let (closed_tx, closed_rx) = admin_channel();
+        drop(closed_rx);
+        let closed = snapshot(closed_tx).await;
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/snapshot")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
+        let (dropping_tx, mut dropping_rx) = admin_channel();
+        let gossip = tokio::task::spawn_local(async move {
+            while let Some(command) = dropping_rx.recv().await {
+                drop(command);
+            }
+        });
+        let dropped = snapshot(dropping_tx).await;
+        gossip
             .await
-            .expect("router responded");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            .expect("the stand-in gossip task ends with its channel");
 
-        let bytes = to_bytes(response.into_body(), 4 * 1024)
-            .await
-            .expect("body");
-        let text = std::str::from_utf8(&bytes).expect("utf8");
+        for (status, body) in [closed, dropped] {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body, UNAVAILABLE.1);
+        }
         assert!(
-            text.contains("gossip runtime is shut down"),
-            "unexpected error body: {text:?}",
+            UNAVAILABLE.1.contains("`gossip_stopped`"),
+            "the body names the log line that says why: {:?}",
+            UNAVAILABLE.1,
         );
     });
 }

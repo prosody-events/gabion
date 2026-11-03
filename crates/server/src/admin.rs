@@ -3,9 +3,8 @@
 //!
 //! - `GET /snapshot`           — top-level structured snapshot of the gossip
 //!   runtime, rule table, and aggregate store.
-//! - `GET /readyz`             — readiness probe that returns 200 once the
-//!   admin router is serving (i.e. the gossip runtime + admin state are wired
-//!   up).
+//! - `GET /readyz`             — readiness probe: 200 whenever the admin HTTP
+//!   server answers, and nothing more.
 //!
 //! All responses are built inside the gossip task in response to an
 //! `AdminCommand` round-trip, so the caller never gets a `Sync` borrow
@@ -70,17 +69,9 @@ pub fn router(state: AdminState) -> Router {
         .with_state(Arc::new(state))
 }
 
-pub async fn serve(bind: SocketAddr, state: AdminState) -> std::io::Result<()> {
-    serve_with_shutdown(bind, state, std::future::pending()).await
-}
-
-/// Like [`serve`] but stops accepting new connections and drains in-flight
-/// admin requests when `shutdown` resolves.
-pub async fn serve_with_shutdown<F>(
-    bind: SocketAddr,
-    state: AdminState,
-    shutdown: F,
-) -> std::io::Result<()>
+/// Serve the admin endpoints on `bind` until `shutdown` resolves, then drain
+/// in-flight requests.
+pub async fn serve<F>(bind: SocketAddr, state: AdminState, shutdown: F) -> std::io::Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -92,7 +83,7 @@ where
 
 async fn snapshot_handler(
     State(state): State<Arc<AdminState>>,
-) -> Result<Response, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, &'static str)> {
     let snapshot = SnapshotJson {
         runtime: admin_snapshot(&state.gossip_admin).await?,
         rules: &state.rule_table,
@@ -101,37 +92,30 @@ async fn snapshot_handler(
     Ok(Json(snapshot).into_response())
 }
 
-/// Readiness probe. The mere fact that the admin router is serving HTTP
-/// implies `AdminState` was built (which means the gossip runtime is
-/// alive and the aggregate store is constructed), so a no-op `200 OK`
-/// is the correct shape. Fits any operator-side liveness probe that wants
-/// something cheaper than `/snapshot`.
+/// Readiness probe: `ready` whenever the admin HTTP server answers. It checks
+/// nothing else, because gabiond exits when its gossip task or a listener
+/// stops.
 async fn readyz_handler() -> &'static str {
     "ready\n"
 }
 
-/// Issue an `AdminCommand::Snapshot` and await the reply. Maps both
-/// failure modes (send-side closed, reply-side dropped) onto the same
-/// 503 shape `/snapshot` uses, since they have the same operator
-/// remedy.
+/// `/snapshot`'s answer once the gossip task has stopped (`admin_unavailable`).
+const UNAVAILABLE: (StatusCode, &str) = (
+    StatusCode::SERVICE_UNAVAILABLE,
+    "The gossip task has stopped, so this node has no live state to report. Look for an earlier \
+     `gossip_stopped` log line; the node is exiting or must be restarted.\n",
+);
+
+/// Ask the gossip task for its snapshot. A closed channel and a dropped reply
+/// both mean the task has stopped.
 async fn admin_snapshot(
     tx: &mpsc::Sender<AdminCommand>,
-) -> Result<AdminSnapshot, (StatusCode, String)> {
+) -> Result<AdminSnapshot, (StatusCode, &'static str)> {
     let (reply_tx, reply_rx) = oneshot::channel();
     tx.send(AdminCommand::Snapshot { reply: reply_tx })
         .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "gossip runtime is shut down".to_string(),
-            )
-        })?;
-    reply_rx.await.map_err(|_| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "gossip runtime dropped admin reply".to_string(),
-        )
-    })
+        .map_err(|_| UNAVAILABLE)?;
+    reply_rx.await.map_err(|_| UNAVAILABLE)
 }
 
 /// Default channel size for the admin command receiver. Admin requests are

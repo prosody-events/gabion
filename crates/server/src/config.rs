@@ -306,7 +306,7 @@ pub enum ConfigError {
          which win over the file, so the value may come from either. See \"How configuration \
          layers\" in the gabiond README."
     )]
-    Config(#[source] config::ConfigError),
+    Config(config::ConfigError),
     #[error(
         "gabiond cannot start: it has no gossip address to listen on, and other gabion nodes need \
          one to reach it. Set `gossip.bind` in the YAML file (for example `0.0.0.0:9000`) or \
