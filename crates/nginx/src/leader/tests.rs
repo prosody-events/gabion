@@ -1,10 +1,10 @@
 use super::*;
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::sync::mpsc as std_mpsc;
 use std::time::Instant;
 
-use gabion::crdt::{DeltaSink, ExpirationSink};
+use gabion::crdt::{BucketEpoch, CellIdentity, DeltaSink, ExpirationSink, KeyHash};
 use gabion::gossip::AggregateStore;
 use gabion::settings::Settings;
 use tokio::time::timeout;
@@ -101,13 +101,18 @@ fn stopping_the_leader_releases_the_lease_to_a_follower() {
     assert!(region.header().identity.load_incarnation() > leader_incarnation);
 }
 
-/// Counts the hits the gossip runtime applies, one delta row each.
+/// The cell and the hits of each delta row the gossip runtime applies.
 #[derive(Default)]
-struct AppliedHits(Cell<usize>);
+struct AppliedRows(RefCell<Vec<(CellIdentity, u32)>>);
 
-impl AggregateStore for AppliedHits {
+impl AggregateStore for AppliedRows {
     fn apply(&self, deltas: &DeltaSink, _: &ExpirationSink) {
-        self.0.set(self.0.get() + deltas.len());
+        let rows = deltas
+            .keys
+            .iter()
+            .copied()
+            .zip(deltas.deltas.iter().copied());
+        self.0.borrow_mut().extend(rows);
     }
 }
 
@@ -116,7 +121,17 @@ impl AggregateStore for AppliedHits {
 async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
     const EVENTS: usize = DRAIN_BATCH.get() + 8;
     let region = leaked_region();
+    // Both halves of each 128-bit field set, so the drain must carry every
+    // field through whole.
+    let cell = CellIdentity {
+        rule_fingerprint: 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+        key_hash: KeyHash(0x1111_2222_3333_4444_5555_6666_7777_8888),
+        bucket: BucketEpoch(7),
+    };
     let event = QueueEvent {
+        rule_fingerprint: cell.rule_fingerprint,
+        key_hash: cell.key_hash,
+        bucket: cell.bucket,
         hits: 1,
         ..QueueEvent::default()
     };
@@ -124,7 +139,7 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
         .try_for_each(|_| region.queue().push(event))
         .expect("queue has room");
     let identity = NodeIdentity::new(gabion::crdt::NodeId(1), 1);
-    let applied = Rc::new(AppliedHits::default());
+    let applied = Rc::new(AppliedRows::default());
     let (gossip, cell_store) = crate::mock::validated(|_| {});
     let gossip = gossip.with_shallow_limit_queue();
     let transport = UdpTransport::bind(LONE_NODE_BIND, &gossip)
@@ -143,7 +158,9 @@ async fn drain_hands_each_event_to_the_runtime_once_it_has_room() {
     assert_eq!(drained(), DRAIN_BATCH.get());
     let both = async { tokio::join!(drain.as_mut(), runtime.run(futures::stream::empty())) };
     assert!(timeout(DEADLINE, both).await.is_err());
-    assert_eq!((applied.0.get(), drained()), (EVENTS, EVENTS));
+    let rows = applied.0.take();
+    assert_eq!((rows.len(), drained()), (EVENTS, EVENTS));
+    assert_eq!(rows.iter().find(|row| **row != (cell, 1)), None);
     // `both` dropped the runtime, closing its queue.
     assert_eq!(drain.await.to_string(), "gossip runtime shut down");
 }

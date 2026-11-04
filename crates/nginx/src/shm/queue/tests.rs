@@ -4,10 +4,16 @@ use quickcheck_macros::quickcheck;
 use std::sync::Arc;
 use std::thread;
 
+/// A key with `i` in both 64-bit halves, so a slot that drops or swaps a
+/// half hands back a different key.
+fn wide_key(i: u64) -> KeyHash {
+    KeyHash(u128::from(i) << 64 | u128::from(!i))
+}
+
 fn event(value: u8) -> QueueEvent {
     QueueEvent {
-        rule_fingerprint: u128::from(value),
-        key_hash: KeyHash(u128::from(value) << 1),
+        rule_fingerprint: u128::from(value) << 64 | 0xF1,
+        key_hash: wide_key(value.into()),
         bucket: BucketEpoch(u32::from(value)),
         hits: 1,
         rule_limit: 1_000,
@@ -80,17 +86,13 @@ fn wraparound_preserves_fifo() {
     // Drain two, then push three more — exercises the index wrap.
     let mut out = [QueueEvent::default(); 2];
     assert_eq!(queue.drain(&mut out), 2);
-    assert_eq!(out[0].now_millis, 0);
-    assert_eq!(out[1].now_millis, 1);
+    assert_eq!(out, [event(0), event(1)]);
     for i in 3..6 {
         queue.push(event(i)).expect("push");
     }
     let mut tail = [QueueEvent::default(); 4];
     assert_eq!(queue.drain(&mut tail), 4);
-    assert_eq!(tail[0].now_millis, 2);
-    assert_eq!(tail[1].now_millis, 3);
-    assert_eq!(tail[2].now_millis, 4);
-    assert_eq!(tail[3].now_millis, 5);
+    assert_eq!(tail, [event(2), event(3), event(4), event(5)]);
 }
 
 #[test]
@@ -194,7 +196,7 @@ fn overlapping_consumers_each_take_distinct_events() {
     let queue = RequestQueue::from_parts(&control, &slots);
     for i in 0..TOTAL {
         let ev = QueueEvent {
-            key_hash: KeyHash(i as u128),
+            key_hash: wide_key(i as u64),
             ..event(0)
         };
         while queue.push(ev).is_err() {
@@ -207,5 +209,6 @@ fn overlapping_consumers_each_take_distinct_events() {
         .flat_map(|consumer| consumer.join().unwrap())
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, (0..TOTAL as u128).map(KeyHash).collect::<Vec<_>>());
+    // `wide_key` orders keys by `i`, so the sorted keys are its range.
+    assert_eq!(keys, (0..TOTAL as u64).map(wide_key).collect::<Vec<_>>());
 }
