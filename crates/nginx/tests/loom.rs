@@ -153,46 +153,79 @@ fn at_most_one_worker_holds_the_lease() {
     });
 }
 
-/// Every field derives from `id`, so a cell mixing two writes matches
-/// neither.
-fn cell(id: u64) -> AggregateCell {
-    AggregateCell {
-        rule_fingerprint: wide(id),
-        key_hash: KeyHash(wide(id)),
-        bucket: BucketEpoch::wrap(id),
-        count: id,
-    }
-}
-
-/// The leader rewrites slot 0 from one cell to another while a worker looks
-/// both up: each lookup returns the whole cell or misses, never a mix.
-#[test]
-fn aggregate_readers_never_see_a_torn_cell() {
-    // Both ids hash home to slot 0, so each lookup reads the slot being
-    // rewritten and stops at empty slot 1. The asserts outside the race
-    // check that.
-    const OLD: u64 = 5;
-    const NEW: u64 = 9;
-    model(|| {
+/// The leader rewrites slot 0 from `old` to `new` while a worker looks both
+/// up: each lookup returns the whole cell or misses, never a mix.
+fn race_a_rewrite(old: AggregateCell, new: AggregateCell) {
+    model(move || {
         let slots = Arc::new([AggregateSlot::empty(), AggregateSlot::empty()]);
-        slots[0].write(2, cell(OLD));
+        slots[0].write(2, old);
         let table = AggregateTable::from_slots(&slots[..]);
-        let lookup = |id| {
-            let key = cell(id);
-            table.get(key.rule_fingerprint, key.key_hash, key.bucket)
-        };
-        assert_eq!(lookup(OLD), Some(cell(OLD)));
+        let lookup =
+            |cell: AggregateCell| table.get(cell.rule_fingerprint, cell.key_hash, cell.bucket);
+        // Each lookup must read slot 0, the one being rewritten.
+        assert_eq!(
+            lookup(old),
+            Some(old),
+            "{old:?} does not hash home to slot 0"
+        );
 
         let writer = {
             let slots = slots.clone();
-            thread::spawn(move || slots[0].write(4, cell(NEW)))
+            thread::spawn(move || slots[0].write(4, new))
         };
-        for id in [OLD, NEW] {
-            if let Some(seen) = lookup(id) {
-                assert_eq!(seen, cell(id), "torn read of cell {id}");
+        for cell in [old, new] {
+            if let Some(seen) = lookup(cell) {
+                assert_eq!(seen, cell, "torn read of {cell:?}");
             }
         }
         writer.join().unwrap();
-        assert_eq!(lookup(NEW), Some(cell(NEW)));
+        assert_eq!(
+            lookup(new),
+            Some(new),
+            "{new:?} does not hash home to slot 0"
+        );
     });
+}
+
+/// A lookup matches on every key word, so a read mixing two keys that differ
+/// in several words matches neither and passes for a miss. Each rewrite
+/// below changes one stored word of the key, and the count: a stale copy of
+/// that word still matches `old`'s lookup and carries `new`'s count, so a
+/// store outside the seqlock in any word turns this red. 23 is the first
+/// replacement word with which every rewrite still hashes home to slot 0.
+#[test]
+fn aggregate_readers_never_see_a_torn_cell() {
+    const LO: u128 = u64::MAX as u128;
+    let old = AggregateCell {
+        rule_fingerprint: wide(5),
+        key_hash: KeyHash(wide(5)),
+        bucket: BucketEpoch::wrap(5),
+        count: 5,
+    };
+    let rewrite = AggregateCell { count: 23, ..old };
+    let (low_word, high_word) = (wide(5) & !LO | 23, 23 << 64 | wide(5) & LO);
+    for new in [
+        AggregateCell {
+            rule_fingerprint: low_word,
+            ..rewrite
+        },
+        AggregateCell {
+            rule_fingerprint: high_word,
+            ..rewrite
+        },
+        AggregateCell {
+            key_hash: KeyHash(low_word),
+            ..rewrite
+        },
+        AggregateCell {
+            key_hash: KeyHash(high_word),
+            ..rewrite
+        },
+        AggregateCell {
+            bucket: BucketEpoch::wrap(23),
+            ..rewrite
+        },
+    ] {
+        race_a_rewrite(old, new);
+    }
 }
