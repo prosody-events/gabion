@@ -1639,7 +1639,7 @@
     const v = (r, k) => (r && toNum(r[k]) !== null ? val(k.endsWith('_ms') ? ms(r[k]) : k.endsWith('_pct') ? pct(r[k]) : scaleFmt('bytes/s')(r[k]), 'scale', k, w(r)) : '—');
     const p183 = at('probe', 'pods-183'), p1k = at('probe', 'pods-1k'), p2k = at('probe', 'pods-2k'), fPeak = at('full', 'prod-peak'), f1k = at('full', 'pods-1k');
     const e208 = at('probe', 'edge-pop'), e8 = at('probe', 'edge-pop-8m'), eFull = at('full', 'edge-pop');
-    const pps = (r) => (r ? d3.format(',.3~s')(r.pkts_per_pod_s).replace('k', 'k') + ' datagrams/s' : '—');
+    const pps = (r) => (r ? d3.format(',.3~s')(r.pkts_per_pod_s) + ' datagrams/s' : '—');
     $('g3-scale-note').replaceChildren(
       'The design the study picked (imp-az-hier-nopk) run past the 300-pod autoscaler maximum, with sizes set for each regime. ',
       el('b', {}, 'More pods, same traffic: '), 'prod-peak\'s cluster load spread over more pods slows convergence (p50 ', v(p183, 'conv_p50_incl_never_ms'), ' at 183 pods, ', v(p1k, 'conv_p50_incl_never_ms'), ' at 1,000, ', v(p2k, 'conv_p50_incl_never_ms'),

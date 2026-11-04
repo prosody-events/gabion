@@ -299,16 +299,16 @@ fn except_truthy_skips_rule() {
 #[test]
 fn except_falsy_missing_or_empty_applies_rule() {
     let rules = rule_with_predicate();
-    for trusted in [Some("off"), None, Some("")] {
+    for predicate in [Some("off"), None, Some("")] {
         let (_buf, region) = TestZone::new(8, 16);
         let mut vars = MockVars::new().set("http_x_tenant", "alice");
-        if let Some(value) = trusted {
+        if let Some(value) = predicate {
             vars = vars.set("trusted", value);
         }
         let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 0);
-        assert!(matches!(outcome, AccessOutcome::Allow(_)), "{trusted:?}");
+        assert!(matches!(outcome, AccessOutcome::Allow(_)), "{predicate:?}");
         let snap = region.stats().snapshot();
-        assert_eq!((snap.exempted, snap.allowed), (0, 1), "{trusted:?}");
+        assert_eq!((snap.exempted, snap.allowed), (0, 1), "{predicate:?}");
     }
 }
 
