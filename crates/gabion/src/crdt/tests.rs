@@ -10,7 +10,7 @@ use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// C19: no slot or epoch type is another, or the bare integer it wraps, so
+/// No slot or epoch type is another, or the bare integer it wraps, so
 /// one cannot stand in for another.
 #[test]
 fn rule_node_bucket_slots_are_distinct_types() {
