@@ -7,8 +7,8 @@ use std::thread;
 fn event(value: u8) -> QueueEvent {
     QueueEvent {
         rule_fingerprint: u128::from(value),
-        key_hash: u128::from(value) << 1,
-        bucket: u32::from(value),
+        key_hash: KeyHash(u128::from(value) << 1),
+        bucket: BucketEpoch(u32::from(value)),
         hits: 1,
         rule_limit: 1_000,
         now_millis: u64::from(value),
@@ -116,8 +116,8 @@ fn mpsc_concurrent_producers() {
             for i in 0..PER_PRODUCER {
                 let ev = QueueEvent {
                     rule_fingerprint: producer as u128,
-                    key_hash: i as u128,
-                    bucket: i as u32,
+                    key_hash: KeyHash(i as u128),
+                    bucket: BucketEpoch(i as u32),
                     hits: 1,
                     rule_limit: 1_000,
                     now_millis: i as u64,
@@ -194,7 +194,7 @@ fn overlapping_consumers_each_take_distinct_events() {
     let queue = RequestQueue::from_parts(&control, &slots);
     for i in 0..TOTAL {
         let ev = QueueEvent {
-            key_hash: i as u128,
+            key_hash: KeyHash(i as u128),
             ..event(0)
         };
         while queue.push(ev).is_err() {
@@ -202,10 +202,10 @@ fn overlapping_consumers_each_take_distinct_events() {
         }
     }
 
-    let mut keys: Vec<u128> = consumers
+    let mut keys: Vec<KeyHash> = consumers
         .into_iter()
         .flat_map(|consumer| consumer.join().unwrap())
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, (0..TOTAL as u128).collect::<Vec<_>>());
+    assert_eq!(keys, (0..TOTAL as u128).map(KeyHash).collect::<Vec<_>>());
 }

@@ -9,8 +9,7 @@ use std::sync::Arc;
 
 use gabion::aggregate::Aggregate;
 use gabion::crdt::{
-    BucketEpoch, CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, KeyHash, NodeId,
-    NodeIdentity,
+    CellHandle, CellIdentity, CellStore, DeltaSink, ExpirationSink, NodeId, NodeIdentity,
 };
 use gabion::gossip::sim::SimRouter;
 use gabion::gossip::{AggregateStore, FixedClock, GossipRuntime};
@@ -98,8 +97,8 @@ fn fold(counts: &Aggregate, hit: QueueEvent) {
         handles: vec![CellHandle::default()],
         keys: vec![CellIdentity {
             rule_fingerprint: hit.rule_fingerprint,
-            key_hash: KeyHash(hit.key_hash),
-            bucket: BucketEpoch(hit.bucket),
+            key_hash: hit.key_hash,
+            bucket: hit.bucket,
         }],
         previous: vec![0],
         current: vec![1],

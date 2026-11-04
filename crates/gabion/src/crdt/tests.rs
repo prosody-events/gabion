@@ -345,59 +345,7 @@ fn portable_snapshot(store: &CellStore) -> BTreeMap<PortableKey, u32> {
 }
 
 fn assert_structural_invariants(store: &CellStore) -> bool {
-    let mut active = 0_u32;
-    let mut rules = BTreeMap::<RuleSlot, u32>::new();
-    let mut nodes = BTreeMap::<NodeSlot, u32>::new();
-    let mut identities = BTreeSet::<(RuleSlot, u128, u32, NodeSlot, Incarnation)>::new();
-
-    for handle in store.active_handles(0) {
-        active += 1;
-        let Some(row) = store.get(handle) else {
-            return false;
-        };
-        if store.resolve(handle) != Some(handle.index) {
-            return false;
-        }
-        if store.find(row.key) != Some(handle) {
-            return false;
-        }
-        if !identities.insert((
-            row.key.rule,
-            row.key.key_hash.0,
-            row.key.bucket.0,
-            row.key.origin,
-            row.key.incarnation,
-        )) {
-            return false;
-        }
-        *rules.entry(row.key.rule).or_default() += 1;
-        *nodes.entry(row.key.origin).or_default() += 1;
-    }
-
-    *nodes.entry(store.local_node_slot()).or_default() += 1;
-
-    if active != store.active_len() || store.index.len() != active {
-        return false;
-    }
-    for slot in 0..store.rule_dictionary().capacity() {
-        let expected = rules.get(&RuleSlot(slot)).copied().unwrap_or(0);
-        if store.rule_dictionary().refcount(RuleSlot(slot)) != expected {
-            return false;
-        }
-        if (store.rule_dictionary().descriptor(RuleSlot(slot)).is_some()) != (expected > 0) {
-            return false;
-        }
-    }
-    for slot in 0..store.node_dictionary().capacity() {
-        let expected = nodes.get(&NodeSlot(slot)).copied().unwrap_or(0);
-        if store.node_dictionary().refcount(NodeSlot(slot)) != expected {
-            return false;
-        }
-        if (store.node_dictionary().descriptor(NodeSlot(slot)).is_some()) != (expected > 0) {
-            return false;
-        }
-    }
-    true
+    assert_invariants_with_pinned_rules(store, &[])
 }
 
 #[quickcheck]
@@ -807,7 +755,7 @@ fn unconfigured_rule_cells_expire_by_last_update() {
     obs.push(observation(
         0xBEEF,
         0xabc,
-        BucketEpoch((t / 100) as u32),
+        BucketEpoch::wrap(t / 100),
         100,
         1,
         3,
@@ -1266,8 +1214,8 @@ fn quickcheck_store_with_pinned_rules() -> CellStore {
     store
 }
 
-/// Variant of `assert_structural_invariants` that allows one extra refcount
-/// on each slot in `pinned_rule_slots` — those carry the registration pin
+/// The store's structural invariants, allowing one extra refcount on each
+/// slot in `pinned_rule_slots` — those carry the registration pin
 /// `intern_rule` holds for a configured rule, on top of their cell refs.
 fn assert_invariants_with_pinned_rules(store: &CellStore, pinned_rule_slots: &[RuleSlot]) -> bool {
     let mut active = 0_u32;
@@ -1959,7 +1907,7 @@ fn wrap_run(t0: u64) -> (u64, u64, usize) {
         batch.push(observation(
             rule.fingerprint(),
             7,
-            BucketEpoch(t as u32),
+            BucketEpoch::wrap(t),
             node.node_id.0,
             node.incarnation,
             1 + u32::from(t == t0),

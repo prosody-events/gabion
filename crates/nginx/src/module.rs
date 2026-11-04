@@ -76,12 +76,11 @@ impl http::HttpModule for Module {
         // SAFETY: `ngx_http_gabion_module` is initialised once at static-init
         // time and is only read (never written) after that. nginx enumerates
         // modules single-threaded from the master process during config
-        // parsing, so there is no concurrent access. `&raw`-style borrow via
-        // a shared reference is sound because the data is immutable for the
-        // remainder of the process lifetime, and the `'static` reference we
-        // hand out points to memory that lives for the whole program. See
-        // the nomicon chapter on `static mut` (Send/Sync, "Working with
-        // Unsafe").
+        // parsing, so there is no concurrent access. A shared reference is
+        // sound, which makes the lint a false positive here: nothing writes
+        // the static after static init, so no `&mut` can alias it, and it
+        // lives for the whole program. See the nomicon chapter on
+        // `static mut` (Send/Sync, "Working with Unsafe").
         #[expect(static_mut_refs)]
         unsafe {
             &ngx_http_gabion_module

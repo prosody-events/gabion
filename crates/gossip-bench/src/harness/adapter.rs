@@ -136,7 +136,7 @@ impl NodeStore {
         let hash = self.identity.hashes[key as usize];
         self.counts
             .table()
-            .get(self.identity.rule.fingerprint, hash.0, BucketEpoch(bucket))
+            .get(self.identity.rule.fingerprint, hash, BucketEpoch(bucket))
             .map_or(0, |cell| cell.count.min(u64::from(u32::MAX)) as u32)
     }
 

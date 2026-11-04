@@ -170,8 +170,8 @@ impl<'a> AggregateTable<'a> {
 
     /// The stored count for `(rule_fingerprint, key_hash, bucket)`, or
     /// `None` when it is absent (or being written or moved right now).
-    pub fn get(&self, fp: u128, kh: u128, bucket: BucketEpoch) -> Option<AggregateCell> {
-        match self.probe(fp, kh, bucket) {
+    pub fn get(&self, fp: u128, kh: KeyHash, bucket: BucketEpoch) -> Option<AggregateCell> {
+        match self.probe(fp, kh.0, bucket) {
             Probe::Found(_, cell) => Some(cell),
             Probe::Vacant(_) | Probe::Full => None,
         }
@@ -204,13 +204,7 @@ impl<'a> AggregateTable<'a> {
     pub fn window_total(&self, spec: RuleSpec, key_hash: KeyHash, now_millis: u64) -> u64 {
         let current = spec.bucket_at(now_millis);
         (0..spec.live_buckets.get())
-            .filter_map(|offset| {
-                self.get(
-                    spec.fingerprint,
-                    key_hash.0,
-                    BucketEpoch(current.0.wrapping_sub(offset)),
-                )
-            })
+            .filter_map(|offset| self.get(spec.fingerprint, key_hash, current.back(offset)))
             .fold(0, |total, cell| total.saturating_add(cell.count))
     }
 
@@ -233,7 +227,7 @@ impl<'a> AggregateTable<'a> {
             total,
             hits,
             |bucket| {
-                self.get(spec.fingerprint, key_hash.0, bucket)
+                self.get(spec.fingerprint, key_hash, bucket)
                     .map_or(0, |cell| cell.count)
             },
         )

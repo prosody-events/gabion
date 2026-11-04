@@ -7,6 +7,8 @@
 //! that doubles as occupancy and ordering. Capacity is a power of two so the
 //! modulo collapses to a mask.
 
+use gabion::crdt::{BucketEpoch, KeyHash};
+
 use super::CachePadded;
 use super::atomic::{AtomicU32, AtomicU64, Ordering};
 use super::hint::spin_loop;
@@ -72,8 +74,8 @@ impl QueueSlot {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueueEvent {
     pub rule_fingerprint: u128,
-    pub key_hash: u128,
-    pub bucket: u32,
+    pub key_hash: KeyHash,
+    pub bucket: BucketEpoch,
     pub hits: u64,
     pub rule_limit: u64,
     pub now_millis: u64,
@@ -194,13 +196,13 @@ fn write_slot(slot: &QueueSlot, event: QueueEvent) {
     // under both Stacked Borrows and Tree Borrows. Single-writer per
     // `(pos & mask)` is enforced by the seq protocol (see push()).
     let fp = event.rule_fingerprint;
-    let kh = event.key_hash;
+    let kh = event.key_hash.0;
     slot.rule_fingerprint_lo.store(fp as u64, Ordering::Relaxed);
     slot.rule_fingerprint_hi
         .store((fp >> 64) as u64, Ordering::Relaxed);
     slot.key_hash_lo.store(kh as u64, Ordering::Relaxed);
     slot.key_hash_hi.store((kh >> 64) as u64, Ordering::Relaxed);
-    slot.bucket.store(event.bucket, Ordering::Relaxed);
+    slot.bucket.store(event.bucket.0, Ordering::Relaxed);
     slot.hits.store(event.hits, Ordering::Relaxed);
     slot.rule_limit.store(event.rule_limit, Ordering::Relaxed);
     slot.now_millis.store(event.now_millis, Ordering::Relaxed);
@@ -210,9 +212,11 @@ fn read_slot(slot: &QueueSlot) -> QueueEvent {
     QueueEvent {
         rule_fingerprint: ((slot.rule_fingerprint_hi.load(Ordering::Relaxed) as u128) << 64)
             | slot.rule_fingerprint_lo.load(Ordering::Relaxed) as u128,
-        key_hash: ((slot.key_hash_hi.load(Ordering::Relaxed) as u128) << 64)
-            | slot.key_hash_lo.load(Ordering::Relaxed) as u128,
-        bucket: slot.bucket.load(Ordering::Relaxed),
+        key_hash: KeyHash(
+            ((slot.key_hash_hi.load(Ordering::Relaxed) as u128) << 64)
+                | slot.key_hash_lo.load(Ordering::Relaxed) as u128,
+        ),
+        bucket: BucketEpoch(slot.bucket.load(Ordering::Relaxed)),
         hits: slot.hits.load(Ordering::Relaxed),
         rule_limit: slot.rule_limit.load(Ordering::Relaxed),
         now_millis: slot.now_millis.load(Ordering::Relaxed),

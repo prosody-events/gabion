@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 use gabion::aggregate::{AggregateCell, AggregateSlot, AggregateTable};
-use gabion::crdt::BucketEpoch;
+use gabion::crdt::{BucketEpoch, KeyHash};
 use gabion_nginx::shm::queue::QueueEvent;
 use gabion_nginx::shm::{LeaderLease, QueueControl, QueueSlot, RequestQueue};
 use loom::sync::Arc;
@@ -56,8 +56,8 @@ fn wide(id: u64) -> u128 {
 fn event(id: u64) -> QueueEvent {
     QueueEvent {
         rule_fingerprint: wide(id),
-        key_hash: wide(id),
-        bucket: id as u32,
+        key_hash: KeyHash(wide(id)),
+        bucket: BucketEpoch::wrap(id),
         hits: id,
         rule_limit: id,
         now_millis: id,
@@ -159,7 +159,7 @@ fn cell(id: u64) -> AggregateCell {
     AggregateCell {
         rule_fingerprint: wide(id),
         key_hash: wide(id),
-        bucket: BucketEpoch(id as u32),
+        bucket: BucketEpoch::wrap(id),
         count: id,
     }
 }
@@ -179,7 +179,7 @@ fn aggregate_readers_never_see_a_torn_cell() {
         let table = AggregateTable::from_slots(&slots[..]);
         let lookup = |id| {
             let key = cell(id);
-            table.get(key.rule_fingerprint, key.key_hash, key.bucket)
+            table.get(key.rule_fingerprint, KeyHash(key.key_hash), key.bucket)
         };
         assert_eq!(lookup(OLD), Some(cell(OLD)));
 

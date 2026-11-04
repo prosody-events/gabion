@@ -262,7 +262,7 @@ fn leader_stamps_incarnation_and_applies_deltas() {
     // Workers should read the new value through the seqlock-protected view.
     let view = region.aggregate();
     let cell = view
-        .get(rule.fingerprint(), key_hash.0, BucketEpoch(3))
+        .get(rule.fingerprint(), key_hash, BucketEpoch(3))
         .expect("found");
     assert_eq!(cell.count, 5);
 }
@@ -279,7 +279,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert_eq!(
         region
             .aggregate()
-            .get(rule.fingerprint(), kh.0, BucketEpoch(1))
+            .get(rule.fingerprint(), kh, BucketEpoch(1))
             .unwrap()
             .count,
         7
@@ -291,7 +291,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert_eq!(
         region
             .aggregate()
-            .get(rule.fingerprint(), kh.0, BucketEpoch(1))
+            .get(rule.fingerprint(), kh, BucketEpoch(1))
             .unwrap()
             .count,
         4
@@ -303,7 +303,7 @@ fn expiration_subtracts_then_empties_when_zero() {
     assert!(
         region
             .aggregate()
-            .get(rule.fingerprint(), kh.0, BucketEpoch(1))
+            .get(rule.fingerprint(), kh, BucketEpoch(1))
             .is_none()
     );
 }
@@ -383,11 +383,11 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
             thread::spawn(move || {
                 while !stop.load(Ordering::Acquire) {
                     let view = region.aggregate();
-                    if let Some(cell) = view.get(fp, steady.0, BucketEpoch(0)) {
+                    if let Some(cell) = view.get(fp, steady, BucketEpoch(0)) {
                         assert_eq!(cell.count, u64::from(STEADY));
                     }
                     for bucket in 1..=8 {
-                        if let Some(cell) = view.get(fp, steady.0, BucketEpoch(bucket)) {
+                        if let Some(cell) = view.get(fp, steady, BucketEpoch(bucket)) {
                             assert_eq!(cell.count, u64::from(bucket));
                         }
                     }
@@ -410,12 +410,10 @@ fn readers_see_exact_counts_while_the_leader_moves_cells() {
 
     let view = region.aggregate();
     assert_eq!(
-        view.get(fp, steady.0, BucketEpoch(0))
-            .expect("steady")
-            .count,
+        view.get(fp, steady, BucketEpoch(0)).expect("steady").count,
         u64::from(STEADY)
     );
-    assert!((1..=8).all(|bucket| view.get(fp, steady.0, BucketEpoch(bucket)).is_none()));
+    assert!((1..=8).all(|bucket| view.get(fp, steady, BucketEpoch(bucket)).is_none()));
 }
 
 // -- 5. Lease takeover under contention ------------------------------------
@@ -488,8 +486,8 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
                 loop {
                     match queue.push(QueueEvent {
                         rule_fingerprint: fingerprint,
-                        key_hash: key_hash.0,
-                        bucket,
+                        key_hash,
+                        bucket: BucketEpoch(bucket),
                         hits: 1,
                         rule_limit: 1_000,
                         now_millis: 0,
@@ -519,11 +517,8 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
                 }
             }
             if batched > 0 {
-                let (d, e) = deltas_and_expirations(
-                    &rule,
-                    &[(KeyHash(key_hash.0), bucket, batched as u32)],
-                    &[],
-                );
+                let (d, e) =
+                    deltas_and_expirations(&rule, &[(key_hash, bucket, batched as u32)], &[]);
                 store.apply(&d, &e);
                 total = total.saturating_add(batched);
             }
@@ -543,7 +538,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
             let r = region;
             let view = r.aggregate();
             while !reader_stop.load(Ordering::Acquire) {
-                let _ = view.get(fingerprint, key_hash.0, BucketEpoch(bucket));
+                let _ = view.get(fingerprint, key_hash, BucketEpoch(bucket));
             }
         }));
     }
@@ -561,7 +556,7 @@ fn end_to_end_workers_push_leader_drains_workers_read() {
 
     let final_view = region.aggregate();
     let cell = final_view
-        .get(fingerprint, key_hash.0, BucketEpoch(bucket))
+        .get(fingerprint, key_hash, BucketEpoch(bucket))
         .expect("aggregate cell present");
     assert_eq!(cell.count, TOTAL);
 }
@@ -645,7 +640,7 @@ fn decide_all_and_leader_apply_concurrent() {
     assert!(
         region
             .aggregate()
-            .get(spec.fingerprint, key_hash.0, BucketEpoch(0))
+            .get(spec.fingerprint, key_hash, BucketEpoch(0))
             .is_none()
     );
 }
@@ -774,8 +769,8 @@ fn custom_queue_capacity_bounds_the_ring() {
     let region = unsafe { ShmRegion::initialize(zone.as_ptr(), layout) };
     let event = |producer: u64, i: u64| QueueEvent {
         rule_fingerprint: u128::from(producer) << 64 | u128::from(i),
-        key_hash: u128::from(i) << 64 | u128::from(producer),
-        bucket: i as u32,
+        key_hash: KeyHash(u128::from(i) << 64 | u128::from(producer)),
+        bucket: BucketEpoch::wrap(i),
         hits: producer + 1,
         rule_limit: i + 1,
         now_millis: producer * 1_000 + i,

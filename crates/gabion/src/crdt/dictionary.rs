@@ -119,11 +119,7 @@ impl RuleDictionary {
     }
 
     pub fn descriptor(&self, slot: RuleSlot) -> Option<&RuleDescriptor> {
-        if slot.index() < usize::from(self.capacity) && self.refcounts[slot.index()] > 0 {
-            Some(&self.descriptors[slot.index()])
-        } else {
-            None
-        }
+        (self.refcount(slot) > 0).then(|| &self.descriptors[slot.index()])
     }
 
     pub fn refcount(&self, slot: RuleSlot) -> u32 {
@@ -245,11 +241,7 @@ impl NodeDictionary {
     }
 
     pub fn descriptor(&self, slot: NodeSlot) -> Option<&NodeDescriptor> {
-        if slot.index() < usize::from(self.capacity) && self.refcounts[slot.index()] > 0 {
-            Some(&self.descriptors[slot.index()])
-        } else {
-            None
-        }
+        (self.refcount(slot) > 0).then(|| &self.descriptors[slot.index()])
     }
 
     pub fn refcount(&self, slot: NodeSlot) -> u32 {

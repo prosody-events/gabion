@@ -127,8 +127,9 @@ server {
 }
 ```
 
-`$arg_tenant` reads the `?tenant=` query argument and `tenant:` is
-the descriptor key, so each distinct tenant gets its own counter.
+`$arg_tenant` reads the `?tenant=` query argument, matching its name
+in any case as nginx's own `$arg_tenant` does, and `tenant:` is the
+descriptor key, so each distinct tenant gets its own counter.
 A request without `?tenant=` produces an empty value, at which point
 the rule declines without bumping a counter and the request flows
 through.

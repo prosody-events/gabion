@@ -27,6 +27,15 @@ fn spec(fingerprint: u128, limit: u64, bucket_millis: u64, live_buckets: u32) ->
     }
 }
 
+/// The count stored for `(fp, kh, bucket)`, which must be present.
+fn count_at(table: &Aggregate, fp: u128, kh: u128, bucket: u32) -> u64 {
+    table
+        .table()
+        .get(fp, KeyHash(kh), BucketEpoch(bucket))
+        .expect("found")
+        .count
+}
+
 fn all_empty(aggregate: &Aggregate) -> bool {
     aggregate
         .slots
@@ -38,23 +47,9 @@ fn all_empty(aggregate: &Aggregate) -> bool {
 fn write_then_read_one_cell() {
     let table = aggregate(8);
     assert!(writer(&table).add(0x42, 0x99, BucketEpoch(7), 3));
-    assert_eq!(
-        table
-            .table()
-            .get(0x42, 0x99, BucketEpoch(7))
-            .expect("found")
-            .count,
-        3
-    );
+    assert_eq!(count_at(&table, 0x42, 0x99, 7), 3);
     assert!(writer(&table).add(0x42, 0x99, BucketEpoch(7), 5));
-    assert_eq!(
-        table
-            .table()
-            .get(0x42, 0x99, BucketEpoch(7))
-            .expect("found")
-            .count,
-        8
-    );
+    assert_eq!(count_at(&table, 0x42, 0x99, 7), 8);
 }
 
 #[test]
@@ -62,16 +57,14 @@ fn expiration_subtracts_then_empties_the_slot() {
     let table = aggregate(8);
     writer(&table).add(0x42, 0x99, BucketEpoch(7), 5);
     writer(&table).subtract(0x42, 0x99, BucketEpoch(7), 2);
-    assert_eq!(
+    assert_eq!(count_at(&table, 0x42, 0x99, 7), 3);
+    writer(&table).subtract(0x42, 0x99, BucketEpoch(7), 3);
+    assert!(
         table
             .table()
-            .get(0x42, 0x99, BucketEpoch(7))
-            .expect("found")
-            .count,
-        3
+            .get(0x42, KeyHash(0x99), BucketEpoch(7))
+            .is_none()
     );
-    writer(&table).subtract(0x42, 0x99, BucketEpoch(7), 3);
-    assert!(table.table().get(0x42, 0x99, BucketEpoch(7)).is_none());
     assert!(all_empty(&table));
 }
 
@@ -98,14 +91,7 @@ fn collisions_are_resolved_by_probing() {
         assert!(writer(&table).add(1, key, BucketEpoch(0), count));
     }
     for (count, &key) in (1..).zip(&keys) {
-        assert_eq!(
-            table
-                .table()
-                .get(1, key, BucketEpoch(0))
-                .expect("found")
-                .count,
-            count
-        );
+        assert_eq!(count_at(&table, 1, key, 0), count);
     }
 }
 
@@ -116,15 +102,17 @@ fn collisions_are_resolved_by_probing() {
 fn aggregate_table_matches_model(ops: Vec<(u8, u8, bool)>) -> bool {
     let table = aggregate(128);
     let mut model: HashMap<(u128, u32), u64> = HashMap::new();
+    // Model bucket `b` lives at epoch `b - 2`, so the window crosses the wrap.
+    let epoch = |bucket: u32| BucketEpoch(bucket.wrapping_sub(2));
     for (key, bucket, expire) in ops {
         let cell = (u128::from(key % 16), u32::from(bucket % 4));
         let count = model.entry(cell).or_default();
         if expire && *count > 0 {
-            writer(&table).subtract(1, cell.0, BucketEpoch(cell.1), *count);
+            writer(&table).subtract(1, cell.0, epoch(cell.1), *count);
             *count = 0;
         } else {
             assert!(
-                writer(&table).add(1, cell.0, BucketEpoch(cell.1), 1),
+                writer(&table).add(1, cell.0, epoch(cell.1), 1),
                 "dropped a write"
             );
             *count += 1;
@@ -135,11 +123,14 @@ fn aggregate_table_matches_model(ops: Vec<(u8, u8, bool)>) -> bool {
         let expected: u64 = (0..4)
             .map(|bucket| model.get(&(key, bucket)).copied().unwrap_or(0))
             .sum();
-        table.table().window_total(rule, KeyHash(key), 3) == expected
+        table
+            .table()
+            .window_total(rule, KeyHash(key), (1 << 32) + 1)
+            == expected
     });
     for (&(key, bucket), &count) in &model {
         if count > 0 {
-            writer(&table).subtract(1, key, BucketEpoch(bucket), count);
+            writer(&table).subtract(1, key, epoch(bucket), count);
         }
     }
     totals_match && table.table().occupied() == 0
@@ -168,22 +159,23 @@ fn delta(bucket: BucketEpoch, delta: u32) -> DeltaSink {
 fn full_aggregate_allows_and_logs() {
     let table = aggregate(MAX_PROBE);
     let none = ExpirationSink::default();
+    let overflow = BucketEpoch(MAX_PROBE as u32);
     let ((), logs) = with_logs(|| {
         for bucket in 0..MAX_PROBE as u32 {
             table.apply(&delta(BucketEpoch(bucket), 1), &none);
         }
         assert_eq!(table.dropped.load(std_atomic::Ordering::Relaxed), 0);
-        table.apply(&delta(BucketEpoch(MAX_PROBE as u32), 1), &none);
+        table.apply(&delta(overflow, 1), &none);
         table.apply(&delta(BucketEpoch(0), 1), &none);
     });
     assert_eq!(table.dropped.load(std_atomic::Ordering::Relaxed), 1);
     let view = table.table();
-    assert!(view.get(1, 2, BucketEpoch(MAX_PROBE as u32)).is_none());
+    assert!(view.get(1, KeyHash(2), overflow).is_none());
     assert_eq!(
-        view.window_total(spec(1, 1, 1, 1), KeyHash(2), u64::from(MAX_PROBE as u32)),
+        view.window_total(spec(1, 1, 1, 1), KeyHash(2), u64::from(overflow.0)),
         0
     );
-    assert_eq!(view.get(1, 2, BucketEpoch(0)).expect("kept").count, 2);
+    assert_eq!(count_at(&table, 1, 2, 0), 2);
     assert_eq!(logs.matches("code=\"aggregate_full\"").count(), 1, "{logs}");
     for knob in [
         "storage.max_cells",

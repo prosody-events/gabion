@@ -3,6 +3,7 @@ use crate::rules::mock::{compile, directive, rules};
 use crate::rules::{CompiledRules, DEFAULT_DOMAIN};
 use crate::shm::mock::{TestZone, seed};
 use crate::shm::{ShmAggregateStore, ShmRegion};
+use gabion::crdt::BucketEpoch;
 use gabion::defaults;
 use gabion::rules::{Descriptor, KeyHash, hash_key};
 use gabion::settings::Settings;
@@ -69,8 +70,8 @@ fn allow_on_empty_aggregate() {
         events[0],
         QueueEvent {
             rule_fingerprint: rules.table().rules()[0].spec().fingerprint,
-            key_hash: key_hash("tenant", "alice").0,
-            bucket: 4,
+            key_hash: key_hash("tenant", "alice"),
+            bucket: BucketEpoch(4),
             hits: 1,
             rule_limit: 2,
             now_millis: 1_000,
@@ -83,7 +84,7 @@ fn reject_when_window_total_exceeds_limit() {
     let (_buf, region) = TestZone::new(8, 16);
     let rules = rules(&[PER_TENANT]);
     let spec = rules.table().rules()[0].spec();
-    let bucket = (1_000_u64 / spec.bucket_millis) as u32;
+    let bucket = BucketEpoch((1_000_u64 / spec.bucket_millis) as u32);
     // Pre-populate aggregate so total >= limit (limit is 2).
     let store = ShmAggregateStore::new(region);
     seed(
@@ -124,7 +125,13 @@ fn reject_delta_reflects_oldest_non_empty_bucket() {
     let rules = rules(&[PER_TENANT]);
     let spec = rules.table().rules()[0].spec();
     let store = ShmAggregateStore::new(region);
-    seed(&store, spec.fingerprint, key_hash("tenant", "alice"), 2, 5);
+    seed(
+        &store,
+        spec.fingerprint,
+        key_hash("tenant", "alice"),
+        BucketEpoch(2),
+        5,
+    );
 
     let vars = MockVars::new().set("http_x_tenant", "alice");
     let outcome = decide(ctx(&rules, &region, |_| {}), &[0], &vars, 1_000);
@@ -248,15 +255,19 @@ fn is_truthy_matches_documented_falsy_set() {
     }
 }
 
-/// `$arg_name` reads the first pair named exactly `name`, value and all.
+/// `$arg_name` reads the first pair whose name matches `name` in any ASCII
+/// case, as nginx's does.
 #[test]
-fn find_query_arg_reads_the_first_exact_pair() {
+fn find_query_arg_matches_the_first_pair_in_any_case() {
     let args = b"tt=1&t&t=x=y&t=z&u=";
     assert_eq!(find_query_arg(args, b"t"), Some(&b"x=y"[..]));
     assert_eq!(find_query_arg(args, b"tt"), Some(&b"1"[..]));
     assert_eq!(find_query_arg(args, b"u"), Some(&b""[..]));
     assert_eq!(find_query_arg(args, b"v"), None);
     assert_eq!(find_query_arg(b"", b"t"), None);
+    assert_eq!(find_query_arg(b"T=1", b"t"), Some(&b"1"[..]));
+    assert_eq!(find_query_arg(b"t=1", b"T"), Some(&b"1"[..]));
+    assert_eq!(find_query_arg(b"&&xt=1&t=2&", b"t"), Some(&b"2"[..]));
 }
 
 fn rule_with_predicate() -> CompiledRules {
@@ -358,7 +369,7 @@ fn decide_all_picks_longest_window() {
             &store,
             rule.fingerprint(),
             key_hash("tenant", "alice"),
-            0,
+            BucketEpoch(0),
             5,
         );
     }
@@ -398,7 +409,13 @@ fn dry_run_records_but_never_rejects() {
     // Pre-populate so the aggregate is way over the limit.
     let store = ShmAggregateStore::new(region);
     let spec = rules.table().rules()[0].spec();
-    seed(&store, spec.fingerprint, key_hash("tenant", "alice"), 0, 99);
+    seed(
+        &store,
+        spec.fingerprint,
+        key_hash("tenant", "alice"),
+        BucketEpoch(0),
+        99,
+    );
 
     let vars = MockVars::new().set("http_x_tenant", "alice");
     // DryRun: over the limit but never rejects.
@@ -488,7 +505,13 @@ fn decide_all_one_rule_exempt_one_rejects() {
     ]);
     let store = ShmAggregateStore::new(region);
     let spec_b = rules.table().rules()[1].spec();
-    seed(&store, spec_b.fingerprint, key_hash("k", "alice"), 0, 5);
+    seed(
+        &store,
+        spec_b.fingerprint,
+        key_hash("k", "alice"),
+        BucketEpoch(0),
+        5,
+    );
 
     let vars = MockVars::new()
         .set("http_x_tenant", "alice")
@@ -675,7 +698,7 @@ fn nginx_rule_domain_hashes_its_keys() {
             value: "x",
         }],
     );
-    assert_eq!(events[0].key_hash, expected.0);
+    assert_eq!(events[0].key_hash, expected);
 }
 
 /// `storage.max_matched_rules` is how many of a request's allowed rules

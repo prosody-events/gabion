@@ -61,8 +61,7 @@ use crate::throttle;
 pub type RuleId = u32;
 
 /// A rule's bucket: `now_millis / bucket_millis`, cut to `u32`. Epochs wrap,
-/// so they carry no order; age one against another with serial-number
-/// arithmetic (`wrapping_sub` on the inner value, read as `i32`).
+/// so they carry no order; age one against another with [`Self::age_since`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct BucketEpoch(pub u32);
@@ -73,13 +72,24 @@ impl BucketEpoch {
     pub fn wrap(bucket: u64) -> Self {
         Self(bucket as u32)
     }
+
+    /// The epoch `n` buckets before this one.
+    pub fn back(self, n: u32) -> Self {
+        Self(self.0.wrapping_sub(n))
+    }
+
+    /// Buckets from `older` to this epoch by serial-number arithmetic: right
+    /// across the wrap while the two lie fewer than 2^31 buckets apart.
+    pub fn age_since(self, older: Self) -> i32 {
+        self.0.wrapping_sub(older.0) as i32
+    }
 }
 
 /// Node incarnation counter — distinguishes successive instances of one node.
 pub type Incarnation = u32;
 
-/// Interned rule slot: an index into [`RuleDictionary`], which alone hands
-/// one out.
+/// Interned rule slot: a row of [`RuleDictionary`]. Only the `crdt` module
+/// makes one; a live cell's slot came from the dictionary.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RuleSlot(u16);
 
@@ -90,8 +100,8 @@ impl RuleSlot {
     }
 }
 
-/// Interned `(node_id, incarnation)` slot: an index into [`NodeDictionary`],
-/// which alone hands one out.
+/// Interned `(node_id, incarnation)` slot: a row of [`NodeDictionary`]. Only
+/// the `crdt` module makes one; a live cell's slot came from the dictionary.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NodeSlot(u16);
 
@@ -1110,10 +1120,9 @@ impl CellStore {
                 continue;
             }
             let expired = match ages.get(self.rules[slot as usize].index()) {
-                // Serial-number age, so the comparison holds across the `u32`
-                // epoch wrap; a window spans fewer than 2^31 buckets.
+                // A window spans fewer than 2^31 buckets.
                 Some(&RuleAge::Epoch { current, live }) => {
-                    current.0.wrapping_sub(self.buckets[slot as usize].0) as i32 > live as i32
+                    current.age_since(self.buckets[slot as usize]) > live as i32
                 }
                 Some(&RuleAge::Idle { since_ms }) => {
                     self.last_update_millis[slot as usize] < since_ms

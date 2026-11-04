@@ -237,7 +237,7 @@ fn maps_descriptors_and_returns_ok_or_over_limit() {
             .limiter
             .counts
             .table()
-            .get(fingerprint, key.0, BucketEpoch(0));
+            .get(fingerprint, key, BucketEpoch(0));
         assert_eq!(cell.map(|cell| cell.count), Some(4));
 
         // Pump until we exceed the limit.

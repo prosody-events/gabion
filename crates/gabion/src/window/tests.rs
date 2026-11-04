@@ -178,3 +178,20 @@ fn next_bucket_boundary_off_boundary_subtracts_remainder() {
         16
     );
 }
+
+/// The walk runs on unwrapped buckets and only the lookup wraps, so a
+/// window straddling the u32 epoch wrap finds its counts and fall-off.
+#[test]
+fn window_straddling_the_epoch_wrap_finds_its_counts() {
+    let ms = NonZeroU64::new(1).unwrap();
+    let delta = time_until_admit_millis(
+        (1 << 32) + 1,
+        ms,
+        live(3),
+        10,
+        10,
+        1,
+        counts_from(&[(0, 10)]),
+    );
+    assert_eq!(delta, 2);
+}

@@ -67,7 +67,7 @@ fn a_new_leader_counts_regossiped_cells_once() {
     lead(&previous, 1);
     let view = region.aggregate();
     assert_eq!(
-        view.get(fingerprint, 0x99, BucketEpoch(7))
+        view.get(fingerprint, KeyHash(0x99), BucketEpoch(7))
             .expect("found")
             .count,
         5
@@ -97,7 +97,7 @@ fn a_new_leader_never_reuses_a_sequence() {
 fn a_full_zone_counts_aggregate_dropped() {
     let (_zone, region, store) = table(2);
     for key in 0..3 {
-        crate::shm::mock::seed(&store, 1, KeyHash(key), 0, 1);
+        crate::shm::mock::seed(&store, 1, KeyHash(key), BucketEpoch(0), 1);
     }
     assert_eq!(region.stats().snapshot().aggregate_dropped, 1);
 }

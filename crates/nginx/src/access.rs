@@ -25,27 +25,16 @@ pub trait VariableLookup {
     fn lookup(&self, binding: &BindingLookup) -> Option<&[u8]>;
 }
 
-/// The value of the first `name=value` pair in the query string `args`: what
-/// a `$arg_name` binding reads.
+/// The value of the first `name=value` pair in the query string `args`, the
+/// name matched without regard to ASCII case as nginx's own `$arg_name`
+/// (`ngx_http_arg`) matches it: what a `$arg_name` binding reads.
 pub fn find_query_arg<'a>(args: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut rest = args;
-    while !rest.is_empty() {
-        let next = rest
-            .iter()
-            .position(|byte| *byte == b'&')
-            .unwrap_or(rest.len());
-        let pair = &rest[..next];
-        if let Some(eq) = pair.iter().position(|byte| *byte == b'=')
-            && &pair[..eq] == name
-        {
-            return Some(&pair[eq + 1..]);
-        }
-        if next == rest.len() {
-            break;
-        }
-        rest = &rest[next + 1..];
-    }
-    None
+    args.split(|byte| *byte == b'&').find_map(|pair| {
+        let eq = pair.iter().position(|byte| *byte == b'=')?;
+        pair[..eq]
+            .eq_ignore_ascii_case(name)
+            .then(|| &pair[eq + 1..])
+    })
 }
 
 /// Result of the access decision.
@@ -321,8 +310,8 @@ fn decide_one(
     }
     let event = QueueEvent {
         rule_fingerprint: spec.fingerprint,
-        key_hash: key_hash.0,
-        bucket: spec.bucket_at(now_millis).0,
+        key_hash,
+        bucket: spec.bucket_at(now_millis),
         hits,
         rule_limit: spec.limit,
         now_millis,
