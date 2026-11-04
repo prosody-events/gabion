@@ -16,8 +16,10 @@ intervals and posterior probabilities.
 ## Open the dashboard
 
 `dashboard/index.html` fetches its data, so it needs a server; `file://` fails.
+`make study-data` first fetches the generated data (see "Data").
 
 ```sh
+make study-data
 python3 -m http.server -d docs/study 8000
 ```
 
@@ -111,11 +113,33 @@ followed. The script:
 4. compacts the four generated datasets (`compact.py`);
 5. runs `make study-test`.
 
+It starts with `make study-data`, so the evidence it does not rebuild
+(`stage4-plumtree/`, `audit/`) is in place. To publish its output, pack and
+upload it as a new release, then pin that release in the `Makefile`:
+
+```sh
+make study-data-pack
+gh release create study-data-<date> target/study-data.tar.gz --latest=false
+shasum -a 256 target/study-data.tar.gz
+```
+
+Set `STUDY_DATA_TAG` to the new tag and `STUDY_DATA_SHA256` to the printed
+digest, in the same commit as any change the new data needs.
+
 The figures follow with `python3 docs/study/figures/make_figures.py`, which
 needs matplotlib and takes its verdicts from
 `crates/gossip-bench/judge/verdict.py`.
 
 ## Data
+
+The generated data is not in git. It is the `study-data.tar.gz` asset of a
+GitHub release, [`study-data-2026-10-24`](https://github.com/prosody-events/gabion/releases/tag/study-data-2026-10-24),
+which `make study-data` downloads, checks against the `Makefile`'s
+`STUDY_DATA_SHA256` and unpacks into `data/`. `make study-test`, `refresh.sh`
+and the Pages publish all run it first. `.gitignore` names the files the asset
+holds: the four generated datasets, the judge's output (`judge/`), and the
+study's Stage 4 summaries (`stage4-plumtree/`) and audit evidence (`audit/`).
+The hand-edited definitions, `scale.json` and `provenance.json` stay in git.
 
 Eight datasets, each a JSON array of flat rows:
 

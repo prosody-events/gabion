@@ -146,6 +146,7 @@ jobs:
         working-directory: crates/gabion-wasm/web
         run: |
           pnpm run build
+          make -C "$GITHUB_WORKSPACE" study-data
           mkdir dist/study
           cp -R "$GITHUB_WORKSPACE/docs/study/dashboard" "$GITHUB_WORKSPACE/docs/study/data" dist/study/
 

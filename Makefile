@@ -127,6 +127,7 @@ help:
 	@printf '%s\n' '  make sim-smoke       Run the study harness judge tests and one small regime; fails on an unhealthy run'
 	@printf '%s\n' '  make sim-baselines   Run the main and imp-az-hier-nopk baseline arms of the regression gate (H1=<sha>)'
 	@printf '%s\n' '  make sim-gate        Run this checkout as the zone arm and apply the regression gate pass rules'
+	@printf '%s\n' '  make study-data      Download the study data release asset, check its sha256 and unpack it into docs/study/data'
 	@printf '%s\n' '  make study-test      Check the study data compaction and run the study dashboard browser audit (Playwright)'
 	@printf '%s\n' '  make wasm-check      Cross-compile gabion-wasm, run its native tests, and build the web frontend'
 	@printf '%s\n' '  make nginx-config    Validate the base nginx:stable-alpine config'
@@ -299,8 +300,33 @@ sim-gate:
 	python3 $(SIM)/judge/matrix.py --solution zone --seeds 3 --jobs $(SIM_JOBS) --out $(SIM_OUT)/results
 	python3 $(SIM)/judge/gate.py $(SIM_OUT)/results --out $(SIM_OUT)/gate
 
+# The study's generated data is a release asset, not part of the tree
+# (docs/study/README.md, "Data"). New data is a new release: bump both.
+STUDY_DATA_TAG := study-data-2026-10-24
+STUDY_DATA_SHA256 := 5716a0315101cc2ddf69d1cff4b7c551792cd76a67df65a9ce1b3a2c82558117
+STUDY_DATA_STAMP := docs/study/.data-$(STUDY_DATA_SHA256)
+
+.PHONY: study-data
+study-data: $(STUDY_DATA_STAMP)
+
+$(STUDY_DATA_STAMP):
+	mkdir -p target
+	curl -fsSL --retry 3 -o target/study-data.tar.gz \
+		https://github.com/prosody-events/gabion/releases/download/$(STUDY_DATA_TAG)/study-data.tar.gz
+	echo '$(STUDY_DATA_SHA256)  target/study-data.tar.gz' | shasum -a 256 -c -
+	tar -xzf target/study-data.tar.gz -C docs/study/data
+	rm -f docs/study/.data-* && touch $@
+
+# The tarball a new study-data release uploads: every file under
+# docs/study/data that docs/study/.gitignore keeps out of the tree.
+.PHONY: study-data-pack
+study-data-pack:
+	mkdir -p target
+	cd docs/study/data && tar -czf ../../../target/study-data.tar.gz \
+		$$(git ls-files --others --ignored --exclude-standard --directory .)
+
 .PHONY: study-test
-study-test:
+study-test: study-data
 	python3 docs/study/tests/test_compact.py
 	python3 docs/study/tests/test_ui.py
 

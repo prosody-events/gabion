@@ -1,3 +1,0 @@
-# Rejected results
-
-None.

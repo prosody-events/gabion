@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Rebuild docs/study/data from matrix.py results with the harness judge: the final
 # judge over every run, then posterior.json, runs.json, seed_metrics.json and
-# self_posterior.json, compacted, then the study tests.
+# self_posterior.json, compacted, then the study tests. It starts from the
+# current study-data release (`make study-data`), which also holds the evidence
+# refresh does not rebuild; publish the result as a new release (README, "Data").
 #
 #   docs/study/scripts/refresh.sh <harness-checkout> <baseline-results> <improved-results> <scratch-dir>
 #
@@ -10,13 +12,14 @@
 # overwritten. Needs python3, rsync, and docs/study/tests/requirements.txt for the tests.
 set -euo pipefail
 if [ $# -ne 4 ]; then
-    sed -n '2,10p' "$0" >&2
+    sed -n '2,12p' "$0" >&2
     exit 2
 fi
 HARNESS=$1 BASE=$2 IMP=$3 WORK=$4
 HERE=$(cd "$(dirname "$0")" && pwd)
 DATA=$HERE/../data
 JUDGE=$HARNESS/crates/gossip-bench/judge/judge.py
+make -C "$HERE/../../.." study-data
 RUN_AT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["run_at_default"])' "$DATA/provenance.json")
 
 rm -rf "$WORK" && mkdir -p "$WORK/all"
