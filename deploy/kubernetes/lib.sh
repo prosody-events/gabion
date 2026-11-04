@@ -55,24 +55,27 @@ build_and_load_images() {
 
 # assert_pods_run_image <selector> <tag>: every started pod the label
 # selector matches runs the image this run built and loaded as <tag>. Each
-# pod's node is asked what <tag> names there: its ID must be this run's build,
-# and the pod's image must be that image. A pod reports the image by a digest
-# containerd recorded when `kind load` imported it, which it lists among the
-# tag's repo digests.
+# pod's node is asked what <tag> names there: its layers must be this run's
+# build, and the pod's image must be that image. Layers, not the image ID,
+# because Docker's containerd image store gives an image a manifest digest
+# where the classic store and containerd give its config digest. A pod
+# reports the image by its config digest or by a digest containerd recorded
+# when `kind load` imported it, which it lists among the tag's repo digests.
 assert_pods_run_image() {
-    want="$(docker image inspect "$2" --format '{{.Id}}')"
+    want="$(docker image inspect "$2" --format '{{.RootFS.Layers}}')"
     kubectl -n "$namespace" get pods -l "$1" \
         -o 'jsonpath={range .items[*]}{.metadata.name} {.spec.nodeName} {.status.containerStatuses[*].imageID}{"\n"}{end}' \
         | awk 'NF == 3' | while read -r pod node image; do
         held="$(docker exec "$node" crictl inspecti -o go-template \
-            --template '{{.status.id}} {{.status.repoDigests}}' "docker.io/library/$2")" \
-            || held="nothing"
-        if [ "${held%% *}" = "$want" ]; then
-            case "$image" in *"${want#sha256:}"*) continue ;; esac
-            case "${held#* }" in *"${image#*@}"*) continue ;; esac
+            --template '{{.info.imageSpec.rootfs.diff_ids}} {{.status.id}} {{.status.repoDigests}}' \
+            "docker.io/library/$2")" || held="nothing"
+        ids="${held#*] }"
+        if [ "${held%%]*}]" = "$want" ]; then
+            case "$image" in *"${ids%% *}"*) continue ;; esac
+            case "${ids#* }" in *"${image#*@}"*) continue ;; esac
         fi
         printf '%s\n' "pod $pod runs image $image, but this run built and loaded $2 \
-(ID $want), and node $node holds $held for it. The cluster runs an older image: \
+(layers $want), and node $node holds $held for it. The cluster runs an older image: \
 rerun with GABION_SKIP_IMAGE_BUILD unset so the script builds and loads this checkout." >&2
         return 1
     done
