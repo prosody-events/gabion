@@ -19,7 +19,7 @@
   // selected. Fed the rolling `history` and a `version` counter that ticks on
   // every new sample, the single signal the charts redraw on. Chart 1 is the
   // study's central result made visible in one run: the share of data bytes
-  // that crossed zones, over what the design predicts with zones and without.
+  // that crossed zones, over what the cost model predicts with zones and without.
   // Charts 2 and 3 are small multiples, one panel per zone with members, in zone
   // order; chart 4 (aggregate vs limit) is shown only under the overload preset.
   let {

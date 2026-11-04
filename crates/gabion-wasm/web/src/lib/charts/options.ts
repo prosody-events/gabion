@@ -2,7 +2,7 @@
 // a complete `uPlot.Options`. The thin `Chart.svelte` wrapper owns the
 // lifecycle; the pedagogy lives here.
 //
-// Conventions enforced across the charts (the design rubric is explicit):
+// Conventions enforced across the charts:
 //   • one shared cursor-sync key, so a hover crosshair tracks the same x on
 //     every panel at once;
 //   • the detached legend is OFF: reference lines are labelled in the right
@@ -206,8 +206,8 @@ function padding(theme: Theme, right: number): uPlot.Padding {
 }
 
 /** Chart 1: the share of data bytes that crossed zones, σ, on a fixed 0–100 %
- *  axis, over two dashed references the design predicts, labelled in the right
- *  margin where the data line never reaches. `refs` is read at every draw, so
+ *  axis, over two dashed references the cost model predicts, labelled in the
+ *  right margin where the data line never reaches. `refs` is read at every draw, so
  *  the references follow the cluster without rebuilding the chart. */
 export function shareOptions(theme: Theme, refs: () => References | null): uPlot.Options {
   const sink = labelSink(theme);

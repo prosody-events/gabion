@@ -738,7 +738,7 @@ where
             let count: u64 = row.count.into();
             cells.push(CellDumpEntry {
                 rule_fingerprint: rule.map_or(0, |r| r.fingerprint),
-                key_hash: row.key.key_hash.0,
+                key_hash: row.key.key_hash,
                 bucket: row.key.bucket,
                 count,
                 last_update_millis: row.last_update_millis,

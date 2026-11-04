@@ -902,7 +902,7 @@ impl EngineState {
         // origin's cells, so keeping every dump would hold N stores at once.
         // No virtual time passes between the two passes.
         let mut origins: Vec<OriginCell> = Vec::new();
-        let mut index: HashMap<(u128, BucketEpoch, u128), usize> = HashMap::new();
+        let mut index: HashMap<(u128, BucketEpoch, KeyHash), usize> = HashMap::new();
         for handle in &self.nodes {
             let own = handle.identity.node_id.0;
             let dump = cell_dump(&handle.admin_tx).await;
@@ -1023,7 +1023,7 @@ impl EngineState {
             .iter()
             .map(|cell| CellView {
                 rule: cell.rule_fingerprint,
-                key: cell.key_hash,
+                key: cell.key_hash.0,
                 bucket: cell.bucket.0,
                 count: cell.count,
                 age_ms: self.virtual_ms.saturating_sub(cell.last_update_millis),

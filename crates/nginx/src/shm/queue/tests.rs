@@ -4,8 +4,8 @@ use quickcheck_macros::quickcheck;
 use std::sync::Arc;
 use std::thread;
 
-/// A key with `i` in both 64-bit halves, so a slot that drops or swaps a
-/// half hands back a different key.
+/// A key with `i` in its high half and `!i` in its low half, so a slot that
+/// drops or swaps a half hands back a different key.
 fn wide_key(i: u64) -> KeyHash {
     KeyHash(u128::from(i) << 64 | u128::from(!i))
 }
@@ -107,6 +107,20 @@ fn mpsc_concurrent_producers() {
     const PER_PRODUCER: usize = 16;
     const CAPACITY: usize = 64;
 
+    /// The `i`th event of `producer`: the producer in both fingerprint
+    /// halves and every other field distinct per event, so a torn, swapped
+    /// or reordered slot cannot pass for the event it should have carried.
+    fn produced(producer: usize, i: usize) -> QueueEvent {
+        QueueEvent {
+            rule_fingerprint: u128::from(producer as u64) << 64 | producer as u128,
+            key_hash: wide_key((producer as u64) << 32 | i as u64),
+            bucket: BucketEpoch(i as u32),
+            hits: 1,
+            rule_limit: 1_000,
+            now_millis: i as u64,
+        }
+    }
+
     let (control, slots) = build(CAPACITY);
     let mut handles = Vec::new();
     for producer in 0..PRODUCERS {
@@ -114,53 +128,43 @@ fn mpsc_concurrent_producers() {
         let slots = slots.clone();
         handles.push(thread::spawn(move || {
             let queue = RequestQueue::from_parts(&control, &slots);
-            let mut pushed = 0_u64;
             for i in 0..PER_PRODUCER {
-                let ev = QueueEvent {
-                    rule_fingerprint: producer as u128,
-                    key_hash: KeyHash(i as u128),
-                    bucket: BucketEpoch(i as u32),
-                    hits: 1,
-                    rule_limit: 1_000,
-                    now_millis: i as u64,
-                };
-                loop {
-                    match queue.push(ev) {
-                        Ok(()) => {
-                            pushed += 1;
-                            break;
-                        }
-                        Err(_) => std::hint::spin_loop(),
-                    }
+                while queue.push(produced(producer, i)).is_err() {
+                    std::hint::spin_loop();
                 }
             }
-            pushed
         }));
     }
 
+    // Each producer pushes in order into the positions it claims and the one
+    // consumer pops in position order, so every producer's events arrive in
+    // the order it pushed them.
     let consumer_control = control.clone();
     let consumer_slots = slots.clone();
     let consumer = thread::spawn(move || {
         let queue = RequestQueue::from_parts(&consumer_control, &consumer_slots);
-        let target = (PRODUCERS * PER_PRODUCER) as u64;
-        let mut seen = 0_u64;
-        while seen < target {
-            if queue.pop().is_some() {
-                seen += 1;
-            } else {
-                std::hint::spin_loop();
-            }
+        let mut next = [0_usize; PRODUCERS];
+        for _ in 0..PRODUCERS * PER_PRODUCER {
+            let ev = loop {
+                match queue.pop() {
+                    Some(ev) => break ev,
+                    None => std::hint::spin_loop(),
+                }
+            };
+            let p = ev.rule_fingerprint as u64 as usize;
+            assert!(p < PRODUCERS, "popped an event from no producer: {ev:?}");
+            assert_eq!(ev, produced(p, next[p]), "producer {p}, event {}", next[p]);
+            next[p] += 1;
         }
-        seen
+        next
     });
 
-    let mut total_pushed = 0_u64;
+    // The consumer first: a failed check there leaves the producers spinning
+    // on a full queue, and joining them first would hang the test.
+    assert_eq!(consumer.join().unwrap(), [PER_PRODUCER; PRODUCERS]);
     for h in handles {
-        total_pushed += h.join().unwrap();
+        h.join().unwrap();
     }
-    let seen = consumer.join().unwrap();
-    assert_eq!(total_pushed, (PRODUCERS * PER_PRODUCER) as u64);
-    assert_eq!(seen, total_pushed);
 }
 
 #[test]

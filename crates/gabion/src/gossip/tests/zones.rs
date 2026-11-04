@@ -1466,16 +1466,18 @@ fn joiner_heard_before_it_knows_its_zone_keeps_its_discovered_zone() {
 }
 
 /// A node that never learns its zone sends every peer its own stream
-/// directly. A peer of another zone keeps the zone discovery gave the node,
-/// yet acks that stream, so the node never suspects it.
+/// directly, and as a gateway relays to every peer too. A peer of another
+/// zone keeps the zone discovery gave the node, yet acks both streams, so
+/// the node never suspects it.
 #[test]
 fn node_that_never_learns_its_zone_is_acked_across_zones() {
     run_paused(async {
         let router = SimRouter::new();
-        let addrs = addrs(49_920, 5);
-        let (zones, x) = (["a", "a", "b", "b"], addrs[4]);
+        // Node 2 ranks x above both zone-a nodes, so routes x as its gateway.
+        let ranked = ranked(id(2, 1), 49_920, 5);
+        let (zones, x, addrs) = (["a", "a", "b", "b"], ranked[0], &ranked[1..]);
         let mut nodes: Vec<_> = (0..4)
-            .map(|i| zoned_node(&router, &addrs[..4], &zones, i))
+            .map(|i| zoned_node(&router, addrs, &zones, i))
             .collect();
         run_for(500).await;
         for node in &nodes {
@@ -1486,7 +1488,9 @@ fn node_that_never_learns_its_zone_is_acked_across_zones() {
             xn.tell(placed(addr, name));
         }
         run_for(500).await;
+        assert_eq!(nodes[2].peer(x).await.role, Role::Gateway);
         xn.hits(0..3).await;
+        nodes[2].hits(10..13).await;
         // Past `gossip.suspect_after`: an unacked stream would be suspect.
         let suspect_after = kubernetes_config(None, |_| {}).suspect_after.0.get();
         run_for(suspect_after + 1_000).await;
@@ -1494,11 +1498,11 @@ fn node_that_never_learns_its_zone_is_acked_across_zones() {
             let held = node.peer(x).await.zone;
             assert_eq!(held, PeerZone::Other(zone("a")), "{}", node.addr);
             let peer = xn.peer(node.addr).await;
-            let state = (peer.answer, peer.own_unacked);
-            assert_eq!(state, (AnswerState::Settled, 0), "{}", node.addr);
+            let state = (peer.answer, peer.own_unacked, peer.relay_unacked);
+            assert_eq!(state, (AnswerState::Settled, 0, 0), "{}", node.addr);
         }
         nodes.push(xn);
-        assert_totals(&nodes.iter().collect::<Vec<_>>(), 3);
+        assert_totals(&nodes.iter().collect::<Vec<_>>(), 6);
         stop_all(nodes).await;
     });
 }

@@ -60,7 +60,6 @@ use crate::throttle;
 /// A rule's bucket: `now_millis / bucket_millis`, cut to `u32`. Epochs wrap,
 /// so they carry no order; age one against another with [`Self::age_since`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct BucketEpoch(pub u32);
 
 impl BucketEpoch {

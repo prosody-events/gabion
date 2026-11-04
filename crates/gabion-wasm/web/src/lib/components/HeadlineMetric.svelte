@@ -4,8 +4,8 @@
   import type { ChartHistory } from '../charts/history';
 
   // The one always-pinned metric: the live spread between the most- and
-  // least-informed node (max − min), the single most-legible realization of the
-  // design's "one always-visible headline". Lives above *either* the charts
+  // least-informed node (max − min), the single most-legible realization of one
+  // always-visible headline. Lives above *either* the charts
   // dashboard or the node inspector, so the convergence story stays in view
   // whichever the right rail is showing. Reads straight off the cluster so it
   // tracks the stage; `history` only feeds the latched "converged in N rounds".

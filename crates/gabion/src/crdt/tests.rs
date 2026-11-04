@@ -15,21 +15,13 @@ use std::collections::{BTreeMap, BTreeSet};
 #[test]
 fn rule_node_bucket_slots_are_distinct_types() {
     use std::any::TypeId;
-    let types = [
-        ("RuleSlot", TypeId::of::<RuleSlot>()),
-        ("NodeSlot", TypeId::of::<NodeSlot>()),
-        ("BucketEpoch", TypeId::of::<BucketEpoch>()),
-        ("u16", TypeId::of::<u16>()),
-        ("u32", TypeId::of::<u32>()),
-    ];
-    let same: Vec<_> = types
-        .iter()
-        .enumerate()
-        .flat_map(|(i, a)| types[i + 1..].iter().map(move |b| (a, b)))
-        .filter(|(a, b)| a.1 == b.1)
-        .map(|(a, b)| (a.0, b.0))
-        .collect();
-    assert!(same.is_empty(), "one type under two names: {same:?}");
+    let rule = TypeId::of::<RuleSlot>();
+    let node = TypeId::of::<NodeSlot>();
+    assert_ne!(rule, TypeId::of::<u16>(), "RuleSlot is a bare u16");
+    assert_ne!(node, TypeId::of::<u16>(), "NodeSlot is a bare u16");
+    let epoch = TypeId::of::<BucketEpoch>();
+    assert_ne!(epoch, TypeId::of::<u32>(), "BucketEpoch is a bare u32");
+    assert_ne!(rule, node, "RuleSlot and NodeSlot are one type");
 }
 
 fn local() -> NodeIdentity {

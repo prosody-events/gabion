@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 
 use super::peer::Role;
 #[cfg(feature = "cell-dump")]
-use crate::crdt::{BucketEpoch, Incarnation};
+use crate::crdt::{BucketEpoch, Incarnation, KeyHash};
 use crate::crdt::{CellStoreStats, NodeId, NodeIdentity};
 use crate::zone::{ZoneHash, ZoneStatus};
 
@@ -244,7 +244,7 @@ pub struct CellDumpSnapshot {
 #[derive(Clone, Copy, Debug)]
 pub struct CellDumpEntry {
     pub rule_fingerprint: u128,
-    pub key_hash: u128,
+    pub key_hash: KeyHash,
     pub bucket: BucketEpoch,
     pub count: u64,
     pub last_update_millis: u64,

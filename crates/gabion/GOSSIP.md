@@ -105,7 +105,7 @@ a peer's zone or answer state changes (`PeerTable::refresh` in
 
 | Role | Who | What it is sent |
 |---|---|---|
-| `unheard` | A peer not heard from yet, of no zone discovery named | The own cells raised since it was added, and a greeting `PROBE` at once and each heartbeat until its first packet arrives with its zone. |
+| `unheard` | A peer not heard from yet, of no zone discovery named | The own cells raised since it was added, and a greeting `PROBE` at once and each heartbeat until its first packet arrives; its header's zone, if it names one, then places it. |
 | `zone` | A peer of this node's zone, or of no zone | The own stream and the relay stream, directly. |
 | `gateway` | The member of a remote zone that ranks first for this node | The own stream, flagged `RELAY_INTO_ZONE`. |
 | `remote` | Any other member of a remote zone | Acks only. |
@@ -291,7 +291,7 @@ three, when the first unanswered packet went out between heartbeats). An
 attempt fails when the packet or its answer is lost, so at independent loss
 `p` it fails with probability `p_a = 1 − (1 − p)²` and a late answer ends in a
 false suspicion with probability at most `p_a` to the power of the attempts.
-The design's loss model predicts (these are model predictions, not
+This loss model predicts (these are model predictions, not
 measurements):
 
 | Packet loss | One late answer ends in a false suspicion | A quiet row retried once per heartbeat is falsely suspected |
