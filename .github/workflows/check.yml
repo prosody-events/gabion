@@ -95,6 +95,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # `make hygiene` greps with ripgrep, which ubuntu-latest (26.04) no
+      # longer ships.
+      - run: sudo apt-get install -y --no-install-recommends ripgrep
       - run: make hygiene
 
   # Gate on `cargo.test`, not `cargo.build`: cargo-rail attributes bench
