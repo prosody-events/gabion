@@ -57,9 +57,6 @@ use crate::rules::{CardinalityLimits, RuleTable};
 use crate::settings::Setting;
 use crate::throttle;
 
-/// Application-level rule identifier — opaque to the CRDT.
-pub type RuleId = u32;
-
 /// A rule's bucket: `now_millis / bucket_millis`, cut to `u32`. Epochs wrap,
 /// so they carry no order; age one against another with [`Self::age_since`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -140,7 +137,7 @@ impl NodeIdentity {
 }
 
 /// Interned counter identity. All fields are dictionary slots or small ints;
-/// the struct never carries a raw `NodeId` or `RuleId`. Internal to one
+/// the struct never carries a raw `NodeId` or rule fingerprint. Internal to one
 /// process — see [`CellIdentity`] for the portable identity exported through
 /// [`DeltaSink`] / [`ExpirationSink`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

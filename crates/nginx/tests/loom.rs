@@ -158,7 +158,7 @@ fn at_most_one_worker_holds_the_lease() {
 fn cell(id: u64) -> AggregateCell {
     AggregateCell {
         rule_fingerprint: wide(id),
-        key_hash: wide(id),
+        key_hash: KeyHash(wide(id)),
         bucket: BucketEpoch::wrap(id),
         count: id,
     }
@@ -179,7 +179,7 @@ fn aggregate_readers_never_see_a_torn_cell() {
         let table = AggregateTable::from_slots(&slots[..]);
         let lookup = |id| {
             let key = cell(id);
-            table.get(key.rule_fingerprint, KeyHash(key.key_hash), key.bucket)
+            table.get(key.rule_fingerprint, key.key_hash, key.bucket)
         };
         assert_eq!(lookup(OLD), Some(cell(OLD)));
 

@@ -67,7 +67,7 @@ const _: () = assert!(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AggregateCell {
     pub rule_fingerprint: u128,
-    pub key_hash: u128,
+    pub key_hash: KeyHash,
     pub bucket: BucketEpoch,
     pub count: u64,
 }
@@ -95,8 +95,10 @@ impl AggregateSlot {
         let cell = AggregateCell {
             rule_fingerprint: ((self.rule_fingerprint_hi.load(Ordering::Relaxed) as u128) << 64)
                 | self.rule_fingerprint_lo.load(Ordering::Relaxed) as u128,
-            key_hash: ((self.key_hash_hi.load(Ordering::Relaxed) as u128) << 64)
-                | self.key_hash_lo.load(Ordering::Relaxed) as u128,
+            key_hash: KeyHash(
+                ((self.key_hash_hi.load(Ordering::Relaxed) as u128) << 64)
+                    | self.key_hash_lo.load(Ordering::Relaxed) as u128,
+            ),
             bucket: BucketEpoch(self.bucket.load(Ordering::Relaxed) as u32),
             count: self.count.load(Ordering::Relaxed),
         };
@@ -116,7 +118,7 @@ impl AggregateSlot {
         self.seq.store(seq.wrapping_sub(1), Ordering::Relaxed);
         // Order the odd `seq` before the field stores.
         fence(Ordering::Release);
-        let (fp, kh) = (cell.rule_fingerprint, cell.key_hash);
+        let (fp, kh) = (cell.rule_fingerprint, cell.key_hash.0);
         self.rule_fingerprint_lo.store(fp as u64, Ordering::Relaxed);
         self.rule_fingerprint_hi
             .store((fp >> 64) as u64, Ordering::Relaxed);
@@ -171,7 +173,7 @@ impl<'a> AggregateTable<'a> {
     /// The stored count for `(rule_fingerprint, key_hash, bucket)`, or
     /// `None` when it is absent (or being written or moved right now).
     pub fn get(&self, fp: u128, kh: KeyHash, bucket: BucketEpoch) -> Option<AggregateCell> {
-        match self.probe(fp, kh.0, bucket) {
+        match self.probe(fp, kh, bucket) {
             Probe::Found(_, cell) => Some(cell),
             Probe::Vacant(_) | Probe::Full => None,
         }
@@ -179,7 +181,7 @@ impl<'a> AggregateTable<'a> {
 
     /// Walk at most `MAX_PROBE` slots from the cell's home, stopping at the
     /// cell or at the first empty slot.
-    fn probe(&self, fp: u128, kh: u128, bucket: BucketEpoch) -> Probe {
+    fn probe(&self, fp: u128, kh: KeyHash, bucket: BucketEpoch) -> Probe {
         let home = mix_index(fp, kh, bucket) & self.mask();
         for distance in 0..MAX_PROBE {
             let index = (home + distance) & self.mask();
@@ -287,7 +289,7 @@ impl<'a> AggregateWriter<'a> {
                 continue;
             }
             let key = &deltas.keys[i];
-            if !self.add(key.rule_fingerprint, key.key_hash.0, key.bucket, delta) {
+            if !self.add(key.rule_fingerprint, key.key_hash, key.bucket, delta) {
                 note_aggregate_full(self.table.capacity(), self.dropped);
             }
         }
@@ -298,7 +300,7 @@ impl<'a> AggregateWriter<'a> {
             let key = &expirations.keys[i];
             self.subtract(
                 key.rule_fingerprint,
-                key.key_hash.0,
+                key.key_hash,
                 key.bucket,
                 u64::from(expirations.last_counts[i]),
             );
@@ -313,7 +315,7 @@ impl<'a> AggregateWriter<'a> {
     }
 
     /// Add `delta` to the cell; false when it has no slot near its home.
-    fn add(&self, fp: u128, kh: u128, bucket: BucketEpoch, delta: u64) -> bool {
+    fn add(&self, fp: u128, kh: KeyHash, bucket: BucketEpoch, delta: u64) -> bool {
         let (index, count) = match self.table.probe(fp, kh, bucket) {
             Probe::Found(index, cell) => (index, cell.count.saturating_add(delta)),
             Probe::Vacant(index) => (index, delta),
@@ -331,7 +333,7 @@ impl<'a> AggregateWriter<'a> {
 
     /// Take an expired origin's `last_count` off the cell, freeing its slot
     /// at zero.
-    fn subtract(&self, fp: u128, kh: u128, bucket: BucketEpoch, last_count: u64) {
+    fn subtract(&self, fp: u128, kh: KeyHash, bucket: BucketEpoch, last_count: u64) {
         let Probe::Found(index, mut cell) = self.table.probe(fp, kh, bucket) else {
             return;
         };
@@ -395,11 +397,11 @@ fn note_aggregate_full(capacity: usize, dropped: &std_atomic::AtomicU64) {
 }
 
 /// Mix `(rule_fingerprint, key_hash, bucket)` into a uniform table index.
-fn mix_index(fp: u128, kh: u128, bucket: BucketEpoch) -> usize {
+fn mix_index(fp: u128, kh: KeyHash, bucket: BucketEpoch) -> usize {
     use twox_hash::xxhash3_128;
     let mut buf = [0_u8; 16 + 16 + 4];
     buf[..16].copy_from_slice(&fp.to_le_bytes());
-    buf[16..32].copy_from_slice(&kh.to_le_bytes());
+    buf[16..32].copy_from_slice(&kh.0.to_le_bytes());
     buf[32..].copy_from_slice(&bucket.0.to_le_bytes());
     let h = xxhash3_128::Hasher::oneshot(&buf);
     (h as u64 ^ (h >> 64) as u64) as usize
