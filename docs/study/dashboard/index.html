@@ -511,6 +511,7 @@
   const HUB_GAP = 20;
   const SUB_NAME_DY = -1, SUB_DY = 10;   // a row name over its variant sub-label
   const ROW_H = 28, FAM_H = 20, GROUP_H = 18, LINE_H = 16, LABEL_PAD = 12;
+  const TEXT_INSET = 1;   // left-anchored svg text starts here, not at 0: a T or V overhangs its origin and the svg clips it
   const STRIP_PITCH = 11, STRIP_GLYPH = 26, KEY_GLYPH = 40, TIE_MIN_W = 5, TIE_MIN_GAP = 2;
   const FOREST_COL_MIN = 128, FOREST_COL_MAX = 240, COL_PAD = 10, LANE_W = 16, LANE_GAP = 4, TICK_GAP = 6, NOT_RUN_CLEAR = 10;
   // A forest cell, top to bottom: verdict mark, interval (line, caps) with the mean tick, seed rail.
@@ -676,9 +677,9 @@
     if (!widths.has(k)) { const t = meas.append('text').attr('class', cls).attr('font-weight', weight || null).text(s); widths.set(k, t.node().getComputedTextLength()); t.remove(); }
     return widths.get(k);
   };
-  const wrap = (text, width, cls) => {
+  const wrap = (text, width, cls, weight) => {
     const lines = []; let line = '';
-    for (const w of text.split(' ')) { const t = line ? line + ' ' + w : w; if (line && textW(t, cls) > width) { lines.push(line); line = w; } else line = t; }
+    for (const w of text.split(' ')) { const t = line ? line + ' ' + w : w; if (line && textW(t, cls, weight) > width) { lines.push(line); line = w; } else line = t; }
     if (line) lines.push(line);
     return lines;
   };
@@ -1073,7 +1074,7 @@
     // label column: family labels, names, verdict strip
     labHost.replaceChildren();
     const ls = d3.select(labHost).append('svg').attr('class', 'small').attr('width', nameW + stripW).attr('height', H).attr('aria-hidden', 'true');
-    for (const f of lay.fams) ls.append('text').attr('class', 't-head').attr('x', 0).attr('y', f.y + FAM_H - 6).text(f.family.toUpperCase());
+    for (const f of lay.fams) ls.append('text').attr('class', 't-head').attr('x', TEXT_INSET).attr('y', f.y + FAM_H - 6).text(f.family.toUpperCase());
     if (!phone) ls.append('text').attr('class', 't-head').attr('x', nameW).attr('y', headH - 8).text('BY REGIME');
     for (const a of arms) {
       const y = lay.ys.get(a.arm), cy = y + ROW_H / 2, sel = a.arm === m.arm.arm;
@@ -1316,20 +1317,25 @@
     const nameW = Math.ceil(d3.max(arms, (a) => textW(rowName(m, a), 't-body', a.arm === m.arm.arm ? 600 : null))) + LABEL_PAD;
     const keyTicks = [[ST_DEC, fmtDec(ST_DEC)], [0, '×1 = main'], [-ST_DEC, fmtDec(-ST_DEC)]];
     const keyTickW = d3.max(keyTicks, ([, t]) => textW(t, 't-cap'));
-    // strip geometry for a slot width; the key is scaled until every group's name fits under its slots on one line
+    // strip geometry for a slot width; the key is scaled until every group's name fits under its slots on one line,
+    // and enlarged up to ST_KEY_SCALE only as far as the key, ticks included, still fits the page; where caption-size
+    // names would push it past the page, they drop to the note size
     const geom = (slot) => {
       const slotX = (j) => ST_PAD + j * slot + gi(j) * ST_GROUP_GAP + slot / 2;
       const stripW = 2 * ST_PAD + regimes.length * slot + gaps;
       const spans = m.groups.map((grp) => { const js = regimes.map((r, j) => j).filter((j) => regimes[j].group === grp); return { grp, a: slotX(js[0]) - slot / 2, b: slotX(js[js.length - 1]) + slot / 2 }; });
-      const K = Math.max(ST_KEY_SCALE, d3.max(spans, (sp) => (textW(sp.grp.toLowerCase(), 't-cap') + 4) / (sp.b - sp.a)));
+      const fit = (cls) => d3.max(spans, (sp) => (textW(sp.grp.toLowerCase(), cls) + 4) / (sp.b - sp.a));
+      const room = (m.W - 6 - keyTickW) / stripW;
+      const grpCls = fit('t-cap') <= room ? 't-cap' : 't-note';
+      const K = Math.max(fit(grpCls), Math.min(ST_KEY_SCALE, room));
       const keyW = Math.ceil(stripW * K + 6 + keyTickW);
-      return { slot, slotX, stripW, pitch: stripW + ST_COL_GAP, spans, K, keyW };
+      return { slot, slotX, stripW, pitch: stripW + ST_COL_GAP, spans, K, keyW, grpCls };
     };
     const desk = geom(ST_SLOT);
     const phone = Math.floor((m.W - nameW + ST_COL_GAP) / desk.pitch) < widest;
     // on the phone the slots grow to share the full width between the widest family's strips
     const labelW = nameW;
-    const { slotX, stripW, pitch, spans, K, keyW } = phone ? geom(Math.max(ST_SLOT, Math.floor(((m.W + ST_COL_GAP) / widest - ST_COL_GAP - 2 * ST_PAD - gaps) / regimes.length))) : desk;
+    const { slotX, stripW, pitch, spans, K, keyW, grpCls } = phone ? geom(Math.max(ST_SLOT, Math.floor(((m.W + ST_COL_GAP) / widest - ST_COL_GAP - 2 * ST_PAD - gaps) / regimes.length))) : desk;
     const cap = Math.floor((m.W - labelW + ST_COL_GAP) / pitch);
     const famPick = $('g3-fam');
     $('g3-super-note').replaceChildren(el('b', {}, `Showing ${VARIANT_PHRASE[m.variant]}. `), `Each strip holds one arm on one metric across every regime, in fixed slots (${m.groups.join(' · ')}, as the key shows); a blank slot has no runs yet. Height is the ratio to main on a log scale from `, fmtDec(-ST_DEC), ' to ', fmtDec(ST_DEC), ' (clamped beyond); the hairline is main. Same marks as the hub. At this scale an interval shows only where it is taller than its mark, as a vertical line; most are not. Choose a strip to open that metric and arm in the hub, where intervals are drawn to scale.');
@@ -1369,14 +1375,14 @@
       for (const sp of spans) {
         const xa = sp.a * K + 1, xb = sp.b * K - 1;
         g.append('line').attr('class', 'rule').attr('x1', xa).attr('x2', xb).attr('y1', ST_H * K + 3).attr('y2', ST_H * K + 3);
-        g.append('text').attr('class', 't-cap mut').attr('x', (xa + xb) / 2).attr('y', ST_H * K + 3 + LINE_H).attr('text-anchor', 'middle').text(sp.grp.toLowerCase());
+        g.append('text').attr('class', grpCls + ' mut').attr('x', (xa + xb) / 2).attr('y', ST_H * K + 3 + LINE_H).attr('text-anchor', 'middle').text(sp.grp.toLowerCase());
       }
     };
     host.replaceChildren();
     const activeKey = fk?.startsWith('st|') ? fk : `st|${m.arm.arm}|${m.metric.metric}`;
     bands.forEach((band, b) => {
       const colX = (k) => lx + k * pitch;
-      const names = band.map((x) => wrap(x.short, stripW, 't-cap')), ranges = band.map((x) => { const r = range.get(x.metric); if (!r) return []; const f = fmtVal(x.unit); const [a, z] = fmtRange(x.unit, r.lo, r.hi), one = r.regimes > 1 ? `main ${a}–${z}` : `main ${f(r.lo)}`; return textW(one, 't-cap') <= stripW || r.regimes < 2 ? [one] : [`main ${a}–`, z]; });
+      const names = band.map((x) => wrap(x.short, stripW, 't-cap', x.metric === m.metric.metric ? 600 : 500)), ranges = band.map((x) => { const r = range.get(x.metric); if (!r) return []; const f = fmtVal(x.unit); const [a, z] = fmtRange(x.unit, r.lo, r.hi), one = r.regimes > 1 ? `main ${a}–${z}` : `main ${f(r.lo)}`; return textW(one, 't-cap') <= stripW || r.regimes < 2 ? [one] : [`main ${a}–`, z]; });
       const nl = d3.max(names, (l) => l.length), rl = d3.max(ranges, (l) => l.length) || 0;
       const headH = GROUP_H + nl * LINE_H + rl * LINE_H + 8;
       if (b === 0) drawKeyStrip(d3.select(host).append('svg').attr('width', keyW).attr('height', keyH), 0, 2);
@@ -1402,17 +1408,17 @@
         ranges[k].forEach((t, i) => mk(svg.append('text').attr('class', 't-cap mut').attr('x', x0).attr('y', GROUP_H + (nl + i + 1) * LINE_H).text(t), 'main_range', 'lo hi', where({ metric: x.metric })));
       });
       // rows
-      for (const f of lay.fams) svg.append('text').attr('class', 't-head').attr('x', 0).attr('y', f.y + ST_FAM_H - 4).text(f.family.toUpperCase());
+      for (const f of lay.fams) svg.append('text').attr('class', 't-head').attr('x', TEXT_INSET).attr('y', f.y + ST_FAM_H - 4).text(f.family.toUpperCase());
       arms.forEach((a) => {
         const y0 = lay.ys.get(a.arm), sy = y0 + (phone ? LINE_H + 2 : 0), sel = a.arm === m.arm.arm;
         if (sel) svg.insert('rect', ':first-child').attr('class', 'hl').attr('x', 0).attr('y', y0 - 2).attr('width', W).attr('height', rowH - ST_ROW_GAP + 4);
         const nt = svg.append('text').attr('class', 't-body' + (a.arm === REFERENCE_ARM ? ' mut' : '')).attr('font-weight', sel ? 600 : null);
         const name = rowName(m, a), sub = rowSub(m, a);
         nt.attr('data-arm', a.arm);
-        if (phone) nt.attr('x', 0).attr('y', y0 + LINE_H - 2).text(name); else nt.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + (sub ? SUB_NAME_DY : 4)).attr('text-anchor', 'end').text(name);
+        if (phone) nt.attr('x', TEXT_INSET).attr('y', y0 + LINE_H - 2).text(name); else nt.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + (sub ? SUB_NAME_DY : 4)).attr('text-anchor', 'end').text(name);
         if (sub) {
           const st = svg.append('text').attr('class', 't-note sub').text(sub);
-          if (phone) st.attr('x', textW(name, 't-body', sel ? 600 : null) + 6).attr('y', y0 + LINE_H - 2); else st.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + SUB_DY).attr('text-anchor', 'end');
+          if (phone) st.attr('x', TEXT_INSET + textW(name, 't-body', sel ? 600 : null) + 6).attr('y', y0 + LINE_H - 2); else st.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + SUB_DY).attr('text-anchor', 'end');
         }
         if (!m.sol(a)) { lackingNote(svg, m.reason(a), lx, sy + ST_H / 2, W - lx); return; }
         const row = svg.append('g').attr('role', 'row');
@@ -1508,7 +1514,7 @@
     if (G.lanes.yi) svg.append('text').attr('class', 't-cap mut').attr('x', G.L - 6).attr('y', G.T + LANE_W / 2 + 4).attr('text-anchor', 'end').text('∞');
     if (opts.titles) {
       svg.append('text').attr('class', 't-cap').attr('x', G.w - G.R).attr('y', G.h - 3).attr('text-anchor', 'end').text(opts.xTitle);
-      svg.append('text').attr('class', 't-cap').attr('x', 0).attr('y', LINE_H - 2).text(opts.yTitle);
+      svg.append('text').attr('class', 't-cap').attr('x', TEXT_INSET).attr('y', LINE_H - 2).text(opts.yTitle);
     }
     const nodes = new Map();
     for (const p of pts) {
