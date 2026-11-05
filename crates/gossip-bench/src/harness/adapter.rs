@@ -132,6 +132,15 @@ impl NodeStore {
             .window_total(self.identity.rule, hash, now_millis)
     }
 
+    /// The adapter's admission decision for one hit of `key` at
+    /// `now_millis`: gabion's `RuleSpec::admits` against the live-window
+    /// total, as `SharedLimiter::decide` makes it.
+    pub fn admits(&self, key: u32, now_millis: u64) -> bool {
+        self.identity
+            .rule
+            .admits(self.window_total(key, now_millis), 1)
+    }
+
     pub fn bucket_count(&self, key: u32, bucket: u32) -> u32 {
         let hash = self.identity.hashes[key as usize];
         self.counts

@@ -159,6 +159,14 @@ impl RuleSpec {
     pub fn bucket_at(self, now_millis: u64) -> BucketEpoch {
         BucketEpoch::wrap(now_millis / self.bucket_millis)
     }
+
+    /// Whether a request of `hits` fits under the limit when the window
+    /// already holds `total`: the one admission comparison every adapter
+    /// makes. The sum saturates, so a full window never wraps into admission.
+    #[inline]
+    pub fn admits(self, total: u64, hits: u64) -> bool {
+        total.saturating_add(hits) <= self.limit
+    }
 }
 
 /// One rule as an adapter writes it, before validation: the one input to

@@ -28,7 +28,7 @@ use crate::crdt::BucketEpoch;
 /// buckets in `[current - live_buckets + 1, current]`.
 ///
 /// Returns `0` if a request would already be admitted (defensive — callers
-/// already gate on `total + hits > limit`).
+/// already gate on [`RuleSpec::admits`](crate::rules::RuleSpec::admits)).
 pub fn time_until_admit_millis<F>(
     now_millis: u64,
     bucket_millis: NonZeroU64,

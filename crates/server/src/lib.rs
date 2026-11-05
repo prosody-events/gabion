@@ -208,7 +208,7 @@ impl SharedLimiter {
             let key_hash = *key_hash.get_or_insert_with(|| hash_key(domain, entries.clone()));
             let spec = rule.spec();
             let total = table.window_total(spec, key_hash, now_millis);
-            if total.saturating_add(hits) > spec.limit && rule.mode() == EnforcementMode::Enforce {
+            if !spec.admits(total, hits) && rule.mode() == EnforcementMode::Enforce {
                 return Decision::Reject(RejectReason::GlobalLimit(Quota {
                     remaining: 0,
                     duration_until_reset_millis: table

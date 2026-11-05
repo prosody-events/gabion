@@ -83,6 +83,26 @@ fn key_hash_separates_pairs_that_run_together() {
     assert_ne!(hash(&[("a", "b"), ("c", "d")]), hash(&[("a", "bc\0d")]));
 }
 
+/// A request fits while the window plus its hits stays at or under the
+/// limit, and a sum past `u64::MAX` saturates instead of wrapping into
+/// admission.
+#[test]
+fn admits_up_to_the_limit_and_saturates() {
+    let spec = build("a", "100r/s", 1, 1, EnforcementMode::Enforce).spec();
+    assert_eq!(spec.limit, 100);
+    assert!(spec.admits(75, 25));
+    assert!(spec.admits(0, 100));
+    assert!(!spec.admits(100, 1));
+    assert!(!spec.admits(90, 25));
+    assert!(!spec.admits(0, 101));
+    assert!(!spec.admits(u64::MAX, 1));
+    let unbounded = RuleSpec {
+        limit: u64::MAX,
+        ..spec
+    };
+    assert!(unbounded.admits(u64::MAX, 0));
+}
+
 /// `parse_rate` with the count unwrapped, for comparing against literals.
 fn rate(input: &str) -> (u64, Duration) {
     let (count, period) = parse_rate(input).unwrap();

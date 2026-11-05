@@ -122,7 +122,8 @@ let key = hash_key(
     }],
 );
 let now = 0;
-if a_counts.table().window_total(spec, key, now) < spec.limit {
+let total = a_counts.table().window_total(spec, key, now);
+if spec.admits(total, 1) {
     let bucket = spec.bucket_at(now);
     a_client
         .record(spec.fingerprint, key, bucket, 1, spec.limit, now)

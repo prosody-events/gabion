@@ -297,7 +297,7 @@ fn decide_one(
     // DryRun rules count and gossip but never reject — they let operators
     // observe what enforcement would do before flipping the switch.
     let hits = 1u64;
-    if total.saturating_add(hits) > spec.limit && rule.mode() == EnforcementMode::Enforce {
+    if !spec.admits(total, hits) && rule.mode() == EnforcementMode::Enforce {
         let delta_until_admit_millis = ctx
             .aggregate
             .time_until_admit_millis(spec, key_hash, now_millis, total, hits);
