@@ -216,9 +216,15 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   let admitted = 0;
   // A57: the buckets the Sends admitted after Play were pressed in.
   const paced: number[] = [];
+  // A57: the most strata a vessel held once Play ran the clock, read as each
+  // state settles, while the act's Sends are still in the window.
+  const strataOf = (): Promise<number> =>
+    page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => Math.max(...c.glyphs.strata));
+  let strata = 0;
   for (let step = 0; step < 60; step++) {
     const where = `${info.project.name}, state ${step}`;
     await untilNext(page, where);
+    if (pressed.includes('Play')) strata = Math.max(strata, await strataOf());
     const label = await checkState(page, where);
     if (label === null) continue;
     pressed.push(label.startsWith('Send') ? 'Send' : label);
@@ -300,11 +306,10 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   const paused = templates.slice(0, templates.findIndex(([id]) => id === 'rl-3'));
   for (const [id, text] of paused) if (id === 'rl-2') expect(text, 'the badge').toContain('agreed in 2 hops');
   // A57: the sliding-window act's Sends fell in buckets of their own: the
-  // vessels hold their strata wherever the inside is tall enough to show them.
-  const [strata, inner] = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => [
-    Math.max(...c.glyphs.strata),
-    2 * (c.glyphs.r[0] - 1),
-  ]);
+  // vessels held their strata wherever the inside is tall enough to show them.
+  // Read as the act went, not at its end, where a slow runner's playing clock
+  // has let all but the last bucket leave.
+  const inner = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => 2 * (c.glyphs.r[0] - 1));
   if (inner >= STRATA_MIN_INNER) expect(strata, 'the sliding window left its strata').toBeGreaterThanOrEqual(2);
 
   // A6: the end hands over. Go to Zone partition loads it paused at its
@@ -382,6 +387,9 @@ test('Propagation stops before each wave and Step flies it (A55)', async ({ page
   // (3) Wave 1 alone: node 0's own packets, Z − 1 of them across zones.
   await primary(page).click();
   await untilNext(page, `${where}: before wave 2`);
+  // Wave 1's landing played the run on by itself to the relays, held for Step.
+  await expect(page.locator('.stage-pane'), `${where}: the relays wait for Step`).toHaveAttribute('data-flight', 'waiting');
+  await expect(page.locator('.stage-pane'), `${where}: the run is still per-wave`).toHaveAttribute('data-clock', 'per-wave');
   const wave1 = await data();
   expect(wave1.length, 'wave 1: node 0 to its zone and a gateway per other zone').toBe(5);
   expect(wave1.every((b) => b.src === 0 && (b.flags & RELAY) === 0)).toBe(true);

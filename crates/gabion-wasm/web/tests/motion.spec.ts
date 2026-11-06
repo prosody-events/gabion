@@ -99,9 +99,20 @@ async function openOnFakeClock(page: Page): Promise<void> {
 }
 
 /** Stop the page's fake clock: from here the page's time moves only as the
- *  test runs it (`runUntil`), until `page.clock.resume()`. */
+ *  test runs it (`runUntil`), until `page.clock.resume()`. The clock runs on
+ *  while the test reads it, so on a loaded machine the instant read may have
+ *  passed by the time the pause reaches the page: each retry reads it again,
+ *  with twice the margin. */
 async function stopClock(page: Page): Promise<void> {
-  await page.clock.pauseAt(await page.evaluate((frame) => Date.now() + frame, FRAME_MS));
+  for (let margin = FRAME_MS; ; margin *= 2) {
+    const at = await page.evaluate((m) => Date.now() + m, margin);
+    try {
+      await page.clock.pauseAt(at);
+      return;
+    } catch (e) {
+      if (margin >= 1024 * FRAME_MS || !String(e).includes('Cannot fast-forward to the past')) throw e;
+    }
+  }
 }
 
 /** Run the page's fake clock until `done` holds, at most `maxMs` of the page's
@@ -456,6 +467,10 @@ for (const speed of [1, 0.1]) {
     expect(wave1.length, 'Step 1 flew node 0 to its zone and one gateway per other zone').toBe(5);
     expect(wave1.every((b) => b.src === 0 && (b.flags & RELAY) === 0), 'Step 1: node 0, no relay').toBe(true);
     expect(wave1.filter((b) => (b.flags & CROSS) !== 0).length, 'Step 1 crossed a zone Z − 1 times').toBe(zones - 1);
+    // Wave 1's landing plays the run on by itself to the relays, which it
+    // holds for Step: the run is still Propagation's per-wave one.
+    await expect(page.locator('.stage-pane'), 'the relays wait for Step').toHaveAttribute('data-flight', 'waiting');
+    await expect(page.locator('.stage-pane'), 'the run is still per-wave').toHaveAttribute('data-clock', 'per-wave');
 
     wall = Date.now();
     await step(page);
@@ -594,7 +609,13 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
   await inFlightAboveLabels();
   await step(page);
   await freezeAt(true, 'propagation-wave2.png');
-  await step(page);
+  // Play, the next action, flies the frozen relays on. With the page's clock
+  // stopped no frame can land them, so the flight is seen before the landing.
+  await stopClock(page);
+  const pane = page.locator('.stage-pane');
+  await page.getByRole('button', { name: 'Play' }).click();
+  await expect(pane, 'Play flies the frozen wave on').toHaveAttribute('data-flight', 'flying');
+  await runUntil(page, async () => (await pane.getAttribute('data-flight')) === 'none', 30 * BEAM_FLIGHT_MS, 'the relays landing after Play');
 });
 
 test('the transport says how long a heartbeat takes to watch', async ({ page }) => {
