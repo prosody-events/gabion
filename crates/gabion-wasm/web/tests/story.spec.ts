@@ -3,7 +3,7 @@ import type { ClusterState } from '../src/lib/sim/types';
 import type { GlyphTable } from '../src/lib/stage/renderer';
 import { CONTROL, CROSS, RELAY, STRATA_MIN_INNER } from '../src/lib/stage/layout';
 import { readTheme } from '../src/lib/theme';
-import { WATCH, sendButton, still } from './drive';
+import { WATCH, pauseIfPlaying, sendButton, still } from './drive';
 import { WATCHES } from '../src/lib/next';
 import { PRESETS, presetById } from '../src/lib/presets';
 import { COMMANDS, clauses } from './next-actions';
@@ -30,8 +30,12 @@ async function open(page: Page): Promise<void> {
   if (await controls.isVisible()) await controls.click();
 }
 
+/** Scenario `name`'s button in the preset list. */
+const presetButton = (page: Page, name: string): Locator =>
+  page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name, exact: true });
+
 async function loadPreset(page: Page, name: string): Promise<void> {
-  const preset = page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name, exact: true });
+  const preset = presetButton(page, name);
   if ((await preset.getAttribute('aria-current')) !== 'true') await preset.click();
   await expect(preset).toHaveAttribute('aria-current', 'true');
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
@@ -197,7 +201,7 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
   test.setTimeout(240_000);
   await open(page);
   // Rate limiting is the page's default: it opens there, at nothing counted.
-  await expect(page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name: 'Rate limiting', exact: true })).toHaveAttribute('aria-current', 'true');
+  await expect(presetButton(page, 'Rate limiting')).toHaveAttribute('aria-current', 'true');
   await expect(page.locator('[data-template]')).toHaveAttribute('data-template', 'rl-0');
   // At 1×: the sliding-window act wants its Sends a bucket apart, and the
   // checks between presses then cost the story next to nothing in simulated
@@ -298,6 +302,26 @@ test('Rate limiting, state by state (A40, A49, A18, A54, A56, A19)', async ({ pa
     2 * (c.glyphs.r[0] - 1),
   ]);
   if (inner >= STRATA_MIN_INNER) expect(strata, 'the sliding window left its strata').toBeGreaterThanOrEqual(2);
+
+  // A6: the end hands over. Go to Zone partition loads it paused at its
+  // start with node 0 selected; Undo restores the finished Rate limiting run.
+  // Checked once; paused first, so the run Undo restores is the one read here.
+  if (info.project.name !== 'audit-1440-light') return;
+  await pauseIfPlaying(page);
+  await still(page);
+  const left = await snapshot(page);
+  const selection = page.locator('.pane-title [data-field="node"]');
+  const selected = squash(await selection.textContent());
+  await primary(page).click();
+  await expect(presetButton(page, 'Zone partition')).toHaveAttribute('aria-current', 'true');
+  await expect(page.locator('.narration')).toContainText('Paused at the start of Zone partition');
+  await expect(selection).toHaveText('0');
+  await page.getByRole('button', { name: 'Undo' }).click();
+  await expect(presetButton(page, 'Rate limiting')).toHaveAttribute('aria-current', 'true');
+  await expect(selection).toHaveText(selected);
+  const back = await snapshot(page);
+  expect(back.virtual_ms, 'Undo: the same instant').toBe(left.virtual_ms);
+  expect(back.nodes.map((n) => n.window_total), 'Undo: the same counts').toEqual(left.nodes.map((n) => n.window_total));
 });
 
 test('Propagation stops before each wave and Step flies it (A55)', async ({ page }, info) => {
@@ -527,7 +551,7 @@ test('a rebuild that fails keeps the running cluster, and the active scenario is
   await still(page);
   const before = await snapshot(page);
   expect(before.oracle_total).toBe(25);
-  await page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name: 'Rate limiting', exact: true }).click();
+  await presetButton(page, 'Rate limiting').click();
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
   const inert = await snapshot(page);
   expect([inert.virtual_ms, inert.oracle_total], 'pressing the active scenario rebuilt it').toEqual([before.virtual_ms, before.oracle_total]);
@@ -744,30 +768,4 @@ test('the pane is one column that never swaps (A5)', async ({ page }, info) => {
   await expect(page.locator('.pane-title [data-field="node"]')).toHaveText('4');
   const after = await order();
   expect(after.slice(1, -1), 'selecting another node swaps nothing').toEqual(before.slice(1, -1));
-});
-
-test("a story's end hands over, and Undo brings it back (A6)", async ({ page }, info) => {
-  test.skip(info.project.name !== 'audit-1440-light', 'the hand-over, checked once');
-  test.setTimeout(120_000);
-  await open(page);
-  await loadPreset(page, 'Propagation');
-  // Propagation's story told quickly: a Send, then Step to the window's edge.
-  await primary(page).click();
-  for (let i = 0; i < 12 && !(await primary(page).textContent())?.startsWith('Go to'); i++) {
-    await untilNext(page, 'Propagation');
-    if ((await primary(page).textContent())?.startsWith('Go to')) break;
-    await primary(page).click();
-    await still(page);
-  }
-  await expect(primary(page)).toHaveText(/^Go to Rate limiting/);
-  const left = await snapshot(page);
-  await primary(page).click();
-  await expect(page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name: 'Rate limiting', exact: true })).toHaveAttribute('aria-current', 'true');
-  await expect(page.locator('.narration')).toContainText('Paused at the start of Rate limiting');
-  await expect(page.locator('.pane-title [data-field="node"]')).toHaveText('0');
-  await page.getByRole('button', { name: 'Undo' }).click();
-  await expect(page.getByRole('group', { name: 'Scenario preset' }).getByRole('button', { name: 'Propagation', exact: true })).toHaveAttribute('aria-current', 'true');
-  const back = await snapshot(page);
-  expect(back.virtual_ms).toBe(left.virtual_ms);
-  expect(back.nodes.map((n) => n.window_total)).toEqual(left.nodes.map((n) => n.window_total));
 });

@@ -1512,7 +1512,10 @@ export class StageRenderer {
       const age = now - pool.start[i];
       if (age < 0) continue;
       let flags = pool.flags[i];
-      if ((flags & LANDED) === 0 && age >= BEAM_FLIGHT_MS) {
+      // Landed on the sum a paused clock stops at (`finish` bounds it at
+      // `start + BEAM_FLIGHT_MS`), never on the difference, which rounding can
+      // leave short of the flight and so hold a beam in the air for ever.
+      if ((flags & LANDED) === 0 && now >= pool.start[i] + BEAM_FLIGHT_MS) {
         pool.land(i);
         if (!keep || (flags & (CONTROL | DROPPED)) !== 0) {
           pool.removeAt(i);

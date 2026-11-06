@@ -172,10 +172,12 @@ export interface BandFrame {
 /** Press Send at the selected node `node`, which refuses it, and return every
  *  frame of the refusal's band, checking each: it never passes the brim
  *  nor reaches the count where one is shown. The recorder starts before the
- *  press, so a band however short is seen from its first frame. */
-export async function refusal(page: Page, node: number, where: string): Promise<BandFrame[]> {
+ *  press, so a band however short is seen from its first frame. With
+ *  `relayout`, the stage's box shrinks to half its height in the band's first
+ *  frame, so the discs resize mid-bounce. */
+export async function refusal(page: Page, node: number, where: string, relayout = false): Promise<BandFrame[]> {
   const recording = page.evaluate(
-    () =>
+    (relayout) =>
       new Promise<BandFrame[]>((done) => {
         const c = document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable };
         const out: BandFrame[] = [];
@@ -183,6 +185,12 @@ export async function refusal(page: Page, node: number, where: string): Promise<
         const tick = (): void => {
           const g = c.glyphs;
           if (g.bounce >= 0) {
+            if (!started && relayout) {
+              const stage = document.querySelector<HTMLElement>('.stage')!;
+              stage.style.flex = 'none';
+              stage.style.aspectRatio = 'auto';
+              stage.style.height = `${stage.clientHeight / 2}px`;
+            }
             started = true;
             out.push({ top: g.bandTop, bottom: g.bandBottom, brim: g.brimY[g.bounce], r: g.r[g.bounce] });
           } else if (started) {
@@ -193,6 +201,7 @@ export async function refusal(page: Page, node: number, where: string): Promise<
         };
         tick();
       }),
+    relayout,
   );
   await sendButton(page).click();
   const frames = await recording;

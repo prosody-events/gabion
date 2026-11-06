@@ -12,9 +12,9 @@ import {
   LABEL_GAP,
   PORT_GAP,
   RELAY,
-  RING_REACH,
   R_MAX,
-  SELECTION_REACH,
+  SELECTION_GAP,
+  SELECTION_WIDTH,
   STRATA_MIN_INNER,
   beamPath,
   pointOn,
@@ -30,6 +30,12 @@ import { PRESETS } from '../src/lib/presets';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
 import { PERIOD_MS, WATCH, period, refusal, send, sendButton, setSpeed, step, stepUntil, still, virtualMs } from './drive';
+
+// How far a node's ring and its selection outline reach outside its disc,
+// summed from the gap and stroke each is drawn with rather than read from the
+// layout's own sums, so a sum that loses a term shows.
+const RING_REACH = ARC_GAP + ARC_WIDTH / 2;
+const SELECTION_REACH = SELECTION_GAP + SELECTION_WIDTH / 2;
 
 // The automated half of the audit checklist in `../README.md` ("Design rules"):
 // A1 to A9. Each audit project fixes a width and a colour scheme; the main test
@@ -1008,6 +1014,16 @@ test('chart 1 prints the windowed share and follows the placement', async ({ pag
   expect(first, 'one heartbeat period of Steady state sends data bytes').not.toBeNull();
   await expect(field(page, 'share')).toHaveText(percent(first!));
   await expect(page.getByText('No traffic yet')).toHaveCount(0);
+  // The axes read seconds of virtual time and percent: each tick's value
+  // from the split it labels (milliseconds, and a share of 1).
+  const ticks = await page
+    .locator('section.block', { hasText: 'Share of data bytes' })
+    .locator('.plot')
+    .evaluate((host: HTMLElement & { uplot?: any }) => host.uplot.axes.map((a: { _splits: number[]; _values: number[] }) => [a._splits, a._values]));
+  const [[xSplits, xValues], [ySplits, yValues]] = ticks as [number[], number[]][];
+  expect(xValues, 'the x axis reads seconds').toEqual(xSplits.map((t) => t / 1000));
+  expect(yValues, 'the y axis reads percent').toEqual(ySplits.map((t) => t * 100));
+  expect([yValues[0], yValues.at(-1)], 'the y axis runs from 0 to 100 %').toEqual([0, 100]);
 
   // Thirty periods on, the window (ten seconds) has slid past the start: σ is
   // the share of the last window's bytes, not the whole run's.
@@ -1523,10 +1539,13 @@ test('runs go quiet after agreement', async ({ page }, info) => {
     'Propagation: a packet in the second period after agreement',
   ).toEqual([]);
 
-  // Zone partition, healed: it reconciles, then sends no data.
+  // Zone partition, healed: the heal's run reconciles and pauses itself,
+  // not at its cap, then the network sends no data.
   await loadPreset(page, 'Zone partition');
   await page.getByRole('button', { name: 'Heal network' }).click();
   await expect(field(page, 'status-cut')).toHaveCount(0);
+  await expect(page.locator('.stage-pane'), 'Zone partition: the heal ran to agreement, not its cap').toHaveAttribute('data-run', 'off', { timeout: 30_000 });
+  await expect(page.locator('.narration')).toHaveText(/every node has it$/);
   await logPackets(page);
   await stepUntil(page, () => agreed(page), 16, 'Zone partition agreed');
   await takePackets(page);
@@ -1622,6 +1641,10 @@ test('the transport stays put when the heartbeat reading appears', async ({ page
   await page.evaluate(() => document.fonts.ready.then(() => undefined));
   const bar = page.locator('.transport');
   const time = page.locator('.readout-item.time');
+  const reading = page.locator('.readout-item.heartbeat');
+  // Kept, but hidden, until a period has played: it never reads a time not
+  // measured.
+  await expect(reading, 'the heartbeat reading before a period played').toBeHidden();
   const before = (await bar.boundingBox())!.height;
   const at = (await time.boundingBox())!;
   const row = (await page.locator('.readout').boundingBox())!;
@@ -1629,6 +1652,7 @@ test('the transport stays put when the heartbeat reading appears', async ({ page
   await page.getByRole('button', { name: 'Play' }).click();
   await expect(field(page, 'heartbeat-wall')).toHaveAttribute('data-ms', /\d/, { timeout: 30_000 });
   await page.getByRole('button', { name: 'Pause' }).click();
+  await expect(reading, 'the heartbeat reading once a period played').toBeVisible();
   expect((await bar.boundingBox())!.height, 'the bar changed height when the reading appeared').toBe(before);
   const after = (await time.boundingBox())!;
   expect(after.x + after.width, 'the simulated time moved when the reading appeared').toBeCloseTo(at.x + at.width, 0);
@@ -1900,6 +1924,17 @@ test('the node glyph tells level, strata, cap, refusal and ring (A42, A16)', asy
   expect(new Set(frames.map((f) => f.top)).size, `${where}: under reduced motion the band rests`).toBe(1);
   expect(await page.evaluate(() => (window as unknown as { pushed: number }).pushed), `${where}: a refusal sends nothing`).toBe(0);
   expect(await page.locator('.count').allTextContents(), `${where}: a refusal counts nothing`).toEqual(counts);
+
+  // A relayout that resizes the disc mid-bounce reshapes the band: it still
+  // rests on the brim. At 0.2× the band stands three seconds, long past the
+  // resize's debounce. Checked where the stage fills the height and where it
+  // keeps its aspect.
+  if (!['audit-1280-light', 'audit-400-dark'].includes(where)) return;
+  await setSpeed(page, 0.2);
+  const resized = await refusal(page, 2, `${where}, resized`, true);
+  await page.locator('.stage').evaluate((el: HTMLElement) => el.removeAttribute('style'));
+  expect(new Set(resized.map((f) => f.r)).size, `${where}: the disc resized mid-bounce`).toBeGreaterThan(1);
+  for (const f of resized) expect(Math.abs(f.bottom - f.brim), `${where}: the resized band rests on its brim`).toBeLessThan(1e-3);
 });
 
 // -- A10: the faces ---------------------------------------------------------------

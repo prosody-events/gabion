@@ -564,6 +564,9 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
     await page.getByRole('button', { name: 'Play' }).click();
     await expect(page.getByRole('button', { name: 'Play' })).toBeVisible({ timeout: 30_000 });
     expect(await pool(page, (c) => c.beams.inFlight), 'paused with a wave in flight').toBeGreaterThan(0);
+    // The held wave is frozen, so Play, the next action, flies it on.
+    await expect(page.locator('.stage-pane')).toHaveAttribute('data-flight', 'frozen');
+    await expect(page.locator('[data-primary]')).toHaveText('Play');
     const before = await pool(page, (c) => [c.beams.len, c.beams.clock]);
     const stage = page.locator('.stage');
     const pixels = await stage.screenshot();

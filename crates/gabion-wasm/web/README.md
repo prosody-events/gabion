@@ -213,7 +213,7 @@ every node mark as drawn (vessel heights, strata, cap, ring role and arc, port
 centres, the refusal's band, the selection and the preview); and the stage pane
 publishes `data-held` (the sequence number of the wave held, "0" when none is),
 `data-flight` (`none`, `waiting`, `flying` or `frozen`), `data-run` (`off`,
-`settled` or `per-wave`) and `data-playing`.
+`capped`, `settled` or `per-wave`) and `data-playing`.
 
 ## Fonts
 

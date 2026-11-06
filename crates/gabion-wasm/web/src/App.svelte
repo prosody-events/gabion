@@ -1283,7 +1283,7 @@
           aria-describedby="next-action"
           data-held={wave.kind === 'none' ? 0 : wave.held.seq}
           data-flight={wave.kind}
-          data-run={clock === 'settled' || clock === 'per-wave' ? clock : 'off'}
+          data-run={bound.kind}
           data-playing={playing ? '1' : '0'}
         >
           <StageCaption
