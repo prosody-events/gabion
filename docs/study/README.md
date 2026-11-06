@@ -80,7 +80,7 @@ make study-test
 ```
 
 `make study-test` runs `tests/test_compact.py` (raw against compacted data) and
-`tests/test_ui.py`, the browser audit: 1,156 checks over the 1440, 1280, 1100,
+`tests/test_ui.py`, the browser audit: 1,160 checks over the 1440, 1280, 1100,
 768 and 400 px viewports in both themes, which recompute every printed number
 from the data in Python and never reuse the page's code. It exits 1 on any FAIL.
 `--only A3,A6` runs the checks whose ids start with those prefixes, and

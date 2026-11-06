@@ -512,12 +512,12 @@
   const SCORE_CARDS_BELOW = 960;
   const HUB_GAP = 20;
   const SUB_NAME_DY = -1, SUB_DY = 10;   // a row name over its variant sub-label
-  const ROW_H = 28, FAM_H = 20, GROUP_H = 18, LINE_H = 16, LABEL_PAD = 12;
+  const ROW_H = 28, FAM_H = 20, GROUP_H = 18, LABEL_PAD = 12;
   const TEXT_INSET = 1;   // left-anchored svg text starts here, not at 0: a T or V overhangs its origin and the svg clips it
   const STRIP_PITCH = 11, STRIP_GLYPH = 26, KEY_GLYPH = 40, TIE_MIN_W = 5, TIE_MIN_GAP = 2;
   const FOREST_COL_MIN = 128, FOREST_COL_MAX = 240, COL_PAD = 10, LANE_W = 16, LANE_GAP = 4, TICK_GAP = 6, NOT_RUN_CLEAR = 10;
   // A forest cell, top to bottom: verdict mark, interval (line, caps) with the mean tick, seed rail.
-  const MARKER = 20, MARK_HALF = 3, MARK_DY = -8, TICK_H = 9, CAP_LEN = 6, SEED_DY = 7, SEED_LEN = 4, NARROW_PX = 6, NOTE_MARGIN = 3, NOTE_DY = 3, NOTE2_DY = [-2, 9];
+  const MARKER = 20, MARK_HALF = 3, MARK_DY = -8, TICK_H = 9, CAP_LEN = 6, SEED_DY = 7, SEED_LEN = 4, NARROW_PX = 6, NOTE_MARGIN = 3;
   const MATRIX_COL_MIN = 24, MATRIX_COL_MAX = 30, MATRIX_GLYPH = 56;
   const DEC_MIN = -4, DEC_MAX = 3;
   const FIT_Q = 0.05, FIT_REACH = 0.15, FIT_PAD = 0.08, FIT_MIN_SPAN = 0.04, RATIO_TICKS = 4;   // forest axis fit, in decades
@@ -527,7 +527,7 @@
   const PLANE_MAX_W = 1040, PLANE_ASPECT = 0.56, PLANE_MIN_H = 320, PLANE_MAX_H = 540, PLANE_GLYPH = 64;
   const PANEL_MIN_W = 240, PANEL_H = 210, PANEL_GAP = 20, HOVER_R = 28, LEADER_GUTTER = 18, GUTTER_MAX_FRAC = 0.3, TINT_MAX_FRAC = 0.5, LABEL_NEAR = 9, LABEL_FAR = 26, LABEL_SPACE = 4;
   const PANE_BELOW_MAX = 640;
-  const ZOOM_H = 40, ZOOM_BAR_Y = 12, ZOOM_INSET = 6, ZOOM_PAD = 0.35, ZOOM_MIN_REL = 0.01, ZOOM_TICKS = 4;
+  const ZOOM_BAR_Y = 12, ZOOM_INSET = 6, ZOOM_PAD = 0.35, ZOOM_MIN_REL = 0.01, ZOOM_TICKS = 4;
   const INTEGER_UNITS = new Set(['datagrams', 'slots']);
   const RESIZE_DEBOUNCE_MS = 120, AGE_REFRESH_MS = 60000;
 
@@ -679,6 +679,13 @@
     if (!widths.has(k)) { const t = meas.append('text').attr('class', cls).attr('font-weight', weight || null).text(s); widths.set(k, t.node().getComputedTextLength()); t.remove(); }
     return widths.get(k);
   };
+  // A text class's line box as the face sets it: ascent above the baseline, descent below, and the pitch at which
+  // stacked lines just clear. Measured once per face, like widths, and cleared with them when the faces load.
+  const boxes = new Map();
+  const lineBox = (cls) => {
+    if (!boxes.has(cls)) { const t = meas.append('text').attr('class', cls).text('Hg'), b = t.node().getBBox(); boxes.set(cls, { asc: -b.y, desc: b.y + b.height, h: Math.ceil(b.height) }); t.remove(); }
+    return boxes.get(cls);
+  };
   const wrap = (text, width, cls, weight) => {
     const lines = []; let line = '';
     for (const w of text.split(' ')) { const t = line ? line + ' ' + w : w; if (line && textW(t, cls, weight) > width) { lines.push(line); line = w; } else line = t; }
@@ -687,9 +694,9 @@
   };
   // "— reason": an arm with no value, one text wrapped to the width its svg leaves, centred on yMid
   const lackingNote = (svg, reason, x, yMid, width) => {
-    const ls = wrap(`— ${reason}`, width, 't-cap sub');
-    const t = svg.append('text').attr('class', 't-cap sub').attr('y', yMid + 4 - (ls.length - 1) * LINE_H / 2);
-    ls.forEach((l, i) => t.append('tspan').attr('x', x).attr('dy', i ? LINE_H : 0).text(i < ls.length - 1 ? l + ' ' : l));
+    const ls = wrap(`— ${reason}`, width, 't-cap sub'), capBox = lineBox('t-cap');
+    const t = svg.append('text').attr('class', 't-cap sub').attr('y', yMid + 4 - (ls.length - 1) * capBox.h / 2);
+    ls.forEach((l, i) => t.append('tspan').attr('x', x).attr('dy', i ? capBox.h : 0).text(i < ls.length - 1 ? l + ' ' : l));
   };
 
   /* tooltip */
@@ -1011,8 +1018,9 @@
     const lines = notes.find((ls) => wide(ls) <= Math.max(roomR, roomL));
     if (!lines) return;
     const onRight = wide(lines) <= roomR;
+    const noteBox = lineBox('t-note');
     lines.forEach((t, i) => mk(cell.append('text').attr('class', 't-note sub halo').attr('x', onRight ? right + 4 : left - 4)
-      .attr('y', cy + (lines.length > 1 ? NOTE2_DY[i] : NOTE_DY)).attr('text-anchor', onRight ? 'start' : 'end').text(t), 'verdicts', field, cellWhere(c)));
+      .attr('y', cy + (i - lines.length / 2) * noteBox.h + noteBox.asc).attr('text-anchor', onRight ? 'start' : 'end').text(t), 'verdicts', field, cellWhere(c)));
   };
 
   const drawKey = (m) => {
@@ -1069,8 +1077,10 @@
     const colW = phone ? Math.max(MATRIX_COL_MIN, Math.min(MATRIX_COL_MAX, Math.floor(avail / present.length)))
       : Math.min(FOREST_COL_MAX, Math.max(FOREST_COL_MIN, Math.floor(avail / present.length)));
     const plotW = colW * present.length;
-    const regW = d3.max(present, (g) => textW(g.regime, 't-cap', 600));
-    const headH = phone ? GROUP_H + Math.ceil(regW) + 8 : GROUP_H + 3 * LINE_H + 8;
+    const regW = d3.max(present, (g) => textW(g.regime, 't-cap', 600)), capBox = lineBox('t-cap');
+    // the header's three caption lines: regime, main's value, tick labels
+    const headLine = (i) => GROUP_H + (i + 1) * capBox.h - capBox.desc;
+    const headH = phone ? GROUP_H + Math.ceil(regW) + 8 : GROUP_H + 3 * capBox.h + 8;
     const lay = rowLayout(arms, headH, ROW_H, FAM_H), H = lay.bottom + 4;
 
     // label column: family labels, names, verdict strip
@@ -1123,16 +1133,16 @@
         hd.append('text').attr('class', 't-cap').attr('font-weight', selCol ? 600 : 500).attr('transform', `translate(${x0 + colW / 2 + 4},${headH - 6}) rotate(-90)`).text(g.regime);
       } else {
         const mainV = toNum(m.mainRow.get(g.regime + '|' + met.metric)?.mean), mw = where({ solution: BASELINE_ARM, regime: g.regime, metric: met.metric });
-        hd.append('rect').attr('class', 'focus').attr('x', x0 + 2).attr('y', GROUP_H).attr('width', colW - 4).attr('height', 2 * LINE_H + 2).attr('rx', 3);
-        hd.append('text').attr('class', 't-cap').attr('font-weight', selCol ? 600 : 500).attr('text-decoration', selCol ? 'underline' : null).attr('x', x0 + COL_PAD).attr('y', GROUP_H + LINE_H - 2).text(g.regime);
+        hd.append('rect').attr('class', 'focus').attr('x', x0 + 2).attr('y', GROUP_H).attr('width', colW - 4).attr('height', 2 * capBox.h + 2).attr('rx', 3);
+        hd.append('text').attr('class', 't-cap').attr('font-weight', selCol ? 600 : 500).attr('text-decoration', selCol ? 'underline' : null).attr('x', x0 + COL_PAD).attr('y', headLine(0)).text(g.regime);
         // main's value, with its unit when that fits the column
         const mainText = [`main ${fmtVal(met.unit)(mainV)}`, `main ${gen(mainV)}`].find((t) => textW(t, 't-cap') <= colW - COL_PAD - 2) ?? `main ${gen(mainV)}`;
-        if (mainV !== null) mk(hd.append('text').attr('class', 't-cap sub').attr('x', x0 + COL_PAD).attr('y', GROUP_H + 2 * LINE_H - 2).text(mainText), 'posterior', 'mean', mw);
+        if (mainV !== null) mk(hd.append('text').attr('class', 't-cap sub').attr('x', x0 + COL_PAD).attr('y', headLine(1)).text(mainText), 'posterior', 'mean', mw);
         // tie band, grid and ×1 under the marks; tick labels centred on their lines: ×1 first, then the outermost
         under.append('rect').attr('class', 'band').attr('x', xs(-band)).attr('y', headH).attr('width', Math.max(0, xs(band) - xs(-band))).attr('height', H - headH);
         for (const t of ticks) under.append('line').attr('class', Math.abs(t) < 1e-9 ? 'ref' : 'grid').attr('x1', xs(t)).attr('x2', xs(t)).attr('y1', headH - 4).attr('y2', H);
         if (!ticks.some((t) => Math.abs(t) < 1e-9)) under.append('line').attr('class', 'ref').attr('x1', xs(0)).attr('x2', xs(0)).attr('y1', headH - 4).attr('y2', H);
-        const ty = GROUP_H + 3 * LINE_H - 2, used = [];
+        const ty = headLine(2), used = [];
         const label = (x, text) => {
           const w = textW(text, 't-cap'), b0 = Math.max(x0 + 2, Math.min(x0 + colW - 2 - w, x - w / 2));
           if (used.some(([a, b]) => b0 < b + TICK_GAP && b0 + w > a - TICK_GAP)) return;
@@ -1272,10 +1282,11 @@
     const vals = [mean, lo, hi, ...seeds].filter((v) => v !== null && isFinite(v));
     const [a, b] = d3.extent(vals), pad = b > a ? (b - a) * ZOOM_PAD : Math.abs(mean) * ZOOM_MIN_REL || 1;
     const x = d3.scaleLinear().domain([ratio ? a - pad : Math.max(0, a - pad), b + pad]).range([ZOOM_INSET, width - ZOOM_INSET]);
-    const [d0, d1] = x.domain(), y = ZOOM_BAR_Y;
-    const svg = d3.create('svg').attr('width', width).attr('height', ZOOM_H).attr('role', 'img').attr('aria-label', `${label}, zoomed`);
-    if (band && band[1] > d0 && band[0] < d1) svg.append('rect').attr('class', 'band').attr('x', x(Math.max(d0, band[0]))).attr('width', x(Math.min(d1, band[1])) - x(Math.max(d0, band[0]))).attr('y', 0).attr('height', y + SEED_DY + SEED_LEN + 2);
-    if (ratio && d0 <= 1 && d1 >= 1) svg.append('line').attr('class', 'ref').attr('x1', x(1)).attr('x2', x(1)).attr('y1', 0).attr('y2', y + SEED_DY + SEED_LEN + 2);
+    const [d0, d1] = x.domain(), y = ZOOM_BAR_Y, stem = y + SEED_DY + SEED_LEN + 2, capBox = lineBox('t-cap');
+    // marks to the stem, then a caption line of tick labels
+    const svg = d3.create('svg').attr('width', width).attr('height', stem + capBox.h).attr('role', 'img').attr('aria-label', `${label}, zoomed`);
+    if (band && band[1] > d0 && band[0] < d1) svg.append('rect').attr('class', 'band').attr('x', x(Math.max(d0, band[0]))).attr('width', x(Math.min(d1, band[1])) - x(Math.max(d0, band[0]))).attr('y', 0).attr('height', stem);
+    if (ratio && d0 <= 1 && d1 >= 1) svg.append('line').attr('class', 'ref').attr('x1', x(1)).attr('x2', x(1)).attr('y1', 0).attr('y2', stem);
     if (lo !== null && hi !== null && lo !== hi) { svg.append('line').attr('class', 'ivl ' + cls).attr('x1', x(lo)).attr('x2', x(hi)).attr('y1', y).attr('y2', y); cap(svg, cls, x(lo), y); cap(svg, cls, x(hi), y); }
     for (const v of seeds) svg.append('line').attr('class', 'seed').attr('x1', x(v)).attr('x2', x(v)).attr('y1', y + SEED_DY).attr('y2', y + SEED_DY + SEED_LEN);
     svg.append('line').attr('class', 'mt ' + cls).attr('x1', x(mean)).attr('x2', x(mean)).attr('y1', y - TICK_H / 2).attr('y2', y + TICK_H / 2);
@@ -1283,7 +1294,7 @@
     const xs = d3.scaleLinear().domain([d0 / k, d1 / k]);
     let ticks = xs.ticks(ZOOM_TICKS);
     if (!ratio && k === 1 && INTEGER_UNITS.has(unit)) ticks = ticks.filter(Number.isInteger);
-    const tf = xs.tickFormat(ZOOM_TICKS), used = [], ty = ZOOM_H - 3;
+    const tf = xs.tickFormat(ZOOM_TICKS), used = [], ty = stem + capBox.asc;
     ticks.forEach((t, i) => {
       const s = (ratio ? '×' : '') + tf(t) + (i === ticks.length - 1 && suffix ? (suffix === '%' ? NBSP + '%' : ' ' + suffix) : ''), w = textW(s, 't-cap');
       const x0 = Math.max(0, Math.min(width - w, x(t * k) - w / 2));
@@ -1367,17 +1378,19 @@
         glyph(g, st, cx, yOf(l) * k, ST_GLYPH * k);
       });
     };
-    const keyH = Math.ceil(ST_H * K) + 2 * LINE_H + 14;
+    // the key, top to bottom: its strip, a rule, the group names, the caption
+    const capBox = lineBox('t-cap'), grpBox = lineBox(grpCls), ruleY = ST_H * K + 3, grpY = ruleY + 3 + grpBox.asc, capY = ruleY + 3 + grpBox.h + capBox.asc;
+    const keyH = Math.ceil(2 + ruleY + 3 + grpBox.h + capBox.h);
     // the key is a real strip, the selected arm on the selected metric, enlarged and annotated
     const drawKeyStrip = (svg, x0, y0) => {
       const g = svg.append('g').attr('transform', `translate(${x0},${y0})`).attr('aria-hidden', 'true');
       stripMarks(g, regimes.map((r) => m.cellOf(m.arm.arm, r.regime, m.metric.metric)), K);
       for (const [l, t] of keyTicks) g.append('text').attr('class', 't-cap mut').attr('x', stripW * K + 4).attr('y', yOf(l) * K + 4).text(t);
-      g.append('text').attr('class', 't-cap mut').attr('x', 0).attr('y', ST_H * K + 3 + 2 * LINE_H).text(`Key: ${armTitle(m, m.arm)}, ${m.metric.short}, enlarged`);
+      g.append('text').attr('class', 't-cap mut').attr('x', 0).attr('y', capY).text(`Key: ${armTitle(m, m.arm)}, ${m.metric.short}, enlarged`);
       for (const sp of spans) {
         const xa = sp.a * K + 1, xb = sp.b * K - 1;
-        g.append('line').attr('class', 'rule').attr('x1', xa).attr('x2', xb).attr('y1', ST_H * K + 3).attr('y2', ST_H * K + 3);
-        g.append('text').attr('class', grpCls + ' mut').attr('x', (xa + xb) / 2).attr('y', ST_H * K + 3 + LINE_H).attr('text-anchor', 'middle').text(sp.grp.toLowerCase());
+        g.append('line').attr('class', 'rule').attr('x1', xa).attr('x2', xb).attr('y1', ruleY).attr('y2', ruleY);
+        g.append('text').attr('class', grpCls + ' mut').attr('x', (xa + xb) / 2).attr('y', grpY).attr('text-anchor', 'middle').text(sp.grp.toLowerCase());
       }
     };
     host.replaceChildren();
@@ -1386,9 +1399,9 @@
       const colX = (k) => lx + k * pitch;
       const names = band.map((x) => wrap(x.short, stripW, 't-cap', x.metric === m.metric.metric ? 600 : 500)), ranges = band.map((x) => { const r = range.get(x.metric); if (!r) return []; const f = fmtVal(x.unit); const [a, z] = fmtRange(x.unit, r.lo, r.hi), one = r.regimes > 1 ? `main ${a}–${z}` : `main ${f(r.lo)}`; return textW(one, 't-cap') <= stripW || r.regimes < 2 ? [one] : [`main ${a}–`, z]; });
       const nl = d3.max(names, (l) => l.length), rl = d3.max(ranges, (l) => l.length) || 0;
-      const headH = GROUP_H + nl * LINE_H + rl * LINE_H + 8;
+      const headH = GROUP_H + (nl + rl) * capBox.h + 8;
       if (b === 0) drawKeyStrip(d3.select(host).append('svg').attr('width', keyW).attr('height', keyH), 0, 2);
-      const rowH = (phone ? LINE_H + 2 : 0) + ST_H + ST_ROW_GAP;
+      const bodyBox = lineBox('t-body'), nameH = phone ? bodyBox.h : 0, rowH = nameH + ST_H + ST_ROW_GAP;
       const lay = rowLayout(arms, headH, rowH, ST_FAM_H);
       const W = lx + band.length * pitch - ST_COL_GAP, H = lay.bottom;
       const svg = d3.select(host).append('div').attr('class', 'scroll').append('svg').attr('class', 'small').attr('width', W).attr('height', H).attr('role', 'grid').attr('aria-label', `Ratio to main per regime for ${band.map((x) => x.short).join(', ')}`).style('margin-top', b ? '18px' : null);
@@ -1405,22 +1418,22 @@
         const hd = headRow.append('g').attr('class', 'hdr').attr('role', 'columnheader').attr('tabindex', 0).attr('data-fk', 'sth|' + x.metric).attr('aria-label', `${x.label}: open in the hub`)
           .on('click', () => dash.setParams({ metric: x.metric })).on('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); dash.setParams({ metric: x.metric }); } });
         hd.append('title').text(x.definition);
-        hd.append('rect').attr('class', 'focus').attr('x', x0 - 3).attr('y', GROUP_H).attr('width', stripW + 6).attr('height', Math.max(MIN_TARGET, nl * LINE_H + 4)).attr('rx', 3);
-        names[k].forEach((t, i) => hd.append('text').attr('class', 't-cap').attr('font-weight', on ? 600 : 500).attr('text-decoration', on ? 'underline' : null).attr('x', x0).attr('y', GROUP_H + (i + 1) * LINE_H - 2).text(t));
-        ranges[k].forEach((t, i) => mk(svg.append('text').attr('class', 't-cap mut').attr('x', x0).attr('y', GROUP_H + (nl + i + 1) * LINE_H).text(t), 'main_range', 'lo hi', where({ metric: x.metric })));
+        hd.append('rect').attr('class', 'focus').attr('x', x0 - 3).attr('y', GROUP_H).attr('width', stripW + 6).attr('height', Math.max(MIN_TARGET, nl * capBox.h + 4)).attr('rx', 3);
+        names[k].forEach((t, i) => hd.append('text').attr('class', 't-cap').attr('font-weight', on ? 600 : 500).attr('text-decoration', on ? 'underline' : null).attr('x', x0).attr('y', GROUP_H + (i + 1) * capBox.h - capBox.desc).text(t));
+        ranges[k].forEach((t, i) => mk(svg.append('text').attr('class', 't-cap mut').attr('x', x0).attr('y', GROUP_H + (nl + i + 1) * capBox.h - capBox.desc + 2).text(t), 'main_range', 'lo hi', where({ metric: x.metric })));
       });
       // rows
       for (const f of lay.fams) svg.append('text').attr('class', 't-head').attr('x', TEXT_INSET).attr('y', f.y + ST_FAM_H - 4).text(f.family.toUpperCase());
       arms.forEach((a) => {
-        const y0 = lay.ys.get(a.arm), sy = y0 + (phone ? LINE_H + 2 : 0), sel = a.arm === m.arm.arm;
+        const y0 = lay.ys.get(a.arm), sy = y0 + nameH, sel = a.arm === m.arm.arm;
         if (sel) svg.insert('rect', ':first-child').attr('class', 'hl').attr('x', 0).attr('y', y0 - 2).attr('width', W).attr('height', rowH - ST_ROW_GAP + 4);
         const nt = svg.append('text').attr('class', 't-body' + (a.arm === REFERENCE_ARM ? ' mut' : '')).attr('font-weight', sel ? 600 : null);
         const name = rowName(m, a), sub = rowSub(m, a);
         nt.attr('data-arm', a.arm);
-        if (phone) nt.attr('x', TEXT_INSET).attr('y', y0 + LINE_H - 2).text(name); else nt.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + (sub ? SUB_NAME_DY : 4)).attr('text-anchor', 'end').text(name);
+        if (phone) nt.attr('x', TEXT_INSET).attr('y', y0 + bodyBox.asc).text(name); else nt.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + (sub ? SUB_NAME_DY : 4)).attr('text-anchor', 'end').text(name);
         if (sub) {
           const st = svg.append('text').attr('class', 't-note sub').text(sub);
-          if (phone) st.attr('x', TEXT_INSET + textW(name, 't-body', sel ? 600 : null) + 6).attr('y', y0 + LINE_H - 2); else st.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + SUB_DY).attr('text-anchor', 'end');
+          if (phone) st.attr('x', TEXT_INSET + textW(name, 't-body', sel ? 600 : null) + 6).attr('y', y0 + bodyBox.asc); else st.attr('x', labelW - LABEL_PAD).attr('y', sy + ST_H / 2 + SUB_DY).attr('text-anchor', 'end');
         }
         if (!m.sol(a)) { lackingNote(svg, m.reason(a), lx, sy + ST_H / 2, W - lx); return; }
         const row = svg.append('g').attr('role', 'row');
@@ -1447,30 +1460,32 @@
   const planeGeom = (pts, w, h, dom, opts) => {
     const tickW = d3.max(dom.y.ticks, (t) => textW(fmtLogTick(t), 't-cap')) ?? 0;
     const lanes = { x0: pts.some((p) => p.bx.kind === 'zero'), xi: pts.some((p) => p.bx.kind === 'mainzero'), y0: pts.some((p) => p.by.kind === 'zero'), yi: pts.some((p) => p.by.kind === 'mainzero') };
-    const L = Math.ceil(tickW) + 8, R = 8 + opts.gutter, T = opts.titles ? LINE_H + 8 : 6, B = LINE_H + (opts.titles ? LINE_H + 8 : 4);
+    const capBox = lineBox('t-cap'), L = Math.ceil(tickW) + 8, R = 8 + opts.gutter, T = opts.titles ? capBox.h + 8 : 6, B = capBox.h + (opts.titles ? capBox.h + 8 : 4);
     const xr = [L + (lanes.x0 ? LANE_W + LANE_GAP : 0), w - R - (lanes.xi ? LANE_W + LANE_GAP : 0)];
     const yr = [h - B - (lanes.y0 ? LANE_W + LANE_GAP : 0), T + (lanes.yi ? LANE_W + LANE_GAP : 0)];
     const x = d3.scaleLinear().domain(dom.x.domain).range(xr).clamp(true);
     const y = d3.scaleLinear().domain(dom.y.domain).range(yr).clamp(true);
     const px = (c) => (c.kind === 'zero' ? L + LANE_W / 2 : c.kind === 'mainzero' ? w - R - LANE_W / 2 : x(Math.log10(c.ratio)));
     const py = (c) => (c.kind === 'zero' ? h - B - LANE_W / 2 : c.kind === 'mainzero' ? T + LANE_W / 2 : y(Math.log10(c.ratio)));
-    return { L, R, T, B, w, h, x, y, px, py, lanes, plot: { x0: L, x1: w - R, y0: T, y1: h - B } };
+    // tickY: the x tick labels' baseline, their line box starting 4 px under the plot
+    return { L, R, T, B, w, h, x, y, px, py, lanes, plot: { x0: L, x1: w - R, y0: T, y1: h - B }, tickY: h - B + 4 + capBox.asc };
   };
 
   // The crosshair's label: right of the vertical line, or left of it when that would leave the plot.
   const mainBox = (G) => {
     const lw = textW(MAIN_LABEL, 't-cap'), x0 = G.x(0) + 4 + lw <= G.plot.x1 ? G.x(0) + 4 : G.x(0) - 4 - lw;
-    return { x0, x1: x0 + lw, y0: G.y(0) - LINE_H - 2, y1: G.y(0) - 2 };
+    return { x0, x1: x0 + lw, y0: G.y(0) - lineBox('t-cap').h - 2, y1: G.y(0) - 2 };
   };
 
   const drawPlanePanel = (m, host, pts, w, h, dom, opts) => {
     const xm = opts.xm, ym = opts.ym;
     let G = planeGeom(pts, w, h, dom, { ...opts, gutter: 0 });
-    const label = (p) => ({ w: textW(rowName(m, p.a), 't-cap', p.a.arm === m.arm.arm ? 600 : null), h: LINE_H });
+    const capBox = lineBox('t-cap');
+    const label = (p) => ({ w: textW(rowName(m, p.a), 't-cap', p.a.arm === m.arm.arm ? 600 : null), h: capBox.h });
     const toLabel = opts.labels ? pts : pts.filter((p) => p.a.arm === m.arm.arm);
     const place = (G) => {
       const obstacles = pts.map((p) => ({ x0: G.px(p.bx) - 7, x1: G.px(p.bx) + 7, y0: G.py(p.by) - 7, y1: G.py(p.by) + 7 }));
-      if (opts.titles) obstacles.push({ x0: G.w - textW(opts.xTitle, 't-cap') - G.R, x1: G.w, y0: G.h - LINE_H - 2, y1: G.h }, { x0: 0, x1: textW(opts.yTitle, 't-cap'), y0: 0, y1: LINE_H + 4 });
+      if (opts.titles) obstacles.push({ x0: G.w - textW(opts.xTitle, 't-cap') - G.R, x1: G.w, y0: G.h - capBox.h - 2, y1: G.h }, { x0: 0, x1: textW(opts.yTitle, 't-cap'), y0: 0, y1: capBox.h + 4 });
       if (opts.tintLabel) obstacles.push(opts.tintLabel(G));
       // the crosshair, its label and every whisker are obstacles too
       obstacles.push(mainBox(G),
@@ -1503,20 +1518,20 @@
     const tintArea = Math.max(0, G.x(0) - G.plot.x0) * Math.max(0, G.plot.y1 - G.y(0)), plotArea = (G.plot.x1 - G.plot.x0) * (G.plot.y1 - G.plot.y0);
     const ll = tintArea <= plotArea * TINT_MAX_FRAC && pts.some((p) => p.bx.ratio !== null && p.by.ratio !== null && p.bx.ratio < 1 && p.by.ratio < 1);
     if (ll) svg.append('rect').attr('x', G.plot.x0).attr('y', G.y(0)).attr('width', Math.max(0, G.x(0) - G.plot.x0)).attr('height', Math.max(0, G.plot.y1 - G.y(0))).attr('fill', 'var(--color-ok)').attr('fill-opacity', 0.06);
-    if (ll && opts.tintLabel) { const b = opts.tintLabel(G); svg.append('text').attr('class', 't-cap mut').attr('x', b.x0).attr('y', b.y1 - 3).text('cheaper and more accurate than main'); }
+    if (ll && opts.tintLabel) { const b = opts.tintLabel(G); svg.append('text').attr('class', 't-cap mut').attr('x', b.x0).attr('y', b.y1 - capBox.desc).text('cheaper and more accurate than main'); }
     for (const e of dom.x.ticks) svg.append('line').attr('class', e ? 'grid' : 'ref').attr('x1', G.x(e)).attr('x2', G.x(e)).attr('y1', G.plot.y0).attr('y2', G.plot.y1);
     for (const e of dom.y.ticks) svg.append('line').attr('class', e ? 'grid' : 'ref').attr('x1', G.plot.x0).attr('x2', G.plot.x1).attr('y1', G.y(e)).attr('y2', G.y(e));
-    svg.append('text').attr('class', 't-cap mut halo').attr('x', mainBox(G).x0).attr('y', G.y(0) - 4).text(MAIN_LABEL);
+    svg.append('text').attr('class', 't-cap mut halo').attr('x', mainBox(G).x0).attr('y', G.y(0) - 2 - capBox.desc).text(MAIN_LABEL);
     const xt = [], yt = [];
-    for (const e of dom.x.ticks) { const s = fmtLogTick(e), tw = textW(s, 't-cap'), x0 = G.x(e) - tw / 2; if (xt.some(([a, b]) => x0 < b + 6 && x0 + tw > a - 6)) continue; xt.push([x0, x0 + tw]); svg.append('text').attr('class', 't-cap mut').attr('x', G.x(e)).attr('y', G.plot.y1 + LINE_H).attr('text-anchor', 'middle').text(s); }
-    for (const e of dom.y.ticks) { const yy = G.y(e); if (yt.some((v) => Math.abs(v - yy) < LINE_H)) continue; yt.push(yy); svg.append('text').attr('class', 't-cap mut').attr('x', G.L - 6).attr('y', yy + 4).attr('text-anchor', 'end').text(fmtLogTick(e)); }
-    if (G.lanes.x0) svg.append('text').attr('class', 't-cap mut').attr('x', G.L + LANE_W / 2).attr('y', G.plot.y1 + LINE_H).attr('text-anchor', 'middle').text('0');
-    if (G.lanes.xi) svg.append('text').attr('class', 't-cap mut').attr('x', G.w - G.R - LANE_W / 2).attr('y', G.plot.y1 + LINE_H).attr('text-anchor', 'middle').text('∞');
+    for (const e of dom.x.ticks) { const s = fmtLogTick(e), tw = textW(s, 't-cap'), x0 = G.x(e) - tw / 2; if (xt.some(([a, b]) => x0 < b + 6 && x0 + tw > a - 6)) continue; xt.push([x0, x0 + tw]); svg.append('text').attr('class', 't-cap mut').attr('x', G.x(e)).attr('y', G.tickY).attr('text-anchor', 'middle').text(s); }
+    for (const e of dom.y.ticks) { const yy = G.y(e); if (yt.some((v) => Math.abs(v - yy) < capBox.h)) continue; yt.push(yy); svg.append('text').attr('class', 't-cap mut').attr('x', G.L - 6).attr('y', yy + 4).attr('text-anchor', 'end').text(fmtLogTick(e)); }
+    if (G.lanes.x0) svg.append('text').attr('class', 't-cap mut').attr('x', G.L + LANE_W / 2).attr('y', G.tickY).attr('text-anchor', 'middle').text('0');
+    if (G.lanes.xi) svg.append('text').attr('class', 't-cap mut').attr('x', G.w - G.R - LANE_W / 2).attr('y', G.tickY).attr('text-anchor', 'middle').text('∞');
     if (G.lanes.y0) svg.append('text').attr('class', 't-cap mut').attr('x', G.L - 6).attr('y', G.plot.y1 - LANE_W / 2 + 4).attr('text-anchor', 'end').text('0');
     if (G.lanes.yi) svg.append('text').attr('class', 't-cap mut').attr('x', G.L - 6).attr('y', G.T + LANE_W / 2 + 4).attr('text-anchor', 'end').text('∞');
     if (opts.titles) {
-      svg.append('text').attr('class', 't-cap').attr('x', G.w - G.R).attr('y', G.h - 3).attr('text-anchor', 'end').text(opts.xTitle);
-      svg.append('text').attr('class', 't-cap').attr('x', TEXT_INSET).attr('y', LINE_H - 2).text(opts.yTitle);
+      svg.append('text').attr('class', 't-cap').attr('x', G.w - G.R).attr('y', G.h - capBox.desc).attr('text-anchor', 'end').text(opts.xTitle);
+      svg.append('text').attr('class', 't-cap').attr('x', TEXT_INSET).attr('y', capBox.asc).text(opts.yTitle);
     }
     const nodes = new Map();
     for (const p of pts) {
@@ -1536,11 +1551,11 @@
         const tx = Math.max(box.x0, Math.min(box.x1, X)), ty = Math.max(box.y0, Math.min(box.y1, Y)), d = Math.hypot(tx - X, ty - Y) || 1, r0 = Math.sqrt(opts.glyph) * 0.7;
         g.append('line').attr('class', 'leader').attr('x1', X + (tx - X) / d * r0).attr('y1', Y + (ty - Y) / d * r0).attr('x2', tx).attr('y2', ty);
       }
-      g.append('text').attr('class', 't-cap halo').attr('font-weight', p.a.arm === m.arm.arm ? 600 : null).attr('x', box.x0).attr('y', box.y0 + LINE_H - 3).text(rowName(m, p.a));
+      g.append('text').attr('class', 't-cap halo').attr('font-weight', p.a.arm === m.arm.arm ? 600 : null).attr('x', box.x0).attr('y', box.y0 + capBox.asc).text(rowName(m, p.a));
     }
     let gy = -Infinity;
     for (const p of (gutterOn ? lab.miss : []).slice().sort((a, b) => nodes.get(a).Y - nodes.get(b).Y)) {
-      const { X, Y, g } = nodes.get(p), lx = G.plot.x1 + LEADER_GUTTER - 4, ly = Math.max(Y, gy + LINE_H);
+      const { X, Y, g } = nodes.get(p), lx = G.plot.x1 + LEADER_GUTTER - 4, ly = Math.max(Y, gy + capBox.h);
       gy = ly;
       g.append('line').attr('class', 'leader').attr('x1', X + 6).attr('y1', Y).attr('x2', lx - 3).attr('y2', ly);
       g.append('text').attr('class', 't-cap halo').attr('font-weight', p.a.arm === m.arm.arm ? 600 : null).attr('x', lx).attr('y', ly + 4).text(rowName(m, p.a));
@@ -1594,7 +1609,7 @@
       const w = Math.min(m.W, PLANE_MAX_W), h = Math.round(Math.max(PLANE_MIN_H, Math.min(PLANE_MAX_H, w * PLANE_ASPECT)));
       const tint = 'cheaper and more accurate than main';
       unlabelled = drawPlanePanel(m, host, pts, w, h, dom, { xm, ym, labels: true, titles: true, xTitle, yTitle, glyph: PLANE_GLYPH, aria: `${xTitle} against ${yTitle} in ${m.regime.regime}`,
-        tintLabel: (G) => ({ x0: G.plot.x0 + 6, x1: G.plot.x0 + 10 + textW(tint, 't-cap'), y0: G.plot.y1 - LINE_H - 4, y1: G.plot.y1 - 2 }) });
+        tintLabel: (G) => ({ x0: G.plot.x0 + 6, x1: G.plot.x0 + 10 + textW(tint, 't-cap'), y0: G.plot.y1 - lineBox('t-cap').h - 4, y1: G.plot.y1 - 2 }) });
     } else {
       const cols = Math.max(1, Math.floor((m.W + PANEL_GAP) / (PANEL_MIN_W + PANEL_GAP))), pw = Math.floor((m.W - (cols - 1) * PANEL_GAP) / cols);
       const grid = el('div', { class: 'mult', style: `grid-template-columns:repeat(${cols}, minmax(0, 1fr))` });
@@ -1692,7 +1707,7 @@
   const schedule = () => { if (!raf) raf = requestAnimationFrame(draw); };
   dash.onData(schedule);
   new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (root.clientWidth !== lastW) schedule(); }, RESIZE_DEBOUNCE_MS); }).observe(root);
-  document.fonts?.ready.then(() => { widths.clear(); schedule(); });
+  document.fonts?.ready.then(() => { widths.clear(); boxes.clear(); schedule(); });
   setInterval(() => { const n = $('g3-age'), a = ageSpan(); if (n && a) n.replaceChildren(a); }, AGE_REFRESH_MS);
 })();
 </script>

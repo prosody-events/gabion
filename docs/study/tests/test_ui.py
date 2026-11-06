@@ -1416,7 +1416,9 @@ JS_FONT_GATE = r'''
 def check_font_gate(S, scope):
     """A10: the page holds its first render for the faces. The face files are held back and
     the page's clock paused, so its fallback timer cannot fire: once params.json is read, the
-    page must still be waiting. Released, it renders."""
+    page must still be waiting. Then the clock runs past the fallback, so the page draws with
+    the fallback face; released, the faces must replace its measured widths and line boxes,
+    so the redrawn page has no text that overlaps or is clipped."""
     ctx = S.browser.new_context(viewport={'width': 1440, 'height': 900}, device_scale_factor=1)
     try:
         pg = ctx.new_page(); held = []
@@ -1429,11 +1431,20 @@ def check_font_gate(S, scope):
             pg.wait_for_timeout(50)
         else: raise RuntimeError(f'params.json was never read, or no face requested; faces held={len(held)}')
         waiting = pg.evaluate('() => Object.keys(dash.params()).length === 0')
+        pg.clock.run_for(10_000); pg.clock.resume()
+        pg.wait_for_selector('[data-fk="metric|bytes_total"]', timeout=25000)
+        # the fallback draw is marked, so the redraw the faces bring is seen when it replaces the mark
+        early = pg.evaluate("""() => !document.fonts.check('16px "Source Sans 3"') && !!(document.querySelector('#g3-hub-plot svg').dataset.fallback = '1')""")
         for route in held: route.continue_()
         pg.unroute('**/fonts/*.woff2')
-        pg.clock.resume()
-        pg.wait_for_selector('[data-fk="metric|bytes_total"]', timeout=25000)
+        for _ in range(250):
+            redrawn = pg.evaluate("""() => document.fonts.check('16px "Source Sans 3"') && !document.querySelector('#g3-hub-plot svg[data-fallback]')""")
+            if redrawn: break
+            pg.wait_for_timeout(40)
+        pg.evaluate(JS_HELPERS); o = pg.evaluate(JS_SCAN)
         rec('A10.faces-before-first-render', scope, waiting, f'selector=dash.params with the faces held | seen=waiting {waiting} | expected=waiting for the faces')
+        rec('A10.late-faces-redraw', scope, early and redrawn and o['overlapCount'] == 0 and o['clippedCount'] == 0,
+            f'selector=visible text after the faces load late | seen=drew before the faces {early}, redrew {redrawn}, {o["overlapCount"]} overlaps {o["overlaps"][:2]}, {o["clippedCount"]} clipped {o["clipped"][:2]} | expected=True, True, 0, 0')
     finally:
         ctx.close()
 
