@@ -87,7 +87,7 @@ const ARC_NOTCH = 1 / 12;
 // How long a ring sweeps from its old share to its new one when a packet
 // lands, and how long the refusal plays, on the presentation clock.
 const SWEEP_MS = 250;
-const BOUNCE_MS = 600;
+export const BOUNCE_MS = 600;
 // The refusal's rebound, as a share of its drop, and the hatch's pitch under
 // reduced motion, px.
 const REBOUND = 0.3;
@@ -697,16 +697,14 @@ export class StageRenderer {
     }
     band.visible = true;
     band.alpha = 1;
+    band.position.y = 0;
     this.#bounceGfx = gfx;
     this.#bounceStart = this.#pool.clock;
     this.#bounceRest = brimY;
     this.#bounceHeight = brimY - top;
     this.#bounceDrop = brimY + bottom;
-    band.position.y = this.#reduceMotion ? 0 : -this.#bounceDrop;
-    const glyphs = this.#glyphs;
-    glyphs.bounce = gfx.slot;
-    glyphs.bandBottom = brimY + band.position.y;
-    glyphs.bandTop = glyphs.bandBottom - this.#bounceHeight;
+    this.#glyphs.bounce = gfx.slot;
+    this.#tickRefusal();
     this.#animEnd = Math.max(this.#animEnd, this.#pool.clock + BOUNCE_MS);
     this.#app.canvas.dataset.bounce = String(id);
   }
@@ -1409,10 +1407,13 @@ export class StageRenderer {
     for (let slot = 0; slot < glyphs.len; slot++) {
       const gfx = this.#bySlot[slot];
       if (gfx === undefined || !gfx.sweeping) continue;
-      const t = Math.min((now - gfx.arcStart) / SWEEP_MS, 1);
-      const eased = 1 - (1 - t) * (1 - t);
-      gfx.arc = gfx.arcFrom + (gfx.arcTo - gfx.arcFrom) * eased;
-      if (t >= 1) {
+      // Ended on the sum the clock stops at (`#animEnd`), never on a quotient
+      // rounding can leave short of 1, which would hold a paused clock's sweep
+      // open for ever.
+      const ended = now >= gfx.arcStart + SWEEP_MS;
+      const t = (now - gfx.arcStart) / SWEEP_MS;
+      gfx.arc = ended ? gfx.arcTo : gfx.arcFrom + (gfx.arcTo - gfx.arcFrom) * (1 - (1 - t) * (1 - t));
+      if (ended) {
         gfx.sweeping = false;
         this.#sweeps -= 1;
       }
@@ -1426,11 +1427,12 @@ export class StageRenderer {
   #tickRefusal(): void {
     const gfx = this.#bounceGfx;
     if (gfx === null) return;
-    const u = (this.#pool.clock - this.#bounceStart) / BOUNCE_MS;
-    if (u >= 1) {
+    // Ended on the sum the clock stops at, as a sweep is.
+    if (this.#pool.clock >= this.#bounceStart + BOUNCE_MS) {
       this.#endBounce();
       return;
     }
+    const u = (this.#pool.clock - this.#bounceStart) / BOUNCE_MS;
     const band = gfx.refusal;
     if (!this.#reduceMotion) {
       const drop = this.#bounceDrop;

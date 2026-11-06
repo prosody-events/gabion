@@ -160,11 +160,13 @@ export async function setRange(range: Locator, value: number): Promise<void> {
 /** Set the playback speed slider. */
 export const setSpeed = (page: Page, value: number): Promise<void> => setRange(page.getByLabel('Playback speed'), value);
 
-/** One frame of a refusal's band, as the stage published it. */
+/** One frame of a refusal's band, as the stage published it, with its
+ *  vessel's brim and its disc's radius. */
 export interface BandFrame {
   readonly top: number;
   readonly bottom: number;
   readonly brim: number;
+  readonly r: number;
 }
 
 /** Press Send at the selected node `node`, which refuses it, and return every
@@ -182,7 +184,7 @@ export async function refusal(page: Page, node: number, where: string): Promise<
           const g = c.glyphs;
           if (g.bounce >= 0) {
             started = true;
-            out.push({ top: g.bandTop, bottom: g.bandBottom, brim: g.brimY[g.bounce] });
+            out.push({ top: g.bandTop, bottom: g.bandBottom, brim: g.brimY[g.bounce], r: g.r[g.bounce] });
           } else if (started) {
             done(out);
             return;

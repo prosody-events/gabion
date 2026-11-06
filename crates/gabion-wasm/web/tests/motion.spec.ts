@@ -3,9 +3,9 @@ import { expect, test, type Page } from '@playwright/test';
 import { ORIGIN } from '../src/lib/presets';
 import type { ClusterState } from '../src/lib/sim/types';
 import { BEAM_FLIGHT_MS, CONTROL, CROSS, DROPPED, LANDED, RELAY } from '../src/lib/stage/layout';
-import { RING_CAUGHT_UP, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
+import { BOUNCE_MS, RING_CAUGHT_UP, type BeamPool, type GlyphTable } from '../src/lib/stage/renderer';
 import { LANDED_ALPHA } from '../src/lib/theme';
-import { PERIOD_MS, WATCH, pauseIfPlaying, refusal, send, sendButton, setRange, setSpeed, step, virtualMs } from './drive';
+import { PERIOD_MS, WATCH, refusal, send, sendButton, setRange, setSpeed, step, virtualMs } from './drive';
 import { sourceOf } from './sourcemap';
 
 // The waves in motion (README "Tests"), run once at 1440 px in the light theme
@@ -27,6 +27,8 @@ const FRAMES = 300;
 const FRAME_MS = 16;
 // How far the test runs the fake clock between checks: a few frames.
 const RUN_MS = 100;
+// The longest one tick of Pixi's ticker advances, ms (its `maxElapsedMS`).
+const MAX_TICK_MS = 100;
 
 /** The page's engine, snapshotted, with node `inspect`'s rows. */
 const snapshot = (page: Page, inspect: number | null = null): Promise<ClusterState> =>
@@ -580,8 +582,10 @@ test('flights scale with speed and Pause freezes them', async ({ page }, info) =
   };
   await page.getByRole('button', { name: 'Restart Propagation' }).click();
   await expect(page.locator('.overlay.rebuilding')).toHaveCount(0);
+  // Propagation's Send stops by itself before wave 1, which waits unflown.
   await pressSend(page, 0);
-  await pauseIfPlaying(page);
+  await expect(page.locator('.stage-pane')).toHaveAttribute('data-flight', 'waiting', { timeout: 30_000 });
+  await expect(page.getByRole('button', { name: 'Play' })).toBeVisible();
   await setSpeed(page, 0.2);
   await freezeAt(false, 'propagation-wave1.png');
   await inFlightAboveLabels();
@@ -833,17 +837,14 @@ for (const stretchOf of STRETCHES) {
 
 test('a ring sweeps up to its new share as its packet lands (A13)', async ({ page }) => {
   test.setTimeout(60_000);
-  await open(page);
-  await loadPreset(page, 'Rate limiting');
-  await setSpeed(page, 1);
-  await page.evaluate(() => {
+  // Every ring's arc, each time it changes, from the page's first frame.
+  await page.addInitScript(() => {
     const w = window as unknown as { arcs: Map<number, number[]> };
     w.arcs = new Map();
-    const c = document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: { len: number; id: Int32Array; arc: Float32Array } };
     const sample = (): void => {
-      const g = c.glyphs;
-      for (let s = 0; s < g.len; s++) {
-        if (g.id[s] <= 0) continue;
+      const g = (document.querySelector('.stage canvas') as (HTMLCanvasElement & { glyphs?: GlyphTable }) | null)?.glyphs;
+      for (let s = 0; g !== undefined && s < g.len; s++) {
+        if (g.id[s] < 0) continue;
         const seen = w.arcs.get(g.id[s]) ?? [];
         if (seen.at(-1) !== g.arc[s]) seen.push(g.arc[s]);
         w.arcs.set(g.id[s], seen);
@@ -852,6 +853,9 @@ test('a ring sweeps up to its new share as its packet lands (A13)', async ({ pag
     };
     requestAnimationFrame(sample);
   });
+  await open(page);
+  await loadPreset(page, 'Rate limiting');
+  await setSpeed(page, 1);
   // Every ring opens closed and caught up: nothing sweeps on load.
   const opened = await page.locator('.stage canvas').evaluate((c: HTMLCanvasElement & { glyphs: GlyphTable }) => {
     const g = c.glyphs;
@@ -860,8 +864,12 @@ test('a ring sweeps up to its new share as its packet lands (A13)', async ({ pag
     return out;
   });
   expect(opened, 'every ring at load').toEqual(opened.map(() => `${RING_CAUGHT_UP}|1`));
+  const loaded = await page.evaluate(() => [...(window as unknown as { arcs: Map<number, number[]> }).arcs]);
+  expect(loaded.length, 'every ring was sampled from the first frame').toBe(12);
+  for (const [id, seen] of loaded) expect(seen, `node ${id}'s ring since the first frame`).toEqual([1]);
+  await page.evaluate(() => (window as unknown as { arcs: Map<number, number[]> }).arcs.clear());
   await send(page, 0);
-  const arcs = await page.evaluate(() => [...(window as unknown as { arcs: Map<number, number[]> }).arcs]);
+  const arcs = await page.evaluate((origin) => [...(window as unknown as { arcs: Map<number, number[]> }).arcs].filter(([id]) => id !== origin), ORIGIN);
   expect(arcs.length, 'every receiver was sampled').toBe(11);
   for (const [id, seen] of arcs) {
     const low = seen.indexOf(Math.min(...seen));
@@ -884,8 +892,19 @@ test("a refusal's band drops, rebounds and fades in the headroom (C37)", async (
   await field.press('Enter');
   await send(page, 0);
   await expect(page.locator('[role="gridcell"][data-node="0"] .count')).toHaveText('100');
+  await setSpeed(page, 1);
   const frames = await refusal(page, 0, 'motion');
   expect(new Set(frames.map((f) => f.top)).size, 'the band moves').toBeGreaterThan(1);
+  // It drops from the disc's top: its bottom never rises above the disc's
+  // inner edge, and its first frame is at most one tick of the presentation
+  // clock in (Pixi caps a tick at `MAX_TICK_MS`), so it has fallen at most
+  // that tick's share of its drop, eased in, (2u)² of it.
+  const [first] = frames;
+  const disc = -(first.r - 1);
+  const drop = first.brim - disc;
+  const u = MAX_TICK_MS / BOUNCE_MS;
+  for (const f of frames) expect(f.bottom, "the band never rises above the disc's top").toBeGreaterThanOrEqual(disc - 1e-3);
+  expect(first.bottom - disc, "the band starts at the disc's top").toBeLessThanOrEqual(drop * (2 * u) ** 2 + 1e-3);
 });
 
 // -- Landed routes -------------------------------------------------------------------

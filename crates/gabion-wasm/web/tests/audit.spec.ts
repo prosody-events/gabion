@@ -24,6 +24,7 @@ import {
 } from '../src/lib/stage/layout';
 import { MARK, RING_BEHIND, RING_CAUGHT_UP, type GlyphTable } from '../src/lib/stage/renderer';
 import { VESSEL_SCALE } from '../src/lib/limit';
+import { zoneAt } from '../src/lib/format';
 import { PRESETS } from '../src/lib/presets';
 import { BAND_ALPHA, BEAM_ALPHA, readTheme, type Theme } from '../src/lib/theme';
 import timings from './phase-timings.json' with { type: 'json' };
@@ -505,8 +506,14 @@ async function checkHeading(page: Page, where: string, snap: ClusterState): Prom
 async function checkGlyphs(page: Page, where: string, name: string): Promise<void> {
   const snap = await snapshot(page);
   const feed = PRESETS.find((p) => p.label === name)?.traffic !== undefined;
+  // Each node's name: its id, and the fault the engine was given that picks it out.
+  const names = new Map(snap.nodes.map((n) => [n.id, `node ${n.id}`]));
+  for (const cut of await page.evaluate(() => window.sim!.cuts())) {
+    if (cut.kind === 'silenced') names.set(cut.node, `node ${cut.node} · silenced`);
+    else if (cut.kind === 'unheard-in-zone') names.set(cut.node, `node ${cut.node} · can't reach ${zoneAt(snap.zones, cut.zone)}`);
+  }
   const findings = await page.evaluate(
-    ({ k, nodes, grace }) => {
+    ({ k, nodes, grace, names }) => {
       const found: string[] = [];
       const c = document.querySelector('.stage canvas') as HTMLCanvasElement & { glyphs: GlyphTable };
       const g = c.glyphs;
@@ -590,12 +597,12 @@ async function checkGlyphs(page: Page, where: string, name: string): Promise<voi
           if (d < g.r[s] + g.r[t] + k.SELECTION_REACH + k.RING_REACH - 1e-6) found.push(`the selection outline crosses node ${g.id[t]}'s ring`);
         }
       }
-      // The names: what they say, smaller than the counts, inside the canvas,
-      // apart from one another and clear of every ring and count.
+      // The names: what they say, smaller than the counts (A3 keeps them inside
+      // the canvas), apart from one another and clear of every ring and count.
       for (const [i, l] of labels.entries()) {
-        if (!/^node \d+( · (silenced|can't reach zone [a-z]))?$/.test(l.text)) found.push(`the name "${l.text}" is not a node's name`);
+        const id = Number(/^node (\d+)/.exec(l.text)?.[1]);
+        if (l.text !== names[id]) found.push(`the name "${l.text}" is not node ${id}'s name, "${names[id]}"`);
         if (boxes.length > 0 && l.size >= boxes[0].size) found.push(`the name "${l.text}" is not smaller than the counts`);
-        if (l.x < 0 || l.y < 0 || l.x + l.w > c.clientWidth || l.y + l.h > c.clientHeight) found.push(`the name "${l.text}" leaves the canvas`);
         const box = { x0: l.x, x1: l.x + l.w, y0: l.y, y1: l.y + l.h };
         for (const o of labels.slice(i + 1)) {
           const vertical = l.y < o.y + o.h && o.y < l.y + l.h;
@@ -621,6 +628,7 @@ async function checkGlyphs(page: Page, where: string, name: string): Promise<voi
       k: { COUNT_FIT, VESSEL_SCALE, RING_REACH, SELECTION_REACH, PORT_GAP, PORT_MIN: portHalf(0), ARC_GAP, ARC_WIDTH, RING_BEHIND, RING_CAUGHT_UP, FAR: MARK.FAR },
       nodes: snap.nodes.map((n) => ({ id: n.id, lag: n.lag, window_total: n.window_total, brim: n.brim })),
       grace: feed ? PERIOD_MS + 5 : 0,
+      names: Object.fromEntries(names),
     },
   );
   expect(findings, `${where} (A42)`).toEqual([]);
@@ -829,6 +837,9 @@ function audit({ theme, beam, band }: { theme: Theme; beam: number; band: number
     for (const l of labels) {
       if (l.size < floor - 0.01) {
         found.A3.push(`canvas label "${l.text}" is ${l.size.toFixed(1)} px, below the ${floor.toFixed(1)} px floor`);
+      }
+      if (l.x < 0 || l.y < 0 || l.x + l.w > canvas.clientWidth || l.y + l.h > canvas.clientHeight) {
+        found.A3.push(`canvas label "${l.text}" leaves its canvas`);
       }
       const clipped = clip(canvas, {
         left: at.left + l.x,

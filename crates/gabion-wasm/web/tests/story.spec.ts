@@ -496,6 +496,8 @@ test('a rebuild that fails keeps the running cluster, and the active scenario is
 test('the next step is reachable from the keyboard (A52, A21)', async ({ page }, info) => {
   test.skip(info.project.name !== 'audit-1440-light', 'the keyboard, checked once');
   await open(page);
+  // The page opens with the scenario's node, node 0, selected (A12).
+  await expect(page.locator('.pane-title [data-field="node"]')).toHaveText('0');
   await page.keyboard.press('Tab');
   await expect(page.locator(':focus')).toHaveText('Skip to the next step');
   await page.keyboard.press('Enter');

@@ -194,9 +194,9 @@ export function nextAction(v: RunView): NextAction {
 }
 
 /** The action that names `control`. */
-export const press = (control: Control): NextAction => ({ kind: 'press', control });
+const press = (control: Control): NextAction => ({ kind: 'press', control });
 /** The wait for `reason`. */
-export const wait = (reason: WaitReason): NextAction => ({ kind: 'wait', reason });
+const wait = (reason: WaitReason): NextAction => ({ kind: 'wait', reason });
 
 /** The action the story's current act wants, once nothing runs. */
 function storyAction(v: RunView): NextAction {

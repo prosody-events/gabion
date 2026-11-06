@@ -1397,6 +1397,45 @@ def check_fonts(S, scope):
     want_faces = {'Source Sans 3', 'Source Serif 4'}
     rec('A10.faces-loaded', scope, o['check'] and want_faces <= set(o['loaded']), f'selector=document.fonts | seen={sorted(set(o["loaded"]))} | expected={sorted(want_faces)} loaded')
     rec('A10.requests-same-origin', scope, not o['foreign'], f'selector=performance resources | seen={o["foreign"][:3]} | expected=none off the page origin')
+    check_font_gate(S, scope)
+
+# Marks when the page has parsed params.json: set before the page's own continuations run,
+# in the same microtask checkpoint, so a check made after it sees what they did.
+JS_FONT_GATE = r'''
+(() => {
+  const fetch0 = window.fetch;
+  window.fetch = (url, ...rest) => fetch0(url, ...rest).then((r) => {
+    if (!String(url).endsWith('params.json')) return r;
+    const json = r.json.bind(r);
+    r.json = () => json().then((v) => ((window.__paramsRead = true), v));
+    return r;
+  });
+})();
+'''
+
+def check_font_gate(S, scope):
+    """A10: the page holds its first render for the faces. The face files are held back and
+    the page's clock paused, so its fallback timer cannot fire: once params.json is read, the
+    page must still be waiting. Released, it renders."""
+    ctx = S.browser.new_context(viewport={'width': 1440, 'height': 900}, device_scale_factor=1)
+    try:
+        pg = ctx.new_page(); held = []
+        pg.route('**/fonts/*.woff2', lambda route: held.append(route))
+        pg.add_init_script(JS_FONT_GATE)
+        pg.clock.install(); pg.clock.pause_at(datetime.datetime.now() + datetime.timedelta(seconds=1))
+        pg.goto(S.base + '/dashboard/', wait_until='commit')
+        for _ in range(400):
+            if pg.evaluate('() => window.__paramsRead === true') and held: break
+            pg.wait_for_timeout(50)
+        else: raise RuntimeError(f'params.json was never read, or no face requested; faces held={len(held)}')
+        waiting = pg.evaluate('() => Object.keys(dash.params()).length === 0')
+        for route in held: route.continue_()
+        pg.unroute('**/fonts/*.woff2')
+        pg.clock.resume()
+        pg.wait_for_selector('[data-fk="metric|bytes_total"]', timeout=25000)
+        rec('A10.faces-before-first-render', scope, waiting, f'selector=dash.params with the faces held | seen=waiting {waiting} | expected=waiting for the faces')
+    finally:
+        ctx.close()
 
 def main():
     handler = functools.partial(Quiet, directory=str(STUDY))

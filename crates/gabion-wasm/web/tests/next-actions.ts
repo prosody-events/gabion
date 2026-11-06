@@ -2,7 +2,7 @@
 // and the one action the page must name there. `next.spec.ts` runs every row
 // through `nextAction`.
 
-import { press, START, wait, type NextAction, type Progress, type RunView } from '../src/lib/next';
+import { START, type Control, type NextAction, type Progress, type RunView, type WaitReason } from '../src/lib/next';
 import type { Admission, Lag } from '../src/lib/sim/types';
 
 const caught: Lag = { kind: 'CaughtUp' };
@@ -49,6 +49,11 @@ export const BASE: RunView = {
 };
 
 const at = (act: Progress['act'], more: Partial<Progress> = {}): Progress => ({ ...START, act, ...more });
+
+// The expected actions, written out here rather than built by next.ts's own
+// constructors, so a wrong constructor cannot change what is expected too.
+const press = (control: Control): NextAction => ({ kind: 'press', control });
+const wait = (reason: WaitReason): NextAction => ({ kind: 'wait', reason });
 
 /** One state and its action. */
 export interface Row {

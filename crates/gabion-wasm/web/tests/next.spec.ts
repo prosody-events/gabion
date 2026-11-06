@@ -115,6 +115,11 @@ test("the heading's forms (A18)", () => {
 test('narration forms', () => {
   expect(text(waveOneCounted([3, 6, 9], [4, 8]))).toBe('nodes 3, 6 and 9 and gateways node 4 and node 8 counted them');
   expect(text(admittedWaiting(0, 1, 1_000_000, 100))).toBe('node 0 admitted 1 hit · that is under 1\u00a0% of the limit, so it waits for its next heartbeat');
+  // Either side of the budget's edge, 1 % of the limit, and at half a percent:
+  // the reason is given only under it.
+  expect(text(admittedWaiting(0, 9_999, 1_000_000, 100))).toBe('node 0 admitted 9999 hits · that is under 1\u00a0% of the limit, so it waits for its next heartbeat');
+  expect(text(admittedWaiting(0, 10_000, 1_000_000, 100))).toBe('node 0 admitted 10000 hits · it waits for its next heartbeat');
+  expect(text(admittedWaiting(0, 4_999, 1_000_000, 50))).toBe('node 0 admitted 4999 hits · that is under 0.5\u00a0% of the limit, so it waits for its next heartbeat');
   expect(text(strandedStop([['zone b is cut off'], ['zone c is cut off']]))).toBe(
     'paused: zone b is cut off and zone c is cut off, so their hits cannot cross until they are reconnected',
   );
