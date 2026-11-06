@@ -190,17 +190,24 @@ fn event_stepping_equals_time_stepping() {
 /// Far from the limit a send waits for its node's heartbeat. Stepping by
 /// event stops before its wave lands, then before the relays land, runs a
 /// bounded step through the acknowledgements, and stops at the instant the
-/// hits leave the window.
+/// hits leave the window. The heartbeat period does not divide the 1 s
+/// bucket, so no heartbeat is due at the window's edge and only the expiry
+/// can end the last step there.
 #[test]
 fn event_stops_at_each_wave_and_at_the_window_edge() {
-    with_state(propagation(), |mut state| async move {
+    const PERIOD: u64 = 700;
+    let config = SimConfig {
+        tick_interval_ms: PERIOD,
+        ..propagation()
+    };
+    with_state(config, |mut state| async move {
         warm(&mut state).await;
         settle(&mut state).await;
         let t0 = state.virtual_ms;
         send(&mut state, 0, 25).await;
 
         let own = state.step(2_000, StepUntil::Event).await;
-        let wave = first_heartbeat(0, P, t0);
+        let wave = first_heartbeat(0, PERIOD, t0);
         assert_eq!(own.virtual_ms, wave);
         let sent = packets(&own.events, PacketKind::Own);
         assert_eq!(sent.len(), 5, "{sent:?}");
@@ -223,8 +230,8 @@ fn event_stops_at_each_wave_and_at_the_window_edge() {
         assert!(relay.events.iter().all(|e| e.virtual_ms <= wave + F_R));
         assert_eq!(state.sub_step, SubStep::Open);
 
-        let acks = state.step(P, StepUntil::Event).await;
-        assert_eq!(acks.virtual_ms, wave + F_R + P, "bounded by its delta");
+        let acks = state.step(PERIOD, StepUntil::Event).await;
+        assert_eq!(acks.virtual_ms, wave + F_R + PERIOD, "bounded by its delta");
         let relayed: Vec<_> = acks
             .events
             .iter()
@@ -234,8 +241,16 @@ fn event_stops_at_each_wave_and_at_the_window_edge() {
         assert_eq!(cell_nodes(&relayed), destinations(&relays));
         assert_eq!(state.sub_step, SubStep::Closed);
 
+        let edge_ms = (t0 / 1_000 + 10) * 1_000;
+        assert!(
+            state
+                .nodes
+                .iter()
+                .all(|n| first_heartbeat(n.id, PERIOD, edge_ms - 1) != edge_ms),
+            "a heartbeat is due at the window's edge {edge_ms}"
+        );
         let edge = state.step(15_000, StepUntil::Event).await;
-        assert_eq!(edge.virtual_ms, (t0 / 1_000 + 10) * 1_000);
+        assert_eq!(edge.virtual_ms, edge_ms);
         for kind in [PacketKind::Own, PacketKind::Relay, PacketKind::Sweep] {
             assert!(packets(&edge.events, kind).is_empty(), "no data moves");
         }
