@@ -347,6 +347,22 @@ the relevant README and link it from the surrounding context.
   for reviewer testing. `release-please` only runs on `main`; merging
   is what triggers the release PR loop. Direct pushes to `main` skip
   review and bypass every gate above.
+- **Clean every worktree when disk space runs low.** A full build
+  here is 5–12 GiB, and parallel agents each build in a worktree of
+  their own, so a busy machine can fill its disk within an hour.
+  Before you start a build, check free space with `df -h .`. If less
+  than 30 GiB is free, run `cargo clean` in every worktree of this
+  repository, the main checkout included, before you build:
+
+  ```sh
+  git worktree list --porcelain | awk '/^worktree /{print $2}' |
+    while read -r wt; do (cd "$wt" && cargo clean); done
+  ```
+
+  Skip a worktree only while a build is running in it: cleaning it
+  then breaks that build. An agent that builds in a worktree of its
+  own runs `cargo clean` there when it finishes, whatever the free
+  space.
 - **`cargo nextest` is the only sanctioned test runner.** Do not
   invoke `cargo test`. Nextest is faster, supports per-test timeouts,
   surfaces failures earlier, and is what CI runs. If you write a new
